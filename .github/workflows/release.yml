@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+      draft:
+        description: "Create as draft"
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark as prerelease"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ais-public-runners
+    strategy:
+      matrix:
+        target:
+          - { bun: bun-darwin-arm64, name: darwin-arm64 }
+          - { bun: bun-darwin-x64, name: darwin-x64 }
+          - { bun: bun-linux-arm64, name: linux-arm64 }
+          - { bun: bun-linux-x64, name: linux-x64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run tests
+        run: bun test
+
+      - name: Build binaries for ${{ matrix.target.name }}
+        # Asset names must match what src/installer.ts requests at
+        # `<tool>-<platform>` — it downloads these directly from the release
+        # over HTTPS, no `gh` CLI or auth involved. `open` shadows macOS's
+        # /usr/bin/open (no equivalent bare `open` command on Linux to fall
+        # back to for passthrough), so it's only built for darwin targets —
+        # see scripts/build.ts's matching platform gate. `ais` (the
+        # management CLI), `grok` (a thin passthrough wrapper, same as
+        # claude/codex — whether the real grok CLI itself ships for a given
+        # platform is a runtime concern for resolve-binary.ts, not a build
+        # concern here), and `zai`/`ali` (same story: both proxy the real
+        # `crush` binary, not a platform-gated concept of their own) are not
+        # platform-gated.
+        run: |
+          bun build --compile --target=${{ matrix.target.bun }} src/claude.ts --outfile claude-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/codex.ts --outfile codex-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/grok.ts --outfile grok-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/kimi.ts --outfile kimi-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/zai.ts --outfile zai-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/ali.ts --outfile ali-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/pi.ts --outfile pi-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/installer.ts --outfile install-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/ais.ts --outfile ais-${{ matrix.target.name }}
+          chmod +x claude-${{ matrix.target.name }} codex-${{ matrix.target.name }} grok-${{ matrix.target.name }} kimi-${{ matrix.target.name }} zai-${{ matrix.target.name }} ali-${{ matrix.target.name }} pi-${{ matrix.target.name }} install-${{ matrix.target.name }} ais-${{ matrix.target.name }}
+          case "${{ matrix.target.name }}" in
+            darwin-*)
+              bun build --compile --target=${{ matrix.target.bun }} src/open.ts --outfile open-${{ matrix.target.name }}
+              chmod +x open-${{ matrix.target.name }}
+              ;;
+          esac
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-profile-switcher-${{ matrix.target.name }}
+          path: |
+            claude-${{ matrix.target.name }}
+            codex-${{ matrix.target.name }}
+            grok-${{ matrix.target.name }}
+            kimi-${{ matrix.target.name }}
+            zai-${{ matrix.target.name }}
+            ali-${{ matrix.target.name }}
+            pi-${{ matrix.target.name }}
+            open-${{ matrix.target.name }}
+            install-${{ matrix.target.name }}
+            ais-${{ matrix.target.name }}
+
+  release:
+    needs: build
+    runs-on: ais-public-runners
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require("node:fs/promises");
+            const path = require("node:path");
+            const tag = process.env.RELEASE_TAG;
+            const { data: release } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: tag,
+              draft: process.env.RELEASE_DRAFT === "true",
+              prerelease: process.env.RELEASE_PRERELEASE === "true",
+              generate_release_notes: true,
+            });
+            const globber = await glob.create("artifacts/*/*");
+            for await (const file of globber.globGenerator()) {
+              await github.rest.repos.uploadReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.id,
+                name: path.basename(file),
+                data: await fs.readFile(file),
+              });
+            }
