@@ -4,15 +4,16 @@ import { existsSync, statSync } from "node:fs";
 import { cyan, dim } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
 import { readServerState } from "../server/state.ts";
-import { DEFAULT_CONSOLE_PORT } from "../server/serve.ts";
 
-/** `ais tui`: ensures the console server is running, then execs the ratatui
- * binary (aistui) against it with the URL and bearer token in env. The TUI
- * itself is a Rust crate under apps/tui; this launcher never blocks on SSH
- * or sync work. */
+/** `ais tui`: GUARANTEES the console server is running (starting a detached
+ * daemon when necessary, same as `ais web start`), then execs the ratatui
+ * binary against it with the URL and bearer token in env. The TUI itself is
+ * a Rust crate under apps/tui; this launcher never blocks on SSH or sync
+ * work. */
 export async function runTuiCommand(_positionals: string[], _flags: Record<string, string | true>): Promise<void> {
+  const { ensureConsoleRunning } = await import("./web.ts");
+  const port = await ensureConsoleRunning();
   const state = await readServerState();
-  const port = state?.port ?? DEFAULT_CONSOLE_PORT;
   const token = state?.token ?? "";
 
   const bin = resolveTuiBinary();

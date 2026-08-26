@@ -32,16 +32,12 @@ export async function runWebCommand(positionals: string[], flags: Record<string,
         await startConsoleServer({ ...(numberFlag(flags) ? { port: numberFlag(flags) } : {}), ...(distDir ? { distDir } : {}) });
         return;
       }
-      const state = await readServerState();
-      if (state && pidAlive(state.pid) && (await healthy(state.port))) {
-        printUrl(state.port, "already running");
-        return;
-      }
-      const daemon = spawnDaemon(numberFlag(flags));
-      const ready = await waitUntilHealthyOrExit(daemon.proc);
-      if (!ready) throw new CliUsageError("console daemon did not become healthy within 10s (it may have failed to bind)");
-      const fresh = await readServerState();
-      printUrl(fresh?.port ?? daemon.requestedPort, "started");
+      const wasRunning = await (async () => {
+        const state = await readServerState();
+        return Boolean(state && pidAlive(state.pid) && (await healthy(state.port)));
+      })();
+      const port = await ensureConsoleRunning(numberFlag(flags));
+      printUrl(port, wasRunning ? "already running" : "started");
       return;
     }
     case "stop": {
@@ -64,14 +60,7 @@ export async function runWebCommand(positionals: string[], flags: Record<string,
       return;
     }
     case "open": {
-      const state = await readServerState();
-      let port = state && pidAlive(state.pid) && (await healthy(state.port)) ? state.port : undefined;
-      if (port === undefined) {
-        const daemon = spawnDaemon(numberFlag(flags));
-        if (!(await waitUntilHealthyOrExit(daemon.proc))) throw new CliUsageError("console daemon did not become healthy within 10s (it may have failed to bind)");
-        const fresh = await readServerState();
-        port = fresh?.port ?? DEFAULT_CONSOLE_PORT;
-      }
+      const port = await ensureConsoleRunning(numberFlag(flags));
       openBrowser(`http://127.0.0.1:${port}`);
       return;
     }
@@ -106,9 +95,14 @@ function spawnDaemon(port: number | undefined): SpawnedDaemon {
   // path has neither a script extension nor a real directory entry that
   // survives both checks.
   const looksLikeScript = /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(main) && statSyncSafe(main);
-  const base = looksLikeScript ? [process.execPath, main] : [process.execPath];
+  const inner = looksLikeScript ? [process.execPath, main] : [process.execPath];
+  // setsid puts the daemon in its OWN session/process group so closing the
+  // launching terminal cannot SIGHUP it (the server also ignores HUP as a
+  // second layer for machines without setsid).
+  const setsid = Bun.which("setsid");
+  const base = setsid ? [setsid] : [];
+  const args = [...base, ...inner, "web", "--serve-internal", `--port=${port ?? DEFAULT_CONSOLE_PORT}`];
   // NOTE: parseArgs only understands --flag=value, never --flag value.
-  const args = [...base, "web", "--serve-internal", `--port=${port ?? DEFAULT_CONSOLE_PORT}`];
   const proc = Bun.spawn(args, {
     env: { ...process.env, AIS_WEB_DAEMON: "1" },
     stdio: ["ignore", "ignore", "ignore"],
@@ -123,6 +117,20 @@ function statSyncSafe(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Shared by `ais web start` and `ais tui`: guarantees a healthy console
+ * daemon, starting one when necessary. Returns its port. This is the
+ * contract that keeps "server should never be down while a frontend is
+ * open" true: no frontend may launch without it. */
+export async function ensureConsoleRunning(portFlag?: number): Promise<number> {
+  const state = await readServerState();
+  if (state && pidAlive(state.pid) && (await healthy(state.port))) return state.port;
+  const daemon = spawnDaemon(portFlag);
+  const ready = await waitUntilHealthyOrExit(daemon.proc);
+  if (!ready) throw new CliUsageError("console daemon did not become healthy within 10s (it may have failed to bind)");
+  const fresh = await readServerState();
+  return fresh?.port ?? daemon.requestedPort;
 }
 
 async function stopDaemon(): Promise<void> {

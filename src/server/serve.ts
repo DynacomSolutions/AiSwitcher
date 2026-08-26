@@ -31,6 +31,11 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   const server = Bun.serve({
     port,
     hostname: host,
+    // Default is 10s, which silently killed any scan slower than that
+    // ("empty reply" at exactly T+10s, observed live). Our own deadlines
+    // (20-30s worker caps) are the real bound; this just has to sit above
+    // them. Bun caps idleTimeout at 255.
+    idleTimeout: Math.min(120, 255),
     fetch(req, bunServer) {
       // Stamp the peer address so the guard can distinguish loopback peers
       // from token-carrying remote ones when a non-loopback bind is used.
@@ -43,6 +48,13 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   if (options.managed !== false) {
     const actualPort = server.port ?? port;
     await writeServerState({ pid: process.pid, port: actualPort, token, startedAt: new Date().toISOString() });
+    // A detached daemon still belongs to the SPAWNING terminal's process
+    // group until it exits; when that terminal/pty closes, SIGHUP takes the
+    // daemon down with it (observed live: server "mysteriously" dying every
+    // time a launching TUI/browser session ended). Ignoring HUP here is
+    // what actually makes `ais web start`'s child survive its parent's
+    // whole session.
+    process.on("SIGHUP", () => {});
     const shutdown = () => {
       void clearServerState();
       server.stop(true);
