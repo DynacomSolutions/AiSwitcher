@@ -26,6 +26,10 @@ impl ConsoleClient {
     pub fn new(settings: Settings) -> reqwest::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
+            // The console is loopback-only; honouring http_proxy/ALL_PROXY
+            // env vars would route 127.0.0.1 through a proxy that cannot
+            // reach it and produce a permanent "unreachable" banner.
+            .no_proxy()
             .build()?;
         Ok(Self { http, settings })
     }
