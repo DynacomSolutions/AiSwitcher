@@ -498,6 +498,41 @@ OpenCode profile. `run`, `acp`, and `serve` are treated as non-interactive
 invocations, so an unresolved identity fails immediately instead of opening a
 picker.
 
+## Console (`ais web` / `ais tui`)
+
+A local control panel over everything AIS manages, in two frontends backed by
+one API:
+
+- **Web**: `ais web start` runs a loopback-only HTTP server (default port
+  47129) and serves the shadcn/ui dashboard from `apps/web/dist`. Pages:
+  dashboard with live agent processes, identity editing, rate limits, token
+  usage, resumable sessions, auth status and fixes, and a config-file editor
+  for skills/agents/hooks/rules/memory inside whitelisted roots. Every page
+  live-polls; nothing is a stale snapshot.
+- **TUI**: `ais tui` launches the ratatui dashboard (`apps/tui`, Rust) against
+  the same server, with tick-polled tabs for status, processes, identities,
+  limits, usage, sessions, and auth.
+
+```bash
+ais web start [--port=N]      # background daemon (default)
+ais web start --foreground    # run in this terminal instead
+ais web status | stop | open  # manage it
+ais tui                       # ratatui frontend
+```
+
+Security model: the server binds `127.0.0.1` only; requests must carry the
+per-boot bearer token from `~/.ais/web/server.json` OR come from a loopback
+peer with a loopback `Host` header (DNS-rebinding guard); every mutating
+request additionally requires an `X-AIS-Console` header, which cross-site
+pages cannot forge without a CORS preflight this server never grants.
+Secrets are never returned by the API: keys/tokens/cookies can be written,
+never read back. File browsing is restricted to `~/.ais`, each tool's home
+container, and registered identity configDirs, with symlink-escape guards and
+automatic pre-edit backups under `~/.ais/web/file-backups/`.
+
+Development: see `apps/web/README.md` (pnpm) and `apps/tui/` (cargo); the API
+contract both frontends build against is `docs/API.md`.
+
 ## CLI (`ais`)
 
 An eighth binary, `ais`, manages `identities.json` so you never have to
