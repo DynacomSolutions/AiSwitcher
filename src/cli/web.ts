@@ -1,6 +1,7 @@
 import { cyan, dim } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
 import { boolFlag } from "./args.ts";
+import { statSync } from "node:fs";
 import { clearServerState, pidAlive, readServerState } from "../server/state.ts";
 import { DEFAULT_CONSOLE_PORT, findDistDir, startConsoleServer } from "../server/serve.ts";
 
@@ -97,10 +98,15 @@ interface SpawnedDaemon {
 }
 
 function spawnDaemon(port: number | undefined): SpawnedDaemon {
-  const script = Bun.main;
-  const execPath = process.execPath;
-  const needsScriptArg = execPath !== script;
-  const base = needsScriptArg ? [execPath, script] : [script];
+  const main = Bun.main;
+  // Compiled binary: Bun.main is a VIRTUAL "/$bunfs/root/<name>" path
+  // (which can pass a plain statSync!) and process.execPath is the real
+  // executable. Dev (`bun src/ais.ts`): Bun.main is a real script file.
+  // Discriminator: a SCRIPT EXTENSION plus on-disk existence; the bunfs
+  // path has neither a script extension nor a real directory entry that
+  // survives both checks.
+  const looksLikeScript = /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(main) && statSyncSafe(main);
+  const base = looksLikeScript ? [process.execPath, main] : [process.execPath];
   // NOTE: parseArgs only understands --flag=value, never --flag value.
   const args = [...base, "web", "--serve-internal", `--port=${port ?? DEFAULT_CONSOLE_PORT}`];
   const proc = Bun.spawn(args, {
@@ -109,6 +115,14 @@ function spawnDaemon(port: number | undefined): SpawnedDaemon {
   });
   proc.unref();
   return { proc, requestedPort: port ?? DEFAULT_CONSOLE_PORT };
+}
+
+function statSyncSafe(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 async function stopDaemon(): Promise<void> {
