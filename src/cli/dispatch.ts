@@ -78,6 +78,16 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "sync":
         return await runSyncCommand(rest, flags);
+      case "__scan_worker":
+        // Dynamic import: a static one here drags the whole scan-engine
+        // graph into every entrypoint's init and segfaults bun --compile
+        // binaries at load (observed live); lazily loaded only when this
+        // hidden internal command actually runs.
+        {
+          const { runScanWorkerStdio } = await import("../server/workers.ts");
+          await runScanWorkerStdio();
+          break;
+        }
       case "web":
         await runWebCommand(rest, flags);
         break;

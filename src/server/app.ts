@@ -11,7 +11,7 @@ import type { ToolConfig } from "../identities/types.ts";
 import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { HttpError } from "./types.ts";
 import * as authApi from "./auth.ts";
-import { limitsEnvelope, PollCache, usageEnvelope } from "./expensive.ts";
+import { runScanIsolated } from "./workers.ts";
 import {
   createIdentityInRegistry,
   deleteIdentityFromRegistry,
@@ -31,7 +31,6 @@ export interface ConsoleAppDeps extends GuardDeps {
 
 export function createApp(deps: ConsoleAppDeps): Hono {
   const app = new Hono();
-  const cache = new PollCache(45_000);
 
   app.onError((err, c) => {
     if (err instanceof HttpError) return c.json({ error: err.message }, err.status as 400);
@@ -95,23 +94,37 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   }
 
   /* ---------------------------- limits / usage ----------------------------- */
+  // Heavy scans run on worker threads (see workers.ts): a stalled scan must
+  // never take the HTTP loop down with it.
 
-  app.get("/api/limits", async (c) =>
-    c.json(await limitsEnvelope(cache, queryValue(c, "tool"), queryValue(c, "identity"), numberQuery(c, "maxAge", 45))),
-  );
-  app.get("/api/usage", async (c) => c.json(await usageEnvelope(cache, queryValue(c, "tool"), queryValue(c, "identity"))));
+  app.get("/api/limits", async (c) => {
+    const result = await runScanIsolated("limits", {
+      ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
+      ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
+      maxAgeS: numberQuery(c, "maxAge", 45),
+    }, 45_000);
+    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "limits scan failed");
+    return c.json(result.payload);
+  });
+  app.get("/api/usage", async (c) => {
+    const result = await runScanIsolated("usage", {
+      ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
+      ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
+    }, 60_000);
+    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
+    return c.json(result.payload);
+  });
 
   /* -------------------------------- sessions ------------------------------- */
 
   app.get("/api/sessions", async (c) => {
-    const { runResumeQuery } = await import("../cli/resume/collect.ts");
-    const flags: Record<string, string> = {};
-    const tool = queryValue(c, "tool");
-    const identity = queryValue(c, "identity");
-    if (tool) flags.tool = tool;
-    if (identity) flags.identity = identity;
-    const results = await runResumeQuery(flags, queryValue(c, "cwd") ?? process.cwd());
-    return c.json({ results });
+    const result = await runScanIsolated("sessions", {
+      cwd: queryValue(c, "cwd"),
+      ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
+      ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
+    }, 30_000);
+    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "session scan failed");
+    return c.json(result.payload);
   });
 
   /* ---------------------------------- auth --------------------------------- */
