@@ -15,6 +15,8 @@ import { startBackgroundProfileSync } from "../sync/background.ts";
 import { migrateLegacyAisHome } from "../shared/migrate-ais-home.ts";
 import { runAuthCommand } from "./auth/dispatch.ts";
 import { runMemoryCommand } from "./memory.ts";
+import { runWebCommand } from "./web.ts";
+import { runTuiCommand } from "./tui.ts";
 
 export async function runCli(argv: string[]): Promise<void> {
   const { positionals, flags } = parseArgs(argv);
@@ -76,6 +78,12 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "sync":
         return await runSyncCommand(rest, flags);
+      case "web":
+        await runWebCommand(rest, flags);
+        break;
+      case "tui":
+        await runTuiCommand(rest, flags);
+        break;
       case "auth":
         await runAuthCommand(rest, flags);
         break;

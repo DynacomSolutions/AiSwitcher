@@ -25,6 +25,8 @@ const COMMANDS: Array<[string, string]> = [
   ["memory [show|path|init|edit|add] [--stdin]", "Machine-local memory shared by every AIS agent and identity"],
   ["doctor [--identity=] [--tool=] [--json]", "Live responsiveness probe per identity — catches a hung/stuck identity"],
   ["resume [session-id] [--identity=] [--tool=] [--json]", "Interactive tree picker (or direct launch) for resumable sessions"],
+  ["web [start|stop|status|open] [--port=] [--foreground]", "Local web console (identities, limits, usage, sessions, auth, files)"],
+  ["tui", "Terminal dashboard (ratatui) against the same local console API"],
   ["help", "Show this message"],
 ];
 
