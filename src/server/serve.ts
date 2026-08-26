@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
-import { clearServerState, newConsoleToken, writeServerState } from "./state.ts";
+import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import type { ConsoleAppDeps } from "./app.ts";
 
 export interface ServeOptions {
@@ -56,12 +56,16 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this
- * code is running from (dev checkout or compiled binary next to apps/). */
+ * code is running from: a dev checkout (probed relative to this module),
+ * an explicit override, or an installed copy at ~/.ais/web/dist (the
+ * installed ais binary has no repo layout around it, so `install:shims`
+ * style setups copy apps/web/dist there). */
 export function findDistDir(): string | undefined {
   const candidates = [
     process.env.AIS_WEB_DIST,
     join(import.meta.dir, "..", "..", "apps", "web", "dist"),
     join(import.meta.dir, "..", "..", "..", "apps", "web", "dist"),
+    join(consoleWebDir(), "dist"),
   ].filter((p): p is string => typeof p === "string" && p.length > 0);
   for (const candidate of candidates) {
     try {
