@@ -21,6 +21,22 @@ export function flagsFor(tool: string | undefined, identity: string | undefined)
   };
 }
 
+/** Hard ceiling for handlers that touch live provider APIs or scan many
+ * local stores. Without it a single wedged fetch (hung network mount,
+ * stalled upstream) holds client connections open forever and, from the
+ * frontends' point of view, looks like the whole console being down. */
+export async function withTimeout<T>(ms: number, label: string, fn: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new HttpError(504, `${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+  });
+  try {
+    return await Promise.race([fn(), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export class PollCache {
   private readonly entries = new Map<string, CacheEntry<unknown>>();
 
