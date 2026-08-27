@@ -11,6 +11,7 @@ import {
   GROK_CONFIG,
   KIMI_CONFIG,
   PI_CONFIG,
+  OPENCODE_CONFIG,
   ZAI_CONFIG,
 } from "../identities/tool-configs.ts";
 import type { ToolConfig } from "../identities/types.ts";
@@ -87,6 +88,12 @@ export const UPGRADE_SPECS: UpgradeSpec[] = [
   {
     cfg: PI_CONFIG,
     npmPackage: "@earendil-works/pi-coding-agent",
+    installer: "npm",
+  },
+  {
+    cfg: OPENCODE_CONFIG,
+    npmPackage: "opencode-ai",
+    nativeUpdateArgs: ["upgrade"],
     installer: "npm",
   },
 ];

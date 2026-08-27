@@ -2153,15 +2153,37 @@ provider's models.
 
 ## Commands
 
+### OpenCode identity proxy (2026-08-27)
+
+- `opencode` is a real eighth AIS-managed CLI, separate from the retired
+  zai-via-OpenCode experiment above. `OPENCODE_CONFIG` points
+  `OPENCODE_CONFIG_DIR` at the identity root and redirects `XDG_DATA_HOME`,
+  `XDG_CACHE_HOME`, and `XDG_STATE_HOME` into `data`, `cache`, and `state`
+  subdirectories. OpenCode adds its own `opencode/` suffix to the XDG roots.
+- `run`, `acp`, and `serve` are non-interactive entrypoints. The wrapper must
+  never prompt for an identity in those modes. `serve` remains loopback-only
+  unless the caller explicitly supplies another hostname.
+- Provider credentials remain OpenCode-owned. In particular, never reuse
+  Claude Pro/Max OAuth: Anthropic supports third-party clients with an API
+  key. OpenAI/xAI use OpenCode's OAuth flows; Kimi For Coding, Z.AI Coding
+  Plan, and Alibaba Token Plan use their dedicated product credentials.
+- OpenCode identities mirror the same account boundaries used by the other
+  AIS wrappers. Never aggregate credentials from unrelated AIS identities
+  into one catch-all OpenCode profile.
+- OpenCode currently participates in identity management, backup, update,
+  upgrade, and SSH profile sync. Usage, limits, doctor, and resume degrade to
+  their existing honest unsupported result until native collectors are added.
+
 - `bun install` — install dependencies.
 - `bun test` — run the unit test suite (`test/match.test.ts`, `test/resolve.test.ts`,
   `test/chrome-profile.test.ts`, `test/codex-backfill.test.ts`,
   `test/store.test.ts`, `test/cli-args.test.ts`, and `test/cli/*`).
-- `bun run build`: `bun build --compile` all seven entrypoints (`claude`,
-  `codex`, `grok`, `kimi`, `zai`, `ali`, `open` (darwin only)) into `dist/`.
+- `bun run build`: `bun build --compile` all eight proxy entrypoints (`claude`,
+  `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `opencode`) plus `open`
+  (darwin only), `ais`, and the installer into `dist/`.
 - `bun run backup` — mirrors `~/.claude`, `~/.claude-identity-a`,
   `~/.claude-personal`, `~/.codex`, `~/.grok`, `~/.kimi-code`, `~/.zai`,
-  `~/.ali` into the persistent git-managed repo at `~/.ais/backups` and
+  `~/.ali`, `~/.pi`, and `~/.opencode` into the persistent git-managed repo at `~/.ais/backups` and
   commits whatever changed since the last backup (see "~/.ais: one
   consolidated root" above).
 - `bun run migrate` — **one-time, destructive.** Restructures the real
@@ -2175,7 +2197,8 @@ provider's models.
   this script was intentionally left claude/codex-only rather than
   generalized speculatively.
 - `bun run install:shims` — backs up, then copies `dist/claude`/`dist/codex`/
-  `dist/grok`/`dist/kimi`/`dist/zai`/`dist/ali`/`dist/open` to `~/.local/bin`.
+  `dist/grok`/`dist/kimi`/`dist/zai`/`dist/ali`/`dist/pi`/`dist/opencode`/
+  `dist/open` to `~/.local/bin`.
   Open a new terminal (or `hash -r`) afterward, and for grok and kimi
   specifically, verify with `which grok` / `which kimi` that they actually
   resolve to `~/.local/bin/grok` / `~/.local/bin/kimi` (see the PATH-ordering

@@ -9,8 +9,8 @@ import { aisManifestPath } from "../src/shared/ais-home.ts";
 // ships on every platform.
 const BINARIES =
   process.platform === "darwin"
-    ? ["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "open", "ais"]
-    : ["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "ais"];
+    ? ["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "opencode", "open", "ais"]
+    : ["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "opencode", "ais"];
 
 // Records the source hash (see source-hash.ts) of whatever's currently
 // deployed at ~/.local/bin/<name> — lets each binary's install be gated
@@ -83,7 +83,7 @@ async function runInstall(): Promise<void> {
   // a config directory a broken build could actually put at risk; "ais"/
   // "open" changing doesn't warrant a multi-GB directory snapshot (see
   // AGENTS.md/backup.ts's BACKUP_GROUPS).
-  const backupGroups = (["claude", "codex", "grok", "kimi", "zai", "ali", "pi"] as const).filter((name) =>
+  const backupGroups = (["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "opencode"] as const).filter((name) =>
     pending.some((p) => p.name === name),
   );
   if (backupGroups.length > 0) {

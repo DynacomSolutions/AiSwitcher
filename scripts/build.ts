@@ -9,6 +9,7 @@ const ENTRYPOINTS: Array<{ entry: string; out: string }> = [
   { entry: "src/zai.ts", out: "dist/zai" },
   { entry: "src/ali.ts", out: "dist/ali" },
   { entry: "src/pi.ts", out: "dist/pi" },
+  { entry: "src/opencode.ts", out: "dist/opencode" },
   // Shadows /usr/bin/open — a macOS-only concept (no equivalent bare `open`
   // command on Linux to fall back to for passthrough) — so only build/ship
   // it there. See src/open.ts.

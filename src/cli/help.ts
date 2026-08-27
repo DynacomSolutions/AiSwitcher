@@ -2,10 +2,10 @@ import { bold, cyan, dim } from "./colors.ts";
 
 const COMMANDS: Array<[string, string]> = [
   ["version", "Print the installed ais version"],
-  ["update", "Re-download the latest claude/codex/grok/kimi/zai/ali/pi/open/ais binaries"],
+  ["update", "Re-download the latest claude/codex/grok/kimi/zai/ali/pi/opencode/open/ais binaries"],
   ["upgrade", "Install or upgrade every real CLI required by the installed AIS shims"],
   ["sync list|add|remove|now|dedupe|recover", "Merge/recover profiles over SSH or locally"],
-  ["identities [list] [--tool=claude|codex|grok|kimi|zai|ali|pi]", "List identities (default; omit --tool to show all)"],
+  ["identities [list] [--tool=claude|codex|grok|kimi|zai|ali|pi|opencode]", "List identities (default; omit --tool to show all)"],
   ["identities show <name> [--tool=]", "Show one identity's full detail"],
   ["identities create --tool=<t> [--name=] ...", "Create an identity (prompts for anything omitted)"],
   ["identities update <name> --tool=<t> ...", "Update label/description/configDir"],
@@ -29,7 +29,7 @@ const COMMANDS: Array<[string, string]> = [
 
 const NOTES = `--tool is required for "create"; every other name-targeted "identities"
 mutation auto-resolves --tool when the name exists in only one of the
-claude/codex/grok/kimi/zai/ali/pi registries, and requires --tool when it exists in more than
+claude/codex/grok/kimi/zai/ali/pi/opencode registries, and requires --tool when it exists in more than
 one (or none). "list"/"show"/"chrome-overrides list" default to showing all
 registries when --tool is omitted.
 

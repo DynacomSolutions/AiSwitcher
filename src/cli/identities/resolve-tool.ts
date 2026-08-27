@@ -5,6 +5,7 @@ import {
   GROK_CONFIG,
   KIMI_CONFIG,
   PI_CONFIG,
+  OPENCODE_CONFIG,
   ZAI_CONFIG,
 } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } from "../../identities/store.ts";
@@ -20,6 +21,7 @@ export const TOOL_CONFIGS = {
   zai: ZAI_CONFIG,
   ali: ALI_CONFIG,
   pi: PI_CONFIG,
+  opencode: OPENCODE_CONFIG,
 } as const;
 
 const TOOL_NAMES = Object.keys(TOOL_CONFIGS) as Array<keyof typeof TOOL_CONFIGS>;

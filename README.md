@@ -1,6 +1,6 @@
 # AiProfileSwitcher
 
-Switch between multiple `claude` / `codex` / `grok` / `kimi` / `zai` / `ali` / `pi`
+Switch between multiple `claude` / `codex` / `grok` / `kimi` / `zai` / `ali` / `pi` / `opencode`
 identities — each with its own isolated config, auth, history, and plugins —
 without ever exporting an env var by hand. `zai` and `ali` are a bit
 different from the other five: neither is a real CLI; both are fake proxy
@@ -22,8 +22,8 @@ identity automatically, mostly based on which directory you're standing in.
 
 ## How it works
 
-Seven compiled executables, `claude`, `codex`, `grok`, `kimi`, `zai`, `ali`,
-and `pi`, install to `~/.local/bin` (ahead of the real Homebrew/`nvm` binaries
+Eight compiled executables, `claude`, `codex`, `grok`, `kimi`, `zai`, `ali`,
+`pi`, and `opencode`, install to `~/.local/bin` (ahead of the real Homebrew/`nvm` binaries
 on `PATH`; see the grok/kimi PATH caveat below, those tools' own installers
 can end up ahead of `~/.local/bin` instead; `zai`/`ali` have no such risk,
 since there's no real `zai`/`ali` binary on `PATH` to lose a race against;
@@ -35,7 +35,7 @@ forwarded untouched:
 
 ```mermaid
 flowchart TD
-    A["you run: claude / codex / grok / kimi / zai / ali / pi ..."] --> B{"--identity=&lt;name&gt;\npassed explicitly?"}
+    A["you run: claude / codex / grok / kimi / zai / ali / pi / opencode ..."] --> B{"--identity=&lt;name&gt;\npassed explicitly?"}
     B -- yes --> R[resolved]
     B -- no --> C{"identity env var\nalready set?"}
     C -- yes --> R
@@ -50,7 +50,8 @@ flowchart TD
 
 1. **`--identity=<name>`** — explicit, always wins.
 2. **Env var already set** — `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME`
-   / `KIMI_CODE_HOME` / `CRUSH_GLOBAL_CONFIG` / `PI_CODING_AGENT_DIR` inherited from a parent process
+   / `KIMI_CODE_HOME` / `CRUSH_GLOBAL_CONFIG` / `PI_CODING_AGENT_DIR` /
+   `OPENCODE_CONFIG_DIR` inherited from a parent process
    (e.g. a nested subagent session honoring its parent's identity).
 3. **Directory match** — the cwd matches a pattern in an identity's
    `directories` list in `identities.json`. Resolved silently, no prompt.
@@ -441,6 +442,34 @@ provider in `models.json`; no executable third-party Pi extension is needed.
 OAuth tokens then refresh independently inside Pi, so subsequent refreshes do
 not get copied back into the original provider CLI profile.
 
+## OpenCode
+
+`opencode` proxies the real multi-provider OpenCode CLI. OpenCode stores one
+profile across its config directory and three XDG roots, so AIS redirects
+`OPENCODE_CONFIG_DIR`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and
+`XDG_STATE_HOME` together. A single identity therefore contains config,
+credentials, model cache, state, and sessions without leaking into another
+OpenCode identity.
+
+```bash
+ais identities create --tool=opencode --name=work --label="Work"
+ais identities create --tool=opencode --name=personal --label="Personal"
+opencode --identity=work providers login
+opencode --identity=personal providers login
+opencode --identity=work models
+opencode --identity=work serve --hostname 127.0.0.1 --port 4096
+```
+
+OpenCode uses its own supported provider login flows. Do not copy Claude Code
+OAuth into OpenCode: Anthropic supports third-party clients through API keys,
+not Claude Pro/Max credentials. OpenAI and xAI offer OpenCode OAuth; Kimi For
+Coding, Z.AI Coding Plan, and Alibaba Token Plan use their product-specific
+keys. Mirror the account identities already used by the other AIS wrappers;
+never collapse credentials from unrelated account identities into one
+OpenCode profile. `run`, `acp`, and `serve` are treated as non-interactive
+invocations, so an unresolved identity fails immediately instead of opening a
+picker.
+
 ## CLI (`ais`)
 
 An eighth binary, `ais`, manages `identities.json` so you never have to
@@ -448,7 +477,7 @@ hand-edit it:
 
 ```bash
 ais version                                              # print the installed version
-ais update                                                # re-download the latest claude/codex/grok/kimi/zai/ali/pi/open/ais
+ais update                                                # re-download the latest claude/codex/grok/kimi/zai/ali/pi/opencode/open/ais
 ais upgrade                                               # install/upgrade every real CLI required by the installed AIS shims
 
 ais sync list                                             # configured SSH aliases
@@ -458,7 +487,7 @@ ais sync now [--pull-only|--push-only] [--tool=<t> --identity=<id>]
 ais sync dedupe [--dry-run] [--json]                     # local stable-session-ID merge
 ais sync recover [--dry-run] [--json]                    # restore retained pre-fix recovery archives
 
-ais identities list                                       # all registries; add --tool=claude|codex|grok|kimi|zai|ali|pi to scope
+ais identities list                                       # all registries; add --tool=claude|codex|grok|kimi|zai|ali|pi|opencode to scope
 ais identities show <name>
 ais identities create --tool=<t> [--name=] [--label=] [--description=] \
                        [--directories=a,b] [--aliases=x,y] [--api-key=]

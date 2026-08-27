@@ -31,7 +31,7 @@ export interface IdentitiesFile {
 }
 
 export interface ToolConfig {
-  toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi";
+  toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode";
   /**
    * Literal binary name resolveRealBinary() searches PATH for — identical to
    * toolName for every real wrapped CLI. "zai" and "ali" are the two
@@ -40,7 +40,7 @@ export interface ToolConfig {
    * ZAI/Z.ai provider and Alibaba Cloud Model Studio's Token plan
    * respectively (see tool-configs.ts's ZAI_CONFIG/ALI_CONFIG).
    */
-  realBinaryName: "claude" | "codex" | "grok" | "kimi" | "crush" | "pi";
+  realBinaryName: "claude" | "codex" | "grok" | "kimi" | "crush" | "pi" | "opencode";
   /**
    * The env var resolve.ts/open.ts treat as "this identity is already
    * resolved" (step (b) of resolveIdentity, and the tool-disambiguation
@@ -53,7 +53,8 @@ export interface ToolConfig {
     | "KIMI_CODE_HOME"
     | "CRUSH_GLOBAL_CONFIG"
     | "ALI_CONFIG_DIR"
-    | "PI_CODING_AGENT_DIR";
+    | "PI_CODING_AGENT_DIR"
+    | "OPENCODE_CONFIG_DIR";
   /**
    * Extra env vars for a tool whose real binary needs more than one
    * directory redirected to achieve full identity isolation. Each entry's

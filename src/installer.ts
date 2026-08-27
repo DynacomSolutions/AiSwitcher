@@ -19,6 +19,7 @@ const TOOLS = [
   { value: "zai", label: "ZAI", hint: "proxies the real `crush` CLI (github.com/charmbracelet/crush), pointed at the ZAI/Z.ai provider" },
   { value: "ali", label: "Alibaba", hint: "proxies the real `crush` CLI (github.com/charmbracelet/crush), pointed at Alibaba Cloud Model Studio's Token plan" },
   { value: "pi", label: "Pi", hint: "proxies the multi-provider `pi` coding-agent CLI" },
+  { value: "opencode", label: "OpenCode", hint: "proxies the multi-provider `opencode` coding-agent CLI" },
 ] as const;
 
 type ToolName = (typeof TOOLS)[number]["value"];

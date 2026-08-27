@@ -18,6 +18,7 @@ const MANAGED_BINARIES = [
   "zai",
   "ali",
   "pi",
+  "opencode",
   ...(process.platform === "darwin" ? ["open"] : []),
   "ais",
 ];

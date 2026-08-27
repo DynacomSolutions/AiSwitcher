@@ -50,6 +50,23 @@ export const PI_CONFIG: ToolConfig = {
   identitiesRootDir: join(homedir(), ".pi", "identities"),
 };
 
+// OpenCode spreads one profile across its bespoke config override and three
+// XDG roots. Point all four at one AIS identity directory so config, auth,
+// cache and state are isolated together. OpenCode appends its own `opencode`
+// subdirectory to the XDG roots; OPENCODE_CONFIG_DIR is used as-is.
+export const OPENCODE_CONFIG: ToolConfig = {
+  toolName: "opencode",
+  realBinaryName: "opencode",
+  envVarName: "OPENCODE_CONFIG_DIR",
+  extraEnvVarNames: [
+    { name: "XDG_DATA_HOME", subdir: "data" },
+    { name: "XDG_CACHE_HOME", subdir: "cache" },
+    { name: "XDG_STATE_HOME", subdir: "state" },
+  ],
+  identitiesJsonPath: join(homedir(), ".opencode", "identities.json"),
+  identitiesRootDir: join(homedir(), ".opencode", "identities"),
+};
+
 // "zai" is NOT a real CLI — it's a fake proxy identity name this project
 // invents for the real `crush` binary (github.com/charmbracelet/crush, npm
 // `@charmland/crush`, brew `charmbracelet/tap/crush`), a multi-provider

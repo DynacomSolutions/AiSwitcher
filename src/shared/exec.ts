@@ -36,7 +36,7 @@ const FORWARD_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"] as
 // CRUSH prefix above. Also re-applied via extraEnv after this strip, so this
 // is mostly belt-and-suspenders rather than something a real hang was ever
 // reproduced against.
-const SESSION_MARKER_PATTERN = /^(CLAUDE|CODEX|GROK|AI_AGENT|CRUSH|ALI)/i;
+const SESSION_MARKER_PATTERN = /^(CLAUDE|CODEX|GROK|AI_AGENT|CRUSH|ALI|OPENCODE_(?:SERVER_PASSWORD|SERVER_USERNAME|CLIENT))/i;
 
 /**
  * Set (by run-wrapper.ts, via execReal's extraEnv) only on the child process

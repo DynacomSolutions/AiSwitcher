@@ -8,6 +8,7 @@ import {
   GROK_CONFIG,
   KIMI_CONFIG,
   PI_CONFIG,
+  OPENCODE_CONFIG,
   ZAI_CONFIG,
 } from "./identities/tool-configs.ts";
 import { resolveRealBinary } from "./shared/resolve-binary.ts";
@@ -20,7 +21,7 @@ import { execReal, IDENTITY_SESSION_MARKER } from "./shared/exec.ts";
 // what disambiguates the two: putting ZAI_CONFIG first would make
 // `.find()` below match every ali session as a zai one, since
 // CRUSH_GLOBAL_CONFIG is present in both.
-const TOOL_CONFIGS = [CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG, ALI_CONFIG, ZAI_CONFIG];
+const TOOL_CONFIGS = [CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG, OPENCODE_CONFIG, ALI_CONFIG, ZAI_CONFIG];
 
 /**
  * Only ever intercept the single plain shape a link-opening OAuth/callback
