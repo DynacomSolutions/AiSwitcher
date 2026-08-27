@@ -7,13 +7,14 @@ import {
   GROK_CONFIG,
   KIMI_CONFIG,
   PI_CONFIG,
+  OPENCODE_CONFIG,
   ZAI_CONFIG,
 } from "../identities/tool-configs.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../shared/reproducible-paths.ts";
 import type { SyncDirection, SyncScope } from "./types.ts";
 
-export const SYNC_TOOL_CONFIGS = [CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, ZAI_CONFIG, ALI_CONFIG, PI_CONFIG];
+export const SYNC_TOOL_CONFIGS = [CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, ZAI_CONFIG, ALI_CONFIG, PI_CONFIG, OPENCODE_CONFIG];
 
 /** Every tool proxying the `crush` binary: zai and ali today. Sync code that
  * needs to treat "any crush-backed identity" uniformly (project-local

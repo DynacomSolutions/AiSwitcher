@@ -88,6 +88,13 @@ describe("detectNonInteractiveHint", () => {
     expect(detectNonInteractiveHint("pi", ["install", "npm:extension"])).toBe(true);
     expect(detectNonInteractiveHint("pi", [])).toBe(false);
   });
+
+  test("opencode: run, ACP and headless server modes are non-interactive", () => {
+    expect(detectNonInteractiveHint("opencode", ["run", "hello"])).toBe(true);
+    expect(detectNonInteractiveHint("opencode", ["acp"])).toBe(true);
+    expect(detectNonInteractiveHint("opencode", ["serve", "--port", "4096"])).toBe(true);
+    expect(detectNonInteractiveHint("opencode", ["providers", "list"])).toBe(false);
+  });
 });
 
 describe("resolveNestedIdentity", () => {
@@ -125,5 +132,10 @@ describe("resolveNestedIdentity", () => {
   test("works the same for pi as every other tool", () => {
     expect(resolveNestedIdentity("pi", "all", undefined)).toBe("all");
     expect(() => resolveNestedIdentity("pi", "all", "personal")).toThrow("active identity is 'all'");
+  });
+
+  test("works the same for opencode as every other tool", () => {
+    expect(resolveNestedIdentity("opencode", "all", undefined)).toBe("all");
+    expect(() => resolveNestedIdentity("opencode", "all", "personal")).toThrow("active identity is 'all'");
   });
 });

@@ -20,6 +20,7 @@ const BACKUP_GROUPS = {
   zai: [".zai"],
   ali: [".ali"],
   pi: [".pi"],
+  opencode: [".opencode"],
 } as const;
 
 type BackupGroup = keyof typeof BACKUP_GROUPS;

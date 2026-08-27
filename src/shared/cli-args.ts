@@ -20,7 +20,7 @@ export interface ParsedCliArgs {
  * identity-a session), not merely omitting the flag.
  */
 export function resolveNestedIdentity(
-  toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi",
+  toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode",
   parentIdentity: string | undefined,
   requestedIdentity: string | undefined,
 ): string | undefined {
@@ -97,7 +97,7 @@ export function stripOwnFlags(argv: string[]): {
  * TTY check, since TTY-ness alone can't distinguish `claude -p "..."` (still
  * a TTY, but semantically non-interactive) from a real interactive session.
  */
-export function detectNonInteractiveHint(toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi", cleanedArgv: string[]): boolean {
+export function detectNonInteractiveHint(toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode", cleanedArgv: string[]): boolean {
   if (toolName === "claude") {
     return cleanedArgv.some((a) => a === "-p" || a === "--print");
   }
@@ -136,12 +136,16 @@ export function detectNonInteractiveHint(toolName: "claude" | "codex" | "grok" |
     const firstPositional = cleanedArgv.find((a) => !a.startsWith("-"));
     return ["install", "remove", "update", "list"].includes(firstPositional ?? "");
   }
+  if (toolName === "opencode") {
+    const firstPositional = cleanedArgv.find((a) => !a.startsWith("-"));
+    return firstPositional === "run" || firstPositional === "acp" || firstPositional === "serve";
+  }
   // codex: `codex exec ...` is explicitly the non-interactive entrypoint.
   const firstPositional = cleanedArgv.find((a) => !a.startsWith("-"));
   return firstPositional === "exec";
 }
 
-export function parseCliArgs(toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi", argv: string[]): ParsedCliArgs {
+export function parseCliArgs(toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode", argv: string[]): ParsedCliArgs {
   const { identityFlag, desktopFlag, cleanedArgv } = stripOwnFlags(argv);
   return {
     identityFlag,

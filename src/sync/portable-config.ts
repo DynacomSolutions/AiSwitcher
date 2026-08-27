@@ -9,11 +9,12 @@ import {
   GROK_CONFIG,
   KIMI_CONFIG,
   PI_CONFIG,
+  OPENCODE_CONFIG,
   ZAI_CONFIG,
 } from "../identities/tool-configs.ts";
 import type { SyncScope } from "./types.ts";
 
-const PROFILE_TOOL_CONFIGS = [CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, ZAI_CONFIG, ALI_CONFIG, PI_CONFIG];
+const PROFILE_TOOL_CONFIGS = [CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, ZAI_CONFIG, ALI_CONFIG, PI_CONFIG, OPENCODE_CONFIG];
 const PROFILE_COMMAND_FILES = ["hooks.json", "settings.json"];
 const STANDARD_HOME_AT_START =
   /^(?:\/Users\/[^/\\\s"'`$;&|<>(){}\[\]]+|\/home\/[^/\\\s"'`$;&|<>(){}\[\]]+|\/root)(?=\/|[\\\s"'`$;&|<>(){}\[\]]|$)/;

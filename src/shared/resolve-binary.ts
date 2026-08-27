@@ -58,7 +58,7 @@ function safeRealpath(path: string): string | null {
  * installing our shim alone is NOT sufficient for it to actually intercept
  * `grok` invocations, unlike claude/codex.
  */
-export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "crush" | "pi" | "open"): string {
+export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "crush" | "pi" | "opencode" | "open"): string {
   const shimDirReal = safeRealpath(SHIM_DIR) ?? SHIM_DIR;
   const rawPath = process.env.PATH ?? "";
 
@@ -92,6 +92,8 @@ export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "
               ? `Run 'ais upgrade' to install the managed @charmland/crush instance.`
               : name === "pi"
                 ? `Run 'ais upgrade' to install the managed @earendil-works/pi-coding-agent instance.`
+                : name === "opencode"
+                  ? `Run 'ais upgrade' to install the managed opencode-ai instance.`
                 : `Run 'ais upgrade' to install the managed Claude Code instance.`;
     throw new BinaryResolutionError(
       `Could not locate the real '${name}' binary on PATH (after excluding our own shim dir ${SHIM_DIR}).\n${hint}`,
@@ -114,6 +116,6 @@ export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "
 }
 
 /** Resolve the .app bundle's real Mach-O binary for --desktop launches. */
-export function resolveAppBundleBinary(appName: "Claude" | "Codex" | "Grok" | "Kimi" | "Crush" | "Pi"): string {
+export function resolveAppBundleBinary(appName: "Claude" | "Codex" | "Grok" | "Kimi" | "Crush" | "Pi" | "OpenCode"): string {
   return `/Applications/${appName}.app/Contents/MacOS/${appName}`;
 }

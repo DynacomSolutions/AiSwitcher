@@ -59,9 +59,10 @@ jobs:
           bun build --compile --target=${{ matrix.target.bun }} src/zai.ts --outfile zai-${{ matrix.target.name }}
           bun build --compile --target=${{ matrix.target.bun }} src/ali.ts --outfile ali-${{ matrix.target.name }}
           bun build --compile --target=${{ matrix.target.bun }} src/pi.ts --outfile pi-${{ matrix.target.name }}
+          bun build --compile --target=${{ matrix.target.bun }} src/opencode.ts --outfile opencode-${{ matrix.target.name }}
           bun build --compile --target=${{ matrix.target.bun }} src/installer.ts --outfile install-${{ matrix.target.name }}
           bun build --compile --target=${{ matrix.target.bun }} src/ais.ts --outfile ais-${{ matrix.target.name }}
-          chmod +x claude-${{ matrix.target.name }} codex-${{ matrix.target.name }} grok-${{ matrix.target.name }} kimi-${{ matrix.target.name }} zai-${{ matrix.target.name }} ali-${{ matrix.target.name }} pi-${{ matrix.target.name }} install-${{ matrix.target.name }} ais-${{ matrix.target.name }}
+          chmod +x claude-${{ matrix.target.name }} codex-${{ matrix.target.name }} grok-${{ matrix.target.name }} kimi-${{ matrix.target.name }} zai-${{ matrix.target.name }} ali-${{ matrix.target.name }} pi-${{ matrix.target.name }} opencode-${{ matrix.target.name }} install-${{ matrix.target.name }} ais-${{ matrix.target.name }}
           case "${{ matrix.target.name }}" in
             darwin-*)
               bun build --compile --target=${{ matrix.target.bun }} src/open.ts --outfile open-${{ matrix.target.name }}
@@ -81,6 +82,7 @@ jobs:
             zai-${{ matrix.target.name }}
             ali-${{ matrix.target.name }}
             pi-${{ matrix.target.name }}
+            opencode-${{ matrix.target.name }}
             open-${{ matrix.target.name }}
             install-${{ matrix.target.name }}
             ais-${{ matrix.target.name }}
