@@ -1,6 +1,6 @@
 # AiProfileSwitcher
 
-Thin wrapper executables (`claude`, `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`) that
+Thin wrapper executables (`claude`, `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `opencode`) that
 shadow the real Claude Code / Codex / Grok / Kimi Code / Pi CLIs on `PATH` (`zai`
 and `ali` are the two exceptions, see below) and let you switch between
 multiple isolated "identities" (each with its own config/auth directory) via
@@ -59,9 +59,12 @@ src/
                           resets a database still owned by a live process
     launch-desktop.ts       best-effort --desktop launch (see below); also mirrors
                           extraEnvVarNames for tools (zai) that need more than one
-    run-wrapper.ts          wires the above together; shared by all seven proxy entrypoints;
+    run-wrapper.ts          wires the above together; shared by all eight proxy entrypoints;
                           also mirrors ToolConfig.extraEnvVarNames onto the spawned
                           child alongside the primary envVarName
+    global-memory.ts       owns `~/.ais/memory/GLOBAL.md` and projects it through each
+                          tool's mandatory native memory channel without creating a
+                          second writable store
   sync/                SSH/rsync profile and usage-data synchronisation — machine-local
                          remote config, portable ~/ registries, staged additive exchange,
                          inter-process lock, and debounced/final reconciliation
@@ -203,6 +206,16 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   most-specific (longest) pattern wins; an exact match always outranks a
   recursive match anchored at the same directory; a true tie between two
   *different* identities falls through to the interactive prompt.
+- **Global memory belongs to AIS, never a vendor identity or the AIS git
+  repository.** `~/.ais/memory/GLOBAL.md` is the sole writable authority and
+  is deliberately outside every SSH profile-sync root and git-managed backup
+  group. `run-wrapper.ts` projects it at launch through the mandatory
+  `ToolConfig.globalMemoryProjection`: Claude append-system-prompt file,
+  Codex developer instructions, Grok rules, Kimi global AGENTS discovery, Pi
+  append-system-prompt file, OpenCode runtime config content, or Crush global
+  context paths. Any vendor file or config entry created for compatibility is
+  a projection only. `ais memory add` is the cross-agent write API. Adding a
+  tool without declaring a projection is a type error.
 - **No `execve`-style process replacement.** Bun has no non-experimental
   primitive for true process-image replacement, so `src/shared/exec.ts` uses
   `Bun.spawn` with full fd inheritance (`stdio: ["inherit","inherit","inherit"]`)
@@ -940,7 +953,8 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
 ## Adding another wrapped tool later
 
 1. Add a new `ToolConfig` (toolName, realBinaryName, envVarName,
-   identitiesJsonPath, identitiesRootDir) in a new entrypoint file, following
+   globalMemoryProjection, identitiesJsonPath, identitiesRootDir) in a new
+   entrypoint file, following
    `src/claude.ts`/`src/codex.ts`/`src/grok.ts`. `realBinaryName` is usually
    just `toolName` again — it's a separate field only because a wrapper's own
    name doesn't have to match the real CLI it proxies (see the "zai case

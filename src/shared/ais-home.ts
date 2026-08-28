@@ -47,6 +47,13 @@ export function aisConfigDir(home: string = homedir()): string {
   return join(aisHome(home), "config");
 }
 
+/** Canonical, machine-local memory shared by every AIS-managed agent and
+ * identity. It is outside every vendor profile, SSH sync tree, and backup
+ * group. Vendor files are projections, never the authority. */
+export function aisGlobalMemoryPath(home: string = homedir()): string {
+  return join(aisHome(home), "memory", "GLOBAL.md");
+}
+
 /** Explicit corrections for sessions whose immutable transcript metadata was
  * created from the wrong working directory. Kept outside the transcript so a
  * live writer never has its open rollout file replaced underneath it. */

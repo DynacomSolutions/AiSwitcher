@@ -10,10 +10,11 @@ import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sy
 import { startProfileSyncWatcher } from "../sync/watch.ts";
 import { migrateLegacyAisHome } from "./migrate-ais-home.ts";
 import { codexPlatformArgs } from "./codex-platform-config.ts";
+import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 
 export async function runWrapper(
   cfg: ToolConfig,
-  appName: "Claude" | "Codex" | "Grok" | "Kimi" | "Crush" | "Pi",
+  appName: "Claude" | "Codex" | "Grok" | "Kimi" | "Crush" | "Pi" | "OpenCode",
   beforeLaunch?: (configDir: string) => Promise<unknown>,
 ): Promise<void> {
   try {
@@ -70,13 +71,19 @@ export async function runWrapper(
           process.cwd(),
         )
       : undefined;
-    const launchArgs = cfg.toolName === "codex"
+    const platformArgs = cfg.toolName === "codex"
       ? codexPlatformArgs(resolved.configDirValue, parsed.cleanedArgv)
       : parsed.cleanedArgv;
+    const memoryProjection = await projectGlobalMemoryForLaunch(
+      cfg,
+      resolved.configDirValue,
+      platformArgs,
+    );
     const launch = () =>
-      spawnReal(realBinary, launchArgs, {
+      spawnReal(realBinary, memoryProjection.argv, {
         [cfg.envVarName]: resolved.configDirValue,
         ...extraEnv,
+        ...memoryProjection.env,
         [IDENTITY_SESSION_MARKER]: activeIdentity,
       });
     // The real agent is spawned before the detached sync worker. Nothing in

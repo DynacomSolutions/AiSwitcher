@@ -3,7 +3,7 @@
 Switch between multiple `claude` / `codex` / `grok` / `kimi` / `zai` / `ali` / `pi` / `opencode`
 identities — each with its own isolated config, auth, history, and plugins —
 without ever exporting an env var by hand. `zai` and `ali` are a bit
-different from the other five: neither is a real CLI; both are fake proxy
+different from the other six: neither is a real CLI; both are fake proxy
 names this project invents for the REAL `crush` binary (a multi-provider
 terminal coding agent by Charm), `zai` pointed at the ZAI/Z.ai provider so it
 runs real GLM models (see "ZAI" below), `ali` pointed at Alibaba Cloud Model
@@ -76,6 +76,30 @@ No `execve`-style replacement — Bun has no stable primitive for that — so th
 wrapper uses `Bun.spawn` with full fd inheritance and explicit signal relay
 (`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGTSTP`), mirroring the child's exit
 code. This is the same model `nvm`/`asdf`/`direnv` shims use.
+
+## Global memory
+
+AIS owns one machine-local memory file at `~/.ais/memory/GLOBAL.md`. It is
+shared across every identity and every managed agent. It is deliberately
+outside the AIS source repository, every vendor profile, the SSH profile-sync
+roots, and the git-managed profile backup, so its contents are never pushed or
+copied as identity state.
+
+At launch, the wrapper projects that one file through each tool's supported
+native instruction channel: Claude's appended system-prompt file, Codex's
+additional developer instructions, Grok's rules, Kimi's global `AGENTS.md`
+discovery, Pi's appended system prompt, OpenCode's runtime `instructions`
+configuration, and Crush's global context paths for both `zai` and `ali`.
+Those integrations are disposable views. The AIS file remains the only
+writable authority.
+
+```bash
+ais memory show
+ais memory path
+ais memory edit
+ais memory add "- Durable fact"
+printf '%s\n' '## Durable context' '- A multiline fact' | ais memory add --stdin
+```
 
 Codex state-DB backfills also self-heal before launch. Codex can leave
 `backfill_state.status='running'` behind after its worker exits, then reject
@@ -504,6 +528,12 @@ ais identities chrome-overrides add --tool=<t> --directories=a,b --target-identi
 ais identities chrome-overrides remove --tool=<t> <index>
 
 ais auth import <pi-id> --tool=pi --claude=<id> --codex=<id> --grok=<id> --kimi=<id> --zai=<id> --ali=<id> [--opencode-go]
+
+ais memory show                                           # read shared machine-local memory
+ais memory path                                           # print the canonical file path
+ais memory edit                                           # edit with $VISUAL or $EDITOR
+ais memory add <text...>                                  # append one durable entry
+ais memory add --stdin                                    # append multiline Markdown from stdin
 
 ais usage                                                 # token usage & cost, every identity/provider
 ais usage --identity=<name>                               # scope to one identity (all tools it's configured for)

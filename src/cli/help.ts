@@ -22,6 +22,7 @@ const COMMANDS: Array<[string, string]> = [
   ["limits [identity] [--tool=] [--json|--watch|--cached]", "Live 5h/weekly/monthly rate-limit usage per identity"],
   ["auth login|refresh|enable <identity> --tool=ali", "SSH-only interactive auth browser and 10-minute cookie renewal"],
   ["auth import <pi-id> --tool=pi --claude=<id> ...", "Merge provider credentials into one Pi identity"],
+  ["memory [show|path|init|edit|add] [--stdin]", "Machine-local memory shared by every AIS agent and identity"],
   ["doctor [--identity=] [--tool=] [--json]", "Live responsiveness probe per identity — catches a hung/stuck identity"],
   ["resume [session-id] [--identity=] [--tool=] [--json]", "Interactive tree picker (or direct launch) for resumable sessions"],
   ["help", "Show this message"],

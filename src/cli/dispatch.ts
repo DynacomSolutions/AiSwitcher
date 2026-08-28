@@ -14,6 +14,7 @@ import { runSyncCommand } from "./sync/dispatch.ts";
 import { startBackgroundProfileSync } from "../sync/background.ts";
 import { migrateLegacyAisHome } from "../shared/migrate-ais-home.ts";
 import { runAuthCommand } from "./auth/dispatch.ts";
+import { runMemoryCommand } from "./memory.ts";
 
 export async function runCli(argv: string[]): Promise<void> {
   const { positionals, flags } = parseArgs(argv);
@@ -77,6 +78,9 @@ export async function runCli(argv: string[]): Promise<void> {
         return await runSyncCommand(rest, flags);
       case "auth":
         await runAuthCommand(rest, flags);
+        break;
+      case "memory":
+        await runMemoryCommand(rest, flags);
         break;
       default:
         throw new CliUsageError(`Unknown command "${command}". Run "ais help" for usage.`);

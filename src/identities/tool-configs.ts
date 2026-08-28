@@ -6,6 +6,7 @@ export const CLAUDE_CONFIG: ToolConfig = {
   toolName: "claude",
   realBinaryName: "claude",
   envVarName: "CLAUDE_CONFIG_DIR",
+  globalMemoryProjection: "claude-append-file",
   identitiesJsonPath: join(homedir(), ".claude", "identities.json"),
   identitiesRootDir: join(homedir(), ".claude", "identities"),
 };
@@ -14,6 +15,7 @@ export const CODEX_CONFIG: ToolConfig = {
   toolName: "codex",
   realBinaryName: "codex",
   envVarName: "CODEX_HOME",
+  globalMemoryProjection: "codex-developer-instructions",
   identitiesJsonPath: join(homedir(), ".codex", "identities.json"),
   identitiesRootDir: join(homedir(), ".codex", "identities"),
 };
@@ -22,6 +24,7 @@ export const GROK_CONFIG: ToolConfig = {
   toolName: "grok",
   realBinaryName: "grok",
   envVarName: "GROK_HOME",
+  globalMemoryProjection: "grok-rules",
   identitiesJsonPath: join(homedir(), ".grok", "identities.json"),
   identitiesRootDir: join(homedir(), ".grok", "identities"),
 };
@@ -33,6 +36,7 @@ export const KIMI_CONFIG: ToolConfig = {
   toolName: "kimi",
   realBinaryName: "kimi",
   envVarName: "KIMI_CODE_HOME",
+  globalMemoryProjection: "kimi-global-agents",
   identitiesJsonPath: join(homedir(), ".kimi-code", "identities.json"),
   identitiesRootDir: join(homedir(), ".kimi-code", "identities"),
 };
@@ -46,6 +50,7 @@ export const PI_CONFIG: ToolConfig = {
   toolName: "pi",
   realBinaryName: "pi",
   envVarName: "PI_CODING_AGENT_DIR",
+  globalMemoryProjection: "pi-append-file",
   identitiesJsonPath: join(homedir(), ".pi", "identities.json"),
   identitiesRootDir: join(homedir(), ".pi", "identities"),
 };
@@ -58,6 +63,7 @@ export const OPENCODE_CONFIG: ToolConfig = {
   toolName: "opencode",
   realBinaryName: "opencode",
   envVarName: "OPENCODE_CONFIG_DIR",
+  globalMemoryProjection: "opencode-config-content",
   extraEnvVarNames: [
     { name: "XDG_DATA_HOME", subdir: "data" },
     { name: "XDG_CACHE_HOME", subdir: "cache" },
@@ -121,6 +127,7 @@ export const ZAI_CONFIG: ToolConfig = {
   toolName: "zai",
   realBinaryName: "crush",
   envVarName: "CRUSH_GLOBAL_CONFIG",
+  globalMemoryProjection: "crush-global-context",
   extraEnvVarNames: [{ name: "CRUSH_GLOBAL_DATA", subdir: "data" }],
   identitiesJsonPath: join(homedir(), ".zai", "identities.json"),
   identitiesRootDir: join(homedir(), ".zai", "identities"),
@@ -164,6 +171,7 @@ export const ALI_CONFIG: ToolConfig = {
   toolName: "ali",
   realBinaryName: "crush",
   envVarName: "ALI_CONFIG_DIR",
+  globalMemoryProjection: "crush-global-context",
   extraEnvVarNames: [{ name: "CRUSH_GLOBAL_CONFIG" }, { name: "CRUSH_GLOBAL_DATA", subdir: "data" }],
   identitiesJsonPath: join(homedir(), ".ali", "identities.json"),
   identitiesRootDir: join(homedir(), ".ali", "identities"),

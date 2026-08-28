@@ -73,6 +73,16 @@ export interface ToolConfig {
    * non-overlapping paths.
    */
   extraEnvVarNames?: Array<{ name: string; subdir?: string }>;
+  /** Native channel used to project AIS's machine-local global memory into
+   * this tool. Mandatory so future wrappers cannot silently omit it. */
+  globalMemoryProjection:
+    | "claude-append-file"
+    | "codex-developer-instructions"
+    | "grok-rules"
+    | "kimi-global-agents"
+    | "pi-append-file"
+    | "opencode-config-content"
+    | "crush-global-context";
   identitiesJsonPath: string;
   identitiesRootDir: string;
 }
