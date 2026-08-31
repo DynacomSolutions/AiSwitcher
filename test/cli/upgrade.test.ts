@@ -56,6 +56,11 @@ describe("UPGRADE_SPECS", () => {
     expect(pi.npmPackage).toBe("@earendil-works/pi-coding-agent");
     expect(pi.installer).toBe("npm");
   });
+
+  test("allows OpenCode's postinstall script to select its platform binary", () => {
+    const opencode = oneSpec("opencode");
+    expect(opencode.allowedScriptPackages).toEqual(["opencode-ai"]);
+  });
 });
 
 describe("helpListsUpdater", () => {

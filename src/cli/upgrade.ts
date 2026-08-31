@@ -93,6 +93,7 @@ export const UPGRADE_SPECS: UpgradeSpec[] = [
   {
     cfg: OPENCODE_CONFIG,
     npmPackage: "opencode-ai",
+    allowedScriptPackages: ["opencode-ai"],
     nativeUpdateArgs: ["upgrade"],
     installer: "npm",
   },
