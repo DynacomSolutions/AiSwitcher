@@ -72,13 +72,9 @@ export const UPGRADE_SPECS: UpgradeSpec[] = [
     allowedScriptPackages: ["@charmland/crush"],
     installer: "npm",
   },
-  // ali proxies the SAME real binary as zai (crush) and needs the identical
-  // npm package; running `installNpmTool` twice for the same package when
-  // both shims are installed is idempotent (npm install --global against an
-  // already-current package is a fast no-op), so this is a deliberate,
-  // accepted doubled install rather than something worth deduplicating: the
-  // per-tool loop shape in runUpgradeWithDeps below stays simple and uniform
-  // across every spec instead of needing a special "shared installer" case.
+  // ali remains a separate shim/spec, but shares this physical installer
+  // with zai. runUpgradeWithDeps caches an identical installer result so npm
+  // never reruns Crush's network-bound postinstall in the same upgrade.
   {
     cfg: ALI_CONFIG,
     npmPackage: "@charmland/crush",
@@ -117,6 +113,11 @@ export interface UpgradeSummary {
   skipped: number;
 }
 
+interface SharedInstallerResult {
+  toolName: string;
+  ok: boolean;
+}
+
 function stripAnsi(value: string): string {
   return value.replace(/\x1b\[[0-9;]*m/g, "");
 }
@@ -136,6 +137,19 @@ export function helpListsUpdater(help: string, command: string): boolean {
 
 export function isOfficialXaiGrokHelp(help: string): boolean {
   return stripAnsi(help).includes("Grok Build TUI");
+}
+
+function sharedInstallerKey(spec: UpgradeSpec): string | undefined {
+  if (spec.installer !== "npm" || !spec.npmPackage) return undefined;
+
+  // Include every field that changes installation or fallback behaviour.
+  // Only genuinely interchangeable specs (currently zai and ali) coalesce.
+  return [
+    spec.npmPackage,
+    spec.cfg.realBinaryName,
+    spec.allowedScriptPackages?.join(",") ?? "",
+    spec.nativeUpdateArgs?.join(",") ?? "",
+  ].join("\0");
 }
 
 async function defaultInstallGrok(): Promise<number> {
@@ -277,6 +291,7 @@ export async function runUpgradeWithDeps(
 ): Promise<UpgradeSummary> {
   const prefix = dim("ais upgrade:");
   const summary: UpgradeSummary = { checked: 0, failed: 0, skipped: 0 };
+  const sharedInstallerResults = new Map<string, SharedInstallerResult>();
 
   for (const spec of specs) {
     const name = spec.cfg.toolName;
@@ -286,11 +301,26 @@ export async function runUpgradeWithDeps(
       continue;
     }
 
+    const installerKey = sharedInstallerKey(spec);
+    const sharedResult = installerKey ? sharedInstallerResults.get(installerKey) : undefined;
+    if (sharedResult) {
+      const packageSpec = `${spec.npmPackage}@latest`;
+      deps.log(
+        sharedResult.ok
+          ? `${prefix} ${name} shares ${cyan(packageSpec)} with ${sharedResult.toolName}; already installed/upgraded`
+          : `${prefix} ${red(
+              `${name} shares ${packageSpec} with ${sharedResult.toolName}; the shared installer already failed`,
+            )}`,
+      );
+      continue;
+    }
+
     try {
       const ok =
         spec.installer === "npm"
           ? await installNpmTool(spec, deps, prefix)
           : await installOrUpgradeGrok(spec, deps, prefix);
+      if (installerKey) sharedInstallerResults.set(installerKey, { toolName: name, ok });
       if (ok) summary.checked++;
       else {
         summary.failed++;
@@ -299,6 +329,9 @@ export async function runUpgradeWithDeps(
     } catch (err) {
       summary.failed++;
       const message = err instanceof Error ? err.message : String(err);
+      if (installerKey) {
+        sharedInstallerResults.set(installerKey, { toolName: name, ok: false });
+      }
       deps.log(`${prefix} ${red(`${name} install/upgrade failed: ${message}`)}`);
     }
   }
