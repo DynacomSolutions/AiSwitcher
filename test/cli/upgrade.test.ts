@@ -43,7 +43,7 @@ function fakeDeps(overrides: Partial<UpgradeDeps> = {}) {
 }
 
 describe("UPGRADE_SPECS", () => {
-  test("ali gets its own spec, sharing the same @charmland/crush npm package as zai", () => {
+  test("ali gets its own spec with the same physical installer as zai", () => {
     const zai = oneSpec("zai");
     const ali = oneSpec("ali");
     expect(ali.npmPackage).toBe("@charmland/crush");
@@ -234,6 +234,47 @@ describe("runUpgradeWithDeps", () => {
     expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
     expect(spawns[0]?.args.at(-1)).toBe("@charmland/crush@latest");
     expect(spawns[0]?.args).toContain("--allow-scripts=@charmland/crush");
+  });
+
+  test("installs the shared Crush CLI only once for zai and ali", async () => {
+    const { deps, spawns, logs } = fakeDeps();
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("zai"), oneSpec("ali")]);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]?.args.at(-1)).toBe("@charmland/crush@latest");
+    expect(logs.some((line) => line.includes("ali shares") && line.includes("already installed/upgraded"))).toBe(
+      true,
+    );
+  });
+
+  test("reports a failed shared Crush installer only once", async () => {
+    let spawnCount = 0;
+    const { deps, logs } = fakeDeps({
+      spawn: async () => {
+        spawnCount++;
+        return 1;
+      },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("zai"), oneSpec("ali")]);
+
+    expect(summary).toEqual({ checked: 0, failed: 1, skipped: 0 });
+    expect(spawnCount).toBe(1);
+    expect(logs.some((line) => line.includes("ali shares") && line.includes("already failed"))).toBe(true);
+  });
+
+  test("installs Crush for ali when the zai shim is absent", async () => {
+    const { deps, spawns } = fakeDeps({
+      shimExists: async (toolName) => toolName === "ali",
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("zai"), oneSpec("ali")]);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 1 });
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]?.args.at(-1)).toBe("@charmland/crush@latest");
   });
 
   test("allows only Kimi's known install-script packages", async () => {

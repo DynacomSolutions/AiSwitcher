@@ -2139,17 +2139,17 @@ provider's models.
   handlers already call the now-generalized `createCrushSnapshotTree`/
   `mergeCrushSnapshotTree` with no args, so ali's databases participate
   automatically.
-- **`ais upgrade`'s `UPGRADE_SPECS` gets its own `ALI_CONFIG` entry, not a
-  shared/deduplicated one with zai's.** Both point at the identical
-  `@charmland/crush` npm package, so when both `zai` and `ali` shims are
-  installed on one machine, `ais upgrade` runs `npm install --global
-  --prefix ... @charmland/crush@latest` twice in a row. This is a
-  deliberate, accepted doubled call, not a bug: the second run is a fast,
-  idempotent no-op (npm treats "install the version already installed" as
-  cheap), and keeping the per-spec loop in `runUpgradeWithDeps` uniform
-  across every tool avoids introducing a "shared installer" special case
-  for what is, from AIS's own registry's point of view, still two distinct
-  proxy identities with two distinct shims.
+- **`ais upgrade` keeps distinct `ZAI_CONFIG` and `ALI_CONFIG` specs, but
+  deduplicates their identical physical installer.** Both point at
+  `@charmland/crush` and the same real `crush` binary. A real upgrade showed
+  why two supposedly idempotent npm calls are unsafe: the first installed
+  Crush successfully, then the second reran Crush's network-bound
+  postinstall and failed on a transient GitHub DNS lookup, turning a
+  successful upgrade into an overall failure. `runUpgradeWithDeps` therefore
+  caches results by npm package, real binary, script allowlist, and fallback
+  arguments. Both installed shims are still detected independently, but one
+  physical installer is attempted and counted once; if only one alias is
+  installed, that alias still triggers the install normally.
 - **Model list is static/fallback metadata, not independently verified
   per-model figures.** Costs are 0 (plan-included, same convention as
   zai's own `glm-5.2` entry) and context windows/max-tokens are reasonable

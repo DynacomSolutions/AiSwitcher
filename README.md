@@ -655,8 +655,8 @@ you trust to hold those credentials.
 
 `ais upgrade` treats an installed AIS shim as the declaration that its real
 CLI should exist. It installs/upgrades Claude Code, Codex, Kimi Code, and
-Crush (the real CLI behind `zai`) in AIS's user-owned npm prefix at
-`~/.ais/npm`, and installs Grok with xAI's official release
+Crush (the real CLI shared by `zai` and `ali`) in AIS's user-owned npm prefix
+at `~/.ais/npm`, and installs Grok with xAI's official release
 installer. The wrappers prefer those managed
 binaries immediately, even in an already-open shell. Native self-updaters are
 only a fallback and are invoked only when the installed CLI explicitly lists
@@ -664,7 +664,8 @@ the subcommand in `--help`; this prevents old Codex versions from interpreting
 the word `update` as a chat prompt. npm install scripts are enabled only for
 the known packages that require them, rather than through npm's broad
 allow-all switch. `ais update` remains separate: it updates the AIS wrapper
-binaries themselves.
+binaries themselves. When multiple shims share an identical physical
+installer, `ais upgrade` runs it once and reuses that result for each alias.
 
 `claude`'s, `codex`'s, `grok`'s, `kimi`'s, `zai`'s, and `ali`'s `identities.json`
 are independent registries, so `--tool=claude|codex|grok|kimi|zai|ali|pi` is always
