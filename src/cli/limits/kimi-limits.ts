@@ -2,7 +2,7 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { categorizeByMinutes } from "./bucket.ts";
-import type { LimitCategory, LimitWindow, OverageInfo, ToolLimitResult } from "./types.ts";
+import type { LimitCategory, LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
 
 const USAGES_URL = "https://api.kimi.com/coding/v1/usages";
 const TOKEN_URL = "https://auth.kimi.com/api/oauth/token";
@@ -201,16 +201,30 @@ export function windowsFromUsagesResponse(resp: KimiUsagesResponseWire): LimitWi
   return windows;
 }
 
+/** The credential material the live usages read needs. The kimi tool's own
+ * fetcher reads it from `<configDir>/credentials/kimi-code.json`; the pi
+ * adapter maps its own auth.json OAuth entry onto this same shape (Pi stores
+ * `access`/`refresh`/`expires`-in-ms for the same Kimi OAuth account). */
+export interface KimiOAuthCredentials {
+  access_token: string;
+  refresh_token?: string;
+  /** Unix seconds. */
+  expires_at?: number;
+}
+
 /** The same refresh-and-persist the kimi CLI itself performs on launch and
  * tokscale performs on read (cross-checked against tokscale's kimi quota
  * fetcher, crates/tokscale-cli/src/commands/usage/kimi.rs): without it, any
  * identity whose token expired since its last real `kimi` run would make
- * this live read permanently dead weight. On success the new access_token /
- * refresh_token / expires_at (now + expires_in) are written back into the
- * credentials file — all other keys preserved — atomically (temp file in the
- * same directory + rename, so a crash mid-write can't leave a truncated
- * credentials file) and with the file's original 0600 mode. */
-async function refreshAccessToken(credentialsPath: string, credentials: CredentialsFile): Promise<string> {
+ * this live read permanently dead weight. On success the refreshed
+ * credentials are handed to `persist` — the kimi tool's fetcher persists
+ * them back into its credentials file (all other keys preserved, atomic
+ * temp-file rename, original 0600 mode); the pi adapter writes them back
+ * into its own auth.json entry the same way. */
+async function refreshCredentials(
+  credentials: KimiOAuthCredentials,
+  persist: (next: KimiOAuthCredentials) => Promise<void>,
+): Promise<KimiOAuthCredentials> {
   const response = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
@@ -225,7 +239,7 @@ async function refreshAccessToken(credentialsPath: string, credentials: Credenti
   const body = (await response.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
   if (!body.access_token) throw new Error("token refresh returned no access_token");
 
-  const next: CredentialsFile = {
+  const next: KimiOAuthCredentials = {
     ...credentials,
     access_token: body.access_token,
     // Not every provider rotates refresh tokens — keep the old one when the
@@ -233,14 +247,104 @@ async function refreshAccessToken(credentialsPath: string, credentials: Credenti
     ...(body.refresh_token ? { refresh_token: body.refresh_token } : {}),
     ...(typeof body.expires_in === "number" ? { expires_at: Math.floor(Date.now() / 1000) + body.expires_in } : {}),
   };
-  const tempPath = `${credentialsPath}.tmp-${process.pid}`;
-  await writeFile(tempPath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-  await rename(tempPath, credentialsPath);
-  return body.access_token;
+  await persist(next);
+  return next;
 }
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+export interface KimiUsageOutcome {
+  windows?: LimitWindow[];
+  overage?: OverageInfo;
+  error?: string;
+}
+
+/** The live usages read for one Kimi OAuth credential — shared by the kimi
+ * tool's own fetcher and the pi adapter (both hold the same account's
+ * token/refresh pair, just in each client's own store format). Auth
+ * handling: a token expiring within EXPIRY_SKEW_SECONDS is refreshed
+ * proactively, and a 401/403 triggers one refresh + retry when a
+ * refresh_token exists. Anything still rejected after that is reported as
+ * needing re-authentication, not retried further. `persist` is only invoked
+ * when a refresh actually produced new credentials. */
+export async function fetchKimiUsageForCredentials(
+  credentials: KimiOAuthCredentials,
+  persist: (next: KimiOAuthCredentials) => Promise<void>,
+): Promise<KimiUsageOutcome> {
+  let accessToken = credentials.access_token;
+  let refreshAttempted = false;
+  let refreshError: string | undefined;
+
+  const secondsUntilExpiry =
+    credentials.expires_at === undefined ? Number.POSITIVE_INFINITY : credentials.expires_at - Date.now() / 1000;
+  if (secondsUntilExpiry <= EXPIRY_SKEW_SECONDS && credentials.refresh_token) {
+    refreshAttempted = true;
+    try {
+      accessToken = (await refreshCredentials(credentials, persist)).access_token;
+    } catch (err) {
+      // Fall through with the existing token: within the skew window it can
+      // still be technically valid, and the GET below is the authoritative
+      // check (a network failure here would sink the GET anyway).
+      refreshError = errorMessage(err);
+    }
+  }
+
+  const fetchUsages = (token: string) =>
+    fetch(USAGES_URL, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+
+  let response: Response;
+  try {
+    response = await fetchUsages(accessToken);
+  } catch (err) {
+    return { error: `usage fetch failed: ${errorMessage(err)}` };
+  }
+
+  if ((response.status === 401 || response.status === 403) && credentials.refresh_token && !refreshAttempted) {
+    refreshAttempted = true;
+    try {
+      accessToken = (await refreshCredentials(credentials, persist)).access_token;
+    } catch (err) {
+      refreshError = errorMessage(err);
+    }
+    if (refreshError === undefined) {
+      try {
+        response = await fetchUsages(accessToken);
+      } catch (err) {
+        return { error: `usage fetch failed after token refresh: ${errorMessage(err)}` };
+      }
+    }
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return {
+      error:
+        `authentication rejected (HTTP ${response.status})` +
+        (refreshError ? `; token refresh also failed: ${refreshError}` : "") +
+        " — re-authenticate by running `kimi` under this identity",
+    };
+  }
+  if (!response.ok) {
+    return { error: `usage fetch failed (HTTP ${response.status})` };
+  }
+
+  let payload: KimiUsagesResponseWire;
+  try {
+    payload = (await response.json()) as KimiUsagesResponseWire;
+  } catch (err) {
+    return { error: `could not parse usage response: ${errorMessage(err)}` };
+  }
+
+  const windows = windowsFromUsagesResponse(payload);
+  if (windows.length === 0) {
+    return { error: "kimi reported no quota windows" };
+  }
+  const overage = overageFromBoosterWallet(payload.boosterWallet);
+  return { windows, ...(overage ? { overage } : {}) };
 }
 
 /**
@@ -255,15 +359,9 @@ function errorMessage(err: unknown): string {
  *   STRINGS, and each window carries its own `resetTime`.
  * - top-level `usage`: the weekly quota (resetTime exactly 7 days out),
  *   reported separately from `limits[]`.
- *
- * Auth handling: a token expiring within EXPIRY_SKEW_SECONDS is refreshed
- * proactively (same refresh-and-persist the kimi CLI itself performs on
- * launch — see refreshAccessToken), and a 401/403 triggers one refresh +
- * retry when a refresh_token exists. Anything still rejected after that is
- * reported as needing re-authentication, not retried further.
  */
-export async function fetchKimiLimits(identity: Identity): Promise<ToolLimitResult> {
-  const base: Pick<ToolLimitResult, "toolName" | "identity"> = { toolName: "kimi", identity };
+export async function fetchKimiLimits(identity: Identity): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "kimi", identity };
   const credentialsPath = join(identity.configDir, "credentials", "kimi-code.json");
 
   let credentials: CredentialsFile;
@@ -292,84 +390,29 @@ export async function fetchKimiLimits(identity: Identity): Promise<ToolLimitResu
     };
   }
 
-  let accessToken = credentials.access_token;
-  let refreshAttempted = false;
-  let refreshError: string | undefined;
+  /** Same atomic write the refresh flow has always used: temp file in the
+   * same directory + rename, so a crash mid-write can't leave a truncated
+   * credentials file, with the file's original 0600 mode. Unknown keys in
+   * the file are preserved verbatim across the round-trip. */
+  const persist = async (next: KimiOAuthCredentials): Promise<void> => {
+    const merged: CredentialsFile = { ...credentials, ...next };
+    const tempPath = `${credentialsPath}.tmp-${process.pid}`;
+    await writeFile(tempPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+    await rename(tempPath, credentialsPath);
+  };
 
-  const secondsUntilExpiry =
-    credentials.expires_at === undefined ? Number.POSITIVE_INFINITY : credentials.expires_at - Date.now() / 1000;
-  if (secondsUntilExpiry <= EXPIRY_SKEW_SECONDS && credentials.refresh_token) {
-    refreshAttempted = true;
-    try {
-      accessToken = await refreshAccessToken(credentialsPath, credentials);
-    } catch (err) {
-      // Fall through with the existing token: within the skew window it can
-      // still be technically valid, and the GET below is the authoritative
-      // check (a network failure here would sink the GET anyway).
-      refreshError = errorMessage(err);
-    }
+  const outcome = await fetchKimiUsageForCredentials(
+    { access_token: credentials.access_token, refresh_token: credentials.refresh_token, expires_at: credentials.expires_at },
+    persist,
+  );
+  if (outcome.error || !outcome.windows) {
+    return { ...base, windows: [], status: "unavailable", error: outcome.error };
   }
-
-  const fetchUsages = (token: string) =>
-    fetch(USAGES_URL, {
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-
-  let response: Response;
-  try {
-    response = await fetchUsages(accessToken);
-  } catch (err) {
-    return { ...base, windows: [], status: "unavailable", error: `usage fetch failed: ${errorMessage(err)}` };
-  }
-
-  if ((response.status === 401 || response.status === 403) && credentials.refresh_token && !refreshAttempted) {
-    refreshAttempted = true;
-    try {
-      accessToken = await refreshAccessToken(credentialsPath, credentials);
-    } catch (err) {
-      refreshError = errorMessage(err);
-    }
-    if (refreshError === undefined) {
-      try {
-        response = await fetchUsages(accessToken);
-      } catch (err) {
-        return {
-          ...base,
-          windows: [],
-          status: "unavailable",
-          error: `usage fetch failed after token refresh: ${errorMessage(err)}`,
-        };
-      }
-    }
-  }
-
-  if (response.status === 401 || response.status === 403) {
-    return {
-      ...base,
-      windows: [],
-      status: "unavailable",
-      error:
-        `authentication rejected (HTTP ${response.status})` +
-        (refreshError ? `; token refresh also failed: ${refreshError}` : "") +
-        " — re-authenticate by running `kimi` under this identity",
-    };
-  }
-  if (!response.ok) {
-    return { ...base, windows: [], status: "unavailable", error: `usage fetch failed (HTTP ${response.status})` };
-  }
-
-  let payload: KimiUsagesResponseWire;
-  try {
-    payload = (await response.json()) as KimiUsagesResponseWire;
-  } catch (err) {
-    return { ...base, windows: [], status: "unavailable", error: `could not parse usage response: ${errorMessage(err)}` };
-  }
-
-  const windows = windowsFromUsagesResponse(payload);
-  if (windows.length === 0) {
-    return { ...base, windows: [], status: "unavailable", error: "kimi reported no quota windows" };
-  }
-  const overage = overageFromBoosterWallet(payload.boosterWallet);
-  return { ...base, windows, status: "live", capturedAt: new Date().toISOString(), ...(overage ? { overage } : {}) };
+  return {
+    ...base,
+    windows: outcome.windows,
+    status: "live",
+    capturedAt: new Date().toISOString(),
+    ...(outcome.overage ? { overage: outcome.overage } : {}),
+  };
 }

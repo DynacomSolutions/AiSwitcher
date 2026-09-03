@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { expandPath } from "../../identities/match.ts";
-import type { LimitCategory, LimitWindow, ToolLimitResult } from "./types.ts";
+import type { LimitCategory, LimitWindow, FetchedLimitResult } from "./types.ts";
 
 /**
  * Alibaba Cloud Model Studio's Token plan has NO quota/usage endpoint that
@@ -122,7 +122,7 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function unavailable(base: Pick<ToolLimitResult, "toolName" | "identity">, error: string): ToolLimitResult {
+function unavailable(base: Pick<FetchedLimitResult, "toolName" | "identity">, error: string): FetchedLimitResult {
   return { ...base, windows: [], status: "unavailable", error };
 }
 
@@ -198,8 +198,8 @@ async function requestAliGateway(cookie: string): Promise<GatewayResult> {
  * `<configDir>/console-cookie.txt` (see the module doc above for why no
  * API-key path exists and where this protocol came from).
  */
-export async function fetchAliLimits(identity: Identity): Promise<ToolLimitResult> {
-  const base: Pick<ToolLimitResult, "toolName" | "identity"> = { toolName: "ali", identity };
+export async function fetchAliLimits(identity: Identity): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "ali", identity };
 
   const cookie = await readConsoleCookie(identity.configDir);
   if (!cookie) {

@@ -2,7 +2,7 @@ import type { Identity } from "../../identities/types.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByLabel } from "./bucket.ts";
-import type { LimitWindow, OverageInfo, ToolLimitResult } from "./types.ts";
+import type { LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
 
 const AUTH_STATUS_TIMEOUT_MS = 10_000;
 // Was 30s — bumped after real hangs at 30s turned out to just need more time
@@ -109,8 +109,8 @@ export function overageFromUsageText(stdout: string): OverageInfo | undefined {
  * observed live (every identity on this machine turned out to be logged in
  * once the env-stripping bug was fixed), so we don't try to infer it from
  * text parsing. */
-export async function fetchClaudeLimits(identity: Identity): Promise<ToolLimitResult> {
-  const base: Pick<ToolLimitResult, "toolName" | "identity"> = { toolName: "claude", identity };
+export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "claude", identity };
 
   let binaryPath: string;
   try {
