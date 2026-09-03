@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { estimateDetailedModelTokenCost } from "../../identities/model-pricing.ts";
+import type { Identity } from "../../identities/types.ts";
 import { localDateKey } from "./local-day.ts";
 import { canonicalUsageProvider } from "./providers.ts";
 import type { DateSpan, TokscaleEntry, TokscaleReport } from "./tokscale.ts";
@@ -29,13 +30,96 @@ import type { DateSpan, TokscaleEntry, TokscaleReport } from "./tokscale.ts";
  * dollar window did these tokens consume".
  */
 
-/** The synthetic identity default-profile usage reports under — the
- * unscoped profile is not an AIS identity, and inventing a fake mapping to
- * a real one would misattribute it. */
+/** The synthetic identity default-profile usage falls back to ONLY when no
+ * identity's credential matches the profile's key — the credential
+ * identifies the account, and the account identifies the identity, so an
+ * unmatched profile is the exceptional case, never the label for known
+ * accounts (the user's default profile held dynacom's OpenCode Go key, and
+ * logging that usage as "default" was wrong — fixed 2026-09-03). */
 export const OPENCODE_DEFAULT_PROFILE_IDENTITY = {
   name: "default",
   label: "Default profile",
 };
+
+/** The default profile's own auth store: provider id -> API key. */
+async function readProfileCredentials(profileAuthPath: string): Promise<Map<string, string>> {
+  const credentials = new Map<string, string>();
+  try {
+    const parsed = JSON.parse(await Bun.file(profileAuthPath).text()) as Record<string, { key?: unknown }>;
+    for (const [provider, entry] of Object.entries(parsed)) {
+      if (entry && typeof entry === "object" && typeof entry.key === "string" && entry.key.length > 0) {
+        credentials.set(canonicalUsageProvider(provider), entry.key);
+      }
+    }
+  } catch {
+    // unreadable/absent -> no credentials to match
+  }
+  return credentials;
+}
+
+/** Every AIS identity that holds opencode-style API credentials, mapped per
+ * canonical provider -> key: the opencode registry (data/opencode/auth.json)
+ * and the pi registry (auth.json api_key entries — OAuth entries hold no
+ * comparable key). */
+async function identityCredentialIndex(): Promise<Array<{ identity: Identity; credentials: Map<string, string> }>> {
+  const { OPENCODE_CONFIG, PI_CONFIG } = await import("../../identities/tool-configs.ts");
+  const { loadIdentitiesFile } = await import("../../identities/store.ts");
+  const index: Array<{ identity: Identity; credentials: Map<string, string> }> = [];
+
+  const registries = [
+    { config: OPENCODE_CONFIG, read: async (configDir: string) => readProfileCredentials(join(configDir, "data", "opencode", "auth.json")) },
+    {
+      config: PI_CONFIG,
+      read: async (configDir: string) => {
+        const credentials = new Map<string, string>();
+        try {
+          const parsed = JSON.parse(await Bun.file(join(configDir, "auth.json")).text()) as Record<string, { type?: unknown; key?: unknown }>;
+          for (const [provider, entry] of Object.entries(parsed)) {
+            if (entry && typeof entry.key === "string" && entry.key.length > 0) {
+              credentials.set(canonicalUsageProvider(provider), entry.key);
+            }
+          }
+        } catch {
+          // skip unreadable
+        }
+        return credentials;
+      },
+    },
+  ];
+
+  for (const { config, read } of registries) {
+    try {
+      const file = await loadIdentitiesFile(config.identitiesJsonPath);
+      for (const identity of file.identities) {
+        index.push({ identity, credentials: await read(identity.configDir) });
+      }
+    } catch {
+      // registry absent -> no candidates from it
+    }
+  }
+  return index;
+}
+
+/** Maps each of the default profile's providers to the AIS identity that
+ * holds the SAME credential — the key identifies the account, and the
+ * account identifies the identity, so profile usage logs under the identity
+ * whose key it ran on. Providers with no matching identity are absent from
+ * the map (caller falls back to the synthetic default identity). */
+export async function resolveOpencodeProfileIdentities(): Promise<Map<string, Identity>> {
+  const profileCredentials = await readProfileCredentials(
+    defaultOpencodeProfileDbPath().replace(join("opencode", "opencode.db"), join("opencode", "auth.json")),
+  );
+  const resolved = new Map<string, Identity>();
+  if (profileCredentials.size === 0) return resolved;
+
+  for (const { identity, credentials } of await identityCredentialIndex()) {
+    for (const [provider, key] of profileCredentials) {
+      if (resolved.has(provider)) continue;
+      if (credentials.get(provider) === key) resolved.set(provider, identity);
+    }
+  }
+  return resolved;
+}
 
 export interface OpencodeProfileUsage {
   provider: string;
@@ -109,8 +193,11 @@ export type OpencodeProfileOutcome =
   | { kind: "error"; message: string };
 
 /** Reads one opencode.db and aggregates every assistant message into
- * per-provider usage. `dbPath` is injectable for tests. */
-export function readOpencodeProfileUsage(dbPath: string): OpencodeProfileOutcome {
+ * per-provider usage. `dbPath` is injectable for tests. The row scan
+ * YIELDS periodically — bun:sqlite is synchronous, and an unyielding scan
+ * of a multi-GB db blocks the event loop and freezes the live render
+ * (observed 2026-09-03). */
+export async function readOpencodeProfileUsage(dbPath: string): Promise<OpencodeProfileOutcome> {
   let db: Database;
   try {
     db = new Database(dbPath, { readonly: true });
@@ -119,10 +206,10 @@ export function readOpencodeProfileUsage(dbPath: string): OpencodeProfileOutcome
   }
 
   try {
-    const rows = db.query("SELECT data FROM message").all() as Array<{ data: string }>;
     const providers = new Map<string, MutableProfileUsage>();
+    let processed = 0;
 
-    for (const { data } of rows) {
+    for (const { data } of db.query("SELECT data FROM message").iterate() as IterableIterator<{ data: string }>) {
       let message: OpencodeMessageData;
       try {
         message = JSON.parse(data) as OpencodeMessageData;
@@ -188,6 +275,10 @@ export function readOpencodeProfileUsage(dbPath: string): OpencodeProfileOutcome
       modelEntry.messageCount += 1;
       modelEntry.cost += estimatedCost;
       aggregate.entries.set(entryKey, modelEntry);
+
+      // Yield the event loop every few hundred rows so spinner ticks keep
+      // firing while the scan runs.
+      if (++processed % 500 === 0) await Bun.sleep(0);
     }
 
     return {
@@ -212,4 +303,16 @@ export function readOpencodeProfileUsage(dbPath: string): OpencodeProfileOutcome
   } finally {
     db.close();
   }
+}
+
+/** Per-provider usage for one AIS opencode IDENTITY — same reader, but the
+ * identity's own redirected data root (`<configDir>/data/opencode/`). This
+ * is the preferred attribution path for identity usage: the db records the
+ * exact upstream per message, while the tokscale path collapses
+ * multi-plan models into comma-joined pseudo-providers
+ * ("opencode_go, zai_coding_plan") that fragment the report. */
+export async function fetchOpencodeIdentityUsage(identity: Identity): Promise<OpencodeProfileUsage[]> {
+  const dbPath = join(identity.configDir, "data", "opencode", "opencode.db");
+  const outcome = await readOpencodeProfileUsage(dbPath);
+  return outcome.kind === "usage" ? outcome.providers : [];
 }

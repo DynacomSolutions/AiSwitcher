@@ -8,7 +8,7 @@ import { fetchCodexLimits } from "../limits/codex-limits.ts";
 import { fetchKimiLimits } from "../limits/kimi-limits.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { fetchAliUsage } from "./ali-usage.ts";
-import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, readOpencodeProfileUsage } from "./opencode-usage.ts";
+import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, fetchOpencodeIdentityUsage, readOpencodeProfileUsage, resolveOpencodeProfileIdentities } from "./opencode-usage.ts";
 import { fetchPiUsage } from "./pi-usage.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
 import {
@@ -222,15 +222,39 @@ async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression
   }
 }
 
+/** OpenCode identities read their OWN opencode.db directly (exact
+ * per-message provider attribution) instead of tokscale, whose opencode
+ * client collapses multi-plan models into comma-joined pseudo-providers
+ * ("opencode_go, zai_coding_plan") that fragment the report into a row per
+ * spelling — observed live 2026-09-03 with a single dynacom identity
+ * showing four OpenCode-ish rows. Same shape as runPiUsage: per-provider
+ * rows, nothing-to-report suppressed unless the source was asked for
+ * explicitly, real read failures as source-only error rows. */
+async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
+  try {
+    const providers = await fetchOpencodeIdentityUsage(target.identity);
+    if (providers.length === 0) {
+      return suppression.explicitTool ? [sourceErrorResult(target, "no local OpenCode provider usage yet for this identity")] : [];
+    }
+    return providers.map(({ provider, report, dateSpan, dailyUsage }) =>
+      providerResult(target, provider, { report, ...(dateSpan ? { dateSpan } : {}), dailyUsage }),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return [sourceErrorResult(target, `Could not read OpenCode usage: ${message}`)];
+  }
+}
+
 async function runOne(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   if (target.toolName === "zai") return runZaiUsage(target, suppression);
   if (target.toolName === "ali") return runAliUsage(target, suppression);
   if (target.toolName === "pi") return runPiUsage(target, suppression);
+  if (target.toolName === "opencode") return runOpencodeUsage(target, suppression);
 
   const [results, extraCost, daily] = await Promise.all([
     runTokscale(target, suppression),
     fetchExtraCost(target.toolName, target.identity),
-    fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi" | "opencode", target.identity),
+    fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
   ]);
   const primaryProvider = providerForTool(target.toolName);
   return results.map((result, index) => ({
@@ -355,20 +379,26 @@ export function shouldIncludeDefaultOpencodeProfile(flags: ParsedArgs["flags"]):
 }
 
 /** Raw (pre-aggregation) per-provider rows for the default opencode
- * profile, under the synthetic "default" identity — it is not an AIS
- * identity, and pretending otherwise would misattribute the usage. Read
- * failures are real failures: source-only error rows, never fabricated
- * provider rows. */
+ * profile. Each provider's usage is attributed to the AIS identity whose
+ * credential matches the profile's key — the key identifies the account,
+ * and the account identifies the identity (the user's default profile held
+ * dynacom's OpenCode Go key, so that usage IS dynacom's). The synthetic
+ * "default" identity is the fallback only for providers no identity can
+ * claim. Read failures are real failures: source-only error rows, never
+ * fabricated provider rows. */
 export async function defaultOpencodeProfileUsageResults(): Promise<UsageResult[]> {
-  const identity: Identity = { ...OPENCODE_DEFAULT_PROFILE_IDENTITY, configDir: defaultOpencodeProfileDbPath() };
-  const outcome = readOpencodeProfileUsage(defaultOpencodeProfileDbPath());
+  const fallbackIdentity: Identity = { ...OPENCODE_DEFAULT_PROFILE_IDENTITY, configDir: defaultOpencodeProfileDbPath() };
+  const [outcome, profileIdentities] = await Promise.all([
+    readOpencodeProfileUsage(defaultOpencodeProfileDbPath()),
+    resolveOpencodeProfileIdentities(),
+  ]);
   if (outcome.kind === "absent") return [];
   if (outcome.kind === "error") {
-    return [{ provider: "unattributed", identity, sourceTool: "opencode", sourceOnlyError: true, error: `Could not read the default OpenCode profile: ${outcome.message}` }];
+    return [{ provider: "unattributed", identity: fallbackIdentity, sourceTool: "opencode", sourceOnlyError: true, error: `Could not read the default OpenCode profile: ${outcome.message}` }];
   }
   return outcome.providers.map(({ provider, report, dateSpan, dailyUsage }) => ({
     provider: canonicalUsageProvider(provider),
-    identity,
+    identity: profileIdentities.get(canonicalUsageProvider(provider)) ?? fallbackIdentity,
     sourceTool: "opencode" as const,
     report,
     dateSpan,

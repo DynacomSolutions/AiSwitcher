@@ -56,7 +56,7 @@ describe("readOpencodeProfileUsage", () => {
       assistant("opencode", "x-preview-f-free", { input: 42, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, 1_780_200_000_000),
     ]);
 
-    const outcome = readOpencodeProfileUsage(dbPath);
+    const outcome = await readOpencodeProfileUsage(dbPath);
     expect(outcome.kind).toBe("usage");
     if (outcome.kind !== "usage") return;
     const go = outcome.providers.find((p) => p.provider === "opencode-go")!;
@@ -77,17 +77,17 @@ describe("readOpencodeProfileUsage", () => {
     const dbPath = await makeDb([
       { ...assistant("opencode-go", "glm-5.2", { input: 1000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, 1_780_000_000_000), cost: 0.5 },
     ]);
-    const outcome = readOpencodeProfileUsage(dbPath);
+    const outcome = await readOpencodeProfileUsage(dbPath);
     if (outcome.kind !== "usage") throw new Error("expected usage");
     expect(outcome.providers[0]!.report.totalCost).toBe(0.5);
   });
 
   test("a missing db is 'absent', a corrupt one is an error", async () => {
-    expect(readOpencodeProfileUsage(join(tmpdir(), "ais-opencode-usage-does-not-exist", "opencode.db")).kind).toBe("absent");
+    expect((await readOpencodeProfileUsage(join(tmpdir(), "ais-opencode-usage-does-not-exist", "opencode.db"))).kind).toBe("absent");
     const dir = await mkdtemp(join(tmpdir(), "ais-opencode-usage-bad-"));
     tempDirs.push(dir);
     await Bun.write(join(dir, "opencode.db"), "this is not sqlite");
-    expect(readOpencodeProfileUsage(join(dir, "opencode.db")).kind).toBe("error");
+    expect((await readOpencodeProfileUsage(join(dir, "opencode.db"))).kind).toBe("error");
   });
 
   test("default db path is ALWAYS the unredirected profile, ignoring ambient XDG_DATA_HOME", () => {

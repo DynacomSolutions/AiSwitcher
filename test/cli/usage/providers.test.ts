@@ -92,3 +92,18 @@ describe("usageProviderLabel", () => {
     expect(usageProviderLabel("some-new_cloud")).toBe("Some New Cloud");
   });
 });
+
+describe("comma-joined provider strings", () => {
+  test("split, canonicalise per part, dedupe, and join deterministically", () => {
+    // tokscale's opencode client merges one model entry across plans into a
+    // comma-joined string (observed live 2026-09-03) — it must collapse to
+    // one stable key instead of fragmenting into a row per spelling.
+    expect(canonicalUsageProvider("opencode_go, zai_coding_plan")).toBe("opencode-go, zai");
+    expect(canonicalUsageProvider("zai_coding_plan,opencode_go")).toBe("opencode-go, zai");
+    expect(usageProviderLabel("opencode-go, zai")).toBe("OpenCode Go, Z.ai");
+  });
+
+  test("the underscore spelling of the Go plan aliases onto the hyphenated upstream", () => {
+    expect(canonicalUsageProvider("opencode_go")).toBe("opencode-go");
+  });
+});

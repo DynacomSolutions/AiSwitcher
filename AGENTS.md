@@ -2372,6 +2372,24 @@ What the rule means in practice, now enforced in both pipelines:
   share-of-window-budget, `status: "rate-limited"` marks an exhausted
   window. Its real token usage also appears in `ais usage` (see
   usage/opencode-usage.ts).
+  **OpenCode identity usage also reads its db directly** (added 2026-09-03
+  after the user saw ONE dynacom plan rendered as FOUR rows): tokscale's
+  opencode client collapses multi-plan models into comma-joined
+  pseudo-providers ("opencode_go, zai_coding_plan") and underscore
+  spellings, fragmenting the report. Identity dbs are read with the same
+  exact per-message providerID attribution as the default profile, and
+  canonicalUsageProvider splits comma-joined provider strings so any
+  residual joined form still collapses to one stable key. The db scan
+  yields every ~500 rows — bun:sqlite is synchronous, and an unyielding
+  scan of a multi-GB db froze the live render's spinners.
+  **Default-profile usage is attributed by CREDENTIAL MATCH, not scope**
+  (fixed 2026-09-03 after the user corrected it hard: their unscoped
+  `~/.local/share/opencode` profile held dynacom's OpenCode Go key, and
+  logging that usage under a synthetic "default" identity was wrong —
+  "ALL USAGE WE HAVE IS FOR DYNACOM"). The profile's auth.json keys are
+  matched against every opencode/pi identity's keys; usage logs under the
+  identity holding the same credential. The synthetic "default" identity
+  is the fallback ONLY for providers no identity can claim.
 - **ONE credential per (identity, provider) — kimi-store.ts.** Kimi rotates
   its OAuth refresh token on EVERY refresh, and the same account's
   credentials exist in two stores: the kimi identity's
