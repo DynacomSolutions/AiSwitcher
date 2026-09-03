@@ -95,7 +95,7 @@ describe("AuthRefreshScheduler", () => {
   test("interval 0 disables the scheduler but refreshNow still works", async () => {
     await withHome(() => {
       const counter = countingRefresher(0);
-      const scheduler = new AuthRefreshScheduler(0, { ali: counter.refresher });
+      const scheduler = new AuthRefreshScheduler(0, { ali: counter.refresher }, async () => [{ name: "personal", label: "personal", configDir: "/tmp/ali-personal" }]);
       expect(scheduler.enabled).toBe(false);
       scheduler.start();
       return scheduler.refreshNow("ali", "personal").then(() => {
