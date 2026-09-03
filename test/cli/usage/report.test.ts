@@ -294,3 +294,41 @@ describe("formatUsageReport", () => {
     expect(output).toContain("Tracking usage from");
   });
 });
+
+describe("source-only errors (multi-provider source failures)", () => {
+  test("never render a table row and are labelled by SOURCE in the Errors footer", () => {
+    // A pi reader failure has no honest provider to name; fabricating an
+    // "Unattributed" table row is exactly the pseudo-provider output the
+    // provider-first rule forbids. The failure stays visible, but only in
+    // the Errors footer under its source label.
+    const failure: UsageResult = {
+      provider: "unattributed",
+      identity: identity("dynacom"),
+      sourceTool: "pi",
+      sourceOnlyError: true,
+      error: "Could not read Pi usage: disk unavailable",
+    };
+    const output = formatUsageReport([failure]);
+    expect(output).toContain("Errors:");
+    expect(output).toContain("pi/dynacom: Could not read Pi usage: disk unavailable");
+    expect(output).not.toContain("Unattributed");
+    // The table renders its (always-present) header but NO data rows: the
+    // only result was a source-only error.
+    expect(output.split("\n").filter((l) => l.startsWith("│"))).toHaveLength(1);
+  });
+
+  test("sit alongside real provider rows without perturbing them", () => {
+    const ok = success("codex", "dynacom");
+    const failure: UsageResult = {
+      provider: "unattributed",
+      identity: identity("dynacom"),
+      sourceTool: "pi",
+      sourceOnlyError: true,
+      error: "Could not read Pi usage: boom",
+    };
+    const output = formatUsageReport([ok, failure]);
+    const tableLines = output.split("\n").filter((l) => l.startsWith("│"));
+    expect(tableLines).toHaveLength(2); // header + the one real provider row
+    expect(output).toContain("pi/dynacom: Could not read Pi usage: boom");
+  });
+});

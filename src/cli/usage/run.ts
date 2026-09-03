@@ -35,6 +35,14 @@ export interface UsageResult {
   sourceTool?: ToolConfig["toolName"];
   /** Pi CLI adapters are covered by this native history when it is present. */
   nativeCoverageTool?: "claude" | "codex";
+  /** Internal: a real failure from a source whose provider can't be named
+   * (a multi-provider client's reader failed before attributing anything).
+   * Never rendered as a provider TABLE row — a fabricated "Unattributed"
+   * row is exactly the pseudo-provider output the provider-first rule
+   * forbids — it surfaces only in the trailing Errors section under its
+   * SOURCE label (`pi/dynacom: ...`). Omitted from every public JSON
+   * result. */
+  sourceOnlyError?: true;
   report?: TokscaleReport;
   error?: string;
   extraCost?: OverageInfo;
@@ -85,6 +93,21 @@ function providerResult(target: UsageTarget, provider: string, fields: Omit<Usag
   return { provider: canonicalUsageProvider(provider), identity: target.identity, sourceTool: target.toolName, ...fields };
 }
 
+/** A real failure from a multi-provider source (pi/opencode) whose reader
+ * failed before attributing any provider. Kept out of the provider table —
+ * there is no honest provider to name and a fabricated "Unattributed" row
+ * is tool-shaped noise — and surfaced only in the Errors footer under the
+ * SOURCE label. */
+function sourceErrorResult(target: UsageTarget, error: string): UsageResult {
+  return { provider: "unattributed", identity: target.identity, sourceTool: target.toolName, sourceOnlyError: true, error };
+}
+
+/** The multi-provider clients: sources whose failures have no honest
+ * provider-level row. */
+function isMultiProviderSource(toolName: UsageTarget["toolName"]): boolean {
+  return toolName === "pi" || toolName === "opencode";
+}
+
 /** Sources with nothing to report render no row in an unscoped report — the
  * view is provider/identity-first, and a "0 messages" or "no local data"
  * placeholder against a pseudo-provider label is noise, not information
@@ -115,16 +138,14 @@ async function runPiUsage(target: UsageTarget, suppression: UsageRowSuppression)
   try {
     const providers = await fetchPiUsage(target.identity);
     if (providers.length === 0) {
-      return suppression.explicitTool
-        ? [providerResult(target, "unattributed", { error: "no local Pi provider usage yet for this identity" })]
-        : [];
+      return suppression.explicitTool ? [sourceErrorResult(target, "no local Pi provider usage yet for this identity")] : [];
     }
     return providers.map(({ provider, nativeCoverageTool, report, dateSpan, dailyUsage }) =>
       providerResult(target, provider, { report, dateSpan, dailyUsage, ...(nativeCoverageTool ? { nativeCoverageTool } : {}) }),
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return [providerResult(target, "unattributed", { error: `Could not read Pi usage: ${message}` })];
+    return [sourceErrorResult(target, `Could not read Pi usage: ${message}`)];
   }
 }
 
@@ -182,7 +203,10 @@ export function providerReportsFromTokscale(target: UsageTarget, report: Tokscal
 async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   const fallbackProvider = providerForTool(target.toolName);
   const invocation = await tokscaleInvocationFor(target.toolName, target.identity);
-  if (!invocation) return [providerResult(target, fallbackProvider, { error: "usage tracking is not supported for this source" })];
+  if (!invocation) {
+    const error = "usage tracking is not supported for this source";
+    return isMultiProviderSource(target.toolName) ? [sourceErrorResult(target, error)] : [providerResult(target, fallbackProvider, { error })];
+  }
   const { env, clientArgs } = invocation;
 
   try {
@@ -192,7 +216,7 @@ async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression
     const message = err instanceof SyntaxError
       ? "Could not parse tokscale's --json output."
       : `Could not run tokscale: ${err instanceof Error ? err.message : String(err)}`;
-    return [providerResult(target, fallbackProvider, { error: message })];
+    return isMultiProviderSource(target.toolName) ? [sourceErrorResult(target, message)] : [providerResult(target, fallbackProvider, { error: message })];
   }
 }
 
@@ -248,6 +272,13 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
   const grouped = new Map<string, UsageResult>();
   for (const result of results) {
     if (result.nativeCoverageTool && nativeCoverage.has(`${result.nativeCoverageTool}\u0000${result.identity.name}`)) continue;
+    // Source-only failures never merge: each source's failure stays its own
+    // Errors-footer line under its own source label, never folded into
+    // another source's row (or into a provider group).
+    if (result.sourceOnlyError) {
+      grouped.set(`sourceOnlyError\u0000${result.sourceTool ?? ""}\u0000${result.identity.name}`, result);
+      continue;
+    }
     const provider = canonicalUsageProvider(result.provider);
     const key = `${provider}\u0000${result.identity.name}`;
     const existing = grouped.get(key);
@@ -278,34 +309,14 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
   return [...grouped.values()];
 }
 
-/** Per-target ceiling. A single target whose storage is unreachable (a
- * crush.db on a hung network mount, observed live) must not hold the whole
- * report forever; it degrades to an honest error row instead, matching the
- * existing "report the error, don't crash" contract for unreadable data. */
-const PER_TARGET_TIMEOUT_MS = 25_000;
-
-async function runOneBounded(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<UsageResult[]>((resolve) => {
-    timer = setTimeout(() => {
-      // A timed-out fetch is a REAL failure, so it keeps an error row. But
-      // the multi-provider clients have no honest tool-level provider label
-      // ("Detecting providers"/"OpenCode" are tool-shaped — see the
-      // provider-first rule), so their timeout reports as Unattributed,
-      // like every other error row from those sources. Construct the row
-      // explicitly: pendingUsageResult is undefined for these targets, so
-      // spreading it here would emit a row with no provider or identity.
-      const provider =
-        target.toolName === "pi" || target.toolName === "opencode" ? "unattributed" : providerForTool(target.toolName);
-      resolve([providerResult(target, provider, { error: `timed out after ${PER_TARGET_TIMEOUT_MS / 1000}ms` })]);
-    }, PER_TARGET_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([runOne(target, suppression), timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
+// NOTE, deliberately NO per-target timeout here (a 25s cap was tried in the
+// console work and reverted 2026-09-03): ~25 targets run concurrently and
+// contend for disk, so a single target's real tokscale scan routinely takes
+// 25-55s on this data volume — the cap turned ENTIRE reports into error
+// rows ("timed out after 25ms", itself mislabeled). Genuine hangs are
+// already bounded where they actually occur: tokscale spawns have their own
+// timeout (tokscale.ts), and limits never had a cap either. Truncating
+// good data to bound a pathological hang is the wrong trade for the report.
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
@@ -316,7 +327,7 @@ export async function runUsageQueryForTargets(
   const results: UsageResult[][] = new Array(targets.length);
   await Promise.all(
     targets.map(async (target, index) => {
-      const targetResults = await runOneBounded(target, suppression);
+      const targetResults = await runOne(target, suppression);
       results[index] = targetResults;
       options.onItemDone?.(index, targetResults);
     }),
@@ -332,7 +343,7 @@ export async function runUsageQuery(flags: ParsedArgs["flags"]): Promise<UsageRe
 /** JSON follows the same provider-first contract as the table. Client/tool
  * provenance is removed from model entries; provider and model remain. */
 export function usageResultsForJson(results: UsageResult[]): unknown[] {
-  return results.map(({ pending: _pending, sourceTool: _sourceTool, nativeCoverageTool: _nativeCoverageTool, ...result }) => ({
+  return results.map(({ pending: _pending, sourceTool: _sourceTool, nativeCoverageTool: _nativeCoverageTool, sourceOnlyError: _sourceOnlyError, ...result }) => ({
     ...result,
     ...(result.report
       ? { report: { ...result.report, entries: result.report.entries.map(({ client: _client, ...entry }) => entry) } }
