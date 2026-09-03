@@ -8,6 +8,7 @@ const CFG: ToolConfig = {
   toolName: "claude",
   realBinaryName: "claude",
   envVarName: "CLAUDE_CONFIG_DIR",
+  globalMemoryProjection: "claude-append-file",
   identitiesJsonPath: "/tmp/does-not-exist/identities.json",
   identitiesRootDir: "/tmp/does-not-exist/identities",
 };

@@ -9,6 +9,7 @@
     "verbatimModuleSyntax": true,
     "noEmit": true,
     "strict": true,
+    "noImplicitReturns": true,
     "skipLibCheck": true,
     "types": ["bun-types"]
   },

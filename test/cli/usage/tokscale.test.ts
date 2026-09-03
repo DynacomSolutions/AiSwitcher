@@ -58,6 +58,15 @@ describe("tokscaleInvocationFor", () => {
     expect(clientArgs).toEqual(["--client", "claude"]);
   });
 
+  test("opencode: points XDG_DATA_HOME at the identity's data subdir — the root tokscale's opencode client resolves through", async () => {
+    const { env, clientArgs } = (await tokscaleInvocationFor(
+      "opencode",
+      identity("/Users/alice/.opencode/identities/identity-a"),
+    ))!;
+    expect(env).toEqual({ XDG_DATA_HOME: "/Users/alice/.opencode/identities/identity-a/data" });
+    expect(clientArgs).toEqual(["--client", "opencode"]);
+  });
+
   test("zai: sets ZAI_API_KEY from the identity's own crush.json, not a directory scan, and no --client (never a valid value for zai)", async () => {
     const configDir = await makeConfigDir();
     await writeZaiAuthFile(configDir, "sk-zai-key");
@@ -110,6 +119,19 @@ describe("buildMergedEnv", () => {
       { toolName: "zai", identity: identity(configDirB) },
     ]);
     expect(env.ZAI_API_KEY).toBeUndefined();
+  });
+
+  test("includes XDG_DATA_HOME when exactly one opencode target is in the set", async () => {
+    const env = await buildMergedEnv([{ toolName: "opencode", identity: identity("/Users/alice/.opencode/identities/a") }]);
+    expect(env.XDG_DATA_HOME).toBe("/Users/alice/.opencode/identities/a/data");
+  });
+
+  test("drops opencode from the merge when more than one opencode identity is targeted (one XDG_DATA_HOME can only point at one data root)", async () => {
+    const env = await buildMergedEnv([
+      { toolName: "opencode", identity: identity("/Users/alice/.opencode/identities/a") },
+      { toolName: "opencode", identity: identity("/Users/alice/.opencode/identities/b") },
+    ]);
+    expect(env.XDG_DATA_HOME).toBeUndefined();
   });
 });
 

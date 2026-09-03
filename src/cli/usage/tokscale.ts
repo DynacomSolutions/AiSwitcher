@@ -1,5 +1,6 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { readZaiApiKey } from "../../identities/zai-auth.ts";
 
 /**
@@ -38,6 +39,15 @@ import { readZaiApiKey } from "../../identities/zai-auth.ts";
  *     `undefined` (same as "not supported") when the identity has no usable
  *     literal key yet (readZaiApiKey) rather than crashing tokscale with an
  *     empty env var.
+ *   - opencode: a real tokscale client id ("opencode", confirmed in
+ *     `tokscale clients` output) whose scan root resolves through
+ *     XDG_DATA_HOME — `<data>/opencode/...`, covering both the legacy
+ *     storage/message tree and the newer opencode.db — with no env var of
+ *     its own. Setting `XDG_DATA_HOME: <configDir>/data` (the same root
+ *     this project's opencode wrapper already scopes per identity, see
+ *     OPENCODE_CONFIG's extraEnvVarNames) scopes tokscale to exactly that
+ *     identity's sessions; confirmed live 2026-09-03 against both storage
+ *     formats with no cross-identity leakage.
  *   - ali: has NO tokscale support at all, unlike zai: tokscale has no
  *     "alibaba"/"ali" client id, AND Alibaba's Token plan API has no
  *     documented quota/usage endpoint for tokscale's own separate `usage`
@@ -86,6 +96,16 @@ export async function tokscaleInvocationFor(
       // No tokscale client, no live quota API to fall back on either (see
       // this function's own doc comment above).
       return undefined;
+    case "opencode": {
+      // tokscale's opencode client resolves its scan root through
+      // XDG_DATA_HOME (`<data>/opencode/...`, covering both the legacy
+      // storage/message tree and the newer opencode.db) with no env var of
+      // its own — the same root opencode itself splits its config/data/
+      // cache/state across (see OPENCODE_CONFIG's extraEnvVarNames), so
+      // pointing XDG_DATA_HOME at the identity's data subdir scopes
+      // tokscale to exactly that identity's sessions, old format or new.
+      return { env: { XDG_DATA_HOME: join(identity.configDir, "data") }, clientArgs };
+    }
     case "pi":
       return undefined;
   }
@@ -144,6 +164,13 @@ function tokscaleSupportsClient(toolName: string): toolName is "claude" | "codex
  * passthrough invokes tokscale's OWN `usage` subcommand, which DOES read
  * this var and DOES return real Z.ai quota data (the default aggregate
  * report doesn't go through tokscale for zai at all — see zai-usage.ts).
+ *
+ * opencode has the same at-most-one limitation, for a different reason: its
+ * scan root resolves through XDG_DATA_HOME (see tokscaleInvocationFor), a
+ * single root that — unlike TOKSCALE_EXTRA_DIRS — can only ever point at
+ * one identity's data dir. Same resolution: with exactly one opencode
+ * target in the set its data root is included via `XDG_DATA_HOME`; with
+ * zero or more than one, opencode is silently dropped from the merge.
  */
 export async function buildMergedEnv(targets: Array<{ toolName: string; identity: Identity }>): Promise<Record<string, string>> {
   const entries: string[] = [];
@@ -156,6 +183,11 @@ export async function buildMergedEnv(targets: Array<{ toolName: string; identity
   if (zaiTargets.length === 1) {
     const apiKey = await readZaiApiKey(zaiTargets[0]!.identity.configDir);
     if (apiKey) env.ZAI_API_KEY = apiKey;
+  }
+
+  const opencodeTargets = targets.filter((t) => t.toolName === "opencode");
+  if (opencodeTargets.length === 1) {
+    env.XDG_DATA_HOME = join(opencodeTargets[0]!.identity.configDir, "data");
   }
   return env;
 }
@@ -401,7 +433,7 @@ export interface DailyUsage {
  * display nicety, never something worth sinking the whole report over.
  */
 export async function fetchTokscaleDailyUsage(
-  toolName: "claude" | "codex" | "grok" | "kimi",
+  toolName: "claude" | "codex" | "grok" | "kimi" | "opencode",
   identity: Identity,
 ): Promise<DailyUsage | undefined> {
   const invocation = await tokscaleInvocationFor(toolName, identity);

@@ -37,6 +37,7 @@ async function makeRegistry(toolName: "claude" | "codex" | "grok", identities: u
     toolName,
     realBinaryName: toolName,
     envVarName: ENV_VAR_NAMES[toolName],
+    globalMemoryProjection: "claude-append-file",
     identitiesJsonPath,
     identitiesRootDir: join(dir, "identities"),
   };
@@ -131,6 +132,16 @@ describe("provider-first usage results", () => {
     );
     expect(results.map((result) => result.provider).sort()).toEqual(["anthropic", "openai"]);
     expect(results.find((result) => result.provider === "anthropic")?.report?.totalInput).toBe(30);
+  });
+
+  test("opencode reports group under the same upstreams as other clients (zai_coding_plan -> zai), never crash on an unlisted tool", () => {
+    const results = providerReportsFromTokscale(
+      { toolName: "opencode", identity: usageIdentity },
+      report([entry("zai_coding_plan", { client: "opencode", input: 100 }), entry("alibaba_token_plan", { client: "opencode", input: 20 })]),
+    );
+    expect(results.map((result) => result.provider).sort()).toEqual(["alibaba", "zai"]);
+    expect(results.find((result) => result.provider === "zai")?.report?.totalInput).toBe(100);
+    expect(results.find((result) => result.provider === "zai")?.identity).toBe(usageIdentity);
   });
 
   test("merges native and Pi traffic for the same provider and identity", () => {

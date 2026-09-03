@@ -180,7 +180,7 @@ async function runOne(target: UsageTarget): Promise<UsageResult[]> {
   const [results, extraCost, daily] = await Promise.all([
     runTokscale(target),
     fetchExtraCost(target.toolName, target.identity),
-    fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
+    fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi" | "opencode", target.identity),
   ]);
   const primaryProvider = providerForTool(target.toolName);
   return results.map((result, index) => ({

@@ -114,7 +114,11 @@ export async function fetchCrushUsage(
         // price to zero, so derive a public-price valuation from the recorded
         // model and token counts whenever possible. The saved value remains a
         // compatibility fallback for old/unknown models.
-        const estimated = session.model && estimateModelTokenCost(providerId, session.model, session.prompt_tokens, session.completion_tokens);
+        // A falsy model (null or "") must fall back to the recorded cost,
+        // never short-circuit into concatenating onto the total.
+        const estimated = session.model
+          ? estimateModelTokenCost(providerId, session.model, session.prompt_tokens, session.completion_tokens)
+          : undefined;
         totalCost += estimated ?? session.cost;
         firstTs = firstTs === undefined ? session.created_at : Math.min(firstTs, session.created_at);
         lastTs = lastTs === undefined ? session.updated_at : Math.max(lastTs, session.updated_at);

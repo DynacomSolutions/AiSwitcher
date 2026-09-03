@@ -32,6 +32,7 @@ async function makeRegistry(toolName: "claude" | "codex" | "grok", identities: u
     toolName,
     realBinaryName: toolName,
     envVarName: ENV_VAR_NAMES[toolName],
+    globalMemoryProjection: "claude-append-file",
     identitiesJsonPath,
     identitiesRootDir: join(dir, "identities"),
   };
