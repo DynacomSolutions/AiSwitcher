@@ -43,7 +43,18 @@ export async function writeServerState(state: ConsoleServerState, path = console
   await Bun.write(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
+/** Removes the state file — but only when it still describes THIS process.
+ * The state file is shared whenever several daemons can write the same
+ * ~/.ais (observed live: a rolling pod restart let the OLD daemon's SIGTERM
+ * handler delete the NEW daemon's freshly written state, blinding every
+ * host-side token reader). A missing or foreign-owner file is left alone. */
 export async function clearServerState(path = consoleServerStatePath()): Promise<void> {
+  try {
+    const state = await readServerState(path);
+    if (state && state.pid !== process.pid) return;
+  } catch {
+    // Unreadable state: nothing sensible to compare, leave it be.
+  }
   await Bun.$`rm -f ${path}`.quiet();
 }
 
