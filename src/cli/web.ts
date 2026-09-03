@@ -4,6 +4,7 @@ import { boolFlag } from "./args.ts";
 import { statSync } from "node:fs";
 import { clearServerState, pidAlive, readServerState } from "../server/state.ts";
 import { DEFAULT_CONSOLE_PORT, findDistDir, startConsoleServer } from "../server/serve.ts";
+import { withUsableCwd } from "../shared/exec.ts";
 
 export interface WebCommandSummary {
   action: "started" | "already-running" | "stopped" | "status" | "opened";
@@ -103,10 +104,12 @@ function spawnDaemon(port: number | undefined): SpawnedDaemon {
   const base = setsid ? [setsid] : [];
   const args = [...base, ...inner, "web", "--serve-internal", `--port=${port ?? DEFAULT_CONSOLE_PORT}`];
   // NOTE: parseArgs only understands --flag=value, never --flag value.
-  const proc = Bun.spawn(args, {
-    env: { ...process.env, AIS_WEB_DAEMON: "1" },
-    stdio: ["ignore", "ignore", "ignore"],
-  });
+  const proc = withUsableCwd(() =>
+    Bun.spawn(args, {
+      env: { ...process.env, AIS_WEB_DAEMON: "1" },
+      stdio: ["ignore", "ignore", "ignore"],
+    }),
+  );
   proc.unref();
   return { proc, requestedPort: port ?? DEFAULT_CONSOLE_PORT };
 }
@@ -196,7 +199,7 @@ function openBrowser(url: string): void {
   for (const bin of ["xdg-open", "open"]) {
     const found = Bun.which(bin);
     if (found) {
-      void Bun.spawn([found, url], { stdio: ["ignore", "ignore", "ignore"] }).unref();
+      void withUsableCwd(() => Bun.spawn([found, url], { stdio: ["ignore", "ignore", "ignore"] })).unref();
       return;
     }
   }
