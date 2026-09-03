@@ -44,7 +44,7 @@ describe("AuthRefreshScheduler", () => {
   test("refreshNow records success and clears the error", async () => {
     await withHome(() => {
       const { refresher } = countingRefresher(0);
-      const scheduler = new AuthRefreshScheduler(0, { ali: refresher });
+      const scheduler = new AuthRefreshScheduler(0, { ali: refresher }, async () => [{ name: "personal", label: "personal", configDir: "/tmp/ali-personal" }]);
       const ok = scheduler.refreshNow("ali", "personal");
       expect(ok).toBeInstanceOf(Promise);
       return ok.then((success) => {
@@ -60,7 +60,7 @@ describe("AuthRefreshScheduler", () => {
   test("failures land in lastError and a later success clears them", async () => {
     await withHome(() => {
       const { refresher } = countingRefresher(1);
-      const scheduler = new AuthRefreshScheduler(0, { ali: refresher });
+      const scheduler = new AuthRefreshScheduler(0, { ali: refresher }, async () => [{ name: "personal", label: "personal", configDir: "/tmp/ali-personal" }]);
       return scheduler
         .refreshNow("ali", "personal")
         .then((first) => {
@@ -78,7 +78,7 @@ describe("AuthRefreshScheduler", () => {
   test("refreshNow rejects unknown tools and identities", async () => {
     await withHome(() => {
       const { refresher } = countingRefresher(0);
-      const scheduler = new AuthRefreshScheduler(0, { ali: refresher });
+      const scheduler = new AuthRefreshScheduler(0, { ali: refresher }, async () => [{ name: "personal", label: "personal", configDir: "/tmp/ali-personal" }]);
       return Promise.all([
         scheduler.refreshNow("claude", "personal").then(
           () => expect.unreachable(),

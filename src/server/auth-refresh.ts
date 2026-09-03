@@ -7,6 +7,13 @@ import { refreshAliAuthSession } from "../identities/auth-session.ts";
 import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
 
+async function listIdentitiesFromRegistry(tool: string): Promise<Identity[]> {
+  const cfg = TOOL_CONFIGS[tool as keyof typeof TOOL_CONFIGS];
+  if (!cfg) return [];
+  const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
+  return file.identities;
+}
+
 /** Daemon-side credential renewal. Today only Alibaba console cookies have a
  * real headless refresh flow (browser session harvest — the same code the
  * host systemd timers run); the registry below is where any future
@@ -52,6 +59,8 @@ export class AuthRefreshScheduler {
   constructor(
     private readonly intervalMs: number,
     private readonly refreshers: Record<string, Refresher> = REFRESHERS,
+    /** Injectable so tests never depend on a real on-disk registry. */
+    private readonly listIdentities: (tool: string) => Promise<Identity[]> = listIdentitiesFromRegistry,
   ) {
     if (this.intervalMs > 0 && this.intervalMs < 60_000) this.intervalMs = 60_000;
   }
@@ -88,11 +97,8 @@ export class AuthRefreshScheduler {
   async targets(): Promise<{ tool: string; identity: Identity; refresher: Refresher }[]> {
     const targets: { tool: string; identity: Identity; refresher: Refresher }[] = [];
     for (const [tool, refresher] of Object.entries(this.refreshers)) {
-      const cfg = TOOL_CONFIGS[tool as keyof typeof TOOL_CONFIGS];
-      if (!cfg) continue;
       try {
-        const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
-        for (const identity of file.identities) targets.push({ tool, identity, refresher });
+        for (const identity of await this.listIdentities(tool)) targets.push({ tool, identity, refresher });
       } catch {
         // Registry unreadable (fresh machine): nothing to refresh yet.
       }
@@ -134,9 +140,8 @@ export class AuthRefreshScheduler {
   async refreshNow(tool: string, identityName: string): Promise<boolean> {
     const refresher = this.refreshers[tool];
     if (!refresher) throw new Error(`no refresh flow for tool "${tool}"`);
-    const cfg = TOOL_CONFIGS[tool as keyof typeof TOOL_CONFIGS];
-    const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
-    const identity = file.identities.find((candidate) => candidate.name === identityName);
+    const identities = await this.listIdentities(tool);
+    const identity = identities.find((candidate) => candidate.name === identityName);
     if (!identity) throw new Error(`no ${tool} identity named "${identityName}"`);
     return this.runOne(tool, identity, refresher);
   }
