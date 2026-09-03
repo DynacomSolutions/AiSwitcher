@@ -530,6 +530,13 @@ never read back. File browsing is restricted to `~/.ais`, each tool's home
 container, and registered identity configDirs, with symlink-escape guards and
 automatic pre-edit backups under `~/.ais/web/file-backups/`.
 
+Reverse-proxied/cluster deployments: set `AIS_WEB_HOST` (bind address, e.g.
+`0.0.0.0`) and `AIS_WEB_ALLOWED_HOSTS` (comma-separated vhostnames trusted
+like loopback peers, e.g. `ais.localhost` when Emissary rewrites every
+external Host to that). Mutations still demand the `X-AIS-Console` header on
+every path in. `GET /api/health` is deliberately unauthenticated so probes
+work without the per-boot token; it leaks nothing beyond the version.
+
 Development: see `apps/web/README.md` (pnpm) and `apps/tui/` (cargo); the API
 contract both frontends build against is `docs/API.md`.
 

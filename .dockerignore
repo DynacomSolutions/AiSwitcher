@@ -1,0 +1,9 @@
+.git
+node_modules
+**/node_modules
+dist
+**/dist
+apps/web/dist
+k8s
+Dockerfile
+.dockerignore

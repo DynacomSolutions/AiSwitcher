@@ -38,6 +38,11 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     return c.json({ error: err instanceof Error ? err.message : "internal error" }, 500);
   });
 
+  // Unauthenticated liveness probe BEFORE the guard: k8s probes and uptime
+  // checks have no per-boot bearer token, and this must leak nothing beyond
+  // what an HTTP response line already does.
+  app.get("/api/health", (c) => c.json({ ok: true as const, version: pkg.version }));
+
   app.use("/api/*", (c, next) => consoleGuard(deps, c, next));
 
   /* --------------------------------- status -------------------------------- */
