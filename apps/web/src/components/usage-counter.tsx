@@ -1,9 +1,8 @@
 import { useMemo } from "react";
 
-import { ProviderIcon } from "@/components/provider-icon";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { useUsageQuery } from "@/hooks/queries";
+import { useLimitsQuery, useUsageQuery } from "@/hooks/queries";
 import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
 import type { UsageResult } from "@/types/api";
 
@@ -19,12 +18,21 @@ function CounterCard({ label, value, sub }: { label: string; value: string; sub?
   );
 }
 
-/** The global usage counter, mirroring `ais usage`'s TOTAL row: every
- * provider, every identity, all recorded history. Rendered anywhere a
- * global view makes sense (dashboard, limits page). */
+function barTone(percent: number): string | undefined {
+  if (percent >= 80) return "bg-red-500";
+  if (percent >= 50) return "bg-amber-500";
+  return undefined;
+}
+
+/** The global usage counter, mirroring `ais usage`'s TOTAL row (every
+ * provider, every identity, all recorded history) plus the CLI limits
+ * report's window bars averaged across every provider: one Session bar,
+ * one Weekly bar. Per-provider quota detail stays on the provider cards. */
 export function GlobalUsageCards({ title = "Global usage" }: { title?: string }) {
-  const query = useUsageQuery();
-  const results = query.data?.results ?? [];
+  const usage = useUsageQuery();
+  const limits = useLimitsQuery();
+  const results = usage.data?.results ?? [];
+  const limitResults = limits.data?.results ?? [];
   const totals = useMemo(() => {
     let input = 0;
     let output = 0;
@@ -44,28 +52,24 @@ export function GlobalUsageCards({ title = "Global usage" }: { title?: string })
     return { total: input + output, today, cost };
   }, [results]);
 
-  if (query.isLoading || (results.length === 0 && query.isPending)) {
-    return (
-      <Card className="gap-3">
-        <CardHeader className="flex-row items-center justify-between space-y-0">
-          <CardTitle className="text-base">{title}</CardTitle>
-          <span className="text-xs text-muted-foreground">scanning usage…</span>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="h-16 animate-pulse rounded-lg bg-muted" />
-            ))}
-          </div>
-          <div className="space-y-2.5">
-            {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="h-6 animate-pulse rounded-md bg-muted" style={{ width: `${95 - i * 9}%` }} />
-            ))}
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }
+  const windowBars = useMemo(() => {
+    const buckets: Record<"session" | "week", number[]> = { session: [], week: [] };
+    for (const r of limitResults) {
+      if (r.status === "unavailable" || r.status === "pending") continue;
+      for (const w of r.windows ?? []) {
+        if (w.category === "session") buckets.session.push(w.usedPercent);
+        else if (w.category === "week") buckets.week.push(w.usedPercent);
+      }
+    }
+    const avg = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+    return [
+      { label: "Session", avg: avg(buckets.session), count: buckets.session.length },
+      { label: "Weekly", avg: avg(buckets.week), count: buckets.week.length },
+    ].filter((b) => b.avg !== null) as { label: string; avg: number; count: number }[];
+  }, [limitResults]);
+
+  const usageLoading = usage.isLoading || (results.length === 0 && usage.isPending);
+  const limitsLoading = limits.isLoading || (limitResults.length === 0 && limits.isPending);
 
   return (
     <Card className="gap-3">
@@ -74,71 +78,44 @@ export function GlobalUsageCards({ title = "Global usage" }: { title?: string })
         <span className="text-xs text-muted-foreground">{results.length} series</span>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <CounterCard label="Total tokens" value={formatTokens(totals.total)} sub="input + output, all providers" />
-          <CounterCard label="Tokens today" value={formatTokens(totals.today)} sub="input + output since midnight" />
-          <CounterCard label="Est. spend" value={formatMoney(totals.cost)} sub="all providers, all time" />
-          <CounterCard label="Usage series" value={String(results.length)} sub="provider + identity pairs" />
-        </div>
-        <ProviderShareBars results={results} total={totals.total} />
+        {usageLoading ? (
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="h-16 animate-pulse rounded-lg bg-muted" />
+            ))}
+          </div>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <CounterCard label="Total tokens" value={formatTokens(totals.total)} sub="input + output, all providers" />
+            <CounterCard label="Tokens today" value={formatTokens(totals.today)} sub="input + output since midnight" />
+            <CounterCard label="Est. spend" value={formatMoney(totals.cost)} sub="all providers, all time" />
+            <CounterCard label="Usage series" value={String(results.length)} sub="provider + identity pairs" />
+          </div>
+        )}
+
+        {!limitsLoading && windowBars.length > 0 ? (
+          <div className="space-y-3">
+            <p className="text-xs text-muted-foreground">Quota usage averaged across all providers</p>
+            {windowBars.map((bar) => (
+              <div key={bar.label} className="space-y-1.5">
+                <div className="flex items-baseline justify-between gap-3 text-sm">
+                  <span>
+                    {bar.label}{" "}
+                    <span className="text-xs text-muted-foreground">· {bar.count} quotas averaged</span>
+                  </span>
+                  <span className="shrink-0 font-medium tabular-nums">{bar.avg.toFixed(1)}%</span>
+                </div>
+                <Progress value={Math.min(100, Math.max(0, bar.avg))} indicatorClassName={barTone(bar.avg)} />
+              </div>
+            ))}
+          </div>
+        ) : limitsLoading ? (
+          <div className="space-y-2.5">
+            <div className="h-6 w-2/3 animate-pulse rounded-md bg-muted" />
+            <div className="h-6 w-1/2 animate-pulse rounded-md bg-muted" />
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );
-}
-
-/** Per-provider share of all recorded tokens, biggest first, with a bar per
- * provider so the global counter reads at a glance. */
-function ProviderShareBars({ results, total }: { results: UsageResult[]; total: number }) {
-  const perProvider = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const r of results) {
-      const rep = r.report;
-      if (!rep) continue;
-      const tokens = rep.totalInput + rep.totalOutput;
-      if (tokens <= 0) continue;
-      map.set(r.provider, (map.get(r.provider) ?? 0) + tokens);
-    }
-    return [...map.entries()].sort((a, b) => b[1] - a[1]);
-  }, [results]);
-
-  if (perProvider.length === 0 || total <= 0) return null;
-  const shown = perProvider.slice(0, 7);
-  const rest = perProvider.slice(7).reduce((acc, [, tokens]) => acc + tokens, 0);
-  const rows: [string, number][] = rest > 0 ? [...shown, ["other", rest]] : shown;
-
-  return (
-    <div className="space-y-2.5">
-      <div className="space-y-1">
-        <div className="flex items-center justify-between gap-3 text-sm font-semibold">
-          <span>all providers</span>
-          <span className="shrink-0 tabular-nums">
-            {formatTokens(total)} · 100%
-          </span>
-        </div>
-        <Progress value={100} />
-      </div>
-      {rows.map(([provider, tokens]) => {
-        const share = total > 0 ? tokens / total : 0;
-        return (
-          <div key={provider} className="space-y-1">
-            <div className="flex items-center justify-between gap-3 text-sm">
-              <span className="flex min-w-0 items-center gap-1.5">
-                <ProviderIcon provider={provider} size={13} />
-                <span className="truncate">{provider}</span>
-              </span>
-              <span className="shrink-0 tabular-nums text-muted-foreground">
-                {formatTokens(tokens)} · {Math.round(share * 100)}%
-              </span>
-            </div>
-            <Progress value={clampShare(share)} />
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function clampShare(share: number): number {
-  if (!Number.isFinite(share)) return 0;
-  return Math.min(100, Math.max(0, share * 100));
 }
