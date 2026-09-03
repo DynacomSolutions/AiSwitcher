@@ -145,6 +145,9 @@ export async function authStatus(configs: ToolConfig[] = Object.values(TOOL_CONF
           case "pi":
             result = await probePi(identity.configDir);
             break;
+          default:
+            result = { kind: "none", state: "unknown", detail: "no auth probe for this tool", fixable: [] };
+            break;
         }
       } catch (err) {
         result = { kind: "none", state: "unknown", detail: err instanceof Error ? err.message : "probe failed", fixable: [] };

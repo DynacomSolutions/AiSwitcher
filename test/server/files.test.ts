@@ -26,6 +26,7 @@ function fakeConfig(configDir: string): ToolConfig {
     envVarName: "CLAUDE_CONFIG_DIR",
     identitiesJsonPath: join(configDir, "identities.json"),
     identitiesRootDir: join(configDir, "identities"),
+    globalMemoryProjection: "claude-append-file",
   };
 }
 

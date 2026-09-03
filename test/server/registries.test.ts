@@ -10,13 +10,17 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-async function makeHome(): Promise<{ home: string; registryPath: string; configDir: (name: string) => string }> {
+async function makeHome(): Promise<{
+  home: string;
+  registryPath: string;
+  configDir: (name: string, sub?: string) => string;
+}> {
   const home = await mkdtemp(join(tmpdir(), "ais-registry-"));
   tempDirs.push(home);
   return {
     home,
     registryPath: join(home, ".claude", "identities.json"),
-    configDir: (name: string) => join(home, ".claude", name),
+    configDir: (name: string, sub?: string) => (sub === undefined ? join(home, ".claude", name) : join(home, ".claude", name, sub)),
   };
 }
 
@@ -27,6 +31,7 @@ function fakeConfig(registryPath: string, overrides: Partial<ToolConfig> = {}): 
     envVarName: "CLAUDE_CONFIG_DIR",
     identitiesJsonPath: registryPath,
     identitiesRootDir: join(registryPath, "..", "identities"),
+    globalMemoryProjection: "claude-append-file",
     ...overrides,
   };
 }
