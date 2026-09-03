@@ -7,4 +7,4 @@ spec:
   hostname: ${PROJECT}.dynacom.dev
   prefix: /
   service: ${PROJECT}.dev:80
-  timeout_ms: ${MAPPING_TIMEOUT_MS}
+  timeout_ms: 120000
