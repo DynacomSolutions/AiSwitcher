@@ -340,7 +340,8 @@ export function UsagePage() {
   const totalCost = sumReport(filtered, (r) => r.totalCost);
   const totalInput = sumReport(filtered, (r) => r.totalInput);
   const totalOutput = sumReport(filtered, (r) => r.totalOutput);
-  const totalCache = sumReport(filtered, (r) => r.totalCacheRead + r.totalCacheWrite);
+  const totalCacheRead = sumReport(filtered, (r) => r.totalCacheRead);
+  const totalCacheWrite = sumReport(filtered, (r) => r.totalCacheWrite);
   const totalMessages = sumReport(filtered, (r) => r.totalMessages);
   const hasAnyReport = filtered.some((r) => r.report !== undefined);
 
@@ -393,7 +394,7 @@ export function UsagePage() {
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
             <StatCard label="Input tokens" value={formatTokens(totalInput)} />
             <StatCard label="Output tokens" value={formatTokens(totalOutput)} />
-            <StatCard label="Cache tokens" value={formatTokens(totalCache)} sub="reads + writes" />
+            <StatCard label="Cache tokens" value={formatTokens(totalCacheRead + totalCacheWrite)} sub="reads + writes" />
             <StatCard label="Messages" value={totalMessages.toLocaleString()} />
             <StatCard label="Est. cost" value={formatMoney(totalCost)} sub="filtered set" />
           </div>
@@ -535,6 +536,18 @@ export function UsagePage() {
                     </TableCell>
                   </TableRow>
                 ))}
+                <TableRow className="border-t-2 hover:bg-transparent">
+                  <TableCell colSpan={4} className="font-semibold">
+                    TOTAL
+                  </TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalInput)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalOutput)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalCacheRead)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalCacheWrite)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{totalMessages.toLocaleString()}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatMoney(totalCost)}</TableCell>
+                  <TableCell />
+                </TableRow>
               </TableBody>
             </Table>
           </div>

@@ -110,6 +110,10 @@ export type LimitFetchStatus = "live" | "cached" | "unavailable" | "pending";
 
 export interface ToolLimitResult {
   toolName: ToolName;
+  /** The upstream provider these windows belong to — the grouping key for
+   * provider-first views. A multi-provider client (pi, opencode) answers for
+   * several providers from one identity, one result per provider. */
+  provider: string;
   identity: Identity;
   windows: LimitWindow[];
   status: LimitFetchStatus;
