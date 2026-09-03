@@ -2359,17 +2359,24 @@ What the rule means in practice, now enforced in both pipelines:
   key, same quota endpoint as zai-limits) and `kimi-coding` (OAuth via
   `fetchKimiUsageForCredentials`, refreshing-and-persisting back into pi's
   own auth.json). Fetchable from opencode today: `zai_coding_plan` only.
-  `opencode-go` is skipped entirely: no quota endpoint is known for its
-  keys, and a section that can never show data is tool-shaped noise (a
-  placeholder row was tried and rejected by the user the same day — its
-  real token usage still appears in `ais usage` from pi's session records).
+  `opencode-go` sits between the two: no public limits API is known for
+  its keys (probed live 2026-09-03 against opencode.ai/zen/v1 — usage,
+  limits, quota, subscription and credits paths all 404), but it IS a
+  provider the user holds, so it renders as an honest "no known API" row
+  rather than vanishing (dropping it entirely was tried and reversed by
+  user feedback the same day; its real token usage also appears in
+  `ais usage` from pi's session records).
 - **No tool-shaped placeholder rows exist for the multi-provider clients.**
   Neither a pending seed (the provider isn't known until the adapter reads
   the identity's own auth store — a placeholder would render a fake
   "Detecting providers"/"OpenCode" section) nor a cached-mode row (same
   problem, persistent). Both render nothing until their real per-provider
   results land; an explicit `--tool=` still gets one honest row. 1:1 tools
-  keep their pending spinners unchanged.
+  keep their pending spinners unchanged. The one deliberate exception to
+  "multi-provider rows carry a real provider": a TIMED-OUT pi/opencode
+  fetch reports as Unattributed with the timeout error — a real failure
+  must stay visible, and a tool label would be worse than the honest
+  unknown.
 - **A source with nothing to report renders no row — unless the user asked
   for that source specifically.** Both pipelines thread an `explicitTool`
   flag (`--tool=<t>`): unscoped, an empty tokscale report or a pi identity

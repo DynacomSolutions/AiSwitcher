@@ -124,19 +124,25 @@ async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry
   });
 }
 
-/** OpenCode Go has no AIS tool of its own, no known quota endpoint for its
- * keys, and no native coverage decision — skipped entirely, same stance as
- * the unknown providers. (A placeholder row was tried and rejected by the
- * user the same day: a provider section that can never show data is
- * tool-shaped noise. Its real token usage still appears in `ais usage`,
- * where pi's session records carry the opencode-go provider.) */
+/** OpenCode Go is a real upstream the user holds a credential for, so the
+ * provider section stays visible — but no quota endpoint for its keys is
+ * known today (probed live 2026-09-03 against opencode.ai/zen/v1: usage,
+ * limits, quota, subscription and credits paths all 404), so the row is an
+ * honest "no known API" rather than fabricated windows. Removing the row
+ * entirely was tried and reversed the same day: the provider must still
+ * show up for identities that hold one. Its real token usage already
+ * appears in `ais usage` from pi's session records. */
+function opencodeGoResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): ToolLimitResult | undefined {
+  if (typeof entry.key !== "string" || entry.key.length === 0) return undefined;
+  return unavailable(toolName, "opencode-go", identity, "no public limits API is known for OpenCode Go keys yet");
+}
 
 /** The auth.json entries this adapter will act on, in file order, with every
  * skip decision already applied: native-covered providers are dropped (their
- * branch comes from the native tool), providers with no fetch mechanism are
- * dropped (opencode-go, unknowns — never guessed at), and only entries whose
- * credential is in the shape the corresponding fetch needs survive. Pure —
- * exported for tests. */
+ * branch comes from the native tool), providers with neither a fetcher nor
+ * a visible-row rationale are dropped (unknowns — never guessed at), and
+ * only entries whose credential is in the shape the corresponding fetch
+ * needs survive. Pure — exported for tests. */
 export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string; entry: PiAuthEntry }> {
   const fetchable: Array<{ provider: string; entry: PiAuthEntry }> = [];
   for (const [piProvider, entry] of Object.entries(auth)) {
@@ -146,9 +152,11 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
       if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else if (provider === "kimi") {
       if (!piKimiCredentials(entry)) continue;
+    } else if (provider === "opencode-go") {
+      if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else {
-      // opencode-go and anything unknown: no fetcher and no native coverage
-      // decision — skipped rather than guessed at.
+      // Anything unknown: no fetcher, no native coverage, no row rationale
+      // — skipped rather than guessed at.
       continue;
     }
     fetchable.push({ provider, entry });
@@ -163,9 +171,11 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
  *
  * Fetchable today: `zai` (static API key, same quota endpoint as the zai
  * tool) and `kimi-coding` (OAuth, same usages endpoint as the kimi tool,
- * with refresh-and-persist back into Pi's own auth.json). Native-covered
- * providers are skipped (see NATIVE_COVERED_PI_PROVIDERS); a provider whose
- * entry isn't in a fetchable shape is skipped too. With no readable
+ * with refresh-and-persist back into Pi's own auth.json). `opencode-go`
+ * has no public limits API but stays visible as an honest row (the user
+ * holds the credential). Native-covered providers are skipped (see
+ * NATIVE_COVERED_PI_PROVIDERS); a provider whose entry isn't in a fetchable
+ * shape is skipped too. With no readable
  * auth.json the identity contributes nothing to an unscoped report; an
  * explicit `ais limits --tool=pi` gets one honest "unavailable" row instead
  * of silence (same explicit-question rule as the usage pipeline).
@@ -183,6 +193,9 @@ export async function fetchPiLimits(identity: Identity, explicitTool = false): P
       if (r) results.push(r);
     } else if (provider === "kimi") {
       const r = await kimiResult("pi", identity, entry);
+      if (r) results.push(r);
+    } else if (provider === "opencode-go") {
+      const r = opencodeGoResult("pi", identity, entry);
       if (r) results.push(r);
     }
   }
