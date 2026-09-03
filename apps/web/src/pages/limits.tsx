@@ -3,6 +3,7 @@ import { useMemo } from "react";
 
 import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
+import { GlobalUsageCards } from "@/components/usage-counter";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -149,6 +150,8 @@ export function LimitsPage() {
         description="Live provider quota per identity. The server caches upstream fetches for 45 seconds."
         updatedAt={query.dataUpdatedAt}
       />
+
+      <GlobalUsageCards title="Global usage" />
 
       {query.isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
