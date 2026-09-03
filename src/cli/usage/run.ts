@@ -2,11 +2,13 @@ import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
+import { runBatched } from "../limits/collect.ts";
 import { fetchClaudeLimits } from "../limits/claude-limits.ts";
 import { fetchCodexLimits } from "../limits/codex-limits.ts";
 import { fetchKimiLimits } from "../limits/kimi-limits.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { fetchAliUsage } from "./ali-usage.ts";
+import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, fetchOpencodeIdentityUsage, readOpencodeProfileUsage, resolveOpencodeProfileIdentities } from "./opencode-usage.ts";
 import { fetchPiUsage } from "./pi-usage.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
 import {
@@ -35,6 +37,14 @@ export interface UsageResult {
   sourceTool?: ToolConfig["toolName"];
   /** Pi CLI adapters are covered by this native history when it is present. */
   nativeCoverageTool?: "claude" | "codex";
+  /** Internal: a real failure from a source whose provider can't be named
+   * (a multi-provider client's reader failed before attributing anything).
+   * Never rendered as a provider TABLE row — a fabricated "Unattributed"
+   * row is exactly the pseudo-provider output the provider-first rule
+   * forbids — it surfaces only in the trailing Errors section under its
+   * SOURCE label (`pi/dynacom: ...`). Omitted from every public JSON
+   * result. */
+  sourceOnlyError?: true;
   report?: TokscaleReport;
   error?: string;
   extraCost?: OverageInfo;
@@ -71,12 +81,33 @@ export async function collectTargets(
   return targets;
 }
 
-export function pendingUsageResult(target: UsageTarget): UsageResult {
+/** Pending seed for a not-yet-resolved target. Multi-provider clients (pi,
+ * opencode) get NO seed: their provider isn't known until their own source
+ * resolves, and a placeholder under the tool's fallback label would render
+ * a fake "Detecting providers"/"OpenCode" section — tool-shaped output the
+ * provider-first views rule forbids. Returns undefined for those. */
+export function pendingUsageResult(target: UsageTarget): UsageResult | undefined {
+  if (target.toolName === "pi" || target.toolName === "opencode") return undefined;
   return { provider: providerForTool(target.toolName), identity: target.identity, sourceTool: target.toolName, pending: true };
 }
 
 function providerResult(target: UsageTarget, provider: string, fields: Omit<UsageResult, "provider" | "identity">): UsageResult {
   return { provider: canonicalUsageProvider(provider), identity: target.identity, sourceTool: target.toolName, ...fields };
+}
+
+/** A real failure from a multi-provider source (pi/opencode) whose reader
+ * failed before attributing any provider. Kept out of the provider table —
+ * there is no honest provider to name and a fabricated "Unattributed" row
+ * is tool-shaped noise — and surfaced only in the Errors footer under the
+ * SOURCE label. */
+function sourceErrorResult(target: UsageTarget, error: string): UsageResult {
+  return { provider: "unattributed", identity: target.identity, sourceTool: target.toolName, sourceOnlyError: true, error };
+}
+
+/** The multi-provider clients: sources whose failures have no honest
+ * provider-level row. */
+function isMultiProviderSource(toolName: UsageTarget["toolName"]): boolean {
+  return toolName === "pi" || toolName === "opencode";
 }
 
 /** Sources with nothing to report render no row in an unscoped report — the
@@ -109,16 +140,14 @@ async function runPiUsage(target: UsageTarget, suppression: UsageRowSuppression)
   try {
     const providers = await fetchPiUsage(target.identity);
     if (providers.length === 0) {
-      return suppression.explicitTool
-        ? [providerResult(target, "unattributed", { error: "no local Pi provider usage yet for this identity" })]
-        : [];
+      return suppression.explicitTool ? [sourceErrorResult(target, "no local Pi provider usage yet for this identity")] : [];
     }
     return providers.map(({ provider, nativeCoverageTool, report, dateSpan, dailyUsage }) =>
       providerResult(target, provider, { report, dateSpan, dailyUsage, ...(nativeCoverageTool ? { nativeCoverageTool } : {}) }),
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return [providerResult(target, "unattributed", { error: `Could not read Pi usage: ${message}` })];
+    return [sourceErrorResult(target, `Could not read Pi usage: ${message}`)];
   }
 }
 
@@ -176,7 +205,10 @@ export function providerReportsFromTokscale(target: UsageTarget, report: Tokscal
 async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   const fallbackProvider = providerForTool(target.toolName);
   const invocation = await tokscaleInvocationFor(target.toolName, target.identity);
-  if (!invocation) return [providerResult(target, fallbackProvider, { error: "usage tracking is not supported for this source" })];
+  if (!invocation) {
+    const error = "usage tracking is not supported for this source";
+    return isMultiProviderSource(target.toolName) ? [sourceErrorResult(target, error)] : [providerResult(target, fallbackProvider, { error })];
+  }
   const { env, clientArgs } = invocation;
 
   try {
@@ -186,7 +218,30 @@ async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression
     const message = err instanceof SyntaxError
       ? "Could not parse tokscale's --json output."
       : `Could not run tokscale: ${err instanceof Error ? err.message : String(err)}`;
-    return [providerResult(target, fallbackProvider, { error: message })];
+    return isMultiProviderSource(target.toolName) ? [sourceErrorResult(target, message)] : [providerResult(target, fallbackProvider, { error: message })];
+  }
+}
+
+/** OpenCode identities read their OWN opencode.db directly (exact
+ * per-message provider attribution) instead of tokscale, whose opencode
+ * client collapses multi-plan models into comma-joined pseudo-providers
+ * ("opencode_go, zai_coding_plan") that fragment the report into a row per
+ * spelling — observed live 2026-09-03 with a single dynacom identity
+ * showing four OpenCode-ish rows. Same shape as runPiUsage: per-provider
+ * rows, nothing-to-report suppressed unless the source was asked for
+ * explicitly, real read failures as source-only error rows. */
+async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
+  try {
+    const providers = await fetchOpencodeIdentityUsage(target.identity);
+    if (providers.length === 0) {
+      return suppression.explicitTool ? [sourceErrorResult(target, "no local OpenCode provider usage yet for this identity")] : [];
+    }
+    return providers.map(({ provider, report, dateSpan, dailyUsage }) =>
+      providerResult(target, provider, { report, ...(dateSpan ? { dateSpan } : {}), dailyUsage }),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return [sourceErrorResult(target, `Could not read OpenCode usage: ${message}`)];
   }
 }
 
@@ -194,11 +249,12 @@ async function runOne(target: UsageTarget, suppression: UsageRowSuppression): Pr
   if (target.toolName === "zai") return runZaiUsage(target, suppression);
   if (target.toolName === "ali") return runAliUsage(target, suppression);
   if (target.toolName === "pi") return runPiUsage(target, suppression);
+  if (target.toolName === "opencode") return runOpencodeUsage(target, suppression);
 
   const [results, extraCost, daily] = await Promise.all([
     runTokscale(target, suppression),
     fetchExtraCost(target.toolName, target.identity),
-    fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi" | "opencode", target.identity),
+    fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
   ]);
   const primaryProvider = providerForTool(target.toolName);
   return results.map((result, index) => ({
@@ -242,6 +298,13 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
   const grouped = new Map<string, UsageResult>();
   for (const result of results) {
     if (result.nativeCoverageTool && nativeCoverage.has(`${result.nativeCoverageTool}\u0000${result.identity.name}`)) continue;
+    // Source-only failures never merge: each source's failure stays its own
+    // Errors-footer line under its own source label, never folded into
+    // another source's row (or into a provider group).
+    if (result.sourceOnlyError) {
+      grouped.set(`sourceOnlyError\u0000${result.sourceTool ?? ""}\u0000${result.identity.name}`, result);
+      continue;
+    }
     const provider = canonicalUsageProvider(result.provider);
     const key = `${provider}\u0000${result.identity.name}`;
     const existing = grouped.get(key);
@@ -272,25 +335,24 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
   return [...grouped.values()];
 }
 
-/** Per-target ceiling. A single target whose storage is unreachable (a
- * crush.db on a hung network mount, observed live) must not hold the whole
- * report forever; it degrades to an honest error row instead, matching the
- * existing "report the error, don't crash" contract for unreadable data.
- * 60s: the containerised console scans months of session history over a
- * mounted hostPath (a big codex history clocked past 25s, observed live). */
-const PER_TARGET_TIMEOUT_MS = 60_000;
+// NOTE, deliberately NO per-target timeout here (a 25s cap shipped in the
+// console work and was reverted 2026-09-03; main's interim 60s ceiling sat
+// right on the measured edge and had the same flaw): ~25 targets run
+// concurrently and contend for disk, so a single target's real tokscale
+// scan routinely takes 25-55s on this data volume — the cap turned ENTIRE
+// reports into error rows ("timed out after 25ms", itself mislabeled).
+// Genuine hangs are already bounded where they actually occur: tokscale
+// spawns have their own ceiling (tokscale.ts, 120s), and limits never had
+// a cap either. Truncating good data to bound a pathological hang is the
+// wrong trade for the report — the user has been explicit about this.
 
-async function runOneBounded(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<UsageResult[]>((resolve) => {
-    timer = setTimeout(() => resolve([{ ...pendingUsageResult(target), pending: undefined, error: `timed out after ${PER_TARGET_TIMEOUT_MS / 1000}s` }]), PER_TARGET_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([runOne(target, suppression), timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
+/** Ceiling on targets fetched at once. Every non-zai/ali/pi target spawns a
+ * tokscale child scanning that identity's whole history; with ~25 targets
+ * firing simultaneously the children thrash the disk and EACH one crawls
+ * (25-55s alone; far worse all-parallel). A bounded pool keeps every scan
+ * out of each other's way enough to finish quickly, matches limits's own
+ * fan-out cap, and makes the live render fill in in waves. */
+const USAGE_MAX_CONCURRENT = 6;
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
@@ -298,26 +360,66 @@ export async function runUsageQueryForTargets(
 ): Promise<UsageResult[]> {
   const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
   if (targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
-  const results: UsageResult[][] = new Array(targets.length);
-  await Promise.all(
-    targets.map(async (target, index) => {
-      const targetResults = await runOneBounded(target, suppression);
-      results[index] = targetResults;
-      options.onItemDone?.(index, targetResults);
-    }),
-  );
-  return aggregateUsageResults(results.flat());
+  return runBatched(
+    targets,
+    USAGE_MAX_CONCURRENT,
+    async (target) => runOne(target, suppression),
+    options.onItemDone,
+  ).then((batches) => aggregateUsageResults(batches.flat()));
+}
+
+/** When the default opencode profile contributes to a report: it is the
+ * user's own unscoped opencode usage, so it belongs whenever identities
+ * aren't being filtered, and whenever the query is scoped to opencode at
+ * all — not when scoped to some other tool's registry. */
+export function shouldIncludeDefaultOpencodeProfile(flags: ParsedArgs["flags"]): boolean {
+  if (stringFlag(flags, "identity") !== undefined) return false;
+  const toolFilter = toolConfigFromFlag(flags);
+  return !toolFilter || toolFilter.toolName === "opencode";
+}
+
+/** Raw (pre-aggregation) per-provider rows for the default opencode
+ * profile. Each provider's usage is attributed to the AIS identity whose
+ * credential matches the profile's key — the key identifies the account,
+ * and the account identifies the identity (the user's default profile held
+ * dynacom's OpenCode Go key, so that usage IS dynacom's). The synthetic
+ * "default" identity is the fallback only for providers no identity can
+ * claim. Read failures are real failures: source-only error rows, never
+ * fabricated provider rows. */
+export async function defaultOpencodeProfileUsageResults(): Promise<UsageResult[]> {
+  const fallbackIdentity: Identity = { ...OPENCODE_DEFAULT_PROFILE_IDENTITY, configDir: defaultOpencodeProfileDbPath() };
+  const [outcome, profileIdentities] = await Promise.all([
+    readOpencodeProfileUsage(defaultOpencodeProfileDbPath()),
+    resolveOpencodeProfileIdentities(),
+  ]);
+  if (outcome.kind === "absent") return [];
+  if (outcome.kind === "error") {
+    return [{ provider: "unattributed", identity: fallbackIdentity, sourceTool: "opencode", sourceOnlyError: true, error: `Could not read the default OpenCode profile: ${outcome.message}` }];
+  }
+  return outcome.providers.map(({ provider, report, dateSpan, dailyUsage }) => ({
+    provider: canonicalUsageProvider(provider),
+    identity: profileIdentities.get(canonicalUsageProvider(provider)) ?? fallbackIdentity,
+    sourceTool: "opencode" as const,
+    report,
+    dateSpan,
+    dailyUsage,
+  }));
 }
 
 export async function runUsageQuery(flags: ParsedArgs["flags"]): Promise<UsageResult[]> {
   const targets = await collectTargets(flags);
-  return runUsageQueryForTargets(targets, { explicitTool: toolConfigFromFlag(flags) !== undefined });
+  const includeDefaultProfile = shouldIncludeDefaultOpencodeProfile(flags);
+  const [results, defaultProfileResults] = await Promise.all([
+    runUsageQueryForTargets(targets, { explicitTool: toolConfigFromFlag(flags) !== undefined }),
+    includeDefaultProfile ? defaultOpencodeProfileUsageResults() : Promise.resolve([] as UsageResult[]),
+  ]);
+  return aggregateUsageResults([...results, ...defaultProfileResults]);
 }
 
 /** JSON follows the same provider-first contract as the table. Client/tool
  * provenance is removed from model entries; provider and model remain. */
 export function usageResultsForJson(results: UsageResult[]): unknown[] {
-  return results.map(({ pending: _pending, sourceTool: _sourceTool, nativeCoverageTool: _nativeCoverageTool, ...result }) => ({
+  return results.map(({ pending: _pending, sourceTool: _sourceTool, nativeCoverageTool: _nativeCoverageTool, sourceOnlyError: _sourceOnlyError, ...result }) => ({
     ...result,
     ...(result.report
       ? { report: { ...result.report, entries: result.report.entries.map(({ client: _client, ...entry }) => entry) } }

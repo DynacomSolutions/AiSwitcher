@@ -21,7 +21,7 @@ async function makeIdentity(auth: PiAuthFile | undefined): Promise<Identity> {
 }
 
 describe("fetchablePiProviders", () => {
-  test("keeps fetchable providers, drops native-covered and unknown ones", () => {
+  test("keeps fetchable and visible providers, drops native-covered and unknown ones", () => {
     const auth: PiAuthFile = {
       anthropic: { type: "oauth", access: "a", refresh: "r", expires: 1 },
       "openai-codex": { type: "oauth", access: "a", refresh: "r", expires: 1 },
@@ -34,16 +34,28 @@ describe("fetchablePiProviders", () => {
     };
     // Native-covered providers get their limits branch from claude/codex/
     // grok/ali instead of a duplicate Pi row; unknown providers are never
-    // guessed at; only zai / kimi / opencode-go survive.
+    // guessed at. opencode-go stays visible: the user holds the credential,
+    // so it renders an honest "no public limits API" row (zai / kimi are
+    // the only providers with a real live fetch from Pi today).
     expect(fetchablePiProviders(auth).map(({ provider }) => provider).sort()).toEqual(["kimi", "opencode-go", "zai"]);
   });
 
   test("drops entries whose credential is not in the shape the fetch needs", () => {
     const auth: PiAuthFile = {
       zai: { type: "api_key" },
-      "kimi-coding": { type: "oauth", refresh: "r" },
+      "opencode-go": { type: "api_key" },
     };
     expect(fetchablePiProviders(auth)).toEqual([]);
+  });
+
+  test("an oauth-shaped kimi entry passes the gate even without tokens in pi's copy — the freshest store decides", () => {
+    // ONE credential per (identity, provider): pi's entry is the gate; the
+    // tokens may live (fresher) in the native kimi identity's store. See
+    // kimi-store.ts.
+    const auth: PiAuthFile = {
+      "kimi-coding": { type: "oauth", refresh: "r" },
+    };
+    expect(fetchablePiProviders(auth).map(({ provider }) => provider)).toEqual(["kimi"]);
   });
 });
 

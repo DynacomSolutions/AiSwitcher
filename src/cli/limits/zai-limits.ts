@@ -1,5 +1,6 @@
 import type { Identity } from "../../identities/types.ts";
 import { readZaiApiKey } from "../../identities/zai-auth.ts";
+import { fetchWithRetry } from "./http.ts";
 import type { LimitCategory, LimitWindow, FetchedLimitResult } from "./types.ts";
 
 const QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
@@ -109,9 +110,8 @@ export interface ZaiQuotaOutcome {
 export async function fetchZaiQuotaForKey(apiKey: string): Promise<ZaiQuotaOutcome> {
   let response: Response;
   try {
-    response = await fetch(QUOTA_URL, {
+    response = await fetchWithRetry(QUOTA_URL, {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (err) {
     return { error: `quota fetch failed: ${errorMessage(err)}` };

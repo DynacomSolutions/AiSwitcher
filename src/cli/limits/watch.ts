@@ -32,17 +32,23 @@ export async function runWatch(
     return;
   }
 
-  let results: ToolLimitResult[] = [];
+  let slots: ToolLimitResult[][] = [];
   let statusLine = dim("fetching…");
 
   await withLiveRender(
-    (tick) => `${statusLine}\n\n${formatLimitsReport(aggregateLimitResults(results), new Date(), spinnerChar(tick))}`,
+    (tick) => `${statusLine}\n\n${formatLimitsReport(aggregateLimitResults(slots.flat()), new Date(), spinnerChar(tick))}`,
     async () => {
       while (true) {
         const targets = await collectLimitTargets(identityFilter, flags);
-        results = targets.map(pendingLimitResult);
+        // One slot per target — 1:1 tools seed a pending spinner row,
+        // multi-provider clients seed nothing until their per-provider
+        // rows land (see collect.ts's MULTI_PROVIDER_TOOLS).
+        slots = targets.map((target) => {
+          const pending = pendingLimitResult(target);
+          return pending ? [pending] : [];
+        });
         statusLine = dim("fetching…");
-        await fetchLimitResults(targets, false, explicitTool, (i, resolved) => results.splice(i, 1, ...resolved));
+        await fetchLimitResults(targets, false, explicitTool, (i, resolved) => (slots[i] = resolved));
         statusLine = dim(`updated ${new Date().toLocaleTimeString()}`);
         await Bun.sleep(intervalMs);
       }

@@ -1,15 +1,54 @@
 import { describe, expect, test } from "bun:test";
-import { aggregateLimitResults, runBatched } from "../../../src/cli/limits/collect.ts";
+import { aggregateLimitResults, fetchLimitResults, pendingLimitResult, runBatched } from "../../../src/cli/limits/collect.ts";
 import type { ToolLimitResult } from "../../../src/cli/limits/types.ts";
-import type { Identity } from "../../../src/identities/types.ts";
+import type { Identity, ToolConfig } from "../../../src/identities/types.ts";
 
 function identity(name: string): Identity {
   return { name, label: name, configDir: `/tmp/does-not-exist/${name}` };
 }
 
+function target(toolName: ToolConfig["toolName"], name = "acme") {
+  return { toolName, identity: identity(name) };
+}
+
 function row(overrides: Partial<ToolLimitResult> & Pick<ToolLimitResult, "toolName" | "provider" | "status">): ToolLimitResult {
   return { identity: identity("acme"), windows: [], ...overrides };
 }
+
+describe("pendingLimitResult", () => {
+  test("1:1 tools seed a pending row under their known provider", () => {
+    const pending = pendingLimitResult(target("claude"))!;
+    expect(pending.provider).toBe("anthropic");
+    expect(pending.status).toBe("pending");
+  });
+
+  test("multi-provider clients seed NOTHING — no fake 'Detecting providers'/'OpenCode' section", () => {
+    // Their provider isn't known until the adapter reads the identity's own
+    // auth store; a tool-shaped placeholder row renders a section named
+    // after a tool, which the provider-first views rule forbids.
+    expect(pendingLimitResult(target("pi"))).toBeUndefined();
+    expect(pendingLimitResult(target("opencode"))).toBeUndefined();
+  });
+});
+
+describe("cached-mode results", () => {
+  test("1:1 tools report their honest cached-unavailable row", async () => {
+    const results = await fetchLimitResults([target("claude")], true, false);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.provider).toBe("anthropic");
+    expect(results[0]!.status).toBe("unavailable");
+  });
+
+  test("multi-provider clients render nothing unscoped; an explicit --tool= still gets an honest row", async () => {
+    const targets = [target("pi"), target("opencode")];
+    expect(await fetchLimitResults(targets, true, false)).toEqual([]);
+
+    const explicit = await fetchLimitResults([targets[0]!], true, true);
+    expect(explicit).toHaveLength(1);
+    expect(explicit[0]!.status).toBe("unavailable");
+    expect(explicit[0]!.error).toContain("cached data not available");
+  });
+});
 
 describe("aggregateLimitResults", () => {
   test("merges the same provider+identity reached through two sources into one row", async () => {

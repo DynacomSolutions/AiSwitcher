@@ -337,10 +337,13 @@ export async function runTokscaleProcess(args: string[], env: Record<string, str
 
 /** Hard ceiling for any single tokscale/bunx child. Without it a wedged
  * child (bunx hitting a stalled network, a scan crawling a hung mount)
- * pends the whole usage report forever; observed live 2026-08-26. 55s:
- * sits just under the 60s per-target ceiling (run.ts), and big mounted
- * session histories need well over the old 25s (observed live). */
-const TOKSCALE_SPAWN_TIMEOUT_MS = 55_000;
+ * pends the whole usage report forever; observed live 2026-08-26. Was 25s
+ * — far too tight for the real data on this machine: a 1.3GB opencode.db
+ * scan (or any scan, once ~25 tokscale children contend for disk) routinely
+ * needs 25-55s, and the ceiling turned good data into "timed out" rows.
+ * (main's interim 55s sat exactly ON that measured edge.) 120s still bounds
+ * a genuinely wedged child without truncating real work. */
+const TOKSCALE_SPAWN_TIMEOUT_MS = 120_000;
 
 async function spawnTokscaleProcess(
   cmd: string,
@@ -366,7 +369,11 @@ async function spawnTokscaleProcess(
       } catch {
         // already exited
       }
-      reject(new Error(`${cmd} ${prefixArgs.join(" ")} timed out after ${TOKSCALE_SPAWN_TIMEOUT_MS / 1000}s`));
+      reject(
+        new Error(
+          `${cmd}${prefixArgs.length ? ` ${prefixArgs.join(" ")}` : ""} timed out after ${TOKSCALE_SPAWN_TIMEOUT_MS / 1000}s`,
+        ),
+      );
     }, TOKSCALE_SPAWN_TIMEOUT_MS);
   });
   try {

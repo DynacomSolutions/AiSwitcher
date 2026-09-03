@@ -210,7 +210,9 @@ function errorMessage(err: unknown): string {
  * was no reason to risk the same class of bug claude-limits.ts hit by
  * stripping it.
  */
-export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
+/** One full app-server session. Not exported — fetchCodexLimits wraps this
+ * with the transient-failure retry. */
+async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitResult> {
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "codex", identity };
 
   let binaryPath: string;
@@ -303,4 +305,24 @@ export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimit
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** The codex CLI does its own networking, and chatgpt.com reachability from
+ * this machine blips (observed live 2026-09-03: "error sending request for
+ * url" on one identity in one run, all four fine in the next). When a
+ * session fails FAST with that transport error it costs only a few seconds,
+ * so retry once before reporting — a slow failure (the 9s handshake
+ * timeout) or any other error is reported as-is. */
+const FAST_FAIL_MAX_MS = 15_000;
+
+export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
+  const started = Date.now();
+  const first = await fetchCodexLimitsOnce(identity);
+  const failedFastOnTransport =
+    first.status === "unavailable" &&
+    first.error !== undefined &&
+    /error sending request/.test(first.error) &&
+    Date.now() - started < FAST_FAIL_MAX_MS;
+  if (!failedFastOnTransport) return first;
+  return fetchCodexLimitsOnce(identity);
 }

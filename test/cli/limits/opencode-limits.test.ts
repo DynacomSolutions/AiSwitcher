@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   fetchOpencodeLimits,
   fetchableOpencodeProviders,
+  windowsFromOpencodeGoUsage,
   type OpencodeAuthFile,
 } from "../../../src/cli/limits/opencode-limits.ts";
 import type { Identity } from "../../../src/identities/types.ts";
@@ -28,22 +29,51 @@ async function makeIdentity(auth: OpencodeAuthFile | undefined): Promise<Identit
 }
 
 describe("fetchableOpencodeProviders", () => {
-  test("keeps only providers with a usable key, dropping native-covered and unknown ones", () => {
+  test("keeps providers with a usable key, dropping native-covered and unknown ones", () => {
     // Hyphenated ids are what OpenCode actually writes on disk (confirmed
     // live 2026-09-03); the underscore spellings appear in tokscale output
     // and are aliased separately in usage/providers.ts.
     const auth: OpencodeAuthFile = {
       "zai-coding-plan": { type: "api", key: "zai-key" },
+      "opencode-go": { type: "api", key: "go-key" },
       "alibaba-token-plan": { type: "api", key: "ali-key" },
       "some-future-provider": { type: "api", key: "k" },
       empty_key: { type: "api" },
     };
     // alibaba is native-covered (ali's console-cookie fetch is the only
     // path to its quota), unknown ids are never guessed at, and a keyless
-    // entry has nothing to fetch with.
+    // entry has nothing to fetch with. zai and opencode-go both have live
+    // quota endpoints.
     expect(fetchableOpencodeProviders(auth)).toEqual([
       { provider: "zai", entry: { type: "api", key: "zai-key" } },
+      { provider: "opencode-go", entry: { type: "api", key: "go-key" } },
     ]);
+  });
+});
+
+describe("windowsFromOpencodeGoUsage", () => {
+  test("maps the live wire shape (captured mid-weekly-limit) to session/week/month windows", () => {
+    // Verbatim shape confirmed live 2026-09-03 against the user's own Go
+    // plan while the weekly window was exhausted.
+    const windows = windowsFromOpencodeGoUsage({
+      usage: {
+        rolling: { status: "ok", percent: 0, resetsAt: "2026-09-03T22:08:19.829Z" },
+        weekly: { status: "rate-limited", percent: 100, resetsAt: "2026-09-07T00:00:00.829Z" },
+        monthly: { status: "ok", percent: 53, resetsAt: "2026-09-24T08:39:02.829Z" },
+      },
+    });
+    expect(windows).toHaveLength(3);
+    const [session, week, month] = windows;
+    expect(session).toMatchObject({ label: "session (5h)", category: "session", usedPercent: 0 });
+    expect(session!.resetsAt).toBeTruthy();
+    expect(week).toMatchObject({ label: "week", category: "week", usedPercent: 100, note: "rate-limited" });
+    expect(week!.resetsAt).toBeTruthy();
+    expect(month).toMatchObject({ label: "month", category: "month", usedPercent: 53 });
+  });
+
+  test("an empty usage block yields no windows rather than fabricated ones", () => {
+    expect(windowsFromOpencodeGoUsage({})).toEqual([]);
+    expect(windowsFromOpencodeGoUsage({ usage: {} })).toEqual([]);
   });
 });
 

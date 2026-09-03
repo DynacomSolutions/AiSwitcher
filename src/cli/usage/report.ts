@@ -196,8 +196,13 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
   // has neither `.report` nor `.error` set yet, so the TOTAL row and the
   // trailing "Errors:" section fill in progressively as real results land,
   // same as limits/report.ts's aggregate rollups do for its own live mode.
+  // sourceOnlyError results render NO table row (a fabricated "Unattributed"
+  // row is pseudo-provider output) — they appear only in the Errors footer
+  // under their SOURCE label, so the table rows' indices are built from the
+  // filtered list.
+  const tableResults = results.filter((r) => !r.sourceOnlyError);
   const successes = results.filter((r) => r.report);
-  const rows = results.map((r) => (r.pending ? pendingRow(r, spinnerFrame) : r.report ? successRow(r) : errorRow(r)));
+  const rows = tableResults.map((r) => (r.pending ? pendingRow(r, spinnerFrame) : r.report ? successRow(r) : errorRow(r)));
   const totals = successes.length > 0 ? computeTotals(successes) : undefined;
   const total = successes.length > 1 && totals ? totalRow(totals) : undefined;
   const span = totals ? combinedDateSpan(results) : undefined;
@@ -228,9 +233,9 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
     bold(padRow(HEADERS, widths, NUMERIC_COLUMNS)),
     borderRow(widths, "├", "┼", "┤"),
     ...rows.map((row, i) =>
-      results[i]!.pending
+      tableResults[i]!.pending
         ? dim(padRow(row, widths, NUMERIC_COLUMNS))
-        : results[i]!.error && !results[i]!.report
+        : tableResults[i]!.error && !tableResults[i]!.report
           ? yellow(padRow(row, widths, NUMERIC_COLUMNS))
           : padRow(row, widths, NUMERIC_COLUMNS),
     ),
@@ -249,7 +254,13 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
   if (errors.length > 0) {
     lines.push("");
     lines.push(bold("Errors:"));
-    for (const r of errors) lines.push(`  ${yellow(`${usageProviderLabel(r.provider)}/${r.identity.name}`)}: ${r.error}`);
+    // Source-only failures are labelled by their SOURCE (pi/dynacom), never
+    // by a fabricated provider — the whole point of keeping them out of the
+    // table.
+    for (const r of errors) {
+      const label = r.sourceOnlyError && r.sourceTool ? `${r.sourceTool}/${r.identity.name}` : `${usageProviderLabel(r.provider)}/${r.identity.name}`;
+      lines.push(`  ${yellow(label)}: ${r.error}`);
+    }
   }
 
   return lines.join("\n");

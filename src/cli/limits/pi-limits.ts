@@ -1,8 +1,9 @@
-import { chmod, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { canonicalUsageProvider } from "../usage/providers.ts";
-import { fetchKimiUsageForCredentials, type KimiOAuthCredentials } from "./kimi-limits.ts";
+import { fetchKimiUsageForCredentials } from "./kimi-limits.ts";
+import { persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
+import { fetchOpencodeGoQuotaForKey } from "./opencode-limits.ts";
 import { fetchZaiQuotaForKey } from "./zai-limits.ts";
 import type { OverageInfo, ToolLimitResult } from "./types.ts";
 
@@ -44,41 +45,20 @@ async function readPiAuth(configDir: string): Promise<PiAuthFile | undefined> {
   }
 }
 
-/** Write a refreshed OAuth credential back into Pi's own auth.json —
- * read-modify-write preserving every other provider entry and unknown keys,
- * atomically (temp file + rename) and mode 0600, the same discipline
- * identities/pi-auth.ts and kimi-limits.ts apply to their own stores. */
-async function persistKimiCredential(configDir: string, updated: KimiOAuthCredentials): Promise<void> {
-  const authPath = join(configDir, "auth.json");
-  const auth = await readPiAuth(configDir);
-  if (!auth) throw new Error("could not re-read Pi auth.json to persist the refreshed token");
-  const existing = auth["kimi-coding"];
-  auth["kimi-coding"] = {
-    ...(typeof existing === "object" && existing !== null ? existing : {}),
-    type: "oauth",
-    access: updated.access_token,
-    ...(updated.refresh_token ? { refresh: updated.refresh_token } : {}),
-    ...(updated.expires_at !== undefined ? { expires: updated.expires_at * 1000 } : {}),
-  };
-  const temporary = `${authPath}.ais-${process.pid}-${crypto.randomUUID()}`;
-  try {
-    await mkdir(join(configDir), { recursive: true, mode: 0o700 });
-    await writeFile(temporary, `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-    await rename(temporary, authPath);
-    await chmod(authPath, 0o600);
-  } catch (error) {
-    await unlink(temporary).catch(() => undefined);
-    throw error;
-  }
-}
-
-function piKimiCredentials(entry: PiAuthEntry): KimiOAuthCredentials | undefined {
-  if (entry.type !== "oauth" || typeof entry.access !== "string" || entry.access.length === 0) return undefined;
-  return {
-    access_token: entry.access,
-    ...(typeof entry.refresh === "string" && entry.refresh.length > 0 ? { refresh_token: entry.refresh } : {}),
-    ...(typeof entry.expires === "number" && Number.isFinite(entry.expires) ? { expires_at: Math.floor(entry.expires / 1000) } : {}),
-  };
+/** One credential per (identity, provider): the pi entry is only a gate —
+ * the tokens used (and refreshed) are the FRESHEST copy across the kimi and
+ * pi stores, and a refresh is written through to both (see kimi-store.ts). */
+async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): Promise<ToolLimitResult | undefined> {
+  if (entry.type !== "oauth") return undefined;
+  const credentials = await readFreshestKimiCredentials(identity, "pi");
+  if (!credentials) return undefined;
+  const outcome = await fetchKimiUsageForCredentials(credentials, (next) => persistKimiCredentials(identity, "pi", next));
+  if (outcome.error || !outcome.windows) return unavailable(toolName, "kimi", identity, outcome.error ?? "usage fetch failed");
+  return result(toolName, "kimi", identity, {
+    status: "live",
+    windows: outcome.windows,
+    ...(outcome.overage ? { overage: outcome.overage } : {}),
+  });
 }
 
 function result(
@@ -112,32 +92,23 @@ async function zaiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry)
   return result(toolName, "zai", identity, { status: "live", windows: outcome.windows });
 }
 
-async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): Promise<ToolLimitResult | undefined> {
-  const credentials = piKimiCredentials(entry);
-  if (!credentials) return undefined;
-  const outcome = await fetchKimiUsageForCredentials(credentials, (next) => persistKimiCredential(identity.configDir, next));
-  if (outcome.error || !outcome.windows) return unavailable(toolName, "kimi", identity, outcome.error ?? "usage fetch failed");
-  return result(toolName, "kimi", identity, {
-    status: "live",
-    windows: outcome.windows,
-    ...(outcome.overage ? { overage: outcome.overage } : {}),
-  });
-}
-
-/** OpenCode Go is a Pi-native provider with no AIS tool of its own and no
- * known quota endpoint for its keys — reported honestly rather than silently
- * dropped, so the OpenCode Go section still shows which identities hold one. */
-function opencodeGoResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): ToolLimitResult | undefined {
+/** OpenCode Go has a REAL quota endpoint (found 2026-09-03 after the user
+ * hit their weekly limit blind: GET opencode.ai/zen/go/v1/usage with the
+ * Go API key returns the plan's three dollar-window percentages) — the
+ * same fetch the opencode adapter uses; only the key's home differs. */
+async function opencodeGoResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): Promise<ToolLimitResult | undefined> {
   if (typeof entry.key !== "string" || entry.key.length === 0) return undefined;
-  return unavailable(toolName, "opencode-go", identity, "no limits API is known for OpenCode Go keys yet");
+  const outcome = await fetchOpencodeGoQuotaForKey(entry.key);
+  if (outcome.error || !outcome.windows) return unavailable(toolName, "opencode-go", identity, outcome.error ?? "quota fetch failed");
+  return result(toolName, "opencode-go", identity, { status: "live", windows: outcome.windows });
 }
 
 /** The auth.json entries this adapter will act on, in file order, with every
  * skip decision already applied: native-covered providers are dropped (their
- * branch comes from the native tool), providers with no fetcher and no
- * coverage decision are dropped (never guessed at), and only entries whose
- * credential is in the shape the corresponding fetch needs survive. Pure —
- * exported for tests. */
+ * branch comes from the native tool), providers with neither a fetcher nor
+ * a visible-row rationale are dropped (unknowns — never guessed at), and
+ * only entries whose credential is in the shape the corresponding fetch
+ * needs survive. Pure — exported for tests. */
 export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string; entry: PiAuthEntry }> {
   const fetchable: Array<{ provider: string; entry: PiAuthEntry }> = [];
   for (const [piProvider, entry] of Object.entries(auth)) {
@@ -146,10 +117,12 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
     if (provider === "zai") {
       if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else if (provider === "kimi") {
-      if (!piKimiCredentials(entry)) continue;
+      if (entry.type !== "oauth") continue;
     } else if (provider === "opencode-go") {
       if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else {
+      // Anything unknown: no fetcher, no native coverage, no row rationale
+      // — skipped rather than guessed at.
       continue;
     }
     fetchable.push({ provider, entry });
@@ -164,9 +137,11 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
  *
  * Fetchable today: `zai` (static API key, same quota endpoint as the zai
  * tool) and `kimi-coding` (OAuth, same usages endpoint as the kimi tool,
- * with refresh-and-persist back into Pi's own auth.json). Native-covered
- * providers are skipped (see NATIVE_COVERED_PI_PROVIDERS); a provider whose
- * entry isn't in a fetchable shape is skipped too. With no readable
+ * with refresh-and-persist back into Pi's own auth.json). `opencode-go`
+ * has no public limits API but stays visible as an honest row (the user
+ * holds the credential). Native-covered providers are skipped (see
+ * NATIVE_COVERED_PI_PROVIDERS); a provider whose entry isn't in a fetchable
+ * shape is skipped too. With no readable
  * auth.json the identity contributes nothing to an unscoped report; an
  * explicit `ais limits --tool=pi` gets one honest "unavailable" row instead
  * of silence (same explicit-question rule as the usage pipeline).
@@ -186,7 +161,7 @@ export async function fetchPiLimits(identity: Identity, explicitTool = false): P
       const r = await kimiResult("pi", identity, entry);
       if (r) results.push(r);
     } else if (provider === "opencode-go") {
-      const r = opencodeGoResult("pi", identity, entry);
+      const r = await opencodeGoResult("pi", identity, entry);
       if (r) results.push(r);
     }
   }

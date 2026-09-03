@@ -202,3 +202,28 @@ describe("provider-first usage results", () => {
     expect(jsonReport.entries[0]?.provider).toBe("openai");
   });
 });
+
+describe("source-only error results", () => {
+  const usageIdentity = { name: "work", label: "Work", configDir: "/tmp/work" };
+
+  test("pass through aggregation unmerged — each source's failure stays its own footer line", () => {
+    const piFailure: UsageResult = {
+      provider: "unattributed", identity: usageIdentity, sourceTool: "pi", sourceOnlyError: true, error: "pi boom",
+    };
+    const opencodeFailure: UsageResult = {
+      provider: "unattributed", identity: usageIdentity, sourceTool: "opencode", sourceOnlyError: true, error: "opencode boom",
+    };
+    const merged = aggregateUsageResults([piFailure, opencodeFailure]);
+    expect(merged).toHaveLength(2);
+    expect(merged.map((r) => r.sourceTool).sort()).toEqual(["opencode", "pi"]);
+  });
+
+  test("are stripped from JSON output like the other internal provenance", () => {
+    const [json] = usageResultsForJson([
+      { provider: "unattributed", identity: usageIdentity, sourceTool: "pi", sourceOnlyError: true, error: "boom" },
+    ]) as Array<Record<string, unknown>>;
+    expect(json).not.toHaveProperty("sourceOnlyError");
+    expect(json).not.toHaveProperty("sourceTool");
+    expect(json?.error).toBe("boom");
+  });
+});

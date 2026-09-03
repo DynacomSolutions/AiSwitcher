@@ -1,7 +1,9 @@
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { categorizeByMinutes } from "./bucket.ts";
+import { fetchWithRetry } from "./http.ts";
+import { persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
 import type { LimitCategory, LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
 
 const USAGES_URL = "https://api.kimi.com/coding/v1/usages";
@@ -212,6 +214,16 @@ export interface KimiOAuthCredentials {
   expires_at?: number;
 }
 
+/** The kimi credentials-file shape narrowed to the token fields. */
+function credentialsFrom(raw: CredentialsFile): KimiOAuthCredentials | undefined {
+  if (!raw.access_token) return undefined;
+  return {
+    access_token: raw.access_token,
+    ...(typeof raw.refresh_token === "string" ? { refresh_token: raw.refresh_token } : {}),
+    ...(typeof raw.expires_at === "number" ? { expires_at: raw.expires_at } : {}),
+  };
+}
+
 /** The same refresh-and-persist the kimi CLI itself performs on launch and
  * tokscale performs on read (cross-checked against tokscale's kimi quota
  * fetcher, crates/tokscale-cli/src/commands/usage/kimi.rs): without it, any
@@ -292,9 +304,11 @@ export async function fetchKimiUsageForCredentials(
   }
 
   const fetchUsages = (token: string) =>
-    fetch(USAGES_URL, {
+    // Retry wrapper, NOT applied to the token refresh above: refreshing is
+    // rotating — a blind retry after a lost response would race the rotated
+    // token. The usages GET is a pure read, safe to retry.
+    fetchWithRetry(USAGES_URL, {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
   let response: Response;
@@ -369,42 +383,39 @@ export async function fetchKimiLimits(identity: Identity): Promise<FetchedLimitR
     credentials = JSON.parse(await readFile(credentialsPath, "utf8")) as CredentialsFile;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      credentials = {};
+    } else if (err instanceof SyntaxError) {
+      return { ...base, windows: [], status: "unavailable", error: `could not parse credentials file: ${err.message}` };
+    } else {
+      return { ...base, windows: [], status: "unavailable", error: errorMessage(err) };
+    }
+  }
+
+  // ONE credential per (identity, provider): when this identity's own file
+  // is missing or blank, a same-named pi identity's projected copy may hold
+  // the live token — prefer the freshest copy across stores before giving
+  // up (see kimi-store.ts).
+  let source: KimiOAuthCredentials | undefined = credentialsFrom(credentials);
+  if (!source) {
+    source = await readFreshestKimiCredentials(identity, "kimi");
+    if (!source) {
       return {
         ...base,
         windows: [],
         status: "unavailable",
-        error: "not authenticated (no credentials file — run `kimi` under this identity to log in)",
+        error: credentials.access_token || credentials.refresh_token
+          ? "not authenticated (credentials file has no usable access_token — run `kimi` under this identity to log in)"
+          : "not authenticated (no credentials file — run `kimi` under this identity to log in)",
       };
     }
-    if (err instanceof SyntaxError) {
-      return { ...base, windows: [], status: "unavailable", error: `could not parse credentials file: ${err.message}` };
-    }
-    return { ...base, windows: [], status: "unavailable", error: errorMessage(err) };
-  }
-  if (!credentials.access_token) {
-    return {
-      ...base,
-      windows: [],
-      status: "unavailable",
-      error: "not authenticated (credentials file has no access_token — run `kimi` under this identity to log in)",
-    };
   }
 
-  /** Same atomic write the refresh flow has always used: temp file in the
-   * same directory + rename, so a crash mid-write can't leave a truncated
-   * credentials file, with the file's original 0600 mode. Unknown keys in
-   * the file are preserved verbatim across the round-trip. */
-  const persist = async (next: KimiOAuthCredentials): Promise<void> => {
-    const merged: CredentialsFile = { ...credentials, ...next };
-    const tempPath = `${credentialsPath}.tmp-${process.pid}`;
-    await writeFile(tempPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
-    await rename(tempPath, credentialsPath);
-  };
+  // Write-through: the rotated token lands in EVERY store of this account
+  // (own credentials file AND the same-named pi identity's projected copy),
+  // so the two never race for the live refresh token (see kimi-store.ts).
+  const persist = (next: KimiOAuthCredentials): Promise<void> => persistKimiCredentials(identity, "kimi", next);
 
-  const outcome = await fetchKimiUsageForCredentials(
-    { access_token: credentials.access_token, refresh_token: credentials.refresh_token, expires_at: credentials.expires_at },
-    persist,
-  );
+  const outcome = await fetchKimiUsageForCredentials(source, persist);
   if (outcome.error || !outcome.windows) {
     return { ...base, windows: [], status: "unavailable", error: outcome.error };
   }

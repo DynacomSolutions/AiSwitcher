@@ -161,7 +161,7 @@ export async function fetchPiUsage(identity: Identity): Promise<PiProviderUsage[
         const estimatedCost =
           recordedCost > 0
             ? recordedCost
-            : provider === "zai" || provider === "alibaba"
+            : provider === "zai" || provider === "alibaba" || provider === "opencode-go"
               ? estimateDetailedModelTokenCost(provider, model, input, output, cacheRead, cacheWrite) ?? 0
               : 0;
         const aggregateKey = `${provider}\u0000${nativeCoverageTool ?? ""}`;

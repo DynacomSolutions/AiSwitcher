@@ -2357,10 +2357,74 @@ What the rule means in practice, now enforced in both pipelines:
   and a pi/opencode row would either duplicate the branch or add an
   unactionable "can't fetch" line. Fetchable from pi today: `zai` (static
   key, same quota endpoint as zai-limits), `kimi-coding` (OAuth via
-  `fetchKimiUsageForCredentials`, refreshing-and-persisting back into pi's
-  own auth.json), and `opencode-go` (honest "no known limits API" row, so
-  the section still shows who holds one). Fetchable from opencode today:
-  `zai_coding_plan` only.
+  `fetchKimiUsageForCredentials`), and `opencode-go` (same Go-plan quota
+  endpoint as opencode-limits). Fetchable from opencode today:
+  `zai_coding_plan` and `opencode-go`.
+  **OpenCode Go's quota endpoint** (`GET
+  https://opencode.ai/zen/go/v1/usage`, Bearer the Go API key) was found
+  2026-09-03 by probing the Go gateway directly — an earlier probe sweep
+  against `/zen/v1/*` (the WRONG base path; Go keys live under
+  `/zen/go/v1`) all 404'd, which produced a bogus "no public limits API"
+  claim that user feedback killed the same day: the user hit their weekly
+  limit with no way to see it. The endpoint returns the plan's three
+  DOLLAR-denominated windows ($12/5h rolling, $30 weekly, $60 monthly) as
+  `usage.{rolling,weekly,monthly}.{status,percent,resetsAt}` — percent is
+  share-of-window-budget, `status: "rate-limited"` marks an exhausted
+  window. Its real token usage also appears in `ais usage` (see
+  usage/opencode-usage.ts).
+  **OpenCode identity usage also reads its db directly** (added 2026-09-03
+  after the user saw ONE dynacom plan rendered as FOUR rows): tokscale's
+  opencode client collapses multi-plan models into comma-joined
+  pseudo-providers ("opencode_go, zai_coding_plan") and underscore
+  spellings, fragmenting the report. Identity dbs are read with the same
+  exact per-message providerID attribution as the default profile, and
+  canonicalUsageProvider splits comma-joined provider strings so any
+  residual joined form still collapses to one stable key. The db scan
+  yields every ~500 rows — bun:sqlite is synchronous, and an unyielding
+  scan of a multi-GB db froze the live render's spinners.
+  **Default-profile usage is attributed by CREDENTIAL MATCH, not scope**
+  (fixed 2026-09-03 after the user corrected it hard: their unscoped
+  `~/.local/share/opencode` profile held dynacom's OpenCode Go key, and
+  logging that usage under a synthetic "default" identity was wrong —
+  "ALL USAGE WE HAVE IS FOR DYNACOM"). The profile's auth.json keys are
+  matched against every opencode/pi identity's keys; usage logs under the
+  identity holding the same credential. The synthetic "default" identity
+  is the fallback ONLY for providers no identity can claim.
+- **ONE credential per (identity, provider) — kimi-store.ts.** Kimi rotates
+  its OAuth refresh token on EVERY refresh, and the same account's
+  credentials exist in two stores: the kimi identity's
+  `credentials/kimi-code.json` (the kimi CLI's own file) and the same-named
+  pi identity's imported `auth.json` "kimi-coding" entry. Left independent,
+  whichever store refreshed first invalidated the other — every few days
+  an access-token expiry stranded a store with HTTP 400 until manual
+  re-auth (observed live 2026-09-03, both kimi identities). The stores are
+  now views of ONE logical token: reads take the FRESHEST copy
+  (freshest-wins self-heals), and every refresh is written through to ALL
+  of the account's stores in each store's own shape (pi's expires is
+  milliseconds, kimi's seconds). pi's entry is thus a live projection, not
+  a fork. The same law will need the same treatment for the other OAuth
+  providers pi holds copies of (anthropic, openai-codex, xai) — kimi is
+  where rotation made the race an everyday failure, so it went first.
+- **No tool-shaped placeholder rows exist for the multi-provider clients.**
+  Neither a pending seed (the provider isn't known until the adapter reads
+  the identity's own auth store — a placeholder would render a fake
+  "Detecting providers"/"OpenCode" section) nor a cached-mode row (same
+  problem, persistent). Both render nothing until their real per-provider
+  results land; an explicit `--tool=` still gets one honest row. 1:1 tools
+  keep their pending spinners unchanged.
+- **No per-target timeout in the shared usage engine.** The console work
+  added a 25s `runOneBounded` cap; on this machine ~25 targets run
+  concurrently and contend for disk, so real scans routinely take 25-55s
+  and the cap turned ENTIRE reports into error rows (labeled "timed out
+  after 25ms" — the unit math was wrong too). Reverted 2026-09-03: the CLI
+  must never truncate good data; genuine hangs stay bounded where they
+  actually occur (tokscale's own spawn timeout; limits has never had a
+  cap). Multi-provider source failures (a pi/opencode reader crashing
+  before attributing any provider) are flagged `sourceOnlyError`: they
+  render NO provider table row — never a fabricated "Unattributed" row —
+  and surface only in the trailing Errors section under their SOURCE label
+  (`pi/dynacom: ...`), the same "per-tool in diagnostics" allowance as the
+  internal logs.
 - **A source with nothing to report renders no row — unless the user asked
   for that source specifically.** Both pipelines thread an `explicitTool`
   flag (`--tool=<t>`): unscoped, an empty tokscale report or a pi identity
