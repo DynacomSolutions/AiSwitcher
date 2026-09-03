@@ -19,6 +19,17 @@ describe("canonicalUsageProvider", () => {
     expect(canonicalUsageProvider("alibaba_token_plan")).toBe("alibaba");
   });
 
+  test("opencode's own auth.json provider ids (HYPHENS on disk) map to the same upstreams as their underscore spellings", () => {
+    // Confirmed live 2026-09-03: ~/.opencode/identities/<name>/data/opencode/
+    // auth.json keys are "zai-coding-plan"/"alibaba-token-plan", while
+    // tokscale's opencode client emits the underscore variants. Both must
+    // collapse onto one upstream or the limits adapter would silently skip
+    // fetchable credentials and the usage report would split one upstream
+    // into two rows.
+    expect(canonicalUsageProvider("zai-coding-plan")).toBe("zai");
+    expect(canonicalUsageProvider("alibaba-token-plan")).toBe("alibaba");
+  });
+
   test("normalises case and surrounding whitespace before lookup", () => {
     expect(canonicalUsageProvider("  ZAI_CODING_PLAN ")).toBe("zai");
     expect(canonicalUsageProvider("Anthropic")).toBe("anthropic");

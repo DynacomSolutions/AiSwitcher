@@ -13,10 +13,15 @@ const PROVIDER_ALIASES: Record<string, string> = {
   "local-kimi": "kimi",
   moonshot: "kimi",
   zai: "zai",
+  // OpenCode names its plan credentials with underscores in tokscale output
+  // but HYPHENS in its own auth.json ("zai-coding-plan" et al, confirmed on
+  // disk) — both spellings must collapse onto the same upstream.
   "zai_coding_plan": "zai",
+  "zai-coding-plan": "zai",
   alibaba: "alibaba",
   "alibaba-plan": "alibaba",
   "alibaba_token_plan": "alibaba",
+  "alibaba-token-plan": "alibaba",
   "opencode-go": "opencode-go",
   "party-cli": "unattributed",
 };
