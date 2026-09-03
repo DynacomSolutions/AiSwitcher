@@ -24,7 +24,7 @@ import type { ToolConfig } from "../identities/types.ts";
  * fail resolving `/Applications/Crush.app`, same as grok/kimi.
  */
 export function launchDesktopApp(
-  appName: "Claude" | "Codex" | "Grok" | "Kimi" | "Crush" | "Pi",
+  appName: "Claude" | "Codex" | "Grok" | "Kimi" | "Crush" | "Pi" | "OpenCode",
   envVarName: ToolConfig["envVarName"],
   configDirValue: string,
   extraEnvVarNames: Array<{ name: string; subdir?: string }> = [],

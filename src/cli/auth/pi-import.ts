@@ -44,7 +44,7 @@ async function openCodeGoApiKey(flags: ParsedArgs["flags"]): Promise<string | un
 
   const result = await clack.password({
     message: "OpenCode Go API key",
-    validate: (value) => value.trim() ? undefined : "API key is required",
+    validate: (value) => (value?.trim() ? undefined : "API key is required"),
   });
   if (clack.isCancel(result)) throw new CliUsageError("OpenCode Go credential import cancelled");
   return result.trim();

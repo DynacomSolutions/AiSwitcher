@@ -18,7 +18,10 @@ interface AuthSessionState {
 }
 
 interface WebDriverResponse {
-  value?: { sessionId?: string; [key: string]: unknown };
+  // Deliberately unknown: WebDriver payloads vary per endpoint (a session id
+  // object, a plain string, null, a cookie array); every consumer narrows at
+  // its own use site.
+  value?: unknown;
 }
 
 async function cdpCommand(port: number, method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -148,7 +151,7 @@ async function ensureSession(identityName: string, openDashboard: boolean): Prom
       },
     },
   });
-  const sessionId = created.payload?.value?.sessionId;
+  const sessionId = (created.payload?.value as { sessionId?: string } | undefined)?.sessionId;
   if (!created.response.ok || typeof sessionId !== "string" || !sessionId) return undefined;
 
   const state: AuthSessionState = {

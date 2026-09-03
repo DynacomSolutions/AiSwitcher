@@ -28,6 +28,7 @@ function codexConfig(home: string): ToolConfig {
     toolName: "codex",
     realBinaryName: "codex",
     envVarName: "CODEX_HOME",
+    globalMemoryProjection: "codex-developer-instructions",
     identitiesJsonPath: join(home, ".codex", "identities.json"),
     identitiesRootDir: join(home, ".codex", "identities"),
   };

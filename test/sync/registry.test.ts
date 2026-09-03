@@ -19,6 +19,7 @@ const cfg: ToolConfig = {
   toolName: "codex",
   realBinaryName: "codex",
   envVarName: "CODEX_HOME",
+  globalMemoryProjection: "codex-developer-instructions",
   identitiesJsonPath: "/Users/alice/.codex/identities.json",
   identitiesRootDir: "/Users/alice/.codex/identities",
 };
