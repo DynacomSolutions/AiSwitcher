@@ -173,6 +173,17 @@ describe("provider-first usage results", () => {
     expect(aggregateUsageResults([piBridge])[0]?.report?.totalInput).toBe(50);
   });
 
+  test("an empty tokscale report renders no row unless the source was explicitly asked for", () => {
+    // A registered-but-never-used client otherwise shows up as a "0 messages"
+    // row under a pseudo-provider label — noise in a provider-first view.
+    const target = { toolName: "opencode" as const, identity: usageIdentity };
+    expect(providerReportsFromTokscale(target, report([]))).toEqual([]);
+    const explicit = providerReportsFromTokscale(target, report([]), { explicitTool: true });
+    expect(explicit).toHaveLength(1);
+    expect(explicit[0]!.provider).toBe("opencode");
+    expect(explicit[0]!.report?.entries).toHaveLength(0);
+  });
+
   test("JSON exposes providers and models, not wrapper/client names", () => {
     const [json] = usageResultsForJson([
       {

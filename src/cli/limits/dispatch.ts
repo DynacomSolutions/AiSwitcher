@@ -1,7 +1,8 @@
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { spinnerChar, withLiveRender } from "../live.ts";
-import { collectLimitTargets, fetchLimitResults, pendingLimitResult, runLimitsQuery } from "./collect.ts";
+import { aggregateLimitResults, collectLimitTargets, fetchLimitResults, pendingLimitResult, runLimitsQuery } from "./collect.ts";
+import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { formatLimitsReport } from "./report.ts";
 import type { ToolLimitResult } from "./types.ts";
 import { runWatch } from "./watch.ts";
@@ -38,10 +39,11 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
   const json = boolFlag(flags, "json");
   const cached = boolFlag(flags, "cached");
   const watch = boolFlag(flags, "watch");
+  const explicitTool = toolConfigFromFlag(flags) !== undefined;
 
   if (watch) {
     if (json) throw new CliUsageError("--watch and --json cannot be combined.");
-    return runWatch(identityFilter, flags, parseIntervalSeconds(flags) * 1000);
+    return runWatch(identityFilter, flags, explicitTool, parseIntervalSeconds(flags) * 1000);
   }
 
   // Live per-row-spinner render: only when there's an actual TTY to redraw
@@ -55,9 +57,14 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
     const targets = await collectLimitTargets(identityFilter, flags);
     const results: ToolLimitResult[] = targets.map(pendingLimitResult);
     await withLiveRender(
-      (tick) => formatLimitsReport(results, new Date(), spinnerChar(tick)),
+      // aggregateLimitResults on every frame: a multi-provider target
+      // resolves to several rows at once, and the same provider+identity can
+      // also be answered by more than one target (a Z.ai key imported into
+      // Pi is the account the zai tool queries too) — the flat list must not
+      // show duplicate branches mid-render.
+      (tick) => formatLimitsReport(aggregateLimitResults(results), new Date(), spinnerChar(tick)),
       async () => {
-        await fetchLimitResults(targets, cached, (i, result) => (results[i] = result));
+        await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => results.splice(i, 1, ...resolved));
       },
     );
     return;

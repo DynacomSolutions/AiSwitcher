@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { categorizeByLabel } from "./bucket.ts";
-import type { ToolLimitResult } from "./types.ts";
+import type { FetchedLimitResult } from "./types.ts";
 
 const BILLING_EVENT_MSG = "billing: fetched credits config";
 
@@ -31,8 +31,8 @@ function formatResetsAt(end: string | undefined): string | undefined {
  * scan for the last "billing: fetched credits config" line rather than a
  * live query. Always `status: "cached"`, never "live", since freshness here
  * is entirely a function of when this identity was last actually used. */
-export async function fetchGrokLimits(identity: Identity): Promise<ToolLimitResult> {
-  const base: Pick<ToolLimitResult, "toolName" | "identity"> = { toolName: "grok", identity };
+export async function fetchGrokLimits(identity: Identity): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "grok", identity };
   const logPath = join(identity.configDir, "logs", "unified.jsonl");
 
   let text: string;

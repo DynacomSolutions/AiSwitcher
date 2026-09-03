@@ -1,6 +1,6 @@
 import type { Identity } from "../../identities/types.ts";
 import { readZaiApiKey } from "../../identities/zai-auth.ts";
-import type { LimitCategory, LimitWindow, ToolLimitResult } from "./types.ts";
+import type { LimitCategory, LimitWindow, FetchedLimitResult } from "./types.ts";
 
 const QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
 const FETCH_TIMEOUT_MS = 10_000;
@@ -96,6 +96,52 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+export interface ZaiQuotaOutcome {
+  windows?: LimitWindow[];
+  error?: string;
+}
+
+/** The live quota read for ONE Z.ai API key — shared by the zai tool's own
+ * fetcher (key from that identity's crush.json) and the pi/opencode
+ * adapters (keys from their own auth stores, typically the same account
+ * imported at identity-creation time). Auth/network/shape handling is
+ * identical either way: only the key differs. */
+export async function fetchZaiQuotaForKey(apiKey: string): Promise<ZaiQuotaOutcome> {
+  let response: Response;
+  try {
+    response = await fetch(QUOTA_URL, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return { error: `quota fetch failed: ${errorMessage(err)}` };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return { error: `authentication rejected (HTTP ${response.status}) — check this identity's Z.ai API key` };
+  }
+  if (!response.ok) {
+    return { error: `quota fetch failed (HTTP ${response.status})` };
+  }
+
+  let payload: ZaiQuotaResponseWire;
+  try {
+    payload = (await response.json()) as ZaiQuotaResponseWire;
+  } catch (err) {
+    return { error: `could not parse quota response: ${errorMessage(err)}` };
+  }
+
+  if (payload.success === false) {
+    return { error: payload.msg ?? "Z.ai reported the quota request failed" };
+  }
+
+  const windows = windowsFromZaiQuotaResponse(payload);
+  if (windows.length === 0) {
+    return { error: "zai reported no quota windows" };
+  }
+  return { windows };
+}
+
 /**
  * Fetches live quota usage for one zai identity via
  * `GET https://api.z.ai/api/monitor/usage/quota/limit`, authenticated with
@@ -103,8 +149,8 @@ function errorMessage(err: unknown): string {
  * (via `readZaiApiKey`) — a static key, not OAuth, so unlike kimi-limits.ts
  * there is no token-refresh flow needed here at all.
  */
-export async function fetchZaiLimits(identity: Identity): Promise<ToolLimitResult> {
-  const base: Pick<ToolLimitResult, "toolName" | "identity"> = { toolName: "zai", identity };
+export async function fetchZaiLimits(identity: Identity): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "zai", identity };
 
   const apiKey = await readZaiApiKey(identity.configDir);
   if (!apiKey) {
@@ -116,42 +162,9 @@ export async function fetchZaiLimits(identity: Identity): Promise<ToolLimitResul
     };
   }
 
-  let response: Response;
-  try {
-    response = await fetch(QUOTA_URL, {
-      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-  } catch (err) {
-    return { ...base, windows: [], status: "unavailable", error: `quota fetch failed: ${errorMessage(err)}` };
+  const outcome = await fetchZaiQuotaForKey(apiKey);
+  if (outcome.error || !outcome.windows) {
+    return { ...base, windows: [], status: "unavailable", error: outcome.error };
   }
-
-  if (response.status === 401 || response.status === 403) {
-    return {
-      ...base,
-      windows: [],
-      status: "unavailable",
-      error: `authentication rejected (HTTP ${response.status}) — check this identity's Z.ai API key`,
-    };
-  }
-  if (!response.ok) {
-    return { ...base, windows: [], status: "unavailable", error: `quota fetch failed (HTTP ${response.status})` };
-  }
-
-  let payload: ZaiQuotaResponseWire;
-  try {
-    payload = (await response.json()) as ZaiQuotaResponseWire;
-  } catch (err) {
-    return { ...base, windows: [], status: "unavailable", error: `could not parse quota response: ${errorMessage(err)}` };
-  }
-
-  if (payload.success === false) {
-    return { ...base, windows: [], status: "unavailable", error: payload.msg ?? "Z.ai reported the quota request failed" };
-  }
-
-  const windows = windowsFromZaiQuotaResponse(payload);
-  if (windows.length === 0) {
-    return { ...base, windows: [], status: "unavailable", error: "zai reported no quota windows" };
-  }
-  return { ...base, windows, status: "live", capturedAt: new Date().toISOString() };
+  return { ...base, windows: outcome.windows, status: "live", capturedAt: new Date().toISOString() };
 }

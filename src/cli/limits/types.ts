@@ -60,8 +60,15 @@ export interface OverageInfo {
 
 export interface ToolLimitResult {
   toolName: ToolConfig["toolName"];
-  identity: Identity;
-  windows: LimitWindow[];
+  /** The upstream provider these windows belong to — the report's grouping
+   * key, per the provider-first views rule (the tool/wrapper is collection
+   * provenance, not a reporting dimension). For the six 1:1 tools this is
+   * just providerForTool(toolName); the multi-provider clients (pi, opencode)
+   * set one result per provider they can actually answer for, so a single Pi
+   * identity can contribute a Kimi row and a Z.ai row at once. Canonical
+   * aliases come from usage/providers.ts. */
+  provider: string;
+  identity: Identity;  windows: LimitWindow[];
   status: LimitFetchStatus;
   /** Human-readable reason when status is "unavailable" (not authenticated,
    * binary missing, RPC error, ...) — always set together with an empty
@@ -75,3 +82,12 @@ export interface ToolLimitResult {
    * this). */
   overage?: OverageInfo;
 }
+
+/** What a single-provider fetcher returns: a complete result EXCEPT the
+ * provider stamp, which limits/collect.ts's singleToolFetcher applies from
+ * the tool it fetched for (1:1 tools always map to one provider, so the
+ * fetcher doesn't need to know its own tool name). The multi-provider
+ * adapters (pi/opencode) construct full ToolLimitResults themselves — only
+ * they know which upstream each answer came from. Typing the fetchers this
+ * narrow keeps the stamping in exactly one place, compiler-enforced. */
+export type FetchedLimitResult = Omit<ToolLimitResult, "provider">;

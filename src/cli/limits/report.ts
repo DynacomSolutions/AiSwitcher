@@ -1,4 +1,5 @@
 import { bold, dim, gray } from "../colors.ts";
+import { canonicalUsageProvider, usageProviderLabel } from "../usage/providers.ts";
 import { renderBar, staleSuffix } from "./bar.ts";
 import type { LimitCategory, ToolLimitResult } from "./types.ts";
 
@@ -109,20 +110,25 @@ function renderRow(row: Row, prefixWidth: number, now: Date): string {
 }
 
 /** Renders the full tree: an unlabeled TOTAL rollup at the top (session/week/
- * month, averaged across every tool and identity), then one section per
- * tool — its own rollup hanging directly off the header, then one branch per
- * configured identity with that tool's actual windows underneath. Every bar
- * in the whole report shares one bracket column, computed dynamically (like
- * usage/report.ts's own column-width convention) rather than a hardcoded
- * width, so it stays correct as label text changes. */
+ * month, averaged across every provider and identity), then one section per
+ * PROVIDER — its own rollup hanging directly off the header, then one branch
+ * per identity with that provider's actual windows underneath. Provider is
+ * the grouping key, not the tool: a multi-provider client (pi, opencode)
+ * contributes rows to the same Anthropic/Z.ai/... sections its native-tool
+ * counterparts do, and collect.ts's aggregation has already merged any
+ * duplicate provider+identity answers into one branch before this renders.
+ * Every bar in the whole report shares one bracket column, computed
+ * dynamically (like usage/report.ts's own column-width convention) rather
+ * than a hardcoded width, so it stays correct as label text changes. */
 export function formatLimitsReport(results: ToolLimitResult[], now: Date = new Date(), spinnerFrame = "⠋"): string {
   if (results.length === 0) return dim("No matching identities found.");
 
-  const groups = new Map<ToolLimitResult["toolName"], ToolLimitResult[]>();
+  const groups = new Map<string, ToolLimitResult[]>();
   for (const r of results) {
-    const list = groups.get(r.toolName) ?? [];
+    const provider = canonicalUsageProvider(r.provider);
+    const list = groups.get(provider) ?? [];
     list.push(r);
-    groups.set(r.toolName, list);
+    groups.set(provider, list);
   }
 
   // Aggregate/TOTAL rows are computed from whatever's resolved so far — a
@@ -132,8 +138,8 @@ export function formatLimitsReport(results: ToolLimitResult[], now: Date = new D
   // per-identity rows below, rather than staying blank until every target
   // is done.
   const totalRows = buildTotalRows(results);
-  const sections = Array.from(groups.entries()).map(([toolName, group]) => ({
-    header: `${bold(toolName)} ${dim(`(${identityCount(group.length)})`)}`,
+  const sections = Array.from(groups.entries()).map(([provider, group]) => ({
+    header: `${bold(usageProviderLabel(provider))} ${dim(`(${identityCount(group.length)})`)}`,
     aggregateRows: buildAggregateRows(group),
     identityBlocks: group.map((r, i) => buildIdentityBlock(r, i === group.length - 1, spinnerFrame)),
   }));

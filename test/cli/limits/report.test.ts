@@ -16,6 +16,7 @@ const NOW = new Date("2026-07-15T12:00:00Z");
 function claudeAcme(): ToolLimitResult {
   return {
     toolName: "claude",
+    provider: "anthropic",
     identity: identity("identity-a", "Identity A"),
     status: "live",
     capturedAt: NOW.toISOString(),
@@ -28,12 +29,13 @@ function claudeAcme(): ToolLimitResult {
 }
 
 function claudeUnauth(name: string): ToolLimitResult {
-  return { toolName: "claude", identity: identity(name), status: "unavailable", windows: [], error: "not authenticated" };
+  return { toolName: "claude", provider: "anthropic", identity: identity(name), status: "unavailable", windows: [], error: "not authenticated" };
 }
 
 function codexAcme(): ToolLimitResult {
   return {
     toolName: "codex",
+    provider: "openai",
     identity: identity("identity-a", "Identity A"),
     status: "live",
     capturedAt: NOW.toISOString(),
@@ -44,6 +46,7 @@ function codexAcme(): ToolLimitResult {
 function grokAcme(): ToolLimitResult {
   return {
     toolName: "grok",
+    provider: "xai",
     identity: identity("identity-a", "Identity A"),
     status: "cached",
     capturedAt: new Date("2026-07-15T10:00:00Z").toISOString(), // 2h before NOW
@@ -75,7 +78,7 @@ describe("aggregateAverage", () => {
   test("a maxed-out identity is diluted by a healthy one, not surfaced as-is — the deliberate tradeoff of averaging over max", () => {
     const mixed = aggregateAverage([
       codexAcme(), // week: 100
-      { toolName: "codex", identity: identity("personal"), status: "live", windows: [{ label: "week", category: "week", usedPercent: 0 }] },
+      { toolName: "codex", provider: "openai", identity: identity("personal"), status: "live", windows: [{ label: "week", category: "week", usedPercent: 0 }] },
     ]);
     expect(mixed).toEqual([{ category: "week", usedPercent: 50 }]);
   });
@@ -109,7 +112,7 @@ describe("formatLimitsReport", () => {
     // Two blank lines separate the rollup from the first provider section.
     expect(lines[2]).toBe("");
     expect(lines[3]).toBe("");
-    expect(lines[4]).toBe("claude (1 identity)");
+    expect(lines[4]).toBe("Anthropic (1 identity)");
   });
 
   test("category is pluralized in the TOTAL/aggregate rollups but not in per-identity rows", () => {
@@ -122,10 +125,10 @@ describe("formatLimitsReport", () => {
 
   test("provider header pluralizes identity count correctly", () => {
     const oneIdentity = formatLimitsReport([grokAcme()], NOW);
-    expect(oneIdentity).toContain("grok (1 identity)");
+    expect(oneIdentity).toContain("xAI (1 identity)");
 
     const twoIdentities = formatLimitsReport([claudeAcme(), claudeUnauth("personal")], NOW);
-    expect(twoIdentities).toContain("claude (2 identities)");
+    expect(twoIdentities).toContain("Anthropic (2 identities)");
   });
 
   test("an aggregate block is followed by a bare pipe connector before the first identity branch", () => {
@@ -160,20 +163,47 @@ describe("formatLimitsReport", () => {
   });
 
   test("a pending identity renders a spinner row instead of a bar, and contributes no aggregate row", () => {
-    const pending: ToolLimitResult = { toolName: "claude", identity: identity("personal"), status: "pending", windows: [] };
+    const pending: ToolLimitResult = { toolName: "claude", provider: "anthropic", identity: identity("personal"), status: "pending", windows: [] };
     const output = formatLimitsReport([pending], NOW, "⠹");
     expect(output).toContain("⠹ loading…");
     expect(output).not.toContain("["); // no bars anywhere — nothing resolved yet, nothing to aggregate
   });
 
   test("a pending identity alongside a resolved one still aggregates the resolved one's windows", () => {
-    const pending: ToolLimitResult = { toolName: "claude", identity: identity("personal"), status: "pending", windows: [] };
+    const pending: ToolLimitResult = { toolName: "claude", provider: "anthropic", identity: identity("personal"), status: "pending", windows: [] };
     const output = formatLimitsReport([claudeAcme(), pending], NOW, "⠹");
     const lines = output.split("\n");
     // TOTAL rollup reflects only the resolved identity (identity-a) — pending
     // contributes nothing yet, same as an "unavailable" result always has.
     expect(lines[0]!.startsWith("sessions")).toBe(true);
     expect(output).toContain("⠹ loading…");
-    expect(output).toContain("claude (2 identities)");
+    expect(output).toContain("Anthropic (2 identities)");
+  });
+
+  test("sections group by PROVIDER, not tool — a multi-provider client's rows land beside their native-tool counterparts", () => {
+    // pi's Z.ai answer and the zai tool's own answer share one Z.ai section;
+    // pi's Kimi answer sits under Kimi. No section is named after a tool.
+    const piZai: ToolLimitResult = {
+      toolName: "pi",
+      provider: "zai",
+      identity: identity("acme"),
+      status: "live",
+      windows: [{ label: "session", category: "session", usedPercent: 12 }],
+    };
+    const piKimi: ToolLimitResult = {
+      toolName: "pi",
+      provider: "kimi",
+      identity: identity("acme"),
+      status: "unavailable",
+      windows: [],
+      error: "not authenticated",
+    };
+    const output = formatLimitsReport([claudeAcme(), codexAcme(), piZai, piKimi], NOW);
+    expect(output).toContain("Anthropic (1 identity)");
+    expect(output).toContain("OpenAI (1 identity)");
+    expect(output).toContain("Z.ai (1 identity)");
+    expect(output).toContain("Kimi (1 identity)");
+    expect(output).not.toContain("pi (");
+    expect(output).not.toContain("zai (");
   });
 });

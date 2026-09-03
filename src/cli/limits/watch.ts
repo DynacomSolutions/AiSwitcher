@@ -1,7 +1,7 @@
 import { dim } from "../colors.ts";
 import { spinnerChar, withLiveRender } from "../live.ts";
 import type { ParsedArgs } from "../args.ts";
-import { collectLimitTargets, fetchLimitResults, pendingLimitResult, runLimitsQuery } from "./collect.ts";
+import { aggregateLimitResults, collectLimitTargets, fetchLimitResults, pendingLimitResult, runLimitsQuery } from "./collect.ts";
 import { formatLimitsReport } from "./report.ts";
 import type { ToolLimitResult } from "./types.ts";
 
@@ -23,6 +23,7 @@ import type { ToolLimitResult } from "./types.ts";
 export async function runWatch(
   identityFilter: string | undefined,
   flags: ParsedArgs["flags"],
+  explicitTool: boolean,
   intervalMs: number,
 ): Promise<void> {
   if (!process.stdout.isTTY) {
@@ -35,13 +36,13 @@ export async function runWatch(
   let statusLine = dim("fetching…");
 
   await withLiveRender(
-    (tick) => `${statusLine}\n\n${formatLimitsReport(results, new Date(), spinnerChar(tick))}`,
+    (tick) => `${statusLine}\n\n${formatLimitsReport(aggregateLimitResults(results), new Date(), spinnerChar(tick))}`,
     async () => {
       while (true) {
         const targets = await collectLimitTargets(identityFilter, flags);
         results = targets.map(pendingLimitResult);
         statusLine = dim("fetching…");
-        await fetchLimitResults(targets, false, (i, result) => (results[i] = result));
+        await fetchLimitResults(targets, false, explicitTool, (i, resolved) => results.splice(i, 1, ...resolved));
         statusLine = dim(`updated ${new Date().toLocaleTimeString()}`);
         await Bun.sleep(intervalMs);
       }

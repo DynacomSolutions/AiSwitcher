@@ -1,7 +1,7 @@
 import type { Identity } from "../../identities/types.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByMinutes } from "./bucket.ts";
-import type { LimitCategory, LimitWindow, OverageInfo, ToolLimitResult } from "./types.ts";
+import type { LimitCategory, LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
 
 /** Whole handshake budget (spawn + initialize + rateLimits/read). Live reads
  * against all three real identities on this machine came back in ~1-2s each,
@@ -210,8 +210,8 @@ function errorMessage(err: unknown): string {
  * was no reason to risk the same class of bug claude-limits.ts hit by
  * stripping it.
  */
-export async function fetchCodexLimits(identity: Identity): Promise<ToolLimitResult> {
-  const base: Pick<ToolLimitResult, "toolName" | "identity"> = { toolName: "codex", identity };
+export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "codex", identity };
 
   let binaryPath: string;
   try {
