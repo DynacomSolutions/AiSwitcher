@@ -24,12 +24,18 @@ interface WebDriverResponse {
   value?: unknown;
 }
 
-async function cdpCommand(port: number, method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+/** One CDP command against the first debuggable target reachable on the
+ * local port-forward. Exported for tests. */
+export async function cdpCommand(port: number, method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() as { webSocketDebuggerUrl?: string }[];
   const wsUrl = list.find((target) => target.webSocketDebuggerUrl)?.webSocketDebuggerUrl;
   if (!wsUrl) throw new Error("normal auth browser is not ready");
+  // The target's debugger URL names the BROWSER's own bind address (e.g.
+  // ws://127.0.0.1:9222/...), which is wrong through a port-forward: rewrite
+  // it onto the local tunnel port we actually reached the HTTP endpoints on.
+  const tunnelled = wsUrl.replace(/^ws:\/\/[^/]+\//, `ws://127.0.0.1:${port}/`);
   return await new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(tunnelled);
     const id = Math.floor(Math.random() * 1_000_000_000);
     const timer = setTimeout(() => { ws.close(); reject(new Error("CDP request timed out")); }, 8_000);
     ws.onopen = () => ws.send(JSON.stringify({ id, method, params }));
