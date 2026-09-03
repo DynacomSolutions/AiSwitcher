@@ -44,6 +44,29 @@ export function GlobalUsageCards({ title = "Global usage" }: { title?: string })
     return { total: input + output, today, cost };
   }, [results]);
 
+  if (query.isLoading || (results.length === 0 && query.isPending)) {
+    return (
+      <Card className="gap-3">
+        <CardHeader className="flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-base">{title}</CardTitle>
+          <span className="text-xs text-muted-foreground">scanning usage…</span>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="h-16 animate-pulse rounded-lg bg-muted" />
+            ))}
+          </div>
+          <div className="space-y-2.5">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="h-6 animate-pulse rounded-md bg-muted" style={{ width: `${95 - i * 9}%` }} />
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <Card className="gap-3">
       <CardHeader className="flex-row items-center justify-between space-y-0">
