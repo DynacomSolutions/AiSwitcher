@@ -13,8 +13,10 @@ const PROVIDER_ALIASES: Record<string, string> = {
   "local-kimi": "kimi",
   moonshot: "kimi",
   zai: "zai",
+  "zai_coding_plan": "zai",
   alibaba: "alibaba",
   "alibaba-plan": "alibaba",
+  "alibaba_token_plan": "alibaba",
   "opencode-go": "opencode-go",
   "party-cli": "unattributed",
 };
@@ -27,6 +29,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   zai: "Z.ai",
   alibaba: "Alibaba",
   "opencode-go": "OpenCode Go",
+  opencode: "OpenCode",
   unattributed: "Unattributed",
   detecting: "Detecting providers",
 };
@@ -56,6 +59,11 @@ export function providerForTool(toolName: ToolConfig["toolName"]): string {
       return "zai";
     case "ali":
       return "alibaba";
+    case "opencode":
+      // Multi-provider client (like pi): its sessions record the real
+      // upstream per message, so there is no single fallback — this is
+      // only the label used before/without any local session data.
+      return "opencode";
     case "pi":
       return "detecting";
   }
