@@ -85,6 +85,15 @@ function ProviderShareBars({ results, total }: { results: UsageResult[]; total: 
 
   return (
     <div className="space-y-2.5">
+      <div className="space-y-1">
+        <div className="flex items-center justify-between gap-3 text-sm font-semibold">
+          <span>all providers</span>
+          <span className="shrink-0 tabular-nums">
+            {formatTokens(total)} · 100%
+          </span>
+        </div>
+        <Progress value={100} />
+      </div>
       {rows.map(([provider, tokens]) => {
         const share = total > 0 ? tokens / total : 0;
         return (
