@@ -337,8 +337,10 @@ export async function runTokscaleProcess(args: string[], env: Record<string, str
 
 /** Hard ceiling for any single tokscale/bunx child. Without it a wedged
  * child (bunx hitting a stalled network, a scan crawling a hung mount)
- * pends the whole usage report forever; observed live 2026-08-26. */
-const TOKSCALE_SPAWN_TIMEOUT_MS = 25_000;
+ * pends the whole usage report forever; observed live 2026-08-26. 55s:
+ * sits just under the 60s per-target ceiling (run.ts), and big mounted
+ * session histories need well over the old 25s (observed live). */
+const TOKSCALE_SPAWN_TIMEOUT_MS = 55_000;
 
 async function spawnTokscaleProcess(
   cmd: string,
