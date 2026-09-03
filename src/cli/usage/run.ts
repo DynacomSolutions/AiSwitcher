@@ -275,13 +275,15 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
 /** Per-target ceiling. A single target whose storage is unreachable (a
  * crush.db on a hung network mount, observed live) must not hold the whole
  * report forever; it degrades to an honest error row instead, matching the
- * existing "report the error, don't crash" contract for unreadable data. */
-const PER_TARGET_TIMEOUT_MS = 25_000;
+ * existing "report the error, don't crash" contract for unreadable data.
+ * 60s: the containerised console scans months of session history over a
+ * mounted hostPath (a big codex history clocked past 25s, observed live). */
+const PER_TARGET_TIMEOUT_MS = 60_000;
 
 async function runOneBounded(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<UsageResult[]>((resolve) => {
-    timer = setTimeout(() => resolve([{ ...pendingUsageResult(target), pending: undefined, error: `timed out after ${PER_TARGET_TIMEOUT_MS / 1000}ms` }]), PER_TARGET_TIMEOUT_MS);
+    timer = setTimeout(() => resolve([{ ...pendingUsageResult(target), pending: undefined, error: `timed out after ${PER_TARGET_TIMEOUT_MS / 1000}s` }]), PER_TARGET_TIMEOUT_MS);
   });
   try {
     return await Promise.race([runOne(target, suppression), timeout]);
