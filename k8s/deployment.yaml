@@ -18,6 +18,12 @@ spec:
       # The console reads (and edits) the same single-user AIS state the host
       # daemon would: identity registries, session transcripts, usage data.
       # Everything is uid 1000 on the host, so no fsGroup juggling needed.
+      #
+      # The hostPath data lives on this workstation only, so pin the pod to
+      # the control-plane node (same pattern mc3-media and the artifacts
+      # pod use); eu3/eu4/hq1 have no /home/thomas.
+      nodeSelector:
+        kubernetes.io/hostname: archlinux
       containers:
         - name: app
           image: localhost:5000/${PROJECT}:${TAG}
