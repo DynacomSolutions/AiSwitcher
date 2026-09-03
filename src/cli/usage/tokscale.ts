@@ -335,6 +335,11 @@ export async function runTokscaleProcess(args: string[], env: Record<string, str
   return run;
 }
 
+/** Hard ceiling for any single tokscale/bunx child. Without it a wedged
+ * child (bunx hitting a stalled network, a scan crawling a hung mount)
+ * pends the whole usage report forever; observed live 2026-08-26. */
+const TOKSCALE_SPAWN_TIMEOUT_MS = 25_000;
+
 async function spawnTokscaleProcess(
   cmd: string,
   prefixArgs: string[],
@@ -346,13 +351,29 @@ async function spawnTokscaleProcess(
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
+  const collect = Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  if (exitCode !== 0) throw new Error(stderr.trim() || `tokscale exited with code ${exitCode}`);
-  return stdout;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      try {
+        proc.kill();
+      } catch {
+        // already exited
+      }
+      reject(new Error(`${cmd} ${prefixArgs.join(" ")} timed out after ${TOKSCALE_SPAWN_TIMEOUT_MS / 1000}s`));
+    }, TOKSCALE_SPAWN_TIMEOUT_MS);
+  });
+  try {
+    const [stdout, stderr, exitCode] = await Promise.race([collect, timeout]);
+    if (exitCode !== 0) throw new Error(stderr.trim() || `tokscale exited with code ${exitCode}`);
+    return stdout;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Once per CLI run, make sure Bun's tokscale cache is up to date before
@@ -371,10 +392,17 @@ export function ensureTokscaleCacheFresh(): Promise<void> {
     if (Bun.which("tokscale")) {
       cacheFreshPromise = Promise.resolve();
     } else {
-      const run = bunxQueue.then(
-        () => spawnTokscaleProcess("bunx", ["tokscale@latest"], ["--version"], {}),
-        () => spawnTokscaleProcess("bunx", ["tokscale@latest"], ["--version"], {}),
-      );
+      const warmUp = (): Promise<string> =>
+        // bunx resolves @latest over the NETWORK; bound it far tighter than
+        // real scans so an offline/stalled registry cannot hold a whole
+        // usage report hostage (the cached binary still serves afterwards).
+        Promise.race([
+          spawnTokscaleProcess("bunx", ["tokscale@latest"], ["--version"], {}),
+          Bun.sleep(8_000).then(() => {
+            throw new Error("bunx cache warm-up timed out after 8s");
+          }),
+        ]);
+      const run = bunxQueue.then(warmUp, warmUp);
       bunxQueue = run.catch(() => undefined);
       cacheFreshPromise = run.then(() => undefined).catch(() => undefined);
     }
