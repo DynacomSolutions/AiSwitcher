@@ -84,6 +84,12 @@ spec:
             - name: k3s-kubeconfig
               mountPath: /etc/rancher/k3s
               readOnly: true
+            # Persist Bun's package cache across pod restarts: the tokscale
+            # binary resolved from ~/.bun/install/cache dies with the
+            # container otherwise, and the 8s bunx warm-up loses that race
+            # on a cold container (observed live).
+            - name: bun-cache
+              mountPath: /home/thomas/.bun
       volumes:
         - name: ais-home
           hostPath:
@@ -128,4 +134,8 @@ spec:
         - name: k3s-kubeconfig
           hostPath:
             path: /etc/rancher/k3s
+            type: Directory
+        - name: bun-cache
+          hostPath:
+            path: /home/thomas/.bun
             type: Directory
