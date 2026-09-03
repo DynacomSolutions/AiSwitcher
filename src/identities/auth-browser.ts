@@ -79,20 +79,22 @@ export async function ensureAuthBrowserPorts(identityName: string): Promise<Auth
     await forward.exited;
   } else {
     // Container mode: a plain detached forward, no unit manager to talk to.
-    const forward = Bun.spawn(
-      [
-        "kubectl",
-        "-n",
-        K3S_NAMESPACE,
-        "port-forward",
-        `service/${config.service}`,
-        `${config.webdriverPort}:4444`,
-        `${config.novncPort}:7900`,
-        "--address",
-        "127.0.0.1",
-      ],
-      { stdout: "ignore", stderr: "ignore", detached: true },
+    // AIS_K8S_API_SERVER lets the kubeconfig's 127.0.0.1 server address be
+    // overridden with an in-pod reachable one (kubernetes.default.svc);
+    // auth still comes from the kubeconfig's client certificate.
+    const args = ["kubectl"];
+    if (process.env.AIS_K8S_API_SERVER) args.push("--server", process.env.AIS_K8S_API_SERVER);
+    args.push(
+      "-n",
+      K3S_NAMESPACE,
+      "port-forward",
+      `service/${config.service}`,
+      `${config.webdriverPort}:4444`,
+      `${config.novncPort}:7900`,
+      "--address",
+      "127.0.0.1",
     );
+    const forward = Bun.spawn(args, { stdout: "ignore", stderr: "ignore", detached: true });
     forward.unref();
   }
 
