@@ -74,6 +74,11 @@ spec:
             - name: kube-config
               mountPath: /home/thomas/.kube
               readOnly: true
+            # ~/.kube/config is a symlink to this host file; mounting the
+            # target at the same path is what makes the symlink resolve.
+            - name: k3s-kubeconfig
+              mountPath: /etc/rancher/k3s
+              readOnly: true
       volumes:
         - name: ais-home
           hostPath:
@@ -114,4 +119,8 @@ spec:
         - name: kube-config
           hostPath:
             path: /home/thomas/.kube
+            type: Directory
+        - name: k3s-kubeconfig
+          hostPath:
+            path: /etc/rancher/k3s
             type: Directory
