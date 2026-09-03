@@ -35,7 +35,10 @@ spec:
           imagePullPolicy: Always
           env:
             - name: AIS_WEB_ALLOWED_HOSTS
-              value: ${PROJECT}.localhost
+              # Both the rewritten (host_rewrite: ais.localhost) and the raw
+              # public hostname: when ingress routes skip the rewrite the
+              # app still sees a trusted vhost instead of a 403.
+              value: ${PROJECT}.localhost,${PROJECT}.dynacom.dev
             - name: AIS_AUTH_REFRESH_INTERVAL_MS
               value: "600000"
             - name: AIS_K8S_API_SERVER
