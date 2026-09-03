@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { categorizeByMinutes } from "./bucket.ts";
+import { fetchWithRetry } from "./http.ts";
 import { persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
 import type { LimitCategory, LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
 
@@ -303,9 +304,11 @@ export async function fetchKimiUsageForCredentials(
   }
 
   const fetchUsages = (token: string) =>
-    fetch(USAGES_URL, {
+    // Retry wrapper, NOT applied to the token refresh above: refreshing is
+    // rotating — a blind retry after a lost response would race the rotated
+    // token. The usages GET is a pure read, safe to retry.
+    fetchWithRetry(USAGES_URL, {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
   let response: Response;

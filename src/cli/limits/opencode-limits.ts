@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { canonicalUsageProvider } from "../usage/providers.ts";
+import { fetchWithRetry } from "./http.ts";
 import { fetchZaiQuotaForKey } from "./zai-limits.ts";
 import type { LimitCategory, LimitWindow, ToolLimitResult } from "./types.ts";
 
@@ -123,9 +124,8 @@ export interface OpencodeGoQuotaOutcome {
 export async function fetchOpencodeGoQuotaForKey(apiKey: string): Promise<OpencodeGoQuotaOutcome> {
   let response: Response;
   try {
-    response = await fetch(OPENCODE_GO_USAGE_URL, {
+    response = await fetchWithRetry(OPENCODE_GO_USAGE_URL, {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (err) {
     return { error: `quota fetch failed: ${errorMessage(err)}` };
