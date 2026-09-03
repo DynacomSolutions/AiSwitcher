@@ -952,6 +952,33 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
 
 ## Adding another wrapped tool later
 
+**A tool is not "added" when it launches — it is added when it is wired
+everywhere.** Registering a new `toolName` in `TOOL_CONFIGS` is an
+all-or-nothing commitment: the CLI's subcommands (`usage`, `limits`,
+`doctor`, `resume`, `identities`), the wrappers, the build/install/backup
+scripts, the release workflow, and BOTH docs must all learn about the new
+tool in the same change. Half-wired tools ship runtime crashes to users —
+opencode was registered without any usage-pipeline wiring and every
+unscoped `ais usage` died on `provider.trim` (2026-09-03, fixed in the
+same commit series that added this rule).
+
+Two gates enforce this — both MUST pass before the change is done:
+
+1. `test/tool-wiring.audit.test.ts` fails the suite when a registered tool
+   is missing from any file that must name every tool (the usage pipeline,
+   build scripts, release workflow, docs, ...). If you are adding a NEW
+   kind of integration point to the codebase, add its file to the audit's
+   `FILES` list in the same change.
+2. The deliberate-partial touchpoints (doctor `PROBES`, `fetchExtraCost`,
+   `cli/limits/*`, `cli/resume/*`, `cli/auth/*`, `model-pricing.ts`) degrade
+   gracefully instead of crashing, so the audit cannot force them. They
+   still require an explicit decision per tool: either wire the new tool in
+   or note in the PR why it is intentionally absent. "I didn't know it
+   existed" is not an absent-state rationale — that is how the opencode
+   usage crash happened.
+
+The recipe:
+
 1. Add a new `ToolConfig` (toolName, realBinaryName, envVarName,
    globalMemoryProjection, identitiesJsonPath, identitiesRootDir) in a new
    entrypoint file, following
@@ -989,7 +1016,26 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
    — is written generically over `Object.keys(TOOL_CONFIGS)`, not a hardcoded
    pair, so nothing else in `cli/*` needs touching) and to `src/open.ts`'s
    `TOOL_CONFIGS` array (chrome-profile-per-identity support).
-5. **Check the new tool's own installer for a PATH-ordering conflict AND a
+5. **Wire the CLI subcommand surface.** `ais identities` is generic (step 4
+   covers it); nothing else is:
+   - `usage`: `src/cli/usage/providers.ts` (`providerForTool` MUST gain an
+     exhaustive case — with `noImplicitReturns` on, omitting it is a compile
+     error; plus `PROVIDER_ALIASES`/`PROVIDER_LABELS` entries if the tool
+     reports provider names of its own),
+     `src/cli/usage/tokscale.ts` (`tokscaleInvocationFor` — again exhaustive),
+     and `src/cli/usage/run.ts` (the `runOne` dispatch and the
+     `fetchTokscaleDailyUsage` client union).
+   - `limits`: a probe in `src/cli/limits/` or a deliberate no-op.
+   - `doctor`: a probe in `src/cli/doctor/collect.ts`'s `PROBES` or a
+     deliberate absence (it reports "unavailable" rather than crashing).
+   - `resume`: a reader in `src/cli/resume/` or a deliberate absence.
+   - `auth` (only if the tool has credentials worth importing): a case in
+     `src/cli/auth/`.
+   - `providers` (upstream APIs, distinct from tools — e.g. adding a new
+     upstream an existing multi-provider client can talk to): alias + label
+     entries in `usage/providers.ts`, and a pricing entry in
+     `identities/model-pricing.ts` if the upstream charges per token.
+6. **Check the new tool's own installer for a PATH-ordering conflict AND a
    pre-existing symlink at the shim destination** before assuming "install to
    `~/.local/bin`" is sufficient — see the two grok bullets under "Key design
    decisions" above for real instances of both: some CLI installers append
@@ -1000,10 +1046,17 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
    `src/installer.ts` now unlink it first before writing, so this is handled
    generically, but confirm it rather than assuming). Verify with
    `which <tool>` after `bun run install:shims`, not by assumption.
-6. Update this file's module tree/design-decision bullets and README.md to
+7. Update this file's module tree/design-decision bullets and README.md to
    mention the new tool everywhere claude/codex/grok are currently listed
    together — grep for the two tools you just added alongside to find every
-   spot.
+   spot. (The audit test enforces the docs mention every registered tool at
+   all; only you can make the mentions *accurate*.)
+8. Prove it: `bun run typecheck && bun test` MUST be green — that includes
+   `test/tool-wiring.audit.test.ts` (the mechanical gate) and
+   `test/cli/usage/providers.test.ts`'s "every registered tool maps to a
+   defined provider" loop. Then run the real command once
+   (`ais usage`, plus whichever subcommands you wired) — the audit proves
+   wiring exists, only execution proves it works.
 
 Note: `src/open.ts` does NOT follow this recipe — it isn't a `ToolConfig`
 proxy for another AI CLI, it's a narrower always-transparent-by-default
