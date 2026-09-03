@@ -15,6 +15,19 @@ export interface ServeOptions {
 
 export const DEFAULT_CONSOLE_PORT = 47129;
 
+/** AIS_WEB_ALLOWED_HOSTS: comma-separated extra vhostnames the guard trusts
+ * like loopback peers (e.g. `ais.localhost` in front of a reverse proxy,
+ * where every peer address is the proxy). Empty/absent keeps the default
+ * loopback-only trust model. */
+export function parseAllowedHosts(raw: string | undefined): ReadonlySet<string> {
+  return new Set(
+    (raw ?? "")
+      .split(",")
+      .map((h) => h.trim().toLowerCase())
+      .filter((h) => h.length > 0),
+  );
+}
+
 /** Boots the console HTTP server in THIS process. Used directly by
  * `ais web --foreground` and by the detached daemon spawned by
  * `ais web start`; tests call createApp() instead. */
@@ -24,11 +37,13 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   // (scan workers, sync kick-offs, fix actions), so land on $HOME up front.
   ensureUsableCwd();
   const port = options.port ?? (Number.parseInt(process.env.AIS_WEB_PORT ?? "", 10) || DEFAULT_CONSOLE_PORT);
-  const host = options.host ?? process.env.AIS_WEB_HOST ?? "127.0.0.1";  const token = newConsoleToken();
+  const host = options.host ?? process.env.AIS_WEB_HOST ?? "127.0.0.1";
+  const token = newConsoleToken();
   const deps: ConsoleAppDeps = {
     token,
     port,
     startedAt: Date.now(),
+    allowedHosts: parseAllowedHosts(process.env.AIS_WEB_ALLOWED_HOSTS),
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
   const app = createApp(deps);

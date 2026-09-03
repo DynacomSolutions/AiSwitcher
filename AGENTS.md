@@ -2629,3 +2629,5 @@ identity's Chrome (Claude MCP) window instead of your regular daily-driver
 Chrome. If a real Chrome window opens instead (or nothing redirects at all),
 the bare-command-name assumption is wrong — drop this mechanism and record
 that finding here instead of iterating on it further.
+
+@/home/thomas/.config/devdeploy/CLAUDE.snippet.md
