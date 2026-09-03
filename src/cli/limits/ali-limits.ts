@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { expandPath } from "../../identities/match.ts";
+import { fetchWithRetry } from "./http.ts";
 import type { LimitCategory, LimitWindow, FetchedLimitResult } from "./types.ts";
 
 /**
@@ -32,7 +33,6 @@ const DASHBOARD_URL =
   "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=plan#/efm/subscription/token-plan/personal";
 const DASHBOARD_ORIGIN = "https://modelstudio.console.alibabacloud.com";
 const COOKIE_FILE = "console-cookie.txt";
-const FETCH_TIMEOUT_MS = 20_000;
 
 /** The gateway wraps its real payload three levels deep: the outer envelope's
  * `data.DataV2.data.data` carries the rolling-window usage. Confirmed LIVE
@@ -172,7 +172,14 @@ async function requestAliGateway(cookie: string): Promise<GatewayResult> {
 
   let response: Response;
   try {
-    response = await fetch(GATEWAY_URL, { method: "POST", headers, body, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    // The gateway query is a read — safe to retry on transport failures
+    // (the machine's connectivity blips under report load; observed live
+    // 2026-09-03). HTTP error statuses are returned as-is.
+    response = await fetchWithRetry(GATEWAY_URL, {
+      method: "POST",
+      headers,
+      body,
+    });
   } catch (err) {
     return { kind: "error", message: `quota fetch failed: ${errorMessage(err)}` };
   }

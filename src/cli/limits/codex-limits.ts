@@ -308,21 +308,30 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
 }
 
 /** The codex CLI does its own networking, and chatgpt.com reachability from
- * this machine blips (observed live 2026-09-03: "error sending request for
- * url" on one identity in one run, all four fine in the next). When a
- * session fails FAST with that transport error it costs only a few seconds,
- * so retry once before reporting — a slow failure (the 9s handshake
- * timeout) or any other error is reported as-is. */
+ * this machine blips under report load (observed live 2026-09-03: "error
+ * sending request for url" on 3 of 4 identities in one run, all four fine
+ * minutes later; bare curl to the same URL showed ~400ms baseline with
+ * multi-second spikes). When a session fails FAST with that transport
+ * error, retry up to twice with backoff (3s, 8s) before reporting — the
+ * backoff rides out the load spike an immediate retry would hit. Slow
+ * failures (the 9s handshake ceiling) and every other error surface
+ * as-is. */
 const FAST_FAIL_MAX_MS = 15_000;
+const TRANSPORT_ERROR_PATTERN = /error sending request/;
+const CODEX_RETRY_DELAYS_MS = [3_000, 8_000];
 
 export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
-  const started = Date.now();
-  const first = await fetchCodexLimitsOnce(identity);
-  const failedFastOnTransport =
-    first.status === "unavailable" &&
-    first.error !== undefined &&
-    /error sending request/.test(first.error) &&
-    Date.now() - started < FAST_FAIL_MAX_MS;
-  if (!failedFastOnTransport) return first;
-  return fetchCodexLimitsOnce(identity);
+  let last: FetchedLimitResult | undefined;
+  for (let attempt = 0; attempt <= CODEX_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) await Bun.sleep(CODEX_RETRY_DELAYS_MS[attempt - 1]!);
+    const started = Date.now();
+    last = await fetchCodexLimitsOnce(identity);
+    const failedFastOnTransport =
+      last.status === "unavailable" &&
+      last.error !== undefined &&
+      TRANSPORT_ERROR_PATTERN.test(last.error) &&
+      Date.now() - started < FAST_FAIL_MAX_MS;
+    if (!failedFastOnTransport) return last;
+  }
+  return last!;
 }
