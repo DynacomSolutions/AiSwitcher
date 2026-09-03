@@ -2372,11 +2372,20 @@ What the rule means in practice, now enforced in both pipelines:
   "Detecting providers"/"OpenCode" section) nor a cached-mode row (same
   problem, persistent). Both render nothing until their real per-provider
   results land; an explicit `--tool=` still gets one honest row. 1:1 tools
-  keep their pending spinners unchanged. The one deliberate exception to
-  "multi-provider rows carry a real provider": a TIMED-OUT pi/opencode
-  fetch reports as Unattributed with the timeout error — a real failure
-  must stay visible, and a tool label would be worse than the honest
-  unknown.
+  keep their pending spinners unchanged.
+- **No per-target timeout in the shared usage engine.** The console work
+  added a 25s `runOneBounded` cap; on this machine ~25 targets run
+  concurrently and contend for disk, so real scans routinely take 25-55s
+  and the cap turned ENTIRE reports into error rows (labeled "timed out
+  after 25ms" — the unit math was wrong too). Reverted 2026-09-03: the CLI
+  must never truncate good data; genuine hangs stay bounded where they
+  actually occur (tokscale's own spawn timeout; limits has never had a
+  cap). Multi-provider source failures (a pi/opencode reader crashing
+  before attributing any provider) are flagged `sourceOnlyError`: they
+  render NO provider table row — never a fabricated "Unattributed" row —
+  and surface only in the trailing Errors section under their SOURCE label
+  (`pi/dynacom: ...`), the same "per-tool in diagnostics" allowance as the
+  internal logs.
 - **A source with nothing to report renders no row — unless the user asked
   for that source specifically.** Both pipelines thread an `explicitTool`
   flag (`--tool=<t>`): unscoped, an empty tokscale report or a pi identity
