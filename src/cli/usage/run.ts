@@ -2,6 +2,7 @@ import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
+import { runBatched } from "../limits/collect.ts";
 import { fetchClaudeLimits } from "../limits/claude-limits.ts";
 import { fetchCodexLimits } from "../limits/codex-limits.ts";
 import { fetchKimiLimits } from "../limits/kimi-limits.ts";
@@ -318,21 +319,26 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
 // timeout (tokscale.ts), and limits never had a cap either. Truncating
 // good data to bound a pathological hang is the wrong trade for the report.
 
+/** Ceiling on targets fetched at once. Every non-zai/ali/pi target spawns a
+ * tokscale child scanning that identity's whole history; with ~25 targets
+ * firing simultaneously the children thrash the disk and EACH one crawls
+ * (25-55s alone; far worse all-parallel). A bounded pool keeps every scan
+ * out of each other's way enough to finish quickly, matches limits's own
+ * fan-out cap, and makes the live render fill in in waves. */
+const USAGE_MAX_CONCURRENT = 6;
+
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
   options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => void } = {},
 ): Promise<UsageResult[]> {
   const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
   if (targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
-  const results: UsageResult[][] = new Array(targets.length);
-  await Promise.all(
-    targets.map(async (target, index) => {
-      const targetResults = await runOne(target, suppression);
-      results[index] = targetResults;
-      options.onItemDone?.(index, targetResults);
-    }),
-  );
-  return aggregateUsageResults(results.flat());
+  return runBatched(
+    targets,
+    USAGE_MAX_CONCURRENT,
+    async (target) => runOne(target, suppression),
+    options.onItemDone,
+  ).then((batches) => aggregateUsageResults(batches.flat()));
 }
 
 export async function runUsageQuery(flags: ParsedArgs["flags"]): Promise<UsageResult[]> {
