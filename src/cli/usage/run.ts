@@ -287,7 +287,18 @@ const PER_TARGET_TIMEOUT_MS = 25_000;
 async function runOneBounded(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<UsageResult[]>((resolve) => {
-    timer = setTimeout(() => resolve([{ ...pendingUsageResult(target), pending: undefined, error: `timed out after ${PER_TARGET_TIMEOUT_MS / 1000}ms` }]), PER_TARGET_TIMEOUT_MS);
+    timer = setTimeout(() => {
+      // A timed-out fetch is a REAL failure, so it keeps an error row. But
+      // the multi-provider clients have no honest tool-level provider label
+      // ("Detecting providers"/"OpenCode" are tool-shaped — see the
+      // provider-first rule), so their timeout reports as Unattributed,
+      // like every other error row from those sources. Construct the row
+      // explicitly: pendingUsageResult is undefined for these targets, so
+      // spreading it here would emit a row with no provider or identity.
+      const provider =
+        target.toolName === "pi" || target.toolName === "opencode" ? "unattributed" : providerForTool(target.toolName);
+      resolve([providerResult(target, provider, { error: `timed out after ${PER_TARGET_TIMEOUT_MS / 1000}ms` })]);
+    }, PER_TARGET_TIMEOUT_MS);
   });
   try {
     return await Promise.race([runOne(target, suppression), timeout]);
