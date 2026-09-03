@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { withUsableCwd } from "../shared/exec.ts";
 import type { SyncRunOptions } from "./types.ts";
 
 interface BackgroundSyncDeps {
@@ -16,11 +17,13 @@ function resolveInstalledAisBinary(): string | undefined {
 }
 
 function spawnDetached(binary: string, args: string[]): void {
-  Bun.spawn([binary, ...args], {
-    env: process.env,
-    stdio: ["ignore", "ignore", "ignore"],
-    detached: true,
-  }).unref();
+  withUsableCwd(() =>
+    Bun.spawn([binary, ...args], {
+      env: process.env,
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: true,
+    }),
+  ).unref();
 }
 
 export function backgroundSyncArgs(options: SyncRunOptions = {}): string[] {

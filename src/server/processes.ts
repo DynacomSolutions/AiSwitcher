@@ -1,7 +1,7 @@
 import { readdir, readlink, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { IDENTITY_SESSION_MARKER } from "../shared/exec.ts";
+import { IDENTITY_SESSION_MARKER, withUsableCwd } from "../shared/exec.ts";
 import type { ProcessInfoDto, ProcessesDto } from "./types.ts";
 
 const PROC = "/proc";
@@ -14,7 +14,7 @@ const AGENT_BINARIES = new Set(["claude", "codex", "grok", "kimi", "zai", "ali",
 function clockTicksPerSecond(): number {
   // Linux is essentially always 100, but read it properly where possible.
   try {
-    const clkTck = Bun.spawnSync(["getconf", "CLK_TCK"]).stdout.toString().trim();
+    const clkTck = withUsableCwd(() => Bun.spawnSync(["getconf", "CLK_TCK"])).stdout.toString().trim();
     const n = Number.parseInt(clkTck, 10);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {

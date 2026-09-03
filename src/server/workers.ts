@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
 
 /** Child-process runner for expensive scans. Every scan executes in a fresh
@@ -57,11 +58,13 @@ export async function runScanIsolated<T>(
       resolve({ ok: false, error: `${kind} scan timed out after ${Math.round(timeoutMs / 1000)}s`, status: 504 });
     }, timeoutMs);
     try {
-      proc = Bun.spawn([...baseArgs(), "__scan_worker"], {
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      proc = withUsableCwd(() =>
+        Bun.spawn([...baseArgs(), "__scan_worker"], {
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      );
     } catch (err) {
       resolve({ ok: false, error: err instanceof Error ? err.message : "failed to start scan worker", status: 500 });
       return;

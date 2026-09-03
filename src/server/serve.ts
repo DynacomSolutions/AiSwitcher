@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
+import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
 
 export interface ServeOptions {
@@ -18,6 +19,10 @@ export const DEFAULT_CONSOLE_PORT = 47129;
  * `ais web --foreground` and by the detached daemon spawned by
  * `ais web start`; tests call createApp() instead. */
 export async function startConsoleServer(options: ServeOptions = {}): Promise<{ port: number; token: string; stop: () => void }> {
+  // The daemon outlives whatever directory launched it. A deleted cwd makes
+  // every child spawn fail with a confusing POSIX permission/ENOENT error
+  // (scan workers, sync kick-offs, fix actions), so land on $HOME up front.
+  ensureUsableCwd();
   const port = options.port ?? (Number.parseInt(process.env.AIS_WEB_PORT ?? "", 10) || DEFAULT_CONSOLE_PORT);
   const host = options.host ?? process.env.AIS_WEB_HOST ?? "127.0.0.1";  const token = newConsoleToken();
   const deps: ConsoleAppDeps = {

@@ -5,6 +5,7 @@ import { requireTool } from "./registries.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { readAliApiKey, writeAliAuthFile } from "../identities/ali-auth.ts";
 import { readZaiApiKey, writeZaiAuthFile } from "../identities/zai-auth.ts";
+import { withUsableCwd } from "../shared/exec.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { HttpError, type AuthDto, type AuthEntryDto, type LoginResultDto } from "./types.ts";
 
@@ -246,19 +247,21 @@ export async function spawnLogin(toolName: ToolConfig["toolName"], identityName:
     ? [terminal.bin, ...terminal.prefix, process.env.SHELL ?? "/bin/bash", "-lc", inner]
     : ["bash", "-lc", inner];
 
-  const proc = Bun.spawn(commandLine, {
-    env: {
-      ...process.env,
-      [cfg.envVarName]: configDir,
-      ...Object.fromEntries(
-        (cfg.extraEnvVarNames ?? []).map((extra) => [
-          extra.name,
-          extra.subdir ? join(configDir, extra.subdir) : configDir,
-        ]),
-      ),
-    },
-    stdio: ["ignore", "ignore", "ignore"],
-  });
+  const proc = withUsableCwd(() =>
+    Bun.spawn(commandLine, {
+      env: {
+        ...process.env,
+        [cfg.envVarName]: configDir,
+        ...Object.fromEntries(
+          (cfg.extraEnvVarNames ?? []).map((extra) => [
+            extra.name,
+            extra.subdir ? join(configDir, extra.subdir) : configDir,
+          ]),
+        ),
+      },
+      stdio: ["ignore", "ignore", "ignore"],
+    }),
+  );
   proc.unref();
   const display = commandLine.map((part) => (part.includes(" ") ? shellQuote(part) : part)).join(" ");
   return { spawned: true, command: display.replace(homedir(), "~") };
