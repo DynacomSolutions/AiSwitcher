@@ -21,7 +21,7 @@ async function makeIdentity(auth: PiAuthFile | undefined): Promise<Identity> {
 }
 
 describe("fetchablePiProviders", () => {
-  test("keeps fetchable providers, drops native-covered and unknown ones", () => {
+  test("keeps fetchable providers, drops native-covered and unfetchable ones", () => {
     const auth: PiAuthFile = {
       anthropic: { type: "oauth", access: "a", refresh: "r", expires: 1 },
       "openai-codex": { type: "oauth", access: "a", refresh: "r", expires: 1 },
@@ -33,9 +33,11 @@ describe("fetchablePiProviders", () => {
       "some-future-provider": { type: "api_key", key: "k" },
     };
     // Native-covered providers get their limits branch from claude/codex/
-    // grok/ali instead of a duplicate Pi row; unknown providers are never
-    // guessed at; only zai / kimi / opencode-go survive.
-    expect(fetchablePiProviders(auth).map(({ provider }) => provider).sort()).toEqual(["kimi", "opencode-go", "zai"]);
+    // grok/ali instead of a duplicate Pi row; opencode-go and unknown
+    // providers have no fetch mechanism and are never guessed at (a row
+    // that can never show data is noise — user feedback 2026-09-03); only
+    // zai / kimi survive.
+    expect(fetchablePiProviders(auth).map(({ provider }) => provider).sort()).toEqual(["kimi", "zai"]);
   });
 
   test("drops entries whose credential is not in the shape the fetch needs", () => {

@@ -124,18 +124,17 @@ async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry
   });
 }
 
-/** OpenCode Go is a Pi-native provider with no AIS tool of its own and no
- * known quota endpoint for its keys — reported honestly rather than silently
- * dropped, so the OpenCode Go section still shows which identities hold one. */
-function opencodeGoResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): ToolLimitResult | undefined {
-  if (typeof entry.key !== "string" || entry.key.length === 0) return undefined;
-  return unavailable(toolName, "opencode-go", identity, "no limits API is known for OpenCode Go keys yet");
-}
+/** OpenCode Go has no AIS tool of its own, no known quota endpoint for its
+ * keys, and no native coverage decision — skipped entirely, same stance as
+ * the unknown providers. (A placeholder row was tried and rejected by the
+ * user the same day: a provider section that can never show data is
+ * tool-shaped noise. Its real token usage still appears in `ais usage`,
+ * where pi's session records carry the opencode-go provider.) */
 
 /** The auth.json entries this adapter will act on, in file order, with every
  * skip decision already applied: native-covered providers are dropped (their
- * branch comes from the native tool), providers with no fetcher and no
- * coverage decision are dropped (never guessed at), and only entries whose
+ * branch comes from the native tool), providers with no fetch mechanism are
+ * dropped (opencode-go, unknowns — never guessed at), and only entries whose
  * credential is in the shape the corresponding fetch needs survive. Pure —
  * exported for tests. */
 export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string; entry: PiAuthEntry }> {
@@ -147,9 +146,9 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
       if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else if (provider === "kimi") {
       if (!piKimiCredentials(entry)) continue;
-    } else if (provider === "opencode-go") {
-      if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else {
+      // opencode-go and anything unknown: no fetcher and no native coverage
+      // decision — skipped rather than guessed at.
       continue;
     }
     fetchable.push({ provider, entry });
@@ -184,9 +183,6 @@ export async function fetchPiLimits(identity: Identity, explicitTool = false): P
       if (r) results.push(r);
     } else if (provider === "kimi") {
       const r = await kimiResult("pi", identity, entry);
-      if (r) results.push(r);
-    } else if (provider === "opencode-go") {
-      const r = opencodeGoResult("pi", identity, entry);
       if (r) results.push(r);
     }
   }
