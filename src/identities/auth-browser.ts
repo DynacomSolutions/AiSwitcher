@@ -42,13 +42,24 @@ async function portListening(port: number): Promise<boolean> {
 /** A listener on the WebDriver port proves nothing on its own: a port-forward
  * pinned to a replaced browser pod keeps accepting connections and failing
  * every request (observed live: HTTP 404 from a tunnel whose target pod had
- * been recreated). WebDriver readiness is the real test. */
+ * been recreated). WebDriver readiness is the real test — but the minimal
+ * chrome-auth deployment speaks Chrome DevTools (no WebDriver at all), so a
+ * live CDP /json/version counts as ready too. */
 async function webdriverReady(port: number): Promise<boolean> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/status`, { signal: AbortSignal.timeout(1500) });
+    if (res.ok) {
+      const body = (await res.json()) as { value?: { ready?: boolean } };
+      if (body.value?.ready === true) return true;
+    }
+  } catch {
+    // Not WebDriver; the CDP probe below decides.
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) });
     if (!res.ok) return false;
-    const body = (await res.json()) as { value?: { ready?: boolean } };
-    return body.value?.ready === true;
+    const body = (await res.json()) as { webSocketDebuggerUrl?: string };
+    return typeof body.webSocketDebuggerUrl === "string";
   } catch {
     return false;
   }
