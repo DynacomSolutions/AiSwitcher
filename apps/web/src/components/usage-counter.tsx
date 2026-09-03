@@ -4,7 +4,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Progress } from "@/components/ui/progress";
 import { useLimitsQuery, useUsageQuery } from "@/hooks/queries";
 import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
-import type { UsageResult } from "@/types/api";
 
 function CounterCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
