@@ -2357,8 +2357,8 @@ What the rule means in practice, now enforced in both pipelines:
   and a pi/opencode row would either duplicate the branch or add an
   unactionable "can't fetch" line. Fetchable from pi today: `zai` (static
   key, same quota endpoint as zai-limits) and `kimi-coding` (OAuth via
-  `fetchKimiUsageForCredentials`, refreshing-and-persisting back into pi's
-  own auth.json). Fetchable from opencode today: `zai_coding_plan` only.
+  `fetchKimiUsageForCredentials`). Fetchable from opencode today:
+  `zai_coding_plan` only.
   `opencode-go` sits between the two: no public limits API is known for
   its keys (probed live 2026-09-03 against opencode.ai/zen/v1 — usage,
   limits, quota, subscription and credits paths all 404), but it IS a
@@ -2366,6 +2366,21 @@ What the rule means in practice, now enforced in both pipelines:
   rather than vanishing (dropping it entirely was tried and reversed by
   user feedback the same day; its real token usage also appears in
   `ais usage` from pi's session records).
+- **ONE credential per (identity, provider) — kimi-store.ts.** Kimi rotates
+  its OAuth refresh token on EVERY refresh, and the same account's
+  credentials exist in two stores: the kimi identity's
+  `credentials/kimi-code.json` (the kimi CLI's own file) and the same-named
+  pi identity's imported `auth.json` "kimi-coding" entry. Left independent,
+  whichever store refreshed first invalidated the other — every few days
+  an access-token expiry stranded a store with HTTP 400 until manual
+  re-auth (observed live 2026-09-03, both kimi identities). The stores are
+  now views of ONE logical token: reads take the FRESHEST copy
+  (freshest-wins self-heals), and every refresh is written through to ALL
+  of the account's stores in each store's own shape (pi's expires is
+  milliseconds, kimi's seconds). pi's entry is thus a live projection, not
+  a fork. The same law will need the same treatment for the other OAuth
+  providers pi holds copies of (anthropic, openai-codex, xai) — kimi is
+  where rotation made the race an everyday failure, so it went first.
 - **No tool-shaped placeholder rows exist for the multi-provider clients.**
   Neither a pending seed (the provider isn't known until the adapter reads
   the identity's own auth store — a placeholder would render a fake
