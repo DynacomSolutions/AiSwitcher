@@ -18,9 +18,14 @@ COPY apps/web ./
 RUN pnpm build
 
 FROM debian:bookworm-slim
+# kubectl: the auth-refresh scheduler drives the chrome-auth browser pods
+# through `kubectl port-forward` (WebDriver + noVNC stay loopback-only).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends util-linux ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends util-linux ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$(dpkg --print-architecture)/kubectl" \
+      -o /usr/local/bin/kubectl \
+ && chmod +x /usr/local/bin/kubectl
 COPY --from=server /out/ais /usr/local/bin/ais
 COPY --from=web /build/dist /web/dist
 # resolveInstalledAisBinary() probes $HOME/.local/bin/ais first (background

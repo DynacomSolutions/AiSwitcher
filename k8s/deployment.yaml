@@ -36,6 +36,8 @@ spec:
           env:
             - name: AIS_WEB_ALLOWED_HOSTS
               value: ${PROJECT}.localhost
+            - name: AIS_AUTH_REFRESH_INTERVAL_MS
+              value: "600000"
           ports:
             - containerPort: ${PORT}
           readinessProbe:
@@ -69,6 +71,9 @@ spec:
               mountPath: /home/thomas/.pi
             - name: opencode-home
               mountPath: /home/thomas/.opencode
+            - name: kube-config
+              mountPath: /home/thomas/.kube
+              readOnly: true
       volumes:
         - name: ais-home
           hostPath:
@@ -105,4 +110,8 @@ spec:
         - name: opencode-home
           hostPath:
             path: /home/thomas/.opencode
+            type: Directory
+        - name: kube-config
+          hostPath:
+            path: /home/thomas/.kube
             type: Directory

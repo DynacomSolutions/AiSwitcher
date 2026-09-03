@@ -17,6 +17,7 @@ export const qk = {
   usage: ["usage"] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
   auth: ["auth"] as const,
+  authRefresh: ["auth", "refresh"] as const,
   fileRoots: ["files", "roots"] as const,
   fileTree: (root: string, path: string) => ["files", "tree", root, path] as const,
   fileContent: (path: string) => ["files", "file", path] as const,
@@ -75,6 +76,14 @@ export function useAuthQuery() {
   return useQuery({
     queryKey: qk.auth,
     queryFn: api.getAuth,
+    refetchInterval: POLL.registry,
+  });
+}
+
+export function useAuthRefreshQuery() {
+  return useQuery({
+    queryKey: qk.authRefresh,
+    queryFn: api.getAuthRefresh,
     refetchInterval: POLL.registry,
   });
 }

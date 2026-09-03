@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
+import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
@@ -38,12 +39,20 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   ensureUsableCwd();
   const port = options.port ?? (Number.parseInt(process.env.AIS_WEB_PORT ?? "", 10) || DEFAULT_CONSOLE_PORT);
   const host = options.host ?? process.env.AIS_WEB_HOST ?? "127.0.0.1";
+  // Daemon-side credential renewal (Alibaba console cookies today). Managed
+  // runs only — tests create the bare app. AIS_AUTH_REFRESH_INTERVAL_MS=0
+  // opts out entirely.
+  const scheduler = new AuthRefreshScheduler(parseRefreshIntervalMs(process.env.AIS_AUTH_REFRESH_INTERVAL_MS));
+  scheduler.hydrate();
+  scheduler.start();
+
   const token = newConsoleToken();
   const deps: ConsoleAppDeps = {
     token,
     port,
     startedAt: Date.now(),
     allowedHosts: parseAllowedHosts(process.env.AIS_WEB_ALLOWED_HOSTS),
+    authRefresh: scheduler,
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
   const app = createApp(deps);
@@ -76,6 +85,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     // whole session.
     process.on("SIGHUP", () => {});
     const shutdown = () => {
+      scheduler.stop();
       void clearServerState();
       server.stop(true);
       setTimeout(() => process.exit(0), 50);
@@ -84,7 +94,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     process.on("SIGINT", shutdown);
   }
 
-  return { port: server.port ?? port, token, stop: () => server.stop(true) };
+  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); server.stop(true); } };
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this
