@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
+import { stat } from "node:fs/promises";
 import { estimateModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity } from "../../identities/types.ts";
 import type { DateSpan, TokscaleReport } from "./tokscale.ts";
@@ -48,7 +49,25 @@ interface SessionUsageRow {
   updated_at: number;
 }
 
-function sessionsInDb(dbPath: string, providerId: "zai" | "alibaba"): SessionUsageRow[] {
+/** Pre-checks the database path with ASYNC stat before any synchronous
+ * bun:sqlite work. A sync open into a hung network mount (observed live
+ * with /home/Projects on SeaweedFS) freezes Bun's single event loop and
+ * takes the whole console API down; a hanging AWAIT only stalls this one
+ * caller on a threadpool thread while every other request keeps flowing.
+ * Returns false when the file is missing or unreadable right now. */
+export async function crushDbReachable(dbPath: string): Promise<boolean> {
+  // The stat itself is raced against a short deadline: an await on a hung
+  // network mount never settles, and since the caller proceeds to
+  // SYNCHRONOUS sqlite work only on true, a pending stat must count as
+  // "unreachable" rather than waiting forever.
+  const probe = stat(dbPath)
+    .then((info) => info.isFile())
+    .catch(() => false);
+  return await Promise.race([probe, Bun.sleep(3_000).then(() => false)]);
+}
+
+async function sessionsInDb(dbPath: string, providerId: "zai" | "alibaba"): Promise<SessionUsageRow[]> {
+  if (!(await crushDbReachable(dbPath))) return [];
   const db = new Database(dbPath, { readonly: true });
   try {
     return db
@@ -104,7 +123,7 @@ export async function fetchCrushUsage(
     if (!(await Bun.file(dbPath).exists())) continue;
 
     try {
-      const sessions = sessionsInDb(dbPath, providerId);
+      const sessions = await sessionsInDb(dbPath, providerId);
       for (const session of sessions) {
         totalMessages += session.messages;
         totalInput += session.prompt_tokens;

@@ -1,0 +1,10 @@
+apiVersion: getambassador.io/v3alpha1
+kind: Mapping
+metadata:
+  name: ${PROJECT}
+  namespace: dev
+spec:
+  hostname: ${PROJECT}.localhost
+  prefix: /
+  service: ${PROJECT}.dev:80
+  timeout_ms: ${MAPPING_TIMEOUT_MS}

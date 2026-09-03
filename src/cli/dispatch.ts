@@ -15,6 +15,8 @@ import { startBackgroundProfileSync } from "../sync/background.ts";
 import { migrateLegacyAisHome } from "../shared/migrate-ais-home.ts";
 import { runAuthCommand } from "./auth/dispatch.ts";
 import { runMemoryCommand } from "./memory.ts";
+import { runWebCommand } from "./web.ts";
+import { runTuiCommand } from "./tui.ts";
 
 export async function runCli(argv: string[]): Promise<void> {
   const { positionals, flags } = parseArgs(argv);
@@ -76,6 +78,22 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "sync":
         return await runSyncCommand(rest, flags);
+      case "__scan_worker":
+        // Dynamic import: a static one here drags the whole scan-engine
+        // graph into every entrypoint's init and segfaults bun --compile
+        // binaries at load (observed live); lazily loaded only when this
+        // hidden internal command actually runs.
+        {
+          const { runScanWorkerStdio } = await import("../server/workers.ts");
+          await runScanWorkerStdio();
+          break;
+        }
+      case "web":
+        await runWebCommand(rest, flags);
+        break;
+      case "tui":
+        await runTuiCommand(rest, flags);
+        break;
       case "auth":
         await runAuthCommand(rest, flags);
         break;

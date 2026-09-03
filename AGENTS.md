@@ -66,8 +66,40 @@ src/
                           tool's mandatory native memory channel without creating a
                           second writable store
   sync/                SSH/rsync profile and usage-data synchronisation — machine-local
-                         remote config, portable ~/ registries, staged additive exchange,
-                         inter-process lock, and debounced/final reconciliation
+                          remote config, portable ~/ registries, staged additive exchange,
+                          inter-process lock, and debounced/final reconciliation
+  server/              the local console API behind `ais web` — thin HTTP wrappers around
+                          the EXISTING engines (store/actions, limits fetchers, usage
+                          aggregation, resume readers, zai/ali auth writers), no new
+                          identity logic; contract documented in docs/API.md
+    app.ts                 Hono app assembly: every /api route, static serving of
+                           apps/web/dist (hand-rolled, cwd-independent), uniform HttpError
+                           mapping; createApp(deps) is fully injectable for tests
+    serve.ts               Bun.serve wiring + server.json lifecycle (pid/port/token) +
+                           findDistDir() discovery of the built WebUI
+    guard.ts               request hardening: loopback Host allowlist (DNS-rebinding),
+                           bearer-token OR loopback-peer auth, X-AIS-Console required on
+                           every mutating method (CSRF guard, see design decisions)
+    state.ts               ~/.ais/web/server.json read/write/clear + token generation
+    expensive.ts           PollCache (TTL + in-flight dedupe) shared by the limits/usage
+                           endpoints so BOTH frontends' live polling never hammers
+                           upstream provider APIs; also maps query params onto the
+                           ParsedArgs["flags"] shape the collectors already read
+    processes.ts           /proc scan for running agent CLIs, attributed to identities via
+                           IDENTITY_SESSION_MARKER in each process's environ
+    registries.ts          registry listing + all mutations via cli/identities/actions.ts's
+                           pure functions + store.ts atomic save; optional apiKey at create
+                           time forwarded to writeZaiAuthFile/writeAliAuthFile
+    auth.ts                per-identity auth health probes (file presence + shape only,
+                           never secret values) and fix actions: zai/ali key writes,
+                           ali console-cookie paste, kimi token refresh (reuses
+                           fetchKimiLimits's refresh-on-expiry path), interactive login
+                           spawned into a detected terminal emulator with the identity env
+    files.ts               whitelisted-root file browsing/editing (~/.ais, tool containers,
+                           registered configDirs): dual lexical+realpath containment guards,
+                           REPRODUCIBLE_JUNK_DIR_NAMES-filtered listings, 2 MB text cap,
+                           binary sniffing, atomic writes with pre-edit backups under
+                           ~/.ais/web/file-backups/
   cli/                 the `ais` management CLI — no identity-resolution logic of its own
     dispatch.ts          top-level subcommand routing + uniform error->exit-code handling
     args.ts                minimal argv parser: positionals + --flag=value/--flag
@@ -159,6 +191,20 @@ src/
                                (bun:sqlite) via that identity's projects.json — the only tool
                                whose sessions live outside its own configDir entirely — see the
                                2026-07-18 zai/Crush addendum
+    web.ts                   `ais web start|stop|status|open [--port=] [--foreground]`:
+                           lifecycle for server/*'s console daemon. Default spawns a
+                           DETACHED child re-invoking this same entrypoint with the hidden
+                           --serve-internal flag (works compiled AND dev: [Bun.main] alone
+                           when self, [process.execPath, Bun.main] under the bun runtime);
+                           fails fast if the child exits before its own pid appears in
+                           server.json and answers a health probe, so a stale daemon
+                           holding the port can never masquerade as a successful start.
+                           NOTE parseArgs only reads --flag=value; "--port 1234" would
+                           silently become port=true + positional "1234"
+    tui.ts                   `ais tui`: ensures the console server is up (reads
+                           ~/.ais/web/server.json), then execs the ratatui binary from
+                           $AIS_TUI_BIN > ~/.local/bin/aistui > apps/tui/target/release/
+                           aistui, passing AIS_CONSOLE_URL/AIS_CONSOLE_TOKEN via env
   claude.ts            entrypoint: ToolConfig for claude, calls runWrapper
   codex.ts             entrypoint: ToolConfig for codex, calls runWrapper
   grok.ts              entrypoint: ToolConfig for grok, calls runWrapper
@@ -962,6 +1008,36 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
     redundant SSH round-trips during the one-time transition, not a
     correctness risk, and stops recurring the moment the last old-binary
     background worker exits.
+
+- **The console (`ais web` + `ais tui`) is a thin HTTP surface over the
+  existing engines, not a second brain.** Every data endpoint delegates to
+  the same functions the CLI uses (store/actions for registry mutations, the
+  limits FETCHERS, usage/run.ts's provider-first aggregation, resume's
+  READERS, zai-auth/ali-auth for key writes), so a behaviour fixed once is
+  fixed for CLI, web, and TUI together. The two frontends (apps/web: Vite +
+  React + shadcn/ui + TanStack Query; apps/tui: Rust ratatui) are LIVE views:
+  both poll on documented intervals (docs/API.md), which is why
+  server/expensive.ts exists — a TTL + in-flight-dedupe cache so N polling
+  clients share one upstream fetch instead of hammering provider quota APIs.
+  Security model, decided up front because this server can write real
+  identity state: binds loopback only; Host header must be loopback-shaped
+  (DNS-rebinding guard); requests authenticate via the per-boot bearer token
+  in ~/.ais/web/server.json OR by being loopback peers; every mutating method
+  additionally requires `X-AIS-Console: 1`, a custom header cross-site pages
+  cannot attach without a CORS preflight this server never answers (this is
+  the CSRF story); secrets are WRITE-ONLY through the API (keys/cookies can
+  be set, never read back); file editing is confined to whitelisted roots
+  with dual lexical+realpath containment checks and pre-edit backups. The
+  server code follows the repo's test-injection convention (`configs =
+  Object.values(TOOL_CONFIGS)` parameters everywhere) so tests exercise the
+  real mutation paths against synthetic temp-dir registries and can never
+  touch a live home. Two gotchas are load-bearing: cli/args.ts's parseArgs
+  reads ONLY `--flag=value` (a space-separated value silently degrades into a
+  boolean flag plus stray positional — bit once already during the daemon
+  spawn work), and identities/match.ts's expandPath resolves bare relative
+  paths against process.cwd(), which is registry-storage semantics and
+  therefore deliberately NOT used for user-supplied paths inside the files
+  API (there, relative means "relative to the selected root").
 
 ## Adding another wrapped tool later
 
@@ -2562,3 +2638,5 @@ identity's Chrome (Claude MCP) window instead of your regular daily-driver
 Chrome. If a real Chrome window opens instead (or nothing redirects at all),
 the bare-command-name assumption is wrong — drop this mechanism and record
 that finding here instead of iterating on it further.
+
+@/home/thomas/.config/devdeploy/CLAUDE.snippet.md

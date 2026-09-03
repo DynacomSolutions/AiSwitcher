@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${PROJECT}
+  namespace: dev
+  labels:
+    app: ${PROJECT}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${PROJECT}
+  template:
+    metadata:
+      labels:
+        app: ${PROJECT}
+    spec:
+      # The console reads (and edits) the same single-user AIS state the host
+      # daemon would: identity registries, session transcripts, usage data.
+      # Everything is uid 1000 on the host, so no fsGroup juggling needed.
+      containers:
+        - name: app
+          image: localhost:5000/${PROJECT}:${TAG}
+          imagePullPolicy: Always
+          env:
+            - name: AIS_WEB_ALLOWED_HOSTS
+              value: ${PROJECT}.localhost
+          ports:
+            - containerPort: ${PORT}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: ${PORT}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: ${PORT}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: ais-home
+              mountPath: /home/thomas/.ais
+            - name: claude-home
+              mountPath: /home/thomas/.claude
+            - name: codex-home
+              mountPath: /home/thomas/.codex
+            - name: grok-home
+              mountPath: /home/thomas/.grok
+            - name: kimi-home
+              mountPath: /home/thomas/.kimi-code
+            - name: zai-home
+              mountPath: /home/thomas/.zai
+            - name: ali-home
+              mountPath: /home/thomas/.ali
+            - name: pi-home
+              mountPath: /home/thomas/.pi
+      volumes:
+        - name: ais-home
+          hostPath:
+            path: /home/thomas/.ais
+            type: Directory
+        - name: claude-home
+          hostPath:
+            path: /home/thomas/.claude
+            type: Directory
+        - name: codex-home
+          hostPath:
+            path: /home/thomas/.codex
+            type: Directory
+        - name: grok-home
+          hostPath:
+            path: /home/thomas/.grok
+            type: Directory
+        - name: kimi-home
+          hostPath:
+            path: /home/thomas/.kimi-code
+            type: Directory
+        - name: zai-home
+          hostPath:
+            path: /home/thomas/.zai
+            type: Directory
+        - name: ali-home
+          hostPath:
+            path: /home/thomas/.ali
+            type: Directory
+        - name: pi-home
+          hostPath:
+            path: /home/thomas/.pi
+            type: Directory

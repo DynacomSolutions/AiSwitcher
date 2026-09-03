@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { normalizePath } from "../../identities/match.ts";
 import type { Identity } from "../../identities/types.ts";
@@ -80,6 +81,14 @@ async function queryTopLevelSessions(dbPath: string, providerId: string): Promis
   let lastErr: unknown;
   for (let attempt = 1; attempt <= QUERY_RETRY_ATTEMPTS; attempt++) {
     try {
+      // Async reachability pre-check: see usage/crush-usage.ts's
+      // crushDbReachable comment (a sync open on a hung network mount
+      // freezes Bun's whole event loop; a hanging await does not).
+      const probe = stat(dbPath)
+        .then((info) => info.isFile())
+        .catch(() => false);
+      const reachable = await Promise.race([probe, Bun.sleep(3_000).then(() => false)]);
+      if (!reachable) return [];
       const db = new Database(dbPath, { readonly: true });
       try {
         return db

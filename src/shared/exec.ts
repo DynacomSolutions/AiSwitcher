@@ -1,6 +1,47 @@
+import { realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
+import { homedir } from "node:os";
+import { chdir } from "node:process";
 
 const FORWARD_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"] as const;
+
+/**
+ * A process whose current working directory has been DELETED (its checkout
+ * was moved or pruned while it ran — seen live: the console daemon kept
+ * serving for days after its worktree moved, and every spawn it attempted
+ * failed with a POSIX EACCES/ENOENT naming the target binary, because the
+ * kernel cannot resolve a dangling cwd during spawn) can never start a child
+ * again on its own. Detection is a single realpath (note: process.cwd()
+ * keeps returning the stale path and Bun's stat(".") does not fail —
+ * verified live — so neither can be the detector); recovery is moving to
+ * $HOME, which exists for the process's remaining lifetime.
+ */
+export function ensureUsableCwd(): void {
+  try {
+    realpathSync(".");
+  } catch {
+    try {
+      chdir(homedir());
+    } catch {
+      // Even $HOME is unusable; children will keep failing to spawn, but
+      // there is nowhere left to recover to.
+    }
+  }
+}
+
+/**
+ * Runs `attempt`, and on spawn failure heals a dangling cwd and retries
+ * exactly once, so a long-lived process self-repairs mid-flight instead of
+ * failing every future child until restart. Any second failure propagates.
+ */
+export function withUsableCwd<T>(attempt: () => T): T {
+  try {
+    return attempt();
+  } catch (err) {
+    ensureUsableCwd();
+    return attempt();
+  }
+}
 
 // Session-marker env vars set by Claude Code / Codex itself when THIS
 // wrapper happens to be invoked from inside an already-running session
