@@ -55,16 +55,22 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
   // suite — see live.ts's own note on why the TTY check lives in callers.
   if (!json && process.stdout.isTTY) {
     const targets = await collectLimitTargets(identityFilter, flags);
-    const results: ToolLimitResult[] = targets.map(pendingLimitResult);
+    // One slot per target: 1:1 tools seed a pending row so the live render
+    // has a spinner to show, multi-provider clients seed NOTHING (their
+    // provider isn't known until the adapter reads the identity's auth
+    // store — a tool-shaped placeholder would render a fake section).
+    // aggregateLimitResults on every frame: the same provider+identity can
+    // be answered by more than one target (a Z.ai key imported into Pi is
+    // the account the zai tool queries too) — the flat list must not show
+    // duplicate branches mid-render.
+    const slots: ToolLimitResult[][] = targets.map((target) => {
+      const pending = pendingLimitResult(target);
+      return pending ? [pending] : [];
+    });
     await withLiveRender(
-      // aggregateLimitResults on every frame: a multi-provider target
-      // resolves to several rows at once, and the same provider+identity can
-      // also be answered by more than one target (a Z.ai key imported into
-      // Pi is the account the zai tool queries too) — the flat list must not
-      // show duplicate branches mid-render.
-      (tick) => formatLimitsReport(aggregateLimitResults(results), new Date(), spinnerChar(tick)),
+      (tick) => formatLimitsReport(aggregateLimitResults(slots.flat()), new Date(), spinnerChar(tick)),
       async () => {
-        await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => results.splice(i, 1, ...resolved));
+        await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => (slots[i] = resolved));
       },
     );
     return;

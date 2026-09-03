@@ -93,13 +93,25 @@ export async function collectLimitTargets(
   return targets;
 }
 
-/** Seeds a placeholder result for a not-yet-fetched target — what
+/** The multi-provider clients. Their limits come from per-provider adapters
+ * that only learn which providers an identity answers for by reading that
+ * identity's own auth store — so there is no meaningful tool-shaped
+ * placeholder row for them anywhere in the pipeline: not a pending seed
+ * (it would render a fake "Detecting providers"/"OpenCode" section), not a
+ * cached-mode row (it would do the same). Unscoped, they render nothing
+ * until their real per-provider results land; an explicit --tool= still
+ * gets an honest row. */
+const MULTI_PROVIDER_TOOLS: ReadonlySet<ToolConfig["toolName"]> = new Set(["pi", "opencode"]);
+
+/** Seeds a placeholder result for a not-yet-fetched 1:1 tool — what
  * limits/dispatch.ts's plain live render and limits/watch.ts's `--watch`
  * loop both use to give report.ts's "pending" spinner row something to
- * render for a target before its own fetch has resolved. The provider is
- * only the tool's fallback ("Detecting providers" for pi) — a multi-provider
- * client's rows move to their real provider sections once its fetch lands. */
-export function pendingLimitResult(target: LimitTarget): ToolLimitResult {
+ * render for a target before its own fetch has resolved. Multi-provider
+ * clients get NO pending seed: their provider isn't known yet, and a
+ * placeholder under the tool's own fallback label would render a fake
+ * tool-shaped section. Returns undefined for those. */
+export function pendingLimitResult(target: LimitTarget): ToolLimitResult | undefined {
+  if (MULTI_PROVIDER_TOOLS.has(target.toolName)) return undefined;
   return { toolName: target.toolName, provider: providerForTool(target.toolName), identity: target.identity, windows: [], status: "pending" };
 }
 
@@ -117,6 +129,29 @@ function unavailableCached(target: LimitTarget): ToolLimitResult {
     status: "unavailable",
     error: "cached data not available for this tool (no offline cache implemented yet) — omit --cached to fetch live",
   };
+}
+
+/** Cached-mode results for one target. The multi-provider clients have no
+ * offline cache AND no honest tool-level provider label, so they render
+ * nothing unscoped — a placeholder section ("Detecting providers",
+ * "OpenCode") would be exactly the tool-shaped output the provider-first
+ * views rule forbids. An explicit --tool= still gets the honest row. */
+function cachedResults(target: LimitTarget, explicitTool: boolean): ToolLimitResult[] {
+  if (MULTI_PROVIDER_TOOLS.has(target.toolName)) {
+    return explicitTool
+      ? [
+          {
+            toolName: target.toolName,
+            provider: "unattributed",
+            identity: target.identity,
+            windows: [],
+            status: "unavailable",
+            error: "cached data not available for this source (no offline cache implemented yet) — omit --cached to fetch live",
+          },
+        ]
+      : [];
+  }
+  return [unavailableCached(target)];
 }
 
 /** Codex, Kimi, and zai live reads hit a real third-party backend once per
@@ -248,7 +283,7 @@ export async function fetchLimitResults(
   const batches = await runBatched(
     targets,
     MAX_CONCURRENT,
-    async (target) => (cached ? [unavailableCached(target)] : fetchTarget(target, explicitTool)),
+    async (target) => (cached ? cachedResults(target, explicitTool) : fetchTarget(target, explicitTool)),
     onItemDone,
   );
   return aggregateLimitResults(batches.flat());
