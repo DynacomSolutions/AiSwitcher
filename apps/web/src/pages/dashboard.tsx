@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import type * as React from "react";
 
 import { IdentityChip, ToolBadge } from "@/components/badges";
@@ -20,8 +21,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { useProcessesQuery, useStatusQuery } from "@/hooks/queries";
-import { durationSince, formatUptime } from "@/lib/format";
+import { useProcessesQuery, useStatusQuery, useUsageQuery } from "@/hooks/queries";
+import { durationSince, formatDateMs, formatMoney, formatUptime, formatTokens } from "@/lib/format";
 
 function SummaryCard({
   title,
@@ -126,6 +127,26 @@ function ProcessesTable() {
 export function DashboardPage() {
   const status = useStatusQuery();
   const processes = useProcessesQuery();
+  const usage = useUsageQuery();
+  const usageResults = usage.data?.results ?? [];
+  const usageTotals = useMemo(() => {
+    let input = 0;
+    let output = 0;
+    let cost = 0;
+    let today = 0;
+    const todayKey = formatDateMs(Date.now());
+    for (const r of usageResults) {
+      const rep = r.report;
+      if (rep) {
+        input += rep.totalInput;
+        output += rep.totalOutput;
+        cost += rep.totalCost;
+      }
+      const dayTokens = r.dailyUsage?.[todayKey];
+      if (typeof dayTokens === "number") today += dayTokens;
+    }
+    return { input: input + output, cost, today };
+  }, [usageResults]);
 
   if (status.isError && !status.data) {
     return (
@@ -171,6 +192,19 @@ export function DashboardPage() {
           />
         </div>
       )}
+
+      {/* Global usage counter, mirroring `ais usage`'s TOTAL row: every
+       * provider, every identity, all recorded history. */}
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <SummaryCard title="Total tokens" value={formatTokens(usageTotals.input)} hint="input + output, all providers" />
+        <SummaryCard title="Tokens today" value={formatTokens(usageTotals.today)} hint="input + output since midnight" />
+        <SummaryCard title="Est. spend" value={formatMoney(usageTotals.cost)} hint="all providers, all time" />
+        <SummaryCard
+          title="Usage series"
+          value={String(usageResults.length)}
+          hint="provider + identity pairs tracked"
+        />
+      </div>
 
       <Card className="gap-4">
         <CardHeader>

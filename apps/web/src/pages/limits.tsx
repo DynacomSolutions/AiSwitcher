@@ -1,6 +1,8 @@
 import { CreditCard } from "lucide-react";
+import { useMemo } from "react";
 
 import { ToolBadge } from "@/components/badges";
+import { ProviderLabel } from "@/components/provider-icon";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -89,10 +91,10 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
       <CardHeader className="space-y-0">
         <div className="flex items-center justify-between gap-2">
           <div className="flex min-w-0 items-center gap-2">
-            <ToolBadge tool={result.toolName} />
             <span className="truncate font-medium" title={result.identity.name}>
               {result.identity.name}
             </span>
+            <ToolBadge tool={result.toolName} />
           </div>
           <StatusBadge status={result.status} />
         </div>
@@ -126,6 +128,20 @@ export function LimitsPage() {
   const query = useLimitsQuery();
   const results = query.data?.results ?? [];
 
+  // Provider-first grouping, mirroring the CLI report: provider is the
+  // grouping key, the wrapper tool is secondary info on each identity row.
+  const providerGroups = useMemo(() => {
+    const map = new Map<string, ToolLimitResult[]>();
+    for (const result of results) {
+      const key = result.provider || "unattributed";
+      const bucket = map.get(key);
+      if (bucket) bucket.push(result);
+      else map.set(key, [result]);
+    }
+    for (const bucket of map.values()) bucket.sort((a, b) => a.identity.name.localeCompare(b.identity.name));
+    return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [results]);
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -148,11 +164,19 @@ export function LimitsPage() {
           description="Add identities with configured credentials; quotas appear once the server can fetch them."
         />
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {results.map((r) => (
-            <LimitCard key={`${r.toolName}/${r.identity.name}`} result={r} />
-          ))}
-        </div>
+        providerGroups.map(([provider, group]) => (
+          <section key={provider} className="space-y-3">
+            <div className="flex items-center gap-2">
+              <ProviderLabel provider={provider} size={16} className="text-base font-semibold" />
+              <Badge variant="muted">{group.length}</Badge>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {group.map((r) => (
+                <LimitCard key={`${r.provider}/${r.toolName}/${r.identity.name}`} result={r} />
+              ))}
+            </div>
+          </section>
+        ))
       )}
     </div>
   );
