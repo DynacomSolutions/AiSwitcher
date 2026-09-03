@@ -8,6 +8,7 @@ import { fetchCodexLimits } from "../limits/codex-limits.ts";
 import { fetchKimiLimits } from "../limits/kimi-limits.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { fetchAliUsage } from "./ali-usage.ts";
+import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, readOpencodeProfileUsage } from "./opencode-usage.ts";
 import { fetchPiUsage } from "./pi-usage.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
 import {
@@ -341,9 +342,46 @@ export async function runUsageQueryForTargets(
   ).then((batches) => aggregateUsageResults(batches.flat()));
 }
 
+/** When the default opencode profile contributes to a report: it is the
+ * user's own unscoped opencode usage, so it belongs whenever identities
+ * aren't being filtered, and whenever the query is scoped to opencode at
+ * all — not when scoped to some other tool's registry. */
+export function shouldIncludeDefaultOpencodeProfile(flags: ParsedArgs["flags"]): boolean {
+  if (stringFlag(flags, "identity") !== undefined) return false;
+  const toolFilter = toolConfigFromFlag(flags);
+  return !toolFilter || toolFilter.toolName === "opencode";
+}
+
+/** Raw (pre-aggregation) per-provider rows for the default opencode
+ * profile, under the synthetic "default" identity — it is not an AIS
+ * identity, and pretending otherwise would misattribute the usage. Read
+ * failures are real failures: source-only error rows, never fabricated
+ * provider rows. */
+export async function defaultOpencodeProfileUsageResults(): Promise<UsageResult[]> {
+  const identity: Identity = { ...OPENCODE_DEFAULT_PROFILE_IDENTITY, configDir: defaultOpencodeProfileDbPath() };
+  const outcome = readOpencodeProfileUsage(defaultOpencodeProfileDbPath());
+  if (outcome.kind === "absent") return [];
+  if (outcome.kind === "error") {
+    return [{ provider: "unattributed", identity, sourceTool: "opencode", sourceOnlyError: true, error: `Could not read the default OpenCode profile: ${outcome.message}` }];
+  }
+  return outcome.providers.map(({ provider, report, dateSpan, dailyUsage }) => ({
+    provider: canonicalUsageProvider(provider),
+    identity,
+    sourceTool: "opencode" as const,
+    report,
+    dateSpan,
+    dailyUsage,
+  }));
+}
+
 export async function runUsageQuery(flags: ParsedArgs["flags"]): Promise<UsageResult[]> {
   const targets = await collectTargets(flags);
-  return runUsageQueryForTargets(targets, { explicitTool: toolConfigFromFlag(flags) !== undefined });
+  const includeDefaultProfile = shouldIncludeDefaultOpencodeProfile(flags);
+  const [results, defaultProfileResults] = await Promise.all([
+    runUsageQueryForTargets(targets, { explicitTool: toolConfigFromFlag(flags) !== undefined }),
+    includeDefaultProfile ? defaultOpencodeProfileUsageResults() : Promise.resolve([] as UsageResult[]),
+  ]);
+  return aggregateUsageResults([...results, ...defaultProfileResults]);
 }
 
 /** JSON follows the same provider-first contract as the table. Client/tool

@@ -7,9 +7,11 @@ import { formatUsageReport } from "./report.ts";
 import {
   aggregateUsageResults,
   collectTargets,
+  defaultOpencodeProfileUsageResults,
   pendingUsageResult,
   runUsageQuery,
   runUsageQueryForTargets,
+  shouldIncludeDefaultOpencodeProfile,
   usageResultsForJson,
   type UsageResult,
 } from "./run.ts";
@@ -80,13 +82,21 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
       const pending = pendingUsageResult(target);
       return pending ? [pending] : [];
     });
+    // The default opencode profile gets its own slot: it is usage outside
+    // any identity and has no target row to hang a spinner on, so it fills
+    // in whenever its (fast, local) db read lands.
+    const includeDefaultProfile = shouldIncludeDefaultOpencodeProfile(flags);
+    const defaultSlot: UsageResult[] = [];
     await withLiveRender(
-      (tick) => formatUsageReport(aggregateUsageResults(resultSlots.flat()), spinnerChar(tick)),
+      (tick) => formatUsageReport(aggregateUsageResults([...resultSlots.flat(), ...defaultSlot]), spinnerChar(tick)),
       async () => {
-        await runUsageQueryForTargets(targets, {
-          explicitTool: toolConfigFromFlag(flags) !== undefined,
-          onItemDone: (index, results) => (resultSlots[index] = results),
-        });
+        await Promise.all([
+          runUsageQueryForTargets(targets, {
+            explicitTool: toolConfigFromFlag(flags) !== undefined,
+            onItemDone: (index, results) => (resultSlots[index] = results),
+          }),
+          includeDefaultProfile ? defaultOpencodeProfileUsageResults().then((rows) => defaultSlot.push(...rows)) : Promise.resolve(),
+        ]);
       },
     );
     return;
