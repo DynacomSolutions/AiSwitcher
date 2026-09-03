@@ -1,4 +1,6 @@
 import { platform } from "node:os";
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 
 const K3S_NAMESPACE = "chrome-mcp";
 const AUTH_PORT_BASE = 9444;
@@ -37,6 +39,46 @@ async function portListening(port: number): Promise<boolean> {
   }
 }
 
+/** A listener on the WebDriver port proves nothing on its own: a port-forward
+ * pinned to a replaced browser pod keeps accepting connections and failing
+ * every request (observed live: HTTP 404 from a tunnel whose target pod had
+ * been recreated). WebDriver readiness is the real test. */
+async function webdriverReady(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/status`, { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { value?: { ready?: boolean } };
+    return body.value?.ready === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Terminates a stale `kubectl port-forward` holding `port` (identified by
+ * /proc cmdline, since the container image has no pkill). Never throws. */
+async function killStaleForward(port: number): Promise<void> {
+  try {
+    for (const dir of await readdir("/proc")) {
+      if (!/^\d+$/.test(dir)) continue;
+      try {
+        const bytes = await Bun.file(join("/proc", dir, "cmdline")).bytes();
+        const cmdline = new TextDecoder().decode(bytes);
+        if (cmdline.includes("port-forward") && cmdline.includes(String(port))) {
+          try {
+            process.kill(Number(dir), "SIGTERM");
+          } catch {
+            // Not ours (or already gone) — nothing to do.
+          }
+        }
+      } catch {
+        // Process vanished mid-scan.
+      }
+    }
+  } catch {
+    // No /proc access to other processes; nothing to clean.
+  }
+}
+
 /** Starts an owned, loopback-only port-forward to the auth browser. It is
  * deliberately separate from Chrome MCP's CDP forward: WebDriver and noVNC
  * must never share or expose the MCP endpoint.
@@ -48,7 +90,14 @@ async function portListening(port: number): Promise<boolean> {
 export async function ensureAuthBrowserPorts(identityName: string): Promise<AuthBrowserConfig | undefined> {
   if (platform() !== "linux" || !Bun.which("kubectl")) return undefined;
   const config = authBrowserConfigFor(identityName);
-  if (await portListening(config.webdriverPort)) return config;
+  if (await webdriverReady(config.webdriverPort)) return config;
+
+  // A live listener that is not WebDriver-ready is a stale forward pinned to
+  // a replaced browser pod; clear it so the fresh forward below can bind.
+  if (await portListening(config.webdriverPort)) {
+    await killStaleForward(config.webdriverPort);
+    await Bun.sleep(500);
+  }
 
   if (Bun.which("systemd-run")) {
     const unit = `chrome-auth-pf-${config.webdriverPort}`;
@@ -99,7 +148,7 @@ export async function ensureAuthBrowserPorts(identityName: string): Promise<Auth
   }
 
   for (let attempt = 0; attempt < 30; attempt += 1) {
-    if (await portListening(config.webdriverPort)) return config;
+    if (await webdriverReady(config.webdriverPort)) return config;
     await Bun.sleep(500);
   }
   return undefined;
