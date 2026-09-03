@@ -39,38 +39,62 @@ async function portListening(port: number): Promise<boolean> {
 
 /** Starts an owned, loopback-only port-forward to the auth browser. It is
  * deliberately separate from Chrome MCP's CDP forward: WebDriver and noVNC
- * must never share or expose the MCP endpoint. */
+ * must never share or expose the MCP endpoint.
+ *
+ * On the host the forward runs under systemd-run so it outlives this
+ * process. Inside a container (the console daemon) there is no systemd:
+ * there we spawn kubectl directly and let the container's own lifetime
+ * manage the forward. */
 export async function ensureAuthBrowserPorts(identityName: string): Promise<AuthBrowserConfig | undefined> {
-  if (platform() !== "linux" || !Bun.which("kubectl") || !Bun.which("systemd-run")) return undefined;
+  if (platform() !== "linux" || !Bun.which("kubectl")) return undefined;
   const config = authBrowserConfigFor(identityName);
   if (await portListening(config.webdriverPort)) return config;
 
-  const unit = `chrome-auth-pf-${config.webdriverPort}`;
-  if (Bun.which("systemctl")) {
-    const stop = Bun.spawn(["systemctl", "--user", "stop", `${unit}.service`], { stdout: "ignore", stderr: "ignore" });
-    await stop.exited;
-  }
+  if (Bun.which("systemd-run")) {
+    const unit = `chrome-auth-pf-${config.webdriverPort}`;
+    if (Bun.which("systemctl")) {
+      const stop = Bun.spawn(["systemctl", "--user", "stop", `${unit}.service`], { stdout: "ignore", stderr: "ignore" });
+      await stop.exited;
+    }
 
-  const forward = Bun.spawn(
-    [
-      "systemd-run",
-      "--user",
-      "--quiet",
-      "--collect",
-      `--unit=${unit}`,
-      "kubectl",
-      "-n",
-      K3S_NAMESPACE,
-      "port-forward",
-      `service/${config.service}`,
-      `${config.webdriverPort}:4444`,
-      `${config.novncPort}:7900`,
-      "--address",
-      "127.0.0.1",
-    ],
-    { stdout: "ignore", stderr: "ignore" },
-  );
-  await forward.exited;
+    const forward = Bun.spawn(
+      [
+        "systemd-run",
+        "--user",
+        "--quiet",
+        "--collect",
+        `--unit=${unit}`,
+        "kubectl",
+        "-n",
+        K3S_NAMESPACE,
+        "port-forward",
+        `service/${config.service}`,
+        `${config.webdriverPort}:4444`,
+        `${config.novncPort}:7900`,
+        "--address",
+        "127.0.0.1",
+      ],
+      { stdout: "ignore", stderr: "ignore" },
+    );
+    await forward.exited;
+  } else {
+    // Container mode: a plain detached forward, no unit manager to talk to.
+    const forward = Bun.spawn(
+      [
+        "kubectl",
+        "-n",
+        K3S_NAMESPACE,
+        "port-forward",
+        `service/${config.service}`,
+        `${config.webdriverPort}:4444`,
+        `${config.novncPort}:7900`,
+        "--address",
+        "127.0.0.1",
+      ],
+      { stdout: "ignore", stderr: "ignore", detached: true },
+    );
+    forward.unref();
+  }
 
   for (let attempt = 0; attempt < 30; attempt += 1) {
     if (await portListening(config.webdriverPort)) return config;

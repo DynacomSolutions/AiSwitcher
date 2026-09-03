@@ -7,6 +7,13 @@ import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -25,9 +32,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
-import { qk, useAuthQuery } from "@/hooks/queries";
+import { qk, useAuthQuery, useAuthRefreshQuery } from "@/hooks/queries";
 import { api, supportsFix } from "@/lib/api";
-import type { AuthEntry } from "@/types/api";
+import { relTime } from "@/lib/format";
+import type { AuthEntry, AuthRefreshStatus } from "@/types/api";
 
 function StateBadge({ state }: { state: AuthEntry["state"] }) {
   switch (state) {
@@ -220,6 +228,106 @@ function FixActions({ entry }: { entry: AuthEntry }) {
   );
 }
 
+function RenewalRow({ status }: { status: AuthRefreshStatus }) {
+  const qc = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: () => api.refreshCredential(status.tool, status.identity),
+    onSuccess: (result) => {
+      void qc.invalidateQueries({ queryKey: qk.authRefresh });
+      if (result.ok) toast.success("Credential refreshed", { description: `${status.tool}/${status.identity}` });
+      else toast.warning("Refresh did not write cookies", { description: `${status.tool}/${status.identity}` });
+    },
+    onError: (error) => toast.error("Refresh failed", { description: error.message }),
+  });
+
+  return (
+    <TableRow>
+      <TableCell>
+        <ToolBadge tool={status.tool} />
+      </TableCell>
+      <TableCell className="font-medium">{status.identity}</TableCell>
+      <TableCell className="text-xs text-muted-foreground">
+        {status.lastAttemptAt ? relTime(status.lastAttemptAt) : "never"}
+      </TableCell>
+      <TableCell className="text-xs">
+        {status.lastSuccessAt ? (
+          relTime(status.lastSuccessAt)
+        ) : (
+          <Badge variant="warning">Never</Badge>
+        )}
+      </TableCell>
+      <TableCell className="max-w-72">
+        {status.lastError ? (
+          <span className="block truncate text-xs text-destructive" title={status.lastError}>
+            {status.lastError}
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">-</span>
+        )}
+      </TableCell>
+      <TableCell className="text-right">
+        <Button variant="outline" size="sm" disabled={mutation.isPending || status.running} onClick={() => mutation.mutate()}>
+          {status.running || mutation.isPending ? "Refreshing…" : "Refresh now"}
+        </Button>
+      </TableCell>
+    </TableRow>
+  );
+}
+
+/** Daemon-side scheduled renewal (Alibaba console cookies today). */
+function RenewalCard() {
+  const query = useAuthRefreshQuery();
+  const results = query.data?.results ?? [];
+  const healthy = results.filter((r) => r.lastSuccessAt && !r.lastError).length;
+
+  return (
+    <Card className="gap-3">
+      <CardHeader>
+        <CardTitle className="text-base">Scheduled credential renewal</CardTitle>
+        <CardDescription>
+          The daemon renews Alibaba console cookies on a 10-minute loop while it runs, so
+          dashboards and quota checks keep working without the host timers.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {query.isLoading ? (
+          <div className="h-16 animate-pulse rounded-lg bg-muted" />
+        ) : results.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No renewals recorded yet. The first pass runs about 15 seconds after the daemon starts,
+            and refreshable credentials appear here.
+          </p>
+        ) : (
+          <>
+            <p className="mb-3 text-xs text-muted-foreground">
+              {healthy} of {results.length} renewing cleanly
+            </p>
+            <div className="overflow-hidden rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead>Tool</TableHead>
+                    <TableHead>Identity</TableHead>
+                    <TableHead>Last attempt</TableHead>
+                    <TableHead>Last success</TableHead>
+                    <TableHead>Error</TableHead>
+                    <TableHead className="text-right"> </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {results.map((status) => (
+                    <RenewalRow key={`${status.tool}/${status.identity}`} status={status} />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function AuthPage() {
   const query = useAuthQuery();
   const entries = query.data?.entries ?? [];
@@ -231,6 +339,8 @@ export function AuthPage() {
         description="Credential health for every identity across every registry."
         updatedAt={query.dataUpdatedAt}
       />
+
+      <RenewalCard />
 
       {query.isLoading && !query.data ? (
         <div className="h-64 animate-pulse rounded-xl bg-muted" />
