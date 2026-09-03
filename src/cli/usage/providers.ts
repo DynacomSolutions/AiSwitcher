@@ -23,6 +23,12 @@ const PROVIDER_ALIASES: Record<string, string> = {
   "alibaba_token_plan": "alibaba",
   "alibaba-token-plan": "alibaba",
   "opencode-go": "opencode-go",
+  // tokscale's opencode client spells the Go plan with an UNDERSCORE, and
+  // can also emit comma-joined multi-plan strings for a single model entry
+  // (observed live 2026-09-03: "opencode_go" and "opencode_go,
+  // zai_coding_plan"); the underscore spelling must collapse onto the same
+  // upstream as the hyphenated one.
+  "opencode_go": "opencode-go",
   "party-cli": "unattributed",
 };
 
@@ -41,10 +47,25 @@ const PROVIDER_LABELS: Record<string, string> = {
 
 /** Collapses provider aliases emitted by different clients into the actual
  * upstream provider. This is intentionally client-agnostic: OpenAI usage is
- * OpenAI whether it came from Codex directly or Pi's openai-codex adapter. */
+ * OpenAI whether it came from Codex directly or Pi's openai-codex adapter.
+ * Comma-joined multi-provider strings (tokscale's opencode client merges a
+ * model entry across plans into e.g. "opencode_go, zai_coding_plan") are
+ * split, each part canonicalised, and the parts re-joined deterministically
+ * so one logical entry can't fragment into a row per spelling. */
 export function canonicalUsageProvider(provider: string): string {
   const normalised = provider.trim().toLowerCase();
   if (!normalised) return "unattributed";
+  if (normalised.includes(",")) {
+    const parts = [
+      ...new Set(
+        normalised
+          .split(",")
+          .map((part) => canonicalUsageProvider(part))
+          .filter((part) => part !== "unattributed"),
+      ),
+    ].sort();
+    return parts.length > 0 ? parts.join(", ") : "unattributed";
+  }
   return PROVIDER_ALIASES[normalised] ?? normalised;
 }
 
@@ -75,6 +96,9 @@ export function providerForTool(toolName: ToolConfig["toolName"]): string {
 }
 
 export function usageProviderLabel(provider: string): string {
+  if (provider.includes(",")) {
+    return provider.split(",").map((part) => usageProviderLabel(part)).join(", ");
+  }
   const canonical = canonicalUsageProvider(provider);
   const known = PROVIDER_LABELS[canonical];
   if (known) return known;
