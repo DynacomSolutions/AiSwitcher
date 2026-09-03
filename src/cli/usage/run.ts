@@ -71,7 +71,13 @@ export async function collectTargets(
   return targets;
 }
 
-export function pendingUsageResult(target: UsageTarget): UsageResult {
+/** Pending seed for a not-yet-resolved target. Multi-provider clients (pi,
+ * opencode) get NO seed: their provider isn't known until their own source
+ * resolves, and a placeholder under the tool's fallback label would render
+ * a fake "Detecting providers"/"OpenCode" section — tool-shaped output the
+ * provider-first views rule forbids. Returns undefined for those. */
+export function pendingUsageResult(target: UsageTarget): UsageResult | undefined {
+  if (target.toolName === "pi" || target.toolName === "opencode") return undefined;
   return { provider: providerForTool(target.toolName), identity: target.identity, sourceTool: target.toolName, pending: true };
 }
 

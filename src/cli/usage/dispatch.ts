@@ -73,7 +73,13 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
   // nothing to do with this render loop at all).
   if (!json && process.stdout.isTTY) {
     const targets = await collectTargets(flags);
-    const resultSlots: UsageResult[][] = targets.map((target) => [pendingUsageResult(target)]);
+    // One slot per target; multi-provider clients (pi/opencode) seed no
+    // pending row — their provider is only known once their own source
+    // resolves (see pendingUsageResult).
+    const resultSlots: UsageResult[][] = targets.map((target) => {
+      const pending = pendingUsageResult(target);
+      return pending ? [pending] : [];
+    });
     await withLiveRender(
       (tick) => formatUsageReport(aggregateUsageResults(resultSlots.flat()), spinnerChar(tick)),
       async () => {
