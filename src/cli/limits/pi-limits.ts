@@ -1,8 +1,8 @@
-import { chmod, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { canonicalUsageProvider } from "../usage/providers.ts";
-import { fetchKimiUsageForCredentials, type KimiOAuthCredentials } from "./kimi-limits.ts";
+import { fetchKimiUsageForCredentials } from "./kimi-limits.ts";
+import { persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
 import { fetchZaiQuotaForKey } from "./zai-limits.ts";
 import type { OverageInfo, ToolLimitResult } from "./types.ts";
 
@@ -44,41 +44,20 @@ async function readPiAuth(configDir: string): Promise<PiAuthFile | undefined> {
   }
 }
 
-/** Write a refreshed OAuth credential back into Pi's own auth.json —
- * read-modify-write preserving every other provider entry and unknown keys,
- * atomically (temp file + rename) and mode 0600, the same discipline
- * identities/pi-auth.ts and kimi-limits.ts apply to their own stores. */
-async function persistKimiCredential(configDir: string, updated: KimiOAuthCredentials): Promise<void> {
-  const authPath = join(configDir, "auth.json");
-  const auth = await readPiAuth(configDir);
-  if (!auth) throw new Error("could not re-read Pi auth.json to persist the refreshed token");
-  const existing = auth["kimi-coding"];
-  auth["kimi-coding"] = {
-    ...(typeof existing === "object" && existing !== null ? existing : {}),
-    type: "oauth",
-    access: updated.access_token,
-    ...(updated.refresh_token ? { refresh: updated.refresh_token } : {}),
-    ...(updated.expires_at !== undefined ? { expires: updated.expires_at * 1000 } : {}),
-  };
-  const temporary = `${authPath}.ais-${process.pid}-${crypto.randomUUID()}`;
-  try {
-    await mkdir(join(configDir), { recursive: true, mode: 0o700 });
-    await writeFile(temporary, `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-    await rename(temporary, authPath);
-    await chmod(authPath, 0o600);
-  } catch (error) {
-    await unlink(temporary).catch(() => undefined);
-    throw error;
-  }
-}
-
-function piKimiCredentials(entry: PiAuthEntry): KimiOAuthCredentials | undefined {
-  if (entry.type !== "oauth" || typeof entry.access !== "string" || entry.access.length === 0) return undefined;
-  return {
-    access_token: entry.access,
-    ...(typeof entry.refresh === "string" && entry.refresh.length > 0 ? { refresh_token: entry.refresh } : {}),
-    ...(typeof entry.expires === "number" && Number.isFinite(entry.expires) ? { expires_at: Math.floor(entry.expires / 1000) } : {}),
-  };
+/** One credential per (identity, provider): the pi entry is only a gate —
+ * the tokens used (and refreshed) are the FRESHEST copy across the kimi and
+ * pi stores, and a refresh is written through to both (see kimi-store.ts). */
+async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): Promise<ToolLimitResult | undefined> {
+  if (entry.type !== "oauth") return undefined;
+  const credentials = await readFreshestKimiCredentials(identity, "pi");
+  if (!credentials) return undefined;
+  const outcome = await fetchKimiUsageForCredentials(credentials, (next) => persistKimiCredentials(identity, "pi", next));
+  if (outcome.error || !outcome.windows) return unavailable(toolName, "kimi", identity, outcome.error ?? "usage fetch failed");
+  return result(toolName, "kimi", identity, {
+    status: "live",
+    windows: outcome.windows,
+    ...(outcome.overage ? { overage: outcome.overage } : {}),
+  });
 }
 
 function result(
@@ -112,18 +91,6 @@ async function zaiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry)
   return result(toolName, "zai", identity, { status: "live", windows: outcome.windows });
 }
 
-async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): Promise<ToolLimitResult | undefined> {
-  const credentials = piKimiCredentials(entry);
-  if (!credentials) return undefined;
-  const outcome = await fetchKimiUsageForCredentials(credentials, (next) => persistKimiCredential(identity.configDir, next));
-  if (outcome.error || !outcome.windows) return unavailable(toolName, "kimi", identity, outcome.error ?? "usage fetch failed");
-  return result(toolName, "kimi", identity, {
-    status: "live",
-    windows: outcome.windows,
-    ...(outcome.overage ? { overage: outcome.overage } : {}),
-  });
-}
-
 /** OpenCode Go is a real upstream the user holds a credential for, so the
  * provider section stays visible — but no quota endpoint for its keys is
  * known today (probed live 2026-09-03 against opencode.ai/zen/v1: usage,
@@ -151,7 +118,7 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
     if (provider === "zai") {
       if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else if (provider === "kimi") {
-      if (!piKimiCredentials(entry)) continue;
+      if (entry.type !== "oauth") continue;
     } else if (provider === "opencode-go") {
       if (typeof entry.key !== "string" || entry.key.length === 0) continue;
     } else {

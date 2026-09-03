@@ -43,9 +43,19 @@ describe("fetchablePiProviders", () => {
   test("drops entries whose credential is not in the shape the fetch needs", () => {
     const auth: PiAuthFile = {
       zai: { type: "api_key" },
-      "kimi-coding": { type: "oauth", refresh: "r" },
+      "opencode-go": { type: "api_key" },
     };
     expect(fetchablePiProviders(auth)).toEqual([]);
+  });
+
+  test("an oauth-shaped kimi entry passes the gate even without tokens in pi's copy — the freshest store decides", () => {
+    // ONE credential per (identity, provider): pi's entry is the gate; the
+    // tokens may live (fresher) in the native kimi identity's store. See
+    // kimi-store.ts.
+    const auth: PiAuthFile = {
+      "kimi-coding": { type: "oauth", refresh: "r" },
+    };
+    expect(fetchablePiProviders(auth).map(({ provider }) => provider)).toEqual(["kimi"]);
   });
 });
 
