@@ -1,4 +1,6 @@
 import { boolFlag, parseArgs } from "../args.ts";
+import { CliUsageError } from "../errors.ts";
+import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { spinnerChar, withLiveRender } from "../live.ts";
 import { runPassthrough } from "./passthrough.ts";
 import { formatUsageReport } from "./report.ts";
@@ -75,7 +77,10 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
     await withLiveRender(
       (tick) => formatUsageReport(aggregateUsageResults(resultSlots.flat()), spinnerChar(tick)),
       async () => {
-        await runUsageQueryForTargets(targets, (index, results) => (resultSlots[index] = results));
+        await runUsageQueryForTargets(targets, {
+          explicitTool: toolConfigFromFlag(flags) !== undefined,
+          onItemDone: (index, results) => (resultSlots[index] = results),
+        });
       },
     );
     return;

@@ -79,25 +79,39 @@ function providerResult(target: UsageTarget, provider: string, fields: Omit<Usag
   return { provider: canonicalUsageProvider(provider), identity: target.identity, sourceTool: target.toolName, ...fields };
 }
 
-async function runZaiUsage(target: UsageTarget): Promise<UsageResult[]> {
+/** Sources with nothing to report render no row in an unscoped report — the
+ * view is provider/identity-first, and a "0 messages" or "no local data"
+ * placeholder against a pseudo-provider label is noise, not information
+ * (per-provider views rule). When the user asked about that source
+ * specifically (`--tool=<t>`), the same condition becomes an explicit,
+ * honest row instead of silence: they asked, so it must answer. */
+export type UsageRowSuppression = { explicitTool: boolean };
+
+async function runZaiUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   const result = await fetchZaiUsage(target.identity).catch(() => undefined);
-  if (!result) return [providerResult(target, "zai", { error: "no local Crush session data yet for this identity" })];
+  if (!result) {
+    return suppression.explicitTool ? [providerResult(target, "zai", { error: "no local Crush session data yet for this identity" })] : [];
+  }
   const { dateSpan, ...report } = result;
   return [providerResult(target, "zai", { report, ...(dateSpan ? { dateSpan } : {}) })];
 }
 
-async function runAliUsage(target: UsageTarget): Promise<UsageResult[]> {
+async function runAliUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   const result = await fetchAliUsage(target.identity).catch(() => undefined);
-  if (!result) return [providerResult(target, "alibaba", { error: "no local Crush session data yet for this identity" })];
+  if (!result) {
+    return suppression.explicitTool ? [providerResult(target, "alibaba", { error: "no local Crush session data yet for this identity" })] : [];
+  }
   const { dateSpan, ...report } = result;
   return [providerResult(target, "alibaba", { report, ...(dateSpan ? { dateSpan } : {}) })];
 }
 
-async function runPiUsage(target: UsageTarget): Promise<UsageResult[]> {
+async function runPiUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   try {
     const providers = await fetchPiUsage(target.identity);
     if (providers.length === 0) {
-      return [providerResult(target, "unattributed", { error: "no local Pi provider usage yet for this identity" })];
+      return suppression.explicitTool
+        ? [providerResult(target, "unattributed", { error: "no local Pi provider usage yet for this identity" })]
+        : [];
     }
     return providers.map(({ provider, nativeCoverageTool, report, dateSpan, dailyUsage }) =>
       providerResult(target, provider, { report, dateSpan, dailyUsage, ...(nativeCoverageTool ? { nativeCoverageTool } : {}) }),
@@ -138,10 +152,14 @@ function reportFromEntries(entries: TokscaleEntry[]): TokscaleReport {
 }
 
 /** Split tokscale output by its recorded upstream provider, never by the
- * wrapper that happened to produce the session file. */
-export function providerReportsFromTokscale(target: UsageTarget, report: TokscaleReport): UsageResult[] {
+ * wrapper that happened to produce the session file. A report with zero
+ * entries (an identity registered but never used) renders no row unless the
+ * user explicitly asked about this source — see UsageRowSuppression. */
+export function providerReportsFromTokscale(target: UsageTarget, report: TokscaleReport, suppression: UsageRowSuppression = { explicitTool: false }): UsageResult[] {
   const fallback = providerForTool(target.toolName);
-  if (report.entries.length === 0) return [providerResult(target, fallback, { report })];
+  if (report.entries.length === 0) {
+    return suppression.explicitTool ? [providerResult(target, fallback, { report })] : [];
+  }
 
   const groups = new Map<string, TokscaleEntry[]>();
   for (const entry of report.entries) {
@@ -155,7 +173,7 @@ export function providerReportsFromTokscale(target: UsageTarget, report: Tokscal
   return [...groups].map(([provider, entries]) => providerResult(target, provider, { report: reportFromEntries(entries) }));
 }
 
-async function runTokscale(target: UsageTarget): Promise<UsageResult[]> {
+async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   const fallbackProvider = providerForTool(target.toolName);
   const invocation = await tokscaleInvocationFor(target.toolName, target.identity);
   if (!invocation) return [providerResult(target, fallbackProvider, { error: "usage tracking is not supported for this source" })];
@@ -163,7 +181,7 @@ async function runTokscale(target: UsageTarget): Promise<UsageResult[]> {
 
   try {
     const stdout = await runTokscaleProcess([...clientArgs, "--json"], env);
-    return providerReportsFromTokscale(target, JSON.parse(stdout) as TokscaleReport);
+    return providerReportsFromTokscale(target, JSON.parse(stdout) as TokscaleReport, suppression);
   } catch (err) {
     const message = err instanceof SyntaxError
       ? "Could not parse tokscale's --json output."
@@ -172,13 +190,13 @@ async function runTokscale(target: UsageTarget): Promise<UsageResult[]> {
   }
 }
 
-async function runOne(target: UsageTarget): Promise<UsageResult[]> {
-  if (target.toolName === "zai") return runZaiUsage(target);
-  if (target.toolName === "ali") return runAliUsage(target);
-  if (target.toolName === "pi") return runPiUsage(target);
+async function runOne(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
+  if (target.toolName === "zai") return runZaiUsage(target, suppression);
+  if (target.toolName === "ali") return runAliUsage(target, suppression);
+  if (target.toolName === "pi") return runPiUsage(target, suppression);
 
   const [results, extraCost, daily] = await Promise.all([
-    runTokscale(target),
+    runTokscale(target, suppression),
     fetchExtraCost(target.toolName, target.identity),
     fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi" | "opencode", target.identity),
   ]);
@@ -256,22 +274,24 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
-  onItemDone?: (index: number, results: UsageResult[]) => void,
+  options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => void } = {},
 ): Promise<UsageResult[]> {
+  const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
   if (targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
   const results: UsageResult[][] = new Array(targets.length);
   await Promise.all(
     targets.map(async (target, index) => {
-      const targetResults = await runOne(target);
+      const targetResults = await runOne(target, suppression);
       results[index] = targetResults;
-      onItemDone?.(index, targetResults);
+      options.onItemDone?.(index, targetResults);
     }),
   );
   return aggregateUsageResults(results.flat());
 }
 
 export async function runUsageQuery(flags: ParsedArgs["flags"]): Promise<UsageResult[]> {
-  return runUsageQueryForTargets(await collectTargets(flags));
+  const targets = await collectTargets(flags);
+  return runUsageQueryForTargets(targets, { explicitTool: toolConfigFromFlag(flags) !== undefined });
 }
 
 /** JSON follows the same provider-first contract as the table. Client/tool
