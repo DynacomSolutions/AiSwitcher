@@ -1,0 +1,19 @@
+# App-owned public alias for the interactive Alibaba auth browser (sub-service
+# `alibaba` of the `ais` project). Serves the chrome-auth-personal noVNC UI
+# (port 7900) at https://ais-alibaba.dynacom.dev — passwordless by design,
+# reachable only over Tailscale (the public name resolves to the
+# workstation's Tailscale IPv4; the record is grey-cloud). timeout 0 keeps
+# long VNC sessions from being culled mid-use; Emissary 3.x proxies the
+# noVNC WebSocket on /websockify without extra config.
+apiVersion: getambassador.io/v3alpha1
+kind: Mapping
+metadata:
+  name: ais-alibaba-public
+  namespace: dev
+spec:
+  hostname: ais-alibaba.dynacom.dev
+  prefix: /
+  service: chrome-auth-personal.chrome-mcp:7900
+  allow_upgrade:
+  - websocket
+  timeout_ms: 0

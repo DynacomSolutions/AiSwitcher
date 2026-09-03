@@ -15,16 +15,34 @@ spec:
       labels:
         app: ${PROJECT}
     spec:
+      # The console scans /proc to list live agent processes; without the
+      # host PID namespace it only ever sees itself ("no agent processes").
+      # Read visibility is the point; runAsUser 1000 still cannot touch
+      # processes owned by other users.
+      hostPID: true
       # The console reads (and edits) the same single-user AIS state the host
       # daemon would: identity registries, session transcripts, usage data.
       # Everything is uid 1000 on the host, so no fsGroup juggling needed.
+      #
+      # The hostPath data lives on this workstation only, so pin the pod to
+      # the control-plane node (same pattern mc3-media and the artifacts
+      # pod use); eu3/eu4/hq1 have no /home/thomas.
+      nodeSelector:
+        kubernetes.io/hostname: archlinux
       containers:
         - name: app
           image: localhost:5000/${PROJECT}:${TAG}
           imagePullPolicy: Always
           env:
             - name: AIS_WEB_ALLOWED_HOSTS
-              value: ${PROJECT}.localhost
+              # Both the rewritten (host_rewrite: ais.localhost) and the raw
+              # public hostname: when ingress routes skip the rewrite the
+              # app still sees a trusted vhost instead of a 403.
+              value: ${PROJECT}.localhost,${PROJECT}.dynacom.dev
+            - name: AIS_AUTH_REFRESH_INTERVAL_MS
+              value: "600000"
+            - name: AIS_K8S_API_SERVER
+              value: https://kubernetes.default.svc
           ports:
             - containerPort: ${PORT}
           readinessProbe:
@@ -56,6 +74,22 @@ spec:
               mountPath: /home/thomas/.ali
             - name: pi-home
               mountPath: /home/thomas/.pi
+            - name: opencode-home
+              mountPath: /home/thomas/.opencode
+            - name: kube-config
+              mountPath: /home/thomas/.kube
+              readOnly: true
+            # ~/.kube/config is a symlink to this host file; mounting the
+            # target at the same path is what makes the symlink resolve.
+            - name: k3s-kubeconfig
+              mountPath: /etc/rancher/k3s
+              readOnly: true
+            # Persist Bun's package cache across pod restarts: the tokscale
+            # binary resolved from ~/.bun/install/cache dies with the
+            # container otherwise, and the 8s bunx warm-up loses that race
+            # on a cold container (observed live).
+            - name: bun-cache
+              mountPath: /home/thomas/.bun
       volumes:
         - name: ais-home
           hostPath:
@@ -88,4 +122,20 @@ spec:
         - name: pi-home
           hostPath:
             path: /home/thomas/.pi
+            type: Directory
+        - name: opencode-home
+          hostPath:
+            path: /home/thomas/.opencode
+            type: Directory
+        - name: kube-config
+          hostPath:
+            path: /home/thomas/.kube
+            type: Directory
+        - name: k3s-kubeconfig
+          hostPath:
+            path: /etc/rancher/k3s
+            type: Directory
+        - name: bun-cache
+          hostPath:
+            path: /home/thomas/.bun
             type: Directory

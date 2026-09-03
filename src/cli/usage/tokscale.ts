@@ -341,7 +341,8 @@ export async function runTokscaleProcess(args: string[], env: Record<string, str
  * — far too tight for the real data on this machine: a 1.3GB opencode.db
  * scan (or any scan, once ~25 tokscale children contend for disk) routinely
  * needs 25-55s, and the ceiling turned good data into "timed out" rows.
- * 120s still bounds a genuinely wedged child without truncating real work. */
+ * (main's interim 55s sat exactly ON that measured edge.) 120s still bounds
+ * a genuinely wedged child without truncating real work. */
 const TOKSCALE_SPAWN_TIMEOUT_MS = 120_000;
 
 async function spawnTokscaleProcess(

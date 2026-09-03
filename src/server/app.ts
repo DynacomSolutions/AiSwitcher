@@ -9,6 +9,7 @@ import { resolveRealBinary } from "../shared/resolve-binary.ts";
 import { aisHome } from "../shared/ais-home.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { consoleGuard, type GuardDeps } from "./guard.ts";
+import { type AuthRefreshScheduler } from "./auth-refresh.ts";
 import { HttpError } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated } from "./workers.ts";
@@ -27,6 +28,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   startedAt: number;
   /** apps/web/dist when present; the SPA plus its assets are served from here. */
   distDir?: string;
+  /** Daemon-side credential renewal; absent in bare-app tests. */
+  authRefresh?: AuthRefreshScheduler;
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {
@@ -153,10 +156,22 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   });
 
   app.post("/api/auth/login", async (c) => {
-    const body = await c.req.json();
-    const toolName = requireString(body.tool, "tool");
+    const body = await c.req.json();    const toolName = requireString(body.tool, "tool");
     if (!(toolName in TOOL_CONFIGS)) throw new HttpError(404, `unknown tool "${toolName}"`);
     return c.json(await authApi.spawnLogin(toolName as ToolConfig["toolName"], requireString(body.identity, "identity")));
+  });
+
+  /* ----------------------- credential refresh scheduler -------------------- */
+
+  app.get("/api/auth/refresh", (c) => c.json({ results: deps.authRefresh?.status() ?? [] }));
+
+  app.post("/api/auth/refresh", async (c) => {
+    if (!deps.authRefresh) return c.json({ error: "refresh scheduler not running" }, 503);
+    const body = await c.req.json();
+    const tool = requireString(body.tool, "tool");
+    const ok = await deps.authRefresh.refreshNow(tool, requireString(body.identity, "identity"));
+    const status = deps.authRefresh.status().find((entry) => entry.tool === tool && entry.identity === body.identity);
+    return c.json({ ok, status });
   });
 
   /* ---------------------------------- files -------------------------------- */

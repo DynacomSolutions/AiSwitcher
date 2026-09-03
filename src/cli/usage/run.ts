@@ -311,14 +311,16 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
   return [...grouped.values()];
 }
 
-// NOTE, deliberately NO per-target timeout here (a 25s cap was tried in the
-// console work and reverted 2026-09-03): ~25 targets run concurrently and
-// contend for disk, so a single target's real tokscale scan routinely takes
-// 25-55s on this data volume — the cap turned ENTIRE reports into error
-// rows ("timed out after 25ms", itself mislabeled). Genuine hangs are
-// already bounded where they actually occur: tokscale spawns have their own
-// timeout (tokscale.ts), and limits never had a cap either. Truncating
-// good data to bound a pathological hang is the wrong trade for the report.
+// NOTE, deliberately NO per-target timeout here (a 25s cap shipped in the
+// console work and was reverted 2026-09-03; main's interim 60s ceiling sat
+// right on the measured edge and had the same flaw): ~25 targets run
+// concurrently and contend for disk, so a single target's real tokscale
+// scan routinely takes 25-55s on this data volume — the cap turned ENTIRE
+// reports into error rows ("timed out after 25ms", itself mislabeled).
+// Genuine hangs are already bounded where they actually occur: tokscale
+// spawns have their own ceiling (tokscale.ts, 120s), and limits never had
+// a cap either. Truncating good data to bound a pathological hang is the
+// wrong trade for the report — the user has been explicit about this.
 
 /** Ceiling on targets fetched at once. Every non-zai/ali/pi target spawns a
  * tokscale child scanning that identity's whole history; with ~25 targets

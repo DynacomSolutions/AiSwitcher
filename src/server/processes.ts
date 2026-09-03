@@ -9,7 +9,7 @@ const PROC = "/proc";
 /** Binary names that count as "an AI agent is running". Shim names (zai/ali)
  * and real binaries (crush) both appear; the marker env var is what actually
  * attributes a process to an identity. */
-const AGENT_BINARIES = new Set(["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "crush"]);
+const AGENT_BINARIES = new Set(["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "crush", "opencode"]);
 
 function clockTicksPerSecond(): number {
   // Linux is essentially always 100, but read it properly where possible.

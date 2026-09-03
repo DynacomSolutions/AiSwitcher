@@ -1,5 +1,6 @@
 import type {
   AuthEntry,
+  AuthRefreshResponse,
   AuthResponse,
   CreateIdentityBody,
   FileContentResponse,
@@ -126,6 +127,9 @@ export const api = {
   getSessions: (cwd?: string) => request<SessionsResponse>(withParams("/api/sessions", { cwd })),
 
   getAuth: () => request<AuthResponse>("/api/auth"),
+  getAuthRefresh: () => request<AuthRefreshResponse>("/api/auth/refresh"),
+  refreshCredential: (tool: string, identity: string) =>
+    request<{ ok: boolean }>("/api/auth/refresh", { method: "POST", body: { tool, identity } }),
   refreshKimiToken: (identity: string) =>
     request<unknown>("/api/auth/kimi-refresh", { method: "POST", body: { identity } }),
   loginIdentity: (tool: string, identity: string) =>

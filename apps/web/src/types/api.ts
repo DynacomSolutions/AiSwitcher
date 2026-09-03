@@ -157,6 +157,9 @@ export interface DateSpan {
 export interface UsageResult {
   provider: string;
   identity: Identity;
+  /** The wrapper the usage came through (claude/codex/pi/...), distinct from
+   * the upstream provider the tokens were billed to. */
+  sourceTool?: string;
   report?: TokscaleReport;
   error?: string;
   extraCost?: OverageInfo;
@@ -209,6 +212,21 @@ export interface AuthEntry {
 
 export interface AuthResponse {
   entries: AuthEntry[];
+}
+
+/* Credential renewal (daemon scheduler) */
+
+export interface AuthRefreshStatus {
+  tool: string;
+  identity: string;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  running: boolean;
+}
+
+export interface AuthRefreshResponse {
+  results: AuthRefreshStatus[];
 }
 
 export interface LoginResult {
