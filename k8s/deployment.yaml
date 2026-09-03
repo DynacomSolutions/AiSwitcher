@@ -15,6 +15,11 @@ spec:
       labels:
         app: ${PROJECT}
     spec:
+      # The console scans /proc to list live agent processes; without the
+      # host PID namespace it only ever sees itself ("no agent processes").
+      # Read visibility is the point; runAsUser 1000 still cannot touch
+      # processes owned by other users.
+      hostPID: true
       # The console reads (and edits) the same single-user AIS state the host
       # daemon would: identity registries, session transcripts, usage data.
       # Everything is uid 1000 on the host, so no fsGroup juggling needed.
@@ -62,6 +67,8 @@ spec:
               mountPath: /home/thomas/.ali
             - name: pi-home
               mountPath: /home/thomas/.pi
+            - name: opencode-home
+              mountPath: /home/thomas/.opencode
       volumes:
         - name: ais-home
           hostPath:
@@ -94,4 +101,8 @@ spec:
         - name: pi-home
           hostPath:
             path: /home/thomas/.pi
+            type: Directory
+        - name: opencode-home
+          hostPath:
+            path: /home/thomas/.opencode
             type: Directory
