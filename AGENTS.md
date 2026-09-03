@@ -2356,16 +2356,22 @@ What the rule means in practice, now enforced in both pipelines:
   CLI itself; the Alibaba Token plan has no API-key quota endpoint at all),
   and a pi/opencode row would either duplicate the branch or add an
   unactionable "can't fetch" line. Fetchable from pi today: `zai` (static
-  key, same quota endpoint as zai-limits) and `kimi-coding` (OAuth via
-  `fetchKimiUsageForCredentials`). Fetchable from opencode today:
-  `zai_coding_plan` only.
-  `opencode-go` sits between the two: no public limits API is known for
-  its keys (probed live 2026-09-03 against opencode.ai/zen/v1 — usage,
-  limits, quota, subscription and credits paths all 404), but it IS a
-  provider the user holds, so it renders as an honest "no known API" row
-  rather than vanishing (dropping it entirely was tried and reversed by
-  user feedback the same day; its real token usage also appears in
-  `ais usage` from pi's session records).
+  key, same quota endpoint as zai-limits), `kimi-coding` (OAuth via
+  `fetchKimiUsageForCredentials`), and `opencode-go` (same Go-plan quota
+  endpoint as opencode-limits). Fetchable from opencode today:
+  `zai_coding_plan` and `opencode-go`.
+  **OpenCode Go's quota endpoint** (`GET
+  https://opencode.ai/zen/go/v1/usage`, Bearer the Go API key) was found
+  2026-09-03 by probing the Go gateway directly — an earlier probe sweep
+  against `/zen/v1/*` (the WRONG base path; Go keys live under
+  `/zen/go/v1`) all 404'd, which produced a bogus "no public limits API"
+  claim that user feedback killed the same day: the user hit their weekly
+  limit with no way to see it. The endpoint returns the plan's three
+  DOLLAR-denominated windows ($12/5h rolling, $30 weekly, $60 monthly) as
+  `usage.{rolling,weekly,monthly}.{status,percent,resetsAt}` — percent is
+  share-of-window-budget, `status: "rate-limited"` marks an exhausted
+  window. Its real token usage also appears in `ais usage` (see
+  usage/opencode-usage.ts).
 - **ONE credential per (identity, provider) — kimi-store.ts.** Kimi rotates
   its OAuth refresh token on EVERY refresh, and the same account's
   credentials exist in two stores: the kimi identity's

@@ -3,6 +3,7 @@ import type { Identity } from "../../identities/types.ts";
 import { canonicalUsageProvider } from "../usage/providers.ts";
 import { fetchKimiUsageForCredentials } from "./kimi-limits.ts";
 import { persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
+import { fetchOpencodeGoQuotaForKey } from "./opencode-limits.ts";
 import { fetchZaiQuotaForKey } from "./zai-limits.ts";
 import type { OverageInfo, ToolLimitResult } from "./types.ts";
 
@@ -91,17 +92,15 @@ async function zaiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry)
   return result(toolName, "zai", identity, { status: "live", windows: outcome.windows });
 }
 
-/** OpenCode Go is a real upstream the user holds a credential for, so the
- * provider section stays visible — but no quota endpoint for its keys is
- * known today (probed live 2026-09-03 against opencode.ai/zen/v1: usage,
- * limits, quota, subscription and credits paths all 404), so the row is an
- * honest "no known API" rather than fabricated windows. Removing the row
- * entirely was tried and reversed the same day: the provider must still
- * show up for identities that hold one. Its real token usage already
- * appears in `ais usage` from pi's session records. */
-function opencodeGoResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): ToolLimitResult | undefined {
+/** OpenCode Go has a REAL quota endpoint (found 2026-09-03 after the user
+ * hit their weekly limit blind: GET opencode.ai/zen/go/v1/usage with the
+ * Go API key returns the plan's three dollar-window percentages) — the
+ * same fetch the opencode adapter uses; only the key's home differs. */
+async function opencodeGoResult(toolName: "pi", identity: Identity, entry: PiAuthEntry): Promise<ToolLimitResult | undefined> {
   if (typeof entry.key !== "string" || entry.key.length === 0) return undefined;
-  return unavailable(toolName, "opencode-go", identity, "no public limits API is known for OpenCode Go keys yet");
+  const outcome = await fetchOpencodeGoQuotaForKey(entry.key);
+  if (outcome.error || !outcome.windows) return unavailable(toolName, "opencode-go", identity, outcome.error ?? "quota fetch failed");
+  return result(toolName, "opencode-go", identity, { status: "live", windows: outcome.windows });
 }
 
 /** The auth.json entries this adapter will act on, in file order, with every
@@ -162,7 +161,7 @@ export async function fetchPiLimits(identity: Identity, explicitTool = false): P
       const r = await kimiResult("pi", identity, entry);
       if (r) results.push(r);
     } else if (provider === "opencode-go") {
-      const r = opencodeGoResult("pi", identity, entry);
+      const r = await opencodeGoResult("pi", identity, entry);
       if (r) results.push(r);
     }
   }
