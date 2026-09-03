@@ -238,13 +238,20 @@ function mountStatic(app: Hono, distDir: string | undefined): void {
     try {
       const info = await stat(filePath);
       if (info.isDirectory()) filePath = join(filePath, "index.html");
+      const isHtml = filePath.endsWith(".html");
       return c.body(Bun.file(filePath).stream(), 200, {
         "Content-Type": MIME[extname(filePath)] ?? "application/octet-stream",
+        // index.html must never be cached: it names the hashed asset bundle,
+        // and a stale shell keeps users on an old UI until a hard refresh.
+        "Cache-Control": isHtml ? "no-cache" : "public, max-age=31536000, immutable",
       });
     } catch {
       // SPA deep link: fall back to the shell.
       const index = join(distReal, "index.html");
-      return c.body(Bun.file(index).stream(), 200, { "Content-Type": MIME[".html"] });
+      return c.body(Bun.file(index).stream(), 200, {
+        "Content-Type": MIME[".html"],
+        "Cache-Control": "no-cache",
+      });
     }
   });
 }
