@@ -31,6 +31,8 @@ function cnyPrice(input: number, output: number, cachedInput = input * 0.2): Mod
 }
 
 export const ZAI_MODEL_PRICES: Record<string, ModelTokenPrice> = {
+  "glm-5.3-flash": { cost_per_1m_in: 0.075, cost_per_1m_out: 0.25, cost_per_1m_in_cached: 0.015, cost_per_1m_out_cached: 0 },
+  "glm-5.3": { cost_per_1m_in: 1.4, cost_per_1m_out: 4.4, cost_per_1m_in_cached: 0.26, cost_per_1m_out_cached: 0 },
   "glm-5.2": { cost_per_1m_in: 1.4, cost_per_1m_out: 4.4, cost_per_1m_in_cached: 0.26, cost_per_1m_out_cached: 0 },
   "glm-5.1": { cost_per_1m_in: 1.4, cost_per_1m_out: 4.4, cost_per_1m_in_cached: 0.26, cost_per_1m_out_cached: 0 },
   "glm-5-turbo": { cost_per_1m_in: 1.2, cost_per_1m_out: 4, cost_per_1m_in_cached: 0.24, cost_per_1m_out_cached: 0 },
@@ -98,11 +100,29 @@ export const OPENCODE_GO_MODEL_PRICES: Record<string, ModelTokenPrice> = {
   "deepseek-v4-flash-vision-exp": { cost_per_1m_in: 0.22, cost_per_1m_out: 0.66, cost_per_1m_in_cached: 0.007, cost_per_1m_out_cached: 0 },
   "hy4-preview": { cost_per_1m_in: 0.834, cost_per_1m_out: 2.501, cost_per_1m_in_cached: 0.042, cost_per_1m_out_cached: 0 },
   "hy3": { cost_per_1m_in: 0.14, cost_per_1m_out: 0.58, cost_per_1m_in_cached: 0.035, cost_per_1m_out_cached: 0 },
-  // "Ox Alpha Free (Unlimited)" — opencode's free preview model (models.dev
-  // prices it at 0 across the board). Priced explicitly at zero so traffic
-  // on it reads as honestly free rather than "unknown model".
-  "ox-alpha-free": { cost_per_1m_in: 0, cost_per_1m_out: 0, cost_per_1m_in_cached: 0, cost_per_1m_out_cached: 0 },
 };
+
+/** Stealth codenames OpenCode serves its Go models under, mapped back to
+ * their real models — taken verbatim from opencode's own stats
+ * normalization (packages/stats/core/src/domain/model-normalization.ts,
+ * MODEL_NAME_ALIASES, dev branch). "ox-alpha-free" is GLM-5.3-Flash under
+ * an alias: pricing it at models.dev's placeholder $0 valued the user's
+ * entire Go-plan history at $1.44 while the plan itself billed ~$30 for
+ * the same window (observed + corrected 2026-09-03). */
+const OPENCODE_GO_MODEL_ALIASES: Record<string, string> = {
+  "ox-alpha": "glm-5.3-flash",
+  "ox-alpha-free": "glm-5.3-flash",
+  "x-preview-f": "glm-5.3-flash",
+  "x-preview-f-free": "glm-5.3-flash",
+};
+
+/** Resolve an opencode-go model id to its priced entry: alias the stealth
+ * codenames, then strip the "-free"/":free"/":global" suffixes opencode's
+ * own normalizer strips (same rule, same source). */
+function normaliseOpencodeGoModelId(model: string): string {
+  const base = normaliseModelId(model).replace(/(-free|:free|:global)+$/, "");
+  return OPENCODE_GO_MODEL_ALIASES[base] ?? base;
+}
 
 const PROVIDER_PRICES: Partial<Record<"zai" | "alibaba" | "opencode-go", Record<string, ModelTokenPrice>>> = {
   zai: ZAI_MODEL_PRICES,
@@ -138,7 +158,8 @@ export function estimateDetailedModelTokenCost(
   cacheWriteTokens: number,
 ): number | undefined {
   const prices = PROVIDER_PRICES[provider];
-  const price = prices?.[normaliseModelId(model)];
+  const modelId = provider === "opencode-go" ? normaliseOpencodeGoModelId(model) : normaliseModelId(model);
+  const price = prices?.[modelId];
   if (!price) return undefined;
   return (
     (inputTokens + cacheWriteTokens) * price.cost_per_1m_in +

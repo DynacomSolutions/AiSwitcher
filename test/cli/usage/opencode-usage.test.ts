@@ -22,10 +22,15 @@ describe("OpenCode Go pricing", () => {
     expect(estimateDetailedModelTokenCost("opencode-go", "opencode-go/glm-5.3", 1_000_000, 0, 0, 0)).toBeDefined();
   });
 
-  test("ox-alpha-free is priced at zero — honestly free, not unknown", () => {
-    // The user's recorded Go traffic ran on "Ox Alpha Free (Unlimited)";
-    // models.dev prices it at 0 across the board.
-    expect(estimateDetailedModelTokenCost("opencode-go", "ox-alpha-free", 57_000_000, 1_000_000, 900_000_000, 0)).toBe(0);
+  test("stealth codenames resolve to their real model — ox-alpha-free is GLM-5.3-Flash, not a free model", () => {
+    // models.dev prices "Ox Alpha Free (Unlimited)" at 0, but opencode's own
+    // stats normalization maps ox-alpha(-free) to glm-5.3-flash. Pricing it
+    // at $0 valued the user's entire Go-plan history at $1.44 while the plan
+    // billed ~$30 for the same window (corrected 2026-09-03).
+    const stealth = estimateDetailedModelTokenCost("opencode-go", "ox-alpha-free", 1_000_000, 1_000_000, 1_000_000, 0)!;
+    expect(stealth).toBeCloseTo(0.15 + 0.5 + 0.03, 6);
+    expect(estimateDetailedModelTokenCost("opencode-go", "ox-alpha", 1_000_000, 0, 0, 0)).toBeDefined();
+    expect(estimateDetailedModelTokenCost("opencode-go", "x-preview-f-free", 1_000_000, 0, 0, 0)).toBeDefined();
   });
 });
 
@@ -63,8 +68,9 @@ describe("readOpencodeProfileUsage", () => {
     expect(go).toBeDefined();
     expect(go.report.totalMessages).toBe(2);
     expect(go.report.totalInput).toBe(1200);
-    // ox-alpha-free is free; the glm row is priced: 200 * 0.15/1M + 50 * 0.5/1M + 3000 * 0.03/1M
-    expect(go.report.totalCost).toBeCloseTo((200 * 0.15 + 50 * 0.5 + 3000 * 0.03) / 1_000_000, 9);
+    // ox-alpha-free prices as its real model (glm-5.3-flash): (1000×0.15 + 100×0.5 + 5000×0.03)/1M;
+    // the glm row: (200×0.15 + 50×0.5 + 3000×0.03)/1M
+    expect(go.report.totalCost).toBeCloseTo(((1000 + 200) * 0.15 + (100 + 50) * 0.5 + (5000 + 3000) * 0.03) / 1_000_000, 9);
     expect(go.report.entries.map((e) => e.model).sort()).toEqual(["glm-5.3-flash", "ox-alpha-free"]);
     expect(go.dateSpan.firstMs).toBe(1_780_000_000_000);
     expect(go.dateSpan.lastMs).toBe(1_780_100_000_000);
