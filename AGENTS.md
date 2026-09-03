@@ -114,25 +114,38 @@ src/
                                [--identity=] [--tool=] [--json | -- <tokscale args>]`
     limits/
       dispatch.ts               `ais limits [identity] [--tool=] [--json] [--cached]
-                               [--watch] [--interval=<s>]` — live/cached provider quota per
-                               identity per tool; identity is a positional, not --identity=
+                                [--watch] [--interval=<s>]` — live/cached provider quota per
+                                identity per PROVIDER (the views are provider-first; the tool is
+                                collection provenance); identity is a positional, not --identity=
       collect.ts report.ts bar.ts watch.ts bucket.ts types.ts
-                               per-target collection + aligned table/bar report + --watch loop
+                                per-target collection (each fetcher returns ONE RESULT PER
+                                PROVIDER) + provider+identity aggregation across sources +
+                                aligned table/bar report grouped by provider + --watch loop
+      pi-limits.ts opencode-limits.ts
+                                the multi-provider clients' adapters — one Pi/OpenCode identity
+                                becomes several provider rows (see "provider-first limits for
+                                the multi-provider clients" below); both thread an
+                                `explicitTool` flag so an explicit `--tool=` question always
+                                gets an answer row while an unscoped report omits
+                                nothing-to-report sources
       claude-limits.ts codex-limits.ts grok-limits.ts kimi-limits.ts zai-limits.ts
-                               ali-limits.ts
-                               per-tool quota fetchers — kimi-limits.ts is a genuinely LIVE
-                               fetch (GET api.kimi.com/coding/v1/usages with the OAuth token
-                               from credentials/kimi-code.json, refreshing expired tokens via
-                               auth.kimi.com), unlike grok's log-scrape — see the kimi case
-                               study. zai-limits.ts is also a genuinely live fetch (GET
-                               api.z.ai/api/monitor/usage/quota/limit with the static key from
-                               that identity's own crush.json — no OAuth/refresh needed,
-                               unlike kimi) — see the 2026-07-18 zai/Crush addendum.
-                               ali-limits.ts is live too but is the odd one out: the Token
-                               plan has NO API-key quota endpoint (probed live), so it hits
-                               Alibaba's OneConsole gateway with a pasted console-session
-                               cookie from <configDir>/console-cookie.txt — see the ali
-                               case study
+                                ali-limits.ts
+                                per-tool quota fetchers — kimi-limits.ts is a genuinely LIVE
+                                fetch (GET api.kimi.com/coding/v1/usages with the OAuth token
+                                from credentials/kimi-code.json, refreshing expired tokens via
+                                auth.kimi.com), unlike grok's log-scrape — see the kimi case
+                                study. zai-limits.ts is also a genuinely live fetch (GET
+                                api.z.ai/api/monitor/usage/quota/limit with the static key from
+                                that identity's own crush.json — no OAuth/refresh needed,
+                                unlike kimi) — see the 2026-07-18 zai/Crush addendum.
+                                ali-limits.ts is live too but is the odd one out: the Token
+                                plan has NO API-key quota endpoint (probed live), so it hits
+                                Alibaba's OneConsole gateway with a pasted console-session
+                                cookie from <configDir>/console-cookie.txt — see the ali
+                                case study. kimi/zai both expose a per-credential entry point
+                                (fetchKimiUsageForCredentials / fetchZaiQuotaForKey) so the
+                                pi/opencode adapters can reuse the same live reads against the
+                                SAME accounts' credentials stored in their own auth files
     resume/
       dispatch.ts               `ais resume [<session-id>] [--identity=] [--tool=] [--json]` —
                                per-cwd resumable-session tree + interactive picker + relaunch
@@ -1025,7 +1038,12 @@ The recipe:
      `src/cli/usage/tokscale.ts` (`tokscaleInvocationFor` — again exhaustive),
      and `src/cli/usage/run.ts` (the `runOne` dispatch and the
      `fetchTokscaleDailyUsage` client union).
-   - `limits`: a probe in `src/cli/limits/` or a deliberate no-op.
+   - `limits`: a fetcher in `src/cli/limits/` wired into collect.ts's
+     `FETCHERS` map (1:1 tools wrap their single-result fetcher via
+     `singleToolFetcher`; multi-provider clients return one result per
+     provider they can answer for and thread `explicitTool` honestly), or a
+     deliberate no-op (the map is `Partial` on purpose — a tool missing from
+     it degrades to an honest "no limits fetcher implemented" row).
    - `doctor`: a probe in `src/cli/doctor/collect.ts`'s `PROBES` or a
      deliberate absence (it reports "unavailable" rather than crashing).
    - `resume`: a reader in `src/cli/resume/` or a deliberate absence.
@@ -1326,18 +1344,24 @@ formerly `sst/opencode`):
   up structurally (same generic path, appName `"OpenCode"`) but UNVERIFIED
   both on whether the Mach-O binary name inside the bundle actually matches
   and on whether the app respects the injected env vars at all.
-- **No resume/limits/doctor support yet**: opencode's session storage is a
-  SQLite db (`opencode.db`, confirmed on disk), not the JSONL/log formats
-  every existing `resume`/`limits` reader parses, and it has no known
-  live-quota API the way kimi's `api.kimi.com/coding/v1/usages` does — out of
-  scope for this pass. `limits/collect.ts`'s `FETCHERS`, `resume/collect.ts`'s
-  `READERS`, and `doctor/collect.ts`'s `PROBES` are all `Partial` records
-  (doctor's already was; limits'/resume's were widened to match) precisely so
+- **Resume/doctor support still absent; limits added 2026-09-03**: opencode's
+  session storage is a SQLite db (`opencode.db`, confirmed on disk), not the
+  JSONL/log formats every existing `resume` reader parses, and it has no
+  doctor probe — both remain out of scope. `resume/collect.ts`'s `READERS`
+  and `doctor/collect.ts`'s `PROBES` being `Partial` records is precisely so
   a tool can exist in the identities registry before its own
-  fetcher/reader/probe does, degrading to an honest "not implemented yet"
-  result instead of a crash — `zai` currently exercises exactly that path in
-  all three. Likewise `ais usage`'s tokscale integration (see the design
-  decision above) reports "not supported" for zai rather than crashing.
+  reader/probe does, degrading to an honest "not implemented yet" result
+  instead of a crash. Likewise `ais usage`'s tokscale integration (see the
+  design decision above) reports "not supported" for a tool without a
+  tokscale client rather than crashing.
+- **Limits support, added 2026-09-03**: opencode's auth.json (under the
+  identity's own `data/opencode/`) holds one static API credential per
+  upstream plan, and the `zai_coding_plan` key is the SAME Z.ai account the
+  zai tool queries, so `ais limits` reuses the same quota endpoint
+  (`fetchZaiQuotaForKey`). `alibaba_token_plan` is skipped as native-covered
+  (the Token plan has no API-key quota endpoint — only ali's console-cookie
+  path can answer), and unknown provider ids are ignored rather than guessed
+  at. See "provider-first limits for the multi-provider clients" below.
 - **No migrate support**: `~/.zai` starts empty, same stance as grok/kimi —
   there's no pre-existing "default" opencode login worth preserving under an
   identity, so `scripts/migrate.ts` was not extended. First identity via
@@ -2217,6 +2241,65 @@ provider's models.
   a JSON file), so `open.ts`'s Chrome-MCP-redirect mechanism has nothing to
   do for ali either (same as zai's own final state, see "zai case study,
   take 3" above), never re-verified because there's nothing here to verify.
+
+### Provider-first views for limits and usage (2026-09-03)
+
+Prompted directly: the per-tool sections in `ais limits` ("pi (4
+identities)… no limits fetcher implemented") and the zero/error placeholder
+rows in `ais usage` were exactly the tool-shaped output the user had already
+rejected — both views must be per PROVIDER + identity, with the wrapper/tool
+kept only as collection provenance (fine to keep in internal records and
+logs for future reporting, never as a reporting dimension).
+
+What the rule means in practice, now enforced in both pipelines:
+
+- **`ToolLimitResult.provider` is the report's grouping key.** The six 1:1
+  tools stamp it from `providerForTool` in one place (`singleToolFetcher` in
+  limits/collect.ts); their fetchers return the narrower
+  `FetchedLimitResult` (no provider field), which makes it a compile error
+  to construct a provider-less result anywhere else. The multi-provider
+  clients' adapters (`pi-limits.ts`, `opencode-limits.ts`) stamp each
+  result's provider themselves — only they know which upstream each answer
+  came from. `formatLimitsReport` renders one section per provider
+  (Anthropic, OpenAI, xAI, Kimi, Z.ai, Alibaba, OpenCode Go, ...), never a
+  tool name.
+- **The same provider+identity reached through two wrappers merges into one
+  row** (`aggregateLimitResults`, the counterpart of usage/run.ts's
+  `aggregateUsageResults`). This is the common case, not the edge case: pi's
+  auth.json was IMPORTED from the native tools (identities/pi-auth.ts), so
+  its Z.ai key IS the zai tool's key. Windows come from the best-ranked
+  result (live > cached > unavailable; the flat target order puts native
+  tools first so ties resolve deterministically); a live answer discards the
+  duplicate source's error text, two failures merge their reasons, and a
+  resolved result always supersedes a pending placeholder.
+- **Native-covered providers are skipped, not duplicated.** Pi's
+  anthropic/openai-codex/xai/alibaba-plan entries and OpenCode's
+  alibaba_token_plan entry contribute nothing: the native claude/codex/
+  grok/ali fetchers already answer for the same account through their own
+  authenticated paths (Claude/Codex/Grok limit reads go through the native
+  CLI itself; the Alibaba Token plan has no API-key quota endpoint at all),
+  and a pi/opencode row would either duplicate the branch or add an
+  unactionable "can't fetch" line. Fetchable from pi today: `zai` (static
+  key, same quota endpoint as zai-limits), `kimi-coding` (OAuth via
+  `fetchKimiUsageForCredentials`, refreshing-and-persisting back into pi's
+  own auth.json), and `opencode-go` (honest "no known limits API" row, so
+  the section still shows who holds one). Fetchable from opencode today:
+  `zai_coding_plan` only.
+- **A source with nothing to report renders no row — unless the user asked
+  for that source specifically.** Both pipelines thread an `explicitTool`
+  flag (`--tool=<t>`): unscoped, an empty tokscale report or a pi identity
+  with no sessions contributes nothing (no "0 messages" pseudo-provider
+  rows, no Unattributed error rows); with an explicit `--tool=`, the same
+  condition becomes one honest "unavailable" row instead of silence. Real
+  failures (tokscale crashed, unreadable session data) keep their error rows
+  in unscoped reports — a blank table over a broken environment would hide
+  the problem.
+
+"Prove it" evidence for the fetchable paths: live `ais limits` after this
+change shows pi's dynacom Z.ai key answering for the same account whose
+native zai row had been timing out, and `ais usage` no longer lists
+Unattributed/OpenCode placeholder rows for the three pi identities with no
+local sessions and the two opencode identities with no data.
 
 ## Commands
 

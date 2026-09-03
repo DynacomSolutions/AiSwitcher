@@ -203,11 +203,15 @@ src/
 │   ├── sync/               `ais sync list|add|remove|now|dedupe`
 │   ├── identities/         actions.ts (pure mutations) + resolve-tool.ts (--tool resolution)
 │   │                      + dispatch/list/show/create/chrome-overrides.ts (CLI wrappers)
-│   ├── limits/             `ais limits`: live/cached provider quota per identity per tool —
-│   │                        per-tool fetchers (claude/codex/grok/kimi — kimi's is a live
+│   ├── limits/             `ais limits`: live/cached provider quota per identity per PROVIDER —
+│   │                        provider-first sections (Anthropic/OpenAI/Kimi/Z.ai/...), never tool
+│   │                        names; multi-provider clients (pi/opencode) contribute rows to the
+│   │                        same provider sections their native tools answer for. Per-tool
+│   │                        fetchers (claude/codex/grok/kimi — kimi's is a live
 │   │                        api.kimi.com usages fetch + OAuth token refresh; zai's is a live
 │   │                        api.z.ai quota fetch using the key from that identity's own
-│   │                        crush.json) + report/watch
+│   │                        crush.json) + pi/opencode adapters reusing the same live reads
+│   │                        against credentials stored in their own auth files + report/watch
 │   ├── resume/             `ais resume`: per-cwd resumable-session listing + relaunch —
 │   │                        per-tool readers (kimi's reads session_index.jsonl + per-session
 │   │                        state.json; zai's reads Crush's own project-local `.crush/crush.db`
