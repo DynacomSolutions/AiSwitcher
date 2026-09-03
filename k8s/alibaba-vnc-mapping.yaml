@@ -14,4 +14,6 @@ spec:
   hostname: ais-alibaba.dynacom.dev
   prefix: /
   service: chrome-auth-personal.chrome-mcp:7900
+  allow_upgrade:
+  - websocket
   timeout_ms: 0
