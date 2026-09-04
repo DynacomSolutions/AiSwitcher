@@ -106,6 +106,15 @@ export interface OverageInfo {
   limitUsd?: number;
 }
 
+/** A manually-spendable reset the provider grants the account (e.g. codex's
+ * "Full reset (Weekly + 5 hr)"). Present only when at least one is usable
+ * right now. */
+export interface ManualResetInfo {
+  availableCount: number;
+  label?: string;
+  expiresAt?: string;
+}
+
 export type LimitFetchStatus = "live" | "cached" | "unavailable" | "pending";
 
 export interface ToolLimitResult {
@@ -120,6 +129,7 @@ export interface ToolLimitResult {
   error?: string;
   capturedAt?: string;
   overage?: OverageInfo;
+  manualReset?: ManualResetInfo;
 }
 
 export interface LimitsResponse {

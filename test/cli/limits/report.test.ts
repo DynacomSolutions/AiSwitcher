@@ -43,6 +43,14 @@ function codexAcme(): ToolLimitResult {
   };
 }
 
+function codexWithManualReset(): ToolLimitResult {
+  return {
+    ...codexAcme(),
+    windows: [{ label: "session", category: "session", usedPercent: 57 }],
+    manualReset: { availableCount: 1, label: "Full reset (Weekly + 5 hr)", expiresAt: "Oct 4, 3:12 PM" },
+  };
+}
+
 function grokAcme(): ToolLimitResult {
   return {
     toolName: "grok",
@@ -160,6 +168,22 @@ describe("formatLimitsReport", () => {
   test("a note (e.g. credits depleted) renders alongside resets/percentage", () => {
     const output = formatLimitsReport([codexAcme()], NOW);
     expect(output).toContain("credits depleted");
+  });
+
+  test("a manual reset renders as its own dim row under the identity branch", () => {
+    const output = formatLimitsReport([codexWithManualReset()], NOW);
+    expect(output).toContain("manual reset available: Full reset (Weekly + 5 hr) (expires Oct 4, 3:12 PM)");
+    // Dim plain row: no bar bracket on that line.
+    const resetLine = output.split("\n").find((l) => l.includes("manual reset available"))!;
+    expect(resetLine).not.toContain("[");
+  });
+
+  test("pluralizes and counts multiple manual resets", () => {
+    const output = formatLimitsReport(
+      [{ ...codexWithManualReset(), manualReset: { availableCount: 3 } }],
+      NOW,
+    );
+    expect(output).toContain("manual resets available ×3");
   });
 
   test("a pending identity renders a spinner row instead of a bar, and contributes no aggregate row", () => {

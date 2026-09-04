@@ -1,13 +1,18 @@
 import type { Identity } from "../../identities/types.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByMinutes } from "./bucket.ts";
-import type { LimitCategory, LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
+import type { LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, FetchedLimitResult } from "./types.ts";
 
-/** Whole handshake budget (spawn + initialize + rateLimits/read). Live reads
- * against all three real identities on this machine came back in ~1-2s each,
- * so 9s leaves generous headroom without letting one unresponsive identity
- * stall a batched `ais limits` run for too long. */
-const HANDSHAKE_TIMEOUT_MS = 9000;
+/** Whole handshake budget (spawn + initialize + rateLimits/read) per
+ * attempt. Live reads against real identities on this machine come back in
+ * ~1-2s when chatgpt.com is healthy, but the same endpoint degrades to
+ * multi-second (or indefinite) hangs under load — observed live 2026-09-04,
+ * when four consecutive runs each burned the previous 9s ceiling without an
+ * answer, then one identity succeeded minutes later. 30s matches http.ts's
+ * generous per-attempt convention for the same upstream: these fetches are
+ * one cheap read when healthy, and the user has been explicit that
+ * transient failures must not become rows. */
+const HANDSHAKE_TIMEOUT_MS = 30_000;
 
 interface RateLimitWindowWire {
   usedPercent: number;
@@ -23,6 +28,32 @@ export interface RateLimitSnapshotWire {
   spendControlReached?: boolean | null;
   planType?: string | null;
   rateLimitReachedType?: string | null;
+}
+
+/** One grantable "spend this to wipe my windows now" credit. Confirmed live
+ * 2026-09-04 against two real team accounts on this machine:
+ * `RateLimitResetCredit_<hex>` ids, `resetType: "codexRateLimits"`, and a
+ * "Full reset (Weekly + 5 hr)" title for a free promo grant. */
+export interface RateLimitResetCreditWire {
+  /** Wire id, e.g. "RateLimitResetCredit_<hex>" (unread). */
+  id?: string;
+  /** Confirmed live: "codexRateLimits" (unread). */
+  resetType?: string;
+  status?: string;
+  title?: string;
+  description?: string;
+  /** Unix seconds. */
+  grantedAt?: number;
+  /** Unix seconds. */
+  expiresAt?: number;
+}
+
+/** Sibling of `rateLimits` in the `account/rateLimits/read` result (also
+ * confirmed present in the installed binary's own embedded type
+ * definitions): the account's manually-spendable rate-limit resets. */
+export interface RateLimitResetCreditsWire {
+  availableCount?: number;
+  credits?: RateLimitResetCreditWire[];
 }
 
 interface JsonRpcMessage {
@@ -149,6 +180,43 @@ export function overageFromSnapshot(snapshot: RateLimitSnapshotWire): OverageInf
   return undefined;
 }
 
+/**
+ * Pure mapping from the `rateLimitResetCredits` sibling of the rateLimits
+ * snapshot to a ManualResetInfo — the account's manually-spendable "wipe my
+ * usage windows now" grants (a separate feature from overage billing; the
+ * count says how many can be used RIGHT NOW). The wire's own
+ * availableCount is trusted where present; otherwise the count is derived
+ * from the credits list. A count of zero (or an absent wire block — every
+ * account without the concept) yields undefined, so nothing renders rather
+ * than a fabricated "no resets" row. Title/expiry come from the first
+ * available credit; expiry reuses this file's resetsAt display format.
+ * Exported pure for tests.
+ */
+export function manualResetFromWire(wire: RateLimitResetCreditsWire | undefined): ManualResetInfo | undefined {
+  if (!wire) return undefined;
+  const available = (wire.credits ?? []).filter((c) => c.status === "available");
+  const count =
+    typeof wire.availableCount === "number" && Number.isFinite(wire.availableCount)
+      ? wire.availableCount
+      : available.length;
+  if (count <= 0) return undefined;
+  const first = available[0];
+  const expiresAt =
+    first?.expiresAt !== undefined
+      ? new Date(first.expiresAt * 1000).toLocaleString(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        })
+      : undefined;
+  return {
+    availableCount: count,
+    ...(first?.title ? { label: first.title } : {}),
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+  };
+}
+
 function buildWindows(snapshot: RateLimitSnapshotWire): LimitWindow[] {
   const note = deriveNote(snapshot);
   const windows: LimitWindow[] = [];
@@ -267,8 +335,10 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
         throw new Error(message);
       }
 
-      const snapshot = (rateLimitsResponse.result as { rateLimits?: RateLimitSnapshotWire } | undefined)
-        ?.rateLimits;
+      const payload = rateLimitsResponse.result as
+        | { rateLimits?: RateLimitSnapshotWire; rateLimitResetCredits?: RateLimitResetCreditsWire }
+        | undefined;
+      const snapshot = payload?.rateLimits;
       if (!snapshot) {
         return { ...base, windows: [], status: "unavailable", error: "codex app-server returned no rate-limit data." };
       }
@@ -284,7 +354,15 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
       }
 
       const overage = overageFromSnapshot(snapshot);
-      return { ...base, windows, status: "live", capturedAt: new Date().toISOString(), ...(overage ? { overage } : {}) };
+      const manualReset = manualResetFromWire(payload?.rateLimitResetCredits);
+      return {
+        ...base,
+        windows,
+        status: "live",
+        capturedAt: new Date().toISOString(),
+        ...(overage ? { overage } : {}),
+        ...(manualReset ? { manualReset } : {}),
+      };
     } finally {
       try {
         proc.kill();
@@ -310,28 +388,36 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
 /** The codex CLI does its own networking, and chatgpt.com reachability from
  * this machine blips under report load (observed live 2026-09-03: "error
  * sending request for url" on 3 of 4 identities in one run, all four fine
- * minutes later; bare curl to the same URL showed ~400ms baseline with
- * multi-second spikes). When a session fails FAST with that transport
- * error, retry up to twice with backoff (3s, 8s) before reporting — the
- * backoff rides out the load spike an immediate retry would hit. Slow
- * failures (the 9s handshake ceiling) and every other error surface
- * as-is. */
-const FAST_FAIL_MAX_MS = 15_000;
-const TRANSPORT_ERROR_PATTERN = /error sending request/;
+ * minutes later; observed again 2026-09-04, harder: hangs that exhausted
+ * the handshake ceiling and app-server processes dying mid-handshake —
+ * "closed its output before responding" — before recovering). When an
+ * attempt ends in one of those TRANSIENT signatures, retry up to twice
+ * with backoff (3s, 8s) before reporting — the backoff rides out the load
+ * spike an immediate retry would hit. Deliberately NOT retried: the auth
+ * gate and codex's semantic "no rate-limit data" answers, which mean
+ * exactly what they say no matter how the network is doing. */
+const TRANSIENT_ERROR_PATTERN =
+  /error sending request|did not respond within \d+s|closed its output before responding/;
 const CODEX_RETRY_DELAYS_MS = [3_000, 8_000];
+
+/** Pure predicate behind fetchCodexLimits' retry decision — exported so the
+ * transient-signature classification has direct unit coverage without
+ * spawning a real codex process (see codex-limits.test.ts). */
+export function isTransientCodexLimitsError(error: string | undefined): boolean {
+  return error !== undefined && TRANSIENT_ERROR_PATTERN.test(error);
+}
 
 export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
   let last: FetchedLimitResult | undefined;
+  let attempts = 0;
   for (let attempt = 0; attempt <= CODEX_RETRY_DELAYS_MS.length; attempt++) {
     if (attempt > 0) await Bun.sleep(CODEX_RETRY_DELAYS_MS[attempt - 1]!);
-    const started = Date.now();
+    attempts++;
     last = await fetchCodexLimitsOnce(identity);
-    const failedFastOnTransport =
-      last.status === "unavailable" &&
-      last.error !== undefined &&
-      TRANSPORT_ERROR_PATTERN.test(last.error) &&
-      Date.now() - started < FAST_FAIL_MAX_MS;
-    if (!failedFastOnTransport) return last;
+    if (!isTransientCodexLimitsError(last.error) || last.status !== "unavailable") return last;
   }
-  return last!;
+  return {
+    ...last!,
+    error: `${last!.error} (still failing after ${attempts} attempts)`,
+  };
 }

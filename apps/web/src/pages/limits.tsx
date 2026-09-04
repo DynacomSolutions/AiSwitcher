@@ -1,4 +1,4 @@
-import { CreditCard } from "lucide-react";
+import { CreditCard, RotateCcw } from "lucide-react";
 import { useMemo } from "react";
 
 import { ToolBadge } from "@/components/badges";
@@ -16,7 +16,7 @@ import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
 import { useLimitsQuery } from "@/hooks/queries";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
-import type { LimitFetchStatus, LimitWindow, OverageInfo, ToolLimitResult } from "@/types/api";
+import type { LimitFetchStatus, LimitWindow, ManualResetInfo, OverageInfo, ToolLimitResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
   switch (status) {
@@ -85,6 +85,25 @@ function OverageBlock({ overage }: { overage: OverageInfo }) {
   );
 }
 
+function ManualResetBlock({ reset }: { reset: ManualResetInfo }) {
+  const count = reset.availableCount > 1 ? ` ×${reset.availableCount}` : "";
+  const label = reset.label ? `: ${reset.label}` : "";
+  const expiry = reset.expiresAt ? ` (expires ${reset.expiresAt})` : "";
+  return (
+    <>
+      <Separator />
+      <div className="flex items-start gap-2 text-xs text-emerald-600 dark:text-emerald-400">
+        <RotateCcw aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+        <span>
+          Manual reset available{count}
+          {label}
+          {expiry}
+        </span>
+      </div>
+    </>
+  );
+}
+
 function LimitCard({ result }: { result: ToolLimitResult }) {
   const unavailable = result.status === "unavailable" || result.status === "pending";
   return (
@@ -120,6 +139,7 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
           <p className="text-sm text-muted-foreground">This tool reported no quota windows.</p>
         ) : null}
         {result.overage ? <OverageBlock overage={result.overage} /> : null}
+        {result.manualReset ? <ManualResetBlock reset={result.manualReset} /> : null}
       </CardContent>
     </Card>
   );

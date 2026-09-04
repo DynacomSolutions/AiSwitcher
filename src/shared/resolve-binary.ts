@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { BinaryResolutionError } from "../identities/errors.ts";
 import { aisNpmDir } from "./ais-home.ts";
 
@@ -37,6 +37,55 @@ function safeRealpath(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** npm-published CLIs whose bin entry is a `#!/usr/bin/env node` launcher
+ * around a platform-native binary (codex, since @openai/codex moved to the
+ * optional-platform-package layout) can't be exec'd directly by this
+ * project: every spawn site here runs the resolved path raw, and the
+ * console daemon image deliberately ships no Node at all (bun only — see
+ * Dockerfile). Confirmed live 2026-09-04: the managed `ais upgrade` install
+ * switched to this launcher layout and every codex limits/doctor/resume
+ * call inside the pod began dying with "env: 'node': No such file or
+ * directory" while the host (which has Node) kept working.
+ *
+ * nativeBinaryForNodeLauncher re-implements the exact resolution
+ * @openai/codex/bin/codex.js performs: its platform-package table plus the
+ * vendor/<triple>/bin/codex layout, keyed off THIS process's platform/arch
+ * (the same thing the launcher itself uses). Returns null for anything that
+ * isn't that launcher shape, so callers fall back to the candidate as-is —
+ * a host with Node keeps exec'ing the launcher exactly like before. */
+export function nativeBinaryForNodeLauncher(realCandidate: string): string | null {
+  const LAUNCHER_SUFFIX = "/bin/codex.js";
+  if (!realCandidate.endsWith(LAUNCHER_SUFFIX)) return null;
+  const pkgRoot = realCandidate.slice(0, -LAUNCHER_SUFFIX.length);
+
+  const target = process.platform === "linux" || process.platform === "android"
+    ? process.arch === "x64"
+      ? { platformPackage: "@openai/codex-linux-x64", triple: "x86_64-unknown-linux-musl" }
+      : process.arch === "arm64"
+        ? { platformPackage: "@openai/codex-linux-arm64", triple: "aarch64-unknown-linux-musl" }
+        : null
+    : process.platform === "darwin"
+      ? process.arch === "x64"
+        ? { platformPackage: "@openai/codex-darwin-x64", triple: "x86_64-apple-darwin" }
+        : process.arch === "arm64"
+          ? { platformPackage: "@openai/codex-darwin-arm64", triple: "aarch64-apple-darwin" }
+          : null
+      : null;
+  if (!target) return null;
+
+  // The launcher checks <platformPackage>/vendor/<triple>/bin/codex, falling
+  // back to <codexPkg>/vendor/<triple>/bin/codex when the platform package
+  // didn't install (bundled installs). Mirror both, same order.
+  const candidates = [
+    join(pkgRoot, "node_modules", target.platformPackage, "vendor", target.triple, "bin", "codex"),
+    join(pkgRoot, "vendor", target.triple, "bin", "codex"),
+  ];
+  for (const path of candidates) {
+    if (existsSync(path)) return path;
+  }
+  return null;
 }
 
 /**
@@ -110,6 +159,14 @@ export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "
       `Refusing to exec: resolved '${name}' (${candidate}) is our own shim. PATH looks ` +
         `misconfigured (duplicate/reordered entries?). Aborting instead of recursing into myself.`,
     );
+  }
+
+  // A `#!/usr/bin/env node` launcher can't be exec'd where Node is absent
+  // (the console daemon image). When the candidate is one, return the
+  // native binary the launcher itself would spawn; otherwise unchanged.
+  if (candidateReal) {
+    const native = nativeBinaryForNodeLauncher(candidateReal);
+    if (native) return native;
   }
 
   return candidate;
