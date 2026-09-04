@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { nativeBinaryForNodeLauncher } from "../../src/shared/resolve-binary.ts";
 
 // resolveRealBinary()'s MANAGED_REAL_BIN_DIR/LEGACY_MANAGED_REAL_BIN_DIR are
 // module-level consts computed once at import time from HOME/env vars —
@@ -87,5 +88,47 @@ describe("resolveRealBinary — legacy npm-prefix fallback", () => {
 
     expect(stdout).toBe("");
     expect(stderr).toContain("Could not locate the real 'claude' binary");
+  });
+});
+
+describe("nativeBinaryForNodeLauncher", () => {
+  test("resolves the @openai/codex launcher layout to the vendor native binary", async () => {
+    // Verbatim layout of the real managed install on this machine (written
+    // 2026-09-04, when @openai/codex moved to the platform-package layout):
+    // bin/codex.js is a #!/usr/bin/env node launcher around the platform
+    // package's vendor binary.
+    const home = await makeHome();
+    const pkgRoot = join(home, "npm", "lib", "node_modules", "@openai", "codex");
+    const launcher = join(pkgRoot, "bin", "codex.js");
+    await Bun.write(launcher, "#!/usr/bin/env node\n");
+    // npm installs bin scripts executable; Bun.which (inside
+    // resolveRealBinary) requires the exec bit to find the symlink at all.
+    await chmod(launcher, 0o755);
+    const native = join(pkgRoot, "node_modules", "@openai", "codex-linux-x64", "vendor", "x86_64-unknown-linux-musl", "bin", "codex");
+    await writeExecutable(native);
+
+    // resolveRealBinary's end-to-end behavior, through the same subprocess
+    // harness the legacy-fallback cases use: the managed dir holds a
+    // symlink to the launcher (exactly what `ais upgrade`'s npm install
+    // creates), and resolution must land on the native binary.
+    const binDir = join(home, ".ais", "npm", "bin");
+    await mkdir(binDir, { recursive: true });
+    await symlink(launcher, join(binDir, "codex"));
+    const { stdout, stderr } = await resolveInSubprocess(home, "codex");
+    expect(stderr).toBe("");
+    expect(stdout).toBe(native);
+  });
+
+  test("non-launcher candidates are returned untouched", () => {
+    expect(nativeBinaryForNodeLauncher("/any/bin/claude")).toBeNull();
+    expect(nativeBinaryForNodeLauncher("/any/bin/codex")).toBeNull();
+    expect(nativeBinaryForNodeLauncher("/npm/@openai/codex/bin/codex.ts")).toBeNull();
+  });
+
+  test("a launcher whose platform package is missing yields null (fall back to the launcher)", async () => {
+    const home = await makeHome();
+    const launcher = join(home, "npm", "lib", "node_modules", "@openai", "codex", "bin", "codex.js");
+    await Bun.write(launcher, "#!/usr/bin/env node\n");
+    expect(nativeBinaryForNodeLauncher(launcher)).toBeNull();
   });
 });
