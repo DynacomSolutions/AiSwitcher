@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  isTransientCodexLimitsError,
   manualResetFromWire,
   overageFromSnapshot,
   type RateLimitResetCreditsWire,
@@ -33,6 +34,30 @@ describe("overageFromSnapshot", () => {
   test("active is always false — this signal only ever describes a blocked state, never confirmed ongoing overage", () => {
     const result = overageFromSnapshot({ spendControlReached: true });
     expect(result?.active).toBe(false);
+  });
+});
+
+describe("isTransientCodexLimitsError", () => {
+  test("all three observed upstream-flakiness signatures are transient", () => {
+    // Verbatim error strings from real degraded runs (2026-09-03/04).
+    expect(isTransientCodexLimitsError("failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)")).toBe(true);
+    expect(isTransientCodexLimitsError("codex app-server did not respond within 30s.")).toBe(true);
+    expect(isTransientCodexLimitsError("codex app-server closed its output before responding.")).toBe(true);
+  });
+
+  test("codex's semantic answers are never retried", () => {
+    expect(
+      isTransientCodexLimitsError("ChatGPT-plan login required (API-key auth doesn't expose rate limits)"),
+    ).toBe(false);
+    expect(isTransientCodexLimitsError("codex app-server returned no rate-limit data.")).toBe(false);
+    expect(
+      isTransientCodexLimitsError("codex reported no active rate-limit windows (primary and secondary both empty)."),
+    ).toBe(false);
+  });
+
+  test("absent or unrelated errors are not transient", () => {
+    expect(isTransientCodexLimitsError(undefined)).toBe(false);
+    expect(isTransientCodexLimitsError("spawnSync /nonexistent ENOENT")).toBe(false);
   });
 });
 
