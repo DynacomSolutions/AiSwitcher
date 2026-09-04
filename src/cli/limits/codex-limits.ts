@@ -1,7 +1,7 @@
 import type { Identity } from "../../identities/types.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByMinutes } from "./bucket.ts";
-import type { LimitCategory, LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
+import type { LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, FetchedLimitResult } from "./types.ts";
 
 /** Whole handshake budget (spawn + initialize + rateLimits/read). Live reads
  * against all three real identities on this machine came back in ~1-2s each,
@@ -23,6 +23,32 @@ export interface RateLimitSnapshotWire {
   spendControlReached?: boolean | null;
   planType?: string | null;
   rateLimitReachedType?: string | null;
+}
+
+/** One grantable "spend this to wipe my windows now" credit. Confirmed live
+ * 2026-09-04 against two real team accounts on this machine:
+ * `RateLimitResetCredit_<hex>` ids, `resetType: "codexRateLimits"`, and a
+ * "Full reset (Weekly + 5 hr)" title for a free promo grant. */
+export interface RateLimitResetCreditWire {
+  /** Wire id, e.g. "RateLimitResetCredit_<hex>" (unread). */
+  id?: string;
+  /** Confirmed live: "codexRateLimits" (unread). */
+  resetType?: string;
+  status?: string;
+  title?: string;
+  description?: string;
+  /** Unix seconds. */
+  grantedAt?: number;
+  /** Unix seconds. */
+  expiresAt?: number;
+}
+
+/** Sibling of `rateLimits` in the `account/rateLimits/read` result (also
+ * confirmed present in the installed binary's own embedded type
+ * definitions): the account's manually-spendable rate-limit resets. */
+export interface RateLimitResetCreditsWire {
+  availableCount?: number;
+  credits?: RateLimitResetCreditWire[];
 }
 
 interface JsonRpcMessage {
@@ -149,6 +175,43 @@ export function overageFromSnapshot(snapshot: RateLimitSnapshotWire): OverageInf
   return undefined;
 }
 
+/**
+ * Pure mapping from the `rateLimitResetCredits` sibling of the rateLimits
+ * snapshot to a ManualResetInfo — the account's manually-spendable "wipe my
+ * usage windows now" grants (a separate feature from overage billing; the
+ * count says how many can be used RIGHT NOW). The wire's own
+ * availableCount is trusted where present; otherwise the count is derived
+ * from the credits list. A count of zero (or an absent wire block — every
+ * account without the concept) yields undefined, so nothing renders rather
+ * than a fabricated "no resets" row. Title/expiry come from the first
+ * available credit; expiry reuses this file's resetsAt display format.
+ * Exported pure for tests.
+ */
+export function manualResetFromWire(wire: RateLimitResetCreditsWire | undefined): ManualResetInfo | undefined {
+  if (!wire) return undefined;
+  const available = (wire.credits ?? []).filter((c) => c.status === "available");
+  const count =
+    typeof wire.availableCount === "number" && Number.isFinite(wire.availableCount)
+      ? wire.availableCount
+      : available.length;
+  if (count <= 0) return undefined;
+  const first = available[0];
+  const expiresAt =
+    first?.expiresAt !== undefined
+      ? new Date(first.expiresAt * 1000).toLocaleString(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        })
+      : undefined;
+  return {
+    availableCount: count,
+    ...(first?.title ? { label: first.title } : {}),
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+  };
+}
+
 function buildWindows(snapshot: RateLimitSnapshotWire): LimitWindow[] {
   const note = deriveNote(snapshot);
   const windows: LimitWindow[] = [];
@@ -267,8 +330,10 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
         throw new Error(message);
       }
 
-      const snapshot = (rateLimitsResponse.result as { rateLimits?: RateLimitSnapshotWire } | undefined)
-        ?.rateLimits;
+      const payload = rateLimitsResponse.result as
+        | { rateLimits?: RateLimitSnapshotWire; rateLimitResetCredits?: RateLimitResetCreditsWire }
+        | undefined;
+      const snapshot = payload?.rateLimits;
       if (!snapshot) {
         return { ...base, windows: [], status: "unavailable", error: "codex app-server returned no rate-limit data." };
       }
@@ -284,7 +349,15 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
       }
 
       const overage = overageFromSnapshot(snapshot);
-      return { ...base, windows, status: "live", capturedAt: new Date().toISOString(), ...(overage ? { overage } : {}) };
+      const manualReset = manualResetFromWire(payload?.rateLimitResetCredits);
+      return {
+        ...base,
+        windows,
+        status: "live",
+        capturedAt: new Date().toISOString(),
+        ...(overage ? { overage } : {}),
+        ...(manualReset ? { manualReset } : {}),
+      };
     } finally {
       try {
         proc.kill();

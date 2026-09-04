@@ -58,6 +58,28 @@ export interface OverageInfo {
   limitUsd?: number;
 }
 
+/**
+ * A manual rate-limit reset the account can spend right now to wipe its
+ * active usage window(s) early, instead of waiting for the scheduled
+ * resetsAt rollover — e.g. OpenAI grants some Codex accounts "Full reset
+ * (Weekly + 5 hr)" credits (confirmed live 2026-09-04: two team accounts on
+ * this machine each held `rateLimitResetCredits.availableCount: 1` with one
+ * `status: "available"` credit). This is an ACTION the user can take in the
+ * provider's own UI/CLI, not a scheduled event; absence of this field means
+ * the provider exposes no such concept or nothing is currently available.
+ * Only codex surfaces it today; other providers' adapters simply never set
+ * it.
+ */
+export interface ManualResetInfo {
+  /** How many resets can be used right now (the wire's own availableCount
+   * where provided, else derived from the credits list). */
+  availableCount: number;
+  /** Provider's own title for the grant, e.g. "Full reset (Weekly + 5 hr)". */
+  label?: string;
+  /** When the grant itself expires, human-formatted by the adapter. */
+  expiresAt?: string;
+}
+
 export interface ToolLimitResult {
   toolName: ToolConfig["toolName"];
   /** The upstream provider these windows belong to — the report's grouping
@@ -81,6 +103,9 @@ export interface ToolLimitResult {
    * live fetch didn't happen (pending/unavailable/cached results never set
    * this). */
   overage?: OverageInfo;
+  /** See ManualResetInfo. Present only when the provider reports at least
+   * one usable manual reset right now. */
+  manualReset?: ManualResetInfo;
 }
 
 /** What a single-provider fetcher returns: a complete result EXCEPT the
