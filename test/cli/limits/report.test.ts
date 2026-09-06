@@ -70,13 +70,13 @@ describe("aggregateAverage", () => {
     const results = [claudeAcme(), claudeUnauth("personal")];
     const totals = aggregateAverage(results);
     expect(totals).toEqual([
-      { category: "session", usedPercent: 25 },
-      { category: "week", usedPercent: 15 },
+      { category: "session", usedPercent: 25, count: 1 },
+      { category: "week", usedPercent: 15, count: 2 },
     ]);
   });
 
   test("only emits categories with at least one real data point", () => {
-    expect(aggregateAverage([codexAcme()])).toEqual([{ category: "week", usedPercent: 100 }]);
+    expect(aggregateAverage([codexAcme()])).toEqual([{ category: "week", usedPercent: 100, count: 1 }]);
   });
 
   test("unavailable results contribute nothing", () => {
@@ -88,7 +88,7 @@ describe("aggregateAverage", () => {
       codexAcme(), // week: 100
       { toolName: "codex", provider: "openai", identity: identity("personal"), status: "live", windows: [{ label: "week", category: "week", usedPercent: 0 }] },
     ]);
-    expect(mixed).toEqual([{ category: "week", usedPercent: 50 }]);
+    expect(mixed).toEqual([{ category: "week", usedPercent: 50, count: 2 }]);
   });
 });
 
@@ -193,15 +193,49 @@ describe("formatLimitsReport", () => {
     expect(output).not.toContain("["); // no bars anywhere — nothing resolved yet, nothing to aggregate
   });
 
-  test("a pending identity alongside a resolved one still aggregates the resolved one's windows", () => {
+  test("while ANY identity in the set is pending, BOTH rollups hold as spinner rows instead of a partial average", () => {
+    // The old behaviour averaged whatever had resolved so far, which could
+    // show an impossible-looking frame (a "week 100%" total above a 22%
+    // sibling still loading). Now the TOTAL and the provider rollup both
+    // hold as "loading…" until every member of their set has resolved.
     const pending: ToolLimitResult = { toolName: "claude", provider: "anthropic", identity: identity("personal"), status: "pending", windows: [] };
     const output = formatLimitsReport([claudeAcme(), pending], NOW, "⠹");
     const lines = output.split("\n");
-    // TOTAL rollup reflects only the resolved identity (identity-a) — pending
-    // contributes nothing yet, same as an "unavailable" result always has.
-    expect(lines[0]!.startsWith("sessions")).toBe(true);
-    expect(output).toContain("⠹ loading…");
-    expect(output).toContain("Anthropic (2 identities)");
+    // TOTAL row: a flush-left spinner, not a "sessions (avg of 1)" partial.
+    expect(lines[0]).toBe("⠹ loading…");
+    // No average renders anywhere in the frame ...
+    expect(output).not.toContain("avg of");
+    // ... the provider section's rollup holds the same way ...
+    const anthropicIdx = lines.findIndex((l) => l.includes("Anthropic (2 identities)"));
+    expect(lines[anthropicIdx + 1]).toBe("│   ⠹ loading…");
+    // ... while the resolved identity's own windows still render, and the
+    // pending identity shows its own spinner row.
+    expect(output).toContain("session (5h)");
+    expect(lines.filter((l) => l.includes("⠹ loading…")).length).toBe(3);
+  });
+
+  test("a pending identity in ONE provider section holds only that section's rollup and the TOTAL, not other sections", () => {
+    const pending: ToolLimitResult = { toolName: "claude", provider: "anthropic", identity: identity("personal"), status: "pending", windows: [] };
+    const output = formatLimitsReport([claudeAcme(), codexAcme(), pending], NOW, "⠹");
+    const lines = output.split("\n");
+    // TOTAL spans every provider, so it holds; the resolved OpenAI section
+    // (no pending member) still shows its average.
+    expect(lines[0]).toBe("⠹ loading…");
+    expect(output).toContain("week (avg of 1)");
+    const anthropicIdx = lines.findIndex((l) => l.includes("Anthropic (2 identities)"));
+    expect(lines[anthropicIdx + 1]).toBe("│   ⠹ loading…");
+  });
+
+  test("rollup labels state their basis: 'week (avg of 3)' counts every contributing window", () => {
+    // claudeAcme(): session x1 (25), week x2 (30, 0). codexAcme(): week x1
+    // (100). TOTAL: sessions (avg of 1), week (avg of 3); the Anthropic
+    // section: sessions (avg of 1), week (avg of 2).
+    const output = formatLimitsReport([claudeAcme(), codexAcme()], NOW);
+    const lines = output.split("\n");
+    expect(lines[0]!.startsWith("sessions (avg of 1)")).toBe(true);
+    expect(lines[1]!.startsWith("week (avg of 3)")).toBe(true);
+    expect(output).toContain("│   sessions (avg of 1)");
+    expect(output).toContain("│   week (avg of 2)");
   });
 
   test("sections group by PROVIDER, not tool — a multi-provider client's rows land beside their native-tool counterparts", () => {
