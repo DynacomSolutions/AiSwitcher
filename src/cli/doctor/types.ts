@@ -1,12 +1,14 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 
-/** "responsive" means the real binary answered within its timeout budget —
+/** "responsive" means the real binary answered within its timeout budget:
  * regardless of whether the answer itself was useful (an auth error, "no
  * rate-limit data", etc. all still count as responsive; the process didn't
  * hang). "hung" is the one status this command exists to catch: the process
  * never answered at all within budget. "unavailable" means the probe was
- * never even attempted (binary not resolvable on PATH, or no doctor probe
- * exists yet for this tool — see collect.ts's PROBES). */
+ * never even attempted: binary not resolvable on PATH, no doctor probe
+ * exists yet for this tool (see collect.ts's PROBES), or a definitive
+ * pre-probe diagnosis made the live turn pointless (e.g. claude-doctor.ts's
+ * credential-wipe detection). */
 export type DoctorStatus = "responsive" | "hung" | "unavailable";
 
 export interface DoctorResult {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { matchDirectory, parseDirectoryPattern } from "../src/identities/match.ts";
+import { isIdentityDirName, matchDirectory, parseDirectoryPattern } from "../src/identities/match.ts";
 import type { Identity } from "../src/identities/types.ts";
 
 function identity(name: string, directories: string[]): Identity {
@@ -76,5 +76,28 @@ describe("matchDirectory", () => {
     // longest naturally wins without needing the ambiguity fallback.
     const result = matchDirectory("/tmp/does-not-exist/foo/bar/baz", [a]);
     expect(result).toMatchObject({ identity: a });
+  });
+});
+
+describe("isIdentityDirName", () => {
+  test("accepts ordinary identity directory names", () => {
+    expect(isIdentityDirName("personal")).toBe(true);
+    expect(isIdentityDirName("phoenix-court-group")).toBe(true);
+    expect(isIdentityDirName("identity-a")).toBe(true);
+  });
+
+  test("rejects `.lock` dirs: claude's own config-lock siblings, provisioned as junk identities live 2026-09", () => {
+    // Verbatim junk dir names from ~/.claude/identities/ on the live machine.
+    expect(isIdentityDirName("personal.lock")).toBe(false);
+    expect(isIdentityDirName("phoenix-court-group.lock")).toBe(false);
+    expect(isIdentityDirName("PERSONAL.LOCK")).toBe(false);
+    expect(isIdentityDirName(".lock")).toBe(false);
+  });
+
+  test("rejects anything failing the identity-key grammar, lock suffix or not", () => {
+    expect(isIdentityDirName("Personal")).toBe(false);
+    expect(isIdentityDirName("foo bar")).toBe(false);
+    expect(isIdentityDirName("foo.lock.bak")).toBe(false);
+    expect(isIdentityDirName("")).toBe(false);
   });
 });

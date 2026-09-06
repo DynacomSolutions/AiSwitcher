@@ -76,6 +76,22 @@ export function isValidIdentityKey(value: string): boolean {
   return /^[a-z0-9]+(-[a-z0-9]+)*$/.test(value);
 }
 
+/** True for a directory name that may legitimately represent an identity
+ * under a tool's `identities/` root: the identity-key grammar above PLUS a
+ * `.lock` exclusion. Claude Code itself leaves sibling `<name>.lock/`
+ * directories behind when locking its config, and junk dirs observed live
+ * 2026-09 (`~/.claude/identities/personal.lock/` and
+ * `phoenix-court-group.lock/`, provisioned with a settings.json + hooks by a
+ * consumer that enumerated the identities root and treated every entry as an
+ * identity) showed those lock dirs must never be read back as identities.
+ * The one listing whose subdirectory names ARE identity candidates (the
+ * console files API's tree() on an identities root) filters through this;
+ * the create paths reject the same names outright, since a `.lock` name
+ * fails isValidIdentityKey's grammar anyway. */
+export function isIdentityDirName(value: string): boolean {
+  return !value.toLowerCase().endsWith(".lock") && isValidIdentityKey(value);
+}
+
 function segmentCount(path: string): number {
   return path.split(sep).filter(Boolean).length;
 }

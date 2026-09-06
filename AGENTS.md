@@ -166,7 +166,13 @@ src/
                                 fetch (GET api.kimi.com/coding/v1/usages with the OAuth token
                                 from credentials/kimi-code.json, refreshing expired tokens via
                                 auth.kimi.com), unlike grok's log-scrape — see the kimi case
-                                study. zai-limits.ts is also a genuinely live fetch (GET
+                                study. claude-limits.ts is live too and STRICTLY read-only:
+                                GET api.anthropic.com/api/oauth/usage with the access token
+                                from that identity's .credentials.json, never spawning claude
+                                and never refreshing (401/403 are terminal; a second writer
+                                racing Anthropic's rotating refresh tokens wiped all three
+                                identities' credentials live 2026-09); see the anthropic
+                                case study below. zai-limits.ts is also a genuinely live fetch (GET
                                 api.z.ai/api/monitor/usage/quota/limit with the static key from
                                 that identity's own crush.json — no OAuth/refresh needed,
                                 unlike kimi) — see the 2026-07-18 zai/Crush addendum.
@@ -2405,6 +2411,22 @@ What the rule means in practice, now enforced in both pipelines:
   a fork. The same law will need the same treatment for the other OAuth
   providers pi holds copies of (anthropic, openai-codex, xai) — kimi is
   where rotation made the race an everyday failure, so it went first.
+- **AIS never spawns claude against a live identity config dir (the
+  anthropic rotation race, 2026-09).** Anthropic rotates the OAuth refresh
+  token on every refresh, the same law as kimi, and Claude Code answers a
+  lost race far more harshly than an HTTP 400: the root k3s AIS web pod
+  ran as a second writer against the same home, its losing refresh met
+  invalid_grant, and all three identities' `.credentials.json` ended up
+  with both token fields as empty strings and `expiresAt: 0` while every
+  other field (refreshTokenExpiresAt included) survived. That wipe
+  signature is how the state is recognised. The invariant: claude limits
+  are probed read-only via GET api.anthropic.com/api/oauth/usage with the
+  access token from the identity's own `.credentials.json`; the fetcher
+  never spawns claude, never refreshes, and treats 401/403 as terminal
+  (its remedy messages point at an interactive `claude` run or
+  `claude auth login` under the affected identity). `ais doctor`
+  recognises the wiped state from the same credential read and reports it
+  instead of probing.
 - **No tool-shaped placeholder rows exist for the multi-provider clients.**
   Neither a pending seed (the provider isn't known until the adapter reads
   the identity's own auth store — a placeholder would render a fake
