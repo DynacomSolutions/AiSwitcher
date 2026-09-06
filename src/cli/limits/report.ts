@@ -91,12 +91,20 @@ function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, spinnerFra
   // A manually-spendable reset (e.g. codex's "Full reset (Weekly + 5 hr)"
   // grants) is account-level, not a property of any one window, so it gets
   // its own dim row under the identity branch instead of being glued onto a
-  // window's extras. Only ever set on live results alongside real windows.
+  // window's extras. Only ever set alongside real windows, whether live or
+  // cached from the last-good store (limits-cache.ts preserves it).
   if (result.manualReset && result.manualReset.availableCount > 0) {
     const reset = result.manualReset;
     const noun = reset.availableCount > 1 ? `manual resets available ×${reset.availableCount}` : "manual reset available";
     const text = [noun, reset.label].filter(Boolean).join(": ") + (reset.expiresAt ? ` (expires ${reset.expiresAt})` : "");
     rows.push({ indent: continuation, label: "", plain: text });
+  }
+  // A cached result can still carry the live fetch's error (the last-good
+  // snapshot above is being shown BECAUSE the live read failed): keep that
+  // failure visible as a dim row under the stale bars rather than letting
+  // the cached data read as a healthy live answer.
+  if (result.status === "cached" && result.error) {
+    rows.push({ indent: continuation, label: "", plain: result.error });
   }
   return { branch, rows };
 }

@@ -3,9 +3,12 @@ import {
   isTransientCodexLimitsError,
   manualResetFromWire,
   overageFromSnapshot,
+  withTransientCodexRetries,
   type RateLimitResetCreditsWire,
   type RateLimitSnapshotWire,
 } from "../../../src/cli/limits/codex-limits.ts";
+import type { FetchedLimitResult } from "../../../src/cli/limits/types.ts";
+import type { Identity } from "../../../src/identities/types.ts";
 
 describe("overageFromSnapshot", () => {
   test("neither signal set yields undefined", () => {
@@ -114,5 +117,87 @@ describe("manualResetFromWire", () => {
   test("credits with a non-available status never count or supply title/expiry", () => {
     const wire: RateLimitResetCreditsWire = { availableCount: 1, credits: [{ status: "used", title: "Full reset" }] };
     expect(manualResetFromWire(wire)).toEqual({ availableCount: 1 });
+  });
+});
+
+describe("withTransientCodexRetries", () => {
+  const identity: Identity = { name: "acme", label: "Acme", configDir: "/tmp/does-not-exist/acme" };
+  const TRANSIENT = "failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)";
+
+  function unavailable(error: string): FetchedLimitResult {
+    return { toolName: "codex", identity, windows: [], status: "unavailable", error };
+  }
+
+  function live(): FetchedLimitResult {
+    return {
+      toolName: "codex",
+      identity,
+      windows: [{ label: "week", category: "week", usedPercent: 42 }],
+      status: "live",
+      capturedAt: new Date().toISOString(),
+    };
+  }
+
+  function recordingSleep(): { sleep: (ms: number) => Promise<void>; pauses: number[] } {
+    const pauses: number[] = [];
+    return {
+      pauses,
+      sleep: (ms: number) => {
+        pauses.push(ms);
+        return Promise.resolve();
+      },
+    };
+  }
+
+  test("a transient failure is retried through the FULL backoff: 5 attempts, pauses 3s/8s/20s/45s", async () => {
+    const { sleep, pauses } = recordingSleep();
+    let calls = 0;
+    const result = await withTransientCodexRetries(async () => {
+      calls++;
+      return unavailable(TRANSIENT);
+    }, sleep);
+    expect(calls).toBe(5);
+    expect(pauses).toEqual([3_000, 8_000, 20_000, 45_000]);
+    expect(result.error).toBe(`${TRANSIENT} (still failing after 5 attempts)`);
+  });
+
+  test("a success mid-backoff stops retrying and returns the live result untouched", async () => {
+    const { sleep, pauses } = recordingSleep();
+    let calls = 0;
+    const result = await withTransientCodexRetries(async () => {
+      calls++;
+      return calls < 3 ? unavailable(TRANSIENT) : live();
+    }, sleep);
+    expect(calls).toBe(3);
+    expect(pauses).toEqual([3_000, 8_000]);
+    expect(result.status).toBe("live");
+    expect(result.error).toBeUndefined();
+  });
+
+  test("codex's semantic answers are NOT retried: one attempt, no pause", async () => {
+    const { sleep, pauses } = recordingSleep();
+    let calls = 0;
+    const result = await withTransientCodexRetries(async () => {
+      calls++;
+      return unavailable("ChatGPT-plan login required (API-key auth doesn't expose rate limits)");
+    }, sleep);
+    expect(calls).toBe(1);
+    expect(pauses).toEqual([]);
+    expect(result.error).not.toContain("still failing");
+  });
+
+  test("a transient SIGNATURE on a non-unavailable result is not retried either", async () => {
+    // Belt and braces: the retry condition is transient AND unavailable, so a
+    // hypothetical live result carrying a transient-looking error string
+    // still returns as-is.
+    const { sleep, pauses } = recordingSleep();
+    let calls = 0;
+    const result = await withTransientCodexRetries(async () => {
+      calls++;
+      return { ...live(), error: TRANSIENT };
+    }, sleep);
+    expect(calls).toBe(1);
+    expect(pauses).toEqual([]);
+    expect(result.status).toBe("live");
   });
 });

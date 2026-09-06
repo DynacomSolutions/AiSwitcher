@@ -47,6 +47,23 @@ export function aisConfigDir(home: string = homedir()): string {
   return join(aisHome(home), "config");
 }
 
+/** Machine-local caches this project can rebuild at any time (currently just
+ * the `ais limits` last-good snapshot store below). Deliberately separate
+ * from aisRemoteCacheDir: that tree is SSH sync's staging area with its own
+ * locking and remote-path conventions, while nothing in here is ever synced
+ * or backed up. */
+export function aisCacheDir(home: string = homedir()): string {
+  return join(aisHome(home), "cache");
+}
+
+/** `ais limits`' last-good snapshot store: one JSON object keyed by
+ * provider:identity holding the most recent successful quota read per
+ * source, so a failed live fetch can still render the last known windows
+ * instead of a bare error row. See cli/limits/limits-cache.ts. */
+export function aisLimitsCacheFile(home: string = homedir()): string {
+  return join(aisCacheDir(home), "limits.json");
+}
+
 /** Canonical, machine-local memory shared by every AIS-managed agent and
  * identity. It is outside every vendor profile, SSH sync tree, and backup
  * group. Vendor files are projections, never the authority. */

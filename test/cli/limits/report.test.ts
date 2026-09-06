@@ -231,3 +231,36 @@ describe("formatLimitsReport", () => {
     expect(output).not.toContain("zai (");
   });
 });
+
+describe("cached-with-error rendering (last-good fallback)", () => {
+  function codexCachedWithError(): ToolLimitResult {
+    return {
+      toolName: "codex",
+      provider: "openai",
+      identity: identity("identity-a", "Identity A"),
+      status: "cached",
+      capturedAt: new Date("2026-07-15T10:00:00Z").toISOString(), // 2h before NOW
+      windows: [{ label: "week", category: "week", usedPercent: 66, resetsAt: "Jul 18 8am" }],
+      error: "failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage) (still failing after 5 attempts)",
+    };
+  }
+
+  test("the live fetch's error renders as a dim bar-less row under the stale cached windows", () => {
+    const output = formatLimitsReport([codexCachedWithError()], NOW);
+    const lines = output.split("\n");
+    const windowLine = lines.find((l) => l.includes("week") && l.includes("resets"))!;
+    const errorLine = lines.find((l) => l.includes("failed to fetch codex rate limits"))!;
+    // The stale bars still render (with their "as of" suffix) ...
+    expect(windowLine).toContain("2h ago");
+    // ... and the failure stays visible underneath them, with no bar bracket
+    // of its own (a dim plain row, same pattern as the manualReset row).
+    expect(errorLine).not.toContain("[");
+    expect(lines.indexOf(errorLine)).toBeGreaterThan(lines.indexOf(windowLine));
+  });
+
+  test("a cached result WITHOUT an error (pure --cached mode) gets no error row", () => {
+    const { error: _omit, ...withoutError } = codexCachedWithError();
+    const output = formatLimitsReport([withoutError], NOW);
+    expect(output).not.toContain("failed to fetch");
+  });
+});

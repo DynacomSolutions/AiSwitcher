@@ -1,5 +1,16 @@
-import { describe, expect, test } from "bun:test";
-import { aggregateLimitResults, fetchLimitResults, pendingLimitResult, runBatched } from "../../../src/cli/limits/collect.ts";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  aggregateLimitResults,
+  applyLastGoodCache,
+  fetchLimitResults,
+  pendingLimitResult,
+  runBatched,
+  runLimitPools,
+} from "../../../src/cli/limits/collect.ts";
+import { lookupCachedLimits, recordLiveLimitsResult } from "../../../src/cli/limits/limits-cache.ts";
 import type { ToolLimitResult } from "../../../src/cli/limits/types.ts";
 import type { Identity, ToolConfig } from "../../../src/identities/types.ts";
 
@@ -14,6 +25,21 @@ function target(toolName: ToolConfig["toolName"], name = "acme") {
 function row(overrides: Partial<ToolLimitResult> & Pick<ToolLimitResult, "toolName" | "provider" | "status">): ToolLimitResult {
   return { identity: identity("acme"), windows: [], ...overrides };
 }
+
+// Every cache-touching test points the last-good store at a fresh temp file
+// (the optional cachePath parameter); the real ~/.ais/cache/limits.json is
+// never read or written by this suite.
+let tempDir = "";
+let cachePath = "";
+
+beforeEach(async () => {
+  tempDir = await mkdtemp(join(tmpdir(), "ais-limits-collect-"));
+  cachePath = join(tempDir, "limits.json");
+});
+
+afterEach(async () => {
+  await rm(tempDir, { recursive: true, force: true });
+});
 
 describe("pendingLimitResult", () => {
   test("1:1 tools seed a pending row under their known provider", () => {
@@ -32,18 +58,19 @@ describe("pendingLimitResult", () => {
 });
 
 describe("cached-mode results", () => {
-  test("1:1 tools report their honest cached-unavailable row", async () => {
-    const results = await fetchLimitResults([target("claude")], true, false);
+  test("1:1 tools with no stored snapshot report their honest cached-unavailable row", async () => {
+    const results = await fetchLimitResults([target("claude")], true, false, undefined, cachePath);
     expect(results).toHaveLength(1);
     expect(results[0]!.provider).toBe("anthropic");
     expect(results[0]!.status).toBe("unavailable");
+    expect(results[0]!.error).toContain("cached data not available");
   });
 
-  test("multi-provider clients render nothing unscoped; an explicit --tool= still gets an honest row", async () => {
+  test("multi-provider clients with no stored snapshot render nothing unscoped; an explicit --tool= still gets an honest row", async () => {
     const targets = [target("pi"), target("opencode")];
-    expect(await fetchLimitResults(targets, true, false)).toEqual([]);
+    expect(await fetchLimitResults(targets, true, false, undefined, cachePath)).toEqual([]);
 
-    const explicit = await fetchLimitResults([targets[0]!], true, true);
+    const explicit = await fetchLimitResults([targets[0]!], true, true, undefined, cachePath);
     expect(explicit).toHaveLength(1);
     expect(explicit[0]!.status).toBe("unavailable");
     expect(explicit[0]!.error).toContain("cached data not available");
@@ -163,5 +190,176 @@ describe("runBatched", () => {
     });
     expect(results).toEqual([]);
     expect(calls).toBe(0);
+  });
+});
+
+describe("runLimitPools", () => {
+  test("codex is capped at 2 concurrent while the rest keep the wider pool, and both pools run at once", async () => {
+    const targets = [
+      target("codex", "c1"),
+      target("codex", "c2"),
+      target("codex", "c3"),
+      target("codex", "c4"),
+      target("claude", "a1"),
+    ];
+    let codexActive = 0;
+    let codexMax = 0;
+    let restActive = 0;
+    let restMax = 0;
+    const done: number[] = [];
+    await runLimitPools(
+      targets,
+      async (t) => {
+        if (t.toolName === "codex") {
+          codexActive++;
+          codexMax = Math.max(codexMax, codexActive);
+          await Bun.sleep(25);
+          codexActive--;
+        } else {
+          restActive++;
+          restMax = Math.max(restMax, restActive);
+          await Bun.sleep(5);
+          restActive--;
+        }
+        return [];
+      },
+      (i) => done.push(i),
+    );
+    expect(codexMax).toBeLessThanOrEqual(2);
+    expect(restMax).toBeLessThanOrEqual(6);
+    // The pools run CONCURRENTLY: the cheap claude fetch (5ms) lands before
+    // the throttled codex queue (4 x 25ms at 2-wide) drains. If the codex
+    // pool had to finish first, claude (index 4) would be done last.
+    expect(done.indexOf(4)).toBeLessThan(done.indexOf(3));
+  });
+
+  test("batches land at each target's ORIGINAL index and onItemDone reports that same index", async () => {
+    const targets = [target("codex", "slow"), target("claude", "fast")];
+    const seen: Array<{ index: number; names: string[] }> = [];
+    const batches = await runLimitPools(
+      targets,
+      async (t) => {
+        await Bun.sleep(t.toolName === "codex" ? 20 : 1);
+        return [
+          row({
+            toolName: t.toolName,
+            provider: t.toolName === "codex" ? "openai" : "anthropic",
+            status: "live",
+            identity: t.identity,
+          }),
+        ];
+      },
+      (index, results) => seen.push({ index, names: results.map((r) => r.identity.name) }),
+    );
+    expect(batches.map((b) => b[0]!.identity.name)).toEqual(["slow", "fast"]);
+    expect(seen).toEqual([
+      { index: 1, names: ["fast"] },
+      { index: 0, names: ["slow"] },
+    ]);
+  });
+});
+
+describe("applyLastGoodCache", () => {
+  const live = () =>
+    row({
+      toolName: "codex",
+      provider: "openai",
+      status: "live",
+      capturedAt: "2026-09-07T10:00:00.000Z",
+      windows: [{ label: "week", category: "week", usedPercent: 42 }],
+    });
+
+  test("a live result is written through to the store and returned untouched", async () => {
+    const result = live();
+    const out = await applyLastGoodCache([result], cachePath);
+    expect(out[0]).toBe(result);
+    expect((await lookupCachedLimits("openai", "acme", cachePath))?.capturedAt).toBe("2026-09-07T10:00:00.000Z");
+  });
+
+  test("an unavailable result with a stored snapshot converts to cached, keeping the ORIGINAL capturedAt and the live error", async () => {
+    await recordLiveLimitsResult(live(), cachePath);
+    const out = await applyLastGoodCache(
+      [row({ toolName: "codex", provider: "openai", status: "unavailable", error: "error sending request for url (...)" })],
+      cachePath,
+    );
+    expect(out[0]!.status).toBe("cached");
+    expect(out[0]!.capturedAt).toBe("2026-09-07T10:00:00.000Z");
+    expect(out[0]!.error).toBe("error sending request for url (...)");
+    expect(out[0]!.windows).toEqual([{ label: "week", category: "week", usedPercent: 42 }]);
+  });
+
+  test("an unavailable result with NO stored snapshot stays an honest error row", async () => {
+    const out = await applyLastGoodCache(
+      [row({ toolName: "codex", provider: "openai", status: "unavailable", error: "not authenticated" })],
+      cachePath,
+    );
+    expect(out[0]!.status).toBe("unavailable");
+    expect(out[0]!.error).toBe("not authenticated");
+  });
+
+  test("a fetcher's own cached result (e.g. grok's log-scrape) passes through without touching the store", async () => {
+    const out = await applyLastGoodCache(
+      [row({ toolName: "grok", provider: "xai", status: "cached", windows: [{ label: "week", category: "week", usedPercent: 1 }] })],
+      cachePath,
+    );
+    expect(out[0]!.status).toBe("cached");
+    expect(await lookupCachedLimits("xai", "acme", cachePath)).toBeUndefined();
+  });
+});
+
+describe("fetchLimitResults + last-good store", () => {
+  test("live mode end to end: grok's real (offline) fetcher fails and the stored snapshot answers instead", async () => {
+    // target() points the identity at a nonexistent configDir, so the real
+    // grok fetcher resolves to "unavailable" without any network; the seeded
+    // snapshot must then take over inside fetchTarget, BEFORE aggregation.
+    await recordLiveLimitsResult(
+      row({
+        toolName: "grok",
+        provider: "xai",
+        status: "live",
+        capturedAt: "2026-09-07T10:00:00.000Z",
+        windows: [{ label: "week", category: "week", usedPercent: 7 }],
+      }),
+      cachePath,
+    );
+    const results = await fetchLimitResults([target("grok")], false, false, undefined, cachePath);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.status).toBe("cached");
+    expect(results[0]!.windows).toEqual([{ label: "week", category: "week", usedPercent: 7 }]);
+    expect(results[0]!.capturedAt).toBe("2026-09-07T10:00:00.000Z");
+    expect(results[0]!.error).toContain("no usage log found");
+  });
+
+  test("--cached reads the store instead of fetching: a hit becomes a cached row with no error", async () => {
+    await recordLiveLimitsResult(
+      row({
+        toolName: "claude",
+        provider: "anthropic",
+        status: "live",
+        capturedAt: "2026-09-07T10:00:00.000Z",
+        windows: [{ label: "session (5h)", category: "session", usedPercent: 25 }],
+      }),
+      cachePath,
+    );
+    const results = await fetchLimitResults([target("claude")], true, false, undefined, cachePath);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.status).toBe("cached");
+    expect(results[0]!.error).toBeUndefined();
+    expect(results[0]!.capturedAt).toBe("2026-09-07T10:00:00.000Z");
+    expect(results[0]!.windows).toHaveLength(1);
+  });
+
+  test("--cached for a multi-provider client returns one cached row per provider the store holds for that identity", async () => {
+    await recordLiveLimitsResult(
+      row({ toolName: "pi", provider: "kimi", status: "live", windows: [{ label: "session", category: "session", usedPercent: 10 }] }),
+      cachePath,
+    );
+    await recordLiveLimitsResult(
+      row({ toolName: "pi", provider: "zai", status: "live", windows: [{ label: "session", category: "session", usedPercent: 20 }] }),
+      cachePath,
+    );
+    const results = await fetchLimitResults([target("pi")], true, false, undefined, cachePath);
+    expect(results.map((r) => r.provider).sort()).toEqual(["kimi", "zai"]);
+    expect(results.every((r) => r.status === "cached")).toBe(true);
   });
 });

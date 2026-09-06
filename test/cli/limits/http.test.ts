@@ -38,6 +38,14 @@ describe("fetchWithRetry", () => {
     expect(pauses).toEqual([3_000, 8_000]);
   });
 
+  test("rides out a longer blip across the full backoff tail", async () => {
+    failWithTimes(4, () => new Response("{}", { status: 200 }));
+    const res = await fetchWithRetry("https://example.test/usage");
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(5);
+    expect(pauses).toEqual([3_000, 8_000, 20_000, 45_000]);
+  });
+
   test("does NOT retry HTTP error statuses — auth failures and rate limits mean what they say", async () => {
     failWithTimes(0, () => new Response("nope", { status: 401 }));
     const res = await fetchWithRetry("https://example.test/usage");
@@ -49,9 +57,9 @@ describe("fetchWithRetry", () => {
   test("exhausting all attempts throws a diagnosable error naming the policy", async () => {
     failWithTimes(99, () => new Response("{}", { status: 200 }));
     await expect(fetchWithRetry("https://example.test/usage")).rejects.toThrow(
-      /The operation timed out\. \(still failing after 3 attempts, 30s timeout each\)/,
+      /The operation timed out\. \(still failing after 5 attempts, 30s timeout each\)/,
     );
-    expect(calls).toHaveLength(3);
-    expect(pauses).toEqual([3_000, 8_000]);
+    expect(calls).toHaveLength(5);
+    expect(pauses).toEqual([3_000, 8_000, 20_000, 45_000]);
   });
 });

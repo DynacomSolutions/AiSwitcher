@@ -11,6 +11,7 @@ import { fetchKimiLimits } from "./kimi-limits.ts";
 import { fetchOpencodeLimits } from "./opencode-limits.ts";
 import { fetchPiLimits } from "./pi-limits.ts";
 import { fetchZaiLimits } from "./zai-limits.ts";
+import { cachedLimitsForIdentity, cachedLimitsFromRecord, lookupCachedLimits, recordLiveLimitsResult } from "./limits-cache.ts";
 import type { FetchedLimitResult, ToolLimitResult } from "./types.ts";
 
 export interface LimitTarget {
@@ -115,11 +116,12 @@ export function pendingLimitResult(target: LimitTarget): ToolLimitResult | undef
   return { toolName: target.toolName, provider: providerForTool(target.toolName), identity: target.identity, windows: [], status: "pending" };
 }
 
-/** Grok's fetch is always a local log-scrape (no live path exists at all —
- * see grok-limits.ts), so `--cached` doesn't change its behavior. Claude,
- * Codex, Kimi, zai, and ali have no offline cache in this version — under
- * `--cached` they report "unavailable" honestly rather than silently
- * falling back to a live call. */
+/** Grok's fetch is always a local log-scrape (no live path exists at all;
+ * see grok-limits.ts), so `--cached` doesn't change its behavior. For every
+ * other tool `--cached` means "answer from the last-good store only, no
+ * network": a stored snapshot becomes a "cached" row, and a miss stays an
+ * honest unavailable row rather than silently falling back to a live
+ * call. */
 function unavailableCached(target: LimitTarget): ToolLimitResult {
   return {
     toolName: target.toolName,
@@ -127,17 +129,27 @@ function unavailableCached(target: LimitTarget): ToolLimitResult {
     identity: target.identity,
     windows: [],
     status: "unavailable",
-    error: "cached data not available for this tool (no offline cache implemented yet) — omit --cached to fetch live",
+    error: "cached data not available for this tool (no snapshot recorded yet for this provider+identity); omit --cached to fetch live",
   };
 }
 
-/** Cached-mode results for one target. The multi-provider clients have no
- * offline cache AND no honest tool-level provider label, so they render
- * nothing unscoped — a placeholder section ("Detecting providers",
- * "OpenCode") would be exactly the tool-shaped output the provider-first
- * views rule forbids. An explicit --tool= still gets the honest row. */
-function cachedResults(target: LimitTarget, explicitTool: boolean): ToolLimitResult[] {
+/** Cached-mode results for one target, read from the last-good store
+ * (limits-cache.ts) with no network at all. A 1:1 tool answers for its one
+ * known provider. The multi-provider clients have no honest tool-level
+ * provider label, so they answer with one cached row per provider the store
+ * holds for that identity (the store is the only offline source of "which
+ * providers can this identity answer for": a live pi/opencode adapter
+ * learns it from the identity's auth file, which --cached must not consult
+ * since those reads can refresh OAuth tokens over the network). A total
+ * miss renders nothing unscoped (a placeholder section would be exactly the
+ * tool-shaped output the provider-first views rule forbids); an explicit
+ * --tool= still gets the honest row. */
+async function cachedResults(target: LimitTarget, explicitTool: boolean, cachePath?: string): Promise<ToolLimitResult[]> {
   if (MULTI_PROVIDER_TOOLS.has(target.toolName)) {
+    const records = await cachedLimitsForIdentity(target.identity.name, cachePath);
+    if (records.length > 0) {
+      return records.map((record) => cachedLimitsFromRecord(record, target.identity));
+    }
     return explicitTool
       ? [
           {
@@ -146,27 +158,40 @@ function cachedResults(target: LimitTarget, explicitTool: boolean): ToolLimitRes
             identity: target.identity,
             windows: [],
             status: "unavailable",
-            error: "cached data not available for this source (no offline cache implemented yet) — omit --cached to fetch live",
+            error: "cached data not available for this source (no snapshot recorded yet for this identity); omit --cached to fetch live",
           },
         ]
       : [];
   }
+  const record = await lookupCachedLimits(providerForTool(target.toolName), target.identity.name, cachePath);
+  if (record) return [cachedLimitsFromRecord(record, target.identity)];
   return [unavailableCached(target)];
 }
 
 /** Codex, Kimi, and zai live reads hit a real third-party backend once per
- * identity (Kimi's is one cheap GET to api.kimi.com — see kimi-limits.ts;
- * zai's is one cheap GET to api.z.ai — see zai-limits.ts) — cap concurrency
+ * identity (Kimi's is one cheap GET to api.kimi.com, see kimi-limits.ts;
+ * zai's is one cheap GET to api.z.ai, see zai-limits.ts); cap concurrency
  * as a courtesy/timeout-safety measure rather than firing every identity at
  * once, even though nothing found in investigation suggests these reads
  * consume visible rate-limit budget themselves. Claude and Grok reads have
  * no such concern (Claude's non-interactive /usage is a single
  * client-intercepted call per identity; Grok is pure local file I/O) but are
- * batched through the same pool for simplicity — the cap only meaningfully
+ * batched through the same pool for simplicity; the cap only meaningfully
  * throttles Codex, Kimi, and zai in practice. Pi and opencode fan out to one
  * backend call per provider they hold a fetchable credential for, so the
- * cap bounds them the same way. */
+ * cap bounds them the same way.
+ *
+ * Codex is the exception and gets its own smaller pool below: its read is
+ * not a bare GET but a whole `codex app-server` process spawn per identity
+ * plus that process's own TLS handshake against chatgpt.com (see
+ * codex-limits.ts). Six of those landing simultaneously (seven codex
+ * identities exist on this machine) correlated with the 2026-09-07 incident
+ * where several identities' wham/usage reads failed in one run while
+ * siblings succeeded, so codex targets run at most two at a time. The two
+ * pools run CONCURRENTLY with each other: the codex throttle must not
+ * delay the other tools' cheap reads behind its own slower ones. */
 const MAX_CONCURRENT = 6;
+const CODEX_MAX_CONCURRENT = 2;
 
 /** `onItemDone`, when given, fires with each item's ORIGINAL index (not the
  * worker loop's own claim order) right as its result lands — this is what
@@ -199,10 +224,35 @@ export async function runBatched<T, R>(
   return results;
 }
 
-function fetchTarget(target: LimitTarget, explicitTool: boolean): Promise<ToolLimitResult[]> {
+/** Runs one fetcher batch through the last-good store (limits-cache.ts):
+ * every "live" result is written through as the new snapshot for its
+ * provider+identity, and every "unavailable" result with a stored snapshot
+ * is converted into a "cached" result carrying the snapshot's windows (with
+ * their ORIGINAL capturedAt, so the report's stale rendering stays honest)
+ * plus the live fetch's own error, which report.ts renders as a dim row
+ * under the stale bars. Results of any other status pass through untouched.
+ * Exported so this conversion has direct unit coverage without a real
+ * fetcher (see test/cli/limits/collect.test.ts). */
+export async function applyLastGoodCache(results: ToolLimitResult[], cachePath?: string): Promise<ToolLimitResult[]> {
+  return Promise.all(
+    results.map(async (result) => {
+      if (result.status === "live") {
+        await recordLiveLimitsResult(result, cachePath);
+        return result;
+      }
+      if (result.status === "unavailable") {
+        const record = await lookupCachedLimits(result.provider, result.identity.name, cachePath);
+        if (record) return cachedLimitsFromRecord(record, result.identity, result.error);
+      }
+      return result;
+    }),
+  );
+}
+
+async function fetchTarget(target: LimitTarget, explicitTool: boolean, cachePath?: string): Promise<ToolLimitResult[]> {
   const fetcher = FETCHERS[target.toolName];
   if (!fetcher) {
-    return Promise.resolve([
+    return [
       {
         toolName: target.toolName,
         provider: providerForTool(target.toolName),
@@ -211,9 +261,9 @@ function fetchTarget(target: LimitTarget, explicitTool: boolean): Promise<ToolLi
         status: "unavailable",
         error: `no limits fetcher implemented for "${target.toolName}" yet`,
       },
-    ]);
+    ];
   }
-  return fetcher(target.identity, explicitTool);
+  return applyLastGoodCache(await fetcher(target.identity, explicitTool), cachePath);
 }
 
 /** Merges every source's answer for the same provider+identity into one row
@@ -267,23 +317,55 @@ export function aggregateLimitResults(results: ToolLimitResult[]): ToolLimitResu
   return [...grouped.values()];
 }
 
-/** Fetches results for an already-collected target list — split out from
+/** Partitions targets into the codex pool and the everything-else pool and
+ * runs BOTH concurrently (see the MAX_CONCURRENT comment above for why
+ * codex is throttled separately). The returned batches array is keyed by
+ * each target's ORIGINAL index, and `onItemDone` fires with that same
+ * original index, so limits/dispatch.ts's live TTY row updates and the
+ * final flat order are exactly as if one pool had run the list. Exported
+ * (with the fetcher injected) so the two-pool split has direct unit
+ * coverage without real fetchers or network (see collect.test.ts). */
+export async function runLimitPools(
+  targets: LimitTarget[],
+  fn: (target: LimitTarget) => Promise<ToolLimitResult[]>,
+  onItemDone?: (index: number, results: ToolLimitResult[]) => void,
+): Promise<ToolLimitResult[][]> {
+  const codex: Array<{ target: LimitTarget; index: number }> = [];
+  const rest: Array<{ target: LimitTarget; index: number }> = [];
+  targets.forEach((target, index) => (target.toolName === "codex" ? codex : rest).push({ target, index }));
+
+  const batches: ToolLimitResult[][] = new Array(targets.length);
+  await Promise.all([
+    runBatched(codex, CODEX_MAX_CONCURRENT, ({ target }) => fn(target), (i, batch) => {
+      batches[codex[i]!.index] = batch;
+      onItemDone?.(codex[i]!.index, batch);
+    }),
+    runBatched(rest, MAX_CONCURRENT, ({ target }) => fn(target), (i, batch) => {
+      batches[rest[i]!.index] = batch;
+      onItemDone?.(rest[i]!.index, batch);
+    }),
+  ]);
+  return batches;
+}
+
+/** Fetches results for an already-collected target list; split out from
  * runLimitsQuery so limits/dispatch.ts's live TTY render can call
  * collectLimitTargets up front (to seed pending placeholder rows before any
  * fetch has even started) and then drive this against the SAME target list,
  * with a per-item callback to update one row in place as it resolves. The
  * callback receives the target's full resolved batch (several rows for the
- * multi-provider clients). */
+ * multi-provider clients). `cachePath` overrides the last-good store's
+ * location; only tests pass it (see collect.test.ts). */
 export async function fetchLimitResults(
   targets: LimitTarget[],
   cached: boolean,
   explicitTool: boolean,
   onItemDone?: (index: number, results: ToolLimitResult[]) => void,
+  cachePath?: string,
 ): Promise<ToolLimitResult[]> {
-  const batches = await runBatched(
+  const batches = await runLimitPools(
     targets,
-    MAX_CONCURRENT,
-    async (target) => (cached ? cachedResults(target, explicitTool) : fetchTarget(target, explicitTool)),
+    (target) => (cached ? cachedResults(target, explicitTool, cachePath) : fetchTarget(target, explicitTool, cachePath)),
     onItemDone,
   );
   return aggregateLimitResults(batches.flat());
