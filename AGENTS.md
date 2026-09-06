@@ -150,9 +150,21 @@ src/
                                 identity per PROVIDER (the views are provider-first; the tool is
                                 collection provenance); identity is a positional, not --identity=
       collect.ts report.ts bar.ts watch.ts bucket.ts types.ts
+                                limits-cache.ts
                                 per-target collection (each fetcher returns ONE RESULT PER
-                                PROVIDER) + provider+identity aggregation across sources +
-                                aligned table/bar report grouped by provider + --watch loop
+                                PROVIDER; codex targets run through a dedicated pool of 2
+                                because each read spawns a codex app-server, everything else
+                                shares the global pool of 6) + provider+identity aggregation
+                                across sources + aligned table/bar report grouped by provider
+                                (rollup rows carry their basis, "week (avg of 3)", and hold as
+                                spinner rows while any target in scope is still pending) +
+                                --watch loop. limits-cache.ts is the last-good snapshot store
+                                (~/.ais/cache/limits.json, keyed provider:identity, atomic
+                                tmp+rename, mode 0600): live results write through, a failed
+                                fetch falls back to the snapshot as status "cached" with the
+                                original capturedAt (renders bars + [as of Xm ago] + the live
+                                error in a dim row), and --cached reads it with no network at
+                                all instead of reporting "no offline cache"
       pi-limits.ts opencode-limits.ts
                                 the multi-provider clients' adapters — one Pi/OpenCode identity
                                 becomes several provider rows (see "provider-first limits for
@@ -1288,8 +1300,8 @@ empirically on this machine, 2026-07-17:
   exactly 7 days out). Endpoint and response shape confirmed live against the
   real account 2026-07-17; flow cross-checked against tokscale's kimi quota
   fetcher (`crates/tokscale-cli/src/commands/usage/kimi.rs`). Under
-  `--cached`, kimi reports "not available" like claude/codex (no offline
-  cache).
+  `--cached`, kimi reads the shared last-good store like every other
+  provider (see limits-cache.ts in the module map).
 - **tokscale/`ais usage`**: kimi works exactly like codex/grok — tokscale's
   kimi client (client id `kimi`, confirmed in tokscale's README `--client`
   list and its sessions scanner, 2026-07-17) reads `KIMI_CODE_HOME` and scans
