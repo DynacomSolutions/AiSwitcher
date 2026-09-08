@@ -27,6 +27,32 @@ export const MANAGED_NPM_PREFIX = dirname(MANAGED_REAL_BIN_DIR);
 const SHIM_DIR = process.env.AI_PROFILE_SWITCHER_SHIM_DIR ?? join(homedir(), ".local", "bin");
 export const GROK_INSTALLER_URL = "https://x.ai/cli/install.sh";
 
+export class UpgradeCancelledError extends Error {
+  readonly exitCode: number;
+
+  constructor(exitCode: number) {
+    super(`upgrade cancelled (exit code ${exitCode})`);
+    this.name = "UpgradeCancelledError";
+    this.exitCode = exitCode;
+  }
+}
+
+const CANCELLATION_EXIT_CODES = new Set([129, 130, 131, 143]);
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org/";
+const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+async function awaitUpgradeStep<T>(promise: Promise<T>, label: string, log: (message: string) => void): Promise<T> {
+  const heartbeat = setInterval(() => log(`ais upgrade: still working on ${label}...`), HEARTBEAT_INTERVAL_MS);
+  try {
+    const result = await promise;
+    if (typeof result === "number" && CANCELLATION_EXIT_CODES.has(result)) throw new UpgradeCancelledError(result);
+    return result;
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
 interface UpgradeSpec {
   cfg: ToolConfig;
   npmPackage?: string;
@@ -104,7 +130,58 @@ export interface UpgradeDeps {
   managedBinaryExists(binaryName: string): Promise<boolean>;
   prepareManagedPrefix(): Promise<void>;
   installGrok(): Promise<number>;
+  latestNpmVersion?(npm: string, packageName: string): Promise<string | undefined>;
+  managedNpmVersion?(packageName: string): Promise<string | undefined>;
   log(message: string): void;
+}
+
+export interface NpmVersionResolverDeps {
+  capture(command: string, args: string[]): Promise<BoundedSpawnResult>;
+  fetch(url: string): Promise<{ ok: boolean; json(): Promise<unknown> }>;
+}
+
+function cancellationFor(exitCode: number): UpgradeCancelledError | undefined {
+  return CANCELLATION_EXIT_CODES.has(exitCode) ? new UpgradeCancelledError(exitCode) : undefined;
+}
+
+function isRegistryUnset(value: string): boolean {
+  return /^(undefined|null)?$/i.test(value.trim());
+}
+
+function isPublicNpmRegistry(value: string): boolean {
+  return `${value.trim().replace(/\/+$/, "")}/` === PUBLIC_NPM_REGISTRY;
+}
+
+/** Resolve an exact release only when npm is configured for the public registry. */
+export async function resolvePublicNpmLatestVersion(
+  npm: string,
+  packageName: string,
+  deps: NpmVersionResolverDeps,
+): Promise<string | undefined> {
+  const scope = packageName.startsWith("@") ? packageName.split("/")[0] : undefined;
+  let probe = await deps.capture(npm, ["config", "get", scope ? `${scope}:registry` : "registry"]);
+  const cancelled = cancellationFor(probe.exitCode);
+  if (cancelled) throw cancelled;
+
+  if (scope && probe.exitCode === 0 && isRegistryUnset(probe.stdout)) {
+    probe = await deps.capture(npm, ["config", "get", "registry"]);
+    const fallbackCancelled = cancellationFor(probe.exitCode);
+    if (fallbackCancelled) throw fallbackCancelled;
+  }
+  if (probe.exitCode !== 0 || probe.timedOut || !isPublicNpmRegistry(probe.stdout)) return undefined;
+
+  try {
+    const response = await deps.fetch(
+      `${PUBLIC_NPM_REGISTRY}${encodeURIComponent(packageName).replace("%40", "@").replaceAll("%2F", "%2f")}/latest`,
+    );
+    if (!response.ok) return undefined;
+    const metadata = (await response.json()) as { name?: unknown; version?: unknown };
+    return metadata.name === packageName && typeof metadata.version === "string" && SEMVER_PATTERN.test(metadata.version)
+      ? metadata.version
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface UpgradeSummary {
@@ -153,7 +230,7 @@ function sharedInstallerKey(spec: UpgradeSpec): string | undefined {
 }
 
 async function defaultInstallGrok(): Promise<number> {
-  const response = await fetch(GROK_INSTALLER_URL);
+  const response = await fetch(GROK_INSTALLER_URL, { signal: AbortSignal.timeout(60_000) });
   if (!response.ok) {
     throw new Error(`Grok installer download failed: HTTP ${response.status} (${GROK_INSTALLER_URL})`);
   }
@@ -188,6 +265,24 @@ function defaultDeps(): UpgradeDeps {
       await mkdir(MANAGED_NPM_PREFIX, { recursive: true });
     },
     installGrok: defaultInstallGrok,
+    latestNpmVersion: async (npm, packageName) =>
+      await resolvePublicNpmLatestVersion(npm, packageName, {
+        capture: async (command, args) => await spawnCapturedBounded(command, args, {}, 10_000),
+        fetch: async (url) => await fetch(url, { signal: AbortSignal.timeout(15_000) }),
+      }),
+    managedNpmVersion: async (packageName) => {
+      try {
+        const manifest = (await Bun.file(join(MANAGED_NPM_PREFIX, "lib", "node_modules", packageName, "package.json")).json()) as {
+          name?: unknown;
+          version?: unknown;
+        };
+        return manifest.name === packageName && typeof manifest.version === "string" && SEMVER_PATTERN.test(manifest.version)
+          ? manifest.version
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    },
     log: console.log,
   };
 }
@@ -228,10 +323,13 @@ async function runNativeFallback(spec: UpgradeSpec, deps: UpgradeDeps, prefix: s
 
   const updateArgs = spec.nativeUpdateArgs!;
   deps.log(`${prefix} running fallback ${cyan(`${spec.cfg.realBinaryName} ${updateArgs.join(" ")}`)} (${realBinary})`);
-  return (await deps.spawn(realBinary, updateArgs)) === 0;
+  return (await awaitUpgradeStep(deps.spawn(realBinary, updateArgs), `${spec.cfg.toolName} native updater`, deps.log)) === 0;
 }
 
 async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: string): Promise<boolean> {
+  if (!spec.npmPackage) {
+    throw new Error(`${spec.cfg.toolName} has no npm package`);
+  }
   const npm = deps.which("npm");
   if (!npm) {
     deps.log(`${prefix} ${yellow("npm is unavailable; trying the installed CLI's native updater")}`);
@@ -239,19 +337,55 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
   }
 
   await deps.prepareManagedPrefix();
-  const packageSpec = `${spec.npmPackage}@latest`;
+  const npmPackage = spec.npmPackage;
+  let version: string | undefined;
+  if (deps.latestNpmVersion) {
+    try {
+      version = await awaitUpgradeStep(
+        deps.latestNpmVersion(npm, npmPackage),
+        `${spec.cfg.toolName} npm version lookup`,
+        deps.log,
+      );
+    } catch (err) {
+      if (err instanceof UpgradeCancelledError) throw err;
+      deps.log(`${prefix} latest ${npmPackage} lookup failed; using npm @latest (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+  const resolvedPackageSpec = `${npmPackage}@${version ?? "latest"}`;
+  if (version && deps.managedNpmVersion && (await deps.managedNpmVersion(npmPackage)) === version) {
+    try {
+      const probe = await deps.capture(join(MANAGED_REAL_BIN_DIR, spec.cfg.realBinaryName), ["--version"]);
+      const cancelled = cancellationFor(probe.exitCode);
+      if (cancelled) throw cancelled;
+      if (!probe.timedOut && probe.exitCode === 0) {
+        deps.log(`${prefix} ${spec.cfg.toolName} ${version} already up to date`);
+        return true;
+      }
+    } catch (err) {
+      if (err instanceof UpgradeCancelledError) throw err;
+    }
+  }
   const args = [
     "install",
     "--global",
     "--prefix",
     MANAGED_NPM_PREFIX,
+    "--foreground-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--loglevel=http",
+    "--fetch-timeout=300000",
+    "--fetch-retries=1",
+    "--fetch-retry-mintimeout=1000",
+    "--fetch-retry-maxtimeout=5000",
+    ...(version ? ["--prefer-online"] : []),
     ...(spec.allowedScriptPackages?.length
       ? [`--allow-scripts=${spec.allowedScriptPackages.join(",")}`]
       : []),
-    packageSpec,
+    resolvedPackageSpec,
   ];
-  deps.log(`${prefix} installing/upgrading ${cyan(packageSpec)} in ${MANAGED_NPM_PREFIX}`);
-  const exitCode = await deps.spawn(npm, args);
+  deps.log(`${prefix} installing/upgrading ${cyan(resolvedPackageSpec)} in ${MANAGED_NPM_PREFIX}`);
+  const exitCode = await awaitUpgradeStep(deps.spawn(npm, args), `${spec.cfg.toolName} npm installer`, deps.log);
   const managedBinary = join(MANAGED_REAL_BIN_DIR, spec.cfg.realBinaryName);
   if (exitCode === 0 && (await deps.managedBinaryExists(spec.cfg.realBinaryName))) {
     const probe = await deps.capture(managedBinary, ["--version"]);
@@ -261,8 +395,8 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
   deps.log(
     `${prefix} ${yellow(
       exitCode === 0
-        ? `${packageSpec} finished but did not provide a runnable ${spec.cfg.realBinaryName}; trying the native updater`
-        : `${packageSpec} exited with code ${exitCode}; trying the native updater`,
+        ? `${resolvedPackageSpec} finished but did not provide a runnable ${spec.cfg.realBinaryName}; trying the native updater`
+        : `${resolvedPackageSpec} exited with code ${exitCode}; trying the native updater`,
     )}`,
   );
   return await runNativeFallback(spec, deps, prefix);
@@ -273,13 +407,13 @@ async function installOrUpgradeGrok(spec: UpgradeSpec, deps: UpgradeDeps, prefix
   if (realBinary && (await supportsNativeUpdater(spec, realBinary, deps))) {
     const updateArgs = spec.nativeUpdateArgs!;
     deps.log(`${prefix} running ${cyan(`grok ${updateArgs.join(" ")}`)} (${realBinary})`);
-    if ((await deps.spawn(realBinary, updateArgs)) === 0) return true;
+    if ((await awaitUpgradeStep(deps.spawn(realBinary, updateArgs), "grok native updater", deps.log)) === 0) return true;
     deps.log(`${prefix} ${yellow("Grok's native updater failed; reinstalling with xAI's installer")}`);
   } else {
     deps.log(`${prefix} Grok is missing or is not xAI's Grok Build CLI; installing the latest xAI release`);
   }
 
-  const exitCode = await deps.installGrok();
+  const exitCode = await awaitUpgradeStep(deps.installGrok(), "grok installer", deps.log);
   if (exitCode !== 0) return false;
   const installedBinary = tryResolve(spec, deps);
   return installedBinary !== undefined && (await supportsNativeUpdater(spec, installedBinary, deps));
@@ -327,6 +461,7 @@ export async function runUpgradeWithDeps(
         deps.log(`${prefix} ${red(`${name} install/upgrade failed`)}`);
       }
     } catch (err) {
+      if (err instanceof UpgradeCancelledError) throw err;
       summary.failed++;
       const message = err instanceof Error ? err.message : String(err);
       if (installerKey) {
@@ -341,7 +476,17 @@ export async function runUpgradeWithDeps(
 
 export async function runUpgrade(): Promise<void> {
   const prefix = dim("ais upgrade:");
-  const summary = await runUpgradeWithDeps(defaultDeps());
+  let summary: UpgradeSummary;
+  try {
+    summary = await runUpgradeWithDeps(defaultDeps());
+  } catch (err) {
+    if (err instanceof UpgradeCancelledError) {
+      console.error(`${prefix} ${yellow("cancelled")}`);
+      process.exitCode = err.exitCode;
+      return;
+    }
+    throw err;
+  }
 
   if (summary.failed > 0) {
     console.log(

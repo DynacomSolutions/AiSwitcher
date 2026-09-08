@@ -720,7 +720,12 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   satisfied with narrow per-tool allowlists (Claude's own package; Kimi plus
   `node-pty`; Crush's own package), never
   `--dangerously-allow-all-scripts`. This is distinct from `ais update`, which
-  only refreshes this project's shim binaries.
+  only refreshes this project's shim binaries. For the public npm registry,
+  `upgrade.ts` resolves the small `/latest` manifest, pins npm to that exact
+  version with `--prefer-online` so stale npm metadata is revalidated, and
+  avoids reinstalling only when the package manifest and managed binary's
+  `--version` probe agree. A custom
+  scoped or default npm registry never triggers a public-registry lookup.
 
 - **`~/.ais` is the one consolidated root for every directory this project's
   own tooling creates and manages — not `~/.local/bin` (the shims
