@@ -111,8 +111,12 @@ as live. Alibaba's Token plan has no API-key quota endpoint, so ali reads the
 same live windows through its OneConsole gateway with the valid console Cookie
 header stored in that identity's console-cookie.txt. "identity" is a
 positional (e.g. "ais limits identity-a"), not
---identity=. --cached skips every live call (claude/codex/kimi/zai report
-"not available" without one; grok is unaffected since it never makes a live
+--identity=. Every successful live read is also written to a last-good
+snapshot store (~/.ais/cache/limits.json), so when a live fetch fails the
+report shows the last known windows flagged "as of <time> ago" with the
+fetch error underneath, instead of a bare error row. --cached skips every
+live call and renders ONLY that store (a provider+identity with no snapshot
+yet reports "not available"; grok is unaffected since it never makes a live
 call anyway). --watch redraws in place on an interval (--interval=<seconds>,
 default 30) instead of printing once; degrades to a single plain run if
 stdout isn't a TTY.

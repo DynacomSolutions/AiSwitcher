@@ -101,4 +101,34 @@ describe("console files endpoints", () => {
     expect(result.binary).toBe(true);
     expect(result.content).toBe("");
   });
+
+  /** Regression for the 2026-09 live junk: `personal.lock/` and
+   * `phoenix-court-group.lock/` sat under ~/.claude/identities (claude's own
+   * config-lock leftovers) and a consumer that enumerated the root treated
+   * them as identities. The identities-root listing is the one place
+   * subdirectory names are identity candidates, so it filters through
+   * isIdentityDirName; every other listing shows real contents. */
+  test("hides lock dirs and non-identity names only at a container's identities root", async () => {
+    const home = await makeRoot();
+    const identitiesDir = join(home, ".claude", "identities");
+    await mkdir(join(identitiesDir, "personal"), { recursive: true });
+    await mkdir(join(identitiesDir, "personal.lock"), { recursive: true });
+    await mkdir(join(identitiesDir, "Bad Name"), { recursive: true });
+    // A marker inside the real identity whose own name would fail the
+    // grammar: nested listings must NOT be filtered.
+    await mkdir(join(identitiesDir, "personal", "inner.lock"), { recursive: true });
+    // Files are never identity candidates; they must pass through untouched.
+    await writeFile(join(identitiesDir, "notes.md"), "hi");
+    const { tree } = await import("../../src/server/files.ts");
+
+    const rootListing = await tree("claude", "identities", [], home);
+    const names = rootListing.entries.map((e) => e.name);
+    expect(names).toContain("personal");
+    expect(names).toContain("notes.md");
+    expect(names).not.toContain("personal.lock");
+    expect(names).not.toContain("Bad Name");
+
+    const nested = await tree("claude", "identities/personal", [], home);
+    expect(nested.entries.map((e) => e.name)).toContain("inner.lock");
+  });
 });

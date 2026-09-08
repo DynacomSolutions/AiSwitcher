@@ -92,19 +92,24 @@ export interface ToolLimitResult {
   provider: string;
   identity: Identity;  windows: LimitWindow[];
   status: LimitFetchStatus;
-  /** Human-readable reason when status is "unavailable" (not authenticated,
-   * binary missing, RPC error, ...) — always set together with an empty
-   * `windows` array. */
+  /** Human-readable failure reason. On "unavailable" it is the whole story
+   * (not authenticated, binary missing, RPC error, ...) and `windows` is
+   * always empty. A "cached" result can ALSO carry one: collect.ts's
+   * last-good fallback preserves the live fetch's error alongside the
+   * snapshot's windows, so the report can show the failure next to the
+   * stale bars (see limits-cache.ts and report.ts's cached-error row). */
   error?: string;
   /** ISO timestamp of when this snapshot was actually captured — "now" for a
    * live fetch, the source data's own timestamp for a cached/log-scraped one. */
   capturedAt?: string;
-  /** See OverageInfo. Absent whenever the tool has no overage concept, or a
-   * live fetch didn't happen (pending/unavailable/cached results never set
-   * this). */
+  /** See OverageInfo. Absent whenever the tool has no overage concept, or no
+   * live read ever produced one (pending/unavailable results never set
+   * this; a cached result only carries the overage its stored live snapshot
+   * had). */
   overage?: OverageInfo;
-  /** See ManualResetInfo. Present only when the provider reports at least
-   * one usable manual reset right now. */
+  /** See ManualResetInfo. Present only when the provider reported at least
+   * one usable manual reset at capture time (cached results carry the
+   * stored snapshot's grant, which may since have been spent or expired). */
   manualReset?: ManualResetInfo;
 }
 

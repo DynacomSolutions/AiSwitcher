@@ -1,20 +1,23 @@
 /** Shared resilient fetch for the limits adapters' live API reads.
  *
- * These are ONE cheap GET per (identity, provider) — but the machine's
+ * These are ONE cheap GET per (identity, provider), but the machine's
  * external connectivity blips under report load (observed live 2026-09-03:
  * Kimi's usages endpoint answered a bare curl in 518ms, then timed out at
  * 10s twice inside a full report; the same run showed chatgpt.com
  * unreachable for codex; bare curl afterwards showed a ~400ms baseline with
- * multi-second spikes). A single short timeout turns every blip into an
- * error row, and the user has been explicit that transient failures must
- * not become rows. So: a GENEROUS per-attempt timeout (30s — these
- * endpoints answer in well under a second when healthy) and retries with
- * BACKOFF (3s, 8s — an immediate retry hits the same spike). HTTP error
- * STATUSES are never retried — auth failures and rate limits mean exactly
- * what they say. */
+ * multi-second spikes; observed again 2026-09-07 when several codex
+ * identities' wham/usage reads failed in one run while siblings succeeded).
+ * A single short timeout turns every blip into an error row, and the user
+ * has been explicit that transient failures must not become rows. So: a
+ * GENEROUS per-attempt timeout (30s; these endpoints answer in well under
+ * a second when healthy) and retries with BACKOFF (3s, 8s, 20s, 45s; an
+ * immediate retry hits the same spike, and the longer tail covers the
+ * multi-second degradation of the later incidents). HTTP error STATUSES
+ * are never retried: auth failures and rate limits mean exactly what they
+ * say. */
 
 const FETCH_TIMEOUT_MS = 30_000;
-const RETRY_PAUSES_MS = [3_000, 8_000];
+const RETRY_PAUSES_MS = [3_000, 8_000, 20_000, 45_000];
 
 /** Performs the request with a per-attempt timeout, retrying only when the
  * fetch itself throws (timeout, connection reset, DNS failure). The final

@@ -45,6 +45,15 @@ describe("createIdentity", () => {
     ).toThrow(CliUsageError);
   });
 
+  /** Regression for the 2026-09 live junk: claude leaves `<name>.lock/`
+   * siblings under its identities root, and a `.lock` name must never be
+   * registrable as an identity (it fails the name grammar outright). */
+  test("rejects a .lock name outright", () => {
+    expect(() =>
+      createIdentity(baseFile(), { name: "personal.lock", label: "Lock leftover", configDir: "/tmp/x" }),
+    ).toThrow(CliUsageError);
+  });
+
   test("rejects a name that collides with an existing name or alias", () => {
     expect(() => createIdentity(baseFile(), { name: "work", label: "Work 2", configDir: "/tmp/x" })).toThrow(
       CliUsageError,

@@ -150,9 +150,21 @@ src/
                                 identity per PROVIDER (the views are provider-first; the tool is
                                 collection provenance); identity is a positional, not --identity=
       collect.ts report.ts bar.ts watch.ts bucket.ts types.ts
+                                limits-cache.ts
                                 per-target collection (each fetcher returns ONE RESULT PER
-                                PROVIDER) + provider+identity aggregation across sources +
-                                aligned table/bar report grouped by provider + --watch loop
+                                PROVIDER; codex targets run through a dedicated pool of 2
+                                because each read spawns a codex app-server, everything else
+                                shares the global pool of 6) + provider+identity aggregation
+                                across sources + aligned table/bar report grouped by provider
+                                (rollup rows carry their basis, "week (avg of 3)", and hold as
+                                spinner rows while any target in scope is still pending) +
+                                --watch loop. limits-cache.ts is the last-good snapshot store
+                                (~/.ais/cache/limits.json, keyed provider:identity, atomic
+                                tmp+rename, mode 0600): live results write through, a failed
+                                fetch falls back to the snapshot as status "cached" with the
+                                original capturedAt (renders bars + [as of Xm ago] + the live
+                                error in a dim row), and --cached reads it with no network at
+                                all instead of reporting "no offline cache"
       pi-limits.ts opencode-limits.ts
                                 the multi-provider clients' adapters — one Pi/OpenCode identity
                                 becomes several provider rows (see "provider-first limits for
@@ -166,7 +178,13 @@ src/
                                 fetch (GET api.kimi.com/coding/v1/usages with the OAuth token
                                 from credentials/kimi-code.json, refreshing expired tokens via
                                 auth.kimi.com), unlike grok's log-scrape — see the kimi case
-                                study. zai-limits.ts is also a genuinely live fetch (GET
+                                study. claude-limits.ts is live too and STRICTLY read-only:
+                                GET api.anthropic.com/api/oauth/usage with the access token
+                                from that identity's .credentials.json, never spawning claude
+                                and never refreshing (401/403 are terminal; a second writer
+                                racing Anthropic's rotating refresh tokens wiped all three
+                                identities' credentials live 2026-09); see the anthropic
+                                case study below. zai-limits.ts is also a genuinely live fetch (GET
                                 api.z.ai/api/monitor/usage/quota/limit with the static key from
                                 that identity's own crush.json — no OAuth/refresh needed,
                                 unlike kimi) — see the 2026-07-18 zai/Crush addendum.
@@ -1287,8 +1305,8 @@ empirically on this machine, 2026-07-17:
   exactly 7 days out). Endpoint and response shape confirmed live against the
   real account 2026-07-17; flow cross-checked against tokscale's kimi quota
   fetcher (`crates/tokscale-cli/src/commands/usage/kimi.rs`). Under
-  `--cached`, kimi reports "not available" like claude/codex (no offline
-  cache).
+  `--cached`, kimi reads the shared last-good store like every other
+  provider (see limits-cache.ts in the module map).
 - **tokscale/`ais usage`**: kimi works exactly like codex/grok — tokscale's
   kimi client (client id `kimi`, confirmed in tokscale's README `--client`
   list and its sessions scanner, 2026-07-17) reads `KIMI_CODE_HOME` and scans
@@ -2410,6 +2428,22 @@ What the rule means in practice, now enforced in both pipelines:
   a fork. The same law will need the same treatment for the other OAuth
   providers pi holds copies of (anthropic, openai-codex, xai) — kimi is
   where rotation made the race an everyday failure, so it went first.
+- **AIS never spawns claude against a live identity config dir (the
+  anthropic rotation race, 2026-09).** Anthropic rotates the OAuth refresh
+  token on every refresh, the same law as kimi, and Claude Code answers a
+  lost race far more harshly than an HTTP 400: the root k3s AIS web pod
+  ran as a second writer against the same home, its losing refresh met
+  invalid_grant, and all three identities' `.credentials.json` ended up
+  with both token fields as empty strings and `expiresAt: 0` while every
+  other field (refreshTokenExpiresAt included) survived. That wipe
+  signature is how the state is recognised. The invariant: claude limits
+  are probed read-only via GET api.anthropic.com/api/oauth/usage with the
+  access token from the identity's own `.credentials.json`; the fetcher
+  never spawns claude, never refreshes, and treats 401/403 as terminal
+  (its remedy messages point at an interactive `claude` run or
+  `claude auth login` under the affected identity). `ais doctor`
+  recognises the wiped state from the same credential read and reports it
+  instead of probing.
 - **No tool-shaped placeholder rows exist for the multi-provider clients.**
   Neither a pending seed (the provider isn't known until the adapter reads
   the identity's own auth store — a placeholder would render a fake

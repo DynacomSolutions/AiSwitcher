@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { ToolConfig } from "../identities/types.ts";
+import { isIdentityDirName } from "../identities/match.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../shared/reproducible-paths.ts";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { aisHome } from "../shared/ais-home.ts";
@@ -22,13 +23,19 @@ interface RootDef {
   id: string;
   label: string;
   base: string;
+  /** Set on the six tool-home container roots (~/.claude, ~/.codex, ...):
+   * their `identities/` subdirectory is the one listing whose entries are
+   * identity candidates, so tree() filters it through isIdentityDirName. */
+  toolContainer?: true;
 }
 
 /** Same test-injection convention as registries.ts/collectLimitTargets:
  * defaults to the real TOOL_CONFIGS; tests pass synthetic registries under a
- * temp dir so these endpoints can never touch the live home. */
-async function collectRoots(configs: ToolConfig[]): Promise<RootDef[]> {
-  const home = homedir();
+ * temp dir so these endpoints can never touch the live home. `home` is the
+ * same kind of seam for the tool-container roots (~/.claude etc.): tests
+ * point it at a temp home so the identities-root listing filter can be
+ * exercised without the real one. */
+async function collectRoots(configs: ToolConfig[], home: string = homedir()): Promise<RootDef[]> {
   const roots: RootDef[] = [{ id: "ais", label: "~/.ais (shared)", base: aisHome() }];
   const containers: Array<[string, string]> = [
     ["claude", ".claude"],
@@ -39,7 +46,7 @@ async function collectRoots(configs: ToolConfig[]): Promise<RootDef[]> {
     ["ali", ".ali"],
   ];
   for (const [id, rel] of containers) {
-    roots.push({ id, label: `~/${rel}`, base: join(home, rel) });
+    roots.push({ id, label: `~/${rel}`, base: join(home, rel), toolContainer: true });
   }
   try {
     const loaded = await loadAll(configs);
@@ -58,9 +65,8 @@ async function collectRoots(configs: ToolConfig[]): Promise<RootDef[]> {
   return roots;
 }
 
-export async function listRoots(configs: ToolConfig[] = Object.values(TOOL_CONFIGS)): Promise<FileRootDto[]> {
-  const roots = await collectRoots(configs);
-  const home = homedir();
+export async function listRoots(configs: ToolConfig[] = Object.values(TOOL_CONFIGS), home: string = homedir()): Promise<FileRootDto[]> {
+  const roots = await collectRoots(configs, home);
   return Promise.all(
     roots.map(async (root) => ({
       root: root.id,
@@ -74,8 +80,8 @@ export async function listRoots(configs: ToolConfig[] = Object.values(TOOL_CONFI
   );
 }
 
-async function requireRoot(rootId: string, configs: ToolConfig[]): Promise<RootDef> {
-  const root = (await collectRoots(configs)).find((r) => r.id === rootId);
+async function requireRoot(rootId: string, configs: ToolConfig[], home: string = homedir()): Promise<RootDef> {
+  const root = (await collectRoots(configs, home)).find((r) => r.id === rootId);
   if (!root) throw new HttpError(404, `unknown file root "${rootId}"`);
   return root;
 }
@@ -83,8 +89,10 @@ async function requireRoot(rootId: string, configs: ToolConfig[]): Promise<RootD
 /** The core traversal guard. Returns the absolute real path of `relPath`
  * inside `root`, or throws. Two checks on purpose: the lexical resolution
  * catches ../ walks before touching disk; the realpath check catches a
- * symlink INSIDE the tree pointing OUTSIDE it. */
-async function safeResolve(base: string, relPath: string | undefined): Promise<{ abs: string; real: string }> {
+ * symlink INSIDE the tree pointing OUTSIDE it. `rootReal` (the base's own
+ * realpath) comes along so callers can tell where inside the root they
+ * landed (tree() uses it to recognise an identities-root listing). */
+async function safeResolve(base: string, relPath: string | undefined): Promise<{ abs: string; real: string; rootReal: string }> {
   const rootReal = await realpath(base);
   // Deliberately NOT expandPath(): that helper resolves bare relative paths
   // against process.cwd() (registry-storage semantics). Here a relative path
@@ -103,21 +111,34 @@ async function safeResolve(base: string, relPath: string | undefined): Promise<{
   if (relative(rootReal, real).startsWith("..")) {
     throw new HttpError(403, "symlink escapes the whitelisted root");
   }
-  return { abs, real };
+  return { abs, real, rootReal };
 }
 
-export async function tree(rootId: string, relPath: string | undefined, configs: ToolConfig[] = Object.values(TOOL_CONFIGS)): Promise<FileTreeDto> {
-  const root = await requireRoot(rootId, configs);
-  const { abs, real } = await safeResolve(root.base, relPath);
+export async function tree(
+  rootId: string,
+  relPath: string | undefined,
+  configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
+  home: string = homedir(),
+): Promise<FileTreeDto> {
+  const root = await requireRoot(rootId, configs, home);
+  const { abs, real, rootReal } = await safeResolve(root.base, relPath);
   let dirents;
   try {
     dirents = await readdir(real, { withFileTypes: true });
   } catch (err) {
     throw new HttpError(404, err instanceof Error ? err.message : "cannot read directory");
   }
+  // The identities-root listing is the one place subdirectory names are
+  // identity candidates: junk lock dirs (claude leaves `<name>.lock/`
+  // siblings behind when locking its config; provisioned junk from exactly
+  // such dirs was found live 2026-09) and anything failing the identity-key
+  // grammar are hidden here rather than presented as if they were
+  // identities. Every other listing shows real directory contents.
+  const listingIdentitiesRoot = root.toolContainer === true && relative(rootReal, real) === "identities";
   const entries = await Promise.all(
     dirents
       .filter((d) => !(d.isDirectory() && (REPRODUCIBLE_JUNK_DIR_NAMES as readonly string[]).includes(d.name)))
+      .filter((d) => !(d.isDirectory() && listingIdentitiesRoot && !isIdentityDirName(d.name)))
       .map(async (d) => {
         const childAbs = join(abs, d.name);
         try {
@@ -134,7 +155,7 @@ export async function tree(rootId: string, relPath: string | undefined, configs:
       }),
   );
   entries.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "directory" ? -1 : 1));
-  return { path: abs.replace(homedir(), "~"), entries };
+  return { path: abs.replace(home, "~"), entries };
 }
 
 function looksBinary(bytes: Uint8Array): boolean {

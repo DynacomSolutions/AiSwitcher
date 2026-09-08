@@ -39,8 +39,11 @@ function identityCount(n: number): string {
  * the group being rolled up — an identity contributing two "week" windows,
  * e.g. Claude's "week (all)" and "week (Fable)", counts as two data points,
  * not one). Only categories with at least one real data point are included
- * — never a fabricated zero row for a category nothing reported. */
-export function aggregateAverage(results: ToolLimitResult[]): Array<{ category: LimitCategory; usedPercent: number }> {
+ * — never a fabricated zero row for a category nothing reported. The
+ * contributing window count rides along so the rollup label can state its
+ * basis ("week (avg of 3)"): a bare average over silently-skipped
+ * failed siblings reads as if it described the whole group. */
+export function aggregateAverage(results: ToolLimitResult[]): Array<{ category: LimitCategory; usedPercent: number; count: number }> {
   const totals = new Map<LimitCategory, { sum: number; count: number }>();
   for (const r of results) {
     for (const w of r.windows) {
@@ -52,20 +55,36 @@ export function aggregateAverage(results: ToolLimitResult[]): Array<{ category: 
   }
   return CATEGORY_ORDER.filter((c) => totals.has(c)).map((category) => {
     const { sum, count } = totals.get(category)!;
-    return { category, usedPercent: sum / count };
+    return { category, usedPercent: sum / count, count };
   });
 }
 
-function buildTotalRows(results: ToolLimitResult[]): Row[] {
-  return aggregateAverage(results).map(({ category, usedPercent }) => ({ indent: "", label: pluralizeCategory(category), usedPercent }));
-}
-
-function buildAggregateRows(results: ToolLimitResult[]): Row[] {
-  return aggregateAverage(results).map(({ category, usedPercent }) => ({
-    indent: AGGREGATE_INDENT,
-    label: pluralizeCategory(category),
+/** Rollup rows for one result set (the TOTAL across everything, or one
+ * provider's section). While ANY member of the set is still pending the
+ * whole rollup holds as a spinner row (same style as an identity's own
+ * pending row) instead of averaging whatever has resolved so far: a partial
+ * frame can put an impossible-looking number above its own children (a
+ * "week 100%" total over a 22% sibling that is still loading), and the user
+ * has been explicit that transient states must not produce misleading rows.
+ * Once every member has resolved, each average's label states how many
+ * windows actually feed it. */
+function buildRollupRows(results: ToolLimitResult[], indent: string, spinnerFrame: string): Row[] {
+  if (results.some((r) => r.status === "pending")) {
+    return [{ indent, label: "", plain: `${spinnerFrame} loading…` }];
+  }
+  return aggregateAverage(results).map(({ category, usedPercent, count }) => ({
+    indent,
+    label: `${pluralizeCategory(category)} (avg of ${count})`,
     usedPercent,
   }));
+}
+
+function buildTotalRows(results: ToolLimitResult[], spinnerFrame: string): Row[] {
+  return buildRollupRows(results, "", spinnerFrame);
+}
+
+function buildAggregateRows(results: ToolLimitResult[], spinnerFrame: string): Row[] {
+  return buildRollupRows(results, AGGREGATE_INDENT, spinnerFrame);
 }
 
 function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, spinnerFrame: string): { branch: string; rows: Row[] } {
@@ -91,12 +110,20 @@ function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, spinnerFra
   // A manually-spendable reset (e.g. codex's "Full reset (Weekly + 5 hr)"
   // grants) is account-level, not a property of any one window, so it gets
   // its own dim row under the identity branch instead of being glued onto a
-  // window's extras. Only ever set on live results alongside real windows.
+  // window's extras. Only ever set alongside real windows, whether live or
+  // cached from the last-good store (limits-cache.ts preserves it).
   if (result.manualReset && result.manualReset.availableCount > 0) {
     const reset = result.manualReset;
     const noun = reset.availableCount > 1 ? `manual resets available ×${reset.availableCount}` : "manual reset available";
     const text = [noun, reset.label].filter(Boolean).join(": ") + (reset.expiresAt ? ` (expires ${reset.expiresAt})` : "");
     rows.push({ indent: continuation, label: "", plain: text });
+  }
+  // A cached result can still carry the live fetch's error (the last-good
+  // snapshot above is being shown BECAUSE the live read failed): keep that
+  // failure visible as a dim row under the stale bars rather than letting
+  // the cached data read as a healthy live answer.
+  if (result.status === "cached" && result.error) {
+    rows.push({ indent: continuation, label: "", plain: result.error });
   }
   return { branch, rows };
 }
@@ -141,16 +168,16 @@ export function formatLimitsReport(results: ToolLimitResult[], now: Date = new D
     groups.set(provider, list);
   }
 
-  // Aggregate/TOTAL rows are computed from whatever's resolved so far — a
-  // "pending" result's windows are always [], so it naturally contributes
-  // nothing yet. In live mode (see limits/dispatch.ts) this means the
-  // rollups fill in progressively as identities resolve, same as the
-  // per-identity rows below, rather than staying blank until every target
-  // is done.
-  const totalRows = buildTotalRows(results);
+  // Rollup rows hold as a spinner while ANY member of their set is still
+  // pending (see buildRollupRows): in live mode (see limits/dispatch.ts)
+  // frames re-render as identities resolve, and a rollup computed from
+  // whatever happened to be done could sit above a contradicting child
+  // (a "week 100%" total over a 22% sibling still loading). Once the set
+  // is fully resolved the averages appear, labelled with their basis.
+  const totalRows = buildTotalRows(results, spinnerFrame);
   const sections = Array.from(groups.entries()).map(([provider, group]) => ({
     header: `${bold(usageProviderLabel(provider))} ${dim(`(${identityCount(group.length)})`)}`,
-    aggregateRows: buildAggregateRows(group),
+    aggregateRows: buildAggregateRows(group, spinnerFrame),
     identityBlocks: group.map((r, i) => buildIdentityBlock(r, i === group.length - 1, spinnerFrame)),
   }));
 

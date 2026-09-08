@@ -389,16 +389,23 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
  * this machine blips under report load (observed live 2026-09-03: "error
  * sending request for url" on 3 of 4 identities in one run, all four fine
  * minutes later; observed again 2026-09-04, harder: hangs that exhausted
- * the handshake ceiling and app-server processes dying mid-handshake —
- * "closed its output before responding" — before recovering). When an
- * attempt ends in one of those TRANSIENT signatures, retry up to twice
- * with backoff (3s, 8s) before reporting — the backoff rides out the load
- * spike an immediate retry would hit. Deliberately NOT retried: the auth
+ * the handshake ceiling and app-server processes dying mid-handshake,
+ * "closed its output before responding", before recovering; observed again
+ * 2026-09-07 across several codex identities at once, wham/usage failing
+ * repeatedly for some while siblings in the same run succeeded, under the
+ * then 6-way parallel spawn that collect.ts has since throttled to 2). When
+ * an attempt ends in one of those TRANSIENT signatures, retry with backoff
+ * (3s, 8s, 20s, 45s; five attempts in total) before reporting: the backoff
+ * rides out the load spike an immediate retry would hit, and the longer
+ * tail covers the multi-second degradation the later incidents showed. Even
+ * when every attempt fails the user still sees the last known windows via
+ * the last-good store (limits-cache.ts); this retry policy is about giving
+ * the live read its best chance first. Deliberately NOT retried: the auth
  * gate and codex's semantic "no rate-limit data" answers, which mean
  * exactly what they say no matter how the network is doing. */
 const TRANSIENT_ERROR_PATTERN =
   /error sending request|did not respond within \d+s|closed its output before responding/;
-const CODEX_RETRY_DELAYS_MS = [3_000, 8_000];
+const CODEX_RETRY_DELAYS_MS = [3_000, 8_000, 20_000, 45_000];
 
 /** Pure predicate behind fetchCodexLimits' retry decision — exported so the
  * transient-signature classification has direct unit coverage without
@@ -407,17 +414,30 @@ export function isTransientCodexLimitsError(error: string | undefined): boolean 
   return error !== undefined && TRANSIENT_ERROR_PATTERN.test(error);
 }
 
-export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
+/** The retry loop, with the attempt function and sleep injectable so the
+ * attempt counting and backoff sequencing have direct unit coverage
+ * (codex-limits.test.ts) without spawning a real codex process. A
+ * still-failing run returns the last attempt's result with the failure
+ * count appended, matching http.ts's own diagnosable-exhaustion
+ * convention. */
+export async function withTransientCodexRetries(
+  attempt: () => Promise<FetchedLimitResult>,
+  sleep: (ms: number) => Promise<unknown> = Bun.sleep,
+): Promise<FetchedLimitResult> {
   let last: FetchedLimitResult | undefined;
   let attempts = 0;
-  for (let attempt = 0; attempt <= CODEX_RETRY_DELAYS_MS.length; attempt++) {
-    if (attempt > 0) await Bun.sleep(CODEX_RETRY_DELAYS_MS[attempt - 1]!);
+  for (let i = 0; i <= CODEX_RETRY_DELAYS_MS.length; i++) {
+    if (i > 0) await sleep(CODEX_RETRY_DELAYS_MS[i - 1]!);
     attempts++;
-    last = await fetchCodexLimitsOnce(identity);
+    last = await attempt();
     if (!isTransientCodexLimitsError(last.error) || last.status !== "unavailable") return last;
   }
   return {
     ...last!,
     error: `${last!.error} (still failing after ${attempts} attempts)`,
   };
+}
+
+export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
+  return withTransientCodexRetries(() => fetchCodexLimitsOnce(identity));
 }
