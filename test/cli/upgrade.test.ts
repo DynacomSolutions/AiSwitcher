@@ -6,7 +6,9 @@ import {
   UPGRADE_SPECS,
   helpListsUpdater,
   isOfficialXaiGrokHelp,
+  resolvePublicNpmLatestVersion,
   runUpgradeWithDeps,
+  UpgradeCancelledError,
   type UpgradeDeps,
 } from "../../src/cli/upgrade.ts";
 
@@ -86,7 +88,143 @@ describe("xAI Grok detection", () => {
   });
 });
 
+describe("resolvePublicNpmLatestVersion", () => {
+  const result = (stdout: string, exitCode = 0) => ({ stdout, stderr: "", exitCode, timedOut: false });
+
+  test("uses the public manifest after a scoped registry falls back to the public default", async () => {
+    const captures: string[][] = [];
+    const fetched: string[] = [];
+    const version = await resolvePublicNpmLatestVersion("npm", "@openai/codex", {
+      capture: async (_command, args) => {
+        captures.push(args);
+        return captures.length === 1 ? result("undefined\n") : result("https://registry.npmjs.org/\n");
+      },
+      fetch: async (url) => {
+        fetched.push(url);
+        return { ok: true, json: async () => ({ name: "@openai/codex", version: "0.144.6" }) };
+      },
+    });
+
+    expect(version).toBe("0.144.6");
+    expect(captures).toEqual([["config", "get", "@openai:registry"], ["config", "get", "registry"]]);
+    expect(fetched).toEqual(["https://registry.npmjs.org/@openai%2fcodex/latest"]);
+  });
+
+  test("honours a custom scoped registry without contacting the public registry", async () => {
+    let fetches = 0;
+    const version = await resolvePublicNpmLatestVersion("npm", "@openai/codex", {
+      capture: async () => result("https://npm.example.test/\n"),
+      fetch: async () => {
+        fetches++;
+        return { ok: true, json: async () => ({}) };
+      },
+    });
+
+    expect(version).toBeUndefined();
+    expect(fetches).toBe(0);
+  });
+
+  test("falls back to npm latest when public metadata is invalid or unavailable", async () => {
+    for (const fetch of [
+      async () => ({ ok: true, json: async () => ({ name: "@openai/codex", version: "not-a-version" }) }),
+      async () => {
+        throw new Error("network failure");
+      },
+    ]) {
+      await expect(
+        resolvePublicNpmLatestVersion("npm", "@openai/codex", {
+          capture: async () => result("https://registry.npmjs.org/\n"),
+          fetch,
+        }),
+      ).resolves.toBeUndefined();
+    }
+  });
+});
+
 describe("runUpgradeWithDeps", () => {
+  test("rethrows cancellation from npm version lookup before fallback or later tools", async () => {
+    const calls: string[] = [];
+    const { deps } = fakeDeps({
+      latestNpmVersion: async () => {
+        calls.push("lookup");
+        throw new UpgradeCancelledError(130);
+      },
+      spawn: async () => {
+        calls.push("install");
+        return 0;
+      },
+    });
+
+    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")])).rejects.toEqual(
+      new UpgradeCancelledError(130),
+    );
+    expect(calls).toEqual(["lookup"]);
+  });
+
+  test("rethrows npm cancellation before attempting native fallback or later tools", async () => {
+    const calls: string[] = [];
+    const { deps } = fakeDeps({
+      spawn: async () => {
+        calls.push("npm");
+        return 130;
+      },
+      resolve: () => {
+        calls.push("resolve");
+        return "/real/codex";
+      },
+    });
+
+    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")])).rejects.toEqual(
+      new UpgradeCancelledError(130),
+    );
+    expect(calls).toEqual(["npm"]);
+  });
+
+  test("rethrows native fallback cancellation before moving to the next tool", async () => {
+    const calls: string[] = [];
+    const { deps } = fakeDeps({
+      which: () => null,
+      spawn: async () => {
+        calls.push("native");
+        return 130;
+      },
+      shimExists: async (toolName) => {
+        calls.push(toolName);
+        return true;
+      },
+    });
+
+    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")])).rejects.toEqual(
+      new UpgradeCancelledError(130),
+    );
+    expect(calls).toEqual(["codex", "native"]);
+  });
+
+  test("rethrows cancellation from Grok native updater without installing", async () => {
+    let installerCalls = 0;
+    const { deps } = fakeDeps({
+      spawn: async () => 143,
+      installGrok: async () => {
+        installerCalls++;
+        return 0;
+      },
+    });
+
+    await expect(runUpgradeWithDeps(deps, [oneSpec("grok")])).rejects.toEqual(new UpgradeCancelledError(143));
+    expect(installerCalls).toBe(0);
+  });
+
+  test("rethrows cancellation from the Grok installer", async () => {
+    const { deps } = fakeDeps({
+      resolve: () => {
+        throw new BinaryResolutionError("missing");
+      },
+      installGrok: async () => 131,
+    });
+
+    await expect(runUpgradeWithDeps(deps, [oneSpec("grok")])).rejects.toEqual(new UpgradeCancelledError(131));
+  });
+
   test("upgrades old Codex through the managed npm package without invoking `codex update`", async () => {
     const probes: Array<{ command: string; args: string[] }> = [];
     const { deps, spawns } = fakeDeps({
@@ -107,6 +245,14 @@ describe("runUpgradeWithDeps", () => {
           "--global",
           "--prefix",
           MANAGED_NPM_PREFIX,
+          "--foreground-scripts",
+          "--no-audit",
+          "--no-fund",
+          "--loglevel=http",
+          "--fetch-timeout=60000",
+          "--fetch-retries=1",
+          "--fetch-retry-mintimeout=1000",
+          "--fetch-retry-maxtimeout=5000",
           "@openai/codex@latest",
         ],
       },
@@ -117,6 +263,75 @@ describe("runUpgradeWithDeps", () => {
         args: ["--version"],
       },
     ]);
+  });
+
+  test("pins a fresh public npm version and prefers the local cache", async () => {
+    const { deps, spawns } = fakeDeps({ latestNpmVersion: async () => "0.144.6" });
+    await runUpgradeWithDeps(deps, [oneSpec("codex")]);
+    expect(spawns[0]?.args).toContain("--prefer-offline");
+    expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@0.144.6");
+  });
+
+  test("skips npm when the pinned package manifest matches and its CLI runs", async () => {
+    const { deps, spawns } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async (packageName) => (packageName === "@openai/codex" ? "0.144.6" : undefined),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("codex")]);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(spawns).toEqual([]);
+  });
+
+  test("reinstalls when the pinned package manifest matches but its CLI is broken", async () => {
+    const { deps, spawns } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async () => "0.144.6",
+      capture: async (command) =>
+        command.endsWith("/bin/codex")
+          ? { stdout: "", stderr: "broken", exitCode: 1, timedOut: false }
+          : { stdout: "", stderr: "", exitCode: 0, timedOut: false },
+    });
+
+    await runUpgradeWithDeps(deps, [oneSpec("codex")]);
+
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@0.144.6");
+  });
+
+  test("reinstalls when the matching managed CLI cannot be executed", async () => {
+    const { deps, spawns } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async () => "0.144.6",
+      capture: async (command) => {
+        if (command.endsWith("/bin/codex")) throw new Error("EACCES");
+        return { stdout: "", stderr: "", exitCode: 0, timedOut: false };
+      },
+    });
+
+    await runUpgradeWithDeps(deps, [oneSpec("codex")]);
+
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@0.144.6");
+  });
+
+  test("rethrows cancellation from the matching managed CLI probe", async () => {
+    const { deps, spawns } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async () => "0.144.6",
+      capture: async () => ({ stdout: "", stderr: "", exitCode: 130, timedOut: false }),
+    });
+
+    await expect(runUpgradeWithDeps(deps, [oneSpec("codex")])).rejects.toEqual(new UpgradeCancelledError(130));
+    expect(spawns).toEqual([]);
+  });
+
+  test("falls back to npm @latest when the version lookup fails", async () => {
+    const { deps, spawns } = fakeDeps({ latestNpmVersion: async () => undefined });
+    await runUpgradeWithDeps(deps, [oneSpec("codex")]);
+    expect(spawns[0]?.args).not.toContain("--prefer-offline");
+    expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@latest");
   });
 
   test("does not report success when an installed npm package has no runnable CLI", async () => {
