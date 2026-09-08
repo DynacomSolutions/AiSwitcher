@@ -94,7 +94,9 @@ export const IDENTITY_SESSION_MARKER = "AI_PROFILE_SWITCHER_SESSION";
 function buildChildEnv(extraEnv: Record<string, string>): Record<string, string | undefined> {
   const cleaned: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (!SESSION_MARKER_PATTERN.test(key)) cleaned[key] = value;
+    // GROK_MEMORY is the one intentional exception. Keep the exact key
+    // spelling scoped, so lowercase grok_memory is still stripped.
+    if (key === "GROK_MEMORY" || !SESSION_MARKER_PATTERN.test(key)) cleaned[key] = value;
   }
   // Re-applied after stripping, so the one CLAUDE_CONFIG_DIR/CODEX_HOME we
   // actually want the child to see always survives regardless of the blanket

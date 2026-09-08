@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { chdir } from "node:process";
-import { ensureUsableCwd, withUsableCwd } from "../../src/shared/exec.ts";
+import { ensureUsableCwd, spawnReal, withUsableCwd } from "../../src/shared/exec.ts";
 
 const tempDirs: string[] = [];
 const originalCwd = process.cwd();
@@ -69,5 +69,86 @@ describe("deleted-cwd resilience", () => {
     });
     expect(attempts).toBe(1);
     expect(result).toBe(marker);
+  });
+});
+
+describe("child environment", () => {
+  async function readSelectedEnvironment(
+    outputPath: string,
+    extraEnv: Record<string, string> = { EXTRA_ENV: "from-extra-env" },
+  ): Promise<Record<string, string | null>> {
+    const script = `await Bun.write(${JSON.stringify(outputPath)}, JSON.stringify({
+      grokMemory: process.env.GROK_MEMORY ?? null,
+      grokOther: process.env.GROK_OTHER ?? null,
+      grokSession: process.env.GROK_MEMORY_SESSION ?? null,
+      claudeSession: process.env.CLAUDECODE ?? null,
+      extra: process.env.EXTRA_ENV ?? null,
+    }))`;
+    const exitCode = await spawnReal(process.execPath, ["-e", script], extraEnv);
+    expect(exitCode).toBe(0);
+    return JSON.parse(await Bun.file(outputPath).text());
+  }
+
+  for (const value of ["0", "1"]) {
+    test(`forwards GROK_MEMORY=${value} while stripping other session markers`, async () => {
+      const outputDir = await mkdtemp(join(tmpdir(), "ais-child-env-"));
+      tempDirs.push(outputDir);
+      const outputPath = join(outputDir, "result.json");
+      const previous = new Map([
+        ["GROK_MEMORY", process.env.GROK_MEMORY],
+        ["GROK_OTHER", process.env.GROK_OTHER],
+        ["GROK_MEMORY_SESSION", process.env.GROK_MEMORY_SESSION],
+        ["CLAUDECODE", process.env.CLAUDECODE],
+        ["EXTRA_ENV", process.env.EXTRA_ENV],
+      ]);
+      try {
+        process.env.GROK_MEMORY = value;
+        process.env.GROK_OTHER = "should-be-stripped";
+        process.env.GROK_MEMORY_SESSION = "should-be-stripped";
+        process.env.CLAUDECODE = "should-be-stripped";
+        process.env.EXTRA_ENV = "from-parent-env";
+        expect(await readSelectedEnvironment(outputPath)).toEqual({
+          grokMemory: value,
+          grokOther: null,
+          grokSession: null,
+          claudeSession: null,
+          extra: "from-extra-env",
+        });
+      } finally {
+        for (const [key, original] of previous) {
+          if (original === undefined) delete process.env[key];
+          else process.env[key] = original;
+        }
+      }
+    });
+  }
+
+  test("leaves GROK_MEMORY unset when it is unset in the parent", async () => {
+    const outputDir = await mkdtemp(join(tmpdir(), "ais-child-env-unset-"));
+    tempDirs.push(outputDir);
+    const outputPath = join(outputDir, "result.json");
+    const original = process.env.GROK_MEMORY;
+    try {
+      delete process.env.GROK_MEMORY;
+      expect((await readSelectedEnvironment(outputPath)).grokMemory).toBeNull();
+    } finally {
+      if (original === undefined) delete process.env.GROK_MEMORY;
+      else process.env.GROK_MEMORY = original;
+    }
+  });
+
+  test("extraEnv GROK_MEMORY overrides inherited value", async () => {
+    const outputDir = await mkdtemp(join(tmpdir(), "ais-child-env-extra-"));
+    tempDirs.push(outputDir);
+    const original = process.env.GROK_MEMORY;
+    try {
+      process.env.GROK_MEMORY = "0";
+      expect((await readSelectedEnvironment(join(outputDir, "result.json"), {
+        GROK_MEMORY: "1",
+      })).grokMemory).toBe("1");
+    } finally {
+      if (original === undefined) delete process.env.GROK_MEMORY;
+      else process.env.GROK_MEMORY = original;
+    }
   });
 });
