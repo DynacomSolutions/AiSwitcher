@@ -249,7 +249,7 @@ describe("runUpgradeWithDeps", () => {
           "--no-audit",
           "--no-fund",
           "--loglevel=http",
-          "--fetch-timeout=60000",
+          "--fetch-timeout=300000",
           "--fetch-retries=1",
           "--fetch-retry-mintimeout=1000",
           "--fetch-retry-maxtimeout=5000",
@@ -265,10 +265,11 @@ describe("runUpgradeWithDeps", () => {
     ]);
   });
 
-  test("pins a fresh public npm version and prefers the local cache", async () => {
+  test("pins a fresh public npm version and revalidates cached metadata", async () => {
     const { deps, spawns } = fakeDeps({ latestNpmVersion: async () => "0.144.6" });
     await runUpgradeWithDeps(deps, [oneSpec("codex")]);
-    expect(spawns[0]?.args).toContain("--prefer-offline");
+    expect(spawns[0]?.args).toContain("--prefer-online");
+    expect(spawns[0]?.args).not.toContain("--prefer-offline");
     expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@0.144.6");
   });
 
@@ -331,6 +332,7 @@ describe("runUpgradeWithDeps", () => {
     const { deps, spawns } = fakeDeps({ latestNpmVersion: async () => undefined });
     await runUpgradeWithDeps(deps, [oneSpec("codex")]);
     expect(spawns[0]?.args).not.toContain("--prefer-offline");
+    expect(spawns[0]?.args).not.toContain("--prefer-online");
     expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@latest");
   });
 

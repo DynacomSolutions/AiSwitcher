@@ -338,7 +338,6 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
 
   await deps.prepareManagedPrefix();
   const npmPackage = spec.npmPackage;
-  const packageSpec = `${npmPackage}@latest`;
   let version: string | undefined;
   if (deps.latestNpmVersion) {
     try {
@@ -375,11 +374,11 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
     "--no-audit",
     "--no-fund",
     "--loglevel=http",
-    "--fetch-timeout=60000",
+    "--fetch-timeout=300000",
     "--fetch-retries=1",
     "--fetch-retry-mintimeout=1000",
     "--fetch-retry-maxtimeout=5000",
-    ...(version ? ["--prefer-offline"] : []),
+    ...(version ? ["--prefer-online"] : []),
     ...(spec.allowedScriptPackages?.length
       ? [`--allow-scripts=${spec.allowedScriptPackages.join(",")}`]
       : []),
@@ -396,8 +395,8 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
   deps.log(
     `${prefix} ${yellow(
       exitCode === 0
-        ? `${packageSpec} finished but did not provide a runnable ${spec.cfg.realBinaryName}; trying the native updater`
-        : `${packageSpec} exited with code ${exitCode}; trying the native updater`,
+        ? `${resolvedPackageSpec} finished but did not provide a runnable ${spec.cfg.realBinaryName}; trying the native updater`
+        : `${resolvedPackageSpec} exited with code ${exitCode}; trying the native updater`,
     )}`,
   );
   return await runNativeFallback(spec, deps, prefix);
