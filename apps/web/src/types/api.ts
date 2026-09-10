@@ -248,8 +248,8 @@ export interface DateSpan {
 
 /** REAL AWS-reported spend for a Bedrock row, deliberately separate from
  * the report's token-estimate cost: every dollar here comes from AWS's own
- * billing plane, never an estimate. Rendered as a dimmed sub-line under the
- * provider row. */
+ * billing plane, never an estimate. Rendered as a dimmed column-aligned
+ * sub-row under the provider row. */
 export interface RealCostInfo {
   label: string;
   /** Cost Explorer month-to-date; absent exactly when the query failed. */
