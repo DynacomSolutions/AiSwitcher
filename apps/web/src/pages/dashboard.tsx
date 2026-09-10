@@ -22,9 +22,9 @@ import {
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { GlobalUsageCards } from "@/components/usage-counter";
-import { useProcessesQuery, useSpendGuardQuery, useStatusQuery } from "@/hooks/queries";
+import { useHerdrBridgeQuery, useProcessesQuery, useSpendGuardQuery, useStatusQuery } from "@/hooks/queries";
 import { clampPercent, durationSince, formatMoney, formatUptime } from "@/lib/format";
-import type { SpendGuardAccountState, SpendGuardKillRecord } from "@/types/api";
+import type { HerdrBridgeResponse, SpendGuardAccountState, SpendGuardKillRecord } from "@/types/api";
 
 function SummaryCard({
   title,
@@ -216,6 +216,94 @@ function RecentKill({ kill }: { kill: SpendGuardKillRecord }) {
   );
 }
 
+function herdrBridgeBadge(state: HerdrBridgeResponse["state"]) {
+  switch (state) {
+    case "active":
+      return <Badge variant="success">Active</Badge>;
+    case "pending":
+      return <Badge variant="warning">Pending</Badge>;
+    case "idle":
+      return <Badge variant="muted">Idle</Badge>;
+    default:
+      return <Badge variant="muted">Disabled</Badge>;
+  }
+}
+
+function HerdrBridgeCard() {
+  const query = useHerdrBridgeQuery();
+  // Hidden entirely when the endpoint is unavailable (no daemon-side
+  // bridge): a machine without herdr has nothing to show either way.
+  if (query.isError) return null;
+  const data = query.data;
+  if (!data) return null;
+
+  return (
+    <Card className="gap-4">
+      <CardHeader>
+        <CardTitle className="text-base">
+          herdr bridge {herdrBridgeBadge(data.state)}
+          {data.config.push ? null : <Badge variant="muted">push off</Badge>}
+        </CardTitle>
+        <CardDescription>
+          Feeds AIS limit percentages to herdr's sidebar per agent pane via display-only metadata tokens
+          {data.herdrVersion ? ` (herdr ${data.herdrVersion})` : ""}. {data.panes.length} attributed pane
+          {data.panes.length === 1 ? "" : "s"}.
+          {data.lastCycleAt ? (
+            <>
+              {" "}Last cycle <RelativeTime iso={data.lastCycleAt} />
+              {data.lastPushAt ? (
+                <>
+                  , last push <RelativeTime iso={data.lastPushAt} />
+                </>
+              ) : null}
+              .
+            </>
+          ) : null}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {data.state === "pending" && data.pendingReason ? (
+          <p className="text-xs text-amber-600 dark:text-amber-400">{data.pendingReason}; the bridge flips to active automatically once herdr supports report-metadata.</p>
+        ) : null}
+        {data.state === "idle" ? (
+          <p className="text-xs text-muted-foreground">herdr is not running; the bridge retries every {data.config.intervalS}s.</p>
+        ) : null}
+        {data.panes.length > 0 ? (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-24">Pane</TableHead>
+                <TableHead className="w-24">Tool</TableHead>
+                <TableHead className="w-36">Identity</TableHead>
+                <TableHead className="w-20">Session</TableHead>
+                <TableHead className="w-20">Week</TableHead>
+                <TableHead className="w-20">Month</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.panes.map((pane) => (
+                <TableRow key={pane.paneId}>
+                  <TableCell className="font-mono text-xs">{pane.paneId}</TableCell>
+                  <TableCell>{pane.tool ? <ToolBadge tool={pane.tool} /> : <span className="text-muted-foreground">-</span>}</TableCell>
+                  <TableCell>{pane.identity ? <IdentityChip name={pane.identity} /> : <span className="text-muted-foreground">-</span>}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{pane.session !== undefined ? `${pane.session}%` : "-"}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{pane.week !== undefined ? `${pane.week}%` : "-"}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{pane.month !== undefined ? `${pane.month}%` : "-"}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            No AIS-wrapped agent panes detected in herdr right now.
+          </p>
+        )}
+        {data.lastError ? <p className="text-xs text-muted-foreground">{data.lastError}</p> : null}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function DashboardPage() {
   const status = useStatusQuery();
   const processes = useProcessesQuery();
@@ -267,6 +355,8 @@ export function DashboardPage() {
       <GlobalUsageCards />
 
       <SpendGuardCard />
+
+      <HerdrBridgeCard />
 
       <Card className="gap-4">
         <CardHeader>

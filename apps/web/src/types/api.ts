@@ -95,6 +95,36 @@ export interface SpendGuardResponse {
   recentKills: SpendGuardKillRecord[];
 }
 
+/* herdr metadata bridge */
+
+export interface HerdrBridgePane {
+  paneId: string;
+  agent?: string;
+  agentStatus?: string;
+  tool?: string;
+  identity?: string;
+  title?: string;
+  session?: number;
+  week?: number;
+  month?: number;
+  summary?: string;
+}
+
+export type HerdrBridgeState = "disabled" | "idle" | "pending" | "active";
+
+export interface HerdrBridgeResponse {
+  ok: true;
+  state: HerdrBridgeState;
+  running: boolean;
+  config: { enabled: boolean; intervalS: number; categories: string[]; push: boolean };
+  herdrVersion?: string;
+  pendingReason?: string;
+  panes: HerdrBridgePane[];
+  lastCycleAt: string | null;
+  lastPushAt: string | null;
+  lastError: string | null;
+}
+
 /* Identities */
 
 export interface IdentityDto extends Identity {

@@ -21,6 +21,7 @@ export const qk = {
   auth: ["auth"] as const,
   authRefresh: ["auth", "refresh"] as const,
   spendGuard: ["spend-guard"] as const,
+  herdrBridge: ["herdr-bridge"] as const,
   loginFlows: ["auth", "flows"] as const,
   loginFlow: (flowId: string) => ["auth", "flows", flowId] as const,
   fileRoots: ["files", "roots"] as const,
@@ -53,6 +54,14 @@ export function useSpendGuardQuery() {
   return useQuery({
     queryKey: qk.spendGuard,
     queryFn: api.getSpendGuard,
+    refetchInterval: POLL.slow,
+  });
+}
+
+export function useHerdrBridgeQuery() {
+  return useQuery({
+    queryKey: qk.herdrBridge,
+    queryFn: api.getHerdrBridge,
     refetchInterval: POLL.slow,
   });
 }

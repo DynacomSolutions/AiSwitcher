@@ -6,6 +6,7 @@ import type {
   FileContentResponse,
   FileRoot,
   FileTreeResponse,
+  HerdrBridgeResponse,
   LimitsResponse,
   LoginFlow,
   LoginFlowsResponse,
@@ -91,6 +92,8 @@ export const api = {
   getProcesses: () => request<ProcessesResponse>("/api/processes"),
 
   getSpendGuard: () => request<SpendGuardResponse>("/api/spend-guard"),
+
+  getHerdrBridge: () => request<HerdrBridgeResponse>("/api/herdr-bridge"),
 
   getIdentities: () => request<RegistriesResponse>("/api/identities"),
   createIdentity: (tool: ToolName, body: CreateIdentityBody) =>
