@@ -31,7 +31,7 @@ import {
 } from "@/components/ui/table";
 import { useUsageQuery } from "@/hooks/queries";
 import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
-import type { TokscaleEntry, UsageResult } from "@/types/api";
+import type { RealCostInfo, TokscaleEntry, UsageResult } from "@/types/api";
 
 type Granularity = "day" | "week" | "month";
 type SinceDays = 7 | 30 | 90 | 0;
@@ -284,6 +284,29 @@ function spanText(result: UsageResult): string {
   return first === last ? first : `${first} to ${last}`;
 }
 
+/** The real-cost sub-line under an AWS Bedrock row: REAL AWS-reported spend
+ * (Cost Explorer month-to-date, budget context where available), never in
+ * the Est. cost column and never labelled an estimate. An errored query
+ * reads "unavailable": a missing real figure is not a zero. */
+function realCostLine(real: RealCostInfo): string {
+  if (real.monthToDateUsd === undefined) {
+    return `└ ${real.label}: unavailable${real.error ? ` (${real.error})` : ""}`;
+  }
+  const parts: string[] = [];
+  if (real.windowUsd !== undefined && Math.abs(real.windowUsd - real.monthToDateUsd) > 0.005) {
+    parts.push(`trailing 3 months ${formatMoney(real.windowUsd)}`);
+  }
+  if (real.budgetLimitUsd !== undefined) {
+    parts.push(
+      real.budgetActualUsd !== undefined
+        ? `budget actual ${formatMoney(real.budgetActualUsd)} of ${formatMoney(real.budgetLimitUsd)}`
+        : `budget ${formatMoney(real.budgetLimitUsd)}`,
+    );
+  }
+  if (real.note) parts.push(real.note);
+  return `└ ${real.label}: ${formatMoney(real.monthToDateUsd)}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`;
+}
+
 function NotesCell({ result }: { result: UsageResult }) {
   if (result.pending) return <Badge variant="muted">Collecting</Badge>;
   if (result.error)
@@ -344,6 +367,11 @@ export function UsagePage() {
   const totalCacheWrite = sumReport(filtered, (r) => r.totalCacheWrite);
   const totalMessages = sumReport(filtered, (r) => r.totalMessages);
   const hasAnyReport = filtered.some((r) => r.report !== undefined);
+  // Real AWS spend is summarised separately from the estimate total: only
+  // rows whose Cost Explorer query actually answered contribute (an
+  // unavailable figure must not read as a confirmed zero).
+  const realTotal = filtered.reduce((sum, r) => (typeof r.realCost?.monthToDateUsd === "number" ? sum + r.realCost.monthToDateUsd : sum), 0);
+  const hasRealTotal = filtered.some((r) => typeof r.realCost?.monthToDateUsd === "number");
 
   const reset = () => {
     setProvider("all");
@@ -499,7 +527,7 @@ export function UsagePage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filtered.map((r, index) => (
+                {filtered.flatMap((r, index) => [
                   <TableRow key={`${r.provider}/${r.identity.name}/${index}`}>
                     <TableCell className="font-medium">
                       <ProviderLabel provider={r.provider} />
@@ -534,8 +562,17 @@ export function UsagePage() {
                     <TableCell>
                       <NotesCell result={r} />
                     </TableCell>
-                  </TableRow>
-                ))}
+                  </TableRow>,
+                  // Real-cost sub-line: distinct element under the Bedrock
+                  // row, so real AWS spend never sits in an estimate column.
+                  r.realCost ? (
+                    <TableRow key={`${r.provider}/${r.identity.name}/${index}/real`} className="hover:bg-transparent">
+                      <TableCell colSpan={11} className="border-none py-1 pl-10 text-xs text-muted-foreground">
+                        {realCostLine(r.realCost)}
+                      </TableCell>
+                    </TableRow>
+                  ) : null,
+                ])}
                 <TableRow className="border-t-2 hover:bg-transparent">
                   <TableCell colSpan={4} className="font-semibold">
                     TOTAL
@@ -548,6 +585,13 @@ export function UsagePage() {
                   <TableCell className="text-right font-semibold tabular-nums">{formatMoney(totalCost)}</TableCell>
                   <TableCell />
                 </TableRow>
+                {hasRealTotal ? (
+                  <TableRow className="hover:bg-transparent">
+                    <TableCell colSpan={11} className="border-none py-1 pl-10 text-xs text-muted-foreground">
+                      └ real AWS total month-to-date: {formatMoney(realTotal)}
+                    </TableCell>
+                  </TableRow>
+                ) : null}
               </TableBody>
             </Table>
           </div>

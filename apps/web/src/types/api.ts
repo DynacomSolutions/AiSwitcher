@@ -246,6 +246,25 @@ export interface DateSpan {
   lastMs: number;
 }
 
+/** REAL AWS-reported spend for a Bedrock row, deliberately separate from
+ * the report's token-estimate cost: every dollar here comes from AWS's own
+ * billing plane, never an estimate. Rendered as a dimmed sub-line under the
+ * provider row. */
+export interface RealCostInfo {
+  label: string;
+  /** Cost Explorer month-to-date; absent exactly when the query failed. */
+  monthToDateUsd?: number;
+  /** UnblendedCost over the full trailing window (three calendar months). */
+  windowUsd?: number;
+  /** The enforced COST budget's actual/limit, when the Budgets fetch answered. */
+  budgetActualUsd?: number;
+  budgetLimitUsd?: number;
+  /** e.g. "reported lag" when AWS's real figure trails the local estimate. */
+  note?: string;
+  /** Present when the Cost Explorer query failed: unavailable, not zero. */
+  error?: string;
+}
+
 export interface UsageResult {
   provider: string;
   identity: Identity;
@@ -255,6 +274,7 @@ export interface UsageResult {
   report?: TokscaleReport;
   error?: string;
   extraCost?: OverageInfo;
+  realCost?: RealCostInfo;
   dateSpan?: DateSpan;
   dailyUsage?: Record<string, number>;
   pending?: true;

@@ -189,8 +189,27 @@ pub struct UsageResult {
     /// the report's token-estimate cost.
     #[serde(default, rename = "extraCost", alias = "extra_cost")]
     pub extra_cost: Option<OverageInfo>,
+    /// AWS Bedrock only: REAL AWS-reported spend (Cost Explorer month-to-date
+    /// plus the enforced budget's limit), separate from the token estimate in
+    /// `report.totalCost`. Maps into the same REAL $ column as extra_cost.
+    #[serde(default, rename = "realCost", alias = "real_cost")]
+    pub real_cost: Option<RealCostInfo>,
     #[serde(default, rename = "dateSpan", alias = "date_span")]
     pub date_span: Option<DateSpan>,
+}
+
+/// Mirrors RealCostInfo from src/cli/usage/aws-bedrock-usage.ts: every
+/// dollar comes from AWS's own billing plane, never an estimate. Only the
+/// fields this view reads are typed; the payload's windowUsd/budgetActualUsd
+/// and any future additions pass through serde untouched.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RealCostInfo {
+    #[serde(default, rename = "monthToDateUsd", alias = "month_to_date_usd")]
+    pub month_to_date_usd: Option<f64>,
+    #[serde(default, rename = "budgetLimitUsd", alias = "budget_limit_usd")]
+    pub budget_limit_usd: Option<f64>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// Totals only: tokscale's per-model entries are not rendered by this view.

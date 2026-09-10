@@ -4,7 +4,7 @@ import { resolveAwsProfileForIdentity, type AwsProfileDeps, type AwsProfileTarge
 import type { Identity, ToolConfig } from "../identities/types.ts";
 import { periodStartForTimeUnit } from "./state.ts";
 import type { AccountSpendState } from "./state.ts";
-import { estimateIdentityLocalSpend } from "./local-estimate.ts";
+import { estimateIdentityLocalSpend } from "../shared/local-spend.ts";
 import { cacheAgeS, loadSpendGuardCache, type SpendGuardCache } from "./cache.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";

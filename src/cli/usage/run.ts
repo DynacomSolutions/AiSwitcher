@@ -9,7 +9,7 @@ import { fetchCodexLimits } from "../limits/codex-limits.ts";
 import { fetchKimiLimits } from "../limits/kimi-limits.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { fetchAliUsage } from "./ali-usage.ts";
-import { fetchAwsBedrockUsage, AwsNoProfileMappedError } from "./aws-bedrock-usage.ts";
+import { fetchAwsBedrockUsage, AwsNoProfileMappedError, type RealCostInfo } from "./aws-bedrock-usage.ts";
 import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, fetchOpencodeIdentityUsage, readOpencodeProfileUsage, resolveOpencodeProfileIdentities } from "./opencode-usage.ts";
 import { fetchPiUsage } from "./pi-usage.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
@@ -50,6 +50,13 @@ export interface UsageResult {
   report?: TokscaleReport;
   error?: string;
   extraCost?: OverageInfo;
+  /** AWS Bedrock only: REAL AWS-reported spend (Cost Explorer month-to-date
+   * plus the enforced budget's limit/actual), deliberately separate from
+   * report.totalCost, which is the LOCAL token-based estimate. Rendered as
+   * a dimmed sub-row under the provider row, never in the EST. COST
+   * column, and never labelled an estimate (see usage/aws-bedrock-usage.ts).
+   */
+  realCost?: RealCostInfo;
   dateSpan?: DateSpan;
   dailyUsage?: Record<string, number>;
   /** AWS Bedrock only: REAL billed dollars per UTC day from Cost Explorer
@@ -259,17 +266,32 @@ async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppre
   }
 }
 
-/** AWS Bedrock identities report REAL billed dollars from Cost Explorer —
- * no tokscale (Bedrock billing records carry no token counts, and tokscale's
- * valuation wouldn't be real spend anyway), no extraCost probe (codex's
- * rate-limit/overage concepts don't exist on Bedrock; the budget-overage
- * signal lives in `ais limits`). No profile mapping = nothing to report
- * unless the user asked for this source explicitly; a malformed mapping or
- * any query failure (SSO expired included) stays an honest error row. */
+/** AWS Bedrock identities report LOCAL month-to-date tracking (tokens and
+ * the token-based estimate) in the normal columns (the same shared readers
+ * the spend guard uses, so both pathways reconcile per identity) while the
+ * REAL AWS figures (Cost Explorer month-to-date, budget limit/actual) ride
+ * separately in realCost for the real-cost sub-row. No tokscale (Bedrock
+ * billing records carry no token counts and the guard's readers are the
+ * reconciliation point), no extraCost probe (codex's rate-limit/overage
+ * concepts don't exist on Bedrock; the budget-overage signal lives in `ais
+ * limits`). No profile mapping = nothing to report unless the user asked
+ * for this source explicitly; a malformed mapping stays an honest error
+ * row, but a Cost Explorer failure no longer costs the row its local
+ * figures: it degrades into realCost.error. */
 async function runAwsBedrockUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   try {
-    const { report, dateSpan, dailyCostUsd } = await fetchAwsBedrockUsage(target.identity);
-    return [providerResult(target, "aws-bedrock", { report, ...(dateSpan ? { dateSpan } : {}), ...(dailyCostUsd ? { dailyCostUsd } : {}) })];
+    const { report, dateSpan, dailyUsage, dailyCostUsd, realCost } = await fetchAwsBedrockUsage(target.identity, {
+      localTool: target.toolName,
+    });
+    return [
+      providerResult(target, "aws-bedrock", {
+        report,
+        realCost,
+        ...(dateSpan ? { dateSpan } : {}),
+        ...(dailyUsage ? { dailyUsage } : {}),
+        ...(dailyCostUsd ? { dailyCostUsd } : {}),
+      }),
+    ];
   } catch (err) {
     if (err instanceof AwsNoProfileMappedError) {
       return suppression.explicitTool ? [providerResult(target, "aws-bedrock", { error: err.message })] : [];
@@ -323,6 +345,16 @@ function mergeReports(a: TokscaleReport | undefined, b: TokscaleReport | undefin
   };
 }
 
+/** Real AWS figures are ACCOUNT-level (Cost Explorer is queried per mapped
+ * profile), so two merged rows carrying the same account's figure must not
+ * have them summed: the larger figure wins. A figure-less info (a failed
+ * query) only survives when it is all there is. */
+function mergeRealCost(a: RealCostInfo | undefined, b: RealCostInfo | undefined): RealCostInfo | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return (a.monthToDateUsd ?? -1) >= (b.monthToDateUsd ?? -1) ? a : b;
+}
+
 /** Merge the same provider+identity across native clients and Pi. */
 export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
   const nativeCoverage = new Set(
@@ -355,6 +387,7 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
     const errors = [...new Set([existing.error, result.error].filter((v): v is string => Boolean(v)))];
     const report = mergeReports(existing.report, result.report);
     const extraCost = mergeExtraCost(existing.extraCost, result.extraCost);
+    const realCost = mergeRealCost(existing.realCost, result.realCost);
 
     grouped.set(key, {
       provider,
@@ -362,6 +395,7 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
       ...(report ? { report } : {}),
       ...(errors.length ? { error: errors.join("; ") } : {}),
       ...(extraCost ? { extraCost } : {}),
+      ...(realCost ? { realCost } : {}),
       ...(firstMs.length && lastMs.length ? { dateSpan: { firstMs: Math.min(...firstMs), lastMs: Math.max(...lastMs) } } : {}),
       ...(Object.keys(dailyUsage).length ? { dailyUsage } : {}),
       ...(existing.pending && result.pending ? { pending: true as const } : {}),

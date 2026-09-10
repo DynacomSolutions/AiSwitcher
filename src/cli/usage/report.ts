@@ -1,6 +1,7 @@
 import { bold, dim, gray, yellow } from "../colors.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { borderRow, padRow } from "../table.ts";
+import { REAL_COST_LABEL, type RealCostInfo } from "./aws-bedrock-usage.ts";
 import { renderContributionGraph } from "./contribution-graph.ts";
 import { calendarDayCount } from "./local-day.ts";
 import { usageProviderLabel } from "./providers.ts";
@@ -62,6 +63,41 @@ function errorRow(result: UsageResult): string[] {
 
 function pendingRow(result: UsageResult, spinnerFrame: string): string[] {
   return [usageProviderLabel(result.provider), result.identity.name, "—", "—", "—", "—", `${spinnerFrame} loading…`, "—"];
+}
+
+/** The dimmed detail line rendered UNDER an AWS Bedrock provider row: the
+ * REAL AWS-reported spend (Cost Explorer month-to-date, plus the budget's
+ * limit/actual where available), deliberately OUTSIDE the EST. COST column
+ * (an estimate column must never carry real spend, nor vice versa). An
+ * errored query renders "unavailable" with its reason: a missing real
+ * figure is not a zero. */
+function realCostSubRowText(real: RealCostInfo): string {
+  if (real.monthToDateUsd === undefined) {
+    return `└ ${REAL_COST_LABEL}: unavailable${real.error ? ` (${real.error})` : ""}`;
+  }
+  const parts: string[] = [];
+  if (real.windowUsd !== undefined && Math.abs(real.windowUsd - real.monthToDateUsd) > 0.005) {
+    parts.push(`trailing 3 months ${formatCost(real.windowUsd)}`);
+  }
+  if (real.budgetLimitUsd !== undefined) {
+    parts.push(
+      real.budgetActualUsd !== undefined
+        ? `budget actual ${formatCost(real.budgetActualUsd)} of ${formatCost(real.budgetLimitUsd)}`
+        : `budget ${formatCost(real.budgetLimitUsd)}`,
+    );
+  }
+  if (real.note) parts.push(real.note);
+  return `└ ${REAL_COST_LABEL}: ${formatCost(real.monthToDateUsd)}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`;
+}
+
+/** A full-table-width detail line (the real-cost sub-rows and the trailing
+ * real-spend total): one spanning cell between the outer borders, clipped
+ * with an ellipsis when longer than the width the columns above already
+ * sized: a chatty error note must never widen the whole table. */
+function spanRow(text: string, tableWidth: number): string {
+  const interior = Math.max(1, tableWidth - 4);
+  const clipped = text.length > interior ? `${text.slice(0, interior - 1)}…` : text;
+  return `│ ${clipped.padEnd(interior)} │`;
 }
 
 interface Totals {
@@ -205,6 +241,13 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
   const rows = tableResults.map((r) => (r.pending ? pendingRow(r, spinnerFrame) : r.report ? successRow(r) : errorRow(r)));
   const totals = successes.length > 0 ? computeTotals(successes) : undefined;
   const total = successes.length > 1 && totals ? totalRow(totals) : undefined;
+  // Real (AWS-reported) spend is summarised separately from the estimate
+  // totals: the TOTAL row's EST. COST stays a sum of local estimates, and
+  // the real figure gets its own trailing line only from rows whose Cost
+  // Explorer query actually answered (an unavailable figure must not read
+  // as a confirmed zero).
+  const realTotal = successes.reduce((sum, r) => (typeof r.realCost?.monthToDateUsd === "number" ? sum + r.realCost.monthToDateUsd : sum), 0);
+  const hasRealTotal = successes.some((r) => typeof r.realCost?.monthToDateUsd === "number");
   const span = totals ? combinedDateSpan(results) : undefined;
   const avgs = totals && span ? avgRows(totals, span) : [];
 
@@ -228,21 +271,22 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
     lines.push("");
   }
 
-  lines.push(
-    borderRow(widths, "┌", "┬", "┐"),
-    bold(padRow(HEADERS, widths, NUMERIC_COLUMNS)),
-    borderRow(widths, "├", "┼", "┤"),
-    ...rows.map((row, i) =>
-      tableResults[i]!.pending
+  lines.push(borderRow(widths, "┌", "┬", "┐"), bold(padRow(HEADERS, widths, NUMERIC_COLUMNS)), borderRow(widths, "├", "┼", "┤"));
+  tableResults.forEach((r, i) => {
+    const row = rows[i]!;
+    lines.push(
+      r.pending
         ? dim(padRow(row, widths, NUMERIC_COLUMNS))
-        : tableResults[i]!.error && !tableResults[i]!.report
+        : r.error && !r.report
           ? yellow(padRow(row, widths, NUMERIC_COLUMNS))
           : padRow(row, widths, NUMERIC_COLUMNS),
-    ),
-  );
+    );
+    if (r.report && r.realCost) lines.push(dim(spanRow(realCostSubRowText(r.realCost), tableWidth)));
+  });
   if (total) {
     lines.push(borderRow(widths, "├", "┼", "┤"));
     lines.push(gray(padRow(total, widths, NUMERIC_COLUMNS)));
+    if (hasRealTotal) lines.push(dim(spanRow(`└ real AWS total month-to-date: ${formatCost(realTotal)}`, tableWidth)));
   }
   if (avgs.length > 0) {
     lines.push(borderRow(widths, "├", "┼", "┤"));
