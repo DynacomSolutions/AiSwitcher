@@ -87,6 +87,41 @@ export interface AwsBedrockLimitsDeps {
   awsProfileDeps?: AwsProfileDeps;
 }
 
+/** The account-scoped budget fetch shared by the `ais limits` identity path
+ * (fetchAwsBedrockLimits below) and the spend guard's per-account cycle
+ * (spend/compute.ts): DescribeBudgets for the list (which alone carries no
+ * CalculatedSpend), then DescribeBudget per budget for the actual-spend
+ * figure. Transient blips retry like every other fetcher; SSO expiry and
+ * hard failures come back classified in `error`/`ssoError` instead of
+ * thrown, so neither caller has to re-implement the taxonomy. Exported for
+ * the guard and for tests. */
+export async function fetchAccountBudgetWires(
+  target: { profile: string; region?: string; accountId: string },
+  api: BudgetsApi = defaultBudgetsApi(target.profile, target.region),
+): Promise<{ budgets: BudgetWire[]; error?: string; ssoError?: boolean }> {
+  try {
+    return {
+      budgets: await withAwsTransientRetry(async () => {
+        const listed = await api.listBudgets(target.accountId);
+        return Promise.all(
+          listed.map(async (budget) =>
+            budget.BudgetName ? { ...budget, ...(await api.describeBudget(target.accountId, budget.BudgetName!)) } : budget,
+          ),
+        );
+      }),
+    };
+  } catch (err) {
+    if (isSsoAuthError(err)) {
+      return {
+        budgets: [],
+        ssoError: true,
+        error: `AWS SSO credentials expired or unavailable for profile "${target.profile}" — run \`aws sso login --profile ${target.profile}\`, then retry`,
+      };
+    }
+    return { budgets: [], error: `AWS Budgets query failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 function formatResetsAt(date: Date): string {
   return date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
@@ -238,24 +273,12 @@ export async function fetchAwsBedrockLimits(identity: Identity, explicitTool: bo
   }
 
   const api = deps.budgets ?? defaultBudgetsApi(target.profile, target.region);
-  let budgets: BudgetWire[];
-  try {
-    budgets = await withAwsTransientRetry(async () => {
-      const listed = await api.listBudgets(target.accountId!);
-      // ListBudgets (DescribeBudgets) alone carries no CalculatedSpend —
-      // describe each budget to get the actual-spend figure the percentage
-      // needs.
-      return Promise.all(
-        listed.map(async (budget) =>
-          budget.BudgetName ? { ...budget, ...(await api.describeBudget(target.accountId!, budget.BudgetName!)) } : budget,
-        ),
-      );
-    });
-  } catch (err) {
-    if (isSsoAuthError(err)) {
-      return [unavailable(identity, `AWS SSO credentials expired or unavailable for profile "${target.profile}" — run \`aws sso login --profile ${target.profile}\`, then retry`)];
-    }
-    return [unavailable(identity, `AWS Budgets query failed: ${err instanceof Error ? err.message : String(err)}`)];
+  const { budgets, error, ssoError } = await fetchAccountBudgetWires(
+    { profile: target.profile, ...(target.region ? { region: target.region } : {}), accountId: target.accountId },
+    api,
+  );
+  if (error !== undefined) {
+    return [unavailable(identity, error)];
   }
 
   const windows = budgets.map((budget) => windowFromBudget(budget, deps)).filter((w): w is LimitWindow => w !== undefined);

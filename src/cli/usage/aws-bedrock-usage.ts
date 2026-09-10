@@ -53,7 +53,10 @@ export interface CostExplorerApi {
  * region (confirmed behaviour of the service, not a per-account quirk). */
 export const COST_EXPLORER_REGION = "us-east-1";
 
-function defaultCostExplorerApi(profile: string): CostExplorerApi {
+/** Exported (not just for fetchAwsBedrockUsage) so the spend guard's
+ * per-account cycle can reuse the exact same endpoint/pagination/filter
+ * behaviour with its own window. */
+export function defaultCostExplorerApi(profile: string): CostExplorerApi {
   const client = new CostExplorerClient({
     region: COST_EXPLORER_REGION,
     credentials: fromIni({ profile, ignoreCache: false }),
@@ -113,6 +116,19 @@ function bucketAmount(time: CostAndUsageBucket): number | undefined {
   if (raw === undefined) return undefined;
   const value = Number(raw);
   return Number.isFinite(value) ? value : undefined;
+}
+
+/** Pure sum of a GetCostAndUsage response's UnblendedCost buckets — the one
+ * figure the spend guard needs from Cost Explorer (period Bedrock spend).
+ * Buckets without a parsable amount contribute 0. Exported for the guard
+ * and for tests. */
+export function sumCostExplorerBuckets(wire: CostExplorerWire): number {
+  let total = 0;
+  for (const bucket of wire.ResultsByTime ?? []) {
+    const amount = bucketAmount(bucket);
+    if (amount !== undefined) total += amount;
+  }
+  return total;
 }
 
 /** Pure mapping from the two wire responses to the report shape. Zero
