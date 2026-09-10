@@ -215,6 +215,86 @@ export function unknownBedrockModelFallbackPrice(): BedrockModelPrice {
   };
 }
 
+/**
+ * List prices for the chat models the wrapped CLIs actually run against,
+ * used by usage/breakdown.ts to value per-tool-call token attribution.
+ * USD per million tokens from https://models.dev/api.json (checked
+ * 10 September 2026), the same catalogue source cited for the Bedrock table
+ * above. These value plan-included usage too: an estimate of what the tokens
+ * would cost at list rates, never real billed spend. Models absent from the
+ * table price at nothing and are reported as unpriced by the caller; only
+ * models seen in this machine's logs (plus their immediate neighbours) are
+ * listed. Publishes no cache-write rate (OpenAI) -> writes are new input at
+ * the ordinary input rate, matching estimateDetailedModelTokenCost's
+ * convention.
+ */
+export interface ListModelPrice {
+  usdPer1mInput: number;
+  usdPer1mOutput: number;
+  usdPer1mCacheRead: number;
+  usdPer1mCacheWrite: number;
+}
+
+function listPrice(input: number, output: number, cacheRead: number, cacheWrite = input): ListModelPrice {
+  return { usdPer1mInput: input, usdPer1mOutput: output, usdPer1mCacheRead: cacheRead, usdPer1mCacheWrite: cacheWrite };
+}
+
+export const CHAT_MODEL_PRICES: Record<string, ListModelPrice> = {
+  "claude-fable-5": listPrice(10, 50, 1, 12.5),
+  "claude-fable-5-1": listPrice(10, 50, 0.25, 12.5),
+  "claude-opus-4-5": listPrice(5, 25, 0.5, 6.25),
+  "claude-opus-4-6": listPrice(5, 25, 0.5, 6.25),
+  "claude-opus-4-7": listPrice(5, 25, 0.5, 6.25),
+  "claude-opus-4-8": listPrice(5, 25, 0.5, 6.25),
+  "claude-opus-5": listPrice(5, 25, 0.5, 6.25),
+  "claude-sonnet-4-5": listPrice(3, 15, 0.3, 3.75),
+  "claude-sonnet-4-6": listPrice(3, 15, 0.3, 3.75),
+  "claude-sonnet-5": listPrice(2, 10, 0.2, 2.5),
+  "claude-haiku-4-5": listPrice(1, 5, 0.1, 1.25),
+  "gpt-5": listPrice(1.25, 10, 0.125),
+  "gpt-5.1": listPrice(1.25, 10, 0.125),
+  "gpt-5.2": listPrice(1.75, 14, 0.175),
+  "gpt-5.2-codex": listPrice(1.75, 14, 0.175),
+  "gpt-5.3-codex": listPrice(1.75, 14, 0.175),
+  "gpt-5.1-codex-mini": listPrice(0.25, 2, 0.025),
+  "gpt-5.4": listPrice(2.5, 15, 0.25),
+  "gpt-5.4-mini": listPrice(0.75, 4.5, 0.075),
+  "gpt-5.4-nano": listPrice(0.2, 1.25, 0.02),
+  "gpt-5.5": listPrice(5, 30, 0.5),
+  "gpt-5.6": listPrice(4, 20, 0.4, 5),
+  "gpt-5.6-luna": listPrice(0.2, 1.2, 0.02, 0.25),
+  "gpt-5.6-sol": listPrice(4, 20, 0.4, 5),
+  "gpt-5.6-terra": listPrice(2, 12, 0.2, 2.5),
+  "gpt-6-astra": listPrice(10, 50, 1, 12.5),
+  "gpt-4o": listPrice(2.5, 10, 1.25),
+};
+
+/** Dated snapshot ids (`claude-opus-4-8-20260101`) price like their base
+ * entry; provider path prefixes (`openai/`, `anthropic/`) are dropped. */
+export function normaliseChatModelId(model: string): string {
+  return normaliseModelId(model).replace(/-\d{8}$/, "");
+}
+
+/** Values one token tally at chat list rates (see CHAT_MODEL_PRICES).
+ * Returns undefined for models with no entry: reporting callers surface
+ * that honestly rather than inventing a price. */
+export function estimateChatModelTokenCost(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheWriteTokens: number,
+): number | undefined {
+  const price = CHAT_MODEL_PRICES[normaliseChatModelId(model)];
+  if (!price) return undefined;
+  return (
+    inputTokens * price.usdPer1mInput +
+    outputTokens * price.usdPer1mOutput +
+    cacheReadTokens * price.usdPer1mCacheRead +
+    cacheWriteTokens * price.usdPer1mCacheWrite
+  ) / 1_000_000;
+}
+
 /** Pi records uncached input, cache reads, and cache writes separately. Use
  * that real split when valuing plan-included Pi activity; cache writes are
  * new input at the ordinary input rate, while reads receive the provider's
