@@ -2,9 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
   estimateIdentityLocalSpend,
   listRecentFiles,
+  readIdentityLocalSpend,
   recordsFromClaudeProjectLog,
   recordsFromCodexRollout,
-} from "../../src/spend/local-estimate.ts";
+} from "../../src/shared/local-spend.ts";
 
 const MONTH_START = new Date(2026, 8, 1); // 1 Sep 2026 local
 
@@ -201,5 +202,79 @@ describe("listRecentFiles", () => {
 
   test("a missing root reports unreadable instead of throwing", () => {
     expect(listRecentFiles("/nothing", MONTH_START, fixtureDeps({ dirs: [], files: {} }), true)).toEqual({ files: [], unreadable: true });
+  });
+});
+
+describe("readIdentityLocalSpend", () => {
+  test("returns the same records' token totals, per-model breakdown, daily tokens and span alongside the estimate", () => {
+    const fixture: FsFixture = {
+      dirs: ["/id/sessions"],
+      files: {
+        "/id/sessions/rollout.jsonl": {
+          text: [
+            codexLine("turn_context"),
+            codexLine("token_count"),
+            codexLine("token_count", { usage: { input_tokens: 2000, cached_input_tokens: 500, cache_write_input_tokens: 0, output_tokens: 100 } }),
+          ].join("\n"),
+          mtimeMs: MONTH_START.getTime() + 1000,
+        },
+      },
+    };
+    const read = readIdentityLocalSpend("codex", "/id", MONTH_START, fixtureDeps(fixture));
+    // record 1: input 100, cacheWrite 900, output 50; record 2: input 1500, cacheRead 500, output 100
+    expect(read.messages).toBe(2);
+    expect(read.input).toBe(1600);
+    expect(read.output).toBe(150);
+    expect(read.cacheRead).toBe(500);
+    expect(read.cacheWrite).toBe(900);
+    expect(read.models).toHaveLength(1);
+    expect(read.models[0]).toMatchObject({ model: "openai.gpt-6-astra", input: 1600, output: 150, cacheRead: 500, cacheWrite: 900, messageCount: 2 });
+    // The per-model valuation matches the record-order estimate total.
+    expect(read.models[0]!.usd).toBeCloseTo(read.usd, 12);
+    expect(read.usd).toBeCloseTo(estimateIdentityLocalSpend("codex", "/id", MONTH_START, fixtureDeps(fixture)).usd, 15);
+    // Both events share one local day: dailyTokens keys on input+output only.
+    expect(read.dailyTokens).toEqual({ "2026-09-02": 1750 });
+    expect(read.firstMs).toBe(Date.parse("2026-09-02T03:00:01.000Z"));
+    expect(read.lastMs).toBe(Date.parse("2026-09-02T03:00:01.000Z"));
+  });
+
+  test("two models produce two entries; untimed records still count but never widen the span", () => {
+    const untimed = JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", info: { last_token_usage: { input_tokens: 10, output_tokens: 5 } } },
+    });
+    const otherModel = [
+      JSON.stringify({ timestamp: "2026-09-03T03:00:00.000Z", type: "turn_context", payload: { model: "openai.gpt-5.6-luna" } }),
+      JSON.stringify({
+        timestamp: "2026-09-03T03:00:01.000Z",
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+      }),
+    ].join("\n");
+    const fixture: FsFixture = {
+      dirs: ["/id/sessions"],
+      files: {
+        "/id/sessions/a.jsonl": { text: untimed, mtimeMs: MONTH_START.getTime() + 1 },
+        "/id/sessions/b.jsonl": { text: otherModel, mtimeMs: MONTH_START.getTime() + 1 },
+      },
+    };
+    const read = readIdentityLocalSpend("codex", "/id", MONTH_START, fixtureDeps(fixture));
+    expect(read.messages).toBe(2);
+    expect(read.models.map((m) => m.model).sort()).toEqual(["openai.gpt-5.6-luna", "unknown"]);
+    expect(read.firstMs).toBe(Date.parse("2026-09-03T03:00:01.000Z"));
+    expect(read.lastMs).toBe(read.firstMs);
+    expect(Object.keys(read.dailyTokens)).toEqual(["2026-09-03"]);
+  });
+
+  test("readerless tools and unreadable roots return zeroed token fields with the guard's exact notes", () => {
+    const readerless = readIdentityLocalSpend("kimi", "/id", MONTH_START, fixtureDeps({ dirs: [], files: {} }));
+    expect(readerless.notes).toEqual(['no local session reader for tool "kimi"']);
+    expect(readerless.messages).toBe(0);
+    expect(readerless.models).toEqual([]);
+    expect(readerless.dailyTokens).toEqual({});
+    const empty = readIdentityLocalSpend("codex", "/id", MONTH_START, fixtureDeps({ dirs: [], files: {} }));
+    expect(empty.messages).toBe(0);
+    expect(empty.notes).toEqual([]);
+    expect(empty.firstMs).toBeUndefined();
   });
 });

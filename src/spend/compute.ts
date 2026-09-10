@@ -7,7 +7,7 @@ import { defaultCostExplorerApi, sumCostExplorerBuckets, type CostExplorerApi } 
 import type { AwsProfileDeps } from "../identities/aws-profile.ts";
 import { periodStartForTimeUnit, chooseBudget, computeAccountState, type AccountSpendState, type BudgetSnapshot } from "./state.ts";
 import { resolveGuardAccounts, type GuardAccount } from "./accounts.ts";
-import { estimateIdentityLocalSpend } from "./local-estimate.ts";
+import { estimateIdentityLocalSpend } from "../shared/local-spend.ts";
 
 /**
  * One full spend-guard cycle: per AWS account, fetch THIS cycle's real

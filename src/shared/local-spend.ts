@@ -2,17 +2,28 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolConfig } from "../identities/types.ts";
 import { estimateBedrockTokenCost, unknownBedrockModelFallbackPrice } from "../identities/model-pricing.ts";
+import { localDateKey } from "../cli/usage/local-day.ts";
 
 /**
- * The spend guard's PRIMARY signal: a fast, fully-offline, token-based cost
- * estimate for one identity over a budget period, computed DIRECTLY from the
- * same local session logs the usage pipeline reads — never by spawning
- * tokscale. Measured on this machine (2026-09-10): a warm tokscale spawn
- * costs ~2.4s for one codex identity (and its default report has no date
- * filter at all, so it cannot produce month-to-date), while the direct
- * readers here walk only period-recent files and finish well under the
- * launch gate's 1.5s ceiling. tokscale remains the right engine for the
- * interactive `ais usage` report; it is simply the wrong shape for a gate.
+ * The shared local session-log readers for AWS Bedrock spend. Two consumers,
+ * one implementation:
+ *
+ *   - the spend guard (`spend/compute.ts`), whose PRIMARY breach signal is
+ *     the fast, fully-offline, token-based cost estimate for one identity
+ *     over a budget period — computed DIRECTLY from the same local session
+ *     logs the usage pipeline reads, never by spawning tokscale. Measured on
+ *     this machine (2026-09-10): a warm tokscale spawn costs ~2.4s for one
+ *     codex identity (and its default report has no date filter at all, so
+ *     it cannot produce month-to-date), while the direct readers here walk
+ *     only period-recent files and finish well under the launch gate's 1.5s
+ *     ceiling. tokscale remains the right engine for the interactive `ais
+ *     usage` report for non-Bedrock providers; it is simply the wrong shape
+ *     for a gate.
+ *   - the `ais usage` report (`usage/aws-bedrock-usage.ts`), whose AWS
+ *     Bedrock rows show the SAME local month-to-date figures in the normal
+ *     token/cost columns (so they reconcile with the guard by construction),
+ *     while AWS's own real billing figures render separately as real-cost
+ *     sub-rows.
  *
  * Readers exist for the two identity kinds that can be Bedrock-backed (see
  * identities/aws-profile.ts): codex (config.toml model_provider =
@@ -39,6 +50,42 @@ export interface LocalSpendResult {
   /** Non-fatal notes (a reader missing for the tool, etc.). Unreadable
    * files and missing session dirs are simply zero contribution. */
   notes: string[];
+}
+
+/** Per-model token/cost totals for one identity's period: feeds the usage
+ * report's per-model entries (model, provider, tokens, estimate). */
+export interface LocalSpendModelTotals {
+  model: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  messageCount: number;
+  /** Period estimate for this model, including unknown-model fallback
+   * valuation when the model is missing from the price table. */
+  usd: number;
+}
+
+/** Everything the usage report and the guard need from one identity's local
+ * logs over a period, from a single walk of the period-recent files. Token
+ * totals count the SAME records the usd estimate values, so an
+ * identity's local figures reconcile with the spend guard's estimate by
+ * construction. */
+export interface LocalSpendRead extends LocalSpendResult {
+  messages: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  models: LocalSpendModelTotals[];
+  /** Local "YYYY-MM-DD" (see usage/local-day.ts) -> input+output tokens that
+   * day, for the shared contribution graph. Only days with activity. */
+  dailyTokens: Record<string, number>;
+  /** Span of timestamped records (records with no parsable timestamp still
+   * COUNT towards the totals, since an under-count defeats the guard; they
+   * just cannot widen a display range they cannot be placed in). */
+  firstMs?: number;
+  lastMs?: number;
 }
 
 export interface LocalEstimateDeps {
@@ -297,28 +344,55 @@ const SESSION_ROOTS: Partial<Record<ToolConfig["toolName"], string>> = {
 };
 
 /**
- * Estimates one identity's Bedrock-priced local spend over the period
- * starting at `periodStart` (the budget's own current period — month-to-date
- * for a MONTHLY budget, and so on). Records with no parsable timestamp are
- * counted (see UsageRecord.atMs); records timestamped BEFORE the period are
- * skipped, so a session file spanning the period boundary contributes only
- * its in-period deltas. Returns 0 with a note (not an error) for tools with
- * no reader and for identities with no session data: "nothing logged this
- * period" is a normal offline state, never a failure.
+ * Reads one identity's local Bedrock usage over the period starting at
+ * `periodStart` (month-to-date for a MONTHLY budget, and so on): the same
+ * records, filters and valuation the guard's estimate uses, plus the token
+ * totals and breakdowns the usage report renders. Records with no parsable
+ * timestamp are counted (see UsageRecord.atMs); records timestamped BEFORE
+ * the period are skipped, so a session file spanning the period boundary
+ * contributes only its in-period deltas. Returns 0 with a note (not an
+ * error) for tools with no reader and for identities with no session data:
+ * "nothing logged this period" is a normal offline state, never a failure.
  */
-export function estimateIdentityLocalSpend(
+export function readIdentityLocalSpend(
   toolName: ToolConfig["toolName"],
   configDir: string,
   periodStart: Date,
   deps: LocalEstimateDeps = {},
-): LocalSpendResult {
+): LocalSpendRead {
   const reader = READERS[toolName];
   const rootName = SESSION_ROOTS[toolName];
   if (!reader || !rootName) {
-    return { usd: 0, unknownModelUsd: 0, filesRead: 0, notes: [`no local session reader for tool "${toolName}"`] };
+    return {
+      usd: 0,
+      unknownModelUsd: 0,
+      filesRead: 0,
+      notes: [`no local session reader for tool "${toolName}"`],
+      messages: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      models: [],
+      dailyTokens: {},
+    };
   }
   const { files, unreadable } = listRecentFiles(join(configDir, rootName), periodStart, deps, toolName === "codex");
-  if (unreadable) return { usd: 0, unknownModelUsd: 0, filesRead: 0, notes: [] };
+  if (unreadable) {
+    return {
+      usd: 0,
+      unknownModelUsd: 0,
+      filesRead: 0,
+      notes: [],
+      messages: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      models: [],
+      dailyTokens: {},
+    };
+  }
 
   const readText = deps.readText ?? defaultReadText;
   const periodStartMs = periodStart.getTime();
@@ -332,5 +406,77 @@ export function estimateIdentityLocalSpend(
     }
   }
   const valued = valueRecords(records);
-  return { usd: valued.usd, unknownModelUsd: valued.unknownModelUsd, filesRead: files.length, notes: [] };
+
+  // Per-model and per-day rollups for the usage report's entries, token
+  // columns, contribution graph and date span. The dollar total itself stays
+  // the record-order sum above, identical to the guard's own accumulation.
+  const models = new Map<string, LocalSpendModelTotals>();
+  const dailyTokens: Record<string, number> = {};
+  let firstMs: number | undefined;
+  let lastMs: number | undefined;
+  let messages = 0;
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let cacheWrite = 0;
+  for (const r of records) {
+    messages += 1;
+    input += r.input;
+    output += r.output;
+    cacheRead += r.cacheRead;
+    cacheWrite += r.cacheWrite;
+    let bucket = models.get(r.model);
+    if (!bucket) models.set(r.model, (bucket = { model: r.model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, messageCount: 0, usd: 0 }));
+    bucket.input += r.input;
+    bucket.output += r.output;
+    bucket.cacheRead += r.cacheRead;
+    bucket.cacheWrite += r.cacheWrite;
+    bucket.messageCount += 1;
+    const priced = estimateBedrockTokenCost(r.model, r.input, r.output, r.cacheRead, r.cacheWrite);
+    if (priced !== undefined) {
+      bucket.usd += priced;
+    } else {
+      const fallback = unknownBedrockModelFallbackPrice();
+      bucket.usd +=
+        (r.input * fallback.usdPer1mInput +
+          r.output * fallback.usdPer1mOutput +
+          r.cacheRead * fallback.usdPer1mCacheRead +
+          r.cacheWrite * fallback.usdPer1mCacheWrite) /
+        1_000_000;
+    }
+    if (r.atMs !== undefined) {
+      const day = localDateKey(r.atMs);
+      dailyTokens[day] = (dailyTokens[day] ?? 0) + r.input + r.output;
+      firstMs = firstMs === undefined ? r.atMs : Math.min(firstMs, r.atMs);
+      lastMs = lastMs === undefined ? r.atMs : Math.max(lastMs, r.atMs);
+    }
+  }
+
+  return {
+    usd: valued.usd,
+    unknownModelUsd: valued.unknownModelUsd,
+    filesRead: files.length,
+    notes: [],
+    messages,
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    models: [...models.values()],
+    dailyTokens,
+    ...(firstMs !== undefined && lastMs !== undefined ? { firstMs, lastMs } : {}),
+  };
+}
+
+/** The guard's estimate: the same read, reduced to the four fields the
+ * enforcement decision consumes. Kept as its own named export so the
+ * guard's contract (and tests) are untouched by the usage side's needs. */
+export function estimateIdentityLocalSpend(
+  toolName: ToolConfig["toolName"],
+  configDir: string,
+  periodStart: Date,
+  deps: LocalEstimateDeps = {},
+): LocalSpendResult {
+  const read = readIdentityLocalSpend(toolName, configDir, periodStart, deps);
+  return { usd: read.usd, unknownModelUsd: read.unknownModelUsd, filesRead: read.filesRead, notes: read.notes };
 }

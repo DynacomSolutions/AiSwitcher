@@ -153,7 +153,7 @@ export function estimateModelTokenCost(provider: "zai" | "alibaba", model: strin
  * WRITES bill above the input rate (1.25x) while reads discount heavily —
  * so this provider needs its own four-rate shape, unlike the subscription
  * estimates above. Values serve the spend guard's LOCAL estimate
- * (spend/local-estimate.ts): an estimate, never real billing — real pricing
+ * (shared/local-spend.ts): an estimate, never real billing — real pricing
  * may differ (request mode, caching behaviour, tiered >200k-context rates
  * are not modelled here, which under-counts very long contexts slightly).
  */
