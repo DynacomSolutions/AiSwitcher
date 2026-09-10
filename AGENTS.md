@@ -2326,6 +2326,33 @@ provider's models.
   a JSON file), so `open.ts`'s Chrome-MCP-redirect mechanism has nothing to
   do for ali either (same as zai's own final state, see "zai case study,
   take 3" above), never re-verified because there's nothing here to verify.
+- **Console-cookie auto-refresh post-mortem and hardening (2026-09-10).**
+  The user's ali console session expired again despite the AuthRefreshScheduler
+  and the host systemd timer. Root cause, three stacked layers, all
+  evidence-backed live: (1) Alibaba expired the pod browser's login
+  server-side (last successful harvest 2026-09-05 10:30Z; no
+  `login_aliyunid_ticket` cookie and the console renders "Log In to Use"
+  after navigation today); a pure cookie harvest can never out-live
+  Alibaba's login TTL, so an interactive noVNC re-login remains the manual
+  step. (2) The auth browser pod's tab sat at `about:blank` after pod
+  churn, and `refreshAliAuthSession`'s starting-URL precondition bailed on
+  that EVERY tick without ever opening the console itself, so a transient
+  tab state permanently bricked the automation with no recovery and no
+  alarm. (3) When the tab WAS on an Alibaba page the harvest wrote whatever
+  it found and reported success (verified live: 39 logged-out analytics
+  cookies stamped over `console-cookie.txt`, including
+  `login_aliyunid_csrf`, which exists logged-out). Fix: the refresh now
+  navigates to the console itself (self-heals pod restarts), verifies the
+  `login_aliyunid_ticket`/`login_aliyunid` cookie BEFORE writing anything,
+  and throws `AliAuthRefreshError` (message + remediation hint) instead of
+  returning `undefined`. Failure is LOUD: `ais auth refresh` prints the
+  error + hint to stderr and exits 1 (the `--quiet` timer still shows in
+  journalctl/systemctl), the scheduler logs one stderr line per failure
+  with a consecutive-failure count and escalates past 3
+  (`ESCALATION_THRESHOLD`), the status endpoint/`ais doctor` (new
+  `probeAliDoctor`, `degraded` status) flag it, and
+  `ais limits --tool=ali` appends "(last refresh attempt <ts>: <error>)"
+  to the expired message via `lastRefreshFailure()`.
 
 ### Provider-first views for limits and usage
 

@@ -17,7 +17,6 @@ function statusLabel(status: DoctorStatus, statusWord: string | undefined): stri
   if (status === "hung" || status === "degraded") return red(`✖ ${word}`);
   return yellow(`○ ${word}`);
 }
-}
 
 function formatElapsed(ms: number | undefined): string {
   return ms === undefined ? "" : `  ${dim(`(${(ms / 1000).toFixed(1)}s)`)}`;
