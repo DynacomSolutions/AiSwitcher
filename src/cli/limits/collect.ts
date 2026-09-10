@@ -4,6 +4,7 @@ import { CliUsageError } from "../errors.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { canonicalUsageProvider, providerForTool } from "../usage/providers.ts";
 import { fetchAliLimits } from "./ali-limits.ts";
+import { fetchAwsBedrockLimits } from "./aws-bedrock-limits.ts";
 import { fetchClaudeLimits } from "./claude-limits.ts";
 import { fetchCodexLimits } from "./codex-limits.ts";
 import { fetchGrokLimits } from "./grok-limits.ts";
@@ -11,6 +12,7 @@ import { fetchKimiLimits } from "./kimi-limits.ts";
 import { fetchOpencodeLimits } from "./opencode-limits.ts";
 import { fetchPiLimits } from "./pi-limits.ts";
 import { fetchZaiLimits } from "./zai-limits.ts";
+import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { FetchedLimitResult, ToolLimitResult } from "./types.ts";
 
 export interface LimitTarget {
@@ -50,7 +52,7 @@ function singleToolFetcher(
 
 const FETCHERS: Partial<Record<ToolConfig["toolName"], LimitFetcher>> = {
   claude: singleToolFetcher(fetchClaudeLimits, "claude"),
-  codex: singleToolFetcher(fetchCodexLimits, "codex"),
+  codex: fetchCodexLimitsForIdentity,
   grok: singleToolFetcher(fetchGrokLimits, "grok"),
   kimi: singleToolFetcher(fetchKimiLimits, "kimi"),
   zai: singleToolFetcher(fetchZaiLimits, "zai"),
@@ -58,6 +60,19 @@ const FETCHERS: Partial<Record<ToolConfig["toolName"], LimitFetcher>> = {
   pi: fetchPiLimits,
   opencode: fetchOpencodeLimits,
 };
+
+/** codex is a 1:1 tool whose PROVIDER varies per identity: a regular codex
+ * identity answers for OpenAI (singleToolFetcher's stamp), but an AWS
+ * Bedrock-backed one (config.toml model_provider = "amazon-bedrock") answers
+ * for AWS Bedrock via AWS Budgets instead — the same routing the usage
+ * pipeline does in usage/run.ts's runOne. The Bedrock fetcher follows the
+ * multi-provider-adapter shape (constructs full ToolLimitResults, stamps
+ * provider itself, may return []) because providerForTool(codex) is "openai",
+ * which these results are not. */
+async function fetchCodexLimitsForIdentity(identity: Identity, explicitTool: boolean): Promise<ToolLimitResult[]> {
+  if (isBedrockIdentity(identity)) return fetchAwsBedrockLimits(identity, explicitTool);
+  return [{ ...(await fetchCodexLimits(identity)), provider: providerForTool("codex") }];
+}
 
 /** Same shape/rules as usage/run.ts's collectTargets, except the identity
  * filter is a positional (`ais limits <identity>`), not `--identity=` —
@@ -109,10 +124,15 @@ const MULTI_PROVIDER_TOOLS: ReadonlySet<ToolConfig["toolName"]> = new Set(["pi",
  * render for a target before its own fetch has resolved. Multi-provider
  * clients get NO pending seed: their provider isn't known yet, and a
  * placeholder under the tool's own fallback label would render a fake
- * tool-shaped section. Returns undefined for those. */
+ * tool-shaped section. Returns undefined for those. codex Bedrock-backed
+ * identities DO get a seed, but stamped "aws-bedrock" — a pending "OpenAI"
+ * spinner over an identity whose provider is AWS would be the same wrong
+ * label by another route (detection is a cheap sync config.toml read). */
 export function pendingLimitResult(target: LimitTarget): ToolLimitResult | undefined {
   if (MULTI_PROVIDER_TOOLS.has(target.toolName)) return undefined;
-  return { toolName: target.toolName, provider: providerForTool(target.toolName), identity: target.identity, windows: [], status: "pending" };
+  const provider =
+    target.toolName === "codex" && isBedrockIdentity(target.identity) ? "aws-bedrock" : providerForTool(target.toolName);
+  return { toolName: target.toolName, provider, identity: target.identity, windows: [], status: "pending" };
 }
 
 /** Grok's fetch is always a local log-scrape (no live path exists at all —
@@ -123,7 +143,8 @@ export function pendingLimitResult(target: LimitTarget): ToolLimitResult | undef
 function unavailableCached(target: LimitTarget): ToolLimitResult {
   return {
     toolName: target.toolName,
-    provider: providerForTool(target.toolName),
+    provider:
+      target.toolName === "codex" && isBedrockIdentity(target.identity) ? "aws-bedrock" : providerForTool(target.toolName),
     identity: target.identity,
     windows: [],
     status: "unavailable",
