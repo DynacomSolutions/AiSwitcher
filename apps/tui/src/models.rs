@@ -115,6 +115,10 @@ pub struct LimitsResponse {
 pub struct LimitResult {
     #[serde(default, rename = "toolName", alias = "tool_name", alias = "tool")]
     pub tool_name: Option<String>,
+    /// Canonical upstream provider (the provider-first grouping key, already
+    /// resolved server-side, e.g. "anthropic", "openai", "opencode-go").
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub identity: IdentityRef,
     #[serde(default)]
@@ -127,6 +131,16 @@ pub struct LimitResult {
     pub captured_at: Option<String>,
     #[serde(default)]
     pub overage: Option<OverageInfo>,
+    #[serde(default, rename = "manualReset", alias = "manual_reset")]
+    pub manual_reset: Option<ManualResetInfo>,
+}
+
+/// Mirrors ManualResetInfo from src/cli/limits/types.ts: a reset credit the
+/// account can spend right now, present only when at least one is available.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ManualResetInfo {
+    #[serde(default, rename = "availableCount", alias = "available_count")]
+    pub available_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -171,6 +185,10 @@ pub struct UsageResult {
     pub report: Option<TokscaleReport>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Provider-reported real billed spend (see OverageInfo), distinct from
+    /// the report's token-estimate cost.
+    #[serde(default, rename = "extraCost", alias = "extra_cost")]
+    pub extra_cost: Option<OverageInfo>,
     #[serde(default, rename = "dateSpan", alias = "date_span")]
     pub date_span: Option<DateSpan>,
 }

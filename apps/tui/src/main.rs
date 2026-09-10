@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod config;
 mod models;
+mod summary;
 mod timefmt;
 mod ui;
 

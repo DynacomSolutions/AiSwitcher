@@ -2675,6 +2675,28 @@ Decisions are final by design; the reasoning is recorded here.
 
 ## Commands
 
+### `ais tui` status page (2026-09-10)
+
+- Tab 1 (Status) leads with an "Identity cost and limits" panel: one row per
+  identity and provider, merged live from `/api/limits` + `/api/usage`. It
+  follows the provider-first views rule: the tool never appears; a Pi/OpenCode
+  identity contributes one row per upstream provider it actually answers for.
+- Columns: IDENTITY, PROVIDER (with the limits fetch-state glyph: `●` live,
+  `○` cached, `✗` unavailable), EST $, REAL $, LIMITS (worst window as a
+  gauge), RESETS (the worst window's scheduled reset, plus a blocking note
+  like "credits depleted" and any `manualReset.availableCount` credits),
+  ERROR. The full per-window detail stays on the Limits and Usage tabs.
+- The EST/REAL split is the real-vs-estimate distinction, preserved: EST $ is
+  tokscale's token-estimate valuation of local token counts (never billed);
+  REAL $ is provider-reported billed spend from `extraCost`/`overage`
+  (`spentUsd`, or the provider's own status wording when no figure exists;
+  `-` when the provider has no overage concept at all).
+- Polling reuses the shared per-endpoint loops: status/processes 3s,
+  limits/usage 60s (server caches 45s); `r` on the status tab refreshes all
+  four sources. Scan requests use a per-endpoint client timeout (50s limits,
+  70s usage) that outlasts the console's server-side scan budget, so a
+  cold-cache poll is waited out rather than aborted mid-scan.
+
 ### OpenCode identity proxy (2026-08-27)
 
 - `opencode` is a real eighth AIS-managed CLI, separate from the retired

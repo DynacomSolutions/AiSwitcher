@@ -114,7 +114,7 @@ fn render_content(f: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect)
 
 fn render_footer(f: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let specific: &[&str] = match app.tab {
-        0 => &["auto 3s"],
+        0 => &["auto 3s", "costs/limits auto 60s", "j/k scroll"],
         1 => &["read-only: edits via web UI or ais CLI"],
         2 => &["r force refresh", "auto 60s"],
         3 => &["auto 60s"],

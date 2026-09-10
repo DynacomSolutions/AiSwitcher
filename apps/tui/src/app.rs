@@ -56,6 +56,17 @@ impl Endpoint {
         }
     }
 
+    /// Whole-request ceiling per endpoint. The scan endpoints must outlast
+    /// the console's server-side scan budgets (45s limits, 60s usage) so a
+    /// cold-cache poll is waited out instead of aborted; see api.rs.
+    const fn timeout(self) -> Duration {
+        match self {
+            Self::Limits => Duration::from_secs(50),
+            Self::Usage => Duration::from_secs(70),
+            _ => Duration::from_secs(20),
+        }
+    }
+
     const fn path(self) -> &'static str {
         match self {
             Self::Status => "/api/status",
@@ -81,9 +92,11 @@ impl Endpoint {
     }
 
     /// Endpoints refreshed by the manual refresh key on the given tab.
+    /// Tab 0's identity panel reads limits + usage, so `r` there refreshes
+    /// all four sources it renders.
     const fn for_tab(tab: usize) -> &'static [Self] {
         match tab {
-            0 => &[Self::Status, Self::Processes],
+            0 => &[Self::Status, Self::Processes, Self::Limits, Self::Usage],
             1 => &[Self::Identities],
             2 => &[Self::Limits],
             3 => &[Self::Usage],
@@ -250,13 +263,25 @@ async fn fetch_loop(
             _ = notify.notified() => {}
         }
         let msg = match endpoint {
-            Endpoint::Status => Msg::Status(client.get_json(endpoint.path()).await),
-            Endpoint::Processes => Msg::Processes(client.get_json(endpoint.path()).await),
-            Endpoint::Identities => Msg::Identities(client.get_json(endpoint.path()).await),
-            Endpoint::Limits => Msg::Limits(client.get_json(endpoint.path()).await),
-            Endpoint::Usage => Msg::Usage(client.get_json(endpoint.path()).await),
-            Endpoint::Sessions => Msg::Sessions(client.get_json(endpoint.path()).await),
-            Endpoint::Auth => Msg::Auth(client.get_json(endpoint.path()).await),
+            Endpoint::Status => {
+                Msg::Status(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
+            Endpoint::Processes => {
+                Msg::Processes(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
+            Endpoint::Identities => {
+                Msg::Identities(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
+            Endpoint::Limits => {
+                Msg::Limits(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
+            Endpoint::Usage => {
+                Msg::Usage(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
+            Endpoint::Sessions => {
+                Msg::Sessions(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
+            Endpoint::Auth => Msg::Auth(client.get_json(endpoint.path(), endpoint.timeout()).await),
         };
         if tx.send(msg).is_err() {
             return; // main loop gone: nothing left to feed
