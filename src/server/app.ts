@@ -10,6 +10,7 @@ import { aisHome } from "../shared/ais-home.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { type AuthRefreshScheduler } from "./auth-refresh.ts";
+import { type SpendGuardScheduler } from "./spend-guard.ts";
 import { HttpError } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated } from "./workers.ts";
@@ -30,6 +31,9 @@ export interface ConsoleAppDeps extends GuardDeps {
   distDir?: string;
   /** Daemon-side credential renewal; absent in bare-app tests. */
   authRefresh?: AuthRefreshScheduler;
+  /** Daemon-side spend guard (breach killer + cache writer); absent in
+   * bare-app tests, where /api/spend-guard answers 503. */
+  spendGuard?: SpendGuardScheduler;
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {
@@ -74,6 +78,13 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   });
 
   app.get("/api/processes", (c) => scanProcesses().then((p) => c.json(p)));
+
+  /* ----------------------------- spend guard ------------------------------- */
+
+  app.get("/api/spend-guard", (c) => {
+    if (!deps.spendGuard) throw new HttpError(503, "spend guard scheduler not running");
+    return c.json(deps.spendGuard.status());
+  });
 
   /* ------------------------------- identities ------------------------------ */
 
