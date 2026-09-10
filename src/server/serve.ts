@@ -3,6 +3,7 @@ import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
+import { loadHerdrBridgeConfig, HerdrBridgeScheduler } from "./herdr-bridge.ts";
 import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
@@ -65,6 +66,17 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     spendGuard.start();
   }
 
+  // Daemon-side herdr metadata bridge: per-pane AIS limit tokens for
+  // herdr's sidebar, via `herdr pane report-metadata --token $ais_*=...`
+  // (CALL only; never signals or restarts any herdr process). Interval and
+  // categories come from the machine-local herdr-bridge.json;
+  // AIS_HERDR_BRIDGE=0 opts the daemon out entirely.
+  let herdrBridge: HerdrBridgeScheduler | undefined;
+  if (process.env.AIS_HERDR_BRIDGE !== "0") {
+    herdrBridge = new HerdrBridgeScheduler({ config: await loadHerdrBridgeConfig() });
+    herdrBridge.start();
+  }
+
   const token = newConsoleToken();
   const deps: ConsoleAppDeps = {
     token,
@@ -73,6 +85,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     allowedHosts: parseAllowedHosts(process.env.AIS_WEB_ALLOWED_HOSTS),
     authRefresh: scheduler,
     ...(spendGuard ? { spendGuard } : {}),
+    ...(herdrBridge ? { herdrBridge } : {}),
     loginFlows,
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
@@ -108,6 +121,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     const shutdown = () => {
       scheduler.stop();
       spendGuard?.stop();
+      herdrBridge?.stop();
       loginFlows.stop();
       void clearServerState();
       server.stop(true);
@@ -117,7 +131,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     process.on("SIGINT", shutdown);
   }
 
-  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); loginFlows.stop(); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); loginFlows.stop(); server.stop(true); } };
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this
