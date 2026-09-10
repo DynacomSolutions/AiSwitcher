@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
-import { listRecentFiles, type LocalEstimateDeps } from "../../spend/local-estimate.ts";
+import { listRecentFiles, type LocalEstimateDeps } from "../../shared/local-spend.ts";
 import type { ParsedArgs } from "../args.ts";
 import { bold, dim, yellow } from "../colors.ts";
 import { runBatched } from "../limits/collect.ts";
