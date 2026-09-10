@@ -159,6 +159,20 @@ fn apply_usage(rows: &mut BTreeMap<RowKey, ProviderSummary>, result: &UsageResul
     if let Some(overage) = &result.extra_cost {
         entry.real = RealSpend::from_overage(overage);
     }
+    // AWS Bedrock rows carry their real spend in `realCost` (Cost Explorer
+    // month-to-date, plus the enforced budget's limit) instead of an overage
+    // probe; it lands in the same REAL $ column. Only an ANSWERED query maps
+    // here: an errored one must not overwrite the figure with a fake zero.
+    if let Some(real_cost) = &result.real_cost
+        && let Some(usd) = real_cost.month_to_date_usd
+    {
+        entry.real = RealSpend {
+            usd: Some(usd),
+            limit_usd: real_cost.budget_limit_usd,
+            active: false,
+            label: real_cost.note.clone(),
+        };
+    }
     if entry.error.is_none() {
         entry.error = result.error.clone();
     }
@@ -220,6 +234,7 @@ mod tests {
             }),
             error: None,
             extra_cost: None,
+            real_cost: None,
             date_span: None,
         }
     }
@@ -401,5 +416,40 @@ mod tests {
             }
             .is_reported()
         );
+    }
+
+    #[test]
+    fn bedrock_real_cost_lands_in_the_real_column_with_the_budget_limit() {
+        let mut usage = usage_result("pcg", "aws-bedrock", 2218.66);
+        usage.real_cost = Some(crate::models::RealCostInfo {
+            month_to_date_usd: Some(0.0),
+            budget_limit_usd: Some(1000.0),
+            note: Some("reported lag".to_string()),
+        });
+
+        let rows = summarize(None, Some(&usage_response(vec![usage])));
+
+        let real = &rows[0].providers[0].real;
+        assert_eq!(real.usd, Some(0.0));
+        assert_eq!(real.limit_usd, Some(1000.0));
+        assert!(!real.active);
+        assert!(real.is_reported());
+        assert_eq!(rows[0].providers[0].est_cost, Some(2218.66));
+    }
+
+    #[test]
+    fn an_errored_bedrock_real_cost_never_fakes_a_zero_figure() {
+        let mut usage = usage_result("pcg", "aws-bedrock", 2218.66);
+        // Only month_to_date_usd present makes the REAL column speak: a
+        // payload without an answered figure maps to nothing at all.
+        usage.real_cost = Some(crate::models::RealCostInfo {
+            month_to_date_usd: None,
+            budget_limit_usd: None,
+            note: None,
+        });
+
+        let rows = summarize(None, Some(&usage_response(vec![usage])));
+
+        assert!(!rows[0].providers[0].real.is_reported());
     }
 }
