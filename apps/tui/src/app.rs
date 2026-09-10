@@ -63,14 +63,14 @@ impl Endpoint {
     }
 
     /// Whole-request ceiling per endpoint. The scan endpoints must outlast
-    /// the console's server-side scan budgets (45s limits, 60s usage, 120s
+    /// the console's server-side scan budgets (45s limits, 60s usage, 240s
     /// breakdown) so a cold-cache poll is waited out instead of aborted; see
     /// api.rs.
     const fn timeout(self) -> Duration {
         match self {
             Self::Limits => Duration::from_secs(50),
             Self::Usage => Duration::from_secs(70),
-            Self::Breakdown => Duration::from_secs(130),
+            Self::Breakdown => Duration::from_secs(250),
             _ => Duration::from_secs(20),
         }
     }
