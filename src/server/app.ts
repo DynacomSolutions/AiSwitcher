@@ -11,6 +11,7 @@ import type { ToolConfig } from "../identities/types.ts";
 import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { type AuthRefreshScheduler } from "./auth-refresh.ts";
 import { type SpendGuardScheduler } from "./spend-guard.ts";
+import { type HerdrBridgeScheduler } from "./herdr-bridge.ts";
 import { HttpError } from "./types.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
@@ -35,6 +36,9 @@ export interface ConsoleAppDeps extends GuardDeps {
   /** Daemon-side spend guard (breach killer + cache writer); absent in
    * bare-app tests, where /api/spend-guard answers 503. */
   spendGuard?: SpendGuardScheduler;
+  /** Daemon-side herdr metadata bridge (per-pane limit tokens); absent in
+   * bare-app tests, where /api/herdr-bridge answers 503. */
+  herdrBridge?: HerdrBridgeScheduler;
   /** Daemon-managed per-identity login flows; absent in bare-app tests. */
   loginFlows?: LoginFlowManagerLike;
 }
@@ -87,6 +91,13 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   app.get("/api/spend-guard", (c) => {
     if (!deps.spendGuard) throw new HttpError(503, "spend guard scheduler not running");
     return c.json(deps.spendGuard.status());
+  });
+
+  /* --------------------------- herdr metadata bridge ------------------------ */
+
+  app.get("/api/herdr-bridge", (c) => {
+    if (!deps.herdrBridge) throw new HttpError(503, "herdr bridge scheduler not running");
+    return c.json(deps.herdrBridge.status());
   });
 
   /* ------------------------------- identities ------------------------------ */

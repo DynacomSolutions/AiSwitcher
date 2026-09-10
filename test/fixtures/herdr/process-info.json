@@ -1,0 +1,40 @@
+{
+  "id": "cli:pane:process_info",
+  "result": {
+    "process_info": {
+      "foreground_process_group_id": 848316,
+      "foreground_processes": [
+        {
+          "argv": [
+            "opencode"
+          ],
+          "cmdline": "opencode",
+          "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+          "name": "opencode",
+          "pid": 848316
+        },
+        {
+          "argv": [
+            "/home/thomas/.ais/npm/bin/opencode"
+          ],
+          "cmdline": "/home/thomas/.ais/npm/bin/opencode",
+          "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+          "name": "opencode",
+          "pid": 849083
+        },
+        {
+          "argv": [
+            "/home/thomas/.local/bin/codebase-memory-mcp"
+          ],
+          "cmdline": "/home/thomas/.local/bin/codebase-memory-mcp",
+          "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+          "name": "codebase-memory",
+          "pid": 853426
+        }
+      ],
+      "pane_id": "w2B:p1",
+      "shell_pid": 802685
+    },
+    "type": "pane_process_info"
+  }
+}

@@ -67,6 +67,49 @@ interface RawProc {
  * vanished mid-scan or belongs to another user (environ/cwd unreadable).
  * A process can still qualify via cmdline alone when environ is readable but
  * has no marker; identity attribution simply stays null then. */
+/** The identity-bearing slice of one process's environment: the wrapper's
+ * session marker (identity name + wrapped flag) and any recognised
+ * per-identity config-dir env vars. Pure over the raw environ text so the
+ * herdr bridge can attribute pane pids with exactly the same rules. */
+export interface EnvironAttribution {
+  identity: string | null;
+  wrapped: boolean;
+  identityEnv: Record<string, string>;
+}
+
+/** Pure environ-text parser (the same shape the herdr detection uses):
+ * NUL-separated KEY=VALUE entries. A marker with an empty value still means
+ * wrapped, with identity null. Exported for tests and the herdr bridge. */
+export function parseIdentityEnviron(text: string): EnvironAttribution {
+  let identity: string | null = null;
+  let wrapped = false;
+  const identityEnv: Record<string, string> = {};
+  for (const entry of text.split("\0")) {
+    if (entry.startsWith(`${IDENTITY_SESSION_MARKER}=`)) {
+      identity = entry.slice(IDENTITY_SESSION_MARKER.length + 1) || null;
+      wrapped = true;
+      continue;
+    }
+    const eq = entry.indexOf("=");
+    if (eq > 0 && IDENTITY_ENV_VARS.has(entry.slice(0, eq))) {
+      identityEnv[entry.slice(0, eq)] = entry.slice(eq + 1);
+    }
+  }
+  return { identity, wrapped, identityEnv };
+}
+
+/** Reads and parses one process's /proc/<pid>/environ. Undefined when the
+ * process vanished mid-scan or belongs to another user (unreadable). */
+export async function readProcessEnviron(pid: number): Promise<EnvironAttribution | undefined> {
+  let text: string;
+  try {
+    text = new TextDecoder().decode(await Bun.file(join(PROC, String(pid), "environ")).bytes());
+  } catch {
+    return undefined;
+  }
+  return parseIdentityEnviron(text);
+}
+
 async function inspectPid(pid: number, ticks: number, btime: number | null): Promise<RawProc | undefined> {
   const base = join(PROC, String(pid));
   let command = "";
@@ -87,19 +130,10 @@ async function inspectPid(pid: number, ticks: number, btime: number | null): Pro
   let cwd: string | null = null;
   let startedAt: string | null = null;
   try {
-    const envRaw = await Bun.file(join(base, "environ")).bytes();
-    const envText = new TextDecoder().decode(envRaw);
-    for (const entry of envText.split("\0")) {
-      if (entry.startsWith(`${IDENTITY_SESSION_MARKER}=`)) {
-        identity = entry.slice(IDENTITY_SESSION_MARKER.length + 1) || null;
-        wrapped = true;
-        continue;
-      }
-      const eq = entry.indexOf("=");
-      if (eq > 0 && IDENTITY_ENV_VARS.has(entry.slice(0, eq))) {
-        identityEnv[entry.slice(0, eq)] = entry.slice(eq + 1);
-      }
-    }
+    const parsed = parseIdentityEnviron(new TextDecoder().decode(await Bun.file(join(base, "environ")).bytes()));
+    identity = parsed.identity;
+    wrapped = parsed.wrapped;
+    Object.assign(identityEnv, parsed.identityEnv);
   } catch {
     // Other-user process: still report the binary/command line.
   }
