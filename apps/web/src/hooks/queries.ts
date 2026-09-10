@@ -25,7 +25,7 @@ export const qk = {
   loginFlow: (flowId: string) => ["auth", "flows", flowId] as const,
   fileRoots: ["files", "roots"] as const,
   fileTree: (root: string, path: string) => ["files", "tree", root, path] as const,
-  fileContent: (path: string) => ["files", "file", path] as const,
+  fileContent: (root: string, path: string) => ["files", "file", root, path] as const,
 };
 
 /** A flow consumes attention while it can still move on its own. */
@@ -131,10 +131,10 @@ export function useFileTreeQuery(root: string, path: string, enabled: boolean) {
   });
 }
 
-export function useFileContentQuery(path: string | null) {
+export function useFileContentQuery(root: string, path: string | null) {
   return useQuery({
-    queryKey: qk.fileContent(path ?? ""),
-    queryFn: () => api.getFileContent(path as string),
-    enabled: path !== null,
+    queryKey: qk.fileContent(root, path ?? ""),
+    queryFn: () => api.getFileContent(root, path as string),
+    enabled: root !== "" && path !== null,
   });
 }

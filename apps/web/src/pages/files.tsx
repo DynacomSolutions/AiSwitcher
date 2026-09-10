@@ -184,9 +184,9 @@ function DirectoryListing({
   );
 }
 
-function EditorPane({ filePath }: { filePath: string | null }) {
+function EditorPane({ rootKey, filePath }: { rootKey: string; filePath: string | null }) {
   const qc = useQueryClient();
-  const query = useFileContentQuery(filePath);
+  const query = useFileContentQuery(rootKey, filePath);
   const data = query.data;
 
   const [draft, setDraft] = useState("");
@@ -204,13 +204,13 @@ function EditorPane({ filePath }: { filePath: string | null }) {
   const dirty = data !== undefined && !data.binary && draft !== savedContent;
 
   const saveMutation = useMutation({
-    mutationFn: () => api.saveFile(filePath as string, draft),
+    mutationFn: () => api.saveFile(rootKey, filePath as string, draft),
     onSuccess: () => {
       setSavedContent(draft);
       toast.warning("File saved", {
         description: "The previous version was backed up by the console server.",
       });
-      void qc.invalidateQueries({ queryKey: qk.fileContent(filePath ?? "") });
+      void qc.invalidateQueries({ queryKey: qk.fileContent(rootKey, filePath ?? "") });
     },
     onError: (error) => toast.error("Save failed", { description: error.message }),
   });
@@ -404,7 +404,7 @@ export function FilesPage() {
           </CardContent>
         </Card>
 
-        <EditorPane filePath={openFilePath} />
+        <EditorPane rootKey={activeRootKey} filePath={openFilePath} />
       </div>
     </div>
   );
