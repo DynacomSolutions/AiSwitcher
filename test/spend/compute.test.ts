@@ -11,7 +11,7 @@ import type { Identity } from "../../src/identities/types.ts";
 
 function wire(overrides: Partial<BudgetWire> = {}): BudgetWire {
   return {
-    BudgetName: "pcg-bedrock-monthly-1000",
+    BudgetName: "acme-bedrock-monthly",
     BudgetType: "COST",
     TimeUnit: "MONTHLY",
     BudgetLimit: { Amount: "1000", Unit: "USD" },
@@ -29,7 +29,7 @@ describe("budgetSnapshotsFromWires", () => {
       wire({ BudgetName: "bad-limit", BudgetLimit: { Amount: "abc", Unit: "USD" } }),
     ]);
     expect(snapshots).toEqual([
-      { name: "pcg-bedrock-monthly-1000", limitUsd: 1000, actualUsd: 12.5, timeUnit: "MONTHLY" },
+      { name: "acme-bedrock-monthly", limitUsd: 1000, actualUsd: 12.5, timeUnit: "MONTHLY" },
     ]);
   });
 
@@ -40,7 +40,7 @@ describe("budgetSnapshotsFromWires", () => {
 
 const ACCOUNT: GuardAccount = {
   accountId: "123456789012",
-  profile: "nazare-prod",
+  profile: "acme-prod",
   region: "eu-west-2",
   identities: [
     { toolName: "codex", identity: { name: "guarded-a", label: "a", configDir: "/id/a" } },
@@ -73,8 +73,8 @@ describe("runSpendGuardCycle", () => {
     expect(errors).toEqual([]);
     const state = states["123456789012"]!;
     expect(state).toMatchObject({
-      profile: "nazare-prod",
-      budgetName: "pcg-bedrock-monthly-1000",
+      profile: "acme-prod",
+      budgetName: "acme-bedrock-monthly",
       budgetLimitUsd: 1000,
       budgetActualUsd: 12.5,
       localEstimateUsd: 200, // both identities summed

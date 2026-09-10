@@ -9,7 +9,7 @@ import {
 } from "../../../src/cli/limits/aws-bedrock-limits.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
-function identity(name = "pcg-bedrock"): Identity {
+function identity(name = "acme-bedrock"): Identity {
   return { name, label: name, configDir: `/tmp/does-not-exist/${name}` };
 }
 
@@ -29,8 +29,8 @@ function costBudget(overrides: Partial<BudgetWire> = {}): BudgetWire {
 
 const MAPPING_DEPS = {
   readText: (path: string): string => {
-    if (path.endsWith("aws-profiles.json")) return JSON.stringify({ version: 1, identities: { "pcg-bedrock": { profile: "pcg-prod" } } });
-    if (path.endsWith("config")) return "[profile pcg-prod]\nsso_account_id = 779846811377\nregion = eu-west-2\n";
+    if (path.endsWith("aws-profiles.json")) return JSON.stringify({ version: 1, identities: { "acme-bedrock": { profile: "acme-prod" } } });
+    if (path.endsWith("config")) return "[profile acme-prod]\nsso_account_id = 779846811377\nregion = eu-west-2\n";
     throw new Error(`unexpected path ${path}`);
   },
   awsProfilesPath: "/fixtures/aws-profiles.json",
@@ -158,7 +158,7 @@ describe("fetchAwsBedrockLimits", () => {
     };
     const results = await fetchAwsBedrockLimits(identity(), false, deps);
     expect(results[0]!.status).toBe("unavailable");
-    expect(results[0]!.error).toContain("aws sso login --profile pcg-prod");
+    expect(results[0]!.error).toContain("aws sso login --profile acme-prod");
     expect(results[0]!.windows).toEqual([]);
   });
 

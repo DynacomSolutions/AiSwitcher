@@ -22,8 +22,8 @@ const NOW = new Date(2026, 8, 10, 12, 0, 0);
 function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
   return {
     accountId: "123456789012",
-    profile: "nazare-prod",
-    budgetName: "pcg-bedrock-monthly-1000",
+    profile: "acme-prod",
+    budgetName: "acme-bedrock-monthly",
     budgetLimitUsd: 1000,
     budgetActualUsd: 0,
     budgetTimeUnit: "MONTHLY",

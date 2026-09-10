@@ -16,19 +16,19 @@ function identity(name: string, overrides: Partial<Identity> = {}): Identity {
 }
 
 const AWS_CONFIG = `
-[profile nazare]
-sso_session = Nazare
+[profile acme-sso]
+sso_session = Acme-SSO
 sso_account_id = 499324396263
 region = eu-west-2
 cli_pager=
 
-[profile pcg-dev]
-sso_session = Nazare
+[profile acme-dev]
+sso_session = Acme-SSO
 sso_account_id = 975049896933
 region = eu-west-2
 
-[profile pcg-prod]
-sso_session = Nazare
+[profile acme-prod]
+sso_session = Acme-SSO
 sso_account_id = 779846811377
 region = eu-west-2
 request_checksum_calculation=WHEN_REQUIRED
@@ -36,7 +36,7 @@ s3 =
   max_concurrent_requests = 1000
   multipart_threshold = 128MB
 
-[sso-session Nazare]
+[sso-session Acme-SSO]
 sso_region = eu-west-2
 
 [default]
@@ -46,18 +46,18 @@ region = us-east-1
 describe("parseAwsConfig", () => {
   test("extracts region and sso_account_id per profile, ignoring nested and sso-session sections", () => {
     const parsed = parseAwsConfig(AWS_CONFIG);
-    expect(parsed["nazare"]).toEqual({ region: "eu-west-2", accountId: "499324396263" });
-    expect(parsed["pcg-dev"]).toEqual({ region: "eu-west-2", accountId: "975049896933" });
-    expect(parsed["pcg-prod"]).toEqual({ region: "eu-west-2", accountId: "779846811377" });
+    expect(parsed["acme-sso"]).toEqual({ region: "eu-west-2", accountId: "499324396263" });
+    expect(parsed["acme-dev"]).toEqual({ region: "eu-west-2", accountId: "975049896933" });
+    expect(parsed["acme-prod"]).toEqual({ region: "eu-west-2", accountId: "779846811377" });
     expect(parsed["default"]).toEqual({ region: "us-east-1" });
   });
 
   test("an sso-session section never becomes a profile, and indented keys are ignored", () => {
     const parsed = parseAwsConfig(AWS_CONFIG);
-    // The `s3 =` sub-keys are indented and must not leak into pcg-prod's
-    // region/account mapping; Nazare has no [profile Nazare] section.
-    expect(parsed["pcg-prod"]).toEqual({ region: "eu-west-2", accountId: "779846811377" });
-    expect(parsed["Nazare"]).toBeUndefined();
+    // The `s3 =` sub-keys are indented and must not leak into acme-prod's
+    // region/account mapping; Acme-SSO has no [profile Acme-SSO] section.
+    expect(parsed["acme-prod"]).toEqual({ region: "eu-west-2", accountId: "779846811377" });
+    expect(parsed["Acme-SSO"]).toBeUndefined();
   });
 
   test("missing keys simply stay absent", () => {
@@ -80,8 +80,8 @@ describe("loadAwsProfileMapping", () => {
     const dir = mkdtempSync(join(tmpdir(), "ais-aws-profiles-"));
     try {
       const path = join(dir, "aws-profiles.json");
-      writeFileSync(path, JSON.stringify({ version: 1, identities: { pcg: { profile: "pcg-prod" } } }));
-      expect(loadAwsProfileMapping(path)).toEqual({ pcg: "pcg-prod" });
+      writeFileSync(path, JSON.stringify({ version: 1, identities: { acme: { profile: "acme-prod" } } }));
+      expect(loadAwsProfileMapping(path)).toEqual({ acme: "acme-prod" });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -121,7 +121,7 @@ describe("isBedrockIdentity", () => {
 describe("resolveAwsProfileForIdentity", () => {
   const deps = {
     readText: (path: string): string => {
-      if (path.endsWith("aws-profiles.json")) return JSON.stringify({ version: 1, identities: { pcg: { profile: "pcg-prod" } } });
+      if (path.endsWith("aws-profiles.json")) return JSON.stringify({ version: 1, identities: { acme: { profile: "acme-prod" } } });
       if (path.endsWith("config")) return AWS_CONFIG;
       throw new Error(`unexpected path ${path}`);
     },
@@ -130,13 +130,13 @@ describe("resolveAwsProfileForIdentity", () => {
   };
 
   test("registry env AWS_PROFILE wins over the machine-local mapping", () => {
-    const resolved = resolveAwsProfileForIdentity(identity("pcg", { env: { AWS_PROFILE: "nazare" } }), deps);
-    expect(resolved).toEqual({ profile: "nazare", region: "eu-west-2", accountId: "499324396263" });
+    const resolved = resolveAwsProfileForIdentity(identity("acme", { env: { AWS_PROFILE: "acme-sso" } }), deps);
+    expect(resolved).toEqual({ profile: "acme-sso", region: "eu-west-2", accountId: "499324396263" });
   });
 
   test("falls back to the machine-local mapping and enriches from the AWS CLI config", () => {
-    expect(resolveAwsProfileForIdentity(identity("pcg"), deps)).toEqual({
-      profile: "pcg-prod",
+    expect(resolveAwsProfileForIdentity(identity("acme"), deps)).toEqual({
+      profile: "acme-prod",
       region: "eu-west-2",
       accountId: "779846811377",
     });
@@ -148,7 +148,7 @@ describe("resolveAwsProfileForIdentity", () => {
 
   test("a malformed mapping file throws rather than silently declining", () => {
     expect(() =>
-      resolveAwsProfileForIdentity(identity("pcg"), {
+      resolveAwsProfileForIdentity(identity("acme"), {
         ...deps,
         readText: () => "not json",
       }),
@@ -160,9 +160,9 @@ describe("resolveAwsProfileForIdentity", () => {
   });
 
   test("a profile unknown to the AWS CLI config still resolves, without region/account", () => {
-    const resolved = resolveAwsProfileForIdentity(identity("pcg"), {
+    const resolved = resolveAwsProfileForIdentity(identity("acme"), {
       ...deps,
-      readText: (path) => (path.endsWith("aws-profiles.json") ? JSON.stringify({ version: 1, identities: { pcg: { profile: "elsewhere" } } }) : AWS_CONFIG),
+      readText: (path) => (path.endsWith("aws-profiles.json") ? JSON.stringify({ version: 1, identities: { acme: { profile: "elsewhere" } } }) : AWS_CONFIG),
     });
     expect(resolved).toEqual({ profile: "elsewhere" });
   });
