@@ -11,6 +11,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 import {
   Table,
   TableBody,
@@ -21,8 +22,9 @@ import {
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { GlobalUsageCards } from "@/components/usage-counter";
-import { useProcessesQuery, useStatusQuery } from "@/hooks/queries";
-import { durationSince, formatUptime } from "@/lib/format";
+import { useProcessesQuery, useSpendGuardQuery, useStatusQuery } from "@/hooks/queries";
+import { clampPercent, durationSince, formatMoney, formatUptime } from "@/lib/format";
+import type { SpendGuardAccountState, SpendGuardKillRecord } from "@/types/api";
 
 function SummaryCard({
   title,
@@ -124,6 +126,96 @@ function ProcessesTable() {
   );
 }
 
+function AccountRow({ account }: { account: SpendGuardAccountState }) {
+  const pct = account.budgetLimitUsd !== undefined && account.budgetLimitUsd > 0 ? clampPercent((account.effectiveUsd / account.budgetLimitUsd) * 100) : undefined;
+  const tone = account.breached ? "bg-red-500" : pct !== undefined && pct >= 70 ? "bg-amber-500" : undefined;
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-baseline justify-between gap-3 text-sm">
+        <span className="min-w-0 truncate font-medium" title={account.budgetName}>
+          {account.budgetName ?? "no usable budget"}
+        </span>
+        <span className="shrink-0 tabular-nums">
+          {formatMoney(account.effectiveUsd)} {account.budgetLimitUsd !== undefined ? `/ ${formatMoney(account.budgetLimitUsd)}` : ""}
+        </span>
+      </div>
+      {pct !== undefined ? <Progress value={pct} indicatorClassName={tone} /> : null}
+      <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+        <span className="min-w-0 truncate">
+          local {formatMoney(account.localEstimateUsd)}
+          {account.realReportedUsd !== undefined ? ` · Cost Explorer ${formatMoney(account.realReportedUsd)}` : ""}
+          {account.identities.length > 0 ? ` · ${account.identities.join(", ")}` : ""}
+        </span>
+        {account.breached ? (
+          <Badge variant="destructive">BREACHED: launches blocked, active sessions terminated</Badge>
+        ) : account.degraded ? (
+          <Badge variant="warning">UNENFORCED</Badge>
+        ) : (
+          <Badge variant="success">Enforcing</Badge>
+        )}
+      </div>
+      {account.degraded && account.reason ? (
+        <p className="text-xs text-amber-600 dark:text-amber-400">{account.reason}</p>
+      ) : null}
+    </div>
+  );
+}
+
+function SpendGuardCard() {
+  const query = useSpendGuardQuery();
+  // Hidden entirely when the endpoint is unavailable (no daemon-side guard):
+  // a machine without AWS mappings has nothing to show either way.
+  if (query.isError) return null;
+  const data = query.data;
+  if (!data) return null;
+
+  return (
+    <Card className="gap-4">
+      <CardHeader>
+        <CardTitle className="text-base">
+          Spend guard{" "}
+          {data.accounts.some((a) => a.breached) ? <Badge variant="destructive">OVER CAP</Badge> : null}
+        </CardTitle>
+        <CardDescription>
+          Per AWS account: local estimate blended with real AWS-reported spend against the account's own Budgets cap.
+          {data.lastCycleAt ? (
+            <>
+              {" "}Last cycle <RelativeTime iso={data.lastCycleAt} />.
+            </>
+          ) : null}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {data.accounts.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No AWS accounts are mapped for enforcement.</p>
+        ) : (
+          data.accounts.map((account) => <AccountRow key={account.accountId} account={account} />)
+        )}
+        {data.lastError ? <p className="text-xs text-muted-foreground">Last cycle errors: {data.lastError}</p> : null}
+        {data.recentKills.length > 0 ? (
+          <div className="space-y-1.5">
+            {data.recentKills.slice(-5).reverse().map((kill) => (
+              <RecentKill key={`${kill.pid}-${kill.at}`} kill={kill} />
+            ))}
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+function RecentKill({ kill }: { kill: SpendGuardKillRecord }) {
+  return (
+    <div className="flex items-start gap-2 text-xs">
+      <Badge variant="destructive">{kill.signal}</Badge>
+      <span className="text-muted-foreground">
+        pid {kill.pid} ({kill.tool}, {kill.identity}, account ...{kill.accountId.slice(-4)}) terminated{" "}
+        <RelativeTime iso={kill.at} />: {kill.reason}
+      </span>
+    </div>
+  );
+}
+
 export function DashboardPage() {
   const status = useStatusQuery();
   const processes = useProcessesQuery();
@@ -173,6 +265,8 @@ export function DashboardPage() {
       )}
 
       <GlobalUsageCards />
+
+      <SpendGuardCard />
 
       <Card className="gap-4">
         <CardHeader>

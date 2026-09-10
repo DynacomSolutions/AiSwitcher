@@ -40,11 +40,59 @@ export interface ProcessInfo {
   cwd: string | null;
   startedAt: string | null;
   command: string;
+  /** True when the process carries the wrapper's session marker (a wrapped
+   * session; the spend guard's kill candidates are exclusively these). */
+  wrapped?: boolean;
+  identityEnv?: Record<string, string>;
 }
 
 export interface ProcessesResponse {
   processes: ProcessInfo[];
   scannedAt: string;
+}
+
+/* Spend guard */
+
+export interface SpendGuardAccountState {
+  accountId: string;
+  profile: string;
+  region?: string;
+  budgetName?: string;
+  budgetLimitUsd?: number;
+  budgetActualUsd?: number;
+  budgetTimeUnit?: string;
+  periodStart?: string;
+  periodEnd?: string;
+  localEstimateUsd: number;
+  realReportedUsd?: number;
+  effectiveUsd: number;
+  breached: boolean;
+  enforced: boolean;
+  degraded: boolean;
+  reason?: string;
+  identities: string[];
+  computedAt: string;
+}
+
+export interface SpendGuardKillRecord {
+  pid: number;
+  tool: string;
+  identity: string;
+  accountId: string;
+  command: string;
+  signal: "SIGTERM" | "SIGKILL" | "ALREADY-GONE";
+  reason: string;
+  at: string;
+}
+
+export interface SpendGuardResponse {
+  ok: true;
+  running: boolean;
+  config: { intervalS: number; killGraceS: number };
+  lastCycleAt: string | null;
+  lastError: string | null;
+  accounts: SpendGuardAccountState[];
+  recentKills: SpendGuardKillRecord[];
 }
 
 /* Identities */
