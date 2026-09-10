@@ -126,11 +126,20 @@ src/
                              zai/ali/pi/open/ais are already in ~/.local/bin, via installer.ts's
                              downloadAssetAtomic
     upgrade.ts                 `ais upgrade`: ensures every installed AIS shim has its real
-                             CLI installed/upgraded — Claude/Codex/Kimi/Crush/Pi in AIS's
-                             user-owned npm prefix, Grok through xAI's official release
-                             installer; capability-checked native updaters are only
-                             fallbacks. Distinct from `ais update`, which refreshes this
-                             project's own shims
+                             CLI installed/upgraded IN PARALLEL (one task per spec;
+                              failures never abort siblings) — Claude/Codex/Kimi/Crush/Pi
+                              in AIS's user-owned npm prefix, Grok through xAI's official
+                              release installer; capability-checked native updaters are
+                              only fallbacks. Installer children run through exec.ts's
+                              captured spawnCaptured, so their output never interleaves
+                              into the status list and is only surfaced on failure (and
+                              in non-TTY failure reports); on a TTY the command renders
+                              a live one-row-per-tool status list, on a pipe it prints
+                              plain start/finish lines. Distinct from `ais update`, which
+                              refreshes this project's own shims
+    upgrade-status.ts             pure status model behind `ais upgrade`'s status list:
+                              rows + transition events + reducer + row formatting, no
+                              process/terminal access, unit-testable without a TTY
     sync/dispatch.ts           `ais sync list|add|remove|now`; SSH aliases come from
                                ~/.ais/config/sync-v2.json and auth stays entirely in SSH config
     identities/
@@ -703,6 +712,21 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   avoids reinstalling only when the package manifest and managed binary's
   `--version` probe agree. A custom
   scoped or default npm registry never triggers a public-registry lookup.
+  Since the parallel-status redesign (2026-09), the upgrades themselves run
+  CONCURRENTLY: `planUpgrades` checks every shim, then groups specs by
+  installer key so identical physical installers (zai/ali) collapse onto one
+  leader whose followers await its result, and `runUpgradeWithDeps` starts
+  all leaders at once. A tool's failure never aborts its siblings; the
+  overall exit code is non-zero when any tool failed, and a cancellation
+  exit code (Ctrl-C: 129/130/131/143) still propagates after the in-flight
+  installs settle. On a TTY, `runUpgrade` renders a stable one-row-per-tool
+  status list (pending/running/done/failed/skipped, spinners via live.ts's
+  `withLiveRender`, the same pattern as `ais limits`) driven by the pure
+  transition reducer in `cli/upgrade-status.ts`; every installer child runs
+  captured (`exec.ts`'s `spawnCaptured`) so npm/Grok noise cannot interleave
+  into the frame and is printed tail-truncated only for failed tools. On a
+  pipe or CI the same run degrades to plain start/finish lines per tool, so
+  logs stay useful without the old scrolling npm output.
 
 - **`~/.ais` is the one consolidated root for every directory this project's
   own tooling creates and manages — not `~/.local/bin` (the shims
@@ -2281,7 +2305,13 @@ provider's models.
   caches results by npm package, real binary, script allowlist, and fallback
   arguments. Both installed shims are still detected independently, but one
   physical installer is attempted and counted once; if only one alias is
-  installed, that alias still triggers the install normally.
+  installed, that alias still triggers the install normally. The parallel
+  runner preserves this structurally rather than by cache timing:
+  `planUpgrades` makes the first spec of each identical installer key the
+  leader and the rest followers, so the single physical install runs while
+  the follower awaits its outcome (success renders the follower as a skipped
+  "shares installer with zai" row; failure fails the follower's row without
+  counting it twice in the summary).
 - **Model list is static/fallback metadata, not independently verified
   per-model figures.** Costs are 0 (plan-included, same convention as
   zai's own `glm-5.2` entry) and context windows/max-tokens are reasonable
