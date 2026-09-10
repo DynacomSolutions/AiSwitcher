@@ -2947,3 +2947,58 @@ identity's Chrome (Claude MCP) window instead of your regular daily-driver
 Chrome. If a real Chrome window opens instead (or nothing redirects at all),
 the bare-command-name assumption is wrong — drop this mechanism and record
 that finding here instead of iterating on it further.
+
+## herdr metadata bridge (2026-09-10, task-herdr-bridge)
+
+`src/server/herdr-bridge.ts` feeds per-pane AIS limit data to herdr's
+sidebar. herdr is a third-party binary: the bridge ONLY CALLS its CLI
+(`herdr pane list`, `herdr pane process-info`, `herdr pane
+report-metadata`) and never kills, restarts, or signals any herdr process
+(killing our own timed-out CLI client spawn is the sole exception; it is
+not a herdr session process).
+
+Per cycle (default 60s, floor 15s, machine-local
+`~/.ais/config/herdr-bridge.json` = `{ enabled, intervalS, categories,
+push }`): run `herdr pane list`; for every pane herdr itself reports an
+AGENT for, resolve `pane process-info` and read `/proc/<pid>/environ` of
+the foreground group (plus the shell pid as last resort) with the exact
+shared rules of the /proc scanner (`parseIdentityEnviron` in
+server/processes.ts): only panes carrying `AI_PROFILE_SWITCHER_SESSION`
+attribute, to the marker's identity name. Environment contents are never
+logged. Limits for exactly those identities come from the SAME isolated
+scan pathway the `/api/limits` route uses (`runScanIsolated("limits")`,
+plus a 45s per-identity cache in the bridge).
+
+Token contract (names are literal, `$` included, because herdr requires
+custom tokens to start with `$`; pushed per pane via
+`herdr pane report-metadata <pane_id> --source ais --token NAME=VALUE ...
+--seq N --ttl-ms 3x-interval`):
+
+- `$ais_identity`: identity label (the marker value).
+- `$ais_session` / `$ais_week` / `$ais_month`: rounded 0-100 percent,
+  omitted when the provider has no such window or the category is not in
+  `config.categories` (default `["session","week"]`). When several
+  providers report the same category for one identity, the MAX wins (the
+  sidebar shows the window that would block).
+- `$ais_limits`: compact summary of whichever configured categories have
+  data, e.g. `s:18% w:42%`.
+- A pane whose identity has NO window data gets NO tokens at all (herdr
+  elides empty tokens); its previous tokens expire via the TTL, so stale
+  panes clear themselves.
+
+State machine (GET /api/herdr-bridge, WebUI dashboard card): `disabled`
+(config off; the scheduler still answers) / `idle` (herdr not running;
+retried every cycle) / `pending` (herdr lacks `pane report-metadata`) /
+`active` (pushes happen). Capability detection is BEHAVIOURAL, never
+version parsing: a `herdr pane report-metadata --help` probe classifies
+supported vs pending. While pending the probe re-runs every cycle, so
+upgrading herdr flips the bridge to active automatically within one
+interval, zero config change and no daemon restart. If a real push fails
+in an unsupported shape, the bridge drops to pending once (then stays
+active-with-error instead of oscillating). Observed live 2026-09-10: this
+machine's herdr 0.8.2 build ALREADY ships `pane report-metadata` (the
+sidebar tokens work landed before the 0.9.0 version bump), so a fresh
+bridge lands in `active`, not `pending`; the pending path remains for
+older builds. `push: false` in the machine config suppresses the writes
+only (attribution, limits and probe still run); `AIS_HERDR_BRIDGE=0`
+removes the scheduler entirely.

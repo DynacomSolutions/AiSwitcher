@@ -46,7 +46,7 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 | `/api/identities`, `/api/auth` | 10s |
 | `/api/sessions` | 15s |
 | `/api/files/*` | on demand |
-| `/api/limits`, `/api/usage`, `/api/spend-guard` | 60s (server caches 45s) |
+| `/api/limits`, `/api/usage`, `/api/spend-guard`, `/api/herdr-bridge` | 60s (server caches 45s) |
 
 ## Endpoints
 
@@ -151,6 +151,52 @@ identity-to-AWS mapping report an empty `accounts` list.
   ]
 }
 ```
+
+### herdr metadata bridge
+
+`GET /api/herdr-bridge`
+
+Last-known state of the daemon-side bridge that feeds per-pane AIS limit
+tokens to herdr's sidebar (`herdr pane report-metadata --token $ais_*=...`).
+503 when the daemon-side scheduler is not running (`AIS_HERDR_BRIDGE=0`).
+`panes` lists every herdr pane attributed to an AIS identity this cycle;
+plain shell panes and unmarked sessions never appear.
+
+```jsonc
+{
+  "ok": true,
+  "state": "active",           // disabled | idle | pending | active
+  "running": true,
+  "config": { "enabled": true, "intervalS": 60, "categories": ["session", "week"], "push": true },
+  "herdrVersion": "0.8.2",     // captured during the capability probe
+  "pendingReason": null,       // set while pending, e.g. "report-metadata needs herdr >= 0.9.0"
+  "panes": [
+    {
+      "paneId": "w2B:p1",
+      "agent": "opencode",     // herdr's own agent label
+      "agentStatus": "working",
+      "tool": "opencode",      // AIS attribution (marked binary / config-dir env)
+      "identity": "dynacom",
+      "title": "OC | ...",
+      "session": 43,           // omitted when the provider has no such window
+      "week": 100,
+      "summary": "s:43% w:100%" // the $ais_limits string pushed for this pane
+    }
+  ],
+  "lastCycleAt": "2026-09-10T10:00:00Z",
+  "lastPushAt": "2026-09-10T10:00:00Z",  // null while pending/idle or push:false
+  "lastError": null
+}
+```
+
+States: `disabled` (config `enabled: false`), `idle` (herdr not running;
+retried every cycle), `pending` (herdr lacks `pane report-metadata`; the
+probe re-runs every cycle, so a herdr upgrade flips to `active` within one
+interval with no config change or restart), `active` (pushes happen each
+cycle with a TTL of three intervals so stale panes clear themselves). A
+pane whose identity has no limits data is listed but carries no
+percentages and gets no push. `push: false` in the machine config
+suppresses the metadata writes only.
 
 ### Identities
 
