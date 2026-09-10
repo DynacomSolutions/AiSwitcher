@@ -241,6 +241,51 @@ pub struct SessionsResponse {
     pub results: Vec<ToolResumeGroup>,
 }
 
+/* Breakdown (per tool call) */
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BreakdownResponse {
+    #[serde(default)]
+    pub results: Vec<BreakdownResult>,
+}
+
+/// Mirrors BreakdownResult from src/cli/usage/breakdown.ts.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BreakdownResult {
+    #[serde(default)]
+    pub identity: Option<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default, rename = "windowDays", alias = "window_days")]
+    pub window_days: Option<u64>,
+    #[serde(default, rename = "filesRead", alias = "files_read")]
+    pub files_read: Option<u64>,
+    #[serde(default)]
+    pub categories: Vec<BreakdownCategory>,
+    #[serde(default)]
+    pub unavailable: Option<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// Mirrors BreakdownCategory. Detail-only fields (per-tool rows, cache
+/// writes) are not rendered by this view and stay untyped.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BreakdownCategory {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, rename = "callCount", alias = "call_count")]
+    pub call_count: Option<f64>,
+    #[serde(default, rename = "inputTokens", alias = "input_tokens")]
+    pub input_tokens: Option<f64>,
+    #[serde(default, rename = "outputTokens", alias = "output_tokens")]
+    pub output_tokens: Option<f64>,
+    #[serde(default, rename = "estCostUsd", alias = "est_cost_usd")]
+    pub est_cost_usd: Option<f64>,
+}
+
 /// Mirrors ToolResumeResult from src/cli/resume/types.ts.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ToolResumeGroup {
