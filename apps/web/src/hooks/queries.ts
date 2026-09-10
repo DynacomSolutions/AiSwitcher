@@ -1,9 +1,11 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import type { LoginFlowStatus } from "@/types/api";
 
 /** Polling intervals from docs/API.md. Files endpoints are on demand. */
 export const POLL = {
   live: 3_000,
+  flow: 1_500,
   registry: 10_000,
   sessions: 15_000,
   slow: 60_000,
@@ -19,10 +21,17 @@ export const qk = {
   auth: ["auth"] as const,
   authRefresh: ["auth", "refresh"] as const,
   spendGuard: ["spend-guard"] as const,
+  loginFlows: ["auth", "flows"] as const,
+  loginFlow: (flowId: string) => ["auth", "flows", flowId] as const,
   fileRoots: ["files", "roots"] as const,
   fileTree: (root: string, path: string) => ["files", "tree", root, path] as const,
   fileContent: (path: string) => ["files", "file", path] as const,
 };
+
+/** A flow consumes attention while it can still move on its own. */
+export function flowIsLive(status: LoginFlowStatus | undefined): boolean {
+  return status === "starting" || status === "waiting" || status === "callback";
+}
 
 export function useStatusQuery() {
   return useQuery({
@@ -94,6 +103,15 @@ export function useAuthRefreshQuery() {
     queryKey: qk.authRefresh,
     queryFn: api.getAuthRefresh,
     refetchInterval: POLL.registry,
+  });
+}
+
+export function useLoginFlowQuery(flowId: string | null) {
+  return useQuery({
+    queryKey: qk.loginFlow(flowId ?? ""),
+    queryFn: () => api.getLoginFlow(flowId as string),
+    enabled: flowId !== null,
+    refetchInterval: (query) => (flowIsLive(query.state.data?.status) ? POLL.flow : false),
   });
 }
 

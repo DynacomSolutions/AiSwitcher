@@ -3,6 +3,7 @@ import { Ellipsis, Plus } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
+import { AuthStateBadge } from "@/components/badges";
 import { PageHeader } from "@/components/page-header";
 import {
   AlertDialog,
@@ -43,9 +44,9 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { useIdentitiesQuery, qk } from "@/hooks/queries";
+import { useIdentitiesQuery, useAuthQuery, qk } from "@/hooks/queries";
 import { api } from "@/lib/api";
-import type { CreateIdentityBody, IdentityDto, RegistryDto, ToolName } from "@/types/api";
+import type { AuthEntry, CreateIdentityBody, IdentityDto, RegistryDto, ToolName } from "@/types/api";
 
 interface IdentityRef {
   tool: ToolName;
@@ -446,7 +447,7 @@ function CreateIdentityDialog({ tool, onClose }: { tool: ToolName; onClose: () =
   );
 }
 
-function RegistryTable({ registry }: { registry: RegistryDto }) {
+function RegistryTable({ registry, authFor }: { registry: RegistryDto; authFor: (tool: string, identity: string) => AuthEntry | undefined }) {
   const [editing, setEditing] = useState<IdentityRef | null>(null);
   const [managing, setManaging] = useState<{ ref: IdentityRef; kind: "directories" | "aliases" } | null>(null);
   const [deleting, setDeleting] = useState<IdentityRef | null>(null);
@@ -467,6 +468,7 @@ function RegistryTable({ registry }: { registry: RegistryDto }) {
             <TableRow className="hover:bg-transparent">
               <TableHead>Name</TableHead>
               <TableHead>Label</TableHead>
+              <TableHead>Auth</TableHead>
               <TableHead>Aliases</TableHead>
               <TableHead>Directories</TableHead>
               <TableHead>Config dir</TableHead>
@@ -474,11 +476,23 @@ function RegistryTable({ registry }: { registry: RegistryDto }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {registry.identities.map((identity) => (
+            {registry.identities.map((identity) => {
+              const auth = authFor(registry.toolName, identity.name);
+              return (
               <TableRow key={identity.name}>
                 <TableCell className="font-medium">{identity.name}</TableCell>
                 <TableCell className="max-w-44 truncate text-muted-foreground" title={identity.description}>
                   {identity.label}
+                </TableCell>
+                <TableCell>
+                  {auth ? (
+                    <AuthStateBadge
+                      state={auth.state}
+                      className="cursor-default"
+                    />
+                  ) : (
+                    <span className="text-xs text-muted-foreground">-</span>
+                  )}
                 </TableCell>
                 <TableCell>
                   {(identity.aliases?.length ?? 0) === 0 ? (
@@ -550,7 +564,8 @@ function RegistryTable({ registry }: { registry: RegistryDto }) {
                   </DropdownMenu>
                 </TableCell>
               </TableRow>
-            ))}
+              );
+            })}
           </TableBody>
         </Table>
       </div>
@@ -575,9 +590,14 @@ function RegistryTable({ registry }: { registry: RegistryDto }) {
 
 export function IdentitiesPage() {
   const query = useIdentitiesQuery();
+  const authQuery = useAuthQuery();
   const registries = query.data?.registries ?? [];
   const [activeTool, setActiveTool] = useState<string>("");
   const [creatingFor, setCreatingFor] = useState<RegistryDto | null>(null);
+
+  const authEntries = authQuery.data?.entries ?? [];
+  const authFor = (tool: string, identity: string): AuthEntry | undefined =>
+    authEntries.find((entry) => entry.toolName === tool && entry.identity === identity);
 
   const active =
     registries.find((r) => r.toolName === activeTool) ?? registries[0] ?? null;
@@ -625,7 +645,7 @@ export function IdentitiesPage() {
           <p className="font-mono text-xs text-muted-foreground" title={active.path}>
             {active.path}
           </p>
-          <RegistryTable key={active.toolName} registry={active} />
+          <RegistryTable key={active.toolName} registry={active} authFor={authFor} />
         </div>
       ) : null}
 

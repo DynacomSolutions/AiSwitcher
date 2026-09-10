@@ -1,7 +1,7 @@
 /** Shared API types for the AIS console server. Mirrors docs/API.md plus the
  * underlying CLI result shapes (limits/usage/resume) it forwards verbatim. */
 
-export type ToolName = "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi";
+export type ToolName = "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode";
 
 export interface Identity {
   name: string;
@@ -270,11 +270,51 @@ export interface AuthEntry {
   state: AuthState;
   detail?: string;
   fixable: string[];
+  /** ISO timestamp when the stored credential expires, when known. */
+  expiresAt?: string;
+  /** ali only: last successful daemon-side console-cookie refresh. */
+  lastRefreshAt?: string;
+  /** ali only: last daemon-side refresh error, if any. */
+  refreshError?: string;
 }
 
 export interface AuthResponse {
   entries: AuthEntry[];
 }
+
+/* Login flows (daemon-managed per-identity logins) */
+
+export type LoginFlowStatus =
+  | "starting"
+  | "waiting"
+  | "callback"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface LoginFlow {
+  flowId: string;
+  toolName: ToolName;
+  identity: string;
+  status: LoginFlowStatus;
+  mode: "pty" | "pipes";
+  authUrl?: string;
+  deviceCode?: string;
+  instruction?: string;
+  acceptsPaste: boolean;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+  endedAt?: string;
+}
+
+export interface LoginFlowsResponse {
+  flows: LoginFlow[];
+}
+
+export type LoginStartResult =
+  | { kind: "managed"; flow: LoginFlow }
+  | { kind: "terminal"; spawned: boolean; command: string };
 
 /* Credential renewal (daemon scheduler) */
 
@@ -290,11 +330,6 @@ export interface AuthRefreshStatus {
 
 export interface AuthRefreshResponse {
   results: AuthRefreshStatus[];
-}
-
-export interface LoginResult {
-  spawned: boolean;
-  command: string;
 }
 
 /* Files */

@@ -7,7 +7,9 @@ import type {
   FileRoot,
   FileTreeResponse,
   LimitsResponse,
-  LoginResult,
+  LoginFlow,
+  LoginFlowsResponse,
+  LoginStartResult,
   PatchIdentityBody,
   ProcessesResponse,
   RegistriesResponse,
@@ -135,8 +137,14 @@ export const api = {
     request<{ ok: boolean }>("/api/auth/refresh", { method: "POST", body: { tool, identity } }),
   refreshKimiToken: (identity: string) =>
     request<unknown>("/api/auth/kimi-refresh", { method: "POST", body: { identity } }),
-  loginIdentity: (tool: string, identity: string) =>
-    request<LoginResult>("/api/auth/login", { method: "POST", body: { tool, identity } }),
+  startLogin: (tool: string, identity: string) =>
+    request<LoginStartResult>("/api/auth/login", { method: "POST", body: { tool, identity } }),
+  getLoginFlows: () => request<LoginFlowsResponse>("/api/auth/flows"),
+  getLoginFlow: (flowId: string) => request<LoginFlow>(`/api/auth/flows/${encodeURIComponent(flowId)}`),
+  submitLoginFlow: (flowId: string, code: string) =>
+    request<LoginFlow>(`/api/auth/flows/${encodeURIComponent(flowId)}/submit`, { method: "POST", body: { code } }),
+  cancelLoginFlow: (flowId: string) =>
+    request<LoginFlow>(`/api/auth/flows/${encodeURIComponent(flowId)}/cancel`, { method: "POST", body: {} }),
   setZaiKey: (tool: "zai" | "ali", identity: string, apiKey: string) =>
     request<unknown>("/api/auth/zai-key", { method: "POST", body: { tool, identity, apiKey } }),
   setAliCookie: (identity: string, cookie: string) =>
