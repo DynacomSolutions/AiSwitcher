@@ -50,9 +50,22 @@ impl ConsoleClient {
             .map(str::to_owned)
     }
 
-    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
+    /// GET and decode a JSON payload with a caller-chosen whole-request
+    /// ceiling. Scan endpoints must outlast the console's own server-side
+    /// scan budget (45s for limits, 60s for usage, per docs/API.md): a
+    /// client timeout below that aborts mid-scan and turns every cold-cache
+    /// poll into an error.
+    pub async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<T, ApiError> {
         let url = format!("{}{}", self.settings.base_url, path);
-        let mut request = self.http.get(&url).header("X-AIS-Console", "1");
+        let mut request = self
+            .http
+            .get(&url)
+            .header("X-AIS-Console", "1")
+            .timeout(timeout);
         if let Some(token) = self.token() {
             request = request.bearer_auth(token);
         }
