@@ -3,7 +3,7 @@ import { bold, cyan, dim } from "./colors.ts";
 const COMMANDS: Array<[string, string]> = [
   ["version", "Print the installed ais version"],
   ["update", "Re-download the latest claude/codex/grok/kimi/zai/ali/pi/opencode/open/ais binaries"],
-  ["upgrade", "Install or upgrade every real CLI required by the installed AIS shims"],
+  ["upgrade", "Install or upgrade every real CLI required by the installed AIS shims, in parallel with a live status list"],
   ["sync list|add|remove|now|dedupe|recover", "Merge/recover profiles over SSH or locally"],
   ["identities [list] [--tool=claude|codex|grok|kimi|zai|ali|pi|opencode]", "List identities (default; omit --tool to show all)"],
   ["identities show <name> [--tool=]", "Show one identity's full detail"],

@@ -6,11 +6,13 @@ import {
   UPGRADE_SPECS,
   helpListsUpdater,
   isOfficialXaiGrokHelp,
+  planUpgrades,
   resolvePublicNpmLatestVersion,
   runUpgradeWithDeps,
   UpgradeCancelledError,
   type UpgradeDeps,
 } from "../../src/cli/upgrade.ts";
+import type { UpgradeEvent } from "../../src/cli/upgrade-status.ts";
 
 function oneSpec(toolName: string) {
   const spec = UPGRADE_SPECS.find((candidate) => candidate.cfg.toolName === toolName);
@@ -21,13 +23,14 @@ function oneSpec(toolName: string) {
 function fakeDeps(overrides: Partial<UpgradeDeps> = {}) {
   const spawns: Array<{ command: string; args: string[] }> = [];
   const logs: string[] = [];
+  const events: UpgradeEvent[] = [];
   const deps: UpgradeDeps = {
     shimExists: async () => true,
     which: (command) => (command === "npm" ? "/usr/bin/npm" : null),
     resolve: (binaryName) => `/real/${binaryName}`,
     spawn: async (command, args) => {
       spawns.push({ command, args });
-      return 0;
+      return { exitCode: 0, stdout: "", stderr: "" };
     },
     capture: async () => ({
       stdout: "Grok Build TUI\nCommands:\n  update    Update to the latest version",
@@ -37,11 +40,12 @@ function fakeDeps(overrides: Partial<UpgradeDeps> = {}) {
     }),
     managedBinaryExists: async () => true,
     prepareManagedPrefix: async () => {},
-    installGrok: async () => 0,
+    installGrok: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
     log: (message) => logs.push(message),
     ...overrides,
   };
-  return { deps, spawns, logs };
+  const hooks = { onEvent: (event: UpgradeEvent) => events.push(event), events };
+  return { deps, spawns, logs, events, hooks };
 }
 
 describe("UPGRADE_SPECS", () => {
@@ -142,31 +146,33 @@ describe("resolvePublicNpmLatestVersion", () => {
 });
 
 describe("runUpgradeWithDeps", () => {
-  test("rethrows cancellation from npm version lookup before fallback or later tools", async () => {
+  test("rethrows cancellation from npm version lookups without running any installer", async () => {
     const calls: string[] = [];
-    const { deps } = fakeDeps({
+    const { deps, hooks } = fakeDeps({
       latestNpmVersion: async () => {
         calls.push("lookup");
         throw new UpgradeCancelledError(130);
       },
       spawn: async () => {
         calls.push("install");
-        return 0;
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     });
 
-    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")])).rejects.toEqual(
+    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")], hooks)).rejects.toEqual(
       new UpgradeCancelledError(130),
     );
-    expect(calls).toEqual(["lookup"]);
+    // Both specs start in parallel, so both lookups may fire, but neither
+    // physical installer is allowed to start once cancellation is observed.
+    expect(calls).toEqual(["lookup", "lookup"]);
   });
 
-  test("rethrows npm cancellation before attempting native fallback or later tools", async () => {
+  test("rethrows npm cancellation without attempting any native fallback", async () => {
     const calls: string[] = [];
-    const { deps } = fakeDeps({
+    const { deps, hooks } = fakeDeps({
       spawn: async () => {
         calls.push("npm");
-        return 130;
+        return { exitCode: 130, stdout: "", stderr: "" };
       },
       resolve: () => {
         calls.push("resolve");
@@ -174,19 +180,19 @@ describe("runUpgradeWithDeps", () => {
       },
     });
 
-    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")])).rejects.toEqual(
+    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")], hooks)).rejects.toEqual(
       new UpgradeCancelledError(130),
     );
-    expect(calls).toEqual(["npm"]);
+    expect(calls).toEqual(["npm", "npm"]);
   });
 
-  test("rethrows native fallback cancellation before moving to the next tool", async () => {
+  test("rethrows native fallback cancellation when npm is unavailable", async () => {
     const calls: string[] = [];
-    const { deps } = fakeDeps({
+    const { deps, hooks } = fakeDeps({
       which: () => null,
       spawn: async () => {
         calls.push("native");
-        return 130;
+        return { exitCode: 130, stdout: "", stderr: "" };
       },
       shimExists: async (toolName) => {
         calls.push(toolName);
@@ -194,35 +200,37 @@ describe("runUpgradeWithDeps", () => {
       },
     });
 
-    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")])).rejects.toEqual(
+    await expect(runUpgradeWithDeps(deps, [oneSpec("codex"), oneSpec("claude")], hooks)).rejects.toEqual(
       new UpgradeCancelledError(130),
     );
-    expect(calls).toEqual(["codex", "native"]);
+    // Shim checks all settle first, then both fallbacks run; neither reaches
+    // a managed install.
+    expect(calls).toEqual(["codex", "claude", "native", "native"]);
   });
 
   test("rethrows cancellation from Grok native updater without installing", async () => {
     let installerCalls = 0;
-    const { deps } = fakeDeps({
-      spawn: async () => 143,
+    const { deps, hooks } = fakeDeps({
+      spawn: async () => ({ exitCode: 143, stdout: "", stderr: "" }),
       installGrok: async () => {
         installerCalls++;
-        return 0;
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     });
 
-    await expect(runUpgradeWithDeps(deps, [oneSpec("grok")])).rejects.toEqual(new UpgradeCancelledError(143));
+    await expect(runUpgradeWithDeps(deps, [oneSpec("grok")], hooks)).rejects.toEqual(new UpgradeCancelledError(143));
     expect(installerCalls).toBe(0);
   });
 
   test("rethrows cancellation from the Grok installer", async () => {
-    const { deps } = fakeDeps({
+    const { deps, hooks } = fakeDeps({
       resolve: () => {
         throw new BinaryResolutionError("missing");
       },
-      installGrok: async () => 131,
+      installGrok: async () => ({ exitCode: 131, stdout: "", stderr: "" }),
     });
 
-    await expect(runUpgradeWithDeps(deps, [oneSpec("grok")])).rejects.toEqual(new UpgradeCancelledError(131));
+    await expect(runUpgradeWithDeps(deps, [oneSpec("grok")], hooks)).rejects.toEqual(new UpgradeCancelledError(131));
   });
 
   test("upgrades old Codex through the managed npm package without invoking `codex update`", async () => {
@@ -379,7 +387,7 @@ describe("runUpgradeWithDeps", () => {
       },
       installGrok: async () => {
         installed = true;
-        return 0;
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     });
 
@@ -394,7 +402,7 @@ describe("runUpgradeWithDeps", () => {
     const { deps, spawns } = fakeDeps({
       installGrok: async () => {
         installerCalls++;
-        return 0;
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     });
 
@@ -420,7 +428,7 @@ describe("runUpgradeWithDeps", () => {
       installGrok: async () => {
         installerCalls++;
         installedOfficialCli = true;
-        return 0;
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     });
 
@@ -471,7 +479,7 @@ describe("runUpgradeWithDeps", () => {
     const { deps, logs } = fakeDeps({
       spawn: async () => {
         spawnCount++;
-        return 1;
+        return { exitCode: 1, stdout: "npm err", stderr: "" };
       },
     });
 
@@ -501,5 +509,92 @@ describe("runUpgradeWithDeps", () => {
 
     expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
     expect(spawns[0]?.args).toContain("--allow-scripts=@moonshot-ai/kimi-code,node-pty");
+  });
+});
+
+describe("planUpgrades", () => {
+  test("keeps every installed spec, with later identical installers as followers", async () => {
+    const { planned, missingShims } = await planUpgrades([oneSpec("zai"), oneSpec("ali"), oneSpec("claude")], async () => true);
+    expect(missingShims).toEqual([]);
+    expect(planned.map((task) => [task.spec.cfg.toolName, task.followerOf])).toEqual([
+      ["zai", undefined],
+      ["ali", "zai"],
+      ["claude", undefined],
+    ]);
+  });
+
+  test("an absent leader shim promotes the follower to leader", async () => {
+    const { planned, missingShims } = await planUpgrades(
+      [oneSpec("zai"), oneSpec("ali")],
+      async (toolName) => toolName === "ali",
+    );
+    expect(missingShims.map((spec) => spec.cfg.toolName)).toEqual(["zai"]);
+    expect(planned).toHaveLength(1);
+    expect(planned[0]?.spec.cfg.toolName).toBe("ali");
+    expect(planned[0]?.followerOf).toBeUndefined();
+  });
+});
+
+describe("parallel upgrade behaviour", () => {
+  test("one failure does not abort the other parallel upgrades", async () => {
+    const { deps, hooks } = fakeDeps({
+      // Fail everything attributable to claude: its npm install AND its
+      // native fallback (the fake --help advertises "update", so without
+      // this claude would quietly succeed through the fallback).
+      spawn: async (command, args) => ({
+        exitCode: command.includes("claude") || args.some((arg) => arg.includes("claude-code")) ? 1 : 0,
+        stdout: "",
+        stderr: "boom",
+      }),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("claude"), oneSpec("codex")], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 1, skipped: 0 });
+  });
+
+  test("emits start then a terminal event per tool, and skip events for dedup followers", async () => {
+    const { deps, hooks, events } = fakeDeps();
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("zai"), oneSpec("ali")], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    const aliEvents = events.filter((event) => event.id === "ali");
+    expect(aliEvents.at(-1)).toEqual({ type: "skip", id: "ali", detail: "shares installer with zai" });
+    const zaiEvents = events.filter((event) => event.id === "zai");
+    expect(zaiEvents[0]).toEqual({ type: "start", id: "zai" });
+    const zaiLast = zaiEvents.at(-1);
+    expect(zaiLast?.type).toBe("finish");
+    expect(zaiLast?.type === "finish" && zaiLast.ok).toBe(true);
+  });
+
+  test("surfaces a failed tool's captured installer output through onFailure", async () => {
+    const failures: Array<{ toolName: string; reason: string; output: string }> = [];
+    const { deps } = fakeDeps({
+      spawn: async () => ({ exitCode: 1, stdout: "", stderr: "npm ERR! boom" }),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("codex")], {
+      onFailure: (failure) => failures.push(failure),
+    });
+
+    expect(summary).toEqual({ checked: 0, failed: 1, skipped: 0 });
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.toolName).toBe("codex");
+    expect(failures[0]?.output).toContain("npm ERR! boom");
+  });
+
+  test("marks a dedup follower failed when its leader fails, without counting it twice", async () => {
+    const { deps, hooks, events } = fakeDeps({
+      spawn: async () => ({ exitCode: 1, stdout: "", stderr: "postinstall failed" }),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("zai"), oneSpec("ali")], hooks);
+
+    expect(summary).toEqual({ checked: 0, failed: 1, skipped: 0 });
+    const aliEvents = events.filter((event) => event.id === "ali");
+    const aliLast = aliEvents.at(-1);
+    expect(aliLast?.type).toBe("finish");
+    expect(aliLast?.type === "finish" && aliLast.ok).toBe(false);
   });
 });
