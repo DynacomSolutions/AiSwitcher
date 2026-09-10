@@ -176,6 +176,71 @@ export interface BoundedSpawnResult {
   timedOut: boolean;
 }
 
+/** Result of a fully-captured, unbounded child run (see spawnCaptured). */
+export interface CapturedRunResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Spawn a REAL binary with the full inherited environment plus `extraEnv`,
+ * capturing stdout/stderr into memory with NO timeout, relaying the same
+ * terminal signals spawnReal relays, and resolving to the child's exit code
+ * (signal exits mirrored as 128+signum). This is the long-running companion
+ * to spawnCapturedBounded (whose hard timeout exists for bounded probes like
+ * `--version` and would kill a real `npm install` mid-flight): it exists so
+ * an in-place TTY UI (ais upgrade's status list) can keep redrawing while
+ * installer children run, without their output interleaving into the frame.
+ * Callers own surfacing the captured output (typically only on failure).
+ * Both the caller's and the child's lifetime are unbounded by design: an
+ * npm install may legitimately run for minutes. Signal relay matches
+ * spawnReal exactly, so a Ctrl-C at the terminal tears the child down the
+ * same way it would with full fd inheritance.
+ */
+export async function spawnCaptured(
+  cmdPath: string,
+  args: string[],
+  extraEnv: Record<string, string>,
+): Promise<CapturedRunResult> {
+  const child = Bun.spawn([cmdPath, ...args], {
+    env: buildChildEnv(extraEnv),
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: process.cwd(),
+  });
+
+  const handlers = new Map<(typeof FORWARD_SIGNALS)[number], () => void>();
+  for (const sig of FORWARD_SIGNALS) {
+    const handler = () => {
+      try {
+        child.kill(sig);
+      } catch {
+        // Child may already be gone — nothing to do.
+      }
+    };
+    handlers.set(sig, handler);
+    process.on(sig, handler);
+  }
+
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    if (child.signalCode) {
+      const num = osConstants.signals[child.signalCode as keyof typeof osConstants.signals];
+      return { exitCode: 128 + (num ?? 0), stdout, stderr };
+    }
+    return { exitCode, stdout, stderr };
+  } finally {
+    for (const [sig, handler] of handlers) {
+      process.removeListener(sig, handler);
+    }
+  }
+}
+
 /**
  * Spawn a REAL binary (never this project's own shim — callers resolve that
  * via resolveRealBinary first) with the full inherited environment plus
