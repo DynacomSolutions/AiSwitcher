@@ -14,10 +14,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - name: Check privacy of incoming commits
+        env:
+          PRIVACY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PRIVACY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bun run privacy:check --ci
 
       - name: Install dependencies
         run: bun install --frozen-lockfile

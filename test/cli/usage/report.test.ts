@@ -78,7 +78,7 @@ describe("formatUsageReport", () => {
 
   test("OpenCode Go keeps its official capitalisation", () => {
     const output = formatUsageReport([
-      { ...success("claude", "personal"), provider: "opencode-go" },
+      { ...success("claude", "identity-a"), provider: "opencode-go" },
     ]);
     expect(output).toContain("OpenCode Go");
   });
@@ -303,14 +303,14 @@ describe("source-only errors (multi-provider source failures)", () => {
     // the Errors footer under its source label.
     const failure: UsageResult = {
       provider: "unattributed",
-      identity: identity("dynacom"),
+      identity: identity("identity-team"),
       sourceTool: "pi",
       sourceOnlyError: true,
       error: "Could not read Pi usage: disk unavailable",
     };
     const output = formatUsageReport([failure]);
     expect(output).toContain("Errors:");
-    expect(output).toContain("pi/dynacom: Could not read Pi usage: disk unavailable");
+    expect(output).toContain("pi/identity-team: Could not read Pi usage: disk unavailable");
     expect(output).not.toContain("Unattributed");
     // The table renders its (always-present) header but NO data rows: the
     // only result was a source-only error.
@@ -318,10 +318,10 @@ describe("source-only errors (multi-provider source failures)", () => {
   });
 
   test("sit alongside real provider rows without perturbing them", () => {
-    const ok = success("codex", "dynacom");
+    const ok = success("codex", "identity-team");
     const failure: UsageResult = {
       provider: "unattributed",
-      identity: identity("dynacom"),
+      identity: identity("identity-team"),
       sourceTool: "pi",
       sourceOnlyError: true,
       error: "Could not read Pi usage: boom",
@@ -329,6 +329,6 @@ describe("source-only errors (multi-provider source failures)", () => {
     const output = formatUsageReport([ok, failure]);
     const tableLines = output.split("\n").filter((l) => l.startsWith("│"));
     expect(tableLines).toHaveLength(2); // header + the one real provider row
-    expect(output).toContain("pi/dynacom: Could not read Pi usage: boom");
+    expect(output).toContain("pi/identity-team: Could not read Pi usage: boom");
   });
 });

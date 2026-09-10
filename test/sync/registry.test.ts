@@ -20,8 +20,8 @@ const cfg: ToolConfig = {
   realBinaryName: "codex",
   envVarName: "CODEX_HOME",
   globalMemoryProjection: "codex-developer-instructions",
-  identitiesJsonPath: "/Users/alice/.codex/identities.json",
-  identitiesRootDir: "/Users/alice/.codex/identities",
+  identitiesJsonPath: "/Users/example/.codex/identities.json",
+  identitiesRootDir: "/Users/example/.codex/identities",
 };
 
 describe("portableIdentitiesFile", () => {
@@ -33,16 +33,16 @@ describe("portableIdentitiesFile", () => {
           {
             name: "identity-a",
             label: "Identity A",
-            configDir: "/Users/alice/.codex/identities/identity-a",
-            directories: ["/Users/alice/Projects/*", "/srv/shared"],
+            configDir: "/Users/example/.codex/identities/identity-a",
+            directories: ["/Users/example/Projects/*", "/srv/shared"],
           },
         ],
         chromeProfileOverrides: [
-          { directories: ["/Users/alice/Projects/Client/*"], targetIdentity: "identity-a" },
+          { directories: ["/Users/example/Projects/Client/*"], targetIdentity: "identity-a" },
         ],
       },
       cfg,
-      "/Users/alice",
+      "/Users/example",
     );
 
     expect(result.identities[0]?.configDir).toBe("~/.codex/identities/identity-a");
@@ -58,14 +58,14 @@ describe("portableIdentitiesFile", () => {
           {
             name: "identity-a",
             label: "Identity A",
-            configDir: "/home/bob/.codex/identities/identity-a",
-            directories: ["/home/bob/Projects/*"],
+            configDir: "/home/example/.codex/identities/identity-a",
+            directories: ["/home/example/Projects/*"],
           },
           { name: "custom", label: "Custom", configDir: "/srv/ais/custom" },
         ],
       },
       cfg,
-      "/Users/alice",
+      "/Users/example",
     );
 
     expect(result.identities[0]).toMatchObject({
@@ -79,10 +79,10 @@ describe("portableIdentitiesFile", () => {
 describe("isSyntheticLegacySessionContainer", () => {
   test("matches the exact pre-AIS archive marker, not an ordinary legacy-named identity", () => {
     expect(isSyntheticLegacySessionContainer({
-      name: "remote1-legacy",
-      label: "HQ0 Legacy",
-      description: "Preserved pre-AIS Codex sessions from remote1",
-      configDir: "~/.codex/identities/remote1-legacy",
+      name: "host-a-legacy",
+      label: "Host A Legacy",
+      description: "Preserved pre-AIS Codex sessions from host-a",
+      configDir: "~/.codex/identities/host-a-legacy",
     })).toBe(true);
     expect(isSyntheticLegacySessionContainer({
       name: "customer-legacy",
@@ -106,10 +106,10 @@ describe("mergeRegistryConflict", () => {
           { name: "shared", label: "Remote", configDir: "~/.codex/identities/shared", aliases: ["remote"] },
           { name: "remote-only", label: "Remote only", configDir: "~/.codex/identities/remote-only" },
           {
-            name: "remote1-legacy",
-            label: "HQ0 Legacy",
-            description: "Preserved pre-AIS Codex sessions from remote1",
-            configDir: "~/.codex/identities/remote1-legacy",
+            name: "host-a-legacy",
+            label: "Host A Legacy",
+            description: "Preserved pre-AIS Codex sessions from host-a",
+            configDir: "~/.codex/identities/host-a-legacy",
           },
         ],
       }),

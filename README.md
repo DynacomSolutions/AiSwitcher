@@ -109,6 +109,63 @@ when none exists, it expires only that orphaned lease and preserves the last
 watermark so Codex resumes immediately. A live worker is never disturbed, and
 an ownership check that cannot be completed leaves the database unchanged.
 
+## Shared Codex defaults
+
+Define per-user MCP servers once in `~/.codex/config.toml`. Every AIS Codex
+launch reads that file again and projects only missing defaults from its
+`mcp_servers` table through runtime configuration arguments. Codex merges those
+defaults with its native configuration. New identities inherit them on
+their first launch; edits apply to existing identities on their next launch.
+AIS does not copy shared entries into identity files. Its shared runtime
+allowlist is `model`, `model_reasoning_effort`, `service_tier`,
+`model_auto_compact_token_limit`, `tool_output_token_limit`, and shared fields
+within `agents` and `features`. These shared values override identity duplicates,
+including settings written back by Codex, while identity-only fields remain.
+An explicit non-OpenAI `model_provider` skips shared `model`, `service_tier`
+and `agents.default_subagent_model`; other shared agent values still apply,
+and local provider-specific model, tier and subagent choices remain untouched.
+Provider configuration, authentication,
+projects, hooks, trusted hashes, marketplaces, plugins, and browser options
+are not inherited.
+
+Shared permission defaults are limited to `approval_policy`,
+`approvals_reviewer`, `sandbox_mode`, `default_permissions`, and the legacy
+`sandbox_workspace_write` table.
+
+For Full Access, set these shared per-user values once in
+`~/.codex/config.toml`:
+
+```toml
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+```
+
+Shared policy, reviewer and compatible sandbox settings override identity
+duplicates. Explicit invocation overrides still win. A local named permission
+profile, or a shared named profile conflicting with local legacy sandbox fields,
+suppresses shared sandbox settings so the two representations are not mixed.
+A shared `default_permissions` takes precedence over shared legacy sandbox
+settings. Custom named permission definitions are not inherited.
+
+For MCP servers, explicit fields in an identity's own `config.toml` override shared fields,
+including nested environment and tool settings. Local values and unrelated
+local servers are never forwarded into launch arguments. Arrays replace shared arrays.
+Set `enabled = false` under an identity's server table to opt out, or keep only
+identity-specific tool approvals there and inherit the shared transport.
+An explicit identity `url` excludes shared stdio fields, and an explicit
+`command` excludes shared HTTP fields, while common settings remain defaults.
+Invocation `-c`/`--config` overrides follow the projection and take precedence.
+For `app-server` and `exec` (including `e`), AIS places the complete root config
+override list inside the subcommand before user subcommand overrides. This
+preserves shared config and memory when the native child parser has its own `-c`.
+Launching with the global Codex home itself adds no projection. Other tools
+retain their existing configuration behaviour.
+
+The projection applies to CLI launches, including `codex app` through the CLI.
+The direct `--desktop` path bypasses CLI argument projection, as it does for
+global memory. Invalid shared or identity TOML stops projection with a diagnostic
+that omits configuration contents.
+
 ## Directory layout on disk
 
 Each identity's entire config directory is self-contained and swapped in as

@@ -42,7 +42,7 @@ export interface UsageResult {
    * Never rendered as a provider TABLE row — a fabricated "Unattributed"
    * row is exactly the pseudo-provider output the provider-first rule
    * forbids — it surfaces only in the trailing Errors section under its
-   * SOURCE label (`pi/dynacom: ...`). Omitted from every public JSON
+   * SOURCE label (the tool and identity). Omitted from every public JSON
    * result. */
   sourceOnlyError?: true;
   report?: TokscaleReport;
@@ -226,8 +226,8 @@ async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression
  * per-message provider attribution) instead of tokscale, whose opencode
  * client collapses multi-plan models into comma-joined pseudo-providers
  * ("opencode_go, zai_coding_plan") that fragment the report into a row per
- * spelling — observed live 2026-09-03 with a single dynacom identity
- * showing four OpenCode-ish rows. Same shape as runPiUsage: per-provider
+ * spelling. Canonical provider keys keep one plan in one row.
+ * Same shape as runPiUsage: per-provider
  * rows, nothing-to-report suppressed unless the source was asked for
  * explicitly, real read failures as source-only error rows. */
 async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
@@ -335,23 +335,14 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
   return [...grouped.values()];
 }
 
-// NOTE, deliberately NO per-target timeout here (a 25s cap shipped in the
-// console work and was reverted 2026-09-03; main's interim 60s ceiling sat
-// right on the measured edge and had the same flaw): ~25 targets run
-// concurrently and contend for disk, so a single target's real tokscale
-// scan routinely takes 25-55s on this data volume — the cap turned ENTIRE
-// reports into error rows ("timed out after 25ms", itself mislabeled).
-// Genuine hangs are already bounded where they actually occur: tokscale
-// spawns have their own ceiling (tokscale.ts, 120s), and limits never had
-// a cap either. Truncating good data to bound a pathological hang is the
-// wrong trade for the report — the user has been explicit about this.
+// No shared per-target timeout: concurrent history scans contend for disk,
+// so a fixed deadline here can discard valid results. Tokscale subprocesses
+// have their own timeout in tokscale.ts.
 
 /** Ceiling on targets fetched at once. Every non-zai/ali/pi target spawns a
- * tokscale child scanning that identity's whole history; with ~25 targets
- * firing simultaneously the children thrash the disk and EACH one crawls
- * (25-55s alone; far worse all-parallel). A bounded pool keeps every scan
- * out of each other's way enough to finish quickly, matches limits's own
- * fan-out cap, and makes the live render fill in in waves. */
+ * tokscale child scanning that identity's whole history. A bounded pool
+ * reduces disk contention, matches limits's own fan-out cap, and lets the
+ * live render fill in as results arrive. */
 const USAGE_MAX_CONCURRENT = 6;
 
 export async function runUsageQueryForTargets(
@@ -381,8 +372,7 @@ export function shouldIncludeDefaultOpencodeProfile(flags: ParsedArgs["flags"]):
 /** Raw (pre-aggregation) per-provider rows for the default opencode
  * profile. Each provider's usage is attributed to the AIS identity whose
  * credential matches the profile's key — the key identifies the account,
- * and the account identifies the identity (the user's default profile held
- * dynacom's OpenCode Go key, so that usage IS dynacom's). The synthetic
+ * and the account identifies the identity. The synthetic
  * "default" identity is the fallback only for providers no identity can
  * claim. Read failures are real failures: source-only error rows, never
  * fabricated provider rows. */

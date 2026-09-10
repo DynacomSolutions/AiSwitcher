@@ -254,9 +254,8 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
   if (errors.length > 0) {
     lines.push("");
     lines.push(bold("Errors:"));
-    // Source-only failures are labelled by their SOURCE (pi/dynacom), never
-    // by a fabricated provider — the whole point of keeping them out of the
-    // table.
+    // Source-only failures use the source tool and identity as their label.
+    // Without provider attribution, they belong only in diagnostics.
     for (const r of errors) {
       const label = r.sourceOnlyError && r.sourceTool ? `${r.sourceTool}/${r.identity.name}` : `${usageProviderLabel(r.provider)}/${r.identity.name}`;
       lines.push(`  ${yellow(label)}: ${r.error}`);

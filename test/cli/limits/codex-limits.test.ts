@@ -39,7 +39,7 @@ describe("overageFromSnapshot", () => {
 
 describe("isTransientCodexLimitsError", () => {
   test("all three observed upstream-flakiness signatures are transient", () => {
-    // Verbatim error strings from real degraded runs (2026-09-03/04).
+    // Representative upstream transport and timeout errors.
     expect(isTransientCodexLimitsError("failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)")).toBe(true);
     expect(isTransientCodexLimitsError("codex app-server did not respond within 30s.")).toBe(true);
     expect(isTransientCodexLimitsError("codex app-server closed its output before responding.")).toBe(true);
@@ -62,28 +62,27 @@ describe("isTransientCodexLimitsError", () => {
 });
 
 describe("manualResetFromWire", () => {
-  /** Verbatim shape confirmed live 2026-09-04 against the real
-   * phoenix-court-group team account on this machine (id shortened). */
-  const liveGrant: RateLimitResetCreditsWire = {
+  /** Synthetic reset-credit fixture matching the upstream wire shape. */
+  const fixtureGrant: RateLimitResetCreditsWire = {
     availableCount: 1,
     credits: [
       {
-        id: "RateLimitResetCredit_2dbf116fad388191ad4f8f6d48f12d38",
+        id: "RateLimitResetCredit_SYNTHETIC_FIXTURE_001",
         resetType: "codexRateLimits",
         status: "available",
-        grantedAt: 1788487959,
-        expiresAt: 1791079959,
+        grantedAt: 1700000000,
+        expiresAt: 1702592000,
         title: "Full reset (Weekly + 5 hr)",
         description: "Thanks for using Codex! You've been granted one free rate limit reset.",
       },
     ],
   };
 
-  test("the live grant maps to a count-1 manual reset with title and expiry", () => {
-    expect(manualResetFromWire(liveGrant)).toEqual({
+  test("the fixture grant maps to a count-1 manual reset with title and expiry", () => {
+    expect(manualResetFromWire(fixtureGrant)).toEqual({
       availableCount: 1,
       label: "Full reset (Weekly + 5 hr)",
-      expiresAt: new Date(1791079959 * 1000).toLocaleString(undefined, {
+      expiresAt: new Date(1702592000 * 1000).toLocaleString(undefined, {
         month: "short",
         day: "numeric",
         hour: "numeric",
@@ -98,7 +97,7 @@ describe("manualResetFromWire", () => {
   });
 
   test("a zero availableCount yields undefined rather than a fabricated no-resets row", () => {
-    expect(manualResetFromWire({ availableCount: 0, credits: liveGrant.credits })).toBeUndefined();
+    expect(manualResetFromWire({ availableCount: 0, credits: fixtureGrant.credits })).toBeUndefined();
   });
 
   test("a non-numeric availableCount falls back to counting status-available credits", () => {

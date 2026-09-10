@@ -10,12 +10,9 @@ import type { DateSpan, TokscaleEntry, TokscaleReport } from "./tokscale.ts";
 /**
  * Reads the DEFAULT OpenCode profile's own database — the usage that exists
  * OUTSIDE any AIS identity (the user running `opencode` directly, unscoped).
- * AIS's opencode wrapper redirects XDG_DATA_HOME into identity dirs, so
- * identity usage flows through tokscale; the default profile's
- * `<data>/opencode/opencode.db` is otherwise invisible, and that is exactly
- * where heavy real-world usage lives (observed live 2026-09-03: a 1.3GB db,
- * 4,595 messages / 57.7M input tokens on the OpenCode Go plan that no
- * identity ever saw).
+ * AIS's opencode wrapper redirects XDG_DATA_HOME into identity dirs.
+ * The default profile's `<data>/opencode/opencode.db` needs a separate
+ * read so unscoped sessions are included alongside identity usage.
  *
  * Rows carry the real upstream per message (`providerID`/`modelID` + a token
  * breakdown), so one profile naturally becomes several provider results —
@@ -34,8 +31,7 @@ import type { DateSpan, TokscaleEntry, TokscaleReport } from "./tokscale.ts";
  * identity's credential matches the profile's key — the credential
  * identifies the account, and the account identifies the identity, so an
  * unmatched profile is the exceptional case, never the label for known
- * accounts (the user's default profile held dynacom's OpenCode Go key, and
- * logging that usage as "default" was wrong — fixed 2026-09-03). */
+ * accounts. */
 export const OPENCODE_DEFAULT_PROFILE_IDENTITY = {
   name: "default",
   label: "Default profile",
@@ -145,9 +141,9 @@ interface MutableProfileUsage {
  * `~/.local/share/opencode/opencode.db`. The ambient XDG_DATA_HOME must be
  * deliberately IGNORED here: inside an AIS-launched opencode session it
  * points at that identity's data dir (already counted, correctly
- * attributed, via tokscale), so honouring it would double-count that
- * identity's rows and mislabel them as "default" (observed live
- * 2026-09-03). The default profile is by definition where opencode lands
+ * attributed, via the identity reader), so honouring it would double-count
+ * that identity's rows and mislabel them as "default".
+ * The default profile is by definition where opencode lands
  * when nothing redirects it. */
 export function defaultOpencodeProfileDbPath(): string {
   return join(homedir(), ".local", "share", "opencode", "opencode.db");
@@ -164,8 +160,7 @@ interface OpencodeMessageData {
 
 /** providerID "opencode" is opencode's first-party gateway id — literally
  * the tool's own name, which can never render as an honest provider label.
- * Negligible in real data (2 messages live); skipped rather than guessing
- * which plan it belongs to. */
+ * Skipped because it does not identify which upstream plan supplied usage. */
 const UNNAMABLE_PROVIDERS = new Set(["opencode"]);
 
 function newMutable(timestampMs: number): MutableProfileUsage {
@@ -195,8 +190,7 @@ export type OpencodeProfileOutcome =
 /** Reads one opencode.db and aggregates every assistant message into
  * per-provider usage. `dbPath` is injectable for tests. The row scan
  * YIELDS periodically — bun:sqlite is synchronous, and an unyielding scan
- * of a multi-GB db blocks the event loop and freezes the live render
- * (observed 2026-09-03). */
+ * of a large db can block the event loop and freeze the live render. */
 export async function readOpencodeProfileUsage(dbPath: string): Promise<OpencodeProfileOutcome> {
   let db: Database;
   try {

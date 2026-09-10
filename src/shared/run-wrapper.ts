@@ -10,6 +10,8 @@ import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sy
 import { startProfileSyncWatcher } from "../sync/watch.ts";
 import { migrateLegacyAisHome } from "./migrate-ais-home.ts";
 import { codexPlatformArgs } from "./codex-platform-config.ts";
+import { projectSharedCodexConfigForLaunch } from "./codex-shared-config.ts";
+import { codexSubcommandConfigArgs } from "./codex-config-args.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 
 export async function runWrapper(
@@ -74,13 +76,21 @@ export async function runWrapper(
     const platformArgs = cfg.toolName === "codex"
       ? codexPlatformArgs(resolved.configDirValue, parsed.cleanedArgv)
       : parsed.cleanedArgv;
-    const memoryProjection = await projectGlobalMemoryForLaunch(
+    const sharedConfigArgs = await projectSharedCodexConfigForLaunch(
       cfg,
       resolved.configDirValue,
       platformArgs,
     );
+    const memoryProjection = await projectGlobalMemoryForLaunch(
+      cfg,
+      resolved.configDirValue,
+      sharedConfigArgs,
+    );
+    const launchArgs = cfg.toolName === "codex"
+      ? codexSubcommandConfigArgs(memoryProjection.argv)
+      : memoryProjection.argv;
     const launch = () =>
-      spawnReal(realBinary, memoryProjection.argv, {
+      spawnReal(realBinary, launchArgs, {
         [cfg.envVarName]: resolved.configDirValue,
         ...extraEnv,
         ...memoryProjection.env,
