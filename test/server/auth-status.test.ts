@@ -199,6 +199,7 @@ describe("ali probe with refresh scheduler status", () => {
         lastAttemptAt: "2026-09-10T00:00:00.000Z",
         lastSuccessAt: "2026-09-10T00:00:01.000Z",
         lastError: null,
+        consecutiveFailures: 0,
         running: false,
       },
     ];
@@ -220,6 +221,7 @@ describe("ali probe with refresh scheduler status", () => {
         lastAttemptAt: "2026-09-10T00:00:00.000Z",
         lastSuccessAt: null,
         lastError: "browser unavailable",
+        consecutiveFailures: 1,
         running: false,
       },
     ];
