@@ -172,9 +172,13 @@ src/
       pi-usage.ts providers.ts    recursive Pi JSONL usage reader + canonical upstream-provider
                                aliases; copied/forked messages are deduplicated before aggregation,
                                party members are provider-attributed, and native CLI bridges are marked
-      aws-bedrock-usage.ts         REAL Bedrock spend in dollars from AWS Cost Explorer
-                               (UnblendedCost, SERVICE = "Amazon Bedrock"), for
-                               Bedrock-backed identities (see the AWS Bedrock case study)
+      aws-bedrock-usage.ts         Bedrock usage in two layers: LOCAL month-to-date
+                                tokens + token-based EST. COST from the shared
+                                session-log readers (shared/local-spend.ts) in the
+                                normal columns, REAL AWS spend (Cost Explorer
+                                UnblendedCost, SERVICE = "Amazon Bedrock") + budget
+                                context in a separate realCost field rendered as a
+                                sub-row (see the AWS Bedrock case study)
       run.ts                     collectTargets() (--tool/--identity filtering, every match
                                across registries — not an ambiguity error, unlike
                                resolve-tool.ts's resolveMutationTarget) + provider-first
@@ -267,6 +271,13 @@ src/
                             owns (backups, sync's local cache/staging, the
                             managed npm prefix, sync config) — see "~/.ais:
                             one consolidated root" below
+    local-spend.ts          the shared Bedrock session-log readers (codex
+                            rollout + claude projects JSONL, month-to-date
+                            period filter, Bedrock-rate valuation): the spend
+                            guard's offline estimate AND the usage report's
+                            Bedrock columns read through this one
+                            implementation, so the two reconcile by
+                            construction (see the spend guard case study)
     migrate-ais-home.ts       self-healing, idempotent relocation of that data
                             from its old scattered locations (~/.cache/ais,
                             ~/.config/ais, ~/.local/share/ais/npm) into ~/.ais,
@@ -2507,6 +2518,18 @@ What the rule means in practice, now enforced in both pipelines:
   failures (tokscale crashed, unreadable session data) keep their error rows
   in unscoped reports — a blank table over a broken environment would hide
   the problem.
+- **ESTIMATES and REAL spend never share a column (real-cost placement
+  rule, 2026-09-10).** The usage table's EST. COST column is exclusively a
+  local token-based estimate; provider-reported real spend (AWS Bedrock's
+  Cost Explorer figures are the only instance today) renders SEPARATELY: a
+  dimmed `└ real …` sub-row directly under its provider row, plus one
+  trailing real-spend total line beneath TOTAL. A sub-row was chosen over
+  an extra column because the figure exists for one provider out of many,
+  and a permanently near-empty column would widen every row's table for
+  nothing. A real figure that could not be fetched renders "unavailable"
+  with its reason, never a fabricated zero, never in the estimate column
+  (the WebUI mirrors this with a sub-line per Bedrock row and the TUI's
+  REAL $ column reads the same `realCost` payload field).
 
 Verification should cover aggregation when native and multi-provider clients
 share a credential, fallback to an available result when one source fails,
@@ -2540,14 +2563,27 @@ billing-plane APIs:
   budget's TimeUnit — recurring budgets set TimePeriod.End to a 2087
   sentinel, so the period end date is NEVER the reset. Spend over limit is
   the one honest OverageInfo (active, real dollars, real cap).
-- **Usage = Cost Explorer** (`usage/aws-bedrock-usage.ts`):
-  GetCostAndUsage, metric UnblendedCost, Filter SERVICE == "Amazon
-  Bedrock", MONTHLY (report entries + totalCost) and DAILY (JSON-only
-  `dailyCostUsd`) over the trailing 3 months. Cost Explorer serves ONLY
-  from us-east-1 — force the client region regardless of profile region.
-  Token/message counts are 0 because the source has none: these are REAL
-  billed dollars in the cost column, not tokscale estimates (tokscale has
-  no aws client and no token counts to value anyway).
+- **Usage = local estimate in the columns, real Cost Explorer underneath**
+  (`usage/aws-bedrock-usage.ts` + `shared/local-spend.ts`, corrected
+  2026-09-10 after the conflation regression): a Bedrock row's MESSAGES/
+  INPUT/OUTPUT/CACHE READ and EST. COST come from the identity's own
+  session logs through the SAME shared readers, period filter and Bedrock
+  rate valuation the spend guard uses (month-to-date, local calendar), so
+  the two pathways reconcile per identity by construction. The REAL AWS
+  figures ride separately in `UsageResult.realCost` (Cost Explorer
+  GetCostAndUsage UnblendedCost (Filter SERVICE == "Amazon Bedrock"),
+  month-to-date sliced from the DAILY buckets of the unchanged trailing
+  3-month window, plus the trailing-window total and the enforced COST
+  budget's limit/ActualSpend, AWS Budgets, best-effort) and render as a
+  dimmed `└ real AWS month-to-date:` sub-row under the provider row, with
+  one trailing real total line beneath TOTAL. The two layers never swap
+  places: an estimate column must never carry real spend, nor vice versa
+  (the original display stuffed real dollars into EST. COST with zero
+  tokens, hiding all local tracking). A Cost Explorer failure degrades
+  into `realCost.error` ("unavailable", never a fabricated zero) while
+  the local half of the row survives; Cost Explorer serves ONLY from
+  us-east-1: force the client region regardless of profile region.
+  dailyCostUsd stays a JSON-only real-dollars-by-UTC-day dimension.
 - **Auth is the AWS CLI's own SSO chain** (fromIni({profile}) reads
   ~/.aws/sso/cache and auto-refreshes sso-session tokens). An expired
   token cannot be fixed non-interactively — classified via
@@ -2590,14 +2626,27 @@ billing-plane APIs:
   budget's TimeUnit — recurring budgets set TimePeriod.End to a 2087
   sentinel, so the period end date is NEVER the reset. Spend over limit is
   the one honest OverageInfo (active, real dollars, real cap).
-- **Usage = Cost Explorer** (`usage/aws-bedrock-usage.ts`):
-  GetCostAndUsage, metric UnblendedCost, Filter SERVICE == "Amazon
-  Bedrock", MONTHLY (report entries + totalCost) and DAILY (JSON-only
-  `dailyCostUsd`) over the trailing 3 months. Cost Explorer serves ONLY
-  from us-east-1 — force the client region regardless of profile region.
-  Token/message counts are 0 because the source has none: these are REAL
-  billed dollars in the cost column, not tokscale estimates (tokscale has
-  no aws client and no token counts to value anyway).
+- **Usage = local estimate in the columns, real Cost Explorer underneath**
+  (`usage/aws-bedrock-usage.ts` + `shared/local-spend.ts`, corrected
+  2026-09-10 after the conflation regression): a Bedrock row's MESSAGES/
+  INPUT/OUTPUT/CACHE READ and EST. COST come from the identity's own
+  session logs through the SAME shared readers, period filter and Bedrock
+  rate valuation the spend guard uses (month-to-date, local calendar), so
+  the two pathways reconcile per identity by construction. The REAL AWS
+  figures ride separately in `UsageResult.realCost` (Cost Explorer
+  GetCostAndUsage UnblendedCost (Filter SERVICE == "Amazon Bedrock"),
+  month-to-date sliced from the DAILY buckets of the unchanged trailing
+  3-month window, plus the trailing-window total and the enforced COST
+  budget's limit/ActualSpend, AWS Budgets, best-effort) and render as a
+  dimmed `└ real AWS month-to-date:` sub-row under the provider row, with
+  one trailing real total line beneath TOTAL. The two layers never swap
+  places: an estimate column must never carry real spend, nor vice versa
+  (the original display stuffed real dollars into EST. COST with zero
+  tokens, hiding all local tracking). A Cost Explorer failure degrades
+  into `realCost.error` ("unavailable", never a fabricated zero) while
+  the local half of the row survives; Cost Explorer serves ONLY from
+  us-east-1: force the client region regardless of profile region.
+  dailyCostUsd stays a JSON-only real-dollars-by-UTC-day dimension.
 - **Auth is the AWS CLI's own SSO chain** (fromIni({profile}) reads
   ~/.aws/sso/cache and auto-refreshes sso-session tokens). An expired
   token cannot be fixed non-interactively — classified via
@@ -2638,7 +2687,9 @@ Decisions are final by design; the reasoning is recorded here.
 - **The local estimate is a direct log reader, not tokscale.** The gate
   must be fast and fully offline: a warm tokscale spawn measured ~2.4s for
   one codex identity and its report has no date filter, so
-  `spend/local-estimate.ts` parses the same session logs directly (codex
+   `shared/local-spend.ts` (moved there 2026-09-10 so the usage fetcher
+   reads through the identical implementation) parses the same session logs
+   directly (codex
   rollout JSONL token_count events, claude projects JSONL usage events),
   period-filtered (month-to-date for a MONTHLY budget), valued at Bedrock
   on-demand rates (`model-pricing.ts`; unknown models at the table's
@@ -2690,7 +2741,11 @@ Decisions are final by design; the reasoning is recorded here.
   tokscale's token-estimate valuation of local token counts (never billed);
   REAL $ is provider-reported billed spend from `extraCost`/`overage`
   (`spentUsd`, or the provider's own status wording when no figure exists;
-  `-` when the provider has no overage concept at all).
+  `-` when the provider has no overage concept at all). AWS Bedrock rows
+  feed the same column from the usage payload's `realCost` (Cost Explorer
+  month-to-date + the enforced budget's limit, rendered `$actual/$limit`);
+  only an ANSWERED query maps, so an errored real fetch never renders as a
+  confirmed zero.
 - Polling reuses the shared per-endpoint loops: status/processes 3s,
   limits/usage 60s (server caches 45s); `r` on the status tab refreshes all
   four sources. Scan requests use a per-endpoint client timeout (50s limits,
