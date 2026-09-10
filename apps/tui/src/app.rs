@@ -383,3 +383,89 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_app() -> App {
+        let settings = Settings {
+            base_url: String::new(),
+            token: None,
+            token_path: PathBuf::from("/synthetic/SYNTHETIC_FIXTURE/server.json"),
+        };
+        App::new(&settings)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, key(code), &[]);
+    }
+
+    #[test]
+    fn cycle_tab_wraps_forward_and_backward() {
+        assert_eq!(App::cycle_tab(0, 1), 1);
+        assert_eq!(App::cycle_tab(TAB_COUNT - 1, 1), 0);
+        assert_eq!(App::cycle_tab(0, -1), TAB_COUNT - 1);
+        assert_eq!(App::cycle_tab(3, TAB_COUNT as i32), 3);
+        assert_eq!(App::cycle_tab(3, -(TAB_COUNT as i32)), 3);
+    }
+
+    #[test]
+    fn right_and_left_arrows_cycle_tabs_with_wraparound() {
+        let mut app = test_app();
+        assert_eq!(app.tab, 0);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.tab, TAB_COUNT - 1, "Left from the first tab wraps");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, 0, "Right from the last tab wraps home");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, 1);
+    }
+
+    #[test]
+    fn tab_and_backtab_still_cycle() {
+        let mut app = test_app();
+        app.tab = TAB_COUNT - 1;
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, 0);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, TAB_COUNT - 1);
+    }
+
+    #[test]
+    fn number_keys_still_jump_to_tabs() {
+        let mut app = test_app();
+        for (digit, expected) in [('1', 0), ('4', 3), ('7', 6)] {
+            press(&mut app, KeyCode::Char(digit));
+            assert_eq!(app.tab, expected, "digit {digit} jumps to tab");
+        }
+    }
+
+    #[test]
+    fn vertical_keys_keep_scrolling_without_changing_tab() {
+        let mut app = test_app();
+        app.tab = 4;
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.scrolls[4], 2);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.scrolls[4], 0);
+        assert_eq!(app.tab, 4, "Up/Down never switch tabs");
+        assert_eq!(app.scrolls[0], 0, "only the active tab scrolls");
+    }
+
+    #[test]
+    fn quit_keys_are_unchanged() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut app = test_app();
+            press(&mut app, code);
+            assert!(app.quitting, "{code:?} still quits");
+        }
+    }
+}
