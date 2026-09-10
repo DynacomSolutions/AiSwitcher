@@ -29,6 +29,12 @@ const PROVIDER_ALIASES: Record<string, string> = {
   // zai_coding_plan"); the underscore spelling must collapse onto the same
   // upstream as the hyphenated one.
   "opencode_go": "opencode-go",
+  // AWS Bedrock identities (codex/claude wrappers pointed at Bedrock): both
+  // spellings collapse so any future underscore-emitting source still lands
+  // on one upstream. Real dollars for this provider come from Cost Explorer
+  // (see usage/aws-bedrock-usage.ts), limits from AWS Budgets.
+  "aws-bedrock": "aws-bedrock",
+  "aws_bedrock": "aws-bedrock",
   "party-cli": "unattributed",
 };
 
@@ -41,6 +47,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   alibaba: "Alibaba",
   "opencode-go": "OpenCode Go",
   opencode: "OpenCode",
+  "aws-bedrock": "AWS Bedrock",
   unattributed: "Unattributed",
   detecting: "Detecting providers",
 };

@@ -1,4 +1,5 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
+import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
@@ -8,6 +9,7 @@ import { fetchCodexLimits } from "../limits/codex-limits.ts";
 import { fetchKimiLimits } from "../limits/kimi-limits.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { fetchAliUsage } from "./ali-usage.ts";
+import { fetchAwsBedrockUsage, AwsNoProfileMappedError } from "./aws-bedrock-usage.ts";
 import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, fetchOpencodeIdentityUsage, readOpencodeProfileUsage, resolveOpencodeProfileIdentities } from "./opencode-usage.ts";
 import { fetchPiUsage } from "./pi-usage.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
@@ -50,6 +52,12 @@ export interface UsageResult {
   extraCost?: OverageInfo;
   dateSpan?: DateSpan;
   dailyUsage?: Record<string, number>;
+  /** AWS Bedrock only: REAL billed dollars per UTC day from Cost Explorer
+   * (see usage/aws-bedrock-usage.ts). Deliberately separate from dailyUsage,
+   * which is a TOKEN-typed dimension feeding the shared contribution graph —
+   * mixing dollars into it would corrupt the scale for every other provider.
+   */
+  dailyCostUsd?: Record<string, number>;
   pending?: true;
 }
 
@@ -85,10 +93,16 @@ export async function collectTargets(
  * opencode) get NO seed: their provider isn't known until their own source
  * resolves, and a placeholder under the tool's fallback label would render
  * a fake "Detecting providers"/"OpenCode" section — tool-shaped output the
- * provider-first views rule forbids. Returns undefined for those. */
+ * provider-first views rule forbids. Returns undefined for those. codex
+ * Bedrock-backed identities DO get a seed, stamped "aws-bedrock": their
+ * provider is known cheaply and synchronously (config.toml probe), and a
+ * pending "OpenAI" row over an AWS account would be that same fake label by
+ * another route. */
 export function pendingUsageResult(target: UsageTarget): UsageResult | undefined {
   if (target.toolName === "pi" || target.toolName === "opencode") return undefined;
-  return { provider: providerForTool(target.toolName), identity: target.identity, sourceTool: target.toolName, pending: true };
+  const provider =
+    target.toolName === "codex" && isBedrockIdentity(target.identity) ? "aws-bedrock" : providerForTool(target.toolName);
+  return { provider, identity: target.identity, sourceTool: target.toolName, pending: true };
 }
 
 function providerResult(target: UsageTarget, provider: string, fields: Omit<UsageResult, "provider" | "identity">): UsageResult {
@@ -245,7 +259,28 @@ async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppre
   }
 }
 
+/** AWS Bedrock identities report REAL billed dollars from Cost Explorer —
+ * no tokscale (Bedrock billing records carry no token counts, and tokscale's
+ * valuation wouldn't be real spend anyway), no extraCost probe (codex's
+ * rate-limit/overage concepts don't exist on Bedrock; the budget-overage
+ * signal lives in `ais limits`). No profile mapping = nothing to report
+ * unless the user asked for this source explicitly; a malformed mapping or
+ * any query failure (SSO expired included) stays an honest error row. */
+async function runAwsBedrockUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
+  try {
+    const { report, dateSpan, dailyCostUsd } = await fetchAwsBedrockUsage(target.identity);
+    return [providerResult(target, "aws-bedrock", { report, ...(dateSpan ? { dateSpan } : {}), ...(dailyCostUsd ? { dailyCostUsd } : {}) })];
+  } catch (err) {
+    if (err instanceof AwsNoProfileMappedError) {
+      return suppression.explicitTool ? [providerResult(target, "aws-bedrock", { error: err.message })] : [];
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return [providerResult(target, "aws-bedrock", { error: message })];
+  }
+}
+
 async function runOne(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
+  if (target.toolName === "codex" && isBedrockIdentity(target.identity)) return runAwsBedrockUsage(target, suppression);
   if (target.toolName === "zai") return runZaiUsage(target, suppression);
   if (target.toolName === "ali") return runAliUsage(target, suppression);
   if (target.toolName === "pi") return runPiUsage(target, suppression);
