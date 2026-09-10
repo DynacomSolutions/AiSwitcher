@@ -230,12 +230,18 @@ impl App {
         }
     }
 
+    /// Tab index `step` tabs away from `current`, wrapping in both
+    /// directions across the TAB_COUNT tabs.
+    fn cycle_tab(current: usize, step: i32) -> usize {
+        (current as i64 + step as i64).rem_euclid(TAB_COUNT as i64) as usize
+    }
+
     fn next_tab(&mut self) {
-        self.tab = (self.tab + 1) % TAB_COUNT;
+        self.tab = Self::cycle_tab(self.tab, 1);
     }
 
     fn prev_tab(&mut self) {
-        self.tab = (self.tab + TAB_COUNT - 1) % TAB_COUNT;
+        self.tab = Self::cycle_tab(self.tab, -1);
     }
 
     fn scroll_up(&mut self, amount: usize) {
@@ -305,6 +311,10 @@ fn handle_key(app: &mut App, key: KeyEvent, notifies: &[Arc<Notify>]) {
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => app.prev_tab(),
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Tab => app.next_tab(),
+        // Pages are read-only, so no in-page widget claims Left/Right; the
+        // top level owns them for tab cycling while Up/Down keep scrolling.
+        KeyCode::Right => app.next_tab(),
+        KeyCode::Left => app.prev_tab(),
         KeyCode::Char(digit @ '1'..='7') => {
             app.tab = digit.to_digit(10).unwrap_or(1) as usize - 1;
         }

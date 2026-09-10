@@ -18,7 +18,7 @@ pub fn render(f: &mut Frame<'_>, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     section(&mut lines, "Keys");
     key_line(&mut lines, "1-7", "jump straight to a tab");
-    key_line(&mut lines, "Tab / Shift+Tab", "cycle tabs");
+    key_line(&mut lines, "Left/Right", "cycle tabs (or Tab / Shift+Tab)");
     key_line(&mut lines, "j / k, Up / Down", "scroll the active tab");
     key_line(&mut lines, "PgUp / PgDn", "scroll by a page");
     key_line(&mut lines, "r", "force refresh of the active tab's data");
