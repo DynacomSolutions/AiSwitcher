@@ -50,6 +50,10 @@ src/
                              non-interactive auth this design's whole existence depends on
     ali-auth.ts              writeAliAuthFile(): the same read-modify-write trick for ali's
                              "alibaba" provider entry, see "ali case study" below
+    aws-profile.ts           identity -> AWS CLI profile resolution for AWS Bedrock
+                             reporting (registry env > ~/.ais/config/aws-profiles.json;
+                             region/account-id enriched from ~/.aws/config) +
+                             isBedrockIdentity(); profile NAMES only, never credentials
     pi-auth.ts               one-shot, secret-silent import of the six provider-specific
                              AIS identities plus OpenCode Go into one Pi auth.json; also translates ali's
                              Crush model catalogue into Pi's models.json
@@ -145,6 +149,9 @@ src/
       pi-usage.ts providers.ts    recursive Pi JSONL usage reader + canonical upstream-provider
                                aliases; copied/forked messages are deduplicated before aggregation,
                                party members are provider-attributed, and native CLI bridges are marked
+      aws-bedrock-usage.ts         REAL Bedrock spend in dollars from AWS Cost Explorer
+                               (UnblendedCost, SERVICE = "Amazon Bedrock"), for
+                               Bedrock-backed identities (see the AWS Bedrock case study)
       run.ts                     collectTargets() (--tool/--identity filtering, every match
                                across registries — not an ambiguity error, unlike
                                resolve-tool.ts's resolveMutationTarget) + provider-first
@@ -172,6 +179,9 @@ src/
                                 `explicitTool` flag so an explicit `--tool=` question always
                                 gets an answer row while an unscoped report omits
                                 nothing-to-report sources
+      aws-bedrock-limits.ts       AWS Budgets as the limits source for Bedrock-backed
+                                identities (one COST budget = one month-category
+                                window; see the AWS Bedrock case study)
       claude-limits.ts codex-limits.ts grok-limits.ts kimi-limits.ts zai-limits.ts
                                 ali-limits.ts
                                 per-tool quota fetchers — kimi-limits.ts is a genuinely LIVE
@@ -2394,6 +2404,56 @@ What the rule means in practice, now enforced in both pipelines:
 Verification should cover aggregation when native and multi-provider clients
 share a credential, fallback to an available result when one source fails,
 and omission of empty sources unless explicitly requested.
+
+### AWS Bedrock case study (2026-09-10): Budgets for limits, Cost Explorer for usage
+
+Some codex identities don't answer to OpenAI at all: their `config.toml`
+sets `model_provider = "amazon-bedrock"` (Bedrock inference auth is a
+`bedrock_api_key` in the identity's own auth.json, separate from AWS
+account auth). Provider-first reporting means these must render as "AWS
+Bedrock" rows, and the only real spend/limit signals are AWS's own
+billing-plane APIs:
+
+- **Identity -> AWS profile is machine-local config, never credentials.**
+  `identities/aws-profile.ts` resolves, in order: `AWS_PROFILE` in the
+  identity's registry `env` (new additive `Identity.env` field), then
+  `~/.ais/config/aws-profiles.json` (`{version:1,identities:{<name>:{profile}}}`
+  — same shape/spirit as chrome-mcp.json: account wiring never belongs in a
+  public repo; absent file = machine isn't set up = "nothing to report",
+  malformed file = honest error row). The profile is enriched with
+  `region`/`sso_account_id` parsed from `~/.aws/config`, which stays the
+  single source of account-id truth. Detection is a sync config.toml probe
+  (`isBedrockIdentity`), safe to call from the pending-seed paths.
+- **Limits = AWS Budgets** (`limits/aws-bedrock-limits.ts`):
+  DescribeBudgets + DescribeBudget per account (the SDK's Budgets list
+  operation is old-style "Describe*", there is no ListBudgets command).
+  Each COST budget renders one `category: "month"` window: label
+  `budget: <name>`, usedPercent = ActualSpend/BudgetLimit (deliberately
+  unclamped; renderBar clamps for display), resetsAt derived from the
+  budget's TimeUnit — recurring budgets set TimePeriod.End to a 2087
+  sentinel, so the period end date is NEVER the reset. Spend over limit is
+  the one honest OverageInfo (active, real dollars, real cap).
+- **Usage = Cost Explorer** (`usage/aws-bedrock-usage.ts`):
+  GetCostAndUsage, metric UnblendedCost, Filter SERVICE == "Amazon
+  Bedrock", MONTHLY (report entries + totalCost) and DAILY (JSON-only
+  `dailyCostUsd`) over the trailing 3 months. Cost Explorer serves ONLY
+  from us-east-1 — force the client region regardless of profile region.
+  Token/message counts are 0 because the source has none: these are REAL
+  billed dollars in the cost column, not tokscale estimates (tokscale has
+  no aws client and no token counts to value anyway).
+- **Auth is the AWS CLI's own SSO chain** (fromIni({profile}) reads
+  ~/.aws/sso/cache and auto-refreshes sso-session tokens). An expired
+  token cannot be fixed non-interactively — classified via
+  `isSsoAuthError` and reported as "run `aws sso login --profile <p>`";
+  ais deliberately never attempts the browser flow. Transport blips retry
+  3s/8s like every other fetcher (a transient Bun "typo in the url"
+  endpoint error was observed live and rides out).
+- **Wiring reuses the multi-provider-adapter shape**: the codex entry in
+  limits/collect.ts's FETCHERS (and usage/run.ts's runOne + both pending
+  seeds) routes Bedrock identities to the AWS fetchers, which stamp
+  provider "aws-bedrock" themselves (providerForTool(codex) is "openai",
+  wrong by definition here) and return [] for nothing-to-report (no
+  budgets, no mapping) unless an explicit `--tool=` asked.
 
 ## Commands
 
