@@ -18,6 +18,7 @@ const COMMANDS: Array<[string, string]> = [
   ["identities chrome-overrides add --tool=<t> --directories=a,b --target-identity=<name> [--label=]", ""],
   ["identities chrome-overrides remove --tool=<t> <index>", ""],
   ["usage [--identity=] [--tool=] [--json]", "Provider-grouped token usage & cost from every client, including Pi"],
+  ["usage breakdown [identity] [--tool=] [--days=30] [--json]", "Per-tool-call breakdown: built-ins, MCP servers, edits; what used the most"],
   ["usage [--identity=] [--tool=] <tokscale args>", "Full tokscale (tui/graph/monthly/pricing/...), scoped"],
   ["limits [identity] [--tool=] [--json|--watch|--cached]", "Live 5h/weekly/monthly rate-limit usage per identity"],
   ["auth login|refresh|enable <identity> --tool=ali", "SSH-only interactive auth browser and 10-minute cookie renewal"],
