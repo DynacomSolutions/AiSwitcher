@@ -6,6 +6,13 @@ export interface Identity {
   directories?: string[];
   /** Alternate short names that resolve to this identity, e.g. "wk" for "work". */
   aliases?: string[];
+  /** Extra environment variables the identity itself declares (currently read
+   * only by reporting features, e.g. AWS_PROFILE in identities/aws-profile.ts
+   * for AWS Bedrock identities). Never applied to launches automatically: a
+   * tool wrapper must opt in to reading a specific key, so an entry here can
+   * never leak into an unrelated child process. Kept secrets-free by
+   * convention: point at profile NAMES, never raw credentials. */
+  env?: Record<string, string>;
 }
 
 /**

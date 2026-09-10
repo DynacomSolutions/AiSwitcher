@@ -36,6 +36,16 @@ function validateIdentity(identity: unknown, index: number): asserts identity is
       throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-string[] "aliases"`);
     }
   }
+  if (rec.env !== undefined) {
+    if (typeof rec.env !== "object" || rec.env === null || Array.isArray(rec.env)) {
+      throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-object "env"`);
+    }
+    for (const [key, value] of Object.entries(rec.env as Record<string, unknown>)) {
+      if (typeof value !== "string") {
+        throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-string env value for "${key}"`);
+      }
+    }
+  }
 }
 
 function validateChromeProfileOverride(
