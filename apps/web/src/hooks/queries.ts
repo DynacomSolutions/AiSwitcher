@@ -9,6 +9,7 @@ export const POLL = {
   registry: 10_000,
   sessions: 15_000,
   slow: 60_000,
+  breakdown: 300_000,
 } as const;
 
 export const qk = {
@@ -17,6 +18,7 @@ export const qk = {
   identities: ["identities"] as const,
   limits: ["limits"] as const,
   usage: ["usage"] as const,
+  breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
   auth: ["auth"] as const,
   authRefresh: ["auth", "refresh"] as const,
@@ -87,6 +89,19 @@ export function useUsageQuery() {
     queryKey: qk.usage,
     queryFn: api.getUsage,
     refetchInterval: POLL.slow,
+  });
+}
+
+/** Per-call breakdown streams raw session JSONL server-side: much heavier
+ * than the other polls, so it refreshes every 5 minutes and only once an
+ * identity is actually selected (never an unscoped scan by accident). */
+export function useBreakdownQuery(identity: string, tool: string, days: number) {
+  return useQuery({
+    queryKey: qk.breakdown(identity, tool, days),
+    queryFn: () => api.getBreakdown(identity, tool, days),
+    enabled: identity !== "" && tool !== "",
+    refetchInterval: POLL.breakdown,
+    placeholderData: keepPreviousData,
   });
 }
 

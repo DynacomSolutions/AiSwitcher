@@ -1,6 +1,7 @@
 //! Top-level layout: header, tab bar, unreachable banner, content, footer.
 
 mod auth;
+mod breakdown;
 mod help;
 mod identities;
 mod limits;
@@ -108,6 +109,7 @@ fn render_content(f: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect)
         3 => usage::render(f, app, area),
         4 => sessions::render(f, app, area),
         5 => auth::render(f, app, area),
+        6 => breakdown::render(f, app, area),
         _ => help::render(f, app, area),
     }
 }
@@ -120,6 +122,7 @@ fn render_footer(f: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
         3 => &["auto 60s"],
         4 => &["j/k scroll", "PgUp/PgDn page"],
         5 => &["read-only: fixes via web UI or ais CLI"],
+        6 => &["r refresh", ",/. identity", "auto 5m", "estimates"],
         _ => &[],
     };
 

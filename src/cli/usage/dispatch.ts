@@ -3,6 +3,11 @@ import { CliUsageError } from "../errors.ts";
 import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { spinnerChar, withLiveRender } from "../live.ts";
 import { runPassthrough } from "./passthrough.ts";
+import {
+  breakdownQueryFromFlags,
+  formatBreakdownReport,
+  runBreakdownQuery,
+} from "./breakdown.ts";
 import { formatUsageReport } from "./report.ts";
 import {
   aggregateUsageResults,
@@ -58,6 +63,20 @@ export function splitPassthroughArgs(
  * splitPassthroughArgs for why this can't be the already-parsed top-level
  * flags the other `ais` subcommands use. */
 export async function runUsageCommand(rawArgs: string[]): Promise<void> {
+  // "breakdown" is our own subcommand, never a tokscale one: intercept it
+  // before the passthrough splitter would hand the bare word to tokscale.
+  if (rawArgs[0] === "breakdown") {
+    const { flags, positionals } = parseArgs(rawArgs.slice(1));
+    const query = breakdownQueryFromFlags(flags, positionals[0]);
+    const results = await runBreakdownQuery(query);
+    if (boolFlag(flags, "json")) {
+      console.log(JSON.stringify({ results }, null, 2));
+      return;
+    }
+    console.log(formatBreakdownReport(results));
+    return;
+  }
+
   const split = splitPassthroughArgs(rawArgs);
   if (split) {
     const { flags } = parseArgs(split.ownArgs);

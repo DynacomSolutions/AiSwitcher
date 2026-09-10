@@ -47,6 +47,7 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 | `/api/sessions` | 15s |
 | `/api/files/*` | on demand |
 | `/api/limits`, `/api/usage`, `/api/spend-guard`, `/api/herdr-bridge` | 60s (server caches 45s) |
+| `/api/usage/breakdown` | 300s (server caches 60s; heavy local JSONL scan) |
 
 ## Endpoints
 
@@ -269,6 +270,56 @@ trailing aggregate row per provider where applicable:
 ```jsonc
 { "results": [ /* UsageResult[] (provider-first) */ ], "generatedAt": "..." }
 ```
+
+### Usage breakdown
+
+`GET /api/usage/breakdown?identity=&tool=&days=30`
+
+Per-tool-call token and cost breakdown for one identity's local logs, read
+in the scan worker (like `/api/usage` but heavier: raw session JSONL, so
+the child ceiling is 240s; a request that outlasts it answers 504 with a
+clear error and a smaller `days` scans proportionally less). `identity` and
+`tool` are optional but recommended: unscoped scans walk every registry
+entry.
+
+```jsonc
+{
+  "results": [
+    {
+      "identity": "dynacom",
+      "tool": "claude",
+      "windowDays": 30,
+      "generatedAt": "...",
+      "filesRead": 7,
+      "categories": [           // estCostUsd-desc
+        {
+          "kind": "tool",       // tool | mcp | edit | web | conversation
+          "name": "Bash",       // mcp rows: "mcp:<server>", with server set
+          "server": undefined,  // MCP server name when kind is "mcp"
+          "callCount": 2649,
+          "inputTokens": 0,
+          "outputTokens": 2635004,
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "estCostUsd": 130.64,
+          "lastUsedAt": "2026-09-04T...",
+          "tools": [ /* mcp only: per-tool rows inside the server */ ]
+        }
+      ],
+      "unavailable": undefined, // set (with reason) for tools without per-call local data
+      "notes": [ /* e.g. models with no list price, excluded from estCostUsd */ ]
+    }
+  ],
+  "generatedAt": "..."
+}
+```
+
+All figures are ESTIMATES under one documented attribution rule (see
+`src/cli/usage/breakdown.ts`): prompt-side tokens (input, cache read,
+cache write) always sit on the `conversation` row, and output tokens split
+evenly across the turn's tool calls. The logs record usage per model turn,
+never per call, so nothing here is real billed spend. Only claude and
+codex produce rows; other tools return `unavailable` with a reason.
 
 ### Sessions
 

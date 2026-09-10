@@ -285,6 +285,41 @@ export interface UsageResponse {
   generatedAt: string;
 }
 
+/* Usage breakdown (per tool call) */
+
+export type BreakdownKind = "tool" | "mcp" | "edit" | "web" | "conversation" | "other";
+
+export interface BreakdownCategory {
+  kind: BreakdownKind;
+  name: string;
+  server?: string;
+  callCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  estCostUsd: number;
+  lastUsedAt: string | null;
+  /** MCP only: per-tool rows inside the server, cost-desc. */
+  tools?: BreakdownCategory[];
+}
+
+export interface BreakdownResult {
+  identity: string;
+  tool: ToolName;
+  windowDays: number;
+  generatedAt: string;
+  filesRead: number;
+  categories: BreakdownCategory[];
+  unavailable?: string;
+  notes?: string[];
+}
+
+export interface BreakdownResponse {
+  results: BreakdownResult[];
+  generatedAt: string;
+}
+
 /* Sessions (resume) */
 
 export interface ResumableSession {

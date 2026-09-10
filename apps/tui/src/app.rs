@@ -13,7 +13,7 @@ use crate::config::Settings;
 use crate::models;
 use crate::ui;
 
-pub const TAB_COUNT: usize = 7;
+pub const TAB_COUNT: usize = 8;
 pub const TAB_NAMES: [&str; TAB_COUNT] = [
     "Status",
     "Identities",
@@ -21,6 +21,7 @@ pub const TAB_NAMES: [&str; TAB_COUNT] = [
     "Usage",
     "Sessions",
     "Auth",
+    "Breakdown",
     "Help",
 ];
 
@@ -34,9 +35,10 @@ enum Endpoint {
     Usage,
     Sessions,
     Auth,
+    Breakdown,
 }
 
-const ENDPOINTS: [Endpoint; 7] = [
+const ENDPOINTS: [Endpoint; 8] = [
     Endpoint::Status,
     Endpoint::Processes,
     Endpoint::Identities,
@@ -44,6 +46,7 @@ const ENDPOINTS: [Endpoint; 7] = [
     Endpoint::Usage,
     Endpoint::Sessions,
     Endpoint::Auth,
+    Endpoint::Breakdown,
 ];
 
 impl Endpoint {
@@ -53,16 +56,21 @@ impl Endpoint {
             Self::Identities | Self::Auth => Duration::from_secs(10),
             Self::Sessions => Duration::from_secs(15),
             Self::Limits | Self::Usage => Duration::from_secs(60),
+            // The breakdown scan streams raw session JSONL: the heaviest
+            // endpoint, so it polls the least often.
+            Self::Breakdown => Duration::from_secs(300),
         }
     }
 
     /// Whole-request ceiling per endpoint. The scan endpoints must outlast
-    /// the console's server-side scan budgets (45s limits, 60s usage) so a
-    /// cold-cache poll is waited out instead of aborted; see api.rs.
+    /// the console's server-side scan budgets (45s limits, 60s usage, 240s
+    /// breakdown) so a cold-cache poll is waited out instead of aborted; see
+    /// api.rs.
     const fn timeout(self) -> Duration {
         match self {
             Self::Limits => Duration::from_secs(50),
             Self::Usage => Duration::from_secs(70),
+            Self::Breakdown => Duration::from_secs(250),
             _ => Duration::from_secs(20),
         }
     }
@@ -76,6 +84,7 @@ impl Endpoint {
             Self::Usage => "/api/usage",
             Self::Sessions => "/api/sessions",
             Self::Auth => "/api/auth",
+            Self::Breakdown => "/api/usage/breakdown?days=30",
         }
     }
 
@@ -88,6 +97,7 @@ impl Endpoint {
             Self::Usage => 4,
             Self::Sessions => 5,
             Self::Auth => 6,
+            Self::Breakdown => 7,
         }
     }
 
@@ -102,6 +112,7 @@ impl Endpoint {
             3 => &[Self::Usage],
             4 => &[Self::Sessions],
             5 => &[Self::Auth],
+            6 => &[Self::Breakdown],
             _ => &[],
         }
     }
@@ -115,6 +126,7 @@ enum Msg {
     Usage(Result<models::UsageResponse, ApiError>),
     Sessions(Result<models::SessionsResponse, ApiError>),
     Auth(Result<models::AuthResponse, ApiError>),
+    Breakdown(Result<models::BreakdownResponse, ApiError>),
 }
 
 #[derive(Debug)]
@@ -164,6 +176,10 @@ pub struct App {
     pub usage: FetchState<models::UsageResponse>,
     pub sessions: FetchState<models::SessionsResponse>,
     pub auth: FetchState<models::AuthResponse>,
+    pub breakdown: FetchState<models::BreakdownResponse>,
+    /// Which breakdown result (one per tool/identity pair) the Breakdown tab
+    /// is showing; cycled with `,` / `.` and clamped at render time.
+    pub breakdown_selection: usize,
     /// When the most recent completed fetch failed: the instant its
     /// endpoint polls again (drives the unreachable banner countdown).
     next_retry: Option<Instant>,
@@ -185,6 +201,8 @@ impl App {
             usage: FetchState::default(),
             sessions: FetchState::default(),
             auth: FetchState::default(),
+            breakdown: FetchState::default(),
+            breakdown_selection: 0,
             next_retry: None,
             quitting: false,
         }
@@ -227,6 +245,7 @@ impl App {
             Msg::Usage(result) => record!(usage, Endpoint::Usage, result),
             Msg::Sessions(result) => record!(sessions, Endpoint::Sessions, result),
             Msg::Auth(result) => record!(auth, Endpoint::Auth, result),
+            Msg::Breakdown(result) => record!(breakdown, Endpoint::Breakdown, result),
         }
     }
 
@@ -251,6 +270,16 @@ impl App {
 
     fn scroll_down(&mut self, amount: usize) {
         self.scrolls[self.tab] = self.scrolls[self.tab].saturating_add(amount);
+    }
+
+    /// `,` / `.` step through the breakdown results (one per tool/identity
+    /// pair); the selection is clamped against the result count at render.
+    fn breakdown_select_prev(&mut self) {
+        self.breakdown_selection = self.breakdown_selection.saturating_sub(1);
+    }
+
+    fn breakdown_select_next(&mut self) {
+        self.breakdown_selection = self.breakdown_selection.saturating_add(1);
     }
 }
 
@@ -288,6 +317,9 @@ async fn fetch_loop(
                 Msg::Sessions(client.get_json(endpoint.path(), endpoint.timeout()).await)
             }
             Endpoint::Auth => Msg::Auth(client.get_json(endpoint.path(), endpoint.timeout()).await),
+            Endpoint::Breakdown => {
+                Msg::Breakdown(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
         };
         if tx.send(msg).is_err() {
             return; // main loop gone: nothing left to feed
@@ -315,9 +347,13 @@ fn handle_key(app: &mut App, key: KeyEvent, notifies: &[Arc<Notify>]) {
         // top level owns them for tab cycling while Up/Down keep scrolling.
         KeyCode::Right => app.next_tab(),
         KeyCode::Left => app.prev_tab(),
-        KeyCode::Char(digit @ '1'..='7') => {
+        KeyCode::Char(digit @ '1'..='8') => {
             app.tab = digit.to_digit(10).unwrap_or(1) as usize - 1;
         }
+        // Breakdown identity cycling (tab 6 only, so typing these elsewhere
+        // stays inert).
+        KeyCode::Char(',') if app.tab == 6 => app.breakdown_select_prev(),
+        KeyCode::Char('.') if app.tab == 6 => app.breakdown_select_next(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
         KeyCode::PageDown => app.scroll_down(10),
@@ -440,10 +476,30 @@ mod tests {
     #[test]
     fn number_keys_still_jump_to_tabs() {
         let mut app = test_app();
-        for (digit, expected) in [('1', 0), ('4', 3), ('7', 6)] {
+        for (digit, expected) in [('1', 0), ('4', 3), ('7', 6), ('8', TAB_COUNT - 1)] {
             press(&mut app, KeyCode::Char(digit));
             assert_eq!(app.tab, expected, "digit {digit} jumps to tab");
         }
+    }
+
+    #[test]
+    fn comma_dot_cycle_breakdown_identity_selection() {
+        let mut app = test_app();
+        app.tab = 6;
+        press(&mut app, KeyCode::Char('.'));
+        press(&mut app, KeyCode::Char('.'));
+        assert_eq!(app.breakdown_selection, 2);
+        press(&mut app, KeyCode::Char(','));
+        assert_eq!(app.breakdown_selection, 1);
+        // Never underflows.
+        press(&mut app, KeyCode::Char(','));
+        press(&mut app, KeyCode::Char(','));
+        assert_eq!(app.breakdown_selection, 0);
+        // Inert outside the breakdown tab.
+        app.tab = 3;
+        press(&mut app, KeyCode::Char('.'));
+        assert_eq!(app.breakdown_selection, 0);
+        assert_eq!(app.tab, 3);
     }
 
     #[test]

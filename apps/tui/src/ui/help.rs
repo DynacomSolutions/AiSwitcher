@@ -17,10 +17,11 @@ pub fn render(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
     section(&mut lines, "Keys");
-    key_line(&mut lines, "1-7", "jump straight to a tab");
+    key_line(&mut lines, "1-8", "jump straight to a tab");
     key_line(&mut lines, "Left/Right", "cycle tabs (or Tab / Shift+Tab)");
     key_line(&mut lines, "j / k, Up / Down", "scroll the active tab");
     key_line(&mut lines, "PgUp / PgDn", "scroll by a page");
+    key_line(&mut lines, ", / .", "breakdown tab: previous / next identity");
     key_line(&mut lines, "r", "force refresh of the active tab's data");
     key_line(&mut lines, "q or Esc, Ctrl+C", "quit");
 
@@ -30,12 +31,17 @@ pub fn render(f: &mut Frame<'_>, app: &App, area: Rect) {
     info_line(
         &mut lines,
         "Polling",
-        "status/processes 3s; identities/auth 10s; sessions 15s; limits/usage 60s (server caches 45s)",
+        "status/processes 3s; identities/auth 10s; sessions 15s; limits/usage 60s; breakdown 300s (server caches 60s)",
     );
     info_line(
         &mut lines,
         "Status page",
         "per identity and provider: EST $ is tokscale's token-estimate cost over local history (never billed); REAL $ is provider-reported billed spend; LIMITS is the worst window; RESETS shows its reset (or a note like \"credits depleted\") plus any manual reset credits",
+    );
+    info_line(
+        &mut lines,
+        "Breakdown page",
+        "per tool call, MCP server and code edit: EST $ from local logs with output split evenly per call and prompt tokens on the chat row; heuristic estimates, never billed",
     );
     info_line(
         &mut lines,

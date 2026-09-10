@@ -2,6 +2,7 @@ import type {
   AuthEntry,
   AuthRefreshResponse,
   AuthResponse,
+  BreakdownResponse,
   CreateIdentityBody,
   FileContentResponse,
   FileRoot,
@@ -131,6 +132,13 @@ export const api = {
   getLimits: () => request<LimitsResponse>("/api/limits?maxAge=45"),
 
   getUsage: () => request<UsageResponse>("/api/usage"),
+
+  getBreakdown: (identity?: string, tool?: string, days?: number) =>
+    request<BreakdownResponse>(withParams("/api/usage/breakdown", {
+      identity,
+      tool,
+      days: days !== undefined ? String(days) : undefined,
+    })),
 
   getSessions: (cwd?: string) => request<SessionsResponse>(withParams("/api/sessions", { cwd })),
 

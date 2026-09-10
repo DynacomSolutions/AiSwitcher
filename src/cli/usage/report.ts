@@ -11,14 +11,15 @@ import type { UsageResult } from "./run.ts";
 const HEADERS = ["PROVIDER", "IDENTITY", "MESSAGES", "INPUT", "OUTPUT", "CACHE READ", "EST. COST", "EXTRA COST"];
 const NUMERIC_COLUMNS = new Set([2, 3, 4, 5, 6, 7]);
 
-function formatNumber(n: number): string {
+/** Shared with usage/breakdown.ts's own table render. */
+export function formatNumber(n: number): string {
   return Math.round(n).toLocaleString("en-US");
 }
 
 /** Comma-grouped, always 2 decimal places — matches formatNumber's
  * toLocaleString convention so a cost over $1,000 doesn't read as a
  * different, ungrouped species of number from every other column. */
-function formatCost(n: number): string {
+export function formatCost(n: number): string {
   return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 

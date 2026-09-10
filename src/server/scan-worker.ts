@@ -1,4 +1,4 @@
-import { limitsEnvelope, PollCache, usageEnvelope, flagsFor } from "./expensive.ts";
+import { limitsEnvelope, PollCache, usageEnvelope, breakdownEnvelope, flagsFor } from "./expensive.ts";
 import { HttpError } from "./types.ts";
 import { runResumeQuery } from "../cli/resume/collect.ts";
 
@@ -12,8 +12,11 @@ import { runResumeQuery } from "../cli/resume/collect.ts";
  * the parent kills it and the next poll starts fresh. */
 
 const cache = new PollCache(45_000);
+// Breakdown streams raw JSONL (bigger and slower than the other scans), so
+// it gets its own slightly longer TTL instead of sharing the scan cache.
+const breakdownCache = new PollCache(60_000);
 
-export type ScanKind = "usage" | "limits" | "sessions";
+export type ScanKind = "usage" | "limits" | "sessions" | "breakdown";
 
 export interface ScanRequest {
   kind: ScanKind;
@@ -21,6 +24,8 @@ export interface ScanRequest {
   identity?: string;
   cwd?: string;
   maxAgeS?: number;
+  /** Breakdown only: lookback window in days. */
+  days?: number;
 }
 
 export interface ScanResult<T = unknown> {
@@ -44,6 +49,11 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
         const flags = flagsFor(req.tool, req.identity);
         const results = await runResumeQuery(flags, req.cwd ?? process.cwd());
         payload = { results };
+        break;
+      }
+      case "breakdown": {
+        const days = typeof req.days === "number" && Number.isFinite(req.days) ? req.days : 30;
+        payload = await breakdownEnvelope(breakdownCache, req.tool, req.identity, days);
         break;
       }
       default:

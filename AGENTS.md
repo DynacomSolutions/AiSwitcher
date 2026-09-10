@@ -169,6 +169,15 @@ src/
                                tokscale (github.com/junhoyeo/tokscale) at one identity's
                                data, + TokscaleReport/TokscaleEntry (its --json shape) +
                                resolveTokscaleCommand() (PATH, else bunx)
+      breakdown.ts              collectIdentityBreakdown()/runBreakdownQuery(): per-tool-call
+                               token & cost breakdown from local logs (claude projects JSONL,
+                               codex rollout JSONL; streaming line reader, mtime/path-date
+                               pruning); MCP servers roll up to mcp:<server> with per-tool
+                               detail, edit/write tools group as kind "edit"; one documented
+                               attribution rule (prompt-side tokens on the "conversation"
+                               row, output split evenly across a turn's tool calls) and
+                               explicit unavailable results for tools without per-call
+                               local data; see the case study below before touching
       pi-usage.ts providers.ts    recursive Pi JSONL usage reader + canonical upstream-provider
                                aliases; copied/forked messages are deduplicated before aggregation,
                                party members are provider-attributed, and native CLI bridges are marked
@@ -709,6 +718,31 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
     would seem natural, and easy to get wrong again if this ever gets
     refactored without re-reading why.
 
+- **`ais usage breakdown` answers WHAT consumed the tokens, per tool call
+  (2026-09-10).** tokscale aggregates per model; breakdown.ts
+  (`src/cli/usage/breakdown.ts`) re-reads the same local logs one level
+  deeper: built-in tool calls, MCP servers rolled up to `mcp:<server>` with
+  per-tool detail, edit/write tools grouped as kind "edit", and a
+  "conversation" row. Only claude and codex have readers (their logs carry
+  both per-turn token usage and tool-call names); every other tool answers
+  an explicit `unavailable` reason (grok's history names calls but has zero
+  usage fields; kimi/Crush/pi/opencode store message or session totals
+  without per-call attribution) — never fabricated rows. **The attribution
+  rule is one convention and must stay consistent:** prompt-side tokens
+  (input + cache read + cache write) price the turn's context, so they
+  always land on the conversation row; output tokens split EVENLY across
+  the turn's tool calls (claude: the message's `tool_use` blocks; codex:
+  the response items buffered per `turn_context`), and a turn with no calls
+  keeps its output on conversation. The logs simply do not record per-call
+  usage, so this is a heuristic and every surface labels it an estimate:
+  costs use CHAT_MODEL_PRICES (models.dev list rates,
+  identities/model-pricing.ts) under the same estimate-only convention as
+  the report's EST. COST, unpriced models are listed in `notes`, and
+  nothing is ever presented as real billed spend. Scans stream line by line
+  with the spend-guard's file pruning (listRecentFiles), run in the
+  isolated scan worker behind `/api/usage/breakdown` (60s server cache,
+  240s child ceiling; a 12GB codex store needs minutes), and the CLI is
+  `ais usage breakdown [identity] [--tool=] [--days=30] [--json]`.
 - **`ais upgrade` owns a deterministic real-CLI installation for every
   installed AIS shim.** The old design blindly invoked each real binary's
   supposed `update` subcommand and skipped missing tools. An unsupported

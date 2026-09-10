@@ -6,6 +6,7 @@ import {
   History,
   IdCard,
   LayoutDashboard,
+  PieChart,
   ShieldCheck,
 } from "lucide-react";
 import { NavLink, Outlet } from "react-router-dom";
@@ -21,6 +22,7 @@ const NAV_ITEMS = [
   { to: "/identities", label: "Identities", icon: IdCard, end: false },
   { to: "/limits", label: "Limits", icon: Gauge, end: false },
   { to: "/usage", label: "Usage", icon: BarChart3, end: false },
+  { to: "/breakdown", label: "Breakdown", icon: PieChart, end: false },
   { to: "/sessions", label: "Sessions", icon: History, end: false },
   { to: "/auth", label: "Auth", icon: ShieldCheck, end: false },
   { to: "/files", label: "Files", icon: FolderOpen, end: false },
