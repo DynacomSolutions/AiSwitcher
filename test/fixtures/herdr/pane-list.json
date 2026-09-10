@@ -1,0 +1,95 @@
+{
+  "id": "cli:pane:list",
+  "result": {
+    "panes": [
+      {
+        "agent": "codex",
+        "agent_session": {
+          "agent": "codex",
+          "kind": "id",
+          "source": "herdr:codex",
+          "value": "01a070ee-1613-7f51-81b4-541eadd2b89b"
+        },
+        "agent_status": "idle",
+        "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "focused": false,
+        "foreground_cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "pane_id": "w1:p1G",
+        "revision": 3,
+        "scroll": {
+          "max_offset_from_bottom": 935,
+          "offset_from_bottom": 0,
+          "viewport_rows": 71
+        },
+        "tab_id": "w1:t14",
+        "terminal_id": "term_65ab921d2403523",
+        "terminal_title": ".cluster",
+        "terminal_title_stripped": ".cluster",
+        "workspace_id": "w1"
+      },
+      {
+        "agent": "opencode",
+        "agent_status": "working",
+        "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+        "focused": false,
+        "foreground_cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+        "pane_id": "w2B:p1",
+        "revision": 13,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 73
+        },
+        "tab_id": "w2B:t1",
+        "terminal_id": "term_65b16c1420dcd45",
+        "terminal_title": "OC | Parallel tasks: Bedrock limits, upgra…",
+        "terminal_title_stripped": "OC | Parallel tasks: Bedrock limits, upgra…",
+        "workspace_id": "w2B"
+      },
+      {
+        "agent_status": "unknown",
+        "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "focused": false,
+        "foreground_cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "pane_id": "w1:p1Q",
+        "revision": 3,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 71
+        },
+        "tab_id": "w1:t14",
+        "terminal_id": "term_65af307ccca5e32",
+        "terminal_title": "thomas@hq1:~",
+        "terminal_title_stripped": "thomas@hq1:~",
+        "workspace_id": "w1"
+      },
+      {
+        "agent": "claude",
+        "agent_session": {
+          "agent": "claude",
+          "kind": "id",
+          "source": "herdr:claude",
+          "value": "d2cb8f54-3e20-4cd3-adf5-bfed726b337c"
+        },
+        "agent_status": "idle",
+        "cwd": "/home/Storage/Projects/repositories/ThomasMcFarlane/primipathic",
+        "focused": false,
+        "foreground_cwd": "/home/Storage/Projects/repositories/ThomasMcFarlane/primipathic",
+        "pane_id": "w2C:p1",
+        "revision": 8,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 73
+        },
+        "tab_id": "w2C:t1",
+        "terminal_id": "term_65b16ce893c3a46",
+        "terminal_title": "✳ Athletic divisions by biological profile",
+        "terminal_title_stripped": "Athletic divisions by biological profile",
+        "workspace_id": "w2C"
+      }
+    ],
+    "type": "pane_list"
+  }
+}
