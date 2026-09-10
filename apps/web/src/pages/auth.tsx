@@ -1,8 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { ExternalLink, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { ToolBadge } from "@/components/badges";
+import { AuthStateBadge, ToolBadge } from "@/components/badges";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -32,24 +33,182 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
-import { qk, useAuthQuery, useAuthRefreshQuery } from "@/hooks/queries";
+import { flowIsLive, qk, useAuthQuery, useAuthRefreshQuery, useLoginFlowQuery } from "@/hooks/queries";
 import { api, supportsFix } from "@/lib/api";
 import { relTime } from "@/lib/format";
-import type { AuthEntry, AuthRefreshStatus } from "@/types/api";
+import type { AuthEntry, AuthRefreshStatus, LoginFlowStatus } from "@/types/api";
 
-function StateBadge({ state }: { state: AuthEntry["state"] }) {
-  switch (state) {
-    case "ok":
-      return <Badge variant="success">OK</Badge>;
-    case "expiring":
-      return <Badge variant="warning">Expiring</Badge>;
-    case "expired":
-      return <Badge variant="destructive">Expired</Badge>;
-    case "missing":
-      return <Badge variant="muted">Missing</Badge>;
-    default:
-      return <Badge variant="secondary">Unknown</Badge>;
+export function flowStatusLabel(status: LoginFlowStatus): string {
+  switch (status) {
+    case "starting":
+      return "Starting CLI login";
+    case "waiting":
+      return "Waiting for you";
+    case "callback":
+      return "Credentials received";
+    case "completed":
+      return "Logged in";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
   }
+}
+
+function FlowStatusBadge({ status }: { status: LoginFlowStatus }) {
+  switch (status) {
+    case "starting":
+      return <Badge variant="secondary">{flowStatusLabel(status)}</Badge>;
+    case "waiting":
+    case "callback":
+      return <Badge variant="warning">{flowStatusLabel(status)}</Badge>;
+    case "completed":
+      return <Badge variant="success">{flowStatusLabel(status)}</Badge>;
+    default:
+      return <Badge variant="destructive">{flowStatusLabel(status)}</Badge>;
+  }
+}
+
+/** Live view of one daemon-managed login flow: the CLI's own auth URL,
+ * a paste box for redirect-code fallbacks, and cancel. Polls while the
+ * flow can still move on its own. */
+function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [paste, setPaste] = useState("");
+  const query = useLoginFlowQuery(flowId);
+  const flow = query.data;
+  const completedRef = useRef(false);
+
+  // Reacting to async server state (the flow finishing while we poll) is
+  // exactly a sync-with-external-system concern.
+  useEffect(() => {
+    if (flow?.status === "completed" && !completedRef.current) {
+      completedRef.current = true;
+      void qc.invalidateQueries({ queryKey: qk.auth });
+      toast.success("Logged in", { description: `${flow.toolName}/${flow.identity}` });
+    }
+  }, [flow, qc]);
+
+  const submitMutation = useMutation({
+    mutationFn: (code: string) => api.submitLoginFlow(flowId, code),
+    onSuccess: (updated) => {
+      qc.setQueryData(qk.loginFlow(flowId), updated);
+      setPaste("");
+    },
+    onError: (error) => toast.error("Could not submit code", { description: error.message }),
+  });
+
+  const cancelMutation = useMutation({
+    mutationFn: () => api.cancelLoginFlow(flowId),
+    onSuccess: (updated) => {
+      qc.setQueryData(qk.loginFlow(flowId), updated);
+      void qc.invalidateQueries({ queryKey: qk.auth });
+    },
+    onError: (error) => toast.error("Could not cancel", { description: error.message }),
+  });
+
+  const live = flowIsLive(flow?.status);
+  const finished = flow?.status === "completed" || flow?.status === "failed" || flow?.status === "cancelled";
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && finished && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            Log in to {flow?.toolName ?? "..."}/{flow?.identity ?? "..."}
+          </DialogTitle>
+          <DialogDescription>
+            The daemon is running this tool's own login flow. Your browser is not on this machine, so
+            open the link on any device that is.
+          </DialogDescription>
+        </DialogHeader>
+
+        {query.isLoading || !flow ? (
+          <div className="h-24 animate-pulse rounded-lg bg-muted" />
+        ) : (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <FlowStatusBadge status={flow.status} />
+              {live ? (
+                <span className="text-xs text-muted-foreground">polling every 1.5s...</span>
+              ) : null}
+            </div>
+
+            {flow.authUrl ? (
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground">Auth URL</Label>
+                <a
+                  href={flow.authUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-start gap-1.5 break-all rounded-lg border bg-muted/40 p-2.5 font-mono text-xs text-primary underline-offset-2 hover:underline"
+                >
+                  {flow.authUrl}
+                  <ExternalLink aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+                </a>
+              </div>
+            ) : null}
+
+            {flow.deviceCode ? (
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground">One-time code</Label>
+                <p className="rounded-lg border bg-muted/40 px-2.5 py-2 font-mono text-base font-semibold tracking-widest">
+                  {flow.deviceCode}
+                </p>
+              </div>
+            ) : null}
+
+            {flow.instruction && live ? (
+              <p className="text-xs text-muted-foreground">{flow.instruction}</p>
+            ) : null}
+
+            {flow.acceptsPaste && live ? (
+              <form
+                className="flex gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const value = paste.trim();
+                  if (value.length > 0 && !submitMutation.isPending) submitMutation.mutate(value);
+                }}
+              >
+                <Input
+                  className="font-mono text-xs"
+                  placeholder="Paste the code (or the full redirect URL) here"
+                  value={paste}
+                  onChange={(e) => setPaste(e.target.value)}
+                  spellCheck={false}
+                />
+                <Button type="submit" disabled={!paste.trim() || submitMutation.isPending}>
+                  Submit
+                </Button>
+              </form>
+            ) : null}
+
+            {flow.error ? (
+              <p className="break-words rounded-lg border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
+                {flow.error}
+              </p>
+            ) : null}
+          </div>
+        )}
+
+        <DialogFooter>
+          {live ? (
+            <Button
+              variant="outline"
+              disabled={cancelMutation.isPending}
+              onClick={() => cancelMutation.mutate()}
+            >
+              <X aria-hidden />
+              Cancel login
+            </Button>
+          ) : (
+            <Button onClick={onClose}>Close</Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 function ZaiKeyDialog({ entry, onClose }: { entry: AuthEntry; onClose: () => void }) {
@@ -150,7 +309,7 @@ function AliCookieDialog({ entry, onClose }: { entry: AuthEntry; onClose: () => 
   );
 }
 
-function FixActions({ entry }: { entry: AuthEntry }) {
+function FixActions({ entry, onFlow }: { entry: AuthEntry; onFlow: (flowId: string) => void }) {
   const qc = useQueryClient();
   const [keyDialogFor, setKeyDialogFor] = useState<AuthEntry | null>(null);
   const [cookieDialogFor, setCookieDialogFor] = useState<AuthEntry | null>(null);
@@ -165,14 +324,15 @@ function FixActions({ entry }: { entry: AuthEntry }) {
   });
 
   const loginMutation = useMutation({
-    mutationFn: () => api.loginIdentity(entry.toolName, entry.identity),
+    mutationFn: () => api.startLogin(entry.toolName, entry.identity),
     onSuccess: (result) => {
-      if (result.spawned) {
+      if (result.kind === "managed") {
+        onFlow(result.flow.flowId);
+      } else if (result.spawned) {
         toast.success("Login launched in a new terminal window", { description: result.command });
       } else {
-        toast.info("Run this command to log in", { description: result.command });
+        toast.info("Run this command in a terminal to log in", { description: result.command });
       }
-      void qc.invalidateQueries({ queryKey: qk.auth });
     },
     onError: (error) => toast.error("Login failed", { description: error.message }),
   });
@@ -346,12 +506,13 @@ function RenewalCard() {
 export function AuthPage() {
   const query = useAuthQuery();
   const entries = query.data?.entries ?? [];
+  const [activeFlowId, setActiveFlowId] = useState<string | null>(null);
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Auth"
-        description="Credential health for every identity across every registry."
+        description="Credential health for every identity across every registry. Logins run the real CLI's own flow right here, so no terminal is needed."
         updatedAt={query.dataUpdatedAt}
       />
 
@@ -389,18 +550,30 @@ export function AuthPage() {
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    <StateBadge state={entry.state} />
+                    <AuthStateBadge state={entry.state} />
                   </TableCell>
                   <TableCell className="max-w-72">
                     <span
                       className={`block truncate text-xs ${entry.state === "ok" ? "" : "text-muted-foreground"}`}
-                      title={entry.detail}
+                      title={
+                        [
+                          entry.detail,
+                          entry.expiresAt ? `expires ${new Date(entry.expiresAt).toLocaleString()}` : undefined,
+                          entry.lastRefreshAt ? `last refresh ${relTime(entry.lastRefreshAt)}` : undefined,
+                          entry.refreshError,
+                        ]
+                          .filter(Boolean)
+                          .join("\n") || undefined
+                      }
                     >
                       {entry.detail ?? "-"}
+                      {entry.refreshError ? (
+                        <span className="block truncate text-destructive">{entry.refreshError}</span>
+                      ) : null}
                     </span>
                   </TableCell>
                   <TableCell>
-                    <FixActions entry={entry} />
+                    <FixActions entry={entry} onFlow={setActiveFlowId} />
                   </TableCell>
                 </TableRow>
               ))}
@@ -408,6 +581,8 @@ export function AuthPage() {
           </Table>
         </div>
       )}
+
+      {activeFlowId ? <LoginFlowDialog flowId={activeFlowId} onClose={() => setActiveFlowId(null)} /> : null}
     </div>
   );
 }

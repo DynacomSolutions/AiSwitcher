@@ -84,38 +84,52 @@ src/
   sync/                SSH/rsync profile and usage-data synchronisation — machine-local
                           remote config, portable ~/ registries, staged additive exchange,
                           inter-process lock, and debounced/final reconciliation
-  server/              the local console API behind `ais web` — thin HTTP wrappers around
-                          the EXISTING engines (store/actions, limits fetchers, usage
-                          aggregation, resume readers, zai/ali auth writers), no new
-                          identity logic; contract documented in docs/API.md
+   server/              the local console API behind `ais web` — thin HTTP wrappers around
+                           the EXISTING engines (store/actions, limits fetchers, usage
+                           aggregation, resume readers, zai/ali auth writers), no new
+                           identity logic; contract documented in docs/API.md
     app.ts                 Hono app assembly: every /api route, static serving of
-                           apps/web/dist (hand-rolled, cwd-independent), uniform HttpError
-                           mapping; createApp(deps) is fully injectable for tests
+                            apps/web/dist (hand-rolled, cwd-independent), uniform HttpError
+                            mapping; createApp(deps) is fully injectable for tests
     serve.ts               Bun.serve wiring + server.json lifecycle (pid/port/token) +
-                           findDistDir() discovery of the built WebUI
+                            findDistDir() discovery of the built WebUI
     guard.ts               request hardening: loopback Host allowlist (DNS-rebinding),
-                           bearer-token OR loopback-peer auth, X-AIS-Console required on
-                           every mutating method (CSRF guard, see design decisions)
+                            bearer-token OR loopback-peer auth, X-AIS-Console required on
+                            every mutating method (CSRF guard, see design decisions)
     state.ts               ~/.ais/web/server.json read/write/clear + token generation
     expensive.ts           PollCache (TTL + in-flight dedupe) shared by the limits/usage
-                           endpoints so BOTH frontends' live polling never hammers
-                           upstream provider APIs; also maps query params onto the
-                           ParsedArgs["flags"] shape the collectors already read
+                            endpoints so BOTH frontends' live polling never hammers
+                            upstream provider APIs; also maps query params onto the
+                            ParsedArgs["flags"] shape the collectors already read
     processes.ts           /proc scan for running agent CLIs, attributed to identities via
-                           IDENTITY_SESSION_MARKER in each process's environ
+                            IDENTITY_SESSION_MARKER in each process's environ
     registries.ts          registry listing + all mutations via cli/identities/actions.ts's
-                           pure functions + store.ts atomic save; optional apiKey at create
-                           time forwarded to writeZaiAuthFile/writeAliAuthFile
-    auth.ts                per-identity auth health probes (file presence + shape only,
-                           never secret values) and fix actions: zai/ali key writes,
-                           ali console-cookie paste, kimi token refresh (reuses
-                           fetchKimiLimits's refresh-on-expiry path), interactive login
-                           spawned into a detected terminal emulator with the identity env
+                            pure functions + store.ts atomic save; optional apiKey at create
+                            time forwarded to writeZaiAuthFile/writeAliAuthFile
+    auth.ts                per-identity auth health probes (file presence + shape +
+                            expiry reads, never secret values) and fix actions: zai/ali
+                            key writes, ali console-cookie paste, kimi token refresh
+                            (reuses fetchKimiLimits's refresh-on-expiry path), login
+                            starts (managed flows with terminal handoff fallback) and
+                            the legacy spawn-into-terminal path; also owns
+                            credentialPathsForTool(), the single source of truth for
+                            "what counts as credentials" shared by the probes and the
+                            flow manager
+    login-specs.ts         LOGIN_FLOW_SPECS: the per-tool managed login command, mode
+                            (pty vs pipes) and paste capability; the terminal fallback
+                            derives its args from the same table so the two never drift
+    login-flows.ts         LoginFlowManager: daemon-managed per-identity logins — spawns
+                            the REAL CLI's own flow (resolveRealBinary, never the shim)
+                            with piped stdio or a script-allocated PTY, surfaces the
+                            auth URL/device code from its output (ANSI-stripped), tracks
+                            status (waiting -> callback -> completed/failed/cancelled)
+                            via process exit + credential-file fingerprints, injects
+                            pasted codes on stdin for claude's paste path
     files.ts               whitelisted-root file browsing/editing (~/.ais, tool containers,
-                           registered configDirs): dual lexical+realpath containment guards,
-                           REPRODUCIBLE_JUNK_DIR_NAMES-filtered listings, 2 MB text cap,
-                           binary sniffing, atomic writes with pre-edit backups under
-                           ~/.ais/web/file-backups/
+                            registered configDirs): dual lexical+realpath containment guards,
+                            REPRODUCIBLE_JUNK_DIR_NAMES-filtered listings, 2 MB text cap,
+                            binary sniffing, atomic writes with pre-edit backups under
+                            ~/.ais/web/file-backups/
   cli/                 the `ais` management CLI — no identity-resolution logic of its own
     dispatch.ts          top-level subcommand routing + uniform error->exit-code handling
     args.ts                minimal argv parser: positionals + --flag=value/--flag
@@ -1031,16 +1045,52 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   the CSRF story); secrets are WRITE-ONLY through the API (keys/cookies can
   be set, never read back); file editing is confined to whitelisted roots
   with dual lexical+realpath containment checks and pre-edit backups. The
-  server code follows the repo's test-injection convention (`configs =
-  Object.values(TOOL_CONFIGS)` parameters everywhere) so tests exercise the
-  real mutation paths against synthetic temp-dir registries and can never
-  touch a live home. Two gotchas are load-bearing: cli/args.ts's parseArgs
-  reads ONLY `--flag=value` (a space-separated value silently degrades into a
-  boolean flag plus stray positional — bit once already during the daemon
-  spawn work), and identities/match.ts's expandPath resolves bare relative
-  paths against process.cwd(), which is registry-storage semantics and
-  therefore deliberately NOT used for user-supplied paths inside the files
-  API (there, relative means "relative to the selected root").
+   server code follows the repo's test-injection convention (`configs =
+   Object.values(TOOL_CONFIGS)` parameters everywhere) so tests exercise the
+   real mutation paths against synthetic temp-dir registries and can never
+   touch a live home. Two gotchas are load-bearing: cli/args.ts's parseArgs
+   reads ONLY `--flag=value` (a space-separated value silently degrades into a
+   boolean flag plus stray positional — bit once already during the daemon
+   spawn work), and identities/match.ts's expandPath resolves bare relative
+   paths against process.cwd(), which is registry-storage semantics and
+   therefore deliberately NOT used for user-supplied paths inside the files
+   API (there, relative means "relative to the selected root").
+
+- **WebUI logins run the real CLIs' own flows with piped stdio (or a
+  script PTY), surfaced to a remote browser — never a second auth
+  implementation.** The console's Auth page can start a per-identity login
+  for claude/codex/grok/kimi (`POST /api/auth/login` -> LoginFlowManager,
+  src/server/login-flows.ts). The design constraints, all verified live on
+  this machine (2026-09-10): the user's browser is on a DIFFERENT device
+  (SSH-hosted daemon), so the daemon surfaces the flow's auth URL/device
+  code through the API instead of opening anything locally.
+  claude's `auth login` renders an Ink UI that prints NOTHING under plain
+  pipes, so the daemon allocates a pseudo-terminal with util-linux `script`
+  (`-qfec`); claude's redirect URI is a remote page that displays a code, so
+  completion works from any device and the pasted code (or full redirect
+  URL) is injected on the CLI's own stdin prompt ("Paste code here if
+  prompted") — injection verified live down to the real token exchange
+  (an invalid code visibly reached it). codex/grok/kimi ship device-code
+  flows that work under plain pipes and poll to completion themselves
+  (`--device-auth`, `--device-auth`, bare `login`), so no injection is
+  needed; device codes are surfaced to the UI (they are display values, not
+  secrets). pi has no login subcommand and opencode's clack prompts proved
+  non-injectable under a script PTY (verified live: keystrokes reached the
+  pty but the prompt never submitted), so both fall back to the legacy
+  terminal handoff, and zai/ali remain key/cookie writes by design.
+  Load-bearing details: the flows spawn `resolveRealBinary()`'s REAL binary,
+  never the shim (spawning the shim from a daemon with a nonstandard HOME
+  recursed shim-into-shim, observed live, because the managed-bin dir moves
+  with HOME); session-marker env vars are stripped for the same reason
+  exec.ts strips them; credential completion is detected by path+mtime+size
+  fingerprints (never contents) shared with the status probes via
+  credentialPathsForTool(); error text is redacted (token-shaped runs) and
+  output tails never contain the pasted code; flows time out after 15
+  minutes. GET /api/auth additionally reports per-identity expiry
+  timestamps read from the stored credentials (claude `.credentials.json`,
+  codex JWTs, kimi/pi/opencode expiry fields) plus ali's scheduler refresh
+  state, so the identity list can show logged in / expiring / expired /
+  not logged in / unknown per tool.
 
 ## Adding another wrapped tool later
 

@@ -91,6 +91,13 @@ export interface AuthEntryDto {
   state: AuthState;
   detail?: string;
   fixable: string[];
+  /** ISO timestamp when the stored credential expires, when its shape
+   * exposes one. Absent for static keys and unreadable shapes. */
+  expiresAt?: string;
+  /** ali only: last successful daemon-side console-cookie refresh. */
+  lastRefreshAt?: string;
+  /** ali only: last daemon-side refresh error, if any. */
+  refreshError?: string;
 }
 
 export interface AuthDto {
@@ -100,6 +107,59 @@ export interface AuthDto {
 export interface LoginResultDto {
   spawned: boolean;
   command: string;
+}
+
+export type LoginFlowStatus =
+  | "starting"
+  | "waiting"
+  | "callback"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+/** A daemon-managed login: the real CLI's own flow spawned with piped
+ * stdio (or a script-allocated PTY for TUI-based logins), its auth URL
+ * surfaced for a remote browser, and a paste path for redirect-code
+ * fallbacks. Device codes are NOT secrets: the CLI displays them and the
+ * user types them into the provider's web UI. */
+export interface LoginFlowDto {
+  flowId: string;
+  toolName: ToolConfig["toolName"];
+  identity: string;
+  status: LoginFlowStatus;
+  /** "pty" = script-allocated pseudo-terminal (TUI login), "pipes" = plain
+   * piped stdio. Flows only exist for tools with a managed spec. */
+  mode: "pty" | "pipes";
+  /** The authorize/device URL parsed from the CLI's output, when seen. */
+  authUrl?: string;
+  /** One-time device code parsed from the CLI's output, when seen. */
+  deviceCode?: string;
+  /** Human instruction for the paste path, when the flow accepts one. */
+  instruction?: string;
+  /** Whether POST /flows/:id/submit can inject a pasted code/URL. */
+  acceptsPaste: boolean;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+  endedAt?: string;
+}
+
+/** POST /api/auth/login result: a managed flow when the tool has one, or a
+ * best-effort handoff to a terminal emulator (headless daemons return
+ * spawned: false plus the command to run by hand). */
+export type LoginStartResultDto =
+  | { kind: "managed"; flow: LoginFlowDto }
+  | { kind: "terminal"; spawned: boolean; command: string };
+
+/** Structural surface of LoginFlowManager that app.ts/auth.ts rely on,
+ * declared here so auth.ts does not have to import the manager class
+ * (login-flows.ts already imports credentialPathsForTool from auth.ts). */
+export interface LoginFlowManagerLike {
+  start(toolName: ToolConfig["toolName"], identityName: string): Promise<LoginFlowDto>;
+  list(): LoginFlowDto[];
+  get(flowId: string): LoginFlowDto;
+  submit(flowId: string, code: string): LoginFlowDto;
+  cancel(flowId: string): LoginFlowDto;
 }
 
 export interface FileRootDto {
