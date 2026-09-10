@@ -88,6 +88,16 @@ export async function runCli(argv: string[]): Promise<void> {
           await runScanWorkerStdio();
           break;
         }
+      case "__spend_refresh":
+        // Same dynamic-import discipline as __scan_worker: the spend
+        // refresh drags the AWS SDK clients in, which must never load in
+        // the shim/wrapper path (the launch gate itself is SDK-free by
+        // design and spawns THIS detached instead of fetching inline).
+        {
+          const { runSpendRefreshCommand } = await import("../spend/refresh.ts");
+          await runSpendRefreshCommand();
+          break;
+        }
       case "web":
         await runWebCommand(rest, flags);
         break;
