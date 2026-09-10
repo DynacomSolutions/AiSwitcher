@@ -230,12 +230,18 @@ impl App {
         }
     }
 
+    /// Tab index `step` tabs away from `current`, wrapping in both
+    /// directions across the TAB_COUNT tabs.
+    fn cycle_tab(current: usize, step: i32) -> usize {
+        (current as i64 + step as i64).rem_euclid(TAB_COUNT as i64) as usize
+    }
+
     fn next_tab(&mut self) {
-        self.tab = (self.tab + 1) % TAB_COUNT;
+        self.tab = Self::cycle_tab(self.tab, 1);
     }
 
     fn prev_tab(&mut self) {
-        self.tab = (self.tab + TAB_COUNT - 1) % TAB_COUNT;
+        self.tab = Self::cycle_tab(self.tab, -1);
     }
 
     fn scroll_up(&mut self, amount: usize) {
@@ -305,6 +311,10 @@ fn handle_key(app: &mut App, key: KeyEvent, notifies: &[Arc<Notify>]) {
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => app.prev_tab(),
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Tab => app.next_tab(),
+        // Pages are read-only, so no in-page widget claims Left/Right; the
+        // top level owns them for tab cycling while Up/Down keep scrolling.
+        KeyCode::Right => app.next_tab(),
+        KeyCode::Left => app.prev_tab(),
         KeyCode::Char(digit @ '1'..='7') => {
             app.tab = digit.to_digit(10).unwrap_or(1) as usize - 1;
         }
@@ -372,4 +382,90 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
             .context("failed to draw frame")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_app() -> App {
+        let settings = Settings {
+            base_url: String::new(),
+            token: None,
+            token_path: PathBuf::from("/synthetic/SYNTHETIC_FIXTURE/server.json"),
+        };
+        App::new(&settings)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, key(code), &[]);
+    }
+
+    #[test]
+    fn cycle_tab_wraps_forward_and_backward() {
+        assert_eq!(App::cycle_tab(0, 1), 1);
+        assert_eq!(App::cycle_tab(TAB_COUNT - 1, 1), 0);
+        assert_eq!(App::cycle_tab(0, -1), TAB_COUNT - 1);
+        assert_eq!(App::cycle_tab(3, TAB_COUNT as i32), 3);
+        assert_eq!(App::cycle_tab(3, -(TAB_COUNT as i32)), 3);
+    }
+
+    #[test]
+    fn right_and_left_arrows_cycle_tabs_with_wraparound() {
+        let mut app = test_app();
+        assert_eq!(app.tab, 0);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.tab, TAB_COUNT - 1, "Left from the first tab wraps");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, 0, "Right from the last tab wraps home");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, 1);
+    }
+
+    #[test]
+    fn tab_and_backtab_still_cycle() {
+        let mut app = test_app();
+        app.tab = TAB_COUNT - 1;
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, 0);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, TAB_COUNT - 1);
+    }
+
+    #[test]
+    fn number_keys_still_jump_to_tabs() {
+        let mut app = test_app();
+        for (digit, expected) in [('1', 0), ('4', 3), ('7', 6)] {
+            press(&mut app, KeyCode::Char(digit));
+            assert_eq!(app.tab, expected, "digit {digit} jumps to tab");
+        }
+    }
+
+    #[test]
+    fn vertical_keys_keep_scrolling_without_changing_tab() {
+        let mut app = test_app();
+        app.tab = 4;
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.scrolls[4], 2);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.scrolls[4], 0);
+        assert_eq!(app.tab, 4, "Up/Down never switch tabs");
+        assert_eq!(app.scrolls[0], 0, "only the active tab scrolls");
+    }
+
+    #[test]
+    fn quit_keys_are_unchanged() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut app = test_app();
+            press(&mut app, code);
+            assert!(app.quitting, "{code:?} still quits");
+        }
+    }
 }

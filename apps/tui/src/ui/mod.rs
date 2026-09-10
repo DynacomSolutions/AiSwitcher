@@ -128,7 +128,7 @@ fn render_footer(f: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::from((*hint).to_string()).dark_gray());
         spans.push(Span::from(" · ").dark_gray());
     }
-    spans.push(Span::from("Tab switch").dark_gray());
+    spans.push(Span::from("←/→ tabs").dark_gray());
     spans.push(Span::from(" · ").dark_gray());
     spans.push(Span::from("q quit").dark_gray());
 
