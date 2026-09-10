@@ -4,6 +4,8 @@
   "version": "0.2.2",
   "scripts": {
     "test": "bun test",
+    "privacy:check": "bun run scripts/privacy-check.ts",
+    "privacy:install": "bun run scripts/install-privacy-hooks.ts",
     "typecheck": "tsc --noEmit",
     "build": "bun run scripts/build.ts",
     "backup": "bun run scripts/backup.ts",
@@ -17,6 +19,7 @@
   "dependencies": {
     "@clack/core": "^1.4.2",
     "@clack/prompts": "^1.0.0",
-    "hono": "^4.13.5"
+    "hono": "^4.13.5",
+    "smol-toml": "^1.8.0"
   }
 }

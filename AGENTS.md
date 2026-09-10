@@ -1,5 +1,17 @@
 # AiProfileSwitcher
 
+Privacy prevention: never add private real identifiers, identifying home paths,
+credentials, or live account/machine captures to fixtures. Use synthetic data
+only; each credential-shaped value and provider reset ID must contain its own
+`SYNTHETIC_FIXTURE` marker. A marker elsewhere on the line grants no exception;
+private-key headers are rejected. Private terms and AIS registries must remain
+outside the checkout, including symlink targets (`AIS_PRIVACY_TERMS_FILE`); local
+guards also read AIS identity names and aliases. Install composed local guards
+with `bun run privacy:install`. Check indexed additions with
+`bun run privacy:check --staged --local`; public CI uses
+`bun run privacy:check --ci` with event base/head SHAs, or explicitly
+`bun run privacy:check --range <base> <head>`. Each incoming commit is checked.
+
 Thin wrapper executables (`claude`, `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `opencode`) that
 shadow the real Claude Code / Codex / Grok / Kimi Code / Pi CLIs on `PATH` (`zai`
 and `ali` are the two exceptions, see below) and let you switch between
@@ -282,11 +294,10 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   exit-code/signal-code mirroring. This is the same model nvm/asdf/direnv-style
   shims use. The one accepted gap: an uncatchable SIGKILL sent to the wrapper
   itself orphans the child rather than killing it too.
-- **Shims install to `~/.local/bin`, not a dedicated shim directory.** It's
-  already ahead of both the real `claude` (Homebrew, `/opt/homebrew/bin`) and
-  real `codex` (nvm bin dir) on `PATH`, and is already the convention for
-  dropping compiled CLI tools on this machine — so installing there needs zero
-  shell-rc edits. `src/shared/resolve-binary.ts` first checks AIS's managed
+- **Shims install to `~/.local/bin`, not a dedicated shim directory.** This
+  conventional user binary directory must precede vendor install directories
+  on `PATH` for the wrappers to intercept commands.
+  `src/shared/resolve-binary.ts` first checks AIS's managed
   real-CLI directory (`~/.ais/npm/bin`, formerly `~/.local/share/ais/npm/bin`
   — see "~/.ais: one consolidated root" below), then the conventional
   Grok/Kimi installer directories where relevant, then strips the shim
@@ -298,20 +309,15 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   older `/usr/bin` binary.
   **This "zero shell-rc edits" assumption does NOT hold for grok**: the
   official Grok CLI installer appends its own `export PATH="$HOME/.grok/bin:
-  $PATH"` line to the shell rc (confirmed in this repo's dev machine's
-  `~/.zshrc`, added *after* the `~/.local/bin` export), which puts the real
-  `~/.grok/bin/grok` ahead of our shim on `PATH` — our `grok` shim gets
-  installed but never actually intercepts anything until the user manually
+  $PATH"` line to the shell rc. If added after the `~/.local/bin` export,
+  it puts `~/.grok/bin/grok` ahead of the shim, which cannot intercept
+  commands until the user
   reorders their shell rc (move the `~/.grok/bin` PATH line above the
-  `~/.local/bin` one, or re-export `~/.local/bin` after it). This is a
-  real, observed gap, not a hypothetical — always tell the user about it when
+  `~/.local/bin` one, or re-export `~/.local/bin` after it). Explain this when
   wiring up grok, and check `which grok` resolves to `~/.local/bin/grok`
-  after `bun run install:shims`. The same gap is CONFIRMED for kimi
-  (2026-07-17): Kimi Code's installer wrote
-  `export PATH="/Users/<username>/.kimi-code/bin:$PATH"` at `~/.zshrc`:166-167,
-  likewise *after* the `~/.local/bin` export — same reorder fix, and check
-  `which kimi` resolves to `~/.local/bin/kimi`. Unlike grok there was no
-  pre-existing symlink at `~/.local/bin/kimi` (checked). See the kimi case
+  after `bun run install:shims`. Kimi Code's installer can likewise put
+  `~/.kimi-code/bin` ahead of the shim. Apply the same reorder fix and check
+  `which kimi` resolves to `~/.local/bin/kimi`. See the kimi case
   study below.
 - **Independent compiled binaries per tool, not one dispatch-by-name
   binary.** Inside a `bun build --compile` executable, `process.argv[0]` is
@@ -331,17 +337,8 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   `run-wrapper.ts` before `resolveIdentity()`, only rejects a nested launch
   that EXPLICITLY names a *different* identity than
   `AI_PROFILE_SWITCHER_SESSION` — that's the actual cross-identity-pollution
-  case. The first cut of this (commit `75053ce`, 2026-07-14) got this
-  backwards: it treated a bare, unqualified nested launch (no `--id` at all)
-  as an error too, on the theory that every nested caller should be taught to
-  pass `--id` explicitly. In practice this broke every real nested caller at
-  once — a whole ecosystem of downstream launchers (a `codex-review` shim,
-  several dispatch/start/brainstorm/revise launcher scripts, and a
-  `claude agents --json` liveness poll) — none of which know or care
-  about identities, and none of which should have to. Corrected the same day
-  after the user pointed out the contradiction directly: enforcement that
-  requires patching every downstream caller across every repo isn't
-  "enforced," it's a landmine. The companion Bash-level hook,
+  case. Bare nested launches must inherit the session so downstream callers
+  need no identity-specific arguments. The companion Bash-level hook,
   `~/.ais/hooks/cross-agent-require-id.sh` /`.py` (wired into every identity's
   settings.json/hooks.json as "everywhere" enforcement — NOT part of this
   repo, lives in the shared `~/.ais/` tree), encodes the identical policy
@@ -399,16 +396,15 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   counters use `MAX`, never addition. Browser profiles, plugin/marketplace
   caches and clones, dependency trees, logs/debug output, worktrees, generated
   media, shell snapshots, and mutable/rebuildable SQLite databases are also
-  excluded: they are machine-specific/reproducible and made the first real
-  dry-run scan 13.6 GB/352,562 files, including macOS artefacts that must not
-  land on Linux.
+  excluded because they are reproducible or machine-specific and can be
+  incompatible across operating systems.
   Never restore a generic `*.tmp` rsync exclusion: Grok URL-encodes working
-  directories as session bucket names, and a real cwd ending in `.tmp` caused
-  24 complete session subtrees to be skipped. Rsync's own atomic staging is
+  directories as session bucket names, so a cwd ending in `.tmp` must remain
+  eligible for transfer. Rsync's own atomic staging is
   the protection for temporary transfer state.
-  Rsync must always use `--no-owner --no-group --no-perms`: the first live
-  Mac-to-root transfer preserved UID/GID/mode onto `/root` on remote2/remote3 and made
-  sshd `StrictModes` reject the unchanged authorised key. Do not weaken that
+  Rsync must always use `--no-owner --no-group --no-perms`: copying ownership
+  or modes across hosts can make sshd `StrictModes` reject authorised keys.
+  Do not weaken that
   cross-host metadata boundary. Exit 24 is a normal live-tree race; retry once,
   then accept it because deletes are intentionally not propagated. Remote AIS
   commands share rsync's ControlMaster so verification reuses its authenticated
@@ -438,8 +434,8 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   says must never happen, reintroduced one layer up from where the three
   commits above had already fixed it for `run-wrapper.ts`/`resume/launch.ts`.
   Whichever invocation won the sync lock race did the full two-way
-  reconciliation against every configured remote (`remote1`/`remote2`/`remote3` on this
-  machine) synchronously, so a slow or unreachable host meant that `ais`
+  reconciliation against every configured remote synchronously, so a slow
+  or unreachable host meant that `ais`
   invocation itself hung; a losing invocation happened to return fast (lock
   already held, `waitForLock` defaults to `false`), which is why the bug was
   intermittent rather than constant and easy to miss in a single manual test.
@@ -455,10 +451,9 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   announces it, rather than reconciliation silently continuing in the void
   with no way for the user to know it's still going.
 - **Codex's 15-minute rollout-backfill lease must self-heal in the wrapper,
-  but only when its SQLite owner is provably gone.** Confirmed on `remote1`
-  with Codex 0.144.6 (2026-07-22): a new 255 MB `state_5.sqlite` indexed
-  14,436 of 37,514 rollout files, its worker exited, and the persisted
-  `backfill_state` remained `running`. Codex replacement processes wait only
+  but only when its SQLite owner is provably gone.** If a backfill worker
+  exits before completing its index, persisted `backfill_state` can remain
+  `running`. Codex replacement processes wait only
   30 seconds but refuse to reclaim that lease for 900 seconds, producing a
   repeated startup failure even though `PRAGMA quick_check` is `ok` and no
   process has the identity database open. `shared/codex-backfill.ts` runs
@@ -489,23 +484,9 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   passthrough, so shipping it there would turn ordinary `open <file>` calls
   into hard crashes instead of transparent passthrough.
 - **The redirect target is the identity's own isolated Chrome (Claude MCP)
-  instance, not a real daily-driver Chrome profile — this was a real, shipped
-  design mistake, caught and fixed 2026-07-14, not a rename for its own
-  sake.** The original cut launched the REAL `Google Chrome.app`
-  (`CHROME_APP_NAME = "Google Chrome"`) with `--profile-directory=<value>`,
-  and `identities.json` stored a real Chrome profile-directory string per
-  identity (`chromeProfile: "Profile 3"`). This was live and even had
-  plausible-looking values already set in Codex's and Grok's `identities.json`
-  (`chromeProfile: "identity-a"`) — which turned out to be pointing at a
-  folder that happened to exist on disk but was registered in Chrome's own
-  `Local State` as `"Your Chrome"`, an empty, never-logged-into placeholder,
-  not any real account. Confirmed by direct inspection (`Local State`'s
-  `profile.info_cache`) that the actually-correct real profiles were
-  elsewhere entirely (e.g. `Profile 2` = "the intended work profile", the real
-  logged-in account) — i.e. even a "fix" that pointed at the real Chrome
-  correctly would still have been touching the user's actual daily-driver
-  browsing profiles for an automated CLI login flow, not something isolated.
-  Also confirmed by bundle-ID inspection (`CFBundleIdentifier`:
+  instance.** An existing Chrome profile directory does not establish account
+  ownership, and automated login flows must stay separate from personal
+  browsing profiles. The distinct bundle IDs (`CFBundleIdentifier`:
   `com.google.Chrome` for real Chrome vs `com.google.Chrome.claude-mcp` for
   `Chrome (Claude MCP).app`) that `open -a "Google Chrome"` can **never**
   resolve to the MCP-dedicated copy — the two are registered as completely
@@ -554,27 +535,17 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   (`ais identities list`/`show` already loop over every tool's registry), so
   `ais usage` (`src/cli/usage/`) is a small extension of that, not a new
   category of tool.
-  - **Per-tool scoping trick, confirmed empirically (2026-07-13) against real
-    identity data, not assumed from tokscale's README:** codex/grok/kimi need
+  - **Per-tool scoping:** codex/grok/kimi need
     nothing extra — tokscale itself reads `CODEX_HOME`/`GROK_HOME`/
     `KIMI_CODE_HOME`, the exact env vars this project already redirects per
-    identity (kimi's entry in that list is confirmed from tokscale's README
-    `--client` list and its sessions scanner, 2026-07-17 — not yet
-    re-verified against real per-identity kimi data the way claude/codex
-    were). claude is the odd
+    identity. claude is the odd
     one out: tokscale hardcodes `<home>/.claude/projects` with no
     `CLAUDE_CONFIG_DIR`-equivalent override anywhere in its source, so
     `tokscaleInvocationFor()` (`src/cli/usage/tokscale.ts`) instead sets
     `TOKSCALE_EXTRA_DIRS=claude:<identity's configDir>/projects` — an
-    additive extra scan root tokscale does support. Verified this correctly
-    isolates one identity's data with **no symlinks**: ran it against two
-    different real identities back to back and got genuinely different
-    totals each time (not stale/cached), and confirmed the top-level
-    `~/.claude` container this project uses has no `projects/` of its own, so
-    tokscale's still-active default scan root contributes nothing to
-    double-count. The originally-considered fallback (tokscale's `--home
-    <fake-home>` flag + a symlink farm) turned out to be unnecessary and was
-    dropped.
+    additive extra scan root tokscale supports without symlinks. Its default
+    scan root remains active, so the top-level `~/.claude/projects` must be
+    empty to avoid including unrelated sessions.
   - **bunx concurrency race, also found empirically, not in any doc — and
     the fix went through two designs; the current one (2026-08-07) is
     "bypass bunx for the actual calls," not "serialize the calls":** when
@@ -602,9 +573,8 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
     bunx promise-queue since it IS a bunx call), every actual scan spawn
     goes DIRECTLY at that cached binary (`runTokscaleProcess`) — no bunx,
     no `.bin` link step, no race, and therefore full parallelism across
-    all targets even without tokscale on `PATH`. Measured on this machine:
-    74s (serial bunx) -> 15.7s first run (includes the warm-up) -> ~6.5s
-    warm, all 12 targets. Candidates are probed for actual executability
+    all targets even without tokscale on `PATH`.
+    Candidates are probed for actual executability
     (`spawnSync --version`) not just file existence, so a wrong-libc or
     corrupt cache entry falls through to the next variant or ultimately to
     the old serialized-bunx fallback; the resolution result is memoized
@@ -687,8 +657,7 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   - **`--client` must come AFTER the tokscale subcommand, not before —
     confirmed by direct testing, undocumented in tokscale itself.**
     `tokscale --client claude models` silently ignores the filter (every
-    other client's data leaks into the report, reproduced directly: a
-    claude-only identity's `models` passthrough showed Gemini entries too);
+    other clients' data can leak into the report);
     `tokscale models --client claude` scopes correctly. Root-level
     invocations with no subcommand accept either order fine. So
     `runPassthrough()` always appends `clientArgs` (`--client <tool>`) AFTER
@@ -698,11 +667,9 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
 
 - **`ais upgrade` owns a deterministic real-CLI installation for every
   installed AIS shim.** The old design blindly invoked each real binary's
-  supposed `update` subcommand and skipped missing tools. `remote1` disproved both
-  assumptions on 2026-07-21: Codex 0.118.0 had no `update` command, treated
-  the positional word as a chat prompt, and returned exit code 0 after Ctrl+C;
-  Claude's updater reported success while leaving the old `/usr/bin/claude`
-  selected. That produced a false-success loop rather than an upgrade.
+  supposed `update` subcommand and skipped missing tools. An unsupported
+  subcommand can be interpreted as a chat prompt, and a successful updater
+  can leave an older binary selected by `PATH`. Neither proves an upgrade.
   Presence of `~/.local/bin/{claude,codex,grok,kimi,zai}` now expresses the
   intended tool set. `upgrade.ts` installs/upgrades Claude Code
   (`@anthropic-ai/claude-code`), Codex (`@openai/codex`), Kimi Code
@@ -766,9 +733,7 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
     `scripts/migrate.ts`'s own precedent (manual, interactive,
     `pgrep`-guarded) is deliberately heavier because it restructures LIVE
     identity data with real running-process risk; this consolidation moves
-    comparatively low-risk cache/config/npm-prefix directories, and — unlike
-    `~/.claude`/`~/.codex`, which this developer's own machine and every
-    `remote1`/`remote2`/`remote3` remote already have real data in — needs to migrate
+    comparatively low-risk cache/config/npm-prefix directories and needs to migrate
     transparently on EVERY machine this project runs on, local or remote,
     without requiring separate manual intervention on each one. `src/shared/
     migrate-ais-home.ts`'s `migrateLegacyAisHome()` is called at the very
@@ -863,7 +828,7 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
       close would require the OLD binary to already know about a
       convention it necessarily predates, which is not something code
       shipped today can retroactively guarantee. Before deploying this to
-      any machine (this one, or `remote1`/`remote2`/`remote3` later), check for an
+      any machine, check for an
       in-flight `ais upgrade`/`npm install --prefix .../ais/npm` first
       (e.g. `pgrep -f 'npm install.*ais'`) rather than relying on the code
       alone.
@@ -888,8 +853,7 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   is what actually keeps the size down.** `scripts/backup.ts`'s old design
   wrote a fresh, independent `~/.ai-switcher-backups/<timestamp>/*.tar.gz`
   tree on every `install`/`update`/`migrate` run, and nothing ever pruned
-  old ones — confirmed on this developer's own machine, which had
-  accumulated eight separate timestamped snapshot trees before this change.
+  old ones, allowing redundant full snapshots to accumulate.
   The new design (`runBackup()`) mirrors each backed-up directory into a
   single persistent working tree at `~/.ais/backups` via `rsync -a --delete
   --delete-excluded` (replacing tar's "always a fresh full copy" with "the
@@ -2323,14 +2287,11 @@ provider's models.
   do for ali either (same as zai's own final state, see "zai case study,
   take 3" above), never re-verified because there's nothing here to verify.
 
-### Provider-first views for limits and usage (2026-09-03)
+### Provider-first views for limits and usage
 
-Prompted directly: the per-tool sections in `ais limits` ("pi (4
-identities)… no limits fetcher implemented") and the zero/error placeholder
-rows in `ais usage` were exactly the tool-shaped output the user had already
-rejected — both views must be per PROVIDER + identity, with the wrapper/tool
-kept only as collection provenance (fine to keep in internal records and
-logs for future reporting, never as a reporting dimension).
+Both `ais limits` and `ais usage` group results by PROVIDER + identity.
+The wrapper/tool is collection provenance, retained in internal records,
+logs and source diagnostics, never as a reporting dimension.
 
 What the rule means in practice, now enforced in both pipelines:
 
@@ -2366,19 +2327,15 @@ What the rule means in practice, now enforced in both pipelines:
   endpoint as opencode-limits). Fetchable from opencode today:
   `zai_coding_plan` and `opencode-go`.
   **OpenCode Go's quota endpoint** (`GET
-  https://opencode.ai/zen/go/v1/usage`, Bearer the Go API key) was found
-  2026-09-03 by probing the Go gateway directly — an earlier probe sweep
-  against `/zen/v1/*` (the WRONG base path; Go keys live under
-  `/zen/go/v1`) all 404'd, which produced a bogus "no public limits API"
-  claim that user feedback killed the same day: the user hit their weekly
-  limit with no way to see it. The endpoint returns the plan's three
+  https://opencode.ai/zen/go/v1/usage`, Bearer the Go API key) uses the
+  `/zen/go/v1` base path; `/zen/v1` does not serve Go quota requests.
+  The endpoint returns the plan's three
   DOLLAR-denominated windows ($12/5h rolling, $30 weekly, $60 monthly) as
   `usage.{rolling,weekly,monthly}.{status,percent,resetsAt}` — percent is
   share-of-window-budget, `status: "rate-limited"` marks an exhausted
   window. Its real token usage also appears in `ais usage` (see
   usage/opencode-usage.ts).
-  **OpenCode identity usage also reads its db directly** (added 2026-09-03
-  after the user saw ONE dynacom plan rendered as FOUR rows): tokscale's
+  **OpenCode identity usage also reads its db directly**: tokscale's
   opencode client collapses multi-plan models into comma-joined
   pseudo-providers ("opencode_go, zai_coding_plan") and underscore
   spellings, fragmenting the report. Identity dbs are read with the same
@@ -2386,12 +2343,10 @@ What the rule means in practice, now enforced in both pipelines:
   canonicalUsageProvider splits comma-joined provider strings so any
   residual joined form still collapses to one stable key. The db scan
   yields every ~500 rows — bun:sqlite is synchronous, and an unyielding
-  scan of a multi-GB db froze the live render's spinners.
+  scan of a large db can block the live render.
   **Default-profile usage is attributed by CREDENTIAL MATCH, not scope**
-  (fixed 2026-09-03 after the user corrected it hard: their unscoped
-  `~/.local/share/opencode` profile held dynacom's OpenCode Go key, and
-  logging that usage under a synthetic "default" identity was wrong —
-  "ALL USAGE WE HAVE IS FOR DYNACOM"). The profile's auth.json keys are
+  because an unscoped profile can use a registered identity's account.
+  The profile's auth.json keys are
   matched against every opencode/pi identity's keys; usage logs under the
   identity holding the same credential. The synthetic "default" identity
   is the fallback ONLY for providers no identity can claim.
@@ -2400,16 +2355,15 @@ What the rule means in practice, now enforced in both pipelines:
   credentials exist in two stores: the kimi identity's
   `credentials/kimi-code.json` (the kimi CLI's own file) and the same-named
   pi identity's imported `auth.json` "kimi-coding" entry. Left independent,
-  whichever store refreshed first invalidated the other — every few days
-  an access-token expiry stranded a store with HTTP 400 until manual
-  re-auth (observed live 2026-09-03, both kimi identities). The stores are
+  whichever store refreshes first can invalidate the other's refresh token.
+  The stores are
   now views of ONE logical token: reads take the FRESHEST copy
   (freshest-wins self-heals), and every refresh is written through to ALL
   of the account's stores in each store's own shape (pi's expires is
   milliseconds, kimi's seconds). pi's entry is thus a live projection, not
   a fork. The same law will need the same treatment for the other OAuth
-  providers pi holds copies of (anthropic, openai-codex, xai) — kimi is
-  where rotation made the race an everyday failure, so it went first.
+  providers pi holds copies of (anthropic, openai-codex, xai) when they
+  rotate shared credentials.
 - **No tool-shaped placeholder rows exist for the multi-provider clients.**
   Neither a pending seed (the provider isn't known until the adapter reads
   the identity's own auth store — a placeholder would render a fake
@@ -2418,17 +2372,14 @@ What the rule means in practice, now enforced in both pipelines:
   results land; an explicit `--tool=` still gets one honest row. 1:1 tools
   keep their pending spinners unchanged.
 - **No per-target timeout in the shared usage engine.** The console work
-  added a 25s `runOneBounded` cap; on this machine ~25 targets run
-  concurrently and contend for disk, so real scans routinely take 25-55s
-  and the cap turned ENTIRE reports into error rows (labeled "timed out
-  after 25ms" — the unit math was wrong too). Reverted 2026-09-03: the CLI
-  must never truncate good data; genuine hangs stay bounded where they
+  must allow history scans to complete despite contention between concurrent
+  targets. The CLI must never truncate good data; hangs stay bounded where they
   actually occur (tokscale's own spawn timeout; limits has never had a
   cap). Multi-provider source failures (a pi/opencode reader crashing
   before attributing any provider) are flagged `sourceOnlyError`: they
   render NO provider table row — never a fabricated "Unattributed" row —
   and surface only in the trailing Errors section under their SOURCE label
-  (`pi/dynacom: ...`), the same "per-tool in diagnostics" allowance as the
+  (the tool and identity), the same "per-tool in diagnostics" allowance as the
   internal logs.
 - **A source with nothing to report renders no row — unless the user asked
   for that source specifically.** Both pipelines thread an `explicitTool`
@@ -2440,11 +2391,9 @@ What the rule means in practice, now enforced in both pipelines:
   in unscoped reports — a blank table over a broken environment would hide
   the problem.
 
-"Prove it" evidence for the fetchable paths: live `ais limits` after this
-change shows pi's dynacom Z.ai key answering for the same account whose
-native zai row had been timing out, and `ais usage` no longer lists
-Unattributed/OpenCode placeholder rows for the three pi identities with no
-local sessions and the two opencode identities with no data.
+Verification should cover aggregation when native and multi-provider clients
+share a credential, fallback to an available result when one source fails,
+and omission of empty sources unless explicitly requested.
 
 ## Commands
 
@@ -2698,5 +2647,3 @@ identity's Chrome (Claude MCP) window instead of your regular daily-driver
 Chrome. If a real Chrome window opens instead (or nothing redirects at all),
 the bare-command-name assumption is wrong — drop this mechanism and record
 that finding here instead of iterating on it further.
-
-@/home/thomas/.config/devdeploy/CLAUDE.snippet.md

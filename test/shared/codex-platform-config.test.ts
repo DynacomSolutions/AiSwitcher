@@ -38,7 +38,7 @@ describe("codexPlatformArgs", () => {
       platform: "linux",
       readConfig: () => `
 [mcp_servers.node_repl]
-command = "/home/thomas/.local/bin/node_repl"
+command = "/home/example/.local/bin/node_repl"
 `,
       commandExists: () => false,
     })).toBe(args);
