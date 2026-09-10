@@ -228,6 +228,11 @@ function FixActions({ entry }: { entry: AuthEntry }) {
   );
 }
 
+/** Mirrors ESCALATION_THRESHOLD in src/server/auth-refresh.ts: past this many
+ * consecutive failures the renewal row shows the escalated destructive badge
+ * instead of a bare count. */
+const AUTH_REFRESH_ESCALATION_THRESHOLD = 3;
+
 function RenewalRow({ status }: { status: AuthRefreshStatus }) {
   const qc = useQueryClient();
   const mutation = useMutation({
@@ -254,6 +259,15 @@ function RenewalRow({ status }: { status: AuthRefreshStatus }) {
           relTime(status.lastSuccessAt)
         ) : (
           <Badge variant="warning">Never</Badge>
+        )}
+      </TableCell>
+      <TableCell className="text-xs">
+        {status.consecutiveFailures >= AUTH_REFRESH_ESCALATION_THRESHOLD ? (
+          <Badge variant="destructive">{status.consecutiveFailures} consecutive</Badge>
+        ) : status.consecutiveFailures > 0 ? (
+          <Badge variant="warning">{status.consecutiveFailures}</Badge>
+        ) : (
+          <span className="text-xs text-muted-foreground">-</span>
         )}
       </TableCell>
       <TableCell className="max-w-72">
@@ -310,6 +324,7 @@ function RenewalCard() {
                     <TableHead>Identity</TableHead>
                     <TableHead>Last attempt</TableHead>
                     <TableHead>Last success</TableHead>
+                    <TableHead>Fails</TableHead>
                     <TableHead>Error</TableHead>
                     <TableHead className="text-right"> </TableHead>
                   </TableRow>

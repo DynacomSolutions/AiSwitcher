@@ -284,6 +284,7 @@ export interface AuthRefreshStatus {
   lastAttemptAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
+  consecutiveFailures: number;
   running: boolean;
 }
 

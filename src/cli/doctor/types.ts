@@ -6,8 +6,11 @@ import type { Identity, ToolConfig } from "../../identities/types.ts";
  * hang). "hung" is the one status this command exists to catch: the process
  * never answered at all within budget. "unavailable" means the probe was
  * never even attempted (binary not resolvable on PATH, or no doctor probe
- * exists yet for this tool — see collect.ts's PROBES). */
-export type DoctorStatus = "responsive" | "hung" | "unavailable";
+ * exists yet for this tool; see collect.ts PROBES). "degraded" means the
+ * tool itself is fine but its credential pipeline is failing on record
+ * (today: ali's console-cookie auto-refresh, see probeAliDoctor): usable
+ * right up until the current cookie expires, then not. */
+export type DoctorStatus = "responsive" | "hung" | "unavailable" | "degraded";
 
 export type DoctorToolName = ToolConfig["toolName"] | "aws-spend-guard";
 

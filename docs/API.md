@@ -265,6 +265,31 @@ Login spawn strategy: detect a terminal emulator (`x-terminal-emulator`,
 `gnome-terminal`, `konsole`, `alacritty`, `kitty`, `wezterm`), run the real
 CLI's interactive flow with the identity env applied. Never blocks the API.
 
+Credential renewal (`AuthRefreshScheduler`, daemon-side; ali console cookies
+today):
+
+`GET /api/auth/refresh` returns one status row per refreshable identity:
+
+```jsonc
+{
+  "results": [
+    {
+      "tool": "ali",
+      "identity": "personal",
+      "lastAttemptAt": "2026-09-10T01:38:14.927Z",
+      "lastSuccessAt": "2026-09-05T10:30:56.178Z",
+      "lastError": "the auth browser is not signed in to the Alibaba console",
+      "consecutiveFailures": 41,   // reset to 0 by any success; the UI escalates at >= 3
+      "running": false
+    }
+  ]
+}
+```
+
+| Route | Body | Effect |
+|---|---|---|
+| `POST /api/auth/refresh` | `{ tool, identity }` | runs that tool's refresher now and returns the updated row; failures never throw, they land in `lastError` |
+
 ### Files
 
 Whitelisted editable roots:

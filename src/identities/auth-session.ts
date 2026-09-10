@@ -109,11 +109,6 @@ async function webdriverRequest(
   return { response, payload };
 }
 
-async function currentUrl(state: AuthSessionState): Promise<string | undefined> {
-  const result = await webdriverRequest(state.webdriverPort, `/session/${encodeURIComponent(state.sessionId)}/url`);
-  return typeof result.payload?.value === "string" ? result.payload.value : undefined;
-}
-
 async function navigateDashboard(state: AuthSessionState): Promise<void> {
   // Execute-script navigation returns immediately even when Alibaba keeps a
   // long-lived login document open; WebDriver's normal `/url` command can
@@ -199,24 +194,61 @@ async function serverHostname(): Promise<string> {
   }
 }
 
-export async function refreshAliAuthSession(identity: Identity): Promise<string | undefined> {
+/** A refresh failure worth escalating, with the exact remediation. Thrown
+ * (never returned as `undefined`) so every caller (the daemon scheduler, the
+ * systemd timer's `ais auth refresh`, POST /api/auth/refresh) records and
+ * shows the same precise message instead of a vague "not authenticated". */
+export class AliAuthRefreshError extends Error {
+  constructor(
+    message: string,
+    /** One concrete command/URL the user can act on; surfaced alongside the
+     * message by the CLI, the scheduler's lastError, and `ais doctor`. */
+    readonly hint?: string,
+  ) {
+    super(message);
+    this.name = "AliAuthRefreshError";
+  }
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Alibaba marks an authenticated console session with the ticket cookies
+ * issued at login. Verified live 2026-09-10: a logged-OUT console still
+ * carries `login_aliyunid_csrf` plus ~39 analytics cookies, so csrf is NOT a
+ * login marker; only the ticket/id pair proves authentication. Accepts CDP
+ * cookie objects ({name}) or harvested "name=value" header entries. Exported
+ * for tests. */
+export function hasAliLoginCookie(cookies: Iterable<{ name?: string } | string>): boolean {
+  for (const cookie of cookies) {
+    const name = typeof cookie === "string" ? cookie.slice(0, cookie.indexOf("=")) : cookie.name;
+    if (name === "login_aliyunid_ticket" || name === "login_aliyunid") return true;
+  }
+  return false;
+}
+
+export async function refreshAliAuthSession(identity: Identity): Promise<string> {
   let state: AuthSessionState | undefined;
   try {
-    state = await ensureSession(identity.name, false);
-  } catch {
-    return undefined;
+    // openDashboard=true is the self-heal: a pod restart (observed live
+    // 2026-09-03/07) or a closed tab leaves the auth browser on about:blank,
+    // and the old starting-URL precondition then failed EVERY future refresh
+    // until a human happened to look. Navigating to the console first
+    // recovers the harvest with no human action.
+    state = await ensureSession(identity.name, true);
+  } catch (err) {
+    throw new AliAuthRefreshError(
+      `could not reach the auth browser for "${identity.name}": ${errorText(err)}`,
+      "check the chrome-auth deployment and its kubectl port-forward (ais auth ports --tool=ali --identity=" + identity.name + ")",
+    );
   }
-  if (!state) return undefined;
-  let url: string | undefined;
-  try {
-    url = await currentUrl(state);
-  } catch {
-    return undefined;
+  if (!state) {
+    throw new AliAuthRefreshError(
+      `auth browser for "${identity.name}" is unreachable (chrome-auth deployment or its port-forward is down)`,
+      "start it with 'ais auth login " + identity.name + " --tool=ali' (prints the noVNC URL), or inspect 'kubectl -n chrome-mcp get pods'",
+    );
   }
-  // Alibaba may redirect a completed login through the public account site
-  // before the console tab is restored. Any Alibaba-owned page is a valid
-  // authenticated starting point; navigation below returns to Model Studio.
-  if (!url || !/(^|\.)alibabacloud\.com(\/|$)|(^|\.)aliyun\.com(\/|$)/i.test(url)) return undefined;
   const cookieByName = new Map<string, string>();
   // WebDriver exposes cookies applicable to the current document domain. The
   // console gateway also relies on Alibaba's account-domain ticket, so collect
@@ -230,17 +262,32 @@ export async function refreshAliAuthSession(identity: Identity): Promise<string 
           cookieByName.set(`${cookie.domain ?? ""}:${cookie.name}`, `${cookie.name}=${cookie.value}`);
         }
       }
-    } catch {
-      return undefined;
+    } catch (err) {
+      throw new AliAuthRefreshError(
+        `cookie harvest from the auth browser failed: ${errorText(err)}`,
+        "retry once; if it persists, restart the chrome-auth browser and re-login over noVNC",
+      );
     }
+  }
+  // Verify AUTHENTICATION before writing anything. Without this check the
+  // harvest happily collected 39 logged-out analytics cookies and stamped
+  // them over a still-valid cookie file, reporting success (observed live
+  // 2026-09-10). The ticket cookie is the only reliable login marker.
+  if (!hasAliLoginCookie(cookieByName.values())) {
+    throw new AliAuthRefreshError(
+      `the auth browser for "${identity.name}" is not signed in to the Alibaba console (no login-ticket cookie after opening the console page)`,
+      `re-login once: run 'ais auth login ${identity.name} --tool=ali' and complete Alibaba sign-in/MFA over the printed noVNC URL; the scheduled refresh keeps that session alive afterwards`,
+    );
   }
   try {
     await navigateDashboard(state);
-  } catch {
-    return undefined;
+  } catch (err) {
+    throw new AliAuthRefreshError(`post-harvest navigation back to the console failed: ${errorText(err)}`);
   }
   const entries = [...cookieByName.values()];
-  if (entries.length === 0) return undefined;
+  if (entries.length === 0) {
+    throw new AliAuthRefreshError("the auth browser carried no alibabacloud.com/aliyun.com cookies to harvest");
+  }
 
   const target = join(expandPath(identity.configDir), "console-cookie.txt");
   const temporary = `${target}.${crypto.randomUUID()}.tmp`;

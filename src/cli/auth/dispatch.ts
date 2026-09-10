@@ -3,6 +3,7 @@ import { CliUsageError } from "../errors.ts";
 import { ALI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import {
+  AliAuthRefreshError,
   authBrowserPorts,
   installAliAuthRefreshTimer,
   refreshAliAuthSession,
@@ -57,9 +58,20 @@ export async function runAuthCommand(positionals: string[], flags: ParsedArgs["f
     return;
   }
   if (subcommand === "refresh") {
-    const path = await refreshAliAuthSession(identity);
-    if (!boolFlag(flags, "quiet")) {
-      console.log(path ? `Alibaba console cookies refreshed for ${identity.name}.` : `Alibaba session is not authenticated for ${identity.name}.`);
+    // Failures are LOUD and non-zero-exit: the systemd renewal timer runs
+    // this with --quiet, so stderr + the exit code are the only signals
+    // journalctl/systemctl will ever show. Silence here is how a dead
+    // harvester went unnoticed for five days (2026-09-05..10).
+    try {
+      const path = await refreshAliAuthSession(identity);
+      if (!boolFlag(flags, "quiet")) {
+        console.log(`Alibaba console cookies refreshed for ${identity.name} (${path}).`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const hint = err instanceof AliAuthRefreshError && err.hint ? `\nFix: ${err.hint}` : "";
+      console.error(`Alibaba cookie refresh failed for ${identity.name}: ${message}${hint}`);
+      process.exitCode = 1;
     }
     return;
   }
