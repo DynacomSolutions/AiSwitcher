@@ -3,6 +3,7 @@ import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
+import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
@@ -46,6 +47,10 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   const scheduler = new AuthRefreshScheduler(parseRefreshIntervalMs(process.env.AIS_AUTH_REFRESH_INTERVAL_MS));
   scheduler.hydrate();
   scheduler.start();
+  // Daemon-managed per-identity login flows (real CLI logins with piped
+  // stdio / a script PTY). AIS_AUTH_REFRESH_INTERVAL_MS=0 does not affect
+  // these: a login flow is always user-initiated, never scheduled.
+  const loginFlows = new LoginFlowManager();
 
   // Daemon-side spend guard: periodic account-state cycle, cache writes for
   // the launch gate, and breach-transition session kills. The interval (and
@@ -68,6 +73,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     allowedHosts: parseAllowedHosts(process.env.AIS_WEB_ALLOWED_HOSTS),
     authRefresh: scheduler,
     ...(spendGuard ? { spendGuard } : {}),
+    loginFlows,
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
   const app = createApp(deps);
@@ -102,6 +108,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     const shutdown = () => {
       scheduler.stop();
       spendGuard?.stop();
+      loginFlows.stop();
       void clearServerState();
       server.stop(true);
       setTimeout(() => process.exit(0), 50);
@@ -110,7 +117,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     process.on("SIGINT", shutdown);
   }
 
-  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); loginFlows.stop(); server.stop(true); } };
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this

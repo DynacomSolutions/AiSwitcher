@@ -12,6 +12,7 @@ import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { type AuthRefreshScheduler } from "./auth-refresh.ts";
 import { type SpendGuardScheduler } from "./spend-guard.ts";
 import { HttpError } from "./types.ts";
+import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated } from "./workers.ts";
 import {
@@ -34,6 +35,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   /** Daemon-side spend guard (breach killer + cache writer); absent in
    * bare-app tests, where /api/spend-guard answers 503. */
   spendGuard?: SpendGuardScheduler;
+  /** Daemon-managed per-identity login flows; absent in bare-app tests. */
+  loginFlows?: LoginFlowManagerLike;
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {
@@ -148,7 +151,9 @@ export function createApp(deps: ConsoleAppDeps): Hono {
 
   /* ---------------------------------- auth --------------------------------- */
 
-  app.get("/api/auth", async (c) => c.json(await authApi.authStatus()));
+  app.get("/api/auth", async (c) =>
+    c.json(await authApi.authStatus(Object.values(TOOL_CONFIGS), deps.authRefresh?.status() ?? [])),
+  );
 
   app.post("/api/auth/zai-key", async (c) => {
     const body = await c.req.json();
@@ -166,10 +171,35 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     return c.json(await authApi.refreshKimiToken(requireString(body.identity, "identity")));
   });
 
+  // Login flows: starts the real CLI's own login with piped stdio (or a
+  // script-allocated PTY), surfaces the auth URL, and tracks status. A tool
+  // without a managed flow (or a host with no PTY support) degrades to the
+  // terminal-handoff spawn. See docs/API.md.
   app.post("/api/auth/login", async (c) => {
-    const body = await c.req.json();    const toolName = requireString(body.tool, "tool");
+    const body = await c.req.json();
+    const toolName = requireString(body.tool, "tool");
     if (!(toolName in TOOL_CONFIGS)) throw new HttpError(404, `unknown tool "${toolName}"`);
-    return c.json(await authApi.spawnLogin(toolName as ToolConfig["toolName"], requireString(body.identity, "identity")));
+    return c.json(
+      await authApi.startLogin(toolName as ToolConfig["toolName"], requireString(body.identity, "identity"), deps.loginFlows),
+    );
+  });
+
+  app.get("/api/auth/flows", (c) => c.json({ flows: deps.loginFlows?.list() ?? [] }));
+
+  app.get("/api/auth/flows/:id", (c) => {
+    if (!deps.loginFlows) throw new HttpError(503, "login flows are not running");
+    return c.json(deps.loginFlows.get(c.req.param("id")));
+  });
+
+  app.post("/api/auth/flows/:id/submit", async (c) => {
+    if (!deps.loginFlows) throw new HttpError(503, "login flows are not running");
+    const body = await c.req.json();
+    return c.json(deps.loginFlows.submit(c.req.param("id"), requireString(body.code, "code")));
+  });
+
+  app.post("/api/auth/flows/:id/cancel", (c) => {
+    if (!deps.loginFlows) throw new HttpError(503, "login flows are not running");
+    return c.json(deps.loginFlows.cancel(c.req.param("id")));
   });
 
   /* ----------------------- credential refresh scheduler -------------------- */

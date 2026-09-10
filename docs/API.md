@@ -235,7 +235,13 @@ Same shape as `ais resume --json`: `ToolResumeResult[]` flattened into
 
 `GET /api/auth`
 
-Per identity/tool auth health:
+Per identity/tool auth health. States: `ok` (logged in), `expiring`,
+`expired` (expiry in the past), `missing` (no credential file at all), and
+`unknown` (credential present but freshness not verifiable). `expiresAt` is
+an ISO timestamp read from the stored credential where its shape exposes one
+(claude `.credentials.json`, codex `auth.json` JWTs, kimi OAuth expiry,
+pi/opencode `auth.json`); ali's entry carries `lastRefreshAt`/`refreshError`
+from the daemon-side refresh scheduler instead.
 
 ```jsonc
 {
@@ -245,8 +251,11 @@ Per identity/tool auth health:
       "identity": "work",
       "kind": "oauth",             // oauth | apikey | cookie | none
       "state": "ok",               // ok | expiring | expired | missing | unknown
-      "detail": "token expires in 3h",
-      "fixable": ["refresh", "login"]
+      "detail": "token expires in 3h (refresh happens on next live fetch)",
+      "fixable": ["refresh", "login"],
+      "expiresAt": "2026-09-10T12:00:00.000Z",
+      "lastRefreshAt": "2026-09-10T02:00:00.000Z",  // ali only
+      "refreshError": null                           // ali only
     }
   ]
 }
@@ -259,11 +268,61 @@ Actions (all POST, JSON bodies):
 | `POST /api/auth/zai-key` | `{ tool: "zai"\|"ali", identity, apiKey }` | writes crush.json provider entry |
 | `POST /api/auth/ali-cookie` | `{ identity, cookie }` | writes console-cookie.txt |
 | `POST /api/auth/kimi-refresh` | `{ identity }` | refreshes OAuth token if expired (live fetch path) |
-| `POST /api/auth/login` | `{ tool, identity }` | spawns an interactive login in a new terminal window (best-effort); returns `{ spawned: bool, command }` |
+| `POST /api/auth/login` | `{ tool, identity }` | starts a login; see below |
+| `GET /api/auth/flows` | – | all active/recent login flows (newest active first) |
+| `GET /api/auth/flows/:id` | – | one flow's current status |
+| `POST /api/auth/flows/:id/submit` | `{ code }` | inject a pasted code/URL (claude's paste path) |
+| `POST /api/auth/flows/:id/cancel` | `{}` | kill the login process, mark `cancelled` |
 
-Login spawn strategy: detect a terminal emulator (`x-terminal-emulator`,
-`gnome-terminal`, `konsole`, `alacritty`, `kitty`, `wezterm`), run the real
-CLI's interactive flow with the identity env applied. Never blocks the API.
+#### Login flows
+
+`POST /api/auth/login` runs the real CLI's own login with piped stdio so it
+works on a headless machine. Per tool:
+
+- **claude** — `claude auth login` under a `script`-allocated pseudo-terminal
+  (its Ink UI renders nothing without a TTY). The authorize URL is parsed
+  from the output; the redirect page is remote (no localhost callback), so
+  the user completes sign-in on any device and pastes the shown code (or the
+  full redirect URL) back, which the daemon injects on the CLI's stdin.
+- **codex / grok / kimi** — device-code flows (`codex login --device-auth`,
+  `grok login --device-auth`, `kimi login`) under plain pipes: the CLI
+  prints the verification URL plus a one-time code (both surfaced here) and
+  polls the provider itself, so no paste is needed.
+- **pi / opencode** — no daemon-managed flow (pi has no login subcommand;
+  opencode's prompts are not scriptable): the response is a terminal
+  handoff instead.
+- **zai / ali** — no login flow by design: use the api-key / ali-cookie
+  actions.
+
+Managed response (`kind: "managed"`):
+
+```jsonc
+{
+  "kind": "managed",
+  "flow": {
+    "flowId": "uuid",
+    "toolName": "claude",
+    "identity": "work",
+    "status": "waiting",   // starting | waiting | callback | completed | failed | cancelled
+    "mode": "pty",         // pty | pipes
+    "authUrl": "https://...",
+    "deviceCode": "4L6A-6ISQH",  // device flows only; not a secret
+    "instruction": "...",        // shown next to the paste box
+    "acceptsPaste": true,
+    "error": null,
+    "startedAt": "...", "updatedAt": "...", "endedAt": null
+  }
+}
+```
+
+Terminal-handoff response (`kind: "terminal"`): `{ kind: "terminal",
+spawned: bool, command }` — best-effort spawn into a detected terminal
+emulator, or the command to run by hand on headless hosts. `callback`
+status means the identity's credential file appeared or changed (path +
+mtime + size fingerprint only, never contents) while the CLI is still
+finishing. Flows time out after 15 minutes; error text is redacted
+(token-shaped runs are stripped). Poll `/api/auth/flows/:id` about every
+1.5s while a flow is active.
 
 Credential renewal (`AuthRefreshScheduler`, daemon-side; ali console cookies
 today):
