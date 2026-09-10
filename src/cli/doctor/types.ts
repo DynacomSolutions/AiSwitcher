@@ -9,10 +9,20 @@ import type { Identity, ToolConfig } from "../../identities/types.ts";
  * exists yet for this tool — see collect.ts's PROBES). */
 export type DoctorStatus = "responsive" | "hung" | "unavailable";
 
+export type DoctorToolName = ToolConfig["toolName"] | "aws-spend-guard";
+
 export interface DoctorResult {
-  toolName: ToolConfig["toolName"];
+  /** "aws-spend-guard" is the spend guard's pseudo-tool: one row per AWS
+   * account (see spend/doctor.ts), grouped as its own section by the
+   * renderer. */
+  toolName: DoctorToolName;
   identity: Identity;
   status: DoctorStatus;
+  /** Replaces the default status WORD ("responsive"/"hung"/"unavailable")
+   * while keeping the status's colour semantics — the spend guard's
+   * breached/degraded wording, so doctor reads consistently without
+   * inventing a second result shape. */
+  statusWord?: string;
   /** Wall-clock time the probe actually took. Set for "responsive" and
    * "hung" (a hang still "takes" the full timeout); unset for "unavailable"
    * since no subprocess was ever spawned. */

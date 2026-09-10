@@ -2,6 +2,7 @@ import { readdir, readlink, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { IDENTITY_SESSION_MARKER, withUsableCwd } from "../shared/exec.ts";
+import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import type { ProcessInfoDto, ProcessesDto } from "./types.ts";
 
 const PROC = "/proc";
@@ -10,6 +11,17 @@ const PROC = "/proc";
  * and real binaries (crush) both appear; the marker env var is what actually
  * attributes a process to an identity. */
 const AGENT_BINARIES = new Set(["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "crush", "opencode"]);
+
+/** Every per-identity config-dir env var any tool wrapper sets (envVarName
+ * plus each extraEnvVarNames entry). The spend guard reads these from a
+ * process's /proc/<pid>/environ to confirm a marked session's tool
+ * config dir, same detection shape as herdr's own environ matching. */
+const IDENTITY_ENV_VARS: ReadonlySet<string> = new Set(
+  Object.values(TOOL_CONFIGS).flatMap((cfg) => [
+    cfg.envVarName,
+    ...(cfg.extraEnvVarNames ?? []).map((extra) => extra.name),
+  ]),
+);
 
 function clockTicksPerSecond(): number {
   // Linux is essentially always 100, but read it properly where possible.
@@ -43,6 +55,10 @@ interface RawProc {
   command: string;
   binary: string;
   identity: string | null;
+  /** True when the environ carried the wrapper's IDENTITY_SESSION_MARKER. */
+  wrapped: boolean;
+  /** The per-identity config-dir env vars present in the process env. */
+  identityEnv: Record<string, string>;
   cwd: string | null;
   startedAt: string | null;
 }
@@ -66,6 +82,8 @@ async function inspectPid(pid: number, ticks: number, btime: number | null): Pro
   if (!AGENT_BINARIES.has(binary)) return undefined;
 
   let identity: string | null = null;
+  let wrapped = false;
+  const identityEnv: Record<string, string> = {};
   let cwd: string | null = null;
   let startedAt: string | null = null;
   try {
@@ -74,7 +92,12 @@ async function inspectPid(pid: number, ticks: number, btime: number | null): Pro
     for (const entry of envText.split("\0")) {
       if (entry.startsWith(`${IDENTITY_SESSION_MARKER}=`)) {
         identity = entry.slice(IDENTITY_SESSION_MARKER.length + 1) || null;
-        break;
+        wrapped = true;
+        continue;
+      }
+      const eq = entry.indexOf("=");
+      if (eq > 0 && IDENTITY_ENV_VARS.has(entry.slice(0, eq))) {
+        identityEnv[entry.slice(0, eq)] = entry.slice(eq + 1);
       }
     }
   } catch {
@@ -98,7 +121,7 @@ async function inspectPid(pid: number, ticks: number, btime: number | null): Pro
   } catch {
     // best effort only
   }
-  return { pid, command: command.replace(/\0/g, " ").trim(), binary, identity, cwd, startedAt };
+  return { pid, command: command.replace(/\0/g, " ").trim(), binary, identity, wrapped, identityEnv, cwd, startedAt };
 }
 
 export async function scanProcesses(now: Date = new Date()): Promise<ProcessesDto> {
@@ -125,6 +148,8 @@ export async function scanProcesses(now: Date = new Date()): Promise<ProcessesDt
       cwd: p.cwd,
       startedAt: p.startedAt,
       command: p.command.replace(new RegExp(`^${homedir()}`), "~"),
+      ...(p.wrapped ? { wrapped: true } : {}),
+      ...(Object.keys(p.identityEnv).length > 0 ? { identityEnv: p.identityEnv } : {}),
     }))
     .sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? "") || a.pid - b.pid);
   return { processes, scannedAt: now.toISOString() };

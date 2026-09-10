@@ -12,6 +12,7 @@ import type {
   ProcessesResponse,
   RegistriesResponse,
   SessionsResponse,
+  SpendGuardResponse,
   StatusResponse,
   ToolName,
   UsageResponse,
@@ -86,6 +87,8 @@ export const api = {
   getStatus: () => request<StatusResponse>("/api/status"),
 
   getProcesses: () => request<ProcessesResponse>("/api/processes"),
+
+  getSpendGuard: () => request<SpendGuardResponse>("/api/spend-guard"),
 
   getIdentities: () => request<RegistriesResponse>("/api/identities"),
   createIdentity: (tool: ToolName, body: CreateIdentityBody) =>

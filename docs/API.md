@@ -46,7 +46,7 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 | `/api/identities`, `/api/auth` | 10s |
 | `/api/sessions` | 15s |
 | `/api/files/*` | on demand |
-| `/api/limits`, `/api/usage` | 60s (server caches 45s) |
+| `/api/limits`, `/api/usage`, `/api/spend-guard` | 60s (server caches 45s) |
 
 ## Endpoints
 
@@ -89,10 +89,66 @@ identity via the `AI_PROFILE_SWITCHER_SESSION` marker env var.
       "identity": "work",        // null if not launched via a wrapper
       "cwd": "/home/me/Projects/foo",
       "startedAt": "2026-08-25T10:00:00Z",
-      "command": "claude --identity=work"
+      "command": "claude --identity=work",
+      "wrapped": true,           // present only when the marker env was found
+      "identityEnv": {           // per-identity config-dir env vars, when present
+        "CODEX_HOME": "/home/me/.codex/identities/work"
+      }
     }
   ],
   "scannedAt": "2026-08-25T12:00:00Z"
+}
+```
+
+### Spend guard
+
+`GET /api/spend-guard`
+
+Last-known per-AWS-account enforcement state (breach killer + cache writer
+status). 503 when the daemon-side scheduler is not running. Machines with no
+identity-to-AWS mapping report an empty `accounts` list.
+
+```jsonc
+{
+  "ok": true,
+  "running": true,
+  "config": { "intervalS": 300, "killGraceS": 10 },
+  "lastCycleAt": "2026-09-10T10:00:00Z",
+  "lastError": null,             // joined cycle errors of the last pass, if any
+  "accounts": [
+    {
+      "accountId": "123456789012",
+      "profile": "nazare-prod",
+      "region": "eu-west-2",
+      "budgetName": "pcg-bedrock-monthly-1000",  // absent when degraded
+      "budgetLimitUsd": 1000,
+      "budgetActualUsd": 12.5,   // the budget's own AWS-side spend
+      "budgetTimeUnit": "MONTHLY",
+      "periodStart": "2026-09-01T00:00:00.000Z",
+      "periodEnd": "2026-10-01T00:00:00.000Z",
+      "localEstimateUsd": 100.5, // offline token-based estimate (primary)
+      "realReportedUsd": 55.5,   // Cost Explorer; present only when fetched this cycle
+      "effectiveUsd": 100.5,     // max(local, every real source that succeeded)
+      "breached": false,
+      "enforced": true,          // false exactly when degraded
+      "degraded": false,
+      "reason": "…",             // degraded reason / breach summary
+      "identities": ["phoenix-court-group-bedrock"],
+      "computedAt": "2026-09-10T10:00:00Z"
+    }
+  ],
+  "recentKills": [               // newest last, capped at 20
+    {
+      "pid": 4242,
+      "tool": "codex",
+      "identity": "phoenix-court-group-bedrock",
+      "accountId": "123456789012",
+      "command": "codex",
+      "signal": "SIGTERM",       // SIGTERM within grace, else SIGKILL
+      "reason": "spend 1004.12 reached cap 1000.00 (pcg-bedrock-monthly-1000)",
+      "at": "2026-09-10T10:05:00Z"
+    }
+  ]
 }
 ```
 

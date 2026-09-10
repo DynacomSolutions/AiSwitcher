@@ -13,6 +13,8 @@ import { fetchOpencodeLimits } from "./opencode-limits.ts";
 import { fetchPiLimits } from "./pi-limits.ts";
 import { fetchZaiLimits } from "./zai-limits.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
+import { annotateWithSpendGuard } from "../../spend/annotate.ts";
+import { loadSpendGuardCache } from "../../spend/cache.ts";
 import type { FetchedLimitResult, ToolLimitResult } from "./types.ts";
 
 export interface LimitTarget {
@@ -316,5 +318,8 @@ export async function runLimitsQuery(
   cached: boolean,
 ): Promise<ToolLimitResult[]> {
   const targets = await collectLimitTargets(identityFilter, flags);
-  return fetchLimitResults(targets, cached, toolConfigFromFlag(flags) !== undefined);
+  const results = await fetchLimitResults(targets, cached, toolConfigFromFlag(flags) !== undefined);
+  // Spend-guard notes ride the shared cache (never fetched inline here):
+  // breached accounts get the loud over-cap note, degraded ones say why.
+  return annotateWithSpendGuard(results, await loadSpendGuardCache());
 }

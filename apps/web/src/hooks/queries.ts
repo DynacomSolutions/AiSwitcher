@@ -18,6 +18,7 @@ export const qk = {
   sessions: (cwd: string) => ["sessions", cwd] as const,
   auth: ["auth"] as const,
   authRefresh: ["auth", "refresh"] as const,
+  spendGuard: ["spend-guard"] as const,
   fileRoots: ["files", "roots"] as const,
   fileTree: (root: string, path: string) => ["files", "tree", root, path] as const,
   fileContent: (path: string) => ["files", "file", path] as const,
@@ -36,6 +37,14 @@ export function useProcessesQuery() {
     queryKey: qk.processes,
     queryFn: api.getProcesses,
     refetchInterval: POLL.live,
+  });
+}
+
+export function useSpendGuardQuery() {
+  return useQuery({
+    queryKey: qk.spendGuard,
+    queryFn: api.getSpendGuard,
+    refetchInterval: POLL.slow,
   });
 }
 

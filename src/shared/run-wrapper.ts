@@ -13,6 +13,7 @@ import { codexPlatformArgs } from "./codex-platform-config.ts";
 import { projectSharedCodexConfigForLaunch } from "./codex-shared-config.ts";
 import { codexSubcommandConfigArgs } from "./codex-config-args.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
+import { runLaunchGate } from "../spend/gate.ts";
 
 export async function runWrapper(
   cfg: ToolConfig,
@@ -43,6 +44,23 @@ export async function runWrapper(
       env: process.env,
       nonInteractiveHint: parsed.nonInteractiveHint,
     });
+
+    // SPEND GUARD launch gate: before ANY side effect (auth refreshes, sync
+    // watchers, desktop launches, the real binary), refuse to start a new
+    // wrapped session on an AWS account that is over its Budgets cap.
+    // Enforcement runs on last-known cached state (<50ms fresh); a missing
+    // or stale cache queues an opportunistic background refresh and never
+    // blocks on missing data. No override exists by design.
+    const gate = await runLaunchGate({
+      toolName: cfg.toolName,
+      ...(resolved.identity ? { identity: resolved.identity } : {}),
+      configDir: resolved.configDirValue,
+    });
+    if (gate.decision === "block") {
+      console.error(gate.refusal);
+      process.exit(1);
+    }
+    if (gate.warn) console.error(gate.warn);
 
     await beforeLaunch?.(resolved.configDirValue);
 

@@ -4,14 +4,16 @@ import type { DoctorResult, DoctorStatus } from "./types.ts";
 const BRANCH = "├── ";
 const BRANCH_LAST = "└── ";
 
-function identityCount(n: number): string {
+function identityCount(n: number, section: "tools" | "accounts" = "tools"): string {
+  if (section === "accounts") return n === 1 ? "1 account" : `${n} accounts`;
   return n === 1 ? "1 identity" : `${n} identities`;
 }
 
-function statusLabel(status: DoctorStatus): string {
-  if (status === "responsive") return green("✔ responsive");
-  if (status === "hung") return red("✖ hung");
-  return yellow("○ unavailable");
+function statusLabel(status: DoctorStatus, statusWord: string | undefined): string {
+  const word = statusWord ?? (status === "responsive" ? "responsive" : status === "hung" ? "hung" : "unavailable");
+  if (status === "responsive") return green(`✔ ${word}`);
+  if (status === "hung") return red(`✖ ${word}`);
+  return yellow(`○ ${word}`);
 }
 
 function formatElapsed(ms: number | undefined): string {
@@ -19,7 +21,7 @@ function formatElapsed(ms: number | undefined): string {
 }
 
 function buildDetailRow(result: DoctorResult): string {
-  const parts = [statusLabel(result.status), formatElapsed(result.elapsedMs)];
+  const parts = [statusLabel(result.status, result.statusWord), formatElapsed(result.elapsedMs)];
   if (result.detail) parts.push(`  ${dim(result.detail)}`);
   return parts.join("");
 }
@@ -44,7 +46,7 @@ export function formatDoctorReport(results: DoctorResult[]): string {
   for (const [toolName, group] of groups) {
     if (!firstSection) lines.push("");
     firstSection = false;
-    lines.push(`${bold(toolName)} ${dim(`(${identityCount(group.length)})`)}`);
+    lines.push(`${bold(toolName)} ${dim(`(${identityCount(group.length, toolName === "aws-spend-guard" ? "accounts" : "tools")})`)}`);
     group.forEach((result, i) => {
       const connector = i === group.length - 1 ? BRANCH_LAST : BRANCH;
       const label = `${bold(result.identity.name)}  ${dim(`(${result.identity.label})`)}`;
@@ -52,7 +54,7 @@ export function formatDoctorReport(results: DoctorResult[]): string {
     });
   }
 
-  const hung = results.filter((r) => r.status === "hung");
+  const hung = results.filter((r) => r.status === "hung" && r.toolName !== "aws-spend-guard");
   if (hung.length > 0) {
     lines.push("");
     const names = hung.map((r) => `${r.toolName}/${r.identity.name}`).join(", ");

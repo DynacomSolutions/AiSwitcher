@@ -28,6 +28,16 @@ export interface ProcessInfoDto {
   cwd: string | null;
   startedAt: string | null;
   command: string;
+  /** True when the process carries the wrapper's IDENTITY_SESSION_MARKER:
+   * a session the AIS wrapper actually launched (as opposed to a bare agent
+   * binary someone ran directly). Additive; the spend guard's kill
+   * candidates are exclusively wrapped sessions. */
+  wrapped?: boolean;
+  /** The recognised per-identity tool config-dir env vars found in the
+   * process environment (CLAUDE_CONFIG_DIR, CODEX_HOME, ...). Present only
+   * when at least one was found; lets callers attribute a session to a
+   * registry identity beyond the marker's bare name. */
+  identityEnv?: Record<string, string>;
 }
 
 export interface ProcessesDto {

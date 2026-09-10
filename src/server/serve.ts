@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
+import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
@@ -46,6 +47,19 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   scheduler.hydrate();
   scheduler.start();
 
+  // Daemon-side spend guard: periodic account-state cycle, cache writes for
+  // the launch gate, and breach-transition session kills. The interval (and
+  // kill grace) come from the machine-local spend-guard.json; the CAP never
+  // comes from config — it is AUTO from AWS Budgets. AIS_SPEND_GUARD=0
+  // opts the daemon out entirely (the launch gate is unaffected: it has no
+  // override).
+  let spendGuard: SpendGuardScheduler | undefined;
+  if (process.env.AIS_SPEND_GUARD !== "0") {
+    spendGuard = new SpendGuardScheduler({ config: await loadSpendGuardConfig() });
+    await spendGuard.hydrate();
+    spendGuard.start();
+  }
+
   const token = newConsoleToken();
   const deps: ConsoleAppDeps = {
     token,
@@ -53,6 +67,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     startedAt: Date.now(),
     allowedHosts: parseAllowedHosts(process.env.AIS_WEB_ALLOWED_HOSTS),
     authRefresh: scheduler,
+    ...(spendGuard ? { spendGuard } : {}),
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
   const app = createApp(deps);
@@ -86,6 +101,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     process.on("SIGHUP", () => {});
     const shutdown = () => {
       scheduler.stop();
+      spendGuard?.stop();
       void clearServerState();
       server.stop(true);
       setTimeout(() => process.exit(0), 50);
@@ -94,7 +110,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     process.on("SIGINT", shutdown);
   }
 
-  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); server.stop(true); } };
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this
