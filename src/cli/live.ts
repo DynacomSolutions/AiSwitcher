@@ -74,6 +74,16 @@ export function truncateToWidth(line: string, maxWidth: number): string {
   return `${out}…${RESET}`;
 }
 
+export interface LiveRenderOptions {
+  /** Replaces the default SIGINT/SIGTERM behaviour (restore cursor, exit 0).
+   * Callers whose run() carries its own cancellation protocol (ais upgrade's
+   * UpgradeCancelledError, which must surface the child's real 129/130/131/143
+   * exit code) pass a no-op here: the terminal's SIGINT reaches the captured
+   * children directly, the run promise settles, and the caller decides the
+   * exit code in its own finally/catch path. */
+  onInterrupt?: () => void;
+}
+
 /**
  * Drives an in-place, per-row terminal render while `run()` is in flight.
  * `render(tick)` returns the FULL current frame (every row, resolved or
@@ -93,7 +103,11 @@ export function truncateToWidth(line: string, maxWidth: number): string {
  * whole live-rendering path (including the per-item progress callback
  * plumbing) rather than call in and get a silent single-frame no-op.
  */
-export async function withLiveRender(render: (tick: number) => string, run: () => Promise<void>): Promise<void> {
+export async function withLiveRender(
+  render: (tick: number) => string,
+  run: () => Promise<void>,
+  options: LiveRenderOptions = {},
+): Promise<void> {
   process.stdout.write(HIDE_CURSOR);
   let previousLineCount = 0;
   let tick = 0;
@@ -111,7 +125,8 @@ export async function withLiveRender(render: (tick: number) => string, run: () =
   const restoreCursor = () => process.stdout.write(SHOW_CURSOR);
   const onSignal = () => {
     restoreCursor();
-    process.exit(0);
+    if (options.onInterrupt) options.onInterrupt();
+    else process.exit(0);
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
