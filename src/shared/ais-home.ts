@@ -74,3 +74,13 @@ export function aisNpmDir(home: string = homedir()): string {
 export function aisManifestPath(home: string = homedir()): string {
   return join(aisHome(home), "manifest.json");
 }
+
+/** Derived-state cache (currently the spend guard's last computed per-account
+ * state). Pure convenience for readers that must never block on a recompute:
+ * the launch gate reads this file and enforces on last-known state, while
+ * the daemon and the internal refresh command rewrite it in the background.
+ * Semantically distinct from remote-cache (SSH sync staging) — this is
+ * machine-local derived data, always safe to delete. */
+export function aisCacheDir(home: string = homedir()): string {
+  return join(aisHome(home), "cache");
+}

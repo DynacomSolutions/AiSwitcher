@@ -145,6 +145,76 @@ export function estimateModelTokenCost(provider: "zai" | "alibaba", model: strin
   return (inputTokens * price.cost_per_1m_in + outputTokens * price.cost_per_1m_out) / 1_000_000;
 }
 
+/**
+ * AWS Bedrock on-demand prices, USD per million tokens, for the models this
+ * machine's Bedrock-backed identities actually run. Source: models.dev's
+ * `amazon-bedrock` catalog (checked 10 September 2026). These differ from
+ * the vanilla OpenAI list prices by Bedrock's regional mark-up, and cache
+ * WRITES bill above the input rate (1.25x) while reads discount heavily —
+ * so this provider needs its own four-rate shape, unlike the subscription
+ * estimates above. Values serve the spend guard's LOCAL estimate
+ * (spend/local-estimate.ts): an estimate, never real billing — real pricing
+ * may differ (request mode, caching behaviour, tiered >200k-context rates
+ * are not modelled here, which under-counts very long contexts slightly).
+ */
+export interface BedrockModelPrice {
+  usdPer1mInput: number;
+  usdPer1mOutput: number;
+  usdPer1mCacheRead: number;
+  usdPer1mCacheWrite: number;
+}
+
+export const AWS_BEDROCK_MODEL_PRICES: Record<string, BedrockModelPrice> = {
+  "openai.gpt-6-astra": { usdPer1mInput: 11, usdPer1mOutput: 55, usdPer1mCacheRead: 1.1, usdPer1mCacheWrite: 13.75 },
+  "openai.gpt-5.6-luna": { usdPer1mInput: 0.22, usdPer1mOutput: 1.32, usdPer1mCacheRead: 0.022, usdPer1mCacheWrite: 0.275 },
+};
+
+/** Bedrock model ids arrive with inference-profile region prefixes
+ * (`us.`, `eu.`, `apac.`, `global.`, `ca.`); strip one so
+ * `us.openai.gpt-6-astra` prices like its base entry. */
+export function normaliseBedrockModelId(model: string): string {
+  const lowered = model.trim().toLowerCase();
+  return lowered.replace(/^(us|eu|apac|global|ca)\./, "");
+}
+
+/** Values one usage record at Bedrock on-demand rates. Returns undefined for
+ * models with no table entry — the caller decides the fallback (the spend
+ * guard deliberately over-counts unknown models rather than letting them
+ * ride free). */
+export function estimateBedrockTokenCost(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadTokens: number,
+  cacheWriteTokens: number,
+): number | undefined {
+  const price =
+    AWS_BEDROCK_MODEL_PRICES[normaliseBedrockModelId(model)] ??
+    AWS_BEDROCK_MODEL_PRICES[normaliseBedrockModelId(model).replace(/^(openai|anthropic|meta|amazon)\./, "")];
+  if (!price) return undefined;
+  return (
+    inputTokens * price.usdPer1mInput +
+    outputTokens * price.usdPer1mOutput +
+    cacheReadTokens * price.usdPer1mCacheRead +
+    cacheWriteTokens * price.usdPer1mCacheWrite
+  ) / 1_000_000;
+}
+
+/** Conservative fallback for models missing from the price table:
+ * element-wise MAX across the table, so an unknown model is never valued at
+ * zero (a guard that under-counts silently defeats itself). Over-counts
+ * cheap models; that is the safe direction for enforcement, and Cost
+ * Explorer's real spend corrects the blend within hours. */
+export function unknownBedrockModelFallbackPrice(): BedrockModelPrice {
+  const entries = Object.values(AWS_BEDROCK_MODEL_PRICES);
+  return {
+    usdPer1mInput: Math.max(...entries.map((p) => p.usdPer1mInput)),
+    usdPer1mOutput: Math.max(...entries.map((p) => p.usdPer1mOutput)),
+    usdPer1mCacheRead: Math.max(...entries.map((p) => p.usdPer1mCacheRead)),
+    usdPer1mCacheWrite: Math.max(...entries.map((p) => p.usdPer1mCacheWrite)),
+  };
+}
+
 /** Pi records uncached input, cache reads, and cache writes separately. Use
  * that real split when valuing plan-included Pi activity; cache writes are
  * new input at the ordinary input rate, while reads receive the provider's
