@@ -11,8 +11,8 @@ const NOW = new Date("2026-09-10T10:00:00.000Z");
 function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
   return {
     accountId: "123456789012",
-    profile: "nazare-prod",
-    budgetName: "pcg-bedrock-monthly-1000",
+    profile: "acme-prod",
+    budgetName: "acme-bedrock-monthly",
     budgetLimitUsd: 1000,
     budgetActualUsd: 982.55,
     budgetTimeUnit: "MONTHLY",
@@ -24,7 +24,7 @@ function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
     breached: true,
     enforced: true,
     degraded: false,
-    reason: "spend 1004.12 reached cap 1000.00 (pcg-bedrock-monthly-1000)",
+    reason: "spend 1004.12 reached cap 1000.00 (acme-bedrock-monthly)",
     identities: ["guarded"],
     computedAt: NOW.toISOString(),
     ...overrides,
@@ -36,7 +36,7 @@ function cache(accounts: Record<string, AccountSpendState>, overrides: Partial<S
 }
 
 const MAPPED: LaunchGateDeps = {
-  target: { profile: "nazare-prod", accountId: "123456789012", region: "eu-west-2" },
+  target: { profile: "acme-prod", accountId: "123456789012", region: "eu-west-2" },
   now: () => NOW,
   intervalS: 300,
 };
@@ -65,8 +65,8 @@ describe("evaluateLaunchGate", () => {
     expect(outcome.decision).toBe("block");
     expect(outcome.refusal).toContain("launch REFUSED");
     expect(outcome.refusal).toContain("...9012");
-    expect(outcome.refusal).toContain("nazare-prod");
-    expect(outcome.refusal).toContain("pcg-bedrock-monthly-1000");
+    expect(outcome.refusal).toContain("acme-prod");
+    expect(outcome.refusal).toContain("acme-bedrock-monthly");
     expect(outcome.refusal).toContain("$1000.00");
     expect(outcome.refusal).toContain("$1004.12");
     expect(outcome.refusal).toContain("Cost Explorer $990.00");
@@ -91,7 +91,7 @@ describe("evaluateLaunchGate", () => {
           breached: false,
           enforced: false,
           degraded: true,
-          reason: "AWS SSO credentials expired or unavailable for profile \"nazare-prod\"",
+          reason: "AWS SSO credentials expired or unavailable for profile \"acme-prod\"",
           budgetName: undefined,
           budgetLimitUsd: undefined,
         }),
@@ -212,7 +212,7 @@ describe("launch gate end-to-end (temp HOME)", () => {
       expect(exitCode).toBe(1);
       expect(stderr).toContain("launch REFUSED");
       expect(stderr).toContain("...9012");
-      expect(stderr).toContain("pcg-bedrock-monthly-1000");
+      expect(stderr).toContain("acme-bedrock-monthly");
       expect(stderr).not.toContain("REAL BINARY MUST NOT RUN");
     } finally {
       rmSync(home, { recursive: true, force: true });

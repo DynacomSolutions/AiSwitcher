@@ -9,7 +9,7 @@ import {
 } from "../../src/spend/state.ts";
 
 function budget(overrides: Partial<BudgetSnapshot> = {}): BudgetSnapshot {
-  return { name: "pcg-bedrock-monthly-1000", limitUsd: 1000, actualUsd: 0, timeUnit: "MONTHLY", ...overrides };
+  return { name: "acme-bedrock-monthly", limitUsd: 1000, actualUsd: 0, timeUnit: "MONTHLY", ...overrides };
 }
 
 const NOW = new Date(2026, 8, 10, 12, 0, 0); // 10 Sep 2026, local noon
@@ -17,10 +17,10 @@ const NOW = new Date(2026, 8, 10, 12, 0, 0); // 10 Sep 2026, local noon
 function baseInput(overrides: Record<string, unknown> = {}) {
   return {
     accountId: "123456789012",
-    profile: "nazare-prod",
+    profile: "acme-prod",
     budgets: [budget()],
     localEstimateUsd: 100,
-    identities: ["phoenix-court-group-bedrock"],
+    identities: ["acme-bedrock"],
     now: NOW,
     ...overrides,
   } as Parameters<typeof computeAccountState>[0];
@@ -90,7 +90,7 @@ describe("computeAccountState", () => {
 
   test("a failed budget fetch leaves the account UNENFORCED but degraded, never breached", () => {
     const state = computeAccountState(
-      baseInput({ budgets: [], budgetError: "AWS SSO credentials expired or unavailable for profile \"nazare-prod\"", localEstimateUsd: 99999 }),
+      baseInput({ budgets: [], budgetError: "AWS SSO credentials expired or unavailable for profile \"acme-prod\"", localEstimateUsd: 99999 }),
     );
     expect(state).toMatchObject({ breached: false, enforced: false, degraded: true });
     expect(state.reason).toContain("SSO");
@@ -108,14 +108,14 @@ describe("computeAccountState", () => {
   test("computedAt and identities travel with the state for surfacing", () => {
     const state = computeAccountState(baseInput());
     expect(state.computedAt).toBe(NOW.toISOString());
-    expect(state.identities).toEqual(["phoenix-court-group-bedrock"]);
+    expect(state.identities).toEqual(["acme-bedrock"]);
   });
 });
 
 function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
   return {
     accountId: "123456789012",
-    profile: "nazare-prod",
+    profile: "acme-prod",
     localEstimateUsd: 0,
     effectiveUsd: 0,
     breached: false,

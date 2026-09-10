@@ -299,7 +299,7 @@ describe("real-cost sub-rows (AWS Bedrock)", () => {
   function bedrock(overrides: Partial<UsageResult> = {}): UsageResult {
     return {
       provider: "aws-bedrock",
-      identity: identity("pcg-bedrock"),
+      identity: identity("acme-bedrock"),
       report: { entries: [], totalInput: 1000, totalOutput: 500, totalCacheRead: 2000, totalCacheWrite: 100, totalMessages: 42, totalCost: 2218.66 },
       realCost: { label: "real AWS month-to-date", monthToDateUsd: 0, budgetActualUsd: 0, budgetLimitUsd: 1000, note: "reported lag" },
       ...overrides,
@@ -308,7 +308,7 @@ describe("real-cost sub-rows (AWS Bedrock)", () => {
 
   test("the Bedrock row's EST. COST column carries the LOCAL estimate; real AWS spend renders as a dimmed sub-row underneath", () => {
     const output = formatUsageReport([bedrock()]);
-    const rowLine = output.split("\n").find((l) => l.includes("pcg-bedrock"))!;
+    const rowLine = output.split("\n").find((l) => l.includes("acme-bedrock"))!;
     expect(rowLine).toContain("$2,218.66"); // local estimate in EST. COST
     const subRowIndex = output.split("\n").findIndex((l) => l.includes("real AWS month-to-date"));
     const rowIndex = output.split("\n").indexOf(rowLine);
@@ -321,7 +321,7 @@ describe("real-cost sub-rows (AWS Bedrock)", () => {
   test("a real figure trails the estimate columns, never replaces them", () => {
     const output = formatUsageReport([bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 19.75, budgetLimitUsd: 1000 } })]);
     expect(output).toContain("└ real AWS month-to-date: $19.75 (budget $1,000.00)");
-    const rowLine = output.split("\n").find((l) => l.includes("pcg-bedrock"))!;
+    const rowLine = output.split("\n").find((l) => l.includes("acme-bedrock"))!;
     expect(rowLine).toContain("$2,218.66");
   });
 
@@ -356,7 +356,7 @@ describe("real-cost sub-rows (AWS Bedrock)", () => {
   test("trailing real-spend total line sums the answered Cost Explorer figures beneath TOTAL", () => {
     const output = formatUsageReport([
       bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 12.5 } }),
-      bedrock({ identity: identity("pcg-bedrock-dev"), realCost: { label: "real AWS month-to-date", monthToDateUsd: 0.25 } }),
+      bedrock({ identity: identity("acme-bedrock-dev"), realCost: { label: "real AWS month-to-date", monthToDateUsd: 0.25 } }),
       success("claude", "identity-a"),
     ]);
     const totalLine = output.split("\n").findIndex((l) => l.includes("TOTAL"));
@@ -368,7 +368,7 @@ describe("real-cost sub-rows (AWS Bedrock)", () => {
   test("no real total line when no Cost Explorer query answered (an unavailable figure is not a zero)", () => {
     const output = formatUsageReport([
       bedrock({ realCost: { label: "real AWS month-to-date", error: "throttled" } }),
-      bedrock({ identity: identity("pcg-bedrock-dev"), realCost: { label: "real AWS month-to-date", error: "throttled" } }),
+      bedrock({ identity: identity("acme-bedrock-dev"), realCost: { label: "real AWS month-to-date", error: "throttled" } }),
     ]);
     expect(output).not.toContain("real AWS total");
   });

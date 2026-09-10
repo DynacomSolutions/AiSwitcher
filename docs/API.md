@@ -119,9 +119,9 @@ identity-to-AWS mapping report an empty `accounts` list.
   "accounts": [
     {
       "accountId": "123456789012",
-      "profile": "nazare-prod",
+      "profile": "acme-prod",
       "region": "eu-west-2",
-      "budgetName": "pcg-bedrock-monthly-1000",  // absent when degraded
+      "budgetName": "acme-bedrock-monthly",  // absent when degraded
       "budgetLimitUsd": 1000,
       "budgetActualUsd": 12.5,   // the budget's own AWS-side spend
       "budgetTimeUnit": "MONTHLY",
@@ -134,7 +134,7 @@ identity-to-AWS mapping report an empty `accounts` list.
       "enforced": true,          // false exactly when degraded
       "degraded": false,
       "reason": "…",             // degraded reason / breach summary
-      "identities": ["phoenix-court-group-bedrock"],
+      "identities": ["acme-bedrock"],
       "computedAt": "2026-09-10T10:00:00Z"
     }
   ],
@@ -142,11 +142,11 @@ identity-to-AWS mapping report an empty `accounts` list.
     {
       "pid": 4242,
       "tool": "codex",
-      "identity": "phoenix-court-group-bedrock",
+      "identity": "acme-bedrock",
       "accountId": "123456789012",
       "command": "codex",
       "signal": "SIGTERM",       // SIGTERM within grace, else SIGKILL
-      "reason": "spend 1004.12 reached cap 1000.00 (pcg-bedrock-monthly-1000)",
+      "reason": "spend 1004.12 reached cap 1000.00 (acme-bedrock-monthly)",
       "at": "2026-09-10T10:05:00Z"
     }
   ]
@@ -177,7 +177,7 @@ plain shell panes and unmarked sessions never appear.
       "agent": "opencode",     // herdr's own agent label
       "agentStatus": "working",
       "tool": "opencode",      // AIS attribution (marked binary / config-dir env)
-      "identity": "dynacom",
+      "identity": "workco",
       "title": "OC | ...",
       "session": 43,           // omitted when the provider has no such window
       "week": 100,
@@ -286,7 +286,7 @@ entry.
 {
   "results": [
     {
-      "identity": "dynacom",
+      "identity": "workco",
       "tool": "claude",
       "windowDays": 30,
       "generatedAt": "...",

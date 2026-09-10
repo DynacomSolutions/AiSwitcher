@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn bedrock_real_cost_lands_in_the_real_column_with_the_budget_limit() {
-        let mut usage = usage_result("pcg", "aws-bedrock", 2218.66);
+        let mut usage = usage_result("acme", "aws-bedrock", 2218.66);
         usage.real_cost = Some(crate::models::RealCostInfo {
             month_to_date_usd: Some(0.0),
             budget_limit_usd: Some(1000.0),
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn an_errored_bedrock_real_cost_never_fakes_a_zero_figure() {
-        let mut usage = usage_result("pcg", "aws-bedrock", 2218.66);
+        let mut usage = usage_result("acme", "aws-bedrock", 2218.66);
         // Only month_to_date_usd present makes the REAL column speak: a
         // payload without an answered figure maps to nothing at all.
         usage.real_cost = Some(crate::models::RealCostInfo {

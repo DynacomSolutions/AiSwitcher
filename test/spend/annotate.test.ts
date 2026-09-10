@@ -16,7 +16,7 @@ function limitResult(name: string, provider = "aws-bedrock"): ToolLimitResult {
     toolName: "codex",
     provider,
     identity: identity(name),
-    windows: [{ label: "budget: pcg-bedrock-monthly-1000", category: "month", usedPercent: 100.4 }],
+    windows: [{ label: "budget: acme-bedrock-monthly", category: "month", usedPercent: 100.4 }],
     status: "live",
   };
 }
@@ -24,7 +24,7 @@ function limitResult(name: string, provider = "aws-bedrock"): ToolLimitResult {
 function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
   return {
     accountId: "123456789012",
-    profile: "nazare-prod",
+    profile: "acme-prod",
     localEstimateUsd: 0,
     effectiveUsd: 0,
     breached: false,

@@ -11,7 +11,7 @@ import {
 import type { Identity } from "../../../src/identities/types.ts";
 import type { LocalSpendRead } from "../../../src/shared/local-spend.ts";
 
-function identity(name = "pcg-bedrock"): Identity {
+function identity(name = "acme-bedrock"): Identity {
   return { name, label: name, configDir: `/tmp/does-not-exist/${name}` };
 }
 
@@ -104,8 +104,8 @@ describe("reportFromLocalRead", () => {
 describe("fetchAwsBedrockUsage", () => {
   const MAPPING_DEPS = {
     readText: (path: string): string => {
-      if (path.endsWith("aws-profiles.json")) return JSON.stringify({ version: 1, identities: { "pcg-bedrock": { profile: "pcg-dev" } } });
-      if (path.endsWith("config")) return "[profile pcg-dev]\nsso_account_id = 975049896933\nregion = eu-west-2\n";
+      if (path.endsWith("aws-profiles.json")) return JSON.stringify({ version: 1, identities: { "acme-bedrock": { profile: "acme-dev" } } });
+      if (path.endsWith("config")) return "[profile acme-dev]\nsso_account_id = 975049896933\nregion = eu-west-2\n";
       throw new Error(`unexpected path ${path}`);
     },
     awsProfilesPath: "/fixtures/aws-profiles.json",
@@ -116,7 +116,7 @@ describe("fetchAwsBedrockUsage", () => {
     async listBudgets() {
       return [
         {
-          BudgetName: "pcg-bedrock-monthly-1000",
+          BudgetName: "acme-bedrock-monthly",
           BudgetType: "COST",
           TimeUnit: "MONTHLY",
           BudgetLimit: { Amount: "1000", Unit: "USD" },
@@ -197,7 +197,7 @@ describe("fetchAwsBedrockUsage", () => {
     const { report, realCost } = await fetchAwsBedrockUsage(identity(), deps);
     expect(report.totalCost).toBeCloseTo(2218.66, 10);
     expect(realCost?.monthToDateUsd).toBeUndefined();
-    expect(realCost?.error).toContain("aws sso login --profile pcg-dev");
+    expect(realCost?.error).toContain("aws sso login --profile acme-dev");
     expect(realCost?.note).toBeUndefined();
   });
 

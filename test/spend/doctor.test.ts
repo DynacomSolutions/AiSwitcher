@@ -8,8 +8,8 @@ const NOW = new Date(2026, 8, 10, 12, 0, 0);
 function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
   return {
     accountId: "123456789012",
-    profile: "nazare-prod",
-    budgetName: "pcg-bedrock-monthly-1000",
+    profile: "acme-prod",
+    budgetName: "acme-bedrock-monthly",
     budgetLimitUsd: 1000,
     budgetActualUsd: 12.5,
     budgetTimeUnit: "MONTHLY",
@@ -19,7 +19,7 @@ function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
     breached: false,
     enforced: true,
     degraded: false,
-    identities: ["phoenix-court-group-bedrock"],
+    identities: ["acme-bedrock"],
     computedAt: NOW.toISOString(),
     ...overrides,
   };
@@ -37,7 +37,7 @@ describe("spendGuardDoctorRows", () => {
     expect(row.detail).toContain("local $100.00");
     expect(row.detail).toContain("Cost Explorer $55.50");
     expect(row.detail).toContain("budget actual $12.50");
-    expect(row.detail).toContain("phoenix-court-group-bedrock");
+    expect(row.detail).toContain("acme-bedrock");
   });
 
   test("breached: hung/BREACHED with the enforcement wording", () => {
@@ -57,7 +57,7 @@ describe("spendGuardDoctorRows", () => {
   });
 
   test("multiple accounts render as multiple rows", () => {
-    const rows = spendGuardDoctorRows(cycle([state(), state({ accountId: "999999999999", profile: "nazare-dev", identities: [] })]));
+    const rows = spendGuardDoctorRows(cycle([state(), state({ accountId: "999999999999", profile: "acme-dev", identities: [] })]));
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r.identity.name).sort()).toEqual(["account ...9012", "account ...9999"]);
   });

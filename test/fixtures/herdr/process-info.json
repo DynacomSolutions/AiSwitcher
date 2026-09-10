@@ -9,25 +9,25 @@
             "opencode"
           ],
           "cmdline": "opencode",
-          "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+          "cwd": "/home/user/work/aiswitcher",
           "name": "opencode",
           "pid": 848316
         },
         {
           "argv": [
-            "/home/thomas/.ais/npm/bin/opencode"
+            "/home/user/.ais/npm/bin/opencode"
           ],
-          "cmdline": "/home/thomas/.ais/npm/bin/opencode",
-          "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+          "cmdline": "/home/user/.ais/npm/bin/opencode",
+          "cwd": "/home/user/work/aiswitcher",
           "name": "opencode",
           "pid": 849083
         },
         {
           "argv": [
-            "/home/thomas/.local/bin/codebase-memory-mcp"
+            "/home/user/.local/bin/codebase-memory-mcp"
           ],
-          "cmdline": "/home/thomas/.local/bin/codebase-memory-mcp",
-          "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+          "cmdline": "/home/user/.local/bin/codebase-memory-mcp",
+          "cwd": "/home/user/work/aiswitcher",
           "name": "codebase-memory",
           "pid": 853426
         }

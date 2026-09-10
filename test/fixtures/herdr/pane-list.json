@@ -11,9 +11,9 @@
           "value": "01a070ee-1613-7f51-81b4-541eadd2b89b"
         },
         "agent_status": "idle",
-        "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "cwd": "/home/user/work/cluster",
         "focused": false,
-        "foreground_cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "foreground_cwd": "/home/user/work/cluster",
         "pane_id": "w1:p1G",
         "revision": 3,
         "scroll": {
@@ -30,9 +30,9 @@
       {
         "agent": "opencode",
         "agent_status": "working",
-        "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+        "cwd": "/home/user/work/aiswitcher",
         "focused": false,
-        "foreground_cwd": "/home/Storage/Projects/repositories/DynacomSolutions/AiSwitcher",
+        "foreground_cwd": "/home/user/work/aiswitcher",
         "pane_id": "w2B:p1",
         "revision": 13,
         "scroll": {
@@ -48,9 +48,9 @@
       },
       {
         "agent_status": "unknown",
-        "cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "cwd": "/home/user/work/cluster",
         "focused": false,
-        "foreground_cwd": "/home/Storage/Projects/repositories/DynacomSolutions/.cluster",
+        "foreground_cwd": "/home/user/work/cluster",
         "pane_id": "w1:p1Q",
         "revision": 3,
         "scroll": {
@@ -60,8 +60,8 @@
         },
         "tab_id": "w1:t14",
         "terminal_id": "term_65af307ccca5e32",
-        "terminal_title": "thomas@hq1:~",
-        "terminal_title_stripped": "thomas@hq1:~",
+        "terminal_title": "me@dev:~",
+        "terminal_title_stripped": "me@dev:~",
         "workspace_id": "w1"
       },
       {
@@ -73,9 +73,9 @@
           "value": "d2cb8f54-3e20-4cd3-adf5-bfed726b337c"
         },
         "agent_status": "idle",
-        "cwd": "/home/Storage/Projects/repositories/ThomasMcFarlane/primipathic",
+        "cwd": "/home/user/work/private-project",
         "focused": false,
-        "foreground_cwd": "/home/Storage/Projects/repositories/ThomasMcFarlane/primipathic",
+        "foreground_cwd": "/home/user/work/private-project",
         "pane_id": "w2C:p1",
         "revision": 8,
         "scroll": {

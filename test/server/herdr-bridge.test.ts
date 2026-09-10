@@ -158,20 +158,20 @@ describe("classifyPaneListFailure", () => {
 
 describe("token contract", () => {
   const results = [
-    { identity: { name: "dynacom" }, windows: [{ category: "session", usedPercent: 18.4 }, { category: "week", usedPercent: 42 }] },
+    { identity: { name: "workco" }, windows: [{ category: "session", usedPercent: 18.4 }, { category: "week", usedPercent: 42 }] },
     { identity: { name: "other" }, windows: [{ category: "session", usedPercent: 99 }] },
-    { identity: { name: "dynacom" }, status: "unavailable", windows: [] },
+    { identity: { name: "workco" }, status: "unavailable", windows: [] },
   ];
 
   test("windowsForIdentity extracts only the named identity's windows", () => {
-    expect(windowsForIdentity(results, "dynacom")).toEqual([{ category: "session", usedPercent: 18.4 }, { category: "week", usedPercent: 42 }]);
+    expect(windowsForIdentity(results, "workco")).toEqual([{ category: "session", usedPercent: 18.4 }, { category: "week", usedPercent: 42 }]);
     expect(windowsForIdentity(results, "missing")).toEqual([]);
-    expect(windowsForIdentity("junk", "dynacom")).toEqual([]);
+    expect(windowsForIdentity("junk", "workco")).toEqual([]);
   });
 
   test("computePaneTokens: present categories round to integers; absent ones are omitted", () => {
-    const tokens = computePaneTokens("dynacom", windowsForIdentity(results, "dynacom"), ["session", "week", "month"]);
-    expect(tokens).toEqual({ identity: "dynacom", session: 18, week: 42, summary: "s:18% w:42%" });
+    const tokens = computePaneTokens("workco", windowsForIdentity(results, "workco"), ["session", "week", "month"]);
+    expect(tokens).toEqual({ identity: "workco", session: 18, week: 42, summary: "s:18% w:42%" });
   });
 
   test("the max percent wins across providers of one identity; rounding rounds half up", () => {
@@ -197,10 +197,10 @@ describe("token contract", () => {
   });
 
   test("tokenArgs emits the $ais_* names literally, summary spaces in one argv element", () => {
-    const args = tokenArgs({ identity: "dynacom", session: 18, week: 42, summary: "s:18% w:42%" });
+    const args = tokenArgs({ identity: "workco", session: 18, week: 42, summary: "s:18% w:42%" });
     expect(args).toEqual([
       "--token",
-      "$ais_identity=dynacom",
+      "$ais_identity=workco",
       "--token",
       "$ais_session=18",
       "--token",
@@ -225,11 +225,11 @@ describe("toolFromIdentityEnv", () => {
 
 describe("parseIdentityEnviron (shared /proc scanner rules)", () => {
   test("marker sets identity + wrapped; config-dir vars are captured; empty marker stays wrapped", () => {
-    const env = `PATH=/usr/bin\0AI_PROFILE_SWITCHER_SESSION=dynacom\0OPENCODE_CONFIG_DIR=/home/me/.ais/npm/identities/dynacom\0SECRET_KEY=never-read-here\0`;
+    const env = `PATH=/usr/bin\0AI_PROFILE_SWITCHER_SESSION=workco\0OPENCODE_CONFIG_DIR=/home/user/.ais/npm/identities/workco\0SECRET_KEY=never-read-here\0`;
     expect(parseIdentityEnviron(env)).toEqual({
-      identity: "dynacom",
+      identity: "workco",
       wrapped: true,
-      identityEnv: { OPENCODE_CONFIG_DIR: "/home/me/.ais/npm/identities/dynacom" },
+      identityEnv: { OPENCODE_CONFIG_DIR: "/home/user/.ais/npm/identities/workco" },
     });
     expect(parseIdentityEnviron("AI_PROFILE_SWITCHER_SESSION=")).toEqual({ identity: null, wrapped: true, identityEnv: {} });
     expect(parseIdentityEnviron("PATH=/usr/bin")).toEqual({ identity: null, wrapped: false, identityEnv: {} });
@@ -267,7 +267,7 @@ function harness(): Harness {
   };
 }
 
-const MARKED_ENV = { identity: "dynacom", wrapped: true as const, identityEnv: { OPENCODE_CONFIG_DIR: "/home/me/.ais/npm/identities/dynacom" } };
+const MARKED_ENV = { identity: "workco", wrapped: true as const, identityEnv: { OPENCODE_CONFIG_DIR: "/home/user/.ais/npm/identities/workco" } };
 
 describe("HerdrBridgeScheduler state machine", () => {
   test("idle: herdr not running", async () => {
@@ -304,7 +304,7 @@ describe("HerdrBridgeScheduler state machine", () => {
         probe: async () => ({ verdict: "pending" }),
         processInfo: async (paneId) => (paneId === "w2B:p1" ? ok(PROCESS_INFO_JSON) : failed("no process info")),
         readEnviron: async (pid) => (pid === 848316 ? MARKED_ENV : undefined),
-        fetchLimits: async () => [{ identity: { name: "dynacom" }, windows: [{ category: "session", usedPercent: 18 }] }],
+        fetchLimits: async () => [{ identity: { name: "workco" }, windows: [{ category: "session", usedPercent: 18 }] }],
       }),
     );
     await scheduler.tick();
@@ -312,7 +312,7 @@ describe("HerdrBridgeScheduler state machine", () => {
     expect(status.state).toBe("pending");
     expect(status.pendingReason).toBe(PENDING_REASON);
     expect(status.panes).toHaveLength(1);
-    expect(status.panes[0]).toMatchObject({ paneId: "w2B:p1", identity: "dynacom", tool: "opencode", session: 18 });
+    expect(status.panes[0]).toMatchObject({ paneId: "w2B:p1", identity: "workco", tool: "opencode", session: 18 });
     expect(h.pushes).toEqual([]);
   });
 
@@ -342,8 +342,8 @@ describe("HerdrBridgeScheduler state machine", () => {
         processInfo: async (paneId) => (paneId === "w2B:p1" ? ok(PROCESS_INFO_JSON) : failed("no process info")),
         readEnviron: async (pid) => (pid === 848316 ? MARKED_ENV : undefined),
         fetchLimits: async (identity) =>
-          identity === "dynacom"
-            ? [{ identity: { name: "dynacom" }, windows: [{ category: "session", usedPercent: 18.4 }, { category: "week", usedPercent: 42 }] }]
+          identity === "workco"
+            ? [{ identity: { name: "workco" }, windows: [{ category: "session", usedPercent: 18.4 }, { category: "week", usedPercent: 42 }] }]
             : [],
       }),
     );
@@ -360,7 +360,7 @@ describe("HerdrBridgeScheduler state machine", () => {
       "--source",
       "ais",
       "--token",
-      "$ais_identity=dynacom",
+      "$ais_identity=workco",
       "--token",
       "$ais_session=18",
       "--token",
@@ -381,7 +381,7 @@ describe("HerdrBridgeScheduler state machine", () => {
         config: { enabled: true, intervalS: 100_000, categories: ["session"], push: true },
         processInfo: async (paneId) => (paneId === "w2B:p1" ? ok(PROCESS_INFO_JSON) : failed("no process info")),
         readEnviron: async (pid) => (pid === 848316 ? MARKED_ENV : undefined),
-        fetchLimits: async () => [{ identity: { name: "dynacom" }, windows: [{ category: "session", usedPercent: 5 }] }],
+        fetchLimits: async () => [{ identity: { name: "workco" }, windows: [{ category: "session", usedPercent: 5 }] }],
       }),
     );
     await scheduler.tick();
@@ -405,7 +405,7 @@ describe("HerdrBridgeScheduler state machine", () => {
     await scheduler.tick();
     expect(h.pushes).toEqual([]);
     expect(scheduler.status().panes).toEqual([
-      { paneId: "w2B:p1", agent: "opencode", agentStatus: "working", tool: "opencode", identity: "dynacom", title: "OC | Parallel tasks: Bedrock limits, upgra…" },
+      { paneId: "w2B:p1", agent: "opencode", agentStatus: "working", tool: "opencode", identity: "workco", title: "OC | Parallel tasks: Bedrock limits, upgra…" },
     ]);
   });
 
@@ -416,7 +416,7 @@ describe("HerdrBridgeScheduler state machine", () => {
         config: { enabled: true, intervalS: 15, categories: ["session"], push: false },
         processInfo: async (paneId) => (paneId === "w2B:p1" ? ok(PROCESS_INFO_JSON) : failed("no process info")),
         readEnviron: async (pid) => (pid === 848316 ? MARKED_ENV : undefined),
-        fetchLimits: async () => [{ identity: { name: "dynacom" }, windows: [{ category: "session", usedPercent: 18 }] }],
+        fetchLimits: async () => [{ identity: { name: "workco" }, windows: [{ category: "session", usedPercent: 18 }] }],
       }),
     );
     await scheduler.tick();
@@ -434,7 +434,7 @@ describe("HerdrBridgeScheduler state machine", () => {
         probe: async () => ({ verdict }),
         processInfo: async (paneId) => (paneId === "w2B:p1" ? ok(PROCESS_INFO_JSON) : failed("no process info")),
         readEnviron: async (pid) => (pid === 848316 ? MARKED_ENV : undefined),
-        fetchLimits: async () => [{ identity: { name: "dynacom" }, windows: [{ category: "session", usedPercent: 18 }] }],
+        fetchLimits: async () => [{ identity: { name: "workco" }, windows: [{ category: "session", usedPercent: 18 }] }],
         push: async () => {
           pushCount += 1;
           return failed("server error: method not implemented yet", 2);

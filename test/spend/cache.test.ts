@@ -16,13 +16,13 @@ import type { AccountSpendState } from "../../src/spend/state.ts";
 function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
   return {
     accountId: "123456789012",
-    profile: "nazare-prod",
+    profile: "acme-prod",
     localEstimateUsd: 100,
     effectiveUsd: 100,
     breached: false,
     enforced: true,
     degraded: false,
-    identities: ["phoenix-court-group-bedrock"],
+    identities: ["acme-bedrock"],
     computedAt: "2026-09-10T10:00:00.000Z",
     ...overrides,
   };
@@ -41,7 +41,7 @@ function cache(overrides: Partial<SpendGuardCache> = {}): SpendGuardCache {
 describe("parseSpendGuardCache", () => {
   test("accepts a well-formed v1 cache", () => {
     const parsed = parseSpendGuardCache(JSON.stringify(cache()));
-    expect(parsed?.accounts["123456789012"]?.profile).toBe("nazare-prod");
+    expect(parsed?.accounts["123456789012"]?.profile).toBe("acme-prod");
   });
 
   test("tolerates corrupt JSON, wrong versions, and missing fields (no cache, not a crash)", () => {
@@ -113,7 +113,7 @@ describe("spendGuardCachePath", () => {
       expect(readFileSync(path, "utf8")).toContain("\"version\": 1");
       const nested = join(dir, "sub", "c.json");
       await writeSpendGuardCache(cache(), nested);
-      expect(readFileSync(nested, "utf8")).toContain("nazare-prod");
+      expect(readFileSync(nested, "utf8")).toContain("acme-prod");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
