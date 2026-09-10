@@ -92,9 +92,11 @@ impl Endpoint {
     }
 
     /// Endpoints refreshed by the manual refresh key on the given tab.
+    /// Tab 0's identity panel reads limits + usage, so `r` there refreshes
+    /// all four sources it renders.
     const fn for_tab(tab: usize) -> &'static [Self] {
         match tab {
-            0 => &[Self::Status, Self::Processes],
+            0 => &[Self::Status, Self::Processes, Self::Limits, Self::Usage],
             1 => &[Self::Identities],
             2 => &[Self::Limits],
             3 => &[Self::Usage],

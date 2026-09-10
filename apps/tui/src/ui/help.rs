@@ -34,6 +34,11 @@ pub fn render(f: &mut Frame<'_>, app: &App, area: Rect) {
     );
     info_line(
         &mut lines,
+        "Status page",
+        "per identity and provider: EST $ is tokscale's token-estimate cost over local history (never billed); REAL $ is provider-reported billed spend; LIMITS is the worst window; RESETS shows its reset (or a note like \"credits depleted\") plus any manual reset credits",
+    );
+    info_line(
+        &mut lines,
         "Scope note",
         "the TUI is a read-only view in v1: identity edits and auth fixes live in the web UI and the ais CLI",
     );
