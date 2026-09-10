@@ -284,27 +284,47 @@ function spanText(result: UsageResult): string {
   return first === last ? first : `${first} to ${last}`;
 }
 
-/** The real-cost sub-line under an AWS Bedrock row: REAL AWS-reported spend
- * (Cost Explorer month-to-date, budget context where available), never in
- * the Est. cost column and never labelled an estimate. An errored query
- * reads "unavailable": a missing real figure is not a zero. */
-function realCostLine(real: RealCostInfo): string {
+/** Upper bound for an in-cell error reason: a chatty Cost Explorer failure
+ * must not stretch the Notes column just to carry a diagnostic. */
+const MAX_REASON_CHARS = 60;
+
+function shortReason(error: string): string {
+  return error.length > MAX_REASON_CHARS ? `${error.slice(0, MAX_REASON_CHARS - 1)}…` : error;
+}
+
+/** The real-cost cell aligned under the Notes column (this table's real-spend
+ * slot, the same place kimi's overage rides): REAL AWS-reported spend plus
+ * the compact budget context, never in the Est. cost column. An errored
+ * query reads "unavailable": a missing real figure is not a zero. */
+function realCostValue(real: RealCostInfo): string {
   if (real.monthToDateUsd === undefined) {
-    return `└ ${real.label}: unavailable${real.error ? ` (${real.error})` : ""}`;
+    return `real unavailable${real.error ? `: ${shortReason(real.error)}` : ""}`;
   }
-  const parts: string[] = [];
+  let text = `real ${formatMoney(real.monthToDateUsd)}`;
   if (real.windowUsd !== undefined && Math.abs(real.windowUsd - real.monthToDateUsd) > 0.005) {
-    parts.push(`trailing 3 months ${formatMoney(real.windowUsd)}`);
+    text += ` · trailing 3mo ${formatMoney(real.windowUsd)}`;
   }
   if (real.budgetLimitUsd !== undefined) {
-    parts.push(
+    text +=
       real.budgetActualUsd !== undefined
-        ? `budget actual ${formatMoney(real.budgetActualUsd)} of ${formatMoney(real.budgetLimitUsd)}`
-        : `budget ${formatMoney(real.budgetLimitUsd)}`,
-    );
+        ? ` · budget ${formatMoney(real.budgetActualUsd)}/${formatMoney(real.budgetLimitUsd)}`
+        : ` · budget ${formatMoney(real.budgetLimitUsd)}`;
   }
-  if (real.note) parts.push(real.note);
-  return `└ ${real.label}: ${formatMoney(real.monthToDateUsd)}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`;
+  if (real.note) text += ` (${real.note})`;
+  return text;
+}
+
+/** The dimmed dashes filling a real-cost sub-row's numeric columns. */
+function RealSubDashCells() {
+  return (
+    <>
+      {Array.from({ length: 5 }, (_, i) => (
+        <TableCell key={i} className="border-none py-1 text-center text-xs text-muted-foreground">
+          ─
+        </TableCell>
+      ))}
+    </>
+  );
 }
 
 function NotesCell({ result }: { result: UsageResult }) {
@@ -563,12 +583,19 @@ export function UsagePage() {
                       <NotesCell result={r} />
                     </TableCell>
                   </TableRow>,
-                  // Real-cost sub-line: distinct element under the Bedrock
-                  // row, so real AWS spend never sits in an estimate column.
+                  // Real-cost sub-row: a genuine row in the same column grid
+                  // (label under Identity, dashes across the numeric columns),
+                  // with the real dollars ONLY in the Notes cell, so real AWS
+                  // spend never sits in the Est. cost column.
                   r.realCost ? (
                     <TableRow key={`${r.provider}/${r.identity.name}/${index}/real`} className="hover:bg-transparent">
-                      <TableCell colSpan={11} className="border-none py-1 pl-10 text-xs text-muted-foreground">
-                        {realCostLine(r.realCost)}
+                      <TableCell colSpan={2} className="border-none py-1" />
+                      <TableCell className="border-none py-1 text-xs text-muted-foreground">└ {r.realCost.label}</TableCell>
+                      <TableCell className="border-none py-1" />
+                      <RealSubDashCells />
+                      <TableCell className="border-none py-1" />
+                      <TableCell className="border-none py-1 text-right font-mono text-xs tabular-nums text-muted-foreground">
+                        {realCostValue(r.realCost)}
                       </TableCell>
                     </TableRow>
                   ) : null,
@@ -587,8 +614,13 @@ export function UsagePage() {
                 </TableRow>
                 {hasRealTotal ? (
                   <TableRow className="hover:bg-transparent">
-                    <TableCell colSpan={11} className="border-none py-1 pl-10 text-xs text-muted-foreground">
-                      └ real AWS total month-to-date: {formatMoney(realTotal)}
+                    <TableCell colSpan={2} className="border-none py-1" />
+                    <TableCell className="border-none py-1 text-xs text-muted-foreground">└ real AWS total</TableCell>
+                    <TableCell className="border-none py-1" />
+                    <RealSubDashCells />
+                    <TableCell className="border-none py-1" />
+                    <TableCell className="border-none py-1 text-right font-mono text-xs tabular-nums text-muted-foreground">
+                      real {formatMoney(realTotal)}
                     </TableCell>
                   </TableRow>
                 ) : null}

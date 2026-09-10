@@ -306,41 +306,54 @@ describe("real-cost sub-rows (AWS Bedrock)", () => {
     };
   }
 
-  test("the Bedrock row's EST. COST column carries the LOCAL estimate; real AWS spend renders as a dimmed sub-row underneath", () => {
+  /** Splits a bordered table line into its trimmed cells. */
+  function cells(line: string): string[] {
+    return line.split("│").slice(1, -1).map((c) => c.trim());
+  }
+
+  test("the real-cost sub-row is a genuine row in the column grid: label under IDENTITY, dashes in the count columns", () => {
     const output = formatUsageReport([bedrock()]);
-    const rowLine = output.split("\n").find((l) => l.includes("acme-bedrock"))!;
-    expect(rowLine).toContain("$2,218.66"); // local estimate in EST. COST
-    const subRowIndex = output.split("\n").findIndex((l) => l.includes("real AWS month-to-date"));
-    const rowIndex = output.split("\n").indexOf(rowLine);
-    expect(subRowIndex).toBe(rowIndex + 1); // directly underneath the provider row
-    expect(output.split("\n")[subRowIndex]).toContain("└ real AWS month-to-date: $0.00 (budget actual $0.00 of $1,000.00, reported lag)");
-    // The real figure never appears in the EST. COST column of the row itself.
-    expect(rowLine).not.toContain("real");
+    const lines = output.split("\n");
+    const rowIndex = lines.findIndex((l) => l.includes("acme-bedrock"));
+    const rowCells = cells(lines[rowIndex]!);
+    expect(rowCells[6]).toBe("$2,218.66"); // local estimate in EST. COST
+    const subCells = cells(lines[rowIndex + 1]!);
+    expect(subCells[0]).toBe(""); // PROVIDER stays empty
+    expect(subCells[1]).toBe("└ real AWS month-to-date"); // label indents under its identity
+    expect(subCells.slice(2, 6)).toEqual(["─", "─", "─", "─"]); // count columns carry dashes
+    // The real figure NEVER sits in an estimate column: EST. COST stays
+    // empty on the sub-row, the real dollars land in EXTRA COST.
+    expect(subCells[6]).toBe("");
+    expect(subCells[7]).toBe("real $0.00 · budget $0.00/$1,000.00 (reported lag)");
   });
 
-  test("a real figure trails the estimate columns, never replaces them", () => {
+  test("a real figure rides in the EXTRA COST cell, never the estimate columns", () => {
     const output = formatUsageReport([bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 19.75, budgetLimitUsd: 1000 } })]);
-    expect(output).toContain("└ real AWS month-to-date: $19.75 (budget $1,000.00)");
+    const subCells = cells(output.split("\n").find((l) => l.includes("real AWS month-to-date"))!);
+    expect(subCells[6]).toBe("");
+    expect(subCells[7]).toBe("real $19.75 · budget $1,000.00");
     const rowLine = output.split("\n").find((l) => l.includes("acme-bedrock"))!;
     expect(rowLine).toContain("$2,218.66");
   });
 
-  test("an errored Cost Explorer query renders 'unavailable', not a fabricated zero", () => {
+  test("an errored Cost Explorer query renders 'unavailable' in the EXTRA COST cell, not a fabricated zero", () => {
     const output = formatUsageReport([
       bedrock({ realCost: { label: "real AWS month-to-date", error: "AWS SSO credentials expired: run `aws sso login`" } }),
     ]);
-    expect(output).toContain("real AWS month-to-date: unavailable (AWS SSO credentials expired: run `aws sso login`)");
+    const subCells = cells(output.split("\n").find((l) => l.includes("real AWS month-to-date"))!);
+    expect(subCells[6]).toBe("");
+    expect(subCells[7]).toBe("real unavailable: AWS SSO credentials expired: run `aws sso login`");
   });
 
-  test("a chatty sub-row is clipped to the table width instead of widening the table", () => {
+  test("a chatty error reason is truncated inside its cell instead of widening the whole table", () => {
     const output = formatUsageReport([
-      bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 0, error: "x".repeat(400) } }),
+      // monthToDateUsd is absent exactly when the query failed (see RealCostInfo).
+      bedrock({ realCost: { label: "real AWS month-to-date", error: "x".repeat(400) } }),
     ]);
-    const lines = output.split("\n");
-    const topBorder = lines.find((l) => l.startsWith("┌"))!;
-    for (const l of lines.filter((l) => l.includes("real AWS month-to-date"))) {
-      expect(l.length).toBe(topBorder.length);
-    }
+    const subCells = cells(output.split("\n").find((l) => l.includes("real AWS month-to-date"))!);
+    expect(subCells[7]!.startsWith("real unavailable: ")).toBe(true);
+    expect(subCells[7]!.endsWith("…")).toBe(true);
+    expect(subCells[7]!.length).toBeLessThan(100);
   });
 
   test("sub-rows sit inside the table's outer borders and never perturb the column layout of other rows", () => {
@@ -353,19 +366,25 @@ describe("real-cost sub-rows (AWS Bedrock)", () => {
     for (const l of lines.filter((l) => l.startsWith("│"))) expect(l.length).toBe(topBorder.length);
   });
 
-  test("trailing real-spend total line sums the answered Cost Explorer figures beneath TOTAL", () => {
+  test("trailing real-spend total renders as a column-aligned row beneath TOTAL", () => {
     const output = formatUsageReport([
       bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 12.5 } }),
       bedrock({ identity: identity("acme-bedrock-dev"), realCost: { label: "real AWS month-to-date", monthToDateUsd: 0.25 } }),
       success("claude", "identity-a"),
     ]);
-    const totalLine = output.split("\n").findIndex((l) => l.includes("TOTAL"));
-    const realTotalIndex = output.split("\n").findIndex((l) => l.includes("real AWS total month-to-date"));
-    expect(realTotalIndex).toBe(totalLine + 1);
-    expect(output.split("\n")[realTotalIndex]).toContain("$12.75");
+    const lines = output.split("\n");
+    const totalIndex = lines.findIndex((l) => l.includes("TOTAL"));
+    const realTotalIndex = lines.findIndex((l) => l.includes("real AWS total"));
+    expect(realTotalIndex).toBe(totalIndex + 1); // directly beneath TOTAL
+    const realCells = cells(lines[realTotalIndex]!);
+    expect(realCells[0]).toBe("");
+    expect(realCells[1]).toBe("└ real AWS total");
+    expect(realCells.slice(2, 6)).toEqual(["─", "─", "─", "─"]);
+    expect(realCells[6]).toBe(""); // never in EST. COST
+    expect(realCells[7]).toBe("real $12.75");
   });
 
-  test("no real total line when no Cost Explorer query answered (an unavailable figure is not a zero)", () => {
+  test("no real total row when no Cost Explorer query answered (an unavailable figure is not a zero)", () => {
     const output = formatUsageReport([
       bedrock({ realCost: { label: "real AWS month-to-date", error: "throttled" } }),
       bedrock({ identity: identity("acme-bedrock-dev"), realCost: { label: "real AWS month-to-date", error: "throttled" } }),

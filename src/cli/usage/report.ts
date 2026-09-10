@@ -66,39 +66,51 @@ function pendingRow(result: UsageResult, spinnerFrame: string): string[] {
   return [usageProviderLabel(result.provider), result.identity.name, "—", "—", "—", "—", `${spinnerFrame} loading…`, "—"];
 }
 
-/** The dimmed detail line rendered UNDER an AWS Bedrock provider row: the
- * REAL AWS-reported spend (Cost Explorer month-to-date, plus the budget's
- * limit/actual where available), deliberately OUTSIDE the EST. COST column
- * (an estimate column must never carry real spend, nor vice versa). An
- * errored query renders "unavailable" with its reason: a missing real
- * figure is not a zero. */
-function realCostSubRowText(real: RealCostInfo): string {
-  if (real.monthToDateUsd === undefined) {
-    return `└ ${REAL_COST_LABEL}: unavailable${real.error ? ` (${real.error})` : ""}`;
-  }
-  const parts: string[] = [];
-  if (real.windowUsd !== undefined && Math.abs(real.windowUsd - real.monthToDateUsd) > 0.005) {
-    parts.push(`trailing 3 months ${formatCost(real.windowUsd)}`);
-  }
-  if (real.budgetLimitUsd !== undefined) {
-    parts.push(
-      real.budgetActualUsd !== undefined
-        ? `budget actual ${formatCost(real.budgetActualUsd)} of ${formatCost(real.budgetLimitUsd)}`
-        : `budget ${formatCost(real.budgetLimitUsd)}`,
-    );
-  }
-  if (real.note) parts.push(real.note);
-  return `└ ${REAL_COST_LABEL}: ${formatCost(real.monthToDateUsd)}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`;
+/** Upper bound for an in-cell error reason: a chatty Cost Explorer failure
+ * (multi-line AWS SDK errors) must not widen the EXTRA COST column out to
+ * table-breaking widths just to carry a diagnostic. */
+const MAX_REASON_CHARS = 60;
+
+function shortReason(error: string): string {
+  return error.length > MAX_REASON_CHARS ? `${error.slice(0, MAX_REASON_CHARS - 1)}…` : error;
 }
 
-/** A full-table-width detail line (the real-cost sub-rows and the trailing
- * real-spend total): one spanning cell between the outer borders, clipped
- * with an ellipsis when longer than the width the columns above already
- * sized: a chatty error note must never widen the whole table. */
-function spanRow(text: string, tableWidth: number): string {
-  const interior = Math.max(1, tableWidth - 4);
-  const clipped = text.length > interior ? `${text.slice(0, interior - 1)}…` : text;
-  return `│ ${clipped.padEnd(interior)} │`;
+/** The EXTRA COST cell of a real-cost sub-row: the real billed dollars plus
+ * the compact budget context. An errored query renders "unavailable" with
+ * its (truncated) reason: a missing real figure is not a zero. */
+function realCostExtraCell(real: RealCostInfo): string {
+  if (real.monthToDateUsd === undefined) {
+    return `real unavailable${real.error ? `: ${shortReason(real.error)}` : ""}`;
+  }
+  let text = `real ${formatCost(real.monthToDateUsd)}`;
+  if (real.windowUsd !== undefined && Math.abs(real.windowUsd - real.monthToDateUsd) > 0.005) {
+    text += ` · trailing 3mo ${formatCost(real.windowUsd)}`;
+  }
+  if (real.budgetLimitUsd !== undefined) {
+    text +=
+      real.budgetActualUsd !== undefined
+        ? ` · budget ${formatCost(real.budgetActualUsd)}/${formatCost(real.budgetLimitUsd)}`
+        : ` · budget ${formatCost(real.budgetLimitUsd)}`;
+  }
+  if (real.note) text += ` (${real.note})`;
+  return text;
+}
+
+const REAL_SUB_DASHES = ["─", "─", "─", "─"];
+
+/** The column-aligned sub-row rendered UNDER an AWS Bedrock provider row: a
+ * genuine table row in the same column grid, not a freeform spanning line.
+ * The label indents under its identity, the count columns carry dashes, and
+ * the REAL AWS-reported spend lives ONLY in the EXTRA COST cell (an
+ * estimate column must never carry real spend, nor vice versa). */
+function realCostSubRowCells(real: RealCostInfo): string[] {
+  return ["", `└ ${REAL_COST_LABEL}`, ...REAL_SUB_DASHES, "", realCostExtraCell(real)];
+}
+
+/** The trailing real-spend total as the same column shape, beneath TOTAL:
+ * it sums only the rows whose Cost Explorer query actually answered. */
+function realCostTotalCells(realTotal: number): string[] {
+  return ["", "└ real AWS total", ...REAL_SUB_DASHES, "", `real ${formatCost(realTotal)}`];
 }
 
 interface Totals {
@@ -244,7 +256,7 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
   const total = successes.length > 1 && totals ? totalRow(totals) : undefined;
   // Real (AWS-reported) spend is summarised separately from the estimate
   // totals: the TOTAL row's EST. COST stays a sum of local estimates, and
-  // the real figure gets its own trailing line only from rows whose Cost
+  // the real figure gets its own trailing row only from rows whose Cost
   // Explorer query actually answered (an unavailable figure must not read
   // as a confirmed zero).
   const realTotal = successes.reduce((sum, r) => (typeof r.realCost?.monthToDateUsd === "number" ? sum + r.realCost.monthToDateUsd : sum), 0);
@@ -252,7 +264,19 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
   const span = totals ? combinedDateSpan(results) : undefined;
   const avgs = totals && span ? avgRows(totals, span) : [];
 
-  const widthRows = [...rows, ...(total ? [total] : []), ...avgs];
+  // Sub-rows are genuine rows in the same column grid, so their cells join
+  // the width computation: a long budget/error cell widens EXTRA COST for
+  // the whole table instead of spilling across other columns.
+  const subRows = tableResults.map((r) => (r.report && r.realCost ? realCostSubRowCells(r.realCost) : undefined));
+  const realTotalRow = hasRealTotal ? realCostTotalCells(realTotal) : undefined;
+
+  const widthRows = [
+    ...rows,
+    ...subRows.filter((s) => s !== undefined),
+    ...(realTotalRow ? [realTotalRow] : []),
+    ...(total ? [total] : []),
+    ...avgs,
+  ];
   const widths = HEADERS.map((h, i) => Math.max(h.length, ...widthRows.map((row) => row[i]!.length)));
   const tableWidth = borderRow(widths, "┌", "┬", "┐").length;
 
@@ -282,12 +306,12 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
           ? yellow(padRow(row, widths, NUMERIC_COLUMNS))
           : padRow(row, widths, NUMERIC_COLUMNS),
     );
-    if (r.report && r.realCost) lines.push(dim(spanRow(realCostSubRowText(r.realCost), tableWidth)));
+    if (r.report && r.realCost) lines.push(dim(padRow(subRows[i]!, widths, NUMERIC_COLUMNS)));
   });
   if (total) {
     lines.push(borderRow(widths, "├", "┼", "┤"));
     lines.push(gray(padRow(total, widths, NUMERIC_COLUMNS)));
-    if (hasRealTotal) lines.push(dim(spanRow(`└ real AWS total month-to-date: ${formatCost(realTotal)}`, tableWidth)));
+    if (realTotalRow) lines.push(dim(padRow(realTotalRow, widths, NUMERIC_COLUMNS)));
   }
   if (avgs.length > 0) {
     lines.push(borderRow(widths, "├", "┼", "┤"));
