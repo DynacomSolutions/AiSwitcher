@@ -155,6 +155,15 @@ describe("provider-first usage results", () => {
     expect(merged[0]?.report?.totalInput).toBe(150);
   });
 
+  test("merging two rows' real AWS figures keeps one account-level figure rather than double-counting it", () => {
+    const results: UsageResult[] = [
+      { provider: "aws-bedrock", identity: usageIdentity, report: report([entry("aws-bedrock")]), realCost: { label: "real AWS month-to-date", monthToDateUsd: 4.2 } },
+      { provider: "aws-bedrock", identity: usageIdentity, report: report([entry("aws-bedrock")]), realCost: { label: "real AWS month-to-date", monthToDateUsd: 4.2 } },
+    ];
+    const merged = aggregateUsageResults(results);
+    expect(merged[0]?.realCost?.monthToDateUsd).toBe(4.2);
+  });
+
   test("does not double-count Pi CLI adapters when their native history is present", () => {
     const native: UsageResult = {
       provider: "openai",

@@ -1,4 +1,4 @@
-import { resetDateForTimeUnit } from "../cli/limits/aws-bedrock-limits.ts";
+import { resetDateForTimeUnit, type BudgetWire } from "../cli/limits/aws-bedrock-limits.ts";
 
 /**
  * Pure per-account spend state for the spend guard — the unit-testable core
@@ -114,6 +114,31 @@ export function periodStartForTimeUnit(timeUnit: string | undefined, now: Date):
 export function chooseBudget(budgets: BudgetSnapshot[]): BudgetSnapshot | undefined {
   if (budgets.length === 0) return undefined;
   return [...budgets].sort((a, b) => b.limitUsd - a.limitUsd || a.name.localeCompare(b.name))[0];
+}
+
+/** Pure mapping from the wire budgets to the snapshots the state core
+ * consumes: COST budgets only (a USAGE budget's "limit" is not dollars),
+ * skip unparseable limits, actual spend defaults to 0 (AWS leaves
+ * CalculatedSpend absent until it has computed something). Exported for
+ * tests, and shared with the usage fetcher's real-cost context (which picks
+ * the same budget the guard enforces on). */
+export function budgetSnapshotsFromWires(budgets: BudgetWire[]): BudgetSnapshot[] {
+  const snapshots: BudgetSnapshot[] = [];
+  for (const budget of budgets) {
+    if (budget.BudgetType !== "COST") continue;
+    const name = budget.BudgetName;
+    const limit = budget.BudgetLimit?.Amount !== undefined ? Number(budget.BudgetLimit.Amount) : undefined;
+    if (!name || limit === undefined || !Number.isFinite(limit)) continue;
+    const actualRaw = budget.CalculatedSpend?.ActualSpend?.Amount;
+    const actual = actualRaw !== undefined ? Number(actualRaw) : 0;
+    snapshots.push({
+      name,
+      limitUsd: limit,
+      actualUsd: Number.isFinite(actual) ? actual : 0,
+      ...(budget.TimeUnit ? { timeUnit: budget.TimeUnit } : {}),
+    });
+  }
+  return snapshots;
 }
 
 /** Pure mapping from this cycle's inputs to the enforceable state. See the

@@ -295,6 +295,90 @@ describe("formatUsageReport", () => {
   });
 });
 
+describe("real-cost sub-rows (AWS Bedrock)", () => {
+  function bedrock(overrides: Partial<UsageResult> = {}): UsageResult {
+    return {
+      provider: "aws-bedrock",
+      identity: identity("pcg-bedrock"),
+      report: { entries: [], totalInput: 1000, totalOutput: 500, totalCacheRead: 2000, totalCacheWrite: 100, totalMessages: 42, totalCost: 2218.66 },
+      realCost: { label: "real AWS month-to-date", monthToDateUsd: 0, budgetActualUsd: 0, budgetLimitUsd: 1000, note: "reported lag" },
+      ...overrides,
+    };
+  }
+
+  test("the Bedrock row's EST. COST column carries the LOCAL estimate; real AWS spend renders as a dimmed sub-row underneath", () => {
+    const output = formatUsageReport([bedrock()]);
+    const rowLine = output.split("\n").find((l) => l.includes("pcg-bedrock"))!;
+    expect(rowLine).toContain("$2,218.66"); // local estimate in EST. COST
+    const subRowIndex = output.split("\n").findIndex((l) => l.includes("real AWS month-to-date"));
+    const rowIndex = output.split("\n").indexOf(rowLine);
+    expect(subRowIndex).toBe(rowIndex + 1); // directly underneath the provider row
+    expect(output.split("\n")[subRowIndex]).toContain("└ real AWS month-to-date: $0.00 (budget actual $0.00 of $1,000.00, reported lag)");
+    // The real figure never appears in the EST. COST column of the row itself.
+    expect(rowLine).not.toContain("real");
+  });
+
+  test("a real figure trails the estimate columns, never replaces them", () => {
+    const output = formatUsageReport([bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 19.75, budgetLimitUsd: 1000 } })]);
+    expect(output).toContain("└ real AWS month-to-date: $19.75 (budget $1,000.00)");
+    const rowLine = output.split("\n").find((l) => l.includes("pcg-bedrock"))!;
+    expect(rowLine).toContain("$2,218.66");
+  });
+
+  test("an errored Cost Explorer query renders 'unavailable', not a fabricated zero", () => {
+    const output = formatUsageReport([
+      bedrock({ realCost: { label: "real AWS month-to-date", error: "AWS SSO credentials expired: run `aws sso login`" } }),
+    ]);
+    expect(output).toContain("real AWS month-to-date: unavailable (AWS SSO credentials expired: run `aws sso login`)");
+  });
+
+  test("a chatty sub-row is clipped to the table width instead of widening the table", () => {
+    const output = formatUsageReport([
+      bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 0, error: "x".repeat(400) } }),
+    ]);
+    const lines = output.split("\n");
+    const topBorder = lines.find((l) => l.startsWith("┌"))!;
+    for (const l of lines.filter((l) => l.includes("real AWS month-to-date"))) {
+      expect(l.length).toBe(topBorder.length);
+    }
+  });
+
+  test("sub-rows sit inside the table's outer borders and never perturb the column layout of other rows", () => {
+    const output = formatUsageReport([success("claude", "identity-a"), bedrock()]);
+    const lines = output.split("\n");
+    const subRow = lines.find((l) => l.includes("real AWS month-to-date"))!;
+    expect(subRow.startsWith("│")).toBe(true);
+    expect(subRow.trimEnd().endsWith("│")).toBe(true);
+    const topBorder = lines.find((l) => l.startsWith("┌"))!;
+    for (const l of lines.filter((l) => l.startsWith("│"))) expect(l.length).toBe(topBorder.length);
+  });
+
+  test("trailing real-spend total line sums the answered Cost Explorer figures beneath TOTAL", () => {
+    const output = formatUsageReport([
+      bedrock({ realCost: { label: "real AWS month-to-date", monthToDateUsd: 12.5 } }),
+      bedrock({ identity: identity("pcg-bedrock-dev"), realCost: { label: "real AWS month-to-date", monthToDateUsd: 0.25 } }),
+      success("claude", "identity-a"),
+    ]);
+    const totalLine = output.split("\n").findIndex((l) => l.includes("TOTAL"));
+    const realTotalIndex = output.split("\n").findIndex((l) => l.includes("real AWS total month-to-date"));
+    expect(realTotalIndex).toBe(totalLine + 1);
+    expect(output.split("\n")[realTotalIndex]).toContain("$12.75");
+  });
+
+  test("no real total line when no Cost Explorer query answered (an unavailable figure is not a zero)", () => {
+    const output = formatUsageReport([
+      bedrock({ realCost: { label: "real AWS month-to-date", error: "throttled" } }),
+      bedrock({ identity: identity("pcg-bedrock-dev"), realCost: { label: "real AWS month-to-date", error: "throttled" } }),
+    ]);
+    expect(output).not.toContain("real AWS total");
+  });
+
+  test("non-Bedrock providers render no sub-row", () => {
+    const output = formatUsageReport([success("claude", "identity-a")]);
+    expect(output).not.toContain("real AWS");
+  });
+});
+
 describe("source-only errors (multi-provider source failures)", () => {
   test("never render a table row and are labelled by SOURCE in the Errors footer", () => {
     // A pi reader failure has no honest provider to name; fabricating an

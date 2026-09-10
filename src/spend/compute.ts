@@ -5,7 +5,7 @@ import {
 } from "../cli/limits/aws-bedrock-limits.ts";
 import { defaultCostExplorerApi, sumCostExplorerBuckets, type CostExplorerApi } from "../cli/usage/aws-bedrock-usage.ts";
 import type { AwsProfileDeps } from "../identities/aws-profile.ts";
-import { periodStartForTimeUnit, chooseBudget, computeAccountState, type AccountSpendState, type BudgetSnapshot } from "./state.ts";
+import { periodStartForTimeUnit, chooseBudget, budgetSnapshotsFromWires, computeAccountState, type AccountSpendState } from "./state.ts";
 import { resolveGuardAccounts, type GuardAccount } from "./accounts.ts";
 import { estimateIdentityLocalSpend } from "../shared/local-spend.ts";
 
@@ -40,29 +40,10 @@ export interface SpendCycleDeps {
   localEstimate?: typeof estimateIdentityLocalSpend;
 }
 
-/** Pure mapping from the wire budgets to the snapshots the state core
- * consumes: COST budgets only (a USAGE budget's "limit" is not dollars),
- * skip unparseable limits, actual spend defaults to 0 (AWS leaves
- * CalculatedSpend absent until it has computed something). Exported for
- * tests. */
-export function budgetSnapshotsFromWires(budgets: BudgetWire[]): BudgetSnapshot[] {
-  const snapshots: BudgetSnapshot[] = [];
-  for (const budget of budgets) {
-    if (budget.BudgetType !== "COST") continue;
-    const name = budget.BudgetName;
-    const limit = budget.BudgetLimit?.Amount !== undefined ? Number(budget.BudgetLimit.Amount) : undefined;
-    if (!name || limit === undefined || !Number.isFinite(limit)) continue;
-    const actualRaw = budget.CalculatedSpend?.ActualSpend?.Amount;
-    const actual = actualRaw !== undefined ? Number(actualRaw) : 0;
-    snapshots.push({
-      name,
-      limitUsd: limit,
-      actualUsd: Number.isFinite(actual) ? actual : 0,
-      ...(budget.TimeUnit ? { timeUnit: budget.TimeUnit } : {}),
-    });
-  }
-  return snapshots;
-}
+// The wire->snapshot mapping lives with the rest of the pure state core
+// (state.ts) so the usage fetcher's real-cost context can reuse it without
+// importing this module (which would cycle back into usage/aws-bedrock-usage.ts).
+export { budgetSnapshotsFromWires };
 
 function isoDay(date: Date): string {
   return date.toISOString().slice(0, 10);
