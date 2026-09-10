@@ -2,6 +2,7 @@ import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
+import { probeAliDoctor } from "./ali-doctor.ts";
 import { probeClaudeDoctor } from "./claude-doctor.ts";
 import { probeCodexDoctor } from "./codex-doctor.ts";
 import { probeGrokDoctor } from "./grok-doctor.ts";
@@ -18,6 +19,7 @@ export interface DoctorTarget {
 // "unavailable" for any tool with no entry here instead of assuming
 // exhaustive coverage.
 const PROBES: Partial<Record<ToolConfig["toolName"], (identity: Identity) => Promise<DoctorResult>>> = {
+  ali: probeAliDoctor,
   claude: probeClaudeDoctor,
   codex: probeCodexDoctor,
   grok: probeGrokDoctor,

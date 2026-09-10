@@ -10,10 +10,13 @@ function identityCount(n: number, section: "tools" | "accounts" = "tools"): stri
 }
 
 function statusLabel(status: DoctorStatus, statusWord: string | undefined): string {
-  const word = statusWord ?? (status === "responsive" ? "responsive" : status === "hung" ? "hung" : "unavailable");
+  const word =
+    statusWord ??
+    (status === "responsive" ? "responsive" : status === "hung" ? "hung" : status === "degraded" ? "degraded" : "unavailable");
   if (status === "responsive") return green(`✔ ${word}`);
-  if (status === "hung") return red(`✖ ${word}`);
+  if (status === "hung" || status === "degraded") return red(`✖ ${word}`);
   return yellow(`○ ${word}`);
+}
 }
 
 function formatElapsed(ms: number | undefined): string {
@@ -62,6 +65,18 @@ export function formatDoctorReport(results: DoctorResult[]): string {
       dim(
         `Hung: ${names} — check for orphaned/still-running agents under ` +
           `${hung.length === 1 ? "that identity" : "those identities"} before assuming a billing or provider-side issue.`,
+      ),
+    );
+  }
+
+  const degraded = results.filter((r) => r.status === "degraded");
+  if (degraded.length > 0) {
+    lines.push("");
+    const names = degraded.map((r) => `${r.toolName}/${r.identity.name}`).join(", ");
+    lines.push(
+      dim(
+        `Degraded: ${names}: the credential pipeline is failing on record; ` +
+          `see each row's detail (and 'ais limits --tool=<tool>') for the precise error and remediation.`,
       ),
     );
   }

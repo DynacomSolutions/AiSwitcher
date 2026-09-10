@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { windowsFromAliUsage, type AliUsageWire } from "../../../src/cli/limits/ali-limits.ts";
+import { aliExpiredMessage, windowsFromAliUsage, type AliUsageWire } from "../../../src/cli/limits/ali-limits.ts";
+import type { RefreshFailureSummary } from "../../../src/server/auth-refresh.ts";
 
 /** Same formatting the adapter itself applies, recomputed here so the
  * assertions pin the epoch-ms->display-string mapping without hardcoding
@@ -50,5 +51,26 @@ describe("windowsFromAliUsage", () => {
 
   test("an empty payload yields no windows", () => {
     expect(windowsFromAliUsage({})).toEqual([]);
+  });
+});
+
+describe("aliExpiredMessage", () => {
+  test("without a failure record, the classic self-serve message stands alone", () => {
+    expect(aliExpiredMessage(undefined)).toBe(
+      "console session expired — replace console-cookie.txt with a fresh Alibaba Cloud console Cookie header",
+    );
+  });
+
+  test("with a failed refresh on record, the message says when and why the automation is not saving you", () => {
+    const failure: RefreshFailureSummary = {
+      lastAttemptAt: "2026-09-10T01:38:14.927Z",
+      lastError:
+        "the auth browser for \"personal\" is not signed in to the Alibaba console (no login-ticket cookie after opening the console page)",
+      consecutiveFailures: 41,
+    };
+    const message = aliExpiredMessage(failure);
+    expect(message).toContain("console session expired");
+    expect(message).toContain("(last refresh attempt 2026-09-10T01:38:14.927Z:");
+    expect(message).toContain("no login-ticket cookie");
   });
 });

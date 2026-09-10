@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { expandPath } from "../../identities/match.ts";
+import { lastRefreshFailure, type RefreshFailureSummary } from "../../server/auth-refresh.ts";
 import { fetchWithRetry } from "./http.ts";
 import type { LimitCategory, LimitWindow, FetchedLimitResult } from "./types.ts";
 
@@ -122,6 +123,17 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Expired-cookie messages include WHY the automated renewal is not saving
+ * you, straight from the refresh state file (timestamps + error text only,
+ * never cookie values). Without this the bare "console session expired" hid
+ * a five-day-dead harvester behind a message that read like ordinary cookie
+ * ageing (observed live 2026-09-05..10). Exported for tests. */
+export function aliExpiredMessage(failure?: RefreshFailureSummary): string {
+  const base = "console session expired — replace console-cookie.txt with a fresh Alibaba Cloud console Cookie header";
+  if (!failure) return base;
+  return `${base} (last refresh attempt ${failure.lastAttemptAt}: ${failure.lastError})`;
+}
+
 function unavailable(base: Pick<FetchedLimitResult, "toolName" | "identity">, error: string): FetchedLimitResult {
   return { ...base, windows: [], status: "unavailable", error };
 }
@@ -210,15 +222,17 @@ export async function fetchAliLimits(identity: Identity): Promise<FetchedLimitRe
 
   const cookie = await readConsoleCookie(identity.configDir);
   if (!cookie) {
+    const failure = await lastRefreshFailure("ali", identity.name);
     return unavailable(
       base,
-      `not authenticated — put a valid Alibaba Cloud console Cookie header in ${join(expandPath(identity.configDir), COOKIE_FILE)}`,
+      `not authenticated — put a valid Alibaba Cloud console Cookie header in ${join(expandPath(identity.configDir), COOKIE_FILE)}` +
+        (failure ? ` (last refresh attempt ${failure.lastAttemptAt}: ${failure.lastError})` : ""),
     );
   }
 
   const gateway = await requestAliGateway(cookie);
   if (gateway.kind === "expired") {
-    return unavailable(base, "console session expired — replace console-cookie.txt with a fresh Alibaba Cloud console Cookie header");
+    return unavailable(base, aliExpiredMessage(await lastRefreshFailure("ali", identity.name)));
   }
   if (gateway.kind === "error") return unavailable(base, gateway.message);
 
