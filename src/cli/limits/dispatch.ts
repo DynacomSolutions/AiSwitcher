@@ -4,6 +4,8 @@ import { spinnerChar, withLiveRender } from "../live.ts";
 import { aggregateLimitResults, collectLimitTargets, fetchLimitResults, pendingLimitResult, runLimitsQuery } from "./collect.ts";
 import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { formatLimitsReport } from "./report.ts";
+import { annotateWithSpendGuard } from "../../spend/annotate.ts";
+import { loadSpendGuardCache } from "../../spend/cache.ts";
 import type { ToolLimitResult } from "./types.ts";
 import { runWatch } from "./watch.ts";
 
@@ -55,6 +57,10 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
   // suite — see live.ts's own note on why the TTY check lives in callers.
   if (!json && process.stdout.isTTY) {
     const targets = await collectLimitTargets(identityFilter, flags);
+    // Spend-guard notes come from the shared cache, loaded once up front so
+    // every live frame annotates without re-reading the file.
+    const spendCache = await loadSpendGuardCache();
+    const annotate = (results: ToolLimitResult[]): ToolLimitResult[] => annotateWithSpendGuard(results, spendCache);
     // One slot per target: 1:1 tools seed a pending row so the live render
     // has a spinner to show, multi-provider clients seed NOTHING (their
     // provider isn't known until the adapter reads the identity's auth
@@ -68,9 +74,9 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
       return pending ? [pending] : [];
     });
     await withLiveRender(
-      (tick) => formatLimitsReport(aggregateLimitResults(slots.flat()), new Date(), spinnerChar(tick)),
+      (tick) => formatLimitsReport(aggregateLimitResults(annotate(slots.flat())), new Date(), spinnerChar(tick)),
       async () => {
-        await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => (slots[i] = resolved));
+        await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => (slots[i] = annotate(resolved)));
       },
     );
     return;
