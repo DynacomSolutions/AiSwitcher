@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
 
@@ -100,5 +100,55 @@ describe("console files endpoints", () => {
     const result = await readTextFile("id:claude:test", "blob.bin", configs);
     expect(result.binary).toBe(true);
     expect(result.content).toBe("");
+  });
+
+  test("expandTilde maps the ~ display prefix onto the real home", async () => {
+    const { expandTilde } = await import("../../src/server/files.ts");
+    expect(expandTilde(undefined)).toBe(".");
+    expect(expandTilde("")).toBe(".");
+    expect(expandTilde("~")).toBe(homedir());
+    expect(expandTilde("~/skills")).toBe(join(homedir(), "skills"));
+    expect(expandTilde("~name")).toBe("~name");
+    expect(expandTilde("skills")).toBe("skills");
+  });
+
+  test("a ~ path that escapes the root is still rejected after expansion", async () => {
+    const { dir, configs } = await makeSeeded();
+    // Exists deliberately: under the old non-expanding resolve, "~/../skills"
+    // collapsed onto the root itself and would have read this file.
+    await mkdir(join(dir, "skills"), { recursive: true });
+    await writeFile(join(dir, "skills", "demo.md"), "# demo");
+    const { readTextFile } = await import("../../src/server/files.ts");
+    await expect(readTextFile("id:claude:test", "~/../../something", configs)).rejects.toThrow(/escapes/);
+    await expect(readTextFile("id:claude:test", "~/../skills/demo.md", configs)).rejects.toThrow(/escapes/);
+  });
+
+  test("treats a ~ name without a slash as a literal file", async () => {
+    const { dir, configs } = await makeSeeded();
+    await writeFile(join(dir, "~literal"), "tilde name");
+    const { readTextFile } = await import("../../src/server/files.ts");
+    const result = await readTextFile("id:claude:test", "~literal", configs);
+    expect(result.content).toBe("tilde name");
+  });
+
+  /** Bun caches os.homedir() from process start, so the "~"-display contract
+   * (listRoots()/tree() emit "~/..." paths that must resolve back) can only
+   * be exercised end-to-end in a subprocess booted with HOME pointed at a
+   * temp dir. See files-home.fixture.ts. */
+  test("serves the reported ~/.ais flow end-to-end under a fake home", async () => {
+    const home = await makeRoot();
+    const fixture = new URL("./files-home.fixture.ts", import.meta.url).pathname;
+    const proc = Bun.spawn([process.execPath, fixture], {
+      env: { ...process.env, HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (code !== 0) throw new Error(`home fixture failed (${code}):\n${stderr}`);
+    expect(stdout.trim()).toBe("fixture-ok");
   });
 });

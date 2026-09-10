@@ -80,16 +80,29 @@ async function requireRoot(rootId: string, configs: ToolConfig[]): Promise<RootD
   return root;
 }
 
+/** The WebUI addresses files in the "~"-display form that listRoots() and
+ * tree() emit (e.g. "~/.ais"), so a leading "~" (bare or "~/...") expands to
+ * the real home BEFORE resolve() -- otherwise it becomes a literal "~"
+ * directory under the root (the ENOENT <root>/~/.ais bug). "~name" is not
+ * expanded: no other-user lookup, it stays a literal name inside the root.
+ * A path without "~" stays relative to the chosen root -- deliberately NOT
+ * expandPath(): that helper resolves bare relative paths against
+ * process.cwd() (registry-storage semantics). Containment in safeResolve is
+ * re-checked on the expanded path. */
+export function expandTilde(relPath: string | undefined): string {
+  if (relPath === undefined || relPath === "") return ".";
+  if (relPath === "~") return homedir();
+  if (relPath.startsWith("~/")) return join(homedir(), relPath.slice(2));
+  return relPath;
+}
+
 /** The core traversal guard. Returns the absolute real path of `relPath`
  * inside `root`, or throws. Two checks on purpose: the lexical resolution
  * catches ../ walks before touching disk; the realpath check catches a
  * symlink INSIDE the tree pointing OUTSIDE it. */
 async function safeResolve(base: string, relPath: string | undefined): Promise<{ abs: string; real: string }> {
   const rootReal = await realpath(base);
-  // Deliberately NOT expandPath(): that helper resolves bare relative paths
-  // against process.cwd() (registry-storage semantics). Here a relative path
-  // always means "relative to the chosen root".
-  const abs = resolve(rootReal, relPath === undefined || relPath === "" ? "." : relPath);
+  const abs = resolve(rootReal, expandTilde(relPath));
   if (relative(rootReal, abs).startsWith("..")) {
     throw new HttpError(403, "path escapes the whitelisted root");
   }

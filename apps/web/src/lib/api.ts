@@ -153,10 +153,10 @@ export const api = {
   getFileRoots: () => request<{ roots: FileRoot[] }>("/api/files/roots"),
   getFileTree: (root: string, path?: string) =>
     request<FileTreeResponse>(withParams("/api/files/tree", { root, path })),
-  getFileContent: (path: string) =>
-    request<FileContentResponse>(withParams("/api/files/file", { path })),
-  saveFile: (path: string, content: string) =>
-    request<unknown>("/api/files/file", { method: "PUT", body: { path, content } }),
+  getFileContent: (root: string, path: string) =>
+    request<FileContentResponse>(withParams("/api/files/file", { root, path })),
+  saveFile: (root: string, path: string, content: string) =>
+    request<unknown>("/api/files/file", { method: "PUT", body: { root, path, content } }),
   runBackup: () => request<{ summary?: string }>("/api/files/backup", { method: "POST" }),
 };
 

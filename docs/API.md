@@ -362,10 +362,17 @@ Traversal guard: resolved realpath must stay inside a whitelisted root;
 symlink escapes rejected; junk dirs (`node_modules`, `.git`, caches...) are
 skipped in listings; text files up to 2 MB.
 
+Path convention: `GET /api/files/roots` and `GET /api/files/tree` return
+paths in `~`-display form (e.g. `~/.ais`), and clients send them back
+verbatim. A leading `~` (bare or `~/...`) expands to the real home before
+the containment check, so `~` paths that land outside the chosen root are
+still rejected; `~name` is treated as a literal file name. Paths without
+`~` are relative to the chosen root.
+
 | Route | Notes |
 |---|---|
 | `GET /api/files/roots` | root list with existence + label |
 | `GET /api/files/tree?root=&path=` | dir listing (files+dirs, sizes, mtimes) |
-| `GET /api/files/file?path=` | `{ path, content, size, mtime, binary }` |
-| `PUT /api/files/file` | `{ path, content }` atomic write; previous bytes kept at `~/.ais/web/file-backups/<ts>-<name>` |
+| `GET /api/files/file?root=&path=` | `{ path, content, size, mtime, binary }` |
+| `PUT /api/files/file` | `{ root, path, content }` atomic write; previous bytes kept at `~/.ais/web/file-backups/<ts>-<name>` |
 | `POST /api/files/backup` | runs the git-managed config backup now; returns commit summary |
