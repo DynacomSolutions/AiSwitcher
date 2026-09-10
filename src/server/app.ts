@@ -147,6 +147,17 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
     return c.json(result.payload);
   });
+  // Breakdown streams raw session JSONL (the heaviest local scan), so it
+  // runs in the same isolated scan child with a ceiling to match.
+  app.get("/api/usage/breakdown", async (c) => {
+    const result = await runScanIsolated("breakdown", {
+      ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
+      ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
+      days: numberQuery(c, "days", 30),
+    }, 120_000);
+    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "breakdown scan failed");
+    return c.json(result.payload);
+  });
 
   /* -------------------------------- sessions ------------------------------- */
 

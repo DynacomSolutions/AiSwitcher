@@ -1,5 +1,6 @@
 import { runLimitsQuery } from "../cli/limits/collect.ts";
 import { runUsageQuery, usageResultsForJson } from "../cli/usage/run.ts";
+import { runBreakdownQuery, type BreakdownDeps, type BreakdownResult } from "../cli/usage/breakdown.ts";
 import type { ParsedArgs } from "../cli/args.ts";
 import type { LimitsEnvelope, UsageEnvelope } from "./types.ts";
 
@@ -69,4 +70,26 @@ export async function usageEnvelope(cache: PollCache, tool: string | undefined, 
   const key = `usage:${tool ?? "*"}:${identity ?? "*"}`;
   const { value } = await cache.get(key, () => runUsageQuery(flagsFor(tool, identity)), USAGE_TTL_MS);
   return { results: usageResultsForJson(value as never[]), generatedAt: new Date().toISOString() };
+}
+
+/** Breakdown scans stream raw JSONL, so they cache a little longer than the
+ * live-API envelopes; still short enough that the view's own slow poll sees
+ * fresh-ish data after a session ends. */
+const BREAKDOWN_TTL_MS = 60_000;
+
+export interface BreakdownEnvelope {
+  results: BreakdownResult[];
+  generatedAt: string;
+}
+
+export async function breakdownEnvelope(
+  cache: PollCache,
+  tool: string | undefined,
+  identity: string | undefined,
+  days: number,
+  deps: BreakdownDeps = {},
+): Promise<BreakdownEnvelope> {
+  const key = `breakdown:${tool ?? "*"}:${identity ?? "*"}:${days}`;
+  const { value } = await cache.get(key, () => runBreakdownQuery({ ...(tool ? { tool } : {}), ...(identity ? { identity } : {}), days }, deps), BREAKDOWN_TTL_MS);
+  return { results: value, generatedAt: new Date().toISOString() };
 }
