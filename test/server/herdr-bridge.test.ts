@@ -88,6 +88,11 @@ describe("parsePaneList (real captured line)", () => {
     expect(panes[2]!.agent).toBeUndefined(); // bare shell pane
   });
 
+  test("herdr's own focused flag rides through verbatim", () => {
+    const panes = parsePaneList(PANE_LIST_JSON);
+    expect(panes.every((p) => p.focused === false)).toBe(true);
+  });
+
   test("tolerant: junk, missing result, or non-array panes are zero panes", () => {
     expect(parsePaneList("not json")).toEqual([]);
     expect(parsePaneList("{}")).toEqual([]);
@@ -407,6 +412,33 @@ describe("HerdrBridgeScheduler state machine", () => {
     expect(scheduler.status().panes).toEqual([
       { paneId: "w2B:p1", agent: "opencode", agentStatus: "working", tool: "opencode", identity: "workco", title: "OC | Parallel tasks: Bedrock limits, upgra…" },
     ]);
+  });
+
+  test("focused is threaded into the DTO only for the focused pane (overview highlight source)", async () => {
+    const h = harness();
+    const syntheticList = JSON.stringify({
+      id: "cli:pane:list",
+      result: {
+        type: "pane_list",
+        panes: [
+          { pane_id: "wA:p1", agent: "codex", agent_status: "idle", focused: true },
+          { pane_id: "wB:p1", agent: "claude", agent_status: "working", focused: false },
+        ],
+      },
+    });
+    const scheduler = new HerdrBridgeScheduler(
+      h.deps({
+        paneList: async () => ok(syntheticList),
+        processInfo: async (paneId) => ok(PROCESS_INFO_JSON),
+        readEnviron: async (pid) => (pid === 848316 ? MARKED_ENV : undefined),
+        fetchLimits: async () => [],
+      }),
+    );
+    await scheduler.tick();
+    const panes = scheduler.status().panes;
+    expect(panes).toHaveLength(2);
+    expect(panes[0]).toMatchObject({ paneId: "wA:p1", identity: "workco", focused: true });
+    expect(panes[1]!.focused).toBeUndefined();
   });
 
   test("push:=false suppresses writes while everything else still runs", async () => {
