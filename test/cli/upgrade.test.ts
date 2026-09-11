@@ -699,4 +699,49 @@ describe("herdr row", () => {
     expect(last?.type).toBe("finish");
     expect(last?.type === "finish" && last.detail?.startsWith("updated")).toBe(true);
   });
+
+  test("running inside a herdr pane skips the row before spawning anything", async () => {
+    const { deps, hooks, events, spawns, logs } = fakeDeps({
+      herdrBinary: () => "/usr/bin/herdr",
+      insideHerdr: () => true,
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [], hooks);
+
+    expect(summary).toEqual({ checked: 0, failed: 0, skipped: 1 });
+    expect(events).toEqual([
+      {
+        type: "skip",
+        id: "herdr",
+        detail: "skipped (herdr is running; detach and rerun ais upgrade, or run herdr update yourself)",
+      },
+    ]);
+    expect(spawns).toEqual([]);
+    expect(logs.some((line) => line.includes("herdr is running in this session"))).toBe(true);
+  });
+
+  test("herdr's attached-refusal output is classified as skipped, never failed", async () => {
+    const failures: Array<{ toolName: string; reason: string }> = [];
+    const { deps, events } = fakeDeps({
+      herdrBinary: () => "/usr/bin/herdr",
+      insideHerdr: () => false,
+      capture: async () => ({ stdout: "", stderr: "probe failure", exitCode: 1, timedOut: false }),
+      spawn: async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "update failed: run `herdr update` outside herdr after detaching from the session",
+      }),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [], {
+      onEvent: (event) => events.push(event),
+      onFailure: (failure) => failures.push(failure),
+    });
+
+    expect(summary).toEqual({ checked: 0, failed: 0, skipped: 1 });
+    const last = events.at(-1);
+    expect(last?.type).toBe("skip");
+    expect(last?.type === "skip" && last.detail?.startsWith("skipped (herdr is running")).toBe(true);
+    expect(failures).toEqual([]);
+  });
 });

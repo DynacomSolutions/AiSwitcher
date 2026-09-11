@@ -90,12 +90,20 @@ export function parseHerdrArgs(
   };
 }
 
+/** herdr's own panes carry HERDR_* env vars (verified live: HERDR_PANE_ID,
+ * HERDR_WORKSPACE_ID, ...). Exported because it decides more than the
+ * wrapper's nesting guard: `ais upgrade` pre-checks it before running
+ * `herdr update`, which refuses while a herdr client is attached. */
+export function insideHerdrPane(env: NodeJS.ProcessEnv): boolean {
+  return Object.keys(env).some((key) => key.startsWith("HERDR_"));
+}
+
 /** Nesting guard: tmux inside a herdr pane (or inside tmux) is a foot-gun.
  * herdr's own panes carry HERDR_* env vars (verified live: HERDR_PANE_ID,
  * HERDR_WORKSPACE_ID, ...), tmux sets TMUX. */
 export function nestingConflict(env: NodeJS.ProcessEnv): "tmux" | "herdr" | undefined {
   if (env.TMUX) return "tmux";
-  if (Object.keys(env).some((key) => key.startsWith("HERDR_"))) return "herdr";
+  if (insideHerdrPane(env)) return "herdr";
   return undefined;
 }
 

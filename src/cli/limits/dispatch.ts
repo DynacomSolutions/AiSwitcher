@@ -68,7 +68,10 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
     // aggregateLimitResults on every frame: the same provider+identity can
     // be answered by more than one target (a Z.ai key imported into Pi is
     // the account the zai tool queries too) — the flat list must not show
-    // duplicate branches mid-render.
+    // duplicate branches mid-render. Resolved slots are stored RAW and
+    // annotated only at render time: annotate() appends its note to any
+    // existing window note, so annotating at store time AND every frame
+    // would double the note on screen.
     const slots: ToolLimitResult[][] = targets.map((target) => {
       const pending = pendingLimitResult(target);
       return pending ? [pending] : [];
@@ -76,9 +79,15 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
     await withLiveRender(
       (tick) => formatLimitsReport(aggregateLimitResults(annotate(slots.flat())), new Date(), spinnerChar(tick)),
       async () => {
-        await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => (slots[i] = annotate(resolved)));
+        await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => (slots[i] = resolved));
       },
+      // The clamped live frame is progress, not the output: erase it once
+      // the fetches settle and print the full uncapped report exactly once,
+      // so what remains on screen matches the non-TTY run. No slot is
+      // pending here anymore, so the report's spinner frame never renders.
+      { eraseOnFinish: true },
     );
+    console.log(formatLimitsReport(aggregateLimitResults(annotate(slots.flat()))));
     return;
   }
 

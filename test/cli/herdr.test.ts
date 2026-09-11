@@ -4,6 +4,7 @@ import {
   HERDR_SESSION,
   buildCreateSteps,
   hasSessionArgs,
+  insideHerdrPane,
   parseHerdrArgs,
   parseRemoteConsoleState,
   rightPaneCommand,
@@ -68,6 +69,18 @@ describe("nestingConflict", () => {
     expect(nestingConflict({ TMUX: "/tmp/tmux-0/default,1,0" })).toBe("tmux");
     expect(nestingConflict({ HERDR_PANE_ID: "w1:p1" })).toBe("herdr");
     expect(nestingConflict({ PATH: "/usr/bin" })).toBeUndefined();
+  });
+});
+
+describe("insideHerdrPane", () => {
+  test("any HERDR_* variable means this shell sits in a herdr pane", () => {
+    expect(insideHerdrPane({ HERDR_PANE_ID: "w1:p1" })).toBe(true);
+    expect(insideHerdrPane({ HERDR_WORKSPACE_ID: "ws" })).toBe(true);
+  });
+
+  test("plain tmux or a clean env does not", () => {
+    expect(insideHerdrPane({ TMUX: "/tmp/tmux-0/default,1,0" })).toBe(false);
+    expect(insideHerdrPane({})).toBe(false);
   });
 });
 

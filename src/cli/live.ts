@@ -1,6 +1,10 @@
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK_MS = 80;
 const FALLBACK_WIDTH = 80;
+/** Mirrors FALLBACK_WIDTH for the height clamp below: a pty can report a
+ * zero window size (no controlling terminal to inherit), and clamping to
+ * the classic 24-row minimum keeps the frame on screen even there. */
+const FALLBACK_HEIGHT = 24;
 const ANSI_ESCAPE = /\x1b\[[0-9;]*m/g;
 const RESET = "\x1b[0m";
 
@@ -82,6 +86,12 @@ export interface LiveRenderOptions {
    * children directly, the run promise settles, and the caller decides the
    * exit code in its own finally/catch path. */
   onInterrupt?: () => void;
+  /** Erase the frame when run() settles instead of redrawing it, leaving the
+   * cursor where the frame began. For callers that print their real output
+   * right after the live phase (limits prints the full uncapped report):
+   * without this the clamped progress frame would stay parked above the
+   * final report, duplicating its top rows on screen. */
+  eraseOnFinish?: boolean;
 }
 
 /**
@@ -95,6 +105,19 @@ export interface LiveRenderOptions {
  * animates, since nothing else would trigger a redraw while it's waiting)
  * and once more after `run()` settles, so the final state is what's left on
  * screen before the cursor is restored.
+ *
+ * The frame is also CLAMPED to the terminal height (rows - 1 lines, the
+ * last row left free for the cursor). moveUpAndClear's cursor math only
+ * works while the whole frame fits on screen: ANSI cursor-up stops at the
+ * screen's top row, so once a frame grows taller than the terminal every
+ * redraw clamps, clears the screen, and repaints while the frame bottom
+ * scrolls — the terminal effectively streams the report instead of holding
+ * one stable frame (confirmed live, 2026-09-11: `ais limits`' report grew
+ * to 89 physical lines as rows resolved and every redraw scrolled). The
+ * clamp keeps ONE frame on screen no matter how tall the logical report
+ * gets; a dim "+N more lines" marker stands in for the withheld rows, and
+ * callers that owe the user the full output print it after the live phase
+ * (see eraseOnFinish).
  *
  * Requires a real TTY, same requirement watch.ts already has for the same
  * reason: an in-place redraw means nothing when piped/redirected. Callers
@@ -114,12 +137,24 @@ export async function withLiveRender(
 
   function draw(): void {
     const width = process.stdout.columns || FALLBACK_WIDTH;
-    const body = render(tick)
+    const maxLines = (process.stdout.rows || FALLBACK_HEIGHT) - 1;
+    let lines = render(tick)
       .split("\n")
-      .map((line) => truncateToWidth(line, width))
-      .join("\n");
+      .map((line) => truncateToWidth(line, width));
+    if (lines.length > maxLines) {
+      // Reserve one line for the marker itself, so the clamped body plus
+      // its trailing "\n" still end the cursor exactly on the bottom row
+      // without scrolling.
+      const kept = Math.max(0, maxLines - 1);
+      const omitted = lines.length - kept;
+      lines = lines.slice(0, kept);
+      lines.push(
+        truncateToWidth(`\x1b[2m… +${omitted} more lines (use --tool=<tool> to narrow the report)\x1b[0m`, width),
+      );
+    }
+    const body = lines.join("\n");
     process.stdout.write(moveUpAndClear(previousLineCount) + body + "\n");
-    previousLineCount = body.split("\n").length;
+    previousLineCount = lines.length;
   }
 
   const restoreCursor = () => process.stdout.write(SHOW_CURSOR);
@@ -143,7 +178,11 @@ export async function withLiveRender(
     clearInterval(timer);
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
-    draw();
+    if (options.eraseOnFinish) {
+      process.stdout.write(moveUpAndClear(previousLineCount));
+    } else {
+      draw();
+    }
     restoreCursor();
   }
 }
