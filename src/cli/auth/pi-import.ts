@@ -31,7 +31,7 @@ async function resolveConfigDir(cfg: ToolConfig, key: string): Promise<string> {
   return expandPath(identity.configDir);
 }
 
-async function openCodeGoApiKey(flags: ParsedArgs["flags"]): Promise<string | undefined> {
+export async function openCodeGoApiKey(flags: ParsedArgs["flags"]): Promise<string | undefined> {
   if (!boolFlag(flags, "opencode-go")) return undefined;
 
   const fromEnvironment = process.env.OPENCODE_API_KEY?.trim();

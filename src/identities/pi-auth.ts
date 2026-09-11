@@ -17,7 +17,7 @@ export interface PiCredentialSourceDirs {
   opencodeGoApiKey?: string;
 }
 
-type JsonObject = Record<string, unknown>;
+export type JsonObject = Record<string, unknown>;
 type PiCredential =
   | { type: "api_key"; key: string }
   | { type: "oauth"; access: string; refresh: string; expires: number };
@@ -162,16 +162,19 @@ async function writeSensitiveJsonAtomic(path: string, value: JsonObject): Promis
 }
 
 /**
- * Merge credentials from existing AIS provider identities into one Pi
- * identity. Secret values are never returned or logged. Existing unrelated Pi
- * credentials and custom providers are preserved.
+ * Reads every supplied source and builds Pi-shaped credentials. Shared by
+ * the explicit import (overwrite semantics) and the sync (add-only
+ * semantics) commands. Secret values live only in the returned structure and
+ * are written straight to auth.json (mode 0600); they are never logged.
  */
-export async function importPiCredentials(
-  piConfigDir: string,
+export async function readPiCredentialSources(
   sourceDirs: PiCredentialSourceDirs,
-): Promise<PiCredentialImportResult> {
-  const authPath = join(piConfigDir, "auth.json");
-  const auth = (await Bun.file(authPath).exists()) ? await readJson(authPath) : {};
+): Promise<{
+  credentials: Record<string, PiCredential>;
+  providers: string[];
+  alibabaProvider?: JsonObject;
+}> {
+  const auth: Record<string, PiCredential> = {};
   const providers: string[] = [];
   let alibabaProvider: JsonObject | undefined;
 
@@ -212,20 +215,126 @@ export async function importPiCredentials(
     providers.push("opencode-go");
   }
 
+  return { credentials: auth, providers, ...(alibabaProvider !== undefined ? { alibabaProvider } : {}) };
+}
+
+/**
+ * Merge credentials from existing AIS provider identities into one Pi
+ * identity. Secret values are never returned or logged. Existing unrelated Pi
+ * credentials and custom providers are preserved. Supplied sources OVERWRITE
+ * their provider entry (explicit import semantics: the caller named the
+ * source on purpose).
+ */
+export async function importPiCredentials(
+  piConfigDir: string,
+  sourceDirs: PiCredentialSourceDirs,
+): Promise<PiCredentialImportResult> {
+  const authPath = join(piConfigDir, "auth.json");
+  const auth = (await Bun.file(authPath).exists()) ? await readJson(authPath) : {};
+  const { credentials, providers, alibabaProvider } = await readPiCredentialSources(sourceDirs);
   if (providers.length === 0) throw new Error("No Pi credential sources were supplied");
+  for (const [provider, credential] of Object.entries(credentials)) {
+    auth[provider] = credential;
+  }
   await writeSensitiveJsonAtomic(authPath, auth);
 
   let modelsPath: string | undefined;
   if (alibabaProvider) {
-    modelsPath = join(piConfigDir, "models.json");
-    const models = (await Bun.file(modelsPath).exists()) ? await readJson(modelsPath) : {};
-    const configuredProviders =
-      typeof models.providers === "object" && models.providers !== null && !Array.isArray(models.providers)
-        ? (models.providers as JsonObject)
-        : {};
-    models.providers = { ...configuredProviders, "alibaba-plan": alibabaProvider };
-    await writeSensitiveJsonAtomic(modelsPath, models);
+    modelsPath = await mergeAlibabaCatalogue(piConfigDir, alibabaProvider);
   }
 
   return { providers, authPath, ...(modelsPath ? { modelsPath } : {}) };
+}
+
+/** Writes the Alibaba provider catalogue into the identity's models.json
+ * (mode 0600), preserving every other configured provider. */
+async function mergeAlibabaCatalogue(piConfigDir: string, alibabaProvider: JsonObject): Promise<string> {
+  const modelsPath = join(piConfigDir, "models.json");
+  const models = (await Bun.file(modelsPath).exists()) ? await readJson(modelsPath) : {};
+  const configuredProviders =
+    typeof models.providers === "object" && models.providers !== null && !Array.isArray(models.providers)
+      ? (models.providers as JsonObject)
+      : {};
+  models.providers = { ...configuredProviders, "alibaba-plan": alibabaProvider };
+  await writeSensitiveJsonAtomic(modelsPath, models);
+  return modelsPath;
+}
+
+export interface PiSyncPlanEntry {
+  provider: string;
+  action: "added" | "kept";
+}
+
+export interface PiSyncPlan {
+  entries: PiSyncPlanEntry[];
+  /** Providers a source supplied but auth.json already held. */
+  kept: string[];
+  /** Providers written into auth.json now. */
+  added: string[];
+  /** Whether models.json needs the Alibaba catalogue merge (only when the
+   * alibaba-plan credential is genuinely new: an existing custom catalogue
+   * may hold local edits a blind overwrite would clobber). */
+  mergeAlibabaCatalogue: boolean;
+}
+
+/**
+ * Pure: plan an ADD-ONLY sync. A provider auth.json already holds is KEPT,
+ * never overwritten: several of these credentials are rotating OAuth tokens
+ * pi itself refreshes, and the freshest copy may already live in auth.json
+ * (the ONE-credential-per-(identity, provider) law - see
+ * src/cli/limits/kimi-store.ts). Only genuinely missing providers are added.
+ */
+export function planPiCredentialSync(
+  currentAuth: JsonObject,
+  collected: { credentials: Record<string, PiCredential>; alibabaProvider?: JsonObject },
+): PiSyncPlan {
+  const entries: PiSyncPlanEntry[] = [];
+  const kept: string[] = [];
+  const added: string[] = [];
+  let mergeAlibabaCatalogue = false;
+  for (const [provider, credential] of Object.entries(collected.credentials)) {
+    if (Object.prototype.hasOwnProperty.call(currentAuth, provider)) {
+      kept.push(provider);
+      entries.push({ provider, action: "kept" });
+      continue;
+    }
+    currentAuth[provider] = credential;
+    added.push(provider);
+    entries.push({ provider, action: "added" });
+    if (provider === "alibaba-plan" && collected.alibabaProvider !== undefined) {
+      mergeAlibabaCatalogue = true;
+    }
+  }
+  return { entries, kept, added, mergeAlibabaCatalogue };
+}
+
+/**
+ * Ensure a Pi identity's auth.json holds every credential the supplied
+ * sources can offer, ADDING missing providers and leaving present ones
+ * untouched (see planPiCredentialSync for why). Returns what changed.
+ */
+export async function syncPiCredentials(
+  piConfigDir: string,
+  sourceDirs: PiCredentialSourceDirs,
+): Promise<{
+  added: string[];
+  kept: string[];
+  authPath: string;
+  modelsPath?: string;
+}> {
+  const authPath = join(piConfigDir, "auth.json");
+  const auth = (await Bun.file(authPath).exists()) ? await readJson(authPath) : {};
+  const collected = await readPiCredentialSources(sourceDirs);
+  if (Object.keys(collected.credentials).length === 0) {
+    throw new Error("No Pi credential sources were supplied");
+  }
+  const plan = planPiCredentialSync(auth, collected);
+  if (plan.added.length > 0) {
+    await writeSensitiveJsonAtomic(authPath, auth);
+  }
+  let modelsPath: string | undefined;
+  if (plan.mergeAlibabaCatalogue && collected.alibabaProvider !== undefined) {
+    modelsPath = await mergeAlibabaCatalogue(piConfigDir, collected.alibabaProvider);
+  }
+  return { added: plan.added, kept: plan.kept, authPath, ...(modelsPath ? { modelsPath } : {}) };
 }
