@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { clearServerState } from "../../src/server/state.ts";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { clearServerState, consoleServerStatePath, consoleWebDir, writeServerState } from "../../src/server/state.ts";
 
 const tempDirs: string[] = [];
 const pid = process.pid;
@@ -41,5 +41,53 @@ describe("clearServerState pid guard", () => {
     await writeFile(path, "not json at all");
     await clearServerState(path);
     await expect(readFile(path)).rejects.toThrow();
+  });
+});
+
+/** AIS_WEB_STATE_DIR is mutated in-place per test and restored in a finally
+ * position: these assertions must hold no matter what a previous test in the
+ * process left behind. */
+describe("consoleWebDir AIS_WEB_STATE_DIR override", () => {
+  let previous: string | undefined;
+
+  const setEnv = (value: string | undefined) => {
+    if (value === undefined) delete process.env.AIS_WEB_STATE_DIR;
+    else process.env.AIS_WEB_STATE_DIR = value;
+  };
+
+  beforeEach(() => {
+    previous = process.env.AIS_WEB_STATE_DIR;
+  });
+
+  afterEach(() => setEnv(previous));
+
+  test("unset keeps the historic ~/.ais/web default", () => {
+    setEnv(undefined);
+    expect(consoleWebDir()).toBe(join(homedir(), ".ais", "web"));
+    expect(consoleServerStatePath()).toBe(join(homedir(), ".ais", "web", "server.json"));
+  });
+
+  test("a blank value is treated as unset", () => {
+    setEnv("   ");
+    expect(consoleWebDir()).toBe(join(homedir(), ".ais", "web"));
+  });
+
+  test("set relocates the state dir and server.json follows", () => {
+    setEnv("/web/state");
+    expect(consoleWebDir()).toBe(resolve("/web/state"));
+    expect(consoleServerStatePath()).toBe(join(resolve("/web/state"), "server.json"));
+  });
+
+  test("writeServerState mkdir -p's the override and writes server.json there (the daemon-start write path)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ais-override-"));
+    tempDirs.push(root);
+    const override = join(root, "nested", "state");
+    setEnv(override);
+    await writeServerState({ pid, port: 4799, token: "t", startedAt: "now" });
+    const raw = JSON.parse(await readFile(join(override, "server.json"), "utf8")) as {
+      pid: number;
+      port: number;
+    };
+    expect(raw).toMatchObject({ pid, port: 4799 });
   });
 });

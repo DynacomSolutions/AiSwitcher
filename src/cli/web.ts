@@ -1,7 +1,9 @@
 import { cyan, dim } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
 import { boolFlag } from "./args.ts";
-import { statSync } from "node:fs";
+import { statSync, readFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { createConnection } from "node:net";
 import { clearServerState, pidAlive, readServerState } from "../server/state.ts";
 import { DEFAULT_CONSOLE_PORT, findDistDir, startConsoleServer } from "../server/serve.ts";
 import { withUsableCwd } from "../shared/exec.ts";
@@ -131,18 +133,61 @@ export async function ensureConsoleRunning(portFlag?: number): Promise<number> {
   if (state && pidAlive(state.pid) && (await healthy(state.port))) return state.port;
   const daemon = spawnDaemon(portFlag);
   const ready = await waitUntilHealthyOrExit(daemon.proc);
-  if (!ready) throw new CliUsageError("console daemon did not become healthy within 10s (it may have failed to bind)");
+  if (!ready) {
+    // The child died before answering: with a busy port that is a bind
+    // failure, and the state file's pid was dead/foreign (else the early
+    // return above took it). Fail with the actionable reason instead of a
+    // vague timeout, and never report "started" in that situation.
+    if (await portInUse(daemon.requestedPort)) {
+      throw new CliUsageError(
+        `port ${daemon.requestedPort} already in use - not starting a second console daemon on it ` +
+          "(the state file named a dead or foreign pid; check `ais web status` and whatever holds the port)",
+      );
+    }
+    throw new CliUsageError("console daemon did not become healthy within 10s (it may have failed to bind)");
+  }
   const fresh = await readServerState();
   return fresh?.port ?? daemon.requestedPort;
 }
 
-async function stopDaemon(): Promise<void> {
+/** Cheap TCP probe: can ANY listener accept on this loopback port? Used to
+ * distinguish "bind failed because the port is taken" from other startup
+ * deaths; a refused connection is the only "free" verdict. */
+async function portInUse(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const done = (occupied: boolean) => {
+      socket.destroy();
+      resolve(occupied);
+    };
+    socket.setTimeout(1000);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
+export interface StopDaemonDeps {
+  /** Test injection: /proc-style root whose <pid>/cmdline files are read
+   * instead of the real /proc. */
+  procDir?: string;
+}
+
+/** Stops the daemon named by the state file, but ONLY after proving the
+ * pid really is a console daemon (see verifyConsoleDaemonPid). This is the
+ * "never take shit down" guarantee: a stale, hand-edited or cross-context
+ * (host vs pod) state file must never turn `ais web stop`/`restart` into a
+ * signal to somebody else's process. A refused stop leaves the state file
+ * exactly as found so the situation stays visible and diagnosable. */
+export async function stopDaemon(deps: StopDaemonDeps = {}): Promise<void> {
   const state = await readServerState();
   if (!state || !pidAlive(state.pid)) {
     await clearServerState();
     console.log("not running");
     return;
   }
+  const refusal = verifyConsoleDaemonPid(state.pid, deps.procDir);
+  if (refusal) throw new CliUsageError(`refusing to kill pid ${state.pid} - ${refusal}`);
   process.kill(state.pid, "SIGTERM");
   const deadline = Date.now() + 5000;
   while (pidAlive(state.pid) && Date.now() < deadline) {
@@ -150,6 +195,44 @@ async function stopDaemon(): Promise<void> {
   }
   await clearServerState();
   console.log(`stopped (pid ${state.pid})`);
+}
+
+/** Reads /proc/<pid>/cmdline (argv, NUL-separated). Returns undefined when
+ * it cannot be read: macOS has no /proc at all, and a Linux pid can die
+ * between the pidAlive check and this read. Undefined means "cannot
+ * verify", and stopDaemon then falls back to the historic blind SIGTERM
+ * rather than refusing to stop a real daemon on a /proc-less machine. */
+function readProcCmdline(pid: number, procDir = "/proc"): string[] | undefined {
+  try {
+    const raw = readFileSync(join(procDir, String(pid), "cmdline"), "utf8");
+    return raw.split("\0").filter((part) => part.length > 0);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The exact match rule for "this pid is one of OUR console daemons": some
+ * argv entry's basename contains "ais" AND some argv entry carries the
+ * --serve-internal flag (the hidden marker only the daemon child is
+ * spawned with). Basename scanning spans the WHOLE argv because setsid(1)
+ * execs its target, leaving setsid itself as argv[0] and the ais binary
+ * further in. Loose on purpose: refusing to stop a genuine daemon is the
+ * worse failure mode, while a process that is both ais-named AND
+ * --serve-internal-marked is a console daemon by construction. */
+export function isConsoleDaemonCmdline(argv: readonly string[]): boolean {
+  const namesAis = argv.some((arg) => basename(arg).includes("ais"));
+  const markedDaemon = argv.some((arg) => arg.includes("--serve-internal"));
+  return namesAis && markedDaemon;
+}
+
+/** Returns a human-readable refusal reason when the pid must NOT be
+ * signalled, or undefined when the pid is a verified console daemon (or
+ * cannot be verified and the legacy fallback applies). */
+function verifyConsoleDaemonPid(pid: number, procDir?: string): string | undefined {
+  const argv = readProcCmdline(pid, procDir);
+  if (argv === undefined) return undefined;
+  if (isConsoleDaemonCmdline(argv)) return undefined;
+  return `it is not a console daemon (cmdline: ${argv.length > 0 ? argv.join(" ") : "<empty>"})`;
 }
 
 async function healthy(port: number): Promise<boolean> {

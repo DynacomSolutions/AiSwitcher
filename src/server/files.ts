@@ -6,6 +6,7 @@ import type { ToolConfig } from "../identities/types.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../shared/reproducible-paths.ts";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { aisHome } from "../shared/ais-home.ts";
+import { consoleWebDir } from "./state.ts";
 import { HttpError, type FileContentDto, type FileRootDto, type FileTreeDto } from "./types.ts";
 
 /** Whitelisted file browsing/editing over the trees AIS legitimately owns:
@@ -16,7 +17,7 @@ import { HttpError, type FileContentDto, type FileRootDto, type FileTreeDto } fr
  * whitelisted root. */
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
-const FILE_BACKUPS_SUBDIR = "web/file-backups";
+const FILE_BACKUPS_SUBDIR = "file-backups";
 
 interface RootDef {
   id: string;
@@ -189,12 +190,16 @@ export async function writeTextFile(
   const rootReal = await realpath(root.base);
   if (relative(rootReal, parentReal).startsWith("..")) throw new HttpError(403, "parent escapes the whitelisted root");
 
-  // Keep the previous bytes under ~/.ais/web/file-backups before replacing.
+  // Keep the previous bytes under <consoleWebDir>/file-backups before
+  // replacing. Derived from consoleWebDir() (not aisHome()/"web") so the
+  // backups follow AIS_WEB_STATE_DIR with every other console write: in the
+  // k8s pod that keeps pre-edit copies pod-local instead of scribbling into
+  // the hostPath-mounted ~/.ais/web the host daemon also uses.
   let backedUpTo: string | undefined;
   const existing = await stat(real).catch(() => undefined);
   if (existing?.isFile()) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = join(aisHome(), FILE_BACKUPS_SUBDIR, `${stamp}-${basename(abs)}`);
+    const backupPath = join(consoleWebDir(), FILE_BACKUPS_SUBDIR, `${stamp}-${basename(abs)}`);
     await mkdir(dirname(backupPath), { recursive: true });
     await Bun.write(backupPath, new Uint8Array(await readFile(real)));
     backedUpTo = backupPath.replace(homedir(), "~");

@@ -96,7 +96,14 @@ src/
     guard.ts               request hardening: loopback Host allowlist (DNS-rebinding),
                             bearer-token OR loopback-peer auth, X-AIS-Console required on
                             every mutating method (CSRF guard, see design decisions)
-    state.ts               ~/.ais/web/server.json read/write/clear + token generation
+    state.ts               server.json read/write/clear + token generation. Default
+                            location ~/.ais/web; AIS_WEB_STATE_DIR relocates the whole
+                            console state dir (server.json, auth-refresh state, file
+                            backups) for contexts that share the host's ~/.ais but must
+                            own separate lifecycle state: the k8s pod sets it to
+                            /web/state (hostPath mount + hostPID otherwise put the pod's
+                            daemon pid in the same server.json the host daemon manages,
+                            and each side's stop/start churn killed the other's daemon)
     expensive.ts           PollCache (TTL + in-flight dedupe) shared by the limits/usage
                             endpoints so BOTH frontends' live polling never hammers
                             upstream provider APIs; also maps query params onto the
@@ -129,7 +136,7 @@ src/
                             registered configDirs): dual lexical+realpath containment guards,
                             REPRODUCIBLE_JUNK_DIR_NAMES-filtered listings, 2 MB text cap,
                             binary sniffing, atomic writes with pre-edit backups under
-                            ~/.ais/web/file-backups/
+                            <consoleWebDir>/file-backups/ (follows AIS_WEB_STATE_DIR)
   cli/                 the `ais` management CLI — no identity-resolution logic of its own
     dispatch.ts          top-level subcommand routing + uniform error->exit-code handling
     args.ts                minimal argv parser: positionals + --flag=value/--flag
@@ -249,16 +256,25 @@ src/
                                (bun:sqlite) via that identity's projects.json — the only tool
                                whose sessions live outside its own configDir entirely — see the
                                2026-07-18 zai/Crush addendum
-    web.ts                   `ais web start|stop|status|open [--port=] [--foreground]`:
-                           lifecycle for server/*'s console daemon. Default spawns a
-                           DETACHED child re-invoking this same entrypoint with the hidden
-                           --serve-internal flag (works compiled AND dev: [Bun.main] alone
-                           when self, [process.execPath, Bun.main] under the bun runtime);
-                           fails fast if the child exits before its own pid appears in
-                           server.json and answers a health probe, so a stale daemon
-                           holding the port can never masquerade as a successful start.
-                           NOTE parseArgs only reads --flag=value; "--port 1234" would
-                           silently become port=true + positional "1234"
+     web.ts                   `ais web start|stop|status|open [--port=] [--foreground]`:
+                            lifecycle for server/*'s console daemon. Default spawns a
+                            DETACHED child re-invoking this same entrypoint with the hidden
+                            --serve-internal flag (works compiled AND dev: [Bun.main] alone
+                            when self, [process.execPath, Bun.main] under the bun runtime);
+                            fails fast if the child exits before its own pid appears in
+                            server.json and answers a health probe, so a stale daemon
+                            holding the port can never masquerade as a successful start
+                            (a genuinely occupied port reports "port N already in use"
+                            instead of a 10s timeout). NEVER-KILL GUARD: stop/restart
+                            verify the state file's pid via /proc/<pid>/cmdline (basename
+                            containing "ais" anywhere in argv + the --serve-internal
+                            marker) before signalling; a stale, hand-edited or foreign
+                            pid is refused loudly and left in place ("refusing to kill
+                            pid N - it is not a console daemon (cmdline: ...)") so
+                            lifecycle churn can never take down an unrelated process.
+                            /proc-less platforms (macOS) fall back to the legacy blind
+                            SIGTERM. NOTE parseArgs only reads --flag=value; "--port 1234"
+                            would silently become port=true + positional "1234"
     tui.ts                   `ais tui`: ensures the console server is up (reads
                            ~/.ais/web/server.json), then execs the ratatui binary from
                            $AIS_TUI_BIN > ~/.local/bin/aistui > apps/tui/target/release/
