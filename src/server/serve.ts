@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
@@ -145,6 +146,12 @@ export function findDistDir(): string | undefined {
     join(import.meta.dir, "..", "..", "apps", "web", "dist"),
     join(import.meta.dir, "..", "..", "..", "apps", "web", "dist"),
     join(consoleWebDir(), "dist"),
+    // The historical installed-copy location, kept as a final fallback even
+    // when AIS_WEB_STATE_DIR relocates consoleWebDir(): the dist dir is
+    // install-time STATIC ASSETS, not daemon state, and an override (e.g.
+    // someone experimenting with the pod's isolation on the host) must not
+    // blind an installed binary's WebUI discovery.
+    join(homedir(), ".ais", "web", "dist"),
   ].filter((p): p is string => typeof p === "string" && p.length > 0);
   for (const candidate of candidates) {
     try {
