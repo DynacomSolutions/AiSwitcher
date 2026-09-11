@@ -107,13 +107,18 @@ identity via the `AI_PROFILE_SWITCHER_SESSION` marker env var.
 
 Last-known per-AWS-account enforcement state (breach killer + cache writer
 status). 503 when the daemon-side scheduler is not running. Machines with no
-identity-to-AWS mapping report an empty `accounts` list.
+identity-to-AWS mapping report an empty `accounts` list. `config.mode`
+decides the breach response: `"warn"` (the default, also when the key or
+the whole `~/.ais/config/spend-guard.json` is absent) surfaces breaches
+loudly but refuses nothing and kills nobody; `"enforce"` blocks new
+launches at the gate and terminates active sessions on the transition into
+breach.
 
 ```jsonc
 {
   "ok": true,
   "running": true,
-  "config": { "intervalS": 300, "killGraceS": 10 },
+  "config": { "intervalS": 300, "killGraceS": 10, "mode": "warn" },
   "lastCycleAt": "2026-09-10T10:00:00Z",
   "lastError": null,             // joined cycle errors of the last pass, if any
   "accounts": [
