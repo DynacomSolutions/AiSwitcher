@@ -56,7 +56,13 @@ src/
                              isBedrockIdentity(); profile NAMES only, never credentials
     pi-auth.ts               one-shot, secret-silent import of the six provider-specific
                              AIS identities plus OpenCode Go into one Pi auth.json; also translates ali's
-                             Crush model catalogue into Pi's models.json
+                             Crush model catalogue into Pi's models.json; plus the ADD-ONLY sync
+                             primitives (readPiCredentialSources/planPiCredentialSync/syncPiCredentials)
+    pi-extension-install.ts  self-heal installer that keeps the current AIS Pi
+                             extension (embedded at build time via Bun's
+                             `type: "text"` import attribute) in
+                             $PI_CODING_AGENT_DIR/extensions/ais-identity.ts,
+                             version-stamped so stale copies refresh; never throws
     resolve.ts             resolveIdentity(): the flag > env > dir-match > prompt/error chain
     prompt.ts               @clack/prompts picker + create-new-identity flow
     errors.ts                typed IdentityResolutionError subclasses
@@ -2479,6 +2485,87 @@ provider's models.
   `probeAliDoctor`, `degraded` status) flag it, and
   `ais limits --tool=ali` appends "(last refresh attempt <ts>: <error>)"
   to the expired message via `lastRefreshFailure()`.
+
+### pi identities extension (2026-09-11): in-session visibility, provider switching, add-only sync
+
+The wrapped pi tool gained an in-session identity surface: a self-heal-installed
+TypeScript extension (`src/pi-extension/ais-identity-extension.ts`) plus an
+add-only credential sync (`ais auth sync --tool=pi <identity>`). Facts about
+pi 0.85.1 (`@earendil-works/pi-coding-agent`) that the design rests on, all
+verified from the installed package (docs/extensions.md, dist/core/auth-storage.js,
+dist/core/model-registry.d.ts) rather than assumed:
+
+- **Extensions are plain TypeScript loaded via jiti** - no bundling step.
+  Pi auto-discovers `$PI_CODING_AGENT_DIR/extensions/*.ts`, which under the
+  AIS wrapper IS the identity's own configDir, so per-identity installation
+  is just a version-stamped file copy (`pi-extension-install.ts`, wired as
+  the `pi` entrypoint's `beforeLaunch` hook; never throws, one stderr
+  warning on failure). The embedded source travels inside the compiled
+  binary via Bun's `with { type: "text" }` import attribute; beware a Bun
+  quirk: in a process that ALSO imports the extension as a module (the unit
+  tests do), the attribute import resolves to the module namespace instead
+  of the text, so the installer falls back to reading the file from disk
+  (only possible in dev/test, where the source tree exists).
+- **pi re-reads auth.json per request.** `AuthStorage.readLatestData()`
+  revalidates a `dev:ino:size:mtimeNs:ctimeNs` file revision on every read
+  and re-reads on change; writes take a file lock. External atomic swaps of
+  auth.json ARE picked up by a running pi - which makes in-session
+  whole-identity swapping TEMPTING and is exactly why the honesty rule
+  matters (next point).
+- **Whole-identity switching is deliberately relaunch-only.** Not because
+  pi can't re-read credentials (it can, proven above) but because a
+  swapped-in copy of another identity's rotating OAuth tokens would refresh
+  INTO the hosting identity's auth.json (pi writes token refreshes back to
+  its own configDir), corrupting AIS's ONE-credential-per-(identity,
+  provider) model - the kimi rotation failure mode kimi-store.ts exists to
+  prevent, with the swapped copy now attributed to the WRONG identity for
+  spend, limits and usage. `/ais identities` therefore lists every registry
+  identity with its `ais pi --identity=<name>` launch command and says
+  plainly that switching requires a relaunch. In-session provider/model
+  switching, by contrast, is fully supported via pi's own
+  `pi.setModel(model)` API (returns false when the provider has no
+  authentication; emits `model_select`, which the extension mirrors into
+  its status line and open widget) and never changes the defaults new
+  sessions start with.
+- **Visibility surfaces**: a persistent footer status
+  (`ctx.ui.setStatus`: `ais <identity>: <provider>/<model>`) set on
+  `session_start` and every `model_select`, plus `/ais` rendering a compact
+  widget panel (pi caps widgets at 10 lines - `InteractiveMode
+  .MAX_WIDGET_LINES`, so the current provider is sorted first and the panel
+  is two header lines + table) showing each provider's credential type and
+  catalogue model count from `ctx.modelRegistry.getAvailable()`, with
+  honest gap notes (`no credential in auth.json`, `credential present but
+  no models in Pi's catalogue`, and the Amazon Bedrock ambient-AWS-chain
+  note). The identity name comes from the wrapper's
+  `AI_PROFILE_SWITCHER_SESSION` env var; when absent the extension says
+  "launched outside the ais wrapper" instead of guessing.
+- **Sync is ADD-ONLY.** `ais auth sync --tool=pi` (planner
+  `planPiCredentialSync` in pi-auth.ts) adds providers auth.json is
+  MISSING and never overwrites present ones: the freshest copy of a
+  rotating OAuth token may already live in auth.json because pi itself
+  refreshed it (the same freshness law kimi-store.ts implements for
+  kimi). Source resolution per tool registry: explicit `--<tool>=<name>`
+  flag > same-named identity > a registry holding exactly one identity >
+  an honest skip note (never a guess). alibaba-plan rides the same
+  Crush-catalogue translation importPiCredentials uses. amazon-bedrock
+  gets a permanent honest gap note: pi speaks it, but its auth rides the
+  ambient AWS credential chain and AIS holds no Bedrock credential to
+  sync (aws-profile.ts is reporting-only by design).
+
+Live verification (2026-09-11, sanitized throwaway copy of an identity
+configDir under a temp HOME, real pi 0.85.1 driven through the real wrapper
+in tmux): the extension self-heal installed on launch and pi listed
+`ais-identity.ts` under loaded extensions; the footer showed
+`ais identity-a: anthropic/claude-opus-4-8`; `/ais` rendered the provider
+table with credential types, model counts and gap notes; `/ais use
+zai/glm-5.3` flipped pi's OWN footer to `(zai) glm-5.3 - high` and the AIS
+status line to `ais identity-a: zai/glm-5.3` with no request sent (cost
+footer stayed at $0.000); unknown providers error honestly. Watch out when
+reproducing: a temp HOME hides `~/.ais/npm/bin`, and PATH then falls
+through to `/usr/bin/pi` - the OLD pre-rebrand `@mariozechner/pi-coding-agent`
+- and the old binary and the AIS shim will spawn each other in an infinite
+`--append-system-prompt`-accumulating loop; symlink the managed bin dir
+into the temp HOME first.
 
 ### Provider-first views for limits and usage
 
