@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { importPiCredentials } from "../../src/identities/pi-auth.ts";
+import { importPiCredentials, planPiCredentialSync, syncPiCredentials, type JsonObject } from "../../src/identities/pi-auth.ts";
 
 const roots: string[] = [];
 
@@ -105,5 +105,103 @@ describe("importPiCredentials", () => {
   test("rejects an import with no selected credential sources", async () => {
     const root = await temporaryRoot();
     await expect(importPiCredentials(join(root, "pi"), {})).rejects.toThrow("No Pi credential sources");
+  });
+});
+
+describe("planPiCredentialSync", () => {
+  test("adds only missing providers and keeps existing ones untouched", () => {
+    const current: JsonObject = {
+      anthropic: { type: "oauth", access: "existing", refresh: "existing", expires: 1 },
+    };
+    const plan = planPiCredentialSync(current, {
+      credentials: {
+        anthropic: { type: "oauth", access: "newer", refresh: "newer", expires: 2 },
+        zai: { type: "api_key", key: "zai-key" },
+      },
+    });
+    expect(plan.added).toEqual(["zai"]);
+    expect(plan.kept).toEqual(["anthropic"]);
+    expect(plan.mergeAlibabaCatalogue).toBe(false);
+    // The existing entry won: never clobbered by the (possibly staler) source.
+    expect((current.anthropic as { access: string }).access).toBe("existing");
+    expect((current.zai as { key: string }).key).toBe("zai-key");
+  });
+
+  test("flags the Alibaba catalogue merge only when alibaba-plan is genuinely new", () => {
+    const plan = planPiCredentialSync({}, {
+      credentials: { "alibaba-plan": { type: "api_key", key: "k" } },
+      alibabaProvider: { baseUrl: "https://example", api: "anthropic-messages", models: [] },
+    });
+    expect(plan.added).toEqual(["alibaba-plan"]);
+    expect(plan.mergeAlibabaCatalogue).toBe(true);
+
+    const kept = planPiCredentialSync({ "alibaba-plan": { type: "api_key", key: "already" } }, {
+      credentials: { "alibaba-plan": { type: "api_key", key: "k" } },
+      alibabaProvider: { baseUrl: "https://example", api: "anthropic-messages", models: [] },
+    });
+    expect(kept.added).toEqual([]);
+    expect(kept.mergeAlibabaCatalogue).toBe(false);
+  });
+});
+
+describe("syncPiCredentials", () => {
+  async function zaiSource(root: string): Promise<string> {
+    const dir = join(root, "zai");
+    await json(join(dir, "crush.json"), { providers: { zai: { api_key: "zai-sync" } } });
+    return dir;
+  }
+
+  test("writes only the missing providers and preserves every existing entry", async () => {
+    const root = await temporaryRoot();
+    const pi = join(root, "pi");
+    await json(join(pi, "auth.json"), {
+      anthropic: { type: "oauth", access: "keep", refresh: "keep", expires: 1 },
+    });
+    const result = await syncPiCredentials(pi, { zai: await zaiSource(root) });
+    expect(result.added).toEqual(["zai"]);
+    // kept only reports providers a SOURCE offered; the untouched anthropic
+    // entry was never offered by a source here.
+    expect(result.kept).toEqual([]);
+    const auth = await Bun.file(join(pi, "auth.json")).json();
+    expect(auth.anthropic).toEqual({ type: "oauth", access: "keep", refresh: "keep", expires: 1 });
+    expect(auth.zai).toEqual({ type: "api_key", key: "zai-sync" });
+    expect((await stat(join(pi, "auth.json"))).mode & 0o777).toBe(0o600);
+    // No Alibaba source: models.json untouched (absent).
+    expect(await Bun.file(join(pi, "models.json")).exists()).toBe(false);
+  });
+
+  test("a no-op sync leaves auth.json byte-identical", async () => {
+    const root = await temporaryRoot();
+    const pi = join(root, "pi");
+    await json(join(pi, "auth.json"), { zai: { type: "api_key", key: "already" } });
+    const before = await Bun.file(join(pi, "auth.json")).text();
+    const result = await syncPiCredentials(pi, { zai: await zaiSource(root) });
+    expect(result.added).toEqual([]);
+    expect(await Bun.file(join(pi, "auth.json")).text()).toBe(before);
+  });
+
+  test("merges the Alibaba catalogue when the alibaba-plan credential is new", async () => {
+    const root = await temporaryRoot();
+    const pi = join(root, "pi");
+    const ali = join(root, "ali");
+    await json(join(ali, "crush.json"), {
+      providers: {
+        alibaba: {
+          api_key: "ali-sync",
+          base_url: "https://token-plan.example/apps/anthropic",
+          models: [{ id: "qwen-sync", can_reason: false }],
+        },
+      },
+    });
+    const result = await syncPiCredentials(pi, { ali });
+    expect(result.added).toEqual(["alibaba-plan"]);
+    expect(result.modelsPath).toBe(join(pi, "models.json"));
+    const models = await Bun.file(join(pi, "models.json")).json();
+    expect(models.providers["alibaba-plan"].models[0]).toMatchObject({ id: "qwen-sync" });
+  });
+
+  test("rejects a sync with no selected credential sources", async () => {
+    const root = await temporaryRoot();
+    await expect(syncPiCredentials(join(root, "pi"), {})).rejects.toThrow("No Pi credential sources");
   });
 });

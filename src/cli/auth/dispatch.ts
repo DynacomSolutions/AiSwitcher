@@ -10,6 +10,7 @@ import {
   startAliAuthSession,
 } from "../../identities/auth-session.ts";
 import { runPiAuthImport } from "./pi-import.ts";
+import { runPiAuthSync } from "./pi-sync.ts";
 
 async function resolveAliIdentity(positionals: string[], flags: ParsedArgs["flags"]) {
   if (stringFlag(flags, "tool") !== undefined && stringFlag(flags, "tool") !== "ali") {
@@ -49,6 +50,10 @@ export async function runAuthCommand(positionals: string[], flags: ParsedArgs["f
   const [subcommand = "login", ...rest] = positionals;
   if (subcommand === "import") {
     await runPiAuthImport(rest, flags);
+    return;
+  }
+  if (subcommand === "sync") {
+    await runPiAuthSync(rest, flags);
     return;
   }
   const identity = await resolveAliIdentity(rest, flags);
