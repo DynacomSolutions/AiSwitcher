@@ -2,6 +2,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { resolveRealBinary, MANAGED_REAL_BIN_DIR } from "../shared/resolve-binary.ts";
+import { resolveHerdrBinary } from "../shared/herdr-bin.ts";
 import { spawnCaptured, spawnCapturedBounded, type BoundedSpawnResult, type CapturedRunResult } from "../shared/exec.ts";
 import { BinaryResolutionError } from "../identities/errors.ts";
 import {
@@ -136,6 +137,11 @@ export interface UpgradeDeps {
   shimExists(toolName: string): Promise<boolean>;
   which(command: string): string | null;
   resolve(binaryName: ToolConfig["realBinaryName"]): string;
+  /** herdr is not an AIS shim and has no installer spec: it rides the
+   * upgrade list ONLY when already installed (the resolver returns its
+   * path). Null = not installed = no row and never an install, so ais
+   * keeps out of herdr's "updates are independent" contract. */
+  herdrBinary?(): string | null;
   /** Fully-captured installer run (see spawnCaptured): output is buffered
    * per tool and only surfaced on failure or in non-TTY failure reports,
    * never streamed into the live status list. */
@@ -312,6 +318,7 @@ function defaultDeps(log: (message: string) => void = console.log): UpgradeDeps 
     shimExists: async (toolName) => await Bun.file(join(SHIM_DIR, toolName)).exists(),
     which: (command) => Bun.which(command),
     resolve: (binaryName) => resolveRealBinary(binaryName),
+    herdrBinary: () => resolveHerdrBinary() ?? null,
     spawn: async (command, args) => await spawnCaptured(command, args, {}),
     capture: async (command, args) => await spawnCapturedBounded(command, args, {}, 10_000),
     managedBinaryExists: async (binaryName) =>
@@ -378,6 +385,49 @@ function describeVersionChange(before: string | undefined, after: string | undef
   if (!before) return after;
   if (before === after) return `${after} (reinstalled)`;
   return `${before} -> ${after}`;
+}
+
+/** Row id for herdr, which is not a ToolConfig and has no UpgradeSpec:
+ * it rides the status list as its own row when (and only when) the binary
+ * is already installed. */
+export const HERDR_UPGRADE_ID = "herdr";
+
+/** "herdr 0.8.2" -> "0.8.2"; any failure is simply no version (the row then
+ * shows the generic "updated" outcome instead of an invented number). */
+async function capturedBinaryVersion(
+  deps: UpgradeDeps,
+  binary: string,
+): Promise<string | undefined> {
+  try {
+    const probe = await deps.capture(binary, ["--version"]);
+    if (probe.timedOut || probe.exitCode !== 0) return undefined;
+    return probe.stdout.trim().split(/\s+/).pop() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** herdr's own updater: `herdr update` (verified against herdr 0.8.2's
+ * documented CLI; it has no --yes-style flag and never prompts). Output is
+ * captured like every other installer child. */
+async function upgradeHerdr(
+  deps: UpgradeDeps,
+  herdr: string,
+  prefix: string,
+  log: (line: string) => void,
+): Promise<UpgradeInstallResult> {
+  const before = await capturedBinaryVersion(deps, herdr);
+  log(`${prefix} running ${cyan("herdr update")} (${herdr})`);
+  const update = await awaitUpgradeStep(deps.spawn(herdr, ["update"]), "herdr updater", log);
+  const cancelled = cancellationFor(update.exitCode);
+  if (cancelled) throw cancelled;
+  if (update.exitCode !== 0) {
+    throw new Error(`herdr update exited with code ${update.exitCode}`);
+  }
+  const after = await capturedBinaryVersion(deps, herdr);
+  if (!after) return { ok: true };
+  if (before === after) return { ok: true, detail: `already ${after}` };
+  return { ok: true, detail: describeVersionChange(before, after) };
 }
 
 async function runNativeFallback(spec: UpgradeSpec, deps: UpgradeDeps, prefix: string): Promise<UpgradeInstallResult> {
@@ -526,7 +576,9 @@ function emit(hooks: UpgradeRunHooks, event: UpgradeEvent): void {
  * once: the first spec of each key is the leader, the rest are followers
  * that await the leader's outcome (a leader failure fails its followers'
  * rows but is only counted once in the summary, matching the historical
- * sequential behaviour). Failures never abort sibling upgrades; a
+ * sequential behaviour). herdr rides alongside as its own row when the
+ * binary is already installed (its native updater runs; it is never
+ * installed). Failures never abort sibling upgrades; a
  * cancellation exit code (Ctrl-C and friends) stops being ignored, lets the
  * already-running installs settle, and is rethrown once everything
  * terminates so callers can set the process exit code.
@@ -615,7 +667,59 @@ export async function runUpgradeWithDeps(
     }
   };
 
-  await Promise.all(planned.filter((task) => !task.followerOf).map(runTask));
+  const herdrTask = async (): Promise<void> => {
+    const herdr = deps.herdrBinary?.() ?? null;
+    // Not installed: no row was seeded either (runUpgrade consults the same
+    // resolver), and AIS must never install herdr on its own.
+    if (!herdr) return;
+    const name = HERDR_UPGRADE_ID;
+    const logLines: string[] = [];
+    const spawned: CapturedRunResult[] = [];
+    const log = (line: string) => {
+      logLines.push(line);
+      deps.log(line);
+    };
+    const taskDeps: UpgradeDeps = {
+      ...deps,
+      log,
+      spawn: async (command, args) => {
+        const result = await deps.spawn(command, args);
+        spawned.push(result);
+        return result;
+      },
+    };
+    emit(hooks, { type: "start", id: name });
+    const startedAt = Date.now();
+    let outcome: { ok: boolean; detail?: string; reason?: string };
+    try {
+      const result = await upgradeHerdr(taskDeps, herdr, prefix, log);
+      outcome = { ok: result.ok, detail: result.detail };
+    } catch (err) {
+      if (err instanceof UpgradeCancelledError) {
+        cancellation = cancellation ?? err;
+        outcome = { ok: false, reason: "cancelled" };
+      } else {
+        outcome = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    const elapsed = formatSeconds(Date.now() - startedAt);
+    if (outcome.ok) {
+      emit(hooks, { type: "finish", id: name, ok: true, detail: `${outcome.detail ?? "updated"} (${elapsed})` });
+      summary.checked++;
+    } else {
+      const reason = outcome.reason ?? "update failed";
+      emit(hooks, { type: "finish", id: name, ok: false, detail: `${reason} (${elapsed})` });
+      summary.failed++;
+      hooks.onFailure?.({
+        toolName: name,
+        reason,
+        logLines,
+        output: combineOutput(spawned),
+      });
+    }
+  };
+
+  await Promise.all([Promise.all(planned.filter((task) => !task.followerOf).map(runTask)), herdrTask()]);
   if (cancellation) throw cancellation;
   return summary;
 }
@@ -676,7 +780,13 @@ export async function runUpgrade(): Promise<void> {
   // or CI output falls back to plain sequential-style start/finish lines.
   const live = process.stdout.isTTY === true;
   const startedAt = Date.now();
-  let rows: UpgradeRow[] = createUpgradeRows(UPGRADE_SPECS.map((spec) => spec.cfg.toolName));
+  // herdr only gets a row when it is already installed (same resolver the
+  // runner consults), matching the "only installed tools" spirit.
+  const herdrInstalled = resolveHerdrBinary() !== undefined;
+  let rows: UpgradeRow[] = createUpgradeRows([
+    ...UPGRADE_SPECS.map((spec) => spec.cfg.toolName),
+    ...(herdrInstalled ? [HERDR_UPGRADE_ID] : []),
+  ]);
   const failures: UpgradeFailure[] = [];
 
   const run = () =>
