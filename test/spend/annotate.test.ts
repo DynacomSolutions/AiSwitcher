@@ -53,10 +53,18 @@ const MAPPING_DEPS = {
 };
 
 describe("annotateWithSpendGuard", () => {
-  test("a breached account's rows carry the loud over-cap note", () => {
-    const [row] = annotateWithSpendGuard([limitResult("guarded")], cache({ "123456789012": state({ breached: true, effectiveUsd: 1004, localEstimateUsd: 1004, reason: "over" }) }), MAPPING_DEPS);
+  test("a breached account's rows carry the loud over-cap note (enforce mode)", () => {
+    const [row] = annotateWithSpendGuard([limitResult("guarded")], cache({ "123456789012": state({ breached: true, effectiveUsd: 1004, localEstimateUsd: 1004, reason: "over" }) }), { ...MAPPING_DEPS, mode: "enforce" });
     expect(row.windows[0]?.note).toContain("SPEND GUARD: over cap");
     expect(row.windows[0]?.note).toContain("launches blocked");
+  });
+
+  test("warn mode (the default) notes the breach as warning-only, pointing at the config", () => {
+    const [row] = annotateWithSpendGuard([limitResult("guarded")], cache({ "123456789012": state({ breached: true, effectiveUsd: 1004, localEstimateUsd: 1004, reason: "over" }) }), MAPPING_DEPS);
+    expect(row.windows[0]?.note).toContain("SPEND GUARD: over cap");
+    expect(row.windows[0]?.note).toContain("warning only, not blocking");
+    expect(row.windows[0]?.note).toContain("set mode=enforce in ~/.ais/config/spend-guard.json to block");
+    expect(row.windows[0]?.note).not.toContain("launches blocked");
   });
 
   test("a degraded account says why it is unenforced", () => {
@@ -80,7 +88,7 @@ describe("annotateWithSpendGuard", () => {
     const [row] = annotateWithSpendGuard(
       [withNote],
       cache({ "123456789012": state({ breached: true, effectiveUsd: 1004, localEstimateUsd: 1004, reason: "over" }) }),
-      MAPPING_DEPS,
+      { ...MAPPING_DEPS, mode: "enforce" },
     );
     expect(row.windows[0]?.note).toContain("over budget");
     expect(row.windows[0]?.note).toContain("SPEND GUARD");
