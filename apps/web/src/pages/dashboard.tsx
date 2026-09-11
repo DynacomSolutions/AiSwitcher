@@ -126,9 +126,11 @@ function ProcessesTable() {
   );
 }
 
-function AccountRow({ account }: { account: SpendGuardAccountState }) {
+function AccountRow({ account, mode }: { account: SpendGuardAccountState; mode: "warn" | "enforce" }) {
   const pct = account.budgetLimitUsd !== undefined && account.budgetLimitUsd > 0 ? clampPercent((account.effectiveUsd / account.budgetLimitUsd) * 100) : undefined;
-  const tone = account.breached ? "bg-red-500" : pct !== undefined && pct >= 70 ? "bg-amber-500" : undefined;
+  const enforceBreach = account.breached && mode === "enforce";
+  const warnBreach = account.breached && mode !== "enforce";
+  const tone = enforceBreach ? "bg-red-500" : warnBreach ? "bg-amber-500" : pct !== undefined && pct >= 70 ? "bg-amber-500" : undefined;
   return (
     <div className="space-y-1.5">
       <div className="flex items-baseline justify-between gap-3 text-sm">
@@ -146,8 +148,10 @@ function AccountRow({ account }: { account: SpendGuardAccountState }) {
           {account.realReportedUsd !== undefined ? ` · Cost Explorer ${formatMoney(account.realReportedUsd)}` : ""}
           {account.identities.length > 0 ? ` · ${account.identities.join(", ")}` : ""}
         </span>
-        {account.breached ? (
-          <Badge variant="destructive">BREACHED: launches blocked, active sessions terminated</Badge>
+        {enforceBreach ? (
+          <Badge variant="destructive">BREACHED (enforced): launches blocked, active sessions terminated</Badge>
+        ) : warnBreach ? (
+          <Badge variant="warning">BREACHED (warning): not blocking</Badge>
         ) : account.degraded ? (
           <Badge variant="warning">UNENFORCED</Badge>
         ) : (
@@ -174,10 +178,17 @@ function SpendGuardCard() {
       <CardHeader>
         <CardTitle className="text-base">
           Spend guard{" "}
-          {data.accounts.some((a) => a.breached) ? <Badge variant="destructive">OVER CAP</Badge> : null}
+          {data.accounts.some((a) => a.breached) ? (
+            data.config.mode === "enforce" ? (
+              <Badge variant="destructive">OVER CAP</Badge>
+            ) : (
+              <Badge variant="warning">OVER CAP (warning only)</Badge>
+            )
+          ) : null}
         </CardTitle>
         <CardDescription>
           Per AWS account: local estimate blended with real AWS-reported spend against the account's own Budgets cap.
+          {data.config.mode === "enforce" ? " Breaches block launches and terminate sessions." : " Breaches warn only; set mode=enforce in ~/.ais/config/spend-guard.json to block."}
           {data.lastCycleAt ? (
             <>
               {" "}Last cycle <RelativeTime iso={data.lastCycleAt} />.
@@ -189,7 +200,7 @@ function SpendGuardCard() {
         {data.accounts.length === 0 ? (
           <p className="text-sm text-muted-foreground">No AWS accounts are mapped for enforcement.</p>
         ) : (
-          data.accounts.map((account) => <AccountRow key={account.accountId} account={account} />)
+          data.accounts.map((account) => <AccountRow key={account.accountId} account={account} mode={data.config.mode} />)
         )}
         {data.lastError ? <p className="text-xs text-muted-foreground">Last cycle errors: {data.lastError}</p> : null}
         {data.recentKills.length > 0 ? (

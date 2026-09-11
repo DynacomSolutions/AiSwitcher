@@ -46,11 +46,14 @@ export async function runWrapper(
     });
 
     // SPEND GUARD launch gate: before ANY side effect (auth refreshes, sync
-    // watchers, desktop launches, the real binary), refuse to start a new
-    // wrapped session on an AWS account that is over its Budgets cap.
-    // Enforcement runs on last-known cached state (<50ms fresh); a missing
-    // or stale cache queues an opportunistic background refresh and never
-    // blocks on missing data. No override exists by design.
+    // watchers, desktop launches, the real binary), check the AWS account's
+    // last-known spend state. mode decides the breach response: "warn" (the
+    // default, also with no config file) prints one loud stderr warning and
+    // continues the launch; "enforce" refuses to start a new wrapped
+    // session (exit 1). Enforcement runs on last-known cached state (<50ms
+    // fresh); a missing or stale cache queues an opportunistic background
+    // refresh and never blocks on missing data. No override exists by
+    // design.
     const gate = await runLaunchGate({
       toolName: cfg.toolName,
       ...(resolved.identity ? { identity: resolved.identity } : {}),

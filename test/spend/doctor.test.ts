@@ -40,11 +40,21 @@ describe("spendGuardDoctorRows", () => {
     expect(row.detail).toContain("acme-bedrock");
   });
 
-  test("breached: hung/BREACHED with the enforcement wording", () => {
-    const [row] = spendGuardDoctorRows(cycle([state({ breached: true, effectiveUsd: 1004, localEstimateUsd: 1004, reason: "over" })]));
+  test("breached + enforce: hung/BREACHED (enforced) with the blocking wording", () => {
+    const [row] = spendGuardDoctorRows(cycle([state({ breached: true, effectiveUsd: 1004, localEstimateUsd: 1004, reason: "over" })]), "enforce");
     expect(row.status).toBe("hung");
-    expect(row.statusWord).toBe("BREACHED");
+    expect(row.statusWord).toBe("BREACHED (enforced)");
     expect(row.detail).toContain("new launches blocked, active sessions terminated");
+  });
+
+  test("breached + warn (the default): BREACHED (warning), nothing blocked, points at the config", () => {
+    const breached = cycle([state({ breached: true, effectiveUsd: 1004, localEstimateUsd: 1004, reason: "over" })]);
+    const [row] = spendGuardDoctorRows(breached);
+    expect(row.status).toBe("hung");
+    expect(row.statusWord).toBe("BREACHED (warning)");
+    expect(row.detail).toContain("warning only: launches and sessions untouched");
+    expect(row.detail).toContain("set mode=enforce in ~/.ais/config/spend-guard.json to block");
+    expect(row.detail).not.toContain("blocked");
   });
 
   test("degraded: unavailable/DEGRADED carrying the reason", () => {

@@ -5,11 +5,13 @@ import { join } from "node:path";
 import {
   DEFAULT_KILL_GRACE_S,
   DEFAULT_SPEND_GUARD_INTERVAL_S,
+  DEFAULT_SPEND_GUARD_MODE,
   MIN_SPEND_GUARD_INTERVAL_S,
   parseSpendGuardConfig,
   SpendGuardScheduler,
   type SpendGuardSchedulerDeps,
 } from "../../src/server/spend-guard.ts";
+import { loadSpendGuardConfig } from "../../src/spend/config.ts";
 import { runSpendGuardCycle } from "../../src/spend/compute.ts";
 import { loadSpendGuardCache } from "../../src/spend/cache.ts";
 import type { AccountSpendState } from "../../src/spend/state.ts";
@@ -41,17 +43,40 @@ function state(overrides: Partial<AccountSpendState> = {}): AccountSpendState {
 
 describe("parseSpendGuardConfig", () => {
   test("defaults when absent; clamps interval up to the minimum and grace into a sane band", () => {
-    expect(parseSpendGuardConfig(undefined)).toEqual({ intervalS: DEFAULT_SPEND_GUARD_INTERVAL_S, killGraceS: DEFAULT_KILL_GRACE_S });
+    expect(parseSpendGuardConfig(undefined)).toEqual({ intervalS: DEFAULT_SPEND_GUARD_INTERVAL_S, killGraceS: DEFAULT_KILL_GRACE_S, mode: DEFAULT_SPEND_GUARD_MODE });
     expect(parseSpendGuardConfig({ intervalS: 5, killGraceS: 10 }).intervalS).toBe(MIN_SPEND_GUARD_INTERVAL_S);
     expect(parseSpendGuardConfig({ intervalS: "abc" }).intervalS).toBe(DEFAULT_SPEND_GUARD_INTERVAL_S);
     expect(parseSpendGuardConfig({ killGraceS: 9999 }).killGraceS).toBe(120);
-    expect(parseSpendGuardConfig({ intervalS: 60, killGraceS: 2 })).toEqual({ intervalS: 60, killGraceS: 2 });
+    expect(parseSpendGuardConfig({ intervalS: 60, killGraceS: 2 })).toEqual({ intervalS: 60, killGraceS: 2, mode: "warn" });
+  });
+
+  test("mode: absent key and absent file default to warn; only the exact word enforces", () => {
+    expect(parseSpendGuardConfig({}).mode).toBe("warn");
+    expect(parseSpendGuardConfig({ intervalS: 300, killGraceS: 10 }).mode).toBe("warn");
+    expect(parseSpendGuardConfig({ mode: "warn" }).mode).toBe("warn");
+    expect(parseSpendGuardConfig({ mode: "enforce" }).mode).toBe("enforce");
+    // A typoed mode must never surprise-enforce: it falls to warn.
+    expect(parseSpendGuardConfig({ mode: "enforce " }).mode).toBe("warn");
+    expect(parseSpendGuardConfig({ mode: "ENFORCE" }).mode).toBe("warn");
+    expect(parseSpendGuardConfig({ mode: 1 }).mode).toBe("warn");
+  });
+
+  test("loadSpendGuardConfig: missing file warns; the live file shape keeps unrelated keys", async () => {
+    const missing = await loadSpendGuardConfig(join(TMP, "no-such-spend-guard.json"));
+    expect(missing.mode).toBe("warn");
+    expect(missing.intervalS).toBe(DEFAULT_SPEND_GUARD_INTERVAL_S);
+    const path = join(TMP, "sg-config.json");
+    await Bun.write(path, JSON.stringify({ intervalS: 300, killGraceS: 10 }));
+    expect(await loadSpendGuardConfig(path)).toEqual({ intervalS: 300, killGraceS: 10, mode: "warn" });
+    await Bun.write(path, JSON.stringify({ intervalS: 120, killGraceS: 5, mode: "enforce", note: "unrelated key preserved by the parser's tolerance" }));
+    const loaded = await loadSpendGuardConfig(path);
+    expect(loaded).toMatchObject({ intervalS: 120, killGraceS: 5, mode: "enforce" });
   });
 });
 
 function schedulerDeps(overrides: Partial<SpendGuardSchedulerDeps> = {}): SpendGuardSchedulerDeps {
   return {
-    config: { intervalS: 60, killGraceS: 1 },
+    config: { intervalS: 60, killGraceS: 1, mode: "enforce" },
     cycle: async () => ({ states: {}, errors: [], computedAt: NOW.toISOString() }),
     scan: async () => ({ processes: [] }),
     signal: () => {},
@@ -137,6 +162,44 @@ describe("SpendGuardScheduler transitions", () => {
     expect(scheduler.status().lastError).toContain("SSO");
   });
 
+  test("warn mode: a fresh breach records state but never kills; the skip is logged and exposed", async () => {
+    const signalled: Array<[number, string]> = [];
+    const logs: string[] = [];
+    const scheduler = new SpendGuardScheduler(
+      schedulerDeps({
+        config: { intervalS: 60, killGraceS: 1, mode: "warn" },
+        cycle: async () => ({ states: { "123456789012": state() }, errors: [], computedAt: NOW.toISOString() }),
+        scan: async () => ({
+          processes: [{ pid: 111, tool: "codex", identity: "canary-identity", cwd: null, startedAt: null, command: "codex", wrapped: true }],
+        }),
+        signal: (pid, sig) => signalled.push([pid, sig]),
+        log: (m) => logs.push(m),
+      }),
+    );
+    await scheduler.tick();
+    expect(signalled).toEqual([]);
+    expect(scheduler.status().recentKills).toEqual([]);
+    expect(scheduler.status().config.mode).toBe("warn");
+    // The breach itself is still recorded for the gate and every surface.
+    expect(scheduler.status().accounts[0]?.breached).toBe(true);
+    expect(logs.join("\n")).toContain("mode=warn");
+    expect(logs.join("\n")).toContain("NOT killing");
+  });
+
+  test("warn mode still persists the breached state to the gate's cache", async () => {
+    const cachePath = join(TMP, `warn-cache-${Math.random().toString(36).slice(2)}.json`);
+    const scheduler = new SpendGuardScheduler(
+      schedulerDeps({
+        config: { intervalS: 60, killGraceS: 1, mode: "warn" },
+        cycle: async () => ({ states: { "123456789012": state() }, errors: [], computedAt: NOW.toISOString() }),
+        cachePath,
+      }),
+    );
+    await scheduler.tick();
+    const cached = await loadSpendGuardCache(cachePath);
+    expect(cached?.accounts["123456789012"]?.breached).toBe(true);
+  });
+
   test("the fresh cycle result is persisted for the launch gate to read", async () => {
     const cachePath = schedulerDeps({}).cachePath!;
     const scheduler = new SpendGuardScheduler(schedulerDeps({ cachePath, cycle: async () => ({ states: { "123456789012": state() }, errors: [], computedAt: NOW.toISOString() }) }));
@@ -189,7 +252,7 @@ describe("spend guard killer (real process canary)", () => {
       const logs: string[] = [];
       const scheduler = new SpendGuardScheduler(
         schedulerDeps({
-          config: { intervalS: 60, killGraceS: 5 },
+          config: { intervalS: 60, killGraceS: 5, mode: "enforce" },
           cycle: async () => ({ states: { "123456789012": state() }, errors: [], computedAt: NOW.toISOString() }),
           // Explicit undefined: fall back to the REAL /proc scanner, REAL
           // signals, and REAL liveness checks for this test.
@@ -218,4 +281,47 @@ describe("spend guard killer (real process canary)", () => {
       cleanup();
     }
   }, 40_000);
+
+  test("warn mode: the marked canary SURVIVES a breach tick untouched (no signal ever sent)", async () => {
+    const dir = join(TMP, "kill-fixture-warn");
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    copyFileSync("/bin/sleep", join(dir, "bin", "codex"));
+
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+    env.AI_PROFILE_SWITCHER_SESSION = "canary-identity";
+    const marked = Bun.spawn([join(dir, "bin", "codex"), "60"], { env, stdout: "ignore", stderr: "ignore" });
+    const cleanup = (): void => {
+      try {
+        marked.kill(9);
+      } catch {
+        // already gone
+      }
+    };
+
+    try {
+      await Bun.sleep(300);
+      const logs: string[] = [];
+      const scheduler = new SpendGuardScheduler(
+        schedulerDeps({
+          config: { intervalS: 60, killGraceS: 1, mode: "warn" },
+          cycle: async () => ({ states: { "123456789012": state() }, errors: [], computedAt: NOW.toISOString() }),
+          scan: undefined,
+          signal: undefined,
+          alive: undefined,
+          sleep: undefined,
+          log: (m) => logs.push(m),
+        }),
+      );
+      await scheduler.tick();
+
+      await Bun.sleep(1_500); // longer than the grace an enforce kill would have used
+      expect(marked.exitCode).toBeNull(); // still running: nothing signalled it
+      expect(scheduler.status().recentKills).toEqual([]);
+      expect(logs.join("\n")).toContain("NOT killing");
+      expect(logs.join("\n")).not.toContain("KILLING");
+    } finally {
+      cleanup();
+    }
+  }, 20_000);
 });

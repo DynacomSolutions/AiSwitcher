@@ -1,18 +1,23 @@
 import type { DoctorResult } from "../cli/doctor/types.ts";
 import { runSpendGuardCycle, type SpendCycleDeps, type SpendGuardCycleResult } from "./compute.ts";
+import { loadSpendGuardConfig, type SpendGuardMode } from "./config.ts";
 
 /**
  * `ais doctor`'s spend-guard section: one row per AWS account with a
- * budget, saying plainly whether it is in budget, BREACHED (launches
- * blocked, active sessions terminated), or DEGRADED (unenforced, with the
- * reason). Implemented standalone on this branch (no other degraded pattern
- * to reuse): it runs a REAL read-only cycle — the same budgets/Cost
- * Explorer/local-estimate pipeline the daemon runs — so doctor's answer is
- * live truth, not a cached maybe. Accounts appear only when the machine has
- * an identity->AWS mapping; everyone else sees no section at all.
+ * budget, saying plainly whether it is in budget, BREACHED, or DEGRADED
+ * (unenforced, with the reason). A breach is qualified by the machine-local
+ * mode: "BREACHED (enforced)" is the original hard stop (launches blocked,
+ * sessions terminated); "BREACHED (warning)" means the same breach with the
+ * default warn response, where nothing is refused or killed and the detail
+ * says how to switch. Implemented standalone on this branch (no other
+ * degraded pattern to reuse): it runs a REAL read-only cycle — the same
+ * budgets/Cost Explorer/local-estimate pipeline the daemon runs — so
+ * doctor's answer is live truth, not a cached maybe. Accounts appear only
+ * when the machine has an identity->AWS mapping; everyone else sees no
+ * section at all.
  */
 
-export function spendGuardDoctorRows(result: SpendGuardCycleResult): DoctorResult[] {
+export function spendGuardDoctorRows(result: SpendGuardCycleResult, mode: SpendGuardMode = "warn"): DoctorResult[] {
   const rows: DoctorResult[] = [];
   for (const state of Object.values(result.states)) {
     const suffix = state.accountId.slice(-4);
@@ -37,12 +42,15 @@ export function spendGuardDoctorRows(result: SpendGuardCycleResult): DoctorResul
       continue;
     }
     if (state.breached) {
+      const warned = mode !== "enforce";
       rows.push({
         toolName: "aws-spend-guard",
         identity: { name: `account ...${suffix}`, label: `profile ${state.profile}`, configDir: "" },
         status: "hung",
-        statusWord: "BREACHED",
-        detail: `${cap} · enforcing on ${money(state.effectiveUsd)} (${signals}) — new launches blocked, active sessions terminated${who}`,
+        statusWord: warned ? "BREACHED (warning)" : "BREACHED (enforced)",
+        detail: warned
+          ? `${cap} · enforcing on ${money(state.effectiveUsd)} (${signals}) · warning only: launches and sessions untouched; set mode=enforce in ~/.ais/config/spend-guard.json to block${who}`
+          : `${cap} · enforcing on ${money(state.effectiveUsd)} (${signals}) — new launches blocked, active sessions terminated${who}`,
       });
       continue;
     }
@@ -58,6 +66,6 @@ export function spendGuardDoctorRows(result: SpendGuardCycleResult): DoctorResul
 }
 
 export async function collectSpendGuardDoctor(deps: SpendCycleDeps = {}): Promise<DoctorResult[]> {
-  const cycle = await runSpendGuardCycle(deps);
-  return spendGuardDoctorRows(cycle);
+  const [cycle, config] = await Promise.all([runSpendGuardCycle(deps), loadSpendGuardConfig()]);
+  return spendGuardDoctorRows(cycle, config.mode);
 }

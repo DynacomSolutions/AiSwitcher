@@ -2709,15 +2709,26 @@ Decisions are final by design; the reasoning is recorded here.
   there is deliberately no manual cap config), a local token-based estimate
   summed across EVERY identity mapped to the account, and real AWS-reported
   spend (Cost Explorer Bedrock spend plus the budget's own
-  CalculatedSpend.ActualSpend). The LAUNCH GATE (`spend/gate.ts`, wired in
-  run-wrapper.ts) refuses new wrapped sessions on a breached account before
-  any side effect, with a full refusal (account, budget, cap, estimate vs
-  real, period) and exit 1. The DAEMON KILLER (`server/spend-guard.ts`,
-  default 5-min cycle from ~/.ais/config/spend-guard.json, the only config
-  that exists) terminates ACTIVE wrapped sessions on the TRANSITION into
-  breach (first observation counts; a stayed-breached account is not
+  CalculatedSpend.ActualSpend). What a breach DOES is decided by the
+  machine-local config's `mode` key (`spend/config.ts`,
+  ~/.ais/config/spend-guard.json): `"warn"` is the DEFAULT (also when the
+  key or the whole file is absent, by owner decision 2026-09-11) and
+  surfaces the breach loudly everywhere while refusing nothing and killing
+  nobody; `"enforce"` is the original hard stop, preserved exactly. In
+  enforce mode the LAUNCH GATE (`spend/gate.ts`, wired in run-wrapper.ts)
+  refuses new wrapped sessions on a breached account before any side
+  effect, with a full refusal (account, budget, cap, estimate vs real,
+  period) and exit 1; in warn mode the same gate prints ONE loud warning
+  (account, budget, cap, effective spend, and how to switch) and the launch
+  continues. In enforce mode the DAEMON KILLER (`server/spend-guard.ts`,
+  default 5-min cycle) terminates ACTIVE wrapped sessions on the TRANSITION
+  into breach (first observation counts; a stayed-breached account is not
   re-killed): SIGTERM, 10s grace, SIGKILL, every kill logged loudly and
-  exposed on GET /api/spend-guard with the state.
+  exposed on GET /api/spend-guard with the state. In warn mode the killer
+  still computes and records every account state and breach transition, but
+  the kill action is unreachable (no scan, no signal) and the skip is
+  logged. Every surface (DTO, `ais doctor`, `ais limits` notes, WebUI)
+  distinguishes BREACHED (warning) from BREACHED (enforced).
 - **The local estimate is a direct log reader, not tokscale.** The gate
   must be fast and fully offline: a warm tokscale spawn measured ~2.4s for
   one codex identity and its report has no date filter, so
@@ -2742,9 +2753,11 @@ Decisions are final by design; the reasoning is recorded here.
   status, `ais doctor`, `ais limits` notes, and the WebUI. Never block on
   missing data; never silently skip either.
 - **No override.** No env var, no flag, no interactive bypass exists, for
-  the gate or the killer. Editing or removing the budget in AWS (or the
-  machine-local identity->profile mapping) is the only escape, and that is
-  accepted.
+  the gate or the killer. The one switch is deliberate and machine-local:
+  `mode` in ~/.ais/config/spend-guard.json ("warn" default, "enforce" to
+  restore the hard stop). Editing or removing the budget in AWS (or the
+  machine-local identity->profile mapping) is the only other escape, and
+  that is accepted.
 - **What cannot be enforced.** In-flight requests always complete: the
   killer signals processes and cannot retract a request a model is already
   generating (billed tokens may still land after the cap is hit). The

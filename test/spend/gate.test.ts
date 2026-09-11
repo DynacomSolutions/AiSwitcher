@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildRefusal, evaluateLaunchGate, type LaunchGateDeps } from "../../src/spend/gate.ts";
+import { buildBreachWarning, buildRefusal, evaluateLaunchGate, runLaunchGate, type LaunchGateDeps } from "../../src/spend/gate.ts";
 import type { AccountSpendState } from "../../src/spend/state.ts";
 import type { SpendGuardCache } from "../../src/spend/cache.ts";
 
@@ -39,6 +39,7 @@ const MAPPED: LaunchGateDeps = {
   target: { profile: "acme-prod", accountId: "123456789012", region: "eu-west-2" },
   now: () => NOW,
   intervalS: 300,
+  mode: "enforce",
 };
 
 describe("evaluateLaunchGate", () => {
@@ -60,7 +61,7 @@ describe("evaluateLaunchGate", () => {
     expect(outcome.warn).toContain("invalid");
   });
 
-  test("cached breach -> BLOCK with a complete refusal", () => {
+  test("cached breach -> BLOCK with a complete refusal (enforce mode)", () => {
     const outcome = evaluateLaunchGate("codex", "guarded", { ...MAPPED, cache: cache({ "123456789012": state() }) });
     expect(outcome.decision).toBe("block");
     expect(outcome.refusal).toContain("launch REFUSED");
@@ -72,6 +73,48 @@ describe("evaluateLaunchGate", () => {
     expect(outcome.refusal).toContain("Cost Explorer $990.00");
     expect(outcome.refusal).toContain("no override");
     expect(outcome.refresh).toBe(false); // fresh cache: nothing to do
+  });
+
+  test("cached breach -> ALLOW with one loud warning (warn mode, the default)", () => {
+    const outcome = evaluateLaunchGate("codex", "guarded", {
+      target: MAPPED.target,
+      now: () => NOW,
+      intervalS: 300,
+      cache: cache({ "123456789012": state() }),
+    });
+    expect(outcome.decision).toBe("allow");
+    expect(outcome.refusal).toBeUndefined();
+    expect(outcome.warn).toContain("WARNING");
+    expect(outcome.warn).toContain("...9012");
+    expect(outcome.warn).toContain("acme-prod");
+    expect(outcome.warn).toContain("acme-bedrock-monthly");
+    expect(outcome.warn).toContain("$1000.00");
+    expect(outcome.warn).toContain("current effective spend $1004.12");
+    expect(outcome.warn).toContain("warning only - not blocking; set mode=enforce in ~/.ais/config/spend-guard.json to block");
+    expect(outcome.refresh).toBe(false); // fresh cache: nothing to do
+  });
+
+  test("an explicit mode=enforce blocks even though warn is the default; a stale warn breach still warns + refreshes", () => {
+    const staleCache = cache({ "123456789012": state() }, { updatedAt: "2026-09-09T10:00:00.000Z" });
+    const warn = evaluateLaunchGate("codex", "guarded", {
+      target: MAPPED.target,
+      now: () => NOW,
+      intervalS: 300,
+      mode: "warn",
+      cache: staleCache,
+    });
+    expect(warn.decision).toBe("allow");
+    expect(warn.warn).toContain("warning only - not blocking");
+    expect(warn.refresh).toBe(true);
+    const enforce = evaluateLaunchGate("codex", "guarded", {
+      target: MAPPED.target,
+      now: () => NOW,
+      intervalS: 300,
+      mode: "enforce",
+      cache: staleCache,
+    });
+    expect(enforce.decision).toBe("block");
+    expect(enforce.refresh).toBe(true);
   });
 
   test("cached healthy -> allow, silent", () => {
@@ -141,10 +184,26 @@ describe("buildRefusal", () => {
   });
 });
 
-/** The full-process proof: a REAL wrapper invocation against a temp HOME
+describe("buildBreachWarning", () => {
+  test("warn-mode wording: full picture, launch continues, says how to enforce", () => {
+    const text = buildBreachWarning("codex", "guarded", state());
+    expect(text).toContain("AWS spend guard WARNING for identity \"guarded\"");
+    expect(text).toContain("...9012");
+    expect(text).toContain("acme-prod");
+    expect(text).toContain("acme-bedrock-monthly");
+    expect(text).toContain("cap $1000.00");
+    expect(text).toContain("current effective spend $1004.12");
+    expect(text).toMatch(/period since \d{4}-\d{2}-\d{2}/);
+    expect(text).toContain("warning only - not blocking; set mode=enforce in ~/.ais/config/spend-guard.json to block");
+    expect(text).not.toContain("REFUSED");
+  });
+});
+
+/** The full-process proof: REAL wrapper invocations against a temp HOME
  * with a synthetic identity mapped to a fake account and a synthetic cache
- * showing breach -> refusal on stderr, exit code 1, and (crucially) the
- * real binary never spawned. */
+ * showing breach, in BOTH modes: warn (config absent) -> warning on stderr,
+ * exit 0, the real binary runs; enforce -> refusal on stderr, exit code 1,
+ * and (crucially) the real binary never spawned. */
 /** Child env with every escape hatch that could reach the REAL machine
  * neutralised: no inherited session marker, no real AWS config overrides,
  * no managed real-bin dir. */
@@ -161,39 +220,82 @@ function isolatedChildEnv(home: string): Record<string, string> {
 }
 
 describe("launch gate end-to-end (temp HOME)", () => {
-  test("a breached account refuses a real wrapper launch with exit code 1 and the exact message", async () => {
+  /** Shared fixture: a temp HOME with a synthetic identity mapped to a fake
+   * account and a synthetic cache showing breach. `mode` writes the
+   * machine-local spend-guard config accordingly (undefined = file left
+   * ABSENT, the default-yields-warn path). */
+  async function breachedHome(home: string, mode?: "warn" | "enforce"): Promise<void> {
+    mkdirSync(join(home, ".codex", "identities", "guarded"), { recursive: true });
+    mkdirSync(join(home, ".ais", "config"), { recursive: true });
+    mkdirSync(join(home, ".ais", "cache"), { recursive: true });
+    mkdirSync(join(home, ".aws"), { recursive: true });
+    mkdirSync(join(home, "shims"), { recursive: true });
+    mkdirSync(join(home, "bin"), { recursive: true });
+
+    writeFileSync(
+      join(home, ".codex", "identities.json"),
+      JSON.stringify({ version: 1, identities: [{ name: "guarded", label: "Guarded", configDir: join(home, ".codex", "identities", "guarded") }] }),
+    );
+    writeFileSync(
+      join(home, ".ais", "config", "aws-profiles.json"),
+      JSON.stringify({ version: 1, identities: { guarded: { profile: "fake-profile" } } }),
+    );
+    writeFileSync(join(home, ".aws", "config"), "[profile fake-profile]\nsso_account_id = 123456789012\nregion = eu-west-2\n");
+    writeFileSync(
+      join(home, ".ais", "cache", "spend-guard.json"),
+      JSON.stringify(cache({ "123456789012": state() })),
+    );
+    if (mode !== undefined) {
+      writeFileSync(join(home, ".ais", "config", "spend-guard.json"), JSON.stringify({ mode }));
+    }
+    // A fake `ais` so the gate's detached refresh spawn is a no-op, and a
+    // fake `codex` whose output proves whether the real binary was allowed
+    // to run (a block must happen BEFORE the real binary).
+    const fakeAis = join(home, "shims", "ais");
+    writeFileSync(fakeAis, "#!/bin/sh\nexit 0\n");
+    chmodSync(fakeAis, 0o755);
+    const fakeCodex = join(home, "bin", "codex");
+    writeFileSync(fakeCodex, "#!/bin/sh\necho FAKE_CODEX_RAN\necho 'REAL BINARY MUST NOT RUN WHEN BLOCKED' >&2\nexit 0\n");
+    chmodSync(fakeCodex, 0o755);
+  }
+
+  test("warn mode (config file ABSENT: the default) allows the launch with one loud warning, exit 0, child runs", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ais-gate-warn-"));
+    const childEnv = isolatedChildEnv(home);
+    try {
+      await breachedHome(home); // no spend-guard.json written at all
+      childEnv.AI_PROFILE_SWITCHER_SHIM_DIR = join(home, "shims");
+      childEnv.PATH = `${join(home, "bin")}:${childEnv.PATH ?? ""}`;
+
+      const src = join(import.meta.dir, "..", "..", "src", "codex.ts");
+      const proc = Bun.spawn([process.execPath, src, "--id=guarded"], {
+        env: childEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: home,
+      });
+      const timer = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("gate e2e warn child hung")), 30_000));
+      const [stdout, stderr, exitCode] = await Promise.race([
+        Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]),
+        timer,
+      ]);
+      expect(exitCode).toBe(0);
+      expect(stdout).toContain("FAKE_CODEX_RAN");
+      expect(stderr).toContain("AWS spend guard WARNING");
+      expect(stderr).toContain("...9012");
+      expect(stderr).toContain("acme-bedrock-monthly");
+      expect(stderr).toContain("$1000.00");
+      expect(stderr).toContain("warning only - not blocking; set mode=enforce in ~/.ais/config/spend-guard.json to block");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("enforce mode refuses a real wrapper launch with exit code 1 and the exact message", async () => {
     const home = mkdtempSync(join(tmpdir(), "ais-gate-home-"));
     const childEnv = isolatedChildEnv(home);
     try {
-      mkdirSync(join(home, ".codex", "identities", "guarded"), { recursive: true });
-      mkdirSync(join(home, ".ais", "config"), { recursive: true });
-      mkdirSync(join(home, ".ais", "cache"), { recursive: true });
-      mkdirSync(join(home, ".aws"), { recursive: true });
-      mkdirSync(join(home, "shims"), { recursive: true });
-      mkdirSync(join(home, "bin"), { recursive: true });
-
-      writeFileSync(
-        join(home, ".codex", "identities.json"),
-        JSON.stringify({ version: 1, identities: [{ name: "guarded", label: "Guarded", configDir: join(home, ".codex", "identities", "guarded") }] }),
-      );
-      writeFileSync(
-        join(home, ".ais", "config", "aws-profiles.json"),
-        JSON.stringify({ version: 1, identities: { guarded: { profile: "fake-profile" } } }),
-      );
-      writeFileSync(join(home, ".aws", "config"), "[profile fake-profile]\nsso_account_id = 123456789012\nregion = eu-west-2\n");
-      writeFileSync(
-        join(home, ".ais", "cache", "spend-guard.json"),
-        JSON.stringify(cache({ "123456789012": state() })),
-      );
-      // A fake `ais` so the gate's detached refresh spawn is a no-op, and a
-      // fake `codex` that would loudly fail the test if it were ever
-      // spawned (a block must happen BEFORE the real binary).
-      const fakeAis = join(home, "shims", "ais");
-      writeFileSync(fakeAis, "#!/bin/sh\nexit 0\n");
-      chmodSync(fakeAis, 0o755);
-      const fakeCodex = join(home, "bin", "codex");
-      writeFileSync(fakeCodex, "#!/bin/sh\necho 'REAL BINARY MUST NOT RUN WHEN BLOCKED' >&2\nexit 0\n");
-      chmodSync(fakeCodex, 0o755);
+      await breachedHome(home, "enforce");
       childEnv.AI_PROFILE_SWITCHER_SHIM_DIR = join(home, "shims");
       childEnv.PATH = `${join(home, "bin")}:${childEnv.PATH ?? ""}`;
 
@@ -205,8 +307,8 @@ describe("launch gate end-to-end (temp HOME)", () => {
         cwd: home,
       });
       const timer = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("gate e2e child hung")), 30_000));
-      const [stderr, exitCode] = await Promise.race([
-        Promise.all([new Response(proc.stderr).text(), proc.exited]),
+      const [stdout, stderr, exitCode] = await Promise.race([
+        Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]),
         timer,
       ]);
       expect(exitCode).toBe(1);
@@ -214,6 +316,7 @@ describe("launch gate end-to-end (temp HOME)", () => {
       expect(stderr).toContain("...9012");
       expect(stderr).toContain("acme-bedrock-monthly");
       expect(stderr).not.toContain("REAL BINARY MUST NOT RUN");
+      expect(stdout).not.toContain("FAKE_CODEX_RAN");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
