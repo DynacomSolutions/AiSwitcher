@@ -89,16 +89,22 @@ interface SpawnedDaemon {
   requestedPort: number;
 }
 
-function spawnDaemon(port: number | undefined): SpawnedDaemon {
+/** argv prefix that re-invokes THIS ais process. Compiled binary:
+ * process.execPath is the real executable and Bun.main is a VIRTUAL
+ * "/$bunfs/root/<name>" path (which can pass a plain statSync!). Dev
+ * (`bun src/ais.ts`): Bun.main is a real script file, so the bun runtime
+ * must be prepended. Discriminator: a SCRIPT EXTENSION plus on-disk
+ * existence; the bunfs path has neither a script extension nor a real
+ * directory entry that survives both checks. Shared by the detached
+ * daemon spawn and herdr's `__herdr_panel` panes. */
+export function aisEntrypoint(): string[] {
   const main = Bun.main;
-  // Compiled binary: Bun.main is a VIRTUAL "/$bunfs/root/<name>" path
-  // (which can pass a plain statSync!) and process.execPath is the real
-  // executable. Dev (`bun src/ais.ts`): Bun.main is a real script file.
-  // Discriminator: a SCRIPT EXTENSION plus on-disk existence; the bunfs
-  // path has neither a script extension nor a real directory entry that
-  // survives both checks.
   const looksLikeScript = /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(main) && statSyncSafe(main);
-  const inner = looksLikeScript ? [process.execPath, main] : [process.execPath];
+  return looksLikeScript ? [process.execPath, main] : [process.execPath];
+}
+
+function spawnDaemon(port: number | undefined): SpawnedDaemon {
+  const inner = aisEntrypoint();
   // setsid puts the daemon in its OWN session/process group so closing the
   // launching terminal cannot SIGHUP it (the server also ignores HUP as a
   // second layer for machines without setsid).

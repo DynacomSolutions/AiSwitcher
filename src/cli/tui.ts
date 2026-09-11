@@ -35,7 +35,10 @@ export async function runTuiCommand(_positionals: string[], _flags: Record<strin
   if (code !== 0) process.exit(code);
 }
 
-function resolveTuiBinary(): string | undefined {
+/** Resolves the aistui binary: AIS_TUI_BIN, ~/.local/bin/aistui, then this
+ * checkout's cargo target dir. Shared with `ais herdr`'s wrapper (the
+ * overview panel is the same binary in --overview mode). */
+export function resolveTuiBinary(): string | undefined {
   const candidates = [
     process.env.AIS_TUI_BIN,
     join(homedir(), ".local", "bin", "aistui"),
