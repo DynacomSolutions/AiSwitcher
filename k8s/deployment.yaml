@@ -43,6 +43,18 @@ spec:
               value: "600000"
             - name: AIS_K8S_API_SERVER
               value: https://kubernetes.default.svc
+            - name: AIS_WEB_STATE_DIR
+              # Pod-local console lifecycle state (server.json,
+              # auth-refresh-state.json, file-edit backups). The pod sees the
+              # host's ~/.ais via the hostPath mounts AND shares its PID
+              # namespace (hostPID), so a shared ~/.ais/web/server.json let
+              # each side's lifecycle churn kill the other's daemon (observed
+              # live: a host `ais web stop` SIGTERMed the pod's daemon; the
+              # Deployment restarted with Reason "Completed") and the two
+              # clobbered each other's port/token. Relocating the state dir
+              # plus src/cli/web.ts's /proc cmdline kill-guard make
+              # `ais web stop` on either side refuse to touch the other.
+              value: /web/state
           ports:
             - containerPort: ${PORT}
           readinessProbe:
@@ -90,6 +102,13 @@ spec:
             # on a cold container (observed live).
             - name: bun-cache
               mountPath: /home/thomas/.bun
+            # Writable pod-local home for AIS_WEB_STATE_DIR. emptyDir on
+            # purpose (NOT a hostPath): the whole point is that this state is
+            # NOT the host's. It is rebuilt on every daemon start and dies
+            # with the pod, which only costs ephemeral pre-edit file backups
+            # and refresh-failure counters.
+            - name: web-state
+              mountPath: /web/state
       volumes:
         - name: ais-home
           hostPath:
@@ -139,3 +158,5 @@ spec:
           hostPath:
             path: /home/thomas/.bun
             type: Directory
+        - name: web-state
+          emptyDir: {}
