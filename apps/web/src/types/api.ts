@@ -88,7 +88,7 @@ export interface SpendGuardKillRecord {
 export interface SpendGuardResponse {
   ok: true;
   running: boolean;
-  config: { intervalS: number; killGraceS: number };
+  config: { intervalS: number; killGraceS: number; mode: "warn" | "enforce" };
   lastCycleAt: string | null;
   lastError: string | null;
   accounts: SpendGuardAccountState[];
