@@ -18,6 +18,7 @@ import {
 import type { ToolConfig } from "../identities/types.ts";
 import { cyan, dim, green, red, yellow } from "./colors.ts";
 import { spinnerChar, withLiveRender } from "./live.ts";
+import { insideHerdrPane } from "./herdr.ts";
 import {
   applyUpgradeEvent,
   createUpgradeRows,
@@ -142,6 +143,11 @@ export interface UpgradeDeps {
    * path). Null = not installed = no row and never an install, so ais
    * keeps out of herdr's "updates are independent" contract. */
   herdrBinary?(): string | null;
+  /** True when this process runs inside a herdr pane (herdr sets HERDR_*
+   * env in its panes). `herdr update` refuses in that situation, so the
+   * runner pre-checks it and skips the row instead of counting a failure
+   * herdr's own contract guarantees. */
+  insideHerdr?(): boolean;
   /** Fully-captured installer run (see spawnCaptured): output is buffered
    * per tool and only surfaced on failure or in non-TTY failure reports,
    * never streamed into the live status list. */
@@ -319,6 +325,7 @@ function defaultDeps(log: (message: string) => void = console.log): UpgradeDeps 
     which: (command) => Bun.which(command),
     resolve: (binaryName) => resolveRealBinary(binaryName),
     herdrBinary: () => resolveHerdrBinary() ?? null,
+    insideHerdr: () => insideHerdrPane(process.env),
     spawn: async (command, args) => await spawnCaptured(command, args, {}),
     capture: async (command, args) => await spawnCapturedBounded(command, args, {}, 10_000),
     managedBinaryExists: async (binaryName) =>
@@ -407,6 +414,26 @@ async function capturedBinaryVersion(
   }
 }
 
+/** herdr update's own refusal while a herdr client is attached (verified
+ * live: "update failed: run `herdr update` outside herdr after detaching
+ * from the session"). Tolerant of the backtick quoting style. */
+const HERDR_ATTACHED_REFUSAL = /run [`"']?herdr update[`"']? outside herdr/i;
+
+/** Thrown when herdr's updater refuses because a herdr client is attached.
+ * herdr's contract guarantees this outcome, so it is a skip, not a failure
+ * — the pre-check (insideHerdr) normally catches it first; this is the
+ * defensive net for any other attachment shape the env check misses. */
+export class HerdrAttachedError extends Error {
+  constructor() {
+    super("herdr update refused: herdr is running");
+    this.name = "HerdrAttachedError";
+  }
+}
+
+function herdrRefusedBecauseAttached(result: { stdout: string; stderr: string }): boolean {
+  return HERDR_ATTACHED_REFUSAL.test(`${result.stdout}\n${result.stderr}`);
+}
+
 /** herdr's own updater: `herdr update` (verified against herdr 0.8.2's
  * documented CLI; it has no --yes-style flag and never prompts). Output is
  * captured like every other installer child. */
@@ -422,6 +449,7 @@ async function upgradeHerdr(
   const cancelled = cancellationFor(update.exitCode);
   if (cancelled) throw cancelled;
   if (update.exitCode !== 0) {
+    if (herdrRefusedBecauseAttached(update)) throw new HerdrAttachedError();
     throw new Error(`herdr update exited with code ${update.exitCode}`);
   }
   const after = await capturedBinaryVersion(deps, herdr);
@@ -673,6 +701,22 @@ export async function runUpgradeWithDeps(
     // resolver), and AIS must never install herdr on its own.
     if (!herdr) return;
     const name = HERDR_UPGRADE_ID;
+    const skipDetail =
+      "skipped (herdr is running; detach and rerun ais upgrade, or run herdr update yourself)";
+    const skipHerdr = (logReason: string) => {
+      summary.skipped++;
+      deps.log(`${prefix} ${yellow(logReason)}`);
+      emit(hooks, { type: "skip", id: name, detail: skipDetail });
+    };
+    // Pre-check: herdr's updater refuses while this process sits in a herdr
+    // pane (HERDR_* env), and that refusal is herdr's contract, not an
+    // upgrade failure. Skip before spawning anything.
+    if (deps.insideHerdr?.()) {
+      skipHerdr(
+        "herdr update skipped: herdr is running in this session (detach and rerun ais upgrade, or run herdr update yourself)",
+      );
+      return;
+    }
     const logLines: string[] = [];
     const spawned: CapturedRunResult[] = [];
     const log = (line: string) => {
@@ -698,6 +742,13 @@ export async function runUpgradeWithDeps(
       if (err instanceof UpgradeCancelledError) {
         cancellation = cancellation ?? err;
         outcome = { ok: false, reason: "cancelled" };
+      } else if (err instanceof HerdrAttachedError) {
+        // Defensive net: the updater's own refusal if the env pre-check
+        // missed the attachment (same skip row, never a failed count).
+        skipHerdr(
+          "herdr update refused because herdr is running (detach and rerun ais upgrade, or run herdr update yourself)",
+        );
+        return;
       } else {
         outcome = { ok: false, reason: err instanceof Error ? err.message : String(err) };
       }
