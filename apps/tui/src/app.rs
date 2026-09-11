@@ -147,7 +147,9 @@ impl<T> Default for FetchState<T> {
 }
 
 impl<T> FetchState<T> {
-    fn record(&mut self, result: Result<T, ApiError>) -> bool {
+    /// Records one poll outcome; pub because the overview mode (a separate
+    /// screen with its own endpoints, see overview.rs) shares this type.
+    pub fn record(&mut self, result: Result<T, ApiError>) -> bool {
         match result {
             Ok(data) => {
                 self.data = Some(data);

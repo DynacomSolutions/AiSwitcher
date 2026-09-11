@@ -331,3 +331,43 @@ pub struct AuthEntry {
     #[serde(default)]
     pub fixable: Vec<String>,
 }
+
+/* herdr metadata bridge (the overview's highlight source) */
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HerdrBridgeResponse {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub panes: Vec<HerdrBridgePane>,
+}
+
+/// Mirrors the fields of HerdrBridgePaneDto (src/server/herdr-bridge.ts)
+/// that the overview actually consumes; the rest of the payload's shape is
+/// documented in docs/API.md.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HerdrBridgePane {
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// True only for herdr's currently focused pane.
+    #[serde(default)]
+    pub focused: Option<bool>,
+    #[serde(default)]
+    pub identity: Option<String>,
+}
+
+/* Spend guard (breach marker source) */
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SpendGuardResponse {
+    #[serde(default)]
+    pub accounts: Vec<SpendGuardAccount>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SpendGuardAccount {
+    #[serde(default)]
+    pub breached: Option<bool>,
+    #[serde(default)]
+    pub identities: Vec<String>,
+}

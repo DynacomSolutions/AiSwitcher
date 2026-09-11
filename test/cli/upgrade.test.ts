@@ -598,3 +598,105 @@ describe("parallel upgrade behaviour", () => {
     expect(aliLast?.type === "finish" && aliLast.ok).toBe(false);
   });
 });
+
+describe("herdr row", () => {
+  test("no herdr binary means no herdr events, spawns, or installs", async () => {
+    const { deps, hooks, events, spawns } = fakeDeps({
+      herdrBinary: () => null,
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("claude")], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(events.filter((event) => event.id === "herdr")).toEqual([]);
+    expect(spawns.filter((call) => call.command.includes("herdr"))).toEqual([]);
+  });
+
+  test("an installed herdr runs its own updater as its own row", async () => {
+    const { deps, hooks, events, spawns } = fakeDeps({
+      herdrBinary: () => "/usr/bin/herdr",
+      capture: async (command, args) => {
+        if (command === "/usr/bin/herdr" && args[0] === "--version") {
+          return { stdout: "herdr 0.8.2\n", stderr: "", exitCode: 0, timedOut: false };
+        }
+        return {
+          stdout: "Grok Build TUI\nCommands:\n  update    Update to the latest version",
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+        };
+      },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(events.map((event) => event.id)).toEqual(["herdr", "herdr"]);
+    expect(events[0]).toEqual({ type: "start", id: "herdr" });
+    expect(spawns.some((call) => call.command === "/usr/bin/herdr" && call.args[0] === "update")).toBe(true);
+    const last = events.at(-1);
+    expect(last?.type).toBe("finish");
+    expect(last?.type === "finish" && last.ok).toBe(true);
+    expect(last?.type === "finish" && last.detail?.startsWith("already 0.8.2")).toBe(true);
+  });
+
+  test("a version transition is reported as before -> after", async () => {
+    let installed = "0.8.2";
+    const { deps, hooks, events } = fakeDeps({
+      herdrBinary: () => "/usr/bin/herdr",
+      capture: async (command, args) => {
+        if (command === "/usr/bin/herdr" && args[0] === "--version") {
+          return { stdout: `herdr ${installed}\n`, stderr: "", exitCode: 0, timedOut: false };
+        }
+        return { stdout: "", stderr: "", exitCode: 0, timedOut: false };
+      },
+      spawn: async () => {
+        installed = "0.8.3";
+        return { exitCode: 0, stdout: "updated\n", stderr: "" };
+      },
+    });
+
+    await runUpgradeWithDeps(deps, [], hooks);
+
+    const last = events.at(-1);
+    expect(last?.type).toBe("finish");
+    expect(last?.type === "finish" && last.detail?.startsWith("0.8.2 -> 0.8.3")).toBe(true);
+  });
+
+  test("a failed herdr update is a failed row with the captured output surfaced", async () => {
+    const failures: Array<{ toolName: string; reason: string; output: string }> = [];
+    const { deps, events } = fakeDeps({
+      herdrBinary: () => "/usr/bin/herdr",
+      spawn: async (_command, args) => ({
+        exitCode: args[0] === "update" ? 1 : 0,
+        stdout: "",
+        stderr: "download failed: connection reset",
+      }),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [], {
+      onEvent: (event) => events.push(event),
+      onFailure: (failure) => failures.push(failure),
+    });
+
+    expect(summary).toEqual({ checked: 0, failed: 1, skipped: 0 });
+    const last = events.at(-1);
+    expect(last?.type).toBe("finish");
+    expect(last?.type === "finish" && last.ok).toBe(false);
+    expect(failures[0]?.toolName).toBe("herdr");
+    expect(failures[0]?.output).toContain("connection reset");
+  });
+
+  test("an unreadable --version degrades to the generic 'updated' outcome, never a fake number", async () => {
+    const { deps, events } = fakeDeps({
+      herdrBinary: () => "/usr/bin/herdr",
+      capture: async () => ({ stdout: "", stderr: "boom", exitCode: 1, timedOut: false }),
+    });
+
+    await runUpgradeWithDeps(deps, [], { onEvent: (event) => events.push(event) });
+
+    const last = events.at(-1);
+    expect(last?.type).toBe("finish");
+    expect(last?.type === "finish" && last.detail?.startsWith("updated")).toBe(true);
+  });
+});

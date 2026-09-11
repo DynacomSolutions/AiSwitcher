@@ -1,7 +1,7 @@
-import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
+import { resolveHerdrBinary } from "../shared/herdr-bin.ts";
 import { readProcessEnviron, type EnvironAttribution } from "./processes.ts";
 import { runScanIsolated } from "./workers.ts";
 
@@ -119,19 +119,11 @@ export interface HerdrCommandResult {
   error?: string;
 }
 
-/** Resolves the herdr binary: PATH first, then the documented install
- * location (~/.local/bin/herdr). Undefined when herdr is not installed. */
-export function resolveHerdrBinary(): string | undefined {
-  const which = Bun.which("herdr");
-  if (which) return which;
-  const fallback = join(homedir(), ".local", "bin", "herdr");
-  try {
-    if (statSync(fallback).isFile()) return fallback;
-  } catch {
-    // not installed
-  }
-  return undefined;
-}
+/** Resolves the herdr binary for every bridge CLI call. Shared with
+ * `ais herdr` and `ais upgrade` (shared/herdr-bin.ts: AIS_HERDR_BIN
+ * override, then PATH, then ~/.local/bin/herdr; herdr is never bundled).
+ * Re-exported so existing importers keep working. */
+export { resolveHerdrBinary };
 
 /** Runs one herdr CLI command with a hard timeout. The spawned process is a
  * short-lived CLI CLIENT talking to herdr's socket; killing it on timeout
@@ -176,6 +168,10 @@ export interface HerdrPane {
   pane_id?: string;
   agent?: string;
   agent_status?: string;
+  /** herdr's own focus flag from `herdr pane list`: true for the pane the
+   * user is currently looking at. Threaded into the DTO so the aistui
+   * overview can mark the focused pane's identity more strongly. */
+  focused?: boolean;
   cwd?: string;
   terminal_title?: string;
   workspace_id?: string;
@@ -378,6 +374,9 @@ export interface HerdrBridgePaneDto {
   paneId: string;
   agent?: string;
   agentStatus?: string;
+  /** True only for herdr's currently focused pane (omitted otherwise, so
+   * at most one pane in the list carries it). */
+  focused?: boolean;
   /** AIS attribution: the marked process's binary basename, else the
    * config-dir env vars' tool, else herdr's own agent label. */
   tool?: string;
@@ -626,6 +625,7 @@ export class HerdrBridgeScheduler {
         paneId: pane.pane_id!,
         ...(pane.agent ? { agent: pane.agent } : {}),
         ...(pane.agent_status ? { agentStatus: pane.agent_status } : {}),
+        ...(pane.focused ? { focused: true } : {}),
         tool,
         identity,
         ...(pane.terminal_title ? { title: pane.terminal_title } : {}),

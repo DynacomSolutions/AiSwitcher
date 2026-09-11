@@ -181,6 +181,7 @@ plain shell panes and unmarked sessions never appear.
       "paneId": "w2B:p1",
       "agent": "opencode",     // herdr's own agent label
       "agentStatus": "working",
+      "focused": true,         // only on the pane herdr currently shows; omitted (not false) elsewhere
       "tool": "opencode",      // AIS attribution (marked binary / config-dir env)
       "identity": "workco",
       "title": "OC | ...",
@@ -202,7 +203,9 @@ interval with no config change or restart), `active` (pushes happen each
 cycle with a TTL of three intervals so stale panes clear themselves). A
 pane whose identity has no limits data is listed but carries no
 percentages and gets no push. `push: false` in the machine config
-suppresses the metadata writes only.
+suppresses the metadata writes only. `focused` mirrors herdr's own
+pane-focus flag (threaded from `herdr pane list`) and is the consumer-side
+highlight source for `aistui --overview`; at most one pane carries it.
 
 ### Identities
 
