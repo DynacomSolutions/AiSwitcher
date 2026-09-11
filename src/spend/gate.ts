@@ -6,13 +6,13 @@ import { periodStartForTimeUnit } from "./state.ts";
 import type { AccountSpendState } from "./state.ts";
 import { estimateIdentityLocalSpend } from "../shared/local-spend.ts";
 import { cacheAgeS, loadSpendGuardCache, type SpendGuardCache } from "./cache.ts";
+import { loadSpendGuardConfig, type SpendGuardMode } from "./config.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 /**
  * The LAUNCH GATE: every wrapped session start flows through here before
- * the real binary (or the desktop app) is spawned. Semantics, fixed by
- * design and with NO override of any kind:
+ * the real binary (or the desktop app) is spawned. Semantics:
  *
  *   - The gate applies only when the active identity resolves to an AWS
  *     account through the machine-local mapping (identities/aws-profile.ts).
@@ -21,10 +21,15 @@ import { join } from "node:path";
  *     enforcement runs on LAST-KNOWN state, refreshed opportunistically in
  *     the background (detached `ais __spend_refresh`). A fresh cache makes
  *     the whole gate a single JSON read.
- *   - enforced && breached -> print the refusal (account, budget, cap,
- *     local estimate vs real spend, period) and exit non-zero. There is no
- *     env var, no flag, no interactive bypass; editing the budget in AWS or
- *     the machine-local mapping is the only escape.
+ *   - enforced && breached -> the machine-local config's `mode` decides the
+ *     response. "warn" (the DEFAULT, also when the key or the whole
+ *     spend-guard.json is absent): print ONE loud stderr warning (account,
+ *     budget, cap, effective spend, and how to switch to enforce) and
+ *     CONTINUE the launch normally. "enforce" is the original hard stop:
+ *     print the refusal (account, budget, cap, local estimate vs real
+ *     spend, period) and exit non-zero. There is no env var, no flag, no
+ *     interactive bypass of enforce; editing the budget in AWS or the
+ *     machine-local mapping is the only escape.
  *   - No cached state for the account (first launch after setup, cache
  *     deleted): the cap is unknowable offline, so the launch is ALLOWED but
  *     loudly warned, the local estimate is computed inline (fast, offline)
@@ -39,9 +44,11 @@ export interface LaunchGateOutcome {
   applies: boolean;
   decision: "allow" | "block";
   state?: AccountSpendState;
-  /** Full multi-line refusal text for stderr when blocked. */
+  /** Full multi-line refusal text for stderr when blocked (enforce mode
+   * only). */
   refusal?: string;
-  /** One-line stderr notice when allowed but degraded/unmonitored. */
+  /** One-line stderr notice when allowed but degraded/unmonitored, or the
+   * multi-line breach warning in warn mode. */
   warn?: string;
   /** True when a background refresh should be spawned (stale or missing
    * cache). */
@@ -52,6 +59,8 @@ export interface LaunchGateDeps {
   cache?: SpendGuardCache;
   now?: () => Date;
   intervalS?: number;
+  /** Breach response mode; defaults to "warn" (see spend/config.ts). */
+  mode?: SpendGuardMode;
   awsProfileDeps?: AwsProfileDeps;
   /** Injectable inline estimator (tests); default computes the local
    * estimate from the identity's own session logs. */
@@ -66,6 +75,7 @@ export const LAUNCH_GATE_FRESHNESS_FALLBACK_S = 300;
 export function evaluateLaunchGate(toolName: ToolConfig["toolName"], identityName: string, deps: LaunchGateDeps): LaunchGateOutcome {
   const now = deps.now?.() ?? new Date();
   const intervalS = deps.intervalS ?? LAUNCH_GATE_FRESHNESS_FALLBACK_S;
+  const mode = deps.mode ?? "warn";
 
   let target: AwsProfileTarget | undefined;
   if ("target" in deps) {
@@ -93,6 +103,15 @@ export function evaluateLaunchGate(toolName: ToolConfig["toolName"], identityNam
 
   if (state) {
     if (state.enforced && state.breached) {
+      if (mode !== "enforce") {
+        return {
+          applies: true,
+          decision: "allow",
+          state,
+          warn: buildBreachWarning(toolName, identityName, state),
+          refresh: needsRefresh,
+        };
+      }
       return {
         applies: true,
         decision: "block",
@@ -164,6 +183,28 @@ export function buildRefusal(toolName: ToolConfig["toolName"], identityName: str
   return lines.join("\n");
 }
 
+/** The warn-mode counterpart of the refusal: the same complete picture
+ * (account, budget, cap, effective spend, period) with a different last
+ * line, because the launch CONTINUES. One loud stderr warning, printed on
+ * every launch while the account stays breached. */
+export function buildBreachWarning(toolName: ToolConfig["toolName"], identityName: string, state: AccountSpendState): string {
+  const lines = [
+    `${toolName}: AWS spend guard WARNING for identity "${identityName}" — AWS account ...${state.accountId.slice(-4)} (profile ${state.profile}) is over its spend cap.`,
+  ];
+  if (state.budgetName !== undefined && state.budgetLimitUsd !== undefined) {
+    lines.push(
+      `  budget: ${state.budgetName}  cap $${state.budgetLimitUsd.toFixed(2)}  current effective spend $${state.effectiveUsd.toFixed(2)}`,
+    );
+  } else {
+    lines.push(`  current effective spend $${state.effectiveUsd.toFixed(2)}`);
+  }
+  if (state.periodStart !== undefined) {
+    lines.push(`  period since ${localDay(state.periodStart)}${state.periodEnd ? `, resets ${localDay(state.periodEnd)}` : ""}`);
+  }
+  lines.push("  warning only - not blocking; set mode=enforce in ~/.ais/config/spend-guard.json to block");
+  return lines.join("\n");
+}
+
 /** Same discovery as sync/background.ts's detached sync worker: prefer the
  * installed shim sibling, fall to PATH. */
 function resolveInstalledAisBinary(): string | undefined {
@@ -194,21 +235,30 @@ export function triggerBackgroundSpendRefresh(
 
 /** The run-wrapper entry point: resolve the active identity name exactly as
  * the wrapper does (registry identity name, else config-dir basename),
- * evaluate the gate, and queue the background refresh when needed. Blocking
- * is the CALLER's job (it owns process.exit), keeping this testable. */
+ * evaluate the gate (with the machine-local breach mode), and queue the
+ * background refresh when needed. Blocking is the CALLER's job (it owns
+ * process.exit), keeping this testable. */
 export async function runLaunchGate(args: {
   toolName: ToolConfig["toolName"];
   identity?: Identity;
   configDir: string;
   cachePath?: string;
   intervalS?: number;
+  /** Explicit mode override (tests); default loads the machine-local
+   * spend-guard config, whose absent-file/absent-key answer is "warn". */
+  mode?: SpendGuardMode;
+  configPath?: string;
   refresh?: typeof triggerBackgroundSpendRefresh;
 }): Promise<LaunchGateOutcome> {
   const identityName = args.identity?.name ?? basename(args.configDir.replace(/\/$/, ""));
-  const cache = await loadSpendGuardCache(args.cachePath);
+  const [cache, config] = await Promise.all([
+    loadSpendGuardCache(args.cachePath),
+    args.mode ? Promise.resolve({ mode: args.mode }) : loadSpendGuardConfig(args.configPath),
+  ]);
   const outcome = evaluateLaunchGate(args.toolName, identityName, {
     cache,
     intervalS: args.intervalS,
+    mode: config.mode,
     inlineEstimate: (periodStart: Date) => estimateIdentityLocalSpend(args.toolName, args.configDir, periodStart).usd,
   });
   if (outcome.refresh) (args.refresh ?? triggerBackgroundSpendRefresh)();

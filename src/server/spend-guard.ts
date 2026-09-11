@@ -1,16 +1,37 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { enteredBreach, type AccountSpendState } from "../spend/state.ts";
 import { runSpendGuardCycle, type SpendGuardCycleResult } from "../spend/compute.ts";
+import {
+  DEFAULT_KILL_GRACE_S,
+  DEFAULT_SPEND_GUARD_INTERVAL_S,
+  DEFAULT_SPEND_GUARD_MODE,
+  MIN_SPEND_GUARD_INTERVAL_S,
+  loadSpendGuardConfig,
+  parseSpendGuardConfig,
+  type SpendGuardConfig,
+  type SpendGuardMode,
+} from "../spend/config.ts";
 import { loadSpendGuardCache, spendGuardCachePath, writeSpendGuardCache, type SpendKillRecord, type SpendGuardCache } from "../spend/cache.ts";
 import { scanProcesses } from "./processes.ts";
 import type { ProcessInfoDto } from "./types.ts";
 
+// The config type, parser, and loader live in spend/config.ts (shared with
+// the launch gate, which must not import server code). Re-exported here so
+// existing consumers (serve.ts, tests) keep their import path.
+export {
+  DEFAULT_KILL_GRACE_S,
+  DEFAULT_SPEND_GUARD_INTERVAL_S,
+  DEFAULT_SPEND_GUARD_MODE,
+  MIN_SPEND_GUARD_INTERVAL_S,
+  loadSpendGuardConfig,
+  parseSpendGuardConfig,
+};
+export type { SpendGuardConfig, SpendGuardMode };
+
 /**
  * The daemon-side spend guard: the half that can ACT. On a fixed interval
  * (default 5 min, machine-local override via ~/.ais/config/spend-guard.json
- * — { intervalS, killGraceS }, the only config that exists because the cap
- * itself is AUTO from AWS Budgets) it runs one spend-guard cycle and:
+ * — { intervalS, killGraceS, mode }; the cap itself is AUTO from AWS
+ * Budgets) it runs one spend-guard cycle and:
  *
  *   - persists the fresh per-account states to the cache the launch gate
  *     reads (the gate is a pure consumer of this file);
@@ -18,6 +39,14 @@ import type { ProcessInfoDto } from "./types.ts";
  *     guard's first observation of an already-blown account), finds every
  *     ACTIVE wrapped session whose identity maps to that account and
  *     terminates it: SIGTERM, killGraceS grace (default 10s), then SIGKILL.
+ *
+ *   - mode decides the response to a breach. "enforce" is the behaviour
+ *     above, unchanged. "warn" (the default, also when the key or the file
+ *     is absent) still computes and records every account state and breach
+ *     transition, but the kill action is never reached: no signal can be
+ *     sent from a warn-mode scheduler. The skip is logged loudly so the
+ *     daemon log proves the gate, and /api/spend-guard exposes config.mode
+ *     with an empty recentKills ring.
  *
  * Kill targeting is deliberately narrow, on a shared production machine:
  * candidates come exclusively from the /proc scanner's AGENT_BINARIES set
@@ -29,36 +58,7 @@ import type { ProcessInfoDto } from "./types.ts";
  * recent-kills ring the /api/spend-guard endpoint exposes.
  */
 
-export const DEFAULT_SPEND_GUARD_INTERVAL_S = 300;
-export const DEFAULT_KILL_GRACE_S = 10;
-export const MIN_SPEND_GUARD_INTERVAL_S = 30;
 export const FIRST_TICK_DELAY_MS = 10_000;
-
-export interface SpendGuardConfig {
-  intervalS: number;
-  killGraceS: number;
-}
-
-/** Tolerant config parse: missing/invalid fields fall to the defaults and
- * out-of-range values are clamped (a typoed config must never disable or
- * hammer enforcement). Exported pure for tests. */
-export function parseSpendGuardConfig(raw: unknown): SpendGuardConfig {
-  const source = (raw ?? {}) as { intervalS?: unknown; killGraceS?: unknown };
-  const interval = Number(source.intervalS);
-  const grace = Number(source.killGraceS);
-  return {
-    intervalS: Number.isFinite(interval) && interval > 0 ? Math.max(MIN_SPEND_GUARD_INTERVAL_S, Math.floor(interval)) : DEFAULT_SPEND_GUARD_INTERVAL_S,
-    killGraceS: Number.isFinite(grace) && grace >= 0 ? Math.min(Math.floor(grace), 120) : DEFAULT_KILL_GRACE_S,
-  };
-}
-
-export async function loadSpendGuardConfig(path: string = join(homedir(), ".ais", "config", "spend-guard.json")): Promise<SpendGuardConfig> {
-  try {
-    return parseSpendGuardConfig(await Bun.file(path).json());
-  } catch {
-    return parseSpendGuardConfig(undefined);
-  }
-}
 
 export interface SpendGuardStatusDto {
   ok: true;
@@ -170,6 +170,16 @@ export class SpendGuardScheduler {
 
       for (const [accountId, current] of Object.entries(cycle.states)) {
         if (!enteredBreach(this.lastStates[accountId], current)) continue;
+        // The breach is computed and recorded either way; only the KILL
+        // action is mode-gated. A warn-mode scheduler can never reach
+        // killAccountSessions, so no in-flight kill can start either.
+        if (this.config.mode !== "enforce") {
+          this.log(
+            `account ...${accountId.slice(-4)} entered breach: mode=warn — warning only, NOT killing ` +
+              `(set mode=enforce in ~/.ais/config/spend-guard.json to terminate sessions)`,
+          );
+          continue;
+        }
         await this.killAccountSessions(accountId, current);
       }
 
