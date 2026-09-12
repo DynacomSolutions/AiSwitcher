@@ -804,10 +804,31 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   `--dangerously-allow-all-scripts`. This is distinct from `ais update`, which
   only refreshes this project's shim binaries. For the public npm registry,
   `upgrade.ts` resolves the small `/latest` manifest, pins npm to that exact
-  version with `--prefer-online` so stale npm metadata is revalidated, and
-  avoids reinstalling only when the package manifest and managed binary's
-  `--version` probe agree. A custom
+  version with `--prefer-online` (sent on every managed install, including the
+  `@latest` fallback, so npm's cached packument can never pick yesterday's
+  release) and avoids reinstalling only when the package manifest AND the
+  managed binary's reported `--version` semver agree with the pinned version.
+  A custom
   scoped or default npm registry never triggers a public-registry lookup.
+  Exit codes are never treated as evidence on their own (verified live
+  2026-09-12: `grok update` exits 0 printing "installed successfully" while
+  npm's install-script policy blocked the package postinstall and the binary
+  was untouched). After any install, the runner re-probes `--version` and
+  parses the first semver it prints (every vendor shape: `2.1.268 (Claude
+  Code)`, `codex-cli 0.154.0`, `crush version v0.93.1`, `grok 1.0.25 (sha)
+  [stable]`): a manifest that did not move to the pinned version, or a binary
+  on the RESOLVED path (what the shim actually execs) still reporting an older
+  version than installed, turns the row into an honest FAILED with the reason
+  (the latter is PATH shadowing: another install is winning, and reinstalling
+  cannot fix it). Grok is checked against xAI's own stable channel
+  (`https://x.ai/cli/stable`, GCS mirror fallback: the same two URLs its
+  install.sh reads, and the source its updater announces updates from; npm
+  knows nothing about it): when `grok update` exits 0 but the version is
+  still below the channel, the row falls through to xAI's installer, and if
+  the version is STILL short afterwards the row fails with "grok still
+  reports X ... channel latest is Y". With the channel unreachable the row
+  degrades to before/after version evidence ("already X" for an unchanged
+  readable version, mirroring herdr) instead of a fabricated success.
   Since the parallel-status redesign (2026-09), the upgrades themselves run
   CONCURRENTLY: `planUpgrades` checks every shim, then groups specs by
   installer key so identical physical installers (zai/ali) collapse onto one
