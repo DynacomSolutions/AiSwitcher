@@ -3,7 +3,7 @@ import { fromIni } from "@aws-sdk/credential-providers";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { resolveAwsProfileForIdentity, type AwsProfileDeps } from "../../identities/aws-profile.ts";
 import { fetchAccountBudgetWires, isSsoAuthError, withAwsTransientRetry, type BudgetsApi } from "../limits/aws-bedrock-limits.ts";
-import { readIdentityLocalSpend, type LocalEstimateDeps, type LocalSpendRead } from "../../shared/local-spend.ts";
+import { readIdentityLocalSpendAsync, type AsyncLocalEstimateDeps, type LocalSpendRead } from "../../shared/local-spend.ts";
 import { budgetSnapshotsFromWires, chooseBudget } from "../../spend/state.ts";
 import type { TokscaleEntry, TokscaleReport } from "./tokscale.ts";
 
@@ -51,6 +51,14 @@ import type { TokscaleEntry, TokscaleReport } from "./tokscale.ts";
  * Distinct from a query failure, which no longer costs the row its local
  * figures (see realCost.error). */
 export class AwsNoProfileMappedError extends Error {}
+
+/** One identity's local month-to-date read; tests may inject either shape. */
+export type LocalSpendReader = (
+  toolName: ToolConfig["toolName"],
+  configDir: string,
+  periodStart: Date,
+  deps: AsyncLocalEstimateDeps,
+) => LocalSpendRead | Promise<LocalSpendRead>;
 
 /** The subset of a GetCostAndUsage response this module reads. */
 export interface CostAndUsageBucket {
@@ -141,9 +149,9 @@ export interface AwsBedrockUsageDeps {
    * reads claude project logs without changes here. */
   localTool?: ToolConfig["toolName"];
   /** Injectable fs layer for the local readers (tests). */
-  localSpendDeps?: LocalEstimateDeps;
+  localSpendDeps?: AsyncLocalEstimateDeps;
   /** Injectable local reader itself (tests). */
-  localSpend?: typeof readIdentityLocalSpend;
+  localSpend?: LocalSpendReader;
 }
 
 export interface AwsBedrockUsageResult {
@@ -332,7 +340,7 @@ export async function fetchAwsBedrockUsage(identity: Identity, deps: AwsBedrockU
   // budget period uses (periodStartForTimeUnit), so an identity's local
   // totals here reconcile with the guard's per-identity estimate.
   const periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const read = (deps.localSpend ?? readIdentityLocalSpend)(deps.localTool ?? "codex", identity.configDir, periodStart, deps.localSpendDeps ?? {});
+  const read = await (deps.localSpend ?? readIdentityLocalSpendAsync)(deps.localTool ?? "codex", identity.configDir, periodStart, deps.localSpendDeps ?? {});
 
   const { realCost, dailyCostUsd } = await fetchRealCost(target, read, deps, now);
 

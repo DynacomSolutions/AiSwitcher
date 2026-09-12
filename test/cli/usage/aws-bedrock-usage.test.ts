@@ -244,4 +244,31 @@ describe("fetchAwsBedrockUsage", () => {
     expect(realCost?.budgetLimitUsd).toBeUndefined();
     expect(realCost?.budgetActualUsd).toBeUndefined();
   });
+
+  test("concurrent fetches overlap their local reads: wall ~= max, never the sum", async () => {
+    // The usage pipeline fans this fetcher out across Bedrock identities via
+    // runBatched, so each fetch's local read must be awaited concurrently.
+    // The regression this pins: a synchronously-blocking local reader (the
+    // 2026-09-12 usage freeze) serialises the whole fan-out on the event
+    // loop. Two ~80ms reads: overlap ~= 80-100ms, serialised >= 160ms.
+    const slowRead = async (): Promise<LocalSpendRead> => {
+      await Bun.sleep(80);
+      return LOCAL_READ;
+    };
+    const deps = () => ({
+      awsProfileDeps: MAPPING_DEPS,
+      now: () => new Date("2026-09-10T12:00:00Z"),
+      costExplorer: ceApi(costWire([{ start: "2026-09-01", amount: "0" }]), costWire([{ start: "2026-09-09", amount: "0" }])),
+      budgets: BUDGETS_API,
+      localSpend: slowRead,
+    });
+    const t0 = performance.now();
+    const [first, second] = await Promise.all([fetchAwsBedrockUsage(identity(), deps()), fetchAwsBedrockUsage(identity("acme-bedrock"), deps())]);
+    const wall = performance.now() - t0;
+    expect(wall).toBeLessThan(150);
+    // Both results still complete and identical (the read is per-identity;
+    // these two calls read the same fixture identity).
+    expect(first.report.totalMessages).toBe(7);
+    expect(second.report.totalMessages).toBe(7);
+  });
 });
