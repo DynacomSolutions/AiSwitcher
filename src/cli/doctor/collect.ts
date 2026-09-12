@@ -6,6 +6,7 @@ import { probeAliDoctor } from "./ali-doctor.ts";
 import { probeClaudeDoctor } from "./claude-doctor.ts";
 import { probeCodexDoctor } from "./codex-doctor.ts";
 import { probeGrokDoctor } from "./grok-doctor.ts";
+import { probePiDoctor } from "./pi-doctor.ts";
 import type { DoctorResult } from "./types.ts";
 
 export interface DoctorTarget {
@@ -23,6 +24,7 @@ const PROBES: Partial<Record<ToolConfig["toolName"], (identity: Identity) => Pro
   claude: probeClaudeDoctor,
   codex: probeCodexDoctor,
   grok: probeGrokDoctor,
+  pi: probePiDoctor,
 };
 
 /** Same shape/rules as usage/run.ts's collectTargets — --identity matching
