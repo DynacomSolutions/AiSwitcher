@@ -1,5 +1,6 @@
 import * as clack from "@clack/prompts";
 import { expandPath } from "../../identities/match.ts";
+import { reconcilePiOAuthStores, renderOAuthReconcileReport } from "../../identities/oauth-reconcile.ts";
 import { importPiCredentials, type PiCredentialSourceDirs } from "../../identities/pi-auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import {
@@ -76,8 +77,25 @@ export async function runPiAuthImport(positionals: string[], flags: ParsedArgs["
   }
   sourceDirs.opencodeGoApiKey = await openCodeGoApiKey(flags);
 
-  const result = await importPiCredentials(expandPath(piIdentity.configDir), sourceDirs);
+  const configDir = expandPath(piIdentity.configDir);
+  // Import OVERWRITES the supplied provider entries with the named source's
+  // copy. If pi's copy was the FRESHER one (pi refreshed since the last
+  // import), a blind import would clobber it - so adopt the freshest copy
+  // across ALL pairs first (pushing pi's fresh grant into the native store
+  // where needed); the import below then converges pi from an
+  // already-freshest native store.
+  const preReconciliation = await reconcilePiOAuthStores({ ...piIdentity, configDir }, { write: true });
+  const result = await importPiCredentials(configDir, sourceDirs);
   console.log(`Imported Pi credentials for: ${result.providers.join(", ")}.`);
   console.log(`Credential store: ${result.authPath} (mode 0600).`);
   if (result.modelsPath) console.log(`Alibaba provider catalogue: ${result.modelsPath} (mode 0600).`);
+  const healed = preReconciliation.entries.filter(
+    (entry) => entry.status === "rewrote-native" || entry.status === "rewrote-pi",
+  );
+  if (healed.length > 0) {
+    console.log("Reconciled diverged copies before importing (freshest wins):");
+    for (const line of renderOAuthReconcileReport({ ...preReconciliation, entries: healed })) {
+      console.log(`  ${line}`);
+    }
+  }
 }

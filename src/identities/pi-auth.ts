@@ -279,10 +279,12 @@ export interface PiSyncPlan {
 
 /**
  * Pure: plan an ADD-ONLY sync. A provider auth.json already holds is KEPT,
- * never overwritten: several of these credentials are rotating OAuth tokens
- * pi itself refreshes, and the freshest copy may already live in auth.json
- * (the ONE-credential-per-(identity, provider) law - see
- * src/cli/limits/kimi-store.ts). Only genuinely missing providers are added.
+ * never overwritten here: several of these credentials are rotating OAuth
+ * tokens pi itself refreshes, and the freshest copy may already live in
+ * auth.json. Convergence of kept entries is the reconcile's job (the ONE
+ * credential per (identity, provider) law: see
+ * src/identities/oauth-reconcile.ts and src/cli/limits/kimi-store.ts).
+ * Only genuinely missing providers are added.
  */
 export function planPiCredentialSync(
   currentAuth: JsonObject,

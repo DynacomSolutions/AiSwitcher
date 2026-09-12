@@ -1,4 +1,5 @@
 import { expandPath } from "../../identities/match.ts";
+import { reconcilePiOAuthStores, renderOAuthReconcileReport } from "../../identities/oauth-reconcile.ts";
 import { syncPiCredentials, type PiCredentialSourceDirs } from "../../identities/pi-auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import {
@@ -141,11 +142,16 @@ export async function runPiAuthSync(positionals: string[], flags: ParsedArgs["fl
   );
   if (result.kept.length > 0) {
     console.log(
-      `Kept existing credentials for: ${result.kept.join(", ")} (never overwritten - the freshest ` +
-        "rotating OAuth copy may already live in auth.json; refresh through the owning tool).",
+      `Kept existing credentials for: ${result.kept.join(", ")} (reconciled below - the freshest ` +
+        "rotating OAuth copy wins across all stores; see src/identities/oauth-reconcile.ts).",
     );
   }
   if (result.modelsPath) console.log(`Alibaba provider catalogue: ${result.modelsPath} (mode 0600).`);
+  // One credential per (identity, provider): converge every projected OAuth
+  // copy with its native store while we are here (the add-only sync above
+  // deliberately never touches existing entries).
+  const reconciliation = await reconcilePiOAuthStores({ ...piIdentity, configDir }, { write: true });
+  for (const line of renderOAuthReconcileReport(reconciliation)) console.log(`  ${line}`);
   for (const entry of resolved) {
     console.log(`  ${entry.key} source: ${entry.configDir} (${entry.via})`);
   }
