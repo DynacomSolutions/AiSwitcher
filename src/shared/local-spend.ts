@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdir as readdirAsync, stat as statAsync } from "node:fs/promises";
 import { join } from "node:path";
 import type { ToolConfig } from "../identities/types.ts";
 import { estimateBedrockTokenCost, unknownBedrockModelFallbackPrice } from "../identities/model-pricing.ts";
@@ -23,7 +24,11 @@ import { localDateKey } from "../cli/usage/local-day.ts";
  *     Bedrock rows show the SAME local month-to-date figures in the normal
  *     token/cost columns (so they reconcile with the guard by construction),
  *     while AWS's own real billing figures render separately as real-cost
- *     sub-rows.
+ *     sub-rows. The usage pathway reads through readIdentityLocalSpendAsync,
+ *     the chunked async twin sharing this file's scanners and reduction
+ *     verbatim: the report fans that fetch out concurrently with a live
+ *     render, so its reads must yield the event loop (the guard keeps the
+ *     sync twin: one identity, off the render's hot path).
  *
  * Readers exist for the two identity kinds that can be Bedrock-backed (see
  * identities/aws-profile.ts): codex (config.toml model_provider =
@@ -239,53 +244,73 @@ function pathYearMonth(dir: string): number {
  * PARTITIONS of input_tokens, not additions). The active model arrives via
  * `turn_context` lines (payload.model) — token_count lines carry no model —
  * so the reader tracks the most recent turn_context model and applies it to
- * subsequent token_count events. Exported for tests. */
+ * subsequent token_count events. The per-line logic lives in a stateful
+ * scanner (shared verbatim by the whole-text reader below and the async
+ * chunked reader, so both paths produce identical records); this whole-text
+ * entry point is the historical/tested surface. Exported for tests. */
 export function recordsFromCodexRollout(text: string): UsageRecord[] {
+  const scanner = codexRolloutScanner();
+  for (const line of text.split("\n")) scanner.push(line);
+  return scanner.records;
+}
+
+/** One line of codex rollout fed in isolation, carrying the reader's
+ * running state (the most recent turn_context model). `push` must be
+ * called once per "\n"-separated line, in order, INCLUDING a final empty
+ * string for newline-terminated text (a no-op, matching split("\n")). */
+interface LineScanner {
+  push(line: string): void;
+  readonly records: UsageRecord[];
+}
+
+function codexRolloutScanner(): LineScanner {
   const records: UsageRecord[] = [];
   let model = "unknown";
-  for (const line of text.split("\n")) {
-    if (!line.includes("token_count") && !line.includes("turn_context")) continue;
-    let parsed: {
-      timestamp?: string;
-      type?: string;
-      payload?: {
+  return {
+    records,
+    push(line: string): void {
+      if (!line.includes("token_count") && !line.includes("turn_context")) return;
+      let parsed: {
+        timestamp?: string;
         type?: string;
-        model?: string;
-        info?: {
-          last_token_usage?: {
-            input_tokens?: number;
-            cached_input_tokens?: number;
-            cache_write_input_tokens?: number;
-            output_tokens?: number;
+        payload?: {
+          type?: string;
+          model?: string;
+          info?: {
+            last_token_usage?: {
+              input_tokens?: number;
+              cached_input_tokens?: number;
+              cache_write_input_tokens?: number;
+              output_tokens?: number;
+            };
           };
         };
       };
-    };
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue; // a torn/truncated trailing line must not sink the estimate
-    }
-    if (parsed.type === "turn_context" && typeof parsed.payload?.model === "string") {
-      model = parsed.payload.model;
-      continue;
-    }
-    if (parsed.type !== "event_msg" || parsed.payload?.type !== "token_count") continue;
-    const usage = parsed.payload.info?.last_token_usage;
-    if (!usage) continue;
-    const input = usage.input_tokens ?? 0;
-    const cached = Math.min(usage.cached_input_tokens ?? 0, input);
-    const cacheWrite = Math.min(usage.cache_write_input_tokens ?? 0, input - cached);
-    records.push({
-      model,
-      input: Math.max(0, input - cached - cacheWrite),
-      output: usage.output_tokens ?? 0,
-      cacheRead: cached,
-      cacheWrite,
-      atMs: parseTimestamp(parsed.timestamp),
-    });
-  }
-  return records;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return; // a torn/truncated trailing line must not sink the estimate
+      }
+      if (parsed.type === "turn_context" && typeof parsed.payload?.model === "string") {
+        model = parsed.payload.model;
+        return;
+      }
+      if (parsed.type !== "event_msg" || parsed.payload?.type !== "token_count") return;
+      const usage = parsed.payload.info?.last_token_usage;
+      if (!usage) return;
+      const input = usage.input_tokens ?? 0;
+      const cached = Math.min(usage.cached_input_tokens ?? 0, input);
+      const cacheWrite = Math.min(usage.cache_write_input_tokens ?? 0, input - cached);
+      records.push({
+        model,
+        input: Math.max(0, input - cached - cacheWrite),
+        output: usage.output_tokens ?? 0,
+        cacheRead: cached,
+        cacheWrite,
+        atMs: parseTimestamp(parsed.timestamp),
+      });
+    },
+  };
 }
 
 /** claude projects JSONL: assistant lines carry `message.usage` with
@@ -293,38 +318,46 @@ export function recordsFromCodexRollout(text: string): UsageRecord[] {
  * not subsets), cache_creation_input_tokens (writes) and
  * cache_read_input_tokens (reads). Exported for tests. */
 export function recordsFromClaudeProjectLog(text: string): UsageRecord[] {
+  const scanner = claudeProjectScanner();
+  for (const line of text.split("\n")) scanner.push(line);
+  return scanner.records;
+}
+
+function claudeProjectScanner(): LineScanner {
   const records: UsageRecord[] = [];
-  for (const line of text.split("\n")) {
-    if (!line.includes('"usage"')) continue;
-    let parsed: {
-      timestamp?: string;
-      message?: {
-        model?: string;
-        usage?: {
-          input_tokens?: number;
-          output_tokens?: number;
-          cache_creation_input_tokens?: number;
-          cache_read_input_tokens?: number;
+  return {
+    records,
+    push(line: string): void {
+      if (!line.includes('"usage"')) return;
+      let parsed: {
+        timestamp?: string;
+        message?: {
+          model?: string;
+          usage?: {
+            input_tokens?: number;
+            output_tokens?: number;
+            cache_creation_input_tokens?: number;
+            cache_read_input_tokens?: number;
+          };
         };
       };
-    };
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const usage = parsed.message?.usage;
-    if (!usage) continue;
-    records.push({
-      model: parsed.message?.model ?? "unknown",
-      input: usage.input_tokens ?? 0,
-      output: usage.output_tokens ?? 0,
-      cacheRead: usage.cache_read_input_tokens ?? 0,
-      cacheWrite: usage.cache_creation_input_tokens ?? 0,
-      atMs: parseTimestamp(parsed.timestamp),
-    });
-  }
-  return records;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return;
+      }
+      const usage = parsed.message?.usage;
+      if (!usage) return;
+      records.push({
+        model: parsed.message?.model ?? "unknown",
+        input: usage.input_tokens ?? 0,
+        output: usage.output_tokens ?? 0,
+        cacheRead: usage.cache_read_input_tokens ?? 0,
+        cacheWrite: usage.cache_creation_input_tokens ?? 0,
+        atMs: parseTimestamp(parsed.timestamp),
+      });
+    },
+  };
 }
 
 function parseTimestamp(raw: string | undefined): number | undefined {
@@ -333,15 +366,40 @@ function parseTimestamp(raw: string | undefined): number | undefined {
   return Number.isFinite(ms) ? ms : undefined;
 }
 
-const READERS: Partial<Record<ToolConfig["toolName"], (text: string) => UsageRecord[]>> = {
-  codex: recordsFromCodexRollout,
-  claude: recordsFromClaudeProjectLog,
+const SCANNERS: Partial<Record<ToolConfig["toolName"], () => LineScanner>> = {
+  codex: codexRolloutScanner,
+  claude: claudeProjectScanner,
 };
 
 const SESSION_ROOTS: Partial<Record<ToolConfig["toolName"], string>> = {
   codex: "sessions",
   claude: "projects",
 };
+
+/** The period filter shared by both read paths: records with no parsable
+ * timestamp COUNT (an under-count defeats the guard), timestamped ones must
+ * fall inside the period. Order-preserving, so both paths yield records in
+ * the same file/file-line order. */
+function filterPeriod(records: UsageRecord[], periodStartMs: number): UsageRecord[] {
+  return records.filter((r) => r.atMs === undefined || r.atMs >= periodStartMs);
+}
+
+/** The zero-contribution result shapes shared by both read paths. */
+function emptyRead(notes: string[]): LocalSpendRead {
+  return {
+    usd: 0,
+    unknownModelUsd: 0,
+    filesRead: 0,
+    notes,
+    messages: 0,
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    models: [],
+    dailyTokens: {},
+  };
+}
 
 /**
  * Reads one identity's local Bedrock usage over the period starting at
@@ -360,38 +418,14 @@ export function readIdentityLocalSpend(
   periodStart: Date,
   deps: LocalEstimateDeps = {},
 ): LocalSpendRead {
-  const reader = READERS[toolName];
+  const scanner = SCANNERS[toolName];
   const rootName = SESSION_ROOTS[toolName];
-  if (!reader || !rootName) {
-    return {
-      usd: 0,
-      unknownModelUsd: 0,
-      filesRead: 0,
-      notes: [`no local session reader for tool "${toolName}"`],
-      messages: 0,
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      models: [],
-      dailyTokens: {},
-    };
+  if (!scanner || !rootName) {
+    return emptyRead([`no local session reader for tool "${toolName}"`]);
   }
   const { files, unreadable } = listRecentFiles(join(configDir, rootName), periodStart, deps, toolName === "codex");
   if (unreadable) {
-    return {
-      usd: 0,
-      unknownModelUsd: 0,
-      filesRead: 0,
-      notes: [],
-      messages: 0,
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      models: [],
-      dailyTokens: {},
-    };
+    return emptyRead([]);
   }
 
   const readText = deps.readText ?? defaultReadText;
@@ -399,17 +433,25 @@ export function readIdentityLocalSpend(
   const records: UsageRecord[] = [];
   for (const file of files) {
     try {
-      records.push(...reader(readText(file)).filter((r) => r.atMs === undefined || r.atMs >= periodStartMs));
+      const lineScanner = scanner();
+      for (const line of readText(file).split("\n")) lineScanner.push(line);
+      records.push(...filterPeriod(lineScanner.records, periodStartMs));
     } catch {
       // A file that vanished or became unreadable mid-read still leaves the
       // rest of the estimate intact.
     }
   }
+  return reduceLocalSpendRead(records, files.length);
+}
+
+/** Per-model and per-day rollups shared verbatim by the sync and async read
+ * paths (so their outputs are byte-identical by construction): the dollar
+ * total stays the record-order sum, identical to the guard's own
+ * accumulation, and the models/dailyTokens/dateSpan rollups feed the usage
+ * report's entries, token columns, contribution graph and date span. */
+function reduceLocalSpendRead(records: UsageRecord[], filesRead: number): LocalSpendRead {
   const valued = valueRecords(records);
 
-  // Per-model and per-day rollups for the usage report's entries, token
-  // columns, contribution graph and date span. The dollar total itself stays
-  // the record-order sum above, identical to the guard's own accumulation.
   const models = new Map<string, LocalSpendModelTotals>();
   const dailyTokens: Record<string, number> = {};
   let firstMs: number | undefined;
@@ -455,7 +497,7 @@ export function readIdentityLocalSpend(
   return {
     usd: valued.usd,
     unknownModelUsd: valued.unknownModelUsd,
-    filesRead: files.length,
+    filesRead,
     notes: [],
     messages,
     input,
@@ -466,6 +508,182 @@ export function readIdentityLocalSpend(
     dailyTokens,
     ...(firstMs !== undefined && lastMs !== undefined ? { firstMs, lastMs } : {}),
   };
+}
+
+/** Injectable fs layer for the async read path (tests). `readTextChunks`
+ * yields the file's text in arbitrary chunks; chunk boundaries may split
+ * multi-byte characters and lines freely, exactly like a real byte stream. */
+export interface AsyncLocalEstimateDeps {
+  readdir?: (path: string) => Promise<string[]>;
+  mtimeMs?: (path: string) => Promise<number>;
+  isDirectory?: (path: string) => Promise<boolean>;
+  readTextChunks?: (path: string) => AsyncIterable<string>;
+}
+
+function defaultReaddirAsync(path: string): Promise<string[]> {
+  return readdirAsync(path);
+}
+
+function defaultMtimeMsAsync(path: string): Promise<number> {
+  return statAsync(path).then((s) => s.mtimeMs);
+}
+
+function defaultIsDirectoryAsync(path: string): Promise<boolean> {
+  return statAsync(path).then((s) => s.isDirectory());
+}
+
+/** Async counterpart of listRecentFiles: same recursive listing, same path
+ * date and mtime pruning, same file order (readdir order), just off the
+ * event loop. Exported for tests. */
+export async function listRecentFilesAsync(
+  root: string,
+  periodStart: Date,
+  deps: AsyncLocalEstimateDeps = {},
+  prunePathDate: boolean,
+): Promise<{ files: string[]; unreadable: boolean }> {
+  const readdir = deps.readdir ?? defaultReaddirAsync;
+  const mtimeMs = deps.mtimeMs ?? defaultMtimeMsAsync;
+  const isDirectory = deps.isDirectory ?? defaultIsDirectoryAsync;
+  try {
+    await readdir(root);
+  } catch {
+    return { files: [], unreadable: true };
+  }
+
+  const startYear = periodStart.getFullYear();
+  const startMonth = periodStart.getMonth() + 1;
+  const startDay = periodStart.getDate();
+  const files: string[] = [];
+
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry);
+      // `depth` is the parent's level, so year/month/day entries sit at
+      // depth+1 = 1/2/3 under the codex sessions/YYYY/MM/DD layout.
+      const level = depth + 1;
+      if (prunePathDate && level >= 1 && level <= 3 && /^\d+$/.test(entry)) {
+        const n = Number.parseInt(entry, 10);
+        if (level === 1 && n < startYear) continue;
+        if (level === 2 && pathYear(dir) <= startYear && n < startMonth) continue;
+        if (level === 3 && pathYearMonth(dir) <= startYear * 12 + startMonth && n < startDay) continue;
+      }
+      let isDir = false;
+      let fresh = true;
+      try {
+        isDir = await isDirectory(full);
+        fresh = (await mtimeMs(full)) >= periodStart.getTime();
+      } catch {
+        continue;
+      }
+      if (isDir) await walk(full, level);
+      else if (fresh && entry.endsWith(".jsonl")) files.push(full);
+    }
+  };
+  await walk(root, 0);
+  return { files, unreadable: false };
+}
+
+/** Upper bound on decoded text handed to the scanners per await: Bun's file
+ * stream can deliver multi-megabyte buffers (or coalesce them), and a
+ * whole-file chunk would turn the line scan back into one long synchronous
+ * job. 256KiB of text scans in single-digit milliseconds, keeping every
+ * event-loop visit short. */
+const FILE_TEXT_PIECE_UNITS = 1 << 18;
+
+/** Streams one file's text as bounded pieces WITHOUT ever holding the whole
+ * file (or blocking the event loop on one giant read): Bun's file stream
+ * performs async reads while a streaming TextDecoder bridges chunk
+ * boundaries inside multi-byte characters; large buffers are re-split into
+ * FILE_TEXT_PIECE_UNITS-sized pieces. The trailing decode() flush mirrors
+ * readFileSync's replacement of a truncated final character. Exported so
+ * tests can pin the chunked (never whole-file) reading. */
+export async function* fileTextChunks(path: string): AsyncIterable<string> {
+  const decoder = new TextDecoder();
+  for await (const blob of Bun.file(path).stream()) {
+    const text = decoder.decode(blob, { stream: true });
+    for (let i = 0; i < text.length; i += FILE_TEXT_PIECE_UNITS) {
+      yield text.slice(i, i + FILE_TEXT_PIECE_UNITS);
+    }
+  }
+  const tail = decoder.decode();
+  if (tail) yield tail;
+}
+
+/** Chunks -> whole lines, verbatim: every complete "\n"-terminated line is
+ * pushed in order, and the remainder after the final newline is pushed too
+ * (the empty string for newline-terminated text), exactly the line
+ * sequence text.split("\n") produces, so the scanners see identical input
+ * whichever read path ran. */
+async function collectRecordsFromChunks(
+  path: string,
+  scanner: () => LineScanner,
+  readTextChunks: (path: string) => AsyncIterable<string>,
+): Promise<UsageRecord[]> {
+  const lineScanner = scanner();
+  let rest = "";
+  for await (const chunk of readTextChunks(path)) {
+    rest += chunk;
+    let newlineAt = rest.indexOf("\n");
+    while (newlineAt !== -1) {
+      lineScanner.push(rest.slice(0, newlineAt));
+      rest = rest.slice(newlineAt + 1);
+      newlineAt = rest.indexOf("\n");
+    }
+    // Real macrotask boundary between pieces: awaiting the stream alone
+    // turned out to run whole-file stretches inside microtasks (measured
+    // 2026-09-12: a 1ms timer fired ZERO times during a 3.2s Bun-stream
+    // read of ~1.1GB), so the live render still starved. Bun.sleep(0) is
+    // the same yield the opencode.db reader uses every 500 rows.
+    await Bun.sleep(0);
+  }
+  lineScanner.push(rest);
+  return lineScanner.records;
+}
+
+/**
+ * Async twin of readIdentityLocalSpend: same records, same filters, same
+ * valuation and rollups (the reduction is shared verbatim), but every file
+ * is read in CHUNKS off the event loop instead of one blocking readFileSync.
+ * This is the path the usage pipeline fans out with: a multi-gigabyte
+ * month-to-date log set must never stop the live render or the other
+ * concurrent fetchers, which is exactly what the sync path did (a ~1 GB
+ * month-to-date scan froze the loop for ~4-6 seconds per Bedrock identity,
+ * measured 2026-09-12).
+ */
+export async function readIdentityLocalSpendAsync(
+  toolName: ToolConfig["toolName"],
+  configDir: string,
+  periodStart: Date,
+  deps: AsyncLocalEstimateDeps = {},
+): Promise<LocalSpendRead> {
+  const scanner = SCANNERS[toolName];
+  const rootName = SESSION_ROOTS[toolName];
+  if (!scanner || !rootName) {
+    return emptyRead([`no local session reader for tool "${toolName}"`]);
+  }
+  const { files, unreadable } = await listRecentFilesAsync(join(configDir, rootName), periodStart, deps, toolName === "codex");
+  if (unreadable) {
+    return emptyRead([]);
+  }
+
+  const readTextChunks = deps.readTextChunks ?? fileTextChunks;
+  const periodStartMs = periodStart.getTime();
+  const records: UsageRecord[] = [];
+  for (const file of files) {
+    try {
+      records.push(...filterPeriod(await collectRecordsFromChunks(file, scanner, readTextChunks), periodStartMs));
+    } catch {
+      // A file that vanished or became unreadable mid-read still leaves the
+      // rest of the estimate intact.
+    }
+  }
+  return reduceLocalSpendRead(records, files.length);
 }
 
 /** The guard's estimate: the same read, reduced to the four fields the
