@@ -1,7 +1,14 @@
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { ALI_CONFIG } from "../../identities/tool-configs.ts";
+import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
+import { expandPath } from "../../identities/match.ts";
+import {
+  refreshIdentityOAuthGrant,
+  type IdentityGrantRefresh,
+  type RefreshableTool,
+} from "../../identities/oauth-refresh.ts";
 import {
   AliAuthRefreshError,
   authBrowserPorts,
@@ -14,7 +21,7 @@ import { runPiAuthSync } from "./pi-sync.ts";
 
 async function resolveAliIdentity(positionals: string[], flags: ParsedArgs["flags"]) {
   if (stringFlag(flags, "tool") !== undefined && stringFlag(flags, "tool") !== "ali") {
-    throw new CliUsageError('auth currently supports only --tool=ali');
+    throw new CliUsageError('auth login/enable/ports support only --tool=ali (auth refresh also accepts codex|claude|grok|kimi)');
   }
   const file = await loadIdentitiesFile(ALI_CONFIG.identitiesJsonPath);
   const flaggedKey = stringFlag(flags, "identity");
@@ -46,27 +53,31 @@ async function printLoginInfo(identityName: string): Promise<void> {
   console.log("Complete Alibaba sign-in/MFA in that browser. AIS will capture the cookies server-side.");
 }
 
-export async function runAuthCommand(positionals: string[], flags: ParsedArgs["flags"]): Promise<void> {
-  const [subcommand = "login", ...rest] = positionals;
-  if (subcommand === "import") {
-    await runPiAuthImport(rest, flags);
-    return;
-  }
-  if (subcommand === "sync") {
-    await runPiAuthSync(rest, flags);
-    return;
-  }
-  const identity = await resolveAliIdentity(rest, flags);
+/** The OAuth-backed tools `ais auth refresh <identity> --tool=<t>` can heal
+ * without a re-login: the daemon-side refresh machinery
+ * (src/identities/oauth-refresh.ts) exchanges the stored refresh token at
+ * the provider's token endpoint and writes the rotated grant through to
+ * every store of the account. ali is handled separately (console cookies,
+ * not OAuth). */
+const OAUTH_REFRESH_TOOLS: readonly RefreshableTool[] = ["codex", "claude", "grok", "kimi"];
 
-  if (subcommand === "login") {
-    await printLoginInfo(identity.name);
-    return;
+function renderRefreshOutcome(result: IdentityGrantRefresh): void {
+  console.log(`${result.tool}/${result.identity}: ${result.detail}`);
+  for (const failure of result.writeFailures) {
+    console.error(`  store write failed (${failure.path}): ${failure.error}`);
   }
-  if (subcommand === "refresh") {
-    // Failures are LOUD and non-zero-exit: the systemd renewal timer runs
-    // this with --quiet, so stderr + the exit code are the only signals
-    // journalctl/systemctl will ever show. Silence here is how a dead
-    // harvester went unnoticed for five days (2026-09-05..10).
+}
+
+/** `ais auth refresh <identity> --tool=<t>`: ali keeps its cookie-harvest
+ * path; codex/claude/grok/kimi run the OAuth grant refresh. Failures are
+ * LOUD and non-zero-exit: the systemd renewal timer runs the ali path with
+ * --quiet, so stderr + the exit code are the only signals journalctl will
+ * ever show (silence here is how a dead harvester went unnoticed for five
+ * days, 2026-09-05..10). */
+async function runAuthRefresh(rest: string[], flags: ParsedArgs["flags"]): Promise<void> {
+  const tool = stringFlag(flags, "tool") ?? "ali";
+  if (tool === "ali") {
+    const identity = await resolveAliIdentity(rest, flags);
     try {
       const path = await refreshAliAuthSession(identity);
       if (!boolFlag(flags, "quiet")) {
@@ -78,6 +89,57 @@ export async function runAuthCommand(positionals: string[], flags: ParsedArgs["f
       console.error(`Alibaba cookie refresh failed for ${identity.name}: ${message}${hint}`);
       process.exitCode = 1;
     }
+    return;
+  }
+  if (!(OAUTH_REFRESH_TOOLS as readonly string[]).includes(tool)) {
+    throw new CliUsageError(
+      `auth refresh supports --tool=ali|${OAUTH_REFRESH_TOOLS.join("|")} (got "${tool}")`,
+    );
+  }
+  const cfg = TOOL_CONFIGS[tool as keyof typeof TOOL_CONFIGS];
+  const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
+  const key = rest[0] ?? stringFlag(flags, "identity");
+  if (rest.length > 1) throw new CliUsageError("auth accepts at most one identity");
+  if (!key) {
+    throw new CliUsageError(`Specify the identity (for example: ais auth refresh <identity> --tool=${tool}).`);
+  }
+  const identity = findIdentityByNameOrAlias(file.identities, key);
+  if (!identity) throw new CliUsageError(`No ${tool} identity named "${key}".`);
+  const resolved: typeof identity = { ...identity, configDir: expandPath(identity.configDir) };
+  try {
+    const result = await refreshIdentityOAuthGrant(tool as RefreshableTool, resolved, { force: true });
+    if (!boolFlag(flags, "quiet")) renderRefreshOutcome(result);
+    if (result.outcome === "skipped-revoked") {
+      console.error(`${tool}/${result.identity}: ${result.detail}`);
+      process.exitCode = 1;
+    } else if (result.outcome === "failed" || result.writeFailures.length > 0) {
+      process.exitCode = 1;
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`${tool} refresh failed for ${identity.name}: ${message}`);
+    process.exitCode = 1;
+  }
+}
+
+export async function runAuthCommand(positionals: string[], flags: ParsedArgs["flags"]): Promise<void> {
+  const [subcommand = "login", ...rest] = positionals;
+  if (subcommand === "import") {
+    await runPiAuthImport(rest, flags);
+    return;
+  }
+  if (subcommand === "sync") {
+    await runPiAuthSync(rest, flags);
+    return;
+  }
+  if (subcommand === "refresh") {
+    await runAuthRefresh(rest, flags);
+    return;
+  }
+  const identity = await resolveAliIdentity(rest, flags);
+
+  if (subcommand === "login") {
+    await printLoginInfo(identity.name);
     return;
   }
   if (subcommand === "enable") {

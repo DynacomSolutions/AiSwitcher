@@ -1,4 +1,5 @@
 import type { Identity } from "../../identities/types.ts";
+import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByLabel } from "./bucket.ts";
@@ -111,6 +112,16 @@ export function overageFromUsageText(stdout: string): OverageInfo | undefined {
  * text parsing. */
 export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimitResult> {
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "claude", identity };
+
+  // ONE reconcile per fetch, before the binary runs: pi may hold a fresher
+  // copy of this account's grant (claude's own copy goes stale whenever pi
+  // refreshed the shared account mid-session, and pi's projected copy goes
+  // stale whenever claude refreshed on its own). Cheap when the copies
+  // agree; never fatal (see oauth-reconcile.ts). kimi is the precedent for
+  // this pattern — its fetcher reads the freshest copy and writes a
+  // refresh through to both stores; the reconcile is the same law for the
+  // stores AIS can only rewrite wholesale.
+  await reconcileOnceForFetch("claude", identity);
 
   let binaryPath: string;
   try {
