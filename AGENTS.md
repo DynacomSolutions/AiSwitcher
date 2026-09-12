@@ -135,6 +135,12 @@ src/
     login-specs.ts         LOGIN_FLOW_SPECS: the per-tool managed login command, mode
                             (pty vs pipes) and paste capability; the terminal fallback
                             derives its args from the same table so the two never drift
+    auth-refresh.ts        the daemon credential-renewal scheduler: REFRESHERS registry
+                            (ali cookie harvest + OAuth refreshers for codex/claude/grok/kimi,
+                            see identities/oauth-refresh.ts), cadence (expiry-window +
+                            daily keep-alive), loud failures with escalation, skip/revoked
+                            state persisted under the console state dir, and
+                            lastRefreshFailure()/lastRefreshState() for the CLI consumers
     login-flows.ts         LoginFlowManager: daemon-managed per-identity logins — spawns
                             the REAL CLI's own flow (resolveRealBinary, never the shim)
                             with piped stdio or a script-allocated PTY, surfaces the
@@ -2704,6 +2710,36 @@ What the rule means in practice, now enforced in both pipelines:
     verbatim on write-through (conservative; claude re-mints it on its next
     refresh); grok's multi-account store matches the account by refresh
     fingerprint, falling back to grok's own freshest entry.
+- **Access tokens are REFRESHED proactively, not just reconciled
+  (`identities/oauth-refresh.ts`).** The reconcile only arbitrates between
+  existing copies; access tokens expire by design, and before this layer
+  only the real CLI's own next run ever renewed the grant (an expired
+  token stayed expired — the weekly "I keep logging in again" tax the
+  2026-09-12 incident was about). The daemon's auth-refresh scheduler now
+  carries OAuth refreshers for codex, claude, grok and kimi (ali's cookie
+  harvester was already there): each exchanges the stored refresh token at
+  the provider's token endpoint (endpoints/client ids read straight from
+  the installed CLIs' own code; xai runs plain OIDC discovery off the
+  account entry's `oidc_issuer`/`oidc_client_id`) and writes the rotated
+  grant through to EVERY store of the account per the one-credential law.
+  Cadence: inside the expiry window (AIS_AUTH_REFRESH_EXPIRY_HOURS, default
+  24) or at least once daily; manual `ais auth refresh <identity>
+  --tool=<t>` and POST /api/auth/refresh force past the cadence. A revoked
+  refresh token (provider `invalid_grant`/`invalid_client`) is terminal
+  and honest: the diagnosis is pinned to that grant's fingerprint, further
+  endpoint calls are skipped (never a loop), and doctor/auth status render
+  "re-login required" — a re-login mints a different token and refreshes
+  resume automatically.
+  - RECONCILE-ON-READ: the OAuth-backed limits/usage fetchers reconcile
+    ONCE per fetch before reading (codex and claude via
+    `reconcileNativeProviderStores`; kimi's fetcher already reads the
+    freshest copy and writes refreshes through both stores natively), and
+    codex retries once on the 401/token_expired family with the healed
+    store. grok's limits fetcher is a log scrape (no token read), so there
+    is nothing to reconcile there.
+  - Doctor: an auth-failed codex probe distinguishes "token expired
+    (refreshable)" (daemon refresh or the one manual command heals it)
+    from "revoked - re-login required" (only a re-login fixes it).
 - **No tool-shaped placeholder rows exist for the multi-provider clients.**
   Neither a pending seed (the provider isn't known until the adapter reads
   the identity's own auth store — a placeholder would render a fake
