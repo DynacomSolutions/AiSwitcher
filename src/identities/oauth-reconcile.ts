@@ -52,6 +52,9 @@ interface StoreCopy {
   grant: OAuthGrant;
   /** grok's multi-account map: the entry this copy was read from. */
   entryKey?: string;
+  /** grok only: the raw account entry (carries the account's oidc_issuer /
+   * oidc_client_id, which the xai refresher needs for OIDC discovery). */
+  rawEntry?: Record<string, unknown>;
 }
 
 /** sha256 prefix (8 hex chars) of the credential that identifies the grant
@@ -83,6 +86,13 @@ function jwtTimestamps(token: string): { iat?: number; exp?: number } {
   } catch {
     return {};
   }
+}
+
+/** The exp claim of a JWT access token in unix seconds, or undefined for
+ * opaque/malformed tokens. Used by the refreshers when a provider's token
+ * response carries no expires_in. */
+export function jwtExpSeconds(token: string): number | undefined {
+  return jwtTimestamps(token).exp;
 }
 
 function secondsFromMs(value: number): number {
@@ -172,7 +182,7 @@ async function writeNativeAnthropic(path: string, grant: OAuthGrant, backups: Se
   });
 }
 
-async function readPiEntry(path: string, provider: string): Promise<StoreCopy | undefined> {
+export async function readPiEntry(path: string, provider: string): Promise<StoreCopy | undefined> {
   const raw = await readJson(path);
   const entry = raw?.[provider] as { type?: unknown; access?: unknown; refresh?: unknown; expires?: unknown } | undefined;
   if (entry?.type !== "oauth" || !usableToken(entry.access)) return undefined;
@@ -189,7 +199,7 @@ async function readPiEntry(path: string, provider: string): Promise<StoreCopy | 
   };
 }
 
-async function writePiEntry(path: string, provider: string, grant: OAuthGrant, backups: Set<string>): Promise<void> {
+export async function writePiEntry(path: string, provider: string, grant: OAuthGrant, backups: Set<string>): Promise<void> {
   const raw = (await readJson(path)) ?? {};
   const entry = (raw[provider] && typeof raw[provider] === "object" ? (raw[provider] as Record<string, unknown>) : {});
   await backupOnce(path, backups);
@@ -289,6 +299,7 @@ async function readNativeGrok(path: string, matchFingerprint?: string): Promise<
     side: "native",
     path,
     entryKey: key,
+    rawEntry: entry,
     grant: {
       access_token: entry.key,
       ...(usableToken(entry.refresh_token) ? { refresh_token: entry.refresh_token } : {}),
@@ -486,6 +497,59 @@ function driftLabel(minutes: number): string {
   return `${Math.round((minutes / 1440) * 10) / 10}d`;
 }
 
+/** One (native, pi) copy pair's compare-and-heal, shared by the pi-identity
+ * sweep (reconcilePiOAuthStores) and the native-side single-provider
+ * reconcile (reconcileNativeProviderStores). Never throws: a failing store
+ * is reported on the entry, never fatal to the caller. */
+async function reconcilePair(
+  provider: string,
+  io: Pick<ProviderPairing, "readNative" | "writeNative" | "readPi" | "writePi">,
+  write: boolean,
+  backups: Set<string>,
+): Promise<OAuthReconcileEntry> {
+  const entry: OAuthReconcileEntry = { provider, status: "unreadable" };
+  try {
+    const [native, pi] = await Promise.all([io.readNative(), io.readPi()]);
+    entry.nativePath = native?.path;
+    entry.piPath = pi?.path;
+    entry.nativeFingerprint = native ? grantFingerprint(native.grant) : undefined;
+    entry.piFingerprint = pi ? grantFingerprint(pi.grant) : undefined;
+    if (!native && !pi) {
+      entry.status = "unreadable";
+      entry.detail = "no copy in either store";
+    } else if (!native || !pi) {
+      entry.status = "single-copy";
+      entry.detail = `only the ${native ? "native" : "pi"} store holds a copy; nothing to reconcile`;
+    } else if (entry.nativeFingerprint === entry.piFingerprint) {
+      entry.status = "in-sync";
+      entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
+    } else {
+      entry.status = "forked";
+      entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
+      const nativeFresher = recency(native.grant) >= recency(pi.grant);
+      entry.adoptedFrom = nativeFresher ? "native" : "pi";
+      if (write) {
+        try {
+          if (nativeFresher) {
+            await io.writePi(native.grant, backups);
+            entry.status = "rewrote-pi";
+          } else {
+            await io.writeNative(native, pi.grant, backups);
+            entry.status = "rewrote-native";
+          }
+        } catch (error) {
+          entry.status = "failed";
+          entry.detail = error instanceof Error ? error.message : String(error);
+        }
+      }
+    }
+  } catch (error) {
+    entry.status = "failed";
+    entry.detail = error instanceof Error ? error.message : String(error);
+  }
+  return entry;
+}
+
 /**
  * Reconcile every projected OAuth provider of one pi identity against its
  * native counterpart stores. With `write` (default false) the freshest copy
@@ -503,47 +567,8 @@ export async function reconcilePiOAuthStores(
   let healed = 0;
   const backups = new Set<string>();
   for (const pairing of await providerPairings(piIdentity)) {
-    const entry: OAuthReconcileEntry = { provider: pairing.provider, status: "unreadable" };
-    try {
-      const [native, pi] = await Promise.all([pairing.readNative(), pairing.readPi()]);
-      entry.nativePath = native?.path;
-      entry.piPath = pi?.path;
-      entry.nativeFingerprint = native ? grantFingerprint(native.grant) : undefined;
-      entry.piFingerprint = pi ? grantFingerprint(pi.grant) : undefined;
-      if (!native && !pi) {
-        entry.status = "unreadable";
-        entry.detail = "no copy in either store";
-      } else if (!native || !pi) {
-        entry.status = "single-copy";
-        entry.detail = `only the ${native ? "native" : "pi"} store holds a copy; nothing to reconcile`;
-      } else if (entry.nativeFingerprint === entry.piFingerprint) {
-        entry.status = "in-sync";
-        entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
-      } else {
-        entry.status = "forked";
-        entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
-        const nativeFresher = recency(native.grant) >= recency(pi.grant);
-        entry.adoptedFrom = nativeFresher ? "native" : "pi";
-        if (write) {
-          try {
-            if (nativeFresher) {
-              await pairing.writePi(native.grant, backups);
-              entry.status = "rewrote-pi";
-            } else {
-              await pairing.writeNative(native, pi.grant, backups);
-              entry.status = "rewrote-native";
-            }
-            healed += 1;
-          } catch (error) {
-            entry.status = "failed";
-            entry.detail = error instanceof Error ? error.message : String(error);
-          }
-        }
-      }
-    } catch (error) {
-      entry.status = "failed";
-      entry.detail = error instanceof Error ? error.message : String(error);
-    }
+    const entry = await reconcilePair(pairing.provider, pairing, write, backups);
+    if (entry.status === "rewrote-native" || entry.status === "rewrote-pi") healed += 1;
     entries.push(entry);
   }
   return { identity: piIdentity.name, entries, healed };
@@ -590,6 +615,128 @@ export function renderOAuthReconcileReport(report: OAuthReconcileReport): string
     }
   }
   return lines;
+}
+
+/* ------------------------------------------------------------------ */
+/* Native-side single-provider surface. The pi sweep above starts from */
+/* a pi identity; the OAuth fetchers and refreshers start from a       */
+/* NATIVE identity's own store and need one provider's read/write and */
+/* a native-vs-pi reconcile for it.                                   */
+/* ------------------------------------------------------------------ */
+
+/** The native tools whose OAuth stores this module can read/write. kimi is
+ * absent deliberately: its fetcher/refresh path already runs the same law
+ * through kimi-store.ts (freshest-wins read + write-through persist), so a
+ * second copy of the machinery here would only be a second thing to keep
+ * in step. */
+export type NativeReconcilableTool = "claude" | "codex" | "grok";
+
+const NATIVE_STORE_RELPATH: Record<NativeReconcilableTool, string> = {
+  claude: ".credentials.json",
+  codex: join("auth.json"),
+  grok: join("auth.json"),
+};
+
+/** One store's copy of an account's grant, plus what a rewrite needs. */
+export interface ProviderGrantCopy {
+  path: string;
+  grant: OAuthGrant;
+  /** grok's multi-account map: the entry a rewrite must target (resolved
+   * BEFORE a rotation — afterwards the fresh refresh token matches no
+   * fingerprint in the store). */
+  entryKey?: string;
+  /** grok only: the raw account entry (oidc_issuer/oidc_client_id for the
+   * xai refresher's OIDC discovery). */
+  rawEntry?: Record<string, unknown>;
+}
+
+export function nativeStorePathFor(tool: NativeReconcilableTool, configDir: string): string {
+  return join(expandPath(configDir), NATIVE_STORE_RELPATH[tool]);
+}
+
+/** Reads the native store's copy of the account's grant. For grok the store
+ * holds one entry per account: `matchFingerprint` (typically the pi
+ * counterpart's) pins the right entry, falling back to the store's freshest. */
+export async function readProviderGrantCopy(
+  tool: NativeReconcilableTool,
+  configDir: string,
+  matchFingerprint?: string,
+): Promise<ProviderGrantCopy | undefined> {
+  const path = nativeStorePathFor(tool, configDir);
+  const copy = await (tool === "claude"
+    ? readNativeAnthropic(path)
+    : tool === "codex"
+      ? readNativeCodex(path)
+      : readNativeGrok(path, matchFingerprint));
+  if (!copy) return undefined;
+  return { path: copy.path, grant: copy.grant, ...(copy.entryKey !== undefined ? { entryKey: copy.entryKey } : {}), ...(copy.rawEntry !== undefined ? { rawEntry: copy.rawEntry } : {}) };
+}
+
+/** Writes a grant into the native store in its own shape (atomic, 0600,
+ * one-time backup). grok requires the pre-resolved entryKey. */
+export async function writeProviderGrantCopy(
+  tool: NativeReconcilableTool,
+  configDir: string,
+  grant: OAuthGrant,
+  options: { entryKey?: string; backups?: Set<string> } = {},
+): Promise<void> {
+  const path = nativeStorePathFor(tool, configDir);
+  const backups = options.backups ?? new Set<string>();
+  if (tool === "claude") return writeNativeAnthropic(path, grant, backups);
+  if (tool === "codex") return writeNativeCodex(path, grant, backups);
+  if (options.entryKey === undefined) throw new Error("no matching grok account entry to rewrite");
+  return writeNativeGrok(path, options.entryKey, grant, backups);
+}
+
+/**
+ * Reconcile ONE native identity's provider store against the same-named pi
+ * identity's projected copy — the native-side counterpart of
+ * reconcilePiOAuthStores, used reconcile-on-read by the OAuth-backed
+ * limits/usage fetchers: cheap when the copies agree (two file reads + a
+ * fingerprint compare), a heal (freshest adopted into the staler store)
+ * exactly when they have forked. Never throws; a diverged-but-unwritable
+ * pair is reported on the entry. */
+export async function reconcileNativeProviderStores(
+  tool: NativeReconcilableTool,
+  identity: Identity,
+  options: { write?: boolean } = {},
+): Promise<OAuthReconcileEntry> {
+  const write = options.write ?? false;
+  const provider = tool === "claude" ? "anthropic" : tool === "codex" ? "openai-codex" : "xai";
+  const nativePath = nativeStorePathFor(tool, identity.configDir);
+  const piDir = await configDirFor(PI_CONFIG.identitiesJsonPath, identity.name);
+  if (!piDir) {
+    return { provider, status: "single-copy", nativePath, detail: "no same-named pi identity; nothing to reconcile" };
+  }
+  const piAuthPath = join(expandPath(piDir), "auth.json");
+  const xaiFingerprint = async (): Promise<string | undefined> => {
+    const pi = await readPiEntry(piAuthPath, "xai");
+    return pi ? grantFingerprint(pi.grant) : undefined;
+  };
+  const io: ProviderPairing =
+    tool === "grok"
+      ? {
+          provider,
+          readNative: async () => readNativeGrok(nativePath, await xaiFingerprint()),
+          writeNative: (native, grant, backups) => {
+            if (native.entryKey === undefined) throw new Error("no matching grok account entry to rewrite");
+            return writeNativeGrok(native.path, native.entryKey, grant, backups);
+          },
+          readPi: () => readPiEntry(piAuthPath, "xai"),
+          writePi: (grant, backups) => writePiEntry(piAuthPath, "xai", grant, backups),
+        }
+      : {
+          provider,
+          readNative: () =>
+            tool === "claude" ? readNativeAnthropic(nativePath) : readNativeCodex(nativePath),
+          writeNative: (native, grant, backups) =>
+            tool === "claude"
+              ? writeNativeAnthropic(native.path, grant, backups)
+              : writeNativeCodex(native.path, grant, backups),
+          readPi: () => readPiEntry(piAuthPath, provider),
+          writePi: (grant, backups) => writePiEntry(piAuthPath, provider, grant, backups),
+        };
+  return reconcilePair(provider, io, write, new Set<string>());
 }
 
 /** The pi wrapper's cheap launch self-heal: resolve the launched configDir

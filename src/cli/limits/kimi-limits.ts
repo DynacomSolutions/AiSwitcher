@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { OAuthRefreshError } from "../../identities/oauth-refresh.ts";
 import type { Identity } from "../../identities/types.ts";
 import { categorizeByMinutes } from "./bucket.ts";
 import { fetchWithRetry } from "./http.ts";
@@ -233,11 +234,16 @@ function credentialsFrom(raw: CredentialsFile): KimiOAuthCredentials | undefined
  * them back into its credentials file (all other keys preserved, atomic
  * temp-file rename, original 0600 mode); the pi adapter writes them back
  * into its own auth.json entry the same way. */
-async function refreshCredentials(
+/** The raw token-endpoint exchange behind refreshCredentials, exported so
+ * the daemon-side OAuth refresher (src/identities/oauth-refresh.ts) reuses
+ * the exact same request shape and rotation semantics instead of growing a
+ * second copy. No persistence here — the caller owns the write-through. */
+export async function refreshKimiOAuthToken(
   credentials: KimiOAuthCredentials,
-  persist: (next: KimiOAuthCredentials) => Promise<void>,
+  deps: { fetchImpl?: typeof fetch } = {},
 ): Promise<KimiOAuthCredentials> {
-  const response = await fetch(TOKEN_URL, {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const response = await fetchImpl(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
     body: new URLSearchParams({
@@ -247,11 +253,18 @@ async function refreshCredentials(
     }),
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  if (!response.ok) throw new Error(`token refresh failed (HTTP ${response.status})`);
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    const revoked = response.status === 400 || response.status === 401;
+    throw new OAuthRefreshError(
+      `token refresh failed (HTTP ${response.status})${detail ? `: ${detail.slice(0, 200)}` : ""}`,
+      revoked,
+    );
+  }
   const body = (await response.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
-  if (!body.access_token) throw new Error("token refresh returned no access_token");
+  if (!body.access_token) throw new OAuthRefreshError("token refresh returned no access_token", false);
 
-  const next: KimiOAuthCredentials = {
+  return {
     ...credentials,
     access_token: body.access_token,
     // Not every provider rotates refresh tokens — keep the old one when the
@@ -259,6 +272,13 @@ async function refreshCredentials(
     ...(body.refresh_token ? { refresh_token: body.refresh_token } : {}),
     ...(typeof body.expires_in === "number" ? { expires_at: Math.floor(Date.now() / 1000) + body.expires_in } : {}),
   };
+}
+
+async function refreshCredentials(
+  credentials: KimiOAuthCredentials,
+  persist: (next: KimiOAuthCredentials) => Promise<void>,
+): Promise<KimiOAuthCredentials> {
+  const next = await refreshKimiOAuthToken(credentials);
   await persist(next);
   return next;
 }
