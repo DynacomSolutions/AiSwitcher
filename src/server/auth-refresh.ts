@@ -4,6 +4,12 @@ import { join } from "node:path";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { refreshAliAuthSession } from "../identities/auth-session.ts";
+import {
+  DEFAULT_EXPIRY_WINDOW_HOURS,
+  OAuthRefreshError,
+  refreshIdentityOAuthGrant,
+  type RefreshableTool,
+} from "../identities/oauth-refresh.ts";
 import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
 
@@ -14,26 +20,84 @@ async function listIdentitiesFromRegistry(tool: string): Promise<Identity[]> {
   return file.identities;
 }
 
-/** Daemon-side credential renewal. Today only Alibaba console cookies have a
- * real headless refresh flow (browser session harvest — the same code the
- * host systemd timers run, hardened 2026-09-10 to self-heal a reset auth
- * browser, verify the login before writing, and throw precise
- * AliAuthRefreshErrors instead of silently returning nothing); the registry
- * below is where any future refreshable credential plugs in. The scheduler
- * runs the same work the per-identity timers do, so it may run alongside
- * them harmlessly: both write the cookie file atomically.
+/** Daemon-side credential renewal. Two kinds of refresher live here:
+ * - ali: the Alibaba console-cookie harvest (browser session — the same
+ *   code the host systemd timers run, hardened 2026-09-10).
+ * - the OAuth refreshers (codex/claude/grok/kimi): proactive access-token
+ *   renewal at each provider's token endpoint, written through to every
+ *   store of the account per the one-credential law
+ *   (src/identities/oauth-refresh.ts). These run on a cadence — inside the
+ *   expiry window (default 24h) or at least once a day — and short-circuit
+ *   without another endpoint call once a grant has been diagnosed revoked
+ *   (re-login is the only fix; retrying would just loop).
  *
- * Failures are LOUD: every failed attempt is logged to stderr (visible in the
- * daemon's journal) and consecutive failures past ESCALATION_THRESHOLD are
- * marked escalated in the status DTO the WebUI and `ais doctor` surface. */
+ * The scheduler runs the same work the per-identity timers do, so it may
+ * run alongside them harmlessly: both write their outputs atomically.
+ *
+ * Failures are LOUD: every failed attempt is logged to stderr (visible in
+ * the daemon's journal) and consecutive failures past ESCALATION_THRESHOLD
+ * are marked escalated in the status DTO the WebUI and `ais doctor`
+ * surface. Skips (nothing to do within cadence) are recorded with their
+ * reason but are never failures. */
 
-type Refresher = (identity: Identity) => Promise<string | undefined>;
+/** What a refresher tells the scheduler about one attempt. A plain string
+ * is a completed refresh (the summary); `undefined` is a failure; the
+ * outcome object reports a deliberate skip (nothing to do) with its
+ * reason, or a completed refresh with extra detail. */
+export interface RefreshOutcome {
+  skipped: boolean;
+  detail: string;
+}
+
+export type Refresher = (
+  identity: Identity,
+  context: RefresherContext,
+) => Promise<string | RefreshOutcome | undefined>;
+
+export interface RefresherContext {
+  /** Manual run (CLI `ais auth refresh` / POST /api/auth/refresh): ignore
+   * the cadence window and refresh regardless of remaining validity. */
+  force: boolean;
+  /** This target's last successful refresh (null when never). */
+  lastSuccessAt: string | null;
+  /** When set, the grant whose fingerprint matches was already diagnosed
+   * revoked — refreshers must skip instead of hammering the endpoint. */
+  revokedFingerprint?: string;
+  /** Proactive window: refresh when the access token expires within this
+   * many hours (AIS_AUTH_REFRESH_EXPIRY_HOURS, default 24). */
+  expiryWindowHours: number;
+}
+
+function oauthRefresherFor(tool: RefreshableTool): Refresher {
+  return async (identity, context) => {
+    const result = await refreshIdentityOAuthGrant(tool, identity, {
+      force: context.force,
+      expiryWindowHours: context.expiryWindowHours,
+      lastSuccessAt: context.lastSuccessAt,
+      revokedFingerprint: context.revokedFingerprint,
+    });
+    if (result.outcome === "failed") return undefined;
+    if (result.outcome === "refreshed") return result.detail;
+    return { skipped: true, detail: result.detail };
+  };
+}
 
 const REFRESHERS: Record<string, Refresher> = {
   ali: (identity) => refreshAliAuthSession(identity),
+  codex: oauthRefresherFor("codex"),
+  claude: oauthRefresherFor("claude"),
+  grok: oauthRefresherFor("grok"),
+  kimi: oauthRefresherFor("kimi"),
 };
 
 export const DEFAULT_REFRESH_INTERVAL_MS = 10 * 60_000;
+
+export function parseRefreshExpiryWindowHours(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_EXPIRY_WINDOW_HOURS;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_EXPIRY_WINDOW_HOURS;
+  return value;
+}
 
 /** After this many consecutive failures a target is flagged escalated in the
  * status DTO (and the failure summary the CLI surfaces), so "the harvester
@@ -46,6 +110,13 @@ export interface RefreshStatusDto {
   lastAttemptAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
+  /** Why the last attempt deliberately did nothing (cadence skip, revoked
+   * grant awaiting re-login, API-key identity). Never a failure. */
+  lastDetail: string | null;
+  /** True while the pinned diagnosis for this target is "refresh token
+   * revoked - re-login required"; cleared by a successful refresh or a
+   * re-login (which mints a different refresh token). */
+  revoked: boolean;
   consecutiveFailures: number;
   running: boolean;
 }
@@ -56,6 +127,11 @@ interface RefreshEntry {
   lastAttemptAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
+  lastDetail: string | null;
+  /** Fingerprint of the refresh token a revoked diagnosis was pinned to
+   * (null when there is no such diagnosis). A re-login mints a different
+   * token, so the fingerprint no longer matches and refreshes resume. */
+  revokedFingerprint: string | null;
   consecutiveFailures: number;
 }
 
@@ -82,13 +158,7 @@ export async function lastRefreshFailure(
   identity: string,
   home: string = homedir(),
 ): Promise<RefreshFailureSummary | undefined> {
-  let parsed: { entries?: (Partial<RefreshEntry> & { tool?: string; identity?: string })[] };
-  try {
-    parsed = await Bun.file(statePath(home)).json();
-  } catch {
-    return undefined;
-  }
-  const entry = (parsed.entries ?? []).find((candidate) => candidate.tool === tool && candidate.identity === identity);
+  const entry = await persistedRefreshEntry(tool, identity, home);
   if (!entry?.lastError || !entry.lastAttemptAt) return undefined;
   // Defensive: a well-formed state file never carries a stale error past a
   // newer success, but hydrating an old or hand-edited file must not invent
@@ -99,6 +169,38 @@ export async function lastRefreshFailure(
     lastError: entry.lastError,
     consecutiveFailures: entry.consecutiveFailures ?? 0,
   };
+}
+
+/** The full persisted refresh-state entry for one target, including the
+ * pinned revoked diagnosis (fingerprint only, never a token). Unlike
+ * lastRefreshFailure this survives a success — the doctor needs the revoked
+ * flag even while the last error has been cleared by a re-login. */
+export async function lastRefreshState(
+  tool: string,
+  identity: string,
+  home: string = homedir(),
+): Promise<{ revokedFingerprint: string | null; lastError: string | null; lastSuccessAt: string | null } | undefined> {
+  const entry = await persistedRefreshEntry(tool, identity, home);
+  if (!entry) return undefined;
+  return {
+    revokedFingerprint: entry.revokedFingerprint ?? null,
+    lastError: entry.lastError ?? null,
+    lastSuccessAt: entry.lastSuccessAt ?? null,
+  };
+}
+
+async function persistedRefreshEntry(
+  tool: string,
+  identity: string,
+  home: string,
+): Promise<(Partial<RefreshEntry> & { tool?: string; identity?: string }) | undefined> {
+  let parsed: { entries?: (Partial<RefreshEntry> & { tool?: string; identity?: string })[] };
+  try {
+    parsed = await Bun.file(statePath(home)).json();
+  } catch {
+    return undefined;
+  }
+  return (parsed.entries ?? []).find((candidate) => candidate.tool === tool && candidate.identity === identity);
 }
 
 export class AuthRefreshScheduler {
@@ -118,6 +220,9 @@ export class AuthRefreshScheduler {
      * explicit temp dir here (observed live: tests silently wrote the real
      * daemon's state file before this parameter existed). */
     private readonly stateHome: string = homedir(),
+    /** Proactive-refresh window for the OAuth refreshers (hours before
+     * access-token expiry at which a refresh runs). */
+    private readonly expiryWindowHours: number = parseRefreshExpiryWindowHours(process.env.AIS_AUTH_REFRESH_EXPIRY_HOURS),
   ) {
     if (this.intervalMs > 0 && this.intervalMs < 60_000) this.intervalMs = 60_000;
   }
@@ -141,6 +246,8 @@ export class AuthRefreshScheduler {
             lastAttemptAt: entry.lastAttemptAt ?? null,
             lastSuccessAt: entry.lastSuccessAt ?? null,
             lastError: entry.lastError ?? null,
+            lastDetail: entry.lastDetail ?? null,
+            revokedFingerprint: entry.revokedFingerprint ?? null,
             consecutiveFailures: entry.consecutiveFailures ?? 0,
           });
         }
@@ -172,7 +279,7 @@ export class AuthRefreshScheduler {
     return targets;
   }
 
-  private async runOne(tool: string, identity: Identity, refresher: Refresher): Promise<boolean> {
+  private async runOne(tool: string, identity: Identity, refresher: Refresher, context: RefresherContext): Promise<boolean> {
     const key = `${tool}/${identity.name}`;
     const existing = this.entries.get(key);
     const entry: RefreshEntry = existing ?? {
@@ -181,6 +288,8 @@ export class AuthRefreshScheduler {
       lastAttemptAt: null,
       lastSuccessAt: null,
       lastError: null,
+      lastDetail: null,
+      revokedFingerprint: null,
       consecutiveFailures: 0,
     };
     this.entries.set(key, entry);
@@ -188,21 +297,42 @@ export class AuthRefreshScheduler {
     this.inFlight.add(key);
     let failed = false;
     try {
-      const written = await refresher(identity);
-      if (written) {
-        entry.lastSuccessAt = entry.lastAttemptAt;
-        entry.lastError = null;
-        entry.consecutiveFailures = 0;
-      } else {
+      const outcome = await refresher(identity, { ...context, lastSuccessAt: entry.lastSuccessAt, revokedFingerprint: entry.revokedFingerprint ?? undefined });
+      if (outcome === undefined) {
         failed = true;
         entry.consecutiveFailures += 1;
         entry.lastError = "refresh returned nothing (session not authenticated or browser unavailable)";
+        entry.lastDetail = null;
+      } else if (typeof outcome === "string") {
+        entry.lastSuccessAt = entry.lastAttemptAt;
+        entry.lastError = null;
+        entry.lastDetail = outcome;
+        entry.revokedFingerprint = null;
+        entry.consecutiveFailures = 0;
+      } else if (outcome.skipped) {
+        // A deliberate skip is not a failure and must not refresh the
+        // last-success stamp (the daily keep-alive floor depends on it).
+        entry.lastError = null;
+        entry.lastDetail = outcome.detail;
+      } else {
+        entry.lastSuccessAt = entry.lastAttemptAt;
+        entry.lastError = null;
+        entry.lastDetail = outcome.detail;
+        entry.revokedFingerprint = null;
+        entry.consecutiveFailures = 0;
       }
-      return Boolean(written);
+      return !failed && typeof outcome !== "undefined";
     } catch (err) {
       failed = true;
       entry.consecutiveFailures += 1;
       entry.lastError = err instanceof Error ? err.message : String(err);
+      entry.lastDetail = null;
+      // Pin a revoked diagnosis to the exact grant it was made against, so
+      // the refresher can skip (never loop) while that token is still in
+      // the store, and resume automatically once a re-login rotates it.
+      if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint) {
+        entry.revokedFingerprint = err.refreshFingerprint;
+      }
       return false;
     } finally {
       this.inFlight.delete(key);
@@ -234,7 +364,12 @@ export class AuthRefreshScheduler {
     const identities = await this.listIdentities(tool);
     const identity = identities.find((candidate) => candidate.name === identityName);
     if (!identity) throw new Error(`no ${tool} identity named "${identityName}"`);
-    return this.runOne(tool, identity, refresher);
+    // Manual runs force the underlying flow past its cadence skip.
+    return this.runOne(tool, identity, refresher, {
+      force: true,
+      lastSuccessAt: null,
+      expiryWindowHours: this.expiryWindowHours,
+    });
   }
 
   async tick(): Promise<void> {
@@ -242,7 +377,11 @@ export class AuthRefreshScheduler {
     const targets = await this.targets();
     for (const { tool, identity, refresher } of targets) {
       if (this.stopped) return;
-      await this.runOne(tool, identity, refresher);
+      await this.runOne(tool, identity, refresher, {
+        force: false,
+        lastSuccessAt: null,
+        expiryWindowHours: this.expiryWindowHours,
+      });
     }
   }
 
@@ -274,6 +413,8 @@ export class AuthRefreshScheduler {
         lastAttemptAt: entry.lastAttemptAt,
         lastSuccessAt: entry.lastSuccessAt,
         lastError: entry.lastError,
+        lastDetail: entry.lastDetail,
+        revoked: entry.revokedFingerprint !== null,
         consecutiveFailures: entry.consecutiveFailures,
         running: this.inFlight.has(`${entry.tool}/${entry.identity}`),
       }))

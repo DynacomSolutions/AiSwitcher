@@ -3,10 +3,12 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Identity } from "../../src/identities/types.ts";
+import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
 import {
   AuthRefreshScheduler,
   ESCALATION_THRESHOLD,
   lastRefreshFailure,
+  parseRefreshExpiryWindowHours,
   parseRefreshIntervalMs,
 } from "../../src/server/auth-refresh.ts";
 
@@ -27,7 +29,7 @@ async function tempStateHome(): Promise<string> {
  * isolate persist()/hydrate(); without injection these tests silently
  * read/wrote the real daemon's ~/.ais/web/auth-refresh-state.json. */
 async function makeScheduler(
-  refresher: (identity: Identity) => Promise<string | undefined>,
+  refresher: (identity: Identity, context: { force: boolean; lastSuccessAt: string | null; revokedFingerprint?: string; expiryWindowHours: number }) => Promise<string | { skipped: boolean; detail: string } | undefined>,
   identities: Identity[] = [{ name: "personal", label: "personal", configDir: "/tmp/ali-personal" }],
 ): Promise<{ scheduler: AuthRefreshScheduler; stateHome: string }> {
   const stateHome = await tempStateHome();
@@ -253,5 +255,88 @@ describe("lastRefreshFailure", () => {
       }),
     );
     expect(await lastRefreshFailure("ali", "personal", dir)).toBeUndefined();
+  });
+});
+
+describe("OAuth refresher outcomes", () => {
+  test("a deliberate skip is recorded with its reason, never a failure", async () => {
+    let seenContext: unknown;
+    const { scheduler } = await makeScheduler(async (_identity, context) => {
+      seenContext = context;
+      return { skipped: true, detail: "access token expires in 31h - nothing to do" };
+    });
+    const ok = await scheduler.refreshNow("ali", "personal");
+    expect(ok).toBe(true);
+    const status = scheduler.status()[0]!;
+    expect(status.lastError).toBeNull();
+    expect(status.lastDetail).toBe("access token expires in 31h - nothing to do");
+    // A skip must not refresh the last-success stamp: the daily keep-alive
+    // floor depends on it.
+    expect(status.lastSuccessAt).toBeNull();
+    expect(seenContext).toBeDefined();
+  });
+
+  test("manual runs force past the cadence skip; ticks do not", async () => {
+    const forces: boolean[] = [];
+    const refresher = async (_identity: Identity, context: { force: boolean }) => {
+      forces.push(context.force);
+      return "refreshed";
+    };
+    const { scheduler } = await makeScheduler(refresher);
+    await scheduler.refreshNow("ali", "personal");
+    await scheduler.tick();
+    expect(forces).toEqual([true, false]);
+  });
+
+  test("a revoked diagnosis is pinned to the grant's fingerprint and exposed on the DTO", async () => {
+    let attempts = 0;
+    const contexts: Array<string | undefined> = [];
+    const refresher = async (_identity: Identity, context: { revokedFingerprint?: string }) => {
+      contexts.push(context.revokedFingerprint);
+      attempts += 1;
+      throw new OAuthRefreshError("refresh token revoked - re-login required: run the real CLI", true, "fp1234");
+    };
+    const { scheduler } = await makeScheduler(refresher);
+    const first = await scheduler.refreshNow("ali", "personal");
+    expect(first).toBe(false);
+    const status = scheduler.status()[0]!;
+    expect(status.revoked).toBe(true);
+    expect(status.lastError).toContain("re-login required");
+
+    // Second attempt: the scheduler hands the pinned fingerprint back so
+    // the refresher can skip instead of hammering the endpoint (never loop).
+    await scheduler.refreshNow("ali", "personal");
+    expect(attempts).toBe(2);
+    expect(contexts[1]).toBe("fp1234");
+  });
+
+  test("a successful refresh clears the revoked diagnosis", async () => {
+    let fail = true;
+    const refresher = async () => {
+      if (fail) throw new OAuthRefreshError("refresh token revoked", true, "fp-dead");
+      return "refreshed after re-login";
+    };
+    const { scheduler } = await makeScheduler(refresher);
+    await scheduler.refreshNow("ali", "personal");
+    fail = false;
+    await scheduler.refreshNow("ali", "personal");
+    const status = scheduler.status()[0]!;
+    expect(status.revoked).toBe(false);
+    expect(status.lastError).toBeNull();
+    expect(status.lastDetail).toBe("refreshed after re-login");
+  });
+
+  test("undefined is still a failure, string a success with detail", async () => {
+    const { scheduler } = await makeScheduler(async () => undefined);
+    expect(await scheduler.refreshNow("ali", "personal")).toBe(false);
+    expect(scheduler.status()[0]!.lastError).toContain("refresh returned nothing");
+  });
+
+  test("parseRefreshExpiryWindowHours defaults to 24 and ignores junk", () => {
+    expect(parseRefreshExpiryWindowHours(undefined)).toBe(24);
+    expect(parseRefreshExpiryWindowHours("")).toBe(24);
+    expect(parseRefreshExpiryWindowHours("nonsense")).toBe(24);
+    expect(parseRefreshExpiryWindowHours("0")).toBe(24);
+    expect(parseRefreshExpiryWindowHours("12")).toBe(12);
   });
 });
