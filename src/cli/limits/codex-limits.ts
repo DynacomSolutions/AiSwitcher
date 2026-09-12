@@ -1,4 +1,5 @@
 import type { Identity } from "../../identities/types.ts";
+import { reconcileOnceForFetch, oauthRefreshHealth } from "../../identities/oauth-refresh.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByMinutes } from "./bucket.ts";
 import type { LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, FetchedLimitResult } from "./types.ts";
@@ -407,17 +408,59 @@ export function isTransientCodexLimitsError(error: string | undefined): boolean 
   return error !== undefined && TRANSIENT_ERROR_PATTERN.test(error);
 }
 
+/** The 401/token_expired family: the app-server REACHED chatgpt.com and was
+ * rejected for the credentials it presented (an expired access token) —
+ * distinct from the auth GATE above (no ChatGPT auth at all, which no
+ * amount of refreshing fixes for an API-key identity). Exported pure for
+ * the retry-path tests. */
+export function isCodexAuthRejectionError(error: string | undefined): boolean {
+  if (error === undefined) return false;
+  if (isAuthGateError(error)) return false;
+  return /token_expired|http 401|\b401\b|unauthorized|token.*expired|expired.*token/i.test(error);
+}
+
 export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
+  // ONE reconcile per fetch, BEFORE the first attempt: pi may hold a
+  // fresher copy of this account's grant (its own copy is refreshed during
+  // pi usage), and adopting the freshest copy here is what stops
+  // `ais limits` from reading a token the pi side already rotated past.
+  // Cheap when the copies agree (two file reads + a fingerprint compare);
+  // never fatal — the read below still runs (see oauth-reconcile.ts).
+  const reconcile = await reconcileOnceForFetch("codex", identity);
   let last: FetchedLimitResult | undefined;
   let attempts = 0;
+  let authRetried = false;
   for (let attempt = 0; attempt <= CODEX_RETRY_DELAYS_MS.length; attempt++) {
     if (attempt > 0) await Bun.sleep(CODEX_RETRY_DELAYS_MS[attempt - 1]!);
     attempts++;
     last = await fetchCodexLimitsOnce(identity);
-    if (!isTransientCodexLimitsError(last.error) || last.status !== "unavailable") return last;
+    if (!isTransientCodexLimitsError(last.error) || last.status !== "unavailable") break;
+  }
+  // The 401/token_expired family gets ONE retry with a fresh app-server
+  // spawn — each attempt re-reads the on-disk grant, so the reconcile's
+  // healed copy (or the proactive refresher's) is picked up here. Never a
+  // second reconcile: the pre-read one is this fetch's whole budget.
+  if (last && last.status === "unavailable" && isCodexAuthRejectionError(last.error) && !authRetried) {
+    authRetried = true;
+    last = await fetchCodexLimitsOnce(identity);
+  }
+  if (last && last.status === "unavailable" && isCodexAuthRejectionError(last.error)) {
+    // Make the row actionable: an expired-but-refreshable grant is healed
+    // by the daemon's proactive refresher or one manual command; a revoked
+    // refresh token honestly says re-login is the only fix.
+    const health = await oauthRefreshHealth("codex", identity).catch(() => undefined);
+    if (health && (health.state === "expired-refreshable" || health.state === "revoked" || health.state === "expired-no-refresh-token")) {
+      return { ...last, error: `${last.error} (${health.detail})` };
+    }
+  }
+  if (!last) {
+    return { toolName: "codex", identity, windows: [], status: "unavailable", error: "codex app-server produced no result." };
+  }
+  if (reconcile.healed) {
+    return { ...last, error: last.error ? `${last.error} (${reconcile.detail})` : last.error };
   }
   return {
     ...last!,
-    error: `${last!.error} (still failing after ${attempts} attempts)`,
+    error: last!.error !== undefined && attempts > 1 ? `${last!.error} (still failing after ${attempts} attempts)` : last!.error,
   };
 }

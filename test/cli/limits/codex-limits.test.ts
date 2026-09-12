@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  isCodexAuthRejectionError,
   isTransientCodexLimitsError,
   manualResetFromWire,
   overageFromSnapshot,
@@ -113,5 +114,29 @@ describe("manualResetFromWire", () => {
   test("credits with a non-available status never count or supply title/expiry", () => {
     const wire: RateLimitResetCreditsWire = { availableCount: 1, credits: [{ status: "used", title: "Full reset" }] };
     expect(manualResetFromWire(wire)).toEqual({ availableCount: 1 });
+  });
+});
+
+describe("isCodexAuthRejectionError", () => {
+  test("matches the 401/token_expired family", () => {
+    for (const error of [
+      "codex request failed: HTTP 401 Unauthorized",
+      "failed to fetch codex rate limits: 401 token_expired from https://chatgpt.com/backend-api/wham/usage",
+      "token has expired",
+      "Unauthorized (invalid access token)",
+    ]) {
+      expect(isCodexAuthRejectionError(error)).toBe(true);
+    }
+  });
+
+  test("does not match the auth GATE or ordinary failures", () => {
+    for (const error of [
+      "ChatGPT-plan login required (API-key auth doesn't expose rate limits)",
+      "codex app-server did not respond within 30s.",
+      "error sending request for url (https://chatgpt.com/backend-api/wham/usage)",
+      undefined,
+    ]) {
+      expect(isCodexAuthRejectionError(error)).toBe(false);
+    }
   });
 });
