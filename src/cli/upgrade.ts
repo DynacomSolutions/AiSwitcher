@@ -51,8 +51,70 @@ const CANCELLATION_EXIT_CODES = new Set([129, 130, 131, 143]);
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org/";
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const SEMVER_SCAN_PATTERN = /\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/;
 const FAILURE_OUTPUT_MAX_LINES = 30;
 const FAILURE_NARRATIVE_MAX_LINES = 10;
+
+/**
+ * xAI's own stable channel is the authoritative "latest" for Grok Build: the
+ * vendor's install.sh reads exactly these two URLs (x.ai first, the direct
+ * GCS bucket as fallback) and Grok's native updater announces updates from
+ * the same channel. npm has no view of it, so the Grok row cannot borrow the
+ * npm version source the npm-installed tools use.
+ */
+export const GROK_CHANNEL_URLS = [
+  "https://x.ai/cli/stable",
+  "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable",
+];
+
+/** First semver inside a tool's --version output, tolerating every vendor
+ * shape seen live: "2.1.268 (Claude Code)", "codex-cli 0.154.0",
+ * "crush version v0.93.1", "grok 1.0.25 (f7e67d6988e2) [stable]". Undefined
+ * when no semver appears (callers must then not pretend to know a version
+ * rather than guess from token positions). */
+export function extractSemver(output: string): string | undefined {
+  return stripAnsi(output).match(SEMVER_SCAN_PATTERN)?.[0];
+}
+
+/** Three-way semver comparison for the post-install gates: numeric core
+ * first, then semver's rule that a prerelease sorts below its release.
+ * Build metadata is ignored. */
+export function compareSemver(a: string, b: string): number {
+  const core = (value: string) => value.split(/[+-]/)[0]!.split(".").map(Number);
+  const left = core(a);
+  const right = core(b);
+  for (let i = 0; i < 3; i++) {
+    const x = left[i] ?? 0;
+    const y = right[i] ?? 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  const aPre = a.includes("-") ? a.split("-")[1]?.split("+")[0] : undefined;
+  const bPre = b.includes("-") ? b.split("-")[1]?.split("+")[0] : undefined;
+  if (aPre && !bPre) return -1;
+  if (!aPre && bPre) return 1;
+  return 0;
+}
+
+/** Resolve xAI's stable channel version, trying each mirror in order and
+ * taking the first line only when it is a clean semver. Undefined when the
+ * channel is unreachable or malformed (the Grok row then degrades to
+ * before/after version evidence instead of a hard expectation). */
+export async function resolveGrokChannelLatestVersion(deps: {
+  fetch(url: string): Promise<{ ok: boolean; text(): Promise<string> }>;
+}): Promise<string | undefined> {
+  for (const url of GROK_CHANNEL_URLS) {
+    try {
+      const response = await deps.fetch(url);
+      if (!response.ok) continue;
+      const version = (await response.text()).trim().split(/\s+/)[0] ?? "";
+      if (SEMVER_PATTERN.test(version)) return version;
+    } catch {
+      // Mirror unreachable: try the next one; a fully dead channel is a
+      // degradation, not a failure of the upgrade itself.
+    }
+  }
+  return undefined;
+}
 
 /** Heartbeats only; the cancellation check lives with the caller, which owns
  * the result's exit code (see cancellationFor). */
@@ -158,6 +220,11 @@ export interface UpgradeDeps {
   installGrok(): Promise<CapturedRunResult>;
   latestNpmVersion?(npm: string, packageName: string): Promise<string | undefined>;
   managedNpmVersion?(packageName: string): Promise<string | undefined>;
+  /** xAI's stable channel version (the authoritative latest for Grok Build,
+   * the same source Grok's own updater and installer consume). Undefined
+   * when unreachable; the Grok row then falls back to before/after version
+   * evidence instead of a hard expectation. */
+  grokChannelVersion?(): Promise<string | undefined>;
   log(message: string): void;
 }
 
@@ -352,6 +419,10 @@ function defaultDeps(log: (message: string) => void = console.log): UpgradeDeps 
         return undefined;
       }
     },
+    grokChannelVersion: async () =>
+      await resolveGrokChannelLatestVersion({
+        fetch: async (url) => await fetch(url, { signal: AbortSignal.timeout(15_000) }),
+      }),
     log,
   };
 }
@@ -385,6 +456,9 @@ interface UpgradeInstallResult {
    * "already 0.144.6". Undefined when the installer cannot know versions
    * (native updaters, Grok's installer); the runner then shows "updated". */
   detail?: string;
+  /** Precise failure headline for the status row when ok is false. The
+   * runner falls back to the generic "install/upgrade failed" when absent. */
+  reason?: string;
 }
 
 function describeVersionChange(before: string | undefined, after: string | undefined): string | undefined {
@@ -399,8 +473,10 @@ function describeVersionChange(before: string | undefined, after: string | undef
  * is already installed. */
 export const HERDR_UPGRADE_ID = "herdr";
 
-/** "herdr 0.8.2" -> "0.8.2"; any failure is simply no version (the row then
- * shows the generic "updated" outcome instead of an invented number). */
+/** Probe a binary's --version and return the first semver it prints
+ * ("herdr 0.8.2" -> "0.8.2", "2.1.268 (Claude Code)" -> "2.1.268"); any
+ * failure is simply no version (the row then shows the generic "updated"
+ * outcome instead of an invented number). */
 async function capturedBinaryVersion(
   deps: UpgradeDeps,
   binary: string,
@@ -408,7 +484,7 @@ async function capturedBinaryVersion(
   try {
     const probe = await deps.capture(binary, ["--version"]);
     if (probe.timedOut || probe.exitCode !== 0) return undefined;
-    return probe.stdout.trim().split(/\s+/).pop() || undefined;
+    return extractSemver(probe.stdout);
   } catch {
     return undefined;
   }
@@ -504,14 +580,39 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
   }
   const resolvedPackageSpec = `${npmPackage}@${version ?? "latest"}`;
   const previousVersion = deps.managedNpmVersion ? await deps.managedNpmVersion(npmPackage) : undefined;
+  const managedBinary = join(MANAGED_REAL_BIN_DIR, spec.cfg.realBinaryName);
   if (version && previousVersion === version) {
     try {
-      const probe = await deps.capture(join(MANAGED_REAL_BIN_DIR, spec.cfg.realBinaryName), ["--version"]);
+      const probe = await deps.capture(managedBinary, ["--version"]);
       const cancelled = cancellationFor(probe.exitCode);
       if (cancelled) throw cancelled;
       if (!probe.timedOut && probe.exitCode === 0) {
-        deps.log(`${prefix} ${spec.cfg.toolName} ${version} already up to date`);
-        return { ok: true, detail: `already ${version}` };
+        // Exit code alone is not evidence: a managed binary that REPORTS an
+        // older version than the pinned one is exactly the stale state this
+        // command exists to fix (reinstall it). And when the binary the user
+        // actually resolves to differs from the managed one and reports an
+        // older version, no reinstall can help: that is PATH shadowing, and
+        // the row must say so instead of showing a green "already".
+        const reported = extractSemver(probe.stdout);
+        if (!reported || compareSemver(reported, version) >= 0) {
+          const resolved = tryResolve(spec, deps);
+          const resolvedVersion = resolved
+            ? resolved === managedBinary
+              ? reported
+              : await capturedBinaryVersion(deps, resolved)
+            : undefined;
+          if (resolvedVersion && compareSemver(resolvedVersion, version) < 0) {
+            return {
+              ok: false,
+              reason: `${resolved} still reports ${resolvedVersion} but ${version} is installed in ${MANAGED_REAL_BIN_DIR} (another install is shadowing the managed one)`,
+            };
+          }
+          deps.log(`${prefix} ${spec.cfg.toolName} ${version} already up to date`);
+          return { ok: true, detail: `already ${version}` };
+        }
+        deps.log(
+          `${prefix} ${yellow(`managed ${spec.cfg.realBinaryName} reports ${reported}, expected ${version}; reinstalling`)}`,
+        );
       }
     } catch (err) {
       if (err instanceof UpgradeCancelledError) throw err;
@@ -530,7 +631,10 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
     "--fetch-retries=1",
     "--fetch-retry-mintimeout=1000",
     "--fetch-retry-maxtimeout=5000",
-    ...(version ? ["--prefer-online"] : []),
+    // Always revalidate: npm's cached packument may lag the registry, and
+    // the @latest fallback (no pinned version) is exactly where stale
+    // metadata would silently reinstall yesterday's release.
+    "--prefer-online",
     ...(spec.allowedScriptPackages?.length
       ? [`--allow-scripts=${spec.allowedScriptPackages.join(",")}`]
       : []),
@@ -540,11 +644,40 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
   const result = await awaitUpgradeStep(deps.spawn(npm, args), `${spec.cfg.toolName} npm installer`, deps.log);
   const cancelled = cancellationFor(result.exitCode);
   if (cancelled) throw cancelled;
-  const managedBinary = join(MANAGED_REAL_BIN_DIR, spec.cfg.realBinaryName);
   if (result.exitCode === 0 && (await deps.managedBinaryExists(spec.cfg.realBinaryName))) {
     const probe = await deps.capture(managedBinary, ["--version"]);
     if (!probe.timedOut && probe.exitCode === 0) {
       const updatedVersion = deps.managedNpmVersion ? await deps.managedNpmVersion(npmPackage) : undefined;
+      // Post-install verification gate: exit code 0 is a claim, not evidence.
+      // (1) A pinned install whose manifest still reports something else did
+      // not actually land. (2) The binary on the RESOLVED path (what the user
+      // actually runs through the shim) must report at least the installed
+      // version; anything older means another install is shadowing the
+      // managed prefix and no reinstall can fix it. Both are honest FAILED
+      // rows with the reason, never a green check. Unparseable --version
+      // output (no semver at all) keeps the historical behaviour: the gate
+      // never fails on a version it could not read.
+      if (version && updatedVersion && updatedVersion !== version) {
+        return {
+          ok: false,
+          reason: `${npmPackage} manifest still reports ${updatedVersion} after installing ${version}`,
+        };
+      }
+      const expected = version ?? updatedVersion;
+      if (expected) {
+        const resolved = tryResolve(spec, deps);
+        const resolvedVersion = resolved
+          ? resolved === managedBinary
+            ? extractSemver(probe.stdout)
+            : await capturedBinaryVersion(deps, resolved)
+          : undefined;
+        if (resolvedVersion && compareSemver(resolvedVersion, expected) < 0) {
+          return {
+            ok: false,
+            reason: `${resolved} still reports ${resolvedVersion} after installing ${expected} (another install is shadowing the managed one)`,
+          };
+        }
+      }
       return { ok: true, detail: describeVersionChange(previousVersion, updatedVersion) };
     }
   }
@@ -560,15 +693,50 @@ async function installNpmTool(spec: UpgradeSpec, deps: UpgradeDeps, prefix: stri
 }
 
 async function installOrUpgradeGrok(spec: UpgradeSpec, deps: UpgradeDeps, prefix: string): Promise<UpgradeInstallResult> {
+  // xAI's stable channel is the authoritative latest (Grok's own updater and
+  // installer both consume it). With it, "exit 0" can be checked against
+  // reality; without it the run degrades to before/after version evidence.
+  const channelLatest = deps.grokChannelVersion
+    ? await awaitUpgradeStep(deps.grokChannelVersion().catch(() => undefined), "grok channel version lookup", deps.log)
+    : undefined;
   const realBinary = tryResolve(spec, deps);
+  let before: string | undefined;
   if (realBinary && (await supportsNativeUpdater(spec, realBinary, deps))) {
     const updateArgs = spec.nativeUpdateArgs!;
+    before = await capturedBinaryVersion(deps, realBinary);
     deps.log(`${prefix} running ${cyan(`grok ${updateArgs.join(" ")}`)} (${realBinary})`);
     const update = await awaitUpgradeStep(deps.spawn(realBinary, updateArgs), "grok native updater", deps.log);
     const updateCancelled = cancellationFor(update.exitCode);
     if (updateCancelled) throw updateCancelled;
-    if (update.exitCode === 0) return { ok: true };
-    deps.log(`${prefix} ${yellow("Grok's native updater failed; reinstalling with xAI's installer")}`);
+    if (update.exitCode === 0) {
+      const afterBinary = tryResolve(spec, deps);
+      const after = afterBinary ? await capturedBinaryVersion(deps, afterBinary) : undefined;
+      if (channelLatest) {
+        if (after && compareSemver(after, channelLatest) >= 0) {
+          if (before && before === after) return { ok: true, detail: `already ${after}` };
+          return { ok: true, detail: describeVersionChange(before, after) };
+        }
+        // Verified live 2026-09-12: `grok update` can exit 0 and print "v1.0.30
+        // installed successfully" while npm's install-script policy blocked the
+        // package postinstall, leaving the binary untouched. Exit codes are not
+        // evidence; fall through to xAI's installer, which writes the real
+        // binary into ~/.grok/bin directly (no npm, no postinstall to block).
+        deps.log(
+          `${prefix} ${yellow(
+            `Grok's native updater exited 0 but grok still reports ${after ?? "an unreadable version"} (xAI's channel latest is ${channelLatest}); reinstalling with xAI's installer`,
+          )}`,
+        );
+      } else {
+        // Channel unreachable: exit 0 plus an unchanged readable version is
+        // reported as "already X" (herdr's precedent, and honest about the
+        // version actually installed); a moved version is a transition;
+        // unreadable output keeps the generic historical outcome.
+        if (before && after && before === after) return { ok: true, detail: `already ${after}` };
+        return { ok: true, detail: describeVersionChange(before, after) };
+      }
+    } else {
+      deps.log(`${prefix} ${yellow("Grok's native updater failed; reinstalling with xAI's installer")}`);
+    }
   } else {
     deps.log(`${prefix} Grok is missing or is not xAI's Grok Build CLI; installing the latest xAI release`);
   }
@@ -579,7 +747,15 @@ async function installOrUpgradeGrok(spec: UpgradeSpec, deps: UpgradeDeps, prefix
   if (install.exitCode !== 0) return { ok: false };
   const installedBinary = tryResolve(spec, deps);
   const usable = installedBinary !== undefined && (await supportsNativeUpdater(spec, installedBinary, deps));
-  return usable ? { ok: true } : { ok: false };
+  if (!usable) return { ok: false };
+  const installedVersion = await capturedBinaryVersion(deps, installedBinary);
+  if (channelLatest && installedVersion && compareSemver(installedVersion, channelLatest) < 0) {
+    return {
+      ok: false,
+      reason: `grok still reports ${installedVersion} after installing, but xAI's channel latest is ${channelLatest}`,
+    };
+  }
+  return { ok: true, detail: installedVersion ? describeVersionChange(before, installedVersion) : undefined };
 }
 
 function formatSeconds(ms: number): string {
@@ -653,7 +829,7 @@ export async function runUpgradeWithDeps(
         task.spec.installer === "npm"
           ? await installNpmTool(task.spec, taskDeps, prefix)
           : await installOrUpgradeGrok(task.spec, taskDeps, prefix);
-      outcome = { ok: result.ok, detail: result.detail };
+      outcome = { ok: result.ok, detail: result.detail, reason: result.reason };
     } catch (err) {
       if (err instanceof UpgradeCancelledError) {
         cancellation = cancellation ?? err;
