@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { BinaryResolutionError } from "../../src/identities/errors.ts";
 import {
+  GROK_CHANNEL_URLS,
   GROK_INSTALLER_URL,
   MANAGED_NPM_PREFIX,
   UPGRADE_SPECS,
+  compareSemver,
+  extractSemver,
   helpListsUpdater,
   isOfficialXaiGrokHelp,
   planUpgrades,
+  resolveGrokChannelLatestVersion,
   resolvePublicNpmLatestVersion,
   runUpgradeWithDeps,
   UpgradeCancelledError,
@@ -86,9 +90,71 @@ describe("xAI Grok detection", () => {
     expect(GROK_INSTALLER_URL).toBe("https://x.ai/cli/install.sh");
   });
 
+  test("reads the same two stable-channel mirrors xAI's installer uses", () => {
+    expect(GROK_CHANNEL_URLS).toEqual([
+      "https://x.ai/cli/stable",
+      "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable",
+    ]);
+  });
+
   test("distinguishes Grok Build from the similarly named community CLI", () => {
     expect(isOfficialXaiGrokHelp("Grok Build TUI\nCommands:\n  update")).toBe(true);
     expect(isOfficialXaiGrokHelp("AI coding agent powered by Grok\nCommands:\n  update")).toBe(false);
+  });
+});
+
+describe("semver helpers", () => {
+  test("extractSemver reads every vendor --version shape seen live", () => {
+    expect(extractSemver("2.1.268 (Claude Code)\n")).toBe("2.1.268");
+    expect(extractSemver("codex-cli 0.154.0\n")).toBe("0.154.0");
+    expect(extractSemver("crush version v0.93.1\n")).toBe("0.93.1");
+    expect(extractSemver("grok 1.0.25 (f7e67d6988e2) [stable]\n")).toBe("1.0.25");
+    expect(extractSemver("herdr 0.8.2\n")).toBe("0.8.2");
+    expect(extractSemver("\x1b[32m1.18.30\x1b[0m")).toBe("1.18.30");
+    expect(extractSemver("Grok Build TUI\nCommands:\n  update    Update to the latest version")).toBeUndefined();
+  });
+
+  test("compareSemver orders numeric cores and prereleases below releases", () => {
+    expect(compareSemver("1.0.25", "1.0.30")).toBeLessThan(0);
+    expect(compareSemver("2.1.269", "2.1.269")).toBe(0);
+    expect(compareSemver("0.10.0", "0.9.0")).toBeGreaterThan(0);
+    expect(compareSemver("1.0.0-rc.1", "1.0.0")).toBeLessThan(0);
+    expect(compareSemver("1.0.0", "1.0.0+build.5")).toBe(0);
+  });
+});
+
+describe("resolveGrokChannelLatestVersion", () => {
+  const text = (body: string, ok = true) => ({ ok, text: async () => body });
+
+  test("reads xAI's stable channel", async () => {
+    const fetched: string[] = [];
+    const version = await resolveGrokChannelLatestVersion({
+      fetch: async (url) => {
+        fetched.push(url);
+        return text("1.0.30\n");
+      },
+    });
+    expect(version).toBe("1.0.30");
+    expect(fetched).toEqual([GROK_CHANNEL_URLS[0]]);
+  });
+
+  test("falls back to the GCS mirror when x.ai fails", async () => {
+    const version = await resolveGrokChannelLatestVersion({
+      fetch: async (url) => (url.startsWith("https://x.ai") ? text("overloaded", false) : text("1.0.30")),
+    });
+    expect(version).toBe("1.0.30");
+  });
+
+  test("degrades to undefined when every mirror is unreachable or malformed", async () => {
+    for (const fetch of [
+      async () => text("bogus", false),
+      async () => {
+        throw new Error("offline");
+      },
+      async () => text("not a version"),
+    ]) {
+      await expect(resolveGrokChannelLatestVersion({ fetch })).resolves.toBeUndefined();
+    }
   });
 });
 
@@ -261,6 +327,7 @@ describe("runUpgradeWithDeps", () => {
           "--fetch-retries=1",
           "--fetch-retry-mintimeout=1000",
           "--fetch-retry-maxtimeout=5000",
+          "--prefer-online",
           "@openai/codex@latest",
         ],
       },
@@ -336,11 +403,11 @@ describe("runUpgradeWithDeps", () => {
     expect(spawns).toEqual([]);
   });
 
-  test("falls back to npm @latest when the version lookup fails", async () => {
+  test("falls back to npm @latest when the version lookup fails, still revalidating npm's cache", async () => {
     const { deps, spawns } = fakeDeps({ latestNpmVersion: async () => undefined });
     await runUpgradeWithDeps(deps, [oneSpec("codex")]);
     expect(spawns[0]?.args).not.toContain("--prefer-offline");
-    expect(spawns[0]?.args).not.toContain("--prefer-online");
+    expect(spawns[0]?.args).toContain("--prefer-online");
     expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@latest");
   });
 
@@ -509,6 +576,197 @@ describe("runUpgradeWithDeps", () => {
 
     expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
     expect(spawns[0]?.args).toContain("--allow-scripts=@moonshot-ai/kimi-code,node-pty");
+  });
+});
+
+describe("grok honest install verification", () => {
+  /** Mutable grok install: --version probes read `version`, --help probes
+   * advertise the official xAI updater, everything else is the default. */
+  function grokDeps(version: { value: string }, overrides: Partial<UpgradeDeps> = {}) {
+    return fakeDeps({
+      capture: async (_command, args) =>
+        args[0] === "--version"
+          ? { stdout: `grok ${version.value} (abc123) [stable]\n`, stderr: "", exitCode: 0, timedOut: false }
+          : {
+              stdout: "Grok Build TUI\nCommands:\n  update    Update to the latest version",
+              stderr: "",
+              exitCode: 0,
+              timedOut: false,
+            },
+      grokChannelVersion: async () => "1.0.30",
+      ...overrides,
+    });
+  }
+
+  test("a lying exit 0 falls back to xAI's installer and reports the real transition", async () => {
+    // 2026-09-12 incident: `grok update` exited 0 printing "installed
+    // successfully" while npm had blocked the package postinstall, so
+    // 1.0.25 stayed on disk under a green row.
+    const version = { value: "1.0.25" };
+    let installerCalls = 0;
+    const spawns: Array<{ command: string; args: string[] }> = [];
+    const { deps, hooks } = grokDeps(version, {
+      spawn: async (command, args) => {
+        spawns.push({ command, args });
+        return { exitCode: 0, stdout: "✓ grok v1.0.30 installed successfully!\n", stderr: "" };
+      },
+      installGrok: async () => {
+        installerCalls++;
+        version.value = "1.0.30";
+        return { exitCode: 0, stdout: "Grok 1.0.30 installed", stderr: "" };
+      },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("grok")], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(spawns).toEqual([{ command: "/real/grok", args: ["update"] }]);
+    expect(installerCalls).toBe(1);
+    const last = hooks.events.at(-1);
+    expect(last?.type).toBe("finish");
+    expect(last?.type === "finish" && last.detail?.startsWith("1.0.25 -> 1.0.30")).toBe(true);
+  });
+
+  test("a version that still did not move after the installer is an honest failed row", async () => {
+    const version = { value: "1.0.25" };
+    const { deps, hooks } = grokDeps(version, {
+      spawn: async () => ({ exitCode: 0, stdout: "✓ grok v1.0.30 installed successfully!\n", stderr: "" }),
+      installGrok: async () => ({ exitCode: 0, stdout: "Grok 1.0.30 installed", stderr: "" }),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("grok")], hooks);
+
+    expect(summary).toEqual({ checked: 0, failed: 1, skipped: 0 });
+    const last = hooks.events.at(-1);
+    expect(last?.type).toBe("finish");
+    expect(last?.type === "finish" && last.ok).toBe(false);
+    expect(last?.type === "finish" && last.detail?.includes("grok still reports 1.0.25")).toBe(true);
+    expect(last?.type === "finish" && last.detail?.includes("channel latest is 1.0.30")).toBe(true);
+  });
+
+  test("a native updater that really moves the version is a green transition without the installer", async () => {
+    const version = { value: "1.0.25" };
+    let installerCalls = 0;
+    const spawns: Array<{ command: string; args: string[] }> = [];
+    const { deps, hooks } = grokDeps(version, {
+      spawn: async (command, args) => {
+        spawns.push({ command, args });
+        version.value = "1.0.30";
+        return { exitCode: 0, stdout: "Updating Grok 1.0.25 → 1.0.30\n", stderr: "" };
+      },
+      installGrok: async () => {
+        installerCalls++;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("grok")], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(spawns).toEqual([{ command: "/real/grok", args: ["update"] }]);
+    expect(installerCalls).toBe(0);
+    const last = hooks.events.at(-1);
+    expect(last?.type === "finish" && last.detail?.startsWith("1.0.25 -> 1.0.30")).toBe(true);
+  });
+
+  test("with the channel unreachable an exit 0 that changes nothing stays honest as already X", async () => {
+    const version = { value: "1.0.25" };
+    let installerCalls = 0;
+    const { deps, hooks } = grokDeps(version, {
+      grokChannelVersion: async () => undefined,
+      spawn: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      installGrok: async () => {
+        installerCalls++;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("grok")], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(installerCalls).toBe(0);
+    const last = hooks.events.at(-1);
+    expect(last?.type === "finish" && last.detail?.startsWith("already 1.0.25")).toBe(true);
+  });
+});
+
+describe("npm post-install verification gate", () => {
+  test("fails honestly when the resolved binary still reports an older version than the pinned install", async () => {
+    const { deps, spawns, hooks } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async () => "0.144.6",
+      // The user's PATH resolves codex somewhere other than the managed
+      // prefix, and that shadow reports yesterday's version.
+      resolve: (binaryName) => `/usr/bin/${binaryName}`,
+      capture: async (command) =>
+        command.startsWith(MANAGED_NPM_PREFIX)
+          ? { stdout: "codex-cli 0.144.6", stderr: "", exitCode: 0, timedOut: false }
+          : { stdout: "codex-cli 0.144.5", stderr: "", exitCode: 0, timedOut: false },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("codex")], hooks);
+
+    expect(summary).toEqual({ checked: 0, failed: 1, skipped: 0 });
+    expect(spawns).toEqual([]);
+    const last = hooks.events.filter((event) => event.id === "codex").at(-1);
+    expect(last?.type).toBe("finish");
+    expect(last?.type === "finish" && last.ok).toBe(false);
+    expect(last?.type === "finish" && last.detail?.includes("/usr/bin/codex still reports 0.144.5")).toBe(true);
+    expect(last?.type === "finish" && last.detail?.includes("shadowing")).toBe(true);
+  });
+
+  test("fails honestly when the managed manifest did not actually move to the pinned version", async () => {
+    const { deps, spawns, hooks } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async () => "0.144.5",
+      capture: async (command) =>
+        command.startsWith(MANAGED_NPM_PREFIX)
+          ? { stdout: "codex-cli 0.144.5", stderr: "", exitCode: 0, timedOut: false }
+          : { stdout: "Grok Build TUI\nCommands:\n  update", stderr: "", exitCode: 0, timedOut: false },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("codex")], hooks);
+
+    expect(summary).toEqual({ checked: 0, failed: 1, skipped: 0 });
+    expect(spawns).toHaveLength(1);
+    const last = hooks.events.filter((event) => event.id === "codex").at(-1);
+    expect(last?.type === "finish" && last.ok).toBe(false);
+    expect(
+      last?.type === "finish" && last.detail?.includes("manifest still reports 0.144.5 after installing 0.144.6"),
+    ).toBe(true);
+  });
+
+  test("reinstalls when the managed binary reports an older version than the pinned manifest", async () => {
+    const { deps, spawns } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async () => "0.144.6",
+      capture: async (command) =>
+        command.startsWith(MANAGED_NPM_PREFIX)
+          ? { stdout: "codex-cli 0.144.5", stderr: "", exitCode: 0, timedOut: false }
+          : { stdout: "", stderr: "", exitCode: 0, timedOut: false },
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("codex")]);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]?.args.at(-1)).toBe("@openai/codex@0.144.6");
+  });
+
+  test("reports already with a matching managed binary that parses to the pinned version", async () => {
+    const { deps, spawns, hooks } = fakeDeps({
+      latestNpmVersion: async () => "0.144.6",
+      managedNpmVersion: async () => "0.144.6",
+      resolve: (binaryName) => `${MANAGED_NPM_PREFIX}/bin/${binaryName}`,
+      capture: async () => ({ stdout: "codex-cli 0.144.6\n", stderr: "", exitCode: 0, timedOut: false }),
+    });
+
+    const summary = await runUpgradeWithDeps(deps, [oneSpec("codex")], hooks);
+
+    expect(summary).toEqual({ checked: 1, failed: 0, skipped: 0 });
+    expect(spawns).toEqual([]);
+    const last = hooks.events.filter((event) => event.id === "codex").at(-1);
+    expect(last?.type === "finish" && last.detail?.startsWith("already 0.144.6")).toBe(true);
   });
 });
 
