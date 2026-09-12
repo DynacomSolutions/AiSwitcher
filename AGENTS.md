@@ -2630,20 +2630,59 @@ What the rule means in practice, now enforced in both pipelines:
   matched against every opencode/pi identity's keys; usage logs under the
   identity holding the same credential. The synthetic "default" identity
   is the fallback ONLY for providers no identity can claim.
-- **ONE credential per (identity, provider) — kimi-store.ts.** Kimi rotates
-  its OAuth refresh token on EVERY refresh, and the same account's
-  credentials exist in two stores: the kimi identity's
-  `credentials/kimi-code.json` (the kimi CLI's own file) and the same-named
-  pi identity's imported `auth.json` "kimi-coding" entry. Left independent,
-  whichever store refreshes first can invalidate the other's refresh token.
-  The stores are
-  now views of ONE logical token: reads take the FRESHEST copy
-  (freshest-wins self-heals), and every refresh is written through to ALL
-  of the account's stores in each store's own shape (pi's expires is
-  milliseconds, kimi's seconds). pi's entry is thus a live projection, not
-  a fork. The same law will need the same treatment for the other OAuth
-  providers pi holds copies of (anthropic, openai-codex, xai) when they
-  rotate shared credentials.
+- **ONE credential per (identity, provider) (kimi-store.ts, oauth-reconcile.ts).**
+  Every OAuth provider pi imports (kimi, anthropic, openai-codex, xai)
+  rotates its refresh token, and each account's grant lives in TWO stores:
+  the native CLI's own file (kimi `credentials/kimi-code.json`; claude
+  `.credentials.json` `claudeAiOauth`; codex `auth.json` `tokens`; grok
+  `auth.json` account entries) and the same-named pi identity's imported
+  `auth.json` entry. Left independent, whichever store refreshes first
+  rotates the grant out from under the other copy, whose next refresh then
+  fails (or, with provider-side reuse detection, revokes the grant
+  everywhere: the 2026-09-12 forced re-login incident found 8 of 9 paired
+  accounts diverged, pi's copies 10-24 days staler). The stores are views
+  of ONE logical token, enforced at the two boundaries AIS owns:
+  - READ/WRITE-THROUGH (kimi's own API path, `limits/kimi-store.ts`): reads
+    take the FRESHEST copy (freshest-wins self-heals), and every refresh is
+    written through to ALL of the account's stores in each store's own
+    shape (pi's `expires` is milliseconds, kimi's `expires_at` seconds).
+    pi's kimi-coding entry is a live projection, not a fork.
+  - RECONCILE (all four providers, `identities/oauth-reconcile.ts`): pi's
+    internal refreshes cannot be hooked, so convergence is enforced at
+    AIS's boundaries instead. Every `ais pi` launch, `ais auth sync
+    --tool=pi` and `ais auth import --tool=pi` compares both copies per
+    provider, adopts the FRESHEST (JWT `iat` for codex/xai, numeric expiry
+    for anthropic, `expires_at` for kimi; native wins ties), and rewrites
+    the staler store in that store's own shape (units, field names,
+    wrapping; 0600, temp+rename, one `.ais-bak` beside each rewritten
+    native file). Import reconciles BEFORE overwriting so a fresher pi copy
+    is adopted into the native store first and survives the import. Divergence
+    is decided by refresh-token fingerprint (sha256 prefix, 8 hex; never
+    the token value), and `ais doctor` reports a pi identity holding
+    diverged copies as `forked` (degraded) with the fingerprints, drift and
+    remediation. The sync stays ADD-ONLY for existing entries; the
+    reconcile does the freshest-wins merge.
+  - Residual race, stated honestly: pi may refresh between two reconciles,
+    and that rotation is invisible to AIS until the next launch/sync heals
+    it. In that window the native tool's copy is stale, and one refresh
+    attempt from it can fail; worst case (a provider that revokes on
+    reuse) that means a re-login of the account. Before this law there was
+    NO healing path at all for anthropic/codex/xai: pi's copy drifted for
+    weeks and every pi-side refresh replayed a long-dead token, which is
+    the forced re-login the user kept hitting. Now the fork window is at
+    most one pi session, and when PI is the fresher side the reconcile
+    adopts pi's copy INTO the native store (observed live 2026-09-12:
+    pi/personal's kimi-coding refreshed between the dry run and the write,
+    and its grant was pushed back into the kimi store), so a pi-side
+    refresh no longer strands the native tool.
+  - Shape limits honoured by the reconcile: codex's pi-side expiry stamp
+    can be synthetic (import time + 5 minutes) when an access token is not
+    a JWT, so codex/xai recency prefers the JWT `iat` of the access token
+    and falls back to codex's own `last_refresh`; claude's
+    `refreshTokenExpiresAt` has no pi-side counterpart and is preserved
+    verbatim on write-through (conservative; claude re-mints it on its next
+    refresh); grok's multi-account store matches the account by refresh
+    fingerprint, falling back to grok's own freshest entry.
 - **No tool-shaped placeholder rows exist for the multi-provider clients.**
   Neither a pending seed (the provider isn't known until the adapter reads
   the identity's own auth store — a placeholder would render a fake
