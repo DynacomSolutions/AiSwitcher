@@ -1,4 +1,5 @@
 import { findIdentityByNameOrAlias } from "../../identities/store.ts";
+import { effectiveIdentityColour } from "../../identities/colour.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import type { ParsedArgs } from "../args.ts";
 import { bold, dim } from "../colors.ts";
@@ -8,6 +9,9 @@ import { loadAll, loadOne, toolConfigFromFlag } from "./resolve-tool.ts";
 function printIdentity(cfg: ToolConfig, identity: Identity): void {
   console.log(`${bold(identity.name)}  ${dim(`(${cfg.toolName})`)}`);
   console.log(JSON.stringify(identity, null, 2));
+  // Session colour the surfaces (session tree, WebUI) render for this
+  // identity: explicit when set, auto palette pick otherwise.
+  console.log(`${dim("colour")}: ${effectiveIdentityColour(cfg.toolName, identity.name, identity.colour)}`);
 }
 
 export async function runShow(rest: string[], flags: ParsedArgs["flags"]): Promise<void> {

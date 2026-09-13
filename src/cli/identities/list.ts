@@ -15,6 +15,7 @@ function identityFields(identity: Identity): Array<[string, string[]]> {
   const fields: Array<[string, string[]]> = [];
   if (identity.aliases?.length) fields.push(["aliases", identity.aliases]);
   fields.push(["configDir", [identity.configDir]]);
+  if (identity.colour !== undefined) fields.push(["colour", [identity.colour]]);
   if (identity.directories?.length) fields.push(["directories", identity.directories]);
   return fields;
 }

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "./types.ts";
 import { InvalidIdentitiesFileError } from "./errors.ts";
+import { isValidIdentityColour } from "./colour.ts";
 import { expandPath, parseDirectoryPattern } from "./match.ts";
 
 function validateIdentity(identity: unknown, index: number): asserts identity is Identity {
@@ -34,6 +35,13 @@ function validateIdentity(identity: unknown, index: number): asserts identity is
   if (rec.aliases !== undefined) {
     if (!Array.isArray(rec.aliases) || rec.aliases.some((a) => typeof a !== "string" || !a)) {
       throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-string[] "aliases"`);
+    }
+  }
+  if (rec.colour !== undefined) {
+    // Validated eagerly so a typo never lands in the registry; identities/colour.ts
+    // is also what every consumer normalises through before display.
+    if (typeof rec.colour !== "string" || !isValidIdentityColour(rec.colour)) {
+      throw new InvalidIdentitiesFileError(`identity "${rec.name}" has an invalid "colour" (use #rgb or #rrggbb)`);
     }
   }
   if (rec.env !== undefined) {

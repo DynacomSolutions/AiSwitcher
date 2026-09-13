@@ -1,4 +1,5 @@
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "../../identities/types.ts";
+import { normaliseIdentityColour } from "../../identities/colour.ts";
 import { isValidIdentityKey, parseDirectoryPattern } from "../../identities/match.ts";
 import { findIdentityByNameOrAlias } from "../../identities/store.ts";
 import { CliUsageError } from "../errors.ts";
@@ -77,6 +78,10 @@ export interface UpdateIdentityInput {
   label?: string;
   description?: string;
   configDir?: string;
+  /** Set to a valid #rgb/#rrggbb string to assign a session colour, or to an
+   * empty string to clear an existing one (the field is then removed from
+   * the persisted identity, falling back to the auto palette colour). */
+  colour?: string;
 }
 
 export function updateIdentity(file: IdentitiesFile, name: string, input: UpdateIdentityInput): Identity {
@@ -89,6 +94,17 @@ export function updateIdentity(file: IdentitiesFile, name: string, input: Update
   if (input.configDir !== undefined) {
     requireNonEmpty(input.configDir, "configDir");
     identity.configDir = input.configDir;
+  }
+  if (input.colour !== undefined) {
+    if (input.colour === "") {
+      delete identity.colour;
+    } else {
+      const normalised = normaliseIdentityColour(input.colour);
+      if (normalised === undefined) {
+        throw new CliUsageError(`Invalid colour "${input.colour}" — use #rgb or #rrggbb (e.g. #22c55e)`);
+      }
+      identity.colour = normalised;
+    }
   }
   return identity;
 }

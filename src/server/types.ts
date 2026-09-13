@@ -51,6 +51,11 @@ export interface IdentityDto {
   description?: string;
   configDir: string;
   configDirExists: boolean;
+  /** Explicit session colour (normalised #rrggbb) when the identity sets one. */
+  colour?: string;
+  /** Always present: `colour` when set, otherwise the stable auto palette
+   * colour for (tool, name) — see identities/colour.ts. */
+  effectiveColour: string;
   directories?: string[];
   aliases?: string[];
 }
