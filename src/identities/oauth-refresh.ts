@@ -501,7 +501,10 @@ export async function refreshIdentityOAuthGrant(
 /* ------------------------------------------------------------------ */
 
 export interface OAuthRefreshHealth {
-  state: "fresh" | "expiring" | "expired-refreshable" | "expired-no-refresh-token" | "revoked" | "absent";
+  /** "unknown": the grant exists but carries no decodable expiry (opaque
+   * token or undecodable JWT) and the store records no expires_at. An
+   * unreadable expiry is never treated as an expired token. */
+  state: "fresh" | "expiring" | "unknown" | "expired-refreshable" | "expired-no-refresh-token" | "revoked" | "absent";
   /** Human line, safe to render (fingerprints/expiry only, no tokens). */
   detail: string;
   expiresAt?: number;
@@ -512,18 +515,21 @@ export interface OAuthRefreshHealth {
  * status: is the access token expired, and if so is it refreshable (the
  * daemon or `ais auth refresh` heals it) or has the refresh token been
  * diagnosed revoked (only a re-login helps)? `revokedFingerprint` is the
- * scheduler's pinned diagnosis for this identity, when any. */
+ * scheduler's pinned diagnosis for this identity, when any. Tests pass
+ * `nowSeconds` explicitly so classification never depends on the clock. */
 export async function oauthRefreshHealth(
   tool: RefreshableTool,
   identity: Identity,
   revokedFingerprint?: string,
+  options: { nowSeconds?: number } = {},
 ): Promise<OAuthRefreshHealth> {
   const freshest = await freshestGrant(tool, identity).catch(() => undefined);
   if (!freshest) return { state: "absent", detail: "no OAuth grant in any store" };
   const grant = freshest.grant;
   const fingerprint = grant.refresh_token ? grantFingerprint(grant) : undefined;
   const expiresAt = grant.expires_at ?? jwtExpSeconds(grant.access_token);
-  const secondsLeft = expiresAt === undefined ? Number.POSITIVE_INFINITY : expiresAt - Math.floor(Date.now() / 1000);
+  const now = Math.floor(options.nowSeconds ?? Date.now() / 1000);
+  const secondsLeft = expiresAt === undefined ? undefined : expiresAt - now;
   if (revokedFingerprint && fingerprint && revokedFingerprint === fingerprint) {
     return {
       state: "revoked",
@@ -532,12 +538,21 @@ export async function oauthRefreshHealth(
       ...(fingerprint ? { refreshFingerprint: fingerprint } : {}),
     };
   }
-  if (secondsLeft > 0 && Number.isFinite(secondsLeft)) {
+  if (secondsLeft !== undefined && secondsLeft > 0) {
     const hours = secondsLeft / 3600;
     return {
       state: hours <= 24 ? "expiring" : "fresh",
       detail: `access token expires in ${hours < 48 ? `${hours.toFixed(1)}h` : `${Math.round(hours / 24)}d`}`,
       ...(expiresAt !== undefined ? { expiresAt } : {}),
+      ...(fingerprint ? { refreshFingerprint: fingerprint } : {}),
+    };
+  }
+  if (secondsLeft === undefined) {
+    return {
+      state: "unknown",
+      detail: grant.refresh_token
+        ? `access token carries no decodable expiry (opaque or unreadable token, no stored expires_at) — not treated as expired; refreshable: the daemon keeps its daily keep-alive, or run \`ais auth refresh ${identity.name} --tool=${tool}\` now`
+        : `access token carries no decodable expiry (opaque or unreadable token, no stored expires_at) and no refresh token is stored — log in again`,
       ...(fingerprint ? { refreshFingerprint: fingerprint } : {}),
     };
   }

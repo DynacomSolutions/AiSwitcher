@@ -3,7 +3,9 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  decodeJwtPayload,
   grantFingerprint,
+  jwtExpSeconds,
   reconcileNativeProviderStores,
   readProviderGrantCopy,
   writeProviderGrantCopy,
@@ -147,6 +149,43 @@ describe("reconcileNativeProviderStores (reconcile-on-read)", () => {
   });
 });
 
+describe("decodeJwtPayload", () => {
+  test("round-trips every payload length 1..64, pinning every base64 alignment", () => {
+    const asBase64url = (json: string): string => Buffer.from(json).toString("base64url");
+    const asStandardBase64 = (json: string): string => Buffer.from(json).toString("base64");
+    const jsonObjectOfLength = (n: number): string | undefined => {
+      if (n === 1) return undefined; // no valid JSON document is one character
+      if (n <= 6) return `{${" ".repeat(n - 2)}}`;
+      return `{"${"k".repeat(n - 6)}":1}`;
+    };
+    for (let n = 1; n <= 64; n++) {
+      const json = jsonObjectOfLength(n);
+      if (json === undefined) {
+        expect(decodeJwtPayload(`h.${asBase64url("7")}.s`)).toBeUndefined();
+        continue;
+      }
+      const expected = JSON.parse(json) as Record<string, unknown>;
+      expect(decodeJwtPayload(`h.${asBase64url(json)}.s`)).toEqual(expected);
+      // The unpadded standard-alphabet form must decode identically: this
+      // exercises the -_ -> +/ restoration wherever the alphabet differs.
+      expect(decodeJwtPayload(`h.${asStandardBase64(json)}.s`)).toEqual(expected);
+    }
+  });
+
+  test("extracts numeric claims and refuses malformed or non-object payloads", () => {
+    expect(decodeJwtPayload(fakeJwt({ iat: NOW, exp: NOW + 3600 }))).toEqual({ iat: NOW, exp: NOW + 3600 });
+    expect(jwtExpSeconds(fakeJwt({ exp: NOW + 3600 }))).toBe(NOW + 3600);
+    const stringExp = `h.${Buffer.from('{"exp":"soon"}').toString("base64url")}.s`;
+    expect(decodeJwtPayload(stringExp)).toEqual({ exp: "soon" });
+    expect(jwtExpSeconds(stringExp)).toBeUndefined();
+    expect(decodeJwtPayload("")).toBeUndefined();
+    expect(decodeJwtPayload("header-only.")).toBeUndefined();
+    expect(decodeJwtPayload("aaa.!!!garbage!!!.bbb")).toBeUndefined();
+    expect(decodeJwtPayload(`h.${Buffer.from('["a"]').toString("base64url")}.s`)).toBeUndefined();
+    expect(decodeJwtPayload(`h.${Buffer.from('"a string"').toString("base64url")}.s`)).toBeUndefined();
+  });
+});
+
 describe("readProviderGrantCopy / writeProviderGrantCopy", () => {
   test("round-trips a codex grant and preserves unknown file keys", async () => {
     await json(CODEX_FILE(), {
@@ -182,7 +221,7 @@ describe("oauthRefreshHealth (doctor classifier)", () => {
     await json(CODEX_FILE(), {
       tokens: { access_token: fakeJwt({ iat: NOW - 7200, exp: NOW - 3600 }), refresh_token: "rt-alive-1" },
     });
-    const health = await oauthRefreshHealth("codex", codexIdentity());
+    const health = await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW });
     expect(health.state).toBe("expired-refreshable");
     expect(health.detail).toContain("refreshable");
     expect(health.detail).toContain("ais auth refresh acme --tool=codex");
@@ -193,7 +232,7 @@ describe("oauthRefreshHealth (doctor classifier)", () => {
       tokens: { access_token: fakeJwt({ iat: NOW - 7200, exp: NOW - 3600 }), refresh_token: "rt-dead-1" },
     });
     const fingerprint = grantFingerprint({ access_token: "x", refresh_token: "rt-dead-1" });
-    const health = await oauthRefreshHealth("codex", codexIdentity(), fingerprint);
+    const health = await oauthRefreshHealth("codex", codexIdentity(), fingerprint, { nowSeconds: NOW });
     expect(health.state).toBe("revoked");
     expect(health.detail).toContain("re-login required");
   });
@@ -206,6 +245,7 @@ describe("oauthRefreshHealth (doctor classifier)", () => {
       "codex",
       codexIdentity(),
       grantFingerprint({ access_token: "x", refresh_token: "rt-dead-1" }),
+      { nowSeconds: NOW },
     );
     expect(health.state).toBe("expired-refreshable");
   });
@@ -214,19 +254,42 @@ describe("oauthRefreshHealth (doctor classifier)", () => {
     await json(CODEX_FILE(), {
       tokens: { access_token: fakeJwt({ iat: NOW, exp: NOW + 3600 }), refresh_token: "rt-alive-1" },
     });
-    const health = await oauthRefreshHealth("codex", codexIdentity());
+    const health = await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW });
     expect(health.state).toBe("expiring");
     await json(CODEX_FILE(), {
       tokens: { access_token: fakeJwt({ iat: NOW, exp: NOW + 30 * 86_400 }), refresh_token: "rt-alive-1" },
     });
-    expect((await oauthRefreshHealth("codex", codexIdentity())).state).toBe("fresh");
+    expect((await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW })).state).toBe("fresh");
+  });
+
+  test("an undecodable access token is never classified expired (runner failure shape)", async () => {
+    // A payload whose exp claim exists but cannot be recovered (truncated
+    // JSON, as a mis-decode leaves behind): the classifier must fall back
+    // to "unknown", never read a healthy grant as expired-refreshable.
+    const truncatedPayload = Buffer.from(JSON.stringify({ iat: NOW, exp: NOW + 3600 }).slice(0, -1)).toString("base64url");
+    await json(CODEX_FILE(), {
+      tokens: { access_token: `aaa.${truncatedPayload}.bbb`, refresh_token: "rt-alive-1" },
+    });
+    const health = await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW });
+    expect(health.state).toBe("unknown");
+    expect(health.detail).toContain("not treated as expired");
+  });
+
+  test("an undecodable token still defers to the store's own expiry signal", async () => {
+    await json(CLAUDE_FILE(), {
+      claudeAiOauth: { accessToken: "at-syn-cla", refreshToken: "rt-alive-1", expiresAt: (NOW + 1800) * 1000 },
+    });
+    const health = await oauthRefreshHealth("claude", { name: ACME, label: "Acme", configDir: dirs.claude }, undefined, {
+      nowSeconds: NOW,
+    });
+    expect(health.state).toBe("expiring");
   });
 
   test("expired with no refresh token is not refreshable", async () => {
     await json(CODEX_FILE(), {
       tokens: { access_token: fakeJwt({ iat: NOW - 7200, exp: NOW - 3600 }) },
     });
-    const health = await oauthRefreshHealth("codex", codexIdentity());
+    const health = await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW });
     expect(health.state).toBe("expired-no-refresh-token");
   });
 
@@ -239,7 +302,9 @@ describe("oauthRefreshHealth (doctor classifier)", () => {
     await json(CLAUDE_FILE(), {
       claudeAiOauth: { accessToken: "at-syn-cla", refreshToken: "rt-alive-1", expiresAt: (NOW - 3600) * 1000 },
     });
-    const health = await oauthRefreshHealth("claude", { name: ACME, label: "Acme", configDir: dirs.claude });
+    const health = await oauthRefreshHealth("claude", { name: ACME, label: "Acme", configDir: dirs.claude }, undefined, {
+      nowSeconds: NOW,
+    });
     expect(health.state).toBe("expired-refreshable");
   });
 });

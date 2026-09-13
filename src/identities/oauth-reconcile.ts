@@ -69,23 +69,37 @@ function recency(grant: OAuthGrant): number {
   return grant.minted_at ?? grant.expires_at ?? -1;
 }
 
+/** Decodes a JWT's payload segment (the middle dot-separated part) into a
+ * claims object. Restores base64url to standard padded base64 first, so
+ * every payload alignment decodes identically on every runtime (a bare
+ * "base64url" decode is the fragile part: runtimes have differed on
+ * unpadded/URL-safe input). Returns undefined on ANY failure: an
+ * undecodable token says nothing about expiry, and callers must fall back
+ * to the store's other expiry signals. */
+export function decodeJwtPayload(token: string): Record<string, unknown> | undefined {
+  try {
+    const segment = token.split(".")[1];
+    if (!segment) return undefined;
+    const base64 = segment.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const decoded: unknown = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+    if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return undefined;
+    return decoded as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Decodes ONLY the iat/exp claims of a JWT access token. Returns {} for
  * opaque tokens (claude's) or malformed input; claims are timestamps,
  * never secrets. */
 function jwtTimestamps(token: string): { iat?: number; exp?: number } {
-  try {
-    const payload = token.split(".")[1];
-    if (!payload) return {};
-    const decoded: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (typeof decoded !== "object" || decoded === null) return {};
-    const claims = decoded as { iat?: unknown; exp?: unknown };
-    return {
-      ...(typeof claims.iat === "number" ? { iat: claims.iat } : {}),
-      ...(typeof claims.exp === "number" ? { exp: claims.exp } : {}),
-    };
-  } catch {
-    return {};
-  }
+  const claims = decodeJwtPayload(token);
+  if (!claims) return {};
+  return {
+    ...(typeof claims.iat === "number" ? { iat: claims.iat } : {}),
+    ...(typeof claims.exp === "number" ? { exp: claims.exp } : {}),
+  };
 }
 
 /** The exp claim of a JWT access token in unix seconds, or undefined for
