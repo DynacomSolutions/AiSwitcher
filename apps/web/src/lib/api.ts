@@ -19,6 +19,7 @@ import type {
   SpendGuardResponse,
   StatusResponse,
   ToolName,
+  TranscriptResponse,
   UsageResponse,
 } from "@/types/api";
 
@@ -141,6 +142,14 @@ export const api = {
     })),
 
   getSessions: (cwd?: string) => request<SessionsResponse>(withParams("/api/sessions", { cwd })),
+
+  getSessionTranscript: (tool: string, identity: string, id: string, tail?: number) =>
+    request<TranscriptResponse>(withParams("/api/sessions/transcript", {
+      tool,
+      identity,
+      id,
+      tail: tail !== undefined ? String(tail) : undefined,
+    })),
 
   getAuth: () => request<AuthResponse>("/api/auth"),
   getAuthRefresh: () => request<AuthRefreshResponse>("/api/auth/refresh"),

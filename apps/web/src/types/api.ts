@@ -350,6 +350,47 @@ export interface SessionsResponse {
   results: ToolResumeResult[];
 }
 
+/* Session transcript (chat view) */
+
+export type TranscriptRole = "user" | "assistant" | "tool" | "system";
+
+export interface TranscriptTurn {
+  role: TranscriptRole;
+  /** role=tool: the tool RESULT (the call is toolName + argsPreview). */
+  text: string;
+  toolName?: string;
+  argsPreview?: string;
+  /** Epoch ms, present only when the tool records per-entry times. */
+  atMs?: number;
+  /** input+output tokens where the tool records per-message usage. */
+  tokens?: number;
+}
+
+export interface TranscriptSessionMeta {
+  id: string;
+  tool: ToolName;
+  identity: string;
+  title?: string;
+  cwd?: string;
+  startedAt?: string;
+  updatedAt?: string;
+}
+
+export interface Transcript {
+  session: TranscriptSessionMeta;
+  /** Chronological, tail-weighted: at most `tail` turns from the END. */
+  turns: TranscriptTurn[];
+  /** Whole-session turn count, including any tail-dropped turns. */
+  totalTurns: number;
+  truncated: boolean;
+  inProgress: boolean;
+}
+
+export interface TranscriptResponse {
+  transcript: Transcript;
+  cached: boolean;
+}
+
 /* Auth */
 
 export type AuthKind = "oauth" | "apikey" | "cookie" | "none";

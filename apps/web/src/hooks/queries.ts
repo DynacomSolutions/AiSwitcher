@@ -8,6 +8,8 @@ export const POLL = {
   flow: 1_500,
   registry: 10_000,
   sessions: 15_000,
+  /** An open transcript, polled only while the chat is in progress. */
+  transcript: 3_000,
   slow: 60_000,
   breakdown: 300_000,
 } as const;
@@ -20,6 +22,8 @@ export const qk = {
   usage: ["usage"] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
+  sessionTranscript: (tool: string, identity: string, id: string, tail: number) =>
+    ["sessions", "transcript", tool, identity, id, tail] as const,
   auth: ["auth"] as const,
   authRefresh: ["auth", "refresh"] as const,
   spendGuard: ["spend-guard"] as const,
@@ -111,6 +115,27 @@ export function useSessionsQuery(cwd: string) {
     queryFn: () => api.getSessions(cwd.trim().length > 0 ? cwd.trim() : undefined),
     refetchInterval: POLL.sessions,
     placeholderData: keepPreviousData,
+  });
+}
+
+/** One session's chat. Polls every 3s ONLY while the session is in progress
+ * (the server caches 4s, so appended lines appear within one interval);
+ * finished sessions stop polling entirely. */
+export function useSessionTranscriptQuery(
+  tool: string,
+  identity: string,
+  id: string,
+  tail: number,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: qk.sessionTranscript(tool, identity, id, tail),
+    queryFn: () => api.getSessionTranscript(tool, identity, id, tail),
+    enabled: enabled && tool !== "" && identity !== "" && id !== "",
+    refetchInterval: (query) => (query.state.data?.transcript.inProgress ? POLL.transcript : false),
+    placeholderData: keepPreviousData,
+    // A mid-flight tail change races the refetchInterval probe; ignore it.
+    retry: 1,
   });
 }
 
