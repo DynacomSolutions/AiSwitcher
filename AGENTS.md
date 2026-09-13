@@ -272,6 +272,32 @@ src/
                                (bun:sqlite) via that identity's projects.json — the only tool
                                whose sessions live outside its own configDir entirely — see the
                                2026-07-18 zai/Crush addendum
+      sessions/                session TREES (what spawned which agent) + normalized
+                               TRANSCRIPTS behind GET /api/sessions/tree and
+                               GET /api/sessions/transcript (docs/API.md carries the DTO
+                               contract; scan kinds "tree"/"transcript" in server/scan-worker.ts
+                               run them in the isolated scan child, 15s/4s caches). ALL reads
+                               stream line-by-line via shared.ts's forEachLine/findFirstLine
+                               (fileTextChunks + a real Bun.sleep(0) yield per chunk — the #63
+                               lesson), never a whole-file sync read. Per-tool readers
+                               claude/codex/pi/grok/kimi/crush.ts: claude subagents are
+                               `<enc>/<sessionId>/subagents/**/agent-<id>.jsonl` (child id
+                               "<sessionId>/<agentId>"); codex subagent/guardian threads are
+                               rollout files with session_meta.parent_thread_id (user-role
+                               response_items starting `<environment_context` are synthetic
+                               and skipped); kimi subagents are `agents/<dir>/wire.jsonl`
+                               (child id "<sessionId>/<agentDir>"; turns come from turn.prompt /
+                               content.part / tool.call / tool.result wire events); crush reads
+                               sessions.parent_session_id + messages.parts (JSON part array,
+                               UNIX-seconds timestamps) provider-scoped like crush-resume.ts;
+                               pi and grok record NO parent links (flat roots). Orphan rule
+                               (tree.ts computeDepths): a child whose parent is outside the
+                               `days` window keeps parentId but renders at depth 0. Identity
+                               session colours live in identities/colour.ts (explicit #rgb/
+                               #rrggbb on Identity.colour, validated in store.ts; every
+                               consumer renders effectiveColour = explicit or a stable
+                               hash(tool:name) palette pick, one shared palette so CLI,
+                               server and web agree).
      web.ts                   `ais web start|stop|status|open [--port=] [--foreground]`:
                             lifecycle for server/*'s console daemon. Default spawns a
                             DETACHED child re-invoking this same entrypoint with the hidden
@@ -1863,6 +1889,12 @@ abandoned.
   `actions.updateIdentity`/`UpdateIdentityInput`, since an API key isn't
   `identities.json` metadata (kept out of the more casually viewed/backed-up
   registry file entirely).
+
+  `--colour=` on the SAME update case IS registry metadata and therefore
+  threads through `actions.updateIdentity`: `#rgb`/`#rrggbb` is normalised
+  to lowercase `#rrggbb` on write, `--colour=` (empty value) clears the
+  field, anything else is a usage error. See `identities/colour.ts` for
+  the effective-colour rendering rule every surface shares.
 - **`ais upgrade` includes zai even though Crush has no self-updater.** Its
   real binary's `--help` still has no `update`/`upgrade` command (the
   `update-providers` command is unrelated), so AIS installs/upgrades the
