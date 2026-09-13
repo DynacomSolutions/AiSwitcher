@@ -129,6 +129,11 @@ export interface HerdrBridgeResponse {
 
 export interface IdentityDto extends Identity {
   configDirExists: boolean;
+  /** Explicit session colour (normalised #rrggbb) when the identity sets one. */
+  colour?: string;
+  /** Always present: `colour` when set, otherwise the stable auto palette
+   * colour for (tool, name). */
+  effectiveColour: string;
 }
 
 export interface ChromeProfileOverrideDto {
@@ -162,6 +167,8 @@ export interface PatchIdentityBody {
   label?: string;
   description?: string;
   configDir?: string;
+  /** #rgb or #rrggbb; "" clears an explicit colour (back to auto). */
+  colour?: string;
 }
 
 /* Limits */
@@ -341,6 +348,86 @@ export interface ToolResumeResult {
 
 export interface SessionsResponse {
   results: ToolResumeResult[];
+}
+
+/* Session trees (what spawned which agent) */
+
+export interface SessionTreeNode {
+  /** Opaque session handle; pass verbatim to the transcript endpoint. */
+  id: string;
+  /** Parent node id within the same (tool, identity) slice when this node
+   * is a spawned child. Orphans (parent outside the window) keep the id
+   * but render at depth 0. */
+  parentId?: string;
+  tool: ToolName;
+  identity: string;
+  title: string;
+  cwd: string | null;
+  startedAt: string;
+  updatedAt: string;
+  inProgress: boolean;
+  /** Absent means "not cheaply available", never zero. */
+  messageCount?: number;
+  depth: number;
+  /** Tool-native subagent name when the child is a spawned agent. */
+  agentName?: string;
+}
+
+export interface ToolSessionTree {
+  tool: ToolName;
+  identity: string;
+  nodes: SessionTreeNode[];
+  /** Set only for tools with no tree support in this build. */
+  unavailable?: string;
+  /** Partial read failure; other data may still be present. */
+  error?: string;
+}
+
+export interface SessionTreeResponse {
+  tools: ToolSessionTree[];
+  generatedAt: string;
+  days: number;
+}
+
+/* Session transcript (chat view) */
+
+export type TranscriptRole = "user" | "assistant" | "tool" | "system";
+
+export interface TranscriptTurn {
+  role: TranscriptRole;
+  /** role=tool: the tool RESULT (the call is toolName + argsPreview). */
+  text: string;
+  toolName?: string;
+  argsPreview?: string;
+  /** Epoch ms, present only when the tool records per-entry times. */
+  atMs?: number;
+  /** input+output tokens where the tool records per-message usage. */
+  tokens?: number;
+}
+
+export interface TranscriptSessionMeta {
+  id: string;
+  tool: ToolName;
+  identity: string;
+  title?: string;
+  cwd?: string;
+  startedAt?: string;
+  updatedAt?: string;
+}
+
+export interface Transcript {
+  session: TranscriptSessionMeta;
+  /** Chronological, tail-weighted: at most `tail` turns from the END. */
+  turns: TranscriptTurn[];
+  /** Whole-session turn count, including any tail-dropped turns. */
+  totalTurns: number;
+  truncated: boolean;
+  inProgress: boolean;
+}
+
+export interface TranscriptResponse {
+  transcript: Transcript;
+  cached: boolean;
 }
 
 /* Auth */

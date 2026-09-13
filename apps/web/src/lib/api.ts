@@ -16,9 +16,11 @@ import type {
   ProcessesResponse,
   RegistriesResponse,
   SessionsResponse,
+  SessionTreeResponse,
   SpendGuardResponse,
   StatusResponse,
   ToolName,
+  TranscriptResponse,
   UsageResponse,
 } from "@/types/api";
 
@@ -141,6 +143,21 @@ export const api = {
     })),
 
   getSessions: (cwd?: string) => request<SessionsResponse>(withParams("/api/sessions", { cwd })),
+
+  getSessionTree: (tool?: string, identity?: string, days?: number) =>
+    request<SessionTreeResponse>(withParams("/api/sessions/tree", {
+      tool,
+      identity,
+      days: days !== undefined ? String(days) : undefined,
+    })),
+
+  getSessionTranscript: (tool: string, identity: string, id: string, tail?: number) =>
+    request<TranscriptResponse>(withParams("/api/sessions/transcript", {
+      tool,
+      identity,
+      id,
+      tail: tail !== undefined ? String(tail) : undefined,
+    })),
 
   getAuth: () => request<AuthResponse>("/api/auth"),
   getAuthRefresh: () => request<AuthRefreshResponse>("/api/auth/refresh"),
