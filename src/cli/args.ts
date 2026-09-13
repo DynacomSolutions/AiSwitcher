@@ -6,11 +6,41 @@ export interface ParsedArgs {
 }
 
 /**
+ * Fold the natural space form "--flag value" into "--flag=value" for the
+ * named valued flags, so commands like `ais herdr --remote <target>` parse
+ * instead of the value landing in positionals. Only BARE occurrences of a
+ * named flag are folded (an existing "--flag=value" is left alone), the
+ * token after a "--" end-of-options marker is forwarded untouched, and a
+ * following flag-looking token (leading "-") is never consumed as a value —
+ * the bare flag then reaches stringFlag's own "requires a value" error.
+ */
+export function foldValuedFlags(argv: string[], valuedFlags: readonly string[]): string[] {
+  const valued = new Set(valuedFlags);
+  const folded: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--") {
+      folded.push(...argv.slice(i));
+      break;
+    }
+    const next = argv[i + 1];
+    if (arg.startsWith("--") && !arg.includes("=") && valued.has(arg.slice(2)) && next !== undefined && !next.startsWith("-")) {
+      folded.push(`${arg}=${next}`);
+      i++;
+      continue;
+    }
+    folded.push(arg);
+  }
+  return folded;
+}
+
+/**
  * Minimal argv parser for `ais` subcommands: "--flag=value" or bare "--flag"
  * (boolean true); everything else is a positional. No space-separated
  * "--flag value" form — matches this codebase's existing convention
  * (shared/cli-args.ts's "--identity=<name>") and keeps flag/positional
- * boundaries unambiguous.
+ * boundaries unambiguous. Commands that want the natural space form fold it
+ * first with foldValuedFlags() for their known valued flags.
  */
 export function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
