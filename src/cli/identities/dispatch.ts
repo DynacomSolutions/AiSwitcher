@@ -47,7 +47,7 @@ export async function runIdentitiesCommand(positionals: string[], flags: ParsedA
       const name = rest[0];
       if (!name) {
         throw new CliUsageError(
-          "Usage: ais identities update <name> --tool=<t> [--label=] [--description=] [--configDir=] [--api-key=]",
+          "Usage: ais identities update <name> --tool=<t> [--label=] [--description=] [--configDir=] [--colour=#rrggbb] [--api-key=]",
         );
       }
       const apiKey = stringFlag(flags, "api-key");
@@ -59,6 +59,7 @@ export async function runIdentitiesCommand(positionals: string[], flags: ParsedA
             label: stringFlag(flags, "label"),
             description: stringFlag(flags, "description"),
             configDir: stringFlag(flags, "configDir"),
+            colour: stringFlag(flags, "colour"),
           });
         },
         (toolName) => `Updated "${name}" in ${toolName}'s registry.`,

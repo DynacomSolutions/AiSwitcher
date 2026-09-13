@@ -12,6 +12,7 @@ import {
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { expandPath } from "../identities/index.ts";
 import { loadIdentitiesFile, saveIdentitiesFile } from "../identities/store.ts";
+import { effectiveIdentityColour, isValidIdentityColour, normaliseIdentityColour } from "../identities/colour.ts";
 import { writeAliAuthFile } from "../identities/ali-auth.ts";
 import { writeZaiAuthFile } from "../identities/zai-auth.ts";
 import type { ToolConfig } from "../identities/types.ts";
@@ -35,6 +36,10 @@ function registryDto(cfg: ToolConfig, file: Awaited<ReturnType<typeof loadIdenti
       ...(identity.description !== undefined ? { description: identity.description } : {}),
       configDir: identity.configDir,
       configDirExists: true, // replaced below
+      ...(identity.colour !== undefined ? { colour: normaliseIdentityColour(identity.colour) } : {}),
+      // Always present: explicit when set, stable auto palette pick otherwise
+      // (identities/colour.ts). The WebUI renders this value directly.
+      effectiveColour: effectiveIdentityColour(cfg.toolName, identity.name, identity.colour),
       ...(identity.directories?.length ? { directories: identity.directories } : {}),
       ...(identity.aliases?.length ? { aliases: identity.aliases } : {}),
     })),
@@ -114,15 +119,19 @@ export async function createIdentityInRegistry(toolName: string, body: CreateBod
 export async function updateIdentityInRegistry(
   toolName: string,
   name: string,
-  body: { label?: string; description?: string; configDir?: string },
+  body: { label?: string; description?: string; configDir?: string; colour?: string },
   configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
 ): Promise<RegistryDto> {
   const cfg = requireTool(toolName, configs);
+  if (body.colour !== undefined && body.colour !== "" && !isValidIdentityColour(body.colour)) {
+    throw new HttpError(400, `"colour" must be #rgb or #rrggbb (e.g. #22c55e)`);
+  }
   await withRegistry(cfg, (file) =>
     updateIdentity(file, name, {
       ...(body.label !== undefined ? { label: body.label } : {}),
       description: body.description,
       ...(body.configDir !== undefined ? { configDir: expandPath(body.configDir) } : {}),
+      ...(body.colour !== undefined ? { colour: body.colour } : {}),
     }),
   );
   return registryFor(cfg, configs);

@@ -173,6 +173,34 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     return c.json(result.payload);
   });
 
+  // Session trees (what spawned which agent) and normalized transcripts.
+  // Both stream-parse session JSONL/SQLite, so both run in the isolated
+  // scan child like every other heavy local read. docs/API.md carries the
+  // exact DTO contract for both.
+  app.get("/api/sessions/tree", async (c) => {
+    const result = await runScanIsolated("tree", {
+      ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
+      ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
+      days: numberQuery(c, "days", 30),
+    }, 120_000);
+    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "session tree scan failed");
+    return c.json(result.payload);
+  });
+
+  app.get("/api/sessions/transcript", async (c) => {
+    const result = await runScanIsolated("transcript", {
+      tool: requireString(queryValue(c, "tool") ?? "", "tool"),
+      identity: requireString(queryValue(c, "identity") ?? "", "identity"),
+      id: requireString(queryValue(c, "id") ?? "", "id"),
+      tail: numberQuery(c, "tail", 500),
+    }, 30_000);
+    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "transcript read failed");
+    if (result.payload === null || (result.payload as { transcript?: unknown })?.transcript == null) {
+      throw new HttpError(404, "session not found");
+    }
+    return c.json(result.payload);
+  });
+
   /* ---------------------------------- auth --------------------------------- */
 
   app.get("/api/auth", async (c) =>

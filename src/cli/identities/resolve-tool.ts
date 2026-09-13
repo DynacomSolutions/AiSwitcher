@@ -32,7 +32,7 @@ export interface LoadedFile {
   file: IdentitiesFile;
 }
 
-function isKnownToolName(tool: string): tool is keyof typeof TOOL_CONFIGS {
+export function isKnownToolName(tool: string): tool is keyof typeof TOOL_CONFIGS {
   return (TOOL_NAMES as string[]).includes(tool);
 }
 

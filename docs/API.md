@@ -45,6 +45,8 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 | `/api/status`, `/api/processes` | 3s |
 | `/api/identities`, `/api/auth` | 10s |
 | `/api/sessions` | 15s |
+| `/api/sessions/tree` | 30s (server caches 15s) |
+| `/api/sessions/transcript` | 3s for an open chat (server caches 4s; appended lines appear within one poll interval) |
 | `/api/files/*` | on demand |
 | `/api/limits`, `/api/usage`, `/api/spend-guard`, `/api/herdr-bridge` | 60s (server caches 45s) |
 | `/api/usage/breakdown` | 300s (server caches 60s; heavy local JSONL scan) |
@@ -222,7 +224,9 @@ highlight source for `aistui --overview`; at most one pane carries it.
           "name": "work", "label": "Work", "description": "...",
           "configDir": "/home/me/.claude/identities/work",
           "configDirExists": true,
-          "directories": ["/home/me/Projects/acme/*"],
+          "colour": "#22c55e",            // only when explicitly set (normalised #rrggbb)
+          "effectiveColour": "#22c55e",   // ALWAYS present: explicit or stable auto pick
+          "directories": ["/home/user/Projects/acme/*"],
           "aliases": ["wk"]
         }
       ],
@@ -239,7 +243,7 @@ Mutations (all return the updated registry entry; body is JSON):
 | Route | Body |
 |---|---|
 | `POST /api/identities/:tool` | `{ name, label, description?, configDir, directories?, aliases?, apiKey? }` |
-| `PATCH /api/identities/:tool/:name` | `{ label?, description?, configDir? }` |
+| `PATCH /api/identities/:tool/:name` | `{ label?, description?, configDir?, colour? }` |
 | `DELETE /api/identities/:tool/:name` | – |
 | `POST /api/identities/:tool/:name/directories` | `{ pattern }` |
 | `DELETE /api/identities/:tool/:name/directories` | `{ pattern }` |
@@ -249,6 +253,25 @@ Mutations (all return the updated registry entry; body is JSON):
 `apiKey` (zai/ali create only) is forwarded to the respective auth writer and
 never persisted anywhere else. Registry edits persist atomically via the
 existing store. Deleting an identity never touches its configDir on disk.
+
+#### Identity colours
+
+Every identity carries a session colour for the WebUI's tree/chat views:
+
+- `colour`: the identity's EXPLICIT colour, `#rgb` or `#rrggbb`
+  (case-insensitive; normalised to lowercase `#rrggbb` on write). Absent
+  unless set. `PATCH ... { "colour": "" }` clears it; an invalid value is a
+  400. CLI equivalent: `ais identities update <name> --tool=<t> --colour=#rrggbb`
+  (`--colour=` clears; `ais identities show` prints the effective colour).
+- `effectiveColour`: ALWAYS present, ready to render. The explicit colour
+  when set, otherwise a stable auto pick: `hash(tool + ":" + name)` over a
+  fixed 16-colour palette (see `src/identities/colour.ts`, the single
+  source of truth so CLI, server and web always agree). Auto colours are
+  pure functions of the identity key: same identity, same colour, on every
+  machine, across restarts, with no stored state.
+
+A malformed `colour` in the registry file is a load error (validated at
+read time); unknown extra fields around it are still preserved.
 
 ### Limits
 
@@ -335,6 +358,138 @@ codex produce rows; other tools return `unavailable` with a reason.
 
 Same shape as `ais resume --json`: `ToolResumeResult[]` flattened into
 `{ results: [...] }`.
+
+### Session trees
+
+`GET /api/sessions/tree?tool=&identity=&days=30`
+
+What-spawned-what: parent/child links between sessions and the subagent
+threads/sidecar agents the tools record locally. Heavy JSONL/SQLite reads
+run in the isolated scan worker; results are cached server-side (15s).
+`tool` and `identity` are optional: unscoped requests scan EVERY registry
+identity of EVERY tool (this is the heavy case; scope when you can).
+`days` is the lookback window (default 30, minimum 1); sessions whose last
+local activity is older drop out.
+
+```jsonc
+{
+  "tools": [                        // one entry per (tool, identity) scanned
+    {
+      "tool": "claude",
+      "identity": "work",
+      "nodes": [
+        {
+          "id": "9b6f...",          // opaque handle; pass verbatim to the transcript endpoint
+          "tool": "claude",
+          "identity": "work",
+          "title": "Fix the session tree",  // <= 72 chars, never empty
+          "cwd": "/home/user/Projects/acme",  // null when the tool records none
+          "startedAt": "2026-09-12T08:00:00.000Z",
+          "updatedAt": "2026-09-12T09:14:00.000Z",
+          "inProgress": false,      // transcript file modified within the last 60s
+          "messageCount": 412,      // only when cheaply available; absent != 0
+          "depth": 0                // recomputed within this response (see below)
+        },
+        {
+          "id": "9b6f.../a8e84a5f8e0625282",  // claude subagent: "<parentSessionId>/<agentId>"
+          "parentId": "9b6f...",
+          "agentName": "a8e84a5f8e0625282",   // codex nickname / kimi agent dir / claude agentId
+          "tool": "claude",
+          "identity": "work",
+          "title": "SYNTHETIC_FIXTURE subagent task",
+          "cwd": "/home/user/Projects/acme",
+          "startedAt": "2026-09-12T08:01:00.000Z",
+          "updatedAt": "2026-09-12T08:05:00.000Z",
+          "inProgress": false,
+          "depth": 1
+        }
+      ],
+      "unavailable": undefined      // set (with reason) ONLY for tools with no tree support
+      ,"error": undefined           // partial read failure; other slices unaffected
+    }
+  ],
+  "generatedAt": "2026-09-12T09:20:00.000Z",
+  "days": 30
+}
+```
+
+Contract notes (the WebUI codes against these):
+
+- Node `id` forms: claude subagents are `"<parentSessionId>/<agentId>"`,
+  kimi subagents are `"<sessionId>/<agentDir>"` (e.g. `session_.../agent-3`);
+  every other tool (and every root) uses the tool's native session/thread
+  id. Treat ids as opaque and pass them back verbatim.
+- `parentId` references a node in the SAME (tool, identity) slice. A child
+  whose parent fell outside the `days` window (or whose parent record
+  vanished) keeps its `parentId` but renders as a ROOT: `depth` is 0 and
+  no node with that id exists in this response (orphan). Cycles terminate
+  at depth 0.
+- `inProgress` is the 60-second file-mtime heuristic (crush:
+  `sessions.updated_at`); it is best-effort by design.
+- Per-tool support: claude (subagent sidecar files), codex
+  (`parent_thread_id` rollout threads, incl. guardian-review threads),
+  kimi (`agents/<dir>` wire files), crush-backed zai/ali
+  (`sessions.parent_session_id`, provider-scoped), pi and grok are FLAT
+  (the tools record no parent links; all nodes are roots); opencode
+  answers `unavailable` ("no session tree reader implemented").
+
+### Session transcript
+
+`GET /api/sessions/transcript?tool=&identity=&id=&tail=500`
+
+One session's normalized transcript for the chat view. All four parameters:
+`tool` and `identity` select the registry identity (required; they come
+from the tree), `id` is the node id from the tree (required), `tail` caps
+the returned turns (default 500, hard cap 2000, minimum 1). Cached
+server-side for 4s so a 2-3s poll of an in-progress chat stays cheap while
+still picking up appended lines (every read streams to the file's current
+end; the cache only bounds re-read cost, it never pins old content beyond
+the TTL).
+
+```jsonc
+{
+  "transcript": {
+    "session": {
+      "id": "9b6f...", "tool": "claude", "identity": "work",
+      "title": "Fix the session tree",
+      "cwd": "/home/user/Projects/acme",
+      "startedAt": "2026-09-12T08:00:00.000Z",   // optional per tool
+      "updatedAt": "2026-09-12T09:14:00.000Z"
+    },
+    "turns": [                        // chronological, tail-weighted (newest kept)
+      { "role": "user",      "text": "SYNTHETIC_FIXTURE please run the tests", "atMs": 1788253200000 },
+      { "role": "tool",      "text": "42 passing",  "toolName": "Bash",
+        "argsPreview": "{\"command\":\"bun test\"}", "atMs": 1788253205000 },
+      { "role": "assistant", "text": "SYNTHETIC_FIXTURE all green", "atMs": 1788253207000, "tokens": 120 }
+    ],
+    "totalTurns": 412,               // the WHOLE session, including tail-dropped turns
+    "truncated": true,               // turns were dropped from the front (totalTurns > turns.length)
+    "inProgress": false
+  },
+  "cached": false
+}
+```
+
+Errors: `400` missing/unknown tool or parameters, `404` when the session
+id does not exist (or its store vanished), `504` when the scan child
+overruns its deadline.
+
+Contract notes:
+
+- Roles: `user`, `assistant`, `tool` (ONE tool invocation: `toolName` +
+  `argsPreview` = the call, `text` = its result; an in-flight call has an
+  empty `text`), `system` (rare; leading system prompts and claude's
+  informational notices only).
+- Normalisation rules: assistant thinking/reasoning content is NEVER a
+  turn; codex's synthetic `<environment_context>` user messages are
+  skipped; claude's `isMeta` entries contribute tool-result fills only;
+  bookkeeping lines (titles, token counts, mode changes) are skipped.
+- `text` is capped at 2000 chars and `argsPreview` at 400 per turn
+  (trailing ellipsis); `atMs` (epoch ms) is present only when the tool
+  records per-entry times (grok records none); `tokens` (input+output)
+  only where the tool records per-message usage (claude, pi).
+- Per-tool support matches the tree (claude, codex, pi, grok, kimi, zai,
+  ali); opencode answers `400` with an honest "no reader" message.
 
 ### Auth
 

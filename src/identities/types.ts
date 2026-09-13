@@ -6,6 +6,12 @@ export interface Identity {
   directories?: string[];
   /** Alternate short names that resolve to this identity, e.g. "wk" for "work". */
   aliases?: string[];
+  /** Optional explicit session colour as #rgb or #rrggbb (see
+   * identities/colour.ts). Purely presentational: session-tree views use it
+   * to visually match a session to its identity. When absent, consumers
+   * render the stable auto palette colour from effectiveIdentityColour()
+   * instead; nothing here ever gates resolution or auth. */
+  colour?: string;
   /** Extra environment variables the identity itself declares (currently read
    * only by reporting features, e.g. AWS_PROFILE in identities/aws-profile.ts
    * for AWS Bedrock identities). Never applied to launches automatically: a
