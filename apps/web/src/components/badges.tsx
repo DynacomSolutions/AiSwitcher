@@ -31,7 +31,16 @@ export function ToolBadge({ tool, className }: { tool: string; className?: strin
   );
 }
 
-export function IdentityChip({ name, className }: { name: string; className?: string }) {
+export function IdentityChip({
+  name,
+  colour,
+  className,
+}: {
+  name: string;
+  /** Effective identity colour (#rrggbb); renders a matching dot when set. */
+  colour?: string;
+  className?: string;
+}) {
   return (
     <span
       className={cn(
@@ -40,8 +49,20 @@ export function IdentityChip({ name, className }: { name: string; className?: st
       )}
       title={name}
     >
+      {colour ? <IdentityDot colour={colour} /> : null}
       {name}
     </span>
+  );
+}
+
+/** Small round identity-colour marker. */
+export function IdentityDot({ colour, className }: { colour: string; className?: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn("inline-block size-2 shrink-0 rounded-full", className)}
+      style={{ backgroundColor: colour }}
+    />
   );
 }
 

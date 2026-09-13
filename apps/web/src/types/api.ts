@@ -129,6 +129,11 @@ export interface HerdrBridgeResponse {
 
 export interface IdentityDto extends Identity {
   configDirExists: boolean;
+  /** Explicit session colour (normalised #rrggbb) when the identity sets one. */
+  colour?: string;
+  /** Always present: `colour` when set, otherwise the stable auto palette
+   * colour for (tool, name). */
+  effectiveColour: string;
 }
 
 export interface ChromeProfileOverrideDto {
@@ -162,6 +167,8 @@ export interface PatchIdentityBody {
   label?: string;
   description?: string;
   configDir?: string;
+  /** #rgb or #rrggbb; "" clears an explicit colour (back to auto). */
+  colour?: string;
 }
 
 /* Limits */

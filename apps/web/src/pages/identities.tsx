@@ -3,7 +3,8 @@ import { Ellipsis, Plus } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
-import { AuthStateBadge } from "@/components/badges";
+import { AuthStateBadge, IdentityDot } from "@/components/badges";
+import { IdentityColourPicker } from "@/components/identity-colour-picker";
 import { PageHeader } from "@/components/page-header";
 import {
   AlertDialog,
@@ -463,26 +464,47 @@ function RegistryTable({ registry, authFor }: { registry: RegistryDto; authFor: 
   return (
     <>
       <div className="overflow-hidden rounded-xl border">
-        <Table>
-          <TableHeader>
-            <TableRow className="hover:bg-transparent">
-              <TableHead>Name</TableHead>
-              <TableHead>Label</TableHead>
-              <TableHead>Auth</TableHead>
-              <TableHead>Aliases</TableHead>
-              <TableHead>Directories</TableHead>
-              <TableHead>Config dir</TableHead>
-              <TableHead className="w-12" />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead>Name</TableHead>
+                <TableHead>Label</TableHead>
+                <TableHead>Colour</TableHead>
+                <TableHead>Auth</TableHead>
+                <TableHead>Aliases</TableHead>
+                <TableHead>Directories</TableHead>
+                <TableHead>Config dir</TableHead>
+                <TableHead className="w-12" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
             {registry.identities.map((identity) => {
               const auth = authFor(registry.toolName, identity.name);
               return (
               <TableRow key={identity.name}>
-                <TableCell className="font-medium">{identity.name}</TableCell>
+                <TableCell className="font-medium">
+                  <span className="flex items-center gap-2">
+                    <IdentityDot colour={identity.effectiveColour} />
+                    {identity.name}
+                  </span>
+                </TableCell>
                 <TableCell className="max-w-44 truncate text-muted-foreground" title={identity.description}>
                   {identity.label}
+                </TableCell>
+                <TableCell>
+                  <IdentityColourPicker tool={registry.toolName} identity={identity}>
+                    <button
+                      type="button"
+                      aria-label={`Change colour of ${identity.name}`}
+                      title={`Session colour: ${identity.colour ?? "auto"} (effective ${identity.effectiveColour}). Click to change.`}
+                      className="flex size-6 items-center justify-center rounded-full border border-border transition-transform hover:scale-110"
+                      style={{ backgroundColor: identity.effectiveColour }}
+                    >
+                      {!identity.colour ? (
+                        <span className="font-mono text-[9px] font-bold text-white/90 mix-blend-luminosity">A</span>
+                      ) : null}
+                    </button>
+                  </IdentityColourPicker>
                 </TableCell>
                 <TableCell>
                   {auth ? (
