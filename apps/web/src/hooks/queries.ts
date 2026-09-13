@@ -8,6 +8,8 @@ export const POLL = {
   flow: 1_500,
   registry: 10_000,
   sessions: 15_000,
+  /** /api/sessions/tree: heavy unscoped scans, server caches 15s. */
+  tree: 30_000,
   /** An open transcript, polled only while the chat is in progress. */
   transcript: 3_000,
   slow: 60_000,
@@ -22,6 +24,8 @@ export const qk = {
   usage: ["usage"] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
+  sessionTree: (tool: string, identity: string, days: number) =>
+    ["sessions", "tree", tool, identity, days] as const,
   sessionTranscript: (tool: string, identity: string, id: string, tail: number) =>
     ["sessions", "transcript", tool, identity, id, tail] as const,
   auth: ["auth"] as const,
@@ -114,6 +118,22 @@ export function useSessionsQuery(cwd: string) {
     queryKey: qk.sessions(cwd),
     queryFn: () => api.getSessions(cwd.trim().length > 0 ? cwd.trim() : undefined),
     refetchInterval: POLL.sessions,
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** The what-spawned-what tree. Polls lightly while the page is open so new
+ * roots appear on their own; the server caches for 15s. */
+export function useSessionTreeQuery(tool: string, identity: string, days: number) {
+  return useQuery({
+    queryKey: qk.sessionTree(tool, identity, days),
+    queryFn: () =>
+      api.getSessionTree(
+        tool.length > 0 ? tool : undefined,
+        identity.length > 0 ? identity : undefined,
+        days,
+      ),
+    refetchInterval: POLL.tree,
     placeholderData: keepPreviousData,
   });
 }

@@ -350,6 +350,45 @@ export interface SessionsResponse {
   results: ToolResumeResult[];
 }
 
+/* Session trees (what spawned which agent) */
+
+export interface SessionTreeNode {
+  /** Opaque session handle; pass verbatim to the transcript endpoint. */
+  id: string;
+  /** Parent node id within the same (tool, identity) slice when this node
+   * is a spawned child. Orphans (parent outside the window) keep the id
+   * but render at depth 0. */
+  parentId?: string;
+  tool: ToolName;
+  identity: string;
+  title: string;
+  cwd: string | null;
+  startedAt: string;
+  updatedAt: string;
+  inProgress: boolean;
+  /** Absent means "not cheaply available", never zero. */
+  messageCount?: number;
+  depth: number;
+  /** Tool-native subagent name when the child is a spawned agent. */
+  agentName?: string;
+}
+
+export interface ToolSessionTree {
+  tool: ToolName;
+  identity: string;
+  nodes: SessionTreeNode[];
+  /** Set only for tools with no tree support in this build. */
+  unavailable?: string;
+  /** Partial read failure; other data may still be present. */
+  error?: string;
+}
+
+export interface SessionTreeResponse {
+  tools: ToolSessionTree[];
+  generatedAt: string;
+  days: number;
+}
+
 /* Session transcript (chat view) */
 
 export type TranscriptRole = "user" | "assistant" | "tool" | "system";
