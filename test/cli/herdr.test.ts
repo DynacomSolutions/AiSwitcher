@@ -287,10 +287,10 @@ function tmuxHarness(env: NodeJS.ProcessEnv = {}, sessionExists = false): TmuxHa
 describe("runHerdrCommand", () => {
   test("--raw execs plain herdr with no tmux at all (and honours --remote)", async () => {
     const h = tmuxHarness();
-    await runHerdrCommand([], invocationFlags({ raw: true }), h.deps());
+    await runHerdrCommand(["--raw"], h.deps());
     expect(h.raw).toEqual([[]]);
     expect(h.tmux).toEqual([]);
-    await runHerdrCommand([], invocationFlags({ raw: true, remote: "box" }), h.deps());
+    await runHerdrCommand(["--raw", "--remote=box"], h.deps());
     expect(h.raw[1]).toEqual(["--remote", "box"]);
   });
 
@@ -298,30 +298,30 @@ describe("runHerdrCommand", () => {
     const h = tmuxHarness();
     h.deps().herdrPath = () => null;
     await expect(
-      runHerdrCommand([], invocationFlags(), { ...h.deps(), herdrPath: () => null }),
+      runHerdrCommand([], { ...h.deps(), herdrPath: () => null }),
     ).rejects.toThrow(/ais upgrade/);
   });
 
   test("the nesting guard refuses inside tmux/herdr and --force overrides it", async () => {
     const h = tmuxHarness({ TMUX: "/tmp/tmux-0/default,1,0" });
-    await expect(runHerdrCommand([], invocationFlags(), h.deps())).rejects.toThrow(/nest|--force/);
+    await expect(runHerdrCommand([], h.deps())).rejects.toThrow(/nest|--force/);
     const forced = tmuxHarness({ TMUX: "/tmp/tmux-0/default,1,0" });
-    await runHerdrCommand([], invocationFlags({ force: true }), forced.deps());
+    await runHerdrCommand(["--force"], forced.deps());
     expect(forced.tmux.some((args) => args[0] === "new-session")).toBe(true);
     const insideHerdr = tmuxHarness({ HERDR_PANE_ID: "w1:p1" });
-    await expect(runHerdrCommand([], invocationFlags(), insideHerdr.deps())).rejects.toThrow(/herdr pane/);
+    await expect(runHerdrCommand([], insideHerdr.deps())).rejects.toThrow(/herdr pane/);
   });
 
   test("missing tmux is its own error", async () => {
     const h = tmuxHarness();
-    await expect(runHerdrCommand([], invocationFlags(), { ...h.deps(), tmuxPath: () => null })).rejects.toThrow(
+    await expect(runHerdrCommand([], { ...h.deps(), tmuxPath: () => null })).rejects.toThrow(
       /tmux/,
     );
   });
 
   test("create: full tmux sequence with console env and the overview panel", async () => {
     const h = tmuxHarness();
-    await runHerdrCommand([], invocationFlags(), h.deps());
+    await runHerdrCommand([], h.deps());
     const labels = h.tmux.map((args) => args[0]);
     expect(labels[0]).toBe("has-session");
     expect(labels).toContain("new-session");
@@ -342,7 +342,7 @@ describe("runHerdrCommand", () => {
 
   test("an existing session is attached, not duplicated", async () => {
     const h = tmuxHarness({}, true);
-    await runHerdrCommand([], invocationFlags(), h.deps());
+    await runHerdrCommand([], h.deps());
     expect(h.tmux.map((args) => args[0])).toEqual(["has-session"]);
     expect(h.attaches).toEqual([["attach-session", "-t", HERDR_SESSION]]);
     expect(h.tmux.some((args) => args[0] === "new-session")).toBe(false);
@@ -350,16 +350,58 @@ describe("runHerdrCommand", () => {
 
   test("--new recreates: kills the old session first, then builds a fresh one", async () => {
     const h = tmuxHarness({}, true);
-    await runHerdrCommand([], invocationFlags({ new: true }), h.deps());
+    await runHerdrCommand(["--new"], h.deps());
     const labels = h.tmux.map((args) => args[0]);
     expect(labels[0]).toBe("has-session");
     expect(labels[1]).toBe("kill-session");
     expect(labels).toContain("new-session");
   });
 
+  test("space form: every valued flag parses like its equals form", async () => {
+    const h = tmuxHarness();
+    await runHerdrCommand(
+      ["--remote", "box.example", "--panel-width", "30", "--panel-cmd", "htop"],
+      h.deps(),
+    );
+    const create = h.tmux.find((args) => args[0] === "new-session")!;
+    expect(create.at(-1)).toBe("/usr/bin/herdr --remote box.example");
+    const split = h.tmux.find((args) => args[0] === "split-window")!;
+    expect(split[split.indexOf("-l") + 1]).toBe("30");
+    expect(split.at(-1)).toBe("htop");
+  });
+
+  test("mixed space and equals forms in one invocation", async () => {
+    const h = tmuxHarness();
+    await runHerdrCommand(["--remote=box.example", "--panel-width", "38"], h.deps());
+    const create = h.tmux.find((args) => args[0] === "new-session")!;
+    expect(create.at(-1)).toBe("/usr/bin/herdr --remote box.example");
+    const split = h.tmux.find((args) => args[0] === "split-window")!;
+    expect(split[split.indexOf("-l") + 1]).toBe("38");
+  });
+
+  test("an unknown positional after space-form flags still fails", async () => {
+    const h = tmuxHarness();
+    await expect(runHerdrCommand(["--remote", "box.example", "junk"], h.deps())).rejects.toThrow(
+      /takes no positionals/,
+    );
+    expect(h.tmux).toEqual([]);
+  });
+
+  test("a bare valued flag with no value keeps its requires-a-value error", async () => {
+    await expect(runHerdrCommand(["--remote"], tmuxHarness().deps())).rejects.toThrow(
+      /--remote requires a value/,
+    );
+  });
+
+  test("a following boolean flag is never eaten as a space-form value", async () => {
+    await expect(runHerdrCommand(["--remote", "--raw"], tmuxHarness().deps())).rejects.toThrow(
+      /--remote requires a value/,
+    );
+  });
+
   test("remote without --remote-ais: herdr gets --remote, panel shows local data with highlighting honestly off", async () => {
     const h = tmuxHarness();
-    await runHerdrCommand([], invocationFlags({ remote: "box.example" }), h.deps());
+    await runHerdrCommand(["--remote", "box.example"], h.deps());
     const create = h.tmux.find((args) => args[0] === "new-session")!;
     expect(create.at(-1)).toBe("/usr/bin/herdr --remote box.example");
     const split = h.tmux.find((args) => args[0] === "split-window")!;
@@ -374,7 +416,7 @@ describe("runHerdrCommand", () => {
 
   test("remote-ais: the right pane is the hidden panel subcommand and no local env is forced", async () => {
     const h = tmuxHarness();
-    await runHerdrCommand([], invocationFlags({ remote: "box", "remote-ais": true }), h.deps());
+    await runHerdrCommand(["--remote=box", "--remote-ais"], h.deps());
     const split = h.tmux.find((args) => args[0] === "split-window")!;
     expect(split.at(-1)).toBe("/usr/local/bin/ais __herdr_panel --remote=box");
     const names = h.tmux.filter((args) => args[0] === "set-environment").map((args) => args[3]);
@@ -384,14 +426,14 @@ describe("runHerdrCommand", () => {
 
   test("interactive stdin attaches after creating", async () => {
     const h = tmuxHarness();
-    await runHerdrCommand([], invocationFlags(), { ...h.deps(), isInteractive: () => true });
+    await runHerdrCommand([], { ...h.deps(), isInteractive: () => true });
     expect(h.attaches).toEqual([["attach-session", "-t", HERDR_SESSION]]);
     expect(h.logs).toEqual([]);
   });
 
   test("--tmux-socket rides every tmux invocation", async () => {
     const h = tmuxHarness({}, true);
-    await runHerdrCommand([], invocationFlags({ "tmux-socket": "ais-test" }), h.deps());
+    await runHerdrCommand(["--tmux-socket", "ais-test"], h.deps());
     expect(h.tmux[0]).toEqual(["-L", "ais-test", "has-session", "-t", HERDR_SESSION]);
     expect(h.attaches[0]).toEqual(["-L", "ais-test", "attach-session", "-t", HERDR_SESSION]);
   });

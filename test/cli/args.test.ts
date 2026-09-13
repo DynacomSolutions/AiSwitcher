@@ -1,6 +1,45 @@
 import { describe, expect, test } from "bun:test";
-import { boolFlag, listFlag, parseArgs, requireFlag, stringFlag } from "../../src/cli/args.ts";
+import { boolFlag, foldValuedFlags, listFlag, parseArgs, requireFlag, stringFlag } from "../../src/cli/args.ts";
 import { CliUsageError } from "../../src/cli/errors.ts";
+
+describe("foldValuedFlags", () => {
+  const valued = ["remote", "panel-width"];
+
+  test("folds the space form of a known valued flag into the equals form", () => {
+    expect(foldValuedFlags(["--remote", "box"], valued)).toEqual(["--remote=box"]);
+    expect(foldValuedFlags(["--panel-width", "42"], valued)).toEqual(["--panel-width=42"]);
+  });
+
+  test("leaves unknown, boolean and already-equals-form flags untouched", () => {
+    expect(foldValuedFlags(["--raw", "--other", "x", "--remote=a"], valued)).toEqual([
+      "--raw",
+      "--other",
+      "x",
+      "--remote=a",
+    ]);
+  });
+
+  test("a flag-looking token is never consumed as a value", () => {
+    expect(foldValuedFlags(["--remote", "--raw"], valued)).toEqual(["--remote", "--raw"]);
+  });
+
+  test("a bare valued flag at the end of argv is left as-is", () => {
+    expect(foldValuedFlags(["--remote"], valued)).toEqual(["--remote"]);
+  });
+
+  test("everything after a bare -- is forwarded untouched", () => {
+    expect(foldValuedFlags(["--remote", "box", "--", "--panel-width", "42"], valued)).toEqual([
+      "--remote=box",
+      "--",
+      "--panel-width",
+      "42",
+    ]);
+  });
+
+  test("values containing '=' and spaces survive the fold", () => {
+    expect(foldValuedFlags(["--remote", "a=b c"], valued)).toEqual(["--remote=a=b c"]);
+  });
+});
 
 describe("parseArgs", () => {
   test("splits positionals from --flag=value and bare --flag", () => {

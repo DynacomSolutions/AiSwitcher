@@ -1,4 +1,4 @@
-import { boolFlag, stringFlag } from "./args.ts";
+import { boolFlag, foldValuedFlags, parseArgs, stringFlag } from "./args.ts";
 import { dim, yellow } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
 import { resolveHerdrBinary } from "../shared/herdr-bin.ts";
@@ -49,6 +49,11 @@ export interface HerdrInvocation {
   panelCmd?: string;
   tmuxSocket?: string;
 }
+
+/** herdr's flags that carry a value. These may be written either as
+ * --flag=value or the natural --flag value space form (folded before
+ * parsing); --raw/--new/--force/--remote-ais stay bare-only booleans. */
+export const HERDR_VALUED_FLAGS = ["remote", "panel-width", "panel-cmd", "tmux-socket"] as const;
 
 export function parseHerdrArgs(
   rest: string[],
@@ -366,12 +371,14 @@ function requireBinary(path: string | null, what: string, hint: string): string 
   throw new CliUsageError(`${what} is required but was not found. ${hint}`);
 }
 
-/** `ais herdr`: create-or-attach the wrapper session. */
+/** `ais herdr`: create-or-attach the wrapper session. Takes the subcommand's
+ * own argv (everything after the "herdr" token) so the space form
+ * `--remote <target>` can be folded into `--remote=<target>` pre-parse. */
 export async function runHerdrCommand(
-  rest: string[],
-  flags: Record<string, string | true>,
+  subArgv: string[],
   deps: HerdrCommandDeps = realDeps(),
 ): Promise<void> {
+  const { positionals: rest, flags } = parseArgs(foldValuedFlags(subArgv, HERDR_VALUED_FLAGS));
   const inv = parseHerdrArgs(rest, flags);
 
   if (inv.raw) {

@@ -106,8 +106,9 @@ export async function runCli(argv: string[]): Promise<void> {
         await runTuiCommand(rest, flags);
         break;
       case "herdr":
-        await runHerdrCommand(rest, flags);
-        break;
+        // Raw subcommand argv (not the shared parseArgs output): herdr folds
+        // its valued flags' natural space form (--remote <t>) pre-parse.
+        return await runHerdrCommand(argv.slice(1));
       case "__herdr_panel":
         // Hidden internal command: runs INSIDE the `ais herdr` wrapper's
         // right pane to mirror a remote console through ssh -L. Never
