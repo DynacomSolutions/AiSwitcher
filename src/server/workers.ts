@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { PollCache } from "./expensive.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
 
@@ -13,6 +14,33 @@ import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./sca
 export interface ScanSpawn {
   proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
   requestedPort?: undefined;
+}
+
+/** DAEMON-side result caches for the poll-heavy session scans. The child is
+ * short-lived, so scan-worker.ts's own PollCache can never carry a result
+ * across HTTP requests; these hold it in the daemon instead. The
+ * transcript TTL is deliberately just under the WebUI's 3s chat poll: a
+ * poll is cheap (no child spawned) while appended lines surface within
+ * one interval, keeping an in-progress transcript live. */
+const treeCache = new PollCache(15_000);
+const transcriptCache = new PollCache(4_000);
+
+/** Cache-through runner for the tree/transcript kinds: identical results
+ * inside the TTL (failures are never cached; the next poll retries). The
+ * payload's `cached` flag is the DAEMON's (the scan child is fresh every
+ * time, so its own flag is meaningless). */
+async function cachedScan<T>(kind: "tree" | "transcript", params: Omit<ScanRequest, "kind">, timeoutMs: number): Promise<ScanResult<T>> {
+  const cache = kind === "tree" ? treeCache : transcriptCache;
+  const key = JSON.stringify({ ...params, kind });
+  const { value, cached } = await cache.get(key, async () => {
+    const result = await spawnScanWorker<T>(kind, params, timeoutMs);
+    if (!result.ok) throw new Error(result.error ?? `${kind} scan failed`);
+    return result;
+  });
+  if (value.payload && typeof value.payload === "object") {
+    (value.payload as { cached?: boolean }).cached = cached;
+  }
+  return value;
 }
 
 function isScriptEntrypoint(main: string): boolean {
@@ -34,6 +62,20 @@ function baseArgs(): string[] {
 }
 
 export async function runScanIsolated<T>(
+  kind: ScanKind,
+  params: Omit<ScanRequest, "kind">,
+  timeoutMs: number,
+): Promise<ScanResult<T>> {
+  // Tree + transcript polls are frequent by design (the WebUI polls the
+  // transcript of an open chat every ~3s): serve repeats from the daemon
+  // cache instead of spawning a fresh child per request.
+  if (kind === "tree" || kind === "transcript") {
+    return cachedScan<T>(kind, params, timeoutMs);
+  }
+  return spawnScanWorker<T>(kind, params, timeoutMs);
+}
+
+async function spawnScanWorker<T>(
   kind: ScanKind,
   params: Omit<ScanRequest, "kind">,
   timeoutMs: number,
