@@ -96,6 +96,17 @@ export interface ToolConfig {
     | "pi-append-file"
     | "opencode-config-content"
     | "crush-global-context";
+  /**
+   * Single-instance tools launch ONE shared config dir that exposes every
+   * AIS identity in-app instead of proxying per identity: identity
+   * resolution NEVER prompts and never errors on no-match, falling back to
+   * this directory (pi's own default home). The matched/flagged identity,
+   * when there is one, only seeds the in-app default (via
+   * AI_PROFILE_SWITCHER_SESSION); the tool's own extension surface handles
+   * switching. See src/identities/resolve.ts resolveSingleInstanceIdentity
+   * and src/pi-extension/ais-identity-extension.ts.
+   */
+  singleInstanceDir?: string;
   identitiesJsonPath: string;
   identitiesRootDir: string;
 }
@@ -113,7 +124,8 @@ export type ResolveSource =
   | "env"
   | "directory-match"
   | "interactive-existing"
-  | "interactive-created";
+  | "interactive-created"
+  | "single-instance";
 
 export interface ResolvedIdentity {
   identity?: Identity;

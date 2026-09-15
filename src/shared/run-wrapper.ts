@@ -79,7 +79,13 @@ export async function runWrapper(
     }
 
     const realBinary = resolveRealBinary(cfg.realBinaryName);
-    const activeIdentity = resolved.identity?.name ?? basename(resolved.configDirValue.replace(/\/$/, ""));
+    // Single-instance tools (pi) launch unseeded when nothing matched: omit
+    // the marker entirely rather than emitting a basename pseudo-identity
+    // ("agent") that nested tool launches would inherit and then fail to
+    // resolve (UnknownIdentityError in the CHILD tool's registry). Other
+    // tools keep the historical basename fallback.
+    const activeIdentity = resolved.identity?.name
+      ?? (cfg.singleInstanceDir ? undefined : basename(resolved.configDirValue.replace(/\/$/, "")));
     const extraEnv = Object.fromEntries(
       (cfg.extraEnvVarNames ?? []).map(({ name, subdir }) => [
         name,
@@ -115,7 +121,7 @@ export async function runWrapper(
         [cfg.envVarName]: resolved.configDirValue,
         ...extraEnv,
         ...memoryProjection.env,
-        [IDENTITY_SESSION_MARKER]: activeIdentity,
+        ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),
       });
     // The real agent is spawned before the detached sync worker. Nothing in
     // the automatic SSH path is awaited by agent startup.

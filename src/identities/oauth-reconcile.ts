@@ -782,3 +782,43 @@ export async function reconcilePiConfigDirOnLaunch(
     );
   }
 }
+
+/** Single-instance launch self-heal: pi now live-reads credentials from
+ * EVERY registered identity's auth.json (the extension resolves namespaced
+ * providers straight off those files), so divergence in ANY identity dir
+ * affects the one shared instance. Reconcile them all on launch; one stderr
+ * line summarising actual heals, one on an unexpected error, silence when
+ * everything is already in sync. Never blocks the launch. */
+export async function reconcileAllPiIdentitiesOnLaunch(
+  deps: { warn?: (message: string) => void } = {},
+): Promise<void> {
+  const warn = deps.warn ?? ((message: string) => console.error(message));
+  try {
+    const file = await loadIdentitiesFile(PI_CONFIG.identitiesJsonPath);
+    const healedLines: string[] = [];
+    for (const identity of file.identities) {
+      try {
+        const report = await reconcilePiOAuthStores(identity, { write: true });
+        const healed = report.entries.filter(
+          (entry) => entry.status === "rewrote-native" || entry.status === "rewrote-pi",
+        );
+        if (healed.length > 0) {
+          healedLines.push(`${identity.name}: ${healed.map((entry) => entry.provider).join(", ")}`);
+        }
+      } catch {
+        // One identity's failure never blocks the launch or the others.
+      }
+    }
+    if (healedLines.length > 0) {
+      warn(
+        `pi: reconciled diverged OAuth credential copies (${healedLines.join("; ")}) ` +
+          `(freshest copy adopted; see src/identities/oauth-reconcile.ts)`,
+      );
+    }
+  } catch (error) {
+    warn(
+      `pi: OAuth credential reconcile skipped: ${error instanceof Error ? error.message : String(error)} ` +
+        "(continuing; the next launch or `ais auth sync --tool=pi` heals)",
+    );
+  }
+}

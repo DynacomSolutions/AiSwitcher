@@ -134,3 +134,75 @@ describe("resolveIdentity precedence chain", () => {
     expect(result.source).toBe("interactive-created");
   });
 });
+
+const SINGLE_CFG: ToolConfig = {
+  toolName: "pi",
+  realBinaryName: "pi",
+  envVarName: "PI_CODING_AGENT_DIR",
+  globalMemoryProjection: "pi-append-file",
+  singleInstanceDir: "/tmp/does-not-exist/pi-agent",
+  identitiesJsonPath: "/tmp/does-not-exist/identities.json",
+  identitiesRootDir: "/tmp/does-not-exist/identities",
+};
+
+describe("single-instance resolution (pi)", () => {
+  test("never prompts and never errors on no-match: falls back to the shared instance dir", async () => {
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/tmp/does-not-exist/unrelated", env: {}, nonInteractiveHint: false },
+      fakeDeps(),
+    );
+    expect(result.source).toBe("single-instance");
+    expect(result.identity).toBeUndefined();
+    expect(result.configDirValue).toBe("/tmp/does-not-exist/pi-agent");
+  });
+
+  test("an explicit --identity seeds the in-app default but keeps the shared instance dir", async () => {
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { explicitIdentityFlag: "w", cwd: "/x", env: {} },
+      fakeDeps(),
+    );
+    expect(result.source).toBe("flag");
+    expect(result.identity?.name).toBe("work");
+    expect(result.configDirValue).toBe("/tmp/does-not-exist/pi-agent");
+  });
+
+  test("an unknown --identity still throws UnknownIdentityError", async () => {
+    await expect(
+      resolveIdentity(SINGLE_CFG, { explicitIdentityFlag: "nope", cwd: "/x", env: {} }, fakeDeps()),
+    ).rejects.toThrow(UnknownIdentityError);
+  });
+
+  test("a preset env var overrides the whole instance dir", async () => {
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/x", env: { PI_CODING_AGENT_DIR: "/custom/instance" } },
+      fakeDeps(),
+    );
+    expect(result.source).toBe("env");
+    expect(result.configDirValue).toBe("/custom/instance");
+    expect(result.identity).toBeUndefined();
+  });
+
+  test("a directory match seeds the default identity without changing the launch dir", async () => {
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/tmp/does-not-exist/proj/anything", env: {} },
+      fakeDeps(),
+    );
+    expect(result.source).toBe("directory-match");
+    expect(result.identity?.name).toBe("work");
+    expect(result.configDirValue).toBe("/tmp/does-not-exist/pi-agent");
+  });
+
+  test("an interactive TTY with no match STILL never prompts (no NonInteractiveResolutionError, no picker)", async () => {
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/tmp/does-not-exist/unrelated", env: {} },
+      fakeDeps({ isInteractive: () => true }),
+    );
+    expect(result.source).toBe("single-instance");
+    expect(result.identity).toBeUndefined();
+  });
+});
