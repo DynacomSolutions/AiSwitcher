@@ -494,7 +494,7 @@ enabled = true
     expect(await readdir(join(home, ".codex"))).toEqual(["config.toml"]);
   });
 
-  test("shared runtime values override local duplicates without forwarding identity-only fields", async () => {
+  test("shared operational limits override local duplicates; user preferences keep local values", async () => {
     const { home, identity } = await fixture(runtimeConfig);
     const local = `
 model = "bedrock-provider-model"
@@ -518,6 +518,7 @@ enabled = false
     const result = await projectGlobalCodexMcpForLaunch(codex, identity, argv, home);
     const expected = parseToml(runtimeConfig);
     delete expected.model;
+    delete expected.model_reasoning_effort;
     delete expected.service_tier;
     expect(projectedConfig(result)).toEqual(expected);
     expect(result.join(" ")).not.toContain("identity-");
@@ -536,11 +537,49 @@ enabled = false
     });
   });
 
-  test("shared runtime values remain projected even when duplicated locally", async () => {
+  test("a user-picked model survives the shared defaults sync without a projection", async () => {
+    // Regression for the reported incident: the /model picker persists its
+    // choice into the identity's config.toml, and every wrapped launch used
+    // to restamp the shared model over it.
     const { home, identity } = await fixture(runtimeConfig);
-    await localConfig(identity, runtimeConfig);
-    expect(projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home)))
-      .toEqual(parseToml(runtimeConfig));
+    const local = 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "low"\n';
+    await localConfig(identity, local);
+    const projected = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
+    expect(projected.model).toBeUndefined();
+    expect(projected.model_reasoning_effort).toBeUndefined();
+    expect(projected.service_tier).toBe("fast");
+    expect(projected.model_auto_compact_token_limit).toBe(150000);
+    expect(projected.tool_output_token_limit).toBe(12000);
+    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(local);
+  });
+
+  test("shared user preferences seed only once; a later picker write takes over", async () => {
+    const { home, shared, identity } = await fixture(runtimeConfig);
+    await localConfig(identity, "[mcp_servers.graph]\nenabled = false\n");
+    const first = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
+    expect(first.model).toBe("shared-model");
+    expect(first.model_reasoning_effort).toBe("high");
+    // Simulate the user picking a different model inside Codex, which writes
+    // the choice into the identity's config.toml for the next launch.
+    await localConfig(identity, 'model = "picked-model"\nmodel_reasoning_effort = "low"\n[mcp_servers.graph]\nenabled = false\n');
+    const second = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
+    expect(second.model).toBeUndefined();
+    expect(second.model_reasoning_effort).toBeUndefined();
+    // Operational limits keep syncing on later launches.
+    await writeFile(shared, 'model = "ignored-shared-model"\ntool_output_token_limit = 9000\n');
+    const third = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
+    expect(third.model).toBeUndefined();
+    expect(third.tool_output_token_limit).toBe(9000);
+  });
+
+  test("an explicit caller override still wins over a local user preference", async () => {
+    const { home, identity } = await fixture(runtimeConfig);
+    const explicit = ["--model", "cli-model", "exec", "-c", "model_reasoning_effort=\"minimal\"", "hello"];
+    await localConfig(identity, 'model = "picked-model"\nmodel_reasoning_effort = "low"\n');
+    const projected = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, explicit, home), explicit);
+    expect(projected.model).toBeUndefined();
+    expect(projected.model_reasoning_effort).toBeUndefined();
+    expect(projected.model_auto_compact_token_limit).toBe(150000);
   });
 
   test("non-OpenAI providers keep their main model and parent-model subagents without a shared service tier", async () => {
