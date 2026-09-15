@@ -485,13 +485,21 @@ enabled = true
       + runtimeConfig.slice(0, tableStart) + excluded
       + runtimeConfig.slice(tableStart) + globalConfig);
     const result = await projectGlobalCodexMcpForLaunch(codex, identity, argv, home);
+    const expected = parseToml(runtimeConfig);
+    delete expected.model;
+    delete expected.model_reasoning_effort;
+    delete expected.service_tier;
     expect(projectedConfig(result)).toEqual({
-      ...parseToml(runtimeConfig),
+      ...expected,
       ...parseToml(permissionConfig),
       ...parseToml(globalConfig),
     });
     expect(result.join(" ")).not.toContain("private-");
-    expect(await readdir(join(home, ".codex"))).toEqual(["config.toml"]);
+    // First-run seeding writes the user preferences into the identity file.
+    expect(parseToml(await readFile(join(identity, "config.toml"), "utf8"))).toEqual({
+      model: "shared-model", model_reasoning_effort: "high", service_tier: "fast",
+    });
+    expect(await readdir(join(home, ".codex"))).toEqual(["config.toml", "identities"]);
   });
 
   test("shared operational limits override local duplicates; user preferences keep local values", async () => {
@@ -529,11 +537,15 @@ enabled = false
   test("runtime edits apply next launch and explicit CLI overrides remain last", async () => {
     const { home, identity, shared } = await fixture(runtimeConfig);
     const explicit = ["--model", "cli-model", "exec", "-c", "agents.max_threads=1", "hello"];
+    const expected = parseToml(runtimeConfig);
+    delete expected.model;
+    delete expected.model_reasoning_effort;
+    delete expected.service_tier;
     expect(projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, explicit, home), explicit))
-      .toEqual(parseToml(runtimeConfig));
+      .toEqual(expected);
     await writeFile(shared, 'model_reasoning_effort = "low"\n[features]\nmulti_agent = false\n');
     expect(projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home))).toEqual({
-      model_reasoning_effort: "low", features: { multi_agent: false },
+      features: { multi_agent: false },
     });
   });
 
@@ -547,39 +559,53 @@ enabled = false
     const projected = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
     expect(projected.model).toBeUndefined();
     expect(projected.model_reasoning_effort).toBeUndefined();
-    expect(projected.service_tier).toBe("fast");
+    expect(projected.service_tier).toBeUndefined();
     expect(projected.model_auto_compact_token_limit).toBe(150000);
     expect(projected.tool_output_token_limit).toBe(12000);
-    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(local);
+    // Only the still-unset service tier is seeded, above the picker's picks.
+    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(`service_tier = "fast"\n\n${local}`);
   });
 
-  test("shared user preferences seed only once; a later picker write takes over", async () => {
+  test("shared user preferences seed the file once; a later picker write takes over", async () => {
     const { home, shared, identity } = await fixture(runtimeConfig);
-    await localConfig(identity, "[mcp_servers.graph]\nenabled = false\n");
+    const initial = "[mcp_servers.graph]\nenabled = false\n";
+    await localConfig(identity, initial);
     const first = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
-    expect(first.model).toBe("shared-model");
-    expect(first.model_reasoning_effort).toBe("high");
+    expect(first.model).toBeUndefined();
+    expect(first.model_reasoning_effort).toBeUndefined();
+    expect(first.service_tier).toBeUndefined();
+    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(
+      'model = "shared-model"\nmodel_reasoning_effort = "high"\nservice_tier = "fast"\n\n' + initial,
+    );
     // Simulate the user picking a different model inside Codex, which writes
     // the choice into the identity's config.toml for the next launch.
-    await localConfig(identity, 'model = "picked-model"\nmodel_reasoning_effort = "low"\n[mcp_servers.graph]\nenabled = false\n');
+    const picked = 'model = "picked-model"\nmodel_reasoning_effort = "low"\n[mcp_servers.graph]\nenabled = false\n';
+    await localConfig(identity, picked);
     const second = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
     expect(second.model).toBeUndefined();
     expect(second.model_reasoning_effort).toBeUndefined();
+    expect(second.service_tier).toBeUndefined();
+    // The picker write dropped the still-unset service tier, so it re-seeds.
+    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(`service_tier = "fast"\n\n${picked}`);
     // Operational limits keep syncing on later launches.
     await writeFile(shared, 'model = "ignored-shared-model"\ntool_output_token_limit = 9000\n');
     const third = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home));
     expect(third.model).toBeUndefined();
     expect(third.tool_output_token_limit).toBe(9000);
+    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(`service_tier = "fast"\n\n${picked}`);
   });
 
   test("an explicit caller override still wins over a local user preference", async () => {
     const { home, identity } = await fixture(runtimeConfig);
     const explicit = ["--model", "cli-model", "exec", "-c", "model_reasoning_effort=\"minimal\"", "hello"];
-    await localConfig(identity, 'model = "picked-model"\nmodel_reasoning_effort = "low"\n');
+    const local = 'model = "picked-model"\nmodel_reasoning_effort = "low"\n';
+    await localConfig(identity, local);
     const projected = projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, explicit, home), explicit);
     expect(projected.model).toBeUndefined();
     expect(projected.model_reasoning_effort).toBeUndefined();
     expect(projected.model_auto_compact_token_limit).toBe(150000);
+    // The caller's own invocation choices are never persisted into the file.
+    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(`service_tier = "fast"\n\n${local}`);
   });
 
   test("non-OpenAI providers keep their main model and parent-model subagents without a shared service tier", async () => {
@@ -588,20 +614,91 @@ enabled = false
     const provider = 'model_provider = "amazon-bedrock"\nmodel = "openai.gpt-6-astra"\n';
     const expected = parseToml(runtimeConfig);
     delete expected.model;
+    delete expected.model_reasoning_effort;
     delete expected.service_tier;
-    for (const local of [
-      provider,
-      provider + 'service_tier = "identity-tier"\n[agents]\ndefault_subagent_model = "identity-worker-model"\n',
-    ]) {
+    // Only the unguarded reasoning effort seeds; the provider's own model and
+    // tier keys never do.
+    const seeded = `model_reasoning_effort = "high"\n\n${provider}`;
+    for (const [local, written] of [
+      [provider, seeded],
+      [provider + 'service_tier = "identity-tier"\n[agents]\ndefault_subagent_model = "identity-worker-model"\n',
+        seeded + 'service_tier = "identity-tier"\n[agents]\ndefault_subagent_model = "identity-worker-model"\n'],
+    ] as Array<[string, string]>) {
       await localConfig(identity, local);
       const result = await projectGlobalCodexMcpForLaunch(codex, identity, argv, home);
       expect(projectedConfig(result)).toEqual(expected);
       expect(result.join(" ")).not.toContain("default_subagent_model");
       expect(result.join(" ")).not.toContain("service_tier");
-      expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(local);
+      expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(written);
     }
     await localConfig(identity, 'model_provider = "openai"\n');
+    const openaiExpected = parseToml(source);
+    delete openaiExpected.model;
+    delete openaiExpected.model_reasoning_effort;
+    delete openaiExpected.service_tier;
     expect(projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home)))
-      .toEqual(parseToml(source));
+      .toEqual(openaiExpected);
+    expect(parseToml(await readFile(join(identity, "config.toml"), "utf8"))).toEqual({
+      model: "shared-model", model_reasoning_effort: "high", service_tier: "fast", model_provider: "openai",
+    });
+  });
+
+  test("no -c user-preference argument ever appears in the constructed spawn args", async () => {
+    // Incident regression: any -c for model, model_reasoning_effort or
+    // service_tier outranks config.toml, so Codex rejects the /model picker's
+    // own save with "a higher-priority configuration layer overrides the
+    // saved value". The keys must only ever move through the file.
+    const userPreferences = ["model", "model_reasoning_effort", "service_tier"];
+    const hasUserPreferenceArg = (args: string[]) => {
+      for (let index = 0; index < args.length; index++) {
+        if (args[index] === "--") break;
+        const override = args[index] === "-c" || args[index] === "--config" ? args[++index]
+          : args[index]!.startsWith("--config=") ? args[index]!.slice("--config=".length)
+          : args[index]!.startsWith("-c") ? args[index]!.slice(2) : undefined;
+        const key = override?.split("=", 1)[0]?.trim();
+        if (key && userPreferences.includes(key)) return true;
+      }
+      return false;
+    };
+    const { home, identity } = await fixture(runtimeConfig);
+    const invocations = [argv, ["--model", "cli-model", ...argv], ["-c", 'model="cli-model"', ...argv]];
+    for (const local of [
+      undefined,
+      'model = "gpt-5.6-sol"\n',
+      'model_provider = "amazon-bedrock"\nmodel = "openai.gpt-6-astra"\n',
+    ]) {
+      await rm(join(identity, "config.toml"), { force: true });
+      await mkdir(identity, { recursive: true });
+      if (local !== undefined) await writeFile(join(identity, "config.toml"), local);
+      for (const invocation of invocations) {
+        const constructed = await projectGlobalCodexMcpForLaunch(codex, identity, invocation, home);
+        // The projection itself never adds a user-preference -c argument;
+        // caller-provided invocation choices pass through untouched.
+        expect(constructed.slice(constructed.length - invocation.length)).toEqual(invocation);
+        expect(hasUserPreferenceArg(constructed.slice(0, constructed.length - invocation.length))).toBe(false);
+      }
+    }
+  });
+
+  test("seeding is an atomic write that leaves no temporary files behind", async () => {
+    const { home, identity } = await fixture(runtimeConfig);
+    const localPath = join(identity, "config.toml");
+    await projectGlobalCodexMcpForLaunch(codex, identity, argv, home);
+    expect(await readdir(identity)).toEqual(["config.toml"]);
+    // A second launch with the keys present must not rewrite the file.
+    const before = await stat(localPath);
+    await projectGlobalCodexMcpForLaunch(codex, identity, argv, home);
+    expect((await stat(localPath)).mtimeMs).toBe(before.mtimeMs);
+    expect(await readdir(identity)).toEqual(["config.toml"]);
+  });
+
+  test("seeding prepends the shared defaults and preserves the identity file verbatim", async () => {
+    const { home, identity } = await fixture(runtimeConfig);
+    const local = '# my identity\nmodel_provider = "openai"\n[mcp_servers.graph]\ncommand = "local-server"\n';
+    await localConfig(identity, local);
+    await projectGlobalCodexMcpForLaunch(codex, identity, argv, home);
+    expect(await readFile(join(identity, "config.toml"), "utf8")).toBe(
+      'model = "shared-model"\nmodel_reasoning_effort = "high"\nservice_tier = "fast"\n\n' + local,
+    );
   });
 });
