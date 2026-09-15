@@ -473,6 +473,26 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   `src/grok.ts`, `src/kimi.ts`, and `src/zai.ts` are separate entrypoints that
   all import the same `src/shared/*` modules; `bun build --compile`
   bundles/tree-shakes each independently.
+- **Codex user-preference defaults are local-wins; only operational limits are
+  authoritative.** The shared Codex defaults projection
+  (`src/shared/codex-shared-config.ts`) splits its runtime allowlist in two.
+  Operational keys (`model_auto_compact_token_limit`, `tool_output_token_limit`,
+  plus the permission defaults) restamp every launch, even over identity
+  duplicates. User preference keys (`model`, `model_reasoning_effort`,
+  `service_tier`) are only projected when the identity's own `config.toml`
+  lacks the key: Codex's `/model` picker persists exactly those keys into the
+  identity file, and a `-c` invocation overlay outranks config.toml at
+  runtime, so always projecting them reverted every user pick on every launch
+  (reported 2026-09-15 as "my Codex default model keeps reverting"; PR #44's
+  original rule, "shared values override identity duplicates, including
+  settings written back by Codex", was the cause). Seeding keeps fresh
+  identities on the shared default; from the first local value onward,
+  including one written by Codex itself, local wins. The non-OpenAI provider
+  guard still skips `model` and `service_tier` entirely, and explicit
+  invocation overrides remain last. There is deliberately no global
+  model-setting command: keep the keys out of identity files and edit the
+  shared `~/.codex/config.toml` value to change the default for identities
+  that have not chosen yet.
 - **`--identity`, not `--account` or `--profile`.** Codex already has an
   unrelated native `-p/--profile <name>` (layers `$CODEX_HOME/<name>.config.toml`
   on the *same* identity — a config variant, not an account switch). Using a

@@ -116,12 +116,18 @@ launch reads that file again and projects only missing defaults from its
 `mcp_servers` table through runtime configuration arguments. Codex merges those
 defaults with its native configuration. New identities inherit them on
 their first launch; edits apply to existing identities on their next launch.
-AIS does not copy shared entries into identity files. Its shared runtime
-allowlist is `model`, `model_reasoning_effort`, `service_tier`,
-`model_auto_compact_token_limit`, `tool_output_token_limit`, and shared fields
-within `agents` and `features`. These shared values override identity duplicates,
-including settings written back by Codex, while identity-only fields remain.
-An explicit non-OpenAI `model_provider` skips shared `model`, `service_tier`
+AIS does not copy shared entries into identity files. Its shared operational
+runtime allowlist is `model_auto_compact_token_limit`, `tool_output_token_limit`,
+and shared fields within `agents` and `features`. These shared values override
+identity duplicates, including settings written back by Codex, while
+identity-only fields remain. Shared user preference keys, `model`,
+`model_reasoning_effort`, and `service_tier`, only seed identities whose own
+`config.toml` does not set them yet. Codex's `/model` picker persists its
+choice into the identity file, so once you pick a model or reasoning effort
+inside Codex it wins every later launch; the shared value applies only until
+that first local choice exists. To seed identities afresh from the shared
+value, remove the key from the identity's `config.toml`. An explicit
+non-OpenAI `model_provider` skips shared `model`, `service_tier`
 and `agents.default_subagent_model`; other shared agent values still apply,
 and local provider-specific model, tier and subagent choices remain untouched.
 Provider configuration, authentication,
