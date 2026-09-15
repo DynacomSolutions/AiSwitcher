@@ -121,13 +121,15 @@ runtime allowlist is `model_auto_compact_token_limit`, `tool_output_token_limit`
 and shared fields within `agents` and `features`. These shared values override
 identity duplicates, including settings written back by Codex, while
 identity-only fields remain. Shared user preference keys, `model`,
-`model_reasoning_effort`, and `service_tier`, only seed identities whose own
-`config.toml` does not set them yet. Codex's `/model` picker persists its
-choice into the identity file, so once you pick a model or reasoning effort
-inside Codex it wins every later launch; the shared value applies only until
-that first local choice exists. To seed identities afresh from the shared
-value, remove the key from the identity's `config.toml`. An explicit
-non-OpenAI `model_provider` skips shared `model`, `service_tier`
+`model_reasoning_effort`, and `service_tier`, are never sent as runtime
+configuration arguments: any such argument outranks `config.toml`, and Codex
+refuses the `/model` picker's save while one exists ("a higher-priority
+configuration layer overrides the saved value"). Instead, AIS writes the
+shared default into an identity's `config.toml` once, while the key is still
+unset, so once you pick a model or reasoning effort inside Codex it wins every
+later launch. To seed identities afresh from the shared value, remove the key
+from the identity's `config.toml`. An explicit non-OpenAI `model_provider`
+skips shared `model`, `service_tier`
 and `agents.default_subagent_model`; other shared agent values still apply,
 and local provider-specific model, tier and subagent choices remain untouched.
 Provider configuration, authentication,
