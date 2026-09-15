@@ -1,6 +1,7 @@
-import { readFile, realpath } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import type { ToolConfig } from "../identities/types.ts";
 
@@ -10,25 +11,28 @@ function isTable(value: unknown): value is Table {
   return value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date);
 }
 
-async function readConfig(path: string): Promise<Table> {
-  let source: string;
+async function readConfig(path: string): Promise<{ config: Table; source: string | undefined }> {
+  let source: string | undefined;
   try {
     source = await readFile(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw new Error(`Cannot read shared Codex configuration: ${path}`);
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new Error(`Cannot read shared Codex configuration: ${path}`);
+    }
   }
-  // Parser diagnostics can contain source lines with credentials.
-  let config: Table;
-  try {
-    config = parseToml(source);
-  } catch {
-    throw new Error(`Invalid TOML in shared Codex configuration: ${path}`);
+  let config: Table = {};
+  if (source !== undefined) {
+    // Parser diagnostics can contain source lines with credentials.
+    try {
+      config = parseToml(source);
+    } catch {
+      throw new Error(`Invalid TOML in shared Codex configuration: ${path}`);
+    }
+    if (config.mcp_servers !== undefined && !isTable(config.mcp_servers)) {
+      throw new Error(`Expected an mcp_servers table in Codex configuration: ${path}`);
+    }
   }
-  if (config.mcp_servers !== undefined && !isTable(config.mcp_servers)) {
-    throw new Error(`Expected an mcp_servers table in Codex configuration: ${path}`);
-  }
-  return config;
+  return { config, source };
 }
 
 function missingDefaults(defaults: Table, overrides: Table): Table {
@@ -76,9 +80,13 @@ const OPERATIONAL_RUNTIME_SCALARS = [
 ];
 // User preferences Codex's own pickers persist into the identity's
 // config.toml (the /model picker writes "model" and
-// "model_reasoning_effort"). A shared value only seeds an identity that has
-// never chosen; once a local value exists it always wins, so a picker write
-// survives every later launch.
+// "model_reasoning_effort"). They are never projected as -c invocation
+// overrides: that layer outranks config.toml, so it silently rejects every
+// picker save with "a higher-priority configuration layer overrides the
+// saved value". Fresh identities are seeded by writing the shared default
+// into the identity's config.toml once while the key is unset; from the
+// first local value onward, including one written by Codex itself, local
+// wins.
 const USER_PREFERENCE_RUNTIME_SCALARS = [
   "model", "model_reasoning_effort", "service_tier",
 ];
@@ -88,10 +96,6 @@ function sharedRuntimeProjection(shared: Table, local: Table): Table {
   const nonOpenAiProvider = Object.hasOwn(local, "model_provider") && local.model_provider !== "openai";
   for (const key of OPERATIONAL_RUNTIME_SCALARS) {
     if (Object.hasOwn(shared, key)) defaults[key] = shared[key];
-  }
-  for (const key of USER_PREFERENCE_RUNTIME_SCALARS) {
-    if (nonOpenAiProvider && (key === "model" || key === "service_tier")) continue;
-    if (!Object.hasOwn(local, key) && Object.hasOwn(shared, key)) defaults[key] = shared[key];
   }
   for (const key of ["agents", "features"]) {
     if (Object.hasOwn(shared, key)) {
@@ -163,15 +167,54 @@ function tomlValue(value: unknown): string {
   throw new Error("Unsupported value in shared Codex configuration");
 }
 
+async function writeFileAtomic(path: string, contents: string): Promise<void> {
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, contents, "utf8");
+    await rename(temporaryPath, path);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * Write shared user-preference defaults into the identity's config.toml once,
+ * while the key is still unset, so Codex pickers later overwrite the file
+ * themselves. Prepending keeps the lines at TOML's root level whatever the
+ * rest of the document declares, and leaves the file's own formatting and
+ * comments untouched.
+ */
+async function seedUserPreferences(
+  shared: Table,
+  local: Table,
+  source: string | undefined,
+  localPath: string,
+): Promise<void> {
+  const nonOpenAiProvider = Object.hasOwn(local, "model_provider") && local.model_provider !== "openai";
+  const seeds: string[] = [];
+  for (const key of USER_PREFERENCE_RUNTIME_SCALARS) {
+    if (nonOpenAiProvider && (key === "model" || key === "service_tier")) continue;
+    if (!Object.hasOwn(local, key) && Object.hasOwn(shared, key)) {
+      seeds.push(`${key} = ${tomlValue(shared[key])}`);
+    }
+  }
+  if (seeds.length === 0) return;
+  if (source === undefined) await mkdir(dirname(localPath), { recursive: true });
+  await writeFileAtomic(localPath, `${seeds.join("\n")}\n\n${source ?? ""}`);
+}
+
 /**
  * Read per-user MCP and whitelisted runtime/permission defaults on every launch;
  * shared operational runtime policy is authoritative and identity values are
  * never forwarded. Shared user-preference runtime keys (model, reasoning
- * effort, service tier) only seed identities without a local value, so Codex
- * picker writes to an identity's config.toml always win from then on; caller
- * overrides for those keys are never projected either. Codex recursively
- * merges the overlay, retaining identity-only fields. MCP transport entries
- * still fill only missing identity fields.
+ * effort, service tier) are never projected as -c invocation overrides, since
+ * that layer outranks config.toml and would override every picker save;
+ * instead the shared value is written into an identity's config.toml once,
+ * while the key is still unset, so Codex picker writes to that file always win
+ * from then on; caller overrides for those keys are never projected either.
+ * Codex recursively merges the overlay, retaining identity-only fields. MCP
+ * transport entries still fill only missing identity fields.
  * A single inline table keeps quoted keys out of Codex's dotted CLI-key parser.
  * Caller overrides follow the projection and retain precedence.
  */
@@ -198,9 +241,10 @@ export async function projectSharedCodexConfigForLaunch(
   );
   if (globalRealPath && globalRealPath === localRealPath) return argv;
 
-  const shared = await readConfig(globalPath);
+  const { config: shared } = await readConfig(globalPath);
   if (Object.keys(shared).length === 0) return argv;
-  const local = await readConfig(localPath);
+  const { config: local, source: localSource } = await readConfig(localPath);
+  await seedUserPreferences(shared, local, localSource, localPath);
   const missing = missingServers(
     (shared.mcp_servers ?? {}) as Table,
     (local.mcp_servers ?? {}) as Table,
