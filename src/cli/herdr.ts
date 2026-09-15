@@ -2,7 +2,7 @@ import { boolFlag, foldValuedFlags, parseArgs, stringFlag } from "./args.ts";
 import { dim, yellow } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
 import { resolveHerdrBinary } from "../shared/herdr-bin.ts";
-import { resolveTuiBinary } from "./tui.ts";
+import { ensureAistuiBinary, resolveTuiBinary } from "../shared/aistui-bin.ts";
 
 /**
  * `ais herdr`: a tmux-based wrapper around the third-party herdr client.
@@ -309,6 +309,10 @@ export interface HerdrCommandDeps {
   tmuxPath(): string | null;
   herdrPath(): string | null;
   tuiPath(): string | null;
+  /** One-shot self-heal when tuiPath() finds nothing: downloads aistui
+   * from the matching release into ~/.local/bin; throws with the reason
+   * when it cannot. Optional so test fakes without network stay honest. */
+  ensureTuiPath?(): Promise<string>;
   /** argv prefix re-invoking this ais process (compiled binary or dev). */
   aisEntrypoint(): Promise<string[]>;
   /** Ensures the local console daemon is up; returns its URL. */
@@ -333,6 +337,7 @@ function realDeps(): HerdrCommandDeps {
     tmuxPath: () => Bun.which("tmux"),
     herdrPath: () => resolveHerdrBinary() ?? null,
     tuiPath: () => resolveTuiBinary() ?? null,
+    ensureTuiPath: () => ensureAistuiBinary(),
     aisEntrypoint: async () => {
       // Same re-invocation contract as web.ts's detached daemon: compiled
       // binaries argv IS [exe, ...]; dev runs under bun with a script path.
@@ -369,6 +374,30 @@ function realDeps(): HerdrCommandDeps {
 function requireBinary(path: string | null, what: string, hint: string): string {
   if (path) return path;
   throw new CliUsageError(`${what} is required but was not found. ${hint}`);
+}
+
+/** aistui with one self-heal attempt: plain resolution first (tuiPath()),
+ * then ensureTuiPath()'s single release download when the binary is
+ * missing. The historical not-found error stays as the final fallback,
+ * extended with WHY the auto-install failed (or that it never ran, which
+ * happens in tests where the dep is not wired). */
+async function requireTuiBinary(deps: {
+  tuiPath(): string | null;
+  ensureTuiPath?(): Promise<string>;
+}): Promise<string> {
+  const found = deps.tuiPath();
+  if (found) return found;
+  let reason: string | undefined;
+  if (deps.ensureTuiPath) {
+    try {
+      return await deps.ensureTuiPath();
+    } catch (err) {
+      reason = err instanceof Error ? err.message : String(err);
+    }
+  }
+  throw new CliUsageError(
+    `the aistui binary is required but was not found${reason ? `, and the automatic download from the GitHub release failed (${reason})` : ""}. Build it with (cd apps/tui && cargo build --release), or install it to ~/.local/bin/aistui.`,
+  );
 }
 
 /** `ais herdr`: create-or-attach the wrapper session. Takes the subcommand's
@@ -435,11 +464,7 @@ export async function runHerdrCommand(
       remote: inv.remote,
     });
   } else {
-    const tui = requireBinary(
-      deps.tuiPath(),
-      "the aistui binary",
-      "Build it with (cd apps/tui && cargo build --release), or install it to ~/.local/bin/aistui.",
-    );
+    const tui = await requireTuiBinary(deps);
     right = rightPaneCommand({ tuiPath: tui });
     env.AIS_CONSOLE_URL = await deps.consoleUrl();
     const token = await deps.consoleToken();
@@ -497,6 +522,8 @@ export interface HerdrPanelDeps {
   /** Local console fallback (ensures the daemon is up). */
   localConsole(): Promise<{ url: string; token: string }>;
   tuiPath(): string | null;
+  /** Same one-shot release download self-heal as the wrapper deps. */
+  ensureTuiPath?(): Promise<string>;
   /** Runs aistui with the given env, full stdio; resolves with its exit. */
   runTui(tuiPath: string, env: Record<string, string>): Promise<number>;
 }
@@ -574,6 +601,7 @@ function realPanelDeps(): HerdrPanelDeps {
       return { url: `http://127.0.0.1:${port}`, token: (await readServerState())?.token ?? "" };
     },
     tuiPath: () => resolveTuiBinary() ?? null,
+    ensureTuiPath: () => ensureAistuiBinary(),
     runTui: async (tuiPath, env) => {
       const { spawnReal } = await import("../shared/exec.ts");
       return await spawnReal(tuiPath, ["--overview"], env);
@@ -638,11 +666,7 @@ export async function runHerdrPanelCommand(
     };
   }
 
-  const tui = requireBinary(
-    deps.tuiPath(),
-    "the aistui binary",
-    "Build it with (cd apps/tui && cargo build --release), or install it to ~/.local/bin/aistui.",
-  );
+  const tui = await requireTuiBinary(deps);
   let code: number;
   try {
     code = await deps.runTui(tui, env);
