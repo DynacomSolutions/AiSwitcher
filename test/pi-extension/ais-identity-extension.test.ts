@@ -1,106 +1,273 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import aisIdentityExtension, {
   AIS_EXTENSION_VERSION,
+  asCredential,
+  baseProviderOf,
   buildIdentityListings,
   buildProviderRows,
+  findModelInCatalog,
   formatIdentityTable,
   formatProviderTable,
   formatTable,
+  identityLabelFor,
+  interpolateConfigValue,
+  matchIdentityForCwd,
+  namespacedProviderId,
+  needsCredentialRefresh,
+  parseNamespacedProviderId,
+  parseRegistryIdentities,
   parseUseTarget,
+  pickDefaultIdentityName,
+  readAisState,
   resolveModel,
+  settingsWithDefaultModel,
   statusLine,
   type AiModel,
   type AuthMap,
   type ExtensionApiSubset,
   type ExtensionContextSubset,
+  type RegistryIdentity,
 } from "../../src/pi-extension/ais-identity-extension.ts";
 import { EXTENSION_SOURCE_TEXT } from "../../src/identities/pi-extension-install.ts";
 
-function embeddedExtensionSourceText(): string {
-  return EXTENSION_SOURCE_TEXT;
-}
+// --- shared fixture models -------------------------------------------------
 
 const sonnet: AiModel = { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" };
+const opus: AiModel = { id: "claude-opus-5", provider: "anthropic", name: "Claude Opus 5" };
 const glm: AiModel = { id: "glm-4.6", provider: "zai", name: "GLM 4.6" };
-const codex: AiModel = { id: "gpt-5-codex", provider: "openai-codex" };
+const codex: AiModel = { id: "gpt-5.6-luna", provider: "openai-codex", name: "GPT-5.6 Luna" };
 
-function registry(models: AiModel[], withAuth = true) {
-  return {
-    getAvailable: () => models,
-    find: (provider: string, modelId: string) =>
-      models.find((model) => model.provider === provider && model.id === modelId),
-    hasConfiguredAuth: (model: AiModel) => withAuth,
-    getProviderDisplayName: (provider: string) => provider.toUpperCase(),
-  };
-}
+const HOME = "/home/example";
 
-function context(overrides: Partial<ExtensionContextSubset> = {}): ExtensionContextSubset {
-  return {
-    hasUI: true,
-    model: sonnet,
-    modelRegistry: registry([sonnet, glm, codex]),
-    ui: { notify: () => undefined, setStatus: () => undefined, setWidget: () => undefined },
-    ...overrides,
-  };
-}
-
-const FIXTURE_AUTH: AuthMap = {
-  anthropic: { type: "oauth" },
-  zai: { type: "api_key" },
-};
-
-const FIXTURE_REGISTRY = {
+const REGISTRY = {
   version: 1,
   identities: [
-    { name: "identity-a", label: "Identity A", configDir: "/tmp/example/pi/identity-a" },
-    { name: "identity-b", label: "Identity B", configDir: "/tmp/example/pi/identity-b" },
+    {
+      name: "personal",
+      label: "Personal",
+      configDir: "/home/example/.pi/identities/personal",
+      directories: ["/home/example/projects/personal/*"],
+    },
+    {
+      name: "work",
+      label: "Work",
+      configDir: "/home/example/.pi/identities/work",
+      directories: ["/home/example/projects/work"],
+      aliases: ["wk"],
+    },
   ],
 };
 
-/** Test harness. Stubs every registration and UI call; readers are injected,
- * so tests never read auth.json, the registry or session env. */
-function harness(ctx: ExtensionContextSubset, options: { setModelResult?: boolean } = {}) {
-  const handlers = new Map<string, (event: never, ctx: ExtensionContextSubset) => unknown>();
-  const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionContextSubset) => unknown }>();
-  const setModelCalls: AiModel[] = [];
-  let setModelResult = options.setModelResult ?? true;
-  const api = {
-    on(event: string, handler: (event: never, ctx: ExtensionContextSubset) => unknown) {
-      handlers.set(event, handler);
-    },
-    registerCommand(name: string, options: { description?: string; handler: (args: string, ctx: ExtensionContextSubset) => unknown }) {
-      commands.set(name, options);
-    },
-    async setModel(model: AiModel) {
-      setModelCalls.push(model);
-      const next = ctx.model;
-      ctx.model = model;
-      return setModelResult;
-    },
-  } as unknown as ExtensionApiSubset & { setModelCalls: AiModel[] };
-  aisIdentityExtension(api, {
-    readAuth: () => FIXTURE_AUTH,
-    readRegistry: () => FIXTURE_REGISTRY,
-    identityName: () => "identity-a",
-  });
+// Per-identity auth.json fixtures (secrets never asserted, only shapes).
+const IDENTITY_AUTH: Record<string, AuthMap> = {
+  "/home/example/.pi/identities/personal": { anthropic: { type: "oauth" }, zai: { type: "api_key" } },
+  "/home/example/.pi/identities/work": { anthropic: { type: "oauth" }, "openai-codex": { type: "oauth" } },
+};
+
+// --- pure-helper fixtures --------------------------------------------------
+
+function nativeProvider(id: string, name: string, models: AiModel[], extra: Record<string, unknown> = {}) {
   return {
-    api,
-    handlers,
-    commands,
-    setModelCalls,
-    setModelResultSetter: (value: boolean) => {
-      setModelResult = value;
+    id,
+    name,
+    baseUrl: `https://api.${id}.test`,
+    auth: {
+      apiKey: {
+        name: `${name} key`,
+        async resolve(input: { credential?: { key?: string } }) {
+          return input.credential?.key ? { auth: { apiKey: input.credential.key }, source: "key" } : undefined;
+        },
+      },
+      ...(extra.oauth ? { oauth: extra.oauth } : {}),
     },
-    ctx,
+    getModels: () => models.map((model) => ({ ...model, provider: id })),
+    stream: () => ({}),
+    streamSimple: () => ({}),
+    ...(extra.filterModels ? { filterModels: extra.filterModels } : {}),
   };
 }
 
-describe("ais extension pure helpers", () => {
-  test("version stamp is present and well-formed", async () => {
-    expect(AIS_EXTENSION_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+const NATIVES = [
+  nativeProvider("anthropic", "Anthropic", [sonnet, opus]),
+  nativeProvider("zai", "ZAI", [glm]),
+  nativeProvider("openai-codex", "OpenAI Codex", [codex]),
+];
+
+describe("namespacing", () => {
+  test("namespacedProviderId joins provider and identity with the separator", () => {
+    expect(namespacedProviderId("anthropic", "personal")).toBe("anthropic--personal");
+    expect(namespacedProviderId("openai-codex", "identity-team")).toBe("openai-codex--identity-team");
   });
 
-  test("formatTable aligns columns to the widest cell", async () => {
+  test("parseNamespacedProviderId splits on the LAST separator", () => {
+    expect(parseNamespacedProviderId("anthropic--personal")).toEqual({ provider: "anthropic", identityName: "personal" });
+    expect(parseNamespacedProviderId("openai-codex--identity-team")).toEqual({
+      provider: "openai-codex",
+      identityName: "identity-team",
+    });
+    expect(parseNamespacedProviderId("anthropic")).toBeUndefined();
+    expect(parseNamespacedProviderId("--personal")).toBeUndefined();
+    expect(parseNamespacedProviderId("anthropic--")).toBeUndefined();
+  });
+
+  test("baseProviderOf strips the namespace", () => {
+    expect(baseProviderOf("anthropic--personal")).toBe("anthropic");
+    expect(baseProviderOf("anthropic")).toBe("anthropic");
+  });
+});
+
+describe("registry parsing and labels", () => {
+  test("parseRegistryIdentities reads the version-1 shape and defaults labels to names", () => {
+    const parsed = parseRegistryIdentities({
+      version: 1,
+      identities: [
+        { name: "work", label: "Work", configDir: "/w" },
+        { name: "bare", configDir: "/b" },
+      ],
+    });
+    expect(parsed).toBeDefined();
+    expect(parsed?.[0]?.label).toBe("Work");
+    expect(parsed?.[1]?.label).toBe("bare");
+  });
+
+  test("parseRegistryIdentities rejects bad shapes with undefined", () => {
+    expect(parseRegistryIdentities(undefined)).toBeUndefined();
+    expect(parseRegistryIdentities({ version: 2, identities: [] })).toBeUndefined();
+    expect(parseRegistryIdentities({ version: 1 })).toBeUndefined();
+  });
+
+  test("identityLabelFor returns the REAL label, not the id", () => {
+    const identities = parseRegistryIdentities(REGISTRY) as RegistryIdentity[];
+    expect(identityLabelFor(identities, "personal")).toBe("Personal");
+    expect(identityLabelFor(identities, "work")).toBe("Work");
+    expect(identityLabelFor(identities, "ghost")).toBe("ghost");
+    expect(identityLabelFor(identities, undefined)).toBeUndefined();
+  });
+
+  test("buildIdentityListings marks the active identity and reports bad registries", () => {
+    const { listings } = buildIdentityListings(REGISTRY, "work");
+    expect(listings.find((l) => l.name === "work")?.current).toBe(true);
+    expect(listings.find((l) => l.name === "personal")?.current).toBe(false);
+    expect(buildIdentityListings(undefined, "work").note).toContain("not readable");
+    expect(buildIdentityListings({ version: 9 }, "work").note).toContain("unexpected shape");
+  });
+
+  test("formatIdentityTable renders launch commands", () => {
+    const { listings } = buildIdentityListings(REGISTRY, "personal");
+    const lines = formatIdentityTable(listings);
+    expect(lines.find((l) => l.includes("> personal"))).toBeDefined();
+    expect(lines.find((l) => l.includes("ais pi --identity=work"))).toBeDefined();
+  });
+});
+
+describe("directory matching (match.ts grammar, replicated)", () => {
+  const identities = parseRegistryIdentities(REGISTRY) as RegistryIdentity[];
+
+  test("recursive /* matches the directory and everything beneath it", () => {
+    expect(matchIdentityForCwd(identities, "/home/example/projects/personal/sub/deep", HOME)?.name).toBe("personal");
+  });
+
+  test("exact pattern matches only that directory", () => {
+    expect(matchIdentityForCwd(identities, "/home/example/projects/work", HOME)?.name).toBe("work");
+    expect(matchIdentityForCwd(identities, "/home/example/projects/work/sub", HOME)).toBeUndefined();
+  });
+
+  test("no match returns undefined", () => {
+    expect(matchIdentityForCwd(identities, "/tmp/elsewhere", HOME)).toBeUndefined();
+  });
+
+  test("most-specific (longest base) match wins", () => {
+    const two = parseRegistryIdentities({
+      version: 1,
+      identities: [
+        { name: "broad", label: "Broad", configDir: "/b", directories: ["/home/example/projects/*"] },
+        { name: "narrow", label: "Narrow", configDir: "/n", directories: ["/home/example/projects/narrow/*"] },
+      ],
+    }) as RegistryIdentity[];
+    expect(matchIdentityForCwd(two, "/home/example/projects/narrow/x", HOME)?.name).toBe("narrow");
+    expect(matchIdentityForCwd(two, "/home/example/projects/other", HOME)?.name).toBe("broad");
+  });
+});
+
+describe("default-identity chain", () => {
+  const identities = parseRegistryIdentities(REGISTRY) as RegistryIdentity[];
+
+  test("wrapper marker wins when it names a registry identity", () => {
+    expect(
+      pickDefaultIdentityName({ identities, envMarker: "work", persisted: "personal", cwdMatch: "personal" }),
+    ).toBe("work");
+  });
+
+  test("an unknown marker is ignored in favour of the persisted identity", () => {
+    expect(
+      pickDefaultIdentityName({ identities, envMarker: "agent", persisted: "personal", cwdMatch: undefined }),
+    ).toBe("personal");
+  });
+
+  test("falls back to cwd match, then the first identity", () => {
+    expect(
+      pickDefaultIdentityName({ identities, envMarker: undefined, persisted: undefined, cwdMatch: "work" }),
+    ).toBe("work");
+    expect(
+      pickDefaultIdentityName({ identities, envMarker: undefined, persisted: undefined, cwdMatch: undefined }),
+    ).toBe("personal");
+    expect(pickDefaultIdentityName({ identities: [], envMarker: undefined, persisted: undefined, cwdMatch: undefined })).toBeUndefined();
+  });
+});
+
+describe("credentials", () => {
+  test("asCredential narrows oauth and api_key, rejects malformed", () => {
+    expect(asCredential({ type: "oauth", access: "a", refresh: "r", expires: 123 })).toEqual({
+      type: "oauth",
+      access: "a",
+      refresh: "r",
+      expires: 123,
+    });
+    expect(asCredential({ type: "oauth", access: "a" })).toBeUndefined();
+    expect(asCredential({ type: "api_key", key: "k" })).toEqual({ type: "api_key", key: "k" });
+    expect(asCredential({ type: "api_key" })).toBeUndefined();
+    expect(asCredential({ type: "mystery" })).toBeUndefined();
+    expect(asCredential(undefined)).toBeUndefined();
+  });
+
+  test("needsCredentialRefresh refreshes near/at expiry but not fresh or unknown", () => {
+    const now = 1_000_000;
+    expect(needsCredentialRefresh({ type: "oauth", access: "a", refresh: "r", expires: now + 1_000 }, now)).toBe(true);
+    expect(needsCredentialRefresh({ type: "oauth", access: "a", refresh: "r", expires: now + 600_000 }, now)).toBe(false);
+    expect(needsCredentialRefresh({ type: "oauth", access: "a", refresh: "r", expires: 0 }, now)).toBe(false);
+    expect(needsCredentialRefresh({ type: "api_key", key: "k" }, now)).toBe(false);
+  });
+
+  test("interpolateConfigValue handles env, braces, literals and rejects !command", () => {
+    const env = (name: string) => (name === "TOKEN" ? "secret-value" : undefined);
+    expect(interpolateConfigValue("$TOKEN", env)).toBe("secret-value");
+    expect(interpolateConfigValue("${TOKEN}", env)).toBe("secret-value");
+    expect(interpolateConfigValue("literal-key", env)).toBe("literal-key");
+    expect(interpolateConfigValue("!cat /secret", env)).toBeUndefined();
+  });
+});
+
+describe("settings + state persistence", () => {
+  test("settingsWithDefaultModel sets the startup default and preserves other keys", () => {
+    const out = JSON.parse(settingsWithDefaultModel({ theme: "dark", defaultProvider: "old" }, sonnet));
+    expect(out.theme).toBe("dark");
+    expect(out.defaultProvider).toBe("anthropic");
+    expect(out.defaultModel).toBe("claude-sonnet-4-5");
+  });
+
+  test("settingsWithDefaultModel starts from empty when existing is not an object", () => {
+    const out = JSON.parse(settingsWithDefaultModel(undefined, glm));
+    expect(out.defaultProvider).toBe("zai");
+    expect(out.defaultModel).toBe("glm-4.6");
+  });
+
+  test("readAisState tolerates bad JSON with an empty state", () => {
+    expect(readAisState("/nonexistent/ais-state.json")).toEqual({});
+  });
+});
+
+describe("tables", () => {
+  test("formatTable aligns columns to the widest cell", () => {
     const lines = formatTable(["A", "BB"], [["x", "y"], ["longer", "z"]]);
     expect(lines[0]).toBe("A       BB");
     expect(lines[1]).toBe("------  --");
@@ -108,271 +275,477 @@ describe("ais extension pure helpers", () => {
     expect(lines[3]).toBe("longer  z");
   });
 
-  test("buildProviderRows merges credentials with the catalogue and marks the current row", async () => {
-    const auth: AuthMap = {
-      anthropic: { type: "oauth" },
-      zai: { type: "api_key" },
-    };
-    const rows = buildProviderRows(auth, [sonnet, glm, codex], sonnet, (provider) => provider);
-    const byProvider = new Map(rows.map((row) => [row.provider, row]));
-    expect(byProvider.get("anthropic")?.credential).toBe("oauth");
-    expect(byProvider.get("anthropic")?.models).toBe(1);
+  test("buildProviderRows marks the current row via the BASE provider of a namespaced model", () => {
+    const namespacedSonnet = { ...sonnet, provider: "anthropic--personal" };
+    const rows = buildProviderRows(
+      { anthropic: { type: "oauth" }, zai: { type: "api_key" } },
+      [namespacedSonnet, glm],
+      namespacedSonnet,
+      (p) => p,
+    );
+    const byProvider = new Map(rows.map((r) => [r.provider, r]));
     expect(byProvider.get("anthropic")?.current).toBe(true);
-    expect(byProvider.get("anthropic")?.note).toBeUndefined();
+    expect(byProvider.get("anthropic")?.models).toBe(1);
     expect(byProvider.get("zai")?.current).toBe(false);
-    expect(byProvider.get("openai-codex")?.credential).toBe("-");
-    expect(byProvider.get("openai-codex")?.models).toBe(1);
-    expect(byProvider.get("openai-codex")?.current).toBe(false);
   });
 
-  test("buildProviderRows explains catalogue-less credentials and credential-less catalogue providers", async () => {
-    const rows = buildProviderRows(
-      { "kimi-coding": { type: "oauth" } },
-      [glm],
-      glm,
-      (provider) => provider,
-    );
-    const byProvider = new Map(rows.map((row) => [row.provider, row]));
+  test("buildProviderRows surfaces gap notes for credential-less and catalogue-less providers", () => {
+    const rows = buildProviderRows({ "kimi-coding": { type: "oauth" } }, [glm], glm, (p) => p);
+    const byProvider = new Map(rows.map((r) => [r.provider, r]));
     expect(byProvider.get("kimi-coding")?.note).toBe("credential present but no models in Pi's catalogue");
-    // zai is the current model's provider but has no auth.json entry.
     expect(byProvider.get("zai")?.note).toBe("active via environment or provider defaults");
   });
 
-  test("buildProviderRows surfaces the known Amazon Bedrock gap", async () => {
-    const rows = buildProviderRows({}, [], undefined, (provider) => provider);
-    expect(rows).toHaveLength(0);
-    const withBedrock = buildProviderRows({ "amazon-bedrock": { type: "api_key" } }, [], undefined, (p) => p);
-    expect(withBedrock[0]?.note).toBe("credential present but no models in Pi's catalogue");
-  });
-
-  test("formatProviderTable marks the current provider and renders its model id", async () => {
-    const auth: AuthMap = { zai: { type: "api_key" } };
-    const rows = buildProviderRows(auth, [glm, sonnet], glm, (provider) => provider);
+  test("formatProviderTable marks the current provider", () => {
+    const rows = buildProviderRows({ zai: { type: "api_key" } }, [glm, sonnet], glm, (p) => p);
     const lines = formatProviderTable(rows, glm);
-    expect(lines[0]).toContain("PROVIDER");
-    const zaiRow = lines.find((line) => line.includes("zai"));
-    expect(zaiRow).toStartWith("> ");
-    expect(zaiRow).toContain("in use: glm-4.6");
-  });
-
-  test("parseUseTarget accepts provider and provider/model and rejects empty input", async () => {
-    expect(parseUseTarget("")).toEqual({
-      error: "usage: /ais use <provider>[/<model>] (example: /ais use zai/glm-4.6)",
-    });
-    expect(parseUseTarget("  zai ")).toEqual({ provider: "zai" });
-    expect(parseUseTarget("zai/glm-4.6")).toEqual({ provider: "zai", modelId: "glm-4.6" });
-  });
-
-  test("resolveModel prefers an exact match, falls back to a partial id, then the first catalogue model", async () => {
-    const reg = registry([sonnet, glm]);
-    expect(resolveModel({ provider: "anthropic", modelId: "claude-sonnet-4-5" }, reg)).toEqual({ model: sonnet });
-    expect(resolveModel({ provider: "anthropic", modelId: "sonnet" }, reg)).toEqual({ model: sonnet });
-    expect(resolveModel({ provider: "anthropic" }, reg)).toEqual({ model: sonnet });
-    const miss = resolveModel({ provider: "anthropic", modelId: "opus" }, reg);
-    expect("error" in miss).toBe(true);
-    const noModels = resolveModel({ provider: "amazon-bedrock" }, reg);
-    expect("error" in noModels && noModels.error).toContain("ambient AWS credential chain");
-  });
-
-  test("buildIdentityListings marks the active identity and reports bad registries honestly", async () => {
-    const registryJson = {
-      version: 1,
-      identities: [
-        { name: "work", label: "Work", configDir: "/home/example/.pi/identities/work" },
-        { name: "personal", configDir: "/home/example/.pi/identities/personal" },
-      ],
-    };
-    const { listings, note } = buildIdentityListings(registryJson, "personal");
-    expect(note).toBeUndefined();
-    expect(listings).toHaveLength(2);
-    expect(listings[0]?.label).toBe("Work");
-    expect(listings[0]?.current).toBe(false);
-    expect(listings[1]?.current).toBe(true);
-    expect(listings[1]?.label).toBe("personal");
-
-    const bad = buildIdentityListings({ version: 2 }, "personal");
-    expect(bad.listings).toHaveLength(0);
-    expect(bad.note).toContain("unexpected shape");
-
-    const unreadable = buildIdentityListings(undefined, "personal");
-    expect(unreadable.note).toContain("not readable");
-
-    const lines = formatIdentityTable(listings);
-    expect(lines.find((line) => line.includes("personal"))).toContain("ais pi --identity=personal");
-    expect(lines.find((line) => line.includes("> personal"))).toBeDefined();
-  });
-
-  test("statusLine reports an honest fallback outside the wrapper", async () => {
-    expect(statusLine("work", glm)).toBe("ais work: zai/glm-4.6");
-    expect(statusLine(undefined, undefined)).toBe("ais: no model selected (launched outside the ais wrapper)");
+    expect(lines.find((l) => l.includes("zai"))).toStartWith("> ");
   });
 });
 
-describe("ais extension command behaviour", () => {
-  test("/ais renders the context widget with the table and gap notes", async () => {
-    const widgets: Array<readonly string[] | undefined> = [];
-    const ctx = context({
-      ui: {
-        notify: () => undefined,
-        setStatus: () => undefined,
-        setWidget: (_key: string | undefined, content: readonly string[] | undefined) => widgets.push(content),
-      },
+describe("/ais use parsing", () => {
+  const keys = ["personal", "work", "wk"];
+
+  test("accepts provider and provider/model", () => {
+    expect(parseUseTarget("zai", keys)).toEqual({ provider: "zai" });
+    expect(parseUseTarget("zai/glm-4.6", keys)).toEqual({ provider: "zai", modelId: "glm-4.6" });
+  });
+
+  test("accepts an identity-scoped form (name or alias)", () => {
+    expect(parseUseTarget("work anthropic/claude-opus-5", keys)).toEqual({
+      identity: "work",
+      provider: "anthropic",
+      modelId: "claude-opus-5",
     });
-    const harnessOne = harness(ctx);
-    harnessOne.handlers.get("session_start")?.(undefined as never, ctx);
-    const handler = harnessOne.commands.get("ais")?.handler;
-    expect(handler).toBeDefined();
-    await handler!("", ctx);
-    expect(widgets).toHaveLength(1);
-    const widget = widgets[0] as readonly string[];
-    expect(widget[0]).toContain("ais identity:");
-    expect(widget[0]).toContain("anthropic/claude-sonnet-4-5");
-    const joined = widget.join("\n");
-    expect(joined).toContain("anthropic");
-    expect(joined).toContain("amazon-bedrock: uses the ambient AWS credential chain");
-    expect(widget.length).toBeLessThanOrEqual(10);
-    expect(joined).toContain("/ais use <provider>[/<model>]");
+    expect(parseUseTarget("wk anthropic", keys)).toEqual({ identity: "wk", provider: "anthropic" });
   });
 
-  test("/ais hides the widget path in non-UI modes and notifies compactly instead", async () => {
-    const notes: string[] = [];
-    const ctx = context({ hasUI: false, ui: { notify: (message) => notes.push(message), setStatus: () => undefined, setWidget: () => undefined } });
-    const harnessOne = harness(ctx);
-    await harnessOne.commands.get("ais")?.handler("", ctx);
-    expect(notes).toHaveLength(1);
-    expect(notes[0]).toContain("ais:");
-  });
-
-  test("/ais use switches the model through pi.setModel and reports the honest default note", async () => {
-    const notes: Array<[string, string | undefined]> = [];
-    const ctx = context({
-      ui: {
-        notify: (message, type) => notes.push([message, type]),
-        setStatus: () => undefined,
-        setWidget: () => undefined,
-      },
+  test("accepts a fully namespaced provider id", () => {
+    expect(parseUseTarget("anthropic--personal/claude-opus-5", keys)).toEqual({
+      identity: "personal",
+      provider: "anthropic",
+      modelId: "claude-opus-5",
     });
-    const harnessOne = harness(ctx);
-    await harnessOne.commands.get("ais")?.handler("use zai/glm-4.6", ctx);
-    expect(harnessOne.setModelCalls).toEqual([glm]);
-    expect(notes[0]?.[0]).toContain("switched to zai/glm-4.6");
-    expect(notes[0]?.[0]).toContain("new sessions still start on the identity's configured default");
-    expect(ctx.model).toEqual(glm);
   });
 
-  test("/ais use with a provider only picks the first catalogue model; a refusal surfaces the real reason", async () => {
-    const notes: Array<[string, string | undefined]> = [];
-    const ctx = context({
-      ui: {
-        notify: (message, type) => notes.push([message, type]),
-        setStatus: () => undefined,
-        setWidget: () => undefined,
+  test("rejects empty input and unknown second tokens", () => {
+    expect("error" in parseUseTarget("", keys)).toBe(true);
+    expect("error" in parseUseTarget("zai extra junk", keys)).toBe(true);
+  });
+});
+
+describe("model resolution", () => {
+  test("findModelInCatalog prefers exact, then substring, then first", () => {
+    const catalog = [sonnet, opus];
+    expect(findModelInCatalog(catalog, "anthropic", "claude-opus-5")).toEqual(opus);
+    expect(findModelInCatalog(catalog, "anthropic", "opus")).toEqual(opus);
+    expect(findModelInCatalog(catalog, "anthropic", undefined)).toEqual(sonnet);
+    expect(findModelInCatalog(catalog, "anthropic", "nope")).toBeUndefined();
+    expect(findModelInCatalog(catalog, "zai", undefined)).toBeUndefined();
+  });
+
+  test("findModelInCatalog matches on the BASE provider of namespaced models", () => {
+    const catalog = [{ ...sonnet, provider: "anthropic--personal" }];
+    expect(findModelInCatalog(catalog, "anthropic", "claude-sonnet-4-5")?.provider).toBe("anthropic--personal");
+  });
+
+  test("resolveModel over pi's native registry prefers exact then partial then first", () => {
+    const reg = {
+      getAvailable: () => [sonnet, glm],
+      find: (p: string, id: string) => [sonnet, glm].find((m) => m.provider === p && m.id === id),
+      hasConfiguredAuth: () => true,
+      getProviderDisplayName: (p: string) => p,
+    };
+    expect(resolveModel({ provider: "anthropic", modelId: "claude-sonnet-4-5" }, reg)).toEqual({ model: sonnet });
+    expect(resolveModel({ provider: "anthropic", modelId: "sonnet" }, reg)).toEqual({ model: sonnet });
+    expect(resolveModel({ provider: "anthropic" }, reg)).toEqual({ model: sonnet });
+    expect("error" in resolveModel({ provider: "amazon-bedrock" }, reg)).toBe(true);
+  });
+});
+
+describe("status line", () => {
+  test("uses the REAL label and the base provider", () => {
+    expect(statusLine("Personal", { ...sonnet, provider: "anthropic--personal" })).toBe(
+      "ais Personal: anthropic/claude-sonnet-4-5",
+    );
+  });
+
+  test("reports an honest fallback when no identity resolved", () => {
+    expect(statusLine(undefined, undefined)).toBe("ais: no model selected (no AIS identity resolved)");
+  });
+});
+
+// --- factory / command behaviour -------------------------------------------
+
+// The extension derives its state/settings/auth paths from
+// PI_CODING_AGENT_DIR (falling back to $HOME/.pi/agent). Pin it to the
+// fixture home for the whole file so injected-store paths are deterministic,
+// and restore the ambient value afterwards.
+const SAVED_PI_DIR = process.env.PI_CODING_AGENT_DIR;
+const INSTANCE_DIR = `${HOME}/.pi/agent`;
+process.env.PI_CODING_AGENT_DIR = INSTANCE_DIR;
+afterAll(() => {
+  if (SAVED_PI_DIR === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = SAVED_PI_DIR;
+});
+
+interface RegisteredProvider {
+  id: string;
+  name: string;
+  getModels(): AiModel[];
+  auth: { apiKey?: { resolve(input: unknown): Promise<unknown> } };
+}
+
+function harness(options: {
+  ctx?: Partial<ExtensionContextSubset>;
+  registry?: unknown;
+  identityAuth?: Record<string, AuthMap>;
+  natives?: unknown[];
+  setModelResult?: boolean;
+  selectResponses?: Array<string | undefined>;
+  argv?: string[];
+}) {
+  const registered: RegisteredProvider[] = [];
+  const setModelCalls: AiModel[] = [];
+  const writes: Array<{ path: string; data: unknown; mode: number }> = [];
+  const jsonStore = new Map<string, unknown>();
+  let setModelResult = options.setModelResult ?? true;
+  const selectResponses = [...(options.selectResponses ?? [])];
+  const selectCalls: Array<{ title: string; options: string[] }> = [];
+
+  const handlers = new Map<string, (event: never, ctx: ExtensionContextSubset) => unknown>();
+  const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionContextSubset) => unknown }>();
+
+  const widgets: Array<readonly string[] | undefined> = [];
+  const statuses: string[] = [];
+  const notes: Array<[string, string | undefined]> = [];
+
+  const baseCtx: ExtensionContextSubset = {
+    hasUI: true,
+    cwd: "/home/example/projects/personal/app",
+    model: undefined,
+    modelRegistry: {
+      getAvailable: () => [],
+      find: () => undefined,
+      hasConfiguredAuth: () => false,
+      getProviderDisplayName: (p: string) => p,
+    },
+    ui: {
+      notify: (m, t) => notes.push([m, t]),
+      setStatus: (_k, text) => {
+        if (text !== undefined) statuses.push(text);
       },
-    });
-    const harnessOne = harness(ctx);
-    await harnessOne.commands.get("ais")?.handler("use anthropic", ctx);
-    expect(harnessOne.setModelCalls).toEqual([sonnet]);
-
-    harnessOne.setModelResultSetter(false);
-    await harnessOne.commands.get("ais")?.handler("use zai", ctx);
-    expect(notes.at(-1)?.[0]).toContain("no authentication configured");
-    expect(notes.at(-1)?.[1]).toBe("error");
-  });
-
-  test("/ais use explains unknown providers and models", async () => {
-    const notes: Array<[string, string | undefined]> = [];
-    const ctx = context({
-      ui: {
-        notify: (message, type) => notes.push([message, type]),
-        setStatus: () => undefined,
-        setWidget: () => undefined,
+      setWidget: (_k, content) => widgets.push(content),
+      select: async (title: string, opts: string[]) => {
+        selectCalls.push({ title, options: opts });
+        return selectResponses.shift();
       },
-    });
-    const harnessOne = harness(ctx);
-    await harnessOne.commands.get("ais")?.handler("use nope", ctx);
-    expect(notes[0]?.[1]).toBe("error");
-    expect(notes[0]?.[0]).toContain("no models for provider");
+    },
+    ...(options.ctx ?? {}),
+  };
+
+  const api = {
+    on(event: string, handler: (event: never, ctx: ExtensionContextSubset) => unknown) {
+      handlers.set(event, handler);
+    },
+    registerCommand(name: string, opts: { description?: string; handler: (args: string, ctx: ExtensionContextSubset) => unknown }) {
+      commands.set(name, opts);
+    },
+    registerProvider(provider: RegisteredProvider) {
+      registered.push(provider);
+    },
+    async setModel(model: AiModel) {
+      setModelCalls.push(model);
+      baseCtx.model = model;
+      return setModelResult;
+    },
+  } as unknown as ExtensionApiSubset;
+
+  const promise = aisIdentityExtension(api, {
+    readRegistry: () => (options.registry ?? REGISTRY),
+    identityName: () => undefined,
+    readAuth: () => ({}),
+    readIdentityAuth: (configDir: string) =>
+      structuredClone((options.identityAuth ?? IDENTITY_AUTH)[configDir] ?? {}),
+    readIdentityModels: () => ({}),
+    natives: () => (options.natives ?? NATIVES) as never,
+    writeJson: (path, data, mode) => {
+      writes.push({ path, data, mode });
+      jsonStore.set(path, data);
+    },
+    readJson: (path) => jsonStore.get(path),
+    now: () => 1_000_000,
+    cwd: () => baseCtx.cwd ?? "/home/example/projects/personal/app",
+    argv: options.argv ?? [],
+    home: () => HOME,
   });
 
-  test("/ais identities lists launch commands and the honest relaunch note", async () => {
-    const widgets: Array<readonly string[] | undefined> = [];
-    const ctx = context({
-      ui: {
-        notify: () => undefined,
-        setStatus: () => undefined,
-        setWidget: (_key: string | undefined, content: readonly string[] | undefined) => widgets.push(content),
-      },
-    });
-    const harnessOne = harness(ctx);
-    await harnessOne.commands.get("ais")?.handler("identities", ctx);
-    const widget = widgets[0] as readonly string[];
-    const joined = widget.join("\n");
-    expect(joined).toContain("requires a relaunch");
-    expect(widget.length).toBeLessThanOrEqual(10);
-    expect(joined).toContain("ais pi --identity=identity-b");
+  return {
+    promise,
+    api,
+    ctx: baseCtx,
+    registered,
+    setModelCalls,
+    setModelResultSetter: (v: boolean) => {
+      setModelResult = v;
+    },
+    writes,
+    jsonStore,
+    widgets,
+    statuses,
+    notes,
+    selectCalls,
+    handlers,
+    commands,
+  };
+}
+
+describe("provider registration", () => {
+  test("registers a namespaced provider per (identity, provider) credential", async () => {
+    const h = harness({});
+    await h.promise;
+    const ids = h.registered.map((p) => p.id).sort();
+    expect(ids).toContain("anthropic--personal");
+    expect(ids).toContain("zai--personal");
+    expect(ids).toContain("anthropic--work");
+    expect(ids).toContain("openai-codex--work");
+    // display names carry the identity LABEL
+    expect(h.registered.find((p) => p.id === "anthropic--personal")?.name).toBe("Anthropic (Personal)");
   });
 
-  test("unknown /ais arguments warn instead of doing nothing", async () => {
-    const notes: Array<[string, string | undefined]> = [];
-    const ctx = context({
-      ui: {
-        notify: (message, type) => notes.push([message, type]),
-        setStatus: () => undefined,
-        setWidget: () => undefined,
-      },
-    });
-    const harnessOne = harness(ctx);
-    await harnessOne.commands.get("ais")?.handler("frobnicate", ctx);
-    expect(notes[0]?.[1]).toBe("warning");
+  test("namespaced models are remapped to the namespaced provider id", async () => {
+    const h = harness({});
+    await h.promise;
+    const personal = h.registered.find((p) => p.id === "anthropic--personal");
+    const models = personal?.getModels() ?? [];
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((m) => m.provider === "anthropic--personal")).toBe(true);
   });
 
-  test("the status line follows model_select and session_start", async () => {
-    const statuses: string[] = [];
-    const ctx = context({
-      ui: {
-        notify: () => undefined,
-        setStatus: (_key, text) => {
-          if (text !== undefined) statuses.push(text);
+  test("oauth credentials resolve through the native provider and refresh writes back to the SOURCE identity", async () => {
+    let refreshCalls = 0;
+    const natives = [
+      nativeProvider("anthropic", "Anthropic", [sonnet], {
+        oauth: {
+          name: "Anthropic OAuth",
+          async refresh(cred: { refresh: string }) {
+            refreshCalls += 1;
+            return { type: "oauth", access: "rotated-access", refresh: `${cred.refresh}-rotated`, expires: 9_999_999_999 };
+          },
+          async toAuth(cred: { access: string }) {
+            return { apiKey: cred.access };
+          },
         },
-        setWidget: () => undefined,
+      }),
+    ];
+    // expired oauth credential for personal/anthropic
+    const identityAuth = {
+      "/home/example/.pi/identities/personal": {
+        anthropic: { type: "oauth", access: "old", refresh: "r0", expires: 1_000_000 - 10 },
+      },
+    };
+    const h = harness({ natives, identityAuth, registry: { version: 1, identities: [REGISTRY.identities[0]] } });
+    await h.promise;
+    const provider = h.registered.find((p) => p.id === "anthropic--personal");
+    const resolved = (await provider?.auth.apiKey?.resolve({
+      ctx: {},
+      credential: undefined,
+      signal: new AbortController().signal,
+    })) as { auth: { apiKey: string }; source: string };
+    expect(refreshCalls).toBe(1);
+    expect(resolved.auth.apiKey).toBe("rotated-access");
+    expect(resolved.source).toContain("Personal");
+    // write-back landed in the SOURCE identity's auth.json at mode 0600
+    const writeBack = h.writes.find((w) => w.path === "/home/example/.pi/identities/personal/auth.json");
+    expect(writeBack?.mode).toBe(0o600);
+    expect((writeBack?.data as AuthMap).anthropic).toMatchObject({ type: "oauth", access: "rotated-access" });
+  });
+
+  test("api_key credentials resolve through the native apiKey resolve", async () => {
+    const h = harness({
+      registry: { version: 1, identities: [REGISTRY.identities[0]] },
+      identityAuth: {
+        "/home/example/.pi/identities/personal": { zai: { type: "api_key", key: "SYNTHETIC_FIXTURE_KEY" } },
       },
     });
-    const harnessOne = harness(ctx);
-    harnessOne.handlers.get("session_start")?.(undefined as never, ctx);
-    harnessOne.handlers.get("model_select")?.({ model: glm } as never, ctx);
-    expect(statuses.at(-1)).toContain("zai/glm-4.6");
+    await h.promise;
+    const zai = h.registered.find((p) => p.id === "zai--personal");
+    expect(zai).toBeDefined();
+    const resolved = (await zai?.auth.apiKey?.resolve({
+      ctx: {},
+      credential: undefined,
+      signal: new AbortController().signal,
+    })) as { auth: { apiKey: string } };
+    expect(resolved.auth.apiKey).toBe("SYNTHETIC_FIXTURE_KEY");
+  });
+});
+
+describe("/ais command behaviour", () => {
+  test("/ais runs the interactive switcher: pick identity then model, then setModel", async () => {
+    const h = harness({ selectResponses: ["Work", "openai-codex/gpt-5.6-luna — GPT-5.6 Luna"] });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    h.setModelCalls.length = 0;
+    await h.commands.get("ais")?.handler("", h.ctx);
+    expect(h.selectCalls[0]?.title).toContain("Switch AIS identity");
+    expect(h.selectCalls[0]?.options).toContain("Personal (current)");
+    expect(h.selectCalls[1]?.title).toContain("Model for Work");
+    expect(h.setModelCalls.at(-1)).toMatchObject({ provider: "openai-codex--work", id: "gpt-5.6-luna" });
+  });
+
+  test("/ais switcher is a no-op when the identity selection is cancelled", async () => {
+    const h = harness({ selectResponses: [undefined] });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    h.setModelCalls.length = 0;
+    await h.commands.get("ais")?.handler("", h.ctx);
+    expect(h.setModelCalls).toHaveLength(0);
+    expect(h.selectCalls).toHaveLength(1);
+  });
+
+  test("/ais show renders the context widget with the active identity label", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.commands.get("ais")?.handler("show", h.ctx);
+    const widget = h.widgets.at(-1) as readonly string[];
+    expect(widget.join("\n")).toContain("ais identity:");
+    expect(widget.length).toBeLessThanOrEqual(12);
+  });
+
+  test("/ais use switches an active-identity namespaced model", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.commands.get("ais")?.handler("use anthropic/claude-opus-5", h.ctx);
+    expect(h.setModelCalls.at(-1)).toMatchObject({ provider: "anthropic--personal", id: "claude-opus-5" });
+  });
+
+  test("/ais use <identity> <provider> switches identity scope", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.commands.get("ais")?.handler("use work openai-codex", h.ctx);
+    expect(h.setModelCalls.at(-1)).toMatchObject({ provider: "openai-codex--work" });
+  });
+
+  test("/ais use surfaces a refusal honestly when pi rejects the switch", async () => {
+    const h = harness({ setModelResult: false });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.commands.get("ais")?.handler("use anthropic", h.ctx);
+    expect(h.notes.at(-1)?.[1]).toBe("error");
+    expect(h.notes.at(-1)?.[0]).toContain("no authentication configured");
+  });
+
+  test("/ais identities renders the table without the old relaunch-only wording", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.commands.get("ais")?.handler("identities", h.ctx);
+    const widget = h.widgets.at(-1) as readonly string[];
+    expect(widget.join("\n")).toContain("Switch in-app");
+    expect(widget.join("\n")).not.toContain("requires a relaunch");
+  });
+
+  test("unknown /ais arguments warn", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.commands.get("ais")?.handler("frobnicate", h.ctx);
+    expect(h.notes.at(-1)?.[1]).toBe("warning");
+  });
+
+  test("a provider the active identity lacks but SEVERAL others have asks the user to disambiguate", async () => {
+    const registry = {
+      version: 1,
+      identities: [
+        { name: "aaa", label: "AAA", configDir: "/home/example/.pi/identities/aaa" },
+        { name: "bbb", label: "BBB", configDir: "/home/example/.pi/identities/bbb" },
+        { name: "ccc", label: "CCC", configDir: "/home/example/.pi/identities/ccc" },
+      ],
+    };
+    const identityAuth = {
+      "/home/example/.pi/identities/aaa": {} as AuthMap,
+      "/home/example/.pi/identities/bbb": { zai: { type: "api_key", key: "SYNTHETIC_FIXTURE_B" } } as AuthMap,
+      "/home/example/.pi/identities/ccc": { zai: { type: "api_key", key: "SYNTHETIC_FIXTURE_C" } } as AuthMap,
+    };
+    const h = harness({ registry, identityAuth, ctx: { cwd: "/tmp/no-match" } });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.commands.get("ais")?.handler("use zai", h.ctx);
+    expect(h.notes.at(-1)?.[1]).toBe("warning");
+    expect(h.notes.at(-1)?.[0]).toContain("several identities");
+  });
+
+  test("a provider only ONE other identity has switches to it and adopts that identity", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    // openai-codex exists only for work; the active identity is personal
+    await h.commands.get("ais")?.handler("use openai-codex", h.ctx);
+    expect(h.setModelCalls.at(-1)).toMatchObject({ provider: "openai-codex--work" });
+    const stateWrite = h.writes.filter((w) => w.path.endsWith("/ais-state.json")).at(-1);
+    expect((stateWrite?.data as { activeIdentity?: string }).activeIdentity).toBe("work");
+  });
+});
+
+describe("model_select persistence", () => {
+  test("model_select writes the settings default (last-used model) and the state", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.handlers.get("model_select")?.({ model: { ...opus, provider: "anthropic--personal" } } as never, h.ctx);
+    const settingsWrite = h.writes.find((w) => w.path.endsWith("/settings.json"));
+    expect((settingsWrite?.data as Record<string, unknown>).defaultProvider).toBe("anthropic--personal");
+    expect((settingsWrite?.data as Record<string, unknown>).defaultModel).toBe("claude-opus-5");
+    const stateWrite = h.writes.find((w) => w.path.endsWith("/ais-state.json"));
+    expect((stateWrite?.data as { activeIdentity?: string }).activeIdentity).toBe("personal");
+  });
+
+  test("a one-off --model flag does NOT overwrite the persisted settings default", async () => {
+    const h = harness({ argv: ["pi", "--model", "anthropic--work/claude-opus-5"] });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.handlers.get("model_select")?.({ model: { ...opus, provider: "anthropic--work" } } as never, h.ctx);
+    expect(h.writes.find((w) => w.path.endsWith("/settings.json"))).toBeUndefined();
+  });
+
+  test("status line follows model_select with the identity LABEL", async () => {
+    const h = harness({});
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    await h.handlers.get("model_select")?.({ model: { ...glm, provider: "zai--personal" } } as never, h.ctx);
+    expect(h.statuses.at(-1)).toBe("ais Personal: zai/glm-4.6");
+  });
+});
+
+describe("session_start default model", () => {
+  test("picks the active identity's model when none is usable", async () => {
+    const h = harness({});
+    await h.promise;
+    // cwd matches personal/* so personal is the default identity
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    expect(h.setModelCalls.length).toBeGreaterThan(0);
+    expect(h.setModelCalls[0]?.provider).toEndWith("--personal");
+  });
+
+  test("leaves a settings-default native model alone", async () => {
+    const h = harness({ ctx: { model: { id: "some-model", provider: "openai" } } });
+    await h.promise;
+    h.jsonStore.set(`${INSTANCE_DIR}/settings.json`, { defaultProvider: "openai", defaultModel: "some-model" });
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    expect(h.setModelCalls).toHaveLength(0);
   });
 });
 
 describe("jiti loadability", () => {
   test("the extension source transpiles cleanly (pi loads extensions via jiti)", () => {
     const transpiler = new Bun.Transpiler({ loader: "ts" });
-    const source = embeddedExtensionSourceText();
+    const source = EXTENSION_SOURCE_TEXT;
     expect(() => transpiler.transformSync(source)).not.toThrow();
     expect(transpiler.transformSync(source)).toContain("aisIdentityExtension");
   });
-});
 
-describe("credential honesty on switch", () => {
-  test("a switch pi accepts without a stored credential carries the honest may-still-fail note", async () => {
-    const notes: Array<[string, string | undefined]> = [];
-    const localKimi: AiModel = { id: "kimi-k2.6", provider: "local-kimi" };
-    const reg = {
-      ...registry([sonnet, localKimi]),
-      hasConfiguredAuth: (model: AiModel) => model.provider !== "local-kimi",
-    };
-    const ctx = context({
-      modelRegistry: reg,
-      ui: {
-        notify: (message, type) => notes.push([message, type]),
-        setStatus: () => undefined,
-        setWidget: () => undefined,
-      },
-    });
-    const harnessOne = harness(ctx);
-    await harnessOne.commands.get("ais")?.handler("use local-kimi", ctx);
-    expect(harnessOne.setModelCalls).toEqual([localKimi]);
-    expect(notes[0]?.[0]).toContain("switched to local-kimi/kimi-k2.6");
-    expect(notes[0]?.[0]).toContain("auth.json holds no credential for this provider");
+  test("version stamp is present and well-formed", () => {
+    expect(AIS_EXTENSION_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });

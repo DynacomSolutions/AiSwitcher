@@ -30,6 +30,14 @@ export async function resolveIdentity(
   opts: ResolveOptions,
   deps: ResolveDeps = defaultResolveDeps,
 ): Promise<ResolvedIdentity> {
+  // Single-instance tools (pi) never proxy per identity and never prompt:
+  // one shared config dir launches, and the tool's own extension surface
+  // exposes every AIS identity for in-app switching. A matched/flagged
+  // identity only seeds the in-app default.
+  if (cfg.singleInstanceDir) {
+    return resolveSingleInstanceIdentity(cfg, opts, deps);
+  }
+
   // (a) explicit --identity=<name> flag always wins outright.
   if (opts.explicitIdentityFlag) {
     const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
@@ -87,4 +95,66 @@ export async function resolveIdentity(
     configDirValue: expandPath(identity.configDir),
     source: created ? "interactive-created" : "interactive-existing",
   };
+}
+
+/**
+ * Resolution for single-instance tools (ToolConfig.singleInstanceDir - pi).
+ * NEVER prompts and NEVER fails on no-match: the launch always targets the
+ * one shared instance dir, and an identity (flag > preset env marker >
+ * directory match) only seeds the in-app default via
+ * AI_PROFILE_SWITCHER_SESSION. An explicit --identity must still name a real
+ * registry entry (a typo should not silently launch a different persona),
+ * and a preset PI_CODING_AGENT_DIR remains a power-user override pointing
+ * the whole instance somewhere else.
+ */
+export async function resolveSingleInstanceIdentity(
+  cfg: ToolConfig,
+  opts: ResolveOptions,
+  deps: ResolveDeps = defaultResolveDeps,
+): Promise<ResolvedIdentity> {
+  if (!cfg.singleInstanceDir) {
+    throw new Error(`${cfg.toolName}: resolveSingleInstanceIdentity requires singleInstanceDir`);
+  }
+  const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
+
+  // (a) explicit --identity=<name> seeds the in-app default identity; it
+  // must exist. The instance dir stays the shared one.
+  if (opts.explicitIdentityFlag) {
+    const identity = findIdentityByNameOrAlias(file.identities, opts.explicitIdentityFlag);
+    if (!identity) {
+      throw new UnknownIdentityError(
+        opts.explicitIdentityFlag,
+        file.identities.map((i) => i.name),
+      );
+    }
+    return { identity, configDirValue: expandPath(cfg.singleInstanceDir), source: "flag" };
+  }
+
+  // (b) preset env var: power-user override of the whole instance dir.
+  const presetEnvValue = opts.env[cfg.envVarName];
+  if (presetEnvValue) {
+    return { identity: undefined, configDirValue: presetEnvValue, source: "env" };
+  }
+
+  // (c) directory match seeds the default identity but never changes the
+  // launch target. Ambiguity is demoted to "no seed" (the in-app switcher
+  // resolves it) instead of prompting.
+  const matchResult = deps.matchDirectory(opts.cwd, file.identities);
+  if (matchResult && !("ambiguous" in matchResult)) {
+    return {
+      identity: matchResult.identity,
+      configDirValue: expandPath(cfg.singleInstanceDir),
+      source: "directory-match",
+    };
+  }
+  if (matchResult && "ambiguous" in matchResult) {
+    console.error(
+      `${cfg.toolName}: cwd matches multiple identities [${matchResult.candidates
+        .map((c) => c.name)
+        .join(", ")}] - launching the shared instance without a default; use /ais inside the app to pick one.`,
+    );
+  }
+
+  // (d) no seed - launch the shared instance plain.
+  return { identity: undefined, configDirValue: expandPath(cfg.singleInstanceDir), source: "single-instance" };
 }

@@ -44,13 +44,26 @@ export const KIMI_CONFIG: ToolConfig = {
 // Pi is a multi-provider coding agent. Unlike the provider-specific wrappers
 // above, one Pi identity can hold credentials for several providers at once.
 // PI_CODING_AGENT_DIR is Pi's documented complete profile boundary: auth,
-// settings, extensions and sessions all live underneath it, which makes it a
-// natural fit for AIS's one-config-directory-per-identity model.
+// settings, extensions and sessions all live underneath it.
+//
+// SINGLE-INSTANCE MODE (2026-09-13): pi no longer proxies per identity. One
+// shared instance (Pi's own default home, ~/.pi/agent) launches without ever
+// prompting for an AIS identity; the AIS pi extension reads the registry
+// below and exposes EVERY identity's credentials as namespaced providers
+// (<provider>--<identity>) with in-app switching (/ais). Per-identity
+// configDirs remain the credential stores (auth.json/models.json) the
+// extension resolves from live - refreshes are written back into the SOURCE
+// identity's auth.json, preserving the one-credential-per-(identity,
+// provider) law. The registered identities below are therefore still the
+// source of truth for credentials, labels and directory patterns; only the
+// launch boundary changed. resolveIdentity never prompts for pi (see
+// resolveSingleInstanceIdentity).
 export const PI_CONFIG: ToolConfig = {
   toolName: "pi",
   realBinaryName: "pi",
   envVarName: "PI_CODING_AGENT_DIR",
   globalMemoryProjection: "pi-append-file",
+  singleInstanceDir: join(homedir(), ".pi", "agent"),
   identitiesJsonPath: join(homedir(), ".pi", "identities.json"),
   identitiesRootDir: join(homedir(), ".pi", "identities"),
 };
