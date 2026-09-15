@@ -69,17 +69,29 @@ function missingServers(shared: Table, local: Table): Table {
 }
 
 const SANDBOX_KEYS = ["sandbox_mode", "default_permissions", "sandbox_workspace_write"];
-const RUNTIME_SCALARS = [
-  "model", "model_reasoning_effort", "service_tier",
+// Operational limits the wrapper owns: the shared value stays authoritative
+// across launches, even when an identity file carries a stale duplicate.
+const OPERATIONAL_RUNTIME_SCALARS = [
   "model_auto_compact_token_limit", "tool_output_token_limit",
+];
+// User preferences Codex's own pickers persist into the identity's
+// config.toml (the /model picker writes "model" and
+// "model_reasoning_effort"). A shared value only seeds an identity that has
+// never chosen; once a local value exists it always wins, so a picker write
+// survives every later launch.
+const USER_PREFERENCE_RUNTIME_SCALARS = [
+  "model", "model_reasoning_effort", "service_tier",
 ];
 
 function sharedRuntimeProjection(shared: Table, local: Table): Table {
   const defaults: Table = {};
   const nonOpenAiProvider = Object.hasOwn(local, "model_provider") && local.model_provider !== "openai";
-  for (const key of RUNTIME_SCALARS) {
-    if (nonOpenAiProvider && (key === "model" || key === "service_tier")) continue;
+  for (const key of OPERATIONAL_RUNTIME_SCALARS) {
     if (Object.hasOwn(shared, key)) defaults[key] = shared[key];
+  }
+  for (const key of USER_PREFERENCE_RUNTIME_SCALARS) {
+    if (nonOpenAiProvider && (key === "model" || key === "service_tier")) continue;
+    if (!Object.hasOwn(local, key) && Object.hasOwn(shared, key)) defaults[key] = shared[key];
   }
   for (const key of ["agents", "features"]) {
     if (Object.hasOwn(shared, key)) {
@@ -153,9 +165,13 @@ function tomlValue(value: unknown): string {
 
 /**
  * Read per-user MCP and whitelisted runtime/permission defaults on every launch;
- * shared runtime policy is authoritative and identity values are never forwarded.
- * Codex recursively merges the overlay, retaining identity-only fields. MCP
- * transport entries still fill only missing identity fields.
+ * shared operational runtime policy is authoritative and identity values are
+ * never forwarded. Shared user-preference runtime keys (model, reasoning
+ * effort, service tier) only seed identities without a local value, so Codex
+ * picker writes to an identity's config.toml always win from then on; caller
+ * overrides for those keys are never projected either. Codex recursively
+ * merges the overlay, retaining identity-only fields. MCP transport entries
+ * still fill only missing identity fields.
  * A single inline table keeps quoted keys out of Codex's dotted CLI-key parser.
  * Caller overrides follow the projection and retain precedence.
  */
