@@ -2,14 +2,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { chmod } from "node:fs/promises";
 import { runBackup } from "../../scripts/backup.ts";
-import { downloadAssetAtomic, platformKey } from "../installer.ts";
+import { downloadAssetAtomic, platformKey } from "../shared/release-assets.ts";
 import { cyan, dim, green, yellow } from "./colors.ts";
 
-// Everything `ais update` knows how to refresh — "open" is darwin-only (see
+// Everything `ais update` knows how to refresh - "open" is darwin-only (see
 // AGENTS.md's "Chrome profile per identity" section), the rest ship
 // everywhere. Only binaries already present in ~/.local/bin get updated;
 // installing something new that wasn't there before is install.ts/
-// installer.ts's job, not this one's.
+// installer.ts's job, not this one's. aistui rides the same rule: the
+// self-heal in shared/aistui-bin.ts owns the FIRST install, `ais update`
+// only refreshes a copy that is already there.
 const MANAGED_BINARIES = [
   "claude",
   "codex",
@@ -21,6 +23,7 @@ const MANAGED_BINARIES = [
   "opencode",
   ...(process.platform === "darwin" ? ["open"] : []),
   "ais",
+  "aistui",
 ];
 
 export async function runUpdate(): Promise<void> {

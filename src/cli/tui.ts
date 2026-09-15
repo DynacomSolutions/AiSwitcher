@@ -1,9 +1,11 @@
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { existsSync, statSync } from "node:fs";
 import { cyan, dim } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
+import { ensureAistuiBinary, resolveTuiBinary } from "../shared/aistui-bin.ts";
 import { readServerState } from "../server/state.ts";
+
+// resolveTuiBinary moved to shared/aistui-bin.ts (next to the self-heal
+// that consumes it); re-exported here for the historical import sites.
+export { resolveTuiBinary } from "../shared/aistui-bin.ts";
 
 /** `ais tui`: GUARANTEES the console server is running (starting a detached
  * daemon when necessary, same as `ais web start`), then execs the ratatui
@@ -16,10 +18,20 @@ export async function runTuiCommand(_positionals: string[], _flags: Record<strin
   const state = await readServerState();
   const token = state?.token ?? "";
 
-  const bin = resolveTuiBinary();
+  let bin = resolveTuiBinary();
+  let autoInstallError: string | undefined;
+  if (!bin) {
+    // One self-heal attempt: aistui ships in releases now, so a machine
+    // without a local cargo build downloads it once and launches.
+    try {
+      bin = await ensureAistuiBinary();
+    } catch (err) {
+      autoInstallError = err instanceof Error ? err.message : String(err);
+    }
+  }
   if (!bin) {
     throw new CliUsageError(
-      'could not find the aistui binary. Build it with: (cd apps/tui && cargo build --release), or install it to ~/.local/bin/aistui.',
+      `could not find the aistui binary, and the automatic install from the GitHub release failed${autoInstallError ? `: ${autoInstallError}` : ""}. Build it with: (cd apps/tui && cargo build --release), or install it to ~/.local/bin/aistui.`,
     );
   }
 
@@ -33,28 +45,6 @@ export async function runTuiCommand(_positionals: string[], _flags: Record<strin
   });
   const code = await proc.exited;
   if (code !== 0) process.exit(code);
-}
-
-/** Resolves the aistui binary: AIS_TUI_BIN, ~/.local/bin/aistui, then this
- * checkout's cargo target dir. Shared with `ais herdr`'s wrapper (the
- * overview panel is the same binary in --overview mode). */
-export function resolveTuiBinary(): string | undefined {
-  const candidates = [
-    process.env.AIS_TUI_BIN,
-    join(homedir(), ".local", "bin", "aistui"),
-    // Dev checkout: <repo>/apps/tui/target/release/aistui derived from this
-    // file's location (src/cli -> ../../apps/tui).
-    join(import.meta.dir, "..", "..", "apps", "tui", "target", "release", "aistui"),
-    join(import.meta.dir, "..", "..", "..", "apps", "tui", "target", "release", "aistui"),
-  ].filter((p): p is string => typeof p === "string" && p.length > 0);
-  for (const candidate of candidates) {
-    try {
-      if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
-    } catch {
-      // keep probing
-    }
-  }
-  return undefined;
 }
 
 export function describeTuiLaunch(bin: string, port: number): string {
