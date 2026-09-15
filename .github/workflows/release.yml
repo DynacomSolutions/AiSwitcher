@@ -87,8 +87,57 @@ jobs:
             install-${{ matrix.target.name }}
             ais-${{ matrix.target.name }}
 
+  build-tui:
+    # aistui (apps/tui) is a Rust crate, so it cannot ride the bun build
+    # matrix above. Same four release platforms, same <tool>-<platform>
+    # asset convention the installer downloads by (`aistui-darwin-arm64`,
+    # ...), uploaded as separate artifacts so the release job's
+    # artifacts/*/* glob picks them up unchanged. Toolchains per leg:
+    # darwin targets build natively on the org's apple-builder macOS
+    # runners (Apple's toolchain links both the arm64 and x86_64 slices);
+    # linux-x64 builds natively on ubuntu; linux-arm64 needs a cross link
+    # toolchain, and `cross` (pinned Docker toolchain) is the least fragile
+    # CI path for aarch64-unknown-linux-gnu. If a leg ever proves
+    # unreliable, drop it from the matrix and say so here rather than
+    # failing the whole release.
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      matrix:
+        target:
+          - { name: darwin-arm64, triple: aarch64-apple-darwin, runner: apple-builder, builder: cargo }
+          - { name: darwin-x64, triple: x86_64-apple-darwin, runner: apple-builder, builder: cargo }
+          - { name: linux-x64, triple: x86_64-unknown-linux-gnu, runner: ubuntu-latest, builder: cargo }
+          - { name: linux-arm64, triple: aarch64-unknown-linux-gnu, runner: ubuntu-latest, builder: cross }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - name: Install cross (aarch64 cross-link toolchain)
+        if: matrix.target.builder == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build aistui for ${{ matrix.target.name }}
+        working-directory: apps/tui
+        run: |
+          ${{ matrix.target.builder }} build --release --locked --target ${{ matrix.target.triple }}
+          # upload-artifact cannot rename, and the release job uploads each
+          # file under its own basename, so the asset itself must carry the
+          # full aistui-<platform> name.
+          cp target/${{ matrix.target.triple }}/release/aistui ../../aistui-${{ matrix.target.name }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aistui-${{ matrix.target.name }}
+          path: aistui-${{ matrix.target.name }}
+
   release:
-    needs: build
+    needs: [build, build-tui]
     runs-on: ais-public-runners
     permissions:
       contents: write
