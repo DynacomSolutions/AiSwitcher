@@ -81,6 +81,18 @@ src/
                         then ~/.local/bin/herdr. Shared by the herdr bridge, the
                         `ais herdr` wrapper and `ais upgrade`'s herdr row; herdr is
                         never bundled, vendored, or installed by ais
+    release-assets.ts    the one release-download layer: platformKeyFrom/platformKey
+                        ("<os>-<cpu>" mapping), downloadAsset/downloadAssetAtomic
+                        (public <tag>/latest redirect, GH_TOKEN/GITHUB_TOKEN API
+                        path, temp+rename+chmod atomic install, destination
+                        symlink never followed). Consumed by installer.ts,
+                        `ais update` and the aistui self-heal
+    aistui-bin.ts          resolveTuiBinary() (AIS_TUI_BIN > ~/.local/bin/aistui >
+                        dev cargo checkout) + ensureAistuiBinary(): the ONE
+                        self-heal download of aistui-<platform> from the release
+                        matching the running ais (v<pkg.version>, latest-release
+                        fallback), atomic into ~/.local/bin/aistui, no retry loop;
+                        shared by `ais tui` and `ais herdr`'s panel
     exec.ts               Bun.spawn passthrough, signal relay, exit-code parity;
                           also defines IDENTITY_SESSION_MARKER (see below)
     cli-args.ts            strip --identity=/--desktop, detect non-interactive intent
@@ -167,8 +179,8 @@ src/
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`
     update.ts                 `ais update`: re-downloads whichever of claude/codex/grok/kimi/
-                             zai/ali/pi/open/ais are already in ~/.local/bin, via installer.ts's
-                             downloadAssetAtomic
+                             zai/ali/pi/open/ais/aistui are already in ~/.local/bin, via
+                             shared/release-assets.ts's downloadAssetAtomic
     upgrade.ts                 `ais upgrade`: ensures every installed AIS shim has its real
                              CLI installed/upgraded IN PARALLEL (one task per spec;
                               failures never abort siblings) — Claude/Codex/Kimi/Crush/Pi
@@ -327,7 +339,10 @@ src/
     tui.ts                   `ais tui`: ensures the console server is up (reads
                             ~/.ais/web/server.json), then execs the ratatui binary from
                             $AIS_TUI_BIN > ~/.local/bin/aistui > apps/tui/target/release/
-                            aistui, passing AIS_CONSOLE_URL/AIS_CONSOLE_TOKEN via env
+                            aistui, passing AIS_CONSOLE_URL/AIS_CONSOLE_TOKEN via env;
+                            when nothing resolves, ONE self-heal download of
+                            aistui-<platform> from the matching release first
+                            (shared/aistui-bin.ts), original not-found error as fallback
     herdr.ts                 `ais herdr`: create-or-attach the "ais-herdr" tmux session
                             (real herdr client LEFT, `aistui --overview` RIGHT at
                             --panel-width, default 42); --remote=<target> points herdr at
@@ -338,7 +353,9 @@ src/
                             --new recreates, --force overrides the nesting guard
                             (TMUX/HERDR_* env), --tmux-socket=/AIS_TMUX_SOCKET isolates
                             the tmux server; console credentials reach the panel via
-                            `tmux set-environment`, never argv
+                            `tmux set-environment`, never argv; the wrapper and panel
+                            share tui.ts's one-shot aistui self-heal before their
+                            not-found error
   claude.ts            entrypoint: ToolConfig for claude, calls runWrapper
   codex.ts             entrypoint: ToolConfig for codex, calls runWrapper
   grok.ts              entrypoint: ToolConfig for grok, calls runWrapper
@@ -3121,6 +3138,34 @@ Decisions are final by design; the reasoning is recorded here.
   attribution via the marker env var, same shape as the herdr detection).
 
 ## Commands
+
+### aistui ships in releases; `ais tui`/`ais herdr` self-heal (2026-09-15)
+
+- release.yml builds the Rust TUI alongside the bun binaries:
+  `aistui-darwin-arm64`/`aistui-darwin-x64` (aarch64-apple-darwin and
+  x86_64-apple-darwin, natively on the org's `apple-builder` macOS runners),
+  `aistui-linux-x64` (x86_64-unknown-linux-gnu on ubuntu) and
+  `aistui-linux-arm64` (aarch64-unknown-linux-gnu via `cross`, the pinned
+  Docker toolchain being the least fragile CI path for that target). Same
+  `<tool>-<platform>` asset convention the installer downloads by.
+- The installer binary fetches `aistui-<platform>` during fresh installs. It
+  is the one tolerated failure: releases older than aistui have no such
+  asset, so a miss is a warning, never an install error.
+- First `ais tui` / `ais herdr` on a machine without the binary self-heals
+  (shared/aistui-bin.ts `ensureAistuiBinary()`): download `aistui-<platform>`
+  from the release matching the RUNNING ais (`v<pkg.version>`; latest release
+  as fallback when that tag predates aistui), install atomically into
+  `~/.local/bin/aistui` (temp file, chmod 755, rename, destination symlink
+  never followed), then launch. ONE attempt per tag per invocation, no retry
+  loop; if the download fails the historical not-found error returns with
+  the reason attached.
+- Resolution order is unchanged: `AIS_TUI_BIN` > `~/.local/bin/aistui` >
+  dev cargo checkout (`apps/tui/target/release/aistui`). Dev checkouts never
+  download. `ais update` refreshes an already-installed aistui like every
+  other managed binary (and never installs a first copy itself).
+- `bun run install:shims` (scripts/install.ts) still installs dist/ binaries
+  only: aistui is a Rust artifact, not a bun compile output, so dev machines
+  get it via `cargo build --release` in apps/tui (or the self-heal above).
 
 ### `ais tui` status page (2026-09-10)
 
