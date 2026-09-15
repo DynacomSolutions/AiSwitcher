@@ -499,7 +499,7 @@ enabled = true
     expect(parseToml(await readFile(join(identity, "config.toml"), "utf8"))).toEqual({
       model: "shared-model", model_reasoning_effort: "high", service_tier: "fast",
     });
-    expect(await readdir(join(home, ".codex"))).toEqual(["config.toml", "identities"]);
+    expect((await readdir(join(home, ".codex"))).sort()).toEqual(["config.toml", "identities"]);
   });
 
   test("shared operational limits override local duplicates; user preferences keep local values", async () => {
