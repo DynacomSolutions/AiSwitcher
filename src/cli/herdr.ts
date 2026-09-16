@@ -1,34 +1,36 @@
 import { boolFlag, foldValuedFlags, parseArgs, stringFlag } from "./args.ts";
-import { dim, yellow } from "./colors.ts";
+import { yellow } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
 import { resolveHerdrBinary } from "../shared/herdr-bin.ts";
 import { ensureAistuiBinary, resolveTuiBinary } from "../shared/aistui-bin.ts";
 
 /**
- * `ais herdr`: a tmux-based wrapper around the third-party herdr client.
- * The LEFT pane runs the real `herdr` binary (never bundled with ais: it is
- * resolved from PATH / ~/.local/bin / AIS_HERDR_BIN at run time, so herdr
- * updates stay independent); the RIGHT pane runs `aistui --overview`, a
- * compact responsive identity/limits/cost panel that highlights the
- * identities whose herdr panes are open on the left (the focused pane's
- * identity most strongly) via /api/herdr-bridge.
+ * `ais herdr`: the native wrapper around the third-party herdr client.
+ * The wrapper EXECUTES `aistui herdr` (the Rust TUI under apps/tui), which
+ * embeds the real herdr client in a PTY on the LEFT and renders the
+ * identity/limits/cost overview natively on the RIGHT. No tmux, no nested
+ * multiplexer: one binary owns the whole screen.
  *
- * Remote support: `--remote=<ssh-target>` points the LEFT pane at a remote
- * herdr server (`herdr --remote <target>`). The right panel then defaults
- * to LOCAL ais data with the highlight source honestly disabled (the local
- * bridge describes local panes, not the remote ones on screen);
- * `--remote-ais` additionally mirrors the remote machine's console through
- * an `ssh -L` tunnel run by the hidden `__herdr_panel` subcommand, so the
- * panel and highlights reflect the remote ais. When the remote turns out
- * to have no reachable ais console, the panel falls back to local data and
- * says so in a note line - never a fabricated remote view.
+ * herdr itself is never bundled with ais: it is resolved from PATH /
+ * ~/.local/bin / AIS_HERDR_BIN at run time and handed to aistui via
+ * --herdr-bin, so herdr updates stay independent.
+ *
+ * Remote support: `--remote=<ssh-target>` makes the embedded child run
+ * `herdr --remote <target>` (the REAL client runs, so remote sessions need
+ * no wrapper-side magic). The overview then defaults to LOCAL ais data with
+ * highlighting honestly disabled; `--remote-ais` additionally mirrors the
+ * remote machine's console through an `ssh -L` tunnel owned by THIS process
+ * (started before aistui, killed after it exits), so the panel and
+ * highlights reflect the remote ais. When the remote turns out to have no
+ * reachable console, the panel falls back to local data and says so in a
+ * note line - never a fabricated remote view.
  *
  * This command never starts, stops, signals, or configures any herdr
- * process: it only EXECUTES the herdr client inside a tmux pane, exactly
- * like a user typing `herdr` (or `herdr --remote ...`).
+ * process beyond launching the client exactly like a user typing `herdr`
+ * (or `herdr --remote ...`); quitting the wrapper kills only that client,
+ * which is safe because herdr sessions live server-side.
  */
 
-export const HERDR_SESSION = "ais-herdr";
 export const DEFAULT_PANEL_WIDTH = 42;
 export const MIN_PANEL_WIDTH = 16;
 export const MAX_PANEL_WIDTH = 80;
@@ -38,22 +40,29 @@ export const MAX_PANEL_WIDTH = 80;
 export interface HerdrInvocation {
   /** --raw: exec plain herdr with no wrapper (escape hatch). */
   raw: boolean;
-  /** --new: kill any existing wrapper session and recreate it. */
-  recreate: boolean;
-  /** --force: proceed even when already inside a herdr/tmux pane. */
+  /** --force: proceed even when already inside a herdr pane. */
   force: boolean;
   remote?: string;
   /** --remote-ais: mirror the remote machine's console through ssh -L. */
   remoteAis: boolean;
   panelWidth: number;
-  panelCmd?: string;
-  tmuxSocket?: string;
 }
 
 /** herdr's flags that carry a value. These may be written either as
  * --flag=value or the natural --flag value space form (folded before
- * parsing); --raw/--new/--force/--remote-ais stay bare-only booleans. */
-export const HERDR_VALUED_FLAGS = ["remote", "panel-width", "panel-cmd", "tmux-socket"] as const;
+ * parsing); --raw/--force/--remote-ais stay bare-only booleans. */
+export const HERDR_VALUED_FLAGS = ["remote", "panel-width"] as const;
+
+/** The tmux-era flags: removed with the tmux architecture. Each maps to a
+ * short explanation instead of a silent "unknown flag". */
+export const REMOVED_TMUX_FLAGS: Record<string, string> = {
+  new: "there is no persistent session any more: the wrapper is a plain "
+    + "foreground TUI, so just run `ais herdr` again",
+  "panel-cmd": "the overview panel is now rendered natively by aistui and "
+    + "cannot be replaced by an external command",
+  "tmux-socket": "the wrapper no longer uses tmux, so there is no session "
+    + "or socket to isolate",
+};
 
 export function parseHerdrArgs(
   rest: string[],
@@ -62,13 +71,15 @@ export function parseHerdrArgs(
   if (rest.length > 0) {
     throw new CliUsageError(`unexpected argument "${rest[0]}": ais herdr takes no positionals`);
   }
+  for (const [flag, hint] of Object.entries(REMOVED_TMUX_FLAGS)) {
+    if (flag in flags) {
+      throw new CliUsageError(`--${flag} is gone: the wrapper no longer uses tmux. ${hint}`);
+    }
+  }
   const raw = boolFlag(flags, "raw");
-  const recreate = boolFlag(flags, "new");
   const force = boolFlag(flags, "force");
   const remote = stringFlag(flags, "remote");
   const remoteAis = boolFlag(flags, "remote-ais");
-  const panelCmd = stringFlag(flags, "panel-cmd");
-  const tmuxSocket = stringFlag(flags, "tmux-socket");
   let panelWidth = DEFAULT_PANEL_WIDTH;
   const widthRaw = stringFlag(flags, "panel-width");
   if (widthRaw !== undefined) {
@@ -85,13 +96,10 @@ export function parseHerdrArgs(
   }
   return {
     raw,
-    recreate,
     force,
     ...(remote !== undefined ? { remote } : {}),
     remoteAis,
     panelWidth,
-    ...(panelCmd !== undefined ? { panelCmd } : {}),
-    ...(tmuxSocket !== undefined ? { tmuxSocket } : {}),
   };
 }
 
@@ -103,144 +111,13 @@ export function insideHerdrPane(env: NodeJS.ProcessEnv): boolean {
   return Object.keys(env).some((key) => key.startsWith("HERDR_"));
 }
 
-/** Nesting guard: tmux inside a herdr pane (or inside tmux) is a foot-gun.
- * herdr's own panes carry HERDR_* env vars (verified live: HERDR_PANE_ID,
- * HERDR_WORKSPACE_ID, ...), tmux sets TMUX. */
-export function nestingConflict(env: NodeJS.ProcessEnv): "tmux" | "herdr" | undefined {
-  if (env.TMUX) return "tmux";
+/** Nesting guard: a herdr wrapper inside a herdr pane is a foot-gun (the
+ * inner client would attach inside the outer client's pane). tmux is
+ * deliberately NOT a conflict any more: the wrapper is a plain TUI and runs
+ * fine inside tmux, ssh, or anything else that gives it a PTY. */
+export function nestingConflict(env: NodeJS.ProcessEnv): "herdr" | undefined {
   if (insideHerdrPane(env)) return "herdr";
   return undefined;
-}
-
-/* ------------------------------- pane commands ----------------------------- */
-
-/** Single-quote for /bin/sh, the only consumer of pane commands. Values
- * made only of shell-safe characters (paths, --flags) stay readable; any
- * other character forces quoting. */
-export function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_\-@%+=:,./~]+$/.test(value)) return value;
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-export function shellJoin(argv: string[]): string {
-  return argv.map(shellQuote).join(" ");
-}
-
-/** The LEFT pane: plain `herdr`, attaching its default session; with
- * `--remote`, the remote form (`herdr --remote <target>`, verified against
- * herdr 0.8.2's own usage). */
-export function leftPaneCommand(herdrPath: string, remote?: string): string {
-  const argv = remote ? [herdrPath, "--remote", remote] : [herdrPath];
-  return shellJoin(argv);
-}
-
-/** The RIGHT pane command for the plain (non --panel-cmd) cases. */
-export function rightPaneCommand(opts: {
-  tuiPath: string;
-  panelCmd?: string;
-  aisEntrypoint?: string[];
-  remoteAis?: boolean;
-  remote?: string;
-}): string {
-  if (opts.panelCmd) return opts.panelCmd;
-  if (opts.remoteAis && opts.remote && opts.aisEntrypoint) {
-    // The panel subcommand owns the tunnel + env for its aistui child and
-    // dies with the pane, so the tunnel never outlives the session.
-    return shellJoin([...opts.aisEntrypoint, "__herdr_panel", `--remote=${opts.remote}`]);
-  }
-  return `${shellQuote(opts.tuiPath)} --overview`;
-}
-
-/* -------------------------------- tmux steps ------------------------------- */
-
-export interface TmuxStep {
-  label: string;
-  args: string[];
-}
-
-export function socketArgs(socket?: string): string[] {
-  return socket ? ["-L", socket] : [];
-}
-
-export function hasSessionArgs(socket?: string): string[] {
-  return [...socketArgs(socket), "has-session", "-t", HERDR_SESSION];
-}
-
-export function killSessionArgs(socket?: string): string[] {
-  return [...socketArgs(socket), "kill-session", "-t", HERDR_SESSION];
-}
-
-export function attachArgs(socket?: string): string[] {
-  return [...socketArgs(socket), "attach-session", "-t", HERDR_SESSION];
-}
-
-export function attachHint(socket?: string): string {
-  const prefix = `tmux${socket ? ` -L ${socket}` : ""}`;
-  return `${prefix} attach -t ${HERDR_SESSION}`;
-}
-
-/** The ordered tmux steps that build the wrapper session: herdr in pane 0
- * (left), the overview split off to the right at the panel width, pane
- * environment carrying the console credentials (never on any argv), the
- * herdr pane kept visible with its dying words if the client exits, and
- * focus left on herdr so the user lands there. */
-export function buildCreateSteps(opts: {
-  inv: HerdrInvocation;
-  left: string;
-  right: string;
-  env: Record<string, string>;
-  cols: number;
-  rows: number;
-}): TmuxStep[] {
-  const steps: TmuxStep[] = [
-    {
-      label: "new-session",
-      args: [
-        "new-session",
-        "-d",
-        "-s",
-        HERDR_SESSION,
-        "-n",
-        HERDR_SESSION,
-        "-x",
-        String(opts.cols),
-        "-y",
-        String(opts.rows),
-        opts.left,
-      ],
-    },
-    // Window option: a dead pane keeps its last output so an honest
-    // failure (e.g. `herdr --remote` against a host without herdr) stays
-    // readable instead of vanishing with the pane.
-    {
-      label: "remain-on-exit",
-      args: ["set-option", "-w", "-t", `${HERDR_SESSION}:0`, "remain-on-exit", "on"],
-    },
-  ];
-  for (const [name, value] of Object.entries(opts.env)) {
-    steps.push({
-      label: `set-environment ${name}`,
-      args: ["set-environment", "-t", HERDR_SESSION, name, value],
-    });
-  }
-  steps.push({
-    label: "split-window",
-    args: [
-      "split-window",
-      "-h",
-      "-d",
-      "-t",
-      `${HERDR_SESSION}:0.0`,
-      "-l",
-      String(opts.inv.panelWidth),
-      opts.right,
-    ],
-  });
-  steps.push({
-    label: "select-pane",
-    args: ["select-pane", "-t", `${HERDR_SESSION}:0.0`],
-  });
-  return steps;
 }
 
 /* ------------------------------ remote console ----------------------------- */
@@ -294,33 +171,48 @@ export async function pickFreePort(): Promise<number> {
   return port;
 }
 
+/* ---------------------------------- exec ----------------------------------- */
+
+/** The aistui argv for the wrapper: subcommand first, then the resolved
+ * herdr path (so the Rust side never re-resolves), then the presentation
+ * flags. Pure for tests. */
+export function wrapperArgv(opts: {
+  herdrPath: string;
+  inv: HerdrInvocation;
+}): string[] {
+  const argv = ["herdr", "--herdr-bin", opts.herdrPath, "--panel-width", String(opts.inv.panelWidth)];
+  if (opts.inv.remote) argv.push("--remote", opts.inv.remote);
+  return argv;
+}
+
 /* ---------------------------------- deps ----------------------------------- */
 
-export interface TmuxRunResult {
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
+export interface Tunnel {
+  kill(): void;
 }
 
 export interface HerdrCommandDeps {
   env: NodeJS.ProcessEnv;
   isInteractive(): boolean;
-  terminalSize(): { cols: number; rows: number };
-  tmuxPath(): string | null;
   herdrPath(): string | null;
   tuiPath(): string | null;
   /** One-shot self-heal when tuiPath() finds nothing: downloads aistui
    * from the matching release into ~/.local/bin; throws with the reason
    * when it cannot. Optional so test fakes without network stay honest. */
   ensureTuiPath?(): Promise<string>;
-  /** argv prefix re-invoking this ais process (compiled binary or dev). */
-  aisEntrypoint(): Promise<string[]>;
   /** Ensures the local console daemon is up; returns its URL. */
   consoleUrl(): Promise<string>;
   consoleToken(): Promise<string>;
-  runTmux(args: string[]): Promise<TmuxRunResult>;
-  /** Full-stdio attach; resolves with tmux's exit code. */
-  attach(args: string[]): Promise<number>;
+  /** ssh-reads the remote console state; throws when ssh fails. */
+  readRemoteState(target: string): Promise<string>;
+  pickFreePort(): Promise<number>;
+  /** Starts the ssh -L tunnel; kill() tears it down. */
+  spawnTunnel(target: string, localPort: number, remotePort: number): Tunnel;
+  /** Probes the tunnelled console; short retries absorb tunnel setup. */
+  verifyTunnel(localPort: number, token: string): Promise<boolean>;
+  /** Runs the wrapper TUI with the given env, full stdio; resolves with
+   * its exit code. */
+  runAistui(argv: string[], env: Record<string, string>): Promise<number>;
   /** Full-stdio raw herdr exec (--raw). */
   execRaw(command: string, args: string[]): Promise<number>;
   log(message: string): void;
@@ -330,20 +222,9 @@ function realDeps(): HerdrCommandDeps {
   return {
     env: process.env,
     isInteractive: () => process.stdin.isTTY === true,
-    terminalSize: () => ({
-      cols: process.stdout.columns ?? 200,
-      rows: process.stdout.rows ?? 50,
-    }),
-    tmuxPath: () => Bun.which("tmux"),
     herdrPath: () => resolveHerdrBinary() ?? null,
     tuiPath: () => resolveTuiBinary() ?? null,
     ensureTuiPath: () => ensureAistuiBinary(),
-    aisEntrypoint: async () => {
-      // Same re-invocation contract as web.ts's detached daemon: compiled
-      // binaries argv IS [exe, ...]; dev runs under bun with a script path.
-      const { aisEntrypoint } = await import("./web.ts");
-      return aisEntrypoint();
-    },
     consoleUrl: async () => {
       const { ensureConsoleRunning } = await import("./web.ts");
       const port = await ensureConsoleRunning();
@@ -353,15 +234,71 @@ function realDeps(): HerdrCommandDeps {
       const { readServerState } = await import("../server/state.ts");
       return (await readServerState())?.token ?? "";
     },
-    runTmux: async (args) => {
-      const proc = Bun.spawn(["tmux", ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-      const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-      const exitCode = await proc.exited;
-      return { exitCode, stdout, stderr };
+    readRemoteState: async (target) => {
+      const proc = Bun.spawn(["ssh", ...remoteStateArgs(target)], {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const timer = setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {
+          // already exited
+        }
+      }, 15_000);
+      timer.unref?.();
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      const code = await proc.exited;
+      clearTimeout(timer);
+      if (code !== 0) {
+        throw new Error(`ssh read of the remote console state failed: ${(stderr || stdout).trim() || `exit ${code}`}`);
+      }
+      return stdout;
     },
-    attach: async (args) => {
-      const proc = Bun.spawn(["tmux", ...args], { stdio: ["inherit", "inherit", "inherit"] });
-      return await proc.exited;
+    pickFreePort,
+    spawnTunnel: (target, localPort, remotePort) => {
+      const proc = Bun.spawn(["ssh", ...tunnelArgs(target, localPort, remotePort)], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      return {
+        kill: () => {
+          try {
+            proc.kill();
+          } catch {
+            // already gone
+          }
+        },
+      };
+    },
+    verifyTunnel: async (localPort, token) => {
+      const url = `http://127.0.0.1:${localPort}/api/status`;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          const response = await fetch(url, {
+            headers: {
+              "X-AIS-Console": "1",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            signal: AbortSignal.timeout(5_000),
+          });
+          if (response.ok) return true;
+        } catch {
+          // tunnel may still be coming up; retry
+        }
+        await Bun.sleep(750);
+      }
+      return false;
+    },
+    runAistui: async (argv, env) => {
+      const { spawnReal } = await import("../shared/exec.ts");
+      const [bin, ...args] = argv;
+      return await spawnReal(bin!, args, env);
     },
     execRaw: async (command, args) => {
       const { spawnReal } = await import("../shared/exec.ts");
@@ -400,9 +337,11 @@ async function requireTuiBinary(deps: {
   );
 }
 
-/** `ais herdr`: create-or-attach the wrapper session. Takes the subcommand's
- * own argv (everything after the "herdr" token) so the space form
- * `--remote <target>` can be folded into `--remote=<target>` pre-parse. */
+/** `ais herdr`: prepare the console data source (local daemon, or the
+ * --remote-ais tunnel), then run the native wrapper TUI in the foreground.
+ * Takes the subcommand's own argv (everything after the "herdr" token) so
+ * the space form `--remote <target>` can be folded into `--remote=<target>`
+ * pre-parse. */
 export async function runHerdrCommand(
   subArgv: string[],
   deps: HerdrCommandDeps = realDeps(),
@@ -421,215 +360,74 @@ export async function runHerdrCommand(
     return;
   }
 
-  const conflict = nestingConflict(deps.env);
-  if (conflict && !inv.force) {
+  // The wrapper is a foreground full-screen TUI: without a terminal there
+  // is nothing to embed herdr into (there is no detachable session any
+  // more), so fail before touching the console or the network.
+  if (!deps.isInteractive()) {
     throw new CliUsageError(
-      `refusing to nest: this shell already runs inside ${conflict === "tmux" ? "a tmux session" : "a herdr pane"} ` +
-        "and ais herdr would open another nested pane manager. Pass --force if you really mean it.",
+      "ais herdr runs an interactive full-screen wrapper and needs a terminal on stdin. Run it from a shell (or use --raw for a plain non-wrapper herdr).",
     );
   }
 
-  const tmux = requireBinary(deps.tmuxPath(), "tmux", "Install tmux (the wrapper is a tmux layout).");
+  const conflict = nestingConflict(deps.env);
+  if (conflict && !inv.force) {
+    throw new CliUsageError(
+      "refusing to nest: this shell already runs inside a herdr pane and ais herdr would open another herdr client inside it. Pass --force if you really mean it.",
+    );
+  }
+
   const herdr = requireBinary(
     deps.herdrPath(),
     "herdr",
     'Install it with "ais upgrade" (herdr is never bundled with ais), or point AIS_HERDR_BIN at it.',
   );
+  const tui = await requireTuiBinary(deps);
 
-  const tmuxBin = (args: string[]) => [tmux, ...args];
-  const exists = await deps.runTmux(hasSessionArgs(inv.tmuxSocket));
-  if (exists.exitCode === 0 && !inv.recreate) {
-    const code = await deps.attach(attachArgs(inv.tmuxSocket));
-    if (code !== 0) process.exit(code);
-    return;
-  }
-  if (exists.exitCode === 0 && inv.recreate) {
-    await deps.runTmux(killSessionArgs(inv.tmuxSocket));
-  }
-
-  let right: string;
-  const env: Record<string, string> = {};
-  if (inv.panelCmd) {
-    if (inv.remoteAis) {
-      deps.log(yellow("warning: --remote-ais is ignored with --panel-cmd (the custom command owns the panel)"));
-    }
-    right = inv.panelCmd;
-  } else if (inv.remoteAis && inv.remote) {
-    // The panel subcommand mirrors the REMOTE console (tunnel inside the
-    // pane) and needs no inherited env.
-    right = rightPaneCommand({
-      tuiPath: "",
-      aisEntrypoint: await deps.aisEntrypoint(),
-      remoteAis: true,
-      remote: inv.remote,
-    });
-  } else {
-    const tui = await requireTuiBinary(deps);
-    right = rightPaneCommand({ tuiPath: tui });
-    env.AIS_CONSOLE_URL = await deps.consoleUrl();
-    const token = await deps.consoleToken();
-    if (token) env.AIS_CONSOLE_TOKEN = token;
-    if (inv.remote) {
-      // Honest degradation: the local bridge describes LOCAL panes, which
-      // are not the ones on screen, so highlighting would be fabricated.
-      env.AIS_OVERVIEW_BRIDGE = "off";
-      env.AIS_OVERVIEW_LABEL = `remote:${inv.remote}`;
-      env.AIS_OVERVIEW_NOTE =
-        `herdr is showing ${inv.remote}; this console is local, so there is no highlight source (use --remote-ais to mirror the remote console)`;
-    }
-  }
-
-  const size = deps.terminalSize();
-  const steps = buildCreateSteps({
-    inv,
-    left: leftPaneCommand(herdr, inv.remote),
-    right,
-    env,
-    cols: Math.max(80, size.cols),
-    rows: Math.max(24, size.rows),
-  });
-  for (const step of steps) {
-    // Socket prefix rides EVERY invocation, including each create step.
-    const result = await deps.runTmux([...socketArgs(inv.tmuxSocket), ...step.args]);
-    if (result.exitCode !== 0) {
-      throw new CliUsageError(
-        `tmux ${step.label} failed (exit ${result.exitCode}): ${result.stderr.trim() || "no stderr"}`,
-      );
-    }
-  }
-
-  if (deps.isInteractive()) {
-    const code = await deps.attach(attachArgs(inv.tmuxSocket));
-    if (code !== 0) process.exit(code);
-    return;
-  }
-  deps.log(
-    `ais herdr: tmux session "${HERDR_SESSION}" created detached (stdin is not a terminal). Attach with: ${dim(attachHint(inv.tmuxSocket))}`,
-  );
-}
-
-/* ------------------------------ panel subcommand --------------------------- */
-
-export interface HerdrPanelDeps {
-  log(message: string): void;
-  /** ssh-reads the remote console state; throws when ssh fails. */
-  readRemoteState(target: string): Promise<string>;
-  pickFreePort(): Promise<number>;
-  /** Starts the ssh -L tunnel; kill() tears it down. */
-  spawnTunnel(target: string, localPort: number, remotePort: number): { kill(): void };
-  /** Probes the tunnelled console; short retries absorb tunnel setup. */
-  verifyTunnel(localPort: number, token: string): Promise<boolean>;
-  /** Local console fallback (ensures the daemon is up). */
-  localConsole(): Promise<{ url: string; token: string }>;
-  tuiPath(): string | null;
-  /** Same one-shot release download self-heal as the wrapper deps. */
-  ensureTuiPath?(): Promise<string>;
-  /** Runs aistui with the given env, full stdio; resolves with its exit. */
-  runTui(tuiPath: string, env: Record<string, string>): Promise<number>;
-}
-
-function realPanelDeps(): HerdrPanelDeps {
-  const tunnels: Array<Bun.Subprocess<"ignore", "ignore", "ignore">> = [];
-  return {
-    log: (message) => console.log(message),
-    readRemoteState: async (target) => {
-      const proc = Bun.spawn(["ssh", ...remoteStateArgs(target)], {
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const timer = setTimeout(() => {
-        try {
-          proc.kill();
-        } catch {
-          // already exited
-        }
-      }, 15_000);
-      timer.unref?.();
-      const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-      ]);
-      const code = await proc.exited;
-      clearTimeout(timer);
-      if (code !== 0) {
-        throw new Error(`ssh read of the remote console state failed: ${(stderr || stdout).trim() || `exit ${code}`}`);
-      }
-      return stdout;
-    },
-    pickFreePort,
-    spawnTunnel: (target, localPort, remotePort) => {
-      const proc = Bun.spawn(["ssh", ...tunnelArgs(target, localPort, remotePort)], {
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      tunnels.push(proc);
-      return {
-        kill: () => {
-          try {
-            proc.kill();
-          } catch {
-            // already gone
-          }
-        },
-      };
-    },
-    verifyTunnel: async (localPort, token) => {
-      const url = `http://127.0.0.1:${localPort}/api/status`;
-      for (let attempt = 0; attempt < 6; attempt++) {
-        try {
-          const response = await fetch(url, {
-            headers: {
-              "X-AIS-Console": "1",
-              ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            },
-            signal: AbortSignal.timeout(5_000),
-          });
-          if (response.ok) return true;
-        } catch {
-          // tunnel may still be coming up; retry
-        }
-        await Bun.sleep(750);
-      }
-      return false;
-    },
-    localConsole: async () => {
-      const { ensureConsoleRunning } = await import("./web.ts");
-      const port = await ensureConsoleRunning();
-      const { readServerState } = await import("../server/state.ts");
-      return { url: `http://127.0.0.1:${port}`, token: (await readServerState())?.token ?? "" };
-    },
-    tuiPath: () => resolveTuiBinary() ?? null,
-    ensureTuiPath: () => ensureAistuiBinary(),
-    runTui: async (tuiPath, env) => {
-      const { spawnReal } = await import("../shared/exec.ts");
-      return await spawnReal(tuiPath, ["--overview"], env);
-    },
+  // Presentation env for the overview panel (consumed by aistui).
+  const env: Record<string, string> = {
+    ...(await baseConsoleEnv(deps)),
   };
+  let tunnel: Tunnel | undefined;
+  if (inv.remote) {
+    env.AIS_OVERVIEW_LABEL = `remote:${inv.remote}`;
+  }
+  if (inv.remote && inv.remoteAis) {
+    tunnel = await mirrorRemoteConsole(deps, inv.remote, env);
+  } else if (inv.remote) {
+    // Honest degradation: the local bridge describes LOCAL panes, which
+    // are not the ones on screen, so highlighting would be fabricated.
+    env.AIS_OVERVIEW_BRIDGE = "off";
+    env.AIS_OVERVIEW_NOTE =
+      `herdr is showing ${inv.remote}; this console is local, so there is no highlight source (use --remote-ais to mirror the remote console)`;
+  }
+
+  const argv = [tui, ...wrapperArgv({ herdrPath: herdr, inv })];
+  let code: number;
+  try {
+    code = await deps.runAistui(argv, env);
+  } finally {
+    // The tunnel's lifetime is exactly this process's wrapper lifetime.
+    tunnel?.kill();
+  }
+  if (code !== 0) process.exit(code);
 }
 
-/** Hidden `ais __herdr_panel --remote=<target>`: runs INSIDE the wrapper's
- * right pane. Mirrors the remote machine's console through an ssh -L
- * tunnel (the pane's lifetime bounds the tunnel's), verifies it, and execs
- * `aistui --overview` against it. Any failure degrades to the LOCAL
- * console with an honest note - the panel never fakes a remote view. */
-export async function runHerdrPanelCommand(
-  rest: string[],
-  flags: Record<string, string | true>,
-  deps: HerdrPanelDeps = realPanelDeps(),
-): Promise<void> {
-  if (rest.length > 0) {
-    throw new CliUsageError(`unexpected argument "${rest[0]}"`);
-  }
-  const remote = stringFlag(flags, "remote");
-  if (!remote) {
-    throw new CliUsageError("__herdr_panel requires --remote=<ssh-target>");
-  }
-  const label = `remote:${remote}`;
-  let env: Record<string, string> | undefined;
-  let tunnel: { kill(): void } | undefined;
+async function baseConsoleEnv(deps: HerdrCommandDeps): Promise<Record<string, string>> {
+  const env: Record<string, string> = { AIS_CONSOLE_URL: await deps.consoleUrl() };
+  const token = await deps.consoleToken();
+  if (token) env.AIS_CONSOLE_TOKEN = token;
+  return env;
+}
 
+/** --remote-ais: mirrors the REMOTE machine's console through an ssh -L
+ * tunnel owned by this process. Any failure degrades to the LOCAL console
+ * with an honest note - the panel never fakes a remote view. Returns the
+ * tunnel to keep alive (undefined when degraded). */
+async function mirrorRemoteConsole(
+  deps: HerdrCommandDeps,
+  remote: string,
+  env: Record<string, string>,
+): Promise<Tunnel | undefined> {
   let state: { port?: number; token?: string } = {};
   let sshError: string | undefined;
   try {
@@ -640,38 +438,28 @@ export async function runHerdrPanelCommand(
 
   if (state.port) {
     const localPort = await deps.pickFreePort();
-    tunnel = deps.spawnTunnel(remote, localPort, state.port);
+    const tunnel = deps.spawnTunnel(remote, localPort, state.port);
     if (await deps.verifyTunnel(localPort, state.token ?? "")) {
-      env = {
-        AIS_CONSOLE_URL: `http://127.0.0.1:${localPort}`,
-        AIS_OVERVIEW_LABEL: label,
-        ...(state.token ? { AIS_CONSOLE_TOKEN: state.token } : {}),
-      };
-    } else {
-      tunnel.kill();
-      tunnel = undefined;
+      env.AIS_CONSOLE_URL = `http://127.0.0.1:${localPort}`;
+      // The remote token must REPLACE the local one (and its absence must
+      // remove it): the panel talks to the remote console now.
+      if (state.token) {
+        env.AIS_CONSOLE_TOKEN = state.token;
+      } else {
+        delete env.AIS_CONSOLE_TOKEN;
+      }
+      // Highlights come from the REMOTE bridge, which IS the server the
+      // embedded herdr client attaches to: no override needed.
+      return tunnel;
     }
+    tunnel.kill();
   }
-  if (!env) {
-    if (state.port === undefined && sshError) {
-      deps.log(yellow(`ais herdr: ${remote} has no readable ais console state (${sshError})`));
-    }
-    const local = await deps.localConsole();
-    env = {
-      AIS_CONSOLE_URL: local.url,
-      AIS_OVERVIEW_LABEL: label,
-      AIS_OVERVIEW_BRIDGE: "off",
-      AIS_OVERVIEW_NOTE: `${remote} has no reachable ais console; showing LOCAL data`,
-      ...(local.token ? { AIS_CONSOLE_TOKEN: local.token } : {}),
-    };
+  if (state.port === undefined && sshError) {
+    deps.log(yellow(`ais herdr: ${remote} has no readable ais console state (${sshError})`));
   }
-
-  const tui = await requireTuiBinary(deps);
-  let code: number;
-  try {
-    code = await deps.runTui(tui, env);
-  } finally {
-    tunnel?.kill();
-  }
-  if (code !== 0) process.exit(code);
+  delete env.AIS_CONSOLE_TOKEN;
+  env.AIS_CONSOLE_URL = await deps.consoleUrl();
+  env.AIS_OVERVIEW_BRIDGE = "off";
+  env.AIS_OVERVIEW_NOTE = `${remote} has no reachable ais console; showing LOCAL data`;
+  return undefined;
 }
