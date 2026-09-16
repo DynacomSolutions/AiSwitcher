@@ -21,6 +21,16 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Fetch the push-event base commit (dangles after a force-push/rollback)
+        if: github.event_name == 'push'
+        env:
+          PRIVACY_BASE_SHA: ${{ github.event.before }}
+        run: |
+          if [ -n "$PRIVACY_BASE_SHA" ] && ! git cat-file -e "${PRIVACY_BASE_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$PRIVACY_BASE_SHA" \
+              || echo "::warning::privacy base $PRIVACY_BASE_SHA unfetchable; privacy-check falls back to scanning the head commit"
+          fi
+
       - name: Check privacy of incoming commits
         env:
           PRIVACY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

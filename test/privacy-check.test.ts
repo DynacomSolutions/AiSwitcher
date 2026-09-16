@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { addedLines, checkLine, loadPrivateTerms, outgoingCommits, rangeCommits, readExternalTerms, scan } from "../scripts/privacy-check.ts";
+import { addedLines, checkLine, ciRevisions, loadPrivateTerms, outgoingCommits, rangeCommits, readExternalTerms, scan } from "../scripts/privacy-check.ts";
 import { installHooks } from "../scripts/install-privacy-hooks.ts";
 
 const directories: string[] = [];
@@ -216,6 +216,30 @@ describe("Git scope", () => {
     const head = record(root, "example\n");
     expect(scan(root, rangeCommits(root, base, head)).map(f => f.rule)).toContain("identifying-home-path");
     expect(rangeCommits(root, zero, head)).toHaveLength(3);
+  });
+
+  test("CI revisions: rollbacks pass trivially, zero base scans the tip", () => {
+    const root = repository(), base = git(root, "rev-parse", "HEAD");
+    const first = record(root, "one\n");
+    const head = record(root, "two\n");
+    // Normal forward push: the incoming range.
+    expect(ciRevisions(root, base, head)).toEqual([first, head]);
+    // ROLLBACK (head is an ancestor of base): no incoming commits, passes.
+    expect(ciRevisions(root, head, base)).toEqual([]);
+    // Branch creation: the head tip.
+    expect(ciRevisions(root, zero, head)).toEqual([head]);
+  });
+
+  test("CI revisions: an unresolvable base degrades to the head tip, never exit-2", () => {
+    const root = repository();
+    record(root, "one\n");
+    const head = record(root, "two\n");
+    // A dangling after-force-push base: valid SHA shape, absent from the clone.
+    const dangling = "a".repeat(39) + "b";
+    expect(ciRevisions(root, dangling, head)).toEqual([head]);
+    // The head tip is still scanned honestly: a violating tip commit fails.
+    const bad = record(root, `${privateHome}\n`);
+    expect(scan(root, ciRevisions(root, dangling, bad)).map(f => f.rule)).toContain("identifying-home-path");
   });
 
   test("outgoing existing, new, multiple and deleted refs", () => {
