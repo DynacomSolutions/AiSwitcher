@@ -403,12 +403,12 @@ describe("runHerdrCommand", () => {
         tuiPath: () => null,
         ensureTuiPath: async () => {
           healCalls++;
-          return "/home/u/.local/bin/aistui";
+          return "/home/user/.local/bin/aistui";
         },
       }),
     );
     expect(healCalls).toBe(1);
-    expect(h.tuiRuns[0]!.argv[0]).toBe("/home/u/.local/bin/aistui");
+    expect(h.tuiRuns[0]!.argv[0]).toBe("/home/user/.local/bin/aistui");
   });
 
   test("aistui unresolvable even after self-heal: error names both the build and the download failure", async () => {
