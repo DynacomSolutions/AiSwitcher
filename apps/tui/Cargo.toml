@@ -7,9 +7,11 @@ edition = "2024"
 anyhow = "1.0.104"
 crossterm = "0.29"
 jiff = "0.2.35"
+portable-pty = "0.9"
 ratatui = "0.30.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+vt100 = "0.16"
