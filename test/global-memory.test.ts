@@ -14,6 +14,7 @@ import {
 import {
   appendGlobalMemory,
   ensureGlobalMemoryFile,
+  piBypassesMemoryProjection,
   projectGlobalMemoryForLaunch,
   readGlobalMemory,
 } from "../src/shared/global-memory.ts";
@@ -56,6 +57,32 @@ describe("AIS global memory", () => {
 
     const pi = await projectGlobalMemoryForLaunch(PI_CONFIG, "/identity", ["-p", "hi"], {}, root);
     expect(pi.argv).toEqual(["--append-system-prompt", path, "-p", "hi"]);
+  });
+
+  test("pi management subcommands bypass the prepend so pi still routes them", async () => {
+    const root = await home();
+    // pi routes package/config/auth subcommands ONLY when argv[0] names them;
+    // a prepended flag turns `pi update --extensions` into a chat launch that
+    // dies with "Unknown option: --extensions" (confirmed live, 2026-09-16).
+    for (const argv of [
+      ["update", "--extensions"],
+      ["update", "self"],
+      ["install", "npm:some-extension"],
+      ["remove", "some-extension"],
+      ["uninstall", "some-extension"],
+      ["list"],
+      ["config"],
+      ["auth", "check"],
+    ]) {
+      const projection = await projectGlobalMemoryForLaunch(PI_CONFIG, "/identity", argv, {}, root);
+      expect(projection.argv).toEqual(argv);
+    }
+    // A chat message that merely STARTS with the word "update" still gets the
+    // projection - bypass keys off argv[0] exactly, like pi's own router.
+    const chat = await projectGlobalMemoryForLaunch(PI_CONFIG, "/identity", ["update the readme"], {}, root);
+    expect(chat.argv[0]).toBe("--append-system-prompt");
+    expect(piBypassesMemoryProjection([])).toBe(false);
+    expect(piBypassesMemoryProjection(["--verbose", "update"])).toBe(false);
   });
 
   test("projects Kimi through its native global AGENTS.md discovery", async () => {

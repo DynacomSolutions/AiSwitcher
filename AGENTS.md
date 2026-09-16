@@ -433,6 +433,15 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   context paths. Any vendor file or config entry created for compatibility is
   a projection only. `ais memory add` is the cross-agent write API. Adding a
   tool without declaring a projection is a type error.
+  - **Pi management subcommands bypass the projection.** Pi routes
+    `install`/`remove`/`uninstall`/`update`/`list`/`config`/`auth` only when
+    the literal argv[0] names them, so the prepend must NOT happen for those:
+    `pi update --extensions` otherwise became a chat launch that died with
+    `Error: Unknown option: --extensions` (confirmed live 2026-09-16).
+    `piBypassesMemoryProjection()` mirrors pi's own argv[0] test exactly -
+    none of these subcommands starts an agent turn, so nothing needs the
+    system prompt. Reproduced and fixed with a sandbox-HOME run through the
+    compiled shim.
 - **No `execve`-style process replacement.** Bun has no non-experimental
   primitive for true process-image replacement, so `src/shared/exec.ts` uses
   `Bun.spawn` with full fd inheritance (`stdio: ["inherit","inherit","inherit"]`)
