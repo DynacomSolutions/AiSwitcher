@@ -96,7 +96,7 @@ interface SpawnedDaemon {
  * must be prepended. Discriminator: a SCRIPT EXTENSION plus on-disk
  * existence; the bunfs path has neither a script extension nor a real
  * directory entry that survives both checks. Shared by the detached
- * daemon spawn and herdr's `__herdr_panel` panes. */
+ * daemon spawn and every wrapper path that re-invokes ais. */
 export function aisEntrypoint(): string[] {
   const main = Bun.main;
   const looksLikeScript = /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(main) && statSyncSafe(main);

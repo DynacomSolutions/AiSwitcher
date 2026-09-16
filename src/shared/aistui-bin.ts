@@ -6,13 +6,14 @@ import { downloadAssetAtomic, platformKey } from "./release-assets.ts";
 
 /**
  * Resolution + one-shot self-heal for the aistui binary (the Rust console
- * TUI under apps/tui). aistui IS shipped in releases (aistui-<platform>,
- * built by release.yml's build-tui job), so a machine that never ran a
- * local cargo build can still get it: when plain resolution finds nothing,
- * ensureAistuiBinary downloads the asset matching the RUNNING ais's own
- * version from the GitHub release, installs it atomically to
- * ~/.local/bin/aistui and hands back the path. Shared by `ais tui` and
- * `ais herdr`'s overview panel (same binary in --overview mode).
+ * TUI under apps/tui: the tabbed dashboard, the --overview panel, and the
+ * native `ais herdr` wrapper in `aistui herdr` mode). aistui IS shipped in
+ * releases (aistui-<platform>, built by release.yml's build-tui job), so a
+ * machine that never ran a local cargo build can still get it: when plain
+ * resolution finds nothing, ensureAistuiBinary downloads the asset matching
+ * the RUNNING ais's own version from the GitHub release, installs it
+ * atomically to ~/.local/bin/aistui and hands back the path. Shared by
+ * `ais tui` and `ais herdr`.
  */
 
 /** Where the self-heal installs to (and the second resolution candidate). */

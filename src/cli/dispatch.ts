@@ -16,7 +16,7 @@ import { migrateLegacyAisHome } from "../shared/migrate-ais-home.ts";
 import { runAuthCommand } from "./auth/dispatch.ts";
 import { runMemoryCommand } from "./memory.ts";
 import { runWebCommand } from "./web.ts";
-import { runHerdrCommand, runHerdrPanelCommand } from "./herdr.ts";
+import { runHerdrCommand } from "./herdr.ts";
 import { runTuiCommand } from "./tui.ts";
 
 export async function runCli(argv: string[]): Promise<void> {
@@ -109,12 +109,6 @@ export async function runCli(argv: string[]): Promise<void> {
         // Raw subcommand argv (not the shared parseArgs output): herdr folds
         // its valued flags' natural space form (--remote <t>) pre-parse.
         return await runHerdrCommand(argv.slice(1));
-      case "__herdr_panel":
-        // Hidden internal command: runs INSIDE the `ais herdr` wrapper's
-        // right pane to mirror a remote console through ssh -L. Never
-        // advertised; not part of the public CLI surface.
-        await runHerdrPanelCommand(rest, flags);
-        break;
       case "auth":
         await runAuthCommand(rest, flags);
         break;
