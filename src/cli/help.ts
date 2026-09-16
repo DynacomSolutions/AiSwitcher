@@ -29,7 +29,7 @@ const COMMANDS: Array<[string, string]> = [
   ["resume [session-id] [--identity=] [--tool=] [--json]", "Interactive tree picker (or direct launch) for resumable sessions"],
   ["web [start|stop|status|open] [--port=] [--foreground]", "Local web console (identities, limits, usage, sessions, auth, files)"],
   ["tui", "Terminal dashboard (ratatui) against the same local console API"],
-  ["herdr [--remote=<ssh-target>] [--remote-ais] [--raw] [--new] [--panel-width=N] [--panel-cmd=<cmd>]", "herdr on the left, the ais usage/limits overview beside it (tmux)"],
+  ["herdr [--remote=<ssh-target>] [--remote-ais] [--raw] [--panel-width=N]", "native wrapper: the real herdr client embedded beside the ais usage/limits overview (no tmux)"],
   ["help", "Show this message"],
 ];
 
@@ -135,28 +135,34 @@ while auth stayed valid and fast throughout — closing those agents fixed it
 immediately. --identity/--tool narrow which identities are probed, same as
 "usage"/"limits".
 
-"herdr" opens herdr with an ais overview beside it: a dedicated "ais-herdr"
-tmux session runs the REAL herdr client on the left and "aistui --overview"
-on the right (a compact, width-responsive panel: every identity's estimated
-cost, session/week limit bars, next reset, spend-guard breaches), reattaching
-to the existing session when there is one. herdr is never bundled, vendored,
-or installed by ais: the wrapper only locates the installed binary (PATH,
-~/.local/bin/herdr, or AIS_HERDR_BIN) and runs it, so herdr updates stay
-independent; "ais upgrade" additionally runs "herdr update" when herdr is
-already installed. The right panel highlights the identities whose herdr
-panes are open on the left (the focused pane's identity most strongly) via
-the daemon's /api/herdr-bridge. Flags: --remote=<ssh-target> points herdr at
-a remote machine's herdr server; the panel then shows LOCAL data with
-highlighting honestly disabled unless --remote-ais also mirrors the remote
-machine's own console over an ssh -L tunnel (no reachable remote console
-degrades to local data with a note, never a fabricated remote view).
---panel-width=N (default 42) sizes the panel, --panel-cmd=<cmd> replaces the
-panel command entirely, --raw execs plain herdr with no wrapper, --new
-recreates the session, --force overrides the nesting guard (refusing to run
-inside an existing tmux/herdr pane by default), and --tmux-socket=<name>
-(or AIS_TMUX_SOCKET) isolates the session on a separate tmux server.
-Run with a non-terminal stdin (e.g. from a script), the session is created
-detached and the attach command is printed instead.`;
+"herdr" opens herdr with an ais overview beside it, with no tmux anywhere:
+"aistui herdr" (a single native binary) embeds the REAL herdr client in a
+PTY on the left and renders the compact, width-responsive overview panel
+natively on the right (every identity's estimated cost, session/week limit
+bars, next reset, spend-guard breaches), with a one-line status bar along
+the bottom showing focus, herdr's state and the remote label. herdr is
+never bundled, vendored, or installed by ais: the wrapper only locates the
+installed binary (PATH, ~/.local/bin/herdr, or AIS_HERDR_BIN) and runs it,
+so herdr updates stay independent; "ais upgrade" additionally runs
+"herdr update" when herdr is already installed. Input model: the herdr side
+owns the keyboard by default (everything, q included, goes to herdr); Tab
+moves focus to the panel (j/k or arrows scroll, r refreshes, q quits the
+wrapper); Ctrl+C always reaches herdr, and pressing it twice within a
+second force-quits the wrapper. When herdr exits, its last frame stays
+visible and r restarts it / q quits. Quitting kills only the herdr CLIENT,
+which is safe: sessions live server-side. The panel highlights the
+identities whose herdr panes are open (the focused pane's identity most
+strongly) via the daemon's /api/herdr-bridge. Flags: --remote=<ssh-target>
+points herdr at a remote machine's herdr server; the panel then shows LOCAL
+data with highlighting honestly disabled unless --remote-ais also mirrors
+the remote machine's own console over an ssh -L tunnel (no reachable remote
+console degrades to local data with a note, never a fabricated remote
+view). --panel-width=N (default 42) sizes the panel (it yields before
+herdr gets squeezed, and disappears on very narrow terminals), --raw execs
+plain herdr with no wrapper, and --force overrides the nesting guard
+(refusing to run inside an existing herdr pane by default; running inside
+tmux is fine and needs no flag). The old tmux flags (--new, --panel-cmd,
+--tmux-socket) are gone with the tmux architecture.`;
 
 // Column width is computed only from commands that actually carry a
 // description — the long, description-less chrome-overrides commands would

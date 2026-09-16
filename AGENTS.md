@@ -343,19 +343,23 @@ src/
                             when nothing resolves, ONE self-heal download of
                             aistui-<platform> from the matching release first
                             (shared/aistui-bin.ts), original not-found error as fallback
-    herdr.ts                 `ais herdr`: create-or-attach the "ais-herdr" tmux session
-                            (real herdr client LEFT, `aistui --overview` RIGHT at
-                            --panel-width, default 42); --remote=<target> points herdr at
-                            a remote herdr server, --remote-ais mirrors the remote
-                            machine's console through the hidden `ais __herdr_panel`
-                            pane subcommand (ssh -L tunnel owned by the pane, honest
-                            local fallback with a note), --raw execs plain herdr,
-                            --new recreates, --force overrides the nesting guard
-                            (TMUX/HERDR_* env), --tmux-socket=/AIS_TMUX_SOCKET isolates
-                            the tmux server; console credentials reach the panel via
-                            `tmux set-environment`, never argv; the wrapper and panel
-                            share tui.ts's one-shot aistui self-heal before their
-                            not-found error
+    herdr.ts                 `ais herdr`: runs the NATIVE wrapper, `aistui herdr`
+                            (apps/tui/src/herdr.rs): the real herdr client embedded
+                            in a PTY on the LEFT, the overview rendered natively on
+                            the RIGHT at --panel-width (default 42), a status bar
+                            below; no tmux anywhere. --remote=<target> points herdr
+                            at a remote herdr server, --remote-ais mirrors the remote
+                            machine's console through an ssh -L tunnel owned by THIS
+                            process (started before aistui, killed in a finally;
+                            honest local fallback with a note), --raw execs plain
+                            herdr, --force overrides the nesting guard (HERDR_* env
+                            only: tmux nesting is fine now the wrapper is a plain
+                            TUI); non-interactive stdin is refused before any side
+                            effects (there is no detachable session any more); the
+                            tmux-era flags --new/--panel-cmd/--tmux-socket are
+                            removed with honest errors; console credentials reach
+                            the panel via env, never argv; shares tui.ts's one-shot
+                            aistui self-heal before its not-found error
   claude.ts            entrypoint: ToolConfig for claude, calls runWrapper
   codex.ts             entrypoint: ToolConfig for codex, calls runWrapper
   grok.ts              entrypoint: ToolConfig for grok, calls runWrapper
