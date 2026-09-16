@@ -140,6 +140,22 @@ function openCodeConfigContent(existing: string | undefined, memoryPath: string)
   return JSON.stringify(config);
 }
 
+/** Pi routes its management subcommands ONLY when the literal first argv
+ * token names them (dist/main.js: runAuthCommand/handlePackageCommand/
+ * handleConfigCommand all test args[0]). Prepending the memory-projection
+ * flag therefore breaks them: `pi update --extensions` launched as
+ * `pi --append-system-prompt <memory> update --extensions` is parsed as a
+ * CHAT invocation whose message is "update" and whose unknown extension
+ * flag --extensions dies with "Error: Unknown option: --extensions"
+ * (confirmed live, 2026-09-16). These subcommands are administrative -
+ * none of them starts an agent turn - so they need no system-prompt
+ * projection at all. Mirror pi's own routing test exactly: first token,
+ * not first non-flag token (pi does NOT route `pi --verbose update`). */
+export function piBypassesMemoryProjection(argv: readonly string[]): boolean {
+  const PI_MANAGEMENT_SUBCOMMANDS = ["install", "remove", "uninstall", "update", "list", "config", "auth"];
+  return argv.length > 0 && PI_MANAGEMENT_SUBCOMMANDS.includes(argv[0]!);
+}
+
 /** Project the one AIS-owned memory file through each tool's supported
  * native instruction channel. No adapter creates another writable store. */
 export async function projectGlobalMemoryForLaunch(
@@ -163,6 +179,9 @@ export async function projectGlobalMemoryForLaunch(
       await ensureKimiProjection(memoryPath, home);
       return { argv: [...argv], env: {}, memoryPath };
     case "pi-append-file":
+      // Management subcommands must stay at argv[0] or pi misroutes them
+      // into chat mode - see piBypassesMemoryProjection.
+      if (piBypassesMemoryProjection(argv)) return { argv: [...argv], env: {}, memoryPath };
       return { argv: ["--append-system-prompt", memoryPath, ...argv], env: {}, memoryPath };
     case "opencode-config-content":
       return {
