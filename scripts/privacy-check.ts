@@ -162,6 +162,37 @@ export function rangeCommits(root: string, base: string, head: string): string[]
   return git(root, ["rev-list", "--reverse", "--topo-order", ...args]).trim().split("\n").filter(Boolean);
 }
 
+/**
+ * CI-mode revision selection, hardened for force-pushes and rollbacks.
+ *
+ * A push event's `before` SHA can be UNRESOLVABLE in the runner's clone:
+ * after a force-push/rollback the old tip dangles on no ref, and even a
+ * full-history fetch only brings ref-reachable objects. Semantics:
+ * - zero base (branch creation): scan the head tip.
+ * - base resolvable: the normal `base..head` incoming range. A ROLLBACK
+ *   (head an ancestor of base) yields the empty range and passes trivially:
+ *   rewinding a branch brings no incoming commits.
+ * - base unresolvable: warn and scan the head tip commit only. A rollback's
+ *   tip already passed this gate when it originally landed; brand-new tip
+ *   content is still scanned. The workflow tries an explicit
+ *   `git fetch origin <before>` first (GitHub serves retained dangling
+ *   SHAs), so this fallback is the rare case and the warning keeps it
+ *   visible in the run log rather than failing the run with exit 2.
+ */
+export function ciRevisions(root: string, base: string, head: string): string[] {
+  const tip = commit(root, head);
+  if (zero(base)) return [tip];
+  try {
+    commit(root, base);
+  } catch {
+    console.error(
+      `privacy-check: base ${base} is not present in this clone (dangling after a force-push/rollback?); scanning the head commit only`,
+    );
+    return [tip];
+  }
+  return rangeCommits(root, base, head);
+}
+
 export function outgoingCommits(root: string, input: string, remote: string): string[] {
   const selected = new Set<string>();
   let remoteTips: string[] | undefined;
@@ -238,7 +269,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
       const base = process.env.PRIVACY_BASE_SHA;
       const head = process.env.PRIVACY_HEAD_SHA;
       if (!base || !head) fail();
-      revisions = rangeCommits(root, sha(base), sha(head));
+      revisions = ciRevisions(root, sha(base), sha(head));
     } else if (local && clean.length === 3 && clean[0] === "--pre-push") {
       revisions = outgoingCommits(root, await Bun.stdin.text(), clean[1]!);
     } else return fail();
