@@ -6,10 +6,11 @@
  * `$PI_CODING_AGENT_DIR/extensions/ais-identity.ts`, which Pi auto-discovers
  * and loads via jiti (TypeScript needs no compilation). This file must stay a
  * self-contained single module: the installed copy cannot resolve sibling
- * imports. Runtime imports are node: builtins plus `@earendil-works/pi-ai`,
- * which Pi's extension loader aliases to its OWN bundled copy in every
- * runtime mode (dist/core/extensions/loader.js), so the version always
- * matches the running pi.
+ * imports. Runtime imports are node: builtins plus `@earendil-works/pi-ai`
+ * and `@earendil-works/pi-tui`, both of which Pi's extension loader aliases
+ * to its OWN bundled copies in every runtime mode
+ * (dist/core/extensions/loader.js), so the versions always match the running
+ * pi.
  *
  * SINGLE-INSTANCE MODE (v2, 2026-09-13): pi no longer proxies per AIS
  * identity. One shared pi instance exposes EVERY identity from
@@ -26,7 +27,10 @@
  * - A persistent footer status (`ctx.ui.setStatus`) showing the AIS identity
  *   LABEL (e.g. "Personal", not "personal"), provider and model in use.
  * - `/ais` - an INTERACTIVE SWITCHER: pick an identity (by display label),
- *   then pick one of its models; the session switches immediately.
+ *   then pick one of its models; the session switches immediately. Both
+ *   pickers are TYPE-TO-SEARCH (a custom pi-tui component: substring filter,
+ *   arrow keys, enter to accept, esc to cancel), falling back to the plain
+ *   selector on hosts without `ctx.ui.custom`.
  * - `/ais show` - the context widget panel: active identity, its providers,
  *   credential types, model counts and honest gap notes.
  * - `/ais use [<identity> ]<provider>[/<model>]` - non-interactive switch.
@@ -45,10 +49,11 @@ import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { stream as compatStream, streamSimple as compatStreamSimple } from "@earendil-works/pi-ai/compat";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 /** Version stamp the installer matches against; bump to force a refresh of
  * installed copies on next launch. */
-export const AIS_EXTENSION_VERSION = "2.0.0";
+export const AIS_EXTENSION_VERSION = "2.1.0";
 
 export const STATUS_KEY = "ais";
 export const WIDGET_KEY = "ais";
@@ -89,11 +94,33 @@ interface ModelRegistrySubset {
   getProviderDisplayName(provider: string): string;
 }
 
+/** The structural slice of pi's custom-component contract this file needs:
+ * pi's `Component` is render(width) + invalidate(), and a focused dialog
+ * receives raw terminal bytes through `handleInput`. */
+export interface SearchableComponent {
+  render(width: number): string[];
+  handleInput(data: string): void;
+  invalidate(): void;
+}
+
+/** Minimal stand-in for pi's TUI handle: we only ever ask for a re-render
+ * after mutating picker state. */
+export interface RenderRequester {
+  requestRender(): void;
+}
+
 interface UiSubset {
   notify(message: string, type?: "info" | "warning" | "error"): void;
   setStatus(key: string, text: string | undefined): void;
   setWidget(key: string, content: readonly string[] | undefined): void;
   select?(title: string, options: string[]): Promise<string | undefined>;
+  /** pi's custom dialog: factory receives (tui, theme, keybindings, done) and
+   * returns a focused component. theme/keybindings are opaque here - the
+   * picker renders plain text. */
+  custom?<T>(
+    factory: (tui: RenderRequester, theme: unknown, keybindings: unknown, done: (result: T) => void) => SearchableComponent,
+    options?: unknown,
+  ): Promise<T>;
 }
 
 export interface ExtensionContextSubset {
@@ -656,6 +683,144 @@ export function currentIdentityName(): string | undefined {
   return value !== undefined && value.length > 0 ? value : undefined;
 }
 
+/** Pure: which option indices match a type-to-search query. Whitespace-
+ * separated tokens must ALL appear (case-insensitive substring, any order);
+ * an empty query matches everything in original order. */
+export function filterOptionIndices(query: string, options: readonly string[]): number[] {
+  const tokens = query.toLowerCase().split(/\s+/).filter((token) => token.length > 0);
+  const matches: number[] = [];
+  for (let index = 0; index < options.length; index++) {
+    const haystack = options[index]!.toLowerCase();
+    if (tokens.every((token) => haystack.includes(token))) matches.push(index);
+  }
+  return matches;
+}
+
+/** Type-to-search selector rendered through pi's `ctx.ui.custom`. Keys:
+ * printable input filters, backspace edits, up/down (and pageUp/pageDown)
+ * move, enter accepts the highlighted ORIGINAL option string, esc cancels.
+ * Inert after completion so late input can never resolve twice. */
+export class SearchableSelect {
+  static readonly MAX_VISIBLE_ROWS = 12;
+  private query = "";
+  private selected = 0;
+  private windowStart = 0;
+  private finished = false;
+  private cachedWidth: number | undefined;
+  private cachedLines: string[] | undefined;
+
+  constructor(
+    private readonly title: string,
+    private readonly options: readonly string[],
+    private readonly finish: (value: string | undefined) => void,
+  ) {}
+
+  handleInput(data: string): void {
+    if (this.finished) return;
+    if (matchesKey(data, Key.escape)) {
+      this.complete(undefined);
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      const match = this.filtered()[this.selected];
+      if (match !== undefined) this.complete(this.options[match]);
+      return;
+    }
+    if (matchesKey(data, Key.up)) {
+      this.moveSelection(-1);
+      return;
+    }
+    if (matchesKey(data, Key.down)) {
+      this.moveSelection(1);
+      return;
+    }
+    if (matchesKey(data, Key.pageUp)) {
+      this.moveSelection(-SearchableSelect.MAX_VISIBLE_ROWS);
+      return;
+    }
+    if (matchesKey(data, Key.pageDown)) {
+      this.moveSelection(SearchableSelect.MAX_VISIBLE_ROWS);
+      return;
+    }
+    if (matchesKey(data, Key.backspace)) {
+      this.query = [...this.query].slice(0, -1).join("");
+      this.resetSelection();
+      return;
+    }
+    // Unrecognised escape sequences (modifier combos, cursor moves we do not
+    // map) are ignored rather than typed as literal garbage.
+    if (data.includes("\u001b") || data.includes("\u007f")) return;
+    // Everything else is typed text (including bracketed-paste chunks);
+    // strip C0/C1 controls so only printable characters reach the query.
+    const text = data.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+    if (text.length > 0) {
+      this.query += text;
+      this.resetSelection();
+    }
+  }
+
+  render(width: number): string[] {
+    if (this.cachedLines !== undefined && this.cachedWidth === width) return this.cachedLines;
+    const matches = this.filtered();
+    if (this.selected >= matches.length) this.selected = Math.max(matches.length - 1, 0);
+    this.scrollIntoView(matches.length);
+    const lines: string[] = [truncateToWidth(this.title, width), truncateToWidth(`Search: ${this.query}\u2588`, width)];
+    if (matches.length === 0) {
+      lines.push(truncateToWidth("  (no matches - keep typing, or esc to cancel)", width));
+    } else {
+      const visible = matches.slice(this.windowStart, this.windowStart + SearchableSelect.MAX_VISIBLE_ROWS);
+      visible.forEach((optionIndex, row) => {
+        const marker = this.windowStart + row === this.selected ? "> " : "  ";
+        lines.push(truncateToWidth(marker + this.options[optionIndex]!, width));
+      });
+    }
+    lines.push(
+      truncateToWidth(
+        `${matches.length}/${this.options.length} \u00b7 type to search \u00b7 enter select \u00b7 esc cancel`,
+        width,
+      ),
+    );
+    this.cachedWidth = width;
+    this.cachedLines = lines;
+    return lines;
+  }
+
+  invalidate(): void {
+    this.cachedWidth = undefined;
+    this.cachedLines = undefined;
+  }
+
+  private filtered(): number[] {
+    return filterOptionIndices(this.query, this.options);
+  }
+
+  private moveSelection(delta: number): void {
+    const count = this.filtered().length;
+    if (count === 0) return;
+    this.selected = Math.min(Math.max(this.selected + delta, 0), count - 1);
+    this.scrollIntoView(count);
+    this.invalidate();
+  }
+
+  private scrollIntoView(count: number): void {
+    const max = SearchableSelect.MAX_VISIBLE_ROWS;
+    if (this.selected < this.windowStart) this.windowStart = this.selected;
+    if (this.selected >= this.windowStart + max) this.windowStart = this.selected - max + 1;
+    this.windowStart = Math.min(Math.max(this.windowStart, 0), Math.max(count - max, 0));
+  }
+
+  private resetSelection(): void {
+    this.selected = 0;
+    this.windowStart = 0;
+    this.invalidate();
+  }
+
+  private complete(value: string | undefined): void {
+    this.finished = true;
+    this.finish(value);
+  }
+}
+
 /** Pure: footer status. Uses the identity's REAL display label ("Personal",
  * not "personal") and shows the base provider for namespaced models. */
 export function statusLine(identityLabel: string | undefined, model: AiModel | undefined): string {
@@ -1148,21 +1313,52 @@ export default async function aisIdentityExtension(
 
   // -- interactive switcher (/ais) -------------------------------------------
 
+  /** Pick one option by index: searchable custom dialog when the host
+   * provides `ctx.ui.custom` (every interactive pi does), else the plain
+   * selector, else nothing. Returns the index into `options`, or undefined
+   * when the user cancelled. */
+  const pickOption = async (
+    ctx: ExtensionContextSubset,
+    title: string,
+    options: readonly string[],
+  ): Promise<number | undefined> => {
+    const list = [...options];
+    if (typeof ctx.ui.custom === "function") {
+      const picked = await ctx.ui.custom<string | undefined>((tui, _theme, _keybindings, done) => {
+        const picker = new SearchableSelect(title, list, done);
+        return {
+          render: (width: number) => picker.render(width),
+          handleInput: (data: string) => {
+            picker.handleInput(data);
+            tui.requestRender();
+          },
+          invalidate: () => picker.invalidate(),
+        };
+      });
+      return picked === undefined ? undefined : list.indexOf(picked);
+    }
+    if (typeof ctx.ui.select === "function") {
+      const picked = await ctx.ui.select(title, list);
+      return picked === undefined ? undefined : list.indexOf(picked);
+    }
+    return undefined;
+  };
+
   const runSwitcher = async (ctx: ExtensionContextSubset): Promise<void> => {
     if (identities.length === 0) {
       ctx.ui.notify("ais: no identities in ~/.pi/identities.json - nothing to switch to", "warning");
       return;
     }
-    if (!ctx.hasUI || typeof ctx.ui.select !== "function") {
+    if (!ctx.hasUI || (typeof ctx.ui.custom !== "function" && typeof ctx.ui.select !== "function")) {
       showIdentitiesWidget(ctx);
       return;
     }
     const labels = identities.map((identity) =>
       identity.name === activeIdentity ? `${identity.label} (current)` : identity.label,
     );
-    const pickedLabel = await ctx.ui.select("Switch AIS identity:", labels);
-    if (pickedLabel === undefined) return;
-    const picked = identities[labels.indexOf(pickedLabel)];
+    const pickedIndex = await pickOption(ctx, "Switch AIS identity:", labels);
+    if (pickedIndex === undefined) return;
+    const picked = identities[pickedIndex];
     if (!picked) return;
     activeIdentity = picked.name;
 
@@ -1189,13 +1385,13 @@ export default async function aisIdentityExtension(
         options[0] = `${options[0]} (last used)`;
       }
     }
-    const pickedOption = await ctx.ui.select(`Model for ${picked.label}:`, options);
-    if (pickedOption === undefined) {
+    const pickedIndexModel = await pickOption(ctx, `Model for ${picked.label}:`, options);
+    if (pickedIndexModel === undefined) {
       persistState();
       showStatus(ctx, ctx.model);
       return;
     }
-    const model = catalog[options.indexOf(pickedOption)];
+    const model = catalog[pickedIndexModel];
     if (!model) return;
     await applyModel(ctx, model, picked.label);
   };
@@ -1210,6 +1406,10 @@ export default async function aisIdentityExtension(
       return;
     }
     showStatus(ctx, model);
+    // Persist the switch immediately; real pi also fires model_select right
+    // after, whose handler writes again - idempotent, and this keeps state
+    // correct even if a host ever swallows the event.
+    persistState();
     ctx.ui.notify(`switched to ${label}: ${baseProviderOf(model.provider)}/${model.id} for this session`, "info");
   };
 

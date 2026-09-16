@@ -5,6 +5,7 @@ import aisIdentityExtension, {
   baseProviderOf,
   buildIdentityListings,
   buildProviderRows,
+  filterOptionIndices,
   findModelInCatalog,
   formatIdentityTable,
   formatProviderTable,
@@ -20,6 +21,7 @@ import aisIdentityExtension, {
   pickDefaultIdentityName,
   readAisState,
   resolveModel,
+  SearchableSelect,
   settingsWithDefaultModel,
   statusLine,
   type AiModel,
@@ -27,6 +29,8 @@ import aisIdentityExtension, {
   type ExtensionApiSubset,
   type ExtensionContextSubset,
   type RegistryIdentity,
+  type RenderRequester,
+  type SearchableComponent,
 } from "../../src/pi-extension/ais-identity-extension.ts";
 import { EXTENSION_SOURCE_TEXT } from "../../src/identities/pi-extension-install.ts";
 
@@ -38,6 +42,15 @@ const glm: AiModel = { id: "glm-4.6", provider: "zai", name: "GLM 4.6" };
 const codex: AiModel = { id: "gpt-5.6-luna", provider: "openai-codex", name: "GPT-5.6 Luna" };
 
 const HOME = "/home/example";
+
+// Raw terminal key data as pi's TUI delivers it to a focused custom component.
+const KEY = {
+  up: "\u001b[A",
+  down: "\u001b[B",
+  enter: "\r",
+  escape: "\u001b",
+  backspace: "\u007f",
+} as const;
 
 const REGISTRY = {
   version: 1,
@@ -403,6 +416,10 @@ function harness(options: {
   natives?: unknown[];
   setModelResult?: boolean;
   selectResponses?: Array<string | undefined>;
+  /** Scripted raw key data per `ctx.ui.custom` dialog. Providing this enables
+   * the fake `custom`; without it the harness omits `custom` entirely so the
+   * extension takes its `select` fallback path. */
+  customKeys?: string[][];
   argv?: string[];
 }) {
   const registered: RegisteredProvider[] = [];
@@ -412,6 +429,8 @@ function harness(options: {
   let setModelResult = options.setModelResult ?? true;
   const selectResponses = [...(options.selectResponses ?? [])];
   const selectCalls: Array<{ title: string; options: string[] }> = [];
+  const customKeys = [...(options.customKeys ?? [])];
+  const customCalls: Array<{ keys: string[]; component: SearchableComponent }> = [];
 
   const handlers = new Map<string, (event: never, ctx: ExtensionContextSubset) => unknown>();
   const commands = new Map<string, { description?: string; handler: (args: string, ctx: ExtensionContextSubset) => unknown }>();
@@ -440,6 +459,27 @@ function harness(options: {
         selectCalls.push({ title, options: opts });
         return selectResponses.shift();
       },
+      ...(options.customKeys !== undefined
+        ? {
+            custom: async <T,>(
+              factory: (tui: RenderRequester, theme: unknown, keybindings: unknown, done: (result: T) => void) => SearchableComponent,
+            ): Promise<T> => {
+              const keys = customKeys.shift() ?? [];
+              let result: T | undefined;
+              let finished = false;
+              const component = factory({ requestRender() {} }, {}, {}, (value: T) => {
+                result = value;
+                finished = true;
+              });
+              customCalls.push({ keys, component });
+              for (const key of keys) {
+                component.handleInput(key);
+                if (finished) break;
+              }
+              return result as T;
+            },
+          }
+        : {}),
     },
     ...(options.ctx ?? {}),
   };
@@ -495,6 +535,7 @@ function harness(options: {
     statuses,
     notes,
     selectCalls,
+    customCalls,
     handlers,
     commands,
   };
@@ -601,6 +642,52 @@ describe("/ais command behaviour", () => {
     await h.commands.get("ais")?.handler("", h.ctx);
     expect(h.setModelCalls).toHaveLength(0);
     expect(h.selectCalls).toHaveLength(1);
+  });
+
+  test("/ais searchable switcher: typed filters pick identity then model via ctx.ui.custom", async () => {
+    const h = harness({ customKeys: [["w", "o", "r", "k", KEY.enter], ["l", "u", "n", "a", KEY.enter]] });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    h.setModelCalls.length = 0;
+    await h.commands.get("ais")?.handler("", h.ctx);
+    expect(h.customCalls).toHaveLength(2);
+    expect(h.selectCalls).toHaveLength(0);
+    expect(h.setModelCalls.at(-1)).toMatchObject({ provider: "openai-codex--work", id: "gpt-5.6-luna" });
+    const stateWrite = h.writes.filter((w) => w.path.endsWith("/ais-state.json")).at(-1);
+    expect((stateWrite?.data as { activeIdentity?: string }).activeIdentity).toBe("work");
+  });
+
+  test("esc at the identity step cancels the whole switcher", async () => {
+    const h = harness({ customKeys: [[KEY.escape]] });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    h.setModelCalls.length = 0;
+    await h.commands.get("ais")?.handler("", h.ctx);
+    expect(h.customCalls).toHaveLength(1);
+    expect(h.setModelCalls).toHaveLength(0);
+  });
+
+  test("esc at the model step keeps the identity switch but changes no model", async () => {
+    const h = harness({ customKeys: [["w", "o", "r", "k", KEY.enter], [KEY.escape]] });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    h.setModelCalls.length = 0;
+    h.writes.length = 0;
+    await h.commands.get("ais")?.handler("", h.ctx);
+    expect(h.setModelCalls).toHaveLength(0);
+    const stateWrite = h.writes.filter((w) => w.path.endsWith("/ais-state.json")).at(-1);
+    expect((stateWrite?.data as { activeIdentity?: string }).activeIdentity).toBe("work");
+  });
+
+  test("hosts without ctx.ui.custom fall back to ctx.ui.select", async () => {
+    const h = harness({ selectResponses: ["Work", "openai-codex/gpt-5.6-luna \u2014 GPT-5.6 Luna"] });
+    await h.promise;
+    await h.handlers.get("session_start")?.(undefined as never, h.ctx);
+    h.setModelCalls.length = 0;
+    await h.commands.get("ais")?.handler("", h.ctx);
+    expect(h.customCalls).toHaveLength(0);
+    expect(h.selectCalls).toHaveLength(2);
+    expect(h.setModelCalls.at(-1)).toMatchObject({ provider: "openai-codex--work", id: "gpt-5.6-luna" });
   });
 
   test("/ais show renders the context widget with the active identity label", async () => {
@@ -747,5 +834,147 @@ describe("jiti loadability", () => {
 
   test("version stamp is present and well-formed", () => {
     expect(AIS_EXTENSION_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+});
+
+describe("filterOptionIndices (pure)", () => {
+  const options = ["anthropic/claude-opus-5 — Claude Opus 5", "anthropic/claude-sonnet-5", "openai-codex/gpt-5.6-luna — GPT-5.6 Luna"];
+
+  test("an empty query matches everything in original order", () => {
+    expect(filterOptionIndices("", options)).toEqual([0, 1, 2]);
+    expect(filterOptionIndices("   ", options)).toEqual([0, 1, 2]);
+  });
+
+  test("tokens AND case-insensitively in any order", () => {
+    expect(filterOptionIndices("LUNA", options)).toEqual([2]);
+    expect(filterOptionIndices("anthropic opus", options)).toEqual([0]);
+    expect(filterOptionIndices("opus anthropic", options)).toEqual([0]);
+    expect(filterOptionIndices("anthropic", options)).toEqual([0, 1]);
+    expect(filterOptionIndices("claude 5", options)).toEqual([0, 1]);
+  });
+
+  test("an impossible token matches nothing", () => {
+    expect(filterOptionIndices("zzz", options)).toEqual([]);
+    expect(filterOptionIndices("anthropic luna", options)).toEqual([]);
+  });
+});
+
+describe("SearchableSelect component", () => {
+  const OPTIONS = [
+    "anthropic/claude-opus-5 — Claude Opus 5",
+    "anthropic/claude-sonnet-5 — Claude Sonnet 5",
+    "openai-codex/gpt-5.6-luna — GPT-5.6 Luna",
+  ];
+
+  function picker(options: readonly string[] = OPTIONS) {
+    const results: Array<string | undefined> = [];
+    const sel = new SearchableSelect("Pick a model:", options, (value) => results.push(value));
+    return { sel, results };
+  }
+
+  test("enter returns the highlighted ORIGINAL option string", () => {
+    const { sel, results } = picker();
+    sel.handleInput("luna");
+    sel.handleInput(KEY.enter);
+    expect(results).toEqual([OPTIONS[2]]);
+  });
+
+  test("typing narrows the list and arrows move within the filtered subset", () => {
+    const { sel, results } = picker();
+    sel.handleInput("anthropic");
+    expect(sel.render(100).filter((line) => line.includes("anthropic/"))).toHaveLength(2);
+    sel.handleInput(KEY.down);
+    sel.handleInput(KEY.enter);
+    expect(results).toEqual([OPTIONS[1]]);
+  });
+
+  test("down past the last match clamps; up returns", () => {
+    const { sel, results } = picker();
+    sel.handleInput("anthropic");
+    sel.handleInput(KEY.down);
+    sel.handleInput(KEY.down); // clamps at 1
+    sel.handleInput(KEY.up); // back to 0
+    sel.handleInput(KEY.enter);
+    expect(results).toEqual([OPTIONS[0]]);
+  });
+
+  test("escape cancels with undefined", () => {
+    const { sel, results } = picker();
+    sel.handleInput(KEY.escape);
+    expect(results).toEqual([undefined]);
+  });
+
+  test("backspace edits the query", () => {
+    const { sel, results } = picker();
+    for (const ch of "lunax") sel.handleInput(ch);
+    sel.handleInput(KEY.backspace);
+    sel.handleInput(KEY.enter);
+    expect(results).toEqual([OPTIONS[2]]);
+  });
+
+  test("unrecognised escape sequences are ignored, not typed as filter text", () => {
+    const { sel } = picker();
+    sel.handleInput("\u001b[1;5C"); // ctrl+right: unmapped
+    expect(sel.render(100)[1]).toBe("Search: \u2588");
+  });
+
+  test("enter with no matches does not resolve; escape still cancels", () => {
+    const { sel, results } = picker();
+    sel.handleInput("zzz");
+    sel.handleInput(KEY.enter);
+    expect(results).toEqual([]);
+    sel.handleInput(KEY.escape);
+    expect(results).toEqual([undefined]);
+  });
+
+  test("the component is inert after completion", () => {
+    const { sel, results } = picker();
+    sel.handleInput(KEY.enter);
+    sel.handleInput(KEY.enter);
+    sel.handleInput(KEY.escape);
+    expect(results).toHaveLength(1);
+  });
+
+  test("render shows title, query with cursor, marker and match counts", () => {
+    const { sel } = picker();
+    sel.handleInput("opus");
+    const lines = sel.render(100);
+    expect(lines[0]).toBe("Pick a model:");
+    expect(lines[1]).toBe("Search: opus\u2588");
+    expect(lines[2]).toBe(`> ${OPTIONS[0]}`);
+    expect(lines.at(-1)).toBe("1/3 \u00b7 type to search \u00b7 enter select \u00b7 esc cancel");
+  });
+
+  test("render reports no matches honestly", () => {
+    const { sel } = picker();
+    sel.handleInput("zzz");
+    const lines = sel.render(100);
+    expect(lines.some((line) => line.includes("(no matches"))).toBe(true);
+    expect(lines.at(-1)).toContain("0/3");
+  });
+
+  test("long lists scroll: the window follows the selection", () => {
+    const many = Array.from({ length: 30 }, (_, i) => `opt-${String(i).padStart(2, "0")}`);
+    const { sel } = picker(many);
+    const first = sel.render(60);
+    // title + search + 12 visible rows + count footer
+    expect(first).toHaveLength(15);
+    expect(first[2]).toBe("> opt-00");
+    expect(first.some((line) => line.includes("opt-12"))).toBe(false);
+    for (let i = 0; i < 13; i++) sel.handleInput(KEY.down);
+    const scrolled = sel.render(60);
+    expect(scrolled.some((line) => line === "> opt-13")).toBe(true);
+    expect(scrolled.some((line) => line.includes("opt-01"))).toBe(false);
+    expect(scrolled.at(-1)).toContain("30/30");
+  });
+
+  test("render output is width-truncated and cached per width", () => {
+    const { sel } = picker();
+    const wide = sel.render(200);
+    const cached = sel.render(200);
+    expect(cached).toBe(wide); // identical array reference while cached
+    const narrow = sel.render(10);
+    expect(narrow).not.toBe(wide);
+    expect(narrow.every((line) => line.length <= 40)).toBe(true);
   });
 });

@@ -2723,10 +2723,21 @@ and pi must remember the last-used model across launches. Design:
   the native `apiKey.resolve` (provider quirks preserved); custom-catalogue
   keys honor `authHeader` and `$ENV`/`${ENV}` interpolation (`!command` is
   unsupported and honestly skipped).
-- **`/ais` = interactive switcher**: `ctx.ui.select` identity (LABELS,
-  current marked) -> select model (last-used floated first) ->
-  `pi.setModel(namespaced)`. Non-UI modes fall back to the identities
-  widget. `/ais show` = the context panel (active identity's providers,
+- **`/ais` = interactive switcher, TYPE-TO-SEARCH** (v2.1.0): both steps
+  run through `SearchableSelect`, a custom component via `ctx.ui.custom`
+  (pi's extension loader aliases `@earendil-works/pi-tui`, so `matchesKey`/
+  `Key`/`truncateToWidth` come from pi's own bundled copy - the installed
+  file stays self-contained). Whitespace-separated tokens AND as
+  case-insensitive substrings; arrows/page keys move within the FILTERED
+  subset (12-row scrolling window), enter accepts the highlighted ORIGINAL
+  option, esc cancels, the component is inert after completion, and
+  unrecognised escape sequences are ignored rather than typed as garbage.
+  Hosts without `ctx.ui.custom` fall back to `ctx.ui.select`, and non-UI
+  modes to the identities widget. Identity step lists LABELS (current
+  marked); model step floats last-used first; `pi.setModel(namespaced)`
+  applies. A successful switch now persists ais-state.json IMMEDIATELY
+  (the model_select handler still writes again - idempotent, and correct
+  even if a host swallowed the event). `/ais show` = the context panel (active identity's providers,
   credential types, counts, gap notes); `/ais use [<identity> ]<provider>[/
   <model>]` = non-interactive, scoped active-identity-first, then a UNIQUE
   foreign-identity match (ambiguous -> honest disambiguation hint), then
@@ -2760,9 +2771,12 @@ and pi must remember the last-used model across launches. Design:
   Gotchas: `pi --list-models` does NOT load extensions (namespaced providers
   only appear in real sessions); an anthropic OAuth roundtrip returned
   Anthropic's "third-party apps draw from extra usage" 400 identically for
-  the NATIVE provider - account policy, not a clone defect. 55 extension
+  the NATIVE provider - account policy, not a clone defect. 74 extension
   unit tests (injected deps, synthetic fixtures) + 6 single-instance
-  resolve tests.
+  resolve tests. Searchable picker driven through a real pty (`script`)
+  against the compiled wrapper: extension 2.1.0 self-installed, both
+  dialogs rendered `Search:`, and typing `synth b` then `opus` ended in
+  `switched to Synth B: anthropic/claude-opus-4-5` (2026-09-15).
 - Known limits: old per-identity session histories stay in their dirs (launch
   with the env override to reach them); per-request auth adds one small
   auth.json read; `opencode`-style multi-var tools are unaffected - this is
