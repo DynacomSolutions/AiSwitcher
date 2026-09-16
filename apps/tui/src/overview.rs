@@ -1,8 +1,12 @@
-//! Compact single-screen overview for the `ais herdr` tmux wrapper's right
-//! panel (`aistui --overview`): every identity's estimated cost, limit
-//! windows and next reset, laid out responsively for a narrow side panel,
-//! with the identities whose herdr panes are open on the wrapper's left
-//! highlighted (the focused pane's identity most strongly).
+//! Compact overview panel for `ais herdr`: every identity's estimated cost,
+//! limit windows and next reset, laid out responsively for a narrow side
+//! panel, with the identities whose herdr panes are open highlighted (the
+//! focused pane's identity most strongly). Rendered two ways from one
+//! implementation:
+//! - `aistui --overview`: the standalone single-screen variant (its own
+//!   event loop in run()),
+//! - `aistui herdr`: the same draw_in() into the wrapper's right region,
+//!   driven by the wrapper's event loop (see herdr.rs).
 //!
 //! Deliberately separate from app.rs's tabbed dashboard: this screen owns a
 //! smaller polling set (limits, usage, herdr bridge, spend guard) and a
@@ -17,7 +21,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Paragraph};
@@ -31,9 +35,9 @@ use crate::ui::widgets;
 
 /* ------------------------- wrapper environment contract -------------------- */
 
-/// Presentation overrides the `ais herdr` wrapper passes through the tmux
-/// pane environment. All optional; the bare `aistui --overview` default is
-/// a local console with bridge highlighting on.
+/// Presentation overrides the `ais herdr` wrapper passes through the
+/// environment. All optional; the bare `aistui --overview` default is a
+/// local console with bridge highlighting on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverviewEnv {
     /// Dim note line under the header: an honest degradation notice from
@@ -45,6 +49,10 @@ pub struct OverviewEnv {
     pub bridge_on: bool,
     /// Short label shown at the header's right (e.g. "remote:box").
     pub label: Option<String>,
+    /// True when drawn INSIDE the `aistui herdr` wrapper (its key hints
+    /// differ: q only quits while the panel has focus). Never from env;
+    /// the wrapper sets it after from_env().
+    pub embedded: bool,
 }
 
 impl OverviewEnv {
@@ -60,6 +68,7 @@ impl OverviewEnv {
             note,
             bridge_on,
             label,
+            embedded: false,
         }
     }
 }
@@ -106,7 +115,10 @@ impl Endpoint {
     }
 }
 
-enum Msg {
+/// One poll result; pub because the herdr wrapper drives an embedded panel
+/// through the same channel (spawn_poller).
+#[derive(Debug)]
+pub enum OverviewMsg {
     Limits(Result<models::LimitsResponse, ApiError>),
     Usage(Result<models::UsageResponse, ApiError>),
     Bridge(Result<models::HerdrBridgeResponse, ApiError>),
@@ -116,7 +128,7 @@ enum Msg {
 async fn fetch_loop(
     client: Arc<ConsoleClient>,
     endpoint: Endpoint,
-    tx: mpsc::UnboundedSender<Msg>,
+    tx: mpsc::UnboundedSender<OverviewMsg>,
     notify: Arc<Notify>,
 ) {
     let mut ticker = tokio::time::interval(endpoint.interval());
@@ -127,21 +139,56 @@ async fn fetch_loop(
         }
         let msg = match endpoint {
             Endpoint::Limits => {
-                Msg::Limits(client.get_json(endpoint.path(), endpoint.timeout()).await)
+                OverviewMsg::Limits(client.get_json(endpoint.path(), endpoint.timeout()).await)
             }
             Endpoint::Usage => {
-                Msg::Usage(client.get_json(endpoint.path(), endpoint.timeout()).await)
+                OverviewMsg::Usage(client.get_json(endpoint.path(), endpoint.timeout()).await)
             }
             Endpoint::Bridge => {
-                Msg::Bridge(client.get_json(endpoint.path(), endpoint.timeout()).await)
+                OverviewMsg::Bridge(client.get_json(endpoint.path(), endpoint.timeout()).await)
             }
             Endpoint::Spend => {
-                Msg::Spend(client.get_json(endpoint.path(), endpoint.timeout()).await)
+                OverviewMsg::Spend(client.get_json(endpoint.path(), endpoint.timeout()).await)
             }
         };
         if tx.send(msg).is_err() {
             return; // main loop gone: nothing left to feed
         }
+    }
+}
+
+/// Polling handles for an overview that is driven by someone else's event
+/// loop (the `aistui herdr` wrapper's embedded panel). The standalone
+/// `aistui --overview` wires the same loops through run().
+pub struct OverviewPoller {
+    pub msgs: mpsc::UnboundedReceiver<OverviewMsg>,
+    notifies: Vec<Arc<Notify>>,
+}
+
+impl OverviewPoller {
+    /// Force every endpoint to poll again (the panel's `r` key).
+    pub fn refresh_all(&self) {
+        for notify in &self.notifies {
+            notify.notify_one();
+        }
+    }
+}
+
+pub fn spawn_poller(client: Arc<ConsoleClient>, env: &OverviewEnv) -> OverviewPoller {
+    let endpoints = endpoints_for(env);
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<OverviewMsg>();
+    let notifies: Vec<Arc<Notify>> = endpoints.iter().map(|_| Arc::new(Notify::new())).collect();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        tokio::spawn(fetch_loop(
+            Arc::clone(&client),
+            *endpoint,
+            msg_tx.clone(),
+            Arc::clone(&notifies[index]),
+        ));
+    }
+    OverviewPoller {
+        msgs: msg_rx,
+        notifies,
     }
 }
 
@@ -588,14 +635,18 @@ fn overview_body(app: &OverviewApp, width: usize) -> Vec<Line<'static>> {
 fn legend_line(app: &OverviewApp) -> Line<'static> {
     let mut spans = vec![
         Span::from("●").cyan(),
-        Span::from(" open   ").dark_gray(),
+        Span::from(" open  ").dark_gray(),
         Span::from("●").yellow(),
-        Span::from(" focused   ").dark_gray(),
+        Span::from(" focused  ").dark_gray(),
         Span::from("⚠").red(),
-        Span::from(" breach   ").dark_gray(),
+        Span::from(" breach").dark_gray(),
     ];
-    spans.push(Span::from("q quit").dark_gray());
-    let _ = app;
+    if !app.env.embedded {
+        spans.push(Span::from("  ·  q quit").dark_gray());
+    }
+    // Embedded (inside the herdr wrapper): markers only, so the legend
+    // never overflows the nominal 42-column panel. The key hints live in
+    // the wrapper's status bar, which knows the current focus.
     Line::from(spans)
 }
 
@@ -617,7 +668,7 @@ pub struct OverviewApp {
 }
 
 impl OverviewApp {
-    fn new(settings: &Settings, env: OverviewEnv) -> Self {
+    pub fn new(settings: &Settings, env: OverviewEnv) -> Self {
         Self {
             base_url: settings.base_url.clone(),
             env,
@@ -632,21 +683,21 @@ impl OverviewApp {
         }
     }
 
-    fn apply(&mut self, msg: Msg) {
+    pub fn apply(&mut self, msg: OverviewMsg) {
         match msg {
-            Msg::Limits(result) => {
+            OverviewMsg::Limits(result) => {
                 let ok = self.limits.record(result);
                 self.finish(Endpoint::Limits, ok);
             }
-            Msg::Usage(result) => {
+            OverviewMsg::Usage(result) => {
                 let ok = self.usage.record(result);
                 self.finish(Endpoint::Usage, ok);
             }
-            Msg::Bridge(result) => {
+            OverviewMsg::Bridge(result) => {
                 let ok = self.bridge.record(result);
                 self.finish(Endpoint::Bridge, ok);
             }
-            Msg::Spend(result) => {
+            OverviewMsg::Spend(result) => {
                 let ok = self.spend.record(result);
                 self.finish(Endpoint::Spend, ok);
             }
@@ -700,8 +751,16 @@ fn handle_key(app: &mut OverviewApp, key: KeyEvent, notifies: &[Arc<Notify>]) {
     }
 }
 
+/// The standalone full-screen entry (`aistui --overview`); the herdr
+/// wrapper renders the same panel through draw_in().
 pub fn draw(f: &mut Frame<'_>, app: &mut OverviewApp) {
-    let area = f.area();
+    draw_in(f, app, f.area());
+}
+
+/// Renders the whole overview (header, note, banner, body, legend) into
+/// any rect: the standalone mode passes the full frame area, the herdr
+/// wrapper its right region.
+pub fn draw_in(f: &mut Frame<'_>, app: &mut OverviewApp, area: Rect) {
     let note_rows = usize::from(app.env.note.is_some());
     let banner_rows = 3 * u16::from(app.console_down());
     let rows = Layout::vertical([
@@ -815,17 +874,8 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
     let client =
         Arc::new(ConsoleClient::new(settings.clone()).context("failed to build HTTP client")?);
 
-    let endpoints = endpoints_for(&env);
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Msg>();
-    let notifies: Vec<Arc<Notify>> = endpoints.iter().map(|_| Arc::new(Notify::new())).collect();
-    for (index, endpoint) in endpoints.iter().enumerate() {
-        tokio::spawn(fetch_loop(
-            Arc::clone(&client),
-            *endpoint,
-            msg_tx.clone(),
-            Arc::clone(&notifies[index]),
-        ));
-    }
+    let mut poller = spawn_poller(Arc::clone(&client), &env);
+    let mut app = OverviewApp::new(&settings, env);
 
     // Blocking reader thread bridged into the async world; it dies with the
     // process, which is fine since nothing else uses the terminal by then.
@@ -838,12 +888,11 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
         }
     });
 
-    let mut app = OverviewApp::new(&settings, env);
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
 
     loop {
         tokio::select! {
-            maybe = msg_rx.recv() => match maybe {
+            maybe = poller.msgs.recv() => match maybe {
                 Some(msg) => app.apply(msg),
                 None => break,
             },
@@ -852,7 +901,7 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
                     if let Event::Key(key) = event
                         && key.kind == KeyEventKind::Press
                     {
-                        handle_key(&mut app, key, &notifies);
+                        handle_key(&mut app, key, &poller.notifies);
                     }
                 }
                 None => break,
@@ -874,6 +923,8 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::models::{
         HerdrBridgePane, HerdrBridgeResponse, IdentityRef, LimitResult, LimitWindow,
         SpendGuardAccount, SpendGuardResponse, TokscaleReport, UsageResult,
@@ -1338,11 +1389,55 @@ mod tests {
     }
 
     #[test]
+    fn embedded_legend_drops_the_key_hints_and_fits_the_nominal_panel() {
+        let settings = Settings {
+            base_url: String::new(),
+            token: None,
+            token_path: PathBuf::from("/synthetic/SYNTHETIC_FIXTURE/server.json"),
+        };
+        let mut app = OverviewApp::new(
+            &settings,
+            OverviewEnv {
+                embedded: true,
+                ..OverviewEnv::default()
+            },
+        );
+        let embedded = legend_line(&app);
+        let text: String = embedded
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            !text.contains("q quit"),
+            "key hints live in the status bar: {text}"
+        );
+        assert!(
+            text.chars().count() <= 42,
+            "legend overflows the 42-col panel: {text}"
+        );
+        assert!(text.contains("open") && text.contains("focused") && text.contains("breach"));
+
+        app.env.embedded = false;
+        let standalone = legend_line(&app);
+        let text: String = standalone
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            text.contains("q quit"),
+            "standalone keeps the q hint: {text}"
+        );
+    }
+
+    #[test]
     fn endpoints_bridge_polling_follows_the_wrapper_switch() {
         let env_on = OverviewEnv {
             note: None,
             bridge_on: true,
             label: None,
+            embedded: false,
         };
         let env_off = OverviewEnv {
             bridge_on: false,
