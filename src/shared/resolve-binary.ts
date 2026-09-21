@@ -142,7 +142,7 @@ export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "
               : name === "pi"
                 ? `Run 'ais upgrade' to install the managed @earendil-works/pi-coding-agent instance.`
                 : name === "opencode"
-                  ? `Run 'ais upgrade' to install the managed opencode-ai instance.`
+                  ? `Run 'ais upgrade' to install the managed @opencode/cli (OpenCode 2) instance.`
                 : `Run 'ais upgrade' to install the managed Claude Code instance.`;
     throw new BinaryResolutionError(
       `Could not locate the real '${name}' binary on PATH (after excluding our own shim dir ${SHIM_DIR}).\n${hint}`,
