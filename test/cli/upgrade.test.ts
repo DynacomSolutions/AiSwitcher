@@ -69,7 +69,7 @@ describe("UPGRADE_SPECS", () => {
 
   test("allows OpenCode's postinstall script to select its platform binary", () => {
     const opencode = oneSpec("opencode");
-    expect(opencode.allowedScriptPackages).toEqual(["opencode-ai"]);
+    expect(opencode.allowedScriptPackages).toEqual(["@opencode/cli"]);
   });
 });
 
