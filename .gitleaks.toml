@@ -1,0 +1,17 @@
+# gitleaks configuration for this repository. Used by scripts/secret-scan.ts
+# when gitleaks is present on PATH; extends the default gitleaks ruleset.
+title = "ais gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Deliberate synthetic fixtures, never real credentials"
+regexes = [
+  '''SYNTHETIC_FIXTURE''',
+]
+paths = [
+  '''(^|/)bun\.lock$''',
+  '''(^|/)Cargo\.lock$''',
+  '''(^|/)pnpm-lock\.yaml$''',
+]

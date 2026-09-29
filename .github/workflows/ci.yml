@@ -37,6 +37,29 @@ jobs:
           PRIVACY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: bun run privacy:check --ci
 
+      # Belt-and-braces: hostnames/domains/emails/IPs/home paths outside the
+      # reviewed allowlist are blocked whether they arrive via an incoming
+      # commit or were already sitting in the tree.
+      - name: Check identifiers of incoming commits
+        env:
+          IDENTIFIER_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          IDENTIFIER_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bun run scripts/identifier-scan.ts --ci
+
+      - name: Check identifiers across the tracked tree
+        run: bun run scripts/identifier-scan.ts --tree
+
+      # Installed if present on the runner image, else scripts/secret-scan.ts
+      # falls back to its own built-in token-shape scanner automatically.
+      - name: Check secrets of incoming commits
+        env:
+          IDENTIFIER_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          IDENTIFIER_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bun run scripts/secret-scan.ts --ci
+
+      - name: Check secrets across the tracked tree
+        run: bun run scripts/secret-scan.ts --tree
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 

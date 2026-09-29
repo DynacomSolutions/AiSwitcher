@@ -2,9 +2,9 @@ apiVersion: getambassador.io/v3alpha1
 kind: Mapping
 metadata:
   name: ${PROJECT}
-  namespace: dev
+  namespace: ${AIS_NAMESPACE}
 spec:
-  hostname: ${PROJECT}.dynacom.dev
+  hostname: ${AIS_PUBLIC_HOSTNAME}
   prefix: /
-  service: ${PROJECT}.dev:80
+  service: ${PROJECT}.${AIS_NAMESPACE}:80
   timeout_ms: 120000

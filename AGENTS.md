@@ -12,6 +12,27 @@ with `bun run privacy:install`. Check indexed additions with
 `bun run privacy:check --ci` with event base/head SHAs, or explicitly
 `bun run privacy:check --range <base> <head>`. Each incoming commit is checked.
 
+Identifier guard (binding, separate from the privacy check above): no
+hostnames, domains, email addresses, IP literals, or identifying home paths
+may enter this repository except the reviewed allowlist in
+`scripts/identifier-allowlist.ts` (RFC 2606/6761 reserved names, plus the
+specific third-party vendor domains this project's code actually calls, each
+with its own one-line justification). This applies to every tracked file,
+not just diffs: `bun run lint` runs `scripts/identifier-scan.ts --tree`
+(hostnames/domains/emails/IPs/home paths) and `scripts/secret-scan.ts --tree`
+(gitleaks when present on `PATH`, else a built-in token-shape scanner) across
+the whole working tree. The same two checks also run scoped to incoming
+commits: `bun run scripts/identifier-scan.ts --staged` /
+`--pre-push <remote>` / `--ci`, and the `secret-scan.ts` equivalents. Adding
+a new vendor domain means adding a justified entry to
+`scripts/identifier-allowlist.ts`, not loosening the scanner. Versioned git
+hooks (installed by `bun run privacy:install`, alongside the privacy guard)
+run the fast staged-scope checks on pre-commit and the full outgoing-commit
+scope plus `bun run typecheck`/`bun run lint` on pre-push; the same checks
+also run as a required CI job, so bypassing hooks does not bypass
+enforcement. Hooks must never be bypassed (no `--no-verify`); if a check is
+wrong, fix the allowlist or the scanner, not the bypass.
+
 Thin wrapper executables (`claude`, `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `opencode`) that
 shadow the real Claude Code / Codex / Grok / Kimi Code / Pi CLIs on `PATH` (`zai`
 and `ali` are the two exceptions, see below) and let you switch between

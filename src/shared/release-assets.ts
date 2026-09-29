@@ -6,6 +6,11 @@ import { chmod, lstat, rename, rm } from "node:fs/promises";
 // (fresh installs), `ais update` (src/cli/update.ts) and the aistui
 // self-heal (src/shared/aistui-bin.ts). No `gh` CLI, no auth required.
 
+// This repository's own public GitHub coordinates. Required, not an
+// identifying leak: it is the exact github.com/<owner>/<repo> path every
+// release download (installer, `ais update`, the aistui self-heal) fetches
+// from, and it is already public (this file lives in that repo). Scoped
+// allowlist entry, see scripts/identifier-allowlist.ts.
 export const REPO = "DynacomSolutions/AiSwitcher";
 
 /** Maps an os/arch pair onto the release asset platform suffix
