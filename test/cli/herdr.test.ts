@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_PANEL_WIDTH,
+  HERDR_CONSOLE_IDLE_SHUTDOWN_MS,
   REMOVED_TMUX_FLAGS,
+  herdrConsoleEnsureOptions,
   insideHerdrPane,
   nestingConflict,
   parseHerdrArgs,
@@ -67,6 +69,32 @@ describe("parseHerdrArgs", () => {
     expect(() => parseHerdrArgs([], invocationFlags({ "panel-cmd": "htop" }))).toThrow(
       /rendered natively by aistui/,
     );
+  });
+});
+
+/**
+ * A local (non-remote) `ais herdr` used to leave a detached `ais web
+ * --serve-internal` console daemon running forever once it spawned one:
+ * ensureConsoleRunning's daemon has no lifecycle tie to the herdr session
+ * that incidentally needed it (see src/cli/web.ts's spawnDaemon, unref'd
+ * and setsid'd on purpose so it survives the launching terminal). The fix
+ * is opt-in idle-shutdown on a FRESH spawn only (an already-running daemon,
+ * e.g. one `ais web start` left up, is reused as-is - see
+ * ensureConsoleRunning's own doc comment). This covers the decision that
+ * wires idleShutdownMs into that spawn.
+ */
+describe("herdrConsoleEnsureOptions (console daemon lifetime)", () => {
+  test("default: a daemon herdr spawns itself is told to idle-shutdown", () => {
+    expect(herdrConsoleEnsureOptions({})).toEqual({ idleShutdownMs: HERDR_CONSOLE_IDLE_SHUTDOWN_MS });
+  });
+
+  test("AIS_HERDR_KEEP_CONSOLE=1 opts back into the old 'leave it running forever' behaviour", () => {
+    expect(herdrConsoleEnsureOptions({ AIS_HERDR_KEEP_CONSOLE: "1" })).toEqual({});
+  });
+
+  test("any other value (including unset) keeps the default idle-shutdown", () => {
+    expect(herdrConsoleEnsureOptions({ AIS_HERDR_KEEP_CONSOLE: "true" })).toEqual({ idleShutdownMs: HERDR_CONSOLE_IDLE_SHUTDOWN_MS });
+    expect(herdrConsoleEnsureOptions({ AIS_HERDR_KEEP_CONSOLE: "0" })).toEqual({ idleShutdownMs: HERDR_CONSOLE_IDLE_SHUTDOWN_MS });
   });
 });
 

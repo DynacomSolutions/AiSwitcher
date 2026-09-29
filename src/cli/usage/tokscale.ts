@@ -2,6 +2,7 @@ import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { readZaiApiKey } from "../../identities/zai-auth.ts";
+import { aisHome } from "../../shared/ais-home.ts";
 
 /**
  * How to point tokscale (github.com/junhoyeo/tokscale) at exactly one
@@ -244,20 +245,46 @@ export function resolveTokscaleCommand(): string[] {
  * on every one of the ~2N spawns in a full report. */
 let cachedBinaryMemo: string[] | undefined | null = null;
 export function resolveTokscaleCachedBinary(): string[] | undefined {
-  if (cachedBinaryMemo === null) cachedBinaryMemo = findCachedTokscaleBinary();
+  if (cachedBinaryMemo === null) cachedBinaryMemo = findCachedTokscaleBinary({});
   return cachedBinaryMemo;
 }
 
-function findCachedTokscaleBinary(): string[] | undefined {
-  const home = process.env.HOME ?? process.env.USERPROFILE;
-  if (!home) return undefined;
-  const cacheRoot = `${home}/.bun/install/cache/@tokscale`;
+/**
+ * tokscale's npm optional-dep package names by platform, confirmed against
+ * the real `tokscale` package's `optionalDependencies` (npm view tokscale):
+ * Linux ships a libc-suffixed pair per arch (`-gnu`/`-musl`, glibc vs musl,
+ * e.g. Alpine) — the ONLY platform where that distinction exists. darwin
+ * and win32 packages carry no libc suffix at all (macOS has no musl/glibc
+ * split; win32 uses `-msvc` instead). The previous version of this function
+ * always appended `-gnu`/`-musl` regardless of platform, so on macOS
+ * neither candidate directory ever existed and findCachedTokscaleBinary
+ * fell through to `undefined` unconditionally — every single call (via
+ * runTokscaleProcess) then went through `bunx tokscale@latest`, even with a
+ * fully warm, working cache, on every scan. Exported pure so this mapping
+ * is unit-tested directly against known package names rather than only
+ * indirectly through a real cache directory. */
+export function tokscalePlatformVariants(platform: string, arch: string): string[] {
+  if (platform === "darwin") return [`cli-darwin-${arch}`];
+  if (platform === "win32") return [`cli-win32-${arch}-msvc`];
+  const linuxPlatform = platform === "linux" ? "linux" : platform;
+  return [`cli-${linuxPlatform}-${arch}-gnu`, `cli-${linuxPlatform}-${arch}-musl`];
+}
 
-  // tokscale ships per-platform optional-dep packages (@tokscale/cli-<os>-<arch>-<libc>).
-  // Try the native libc variant for this platform first, then the musl one.
-  const platform = process.platform === "linux" ? "linux" : process.platform;
-  const arch = process.arch;
-  const variants = [`cli-${platform}-${arch}-gnu`, `cli-${platform}-${arch}-musl`];
+/** Exported (pure apart from the fs reads) so tests can drive it against a
+ * synthetic cache directory and an explicit platform/arch, independent of
+ * both the real ~/.bun cache and whatever OS the test happens to run on. */
+export function findCachedTokscaleBinary(opts: {
+  cacheRoot?: string;
+  platform?: string;
+  arch?: string;
+} = {}): string[] | undefined {
+  const cacheRoot = opts.cacheRoot ?? (() => {
+    const home = process.env.HOME ?? process.env.USERPROFILE;
+    return home ? `${home}/.bun/install/cache/@tokscale` : undefined;
+  })();
+  if (!cacheRoot) return undefined;
+
+  const variants = tokscalePlatformVariants(opts.platform ?? process.platform, opts.arch ?? process.arch);
 
   for (const variant of variants) {
     let versions: string[];
@@ -385,38 +412,98 @@ async function spawnTokscaleProcess(
   }
 }
 
-/** Once per CLI run, make sure Bun's tokscale cache is up to date before
- * fanning out to parallel cache-direct spawns: resolveTokscaleCachedBinary
- * picks whatever version happens to be newest in the cache, which pins a
- * stale tokscale forever if nothing ever refreshes it. `bunx tokscale@latest`
- * (run through bunxQueue, so it can't race anything) is the same refresh
- * mechanism the old design used implicitly on every single call — now it
- * runs exactly once, and only when tokscale isn't on PATH (a PATH install is
- * the user's own choice of version). Never throws: if the refresh fails
+/** Where the last successful cache-refresh time is persisted, so the
+ * cool-down below survives across process boundaries (each scan runs in a
+ * brand-new `ais __scan_worker` child - see server/workers.ts - so an
+ * in-memory-only timestamp would reset on every single scan and refresh on
+ * every one, which is the bug this whole file's caching exists to avoid). */
+function tokscaleRefreshStatePath(): string {
+  return join(aisHome(), "usage", "tokscale-refresh.json");
+}
+
+async function readLastRefreshMs(path = tokscaleRefreshStatePath()): Promise<number | undefined> {
+  try {
+    const raw = (await Bun.file(path).json()) as { lastRefreshMs?: unknown };
+    return typeof raw.lastRefreshMs === "number" && Number.isFinite(raw.lastRefreshMs) ? raw.lastRefreshMs : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeLastRefreshMs(ms: number, path = tokscaleRefreshStatePath()): Promise<void> {
+  try {
+    await Bun.write(path, JSON.stringify({ lastRefreshMs: ms }));
+  } catch {
+    // Best-effort: a failed write just means the next process re-checks too.
+  }
+}
+
+/** How often the bunx refresh (see below) is allowed to actually run once a
+ * working cached binary already exists. Exported so the interval is
+ * configurable for unusually stale/fast-moving setups; the default favours
+ * "almost never" over "every scan" — see ensureTokscaleCacheFresh. */
+export function tokscaleRefreshIntervalMs(): number {
+  const raw = Number.parseInt(process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 24 * 60 * 60 * 1000;
+}
+
+/** Pure decision function behind ensureTokscaleCacheFresh's cool-down,
+ * exported so it is unit-testable without touching the filesystem, a
+ * network, or process-lifetime state. */
+export function shouldRefreshTokscaleCache(lastRefreshMs: number | undefined, now: number, intervalMs: number): boolean {
+  return lastRefreshMs === undefined || now - lastRefreshMs >= intervalMs;
+}
+
+/** Keeps Bun's tokscale cache from pinning a stale version forever, WITHOUT
+ * re-verifying it on every scan. `resolveTokscaleCachedBinary` already picks
+ * whatever version happens to be newest in the cache; left unrefreshed that
+ * pins a stale tokscale forever, so this occasionally re-runs
+ * `bunx tokscale@latest -- --version` (which also downloads/updates the
+ * cache as a side effect) to catch up. That refresh is now gated on BOTH
+ * "no working binary is cached yet" (a genuine cold start, always refreshes)
+ * OR "the persisted cool-down has elapsed" (tokscaleRefreshIntervalMs,
+ * default 24h) - previously it ran on every call whenever `tokscale` wasn't
+ * literally on PATH, which given each scan runs in a brand-new
+ * `__scan_worker` child (per-process memoization does nothing across
+ * processes) meant EVERY scan, forever, re-ran a full `bunx` cold start -
+ * complete with a fresh temp `bunx-*` extraction dir that macOS
+ * Gatekeeper/XProtect re-scanned on every single launch, even though a
+ * perfectly good native binary was already cached and immediately
+ * discarded in favour of the bunx one. Never throws: if the refresh fails
  * (offline, registry down) the possibly-stale cached binary still serves,
  * matching tokscale's "prefer on PATH, bunx on demand" best-effort contract. */
 let cacheFreshPromise: Promise<void> | undefined;
 export function ensureTokscaleCacheFresh(): Promise<void> {
   if (!cacheFreshPromise) {
-    if (Bun.which("tokscale")) {
-      cacheFreshPromise = Promise.resolve();
-    } else {
-      const warmUp = (): Promise<string> =>
-        // bunx resolves @latest over the NETWORK; bound it far tighter than
-        // real scans so an offline/stalled registry cannot hold a whole
-        // usage report hostage (the cached binary still serves afterwards).
-        Promise.race([
-          spawnTokscaleProcess("bunx", ["tokscale@latest"], ["--version"], {}),
-          Bun.sleep(8_000).then(() => {
-            throw new Error("bunx cache warm-up timed out after 8s");
-          }),
-        ]);
-      const run = bunxQueue.then(warmUp, warmUp);
-      bunxQueue = run.catch(() => undefined);
-      cacheFreshPromise = run.then(() => undefined).catch(() => undefined);
-    }
+    cacheFreshPromise = (async () => {
+      if (Bun.which("tokscale")) return; // PATH install: the user's own version choice.
+      const cached = resolveTokscaleCachedBinary();
+      if (cached) {
+        const lastRefreshMs = await readLastRefreshMs();
+        if (!shouldRefreshTokscaleCache(lastRefreshMs, Date.now(), tokscaleRefreshIntervalMs())) return;
+      }
+      await warmUpTokscaleCache();
+    })();
   }
   return cacheFreshPromise;
+}
+
+async function warmUpTokscaleCache(): Promise<void> {
+  const warmUp = (): Promise<string> =>
+    // bunx resolves @latest over the NETWORK; bound it far tighter than
+    // real scans so an offline/stalled registry cannot hold a whole
+    // usage report hostage (the cached binary still serves afterwards).
+    Promise.race([
+      spawnTokscaleProcess("bunx", ["tokscale@latest"], ["--version"], {}),
+      Bun.sleep(8_000).then(() => {
+        throw new Error("bunx cache warm-up timed out after 8s");
+      }),
+    ]);
+  const run = bunxQueue.then(warmUp, warmUp);
+  bunxQueue = run.catch(() => undefined);
+  await run
+    .then(() => writeLastRefreshMs(Date.now()))
+    .catch(() => undefined);
 }
 
 /** One entry of tokscale's `hourly --json` output — only the fields this

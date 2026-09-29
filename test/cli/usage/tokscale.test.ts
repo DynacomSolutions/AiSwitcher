@@ -1,9 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeZaiAuthFile } from "../../../src/identities/zai-auth.ts";
-import { buildMergedEnv, dailyUsageFromHourlyEntries, tokscaleInvocationFor } from "../../../src/cli/usage/tokscale.ts";
+import {
+  buildMergedEnv,
+  dailyUsageFromHourlyEntries,
+  findCachedTokscaleBinary,
+  shouldRefreshTokscaleCache,
+  tokscaleInvocationFor,
+  tokscalePlatformVariants,
+  tokscaleRefreshIntervalMs,
+} from "../../../src/cli/usage/tokscale.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
 function identity(configDir: string): Identity {
@@ -165,5 +173,129 @@ describe("dailyUsageFromHourlyEntries", () => {
       { hour: "2026-03-10 09:00", input: 5, output: 5 },
     ]);
     expect(result?.daily).toEqual({ "2026-03-10": 10 });
+  });
+});
+
+describe("tokscalePlatformVariants (native-binary cache resolution)", () => {
+  test("darwin has no libc suffix at all — the previous bug appended one unconditionally", () => {
+    expect(tokscalePlatformVariants("darwin", "arm64")).toEqual(["cli-darwin-arm64"]);
+    expect(tokscalePlatformVariants("darwin", "x64")).toEqual(["cli-darwin-x64"]);
+  });
+
+  test("win32 uses -msvc, not -gnu/-musl", () => {
+    expect(tokscalePlatformVariants("win32", "x64")).toEqual(["cli-win32-x64-msvc"]);
+  });
+
+  test("linux tries the glibc variant before the musl one", () => {
+    expect(tokscalePlatformVariants("linux", "x64")).toEqual(["cli-linux-x64-gnu", "cli-linux-x64-musl"]);
+    expect(tokscalePlatformVariants("linux", "arm64")).toEqual(["cli-linux-arm64-gnu", "cli-linux-arm64-musl"]);
+  });
+});
+
+describe("findCachedTokscaleBinary (prefers the cached native binary over bunx)", () => {
+  const tempDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  async function fakeCacheRoot(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "ais-tokscale-cache-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  /** A tiny real executable that answers `--version` successfully, standing
+   * in for the real native tokscale binary tokscale's optional-dep package
+   * ships. */
+  async function writeFakeBinary(path: string): Promise<void> {
+    await mkdir(path.slice(0, path.lastIndexOf("/")), { recursive: true });
+    await writeFile(path, "#!/bin/sh\nexit 0\n");
+    await chmod(path, 0o755);
+  }
+
+  test("darwin: finds the cached cli-darwin-<arch> binary with no libc suffix", async () => {
+    const cacheRoot = await fakeCacheRoot();
+    await writeFakeBinary(join(cacheRoot, "cli-darwin-arm64", "4.17.0@@@1", "bin", "tokscale"));
+    const found = findCachedTokscaleBinary({ cacheRoot, platform: "darwin", arch: "arm64" });
+    expect(found).toEqual([join(cacheRoot, "cli-darwin-arm64", "4.17.0@@@1", "bin", "tokscale")]);
+  });
+
+  test("darwin: a cache shaped like the OLD (buggy) -gnu/-musl variant names is never matched (regression guard)", async () => {
+    const cacheRoot = await fakeCacheRoot();
+    // Only a wrongly-libc-suffixed directory exists - what the OLD variant
+    // list (unconditional -gnu/-musl) would have looked for and, on a real
+    // machine, never found either (npm never ships that package name for
+    // darwin at all). The real, correctly-shaped darwin package is absent
+    // here on purpose.
+    await writeFakeBinary(join(cacheRoot, "cli-darwin-arm64-gnu", "4.17.0@@@1", "bin", "tokscale"));
+    expect(findCachedTokscaleBinary({ cacheRoot, platform: "darwin", arch: "arm64" })).toBeUndefined();
+  });
+
+  test("picks the newest semver-sorted cached version when several are present", async () => {
+    const cacheRoot = await fakeCacheRoot();
+    await writeFakeBinary(join(cacheRoot, "cli-linux-x64-gnu", "4.9.0@@@1", "bin", "tokscale"));
+    await writeFakeBinary(join(cacheRoot, "cli-linux-x64-gnu", "4.17.0@@@1", "bin", "tokscale"));
+    await writeFakeBinary(join(cacheRoot, "cli-linux-x64-gnu", "4.12.0@@@1", "bin", "tokscale"));
+    const found = findCachedTokscaleBinary({ cacheRoot, platform: "linux", arch: "x64" });
+    expect(found).toEqual([join(cacheRoot, "cli-linux-x64-gnu", "4.17.0@@@1", "bin", "tokscale")]);
+  });
+
+  test("falls through gnu -> musl, and to undefined (bunx fallback) when nothing is cached", async () => {
+    const cacheRoot = await fakeCacheRoot();
+    await writeFakeBinary(join(cacheRoot, "cli-linux-x64-musl", "4.5.0@@@1", "bin", "tokscale"));
+    const found = findCachedTokscaleBinary({ cacheRoot, platform: "linux", arch: "x64" });
+    expect(found).toEqual([join(cacheRoot, "cli-linux-x64-musl", "4.5.0@@@1", "bin", "tokscale")]);
+
+    expect(findCachedTokscaleBinary({ cacheRoot: await fakeCacheRoot(), platform: "linux", arch: "x64" })).toBeUndefined();
+  });
+
+  test("a real symlinked bin directory (the actual bun cache layout) resolves fine", async () => {
+    const cacheRoot = await fakeCacheRoot();
+    const real = join(cacheRoot, "cli-linux-x64-gnu@4.17.0@@@1");
+    await writeFakeBinary(join(real, "bin", "tokscale"));
+    await mkdir(join(cacheRoot, "cli-linux-x64-gnu"), { recursive: true });
+    await symlink(real, join(cacheRoot, "cli-linux-x64-gnu", "4.17.0@@@1"));
+    const found = findCachedTokscaleBinary({ cacheRoot, platform: "linux", arch: "x64" });
+    expect(found).toEqual([join(cacheRoot, "cli-linux-x64-gnu", "4.17.0@@@1", "bin", "tokscale")]);
+  });
+
+  test("a cache entry that exists but cannot execute (wrong libc / corrupt download) is skipped", async () => {
+    const cacheRoot = await fakeCacheRoot();
+    const badBin = join(cacheRoot, "cli-linux-x64-gnu", "4.17.0@@@1", "bin", "tokscale");
+    await mkdir(badBin.slice(0, badBin.lastIndexOf("/")), { recursive: true });
+    await writeFile(badBin, "#!/bin/sh\nexit 1\n");
+    await chmod(badBin, 0o755);
+    expect(findCachedTokscaleBinary({ cacheRoot, platform: "linux", arch: "x64" })).toBeUndefined();
+  });
+});
+
+describe("shouldRefreshTokscaleCache / tokscaleRefreshIntervalMs (never re-run --version per scan)", () => {
+  test("no prior refresh timestamp always refreshes (genuine cold start)", () => {
+    expect(shouldRefreshTokscaleCache(undefined, Date.now(), 60_000)).toBe(true);
+  });
+
+  test("within the interval: no refresh needed", () => {
+    const now = 1_000_000;
+    expect(shouldRefreshTokscaleCache(now - 1_000, now, 60_000)).toBe(false);
+  });
+
+  test("interval elapsed: refresh again", () => {
+    const now = 1_000_000;
+    expect(shouldRefreshTokscaleCache(now - 60_000, now, 60_000)).toBe(true);
+  });
+
+  test("tokscaleRefreshIntervalMs defaults to 24h and honours the env override", () => {
+    const original = process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS;
+    try {
+      delete process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS;
+      expect(tokscaleRefreshIntervalMs()).toBe(24 * 60 * 60 * 1000);
+      process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS = "5000";
+      expect(tokscaleRefreshIntervalMs()).toBe(5000);
+      process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS = "not-a-number";
+      expect(tokscaleRefreshIntervalMs()).toBe(24 * 60 * 60 * 1000);
+    } finally {
+      if (original === undefined) delete process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS;
+      else process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS = original;
+    }
   });
 });

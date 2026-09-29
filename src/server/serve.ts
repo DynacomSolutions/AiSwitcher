@@ -16,9 +16,34 @@ export interface ServeOptions {
   distDir?: string;
   /** Test hook: skip writing the state file / signal handlers. */
   managed?: boolean;
+  /** Self-terminate after this many ms with no request. Undefined (the
+   * default for every explicit `ais web start`/`--foreground` and for the
+   * k8s pod's direct `ais web --serve-internal`) means "run forever, until
+   * `ais web stop`" — unchanged, explicit-daemon behaviour. Only a caller
+   * that spawns the daemon IMPLICITLY on someone's behalf (see
+   * cli/web.ts's ensureConsoleRunning) should ever pass this: it is what
+   * keeps a console daemon spawned as a side effect (e.g. `ais herdr`'s
+   * overview panel) from outliving the session that incidentally needed
+   * it, without the client having to track/kill a pid it may not even be
+   * the sole user of (another consumer's own request resets the timer). */
+  idleShutdownMs?: number;
 }
 
 export const DEFAULT_CONSOLE_PORT = 47129;
+
+/** Pure decision behind the idle-shutdown timer, exported so it is
+ * unit-testable without booting a real Bun.serve instance or touching
+ * process.exit (the real shutdown path). */
+export function isIdleTooLong(lastActivityMs: number, nowMs: number, idleShutdownMs: number): boolean {
+  return nowMs - lastActivityMs >= idleShutdownMs;
+}
+
+/** How often the idle timer polls: frequent enough that a daemon does not
+ * linger long past its budget, but never faster than 1s or more than every
+ * 30s regardless of how large idleShutdownMs is. */
+export function idleCheckIntervalMs(idleShutdownMs: number): number {
+  return Math.min(30_000, Math.max(1_000, Math.floor(idleShutdownMs / 4)));
+}
 
 /** AIS_WEB_ALLOWED_HOSTS: comma-separated extra vhostnames the guard trusts
  * like loopback peers (e.g. `ais.localhost` in front of a reverse proxy,
@@ -92,6 +117,13 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   };
   const app = createApp(deps);
 
+  // Tracks the last time ANY request hit this daemon, for idleShutdownMs
+  // below. Every request counts, from every consumer (WebUI, TUI, herdr's
+  // overview panel, another herdr session sharing this same daemon) - the
+  // point is "is anything still using this console", not "did the caller
+  // that spawned it exit".
+  let lastActivityMs = Date.now();
+
   const server = Bun.serve({
     port,
     hostname: host,
@@ -101,6 +133,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     // them. Bun caps idleTimeout at 255.
     idleTimeout: Math.min(120, 255),
     fetch(req, bunServer) {
+      lastActivityMs = Date.now();
       // Stamp the peer address so the guard can distinguish loopback peers
       // from token-carrying remote ones when a non-loopback bind is used.
       const ip = bunServer.requestIP(req);
@@ -130,6 +163,21 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     };
     process.on("SIGTERM", shutdown);
     process.on("SIGINT", shutdown);
+
+    // idleShutdownMs: ONLY set by an implicit spawn (see ServeOptions doc).
+    // An explicit `ais web start`/`--foreground`, and the k8s pod's direct
+    // `ais web --serve-internal`, never pass it, so they run forever exactly
+    // as before - this is opt-in per spawn, not a global behaviour change.
+    if (options.idleShutdownMs && options.idleShutdownMs > 0) {
+      const idleShutdownMs = options.idleShutdownMs;
+      const idleTimer = setInterval(() => {
+        if (isIdleTooLong(lastActivityMs, Date.now(), idleShutdownMs)) {
+          clearInterval(idleTimer);
+          shutdown();
+        }
+      }, idleCheckIntervalMs(idleShutdownMs));
+      idleTimer.unref?.();
+    }
   }
 
   return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); loginFlows.stop(); server.stop(true); } };

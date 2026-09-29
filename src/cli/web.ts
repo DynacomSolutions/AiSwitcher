@@ -22,7 +22,12 @@ export async function runWebCommand(positionals: string[], flags: Record<string,
 
   if (boolFlag(flags as never, "serve-internal")) {
     const distDir = findDistDir();
-    await startConsoleServer({ ...(numberFlag(flags) ? { port: numberFlag(flags) } : {}), ...(distDir ? { distDir } : {}) });
+    const idleShutdownMs = idleShutdownFlag(flags);
+    await startConsoleServer({
+      ...(numberFlag(flags) ? { port: numberFlag(flags) } : {}),
+      ...(distDir ? { distDir } : {}),
+      ...(idleShutdownMs !== undefined ? { idleShutdownMs } : {}),
+    });
     return; // Bun.serve keeps the process alive.
   }
 
@@ -80,6 +85,18 @@ function numberFlag(flags: Record<string, string | true>): number | undefined {
   return parsed;
 }
 
+/** Hidden, --serve-internal-only companion flag: carries idleShutdownMs
+ * from spawnDaemon's argv into the daemon child's own startConsoleServer
+ * call (see ensureConsoleRunning's `opts.idleShutdownMs`). Never set by a
+ * human directly - it only ever appears in argv this project's own code
+ * constructs. */
+function idleShutdownFlag(flags: Record<string, string | true>): number | undefined {
+  const raw = flags["idle-shutdown-ms"];
+  if (typeof raw !== "string" || raw === "") return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 /** Re-invokes this same ais entrypoint as a detached background process.
  * Compiled binary: argv IS [exe, ...]. Dev (`bun src/ais.ts`): prepend the
  * bun runtime with the script path. AIS_WEB_DAEMON marks the child so logs
@@ -103,14 +120,33 @@ export function aisEntrypoint(): string[] {
   return looksLikeScript ? [process.execPath, main] : [process.execPath];
 }
 
-function spawnDaemon(port: number | undefined): SpawnedDaemon {
+/** Pure argv builder for the detached daemon spawn, exported so the
+ * idle-shutdown flag's presence/absence is unit-testable without actually
+ * spawning a process. `setsidBin` and `inner` are resolved by the caller
+ * (environment-dependent); this function only assembles the argv. */
+export function daemonSpawnArgs(inner: string[], setsidBin: string | undefined, port: number, idleShutdownMs?: number): string[] {
+  const base = setsidBin ? [setsidBin] : [];
+  return [
+    ...base,
+    ...inner,
+    "web",
+    "--serve-internal",
+    `--port=${port}`,
+    // Only present for an IMPLICIT spawn (ensureConsoleRunning's caller
+    // opted in, e.g. `ais herdr` - see its doc comment). Absent means the
+    // daemon runs forever, same as every explicit `ais web start`.
+    ...(idleShutdownMs !== undefined ? [`--idle-shutdown-ms=${idleShutdownMs}`] : []),
+  ];
+}
+
+function spawnDaemon(port: number | undefined, idleShutdownMs?: number): SpawnedDaemon {
   const inner = aisEntrypoint();
   // setsid puts the daemon in its OWN session/process group so closing the
   // launching terminal cannot SIGHUP it (the server also ignores HUP as a
   // second layer for machines without setsid).
   const setsid = Bun.which("setsid");
-  const base = setsid ? [setsid] : [];
-  const args = [...base, ...inner, "web", "--serve-internal", `--port=${port ?? DEFAULT_CONSOLE_PORT}`];
+  const requestedPort = port ?? DEFAULT_CONSOLE_PORT;
+  const args = daemonSpawnArgs(inner, setsid ?? undefined, requestedPort, idleShutdownMs);
   // NOTE: parseArgs only understands --flag=value, never --flag value.
   const proc = withUsableCwd(() =>
     Bun.spawn(args, {
@@ -119,7 +155,7 @@ function spawnDaemon(port: number | undefined): SpawnedDaemon {
     }),
   );
   proc.unref();
-  return { proc, requestedPort: port ?? DEFAULT_CONSOLE_PORT };
+  return { proc, requestedPort };
 }
 
 function statSyncSafe(path: string): boolean {
@@ -130,14 +166,26 @@ function statSyncSafe(path: string): boolean {
   }
 }
 
+export interface EnsureConsoleRunningOptions {
+  /** Only takes effect on a FRESH spawn (an already-running daemon - e.g.
+   * one an explicit `ais web start` left up - is reused exactly as it is,
+   * never downgraded to a shorter lifetime by a caller that merely wants to
+   * read from it). See ServeOptions.idleShutdownMs and spawnDaemon. */
+  idleShutdownMs?: number;
+}
+
 /** Shared by `ais web start` and `ais tui`: guarantees a healthy console
  * daemon, starting one when necessary. Returns its port. This is the
  * contract that keeps "server should never be down while a frontend is
- * open" true: no frontend may launch without it. */
-export async function ensureConsoleRunning(portFlag?: number): Promise<number> {
+ * open" true: no frontend may launch without it. `ais web start`/`open`
+ * and `ais tui` never pass idleShutdownMs, so a daemon they spawn still
+ * runs forever, exactly as before; only a caller like `ais herdr`, whose
+ * need for the console is incidental to its own job, opts a fresh spawn
+ * into self-shutdown. */
+export async function ensureConsoleRunning(portFlag?: number, opts: EnsureConsoleRunningOptions = {}): Promise<number> {
   const state = await readServerState();
   if (state && pidAlive(state.pid) && (await healthy(state.port))) return state.port;
-  const daemon = spawnDaemon(portFlag);
+  const daemon = spawnDaemon(portFlag, opts.idleShutdownMs);
   const ready = await waitUntilHealthyOrExit(daemon.proc);
   if (!ready) {
     // The child died before answering: with a busy port that is a bind
