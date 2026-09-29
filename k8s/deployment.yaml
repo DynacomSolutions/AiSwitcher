@@ -44,6 +44,11 @@ spec:
               value: "600000"
             - name: AIS_K8S_API_SERVER
               value: https://kubernetes.default.svc
+            - name: AIS_AUTH_BROWSER_NAMESPACE
+              # Kubernetes namespace where the interactive auth browser
+              # service (chrome-auth-<identity>) is deployed. The app falls
+              # back to its built-in default "chrome-mcp" if this is empty.
+              value: ${AIS_AUTH_BROWSER_NAMESPACE}
             - name: AIS_WEB_STATE_DIR
               # Pod-local console lifecycle state (server.json,
               # auth-refresh-state.json, file-edit backups). The pod sees the
