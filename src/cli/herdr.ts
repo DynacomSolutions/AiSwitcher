@@ -35,6 +35,25 @@ export const DEFAULT_PANEL_WIDTH = 42;
 export const MIN_PANEL_WIDTH = 16;
 export const MAX_PANEL_WIDTH = 80;
 
+/** If `ais herdr` has to spawn the console daemon itself (nothing was
+ * already running), the daemon self-terminates after this long with no
+ * request from ANY consumer, rather than being left running forever by a
+ * command whose actual purpose has nothing to do with the web console (see
+ * ensureConsoleRunning/spawnDaemon/ServeOptions.idleShutdownMs). Set
+ * AIS_HERDR_KEEP_CONSOLE=1 to opt back into the old "leave it running"
+ * behaviour (e.g. someone who also wants the WebUI reachable afterwards
+ * without a separate `ais web start`). Reusing an ALREADY-running daemon
+ * (started explicitly, e.g. via `ais web start`) is never affected either
+ * way - this only governs the lifetime of a daemon herdr itself spawns. */
+export const HERDR_CONSOLE_IDLE_SHUTDOWN_MS = 10 * 60_000;
+
+/** Pure decision behind the opt-out above, exported so the env-var contract
+ * is unit-testable without going through ensureConsoleRunning/spawnDaemon
+ * at all. */
+export function herdrConsoleEnsureOptions(env: NodeJS.ProcessEnv): { idleShutdownMs?: number } {
+  return env.AIS_HERDR_KEEP_CONSOLE === "1" ? {} : { idleShutdownMs: HERDR_CONSOLE_IDLE_SHUTDOWN_MS };
+}
+
 /* ------------------------------ argument model ----------------------------- */
 
 export interface HerdrInvocation {
@@ -227,7 +246,7 @@ function realDeps(): HerdrCommandDeps {
     ensureTuiPath: () => ensureAistuiBinary(),
     consoleUrl: async () => {
       const { ensureConsoleRunning } = await import("./web.ts");
-      const port = await ensureConsoleRunning();
+      const port = await ensureConsoleRunning(undefined, herdrConsoleEnsureOptions(process.env));
       return `http://127.0.0.1:${port}`;
     },
     consoleToken: async () => {
