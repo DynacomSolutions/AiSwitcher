@@ -23,7 +23,13 @@ function git(root: string, args: string[]): string {
 }
 
 function hasGitleaks(): boolean {
-  return Bun.spawnSync(["gitleaks", "version"], { stdout: "pipe", stderr: "pipe" }).exitCode === 0;
+  // Bun.spawnSync throws synchronously (ENOENT) rather than returning a
+  // non-zero exit code when the executable isn't on PATH at all.
+  try {
+    return Bun.spawnSync(["gitleaks", "version"], { stdout: "pipe", stderr: "pipe" }).exitCode === 0;
+  } catch {
+    return false;
+  }
 }
 
 function runGitleaks(root: string, args: string[]): boolean {
@@ -40,20 +46,37 @@ function runGitleaks(root: string, args: string[]): boolean {
 // credential-literal patterns: common provider API key/token shapes, cloud
 // access keys, PEM private-key headers, bearer tokens and JWT-shaped
 // strings. Only used when gitleaks is not available on PATH.
-const CREDENTIAL_PATTERNS: RegExp[] = [
+const STRUCTURAL_CREDENTIAL_PATTERNS: RegExp[] = [
   /\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|xai-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})\b/g,
   /\b(?:AKIA|ASIA|AIDA|AROA)[A-Z0-9]{16}\b/g,
   /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/g,
   /\bBearer\s+([A-Za-z0-9_./+=-]{8,})/gi,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
-  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret[_-]?access[_-]?key|password)\s*["']?\s*[:=]\s*["']([A-Za-z0-9_./+=-]{12,})["']/gi,
 ];
+// This one alone needs an entropy check: unlike the structural patterns
+// above, "api_key: \"...\"" matches equally well on a real secret and on an
+// obviously-fake test fixture ("access_token: \"codex-access\""), which
+// this codebase's own tests are full of.
+const KEY_VALUE_CREDENTIAL_PATTERN =
+  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret[_-]?access[_-]?key|password)\s*["']?\s*[:=]\s*["']([A-Za-z0-9_./+=-]{12,})["']/gi;
+
+// A plain lowercase, hyphen/underscore-joined run of short "words" (up to 5)
+// reads as a descriptive placeholder ("codex-access", "ali-plan-key"), not a
+// real credential: real tokens are effectively random, so a genuine one
+// only matches this by chance far less often than fixtures use this style.
+function looksLikePlaceholder(value: string): boolean {
+  return /^[a-z]+([_-][a-z0-9]+){0,4}$/.test(value) && value.length < 32;
+}
 
 function builtinLineHasSecret(text: string): boolean {
-  return CREDENTIAL_PATTERNS.some(pattern => {
-    pattern.lastIndex = 0;
-    return pattern.test(text) && !text.includes("SYNTHETIC_FIXTURE");
-  });
+  if (text.includes("SYNTHETIC_FIXTURE")) return false;
+  if (STRUCTURAL_CREDENTIAL_PATTERNS.some(pattern => { pattern.lastIndex = 0; return pattern.test(text); })) return true;
+  KEY_VALUE_CREDENTIAL_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = KEY_VALUE_CREDENTIAL_PATTERN.exec(text))) {
+    if (!looksLikePlaceholder(match[1]!)) return true;
+  }
+  return false;
 }
 
 function builtinScanDiff(diff: string): number {
