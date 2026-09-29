@@ -178,6 +178,22 @@ export function findHomePaths(text: string): string[] {
   return found;
 }
 
+// ---- personal machine nicknames -----------------------------------------------
+// A device nickname naming one specific, identifiable machine is an
+// anecdote, not a generic platform reference. Deliberately narrow: it must
+// never fire on ordinary platform prose (the OS name, or the bare
+// hardware-family word on its own, stay unblocked), only on nickname-shaped
+// phrases that point at a specific personal laptop or desktop.
+//
+// The pattern text below is itself an instance of what it matches, so
+// findMachineNicknames is only ever run through scannableSegments (never on
+// raw code) to keep this file from flagging its own regex literal.
+const MACHINE_NICKNAME_RE = /\b(?:the\s+macbook|my\s+macbook|macbook(?:\s+pro|\s+air)?|imac|mac\s*mini|my\s+laptop)\b/gi;
+
+export function findMachineNicknames(text: string): string[] {
+  return [...text.matchAll(MACHINE_NICKNAME_RE)].map(match => match[0]);
+}
+
 // ---- per-line rule aggregation -----------------------------------------------
 
 // This scanner's own unit tests deliberately contain non-allowlisted
@@ -193,7 +209,8 @@ export function checkLine(path: string, text: string, state: CommentState = { in
   if (findEmails(text).length) rules.add("blocked-email");
   if (findIps(text).length) rules.add("blocked-ip");
   for (const segment of scannableSegments(path, text, state)) {
-    if (findDomains(segment).length) { rules.add("blocked-domain"); break; }
+    if (findDomains(segment).length) rules.add("blocked-domain");
+    if (findMachineNicknames(segment).length) rules.add("personal-machine-nickname");
   }
   return [...rules];
 }

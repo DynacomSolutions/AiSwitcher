@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
-  checkLine, findDomains, findEmails, findHomePaths, findIps, isAllowedDomain, scannableSegments,
+  checkLine, findDomains, findEmails, findHomePaths, findIps, findMachineNicknames, isAllowedDomain,
+  scannableSegments,
 } from "../scripts/identifier-scan.ts";
 
 describe("domain allowlist", () => {
@@ -131,6 +132,26 @@ describe("findHomePaths", () => {
 
   test("blocks a real-looking username", () => {
     expect(findHomePaths("/home/" + ["jane", "doe"].join("") + "/project")).toHaveLength(1);
+  });
+});
+
+describe("findMachineNicknames", () => {
+  test("blocks personal device nicknames", () => {
+    for (const text of [
+      "observed on the MacBook, first-run 13G mirror",
+      "was not found on the MacBook (no local Rust build)",
+      "reproduced on my laptop this morning",
+      "tested on an iMac and a Mac Mini",
+    ]) expect(findMachineNicknames(text).length).toBeGreaterThan(0);
+  });
+
+  test("never flags generic macOS/platform prose", () => {
+    for (const text of [
+      "Installer backup hangs on macOS: runBackup loops at ~157% CPU",
+      "aarch64-apple-darwin native on apple-builder",
+      "supports macOS and Linux",
+      "a Mac in the generic sense, not a device nickname",
+    ]) expect(findMachineNicknames(text)).toEqual([]);
   });
 });
 
