@@ -991,7 +991,7 @@ mod tests {
     fn status_bar_fits_its_width() {
         let s = state();
         for width in [40, 60, 80, 120, 200] {
-            let text = line_text(&status_line(&s, Some("remote:herdr.dynacom.dev"), width));
+            let text = line_text(&status_line(&s, Some("remote:herdr.example.com"), width));
             assert!(
                 text.chars().count() <= width,
                 "status bar overflows {width}: {text}"

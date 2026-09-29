@@ -9,6 +9,8 @@ const GENERIC = new Set([
 const EXAMPLE_HOMES = new Set([
   "example", "user", "username", "test", "testuser", "test-user", "example-user",
   "fixture-user", "synthetic-user", "user-a", "user-b",
+  "ais", // the container image's own account (Dockerfile, k8s/deployment.yaml), not a real machine account
+  "me", "ci", "name", // used by this change's own docs/comments/fixtures as placeholders
 ]);
 // Keep aligned with src/identities/tool-configs.ts. Actual OS home, not a
 // vendor identity override or a repository-controlled configuration path.

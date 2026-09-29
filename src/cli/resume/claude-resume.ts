@@ -7,10 +7,9 @@ import type { ResumableSession, ToolResumeResult } from "./types.ts";
 
 /**
  * Claude Code's own project-directory naming: every character that isn't a
- * letter or digit is replaced with "-" (confirmed empirically against every
- * real project directory on this machine: slashes, dots, and spaces all
- * turn into "-", e.g. "/Users/t/Projects/r8er.co.uk" ->
- * "-Users-t-Projects-r8er-co-uk"). This is a pure forward encoding used only
+ * letter or digit is replaced with "-" (confirmed empirically: slashes,
+ * dots, and spaces all turn into "-", e.g. "/Users/me/Projects/example.com"
+ * -> "-Users-me-Projects-example-com"). This is a pure forward encoding used only
  * to find the CANDIDATE directory; the authoritative check is always each
  * session's own recorded "cwd" field below, since the encoding is lossy in
  * the reverse direction (a real path containing a literal "-" is

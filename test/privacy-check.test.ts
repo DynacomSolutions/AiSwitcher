@@ -286,7 +286,10 @@ describe("hook installation", () => {
   test("preserves existing hooks, stdin, arguments, failure status and idempotency", () => {
     const root = repository(), hooks = join(root, ".git", "hooks");
     const fakeBun = join(root, "fake-bun");
-    writeFileSync(fakeBun, '#!/bin/sh\nprintf "%s\\n" "$@" > "$GUARD_ARGS"\ncat > "$GUARD_INPUT"\nexit "${GUARD_STATUS:-0}"\n', { mode: 0o755 });
+    // Each hook now shells out to bun multiple times (privacy-check,
+    // identifier-scan, secret-scan, and typecheck/lint on pre-push), so the
+    // fake bun APPENDS its args/stdin across calls rather than overwriting.
+    writeFileSync(fakeBun, '#!/bin/sh\nprintf "%s\\n" "$@" >> "$GUARD_ARGS"\nprintf "==\\n" >> "$GUARD_ARGS"\ncat >> "$GUARD_INPUT"\nexit "${GUARD_STATUS:-0}"\n', { mode: 0o755 });
     const previous = '#!/bin/sh\nprintf "%s\\n" "$@" > "$OLD_ARGS"\ncat > "$OLD_INPUT"\nexit "${OLD_STATUS:-0}"\n';
     for (const kind of ["pre-commit", "pre-push"]) writeFileSync(join(hooks, kind), previous, { mode: 0o755 });
     installHooks(root, fakeBun);
@@ -305,7 +308,9 @@ describe("hook installation", () => {
     );
     expect(run("pre-push").exitCode).toBe(0);
     expect(readFileSync(env.OLD_INPUT, "utf8")).toBe(input);
-    expect(readFileSync(env.GUARD_INPUT, "utf8")).toBe(input);
+    // The three pre-push checks (privacy-check, identifier-scan, secret-scan)
+    // are each fed the same captured input; typecheck/lint read /dev/null.
+    expect(readFileSync(env.GUARD_INPUT, "utf8")).toBe(input + input + input);
     expect(readFileSync(env.OLD_ARGS, "utf8")).toBe("destination\nsynthetic-destination\n");
     expect(readFileSync(env.GUARD_ARGS, "utf8")).toContain("--pre-push\ndestination\nsynthetic-destination\n");
     writeFileSync(env.GUARD_INPUT, "not called");

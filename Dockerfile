@@ -34,13 +34,13 @@ COPY --from=oven/bun:1.3 /usr/local/bin/bunx /usr/local/bin/bunx
 COPY --from=web /build/dist /web/dist
 # resolveInstalledAisBinary() probes $HOME/.local/bin/ais first (background
 # sync workers and remote-AIS callers), so give it a real file to find.
-RUN useradd --uid 1000 --create-home thomas \
- && mkdir -p /home/thomas/.local/bin /web/state \
- && cp /usr/local/bin/ais /home/thomas/.local/bin/ais \
- && chown -R 1000:1000 /home/thomas /web/state
+RUN useradd --uid 1000 --create-home ais \
+ && mkdir -p /home/ais/.local/bin /web/state \
+ && cp /usr/local/bin/ais /home/ais/.local/bin/ais \
+ && chown -R 1000:1000 /home/ais /web/state
 USER 1000
-WORKDIR /home/thomas
-ENV HOME=/home/thomas \
+WORKDIR /home/ais
+ENV HOME=/home/ais \
     AIS_WEB_HOST=0.0.0.0 \
     AIS_WEB_PORT=47129 \
     AIS_WEB_DIST=/web/dist

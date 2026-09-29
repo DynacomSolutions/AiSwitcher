@@ -1,7 +1,7 @@
 import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-const MARKER = "# AIS privacy guard v1";
+const MARKER = "# AIS privacy guard v2";
 const quote = (text: string): string => `'${text.replace(/'/g, "'\\''")}'`;
 function exists(path: string): boolean {
   try { lstatSync(path); return true; } catch (error) {
@@ -25,13 +25,15 @@ function resolvedPath(path: string): string {
 }
 
 export function hookText(kind: "pre-commit" | "pre-push", previous: string, bun: string): string {
-  const command = `${quote(bun)} run scripts/privacy-check.ts --local`;
+  const b = quote(bun);
   const prelude = `#!/bin/sh\n${MARKER}\nset -u\nprevious=${quote(previous)}\n`;
   if (kind === "pre-commit") return `${prelude}
 if [ -x "$previous" ]; then
   "$previous" "$@" || exit "$?"
 fi
-${command} --staged
+${b} run scripts/privacy-check.ts --local --staged || exit "$?"
+${b} run scripts/identifier-scan.ts --staged || exit "$?"
+${b} run scripts/secret-scan.ts --staged
 `;
   return `${prelude}
 umask 077
@@ -42,7 +44,11 @@ cat > "$input" || exit 2
 if [ -x "$previous" ]; then
   "$previous" "$@" < "$input" || exit "$?"
 fi
-${command} --pre-push "$@" < "$input"
+${b} run scripts/privacy-check.ts --local --pre-push "$@" < "$input" || exit "$?"
+${b} run scripts/identifier-scan.ts --pre-push "$@" < "$input" || exit "$?"
+${b} run scripts/secret-scan.ts --pre-push "$@" < "$input" || exit "$?"
+${b} run typecheck < /dev/null || exit "$?"
+${b} run lint < /dev/null
 `;
 }
 
