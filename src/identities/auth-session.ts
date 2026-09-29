@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Identity } from "./types.ts";
 import { expandPath } from "./match.ts";
-import { authBrowserConfigFor, ensureAuthBrowserPorts, readAuthVncPassword } from "./auth-browser.ts";
+import { authBrowserConfigFor, ensureAuthBrowserPorts, readAuthVncPassword, getAuthBrowserNamespace } from "./auth-browser.ts";
 
 const AUTH_STATE_DIR = join(homedir(), ".ais", "auth-browser");
 const ALI_CONSOLE_URL =
@@ -246,7 +246,7 @@ export async function refreshAliAuthSession(identity: Identity): Promise<string>
   if (!state) {
     throw new AliAuthRefreshError(
       `auth browser for "${identity.name}" is unreachable (chrome-auth deployment or its port-forward is down)`,
-      "start it with 'ais auth login " + identity.name + " --tool=ali' (prints the noVNC URL), or inspect 'kubectl -n chrome-mcp get pods'",
+      "start it with 'ais auth login " + identity.name + " --tool=ali' (prints the noVNC URL), or inspect 'kubectl -n " + getAuthBrowserNamespace() + " get pods'",
     );
   }
   const cookieByName = new Map<string, string>();

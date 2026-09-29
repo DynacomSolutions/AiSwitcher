@@ -2,9 +2,17 @@ import { platform } from "node:os";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-const K3S_NAMESPACE = "chrome-mcp";
+const DEFAULT_AUTH_BROWSER_NAMESPACE = "chrome-mcp";
 const AUTH_PORT_BASE = 9444;
 const NOVNC_PORT_BASE = 9744;
+
+/** Resolves the Kubernetes namespace for the interactive auth browser service.
+ * Reads from AIS_AUTH_BROWSER_NAMESPACE environment variable (trimmed),
+ * falling back to the default "chrome-mcp" if unset or empty. */
+export function getAuthBrowserNamespace(): string {
+  const envValue = process.env.AIS_AUTH_BROWSER_NAMESPACE?.trim();
+  return envValue && envValue.length > 0 ? envValue : DEFAULT_AUTH_BROWSER_NAMESPACE;
+}
 
 export interface AuthBrowserConfig {
   webdriverPort: number;
@@ -126,7 +134,7 @@ export async function ensureAuthBrowserPorts(identityName: string): Promise<Auth
         `--unit=${unit}`,
         "kubectl",
         "-n",
-        K3S_NAMESPACE,
+        getAuthBrowserNamespace(),
         "port-forward",
         `service/${config.service}`,
         `${config.webdriverPort}:4444`,
@@ -146,7 +154,7 @@ export async function ensureAuthBrowserPorts(identityName: string): Promise<Auth
     if (process.env.AIS_K8S_API_SERVER) args.push("--server", process.env.AIS_K8S_API_SERVER);
     args.push(
       "-n",
-      K3S_NAMESPACE,
+      getAuthBrowserNamespace(),
       "port-forward",
       `service/${config.service}`,
       `${config.webdriverPort}:4444`,
@@ -170,7 +178,7 @@ export async function readAuthVncPassword(identityName: string): Promise<string 
   const { secret } = authBrowserConfigFor(identityName);
   try {
     const proc = Bun.spawn(
-      ["kubectl", "-n", K3S_NAMESPACE, "get", "secret", secret, "-o", "jsonpath={.data.password}"],
+      ["kubectl", "-n", getAuthBrowserNamespace(), "get", "secret", secret, "-o", "jsonpath={.data.password}"],
       { stdout: "pipe", stderr: "ignore" },
     );
     const encoded = (await new Response(proc.stdout).text()).trim();
