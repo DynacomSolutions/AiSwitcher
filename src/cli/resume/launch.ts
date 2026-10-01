@@ -5,6 +5,7 @@ import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import type { ResumableSession } from "./types.ts";
 import { recoverOrphanedCodexBackfill } from "../../shared/codex-backfill.ts";
 import { startProfileSyncWatcher } from "../../sync/watch.ts";
+import { gatePluginArgs } from "../../shared/plugin-gating.ts";
 import { launchThenStartBackgroundSync } from "../../sync/background.ts";
 
 /** Per-tool resume invocation, confirmed against each real CLI's own --help:
@@ -67,7 +68,7 @@ export async function launchResume(session: ResumableSession): Promise<never> {
     process.cwd(),
   );
   const exitCode = await launchThenStartBackgroundSync(() =>
-    spawnReal(binaryPath, resumeArgs(session.sessionId), {
+    spawnReal(binaryPath, gatePluginArgs(session.toolName, resumeArgs(session.sessionId), process.cwd()), {
       [cfg.envVarName]: session.identity.configDir,
       ...extraEnv,
       [IDENTITY_SESSION_MARKER]: session.identity.name,
