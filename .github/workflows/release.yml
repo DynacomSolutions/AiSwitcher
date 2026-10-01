@@ -93,8 +93,8 @@ jobs:
     # asset convention the installer downloads by (`aistui-darwin-arm64`,
     # ...), uploaded as separate artifacts so the release job's
     # artifacts/*/* glob picks them up unchanged. Toolchains per leg:
-    # darwin targets build natively on the org's apple-builder macOS
-    # runners (Apple's toolchain links both the arm64 and x86_64 slices);
+    # darwin targets build on macos-latest GitHub-hosted runners; the
+    # rust toolchain can cross-compile x86_64 binaries on arm64 macOS;
     # linux-x64 builds natively on ubuntu; linux-arm64 needs a cross link
     # toolchain, and `cross` (pinned Docker toolchain) is the least fragile
     # CI path for aarch64-unknown-linux-gnu. If a leg ever proves
@@ -104,8 +104,8 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: darwin-arm64, triple: aarch64-apple-darwin, runner: apple-builder, builder: cargo }
-          - { name: darwin-x64, triple: x86_64-apple-darwin, runner: apple-builder, builder: cargo }
+          - { name: darwin-arm64, triple: aarch64-apple-darwin, runner: macos-latest, builder: cargo }
+          - { name: darwin-x64, triple: x86_64-apple-darwin, runner: macos-latest, builder: cargo }
           - { name: linux-x64, triple: x86_64-unknown-linux-gnu, runner: ubuntu-latest, builder: cargo }
           - { name: linux-arm64, triple: aarch64-unknown-linux-gnu, runner: ubuntu-latest, builder: cross }
     steps:
