@@ -13,6 +13,7 @@ import { codexPlatformArgs } from "./codex-platform-config.ts";
 import { projectSharedCodexConfigForLaunch } from "./codex-shared-config.ts";
 import { codexSubcommandConfigArgs } from "./codex-config-args.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
+import { gatePluginArgs } from "./plugin-gating.ts";
 import { runLaunchGate } from "../spend/gate.ts";
 
 export async function runWrapper(
@@ -115,7 +116,7 @@ export async function runWrapper(
     );
     const launchArgs = cfg.toolName === "codex"
       ? codexSubcommandConfigArgs(memoryProjection.argv)
-      : memoryProjection.argv;
+      : gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd());
     const launch = () =>
       spawnReal(realBinary, launchArgs, {
         [cfg.envVarName]: resolved.configDirValue,
