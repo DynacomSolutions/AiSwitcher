@@ -17,7 +17,7 @@ on:
 
 jobs:
   build:
-    runs-on: ais-public-runners
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         target:
@@ -138,7 +138,7 @@ jobs:
 
   release:
     needs: [build, build-tui]
-    runs-on: ais-public-runners
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
