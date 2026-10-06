@@ -421,6 +421,7 @@ function harness(options: {
    * extension takes its `select` fallback path. */
   customKeys?: string[][];
   argv?: string[];
+  runHerdr?: (args: string[]) => Promise<{ ok: boolean; stdout: string }>;
 }) {
   const registered: RegisteredProvider[] = [];
   const setModelCalls: AiModel[] = [];
@@ -518,6 +519,7 @@ function harness(options: {
     cwd: () => baseCtx.cwd ?? "/home/example/projects/personal/app",
     argv: options.argv ?? [],
     home: () => HOME,
+    ...(options.runHerdr ? { runHerdr: options.runHerdr } : {}),
   });
 
   return {
@@ -618,6 +620,102 @@ describe("provider registration", () => {
       signal: new AbortController().signal,
     })) as { auth: { apiKey: string } };
     expect(resolved.auth.apiKey).toBe("SYNTHETIC_FIXTURE_KEY");
+  });
+});
+
+describe("Pi Herdr chat tab titles", () => {
+  test("updates the exact Pi session tab from each meaningful prompt and preserves manual labels", async () => {
+    const previousOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
+    const previousMarker = process.env.AI_PROFILE_SWITCHER_SESSION;
+    delete process.env.AIS_HERDR_TITLE_OWNER_PID;
+    delete process.env.AI_PROFILE_SWITCHER_SESSION;
+    try {
+      let label = "4";
+      const commands: string[][] = [];
+      const runHerdr = async (args: string[]) => {
+        commands.push(args);
+        if (args[0] === "pane" && args[1] === "current") return { ok: true, stdout: JSON.stringify({ result: { pane: { pane_id: "pi-pane", tab_id: "pi-tab" } } }) };
+        if (args[0] === "pane" && args[1] === "process-info") return { ok: true, stdout: JSON.stringify({ result: { process_info: { foreground_processes: [{ pid: process.pid }] } } }) };
+        if (args[0] === "tab" && args[1] === "list") return { ok: true, stdout: JSON.stringify({ result: { tabs: [{ tab_id: "pi-tab", label, number: 4 }] } }) };
+        if (args[0] === "pane" && args[1] === "list") return { ok: true, stdout: JSON.stringify({ result: { panes: [{ pane_id: "pi-pane", tab_id: "pi-tab", agent: "pi", agent_session: { agent: "pi", kind: "id", value: "session-pi" } }] } }) };
+        if (args[0] === "tab" && args[1] === "rename") { label = args[3] ?? ""; return { ok: true, stdout: "" }; }
+        return { ok: true, stdout: "" };
+      };
+      const h = harness({
+        ctx: { sessionManager: { getSessionId: () => "session-pi", getSessionFile: () => "/synthetic/pi-session.jsonl" } },
+        runHerdr,
+      });
+      await h.promise;
+      expect(String(process.env.AIS_HERDR_TITLE_OWNER_PID)).toBe(String(process.pid));
+      await h.handlers.get("session_start")?.({} as never, h.ctx);
+      await h.handlers.get("before_agent_start")?.({ prompt: "Investigate the exact-session title update" } as never, h.ctx);
+      expect(label).toBe("Investigate the exact-session title update");
+      await h.handlers.get("before_agent_start")?.({ prompt: "okay" } as never, h.ctx);
+      expect(label).toBe("Investigate the exact-session title update");
+      label = "My manually chosen Pi title";
+      await h.handlers.get("before_agent_start")?.({ prompt: "Change the database index" } as never, h.ctx);
+      label = "Investigate the exact-session title update";
+      await h.handlers.get("before_agent_start")?.({ prompt: "Change the database index" } as never, h.ctx);
+      expect(label).toBe("Investigate the exact-session title update");
+      expect(commands.filter((args) => args[0] === "pane" && args[1] === "current")).toHaveLength(1);
+      expect(commands.filter((args) => args[0] === "tab" && args[1] === "rename")).toHaveLength(1);
+    } finally {
+      if (previousOwner === undefined) delete process.env.AIS_HERDR_TITLE_OWNER_PID;
+      else process.env.AIS_HERDR_TITLE_OWNER_PID = previousOwner;
+      if (previousMarker === undefined) delete process.env.AI_PROFILE_SWITCHER_SESSION;
+      else process.env.AI_PROFILE_SWITCHER_SESSION = previousMarker;
+    }
+  });
+
+  test("retries session metadata at agent_end using the exact current user message", async () => {
+    const previousOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
+    delete process.env.AIS_HERDR_TITLE_OWNER_PID;
+    const sessionFile = `/tmp/ais-pi-title-${crypto.randomUUID()}.jsonl`;
+    try {
+      let label = "5";
+      let bindingAvailable = false;
+      const runHerdr = async (args: string[]) => {
+        if (args[0] === "pane" && args[1] === "current") return { ok: true, stdout: JSON.stringify({ result: { pane: { pane_id: "p", tab_id: "t" } } }) };
+        if (args[0] === "pane" && args[1] === "process-info") return { ok: true, stdout: JSON.stringify({ result: { process_info: { foreground_processes: [{ pid: process.pid }] } } }) };
+        if (args[0] === "tab" && args[1] === "list") return { ok: true, stdout: JSON.stringify({ result: { tabs: [{ tab_id: "t", label, number: 5 }] } }) };
+        if (args[0] === "pane" && args[1] === "list") return { ok: true, stdout: JSON.stringify({ result: { panes: [{ pane_id: "p", tab_id: "t", agent: "pi", agent_session: bindingAvailable ? { agent: "pi", kind: "id", value: "pi-session" } : null }] } }) };
+        if (args[0] === "tab" && args[1] === "rename") { label = args[3] ?? ""; return { ok: true, stdout: "" }; }
+        return { ok: true, stdout: "" };
+      };
+      await Bun.write(sessionFile, "");
+      const h = harness({
+        ctx: { sessionManager: { getSessionId: () => "pi-session", getSessionFile: () => sessionFile } },
+        runHerdr,
+      });
+      await h.promise;
+      await h.handlers.get("session_start")?.({} as never, h.ctx);
+      await h.handlers.get("before_agent_start")?.({ prompt: "Map the recent user session topic" } as never, h.ctx);
+      expect(label).toBe("5");
+      bindingAvailable = true;
+      await Bun.write(sessionFile, `${JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "Map the recent user session topic" }] } })}\n`);
+      await h.handlers.get("agent_end")?.({} as never, h.ctx);
+      expect(label).toBe("Map the recent user session topic");
+    } finally {
+      await Bun.file(sessionFile).delete().catch(() => undefined);
+      if (previousOwner === undefined) delete process.env.AIS_HERDR_TITLE_OWNER_PID;
+      else process.env.AIS_HERDR_TITLE_OWNER_PID = previousOwner;
+    }
+  });
+
+  test("does not claim a Pi session inherited from another owning process", async () => {
+    const previousOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
+    process.env.AIS_HERDR_TITLE_OWNER_PID = "99999999";
+    let calls = 0;
+    try {
+      const h = harness({ runHerdr: async () => { calls += 1; return { ok: false, stdout: "" }; } });
+      await h.promise;
+      await h.handlers.get("session_start")?.({} as never, h.ctx);
+      await h.handlers.get("before_agent_start")?.({ prompt: "Do not claim the parent's tab" } as never, h.ctx);
+      expect(calls).toBe(0);
+    } finally {
+      if (previousOwner === undefined) delete process.env.AIS_HERDR_TITLE_OWNER_PID;
+      else process.env.AIS_HERDR_TITLE_OWNER_PID = previousOwner;
+    }
   });
 });
 

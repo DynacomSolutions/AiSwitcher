@@ -44,16 +44,17 @@
  *   first registry identity.
  */
 
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, realpathSync, renameSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
+import { spawn } from "node:child_process";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { stream as compatStream, streamSimple as compatStreamSimple } from "@earendil-works/pi-ai/compat";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 /** Version stamp the installer matches against; bump to force a refresh of
  * installed copies on next launch. */
-export const AIS_EXTENSION_VERSION = "2.1.0";
+export const AIS_EXTENSION_VERSION = "2.2.0";
 
 export const STATUS_KEY = "ais";
 export const WIDGET_KEY = "ais";
@@ -64,6 +65,7 @@ const IDENTITY_ENV_VAR = "AI_PROFILE_SWITCHER_SESSION";
 
 /** AIS's complete-profile boundary for Pi (src/identities/tool-configs.ts). */
 const CONFIG_DIR_ENV_VAR = "PI_CODING_AGENT_DIR";
+const HERDR_TITLE_OWNER_ENV_VAR = "AIS_HERDR_TITLE_OWNER_PID";
 
 /** Separator between base provider id and identity name in namespaced
  * provider ids: `anthropic--personal`. Base provider ids and identity names
@@ -129,6 +131,7 @@ export interface ExtensionContextSubset {
   model: AiModel | undefined;
   modelRegistry: ModelRegistrySubset;
   ui: UiSubset;
+  sessionManager?: { getSessionId(): string; getSessionFile(): string | undefined };
 }
 
 interface RegisteredCommandSubset {
@@ -139,6 +142,8 @@ interface RegisteredCommandSubset {
 
 export interface ExtensionApiSubset {
   on(event: "session_start", handler: (event: unknown, ctx: ExtensionContextSubset) => void | Promise<void>): void;
+  on(event: "before_agent_start", handler: (event: { prompt: string }, ctx: ExtensionContextSubset) => void | Promise<void>): void;
+  on(event: "agent_end", handler: (event: unknown, ctx: ExtensionContextSubset) => void | Promise<void>): void;
   on(
     event: "model_select",
     handler: (event: { model: AiModel }, ctx: ExtensionContextSubset) => void | Promise<void>,
@@ -881,6 +886,86 @@ export interface ExtensionDeps {
   cwd?: () => string;
   argv?: string[];
   home?: () => string;
+  runHerdr?: (args: string[]) => Promise<{ ok: boolean; stdout: string }>;
+}
+
+interface PiHerdrPane {
+  pane_id: string;
+  tab_id: string;
+  agent?: string;
+  agent_session?: { agent: string; kind: "id" | "path"; value: string } | null;
+}
+
+interface PiHerdrTab { tab_id: string; label: string; number: number }
+
+function piChatTitle(value: string): string | undefined {
+  const cleaned = value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/<environment_context[\s\S]*?<\/environment_context>/gi, " ")
+    .replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  if (cleaned.length < 4 || /^(help|version|resume|new|continue|quit|exit|clear|status|model)$/i.test(cleaned)) return undefined;
+  if (/^(yes|yep|yeah|ok|okay|sure|continue|go ahead|proceed|do it|sounds good|thanks|thank you|no|nope|right|correct|exactly)[.!?,\s]*$/i.test(cleaned)) return undefined;
+  return cleaned.length > 64 ? `${cleaned.slice(0, 61).trimEnd()}…` : cleaned;
+}
+
+function recentPiUserPrompt(path: string | undefined): string | undefined {
+  if (!path) return undefined;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const totalSize = fstatSync(fd).size;
+    const size = Math.min(128 * 1024, totalSize);
+    const buffer = Buffer.alloc(size);
+    readSync(fd, buffer, 0, size, Math.max(0, totalSize - size));
+    const rows = buffer.toString("utf8").split("\n").filter(Boolean).reverse();
+    for (const row of rows) {
+      let parsed: { type?: string; message?: { role?: string; content?: unknown } };
+      try { parsed = JSON.parse(row) as typeof parsed; } catch { continue; }
+      if (parsed.type !== "message" || parsed.message?.role !== "user") continue;
+      const content = parsed.message.content;
+      const text = typeof content === "string" ? content : Array.isArray(content)
+        ? content.flatMap((part) => part && typeof part === "object" && "type" in part && (part.type === "text" || part.type === "input_text") && "text" in part && typeof part.text === "string" ? [part.text] : []).join(" ")
+        : "";
+      const title = piChatTitle(text);
+      if (title) return title;
+    }
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ }
+  }
+  return undefined;
+}
+
+async function runPiHerdr(args: string[]): Promise<{ ok: boolean; stdout: string }> {
+  const override = process.env.AIS_HERDR_BIN?.trim();
+  const bin = override || process.env.PATH?.split(":").map((dir) => `${dir}/herdr`).find((path) => existsSync(path)) || `${homedir()}/.local/bin/herdr`;
+  if (!existsSync(bin)) return { ok: false, stdout: "" };
+  return await new Promise((resolve) => {
+    let stdout = "";
+    let child: ReturnType<typeof spawn> | undefined;
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ ok, stdout });
+    };
+    try {
+      child = spawn(bin, args, { stdio: ["ignore", "pipe", "ignore"] });
+      child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); if (stdout.length > 256_000) child?.kill(); });
+      child.on("error", () => finish(false));
+      child.on("close", (code) => finish(code === 0 && stdout.length <= 256_000));
+    } catch { finish(false); }
+    timer = setTimeout(() => { child?.kill(); finish(false); }, 900);
+    timer.unref?.();
+  });
+}
+
+function piHerdrResult<T>(stdout: string, key: string): T | undefined {
+  try { return (JSON.parse(stdout) as { result?: Record<string, unknown> }).result?.[key] as T | undefined; }
+  catch { return undefined; }
 }
 
 function defaultReadIdentityModels(configDir: string): Record<string, CustomProviderConfig> {
@@ -928,6 +1013,80 @@ export default async function aisIdentityExtension(
   const writeJson = deps.writeJson ?? writeJsonAtomic;
   const readJson = deps.readJson ?? readJsonSafe;
   const readInstanceAuth = deps.readAuth ?? (() => readAuthMap(authPath()));
+  const herdr = deps.runHerdr ?? runPiHerdr;
+  let titlePane: PiHerdrPane | undefined;
+  let titleLabel: string | undefined;
+  const inheritedTitleOwner = process.env[HERDR_TITLE_OWNER_ENV_VAR];
+  let titleDisabled = inheritedTitleOwner !== undefined && inheritedTitleOwner !== String(process.pid);
+  // Descendant wrappers can now distinguish this Pi process from the root
+  // plugin instance. The PID remains stable across /reload, so reloading the
+  // extension does not suppress its own title updates.
+  process.env[HERDR_TITLE_OWNER_ENV_VAR] = String(process.pid);
+  let titleCapture: Promise<void> | undefined;
+  let titleQueue: Promise<void> = Promise.resolve();
+
+  async function captureTitlePane(ctx: ExtensionContextSubset): Promise<void> {
+    if (titleCapture) return titleCapture;
+    titleCapture = doCaptureTitlePane(ctx).finally(() => {
+      if (!titlePane) titleCapture = undefined;
+    });
+    return titleCapture;
+  }
+
+  async function doCaptureTitlePane(ctx: ExtensionContextSubset): Promise<void> {
+    if (titleDisabled || titlePane || !ctx.sessionManager) return;
+    try {
+      const current = await herdr(["pane", "current", "--current"]);
+      const pane = current.ok ? piHerdrResult<PiHerdrPane>(current.stdout, "pane") : undefined;
+      if (!pane?.pane_id || !pane.tab_id) return;
+      const processResult = await herdr(["pane", "process-info", "--pane", pane.pane_id]);
+      const info = processResult.ok ? piHerdrResult<{ foreground_processes?: Array<{ pid?: number }> }>(processResult.stdout, "process_info") : undefined;
+      if (!info?.foreground_processes?.some((candidate) => candidate.pid === process.pid)) return;
+      const tabsResult = await herdr(["tab", "list"]);
+      const tabs = tabsResult.ok ? piHerdrResult<PiHerdrTab[]>(tabsResult.stdout, "tabs") : undefined;
+      const tab = tabs?.find((candidate) => candidate.tab_id === pane.tab_id);
+      if (!tab || tab.label !== String(tab.number)) return;
+      titlePane = pane;
+    } catch {
+      // Optional integration: failed ownership proof leaves titles untouched.
+    }
+  }
+
+  async function updatePiTitle(prompt: string, ctx: ExtensionContextSubset): Promise<void> {
+    if (titleDisabled || !titlePane || !ctx.sessionManager) return;
+    const title = piChatTitle(prompt);
+    if (!title) return;
+    try {
+      const panesResult = await herdr(["pane", "list"]);
+      const panes = panesResult.ok ? piHerdrResult<PiHerdrPane[]>(panesResult.stdout, "panes") : undefined;
+      const pane = panes?.find((candidate) => candidate.pane_id === titlePane?.pane_id);
+      const session = pane?.agent_session;
+      if (!pane || pane.tab_id !== titlePane.tab_id || pane.agent !== "pi" || session?.agent !== "pi") return;
+      const sessionMatches = session.kind === "id"
+        ? session.value === ctx.sessionManager.getSessionId()
+        : Boolean(ctx.sessionManager.getSessionFile()) && resolvePath(session.value) === resolvePath(ctx.sessionManager.getSessionFile() as string);
+      if (!sessionMatches) return;
+      const tabsResult = await herdr(["tab", "list"]);
+      const tabs = tabsResult.ok ? piHerdrResult<PiHerdrTab[]>(tabsResult.stdout, "tabs") : undefined;
+      const tab = tabs?.find((candidate) => candidate.tab_id === pane.tab_id);
+      if (!tab) return;
+      if (tab.label !== String(tab.number) && tab.label !== titleLabel) {
+        titleDisabled = true;
+        return;
+      }
+      if (tab.label === title) return;
+      const renamed = await herdr(["tab", "rename", pane.tab_id, title]);
+      if (renamed.ok) titleLabel = title;
+    } catch {
+      // Herdr is optional; never interrupt Pi's prompt flow.
+    }
+  }
+
+  function queuePiTitle(prompt: string | undefined, ctx: ExtensionContextSubset): Promise<void> {
+    if (!prompt) return titleQueue;
+    titleQueue = titleQueue.then(() => updatePiTitle(prompt, ctx)).catch(() => undefined);
+    return titleQueue;
+  }
 
   const identities = parseRegistryIdentities(readRegistry()) ?? [];
   const identityByName = new Map(identities.map((identity) => [identity.name, identity]));
@@ -1502,6 +1661,9 @@ export default async function aisIdentityExtension(
   // -- lifecycle ---------------------------------------------------------------
 
   pi.on("session_start", async (_event, ctx) => {
+    await captureTitlePane(ctx);
+    const resumedTitle = recentPiUserPrompt(ctx.sessionManager?.getSessionFile());
+    if (resumedTitle) await queuePiTitle(resumedTitle, ctx);
     refreshKnownProviders(ctx);
     const state = stateFile();
     const cwdMatch = matchIdentityForCwd(identities, ctx.cwd ?? cwd(), home());
@@ -1553,6 +1715,16 @@ export default async function aisIdentityExtension(
     }
     persistState();
     showStatus(ctx, ctx.model);
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    await captureTitlePane(ctx);
+    await queuePiTitle(event.prompt, ctx);
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    const latestTitle = recentPiUserPrompt(ctx.sessionManager?.getSessionFile());
+    await queuePiTitle(latestTitle, ctx);
   });
 
   function safeHasAuth(ctx: ExtensionContextSubset, model: AiModel): boolean {
