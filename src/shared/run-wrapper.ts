@@ -15,6 +15,8 @@ import { codexSubcommandConfigArgs } from "./codex-config-args.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 import { gatePluginArgs } from "./plugin-gating.ts";
 import { runLaunchGate } from "../spend/gate.ts";
+import { readHerdrChatTitle, type HerdrChatTool } from "./herdr-chat-source.ts";
+import { HerdrTabTitleWatcher, promptFromCliArgs } from "./herdr-tab-title.ts";
 
 export async function runWrapper(
   cfg: ToolConfig,
@@ -122,11 +124,33 @@ export async function runWrapper(
         [cfg.envVarName]: resolved.configDirValue,
         ...extraEnv,
         ...memoryProjection.env,
+        ...((process.env.AIS_HERDR_TITLE_OWNER_PID ?? (parentIdentity || cfg.toolName !== "pi" ? String(process.pid) : undefined))
+          ? { AIS_HERDR_TITLE_OWNER_PID: process.env.AIS_HERDR_TITLE_OWNER_PID ?? String(process.pid) }
+          : {}),
         ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),
       });
+    const chatTitleTools: HerdrChatTool[] = ["claude", "codex", "grok", "kimi", "zai", "ali", "opencode"];
+    const chatTitleTool = chatTitleTools.find((tool): tool is HerdrChatTool => tool === cfg.toolName);
+    const inheritedTitleOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
+    const titleWatcher = !parentIdentity && (!inheritedTitleOwner || inheritedTitleOwner === String(process.pid)) && chatTitleTool
+      ? new HerdrTabTitleWatcher({
+          agent: cfg.realBinaryName,
+          tool: chatTitleTool,
+          configDir: resolved.configDirValue,
+          cwd: process.cwd(),
+          initialPrompt: promptFromCliArgs(cfg.toolName, parsed.cleanedArgv),
+          readTitle: readHerdrChatTitle,
+        })
+      : undefined;
+    await titleWatcher?.start();
     // The real agent is spawned before the detached sync worker. Nothing in
     // the automatic SSH path is awaited by agent startup.
-    const exitCode = await (parentIdentity ? launch() : launchThenStartBackgroundSync(launch));
+    let exitCode: number;
+    try {
+      exitCode = await (parentIdentity ? launch() : launchThenStartBackgroundSync(launch));
+    } finally {
+      titleWatcher?.stop();
+    }
     if (watcher) {
       await watcher.stop();
     } else {
