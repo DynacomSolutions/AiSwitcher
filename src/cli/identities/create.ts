@@ -9,6 +9,7 @@ import { listFlag, stringFlag } from "../args.ts";
 import { bold, green } from "../colors.ts";
 import { createIdentity } from "./actions.ts";
 import { loadOne, persist, requireToolConfigFromFlag } from "./resolve-tool.ts";
+import { CliUsageError } from "../errors.ts";
 
 function exitOnCancel(value: unknown): asserts value is string {
   if (clack.isCancel(value)) {
@@ -48,6 +49,11 @@ export async function runCreate(flags: ParsedArgs["flags"]): Promise<void> {
   const cfg = requireToolConfigFromFlag(flags);
 
   const nameFlag = stringFlag(flags, "name");
+  if (nameFlag !== undefined && !isValidIdentityKey(nameFlag)) {
+    throw new CliUsageError(
+      `Invalid name "${nameFlag}" — use lowercase letters, digits, and single hyphens only (e.g. identity-a)`,
+    );
+  }
   const labelFlag = stringFlag(flags, "label");
   const descriptionFlag = stringFlag(flags, "description");
   const directoriesFlag = listFlag(flags, "directories");
