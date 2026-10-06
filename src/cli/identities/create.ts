@@ -51,7 +51,7 @@ export async function runCreate(flags: ParsedArgs["flags"]): Promise<void> {
   const nameFlag = stringFlag(flags, "name");
   if (nameFlag !== undefined && !isValidIdentityKey(nameFlag)) {
     throw new CliUsageError(
-      `Invalid name "${nameFlag}" — use lowercase letters, digits, and single hyphens only (e.g. identity-a)`,
+      `Invalid name "${nameFlag}": use lowercase letters, digits, and single hyphens only (e.g. identity-a)`,
     );
   }
   const labelFlag = stringFlag(flags, "label");
