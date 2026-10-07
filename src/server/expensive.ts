@@ -13,6 +13,20 @@ interface CacheEntry<T> {
   at: number;
   value: T;
   inflight?: Promise<T>;
+  /** True once a fetch has succeeded; `value` is meaningless before that. */
+  hasValue?: boolean;
+  lastError?: string;
+  lastErrorAt?: number;
+}
+
+export interface SwrResult<T> {
+  value: T;
+  cached: boolean;
+  /** True when the value is older than its max age and a background refresh was started or is running. */
+  stale: boolean;
+  /** Message of the most recent failed refresh, while the last-good value is still being served. */
+  lastError?: string;
+  lastErrorAt?: number;
 }
 
 export function flagsFor(tool: string | undefined, identity: string | undefined): ParsedArgs["flags"] {
@@ -36,6 +50,7 @@ export class PollCache {
     entry.inflight = fetcher()
       .then((value) => {
         entry.value = value;
+        entry.hasValue = true;
         entry.at = Date.now();
         return value;
       })
@@ -44,6 +59,53 @@ export class PollCache {
       });
     this.entries.set(key, entry);
     return { value: await entry.inflight, cached: false };
+  }
+
+  /** Stale-while-revalidate read. With a last-good value this NEVER waits
+   * and never fails: a value older than `maxAgeMs` is returned immediately
+   * (`stale: true`) while ONE background refresh runs (deduplicated through
+   * the shared inflight promise). A failed refresh keeps the last-good value
+   * and records `lastError`/`lastErrorAt` until a refresh succeeds. The
+   * first-ever request (no value yet) waits for the fetch, and its failure
+   * propagates as usual. */
+  async getSwr<T>(key: string, fetcher: () => Promise<T>, maxAgeMs = this.ttlMs): Promise<SwrResult<T>> {
+    const existing = this.entries.get(key) as CacheEntry<T> | undefined;
+    if (!existing?.hasValue) {
+      if (existing?.inflight) return { value: await existing.inflight, cached: false, stale: false };
+      const entry: CacheEntry<T> = existing ?? { at: 0, value: undefined as T };
+      this.entries.set(key, entry);
+      const value = await this.refresh(entry, fetcher);
+      return { value, cached: false, stale: false };
+    }
+    const errorInfo = existing.lastError !== undefined ? { lastError: existing.lastError, lastErrorAt: existing.lastErrorAt } : {};
+    if (Date.now() - existing.at < maxAgeMs) {
+      return { value: existing.value, cached: true, stale: false, ...errorInfo };
+    }
+    if (!existing.inflight) {
+      this.refresh(existing, fetcher).catch(() => undefined);
+    }
+    return { value: existing.value, cached: true, stale: true, ...errorInfo };
+  }
+
+  private refresh<T>(entry: CacheEntry<T>, fetcher: () => Promise<T>): Promise<T> {
+    entry.inflight = fetcher()
+      .then((value) => {
+        entry.value = value;
+        entry.hasValue = true;
+        entry.at = Date.now();
+        entry.lastError = undefined;
+        entry.lastErrorAt = undefined;
+        return value;
+      })
+      .catch((error: unknown) => {
+        entry.lastError = error instanceof Error ? error.message : String(error);
+        entry.lastErrorAt = Date.now();
+        throw error;
+      })
+      .finally(() => {
+        entry.inflight = undefined;
+      });
+    return entry.inflight;
   }
 
   clear(): void {

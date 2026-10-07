@@ -15,7 +15,16 @@ import { type HerdrBridgeScheduler } from "./herdr-bridge.ts";
 import { HttpError } from "./types.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
+import { tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { runScanIsolated } from "./workers.ts";
+
+/** Usage and breakdown scans spawn tokscale, whose own ceiling is
+ * configurable (AIS_TOKSCALE_TIMEOUT_MS). The outer scan ceiling must never
+ * be shorter than that or it would cut the child off first, so it is the
+ * larger of the historical cap and the tokscale ceiling plus a margin. */
+function scanTimeoutAboveTokscale(baseMs: number): number {
+  return Math.max(baseMs, tokscaleSpawnTimeoutMs() + 30_000);
+}
 import {
   createIdentityInRegistry,
   deleteIdentityFromRegistry,
@@ -143,7 +152,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     const result = await runScanIsolated("usage", {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
-    }, 60_000);
+    }, scanTimeoutAboveTokscale(60_000));
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
     return c.json(result.payload);
   });
@@ -156,7 +165,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
       days: numberQuery(c, "days", 30),
-    }, 240_000);
+    }, scanTimeoutAboveTokscale(240_000));
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "breakdown scan failed");
     return c.json(result.payload);
   });

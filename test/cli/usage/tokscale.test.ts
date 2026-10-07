@@ -11,6 +11,9 @@ import {
   tokscaleInvocationFor,
   tokscalePlatformVariants,
   tokscaleRefreshIntervalMs,
+  tokscaleSpawnTimeoutMs,
+  tokscaleTimeoutMessage,
+  DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS,
 } from "../../../src/cli/usage/tokscale.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
@@ -297,5 +300,41 @@ describe("shouldRefreshTokscaleCache / tokscaleRefreshIntervalMs (never re-run -
       if (original === undefined) delete process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS;
       else process.env.AIS_TOKSCALE_REFRESH_INTERVAL_MS = original;
     }
+  });
+});
+
+describe("tokscaleSpawnTimeoutMs", () => {
+  const saved = process.env.AIS_TOKSCALE_TIMEOUT_MS;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.AIS_TOKSCALE_TIMEOUT_MS;
+    else process.env.AIS_TOKSCALE_TIMEOUT_MS = saved;
+  });
+
+  test("defaults to 10 minutes when unset", () => {
+    delete process.env.AIS_TOKSCALE_TIMEOUT_MS;
+    expect(tokscaleSpawnTimeoutMs()).toBe(600_000);
+    expect(DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS).toBe(600_000);
+  });
+
+  test("honours a valid positive integer override at call time", () => {
+    process.env.AIS_TOKSCALE_TIMEOUT_MS = "1800000";
+    expect(tokscaleSpawnTimeoutMs()).toBe(1_800_000);
+    process.env.AIS_TOKSCALE_TIMEOUT_MS = " 5000 ";
+    expect(tokscaleSpawnTimeoutMs()).toBe(5000);
+  });
+
+  test("falls back to the default for empty or invalid values", () => {
+    for (const bad of ["", "   ", "abc", "0", "-5", "1.5", "1e3", "12abc", "NaN", "99999999999999999999"]) {
+      process.env.AIS_TOKSCALE_TIMEOUT_MS = bad;
+      expect(tokscaleSpawnTimeoutMs()).toBe(DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS);
+    }
+  });
+});
+
+describe("tokscaleTimeoutMessage", () => {
+  test("states the limit and names the env var", () => {
+    const message = tokscaleTimeoutMessage("/bin/tokscale", 600_000);
+    expect(message).toContain("/bin/tokscale timed out after 600s");
+    expect(message).toContain("AIS_TOKSCALE_TIMEOUT_MS");
   });
 });

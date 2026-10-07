@@ -100,7 +100,7 @@ impl Endpoint {
     const fn timeout(self) -> Duration {
         match self {
             Self::Limits => Duration::from_secs(50),
-            Self::Usage => Duration::from_secs(70),
+            Self::Usage => Duration::from_secs(crate::app::USAGE_SCAN_CEILING_SECS),
             _ => Duration::from_secs(20),
         }
     }

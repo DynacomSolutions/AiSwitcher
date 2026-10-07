@@ -845,6 +845,18 @@ docs:
   fetch or display them at all, to avoid mixing two different kinds of data
   in one report.
 
+Each tokscale child is bounded by a 10 minute ceiling (a scan must parse every
+uncached transcript, which is slow under disk contention). Set
+`AIS_TOKSCALE_TIMEOUT_MS` (positive integer milliseconds; invalid or empty falls
+back to the default) to raise or lower it. The web console's `/api/usage` and
+`/api/usage/breakdown` scan ceilings are never shorter than this value plus a
+30 second margin. Those two endpoints are also stale-while-revalidate: once a
+scan has succeeded, a request older than the cache TTL returns the last-good
+payload immediately (`stale: true`) and starts one background refresh; a failed
+refresh keeps serving the last-good payload with `lastError`/`lastErrorAt`. Only
+the first-ever request waits for the scan. The terminal UI waits up to 11
+minutes for these two endpoints.
+
 `ais usage <tokscale args>` gives you everything else tokscale can do — the
 interactive TUI, `graph`, `monthly`, `hourly`, `pricing`, `report`, `wrapped`,
 the social commands — not just the aggregate table. Everything after the
