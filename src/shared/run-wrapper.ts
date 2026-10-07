@@ -16,6 +16,7 @@ import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 import { gatePluginArgs } from "./plugin-gating.ts";
 import { runLaunchGate } from "../spend/gate.ts";
 import { readHerdrChatTitle, type HerdrChatTool } from "./herdr-chat-source.ts";
+import { aisHerdrTabLabelsPath } from "./ais-home.ts";
 import { HerdrTabTitleWatcher, promptFromCliArgs } from "./herdr-tab-title.ts";
 
 export async function runWrapper(
@@ -140,6 +141,7 @@ export async function runWrapper(
           cwd: process.cwd(),
           initialPrompt: promptFromCliArgs(cfg.toolName, parsed.cleanedArgv),
           readTitle: readHerdrChatTitle,
+          statePath: aisHerdrTabLabelsPath(),
         })
       : undefined;
     await titleWatcher?.start();

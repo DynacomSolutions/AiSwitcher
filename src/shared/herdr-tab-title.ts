@@ -1,5 +1,7 @@
 import { resolveHerdrBinary } from "./herdr-bin.ts";
 import { spawn } from "node:child_process";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type { HerdrChatTool } from "./herdr-chat-source.ts";
 
 export interface HerdrAgentSession {
@@ -38,8 +40,30 @@ export function formatHerdrChatTitle(text: string): string | undefined {
   return cleaned.length > 64 ? `${cleaned.slice(0, 61).trimEnd()}…` : cleaned;
 }
 
-export function isAutomaticHerdrTab(tab: HerdrTitleTab, lastAutomaticLabel?: string): boolean {
-  return tab.label === String(tab.number) || (lastAutomaticLabel !== undefined && tab.label === lastAutomaticLabel);
+export function isAutomaticHerdrTab(tab: HerdrTitleTab, lastAutomaticLabel?: string, persistedLabel?: string): boolean {
+  return tab.label === String(tab.number)
+    || (lastAutomaticLabel !== undefined && tab.label === lastAutomaticLabel)
+    || (persistedLabel !== undefined && tab.label === persistedLabel);
+}
+
+const MAX_PERSISTED_LABELS = 256;
+
+async function readTabLabels(path: string): Promise<Record<string, string>> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  } catch {
+    return {};
+  }
+}
+
+async function writeTabLabels(path: string, labels: Record<string, string>): Promise<void> {
+  const entries = Object.entries(labels).slice(-MAX_PERSISTED_LABELS);
+  const temp = `${path}.${process.pid}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(temp, `${JSON.stringify(Object.fromEntries(entries))}\n`);
+  await rename(temp, path);
 }
 
 function parseResult<T>(stdout: string, key: string): T | undefined {
@@ -105,6 +129,8 @@ export class HerdrTabTitleWatcher {
       readTitle: (tool: HerdrChatTool, configDir: string, cwd: string, session: HerdrAgentSession) => Promise<string | null>;
       pid?: number;
       runHerdr?: typeof runTitleHerdr;
+      /** JSON map of tab_id -> last automatic label; persistence is off when omitted. */
+      statePath?: string;
     },
   ) {}
 
@@ -139,10 +165,23 @@ export class HerdrTabTitleWatcher {
       if (!info?.foreground_processes?.some((candidate) => candidate.pid === pid)) return;
       const tabs = await this.command(["tab", "list"], "tabs") as HerdrTitleTab[] | undefined;
       const tab = tabs?.find((candidate) => candidate.tab_id === pane.tab_id);
-      if (!tab || tab.label !== String(tab.number)) return;
+      if (!tab) return;
+      const persisted = this.options.statePath ? (await readTabLabels(this.options.statePath))[tab.tab_id] : undefined;
+      if (!isAutomaticHerdrTab(tab, undefined, persisted)) return;
       this.pinnedPane = pane;
     } catch {
       // Herdr is optional; failure to prove pane ownership disables updates.
+    }
+  }
+
+  private async persist(labels: Record<string, string>, tabs: HerdrTitleTab[], tabId: string, title: string): Promise<void> {
+    try {
+      const live = new Set(tabs.map((candidate) => candidate.tab_id));
+      const next = Object.fromEntries(Object.entries(labels).filter(([id]) => live.has(id) && id !== tabId));
+      next[tabId] = title;
+      await writeTabLabels(this.options.statePath!, next);
+    } catch {
+      // Persistence is best-effort; the in-memory label still protects this session.
     }
   }
 
@@ -158,7 +197,8 @@ export class HerdrTabTitleWatcher {
       const tabs = await this.command(["tab", "list"], "tabs") as HerdrTitleTab[] | undefined;
       const tab = tabs?.find((candidate) => candidate.tab_id === pane.tab_id);
       if (!tab) return;
-      if (!isAutomaticHerdrTab(tab, this.lastAutomaticLabel)) {
+      const labels = this.options.statePath ? await readTabLabels(this.options.statePath) : undefined;
+      if (!isAutomaticHerdrTab(tab, this.lastAutomaticLabel, labels?.[tab.tab_id])) {
         this.stop();
         return;
       }
@@ -192,6 +232,7 @@ export class HerdrTabTitleWatcher {
       const renamed = await (this.options.runHerdr ?? runTitleHerdr)(["tab", "rename", pane.tab_id, title]);
       if (renamed.ok) {
         this.lastAutomaticLabel = title;
+        if (this.options.statePath) await this.persist(labels ?? {}, tabs ?? [], pane.tab_id, title);
       }
     } catch {
       // Herdr is optional. A transient socket or session-reader failure must
