@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import * as clack from "@clack/prompts";
 import { expandPath, isValidIdentityKey } from "../../identities/match.ts";
 import { writeZaiAuthFile } from "../../identities/zai-auth.ts";
+import { ensureClaudeTranscriptRetention } from "../../identities/claude-settings.ts";
 import { writeAliAuthFile } from "../../identities/ali-auth.ts";
 import type { ParsedArgs } from "../args.ts";
 import { listFlag, stringFlag } from "../args.ts";
@@ -127,6 +128,7 @@ export async function runCreate(flags: ParsedArgs["flags"]): Promise<void> {
     if (isZai) await writeZaiAuthFile(configDir, apiKey);
     else if (isAli) await writeAliAuthFile(configDir, apiKey);
   }
+  if (cfg.toolName === "claude") await ensureClaudeTranscriptRetention(configDir);
   await persist(loaded);
 
   console.log(

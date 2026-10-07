@@ -266,9 +266,10 @@ async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppre
   }
 }
 
-/** AWS Bedrock identities report LOCAL month-to-date tracking (tokens and
+/** AWS Bedrock identities report LOCAL all-time tracking (tokens and
  * the token-based estimate) in the normal columns (the same shared readers
- * the spend guard uses, so both pathways reconcile per identity) while the
+ * the spend guard uses, so both pathways reconcile per identity, though the report
+ * covers the full history where the guard is month-to-date) while the
  * REAL AWS figures (Cost Explorer month-to-date, budget limit/actual) ride
  * separately in realCost for the real-cost sub-row. No tokscale (Bedrock
  * billing records carry no token counts and the guard's readers are the
