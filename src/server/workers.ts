@@ -82,6 +82,24 @@ async function cachedScan<T>(
     return result;
   };
   const maxAgeMs = kind === "limits" && typeof params.maxAgeS === "number" ? Math.max(5, params.maxAgeS) * 1000 : undefined;
+  // usage/breakdown are the slow scans (tokscale can run for minutes): serve
+  // the last-good value immediately and refresh in the background.
+  if (kind === "usage" || kind === "breakdown") {
+    const swr = await cache.getSwr(key, fetcher);
+    if (swr.value.payload && typeof swr.value.payload === "object") {
+      const payload = swr.value.payload as Record<string, unknown>;
+      payload.cached = swr.cached;
+      payload.stale = swr.stale;
+      if (swr.lastError !== undefined) {
+        payload.lastError = swr.lastError;
+        payload.lastErrorAt = swr.lastErrorAt !== undefined ? new Date(swr.lastErrorAt).toISOString() : undefined;
+      } else {
+        delete payload.lastError;
+        delete payload.lastErrorAt;
+      }
+    }
+    return swr.value;
+  }
   const { value, cached } = maxAgeMs !== undefined ? await cache.get(key, fetcher, maxAgeMs) : await cache.get(key, fetcher);
   if (value.payload && typeof value.payload === "object") {
     (value.payload as { cached?: boolean }).cached = cached;

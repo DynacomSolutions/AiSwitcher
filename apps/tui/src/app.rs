@@ -13,6 +13,12 @@ use crate::config::Settings;
 use crate::models;
 use crate::ui;
 
+/// Usage and breakdown request ceiling: the default 10 minute tokscale
+/// timeout (AIS_TOKSCALE_TIMEOUT_MS) plus a minute of margin. Warm requests
+/// return at once (the console serves stale data while it refreshes); only a
+/// cold first scan can approach this.
+pub const USAGE_SCAN_CEILING_SECS: u64 = 11 * 60;
+
 pub const TAB_COUNT: usize = 8;
 pub const TAB_NAMES: [&str; TAB_COUNT] = [
     "Status",
@@ -63,14 +69,14 @@ impl Endpoint {
     }
 
     /// Whole-request ceiling per endpoint. The scan endpoints must outlast
-    /// the console's server-side scan budgets (45s limits, 60s usage, 240s
-    /// breakdown) so a cold-cache poll is waited out instead of aborted; see
-    /// api.rs.
+    /// the console's server-side scan budgets (45s limits; usage and
+    /// breakdown up to the 10 minute tokscale ceiling plus margin) so a
+    /// cold-cache poll is waited out instead of aborted; see api.rs.
     const fn timeout(self) -> Duration {
         match self {
             Self::Limits => Duration::from_secs(50),
-            Self::Usage => Duration::from_secs(70),
-            Self::Breakdown => Duration::from_secs(250),
+            Self::Usage => Duration::from_secs(USAGE_SCAN_CEILING_SECS),
+            Self::Breakdown => Duration::from_secs(USAGE_SCAN_CEILING_SECS),
             _ => Duration::from_secs(20),
         }
     }

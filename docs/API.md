@@ -299,8 +299,17 @@ Same shape as `ais usage --json` (`usageResultsForJson()` output), plus a
 trailing aggregate row per provider where applicable:
 
 ```jsonc
-{ "results": [ /* UsageResult[] (provider-first) */ ], "generatedAt": "..." }
+{ "results": [ /* UsageResult[] (provider-first) */ ], "generatedAt": "...",
+  "cached": true, "stale": false, "lastError": "...", "lastErrorAt": "..." }
 ```
+
+`/api/usage` and `/api/usage/breakdown` are stale-while-revalidate. Once a scan
+has succeeded, a request older than the server TTL returns the last-good
+payload immediately with `stale: true` and starts one background refresh. A
+failed refresh keeps serving the last-good payload and sets `lastError` and
+`lastErrorAt` (both absent after a successful refresh). Only the first-ever
+request waits for the scan, bounded by `AIS_TOKSCALE_TIMEOUT_MS` (default 10
+minutes), so clients should allow at least 11 minutes for that cold request.
 
 ### Usage breakdown
 
