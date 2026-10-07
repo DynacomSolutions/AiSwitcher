@@ -6,6 +6,7 @@ import { expandPath, isValidIdentityKey, parseDirectoryPattern } from "./match.t
 import { saveIdentitiesFile } from "./store.ts";
 import { PromptCancelledError, PromptTimeoutError, InvalidIdentitiesFileError } from "./errors.ts";
 import { writeZaiAuthFile } from "./zai-auth.ts";
+import { ensureClaudeTranscriptRetention } from "./claude-settings.ts";
 import { writeAliAuthFile } from "./ali-auth.ts";
 
 // A plain string sentinel rather than a Symbol: identity names are validated
@@ -181,6 +182,7 @@ async function createIdentityFlow(
     if (cfg.toolName === "zai") await writeZaiAuthFile(configDir, apiKey);
     else if (cfg.toolName === "ali") await writeAliAuthFile(configDir, apiKey);
   }
+  if (cfg.toolName === "claude") await ensureClaudeTranscriptRetention(configDir);
 
   const identity: Identity = {
     name: name as string,
