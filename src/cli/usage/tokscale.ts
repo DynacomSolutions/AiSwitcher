@@ -368,9 +368,26 @@ export async function runTokscaleProcess(args: string[], env: Record<string, str
  * — far too tight for the real data on this machine: a 1.3GB opencode.db
  * scan (or any scan, once ~25 tokscale children contend for disk) routinely
  * needs 25-55s, and the ceiling turned good data into "timed out" rows.
- * (main's interim 55s sat exactly ON that measured edge.) 120s still bounds
- * a genuinely wedged child without truncating real work. */
-const TOKSCALE_SPAWN_TIMEOUT_MS = 120_000;
+ * (main's interim 55s sat exactly ON that measured edge.) Even 120s later
+ * proved too tight: under heavy disk contention, or after many new
+ * transcripts (tokscale must parse every uncached file), whole Claude/Codex
+ * rows timed out and silently contributed $0. The default is now 10 minutes,
+ * which still bounds a genuinely wedged child; AIS_TOKSCALE_TIMEOUT_MS
+ * overrides it (positive integer milliseconds, read at call time). */
+export const DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS = 10 * 60 * 1000;
+
+export function tokscaleSpawnTimeoutMs(): number {
+  const raw = process.env.AIS_TOKSCALE_TIMEOUT_MS?.trim() ?? "";
+  if (!/^\d+$/.test(raw)) return DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS;
+}
+
+/** Message for a tokscale child that outlived the ceiling. Names the env var
+ * so users know how to raise it. */
+export function tokscaleTimeoutMessage(command: string, timeoutMs: number): string {
+  return `${command} timed out after ${timeoutMs / 1000}s (raise the limit with AIS_TOKSCALE_TIMEOUT_MS, in milliseconds)`;
+}
 
 async function spawnTokscaleProcess(
   cmd: string,
@@ -388,6 +405,7 @@ async function spawnTokscaleProcess(
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
+  const timeoutMs = tokscaleSpawnTimeoutMs();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
@@ -397,11 +415,9 @@ async function spawnTokscaleProcess(
         // already exited
       }
       reject(
-        new Error(
-          `${cmd}${prefixArgs.length ? ` ${prefixArgs.join(" ")}` : ""} timed out after ${TOKSCALE_SPAWN_TIMEOUT_MS / 1000}s`,
-        ),
+        new Error(tokscaleTimeoutMessage(`${cmd}${prefixArgs.length ? ` ${prefixArgs.join(" ")}` : ""}`, timeoutMs)),
       );
-    }, TOKSCALE_SPAWN_TIMEOUT_MS);
+    }, timeoutMs);
   });
   try {
     const [stdout, stderr, exitCode] = await Promise.race([collect, timeout]);
