@@ -30,7 +30,51 @@ describe("readHerdrChatTitle", () => {
       JSON.stringify({ type: "user", message: { content: "yes" } }),
       JSON.stringify({ type: "user", message: { content: "SYNTHETIC_FIXTURE fix the account settings screen layout" } }),
     ].join("\n"));
-    expect(await readHerdrChatTitle("claude", config, "/tmp/project", binding("claude", "claude-id"))).toBe("SYNTHETIC_FIXTURE fix the account settings screen layout");
+    expect(await readHerdrChatTitle("claude", config, "/tmp/project", binding("claude", "claude-id"))).toBe("SYNTHETIC_FIXTURE update the account settings screen");
+  });
+
+  async function claudeTitle(rows: unknown[]): Promise<string | null> {
+    const config = await fixture();
+    const dir = join(config, "projects", "-tmp-project");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "claude-id.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n"));
+    return readHerdrChatTitle("claude", config, "/tmp/project", binding("claude", "claude-id"));
+  }
+  const human = (text: string) => ({ type: "user", origin: { kind: "human" }, promptSource: "typed", message: { content: text } });
+
+  test("Claude ignores task-notification rows", async () => {
+    expect(await claudeTitle([
+      human("SYNTHETIC_FIXTURE refactor the billing module"),
+      { type: "user", origin: { kind: "task-notification" }, promptSource: "system", message: { content: "<task-notification>\n<task-id>bimc2nhpm</task-id>\n<tool-use-id>toolu_01U4</tool-use-id>\n<output-file>/tmp/x</output-file>" } },
+      { type: "user", message: { content: "<task-notification>\n<task-id>abc</task-id>" } },
+    ])).toBe("SYNTHETIC_FIXTURE refactor the billing module");
+  });
+
+  test("Claude ignores command, bash and local-command rows", async () => {
+    expect(await claudeTitle([
+      human("SYNTHETIC_FIXTURE refactor the billing module"),
+      { type: "user", message: { content: "<command-message>deploy</command-message>\n<command-name>/deploy</command-name>" } },
+      { type: "user", message: { content: "<bash-input>ls -la /srv</bash-input>" } },
+      { type: "user", message: { content: "<bash-stdout>total 4</bash-stdout><bash-stderr></bash-stderr>" } },
+      { type: "user", message: { content: "<local-command-stdout>done it</local-command-stdout>" } },
+      { type: "user", message: { content: "<system-reminder>remember things</system-reminder>" } },
+    ])).toBe("SYNTHETIC_FIXTURE refactor the billing module");
+  });
+
+  test("Claude prefers the newest ai-title over a later human prompt", async () => {
+    expect(await claudeTitle([
+      human("SYNTHETIC_FIXTURE first real prompt here"),
+      { type: "ai-title", aiTitle: "Old generated title" },
+      { type: "ai-title", aiTitle: "Newest generated title" },
+      human("SYNTHETIC_FIXTURE etas? hurry up please"),
+    ])).toBe("Newest generated title");
+  });
+
+  test("Claude falls back to the first human prompt when no ai-title exists", async () => {
+    expect(await claudeTitle([
+      human("SYNTHETIC_FIXTURE first real prompt here"),
+      human("SYNTHETIC_FIXTURE etas? hurry up please"),
+    ])).toBe("SYNTHETIC_FIXTURE first real prompt here");
   });
 
   test("uses only the matching Codex rollout and ignores environment injection", async () => {

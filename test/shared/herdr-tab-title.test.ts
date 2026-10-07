@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { HerdrTabTitleWatcher, formatHerdrChatTitle } from "../../src/shared/herdr-tab-title.ts";
 
 describe("Herdr chat tab titles", () => {
@@ -91,5 +94,64 @@ describe("Herdr chat tab titles", () => {
     resolveTitle("A title after shutdown");
     await starting;
     expect(renameCount).toBe(0);
+  });
+
+  function harness(label: string, tabId = "t") {
+    const state = { label, renames: [] as string[] };
+    const runHerdr = async (args: string[]) => {
+      if (args[0] === "pane" && args[1] === "current") return { ok: true, stdout: JSON.stringify({ result: { pane: { pane_id: "p", tab_id: tabId } } }) };
+      if (args[0] === "pane" && args[1] === "process-info") return { ok: true, stdout: JSON.stringify({ result: { process_info: { foreground_processes: [{ pid: 42 }] } } }) };
+      if (args[0] === "tab" && args[1] === "list") return { ok: true, stdout: JSON.stringify({ result: { tabs: [{ tab_id: tabId, label: state.label, number: 3 }] } }) };
+      if (args[0] === "pane" && args[1] === "list") return { ok: true, stdout: JSON.stringify({ result: { panes: [{ pane_id: "p", tab_id: tabId, agent: "claude", agent_session: { agent: "claude", kind: "id", value: "s" } }] } }) };
+      if (args[0] === "tab" && args[1] === "rename") { state.label = args[3] ?? ""; state.renames.push(state.label); }
+      return { ok: true, stdout: "" };
+    };
+    return { state, runHerdr };
+  }
+  const make = (h: ReturnType<typeof harness>, statePath: string, title: string) =>
+    new HerdrTabTitleWatcher({ agent: "claude", tool: "claude", configDir: "/s", cwd: "/s", pid: 42, runHerdr: h.runHerdr, statePath, readTitle: async () => title });
+
+  test("persists automatic labels and a resumed watcher keeps renaming that tab", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ais-herdr-state-"));
+    const statePath = join(dir, "labels.json");
+    const h = harness("3");
+    const first = make(h, statePath, "First generated title");
+    await first.start();
+    first.stop();
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual({ t: "First generated title" });
+
+    const resumed = make(h, statePath, "Second generated title");
+    await resumed.start();
+    resumed.stop();
+    expect(h.state.renames).toEqual(["First generated title", "Second generated title"]);
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual({ t: "Second generated title" });
+  });
+
+  test("a manual label differing from persisted state still blocks renames", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ais-herdr-state-"));
+    const statePath = join(dir, "labels.json");
+    await writeFile(statePath, JSON.stringify({ t: "Old automatic title" }));
+    const h = harness("My manual name");
+    const watcher = make(h, statePath, "Fresh title");
+    await watcher.start();
+    watcher.stop();
+    expect(h.state.renames).toEqual([]);
+  });
+
+  test("tolerates a corrupt state file and prunes tab ids that no longer exist", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ais-herdr-state-"));
+    const statePath = join(dir, "labels.json");
+    await writeFile(statePath, "{not json");
+    const h = harness("3");
+    const a = make(h, statePath, "Title after corruption");
+    await a.start();
+    a.stop();
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual({ t: "Title after corruption" });
+    await writeFile(statePath, JSON.stringify({ t: "Title after corruption", gone: "Stale tab title" }));
+    h.state.label = "Title after corruption";
+    const b = make(h, statePath, "Another title");
+    await b.start();
+    b.stop();
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toEqual({ t: "Another title" });
   });
 });

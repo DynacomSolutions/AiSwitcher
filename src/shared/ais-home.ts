@@ -84,3 +84,9 @@ export function aisManifestPath(home: string = homedir()): string {
 export function aisCacheDir(home: string = homedir()): string {
   return join(aisHome(home), "cache");
 }
+
+/** Last tab label AIS set automatically per Herdr tab id, so a resumed or
+ * second session in the same tab keeps updating it. */
+export function aisHerdrTabLabelsPath(home: string = homedir()): string {
+  return join(aisHome(home), "herdr-tab-labels.json");
+}

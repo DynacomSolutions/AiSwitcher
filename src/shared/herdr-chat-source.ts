@@ -38,7 +38,7 @@ function meaningful(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const text = value.replace(/\u0000/g, "").trim();
   if (text.length < 4 || /^(?:untitled session|new session|\(no summary\))$/i.test(text) || ACKNOWLEDGEMENT.test(text) || SYNTHETIC.test(text)) return null;
-  if (/^(?:<environment_context|<task>|<system-reminder>|<instructions>)/i.test(text)) return null;
+  if (/^(?:<environment_context|<task>|<system-reminder|<instructions>|<task-notification|<command-|<bash-|<local-command-)/i.test(text)) return null;
   return text.slice(0, 240).replace(/\s+/g, " ");
 }
 
@@ -120,11 +120,15 @@ function parseLine(line: string): Record<string, unknown> | undefined {
   try { return record(JSON.parse(line)); } catch { return undefined; }
 }
 
-function claudePrompt(row: Record<string, unknown>): string | null {
-  if (row.type === "ai-title" && typeof row.aiTitle === "string") return meaningful(row.aiTitle);
-  if (row.type !== "user" || row.isMeta === true || row.isSidechain === true) return null;
-  const message = record(row.message);
-  return meaningful(contentText(message?.content));
+function claudeHumanPrompt(row: Record<string, unknown>): string | null {
+  if (row.type !== "user" || row.isMeta === true || row.isSidechain === true || row.promptSource === "system") return null;
+  const origin = record(row.origin);
+  if (origin && origin.kind !== "human") return null;
+  return meaningful(contentText(record(row.message)?.content));
+}
+
+function claudeAiTitle(row: Record<string, unknown>): string | null {
+  return row.type === "ai-title" && typeof row.aiTitle === "string" ? meaningful(row.aiTitle) : null;
 }
 
 function codexPrompt(row: Record<string, unknown>): string | null {
@@ -167,6 +171,15 @@ async function lastJsonlPrompt(path: string, parser: (row: Record<string, unknow
   const lines = await tailLines(path);
   for (let i = lines.length - 1; i >= 0; i--) {
     const row = parseLine(lines[i]!);
+    const title = row && parser(row);
+    if (title) return title;
+  }
+  return null;
+}
+
+async function firstJsonlPrompt(path: string, parser: (row: Record<string, unknown>) => string | null): Promise<string | null> {
+  for (const line of await tailLines(path)) {
+    const row = parseLine(line);
     const title = row && parser(row);
     if (title) return title;
   }
@@ -331,7 +344,7 @@ export async function readHerdrChatTitle(
   if (!path) return null;
   if (tool === "codex" || tool === "kimi") sourceLocations.set(cacheKey, path);
   const reader = async (): Promise<string | null> => {
-  if (tool === "claude") return lastJsonlPrompt(path!, claudePrompt);
+  if (tool === "claude") return await lastJsonlPrompt(path!, claudeAiTitle) ?? firstJsonlPrompt(path!, claudeHumanPrompt);
   if (tool === "codex") return lastJsonlPrompt(path!, codexPrompt);
   if (tool === "grok") {
     const summaryPath = join(path!, "..", "summary.json");
