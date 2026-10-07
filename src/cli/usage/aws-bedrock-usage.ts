@@ -13,11 +13,11 @@ import type { TokscaleEntry, TokscaleReport } from "./tokscale.ts";
  *   - LOCAL TRACKING (the report's normal columns): messages, input/output/
  *     cache tokens and the EST. COST column all come from this identity's
  *     own session logs (codex rollout / claude projects JSONL) via
- *     shared/local-spend.ts: the exact same reader, period filter and
- *     Bedrock-rate valuation the spend guard uses, over the same
- *     month-to-date window. A Bedrock row's local figures therefore
- *     reconcile with the guard's per-identity estimate by construction, and
- *     render exactly like every other provider's rows.
+ *     shared/local-spend.ts: the exact same reader and Bedrock-rate
+ *     valuation the spend guard uses, but over the identity's FULL local
+ *     history (all-time), like every other provider's rows in the report.
+ *     (The guard itself stays month-to-date; only this report widens the
+ *     window.) The row renders exactly like every other provider's.
  *
  *   - REAL AWS SPEND (separate realCost info, rendered as a dimmed sub-row
  *     under the provider row): Cost Explorer GetCostAndUsage UnblendedCost
@@ -52,7 +52,7 @@ import type { TokscaleEntry, TokscaleReport } from "./tokscale.ts";
  * figures (see realCost.error). */
 export class AwsNoProfileMappedError extends Error {}
 
-/** One identity's local month-to-date read; tests may inject either shape. */
+/** One identity's local read over [periodStart, now]; tests may inject either shape. */
 export type LocalSpendReader = (
   toolName: ToolConfig["toolName"],
   configDir: string,
@@ -155,7 +155,7 @@ export interface AwsBedrockUsageDeps {
 }
 
 export interface AwsBedrockUsageResult {
-  /** LOCAL month-to-date tracking: token totals, per-model entries and the
+  /** LOCAL all-time tracking: token totals, per-model entries and the
    * token-based EST. COST: the row's normal columns. */
   report: TokscaleReport;
   dateSpan?: { firstMs: number; lastMs: number };
@@ -313,14 +313,14 @@ async function fetchRealCost(
     ...(windowUsd !== undefined ? { windowUsd } : {}),
     ...(budgetLimitUsd !== undefined ? { budgetLimitUsd } : {}),
     ...(budgetActualUsd !== undefined ? { budgetActualUsd } : {}),
-    ...(monthToDateUsd !== undefined && monthToDateUsd < read.usd ? { note: "reported lag" } : {}),
+    ...(monthToDateUsd !== undefined && monthToDateUsd < (read.usdSince ?? read.usd) ? { note: "reported lag" } : {}),
     ...(error ? { error } : {}),
   };
   return { realCost, ...(dailyCostUsd && Object.keys(dailyCostUsd).length > 0 ? { dailyCostUsd } : {}) };
 }
 
 /**
- * Fetches one Bedrock-backed identity's usage: the local month-to-date
+ * Fetches one Bedrock-backed identity's usage: the local all-time
  * report (normal columns) plus the real AWS figures (separate realCost).
  * Throws AwsNoProfileMappedError when the identity has no profile mapping
  * (callers treat that as nothing-to-report); everything else degrades into
@@ -336,11 +336,16 @@ export async function fetchAwsBedrockUsage(identity: Identity, deps: AwsBedrockU
   }
 
   const now = deps.now?.() ?? new Date();
-  // Month-to-date, local calendar: the same frame the guard's MONTHLY
-  // budget period uses (periodStartForTimeUnit), so an identity's local
-  // totals here reconcile with the guard's per-identity estimate.
-  const periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const read = await (deps.localSpend ?? readIdentityLocalSpendAsync)(deps.localTool ?? "codex", identity.configDir, periodStart, deps.localSpendDeps ?? {});
+  // The report's normal columns are all-time, like every other provider's
+  // rows: the epoch start disables the reader's period pruning and filter.
+  // Month-to-date (the local calendar frame the guard's MONTHLY budget
+  // period uses) is still tracked, as usdSince, purely so the real
+  // sub-row's "reported lag" note compares like with like.
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const read = await (deps.localSpend ?? readIdentityLocalSpendAsync)(deps.localTool ?? "codex", identity.configDir, new Date(0), {
+    ...deps.localSpendDeps,
+    usdSinceMs: monthStart.getTime(),
+  });
 
   const { realCost, dailyCostUsd } = await fetchRealCost(target, read, deps, now);
 

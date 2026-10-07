@@ -9,7 +9,7 @@ import {
   type CostExplorerWire,
 } from "../../../src/cli/usage/aws-bedrock-usage.ts";
 import type { Identity } from "../../../src/identities/types.ts";
-import type { LocalSpendRead } from "../../../src/shared/local-spend.ts";
+import type { AsyncLocalEstimateDeps, LocalSpendRead } from "../../../src/shared/local-spend.ts";
 
 function identity(name = "acme-bedrock"): Identity {
   return { name, label: name, configDir: `/tmp/does-not-exist/${name}` };
@@ -155,11 +155,78 @@ describe("fetchAwsBedrockUsage", () => {
   };
   const localSpend = () => LOCAL_READ;
 
+  test("report row is ALL-TIME (pre-current-month usage included) while realCost stays month-to-date", async () => {
+    // Real reader over an in-memory codex tree: one August rollout, one September.
+    const rollout = (day: string) =>
+      [
+        JSON.stringify({ timestamp: `${day}T03:00:00.000Z`, type: "turn_context", payload: { model: "openai.gpt-6-astra" } }),
+        JSON.stringify({
+          timestamp: `${day}T03:00:01.000Z`,
+          type: "event_msg",
+          payload: { type: "token_count", info: { last_token_usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 50 } } },
+        }),
+      ].join("\n");
+    const files: Record<string, { text: string; mtimeMs: number }> = {
+      "/id/sessions/2026/08/20/a.jsonl": { text: rollout("2026-08-20"), mtimeMs: Date.parse("2026-08-20T04:00:00Z") },
+      "/id/sessions/2026/09/09/b.jsonl": { text: rollout("2026-09-09"), mtimeMs: Date.parse("2026-09-09T04:00:00Z") },
+    };
+    const dirs = new Set(["/id/sessions", "/id/sessions/2026", "/id/sessions/2026/08", "/id/sessions/2026/09", "/id/sessions/2026/08/20", "/id/sessions/2026/09/09"]);
+    const fsDeps: AsyncLocalEstimateDeps = {
+      readdir: async (path) => {
+        const prefix = `${path}/`;
+        const names = new Set<string>();
+        for (const p of [...dirs, ...Object.keys(files)]) if (p.startsWith(prefix)) names.add(p.slice(prefix.length).split("/")[0]!);
+        return [...names];
+      },
+      isDirectory: async (path) => dirs.has(path),
+      mtimeMs: async (path) => files[path]?.mtimeMs ?? 0,
+      readTextChunks: async function* (path) {
+        yield files[path]!.text;
+      },
+    };
+    const result = await fetchAwsBedrockUsage(
+      { name: "acme-bedrock", label: "acme-bedrock", configDir: "/id" },
+      {
+        awsProfileDeps: MAPPING_DEPS,
+        now: () => new Date("2026-10-08T12:00:00Z"), // both rollouts predate October
+        costExplorer: ceApi(costWire([{ start: "2026-09-01", amount: "5.00" }]), costWire([{ start: "2026-09-09", amount: "5.00" }])),
+        budgets: BUDGETS_API,
+        localSpendDeps: fsDeps,
+      },
+    );
+    expect(result.report.totalMessages).toBe(2);
+    expect(result.report.totalInput).toBe(2000);
+    expect(result.report.totalCost).toBeGreaterThan(0);
+    expect(Object.keys(result.dailyUsage ?? {}).sort()).toEqual(["2026-08-20", "2026-09-09"]);
+    expect(result.dateSpan?.firstMs).toBe(Date.parse("2026-08-20T03:00:01.000Z"));
+    // Real figures keep their month-to-date meaning (October has no bucket here).
+    expect(result.realCost?.label).toBe(REAL_COST_LABEL);
+    expect(result.realCost?.monthToDateUsd).toBe(0);
+    expect(result.realCost?.windowUsd).toBeCloseTo(5);
+    // The lag note compares against the local MONTH-TO-DATE slice (zero), not the all-time total.
+    expect(result.realCost?.note).toBeUndefined();
+  });
+
+  test("the local read is requested from the epoch, with month start only as the lag-note cut-off", async () => {
+    const calls: Array<{ start: number; usdSinceMs?: number }> = [];
+    await fetchAwsBedrockUsage(identity(), {
+      awsProfileDeps: MAPPING_DEPS,
+      now: () => new Date("2026-09-10T12:00:00Z"),
+      costExplorer: ceApi(costWire([]), costWire([])),
+      budgets: BUDGETS_API,
+      localSpend: (_tool, _dir, periodStart, deps) => {
+        calls.push({ start: periodStart.getTime(), usdSinceMs: deps.usdSinceMs });
+        return LOCAL_READ;
+      },
+    });
+    expect(calls).toEqual([{ start: 0, usdSinceMs: new Date(2026, 8, 1).getTime() }]);
+  });
+
   test("an unmapped identity throws the typed nothing-to-report error", async () => {
     await expect(fetchAwsBedrockUsage(identity("personal"), { awsProfileDeps: MAPPING_DEPS })).rejects.toBeInstanceOf(AwsNoProfileMappedError);
   });
 
-  test("normal columns carry the LOCAL month-to-date figures; real AWS spend rides separately in realCost", async () => {
+  test("normal columns carry the LOCAL all-time figures; real AWS spend rides separately in realCost", async () => {
     const deps = {
       awsProfileDeps: MAPPING_DEPS,
       now: () => new Date("2026-09-10T12:00:00Z"),

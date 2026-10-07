@@ -91,6 +91,11 @@ export interface LocalSpendRead extends LocalSpendResult {
    * just cannot widen a display range they cannot be placed in). */
   firstMs?: number;
   lastMs?: number;
+  /** Estimated dollars for just the records on/after the reader's optional
+   * `usdSinceMs` (see AsyncLocalEstimateDeps), same valuation as `usd`.
+   * Absent unless a cut-off was requested: lets an all-time read still
+   * compare its month-to-date slice with a month-to-date billing figure. */
+  usdSince?: number;
 }
 
 export interface LocalEstimateDeps {
@@ -449,7 +454,7 @@ export function readIdentityLocalSpend(
  * total stays the record-order sum, identical to the guard's own
  * accumulation, and the models/dailyTokens/dateSpan rollups feed the usage
  * report's entries, token columns, contribution graph and date span. */
-function reduceLocalSpendRead(records: UsageRecord[], filesRead: number): LocalSpendRead {
+function reduceLocalSpendRead(records: UsageRecord[], filesRead: number, usdSinceMs?: number): LocalSpendRead {
   const valued = valueRecords(records);
 
   const models = new Map<string, LocalSpendModelTotals>();
@@ -507,6 +512,9 @@ function reduceLocalSpendRead(records: UsageRecord[], filesRead: number): LocalS
     models: [...models.values()],
     dailyTokens,
     ...(firstMs !== undefined && lastMs !== undefined ? { firstMs, lastMs } : {}),
+    ...(usdSinceMs !== undefined
+      ? { usdSince: valueRecords(records.filter((r) => r.atMs === undefined || r.atMs >= usdSinceMs)).usd }
+      : {}),
   };
 }
 
@@ -518,6 +526,9 @@ export interface AsyncLocalEstimateDeps {
   mtimeMs?: (path: string) => Promise<number>;
   isDirectory?: (path: string) => Promise<boolean>;
   readTextChunks?: (path: string) => AsyncIterable<string>;
+  /** Also report `usdSince`: the estimate over records on/after this epoch-ms
+   * cut-off, without narrowing the read itself. */
+  usdSinceMs?: number;
 }
 
 function defaultReaddirAsync(path: string): Promise<string[]> {
@@ -683,7 +694,7 @@ export async function readIdentityLocalSpendAsync(
       // rest of the estimate intact.
     }
   }
-  return reduceLocalSpendRead(records, files.length);
+  return reduceLocalSpendRead(records, files.length, deps.usdSinceMs);
 }
 
 /** The guard's estimate: the same read, reduced to the four fields the
