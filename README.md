@@ -638,6 +638,7 @@ ais sync dedupe [--dry-run] [--json]                     # local stable-session-
 ais sync recover [--dry-run] [--json]                    # restore retained pre-fix recovery archives
 
 ais identities list                                       # all registries; add --tool=claude|codex|grok|kimi|zai|ali|pi|opencode to scope
+                                                           # claude pools are not identities: listed in their own section with every member
 ais identities show <name>
 ais identities create --tool=<t> [--name=] [--label=] [--description=] \
                        [--directories=a,b] [--aliases=x,y] [--api-key=]
