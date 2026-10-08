@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
 import { BinaryResolutionError } from "../identities/errors.ts";
 import { aisNpmDir } from "./ais-home.ts";
@@ -30,6 +30,33 @@ export const MANAGED_REAL_BIN_DIR = process.env.AI_PROFILE_SWITCHER_REAL_BIN_DIR
 const LEGACY_MANAGED_REAL_BIN_DIR = process.env.AI_PROFILE_SWITCHER_REAL_BIN_DIR
   ? undefined
   : join(homedir(), ".local", "share", "ais", "npm", "bin");
+
+/** Env var a wrapper sets on the real binary it spawns, holding that binary's
+ * realpath. A shim started with this equal to its OWN realpath was exec'd as
+ * "the real binary" by another shim instance, i.e. it is recursing. */
+export function shimExecEnvVar(name: string): string {
+  return `AIS_SHIM_EXEC_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+}
+
+export interface ResolveDeps {
+  /** Defaults to process.execPath. */
+  execPath?: string;
+  /** Defaults to process.env. */
+  env?: Record<string, string | undefined>;
+  /** Defaults to Bun.which. */
+  which?: (name: string, options: { PATH: string }) => string | null;
+}
+
+const INTERPRETER_NAMES = new Set(["bun", "bunx", "node", "nodejs"]);
+
+/** Realpath of the running executable when it is a compiled shim (not a
+ * bun/node interpreter running source), else null. HOME-independent. */
+function runningShimReal(execPath: string): string | null {
+  const real = safeRealpath(execPath);
+  if (!real) return null;
+  const base = basename(real).replace(/\.exe$/i, "");
+  return INTERPRETER_NAMES.has(base) || INTERPRETER_NAMES.has(basename(execPath)) ? null : real;
+}
 
 function safeRealpath(path: string): string | null {
   try {
@@ -107,14 +134,37 @@ export function nativeBinaryForNodeLauncher(realCandidate: string): string | nul
  * installing our shim alone is NOT sufficient for it to actually intercept
  * `grok` invocations, unlike claude/codex.
  */
-export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "crush" | "pi" | "opencode" | "open"): string {
+export function resolveRealBinary(
+  name: "claude" | "codex" | "grok" | "kimi" | "crush" | "pi" | "opencode" | "open",
+  deps: ResolveDeps = {},
+): string {
+  const env = deps.env ?? process.env;
+  const which = deps.which ?? ((n: string, o: { PATH: string }) => Bun.which(n, o));
+  const selfReal = runningShimReal(deps.execPath ?? process.execPath);
+
+  // Path-independent re-entry guard: the wrapper that spawned us recorded the
+  // realpath it believed was the real binary. If that is us, we are the shim
+  // being exec'd as its own "real binary" (HOME relocated, PATH oddities...).
+  // A legitimate nested launch carries the REAL binary's path, never ours.
+  const execMarker = env[shimExecEnvVar(name)];
+  if (selfReal && execMarker && (safeRealpath(execMarker) ?? execMarker) === selfReal) {
+    throw new BinaryResolutionError(
+      `Refusing to run: '${name}' shim (${selfReal}) was launched as its own real binary ` +
+        `(${shimExecEnvVar(name)} points at me). Aborting instead of recursing into myself.`,
+    );
+  }
+
   const shimDirReal = safeRealpath(SHIM_DIR) ?? SHIM_DIR;
-  const rawPath = process.env.PATH ?? "";
+  const selfDirReal = selfReal ? dirname(selfReal) : null;
+  const rawPath = env.PATH ?? "";
 
   const filteredPath = rawPath
     .split(":")
     .filter(Boolean)
-    .filter((dir) => (safeRealpath(dir) ?? dir) !== shimDirReal)
+    .filter((dir) => {
+      const real = safeRealpath(dir) ?? dir;
+      return real !== shimDirReal && real !== selfDirReal;
+    })
     .join(delimiter);
 
   const preferredDirs = [
@@ -125,7 +175,7 @@ export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "
   ];
 
   const candidate =
-    Bun.which(name, { PATH: preferredDirs.join(delimiter) }) ?? Bun.which(name, { PATH: filteredPath });
+    which(name, { PATH: preferredDirs.join(delimiter) }) ?? which(name, { PATH: filteredPath });
 
   if (!candidate) {
     const hint =
@@ -158,6 +208,14 @@ export function resolveRealBinary(name: "claude" | "codex" | "grok" | "kimi" | "
     throw new BinaryResolutionError(
       `Refusing to exec: resolved '${name}' (${candidate}) is our own shim. PATH looks ` +
         `misconfigured (duplicate/reordered entries?). Aborting instead of recursing into myself.`,
+    );
+  }
+
+  // HOME-independent: the candidate is the running compiled shim itself.
+  if (selfReal && candidateReal && candidateReal === selfReal) {
+    throw new BinaryResolutionError(
+      `Refusing to exec: resolved '${name}' (${candidate}) is the running shim itself (${selfReal}). ` +
+        `Aborting instead of recursing into myself.`,
     );
   }
 

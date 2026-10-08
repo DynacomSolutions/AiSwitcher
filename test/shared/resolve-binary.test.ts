@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { nativeBinaryForNodeLauncher } from "../../src/shared/resolve-binary.ts";
+import { nativeBinaryForNodeLauncher, resolveRealBinary, shimExecEnvVar } from "../../src/shared/resolve-binary.ts";
 
 // resolveRealBinary()'s MANAGED_REAL_BIN_DIR/LEGACY_MANAGED_REAL_BIN_DIR are
 // module-level consts computed once at import time from HOME/env vars —
@@ -130,5 +130,86 @@ describe("nativeBinaryForNodeLauncher", () => {
     const launcher = join(home, "npm", "lib", "node_modules", "@openai", "codex", "bin", "codex.js");
     await Bun.write(launcher, "#!/usr/bin/env node\n");
     expect(nativeBinaryForNodeLauncher(launcher)).toBeNull();
+  });
+});
+
+describe("resolveRealBinary - shim self-recursion guards (HOME-independent)", () => {
+  // Layout: <root>/shims/codex (the installed compiled shim) and
+  // <root>/real/codex (the real CLI). SHIM_DIR was computed at import time
+  // from the real HOME and never matches <root>, as with a relocated HOME.
+  async function layout() {
+    const root = await makeHome();
+    const shim = join(root, "shims", "codex");
+    const real = join(root, "real", "codex");
+    await writeExecutable(shim);
+    await writeExecutable(real);
+    return { root, shim, real };
+  }
+
+  test("shim dir on PATH is skipped via the running executable's directory", async () => {
+    const { root, shim, real } = await layout();
+    const found = resolveRealBinary("codex", {
+      execPath: shim,
+      env: { PATH: `${join(root, "shims")}:${join(root, "real")}` },
+      which: (_n, o) =>
+        o.PATH.split(":").includes(join(root, "shims")) ? shim : o.PATH.includes(join(root, "real")) ? real : null,
+    });
+    expect(found).toBe(real);
+  });
+
+  test("candidate equal to own execPath is refused", async () => {
+    const { root, shim } = await layout();
+    const link = join(root, "link-dir", "codex");
+    await mkdir(join(root, "link-dir"), { recursive: true });
+    await symlink(shim, link);
+    expect(() =>
+      resolveRealBinary("codex", { execPath: shim, env: { PATH: "/nonexistent" }, which: () => link }),
+    ).toThrow(/running shim itself/);
+  });
+
+  test("re-entry env var pointing at own realpath is refused", async () => {
+    const { shim, real } = await layout();
+    expect(() =>
+      resolveRealBinary("codex", {
+        execPath: shim,
+        env: { PATH: "", [shimExecEnvVar("codex")]: shim },
+        which: () => real,
+      }),
+    ).toThrow(/Aborting instead of recursing/);
+  });
+
+  test("legitimate nesting (env holds the real binary path) is allowed", async () => {
+    const { shim, real } = await layout();
+    expect(
+      resolveRealBinary("codex", {
+        execPath: shim,
+        env: { PATH: "", [shimExecEnvVar("codex")]: real },
+        which: () => real,
+      }),
+    ).toBe(real);
+  });
+
+  test("bun interpreter execPath disables the executable-based guards", async () => {
+    const root = await makeHome();
+    const bun = join(root, "bin", "bun");
+    await writeExecutable(bun);
+    expect(
+      resolveRealBinary("codex", {
+        execPath: bun,
+        env: { PATH: "", [shimExecEnvVar("codex")]: bun },
+        which: () => bun,
+      }),
+    ).toBe(bun);
+  });
+
+  test("PATH containing only the shim dir yields no candidate", async () => {
+    const { root, shim } = await layout();
+    expect(() =>
+      resolveRealBinary("codex", {
+        execPath: shim,
+        env: { PATH: join(root, "shims") },
+        which: (_n, o) => (o.PATH.includes(join(root, "shims")) ? shim : null),
+      }),
+    ).toThrow(/Could not locate/);
   });
 });
