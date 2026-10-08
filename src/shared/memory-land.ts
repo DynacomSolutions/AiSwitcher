@@ -11,6 +11,8 @@ export interface GitBaseTarget {
   toplevel: string;
   org: string;
   repo: string;
+  /** Repos root: the part of the toplevel before `/.worktrees/`. */
+  root: string;
   /** Memory file path relative to the base toplevel. */
   relpath: string;
 }
@@ -20,15 +22,15 @@ export interface LandResult {
   result: string;
 }
 
-const BASE_TOPLEVEL = /(?:^|\/)\.worktrees\/([^/]+)\/\.base\/([^/]+)$/;
+const BASE_TOPLEVEL = /^(.*)\/\.worktrees\/([^/]+)\/\.base\/([^/]+)$/;
 
 /** Match `<anything>/.worktrees/<org>/.base/<repo>` exactly. */
-export function parseBaseToplevel(toplevel: string): { org: string; repo: string } | null {
+export function parseBaseToplevel(toplevel: string): { root: string; org: string; repo: string } | null {
   const match = BASE_TOPLEVEL.exec(toplevel.replace(/\/+$/, ""));
   if (!match) return null;
-  const [, org, repo] = match;
+  const [, rawRoot, org, repo] = match;
   if (!org || !repo || org === ".base" || repo === ".base") return null;
-  return { org, repo };
+  return { root: rawRoot || "/", org, repo };
 }
 
 async function isExecutable(path: string): Promise<boolean> {
@@ -91,7 +93,7 @@ export async function detectGitBase(
   }
   const top = await run("git", ["-C", dirname(realFile), "rev-parse", "--show-toplevel"], env);
   if (top.code !== 0) return null;
-  const toplevel = top.stdout.trim();
+  const toplevel = await realpath(top.stdout.trim()).catch(() => top.stdout.trim());
   const parsed = parseBaseToplevel(toplevel);
   if (!parsed) return null;
   const relpath = relative(toplevel, realFile);
@@ -117,7 +119,7 @@ export async function landMemory(
     const res = await run(
       target.bin,
       ["land", `${org}/${repo}`, "-m", message, mode === "append" ? "--append" : "--file", `${relpath}=${temp}`],
-      env,
+      { ...env, AIS_REPOS_ROOT: target.root },
     );
     if (res.code !== 0) {
       throw new Error(`git-base land failed (exit ${res.code}): ${res.stderr.trim() || "no output"}`);

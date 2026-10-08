@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runMemoryCommand } from "../src/cli/memory.ts";
@@ -41,6 +41,7 @@ async function fixture(opts: { fail?: boolean; reply?: string; seed?: boolean } 
     bin,
     `#!/bin/sh
 printf '%s\\n' "$@" > "${argsLog}"
+printf '%s' "$AIS_REPOS_ROOT" > "${argsLog}.root"
 if [ -n "$FAKE_FAIL" ]; then echo "boom: push rejected" >&2; exit 3; fi
 # simulate the fast-forward: copy the --file tempfile over the target
 mode=""
@@ -79,8 +80,8 @@ async function capture(fn: () => Promise<void>): Promise<string> {
 
 describe("git-base detection", () => {
   test("matches only <x>/.worktrees/<org>/.base/<repo>", () => {
-    expect(parseBaseToplevel("/r/.worktrees/acme/.base/widgets")).toEqual({ org: "acme", repo: "widgets" });
-    expect(parseBaseToplevel("/r/.worktrees/acme/.base/widgets/")).toEqual({ org: "acme", repo: "widgets" });
+    expect(parseBaseToplevel("/r/.worktrees/acme/.base/widgets")).toEqual({ root: "/r", org: "acme", repo: "widgets" });
+    expect(parseBaseToplevel("/r/.worktrees/acme/.base/widgets/")).toEqual({ root: "/r", org: "acme", repo: "widgets" });
     expect(parseBaseToplevel("/r/.worktrees/acme/task/widgets")).toBeNull();
     expect(parseBaseToplevel("/r/acme/.base/widgets")).toBeNull();
     expect(parseBaseToplevel("/r/.worktrees/acme/.base/widgets/sub")).toBeNull();
@@ -117,6 +118,17 @@ describe("ais memory landing", () => {
     expect(await readFile(f.memory, "utf8")).toBe(`${INITIAL_MEMORY}\n## Fact one\n\nbody\n`);
     expect(out.split("\n").pop()).toBe("a".repeat(40));
     expect(await readFile(args[5]!.split("=")[1]!, "utf8").catch(() => "gone")).toBe("gone");
+  });
+
+  test("passes the detected repos root, overriding an inherited AIS_REPOS_ROOT", async () => {
+    const f = await fixture();
+    const env = { ...f.env, AIS_REPOS_ROOT: "/somewhere/else" };
+    const t = await detectGitBase(join(f.home, ".ais", "memory", "GLOBAL.md"), env);
+    await capture(() => runMemoryCommand(["add", "x"], {}, env, f.home));
+    const recorded = await readFile(`${f.argsLog}.root`, "utf8");
+    expect(recorded).toBe(t!.root);
+    expect(recorded).not.toBe("/somewhere/else");
+    expect(await realpath(f.base)).toBe(`${recorded}/.worktrees/acme/.base/widgets`);
   });
 
   test("unchanged is passed through", async () => {
