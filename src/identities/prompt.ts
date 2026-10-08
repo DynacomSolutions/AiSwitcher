@@ -46,7 +46,9 @@ export async function promptForIdentity(
     const choice = await clack.select({
       message: "Select an identity to use",
       options: [
-        ...activeIdentities(identitiesFile.identities).map((identity) => ({
+        // A pool is not a normal choice; it is launched explicitly
+        // with --identity=<pool>.
+        ...activeIdentities(identitiesFile.identities).filter((identity) => identity.swapPool === undefined).map((identity) => ({
           value: identity.name,
           label: identity.label,
           hint: identity.description,
