@@ -103,6 +103,27 @@ identity via the `AI_PROFILE_SWITCHER_SESSION` marker env var.
 }
 ```
 
+### Claude swap pools
+
+`GET /api/claude-swap[?pool=<name>][&usage=0]`
+
+Members of a claude swap pool with the active marker, allowed flag and live
+5h/weekly utilisation (`usage=0` skips the live calls). 404 when no/unknown
+pool. `scheduler` is the daemon auto-swap status, or `null` when the
+scheduler is not running (`AIS_CLAUDE_SWAP=0`).
+
+```jsonc
+{
+  "ok": true, "pool": "shared", "active": "work", "auto": true, "thresholdPercent": 95,
+  "accounts": [
+    { "name": "work", "active": true, "allowed": true,
+      "usage": { "status": "live", "fiveHour": { "utilization": 12, "resetsAt": "..." },
+                 "sevenDay": { "utilization": 30 }, "maxUtilization": 30, "capturedAt": "..." } }
+  ],
+  "scheduler": { "ok": true, "enabled": true, "pools": [{ "pool": "shared", "auto": true, "lastCheckAt": null, "lastOutcome": null, "backoffMs": 0 }] }
+}
+```
+
 ### Spend guard
 
 `GET /api/spend-guard`

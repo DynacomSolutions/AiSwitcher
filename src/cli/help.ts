@@ -26,6 +26,10 @@ const COMMANDS: Array<[string, string]> = [
   ["auth login|enable <identity> --tool=ali", "SSH-only interactive auth browser and 10-minute cookie renewal"],
   ["auth refresh <identity> [--tool=ali|codex|claude|grok|kimi]", "Renew credentials without re-login: ali cookies, or the OAuth grant (written through to every store)"],
   ["auth import <pi-id> --tool=pi --claude=<id> ...", "Merge provider credentials into one Pi identity"],
+  ["claude-swap [status] [pool] [--json]", "Claude swap pool: members, active marker, 5h/weekly use, allowed flag"],
+  ["claude-swap to <account> | next [--if-limited] [--pool=]", "Swap the pool's Claude login to a member (manual), or to the one with most headroom"],
+  ["claude-swap pool create <name> --accounts=a,b[,c] [--config-dir=]", "Create a pool identity sharing one Claude folder across accounts"],
+  ["claude-swap allow|disallow <account> | auto on|off [--threshold=95] | usage", "Edit allowed accounts, automatic limit swap, per-member usage split"],
   ["memory [show|path|init|edit|add] [--stdin]", "Machine-local memory shared by every AIS agent and identity"],
   ["doctor [--identity=] [--tool=] [--json]", "Live responsiveness probe per identity — catches a hung/stuck identity"],
   ["resume [session-id] [--identity=] [--tool=] [--json]", "Interactive tree picker (or direct launch) for resumable sessions"],
@@ -142,6 +146,17 @@ one identity made every subsequent prompt on that identity hang indefinitely
 while auth stayed valid and fast throughout — closing those agents fixed it
 immediately. --identity/--tool narrow which identities are probed, same as
 "usage"/"limits".
+
+"claude-swap" is for claude swap POOLS only: a pool is a normal claude identity
+(own configDir with the shared settings, history, skills and plugins) whose
+OAuth login is swapped between member identities by copying the member's
+.credentials.json and oauthAccount into it, under Claude Code's own lock
+dirs. Nothing happens to identities that are not pools. A running Claude
+session uses the new account from its next message. "auto on" lets the
+console daemon (AIS_CLAUDE_SWAP=0 opts out) swap when the active account
+reaches --threshold (default 95%) on the 5h or weekly window; "next
+--if-limited" does the same check once and is suitable for a Claude Code
+StopFailure hook. Only accounts marked allowed are used by "next"/auto.
 
 "herdr" opens herdr with an ais overview beside it, with no tmux anywhere:
 "aistui herdr" (a single native binary) embeds the REAL herdr client in a

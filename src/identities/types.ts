@@ -30,6 +30,30 @@ export interface Identity {
    * order retire/unretire events per identity across hosts (newest event
    * wins). */
   unretiredAt?: string;
+  /** Claude only. Present means this identity is a SWAP POOL: one shared
+   * Claude folder (settings, history, skills, plugins) whose OAuth grant is
+   * swapped between member identities by `ais claude-swap`. Absent means a
+   * normal identity and nothing credential-related ever happens to it. See
+   * identities/claude-swap.ts. */
+  swapPool?: SwapPool;
+}
+
+/** Credential-swap pool configuration, stored on the pool identity itself. */
+export interface SwapPool {
+  /** Names of other claude identities whose configDir
+   * `.credentials.json` / `.claude.json` `oauthAccount` act as the
+   * per-account vault. */
+  accounts: string[];
+  /** The member whose grant currently sits in the pool's configDir. */
+  active?: string;
+  /** Members excluded from `next` and automatic swaps (absent = all
+   * allowed). A subset of `accounts`. */
+  disallowed?: string[];
+  /** Daemon swaps automatically when the active member reaches the
+   * threshold. */
+  auto?: boolean;
+  /** Utilisation percent (1-100) at which auto swap triggers. Default 95. */
+  thresholdPercent?: number;
 }
 
 /**

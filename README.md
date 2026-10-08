@@ -961,6 +961,54 @@ it `(retired)` and sorts it last.
   of every retired identity are purged again, because rsync would otherwise
   copy the other host's files back.
 
+## Claude swap pools (`ais claude-swap`)
+
+A swap pool gives several Claude accounts ONE shared Claude folder (settings,
+history, skills, plugins) and swaps only the login. It is opt-in: only a
+claude identity that carries `swapPool` in `~/.claude/identities.json` is
+ever touched; there is no in-Claude slash command, everything runs as
+`ais claude-swap` outside the session.
+
+```
+ais claude-swap pool create shared --accounts=work,personal [--config-dir=]
+ais claude-swap                      # members, active marker, 5h/weekly use, resets, allowed
+ais claude-swap to personal          # manual swap (add --force for a disallowed member)
+ais claude-swap next                 # the allowed member with the most headroom
+ais claude-swap allow|disallow <account>
+ais claude-swap auto on --threshold=95
+ais claude-swap hook on              # optional instant trigger, see below
+ais claude-swap usage                # per-member transcript usage split
+```
+
+Members are existing, non-retired, non-pool claude identities; their own
+configDir stays the per-account vault. A swap takes Claude Code's own
+`.oauth_refresh.lock` / `.claude.json.lock` dirs (bounded wait, clear failure),
+writes the pool's possibly-rotated live grant back to the member that owns it,
+copies the target's `.credentials.json` (0600, atomic) into the pool and
+replaces `oauthAccount` in the pool's `.claude.json` (all other keys kept).
+`swapPool.active` and an event line in `~/.ais/state/claude-swap.jsonl`
+(`{ts,pool,from,to,reason: manual|auto|launch}`) record it. A running Claude
+session picks the new login up on its next message (verified on Linux with
+Claude Code 2.1.293).
+
+Limits come from one `GET /api/oauth/usage` per member (refreshing an expired
+token first through the normal refresh path). With `auto on`, the console
+daemon (disable with `AIS_CLAUDE_SWAP=0`) polls the active member every 60-120s
+(jittered) and swaps when the 5h or weekly window reaches the threshold, or the
+usage call itself is rate-limited, to an allowed member below the threshold. A 10 minute
+cooldown prevents flapping; with no qualifying member it logs and backs off.
+The claude shim does one bounded (4s) pre-launch check for a pool (reason
+`launch`). `ais claude-swap hook on` installs a `StopFailure` hook
+(matcher `rate_limit`) in the pool's `settings.json` that runs
+`ais claude-swap next --if-limited --assume-limited --reason=auto`, so a hard 429
+swaps at once (needs `ais` on PATH).
+
+While a member is active, the pool's `.credentials.json` is another store of
+that member's grant: the daemon refresh writes through to it and picks the
+freshest copy, and never refreshes the pool identity itself. `ais usage` shows
+the pool as its own row; `ais claude-swap usage` (and `GET /api/claude-swap`
+for status) split it by member using the ledger.
+
 ## Desktop apps
 
 - **Codex**: `codex --identity=<name> app [PATH]` — routed through the codex
