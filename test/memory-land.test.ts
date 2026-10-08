@@ -43,7 +43,17 @@ async function fixture(opts: { fail?: boolean; reply?: string; seed?: boolean } 
 printf '%s\\n' "$@" > "${argsLog}"
 if [ -n "$FAKE_FAIL" ]; then echo "boom: push rejected" >&2; exit 3; fi
 # simulate the fast-forward: copy the --file tempfile over the target
-for a in "$@"; do case "$a" in *=*) rel="\${a%%=*}"; tmp="\${a#*=}"; cat "$tmp" > "${base}/$rel";; esac; done
+mode=""
+for a in "$@"; do
+  case "$a" in
+    --file|--append) mode="$a";;
+    *=*) rel="\${a%%=*}"; tmp="\${a#*=}"
+      if [ "$mode" = "--append" ]; then
+        if [ -s "${base}/$rel" ] && [ -n "$(tail -c1 "${base}/$rel")" ]; then echo >> "${base}/$rel"; fi
+        cat "$tmp" >> "${base}/$rel"
+      else cat "$tmp" > "${base}/$rel"; fi;;
+  esac
+done
 echo "noise"
 echo "\${FAKE_REPLY:-${"a".repeat(40)}}"
 `,
@@ -102,11 +112,11 @@ describe("ais memory landing", () => {
     const f = await fixture();
     const out = await capture(() => runMemoryCommand(["add", "## Fact one\n\nbody"], {}, f.env, f.home));
     const args = (await readFile(f.argsLog, "utf8")).trim().split("\n");
-    expect(args.slice(0, 5)).toEqual(["land", "acme/widgets", "-m", "docs(memory): Fact one", "--file"]);
+    expect(args.slice(0, 5)).toEqual(["land", "acme/widgets", "-m", "docs(memory): Fact one", "--append"]);
     expect(args[5]).toStartWith("memory/GLOBAL.md=");
     expect(await readFile(f.memory, "utf8")).toBe(`${INITIAL_MEMORY}\n## Fact one\n\nbody\n`);
     expect(out.split("\n").pop()).toBe("a".repeat(40));
-    expect(args[5]!.split("=")[1]).not.toBe("");
+    expect(await readFile(args[5]!.split("=")[1]!, "utf8").catch(() => "gone")).toBe("gone");
   });
 
   test("unchanged is passed through", async () => {
@@ -120,6 +130,7 @@ describe("ais memory landing", () => {
     await capture(() => runMemoryCommand(["init"], {}, f.env, f.home));
     const args = (await readFile(f.argsLog, "utf8")).split("\n");
     expect(args[3]).toBe("docs(memory): initialise global memory");
+    expect(args[4]).toBe("--file");
     expect(await readFile(f.memory, "utf8")).toBe(INITIAL_MEMORY);
   });
 

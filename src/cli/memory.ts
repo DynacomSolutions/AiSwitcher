@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { boolFlag, type ParsedArgs } from "./args.ts";
 import { CliUsageError } from "./errors.ts";
 import {
-  appendedMemoryContent,
+  appendedMemoryBlock,
   appendGlobalMemory,
   ensureGlobalMemoryFile,
   INITIAL_MEMORY,
@@ -35,8 +35,14 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function land(target: GitBaseTarget, content: string, message: string, env: Env): Promise<void> {
-  const { result } = await landMemory(target, content, message, env);
+async function land(
+  target: GitBaseTarget,
+  content: string,
+  message: string,
+  env: Env,
+  mode: "file" | "append" = "file",
+): Promise<void> {
+  const { result } = await landMemory(target, content, message, env, mode);
   console.log(result);
 }
 
@@ -99,9 +105,8 @@ export async function runMemoryCommand(
         : entryParts.join(" ");
       if (!entry.trim()) throw new CliUsageError("Usage: ais memory add <text...> or ais memory add --stdin");
       if (target) {
-        const next = appendedMemoryContent(await readFile(path, "utf8"), entry);
         console.log(path);
-        await land(target, next, addCommitMessage(entry), env);
+        await land(target, appendedMemoryBlock(entry), addCommitMessage(entry), env, "append");
         return;
       }
       await appendGlobalMemory(entry, home);

@@ -99,13 +99,15 @@ export async function detectGitBase(
   return { bin, toplevel, ...parsed, relpath };
 }
 
-/** Land `content` as the new content of the memory file via `git-base land`.
+/** Land `content` via `git-base land`: the whole new file (`file`) or only a
+ * block to append (`append`, race-safe under concurrent writers).
  * Throws with git-base's stderr on any failure; never writes in place. */
 export async function landMemory(
   target: GitBaseTarget,
   content: string,
   message: string,
   env: Record<string, string | undefined> = process.env,
+  mode: "file" | "append" = "file",
 ): Promise<LandResult> {
   const dir = await mkdtemp(join(tmpdir(), "ais-memory-land-"));
   try {
@@ -114,7 +116,7 @@ export async function landMemory(
     const { org, repo, relpath } = target;
     const res = await run(
       target.bin,
-      ["land", `${org}/${repo}`, "-m", message, "--file", `${relpath}=${temp}`],
+      ["land", `${org}/${repo}`, "-m", message, mode === "append" ? "--append" : "--file", `${relpath}=${temp}`],
       env,
     );
     if (res.code !== 0) {

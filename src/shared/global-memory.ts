@@ -76,9 +76,14 @@ export async function readGlobalMemory(home: string = homedir()): Promise<string
 /** New file content produced by appending `entry`; shared by the in-place and
  * git-base landing write paths so both append identically. */
 export function appendedMemoryContent(current: string, entry: string): string {
+  return `${current}${appendedMemoryBlock(entry)}`;
+}
+
+/** The exact bytes an append adds after content that ends with a newline. */
+export function appendedMemoryBlock(entry: string): string {
   const trimmed = entry.trim();
   if (!trimmed) throw new Error("Global memory entry cannot be empty");
-  return `${current}\n${trimmed}\n`;
+  return `\n${trimmed}\n`;
 }
 
 export async function appendGlobalMemory(entry: string, home: string = homedir()): Promise<string> {
