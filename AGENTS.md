@@ -101,6 +101,12 @@ src/
                              errors on no-match, always launches the one shared dir (flag >
                              env override still honored; a match only seeds the in-app default)
     prompt.ts               @clack/prompts picker + create-new-identity flow
+                             The picker lists claude pools under one "Claude Pools" entry
+                             (second select of member accounts; a member choice makes it
+                             active via the manual switch, then launches the pool) and
+                             pre-selects the last pick per tool, remembered by
+                             last-identity.ts in ~/.ais/state/last-identity.json (mode 0600,
+                             every read/write best-effort)
     errors.ts                typed IdentityResolutionError subclasses
   shared/              process/OS mechanics — no identity-resolution logic
     resolve-binary.ts    find the REAL claude/codex/grok/kimi/open/crush/pi binary,
