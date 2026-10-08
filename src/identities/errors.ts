@@ -19,6 +19,15 @@ export class UnknownIdentityError extends IdentityResolutionError {
   }
 }
 
+export class UnknownPoolError extends IdentityResolutionError {
+  constructor(name: string, validNames: string[]) {
+    super(
+      "UNKNOWN_POOL",
+      `Unknown pool "${name}". Valid pools: ${validNames.length ? validNames.join(", ") : "(none configured yet)"}`,
+    );
+  }
+}
+
 export class RetiredIdentityError extends IdentityResolutionError {
   constructor(toolName: string, identity: { name: string; retiredAt?: string }) {
     super(

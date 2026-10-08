@@ -2,7 +2,7 @@ import type { IdentitiesFile, ResolveOptions, ResolvedIdentity, ToolConfig } fro
 import { expandPath, matchDirectory } from "./match.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } from "./store.ts";
 import { promptForIdentity } from "./prompt.ts";
-import { NonInteractiveResolutionError, RetiredIdentityError, UnknownIdentityError } from "./errors.ts";
+import { NonInteractiveResolutionError, RetiredIdentityError, UnknownIdentityError, UnknownPoolError } from "./errors.ts";
 import { findRetiredByConfigDir, isRetired } from "./retired.ts";
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
@@ -73,18 +73,32 @@ export async function resolveIdentity(
     return { identity, configDirValue: expandPath(identity.configDir), source: "flag" };
   }
 
+  // (a2) explicit --pool=<name> launches that pool directly (claude only).
+  if (opts.explicitPoolFlag) {
+    const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
+    const pools = file.identities.filter((i) => i.swapPool !== undefined && !isRetired(i));
+    const pool = findIdentityByNameOrAlias(pools, opts.explicitPoolFlag);
+    if (!pool) {
+      throw new UnknownPoolError(
+        opts.explicitPoolFlag,
+        pools.map((p) => p.name),
+      );
+    }
+    return { identity: pool, configDirValue: expandPath(pool.configDir), source: "flag" };
+  }
+
   // (b) an already-set env var is an explicit override — skip everything
   // else. Preserves nested/child-session inheritance (e.g. subagents) and
   // deliberate manual power-user overrides.
   const presetEnvValue = opts.env[cfg.envVarName];
-  if (presetEnvValue) {
+  if (presetEnvValue && !opts.pickerMode) {
     await assertEnvNotRetired(cfg, presetEnvValue, deps);
     return { identity: undefined, configDirValue: presetEnvValue, source: "env" };
   }
 
   // (c) directory-pattern match against cwd, if unique.
   const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
-  let matchResult = deps.matchDirectory(opts.cwd, file.identities);
+  let matchResult = opts.pickerMode ? undefined : deps.matchDirectory(opts.cwd, file.identities);
   // A retired identity tying with active ones must not make the match
   // ambiguous (that would block every non-interactive launch): drop the
   // retired candidates from the tie. A unique best match that is itself
@@ -126,7 +140,7 @@ export async function resolveIdentity(
   }
 
   const timeoutMs = opts.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
-  const { identity, created } = await deps.promptForIdentity(file, cfg, timeoutMs);
+  const { identity, created } = await deps.promptForIdentity(file, cfg, timeoutMs, undefined, opts.pickerMode);
   return {
     identity,
     configDirValue: expandPath(identity.configDir),

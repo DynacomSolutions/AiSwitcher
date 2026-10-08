@@ -98,6 +98,12 @@ export function aisStateDir(home: string = homedir()): string {
   return join(aisHome(home), "state");
 }
 
+/** Last identity picked in the interactive picker, per tool:
+ * `{"claude": "<name>"}`. Convenience only; safe to delete. */
+export function aisLastIdentityPath(home: string = homedir()): string {
+  return join(aisStateDir(home), "last-identity.json");
+}
+
 /** JSONL ledger of claude-swap events ({ts, pool, from, to, reason}). The
  * usage attribution reads it to map transcript timestamps to the member
  * account that was active. */

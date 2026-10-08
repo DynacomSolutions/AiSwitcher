@@ -148,6 +148,10 @@ export interface ToolConfig {
 
 export interface ResolveOptions {
   explicitIdentityFlag?: string;
+  /** `--pool=<name>`: launch that claude pool directly. */
+  explicitPoolFlag?: string;
+  /** Bare `--identity` / `--pool`: open only that picker list. */
+  pickerMode?: "identity" | "pool";
   cwd: string;
   env: Record<string, string | undefined>;
   nonInteractiveHint?: boolean;
