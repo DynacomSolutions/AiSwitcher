@@ -33,6 +33,28 @@ describe("stripOwnFlags", () => {
   });
 });
 
+describe("stripOwnFlags pool and bare picker flags", () => {
+  test("--pool=<name> is stripped for claude and carries the name", () => {
+    const r = stripOwnFlags(["--pool=team", "hello"], { pools: true });
+    expect(r.poolFlag).toBe("team");
+    expect(r.cleanedArgv).toEqual(["hello"]);
+  });
+
+  test("bare --pool and bare --identity select a single list", () => {
+    expect(stripOwnFlags(["--pool", "x"], { pools: true }).pickerMode).toBe("pool");
+    expect(stripOwnFlags(["--pool", "x"], { pools: true }).cleanedArgv).toEqual(["x"]);
+    expect(stripOwnFlags(["--identity"]).pickerMode).toBe("identity");
+    expect(stripOwnFlags(["--identity"]).cleanedArgv).toEqual([]);
+  });
+
+  test("--identity=<name> behaves as before; --pool is forwarded when pools are off", () => {
+    const r = stripOwnFlags(["--identity=work", "--pool=a"]);
+    expect(r.identityFlag).toBe("work");
+    expect(r.pickerMode).toBeUndefined();
+    expect(r.cleanedArgv).toEqual(["--pool=a"]);
+  });
+});
+
 describe("detectNonInteractiveHint", () => {
   test("claude: -p/--print is non-interactive", () => {
     expect(detectNonInteractiveHint("claude", ["-p", "hello"])).toBe(true);

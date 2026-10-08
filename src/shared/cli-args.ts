@@ -2,6 +2,10 @@ import { IDENTITY_SESSION_MARKER } from "./exec.ts";
 
 export interface ParsedCliArgs {
   identityFlag?: string;
+  /** `--pool=<name>`: launch that pool directly. */
+  poolFlag?: string;
+  /** Bare `--identity` / `--pool`: open only that picker list. */
+  pickerMode?: "identity" | "pool";
   desktopFlag: boolean;
   nonInteractiveHint: boolean;
   cleanedArgv: string[];
@@ -66,6 +70,9 @@ export function resolveNestedIdentity(
 // `-p` is --prompt, not --print; zai's real binary is `crush`, whose own
 // flag list — confirmed via `crush --help` — has no --id/--identity either).
 const IDENTITY_PREFIXES = ["--identity=", "--id="];
+const BARE_IDENTITY_FLAGS = ["--identity", "--id"];
+const POOL_PREFIX = "--pool=";
+const BARE_POOL_FLAG = "--pool";
 const DESKTOP_FLAG = "--desktop";
 
 /**
@@ -75,13 +82,20 @@ const DESKTOP_FLAG = "--desktop";
  * "--" end-of-options token is seen so anything after it (e.g.
  * `codex -- --identity=foo`) is forwarded literally rather than stripped.
  */
-export function stripOwnFlags(argv: string[]): {
+export function stripOwnFlags(
+  argv: string[],
+  opts: { pools?: boolean } = {},
+): {
   identityFlag?: string;
+  poolFlag?: string;
+  pickerMode?: "identity" | "pool";
   desktopFlag: boolean;
   cleanedArgv: string[];
 } {
   const cleaned: string[] = [];
   let identityFlag: string | undefined;
+  let poolFlag: string | undefined;
+  let pickerMode: "identity" | "pool" | undefined;
   let desktopFlag = false;
   let pastEndOfOptions = false;
 
@@ -100,6 +114,18 @@ export function stripOwnFlags(argv: string[]): {
       identityFlag = arg.slice(identityPrefix.length);
       continue;
     }
+    if (BARE_IDENTITY_FLAGS.includes(arg)) {
+      pickerMode = "identity";
+      continue;
+    }
+    if (opts.pools && arg.startsWith(POOL_PREFIX)) {
+      poolFlag = arg.slice(POOL_PREFIX.length);
+      continue;
+    }
+    if (opts.pools && arg === BARE_POOL_FLAG) {
+      pickerMode = "pool";
+      continue;
+    }
     if (arg === DESKTOP_FLAG) {
       desktopFlag = true;
       continue;
@@ -107,7 +133,13 @@ export function stripOwnFlags(argv: string[]): {
     cleaned.push(arg);
   }
 
-  return { identityFlag, desktopFlag, cleanedArgv: cleaned };
+  return {
+    identityFlag,
+    ...(poolFlag !== undefined ? { poolFlag } : {}),
+    ...(pickerMode ? { pickerMode } : {}),
+    desktopFlag,
+    cleanedArgv: cleaned,
+  };
 }
 
 /**
@@ -165,9 +197,13 @@ export function detectNonInteractiveHint(toolName: "claude" | "codex" | "grok" |
 }
 
 export function parseCliArgs(toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode", argv: string[]): ParsedCliArgs {
-  const { identityFlag, desktopFlag, cleanedArgv } = stripOwnFlags(argv);
+  const { identityFlag, poolFlag, pickerMode, desktopFlag, cleanedArgv } = stripOwnFlags(argv, {
+    pools: toolName === "claude",
+  });
   return {
     identityFlag,
+    ...(poolFlag !== undefined ? { poolFlag } : {}),
+    ...(pickerMode ? { pickerMode } : {}),
     desktopFlag,
     nonInteractiveHint: detectNonInteractiveHint(toolName, cleanedArgv),
     cleanedArgv,

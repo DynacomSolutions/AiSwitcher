@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { resolveIdentity, type ResolveDeps } from "../src/identities/resolve.ts";
 import { matchDirectory } from "../src/identities/match.ts";
-import { NonInteractiveResolutionError, UnknownIdentityError } from "../src/identities/errors.ts";
+import { NonInteractiveResolutionError, UnknownIdentityError, UnknownPoolError } from "../src/identities/errors.ts";
 import type { Identity, IdentitiesFile, ToolConfig } from "../src/identities/types.ts";
 
 const CFG: ToolConfig = {
@@ -204,5 +204,58 @@ describe("single-instance resolution (pi)", () => {
     );
     expect(result.source).toBe("single-instance");
     expect(result.identity).toBeUndefined();
+  });
+});
+
+describe("pool flags", () => {
+  const pool: Identity = {
+    name: "team-pool",
+    label: "Team Pool",
+    configDir: "/tmp/does-not-exist/team-pool",
+    swapPool: { accounts: ["work", "personal"], active: "work" },
+  };
+  const withPool = (overrides: Partial<ResolveDeps> = {}) =>
+    fakeDeps({
+      loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+      ...overrides,
+    });
+
+  test("--pool=<name> launches the pool directly without prompting", async () => {
+    const result = await resolveIdentity(
+      CFG,
+      { explicitPoolFlag: "team-pool", cwd: "/x", env: {} },
+      withPool(),
+    );
+    expect(result.source).toBe("flag");
+    expect(result.identity?.name).toBe("team-pool");
+  });
+
+  test("--pool=<unknown> errors and lists pool names", async () => {
+    const run = resolveIdentity(CFG, { explicitPoolFlag: "nope", cwd: "/x", env: {} }, withPool());
+    await expect(run).rejects.toThrow(UnknownPoolError);
+    await expect(run).rejects.toThrow("Valid pools: team-pool");
+  });
+
+  test("bare --pool / --identity prompt with that single list, ignoring env and cwd match", async () => {
+    for (const mode of ["pool", "identity"] as const) {
+      let seen: unknown;
+      const result = await resolveIdentity(
+        CFG,
+        {
+          pickerMode: mode,
+          cwd: "/tmp/does-not-exist/proj/anything",
+          env: { CLAUDE_CONFIG_DIR: "/preset" },
+        },
+        withPool({
+          isInteractive: () => true,
+          promptForIdentity: (async (...args: unknown[]) => {
+            seen = args[4];
+            return { identity: pool, created: false };
+          }) as never,
+        }),
+      );
+      expect(seen).toBe(mode);
+      expect(result.source).toBe("interactive-existing");
+    }
   });
 });

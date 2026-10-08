@@ -20,7 +20,7 @@ beforeEach(() => {
   memoryPath = join(dir, "state", "last-identity.json");
 });
 afterEach(() => {
-  for (const fn of ["select", "intro", "outro"] as const) spyOn(clack, fn).mockRestore();
+  for (const fn of ["select", "intro", "outro", "isCancel"] as const) spyOn(clack, fn).mockRestore();
   spyOn(clack.log, "error").mockRestore();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -45,7 +45,9 @@ function registry(): IdentitiesFile {
 
 const cfg = { toolName: "claude" } as ToolConfig;
 
-function harness(answers: string[]) {
+const CANCEL = Symbol("cancel");
+
+function harness(answers: unknown[]) {
   const calls: SelectOpts[] = [];
   const switched: Array<[string, string]> = [];
   const errors: string[] = [];
@@ -56,6 +58,7 @@ function harness(answers: string[]) {
     calls.push(opts);
     return answers.shift();
   }) as never);
+  spyOn(clack, "isCancel").mockImplementation(((v: unknown) => v === CANCEL) as never);
   const deps: PromptDeps = {
     switchMember: async (pool, member) => void switched.push([pool.name, member]),
     readLast: (tool) => readLastIdentity(tool, memoryPath),
@@ -64,55 +67,97 @@ function harness(answers: string[]) {
   return { calls, switched, errors, deps };
 }
 
-const memberValue = (pool: string, member: string) => `pool:${pool}:${member}`;
-const selectable = (o: SelectOpts) => o.options.filter((x) => !x.disabled);
+const plainText = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, "");
+const labels = (o: SelectOpts) => o.options.map((x) => plainText(x.label));
 
-test("one screen: header, identities, create, header, member rows; no Go to row", async () => {
-  const h = harness(["solo"]);
-  await promptForIdentity(registry(), cfg, 1000, h.deps);
-  expect(h.calls).toHaveLength(1);
-  const opts = h.calls[0]!.options;
-  expect(opts.map((o) => o.label)).toEqual([
-    "Identities",
+test("prompt 1 is a chooser with Identity and Pool, then prompt 2 lists identities", async () => {
+  const h = harness(["identity", "solo"]);
+  const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
+  expect(h.calls.map((c) => c.message)).toEqual(["Select an identity or pool", "Select an identity"]);
+  expect(labels(h.calls[0]!)).toEqual(["Identity", "Pool"]);
+  expect(labels(h.calls[1]!)).toEqual([
     "Solo",
-    "Account A",
-    "Account B",
-    "Account C",
+    "Account A [pool: shared-pool]",
+    "Account B [pool: shared-pool]",
+    "Account C [pool: shared-pool (not allowed)]",
     "+ Create new identity",
-    "Claude Pools",
-    "Account A",
-    "Account B",
-    "Account C",
   ]);
-  expect(opts.some((o) => o.label.includes("Go to"))).toBe(false);
-  expect(opts.map((o) => o.value)).not.toContain("shared-pool");
-  expect(opts.filter((o) => o.disabled).map((o) => o.label)).toEqual(["Identities", "Claude Pools"]);
-  expect(opts[0]!.disabled).toBe(true);
-  expect(opts[6]!.disabled).toBe(true);
+  expect(result.identity.name).toBe("solo");
 });
 
-test("member rows are top-level with encoded values and active / not-allowed hints", async () => {
-  const h = harness(["solo"]);
+test("no disabled rows, no Claude Pools row, no pool row on the identity screen", async () => {
+  const h = harness(["identity", "solo"]);
   await promptForIdentity(registry(), cfg, 1000, h.deps);
-  const members = h.calls[0]!.options.slice(7);
-  expect(members.map((o) => o.value)).toEqual(
-    ["acct-a", "acct-b", "acct-c"].map((m) => memberValue("shared-pool", m)),
-  );
-  expect(members.every((o) => !o.disabled)).toBe(true);
-  expect(members.map((o) => o.hint)).toEqual(["(active)", undefined, "(not allowed)"]);
+  for (const c of h.calls) {
+    expect(c.options.some((o) => o.disabled)).toBe(false);
+    expect(labels(c)).not.toContain("Claude Pools");
+  }
+  expect(h.calls[1]!.options.map((o) => o.value)).not.toContain("shared-pool");
 });
 
-test("no pools: no Claude Pools header", async () => {
+test("pool list: one row per pool, hint has member count and active account, no member rows", async () => {
+  const h = harness(["pool", "shared-pool"]);
+  const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
+  expect(h.calls[1]!.message).toBe("Select a pool");
+  expect(labels(h.calls[1]!)).toEqual(["Shared Pool"]);
+  expect(h.calls[1]!.options[0]!.value).toBe("shared-pool");
+  expect(h.calls[1]!.options[0]!.hint).toBe("3 accounts, active: Account A");
+  expect(h.switched).toEqual([]);
+  expect(result.identity.name).toBe("shared-pool");
+  expect(result.created).toBe(false);
+  expect(await readLastIdentity("claude", memoryPath)).toBe("shared-pool");
+});
+
+test("no pools: no chooser, behaves as before", async () => {
   const file = registry();
   file.identities.pop();
   const h = harness(["solo"]);
   await promptForIdentity(file, cfg, 1000, h.deps);
-  const labels = h.calls[0]!.options.map((o) => o.label);
-  expect(labels).not.toContain("Claude Pools");
-  expect(labels).toEqual(["Identities", "Solo", "Account A", "Account B", "Account C", "+ Create new identity"]);
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]!.message).toBe("Select an identity");
+  expect(labels(h.calls[0]!)).toEqual(["Solo", "Account A", "Account B", "Account C", "+ Create new identity"]);
 });
 
-test("several pools: member hints are prefixed with the pool name", async () => {
+test("esc on prompt 2 returns to prompt 1; esc on prompt 1 cancels", async () => {
+  const h = harness(["identity", CANCEL, "pool", CANCEL, "identity", "acct-b"]);
+  const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
+  expect(h.calls.map((c) => c.message)).toEqual([
+    "Select an identity or pool",
+    "Select an identity",
+    "Select an identity or pool",
+    "Select a pool",
+    "Select an identity or pool",
+    "Select an identity",
+  ]);
+  expect(result.identity.name).toBe("acct-b");
+
+  spyOn(clack, "select").mockRestore();
+  const h2 = harness([CANCEL]);
+  await expect(promptForIdentity(registry(), cfg, 1000, h2.deps)).rejects.toThrow();
+});
+
+test("esc on the only prompt (no chooser) cancels", async () => {
+  const file = registry();
+  file.identities.pop();
+  const h = harness([CANCEL]);
+  await expect(promptForIdentity(file, cfg, 1000, h.deps)).rejects.toThrow();
+  expect(h.calls).toHaveLength(1);
+});
+
+test("remembered identity pre-selects kind Identity and the entry; a pick is recorded", async () => {
+  await writeLastIdentity("claude", "acct-b", memoryPath);
+  await writeLastIdentity("codex", "other", memoryPath);
+  const h = harness(["identity", "acct-a"]);
+  await promptForIdentity(registry(), cfg, 1000, h.deps);
+  expect(h.calls[0]!.initialValue).toBe("identity");
+  expect(h.calls[1]!.initialValue).toBe("acct-b");
+  expect(await readLastIdentity("claude", memoryPath)).toBe("acct-a");
+  expect(await readLastIdentity("codex", memoryPath)).toBe("other");
+  expect(statSync(memoryPath).mode & 0o777).toBe(0o600);
+});
+
+test("remembered pool pre-selects kind Pool and that pool", async () => {
+  await writeLastIdentity("claude", "other-pool", memoryPath);
   const file = registry();
   file.identities.push({
     name: "other-pool",
@@ -120,67 +165,23 @@ test("several pools: member hints are prefixed with the pool name", async () => 
     configDir: "/example/other-pool",
     swapPool: { accounts: ["acct-a"], active: "acct-a" },
   });
-  const h = harness([memberValue("other-pool", "acct-a")]);
+  const h = harness(["pool", "other-pool"]);
   const result = await promptForIdentity(file, cfg, 1000, h.deps);
-  expect(h.calls[0]!.options.slice(7).map((o) => o.hint)).toEqual([
-    "Shared Pool (active)",
-    "Shared Pool",
-    "Shared Pool (not allowed)",
-    "Other Pool (active)",
-  ]);
-  expect(h.switched).toEqual([["other-pool", "acct-a"]]);
+  expect(h.calls[0]!.initialValue).toBe("pool");
+  expect(h.calls[1]!.initialValue).toBe("other-pool");
+  expect(labels(h.calls[1]!)).toEqual(["Shared Pool", "Other Pool"]);
   expect(result.identity.name).toBe("other-pool");
 });
 
-test("choosing a member switches manually and launches the pool", async () => {
-  const h = harness([memberValue("shared-pool", "acct-b")]);
-  const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
-  expect(h.calls).toHaveLength(1);
-  expect(h.switched).toEqual([["shared-pool", "acct-b"]]);
-  expect(result.identity.name).toBe("shared-pool");
-  expect(result.created).toBe(false);
-  expect(await readLastIdentity("claude", memoryPath)).toBe("shared-pool");
-});
-
-test("a disallowed member is refused: no switch, error shown, same screen re-shown", async () => {
-  const h = harness([memberValue("shared-pool", "acct-c"), "solo"]);
-  const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
-  expect(h.switched).toEqual([]);
-  expect(h.errors.join("\n")).toContain("not allowed");
-  expect(h.calls).toHaveLength(2);
-  expect(h.calls[1]!.options).toEqual(h.calls[0]!.options);
-  expect(result.identity.name).toBe("solo");
-});
-
-test("the remembered identity is pre-selected and a pick is recorded", async () => {
-  await writeLastIdentity("claude", "acct-b", memoryPath);
-  await writeLastIdentity("codex", "other", memoryPath);
-  const h = harness(["acct-a"]);
-  await promptForIdentity(registry(), cfg, 1000, h.deps);
-  expect(h.calls[0]!.initialValue).toBe("acct-b");
-  expect(await readLastIdentity("claude", memoryPath)).toBe("acct-a");
-  expect(await readLastIdentity("codex", memoryPath)).toBe("other");
-  expect(statSync(memoryPath).mode & 0o777).toBe(0o600);
-});
-
-test("a remembered pool pre-selects its active member row", async () => {
-  await writeLastIdentity("claude", "shared-pool", memoryPath);
-  const file = registry();
-  file.identities[4]!.swapPool!.active = "acct-b";
-  const h = harness([memberValue("shared-pool", "acct-b")]);
-  await promptForIdentity(file, cfg, 1000, h.deps);
-  expect(h.calls[0]!.initialValue).toBe(memberValue("shared-pool", "acct-b"));
-});
-
-test("a remembered identity that is gone or retired falls back to the first entry", async () => {
+test("a remembered identity that is gone or retired falls back to Identity and the first entry", async () => {
   const file = registry();
   file.identities[1]!.retired = true;
   for (const stale of ["acct-a", "vanished"]) {
     await writeLastIdentity("claude", stale, memoryPath);
-    const h = harness(["solo"]);
+    const h = harness(["identity", "solo"]);
     await promptForIdentity(file, cfg, 1000, h.deps);
-    expect(h.calls[0]!.initialValue).toBe("solo");
-    expect(selectable(h.calls[0]!)[0]!.value).toBe("solo");
+    expect(h.calls[0]!.initialValue).toBe("identity");
+    expect(h.calls[1]!.initialValue).toBe("solo");
     spyOn(clack, "select").mockRestore();
   }
 });
@@ -188,9 +189,33 @@ test("a remembered identity that is gone or retired falls back to the first entr
 test("a corrupt memory file is ignored and then replaced", async () => {
   mkdirSync(join(dir, "state"), { recursive: true });
   writeFileSync(memoryPath, "{not json");
-  const h = harness(["acct-b"]);
+  const h = harness(["identity", "acct-b"]);
   const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
-  expect(h.calls[0]!.initialValue).toBe("solo");
+  expect(h.calls[1]!.initialValue).toBe("solo");
   expect(result.identity.name).toBe("acct-b");
   expect(JSON.parse(readFileSync(memoryPath, "utf8"))).toEqual({ claude: "acct-b" });
+});
+
+test("only=pool opens just the pool list, no chooser; esc cancels", async () => {
+  const h = harness(["shared-pool"]);
+  const result = await promptForIdentity(registry(), cfg, 1000, h.deps, "pool");
+  expect(h.calls.map((c) => c.message)).toEqual(["Select a pool"]);
+  expect(result.identity.name).toBe("shared-pool");
+
+  spyOn(clack, "select").mockRestore();
+  const h2 = harness([CANCEL]);
+  await expect(promptForIdentity(registry(), cfg, 1000, h2.deps, "pool")).rejects.toThrow();
+  expect(h2.calls).toHaveLength(1);
+});
+
+test("only=identity opens just the identity list, no chooser; esc cancels", async () => {
+  const h = harness(["acct-a"]);
+  const result = await promptForIdentity(registry(), cfg, 1000, h.deps, "identity");
+  expect(h.calls.map((c) => c.message)).toEqual(["Select an identity"]);
+  expect(result.identity.name).toBe("acct-a");
+
+  spyOn(clack, "select").mockRestore();
+  const h2 = harness([CANCEL]);
+  await expect(promptForIdentity(registry(), cfg, 1000, h2.deps, "identity")).rejects.toThrow();
+  expect(h2.calls).toHaveLength(1);
 });

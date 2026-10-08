@@ -1,10 +1,11 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { styleText } from "node:util";
 import * as clack from "@clack/prompts";
 import type { Identity, IdentitiesFile, ToolConfig } from "./types.ts";
 import { expandPath, isValidIdentityKey, parseDirectoryPattern } from "./match.ts";
 import { saveIdentitiesFile } from "./store.ts";
-import { PromptCancelledError, PromptTimeoutError, InvalidIdentitiesFileError } from "./errors.ts";
+import { PromptCancelledError, PromptTimeoutError, InvalidIdentitiesFileError, UnknownPoolError } from "./errors.ts";
 import { writeZaiAuthFile } from "./zai-auth.ts";
 import { ensureClaudeTranscriptRetention } from "./claude-settings.ts";
 import { writeAliAuthFile } from "./ali-auth.ts";
@@ -17,11 +18,8 @@ import { performSwap } from "./claude-swap.ts";
 // real identity name, and it keeps clack's select() value type a plain
 // string (a Symbol value forced awkward type-widening at the call site).
 const CREATE_NEW = "__create_new_identity__";
-// Disabled heading rows; clack's cursor skips them, so they are never chosen.
-const HEADER_IDENTITIES = "__header_identities__";
-const HEADER_POOLS = "__header_claude_pools__";
-const POOL_PREFIX = "pool:";
-const poolValue = (pool: string, member: string) => `${POOL_PREFIX}${pool}:${member}`;
+const KIND_IDENTITY = "identity";
+const KIND_POOL = "pool";
 
 export interface PromptDeps {
   /** Makes `member` the active account of `pool` (manual reason). */
@@ -43,6 +41,10 @@ function poolMembers(pool: Identity): string[] {
   return pool.swapPool?.accounts ?? [];
 }
 
+function labelOfName(active: Identity[], name: string | undefined): string {
+  return active.find((i) => i.name === name)?.label ?? name ?? "none";
+}
+
 function memberAllowed(pool: Identity, member: string): boolean {
   return poolMembers(pool).includes(member) && !(pool.swapPool?.disallowed ?? []).includes(member);
 }
@@ -62,6 +64,8 @@ export async function promptForIdentity(
   cfg: ToolConfig,
   timeoutMs: number,
   deps: PromptDeps = defaultPromptDeps(cfg),
+  /** Open only this list (no chooser); undefined = normal chooser flow. */
+  only?: "identity" | "pool",
 ): Promise<PromptResult> {
   const controller = new AbortController();
   let timedOut = false;
@@ -79,59 +83,80 @@ export async function promptForIdentity(
     const pools = cfg.toolName === "claude" ? active.filter((i) => i.swapPool !== undefined) : [];
     const plain = active.filter((i) => i.swapPool === undefined);
     const remembered = await deps.readLast(cfg.toolName).catch(() => undefined);
-    const rows = pools.flatMap((pool) =>
-      poolMembers(pool).map((member) => ({ pool, member, value: poolValue(pool.name, member) })),
-    );
-    const labelOf = (name: string) => active.find((i) => i.name === name)?.label ?? name;
-    const several = pools.length > 1;
     const rememberedPool = remembered !== undefined ? pools.find((p) => p.name === remembered) : undefined;
-    const rememberedRow = rememberedPool
-      ? (rows.find((r) => r.pool === rememberedPool && r.member === rememberedPool.swapPool?.active) ??
-        rows.find((r) => r.pool === rememberedPool))
-      : undefined;
-    const initialValue =
-      rememberedRow?.value ??
-      (remembered !== undefined && plain.some((i) => i.name === remembered) ? remembered : undefined) ??
-      plain[0]?.name ??
-      CREATE_NEW;
+    const rememberedIdentity =
+      remembered !== undefined && plain.some((i) => i.name === remembered) ? remembered : undefined;
+    if (only === "pool" && pools.length === 0) {
+      throw new UnknownPoolError("(any)", []);
+    }
+    const showChooser = pools.length > 0 && only === undefined;
+
+    // Pool-member accounts keep their own identity row; they only gain a tag.
+    const tagFor = (name: string): string => {
+      const tags = pools
+        .filter((p) => poolMembers(p).includes(name))
+        .map((p) => `[pool: ${p.name}${memberAllowed(p, name) ? "" : " (not allowed)"}]`);
+      return tags.length > 0 ? ` ${styleText("cyan", tags.join(" "))}` : "";
+    };
+
+    const cancelled = (): Error =>
+      timedOut ? new PromptTimeoutError(cfg.toolName, timeoutMs) : new PromptCancelledError(cfg.toolName);
 
     for (;;) {
+      let kind: string = only ?? KIND_IDENTITY;
+      if (showChooser) {
+        const picked = await clack.select({
+          message: "Select an identity or pool",
+          options: [
+            { value: KIND_IDENTITY, label: "Identity" },
+            { value: KIND_POOL, label: "Pool" },
+          ],
+          initialValue: rememberedPool ? KIND_POOL : KIND_IDENTITY,
+          signal: controller.signal,
+        });
+        if (clack.isCancel(picked)) throw cancelled();
+        kind = picked as string;
+      }
+
+      if (kind === KIND_POOL) {
+        const picked = await clack.select({
+          message: "Select a pool",
+          options: pools.map((pool) => ({
+            value: pool.name,
+            label: pool.label,
+            hint: `${poolMembers(pool).length} accounts, active: ${labelOfName(active, pool.swapPool?.active)}`,
+          })),
+          initialValue: rememberedPool?.name ?? pools[0]!.name,
+          signal: controller.signal,
+        });
+        if (clack.isCancel(picked)) {
+          if (timedOut || !showChooser) throw cancelled();
+          continue;
+        }
+        const pool = pools.find((p) => p.name === picked);
+        if (!pool) throw new InvalidIdentitiesFileError(`selected pool "${String(picked)}" vanished`);
+        await deps.writeLast(cfg.toolName, pool.name).catch(() => undefined);
+        clack.outro(`Using identity "${pool.name}"`);
+        return { identity: pool, created: false };
+      }
+
       const choice = await clack.select({
         message: "Select an identity",
         options: [
-          { value: HEADER_IDENTITIES, label: "Identities", disabled: true },
           ...plain.map((identity) => ({
             value: identity.name,
-            label: identity.label,
+            label: `${identity.label}${tagFor(identity.name)}`,
             hint: identity.description,
           })),
           { value: CREATE_NEW, label: "+ Create new identity" },
-          ...(pools.length > 0
-            ? [
-                { value: HEADER_POOLS, label: "Claude Pools", disabled: true },
-                ...rows.map((r) => ({
-                  value: r.value,
-                  label: labelOf(r.member),
-                  hint:
-                    [
-                      several ? r.pool.label : undefined,
-                      r.member === r.pool.swapPool?.active ? "(active)" : undefined,
-                      memberAllowed(r.pool, r.member) ? undefined : "(not allowed)",
-                    ]
-                      .filter(Boolean)
-                      .join(" ") || undefined,
-                })),
-              ]
-            : []),
         ],
-        initialValue,
+        initialValue: rememberedIdentity ?? plain[0]?.name ?? CREATE_NEW,
         signal: controller.signal,
       });
 
       if (clack.isCancel(choice)) {
-        throw timedOut
-          ? new PromptTimeoutError(cfg.toolName, timeoutMs)
-          : new PromptCancelledError(cfg.toolName);
+        if (showChooser && !timedOut) continue;
+        throw cancelled();
       }
 
       if (choice === CREATE_NEW) {
@@ -145,26 +170,6 @@ export async function promptForIdentity(
         await deps.writeLast(cfg.toolName, created.name).catch(() => undefined);
         clack.outro(`Created identity "${created.name}"`);
         return { identity: created, created: true };
-      }
-
-      if (typeof choice === "string" && choice.startsWith(POOL_PREFIX)) {
-        const row = rows.find((r) => r.value === choice);
-        if (!row) throw new InvalidIdentitiesFileError(`selected pool account "${choice}" vanished`);
-        const { pool, member } = row;
-        if (!memberAllowed(pool, member)) {
-          clack.log.error(`Account "${member}" is not allowed in pool "${pool.name}"`);
-          continue;
-        }
-        try {
-          await deps.switchMember(pool, member);
-        } catch (err) {
-          clack.log.error(err instanceof Error ? err.message : String(err));
-          continue;
-        }
-        if (pool.swapPool) pool.swapPool.active = member;
-        await deps.writeLast(cfg.toolName, pool.name).catch(() => undefined);
-        clack.outro(`Using identity "${pool.name}"`);
-        return { identity: pool, created: false };
       }
 
       const identity = plain.find((i) => i.name === choice);

@@ -47,6 +47,8 @@ export async function runWrapper(
 
     const resolved = await resolveIdentity(cfg, {
       explicitIdentityFlag: identityFlag,
+      ...(parsed.poolFlag !== undefined ? { explicitPoolFlag: parsed.poolFlag } : {}),
+      ...(parsed.pickerMode ? { pickerMode: parsed.pickerMode } : {}),
       cwd: process.cwd(),
       env: process.env,
       nonInteractiveHint: parsed.nonInteractiveHint,
