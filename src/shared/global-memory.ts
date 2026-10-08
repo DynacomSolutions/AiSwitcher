@@ -15,7 +15,7 @@ import {
 import type { ToolConfig } from "../identities/types.ts";
 import { aisGlobalMemoryPath } from "./ais-home.ts";
 
-const INITIAL_MEMORY = `# AIS global memory
+export const INITIAL_MEMORY = `# AIS global memory
 
 This is the machine-local source of durable context shared by every
 AIS-managed agent and identity. Vendor-specific files are projections only.
@@ -71,6 +71,14 @@ export async function ensureGlobalMemoryFile(home: string = homedir()): Promise<
 
 export async function readGlobalMemory(home: string = homedir()): Promise<string> {
   return readFile(await ensureGlobalMemoryFile(home), "utf8");
+}
+
+/** New file content produced by appending `entry`; shared by the in-place and
+ * git-base landing write paths so both append identically. */
+export function appendedMemoryContent(current: string, entry: string): string {
+  const trimmed = entry.trim();
+  if (!trimmed) throw new Error("Global memory entry cannot be empty");
+  return `${current}\n${trimmed}\n`;
 }
 
 export async function appendGlobalMemory(entry: string, home: string = homedir()): Promise<string> {

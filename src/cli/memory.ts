@@ -1,10 +1,21 @@
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir, homedir } from "node:os";
+import { join } from "node:path";
 import { boolFlag, type ParsedArgs } from "./args.ts";
 import { CliUsageError } from "./errors.ts";
-import { appendGlobalMemory, ensureGlobalMemoryFile } from "../shared/global-memory.ts";
+import {
+  appendedMemoryContent,
+  appendGlobalMemory,
+  ensureGlobalMemoryFile,
+  INITIAL_MEMORY,
+} from "../shared/global-memory.ts";
+import { aisGlobalMemoryPath } from "../shared/ais-home.ts";
+import { addCommitMessage, detectGitBase, landMemory, type GitBaseTarget } from "../shared/memory-land.ts";
 
-async function edit(path: string): Promise<void> {
+type Env = Record<string, string | undefined>;
+
+async function runEditor(path: string): Promise<void> {
   if (!process.stdin.isTTY) throw new CliUsageError("ais memory edit requires a terminal");
   const editor = process.env.VISUAL || process.env.EDITOR;
   if (!editor) throw new CliUsageError("Set VISUAL or EDITOR before running ais memory edit");
@@ -15,26 +26,85 @@ async function edit(path: string): Promise<void> {
   });
 }
 
-export async function runMemoryCommand(positionals: string[], flags: ParsedArgs["flags"]): Promise<void> {
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function land(target: GitBaseTarget, content: string, message: string, env: Env): Promise<void> {
+  const { result } = await landMemory(target, content, message, env);
+  console.log(result);
+}
+
+export async function runMemoryCommand(
+  positionals: string[],
+  flags: ParsedArgs["flags"],
+  env: Env = process.env,
+  home: string = homedir(),
+): Promise<void> {
   const [action = "show", ...entryParts] = positionals;
-  const path = await ensureGlobalMemoryFile();
+  const memoryPath = aisGlobalMemoryPath(home);
+  const target = await detectGitBase(memoryPath, env);
+  const present = await exists(memoryPath);
+
+  // Served from a git-base base checkout: never create or edit it in place.
+  if (target && !present) {
+    if (!["path", "init", "show", "edit", "add"].includes(action)) {
+      throw new CliUsageError(`Unknown memory action "${action}". Use show, path, init, edit, or add.`);
+    }
+    await land(target, INITIAL_MEMORY, "docs(memory): initialise global memory", env);
+  }
+  const path = target ? memoryPath : await ensureGlobalMemoryFile(home);
+
   switch (action) {
     case "path":
+      console.log(path);
+      return;
     case "init":
       console.log(path);
+      if (target && present) console.log("unchanged");
       return;
     case "show":
       process.stdout.write(await readFile(path, "utf8"));
       return;
-    case "edit":
-      await edit(path);
+    case "edit": {
+      if (!target) {
+        await runEditor(path);
+        return;
+      }
+      const dir = await mkdtemp(join(tmpdir(), "ais-memory-edit-"));
+      try {
+        const copy = join(dir, "GLOBAL.md");
+        await copyFile(path, copy);
+        const before = await readFile(copy, "utf8");
+        await runEditor(copy);
+        const after = await readFile(copy, "utf8");
+        if (after === before) {
+          console.log("unchanged");
+          return;
+        }
+        await land(target, after, "docs(memory): edit global memory", env);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
       return;
+    }
     case "add": {
       const entry = boolFlag(flags, "stdin")
         ? await new Response(Bun.stdin.stream()).text()
         : entryParts.join(" ");
       if (!entry.trim()) throw new CliUsageError("Usage: ais memory add <text...> or ais memory add --stdin");
-      await appendGlobalMemory(entry);
+      if (target) {
+        const next = appendedMemoryContent(await readFile(path, "utf8"), entry);
+        console.log(path);
+        await land(target, next, addCommitMessage(entry), env);
+        return;
+      }
+      await appendGlobalMemory(entry, home);
       console.log(path);
       return;
     }
