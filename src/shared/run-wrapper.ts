@@ -4,7 +4,8 @@ import { resolveIdentity } from "../identities/resolve.ts";
 import { PromptCancelledError, RetiredIdentityError } from "../identities/errors.ts";
 import { isRetired } from "../identities/retired.ts";
 import { parseCliArgs, resolveNestedIdentity } from "./cli-args.ts";
-import { resolveRealBinary } from "./resolve-binary.ts";
+import { realpathSync } from "node:fs";
+import { resolveRealBinary, shimExecEnvVar } from "./resolve-binary.ts";
 import { IDENTITY_SESSION_MARKER, spawnReal } from "./exec.ts";
 import { launchDesktopApp } from "./launch-desktop.ts";
 import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sync/background.ts";
@@ -130,6 +131,15 @@ export async function runWrapper(
     const launch = () =>
       spawnReal(realBinary, launchArgs, {
         [cfg.envVarName]: resolved.configDirValue,
+        // Re-entry guard: see resolveRealBinary(). Holds the REAL binary's
+        // realpath, so a legitimately nested shim launch (different path) passes.
+        [shimExecEnvVar(cfg.realBinaryName)]: (() => {
+          try {
+            return realpathSync(realBinary);
+          } catch {
+            return realBinary;
+          }
+        })(),
         ...extraEnv,
         ...memoryProjection.env,
         ...((process.env.AIS_HERDR_TITLE_OWNER_PID ?? (parentIdentity || cfg.toolName !== "pi" ? String(process.pid) : undefined))
