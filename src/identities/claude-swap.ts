@@ -22,8 +22,9 @@ import type { Identity } from "./types.ts";
  * back to the member that owned it (refresh tokens rotate, so an
  * unsynchronised copy would die).
  *
- * Whether a RUNNING Claude session picks up a mid-session swap on Linux is
- * not live-verified (see TASKS.md); a new launch always does.
+ * Live-verified on Linux (Claude Code 2.1.293): a running session re-reads
+ * .credentials.json every turn, so a swap applies on the next message with no
+ * restart; a new launch always picks it up too.
  */
 
 export type SwapReason = "manual" | "auto" | "launch";
