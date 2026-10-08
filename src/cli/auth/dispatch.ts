@@ -4,6 +4,8 @@ import { ALI_CONFIG } from "../../identities/tool-configs.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { expandPath } from "../../identities/match.ts";
+import { isRetired } from "../../identities/retired.ts";
+import type { Identity } from "../../identities/types.ts";
 import {
   refreshIdentityOAuthGrant,
   type IdentityGrantRefresh,
@@ -18,6 +20,16 @@ import {
 } from "../../identities/auth-session.ts";
 import { runPiAuthImport } from "./pi-import.ts";
 import { runPiAuthSync } from "./pi-sync.ts";
+
+/** Auth actions never touch a retired identity: its credentials were purged
+ * on retirement, and a login or refresh would silently recreate them. */
+function assertNotRetired(tool: string, identity: Identity): void {
+  if (isRetired(identity)) {
+    throw new CliUsageError(
+      `Identity "${identity.name}" (${tool}) is retired, so auth actions are refused. Run "ais identities unretire ${identity.name} --tool=${tool}" first, then log in again.`,
+    );
+  }
+}
 
 async function resolveAliIdentity(positionals: string[], flags: ParsedArgs["flags"]) {
   if (stringFlag(flags, "tool") !== undefined && stringFlag(flags, "tool") !== "ali") {
@@ -38,6 +50,7 @@ async function resolveAliIdentity(positionals: string[], flags: ParsedArgs["flag
         : "Specify the ali identity (for example: ais auth login personal --tool=ali).",
     );
   }
+  assertNotRetired("ali", identity);
   return identity;
 }
 
@@ -105,6 +118,7 @@ async function runAuthRefresh(rest: string[], flags: ParsedArgs["flags"]): Promi
   }
   const identity = findIdentityByNameOrAlias(file.identities, key);
   if (!identity) throw new CliUsageError(`No ${tool} identity named "${key}".`);
+  assertNotRetired(tool, identity);
   const resolved: typeof identity = { ...identity, configDir: expandPath(identity.configDir) };
   try {
     const result = await refreshIdentityOAuthGrant(tool as RefreshableTool, resolved, { force: true });

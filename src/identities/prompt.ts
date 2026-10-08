@@ -8,6 +8,7 @@ import { PromptCancelledError, PromptTimeoutError, InvalidIdentitiesFileError } 
 import { writeZaiAuthFile } from "./zai-auth.ts";
 import { ensureClaudeTranscriptRetention } from "./claude-settings.ts";
 import { writeAliAuthFile } from "./ali-auth.ts";
+import { activeIdentities } from "./retired.ts";
 
 // A plain string sentinel rather than a Symbol: identity names are validated
 // elsewhere to be lowercase kebab-case only, so this can never collide with a
@@ -45,7 +46,7 @@ export async function promptForIdentity(
     const choice = await clack.select({
       message: "Select an identity to use",
       options: [
-        ...identitiesFile.identities.map((identity) => ({
+        ...activeIdentities(identitiesFile.identities).map((identity) => ({
           value: identity.name,
           label: identity.label,
           hint: identity.description,
@@ -73,7 +74,7 @@ export async function promptForIdentity(
       return { identity: created, created: true };
     }
 
-    const identity = identitiesFile.identities.find((i) => i.name === choice);
+    const identity = activeIdentities(identitiesFile.identities).find((i) => i.name === choice);
     if (!identity) {
       // Shouldn't happen — choice came from the options list above.
       throw new InvalidIdentitiesFileError(`selected identity "${String(choice)}" vanished`);
@@ -93,6 +94,7 @@ async function createIdentityFlow(
   timeoutMs: number,
 ): Promise<Identity> {
   // Names and aliases share one namespace, so both must be checked together.
+  // Retired identities still count: unretiring must never collide.
   const existingKeys = new Set(
     identitiesFile.identities.flatMap((i) => [i.name, ...(i.aliases ?? [])]),
   );

@@ -13,11 +13,23 @@ use serde::Deserialize;
 pub struct IdentityRef {
     #[serde(default)]
     pub name: Option<String>,
+    /// Retired identities keep their usage history but are never launched.
+    #[serde(default)]
+    pub retired: bool,
 }
 
 impl IdentityRef {
     pub fn name(&self) -> &str {
         self.name.as_deref().unwrap_or("?")
+    }
+
+    /// Display name, marking retired identities.
+    pub fn display_name(&self) -> String {
+        if self.retired {
+            format!("{} (retired)", self.name())
+        } else {
+            self.name().to_string()
+        }
     }
 }
 
@@ -102,6 +114,12 @@ pub struct IdentityEntry {
     pub directories: Vec<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub retired: bool,
+    /// Mirrors the API field; not rendered yet.
+    #[allow(dead_code)]
+    #[serde(default, rename = "retiredAt", alias = "retired_at")]
+    pub retired_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -263,6 +281,8 @@ pub struct BreakdownResult {
     #[serde(default)]
     pub categories: Vec<BreakdownCategory>,
     #[serde(default)]
+    pub retired: bool,
+    #[serde(default)]
     pub unavailable: Option<String>,
     #[serde(default)]
     pub notes: Vec<String>,
@@ -370,4 +390,22 @@ pub struct SpendGuardAccount {
     pub breached: Option<bool>,
     #[serde(default)]
     pub identities: Vec<String>,
+}
+
+#[cfg(test)]
+mod retired_tests {
+    use super::*;
+
+    #[test]
+    fn retired_flags_deserialise_and_default_to_active() {
+        let entry: IdentityEntry = serde_json::from_str(
+            r#"{"name":"a","retired":true,"retiredAt":"2026-10-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        assert!(entry.retired);
+        let active: IdentityEntry = serde_json::from_str(r#"{"name":"b"}"#).unwrap();
+        assert!(!active.retired);
+        let usage: IdentityRef = serde_json::from_str(r#"{"name":"c","retired":true}"#).unwrap();
+        assert_eq!(usage.display_name(), "c (retired)");
+    }
 }

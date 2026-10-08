@@ -9,6 +9,7 @@ import {
   PI_CONFIG,
 } from "./tool-configs.ts";
 import { expandPath } from "./match.ts";
+import { isRetired } from "./retired.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "./store.ts";
 import type { Identity } from "./types.ts";
 
@@ -392,22 +393,35 @@ async function configDirFor(identitiesJsonPath: string, identityName: string): P
   try {
     const file = await loadIdentitiesFile(identitiesJsonPath);
     const identity = findIdentityByNameOrAlias(file.identities, identityName);
-    return identity ? expandPath(identity.configDir) : undefined;
+    // A retired counterpart is not a source or a target: a copy must never
+    // restore a retired native credential, or the other way round.
+    return identity && !isRetired(identity) ? expandPath(identity.configDir) : undefined;
   } catch {
     return undefined;
   }
 }
 
+/** Registry file overrides, for tests only: the defaults are the real
+ * per-tool registries. */
+export interface ReconcileRegistryPaths {
+  pi?: string;
+  claude?: string;
+  codex?: string;
+  grok?: string;
+  kimi?: string;
+}
+
 /** The four projected providers and their native counterpart stores for one
  * pi identity. A provider pairs only when the SAME-NAMED identity exists in
  * the native registry (never guess a source). */
-async function providerPairings(piIdentity: Identity): Promise<ProviderPairing[]> {
+async function providerPairings(piIdentity: Identity, paths: ReconcileRegistryPaths = {}): Promise<ProviderPairing[]> {
+  if (isRetired(piIdentity)) return [];
   const piAuthPath = join(expandPath(piIdentity.configDir), "auth.json");
   const [claudeDir, codexDir, grokDir, kimiDir] = await Promise.all([
-    configDirFor(CLAUDE_CONFIG.identitiesJsonPath, piIdentity.name),
-    configDirFor(CODEX_CONFIG.identitiesJsonPath, piIdentity.name),
-    configDirFor(GROK_CONFIG.identitiesJsonPath, piIdentity.name),
-    configDirFor(KIMI_CONFIG.identitiesJsonPath, piIdentity.name),
+    configDirFor(paths.claude ?? CLAUDE_CONFIG.identitiesJsonPath, piIdentity.name),
+    configDirFor(paths.codex ?? CODEX_CONFIG.identitiesJsonPath, piIdentity.name),
+    configDirFor(paths.grok ?? GROK_CONFIG.identitiesJsonPath, piIdentity.name),
+    configDirFor(paths.kimi ?? KIMI_CONFIG.identitiesJsonPath, piIdentity.name),
   ]);
   const pairings: ProviderPairing[] = [];
   if (claudeDir) {
@@ -574,13 +588,13 @@ async function reconcilePair(
  */
 export async function reconcilePiOAuthStores(
   piIdentity: Identity,
-  options: { write?: boolean } = {},
+  options: { write?: boolean; registryPaths?: ReconcileRegistryPaths } = {},
 ): Promise<OAuthReconcileReport> {
   const write = options.write ?? false;
   const entries: OAuthReconcileEntry[] = [];
   let healed = 0;
   const backups = new Set<string>();
-  for (const pairing of await providerPairings(piIdentity)) {
+  for (const pairing of await providerPairings(piIdentity, options.registryPaths)) {
     const entry = await reconcilePair(pairing.provider, pairing, write, backups);
     if (entry.status === "rewrote-native" || entry.status === "rewrote-pi") healed += 1;
     entries.push(entry);
@@ -713,12 +727,15 @@ export async function writeProviderGrantCopy(
 export async function reconcileNativeProviderStores(
   tool: NativeReconcilableTool,
   identity: Identity,
-  options: { write?: boolean } = {},
+  options: { write?: boolean; registryPaths?: ReconcileRegistryPaths } = {},
 ): Promise<OAuthReconcileEntry> {
   const write = options.write ?? false;
   const provider = tool === "claude" ? "anthropic" : tool === "codex" ? "openai-codex" : "xai";
   const nativePath = nativeStorePathFor(tool, identity.configDir);
-  const piDir = await configDirFor(PI_CONFIG.identitiesJsonPath, identity.name);
+  if (isRetired(identity)) {
+    return { provider, status: "single-copy", nativePath, detail: "identity is retired; nothing to reconcile" };
+  }
+  const piDir = await configDirFor(options.registryPaths?.pi ?? PI_CONFIG.identitiesJsonPath, identity.name);
   if (!piDir) {
     return { provider, status: "single-copy", nativePath, detail: "no same-named pi identity; nothing to reconcile" };
   }
@@ -797,6 +814,7 @@ export async function reconcileAllPiIdentitiesOnLaunch(
     const file = await loadIdentitiesFile(PI_CONFIG.identitiesJsonPath);
     const healedLines: string[] = [];
     for (const identity of file.identities) {
+      if (isRetired(identity)) continue;
       try {
         const report = await reconcilePiOAuthStores(identity, { write: true });
         const healed = report.entries.filter(

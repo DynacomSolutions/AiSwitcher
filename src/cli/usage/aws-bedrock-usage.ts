@@ -152,6 +152,10 @@ export interface AwsBedrockUsageDeps {
   localSpendDeps?: AsyncLocalEstimateDeps;
   /** Injectable local reader itself (tests). */
   localSpend?: LocalSpendReader;
+  /** Report the LOCAL history only: no profile mapping lookup, Cost Explorer
+   * or Budgets call, and no realCost. Used for retired identities, whose AWS
+   * profile or account may no longer exist. */
+  localOnly?: boolean;
 }
 
 export interface AwsBedrockUsageResult {
@@ -328,8 +332,8 @@ async function fetchRealCost(
  * again (the 2026-09 display regression).
  */
 export async function fetchAwsBedrockUsage(identity: Identity, deps: AwsBedrockUsageDeps = {}): Promise<AwsBedrockUsageResult> {
-  const target = resolveAwsProfileForIdentity(identity, deps.awsProfileDeps);
-  if (!target) {
+  const target = deps.localOnly ? undefined : resolveAwsProfileForIdentity(identity, deps.awsProfileDeps);
+  if (!target && !deps.localOnly) {
     throw new AwsNoProfileMappedError(
       `no AWS profile mapping for this identity — set AWS_PROFILE in the identity's registry env, or add one to ~/.ais/config/aws-profiles.json`,
     );
@@ -347,13 +351,15 @@ export async function fetchAwsBedrockUsage(identity: Identity, deps: AwsBedrockU
     usdSinceMs: monthStart.getTime(),
   });
 
-  const { realCost, dailyCostUsd } = await fetchRealCost(target, read, deps, now);
+  const { realCost, dailyCostUsd }: { realCost?: RealCostInfo; dailyCostUsd?: Record<string, number> } = target
+    ? await fetchRealCost(target, read, deps, now)
+    : {};
 
   return {
     report: reportFromLocalRead(read),
     ...(read.firstMs !== undefined && read.lastMs !== undefined ? { dateSpan: { firstMs: read.firstMs, lastMs: read.lastMs } } : {}),
     ...(Object.keys(read.dailyTokens).length > 0 ? { dailyUsage: read.dailyTokens } : {}),
-    realCost,
+    ...(realCost ? { realCost } : {}),
     ...(dailyCostUsd ? { dailyCostUsd } : {}),
   };
 }

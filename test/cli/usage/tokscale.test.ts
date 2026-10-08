@@ -86,6 +86,13 @@ describe("tokscaleInvocationFor", () => {
     expect(clientArgs).toEqual([]);
   });
 
+  test("zai: a retired identity is not supported (no live quota call), even if a key file lingers", async () => {
+    const configDir = await makeConfigDir();
+    await writeZaiAuthFile(configDir, "sk-zai-key");
+    const invocation = await tokscaleInvocationFor("zai", { ...identity(configDir), retired: true });
+    expect(invocation).toBeUndefined();
+  });
+
   test("zai: returns undefined (not supported) when the identity has no usable key yet", async () => {
     const configDir = await makeConfigDir();
     expect(await tokscaleInvocationFor("zai", identity(configDir))).toBeUndefined();

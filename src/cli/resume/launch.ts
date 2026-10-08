@@ -7,6 +7,8 @@ import { recoverOrphanedCodexBackfill } from "../../shared/codex-backfill.ts";
 import { startProfileSyncWatcher } from "../../sync/watch.ts";
 import { gatePluginArgs } from "../../shared/plugin-gating.ts";
 import { launchThenStartBackgroundSync } from "../../sync/background.ts";
+import { RetiredIdentityError } from "../../identities/errors.ts";
+import { isRetired } from "../../identities/retired.ts";
 
 /** Per-tool resume invocation, confirmed against each real CLI's own --help:
  * claude/grok take the session id as an optional value on their --resume
@@ -48,6 +50,7 @@ const RESUME_ARGS: Partial<Record<ResumableSession["toolName"], (sessionId: stri
  * (and, for ali, `CRUSH_GLOBAL_CONFIG` too) set correctly or crush would
  * fall back to its own unscoped defaults instead of this identity's. */
 export async function launchResume(session: ResumableSession): Promise<never> {
+  if (isRetired(session.identity)) throw new RetiredIdentityError(session.toolName, session.identity);
   const cfg = TOOL_CONFIGS[session.toolName];
   const resumeArgs = RESUME_ARGS[session.toolName];
   if (!resumeArgs) throw new Error(`no resume launcher implemented for "${session.toolName}" yet`);

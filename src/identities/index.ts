@@ -5,3 +5,11 @@ export { loadIdentitiesFile, saveIdentitiesFile, parseIdentitiesFile } from "./s
 export { resolveIdentity, defaultResolveDeps } from "./resolve.ts";
 export type { ResolveDeps } from "./resolve.ts";
 export { promptForIdentity } from "./prompt.ts";
+export {
+  isRetired,
+  activeIdentities,
+  retireIdentityFields,
+  unretireIdentityFields,
+  lastRetirementEventMs,
+  findRetiredByConfigDir,
+} from "./retired.ts";

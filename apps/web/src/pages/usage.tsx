@@ -556,7 +556,10 @@ export function UsagePage() {
                       <ToolBadge tool={r.sourceTool ?? "unknown"} />
                     </TableCell>
                     <TableCell>
-                      <IdentityChip name={r.identity.name} />
+                      <span className="flex items-center gap-1.5">
+                        <IdentityChip name={r.identity.name} />
+                        {r.identity.retired ? <Badge variant="muted">Retired</Badge> : null}
+                      </span>
                     </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">
                       {spanText(r)}

@@ -195,7 +195,11 @@ export function BreakdownPage() {
   const pairs = useMemo(
     () =>
       (registries.data?.registries ?? []).flatMap((registry) =>
-        registry.identities.map((identity) => ({ tool: registry.toolName, identity: identity.name })),
+        registry.identities.map((identity) => ({
+          tool: registry.toolName,
+          identity: identity.name,
+          retired: identity.retired === true,
+        })),
       ),
     [registries.data],
   );
@@ -228,7 +232,7 @@ export function BreakdownPage() {
           <SelectContent>
             {pairs.map((pair) => (
               <SelectItem key={`${pair.tool}:${pair.identity}`} value={`${pair.tool}:${pair.identity}`} className="text-xs">
-                {pair.identity} ({pair.tool})
+                {pair.identity} ({pair.tool}){pair.retired ? " (retired)" : ""}
               </SelectItem>
             ))}
           </SelectContent>

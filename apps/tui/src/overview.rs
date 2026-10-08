@@ -936,6 +936,7 @@ mod tests {
             provider: Some("anthropic".to_string()),
             identity: IdentityRef {
                 name: Some(identity.to_string()),
+                ..Default::default()
             },
             windows: windows
                 .into_iter()
@@ -959,6 +960,7 @@ mod tests {
             provider: Some("anthropic".to_string()),
             identity: IdentityRef {
                 name: Some(identity.to_string()),
+                ..Default::default()
             },
             report: Some(TokscaleReport {
                 total_cost: Some(cost),

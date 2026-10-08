@@ -93,3 +93,35 @@ describe("loadIdentitiesFile", () => {
     expect(parsed.identities[0]?.configDir).toBe("~/.codex/identities/personal");
   });
 });
+
+describe("retired identity fields", () => {
+  test("round-trips through save and load", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ais-retired-"));
+    tempDirs.push(dir);
+    const path = join(dir, "identities.json");
+    const { saveIdentitiesFile } = await import("../src/identities/store.ts");
+    await saveIdentitiesFile(
+      path,
+      parseIdentitiesFile(
+        baseFile({ retired: true, retiredAt: "2026-02-01T00:00:00.000Z", unretiredAt: "2026-01-01T00:00:00.000Z" }),
+      ),
+    );
+    const loaded = await loadIdentitiesFile(path);
+    expect(loaded.identities[0]).toMatchObject({
+      retired: true,
+      retiredAt: "2026-02-01T00:00:00.000Z",
+      unretiredAt: "2026-01-01T00:00:00.000Z",
+    });
+  });
+
+  test("absent means active", () => {
+    expect(parseIdentitiesFile(baseFile()).identities[0]!.retired).toBeUndefined();
+  });
+
+  test("rejects invalid types", () => {
+    expect(() => parseIdentitiesFile(baseFile({ retired: "yes" }))).toThrow(InvalidIdentitiesFileError);
+    expect(() => parseIdentitiesFile(baseFile({ retiredAt: 5 }))).toThrow(InvalidIdentitiesFileError);
+    expect(() => parseIdentitiesFile(baseFile({ retiredAt: "not a date" }))).toThrow(InvalidIdentitiesFileError);
+    expect(() => parseIdentitiesFile(baseFile({ unretiredAt: "nope" }))).toThrow(InvalidIdentitiesFileError);
+  });
+});

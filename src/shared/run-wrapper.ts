@@ -1,7 +1,8 @@
 import type { ToolConfig } from "../identities/types.ts";
 import { basename, join } from "node:path";
 import { resolveIdentity } from "../identities/resolve.ts";
-import { PromptCancelledError } from "../identities/errors.ts";
+import { PromptCancelledError, RetiredIdentityError } from "../identities/errors.ts";
+import { isRetired } from "../identities/retired.ts";
 import { parseCliArgs, resolveNestedIdentity } from "./cli-args.ts";
 import { resolveRealBinary } from "./resolve-binary.ts";
 import { IDENTITY_SESSION_MARKER, spawnReal } from "./exec.ts";
@@ -48,6 +49,12 @@ export async function runWrapper(
       env: process.env,
       nonInteractiveHint: parsed.nonInteractiveHint,
     });
+
+    // Safety net: resolution already refuses retired identities, but nothing
+    // downstream (spend gate, sync, spawn) may ever act for one.
+    if (resolved.identity && isRetired(resolved.identity)) {
+      throw new RetiredIdentityError(cfg.toolName, resolved.identity);
+    }
 
     // SPEND GUARD launch gate: before ANY side effect (auth refreshes, sync
     // watchers, desktop launches, the real binary), check the AWS account's

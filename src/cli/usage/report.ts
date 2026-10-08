@@ -1,3 +1,5 @@
+import { isRetired } from "../../identities/retired.ts";
+import type { Identity } from "../../identities/types.ts";
 import { bold, dim, gray, yellow } from "../colors.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { borderRow, padRow } from "../table.ts";
@@ -40,11 +42,16 @@ function formatExtraCost(info: OverageInfo | undefined): string {
   return info.label;
 }
 
+/** Identity name for display, marking retired identities. */
+export function usageIdentityLabel(identity: Pick<Identity, "name" | "retired">): string {
+  return isRetired(identity) ? `${identity.name} (retired)` : identity.name;
+}
+
 function successRow(result: UsageResult): string[] {
   const r = result.report!;
   return [
     usageProviderLabel(result.provider),
-    result.identity.name,
+    usageIdentityLabel(result.identity),
     formatNumber(r.totalMessages),
     formatNumber(r.totalInput),
     formatNumber(r.totalOutput),
@@ -59,11 +66,11 @@ function errorRow(result: UsageResult): string[] {
   // live overage probe and the local-log tokscale fetch run independently
   // (see usage/run.ts's runOne), so a tokscale failure doesn't imply the
   // overage probe also failed.
-  return [usageProviderLabel(result.provider), result.identity.name, "—", "—", "—", "—", "error", formatExtraCost(result.extraCost)];
+  return [usageProviderLabel(result.provider), usageIdentityLabel(result.identity), "—", "—", "—", "—", "error", formatExtraCost(result.extraCost)];
 }
 
 function pendingRow(result: UsageResult, spinnerFrame: string): string[] {
-  return [usageProviderLabel(result.provider), result.identity.name, "—", "—", "—", "—", `${spinnerFrame} loading…`, "—"];
+  return [usageProviderLabel(result.provider), usageIdentityLabel(result.identity), "—", "—", "—", "—", `${spinnerFrame} loading…`, "—"];
 }
 
 /** Upper bound for an in-cell error reason: a chatty Cost Explorer failure
@@ -326,7 +333,7 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
     // Source-only failures use the source tool and identity as their label.
     // Without provider attribution, they belong only in diagnostics.
     for (const r of errors) {
-      const label = r.sourceOnlyError && r.sourceTool ? `${r.sourceTool}/${r.identity.name}` : `${usageProviderLabel(r.provider)}/${r.identity.name}`;
+      const label = r.sourceOnlyError && r.sourceTool ? `${r.sourceTool}/${usageIdentityLabel(r.identity)}` : `${usageProviderLabel(r.provider)}/${usageIdentityLabel(r.identity)}`;
       lines.push(`  ${yellow(label)}: ${r.error}`);
     }
   }

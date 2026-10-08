@@ -1,4 +1,4 @@
-import { chmod, mkdir, rename } from "node:fs/promises";
+import { chmod, mkdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Identity } from "./types.ts";
@@ -318,6 +318,36 @@ export async function installAliAuthRefreshTimer(identityName: string): Promise<
   const enable = Bun.spawn(["systemctl", "--user", "enable", "--now", `${unitBase}.timer`], { stdout: "ignore", stderr: "ignore" });
   await enable.exited;
   return enable.exitCode === 0;
+}
+
+/** Counterpart of installAliAuthRefreshTimer, used when an ali identity is
+ * retired. Best effort: returns false (never throws) where systemctl is
+ * unavailable or nothing was installed. */
+export async function removeAliAuthRefreshTimer(
+  identityName: string,
+  unitDir: string = join(homedir(), ".config", "systemd", "user"),
+): Promise<boolean> {
+  const safeName = identityName.replace(/[^a-zA-Z0-9_.-]/g, "-");
+  const unitBase = `ais-ali-auth-refresh-${safeName}`;
+  const timerPath = join(unitDir, `${unitBase}.timer`);
+  const servicePath = join(unitDir, `${unitBase}.service`);
+  const installed = (await Bun.file(timerPath).exists()) || (await Bun.file(servicePath).exists());
+  if (!installed) return false;
+  try {
+    if (Bun.which("systemctl")) {
+      const disable = Bun.spawn(["systemctl", "--user", "disable", "--now", `${unitBase}.timer`], { stdout: "ignore", stderr: "ignore" });
+      await disable.exited;
+    }
+    await rm(timerPath, { force: true });
+    await rm(servicePath, { force: true });
+    if (Bun.which("systemctl")) {
+      const reload = Bun.spawn(["systemctl", "--user", "daemon-reload"], { stdout: "ignore", stderr: "ignore" });
+      await reload.exited;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function authDashboardUrl(): string {

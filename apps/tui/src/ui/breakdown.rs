@@ -80,6 +80,12 @@ pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn render_result(result: &BreakdownResult, index: usize, count: usize) -> Vec<Line<'static>> {
     let identity = result.identity.as_deref().unwrap_or("?");
+    let identity = if result.retired {
+        format!("{identity} (retired)")
+    } else {
+        identity.to_string()
+    };
+    let identity = identity.as_str();
     let tool = result.tool.as_deref().unwrap_or("?");
     let window = result.window_days.unwrap_or(30);
 

@@ -2,6 +2,7 @@ import { expandPath } from "../../identities/match.ts";
 import { reconcilePiOAuthStores, renderOAuthReconcileReport } from "../../identities/oauth-reconcile.ts";
 import { syncPiCredentials, type PiCredentialSourceDirs } from "../../identities/pi-auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
+import { activeIdentities, isRetired } from "../../identities/retired.ts";
 import {
   ALI_CONFIG,
   CLAUDE_CONFIG,
@@ -78,18 +79,27 @@ export function pickSourceIdentity(
 export async function resolveSyncSources(
   piIdentityName: string,
   flags: ParsedArgs["flags"],
+  sources: Array<[SourceKey, ToolConfig]> = Object.entries(SOURCES) as Array<[SourceKey, ToolConfig]>,
 ): Promise<{ resolved: SourceResolution[]; skipped: string[] }> {
   const resolved: SourceResolution[] = [];
   const skipped: string[] = [];
-  for (const [key, cfg] of Object.entries(SOURCES) as Array<[SourceKey, ToolConfig]>) {
+  for (const [key, cfg] of sources) {
     const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
-    const names = file.identities.map((identity) => identity.name);
+    // Retired identities are neither a same-named match nor the "only
+    // identity" fallback, and an explicit flag naming one is skipped.
+    const flaggedKey = stringFlag(flags, key);
+    const flaggedIdentity = flaggedKey ? findIdentityByNameOrAlias(file.identities, flaggedKey) : undefined;
+    if (flaggedIdentity && isRetired(flaggedIdentity)) {
+      skipped.push(`${key}: ${cfg.toolName} identity "${flaggedIdentity.name}" is retired`);
+      continue;
+    }
+    const names = activeIdentities(file.identities).map((identity) => identity.name);
     const pick = pickSourceIdentity(piIdentityName, stringFlag(flags, key), names, cfg.toolName, key);
     if ("skip" in pick) {
       skipped.push(pick.skip);
       continue;
     }
-    const identity = findIdentityByNameOrAlias(file.identities, pick.name);
+    const identity = findIdentityByNameOrAlias(activeIdentities(file.identities), pick.name);
     if (!identity) {
       skipped.push(`${key}: no ${cfg.toolName} identity named "${pick.name}"`);
       continue;
@@ -118,6 +128,11 @@ export async function runPiAuthSync(positionals: string[], flags: ParsedArgs["fl
     );
   }
 
+  if (isRetired(piIdentity)) {
+    throw new CliUsageError(
+      `Pi identity "${piIdentity.name}" is retired, so credentials cannot be synced into it. Run "ais identities unretire ${piIdentity.name} --tool=pi" first.`,
+    );
+  }
   const piName = piIdentity.name;
   const { resolved, skipped } = await resolveSyncSources(piName, flags);
 

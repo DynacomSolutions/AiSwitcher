@@ -1,3 +1,4 @@
+import { isRetired } from "../../identities/retired.ts";
 import { join } from "node:path";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
@@ -60,6 +61,8 @@ export interface BreakdownCategory {
 
 export interface BreakdownResult {
   identity: string;
+  /** True for a retired identity: history is still reported, from local logs. */
+  retired?: true;
   tool: ToolConfig["toolName"];
   windowDays: number;
   generatedAt: string;
@@ -598,6 +601,7 @@ export async function collectIdentityBreakdown(
   const windowStartMs = now.getTime() - days * 86_400_000;
   const meta = {
     identity: identity.name,
+    ...(isRetired(identity) ? { retired: true as const } : {}),
     tool: toolName,
     windowDays: days,
     generatedAt: now.toISOString(),
@@ -739,14 +743,14 @@ export function formatBreakdownReport(results: BreakdownResult[]): string {
   if (unavailable.length > 0) {
     lines.push("");
     lines.push(bold("Unavailable:"));
-    for (const r of unavailable) lines.push(`  ${yellow(`${r.tool}/${r.identity}`)}: ${r.unavailable}`);
+    for (const r of unavailable) lines.push(`  ${yellow(`${r.tool}/${r.identity}${r.retired ? " (retired)" : ""}`)}: ${r.unavailable}`);
   }
 
   const notes = answerable.filter((r) => (r.notes?.length ?? 0) > 0);
   if (notes.length > 0) {
     lines.push("");
     lines.push(bold("Notes:"));
-    for (const r of notes) for (const note of r.notes ?? []) lines.push(`  ${dim(`${r.tool}/${r.identity}`)}: ${note}`);
+    for (const r of notes) for (const note of r.notes ?? []) lines.push(`  ${dim(`${r.tool}/${r.identity}${r.retired ? " (retired)" : ""}`)}: ${note}`);
   }
 
   return lines.join("\n");

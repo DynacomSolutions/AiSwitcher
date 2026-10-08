@@ -69,6 +69,14 @@ src/
                              session/model-cache data (see "zai case study" below); ali's
                              own envVarName is bespoke too, to disambiguate from zai; see
                              "ali case study")
+    retired.ts              isRetired/activeIdentities/retire+unretire field helpers and
+                             lastRetirementEventMs() (sync ordering); RetiredIdentityError
+                             lives in errors.ts
+    credential-paths.ts     credentialPathsForTool(): the on-disk credential files per tool
+                             (server/auth.ts re-exports it)
+    retire-credentials.ts    purgeRetiredIdentityCredentials(): deletes a retired identity's
+                             credentials (files, crush.json api key, ali cookie/auth-browser/
+                             timer, same-named pi auth.json entry); never touches logs/DBs
     zai-auth.ts             writeZaiAuthFile(): read-modify-write into a zai identity's own
                              <configDir>/crush.json with its "zai" provider entry — the
                              non-interactive auth this design's whole existence depends on
@@ -436,6 +444,21 @@ resolution engine pure and unit-testable (see `test/`) without any
 process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
 
 ## Key design decisions (don't relitigate without reading why first)
+
+- **Retirement keeps the identity, drops its credentials (`identities/retired.ts`,
+  `retire-credentials.ts`).** `ais identities retire` sets `retired`/`retiredAt`
+  and purges stored credentials; the registry entry stays so the name and aliases
+  remain occupied and local usage history stays attributable. Retired identities
+  are excluded from every selection and live-probe path (launch, resolution,
+  limits, doctor, auth refresh, reconcile) but kept in usage reports from local
+  data only. `unretire` records `unretiredAt` and does NOT restore credentials.
+  Sync treats the three fields as one event stream: the side with the newest
+  `retiredAt`/`unretiredAt` wins all three (absent fields on the winner are
+  removed); with no events the old primary-wins merge applies. rsync never
+  propagates deletes and the tree merge copies absent files in, so
+  `mergeIncomingProfileTree`/`recoverProfileArchives` re-run the purge for every
+  retired identity afterwards. macOS Keychain entries for Claude are not
+  handled (no known service name); retire only prints a manual-removal warning.
 
 - **Directory-pattern grammar is intentionally stricter than a standard glob
   dialect.** A `directories` entry with no wildcard matches only that exact

@@ -58,6 +58,10 @@ export interface IdentityDto {
   effectiveColour: string;
   directories?: string[];
   aliases?: string[];
+  /** Present (true) only for a retired identity. */
+  retired?: true;
+  /** ISO timestamp of the retirement, when recorded. */
+  retiredAt?: string;
 }
 
 export interface RegistryDto {
@@ -87,7 +91,9 @@ export interface SessionsEnvelope {
 }
 
 export type AuthKind = "oauth" | "apikey" | "cookie" | "none";
-export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown";
+/** "retired" is reported without probing: the identity's credentials were
+ * deleted on purpose and nothing may touch it until it is unretired. */
+export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown" | "retired";
 
 export interface AuthEntryDto {
   toolName: ToolConfig["toolName"];

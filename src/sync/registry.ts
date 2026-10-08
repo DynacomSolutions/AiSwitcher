@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { dirname, relative, sep } from "node:path";
 import { copyFile } from "node:fs/promises";
+import { lastRetirementEventMs } from "../identities/retired.ts";
 import { loadIdentitiesFile, parseIdentitiesFile, saveIdentitiesFile } from "../identities/store.ts";
 import type { ChromeProfileOverride, IdentitiesFile, Identity, ToolConfig } from "../identities/types.ts";
 
@@ -89,13 +90,30 @@ function mergeStrings(primary: string[] | undefined, secondary: string[] | undef
   return merged.length > 0 ? merged : undefined;
 }
 
+/** Retirement state is a single event stream, not a union: the side holding
+ * the newest retire/unretire event decides all three fields, and a field
+ * absent there is removed from the result rather than inherited from the
+ * other side. With no event on either side the primary-wins spread applies. */
+function mergeRetirement(merged: Identity, primary: Identity, secondary: Identity): void {
+  const primaryMs = lastRetirementEventMs(primary);
+  const secondaryMs = lastRetirementEventMs(secondary);
+  if (primaryMs === undefined && secondaryMs === undefined) return;
+  const winner = secondaryMs !== undefined && (primaryMs === undefined || secondaryMs > primaryMs) ? secondary : primary;
+  for (const key of ["retired", "retiredAt", "unretiredAt"] as const) {
+    if (winner[key] === undefined) delete merged[key];
+    else Object.assign(merged, { [key]: winner[key] });
+  }
+}
+
 function mergeIdentity(primary: Identity, secondary: Identity): Identity {
-  return {
+  const merged: Identity = {
     ...secondary,
     ...primary,
     directories: mergeStrings(primary.directories, secondary.directories),
     aliases: mergeStrings(primary.aliases, secondary.aliases),
   };
+  mergeRetirement(merged, primary, secondary);
+  return merged;
 }
 
 /** These entries were one-off containers created to preserve a host's

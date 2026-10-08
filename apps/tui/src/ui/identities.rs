@@ -14,7 +14,7 @@ use crate::models::{IdentityEntry, Registry};
 use crate::ui::widgets;
 
 const TAB_INDEX: usize = 1;
-const NAME_W: usize = 16;
+const NAME_W: usize = 26;
 const LABEL_W: usize = 18;
 const ALIASES_W: usize = 12;
 const DIRS_W: usize = 6;
@@ -94,7 +94,10 @@ fn push_registry(lines: &mut Vec<Line<'static>>, registry: &Registry) {
         ));
         return;
     }
-    for identity in &registry.identities {
+    // Retired identities sort last (stable, so registry order is otherwise kept).
+    let mut ordered: Vec<&IdentityEntry> = registry.identities.iter().collect();
+    ordered.sort_by_key(|identity| identity.retired);
+    for identity in ordered {
         lines.push(identity_line(identity));
     }
 }
@@ -106,13 +109,21 @@ fn identity_line(identity: &IdentityEntry) -> Line<'static> {
         widgets::ellipsize(&identity.aliases.join(","), ALIASES_W)
     };
     let dirs = identity.directories.len().to_string();
+    let name = identity.name.as_deref().unwrap_or("?");
+    let name = if identity.retired {
+        format!("{name} (retired)")
+    } else {
+        name.to_string()
+    };
+    let name_span = Span::from(pad_owned(widgets::ellipsize(&name, NAME_W), NAME_W));
+    let name_span = if identity.retired {
+        name_span.dark_gray()
+    } else {
+        name_span.bold()
+    };
     Line::from(vec![
         Span::from("  "),
-        Span::from(pad_owned(
-            widgets::ellipsize(identity.name.as_deref().unwrap_or("?"), NAME_W),
-            NAME_W,
-        ))
-        .bold(),
+        name_span,
         Span::from(pad_owned(
             widgets::ellipsize(identity.label.as_deref().unwrap_or(""), LABEL_W),
             LABEL_W,

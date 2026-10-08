@@ -227,6 +227,9 @@ export interface RegistryIdentity {
   configDir: string;
   directories?: string[];
   aliases?: string[];
+  /** True for a retired identity: never listed, selected, matched or
+   * registered as providers (src/identities/retired.ts). */
+  retired?: boolean;
 }
 
 export interface IdentityListing {
@@ -250,7 +253,7 @@ export function buildIdentityListings(
     return { listings: [], note: "AIS Pi registry has an unexpected shape - cannot list identities" };
   }
   return {
-    listings: identities.map((identity) => ({
+    listings: identities.filter((identity) => identity.retired !== true).map((identity) => ({
       name: identity.name,
       label: identity.label,
       configDir: identity.configDir,
@@ -274,6 +277,7 @@ export function parseRegistryIdentities(registry: unknown): RegistryIdentity[] |
       configDir?: unknown;
       directories?: unknown;
       aliases?: unknown;
+      retired?: unknown;
     };
     if (typeof entry.name !== "string" || typeof entry.configDir !== "string") continue;
     identities.push({
@@ -286,6 +290,7 @@ export function parseRegistryIdentities(registry: unknown): RegistryIdentity[] |
       ...(Array.isArray(entry.aliases)
         ? { aliases: entry.aliases.filter((a): a is string => typeof a === "string") }
         : {}),
+      ...(entry.retired === true ? { retired: true } : {}),
     });
   }
   return identities;
@@ -331,6 +336,7 @@ export function matchIdentityForCwd(
   const target = normalizeDirPath(cwd, home);
   let best: { identity: RegistryIdentity; baseLength: number } | undefined;
   for (const identity of identities) {
+    if (identity.retired === true) continue;
     for (const raw of identity.directories ?? []) {
       let base: string;
       let recursive: boolean;
@@ -362,11 +368,12 @@ export function pickDefaultIdentityName(inputs: {
   persisted: string | undefined;
   cwdMatch: string | undefined;
 }): string | undefined {
-  const known = new Set(inputs.identities.map((identity) => identity.name));
+  const active = inputs.identities.filter((identity) => identity.retired !== true);
+  const known = new Set(active.map((identity) => identity.name));
   if (inputs.envMarker !== undefined && known.has(inputs.envMarker)) return inputs.envMarker;
   if (inputs.persisted !== undefined && known.has(inputs.persisted)) return inputs.persisted;
   if (inputs.cwdMatch !== undefined && known.has(inputs.cwdMatch)) return inputs.cwdMatch;
-  return inputs.identities[0]?.name;
+  return active[0]?.name;
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,7 +1095,9 @@ export default async function aisIdentityExtension(
     return titleQueue;
   }
 
-  const identities = parseRegistryIdentities(readRegistry()) ?? [];
+  // Retired identities are dropped here, once: nothing below (provider
+  // registration, /ais, default seeding) ever sees them.
+  const identities = (parseRegistryIdentities(readRegistry()) ?? []).filter((identity) => identity.retired !== true);
   const identityByName = new Map(identities.map((identity) => [identity.name, identity]));
 
   /** Per-identity namespaced model catalogues registered in this instance. */

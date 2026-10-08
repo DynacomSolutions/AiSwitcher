@@ -1,4 +1,5 @@
 import { findIdentityByNameOrAlias } from "../../identities/store.ts";
+import { isRetired } from "../../identities/retired.ts";
 import { effectiveIdentityColour } from "../../identities/colour.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import type { ParsedArgs } from "../args.ts";
@@ -11,6 +12,7 @@ function printIdentity(cfg: ToolConfig, identity: Identity): void {
   console.log(JSON.stringify(identity, null, 2));
   // Session colour the surfaces (session tree, WebUI) render for this
   // identity: explicit when set, auto palette pick otherwise.
+  if (isRetired(identity)) console.log(`${dim("retired")}: ${identity.retiredAt ?? "yes"}`);
   console.log(`${dim("colour")}: ${effectiveIdentityColour(cfg.toolName, identity.name, identity.colour)}`);
 }
 

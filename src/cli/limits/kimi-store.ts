@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
+import { isRetired } from "../../identities/retired.ts";
 import type { Identity } from "../../identities/types.ts";
 import type { KimiOAuthCredentials } from "./kimi-limits.ts";
 
@@ -136,7 +137,9 @@ async function configDirFor(toolName: "kimi" | "pi", identityName: string): Prom
   const config = toolName === "kimi" ? KIMI_CONFIG : PI_CONFIG;
   try {
     const file = await loadIdentitiesFile(config.identitiesJsonPath);
-    return findIdentityByNameOrAlias(file.identities, identityName)?.configDir;
+    const found = findIdentityByNameOrAlias(file.identities, identityName);
+    // A retired counterpart is never a read or write target.
+    return found && !isRetired(found) ? found.configDir : undefined;
   } catch {
     return undefined;
   }
@@ -149,6 +152,7 @@ async function configDirFor(toolName: "kimi" | "pi", identityName: string): Prom
  * registry — the normal case for credentials imported via pi-auth. */
 export async function kimiCredentialStores(identity: Identity, self: "kimi" | "pi"): Promise<Store[]> {
   const stores: Store[] = [];
+  if (isRetired(identity)) return stores;
   const nativeDir = self === "kimi" ? identity.configDir : await configDirFor("kimi", identity.name);
   if (nativeDir) stores.push(storeFor("native", join(nativeDir, NATIVE_FILE_RELPATH)));
   const piDir = self === "pi" ? identity.configDir : await configDirFor("pi", identity.name);

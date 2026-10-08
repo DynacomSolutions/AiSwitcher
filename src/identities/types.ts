@@ -19,6 +19,17 @@ export interface Identity {
    * never leak into an unrelated child process. Kept secrets-free by
    * convention: point at profile NAMES, never raw credentials. */
   env?: Record<string, string>;
+  /** True when the identity is retired: it is never launched and is excluded
+   * from pickers, limits, doctor, auth refresh and live provider calls, and
+   * its credentials are purged. Historical usage is still reported. Absent
+   * means active. */
+  retired?: boolean;
+  /** ISO 8601 timestamp of the retire. */
+  retiredAt?: string;
+  /** ISO 8601 timestamp of the last unretire. Kept only so `ais sync` can
+   * order retire/unretire events per identity across hosts (newest event
+   * wins). */
+  unretiredAt?: string;
 }
 
 /**

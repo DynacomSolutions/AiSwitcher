@@ -15,6 +15,8 @@ import type {
   PatchIdentityBody,
   ProcessesResponse,
   RegistriesResponse,
+  RegistryDto,
+  RetireResultDto,
   SessionsResponse,
   SessionTreeResponse,
   SpendGuardResponse,
@@ -109,6 +111,14 @@ export const api = {
   deleteIdentity: (tool: ToolName, name: string) =>
     request<unknown>(`/api/identities/${encodeURIComponent(tool)}/${encodeURIComponent(name)}`, {
       method: "DELETE",
+    }),
+  retireIdentity: (tool: ToolName, name: string) =>
+    request<RetireResultDto>(`/api/identities/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/retire`, {
+      method: "POST",
+    }),
+  unretireIdentity: (tool: ToolName, name: string) =>
+    request<RegistryDto>(`/api/identities/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/unretire`, {
+      method: "POST",
     }),
   addDirectoryPattern: (tool: ToolName, name: string, pattern: string) =>
     request<unknown>(`/api/identities/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/directories`, {

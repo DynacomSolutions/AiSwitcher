@@ -31,6 +31,8 @@ import {
   listRegistries,
   mutateAlias,
   mutateDirectory,
+  retireIdentityInRegistry,
+  unretireIdentityInRegistry,
   updateIdentityInRegistry,
 } from "./registries.ts";
 import { scanProcesses } from "./processes.ts";
@@ -118,6 +120,13 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   );
   app.delete("/api/identities/:tool/:name", async (c) =>
     c.json(await deleteIdentityFromRegistry(c.req.param("tool"), decodeSegment(c.req.param("name")))),
+  );
+
+  app.post("/api/identities/:tool/:name/retire", async (c) =>
+    c.json(await retireIdentityInRegistry(c.req.param("tool"), decodeSegment(c.req.param("name")))),
+  );
+  app.post("/api/identities/:tool/:name/unretire", async (c) =>
+    c.json(await unretireIdentityInRegistry(c.req.param("tool"), decodeSegment(c.req.param("name")))),
   );
 
   for (const method of ["post", "delete"] as const) {
