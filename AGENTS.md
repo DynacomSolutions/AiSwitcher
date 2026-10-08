@@ -458,6 +458,11 @@ process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
   context paths. Any vendor file or config entry created for compatibility is
   a projection only. `ais memory add` is the cross-agent write API. Adding a
   tool without declaring a projection is a type error.
+  When the memory file resolves into a git-base base checkout
+  (`<root>/.worktrees/<org>/.base/<repo>`) with `git-base` on `PATH`, writes go
+  through `git-base land` (`src/shared/memory-land.ts`) and never in place;
+  failures propagate. `AIS_MEMORY_LAND=0` forces in-place;
+  `AIS_GIT_BASE_BIN` overrides the executable.
   - **Pi management subcommands bypass the projection.** Pi routes
     `install`/`remove`/`uninstall`/`update`/`list`/`config`/`auth` only when
     the literal argv[0] names them, so the prepend must NOT happen for those:

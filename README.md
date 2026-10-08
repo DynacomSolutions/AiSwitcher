@@ -93,6 +93,21 @@ configuration, and Crush's global context paths for both `zai` and `ali`.
 Those integrations are disposable views. The AIS file remains the only
 writable authority.
 
+### Memory served from a git-base base checkout
+
+If `~/.ais/memory` resolves into a `git-base` base checkout (a git toplevel
+shaped `<root>/.worktrees/<org>/.base/<repo>`) and an executable `git-base` is
+on `PATH`, `ais memory add`, `edit` and `init` never write the file in place.
+They compute the new content, then run
+`git-base land <org>/<repo> -m "docs(memory): ..." --file <relpath>=<tempfile>`,
+which commits in an ephemeral worktree, pushes and fast-forwards the base. The
+command prints the pushed commit SHA, or `unchanged`. If `git-base land` fails,
+`ais memory` exits non-zero with its stderr and does not fall back to an
+in-place write. Without a base (or without `git-base`) behaviour is unchanged.
+
+Overrides: `AIS_MEMORY_LAND=0` forces in-place writes; `AIS_GIT_BASE_BIN` sets
+the `git-base` executable path.
+
 ```bash
 ais memory show
 ais memory path
