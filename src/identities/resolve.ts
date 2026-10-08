@@ -2,7 +2,8 @@ import type { IdentitiesFile, ResolveOptions, ResolvedIdentity, ToolConfig } fro
 import { expandPath, matchDirectory } from "./match.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } from "./store.ts";
 import { promptForIdentity } from "./prompt.ts";
-import { NonInteractiveResolutionError, UnknownIdentityError } from "./errors.ts";
+import { NonInteractiveResolutionError, RetiredIdentityError, UnknownIdentityError } from "./errors.ts";
+import { findRetiredByConfigDir, isRetired } from "./retired.ts";
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
 
@@ -24,6 +25,26 @@ export const defaultResolveDeps: ResolveDeps = {
   promptForIdentity,
   isInteractive: realIsInteractive,
 };
+
+/**
+ * A preset env var normally skips the registry. A retired identity must still
+ * never launch through it, so look the value up among retired config dirs. A
+ * missing or unreadable registry must not break the power-user override.
+ */
+async function assertEnvNotRetired(
+  cfg: ToolConfig,
+  envValue: string,
+  deps: ResolveDeps,
+): Promise<void> {
+  let retired;
+  try {
+    const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
+    retired = findRetiredByConfigDir(file.identities, expandPath(envValue));
+  } catch {
+    return;
+  }
+  if (retired) throw new RetiredIdentityError(cfg.toolName, retired);
+}
 
 export async function resolveIdentity(
   cfg: ToolConfig,
@@ -48,6 +69,7 @@ export async function resolveIdentity(
         file.identities.map((i) => i.name),
       );
     }
+    if (isRetired(identity)) throw new RetiredIdentityError(cfg.toolName, identity);
     return { identity, configDirValue: expandPath(identity.configDir), source: "flag" };
   }
 
@@ -56,13 +78,28 @@ export async function resolveIdentity(
   // deliberate manual power-user overrides.
   const presetEnvValue = opts.env[cfg.envVarName];
   if (presetEnvValue) {
+    await assertEnvNotRetired(cfg, presetEnvValue, deps);
     return { identity: undefined, configDirValue: presetEnvValue, source: "env" };
   }
 
   // (c) directory-pattern match against cwd, if unique.
   const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
-  const matchResult = deps.matchDirectory(opts.cwd, file.identities);
+  let matchResult = deps.matchDirectory(opts.cwd, file.identities);
+  // A retired identity tying with active ones must not make the match
+  // ambiguous (that would block every non-interactive launch): drop the
+  // retired candidates from the tie. A unique best match that is itself
+  // retired is still refused below.
+  if (matchResult && "ambiguous" in matchResult) {
+    if (matchResult.candidates.some(isRetired) && !matchResult.candidates.every(isRetired)) {
+      // Re-match against the active identities only: they hold the same
+      // tied best score, so this yields the unique or still-ambiguous result.
+      matchResult = deps.matchDirectory(opts.cwd, file.identities.filter((i) => !isRetired(i)));
+    }
+  }
   if (matchResult && !("ambiguous" in matchResult)) {
+    // Refuse rather than silently switching to some other identity: the
+    // directory was explicitly bound to this one.
+    if (isRetired(matchResult.identity)) throw new RetiredIdentityError(cfg.toolName, matchResult.identity);
     return {
       identity: matchResult.identity,
       configDirValue: expandPath(matchResult.identity.configDir),
@@ -127,12 +164,14 @@ export async function resolveSingleInstanceIdentity(
         file.identities.map((i) => i.name),
       );
     }
+    if (isRetired(identity)) throw new RetiredIdentityError(cfg.toolName, identity);
     return { identity, configDirValue: expandPath(cfg.singleInstanceDir), source: "flag" };
   }
 
   // (b) preset env var: power-user override of the whole instance dir.
   const presetEnvValue = opts.env[cfg.envVarName];
   if (presetEnvValue) {
+    await assertEnvNotRetired(cfg, presetEnvValue, deps);
     return { identity: undefined, configDirValue: presetEnvValue, source: "env" };
   }
 
@@ -140,7 +179,8 @@ export async function resolveSingleInstanceIdentity(
   // launch target. Ambiguity is demoted to "no seed" (the in-app switcher
   // resolves it) instead of prompting.
   const matchResult = deps.matchDirectory(opts.cwd, file.identities);
-  if (matchResult && !("ambiguous" in matchResult)) {
+  // A retired match is ignored: it must never seed the in-app default.
+  if (matchResult && !("ambiguous" in matchResult) && !isRetired(matchResult.identity)) {
     return {
       identity: matchResult.identity,
       configDirValue: expandPath(cfg.singleInstanceDir),

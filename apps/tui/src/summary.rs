@@ -203,6 +203,7 @@ mod tests {
             provider: Some(provider.to_string()),
             identity: IdentityRef {
                 name: Some(identity.to_string()),
+                ..Default::default()
             },
             windows: Vec::new(),
             status: Some("live".to_string()),
@@ -227,6 +228,7 @@ mod tests {
             provider: Some(provider.to_string()),
             identity: IdentityRef {
                 name: Some(identity.to_string()),
+                ..Default::default()
             },
             report: Some(TokscaleReport {
                 total_cost: Some(cost),

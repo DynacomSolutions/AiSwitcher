@@ -6,12 +6,16 @@ import {
   deleteIdentity,
   removeAlias,
   removeDirectory,
+  retireIdentity,
+  unretireIdentity,
   updateIdentity,
   type CreateIdentityInput,
 } from "../cli/identities/actions.ts";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { expandPath } from "../identities/index.ts";
-import { loadIdentitiesFile, saveIdentitiesFile } from "../identities/store.ts";
+import { isRetired } from "../identities/retired.ts";
+import { purgeRetiredIdentityCredentials, type PurgeOptions, type PurgeReport } from "../identities/retire-credentials.ts";
+import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } from "../identities/store.ts";
 import { effectiveIdentityColour, isValidIdentityColour, normaliseIdentityColour } from "../identities/colour.ts";
 import { writeAliAuthFile } from "../identities/ali-auth.ts";
 import { writeZaiAuthFile } from "../identities/zai-auth.ts";
@@ -42,6 +46,8 @@ function registryDto(cfg: ToolConfig, file: Awaited<ReturnType<typeof loadIdenti
       effectiveColour: effectiveIdentityColour(cfg.toolName, identity.name, identity.colour),
       ...(identity.directories?.length ? { directories: identity.directories } : {}),
       ...(identity.aliases?.length ? { aliases: identity.aliases } : {}),
+      ...(isRetired(identity) ? { retired: true as const } : {}),
+      ...(identity.retiredAt !== undefined ? { retiredAt: identity.retiredAt } : {}),
     })),
     ...(file.chromeProfileOverrides?.length ? { chromeProfileOverrides: file.chromeProfileOverrides } : {}),
   };
@@ -140,6 +146,47 @@ export async function updateIdentityInRegistry(
 export async function deleteIdentityFromRegistry(toolName: string, name: string, configs: ToolConfig[] = Object.values(TOOL_CONFIGS)): Promise<RegistryDto> {
   const cfg = requireTool(toolName, configs);
   await withRegistry(cfg, (file) => deleteIdentity(file, name));
+  return registryFor(cfg, configs);
+}
+
+/** Seams for tests; the defaults purge the real home. */
+export interface RetireDeps {
+  now?: () => Date;
+  purge?: (opts: PurgeOptions) => Promise<PurgeReport>;
+}
+
+/** Retires an identity and deletes its stored credentials. The registry is
+ * saved first; the purge report (paths and warnings, never values) rides back
+ * beside the updated registry. */
+export async function retireIdentityInRegistry(
+  toolName: string,
+  name: string,
+  configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
+  deps: RetireDeps = {},
+): Promise<RegistryDto & { purge: PurgeReport }> {
+  const cfg = requireTool(toolName, configs);
+  const { result: identity } = await withRegistry(cfg, (file) => {
+    if (!findIdentityByNameOrAlias(file.identities, name)) throw new HttpError(404, `no identity named "${name}"`);
+    return retireIdentity(file, name, (deps.now ?? (() => new Date()))());
+  });
+  const purge = await (deps.purge ?? purgeRetiredIdentityCredentials)({ toolName: cfg.toolName, identity });
+  return { ...(await registryFor(cfg, configs)), purge };
+}
+
+/** Restores a retired identity. Credentials are not restored: the user logs in again. */
+export async function unretireIdentityInRegistry(
+  toolName: string,
+  name: string,
+  configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
+  deps: Pick<RetireDeps, "now"> = {},
+): Promise<RegistryDto> {
+  const cfg = requireTool(toolName, configs);
+  await withRegistry(cfg, (file) => {
+    const found = findIdentityByNameOrAlias(file.identities, name);
+    if (!found) throw new HttpError(404, `no identity named "${name}"`);
+    if (!isRetired(found)) throw new HttpError(409, `"${name}" is not retired`);
+    return unretireIdentity(file, name, (deps.now ?? (() => new Date()))());
+  });
   return registryFor(cfg, configs);
 }
 

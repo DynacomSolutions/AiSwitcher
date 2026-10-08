@@ -6,7 +6,9 @@ import { isKnownToolName } from "../cli/identities/resolve-tool.ts";
 import { hasTreeReader, readSessionTrees } from "../cli/sessions/tree.ts";
 import { DEFAULT_TAIL_TURNS, readTranscript } from "../cli/sessions/transcript.ts";
 
-/** The (tool, identity) target list for the tree/transcript scans. The
+/** The (tool, identity) target list for the tree/transcript scans. Retired
+ * identities are included: their history stays viewable (they are only
+ * non-resumable, which the CLI picker and launchResume enforce). The
  * --tool filter is applied AFTER collection, against the injected configs
  * when a caller (test) provided any, so synthetic registries are honoured
  * even when a tool is named; unknown tool names still fail the same way
@@ -15,7 +17,7 @@ async function collectSessionTargets(tool: string | undefined, identity: string 
   if (tool !== undefined && !isKnownToolName(tool)) {
     throw new CliUsageError(`Invalid --tool="${tool}"`);
   }
-  const targets = await collectResumeTargets(flagsFor(undefined, identity), configs);
+  const targets = await collectResumeTargets(flagsFor(undefined, identity), configs, { includeRetired: true });
   return tool === undefined ? targets : targets.filter((t) => t.toolName === tool);
 }
 
@@ -79,7 +81,7 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
         break;
       case "sessions": {
         const flags = flagsFor(req.tool, req.identity);
-        const results = await runResumeQuery(flags, req.cwd ?? process.cwd());
+        const results = await runResumeQuery(flags, req.cwd ?? process.cwd(), { includeRetired: true });
         payload = { results };
         break;
       }

@@ -1,6 +1,7 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
+import { isRetired } from "../../identities/retired.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { readClaudeSessions } from "./claude-resume.ts";
 import { readCodexSessions } from "./codex-resume.ts";
@@ -41,22 +42,37 @@ const READERS: Partial<Record<ToolConfig["toolName"], (identity: Identity, cwd: 
 export async function collectResumeTargets(
   flags: ParsedArgs["flags"],
   configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
+  opts: { includeRetired?: boolean } = {},
 ): Promise<ResumeTarget[]> {
   const toolFilter = toolConfigFromFlag(flags);
   const identityFilter = stringFlag(flags, "identity");
   const targetConfigs = toolFilter ? [toolFilter] : configs;
   const loaded = await loadAll(targetConfigs);
 
+  // Retired identities are never resumable: by default their sessions are
+  // left out of the listing entirely (launchResume also refuses them as a
+  // safety net). History viewers (the WebUI session tree, transcript and
+  // list scans) pass includeRetired so past sessions stay readable.
   const targets: ResumeTarget[] = [];
+  let skippedRetired: string | undefined;
   for (const { cfg, file } of loaded) {
     for (const identity of file.identities) {
       if (identityFilter && identity.name !== identityFilter && !(identity.aliases ?? []).includes(identityFilter)) {
+        continue;
+      }
+      if (isRetired(identity) && !opts.includeRetired) {
+        skippedRetired ??= identity.name;
         continue;
       }
       targets.push({ toolName: cfg.toolName, identity });
     }
   }
 
+  if (identityFilter && targets.length === 0 && skippedRetired) {
+    throw new CliUsageError(
+      `Identity "${skippedRetired}" is retired, so its sessions cannot be resumed. Run "ais identities unretire ${skippedRetired}" to restore it.`,
+    );
+  }
   if (identityFilter && targets.length === 0) {
     throw new CliUsageError(
       `No identity named "${identityFilter}" found${toolFilter ? ` in ${toolFilter.toolName}'s registry` : ""}.`,
@@ -81,7 +97,11 @@ function readTarget(target: ResumeTarget, cwd: string): Promise<ToolResumeResult
 /** Reads are pure local filesystem I/O (no subprocess, no live API, no rate
  * limits to be a courteous neighbor to), unlike limits' fetchers, so every
  * target is safe to run fully in parallel. */
-export async function runResumeQuery(flags: ParsedArgs["flags"], cwd: string): Promise<ToolResumeResult[]> {
-  const targets = await collectResumeTargets(flags);
+export async function runResumeQuery(
+  flags: ParsedArgs["flags"],
+  cwd: string,
+  opts: { includeRetired?: boolean } = {},
+): Promise<ToolResumeResult[]> {
+  const targets = await collectResumeTargets(flags, undefined, opts);
   return Promise.all(targets.map((t) => readTarget(t, cwd)));
 }

@@ -1,5 +1,6 @@
+import { isRetired } from "../../identities/retired.ts";
 import { findIdentityByNameOrAlias } from "../../identities/store.ts";
-import type { IdentitiesFile } from "../../identities/types.ts";
+import type { IdentitiesFile, ToolConfig } from "../../identities/types.ts";
 import { writeZaiAuthFile } from "../../identities/zai-auth.ts";
 import { writeAliAuthFile } from "../../identities/ali-auth.ts";
 import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
@@ -9,6 +10,7 @@ import * as actions from "./actions.ts";
 import { runChromeOverrides } from "./chrome-overrides.ts";
 import { runCreate } from "./create.ts";
 import { runList } from "./list.ts";
+import { runRetire, runUnretire, type RetireDeps } from "./retire.ts";
 import { type LoadedFile, persist, resolveMutationTarget } from "./resolve-tool.ts";
 import { runShow } from "./show.ts";
 
@@ -22,15 +24,20 @@ async function runNamedMutation(
   name: string,
   apply: (file: IdentitiesFile) => { note?: string } | void,
   successMessage: (toolName: string) => string,
+  configs?: ToolConfig[],
 ): Promise<void> {
-  const loaded: LoadedFile = await resolveMutationTarget(flags, name);
+  const loaded: LoadedFile = await resolveMutationTarget(flags, name, configs);
   const result = apply(loaded.file);
   await persist(loaded);
   if (result?.note) console.log(dim(result.note));
   console.log(`${green("✔")} ${successMessage(loaded.cfg.toolName)}`);
 }
 
-export async function runIdentitiesCommand(positionals: string[], flags: ParsedArgs["flags"]): Promise<void> {
+export async function runIdentitiesCommand(
+  positionals: string[],
+  flags: ParsedArgs["flags"],
+  retireDeps: RetireDeps = {},
+): Promise<void> {
   const [action, ...rest] = positionals;
 
   switch (action ?? "list") {
@@ -51,6 +58,17 @@ export async function runIdentitiesCommand(positionals: string[], flags: ParsedA
         );
       }
       const apiKey = stringFlag(flags, "api-key");
+      if (apiKey !== undefined) {
+        // Refuse before anything is persisted: a retired identity holds no
+        // credentials, and writing a key would silently re-arm it.
+        const pre = await resolveMutationTarget(flags, name, retireDeps.configs);
+        const existing = findIdentityByNameOrAlias(pre.file.identities, name);
+        if (existing && isRetired(existing)) {
+          throw new CliUsageError(
+            `Identity "${existing.name}" is retired, so --api-key cannot be written. Run "ais identities unretire ${existing.name} --tool=${pre.cfg.toolName}" first.`,
+          );
+        }
+      }
       await runNamedMutation(
         flags,
         name,
@@ -63,6 +81,7 @@ export async function runIdentitiesCommand(positionals: string[], flags: ParsedA
           });
         },
         (toolName) => `Updated "${name}" in ${toolName}'s registry.`,
+        retireDeps.configs,
       );
       // --api-key isn't identities.json metadata (it's a secret, kept out of
       // the more casually viewed/backed-up registry file — see
@@ -72,7 +91,7 @@ export async function runIdentitiesCommand(positionals: string[], flags: ParsedA
       // call) has already been persisted, so the key lands in the identity's
       // CURRENT configDir.
       if (apiKey !== undefined) {
-        const loaded = await resolveMutationTarget(flags, name);
+        const loaded = await resolveMutationTarget(flags, name, retireDeps.configs);
         if (loaded.cfg.toolName !== "zai" && loaded.cfg.toolName !== "ali") {
           throw new CliUsageError(
             `--api-key only applies to zai/ali identities (got --tool=${loaded.cfg.toolName}).`,
@@ -110,6 +129,12 @@ export async function runIdentitiesCommand(positionals: string[], flags: ParsedA
         (toolName) => `Deleted "${name}" from ${toolName}'s registry.`,
       );
     }
+
+    case "retire":
+      return runRetire(rest, flags, retireDeps);
+
+    case "unretire":
+      return runUnretire(rest, flags, retireDeps);
 
     case "add-directory": {
       const [name, pattern] = rest;

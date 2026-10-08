@@ -1,5 +1,6 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import type { ParsedArgs } from "../args.ts";
+import { isRetired } from "../../identities/retired.ts";
 import { bold, dim, gray } from "../colors.ts";
 import { TOOL_CONFIGS, loadOne, toolConfigFromFlag } from "./resolve-tool.ts";
 
@@ -17,6 +18,7 @@ function identityFields(identity: Identity): Array<[string, string[]]> {
   fields.push(["configDir", [identity.configDir]]);
   if (identity.colour !== undefined) fields.push(["colour", [identity.colour]]);
   if (identity.directories?.length) fields.push(["directories", identity.directories]);
+  if (identity.retiredAt !== undefined) fields.push(["retiredAt", [identity.retiredAt]]);
   return fields;
 }
 
@@ -27,7 +29,8 @@ function identityFields(identity: Identity): Array<[string, string[]]> {
 // instead of trailing off after a comma-separated run.
 function formatIdentity(identity: Identity, isLast: boolean): string {
   const continuation = isLast ? BLANK : PIPE;
-  const lines = [`${isLast ? BRANCH_LAST : BRANCH}${bold(identity.name)}  ${dim(`(${identity.label})`)}`];
+  const retired = isRetired(identity) ? `  ${dim("(retired)")}` : "";
+  const lines = [`${isLast ? BRANCH_LAST : BRANCH}${bold(identity.name)}  ${dim(`(${identity.label})`)}${retired}`];
   for (const [key, values] of identityFields(identity)) {
     lines.push(`${continuation}${FIELD_INDENT}${gray(key)}: ${values[0]}`);
     const padding = " ".repeat(key.length + 2);
@@ -38,6 +41,11 @@ function formatIdentity(identity: Identity, isLast: boolean): string {
   return lines.join("\n");
 }
 
+/** Retired identities last; otherwise the registry's own order is kept. */
+export function sortRetiredLast(identities: Identity[]): Identity[] {
+  return [...identities.filter((i) => !isRetired(i)), ...identities.filter(isRetired)];
+}
+
 async function printRegistry(cfg: ToolConfig): Promise<void> {
   const { file } = await loadOne(cfg);
   console.log(`${bold(cfg.toolName)} ${dim(`(${cfg.identitiesJsonPath})`)}`);
@@ -45,8 +53,9 @@ async function printRegistry(cfg: ToolConfig): Promise<void> {
     console.log(`${BRANCH_LAST}${dim("(no identities configured)")}`);
     return;
   }
-  file.identities.forEach((identity, i) => {
-    console.log(formatIdentity(identity, i === file.identities.length - 1));
+  const identities = sortRetiredLast(file.identities);
+  identities.forEach((identity, i) => {
+    console.log(formatIdentity(identity, i === identities.length - 1));
   });
 }
 

@@ -3,6 +3,7 @@ import { credentialPathsForTool } from "./auth.ts";
 import { requireTool } from "./registries.ts";
 import { LOGIN_FLOW_SPECS } from "./login-specs.ts";
 import { resolveRealBinary } from "../shared/resolve-binary.ts";
+import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { HttpError, type LoginFlowDto, type LoginFlowStatus } from "./types.ts";
@@ -131,6 +132,7 @@ async function defaultResolveIdentity(
   const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
   const identity = findIdentityByNameOrAlias(file.identities, identityName);
   if (!identity) throw new HttpError(404, `identity "${identityName}" not found in ${toolName}'s registry`);
+  if (isRetired(identity)) throw new HttpError(409, `identity "${identityName}" is retired; unretire it first`);
   return { cfg, configDir: identity.configDir, identityName: identity.name };
 }
 

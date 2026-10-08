@@ -505,7 +505,10 @@ function RenewalCard() {
 
 export function AuthPage() {
   const query = useAuthQuery();
-  const entries = query.data?.entries ?? [];
+  // Retired identities are listed last and never offer fixes.
+  const entries = [...(query.data?.entries ?? [])].sort(
+    (a, b) => Number(a.state === "retired") - Number(b.state === "retired"),
+  );
   const [activeFlowId, setActiveFlowId] = useState<string | null>(null);
 
   return (

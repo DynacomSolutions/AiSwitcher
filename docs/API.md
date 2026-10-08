@@ -227,7 +227,9 @@ highlight source for `aistui --overview`; at most one pane carries it.
           "colour": "#22c55e",            // only when explicitly set (normalised #rrggbb)
           "effectiveColour": "#22c55e",   // ALWAYS present: explicit or stable auto pick
           "directories": ["/home/user/Projects/acme/*"],
-          "aliases": ["wk"]
+          "aliases": ["wk"],
+          "retired": true,                // only when retired (absent means active)
+          "retiredAt": "2026-10-08T12:00:00.000Z"  // when the retirement was recorded
         }
       ],
       "chromeProfileOverrides": [
@@ -249,10 +251,30 @@ Mutations (all return the updated registry entry; body is JSON):
 | `DELETE /api/identities/:tool/:name/directories` | `{ pattern }` |
 | `POST /api/identities/:tool/:name/aliases` | `{ alias }` |
 | `DELETE /api/identities/:tool/:name/aliases` | `{ alias }` |
+| `POST /api/identities/:tool/:name/retire` | – |
+| `POST /api/identities/:tool/:name/unretire` | – |
 
 `apiKey` (zai/ali create only) is forwarded to the respective auth writer and
 never persisted anywhere else. Registry edits persist atomically via the
 existing store. Deleting an identity never touches its configDir on disk.
+
+#### Retiring identities
+
+`POST .../retire` marks the identity retired (`retired: true`, `retiredAt`)
+and deletes its stored credentials. It is irreversible for the credentials:
+`POST .../unretire` clears the retired fields but does not restore them, so the
+user logs in again. Retire is idempotent and returns the updated registry plus
+a `purge` report (`{ removed: string[], warnings: string[] }`: paths and
+messages only, never credential values). Errors use the uniform
+`{ error }` body: `404` unknown tool or identity, `409` unretiring an identity
+that is not retired. Both routes need the usual `X-AIS-Console: 1` header.
+
+A retired identity is never launched, selected, probed, refreshed or offered in
+the WebUI's launch/login actions: `GET /api/auth` reports it with
+`state: "retired"` and no fixes, `POST /api/auth/*` mutations and login flows
+for it answer `409`, and limits, sessions and resume skip it. Usage keeps it
+(see Usage). Its configDir stays a readable and editable Files root, labelled
+"(retired)", so its history remains browsable.
 
 #### Identity colours
 
@@ -302,6 +324,13 @@ trailing aggregate row per provider where applicable:
 { "results": [ /* UsageResult[] (provider-first) */ ], "generatedAt": "...",
   "cached": true, "stale": false, "lastError": "...", "lastErrorAt": "..." }
 ```
+
+Retired identities stay in the report: their `identity` object carries
+`retired: true` and the numbers come from local session data only. No live
+call is made for them (no OAuth limits/extra-cost lookups, no AWS Cost
+Explorer or Budgets), so a retired Bedrock identity reports local tokens and
+the estimated cost with no `realCost` and never errors because its AWS
+profile or account is gone. Breakdown results for them carry `retired: true`.
 
 `/api/usage` and `/api/usage/breakdown` are stale-while-revalidate. Once a scan
 has succeeded, a request older than the server TTL returns the last-good
@@ -505,8 +534,9 @@ Contract notes:
 `GET /api/auth`
 
 Per identity/tool auth health. States: `ok` (logged in), `expiring`,
-`expired` (expiry in the past), `missing` (no credential file at all), and
-`unknown` (credential present but freshness not verifiable). `expiresAt` is
+`expired` (expiry in the past), `missing` (no credential file at all),
+`unknown` (credential present but freshness not verifiable), and `retired`
+(identity retired: not probed, `kind: "none"`, no fixes). `expiresAt` is
 an ISO timestamp read from the stored credential where its shape exposes one
 (claude `.credentials.json`, codex `auth.json` JWTs, kimi OAuth expiry,
 pi/opencode `auth.json`); ali's entry carries `lastRefreshAt`/`refreshError`
@@ -519,7 +549,7 @@ from the daemon-side refresh scheduler instead.
       "toolName": "kimi",
       "identity": "work",
       "kind": "oauth",             // oauth | apikey | cookie | none
-      "state": "ok",               // ok | expiring | expired | missing | unknown
+      "state": "ok",               // ok | expiring | expired | missing | unknown | retired
       "detail": "token expires in 3h (refresh happens on next live fetch)",
       "fixable": ["refresh", "login"],
       "expiresAt": "2026-09-10T12:00:00.000Z",
@@ -625,7 +655,8 @@ Whitelisted editable roots:
 - `~/.ais` (shared skills, hooks, AGENTS.md, STANDING-DEFAULTS.md, config)
 - Each existing tool container dir (`~/.claude`, `~/.codex`, `~/.grok`,
   `~/.kimi-code`, `~/.zai`, `~/.ali`, Pi dir)
-- Each registered identity's configDir (covers custom locations)
+- Each registered identity's configDir (covers custom locations), retired
+  identities included (labelled "(retired)")
 
 Traversal guard: resolved realpath must stay inside a whitelisted root;
 symlink escapes rejected; junk dirs (`node_modules`, `.git`, caches...) are

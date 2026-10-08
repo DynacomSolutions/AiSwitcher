@@ -645,6 +645,8 @@ ais identities create --tool=<t> [--name=] [--label=] [--description=] \
                                                            # (--api-key is zai/ali-only, see "ZAI"/"ALI" above)
 ais identities update <name> --tool=<t> [--label=] [--description=] [--configDir=] [--api-key=]
 ais identities delete <name> --tool=<t> --yes             # registry only — configDir is left on disk
+ais identities retire <name> [--tool=<t>] [--yes]         # never launched/selected; deletes stored credentials (confirms)
+ais identities unretire <name> [--tool=<t>]               # selectable again; sign in again (credentials are not restored)
 ais identities add-directory <name> <pattern> --tool=<t>
 ais identities remove-directory <name> <pattern> --tool=<t>
 ais identities add-alias <name> <alias> --tool=<t>
@@ -927,6 +929,37 @@ identity. Hand-editing `~/.claude/identities.json` /
 `~/.codex/identities.json` / `~/.grok/identities.json` /
 `~/.kimi-code/identities.json` / `~/.zai/identities.json` / `~/.ali/identities.json`
 still works too.
+
+### Retiring an identity
+
+`ais identities retire <name>` is for an account that no longer exists or that
+you have stopped using. The identity stays in the registry (so its name and
+aliases cannot be reused) but is never launched, selected, refreshed or
+probed: it is skipped by flags, aliases, directory matching, pickers, limits,
+`doctor`, auth refresh and the web/TUI selectors. `ais identities list` marks
+it `(retired)` and sorts it last.
+
+- **Removed (irreversibly, so retire confirms; `--yes` skips the prompt and is
+  required when not interactive):** the identity's credential files (for
+  example `.credentials.json`, `auth.json`, `credentials/kimi-code.json`),
+  the API key inside a zai/ali `crush.json` (the rest of the file is kept),
+  ali's console cookie, auth-browser state and systemd refresh timer, and the
+  same provider's entry in a same-named pi identity's `auth.json`. The command
+  prints the paths it removed, never values.
+- **Kept:** session logs, transcripts and databases. Retired identities still
+  appear in `ais usage` and the web/TUI usage views from local data, labelled
+  `retired`; live remote lookups (OAuth limits, AWS Cost Explorer) are skipped.
+- **macOS Keychain:** Claude Code on macOS may keep credentials in the
+  Keychain. `ais` cannot remove that entry; retire prints a reminder to delete
+  it in Keychain Access yourself.
+- **Unretire:** `ais identities unretire <name>` makes the identity selectable
+  again but does not restore credentials. Sign in again (`ais auth login <name>
+  --tool=ali` for ali; launch the tool through `ais` and log in for the rest).
+- **Sync:** retirement travels with `ais sync`. Per identity, the newest
+  retire/unretire event across both hosts wins, so a retirement is not undone
+  by a later unrelated edit on another host. After every pull the credentials
+  of every retired identity are purged again, because rsync would otherwise
+  copy the other host's files back.
 
 ## Desktop apps
 

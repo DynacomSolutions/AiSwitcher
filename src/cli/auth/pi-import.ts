@@ -1,6 +1,7 @@
 import * as clack from "@clack/prompts";
 import { expandPath } from "../../identities/match.ts";
 import { reconcilePiOAuthStores, renderOAuthReconcileReport } from "../../identities/oauth-reconcile.ts";
+import { isRetired } from "../../identities/retired.ts";
 import { importPiCredentials, type PiCredentialSourceDirs } from "../../identities/pi-auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import {
@@ -29,6 +30,11 @@ async function resolveConfigDir(cfg: ToolConfig, key: string): Promise<string> {
   const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
   const identity = findIdentityByNameOrAlias(file.identities, key);
   if (!identity) throw new CliUsageError(`No ${cfg.toolName} identity named "${key}".`);
+  if (isRetired(identity)) {
+    throw new CliUsageError(
+      `${cfg.toolName} identity "${identity.name}" is retired and cannot be a credential source. Run "ais identities unretire ${identity.name} --tool=${cfg.toolName}" first.`,
+    );
+  }
   return expandPath(identity.configDir);
 }
 
@@ -67,6 +73,12 @@ export async function runPiAuthImport(positionals: string[], flags: ParsedArgs["
   if (!piIdentity) {
     throw new CliUsageError(
       piKey ? `No pi identity named "${piKey}".` : "Specify the Pi identity to receive credentials.",
+    );
+  }
+
+  if (isRetired(piIdentity)) {
+    throw new CliUsageError(
+      `Pi identity "${piIdentity.name}" is retired, so credentials cannot be imported into it. Run "ais identities unretire ${piIdentity.name} --tool=pi" first.`,
     );
   }
 

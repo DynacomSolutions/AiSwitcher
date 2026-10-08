@@ -8,6 +8,8 @@ import {
   removeAlias,
   removeChromeOverride,
   removeDirectory,
+  retireIdentity,
+  unretireIdentity,
   updateIdentity,
 } from "../../src/cli/identities/actions.ts";
 import { CliUsageError } from "../../src/cli/errors.ts";
@@ -188,5 +190,55 @@ describe("addChromeOverride / removeChromeOverride", () => {
   test("throws on an out-of-range index", () => {
     const file = baseFile();
     expect(() => removeChromeOverride(file, 0)).toThrow(CliUsageError);
+  });
+});
+
+describe("retireIdentity / unretireIdentity", () => {
+  const t1 = new Date("2026-01-01T00:00:00.000Z");
+  const t2 = new Date("2026-02-01T00:00:00.000Z");
+
+  test("retire marks the identity, looked up by name or alias", () => {
+    const file = baseFile();
+    const identity = retireIdentity(file, "w", t1);
+    expect(identity).toMatchObject({ name: "work", retired: true, retiredAt: t1.toISOString() });
+  });
+
+  test("retire is idempotent and keeps the original retiredAt", () => {
+    const file = baseFile();
+    retireIdentity(file, "work", t1);
+    retireIdentity(file, "work", t2);
+    expect(file.identities[1]?.retiredAt).toBe(t1.toISOString());
+  });
+
+  test("unretire clears retired fields and records unretiredAt", () => {
+    const file = baseFile();
+    retireIdentity(file, "work", t1);
+    const identity = unretireIdentity(file, "work", t2);
+    expect(identity.retired).toBeUndefined();
+    expect(identity.retiredAt).toBeUndefined();
+    expect(identity.unretiredAt).toBe(t2.toISOString());
+  });
+
+  test("retire after unretire clears unretiredAt", () => {
+    const file = baseFile();
+    retireIdentity(file, "work", t1);
+    unretireIdentity(file, "work", t2);
+    retireIdentity(file, "work", new Date("2026-03-01T00:00:00.000Z"));
+    expect(file.identities[1]?.unretiredAt).toBeUndefined();
+    expect(file.identities[1]?.retired).toBe(true);
+  });
+
+  test("unretire on an active identity errors; unknown names error", () => {
+    expect(() => unretireIdentity(baseFile(), "work", t1)).toThrow(/not retired/);
+    expect(() => retireIdentity(baseFile(), "nope", t1)).toThrow(CliUsageError);
+  });
+
+  test("a retired identity still occupies its name and aliases", () => {
+    const file = baseFile();
+    retireIdentity(file, "work", t1);
+    expect(() => createIdentity(file, { name: "work", label: "X", configDir: "/tmp/x" })).toThrow(CliUsageError);
+    expect(() => createIdentity(file, { name: "other", label: "X", configDir: "/tmp/x", aliases: ["w"] })).toThrow(
+      CliUsageError,
+    );
   });
 });

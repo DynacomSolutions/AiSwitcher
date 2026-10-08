@@ -355,7 +355,8 @@ export function SessionsPage() {
     const names = new Set<string>();
     for (const registry of effectiveColours) {
       if (tool && registry.toolName !== tool) continue;
-      for (const item of registry.identities) names.add(item.name);
+      // Retired identities cannot be launched or resumed: not offered as a filter.
+      for (const item of registry.identities) if (!item.retired) names.add(item.name);
     }
     for (const slice of slices) {
       if (tool && slice.tool !== tool) continue;

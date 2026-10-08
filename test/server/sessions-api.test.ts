@@ -116,4 +116,34 @@ describe("scan-worker tree + transcript kinds", () => {
     expect(noId.ok).toBe(false);
     expect(noId.status).toBe(400);
   });
+
+  test("a retired identity's session history stays viewable in tree and transcript scans", async () => {
+    const { registryPath, configDir } = await makeHome();
+    const configs = [fakeConfig(registryPath)];
+    await seedClaudeSession(registryPath, configDir, "old-sess");
+    await writeFile(registryPath, JSON.stringify({
+      version: 1,
+      identities: [{ name: "testa", label: "Test A", configDir, retired: true, retiredAt: "2026-10-01T00:00:00.000Z" }],
+    }));
+
+    const tree = await runScan<{ tools: Array<{ identity: string; nodes: unknown[] }> }>({
+      kind: "tree",
+      tool: "claude",
+      configs,
+      days: 30,
+    });
+    expect(tree.ok).toBe(true);
+    expect(tree.payload!.tools.map((t) => t.identity)).toEqual(["testa"]);
+    expect(tree.payload!.tools[0]!.nodes).toHaveLength(1);
+
+    const transcript = await runScan<{ transcript: { totalTurns: number } | null }>({
+      kind: "transcript",
+      tool: "claude",
+      identity: "testa",
+      id: "old-sess",
+      configs,
+    });
+    expect(transcript.ok).toBe(true);
+    expect(transcript.payload!.transcript!.totalTurns).toBe(2);
+  });
 });

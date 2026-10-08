@@ -1,4 +1,5 @@
 import type { ChromeProfileOverride, IdentitiesFile } from "./types.ts";
+import { isRetired } from "./retired.ts";
 import { normalizePath, parseDirectoryPattern, patternMatches, scorePattern } from "./match.ts";
 
 export interface ChromeMcpTargetResolution {
@@ -32,6 +33,11 @@ function bestOverrideMatch(
  * identity — they exist specifically to redirect to a different one. Returns
  * null when nothing resolves, so callers fall back to unmodified `open`
  * behavior.
+ *
+ * A retired identity never gets a Chrome instance started for it: an override
+ * whose target is retired (or a retired active identity) resolves to null so
+ * the link falls through to the unmodified `open`, rather than failing a
+ * plain link-open or silently redirecting to some other identity's profile.
  */
 export function resolveChromeMcpTarget(
   cwd: string,
@@ -42,13 +48,15 @@ export function resolveChromeMcpTarget(
 
   const override = bestOverrideMatch(normalizedCwd, file.chromeProfileOverrides ?? []);
   if (override) {
+    const target = file.identities.find((i) => i.name === override.targetIdentity);
+    if (target && isRetired(target)) return null;
     return { identityName: override.targetIdentity, source: "directory-override", label: override.label };
   }
 
   if (!configDirValue) return null;
   const normalizedConfigDir = normalizePath(configDirValue);
   const identity = file.identities.find((i) => normalizePath(i.configDir) === normalizedConfigDir);
-  if (identity) {
+  if (identity && !isRetired(identity)) {
     return { identityName: identity.name, source: "active-identity" };
   }
   return null;

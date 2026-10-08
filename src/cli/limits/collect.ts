@@ -1,5 +1,6 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import type { ParsedArgs } from "../args.ts";
+import { isRetired } from "../../identities/retired.ts";
 import { CliUsageError } from "../errors.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { canonicalUsageProvider, providerForTool } from "../usage/providers.ts";
@@ -93,16 +94,27 @@ export async function collectLimitTargets(
   const targetConfigs = toolFilter ? [toolFilter] : configs;
   const loaded = await loadAll(targetConfigs);
 
+  // Retired identities are never probed: no live provider or subprocess call.
   const targets: LimitTarget[] = [];
+  let skippedRetired: string | undefined;
   for (const { cfg, file } of loaded) {
     for (const identity of file.identities) {
       if (identityFilter && identity.name !== identityFilter && !(identity.aliases ?? []).includes(identityFilter)) {
+        continue;
+      }
+      if (isRetired(identity)) {
+        skippedRetired ??= identity.name;
         continue;
       }
       targets.push({ toolName: cfg.toolName, identity });
     }
   }
 
+  if (identityFilter && targets.length === 0 && skippedRetired) {
+    throw new CliUsageError(
+      `Identity "${skippedRetired}" is retired, so limits cannot be queried. Run "ais identities unretire ${skippedRetired}" to restore it.`,
+    );
+  }
   if (identityFilter && targets.length === 0) {
     throw new CliUsageError(
       `No identity named "${identityFilter}" found${toolFilter ? ` in ${toolFilter.toolName}'s registry` : ""}.`,

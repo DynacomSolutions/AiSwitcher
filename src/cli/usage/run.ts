@@ -1,5 +1,6 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
+import { isRetired } from "../../identities/retired.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
@@ -80,6 +81,7 @@ export async function collectTargets(
   const targetConfigs = toolFilter ? [toolFilter] : configs;
   const loaded = await loadAll(targetConfigs);
 
+  // Retired identities are kept: usage is historical, read from local data.
   const targets: UsageTarget[] = [];
   for (const { cfg, file } of loaded) {
     for (const identity of file.identities) {
@@ -223,6 +225,15 @@ export function providerReportsFromTokscale(target: UsageTarget, report: Tokscal
   return [...groups].map(([provider, entries]) => providerResult(target, provider, { report: reportFromEntries(entries) }));
 }
 
+/** Seams for tests: the remote lookups and tokscale subprocesses a usage run
+ * would otherwise perform. Production passes none. */
+export interface UsageRunDeps {
+  fetchExtraCost?: typeof fetchExtraCost;
+  fetchAwsBedrockUsage?: typeof fetchAwsBedrockUsage;
+  runTokscale?: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]>;
+  fetchTokscaleDailyUsage?: typeof fetchTokscaleDailyUsage;
+}
+
 async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
   const fallbackProvider = providerForTool(target.toolName);
   const invocation = await tokscaleInvocationFor(target.toolName, target.identity);
@@ -279,10 +290,18 @@ async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppre
  * for this source explicitly; a malformed mapping stays an honest error
  * row, but a Cost Explorer failure no longer costs the row its local
  * figures: it degrades into realCost.error. */
-async function runAwsBedrockUsage(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
+async function runAwsBedrockUsage(
+  target: UsageTarget,
+  suppression: UsageRowSuppression,
+  fetchBedrock: typeof fetchAwsBedrockUsage = fetchAwsBedrockUsage,
+): Promise<UsageResult[]> {
   try {
-    const { report, dateSpan, dailyUsage, dailyCostUsd, realCost } = await fetchAwsBedrockUsage(target.identity, {
+    // A retired identity reports its LOCAL history only: no profile lookup,
+    // Cost Explorer or Budgets call, so a deleted AWS profile or account
+    // never turns into an error row.
+    const { report, dateSpan, dailyUsage, dailyCostUsd, realCost } = await fetchBedrock(target.identity, {
       localTool: target.toolName,
+      ...(isRetired(target.identity) ? { localOnly: true } : {}),
     });
     return [
       providerResult(target, "aws-bedrock", {
@@ -302,17 +321,21 @@ async function runAwsBedrockUsage(target: UsageTarget, suppression: UsageRowSupp
   }
 }
 
-async function runOne(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
-  if (target.toolName === "codex" && isBedrockIdentity(target.identity)) return runAwsBedrockUsage(target, suppression);
+async function runOne(target: UsageTarget, suppression: UsageRowSuppression, deps: UsageRunDeps = {}): Promise<UsageResult[]> {
+  if (target.toolName === "codex" && isBedrockIdentity(target.identity)) {
+    return runAwsBedrockUsage(target, suppression, deps.fetchAwsBedrockUsage);
+  }
   if (target.toolName === "zai") return runZaiUsage(target, suppression);
   if (target.toolName === "ali") return runAliUsage(target, suppression);
   if (target.toolName === "pi") return runPiUsage(target, suppression);
   if (target.toolName === "opencode") return runOpencodeUsage(target, suppression);
 
   const [results, extraCost, daily] = await Promise.all([
-    runTokscale(target, suppression),
-    fetchExtraCost(target.toolName, target.identity),
-    fetchTokscaleDailyUsage(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
+    (deps.runTokscale ?? runTokscale)(target, suppression),
+    // Retired identities keep local usage only: the extra-cost probe is a
+    // live OAuth call against an account whose credentials are gone.
+    isRetired(target.identity) ? Promise.resolve(undefined) : (deps.fetchExtraCost ?? fetchExtraCost)(target.toolName, target.identity),
+    (deps.fetchTokscaleDailyUsage ?? fetchTokscaleDailyUsage)(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
   ]);
   const primaryProvider = providerForTool(target.toolName);
   return results.map((result, index) => ({
@@ -417,14 +440,14 @@ const USAGE_MAX_CONCURRENT = 6;
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
-  options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => void } = {},
+  options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => void; deps?: UsageRunDeps } = {},
 ): Promise<UsageResult[]> {
   const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
-  if (targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
+  if (!options.deps?.runTokscale && targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
   return runBatched(
     targets,
     USAGE_MAX_CONCURRENT,
-    async (target) => runOne(target, suppression),
+    async (target) => runOne(target, suppression, options.deps),
     options.onItemDone,
   ).then((batches) => aggregateUsageResults(batches.flat()));
 }

@@ -10,6 +10,8 @@ const COMMANDS: Array<[string, string]> = [
   ["identities create --tool=<t> [--name=] ...", "Create an identity (prompts for anything omitted)"],
   ["identities update <name> --tool=<t> ...", "Update label/description/configDir"],
   ["identities delete <name> --tool=<t> --yes", "Remove from the registry (configDir is left on disk)"],
+  ["identities retire <name> [--tool=] [--yes]", "Retire: never launched or selected; deletes stored credentials, keeps usage history"],
+  ["identities unretire <name> [--tool=]", "Restore a retired identity (sign in again; credentials are not restored)"],
   ["identities add-directory <name> <pattern> --tool=<t>", ""],
   ["identities remove-directory <name> <pattern> --tool=<t>", ""],
   ["identities add-alias <name> <alias> --tool=<t>", ""],
@@ -38,6 +40,12 @@ mutation auto-resolves --tool when the name exists in only one of the
 claude/codex/grok/kimi/zai/ali/pi/opencode registries, and requires --tool when it exists in more than
 one (or none). "list"/"show"/"chrome-overrides list" default to showing all
 registries when --tool is omitted.
+
+"identities retire" marks an identity retired and irreversibly deletes its
+stored credentials (confirms, or pass --yes; required when not interactive).
+Session logs and usage history are kept and still appear in usage reports.
+"unretire" restores selection but not credentials. Retirement syncs between
+hosts: the newest retire/unretire event wins.
 
 "auth import <pi-id> --tool=pi" accepts any of --claude=<id>, --codex=<id>,
 --grok=<id>, --kimi=<id>, --zai=<id>, --ali=<id>, and bare --opencode-go.

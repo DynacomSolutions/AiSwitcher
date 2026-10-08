@@ -46,6 +46,12 @@ describe("formatUsageReport", () => {
     expect(output).not.toContain("TOTAL");
   });
 
+  test("retired identities are marked in the identity column", () => {
+    const result = success("claude", "identity-a");
+    result.identity = { ...result.identity, retired: true };
+    expect(formatUsageReport([result])).toContain("identity-a (retired)");
+  });
+
   test("multiple identities: adds a TOTAL row summing all successes", () => {
     const output = formatUsageReport([
       success("claude", "identity-a", { totalMessages: 10, totalCost: 1 }),

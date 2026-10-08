@@ -2,6 +2,7 @@ import { basename, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { isRetired } from "../identities/retired.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../shared/reproducible-paths.ts";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
@@ -48,7 +49,8 @@ async function collectRoots(configs: ToolConfig[]): Promise<RootDef[]> {
       for (const identity of file.identities) {
         roots.push({
           id: `id:${cfg.toolName}:${identity.name}`,
-          label: `${cfg.toolName}/${identity.name} configDir`,
+          // Retired identities stay browsable (their session history is kept).
+          label: `${cfg.toolName}/${identity.name}${isRetired(identity) ? " (retired)" : ""} configDir`,
           base: identity.configDir,
         });
       }

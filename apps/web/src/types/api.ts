@@ -10,6 +10,10 @@ export interface Identity {
   configDir: string;
   directories?: string[];
   aliases?: string[];
+  /** True only for a retired identity: kept for usage history, never launched. */
+  retired?: boolean;
+  /** ISO timestamp of the retirement, when recorded. */
+  retiredAt?: string;
 }
 
 /* Status */
@@ -140,6 +144,16 @@ export interface ChromeProfileOverrideDto {
   directories: string[];
   targetIdentity: string;
   label?: string;
+}
+
+/** What retirement removed: paths only, never credential values. */
+export interface RetirePurgeReport {
+  removed: string[];
+  warnings: string[];
+}
+
+export interface RetireResultDto extends RegistryDto {
+  purge: RetirePurgeReport;
 }
 
 export interface RegistryDto {
@@ -433,7 +447,7 @@ export interface TranscriptResponse {
 /* Auth */
 
 export type AuthKind = "oauth" | "apikey" | "cookie" | "none";
-export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown";
+export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown" | "retired";
 
 export interface AuthEntry {
   toolName: ToolName;

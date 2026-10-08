@@ -306,6 +306,66 @@ function DeleteIdentityDialog({
   );
 }
 
+function RetireIdentityDialog({
+  target,
+  onClose,
+}: {
+  target: IdentityRef;
+  onClose: () => void;
+}) {
+  const invalidate = useInvalidateIdentities();
+  const qc = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: () => api.retireIdentity(target.tool, target.identity.name),
+    onSuccess: (result) => {
+      invalidate();
+      void qc.invalidateQueries({ queryKey: qk.auth });
+      toast.success("Identity retired", {
+        description: `${target.tool}/${target.identity.name}: usage history kept.`,
+      });
+      for (const warning of result.purge.warnings) toast.warning("Retire warning", { description: warning });
+      onClose();
+    },
+    onError: (error) => toast.error("Retire failed", { description: error.message }),
+  });
+
+  return (
+    <AlertDialog open onOpenChange={(open) => !open && onClose()}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Retire identity?</AlertDialogTitle>
+          <AlertDialogDescription asChild>
+            <div className="space-y-2">
+              <p>
+                <span className="font-mono text-xs">{target.tool}/{target.identity.name}</span> will
+                never be launched, selected, refreshed or probed again. It stays in the registry and
+                keeps appearing in usage reports, read from local data only.
+              </p>
+              <p>
+                Its stored credentials will be deleted now and cannot be restored. Unretiring later
+                brings the identity back but you will need to log in again.
+              </p>
+            </div>
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            disabled={mutation.isPending}
+            onClick={(e) => {
+              e.preventDefault();
+              mutation.mutate();
+            }}
+          >
+            {mutation.isPending ? "Retiring..." : "Retire identity"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
 function CreateIdentityDialog({ tool, onClose }: { tool: ToolName; onClose: () => void }) {
   const invalidate = useInvalidateIdentities();
   const [name, setName] = useState("");
@@ -452,6 +512,20 @@ function RegistryTable({ registry, authFor }: { registry: RegistryDto; authFor: 
   const [editing, setEditing] = useState<IdentityRef | null>(null);
   const [managing, setManaging] = useState<{ ref: IdentityRef; kind: "directories" | "aliases" } | null>(null);
   const [deleting, setDeleting] = useState<IdentityRef | null>(null);
+  const [retiring, setRetiring] = useState<IdentityRef | null>(null);
+  const invalidate = useInvalidateIdentities();
+  const unretire = useMutation({
+    mutationFn: (identity: IdentityDto) => api.unretireIdentity(registry.toolName, identity.name),
+    onSuccess: (_data, identity) => {
+      invalidate();
+      toast.success("Identity unretired", {
+        description: `${registry.toolName}/${identity.name}: log in again to use it.`,
+      });
+    },
+    onError: (error) => toast.error("Unretire failed", { description: error.message }),
+  });
+  // Retired identities sort last, otherwise registry order.
+  const identities = [...registry.identities].sort((a, b) => Number(!!a.retired) - Number(!!b.retired));
 
   if (registry.identities.length === 0) {
     return (
@@ -478,14 +552,22 @@ function RegistryTable({ registry, authFor }: { registry: RegistryDto; authFor: 
               </TableRow>
             </TableHeader>
             <TableBody>
-            {registry.identities.map((identity) => {
+            {identities.map((identity) => {
               const auth = authFor(registry.toolName, identity.name);
               return (
-              <TableRow key={identity.name}>
+              <TableRow key={identity.name} className={identity.retired ? "opacity-60" : undefined}>
                 <TableCell className="font-medium">
                   <span className="flex items-center gap-2">
                     <IdentityDot colour={identity.effectiveColour} />
                     {identity.name}
+                    {identity.retired ? (
+                      <Badge
+                        variant="muted"
+                        title={identity.retiredAt ? `Retired ${identity.retiredAt}` : "Retired"}
+                      >
+                        Retired
+                      </Badge>
+                    ) : null}
                   </span>
                 </TableCell>
                 <TableCell className="max-w-44 truncate text-muted-foreground" title={identity.description}>
@@ -576,6 +658,18 @@ function RegistryTable({ registry, authFor }: { registry: RegistryDto; authFor: 
                         Aliases...
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
+                      {identity.retired ? (
+                        <DropdownMenuItem onSelect={() => unretire.mutate(identity)}>
+                          Unretire
+                        </DropdownMenuItem>
+                      ) : (
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onSelect={() => setRetiring({ tool: registry.toolName, identity })}
+                        >
+                          Retire identity...
+                        </DropdownMenuItem>
+                      )}
                       <DropdownMenuItem
                         variant="destructive"
                         onSelect={() => setDeleting({ tool: registry.toolName, identity })}
@@ -602,6 +696,9 @@ function RegistryTable({ registry, authFor }: { registry: RegistryDto; authFor: 
           kind={managing.kind}
           onClose={() => setManaging(null)}
         />
+      ) : null}
+      {retiring ? (
+        <RetireIdentityDialog target={retiring} onClose={() => setRetiring(null)} />
       ) : null}
       {deleting ? (
         <DeleteIdentityDialog target={deleting} onClose={() => setDeleting(null)} />

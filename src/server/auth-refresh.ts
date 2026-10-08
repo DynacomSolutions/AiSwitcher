@@ -10,6 +10,7 @@ import {
   refreshIdentityOAuthGrant,
   type RefreshableTool,
 } from "../identities/oauth-refresh.ts";
+import { isRetired } from "../identities/retired.ts";
 import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
 
@@ -271,7 +272,12 @@ export class AuthRefreshScheduler {
     const targets: { tool: string; identity: Identity; refresher: Refresher }[] = [];
     for (const [tool, refresher] of Object.entries(this.refreshers)) {
       try {
-        for (const identity of await this.listIdentities(tool)) targets.push({ tool, identity, refresher });
+        // Retired identities are never refreshed: their credentials were
+        // purged and a refresh must not recreate them.
+        for (const identity of await this.listIdentities(tool)) {
+          if (isRetired(identity)) continue;
+          targets.push({ tool, identity, refresher });
+        }
       } catch {
         // Registry unreadable (fresh machine): nothing to refresh yet.
       }
@@ -364,6 +370,9 @@ export class AuthRefreshScheduler {
     const identities = await this.listIdentities(tool);
     const identity = identities.find((candidate) => candidate.name === identityName);
     if (!identity) throw new Error(`no ${tool} identity named "${identityName}"`);
+    if (isRetired(identity)) {
+      throw new Error(`${tool} identity "${identityName}" is retired; unretire it and log in again first`);
+    }
     // Manual runs force the underlying flow past its cadence skip.
     return this.runOne(tool, identity, refresher, {
       force: true,

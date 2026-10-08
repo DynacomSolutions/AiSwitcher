@@ -6,6 +6,7 @@ import {
 import { defaultCostExplorerApi, sumCostExplorerBuckets, type CostExplorerApi } from "../cli/usage/aws-bedrock-usage.ts";
 import type { AwsProfileDeps } from "../identities/aws-profile.ts";
 import { periodStartForTimeUnit, chooseBudget, budgetSnapshotsFromWires, computeAccountState, type AccountSpendState } from "./state.ts";
+import { isRetired } from "../identities/retired.ts";
 import { resolveGuardAccounts, type GuardAccount } from "./accounts.ts";
 import { estimateIdentityLocalSpend } from "../shared/local-spend.ts";
 
@@ -57,10 +58,13 @@ export async function runSpendGuardCycle(deps: SpendCycleDeps = {}): Promise<Spe
     ? { accounts: deps.accounts, errors: [] as string[] }
     : await resolveGuardAccounts(undefined, deps.awsProfileDeps);
   errors.push(...mappingErrors);
+  // Retired identities still count toward their account's local spend, but an
+  // account with no active identity left needs no live AWS calls.
+  const liveAccounts = accounts.filter((a) => a.identities.some(({ identity }) => !isRetired(identity)));
 
   const states: Record<string, AccountSpendState> = {};
   await Promise.all(
-    accounts.map(async (account) => {
+    liveAccounts.map(async (account) => {
       const budgetFetch = await fetchAccountBudgetWires(
         {
           profile: account.profile,

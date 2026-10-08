@@ -1,6 +1,7 @@
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "../../identities/types.ts";
 import { normaliseIdentityColour } from "../../identities/colour.ts";
 import { isValidIdentityKey, parseDirectoryPattern } from "../../identities/match.ts";
+import { isRetired, retireIdentityFields, unretireIdentityFields } from "../../identities/retired.ts";
 import { findIdentityByNameOrAlias } from "../../identities/store.ts";
 import { CliUsageError } from "../errors.ts";
 
@@ -115,6 +116,24 @@ export function updateIdentity(file: IdentitiesFile, name: string, input: Update
 export function deleteIdentity(file: IdentitiesFile, name: string): Identity {
   const identity = requireIdentity(file, name);
   file.identities = file.identities.filter((i) => i !== identity);
+  return identity;
+}
+
+/** Marks the identity retired. Idempotent: retiring an already retired
+ * identity keeps its original retiredAt. A retired identity still occupies
+ * its name and aliases (existingKeys sees it), so they cannot be reused. */
+export function retireIdentity(file: IdentitiesFile, name: string, now: Date): Identity {
+  const identity = requireIdentity(file, name);
+  if (!isRetired(identity)) retireIdentityFields(identity, now);
+  return identity;
+}
+
+/** Restores a retired identity. Credentials removed at retirement are not
+ * restored. Errors when the identity is not retired. */
+export function unretireIdentity(file: IdentitiesFile, name: string, now: Date): Identity {
+  const identity = requireIdentity(file, name);
+  if (!isRetired(identity)) throw new CliUsageError(`"${name}" is not retired`);
+  unretireIdentityFields(identity, now);
   return identity;
 }
 

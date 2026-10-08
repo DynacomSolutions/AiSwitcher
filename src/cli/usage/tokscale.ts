@@ -1,6 +1,7 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { isRetired } from "../../identities/retired.ts";
 import { readZaiApiKey } from "../../identities/zai-auth.ts";
 import { aisHome } from "../../shared/ais-home.ts";
 
@@ -89,6 +90,10 @@ export async function tokscaleInvocationFor(
     case "claude":
       return { env: { TOKSCALE_EXTRA_DIRS: tokscaleExtraDirEntry("claude", identity) }, clientArgs };
     case "zai": {
+      // A retired identity's credentials are deleted and tokscale's live
+      // quota call must never run for it: same "not supported" answer as the
+      // no-key path.
+      if (isRetired(identity)) return undefined;
       const apiKey = await readZaiApiKey(identity.configDir);
       if (!apiKey) return undefined;
       return { env: { ZAI_API_KEY: apiKey }, clientArgs };

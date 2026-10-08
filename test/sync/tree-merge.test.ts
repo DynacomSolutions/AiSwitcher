@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, open, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readdir, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
@@ -145,3 +145,139 @@ describe("recoverProfileArchives", () => {
     expect(await Bun.file(archived).text()).toBe('one\ntwo\nthree\nfour\n');
   });
 });
+
+describe("post-merge credential purge", () => {
+  test("a credential copied in from the remote is purged for a retired identity only", async () => {
+    const home = await makeDir("ais-tree-retired-home-");
+    const incoming = await makeDir("ais-tree-retired-incoming-");
+    const entry = (name: string, extra: object = {}) => ({
+      name,
+      label: name,
+      configDir: join(home, ".codex", "identities", name),
+      ...extra,
+    });
+    await write(
+      join(home, ".codex", "identities.json"),
+      JSON.stringify({
+        version: 1,
+        identities: [
+          entry("old-team", { retired: true, retiredAt: "2026-02-01T00:00:00.000Z" }),
+          entry("work"),
+        ],
+      }),
+    );
+    // The remote still believes both are active and carries their credentials.
+    await write(
+      join(incoming, ".codex", "identities.json"),
+      JSON.stringify({ version: 1, identities: [entry("old-team"), entry("work")] }),
+    );
+    for (const name of ["old-team", "work"]) {
+      await write(join(incoming, ".codex", "identities", name, "auth.json"), '{"secret":"x"}');
+      await write(join(incoming, ".codex", "identities", name, "history.jsonl"), "event\n");
+    }
+
+    await mergeIncomingProfileTree(incoming, { kind: "all" }, { home });
+
+    const oldDir = join(home, ".codex", "identities", "old-team");
+    expect(await Bun.file(join(oldDir, "auth.json")).exists()).toBe(false);
+    expect(await Bun.file(join(oldDir, "history.jsonl")).exists()).toBe(true);
+    expect(await Bun.file(join(home, ".codex", "identities", "work", "auth.json")).exists()).toBe(true);
+    const merged = await Bun.file(join(home, ".codex", "identities.json")).json();
+    expect(merged.identities.find((i: { name: string }) => i.name === "old-team").retired).toBe(true);
+  });
+
+  // Explicit mtimes pin the newest-wins branch: either side may be newer, and
+  // the registries and credentials must be handled identically in both.
+  for (const newer of ["incoming", "local", "equal"] as const) {
+  test(`conflict copies of a retired identity's credentials are scrubbed, other conflicts kept (${newer} newer)`, async () => {
+    const home = await makeDir("ais-tree-retired-conflict-home-");
+    const incoming = await makeDir("ais-tree-retired-conflict-in-");
+    const conflictRoot = await makeDir("ais-tree-retired-conflicts-");
+    const entry = (name: string, extra: object = {}) => ({
+      name,
+      label: name,
+      configDir: join(home, ".codex", "identities", name),
+      ...extra,
+    });
+    const zaiEntry = {
+      name: "old-zai",
+      label: "old-zai",
+      configDir: join(home, ".zai", "identities", "old-zai"),
+      retired: true,
+      retiredAt: "2026-02-01T00:00:00.000Z",
+    };
+    await write(
+      join(home, ".codex", "identities.json"),
+      JSON.stringify({ version: 1, identities: [entry("old-team", { retired: true, retiredAt: "2026-02-01T00:00:00.000Z" }), entry("work")] }),
+    );
+    await write(join(home, ".zai", "identities.json"), JSON.stringify({ version: 1, identities: [zaiEntry] }));
+    await write(join(incoming, ".codex", "identities.json"), JSON.stringify({ version: 1, identities: [entry("old-team"), entry("work")] }));
+    await write(join(incoming, ".zai", "identities.json"), JSON.stringify({ version: 1, identities: [{ ...zaiEntry, retired: undefined, retiredAt: undefined }] }));
+    // Both sides differ for every file, so each live copy is preserved or overwritten.
+    for (const name of ["old-team", "work"]) {
+      await write(join(home, ".codex", "identities", name, "auth.json"), '{"secret":"local"}');
+      await write(join(incoming, ".codex", "identities", name, "auth.json"), '{"secret":"remote"}');
+    }
+    const crush = (key: string) => JSON.stringify({ providers: { zai: { api_key: key, base_url: "https://example.invalid" } } });
+    await write(join(home, ".zai", "identities", "old-zai", "crush.json"), crush("local-key"));
+    await write(join(incoming, ".zai", "identities", "old-zai", "crush.json"), crush("remote-key"));
+
+    const old = new Date("2026-03-01T00:00:00Z");
+    const recent = new Date("2026-03-02T00:00:00Z");
+    for (const [root, isIncoming] of [[home, false], [incoming, true]] as const) {
+      const when = newer === "equal" ? old : (newer === "incoming") === isIncoming ? recent : old;
+      for (const file of await readdir(root, { recursive: true })) {
+        const full = join(root, file);
+        if ((await stat(full)).isFile()) await utimes(full, when, when);
+      }
+    }
+
+    await mergeIncomingProfileTree(incoming, { kind: "all" }, { home, conflictRoot });
+
+    const preserved: string[] = [];
+    for (const side of ["local", "incoming"]) {
+      const files = await readdir(join(conflictRoot, side), { recursive: true }).catch(() => [] as string[]);
+      for (const f of files) if (!(await stat(join(conflictRoot, side, f))).isDirectory()) preserved.push(`${side}/${f}`);
+    }
+    // No retired-identity codex credential survives under the conflict dir; work's does.
+    expect(preserved.filter((p) => p.includes("old-team"))).toEqual([]);
+    expect(preserved.filter((p) => p.includes("work") && p.endsWith("auth.json")).length).toBe(1);
+    // The retired zai crush.json copy is kept without its api key.
+    const crushCopies = preserved.filter((p) => p.includes("old-zai"));
+    expect(crushCopies.length).toBe(1);
+    const copy = await Bun.file(join(conflictRoot, crushCopies[0]!)).json();
+    expect(copy.providers.zai.api_key).toBeUndefined();
+    expect(copy.providers.zai.base_url).toBe("https://example.invalid");
+  });
+  }
+
+  test("uses an injected purge", async () => {
+    const home = await makeDir("ais-tree-retired-inject-");
+    const incoming = await makeDir("ais-tree-retired-inject-in-");
+    await write(
+      join(home, ".codex", "identities.json"),
+      JSON.stringify({
+        version: 1,
+        identities: [
+          {
+            name: "old-team",
+            label: "Old",
+            configDir: join(home, ".codex", "identities", "old-team"),
+            retired: true,
+            retiredAt: "2026-02-01T00:00:00.000Z",
+          },
+        ],
+      }),
+    );
+    const seen: string[] = [];
+    await mergeIncomingProfileTree(incoming, { kind: "identity", cfg: codexConfig(home), identityName: "old-team" }, {
+      home,
+      purgeRetired: async (opts) => {
+        seen.push(`${opts.toolName}:${opts.identity.name}`);
+        return { removed: [], warnings: [] };
+      },
+    });
+    expect(seen).toEqual(["codex:old-team"]);
+  });
+});
+

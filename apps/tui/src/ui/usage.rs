@@ -77,7 +77,7 @@ pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn result_row(result: &UsageResult) -> Row<'static> {
-    let identity = result.identity.name().to_string();
+    let identity = result.identity.display_name();
     let provider = result
         .provider
         .clone()

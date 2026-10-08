@@ -19,6 +19,14 @@ import { runWebCommand } from "./web.ts";
 import { runHerdrCommand } from "./herdr.ts";
 import { runTuiCommand } from "./tui.ts";
 
+/** Commands that kick off the detached background sync. `identities retire`
+ * and `unretire` are excluded: a sync merging the remote registry while the
+ * command saves its own change could race the write and undo the retirement. */
+export function wantsAutoBackgroundSync(command: string | undefined, rest: string[]): boolean {
+  if (command === undefined || !["identities", "usage", "limits", "doctor"].includes(command)) return false;
+  return !(command === "identities" && (rest[0] === "retire" || rest[0] === "unretire"));
+}
+
 export async function runCli(argv: string[]): Promise<void> {
   const { positionals, flags } = parseArgs(argv);
   const [command, ...rest] = positionals;
@@ -46,8 +54,7 @@ export async function runCli(argv: string[]): Promise<void> {
     // worker `startBackgroundProfileSync` already uses elsewhere, and to say
     // so out loud (stderr, so `--json` output stays clean) rather than
     // leaving reconciliation silently running after this process exits.
-    const syncAware = new Set(["identities", "usage", "limits", "doctor"]);
-    if (syncAware.has(command)) {
+    if (wantsAutoBackgroundSync(command, rest)) {
       const started = startBackgroundProfileSync({ direction: "both", scope: { kind: "all" } });
       if (started) {
         console.error('ais sync: reconciling with configured SSH remotes in the background (run "ais sync now" to wait for it directly).');

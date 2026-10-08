@@ -3,7 +3,9 @@ import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { requireTool } from "./registries.ts";
+import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
+import { credentialPathsForTool } from "../identities/credential-paths.ts";
 import { readAliApiKey, writeAliAuthFile } from "../identities/ali-auth.ts";
 import { readZaiApiKey, writeZaiAuthFile } from "../identities/zai-auth.ts";
 import { withUsableCwd } from "../shared/exec.ts";
@@ -40,32 +42,9 @@ function exists(path: string): Promise<boolean> {
     .catch(() => false);
 }
 
-/** Every on-disk file that constitutes "credentials" for a tool identity.
- * The single source of truth shared by the status probes and the login
- * flow manager's callback detection, so the two can never drift. */
-export function credentialPathsForTool(toolName: ToolConfig["toolName"], configDir: string): string[] {
-  switch (toolName) {
-    case "claude":
-      return [join(configDir, ".credentials.json")];
-    case "codex":
-      return [join(configDir, "auth.json")];
-    case "grok":
-      return ["credentials.json", "auth.json", "auth.toml"].map((name) => join(configDir, name));
-    case "kimi":
-      return [join(configDir, "credentials", "kimi-code.json")];
-    case "pi":
-      return [join(configDir, "auth.json")];
-    case "opencode":
-      // XDG_DATA_HOME points at <configDir>/data (tool-configs.ts), and
-      // opencode appends its own /opencode segment: auth.json lives under
-      // data/opencode/.
-      return [join(configDir, "data", "opencode", "auth.json"), join(configDir, "opencode", "auth.json")];
-    default:
-      // zai (crush.json provider key) and ali (console-cookie.txt) are
-      // handled by their own probes; nothing else to watch.
-      return [];
-  }
-}
+// The path list lives with the identities engine so credential purging on
+// retirement shares it; re-exported here for the status probes and login flows.
+export { credentialPathsForTool };
 
 /** Expires-in state mapping shared by every probe with a known expiry. */
 function stateFromExpiry(expiresAtMs: number): { state: AuthEntryDto["state"]; detail: string } {
@@ -290,6 +269,19 @@ export async function authStatus(
   const entries: AuthEntryDto[] = [];
   for (const { cfg, file } of loaded) {
     for (const identity of file.identities) {
+      // Retired identities are never probed (no file reads, no refresh
+      // lookups): they report a terminal "retired" state with no fixes.
+      if (isRetired(identity)) {
+        entries.push({
+          toolName: cfg.toolName,
+          identity: identity.name,
+          kind: "none",
+          state: "retired",
+          detail: "retired: credentials removed; unretire and log in again to use it",
+          fixable: [],
+        });
+        continue;
+      }
       let result: ProbeResult;
       try {
         switch (cfg.toolName) {
@@ -348,6 +340,7 @@ async function registryIdentity(toolName: ToolConfig["toolName"], identityName: 
   const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
   const identity = findIdentityByNameOrAlias(file.identities, identityName);
   if (!identity) throw new HttpError(404, `identity "${identityName}" not found in ${toolName}'s registry`);
+  if (isRetired(identity)) throw new HttpError(409, `identity "${identityName}" is retired; unretire it first`);
   return { cfg, configDir: identity.configDir };
 }
 

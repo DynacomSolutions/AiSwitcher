@@ -39,6 +39,9 @@ export async function resolveGuardAccounts(
   const loaded = await loadAll(configs);
   for (const { cfg, file } of loaded) {
     for (const identity of file.identities) {
+      // Retired identities stay in the account: their local month-to-date
+      // spend still counts toward the shared account total. Live remote
+      // calls are skipped for accounts with no active identity (compute.ts).
       let target;
       try {
         target = resolveAwsProfileForIdentity(identity, awsProfileDeps);

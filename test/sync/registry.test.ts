@@ -147,3 +147,60 @@ describe("mergeRegistryConflict", () => {
     });
   });
 });
+
+describe("mergeRegistryConflict retirement", () => {
+  async function merge(
+    live: Record<string, unknown>,
+    previous: Record<string, unknown>,
+    liveIsNewer: boolean,
+  ): Promise<Record<string, unknown>> {
+    const dir = await mkdtemp(join(tmpdir(), "ais-registry-retire-"));
+    tempDirs.push(dir);
+    const livePath = join(dir, "live.json");
+    const previousPath = join(dir, "previous.json");
+    const wrap = (identity: Record<string, unknown>) =>
+      JSON.stringify({ version: 1, identities: [{ name: "old-team", label: "Old", configDir: "~/.codex/identities/old-team", ...identity }] });
+    await Bun.write(livePath, wrap(live));
+    await Bun.write(previousPath, wrap(previous));
+    await utimes(previousPath, new Date(liveIsNewer ? 1_000 : 2_000), new Date(liveIsNewer ? 1_000 : 2_000));
+    await utimes(livePath, new Date(liveIsNewer ? 2_000 : 1_000), new Date(liveIsNewer ? 2_000 : 1_000));
+    await mergeRegistryConflict(livePath, previousPath);
+    return (await Bun.file(livePath).json()).identities[0];
+  }
+
+  const retired = { retired: true, retiredAt: "2026-03-01T00:00:00.000Z" };
+
+  test("a retirement on the older file is not resurrected by a newer unrelated edit", async () => {
+    const merged = await merge({ label: "Renamed" }, retired, true);
+    expect(merged).toMatchObject({ label: "Renamed", retired: true, retiredAt: retired.retiredAt });
+    const reverse = await merge(retired, { label: "Renamed" }, false);
+    expect(reverse).toMatchObject({ retired: true, retiredAt: retired.retiredAt });
+  });
+
+  test("a newer unretire wins and removes the retired fields", async () => {
+    const unretired = { unretiredAt: "2026-04-01T00:00:00.000Z" };
+    // Primary (newer file) holds the older retirement; secondary holds the newer unretire.
+    const merged = await merge(retired, unretired, true);
+    expect(merged.retired).toBeUndefined();
+    expect(merged.retiredAt).toBeUndefined();
+    expect(merged.unretiredAt).toBe(unretired.unretiredAt);
+  });
+
+  test("a newer retire after an older unretire wins and drops unretiredAt", async () => {
+    const merged = await merge(
+      { unretiredAt: "2026-02-01T00:00:00.000Z" },
+      { retired: true, retiredAt: "2026-05-01T00:00:00.000Z" },
+      true,
+    );
+    expect(merged).toMatchObject({ retired: true, retiredAt: "2026-05-01T00:00:00.000Z" });
+    expect(merged.unretiredAt).toBeUndefined();
+  });
+
+  test("with no events on either side nothing is added", async () => {
+    const merged = await merge({}, {}, true);
+    expect(merged.retired).toBeUndefined();
+    expect(merged.retiredAt).toBeUndefined();
+    expect(merged.unretiredAt).toBeUndefined();
+  });
+});
+

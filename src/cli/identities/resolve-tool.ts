@@ -80,7 +80,8 @@ export async function resolveMutationTarget(
   configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
 ): Promise<LoadedFile> {
   const explicit = toolConfigFromFlag(flags);
-  if (explicit) return loadOne(explicit);
+  // Honour injected configs (tests) for the named tool; real callers pass the defaults.
+  if (explicit) return loadOne(configs.find((c) => c.toolName === explicit.toolName) ?? explicit);
 
   const loaded = await loadAll(configs);
   const matches = loaded.filter((l) => findIdentityByNameOrAlias(l.file.identities, name));

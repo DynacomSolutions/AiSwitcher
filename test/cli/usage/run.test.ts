@@ -7,6 +7,7 @@ import {
   aggregateUsageResults,
   collectTargets,
   providerReportsFromTokscale,
+  runUsageQueryForTargets,
   usageResultsForJson,
   type UsageResult,
 } from "../../../src/cli/usage/run.ts";
@@ -234,5 +235,78 @@ describe("source-only error results", () => {
     expect(json).not.toHaveProperty("sourceOnlyError");
     expect(json).not.toHaveProperty("sourceTool");
     expect(json?.error).toBe("boom");
+  });
+});
+
+describe("retired identities", () => {
+  const emptyReport: TokscaleReport = {
+    entries: [],
+    totalInput: 10,
+    totalOutput: 5,
+    totalCacheRead: 0,
+    totalCacheWrite: 0,
+    totalMessages: 3,
+    totalCost: 0.5,
+  };
+
+  test("collectTargets keeps retired identities", async () => {
+    const claude = await makeRegistry("claude", [
+      { name: "gone", label: "Gone", configDir: "/tmp/does-not-exist/gone", retired: true, retiredAt: "2026-10-01T00:00:00.000Z" },
+      { name: "live", label: "Live", configDir: "/tmp/does-not-exist/live" },
+    ]);
+    const targets = await collectTargets({}, [claude]);
+    expect(targets.map((t) => t.identity.name).sort()).toEqual(["gone", "live"]);
+    expect(await collectTargets({ identity: "gone" }, [claude])).toHaveLength(1);
+  });
+
+  test("a retired claude identity is reported from local logs without the live extra-cost call", async () => {
+    const identity = { name: "gone", label: "Gone", configDir: "/tmp/does-not-exist/gone", retired: true };
+    const active = { name: "live", label: "Live", configDir: "/tmp/does-not-exist/live" };
+    const extraCostCalls: string[] = [];
+    const results = await runUsageQueryForTargets(
+      [
+        { toolName: "claude", identity },
+        { toolName: "claude", identity: active },
+      ],
+      {
+        deps: {
+          runTokscale: async (target) => providerReportsFromTokscale(target, { ...emptyReport, entries: [{ client: "claude", model: "m", provider: "anthropic", input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 3, cost: 0.5 }] }),
+          fetchExtraCost: async (_tool, id) => {
+            extraCostCalls.push(id.name);
+            return { active: false, label: "none" } as never;
+          },
+          fetchTokscaleDailyUsage: async () => undefined,
+        },
+      },
+    );
+    expect(results.map((r) => r.identity.name).sort()).toEqual(["gone", "live"]);
+    expect(results.find((r) => r.identity.name === "gone")?.report?.totalMessages).toBe(3);
+    expect(results.find((r) => r.identity.name === "gone")?.extraCost).toBeUndefined();
+    expect(extraCostCalls).toEqual(["live"]);
+  });
+
+  test("a retired Bedrock identity never reaches AWS and yields no error", async () => {
+    const identity = { name: "gone-bedrock", label: "Gone", configDir: "/tmp/does-not-exist/gone-bedrock", retired: true, env: { CLAUDE_CODE_USE_BEDROCK: "1" } };
+    const seen: unknown[] = [];
+    const results = await runUsageQueryForTargets([{ toolName: "codex", identity }], {
+      deps: {
+        fetchAwsBedrockUsage: async (_id, options) => {
+          seen.push(options);
+          return { report: emptyReport };
+        },
+      },
+    });
+    expect(seen).toEqual([{ localTool: "codex", localOnly: true }]);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.error).toBeUndefined();
+    expect(results[0]?.realCost).toBeUndefined();
+    expect(results[0]?.report?.totalMessages).toBe(3);
+  });
+
+  test("JSON output carries the retired flag", () => {
+    const rows = usageResultsForJson([
+      { provider: "anthropic", identity: { name: "gone", label: "Gone", configDir: "/x", retired: true }, report: emptyReport },
+    ]) as Array<{ identity: { retired?: boolean } }>;
+    expect(rows[0]?.identity.retired).toBe(true);
   });
 });

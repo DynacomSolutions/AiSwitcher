@@ -93,6 +93,12 @@ export function AuthStateBadge({ state, className }: { state: AuthState; classNa
           Not logged in
         </Badge>
       );
+    case "retired":
+      return (
+        <Badge variant="muted" className={className}>
+          Retired
+        </Badge>
+      );
     default:
       return (
         <Badge variant="secondary" className={className}>

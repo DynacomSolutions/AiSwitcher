@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
+import { isRetired } from "../identities/retired.ts";
+import { loadIdentitiesFile } from "../identities/store.ts";
 import { resolveHerdrBinary } from "../shared/herdr-bin.ts";
 import { readProcessEnviron, type EnvironAttribution } from "./processes.ts";
 import { runScanIsolated } from "./workers.ts";
@@ -422,10 +424,31 @@ export interface HerdrBridgeSchedulerDeps {
   /** Limits for one identity name: the results array of the /api/limits
    * envelope shape (or anything tolerable to windowsForIdentity). */
   fetchLimits?: (identity: string) => Promise<unknown>;
+  /** True when the named identity (for the pane's tool) is retired, so no
+   * live limits lookup is made for it. Default: the on-disk registries. */
+  isRetiredIdentity?: (identity: string, tool: string | undefined) => Promise<boolean>;
   /** The metadata write. Default: the real report-metadata CLI call. */
   push?: (paneId: string, args: string[]) => Promise<HerdrCommandResult>;
   now?: () => Date;
   log?: (message: string) => void;
+}
+
+async function defaultIsRetiredIdentity(identity: string, tool: string | undefined): Promise<boolean> {
+  const all = Object.values(TOOL_CONFIGS);
+  // Unknown tool: retired only when no registry holds an active identity of that name.
+  const configs = tool ? all.filter((cfg) => cfg.toolName === tool) : all;
+  let retired = false;
+  for (const cfg of configs) {
+    try {
+      const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
+      const found = file.identities.find((i) => i.name === identity);
+      if (found && !isRetired(found)) return false;
+      if (found) retired = true;
+    } catch {
+      // Unreadable registry: treat as not retired (no guessing).
+    }
+  }
+  return retired;
 }
 
 function firstLine(text: string): string {
@@ -612,8 +635,18 @@ export class HerdrBridgeScheduler {
 
     // (c) Limits for exactly the affected identities (shared TTL cache).
     const limitsByIdentity = new Map<string, unknown>();
-    for (const identity of new Set(attributed.map((a) => a.identity))) {
-      limitsByIdentity.set(identity, await (this.deps.fetchLimits ?? defaultFetchLimits())(identity));
+    // Retired identities are skipped: no live provider call for them.
+    const isRetiredIdentity = this.deps.isRetiredIdentity ?? defaultIsRetiredIdentity;
+    const limitsFetcher = this.deps.fetchLimits ?? defaultFetchLimits();
+    const seen = new Set<string>();
+    for (const { identity, tool } of attributed) {
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      if (await isRetiredIdentity(identity, tool)) {
+        limitsByIdentity.set(identity, []);
+        continue;
+      }
+      limitsByIdentity.set(identity, await limitsFetcher(identity));
     }
 
     // (d) Tokens per pane + the status DTO.

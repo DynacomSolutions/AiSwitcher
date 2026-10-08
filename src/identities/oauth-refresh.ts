@@ -12,6 +12,7 @@ import {
 } from "./oauth-reconcile.ts";
 import { expandPath } from "./match.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "./store.ts";
+import { isRetired } from "./retired.ts";
 import { PI_CONFIG } from "./tool-configs.ts";
 import type { Identity } from "./types.ts";
 import { persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
@@ -221,7 +222,9 @@ async function piIdentityFor(identityName: string): Promise<Identity | undefined
   try {
     const file = await loadIdentitiesFile(PI_CONFIG.identitiesJsonPath);
     const found = findIdentityByNameOrAlias(file.identities, identityName);
-    return found ? { ...found, configDir: expandPath(found.configDir) } : undefined;
+    // A retired pi identity's store is never written (one-credential law
+    // covers live identities only).
+    return found && !isRetired(found) ? { ...found, configDir: expandPath(found.configDir) } : undefined;
   } catch {
     return undefined;
   }
@@ -247,6 +250,8 @@ export async function writeGrantThroughStores(
 ): Promise<WriteThroughReport> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
+  // Never write into a retired identity's stores (its credentials were purged).
+  if (isRetired(identity)) return { written, failed };
   if (tool === "kimi") {
     const credentials: KimiOAuthCredentials = {
       access_token: grant.access_token,
@@ -394,6 +399,10 @@ export async function refreshIdentityOAuthGrant(
   const base: IdentityGrantRefresh = { tool, identity: identity.name, outcome: "failed", detail: "", written: [], writeFailures: [] };
   const now = options.now ?? Date.now;
   const nowSeconds = () => Math.floor(now() / 1000);
+
+  if (isRetired(identity)) {
+    return { ...base, outcome: "no-grant", detail: "identity is retired - not refreshing; unretire it and log in again" };
+  }
 
   const freshest = await freshestGrant(tool, identity).catch(() => undefined);
   if (!freshest || !freshest.grant.refresh_token) {
@@ -578,6 +587,7 @@ export async function reconcileOnceForFetch(
   tool: NativeReconcilableTool,
   identity: Identity,
 ): Promise<{ healed: boolean; detail?: string }> {
+  if (isRetired(identity)) return { healed: false };
   try {
     const entry = await reconcileNativeProviderStores(tool, identity, { write: true });
     const healed = entry.status === "rewrote-native" || entry.status === "rewrote-pi";
