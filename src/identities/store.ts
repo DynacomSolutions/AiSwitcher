@@ -44,6 +44,15 @@ function validateIdentity(identity: unknown, index: number): asserts identity is
       throw new InvalidIdentitiesFileError(`identity "${rec.name}" has an invalid "colour" (use #rgb or #rrggbb)`);
     }
   }
+  if (rec.retired !== undefined && typeof rec.retired !== "boolean") {
+    throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-boolean "retired"`);
+  }
+  for (const key of ["retiredAt", "unretiredAt"] as const) {
+    const value = rec[key];
+    if (value !== undefined && (typeof value !== "string" || Number.isNaN(Date.parse(value)))) {
+      throw new InvalidIdentitiesFileError(`identity "${rec.name}" has an invalid "${key}" (use an ISO 8601 timestamp)`);
+    }
+  }
   if (rec.env !== undefined) {
     if (typeof rec.env !== "object" || rec.env === null || Array.isArray(rec.env)) {
       throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-object "env"`);

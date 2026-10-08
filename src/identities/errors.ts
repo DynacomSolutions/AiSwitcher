@@ -19,6 +19,15 @@ export class UnknownIdentityError extends IdentityResolutionError {
   }
 }
 
+export class RetiredIdentityError extends IdentityResolutionError {
+  constructor(toolName: string, identity: { name: string; retiredAt?: string }) {
+    super(
+      "RETIRED_IDENTITY",
+      `identity "${identity.name}" for ${toolName} is retired (since ${identity.retiredAt ?? "an unknown date"}) and cannot be used. Run "ais identities unretire ${identity.name} --tool=${toolName}" to restore it.`,
+    );
+  }
+}
+
 export class InvalidIdentitiesFileError extends IdentityResolutionError {
   constructor(message: string) {
     super("INVALID_IDENTITIES_FILE", message);
