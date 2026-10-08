@@ -17,8 +17,7 @@ import { performSwap } from "./claude-swap.ts";
 // real identity name, and it keeps clack's select() value type a plain
 // string (a Symbol value forced awkward type-widening at the call site).
 const CREATE_NEW = "__create_new_identity__";
-const POOLS = "__claude_pools__";
-const POOL_PREFIX = "__pool__:";
+const POOLS = "__claude_pools__"; // row on the Identities screen that opens the Claude Pools screen
 
 export interface PromptDeps {
   /** Makes `member` the active account of `pool` (manual reason). */
@@ -85,15 +84,15 @@ export async function promptForIdentity(
 
     for (;;) {
       const choice = await clack.select({
-        message: "Select an identity to use",
+        message: "Identities",
         options: [
           ...plain.map((identity) => ({
             value: identity.name,
             label: identity.label,
             hint: identity.description,
           })),
-          ...(pools.length > 0 ? [{ value: POOLS, label: "Claude Pools" }] : []),
           { value: CREATE_NEW, label: "+ Create new identity" },
+          ...(pools.length > 0 ? [{ value: POOLS, label: "Go to Claude Pools >" }] : []),
         ],
         ...(initialValue !== undefined ? { initialValue } : {}),
         signal: controller.signal,
@@ -119,7 +118,7 @@ export async function promptForIdentity(
       }
 
       if (choice === POOLS) {
-        const pool = await pickPoolMember(pools, (name) => active.find((i) => i.name === name)?.label ?? name, deps, controller.signal, () => timedOut, timeoutMs, cfg);
+        const pool = await pickPoolMember(pools, remembered, (name) => active.find((i) => i.name === name)?.label ?? name, deps, controller.signal, () => timedOut, timeoutMs, cfg);
         if (!pool) continue;
         await deps.writeLast(cfg.toolName, pool.name).catch(() => undefined);
         clack.outro(`Using identity "${pool.name}"`);
@@ -141,12 +140,13 @@ export async function promptForIdentity(
 }
 
 /**
- * Second select of the "Claude Pools" entry. Returns the pool once the chosen
- * member is active, or undefined to send the user back to the main picker
- * (disallowed member, or the switch itself failed).
+ * Separate "Claude Pools" screen: one row per member account of every pool.
+ * Returns the pool once the chosen member is active, or undefined to send the
+ * user back to the Identities screen (disallowed member, or the switch failed).
  */
 async function pickPoolMember(
   pools: Identity[],
+  remembered: string | undefined,
   labelOf: (name: string) => string,
   deps: PromptDeps,
   signal: AbortSignal,
@@ -154,35 +154,40 @@ async function pickPoolMember(
   timeoutMs: number,
   cfg: ToolConfig,
 ): Promise<Identity | undefined> {
-  let found: Identity | undefined = pools[0];
-  if (pools.length > 1) {
-    const picked = await clack.select({
-      message: "Select a Claude pool",
-      options: pools.map((p) => ({ value: p.name, label: p.label, hint: p.description })),
-      signal,
-    });
-    assertNotCancelled(picked, cfg, timedOut, timeoutMs);
-    found = pools.find((p) => p.name === picked);
+  const rows = pools.flatMap((pool) =>
+    poolMembers(pool).map((member) => ({ pool, member, value: `${pool.name}\u0000${member}` })),
+  );
+  if (rows.length === 0) {
+    clack.log.error("No Claude pool has any member accounts");
+    return undefined;
   }
-  if (!found) return undefined;
-  const pool: Identity = found;
-
-  const members = poolMembers(pool);
-  const activeMember = pool.swapPool?.active;
-  const member = await clack.select({
-    message: `Select an account for ${pool.label}`,
-    options: members.map((name) => ({
-      value: name,
-      label: labelOf(name),
-      hint: [
-        name === activeMember ? "(active)" : undefined,
-        memberAllowed(pool, name) ? undefined : "(not allowed)",
-      ].filter(Boolean).join(" ") || undefined,
+  const several = pools.length > 1;
+  const rememberedPool = pools.find((p) => p.name === remembered) ?? pools[0]!;
+  const preselect =
+    rows.find((r) => r.pool === rememberedPool && r.member === rememberedPool.swapPool?.active) ??
+    rows.find((r) => r.pool === rememberedPool) ??
+    rows[0]!;
+  const picked = await clack.select({
+    message: "Claude Pools",
+    options: rows.map((r) => ({
+      value: r.value,
+      label: labelOf(r.member),
+      hint:
+        [
+          several ? r.pool.label : undefined,
+          r.member === r.pool.swapPool?.active ? "(active)" : undefined,
+          memberAllowed(r.pool, r.member) ? undefined : "(not allowed)",
+        ]
+          .filter(Boolean)
+          .join(" ") || undefined,
     })),
-    ...(activeMember !== undefined && members.includes(activeMember) ? { initialValue: activeMember } : {}),
+    initialValue: preselect.value,
     signal,
   });
-  assertNotCancelled(member, cfg, timedOut, timeoutMs);
+  assertNotCancelled(picked, cfg, timedOut, timeoutMs);
+  const row = rows.find((r) => r.value === picked);
+  if (!row) return undefined;
+  const { pool, member } = row;
 
   if (!memberAllowed(pool, member)) {
     clack.log.error(`Account "${member}" is not allowed in pool "${pool.name}"`);
