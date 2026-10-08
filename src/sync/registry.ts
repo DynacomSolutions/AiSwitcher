@@ -105,7 +105,23 @@ function mergeRetirement(merged: Identity, primary: Identity, secondary: Identit
   }
 }
 
-function mergeIdentity(primary: Identity, secondary: Identity): Identity {
+/** Swap pool config: the primary side's settings win (auto, threshold,
+ * disallowed, active), but the account lists are unioned so a member added
+ * on either host survives. `active` is host-local state; the primary's is
+ * kept, falling back to the secondary's only when the primary has none. */
+function mergeSwapPool(merged: Identity, primary: Identity, secondary: Identity): void {
+  if (!primary.swapPool && !secondary.swapPool) return;
+  if (!primary.swapPool || !secondary.swapPool) {
+    merged.swapPool = { ...(primary.swapPool ?? secondary.swapPool!) };
+    return;
+  }
+  const accounts = mergeStrings(primary.swapPool.accounts, secondary.swapPool.accounts) ?? [];
+  const next = { ...secondary.swapPool, ...primary.swapPool, accounts };
+  if (primary.swapPool.active === undefined && secondary.swapPool.active !== undefined) next.active = secondary.swapPool.active;
+  merged.swapPool = next;
+}
+
+export function mergeIdentity(primary: Identity, secondary: Identity): Identity {
   const merged: Identity = {
     ...secondary,
     ...primary,
@@ -113,6 +129,7 @@ function mergeIdentity(primary: Identity, secondary: Identity): Identity {
     aliases: mergeStrings(primary.aliases, secondary.aliases),
   };
   mergeRetirement(merged, primary, secondary);
+  mergeSwapPool(merged, primary, secondary);
   return merged;
 }
 

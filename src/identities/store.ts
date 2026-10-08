@@ -5,6 +5,49 @@ import { InvalidIdentitiesFileError } from "./errors.ts";
 import { isValidIdentityColour } from "./colour.ts";
 import { expandPath, parseDirectoryPattern } from "./match.ts";
 
+/** Structural validation only. Whether members exist, are claude identities,
+ * are not retired and are not pools themselves depends on the OTHER
+ * identities and is checked by identities/swap-pool.ts at the points that
+ * need it, so a later retire of a member never makes the registry unloadable. */
+function validateSwapPool(value: unknown, owner: string): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new InvalidIdentitiesFileError(`identity "${owner}" has a non-object "swapPool"`);
+  }
+  const pool = value as Record<string, unknown>;
+  const names = (key: string): string[] | undefined => {
+    const raw = pool[key];
+    if (raw === undefined) return undefined;
+    if (!Array.isArray(raw) || raw.some((a) => typeof a !== "string" || !a)) {
+      throw new InvalidIdentitiesFileError(`identity "${owner}" has a non-string[] "swapPool.${key}"`);
+    }
+    return raw as string[];
+  };
+  const accounts = names("accounts");
+  if (!accounts) throw new InvalidIdentitiesFileError(`identity "${owner}" swapPool is missing "accounts"`);
+  if (new Set(accounts).size !== accounts.length) {
+    throw new InvalidIdentitiesFileError(`identity "${owner}" swapPool.accounts has duplicates`);
+  }
+  if (accounts.includes(owner)) {
+    throw new InvalidIdentitiesFileError(`identity "${owner}" lists itself in swapPool.accounts`);
+  }
+  if (pool.active !== undefined && (typeof pool.active !== "string" || !accounts.includes(pool.active))) {
+    throw new InvalidIdentitiesFileError(`identity "${owner}" swapPool.active must be one of swapPool.accounts`);
+  }
+  const disallowed = names("disallowed");
+  if (disallowed?.some((name) => !accounts.includes(name))) {
+    throw new InvalidIdentitiesFileError(`identity "${owner}" swapPool.disallowed must be a subset of swapPool.accounts`);
+  }
+  if (pool.auto !== undefined && typeof pool.auto !== "boolean") {
+    throw new InvalidIdentitiesFileError(`identity "${owner}" has a non-boolean "swapPool.auto"`);
+  }
+  if (pool.thresholdPercent !== undefined) {
+    const t = pool.thresholdPercent;
+    if (typeof t !== "number" || !Number.isFinite(t) || t < 1 || t > 100) {
+      throw new InvalidIdentitiesFileError(`identity "${owner}" swapPool.thresholdPercent must be a number from 1 to 100`);
+    }
+  }
+}
+
 function validateIdentity(identity: unknown, index: number): asserts identity is Identity {
   if (typeof identity !== "object" || identity === null) {
     throw new InvalidIdentitiesFileError(`identities[${index}] is not an object`);
@@ -53,6 +96,7 @@ function validateIdentity(identity: unknown, index: number): asserts identity is
       throw new InvalidIdentitiesFileError(`identity "${rec.name}" has an invalid "${key}" (use an ISO 8601 timestamp)`);
     }
   }
+  if (rec.swapPool !== undefined) validateSwapPool(rec.swapPool, String(rec.name));
   if (rec.env !== undefined) {
     if (typeof rec.env !== "object" || rec.env === null || Array.isArray(rec.env)) {
       throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-object "env"`);

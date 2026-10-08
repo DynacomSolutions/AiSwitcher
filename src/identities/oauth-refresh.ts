@@ -13,7 +13,9 @@ import {
 import { expandPath } from "./match.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "./store.ts";
 import { isRetired } from "./retired.ts";
-import { PI_CONFIG } from "./tool-configs.ts";
+import { CLAUDE_CONFIG, PI_CONFIG } from "./tool-configs.ts";
+import { isSwapPool, poolsHoldingMember } from "./swap-pool.ts";
+import { withOauthRefreshLock } from "./claude-swap-lock.ts";
 import type { Identity } from "./types.ts";
 import { persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
 import { refreshKimiOAuthToken } from "../cli/limits/kimi-limits.ts";
@@ -218,6 +220,20 @@ export interface WriteThroughReport {
   failed: Array<{ path: string; error: string }>;
 }
 
+/** Pool configDirs that currently hold `identity`'s grant (claude swap
+ * pools whose active member it is). While a member is active in a pool,
+ * the pool's .credentials.json is just another store of the same grant, so
+ * every refresh must write through to it and every freshest-copy pick must
+ * consider it; otherwise the daemon would fork the rotating refresh token. */
+export async function poolStoreDirsFor(identity: Identity, registryPath?: string): Promise<string[]> {
+  try {
+    const file = await loadIdentitiesFile(registryPath ?? CLAUDE_CONFIG.identitiesJsonPath);
+    return poolsHoldingMember(file, identity.name).map((pool) => pool.configDir);
+  } catch {
+    return [];
+  }
+}
+
 async function piIdentityFor(identityName: string): Promise<Identity | undefined> {
   try {
     const file = await loadIdentitiesFile(PI_CONFIG.identitiesJsonPath);
@@ -246,7 +262,7 @@ export async function writeGrantThroughStores(
   tool: RefreshableTool,
   identity: Identity,
   grant: OAuthGrant,
-  options: { entryKey?: string; piDir?: string } = {},
+  options: { entryKey?: string; piDir?: string; claudeRegistryPath?: string } = {},
 ): Promise<WriteThroughReport> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
@@ -273,6 +289,16 @@ export async function writeGrantThroughStores(
     written.push(`native:${identity.configDir}`);
   } catch (err) {
     failed.push({ path: `native:${identity.configDir}`, error: err instanceof Error ? err.message : String(err) });
+  }
+  if (tool === "claude") {
+    for (const poolDir of await poolStoreDirsFor(identity, options.claudeRegistryPath)) {
+      try {
+        await withOauthRefreshLock(poolDir, () => writeProviderGrantCopy("claude", poolDir, grant, { backups }));
+        written.push(`pool:${poolDir}`);
+      } catch (err) {
+        failed.push({ path: `pool:${poolDir}`, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
   }
   const piDir = options.piDir ?? (await piIdentityFor(identity.name))?.configDir;
   if (piDir) {
@@ -319,10 +345,61 @@ export function shouldAttemptOAuthRefresh(
 
 export const DEFAULT_EXPIRY_WINDOW_HOURS = 24;
 
+/** claude member that is active in a swap pool: the freshest of its own
+ * store and the pool store(s). Undefined when no pool holds it (the normal
+ * path then applies unchanged). */
+async function freshestWithPools(
+  identity: Identity,
+  registryPath?: string,
+): Promise<{ grant: OAuthGrant; entryKey?: string; rawEntry?: Record<string, unknown>; source: string } | undefined> {
+  const poolDirs = await poolStoreDirsFor(identity, registryPath);
+  if (poolDirs.length === 0) return undefined;
+  const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
+  let best = await readProviderGrantCopy("claude", identity.configDir);
+  for (const dir of poolDirs) {
+    const copy = await readProviderGrantCopy("claude", dir);
+    if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
+  }
+  return best ? { grant: best.grant, source: `claude store:${best.path}` } : undefined;
+}
+
+/** Makes the member's own store and every pool store hold the same (freshest)
+ * grant. Claude Code refreshing inside the pool, or a standalone session of
+ * the member refreshing its own file, both rotate the refresh token; this
+ * propagates whichever is newer. Returns the stores written. */
+export async function convergeClaudePoolStores(
+  identity: Identity,
+  registryPath?: string,
+): Promise<{ written: string[]; failed: Array<{ path: string; error: string }> }> {
+  const written: string[] = [];
+  const failed: Array<{ path: string; error: string }> = [];
+  const poolDirs = await poolStoreDirsFor(identity, registryPath);
+  if (poolDirs.length === 0) return { written, failed };
+  const dirs = [identity.configDir, ...poolDirs];
+  const copies = await Promise.all(dirs.map((dir) => readProviderGrantCopy("claude", dir)));
+  const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
+  let best: { grant: OAuthGrant } | undefined;
+  for (const copy of copies) if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
+  if (!best) return { written, failed };
+  const fp = grantFingerprint(best.grant);
+  for (let i = 0; i < dirs.length; i++) {
+    const copy = copies[i];
+    if (copy && grantFingerprint(copy.grant) === fp && copy.grant.access_token === best.grant.access_token) continue;
+    try {
+      await withOauthRefreshLock(dirs[i]!, () => writeProviderGrantCopy("claude", dirs[i]!, best!.grant));
+      written.push(dirs[i]!);
+    } catch (err) {
+      failed.push({ path: dirs[i]!, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { written, failed };
+}
+
 /** Where the freshest refreshable copy of an identity's grant lives. */
 async function freshestGrant(
   tool: RefreshableTool,
   identity: Identity,
+  claudeRegistryPath?: string,
 ): Promise<{ grant: OAuthGrant; entryKey?: string; rawEntry?: Record<string, unknown>; source: string } | undefined> {
   if (tool === "kimi") {
     const credentials = await readFreshestKimiCredentials(identity, "kimi");
@@ -335,6 +412,10 @@ async function freshestGrant(
       },
       source: "kimi stores (freshest)",
     };
+  }
+  if (tool === "claude") {
+    const pooled = await freshestWithPools(identity, claudeRegistryPath);
+    if (pooled) return pooled;
   }
   const piDir = (await piIdentityFor(identity.name))?.configDir;
   let piGrant: OAuthGrant | undefined;
@@ -384,6 +465,8 @@ export interface OAuthRefreshOptions {
   lastSuccessAt?: string | null;
   fetchImpl?: FetchImpl;
   now?: () => number;
+  /** Test hook: claude registry that lists swap pools. */
+  claudeRegistryPath?: string;
 }
 
 /** Refreshes one identity's OAuth grant for one tool: picks the freshest
@@ -404,7 +487,16 @@ export async function refreshIdentityOAuthGrant(
     return { ...base, outcome: "no-grant", detail: "identity is retired - not refreshing; unretire it and log in again" };
   }
 
-  const freshest = await freshestGrant(tool, identity).catch(() => undefined);
+  if (tool === "claude" && isSwapPool(identity)) {
+    return {
+      ...base,
+      outcome: "no-grant",
+      detail: "claude swap pool: its credentials are a copy of the active member's grant and are refreshed through that member",
+    };
+  }
+  if (tool === "claude") await convergeClaudePoolStores(identity, options.claudeRegistryPath).catch(() => undefined);
+
+  const freshest = await freshestGrant(tool, identity, options.claudeRegistryPath).catch(() => undefined);
   if (!freshest || !freshest.grant.refresh_token) {
     return {
       ...base,
@@ -489,6 +581,7 @@ export async function refreshIdentityOAuthGrant(
   const afterFingerprint = grantFingerprint(grant);
   const writeThrough = await writeGrantThroughStores(tool, identity, grant, {
     entryKey: freshest.entryKey,
+    ...(options.claudeRegistryPath ? { claudeRegistryPath: options.claudeRegistryPath } : {}),
   });
   const wrote = writeThrough.written.length > 0;
   return {

@@ -5,6 +5,7 @@ import { createApp } from "./app.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
 import { loadHerdrBridgeConfig, HerdrBridgeScheduler } from "./herdr-bridge.ts";
+import { ClaudeSwapScheduler } from "./claude-swap-auto.ts";
 import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
@@ -103,6 +104,15 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     herdrBridge.start();
   }
 
+  // Daemon-side claude swap pools: automatic limit-triggered credential swap
+  // for pools with auto on. AIS_CLAUDE_SWAP=0 opts the daemon out entirely
+  // (the CLI and launch check are unaffected).
+  let claudeSwap: ClaudeSwapScheduler | undefined;
+  if (process.env.AIS_CLAUDE_SWAP !== "0") {
+    claudeSwap = new ClaudeSwapScheduler();
+    claudeSwap.start();
+  }
+
   const token = newConsoleToken();
   const deps: ConsoleAppDeps = {
     token,
@@ -112,6 +122,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     authRefresh: scheduler,
     ...(spendGuard ? { spendGuard } : {}),
     ...(herdrBridge ? { herdrBridge } : {}),
+    ...(claudeSwap ? { claudeSwap } : {}),
     loginFlows,
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
@@ -156,6 +167,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
       scheduler.stop();
       spendGuard?.stop();
       herdrBridge?.stop();
+      claudeSwap?.stop();
       loginFlows.stop();
       void clearServerState();
       server.stop(true);
@@ -180,7 +192,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     }
   }
 
-  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); loginFlows.stop(); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); loginFlows.stop(); server.stop(true); } };
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this

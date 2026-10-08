@@ -12,6 +12,8 @@ import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { type AuthRefreshScheduler } from "./auth-refresh.ts";
 import { type SpendGuardScheduler } from "./spend-guard.ts";
 import { type HerdrBridgeScheduler } from "./herdr-bridge.ts";
+import { type ClaudeSwapScheduler } from "./claude-swap-auto.ts";
+import { poolStatus } from "../identities/claude-swap-ops.ts";
 import { HttpError } from "./types.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
@@ -50,6 +52,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   /** Daemon-side herdr metadata bridge (per-pane limit tokens); absent in
    * bare-app tests, where /api/herdr-bridge answers 503. */
   herdrBridge?: HerdrBridgeScheduler;
+  /** Daemon-side claude swap auto scheduler; absent in bare-app tests. */
+  claudeSwap?: ClaudeSwapScheduler;
   /** Daemon-managed per-identity login flows; absent in bare-app tests. */
   loginFlows?: LoginFlowManagerLike;
 }
@@ -109,6 +113,28 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   app.get("/api/herdr-bridge", (c) => {
     if (!deps.herdrBridge) throw new HttpError(503, "herdr bridge scheduler not running");
     return c.json(deps.herdrBridge.status());
+  });
+
+  /* ----------------------------- claude swap pools -------------------------- */
+
+  // Pool members with active marker, allowed flag and live 5h/weekly use.
+  // ?pool=<name> picks a pool (optional with exactly one); ?usage=0 skips the
+  // live usage calls.
+  app.get("/api/claude-swap", async (c) => {
+    try {
+      const status = await poolStatus({}, queryValue(c, "pool"), { usage: queryValue(c, "usage") !== "0" });
+      return c.json({
+        ok: true,
+        pool: status.pool.name,
+        active: status.pool.swapPool.active ?? null,
+        auto: status.pool.swapPool.auto === true,
+        thresholdPercent: status.thresholdPercent,
+        accounts: status.rows,
+        scheduler: deps.claudeSwap ? await deps.claudeSwap.status() : null,
+      });
+    } catch (err) {
+      throw new HttpError(404, err instanceof Error ? err.message : String(err));
+    }
   });
 
   /* ------------------------------- identities ------------------------------ */

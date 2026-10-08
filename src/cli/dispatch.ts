@@ -18,6 +18,7 @@ import { runMemoryCommand } from "./memory.ts";
 import { runWebCommand } from "./web.ts";
 import { runHerdrCommand } from "./herdr.ts";
 import { runTuiCommand } from "./tui.ts";
+import { runClaudeSwapCommand } from "./claude-swap/dispatch.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
  * and `unretire` are excluded: a sync merging the remote registry while the
@@ -118,6 +119,9 @@ export async function runCli(argv: string[]): Promise<void> {
         return await runHerdrCommand(argv.slice(1));
       case "auth":
         await runAuthCommand(rest, flags);
+        break;
+      case "claude-swap":
+        await runClaudeSwapCommand(rest, flags);
         break;
       case "memory":
         await runMemoryCommand(rest, flags);

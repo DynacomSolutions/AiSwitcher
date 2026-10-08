@@ -90,3 +90,17 @@ export function aisCacheDir(home: string = homedir()): string {
 export function aisHerdrTabLabelsPath(home: string = homedir()): string {
   return join(aisHome(home), "herdr-tab-labels.json");
 }
+
+/** Machine-local operational state that is neither a cache (safe to delete)
+ * nor config: append-only ledgers and similar history. Currently the
+ * claude-swap event ledger. */
+export function aisStateDir(home: string = homedir()): string {
+  return join(aisHome(home), "state");
+}
+
+/** JSONL ledger of claude-swap events ({ts, pool, from, to, reason}). The
+ * usage attribution reads it to map transcript timestamps to the member
+ * account that was active. */
+export function aisClaudeSwapLedgerPath(home: string = homedir()): string {
+  return join(aisStateDir(home), "claude-swap.jsonl");
+}

@@ -36,7 +36,7 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "openai.com", reason: "OpenAI OAuth token endpoint (src/identities/oauth-refresh.ts)" },
   { domain: "claude.com", reason: "Anthropic platform/OAuth endpoint (src/identities/oauth-refresh.ts)" },
   { domain: "claude.ai", reason: "Anthropic's consumer product, referenced when distinguishing plan types (src/cli/limits/claude-limits.ts)" },
-  { domain: "anthropic.com", reason: "historical Anthropic OAuth endpoint referenced for context (src/identities/oauth-refresh.ts)" },
+  { domain: "anthropic.com", reason: "Anthropic API: GET /api/oauth/usage for claude swap pool limits (src/identities/claude-usage-api.ts), plus OAuth context in src/identities/oauth-refresh.ts" },
   { domain: "alibabacloud.com", reason: "Alibaba Cloud console/auth domains (src/identities/auth-session.ts, ali-limits.ts)" },
   { domain: "aliyun.com", reason: "Alibaba Cloud auth cookie domain (src/identities/auth-session.ts)" },
   { domain: "aliyuncs.com", reason: "Alibaba MaaS token-plan API (src/identities/ali-auth.ts, tool-configs.ts)" },
