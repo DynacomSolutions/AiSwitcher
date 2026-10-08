@@ -10,7 +10,7 @@ import type { IdentitiesFile, ToolConfig } from "../src/identities/types.ts";
 type SelectOpts = {
   message: string;
   initialValue?: string;
-  options: Array<{ value: string; label: string; hint?: string }>;
+  options: Array<{ value: string; label: string; hint?: string; disabled?: boolean }>;
 };
 
 let dir: string;
@@ -64,51 +64,55 @@ function harness(answers: string[]) {
   return { calls, switched, errors, deps };
 }
 
-const GO = "__claude_pools__";
-const memberValue = (pool: string, member: string) => `${pool}\u0000${member}`;
+const memberValue = (pool: string, member: string) => `pool:${pool}:${member}`;
+const selectable = (o: SelectOpts) => o.options.filter((x) => !x.disabled);
 
-test("Identities screen lists only normal identities, create, and one Go to Claude Pools row", async () => {
+test("one screen: header, identities, create, header, member rows; no Go to row", async () => {
   const h = harness(["solo"]);
   await promptForIdentity(registry(), cfg, 1000, h.deps);
   expect(h.calls).toHaveLength(1);
-  expect(h.calls[0]!.message).toBe("Identities");
-  const values = h.calls[0]!.options.map((o) => o.value);
-  expect(values).not.toContain("shared-pool");
-  expect(h.calls[0]!.options.map((o) => o.label)).toEqual([
+  const opts = h.calls[0]!.options;
+  expect(opts.map((o) => o.label)).toEqual([
+    "Identities",
     "Solo",
     "Account A",
     "Account B",
     "Account C",
     "+ Create new identity",
-    "Go to Claude Pools >",
+    "Claude Pools",
+    "Account A",
+    "Account B",
+    "Account C",
   ]);
+  expect(opts.some((o) => o.label.includes("Go to"))).toBe(false);
+  expect(opts.map((o) => o.value)).not.toContain("shared-pool");
+  expect(opts.filter((o) => o.disabled).map((o) => o.label)).toEqual(["Identities", "Claude Pools"]);
+  expect(opts[0]!.disabled).toBe(true);
+  expect(opts[6]!.disabled).toBe(true);
 });
 
-test("no pools: no Go to Claude Pools row", async () => {
+test("member rows are top-level with encoded values and active / not-allowed hints", async () => {
+  const h = harness(["solo"]);
+  await promptForIdentity(registry(), cfg, 1000, h.deps);
+  const members = h.calls[0]!.options.slice(7);
+  expect(members.map((o) => o.value)).toEqual(
+    ["acct-a", "acct-b", "acct-c"].map((m) => memberValue("shared-pool", m)),
+  );
+  expect(members.every((o) => !o.disabled)).toBe(true);
+  expect(members.map((o) => o.hint)).toEqual(["(active)", undefined, "(not allowed)"]);
+});
+
+test("no pools: no Claude Pools header", async () => {
   const file = registry();
   file.identities.pop();
   const h = harness(["solo"]);
   await promptForIdentity(file, cfg, 1000, h.deps);
-  expect(h.calls[0]!.options.map((o) => o.value)).not.toContain(GO);
+  const labels = h.calls[0]!.options.map((o) => o.label);
+  expect(labels).not.toContain("Claude Pools");
+  expect(labels).toEqual(["Identities", "Solo", "Account A", "Account B", "Account C", "+ Create new identity"]);
 });
 
-test("Claude Pools is a separate prompt listing every member with active and not-allowed markers", async () => {
-  const h = harness([GO, memberValue("shared-pool", "acct-b")]);
-  await promptForIdentity(registry(), cfg, 1000, h.deps);
-  expect(h.calls).toHaveLength(2);
-  expect(h.calls[1]!.message).toBe("Claude Pools");
-  const members = h.calls[1]!.options;
-  expect(members.map((o) => o.value)).toEqual(
-    ["acct-a", "acct-b", "acct-c"].map((m) => memberValue("shared-pool", m)),
-  );
-  expect(members.map((o) => o.label)).toEqual(["Account A", "Account B", "Account C"]);
-  expect(members[0]!.hint).toBe("(active)");
-  expect(members[1]!.hint).toBeUndefined();
-  expect(members[2]!.hint).toBe("(not allowed)");
-  expect(h.calls[1]!.initialValue).toBe(memberValue("shared-pool", "acct-a"));
-});
-
-test("several pools: members are distinguishable by pool name in the hint", async () => {
+test("several pools: member hints are prefixed with the pool name", async () => {
   const file = registry();
   file.identities.push({
     name: "other-pool",
@@ -116,10 +120,9 @@ test("several pools: members are distinguishable by pool name in the hint", asyn
     configDir: "/example/other-pool",
     swapPool: { accounts: ["acct-a"], active: "acct-a" },
   });
-  const h = harness([GO, memberValue("other-pool", "acct-a")]);
+  const h = harness([memberValue("other-pool", "acct-a")]);
   const result = await promptForIdentity(file, cfg, 1000, h.deps);
-  const hints = h.calls[1]!.options.map((o) => o.hint);
-  expect(hints).toEqual([
+  expect(h.calls[0]!.options.slice(7).map((o) => o.hint)).toEqual([
     "Shared Pool (active)",
     "Shared Pool",
     "Shared Pool (not allowed)",
@@ -130,21 +133,22 @@ test("several pools: members are distinguishable by pool name in the hint", asyn
 });
 
 test("choosing a member switches manually and launches the pool", async () => {
-  const h = harness([GO, memberValue("shared-pool", "acct-b")]);
+  const h = harness([memberValue("shared-pool", "acct-b")]);
   const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
+  expect(h.calls).toHaveLength(1);
   expect(h.switched).toEqual([["shared-pool", "acct-b"]]);
   expect(result.identity.name).toBe("shared-pool");
   expect(result.created).toBe(false);
   expect(await readLastIdentity("claude", memoryPath)).toBe("shared-pool");
 });
 
-test("a disallowed member is refused: no switch, error shown, back to the picker", async () => {
-  const h = harness([GO, memberValue("shared-pool", "acct-c"), "solo"]);
+test("a disallowed member is refused: no switch, error shown, same screen re-shown", async () => {
+  const h = harness([memberValue("shared-pool", "acct-c"), "solo"]);
   const result = await promptForIdentity(registry(), cfg, 1000, h.deps);
   expect(h.switched).toEqual([]);
   expect(h.errors.join("\n")).toContain("not allowed");
-  expect(h.calls).toHaveLength(3);
-  expect(h.calls[2]!.message).toBe("Identities");
+  expect(h.calls).toHaveLength(2);
+  expect(h.calls[1]!.options).toEqual(h.calls[0]!.options);
   expect(result.identity.name).toBe("solo");
 });
 
@@ -159,14 +163,13 @@ test("the remembered identity is pre-selected and a pick is recorded", async () 
   expect(statSync(memoryPath).mode & 0o777).toBe(0o600);
 });
 
-test("a remembered pool pre-selects the Go row, then its active member on the Claude Pools screen", async () => {
+test("a remembered pool pre-selects its active member row", async () => {
   await writeLastIdentity("claude", "shared-pool", memoryPath);
   const file = registry();
   file.identities[4]!.swapPool!.active = "acct-b";
-  const h = harness([GO, memberValue("shared-pool", "acct-b")]);
+  const h = harness([memberValue("shared-pool", "acct-b")]);
   await promptForIdentity(file, cfg, 1000, h.deps);
-  expect(h.calls[0]!.initialValue).toBe(GO);
-  expect(h.calls[1]!.initialValue).toBe(memberValue("shared-pool", "acct-b"));
+  expect(h.calls[0]!.initialValue).toBe(memberValue("shared-pool", "acct-b"));
 });
 
 test("a remembered identity that is gone or retired falls back to the first entry", async () => {
@@ -177,6 +180,7 @@ test("a remembered identity that is gone or retired falls back to the first entr
     const h = harness(["solo"]);
     await promptForIdentity(file, cfg, 1000, h.deps);
     expect(h.calls[0]!.initialValue).toBe("solo");
+    expect(selectable(h.calls[0]!)[0]!.value).toBe("solo");
     spyOn(clack, "select").mockRestore();
   }
 });
