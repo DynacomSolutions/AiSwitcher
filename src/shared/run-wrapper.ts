@@ -3,7 +3,7 @@ import { basename, join } from "node:path";
 import { resolveIdentity } from "../identities/resolve.ts";
 import { PromptCancelledError, RetiredIdentityError } from "../identities/errors.ts";
 import { isRetired } from "../identities/retired.ts";
-import { parseCliArgs, resolveNestedIdentity } from "./cli-args.ts";
+import { activeParentIdentity, parseCliArgs, resolveNestedIdentity } from "./cli-args.ts";
 import { realpathSync } from "node:fs";
 import { resolveRealBinary, shimExecEnvVar } from "./resolve-binary.ts";
 import { IDENTITY_SESSION_MARKER, spawnReal } from "./exec.ts";
@@ -34,7 +34,7 @@ export async function runWrapper(
     // see migrate-ais-home.ts. Never throws.
     await migrateLegacyAisHome();
     const parsed = parseCliArgs(cfg.toolName, process.argv.slice(2));
-    const parentIdentity = process.env[IDENTITY_SESSION_MARKER];
+    const parentIdentity = activeParentIdentity(cfg.envVarName, process.env);
 
     // A nested launch with no --id auto-inherits the parent session's
     // identity (see resolveNestedIdentity) — only an explicit, DIFFERENT

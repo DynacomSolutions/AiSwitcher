@@ -1,3 +1,5 @@
+import { IDENTITY_SESSION_MARKER } from "./exec.ts";
+
 export interface ParsedCliArgs {
   identityFlag?: string;
   desktopFlag: boolean;
@@ -19,6 +21,23 @@ export interface ParsedCliArgs {
  * pollution case (e.g. a hardcoded --id=personal firing from inside a
  * identity-a session), not merely omitting the flag.
  */
+/**
+ * The parent session identity a launch may inherit, or undefined for a
+ * top-level launch. The marker is only trusted together with the tool's own
+ * config env var: every genuine nested launch carries both (spawnReal sets
+ * them as a pair). A marker alone is stale, typically leaked into a fresh
+ * shell by a terminal multiplexer or a daemon started from inside a session,
+ * and honouring it silently skips the picker and directory matching.
+ */
+export function activeParentIdentity(
+  envVarName: string,
+  env: Record<string, string | undefined>,
+): string | undefined {
+  const marker = env[IDENTITY_SESSION_MARKER];
+  if (!marker) return undefined;
+  return env[envVarName] ? marker : undefined;
+}
+
 export function resolveNestedIdentity(
   toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode",
   parentIdentity: string | undefined,
