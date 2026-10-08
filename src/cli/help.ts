@@ -5,7 +5,7 @@ const COMMANDS: Array<[string, string]> = [
   ["update", "Re-download the latest claude/codex/grok/kimi/zai/ali/pi/opencode/open/ais binaries"],
   ["upgrade", "Install or upgrade every real CLI required by the installed AIS shims, in parallel with a live status list"],
   ["sync list|add|remove|now|dedupe|recover", "Merge/recover profiles over SSH or locally"],
-  ["identities [list] [--tool=claude|codex|grok|kimi|zai|ali|pi|opencode]", "List identities (default; omit --tool to show all)"],
+  ["identities [list] [--tool=claude|codex|grok|kimi|zai|ali|pi|opencode]", "List identities (default; omit --tool to show all); claude pools are listed apart, with every member"],
   ["identities show <name> [--tool=]", "Show one identity's full detail"],
   ["identities create --tool=<t> [--name=] ...", "Create an identity (prompts for anything omitted)"],
   ["identities update <name> --tool=<t> ...", "Update label/description/configDir"],
