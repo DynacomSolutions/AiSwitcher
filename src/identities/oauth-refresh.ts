@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   grantFingerprint,
@@ -549,6 +549,13 @@ export async function refreshIdentityOAuthGrant(
   options: OAuthRefreshOptions = {},
 ): Promise<IdentityGrantRefresh> {
   if (tool !== "claude" && !isRetired(identity)) {
+    // Never-logged-in identity: don't mkdir its configDir (via the lock) every tick.
+    if (!options.force && !(await stat(identity.configDir).then(() => true, () => false))) {
+      return {
+        tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [],
+        detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
+      };
+    }
     // Rotating refresh tokens must not be POSTed by two processes (host timers + pod): lock the
     // identity dir across re-read-freshest -> POST -> write-through; the inner call re-reads under it.
     try {

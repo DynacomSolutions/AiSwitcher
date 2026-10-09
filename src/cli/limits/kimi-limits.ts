@@ -4,7 +4,8 @@ import { OAuthRefreshError } from "../../identities/oauth-refresh.ts";
 import type { Identity } from "../../identities/types.ts";
 import { categorizeByMinutes } from "./bucket.ts";
 import { fetchWithRetry } from "./http.ts";
-import { persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
+import { withOauthRefreshLock } from "../../identities/claude-swap-lock.ts";
+import { kimiRefreshContext, persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
 import type { LimitCategory, LimitWindow, OverageInfo, FetchedLimitResult } from "./types.ts";
 
 const USAGES_URL = "https://api.kimi.com/coding/v1/usages";
@@ -274,13 +275,31 @@ export async function refreshKimiOAuthToken(
   };
 }
 
+export interface KimiRefreshContext {
+  lockDir: string;
+  reread: () => Promise<KimiOAuthCredentials | undefined>;
+}
+
 async function refreshCredentials(
   credentials: KimiOAuthCredentials,
   persist: (next: KimiOAuthCredentials) => Promise<void>,
+  ctx?: KimiRefreshContext,
 ): Promise<KimiOAuthCredentials> {
-  const next = await refreshKimiOAuthToken(credentials);
-  await persist(next);
-  return next;
+  const run = async (from: KimiOAuthCredentials) => {
+    const next = await refreshKimiOAuthToken(from);
+    await persist(next);
+    return next;
+  };
+  if (!ctx) return run(credentials);
+  // The refresh token rotates: hold the identity lock (shared with the daemon refresher) and
+  // re-read, so a grant rotated meanwhile is used as-is instead of POSTing the spent token.
+  return withOauthRefreshLock(ctx.lockDir, async () => {
+    const current = (await ctx.reread().catch(() => undefined)) ?? credentials;
+    const rotated = current.refresh_token !== credentials.refresh_token;
+    const secondsLeft = current.expires_at === undefined ? Number.POSITIVE_INFINITY : current.expires_at - Date.now() / 1000;
+    if (rotated && secondsLeft > EXPIRY_SKEW_SECONDS) return current;
+    return run(current);
+  });
 }
 
 function errorMessage(err: unknown): string {
@@ -304,6 +323,7 @@ export interface KimiUsageOutcome {
 export async function fetchKimiUsageForCredentials(
   credentials: KimiOAuthCredentials,
   persist: (next: KimiOAuthCredentials) => Promise<void>,
+  refreshCtx?: KimiRefreshContext,
 ): Promise<KimiUsageOutcome> {
   let accessToken = credentials.access_token;
   let refreshAttempted = false;
@@ -314,7 +334,7 @@ export async function fetchKimiUsageForCredentials(
   if (secondsUntilExpiry <= EXPIRY_SKEW_SECONDS && credentials.refresh_token) {
     refreshAttempted = true;
     try {
-      accessToken = (await refreshCredentials(credentials, persist)).access_token;
+      accessToken = (await refreshCredentials(credentials, persist, refreshCtx)).access_token;
     } catch (err) {
       // Fall through with the existing token: within the skew window it can
       // still be technically valid, and the GET below is the authoritative
@@ -341,7 +361,7 @@ export async function fetchKimiUsageForCredentials(
   if ((response.status === 401 || response.status === 403) && credentials.refresh_token && !refreshAttempted) {
     refreshAttempted = true;
     try {
-      accessToken = (await refreshCredentials(credentials, persist)).access_token;
+      accessToken = (await refreshCredentials(credentials, persist, refreshCtx)).access_token;
     } catch (err) {
       refreshError = errorMessage(err);
     }
@@ -435,7 +455,7 @@ export async function fetchKimiLimits(identity: Identity): Promise<FetchedLimitR
   // so the two never race for the live refresh token (see kimi-store.ts).
   const persist = (next: KimiOAuthCredentials): Promise<void> => persistKimiCredentials(identity, "kimi", next);
 
-  const outcome = await fetchKimiUsageForCredentials(source, persist);
+  const outcome = await fetchKimiUsageForCredentials(source, persist, await kimiRefreshContext(identity, "kimi"));
   if (outcome.error || !outcome.windows) {
     return { ...base, windows: [], status: "unavailable", error: outcome.error };
   }

@@ -31,6 +31,11 @@ export function expandPath(raw: string): string {
   return isAbsolute(expanded) ? expanded : resolve(expanded);
 }
 
+/** $HOME when set (what os.homedir() returns on Linux, but read live so tests can inject it), else os.homedir(). */
+function defaultLocalHome(): string {
+  return stripTrailingSlash(process.env.HOME?.trim() || homedir());
+}
+
 /** Translates a registry-stored (host-absolute) path into the path visible to
  * this process. Registries record host paths such as `<host home>/.claude/...`;
  * inside a container the host home is mounted at a different home, so a prefix
@@ -44,7 +49,7 @@ export function expandPath(raw: string): string {
 export function translateHostPath(
   raw: string,
   env: Record<string, string | undefined> = process.env,
-  localHome: string = homedir(),
+  localHome: string = defaultLocalHome(),
 ): string {
   const hostHome = stripTrailingSlash(env.AIS_HOST_HOME?.trim() || localHome);
   if (hostHome === localHome || hostHome === "") return raw;
@@ -58,7 +63,7 @@ export function translateHostPath(
 export function untranslateHostPath(
   raw: string,
   env: Record<string, string | undefined> = process.env,
-  localHome: string = homedir(),
+  localHome: string = defaultLocalHome(),
 ): string {
   const hostHome = stripTrailingSlash(env.AIS_HOST_HOME?.trim() || localHome);
   if (hostHome === localHome || hostHome === "") return raw;

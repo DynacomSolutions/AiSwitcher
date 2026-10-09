@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { canonicalUsageProvider } from "../usage/providers.ts";
 import { fetchKimiUsageForCredentials } from "./kimi-limits.ts";
-import { persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
+import { kimiRefreshContext, persistKimiCredentials, readFreshestKimiCredentials } from "./kimi-store.ts";
 import { fetchOpencodeGoQuotaForKey } from "./opencode-limits.ts";
 import { fetchZaiQuotaForKey } from "./zai-limits.ts";
 import type { OverageInfo, ToolLimitResult } from "./types.ts";
@@ -52,7 +52,7 @@ async function kimiResult(toolName: "pi", identity: Identity, entry: PiAuthEntry
   if (entry.type !== "oauth") return undefined;
   const credentials = await readFreshestKimiCredentials(identity, "pi");
   if (!credentials) return undefined;
-  const outcome = await fetchKimiUsageForCredentials(credentials, (next) => persistKimiCredentials(identity, "pi", next));
+  const outcome = await fetchKimiUsageForCredentials(credentials, (next) => persistKimiCredentials(identity, "pi", next), await kimiRefreshContext(identity, "pi"));
   if (outcome.error || !outcome.windows) return unavailable(toolName, "kimi", identity, outcome.error ?? "usage fetch failed");
   return result(toolName, "kimi", identity, {
     status: "live",

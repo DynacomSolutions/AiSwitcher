@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { withOauthRefreshLock } from "./claude-swap-lock.ts";
 import {
   CLAUDE_CONFIG,
   CODEX_CONFIG,
@@ -214,7 +215,13 @@ export async function readPiEntry(path: string, provider: string): Promise<Store
   };
 }
 
+/** auth.json holds every provider, so the read-modify-write is serialised per pi dir
+ * (the LAST lock taken, after any tool lock) or concurrent refreshes would revert each other. */
 export async function writePiEntry(path: string, provider: string, grant: OAuthGrant, backups: Set<string>): Promise<void> {
+  await withOauthRefreshLock(dirname(path), () => writePiEntryUnlocked(path, provider, grant, backups));
+}
+
+async function writePiEntryUnlocked(path: string, provider: string, grant: OAuthGrant, backups: Set<string>): Promise<void> {
   const raw = (await readJson(path)) ?? {};
   const entry = (raw[provider] && typeof raw[provider] === "object" ? (raw[provider] as Record<string, unknown>) : {});
   await backupOnce(path, backups);

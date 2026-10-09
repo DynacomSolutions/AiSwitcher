@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
 
@@ -109,15 +109,17 @@ describe("console identity mutations", () => {
 
   test("with AIS_HOST_HOME set: host-form configDir writes under the local home, updates persist host paths", async () => {
     const { registryPath } = await makeHome();
-    const saved = process.env.AIS_HOST_HOME;
+    const saved = { HOME: process.env.HOME, AIS_HOST_HOME: process.env.AIS_HOST_HOME };
+    const localHome = await mkdtemp(join(tmpdir(), "ais-local-home-"));
+    tempDirs.push(localHome);
     process.env.AIS_HOST_HOME = "/synthetic/host-home";
-    // os.homedir() is fixed per process, so the "container" dir is a throwaway subdir of the real home.
-    const localDir = await mkdtemp(join(homedir(), ".ais-test-hostpath-"));
-    tempDirs.push(localDir);
+    process.env.HOME = localHome; // translation reads $HOME live (os.homedir() is cached in bun)
+    const localDir = join(localHome, ".zai", "z");
+    await mkdir(localDir, { recursive: true });
     try {
       const configs = [fakeConfig(registryPath, { toolName: "zai", realBinaryName: "crush", envVarName: "CRUSH_GLOBAL_CONFIG" })];
       const mod = await import("../../src/server/registries.ts");
-      const hostDir = `/synthetic/host-home${localDir.slice(homedir().length)}`;
+      const hostDir = "/synthetic/host-home/.zai/z";
       await mod.createIdentityInRegistry("zai", { name: "z", label: "Z", configDir: hostDir, apiKey: "SYNTHETIC_FIXTURE-key-value" }, configs);
       const crush = JSON.parse(await Bun.file(join(localDir, "crush.json")).text());
       expect(crush.providers.zai.api_key).toBe("SYNTHETIC_FIXTURE-key-value");
@@ -125,12 +127,14 @@ describe("console identity mutations", () => {
       await mod.updateIdentityInRegistry("zai", "z", { label: "Zed" }, configs);
       const stored = await Bun.file(registryPath).text();
       expect(stored).toContain(hostDir);
-      expect(stored).not.toContain(homedir());
+      expect(stored).not.toContain(localHome);
       const listed = await mod.listRegistries(configs);
       expect(listed.registries[0]!.identities[0]!.configDirExists).toBe(true);
     } finally {
-      if (saved === undefined) delete process.env.AIS_HOST_HOME;
-      else process.env.AIS_HOST_HOME = saved;
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
     }
   });
 });
