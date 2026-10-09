@@ -192,7 +192,7 @@ src/
     auth-refresh.ts        the daemon credential-renewal scheduler: REFRESHERS registry
                             (ali cookie harvest + OAuth refreshers for codex/claude/grok/kimi,
                             see identities/oauth-refresh.ts), cadence (expiry-window +
-                            daily keep-alive), loud failures with escalation, skip/revoked
+                            daily keep-alive; claude: 1h window, no keep-alive), loud failures with escalation, skip/revoked
                             state persisted under the console state dir, and
                             lastRefreshFailure()/lastRefreshState() for the CLI consumers
     login-flows.ts         LoginFlowManager: daemon-managed per-identity logins — spawns
@@ -2980,7 +2980,16 @@ What the rule means in practice, now enforced in both pipelines:
   grant through to EVERY store of the account per the one-credential law.
   Cadence: inside the expiry window (AIS_AUTH_REFRESH_EXPIRY_HOURS, default
   24) or at least once daily; manual `ais auth refresh <identity>
-  --tool=<t>` and POST /api/auth/refresh force past the cadence. A revoked
+  --tool=<t>` and POST /api/auth/refresh force past the cadence. Claude is
+  the exception: its ~8h access token is always inside a 24h window, which
+  rotated every refresh token each 10-minute tick and logged out running
+  sessions ("Login expired"). Claude refreshes only inside
+  `CLAUDE_EXPIRY_WINDOW_HOURS` (1h; `min` with the configured window) and
+  gets no daily keep-alive while its token is valid. Its refresh holds
+  Claude Code's `.oauth_refresh.lock` for the member dir AND every swap-pool
+  dir holding the grant (sorted order, `withOauthRefreshLocks`) across
+  read-freshest -> POST -> write-through, re-reading the freshest copy once
+  locked so a grant someone else refreshed meanwhile is skipped. A revoked
   refresh token (provider `invalid_grant`/`invalid_client`) is terminal
   and honest: the diagnosis is pinned to that grant's fingerprint, further
   endpoint calls are skipped (never a loop), and doctor/auth status render

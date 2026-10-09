@@ -13,6 +13,8 @@ export class SwapLockError extends Error {
   constructor(
     message: string,
     readonly lockPath: string,
+    /** True only for a wait timeout (a holder is busy), not for mkdir failures like EACCES. */
+    readonly timedOut = false,
   ) {
     super(message);
     this.name = "SwapLockError";
@@ -58,6 +60,7 @@ async function acquire(lockPath: string, options: LockOptions): Promise<() => Pr
       throw new SwapLockError(
         `could not take lock ${lockPath} within ${timeoutMs}ms (a Claude Code session is probably refreshing its token right now; retry in a moment)`,
         lockPath,
+        true,
       );
     }
     await sleep(pollMs);
@@ -97,4 +100,13 @@ export async function withOauthRefreshLock<T>(configDir: string, fn: () => Promi
   } finally {
     await release();
   }
+}
+
+/** Runs `fn` while holding `.oauth_refresh.lock` of every dir, acquired in
+ * sorted order (a stable order across callers, so two holders of
+ * overlapping sets cannot deadlock). */
+export async function withOauthRefreshLocks<T>(dirs: string[], fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
+  const [first, ...rest] = [...new Set(dirs)].sort();
+  if (first === undefined) return fn();
+  return withOauthRefreshLock(first, () => withOauthRefreshLocks(rest, fn, options), options);
 }

@@ -254,7 +254,10 @@ export async function swapCredentialFiles(input: SwapFsInput): Promise<Omit<Swap
       if (targetAccount !== undefined) {
         await writeFileAtomic(claudeJsonPath(poolDir), `${JSON.stringify({ ...poolClaudeJson, oauthAccount: targetAccount }, null, 2)}\n`);
       } else {
-        notes.push(`account "${target.name}" has no oauthAccount in its .claude.json; the pool's previous one was left in place`);
+        // Never leave the previous account's oauthAccount next to the target's credentials.
+        const { oauthAccount: _previous, ...withoutAccount } = poolClaudeJson;
+        await writeFileAtomic(claudeJsonPath(poolDir), `${JSON.stringify(withoutAccount, null, 2)}\n`);
+        notes.push(`account "${target.name}" has no oauthAccount in its .claude.json; the pool's previous oauthAccount was removed`);
       }
     } catch (err) {
       if (poolCredText !== undefined) await writeFileAtomic(poolCredPath, poolCredText).catch(() => undefined);
