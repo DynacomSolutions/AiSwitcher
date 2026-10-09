@@ -13,6 +13,7 @@ import {
   aggregateUsageResults,
   collectTargets,
   defaultOpencodeProfileUsageResults,
+  swapPoolUsageResults,
   pendingUsageResult,
   runUsageQuery,
   runUsageQueryForTargets,
@@ -115,6 +116,7 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
             onItemDone: (index, results) => (resultSlots[index] = results),
           }),
           includeDefaultProfile ? defaultOpencodeProfileUsageResults().then((rows) => defaultSlot.push(...rows)) : Promise.resolve(),
+          swapPoolUsageResults(flags).then((rows) => defaultSlot.push(...rows)),
         ]);
       },
     );

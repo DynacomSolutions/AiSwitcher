@@ -45,6 +45,15 @@ async function makeRegistry(toolName: "claude" | "codex" | "grok", identities: u
 }
 
 describe("collectTargets", () => {
+  test("skips a swap pool unless includePools is true", async () => {
+    const claude = await makeRegistry("claude", [
+      { name: "member", label: "Member", configDir: "/tmp/does-not-exist/member" },
+      { name: "pool-x", label: "Pool", configDir: "/tmp/does-not-exist/pool-x", swapPool: { accounts: ["member"] } },
+    ]);
+    expect((await collectTargets({}, [claude])).map((t) => t.identity.name)).toEqual(["member"]);
+    expect((await collectTargets({}, [claude], { includePools: true })).map((t) => t.identity.name)).toEqual(["member", "pool-x"]);
+  });
+
   test("with no filters, returns every identity across every registry", async () => {
     const claude = await makeRegistry("claude", [
       { name: "personal", label: "Personal", configDir: "/tmp/does-not-exist/personal" },

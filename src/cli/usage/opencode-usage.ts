@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { estimateDetailedModelTokenCost } from "../../identities/model-pricing.ts";
-import type { Identity } from "../../identities/types.ts";
+import { isRetired } from "../../identities/retired.ts";
+import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { localDateKey } from "./local-day.ts";
 import { canonicalUsageProvider } from "./providers.ts";
 import type { DateSpan, TokscaleEntry, TokscaleReport } from "./tokscale.ts";
@@ -53,16 +54,31 @@ async function readProfileCredentials(profileAuthPath: string): Promise<Map<stri
   return credentials;
 }
 
-/** Every AIS identity that holds opencode-style API credentials, mapped per
- * canonical provider -> key: the opencode registry (data/opencode/auth.json)
- * and the pi registry (auth.json api_key entries — OAuth entries hold no
- * comparable key). */
-async function identityCredentialIndex(): Promise<Array<{ identity: Identity; credentials: Map<string, string> }>> {
-  const { OPENCODE_CONFIG, PI_CONFIG } = await import("../../identities/tool-configs.ts");
-  const { loadIdentitiesFile } = await import("../../identities/store.ts");
-  const index: Array<{ identity: Identity; credentials: Map<string, string> }> = [];
+export interface CredentialIndexEntry {
+  tool: ToolConfig["toolName"];
+  identity: Identity;
+  credentials: Map<string, string>;
+}
 
+/** Every AIS identity that holds API credentials, mapped per canonical
+ * provider -> key: the NATIVE zai/ali registries first (their crush.json key
+ * makes them the canonical account for that provider), then the opencode
+ * registry (data/opencode/auth.json) and the pi registry (auth.json api_key
+ * entries — OAuth entries hold no comparable key). */
+export async function identityCredentialIndex(): Promise<CredentialIndexEntry[]> {
+  const { OPENCODE_CONFIG, PI_CONFIG, ZAI_CONFIG, ALI_CONFIG } = await import("../../identities/tool-configs.ts");
+  const { loadIdentitiesFile } = await import("../../identities/store.ts");
+  const { readZaiApiKey } = await import("../../identities/zai-auth.ts");
+  const { readAliApiKey } = await import("../../identities/ali-auth.ts");
+  const index: CredentialIndexEntry[] = [];
+
+  const nativeKey = (provider: string, read: (configDir: string) => Promise<string | undefined>) => async (configDir: string) => {
+    const key = await read(configDir);
+    return new Map(key ? [[provider, key]] : []);
+  };
   const registries = [
+    { config: ZAI_CONFIG, read: nativeKey("zai", readZaiApiKey) },
+    { config: ALI_CONFIG, read: nativeKey("alibaba", readAliApiKey) },
     { config: OPENCODE_CONFIG, read: async (configDir: string) => readProfileCredentials(join(configDir, "data", "opencode", "auth.json")) },
     {
       config: PI_CONFIG,
@@ -87,13 +103,38 @@ async function identityCredentialIndex(): Promise<Array<{ identity: Identity; cr
     try {
       const file = await loadIdentitiesFile(config.identitiesJsonPath);
       for (const identity of file.identities) {
-        index.push({ identity, credentials: await read(identity.configDir) });
+        index.push({ tool: config.toolName, identity, credentials: await read(identity.configDir) });
       }
     } catch {
       // registry absent -> no candidates from it
     }
   }
   return index;
+}
+
+/** The providers whose account is a native identity (zai / ali) rather than
+ * the multi-provider wrapper that happened to call them. */
+const NATIVE_PROVIDER_TOOL: Record<string, ToolConfig["toolName"]> = { zai: "zai", alibaba: "ali" };
+
+/** The real account behind a pi/opencode per-provider row. The source
+ * identity's name is the WRAPPER, not the account: (a) a native identity
+ * holding the same key wins; (b) with no key of its own for the provider
+ * (historic usage) the sole native account of that provider owns it; (c)
+ * otherwise, and for every other provider, the source identity stays. */
+export function pickProviderAccount(index: CredentialIndexEntry[], tool: ToolConfig["toolName"], source: Identity, provider: string): Identity {
+  const nativeTool = NATIVE_PROVIDER_TOOL[provider];
+  if (!nativeTool) return source;
+  const natives = index.filter((entry) => entry.tool === nativeTool && !isRetired(entry.identity));
+  const sourceKey = index.find((entry) => entry.tool === tool && entry.identity.name === source.name)?.credentials.get(provider);
+  if (sourceKey) return natives.find((entry) => entry.credentials.get(provider) === sourceKey)?.identity ?? source;
+  return natives.length === 1 ? natives[0]!.identity : source;
+}
+
+/** Drops provider rows with no tokens and no cost (e.g. a single empty
+ * message), unless the user explicitly scoped to the tool. */
+export function withoutEmptyProviders<T extends { report: TokscaleReport }>(providers: T[], explicitTool: boolean): T[] {
+  if (explicitTool) return providers;
+  return providers.filter(({ report: r }) => r.totalInput + r.totalOutput + r.totalCacheRead + r.totalCacheWrite + r.totalCost > 0);
 }
 
 /** Maps each of the default profile's providers to the AIS identity that

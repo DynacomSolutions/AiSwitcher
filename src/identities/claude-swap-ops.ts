@@ -1,5 +1,5 @@
 import { aisClaudeSwapLedgerPath } from "../shared/ais-home.ts";
-import { readSwapEvents, performSwap, type SwapReason, type SwapResult } from "./claude-swap.ts";
+import { eventsForPool, readSwapEvents, performSwap, type SwapReason, type SwapResult } from "./claude-swap.ts";
 import { fetchMemberUsage, type FetchUsageDeps, type MemberUsage } from "./claude-usage-api.ts";
 import { isRetired } from "./retired.ts";
 import { loadIdentitiesFile } from "./store.ts";
@@ -109,7 +109,7 @@ export async function swapIfLimited(
   if (!active) return { action: "skipped", why: "pool has no active account yet" };
   const now = deps.now?.() ?? Date.now();
   const cooldownMs = options.cooldownMs ?? SWAP_COOLDOWN_MS;
-  const events = (await readSwapEvents(deps.ledgerPath ?? aisClaudeSwapLedgerPath())).filter((e) => e.pool === pool.name && e.reason !== "manual");
+  const events = eventsForPool(await readSwapEvents(deps.ledgerPath ?? aisClaudeSwapLedgerPath()), pool).filter((e) => e.reason !== "manual");
   const last = events[events.length - 1];
   if (last && now - Date.parse(last.ts) < cooldownMs) return { action: "cooldown", retryAfterMs: cooldownMs - (now - Date.parse(last.ts)) };
 

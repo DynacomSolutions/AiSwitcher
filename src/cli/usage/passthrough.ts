@@ -37,14 +37,14 @@ export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: s
   const identityFilter = stringFlag(flags, "identity");
 
   if (!identityFilter) {
-    const targets = await collectTargets(flags);
+    const targets = await collectTargets(flags, undefined, { includePools: true });
     if (targets.length === 0) {
       return execReal(cmd!, [...prefixArgs, ...tokscaleArgs], {});
     }
     return execReal(cmd!, [...prefixArgs, ...tokscaleArgs], await buildMergedEnv(targets));
   }
 
-  const targets = await collectTargets(flags);
+  const targets = await collectTargets(flags, undefined, { includePools: true });
   if (targets.length > 1) {
     throw new CliUsageError(
       `--identity="${identityFilter}" matches more than one registry (${targets.map((t) => t.toolName).join(", ")}) — ` +

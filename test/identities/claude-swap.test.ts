@@ -500,6 +500,17 @@ describe("selection and auto swap", () => {
     expect(second.action).toBe("cooldown");
   });
 
+  test("a ledger event under the pool's former name still blocks the auto swap", async () => {
+    // Pool renamed: configDir basename ("pool") is the name the ledger recorded.
+    await writeRegistry({ auto: true });
+    const file = await read(registry);
+    file.identities.find((i: Identity) => i.name === "pool").name = "renamed-pool";
+    await writeFile(registry, JSON.stringify(file));
+    await writeFile(ledger, `${JSON.stringify({ ts: new Date((NOW_S - 60) * 1000).toISOString(), pool: "pool", from: "a", to: "b", reason: "auto" })}\n`);
+    const deps = { registryPath: registry, ledgerPath: ledger, fetchUsage: usageMap({ a: 99, b: 0, c: 0 }), now: () => NOW_S * 1000 };
+    expect((await swapIfLimited(deps, "renamed-pool", "auto")).action).toBe("cooldown");
+  });
+
   test("below threshold does nothing; no qualifying member does nothing", async () => {
     await writeRegistry({ auto: true });
     const deps = { registryPath: registry, ledgerPath: ledger, now: () => NOW_S * 1000 };

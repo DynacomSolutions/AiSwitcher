@@ -1,8 +1,12 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import { isRetired } from "../../identities/retired.ts";
+import { aisClaudeSwapLedgerPath } from "../../shared/ais-home.ts";
+import { isSwapPool, poolsOf } from "../../identities/swap-pool.ts";
+import { poolMemberModelUsage } from "../claude-swap/attribution.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
+import { CLAUDE_CONFIG } from "../../identities/tool-configs.ts";
 import { loadAll, TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { runBatched } from "../limits/collect.ts";
 import { fetchClaudeLimits } from "../limits/claude-limits.ts";
@@ -11,7 +15,7 @@ import { fetchKimiLimits } from "../limits/kimi-limits.ts";
 import type { OverageInfo } from "../limits/types.ts";
 import { fetchAliUsage } from "./ali-usage.ts";
 import { fetchAwsBedrockUsage, AwsNoProfileMappedError, type RealCostInfo } from "./aws-bedrock-usage.ts";
-import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, fetchOpencodeIdentityUsage, readOpencodeProfileUsage, resolveOpencodeProfileIdentities } from "./opencode-usage.ts";
+import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, fetchOpencodeIdentityUsage, identityCredentialIndex, pickProviderAccount, readOpencodeProfileUsage, resolveOpencodeProfileIdentities, withoutEmptyProviders } from "./opencode-usage.ts";
 import { fetchPiUsage } from "./pi-usage.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
 import {
@@ -75,6 +79,7 @@ export interface UsageResult {
 export async function collectTargets(
   flags: ParsedArgs["flags"],
   configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
+  options: { includePools?: boolean } = {},
 ): Promise<UsageTarget[]> {
   const toolFilter = toolConfigFromFlag(flags);
   const identityFilter = stringFlag(flags, "identity");
@@ -85,6 +90,9 @@ export async function collectTargets(
   const targets: UsageTarget[] = [];
   for (const { cfg, file } of loaded) {
     for (const identity of file.identities) {
+      // A swap pool is not an account: its usage is folded into its members
+      // (swapPoolUsageResults). Only the tokscale passthrough keeps its dir.
+      if (isSwapPool(identity) && !options.includePools) continue;
       if (identityFilter && identity.name !== identityFilter && !(identity.aliases ?? []).includes(identityFilter)) continue;
       targets.push({ toolName: cfg.toolName, identity });
     }
@@ -114,8 +122,8 @@ export function pendingUsageResult(target: UsageTarget): UsageResult | undefined
   return { provider, identity: target.identity, sourceTool: target.toolName, pending: true };
 }
 
-function providerResult(target: UsageTarget, provider: string, fields: Omit<UsageResult, "provider" | "identity">): UsageResult {
-  return { provider: canonicalUsageProvider(provider), identity: target.identity, sourceTool: target.toolName, ...fields };
+function providerResult(target: UsageTarget, provider: string, fields: Omit<UsageResult, "provider" | "identity">, identity: Identity = target.identity): UsageResult {
+  return { provider: canonicalUsageProvider(provider), identity, sourceTool: target.toolName, ...fields };
 }
 
 /** A real failure from a multi-provider source (pi/opencode) whose reader
@@ -165,8 +173,10 @@ async function runPiUsage(target: UsageTarget, suppression: UsageRowSuppression)
     if (providers.length === 0) {
       return suppression.explicitTool ? [sourceErrorResult(target, "no local Pi provider usage yet for this identity")] : [];
     }
-    return providers.map(({ provider, nativeCoverageTool, report, dateSpan, dailyUsage }) =>
-      providerResult(target, provider, { report, dateSpan, dailyUsage, ...(nativeCoverageTool ? { nativeCoverageTool } : {}) }),
+    const index = await identityCredentialIndex();
+    const shown = withoutEmptyProviders(providers, suppression.explicitTool);
+    return shown.map(({ provider, nativeCoverageTool, report, dateSpan, dailyUsage }) =>
+      providerResult(target, provider, { report, dateSpan, dailyUsage, ...(nativeCoverageTool ? { nativeCoverageTool } : {}) }, pickProviderAccount(index, "pi", target.identity, canonicalUsageProvider(provider))),
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -268,8 +278,9 @@ async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppre
     if (providers.length === 0) {
       return suppression.explicitTool ? [sourceErrorResult(target, "no local OpenCode provider usage yet for this identity")] : [];
     }
-    return providers.map(({ provider, report, dateSpan, dailyUsage }) =>
-      providerResult(target, provider, { report, ...(dateSpan ? { dateSpan } : {}), dailyUsage }),
+    const index = await identityCredentialIndex();
+    return withoutEmptyProviders(providers, suppression.explicitTool).map(({ provider, report, dateSpan, dailyUsage }) =>
+      providerResult(target, provider, { report, ...(dateSpan ? { dateSpan } : {}), dailyUsage }, pickProviderAccount(index, "opencode", target.identity, canonicalUsageProvider(provider))),
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -489,14 +500,65 @@ export async function defaultOpencodeProfileUsageResults(): Promise<UsageResult[
   }));
 }
 
+/** Usage of every claude swap pool, charged to the member accounts that were
+ * active (per the swap ledger) — a pool is not an account and gets no row.
+ * Respects --tool / --identity (matched against the member). */
+export async function swapPoolUsageResults(
+  flags: ParsedArgs["flags"],
+  ledgerPath: string = aisClaudeSwapLedgerPath(),
+  tokscaleForPool: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]> = runTokscale,
+): Promise<UsageResult[]> {
+  const toolFilter = toolConfigFromFlag(flags);
+  if (toolFilter && toolFilter.toolName !== "claude") return [];
+  const identityFilter = stringFlag(flags, "identity");
+  const [{ file }] = await loadAll([CLAUDE_CONFIG]);
+  const results: UsageResult[] = [];
+  for (const pool of poolsOf(file)) {
+    const members = pool.swapPool.accounts.map((name) => file.identities.find((i) => i.name === name)).filter((i): i is Identity => i !== undefined);
+    const usages = await poolMemberModelUsage(pool, members, ledgerPath);
+    // Cost: the pool's tokscale per-model cost, split by each member's token share
+    // of that model (the transcripts carry no cost). Models tokscale did not
+    // report keep the list-price estimate.
+    const poolCost = new Map<string, number>();
+    const modelTokens = new Map<string, number>();
+    const tokens = (e: TokscaleEntry) => e.input + e.output + e.cacheRead + e.cacheWrite;
+    for (const result of await tokscaleForPool({ toolName: "claude", identity: pool }, { explicitTool: false }).catch(() => [])) {
+      for (const e of result.report?.entries ?? []) poolCost.set(e.model, (poolCost.get(e.model) ?? 0) + e.cost);
+    }
+    for (const usage of usages) for (const e of usage.entries) modelTokens.set(e.model, (modelTokens.get(e.model) ?? 0) + tokens(e));
+    for (const usage of usages) {
+      for (const e of usage.entries) {
+        const total = modelTokens.get(e.model) ?? 0;
+        if (poolCost.has(e.model) && total > 0) e.cost = poolCost.get(e.model)! * (tokens(e) / total);
+      }
+    }
+    for (const usage of usages) {
+      const identity =
+        members.find((m) => m.name === usage.member) ??
+        { name: `${pool.name} (unattributed)`, label: `${pool.name} (unattributed)`, configDir: pool.configDir };
+      if (identityFilter && identity.name !== identityFilter && !(identity.aliases ?? []).includes(identityFilter)) continue;
+      results.push({
+        provider: "anthropic",
+        identity,
+        sourceTool: "claude",
+        report: reportFromEntries(usage.entries),
+        dateSpan: { firstMs: usage.firstMs, lastMs: usage.lastMs },
+        dailyUsage: usage.dailyUsage,
+      });
+    }
+  }
+  return results;
+}
+
 export async function runUsageQuery(flags: ParsedArgs["flags"]): Promise<UsageResult[]> {
   const targets = await collectTargets(flags);
   const includeDefaultProfile = shouldIncludeDefaultOpencodeProfile(flags);
-  const [results, defaultProfileResults] = await Promise.all([
+  const [results, defaultProfileResults, poolResults] = await Promise.all([
     runUsageQueryForTargets(targets, { explicitTool: toolConfigFromFlag(flags) !== undefined }),
     includeDefaultProfile ? defaultOpencodeProfileUsageResults() : Promise.resolve([] as UsageResult[]),
+    swapPoolUsageResults(flags),
   ]);
-  return aggregateUsageResults([...results, ...defaultProfileResults]);
+  return aggregateUsageResults([...results, ...defaultProfileResults, ...poolResults]);
 }
 
 /** JSON follows the same provider-first contract as the table. Client/tool
