@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fsp from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -227,6 +228,9 @@ describe("held lock vs Claude Code's stale rule", () => {
       await withOauthRefreshLock(dir, async (handle) => {
         await rm(lock, { recursive: true });
         await mkdir(lock); // Claude Code's re-acquired lock
+        // Coarse-mtime filesystems may reuse the inode and the mtime: make the replacement distinguishable.
+        const later = new Date(Date.now() + 2000);
+        await utimes(lock, later, later);
         lost = await waitFor(async () => handle.isLost());
       }, { updateMs: 10 });
     } finally {
@@ -234,6 +238,30 @@ describe("held lock vs Claude Code's stale rule", () => {
     }
     expect(lost).toBe(true);
     expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+
+  test("a transient stat failure after a touch does not mark the lock lost", async () => {
+    const dir = join(root, "flaky-stat");
+    const lock = join(dir, ".oauth_refresh.lock");
+    const real = fsp.stat;
+    let calls = 0;
+    let failed = false;
+    const spy = spyOn(fsp, "stat").mockImplementation((async (...args: Parameters<typeof real>) => {
+      calls++;
+      // 1: acquire, 2: tick compare, 3: tick read-back after utimes -> fail once
+      if (calls === 3 && !failed) { failed = true; throw Object.assign(new Error("EIO"), { code: "EIO" }); }
+      return real(...args);
+    }) as typeof real);
+    try {
+      await withOauthRefreshLock(dir, async (handle) => {
+        await new Promise((r) => setTimeout(r, 150));
+        expect(failed).toBe(true);
+        expect(handle.isLost()).toBe(false);
+      }, { updateMs: 20 });
+    } finally {
+      spy.mockRestore();
+    }
+    await expect(real(lock)).rejects.toThrow();
   });
 
   test("a 30s-old .oauth_refresh.lock is fresh (Claude Code 2.1.295 stale is 60s)", async () => {

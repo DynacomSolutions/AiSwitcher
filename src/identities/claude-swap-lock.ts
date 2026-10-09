@@ -59,7 +59,9 @@ async function own(lockPath: string, updateMs: number): Promise<HeldLock> {
   let released = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> = Promise.resolve();
-  const same = (s: { ino: number; mtimeMs: number }) => s.ino === mine.ino && s.mtimeMs === mine.mtimeMs;
+  // Set when we touched the dir but could not read the new mtime back: only the inode can be compared until the next stat.
+  let resync = false;
+  const same = (s: { ino: number; mtimeMs: number }) => s.ino === mine.ino && (resync || s.mtimeMs === mine.mtimeMs);
   const schedule = () => {
     if (released || lost) return;
     timer = setTimeout(() => { running = tick(); }, updateMs);
@@ -67,10 +69,14 @@ async function own(lockPath: string, updateMs: number): Promise<HeldLock> {
   };
   const tick = async () => {
     try {
-      if (!same(await stat(lockPath))) { lost = true; return; }
+      const seen = await stat(lockPath);
+      if (!same(seen)) { lost = true; return; }
+      if (resync) { mine = seen; resync = false; }
       const now = new Date();
       await utimes(lockPath, now, now);
+      resync = true;
       mine = await stat(lockPath);
+      resync = false;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") { lost = true; return; }
       // transient failure: retry next tick, the lock is still ours
