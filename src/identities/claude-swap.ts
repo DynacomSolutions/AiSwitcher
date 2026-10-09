@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { appendFile, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { aisClaudeSwapLedgerPath } from "../shared/ais-home.ts";
 import { withClaudeLocks, withOauthRefreshLock, type LockOptions } from "./claude-swap-lock.ts";
 import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuthGrant } from "./oauth-reconcile.ts";
@@ -96,6 +96,14 @@ export function activeMemberAt(events: SwapEvent[], pool: string, atMs: number):
     active = e.to;
   }
   return active;
+}
+
+/** Ledger events for `pool`, normalised to its current name. Events keep the
+ * pool name of their day, so a renamed pool's history is matched by its
+ * current name, its configDir basename (the original name) or an alias. */
+export function eventsForPool(events: SwapEvent[], pool: PoolIdentity): SwapEvent[] {
+  const names = new Set([pool.name, basename(pool.configDir), ...(pool.aliases ?? [])]);
+  return events.filter((e) => names.has(e.pool)).map((e) => ({ ...e, pool: pool.name }));
 }
 
 /* --------------------------- atomic file helpers --------------------------- */
