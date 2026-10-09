@@ -1,4 +1,4 @@
-import { mkdir, rmdir, stat } from "node:fs/promises";
+import { mkdir, rmdir, stat, utimes } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -24,24 +24,64 @@ export class SwapLockError extends Error {
 export interface LockOptions {
   /** Total time to wait for one lock. Default 5s. */
   timeoutMs?: number;
-  /** A lock dir older than this is presumed abandoned and broken. Default 30s. */
+  /** A lock dir older than this is presumed abandoned and broken. Default 10s: Claude Code's
+   * proper-lockfile `stale` (v2.1.159: `stale: 1e4`), which breaks any lock whose mtime is older. */
   staleMs?: number;
+  /** While held, the lock dir's mtime is touched this often so Claude Code never sees it as
+   * stale. Default 5s (proper-lockfile's `update` = stale / 2); keep well under `staleMs`. */
+  updateMs?: number;
   pollMs?: number;
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Keeps a just-created lock dir fresh (like proper-lockfile's update loop) and
+ * returns a release that removes the dir only while it is still the one we
+ * made. If Claude Code broke it as stale and re-took it, its dir has another
+ * inode/mtime and must be left alone.
+ */
+async function own(lockPath: string, updateMs: number): Promise<() => Promise<void>> {
+  let mine = await stat(lockPath);
+  let lost = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const same = (s: { ino: number; mtimeMs: number }) => s.ino === mine.ino && s.mtimeMs === mine.mtimeMs;
+  const tick = async () => {
+    try {
+      if (!same(await stat(lockPath))) { lost = true; return; }
+      const now = new Date();
+      await utimes(lockPath, now, now);
+      mine = await stat(lockPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") { lost = true; return; }
+      // transient failure: retry next tick, the lock is still ours
+    }
+    timer = setTimeout(tick, updateMs);
+    timer.unref();
+  };
+  timer = setTimeout(tick, updateMs);
+  timer.unref();
+  return async () => {
+    clearTimeout(timer);
+    if (lost) return;
+    try {
+      if (same(await stat(lockPath))) await rmdir(lockPath);
+    } catch {
+      // already gone or not ours
+    }
+  };
+}
+
 async function acquire(lockPath: string, options: LockOptions): Promise<() => Promise<void>> {
   const timeoutMs = options.timeoutMs ?? 5_000;
-  const staleMs = options.staleMs ?? 30_000;
+  const staleMs = options.staleMs ?? 10_000;
+  const updateMs = options.updateMs ?? 5_000;
   const pollMs = options.pollMs ?? 50;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       await mkdir(lockPath);
-      return async () => {
-        await rmdir(lockPath).catch(() => undefined);
-      };
+      return await own(lockPath, updateMs);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
         throw new SwapLockError(`could not create lock ${lockPath}: ${(err as Error).message}`, lockPath);

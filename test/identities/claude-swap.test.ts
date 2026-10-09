@@ -192,6 +192,30 @@ describe("performSwap", () => {
   });
 });
 
+describe("held lock vs Claude Code's 10s stale rule", () => {
+  test("mtime is refreshed while held, so it never looks stale", async () => {
+    const dir = join(root, "held");
+    const lock = join(dir, ".oauth_refresh.lock");
+    await withOauthRefreshLock(dir, async () => {
+      const first = (await stat(lock)).mtimeMs;
+      await new Promise((r) => setTimeout(r, 250));
+      expect((await stat(lock)).mtimeMs).toBeGreaterThan(first);
+    }, { updateMs: 50 });
+    await expect(stat(lock)).rejects.toThrow();
+  });
+
+  test("release leaves a lock that Claude Code broke and re-took", async () => {
+    const dir = join(root, "stolen");
+    const lock = join(dir, ".oauth_refresh.lock");
+    await withOauthRefreshLock(dir, async () => {
+      await rm(lock, { recursive: true });
+      await new Promise((r) => setTimeout(r, 5));
+      await mkdir(lock); // Claude Code's re-acquired lock
+    }, { updateMs: 10_000 });
+    expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+});
+
 describe("ledger attribution", () => {
   test("activeMemberAt maps timestamps to members", () => {
     const events = [
