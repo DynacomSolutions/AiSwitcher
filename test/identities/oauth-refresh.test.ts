@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ANTHROPIC_TOKEN_URL,
+  CLAUDE_EXPIRY_WINDOW_HOURS,
   DEFAULT_EXPIRY_WINDOW_HOURS,
   OPENAI_CODEX_CLIENT_ID,
   OPENAI_CODEX_TOKEN_URL,
@@ -13,6 +15,7 @@ import {
   refreshIdentityOAuthGrant,
   shouldAttemptOAuthRefresh,
 } from "../../src/identities/oauth-refresh.ts";
+import { oauthRefreshLockPath, withOauthRefreshLock } from "../../src/identities/claude-swap-lock.ts";
 import { grantFingerprint } from "../../src/identities/oauth-reconcile.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import type { Identity, ToolConfig } from "../../src/identities/types.ts";
@@ -218,6 +221,49 @@ describe("shouldAttemptOAuthRefresh (scheduler cadence)", () => {
   test("default window is 24 hours", () => {
     expect(DEFAULT_EXPIRY_WINDOW_HOURS).toBe(24);
   });
+
+  describe("claude (~8h access token)", () => {
+    const recent = new Date((NOW - 60) * 1000).toISOString();
+    const claude = (secondsLeft: number, lastSuccessAt: string | null = recent) =>
+      shouldAttemptOAuthRefresh(
+        { access_token: "x", expires_at: NOW + secondsLeft },
+        { tool: "claude", expiryWindowHours: 24, lastSuccessAt, nowSeconds: NOW },
+      );
+
+    test("window is one hour", () => {
+      expect(CLAUDE_EXPIRY_WINDOW_HOURS).toBe(1);
+    });
+
+    test("7h left is not refreshed, even with the default 24h window", () => {
+      expect(claude(7 * 3600).attempt).toBe(false);
+    });
+
+    test("30 minutes left is refreshed", () => {
+      expect(claude(1800).attempt).toBe(true);
+    });
+
+    test("an expired token is refreshed", () => {
+      expect(claude(-7200).attempt).toBe(true);
+    });
+
+    test("no daily keep-alive while the token is still valid", () => {
+      expect(claude(7 * 3600, null).attempt).toBe(false);
+      expect(claude(7 * 3600, new Date((NOW - 30 * 3600) * 1000).toISOString()).attempt).toBe(false);
+    });
+
+    test("other tools keep the 24h window and the daily keep-alive", () => {
+      const grant = { access_token: "x", expires_at: NOW + 7 * 3600 };
+      for (const tool of ["codex", "grok", "kimi"] as const) {
+        expect(shouldAttemptOAuthRefresh(grant, { tool, expiryWindowHours: 24, lastSuccessAt: null, nowSeconds: NOW }).attempt).toBe(true);
+      }
+      expect(
+        shouldAttemptOAuthRefresh(
+          { access_token: "x", expires_at: NOW + 10 * 86_400 },
+          { tool: "codex", lastSuccessAt: new Date((NOW - 30 * 3600) * 1000).toISOString(), nowSeconds: NOW },
+        ).reason,
+      ).toContain("daily keep-alive");
+    });
+  });
 });
 
 describe("postRefreshTokenGrant", () => {
@@ -376,6 +422,77 @@ describe("refreshIdentityOAuthGrant: anthropic", () => {
 
     const pi = await readJson<Record<string, { refresh: string }>>(PI_AUTH());
     expect(pi.anthropic!.refresh).toBe("rt-new-1");
+  });
+});
+
+describe("refreshIdentityOAuthGrant: anthropic swap pool locking", () => {
+  let poolDir: string;
+  let registry: string;
+  const claudeCreds = (dir: string, refresh: string, expiresAtSeconds: number) =>
+    json(join(dir, ".credentials.json"), {
+      claudeAiOauth: { accessToken: "at-syn-cla", refreshToken: refresh, expiresAt: expiresAtSeconds * 1000 },
+    });
+
+  beforeEach(async () => {
+    poolDir = join(dirs.claude, "..", "pool");
+    await mkdir(poolDir, { recursive: true });
+    registry = join(dirs.claude, "..", "pool-registry.json");
+    await json(registry, {
+      version: 1,
+      identities: [
+        { name: ACME, label: "Acme", configDir: dirs.claude },
+        { name: "pool", label: "Pool", configDir: poolDir, swapPool: { accounts: [ACME], active: ACME } },
+      ],
+    });
+  });
+
+  test("holds the member and pool locks across the POST and writes through to both", async () => {
+    await claudeCreds(dirs.claude, "rt-old-1", NOW + 600);
+    await claudeCreds(poolDir, "rt-old-1", NOW + 600);
+    const held: boolean[] = [];
+    const fetchImpl = (async () => {
+      held.push(existsSync(oauthRefreshLockPath(dirs.claude)), existsSync(oauthRefreshLockPath(poolDir)));
+      return new Response(JSON.stringify({ access_token: "at-new", refresh_token: "rt-new-1", expires_in: 28_800 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await refreshIdentityOAuthGrant("claude", identityIn(dirs.claude), {
+      claudeRegistryPath: registry,
+      fetchImpl,
+      now: () => NOW * 1000,
+    });
+
+    expect(result.outcome).toBe("refreshed");
+    expect(held).toEqual([true, true]);
+    for (const dir of [dirs.claude, poolDir]) {
+      expect((await readJson<{ claudeAiOauth: { refreshToken: string } }>(join(dir, ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-new-1");
+      expect(existsSync(oauthRefreshLockPath(dir))).toBe(false);
+    }
+  });
+
+  test("skips the POST when a fresher copy appears while waiting for the locks", async () => {
+    await claudeCreds(dirs.claude, "rt-old-1", NOW + 600);
+    await claudeCreds(poolDir, "rt-old-1", NOW + 600);
+    const { calls, fetchImpl } = stubFetch([tokenResponse()]);
+
+    let pending: Promise<unknown> | undefined;
+    await withOauthRefreshLock(poolDir, async () => {
+      pending = refreshIdentityOAuthGrant("claude", identityIn(dirs.claude), {
+        claudeRegistryPath: registry,
+        fetchImpl,
+        now: () => NOW * 1000,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150)); // refresh is now blocked on the pool lock
+      await claudeCreds(poolDir, "rt-other-2", NOW + 8 * 3600); // Claude Code refreshed in the pool
+    });
+    const result = (await pending) as { outcome: string };
+
+    expect(result.outcome).toBe("skipped-fresh");
+    expect(calls).toHaveLength(0);
+    const member = await readJson<{ claudeAiOauth: { refreshToken: string } }>(join(dirs.claude, ".credentials.json"));
+    expect(member.claudeAiOauth.refreshToken).toBe("rt-other-2"); // converged
   });
 });
 

@@ -98,3 +98,12 @@ export async function withOauthRefreshLock<T>(configDir: string, fn: () => Promi
     await release();
   }
 }
+
+/** Runs `fn` while holding `.oauth_refresh.lock` of every dir, acquired in
+ * sorted order (a stable order across callers, so two holders of
+ * overlapping sets cannot deadlock). */
+export async function withOauthRefreshLocks<T>(dirs: string[], fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
+  const [first, ...rest] = [...new Set(dirs)].sort();
+  if (first === undefined) return fn();
+  return withOauthRefreshLock(first, () => withOauthRefreshLocks(rest, fn, options), options);
+}

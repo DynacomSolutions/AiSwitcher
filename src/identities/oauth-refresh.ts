@@ -15,7 +15,7 @@ import { findIdentityByNameOrAlias, loadIdentitiesFile } from "./store.ts";
 import { isRetired } from "./retired.ts";
 import { CLAUDE_CONFIG, PI_CONFIG } from "./tool-configs.ts";
 import { isSwapPool, poolsHoldingMember } from "./swap-pool.ts";
-import { withOauthRefreshLock } from "./claude-swap-lock.ts";
+import { withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
 import type { Identity } from "./types.ts";
 import { persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
 import { refreshKimiOAuthToken } from "../cli/limits/kimi-limits.ts";
@@ -262,7 +262,7 @@ export async function writeGrantThroughStores(
   tool: RefreshableTool,
   identity: Identity,
   grant: OAuthGrant,
-  options: { entryKey?: string; piDir?: string; claudeRegistryPath?: string } = {},
+  options: { entryKey?: string; piDir?: string; claudeRegistryPath?: string; locksHeld?: boolean } = {},
 ): Promise<WriteThroughReport> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
@@ -293,7 +293,8 @@ export async function writeGrantThroughStores(
   if (tool === "claude") {
     for (const poolDir of await poolStoreDirsFor(identity, options.claudeRegistryPath)) {
       try {
-        await withOauthRefreshLock(poolDir, () => writeProviderGrantCopy("claude", poolDir, grant, { backups }));
+        const write = () => writeProviderGrantCopy("claude", poolDir, grant, { backups });
+        await (options.locksHeld ? write() : withOauthRefreshLock(poolDir, write));
         written.push(`pool:${poolDir}`);
       } catch (err) {
         failed.push({ path: `pool:${poolDir}`, error: err instanceof Error ? err.message : String(err) });
@@ -315,13 +316,19 @@ export async function writeGrantThroughStores(
 /** The refresh decision for the scheduler's cadence: refresh when the
  * access token is within `expiryWindowHours` of expiry, and at least once
  * a day even for long-lived tokens (so a healthy grant is still exercised
- * and any rotation is propagated). Manual refreshes pass force=true. */
+ * and any rotation is propagated). Manual refreshes pass force=true.
+ * Claude's ~8h access token is always inside a 24h window, so it would be
+ * rotated every tick and log out sessions holding the previous refresh
+ * token: for tool "claude" the window is capped at CLAUDE_EXPIRY_WINDOW_HOURS
+ * and the daily keep-alive is skipped (a valid token rotates naturally). */
 export function shouldAttemptOAuthRefresh(
   grant: OAuthGrant,
-  options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number },
+  options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number; tool?: RefreshableTool },
 ): { attempt: boolean; reason: string } {
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
-  const windowSeconds = (options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS) * 3600;
+  const isClaude = options.tool === "claude";
+  const windowHours = Math.min(options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS, isClaude ? CLAUDE_EXPIRY_WINDOW_HOURS : Infinity);
+  const windowSeconds = windowHours * 3600;
   const secondsLeft = grant.expires_at === undefined ? Number.POSITIVE_INFINITY : grant.expires_at - now;
   if (options.force) return { attempt: true, reason: "manual refresh" };
   if (secondsLeft <= windowSeconds) {
@@ -329,9 +336,12 @@ export function shouldAttemptOAuthRefresh(
       attempt: true,
       reason:
         secondsLeft <= 0
-          ? `access token expired ${Math.abs(secondsLeft / 3600).toFixed(1)}h ago (window ${options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS}h)`
-          : `access token expires in ${(secondsLeft / 3600).toFixed(1)}h (window ${options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS}h)`,
+          ? `access token expired ${Math.abs(secondsLeft / 3600).toFixed(1)}h ago (window ${windowHours}h)`
+          : `access token expires in ${(secondsLeft / 3600).toFixed(1)}h (window ${windowHours}h)`,
     };
+  }
+  if (isClaude && grant.expires_at !== undefined) {
+    return { attempt: false, reason: `access token expires in ${(secondsLeft / 3600).toFixed(1)}h (window ${windowHours}h) — nothing to do` };
   }
   const last = options.lastSuccessAt !== null && options.lastSuccessAt !== undefined ? Date.parse(options.lastSuccessAt) : NaN;
   if (!Number.isFinite(last) || now - last / 1000 >= 86_400) {
@@ -343,6 +353,8 @@ export function shouldAttemptOAuthRefresh(
   };
 }
 
+/** Claude refreshes this close to expiry (comfortably above the 10-minute tick). */
+export const CLAUDE_EXPIRY_WINDOW_HOURS = 1;
 export const DEFAULT_EXPIRY_WINDOW_HOURS = 24;
 
 /** claude member that is active in a swap pool: the freshest of its own
@@ -370,6 +382,7 @@ async function freshestWithPools(
 export async function convergeClaudePoolStores(
   identity: Identity,
   registryPath?: string,
+  locksHeld = false,
 ): Promise<{ written: string[]; failed: Array<{ path: string; error: string }> }> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
@@ -386,7 +399,8 @@ export async function convergeClaudePoolStores(
     const copy = copies[i];
     if (copy && grantFingerprint(copy.grant) === fp && copy.grant.access_token === best.grant.access_token) continue;
     try {
-      await withOauthRefreshLock(dirs[i]!, () => writeProviderGrantCopy("claude", dirs[i]!, best!.grant));
+      const write = () => writeProviderGrantCopy("claude", dirs[i]!, best!.grant);
+      await (locksHeld ? write() : withOauthRefreshLock(dirs[i]!, write));
       written.push(dirs[i]!);
     } catch (err) {
       failed.push({ path: dirs[i]!, error: err instanceof Error ? err.message : String(err) });
@@ -467,6 +481,8 @@ export interface OAuthRefreshOptions {
   now?: () => number;
   /** Test hook: claude registry that lists swap pools. */
   claudeRegistryPath?: string;
+  /** Internal: the caller already holds every claude `.oauth_refresh.lock`. */
+  locksHeld?: boolean;
 }
 
 /** Refreshes one identity's OAuth grant for one tool: picks the freshest
@@ -478,6 +494,41 @@ export async function refreshIdentityOAuthGrant(
   tool: RefreshableTool,
   identity: Identity,
   options: OAuthRefreshOptions = {},
+): Promise<IdentityGrantRefresh> {
+  if (tool !== "claude" || options.locksHeld || isRetired(identity) || isSwapPool(identity)) {
+    return refreshGrantUnlocked(tool, identity, options);
+  }
+  // Claude Code rotates the refresh token under <configDir>/.oauth_refresh.lock.
+  // Hold that lock for the member dir AND every pool dir holding the grant
+  // across read-freshest -> POST -> write-through, so neither Claude Code nor
+  // a second AIS pass can race the rotation. The inner call re-reads the
+  // freshest copy under the locks, so a grant refreshed meanwhile is skipped.
+  if (!options.force) {
+    // Cheap pre-check without locks: don't contend with Claude Code when there is nothing to do.
+    const peek = await freshestGrant(tool, identity, options.claudeRegistryPath).catch(() => undefined);
+    if (peek?.grant.refresh_token) {
+      const decision = shouldAttemptOAuthRefresh(peek.grant, {
+        expiryWindowHours: options.expiryWindowHours,
+        lastSuccessAt: options.lastSuccessAt,
+        nowSeconds: Math.floor((options.now ?? Date.now)() / 1000),
+        tool,
+      });
+      if (!decision.attempt) {
+        return {
+          tool, identity: identity.name, outcome: "skipped-fresh", detail: decision.reason,
+          beforeFingerprint: grantFingerprint(peek.grant), written: [], writeFailures: [],
+        };
+      }
+    }
+  }
+  const dirs = [identity.configDir, ...(await poolStoreDirsFor(identity, options.claudeRegistryPath))];
+  return withOauthRefreshLocks(dirs, () => refreshGrantUnlocked(tool, identity, { ...options, locksHeld: true }));
+}
+
+async function refreshGrantUnlocked(
+  tool: RefreshableTool,
+  identity: Identity,
+  options: OAuthRefreshOptions,
 ): Promise<IdentityGrantRefresh> {
   const base: IdentityGrantRefresh = { tool, identity: identity.name, outcome: "failed", detail: "", written: [], writeFailures: [] };
   const now = options.now ?? Date.now;
@@ -494,7 +545,7 @@ export async function refreshIdentityOAuthGrant(
       detail: "claude swap pool: its credentials are a copy of the active member's grant and are refreshed through that member",
     };
   }
-  if (tool === "claude") await convergeClaudePoolStores(identity, options.claudeRegistryPath).catch(() => undefined);
+  if (tool === "claude") await convergeClaudePoolStores(identity, options.claudeRegistryPath, options.locksHeld).catch(() => undefined);
 
   const freshest = await freshestGrant(tool, identity, options.claudeRegistryPath).catch(() => undefined);
   if (!freshest || !freshest.grant.refresh_token) {
@@ -519,6 +570,7 @@ export async function refreshIdentityOAuthGrant(
     expiryWindowHours: options.expiryWindowHours,
     lastSuccessAt: options.lastSuccessAt,
     nowSeconds: nowSeconds(),
+    tool,
   });
   if (!decision.attempt) {
     return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason };
@@ -582,6 +634,7 @@ export async function refreshIdentityOAuthGrant(
   const writeThrough = await writeGrantThroughStores(tool, identity, grant, {
     entryKey: freshest.entryKey,
     ...(options.claudeRegistryPath ? { claudeRegistryPath: options.claudeRegistryPath } : {}),
+    locksHeld: options.locksHeld,
   });
   const wrote = writeThrough.written.length > 0;
   return {
