@@ -536,6 +536,8 @@ export interface OAuthRefreshOptions {
   locksHeld?: boolean;
   /** Internal: the pool dirs that were locked (never re-read from the registry under the locks). */
   lockedPoolDirs?: string[];
+  /** Set by the lock holder: true once a held refresh lock was broken under us. */
+  isLockLost?: () => boolean;
 }
 
 /** Refreshes one identity's OAuth grant for one tool: picks the freshest
@@ -582,9 +584,12 @@ export async function refreshIdentityOAuthGrant(
     }
   }
   // Same order as `ais claude-swap` (pool dirs first, owner member last), so the two never invert.
-  const inner = () => refreshGrantUnlocked(tool, identity, { ...options, locksHeld: true, lockedPoolDirs: poolDirs });
+  const inner = (isLockLost: () => boolean) =>
+    refreshGrantUnlocked(tool, identity, { ...options, locksHeld: true, lockedPoolDirs: poolDirs, isLockLost });
   try {
-    return await withOauthRefreshLocks(poolDirs, () => withOauthRefreshLock(identity.configDir, inner));
+    return await withOauthRefreshLocks(poolDirs, (pool) =>
+      withOauthRefreshLock(identity.configDir, (own) => inner(() => pool.isLost() || own.isLost())),
+    );
   } catch (err) {
     if (!options.force && err instanceof SwapLockError && err.timedOut) {
       return { tool, identity: identity.name, outcome: "skipped-fresh", detail: `lock busy (${err.message}) — will retry next tick`, written: [], writeFailures: [] };
@@ -646,6 +651,10 @@ async function refreshGrantUnlocked(
     return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason };
   }
 
+  // Before the POST, while the refresh token is still unspent: if Claude Code broke our lock, it may be refreshing the same token.
+  if (options.isLockLost?.()) {
+    return { ...base, outcome: "failed", beforeFingerprint, detail: "refresh lock was lost to another process before the token request; not refreshing (retry next tick)" };
+  }
   let grant: OAuthGrant;
   try {
     if (tool === "kimi") {

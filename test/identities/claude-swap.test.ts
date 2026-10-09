@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fsp from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { chooseBest, swapIfLimited } from "../../src/identities/claude-swap-ops.
 import { parseUsageBody, fetchMemberUsage } from "../../src/identities/claude-usage-api.ts";
 import { refreshIdentityOAuthGrant, writeGrantThroughStores, convergeClaudePoolStores } from "../../src/identities/oauth-refresh.ts";
 import { PI_CONFIG } from "../../src/identities/tool-configs.ts";
-import { chmod } from "node:fs/promises";
+import { chmod, utimes } from "node:fs/promises";
 import { loadIdentitiesFile, parseIdentitiesFile } from "../../src/identities/store.ts";
 import { validateMembers } from "../../src/identities/swap-pool.ts";
 import { claudeSwapLaunchCheck } from "../../src/identities/claude-swap-launch.ts";
@@ -188,6 +189,100 @@ describe("performSwap", () => {
     await mkdir(join(root, "locked", ".oauth_refresh.lock"), { recursive: true });
     let ran = false;
     await withClaudeLocks(join(root, "locked"), async () => { ran = true; }, { staleMs: -1, timeoutMs: 500 });
+    expect(ran).toBe(true);
+  });
+});
+
+describe("held lock vs Claude Code's stale rule", () => {
+  const waitFor = async (cond: () => Promise<boolean>, ms = 3000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 10))) if (await cond()) return true;
+    return false;
+  };
+
+  test("mtime is refreshed while held, so it never looks stale", async () => {
+    const dir = join(root, "held");
+    const lock = join(dir, ".oauth_refresh.lock");
+    await withOauthRefreshLock(dir, async () => {
+      const first = (await stat(lock)).mtimeMs;
+      expect(await waitFor(async () => (await stat(lock)).mtimeMs > first)).toBe(true);
+    }, { updateMs: 20 });
+    await expect(stat(lock)).rejects.toThrow();
+  });
+
+  test("release never races an in-flight touch: no leaked lock dir", async () => {
+    const dir = join(root, "race");
+    const lock = join(dir, ".oauth_refresh.lock");
+    for (let i = 0; i < 500; i++) {
+      await withOauthRefreshLock(dir, () => new Promise<void>((r) => setTimeout(r, Math.random() * 3)), { updateMs: 1 });
+      await expect(stat(lock)).rejects.toThrow();
+    }
+  });
+
+  test("release leaves a lock that Claude Code broke and re-took, and the caller sees the loss", async () => {
+    const dir = join(root, "stolen");
+    const lock = join(dir, ".oauth_refresh.lock");
+    let lost = false;
+    const warn = console.warn;
+    console.warn = () => undefined;
+    try {
+      await withOauthRefreshLock(dir, async (handle) => {
+        await rm(lock, { recursive: true });
+        await mkdir(lock); // Claude Code's re-acquired lock
+        // Coarse-mtime filesystems may reuse the inode and the mtime: make the replacement distinguishable.
+        const later = new Date(Date.now() + 2000);
+        await utimes(lock, later, later);
+        lost = await waitFor(async () => handle.isLost());
+      }, { updateMs: 10 });
+    } finally {
+      console.warn = warn;
+    }
+    expect(lost).toBe(true);
+    expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+
+  test("a transient stat failure after a touch does not mark the lock lost", async () => {
+    const dir = join(root, "flaky-stat");
+    const lock = join(dir, ".oauth_refresh.lock");
+    const real = fsp.stat;
+    let calls = 0;
+    let failed = false;
+    const spy = spyOn(fsp, "stat").mockImplementation((async (...args: Parameters<typeof real>) => {
+      calls++;
+      // 1: acquire, 2: tick compare, 3: tick read-back after utimes -> fail once
+      if (calls === 3 && !failed) { failed = true; throw Object.assign(new Error("EIO"), { code: "EIO" }); }
+      return real(...args);
+    }) as typeof real);
+    try {
+      await withOauthRefreshLock(dir, async (handle) => {
+        await new Promise((r) => setTimeout(r, 150));
+        expect(failed).toBe(true);
+        expect(handle.isLost()).toBe(false);
+      }, { updateMs: 20 });
+    } finally {
+      spy.mockRestore();
+    }
+    await expect(real(lock)).rejects.toThrow();
+  });
+
+  test("a 30s-old .oauth_refresh.lock is fresh (Claude Code 2.1.295 stale is 60s)", async () => {
+    const dir = join(root, "fresh-refresh");
+    const lock = join(dir, ".oauth_refresh.lock");
+    await mkdir(lock, { recursive: true });
+    const old = new Date(Date.now() - 30_000);
+    await utimes(lock, old, old);
+    const err = await withOauthRefreshLock(dir, async () => undefined, { timeoutMs: 200 }).catch((e) => e);
+    expect(err).toBeInstanceOf(SwapLockError);
+    expect((err as SwapLockError).timedOut).toBe(true);
+    expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+
+  test("a 15s-old .claude.json.lock is stale (10s) and broken", async () => {
+    const dir = join(root, "stale-json");
+    await mkdir(join(dir, ".claude.json.lock"), { recursive: true });
+    const old = new Date(Date.now() - 15_000);
+    await utimes(join(dir, ".claude.json.lock"), old, old);
+    let ran = false;
+    await withClaudeLocks(dir, async () => { ran = true; }, { timeoutMs: 500 });
     expect(ran).toBe(true);
   });
 });
