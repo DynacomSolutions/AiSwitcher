@@ -36,17 +36,35 @@ export interface LockOptions {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** Passed to the callback of the `with*Lock` helpers. */
+export interface LockHandle {
+  /** True once the lock dir was removed or replaced under us (e.g. Claude Code broke it as stale). */
+  isLost(): boolean;
+}
+
+interface HeldLock extends LockHandle {
+  release(): Promise<void>;
+}
+
 /**
  * Keeps a just-created lock dir fresh (like proper-lockfile's update loop) and
  * returns a release that removes the dir only while it is still the one we
  * made. If Claude Code broke it as stale and re-took it, its dir has another
- * inode/mtime and must be left alone.
+ * inode/mtime and must be left alone. Release waits for an in-flight touch so
+ * the two never interleave.
  */
-async function own(lockPath: string, updateMs: number): Promise<() => Promise<void>> {
+async function own(lockPath: string, updateMs: number): Promise<HeldLock> {
   let mine = await stat(lockPath);
   let lost = false;
+  let released = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let running: Promise<void> = Promise.resolve();
   const same = (s: { ino: number; mtimeMs: number }) => s.ino === mine.ino && s.mtimeMs === mine.mtimeMs;
+  const schedule = () => {
+    if (released || lost) return;
+    timer = setTimeout(() => { running = tick(); }, updateMs);
+    timer.unref();
+  };
   const tick = async () => {
     try {
       if (!same(await stat(lockPath))) { lost = true; return; }
@@ -57,23 +75,26 @@ async function own(lockPath: string, updateMs: number): Promise<() => Promise<vo
       if ((err as NodeJS.ErrnoException).code === "ENOENT") { lost = true; return; }
       // transient failure: retry next tick, the lock is still ours
     }
-    timer = setTimeout(tick, updateMs);
-    timer.unref();
+    schedule();
   };
-  timer = setTimeout(tick, updateMs);
-  timer.unref();
-  return async () => {
-    clearTimeout(timer);
-    if (lost) return;
-    try {
-      if (same(await stat(lockPath))) await rmdir(lockPath);
-    } catch {
-      // already gone or not ours
-    }
+  schedule();
+  return {
+    isLost: () => lost,
+    release: async () => {
+      released = true;
+      clearTimeout(timer);
+      await running;
+      if (lost) return;
+      try {
+        if (same(await stat(lockPath))) await rmdir(lockPath);
+      } catch {
+        // already gone or not ours
+      }
+    },
   };
 }
 
-async function acquire(lockPath: string, options: LockOptions): Promise<() => Promise<void>> {
+async function acquire(lockPath: string, options: LockOptions): Promise<HeldLock> {
   const timeoutMs = options.timeoutMs ?? 5_000;
   const staleMs = options.staleMs ?? (lockPath.endsWith(".oauth_refresh.lock") ? 60_000 : 10_000);
   const updateMs = options.updateMs ?? 5_000;
@@ -116,38 +137,45 @@ export function claudeJsonLockPath(configDir: string): string {
   return join(configDir, ".claude.json.lock");
 }
 
+const noteLost = (path: string, held: HeldLock) => {
+  if (held.isLost()) console.warn(`[ais] lock ${path} was broken while held; Claude Code may have used the same refresh token`);
+};
+
 /** Runs `fn` while holding both Claude Code locks of `configDir`. */
-export async function withClaudeLocks<T>(configDir: string, fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
+export async function withClaudeLocks<T>(configDir: string, fn: (handle: LockHandle) => Promise<T>, options: LockOptions = {}): Promise<T> {
   await mkdir(configDir, { recursive: true });
-  const releaseRefresh = await acquire(oauthRefreshLockPath(configDir), options);
+  const refresh = await acquire(oauthRefreshLockPath(configDir), options);
   try {
-    const releaseJson = await acquire(claudeJsonLockPath(configDir), options);
+    const json = await acquire(claudeJsonLockPath(configDir), options);
     try {
-      return await fn();
+      return await fn({ isLost: () => refresh.isLost() || json.isLost() });
     } finally {
-      await releaseJson();
+      await json.release();
+      noteLost(claudeJsonLockPath(configDir), json);
     }
   } finally {
-    await releaseRefresh();
+    await refresh.release();
+    noteLost(oauthRefreshLockPath(configDir), refresh);
   }
 }
 
 /** Runs `fn` while holding only `<configDir>/.oauth_refresh.lock`. */
-export async function withOauthRefreshLock<T>(configDir: string, fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
+export async function withOauthRefreshLock<T>(configDir: string, fn: (handle: LockHandle) => Promise<T>, options: LockOptions = {}): Promise<T> {
   await mkdir(configDir, { recursive: true });
-  const release = await acquire(oauthRefreshLockPath(configDir), options);
+  const held = await acquire(oauthRefreshLockPath(configDir), options);
   try {
-    return await fn();
+    return await fn(held);
   } finally {
-    await release();
+    await held.release();
+    noteLost(oauthRefreshLockPath(configDir), held);
   }
 }
 
 /** Runs `fn` while holding `.oauth_refresh.lock` of every dir, acquired in
  * sorted order (a stable order across callers, so two holders of
  * overlapping sets cannot deadlock). */
-export async function withOauthRefreshLocks<T>(dirs: string[], fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
+export async function withOauthRefreshLocks<T>(dirs: string[], fn: (handle: LockHandle) => Promise<T>, options: LockOptions = {}): Promise<T> {
   const [first, ...rest] = [...new Set(dirs)].sort();
-  if (first === undefined) return fn();
-  return withOauthRefreshLock(first, () => withOauthRefreshLocks(rest, fn, options), options);
+  if (first === undefined) return fn({ isLost: () => false });
+  return withOauthRefreshLock(first, (own) => withOauthRefreshLocks(rest, (inner) => fn({ isLost: () => own.isLost() || inner.isLost() }), options), options);
 }
