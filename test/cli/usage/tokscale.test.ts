@@ -63,7 +63,7 @@ describe("tokscaleInvocationFor", () => {
   test("claude: sets CLAUDE_CONFIG_DIR (replacing the default root) and no additive extra dir", async () => {
     const { env, clientArgs } = (await tokscaleInvocationFor(
       "claude",
-      identity("/Users/alice/.claude/identities/identity-a"),
+      identity("/home/user/.claude/identities/identity-a"),
     ))!;
     expect(env).toEqual({ CLAUDE_CONFIG_DIR: "/home/user/.claude/identities/identity-a" });
     expect(clientArgs).toEqual(["--client", "claude"]);
