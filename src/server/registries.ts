@@ -13,6 +13,7 @@ import {
 } from "../cli/identities/actions.ts";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { expandPath } from "../identities/index.ts";
+import { translateHostPath } from "../identities/match.ts";
 import { isRetired } from "../identities/retired.ts";
 import { purgeRetiredIdentityCredentials, type PurgeOptions, type PurgeReport } from "../identities/retire-credentials.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } from "../identities/store.ts";
@@ -64,7 +65,7 @@ export async function listRegistries(configs: ToolConfig[] = Object.values(TOOL_
       const dto = registryDto(cfg, file);
       await Promise.all(
         dto.identities.map(async (identity) => {
-          identity.configDirExists = await dirExists(identity.configDir);
+          identity.configDirExists = await dirExists(translateHostPath(identity.configDir));
         }),
       );
       return dto;

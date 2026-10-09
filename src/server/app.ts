@@ -39,6 +39,7 @@ import {
 } from "./registries.ts";
 import { scanProcesses } from "./processes.ts";
 import * as filesApi from "./files.ts";
+import { buildPermissions } from "./permissions.ts";
 
 export interface ConsoleAppDeps extends GuardDeps {
   startedAt: number;
@@ -309,6 +310,13 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     const ok = await deps.authRefresh.refreshNow(tool, requireString(body.identity, "identity"));
     const status = deps.authRefresh.status().find((entry) => entry.tool === tool && entry.identity === body.identity);
     return c.json({ ok, status });
+  });
+
+  /* ------------------------------- permissions ----------------------------- */
+
+  app.get("/api/permissions", async (c) => {
+    const refresh = queryValue(c, "refresh");
+    return c.json(await buildPermissions({ refresh: refresh === "1" || refresh === "true" }));
   });
 
   /* ---------------------------------- files -------------------------------- */

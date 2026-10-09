@@ -12,6 +12,7 @@ import type {
   LoginFlow,
   LoginFlowsResponse,
   LoginStartResult,
+  PermissionsDto,
   PatchIdentityBody,
   ProcessesResponse,
   RegistriesResponse,
@@ -99,6 +100,8 @@ export const api = {
   getSpendGuard: () => request<SpendGuardResponse>("/api/spend-guard"),
 
   getHerdrBridge: () => request<HerdrBridgeResponse>("/api/herdr-bridge"),
+
+  getPermissions: (refresh = false) => request<PermissionsDto>(refresh ? "/api/permissions?refresh=1" : "/api/permissions"),
 
   getIdentities: () => request<RegistriesResponse>("/api/identities"),
   createIdentity: (tool: ToolName, body: CreateIdentityBody) =>
