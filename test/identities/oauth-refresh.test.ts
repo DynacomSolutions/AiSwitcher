@@ -251,11 +251,20 @@ describe("shouldAttemptOAuthRefresh (scheduler cadence)", () => {
       expect(claude(7 * 3600, new Date((NOW - 30 * 3600) * 1000).toISOString()).attempt).toBe(false);
     });
 
-    test("other tools keep the 24h window and the daily keep-alive", () => {
+    test("grok and kimi use short windows and no daily keep-alive", () => {
+      const at = (tool: "grok" | "kimi", secondsLeft: number, lastSuccessAt: string | null = null) =>
+        shouldAttemptOAuthRefresh({ access_token: "x", expires_at: NOW + secondsLeft }, { tool, expiryWindowHours: 24, lastSuccessAt, nowSeconds: NOW }).attempt;
+      expect(at("grok", 5.9 * 3600)).toBe(false);
+      expect(at("grok", 5.9 * 3600, new Date((NOW - 30 * 3600) * 1000).toISOString())).toBe(false);
+      expect(at("grok", 1800)).toBe(true);
+      expect(at("kimi", 14 * 60)).toBe(true);
+      expect(at("kimi", 20 * 60)).toBe(false);
+      expect(at("kimi", 20 * 60, new Date((NOW - 30 * 3600) * 1000).toISOString())).toBe(false);
+    });
+
+    test("codex keeps the 24h window and the daily keep-alive", () => {
       const grant = { access_token: "x", expires_at: NOW + 7 * 3600 };
-      for (const tool of ["codex", "grok", "kimi"] as const) {
-        expect(shouldAttemptOAuthRefresh(grant, { tool, expiryWindowHours: 24, lastSuccessAt: null, nowSeconds: NOW }).attempt).toBe(true);
-      }
+      expect(shouldAttemptOAuthRefresh(grant, { tool: "codex", expiryWindowHours: 24, lastSuccessAt: null, nowSeconds: NOW }).attempt).toBe(true);
       expect(
         shouldAttemptOAuthRefresh(
           { access_token: "x", expires_at: NOW + 10 * 86_400 },

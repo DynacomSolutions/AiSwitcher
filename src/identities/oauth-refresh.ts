@@ -349,17 +349,18 @@ export async function writeGrantThroughStores(
  * access token is within `expiryWindowHours` of expiry, and at least once
  * a day even for long-lived tokens (so a healthy grant is still exercised
  * and any rotation is propagated). Manual refreshes pass force=true.
- * Claude's ~8h access token is always inside a 24h window, so it would be
- * rotated every tick and log out sessions holding the previous refresh
- * token: for tool "claude" the window is capped at CLAUDE_EXPIRY_WINDOW_HOURS
- * and the daily keep-alive is skipped (a valid token rotates naturally). */
+ * Short-lived access tokens (claude ~8h, grok ~6h, kimi ~15min) are always
+ * inside a 24h window, so they would be rotated every tick and log out
+ * sessions holding the previous refresh token: tools in
+ * SHORT_TOKEN_EXPIRY_WINDOW_HOURS cap the window to their entry and skip
+ * the daily keep-alive (a valid token rotates naturally). */
 export function shouldAttemptOAuthRefresh(
   grant: OAuthGrant,
   options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number; tool?: RefreshableTool },
 ): { attempt: boolean; reason: string } {
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
-  const isClaude = options.tool === "claude";
-  const windowHours = Math.min(options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS, isClaude ? CLAUDE_EXPIRY_WINDOW_HOURS : Infinity);
+  const toolWindow = options.tool === undefined ? undefined : SHORT_TOKEN_EXPIRY_WINDOW_HOURS[options.tool];
+  const windowHours = Math.min(options.expiryWindowHours ?? DEFAULT_EXPIRY_WINDOW_HOURS, toolWindow ?? Infinity);
   const windowSeconds = windowHours * 3600;
   const secondsLeft = grant.expires_at === undefined ? Number.POSITIVE_INFINITY : grant.expires_at - now;
   if (options.force) return { attempt: true, reason: "manual refresh" };
@@ -372,7 +373,7 @@ export function shouldAttemptOAuthRefresh(
           : `access token expires in ${(secondsLeft / 3600).toFixed(1)}h (window ${windowHours}h)`,
     };
   }
-  if (isClaude && grant.expires_at !== undefined) {
+  if (toolWindow !== undefined && grant.expires_at !== undefined) {
     return { attempt: false, reason: `access token expires in ${(secondsLeft / 3600).toFixed(1)}h (window ${windowHours}h) — nothing to do` };
   }
   const last = options.lastSuccessAt !== null && options.lastSuccessAt !== undefined ? Date.parse(options.lastSuccessAt) : NaN;
@@ -387,6 +388,17 @@ export function shouldAttemptOAuthRefresh(
 
 /** Claude refreshes this close to expiry (comfortably above the 10-minute tick). */
 export const CLAUDE_EXPIRY_WINDOW_HOURS = 1;
+/** Per-tool refresh window for tools with short-lived access tokens; codex
+ * (~10 day tokens) is absent and keeps the configured window + keep-alive.
+ * Every window must stay above the daemon tick (10 min) plus margin, or a
+ * token could lapse between ticks. Kimi's ~15 min token is shorter than
+ * 1.5 ticks, so it still refreshes about once per tick: no window can both
+ * beat the tick and leave a 15 min token alone. */
+export const SHORT_TOKEN_EXPIRY_WINDOW_HOURS: Partial<Record<RefreshableTool, number>> = {
+  claude: CLAUDE_EXPIRY_WINDOW_HOURS,
+  grok: 1,
+  kimi: 0.25,
+};
 export const DEFAULT_EXPIRY_WINDOW_HOURS = 24;
 
 /** claude member that is active in a swap pool: the freshest of its own

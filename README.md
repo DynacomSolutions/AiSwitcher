@@ -1006,9 +1006,10 @@ swaps at once (needs `ais` on PATH).
 
 While a member is active, the pool's `.credentials.json` is another store of
 that member's grant: the daemon refresh writes through to it and picks the
-freshest copy, and never refreshes the pool identity itself. Claude refreshes
-only inside the last hour of its ~8h access token (no daily keep-alive while the
-token is valid), holding `.oauth_refresh.lock` of the member dir and every pool
+freshest copy, and never refreshes the pool identity itself. Claude and grok refresh
+only inside the last hour of their access tokens, kimi inside its last 15 minutes
+(no daily keep-alive while a token is valid; codex keeps its 24h window and daily
+keep-alive). Claude's refresh holds `.oauth_refresh.lock` of the member dir and every pool
 dir (sorted order) across the whole read-freshest, POST and write-through, and
 skipping if a fresher copy appears once locked. `ais usage` shows
 the pool as its own row; `ais claude-swap usage` (and `GET /api/claude-swap`
