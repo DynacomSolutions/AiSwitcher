@@ -88,12 +88,12 @@ async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promis
   if (!grant) return { error: "no Claude login stored for this account" };
   if (grant.expires_at !== undefined && grant.expires_at - EXPIRY_SKEW_SECONDS <= nowSeconds) {
     const result = await refreshIdentityOAuthGrant("claude", member, {
-      force: true,
+      // Not forced: under the lock a fresher non-expired grant (rotated by someone else) is kept, not re-rotated.
       ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
       ...(deps.now ? { now: deps.now } : {}),
       ...(deps.claudeRegistryPath ? { claudeRegistryPath: deps.claudeRegistryPath } : {}),
     }).catch((err: unknown) => ({ outcome: "failed" as const, detail: err instanceof Error ? err.message : String(err) }));
-    if (result.outcome !== "refreshed") return { error: `token expired and refresh failed: ${result.detail}` };
+    if (result.outcome !== "refreshed" && result.outcome !== "skipped-fresh") return { error: `token expired and refresh failed: ${result.detail}` };
     grant = await read();
     if (!grant) return { error: "no Claude login stored for this account" };
   }

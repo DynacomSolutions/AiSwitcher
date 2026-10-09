@@ -496,6 +496,97 @@ describe("refreshIdentityOAuthGrant: anthropic swap pool locking", () => {
   });
 });
 
+describe("refreshIdentityOAuthGrant: anthropic swap pool review fixes", () => {
+  let poolDir: string;
+  let registry: string;
+  const creds = (dir: string, refresh: string, expiresAtSeconds: number) =>
+    json(join(dir, ".credentials.json"), {
+      claudeAiOauth: { accessToken: "at-syn-cla", refreshToken: refresh, expiresAt: expiresAtSeconds * 1000 },
+    });
+  const refreshRefreshToken = async (dir: string) =>
+    (await readJson<{ claudeAiOauth: { refreshToken: string } }>(join(dir, ".credentials.json"))).claudeAiOauth.refreshToken;
+  const opts = (extra: Record<string, unknown> = {}) => ({ claudeRegistryPath: registry, now: () => NOW * 1000, ...extra });
+
+  beforeEach(async () => {
+    poolDir = join(dirs.claude, "..", "pool");
+    await mkdir(poolDir, { recursive: true });
+    registry = join(dirs.claude, "..", "pool-registry.json");
+    await json(registry, {
+      version: 1,
+      identities: [
+        { name: ACME, label: "Acme", configDir: dirs.claude },
+        { name: "pool", label: "Pool", configDir: poolDir, swapPool: { accounts: [ACME], active: ACME } },
+      ],
+    });
+  });
+
+  test("an idle tick still converges diverged member and pool stores", async () => {
+    await creds(dirs.claude, "rt-old-1", NOW + 6 * 3600);
+    await creds(poolDir, "rt-newer-2", NOW + 7 * 3600);
+    const { calls, fetchImpl } = stubFetch([tokenResponse()]);
+    const result = await refreshIdentityOAuthGrant("claude", identityIn(dirs.claude), opts({ fetchImpl }));
+    expect(result.outcome).toBe("skipped-fresh");
+    expect(calls).toHaveLength(0);
+    expect(await refreshRefreshToken(dirs.claude)).toBe("rt-newer-2");
+    expect(await refreshRefreshToken(poolDir)).toBe("rt-newer-2");
+  });
+
+  test("a pool listed after the locks were taken is never written without its lock", async () => {
+    const lateDir = join(dirs.claude, "..", "late");
+    await mkdir(lateDir, { recursive: true });
+    await creds(dirs.claude, "rt-old-1", NOW + 600);
+    await creds(poolDir, "rt-old-1", NOW + 600);
+    const fetchImpl = (async () => {
+      await json(registry, {
+        version: 1,
+        identities: [
+          { name: ACME, label: "Acme", configDir: dirs.claude },
+          { name: "pool", label: "Pool", configDir: poolDir, swapPool: { accounts: [ACME], active: ACME } },
+          { name: "late", label: "Late", configDir: lateDir, swapPool: { accounts: [ACME], active: ACME } },
+        ],
+      });
+      return new Response(JSON.stringify({ access_token: "at-new", refresh_token: "rt-new-1", expires_in: 28_800 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const result = await refreshIdentityOAuthGrant("claude", identityIn(dirs.claude), opts({ fetchImpl }));
+    expect(result.outcome).toBe("refreshed");
+    expect(existsSync(join(lateDir, ".credentials.json"))).toBe(false);
+  });
+
+  test("takes pool locks before the member lock, so a concurrent swap cannot invert", async () => {
+    await creds(dirs.claude, "rt-old-1", NOW + 600);
+    await creds(poolDir, "rt-old-1", NOW + 600);
+    const { fetchImpl } = stubFetch([tokenResponse({ refresh_token: "rt-new-1" })]);
+    let pending: Promise<unknown> | undefined;
+    // Swap order: pool lock, then the member (owner) lock.
+    await withOauthRefreshLock(poolDir, async () => {
+      pending = refreshIdentityOAuthGrant("claude", identityIn(dirs.claude), opts({ fetchImpl }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await withOauthRefreshLock(dirs.claude, async () => undefined, { timeoutMs: 1000 });
+    });
+    expect(((await pending) as { outcome: string }).outcome).toBe("refreshed");
+  });
+
+  test("a busy lock is a skip, not a failure (unless forced)", async () => {
+    await creds(dirs.claude, "rt-old-1", NOW + 600);
+    await creds(poolDir, "rt-old-1", NOW + 600);
+    const { calls, fetchImpl } = stubFetch([tokenResponse()]);
+    let result: { outcome: string; detail: string } | undefined;
+    await withOauthRefreshLock(poolDir, async () => {
+      result = await refreshIdentityOAuthGrant("claude", identityIn(dirs.claude), opts({ fetchImpl }));
+    });
+    expect(result!.outcome).toBe("skipped-fresh");
+    expect(result!.detail).toContain("lock busy");
+    expect(calls).toHaveLength(0);
+  }, 15_000);
+
+  test("no refresh token and not forced: no-grant without creating the config dir", async () => {
+    const gone = join(dirs.claude, "..", "gone");
+    const result = await refreshIdentityOAuthGrant("claude", { name: ACME, label: "Acme", configDir: gone }, opts());
+    expect(result.outcome).toBe("no-grant");
+    expect(existsSync(gone)).toBe(false);
+  });
+});
+
 describe("refreshIdentityOAuthGrant: xai (grok)", () => {
   test("discovers the token endpoint from the account entry and rewrites the right entry, siblings untouched", async () => {
     const iso = (seconds: number): string => new Date(seconds * 1000).toISOString();
