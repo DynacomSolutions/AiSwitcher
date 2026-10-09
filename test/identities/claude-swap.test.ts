@@ -103,6 +103,17 @@ describe("decideWriteBack", () => {
 });
 
 describe("performSwap", () => {
+  test("a target without oauthAccount removes the pool's previous one", async () => {
+    await writeRegistry();
+    await writeFile(join(root, "b", ".claude.json"), JSON.stringify({ theme: "light" }));
+    const r = await performSwap({ registryPath: registry, ledgerPath: ledger, target: "b", reason: "manual" });
+    expect(r.notes.join(" ")).toContain("previous oauthAccount was removed");
+    const cj = await read(join(root, "pool", ".claude.json"));
+    expect(cj.oauthAccount).toBeUndefined();
+    expect(cj.theme).toBe("dark");
+    expect((await read(join(root, "pool", ".credentials.json"))).claudeAiOauth.accessToken).toBe("at-b1");
+  });
+
   test("copies credentials and oauthAccount, preserves other keys, mode 0600, persists active, logs event", async () => {
     await writeRegistry();
     const r = await performSwap({ registryPath: registry, ledgerPath: ledger, target: "b", reason: "manual" });
@@ -275,6 +286,23 @@ describe("refresh integration with a pool", () => {
     } finally {
       await chmod(join(root, "pool"), 0o700);
     }
+  });
+
+  test("unlocked convergence re-checks the account under the locks (mid-swap pool is never copied into the member)", async () => {
+    await writeRegistry();
+    // Mid-swap: pool credentials already b's and fresher, pool .claude.json still names a.
+    await writeFile(join(root, "pool", ".credentials.json"), cred("at-b2", "rt-b2", NOW_S + 8 * 3600));
+    const a = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "a")!;
+    // The swap holds the pool lock and finishes its .claude.json write before releasing.
+    let pending: ReturnType<typeof convergeClaudePoolStores> | undefined;
+    await withOauthRefreshLock(join(root, "pool"), async () => {
+      pending = convergeClaudePoolStores(a, registry);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await writeFile(join(root, "pool", ".claude.json"), claudeJson("uuid-b"));
+    });
+    expect((await pending!).written).toEqual([]);
+    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-a1");
+    expect((await read(join(root, "pool", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-b2");
   });
 
   test("the pool identity itself is never refreshed", async () => {

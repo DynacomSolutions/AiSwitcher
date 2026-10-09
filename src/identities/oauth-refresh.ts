@@ -429,12 +429,28 @@ export async function convergeClaudePoolStores(
   for (const copy of copies) if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
   if (!best) return { written, failed };
   const fp = grantFingerprint(best.grant);
-  for (let i = 0; i < dirs.length; i++) {
-    const copy = copies[i];
-    if (copy && grantFingerprint(copy.grant) === fp && copy.grant.access_token === best.grant.access_token) continue;
+  const same = (copy: (typeof copies)[number]) =>
+    copy !== undefined && grantFingerprint(copy.grant) === fp && copy.grant.access_token === best!.grant.access_token;
+  if (!locksHeld) {
+    if (copies.every(same)) return { written, failed };
+    // A difference: the unlocked read may be mid-swap (pool credentials already another account's while its
+    // .claude.json still names this one). Re-check under the same locks, in the same order, as the refresh.
     try {
-      const write = () => writeProviderGrantCopy("claude", dirs[i]!, best!.grant);
-      await (locksHeld ? write() : withOauthRefreshLock(dirs[i]!, write));
+      return await withOauthRefreshLocks(poolDirs, () =>
+        withOauthRefreshLock(identity.configDir, async () =>
+          convergeClaudePoolStores(identity, registryPath, true, await sameAccountDirs(identity, poolDirs)),
+        ),
+      );
+    } catch (err) {
+      if (err instanceof SwapLockError && err.timedOut) return { written, failed }; // busy: next tick
+      failed.push({ path: identity.configDir, error: err instanceof Error ? err.message : String(err) });
+      return { written, failed };
+    }
+  }
+  for (let i = 0; i < dirs.length; i++) {
+    if (same(copies[i])) continue;
+    try {
+      await writeProviderGrantCopy("claude", dirs[i]!, best.grant);
       written.push(dirs[i]!);
     } catch (err) {
       failed.push({ path: dirs[i]!, error: err instanceof Error ? err.message : String(err) });
