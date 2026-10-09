@@ -50,6 +50,20 @@ export function translateHostPath(
   return raw;
 }
 
+/** Inverse of `translateHostPath`: rewrites a local-home path back to the host
+ * home so registries never persist container paths. No-op outside a container. */
+export function untranslateHostPath(
+  raw: string,
+  env: Record<string, string | undefined> = process.env,
+  localHome: string = homedir(),
+): string {
+  const hostHome = stripTrailingSlash(env.AIS_HOST_HOME?.trim() || localHome);
+  if (hostHome === localHome || hostHome === "") return raw;
+  if (raw === localHome) return hostHome;
+  if (raw.startsWith(`${localHome}/`)) return hostHome + raw.slice(localHome.length);
+  return raw;
+}
+
 /** Tilde-expand, realpath-resolve (if it exists), and strip any trailing
  * separator — the canonical form used to compare a cwd against a pattern's
  * base. Exported so other directory-pattern matchers (e.g. chrome-profile.ts)
