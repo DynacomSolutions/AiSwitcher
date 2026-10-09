@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   grantFingerprint,
@@ -228,10 +229,38 @@ export interface WriteThroughReport {
 export async function poolStoreDirsFor(identity: Identity, registryPath?: string): Promise<string[]> {
   try {
     const file = await loadIdentitiesFile(registryPath ?? CLAUDE_CONFIG.identitiesJsonPath);
-    return poolsHoldingMember(file, identity.name).map((pool) => pool.configDir);
+    return sameAccountDirs(identity, poolsHoldingMember(file, identity.name).map((pool) => pool.configDir));
   } catch {
     return [];
   }
+}
+
+async function oauthAccountUuid(dir: string): Promise<string | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(join(expandPath(dir), ".claude.json"), "utf8")) as { oauthAccount?: { accountUuid?: unknown } };
+    const uuid = parsed.oauthAccount?.accountUuid;
+    return typeof uuid === "string" ? uuid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Drops pool dirs whose `.claude.json` oauthAccount belongs to a DIFFERENT
+ * account than the member's own. `ais claude-swap` writes the pool's
+ * credentials and oauthAccount together under the pool lock but saves
+ * `swapPool.active` only after releasing it, so a registry read can still
+ * say "active = this member" while the pool already holds another account's
+ * grant; that grant must never be converged into the member's store. An
+ * unknown uuid on either side cannot be compared and is kept. */
+export async function sameAccountDirs(identity: Identity, dirs: string[]): Promise<string[]> {
+  if (dirs.length === 0) return dirs;
+  const own = await oauthAccountUuid(identity.configDir);
+  if (own === undefined) return dirs;
+  const keep = await Promise.all(dirs.map(async (dir) => {
+    const theirs = await oauthAccountUuid(dir);
+    return theirs === undefined || theirs === own;
+  }));
+  return dirs.filter((_, i) => keep[i]);
 }
 
 async function piIdentityFor(identityName: string): Promise<Identity | undefined> {
@@ -251,6 +280,9 @@ async function writePiGrant(provider: string, piDir: string, grant: OAuthGrant, 
   await writePiEntry(path, provider, grant, backups);
   return path;
 }
+
+/** Writes the rotated grant through to EVERY store of the account per the
+ * one-credential law: the native store (in its own shape) and the
 
 /** Writes the rotated grant through to EVERY store of the account per the
  * one-credential law: the native store (in its own shape) and the
@@ -538,7 +570,7 @@ export async function refreshIdentityOAuthGrant(
   try {
     return await withOauthRefreshLocks(poolDirs, () => withOauthRefreshLock(identity.configDir, inner));
   } catch (err) {
-    if (!options.force && err instanceof SwapLockError) {
+    if (!options.force && err instanceof SwapLockError && err.timedOut) {
       return { tool, identity: identity.name, outcome: "skipped-fresh", detail: `lock busy (${err.message}) — will retry next tick`, written: [], writeFailures: [] };
     }
     throw err;
@@ -550,6 +582,8 @@ async function refreshGrantUnlocked(
   identity: Identity,
   options: OAuthRefreshOptions,
 ): Promise<IdentityGrantRefresh> {
+  // Under the locks, re-verify the account of each pool dir (a swap may have landed while we waited).
+  if (options.lockedPoolDirs) options = { ...options, lockedPoolDirs: await sameAccountDirs(identity, options.lockedPoolDirs) };
   const base: IdentityGrantRefresh = { tool, identity: identity.name, outcome: "failed", detail: "", written: [], writeFailures: [] };
   const now = options.now ?? Date.now;
   const nowSeconds = () => Math.floor(now() / 1000);

@@ -13,6 +13,8 @@ export class SwapLockError extends Error {
   constructor(
     message: string,
     readonly lockPath: string,
+    /** True only for a wait timeout (a holder is busy), not for mkdir failures like EACCES. */
+    readonly timedOut = false,
   ) {
     super(message);
     this.name = "SwapLockError";
@@ -58,6 +60,7 @@ async function acquire(lockPath: string, options: LockOptions): Promise<() => Pr
       throw new SwapLockError(
         `could not take lock ${lockPath} within ${timeoutMs}ms (a Claude Code session is probably refreshing its token right now; retry in a moment)`,
         lockPath,
+        true,
       );
     }
     await sleep(pollMs);

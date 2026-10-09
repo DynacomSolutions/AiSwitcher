@@ -3,10 +3,12 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activeMemberAt, decideWriteBack, performSwap, readSwapEvents } from "../../src/identities/claude-swap.ts";
-import { withClaudeLocks, SwapLockError } from "../../src/identities/claude-swap-lock.ts";
+import { withClaudeLocks, withOauthRefreshLock, SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { chooseBest, swapIfLimited } from "../../src/identities/claude-swap-ops.ts";
 import { parseUsageBody, fetchMemberUsage } from "../../src/identities/claude-usage-api.ts";
 import { refreshIdentityOAuthGrant, writeGrantThroughStores, convergeClaudePoolStores } from "../../src/identities/oauth-refresh.ts";
+import { PI_CONFIG } from "../../src/identities/tool-configs.ts";
+import { chmod } from "node:fs/promises";
 import { loadIdentitiesFile, parseIdentitiesFile } from "../../src/identities/store.ts";
 import { validateMembers } from "../../src/identities/swap-pool.ts";
 import { claudeSwapLaunchCheck } from "../../src/identities/claude-swap-launch.ts";
@@ -232,6 +234,49 @@ describe("refresh integration with a pool", () => {
     expect((await read(join(root, "pool", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-a4");
   });
 
+  test("a swap landing while refresh waits for the pool lock never copies the other account into the member", async () => {
+    await writeRegistry();
+    const a = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "a")!;
+    const seen: string[] = [];
+    const fetchImpl = (async (_url: unknown, init?: { body?: URLSearchParams }) => {
+      seen.push(String(init?.body?.get("refresh_token")));
+      return new Response(JSON.stringify({ access_token: "at-a3", refresh_token: "rt-a3", expires_in: 3600 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    let pending: Promise<{ outcome: string }> | undefined;
+    // Simulate `ais claude-swap` a -> b: pool lock held, b's grant + account written, registry saved afterwards.
+    await withOauthRefreshLock(join(root, "pool"), async () => {
+      pending = refreshIdentityOAuthGrant("claude", a, { fetchImpl, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await writeFile(join(root, "pool", ".credentials.json"), cred("at-b2", "rt-b2", NOW_S + 8 * 3600));
+      await writeFile(join(root, "pool", ".claude.json"), claudeJson("uuid-b"));
+    });
+    await writeRegistry({ active: "b" });
+    const out = await pending!;
+    expect(out.outcome).toBe("refreshed");
+    expect(seen).toEqual(["rt-a1"]);
+    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-a3");
+    expect((await read(join(root, "pool", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-b2");
+  });
+
+  test("lock timeout is timedOut; a mkdir failure is not and still throws out of refresh", async () => {
+    await writeRegistry();
+    await withOauthRefreshLock(join(root, "a"), async () => {
+      const err = await withOauthRefreshLock(join(root, "a"), async () => undefined, { timeoutMs: 100 }).catch((e) => e);
+      expect(err).toBeInstanceOf(SwapLockError);
+      expect(err.timedOut).toBe(true);
+    });
+    if (process.getuid?.() === 0) return; // root ignores directory permissions
+    const a = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "a")!;
+    await chmod(join(root, "pool"), 0o500);
+    try {
+      const err = await refreshIdentityOAuthGrant("claude", a, { claudeRegistryPath: registry, now: () => NOW_S * 1000, fetchImpl: (async () => { throw new Error("must not call"); }) as unknown as typeof fetch }).catch((e) => e);
+      expect(err).toBeInstanceOf(SwapLockError);
+      expect(err.timedOut).toBe(false);
+    } finally {
+      await chmod(join(root, "pool"), 0o700);
+    }
+  });
+
   test("the pool identity itself is never refreshed", async () => {
     await writeRegistry();
     const pool = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "pool")!;
@@ -276,6 +321,39 @@ describe("usage api", () => {
     }) as unknown as typeof fetch;
     await fetchMemberUsage(b, { fetchImpl, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
     expect(auth).toBe("Bearer at-new");
+  });
+});
+
+describe("usage api: skipped refresh with a still-expired native store", () => {
+  test("falls back to a forced refresh instead of sending the expired token", async () => {
+    await writeRegistry();
+    const piDir = join(root, "pi-b");
+    await mkdir(piDir, { recursive: true });
+    // pi holds a non-expired copy, so the unforced refresh skips; the native store stays expired.
+    await writeFile(join(piDir, "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "at-pi", refresh: "rt-b1", expires: (NOW_S + 3600) * 1000 } }));
+    const piRegistry = join(root, "pi.json");
+    await writeFile(piRegistry, JSON.stringify({ version: 1, identities: [{ name: "b", label: "b", configDir: piDir }] }));
+    const saved = PI_CONFIG.identitiesJsonPath;
+    (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = piRegistry;
+    try {
+      await writeFile(join(root, "b", ".credentials.json"), cred("at-old", "rt-b1", NOW_S - 10));
+      const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+      let auth = "";
+      let tokenCalls = 0;
+      const fetchImpl = (async (url: unknown, init?: { headers?: Record<string, string> }) => {
+        if (String(url).includes("/oauth/token")) {
+          tokenCalls++;
+          return new Response(JSON.stringify({ access_token: "at-new", refresh_token: "rt-new", expires_in: 3600 }), { status: 200 });
+        }
+        auth = init?.headers?.Authorization ?? "";
+        return new Response(JSON.stringify({ five_hour: { utilization: 1 } }), { status: 200 });
+      }) as unknown as typeof fetch;
+      await fetchMemberUsage(b, { fetchImpl, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
+      expect(tokenCalls).toBe(1);
+      expect(auth).toBe("Bearer at-new");
+    } finally {
+      (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
+    }
   });
 });
 

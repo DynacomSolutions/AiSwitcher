@@ -86,16 +86,23 @@ async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promis
   };
   let grant = await read();
   if (!grant) return { error: "no Claude login stored for this account" };
-  if (grant.expires_at !== undefined && grant.expires_at - EXPIRY_SKEW_SECONDS <= nowSeconds) {
-    const result = await refreshIdentityOAuthGrant("claude", member, {
-      // Not forced: under the lock a fresher non-expired grant (rotated by someone else) is kept, not re-rotated.
-      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-      ...(deps.now ? { now: deps.now } : {}),
-      ...(deps.claudeRegistryPath ? { claudeRegistryPath: deps.claudeRegistryPath } : {}),
-    }).catch((err: unknown) => ({ outcome: "failed" as const, detail: err instanceof Error ? err.message : String(err) }));
-    if (result.outcome !== "refreshed" && result.outcome !== "skipped-fresh") return { error: `token expired and refresh failed: ${result.detail}` };
-    grant = await read();
-    if (!grant) return { error: "no Claude login stored for this account" };
+  const expired = (g: { expires_at?: number }) => g.expires_at !== undefined && g.expires_at - EXPIRY_SKEW_SECONDS <= nowSeconds;
+  if (expired(grant)) {
+    // Not forced first: under the lock a fresher non-expired grant (rotated by someone else) is kept, not re-rotated.
+    // If that skipped (lock busy, or the freshest copy was not a native store) and the stores are still expired, force.
+    for (const force of [false, true]) {
+      const result = await refreshIdentityOAuthGrant("claude", member, {
+        ...(force ? { force: true } : {}),
+        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+        ...(deps.now ? { now: deps.now } : {}),
+        ...(deps.claudeRegistryPath ? { claudeRegistryPath: deps.claudeRegistryPath } : {}),
+      }).catch((err: unknown) => ({ outcome: "failed" as const, detail: err instanceof Error ? err.message : String(err) }));
+      if (result.outcome !== "refreshed" && result.outcome !== "skipped-fresh") return { error: `token expired and refresh failed: ${result.detail}` };
+      grant = await read();
+      if (!grant) return { error: "no Claude login stored for this account" };
+      if (!expired(grant)) break;
+      if (force) return { error: "token expired and refresh failed: stores still hold an expired grant" };
+    }
   }
   return { token: grant.access_token };
 }
