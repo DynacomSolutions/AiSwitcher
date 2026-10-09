@@ -24,13 +24,13 @@ function fakeConfig(toolName: ToolConfig["toolName"], registryPath: string): Too
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "ais-perms-"));
   tempDirs.push(root);
-  const hostDir = "/synthetic/host-home/.claude/identities/a";
   const localHome = join(root, "home");
   const configDir = join(localHome, ".claude", "identities", "a");
   await mkdir(configDir, { recursive: true });
   await writeFile(join(configDir, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(ls)"], deny: ["Read(.env)"] } }));
+  // The store already hands back local paths; buildPermissions reports host form.
   const registry = join(root, "claude-identities.json");
-  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "a", label: "A", configDir: hostDir }] }));
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "a", label: "A", configDir }] }));
   const piRegistry = join(root, "pi-identities.json");
   await writeFile(piRegistry, JSON.stringify({ version: 1, identities: [{ name: "p", label: "P", configDir: join(root, "pi") }] }));
   const repos = join(root, "repos");
@@ -96,7 +96,7 @@ describe("buildPermissions", () => {
     expect(typeof entry.mtimeMs).toBe("number");
     expect(entry.size).toBeGreaterThan(0);
     expect(entry.parsedAt).toBeTruthy();
-    expect(cache.identities["claude/a"]).toBeTruthy();
+    expect(cache.identities["claude/a"].configDir).toBe("/synthetic/host-home/.claude/identities/a");
     expect(cache.repos["owner/r"]).toBeTruthy();
     expect(Object.keys(cache.worktrees)).toHaveLength(2);
     await expect(stat(`${deps.cachePath}.tmp`)).rejects.toThrow();

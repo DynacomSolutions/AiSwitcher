@@ -35,6 +35,8 @@ spec:
           image: ${AIS_IMAGE_REGISTRY}/${PROJECT}:${TAG}
           imagePullPolicy: Always
           env:
+            - name: AIS_HOST_HOME
+              value: ${AIS_HOST_HOME}
             - name: AIS_WEB_ALLOWED_HOSTS
               # Comma-separated vhostnames the guard trusts like loopback
               # peers, e.g. a rewritten internal hostname plus the raw

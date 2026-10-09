@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
 
@@ -105,5 +105,32 @@ describe("console identity mutations", () => {
     );
     const crushJson = JSON.parse(await Bun.file(join(dir, "crush.json")).text());
     expect(crushJson.providers.zai.api_key).toBe("test-key-value");
+  });
+
+  test("with AIS_HOST_HOME set: host-form configDir writes under the local home, updates persist host paths", async () => {
+    const { registryPath } = await makeHome();
+    const saved = process.env.AIS_HOST_HOME;
+    process.env.AIS_HOST_HOME = "/synthetic/host-home";
+    // os.homedir() is fixed per process, so the "container" dir is a throwaway subdir of the real home.
+    const localDir = await mkdtemp(join(homedir(), ".ais-test-hostpath-"));
+    tempDirs.push(localDir);
+    try {
+      const configs = [fakeConfig(registryPath, { toolName: "zai", realBinaryName: "crush", envVarName: "CRUSH_GLOBAL_CONFIG" })];
+      const mod = await import("../../src/server/registries.ts");
+      const hostDir = `/synthetic/host-home${localDir.slice(homedir().length)}`;
+      await mod.createIdentityInRegistry("zai", { name: "z", label: "Z", configDir: hostDir, apiKey: "SYNTHETIC_FIXTURE-key-value" }, configs);
+      const crush = JSON.parse(await Bun.file(join(localDir, "crush.json")).text());
+      expect(crush.providers.zai.api_key).toBe("SYNTHETIC_FIXTURE-key-value");
+
+      await mod.updateIdentityInRegistry("zai", "z", { label: "Zed" }, configs);
+      const stored = await Bun.file(registryPath).text();
+      expect(stored).toContain(hostDir);
+      expect(stored).not.toContain(homedir());
+      const listed = await mod.listRegistries(configs);
+      expect(listed.registries[0]!.identities[0]!.configDirExists).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.AIS_HOST_HOME;
+      else process.env.AIS_HOST_HOME = saved;
+    }
   });
 });

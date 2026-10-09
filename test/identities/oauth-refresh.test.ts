@@ -305,6 +305,19 @@ describe("postRefreshTokenGrant", () => {
 /* --------------------------- provider refreshes ------------------------ */
 
 describe("refreshIdentityOAuthGrant: openai-codex", () => {
+  test("two concurrent non-claude refreshes POST the rotating token only once", async () => {
+    await json(CODEX_FILE(), {
+      OPENAI_API_KEY: null,
+      tokens: { access_token: fakeJwt({ iat: NOW - 7200, exp: NOW - 3600 }), refresh_token: "rt-old-1" },
+      last_refresh: new Date((NOW - 7200) * 1000).toISOString(),
+    });
+    const { calls, fetchImpl } = stubFetch([tokenResponse({ refresh_token: "rt-new-1" })]);
+    const run = () => refreshIdentityOAuthGrant("codex", identityIn(dirs.codex), { expiryWindowHours: 0.5, lastSuccessAt: new Date(NOW * 1000).toISOString(), fetchImpl, now: () => NOW * 1000 });
+    const results = await Promise.all([run(), run()]);
+    expect(calls).toHaveLength(1);
+    expect(results.map((r) => r.outcome).sort()).toEqual(["refreshed", "skipped-fresh"]);
+  });
+
   test("exchanges at the codex token endpoint and writes both stores in each store's shape", async () => {
     await json(CODEX_FILE(), {
       OPENAI_API_KEY: null,

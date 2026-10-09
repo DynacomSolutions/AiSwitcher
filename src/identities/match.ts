@@ -36,8 +36,11 @@ export function expandPath(raw: string): string {
  * inside a container the host home is mounted at a different home, so a prefix
  * of `AIS_HOST_HOME` followed by `/` is rewritten to the local home. With
  * `AIS_HOST_HOME` unset the host home defaults to the local home, making this
- * a no-op. The stored registry value is never changed; use this only for
- * existence checks and reads. */
+ * a no-op. `loadIdentitiesFile` applies this to every configDir and
+ * `saveIdentitiesFile` reverses it, so registry consumers get local paths and
+ * the stored value stays the host path. Apply it directly only to paths that
+ * do not come from a loaded registry (for example user-typed input). Not
+ * idempotent when the local home lies inside the host home. */
 export function translateHostPath(
   raw: string,
   env: Record<string, string | undefined> = process.env,

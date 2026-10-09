@@ -548,6 +548,18 @@ export async function refreshIdentityOAuthGrant(
   identity: Identity,
   options: OAuthRefreshOptions = {},
 ): Promise<IdentityGrantRefresh> {
+  if (tool !== "claude" && !isRetired(identity)) {
+    // Rotating refresh tokens must not be POSTed by two processes (host timers + pod): lock the
+    // identity dir across re-read-freshest -> POST -> write-through; the inner call re-reads under it.
+    try {
+      return await withOauthRefreshLock(identity.configDir, () => refreshGrantUnlocked(tool, identity, options));
+    } catch (err) {
+      if (!options.force && err instanceof SwapLockError && err.timedOut) {
+        return { tool, identity: identity.name, outcome: "skipped-fresh", detail: `lock busy (${err.message}) — will retry next tick`, written: [], writeFailures: [] };
+      }
+      throw err;
+    }
+  }
   if (tool !== "claude" || options.locksHeld || isRetired(identity) || isSwapPool(identity)) {
     return refreshGrantUnlocked(tool, identity, options);
   }
