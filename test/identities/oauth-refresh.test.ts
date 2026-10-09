@@ -305,6 +305,19 @@ describe("postRefreshTokenGrant", () => {
 /* --------------------------- provider refreshes ------------------------ */
 
 describe("refreshIdentityOAuthGrant: openai-codex", () => {
+  test("two concurrent non-claude refreshes POST the rotating token only once", async () => {
+    await json(CODEX_FILE(), {
+      OPENAI_API_KEY: null,
+      tokens: { access_token: fakeJwt({ iat: NOW - 7200, exp: NOW - 3600 }), refresh_token: "rt-old-1" },
+      last_refresh: new Date((NOW - 7200) * 1000).toISOString(),
+    });
+    const { calls, fetchImpl } = stubFetch([tokenResponse({ refresh_token: "rt-new-1" })]);
+    const run = () => refreshIdentityOAuthGrant("codex", identityIn(dirs.codex), { expiryWindowHours: 0.5, lastSuccessAt: new Date(NOW * 1000).toISOString(), fetchImpl, now: () => NOW * 1000 });
+    const results = await Promise.all([run(), run()]);
+    expect(calls).toHaveLength(1);
+    expect(results.map((r) => r.outcome).sort()).toEqual(["refreshed", "skipped-fresh"]);
+  });
+
   test("exchanges at the codex token endpoint and writes both stores in each store's shape", async () => {
     await json(CODEX_FILE(), {
       OPENAI_API_KEY: null,
@@ -685,6 +698,53 @@ describe("refreshIdentityOAuthGrant: kimi (existing machinery)", () => {
     expect(Math.abs(native.expires_at - 3600 - Date.now() / 1000)).toBeLessThan(30);
     const pi = await readJson<Record<string, { refresh: string }>>(PI_AUTH());
     expect(pi["kimi-coding"]!.refresh).toBe("rt-new-1");
+  });
+});
+
+describe("cross-process serialisation", () => {
+  test("concurrent fetchKimiLimits and refreshIdentityOAuthGrant(kimi) POST the rotating token once", async () => {
+    await mkdir(join(dirs.kimi, "credentials"), { recursive: true });
+    await json(KIMI_FILE(), { access_token: "at-syn-kim", refresh_token: "rt-old-1", expires_at: Math.floor(Date.now() / 1000) - 3600 });
+    const urls: string[] = [];
+    const mock = (async (url: string | URL | Request) => {
+      urls.push(String(url));
+      const body = String(url).includes("oauth/token")
+        ? { access_token: "at-syn-new", refresh_token: "rt-new-1", expires_in: 3600 }
+        : {};
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = mock;
+    try {
+      const { fetchKimiLimits } = await import("../../src/cli/limits/kimi-limits.ts");
+      await Promise.all([
+        fetchKimiLimits(identityIn(dirs.kimi)),
+        refreshIdentityOAuthGrant("kimi", identityIn(dirs.kimi), { fetchImpl: mock, expiryWindowHours: 0.5, lastSuccessAt: new Date().toISOString() }),
+      ]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(urls.filter((u) => u.includes("oauth/token"))).toHaveLength(1);
+  });
+
+  test("concurrent pi writes for different providers both survive", async () => {
+    const { writePiEntry } = await import("../../src/identities/oauth-reconcile.ts");
+    const grant = (n: string) => ({ access_token: `at-${n}`, refresh_token: `rt-${n}`, expires_at: NOW + 3600 });
+    const path = PI_AUTH();
+    await Promise.all(
+      ["openai-codex", "xai", "kimi-coding", "anthropic"].map((p) => writePiEntry(path, p, grant(p.slice(0, 3)), new Set())),
+    );
+    const pi = await readJson<Record<string, { refresh: string }>>(path);
+    expect(Object.keys(pi).sort()).toEqual(["anthropic", "kimi-coding", "openai-codex", "xai"]);
+  });
+
+  test("a never-logged-in identity (no configDir) is no-grant and the dir is not created", async () => {
+    const missing = join(dirs.codex, "..", "never-logged-in");
+    const { calls, fetchImpl } = stubFetch([tokenResponse()]);
+    const result = await refreshIdentityOAuthGrant("codex", identityIn(missing), { fetchImpl });
+    expect(result.outcome).toBe("no-grant");
+    expect(calls).toHaveLength(0);
+    expect(existsSync(missing)).toBe(false);
   });
 });
 

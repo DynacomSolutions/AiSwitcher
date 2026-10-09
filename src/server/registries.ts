@@ -65,7 +65,7 @@ export async function listRegistries(configs: ToolConfig[] = Object.values(TOOL_
       const dto = registryDto(cfg, file);
       await Promise.all(
         dto.identities.map(async (identity) => {
-          identity.configDirExists = await dirExists(translateHostPath(identity.configDir));
+          identity.configDirExists = await dirExists(identity.configDir);
         }),
       );
       return dto;
@@ -117,8 +117,8 @@ export async function createIdentityInRegistry(toolName: string, body: CreateBod
   // write must not roll back or block the identity itself (the user can
   // retry via the auth endpoints).
   if (body.apiKey) {
-    if (cfg.toolName === "zai") await writeZaiAuthFile(expandedDir, body.apiKey);
-    else if (cfg.toolName === "ali") await writeAliAuthFile(expandedDir, body.apiKey);
+    if (cfg.toolName === "zai") await writeZaiAuthFile(translateHostPath(expandedDir), body.apiKey);
+    else if (cfg.toolName === "ali") await writeAliAuthFile(translateHostPath(expandedDir), body.apiKey);
   }
   return registryFor(cfg, configs);
 }

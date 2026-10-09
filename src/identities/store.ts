@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "./types.ts";
 import { InvalidIdentitiesFileError } from "./errors.ts";
 import { isValidIdentityColour } from "./colour.ts";
-import { expandPath, parseDirectoryPattern } from "./match.ts";
+import { expandPath, parseDirectoryPattern, translateHostPath, untranslateHostPath } from "./match.ts";
 
 /** Structural validation only. Whether members exist, are claude identities,
  * are not retired and are not pools themselves depends on the OTHER
@@ -203,7 +203,8 @@ export async function loadIdentitiesFile(path: string): Promise<IdentitiesFile> 
     ...parsed,
     identities: parsed.identities.map((identity) => ({
       ...identity,
-      configDir: expandPath(identity.configDir),
+      // In a container the host-absolute dir is mapped to its mount; saves reverse it.
+      configDir: translateHostPath(expandPath(identity.configDir)),
     })),
   };
 }
@@ -212,7 +213,11 @@ export async function loadIdentitiesFile(path: string): Promise<IdentitiesFile> 
 export async function saveIdentitiesFile(path: string, data: IdentitiesFile): Promise<void> {
   const dir = dirname(path);
   const tmpPath = `${dir}/.identities.${randomUUID()}.tmp`;
-  await Bun.write(tmpPath, `${JSON.stringify(data, null, 2)}\n`);
+  const hostData = {
+    ...data,
+    identities: data.identities.map((i) => ({ ...i, configDir: untranslateHostPath(i.configDir) })),
+  };
+  await Bun.write(tmpPath, `${JSON.stringify(hostData, null, 2)}\n`);
   const { rename } = await import("node:fs/promises");
   await rename(tmpPath, path);
 }

@@ -31,22 +31,44 @@ export function expandPath(raw: string): string {
   return isAbsolute(expanded) ? expanded : resolve(expanded);
 }
 
+/** $HOME when set (what os.homedir() returns on Linux, but read live so tests can inject it), else os.homedir(). */
+function defaultLocalHome(): string {
+  return stripTrailingSlash(process.env.HOME?.trim() || homedir());
+}
+
 /** Translates a registry-stored (host-absolute) path into the path visible to
  * this process. Registries record host paths such as `<host home>/.claude/...`;
  * inside a container the host home is mounted at a different home, so a prefix
  * of `AIS_HOST_HOME` followed by `/` is rewritten to the local home. With
  * `AIS_HOST_HOME` unset the host home defaults to the local home, making this
- * a no-op. The stored registry value is never changed; use this only for
- * existence checks and reads. */
+ * a no-op. `loadIdentitiesFile` applies this to every configDir and
+ * `saveIdentitiesFile` reverses it, so registry consumers get local paths and
+ * the stored value stays the host path. Apply it directly only to paths that
+ * do not come from a loaded registry (for example user-typed input). Not
+ * idempotent when the local home lies inside the host home. */
 export function translateHostPath(
   raw: string,
   env: Record<string, string | undefined> = process.env,
-  localHome: string = homedir(),
+  localHome: string = defaultLocalHome(),
 ): string {
   const hostHome = stripTrailingSlash(env.AIS_HOST_HOME?.trim() || localHome);
   if (hostHome === localHome || hostHome === "") return raw;
   if (raw === hostHome) return localHome;
   if (raw.startsWith(`${hostHome}/`)) return localHome + raw.slice(hostHome.length);
+  return raw;
+}
+
+/** Inverse of `translateHostPath`: rewrites a local-home path back to the host
+ * home so registries never persist container paths. No-op outside a container. */
+export function untranslateHostPath(
+  raw: string,
+  env: Record<string, string | undefined> = process.env,
+  localHome: string = defaultLocalHome(),
+): string {
+  const hostHome = stripTrailingSlash(env.AIS_HOST_HOME?.trim() || localHome);
+  if (hostHome === localHome || hostHome === "") return raw;
+  if (raw === localHome) return hostHome;
+  if (raw.startsWith(`${localHome}/`)) return hostHome + raw.slice(localHome.length);
   return raw;
 }
 

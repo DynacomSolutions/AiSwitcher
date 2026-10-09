@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { withOauthRefreshLock } from "../../identities/claude-swap-lock.ts";
 import { KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { isRetired } from "../../identities/retired.ts";
@@ -116,7 +117,9 @@ function storeFor(kind: "native" | "pi", path: string): Store {
       const raw = (await readJson(path)) as Record<string, unknown> | undefined;
       return credentialsFromPi(raw?.["kimi-coding"] as PiKimiEntry | undefined);
     },
-    write: async (next) => {
+    // auth.json holds every provider: serialise the read-modify-write with the other tools' pi writes
+    // (always the LAST lock taken, after any tool lock).
+    write: (next) => withOauthRefreshLock(dirname(path), async () => {
       const raw = (await readJson(path)) as Record<string, unknown> | undefined;
       const entry = (raw?.["kimi-coding"] as PiKimiEntry | undefined) ?? {};
       await writeJsonAtomic(path, {
@@ -129,7 +132,7 @@ function storeFor(kind: "native" | "pi", path: string): Store {
           ...(next.expires_at !== undefined ? { expires: next.expires_at * 1000 } : {}),
         },
       });
-    },
+    }),
   };
 }
 
@@ -184,4 +187,16 @@ export async function persistKimiCredentials(identity: Identity, self: "kimi" | 
   for (const store of await kimiCredentialStores(identity, self)) {
     await store.write(next).catch(() => undefined);
   }
+}
+
+/** What a refresh needs to be serialised with the daemon refresher: the kimi
+ * identity's configDir lock (the one refreshIdentityOAuthGrant("kimi") takes)
+ * and a re-read of the freshest copy. Undefined when the account has no kimi
+ * identity (pi-only): there is then no cross-process refresher to race. */
+export async function kimiRefreshContext(
+  identity: Identity,
+  self: "kimi" | "pi",
+): Promise<{ lockDir: string; reread: () => Promise<KimiOAuthCredentials | undefined> } | undefined> {
+  const lockDir = self === "kimi" ? identity.configDir : await configDirFor("kimi", identity.name);
+  return lockDir ? { lockDir, reread: () => readFreshestKimiCredentials(identity, self) } : undefined;
 }

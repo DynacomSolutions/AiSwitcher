@@ -4,7 +4,6 @@ import { homedir } from "node:os";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { requireTool } from "./registries.ts";
 import { isRetired } from "../identities/retired.ts";
-import { translateHostPath } from "../identities/match.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { credentialPathsForTool } from "../identities/credential-paths.ts";
 import { readAliApiKey, writeAliAuthFile } from "../identities/ali-auth.ts";
@@ -287,28 +286,28 @@ export async function authStatus(
       try {
         switch (cfg.toolName) {
           case "claude":
-            result = await probeClaude(translateHostPath(identity.configDir));
+            result = await probeClaude(identity.configDir);
             break;
           case "codex":
-            result = await probeCodex(translateHostPath(identity.configDir));
+            result = await probeCodex(identity.configDir);
             break;
           case "grok":
-            result = await probeGrok(translateHostPath(identity.configDir));
+            result = await probeGrok(identity.configDir);
             break;
           case "kimi":
-            result = await probeKimi(translateHostPath(identity.configDir));
+            result = await probeKimi(identity.configDir);
             break;
           case "zai":
-            result = await probeZai(translateHostPath(identity.configDir));
+            result = await probeZai(identity.configDir);
             break;
           case "ali":
-            result = await probeAli(translateHostPath(identity.configDir));
+            result = await probeAli(identity.configDir);
             break;
           case "pi":
-            result = await probePi(translateHostPath(identity.configDir));
+            result = await probePi(identity.configDir);
             break;
           case "opencode":
-            result = await probeOpencode(translateHostPath(identity.configDir));
+            result = await probeOpencode(identity.configDir);
             break;
           default:
             result = { kind: "none", state: "unknown", detail: "no auth probe for this tool", fixable: [] };

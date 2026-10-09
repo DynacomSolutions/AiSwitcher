@@ -4,7 +4,7 @@ import { performSwap, type SwapReason, type SwapResult } from "../../identities/
 import { swapIfLimited, swapToNext, poolStatus, type MemberRow, type OpsDeps } from "../../identities/claude-swap-ops.ts";
 import { installSwapHook, removeSwapHook } from "../../identities/claude-swap-hook.ts";
 import { ensureClaudeTranscriptRetention } from "../../identities/claude-settings.ts";
-import { expandPath, isValidIdentityKey } from "../../identities/match.ts";
+import { expandPath, isValidIdentityKey, translateHostPath } from "../../identities/match.ts";
 import { loadIdentitiesFile, saveIdentitiesFile } from "../../identities/store.ts";
 import {
   DEFAULT_SWAP_THRESHOLD_PERCENT,
@@ -181,7 +181,7 @@ export async function runClaudeSwapCommand(positionals: string[], flags: ParsedA
         const file = await loadIdentitiesFile(registryPath);
         const accounts = validateMembers(file, name, requested);
         const configDir = stringFlag(flags, "config-dir") ?? join(CLAUDE_CONFIG.identitiesRootDir, name);
-        const dir = expandPath(configDir);
+        const dir = translateHostPath(expandPath(configDir)); // fs form; the registry keeps the host form
         // Two pools sharing one folder would fight over its credentials.
         if (poolsOf(file).some((p) => expandPath(p.configDir) === dir) || file.identities.some((i) => expandPath(i.configDir) === dir)) {
           throw new SwapPoolError(`configDir ${dir} is already used by another identity`);

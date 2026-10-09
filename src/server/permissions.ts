@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { translateHostPath } from "../identities/match.ts";
+import { untranslateHostPath } from "../identities/match.ts";
 import { isRetired } from "../identities/retired.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { aisHome } from "../shared/ais-home.ts";
@@ -358,7 +358,8 @@ export async function buildPermissions(deps: PermissionsDeps = {}): Promise<Perm
   for (const { cfg, file } of loaded) {
     const identities: PermissionIdentityNode[] = [];
     for (const identity of file.identities) {
-      const configDir = translateHostPath(identity.configDir, env, deps.localHome);
+      const configDir = identity.configDir; // already container-local (store load translates)
+      const hostDir = untranslateHostPath(configDir, env, deps.localHome);
       const spec = identitySpec(cfg.toolName);
       const sources = "spec" in spec ? [await readSource(join(configDir, spec.spec.file), spec.spec.file, spec.spec.parser)] : [];
       const rules = mergeRules(sources);
@@ -369,14 +370,14 @@ export async function buildPermissions(deps: PermissionsDeps = {}): Promise<Perm
       cache.identities[`${cfg.toolName}/${identity.name}`] = {
         tool: cfg.toolName,
         name: identity.name,
-        configDir: identity.configDir,
+        configDir: hostDir,
         seenAt: nowIso,
       };
       dirty = true;
       identities.push({
         name: identity.name,
         label: identity.label,
-        configDir: identity.configDir,
+        configDir: hostDir,
         ...(isRetired(identity) ? { retired: true as const } : {}),
         sources,
         rules,
