@@ -31,6 +31,25 @@ export function expandPath(raw: string): string {
   return isAbsolute(expanded) ? expanded : resolve(expanded);
 }
 
+/** Translates a registry-stored (host-absolute) path into the path visible to
+ * this process. Registries record host paths such as `<host home>/.claude/...`;
+ * inside a container the host home is mounted at a different home, so a prefix
+ * of `AIS_HOST_HOME` followed by `/` is rewritten to the local home. With
+ * `AIS_HOST_HOME` unset the host home defaults to the local home, making this
+ * a no-op. The stored registry value is never changed; use this only for
+ * existence checks and reads. */
+export function translateHostPath(
+  raw: string,
+  env: Record<string, string | undefined> = process.env,
+  localHome: string = homedir(),
+): string {
+  const hostHome = stripTrailingSlash(env.AIS_HOST_HOME?.trim() || localHome);
+  if (hostHome === localHome || hostHome === "") return raw;
+  if (raw === hostHome) return localHome;
+  if (raw.startsWith(`${hostHome}/`)) return localHome + raw.slice(hostHome.length);
+  return raw;
+}
+
 /** Tilde-expand, realpath-resolve (if it exists), and strip any trailing
  * separator — the canonical form used to compare a cwd against a pattern's
  * base. Exported so other directory-pattern matchers (e.g. chrome-profile.ts)

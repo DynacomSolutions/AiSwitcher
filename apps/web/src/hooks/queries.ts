@@ -20,6 +20,7 @@ export const qk = {
   status: ["status"] as const,
   processes: ["processes"] as const,
   identities: ["identities"] as const,
+  permissions: ["permissions"] as const,
   limits: ["limits"] as const,
   usage: ["usage"] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
@@ -81,6 +82,14 @@ export function useIdentitiesQuery() {
     queryKey: qk.identities,
     queryFn: api.getIdentities,
     refetchInterval: POLL.registry,
+  });
+}
+
+export function usePermissionsQuery() {
+  return useQuery({
+    queryKey: qk.permissions,
+    queryFn: () => api.getPermissions(),
+    refetchInterval: POLL.slow,
   });
 }
 

@@ -8,6 +8,7 @@ import { FilesPage } from "@/pages/files";
 import { IdentitiesPage } from "@/pages/identities";
 import { LimitsPage } from "@/pages/limits";
 import { NotFoundPage } from "@/pages/not-found";
+import { PermissionsPage } from "@/pages/permissions";
 import { SessionsPage } from "@/pages/sessions";
 import { UsagePage } from "@/pages/usage";
 
@@ -22,6 +23,7 @@ export function AppRoutes() {
         <Route path="breakdown" element={<BreakdownPage />} />
         <Route path="sessions" element={<SessionsPage />} />
         <Route path="auth" element={<AuthPage />} />
+        <Route path="permissions" element={<PermissionsPage />} />
         <Route path="files" element={<FilesPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

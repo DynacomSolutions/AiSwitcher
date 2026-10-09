@@ -200,6 +200,88 @@ export interface FileContentDto {
   binary: boolean;
 }
 
+/* Permissions tree (GET /api/permissions). Read-only view of generated files. */
+
+export type PermissionGroup = "allow" | "ask" | "deny";
+
+export interface PermissionRulesDto {
+  allow: string[];
+  ask: string[];
+  deny: string[];
+}
+
+export interface PermissionCountsDto {
+  allow: number;
+  ask: number;
+  deny: number;
+  total: number;
+}
+
+export interface PermissionCacheStatsDto {
+  hits: number;
+  misses: number;
+}
+
+export interface PermissionSourceDto {
+  /** Absolute path as read inside this process. */
+  path: string;
+  label: string;
+  exists: boolean;
+  /** "hit" = served from the cache, "miss" = (re)read; absent when the file does not exist. */
+  cache?: "hit" | "miss";
+  rules: PermissionRulesDto;
+  error?: string;
+}
+
+/** Fields shared by every node of the tree. */
+export interface PermissionNodeBase {
+  counts: PermissionCountsDto;
+  cache: PermissionCacheStatsDto;
+}
+
+export interface PermissionWorktreeNode extends PermissionNodeBase {
+  path: string;
+  kind: "base" | "task";
+  /** Task name for task worktrees. */
+  task?: string;
+  sources: PermissionSourceDto[];
+  rules: PermissionRulesDto;
+}
+
+export interface PermissionRepoNode extends PermissionNodeBase {
+  owner: string;
+  repo: string;
+  worktrees: PermissionWorktreeNode[];
+}
+
+export interface PermissionIdentityNode extends PermissionNodeBase {
+  name: string;
+  label: string;
+  configDir: string;
+  retired?: true;
+  /** Identity-level rules (the tool's own config in the identity's config dir). */
+  sources: PermissionSourceDto[];
+  rules: PermissionRulesDto;
+  /** Set when the tool has no readable permission concept. */
+  reason?: string;
+  repos: PermissionRepoNode[];
+}
+
+export interface PermissionToolNode extends PermissionNodeBase {
+  toolName: ToolConfig["toolName"];
+  identities: PermissionIdentityNode[];
+}
+
+export interface PermissionsDto {
+  generatedAt: string;
+  refreshed: boolean;
+  cachePath: string;
+  reposRoot: string;
+  counts: PermissionCountsDto;
+  cache: PermissionCacheStatsDto;
+  tools: PermissionToolNode[];
+}
+
 export class HttpError extends Error {
   constructor(
     public readonly status: number,
