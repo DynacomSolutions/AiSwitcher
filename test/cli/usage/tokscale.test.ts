@@ -60,13 +60,27 @@ describe("tokscaleInvocationFor", () => {
     expect(clientArgs).toEqual(["--client", "kimi"]);
   });
 
-  test("claude: sets TOKSCALE_EXTRA_DIRS to <configDir>/projects, prefixed with the client id", async () => {
+  test("claude: sets CLAUDE_CONFIG_DIR (replacing the default root) and no additive extra dir", async () => {
     const { env, clientArgs } = (await tokscaleInvocationFor(
       "claude",
       identity("/Users/alice/.claude/identities/identity-a"),
     ))!;
-    expect(env).toEqual({ TOKSCALE_EXTRA_DIRS: "claude:/Users/alice/.claude/identities/identity-a/projects" });
+    expect(env).toEqual({ CLAUDE_CONFIG_DIR: "/home/user/.claude/identities/identity-a" });
     expect(clientArgs).toEqual(["--client", "claude"]);
+  });
+
+  test("claude: the child env overrides an inherited CLAUDE_CONFIG_DIR and never depends on HOME", async () => {
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = "/home/user/.claude/identities/swap";
+    try {
+      const { env } = (await tokscaleInvocationFor("claude", identity("/x/identity-a")))!;
+      const child = { ...process.env, ...env };
+      expect(child.CLAUDE_CONFIG_DIR).toBe("/x/identity-a");
+      expect(env.TOKSCALE_EXTRA_DIRS).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = saved;
+    }
   });
 
   test("opencode: points XDG_DATA_HOME at the identity's data subdir — the root tokscale's opencode client resolves through", async () => {
@@ -118,6 +132,13 @@ describe("buildMergedEnv", () => {
       "claude:/Users/alice/.claude/identities/a/projects,codex:/Users/alice/.codex/identities/b/sessions",
     );
     expect(env.ZAI_API_KEY).toBeUndefined();
+  });
+
+  test("redirects every default scan root to one empty path so $HOME's own sessions never leak in", async () => {
+    const env = await buildMergedEnv([{ toolName: "claude", identity: identity("/home/user/.claude/identities/a") }]);
+    const empty = env.CLAUDE_CONFIG_DIR!;
+    expect(empty).toContain("no-default-scan");
+    expect([env.CODEX_HOME, env.GROK_HOME, env.KIMI_CODE_HOME]).toEqual([empty, empty, empty]);
   });
 
   test("includes ZAI_API_KEY when exactly one zai target has a usable key", async () => {
