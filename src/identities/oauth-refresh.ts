@@ -349,11 +349,13 @@ export async function writeGrantThroughStores(
  * access token is within `expiryWindowHours` of expiry, and at least once
  * a day even for long-lived tokens (so a healthy grant is still exercised
  * and any rotation is propagated). Manual refreshes pass force=true.
- * Short-lived access tokens (claude ~8h, grok ~6h, kimi ~15min) are always
- * inside a 24h window, so they would be rotated every tick and log out
- * sessions holding the previous refresh token: tools in
- * SHORT_TOKEN_EXPIRY_WINDOW_HOURS cap the window to their entry and skip
- * the daily keep-alive (a valid token rotates naturally). */
+ * Short-lived access tokens (claude ~8h, grok ~6h) are always inside a 24h
+ * window, so they would be rotated every tick and log out sessions holding
+ * the previous refresh token: tools in SHORT_TOKEN_EXPIRY_WINDOW_HOURS cap
+ * the window to their entry and skip the daily keep-alive (a valid token
+ * rotates naturally). Kimi's ~15min token is shorter than 1.5 ticks, so no
+ * window avoids a refresh per tick: the kimi CLI refreshes it when used, and
+ * the daemon only runs the daily keep-alive (never the expiry window). */
 export function shouldAttemptOAuthRefresh(
   grant: OAuthGrant,
   options: { force?: boolean; expiryWindowHours?: number; lastSuccessAt?: string | null; nowSeconds?: number; tool?: RefreshableTool },
@@ -364,7 +366,7 @@ export function shouldAttemptOAuthRefresh(
   const windowSeconds = windowHours * 3600;
   const secondsLeft = grant.expires_at === undefined ? Number.POSITIVE_INFINITY : grant.expires_at - now;
   if (options.force) return { attempt: true, reason: "manual refresh" };
-  if (secondsLeft <= windowSeconds) {
+  if (options.tool !== "kimi" && secondsLeft <= windowSeconds) {
     return {
       attempt: true,
       reason:
@@ -389,15 +391,12 @@ export function shouldAttemptOAuthRefresh(
 /** Claude refreshes this close to expiry (comfortably above the 10-minute tick). */
 export const CLAUDE_EXPIRY_WINDOW_HOURS = 1;
 /** Per-tool refresh window for tools with short-lived access tokens; codex
- * (~10 day tokens) is absent and keeps the configured window + keep-alive.
- * Every window must stay above the daemon tick (10 min) plus margin, or a
- * token could lapse between ticks. Kimi's ~15 min token is shorter than
- * 1.5 ticks, so it still refreshes about once per tick: no window can both
- * beat the tick and leave a 15 min token alone. */
+ * (~10 day tokens) is absent and keeps the configured window + keep-alive,
+ * kimi is handled as keep-alive only. Windows must stay above the daemon
+ * tick (10 min) plus margin. */
 export const SHORT_TOKEN_EXPIRY_WINDOW_HOURS: Partial<Record<RefreshableTool, number>> = {
   claude: CLAUDE_EXPIRY_WINDOW_HOURS,
   grok: 1,
-  kimi: 0.25,
 };
 export const DEFAULT_EXPIRY_WINDOW_HOURS = 24;
 

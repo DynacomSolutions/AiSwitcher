@@ -257,9 +257,18 @@ describe("shouldAttemptOAuthRefresh (scheduler cadence)", () => {
       expect(at("grok", 5.9 * 3600)).toBe(false);
       expect(at("grok", 5.9 * 3600, new Date((NOW - 30 * 3600) * 1000).toISOString())).toBe(false);
       expect(at("grok", 1800)).toBe(true);
-      expect(at("kimi", 14 * 60)).toBe(true);
-      expect(at("kimi", 20 * 60)).toBe(false);
-      expect(at("kimi", 20 * 60, new Date((NOW - 30 * 3600) * 1000).toISOString())).toBe(false);
+    });
+
+    test("kimi is keep-alive only: no expiry window", () => {
+      const recent = new Date((NOW - 3600) * 1000).toISOString();
+      const old = new Date((NOW - 30 * 3600) * 1000).toISOString();
+      const kimi = (secondsLeft: number, lastSuccessAt: string | null) =>
+        shouldAttemptOAuthRefresh({ access_token: "x", expires_at: NOW + secondsLeft }, { tool: "kimi", expiryWindowHours: 24, lastSuccessAt, nowSeconds: NOW });
+      expect(kimi(60, recent).attempt).toBe(false);
+      expect(kimi(-600, recent).attempt).toBe(false);
+      expect(kimi(60, old).attempt).toBe(true);
+      expect(kimi(60, old).reason).toContain("daily keep-alive");
+      expect(shouldAttemptOAuthRefresh({ access_token: "x", expires_at: NOW + 60 }, { tool: "kimi", force: true, lastSuccessAt: recent, nowSeconds: NOW }).attempt).toBe(true);
     });
 
     test("codex keeps the 24h window and the daily keep-alive", () => {

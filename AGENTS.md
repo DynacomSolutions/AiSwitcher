@@ -2981,16 +2981,18 @@ What the rule means in practice, now enforced in both pipelines:
   Cadence: inside the expiry window (AIS_AUTH_REFRESH_EXPIRY_HOURS, default
   24) or at least once daily; manual `ais auth refresh <identity>
   --tool=<t>` and POST /api/auth/refresh force past the cadence. Claude is
-  the exception, as are grok and kimi: their short access tokens (claude
-  ~8h, grok ~6h, kimi ~15min) are always inside a 24h window, which
+  the exception, as is grok: their short access tokens (claude
+  ~8h, grok ~6h) are always inside a 24h window, which
   rotated every refresh token each 10-minute tick and logged out running
-  sessions ("Login expired"). They refresh only inside
-  `SHORT_TOKEN_EXPIRY_WINDOW_HOURS` (claude 1h, grok 1h, kimi 15min; `min`
+  sessions ("Login expired"). Claude and grok refresh only inside
+  `SHORT_TOKEN_EXPIRY_WINDOW_HOURS` (claude 1h, grok 1h; `min`
   with the configured window) and get no daily keep-alive while their token
-  is valid; codex (~10 day token) keeps 24h + keep-alive. Kimi's 15min
-  token is under 1.5 ticks, so it still refreshes about once per tick; its
-  limits path (`EXPIRY_SKEW_SECONDS` 300) refreshes only when <=5min is left,
-  inside the daemon window, so the two stay consistent. The claude refresh holds
+  is valid; codex (~10 day token) keeps 24h + keep-alive. Kimi's ~15min
+  token is under 1.5 ticks, so no window avoids a refresh per tick: the
+  daemon never refreshes kimi on expiry (the kimi CLI does when used) and
+  runs only the daily keep-alive (no successful refresh in 24h); forced
+  refreshes and the limits path (`EXPIRY_SKEW_SECONDS` 300) are unchanged.
+  The claude refresh holds
   Claude Code's `.oauth_refresh.lock` for the member dir AND every swap-pool
   dir holding the grant (sorted order, `withOauthRefreshLocks`) across
   read-freshest -> POST -> write-through, re-reading the freshest copy once
