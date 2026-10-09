@@ -15,14 +15,11 @@ import { aisHome } from "../../shared/ais-home.ts";
  *     KIMI_CODE_HOME to locate session data — the exact same env vars this
  *     project already redirects per identity (see identities/tool-configs.ts).
  *     No extra step needed.
- *   - claude: tokscale hardcodes `<home>/.claude/projects` and has no
- *     CLAUDE_CONFIG_DIR-equivalent override (confirmed absent from its
- *     source), so `TOKSCALE_EXTRA_DIRS=claude:<path>` — an additive extra
- *     scan root — is the only lever. Verified this correctly scopes to just
- *     one identity's data with no symlinks and no cross-identity leakage:
- *     the top-level `~/.claude` container this project uses has no
- *     `projects/` of its own, so tokscale's default scan root (still active
- *     alongside the extra dir) contributes nothing to double-count.
+ *   - claude: tokscale (>= 4.18) reads CLAUDE_CONFIG_DIR and scans
+ *     `<it>/projects`, replacing its `$HOME/.claude` default. Verified
+ *     2026-10-10: that alone scopes to one identity. TOKSCALE_EXTRA_DIRS is
+ *     ADDITIVE, so using it alone also scanned the default root and leaked it
+ *     into every identity.
  *   - zai: NOT a directory scan at all, unlike the other four, and this
  *     project's own `usage/run.ts` doesn't even use this for its default
  *     aggregate report — zai's real MESSAGES/INPUT/OUTPUT/COST numbers come
@@ -88,7 +85,11 @@ export async function tokscaleInvocationFor(
     case "kimi":
       return { env: { KIMI_CODE_HOME: identity.configDir }, clientArgs };
     case "claude":
-      return { env: { TOKSCALE_EXTRA_DIRS: tokscaleExtraDirEntry("claude", identity) }, clientArgs };
+      // CLAUDE_CONFIG_DIR REPLACES tokscale's default claude root (tokscale
+      // >= 4.18 reads it, appending `projects`). TOKSCALE_EXTRA_DIRS is
+      // additive, so using it alone also scanned $HOME/.claude/projects (or the
+      // caller's own CLAUDE_CONFIG_DIR) and leaked it into every identity.
+      return { env: { CLAUDE_CONFIG_DIR: identity.configDir }, clientArgs };
     case "zai": {
       // A retired identity's credentials are deleted and tokscale's live
       // quota call must never run for it: same "not supported" answer as the
@@ -183,7 +184,16 @@ export async function buildMergedEnv(targets: Array<{ toolName: string; identity
   for (const t of targets) {
     if (tokscaleSupportsClient(t.toolName)) entries.push(tokscaleExtraDirEntry(t.toolName, t.identity));
   }
-  const env: Record<string, string> = { TOKSCALE_EXTRA_DIRS: entries.join(",") };
+  // TOKSCALE_EXTRA_DIRS is additive: point every default root at an empty
+  // path so only the listed identities are scanned, never $HOME's own dirs.
+  const empty = join(aisHome(), "usage", "no-default-scan");
+  const env: Record<string, string> = {
+    TOKSCALE_EXTRA_DIRS: entries.join(","),
+    CLAUDE_CONFIG_DIR: empty,
+    CODEX_HOME: empty,
+    GROK_HOME: empty,
+    KIMI_CODE_HOME: empty,
+  };
 
   const zaiTargets = targets.filter((t) => t.toolName === "zai");
   if (zaiTargets.length === 1) {
