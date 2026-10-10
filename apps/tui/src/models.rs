@@ -190,6 +190,9 @@ pub struct OverageInfo {
 pub struct UsageResponse {
     #[serde(default)]
     pub results: Vec<UsageResult>,
+    /// Server has no value yet (first scan still running); not an error.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// Mirrors UsageResult from src/cli/usage/run.ts after usageResultsForJson().
@@ -214,6 +217,9 @@ pub struct UsageResult {
     pub real_cost: Option<RealCostInfo>,
     #[serde(default, rename = "dateSpan", alias = "date_span")]
     pub date_span: Option<DateSpan>,
+    /// Server has no value yet (first scan still running); not an error.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// Mirrors RealCostInfo from src/cli/usage/aws-bedrock-usage.ts: every
@@ -265,6 +271,9 @@ pub struct SessionsResponse {
 pub struct BreakdownResponse {
     #[serde(default)]
     pub results: Vec<BreakdownResult>,
+    /// Server has no value yet (first scan still running); not an error.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// Mirrors BreakdownResult from src/cli/usage/breakdown.ts.

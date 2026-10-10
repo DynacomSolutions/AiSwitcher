@@ -238,6 +238,7 @@ mod tests {
             extra_cost: None,
             real_cost: None,
             date_span: None,
+            pending: false,
         }
     }
 
@@ -246,7 +247,7 @@ mod tests {
     }
 
     fn usage_response(results: Vec<UsageResult>) -> UsageResponse {
-        UsageResponse { results }
+        UsageResponse { results, pending: false }
     }
 
     #[test]

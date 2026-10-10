@@ -55,6 +55,8 @@ const ENDPOINTS: [Endpoint; 8] = [
     Endpoint::Breakdown,
 ];
 
+const PENDING_REPOLL: Duration = Duration::from_secs(3);
+
 impl Endpoint {
     const fn interval(self) -> Duration {
         match self {
@@ -300,10 +302,20 @@ async fn fetch_loop(
     // tokio intervals fire immediately on the first tick, which doubles as
     // the initial load for every endpoint.
     let mut ticker = tokio::time::interval(endpoint.interval());
+    let mut repoll = false;
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = notify.notified() => {}
+        if repoll {
+            // Server answered "pending" (first scan running): poll again soon.
+            tokio::select! {
+                _ = tokio::time::sleep(PENDING_REPOLL) => {}
+                _ = notify.notified() => {}
+            }
+            ticker.reset();
+        } else {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = notify.notified() => {}
+            }
         }
         let msg = match endpoint {
             Endpoint::Status => {
@@ -329,6 +341,8 @@ async fn fetch_loop(
                 Msg::Breakdown(client.get_json(endpoint.path(), endpoint.timeout()).await)
             }
         };
+        repoll = matches!(&msg, Msg::Usage(Ok(r)) if r.pending)
+            || matches!(&msg, Msg::Breakdown(Ok(r)) if r.pending);
         if tx.send(msg).is_err() {
             return; // main loop gone: nothing left to feed
         }

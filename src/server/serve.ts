@@ -10,6 +10,7 @@ import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
+import { warmUsageCaches } from "./workers.ts";
 
 export interface ServeOptions {
   port?: number;
@@ -154,6 +155,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   });
 
   if (options.managed !== false) {
+    warmUsageCaches();
     const actualPort = server.port ?? port;
     await writeServerState({ pid: process.pid, port: actualPort, token, startedAt: new Date().toISOString() });
     // A detached daemon still belongs to the SPAWNING terminal's process
