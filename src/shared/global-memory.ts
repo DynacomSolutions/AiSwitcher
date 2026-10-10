@@ -114,6 +114,27 @@ async function ensureKimiProjection(memoryPath: string, home: string): Promise<v
   await symlink(memoryPath, projection);
 }
 
+/** Grok loads every `*.md` in `$GROK_HOME/rules/` as a global rule (verified
+ * with 1.0.50: `grok inspect` lists it and the model sees it). A symlink keeps
+ * the ~43 KB memory off argv, where `pkill -f` patterns matched and killed it. */
+async function ensureGrokProjection(configDir: string, memoryPath: string): Promise<void> {
+  const projection = join(configDir, "rules", "ais-global-memory.md");
+  await mkdir(dirname(projection), { recursive: true, mode: 0o700 });
+  try {
+    const stat = await lstat(projection);
+    if (stat.isSymbolicLink() && (await readlink(projection)) === memoryPath) return;
+    if (!stat.isSymbolicLink()) {
+      throw new Error(
+        `Cannot project AIS global memory into Grok: ${projection} already exists and is not an AIS-managed link`,
+      );
+    }
+    await unlink(projection); // stale AIS link (memory path moved)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await symlink(memoryPath, projection);
+}
+
 async function ensureCrushProjection(configDir: string, memoryPath: string): Promise<void> {
   const configPath = join(configDir, "crush.json");
   let config: Record<string, unknown> = {};
@@ -187,7 +208,8 @@ export async function projectGlobalMemoryForLaunch(
     case "codex-developer-instructions":
       return { argv: ["-c", `developer_instructions=${JSON.stringify(content)}`, ...argv], env: {}, memoryPath };
     case "grok-rules":
-      return { argv: ["--rules", content, ...argv], env: {}, memoryPath };
+      await ensureGrokProjection(configDir, memoryPath);
+      return { argv: [...argv], env: {}, memoryPath };
     case "kimi-global-agents":
       await ensureKimiProjection(memoryPath, home);
       return { argv: [...argv], env: {}, memoryPath };
