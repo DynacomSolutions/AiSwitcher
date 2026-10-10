@@ -409,7 +409,7 @@ export function UsagePage() {
         updatedAt={query.dataUpdatedAt}
       />
 
-      {query.isLoading ? (
+      {query.isLoading || (query.data?.pending && results.length === 0) ? (
         <div className="space-y-4">
           <div className="h-72 animate-pulse rounded-xl bg-muted" />
           <div className="h-64 animate-pulse rounded-xl bg-muted" />

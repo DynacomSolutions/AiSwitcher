@@ -118,7 +118,7 @@ fn result_row(result: &UsageResult) -> Row<'static> {
         None if result.pending && result.error.is_none() => Row::new(vec![
             Cell::from(Span::from(provider).cyan()),
             Cell::from(identity),
-            Cell::from(Span::from("collecting usage...").dark_gray()),
+            Cell::from(Span::from("collecting…").dark_gray()),
         ]),
         None => {
             let message = result

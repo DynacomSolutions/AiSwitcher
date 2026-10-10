@@ -259,7 +259,7 @@ export function BreakdownPage() {
         ) : null}
       </div>
 
-      {query.isLoading ? (
+      {query.isLoading || (query.data?.pending && !result) ? (
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {[0, 1, 2, 3].map((i) => (

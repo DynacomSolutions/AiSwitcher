@@ -105,7 +105,7 @@ export function useUsageQuery() {
   return useQuery({
     queryKey: qk.usage,
     queryFn: api.getUsage,
-    refetchInterval: POLL.slow,
+    refetchInterval: (q) => (q.state.data?.pending ? 3000 : POLL.slow),
   });
 }
 
@@ -117,7 +117,7 @@ export function useBreakdownQuery(identity: string, tool: string, days: number) 
     queryKey: qk.breakdown(identity, tool, days),
     queryFn: () => api.getBreakdown(identity, tool, days),
     enabled: identity !== "" && tool !== "",
-    refetchInterval: POLL.breakdown,
+    refetchInterval: (q) => (q.state.data?.pending ? 3000 : POLL.breakdown),
     placeholderData: keepPreviousData,
   });
 }

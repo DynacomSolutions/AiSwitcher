@@ -2,6 +2,7 @@ import { statSync } from "node:fs";
 import { join } from "node:path";
 import { PollCache } from "./expensive.ts";
 import { aisCacheDir } from "../shared/ais-home.ts";
+import { CliUsageError } from "../cli/errors.ts";
 import { collectTargets, pendingUsageResult } from "../cli/usage/run.ts";
 import { tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { withUsableCwd } from "../shared/exec.ts";
@@ -58,8 +59,9 @@ async function pendingPayload(kind: "usage" | "breakdown", params: Omit<ScanRequ
         ...(params.identity !== undefined ? { identity: params.identity } : {}),
       });
       results = targets.map(pendingUsageResult).filter((r) => r !== undefined);
-    } catch {
-      // no seed rows; the bare pending flag still tells clients to keep polling
+    } catch (error) {
+      if (error instanceof CliUsageError) throw error; // e.g. unknown --identity: an error, not pending
+      // otherwise no seed rows; the bare pending flag still tells clients to keep polling
     }
   }
   return { ok: true, payload: { results, generatedAt: new Date().toISOString(), pending: true } };
@@ -105,9 +107,14 @@ async function cachedScan<T>(
   // usage/breakdown are the slow scans (tokscale can run for minutes): serve
   // the last-good value immediately and refresh in the background.
   if (kind === "usage" || kind === "breakdown") {
-    const swr = await cache.getSwr(key, fetcher, undefined, {
-      pending: () => pendingPayload(kind, params) as Promise<ScanResult<T>>,
-    });
+    let swr;
+    try {
+      swr = await cache.getSwr(key, fetcher, undefined, {
+        pending: () => pendingPayload(kind, params) as Promise<ScanResult<T>>,
+      });
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error), status: error instanceof CliUsageError ? 400 : 500 };
+    }
     if (swr.value.payload && typeof swr.value.payload === "object") {
       const payload = swr.value.payload as Record<string, unknown>;
       payload.cached = swr.cached;

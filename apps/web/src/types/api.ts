@@ -304,6 +304,8 @@ export interface UsageResult {
 export interface UsageResponse {
   results: UsageResult[];
   generatedAt: string;
+  /** First scan still running; keep polling. */
+  pending?: boolean;
 }
 
 /* Usage breakdown (per tool call) */
@@ -339,6 +341,8 @@ export interface BreakdownResult {
 export interface BreakdownResponse {
   results: BreakdownResult[];
   generatedAt: string;
+  /** First scan still running; keep polling. */
+  pending?: boolean;
 }
 
 /* Sessions (resume) */

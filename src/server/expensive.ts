@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runLimitsQuery } from "../cli/limits/collect.ts";
 import { runUsageQuery, usageResultsForJson } from "../cli/usage/run.ts";
@@ -49,6 +49,8 @@ export class PollCache {
   /** `persistDir`: getSwr last-good values are written there (one 0600 JSON per hashed key) and reloaded after a restart. */
   constructor(private readonly ttlMs: number, private readonly persistDir?: string) {}
 
+  private warned = false;
+
   private fileFor(key: string): string {
     return join(this.persistDir!, `${new Bun.CryptoHasher("sha256").update(key).digest("hex")}.json`);
   }
@@ -68,15 +70,23 @@ export class PollCache {
 
   private save(key: string, entry: CacheEntry<unknown>): void {
     if (!this.persistDir) return;
+    const tmp = `${this.fileFor(key)}.${process.pid}.${crypto.randomUUID()}.tmp`;
     try {
       mkdirSync(this.persistDir, { recursive: true, mode: 0o700 });
       const file = this.fileFor(key);
-      const tmp = `${file}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify({ key, at: entry.at, value: entry.value }), { mode: 0o600 });
       chmodSync(tmp, 0o600);
       renameSync(tmp, file);
-    } catch {
-      // persistence is best effort; the in-memory value still serves
+    } catch (error) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // no temp file left
+      }
+      if (!this.warned) {
+        this.warned = true;
+        console.warn(`[ais] cache persist failed (${this.persistDir}): ${error instanceof Error ? error.message : error}`);
+      }
     }
   }
 
@@ -105,12 +115,20 @@ export class PollCache {
    * (`stale: true`) while ONE background refresh runs (deduplicated through
    * the shared inflight promise). A failed refresh keeps the last-good value
    * and records `lastError`/`lastErrorAt` until a refresh succeeds. The
-   * first-ever request (no value yet) waits for the fetch, and its failure
-   * propagates as usual. */
+   * first-ever request (no value yet) waits for the fetch (or gets
+   * `opts.pending()` straight away); a failed cold fetch is rethrown to the
+   * next request, which then retries. */
   async getSwr<T>(key: string, fetcher: () => Promise<T>, maxAgeMs = this.ttlMs, opts: SwrOptions<T> = {}): Promise<SwrResult<T>> {
     let existing = this.entries.get(key) as CacheEntry<T> | undefined;
     if (!existing?.hasValue && !existing?.inflight) existing = this.load<T>(key) ?? existing;
     if (!existing?.hasValue) {
+      if (existing && !existing.inflight && existing.lastError !== undefined) {
+        // The cold scan failed: surface the error once (later request retries; never loop).
+        const message = existing.lastError;
+        existing.lastError = undefined;
+        existing.lastErrorAt = undefined;
+        throw new Error(message);
+      }
       let entry = existing;
       if (!entry?.inflight) {
         entry = existing ?? { at: 0, value: undefined as T };

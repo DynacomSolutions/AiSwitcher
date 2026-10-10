@@ -76,3 +76,21 @@ describe("warmUsageCaches", () => {
     expect(calls).toEqual([["usage", {}], ["breakdown", { days: 30 }]]);
   });
 });
+
+describe("cold failure", () => {
+  test("second cold call after a failed fetch surfaces the error, then retries", async () => {
+    const cache = new PollCache(1000);
+    let calls = 0;
+    const fetcher = async () => {
+      calls++;
+      throw new Error("scan broke");
+    };
+    const opts = { pending: async () => "pending" };
+    expect((await cache.getSwr("k", fetcher, undefined, opts)).value).toBe("pending");
+    await Bun.sleep(5);
+    await expect(cache.getSwr("k", fetcher, undefined, opts)).rejects.toThrow("scan broke");
+    expect(calls).toBe(1);
+    expect((await cache.getSwr("k", fetcher, undefined, opts)).value).toBe("pending");
+    expect(calls).toBe(2);
+  });
+});
