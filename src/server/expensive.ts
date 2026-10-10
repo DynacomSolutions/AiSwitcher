@@ -1,3 +1,5 @@
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { runLimitsQuery } from "../cli/limits/collect.ts";
 import { runUsageQuery, usageResultsForJson } from "../cli/usage/run.ts";
 import { runBreakdownQuery, type BreakdownDeps, type BreakdownResult } from "../cli/usage/breakdown.ts";
@@ -36,10 +38,47 @@ export function flagsFor(tool: string | undefined, identity: string | undefined)
   };
 }
 
+export interface SwrOptions<T> {
+  /** First-ever request only (no memory or disk value): answer `pending()` immediately; the fetch keeps running. */
+  pending?: () => Promise<T>;
+}
+
 export class PollCache {
   private readonly entries = new Map<string, CacheEntry<unknown>>();
 
-  constructor(private readonly ttlMs: number) {}
+  /** `persistDir`: getSwr last-good values are written there (one 0600 JSON per hashed key) and reloaded after a restart. */
+  constructor(private readonly ttlMs: number, private readonly persistDir?: string) {}
+
+  private fileFor(key: string): string {
+    return join(this.persistDir!, `${new Bun.CryptoHasher("sha256").update(key).digest("hex")}.json`);
+  }
+
+  private load<T>(key: string): CacheEntry<T> | undefined {
+    if (!this.persistDir) return undefined;
+    try {
+      const parsed = JSON.parse(readFileSync(this.fileFor(key), "utf8")) as { key?: unknown; at?: unknown; value?: T };
+      if (parsed.key !== key || typeof parsed.at !== "number" || parsed.value === undefined) return undefined;
+      const entry: CacheEntry<T> = { at: parsed.at, value: parsed.value, hasValue: true };
+      this.entries.set(key, entry);
+      return entry;
+    } catch {
+      return undefined; // missing or corrupt: behave as a cold cache
+    }
+  }
+
+  private save(key: string, entry: CacheEntry<unknown>): void {
+    if (!this.persistDir) return;
+    try {
+      mkdirSync(this.persistDir, { recursive: true, mode: 0o700 });
+      const file = this.fileFor(key);
+      const tmp = `${file}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ key, at: entry.at, value: entry.value }), { mode: 0o600 });
+      chmodSync(tmp, 0o600);
+      renameSync(tmp, file);
+    } catch {
+      // persistence is best effort; the in-memory value still serves
+    }
+  }
 
   async get<T>(key: string, fetcher: () => Promise<T>, maxAgeMs = this.ttlMs): Promise<{ value: T; cached: boolean }> {
     const existing = this.entries.get(key) as CacheEntry<T> | undefined;
@@ -68,26 +107,31 @@ export class PollCache {
    * and records `lastError`/`lastErrorAt` until a refresh succeeds. The
    * first-ever request (no value yet) waits for the fetch, and its failure
    * propagates as usual. */
-  async getSwr<T>(key: string, fetcher: () => Promise<T>, maxAgeMs = this.ttlMs): Promise<SwrResult<T>> {
-    const existing = this.entries.get(key) as CacheEntry<T> | undefined;
+  async getSwr<T>(key: string, fetcher: () => Promise<T>, maxAgeMs = this.ttlMs, opts: SwrOptions<T> = {}): Promise<SwrResult<T>> {
+    let existing = this.entries.get(key) as CacheEntry<T> | undefined;
+    if (!existing?.hasValue && !existing?.inflight) existing = this.load<T>(key) ?? existing;
     if (!existing?.hasValue) {
-      if (existing?.inflight) return { value: await existing.inflight, cached: false, stale: false };
-      const entry: CacheEntry<T> = existing ?? { at: 0, value: undefined as T };
-      this.entries.set(key, entry);
-      const value = await this.refresh(entry, fetcher);
-      return { value, cached: false, stale: false };
+      let entry = existing;
+      if (!entry?.inflight) {
+        entry = existing ?? { at: 0, value: undefined as T };
+        this.entries.set(key, entry);
+        this.refresh(key, entry, fetcher).catch(() => undefined);
+      }
+      const inflight = entry.inflight!;
+      if (!opts.pending) return { value: await inflight, cached: false, stale: false };
+      return { value: await opts.pending(), cached: false, stale: true };
     }
     const errorInfo = existing.lastError !== undefined ? { lastError: existing.lastError, lastErrorAt: existing.lastErrorAt } : {};
     if (Date.now() - existing.at < maxAgeMs) {
       return { value: existing.value, cached: true, stale: false, ...errorInfo };
     }
     if (!existing.inflight) {
-      this.refresh(existing, fetcher).catch(() => undefined);
+      this.refresh(key, existing, fetcher).catch(() => undefined);
     }
     return { value: existing.value, cached: true, stale: true, ...errorInfo };
   }
 
-  private refresh<T>(entry: CacheEntry<T>, fetcher: () => Promise<T>): Promise<T> {
+  private refresh<T>(key: string, entry: CacheEntry<T>, fetcher: () => Promise<T>): Promise<T> {
     entry.inflight = fetcher()
       .then((value) => {
         entry.value = value;
@@ -95,6 +139,7 @@ export class PollCache {
         entry.at = Date.now();
         entry.lastError = undefined;
         entry.lastErrorAt = undefined;
+        this.save(key, entry);
         return value;
       })
       .catch((error: unknown) => {

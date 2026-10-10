@@ -54,6 +54,9 @@ pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     let lines: Vec<Line> = match &app.breakdown.data {
+        Some(data) if data.results.is_empty() && data.pending => {
+            vec![widgets::loading_line("collecting breakdown (first scan running)", app.frame)]
+        }
         Some(data) if data.results.is_empty() => {
             vec![Line::from(Span::from("no breakdown results reported").dark_gray())]
         }

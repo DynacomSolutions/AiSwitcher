@@ -35,6 +35,9 @@ pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let mut rows: Vec<Row> = Vec::new();
     match &app.usage.data {
+        Some(data) if data.results.is_empty() && data.pending => {
+            rows.push(Row::new([Cell::from(widgets::loading_line("collecting usage (first scan running)", app.frame))]));
+        }
         Some(data) if data.results.is_empty() => {
             rows.push(Row::new([Cell::from(
                 Span::from("no usage results reported").dark_gray(),
@@ -112,6 +115,11 @@ fn result_row(result: &UsageResult) -> Row<'static> {
                 Cell::from(error_span),
             ])
         }
+        None if result.pending && result.error.is_none() => Row::new(vec![
+            Cell::from(Span::from(provider).cyan()),
+            Cell::from(identity),
+            Cell::from(Span::from("collecting usage...").dark_gray()),
+        ]),
         None => {
             let message = result
                 .error

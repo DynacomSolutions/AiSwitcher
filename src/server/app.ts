@@ -17,16 +17,8 @@ import { poolStatus } from "../identities/claude-swap-ops.ts";
 import { HttpError } from "./types.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
-import { tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
-import { runScanIsolated } from "./workers.ts";
+import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 
-/** Usage and breakdown scans spawn tokscale, whose own ceiling is
- * configurable (AIS_TOKSCALE_TIMEOUT_MS). The outer scan ceiling must never
- * be shorter than that or it would cut the child off first, so it is the
- * larger of the historical cap and the tokscale ceiling plus a margin. */
-function scanTimeoutAboveTokscale(baseMs: number): number {
-  return Math.max(baseMs, tokscaleSpawnTimeoutMs() + 30_000);
-}
 import {
   createIdentityInRegistry,
   deleteIdentityFromRegistry,

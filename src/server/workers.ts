@@ -1,5 +1,9 @@
 import { statSync } from "node:fs";
+import { join } from "node:path";
 import { PollCache } from "./expensive.ts";
+import { aisCacheDir } from "../shared/ais-home.ts";
+import { collectTargets, pendingUsageResult } from "../cli/usage/run.ts";
+import { tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
 
@@ -41,9 +45,25 @@ export interface ScanSpawn {
  * (previously dead) caching already documented as the intended budget. */
 const treeCache = new PollCache(15_000);
 const transcriptCache = new PollCache(4_000);
-const usageCache = new PollCache(45_000);
+const usageCache = new PollCache(45_000, join(aisCacheDir(), "swr", "usage"));
 const limitsCache = new PollCache(45_000);
-const breakdownCache = new PollCache(60_000);
+const breakdownCache = new PollCache(60_000, join(aisCacheDir(), "swr", "breakdown"));
+
+async function pendingPayload(kind: "usage" | "breakdown", params: Omit<ScanRequest, "kind">): Promise<ScanResult<unknown>> {
+  let results: unknown[] = [];
+  if (kind === "usage") {
+    try {
+      const targets = await collectTargets({
+        ...(params.tool !== undefined ? { tool: params.tool } : {}),
+        ...(params.identity !== undefined ? { identity: params.identity } : {}),
+      });
+      results = targets.map(pendingUsageResult).filter((r) => r !== undefined);
+    } catch {
+      // no seed rows; the bare pending flag still tells clients to keep polling
+    }
+  }
+  return { ok: true, payload: { results, generatedAt: new Date().toISOString(), pending: true } };
+}
 
 function cacheFor(kind: ScanKind): PollCache | undefined {
   switch (kind) {
@@ -85,7 +105,9 @@ async function cachedScan<T>(
   // usage/breakdown are the slow scans (tokscale can run for minutes): serve
   // the last-good value immediately and refresh in the background.
   if (kind === "usage" || kind === "breakdown") {
-    const swr = await cache.getSwr(key, fetcher);
+    const swr = await cache.getSwr(key, fetcher, undefined, {
+      pending: () => pendingPayload(kind, params) as Promise<ScanResult<T>>,
+    });
     if (swr.value.payload && typeof swr.value.payload === "object") {
       const payload = swr.value.payload as Record<string, unknown>;
       payload.cached = swr.cached;
@@ -134,6 +156,26 @@ function baseArgs(): string[] {
 const CACHED_SCAN_KINDS = new Set<ScanKind>(["tree", "transcript", "usage", "limits", "breakdown"]);
 export function isCachedScanKind(kind: ScanKind): kind is "tree" | "transcript" | "usage" | "limits" | "breakdown" {
   return CACHED_SCAN_KINDS.has(kind);
+}
+
+/** Usage and breakdown scans spawn tokscale, whose own ceiling is
+ * configurable (AIS_TOKSCALE_TIMEOUT_MS). The outer scan ceiling must never
+ * be shorter than that or it would cut the child off first, so it is the
+ * larger of the historical cap and the tokscale ceiling plus a margin. */
+export function scanTimeoutAboveTokscale(baseMs: number): number {
+  return Math.max(baseMs, tokscaleSpawnTimeoutMs() + 30_000);
+}
+
+let warmed = false;
+
+/** Daemon start: one background refresh of the keys the TUI and web request by
+ * default (/api/usage, /api/usage/breakdown?days=30), so the cache is warm
+ * before the first client. Never awaited; the scan limiter still applies. */
+export function warmUsageCaches(run: typeof runScanIsolated = runScanIsolated): void {
+  if (warmed) return;
+  warmed = true;
+  void run("usage", {}, scanTimeoutAboveTokscale(60_000)).catch(() => undefined);
+  void run("breakdown", { days: 30 }, scanTimeoutAboveTokscale(240_000)).catch(() => undefined);
 }
 
 export async function runScanIsolated<T>(

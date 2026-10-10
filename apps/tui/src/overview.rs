@@ -970,6 +970,7 @@ mod tests {
             extra_cost: None,
             real_cost: None,
             date_span: None,
+            pending: false,
         }
     }
 
@@ -1057,6 +1058,7 @@ mod tests {
                 usage_result("workco", 2_700.0),
                 usage_result("solo", 4.5),
             ],
+            pending: false,
         };
 
         let rows = build_rows(&limits, &usage, None, &BTreeSet::new());
@@ -1098,7 +1100,7 @@ mod tests {
         let limits = models::LimitsResponse {
             results: vec![limit_result("acme-bedrock", vec![("week", 10.0, None)])],
         };
-        let usage = models::UsageResponse { results: vec![] };
+        let usage = models::UsageResponse { results: vec![], pending: false };
         let rows = build_rows(&limits, &usage, None, &breached);
         assert!(rows[0].breach);
     }
@@ -1111,7 +1113,7 @@ mod tests {
                 limit_result("personal", vec![("session", 3.0, None)]),
             ],
         };
-        let usage = models::UsageResponse { results: vec![] };
+        let usage = models::UsageResponse { results: vec![], pending: false };
         let bridge = HerdrBridgeResponse {
             state: Some("active".to_string()),
             panes: vec![pane(Some("workco"), Some("codex"), true)],
