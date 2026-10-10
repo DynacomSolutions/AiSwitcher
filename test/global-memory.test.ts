@@ -51,9 +51,14 @@ describe("AIS global memory", () => {
     expect(codex.argv[1]).toStartWith("developer_instructions=");
     expect(codex.argv.slice(2)).toEqual(["exec", "hi"]);
 
-    const grok = await projectGlobalMemoryForLaunch(GROK_CONFIG, "/identity", ["-p", "hi"], {}, root);
-    expect(grok.argv[0]).toBe("--rules");
-    expect(grok.argv[1]).toContain("# AIS global memory");
+    // Grok: memory must stay off argv (pkill -f matched the 43 KB cmdline);
+    // it arrives as a symlinked global rule under $GROK_HOME/rules/.
+    const grokDir = join(root, "grok-home");
+    const grok = await projectGlobalMemoryForLaunch(GROK_CONFIG, grokDir, ["-p", "hi"], {}, root);
+    expect(grok.argv).toEqual(["-p", "hi"]);
+    const rule = join(grokDir, "rules", "ais-global-memory.md");
+    expect(await readlink(rule)).toBe(path);
+    await projectGlobalMemoryForLaunch(GROK_CONFIG, grokDir, ["-p", "hi"], {}, root); // idempotent
 
     const pi = await projectGlobalMemoryForLaunch(PI_CONFIG, "/identity", ["-p", "hi"], {}, root);
     expect(pi.argv).toEqual(["--append-system-prompt", path, "-p", "hi"]);
