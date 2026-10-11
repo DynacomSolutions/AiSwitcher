@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { activeMemberAt, decideWriteBack, performSwap, readSwapEvents } from "../../src/identities/claude-swap.ts";
 import { withClaudeLocks, withOauthRefreshLock, SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { chooseBest, swapIfLimited } from "../../src/identities/claude-swap-ops.ts";
-import { parseUsageBody, fetchMemberUsage } from "../../src/identities/claude-usage-api.ts";
+import { parseUsageBody, fetchMemberUsage, fetchMemberResets, manualResetFromCedarEmber, CLAUDE_RESETS_USER_AGENT } from "../../src/identities/claude-usage-api.ts";
 import { refreshIdentityOAuthGrant, writeGrantThroughStores, convergeClaudePoolStores } from "../../src/identities/oauth-refresh.ts";
 import { PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { chmod, utimes } from "node:fs/promises";
@@ -430,6 +430,49 @@ describe("usage api", () => {
     expect(headers["anthropic-beta"]).toBe("oauth-2025-04-20");
     const limited = (async () => new Response("", { status: 429, headers: { "retry-after": "30" } })) as unknown as typeof fetch;
     expect(await fetchMemberUsage(b, { fetchImpl: limited, claudeRegistryPath: registry, now: () => NOW_S * 1000 })).toMatchObject({ status: "rate-limited", retryAfterSeconds: 30 });
+  });
+
+  describe("cedar_ember reset grants", () => {
+    const NOW = Date.parse("2026-10-11T12:00:00Z");
+    const grant = {
+      id: "opus55-launch-promax-20260921",
+      label: "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max",
+      resets_total: 1,
+      resets_left: 0,
+      starts_at: "2026-09-22T16:00:00+00:00",
+      ends_at: "2026-10-22T16:00:00+00:00",
+      paused: false,
+    };
+    const block = (g: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ eligible: true, grants: [{ ...grant, ...g }], ...extra });
+
+    test("maps usable grants only", () => {
+      expect(manualResetFromCedarEmber(block({}), NOW)).toBeUndefined();
+      const one = manualResetFromCedarEmber(block({ resets_left: 1 }), NOW);
+      expect(one).toMatchObject({ availableCount: 1, label: grant.label });
+      expect(one?.expiresAt).toBeTruthy();
+      expect(manualResetFromCedarEmber(block({ resets_left: 1 }, { eligible: false }), NOW)).toBeUndefined();
+      expect(manualResetFromCedarEmber(block({ resets_left: 1, paused: true }), NOW)).toBeUndefined();
+      expect(manualResetFromCedarEmber(block({ resets_left: 1, ends_at: "2026-10-01T00:00:00Z" }), NOW)).toBeUndefined();
+      for (const junk of [undefined, null, "x", {}, { eligible: true, grants: "x" }, { eligible: true, grants: [null, { resets_left: "x" }] }]) {
+        expect(manualResetFromCedarEmber(junk, NOW)).toBeUndefined();
+      }
+    });
+
+    test("fetchMemberResets sends the claude-cli user agent and never throws", async () => {
+      await writeRegistry();
+      const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+      let headers: Record<string, string> = {};
+      const ok = (async (_u: unknown, init?: { headers?: Record<string, string> }) => {
+        headers = init?.headers ?? {};
+        return new Response(JSON.stringify({ cedar_ember: block({ resets_left: 1, ends_at: "2099-01-01T00:00:00Z" }) }), { status: 200 });
+      }) as unknown as typeof fetch;
+      const deps = { claudeRegistryPath: registry, now: () => NOW_S * 1000 };
+      expect(await fetchMemberResets(b, { ...deps, fetchImpl: ok })).toMatchObject({ availableCount: 1 });
+      expect(headers["User-Agent"]).toBe(CLAUDE_RESETS_USER_AGENT);
+      expect(headers.Authorization).toBe("Bearer at-b1");
+      const boom = (async () => { throw new Error("down"); }) as unknown as typeof fetch;
+      expect(await fetchMemberResets(b, { ...deps, fetchImpl: boom })).toBeUndefined();
+    });
   });
 
   test("an expired token is refreshed first", async () => {

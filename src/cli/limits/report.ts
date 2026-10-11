@@ -89,7 +89,7 @@ function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, spinnerFra
     capturedAt: result.capturedAt,
   }));
   // A manually-spendable reset (e.g. codex's "Full reset (Weekly + 5 hr)"
-  // grants) is account-level, not a property of any one window, so it gets
+  // credits, or Claude's /limit-reset grants) is account-level, not a property of any one window, so it gets
   // its own dim row under the identity branch instead of being glued onto a
   // window's extras. Only ever set on live results alongside real windows.
   if (result.manualReset && result.manualReset.availableCount > 0) {
