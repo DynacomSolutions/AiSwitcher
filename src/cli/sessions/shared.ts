@@ -18,12 +18,20 @@ export const IN_PROGRESS_WINDOW_MS = 60_000;
 export const DEFAULT_TAIL_TURNS = 500;
 export const MAX_TAIL_TURNS = 2_000;
 
+/** "Active" session: transcript mtime within this window. shortcut: mtime
+ * heuristic only (no per-session process liveness is detectable cheaply), so
+ * a quietly idle live process older than this reads as inactive. */
+export const ACTIVE_WINDOW_MS = 15 * 60_000;
+
 export interface WindowOpts {
   /** Scan-time override (tests). Defaults to Date.now(). */
   now?: number;
   /** Lookback window in days; mtime (or the tool's own updated_at) older
    * than the window drops the session from the tree. Default 30. */
   days?: number;
+  /** Active-only scan: replaces the `days` window with this many ms, so every
+   * reader's existing mtime cutoff skips older files before any parsing. */
+  activeWithinMs?: number;
 }
 
 export interface TranscriptOpts {
@@ -35,6 +43,7 @@ export interface TranscriptOpts {
 
 export function windowCutoffMs(opts: WindowOpts = {}): number {
   const now = opts.now ?? Date.now();
+  if (opts.activeWithinMs !== undefined) return now - opts.activeWithinMs;
   const days = opts.days ?? DEFAULT_TREE_DAYS;
   return now - Math.max(1, days) * 86_400_000;
 }

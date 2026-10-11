@@ -219,6 +219,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
       days: numberQuery(c, "days", 30),
+      active: queryValue(c, "active") === "1",
     }, 120_000);
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "session tree scan failed");
     return c.json(result.payload);

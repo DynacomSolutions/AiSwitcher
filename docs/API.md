@@ -420,7 +420,7 @@ Same shape as `ais resume --json`: `ToolResumeResult[]` flattened into
 
 ### Session trees
 
-`GET /api/sessions/tree?tool=&identity=&days=30`
+`GET /api/sessions/tree?tool=&identity=&days=30&active=1`
 
 What-spawned-what: parent/child links between sessions and the subagent
 threads/sidecar agents the tools record locally. Heavy JSONL/SQLite reads
@@ -429,6 +429,12 @@ run in the isolated scan worker; results are cached server-side (15s).
 identity of EVERY tool (this is the heavy case; scope when you can).
 `days` is the lookback window (default 30, minimum 1); sessions whose last
 local activity is older drop out.
+`active=1` (additive, default off) returns only sessions whose transcript file
+changed within the last 15 minutes; `days` is then ignored. The mtime check
+runs before any JSONL/SQLite is parsed, so the scan touches only a handful of
+files. A subagent whose parent is not itself active renders as an orphan root
+(see below). Results are served stale-while-revalidate: a cached result older
+than the TTL is returned immediately and refreshed in the background.
 
 ```jsonc
 {

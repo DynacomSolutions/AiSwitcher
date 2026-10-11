@@ -157,11 +157,12 @@ export const api = {
 
   getSessions: (cwd?: string) => request<SessionsResponse>(withParams("/api/sessions", { cwd })),
 
-  getSessionTree: (tool?: string, identity?: string, days?: number) =>
+  getSessionTree: (tool?: string, identity?: string, days?: number, active?: boolean) =>
     request<SessionTreeResponse>(withParams("/api/sessions/tree", {
       tool,
       identity,
       days: days !== undefined ? String(days) : undefined,
+      active: active ? "1" : undefined,
     })),
 
   getSessionTranscript: (tool: string, identity: string, id: string, tail?: number) =>

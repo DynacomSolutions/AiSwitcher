@@ -125,6 +125,19 @@ async function projectDataDirs(identity: Identity, dataSubdir: string): Promise<
   return out;
 }
 
+/** Newest mtime of the db and its -wal; undefined when the db does not exist
+ * (a registered project that never created one: nothing to read, and the
+ * retrying open below would waste ~200ms on it); Infinity when it cannot be
+ * stat'd for any other reason, so the real open still reports the error. */
+async function newestDbMtimeMs(dbPath: string): Promise<number | undefined> {
+  const wal = await stat(`${dbPath}-wal`).then((st) => st.mtimeMs, () => 0);
+  try {
+    return Math.max((await stat(dbPath)).mtimeMs, wal);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? undefined : Number.POSITIVE_INFINITY;
+  }
+}
+
 export async function readCrushTree(
   toolName: "zai" | "ali",
   identity: Identity,
@@ -138,6 +151,11 @@ export async function readCrushTree(
   let dbError: string | undefined;
   for (const { dataDir, projectPath } of await projectDataDirs(identity, dataSubdir)) {
     const dbPath = join(dataDir, "crush.db");
+    // Cheap prefilter: any session update touches the db or its WAL, so a
+    // pair older than the cutoff holds no in-window session. Skips the
+    // (slow, possibly network-mounted) SQLite open. Stat failure => query.
+    const newest = await newestDbMtimeMs(dbPath);
+    if (newest === undefined || newest < cutoffMs) continue;
     let rows: SessionRow[];
     try {
       rows = await queryCrushDb(dbPath, (db) =>
