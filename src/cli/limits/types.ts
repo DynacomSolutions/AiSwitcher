@@ -18,6 +18,8 @@ export interface LimitWindow {
    * normalizes to one display string here rather than pushing that
    * conversion into the report renderer). */
   resetsAt?: string;
+  /** Reset instant as epoch milliseconds, when the adapter knows it exactly. */
+  resetsAtMs?: number;
   /** Extra free-text status, e.g. "credits depleted". */
   note?: string;
 }
