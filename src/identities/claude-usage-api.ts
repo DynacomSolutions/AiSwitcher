@@ -111,16 +111,39 @@ async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promis
   return { token: grant.access_token };
 }
 
+/** The one shared GET: bearer token plus the beta header, optionally the claude-cli UA the reset grants need. */
+function getUsage(token: string, url: string, deps: FetchUsageDeps, cliUserAgent = false): Promise<Response> {
+  return (deps.fetchImpl ?? fetch)(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": CLAUDE_USAGE_BETA,
+      ...(cliUserAgent ? { "User-Agent": CLAUDE_RESETS_USER_AGENT } : {}),
+      Accept: "application/json",
+    },
+    signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
+  });
+}
+
+/** Raw usage body including the `cedar_ember` reset grants, from one request; `error` on ANY failure (never throws). */
+export async function fetchUsageBodyWithResets(member: Identity, deps: FetchUsageDeps = {}): Promise<{ body?: unknown; error?: string }> {
+  try {
+    const { token, error } = await usableAccessToken(member, deps);
+    if (!token) return { error: error ?? "no token" };
+    const response = await getUsage(token, CLAUDE_RESETS_URL, deps, true);
+    if (!response.ok) return { error: `usage endpoint answered HTTP ${response.status}` };
+    return { body: await response.json() };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function fetchMemberUsage(member: Identity, deps: FetchUsageDeps = {}): Promise<MemberUsage> {
   const capturedAt = new Date((deps.now?.() ?? Date.now())).toISOString();
   const { token, error } = await usableAccessToken(member, deps);
   if (!token) return { status: "unavailable", error: error ?? "no token", capturedAt };
   let response: Response;
   try {
-    response = await (deps.fetchImpl ?? fetch)(CLAUDE_USAGE_URL, {
-      headers: { Authorization: `Bearer ${token}`, "anthropic-beta": CLAUDE_USAGE_BETA, Accept: "application/json" },
-      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
-    });
+    response = await getUsage(token, CLAUDE_USAGE_URL, deps);
   } catch (err) {
     return { status: "unavailable", error: `usage endpoint unreachable: ${err instanceof Error ? err.message : String(err)}`, capturedAt };
   }
@@ -170,17 +193,6 @@ export function manualResetFromCedarEmber(block: unknown, now: number = Date.now
 
 /** Spendable usage-limit reset grants for one account; undefined on none or on ANY failure (never throws). */
 export async function fetchMemberResets(member: Identity, deps: FetchUsageDeps = {}): Promise<ManualResetInfo | undefined> {
-  try {
-    const { token } = await usableAccessToken(member, deps);
-    if (!token) return undefined;
-    const response = await (deps.fetchImpl ?? fetch)(CLAUDE_RESETS_URL, {
-      headers: { Authorization: `Bearer ${token}`, "anthropic-beta": CLAUDE_USAGE_BETA, "User-Agent": CLAUDE_RESETS_USER_AGENT, Accept: "application/json" },
-      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
-    });
-    if (!response.ok) return undefined;
-    const body = (await response.json()) as { cedar_ember?: unknown } | null;
-    return manualResetFromCedarEmber(body?.cedar_ember, deps.now?.() ?? Date.now());
-  } catch {
-    return undefined;
-  }
+  const { body } = await fetchUsageBodyWithResets(member, deps);
+  return manualResetFromCedarEmber((body as { cedar_ember?: unknown } | null)?.cedar_ember, deps.now?.() ?? Date.now());
 }
