@@ -51,6 +51,7 @@ const FILES: Array<{ path: string; why: string }> = [
   { path: "scripts/backup.ts", why: "the backup groups" },
   { path: ".github/workflows/release.yml", why: "the build/upload steps" },
   { path: "AGENTS.md", why: "the contributor/agent docs" },
+  { path: "docs/agents/module-map.md", why: "the per-file module map" },
   { path: "README.md", why: "the user-facing docs" },
 ];
 
