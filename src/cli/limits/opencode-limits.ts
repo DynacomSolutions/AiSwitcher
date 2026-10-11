@@ -90,6 +90,7 @@ function windowFrom(
     resetsAt: resetsAt && !Number.isNaN(resetsAt.getTime())
       ? resetsAt.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
       : undefined,
+    ...(resetsAt && !Number.isNaN(resetsAt.getTime()) ? { resetsAtMs: resetsAt.getTime() } : {}),
     ...(window.status && window.status !== "ok" ? { note: window.status } : {}),
   };
 }

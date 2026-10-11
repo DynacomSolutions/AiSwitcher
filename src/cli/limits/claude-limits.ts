@@ -1,4 +1,8 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
+import { fetchUsageBodyWithResets, manualResetFromCedarEmber, fetchMemberResets } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
@@ -53,6 +57,61 @@ function parseUsageWindows(stdout: string): LimitWindow[] {
     });
   }
   return windows;
+}
+
+function str(v: unknown): string | undefined {
+  return typeof v === "string" && v ? v : undefined;
+}
+
+function humanReset(iso: unknown): { resetsAt?: string; resetsAtMs?: number } {
+  const ms = typeof iso === "string" ? Date.parse(iso) : Number.NaN;
+  if (!Number.isFinite(ms)) return {};
+  const resetsAt = new Date(ms).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  return { resetsAt, resetsAtMs: ms };
+}
+
+/** Windows from the `GET /api/oauth/usage` body: `limits[]` when present, else five_hour/seven_day. */
+export function windowsFromUsageBody(body: unknown): LimitWindow[] {
+  const rec = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
+  const make = (rawLabel: string, label: string, pct: unknown, resets: unknown): LimitWindow[] =>
+    typeof pct === "number" && Number.isFinite(pct)
+      ? [{ label, category: categorizeByLabel(rawLabel), usedPercent: pct, ...humanReset(resets) }]
+      : [];
+  if (Array.isArray(rec.limits)) {
+    return rec.limits.flatMap((raw: unknown) => {
+      const l = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+      const kind = str(l.kind) ?? "other";
+      const model = (l.scope as { model?: { display_name?: unknown } } | null)?.model?.display_name;
+      const surface = (l.scope as { surface?: unknown } | null)?.surface;
+      const label =
+        kind === "session" ? "session (5h)"
+        : kind === "weekly_all" ? "week (all)"
+        : kind === "weekly_scoped" ? `week (${str(model) ?? str(surface) ?? "scoped"})`
+        : kind;
+      // Raw label mirrors what the text path passed, so categorisation is identical.
+      const rawLabel = kind === "session" ? "session" : kind.startsWith("weekly") ? "week" : kind;
+      return make(rawLabel, label, l.percent, l.resets_at);
+    });
+  }
+  const five = rec.five_hour as Record<string, unknown> | null | undefined;
+  const seven = rec.seven_day as Record<string, unknown> | null | undefined;
+  return [...make("session", "session (5h)", five?.utilization, five?.resets_at), ...make("week", "week (all)", seven?.utilization, seven?.resets_at)];
+}
+
+/** Same semantics as overageFromUsageText, read from the body's `extra_usage` block. */
+export function overageFromUsageBody(body: unknown): OverageInfo | undefined {
+  const extra = (body as { extra_usage?: Record<string, unknown> | null } | null)?.extra_usage;
+  if (typeof extra !== "object" || extra === null) return undefined;
+  if (extra.is_enabled !== true) {
+    // shortcut: seat-lacks-extra-usage matched by a loose substring on disabled_reason; tighten once real values are seen.
+    const reason = str(extra.disabled_reason);
+    return reason && /seat|plan|not.?(available|eligible|supported)/i.test(reason)
+      ? { active: false, label: "extra usage not available on this seat", spentUsd: 0 }
+      : { active: false, label: "subscription only", spentUsd: 0 };
+  }
+  return extra.spend_limit_reached === true
+    ? { active: false, label: "out of extra usage" }
+    : { active: true, label: "using extra usage" };
 }
 
 /**
@@ -110,7 +169,40 @@ export function overageFromUsageText(stdout: string): OverageInfo | undefined {
  * observed live (every identity on this machine turned out to be logged in
  * once the env-stripping bug was fixed), so we don't try to infer it from
  * text parsing. */
-export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimitResult> {
+export interface ClaudeLimitsDeps {
+  /** Test hooks. */
+  fetchBody?: typeof fetchUsageBodyWithResets;
+  cacheDir?: string;
+  reconcile?: typeof reconcileOnceForFetch;
+}
+
+function lastGoodPath(identity: Identity, cacheDir: string): string {
+  return join(cacheDir, "claude-limits", `${encodeURIComponent(identity.name)}.json`);
+}
+
+/** Last successful API read, kept so a 429 can still show (stale) numbers. */
+async function saveLastGood(identity: Identity, result: FetchedLimitResult, cacheDir: string): Promise<void> {
+  try {
+    const { identity: _identity, ...rest } = result;
+    const path = lastGoodPath(identity, cacheDir);
+    await mkdir(join(cacheDir, "claude-limits"), { recursive: true });
+    await writeFile(path, JSON.stringify(rest));
+  } catch {
+    // Bookkeeping only; never fail a fetch over it.
+  }
+}
+
+async function loadLastGood(identity: Identity, cacheDir: string): Promise<FetchedLimitResult | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(lastGoodPath(identity, cacheDir), "utf8")) as Omit<FetchedLimitResult, "identity">;
+    return Array.isArray(parsed.windows) && parsed.windows.length > 0 ? { ...parsed, identity } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDeps = {}): Promise<FetchedLimitResult> {
+  const cacheDir = deps.cacheDir ?? aisCacheDir();
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "claude", identity };
 
   // ONE reconcile per fetch, before the binary runs: pi may hold a fresher
@@ -121,7 +213,33 @@ export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimi
   // this pattern — its fetcher reads the freshest copy and writes a
   // refresh through to both stores; the reconcile is the same law for the
   // stores AIS can only rewrite wholesale.
-  await reconcileOnceForFetch("claude", identity);
+  await (deps.reconcile ?? reconcileOnceForFetch)("claude", identity);
+
+  // Fast path: one HTTP call. Any failure falls through to the spawn path below.
+  const { body, status } = await (deps.fetchBody ?? fetchUsageBodyWithResets)(identity);
+  const apiWindows = body === undefined ? [] : windowsFromUsageBody(body);
+  if (apiWindows.length > 0) {
+    const overage = overageFromUsageBody(body);
+    const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown }).cedar_ember);
+    const live: FetchedLimitResult = {
+      ...base,
+      windows: apiWindows,
+      status: "live",
+      capturedAt: new Date().toISOString(),
+      ...(overage ? { overage } : {}),
+      ...(manualReset ? { manualReset } : {}),
+    };
+    await saveLastGood(identity, live, cacheDir);
+    return live;
+  }
+  // 429: the `claude -p /usage` spawn hits the same endpoint, so spawning
+  // only adds seconds. Serve the last good read (stale marker comes from its
+  // capturedAt) or fail fast.
+  if (status === 429) {
+    const last = await loadLastGood(identity, cacheDir);
+    if (last) return { ...last, status: "cached" };
+    return { ...base, windows: [], status: "unavailable", error: "rate-limited by Anthropic usage endpoint, retry shortly" };
+  }
 
   let binaryPath: string;
   try {
@@ -204,5 +322,14 @@ export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimi
   }
 
   const overage = overageFromUsageText(usageStdout);
-  return { ...base, windows, status: "live", capturedAt: new Date().toISOString(), ...(overage ? { overage } : {}) };
+  // Non-fatal and sequential: it may refresh the token, which must not race the /usage spawn above.
+  const manualReset = await fetchMemberResets(identity);
+  return {
+    ...base,
+    windows,
+    status: "live",
+    capturedAt: new Date().toISOString(),
+    ...(overage ? { overage } : {}),
+    ...(manualReset ? { manualReset } : {}),
+  };
 }

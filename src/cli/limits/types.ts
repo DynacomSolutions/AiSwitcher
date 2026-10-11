@@ -18,6 +18,8 @@ export interface LimitWindow {
    * normalizes to one display string here rather than pushing that
    * conversion into the report renderer). */
   resetsAt?: string;
+  /** Reset instant as epoch milliseconds, when the adapter knows it exactly. */
+  resetsAtMs?: number;
   /** Extra free-text status, e.g. "credits depleted". */
   note?: string;
 }
@@ -67,8 +69,8 @@ export interface OverageInfo {
  * `status: "available"` credit). This is an ACTION the user can take in the
  * provider's own UI/CLI, not a scheduled event; absence of this field means
  * the provider exposes no such concept or nothing is currently available.
- * Only codex surfaces it today; other providers' adapters simply never set
- * it.
+ * Codex (reset credits) and Claude (`/limit-reset` grants) surface it;
+ * other providers' adapters simply never set it.
  */
 export interface ManualResetInfo {
   /** How many resets can be used right now (the wire's own availableCount

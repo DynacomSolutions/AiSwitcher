@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { aggregateLimitResults, fetchLimitResults, pendingLimitResult, runBatched } from "../../../src/cli/limits/collect.ts";
+import { aggregateLimitResults, fetchLimitResults, isMirroredPoolTarget, pendingLimitResult, runBatched } from "../../../src/cli/limits/collect.ts";
 import type { ToolLimitResult } from "../../../src/cli/limits/types.ts";
 import type { Identity, ToolConfig } from "../../../src/identities/types.ts";
 
@@ -163,5 +163,21 @@ describe("runBatched", () => {
     });
     expect(results).toEqual([]);
     expect(calls).toBe(0);
+  });
+});
+
+describe("isMirroredPoolTarget", () => {
+  const pool = (active?: string) => ({
+    toolName: "claude" as const,
+    identity: { ...identity("pool-x"), swapPool: { accounts: ["a"], ...(active ? { active } : {}) } },
+  });
+
+  test("a pool whose active member is also a target is skipped; others are not", () => {
+    const member = target("claude", "a");
+    const p = pool("a");
+    expect(isMirroredPoolTarget(p, [member, p])).toBe(true);
+    expect(isMirroredPoolTarget(member, [member, p])).toBe(false);
+    expect(isMirroredPoolTarget(p, [p])).toBe(false);
+    expect(isMirroredPoolTarget(pool(), [member, pool()])).toBe(false);
   });
 });

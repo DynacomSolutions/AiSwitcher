@@ -28,9 +28,9 @@ describe("windowsFromZaiQuotaResponse", () => {
 
     const windows = windowsFromZaiQuotaResponse(payload);
     expect(windows).toEqual([
-      { label: "session", category: "session", usedPercent: 1, resetsAt: expectedResetsAt(1784314903145) },
-      { label: "week", category: "week", usedPercent: 1, resetsAt: expectedResetsAt(1784866901994) },
-      { label: "web tools", category: "other", usedPercent: 0, resetsAt: expectedResetsAt(1786940501978) },
+      { label: "session", category: "session", usedPercent: 1, resetsAt: expectedResetsAt(1784314903145), resetsAtMs: 1784314903145 },
+      { label: "week", category: "week", usedPercent: 1, resetsAt: expectedResetsAt(1784866901994), resetsAtMs: 1784866901994 },
+      { label: "web tools", category: "other", usedPercent: 0, resetsAt: expectedResetsAt(1786940501978), resetsAtMs: 1786940501978 },
     ]);
   });
 

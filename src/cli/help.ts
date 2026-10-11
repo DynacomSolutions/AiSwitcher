@@ -22,7 +22,7 @@ const COMMANDS: Array<[string, string]> = [
   ["usage [--identity=] [--tool=] [--json]", "Provider-grouped token usage & cost from every client, including Pi"],
   ["usage breakdown [identity] [--tool=] [--days=30] [--json]", "Per-tool-call breakdown: built-ins, MCP servers, edits; what used the most"],
   ["usage [--identity=] [--tool=] <tokscale args>", "Full tokscale (tui/graph/monthly/pricing/...), scoped"],
-  ["limits [identity] [--tool=] [--json|--watch|--cached]", "Live 5h/weekly/monthly rate-limit usage per identity"],
+  ["limits [identity] [--tool=] [--json|--watch|--cached|--compact]", "Live 5h/weekly/monthly rate-limit usage per identity (--compact: one line each)"],
   ["auth login|enable <identity> --tool=ali", "SSH-only interactive auth browser and 10-minute cookie renewal"],
   ["auth refresh <identity> [--tool=ali|codex|claude|grok|kimi]", "Renew credentials without re-login: ali cookies, or the OAuth grant (written through to every store)"],
   ["auth import <pi-id> --tool=pi --claude=<id> ...", "Merge provider credentials into one Pi identity"],

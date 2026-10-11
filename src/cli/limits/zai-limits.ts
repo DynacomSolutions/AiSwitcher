@@ -88,6 +88,7 @@ export function windowsFromZaiQuotaResponse(resp: ZaiQuotaResponseWire): LimitWi
       category: labeled.category,
       usedPercent: Math.min(100, Math.max(0, entry.percentage)),
       resetsAt: formatResetsAt(entry.nextResetTime),
+      ...(Number.isFinite(entry.nextResetTime) ? { resetsAtMs: entry.nextResetTime } : {}),
     });
   }
   return windows;
