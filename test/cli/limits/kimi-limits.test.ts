@@ -35,12 +35,14 @@ describe("windowsFromUsagesResponse", () => {
       category: "session",
       usedPercent: 1,
       resetsAt: expectedResetsAt("2026-07-17T08:31:45.259929Z"),
+      resetsAtMs: new Date("2026-07-17T08:31:45.259929Z").getTime(),
     });
     expect(windows[1]).toEqual({
       label: "week",
       category: "week",
       usedPercent: 0,
       resetsAt: expectedResetsAt("2026-07-24T03:31:45.259929Z"),
+      resetsAtMs: new Date("2026-07-24T03:31:45.259929Z").getTime(),
     });
   });
 
@@ -102,12 +104,14 @@ describe("windowsFromUsagesResponse", () => {
       category: "session",
       usedPercent: 100,
       resetsAt: expectedResetsAt("2026-07-20T11:31:45.259929Z"),
+      resetsAtMs: new Date("2026-07-20T11:31:45.259929Z").getTime(),
     });
     expect(windows[1]).toEqual({
       label: "week",
       category: "week",
       usedPercent: 26,
       resetsAt: expectedResetsAt("2026-07-24T03:31:45.259929Z"),
+      resetsAtMs: new Date("2026-07-24T03:31:45.259929Z").getTime(),
     });
   });
 });

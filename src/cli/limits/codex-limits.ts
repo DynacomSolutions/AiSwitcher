@@ -237,6 +237,7 @@ function buildWindows(snapshot: RateLimitSnapshotWire): LimitWindow[] {
               minute: "2-digit",
             })
           : undefined,
+      ...(raw.resetsAt !== undefined ? { resetsAtMs: raw.resetsAt * 1000 } : {}),
       ...(note ? { note } : {}),
     });
   }

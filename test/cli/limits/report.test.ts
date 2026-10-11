@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { aggregateAverage, formatLimitsReport } from "../../../src/cli/limits/report.ts";
+import { aggregateAverage, formatClock, formatCountdown, formatLimitsReport, packColumns, sortByUrgency, wrapText } from "../../../src/cli/limits/report.ts";
 import type { ToolLimitResult } from "../../../src/cli/limits/types.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
@@ -98,9 +98,11 @@ describe("formatLimitsReport", () => {
   });
 
   test("every bar's opening bracket lines up at the same column", () => {
-    const output = formatLimitsReport([claudeAcme(), codexAcme(), grokAcme()], NOW);
+    const output = formatLimitsReport([claudeAcme(), claudeUnauth("x"), { ...claudeAcme(), identity: identity("longer-name-b") }], NOW);
+    // Within a provider block (the TOTAL rollup above it aligns on its own).
     const bracketColumns = output
       .split("\n")
+      .slice(output.split("\n").indexOf("") + 1)
       .filter((line) => line.includes("["))
       .map((line) => line.indexOf("["));
     expect(new Set(bracketColumns).size).toBe(1);
@@ -117,10 +119,9 @@ describe("formatLimitsReport", () => {
     expect(lines[0]!.startsWith("sessions")).toBe(true);
     expect(lines[1]!.startsWith("week")).toBe(true);
     expect(lines[1]!.startsWith(" ")).toBe(false);
-    // Two blank lines separate the rollup from the first provider section.
+    // One blank line separates the rollup from the first provider section.
     expect(lines[2]).toBe("");
-    expect(lines[3]).toBe("");
-    expect(lines[4]).toBe("Anthropic (1 identity)");
+    expect(lines[3]).toBe("Anthropic (1 identity)");
   });
 
   test("category is pluralized in the TOTAL/aggregate rollups but not in per-identity rows", () => {
@@ -139,15 +140,11 @@ describe("formatLimitsReport", () => {
     expect(twoIdentities).toContain("Anthropic (2 identities)");
   });
 
-  test("an aggregate block is followed by a bare pipe connector before the first identity branch", () => {
-    // claudeAcme() contributes two aggregate rows (session, week), so the
-    // connector sits right after both, not right after the first.
-    const output = formatLimitsReport([claudeAcme()], NOW);
-    const lines = output.split("\n");
+  test("an aggregate block is followed directly by the first identity branch (no spacer line)", () => {
+    const lines = formatLimitsReport([claudeAcme()], NOW).split("\n");
     const sessionsAggIdx = lines.findIndex((l) => l.startsWith("│   sessions"));
     expect(lines[sessionsAggIdx + 1]!.startsWith("│   week")).toBe(true);
-    expect(lines[sessionsAggIdx + 2]).toBe("│");
-    expect(lines[sessionsAggIdx + 3]).toContain("identity-a");
+    expect(lines[sessionsAggIdx + 2]).toContain("identity-a");
   });
 
   test("an unavailable identity renders its error message with no bar, and contributes no aggregate row", () => {
@@ -229,5 +226,131 @@ describe("formatLimitsReport", () => {
     expect(output).toContain("Kimi (1 identity)");
     expect(output).not.toContain("pi (");
     expect(output).not.toContain("zai (");
+  });
+});
+
+const LOCAL = (y: number, mo: number, d: number, h: number, mi: number) => new Date(y, mo, d, h, mi).getTime();
+const LNOW = new Date(2026, 9, 11, 12, 0);
+
+describe("reset countdown", () => {
+  test("<1h, <24h and >=24h rules", () => {
+    expect(formatCountdown(LNOW.getTime() + 41 * 60_000, LNOW)).toBe("in 41m");
+    expect(formatCountdown(LNOW.getTime() + (3 * 60 + 41) * 60_000, LNOW)).toBe("in 3h 41m");
+    expect(formatCountdown(LNOW.getTime() + (52 * 60) * 60_000, LNOW)).toBe("in 2d 4h");
+    expect(formatCountdown(LNOW.getTime() - 5, LNOW)).toBe("now");
+  });
+
+  test("clock is local 24h with weekday; date added from 7 days out", () => {
+    expect(formatClock(LOCAL(2026, 9, 12, 3, 9), LNOW)).toBe("Mon 03:09");
+    expect(formatClock(LOCAL(2026, 9, 18, 21, 59), LNOW)).toBe("Sun 18 Oct 21:59");
+  });
+
+  test("report uses resetsAtMs over resetsAt, and falls back to the string", () => {
+    const r = claudeAcme();
+    r.windows = [
+      { label: "a", category: "session", usedPercent: 1, resetsAt: "legacy", resetsAtMs: LNOW.getTime() + 41 * 60_000 },
+      { label: "b", category: "week", usedPercent: 1, resetsAt: "Oct 18, 9am" },
+    ];
+    const out = formatLimitsReport([r], LNOW, "⠋", { width: 100, columns: false });
+    expect(out).toContain("resets in 41m (Sun 12:41)".replace("Sun", formatClock(LNOW.getTime() + 41 * 60_000, LNOW).slice(0, 3)));
+    expect(out).toContain("resets Oct 18, 9am");
+    expect(out).not.toContain("legacy");
+  });
+});
+
+function withWindows(name: string, percents: number[], status: ToolLimitResult["status"] = "live"): ToolLimitResult {
+  return {
+    toolName: "claude",
+    provider: "anthropic",
+    identity: identity(name),
+    status,
+    windows: percents.map((usedPercent, i) => ({ label: `w${i}`, category: "week", usedPercent })),
+    ...(status === "unavailable" ? { error: "nope" } : {}),
+  };
+}
+
+describe("sortByUrgency", () => {
+  test("most headroom first, exhausted then unavailable last, stable on ties", () => {
+    const sorted = sortByUrgency([
+      withWindows("gone", [], "unavailable"),
+      withWindows("full", [100, 0]),
+      withWindows("busy", [80]),
+      withWindows("tie-a", [20]),
+      withWindows("free", [5, 10]),
+      withWindows("tie-b", [20]),
+    ]);
+    expect(sorted.map((r) => r.identity.name)).toEqual(["free", "tie-a", "tie-b", "busy", "full", "gone"]);
+  });
+});
+
+describe("swap pool row", () => {
+  const pool = (): ToolLimitResult => ({
+    ...withWindows("pool-x", [71]),
+    identity: { ...identity("pool-x"), swapPool: { accounts: ["identity-a"], active: "identity-a" } },
+  });
+
+  test("renders one pointer line and stays out of the aggregates", () => {
+    const out = formatLimitsReport([claudeAcme(), pool()], NOW, "⠋", { width: 100, columns: false });
+    expect(out).toContain("→ active member: identity-a");
+    expect(out).toContain("sessions          [██████░░░░░░░░░░░░░░]  25%".slice(0, 8));
+    expect(out.split("\n")[0]).toContain(" 25%"); // 71 would shift the session average
+    expect(out.match(/71%/g)).toBeNull();
+    // pointer row sorts after real identities
+    expect(out.indexOf("pool-x")).toBeGreaterThan(out.indexOf("identity-a  "));
+  });
+
+  test("a pool whose active member is not in the report keeps its own windows", () => {
+    const out = formatLimitsReport([pool()], NOW, "⠋", { width: 100, columns: false });
+    expect(out).not.toContain("active member");
+    expect(out).toContain("71%");
+  });
+});
+
+describe("wrapping and layout", () => {
+  test("wrapText wraps with continuation indent and splits overlong words", () => {
+    const lines = wrapText("aaa bbb ccc ddd", 11, "  ", "    ");
+    expect(lines).toEqual(["  aaa bbb", "    ccc ddd"]);
+    expect(wrapText("x".repeat(30), 12, "", "  ").every((l) => l.length <= 12)).toBe(true);
+  });
+
+  test("long errors wrap to the width", () => {
+    const r = claudeUnauth("personal");
+    r.error = "word ".repeat(60).trim();
+    const out = formatLimitsReport([r], NOW, "⠋", { width: 60, columns: false });
+    const lines = out.split("\n");
+    expect(lines.length).toBeGreaterThan(4);
+    expect(Math.max(...lines.map((l) => l.length))).toBeLessThanOrEqual(60);
+  });
+
+  test("packColumns balances blocks across the widest fitting column count", () => {
+    const a = ["AAAA", "a1", "a2", "a3"];
+    const b = ["BBBB", "b1"];
+    const c = ["CCCC", "c1"];
+    expect(packColumns([a, b, c], 40, 2)).toEqual(["AAAA  BBBB  CCCC", "a1    b1    c1", "a2", "a3"]);
+    expect(packColumns([a, b, c], 12, 2)).toEqual(["AAAA  BBBB", "a1    b1", "a2    CCCC", "a3    c1"]);
+    expect(packColumns([a, b, c], 5, 2)).toBeUndefined();
+  });
+
+  test("columns collapse to a single column when narrow or disabled", () => {
+    const rs = [claudeAcme(), codexAcme()];
+    expect(formatLimitsReport(rs, NOW, "⠋", { width: 100, columns: true })).toBe(formatLimitsReport(rs, NOW, "⠋", { width: 100, columns: false }));
+    const wide = formatLimitsReport(rs, NOW, "⠋", { width: 220, columns: true });
+    const header = wide.split("\n").find((l) => l.includes("Anthropic"))!;
+    expect(header).toContain("OpenAI");
+  });
+});
+
+describe("--compact", () => {
+  test("one line per identity: worst window, bar, reset and manual-reset marker", () => {
+    const r = codexWithManualReset();
+    r.windows = [
+      { label: "session", category: "session", usedPercent: 10 },
+      { label: "week", category: "week", usedPercent: 57, resetsAtMs: NOW.getTime() + 90 * 60_000 },
+    ];
+    const lines = formatLimitsReport([r, claudeUnauth("zed")], NOW, "⠋", { width: 100, compact: true }).split("\n");
+    expect(lines[0]).toBe("OpenAI (1 identity)");
+    expect(lines[1]).toMatch(/^ {2}identity-a {2}week {1,}\[.{10}\] {2}57% {2}in 1h 30m \(.*\) {2}↺1$/);
+    expect(lines).toHaveLength(5);
+    expect(lines[4]).toBe("  zed  not authenticated");
   });
 });

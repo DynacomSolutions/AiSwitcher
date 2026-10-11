@@ -27,8 +27,9 @@ describe("windowsFromAliUsage", () => {
         category: "session",
         usedPercent: 0.09973083333333333,
         resetsAt: expectedResetsAt(1784813220000),
+        resetsAtMs: 1784813220000,
       },
-      { label: "week", category: "week", usedPercent: 0.03014725, resetsAt: expectedResetsAt(1785234900000) },
+      { label: "week", category: "week", usedPercent: 0.03014725, resetsAt: expectedResetsAt(1785234900000), resetsAtMs: 1785234900000 },
     ]);
   });
 

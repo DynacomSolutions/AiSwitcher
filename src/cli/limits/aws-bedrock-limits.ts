@@ -165,14 +165,13 @@ export function windowFromBudget(budget: BudgetWire, deps: AwsBedrockLimitsDeps 
   if (!name || limit === undefined) return undefined;
   const actual = amount(budget.CalculatedSpend?.ActualSpend) ?? 0;
   const over = actual > limit;
+  const reset = resetDateForTimeUnit(budget.TimeUnit, deps.now?.() ?? new Date());
   return {
     label: `budget: ${name}`,
     category: "month",
     usedPercent: limit > 0 ? (actual / limit) * 100 : actual > 0 ? 100 : 0,
-    resetsAt: (() => {
-      const reset = resetDateForTimeUnit(budget.TimeUnit, deps.now?.() ?? new Date());
-      return reset ? formatResetsAt(reset) : undefined;
-    })(),
+    resetsAt: reset ? formatResetsAt(reset) : undefined,
+    ...(reset ? { resetsAtMs: reset.getTime() } : {}),
     ...(over ? { note: `over budget: $${actual.toFixed(2)} of $${limit.toFixed(2)}` } : {}),
   };
 }

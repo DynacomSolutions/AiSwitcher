@@ -24,7 +24,7 @@ export function parseIntervalSeconds(flags: ParsedArgs["flags"]): number {
   return seconds;
 }
 
-/** `ais limits [identity] [--tool=] [--json] [--cached] [--watch] [--interval=<seconds>]`
+/** `ais limits [identity] [--tool=] [--json] [--cached] [--watch] [--compact] [--interval=<seconds>]`
  * Identity is a positional, not `--identity=`. Takes the top-level parser's
  * already-parsed `positionals`/`flags` directly (mirrors
  * identities/dispatch.ts's `runIdentitiesCommand(rest, flags)`) rather than
@@ -41,11 +41,12 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
   const json = boolFlag(flags, "json");
   const cached = boolFlag(flags, "cached");
   const watch = boolFlag(flags, "watch");
+  const compact = boolFlag(flags, "compact");
   const explicitTool = toolConfigFromFlag(flags) !== undefined;
 
   if (watch) {
     if (json) throw new CliUsageError("--watch and --json cannot be combined.");
-    return runWatch(identityFilter, flags, explicitTool, parseIntervalSeconds(flags) * 1000);
+    return runWatch(identityFilter, flags, explicitTool, parseIntervalSeconds(flags) * 1000, compact);
   }
 
   // Live per-row-spinner render: only when there's an actual TTY to redraw
@@ -77,7 +78,7 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
       return pending ? [pending] : [];
     });
     await withLiveRender(
-      (tick) => formatLimitsReport(aggregateLimitResults(annotate(slots.flat())), new Date(), spinnerChar(tick)),
+      (tick) => formatLimitsReport(aggregateLimitResults(annotate(slots.flat())), new Date(), spinnerChar(tick), { compact }),
       async () => {
         await fetchLimitResults(targets, cached, explicitTool, (i, resolved) => (slots[i] = resolved));
       },
@@ -87,7 +88,7 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
       // pending here anymore, so the report's spinner frame never renders.
       { eraseOnFinish: true },
     );
-    console.log(formatLimitsReport(aggregateLimitResults(annotate(slots.flat()))));
+    console.log(formatLimitsReport(aggregateLimitResults(annotate(slots.flat())), new Date(), undefined, { compact }));
     return;
   }
 
@@ -96,5 +97,5 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
     console.log(JSON.stringify(results, null, 2));
     return;
   }
-  console.log(formatLimitsReport(results));
+  console.log(formatLimitsReport(results, new Date(), undefined, { compact }));
 }
