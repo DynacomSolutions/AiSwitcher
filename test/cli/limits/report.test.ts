@@ -97,15 +97,40 @@ describe("formatLimitsReport", () => {
     expect(formatLimitsReport([])).toBe("No matching identities found.");
   });
 
-  test("every bar's opening bracket lines up at the same column", () => {
-    const output = formatLimitsReport([claudeAcme(), claudeUnauth("x"), { ...claudeAcme(), identity: identity("longer-name-b") }], NOW);
-    // Within a provider block (the TOTAL rollup above it aligns on its own).
-    const bracketColumns = output
-      .split("\n")
-      .slice(output.split("\n").indexOf("") + 1)
-      .filter((line) => line.includes("["))
-      .map((line) => line.indexOf("["));
-    expect(new Set(bracketColumns).size).toBe(1);
+  describe("bar alignment", () => {
+    const results = (): ToolLimitResult[] => [
+      claudeAcme(),
+      claudeUnauth("x"),
+      { ...claudeAcme(), identity: identity("longer-name-b") },
+      codexAcme(),
+    ];
+    const bracketColumns = (output: string): number[][] =>
+      output
+        .split("\n")
+        .filter((l) => /\[[█░]/.test(l))
+        .map((l) => [...l.matchAll(/\[[█░]/g)].map((m) => m.index!));
+
+    test("single column: TOTAL and every provider share one bar column", () => {
+      const cols = bracketColumns(formatLimitsReport(results(), NOW, "⠋", { width: 100, columns: false }));
+      expect(cols.length).toBeGreaterThan(5);
+      expect(new Set(cols.map((c) => c[0])).size).toBe(1);
+    });
+
+    test("columns: bars align within each column (and share one width when it fits)", () => {
+      const output = formatLimitsReport(results(), NOW, "⠋", { width: 200, columns: true });
+      const cols = bracketColumns(output).filter((c) => c.length === 2);
+      expect(cols.length).toBeGreaterThan(0);
+      expect(new Set(cols.map((c) => c[0])).size).toBe(1);
+      expect(new Set(cols.map((c) => c[1])).size).toBe(1);
+      // The TOTAL rows (single bar, above the columns) use the same prefix.
+      expect(bracketColumns(output)[0]![0]).toBe(cols[0]![0]);
+    });
+
+    test("compact: name and label columns are global, so bars line up across providers", () => {
+      const cols = bracketColumns(formatLimitsReport(results(), NOW, "⠋", { width: 100, columns: false, compact: true }));
+      expect(cols.length).toBeGreaterThan(2);
+      expect(new Set(cols.map((c) => c[0])).size).toBe(1);
+    });
   });
 
   test("TOTAL rollup has no title and sits at the very top, flush left", () => {
@@ -351,7 +376,8 @@ describe("--compact", () => {
     expect(lines[0]).toBe("OpenAI (1 identity)");
     expect(lines[1]).toMatch(/^ {2}identity-a {2}week {1,}\[.{10}\] {2}57% {2}in 1h 30m \(.*\) {2}↺1$/);
     expect(lines).toHaveLength(5);
-    expect(lines[4]).toBe("  zed  not authenticated");
+    // Name width is global across providers, so "zed" pads to "identity-a".
+    expect(lines[4]).toBe("  zed         not authenticated");
   });
 });
 

@@ -272,18 +272,38 @@ function compactLine(result: ToolLimitResult, nameWidth: number, labelWidth: num
   return line;
 }
 
-function buildSection(provider: string, group: ToolLimitResult[], ctx: Ctx): string[] {
-  const header = `${bold(usageProviderLabel(provider))} ${dim(`(${identityCount(group.length)})`)}`;
+interface Widths {
+  /** Indent + label + gap: the column every bar starts at. */
+  prefix: number;
+  name: number;
+  label: number;
+}
+
+function sectionRows(group: ToolLimitResult[], ctx: Ctx) {
   const sorted = sortByUrgency(group, ctx.all);
-  if (ctx.compact) {
-    const nameWidth = Math.max(...sorted.map((r) => r.identity.name.length));
-    const labelWidth = Math.max(0, ...sorted.filter((r) => r.windows.length > 0).map((r) => worstWindow(r).label.length));
-    return [header, ...sorted.map((r) => compactLine(r, nameWidth, labelWidth, ctx))];
-  }
   const aggregateRows = buildAggregateRows(group.filter((r) => !isMirroredPool(r, ctx.all)));
   const blocks = sorted.map((r, i) => buildIdentityBlock(r, i === sorted.length - 1, ctx));
   const dataRows = [...aggregateRows, ...blocks.flatMap((b) => b.rows)].filter((r) => r.plain === undefined);
-  const prefixWidth = Math.max(0, ...dataRows.map((r) => r.indent.length + r.label.length)) + GAP;
+  return { sorted, aggregateRows, blocks, dataRows };
+}
+
+const rowPrefix = (rows: Row[]): number => Math.max(0, ...rows.map((r) => r.indent.length + r.label.length)) + GAP;
+
+/** Widest prefix, name and worst-window label over the given groups. */
+function measure(groups: ToolLimitResult[][], extraRows: Row[], ctx: Ctx): Widths {
+  const sorted = groups.flatMap((g) => g);
+  return {
+    prefix: rowPrefix([...extraRows, ...groups.flatMap((g) => sectionRows(g, ctx).dataRows)]),
+    name: Math.max(0, ...sorted.map((r) => r.identity.name.length)),
+    label: Math.max(0, ...sorted.filter((r) => r.windows.length > 0).map((r) => worstWindow(r).label.length)),
+  };
+}
+
+function buildSection(provider: string, group: ToolLimitResult[], ctx: Ctx, widths: Widths): string[] {
+  const header = `${bold(usageProviderLabel(provider))} ${dim(`(${identityCount(group.length)})`)}`;
+  const { sorted, aggregateRows, blocks, dataRows } = sectionRows(group, ctx);
+  if (ctx.compact) return [header, ...sorted.map((r) => compactLine(r, widths.name, widths.label, ctx))];
+  const prefixWidth = widths.prefix;
   // In columns mode a plain row wraps at its block's data width (min 40), so
   // it never widens the block; single column wraps at the terminal width.
   const natural = Math.max(
@@ -305,18 +325,34 @@ function buildSection(provider: string, group: ToolLimitResult[], ctx: Ctx): str
 /** Lays blocks out side by side: the most columns that fit `width`, each
  * block going to the currently shortest column. Returns undefined when even
  * two columns do not fit (caller falls back to a single column). */
-export function packColumns(blocks: string[][], width: number, gap = COLUMN_GAP): string[] | undefined {
+export function packColumns(
+  blocks: string[][],
+  width: number,
+  gap = COLUMN_GAP,
+  /** Re-renders the blocks at these indices with their own (column-local) alignment; tried when the shared one does not fit. */
+  relayout?: (indices: number[]) => string[][],
+): string[] | undefined {
   for (let k = Math.min(blocks.length, 6); k >= 2; k--) {
-    const cols: string[][][] = Array.from({ length: k }, () => []);
+    let cols: string[][][] = Array.from({ length: k }, () => []);
+    const idx: number[][] = Array.from({ length: k }, () => []);
     const heights = new Array<number>(k).fill(0);
-    for (const block of blocks) {
+    blocks.forEach((block, i) => {
       const j = heights.indexOf(Math.min(...heights));
       cols[j]!.push(block);
+      idx[j]!.push(i);
       heights[j]! += block.length;
+    });
+    const measureCols = (cs: string[][][]) => {
+      const ls = cs.map((c) => c.flat());
+      return { ls, ws: ls.map((c) => Math.max(0, ...c.map(visibleLength))) };
+    };
+    let { ls: lines, ws: widths } = measureCols(cols);
+    const fits = () => widths.reduce((a, b) => a + b, 0) + gap * (k - 1) <= width;
+    if (!fits() && relayout) {
+      cols = idx.map((i) => relayout(i));
+      ({ ls: lines, ws: widths } = measureCols(cols));
     }
-    const lines = cols.map((c) => c.flat());
-    const widths = lines.map((c) => Math.max(0, ...c.map(visibleLength)));
-    if (widths.reduce((a, b) => a + b, 0) + gap * (k - 1) > width) continue;
+    if (!fits()) continue;
     const out: string[] = [];
     for (let i = 0; i < Math.max(...heights); i++) {
       out.push(
@@ -379,15 +415,23 @@ export function formatLimitsReport(
   // rollups fill in progressively as identities resolve, same as the
   // per-identity rows, rather than staying blank until every target
   // is done.
-  const totalRows = compact
+  const totalRows: Row[] = compact
     ? []
     : aggregateAverage(results).map(({ category, usedPercent }) => ({ indent: "", label: pluralizeCategory(category), usedPercent }));
-  const totalPrefix = Math.max(0, ...totalRows.map((r) => r.label.length)) + GAP;
+  // One prefix width over every row of every block (TOTAL included), so all bars start at the same column.
+  const entries = Array.from(groups.entries());
+  const shared = measure(entries.map(([, g]) => g), totalRows, ctx);
+  const blocks = entries.map(([provider, group]) => buildSection(provider, group, ctx, shared));
+  // Fallback when the shared width does not fit: each column aligns to its own widest prefix.
+  const relayout = (indices: number[]) => {
+    const own = measure(indices.map((i) => entries[i]![1]), [], ctx);
+    return indices.map((i) => buildSection(entries[i]![0], entries[i]![1], ctx, { ...shared, prefix: own.prefix }));
+  };
+  const body =
+    (columns ? packColumns(blocks, width, COLUMN_GAP, ctx.compact ? undefined : relayout) : undefined) ??
+    blocks.flatMap((b, i) => (i > 0 ? ["", ...b] : b));
 
-  const blocks = Array.from(groups.entries()).map(([provider, group]) => buildSection(provider, group, ctx));
-  const body = (columns ? packColumns(blocks, width) : undefined) ?? blocks.flatMap((b, i) => (i > 0 ? ["", ...b] : b));
-
-  const lines = totalRows.map((row) => renderRow(row, totalPrefix, ctx));
+  const lines = totalRows.map((row) => renderRow(row, shared.prefix, ctx));
   if (lines.length > 0) lines.push("");
   return [...lines, ...body].join("\n");
 }
