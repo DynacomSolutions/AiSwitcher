@@ -114,6 +114,7 @@ export function windowsFromAliUsage(wire: AliUsageWire): LimitWindow[] {
       category: entry.category,
       usedPercent: Math.min(100, Math.max(0, entry.fraction * 100)),
       resetsAt: formatResetsAt(entry.reset),
+      ...(entry.reset !== undefined && Number.isFinite(new Date(entry.reset).getTime()) ? { resetsAtMs: entry.reset } : {}),
     });
   }
   return windows;

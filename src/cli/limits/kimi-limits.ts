@@ -177,6 +177,12 @@ function formatResetsAt(resetTime: string | undefined): string | undefined {
   return parsed.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
+/** The exact reset instant, or nothing when unparseable. */
+function resetMs(resetTime: string | undefined): { resetsAtMs?: number } {
+  const ms = resetTime ? new Date(resetTime).getTime() : NaN;
+  return Number.isNaN(ms) ? {} : { resetsAtMs: ms };
+}
+
 /** Pure mapping from the wire shape to display windows, exported so tests
  * can exercise it without any network. Each `limits[]` entry becomes one
  * window; the top-level weekly `usage` block becomes one more ("week"),
@@ -190,7 +196,7 @@ export function windowsFromUsagesResponse(resp: KimiUsagesResponseWire): LimitWi
     const usedPercent = usedPercentFromStrings(entry.detail?.limit, entry.detail?.remaining, entry.detail?.used);
     if (usedPercent === undefined) continue;
     const { label, category } = labelAndCategoryFor(durationMinutes(entry));
-    windows.push({ label, category, usedPercent, resetsAt: formatResetsAt(entry.detail?.resetTime) });
+    windows.push({ label, category, usedPercent, resetsAt: formatResetsAt(entry.detail?.resetTime), ...resetMs(entry.detail?.resetTime) });
   }
 
   const usage = resp.usage;
@@ -199,7 +205,7 @@ export function windowsFromUsagesResponse(resp: KimiUsagesResponseWire): LimitWi
     if (usedPercent !== undefined) {
       const resetsAt = formatResetsAt(usage.resetTime);
       const duplicate = windows.some((w) => w.usedPercent === usedPercent && w.resetsAt === resetsAt);
-      if (!duplicate) windows.push({ label: "week", category: "week", usedPercent, resetsAt });
+      if (!duplicate) windows.push({ label: "week", category: "week", usedPercent, resetsAt, ...resetMs(usage.resetTime) });
     }
   }
   return windows;

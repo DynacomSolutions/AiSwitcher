@@ -45,6 +45,7 @@ describe("windowFromBudget", () => {
       category: "month",
       usedPercent: 25,
       resetsAt: new Date(2026, 9, 1).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }),
+      resetsAtMs: new Date(2026, 9, 1).getTime(),
       note: undefined,
     });
   });

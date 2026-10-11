@@ -25,10 +25,11 @@ export async function runWatch(
   flags: ParsedArgs["flags"],
   explicitTool: boolean,
   intervalMs: number,
+  compact = false,
 ): Promise<void> {
   if (!process.stdout.isTTY) {
     const results = await runLimitsQuery(identityFilter, flags, false);
-    console.log(formatLimitsReport(results));
+    console.log(formatLimitsReport(results, new Date(), undefined, { compact }));
     return;
   }
 
@@ -36,7 +37,7 @@ export async function runWatch(
   let statusLine = dim("fetching…");
 
   await withLiveRender(
-    (tick) => `${statusLine}\n\n${formatLimitsReport(aggregateLimitResults(slots.flat()), new Date(), spinnerChar(tick))}`,
+    (tick) => `${statusLine}\n\n${formatLimitsReport(aggregateLimitResults(slots.flat()), new Date(), spinnerChar(tick), { compact })}`,
     async () => {
       while (true) {
         const targets = await collectLimitTargets(identityFilter, flags);

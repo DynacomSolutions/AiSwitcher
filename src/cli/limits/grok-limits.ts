@@ -67,6 +67,7 @@ export async function fetchGrokLimits(identity: Identity): Promise<FetchedLimitR
           category,
           usedPercent,
           resetsAt: formatResetsAt(config?.currentPeriod?.end),
+          ...(Number.isFinite(Date.parse(config?.currentPeriod?.end ?? "")) ? { resetsAtMs: Date.parse(config!.currentPeriod!.end!) } : {}),
         },
       ],
       status: "cached",
