@@ -103,7 +103,7 @@ The recipe:
    `src/installer.ts` now unlink it first before writing, so this is handled
    generically, but confirm it rather than assuming). Verify with
    `which <tool>` after `bun run install:shims`, not by assumption.
-7. Update this file's module tree/design-decision bullets and README.md to
+7. Update AGENTS.md (core), docs/agents/module-map.md and README.md to
    mention the new tool everywhere claude/codex/grok are currently listed
    together — grep for the two tools you just added alongside to find every
    spot. (The audit test enforces the docs mention every registered tool at

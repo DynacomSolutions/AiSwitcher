@@ -106,7 +106,8 @@ Identity and launch:
   must never be sent as `-c` overrides. Never weaken the Codex backfill lease
   guards (repair only when the SQLite owner is provably gone). Never rewrite a
   live Codex rollout to fix its cwd; use `resume-cwd-overrides.json`.
-- `open` shim: darwin only; acts only when `IDENTITY_SESSION_MARKER` is set; on
+- `open` shim: darwin only; acts only when `IDENTITY_SESSION_MARKER` (env var
+  `AI_PROFILE_SWITCHER_SESSION`) is set; on
   any failure it falls through to plain `open`, loudly, never silently.
 
 Sync, data and upgrades:
@@ -128,29 +129,41 @@ Sync, data and upgrades:
 Console, reporting and credentials:
 - The console is a thin HTTP surface over the existing engines. Loopback bind only,
   loopback Host check, bearer token or loopback peer, `X-AIS-Console: 1` on every
-  mutating method, secrets write-only, file editing confined to whitelisted roots.
+  mutating method, secrets write-only, file editing confined to whitelisted roots (dual lexical+realpath containment
+  checks and pre-edit backups).
   `parseArgs` reads only `--flag=value`.
-- Login flows spawn the REAL binary (`resolveRealBinary`), never the shim.
+- Console (WebUI) login flows spawn the REAL binary (`resolveRealBinary`), never the shim.
 - Limits and usage are provider-first: group by provider+identity, never by tool.
   ESTIMATES and REAL spend never share a column. A source with nothing to report
   renders no row unless `--tool=` asked for it; failures are honest rows, never
-  fabricated zeros.
+  fabricated zeros (source-only failures: Errors section only).
 - `ais usage`: tokscale is not a dependency; `--client` goes AFTER the tokscale
   subcommand; unscoped passthrough must merge identities, not inject nothing;
   breakdown attribution rule is fixed (prompt tokens on conversation, output split
   evenly over a turn's tool calls) and always labelled an estimate.
 - One credential per (identity, provider): OAuth copies are views of one logical
-  token (freshest wins); never copy credentials between identities; pi sync is
-  ADD-ONLY for existing entries; a pool identity's refresh token must never fork.
+  token (freshest wins); pi sync is ADD-ONLY for existing entries; a pool
+  identity's refresh token must never fork. The pi single instance never copies
+  credentials: it reads the source identity's store per request and writes
+  rotations back to that source. Claude swap pools are the deliberate exception:
+  the pool's `.credentials.json` mirrors the active member's grant and is
+  written back before each swap.
 - Spend guard: no override env var or flag; never block on missing data and never
   skip it silently (flag degraded); `mode` in `~/.ais/config/spend-guard.json`
   is the only switch.
 - crush-backed tools: never run `crush update-providers` for per-identity scoping;
   `CRUSH_GLOBAL_CONFIG` and `CRUSH_GLOBAL_DATA` must point at different directories.
 - OpenCode wrapper never prompts for identity in `run`/`acp`/`serve`; never reuse
-  Claude Pro/Max OAuth; never aggregate credentials across identities.
+  Claude Pro/Max OAuth; never aggregate credentials from unrelated identities
+  into one OpenCode profile.
+- pi (single instance) never prompts and never errors on no-match; with no match
+  it omits `AI_PROFILE_SWITCHER_SESSION`.
 - herdr is never bundled or installed by ais; the bridge only calls its CLI and
-  never kills or signals herdr processes.
+  never kills or signals herdr processes (except killing our own timed-out CLI
+  client spawn).
+- Secrets never reach argv, logs or output tails; identify credentials by
+  fingerprint only. Never kill processes this project does not own; take no
+  unrequested destructive action.
 - Account wiring (AWS profiles, Chrome MCP identities) is machine-local config under
   `~/.ais/config/`, never in this public repo.
 
@@ -158,12 +171,30 @@ Console, reporting and credentials:
 
 A tool is not "added" when it launches; it is added when it is wired everywhere
 (CLI subcommands, wrappers, build/install/backup scripts, release workflow and
-BOTH docs, in the same change). Two gates MUST pass: `test/tool-wiring.audit.test.ts`
+BOTH docs, in the same change: `AGENTS.md` core, `docs/agents/module-map.md`
+and `README.md`). Two gates MUST pass: `test/tool-wiring.audit.test.ts`
 (add new integration-point files to its `FILES` list) and an explicit per-tool
 decision (wire it, or say in the PR why absent) for the deliberately partial
 touchpoints (doctor `PROBES`, `fetchExtraCost`, `cli/limits/*`, `cli/resume/*`,
 `cli/auth/*`, `model-pricing.ts`). `bun run typecheck && bun test` must be green,
 then run the real command once. Full recipe: `docs/agents/adding-a-tool.md`.
+
+## Touching paths (every `src/` directory maps to at least one entry)
+
+- `src/sync/**`, `src/cli/sync/**`: sync.md
+- `src/cli/resume/**`, `src/cli/sessions/**`: sync.md, codex.md, crush-tools.md
+- `src/cli/usage/**`: usage-tokscale.md, provider-first.md, crush-tools.md, bedrock-spend.md
+- `src/cli/limits/**`: provider-first.md, bedrock-spend.md, crush-tools.md
+- `src/server/**`: console-web.md
+- `src/spend/**`: bedrock-spend.md
+- `src/identities/*auth*`, `src/identities/oauth-*`: provider-first.md, pi.md
+- `src/identities/claude-swap*`, `src/cli/claude-swap/**`: claude-swap-pools.md
+- `src/identities/**` (rest): identities.md, module-map.md
+- `src/pi-extension/**`: pi.md
+- `src/shared/**`: wrappers-and-shims.md, module-map.md
+- `src/cli/auth/**`: provider-first.md, pi.md
+- `src/cli/doctor/**`, `src/cli/identities/**`, other `src/cli/*`: module-map.md
+- `src/<tool>.ts`, `src/open.ts`: wrappers-and-shims.md, chrome-open.md
 
 ## Topic index (read the file before touching the area)
 
