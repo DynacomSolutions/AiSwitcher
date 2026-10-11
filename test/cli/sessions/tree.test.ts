@@ -3,6 +3,7 @@ import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { ACTIVE_WINDOW_MS } from "../../../src/cli/sessions/shared.ts";
 import { readSessionTrees } from "../../../src/cli/sessions/tree.ts";
 import type { TreeNodeDto } from "../../../src/cli/sessions/types.ts";
 import type { Identity } from "../../../src/identities/types.ts";
@@ -83,6 +84,22 @@ describe("claude tree", () => {
     expect(orphan.parentId).toBe("old-parent"); // kept, though parent is outside the window
     expect(orphan.depth).toBe(0); // renders as a root
     expect(nodeIds(tree.nodes)).not.toContain("old-parent");
+  });
+
+  test("activeWithinMs keeps only recently modified sessions, filtering by mtime before parsing", async () => {
+    const configDir = await freshDir("claude-active");
+    const enc = join(configDir, "projects", CLAUDE_ENC);
+    await writeJsonl(join(enc, "recent.jsonl"), [
+      claudeUserLine("/tmp/proj-a", "SYNTHETIC_FIXTURE recent", "2026-09-01T11:59:50.000Z"),
+    ], NOW - 5 * 60_000);
+    await writeJsonl(join(enc, "hour-old.jsonl"), [
+      claudeUserLine("/tmp/proj-a", "SYNTHETIC_FIXTURE hour old", "2026-09-01T11:00:00.000Z"),
+    ], NOW - 60 * 60_000);
+
+    const all = await readSessionTrees("claude", identity(configDir), OPTS);
+    expect(nodeIds(all.nodes).sort()).toEqual(["hour-old", "recent"]);
+    const active = await readSessionTrees("claude", identity(configDir), { ...OPTS, activeWithinMs: ACTIVE_WINDOW_MS });
+    expect(nodeIds(active.nodes)).toEqual(["recent"]);
   });
 
   test("fresh mtime marks a session in progress; the days window prunes old files", async () => {

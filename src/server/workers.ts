@@ -46,6 +46,7 @@ export interface ScanSpawn {
  * (previously dead) caching already documented as the intended budget. */
 const treeCache = new PollCache(15_000);
 const transcriptCache = new PollCache(4_000);
+const sessionsCache = new PollCache(15_000);
 const usageCache = new PollCache(45_000, join(aisCacheDir(), "swr", "usage"));
 const limitsCache = new PollCache(45_000);
 const breakdownCache = new PollCache(60_000, join(aisCacheDir(), "swr", "breakdown"));
@@ -73,6 +74,8 @@ function cacheFor(kind: ScanKind): PollCache | undefined {
       return treeCache;
     case "transcript":
       return transcriptCache;
+    case "sessions":
+      return sessionsCache;
     case "usage":
       return usageCache;
     case "limits":
@@ -92,7 +95,7 @@ function cacheFor(kind: ScanKind): PollCache | undefined {
  * scan-worker.ts's own limitsEnvelope did) rather than the fixed default,
  * since that is a documented API parameter, not an internal cache detail. */
 async function cachedScan<T>(
-  kind: "tree" | "transcript" | "usage" | "limits" | "breakdown",
+  kind: "tree" | "transcript" | "usage" | "limits" | "breakdown" | "sessions",
   params: Omit<ScanRequest, "kind">,
   timeoutMs: number,
 ): Promise<ScanResult<T>> {
@@ -104,13 +107,17 @@ async function cachedScan<T>(
     return result;
   };
   const maxAgeMs = kind === "limits" && typeof params.maxAgeS === "number" ? Math.max(5, params.maxAgeS) * 1000 : undefined;
-  // usage/breakdown are the slow scans (tokscale can run for minutes): serve
-  // the last-good value immediately and refresh in the background.
-  if (kind === "usage" || kind === "breakdown") {
+  // usage/breakdown/tree/sessions are the slow scans (tokscale can run for
+  // minutes; tree/sessions walk every transcript): serve the last-good value
+  // immediately and refresh in the background. Only usage/breakdown have a
+  // "pending" seed; a cold tree/sessions request waits for its first scan.
+  if (kind === "usage" || kind === "breakdown" || kind === "tree" || kind === "sessions") {
     let swr;
     try {
       swr = await cache.getSwr(key, fetcher, undefined, {
-        pending: () => pendingPayload(kind, params) as Promise<ScanResult<T>>,
+        ...(kind === "usage" || kind === "breakdown"
+          ? { pending: () => pendingPayload(kind, params) as Promise<ScanResult<T>> }
+          : {}),
       });
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error), status: error instanceof CliUsageError ? 400 : 500 };
@@ -157,11 +164,10 @@ function baseArgs(): string[] {
 /** Every poll-driven kind (tree/transcript, and now usage/limits/
  * breakdown) serves repeats from the daemon cache instead of spawning a
  * fresh child per request; see cachedScan's doc comment above. "sessions"
- * is a lighter local listing with no tokscale/provider-API cost and stays
- * uncached, same as before. Exported as a pure predicate so the routing
+ * is cached with the same stale-while-revalidate read as tree. Exported as a pure predicate so the routing
  * decision itself is unit-testable without spawning anything. */
-const CACHED_SCAN_KINDS = new Set<ScanKind>(["tree", "transcript", "usage", "limits", "breakdown"]);
-export function isCachedScanKind(kind: ScanKind): kind is "tree" | "transcript" | "usage" | "limits" | "breakdown" {
+const CACHED_SCAN_KINDS = new Set<ScanKind>(["tree", "transcript", "usage", "limits", "breakdown", "sessions"]);
+export function isCachedScanKind(kind: ScanKind): kind is "tree" | "transcript" | "usage" | "limits" | "breakdown" | "sessions" {
   return CACHED_SCAN_KINDS.has(kind);
 }
 

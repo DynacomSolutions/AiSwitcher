@@ -4,6 +4,7 @@ import { collectResumeTargets, runResumeQuery } from "../cli/resume/collect.ts";
 import { CliUsageError } from "../cli/errors.ts";
 import { isKnownToolName } from "../cli/identities/resolve-tool.ts";
 import { hasTreeReader, readSessionTrees } from "../cli/sessions/tree.ts";
+import { ACTIVE_WINDOW_MS } from "../cli/sessions/shared.ts";
 import { DEFAULT_TAIL_TURNS, readTranscript } from "../cli/sessions/transcript.ts";
 
 /** The (tool, identity) target list for the tree/transcript scans. Retired
@@ -53,6 +54,9 @@ export interface ScanRequest {
   maxAgeS?: number;
   /** Breakdown and tree: lookback window in days. */
   days?: number;
+  /** Tree and sessions: only sessions whose transcript changed within
+   * ACTIVE_WINDOW_MS (filtered by mtime before any parsing). */
+  active?: boolean;
   /** Transcript only: opaque session id from the tree response. */
   id?: string;
   /** Transcript only: max turns returned (tail-weighted). */
@@ -96,10 +100,10 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
         // never collide with the live home's entries.
         const scope = req.configs?.map((c) => c.identitiesJsonPath).join(",") ?? "live";
         const { value, cached } = await treeCache.get(
-          `${scope}|${req.tool ?? "*"}|${req.identity ?? "*"}|${days}`,
+          `${scope}|${req.tool ?? "*"}|${req.identity ?? "*"}|${days}|${req.active ? "active" : "all"}`,
           async () => {
             const targets = await collectSessionTargets(req.tool, req.identity, req.configs);
-            const tools = await Promise.all(targets.map((t) => readSessionTrees(t.toolName, t.identity, { days })));
+            const tools = await Promise.all(targets.map((t) => readSessionTrees(t.toolName, t.identity, req.active ? { days, activeWithinMs: ACTIVE_WINDOW_MS } : { days })));
             // A reader-less tool named explicitly still earns its honest
             // unavailable slice, even when no registry provides identities
             // for it (the WebUI shows "unavailable", not a silent gap).

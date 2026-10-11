@@ -20,8 +20,8 @@ describe("isCachedScanKind", () => {
     expect(isCachedScanKind("transcript")).toBe(true);
   });
 
-  test("sessions stays uncached (a lighter local listing, no tokscale/provider cost)", () => {
-    expect(isCachedScanKind("sessions")).toBe(false);
+  test("sessions is cached too (stale-while-revalidate)", () => {
+    expect(isCachedScanKind("sessions")).toBe(true);
   });
 });
 

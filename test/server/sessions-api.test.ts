@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Identity, ToolConfig } from "../../src/identities/types.ts";
@@ -47,6 +47,24 @@ async function seedClaudeSession(registryPath: string, configDir: string, sessio
 }
 
 describe("scan-worker tree + transcript kinds", () => {
+  test("tree kind honours active=true (mtime filter) as a separate cache key", async () => {
+    const { registryPath, configDir } = await makeHome();
+    const configs = [fakeConfig(registryPath)];
+    await seedClaudeSession(registryPath, configDir, "act-sess");
+    const file = join(configDir, "projects", "-tmp-proj-a", "act-sess.jsonl");
+    type Tree = { tools: Array<{ nodes: unknown[] }> };
+    const live = await runScan<Tree>({ kind: "tree", tool: "claude", configs, days: 30, active: true });
+    expect(live.payload!.tools[0]!.nodes).toHaveLength(1);
+    const hourAgo = new Date(Date.now() - 3_600_000);
+    await utimes(file, hourAgo, hourAgo);
+    // days: 29 sidesteps the 15s scan-worker cache entry from the call above.
+    const stale = await runScan<Tree>({ kind: "tree", tool: "claude", configs, days: 29, active: true });
+    // The "all" view still lists it: the active flag is part of the cache key.
+    const all = await runScan<Tree>({ kind: "tree", tool: "claude", configs, days: 30 });
+    expect(stale.payload!.tools[0]!.nodes).toHaveLength(0);
+    expect(all.payload!.tools[0]!.nodes).toHaveLength(1);
+  });
+
   test("tree kind returns the per-tool envelope; opencode honest unavailable", async () => {
     const { registryPath, configDir } = await makeHome();
     const configs = [fakeConfig(registryPath)];

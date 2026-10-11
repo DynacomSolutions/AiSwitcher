@@ -305,19 +305,24 @@ export function SessionsPage() {
     searchParams.get("tool") ?? "",
     searchParams.get("identity") ?? "",
     parsedDays(searchParams.get("days")),
+    searchParams.get("show") !== "all",
   );
   const identitiesQuery = useIdentitiesQuery();
 
   const tool = searchParams.get("tool") ?? "";
   const identity = searchParams.get("identity") ?? "";
   const days = parsedDays(searchParams.get("days"));
+  // Default view = active sessions only; `?show=all` lists everything in the window.
+  const showAll = searchParams.get("show") === "all";
   const chat = parseChat(searchParams.get("chat"));
 
-  const setParam = (key: string, value: string) => {
+  // Filters rewrite the URL in place (history REPLACE); opening a chat is
+  // content navigation and keeps a normal history entry.
+  const setParam = (key: string, value: string, replace = key !== "chat") => {
     const next = new URLSearchParams(searchParams);
     if (value.length > 0) next.set(key, value);
     else next.delete(key);
-    setSearchParams(next);
+    setSearchParams(next, { replace });
   };
 
   const slices = treeQuery.data?.tools ?? [];
@@ -410,7 +415,16 @@ export function SessionsPage() {
             ))}
           </SelectContent>
         </Select>
-        <Select value={String(days)} onValueChange={(v) => setParam("days", v)}>
+        <Button
+          variant={showAll ? "outline" : "default"}
+          size="sm"
+          className="h-8 text-xs"
+          aria-pressed={!showAll}
+          onClick={() => setParam("show", showAll ? "" : "all")}
+        >
+          {showAll ? "Show active only" : "Active only"}
+        </Button>
+        <Select value={String(days)} disabled={!showAll} onValueChange={(v) => setParam("days", v)}>
           <SelectTrigger className="h-8 w-36 text-xs" aria-label="Lookback window">
             <SelectValue placeholder="Window" />
           </SelectTrigger>
@@ -441,7 +455,11 @@ export function SessionsPage() {
       ) : visible.length === 0 ? (
         <EmptyState
           title="No session activity found"
-          description={`No agent sessions recorded in the last ${days} day${days === 1 ? "" : "s"} for this filter; launch an agent or widen the window.`}
+          description={
+            showAll
+              ? `No agent sessions recorded in the last ${days} day${days === 1 ? "" : "s"} for this filter; launch an agent or widen the window.`
+              : "No active sessions (transcript changed in the last 15 minutes) for this filter; use the toggle to show all."
+          }
         />
       ) : (
         <div className="grid gap-4 xl:grid-cols-2">

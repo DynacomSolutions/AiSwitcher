@@ -25,8 +25,8 @@ export const qk = {
   usage: ["usage"] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
-  sessionTree: (tool: string, identity: string, days: number) =>
-    ["sessions", "tree", tool, identity, days] as const,
+  sessionTree: (tool: string, identity: string, days: number, active: boolean) =>
+    ["sessions", "tree", tool, identity, days, active] as const,
   sessionTranscript: (tool: string, identity: string, id: string, tail: number) =>
     ["sessions", "transcript", tool, identity, id, tail] as const,
   auth: ["auth"] as const,
@@ -133,14 +133,15 @@ export function useSessionsQuery(cwd: string) {
 
 /** The what-spawned-what tree. Polls lightly while the page is open so new
  * roots appear on their own; the server caches for 15s. */
-export function useSessionTreeQuery(tool: string, identity: string, days: number) {
+export function useSessionTreeQuery(tool: string, identity: string, days: number, active: boolean) {
   return useQuery({
-    queryKey: qk.sessionTree(tool, identity, days),
+    queryKey: qk.sessionTree(tool, identity, days, active),
     queryFn: () =>
       api.getSessionTree(
         tool.length > 0 ? tool : undefined,
         identity.length > 0 ? identity : undefined,
         days,
+        active,
       ),
     refetchInterval: POLL.tree,
     placeholderData: keepPreviousData,
