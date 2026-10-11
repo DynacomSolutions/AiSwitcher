@@ -156,4 +156,27 @@ describe("readCodexSessions", () => {
     expect(result.sessions).toHaveLength(1);
     expect(Number.isNaN(new Date(result.sessions[0]!.lastActiveAt).getTime())).toBe(false);
   });
+
+  test("huge first lines (multi-byte, spanning many reads) still parse; non-matching files are dropped", async () => {
+    const configDir = await makeConfigDir();
+    const big = "é".repeat(100_000); // 200 KB of 2-byte chars, so reads split mid-character
+    for (let i = 0; i < 20; i++) {
+      const cwd = i === 7 ? TARGET_CWD : "/elsewhere";
+      await writeRollout(configDir, `2026/07/15/rollout-${i}.jsonl`, [
+        sessionMeta(`id-${i}`, cwd, { base_instructions: big }),
+        userMessage(`msg ${i}`, "2026-07-15T00:05:00.000Z"),
+      ]);
+    }
+    const result = await readCodexSessions(identity(configDir), TARGET_CWD);
+    expect(result.sessions.map((s) => [s.sessionId, s.label])).toEqual([["id-7", "msg 7"]]);
+  });
+
+  test("a first line over 1 MiB is skipped, not buffered", async () => {
+    const configDir = await makeConfigDir();
+    await writeRollout(configDir, "2026/07/15/rollout-x.jsonl", [
+      sessionMeta("id-x", TARGET_CWD, { base_instructions: "a".repeat(1_100_000) }),
+    ]);
+    const result = await readCodexSessions(identity(configDir), TARGET_CWD);
+    expect(result.sessions).toEqual([]);
+  });
 });
