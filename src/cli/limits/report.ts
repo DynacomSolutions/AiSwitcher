@@ -10,8 +10,6 @@ const DEFAULT_WIDTH = 100;
 const NARROW_WIDTH = 80;
 /** Below this width provider blocks never go side by side. */
 const COLUMNS_MIN_WIDTH = 120;
-/** Error wrap width used when columns are on, so one long error cannot widen its whole block. */
-const COLUMN_WRAP_WIDTH = 64;
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -53,6 +51,8 @@ interface Ctx {
   spinnerFrame: string;
   barWidth: number;
   wrapWidth: number;
+  /** Blocks share the line: plain rows wrap to their own block's width, not the terminal's. */
+  columns: boolean;
   compact: boolean;
   all: ToolLimitResult[];
 }
@@ -140,7 +140,7 @@ export function formatCountdown(resetsAtMs: number, now: Date): string {
 
 /** Local 24h clock: "Sun 03:09", or "Sat 18 Oct 21:59" once ≥7 days away. */
 export function formatClock(resetsAtMs: number, now: Date): string {
-  const d = new Date(resetsAtMs);
+  const d = new Date(Math.round(resetsAtMs / 60_000) * 60_000);
   const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const far = resetsAtMs - now.getTime() >= 7 * 24 * 60 * 60_000;
   return `${WEEKDAYS[d.getDay()]} ${far ? `${d.getDate()} ${MONTHS[d.getMonth()]} ` : ""}${hhmm}`;
@@ -260,7 +260,7 @@ function compactLine(result: ToolLimitResult, nameWidth: number, labelWidth: num
   if (result.status === "pending") return `  ${bold(name)}  ${gray(`${ctx.spinnerFrame} loading…`)}`;
   if (result.status === "unavailable" || result.windows.length === 0) {
     const text = (result.error ?? "no data").replace(/\s+/g, " ");
-    const room = Math.max(10, ctx.wrapWidth - nameWidth - 4);
+    const room = Math.max(10, (ctx.columns ? Math.min(ctx.wrapWidth, 60) : ctx.wrapWidth) - nameWidth - 4);
     return `  ${bold(name)}  ${gray(text.length > room ? `${text.slice(0, room - 1)}…` : text)}`;
   }
   const w = worstWindow(result);
@@ -284,11 +284,20 @@ function buildSection(provider: string, group: ToolLimitResult[], ctx: Ctx): str
   const blocks = sorted.map((r, i) => buildIdentityBlock(r, i === sorted.length - 1, ctx));
   const dataRows = [...aggregateRows, ...blocks.flatMap((b) => b.rows)].filter((r) => r.plain === undefined);
   const prefixWidth = Math.max(0, ...dataRows.map((r) => r.indent.length + r.label.length)) + GAP;
+  // In columns mode a plain row wraps at its block's data width (min 40), so
+  // it never widens the block; single column wraps at the terminal width.
+  const natural = Math.max(
+    40,
+    visibleLength(header),
+    ...blocks.map((b) => visibleLength(b.branch)),
+    ...dataRows.map((r) => visibleLength(renderRow(r, prefixWidth, ctx))),
+  );
+  const rowCtx = ctx.columns ? { ...ctx, wrapWidth: Math.min(ctx.wrapWidth, natural) } : ctx;
   const lines = [header];
-  for (const row of aggregateRows) lines.push(renderRow(row, prefixWidth, ctx));
+  for (const row of aggregateRows) lines.push(renderRow(row, prefixWidth, rowCtx));
   for (const block of blocks) {
     lines.push(block.branch);
-    for (const row of block.rows) lines.push(renderRow(row, prefixWidth, ctx));
+    for (const row of block.rows) lines.push(renderRow(row, prefixWidth, rowCtx));
   }
   return lines.flatMap((l) => l.split("\n"));
 }
@@ -350,7 +359,8 @@ export function formatLimitsReport(
     now,
     spinnerFrame,
     barWidth: compact || width < NARROW_WIDTH ? 10 : 20,
-    wrapWidth: columns ? COLUMN_WRAP_WIDTH : width,
+    wrapWidth: width,
+    columns,
     compact,
     all: results,
   };

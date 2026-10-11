@@ -125,12 +125,15 @@ function getUsage(token: string, url: string, deps: FetchUsageDeps, cliUserAgent
 }
 
 /** Raw usage body including the `cedar_ember` reset grants, from one request; `error` on ANY failure (never throws). */
-export async function fetchUsageBodyWithResets(member: Identity, deps: FetchUsageDeps = {}): Promise<{ body?: unknown; error?: string }> {
+export async function fetchUsageBodyWithResets(
+  member: Identity,
+  deps: FetchUsageDeps = {},
+): Promise<{ body?: unknown; error?: string; status?: number }> {
   try {
     const { token, error } = await usableAccessToken(member, deps);
     if (!token) return { error: error ?? "no token" };
     const response = await getUsage(token, CLAUDE_RESETS_URL, deps, true);
-    if (!response.ok) return { error: `usage endpoint answered HTTP ${response.status}` };
+    if (!response.ok) return { error: `usage endpoint answered HTTP ${response.status}`, status: response.status };
     return { body: await response.json() };
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };

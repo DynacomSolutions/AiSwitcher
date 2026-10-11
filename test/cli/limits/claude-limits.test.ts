@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { overageFromUsageBody, overageFromUsageText, windowsFromUsageBody } from "../../../src/cli/limits/claude-limits.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fetchClaudeLimits, overageFromUsageBody, overageFromUsageText, windowsFromUsageBody } from "../../../src/cli/limits/claude-limits.ts";
 
 describe("overageFromUsageText", () => {
   test("the confirmed-live default intro line reports subscription-only with a confirmed $0 spend, not just a label", () => {
@@ -92,5 +95,29 @@ describe("overageFromUsageBody", () => {
     expect(overageFromUsageBody({ extra_usage: { is_enabled: true, spend_limit_reached: true } })).toEqual({ active: false, label: "out of extra usage" });
     expect(overageFromUsageBody({ extra_usage: { is_enabled: true } })).toEqual({ active: true, label: "using extra usage" });
     expect(overageFromUsageBody({})).toBeUndefined();
+  });
+});
+
+describe("fetchClaudeLimits rate limiting", () => {
+  const id = { name: "acct", label: "Acct", configDir: "/nonexistent/acct" };
+  const cacheDir = () => mkdtempSync(join(tmpdir(), "ais-limits-"));
+  const ok = async () => ({ body: { five_hour: { utilization: 42, resets_at: "2026-10-12T00:00:00Z" } } });
+  const limited = async () => ({ error: "usage endpoint answered HTTP 429", status: 429 });
+  const common = { reconcile: async () => undefined as never };
+
+  test("a 429 with a last-good read returns it as cached, with its original capturedAt, without spawning", async () => {
+    const dir = cacheDir();
+    const live = await fetchClaudeLimits(id, { ...common, cacheDir: dir, fetchBody: ok });
+    expect(live.status).toBe("live");
+    const stale = await fetchClaudeLimits(id, { ...common, cacheDir: dir, fetchBody: limited });
+    expect(stale.status).toBe("cached");
+    expect(stale.windows[0]?.usedPercent).toBe(42);
+    expect(stale.capturedAt).toBe(live.capturedAt);
+  });
+
+  test("a 429 with no cache fails fast as unavailable", async () => {
+    const result = await fetchClaudeLimits(id, { ...common, cacheDir: cacheDir(), fetchBody: limited });
+    expect(result.status).toBe("unavailable");
+    expect(result.error).toContain("rate-limited");
   });
 });

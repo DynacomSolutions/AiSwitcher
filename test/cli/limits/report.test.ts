@@ -354,3 +354,25 @@ describe("--compact", () => {
     expect(lines[4]).toBe("  zed  not authenticated");
   });
 });
+
+describe("column-width wrapping and minute rounding", () => {
+  test("a short plain row is not wrapped in column mode", () => {
+    const r = codexWithManualReset();
+    r.manualReset = { availableCount: 3, label: "Full reset", expiresAt: "Oct 23, 3:24 AM" };
+    r.windows = [{ label: "week", category: "week", usedPercent: 0, resetsAtMs: NOW.getTime() + 7 * 86_400_000 }];
+    const out = formatLimitsReport([r], NOW, "⠋", { width: 220, columns: true });
+    const line = out.split("\n").find((l) => l.includes("manual resets"))!;
+    expect(line).toContain("(expires Oct 23, 3:24 AM)");
+  });
+
+  test("a long error wraps at its block's width, not the terminal's", () => {
+    const r = claudeUnauth("personal");
+    r.error = "word ".repeat(60).trim();
+    const lines = formatLimitsReport([r], NOW, "⠋", { width: 220, columns: true }).split("\n");
+    expect(Math.max(...lines.map((l) => l.length))).toBeLessThanOrEqual(60);
+  });
+
+  test("clock rounds to the nearest minute", () => {
+    expect(formatClock(LOCAL(2026, 9, 12, 2, 59) + 59_900, LNOW)).toBe("Mon 03:00");
+  });
+});

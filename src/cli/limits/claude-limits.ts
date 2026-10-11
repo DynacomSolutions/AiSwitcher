@@ -1,3 +1,6 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
 import { fetchUsageBodyWithResets, manualResetFromCedarEmber, fetchMemberResets } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
@@ -166,7 +169,40 @@ export function overageFromUsageText(stdout: string): OverageInfo | undefined {
  * observed live (every identity on this machine turned out to be logged in
  * once the env-stripping bug was fixed), so we don't try to infer it from
  * text parsing. */
-export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimitResult> {
+export interface ClaudeLimitsDeps {
+  /** Test hooks. */
+  fetchBody?: typeof fetchUsageBodyWithResets;
+  cacheDir?: string;
+  reconcile?: typeof reconcileOnceForFetch;
+}
+
+function lastGoodPath(identity: Identity, cacheDir: string): string {
+  return join(cacheDir, "claude-limits", `${encodeURIComponent(identity.name)}.json`);
+}
+
+/** Last successful API read, kept so a 429 can still show (stale) numbers. */
+async function saveLastGood(identity: Identity, result: FetchedLimitResult, cacheDir: string): Promise<void> {
+  try {
+    const { identity: _identity, ...rest } = result;
+    const path = lastGoodPath(identity, cacheDir);
+    await mkdir(join(cacheDir, "claude-limits"), { recursive: true });
+    await writeFile(path, JSON.stringify(rest));
+  } catch {
+    // Bookkeeping only; never fail a fetch over it.
+  }
+}
+
+async function loadLastGood(identity: Identity, cacheDir: string): Promise<FetchedLimitResult | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(lastGoodPath(identity, cacheDir), "utf8")) as Omit<FetchedLimitResult, "identity">;
+    return Array.isArray(parsed.windows) && parsed.windows.length > 0 ? { ...parsed, identity } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDeps = {}): Promise<FetchedLimitResult> {
+  const cacheDir = deps.cacheDir ?? aisCacheDir();
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "claude", identity };
 
   // ONE reconcile per fetch, before the binary runs: pi may hold a fresher
@@ -177,15 +213,15 @@ export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimi
   // this pattern — its fetcher reads the freshest copy and writes a
   // refresh through to both stores; the reconcile is the same law for the
   // stores AIS can only rewrite wholesale.
-  await reconcileOnceForFetch("claude", identity);
+  await (deps.reconcile ?? reconcileOnceForFetch)("claude", identity);
 
   // Fast path: one HTTP call. Any failure falls through to the spawn path below.
-  const { body } = await fetchUsageBodyWithResets(identity);
+  const { body, status } = await (deps.fetchBody ?? fetchUsageBodyWithResets)(identity);
   const apiWindows = body === undefined ? [] : windowsFromUsageBody(body);
   if (apiWindows.length > 0) {
     const overage = overageFromUsageBody(body);
     const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown }).cedar_ember);
-    return {
+    const live: FetchedLimitResult = {
       ...base,
       windows: apiWindows,
       status: "live",
@@ -193,6 +229,16 @@ export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimi
       ...(overage ? { overage } : {}),
       ...(manualReset ? { manualReset } : {}),
     };
+    await saveLastGood(identity, live, cacheDir);
+    return live;
+  }
+  // 429: the `claude -p /usage` spawn hits the same endpoint, so spawning
+  // only adds seconds. Serve the last good read (stale marker comes from its
+  // capturedAt) or fail fast.
+  if (status === 429) {
+    const last = await loadLastGood(identity, cacheDir);
+    if (last) return { ...last, status: "cached" };
+    return { ...base, windows: [], status: "unavailable", error: "rate-limited by Anthropic usage endpoint, retry shortly" };
   }
 
   let binaryPath: string;

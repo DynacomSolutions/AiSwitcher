@@ -303,6 +303,17 @@ export function aggregateLimitResults(results: ToolLimitResult[]): ToolLimitResu
   return [...grouped.values()];
 }
 
+/** A claude swap pool whose active member is also a target: it shares that
+ * member's token and renders as a pointer row, so it is never fetched. */
+export function isMirroredPoolTarget(target: LimitTarget, targets: LimitTarget[]): boolean {
+  const active = target.identity.swapPool?.active;
+  return (
+    target.toolName === "claude" &&
+    active !== undefined &&
+    targets.some((t) => t !== target && t.toolName === "claude" && t.identity.name === active)
+  );
+}
+
 /** Fetches results for an already-collected target list — split out from
  * runLimitsQuery so limits/dispatch.ts's live TTY render can call
  * collectLimitTargets up front (to seed pending placeholder rows before any
@@ -319,7 +330,21 @@ export async function fetchLimitResults(
   const batches = await runBatched(
     targets,
     MAX_CONCURRENT,
-    async (target) => (cached ? cachedResults(target, explicitTool) : fetchTarget(target, explicitTool)),
+    async (target): Promise<ToolLimitResult[]> =>
+      isMirroredPoolTarget(target, targets)
+        ? [
+            {
+              toolName: target.toolName,
+              provider: providerForTool(target.toolName),
+              identity: target.identity,
+              windows: [],
+              status: "unavailable",
+              error: `mirrors active member ${target.identity.swapPool!.active} (not fetched)`,
+            },
+          ]
+        : cached
+          ? cachedResults(target, explicitTool)
+          : fetchTarget(target, explicitTool),
     onItemDone,
   );
   return aggregateLimitResults(batches.flat());
