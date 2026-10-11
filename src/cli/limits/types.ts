@@ -67,8 +67,8 @@ export interface OverageInfo {
  * `status: "available"` credit). This is an ACTION the user can take in the
  * provider's own UI/CLI, not a scheduled event; absence of this field means
  * the provider exposes no such concept or nothing is currently available.
- * Only codex surfaces it today; other providers' adapters simply never set
- * it.
+ * Codex (reset credits) and Claude (`/limit-reset` grants) surface it;
+ * other providers' adapters simply never set it.
  */
 export interface ManualResetInfo {
   /** How many resets can be used right now (the wire's own availableCount

@@ -1,4 +1,5 @@
 import type { Identity } from "../../identities/types.ts";
+import { fetchMemberResets } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
@@ -204,5 +205,14 @@ export async function fetchClaudeLimits(identity: Identity): Promise<FetchedLimi
   }
 
   const overage = overageFromUsageText(usageStdout);
-  return { ...base, windows, status: "live", capturedAt: new Date().toISOString(), ...(overage ? { overage } : {}) };
+  // Non-fatal and sequential: it may refresh the token, which must not race the /usage spawn above.
+  const manualReset = await fetchMemberResets(identity);
+  return {
+    ...base,
+    windows,
+    status: "live",
+    capturedAt: new Date().toISOString(),
+    ...(overage ? { overage } : {}),
+    ...(manualReset ? { manualReset } : {}),
+  };
 }
