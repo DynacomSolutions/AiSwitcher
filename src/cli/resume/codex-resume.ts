@@ -7,6 +7,7 @@ import type { ResumableSession, ToolResumeResult } from "./types.ts";
 import { mapPool } from "../sessions/shared.ts";
 import { readSessionCwdOverrides, type SessionCwdOverrides } from "./cwd-overrides.ts";
 
+const MAX_FIRST_LINE_BYTES = 1024 * 1024;
 const MAX_WALK_DEPTH = 6; // real layout is sessions/YYYY/MM/DD/ (3 levels): generous headroom, not a hard assumption
 
 async function collectRolloutFiles(root: string): Promise<string[]> {
@@ -50,17 +51,24 @@ async function readFirstLine(path: string): Promise<string | undefined> {
   try {
     handle = await open(path, "r");
     const chunk = Buffer.allocUnsafe(32768);
-    let buffer = "";
+    const parts: Buffer[] = [];
+    let total = 0;
     let position = 0;
     while (true) {
       const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
-      if (bytesRead === 0) return buffer.trim() ? buffer : undefined;
+      if (bytesRead === 0) break;
       position += bytesRead;
-      // shortcut: multi-byte chars split across 32 KiB reads decode as U+FFFD; only the cwd/id fields matter and are ASCII-safe in practice.
-      buffer += chunk.toString("utf8", 0, bytesRead);
-      const newlineIndex = buffer.indexOf("\n");
-      if (newlineIndex >= 0) return buffer.slice(0, newlineIndex);
+      const newlineIndex = chunk.subarray(0, bytesRead).indexOf(0x0a);
+      const end = newlineIndex >= 0 ? newlineIndex : bytesRead;
+      total += end;
+      // Cap: a first line past 1 MiB is not a sane session_meta; give up rather than buffer it.
+      if (total > MAX_FIRST_LINE_BYTES) return undefined;
+      // Copy: chunk is reused, and buffers (not strings) are decoded once so split multi-byte chars survive.
+      parts.push(Buffer.from(chunk.subarray(0, end)));
+      if (newlineIndex >= 0) break;
     }
+    const line = Buffer.concat(parts).toString("utf8");
+    return line.trim() ? line : undefined;
   } catch {
     return undefined;
   } finally {
@@ -162,16 +170,23 @@ export async function readCodexSessions(
   }
 
   // Peek first lines 4 at a time (order preserved); sequential peeks of tens
-  // of thousands of files were the /api/sessions hot spot.
-  const peeked = await mapPool(files, 4, async (filePath) => ({ filePath, firstLine: await readFirstLine(filePath) }));
-  const sessions: ResumableSession[] = [];
-  for (const { filePath, firstLine } of peeked) {
-    if (!firstLine) continue;
+  // of thousands of files were the /api/sessions hot spot. Filter inside the
+  // pool so only matches survive: first lines run to tens of KB and keeping
+  // all of them for ~49k files OOMed the console.
+  const peeked = await mapPool(files, 4, async (filePath) => {
+    const firstLine = await readFirstLine(filePath);
+    if (!firstLine) return undefined;
     const meta = parseSessionMeta(firstLine);
-    if (!meta?.sessionId || meta.cwd === undefined) continue;
+    if (!meta?.sessionId || meta.cwd === undefined) return undefined;
     const effectiveCwd = overrides[meta.sessionId] ?? normalizePath(meta.cwd);
-    if (effectiveCwd !== targetCwd) continue;
-    if (meta.hasParentThread || (meta.threadSource !== undefined && meta.threadSource !== "user")) continue;
+    if (effectiveCwd !== targetCwd) return undefined;
+    if (meta.hasParentThread || (meta.threadSource !== undefined && meta.threadSource !== "user")) return undefined;
+    return { filePath, sessionId: meta.sessionId, effectiveCwd };
+  });
+  const sessions: ResumableSession[] = [];
+  for (const match of peeked) {
+    if (!match) continue;
+    const { filePath, sessionId, effectiveCwd } = match;
 
     let text: string;
     try {
@@ -193,7 +208,7 @@ export async function readCodexSessions(
     sessions.push({
       toolName: "codex",
       identity,
-      sessionId: meta.sessionId,
+      sessionId,
       cwd: effectiveCwd,
       label: rest.label ?? "(no user message)",
       lastActiveAt,
