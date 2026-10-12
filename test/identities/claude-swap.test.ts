@@ -562,6 +562,29 @@ describe("selection and auto swap", () => {
     expect(await readSwapEvents(ledger)).toHaveLength(0);
   });
 
+  test("falls back to the least-used member when none is below the threshold", async () => {
+    await writeRegistry({ auto: true });
+    const deps = { registryPath: registry, ledgerPath: ledger, now: () => NOW_S * 1000 };
+    // Reported scenario: active at 100, one member at 95 (5% headroom), rest at 100.
+    const r = await swapIfLimited({ ...deps, fetchUsage: usageMap({ a: 100, b: 95, c: 100 }) }, "pool", "auto");
+    expect(r.action === "swapped" && r.result.to).toBe("b");
+  });
+
+  test("no fallback swap when every other member is at 100 or not better than the active one", async () => {
+    await writeRegistry({ auto: true });
+    const deps = { registryPath: registry, ledgerPath: ledger, now: () => NOW_S * 1000 };
+    expect((await swapIfLimited({ ...deps, fetchUsage: usageMap({ a: 100, b: 100, c: 100 }) }, "pool", "auto")).action).toBe("no-candidate");
+    expect((await swapIfLimited({ ...deps, fetchUsage: usageMap({ a: 96, b: 97, c: 99 }) }, "pool", "auto")).action).toBe("no-candidate");
+    expect((await swapIfLimited({ ...deps, fetchUsage: usageMap({ a: 96, b: 96, c: 100 }) }, "pool", "auto")).action).toBe("no-candidate");
+    expect(await readSwapEvents(ledger)).toHaveLength(0);
+  });
+
+  test("a below-threshold member is preferred over the fallback", async () => {
+    await writeRegistry({ auto: true });
+    const r = await swapIfLimited({ registryPath: registry, ledgerPath: ledger, fetchUsage: usageMap({ a: 100, b: 99, c: 94 }), now: () => NOW_S * 1000 }, "pool", "auto");
+    expect(r.action === "swapped" && r.result.to).toBe("c");
+  });
+
   test("disallowed members are never chosen", async () => {
     await writeRegistry({ auto: true, disallowed: ["c"] });
     const r = await swapIfLimited({ registryPath: registry, ledgerPath: ledger, fetchUsage: usageMap({ a: 99, b: 80, c: 1 }), now: () => NOW_S * 1000 }, "pool", "auto");

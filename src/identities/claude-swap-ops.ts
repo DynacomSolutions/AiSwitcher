@@ -95,7 +95,8 @@ export type LimitedOutcome =
 
 /** If the pool's active member is at/over the threshold (or its usage call
  * was itself rate limited, or `assumeLimited` because a 429 was observed),
- * swap to the best allowed member below the threshold. Honors the cooldown
+ * swap to the best allowed member below the threshold (else the least-used
+ * member that is under 100% and better than the active one). Honors the cooldown
  * recorded in the ledger. Used by the daemon poll, the launch check and the
  * optional in-session hook (`next --if-limited`). */
 export async function swapIfLimited(
@@ -128,7 +129,13 @@ export async function swapIfLimited(
       return { name, usage: member && !isRetired(member) ? await fetchUsage(member) : undefined };
     }),
   );
-  const target = chooseBest(rows, { belowPercent: threshold, requireKnown: true });
+  // Nobody below the threshold: fall back to the known member with the lowest
+  // utilization if it still has headroom (< 100) and beats the active member
+  // (rate-limited or unknown active usage counts as 100).
+  const activeUtil = usage.status === "live" ? usage.maxUtilization ?? 100 : 100;
+  const fallback = chooseBest(rows, { belowPercent: 100, requireKnown: true });
+  const fallbackUtil = rows.find((r) => r.name === fallback)?.usage?.maxUtilization;
+  const target = chooseBest(rows, { belowPercent: threshold, requireKnown: true }) ?? (fallbackUtil !== undefined && fallbackUtil < activeUtil ? fallback : undefined);
   if (!target) return { action: "no-candidate", ...(usage.maxUtilization !== undefined ? { utilization: usage.maxUtilization } : {}) };
   const result = await performSwap({
     ...(deps.registryPath ? { registryPath: deps.registryPath } : {}),
