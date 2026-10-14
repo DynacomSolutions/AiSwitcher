@@ -244,3 +244,9 @@ export const bandRows = (r: Resolved, status: SwapStatus | null, limits: LimitsE
   }
   return out
 }
+
+/** Notice text when the pool's active member changed since `prev`; none on first sight or no change. */
+export const switchNotice = (prev: string, status: SwapStatus | null): string | undefined =>
+  status && prev && prev !== status.active
+    ? `AIS pool ${status.pool} switched account from ${prev} to ${status.active} since your last turn; limits shown now refer to ${status.active}.`
+    : undefined

@@ -16,6 +16,7 @@ import {
   shares,
   shortError,
   statusLine,
+  switchNotice,
   tone,
   totals,
   twoToneBar,
@@ -30,6 +31,9 @@ const expanded = atom({ plugin: 'ais-usage', key: 'expanded' } as const, [])
 const updatedAt = atom({ plugin: 'ais-usage', key: 'updatedAt' } as const, 0)
 const loading = atom({ plugin: 'ais-usage', key: 'loading' } as const, 0)
 const errors = atom({ plugin: 'ais-usage', key: 'errors' } as const, [])
+
+// Last pool member seen at a prompt; '' until the first prompt.
+const lastMember = atom({ plugin: 'ais-usage', key: 'lastMember' } as const, '')
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 
@@ -112,6 +116,15 @@ export const register: Register = on => {
     refreshHandle = refreshAll
 
     return next(e)
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    const st = await read($, status)
+    const notice = switchNotice(await read($, lastMember), st)
+    if (st) await update($, lastMember, () => st.active)
+    if (!notice) return next(e)
+    $.ui.toast(notice)
+    return next({ ...e, context: [...(e.context ?? []), notice] })
   })
 
   on('command.run', { command: 'ais-usage' }, async $ => {

@@ -43,6 +43,8 @@ declare module 'claude-code' {
       /** Fetches in flight. */
       loading: number
       errors: string[]
+      /** Pool member seen at the previous prompt, '' for none. */
+      lastMember: string
     }
   }
 }
