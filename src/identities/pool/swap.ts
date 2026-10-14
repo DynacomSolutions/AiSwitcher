@@ -37,14 +37,14 @@ export async function performPoolSwap(adapter: PoolAdapter<any>, options: Perfor
   const registryPath = options.registryPath ?? adapter.config.identitiesJsonPath;
   // Resolve the pool dir unlocked, then hold the pool lock across the whole
   // read-decide-write sequence so two swappers cannot both act on stale state.
-  const poolDir = requirePool(await loadIdentitiesFile(registryPath), options.pool).configDir;
+  const poolDir = requirePool(await loadIdentitiesFile(registryPath), options.pool, adapter.tool).configDir;
   return withPoolLock(poolDir, () => swapLocked(adapter, options), options.lock);
 }
 
 async function swapLocked(adapter: PoolAdapter<any>, options: PerformSwapOptions): Promise<SwapResult> {
   const registryPath = options.registryPath ?? adapter.config.identitiesJsonPath;
   const file = await loadIdentitiesFile(registryPath);
-  const pool = requirePool(file, options.pool);
+  const pool = requirePool(file, options.pool, adapter.tool);
   const ledgerPath = options.ledgerPath ?? ledgerPathFor(adapter.tool);
   await options.guard?.({ pool, ledgerPath });
   const target = memberIdentity(file, pool, options.target);

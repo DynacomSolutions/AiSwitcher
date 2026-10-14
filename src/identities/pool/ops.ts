@@ -47,7 +47,7 @@ function usageOf<U extends PoolUsage>(adapter: PoolAdapter<U>, deps: PoolOpsDeps
 
 async function load(adapter: PoolAdapter<any>, deps: PoolOpsDeps<any>, poolKey: string | undefined) {
   const file = await loadIdentitiesFile(deps.registryPath ?? adapter.config.identitiesJsonPath);
-  const pool = requirePool(file, poolKey);
+  const pool = requirePool(file, poolKey, adapter.tool);
   const members = pool.swapPool.accounts
     .map((name) => file.identities.find((i) => i.name === name))
     .filter((i): i is Identity => i !== undefined);

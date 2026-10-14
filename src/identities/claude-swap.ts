@@ -1,8 +1,8 @@
-import { randomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisClaudeSwapLedgerPath } from "../shared/ais-home.ts";
 import { withClaudeLocks, withOauthRefreshLock, type LockOptions } from "./claude-swap-lock.ts";
+import { writeFileAtomic } from "./pool/fs.ts";
 import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuthGrant } from "./oauth-reconcile.ts";
 import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, readSwapEvents as readPoolSwapEvents } from "./pool/ledger.ts";
 import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
@@ -36,13 +36,6 @@ export const appendSwapEvent = (event: SwapEvent, ledgerPath: string = aisClaude
 export const readSwapEvents = (ledgerPath: string = aisClaudeSwapLedgerPath()): Promise<SwapEvent[]> => readPoolSwapEvents(ledgerPath);
 
 /* --------------------------- atomic file helpers --------------------------- */
-
-async function writeFileAtomic(path: string, content: string): Promise<void> {
-  const temp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  await writeFile(temp, content, { mode: 0o600 });
-  await chmod(temp, 0o600);
-  await rename(temp, path);
-}
 
 async function readText(path: string): Promise<string | undefined> {
   try {
