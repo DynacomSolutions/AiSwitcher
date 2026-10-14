@@ -36,7 +36,7 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(() => rmSync(compiledDir, { recursive: true, force: true }));
 
-function setup() {
+function setup(options: { pool?: boolean } = {}) {
   const home = mkdtempSync(join(tmpdir(), "ais-execve-"));
   dirs.push(home);
   const realBin = join(home, "real-bin");
@@ -44,9 +44,15 @@ function setup() {
   mkdirSync(realBin, { recursive: true });
   mkdirSync(shimDir, { recursive: true });
   mkdirSync(join(home, ".claude"), { recursive: true });
+  const member = (name: string) => ({ name, label: name, configDir: join(home, name) });
   writeFileSync(
     join(home, ".claude", "identities.json"),
-    JSON.stringify({ version: 1, identities: [{ name: "acct-a", label: "A", configDir: join(home, "a") }] }),
+    JSON.stringify({
+      version: 1,
+      identities: options.pool
+        ? [member("a"), member("b"), { ...member("pool"), swapPool: { accounts: ["a", "b"], active: "a", auto: true } }]
+        : [{ name: "acct-a", label: "A", configDir: join(home, "a") }],
+    }),
   );
   const out = join(home, "fake.out");
   const release = join(home, "release");
@@ -74,6 +80,7 @@ exit 7`,
     AI_PROFILE_SWITCHER_SHIM_DIR: shimDir,
     FAKE_OUT: out,
     FAKE_RELEASE: release,
+    FAKE_MARK_DIR: home,
   };
   return { home, env, out, release, syncLog };
 }
@@ -181,5 +188,26 @@ describe.each([
     });
     expect(lines.every((l) => l.startsWith("sync background"))).toBe(true);
     expect(lines.at(-1)).toContain("--identity=acct-a");
+  }, 60_000);
+});
+
+describe("shim execve and swap pools", () => {
+  linuxOnly("a pool swap that outlives the launch-check budget finishes before the exec cuts the process", async () => {
+    const { home, env, out, release } = setup({ pool: true });
+    const shim = Bun.spawn([process.execPath, join(REPO, "test", "fixtures", "pool-slow-claude.ts"), "--identity=pool"], {
+      cwd: home,
+      env,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "inherit",
+    });
+    killers.push(shim.pid);
+    await waitFor(() => existsSync(out), 40_000); // the fake tool only starts once the swap is done
+    expect(existsSync(join(home, "swap-1"))).toBe(true);
+    expect(existsSync(join(home, "swap-2"))).toBe(true);
+    const registry = JSON.parse(readFileSync(join(home, ".claude", "identities.json"), "utf8"));
+    expect(registry.identities.find((i: { name: string }) => i.name === "pool").swapPool.active).toBe("b");
+    writeFileSync(release, "");
+    expect(await shim.exited).toBe(7);
   }, 60_000);
 });
