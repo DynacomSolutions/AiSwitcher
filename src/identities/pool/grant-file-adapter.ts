@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, rm, stat, utimes } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { LimitWindow } from "../../cli/limits/types.ts";
-import { withOauthRefreshLock } from "../claude-swap-lock.ts";
+import { lockOrder, withOauthRefreshLock } from "../claude-swap-lock.ts";
 import { expandPath } from "../match.ts";
 import type { Identity, ToolConfig } from "../types.ts";
 import type { PoolAdapter, PoolUsage, SwapResult, WriteBackOutcome } from "./adapter.ts";
@@ -163,22 +163,30 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     return undefined;
   }
 
-  /** Writes the pool's grant into the owning member's vault when it is newer. */
-  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, lock?: LockOptions, alreadyLocked = false): Promise<WriteBackOutcome> {
+  /** Writes the pool's grant into the owning member's vault when it is newer.
+   * The caller holds the owner's oauth and tool locks (see `withHeldLocks`), so the read
+   * and compare below can never overwrite a concurrent member refresh. */
+  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile): Promise<WriteBackOutcome> {
     const poolId = spec.identity(poolGrant).id;
-    const locked = <T>(fn: () => Promise<T>) => (alreadyLocked ? fn() : withOauthRefreshLock(owner.configDir, fn, lock));
-    // Read and compare under the owner's locks so a concurrent member refresh is never overwritten.
-    return locked(() => withToolLock(spec, owner.configDir, async (): Promise<WriteBackOutcome> => {
-      const { grant: ownerGrant, who } = await load(owner.configDir);
-      if (spec.usable(ownerGrant)) {
-        if (who.id !== poolId) return "none-account-mismatch";
-        if (spec.fingerprint(ownerGrant!) === spec.fingerprint(poolGrant)) return "none-identical";
-      }
-      const next = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant);
-      if (!next) return "none-member-newer";
-      await writeText(owner.configDir, json(next));
-      return "written";
-    }));
+    const { grant: ownerGrant, who } = await load(owner.configDir);
+    if (spec.usable(ownerGrant)) {
+      if (who.id !== poolId) return "none-account-mismatch";
+      if (spec.fingerprint(ownerGrant!) === spec.fingerprint(poolGrant)) return "none-identical";
+    }
+    const next = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant);
+    if (!next) return "none-member-newer";
+    await writeText(owner.configDir, json(next));
+    return "written";
+  }
+
+  /** Two-tier lock order, as refresh: the pool dir first, then the member set in `lockOrder`.
+   * Each dir's tool lock is taken right after its own oauth lock, by this outer layer only. */
+  function withHeldLocks<T>(poolDir: string, held: Set<string>, lock: LockOptions | undefined, fn: () => Promise<T>): Promise<T> {
+    const poolKey = resolve(expandPath(poolDir));
+    const dirs = lockOrder([...held]).filter((d) => d !== poolKey);
+    const layer = <R>(dir: string, inner: () => Promise<R>) => withOauthRefreshLock(dir, () => withToolLock(spec, dir, inner), lock);
+    const nest = (rest: string[]): Promise<T> => (rest.length === 0 ? fn() : layer(rest[0]!, () => nest(rest.slice(1))));
+    return layer(poolDir, () => nest(dirs));
   }
 
   async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>[0]): Promise<Omit<SwapResult, "reason">> {
@@ -187,8 +195,21 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     const poolPath = fileOf(poolDir);
     const notes: string[] = [];
 
-    // Lock order: pool, pool oauth, then the target vault, held until the pool write is verified.
-    return withOauthRefreshLock(poolDir, () => withOauthRefreshLock(target.configDir, () => withToolLock(spec, poolDir, async () => {
+    // Two-tier order, same as refresh: the pool dir first, then target vault and write-back owner in
+    // `lockOrder`, held until the pool write is verified. The owner is only known under the lock: if it is
+    // outside the held set, release, widen the member set and go again (nothing is written before that point).
+    const wanted = [target.configDir];
+    const activeMember = members.find((m) => m.name === pool.swapPool.active);
+    if (activeMember) wanted.push(activeMember.configDir);
+    for (;;) {
+      const held = new Set(lockOrder([poolDir, ...wanted]));
+      const result = await swapHeld(held);
+      if ("needLock" in result) { wanted.push(result.needLock); continue; }
+      return result;
+    }
+
+    async function swapHeld(held: Set<string>): Promise<Omit<SwapResult, "reason"> | { needLock: string }> {
+    return withHeldLocks(poolDir, held, lock, async () => {
       let target_ = await load(target.configDir);
       if (target_.text === undefined || !spec.usable(target_.grant)) {
         throw new SwapPoolError(`Account "${target.name}" has no usable ${spec.label} login (no OAuth tokens in ${target.configDir}); ${spec.loginHint} first.`);
@@ -210,10 +231,11 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         writeBack = "none-account-mismatch";
       } else {
         const owner = live.who.id ? await ownerByAccount(members, live.who.id, activeName) : undefined;
+        if (owner && !held.has(resolve(expandPath(owner.configDir)))) return { needLock: owner.configDir };
         if (!owner) {
           writeBack = "none-unknown-owner";
         } else {
-          writeBack = await writeBackToOwner(owner, live.grant!, lock, owner.configDir === target.configDir);
+          writeBack = await writeBackToOwner(owner, live.grant!);
           if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
         }
       }
@@ -242,7 +264,8 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         throw new SwapPoolError(`could not verify ${poolPath} after the swap (account id mismatch); the previous file was restored`);
       }
       return { pool: pool.name, from: activeName, to: target.name, noop: false, writeBack, notes };
-    }), lock), lock);
+    });
+    }
   }
 
   /**
@@ -262,15 +285,15 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     const activeName = pool.swapPool.active;
     const active = members.find((m) => m.name === activeName);
     if (!activeName || !active) return [];
-    const vault = await load(active.configDir);
+    let vault = await load(active.configDir);
     if (vault.text === undefined || !spec.usable(vault.grant) || !vault.who.id) return [`cannot heal ${pool.name}: active account "${activeName}" has no usable login in its vault`];
     if (!spec.complete(vault.grant)) return [`cannot heal ${pool.name}: active account "${activeName}" has an incomplete login in its vault (not restoring from it)`];
-    const vaultGrant = vault.grant!;
 
     const poolPath = fileOf(pool.configDir);
     const classify = async () => {
       const cur = await load(pool.configDir);
       const grant = cur.grant;
+      const vaultGrant = vault.grant!;
       const complete = grant !== undefined && spec.usable(grant) && spec.complete(grant);
       let kind: "damaged" | "hybrid" | "foreign" | "same" | "behind" | "ok";
       if (!complete) kind = "damaged";
@@ -290,9 +313,24 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     }
     if (state.kind === "ok") return [];
 
+    // Two-tier order, same as refresh: the pool dir first, then the active vault and a foreign capture
+    // owner in `lockOrder`; an owner outside the held set is only known under the lock, so release,
+    // widen the member set and go again (nothing written yet).
+    const wanted = [active.configDir];
+    for (;;) {
+      const held = new Set(lockOrder([pool.configDir, ...wanted]));
+      const result = await healHeld(held);
+      if (!Array.isArray(result)) { wanted.push(result.needLock); continue; }
+      return result;
+    }
+
+    async function healHeld(held: Set<string>): Promise<string[] | { needLock: string }> {
     const notes: string[] = [];
-    return withOauthRefreshLock(pool.configDir, () => withToolLock(spec, pool.configDir, async () => {
-      // Decide on the file as it is under the lock, not as it was before waiting for it.
+    return withHeldLocks(pool.configDir, held, lock, async () => {
+      // Decide on the files as they are under the locks, not as they were before waiting for them.
+      vault = await load(active!.configDir);
+      if (vault.text === undefined || !spec.usable(vault.grant) || !vault.who.id) return [`cannot heal ${pool.name}: active account "${activeName}" has no usable login in its vault`];
+      if (!spec.complete(vault.grant)) return [`cannot heal ${pool.name}: active account "${activeName}" has an incomplete login in its vault (not restoring from it)`];
       let now = await classify();
       if (now.kind === "damaged") {
         await sleep(grantFileTuning.healRetryMs);
@@ -301,13 +339,14 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       if (now.kind === "ok") return [];
       if (now.kind === "same") {
         // Same account as the active vault: never restore over it, keep the newer tokens in the vault.
-        const outcome = await writeBackToOwner(active, now.grant!, lock);
+        const outcome = await writeBackToOwner(active!, now.grant!);
         return [`pool ${pool.name} held newer tokens for "${activeName}"; vault write-back: ${outcome}`];
       }
       if (now.kind === "foreign") {
-        const owner = await ownerByAccount(members, now.who.id!, activeName);
+        const owner = await ownerByAccount(members, now.who.id!, activeName!);
+        if (owner && !held.has(resolve(expandPath(owner.configDir)))) return { needLock: owner.configDir };
         if (owner) {
-          const outcome = await writeBackToOwner(owner, now.grant!, lock);
+          const outcome = await writeBackToOwner(owner, now.grant!);
           notes.push(`pool ${pool.name} held "${owner.name}"'s account instead of "${activeName}"; ${outcome === "written" ? `captured it into "${owner.name}"` : `left "${owner.name}" as it was (${outcome})`}`);
         } else {
           await writeFileAtomic(`${poolPath}.pre-heal.bak`, now.text!);
@@ -329,12 +368,13 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         await writeFileAtomic(backup, now.text!);
         notes.push(`pool ${pool.name} credentials held content the vault lacks; kept a 0600 copy at ${backup}`);
       }
-      // Re-read the vault under the pool lock: a write-back above may have merged newer tokens into it.
-      const restoreText = (await readText(active.configDir)) ?? vault.text!;
+      // Re-read the vault: a write-back above may have merged newer tokens into it.
+      const restoreText = (await readText(active!.configDir)) ?? vault.text!;
       await writeText(pool.configDir, restoreText);
       notes.push(`restored "${activeName}" into ${pool.name}`);
       return notes;
-    }), lock);
+    });
+    }
   }
 
   return {
