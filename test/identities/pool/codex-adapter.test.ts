@@ -332,7 +332,8 @@ describe("review fixes", () => {
     setTimeout(() => { void writeFile(join(dirOf("pool"), "auth.json"), rotated); }, 100);
     const notes = await healPool();
     expect(await read("pool")).toBe(rotated);
-    expect(notes).toEqual([]);
+    expect(notes.join(" ")).toContain("write-back: written");
+    expect(await refreshToken("a")).toBe("SYNTHETIC_FIXTURE-rt-a-rotated");
   });
 
   test("member validation requires tokens.account_id", async () => {
