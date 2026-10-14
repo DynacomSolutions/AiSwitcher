@@ -16,7 +16,8 @@ import { projectSharedCodexConfigForLaunch } from "./codex-shared-config.ts";
 import { codexSubcommandConfigArgs } from "./codex-config-args.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 import { gatePluginArgs } from "./plugin-gating.ts";
-import { claudeSwapLaunchCheck } from "../identities/claude-swap-launch.ts";
+import { poolLaunchCheck } from "../identities/pool/launch.ts";
+import { adapterFor } from "../identities/pool/registry.ts";
 import { runLaunchGate } from "../spend/gate.ts";
 import { readHerdrChatTitle, type HerdrChatTool } from "./herdr-chat-source.ts";
 import { aisHerdrTabLabelsPath } from "./ais-home.ts";
@@ -80,11 +81,13 @@ export async function runWrapper(
     }
     if (gate.warn) console.error(gate.warn);
 
-    // Claude swap pools only: one bounded pre-launch check (bootstrap, or
-    // swap away from a member over its threshold). Never blocks for long,
-    // never throws; other identities are untouched.
-    if (cfg.toolName === "claude" && resolved.identity?.swapPool) {
-      const note = await claudeSwapLaunchCheck(resolved.identity);
+    // Swap pools only (tools with a registered pool adapter): one bounded
+    // pre-launch check (bootstrap, or swap away from a member over its
+    // threshold). Never blocks for long, never throws; other identities are
+    // untouched.
+    const poolAdapter = resolved.identity?.swapPool ? adapterFor(cfg.toolName) : undefined;
+    if (poolAdapter && resolved.identity) {
+      const note = await poolLaunchCheck(poolAdapter, resolved.identity);
       if (note) console.error(note);
     }
 
