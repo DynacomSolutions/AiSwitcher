@@ -152,11 +152,7 @@ export const register: Register = on => {
         <Text> </Text>
         {r.pool && (
           <Text dimColor>
-            {r.pool} &gt; {r.current}
-            {'  '}
-            <Text color="cyan">{block}</Text> {r.current}
-            {'  '}
-            <Text color="blue">{block}</Text> pool avg
+            <Text color="blue">{block}</Text> {r.pool} &gt; <Text color="cyan">{block}</Text> {r.current}
           </Text>
         )}
         {rows.map(row => {
