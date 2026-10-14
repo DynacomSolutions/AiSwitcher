@@ -1,13 +1,14 @@
 import { randomBytes } from "node:crypto";
-import { appendFile, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { aisClaudeSwapLedgerPath } from "../shared/ais-home.ts";
 import { withClaudeLocks, withOauthRefreshLock, type LockOptions } from "./claude-swap-lock.ts";
 import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuthGrant } from "./oauth-reconcile.ts";
-import { isRetired } from "./retired.ts";
-import { loadIdentitiesFile, saveIdentitiesFile } from "./store.ts";
-import { CLAUDE_CONFIG } from "./tool-configs.ts";
-import { allowedAccounts, isAllowed, memberIdentity, requirePool, SwapPoolError, type PoolIdentity } from "./swap-pool.ts";
+import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, readSwapEvents as readPoolSwapEvents } from "./pool/ledger.ts";
+import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
+import { claudeAdapter } from "./pool/claude-adapter.ts";
+import { performPoolSwap, type PerformSwapOptions } from "./pool/swap.ts";
+import { allowedAccounts, SwapPoolError, type PoolIdentity } from "./pool/swap-pool.ts";
 import type { Identity } from "./types.ts";
 
 /**
@@ -27,84 +28,12 @@ import type { Identity } from "./types.ts";
  * restart; a new launch always picks it up too.
  */
 
-export type SwapReason = "manual" | "auto" | "launch";
+export type { SwapReason, SwapEvent, WriteBackOutcome, SwapResult };
+export { activeMemberAt, eventsForPool };
 
-export interface SwapEvent {
-  ts: string;
-  pool: string;
-  from: string | null;
-  to: string;
-  reason: SwapReason;
-}
-
-export type WriteBackOutcome =
-  | "written"
-  | "none-no-live-credentials"
-  | "none-identical"
-  | "none-member-newer"
-  | "none-unknown-owner"
-  | "none-account-mismatch";
-
-export interface SwapResult {
-  pool: string;
-  from: string | null;
-  to: string;
-  reason: SwapReason;
-  /** True when the target was already active and credentials were in place. */
-  noop: boolean;
-  writeBack: WriteBackOutcome;
-  notes: string[];
-}
-
-/* ------------------------------ ledger ------------------------------------ */
-
-export async function appendSwapEvent(event: SwapEvent, ledgerPath: string = aisClaudeSwapLedgerPath()): Promise<void> {
-  await mkdir(dirname(ledgerPath), { recursive: true });
-  await appendFile(ledgerPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
-}
-
-/** All ledger events, oldest first. Torn or foreign lines are skipped. */
-export async function readSwapEvents(ledgerPath: string = aisClaudeSwapLedgerPath()): Promise<SwapEvent[]> {
-  let text: string;
-  try {
-    text = await readFile(ledgerPath, "utf8");
-  } catch {
-    return [];
-  }
-  const events: SwapEvent[] = [];
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const e = JSON.parse(line) as Partial<SwapEvent>;
-      if (typeof e.ts === "string" && typeof e.pool === "string" && typeof e.to === "string" && Number.isFinite(Date.parse(e.ts))) {
-        events.push({ ts: e.ts, pool: e.pool, from: typeof e.from === "string" ? e.from : null, to: e.to, reason: (e.reason ?? "manual") as SwapReason });
-      }
-    } catch {
-      // torn line
-    }
-  }
-  return events.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
-}
-
-/** The member active in `pool` at `atMs`, per the ledger (undefined before
- * the first recorded swap). */
-export function activeMemberAt(events: SwapEvent[], pool: string, atMs: number): string | undefined {
-  let active: string | undefined;
-  for (const e of events) {
-    if (e.pool !== pool) continue;
-    if (Date.parse(e.ts) > atMs) break;
-    active = e.to;
-  }
-  return active;
-}
-
-/** Ledger events for `pool`, normalised to its current name. Events keep the
- * pool name of their day, so a renamed pool's history is matched by its
- * current name, its configDir basename (the original name) or an alias. */
-export function eventsForPool(events: SwapEvent[], pool: PoolIdentity): SwapEvent[] {
-  const names = new Set([pool.name, basename(pool.configDir), ...(pool.aliases ?? [])]);
-  return events.filter((e) => names.has(e.pool)).map((e) => ({ ...e, pool: pool.name }));
-}
+/** Claude ledger (`claude-swap.jsonl`): the generic ledger bound to the default path. */
+export const appendSwapEvent = (event: SwapEvent, ledgerPath: string = aisClaudeSwapLedgerPath()): Promise<void> => appendPoolSwapEvent(event, ledgerPath);
+export const readSwapEvents = (ledgerPath: string = aisClaudeSwapLedgerPath()): Promise<SwapEvent[]> => readPoolSwapEvents(ledgerPath);
 
 /* --------------------------- atomic file helpers --------------------------- */
 
@@ -275,51 +204,10 @@ export async function swapCredentialFiles(input: SwapFsInput): Promise<Omit<Swap
   }, input.lock);
 }
 
-export interface PerformSwapOptions {
-  registryPath?: string;
-  /** Pool name; omitted when exactly one pool exists. */
-  pool?: string;
-  /** Member name or alias. */
-  target: string;
-  reason: SwapReason;
-  /** Manual swaps may override the allowed set. */
-  force?: boolean;
-  ledgerPath?: string;
-  lock?: LockOptions;
-  now?: () => Date;
-}
+export type { PerformSwapOptions };
 
-/** Full swap: validate, swap files, persist `swapPool.active`, append the
- * ledger event. */
-export async function performSwap(options: PerformSwapOptions): Promise<SwapResult> {
-  const registryPath = options.registryPath ?? CLAUDE_CONFIG.identitiesJsonPath;
-  const file = await loadIdentitiesFile(registryPath);
-  const pool = requirePool(file, options.pool);
-  const target = memberIdentity(file, pool, options.target);
-  if (isRetired(target)) throw new SwapPoolError(`Account "${target.name}" is retired`);
-  if (!options.force && !isAllowed(pool, target.name)) {
-    throw new SwapPoolError(`Account "${target.name}" is not allowed in pool "${pool.name}" (run "ais claude-swap allow ${target.name}" or pass --force).`);
-  }
-  const members = pool.swapPool.accounts
-    .map((name) => file.identities.find((i) => i.name === name))
-    .filter((i): i is Identity => i !== undefined && !isRetired(i));
-  const fsResult = await swapCredentialFiles({ pool, members, target, reason: options.reason, ...(options.lock ? { lock: options.lock } : {}) });
-
-  // Re-read so a registry edit made while we waited for the locks survives.
-  const fresh = await loadIdentitiesFile(registryPath);
-  const freshPool = fresh.identities.find((i) => i.name === pool.name);
-  if (freshPool?.swapPool && freshPool.swapPool.active !== target.name) {
-    freshPool.swapPool.active = target.name;
-    await saveIdentitiesFile(registryPath, fresh);
-  }
-  if (!fsResult.noop) {
-    await appendSwapEvent(
-      { ts: (options.now?.() ?? new Date()).toISOString(), pool: pool.name, from: fsResult.from, to: target.name, reason: options.reason },
-      options.ledgerPath,
-    );
-  }
-  return { ...fsResult, reason: options.reason };
-}
+/** Full claude swap (see pool/swap.ts). */
+export const performSwap = (options: PerformSwapOptions): Promise<SwapResult> => performPoolSwap(claudeAdapter, options);
 
 /** Pool accounts the daemon / `next` may choose from. */
 export function candidateAccounts(pool: PoolIdentity, exclude?: string): string[] {

@@ -108,5 +108,10 @@ export function aisLastIdentityPath(home: string = homedir()): string {
  * usage attribution reads it to map transcript timestamps to the member
  * account that was active. */
 export function aisClaudeSwapLedgerPath(home: string = homedir()): string {
-  return join(aisStateDir(home), "claude-swap.jsonl");
+  return aisSwapLedgerPath("claude", home);
+}
+
+/** Per-tool swap pool ledger: `<tool>-swap.jsonl` (claude keeps its historical name). */
+export function aisSwapLedgerPath(tool: string, home: string = homedir()): string {
+  return join(aisStateDir(home), `${tool}-swap.jsonl`);
 }

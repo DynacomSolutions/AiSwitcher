@@ -5,7 +5,8 @@ import { createApp } from "./app.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
 import { loadHerdrBridgeConfig, HerdrBridgeScheduler } from "./herdr-bridge.ts";
-import { ClaudeSwapScheduler } from "./claude-swap-auto.ts";
+import { PoolSwapScheduler } from "../identities/pool/scheduler.ts";
+import { allAdapters } from "../identities/pool/registry.ts";
 import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
@@ -105,12 +106,14 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     herdrBridge.start();
   }
 
-  // Daemon-side claude swap pools: automatic limit-triggered credential swap
-  // for pools with auto on. AIS_CLAUDE_SWAP=0 opts the daemon out entirely
+  // Daemon-side swap pools: automatic limit-triggered credential swap for
+  // pools with auto on, over every tool with a registered pool adapter.
+  // AIS_CLAUDE_SWAP=0 (claude) or AIS_POOL_SWAP_<TOOL>=0 opts that tool out
   // (the CLI and launch check are unaffected).
-  let claudeSwap: ClaudeSwapScheduler | undefined;
-  if (process.env.AIS_CLAUDE_SWAP !== "0") {
-    claudeSwap = new ClaudeSwapScheduler();
+  const poolSwapEnabled = (tool: string) => process.env[tool === "claude" ? "AIS_CLAUDE_SWAP" : `AIS_POOL_SWAP_${tool.toUpperCase()}`] !== "0";
+  let claudeSwap: PoolSwapScheduler | undefined;
+  if (allAdapters().some((a) => poolSwapEnabled(a.tool))) {
+    claudeSwap = new PoolSwapScheduler({ adapters: () => allAdapters().filter((a) => poolSwapEnabled(a.tool)) });
     claudeSwap.start();
   }
 
