@@ -183,6 +183,16 @@ describe("kimi swapCredentials write and verify", () => {
   });
 });
 
+describe("kimi swap to the account the pool holds", () => {
+  test("a newer pool grant written back to the vault is what ends up in the pool (no spent refresh token)", async () => {
+    await setup();
+    await put("pool", creds("user-a", T0 + 100, { tag: "a-rt2" }));
+    expect((await swap("a")).writeBack).toBe("written");
+    expect(await refreshToken("a")).toBe("SYNTHETIC_FIXTURE-rt-a-rt2");
+    expect(await refreshToken("pool")).toBe("SYNTHETIC_FIXTURE-rt-a-rt2");
+  });
+});
+
 describe("kimi heal", () => {
   test("restores an empty or partial file from the active vault", async () => {
     await setup();

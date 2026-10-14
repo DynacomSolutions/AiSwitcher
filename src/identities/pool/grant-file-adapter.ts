@@ -165,7 +165,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
 
     // Lock order: pool, pool oauth, then the target vault, held until the pool write is verified.
     return withOauthRefreshLock(poolDir, () => withOauthRefreshLock(target.configDir, () => withToolLock(spec, poolDir, async () => {
-      const target_ = await load(target.configDir);
+      let target_ = await load(target.configDir);
       if (target_.text === undefined || !spec.usable(target_.grant)) {
         throw new SwapPoolError(`Account "${target.name}" has no usable ${spec.label} login (no OAuth tokens in ${target.configDir}); ${spec.loginHint} first.`);
       }
@@ -200,7 +200,12 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         notes.push(`live pool credentials could not be attributed to a member; kept a 0600 copy at ${backup}`);
       }
 
-      await writeText(poolDir, target_.text);
+      // The write-back may have just updated the target's own vault (pool held the target's account): copy the vault as it is now.
+      if (writeBack === "written") {
+        const refreshed = await load(target.configDir);
+        if (refreshed.text !== undefined && spec.usable(refreshed.grant) && refreshed.who.id === target_.who.id) target_ = refreshed;
+      }
+      await writeText(poolDir, target_.text!);
       const after = (await load(poolDir)).who;
       if (after.id !== target_.who.id) {
         if (live.text !== undefined) await writeText(poolDir, live.text).catch(() => undefined);

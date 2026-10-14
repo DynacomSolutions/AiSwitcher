@@ -94,8 +94,8 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
 
   // Lock order: pool, pool oauth, then the target vault, held until the pool write is verified.
   return withOauthRefreshLock(poolDir, () => withOauthRefreshLock(target.configDir, async () => {
-    const targetText = await readCodexAuthText(target.configDir);
-    const targetAuth = parseCodexAuth(targetText);
+    let targetText = await readCodexAuthText(target.configDir);
+    let targetAuth = parseCodexAuth(targetText);
     if (targetText === undefined || !hasCodexTokens(targetAuth)) {
       throw new SwapPoolError(`Account "${target.name}" has no usable Codex login (no ChatGPT tokens in ${target.configDir}); run "codex login" under that identity first.`);
     }
@@ -133,7 +133,16 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
       notes.push(`live pool credentials could not be attributed to a member; kept a 0600 copy at ${backup}`);
     }
 
-    await writeFileAtomic(poolPath, targetText);
+    // The write-back may have just updated the target's own vault (pool held the target's account): copy the vault as it is now.
+    if (writeBack === "written") {
+      const refreshedText = await readCodexAuthText(target.configDir);
+      const refreshed = parseCodexAuth(refreshedText);
+      if (refreshedText !== undefined && hasCodexTokens(refreshed) && codexAccountOf(refreshed).id === targetAcct.id) {
+        targetText = refreshedText;
+        targetAuth = refreshed;
+      }
+    }
+    await writeFileAtomic(poolPath, targetText!);
     const after = codexAccountOf(parseCodexAuth(await readCodexAuthText(poolDir)));
     if (after.id !== targetAcct.id) {
       if (poolText !== undefined) await writeFileAtomic(poolPath, poolText).catch(() => undefined);
