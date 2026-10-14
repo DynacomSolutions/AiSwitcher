@@ -69,7 +69,12 @@ function setup(options: { pool?: boolean } = {}) {
 {
 echo "pid=$$"; echo "ppid=$PPID"; echo "session=$AI_PROFILE_SWITCHER_SESSION"
 if [ -r /proc/$$/status ]; then grep -E '^Sig(Ign|Blk)' /proc/$$/status | tr -d '\\t' | tr ':' '='
-else echo "SigIgn=$(ps -o ignored= -p $$ | tr -d ' ')"; fi
+else # macOS ps has no ignored-signals column: probe by sending SIGPIPE / SIGXFSZ to a child shell that inherits ours
+  ign=0
+  sh -c 'kill -s PIPE $$; echo survived' | grep -q survived && ign=$((ign + 4096))
+  sh -c 'kill -s XFSZ $$; echo survived' | grep -q survived && ign=$((ign + 16777216))
+  echo "SigIgn=$(printf '%x' $ign)"
+fi
 fdroot=/proc/$$/fd; [ -d "$fdroot" ] || fdroot=/dev/fd
 fds=; for fd in 3 4 5 6 7 8 9; do [ -e "$fdroot/$fd" ] && fds="$fds$fd,"; done; echo "fds=$fds"
 } > "$FAKE_OUT.tmp"
