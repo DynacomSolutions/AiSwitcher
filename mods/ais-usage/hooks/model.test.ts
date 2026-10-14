@@ -112,3 +112,10 @@ test('bandRows', async () => {
   expect(ri.map(x => [x.name, x.active])).toEqual([['session', 4], ['week', 1]])
   expect(bandRows(resolveCurrent(limits, '/nope', null), null, limits)).toEqual([])
 })
+
+test('bandRows accepts cached member limits', async () => {
+  const cached = limits.map(l => (l.toolName === 'claude' && !l.identity.swapPool ? { ...l, status: 'cached' } : l)) as LimitsEntry[]
+  const rows = bandRows(resolveCurrent(cached, '/c/swap', null), null, cached)
+  expect(rows.map(x => x.name)).toEqual(['session', 'week'])
+  expect(rows[0]!.active).toBe(4)
+})

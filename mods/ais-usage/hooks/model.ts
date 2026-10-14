@@ -100,7 +100,7 @@ const pick = (ws: Win[], cat: string) => ws.find(w => w.category === cat)
 
 const CAT = { fiveHour: 'session', sevenDay: 'week' } as const
 
-/** One member's window: from status when it carries usage, else from its own live `claude` limits entry. */
+/** One member's window: from status when it carries usage, else from its own `claude` limits entry (live preferred, cached accepted). */
 export const memberWindow = (
   status: SwapStatus | null,
   limits: LimitsEntry[] | null,
@@ -109,8 +109,8 @@ export const memberWindow = (
 ): { pct: number; resetsAt?: string | number } | undefined => {
   const u = status?.accounts.find(a => a.name === name)?.usage?.[key]
   if (u) return { pct: u.utilization, resetsAt: u.resetsAt }
-  const e = entriesFor(limits, name).find(l => l.toolName === 'claude' && l.status === 'live')
-  const w = e && pick(e.windows, CAT[key])
+  const es = entriesFor(limits, name).filter(l => l.toolName === 'claude')
+  const w = [...es.filter(l => l.status === 'live'), ...es].map(l => pick(l.windows, CAT[key])).find(Boolean)
   return w ? { pct: w.usedPercent, resetsAt: w.resetsAtMs ?? w.resetsAt } : undefined
 }
 
