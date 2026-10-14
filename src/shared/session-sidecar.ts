@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readlinkSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ToolConfig } from "../identities/types.ts";
 import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sync/background.ts";
@@ -22,6 +22,8 @@ export const SIDECAR_ARG = "__session-sidecar";
 export const SIDECAR_SPEC_ENV = "AIS_SESSION_SIDECAR_SPEC";
 /** The title uses about 64 characters; this only bounds the env var (one string holds ~128 KiB). */
 export const MAX_PROMPT_BYTES = 1024;
+/** The fallback log is truncated when it grows past this. */
+export const MAX_LOG_BYTES = 1024 * 1024;
 const EXEC_WAIT_MS = 3_000;
 const POLL_MS = 500;
 
@@ -215,6 +217,7 @@ function logFallback(path: string | undefined, tool: string, message: string): v
   try {
     const file = path ?? join(aisStateDir(), "shim-fallback.log");
     mkdirSync(dirname(file), { recursive: true });
+    if (existsSync(file) && statSync(file).size > MAX_LOG_BYTES) writeFileSync(file, "");
     appendFileSync(file, `${new Date().toISOString()} ${tool} pid=${process.pid} ${message}\n`);
   } catch {}
 }
@@ -225,6 +228,8 @@ export interface LaunchDeps {
   execve: (real: RealLaunch) => string | undefined;
   /** Where fallbacks are recorded; defaults to the AIS state dir. */
   logPath?: string;
+  /** Defaults to process.platform; execve is expected to be unsupported off Linux. */
+  platform?: NodeJS.Platform;
   spawn: (real: RealLaunch) => Promise<number>;
   startWork: (cfg: ToolConfig, spec: SessionSpec) => Promise<SessionWork>;
 }
@@ -263,7 +268,10 @@ export async function launchWithSession(
   };
   if (await deps.spawnSidecar(full)) {
     const reason = deps.execve(real);
-    logFallback(deps.logPath, cfg.toolName, `spawn fallback (sidecar keeps the session work): ${reason}`);
+    // Off Linux the spawn path is the normal route, not a fallback worth recording.
+    if ((deps.platform ?? process.platform) === "linux") {
+      logFallback(deps.logPath, cfg.toolName, `spawn fallback (sidecar keeps the session work): ${reason}`);
+    }
     return await deps.spawn(real);
   }
   logFallback(deps.logPath, cfg.toolName, "in-process fallback: the sidecar could not be started");

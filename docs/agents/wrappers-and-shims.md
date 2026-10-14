@@ -21,7 +21,8 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 50
   that cannot start falls back to the fully in-process legacy flow.
   The sidecar is double-forked through a short-lived `sh` so it is never the
   tool's child. Every fallback to the old spawn path appends one line to
-  `~/.ais/state/shim-fallback.log` (never the terminal). Anything that must
+  `~/.ais/state/shim-fallback.log` (never the terminal; Linux only, since off Linux
+  spawning is the expected route; truncated past 1 MiB). Anything that must
   finish before the exec has to be awaited first: `poolLaunchCheck` therefore
   stops starting new swaps after `LAUNCH_SETTLE_MS` past its 4 s budget but
   always awaits the in-flight work (token refresh, locks) to its end. `AIS_HERDR_TITLE_OWNER_PID` for a nested launch names the

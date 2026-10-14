@@ -1,11 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CODEX_CONFIG } from "../../src/identities/tool-configs.ts";
 import {
   isPidRunning,
   launchWithSession,
+  MAX_LOG_BYTES,
   MAX_PROMPT_BYTES,
   procStartTime,
   SIDECAR_ARG,
@@ -135,6 +136,36 @@ describe("launchWithSession", () => {
       expect(lines[0]).toContain("spawn fallback");
       expect(lines[0]).toContain("execve failed: boom");
       expect(lines[1]).toContain("in-process fallback");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("the expected non-Linux execve fallback is not logged, but a real failure on Linux is", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ais-fallback-log-"));
+    const log = join(home, "shim-fallback.log");
+    try {
+      const mac = deps({ execve: () => "execve unsupported on darwin", logPath: log, platform: "darwin" });
+      await launchWithSession(CODEX_CONFIG, base, real, mac.d);
+      expect(existsSync(log)).toBe(false);
+      const linux = deps({ execve: () => "execve(/real/codex) failed", logPath: log, platform: "linux" });
+      await launchWithSession(CODEX_CONFIG, base, real, linux.d);
+      expect(readFileSync(log, "utf8")).toContain("execve(/real/codex) failed");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("the fallback log is truncated once it passes its size cap", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ais-fallback-log-"));
+    const log = join(home, "shim-fallback.log");
+    try {
+      writeFileSync(log, "x".repeat(MAX_LOG_BYTES + 1));
+      const { d } = deps({ logPath: log, platform: "linux" });
+      await launchWithSession(CODEX_CONFIG, base, real, d);
+      const text = readFileSync(log, "utf8");
+      expect(text.length).toBeLessThan(1000);
+      expect(text).toContain("spawn fallback");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
