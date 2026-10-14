@@ -288,7 +288,7 @@ async function piIdentityFor(identityName: string): Promise<Identity | undefined
     const found = findIdentityByNameOrAlias(file.identities, identityName);
     // A retired pi identity's store is never written (one-credential law
     // covers live identities only).
-    return found && !isRetired(found) ? { ...found, configDir: expandPath(found.configDir) } : undefined;
+    return found && !isRetired(found) && !found.swapPool ? { ...found, configDir: expandPath(found.configDir) } : undefined;
   } catch {
     return undefined;
   }
