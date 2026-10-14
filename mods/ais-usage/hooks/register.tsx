@@ -137,6 +137,7 @@ export const register: Register = on => {
     if (!lim) {
       return (
         <Box flexDirection="column">
+          <Text> </Text>
           {['session', 'week'].map(name => (
             <Text key={name}>
               {name.padEnd(8)}[<Text color="gray">{block.repeat(20)}</Text>] <Text dimColor>loading...</Text>
@@ -148,13 +149,10 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
+        <Text> </Text>
         {r.pool && (
           <Text dimColor>
-            {r.pool} &gt; {r.current}
-            {'  '}
-            <Text color="cyan">{block}</Text> {r.current}
-            {'  '}
-            <Text color="blue">{block}</Text> pool avg
+            <Text color="blue">{block}</Text> {r.pool} &gt; <Text color="cyan">{block}</Text> {r.current}
           </Text>
         )}
         {rows.map(row => {
