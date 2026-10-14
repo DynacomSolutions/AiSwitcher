@@ -4,6 +4,7 @@ import { withOauthRefreshLock } from "../../identities/claude-swap-lock.ts";
 import { KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { isRetired } from "../../identities/retired.ts";
+import { withLockDir } from "../../identities/pool/grant-file-adapter.ts";
 import { pairIdentity } from "../../identities/pool/token-account.ts";
 import { poolsHoldingMember } from "../../identities/pool/swap-pool.ts";
 import type { Identity } from "../../identities/types.ts";
@@ -59,6 +60,8 @@ interface Store {
   path: string;
   read: () => Promise<KimiOAuthCredentials | undefined>;
   write: (next: KimiOAuthCredentials) => Promise<void>;
+  /** The same write without taking the store's own lock: for a caller that already holds it. */
+  writeUnlocked: (next: KimiOAuthCredentials) => Promise<void>;
 }
 
 function credentialsFromNative(raw: NativeCredentialsFile | undefined): KimiOAuthCredentials | undefined {
@@ -101,15 +104,31 @@ async function writeJsonAtomic(path: string, value: Record<string, unknown>): Pr
 }
 
 function storeFor(kind: "native" | "pi", path: string): Store {
+  const nativeWrite = async (next: KimiOAuthCredentials) => {
+    const raw = (await readJson(path)) as NativeCredentialsFile | undefined;
+    await writeJsonAtomic(path, { ...(raw ?? {}), access_token: next.access_token, ...(next.refresh_token ? { refresh_token: next.refresh_token } : {}), ...(next.expires_at !== undefined ? { expires_at: next.expires_at } : {}) });
+  };
+  const piWrite = async (next: KimiOAuthCredentials) => {
+    const raw = (await readJson(path)) as Record<string, unknown> | undefined;
+    const entry = (raw?.["kimi-coding"] as PiKimiEntry | undefined) ?? {};
+    await writeJsonAtomic(path, {
+      ...(raw ?? {}),
+      "kimi-coding": {
+        ...entry,
+        type: "oauth",
+        access: next.access_token,
+        ...(next.refresh_token ? { refresh: next.refresh_token } : {}),
+        ...(next.expires_at !== undefined ? { expires: next.expires_at * 1000 } : {}),
+      },
+    });
+  };
   if (kind === "native") {
     return {
       kind,
       path,
       read: async () => credentialsFromNative((await readJson(path)) as NativeCredentialsFile | undefined),
-      write: async (next) => {
-        const raw = (await readJson(path)) as NativeCredentialsFile | undefined;
-        await writeJsonAtomic(path, { ...(raw ?? {}), access_token: next.access_token, ...(next.refresh_token ? { refresh_token: next.refresh_token } : {}), ...(next.expires_at !== undefined ? { expires_at: next.expires_at } : {}) });
-      },
+      write: (next) => nativeWrite(next),
+      writeUnlocked: (next) => nativeWrite(next),
     };
   }
   return {
@@ -121,20 +140,8 @@ function storeFor(kind: "native" | "pi", path: string): Store {
     },
     // auth.json holds every provider: serialise the read-modify-write with the other tools' pi writes
     // (always the LAST lock taken, after any tool lock).
-    write: (next) => withOauthRefreshLock(dirname(path), async () => {
-      const raw = (await readJson(path)) as Record<string, unknown> | undefined;
-      const entry = (raw?.["kimi-coding"] as PiKimiEntry | undefined) ?? {};
-      await writeJsonAtomic(path, {
-        ...(raw ?? {}),
-        "kimi-coding": {
-          ...entry,
-          type: "oauth",
-          access: next.access_token,
-          ...(next.refresh_token ? { refresh: next.refresh_token } : {}),
-          ...(next.expires_at !== undefined ? { expires: next.expires_at * 1000 } : {}),
-        },
-      });
-    }),
+    write: (next) => withOauthRefreshLock(dirname(path), () => piWrite(next)),
+    writeUnlocked: (next) => piWrite(next),
   };
 }
 
@@ -224,10 +231,13 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
       const current = await store.read();
       return current !== undefined && pairIdentity(current.access_token, current.refresh_token).id === mine;
     };
-    // The pi store write takes the pool dir's lock itself; the native one does not.
-    const guarded = store.kind === "native"
-      ? () => withOauthRefreshLock(dirname(dirname(store.path)), async () => { if (await sameAccount()) await store.write(next); }, { timeoutMs: 1_500 })
-      : async () => { if (await sameAccount()) await store.write(next); };
+    // Pool lock first (short wait, busy pools are skipped), then the tool's own lock for that file, and the
+    // account is re-checked under both: a swap that landed while we waited must not receive this grant.
+    const poolDir = store.kind === "native" ? dirname(dirname(store.path)) : dirname(store.path);
+    const toolLock = store.kind === "native" ? { path: join(poolDir, "oauth", "kimi-code.lock"), staleMs: 5_000 } : { path: join(poolDir, "auth.json.lock"), staleMs: 30_000 };
+    const guarded = () => withOauthRefreshLock(poolDir, () => withLockDir(toolLock.path, toolLock.staleMs, "pool credentials are being refreshed", async () => {
+      if (await sameAccount()) await store.writeUnlocked(next);
+    }), { timeoutMs: 1_500 });
     await guarded().catch(() => undefined);
   }
 }

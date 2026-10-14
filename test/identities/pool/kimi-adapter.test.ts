@@ -209,6 +209,17 @@ describe("tool lock upkeep", () => {
     await expect(stat(lock)).rejects.toThrow();
   });
 
+  test("a lock is removed only while it still carries our owner token", async () => {
+    const lock = join(root, "x.lock");
+    let seen = "";
+    await withToolLock(fake, root, async () => { seen = await readFile(join(lock, "owner"), "utf8"); });
+    expect(seen).toMatch(/^\d+-[0-9a-f]{16}$/);
+    await expect(stat(lock)).rejects.toThrow();
+    // the tool broke our lock and took its own (no token file): release leaves it alone
+    await withToolLock(fake, root, async () => { await rm(lock, { recursive: true }); await mkdir(lock); await writeFile(join(lock, "owner"), "someone-else"); });
+    expect(await readFile(join(lock, "owner"), "utf8")).toBe("someone-else");
+  });
+
   test("a lock that now belongs to someone else is not removed on release", async () => {
     grantFileTuning.toolLockUpdateMs = 30;
     const lock = join(root, "x.lock");

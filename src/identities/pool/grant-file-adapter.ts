@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rm, stat, utimes } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { LimitWindow } from "../../cli/limits/types.ts";
 import { lockOrder, withOauthRefreshLock } from "../claude-swap-lock.ts";
@@ -98,13 +99,13 @@ export function usageFromLimits(results: Array<{ status: string; windows: LimitW
   };
 }
 
-/** Takes a proper-lockfile style lock (a directory next to the file) around
- * the tool's own refresh critical section, so a swap never lands mid-refresh.
- * Like proper-lockfile, the holder keeps the lock's mtime fresh (the tool
- * breaks locks older than its stale time) and, on release, removes only a
- * lock it still owns (its mtime is the one we last wrote). */
-export async function withToolLock<T>(spec: GrantFileSpec, configDir: string, fn: () => Promise<T>): Promise<T> {
-  const { path, staleMs } = spec.toolLock(expandPath(configDir));
+/** Takes a proper-lockfile style lock (a directory) around a critical
+ * section. Like proper-lockfile, the holder keeps the lock's mtime fresh (the
+ * tool breaks locks older than its stale time). Ownership is an owner token
+ * (pid plus random) written inside the directory: on release only a lock that
+ * still carries our token is removed, so a lock the tool broke and re-took is
+ * left alone. */
+export async function withLockDir<T>(path: string, staleMs: number, label: string, fn: () => Promise<T>): Promise<T> {
   await mkdir(dirname(path), { recursive: true });
   const deadline = Date.now() + grantFileTuning.toolLockWaitMs;
   for (;;) {
@@ -118,22 +119,19 @@ export async function withToolLock<T>(spec: GrantFileSpec, configDir: string, fn
         await rm(path, { recursive: true, force: true });
         continue;
       }
-      if (Date.now() >= deadline) throw new SwapPoolError(`${spec.label} is refreshing its credentials in ${configDir} (lock ${path} busy); try again shortly`);
+      if (Date.now() >= deadline) throw new SwapPoolError(`${label} (lock ${path} busy); try again shortly`);
       await sleep(50);
     }
   }
-  let mine = Math.floor(Date.now());
-  const owned = async () => (await stat(path).then((s) => Math.abs(s.mtimeMs - mine) < 2, () => false));
-  const touch = async () => {
-    mine = Math.floor(Date.now());
-    await utimes(path, mine / 1000, mine / 1000).catch(() => undefined);
-  };
-  await touch();
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const tokenPath = join(path, "owner");
+  await writeFile(tokenPath, token).catch(() => undefined);
+  const owned = async () => (await readFile(tokenPath, "utf8").then((t) => t === token, () => false));
   let busy = false;
   const timer = setInterval(() => {
     if (busy) return;
     busy = true;
-    void owned().then((ok) => (ok ? touch() : undefined)).finally(() => { busy = false; });
+    void owned().then((ok) => (ok ? utimes(path, new Date(), new Date()).catch(() => undefined) : undefined)).finally(() => { busy = false; });
   }, grantFileTuning.toolLockUpdateMs ?? Math.min(staleMs / 2, 5_000));
   try {
     return await fn();
@@ -142,6 +140,12 @@ export async function withToolLock<T>(spec: GrantFileSpec, configDir: string, fn
     while (busy) await sleep(5);
     if (await owned()) await rm(path, { recursive: true, force: true });
   }
+}
+
+/** The tool's own refresh lock around a critical section, so a swap never lands mid-refresh. */
+export function withToolLock<T>(spec: GrantFileSpec, configDir: string, fn: () => Promise<T>): Promise<T> {
+  const { path, staleMs } = spec.toolLock(expandPath(configDir));
+  return withLockDir(path, staleMs, `${spec.label} is refreshing its credentials in ${configDir}`, fn);
 }
 
 export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {

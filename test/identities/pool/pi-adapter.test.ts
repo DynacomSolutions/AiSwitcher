@@ -114,7 +114,7 @@ describe("pi adapter identity and registration", () => {
 });
 
 describe("pi swapCredentials write and verify", () => {
-  test("swaps A to B to A; A's newer pool OAuth entries are written back per provider, other keys kept", async () => {
+  test("swaps A to B to A; only A's kimi-coding entry is written back, other providers are backed up not copied", async () => {
     await setup();
     // a session refreshed A's kimi-coding and openai-codex entries in the pool; the zai key in the pool is untouched
     await put("pool", auth("user-a", T0 + 100, { tag: "a-refreshed", codexTag: "a-cx2", codexExpires: T0 + 100 }));
@@ -122,7 +122,8 @@ describe("pi swapCredentials write and verify", () => {
     expect(toB).toMatchObject({ from: "a", to: "b", writeBack: "written", noop: false });
     const a = await parsed("a");
     expect(a["kimi-coding"]!.refresh).toBe("SYNTHETIC_FIXTURE-rt-a-refreshed");
-    expect(a["openai-codex"]!.refresh).toBe("SYNTHETIC_FIXTURE-cx-rt-a-cx2");
+    expect(a["openai-codex"]!.refresh).toBe(`SYNTHETIC_FIXTURE-cx-rt-user-a`); // never copied between files
+    expect(await readFile(join(dirOf("pool"), "auth.json.pre-swap.bak"), "utf8")).toContain("SYNTHETIC_FIXTURE-cx-rt-a-cx2");
     expect(a.zai!.key).toBe("SYNTHETIC_FIXTURE-key-user-a");
     expect(await read("pool")).toBe(await read("b"));
     expect((await stat(join(dirOf("pool"), "auth.json"))).mode & 0o777).toBe(0o600);
@@ -227,6 +228,28 @@ describe("pi pool-only entries are never dropped silently", () => {
   });
 });
 
+describe("pi heal never moves other providers between member vaults", () => {
+  test("a pool holding B's providers with A's kimi-coding captures only the kimi-coding entry into A", async () => {
+    await setup("b");
+    const anth = (who: string, exp: number) => ({ type: "oauth", access: `SYNTHETIC_FIXTURE-ANTH-${who}`, refresh: `SYNTHETIC_FIXTURE-ANTH-RT-${who}`, expires: exp });
+    const withAnth = async (name: string, who: string, exp: number, kimi: Record<string, unknown>) => {
+      const base = JSON.parse(await read(name)) as Record<string, unknown>;
+      await put(name, JSON.stringify({ ...base, "kimi-coding": kimi, anthropic: anth(who, exp) }));
+    };
+    const kimiOf = async (name: string) => (await parsed(name))["kimi-coding"] as unknown as Record<string, unknown>;
+    await withAnth("a", "A", T0 * 1000, await kimiOf("a"));
+    await withAnth("b", "B", (T0 + 3600) * 1000, await kimiOf("b"));
+    // a Kimi login as A inside the pool where B is active
+    await withAnth("pool", "B", (T0 + 3600) * 1000, { ...(await kimiOf("a")), refresh: "SYNTHETIC_FIXTURE-rt-A-new", expires: (T0 + 900) * 1000 });
+    const notes = (await healPool()).join(" ");
+    expect(notes).toContain('captured it into "a"');
+    const a = await parsed("a");
+    expect(a.anthropic!.access).toBe("SYNTHETIC_FIXTURE-ANTH-A");
+    expect(a["kimi-coding"]!.refresh).toBe("SYNTHETIC_FIXTURE-rt-A-new");
+    expect(await read("pool")).toBe(await read("b"));
+  });
+});
+
 describe("pi heal", () => {
   test("restores an empty, partial or structurally invalid file from the active vault", async () => {
     await setup();
@@ -297,6 +320,20 @@ describe("pi heal", () => {
 });
 
 describe("pi pool write-through", () => {
+  test("a pool swapped to another account while the write-through waits for the lock is not overwritten", async () => {
+    await setup();
+    const { withOauthRefreshLock } = await import("../../../src/identities/claude-swap-lock.ts");
+    const rotated = { access_token: jwt("user-a", T0 + 20), refresh_token: "SYNTHETIC_FIXTURE-rt-a-rot-late", expires_at: T0 + 920 };
+    await withOauthRefreshLock(dirOf("pool"), async () => {
+      const writing = persistKimiCredentials(member("a"), "pi", rotated);
+      await new Promise((r) => setTimeout(r, 200));
+      await put("pool", await read("b")); // the swap lands while the write-through is queued
+      (globalThis as { __wt?: Promise<void> }).__wt = writing;
+    });
+    await (globalThis as { __wt?: Promise<void> }).__wt;
+    expect(await read("pool")).toBe(await read("b"));
+  });
+
   test("a member's kimi refresh reaches the pool only while that member is active and the pool holds its account", async () => {
     await setup();
     const rotated = (user: string, tag: string) => ({ access_token: jwt(user, T0 + 20), refresh_token: `SYNTHETIC_FIXTURE-rt-${tag}`, expires_at: T0 + 920 });
