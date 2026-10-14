@@ -211,3 +211,37 @@ describe("shim execve and swap pools", () => {
     expect(await shim.exited).toBe(7);
   }, 60_000);
 });
+
+describe("shim execve and Herdr title ownership", () => {
+  // The pi extension disables titles when AIS_HERDR_TITLE_OWNER_PID is set to
+  // a PID other than its own. After execve the real tool has the shim's PID,
+  // so a nested launch must not hand it its own PID as the owner.
+  linuxOnly("a nested pi never receives its own PID as the title owner", async () => {
+    const { home, env, out, release } = setup();
+    mkdirSync(join(home, ".pi"), { recursive: true });
+    writeFileSync(
+      join(home, ".pi", "identities.json"),
+      JSON.stringify({ version: 1, identities: [{ name: "acct-a", label: "A", configDir: join(home, "a") }] }),
+    );
+    const fakePi = join(home, "real-bin", "pi");
+    writeFileSync(
+      fakePi,
+      `#!/bin/sh\n{ echo "pid=$$"; echo "owner=$AIS_HERDR_TITLE_OWNER_PID"; } > "$FAKE_OUT.tmp"\nmv "$FAKE_OUT.tmp" "$FAKE_OUT"\nwhile [ ! -e "$FAKE_RELEASE" ]; do sleep 0.05; done\n`,
+    );
+    chmodSync(fakePi, 0o755);
+    const shim = Bun.spawn([process.execPath, join(REPO, "src", "pi.ts")], {
+      cwd: home,
+      env: { ...env, AI_PROFILE_SWITCHER_SESSION: "acct-a", PI_CODING_AGENT_DIR: join(home, "a") },
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "inherit",
+    });
+    killers.push(shim.pid);
+    const fake = await waitFor(() => existsSync(out) && parse(out));
+    expect(Number(fake.pid)).toBe(shim.pid);
+    expect(fake.owner).toMatch(/^\d+$/);
+    expect(fake.owner).not.toBe(fake.pid);
+    writeFileSync(release, "");
+    await shim.exited;
+  }, 60_000);
+});

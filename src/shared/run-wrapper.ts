@@ -144,6 +144,12 @@ export async function runWrapper(
     const chatTitleTool = chatTitleTools.find((tool): tool is HerdrChatTool => tool === cfg.toolName);
     const inheritedTitleOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
     const wantsTitles = !parentIdentity && (!inheritedTitleOwner || inheritedTitleOwner === String(process.pid)) && chatTitleTool;
+    // The real tool takes over this PID (execve). A nested launch used to hand
+    // its child the wrapper's PID, i.e. "someone else"; keep that meaning by
+    // naming the parent, or pi's extension would see its own PID and claim the
+    // tab titles.
+    const titleOwnerPid = process.env.AIS_HERDR_TITLE_OWNER_PID
+      ?? (parentIdentity ? String(process.ppid) : cfg.toolName !== "pi" ? String(process.pid) : undefined);
     const initialPrompt = promptFromCliArgs(cfg.toolName, parsed.cleanedArgv);
     // The real agent replaces this process (execve), so in-session work (sync
     // watcher, Herdr tab titles, post-exit sync) lives in a detached sidecar;
@@ -178,9 +184,7 @@ export async function runWrapper(
           })(),
           ...extraEnv,
           ...memoryProjection.env,
-          ...((process.env.AIS_HERDR_TITLE_OWNER_PID ?? (parentIdentity || cfg.toolName !== "pi" ? String(process.pid) : undefined))
-            ? { AIS_HERDR_TITLE_OWNER_PID: process.env.AIS_HERDR_TITLE_OWNER_PID ?? String(process.pid) }
-            : {}),
+          ...(titleOwnerPid !== undefined ? { AIS_HERDR_TITLE_OWNER_PID: titleOwnerPid } : {}),
           ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),
         },
       },
