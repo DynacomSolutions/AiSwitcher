@@ -6,6 +6,7 @@ import { buildChildEnv, execveReal } from "../../src/shared/exec.ts";
 import { buildEnvp, buildExecBlock, tryExecve } from "../../src/shared/execve.ts";
 
 const BASE = 0x7f0000010000n;
+const execveSupported = process.platform === "linux" || process.platform === "darwin";
 
 /** Reads a NUL-terminated string at a fake address back out of the block. */
 function cstr(buffer: Uint8Array, addr: bigint): string {
@@ -74,7 +75,7 @@ describe("tryExecve", () => {
     expect(tryExecve("/etc/hostname", ["x"], {})).toContain("not executable");
   });
 
-  test.skipIf(process.platform !== "linux")("replaces a real process: arguments and env arrive intact", () => {
+  test.skipIf(!execveSupported)("replaces a real process: arguments and env arrive intact", () => {
     const script = `
       import { tryExecve } from ${JSON.stringify(new URL("../../src/shared/execve.ts", import.meta.url).pathname)};
       tryExecve("/bin/sh", ["sh", "-c", 'echo "$0|$1|$X|$Y|' + process.pid + '|$$"', "zero", "arg one"], { X: "ex ex", Y: undefined });
@@ -90,7 +91,7 @@ describe("tryExecve", () => {
     expect(after).toBe(before); // same PID: image replaced, not forked
   });
 
-  test.skipIf(process.platform !== "linux")("a bare command name is resolved through PATH, never relative to cwd", () => {
+  test.skipIf(!execveSupported)("a bare command name is resolved through PATH, never relative to cwd", () => {
     const root = mkdtempSync(join(tmpdir(), "ais-execve-bare-"));
     try {
       const cwd = join(root, "cwd");

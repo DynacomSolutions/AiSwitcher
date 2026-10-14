@@ -71,3 +71,55 @@ jobs:
 
       - name: Test
         run: bun test
+
+  # Decides whether the macOS job is needed. Pushes to main always run it.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Filter paths that can affect execve on macOS
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Fails open: any doubt about the diff runs the macOS job.
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA"); then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s\n' "$changed" | grep -Eq '^(src/|test/|\.github/workflows/ci\.yml$|package\.json$|bun\.lock$|tsconfig\.json$)'; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # GitHub-hosted runner only: this repository is public, never self-hosted.
+  test-macos:
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # The shim replaces itself with the real tool via posix_spawn(SETEXEC).
+      - name: Test execve, session sidecar and shim end to end
+        run: bun test test/shim-execve.test.ts test/shared/execve.test.ts test/shared/session-sidecar.test.ts

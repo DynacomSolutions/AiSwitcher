@@ -8,20 +8,24 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 50
   background, mouse tracking on, over the shell's prompt). So `runWrapper` (and
   `ais resume`) do all setup, spawn `<self> __session-sidecar` (own session, stdio
   `/dev/null`, spec in `AIS_SESSION_SIDECAR_SPEC`; see `session-sidecar.ts`), then
-  `execve` the real binary over the shim (`execve.ts`, libc via `bun:ffi`, Linux
-  only), so the tool keeps the shim's PID, parent and terminal. The sidecar polls
-  the PID (`/proc` start-time guarded; Bun has no pidfd), runs the profile-sync
+  `execve` the real binary over the shim (`execve.ts`, libc via `bun:ffi`; Linux
+  `execve`, macOS `posix_spawn` with `POSIX_SPAWN_SETEXEC`), so the tool keeps the shim's PID, parent and terminal. The sidecar polls
+  the PID (start-time guarded: `/proc` on Linux, `sysctl kern.proc.pid` in
+  `darwin-proc.ts` on macOS; zombies count as exited; Bun has no pidfd), runs the profile-sync
   watcher and `HerdrTabTitleWatcher` meanwhile, and on exit does the post-exit
   sync. It must never touch the terminal. `execve` also clears ignored signals
   (Bun ignores SIGPIPE/SIGXFSZ), the blocked mask and non-CLOEXEC descriptors so
-  the child sees what `Bun.spawn` would have given it. Fallbacks: execve
-  unavailable (macOS, no FFI, exec error) keeps the old `Bun.spawn` path in
+  the child sees what `Bun.spawn` would have given it. On macOS this is one
+  `posix_spawn` attribute set (SETSIGDEF, SETSIGMASK, CLOEXEC_DEFAULT keeping
+  fds 0-2) because `fcntl` is variadic and a non-variadic `bun:ffi` declaration
+  is not ABI-safe on Apple arm64; never reintroduce `fcntl`/`ioctl` there. Fallbacks: execve
+  unavailable (other platforms, no FFI, exec error) keeps the old `Bun.spawn` path in
   `exec.ts` (inherited stdio, signal relay SIGINT/SIGTERM/SIGHUP/SIGQUIT/SIGTSTP,
   exit-code mirroring) with the sidecar still doing the session work; a sidecar
   that cannot start falls back to the fully in-process legacy flow.
   The sidecar is double-forked through a short-lived `sh` so it is never the
   tool's child. Every fallback to the old spawn path appends one line to
-  `~/.ais/state/shim-fallback.log` (never the terminal; Linux only, since off Linux
+  `~/.ais/state/shim-fallback.log` (never the terminal; Linux and macOS only, since elsewhere
   spawning is the expected route; truncated past 1 MiB). Anything that must
   finish before the exec has to be awaited first: `poolLaunchCheck` therefore
   stops starting new swaps after `LAUNCH_SETTLE_MS` past its 4 s budget but

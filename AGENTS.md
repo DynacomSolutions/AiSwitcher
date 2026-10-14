@@ -96,7 +96,8 @@ Identity and launch:
 - The wrapper never stays alive as the TUI's parent: after setup it spawns the
   detached `__session-sidecar` (sync watcher, Herdr titles, post-exit sync; never
   touches the terminal), then replaces itself with the real binary via libc
-  `execve` (`src/shared/execve.ts`, `session-sidecar.ts`; Linux only). Without
+  `execve` (`src/shared/execve.ts`, `session-sidecar.ts`; Linux, and macOS via
+  `posix_spawn` SETEXEC). Without
   FFI or on failure it falls back to `Bun.spawn` in `src/shared/exec.ts`
   (inherited stdio, explicit signal relay). Shims install to `~/.local/bin`; the
   real binary is resolved fresh each run, never cached. One compiled binary per

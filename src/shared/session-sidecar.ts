@@ -4,6 +4,7 @@ import type { ToolConfig } from "../identities/types.ts";
 import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sync/background.ts";
 import { startProfileSyncWatcher } from "../sync/watch.ts";
 import { aisHerdrTabLabelsPath, aisStateDir } from "./ais-home.ts";
+import { darwinExe, darwinProc } from "./darwin-proc.ts";
 import { execveReal, spawnReal, withUsableCwd } from "./exec.ts";
 import { readHerdrChatTitle, type HerdrChatTool } from "./herdr-chat-source.ts";
 import { HerdrTabTitleWatcher } from "./herdr-tab-title.ts";
@@ -31,9 +32,9 @@ export interface SessionSpec {
   toolName: ToolConfig["toolName"];
   /** PID to watch: the wrapper's own PID, which the real tool takes over via execve. */
   pid: number;
-  /** /proc start time of `pid`, guarding against PID reuse (Linux only). */
+  /** Start time of `pid` (/proc on Linux, sysctl on macOS), guarding against PID reuse. */
   startTime?: string;
-  /** Wrapper's /proc/<pid>/exe at spawn; a change means the exec happened. */
+  /** Wrapper's executable path at spawn (/proc/<pid>/exe, proc_pidpath on macOS); a change means the exec happened. */
   initialExe?: string;
   identity?: { name: string; configDir: string };
   configDirValue: string;
@@ -55,6 +56,7 @@ interface ProcStat {
 }
 
 function readProcStat(pid: number): ProcStat | undefined {
+  if (process.platform === "darwin") return darwinProc(pid);
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     // comm may contain spaces and parentheses: fields resume after the LAST ")".
@@ -82,7 +84,7 @@ export function isPidRunning(pid: number, startTime?: string): boolean {
   }
 }
 
-/** Polls (pidfd_open is not reachable from Bun) until `pid` is gone. */
+/** Polls (pidfd_open is not reachable from Bun; kqueue neither) until `pid` is gone. */
 export async function waitForPidExit(
   pid: number,
   options: { startTime?: string; pollMs?: number; isRunning?: (pid: number, startTime?: string) => boolean } = {},
@@ -92,6 +94,7 @@ export async function waitForPidExit(
 }
 
 function exeOf(pid: number): string | undefined {
+  if (process.platform === "darwin") return darwinExe(pid);
   try {
     return readlinkSync(`/proc/${pid}/exe`);
   } catch {
@@ -228,7 +231,7 @@ export interface LaunchDeps {
   execve: (real: RealLaunch) => string | undefined;
   /** Where fallbacks are recorded; defaults to the AIS state dir. */
   logPath?: string;
-  /** Defaults to process.platform; execve is expected to be unsupported off Linux. */
+  /** Defaults to process.platform; execve is expected to be unsupported off Linux and macOS. */
   platform?: NodeJS.Platform;
   spawn: (real: RealLaunch) => Promise<number>;
   startWork: (cfg: ToolConfig, spec: SessionSpec) => Promise<SessionWork>;
@@ -268,8 +271,8 @@ export async function launchWithSession(
   };
   if (await deps.spawnSidecar(full)) {
     const reason = deps.execve(real);
-    // Off Linux the spawn path is the normal route, not a fallback worth recording.
-    if ((deps.platform ?? process.platform) === "linux") {
+    // Elsewhere the spawn path is the normal route, not a fallback worth recording.
+    if (["linux", "darwin"].includes(deps.platform ?? process.platform)) {
       logFallback(deps.logPath, cfg.toolName, `spawn fallback (sidecar keeps the session work): ${reason}`);
     }
     return await deps.spawn(real);

@@ -11,7 +11,9 @@ import { join } from "node:path";
 const REPO = join(import.meta.dir, "..");
 const dirs: string[] = [];
 const killers: number[] = [];
-const linuxOnly = process.platform === "linux" ? test : test.skip;
+const darwin = process.platform === "darwin";
+// execve is implemented on Linux (execve) and macOS (posix_spawn SETEXEC); /proc probes have ps/lsof twins below.
+const execveTest = process.platform === "linux" || darwin ? test : test.skip;
 
 afterEach(() => {
   for (const pid of killers.splice(0)) {
@@ -66,8 +68,15 @@ function setup(options: { pool?: boolean } = {}) {
     `for a in "$@"; do printf '%s\\n' "$a"; done > "$FAKE_OUT.args"
 {
 echo "pid=$$"; echo "ppid=$PPID"; echo "session=$AI_PROFILE_SWITCHER_SESSION"
-grep -E '^Sig(Ign|Blk)' /proc/$$/status | tr -d '\\t' | tr ':' '='
-fds=; for fd in 3 4 5 6 7 8 9; do [ -e /proc/$$/fd/$fd ] && fds="$fds$fd,"; done; echo "fds=$fds"
+if [ -r /proc/$$/status ]; then grep -E '^Sig(Ign|Blk)' /proc/$$/status | tr -d '\\t' | tr ':' '='
+else # macOS ps has no ignored-signals column: probe by sending SIGPIPE / SIGXFSZ to a child shell that inherits ours
+  ign=0
+  sh -c 'kill -s PIPE $$; echo survived' | grep -q survived && ign=$((ign + 4096))
+  sh -c 'kill -s XFSZ $$; echo survived' | grep -q survived && ign=$((ign + 16777216))
+  echo "SigIgn=$(printf '%x' $ign)"
+fi
+fdroot=/proc/$$/fd; [ -d "$fdroot" ] || fdroot=/dev/fd
+fds=; for fd in 3 4 5 6 7 8 9; do [ -e "$fdroot/$fd" ] && fds="$fds$fd,"; done; echo "fds=$fds"
 } > "$FAKE_OUT.tmp"
 mv "$FAKE_OUT.tmp" "$FAKE_OUT"
 while [ ! -e "$FAKE_RELEASE" ]; do sleep 0.05; done
@@ -96,7 +105,16 @@ async function waitFor<T>(probe: () => T | undefined | false, ms = 20_000): Prom
   throw new Error("timed out waiting for condition");
 }
 
+const psOut = (...args: string[]) => Bun.spawnSync(["ps", ...args]).stdout.toString();
+
 function findSidecar(home: string): number | undefined {
+  if (darwin) {
+    // -E appends each process's environment to its command line.
+    for (const line of psOut("-axwwE", "-o", "pid=,command=").split("\n")) {
+      if (line.includes("__session-sidecar") && new RegExp(`HOME=${home}(\\s|$)`).test(line)) return Number(line.trim().split(/\s+/)[0]);
+    }
+    return undefined;
+  }
   for (const entry of readdirSync("/proc")) {
     if (!/^\d+$/.test(entry)) continue;
     try {
@@ -112,16 +130,31 @@ function findSidecar(home: string): number | undefined {
 const alive = (pid: number) => {
   try {
     process.kill(pid, 0);
-    return !readFileSync(`/proc/${pid}/stat`, "utf8").includes(") Z ");
+    return darwin ? !psOut("-o", "stat=", "-p", String(pid)).trim().startsWith("Z") : !readFileSync(`/proc/${pid}/stat`, "utf8").includes(") Z ");
   } catch {
     return false;
   }
 };
 
-const sessionOf = (pid: number) => {
+/** Parent, session (macOS: process group, ps has no session id), and whether there is no controlling terminal. */
+function detachInfo(pid: number): { ppid: number; session: number; noTty: boolean } {
+  if (darwin) {
+    const [ppid, pgid, tty] = psOut("-o", "ppid=,pgid=,tty=", "-p", String(pid)).trim().split(/\s+/);
+    return { ppid: Number(ppid), session: Number(pgid), noTty: tty === "??" };
+  }
   const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
-  return Number(raw.slice(raw.lastIndexOf(")") + 2).split(" ")[3]);
-};
+  const [, ppid, , session, tty] = raw.slice(raw.lastIndexOf(")") + 2).split(" ").map(Number);
+  return { ppid: ppid!, session: session!, noTty: tty === 0 };
+}
+
+/** What fds 0-2 of `pid` point at. */
+function stdioTargets(pid: number): string[] {
+  if (darwin) {
+    const out = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "0,1,2", "-Fn"]).stdout.toString();
+    return out.split("\n").filter((l) => l.startsWith("n")).map((l) => l.slice(1));
+  }
+  return [0, 1, 2].map((fd) => readlinkSync(`/proc/${pid}/fd/${fd}`));
+}
 
 const parse = (path: string) =>
   Object.fromEntries(readFileSync(path, "utf8").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
@@ -130,7 +163,7 @@ describe.each([
   ["bun run src/claude.ts", () => [process.execPath, join(REPO, "src", "claude.ts")]],
   ["compiled shim", () => [compiledShim]],
 ])("shim execve (%s)", (_name, command) => {
-  linuxOnly("the real tool replaces the shim: same PID, caller as parent, clean process state", async () => {
+  execveTest("the real tool replaces the shim: same PID, caller as parent, clean process state", async () => {
     const { home, env, out, release } = setup();
     const shim = Bun.spawn([...command(), "--identity=acct-a", "hello", "world"], {
       cwd: home,
@@ -160,7 +193,7 @@ describe.each([
     expect(await shim.exited).toBe(7);
   }, 60_000);
 
-  linuxOnly("the sidecar is detached, never touches the real tool when killed, and runs the post-exit sync", async () => {
+  execveTest("the sidecar is detached, never touches the real tool when killed, and runs the post-exit sync", async () => {
     const { home, env, out, release } = setup();
     const shim = Bun.spawn([...command(), "--identity=acct-a"], { cwd: home, env, stdin: "ignore", stdout: "ignore", stderr: "inherit" });
     killers.push(shim.pid);
@@ -168,12 +201,11 @@ describe.each([
     const sidecar = await waitFor(() => findSidecar(home));
     killers.push(sidecar);
 
-    const raw = readFileSync(`/proc/${sidecar}/stat`, "utf8");
-    const [, ppid, , session, tty] = raw.slice(raw.lastIndexOf(")") + 2).split(" ").map(Number);
-    expect(ppid).not.toBe(shim.pid); // double-forked: not a child (zombie, signal target) of the tool
-    expect(session).not.toBe(sessionOf(shim.pid)); // own session, away from the caller's terminal
-    expect(tty).toBe(0); // no controlling terminal
-    for (const fd of [0, 1, 2]) expect(readlinkSync(`/proc/${sidecar}/fd/${fd}`)).toBe("/dev/null");
+    const info = detachInfo(sidecar);
+    expect(info.ppid).not.toBe(shim.pid); // double-forked: not a child (zombie, signal target) of the tool
+    expect(info.session).not.toBe(detachInfo(shim.pid).session); // own session, away from the caller's terminal
+    expect(info.noTty).toBe(true); // no controlling terminal
+    expect(stdioTargets(sidecar)).toEqual(["/dev/null", "/dev/null", "/dev/null"]);
 
     process.kill(sidecar, "SIGKILL");
     await waitFor(() => !alive(sidecar));
@@ -184,12 +216,16 @@ describe.each([
     expect(await shim.exited).toBe(7);
   }, 60_000);
 
-  linuxOnly("a live sidecar runs the launch and post-exit sync when the tool exits", async () => {
+  execveTest("a live sidecar runs the launch and post-exit sync when the tool exits", async () => {
     const { home, env, out, release, syncLog } = setup();
     const shim = Bun.spawn([...command(), "--identity=acct-a"], { cwd: home, env, stdin: "ignore", stdout: "ignore", stderr: "inherit" });
     killers.push(shim.pid);
     await waitFor(() => existsSync(out));
     await waitFor(() => existsSync(syncLog)); // launch-time sync
+    // Proves the sidecar's PID watch survives the exec (start time kept): a watch that
+    // wrongly saw the PID as recycled would run the post-exit sync while the tool still runs.
+    await Bun.sleep(1_500);
+    expect(readFileSync(syncLog, "utf8")).not.toContain("--wait");
     writeFileSync(release, "");
     await shim.exited;
     const lines = await waitFor(() => {
@@ -202,7 +238,7 @@ describe.each([
 });
 
 describe("shim execve and swap pools", () => {
-  linuxOnly("a pool swap that outlives the launch-check budget finishes before the exec cuts the process", async () => {
+  execveTest("a pool swap that outlives the launch-check budget finishes before the exec cuts the process", async () => {
     const { home, env, out, release } = setup({ pool: true });
     const shim = Bun.spawn([process.execPath, join(REPO, "test", "fixtures", "pool-slow-claude.ts"), "--identity=pool"], {
       cwd: home,
@@ -226,7 +262,7 @@ describe("shim execve and Herdr title ownership", () => {
   // The pi extension disables titles when AIS_HERDR_TITLE_OWNER_PID is set to
   // a PID other than its own. After execve the real tool has the shim's PID,
   // so a nested launch must not hand it its own PID as the owner.
-  linuxOnly("a nested pi never receives its own PID as the title owner", async () => {
+  execveTest("a nested pi never receives its own PID as the title owner", async () => {
     const { home, env, out, release } = setup();
     mkdirSync(join(home, ".pi"), { recursive: true });
     writeFileSync(
