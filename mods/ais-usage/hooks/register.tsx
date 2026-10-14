@@ -212,7 +212,7 @@ export const register: Register = on => {
 
     const rows = (entries: LimitsEntry[], withName = false) =>
       entries.map(l =>
-        l.status === 'live' && l.windows.length ? (
+        l.windows.length ? (
           <Text key={`${l.toolName}-${l.identity.name}`}>
             {(withName ? `${l.identity.name === r.current ? '*' : ' '} ${l.identity.name}` : l.toolName).padEnd(withName ? 20 : 8)}
             {l.windows.map(w => (
