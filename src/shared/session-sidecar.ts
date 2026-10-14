@@ -170,15 +170,36 @@ export function selfCommand(execPath = process.execPath, main = Bun.main): strin
   return main.startsWith("/$bunfs/") || main.includes("~BUN") ? [execPath] : [execPath, main];
 }
 
-/** Starts the detached sidecar (own session, stdio to /dev/null). False if it could not start. */
-export function spawnSidecar(spec: SessionSpec): boolean {
+const REAP_WAIT_MS = 2_000;
+
+/**
+ * Starts the detached sidecar (own session, stdio to /dev/null) and
+ * double-forks it: a short-lived `sh` (the session leader) backgrounds the
+ * sidecar and exits, and we reap it here. After the exec the sidecar is then
+ * a child of init, not of the real tool, so it can never become the tool's
+ * zombie or be reaped or signalled by it. Falls back to a direct detached
+ * spawn without `sh`. False if the sidecar could not start.
+ */
+export async function spawnSidecar(spec: SessionSpec): Promise<boolean> {
+  const env = { ...process.env, [SIDECAR_SPEC_ENV]: JSON.stringify(spec) };
+  const command = [...selfCommand(), SIDECAR_ARG];
   try {
-    withUsableCwd(() =>
-      Bun.spawn([...selfCommand(), SIDECAR_ARG], {
-        env: { ...process.env, [SIDECAR_SPEC_ENV]: JSON.stringify(spec) },
+    const stage = withUsableCwd(() =>
+      Bun.spawn(["/bin/sh", "-c", '"$@" </dev/null >/dev/null 2>&1 &', "sh", ...command], {
+        env,
         stdio: ["ignore", "ignore", "ignore"],
         detached: true,
       }),
+    );
+    const exited = await Promise.race([stage.exited, Bun.sleep(REAP_WAIT_MS).then(() => undefined)]);
+    // A stage that has not exited yet may still start the sidecar: never spawn a second one.
+    if (exited === 0 || exited === undefined) return true;
+  } catch {
+    // no usable sh: fall through to the direct spawn
+  }
+  try {
+    withUsableCwd(() =>
+      Bun.spawn(command, { env, stdio: ["ignore", "ignore", "ignore"], detached: true }),
     ).unref();
     return true;
   } catch {
@@ -187,7 +208,7 @@ export function spawnSidecar(spec: SessionSpec): boolean {
 }
 
 export interface LaunchDeps {
-  spawnSidecar: (spec: SessionSpec) => boolean;
+  spawnSidecar: (spec: SessionSpec) => boolean | Promise<boolean>;
   execve: (real: RealLaunch) => boolean;
   spawn: (real: RealLaunch) => Promise<number>;
   startWork: (cfg: ToolConfig, spec: SessionSpec) => Promise<SessionWork>;
@@ -221,7 +242,7 @@ export async function launchWithSession(
     ...(procStartTime(process.pid) ? { startTime: procStartTime(process.pid) as string } : {}),
     ...(exeOf(process.pid) ? { initialExe: exeOf(process.pid) as string } : {}),
   };
-  if (deps.spawnSidecar(full)) {
+  if (await deps.spawnSidecar(full)) {
     deps.execve(real);
     return await deps.spawn(real);
   }

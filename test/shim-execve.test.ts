@@ -117,6 +117,11 @@ const alive = (pid: number) => {
   }
 };
 
+const sessionOf = (pid: number) => {
+  const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+  return Number(raw.slice(raw.lastIndexOf(")") + 2).split(" ")[3]);
+};
+
 const parse = (path: string) =>
   Object.fromEntries(readFileSync(path, "utf8").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
 
@@ -159,9 +164,9 @@ describe.each([
     killers.push(sidecar);
 
     const raw = readFileSync(`/proc/${sidecar}/stat`, "utf8");
-    const [, , pgrp, session, tty] = raw.slice(raw.lastIndexOf(")") + 2).split(" ").map(Number);
-    expect(pgrp).toBe(sidecar); // own process group
-    expect(session).toBe(sidecar); // own session
+    const [, ppid, , session, tty] = raw.slice(raw.lastIndexOf(")") + 2).split(" ").map(Number);
+    expect(ppid).not.toBe(shim.pid); // double-forked: not a child (zombie, signal target) of the tool
+    expect(session).not.toBe(sessionOf(shim.pid)); // own session, away from the caller's terminal
     expect(tty).toBe(0); // no controlling terminal
     for (const fd of [0, 1, 2]) expect(readlinkSync(`/proc/${sidecar}/fd/${fd}`)).toBe("/dev/null");
 
