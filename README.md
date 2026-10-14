@@ -1078,6 +1078,20 @@ silently hands off to whichever instance started first (see the
 resolution/self-heal failure falls through to unmodified `open` too — loudly,
 via a `console.error` diagnostic, never silently.
 
+## Claude Code mod: ais-usage
+
+`mods/ais-usage` is a Claude Code mod that shows the current pool or identity
+across providers, with the other identities expandable. Install it from this
+repository's marketplace (`aiswitcher`):
+
+```
+/plugin marketplace add DynacomSolutions/AiSwitcher
+/plugin install ais-usage@aiswitcher
+```
+
+Then run `/ais-usage` to open the pane. It calls the `ais` CLI, so `ais` must
+be on `PATH` (or in `~/.local/bin`).
+
 ## Commands
 
 | Command | What it does |
