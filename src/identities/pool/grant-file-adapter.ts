@@ -42,14 +42,18 @@ export interface GrantMerge {
 
 const BACKUPS_KEPT = 10;
 
-/** Writes `text` to a new `<file>.pre-<kind>.<stamp>.bak` (0600) and keeps the newest few per kind. */
-async function writeBackup(file: string, kind: "swap" | "heal" | "merge", text: string): Promise<string> {
+const STAMP = "\\d{8}T\\d{9}Z-[0-9a-f]{4}";
+const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Writes `text` to a new `<file>.pre-<kind>.<stamp>.bak` (0600) and keeps the newest few per kind.
+ * Only names in exactly that stamp format are ever pruned, and never the file just written (even if the clock stepped back). */
+export async function writeBackup(file: string, kind: "swap" | "heal" | "merge", text: string): Promise<string> {
   const stamp = `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(2).toString("hex")}`;
   const path = `${file}.pre-${kind}.${stamp}.bak`;
   await writeFileAtomic(path, text);
-  const prefix = `${basename(file)}.pre-${kind}.`;
-  const old = (await readdir(dirname(file)).catch(() => [] as string[])).filter((n) => n.startsWith(prefix) && n.endsWith(".bak")).sort();
-  for (const name of old.slice(0, Math.max(0, old.length - BACKUPS_KEPT))) await rm(join(dirname(file), name), { force: true });
+  const own = new RegExp(`^${escapeRe(basename(file))}\\.pre-${kind}\\.${STAMP}\\.bak$`);
+  const old = (await readdir(dirname(file)).catch(() => [] as string[])).filter((n) => own.test(n) && join(dirname(file), n) !== path).sort();
+  for (const name of old.slice(0, Math.max(0, old.length - (BACKUPS_KEPT - 1)))) await rm(join(dirname(file), name), { force: true });
   return path;
 }
 
@@ -60,6 +64,8 @@ export const grantFileTuning = {
   toolLockWaitMs: 3_000,
   /** How often a held tool lock's mtime is refreshed; default half its stale time, at most 5s. */
   toolLockUpdateMs: undefined as number | undefined,
+  /** How a held lock directory is stat'ed (tests simulate a filesystem without birth times). */
+  statLock: ((p: string) => stat(p)) as (p: string) => Promise<{ ino: number; birthtimeMs: number; mtimeMs: number }>,
 };
 
 export interface GrantFileSpec {
@@ -151,16 +157,29 @@ export async function withLockDir<T>(path: string, staleMs: number, label: strin
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
   const tokenPath = `${path}.owner`; // beside the lock dir: the tool's own cleanup of the dir must stay a plain rmdir
   await writeFile(tokenPath, token).catch(() => undefined);
-  // Ownership = our token AND the very directory we created (inode plus birth time): a lock the tool broke
-  // and re-took is a different directory even though our sibling token file is still there.
-  const identOf = async () => stat(path).then((s) => `${s.ino}:${s.birthtimeMs}`, () => "");
-  const ident = await identOf();
-  const owned = async () => (await readFile(tokenPath, "utf8").then((t) => t === token, () => false)) && (await identOf()) === ident;
+  // Ownership = our token AND the very directory we created. With a birth time that is inode plus birth time;
+  // where the filesystem reports none (0), an inode alone can be reused by a re-taken lock, so the directory's
+  // mtime must also be the one we last set. Uncertain means not ours: the lock is left for stale cleanup.
+  const statDir = () => grantFileTuning.statLock(path).catch(() => undefined);
+  const first = await statDir();
+  let lastMtime = first?.mtimeMs;
+  const owned = async () => {
+    if (!(await readFile(tokenPath, "utf8").then((t) => t === token, () => false))) return false;
+    const s = await statDir();
+    if (!s || !first || s.ino !== first.ino || s.birthtimeMs !== first.birthtimeMs) return false;
+    return first.birthtimeMs > 0 || s.mtimeMs === lastMtime;
+  };
   let busy = false;
   const timer = setInterval(() => {
     if (busy) return;
     busy = true;
-    void owned().then((ok) => (ok ? utimes(path, new Date(), new Date()).catch(() => undefined) : undefined)).finally(() => { busy = false; });
+    void owned()
+      .then(async (ok) => {
+        if (!ok) return;
+        await utimes(path, new Date(), new Date()).catch(() => undefined);
+        lastMtime = (await statDir())?.mtimeMs;
+      })
+      .finally(() => { busy = false; });
   }, grantFileTuning.toolLockUpdateMs ?? Math.min(staleMs / 2, 5_000));
   try {
     return await fn();
@@ -202,6 +221,13 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     for (const m of members) if (resolve(expandPath(m.configDir)) !== resolve(expandPath(owner.configDir))) {
       const g = (await load(m.configDir)).grant;
       if (g) out.push(g);
+      // Their recent merge backups hold chains they rotated away from: `replaced:<key>` / `skipped:<key>` entries count as theirs.
+      const file = fileOf(m.configDir);
+      const re = new RegExp(`^${escapeRe(basename(file))}\\.pre-merge\\.${STAMP}\\.bak$`);
+      for (const n of (await readdir(dirname(file)).catch(() => [] as string[])).filter((x) => re.test(x))) {
+        const b = parseGrantFile(await readFile(join(dirname(file), n), "utf8").catch(() => undefined));
+        if (b) out.push(Object.fromEntries(Object.entries(b).map(([k, v]) => [k.replace(/^(replaced|skipped):/, ""), v])));
+      }
     }
     return out;
   }
