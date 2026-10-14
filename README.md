@@ -981,6 +981,17 @@ ais claude-swap hook on              # optional instant trigger, see below
 ais claude-swap usage                # per-member transcript usage split
 ```
 
+`ais swap <tool> ...` takes the same subcommands for any pooled tool and
+`ais claude-swap ...` is an exact alias of `ais swap claude ...`. Codex pools
+(`ais swap codex pool create shared --accounts=a,b`) need ChatGPT-login
+members (`auth.json` is the vault; API-key, Bedrock and logged-out identities
+are refused). `hook` is Claude-only. Codex reads `auth.json` once at startup,
+so running sessions keep the old account after a swap: `to` and `next` print
+how many are running, and new launches (or `codex resume`) get the new one.
+`ais swap codex usage` splits `<pool>/sessions/**/rollout-*.jsonl` token usage
+per member from the ledger (`~/.ais/state/codex-swap.jsonl`).
+`ais limits` and `ais identities list` show codex pools like claude pools.
+
 Members are existing, non-retired, non-pool claude identities; their own
 configDir stays the per-account vault. A swap takes Claude Code's own
 `.oauth_refresh.lock` / `.claude.json.lock` dirs (bounded wait, clear failure),

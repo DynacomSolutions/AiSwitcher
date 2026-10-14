@@ -4,7 +4,7 @@ import type { Identity } from "../types.ts";
 import type { PoolAdapter, SwapReason, SwapResult } from "./adapter.ts";
 import { appendSwapEvent, ledgerPathFor } from "./ledger.ts";
 import { withPoolLock, type LockOptions } from "./lock.ts";
-import { isAllowed, memberIdentity, requirePool, SwapPoolError, type PoolIdentity } from "./swap-pool.ts";
+import { isAllowed, memberIdentity, requirePool, SwapPoolError, swapCommandName, type PoolIdentity } from "./swap-pool.ts";
 
 /** Thrown by a `guard` to abandon a swap; `outcome` is the caller's own value. */
 export class SwapSkipped<O = unknown> extends Error {
@@ -50,7 +50,7 @@ async function swapLocked(adapter: PoolAdapter<any>, options: PerformSwapOptions
   const target = memberIdentity(file, pool, options.target);
   if (isRetired(target)) throw new SwapPoolError(`Account "${target.name}" is retired`);
   if (!options.force && !isAllowed(pool, target.name)) {
-    throw new SwapPoolError(`Account "${target.name}" is not allowed in pool "${pool.name}" (run "ais ${adapter.tool}-swap allow ${target.name}" or pass --force).`);
+    throw new SwapPoolError(`Account "${target.name}" is not allowed in pool "${pool.name}" (run "${swapCommandName(adapter.tool)} allow ${target.name}" or pass --force).`);
   }
   const members = pool.swapPool.accounts
     .map((name) => file.identities.find((i) => i.name === name))

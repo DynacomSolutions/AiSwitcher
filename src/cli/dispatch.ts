@@ -19,6 +19,7 @@ import { runWebCommand } from "./web.ts";
 import { runHerdrCommand } from "./herdr.ts";
 import { runTuiCommand } from "./tui.ts";
 import { runClaudeSwapCommand } from "./claude-swap/dispatch.ts";
+import { runSwapCommand } from "./swap/dispatch.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
  * and `unretire` are excluded: a sync merging the remote registry while the
@@ -123,6 +124,12 @@ export async function runCli(argv: string[]): Promise<void> {
       case "claude-swap":
         await runClaudeSwapCommand(rest, flags);
         break;
+      case "swap": {
+        const [tool, ...toolRest] = rest;
+        if (!tool) throw new CliUsageError("Usage: ais swap <claude|codex> [status|to|next|allow|disallow|auto|usage|pool create|hook] ...");
+        await runSwapCommand(tool, toolRest, flags);
+        break;
+      }
       case "memory":
         await runMemoryCommand(rest, flags);
         break;

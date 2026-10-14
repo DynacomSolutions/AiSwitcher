@@ -303,14 +303,14 @@ export function aggregateLimitResults(results: ToolLimitResult[]): ToolLimitResu
   return [...grouped.values()];
 }
 
-/** A claude swap pool whose active member is also a target: it shares that
+/** A swap pool (claude or codex) whose active member is also a target: it shares that
  * member's token and renders as a pointer row, so it is never fetched. */
 export function isMirroredPoolTarget(target: LimitTarget, targets: LimitTarget[]): boolean {
   const active = target.identity.swapPool?.active;
   return (
-    target.toolName === "claude" &&
+    target.identity.swapPool !== undefined &&
     active !== undefined &&
-    targets.some((t) => t !== target && t.toolName === "claude" && t.identity.name === active)
+    targets.some((t) => t !== target && t.toolName === target.toolName && t.identity.name === active)
   );
 }
 

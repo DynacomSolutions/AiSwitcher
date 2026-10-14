@@ -2,9 +2,10 @@ import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { activeMemberAt, eventsForPool, readSwapEvents, type SwapEvent } from "../../identities/claude-swap.ts";
+import type { SwapEvent } from "../../identities/pool/adapter.ts";
+import { activeMemberAt, eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
-import type { PoolIdentity } from "../../identities/swap-pool.ts";
+import type { PoolIdentity } from "../../identities/pool/swap-pool.ts";
 import type { Identity } from "../../identities/types.ts";
 import { localDateKey } from "../usage/local-day.ts";
 import type { TokscaleEntry } from "../usage/tokscale.ts";
@@ -83,14 +84,57 @@ export function attributeLine(
   };
 }
 
-export async function poolMemberUsageSplit(pool: PoolIdentity, options: { days: number; ledgerPath: string; now?: number }): Promise<PoolUsageSplit> {
+type Hit = NonNullable<ReturnType<typeof attributeLine>>;
+
+/** Codex rollouts: `token_count` event_msg lines carry the per-request delta in
+ * `payload.info.last_token_usage` (cached/cache-write are subsets of
+ * input_tokens, as in shared/local-spend.ts); the model arrives on
+ * `turn_context` lines. Stateful per file: build one reader per rollout. */
+export function codexLineReader(events: SwapEvent[], pool: string, sinceMs: number): (line: string) => Hit | undefined {
+  let model: string | undefined;
+  return (line) => {
+    if (!line.includes("token_count") && !line.includes("turn_context")) return undefined;
+    let parsed: { timestamp?: string; type?: string; payload?: { type?: string; model?: string; info?: { last_token_usage?: Record<string, number | undefined> } } };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return undefined;
+    }
+    if (parsed.type === "turn_context" && typeof parsed.payload?.model === "string") {
+      model = parsed.payload.model;
+      return undefined;
+    }
+    const usage = parsed.payload?.info?.last_token_usage;
+    const at = typeof parsed.timestamp === "string" ? Date.parse(parsed.timestamp) : NaN;
+    if (parsed.type !== "event_msg" || parsed.payload?.type !== "token_count" || !usage || !Number.isFinite(at) || at < sinceMs) return undefined;
+    const input = usage.input_tokens ?? 0;
+    const cacheRead = Math.min(usage.cached_input_tokens ?? 0, input);
+    const cacheWrite = Math.min(usage.cache_write_input_tokens ?? 0, input - cacheRead);
+    return {
+      member: activeMemberAt(events, pool, at) ?? "(before first swap)",
+      at,
+      ...(model ? { model } : {}),
+      usage: { input: input - cacheRead - cacheWrite, output: usage.output_tokens ?? 0, cacheRead, cacheWrite },
+    };
+  };
+}
+
+/** Where a tool keeps the usage logs of a pool folder, and how to read a line. */
+const usageSources = {
+  claude: { dir: "projects", reader: (events: SwapEvent[], pool: string, sinceMs: number) => (line: string) => attributeLine(line, events, pool, sinceMs) },
+  codex: { dir: "sessions", reader: codexLineReader },
+} as const;
+
+export async function poolMemberUsageSplit(pool: PoolIdentity, options: { days: number; ledgerPath: string; now?: number; tool?: keyof typeof usageSources }): Promise<PoolUsageSplit> {
+  const source = usageSources[options.tool ?? "claude"];
   const events = eventsForPool(await readSwapEvents(options.ledgerPath), pool);
   const sinceMs = (options.now ?? Date.now()) - options.days * 86_400_000;
   const rows = new Map<string, MemberSplitRow>();
-  for await (const file of jsonlFiles(join(pool.configDir, "projects"), sinceMs)) {
+  for await (const file of jsonlFiles(join(pool.configDir, source.dir), sinceMs)) {
     const rl = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+    const read = source.reader(events, pool.name, sinceMs);
     for await (const line of rl) {
-      const hit = attributeLine(line, events, pool.name, sinceMs);
+      const hit = read(line);
       if (!hit) continue;
       const row = rows.get(hit.member) ?? { member: hit.member, messages: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
       row.messages += 1;

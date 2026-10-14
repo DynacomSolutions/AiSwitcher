@@ -188,7 +188,7 @@ then run the real command once. Full recipe: `docs/agents/adding-a-tool.md`.
 - `src/server/**`: console-web.md
 - `src/spend/**`: bedrock-spend.md
 - `src/identities/*auth*`, `src/identities/oauth-*`: provider-first.md, pi.md
-- `src/identities/claude-swap*`, `src/cli/claude-swap/**`: claude-swap-pools.md
+- `src/identities/claude-swap*`, `src/identities/pool/**`, `src/cli/claude-swap/**`, `src/cli/swap/**`: claude-swap-pools.md
 - `src/identities/**` (rest): identities.md, module-map.md
 - `src/pi-extension/**`: pi.md
 - `src/shared/**`: wrappers-and-shims.md, module-map.md

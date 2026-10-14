@@ -106,7 +106,7 @@ function buildAggregateRows(results: ToolLimitResult[]): Row[] {
  * keeps its own windows — there is nothing else to show them from. */
 function isMirroredPool(r: ToolLimitResult, all: ToolLimitResult[]): boolean {
   const active = r.identity.swapPool?.active;
-  return active !== undefined && all.some((o) => o !== r && o.identity.name === active);
+  return active !== undefined && all.some((o) => o !== r && o.toolName === r.toolName && o.identity.name === active);
 }
 
 /** Headroom = 100 − worst window. */
