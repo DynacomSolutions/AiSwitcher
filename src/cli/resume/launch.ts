@@ -1,12 +1,11 @@
 import { join } from "node:path";
-import { IDENTITY_SESSION_MARKER, spawnReal } from "../../shared/exec.ts";
+import { IDENTITY_SESSION_MARKER } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import type { ResumableSession } from "./types.ts";
 import { recoverOrphanedCodexBackfill } from "../../shared/codex-backfill.ts";
-import { startProfileSyncWatcher } from "../../sync/watch.ts";
 import { gatePluginArgs } from "../../shared/plugin-gating.ts";
-import { launchThenStartBackgroundSync } from "../../sync/background.ts";
+import { launchWithSession } from "../../shared/session-sidecar.ts";
 import { RetiredIdentityError } from "../../identities/errors.ts";
 import { isRetired } from "../../identities/retired.ts";
 
@@ -34,8 +33,8 @@ const RESUME_ARGS: Partial<Record<ResumableSession["toolName"], (sessionId: stri
 
 /** Launches the real tool, resuming one specific session: mirrors
  * run-wrapper.ts's own exec shape (same env var injection, same
- * IDENTITY_SESSION_MARKER, same execReal) rather than going through our own
- * installed claude/codex/grok shim, since the identity is already fully
+ * IDENTITY_SESSION_MARKER, same execve-with-sidecar launch) rather than going
+ * through our own installed claude/codex/grok shim, since the identity is already fully
  * resolved here and re-resolving it through the shim would be redundant
  * indirection. Never returns: replaces this process the same way every
  * other proxy entrypoint does.
@@ -64,19 +63,23 @@ export async function launchResume(session: ResumableSession): Promise<never> {
       subdir ? join(session.identity.configDir, subdir) : session.identity.configDir,
     ]),
   );
-  const watcher = startProfileSyncWatcher(
+  const exitCode = await launchWithSession(
     cfg,
-    session.identity.name,
-    session.identity.configDir,
-    process.cwd(),
+    {
+      identity: { name: session.identity.name, configDir: session.identity.configDir },
+      configDirValue: session.identity.configDir,
+      cwd: process.cwd(),
+      syncAtLaunch: true,
+    },
+    {
+      path: binaryPath,
+      args: gatePluginArgs(session.toolName, resumeArgs(session.sessionId), process.cwd()),
+      env: {
+        [cfg.envVarName]: session.identity.configDir,
+        ...extraEnv,
+        [IDENTITY_SESSION_MARKER]: session.identity.name,
+      },
+    },
   );
-  const exitCode = await launchThenStartBackgroundSync(() =>
-    spawnReal(binaryPath, gatePluginArgs(session.toolName, resumeArgs(session.sessionId), process.cwd()), {
-      [cfg.envVarName]: session.identity.configDir,
-      ...extraEnv,
-      [IDENTITY_SESSION_MARKER]: session.identity.name,
-    }),
-  );
-  await watcher.stop();
   process.exit(exitCode);
 }
