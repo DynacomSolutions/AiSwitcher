@@ -271,10 +271,11 @@ async function oauthAccountUuid(dir: string): Promise<string | undefined> {
 export async function sameAccountDirs(identity: Identity, dirs: string[], tool: RefreshableTool = "claude"): Promise<string[]> {
   if (dirs.length === 0) return dirs;
   const own = await accountKeyOf(tool, identity.configDir);
-  if (own === undefined) return dirs;
+  // codex: a hybrid, partial or unreadable file has no account and is never a converge source or target (heal repairs it).
+  if (own === undefined) return tool === "codex" ? [] : dirs;
   const keep = await Promise.all(dirs.map(async (dir) => {
     const theirs = await accountKeyOf(tool, dir);
-    return theirs === undefined || theirs === own;
+    return tool === "codex" ? theirs === own : theirs === undefined || theirs === own;
   }));
   return dirs.filter((_, i) => keep[i]);
 }

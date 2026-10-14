@@ -264,7 +264,10 @@ async function readNativeCodex(path: string): Promise<StoreCopy | undefined> {
 }
 
 async function writeNativeCodex(path: string, grant: OAuthGrant, backups: Set<string>): Promise<void> {
-  const raw = ((await readJson(path)) as NativeCodexFile | undefined) ?? {};
+  const existing = (await readJson(path)) as NativeCodexFile | undefined;
+  // Present but unparsable (e.g. read mid-truncate): rebuilding from {} would drop id_token/account_id.
+  if (!existing && (await readFile(path, "utf8").then(() => true, () => false))) throw new Error(`${path} is present but unparsable; refusing to rewrite it`);
+  const raw = existing ?? {};
   const tokens = (raw.tokens && typeof raw.tokens === "object" ? raw.tokens : {}) as Record<string, unknown>;
   await backupOnce(path, backups);
   await writeJsonAtomic(path, {
