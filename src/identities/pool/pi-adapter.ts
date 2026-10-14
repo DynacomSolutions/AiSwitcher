@@ -59,7 +59,8 @@ export const piAdapter = createGrantFileAdapter({
   // "same": the pool file is the member's own, so the OAuth entries it rotated go back (only providers the
   // member already holds), each one checked: a different account claim, or tokens equal to another member's
   // entry (a copy of their rotating chain), are backed up and skipped; a merge first keeps the entry it
-  // replaces. "capture": other providers may belong to another member, so only kimi-coding moves.
+  // replaces. shortcut: "another member's entry" covers their vault and the entries their .pre-merge backups kept
+  // (so a copy of a chain they have since rotated is still caught); a copy of a chain AIS never saw is not. "capture": other providers may belong to another member, so only kimi-coding moves.
   newerInto: (owner, pool, mode, others) => {
     if (!owner) return { next: pool };
     const next: GrantFile = { ...owner };

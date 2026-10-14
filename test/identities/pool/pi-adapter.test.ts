@@ -282,6 +282,17 @@ describe("pi own-mode merge checks every provider entry", () => {
     expect(mergeBaks("a").length).toBe(1);
   });
 
+  test("a pool entry equal to a chain another member rotated away from (kept in their merge backup) is skipped", async () => {
+    await setup("a");
+    await set("a", { anthropic: entry("ANTH-R1", T0) });
+    await set("b", { anthropic: entry("ANTH-B2", T0 + 3600) });
+    await writeFile(join(dirOf("b"), "auth.json.pre-merge.20260101T000000000Z-abcd.bak"), JSON.stringify({ "replaced:anthropic": entry("ANTH-B1", T0) }));
+    await set("pool", { anthropic: entry("ANTH-B1", T0 + 8 * 3600) }); // b's old chain, copied into a's pool file
+    await swap("b");
+    expect((await parsed("a")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-R1");
+    expect(mergeBaks("a").length).toBe(1);
+  });
+
   test("an unclaimed, unshared newer entry is merged after a backup of the owner's previous entry", async () => {
     await setup("a");
     await set("a", { anthropic: entry("ANTH-R1", T0) });

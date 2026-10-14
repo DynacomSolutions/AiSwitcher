@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +65,12 @@ async function healPool() {
   return codexAdapter.heal!(pool, members);
 }
 
+/** Newest unique-stamped `auth.json.pre-<kind>.<stamp>.bak` in the pool dir. */
+const bakPath = (kind: "swap" | "heal") => {
+  const n = readdirSync(dirOf("pool")).filter((f) => new RegExp(`^auth\\.json\\.pre-${kind}\\.\\d{8}T\\d{9}Z-[0-9a-f]{4}\\.bak$`).test(f)).sort().at(-1);
+  return join(dirOf("pool"), n ?? `auth.json.pre-${kind}.MISSING.bak`);
+};
+
 describe("codex adapter registration", () => {
   test("is registered, not live, with heal and notify hooks", () => {
     expect(adapterFor("codex")).toBe(codexAdapter);
@@ -99,8 +106,8 @@ describe("codex swapCredentials", () => {
     expect(r.writeBack).toBe("none-unknown-owner");
     expect(await read("a")).toBe(before.a);
     expect(await read("b")).toBe(before.b);
-    expect(await readFile(join(dirOf("pool"), "auth.json.pre-swap.bak"), "utf8")).toContain("SYNTHETIC_FIXTURE-rt-acct-c-");
-    expect((await stat(join(dirOf("pool"), "auth.json.pre-swap.bak"))).mode & 0o777).toBe(0o600);
+    expect(await readFile(bakPath("swap"), "utf8")).toContain("SYNTHETIC_FIXTURE-rt-acct-c-");
+    expect((await stat(bakPath("swap"))).mode & 0o777).toBe(0o600);
   });
 
   test("a hybrid pool file is kept as a backup and never attributed", async () => {
@@ -159,7 +166,7 @@ describe("codex heal", () => {
     await put("pool", auth("acct-c", T0 + 1, { tag: "c1" }));
     const notes = await healPool();
     expect(notes.join(" ")).toContain("not a member");
-    expect(await readFile(join(dirOf("pool"), "auth.json.pre-heal.bak"), "utf8")).toContain("SYNTHETIC_FIXTURE-rt-c1");
+    expect(await readFile(bakPath("heal"), "utf8")).toContain("SYNTHETIC_FIXTURE-rt-c1");
     expect(await read("pool")).toBe(await read("a"));
     expect(await refreshToken("a")).toBe(`SYNTHETIC_FIXTURE-rt-acct-a-${T0}`);
   });
@@ -169,7 +176,7 @@ describe("codex heal", () => {
     await put("pool", auth("acct-b", T0 + 50, { fileAccount: "acct-a", tag: "hybrid" }));
     const notes = await healPool();
     expect(notes.join(" ")).toContain("hybrid");
-    const bak = join(dirOf("pool"), "auth.json.pre-heal.bak");
+    const bak = bakPath("heal");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-rt-hybrid");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
     expect(await read("pool")).toBe(await read("a"));

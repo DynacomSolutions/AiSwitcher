@@ -227,6 +227,27 @@ describe("tool lock upkeep", () => {
     expect(readdirSync(lock)).toEqual([]); // nothing inside the tool's own lock directory
   });
 
+  test("without birth times, a re-taken lock with the same inode is not ours (mtime differs); the owned one is still released", async () => {
+    const real = grantFileTuning.statLock;
+    grantFileTuning.statLock = async (p) => { const s = await real(p); return { ino: 1, birthtimeMs: 0, mtimeMs: s.mtimeMs }; };
+    try {
+      const lock = join(root, "x.lock");
+      await withToolLock(fake, root, async () => {
+        await rm(lock, { recursive: true });
+        await mkdir(lock);
+        const theirs = new Date(Date.now() - 5_000);
+        await utimes(lock, theirs, theirs);
+      });
+      expect((await stat(lock)).isDirectory()).toBe(true);
+      await rm(lock, { recursive: true });
+      await rm(`${lock}.owner`, { force: true });
+      await withToolLock(fake, root, async () => undefined);
+      await expect(stat(lock)).rejects.toThrow();
+    } finally {
+      grantFileTuning.statLock = real;
+    }
+  });
+
   test("a lock that now belongs to someone else is not removed on release", async () => {
     grantFileTuning.toolLockUpdateMs = 30;
     const lock = join(root, "x.lock");
@@ -380,5 +401,19 @@ describe("kimi pool refresh integration", () => {
     await put("pool", creds("user-b", T0 + 50, { tag: "b-in-pool" }));
     await persistKimiCredentials(member("a"), "kimi", rotated("user-a", "a-rot2"));
     expect(await refreshToken("pool")).toBe("SYNTHETIC_FIXTURE-rt-b-in-pool");
+  });
+
+  test("pruning touches only exact-format backups of the same kind and never the one just written, even if the clock stepped back", async () => {
+    await setup();
+    const dir = join(dirOf("pool"), "credentials");
+    const names = ["kimi-code.json.pre-heal.notes.bak", "kimi-code.json.pre-heal.bak", "kimi-code.json.pre-swap.20200101T000000000Z-abcd.bak", "other.json.pre-heal.20200101T000000000Z-abcd.bak", "kimi-code.json.pre-heal.20200101T000000000Z-abcd.bak.keep"];
+    for (const n of names) await writeFile(join(dir, n), "keep me");
+    for (let i = 0; i < 11; i++) await writeFile(join(dir, `kimi-code.json.pre-heal.20990101T0000000${String(i).padStart(2, "0")}Z-000${i % 10}.bak`), "future");
+    await put("pool", creds("user-c", T0 + 1, { tag: "stepback" }));
+    await healPool(); // stamped now, older than every "future" backup
+    for (const n of names) expect(await readFile(join(dir, n), "utf8")).toBe("keep me");
+    const baks = bakFiles(dir, "kimi-code.json", "heal").filter((f) => /\.\d{8}T\d{9}Z-[0-9a-f]{4}\.bak$/.test(f));
+    expect(baks.length).toBe(10);
+    expect((await Promise.all(baks.map((f) => readFile(f, "utf8")))).some((t) => t.includes("SYNTHETIC_FIXTURE-rt-stepback"))).toBe(true);
   });
 });

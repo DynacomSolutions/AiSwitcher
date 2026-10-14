@@ -11,6 +11,7 @@ import { CODEX_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
 import type { PoolAdapter, PoolUsage, SwapResult, WriteBackOutcome } from "./adapter.ts";
 import { writeFileAtomic } from "./fs.ts";
+import { writeBackup } from "./grant-file-adapter.ts";
 import type { LockOptions } from "./lock.ts";
 import { SwapPoolError, type PoolIdentity } from "./swap-pool.ts";
 
@@ -145,8 +146,7 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
     }
     // A live grant we cannot attribute is never silently destroyed.
     if ((writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && poolText !== undefined) {
-      const backup = `${poolPath}.pre-swap.bak`;
-      await writeFileAtomic(backup, poolText);
+      const backup = await writeBackup(poolPath, "swap", poolText);
       notes.push(`live pool credentials could not be attributed to a member; kept a 0600 copy at ${backup}`);
     }
 
@@ -250,12 +250,10 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
         const outcome = await writeBackToOwner(owner, now.auth!, lock, true);
         notes.push(`pool ${pool.name} held "${owner.name}"'s account instead of "${activeName}"; ${outcome === "written" ? `captured it into "${owner.name}"` : `left "${owner.name}" as it was (${outcome})`}`);
       } else {
-        await writeFileAtomic(`${poolPath}.pre-heal.bak`, now.text!);
-        notes.push(`pool ${pool.name} held an account that is not a member; kept a 0600 copy at ${poolPath}.pre-heal.bak`);
+        notes.push(`pool ${pool.name} held an account that is not a member; kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
       }
     } else if (now.kind === "hybrid") {
-      await writeFileAtomic(`${poolPath}.pre-heal.bak`, now.text!);
-      notes.push(`pool ${pool.name} auth.json was hybrid (account_id disagrees with its token); kept a 0600 copy at ${poolPath}.pre-heal.bak`);
+      notes.push(`pool ${pool.name} auth.json was hybrid (account_id disagrees with its token); kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
     } else {
       notes.push(`pool ${pool.name} auth.json was empty or partial`);
     }
