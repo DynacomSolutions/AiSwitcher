@@ -2,13 +2,25 @@
 
 _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 504-543 566-588). Read before touching this area._
 
-- **No `execve`-style process replacement.** Bun has no non-experimental
-  primitive for true process-image replacement, so `src/shared/exec.ts` uses
-  `Bun.spawn` with full fd inheritance (`stdio: ["inherit","inherit","inherit"]`)
-  plus explicit signal relay (SIGINT/SIGTERM/SIGHUP/SIGQUIT/SIGTSTP) and
-  exit-code/signal-code mirroring. This is the same model nvm/asdf/direnv-style
-  shims use. The one accepted gap: an uncatchable SIGKILL sent to the wrapper
-  itself orphans the child rather than killing it too.
+- **The shim execs the real tool; a detached sidecar does the session work.**
+  A wrapper that stays alive as the TUI's parent orphans the TUI when it dies
+  (2026-10-14: a JSC GC segfault in the codex shim left codex drawing in the
+  background, mouse tracking on, over the shell's prompt). So `runWrapper` (and
+  `ais resume`) do all setup, spawn `<self> __session-sidecar` (own session, stdio
+  `/dev/null`, spec in `AIS_SESSION_SIDECAR_SPEC`; see `session-sidecar.ts`), then
+  `execve` the real binary over the shim (`execve.ts`, libc via `bun:ffi`, Linux
+  only), so the tool keeps the shim's PID, parent and terminal. The sidecar polls
+  the PID (`/proc` start-time guarded; Bun has no pidfd), runs the profile-sync
+  watcher and `HerdrTabTitleWatcher` meanwhile, and on exit does the post-exit
+  sync. It must never touch the terminal. `execve` also clears ignored signals
+  (Bun ignores SIGPIPE/SIGXFSZ), the blocked mask and non-CLOEXEC descriptors so
+  the child sees what `Bun.spawn` would have given it. Fallbacks: execve
+  unavailable (macOS, no FFI, exec error) keeps the old `Bun.spawn` path in
+  `exec.ts` (inherited stdio, signal relay SIGINT/SIGTERM/SIGHUP/SIGQUIT/SIGTSTP,
+  exit-code mirroring) with the sidecar still doing the session work; a sidecar
+  that cannot start falls back to the fully in-process legacy flow.
+  `execReal` (usage passthrough, `open`) tries execve first; `ais upgrade` and
+  `ais herdr` keep `spawnReal` (sequential or follow-up work after the child).
 - **Shims install to `~/.local/bin`, not a dedicated shim directory.** This
   conventional user binary directory must precede vendor install directories
   on `PATH` for the wrappers to intercept commands.
