@@ -49,5 +49,13 @@ export async function performPoolSwap(adapter: PoolAdapter<any>, options: Perfor
       options.ledgerPath ?? ledgerPathFor(adapter.tool),
     );
   }
-  return { ...fsResult, reason: options.reason };
+  let runningSessions: number | undefined;
+  if (!fsResult.noop && adapter.notifySwapped) {
+    try {
+      runningSessions = (await adapter.notifySwapped({ ...pool, swapPool: { ...pool.swapPool, active: target.name } }, fsResult.from, target.name))?.sessions;
+    } catch {
+      // notification is best effort
+    }
+  }
+  return { ...fsResult, reason: options.reason, ...(runningSessions !== undefined ? { runningSessions } : {}) };
 }

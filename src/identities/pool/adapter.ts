@@ -37,6 +37,9 @@ export interface SwapResult {
   noop: boolean;
   writeBack: WriteBackOutcome;
   notes: string[];
+  /** Running sessions that cannot follow the swap (set by `notifySwapped`
+   * for `liveSwap: false` adapters). */
+  runningSessions?: number;
 }
 
 /** Minimum a usage reading must carry for the core to decide on it. */
@@ -75,4 +78,12 @@ export interface PoolAdapter<U extends PoolUsage = PoolUsage> {
   /** Utilisation of one member. `deps` is the caller's opaque dependency bag
    * (test hooks, fetch implementations). Never throws for provider errors. */
   fetchUsage(member: Identity, deps?: unknown): Promise<U>;
+  /** Called by the core after the ledger append of a real swap. Best effort:
+   * errors are swallowed. A `liveSwap: false` adapter uses it to tell running
+   * sessions to relaunch; the returned count is surfaced on the result. */
+  notifySwapped?(pool: PoolIdentity, from: string | null, to: string): Promise<{ sessions?: number } | void>;
+  /** Repairs the pool folder if something outside the core damaged it (e.g. a
+   * running session rewriting its own account). Called by the scheduler each
+   * tick, under the pool lock, before the swap check. Optional. */
+  heal?(pool: PoolIdentity, members: Identity[], lock?: LockOptions): Promise<string[]>;
 }

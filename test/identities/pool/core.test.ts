@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PoolAdapter, PoolUsage } from "../../../src/identities/pool/adapter.ts";
 import { appendSwapEvent, ledgerPathFor, readSwapEvents } from "../../../src/identities/pool/ledger.ts";
+import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
 import { chooseBest, swapIfLimited } from "../../../src/identities/pool/ops.ts";
 import { PoolSwapScheduler } from "../../../src/identities/pool/scheduler.ts";
 import { aisClaudeSwapLedgerPath, aisSwapLedgerPath } from "../../../src/shared/ais-home.ts";
@@ -77,5 +78,25 @@ describe("generic pool core", () => {
     expect(seen).toEqual(["claude:pool", "codex:pool"]);
     const st = await sched.status();
     expect(st.pools.map((p) => p.tool)).toEqual(["claude", "codex"]);
+  });
+
+  test("liveSwap:false adapter still swaps and notifySwapped runs after the ledger append", async () => {
+    const registry = join(root, "codex.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "codex-swap.jsonl");
+    const calls: string[] = [];
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("codex", registry, { a: 99, b: 5 }),
+      notifySwapped: async (pool, from, to) => {
+        calls.push(`${pool.name}:${from}->${to}:${(await readSwapEvents(ledger)).length}`);
+        return { sessions: 2 };
+      },
+    };
+    const r = await swapIfLimited(adapter, { ledgerPath: ledger }, "pool", "auto");
+    expect(r.action === "swapped" && r.result.runningSessions).toBe(2);
+    expect(calls).toEqual(["pool:a->b:1"]);
+    const throwing: PoolAdapter = { ...adapter, notifySwapped: async () => { throw new Error("boom"); } };
+    const back = await performPoolSwap(throwing, { registryPath: registry, ledgerPath: ledger, target: "a", reason: "manual" });
+    expect(back.to).toBe("a");
   });
 });
