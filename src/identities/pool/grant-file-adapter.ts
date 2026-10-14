@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, utimes } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { LimitWindow } from "../../cli/limits/types.ts";
 import { withOauthRefreshLock } from "../claude-swap-lock.ts";
@@ -32,6 +32,8 @@ export const grantFileTuning = {
   healRetryMs: 200,
   /** How long to wait for the tool's own credential lock before giving up. */
   toolLockWaitMs: 3_000,
+  /** How often a held tool lock's mtime is refreshed; default half its stale time, at most 5s. */
+  toolLockUpdateMs: undefined as number | undefined,
 };
 
 export interface GrantFileSpec {
@@ -93,8 +95,11 @@ export function usageFromLimits(results: Array<{ status: string; windows: LimitW
 }
 
 /** Takes a proper-lockfile style lock (a directory next to the file) around
- * the tool's own refresh critical section, so a swap never lands mid-refresh. */
-async function withToolLock<T>(spec: GrantFileSpec, configDir: string, fn: () => Promise<T>): Promise<T> {
+ * the tool's own refresh critical section, so a swap never lands mid-refresh.
+ * Like proper-lockfile, the holder keeps the lock's mtime fresh (the tool
+ * breaks locks older than its stale time) and, on release, removes only a
+ * lock it still owns (its mtime is the one we last wrote). */
+export async function withToolLock<T>(spec: GrantFileSpec, configDir: string, fn: () => Promise<T>): Promise<T> {
   const { path, staleMs } = spec.toolLock(expandPath(configDir));
   await mkdir(dirname(path), { recursive: true });
   const deadline = Date.now() + grantFileTuning.toolLockWaitMs;
@@ -113,10 +118,25 @@ async function withToolLock<T>(spec: GrantFileSpec, configDir: string, fn: () =>
       await sleep(50);
     }
   }
+  let mine = Math.floor(Date.now());
+  const owned = async () => (await stat(path).then((s) => Math.abs(s.mtimeMs - mine) < 2, () => false));
+  const touch = async () => {
+    mine = Math.floor(Date.now());
+    await utimes(path, mine / 1000, mine / 1000).catch(() => undefined);
+  };
+  await touch();
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void owned().then((ok) => (ok ? touch() : undefined)).finally(() => { busy = false; });
+  }, grantFileTuning.toolLockUpdateMs ?? Math.min(staleMs / 2, 5_000));
   try {
     return await fn();
   } finally {
-    await rm(path, { recursive: true, force: true });
+    clearInterval(timer);
+    while (busy) await sleep(5);
+    if (await owned()) await rm(path, { recursive: true, force: true });
   }
 }
 

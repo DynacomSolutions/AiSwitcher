@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { persistKimiCredentials } from "../../../src/cli/limits/kimi-store.ts";
 import { refreshIdentityOAuthGrant } from "../../../src/identities/oauth-refresh.ts";
-import { grantFileTuning } from "../../../src/identities/pool/grant-file-adapter.ts";
+import { grantFileTuning, withToolLock, type GrantFileSpec } from "../../../src/identities/pool/grant-file-adapter.ts";
 import { kimiAdapter } from "../../../src/identities/pool/kimi-adapter.ts";
 import { readSwapEvents } from "../../../src/identities/pool/ledger.ts";
 import { adapterFor } from "../../../src/identities/pool/registry.ts";
@@ -190,6 +190,37 @@ describe("kimi swap to the account the pool holds", () => {
     expect((await swap("a")).writeBack).toBe("written");
     expect(await refreshToken("a")).toBe("SYNTHETIC_FIXTURE-rt-a-rt2");
     expect(await refreshToken("pool")).toBe("SYNTHETIC_FIXTURE-rt-a-rt2");
+  });
+});
+
+describe("tool lock upkeep", () => {
+  const fake = { label: "T", toolLock: (dir: string) => ({ path: join(dir, "x.lock"), staleMs: 5_000 }) } as unknown as GrantFileSpec;
+  const mtime = async (path: string) => (await stat(path)).mtimeMs;
+
+  test("the held lock's mtime is refreshed so the CLI never sees it as stale", async () => {
+    grantFileTuning.toolLockUpdateMs = 30;
+    const lock = join(root, "x.lock");
+    await withToolLock(fake, root, async () => {
+      const first = await mtime(lock);
+      await new Promise((r) => setTimeout(r, 250));
+      expect(await mtime(lock)).toBeGreaterThan(first + 60);
+    });
+    grantFileTuning.toolLockUpdateMs = undefined;
+    await expect(stat(lock)).rejects.toThrow();
+  });
+
+  test("a lock that now belongs to someone else is not removed on release", async () => {
+    grantFileTuning.toolLockUpdateMs = 30;
+    const lock = join(root, "x.lock");
+    await withToolLock(fake, root, async () => {
+      await rm(lock, { recursive: true });
+      await mkdir(lock);
+      const theirs = new Date(Date.now() - 2_000);
+      await utimes(lock, theirs, theirs);
+      await new Promise((r) => setTimeout(r, 100));
+    });
+    grantFileTuning.toolLockUpdateMs = undefined;
+    expect((await stat(lock)).isDirectory()).toBe(true);
   });
 });
 
