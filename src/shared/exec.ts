@@ -2,6 +2,7 @@ import { realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { homedir } from "node:os";
 import { chdir } from "node:process";
+import { tryExecve } from "./execve.ts";
 
 const FORWARD_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"] as const;
 
@@ -91,7 +92,7 @@ const SESSION_MARKER_PATTERN = /^(CLAUDE|CODEX|GROK|AI_AGENT|CRUSH|ALI|OPENCODE_
  */
 export const IDENTITY_SESSION_MARKER = "AI_PROFILE_SWITCHER_SESSION";
 
-function buildChildEnv(extraEnv: Record<string, string>): Record<string, string | undefined> {
+export function buildChildEnv(extraEnv: Record<string, string>): Record<string, string | undefined> {
   const cleaned: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(process.env)) {
     // GROK_MEMORY is the one intentional exception. Keep the exact key
@@ -156,15 +157,28 @@ export async function spawnReal(
 }
 
 /**
- * No true `execve`-style process-image replacement exists in Bun without
- * experimental FFI, so this is `spawnReal` followed by `process.exit` —
- * the same model nvm/asdf/direnv-style shims use. Never returns.
+ * Replaces the current process image with the real binary (libc `execve`
+ * via bun:ffi), so the real tool inherits this PID and terminal and nothing
+ * of ours can die underneath it. Never returns on success; returns `false`
+ * (unsupported platform, FFI unavailable, execve failed) and the caller
+ * falls back to `spawnReal`. Environment is built exactly as `spawnReal`
+ * builds it.
+ */
+export function execveReal(cmdPath: string, args: string[], extraEnv: Record<string, string>): boolean {
+  return tryExecve(cmdPath, [cmdPath, ...args], buildChildEnv(extraEnv));
+}
+
+/**
+ * Single-invocation, never-returns launch: `execve` when possible, otherwise
+ * `spawnReal` followed by `process.exit` (the nvm/asdf/direnv shim model).
+ * Use it only where there is no post-exit work for this process to do.
  */
 export async function execReal(
   cmdPath: string,
   args: string[],
   extraEnv: Record<string, string>,
 ): Promise<never> {
+  execveReal(cmdPath, args, extraEnv);
   const exitCode = await spawnReal(cmdPath, args, extraEnv);
   process.exit(exitCode);
 }
