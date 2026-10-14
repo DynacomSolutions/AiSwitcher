@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, statusLine, others, entriesFor } from './model'
+import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, statusLine, switchNotice, others, entriesFor } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -118,4 +118,14 @@ test('bandRows accepts cached member limits', async () => {
   const rows = bandRows(resolveCurrent(cached, '/c/swap', null), null, cached)
   expect(rows.map(x => x.name)).toEqual(['session', 'week'])
   expect(rows[0]!.active).toBe(4)
+})
+
+test('switchNotice: first observation, no change, change', () => {
+  const st = { pool: 'p', active: 'b', auto: true, thresholdPercent: 90, accounts: [] } as SwapStatus
+  expect(switchNotice('', st)).toBeUndefined()
+  expect(switchNotice('b', st)).toBeUndefined()
+  expect(switchNotice('a', null)).toBeUndefined()
+  expect(switchNotice('a', st)).toBe(
+    'AIS pool p switched account from a to b since your last turn; limits shown now refer to b.',
+  )
 })
