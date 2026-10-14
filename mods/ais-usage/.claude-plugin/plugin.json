@@ -1,0 +1,9 @@
+{
+  "name": "ais-usage",
+  "version": "0.1.0",
+  "description": "AIS pool and identity usage pane",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "DynacomSolutions"
+  }
+}

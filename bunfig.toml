@@ -1,0 +1,3 @@
+[test]
+# mods/ tests need the Claude Code engine (`claude plugin test`), not bun.
+pathIgnorePatterns = ["mods/**"]

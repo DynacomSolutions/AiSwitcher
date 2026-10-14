@@ -1,0 +1,6 @@
+{
+  "name": "aiswitcher",
+  "description": "AiSwitcher Claude Code mods",
+  "owner": { "name": "DynacomSolutions" },
+  "plugins": [{ "name": "ais-usage", "source": "./mods/ais-usage" }]
+}
