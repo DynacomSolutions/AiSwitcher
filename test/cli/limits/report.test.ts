@@ -324,6 +324,12 @@ describe("swap pool row", () => {
     expect(out.indexOf("pool-x")).toBeGreaterThan(out.indexOf("identity-a  "));
   });
 
+  test("a codex pool mirrors its active codex member, not a claude one of that name", () => {
+    const codexPool = { ...pool(), toolName: "codex" as const };
+    expect(formatLimitsReport([claudeAcme(), codexPool], NOW, "⠋", { width: 100, columns: false })).not.toContain("active member");
+    expect(formatLimitsReport([claudeAcme(), codexPool, { ...codexAcme(), identity: identity("identity-a") }], NOW, "⠋", { width: 100, columns: false })).toContain("→ active member: identity-a");
+  });
+
   test("a pool whose active member is not in the report keeps its own windows", () => {
     const out = formatLimitsReport([pool()], NOW, "⠋", { width: 100, columns: false });
     expect(out).not.toContain("active member");

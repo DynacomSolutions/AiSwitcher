@@ -180,4 +180,10 @@ describe("isMirroredPoolTarget", () => {
     expect(isMirroredPoolTarget(p, [p])).toBe(false);
     expect(isMirroredPoolTarget(pool(), [member, pool()])).toBe(false);
   });
+
+  test("codex pools mirror their active codex member, never a same-named claude one", () => {
+    const p = { ...pool("a"), toolName: "codex" as const };
+    expect(isMirroredPoolTarget(p, [target("codex", "a"), p])).toBe(true);
+    expect(isMirroredPoolTarget(p, [target("claude", "a"), p])).toBe(false);
+  });
 });

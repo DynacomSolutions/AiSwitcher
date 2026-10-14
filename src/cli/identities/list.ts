@@ -62,8 +62,8 @@ function pad(text: string, width: number): string {
 }
 
 /**
- * One block per claude pool, kept apart from the identity tree: a pool
- * is a shared Claude folder whose grant is swapped between member accounts,
+ * One block per swap pool (any tool), kept apart from the identity tree: a pool
+ * is a shared tool folder whose grant is swapped between member accounts,
  * not an identity of its own. Lists every member with its active and allowed
  * state, from the registry alone (no network).
  */

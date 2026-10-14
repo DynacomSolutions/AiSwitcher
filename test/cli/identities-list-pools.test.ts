@@ -75,6 +75,14 @@ describe("ais identities list: pools", () => {
     expect(c).not.toContain("active");
   });
 
+  test("a codex pool is listed apart like a claude pool", async () => {
+    const cfg = { ...(await makeClaude([member("solo", "Solo"), member("acct-a", "A"), member("acct-b", "B"), { ...member("cpool", "C Pool"), swapPool: { accounts: ["acct-a", "acct-b"], active: "acct-a", disallowed: ["acct-b"] } }])), toolName: "codex" as const };
+    const [tree, section] = (await render(cfg)).split("codex pools (not identities)");
+    expect(tree).not.toContain("cpool");
+    expect(section!.split("\n").find((l) => l.includes("acct-a"))).toContain("active");
+    expect(section).toContain("no (disallowed)");
+  });
+
   test("registry without pools prints no pool section", async () => {
     const cfg = await makeClaude([member("solo", "Solo")]);
     expect(await render(cfg)).not.toContain("claude pools");
