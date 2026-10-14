@@ -224,7 +224,15 @@ export const bandRows = (r: Resolved, status: SwapStatus | null, limits: LimitsE
     const me = accounts.find(a => a.name === r.current)
     for (const [name, key] of [['session', 'fiveHour'], ['week', 'sevenDay']] as const) {
       const w = me?.usage?.[key]
-      if (w) out.push({ name, active: w.utilization, resets: resetLabel(w.resetsAt, name), pool: poolWindowPct(accounts, key) })
+      const pool = poolWindowPct(accounts, key)
+      if (w) {
+        out.push({ name, active: w.utilization, resets: resetLabel(w.resetsAt, name), pool })
+        continue
+      }
+      // The usage endpoint answers HTTP 429 for every member at times: fall back to the member's own limits entry.
+      const lw = entriesFor(limits, r.current).find(l => l.toolName === 'claude' && l.status === 'live')
+      const f = lw && pick(lw.windows, name)
+      if (f) out.push({ name, active: f.usedPercent, resets: resetLabel(f.resetsAtMs ?? f.resetsAt, name), pool })
     }
   } else {
     const e = entriesFor(limits, r.current).find(l => l.toolName === 'claude')
