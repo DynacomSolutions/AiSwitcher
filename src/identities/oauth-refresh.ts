@@ -15,7 +15,8 @@ import { expandPath } from "./match.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "./store.ts";
 import { isRetired } from "./retired.ts";
 import { CLAUDE_CONFIG, PI_CONFIG } from "./tool-configs.ts";
-import { isSwapPool, poolsHoldingMember } from "./swap-pool.ts";
+import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
+import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
 import type { Identity } from "./types.ts";
 import { persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
@@ -226,13 +227,28 @@ export interface WriteThroughReport {
  * the pool's .credentials.json is just another store of the same grant, so
  * every refresh must write through to it and every freshest-copy pick must
  * consider it; otherwise the daemon would fork the rotating refresh token. */
-export async function poolStoreDirsFor(identity: Identity, registryPath?: string): Promise<string[]> {
+export async function poolStoreDirsFor(identity: Identity, registryPath?: string, tool: RefreshableTool = "claude"): Promise<string[]> {
   try {
-    const file = await loadIdentitiesFile(registryPath ?? CLAUDE_CONFIG.identitiesJsonPath);
-    return sameAccountDirs(identity, poolsHoldingMember(file, identity.name).map((pool) => pool.configDir));
+    const file = await loadIdentitiesFile(registryPath ?? (await poolAdapterFor(tool))?.config.identitiesJsonPath ?? CLAUDE_CONFIG.identitiesJsonPath);
+    return sameAccountDirs(identity, poolsHoldingMember(file, identity.name).map((pool) => pool.configDir), tool);
   } catch {
     return [];
   }
+}
+
+/** The tool's pool adapter, if any. Imported lazily: the adapter registry
+ * reaches this module through claude-usage-api, so a static import would be a cycle. */
+async function poolAdapterFor(tool: RefreshableTool) {
+  return (await import("./pool/registry.ts")).adapterFor(tool as "claude");
+}
+
+/** Test hook registry for a tool's pools: `poolRegistryPath`, or the claude alias for claude. */
+const registryOf = (tool: RefreshableTool, options: { poolRegistryPath?: string; claudeRegistryPath?: string }): string | undefined =>
+  options.poolRegistryPath ?? (tool === "claude" ? options.claudeRegistryPath : undefined);
+
+/** The account a store belongs to, when it records one (claude: oauthAccount uuid; codex: account_id). */
+async function accountKeyOf(tool: RefreshableTool, dir: string): Promise<string | undefined> {
+  return tool === "codex" ? codexAccountIdOfDir(dir) : oauthAccountUuid(dir);
 }
 
 async function oauthAccountUuid(dir: string): Promise<string | undefined> {
@@ -252,13 +268,14 @@ async function oauthAccountUuid(dir: string): Promise<string | undefined> {
  * say "active = this member" while the pool already holds another account's
  * grant; that grant must never be converged into the member's store. An
  * unknown uuid on either side cannot be compared and is kept. */
-export async function sameAccountDirs(identity: Identity, dirs: string[]): Promise<string[]> {
+export async function sameAccountDirs(identity: Identity, dirs: string[], tool: RefreshableTool = "claude"): Promise<string[]> {
   if (dirs.length === 0) return dirs;
-  const own = await oauthAccountUuid(identity.configDir);
-  if (own === undefined) return dirs;
+  const own = await accountKeyOf(tool, identity.configDir);
+  // codex: a hybrid, partial or unreadable file has no account and is never a converge source or target (heal repairs it).
+  if (own === undefined) return tool === "codex" ? [] : dirs;
   const keep = await Promise.all(dirs.map(async (dir) => {
-    const theirs = await oauthAccountUuid(dir);
-    return theirs === undefined || theirs === own;
+    const theirs = await accountKeyOf(tool, dir);
+    return tool === "codex" ? theirs === own : theirs === undefined || theirs === own;
   }));
   return dirs.filter((_, i) => keep[i]);
 }
@@ -294,7 +311,7 @@ export async function writeGrantThroughStores(
   tool: RefreshableTool,
   identity: Identity,
   grant: OAuthGrant,
-  options: { entryKey?: string; piDir?: string; claudeRegistryPath?: string; locksHeld?: boolean; poolDirs?: string[] } = {},
+  options: { entryKey?: string; piDir?: string; claudeRegistryPath?: string; poolRegistryPath?: string; locksHeld?: boolean; poolDirs?: string[] } = {},
 ): Promise<WriteThroughReport> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
@@ -322,10 +339,10 @@ export async function writeGrantThroughStores(
   } catch (err) {
     failed.push({ path: `native:${identity.configDir}`, error: err instanceof Error ? err.message : String(err) });
   }
-  if (tool === "claude") {
-    for (const poolDir of options.poolDirs ?? (await poolStoreDirsFor(identity, options.claudeRegistryPath))) {
+  if (await poolAdapterFor(tool)) {
+    for (const poolDir of options.poolDirs ?? (await poolStoreDirsFor(identity, registryOf(tool, options), tool))) {
       try {
-        const write = () => writeProviderGrantCopy("claude", poolDir, grant, { backups });
+        const write = () => writeProviderGrantCopy(tool as NativeReconcilableTool, poolDir, grant, { backups });
         await (options.locksHeld ? write() : withOauthRefreshLock(poolDir, write));
         written.push(`pool:${poolDir}`);
       } catch (err) {
@@ -404,19 +421,20 @@ export const DEFAULT_EXPIRY_WINDOW_HOURS = 24;
  * store and the pool store(s). Undefined when no pool holds it (the normal
  * path then applies unchanged). */
 async function freshestWithPools(
+  tool: RefreshableTool,
   identity: Identity,
   registryPath?: string,
   lockedPoolDirs?: string[],
 ): Promise<{ grant: OAuthGrant; entryKey?: string; rawEntry?: Record<string, unknown>; source: string } | undefined> {
-  const poolDirs = lockedPoolDirs ?? (await poolStoreDirsFor(identity, registryPath));
+  const poolDirs = lockedPoolDirs ?? (await poolStoreDirsFor(identity, registryPath, tool));
   if (poolDirs.length === 0) return undefined;
   const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
-  let best = await readProviderGrantCopy("claude", identity.configDir);
+  let best = await readProviderGrantCopy(tool as NativeReconcilableTool, identity.configDir);
   for (const dir of poolDirs) {
-    const copy = await readProviderGrantCopy("claude", dir);
+    const copy = await readProviderGrantCopy(tool as NativeReconcilableTool, dir);
     if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
   }
-  return best ? { grant: best.grant, source: `claude store:${best.path}` } : undefined;
+  return best ? { grant: best.grant, source: `${tool} store:${best.path}` } : undefined;
 }
 
 /** Makes the member's own store and every pool store hold the same (freshest)
@@ -428,13 +446,14 @@ export async function convergeClaudePoolStores(
   registryPath?: string,
   locksHeld = false,
   lockedPoolDirs?: string[],
+  tool: RefreshableTool = "claude",
 ): Promise<{ written: string[]; failed: Array<{ path: string; error: string }> }> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
-  const poolDirs = lockedPoolDirs ?? (await poolStoreDirsFor(identity, registryPath));
+  const poolDirs = lockedPoolDirs ?? (await poolStoreDirsFor(identity, registryPath, tool));
   if (poolDirs.length === 0) return { written, failed };
   const dirs = [identity.configDir, ...poolDirs];
-  const copies = await Promise.all(dirs.map((dir) => readProviderGrantCopy("claude", dir)));
+  const copies = await Promise.all(dirs.map((dir) => readProviderGrantCopy(tool as NativeReconcilableTool, dir)));
   const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
   let best: { grant: OAuthGrant } | undefined;
   for (const copy of copies) if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
@@ -449,7 +468,7 @@ export async function convergeClaudePoolStores(
     try {
       return await withOauthRefreshLocks(poolDirs, () =>
         withOauthRefreshLock(identity.configDir, async () =>
-          convergeClaudePoolStores(identity, registryPath, true, await sameAccountDirs(identity, poolDirs)),
+          convergeClaudePoolStores(identity, registryPath, true, await sameAccountDirs(identity, poolDirs, tool), tool),
         ),
       );
     } catch (err) {
@@ -461,7 +480,7 @@ export async function convergeClaudePoolStores(
   for (let i = 0; i < dirs.length; i++) {
     if (same(copies[i])) continue;
     try {
-      await writeProviderGrantCopy("claude", dirs[i]!, best.grant);
+      await writeProviderGrantCopy(tool as NativeReconcilableTool, dirs[i]!, best.grant);
       written.push(dirs[i]!);
     } catch (err) {
       failed.push({ path: dirs[i]!, error: err instanceof Error ? err.message : String(err) });
@@ -489,8 +508,8 @@ async function freshestGrant(
       source: "kimi stores (freshest)",
     };
   }
-  if (tool === "claude") {
-    const pooled = await freshestWithPools(identity, claudeRegistryPath, lockedPoolDirs);
+  if (await poolAdapterFor(tool)) {
+    const pooled = await freshestWithPools(tool, identity, claudeRegistryPath, lockedPoolDirs);
     if (pooled) return pooled;
   }
   const piDir = (await piIdentityFor(identity.name))?.configDir;
@@ -543,6 +562,8 @@ export interface OAuthRefreshOptions {
   now?: () => number;
   /** Test hook: claude registry that lists swap pools. */
   claudeRegistryPath?: string;
+  /** Test hook: registry that lists this tool's swap pools (claudeRegistryPath is the claude alias). */
+  poolRegistryPath?: string;
   /** Internal: the caller already holds every claude `.oauth_refresh.lock`. */
   locksHeld?: boolean;
   /** Internal: the pool dirs that were locked (never re-read from the registry under the locks). */
@@ -561,7 +582,9 @@ export async function refreshIdentityOAuthGrant(
   identity: Identity,
   options: OAuthRefreshOptions = {},
 ): Promise<IdentityGrantRefresh> {
-  if (tool !== "claude" && !isRetired(identity)) {
+  const pooled = (await poolAdapterFor(tool)) !== undefined;
+  const registryPath = registryOf(tool, options);
+  if (!pooled && !isRetired(identity)) {
     // Never-logged-in identity: don't mkdir its configDir (via the lock) every tick.
     if (!options.force && !(await stat(identity.configDir).then(() => true, () => false))) {
       return {
@@ -580,7 +603,7 @@ export async function refreshIdentityOAuthGrant(
       throw err;
     }
   }
-  if (tool !== "claude" || options.locksHeld || isRetired(identity) || isSwapPool(identity)) {
+  if (!pooled || options.locksHeld || isRetired(identity) || isSwapPool(identity)) {
     return refreshGrantUnlocked(tool, identity, options);
   }
   // Claude Code rotates the refresh token under <configDir>/.oauth_refresh.lock.
@@ -589,11 +612,11 @@ export async function refreshIdentityOAuthGrant(
   // a second AIS pass can race the rotation. The inner call re-reads the
   // freshest copy under the locks, so a grant refreshed meanwhile is skipped.
   // Heal diverged member/pool stores every tick (locks each dir as it writes), even when nothing is due.
-  await convergeClaudePoolStores(identity, options.claudeRegistryPath).catch(() => undefined);
-  const poolDirs = await poolStoreDirsFor(identity, options.claudeRegistryPath);
+  await convergeClaudePoolStores(identity, registryPath, false, undefined, tool).catch(() => undefined);
+  const poolDirs = await poolStoreDirsFor(identity, registryPath, tool);
   if (!options.force) {
     // Cheap pre-check without locks: don't contend with Claude Code when there is nothing to do.
-    const peek = await freshestGrant(tool, identity, options.claudeRegistryPath, poolDirs).catch(() => undefined);
+    const peek = await freshestGrant(tool, identity, registryPath, poolDirs).catch(() => undefined);
     if (!peek?.grant.refresh_token) {
       return {
         tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [],
@@ -634,7 +657,9 @@ async function refreshGrantUnlocked(
   options: OAuthRefreshOptions,
 ): Promise<IdentityGrantRefresh> {
   // Under the locks, re-verify the account of each pool dir (a swap may have landed while we waited).
-  if (options.lockedPoolDirs) options = { ...options, lockedPoolDirs: await sameAccountDirs(identity, options.lockedPoolDirs) };
+  if (options.lockedPoolDirs) options = { ...options, lockedPoolDirs: await sameAccountDirs(identity, options.lockedPoolDirs, tool) };
+  const pooled = (await poolAdapterFor(tool)) !== undefined;
+  const registryPath = registryOf(tool, options);
   const base: IdentityGrantRefresh = { tool, identity: identity.name, outcome: "failed", detail: "", written: [], writeFailures: [] };
   const now = options.now ?? Date.now;
   const nowSeconds = () => Math.floor(now() / 1000);
@@ -643,16 +668,16 @@ async function refreshGrantUnlocked(
     return { ...base, outcome: "no-grant", detail: "identity is retired - not refreshing; unretire it and log in again" };
   }
 
-  if (tool === "claude" && isSwapPool(identity)) {
+  if (pooled && isSwapPool(identity)) {
     return {
       ...base,
       outcome: "no-grant",
-      detail: "claude swap pool: its credentials are a copy of the active member's grant and are refreshed through that member",
+      detail: `${tool} swap pool: its credentials are a copy of the active member's grant and are refreshed through that member`,
     };
   }
-  if (tool === "claude") await convergeClaudePoolStores(identity, options.claudeRegistryPath, options.locksHeld, options.lockedPoolDirs).catch(() => undefined);
+  if (pooled) await convergeClaudePoolStores(identity, registryPath, options.locksHeld, options.lockedPoolDirs, tool).catch(() => undefined);
 
-  const freshest = await freshestGrant(tool, identity, options.claudeRegistryPath, options.lockedPoolDirs).catch(() => undefined);
+  const freshest = await freshestGrant(tool, identity, registryPath, options.lockedPoolDirs).catch(() => undefined);
   if (!freshest || !freshest.grant.refresh_token) {
     return {
       ...base,
@@ -743,6 +768,7 @@ async function refreshGrantUnlocked(
   const writeThrough = await writeGrantThroughStores(tool, identity, grant, {
     entryKey: freshest.entryKey,
     ...(options.claudeRegistryPath ? { claudeRegistryPath: options.claudeRegistryPath } : {}),
+    ...(options.poolRegistryPath ? { poolRegistryPath: options.poolRegistryPath } : {}),
     locksHeld: options.locksHeld,
     poolDirs: options.lockedPoolDirs,
   });

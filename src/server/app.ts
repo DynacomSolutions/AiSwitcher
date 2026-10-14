@@ -12,7 +12,7 @@ import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { type AuthRefreshScheduler } from "./auth-refresh.ts";
 import { type SpendGuardScheduler } from "./spend-guard.ts";
 import { type HerdrBridgeScheduler } from "./herdr-bridge.ts";
-import { claudeStatusOf, type ClaudeSwapStatusDto } from "./claude-swap-auto.ts";
+import { claudeSchedulerView, type ClaudeSwapStatusDto } from "./claude-swap-auto.ts";
 import type { PoolSwapStatusDto } from "../identities/pool/scheduler.ts";
 import { poolStatus } from "../identities/claude-swap-ops.ts";
 import { HttpError } from "./types.ts";
@@ -124,7 +124,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
         auto: status.pool.swapPool.auto === true,
         thresholdPercent: status.thresholdPercent,
         accounts: status.rows,
-        scheduler: deps.claudeSwap ? claudeStatusOf(await deps.claudeSwap.status()) : null,
+        scheduler: deps.claudeSwap ? claudeSchedulerView(await deps.claudeSwap.status()) : null,
       });
     } catch (err) {
       throw new HttpError(404, err instanceof Error ? err.message : String(err));

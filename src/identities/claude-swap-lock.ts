@@ -1,5 +1,6 @@
 import { mkdir, rmdir, stat, utimes } from "node:fs/promises";
 import { join } from "node:path";
+import type { LockOptions } from "./pool/lock.ts";
 
 /**
  * Claude Code serialises its own OAuth refresh and `.claude.json` writes with
@@ -21,18 +22,7 @@ export class SwapLockError extends Error {
   }
 }
 
-export interface LockOptions {
-  /** Total time to wait for one lock. Default 5s. */
-  timeoutMs?: number;
-  /** A lock dir older than this is presumed abandoned and broken. Default: Claude Code's own
-   * proper-lockfile `stale` for that lock, which breaks any lock whose mtime is older
-   * (`.oauth_refresh.lock` 60s in 2.1.295, 10s in 2.1.159; `.claude.json.lock` 10s). */
-  staleMs?: number;
-  /** While held, the lock dir's mtime is touched this often so Claude Code never sees it as
-   * stale. Default 5s (proper-lockfile's `update` = stale / 2); keep well under every Claude Code stale value (min 10s). */
-  updateMs?: number;
-  pollMs?: number;
-}
+export type { LockOptions };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -42,7 +32,7 @@ export interface LockHandle {
   isLost(): boolean;
 }
 
-interface HeldLock extends LockHandle {
+export interface HeldLock extends LockHandle {
   release(): Promise<void>;
 }
 
@@ -100,7 +90,7 @@ async function own(lockPath: string, updateMs: number): Promise<HeldLock> {
   };
 }
 
-async function acquire(lockPath: string, options: LockOptions): Promise<HeldLock> {
+export async function acquire(lockPath: string, options: LockOptions): Promise<HeldLock> {
   const timeoutMs = options.timeoutMs ?? 5_000;
   const staleMs = options.staleMs ?? (lockPath.endsWith(".oauth_refresh.lock") ? 60_000 : 10_000);
   const updateMs = options.updateMs ?? 5_000;

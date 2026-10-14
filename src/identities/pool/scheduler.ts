@@ -1,8 +1,11 @@
+import { isRetired } from "../retired.ts";
 import { loadIdentitiesFile } from "../store.ts";
 import type { PoolAdapter } from "./adapter.ts";
 import { swapIfLimited, type LimitedOutcome, type PoolOpsDeps } from "./ops.ts";
+import { withPoolLock } from "./lock.ts";
 import { allAdapters } from "./registry.ts";
-import { poolsOf } from "./swap-pool.ts";
+import { poolsOf, requirePool, type PoolIdentity } from "./swap-pool.ts";
+import type { Identity } from "../types.ts";
 
 /**
  * Daemon loop: for every swap pool with `auto` on, in the registry of every
@@ -24,10 +27,15 @@ export function jitteredDelayMs(random: () => number = Math.random): number {
 export interface PoolSwapStatusDto {
   ok: true;
   enabled: boolean;
+  /** Tools whose adapter this scheduler serves. */
+  tools: string[];
   pools: Array<{ tool: string; pool: string; auto: boolean; lastCheckAt: string | null; lastOutcome: string | null; backoffMs: number }>;
 }
 
-export interface PoolSwapSchedulerDeps extends PoolOpsDeps<any> {
+export interface PoolSwapSchedulerDeps {
+  /** Per-tool ops deps (registry path, ledger path, usage fetch, test hooks).
+   * Never shared across tools: each adapter reads its own registry and ledger. */
+  perTool?: Partial<Record<PoolAdapter["tool"], PoolOpsDeps<any>>>;
   /** Adapters to serve; defaults to every registered adapter. */
   adapters?: () => PoolAdapter<any>[];
   check?: (adapter: PoolAdapter<any>, pool: string) => Promise<LimitedOutcome>;
@@ -57,7 +65,32 @@ export class PoolSwapScheduler {
   }
 
   private async poolsOfAdapter(adapter: PoolAdapter<any>) {
-    return poolsOf(await loadIdentitiesFile(this.deps.registryPath ?? adapter.config.identitiesJsonPath));
+    return poolsOf(await this.fileOf(adapter));
+  }
+
+  private fileOf(adapter: PoolAdapter<any>) {
+    return loadIdentitiesFile(this.deps.perTool?.[adapter.tool]?.registryPath ?? adapter.config.identitiesJsonPath);
+  }
+
+  /** Heal pass for `liveSwap: false` adapters: a running session can rewrite
+   * the pool credentials after a swap, so repair them every tick, under the pool lock. */
+  private async healPool(adapter: PoolAdapter<any>, pool: PoolIdentity): Promise<void> {
+    if (adapter.liveSwap || !adapter.heal) return;
+    try {
+      const lock = { timeoutMs: 1_500 };
+      const notes = await withPoolLock(pool.configDir, async () => {
+        // Reload under the lock: a swap that landed while we waited must not be undone.
+        const file = await this.fileOf(adapter);
+        const fresh = requirePool(file, pool.name, adapter.tool);
+        const members = fresh.swapPool.accounts
+          .map((name) => file.identities.find((i) => i.name === name))
+          .filter((i): i is Identity => i !== undefined && !isRetired(i));
+        return adapter.heal!(fresh, members, lock);
+      }, lock);
+      for (const note of notes) this.log(adapter.tool, note);
+    } catch (err) {
+      this.log(adapter.tool, `pool ${pool.name}: heal failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** One pass over the pools whose next poll is due. Exported for tests. */
@@ -71,13 +104,14 @@ export class PoolSwapScheduler {
       }
       for (const pool of pools) {
         if (this.stopped) return;
+        await this.healPool(adapter, pool);
         if (pool.swapPool.auto !== true) continue;
         const key = `${adapter.tool}:${pool.name}`;
         const st = this.state.get(key) ?? { lastCheckAt: 0, nextAt: 0, backoffMs: 0, lastOutcome: null };
         if (nowMs < st.nextAt) continue;
         let outcome: LimitedOutcome;
         try {
-          outcome = await (this.deps.check ?? ((a, name) => swapIfLimited(a, { ...this.deps, now: () => nowMs }, name, "auto")))(adapter, pool.name);
+          outcome = await (this.deps.check ?? ((a, name) => swapIfLimited(a, { ...this.deps.perTool?.[a.tool], now: () => nowMs }, name, "auto")))(adapter, pool.name);
         } catch (err) {
           outcome = { action: "skipped", why: err instanceof Error ? err.message : String(err) };
         }
@@ -134,6 +168,6 @@ export class PoolSwapScheduler {
         // no registry yet
       }
     }
-    return { ok: true, enabled: true, pools: out };
+    return { ok: true, enabled: true, tools: this.adapters().map((a) => a.tool), pools: out };
   }
 }

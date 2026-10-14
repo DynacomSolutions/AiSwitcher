@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PoolAdapter, PoolUsage } from "../../../src/identities/pool/adapter.ts";
 import { appendSwapEvent, ledgerPathFor, readSwapEvents } from "../../../src/identities/pool/ledger.ts";
+import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
 import { chooseBest, swapIfLimited } from "../../../src/identities/pool/ops.ts";
 import { PoolSwapScheduler } from "../../../src/identities/pool/scheduler.ts";
 import { aisClaudeSwapLedgerPath, aisSwapLedgerPath } from "../../../src/shared/ais-home.ts";
@@ -77,5 +78,63 @@ describe("generic pool core", () => {
     expect(seen).toEqual(["claude:pool", "codex:pool"]);
     const st = await sched.status();
     expect(st.pools.map((p) => p.tool)).toEqual(["claude", "codex"]);
+  });
+
+  test("liveSwap:false adapter still swaps and notifySwapped runs after the ledger append", async () => {
+    const registry = join(root, "codex.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "codex-swap.jsonl");
+    const calls: string[] = [];
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("codex", registry, { a: 99, b: 5 }),
+      notifySwapped: async (pool, from, to) => {
+        calls.push(`${pool.name}:${from}->${to}:${(await readSwapEvents(ledger)).length}`);
+        return { sessions: 2 };
+      },
+    };
+    const r = await swapIfLimited(adapter, { ledgerPath: ledger }, "pool", "auto");
+    expect(r.action === "swapped" && r.result.runningSessions).toBe(2);
+    expect(calls).toEqual(["pool:a->b:1"]);
+    const throwing: PoolAdapter = { ...adapter, notifySwapped: async () => { throw new Error("boom"); } };
+    const back = await performPoolSwap(throwing, { registryPath: registry, ledgerPath: ledger, target: "a", reason: "manual" });
+    expect(back.to).toBe("a");
+  });
+
+  test("two concurrent swapIfLimited on one pool produce exactly one ledger event", async () => {
+    const registry = join(root, "codex.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "codex-swap.jsonl");
+    let arrived = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const util: Record<string, number> = { a: 99, b: 5 };
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("codex", registry, util),
+      fetchUsage: async (m) => {
+        if (m.name === "a" && ++arrived <= 2) {
+          if (arrived === 2) release();
+          await barrier;
+        }
+        return live(util[m.name] ?? 0);
+      },
+    };
+    const now = () => 1_000_000;
+    const [x, y] = await Promise.all([
+      swapIfLimited(adapter, { ledgerPath: ledger, now }, "pool", "auto"),
+      swapIfLimited(adapter, { ledgerPath: ledger, now }, "pool", "auto"),
+    ]);
+    expect([x.action, y.action].filter((a) => a === "swapped")).toHaveLength(1);
+    expect(await readSwapEvents(ledger)).toHaveLength(1);
+  });
+});
+
+describe("claude scheduler view", () => {
+  test("is null when the claude adapter is not served", async () => {
+    const { claudeSchedulerView } = await import("../../../src/server/claude-swap-auto.ts");
+    const registry = join(root, "codex.json");
+    await writeRegistry(registry);
+    const only = (tool: "claude" | "codex") => new PoolSwapScheduler({ adapters: () => [fakeAdapter(tool, registry, {})] });
+    expect(claudeSchedulerView(await only("codex").status())).toBeNull();
+    expect(claudeSchedulerView(await only("claude").status())?.pools).toHaveLength(1);
   });
 });

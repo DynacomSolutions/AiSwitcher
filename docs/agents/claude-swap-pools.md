@@ -49,3 +49,66 @@ remain as thin Claude bindings so callers and tests are unchanged. The shim
 (`shared/run-wrapper.ts`) and the daemon (`server/serve.ts`) go through the
 core; `AIS_CLAUDE_SWAP=0` drops claude and `AIS_POOL_SWAP_<TOOL>=0` drops any
 other tool from the daemon loop. No other adapter exists yet.
+
+
+### Codex adapter and `liveSwap: false` (tasks 43 and 44)
+
+`pool/codex-adapter.ts` (registered in `pool/registry.ts`) pools Codex
+identities. The pool is a codex identity with `swapPool`; its configDir is the
+shared `CODEX_HOME`; members are other codex identities (ChatGPT logins only,
+see `codexMemberProblem`: API-key, Bedrock and logged-out identities are
+rejected) whose own `auth.json` is the per-account vault. Helpers for the file
+shape are in `identities/codex-auth.ts`. The account is `tokens.account_id`
+cross-checked with the `https://api.openai.com/auth`.chatgpt_account_id claim
+of the access token (id token as fallback); when both exist and differ the file
+is "hybrid" and is never trusted or attributed.
+
+Why `liveSwap: false` (Codex 0.145.0 source): `auth.json` is loaded once at
+startup and cached; it is reloaded only on a proactive refresh or a 401. A
+refresh first checks the file's account and fails permanently ("account
+mismatch") if it is another account; the 401 path skips that guard; the
+refreshed tokens are persisted over the file with no account check and no
+cross-process lock; writes truncate in place (readers can see empty or partial
+files); the `chatgpt-account-id` header comes from memory. A running session
+therefore cannot follow a swap and must relaunch or `codex resume`.
+
+Policy (owner decision): swap anyway. Auto swap only fires when the active
+account is at its limit, so those sessions are stuck regardless; new launches
+get the new account. The core calls the optional `notifySwapped(pool, from, to)`
+after the ledger append (non-fatal); the Codex one counts running codex
+processes whose `CODEX_HOME` is the pool dir (`/proc/<pid>/environ`, own user,
+never kills anything), logs `codex-swap: account swapped to X; relaunch or
+"codex resume" in N running sessions`, and returns `{sessions}`, which
+`performPoolSwap` puts on `SwapResult.runningSessions` for the manual-swap
+warning (the CLI side is task 45).
+
+Swap (`swapCredentials`, under the pool lock and the pool dir's
+`.oauth_refresh.lock`): write the pool grant back to the member whose vault
+holds the SAME account id when its `last_refresh` (else token iat/exp) is newer,
+never to another account; an unattributable or hybrid pool file is kept as a
+0600 `auth.json.pre-swap.bak`; the target's `auth.json` is written atomically
+(0600, temp plus rename, all its keys kept), then re-read and verified by
+account id (restored on mismatch).
+
+Heal (`heal(pool, members)`, optional adapter hook; the scheduler calls it every
+tick for `liveSwap: false` adapters, before the swap check, even with auto off,
+under the pool lock): after one re-read 200 ms later (a writer may be
+mid-truncate) it restores the active member's vault into the pool when the file
+is empty, partial, unparsable or token-less; when it holds another account it
+captures those tokens into the member that owns the account if newer (else a
+0600 `auth.json.pre-heal.bak` for a non-member) and restores the active one;
+a hybrid file gets a `.pre-heal.bak` and is restored. A refresh-during-swap
+race (the old session rewrites A's newer tokens after a swap to B) ends with A's
+vault updated and B restored.
+
+Core changes that came with it: `performPoolSwap` holds a pool-level lock
+(`pool/lock.ts`, `<poolDir>/.ais-pool.lock`, taken before any provider lock)
+across registry re-read, guard (cooldown and "active unchanged" re-check from
+`swapIfLimited`), credential swap, `active` persist and ledger append, so two
+concurrent swappers produce one ledger event. Scheduler deps are keyed per tool
+(`perTool`). `oauth-refresh.ts` gates pool behaviour on `adapterFor(tool)`: the
+pool identity is never refreshed (outcome `no-grant`, "refreshed through that
+member"), and a member's refresh writes through to the pool copy only while that
+member is active and the pool holds the same account (`poolRegistryPath` is the
+test hook; `claudeRegistryPath` stays the claude alias). Daemon opt-out for
+codex: `AIS_POOL_SWAP_CODEX=0`.

@@ -28,11 +28,17 @@ export function claudeStatusOf(dto: ClaudeSwapStatusDto | PoolSwapStatusDto): Cl
   return { ...dto, pools };
 }
 
+/** What `/api/claude-swap` reports as `scheduler`: null when the claude
+ * adapter is not served by the daemon (AIS_CLAUDE_SWAP=0). */
+export function claudeSchedulerView(dto: ClaudeSwapStatusDto | PoolSwapStatusDto): ClaudeSwapStatusDto | null {
+  return "tools" in dto && !dto.tools.includes("claude") ? null : claudeStatusOf(dto);
+}
+
 export class ClaudeSwapScheduler {
   private readonly inner: PoolSwapScheduler;
   constructor(deps: ClaudeSwapSchedulerDeps = {}) {
-    const { check, ...rest } = deps;
-    this.inner = new PoolSwapScheduler({ ...rest, adapters: () => [claudeAdapter], ...(check ? { check: (_a, pool) => check(pool) } : {}) });
+    const { check, log, random, ...rest } = deps;
+    this.inner = new PoolSwapScheduler({ ...(log ? { log } : {}), ...(random ? { random } : {}), perTool: { claude: rest }, adapters: () => [claudeAdapter], ...(check ? { check: (_a, pool) => check(pool) } : {}) });
   }
   tick(nowMs?: number): Promise<void> { return this.inner.tick(nowMs); }
   start(): void { this.inner.start(); }

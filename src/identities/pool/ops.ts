@@ -3,7 +3,7 @@ import { loadIdentitiesFile } from "../store.ts";
 import type { Identity } from "../types.ts";
 import type { PoolAdapter, PoolUsage, SwapReason, SwapResult } from "./adapter.ts";
 import { eventsForPool, ledgerPathFor, readSwapEvents } from "./ledger.ts";
-import { performPoolSwap } from "./swap.ts";
+import { performPoolSwap, SwapSkipped } from "./swap.ts";
 import { allowedAccounts, isAllowed, poolThreshold, requirePool, type PoolIdentity } from "./swap-pool.ts";
 
 /** Selection and orchestration on top of an adapter: who has headroom, and
@@ -47,7 +47,7 @@ function usageOf<U extends PoolUsage>(adapter: PoolAdapter<U>, deps: PoolOpsDeps
 
 async function load(adapter: PoolAdapter<any>, deps: PoolOpsDeps<any>, poolKey: string | undefined) {
   const file = await loadIdentitiesFile(deps.registryPath ?? adapter.config.identitiesJsonPath);
-  const pool = requirePool(file, poolKey);
+  const pool = requirePool(file, poolKey, adapter.tool);
   const members = pool.swapPool.accounts
     .map((name) => file.identities.find((i) => i.name === name))
     .filter((i): i is Identity => i !== undefined);
@@ -110,9 +110,15 @@ export async function swapIfLimited<U extends PoolUsage>(
   if (!active) return { action: "skipped", why: "pool has no active account yet" };
   const now = deps.now?.() ?? Date.now();
   const cooldownMs = options.cooldownMs ?? SWAP_COOLDOWN_MS;
-  const events = eventsForPool(await readSwapEvents(deps.ledgerPath ?? ledgerPathFor(adapter.tool)), pool).filter((e) => e.reason !== "manual");
-  const last = events[events.length - 1];
-  if (last && now - Date.parse(last.ts) < cooldownMs) return { action: "cooldown", retryAfterMs: cooldownMs - (now - Date.parse(last.ts)) };
+  const ledgerPath = deps.ledgerPath ?? ledgerPathFor(adapter.tool);
+  const cooldown = async (p: PoolIdentity): Promise<LimitedOutcome | undefined> => {
+    const events = eventsForPool(await readSwapEvents(ledgerPath), p).filter((e) => e.reason !== "manual");
+    const last = events[events.length - 1];
+    if (last && now - Date.parse(last.ts) < cooldownMs) return { action: "cooldown", retryAfterMs: cooldownMs - (now - Date.parse(last.ts)) };
+    return undefined;
+  };
+  const cooling = await cooldown(pool);
+  if (cooling) return cooling;
 
   const fetchUsage = usageOf(adapter, deps);
   const activeMember = members.find((m) => m.name === active);
@@ -137,13 +143,25 @@ export async function swapIfLimited<U extends PoolUsage>(
   const fallbackUtil = rows.find((r) => r.name === fallback)?.usage?.maxUtilization;
   const target = chooseBest(rows, { belowPercent: threshold, requireKnown: true }) ?? (fallbackUtil !== undefined && fallbackUtil < activeUtil ? fallback : undefined);
   if (!target) return { action: "no-candidate", ...(usage.maxUtilization !== undefined ? { utilization: usage.maxUtilization } : {}) };
-  const result = await performPoolSwap(adapter, {
-    ...(deps.registryPath ? { registryPath: deps.registryPath } : {}),
-    ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}),
-    pool: pool.name,
-    target,
-    reason,
-    now: () => new Date(now),
-  });
+  let result: SwapResult;
+  try {
+    result = await performPoolSwap(adapter, {
+      ...(deps.registryPath ? { registryPath: deps.registryPath } : {}),
+      ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}),
+      pool: pool.name,
+      target,
+      reason,
+      now: () => new Date(now),
+      // Decided on a snapshot taken before the usage calls; re-check under the pool lock.
+      guard: async ({ pool: current }) => {
+        if (current.swapPool.active !== active) throw new SwapSkipped<LimitedOutcome>({ action: "skipped", why: `pool changed to "${current.swapPool.active}" while deciding` });
+        const again = await cooldown(current);
+        if (again) throw new SwapSkipped<LimitedOutcome>(again);
+      },
+    });
+  } catch (err) {
+    if (err instanceof SwapSkipped) return err.outcome as LimitedOutcome;
+    throw err;
+  }
   return { action: "swapped", result, ...(usage.maxUtilization !== undefined ? { utilization: usage.maxUtilization } : {}) };
 }

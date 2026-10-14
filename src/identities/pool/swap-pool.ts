@@ -3,11 +3,11 @@ import { isRetired } from "../retired.ts";
 import { findIdentityByNameOrAlias } from "../store.ts";
 
 /**
- * Pure helpers for claude swap pools (Identity.swapPool). A pool is an
- * ordinary claude identity with its own configDir; only identities that
+ * Pure helpers for swap pools (Identity.swapPool). A pool is an ordinary
+ * identity of the pool's tool with its own configDir; only identities that
  * carry `swapPool` ever take part in a credential swap. Members are other
- * claude identities whose configDir holds the per-account vault
- * (.credentials.json plus .claude.json oauthAccount).
+ * identities of the same tool whose configDir holds the per-account vault
+ * (claude: .credentials.json plus .claude.json oauthAccount; codex: auth.json).
  */
 
 export const DEFAULT_SWAP_THRESHOLD_PERCENT = 95;
@@ -47,7 +47,7 @@ export function poolsHoldingMember(file: IdentitiesFile, member: string): PoolId
 }
 
 /** Pick a pool by name/alias, or the only pool when none is named. */
-export function requirePool(file: IdentitiesFile, key: string | undefined): PoolIdentity {
+export function requirePool(file: IdentitiesFile, key: string | undefined, tool: string = "claude"): PoolIdentity {
   if (key !== undefined) {
     const found = findIdentityByNameOrAlias(file.identities, key);
     if (!found) throw new SwapPoolError(`No identity named "${key}"`);
@@ -57,7 +57,7 @@ export function requirePool(file: IdentitiesFile, key: string | undefined): Pool
   }
   const pools = poolsOf(file);
   if (pools.length === 1) return pools[0]!;
-  if (pools.length === 0) throw new SwapPoolError('No swap pool exists yet. Create one with "ais claude-swap pool create <name> --accounts=a,b".');
+  if (pools.length === 0) throw new SwapPoolError(`No swap pool exists yet. Create one with "ais ${tool}-swap pool create <name> --accounts=a,b".`);
   throw new SwapPoolError(`More than one swap pool exists (${pools.map((p) => p.name).join(", ")}); pass --pool=<name>.`);
 }
 
@@ -71,24 +71,24 @@ export function memberIdentity(file: IdentitiesFile, pool: PoolIdentity, key: st
 }
 
 /** Why a candidate cannot be a pool member, or undefined when it can. */
-export function memberProblem(file: IdentitiesFile, poolName: string, name: string): string | undefined {
+export function memberProblem(file: IdentitiesFile, poolName: string, name: string, tool: string = "claude", extra?: (member: Identity) => string | undefined): string | undefined {
   const found = findIdentityByNameOrAlias(file.identities, name);
-  if (!found) return `"${name}" is not an existing claude identity`;
+  if (!found) return `"${name}" is not an existing ${tool} identity`;
   if (found.name === poolName) return `a pool cannot contain itself`;
   if (isRetired(found)) return `"${found.name}" is retired`;
   if (isSwapPool(found)) return `"${found.name}" is itself a swap pool`;
-  return undefined;
+  return extra?.(found);
 }
 
-/** Validates the whole member list against the claude registry, returning
+/** Validates the whole member list against the tool's registry, returning
  * the canonical member names (aliases resolved) or throwing one error that
  * lists every problem. */
-export function validateMembers(file: IdentitiesFile, poolName: string, requested: string[]): string[] {
+export function validateMembers(file: IdentitiesFile, poolName: string, requested: string[], tool: string = "claude", extra?: (member: Identity) => string | undefined): string[] {
   if (requested.length < 2) throw new SwapPoolError("A swap pool needs at least two accounts.");
   const names: string[] = [];
   const problems: string[] = [];
   for (const key of requested) {
-    const problem = memberProblem(file, poolName, key);
+    const problem = memberProblem(file, poolName, key, tool, extra);
     if (problem) {
       problems.push(problem);
       continue;
