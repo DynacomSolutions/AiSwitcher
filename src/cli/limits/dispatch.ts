@@ -62,10 +62,9 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
     // every live frame annotates without re-reading the file.
     const spendCache = await loadSpendGuardCache();
     const annotate = (results: ToolLimitResult[]): ToolLimitResult[] => annotateWithSpendGuard(results, spendCache);
-    // One slot per target: 1:1 tools seed a pending row so the live render
-    // has a spinner to show, multi-provider clients seed NOTHING (their
-    // provider isn't known until the adapter reads the identity's auth
-    // store — a tool-shaped placeholder would render a fake section).
+    // One slot per target: pending rows so the live render has a spinner to
+    // show; multi-provider clients seed one per provider found in the
+    // identity's auth store, so sections never pop in later.
     // aggregateLimitResults on every frame: the same provider+identity can
     // be answered by more than one target (a Z.ai key imported into Pi is
     // the account the zai tool queries too) — the flat list must not show
@@ -73,10 +72,7 @@ export async function runLimitsCommand(positionals: string[], flags: ParsedArgs[
     // annotated only at render time: annotate() appends its note to any
     // existing window note, so annotating at store time AND every frame
     // would double the note on screen.
-    const slots: ToolLimitResult[][] = targets.map((target) => {
-      const pending = pendingLimitResult(target);
-      return pending ? [pending] : [];
-    });
+    const slots: ToolLimitResult[][] = await Promise.all(targets.map(pendingLimitResult));
     await withLiveRender(
       (tick) => formatLimitsReport(aggregateLimitResults(annotate(slots.flat())), new Date(), spinnerChar(tick), { compact }),
       async () => {

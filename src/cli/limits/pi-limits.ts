@@ -130,6 +130,16 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
   return fetchable;
 }
 
+/** Canonical provider ids `fetchPiLimits` will answer for, from a cheap local
+ * auth.json read (no network) — what the live render seeds pending rows from.
+ * Same gate as the fetch: swap pools fetch nothing, and the provider list is
+ * `fetchablePiProviders`'s. */
+export async function pendingPiProviders(identity: Identity): Promise<string[]> {
+  if (identity.swapPool) return [];
+  const auth = await readPiAuth(identity.configDir);
+  return auth ? fetchablePiProviders(auth).map((f) => f.provider) : [];
+}
+
 /**
  * Limits for one Pi identity, one result per upstream provider Pi can
  * actually answer for — Pi is a multi-provider client, so the provider-first

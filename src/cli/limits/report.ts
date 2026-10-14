@@ -323,14 +323,18 @@ function buildSection(provider: string, group: ToolLimitResult[], ctx: Ctx, widt
 }
 
 /** Lays blocks out side by side: the most columns that fit `width`, each
- * block going to the currently shortest column. Returns undefined when even
- * two columns do not fit (caller falls back to a single column). */
+ * block going to the currently shortest column, with one blank line between
+ * blocks stacked in the same column. `weights` (one per block) replace the
+ * real block heights for that choice, so placement does not shift as rows
+ * load; widths are always measured from the real lines. Returns undefined
+ * when even two columns do not fit (caller falls back to a single column). */
 export function packColumns(
   blocks: string[][],
   width: number,
   gap = COLUMN_GAP,
   /** Re-renders the blocks at these indices with their own (column-local) alignment; tried when the shared one does not fit. */
   relayout?: (indices: number[]) => string[][],
+  weights: number[] = blocks.map((b) => b.length),
 ): string[] | undefined {
   for (let k = Math.min(blocks.length, 6); k >= 2; k--) {
     let cols: string[][][] = Array.from({ length: k }, () => []);
@@ -338,12 +342,13 @@ export function packColumns(
     const heights = new Array<number>(k).fill(0);
     blocks.forEach((block, i) => {
       const j = heights.indexOf(Math.min(...heights));
+      // +1 for the blank separator above every block after the first.
+      heights[j]! += weights[i]! + (cols[j]!.length > 0 ? 1 : 0);
       cols[j]!.push(block);
       idx[j]!.push(i);
-      heights[j]! += block.length;
     });
     const measureCols = (cs: string[][][]) => {
-      const ls = cs.map((c) => c.flat());
+      const ls = cs.map((c) => c.flatMap((b, i) => (i > 0 ? ["", ...b] : b)));
       return { ls, ws: ls.map((c) => Math.max(0, ...c.map(visibleLength))) };
     };
     let { ls: lines, ws: widths } = measureCols(cols);
@@ -354,7 +359,7 @@ export function packColumns(
     }
     if (!fits()) continue;
     const out: string[] = [];
-    for (let i = 0; i < Math.max(...heights); i++) {
+    for (let i = 0; i < Math.max(...lines.map((c) => c.length)); i++) {
       out.push(
         lines
           .map((c, j) => {
@@ -427,8 +432,10 @@ export function formatLimitsReport(
     const own = measure(indices.map((i) => entries[i]![1]), [], ctx);
     return indices.map((i) => buildSection(entries[i]![0], entries[i]![1], ctx, { ...shared, prefix: own.prefix }));
   };
+  // Load-independent heights: header + aggregate rows + one branch and a few detail rows per identity.
+  const weights = entries.map(([, g]) => 4 + 4 * g.length);
   const body =
-    (columns ? packColumns(blocks, width, COLUMN_GAP, ctx.compact ? undefined : relayout) : undefined) ??
+    (columns ? packColumns(blocks, width, COLUMN_GAP, ctx.compact ? undefined : relayout, weights) : undefined) ??
     blocks.flatMap((b, i) => (i > 0 ? ["", ...b] : b));
 
   const lines = totalRows.map((row) => renderRow(row, shared.prefix, ctx));

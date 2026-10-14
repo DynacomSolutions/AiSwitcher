@@ -153,6 +153,14 @@ export async function fetchOpencodeGoQuotaForKey(apiKey: string): Promise<Openco
   return { windows };
 }
 
+/** Canonical provider ids `fetchOpencodeLimits` will answer for, from a cheap
+ * local auth.json read (no network) — what the live render seeds pending rows
+ * from. Same list as the fetch: `fetchableOpencodeProviders`. */
+export async function pendingOpencodeProviders(identity: Identity): Promise<string[]> {
+  const auth = await readOpencodeAuth(identity.configDir);
+  return auth ? fetchableOpencodeProviders(auth).map((f) => f.provider) : [];
+}
+
 /**
  * Limits for one OpenCode identity, one result per upstream provider
  * OpenCode holds a fetchable credential for (the Z.ai coding plan — the

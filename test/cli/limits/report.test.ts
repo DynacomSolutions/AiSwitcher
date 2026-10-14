@@ -358,7 +358,9 @@ describe("wrapping and layout", () => {
     const b = ["BBBB", "b1"];
     const c = ["CCCC", "c1"];
     expect(packColumns([a, b, c], 40, 2)).toEqual(["AAAA  BBBB  CCCC", "a1    b1    c1", "a2", "a3"]);
-    expect(packColumns([a, b, c], 12, 2)).toEqual(["AAAA  BBBB", "a1    b1", "a2    CCCC", "a3    c1"]);
+    // Weights, not real heights, decide placement: c lands under a instead of b.
+    expect(packColumns([a, b, c], 12, 2, undefined, [1, 1, 1])).toEqual(["AAAA  BBBB", "a1    b1", "a2", "a3", "", "CCCC", "c1"]);
+    expect(packColumns([a, b, c], 12, 2)).toEqual(["AAAA  BBBB", "a1    b1", "a2", "a3    CCCC", "      c1"]);
     expect(packColumns([a, b, c], 5, 2)).toBeUndefined();
   });
 
