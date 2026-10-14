@@ -100,8 +100,10 @@ src/
     exec.ts               Bun.spawn passthrough, signal relay, exit-code parity;
                           execveReal/execReal try execve first;
                           also defines IDENTITY_SESSION_MARKER (see below)
-    execve.ts             libc execve via bun:ffi (Linux): argv/envp block, signal
-                          and fd hygiene; every failure returns false
+    execve.ts             libc execve via bun:ffi (Linux) or posix_spawn SETEXEC
+                          (macOS): argv/envp block, signal and fd hygiene; every
+                          failure returns a reason string
+    darwin-proc.ts        macOS sysctl/proc_pidpath reads for the sidecar's PID watch
     session-sidecar.ts    detached `__session-sidecar` (sync watcher, Herdr titles,
                           PID-exit watch, post-exit sync) and launchWithSession()
     cli-args.ts            strip --identity=/--desktop, detect non-interactive intent
