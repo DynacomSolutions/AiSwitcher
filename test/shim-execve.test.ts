@@ -63,8 +63,9 @@ function setup(options: { pool?: boolean } = {}) {
   };
   script(
     join(realBin, "claude"),
-    `{
-echo "pid=$$"; echo "ppid=$PPID"; echo "session=$AI_PROFILE_SWITCHER_SESSION"; echo "args=$*"
+    `for a in "$@"; do printf '%s\\n' "$a"; done > "$FAKE_OUT.args"
+{
+echo "pid=$$"; echo "ppid=$PPID"; echo "session=$AI_PROFILE_SWITCHER_SESSION"
 grep -E '^Sig(Ign|Blk)' /proc/$$/status | tr -d '\\t' | tr ':' '='
 fds=; for fd in 3 4 5 6 7 8 9; do [ -e /proc/$$/fd/$fd ] && fds="$fds$fd,"; done; echo "fds=$fds"
 } > "$FAKE_OUT.tmp"
@@ -144,7 +145,11 @@ describe.each([
     expect(Number(fake.pid)).toBe(shim.pid); // execve kept the PID
     expect(Number(fake.ppid)).toBe(process.pid); // no Bun parent in between
     expect(fake.session).toBe("acct-a");
-    expect(fake.args).toContain(" hello world ");
+    // Wrapper-injected flags may sit before or after the user's arguments, so only
+    // their relative order is asserted (one argument per line, so no splitting ambiguity).
+    const args = readFileSync(`${out}.args`, "utf8").trimEnd().split("\n");
+    expect(args[args.indexOf("hello") + 1]).toBe("world");
+    expect(args).toContain("hello");
     // Nothing Bun-specific leaks across exec: no ignored SIGPIPE/SIGXFSZ (Bun ignores both)
     // and no stray descriptors. (bash itself ignores SIGQUIT and blocks SIGCHLD, so the
     // full masks are not compared.)
