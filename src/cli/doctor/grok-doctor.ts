@@ -11,9 +11,8 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * limits/grok-limits.ts has no live path at all (it's a pure log-scrape —
- * see its own doc comment), so this is the first live probe against the real
- * grok binary in this project. `-p`/`--single <PROMPT>` (confirmed via
+ * This probes the real grok binary with a full prompt turn, unlike
+ * limits/grok-limits.ts, which only asks the ACP server for billing. `-p`/`--single <PROMPT>` (confirmed via
  * `grok --help`) is grok's equivalent of claude's `-p`: prints one response
  * and exits. `--no-subagents` keeps the probe to a single turn, the same
  * intent as claude-doctor.ts's `--strict-mcp-config`: rule out anything
