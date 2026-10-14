@@ -991,6 +991,11 @@ how many are running, and new launches (or `codex resume`) get the new one.
 `ais swap codex usage` splits `<pool>/sessions/**/rollout-*.jsonl` token usage
 per member from the ledger (`~/.ais/state/codex-swap.jsonl`).
 `ais limits` and `ais identities list` show codex pools like claude pools.
+Kimi and Pi pools (`ais swap kimi|pi pool create shared --accounts=a,b`) take
+OAuth-login members whose token names an account (Pi: a Kimi login in
+`auth.json`); both CLIs re-read their credentials per request, so running
+sessions follow a swap and no relaunch notice is printed. `usage` is
+claude/codex only.
 
 Members are existing, non-retired, non-pool claude identities; their own
 configDir stays the per-account vault. A swap takes Claude Code's own

@@ -110,8 +110,8 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
 
   async function swapHeld(held: Set<string>): Promise<Omit<SwapResult, "reason"> | { needLock: string }> {
   return withOauthRefreshLock(poolDir, () => withOauthRefreshLocks(memberDirs(held, poolDir), async () => {
-    const targetText = await readCodexAuthText(target.configDir);
-    const targetAuth = parseCodexAuth(targetText);
+    let targetText = await readCodexAuthText(target.configDir);
+    let targetAuth = parseCodexAuth(targetText);
     if (targetText === undefined || !hasCodexTokens(targetAuth)) {
       throw new SwapPoolError(`Account "${target.name}" has no usable Codex login (no ChatGPT tokens in ${target.configDir}); run "codex login" under that identity first.`);
     }
@@ -150,7 +150,16 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
       notes.push(`live pool credentials could not be attributed to a member; kept a 0600 copy at ${backup}`);
     }
 
-    await writeFileAtomic(poolPath, targetText);
+    // The write-back may have just updated the target's own vault (pool held the target's account): copy the vault as it is now.
+    if (writeBack === "written") {
+      const refreshedText = await readCodexAuthText(target.configDir);
+      const refreshed = parseCodexAuth(refreshedText);
+      if (refreshedText !== undefined && hasCodexTokens(refreshed) && codexAccountOf(refreshed).id === targetAcct.id) {
+        targetText = refreshedText;
+        targetAuth = refreshed;
+      }
+    }
+    await writeFileAtomic(poolPath, targetText!);
     const after = codexAccountOf(parseCodexAuth(await readCodexAuthText(poolDir)));
     if (after.id !== targetAcct.id) {
       if (poolText !== undefined) await writeFileAtomic(poolPath, poolText).catch(() => undefined);
@@ -268,17 +277,21 @@ export async function countCodexSessions(configDir: string, procRoot = "/proc"):
   } catch {
     return 0;
   }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+  // Thousands of processes on a busy host: scan in parallel chunks, a sequential scan took over half a second per swap.
+  const pids = entries.filter((entry) => /^\d+$/.test(entry) && Number(entry) !== process.pid);
+  const isMine = async (entry: string): Promise<boolean> => {
     try {
-      if (uid !== undefined && (await stat(`${procRoot}/${entry}`)).uid !== uid) continue;
+      if (uid !== undefined && (await stat(`${procRoot}/${entry}`)).uid !== uid) return false;
       const argv = (await readFile(`${procRoot}/${entry}/cmdline`, "utf8")).split("\0");
-      if (basename(argv[0] ?? "") !== "codex" && basename(argv[1] ?? "") !== "codex") continue;
+      if (basename(argv[0] ?? "") !== "codex" && basename(argv[1] ?? "") !== "codex") return false;
       const home = (await readFile(`${procRoot}/${entry}/environ`, "utf8")).split("\0").find((kv) => kv.startsWith("CODEX_HOME="));
-      if (home && resolve(expandPath(home.slice("CODEX_HOME=".length))) === want) count++;
+      return home !== undefined && resolve(expandPath(home.slice("CODEX_HOME=".length))) === want;
     } catch {
-      // gone, or not ours to read
+      return false; // gone, or not ours to read
     }
+  };
+  for (let i = 0; i < pids.length; i += 256) {
+    count += (await Promise.all(pids.slice(i, i + 256).map(isMine))).filter(Boolean).length;
   }
   return count;
 }
@@ -287,6 +300,7 @@ export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
   tool: "codex",
   config: CODEX_CONFIG,
   liveSwap: false,
+  memberProblem: codexMemberProblem,
   hasCredentials: (configDir) => hasCodexTokens(parseCodexAuth(readSyncOrUndefined(codexAuthPath(configDir)))),
   swapCredentials,
   heal,

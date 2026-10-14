@@ -26,7 +26,7 @@ const COMMANDS: Array<[string, string]> = [
   ["auth login|enable <identity> --tool=ali", "SSH-only interactive auth browser and 10-minute cookie renewal"],
   ["auth refresh <identity> [--tool=ali|codex|claude|grok|kimi]", "Renew credentials without re-login: ali cookies, or the OAuth grant (written through to every store)"],
   ["auth import <pi-id> --tool=pi --claude=<id> ...", "Merge provider credentials into one Pi identity"],
-  ["swap <claude|codex> [status|to|next|allow|disallow|auto|usage|pool create]", "Swap pool for a tool (same subcommands as claude-swap); codex: ChatGPT logins only, running sessions must relaunch"],
+  ["swap <claude|codex|kimi|pi> [status|to|next|allow|disallow|auto|usage|pool create]", "Swap pool for a tool (same subcommands as claude-swap); codex: ChatGPT logins only, running sessions must relaunch; kimi and pi: OAuth logins, running sessions follow the swap"],
   ["claude-swap [status] [pool] [--json]", "Alias of \"swap claude\". Claude swap pool: members, active marker, 5h/weekly use, allowed flag"],
   ["claude-swap to <account> | next [--if-limited] [--pool=]", "Swap the pool's Claude login to a member (manual), or to the one with most headroom"],
   ["claude-swap pool create <name> --accounts=a,b[,c] [--config-dir=]", "Create a pool identity sharing one Claude folder across accounts"],
@@ -152,6 +152,9 @@ immediately. --identity/--tool narrow which identities are probed, same as
 <name> --accounts=a,b" needs ChatGPT-login members; "hook" is Claude-only). A
 swapped Codex login only reaches new launches: running codex sessions keep the
 old account until relaunched or "codex resume"; "to"/"next" print how many.
+kimi and pi pools need OAuth-login members whose token names an account (Pi:
+a kimi-coding login); their running sessions re-read the credentials on the next
+request, and "usage" (per-member token split) is claude/codex only.
 "ais claude-swap ..." is the same as "ais swap claude ...".
 
 "claude-swap" is for claude swap POOLS only: a pool is a normal claude identity

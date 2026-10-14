@@ -126,7 +126,7 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "swap": {
         const [tool, ...toolRest] = rest;
-        if (!tool) throw new CliUsageError("Usage: ais swap <claude|codex> [status|to|next|allow|disallow|auto|usage|pool create|hook] ...");
+        if (!tool) throw new CliUsageError("Usage: ais swap <claude|codex|kimi|pi> [status|to|next|allow|disallow|auto|usage|pool create|hook] ...");
         await runSwapCommand(tool, toolRest, flags);
         break;
       }

@@ -48,7 +48,7 @@ and per-tool adapters. Core: `swap-pool.ts` (registry helpers, moved from
 remain as thin Claude bindings so callers and tests are unchanged. The shim
 (`shared/run-wrapper.ts`) and the daemon (`server/serve.ts`) go through the
 core; `AIS_CLAUDE_SWAP=0` drops claude and `AIS_POOL_SWAP_<TOOL>=0` drops any
-other tool from the daemon loop. No other adapter exists yet.
+other tool from the daemon loop. Adapters: claude, codex, kimi, pi.
 
 
 ### Codex adapter and `liveSwap: false` (tasks 43 and 44)
@@ -126,3 +126,59 @@ through `claude-swap/attribution.ts` `poolMemberUsageSplit(..., {tool})`:
 claude reads `projects/`, codex reads `sessions/**/rollout-*.jsonl`
 `token_count` events; both attribute by `activeMemberAt` on the tool's ledger.
 `ais limits` mirrors a pool row to its active member of the SAME tool.
+
+
+### Kimi and Pi adapters, `liveSwap: true` (task 46)
+
+`pool/kimi-adapter.ts` and `pool/pi-adapter.ts` are small specs over
+`pool/grant-file-adapter.ts` (`createGrantFileAdapter`): swap, write-back and
+heal are the Codex rules for any tool whose credentials are one JSON file with
+rotating OAuth tokens. Kimi's file is `<home>/credentials/kimi-code.json`; Pi's
+is the whole `<dir>/auth.json` (every provider). Members are checked by the
+adapter's optional `memberProblem` (used by `pool create`): an OAuth login whose
+access/refresh JWT names an account (`user_id`, else `sub`, else `uid`; Pi: the
+`kimi-coding` entry). A token without such a claim cannot be attributed, so it
+is rejected rather than guessed ("unattributable"); access and refresh naming
+different accounts is "hybrid". If Kimi tokens turn out to be opaque, pool
+create fails closed for every member and `tokenAccount` in
+`pool/token-account.ts` is the one place to teach.
+
+Why `liveSwap: true` (read from the installed packages, not assumed):
+- kimi-code 2.1.1: each request runs `OAuthManager.ensureFresh()`, which reloads
+  the token file (`FileTokenStorage.load`, plain readFileSync, no cache) and
+  saves with temp plus rename. Refresh rotates under `<home>/oauth/kimi-code.lock`
+  (proper-lockfile, stale 5s).
+- Pi: `AuthStorage.readLatestData()` compares the file revision on every read and
+  reloads on change. Refresh runs in `withLockAsync` on `auth.json.lock`
+  (proper-lockfile, stale 30s) and writes `{...snapshot, [provider]: refreshed}`.
+So a running session follows the swap on its next request and no relaunch notice
+is printed (`notifySwapped` is absent).
+
+The hazard that remains is the same rotating-token one as Codex: a refresh in
+flight for account A when the pool swaps to B saves A's rotated tokens over B.
+Swap and heal therefore take the tool's own lock (`withToolLock`: mkdir the same
+lock directory, stale-break, fail after 3s) around every write to a pool or
+vault file, in addition to the pool and `.oauth_refresh.lock` locks, and the
+scheduler now runs `heal` for every adapter that has one, live-swap or not.
+Heal additionally catches the same-account cases: pool newer than vault is
+written back, vault newer than pool (a member refresh whose write-through was
+skipped) is copied into the pool.
+
+Rules carried over from Codex: the pool grant is written back to the member that
+owns it (matched by account id) under the pool lock, only when strictly newer
+(Kimi: `expires_at`; Pi: `expires` ms per OAuth entry. When the pool file is the owner's own, every entry it rotated goes back; when the pool only holds the owner's account next to parts that may be another member's (foreign capture), just `kimi-coding` moves and a newer other-provider entry is kept as a backup). Backups are `<file>.pre-swap.<stamp>.bak` / `.pre-heal.<stamp>.bak` (0600, newest 10 kept); an unattributable or hybrid pool file is kept as a
+0600 `.pre-swap.bak`/`.pre-heal.bak`; AIS never refreshes the pool identity
+(`fetchKimiLimits`/`fetchPiLimits` return unavailable for a pool, `kimiCredentialStores`
+returns no stores for one, `refreshIdentityOAuthGrant("kimi", pool)` is `no-grant`).
+A member's refresh reaches pool copies through `persistKimiCredentials`
+(`writeThroughPools`: kimi and pi registries, only pools whose active member is
+that name, only while the pool file still holds the same account, short pool-lock
+wait, busy pools left to heal). Pi write-back covers every OAuth entry, but the
+member's native Kimi counterpart store is not updated by a swap write-back (the
+existing freshest-wins reconcile and kimi-store reads cover it).
+
+Usage: `fetchUsage` reuses `fetchKimiLimits` / `fetchPiLimits` (worst window; Pi
+takes the worst across its fetchable providers). `ais swap kimi|pi usage` is
+rejected: neither keeps a per-message log the ledger can split. Daemon opt-out:
+`AIS_POOL_SWAP_KIMI=0`, `AIS_POOL_SWAP_PI=0`. Not run: a live pool and a real
+kimi/pi session (no real credentials were touched).

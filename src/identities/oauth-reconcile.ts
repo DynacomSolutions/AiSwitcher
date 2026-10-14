@@ -405,7 +405,8 @@ async function configDirFor(identitiesJsonPath: string, identityName: string): P
     const identity = findIdentityByNameOrAlias(file.identities, identityName);
     // A retired counterpart is not a source or a target: a copy must never
     // restore a retired native credential, or the other way round.
-    return identity && !isRetired(identity) ? expandPath(identity.configDir) : undefined;
+    // A swap pool's file is only a view of its active member, never a pairing source or target.
+    return identity && !isRetired(identity) && !identity.swapPool ? expandPath(identity.configDir) : undefined;
   } catch {
     return undefined;
   }
@@ -425,7 +426,7 @@ export interface ReconcileRegistryPaths {
  * pi identity. A provider pairs only when the SAME-NAMED identity exists in
  * the native registry (never guess a source). */
 async function providerPairings(piIdentity: Identity, paths: ReconcileRegistryPaths = {}): Promise<ProviderPairing[]> {
-  if (isRetired(piIdentity)) return [];
+  if (isRetired(piIdentity) || piIdentity.swapPool) return [];
   const piAuthPath = join(expandPath(piIdentity.configDir), "auth.json");
   const [claudeDir, codexDir, grokDir, kimiDir] = await Promise.all([
     configDirFor(paths.claude ?? CLAUDE_CONFIG.identitiesJsonPath, piIdentity.name),

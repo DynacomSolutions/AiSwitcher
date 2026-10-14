@@ -359,6 +359,8 @@ describe("review fixes", () => {
     await put("pool", auth("acct-a", T0 + 100, { tag: "a-pool" }));
     const r = await swap("a");
     expect(r.writeBack).toBe("written");
+    expect(await refreshToken("pool")).toBe("SYNTHETIC_FIXTURE-rt-a-pool");
+    expect(await refreshToken("a")).toBe("SYNTHETIC_FIXTURE-rt-a-pool");
   });
 
   test("the target vault lock is held until the pool write is done", async () => {
