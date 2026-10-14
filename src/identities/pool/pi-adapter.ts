@@ -69,6 +69,11 @@ export const piAdapter = createGrantFileAdapter({
     }
     return changed ? next : undefined;
   },
+  hasPoolOnlyContent: (pool, vault) =>
+    entries(pool).some(([key, e]) => {
+      const v = vault?.[key];
+      return v === undefined || (!isOauth(e) && JSON.stringify(v) !== JSON.stringify(e));
+    }),
   toolLock: (dir) => ({ path: join(dir, "auth.json.lock"), staleMs: 30_000 }),
   fetchUsage: async (member, deps) => {
     const fetcher = (deps as { fetchPiLimits?: (identity: Identity) => Promise<ToolLimitResult[]> } | undefined)?.fetchPiLimits ?? ((m: Identity) => fetchPiLimits(m, true));

@@ -54,6 +54,10 @@ export interface GrantFileSpec {
   /** The owner's content after taking whatever in `pool` is strictly newer,
    * or undefined when nothing is. Keys the pool copy lacks survive. */
   newerInto(owner: GrantFile | undefined, pool: GrantFile): GrantFile | undefined;
+  /** The pool holds content the vault lacks that a restore or swap would
+   * drop and no write-back carries over (logins made inside the pool, edited
+   * static keys). Optional: a single-grant file has none. */
+  hasPoolOnlyContent?(pool: GrantFile, vault: GrantFile | undefined): boolean;
   /** The lock directory the tool itself takes around its own refreshes. */
   toolLock(configDir: string): { path: string; staleMs: number };
   fetchUsage(member: Identity, deps?: unknown): Promise<PoolUsage>;
@@ -213,11 +217,17 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
           if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
         }
       }
-      // A live grant we cannot attribute is never silently destroyed.
-      if ((writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && live.text !== undefined) {
+      // A live grant we cannot attribute, or pool-only content no write-back carries over, is never silently destroyed.
+      let poolOnly = false;
+      if (spec.hasPoolOnlyContent && live.grant && live.who.id && !live.who.hybrid) {
+        const owner = members.find((m) => m.name === (activeName ?? target.name));
+        const vault = owner ? (await load(owner.configDir)).grant : undefined;
+        poolOnly = spec.hasPoolOnlyContent(live.grant, vault);
+      }
+      if ((poolOnly || writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && live.text !== undefined) {
         const backup = `${poolPath}.pre-swap.bak`;
         await writeFileAtomic(backup, live.text);
-        notes.push(`live pool credentials could not be attributed to a member; kept a 0600 copy at ${backup}`);
+        notes.push(`live pool credentials ${poolOnly ? "hold entries the member lacks" : "could not be attributed to a member"}; kept a 0600 copy at ${backup}`);
       }
 
       // The write-back may have just updated the target's own vault (pool held the target's account): copy the vault as it is now.
@@ -254,6 +264,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     if (!activeName || !active) return [];
     const vault = await load(active.configDir);
     if (vault.text === undefined || !spec.usable(vault.grant) || !vault.who.id) return [`cannot heal ${pool.name}: active account "${activeName}" has no usable login in its vault`];
+    if (!spec.complete(vault.grant)) return [`cannot heal ${pool.name}: active account "${activeName}" has an incomplete login in its vault (not restoring from it)`];
     const vaultGrant = vault.grant!;
 
     const poolPath = fileOf(pool.configDir);
@@ -309,6 +320,14 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         notes.push(`pool ${pool.name} was behind the vault of "${activeName}" (a member refresh missed it)`);
       } else {
         notes.push(`pool ${pool.name} credentials were empty or partial`);
+      }
+      // Anything a restore would drop and no write-back kept (damaged but non-empty, pool-only entries) gets a backup first.
+      const backup = `${poolPath}.pre-heal.bak`;
+      const alreadyBacked = notes.some((n) => n.includes(backup));
+      const dropsContent = now.kind === "damaged" ? now.text !== undefined && now.text.trim() !== "" : now.grant !== undefined && spec.hasPoolOnlyContent?.(now.grant, vault.grant) === true;
+      if (!alreadyBacked && dropsContent) {
+        await writeFileAtomic(backup, now.text!);
+        notes.push(`pool ${pool.name} credentials held content the vault lacks; kept a 0600 copy at ${backup}`);
       }
       // Re-read the vault under the pool lock: a write-back above may have merged newer tokens into it.
       const restoreText = (await readText(active.configDir)) ?? vault.text!;

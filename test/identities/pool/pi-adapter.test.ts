@@ -180,6 +180,53 @@ describe("pi swapCredentials write and verify", () => {
   });
 });
 
+describe("pi pool-only entries are never dropped silently", () => {
+  const login = { opencode: { type: "oauth", access: "SYNTHETIC_FIXTURE-oc-acc", refresh: "SYNTHETIC_FIXTURE-oc-rt", expires: 1 } };
+
+  test("swap keeps a 0600 backup when the pool holds a login the vault lacks or an edited api key", async () => {
+    await setup();
+    await put("pool", auth("user-a", T0, { extra: login }));
+    const r = await swap("b");
+    const bak = join(dirOf("pool"), "auth.json.pre-swap.bak");
+    expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-oc-rt");
+    expect((await stat(bak)).mode & 0o777).toBe(0o600);
+    expect(r.notes.join(" ")).toContain("pre-swap.bak");
+    await rm(bak);
+    await swap("a");
+    const edited = JSON.parse(await read("pool")) as Record<string, unknown>;
+    edited.zai = { type: "api_key", key: "SYNTHETIC_FIXTURE-edited" };
+    await put("pool", JSON.stringify(edited));
+    await swap("b");
+    expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-edited");
+  });
+
+  test("a clean pool leaves no backup", async () => {
+    await setup();
+    await swap("b");
+    await expect(stat(join(dirOf("pool"), "auth.json.pre-swap.bak"))).rejects.toThrow();
+  });
+
+  test("heal keeps a 0600 backup before restoring over pool-only entries", async () => {
+    await setup();
+    await put("pool", auth("user-a", T0 - 50, { extra: login })); // same account, older: restore would drop the login
+    await healPool();
+    const bak = join(dirOf("pool"), "auth.json.pre-heal.bak");
+    expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-oc-rt");
+    expect((await stat(bak)).mode & 0o777).toBe(0o600);
+  });
+
+  test("heal never restores from an incomplete vault", async () => {
+    await setup();
+    const broken = JSON.parse(await read("a")) as Record<string, Record<string, unknown>>;
+    delete broken["openai-codex"]!.refresh;
+    await put("a", JSON.stringify(broken));
+    await put("pool", auth("user-a", T0 + 400, { tag: "a-pool-refreshed" }));
+    const before = await read("pool");
+    expect((await healPool()).join(" ")).toContain("cannot heal");
+    expect(await read("pool")).toBe(before);
+  });
+});
+
 describe("pi heal", () => {
   test("restores an empty, partial or structurally invalid file from the active vault", async () => {
     await setup();

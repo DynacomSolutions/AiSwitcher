@@ -265,6 +265,16 @@ describe("kimi heal", () => {
     expect(await read("pool")).toBe(await read("a"));
   });
 
+  test("a complete pool file with no account id is backed up at 0600 before it is restored", async () => {
+    await setup();
+    await put("pool", JSON.stringify({ access_token: "SYNTHETIC_FIXTURE-opaque", refresh_token: "SYNTHETIC_FIXTURE-opaque-rt", expires_at: T0 + 10 }));
+    expect((await healPool()).join(" ")).toContain('restored "a"');
+    const bak = `${credPath("pool")}.pre-heal.bak`;
+    expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-opaque-rt");
+    expect((await stat(bak)).mode & 0o777).toBe(0o600);
+    expect(await read("pool")).toBe(await read("a"));
+  });
+
   test("a revoked tombstone written by the CLI is restored from the vault", async () => {
     await setup();
     await put("pool", JSON.stringify({ access_token: "", refresh_token: "", expires_at: 0, scope: "kimi-code" }));
