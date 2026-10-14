@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { lockOrder } from "../../../src/identities/claude-swap-lock.ts";
+import { lockOrder, withOauthRefreshLock } from "../../../src/identities/claude-swap-lock.ts";
 import { codexAdapter } from "../../../src/identities/pool/codex-adapter.ts";
+import { loadIdentitiesFile } from "../../../src/identities/store.ts";
+import { requirePool } from "../../../src/identities/pool/swap-pool.ts";
 import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
 
 let root: string;
@@ -49,4 +51,27 @@ test("two pools sharing members swap concurrently without a lock timeout", async
     for (const id of file.identities) if (id.name === "p1") id.swapPool.active = "x"; else if (id.name === "p2") id.swapPool.active = "m";
     await writeFile(registryPath, JSON.stringify(file));
   }
+});
+
+test("heal restores the vault as it is under the lock, not a token a refresh just spent", async () => {
+  const T0 = 1_789_200_000;
+  const dir = (n: string) => join(root, n);
+  const member = (name: string) => ({ name, label: name, configDir: dir(name) });
+  const registryPath = join(root, "codex-identities.json");
+  await writeFile(registryPath, JSON.stringify({ version: 1, identities: [member("m"), { ...member("p"), swapPool: { accounts: ["m"], active: "m" } }] }));
+  const put = async (name: string, text: string) => { await mkdir(dir(name), { recursive: true }); await writeFile(join(dir(name), "auth.json"), text); };
+  await put("m", auth("acct-m", T0));
+  await put("p", "");
+  const file = await loadIdentitiesFile(registryPath);
+  const pool = requirePool(file, "p", "codex");
+  const members = [file.identities.find((i) => i.name === "m")!];
+  // A refresh holds the vault lock; heal has already read the old vault by the time it waits for it.
+  let heal!: Promise<string[]>;
+  await withOauthRefreshLock(dir("m"), async () => {
+    heal = codexAdapter.heal!(pool, members, { timeoutMs: 5_000 });
+    await Bun.sleep(300);
+    await writeFile(join(dir("m"), "auth.json"), auth("acct-m", T0 + 500));
+  });
+  await heal;
+  expect(await readFile(join(dir("p"), "auth.json"), "utf8")).toBe(auth("acct-m", T0 + 500));
 });
