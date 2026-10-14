@@ -3,3 +3,4 @@ dist/
 *.log
 .crush/
 .claude/
+mods/**/.claude-plugin/types/
