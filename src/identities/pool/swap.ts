@@ -1,10 +1,18 @@
-import type { LockOptions } from "../claude-swap-lock.ts";
 import { isRetired } from "../retired.ts";
 import { loadIdentitiesFile, saveIdentitiesFile } from "../store.ts";
 import type { Identity } from "../types.ts";
 import type { PoolAdapter, SwapReason, SwapResult } from "./adapter.ts";
 import { appendSwapEvent, ledgerPathFor } from "./ledger.ts";
-import { isAllowed, memberIdentity, requirePool, SwapPoolError } from "./swap-pool.ts";
+import { withPoolLock, type LockOptions } from "./lock.ts";
+import { isAllowed, memberIdentity, requirePool, SwapPoolError, type PoolIdentity } from "./swap-pool.ts";
+
+/** Thrown by a `guard` to abandon a swap; `outcome` is the caller's own value. */
+export class SwapSkipped<O = unknown> extends Error {
+  constructor(readonly outcome: O) {
+    super("swap skipped");
+    this.name = "SwapSkipped";
+  }
+}
 
 export interface PerformSwapOptions {
   registryPath?: string;
@@ -18,14 +26,27 @@ export interface PerformSwapOptions {
   ledgerPath?: string;
   lock?: LockOptions;
   now?: () => Date;
+  /** Runs under the pool lock after the registry re-read, before any
+   * credential is touched; throw `SwapSkipped` to abandon the swap. */
+  guard?: (ctx: { pool: PoolIdentity; ledgerPath: string }) => Promise<void>;
 }
 
 /** Full swap: validate, swap credentials through the adapter, persist
  * `swapPool.active`, append the ledger event. */
 export async function performPoolSwap(adapter: PoolAdapter<any>, options: PerformSwapOptions): Promise<SwapResult> {
   const registryPath = options.registryPath ?? adapter.config.identitiesJsonPath;
+  // Resolve the pool dir unlocked, then hold the pool lock across the whole
+  // read-decide-write sequence so two swappers cannot both act on stale state.
+  const poolDir = requirePool(await loadIdentitiesFile(registryPath), options.pool).configDir;
+  return withPoolLock(poolDir, () => swapLocked(adapter, options), options.lock);
+}
+
+async function swapLocked(adapter: PoolAdapter<any>, options: PerformSwapOptions): Promise<SwapResult> {
+  const registryPath = options.registryPath ?? adapter.config.identitiesJsonPath;
   const file = await loadIdentitiesFile(registryPath);
   const pool = requirePool(file, options.pool);
+  const ledgerPath = options.ledgerPath ?? ledgerPathFor(adapter.tool);
+  await options.guard?.({ pool, ledgerPath });
   const target = memberIdentity(file, pool, options.target);
   if (isRetired(target)) throw new SwapPoolError(`Account "${target.name}" is retired`);
   if (!options.force && !isAllowed(pool, target.name)) {
@@ -46,7 +67,7 @@ export async function performPoolSwap(adapter: PoolAdapter<any>, options: Perfor
   if (!fsResult.noop) {
     await appendSwapEvent(
       { ts: (options.now?.() ?? new Date()).toISOString(), pool: pool.name, from: fsResult.from, to: target.name, reason: options.reason },
-      options.ledgerPath ?? ledgerPathFor(adapter.tool),
+      ledgerPath,
     );
   }
   let runningSessions: number | undefined;

@@ -99,4 +99,31 @@ describe("generic pool core", () => {
     const back = await performPoolSwap(throwing, { registryPath: registry, ledgerPath: ledger, target: "a", reason: "manual" });
     expect(back.to).toBe("a");
   });
+
+  test("two concurrent swapIfLimited on one pool produce exactly one ledger event", async () => {
+    const registry = join(root, "codex.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "codex-swap.jsonl");
+    let arrived = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const util: Record<string, number> = { a: 99, b: 5 };
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("codex", registry, util),
+      fetchUsage: async (m) => {
+        if (m.name === "a" && ++arrived <= 2) {
+          if (arrived === 2) release();
+          await barrier;
+        }
+        return live(util[m.name] ?? 0);
+      },
+    };
+    const now = () => 1_000_000;
+    const [x, y] = await Promise.all([
+      swapIfLimited(adapter, { ledgerPath: ledger, now }, "pool", "auto"),
+      swapIfLimited(adapter, { ledgerPath: ledger, now }, "pool", "auto"),
+    ]);
+    expect([x.action, y.action].filter((a) => a === "swapped")).toHaveLength(1);
+    expect(await readSwapEvents(ledger)).toHaveLength(1);
+  });
 });
