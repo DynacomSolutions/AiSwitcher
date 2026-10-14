@@ -1,8 +1,11 @@
+import { isRetired } from "../retired.ts";
 import { loadIdentitiesFile } from "../store.ts";
 import type { PoolAdapter } from "./adapter.ts";
 import { swapIfLimited, type LimitedOutcome, type PoolOpsDeps } from "./ops.ts";
+import { withPoolLock } from "./lock.ts";
 import { allAdapters } from "./registry.ts";
-import { poolsOf } from "./swap-pool.ts";
+import { poolsOf, type PoolIdentity } from "./swap-pool.ts";
+import type { Identity } from "../types.ts";
 
 /**
  * Daemon loop: for every swap pool with `auto` on, in the registry of every
@@ -62,7 +65,27 @@ export class PoolSwapScheduler {
   }
 
   private async poolsOfAdapter(adapter: PoolAdapter<any>) {
-    return poolsOf(await loadIdentitiesFile(this.deps.perTool?.[adapter.tool]?.registryPath ?? adapter.config.identitiesJsonPath));
+    return poolsOf(await this.fileOf(adapter));
+  }
+
+  private fileOf(adapter: PoolAdapter<any>) {
+    return loadIdentitiesFile(this.deps.perTool?.[adapter.tool]?.registryPath ?? adapter.config.identitiesJsonPath);
+  }
+
+  /** Heal pass for `liveSwap: false` adapters: a running session can rewrite
+   * the pool credentials after a swap, so repair them every tick, under the pool lock. */
+  private async healPool(adapter: PoolAdapter<any>, pool: PoolIdentity): Promise<void> {
+    if (adapter.liveSwap || !adapter.heal) return;
+    try {
+      const file = await this.fileOf(adapter);
+      const members = pool.swapPool.accounts
+        .map((name) => file.identities.find((i) => i.name === name))
+        .filter((i): i is Identity => i !== undefined && !isRetired(i));
+      const lock = { timeoutMs: 1_500 };
+      for (const note of await withPoolLock(pool.configDir, () => adapter.heal!(pool, members, lock), lock)) this.log(adapter.tool, note);
+    } catch (err) {
+      this.log(adapter.tool, `pool ${pool.name}: heal failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** One pass over the pools whose next poll is due. Exported for tests. */
@@ -76,6 +99,7 @@ export class PoolSwapScheduler {
       }
       for (const pool of pools) {
         if (this.stopped) return;
+        await this.healPool(adapter, pool);
         if (pool.swapPool.auto !== true) continue;
         const key = `${adapter.tool}:${pool.name}`;
         const st = this.state.get(key) ?? { lastCheckAt: 0, nextAt: 0, backoffMs: 0, lastOutcome: null };

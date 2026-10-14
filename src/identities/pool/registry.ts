@@ -1,4 +1,5 @@
 import { claudeAdapter } from "./claude-adapter.ts";
+import { codexAdapter } from "./codex-adapter.ts";
 import type { PoolAdapter } from "./adapter.ts";
 import type { ToolConfig } from "../types.ts";
 
@@ -17,3 +18,4 @@ export function allAdapters(): PoolAdapter<any>[] {
 }
 
 registerAdapter(claudeAdapter);
+registerAdapter(codexAdapter);
