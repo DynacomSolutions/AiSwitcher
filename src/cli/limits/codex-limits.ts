@@ -57,7 +57,7 @@ export interface RateLimitResetCreditsWire {
   credits?: RateLimitResetCreditWire[];
 }
 
-interface JsonRpcMessage {
+export interface JsonRpcMessage {
   id?: number;
   method?: string;
   result?: unknown;
@@ -80,7 +80,7 @@ interface MinimalStreamReader {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
 }
 
-class NdjsonReader {
+export class NdjsonReader {
   private reader: MinimalStreamReader;
   private decoder = new TextDecoder();
   private buffer = "";
@@ -111,7 +111,7 @@ class NdjsonReader {
   }
 }
 
-async function waitForResponse(reader: NdjsonReader, id: number): Promise<JsonRpcMessage> {
+export async function waitForResponse(reader: NdjsonReader, id: number): Promise<JsonRpcMessage> {
   while (true) {
     const msg = await reader.next();
     if (!msg) throw new Error("codex app-server closed its output before responding.");

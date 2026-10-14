@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { aggregateLimitResults, fetchLimitResults, isMirroredPoolTarget, pendingLimitResult, runBatched } from "../../../src/cli/limits/collect.ts";
 import type { ToolLimitResult } from "../../../src/cli/limits/types.ts";
 import type { Identity, ToolConfig } from "../../../src/identities/types.ts";
@@ -16,18 +19,34 @@ function row(overrides: Partial<ToolLimitResult> & Pick<ToolLimitResult, "toolNa
 }
 
 describe("pendingLimitResult", () => {
-  test("1:1 tools seed a pending row under their known provider", () => {
-    const pending = pendingLimitResult(target("claude"))!;
-    expect(pending.provider).toBe("anthropic");
-    expect(pending.status).toBe("pending");
+  test("1:1 tools seed a pending row under their known provider", async () => {
+    const [pending] = await pendingLimitResult(target("claude"));
+    expect(pending!.provider).toBe("anthropic");
+    expect(pending!.status).toBe("pending");
   });
 
-  test("multi-provider clients seed NOTHING — no fake 'Detecting providers'/'OpenCode' section", () => {
-    // Their provider isn't known until the adapter reads the identity's own
-    // auth store; a tool-shaped placeholder row renders a section named
-    // after a tool, which the provider-first views rule forbids.
-    expect(pendingLimitResult(target("pi"))).toBeUndefined();
-    expect(pendingLimitResult(target("opencode"))).toBeUndefined();
+  test("multi-provider clients with no readable auth store seed nothing", async () => {
+    expect(await pendingLimitResult(target("pi"))).toEqual([]);
+    expect(await pendingLimitResult(target("opencode"))).toEqual([]);
+  });
+
+  test("pi and opencode seed one pending row per fetchable provider, skipping native-covered ones", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ais-pending-"));
+    try {
+      const piDir = join(dir, "pi");
+      const ocDir = join(dir, "oc");
+      mkdirSync(piDir, { recursive: true });
+      mkdirSync(join(ocDir, "data", "opencode"), { recursive: true });
+      writeFileSync(join(piDir, "auth.json"), JSON.stringify({ anthropic: { type: "oauth" }, zai: { key: "k" }, "opencode-go": { key: "k" } }));
+      writeFileSync(join(ocDir, "data", "opencode", "auth.json"), JSON.stringify({ alibaba_token_plan: { key: "k" }, zai_coding_plan: { key: "k" } }));
+      const pi = await pendingLimitResult({ toolName: "pi", identity: { ...identity("a"), configDir: piDir } });
+      const oc = await pendingLimitResult({ toolName: "opencode", identity: { ...identity("a"), configDir: ocDir } });
+      expect(pi.map((r) => r.provider)).toEqual(["zai", "opencode-go"]);
+      expect(oc.map((r) => r.provider)).toEqual(["zai"]);
+      expect([...pi, ...oc].every((r) => r.status === "pending")).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

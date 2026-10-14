@@ -41,13 +41,8 @@ export async function runWatch(
     async () => {
       while (true) {
         const targets = await collectLimitTargets(identityFilter, flags);
-        // One slot per target — 1:1 tools seed a pending spinner row,
-        // multi-provider clients seed nothing until their per-provider
-        // rows land (see collect.ts's MULTI_PROVIDER_TOOLS).
-        slots = targets.map((target) => {
-          const pending = pendingLimitResult(target);
-          return pending ? [pending] : [];
-        });
+        // One slot per target, seeded with pending spinner rows (see collect.ts's pendingLimitResult).
+        slots = await Promise.all(targets.map(pendingLimitResult));
         statusLine = dim("fetching…");
         await fetchLimitResults(targets, false, explicitTool, (i, resolved) => (slots[i] = resolved));
         statusLine = dim(`updated ${new Date().toLocaleTimeString()}`);

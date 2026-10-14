@@ -8,10 +8,10 @@ import { fetchAliLimits } from "./ali-limits.ts";
 import { fetchAwsBedrockLimits } from "./aws-bedrock-limits.ts";
 import { fetchClaudeLimits } from "./claude-limits.ts";
 import { fetchCodexLimits } from "./codex-limits.ts";
-import { fetchGrokLimits } from "./grok-limits.ts";
+import { fetchGrokLimits, fetchGrokLimitsFromLog } from "./grok-limits.ts";
 import { fetchKimiLimits } from "./kimi-limits.ts";
-import { fetchOpencodeLimits } from "./opencode-limits.ts";
-import { fetchPiLimits } from "./pi-limits.ts";
+import { fetchOpencodeLimits, pendingOpencodeProviders } from "./opencode-limits.ts";
+import { fetchPiLimits, pendingPiProviders } from "./pi-limits.ts";
 import { fetchZaiLimits } from "./zai-limits.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import { annotateWithSpendGuard } from "../../spend/annotate.ts";
@@ -57,7 +57,7 @@ function singleToolFetcher(
 const FETCHERS: Partial<Record<ToolConfig["toolName"], LimitFetcher>> = {
   claude: singleToolFetcher(fetchClaudeLimits, "claude"),
   codex: fetchCodexLimitsForIdentity,
-  grok: singleToolFetcher(fetchGrokLimits, "grok"),
+  grok: singleToolFetcher((identity) => fetchGrokLimits(identity), "grok"),
   kimi: singleToolFetcher(fetchKimiLimits, "kimi"),
   zai: singleToolFetcher(fetchZaiLimits, "zai"),
   ali: singleToolFetcher(fetchAliLimits, "ali"),
@@ -133,25 +133,30 @@ export async function collectLimitTargets(
  * gets an honest row. */
 const MULTI_PROVIDER_TOOLS: ReadonlySet<ToolConfig["toolName"]> = new Set(["pi", "opencode"]);
 
-/** Seeds a placeholder result for a not-yet-fetched 1:1 tool — what
+/** Seeds placeholder results for a not-yet-fetched target — what
  * limits/dispatch.ts's plain live render and limits/watch.ts's `--watch`
  * loop both use to give report.ts's "pending" spinner row something to
- * render for a target before its own fetch has resolved. Multi-provider
- * clients get NO pending seed: their provider isn't known yet, and a
- * placeholder under the tool's own fallback label would render a fake
- * tool-shaped section. Returns undefined for those. codex Bedrock-backed
- * identities DO get a seed, but stamped "aws-bedrock" — a pending "OpenAI"
- * spinner over an identity whose provider is AWS would be the same wrong
- * label by another route (detection is a cheap sync config.toml read). */
-export function pendingLimitResult(target: LimitTarget): ToolLimitResult | undefined {
-  if (MULTI_PROVIDER_TOOLS.has(target.toolName)) return undefined;
-  const provider =
-    target.toolName === "codex" && isBedrockIdentity(target.identity) ? "aws-bedrock" : providerForTool(target.toolName);
-  return { toolName: target.toolName, provider, identity: target.identity, windows: [], status: "pending" };
+ * render for a target before its own fetch has resolved. 1:1 tools get one
+ * row. Multi-provider clients (pi, opencode) get one row per provider the
+ * fetch will answer for, found by a cheap local auth-store read (no
+ * network), so provider sections and their order are fixed from the first
+ * frame; with none fetchable they seed nothing, as a tool-shaped
+ * placeholder would render a fake section. codex Bedrock-backed identities
+ * are stamped "aws-bedrock" — a pending "OpenAI" spinner over an identity
+ * whose provider is AWS would be the wrong label (detection is a cheap sync
+ * config.toml read). */
+export async function pendingLimitResult(target: LimitTarget): Promise<ToolLimitResult[]> {
+  const { toolName, identity } = target;
+  if (MULTI_PROVIDER_TOOLS.has(toolName)) {
+    const providers = toolName === "pi" ? await pendingPiProviders(identity) : await pendingOpencodeProviders(identity);
+    return providers.map((provider) => ({ toolName, provider, identity, windows: [], status: "pending" as const }));
+  }
+  const provider = toolName === "codex" && isBedrockIdentity(identity) ? "aws-bedrock" : providerForTool(toolName);
+  return [{ toolName, provider, identity, windows: [], status: "pending" }];
 }
 
-/** Grok's fetch is always a local log-scrape (no live path exists at all —
- * see grok-limits.ts), so `--cached` doesn't change its behavior. Claude,
+/** Grok under `--cached` is the local log-scrape only (see cachedResults),
+ * never a spawn. Claude,
  * Codex, Kimi, zai, and ali have no offline cache in this version — under
  * `--cached` they report "unavailable" honestly rather than silently
  * falling back to a live call. */
@@ -172,7 +177,7 @@ function unavailableCached(target: LimitTarget): ToolLimitResult {
  * nothing unscoped — a placeholder section ("Detecting providers",
  * "OpenCode") would be exactly the tool-shaped output the provider-first
  * views rule forbids. An explicit --tool= still gets the honest row. */
-function cachedResults(target: LimitTarget, explicitTool: boolean): ToolLimitResult[] {
+function cachedResults(target: LimitTarget, explicitTool: boolean): ToolLimitResult[] | Promise<ToolLimitResult[]> {
   if (MULTI_PROVIDER_TOOLS.has(target.toolName)) {
     return explicitTool
       ? [
@@ -187,6 +192,9 @@ function cachedResults(target: LimitTarget, explicitTool: boolean): ToolLimitRes
         ]
       : [];
   }
+  if (target.toolName === "grok") {
+    return fetchGrokLimitsFromLog(target.identity).then((r) => [{ ...r, provider: providerForTool("grok") }]);
+  }
   return [unavailableCached(target)];
 }
 
@@ -197,9 +205,9 @@ function cachedResults(target: LimitTarget, explicitTool: boolean): ToolLimitRes
  * once, even though nothing found in investigation suggests these reads
  * consume visible rate-limit budget themselves. Claude and Grok reads have
  * no such concern (Claude's non-interactive /usage is a single
- * client-intercepted call per identity; Grok is pure local file I/O) but are
- * batched through the same pool for simplicity — the cap only meaningfully
- * throttles Codex, Kimi, and zai in practice. Pi and opencode fan out to one
+ * client-intercepted call per identity; Grok spawns a short-lived local ACP
+ * process) but are batched through the same pool for simplicity — the cap
+ * only meaningfully throttles Codex, Kimi, and zai in practice. Pi and opencode fan out to one
  * backend call per provider they hold a fetchable credential for, so the
  * cap bounds them the same way. */
 const MAX_CONCURRENT = 6;
