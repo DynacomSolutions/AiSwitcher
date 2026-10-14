@@ -127,3 +127,14 @@ describe("generic pool core", () => {
     expect(await readSwapEvents(ledger)).toHaveLength(1);
   });
 });
+
+describe("claude scheduler view", () => {
+  test("is null when the claude adapter is not served", async () => {
+    const { claudeSchedulerView } = await import("../../../src/server/claude-swap-auto.ts");
+    const registry = join(root, "codex.json");
+    await writeRegistry(registry);
+    const only = (tool: "claude" | "codex") => new PoolSwapScheduler({ adapters: () => [fakeAdapter(tool, registry, {})] });
+    expect(claudeSchedulerView(await only("codex").status())).toBeNull();
+    expect(claudeSchedulerView(await only("claude").status())?.pools).toHaveLength(1);
+  });
+});

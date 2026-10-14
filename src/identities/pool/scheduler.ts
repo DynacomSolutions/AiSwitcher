@@ -24,6 +24,8 @@ export function jitteredDelayMs(random: () => number = Math.random): number {
 export interface PoolSwapStatusDto {
   ok: true;
   enabled: boolean;
+  /** Tools whose adapter this scheduler serves. */
+  tools: string[];
   pools: Array<{ tool: string; pool: string; auto: boolean; lastCheckAt: string | null; lastOutcome: string | null; backoffMs: number }>;
 }
 
@@ -137,6 +139,6 @@ export class PoolSwapScheduler {
         // no registry yet
       }
     }
-    return { ok: true, enabled: true, pools: out };
+    return { ok: true, enabled: true, tools: this.adapters().map((a) => a.tool), pools: out };
   }
 }
