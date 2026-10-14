@@ -19,6 +19,13 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 50
   `exec.ts` (inherited stdio, signal relay SIGINT/SIGTERM/SIGHUP/SIGQUIT/SIGTSTP,
   exit-code mirroring) with the sidecar still doing the session work; a sidecar
   that cannot start falls back to the fully in-process legacy flow.
+  The sidecar is double-forked through a short-lived `sh` so it is never the
+  tool's child. Every fallback to the old spawn path appends one line to
+  `~/.ais/state/shim-fallback.log` (never the terminal). Anything that must
+  finish before the exec has to be awaited first: `poolLaunchCheck` therefore
+  waits up to `LAUNCH_SETTLE_MS` past its 4 s budget and never abandons a swap
+  that has started. `AIS_HERDR_TITLE_OWNER_PID` for a nested launch names the
+  parent, not the wrapper, because the tool now shares the wrapper's PID.
   `execReal` (usage passthrough, `open`) tries execve first; `ais upgrade` and
   `ais herdr` keep `spawnReal` (sequential or follow-up work after the child).
 - **Shims install to `~/.local/bin`, not a dedicated shim directory.** This
