@@ -43,7 +43,8 @@ export function codexMemberProblem(member: Identity): string | undefined {
   if (isBedrockIdentity(member)) return `"${member.name}" is a Bedrock identity (pools need ChatGPT logins)`;
   const auth = parseCodexAuth(readSyncOrUndefined(codexAuthPath(member.configDir)));
   if (!hasCodexTokens(auth)) return `"${member.name}" has no ChatGPT login (API-key or logged-out; run "codex login" under that identity)`;
-  if (!codexAccountOf(auth).id) return `"${member.name}" has an inconsistent or missing account id in auth.json`;
+  // Same rule as heal: a member must carry tokens.account_id (agreeing with its JWT), never a JWT-only id.
+  if (!codexAccountOf(auth).fileId || !codexAccountOf(auth).id) return `"${member.name}" has an inconsistent or missing account id in auth.json`;
   return undefined;
 }
 
@@ -65,9 +66,10 @@ async function ownerByAccount(members: Identity[], accountId: string, activeName
 }
 
 /** Writes the pool's grant into the owning member's vault when it is newer. */
-async function writeBackToOwner(owner: Identity, poolAuth: CodexAuthFile, lock?: LockOptions): Promise<WriteBackOutcome> {
+async function writeBackToOwner(owner: Identity, poolAuth: CodexAuthFile, lock?: LockOptions, alreadyLocked = false): Promise<WriteBackOutcome> {
   const poolId = codexAccountOf(poolAuth).id;
-  return withOauthRefreshLock(owner.configDir, async (): Promise<WriteBackOutcome> => {
+  const locked = <T>(fn: () => Promise<T>) => (alreadyLocked ? fn() : withOauthRefreshLock(owner.configDir, fn, lock));
+  return locked(async (): Promise<WriteBackOutcome> => {
     // Read and compare under the owner's lock so a concurrent member refresh is never overwritten.
     const ownerAuth = parseCodexAuth(await readCodexAuthText(owner.configDir));
     if (hasCodexTokens(ownerAuth)) {
@@ -77,10 +79,11 @@ async function writeBackToOwner(owner: Identity, poolAuth: CodexAuthFile, lock?:
       if (o.access_token === p.access_token && o.refresh_token === p.refresh_token) return "none-identical";
       if (codexRecency(poolAuth) <= codexRecency(ownerAuth)) return "none-member-newer";
     }
-    const next = { ...(ownerAuth ?? {}), tokens: poolAuth.tokens, ...(poolAuth.last_refresh !== undefined ? { last_refresh: poolAuth.last_refresh } : {}) };
+    // Merge so keys the pool copy lacks (account_id, id_token) survive in the vault.
+    const next = { ...(ownerAuth ?? {}), tokens: { ...(ownerAuth?.tokens ?? {}), ...poolAuth.tokens }, ...(poolAuth.last_refresh !== undefined ? { last_refresh: poolAuth.last_refresh } : {}) };
     await writeFileAtomic(codexAuthPath(owner.configDir), json(next));
     return "written";
-  }, lock);
+  });
 }
 
 async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>[0]): Promise<Omit<SwapResult, "reason">> {
@@ -89,8 +92,9 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
   const poolPath = codexAuthPath(poolDir);
   const notes: string[] = [];
 
-  return withOauthRefreshLock(poolDir, async () => {
-    const targetText = await withOauthRefreshLock(target.configDir, () => readCodexAuthText(target.configDir), lock);
+  // Lock order: pool, pool oauth, then the target vault, held until the pool write is verified.
+  return withOauthRefreshLock(poolDir, () => withOauthRefreshLock(target.configDir, async () => {
+    const targetText = await readCodexAuthText(target.configDir);
     const targetAuth = parseCodexAuth(targetText);
     if (targetText === undefined || !hasCodexTokens(targetAuth)) {
       throw new SwapPoolError(`Account "${target.name}" has no usable Codex login (no ChatGPT tokens in ${target.configDir}); run "codex login" under that identity first.`);
@@ -118,7 +122,7 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
       if (!owner) {
         writeBack = "none-unknown-owner";
       } else {
-        writeBack = await writeBackToOwner(owner, poolAuth!, lock);
+        writeBack = await writeBackToOwner(owner, poolAuth!, lock, owner.configDir === target.configDir);
         if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
       }
     }
@@ -136,7 +140,7 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
       throw new SwapPoolError(`could not verify ${poolPath} after the swap (account id mismatch); the previous file was restored`);
     }
     return { pool: pool.name, from: activeName, to: target.name, noop: false, writeBack, notes };
-  }, lock);
+  }, lock), lock);
 }
 
 /**
@@ -164,8 +168,9 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
     const text = await readCodexAuthText(pool.configDir);
     const auth = parseCodexAuth(text);
     const acct = codexAccountOf(auth);
-    const complete = hasCodexTokens(auth) && typeof auth?.tokens?.id_token === "string" && auth.tokens.id_token !== "" && acct.fileId !== undefined;
-    const kind = !complete ? "damaged" : acct.hybrid ? "hybrid" : acct.id === vaultAcct.id ? "ok" : acct.id ? "foreign" : "damaged";
+    const complete = hasCodexTokens(auth) && typeof auth?.tokens?.id_token === "string" && auth.tokens.id_token !== "";
+    const newer = complete && auth!.tokens!.refresh_token !== vaultAuth!.tokens!.refresh_token && codexRecency(auth) > codexRecency(vaultAuth);
+    const kind = !complete ? "damaged" : acct.hybrid ? "hybrid" : acct.id === vaultAcct.id ? (newer ? "same" : "ok") : acct.id ? "foreign" : "damaged";
     return { text, auth, acct, kind } as const;
   };
   let state = await classify();
@@ -184,6 +189,11 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
       now = await classify();
     }
     if (now.kind === "ok") return [];
+    if (now.kind === "same") {
+      // Same account as the active vault: never restore over it, keep the newer tokens in the vault.
+      const outcome = await writeBackToOwner(active, now.auth!, lock);
+      return [`pool ${pool.name} held newer tokens for "${activeName}"; vault write-back: ${outcome}`];
+    }
     if (now.kind === "foreign") {
       const owner = await ownerByAccount(members, now.acct.id!, activeName);
       if (owner) {

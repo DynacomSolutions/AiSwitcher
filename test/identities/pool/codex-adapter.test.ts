@@ -334,4 +334,47 @@ describe("review fixes", () => {
     expect(await read("pool")).toBe(rotated);
     expect(notes).toEqual([]);
   });
+
+  test("member validation requires tokens.account_id", async () => {
+    const t = JSON.parse(auth("acct-n", T0)) as { tokens: Record<string, unknown> };
+    delete t.tokens.account_id;
+    await put("n", JSON.stringify(t));
+    expect(codexMemberProblem(member("n"))).toContain("missing account id");
+  });
+
+  test("heal writes a newer same-account pool grant back to the vault instead of restoring over it", async () => {
+    await setup();
+    const strip = (text: string) => { const t = JSON.parse(text) as { tokens: Record<string, unknown> }; delete t.tokens.account_id; return JSON.stringify(t); };
+    await put("pool", strip(auth("acct-a", T0 + 400, { tag: "a-rotated" })));
+    const notes = await healPool();
+    expect(notes.join(" ")).toContain("write-back: written");
+    expect(await refreshToken("a")).toBe("SYNTHETIC_FIXTURE-rt-a-rotated");
+    expect((JSON.parse(await read("a")) as { tokens: { account_id: string } }).tokens.account_id).toBe("acct-a");
+    expect(await healPool()).toEqual([]);
+  });
+
+  test("swapping to the account the pool holds does not deadlock on the target lock", async () => {
+    await setup();
+    await put("pool", auth("acct-a", T0 + 100, { tag: "a-pool" }));
+    const r = await swap("a");
+    expect(r.writeBack).toBe("written");
+  });
+
+  test("the target vault lock is held until the pool write is done", async () => {
+    await setup();
+    const { withOauthRefreshLock } = await import("../../../src/identities/claude-swap-lock.ts");
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    let locked!: () => void;
+    const gotLock = new Promise<void>((r) => { locked = r; });
+    const holder = withOauthRefreshLock(dirOf("b"), async () => { locked(); await held; });
+    await gotLock;
+    const p = swap("b");
+    await new Promise((r) => setTimeout(r, 200));
+    expect(await read("pool")).toBe(await read("a")); // not written while b is locked
+    release();
+    await holder;
+    await p;
+    expect(await read("pool")).toBe(await read("b"));
+  });
 });
