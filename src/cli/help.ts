@@ -26,7 +26,8 @@ const COMMANDS: Array<[string, string]> = [
   ["auth login|enable <identity> --tool=ali", "SSH-only interactive auth browser and 10-minute cookie renewal"],
   ["auth refresh <identity> [--tool=ali|codex|claude|grok|kimi]", "Renew credentials without re-login: ali cookies, or the OAuth grant (written through to every store)"],
   ["auth import <pi-id> --tool=pi --claude=<id> ...", "Merge provider credentials into one Pi identity"],
-  ["claude-swap [status] [pool] [--json]", "Claude swap pool: members, active marker, 5h/weekly use, allowed flag"],
+  ["swap <claude|codex> [status|to|next|allow|disallow|auto|usage|pool create]", "Swap pool for a tool (same subcommands as claude-swap); codex: ChatGPT logins only, running sessions must relaunch"],
+  ["claude-swap [status] [pool] [--json]", "Alias of \"swap claude\". Claude swap pool: members, active marker, 5h/weekly use, allowed flag"],
   ["claude-swap to <account> | next [--if-limited] [--pool=]", "Swap the pool's Claude login to a member (manual), or to the one with most headroom"],
   ["claude-swap pool create <name> --accounts=a,b[,c] [--config-dir=]", "Create a pool identity sharing one Claude folder across accounts"],
   ["claude-swap allow|disallow <account> | auto on|off [--threshold=95] | usage", "Edit allowed accounts, automatic limit swap, per-member usage split"],
@@ -146,6 +147,12 @@ one identity made every subsequent prompt on that identity hang indefinitely
 while auth stayed valid and fast throughout — closing those agents fixed it
 immediately. --identity/--tool narrow which identities are probed, same as
 "usage"/"limits".
+
+"swap <tool>" runs the same pool commands for codex ("ais swap codex pool create
+<name> --accounts=a,b" needs ChatGPT-login members; "hook" is Claude-only). A
+swapped Codex login only reaches new launches: running codex sessions keep the
+old account until relaunched or "codex resume"; "to"/"next" print how many.
+"ais claude-swap ..." is the same as "ais swap claude ...".
 
 "claude-swap" is for claude swap POOLS only: a pool is a normal claude identity
 (own configDir with the shared settings, history, skills and plugins) whose

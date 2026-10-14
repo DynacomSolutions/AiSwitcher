@@ -1,7 +1,11 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { performSwap, type SwapReason, type SwapResult } from "../../identities/claude-swap.ts";
-import { swapIfLimited, swapToNext, poolStatus, type MemberRow, type OpsDeps } from "../../identities/claude-swap-ops.ts";
+import type { MemberUsage } from "../../identities/claude-usage-api.ts";
+import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
+import { codexMemberProblem } from "../../identities/pool/codex-adapter.ts";
+import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps } from "../../identities/pool/ops.ts";
+import { adapterFor } from "../../identities/pool/registry.ts";
+import { performPoolSwap } from "../../identities/pool/swap.ts";
 import { installSwapHook, removeSwapHook } from "../../identities/claude-swap-hook.ts";
 import { ensureClaudeTranscriptRetention } from "../../identities/claude-settings.ts";
 import { expandPath, isValidIdentityKey, translateHostPath } from "../../identities/match.ts";
@@ -12,30 +16,30 @@ import {
   poolsOf,
   requirePool,
   SwapPoolError,
+  swapCommandName,
   validateMembers,
-} from "../../identities/swap-pool.ts";
-import { CLAUDE_CONFIG } from "../../identities/tool-configs.ts";
-import type { IdentitiesFile } from "../../identities/types.ts";
-import { aisClaudeSwapLedgerPath } from "../../shared/ais-home.ts";
+} from "../../identities/pool/swap-pool.ts";
+import type { IdentitiesFile, ToolConfig } from "../../identities/types.ts";
+import { aisSwapLedgerPath } from "../../shared/ais-home.ts";
 import { boolFlag, listFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { bold, dim, green, yellow } from "../colors.ts";
 import { createIdentity } from "../identities/actions.ts";
 import { CliUsageError } from "../errors.ts";
-import { poolMemberUsageSplit } from "./attribution.ts";
+import { poolMemberUsageSplit } from "../claude-swap/attribution.ts";
 
-export interface ClaudeSwapDeps extends OpsDeps {
+export interface SwapDeps extends PoolOpsDeps<any> {
   log?: (line: string) => void;
 }
 
-const USAGE = `Usage:
-  ais claude-swap [status] [pool] [--json] [--no-usage]
-  ais claude-swap to <account> [--pool=] [--force]
-  ais claude-swap next [--pool=] [--if-limited] [--reason=manual|auto|launch]
-  ais claude-swap pool create <name> --accounts=a,b[,c] [--config-dir=]
-  ais claude-swap allow|disallow <account> [--pool=]
-  ais claude-swap auto on|off [--pool=] [--threshold=95]
-  ais claude-swap hook on|off [--pool=]   (optional StopFailure rate_limit hook in the pool's settings.json)
-  ais claude-swap usage [pool] [--days=30] [--json]`;
+const usageText = (cmd: string, tool: string): string => `Usage:
+  ${cmd} [status] [pool] [--json] [--no-usage]
+  ${cmd} to <account> [--pool=] [--force]
+  ${cmd} next [--pool=] [--if-limited] [--reason=manual|auto|launch]
+  ${cmd} pool create <name> --accounts=a,b[,c] [--config-dir=]
+  ${cmd} allow|disallow <account> [--pool=]
+  ${cmd} auto on|off [--pool=] [--threshold=95]${tool === "claude" ? `
+  ${cmd} hook on|off [--pool=]   (optional StopFailure rate_limit hook in the pool's settings.json)` : ""}
+  ${cmd} usage [pool] [--days=30] [--json]`;
 
 function reasonFlag(flags: ParsedArgs["flags"], fallback: SwapReason): SwapReason {
   const raw = stringFlag(flags, "reason");
@@ -64,7 +68,7 @@ function describeSwap(r: SwapResult): string {
   return `${r.pool}: ${previous ?? "(none)"} -> ${target} (${r.reason})${wb}`;
 }
 
-function renderStatus(poolName: string, auto: boolean, threshold: number, rows: MemberRow[]): string[] {
+function renderStatus(poolName: string, auto: boolean, threshold: number, rows: MemberRow<MemberUsage>[]): string[] {
   const name = Math.max(7, ...rows.map((r) => r.name.length));
   const lines = [`${bold(poolName)} ${dim(`auto ${auto ? `on (>=${threshold}%)` : "off"}`)}`];
   lines.push(dim(`  ${" "} ${"account".padEnd(name)}  ${"5h".padStart(5)} ${"reset".padEnd(6)} ${"week".padStart(5)} ${"reset".padEnd(6)} allowed`));
@@ -78,24 +82,49 @@ function renderStatus(poolName: string, auto: boolean, threshold: number, rows: 
   return lines;
 }
 
+function renderWindowStatus(poolName: string, auto: boolean, threshold: number, rows: MemberRow[]): string[] {
+  const name = Math.max(7, ...rows.map((r) => r.name.length));
+  const lines = [`${bold(poolName)} ${dim(`auto ${auto ? `on (>=${threshold}%)` : "off"}`)}`];
+  lines.push(dim(`  ${" "} ${"account".padEnd(name)}  usage  allowed`));
+  for (const r of rows) {
+    const u = r.usage;
+    const note = u && u.status !== "live" ? dim(` (${u.error ?? u.status})`) : "";
+    const windows = (u?.windows ?? []).map((w) => `${w.label} ${pct(w.utilization)}${w.resetsAt ? ` (${reset(w.resetsAt)})` : ""}`).join("  ") || "-";
+    lines.push(`  ${r.active ? green("*") : " "} ${r.name.padEnd(name)}  ${windows}  ${r.allowed ? "yes" : yellow("no")}${note}`);
+  }
+  return lines;
+}
+
 async function mutatePool(
-  deps: ClaudeSwapDeps,
+  config: ToolConfig,
+  deps: SwapDeps,
   poolKey: string | undefined,
   apply: (file: IdentitiesFile, pool: ReturnType<typeof requirePool>) => string,
 ): Promise<string> {
-  const path = deps.registryPath ?? CLAUDE_CONFIG.identitiesJsonPath;
+  const path = deps.registryPath ?? config.identitiesJsonPath;
   const file = await loadIdentitiesFile(path);
-  const pool = requirePool(file, poolKey);
+  const pool = requirePool(file, poolKey, config.toolName);
   const message = apply(file, pool);
   await saveIdentitiesFile(path, file);
   return message;
 }
 
-export async function runClaudeSwapCommand(positionals: string[], flags: ParsedArgs["flags"], deps: ClaudeSwapDeps = {}): Promise<void> {
+/** `ais swap <tool> ...` (and the `ais claude-swap ...` alias): one command
+ * set over the generic pool core, driven by the tool's adapter. */
+export async function runSwapCommand(tool: string, positionals: string[], flags: ParsedArgs["flags"], deps: SwapDeps = {}): Promise<void> {
+  const adapter = adapterFor(tool as ToolConfig["toolName"]);
+  if (!adapter) throw new CliUsageError(`No swap pool support for "${tool}". Supported: claude, codex.`);
+  const config = adapter.config;
+  const cmd = swapCommandName(tool);
+  const USAGE = usageText(cmd, tool);
   const log = deps.log ?? ((line: string) => console.log(line));
+  // Sessions that cannot follow the swap (liveSwap: false adapters) must relaunch.
+  const runningWarning = (r: SwapResult): void => {
+    if (r.runningSessions) log(yellow(`  ${r.runningSessions} running session${r.runningSessions === 1 ? "" : "s"} keep the old account until relaunched ("${tool} resume")`));
+  };
   const json = boolFlag(flags, "json");
-  const opsDeps: OpsDeps = { ...deps };
-  const registryPath = deps.registryPath ?? CLAUDE_CONFIG.identitiesJsonPath;
+  const opsDeps = { ...deps };
+  const registryPath = deps.registryPath ?? config.identitiesJsonPath;
   const known = new Set(["status", "to", "next", "pool", "allow", "disallow", "auto", "usage", "hook", "help"]);
   const first = positionals[0];
   const sub = first === undefined ? "status" : known.has(first) ? first : "status";
@@ -108,43 +137,44 @@ export async function runClaudeSwapCommand(positionals: string[], flags: ParsedA
         return log(USAGE);
 
       case "status": {
-        const status = await poolStatus(opsDeps, rest[0] ?? poolFlag, { usage: !boolFlag(flags, "no-usage") });
+        const status = await poolStatus(adapter, opsDeps, rest[0] ?? poolFlag, { usage: !boolFlag(flags, "no-usage") });
         if (json) {
           return log(JSON.stringify({ pool: status.pool.name, active: status.pool.swapPool.active ?? null, auto: status.pool.swapPool.auto === true, thresholdPercent: status.thresholdPercent, accounts: status.rows }, null, 2));
         }
-        for (const line of renderStatus(status.pool.name, status.pool.swapPool.auto === true, status.thresholdPercent, status.rows)) log(line);
+        for (const line of (tool === "claude" ? renderStatus : renderWindowStatus)(status.pool.name, status.pool.swapPool.auto === true, status.thresholdPercent, status.rows as MemberRow<MemberUsage>[])) log(line);
         return;
       }
 
       case "to": {
         const account = rest[0];
-        if (!account) throw new CliUsageError("Usage: ais claude-swap to <account> [--pool=] [--force]");
-        const r = await performSwap({ registryPath, ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}), ...(poolFlag ? { pool: poolFlag } : {}), target: account, reason: reasonFlag(flags, "manual"), force: boolFlag(flags, "force") });
+        if (!account) throw new CliUsageError(`Usage: ${cmd} to <account> [--pool=] [--force]`);
+        const r = await performPoolSwap(adapter, { registryPath, ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}), ...(poolFlag ? { pool: poolFlag } : {}), target: account, reason: reasonFlag(flags, "manual"), force: boolFlag(flags, "force") });
         if (json) return log(JSON.stringify(r, null, 2));
         log(`${green("✔")} ${describeSwap(r)}`);
         for (const n of r.notes) log(dim(`  ${n}`));
-        return;
+        return runningWarning(r);
       }
 
       case "next": {
         const reason = reasonFlag(flags, boolFlag(flags, "if-limited") ? "auto" : "manual");
         if (boolFlag(flags, "if-limited")) {
-          const outcome = await swapIfLimited(opsDeps, poolFlag, reason, { assumeLimited: boolFlag(flags, "assume-limited") });
+          const outcome = await swapIfLimited(adapter, opsDeps, poolFlag, reason, { assumeLimited: boolFlag(flags, "assume-limited") });
           if (json) return log(JSON.stringify(outcome, null, 2));
-          log(outcome.action === "swapped" ? `${green("✔")} ${describeSwap(outcome.result)}` : dim(`claude-swap: ${outcome.action}${"why" in outcome ? ` (${outcome.why})` : ""}`));
-          return;
+          log(outcome.action === "swapped" ? `${green("✔")} ${describeSwap(outcome.result)}` : dim(`${tool}-swap: ${outcome.action}${"why" in outcome ? ` (${outcome.why})` : ""}`));
+          return outcome.action === "swapped" ? runningWarning(outcome.result) : undefined;
         }
-        const r = await swapToNext(opsDeps, poolFlag, reason);
+        const r = await swapToNext(adapter, opsDeps, poolFlag, reason);
         if (!r) throw new SwapPoolError("No other allowed account to switch to.");
         if (json) return log(JSON.stringify(r, null, 2));
-        return log(`${green("✔")} ${describeSwap(r)}`);
+        log(`${green("✔")} ${describeSwap(r)}`);
+        return runningWarning(r);
       }
 
       case "allow":
       case "disallow": {
         const account = rest[0];
-        if (!account) throw new CliUsageError(`Usage: ais claude-swap ${sub} <account> [--pool=]`);
-        const msg = await mutatePool(deps, poolFlag, (file, pool) => {
+        if (!account) throw new CliUsageError(`Usage: ${cmd} ${sub} <account> [--pool=]`);
+        const msg = await mutatePool(config, deps, poolFlag, (file, pool) => {
           const member = memberIdentity(file, pool, account);
           const set = new Set(pool.swapPool.disallowed ?? []);
           if (sub === "allow") set.delete(member.name);
@@ -158,13 +188,13 @@ export async function runClaudeSwapCommand(positionals: string[], flags: ParsedA
 
       case "auto": {
         const mode = rest[0];
-        if (mode !== "on" && mode !== "off") throw new CliUsageError("Usage: ais claude-swap auto on|off [--pool=] [--threshold=95]");
+        if (mode !== "on" && mode !== "off") throw new CliUsageError(`Usage: ${cmd} auto on|off [--pool=] [--threshold=95]`);
         const rawThreshold = stringFlag(flags, "threshold");
         const threshold = rawThreshold === undefined ? undefined : Number(rawThreshold);
         if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 1 || threshold > 100)) {
           throw new CliUsageError("--threshold must be a number from 1 to 100");
         }
-        const msg = await mutatePool(deps, poolFlag, (_file, pool) => {
+        const msg = await mutatePool(config, deps, poolFlag, (_file, pool) => {
           pool.swapPool.auto = mode === "on";
           if (threshold !== undefined) pool.swapPool.thresholdPercent = threshold;
           return `auto swap ${mode} for pool ${pool.name} (threshold ${pool.swapPool.thresholdPercent ?? DEFAULT_SWAP_THRESHOLD_PERCENT}%)`;
@@ -175,43 +205,44 @@ export async function runClaudeSwapCommand(positionals: string[], flags: ParsedA
       case "pool": {
         if (rest[0] !== "create") throw new CliUsageError(USAGE);
         const name = rest[1];
-        if (!name || !isValidIdentityKey(name)) throw new CliUsageError("Usage: ais claude-swap pool create <name> --accounts=a,b[,c] [--config-dir=]  (name: lowercase letters, digits, hyphens)");
+        if (!name || !isValidIdentityKey(name)) throw new CliUsageError(`Usage: ${cmd} pool create <name> --accounts=a,b[,c] [--config-dir=]  (name: lowercase letters, digits, hyphens)`);
         const requested = listFlag(flags, "accounts");
         if (!requested) throw new CliUsageError("Missing required --accounts=a,b[,c]");
         const file = await loadIdentitiesFile(registryPath);
-        const accounts = validateMembers(file, name, requested);
-        const configDir = stringFlag(flags, "config-dir") ?? join(CLAUDE_CONFIG.identitiesRootDir, name);
+        const accounts = validateMembers(file, name, requested, tool, tool === "codex" ? codexMemberProblem : undefined);
+        const configDir = stringFlag(flags, "config-dir") ?? join(config.identitiesRootDir, name);
         const dir = translateHostPath(expandPath(configDir)); // fs form; the registry keeps the host form
         // Two pools sharing one folder would fight over its credentials.
         if (poolsOf(file).some((p) => expandPath(p.configDir) === dir) || file.identities.some((i) => expandPath(i.configDir) === dir)) {
           throw new SwapPoolError(`configDir ${dir} is already used by another identity`);
         }
-        const identity = createIdentity(file, { name, label: name, description: "Claude swap pool", configDir });
+        const identity = createIdentity(file, { name, label: name, description: `${tool === "claude" ? "Claude" : "Codex"} swap pool`, configDir });
         identity.swapPool = { accounts };
         await mkdir(dir, { recursive: true });
-        await ensureClaudeTranscriptRetention(dir);
+        if (tool === "claude") await ensureClaudeTranscriptRetention(dir);
         await saveIdentitiesFile(registryPath, file);
         log(`${green("✔")} Created swap pool ${bold(name)} (configDir: ${configDir}; accounts: ${accounts.join(", ")}).`);
         // Secrets reach the pool only through the swap: activate the first
         // member that has a login.
         for (const account of accounts) {
           try {
-            const r = await performSwap({ registryPath, ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}), pool: name, target: account, reason: "manual" });
+            const r = await performPoolSwap(adapter, { registryPath, ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}), pool: name, target: account, reason: "manual" });
             log(`${green("✔")} ${describeSwap(r)}`);
             return;
           } catch (err) {
             log(yellow(`  could not activate ${account}: ${err instanceof Error ? err.message : String(err)}`));
           }
         }
-        log(yellow("  no member could be activated yet; log in to each account identity, then run: ais claude-swap to <account>"));
+        log(yellow(`  no member could be activated yet; log in to each account identity, then run: ${cmd} to <account>`));
         return;
       }
 
       case "hook": {
+        if (tool !== "claude") throw new CliUsageError(`"hook" is Claude-only (it installs a Claude Code StopFailure hook); ${tool} pools swap through the console daemon or "${cmd} next --if-limited".`);
         const mode = rest[0];
         if (mode !== "on" && mode !== "off") throw new CliUsageError("Usage: ais claude-swap hook on|off [--pool=]");
         const file = await loadIdentitiesFile(registryPath);
-        const pool = requirePool(file, poolFlag);
+        const pool = requirePool(file, poolFlag, tool);
         if (mode === "on") {
           await installSwapHook(pool.configDir, pool.name);
           return log(`${green("✔")} StopFailure(rate_limit) hook installed in ${join(pool.configDir, "settings.json")}`);
@@ -223,8 +254,8 @@ export async function runClaudeSwapCommand(positionals: string[], flags: ParsedA
       case "usage": {
         const days = Number(stringFlag(flags, "days") ?? 30);
         const file = await loadIdentitiesFile(registryPath);
-        const pool = requirePool(file, rest[0] ?? poolFlag);
-        const split = await poolMemberUsageSplit(pool, { days, ledgerPath: deps.ledgerPath ?? aisClaudeSwapLedgerPath() });
+        const pool = requirePool(file, rest[0] ?? poolFlag, tool);
+        const split = await poolMemberUsageSplit(pool, { days, ledgerPath: deps.ledgerPath ?? aisSwapLedgerPath(tool), tool: tool as "claude" | "codex" });
         if (json) return log(JSON.stringify(split, null, 2));
         log(bold(`${pool.name}: transcript usage by active member, last ${days}d`));
         for (const row of split.members) {
@@ -235,3 +266,5 @@ export async function runClaudeSwapCommand(positionals: string[], flags: ParsedA
     }
   }
 }
+
+export const runClaudeSwapCommand = (positionals: string[], flags: ParsedArgs["flags"], deps: SwapDeps = {}): Promise<void> => runSwapCommand("claude", positionals, flags, deps);

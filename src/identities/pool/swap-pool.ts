@@ -12,6 +12,9 @@ import { findIdentityByNameOrAlias } from "../store.ts";
 
 export const DEFAULT_SWAP_THRESHOLD_PERCENT = 95;
 
+/** The CLI spelling that manages a tool's pools (claude keeps its alias). */
+export const swapCommandName = (tool: string): string => (tool === "claude" ? "ais claude-swap" : `ais swap ${tool}`);
+
 export class SwapPoolError extends Error {
   constructor(message: string) {
     super(message);
@@ -57,7 +60,7 @@ export function requirePool(file: IdentitiesFile, key: string | undefined, tool:
   }
   const pools = poolsOf(file);
   if (pools.length === 1) return pools[0]!;
-  if (pools.length === 0) throw new SwapPoolError(`No swap pool exists yet. Create one with "ais ${tool}-swap pool create <name> --accounts=a,b".`);
+  if (pools.length === 0) throw new SwapPoolError(`No swap pool exists yet. Create one with "${swapCommandName(tool)} pool create <name> --accounts=a,b".`);
   throw new SwapPoolError(`More than one swap pool exists (${pools.map((p) => p.name).join(", ")}); pass --pool=<name>.`);
 }
 
