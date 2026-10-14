@@ -5,12 +5,13 @@ import { fetchCodexLimits } from "../../cli/limits/codex-limits.ts";
 import type { FetchedLimitResult } from "../../cli/limits/types.ts";
 import { isBedrockIdentity } from "../aws-profile.ts";
 import { codexAccountOf, codexAuthPath, codexRecency, hasCodexTokens, parseCodexAuth, readCodexAuthText, type CodexAuthFile } from "../codex-auth.ts";
-import { withOauthRefreshLock } from "../claude-swap-lock.ts";
+import { lockOrder, withOauthRefreshLock, withOauthRefreshLocks } from "../claude-swap-lock.ts";
 import { expandPath } from "../match.ts";
 import { CODEX_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
 import type { PoolAdapter, PoolUsage, SwapResult, WriteBackOutcome } from "./adapter.ts";
 import { writeFileAtomic } from "./fs.ts";
+import { writeBackup } from "./grant-file-adapter.ts";
 import type { LockOptions } from "./lock.ts";
 import { SwapPoolError, type PoolIdentity } from "./swap-pool.ts";
 
@@ -86,16 +87,32 @@ async function writeBackToOwner(owner: Identity, poolAuth: CodexAuthFile, lock?:
   });
 }
 
+/** The member tier of a held set: everything except the pool dir, which is locked first on its own. */
+const memberDirs = (held: Set<string>, poolDir: string): string[] => [...held].filter((d) => d !== resolve(poolDir));
+
 async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>[0]): Promise<Omit<SwapResult, "reason">> {
   const { pool, members, target, lock } = input;
   const poolDir = pool.configDir;
   const poolPath = codexAuthPath(poolDir);
   const notes: string[] = [];
 
-  // Lock order: pool, pool oauth, then the target vault, held until the pool write is verified.
-  return withOauthRefreshLock(poolDir, () => withOauthRefreshLock(target.configDir, async () => {
-    const targetText = await readCodexAuthText(target.configDir);
-    const targetAuth = parseCodexAuth(targetText);
+  // Two-tier order, same as refresh: the pool dir first, then target vault and write-back owner in
+  // `lockOrder`, held until the pool write is verified. The owner is only known under the lock: if it is
+  // outside the held set, release, widen the member set and go again (nothing is written before that point).
+  const wanted = [target.configDir];
+  const activeMember = members.find((m) => m.name === pool.swapPool.active);
+  if (activeMember) wanted.push(activeMember.configDir);
+  for (;;) {
+    const held = new Set(lockOrder([poolDir, ...wanted]));
+    const result = await swapHeld(held);
+    if ("needLock" in result) { wanted.push(result.needLock); continue; }
+    return result;
+  }
+
+  async function swapHeld(held: Set<string>): Promise<Omit<SwapResult, "reason"> | { needLock: string }> {
+  return withOauthRefreshLock(poolDir, () => withOauthRefreshLocks(memberDirs(held, poolDir), async () => {
+    let targetText = await readCodexAuthText(target.configDir);
+    let targetAuth = parseCodexAuth(targetText);
     if (targetText === undefined || !hasCodexTokens(targetAuth)) {
       throw new SwapPoolError(`Account "${target.name}" has no usable Codex login (no ChatGPT tokens in ${target.configDir}); run "codex login" under that identity first.`);
     }
@@ -119,21 +136,30 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
       writeBack = "none-account-mismatch";
     } else {
       const owner = poolAcct.id ? await ownerByAccount(members, poolAcct.id, activeName) : undefined;
+      if (owner && !held.has(resolve(owner.configDir))) return { needLock: owner.configDir };
       if (!owner) {
         writeBack = "none-unknown-owner";
       } else {
-        writeBack = await writeBackToOwner(owner, poolAuth!, lock, owner.configDir === target.configDir);
+        writeBack = await writeBackToOwner(owner, poolAuth!, lock, true);
         if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
       }
     }
     // A live grant we cannot attribute is never silently destroyed.
     if ((writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && poolText !== undefined) {
-      const backup = `${poolPath}.pre-swap.bak`;
-      await writeFileAtomic(backup, poolText);
+      const backup = await writeBackup(poolPath, "swap", poolText);
       notes.push(`live pool credentials could not be attributed to a member; kept a 0600 copy at ${backup}`);
     }
 
-    await writeFileAtomic(poolPath, targetText);
+    // The write-back may have just updated the target's own vault (pool held the target's account): copy the vault as it is now.
+    if (writeBack === "written") {
+      const refreshedText = await readCodexAuthText(target.configDir);
+      const refreshed = parseCodexAuth(refreshedText);
+      if (refreshedText !== undefined && hasCodexTokens(refreshed) && codexAccountOf(refreshed).id === targetAcct.id) {
+        targetText = refreshedText;
+        targetAuth = refreshed;
+      }
+    }
+    await writeFileAtomic(poolPath, targetText!);
     const after = codexAccountOf(parseCodexAuth(await readCodexAuthText(poolDir)));
     if (after.id !== targetAcct.id) {
       if (poolText !== undefined) await writeFileAtomic(poolPath, poolText).catch(() => undefined);
@@ -141,6 +167,7 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
     }
     return { pool: pool.name, from: activeName, to: target.name, noop: false, writeBack, notes };
   }, lock), lock);
+  }
 }
 
 /**
@@ -150,17 +177,22 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
  *  - empty, partial, unparsable or token-less: restore from the active vault;
  *  - tokens of a different account than the active one (a running session
  *    refreshed or relogged after a swap): capture them into the member that
- *    owns that account when newer, else keep a `.pre-heal.bak`, then restore;
- *  - hybrid (account_id and the token JWT disagree): `.pre-heal.bak`, restore.
+ *    owns that account when newer, else keep a `.pre-heal.<stamp>.bak`, then restore;
+ *  - hybrid (account_id and the token JWT disagree): `.pre-heal.<stamp>.bak`, restore.
  * Caller holds the pool lock. Returns human notes for what it did.
  */
 async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions): Promise<string[]> {
   const activeName = pool.swapPool.active;
   const active = members.find((m) => m.name === activeName);
   if (!activeName || !active) return [];
-  const vaultText = await readCodexAuthText(active.configDir);
-  const vaultAuth = parseCodexAuth(vaultText);
-  const vaultAcct = codexAccountOf(vaultAuth);
+  let vaultText = await readCodexAuthText(active.configDir);
+  let vaultAuth = parseCodexAuth(vaultText);
+  let vaultAcct = codexAccountOf(vaultAuth);
+  const loadVault = async () => {
+    vaultText = await readCodexAuthText(active.configDir);
+    vaultAuth = parseCodexAuth(vaultText);
+    vaultAcct = codexAccountOf(vaultAuth);
+  };
   if (vaultText === undefined || !hasCodexTokens(vaultAuth) || !vaultAcct.id) return [`cannot heal ${pool.name}: active account "${activeName}" has no usable login in its vault`];
 
   const poolPath = codexAuthPath(pool.configDir);
@@ -180,9 +212,26 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
   }
   if (state.kind === "ok") return [];
 
+  // Two-tier order, same as refresh: the pool dir first, then active vault and capture owner in `lockOrder`;
+  // a foreign owner outside the held set is only known under the lock, so release, widen the member set
+  // and go again (nothing written yet).
+  const activeOwner = active;
+  const activeLabel = activeName;
+  const wanted = [active.configDir];
+  for (;;) {
+    const held = new Set(lockOrder([pool.configDir, ...wanted]));
+    const result = await healHeld(held);
+    if (!Array.isArray(result)) { wanted.push(result.needLock); continue; }
+    return result;
+  }
+
+  async function healHeld(held: Set<string>): Promise<string[] | { needLock: string }> {
   const notes: string[] = [];
-  return withOauthRefreshLock(pool.configDir, async () => {
-    // Decide on the file as it is under the lock, not as it was before waiting for it.
+  return withOauthRefreshLock(pool.configDir, () => withOauthRefreshLocks(memberDirs(held, pool.configDir), async () => {
+    // Decide on the files as they are under the locks, not as they were before waiting for them: a
+    // concurrent refresh may have rotated the vault's token, which must not be restored over.
+    await loadVault();
+    if (vaultText === undefined || !hasCodexTokens(vaultAuth) || !vaultAcct.id) return [`cannot heal ${pool.name}: active account "${activeLabel}" has no usable login in its vault`];
     let now = await classify();
     if (now.kind === "damaged") {
       await sleep(codexTuning.healRetryMs);
@@ -191,28 +240,28 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
     if (now.kind === "ok") return [];
     if (now.kind === "same") {
       // Same account as the active vault: never restore over it, keep the newer tokens in the vault.
-      const outcome = await writeBackToOwner(active, now.auth!, lock);
+      const outcome = await writeBackToOwner(activeOwner, now.auth!, lock, true);
       return [`pool ${pool.name} held newer tokens for "${activeName}"; vault write-back: ${outcome}`];
     }
     if (now.kind === "foreign") {
-      const owner = await ownerByAccount(members, now.acct.id!, activeName);
+      const owner = await ownerByAccount(members, now.acct.id!, activeLabel);
+      if (owner && !held.has(resolve(owner.configDir))) return { needLock: owner.configDir };
       if (owner) {
-        const outcome = await writeBackToOwner(owner, now.auth!, lock);
+        const outcome = await writeBackToOwner(owner, now.auth!, lock, true);
         notes.push(`pool ${pool.name} held "${owner.name}"'s account instead of "${activeName}"; ${outcome === "written" ? `captured it into "${owner.name}"` : `left "${owner.name}" as it was (${outcome})`}`);
       } else {
-        await writeFileAtomic(`${poolPath}.pre-heal.bak`, now.text!);
-        notes.push(`pool ${pool.name} held an account that is not a member; kept a 0600 copy at ${poolPath}.pre-heal.bak`);
+        notes.push(`pool ${pool.name} held an account that is not a member; kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
       }
     } else if (now.kind === "hybrid") {
-      await writeFileAtomic(`${poolPath}.pre-heal.bak`, now.text!);
-      notes.push(`pool ${pool.name} auth.json was hybrid (account_id disagrees with its token); kept a 0600 copy at ${poolPath}.pre-heal.bak`);
+      notes.push(`pool ${pool.name} auth.json was hybrid (account_id disagrees with its token); kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
     } else {
       notes.push(`pool ${pool.name} auth.json was empty or partial`);
     }
-    await writeFileAtomic(poolPath, vaultText);
-    notes.push(`restored "${activeName}" into ${pool.name}`);
+    await writeFileAtomic(poolPath, vaultText!);
+    notes.push(`restored "${activeLabel}" into ${pool.name}`);
     return notes;
-  }, lock);
+  }, lock), lock);
+  }
 }
 
 /** Running codex processes (owned by this user) whose CODEX_HOME is `configDir`. Linux /proc only; best effort. */
@@ -226,17 +275,21 @@ export async function countCodexSessions(configDir: string, procRoot = "/proc"):
   } catch {
     return 0;
   }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+  // Thousands of processes on a busy host: scan in parallel chunks, a sequential scan took over half a second per swap.
+  const pids = entries.filter((entry) => /^\d+$/.test(entry) && Number(entry) !== process.pid);
+  const isMine = async (entry: string): Promise<boolean> => {
     try {
-      if (uid !== undefined && (await stat(`${procRoot}/${entry}`)).uid !== uid) continue;
+      if (uid !== undefined && (await stat(`${procRoot}/${entry}`)).uid !== uid) return false;
       const argv = (await readFile(`${procRoot}/${entry}/cmdline`, "utf8")).split("\0");
-      if (basename(argv[0] ?? "") !== "codex" && basename(argv[1] ?? "") !== "codex") continue;
+      if (basename(argv[0] ?? "") !== "codex" && basename(argv[1] ?? "") !== "codex") return false;
       const home = (await readFile(`${procRoot}/${entry}/environ`, "utf8")).split("\0").find((kv) => kv.startsWith("CODEX_HOME="));
-      if (home && resolve(expandPath(home.slice("CODEX_HOME=".length))) === want) count++;
+      return home !== undefined && resolve(expandPath(home.slice("CODEX_HOME=".length))) === want;
     } catch {
-      // gone, or not ours to read
+      return false; // gone, or not ours to read
     }
+  };
+  for (let i = 0; i < pids.length; i += 256) {
+    count += (await Promise.all(pids.slice(i, i + 256).map(isMine))).filter(Boolean).length;
   }
   return count;
 }
@@ -245,6 +298,7 @@ export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
   tool: "codex",
   config: CODEX_CONFIG,
   liveSwap: false,
+  memberProblem: codexMemberProblem,
   hasCredentials: (configDir) => hasCodexTokens(parseCodexAuth(readSyncOrUndefined(codexAuthPath(configDir)))),
   swapCredentials,
   heal,

@@ -72,10 +72,11 @@ export class PoolSwapScheduler {
     return loadIdentitiesFile(this.deps.perTool?.[adapter.tool]?.registryPath ?? adapter.config.identitiesJsonPath);
   }
 
-  /** Heal pass for `liveSwap: false` adapters: a running session can rewrite
-   * the pool credentials after a swap, so repair them every tick, under the pool lock. */
+  /** Heal pass for every adapter that has one: a running session can rewrite
+   * the pool credentials after a swap (even a live-swap tool refreshes the
+   * account it had in flight), so repair them every tick, under the pool lock. */
   private async healPool(adapter: PoolAdapter<any>, pool: PoolIdentity): Promise<void> {
-    if (adapter.liveSwap || !adapter.heal) return;
+    if (!adapter.heal) return;
     try {
       const lock = { timeoutMs: 1_500 };
       const notes = await withPoolLock(pool.configDir, async () => {

@@ -1,5 +1,5 @@
 import { mkdir, rmdir, stat, utimes } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { LockOptions } from "./pool/lock.ts";
 
 /**
@@ -167,11 +167,21 @@ export async function withOauthRefreshLock<T>(configDir: string, fn: (handle: Lo
   }
 }
 
+/** The one global acquisition order for oauth-refresh locks: resolved dirs,
+ * de-duplicated, sorted by lock path. Every path taking more than one lock
+ * must acquire in this order so two pools sharing a member never invert. */
+export function lockOrder(dirs: readonly string[]): string[] {
+  return [...new Set(dirs.map((d) => resolve(d)))].sort((a, b) => {
+    const [x, y] = [oauthRefreshLockPath(a), oauthRefreshLockPath(b)];
+    return x < y ? -1 : x > y ? 1 : 0;
+  });
+}
+
 /** Runs `fn` while holding `.oauth_refresh.lock` of every dir, acquired in
- * sorted order (a stable order across callers, so two holders of
+ * `lockOrder` (a stable order across callers, so two holders of
  * overlapping sets cannot deadlock). */
 export async function withOauthRefreshLocks<T>(dirs: string[], fn: (handle: LockHandle) => Promise<T>, options: LockOptions = {}): Promise<T> {
-  const [first, ...rest] = [...new Set(dirs)].sort();
+  const [first, ...rest] = lockOrder(dirs);
   if (first === undefined) return fn({ isLost: () => false });
   return withOauthRefreshLock(first, (own) => withOauthRefreshLocks(rest, (inner) => fn({ isLost: () => own.isLost() || inner.isLost() }), options), options);
 }

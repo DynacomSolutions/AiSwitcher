@@ -69,6 +69,8 @@ export interface PoolAdapter<U extends PoolUsage = PoolUsage> {
   /** True when a running session picks up swapped credentials on its next
    * turn (no restart needed). */
   liveSwap: boolean;
+  /** Why an identity cannot be a pool member (e.g. not an OAuth login), or undefined. */
+  memberProblem?(member: Identity): string | undefined;
   /** True when the pool folder already holds a credential store. */
   hasCredentials(configDir: string): boolean;
   /** Write back the pool's live grant to its owner, then atomically make the

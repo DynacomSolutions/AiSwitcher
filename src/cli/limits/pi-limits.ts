@@ -147,6 +147,8 @@ export function fetchablePiProviders(auth: PiAuthFile): Array<{ provider: string
  * of silence (same explicit-question rule as the usage pipeline).
  */
 export async function fetchPiLimits(identity: Identity, explicitTool = false): Promise<ToolLimitResult[]> {
+  // A swap pool's auth.json is a copy of its active member's grants; it is refreshed through that member only.
+  if (identity.swapPool) return explicitTool ? [unavailable("pi", "unattributed", identity, "swap pool: limits come from its active member (not fetched)")] : [];
   const auth = await readPiAuth(identity.configDir);
   if (!auth) {
     return explicitTool ? [unavailable("pi", "unattributed", identity, "no readable Pi auth.json — nothing to fetch limits from")] : [];
