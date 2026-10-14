@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { poolProviders, humanise, resolveCurrent, shares, statusLine, others, entriesFor } from './model'
-import type { LimitsEntry, SwapStatus, SwapUsage } from '../types'
+import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, statusLine, others, entriesFor } from './model'
+import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
   toolName: tool,
@@ -65,4 +65,47 @@ test('shares sum to 100 and humanise', async () => {
   expect(humanise(9760032)).toBe('9.8M')
   expect(humanise(2_500_000_000)).toBe('2.5B')
   expect(humanise(12_300)).toBe('12.3k')
+})
+
+test('bar', async () => {
+  expect(bar(42, 20)).toBe('########------------')
+  expect(bar(0, 10)).toBe('----------')
+  expect(bar(150, 10)).toBe('##########')
+})
+
+const acc = (name: string, five: number | undefined, allowed = true) =>
+  ({ name, active: false, allowed, usage: five === undefined ? undefined : { fiveHour: { utilization: five } } }) as SwapAccount
+
+test('poolWindowPct', async () => {
+  const r = poolWindowPct([acc('a', 10), acc('b', 30), acc('c', undefined), acc('d', 90, false)], 'fiveHour')
+  expect(r).toEqual({ pct: 20, reporting: 2, total: 3 })
+  expect(poolWindowPct([acc('a', undefined)], 'fiveHour').pct).toBeUndefined()
+  expect(poolWindowPct([acc('a', 50, false)], 'fiveHour')).toEqual({ pct: undefined, reporting: 0, total: 0 })
+})
+
+test('twoToneBar', async () => {
+  const sum = (s: { len: number }[]) => s.reduce((n, x) => n + x.len, 0)
+  expect(twoToneBar(10, 50, 20)).toEqual([
+    { kind: 'active', len: 2 }, { kind: 'pool', len: 8 }, { kind: 'empty', len: 10 },
+  ])
+  const over = twoToneBar(80, 50, 20)
+  expect(over).toEqual([
+    { kind: 'active', len: 10 }, { kind: 'marker', len: 1 }, { kind: 'active', len: 5 }, { kind: 'empty', len: 4 },
+  ])
+  expect(sum(over)).toBe(20)
+  expect(twoToneBar(25, undefined, 20)).toEqual([{ kind: 'active', len: 5 }, { kind: 'empty', len: 15 }])
+  expect(twoToneBar(0, 0, 10)).toEqual([{ kind: 'empty', len: 10 }])
+})
+
+test('bandRows', async () => {
+  const st = { active: 'workco', accounts: [
+    { name: 'workco', active: true, allowed: true, usage: { fiveHour: { utilization: 4 }, sevenDay: { utilization: 1 } } },
+    acc('personal', 20),
+  ] } as unknown as SwapStatus
+  const rp = bandRows(resolveCurrent(limits, '/c/swap', st), st, limits)
+  expect(rp.map(x => x.name)).toEqual(['session', 'week'])
+  expect(rp[0]!.pool).toEqual({ pct: 12, reporting: 2, total: 2 })
+  const ri = bandRows(resolveCurrent(limits, '/c/acme', null), null, limits)
+  expect(ri.map(x => [x.name, x.active])).toEqual([['session', 4], ['week', 1]])
+  expect(bandRows(resolveCurrent(limits, '/nope', null), null, limits)).toEqual([])
 })

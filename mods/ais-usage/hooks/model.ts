@@ -1,4 +1,4 @@
-import type { LimitsEntry, SwapStatus, SwapUsage, Win } from '../types'
+import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage, Win } from '../types'
 
 export type Resolved = {
   kind: 'pool' | 'identity' | 'unknown'
@@ -138,6 +138,100 @@ export const poolProviders = (limits: LimitsEntry[] | null, r: Resolved): Provid
       (limits ?? []).filter(l => l.toolName === tool && l.identity.name === n && !l.identity.swapPool),
     )
     if (rows.length) out.push({ tool, rows })
+  }
+  return out
+}
+
+const clamp01 = (p: number) => Math.min(100, Math.max(0, Number.isFinite(p) ? p : 0))
+const cells = (p: number, width: number) => Math.round((clamp01(p) / 100) * width)
+
+/** Single-colour bar body (no brackets): '#' for used cells, '-' for the rest. */
+export const bar = (p: number, width: number): string => {
+  const n = cells(p, width)
+  return '#'.repeat(n) + '-'.repeat(Math.max(0, width - n))
+}
+
+export type Window5 = 'fiveHour' | 'sevenDay'
+
+/** Mean utilization of one window across allowed members that report it. */
+export const poolWindowPct = (
+  accounts: SwapAccount[],
+  key: Window5,
+): { pct: number | undefined; reporting: number; total: number } => {
+  const allowed = accounts.filter(a => a.allowed)
+  const vals = allowed.flatMap(a => {
+    const u = a.usage?.[key]?.utilization
+    return typeof u === 'number' ? [u] : []
+  })
+  return {
+    pct: vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : undefined,
+    reporting: vals.length,
+    total: allowed.length,
+  }
+}
+
+export type BarSegment = { kind: 'active' | 'pool' | 'marker' | 'empty'; len: number }
+
+/**
+ * Two-tone bar: active fill, then pool fill up to poolPct. When the active
+ * fill passes the pool figure, one marker cell at the pool position stays
+ * visible. Segment lengths always sum to width; zero-length ones are dropped.
+ */
+export const twoToneBar = (activePct: number, poolPct: number | undefined, width: number): BarSegment[] => {
+  const a = cells(activePct, width)
+  const p = poolPct === undefined ? 0 : cells(poolPct, width)
+  const segs: BarSegment[] =
+    poolPct !== undefined && p < a
+      ? [
+          { kind: 'active', len: p },
+          { kind: 'marker', len: 1 },
+          { kind: 'active', len: a - p - 1 },
+          { kind: 'empty', len: width - a },
+        ]
+      : [
+          { kind: 'active', len: a },
+          { kind: 'pool', len: Math.max(0, p - a) },
+          { kind: 'empty', len: width - Math.max(a, p) },
+        ]
+  return segs.filter(s => s.len > 0)
+}
+
+const pad2 = (n: number) => String(n).padStart(2, '0')
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** Reset moment as `HH:MM` (session) or `Mon D` (week); raw text when unparseable. */
+export const resetLabel = (at: string | number | undefined, kind: 'session' | 'week'): string => {
+  if (at === undefined || at === '') return ''
+  const d = new Date(at)
+  if (Number.isNaN(d.getTime())) return String(at)
+  return kind === 'session' ? `${pad2(d.getHours())}:${pad2(d.getMinutes())}` : `${MONTHS[d.getMonth()]} ${d.getDate()}`
+}
+
+export type BandRow = {
+  name: 'session' | 'week'
+  active: number
+  resets: string
+  /** Pool case only. */
+  pool?: { pct: number | undefined; reporting: number; total: number }
+}
+
+/** Rows for the band above the prompt, or [] when there is nothing to show. */
+export const bandRows = (r: Resolved, status: SwapStatus | null, limits: LimitsEntry[] | null): BandRow[] => {
+  if (!r.current) return []
+  const out: BandRow[] = []
+  if (r.kind === 'pool') {
+    const accounts = status?.accounts ?? []
+    const me = accounts.find(a => a.name === r.current)
+    for (const [name, key] of [['session', 'fiveHour'], ['week', 'sevenDay']] as const) {
+      const w = me?.usage?.[key]
+      if (w) out.push({ name, active: w.utilization, resets: resetLabel(w.resetsAt, name), pool: poolWindowPct(accounts, key) })
+    }
+  } else {
+    const e = entriesFor(limits, r.current).find(l => l.toolName === 'claude')
+    for (const name of ['session', 'week'] as const) {
+      const w = e && pick(e.windows, name)
+      if (w) out.push({ name, active: w.usedPercent, resets: resetLabel(w.resetsAtMs ?? w.resetsAt, name) })
+    }
   }
   return out
 }

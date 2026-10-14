@@ -3,6 +3,8 @@ import type { Register } from 'claude-code'
 
 import type { LimitsEntry, SwapStatus, SwapUsage } from '../types'
 import {
+  bandRows,
+  bar,
   entriesFor,
   humanise,
   others,
@@ -15,6 +17,7 @@ import {
   statusLine,
   tone,
   totals,
+  twoToneBar,
 } from './model'
 
 const PANE = 'ais-usage'
@@ -115,6 +118,61 @@ export const register: Register = on => {
     void refreshHandle?.()
 
     return { text: 'AIS usage pane opened.' }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const st = await read($, status)
+    const lim = await read($, limits)
+    const r = resolveCurrent(lim, await $.env.get('CLAUDE_CONFIG_DIR'), st)
+    const rows = bandRows(r, st, lim)
+    if (e.props.hasSurvey || !rows.length) return next(e)
+
+    const { Box, Text } = $.ui.resolve(e)
+    const cols = e.props.bodyColumns ?? e.viewport?.columns ?? 80
+    const fill = { active: 'cyan', pool: 'blue', marker: 'white', empty: undefined } as const
+    const glyph = { active: '\u2588', pool: '\u2588', marker: '|', empty: '\u2591' } as const
+
+    return (
+      <Box flexDirection="column">
+        {r.pool && (
+          <Text dimColor>
+            {r.pool} &gt; {r.current}
+          </Text>
+        )}
+        {rows.map(row => {
+          const pool = row.pool
+          const left = pool?.pct === undefined ? undefined : Math.max(0, 100 - Math.round(pool.pct))
+          const label = pool
+            ? `${pool.pct === undefined ? 'pool n/a' : `pool ${pct(pool.pct)} used, ${left}% left`}  |  ${r.current} ${pct(row.active)}`
+            : pct(row.active)
+          const width = Math.min(40, Math.max(10, cols - 12 - label.length - (row.resets.length + 9) - (pool ? 16 : 0)))
+          return (
+            <Text key={row.name}>
+              {row.name.padEnd(8)}[
+              {pool ? (
+                twoToneBar(row.active, pool.pct, width).map((s, i) => (
+                  <Text key={i} color={fill[s.kind]} dimColor={s.kind === 'empty'}>
+                    {glyph[s.kind].repeat(s.len)}
+                  </Text>
+                ))
+              ) : (
+                <Text color={tone(row.active)}>{bar(row.active, width)}</Text>
+              )}
+              ]{' '}
+              {pool ? (
+                <Text>
+                  <Text color={tone(pool.pct ?? 0)}>{label.split('  |  ')[0]}</Text>  |  <Text color={tone(row.active)}>{r.current} {pct(row.active)}</Text>
+                </Text>
+              ) : (
+                <Text color={tone(row.active)}>{label}</Text>
+              )}
+              {row.resets ? <Text dimColor>  resets {row.resets}</Text> : null}
+              {pool && pool.reporting < pool.total ? <Text dimColor> ({pool.reporting}/{pool.total} reporting)</Text> : null}
+            </Text>
+          )
+        })}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
