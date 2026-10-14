@@ -29,3 +29,23 @@ on a member leaves the pool's previous one in place with a note; an
 unattributable live pool grant is never destroyed (a 0600 `.pre-swap.bak` is
 kept).
 
+
+### Provider-neutral core and adapters (task provider-pools)
+
+The pool logic is split into a provider-neutral core in `src/identities/pool/`
+and per-tool adapters. Core: `swap-pool.ts` (registry helpers, moved from
+`identities/swap-pool.ts`, which re-exports), `ledger.ts` (per-tool JSONL
+`~/.ais/state/<tool>-swap.jsonl`; claude stays exactly `claude-swap.jsonl`),
+`swap.ts` (`performPoolSwap`: validate, adapter swap, persist `active`, ledger),
+`ops.ts` (`chooseBest`, `swapIfLimited`, 10 min cooldown, `poolStatus`,
+`swapToNext`), `launch.ts` (`poolLaunchCheck`), `scheduler.ts`
+(`PoolSwapScheduler`: daemon loop over every registered adapter's registry),
+`registry.ts` (`adapterFor(tool)`, `allAdapters()`). An adapter
+(`pool/adapter.ts` `PoolAdapter`) supplies only `tool`, `config`, `liveSwap`,
+`hasCredentials`, `swapCredentials` (write-back plus atomic copy) and
+`fetchUsage`. `pool/claude-adapter.ts` wraps the existing `claude-swap.ts` I/O;
+`claude-swap-ops.ts`, `claude-swap-launch.ts` and `server/claude-swap-auto.ts`
+remain as thin Claude bindings so callers and tests are unchanged. The shim
+(`shared/run-wrapper.ts`) and the daemon (`server/serve.ts`) go through the
+core; `AIS_CLAUDE_SWAP=0` drops claude and `AIS_POOL_SWAP_<TOOL>=0` drops any
+other tool from the daemon loop. No other adapter exists yet.
