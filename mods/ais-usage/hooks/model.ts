@@ -160,10 +160,10 @@ export const poolProviders = (limits: LimitsEntry[] | null, r: Resolved): Provid
 const clamp01 = (p: number) => Math.min(100, Math.max(0, Number.isFinite(p) ? p : 0))
 const cells = (p: number, width: number) => Math.round((clamp01(p) / 100) * width)
 
-/** Single-colour bar body (no brackets): '#' for used cells, '-' for the rest. */
-export const bar = (p: number, width: number): string => {
+/** Single-colour bar body (no brackets) as [filled, empty] full-block runs. */
+export const bar = (p: number, width: number): [string, string] => {
   const n = cells(p, width)
-  return '#'.repeat(n) + '-'.repeat(Math.max(0, width - n))
+  return ['\u2588'.repeat(n), '\u2588'.repeat(Math.max(0, width - n))]
 }
 
 export type Window5 = 'fiveHour' | 'sevenDay'
@@ -185,29 +185,18 @@ export const poolWindowPct = (
   }
 }
 
-export type BarSegment = { kind: 'active' | 'pool' | 'marker' | 'empty'; len: number }
+export type BarSegment = { kind: 'active' | 'pool' | 'empty'; len: number }
 
-/**
- * Two-tone bar: active fill, then pool fill up to poolPct. When the active
- * fill passes the pool figure, one marker cell at the pool position stays
- * visible. Segment lengths always sum to width; zero-length ones are dropped.
- */
+/** Overlay bar: cells up to the lower value take its colour, up to the higher value the higher one's, then empty. Equal values draw as active. */
 export const twoToneBar = (activePct: number, poolPct: number | undefined, width: number): BarSegment[] => {
   const a = cells(activePct, width)
   const p = poolPct === undefined ? 0 : cells(poolPct, width)
-  const segs: BarSegment[] =
-    poolPct !== undefined && p < a
-      ? [
-          { kind: 'active', len: p },
-          { kind: 'marker', len: 1 },
-          { kind: 'active', len: a - p - 1 },
-          { kind: 'empty', len: width - a },
-        ]
-      : [
-          { kind: 'active', len: a },
-          { kind: 'pool', len: Math.max(0, p - a) },
-          { kind: 'empty', len: width - Math.max(a, p) },
-        ]
+  const [lo, hi] = a <= p ? (['active', 'pool'] as const) : (['pool', 'active'] as const)
+  const segs: BarSegment[] = [
+    { kind: lo, len: Math.min(a, p) },
+    { kind: hi, len: Math.abs(a - p) },
+    { kind: 'empty', len: width - Math.max(a, p) },
+  ]
   return segs.filter(s => s.len > 0)
 }
 

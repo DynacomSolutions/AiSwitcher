@@ -126,18 +126,35 @@ export const register: Register = on => {
     const lim = await read($, limits)
     const r = resolveCurrent(lim, await $.env.get('CLAUDE_CONFIG_DIR'), st)
     const rows = bandRows(r, st, lim)
-    if (e.props.hasSurvey || !rows.length) return next(e)
+    if (e.props.hasSurvey || (lim && !rows.length)) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
     const cols = e.props.bodyColumns ?? e.viewport?.columns ?? 80
-    const fill = { active: 'cyan', pool: 'blue', marker: 'white', empty: undefined } as const
-    const glyph = { active: '\u2588', pool: '\u2588', marker: '|', empty: '\u2591' } as const
+    const fill = { active: 'cyan', pool: 'blue', empty: 'gray' } as const
+    const block = '\u2588'
+
+    // Limits not in yet: show the band at once with an empty bar.
+    if (!lim) {
+      return (
+        <Box flexDirection="column">
+          {['session', 'week'].map(name => (
+            <Text key={name}>
+              {name.padEnd(8)}[<Text color="gray">{block.repeat(20)}</Text>] <Text dimColor>loading...</Text>
+            </Text>
+          ))}
+        </Box>
+      )
+    }
 
     return (
       <Box flexDirection="column">
         {r.pool && (
           <Text dimColor>
             {r.pool} &gt; {r.current}
+            {'  '}
+            <Text color="cyan">{block}</Text> {r.current}
+            {'  '}
+            <Text color="blue">{block}</Text> pool avg
           </Text>
         )}
         {rows.map(row => {
@@ -152,12 +169,15 @@ export const register: Register = on => {
               {row.name.padEnd(8)}[
               {pool ? (
                 twoToneBar(row.active, pool.pct, width).map((s, i) => (
-                  <Text key={i} color={fill[s.kind]} dimColor={s.kind === 'empty'}>
-                    {glyph[s.kind].repeat(s.len)}
+                  <Text key={i} color={fill[s.kind]}>
+                    {block.repeat(s.len)}
                   </Text>
                 ))
               ) : (
-                <Text color={tone(row.active)}>{bar(row.active, width)}</Text>
+                <>
+                  <Text color={tone(row.active)}>{bar(row.active, width)[0]}</Text>
+                  <Text color="gray">{bar(row.active, width)[1]}</Text>
+                </>
               )}
               ]{' '}
               {pool ? (

@@ -68,9 +68,9 @@ test('shares sum to 100 and humanise', async () => {
 })
 
 test('bar', async () => {
-  expect(bar(42, 20)).toBe('########------------')
-  expect(bar(0, 10)).toBe('----------')
-  expect(bar(150, 10)).toBe('##########')
+  expect(bar(42, 20)).toEqual(['\u2588'.repeat(8), '\u2588'.repeat(12)])
+  expect(bar(0, 10)).toEqual(['', '\u2588'.repeat(10)])
+  expect(bar(150, 10)).toEqual(['\u2588'.repeat(10), ''])
 })
 
 const acc = (name: string, five: number | undefined, allowed = true) =>
@@ -88,10 +88,9 @@ test('twoToneBar', async () => {
   expect(twoToneBar(10, 50, 20)).toEqual([
     { kind: 'active', len: 2 }, { kind: 'pool', len: 8 }, { kind: 'empty', len: 10 },
   ])
+  expect(twoToneBar(50, 50, 20)).toEqual([{ kind: 'active', len: 10 }, { kind: 'empty', len: 10 }])
   const over = twoToneBar(80, 50, 20)
-  expect(over).toEqual([
-    { kind: 'active', len: 10 }, { kind: 'marker', len: 1 }, { kind: 'active', len: 5 }, { kind: 'empty', len: 4 },
-  ])
+  expect(over).toEqual([{ kind: 'pool', len: 10 }, { kind: 'active', len: 6 }, { kind: 'empty', len: 4 }])
   expect(sum(over)).toBe(20)
   expect(twoToneBar(25, undefined, 20)).toEqual([{ kind: 'active', len: 5 }, { kind: 'empty', len: 15 }])
   expect(twoToneBar(0, 0, 10)).toEqual([{ kind: 'empty', len: 10 }])
