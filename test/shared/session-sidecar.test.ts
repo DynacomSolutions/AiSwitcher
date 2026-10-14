@@ -19,7 +19,8 @@ import {
   type SessionSpec,
 } from "../../src/shared/session-sidecar.ts";
 
-const linux = process.platform === "linux";
+// Start-time and zombie detection exist on both: /proc on Linux, sysctl on macOS.
+const supported = process.platform === "linux" || process.platform === "darwin";
 
 describe("pid exit detection", () => {
   test("this process is running; an unused pid is not", () => {
@@ -27,14 +28,25 @@ describe("pid exit detection", () => {
     expect(isPidRunning(2 ** 22 + 12345)).toBe(false);
   });
 
-  test.skipIf(!linux)("a recycled pid (different start time) counts as exited", () => {
+  test.skipIf(!supported)("a recycled pid (different start time) counts as exited", () => {
     const start = procStartTime(process.pid);
     expect(start).toBeTruthy();
     expect(isPidRunning(process.pid, start)).toBe(true);
     expect(isPidRunning(process.pid, `${start}0`)).toBe(false);
   });
 
-  test.skipIf(!linux)("an unreaped zombie counts as exited", async () => {
+  test.skipIf(process.platform !== "darwin")("the macOS start time is the real process start (sysctl layout check)", async () => {
+    const child = Bun.spawn(["sleep", "5"], { stdio: ["ignore", "ignore", "ignore"] });
+    try {
+      const [seconds] = (procStartTime(child.pid) ?? "").split(".");
+      expect(Math.abs(Number(seconds) * 1000 - Date.now())).toBeLessThan(10_000);
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  });
+
+  test.skipIf(!supported)("an unreaped zombie counts as exited", async () => {
     // The shell exits; we keep the Subprocess unreaped by not awaiting it yet.
     const child = Bun.spawn(["sh", "-c", "exit 0"], { stdio: ["ignore", "ignore", "ignore"] });
     const start = Date.now();
@@ -49,7 +61,7 @@ describe("pid exit detection", () => {
     expect(calls).toBe(4);
   });
 
-  test.skipIf(!linux)("waitForPidExit follows a real process that is not our child", async () => {
+  test.skipIf(!supported)("waitForPidExit follows a real process that is not our child", async () => {
     const child = Bun.spawn(["sleep", "0.4"], { stdio: ["ignore", "ignore", "ignore"] });
     const started = Date.now();
     await waitForPidExit(child.pid, { pollMs: 20, startTime: procStartTime(child.pid) as string });
@@ -141,16 +153,20 @@ describe("launchWithSession", () => {
     }
   });
 
-  test("the expected non-Linux execve fallback is not logged, but a real failure on Linux is", async () => {
+  test("a platform where execve is never expected is not logged, but a real failure on Linux or macOS is", async () => {
     const home = mkdtempSync(join(tmpdir(), "ais-fallback-log-"));
     const log = join(home, "shim-fallback.log");
     try {
-      const mac = deps({ execve: () => "execve unsupported on darwin", logPath: log, platform: "darwin" });
-      await launchWithSession(CODEX_CONFIG, base, real, mac.d);
+      const other = deps({ execve: () => "execve unsupported on win32", logPath: log, platform: "win32" });
+      await launchWithSession(CODEX_CONFIG, base, real, other.d);
       expect(existsSync(log)).toBe(false);
-      const linux = deps({ execve: () => "execve(/real/codex) failed", logPath: log, platform: "linux" });
-      await launchWithSession(CODEX_CONFIG, base, real, linux.d);
-      expect(readFileSync(log, "utf8")).toContain("execve(/real/codex) failed");
+      for (const platform of ["linux", "darwin"] as const) {
+        const failing = deps({ execve: () => `execve(/real/${platform}) failed`, logPath: log, platform });
+        await launchWithSession(CODEX_CONFIG, base, real, failing.d);
+      }
+      const text = readFileSync(log, "utf8");
+      expect(text).toContain("execve(/real/linux) failed");
+      expect(text).toContain("execve(/real/darwin) failed");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
