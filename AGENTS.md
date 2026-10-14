@@ -93,10 +93,14 @@ Identity and launch:
   must declare `globalMemoryProjection`. Write via `ais memory add`. Pi management
   subcommands (`install`/`remove`/`uninstall`/`update`/`list`/`config`/`auth`) must
   bypass the projection.
-- No `execve`: `src/shared/exec.ts` uses `Bun.spawn` with inherited stdio and
-  explicit signal relay. Shims install to `~/.local/bin`; the real binary is
-  resolved fresh each run, never cached. One compiled binary per tool; no
-  argv0 dispatch.
+- The wrapper never stays alive as the TUI's parent: after setup it spawns the
+  detached `__session-sidecar` (sync watcher, Herdr titles, post-exit sync; never
+  touches the terminal), then replaces itself with the real binary via libc
+  `execve` (`src/shared/execve.ts`, `session-sidecar.ts`; Linux only). Without
+  FFI or on failure it falls back to `Bun.spawn` in `src/shared/exec.ts`
+  (inherited stdio, explicit signal relay). Shims install to `~/.local/bin`; the
+  real binary is resolved fresh each run, never cached. One compiled binary per
+  tool; no argv0 dispatch (the sidecar is re-entered via argv[2] plus an env spec).
 - The flag is `--identity` (not `--account`/`--profile`; codex owns `-p/--profile`).
 - A nested launch with no `--id` inherits `AI_PROFILE_SWITCHER_SESSION`; only an
   explicit, different identity is rejected. The Bash hook

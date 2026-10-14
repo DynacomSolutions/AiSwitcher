@@ -98,7 +98,12 @@ src/
                         fallback), atomic into ~/.local/bin/aistui, no retry loop;
                         shared by `ais tui` and `ais herdr`'s panel
     exec.ts               Bun.spawn passthrough, signal relay, exit-code parity;
+                          execveReal/execReal try execve first;
                           also defines IDENTITY_SESSION_MARKER (see below)
+    execve.ts             libc execve via bun:ffi (Linux): argv/envp block, signal
+                          and fd hygiene; every failure returns false
+    session-sidecar.ts    detached `__session-sidecar` (sync watcher, Herdr titles,
+                          PID-exit watch, post-exit sync) and launchWithSession()
     cli-args.ts            strip --identity=/--desktop, detect non-interactive intent
                           (per-tool: claude's -p/--print, codex's `exec` subcommand,
                           grok's -p/--single or `agent` subcommand, kimi's -p/--prompt

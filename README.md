@@ -72,10 +72,13 @@ Claude Code at Z.ai's Anthropic-compatible endpoint instead (that endpoint
 transparently remaps whatever model alias Claude Code sends, with no way for
 Claude Code's own UI to reflect what actually answered).
 
-No `execve`-style replacement — Bun has no stable primitive for that — so the
-wrapper uses `Bun.spawn` with full fd inheritance and explicit signal relay
-(`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGTSTP`), mirroring the child's exit
-code. This is the same model `nvm`/`asdf`/`direnv` shims use.
+On Linux the wrapper `execve`s the real tool over itself (libc via `bun:ffi`),
+so the tool owns the shim's PID and terminal and a wrapper crash can never
+orphan it. Sync and Herdr tab-title work run in a detached `__session-sidecar`
+that watches the tool's PID. Where `execve` is unavailable (macOS, no FFI) the
+wrapper falls back to `Bun.spawn` with full fd inheritance and explicit signal
+relay (`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`/`SIGTSTP`), mirroring the child's
+exit code, the model `nvm`/`asdf`/`direnv` shims use.
 
 ## Global memory
 
@@ -268,6 +271,8 @@ src/
 │   │                      recursion guard — takes a realBinaryName, not a toolName
 │   │                      (zai's realBinaryName is "crush", not "zai")
 │   ├── exec.ts             Bun.spawn passthrough, signal relay, exit-code parity
+│   ├── execve.ts           libc execve via bun:ffi (Linux), falls back to exec.ts
+│   ├── session-sidecar.ts  detached sidecar: sync watcher, Herdr titles, post-exit sync
 │   ├── cli-args.ts         strip --identity=/--desktop, detect non-interactive intent
 │   ├── codex-backfill.ts   recover orphaned Codex state-DB backfill leases
 │   ├── launch-desktop.ts   best-effort --desktop launch
