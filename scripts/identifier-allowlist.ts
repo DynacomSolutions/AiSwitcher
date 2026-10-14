@@ -51,6 +51,7 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "w3.org", reason: "SVG namespace URI required by the SVG spec, not a network endpoint (apps/web/index.html)" },
   { domain: "bigmodel.cn", reason: "Zhipu/Z.ai China-region API endpoint, alongside the global z.ai endpoint (AGENTS.md)" },
   { domain: "command.run", reason: "engine event name in mods/ais-usage, not a host" },
+  { domain: "process.run", reason: "engine event name in mods/ais-usage, not a host" },
 ];
 
 // Not a domain/hostname (no TLD-shaped last label), so the scanner never
