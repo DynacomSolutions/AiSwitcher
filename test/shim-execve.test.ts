@@ -222,6 +222,10 @@ describe.each([
     killers.push(shim.pid);
     await waitFor(() => existsSync(out));
     await waitFor(() => existsSync(syncLog)); // launch-time sync
+    // Proves the sidecar's PID watch survives the exec (start time kept): a watch that
+    // wrongly saw the PID as recycled would run the post-exit sync while the tool still runs.
+    await Bun.sleep(1_500);
+    expect(readFileSync(syncLog, "utf8")).not.toContain("--wait");
     writeFileSync(release, "");
     await shim.exited;
     const lines = await waitFor(() => {
