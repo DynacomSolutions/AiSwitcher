@@ -21,10 +21,11 @@ import { nonEmpty, pairIdentity } from "./token-account.ts";
  * so a refresh in flight during a swap would write the old account back; the
  * swap and heal take that same lock, and heal captures anything that still
  * lands. The rotating-refresh-token rule is the Codex one: the pool copy is
- * written back to the member that owns it, newer `expires` only, and only
- * the `kimi-coding` entry (the one with an account claim): other providers are
- * never copied between member vaults, a newer one in the pool is backed up
- * instead. AIS never refreshes the pool itself.
+ * written back to the member that owns it, newer `expires` only: every OAuth
+ * entry when the pool file is that member's own, only the `kimi-coding` entry
+ * (the one with an account claim) when the pool holds the member's account next
+ * to parts that may be another member's; a newer entry that cannot move is
+ * backed up instead. AIS never refreshes the pool itself.
  */
 
 const KIMI_ENTRY = "kimi-coding";
@@ -55,15 +56,24 @@ export const piAdapter = createGrantFileAdapter({
   identity: (g) => pairIdentity(kimiEntry(g)?.access, kimiEntry(g)?.refresh),
   complete: (g) => g !== undefined && Object.values(g).every((e) => typeof e === "object" && e !== null && !Array.isArray(e) && validEntry(e as Entry)),
   fingerprint: (g) => JSON.stringify(entries(g).filter(([, e]) => isOauth(e)).map(([k, e]) => [k, e.access, e.refresh]).sort()),
-  // Only the account-bearing entry moves between files: every other provider has no
-  // account claim to check, so copying it could hand one member another account's tokens.
-  newerInto: (owner, pool) => {
+  // "same": the pool file is the member's own, so every OAuth entry it rotated goes back (only providers
+  // the member already holds). "capture": other providers carry no account claim to check and may belong
+  // to another member, so only the account-bearing kimi-coding entry moves.
+  newerInto: (owner, pool, mode) => {
     if (!owner) return pool;
-    const o = owner[KIMI_ENTRY] as Entry | undefined;
-    const p = pool[KIMI_ENTRY] as Entry | undefined;
-    if (!o || !p || !isOauth(o) || !isOauth(p)) return undefined;
-    const newer = typeof p.expires === "number" && p.expires > (typeof o.expires === "number" ? o.expires : -1);
-    return newer && (p.access !== o.access || p.refresh !== o.refresh) ? { ...owner, [KIMI_ENTRY]: { ...o, ...p } } : undefined;
+    const next: GrantFile = { ...owner };
+    let changed = false;
+    for (const [key, p] of entries(pool)) {
+      if (mode === "capture" && key !== KIMI_ENTRY) continue;
+      const o = owner[key] as Entry | undefined;
+      if (!o || !isOauth(o) || !isOauth(p)) continue;
+      const newer = typeof p.expires === "number" && p.expires > (typeof o.expires === "number" ? o.expires : -1);
+      if (newer && (p.access !== o.access || p.refresh !== o.refresh)) {
+        next[key] = { ...o, ...p };
+        changed = true;
+      }
+    }
+    return changed ? next : undefined;
   },
   hasPoolOnlyContent: (pool, vault) =>
     entries(pool).some(([key, e]) => {

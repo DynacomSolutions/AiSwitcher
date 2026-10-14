@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import type { LimitWindow } from "../../cli/limits/types.ts";
 import { lockOrder, withOauthRefreshLock } from "../claude-swap-lock.ts";
 import { expandPath } from "../match.ts";
@@ -22,11 +22,29 @@ import type { GrantIdentity } from "./token-account.ts";
  *  - AIS never refreshes the pool identity itself (refreshes go to the
  *    member and are written through);
  *  - heal repairs empty/partial, foreign-account, hybrid and lagging pool
- *    files, keeping a 0600 `.pre-heal.bak` of anything it cannot attribute.
+ *    files, keeping a 0600 `.pre-heal.<stamp>.bak` of anything it cannot attribute.
  * What differs per tool is supplied by a `GrantFileSpec`.
  */
 
 export type GrantFile = Record<string, unknown>;
+
+/** "same": the pool file belongs to the member it is written back to (every part of it is that
+ * member's), so everything newer goes back. "capture": the pool holds that member's account next
+ * to parts that may belong to another one, so only the account-bearing part may move. */
+export type WriteBackMode = "same" | "capture";
+
+const BACKUPS_KEPT = 10;
+
+/** Writes `text` to a new `<file>.pre-<kind>.<stamp>.bak` (0600) and keeps the newest few per kind. */
+async function writeBackup(file: string, kind: "swap" | "heal", text: string): Promise<string> {
+  const stamp = `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(2).toString("hex")}`;
+  const path = `${file}.pre-${kind}.${stamp}.bak`;
+  await writeFileAtomic(path, text);
+  const prefix = `${basename(file)}.pre-${kind}.`;
+  const old = (await readdir(dirname(file)).catch(() => [] as string[])).filter((n) => n.startsWith(prefix) && n.endsWith(".bak")).sort();
+  for (const name of old.slice(0, Math.max(0, old.length - BACKUPS_KEPT))) await rm(join(dirname(file), name), { force: true });
+  return path;
+}
 
 export const grantFileTuning = {
   /** Wait before re-reading a pool file that looks damaged (a writer may be mid-write). */
@@ -54,7 +72,7 @@ export interface GrantFileSpec {
   fingerprint(g: GrantFile): string;
   /** The owner's content after taking whatever in `pool` is strictly newer,
    * or undefined when nothing is. Keys the pool copy lacks survive. */
-  newerInto(owner: GrantFile | undefined, pool: GrantFile): GrantFile | undefined;
+  newerInto(owner: GrantFile | undefined, pool: GrantFile, mode: WriteBackMode): GrantFile | undefined;
   /** The pool holds content the vault lacks that a restore or swap would
    * drop and no write-back carries over (logins made inside the pool, edited
    * static keys). Optional: a single-grant file has none. */
@@ -124,9 +142,13 @@ export async function withLockDir<T>(path: string, staleMs: number, label: strin
     }
   }
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
-  const tokenPath = join(path, "owner");
+  const tokenPath = `${path}.owner`; // beside the lock dir: the tool's own cleanup of the dir must stay a plain rmdir
   await writeFile(tokenPath, token).catch(() => undefined);
-  const owned = async () => (await readFile(tokenPath, "utf8").then((t) => t === token, () => false));
+  // Ownership = our token AND the very directory we created (inode plus birth time): a lock the tool broke
+  // and re-took is a different directory even though our sibling token file is still there.
+  const identOf = async () => stat(path).then((s) => `${s.ino}:${s.birthtimeMs}`, () => "");
+  const ident = await identOf();
+  const owned = async () => (await readFile(tokenPath, "utf8").then((t) => t === token, () => false)) && (await identOf()) === ident;
   let busy = false;
   const timer = setInterval(() => {
     if (busy) return;
@@ -138,7 +160,7 @@ export async function withLockDir<T>(path: string, staleMs: number, label: strin
   } finally {
     clearInterval(timer);
     while (busy) await sleep(5);
-    if (await owned()) await rm(path, { recursive: true, force: true });
+    if (await owned()) await Promise.all([rm(path, { recursive: true, force: true }), rm(tokenPath, { force: true })]);
   }
 }
 
@@ -170,14 +192,14 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
   /** Writes the pool's grant into the owning member's vault when it is newer.
    * The caller holds the owner's oauth and tool locks (see `withHeldLocks`), so the read
    * and compare below can never overwrite a concurrent member refresh. */
-  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile): Promise<WriteBackOutcome> {
+  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, mode: WriteBackMode): Promise<WriteBackOutcome> {
     const poolId = spec.identity(poolGrant).id;
     const { grant: ownerGrant, who } = await load(owner.configDir);
     if (spec.usable(ownerGrant)) {
       if (who.id !== poolId) return "none-account-mismatch";
       if (spec.fingerprint(ownerGrant!) === spec.fingerprint(poolGrant)) return "none-identical";
     }
-    const next = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant);
+    const next = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant, mode);
     if (!next) return "none-member-newer";
     await writeText(owner.configDir, json(next));
     return "written";
@@ -239,7 +261,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         if (!owner) {
           writeBack = "none-unknown-owner";
         } else {
-          writeBack = await writeBackToOwner(owner, live.grant!);
+          writeBack = await writeBackToOwner(owner, live.grant!, owner.name === activeName ? "same" : "capture");
           if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
         }
       }
@@ -251,8 +273,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         poolOnly = spec.hasPoolOnlyContent(live.grant, vault);
       }
       if ((poolOnly || writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && live.text !== undefined) {
-        const backup = `${poolPath}.pre-swap.bak`;
-        await writeFileAtomic(backup, live.text);
+        const backup = await writeBackup(poolPath, "swap", live.text);
         notes.push(`live pool credentials ${poolOnly ? "hold entries the member lacks" : "could not be attributed to a member"}; kept a 0600 copy at ${backup}`);
       }
 
@@ -305,8 +326,8 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       else if (!cur.who.id) kind = "damaged";
       else if (cur.who.id !== vault.who.id) kind = "foreign";
       else if (spec.fingerprint(grant!) === spec.fingerprint(vaultGrant)) kind = "ok";
-      else if (spec.newerInto(vaultGrant, grant!)) kind = "same";
-      else if (spec.newerInto(grant!, vaultGrant)) kind = "behind";
+      else if (spec.newerInto(vaultGrant, grant!, "same")) kind = "same";
+      else if (spec.newerInto(grant!, vaultGrant, "same")) kind = "behind";
       else kind = "ok";
       return { ...cur, kind } as const;
     };
@@ -330,6 +351,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
 
     async function healHeld(held: Set<string>): Promise<string[] | { needLock: string }> {
     const notes: string[] = [];
+    let backedUp = false;
     return withHeldLocks(pool.configDir, held, lock, async () => {
       // Decide on the files as they are under the locks, not as they were before waiting for them.
       vault = await load(active!.configDir);
@@ -343,34 +365,31 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       if (now.kind === "ok") return [];
       if (now.kind === "same") {
         // Same account as the active vault: never restore over it, keep the newer tokens in the vault.
-        const outcome = await writeBackToOwner(active!, now.grant!);
+        const outcome = await writeBackToOwner(active!, now.grant!, "same");
         return [`pool ${pool.name} held newer tokens for "${activeName}"; vault write-back: ${outcome}`];
       }
       if (now.kind === "foreign") {
         const owner = await ownerByAccount(members, now.who.id!, activeName!);
         if (owner && !held.has(resolve(expandPath(owner.configDir)))) return { needLock: owner.configDir };
         if (owner) {
-          const outcome = await writeBackToOwner(owner, now.grant!);
+          const outcome = await writeBackToOwner(owner, now.grant!, "capture");
           notes.push(`pool ${pool.name} held "${owner.name}"'s account instead of "${activeName}"; ${outcome === "written" ? `captured it into "${owner.name}"` : `left "${owner.name}" as it was (${outcome})`}`);
         } else {
-          await writeFileAtomic(`${poolPath}.pre-heal.bak`, now.text!);
-          notes.push(`pool ${pool.name} held an account that is not a member; kept a 0600 copy at ${poolPath}.pre-heal.bak`);
+          backedUp = true;
+          notes.push(`pool ${pool.name} held an account that is not a member; kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
         }
       } else if (now.kind === "hybrid") {
-        await writeFileAtomic(`${poolPath}.pre-heal.bak`, now.text!);
-        notes.push(`pool ${pool.name} credentials were hybrid (parts disagree on the account); kept a 0600 copy at ${poolPath}.pre-heal.bak`);
+        backedUp = true;
+        notes.push(`pool ${pool.name} credentials were hybrid (parts disagree on the account); kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
       } else if (now.kind === "behind") {
         notes.push(`pool ${pool.name} was behind the vault of "${activeName}" (a member refresh missed it)`);
       } else {
         notes.push(`pool ${pool.name} credentials were empty or partial`);
       }
       // Anything a restore would drop and no write-back kept (damaged but non-empty, pool-only entries) gets a backup first.
-      const backup = `${poolPath}.pre-heal.bak`;
-      const alreadyBacked = notes.some((n) => n.includes(backup));
       const dropsContent = now.kind === "damaged" ? now.text !== undefined && now.text.trim() !== "" : now.grant !== undefined && spec.hasPoolOnlyContent?.(now.grant, vault.grant) === true;
-      if (!alreadyBacked && dropsContent) {
-        await writeFileAtomic(backup, now.text!);
-        notes.push(`pool ${pool.name} credentials held content the vault lacks; kept a 0600 copy at ${backup}`);
+      if (!backedUp && dropsContent) {
+        notes.push(`pool ${pool.name} credentials held content the vault lacks; kept a 0600 copy at ${await writeBackup(poolPath, "heal", now.text!)}`);
       }
       // Re-read the vault: a write-back above may have merged newer tokens into it.
       const restoreText = (await readText(active!.configDir)) ?? vault.text!;

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,6 +57,10 @@ const credPath = (name: string) => join(dirOf(name), "credentials", "kimi-code.j
 const put = async (name: string, text: string) => { await mkdir(join(dirOf(name), "credentials"), { recursive: true }); await writeFile(credPath(name), text); };
 const read = (name: string) => readFile(credPath(name), "utf8");
 const refreshToken = async (name: string) => (JSON.parse(await read(name)) as { refresh_token: string }).refresh_token;
+
+/** Newest `<base>.pre-<kind>.<stamp>.bak` in `dir`, if any. */
+const bakFiles = (dir: string, base: string, kind: "swap" | "heal") => readdirSync(dir).filter((n) => n.startsWith(`${base}.pre-${kind}.`) && n.endsWith(".bak")).sort().map((n) => join(dir, n));
+const bakPath = (dir: string, base: string, kind: "swap" | "heal") => bakFiles(dir, base, kind).at(-1) ?? join(dir, `${base}.pre-${kind}.MISSING.bak`);
 const T0 = 1_789_200_000;
 
 async function setup(active: string | undefined = "a"): Promise<void> {
@@ -139,7 +144,7 @@ describe("kimi swapCredentials write and verify", () => {
     expect((await swap("b")).writeBack).toBe("none-unknown-owner");
     expect(await read("a")).toBe(before.a);
     expect(await read("b")).toBe(before.b);
-    const bak = `${credPath("pool")}.pre-swap.bak`;
+    const bak = bakPath(join(dirOf("pool"), "credentials"), "kimi-code.json", "swap");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-rt-user-c-");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
   });
@@ -212,12 +217,14 @@ describe("tool lock upkeep", () => {
   test("a lock is removed only while it still carries our owner token", async () => {
     const lock = join(root, "x.lock");
     let seen = "";
-    await withToolLock(fake, root, async () => { seen = await readFile(join(lock, "owner"), "utf8"); });
+    await withToolLock(fake, root, async () => { seen = await readFile(`${lock}.owner`, "utf8"); expect(readdirSync(lock)).toEqual([]); });
     expect(seen).toMatch(/^\d+-[0-9a-f]{16}$/);
     await expect(stat(lock)).rejects.toThrow();
+    await expect(stat(`${lock}.owner`)).rejects.toThrow();
     // the tool broke our lock and took its own (no token file): release leaves it alone
-    await withToolLock(fake, root, async () => { await rm(lock, { recursive: true }); await mkdir(lock); await writeFile(join(lock, "owner"), "someone-else"); });
-    expect(await readFile(join(lock, "owner"), "utf8")).toBe("someone-else");
+    await withToolLock(fake, root, async () => { await rm(lock, { recursive: true }); await mkdir(lock); await writeFile(`${lock}.owner`, "someone-else"); });
+    expect(await readFile(`${lock}.owner`, "utf8")).toBe("someone-else");
+    expect(readdirSync(lock)).toEqual([]); // nothing inside the tool's own lock directory
   });
 
   test("a lock that now belongs to someone else is not removed on release", async () => {
@@ -232,6 +239,21 @@ describe("tool lock upkeep", () => {
     });
     grantFileTuning.toolLockUpdateMs = undefined;
     expect((await stat(lock)).isDirectory()).toBe(true);
+  });
+});
+
+describe("kimi backups", () => {
+  test("every backup has its own name, 0600, and only the newest 10 are kept", async () => {
+    await setup();
+    for (let i = 0; i < 12; i++) {
+      await put("pool", creds("user-c", T0 + 1 + i, { tag: `c${i}` })); // a non-member account each time
+      await healPool();
+    }
+    const baks = bakFiles(join(dirOf("pool"), "credentials"), "kimi-code.json", "heal");
+    expect(baks.length).toBe(10);
+    expect(await readFile(baks.at(-1)!, "utf8")).toContain("SYNTHETIC_FIXTURE-rt-c11");
+    expect(await readFile(baks[0]!, "utf8")).toContain("SYNTHETIC_FIXTURE-rt-c2");
+    expect((await stat(baks[0]!)).mode & 0o777).toBe(0o600);
   });
 });
 
@@ -261,7 +283,7 @@ describe("kimi heal", () => {
     expect(await refreshToken("b")).toBe(`SYNTHETIC_FIXTURE-rt-user-b-${T0}`);
     await put("pool", creds("user-c", T0 + 1, { tag: "c1" }));
     expect((await healPool()).join(" ")).toContain("not a member");
-    const bak = `${credPath("pool")}.pre-heal.bak`;
+    const bak = bakPath(join(dirOf("pool"), "credentials"), "kimi-code.json", "heal");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-rt-c1");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
     expect(await read("pool")).toBe(await read("a"));
@@ -271,7 +293,7 @@ describe("kimi heal", () => {
     await setup();
     await put("pool", creds("user-b", T0 + 50, { refreshUser: "user-a" }));
     expect((await healPool()).join(" ")).toContain("hybrid");
-    const bak = `${credPath("pool")}.pre-heal.bak`;
+    const bak = bakPath(join(dirOf("pool"), "credentials"), "kimi-code.json", "heal");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
     expect(await read("pool")).toBe(await read("a"));
   });
@@ -280,7 +302,7 @@ describe("kimi heal", () => {
     await setup();
     await put("pool", JSON.stringify({ access_token: "SYNTHETIC_FIXTURE-opaque", refresh_token: "SYNTHETIC_FIXTURE-opaque-rt", expires_at: T0 + 10 }));
     expect((await healPool()).join(" ")).toContain('restored "a"');
-    const bak = `${credPath("pool")}.pre-heal.bak`;
+    const bak = bakPath(join(dirOf("pool"), "credentials"), "kimi-code.json", "heal");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-opaque-rt");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
     expect(await read("pool")).toBe(await read("a"));

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +54,10 @@ const put = async (name: string, text: string) => { await mkdir(dirOf(name), { r
 const read = (name: string) => readFile(join(dirOf(name), "auth.json"), "utf8");
 const parsed = async (name: string) => JSON.parse(await read(name)) as Record<string, Record<string, string>>;
 const kimiRefresh = async (name: string) => (await parsed(name))["kimi-coding"]!.refresh;
+
+/** Newest `<base>.pre-<kind>.<stamp>.bak` in `dir`, if any. */
+const bakFiles = (dir: string, base: string, kind: "swap" | "heal") => readdirSync(dir).filter((n) => n.startsWith(`${base}.pre-${kind}.`) && n.endsWith(".bak")).sort().map((n) => join(dir, n));
+const bakPath = (dir: string, base: string, kind: "swap" | "heal") => bakFiles(dir, base, kind).at(-1) ?? join(dir, `${base}.pre-${kind}.MISSING.bak`);
 const T0 = 1_789_200_000;
 
 async function setup(active: string | undefined = "a"): Promise<void> {
@@ -114,7 +119,7 @@ describe("pi adapter identity and registration", () => {
 });
 
 describe("pi swapCredentials write and verify", () => {
-  test("swaps A to B to A; only A's kimi-coding entry is written back, other providers are backed up not copied", async () => {
+  test("swaps A to B to A; A's rotated OAuth entries are written back per provider, other keys kept", async () => {
     await setup();
     // a session refreshed A's kimi-coding and openai-codex entries in the pool; the zai key in the pool is untouched
     await put("pool", auth("user-a", T0 + 100, { tag: "a-refreshed", codexTag: "a-cx2", codexExpires: T0 + 100 }));
@@ -122,8 +127,7 @@ describe("pi swapCredentials write and verify", () => {
     expect(toB).toMatchObject({ from: "a", to: "b", writeBack: "written", noop: false });
     const a = await parsed("a");
     expect(a["kimi-coding"]!.refresh).toBe("SYNTHETIC_FIXTURE-rt-a-refreshed");
-    expect(a["openai-codex"]!.refresh).toBe(`SYNTHETIC_FIXTURE-cx-rt-user-a`); // never copied between files
-    expect(await readFile(join(dirOf("pool"), "auth.json.pre-swap.bak"), "utf8")).toContain("SYNTHETIC_FIXTURE-cx-rt-a-cx2");
+    expect(a["openai-codex"]!.refresh).toBe("SYNTHETIC_FIXTURE-cx-rt-a-cx2");
     expect(a.zai!.key).toBe("SYNTHETIC_FIXTURE-key-user-a");
     expect(await read("pool")).toBe(await read("b"));
     expect((await stat(join(dirOf("pool"), "auth.json"))).mode & 0o777).toBe(0o600);
@@ -149,7 +153,7 @@ describe("pi swapCredentials write and verify", () => {
     expect((await swap("b")).writeBack).toBe("none-unknown-owner");
     expect(await read("a")).toBe(before.a);
     expect(await read("b")).toBe(before.b);
-    const bak = join(dirOf("pool"), "auth.json.pre-swap.bak");
+    const bak = bakPath(dirOf("pool"), "auth.json", "swap");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-rt-user-c-");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
   });
@@ -188,30 +192,30 @@ describe("pi pool-only entries are never dropped silently", () => {
     await setup();
     await put("pool", auth("user-a", T0, { extra: login }));
     const r = await swap("b");
-    const bak = join(dirOf("pool"), "auth.json.pre-swap.bak");
+    const bak = bakPath(dirOf("pool"), "auth.json", "swap");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-oc-rt");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
-    expect(r.notes.join(" ")).toContain("pre-swap.bak");
+    expect(r.notes.join(" ")).toContain(".pre-swap.");
     await rm(bak);
     await swap("a");
     const edited = JSON.parse(await read("pool")) as Record<string, unknown>;
     edited.zai = { type: "api_key", key: "SYNTHETIC_FIXTURE-edited" };
     await put("pool", JSON.stringify(edited));
     await swap("b");
-    expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-edited");
+    expect(await readFile(bakPath(dirOf("pool"), "auth.json", "swap"), "utf8")).toContain("SYNTHETIC_FIXTURE-edited");
   });
 
   test("a clean pool leaves no backup", async () => {
     await setup();
     await swap("b");
-    await expect(stat(join(dirOf("pool"), "auth.json.pre-swap.bak"))).rejects.toThrow();
+    expect(bakFiles(dirOf("pool"), "auth.json", "swap")).toEqual([]);
   });
 
   test("heal keeps a 0600 backup before restoring over pool-only entries", async () => {
     await setup();
     await put("pool", auth("user-a", T0 - 50, { extra: login })); // same account, older: restore would drop the login
     await healPool();
-    const bak = join(dirOf("pool"), "auth.json.pre-heal.bak");
+    const bak = bakPath(dirOf("pool"), "auth.json", "heal");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-oc-rt");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
   });
@@ -225,6 +229,28 @@ describe("pi pool-only entries are never dropped silently", () => {
     const before = await read("pool");
     expect((await healPool()).join(" ")).toContain("cannot heal");
     expect(await read("pool")).toBe(before);
+  });
+});
+
+describe("pi pool file that is the active member's own", () => {
+  const anth = (rt: string, exp: number) => ({ type: "oauth", access: `SYNTHETIC_FIXTURE-AT-${rt}`, refresh: `SYNTHETIC_FIXTURE-${rt}`, expires: exp * 1000 });
+  const withAnth = async (name: string, rt: string, exp: number) => {
+    const base = JSON.parse(await read(name)) as Record<string, unknown>;
+    await put(name, JSON.stringify({ ...base, anthropic: anth(rt, exp) }));
+  };
+
+  test("a provider the pool session rotated (anthropic) goes back to the vault on heal and again on swap-away", async () => {
+    await setup("a");
+    await withAnth("a", "ANTH-R1", T0);
+    await withAnth("pool", "ANTH-R2", T0 + 8 * 3600); // same kimi account, anthropic rotated by a pi session in the pool
+    expect((await healPool()).join(" ")).toContain("write-back: written");
+    expect((await parsed("a")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-R2");
+
+    await withAnth("pool", "ANTH-R3", T0 + 16 * 3600);
+    const r = await swap("b");
+    expect(r.writeBack).toBe("written");
+    expect((await parsed("a")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-R3");
+    expect(bakFiles(dirOf("pool"), "auth.json", "swap")).toEqual([]); // nothing was left behind to back up
   });
 });
 
@@ -273,7 +299,7 @@ describe("pi heal", () => {
     await setup();
     await put("pool", auth("user-c", T0 + 1, { tag: "c1" }));
     expect((await healPool()).join(" ")).toContain("not a member");
-    const bak = join(dirOf("pool"), "auth.json.pre-heal.bak");
+    const bak = bakPath(dirOf("pool"), "auth.json", "heal");
     expect(await readFile(bak, "utf8")).toContain("SYNTHETIC_FIXTURE-rt-c1");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
     expect(await read("pool")).toBe(await read("a"));
@@ -283,7 +309,7 @@ describe("pi heal", () => {
     await setup();
     await put("pool", auth("user-b", T0 + 50, { refreshUser: "user-a" }));
     expect((await healPool()).join(" ")).toContain("hybrid");
-    const bak = join(dirOf("pool"), "auth.json.pre-heal.bak");
+    const bak = bakPath(dirOf("pool"), "auth.json", "heal");
     expect((await stat(bak)).mode & 0o777).toBe(0o600);
     expect(await read("pool")).toBe(await read("a"));
   });
