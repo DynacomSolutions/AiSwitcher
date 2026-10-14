@@ -177,8 +177,8 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
  *  - empty, partial, unparsable or token-less: restore from the active vault;
  *  - tokens of a different account than the active one (a running session
  *    refreshed or relogged after a swap): capture them into the member that
- *    owns that account when newer, else keep a `.pre-heal.bak`, then restore;
- *  - hybrid (account_id and the token JWT disagree): `.pre-heal.bak`, restore.
+ *    owns that account when newer, else keep a `.pre-heal.<stamp>.bak`, then restore;
+ *  - hybrid (account_id and the token JWT disagree): `.pre-heal.<stamp>.bak`, restore.
  * Caller holds the pool lock. Returns human notes for what it did.
  */
 async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions): Promise<string[]> {

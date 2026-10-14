@@ -26,7 +26,7 @@ refresh token never forks. Usage attribution: the pool is its own row in
 each transcript message to the member active at its timestamp per the ledger
 (approximate: one active member per pool at any instant). Missing oauthAccount
 on a member leaves the pool's previous one in place with a note; an
-unattributable live pool grant is never destroyed (a 0600 `.pre-swap.bak` is
+unattributable live pool grant is never destroyed (a 0600 `.pre-swap.<stamp>.bak` is
 kept).
 
 
@@ -86,7 +86,7 @@ Swap (`swapCredentials`, under the pool lock and the pool dir's
 `.oauth_refresh.lock`): write the pool grant back to the member whose vault
 holds the SAME account id when its `last_refresh` (else token iat/exp) is newer,
 never to another account; an unattributable or hybrid pool file is kept as a
-0600 `auth.json.pre-swap.bak`; the target's `auth.json` is written atomically
+0600 `auth.json.pre-swap.<stamp>.bak`; the target's `auth.json` is written atomically
 (0600, temp plus rename, all its keys kept), then re-read and verified by
 account id (restored on mismatch).
 
@@ -96,8 +96,8 @@ under the pool lock): after one re-read 200 ms later (a writer may be
 mid-truncate) it restores the active member's vault into the pool when the file
 is empty, partial, unparsable or token-less; when it holds another account it
 captures those tokens into the member that owns the account if newer (else a
-0600 `auth.json.pre-heal.bak` for a non-member) and restores the active one;
-a hybrid file gets a `.pre-heal.bak` and is restored. A refresh-during-swap
+0600 `auth.json.pre-heal.<stamp>.bak` for a non-member) and restores the active one;
+a hybrid file gets a `.pre-heal.<stamp>.bak` and is restored. A refresh-during-swap
 race (the old session rewrites A's newer tokens after a swap to B) ends with A's
 vault updated and B restored.
 
@@ -166,8 +166,8 @@ skipped) is copied into the pool.
 
 Rules carried over from Codex: the pool grant is written back to the member that
 owns it (matched by account id) under the pool lock, only when strictly newer
-(Kimi: `expires_at`; Pi: `expires` ms per OAuth entry. When the pool file is the owner's own, every entry it rotated goes back; when the pool only holds the owner's account next to parts that may be another member's (foreign capture), just `kimi-coding` moves and a newer other-provider entry is kept as a backup). Backups are `<file>.pre-swap.<stamp>.bak` / `.pre-heal.<stamp>.bak` (0600, newest 10 kept); an unattributable or hybrid pool file is kept as a
-0600 `.pre-swap.bak`/`.pre-heal.bak`; AIS never refreshes the pool identity
+(Kimi: `expires_at`; Pi: `expires` ms per OAuth entry. When the pool file is the owner's own, every entry it rotated goes back; when the pool only holds the owner's account next to parts that may be another member's (foreign capture), just `kimi-coding` moves and a newer other-provider entry is kept as a backup). Backups are `<file>.pre-<swap|heal|merge>.<stamp>.bak` (0600, newest 10 kept per kind); an unattributable or hybrid pool file is kept as a
+0600 `.pre-<swap|heal>.<stamp>.bak`; AIS never refreshes the pool identity
 (`fetchKimiLimits`/`fetchPiLimits` return unavailable for a pool, `kimiCredentialStores`
 returns no stores for one, `refreshIdentityOAuthGrant("kimi", pool)` is `no-grant`).
 A member's refresh reaches pool copies through `persistKimiCredentials`
