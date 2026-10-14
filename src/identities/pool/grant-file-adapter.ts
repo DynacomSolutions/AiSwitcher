@@ -33,10 +33,17 @@ export type GrantFile = Record<string, unknown>;
  * to parts that may belong to another one, so only the account-bearing part may move. */
 export type WriteBackMode = "same" | "capture";
 
+/** What moving a pool grant into an owner's vault comes to. `next` is the owner's new content (absent when
+ * nothing moves); `backup` holds content that must be kept before it is replaced or skipped. */
+export interface GrantMerge {
+  next?: GrantFile;
+  backup?: Record<string, unknown>;
+}
+
 const BACKUPS_KEPT = 10;
 
 /** Writes `text` to a new `<file>.pre-<kind>.<stamp>.bak` (0600) and keeps the newest few per kind. */
-async function writeBackup(file: string, kind: "swap" | "heal", text: string): Promise<string> {
+async function writeBackup(file: string, kind: "swap" | "heal" | "merge", text: string): Promise<string> {
   const stamp = `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomBytes(2).toString("hex")}`;
   const path = `${file}.pre-${kind}.${stamp}.bak`;
   await writeFileAtomic(path, text);
@@ -72,7 +79,7 @@ export interface GrantFileSpec {
   fingerprint(g: GrantFile): string;
   /** The owner's content after taking whatever in `pool` is strictly newer,
    * or undefined when nothing is. Keys the pool copy lacks survive. */
-  newerInto(owner: GrantFile | undefined, pool: GrantFile, mode: WriteBackMode): GrantFile | undefined;
+  newerInto(owner: GrantFile | undefined, pool: GrantFile, mode: WriteBackMode, others: GrantFile[]): GrantMerge | undefined;
   /** The pool holds content the vault lacks that a restore or swap would
    * drop and no write-back carries over (logins made inside the pool, edited
    * static keys). Optional: a single-grant file has none. */
@@ -189,19 +196,30 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
     return undefined;
   }
 
+  /** The other members' vault grants: a pool entry that equals one of theirs is a copy of their chain. */
+  async function otherGrants(owner: Identity, members: Identity[]): Promise<GrantFile[]> {
+    const out: GrantFile[] = [];
+    for (const m of members) if (resolve(expandPath(m.configDir)) !== resolve(expandPath(owner.configDir))) {
+      const g = (await load(m.configDir)).grant;
+      if (g) out.push(g);
+    }
+    return out;
+  }
+
   /** Writes the pool's grant into the owning member's vault when it is newer.
    * The caller holds the owner's oauth and tool locks (see `withHeldLocks`), so the read
    * and compare below can never overwrite a concurrent member refresh. */
-  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, mode: WriteBackMode): Promise<WriteBackOutcome> {
+  async function writeBackToOwner(owner: Identity, poolGrant: GrantFile, mode: WriteBackMode, members: Identity[]): Promise<WriteBackOutcome> {
     const poolId = spec.identity(poolGrant).id;
     const { grant: ownerGrant, who } = await load(owner.configDir);
     if (spec.usable(ownerGrant)) {
       if (who.id !== poolId) return "none-account-mismatch";
       if (spec.fingerprint(ownerGrant!) === spec.fingerprint(poolGrant)) return "none-identical";
     }
-    const next = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant, mode);
-    if (!next) return "none-member-newer";
-    await writeText(owner.configDir, json(next));
+    const merge = spec.newerInto(spec.usable(ownerGrant) ? ownerGrant : undefined, poolGrant, mode, await otherGrants(owner, members));
+    if (merge?.backup) await writeBackup(fileOf(owner.configDir), "merge", json(merge.backup));
+    if (!merge?.next) return "none-member-newer";
+    await writeText(owner.configDir, json(merge.next));
     return "written";
   }
 
@@ -261,7 +279,7 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
         if (!owner) {
           writeBack = "none-unknown-owner";
         } else {
-          writeBack = await writeBackToOwner(owner, live.grant!, owner.name === activeName ? "same" : "capture");
+          writeBack = await writeBackToOwner(owner, live.grant!, owner.name === activeName ? "same" : "capture", members);
           if (activeName && owner.name !== activeName) notes.push(`pool held "${owner.name}"'s account, not the recorded active "${activeName}"; wrote it back to "${owner.name}"`);
         }
       }
@@ -326,8 +344,8 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       else if (!cur.who.id) kind = "damaged";
       else if (cur.who.id !== vault.who.id) kind = "foreign";
       else if (spec.fingerprint(grant!) === spec.fingerprint(vaultGrant)) kind = "ok";
-      else if (spec.newerInto(vaultGrant, grant!, "same")) kind = "same";
-      else if (spec.newerInto(grant!, vaultGrant, "same")) kind = "behind";
+      else if (spec.newerInto(vaultGrant, grant!, "same", await otherGrants(active!, members))?.next) kind = "same";
+      else if (spec.newerInto(grant!, vaultGrant, "same", [])?.next) kind = "behind";
       else kind = "ok";
       return { ...cur, kind } as const;
     };
@@ -365,14 +383,14 @@ export function createGrantFileAdapter(spec: GrantFileSpec): PoolAdapter {
       if (now.kind === "ok") return [];
       if (now.kind === "same") {
         // Same account as the active vault: never restore over it, keep the newer tokens in the vault.
-        const outcome = await writeBackToOwner(active!, now.grant!, "same");
+        const outcome = await writeBackToOwner(active!, now.grant!, "same", members);
         return [`pool ${pool.name} held newer tokens for "${activeName}"; vault write-back: ${outcome}`];
       }
       if (now.kind === "foreign") {
         const owner = await ownerByAccount(members, now.who.id!, activeName!);
         if (owner && !held.has(resolve(expandPath(owner.configDir)))) return { needLock: owner.configDir };
         if (owner) {
-          const outcome = await writeBackToOwner(owner, now.grant!, "capture");
+          const outcome = await writeBackToOwner(owner, now.grant!, "capture", members);
           notes.push(`pool ${pool.name} held "${owner.name}"'s account instead of "${activeName}"; ${outcome === "written" ? `captured it into "${owner.name}"` : `left "${owner.name}" as it was (${outcome})`}`);
         } else {
           backedUp = true;

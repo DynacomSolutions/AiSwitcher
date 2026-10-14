@@ -56,8 +56,8 @@ const parsed = async (name: string) => JSON.parse(await read(name)) as Record<st
 const kimiRefresh = async (name: string) => (await parsed(name))["kimi-coding"]!.refresh;
 
 /** Newest `<base>.pre-<kind>.<stamp>.bak` in `dir`, if any. */
-const bakFiles = (dir: string, base: string, kind: "swap" | "heal") => readdirSync(dir).filter((n) => n.startsWith(`${base}.pre-${kind}.`) && n.endsWith(".bak")).sort().map((n) => join(dir, n));
-const bakPath = (dir: string, base: string, kind: "swap" | "heal") => bakFiles(dir, base, kind).at(-1) ?? join(dir, `${base}.pre-${kind}.MISSING.bak`);
+const bakFiles = (dir: string, base: string, kind: "swap" | "heal" | "merge") => readdirSync(dir).filter((n) => n.startsWith(`${base}.pre-${kind}.`) && n.endsWith(".bak")).sort().map((n) => join(dir, n));
+const bakPath = (dir: string, base: string, kind: "swap" | "heal" | "merge") => bakFiles(dir, base, kind).at(-1) ?? join(dir, `${base}.pre-${kind}.MISSING.bak`);
 const T0 = 1_789_200_000;
 
 async function setup(active: string | undefined = "a"): Promise<void> {
@@ -251,6 +251,47 @@ describe("pi pool file that is the active member's own", () => {
     expect(r.writeBack).toBe("written");
     expect((await parsed("a")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-R3");
     expect(bakFiles(dirOf("pool"), "auth.json", "swap")).toEqual([]); // nothing was left behind to back up
+  });
+});
+
+describe("pi own-mode merge checks every provider entry", () => {
+  const entry = (rt: string, exp: number, access = `SYNTHETIC_FIXTURE-AT-${rt}`) => ({ type: "oauth", access, refresh: `SYNTHETIC_FIXTURE-${rt}`, expires: exp * 1000 });
+  const set = async (name: string, patch: Record<string, unknown>) => put(name, JSON.stringify({ ...(JSON.parse(await read(name)) as object), ...patch }));
+  const mergeBaks = (name: string) => bakFiles(dirOf(name), "auth.json", "merge");
+
+  test("a pool entry equal to another member's vault entry is backed up and never merged (no shared rotation chain)", async () => {
+    await setup("a");
+    await set("a", { anthropic: entry("ANTH-R1", T0) });
+    await set("b", { anthropic: entry("ANTH-B", T0) });
+    await set("pool", { anthropic: entry("ANTH-B", T0 + 8 * 3600) }); // a copy of b's chain next to a's kimi-coding
+    await healPool();
+    await swap("b");
+    expect((await parsed("a")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-R1");
+    expect((await parsed("b")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-B");
+    expect(mergeBaks("a").length + bakFiles(dirOf("pool"), "auth.json", "swap").length).toBeGreaterThan(0);
+  });
+
+  test("an entry whose account claim differs from the owner's entry is skipped with a backup", async () => {
+    await setup("a");
+    const withClaim = (u: string, rt: string, exp: number) => ({ type: "oauth", access: jwt(u, exp), refresh: `SYNTHETIC_FIXTURE-${rt}`, expires: exp * 1000 });
+    await set("a", { anthropic: withClaim("acct-1", "ANTH-R1", T0) });
+    await set("pool", { anthropic: withClaim("acct-2", "ANTH-R2", T0 + 8 * 3600) });
+    await healPool(); // nothing to write back, so nothing moves
+    await swap("b"); // swapping away is where the skipped entry would have been merged
+    expect((await parsed("a")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-R1");
+    expect(mergeBaks("a").length).toBe(1);
+  });
+
+  test("an unclaimed, unshared newer entry is merged after a backup of the owner's previous entry", async () => {
+    await setup("a");
+    await set("a", { anthropic: entry("ANTH-R1", T0) });
+    await set("pool", { anthropic: entry("ANTH-R2", T0 + 8 * 3600) });
+    expect((await healPool()).join(" ")).toContain("write-back: written");
+    expect((await parsed("a")).anthropic!.refresh).toBe("SYNTHETIC_FIXTURE-ANTH-R2");
+    const baks = mergeBaks("a");
+    expect(baks.length).toBe(1);
+    expect(await readFile(join(dirOf("a"), baks[0]!.split("/").pop()!), "utf8")).toContain("SYNTHETIC_FIXTURE-ANTH-R1");
+    expect((await stat(baks[0]!)).mode & 0o777).toBe(0o600);
   });
 });
 

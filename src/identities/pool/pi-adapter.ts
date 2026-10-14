@@ -4,7 +4,7 @@ import type { ToolLimitResult } from "../../cli/limits/types.ts";
 import { PI_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
 import { createGrantFileAdapter, usageFromLimits, type GrantFile } from "./grant-file-adapter.ts";
-import { nonEmpty, pairIdentity } from "./token-account.ts";
+import { nonEmpty, pairIdentity, tokenAccount } from "./token-account.ts";
 
 /**
  * Pi pool adapter. The pool is one PI_CODING_AGENT_DIR whose `auth.json`
@@ -56,24 +56,40 @@ export const piAdapter = createGrantFileAdapter({
   identity: (g) => pairIdentity(kimiEntry(g)?.access, kimiEntry(g)?.refresh),
   complete: (g) => g !== undefined && Object.values(g).every((e) => typeof e === "object" && e !== null && !Array.isArray(e) && validEntry(e as Entry)),
   fingerprint: (g) => JSON.stringify(entries(g).filter(([, e]) => isOauth(e)).map(([k, e]) => [k, e.access, e.refresh]).sort()),
-  // "same": the pool file is the member's own, so every OAuth entry it rotated goes back (only providers
-  // the member already holds). "capture": other providers carry no account claim to check and may belong
-  // to another member, so only the account-bearing kimi-coding entry moves.
-  newerInto: (owner, pool, mode) => {
-    if (!owner) return pool;
+  // "same": the pool file is the member's own, so the OAuth entries it rotated go back (only providers the
+  // member already holds), each one checked: a different account claim, or tokens equal to another member's
+  // entry (a copy of their rotating chain), are backed up and skipped; a merge first keeps the entry it
+  // replaces. "capture": other providers may belong to another member, so only kimi-coding moves.
+  newerInto: (owner, pool, mode, others) => {
+    if (!owner) return { next: pool };
     const next: GrantFile = { ...owner };
+    const backup: Record<string, unknown> = {};
     let changed = false;
     for (const [key, p] of entries(pool)) {
       if (mode === "capture" && key !== KIMI_ENTRY) continue;
       const o = owner[key] as Entry | undefined;
       if (!o || !isOauth(o) || !isOauth(p)) continue;
       const newer = typeof p.expires === "number" && p.expires > (typeof o.expires === "number" ? o.expires : -1);
-      if (newer && (p.access !== o.access || p.refresh !== o.refresh)) {
-        next[key] = { ...o, ...p };
-        changed = true;
+      if (!newer || (p.access === o.access && p.refresh === o.refresh)) continue;
+      if (key !== KIMI_ENTRY) {
+        const mine = tokenAccount(o.access) ?? tokenAccount(o.refresh);
+        const theirs = tokenAccount(p.access) ?? tokenAccount(p.refresh);
+        const foreignClaim = theirs !== undefined && (mine === undefined || mine.key !== theirs.key || mine.value !== theirs.value);
+        const sharedChain = others.some((g) => {
+          const e = g[key] as Entry | undefined;
+          return e !== undefined && isOauth(e) && (e.access === p.access || e.refresh === p.refresh || e.access === p.refresh || e.refresh === p.access);
+        });
+        if (foreignClaim || sharedChain) {
+          backup[`skipped:${key}`] = p;
+          continue;
+        }
+        backup[`replaced:${key}`] = o;
       }
+      next[key] = { ...o, ...p };
+      changed = true;
     }
-    return changed ? next : undefined;
+    if (!changed && Object.keys(backup).length === 0) return undefined;
+    return { ...(changed ? { next } : {}), ...(Object.keys(backup).length > 0 ? { backup } : {}) };
   },
   hasPoolOnlyContent: (pool, vault) =>
     entries(pool).some(([key, e]) => {

@@ -36,10 +36,10 @@ export const kimiAdapter = createGrantFileAdapter({
   complete: (g) => nonEmpty(g?.access_token) && nonEmpty(g?.refresh_token) && typeof g?.expires_at === "number",
   fingerprint: (g) => `${String(g.access_token)}|${String(g.refresh_token)}`,
   newerInto: (owner, pool) => {
-    if (!owner) return pool;
+    if (!owner) return { next: pool };
     const expiry = (g: GrantFile) => (typeof g.expires_at === "number" ? g.expires_at : -1);
     const identical = owner.access_token === pool.access_token && owner.refresh_token === pool.refresh_token;
-    return !identical && expiry(pool) > expiry(owner) ? { ...owner, ...pool } : undefined;
+    return !identical && expiry(pool) > expiry(owner) ? { next: { ...owner, ...pool } } : undefined;
   },
   toolLock: (dir) => ({ path: join(dir, "oauth", "kimi-code.lock"), staleMs: 5_000 }),
   fetchUsage: async (member, deps) => {
