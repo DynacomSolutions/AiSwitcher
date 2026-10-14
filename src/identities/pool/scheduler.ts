@@ -27,7 +27,10 @@ export interface PoolSwapStatusDto {
   pools: Array<{ tool: string; pool: string; auto: boolean; lastCheckAt: string | null; lastOutcome: string | null; backoffMs: number }>;
 }
 
-export interface PoolSwapSchedulerDeps extends PoolOpsDeps<any> {
+export interface PoolSwapSchedulerDeps {
+  /** Per-tool ops deps (registry path, ledger path, usage fetch, test hooks).
+   * Never shared across tools: each adapter reads its own registry and ledger. */
+  perTool?: Partial<Record<PoolAdapter["tool"], PoolOpsDeps<any>>>;
   /** Adapters to serve; defaults to every registered adapter. */
   adapters?: () => PoolAdapter<any>[];
   check?: (adapter: PoolAdapter<any>, pool: string) => Promise<LimitedOutcome>;
@@ -57,7 +60,7 @@ export class PoolSwapScheduler {
   }
 
   private async poolsOfAdapter(adapter: PoolAdapter<any>) {
-    return poolsOf(await loadIdentitiesFile(this.deps.registryPath ?? adapter.config.identitiesJsonPath));
+    return poolsOf(await loadIdentitiesFile(this.deps.perTool?.[adapter.tool]?.registryPath ?? adapter.config.identitiesJsonPath));
   }
 
   /** One pass over the pools whose next poll is due. Exported for tests. */
@@ -77,7 +80,7 @@ export class PoolSwapScheduler {
         if (nowMs < st.nextAt) continue;
         let outcome: LimitedOutcome;
         try {
-          outcome = await (this.deps.check ?? ((a, name) => swapIfLimited(a, { ...this.deps, now: () => nowMs }, name, "auto")))(adapter, pool.name);
+          outcome = await (this.deps.check ?? ((a, name) => swapIfLimited(a, { ...this.deps.perTool?.[a.tool], now: () => nowMs }, name, "auto")))(adapter, pool.name);
         } catch (err) {
           outcome = { action: "skipped", why: err instanceof Error ? err.message : String(err) };
         }

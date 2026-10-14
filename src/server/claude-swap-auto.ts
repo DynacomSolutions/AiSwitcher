@@ -31,8 +31,8 @@ export function claudeStatusOf(dto: ClaudeSwapStatusDto | PoolSwapStatusDto): Cl
 export class ClaudeSwapScheduler {
   private readonly inner: PoolSwapScheduler;
   constructor(deps: ClaudeSwapSchedulerDeps = {}) {
-    const { check, ...rest } = deps;
-    this.inner = new PoolSwapScheduler({ ...rest, adapters: () => [claudeAdapter], ...(check ? { check: (_a, pool) => check(pool) } : {}) });
+    const { check, log, random, ...rest } = deps;
+    this.inner = new PoolSwapScheduler({ ...(log ? { log } : {}), ...(random ? { random } : {}), perTool: { claude: rest }, adapters: () => [claudeAdapter], ...(check ? { check: (_a, pool) => check(pool) } : {}) });
   }
   tick(nowMs?: number): Promise<void> { return this.inner.tick(nowMs); }
   start(): void { this.inner.start(); }
