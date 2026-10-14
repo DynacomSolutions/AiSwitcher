@@ -49,13 +49,11 @@ describe("poolLaunchCheck vs process replacement", () => {
     expect(note).toContain("switched a -> b");
   });
 
-  test("work that cannot start its swap within the settle window is cancelled, not cut mid-swap", async () => {
+  test("work that cannot start its swap within the settle window is cancelled before swapping", async () => {
     const { adapter, pool, first, ledgerPath, registryPath } = await setup(400, 0);
-    const started = Date.now();
     const note = await poolLaunchCheck(adapter, pool, { timeoutMs: 20, settleMs: 100, ledgerPath, registryPath });
     expect(note).toBeUndefined();
-    expect(Date.now() - started).toBeLessThan(380);
-    await Bun.sleep(1000); // the abandoned fetch resolves later; it must not start a swap now
+    await Bun.sleep(1000); // nothing may start a swap after cancellation
     expect(existsSync(first)).toBe(false);
   });
 
@@ -63,5 +61,20 @@ describe("poolLaunchCheck vs process replacement", () => {
     const { adapter, pool, second, ledgerPath, registryPath } = await setup(0, 300);
     await poolLaunchCheck(adapter, pool, { timeoutMs: 20, settleMs: 100, ledgerPath, registryPath });
     expect(existsSync(second)).toBe(true);
+  });
+
+  test("work that is cancelled after the settle window is still awaited to its end (no cut mid token refresh)", async () => {
+    const { adapter, pool, ledgerPath, registryPath } = await setup(0, 0);
+    const before = join(root, "refresh-1");
+    const after = join(root, "refresh-2");
+    adapter.fetchUsage = async () => {
+      await writeFile(before, "1");
+      await Bun.sleep(300);
+      await writeFile(after, "2");
+      return live(10); // not limited: no swap follows
+    };
+    await poolLaunchCheck(adapter, pool, { timeoutMs: 20, settleMs: 100, ledgerPath, registryPath });
+    expect(existsSync(before)).toBe(true);
+    expect(existsSync(after)).toBe(true);
   });
 });

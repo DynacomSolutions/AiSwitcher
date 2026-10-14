@@ -10,8 +10,9 @@ export const LAUNCH_CHECK_TIMEOUT_MS = 4_000;
  * The shim now replaces itself with the real tool (execve), which would cut
  * any swap still running in this process mid-write. So work that loses the
  * budget race gets this much longer to finish; if it has not even started
- * swapping by then it is cancelled, and a swap that has started is always
- * awaited to the end (its lock waits are bounded).
+ * swapping by then it is cancelled (no new swap can start). Either way the
+ * work is awaited to its end, so the exec never cuts a token refresh or a
+ * held lock; every step is timeout-bounded.
  */
 export const LAUNCH_SETTLE_MS = 30_000;
 
@@ -31,13 +32,10 @@ export async function poolLaunchCheck<U extends PoolUsage>(
   if (!isSwapPool(identity)) return undefined;
   const pool = identity;
   let cancelled = false;
-  let swapping = false;
-  // Everything after this point is the critical section: it is never abandoned.
   const adapter: PoolAdapter<U> = {
     ...realAdapter,
     swapCredentials: async (input) => {
       if (cancelled) throw new Error("pool launch check cancelled before swapping");
-      swapping = true;
       return realAdapter.swapCredentials(input);
     },
   };
@@ -81,8 +79,10 @@ export async function poolLaunchCheck<U extends PoolUsage>(
     ]);
     if (settleTimer) clearTimeout(settleTimer);
     if (second) return second.note;
+    // No new swap can start now, but a token refresh or lock may be in flight:
+    // every step is timeout-bounded, so wait for the work to wind down.
     cancelled = true;
-    if (swapping) await settled;
+    await settled;
     return undefined;
   } finally {
     if (timer) clearTimeout(timer);

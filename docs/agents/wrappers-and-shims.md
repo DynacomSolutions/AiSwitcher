@@ -23,8 +23,8 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 50
   tool's child. Every fallback to the old spawn path appends one line to
   `~/.ais/state/shim-fallback.log` (never the terminal). Anything that must
   finish before the exec has to be awaited first: `poolLaunchCheck` therefore
-  waits up to `LAUNCH_SETTLE_MS` past its 4 s budget and never abandons a swap
-  that has started. `AIS_HERDR_TITLE_OWNER_PID` for a nested launch names the
+  stops starting new swaps after `LAUNCH_SETTLE_MS` past its 4 s budget but
+  always awaits the in-flight work (token refresh, locks) to its end. `AIS_HERDR_TITLE_OWNER_PID` for a nested launch names the
   parent, not the wrapper, because the tool now shares the wrapper's PID.
   `execReal` (usage passthrough, `open`) tries execve first; `ais upgrade` and
   `ais herdr` keep `spawnReal` (sequential or follow-up work after the child).
