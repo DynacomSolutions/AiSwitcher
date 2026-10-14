@@ -112,3 +112,17 @@ member"), and a member's refresh writes through to the pool copy only while that
 member is active and the pool holds the same account (`poolRegistryPath` is the
 test hook; `claudeRegistryPath` stays the claude alias). Daemon opt-out for
 codex: `AIS_POOL_SWAP_CODEX=0`.
+
+
+### CLI and surfaces (task 45)
+
+`ais swap <tool> status|to|next|allow|disallow|auto|usage|pool create|hook`
+lives in `src/cli/swap/dispatch.ts` (`runSwapCommand(tool, ...)`, driven by
+`adapterFor(tool)`); `ais claude-swap` is `runClaudeSwapCommand`, the same
+function bound to claude (same output, flags, exit codes). `hook` is
+Claude-only. Codex `to`/`next` print `SwapResult.runningSessions`; codex
+`pool create` validates members with `codexMemberProblem`. `usage` goes
+through `claude-swap/attribution.ts` `poolMemberUsageSplit(..., {tool})`:
+claude reads `projects/`, codex reads `sessions/**/rollout-*.jsonl`
+`token_count` events; both attribute by `activeMemberAt` on the tool's ledger.
+`ais limits` mirrors a pool row to its active member of the SAME tool.
