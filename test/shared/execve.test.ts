@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildChildEnv, execveReal } from "../../src/shared/exec.ts";
 import { buildEnvp, buildExecBlock, tryExecve } from "../../src/shared/execve.ts";
 
@@ -85,5 +88,30 @@ describe("tryExecve", () => {
     expect(x).toBe("ex ex");
     expect(y).toBe(""); // undefined values are not exported
     expect(after).toBe(before); // same PID: image replaced, not forked
+  });
+
+  test.skipIf(process.platform !== "linux")("a bare command name is resolved through PATH, never relative to cwd", () => {
+    const root = mkdtempSync(join(tmpdir(), "ais-execve-bare-"));
+    try {
+      const cwd = join(root, "cwd");
+      const bin = join(root, "bin");
+      mkdirSync(cwd);
+      mkdirSync(bin);
+      for (const [dir, who] of [[cwd, "from-cwd"], [bin, "from-path"]] as const) {
+        writeFileSync(join(dir, "faketool"), `#!/bin/sh\necho ${who}\n`);
+        chmodSync(join(dir, "faketool"), 0o755);
+      }
+      const script = `
+        import { tryExecve } from ${JSON.stringify(new URL("../../src/shared/execve.ts", import.meta.url).pathname)};
+        tryExecve("faketool", ["faketool"], { PATH: ${JSON.stringify(`${bin}:/usr/bin:/bin`)} });
+        process.exit(99);
+      `;
+      const proc = Bun.spawnSync([process.execPath, "-e", script], { cwd, env: { PATH: process.env.PATH ?? "" } });
+      expect(proc.stdout.toString().trim()).toBe("from-path");
+      const missing = Bun.spawnSync([process.execPath, "-e", script.replace(bin, join(root, "nowhere"))], { cwd });
+      expect(missing.exitCode).toBe(99); // not on PATH: refuses rather than exec'ing ./faketool
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

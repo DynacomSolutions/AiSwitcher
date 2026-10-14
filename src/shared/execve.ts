@@ -124,6 +124,12 @@ function openLibc() {
 export function tryExecve(path: string, argv: readonly string[], env: Record<string, string | undefined>): boolean {
   if (process.platform !== "linux") return false;
   try {
+    // execve never searches PATH: a bare name (e.g. `bunx`) would run ./bunx.
+    if (!path.includes("/")) {
+      const found = Bun.which(path, { PATH: env.PATH ?? process.env.PATH ?? "" });
+      if (!found) return false;
+      path = found;
+    }
     accessSync(path, constants.X_OK);
     const lib = openLibc();
     const block = buildExecBlock(path, argv, buildEnvp(env), (buffer) => BigInt(ptr(buffer)));
