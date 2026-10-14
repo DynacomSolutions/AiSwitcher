@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, open, readdir, rm, stat, utimes } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readdir, realpath, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
-import { mergeIncomingProfileTree, recoverProfileArchives } from "../../src/sync/tree-merge.ts";
+import {
+  hasOpenOwner,
+  mergeIncomingProfileTree,
+  recoverProfileArchives,
+  setOpenScanner,
+} from "../../src/sync/tree-merge.ts";
 import { aisRemoteCacheDir } from "../../src/shared/ais-home.ts";
 
 const tempDirs: string[] = [];
@@ -281,3 +286,50 @@ describe("post-merge credential purge", () => {
   });
 });
 
+
+describe("hasOpenOwner", () => {
+  afterEach(() => setOpenScanner());
+
+  test("per-file path reports a file held by a child open and a closed one not", async () => {
+    const dir = await makeDir("ais-open-owner-");
+    const held = join(dir, "held.jsonl");
+    const closed = join(dir, "closed.jsonl");
+    await Bun.write(held, "x\n");
+    await Bun.write(closed, "x\n");
+    const child = Bun.spawn(["sh", "-c", `exec 3<"${held}"; echo ready; sleep 30`], { stdout: "pipe" });
+    try {
+      await child.stdout.getReader().read();
+      const pass = { lookups: 0 };
+      expect(await hasOpenOwner(held, pass)).toBe(true);
+      expect(await hasOpenOwner(closed, pass)).toBe(false);
+      expect(await hasOpenOwner(join(dir, "missing.jsonl"), pass)).toBe(false);
+    } finally {
+      child.kill();
+    }
+  });
+
+  test("after the per-file budget, many lookups share one snapshot scan", async () => {
+    const dir = await makeDir("ais-open-owner-snap-");
+    const held = join(dir, "held.jsonl");
+    const closed = join(dir, "closed.jsonl");
+    await Bun.write(held, "x\n");
+    await Bun.write(closed, "x\n");
+    let scans = 0;
+    setOpenScanner(async () => {
+      scans++;
+      return new Set([await realpath(held)]);
+    });
+    const pass = { lookups: 1000 };
+    expect(await hasOpenOwner(held, pass)).toBe(true);
+    for (let i = 0; i < 50; i++) expect(await hasOpenOwner(closed, pass)).toBe(false);
+    expect(scans).toBe(1);
+  });
+
+  test("an unverifiable snapshot answers undefined", async () => {
+    const dir = await makeDir("ais-open-owner-unk-");
+    const file = join(dir, "a.jsonl");
+    await Bun.write(file, "x\n");
+    setOpenScanner(async () => undefined);
+    expect(await hasOpenOwner(file, { lookups: 1000 })).toBeUndefined();
+  });
+});
