@@ -66,16 +66,21 @@ async function ownerByAccount(members: Identity[], accountId: string, activeName
 
 /** Writes the pool's grant into the owning member's vault when it is newer. */
 async function writeBackToOwner(owner: Identity, poolAuth: CodexAuthFile, lock?: LockOptions): Promise<WriteBackOutcome> {
-  const ownerAuth = parseCodexAuth(await readCodexAuthText(owner.configDir));
-  if (hasCodexTokens(ownerAuth)) {
-    const o = ownerAuth!.tokens!;
-    const p = poolAuth.tokens!;
-    if (o.access_token === p.access_token && o.refresh_token === p.refresh_token) return "none-identical";
-    if (codexRecency(poolAuth) <= codexRecency(ownerAuth)) return "none-member-newer";
-  }
-  const next = { ...(ownerAuth ?? {}), tokens: poolAuth.tokens, ...(poolAuth.last_refresh !== undefined ? { last_refresh: poolAuth.last_refresh } : {}) };
-  await withOauthRefreshLock(owner.configDir, () => writeFileAtomic(codexAuthPath(owner.configDir), json(next)), lock);
-  return "written";
+  const poolId = codexAccountOf(poolAuth).id;
+  return withOauthRefreshLock(owner.configDir, async (): Promise<WriteBackOutcome> => {
+    // Read and compare under the owner's lock so a concurrent member refresh is never overwritten.
+    const ownerAuth = parseCodexAuth(await readCodexAuthText(owner.configDir));
+    if (hasCodexTokens(ownerAuth)) {
+      if (codexAccountOf(ownerAuth).id !== poolId) return "none-account-mismatch";
+      const o = ownerAuth!.tokens!;
+      const p = poolAuth.tokens!;
+      if (o.access_token === p.access_token && o.refresh_token === p.refresh_token) return "none-identical";
+      if (codexRecency(poolAuth) <= codexRecency(ownerAuth)) return "none-member-newer";
+    }
+    const next = { ...(ownerAuth ?? {}), tokens: poolAuth.tokens, ...(poolAuth.last_refresh !== undefined ? { last_refresh: poolAuth.last_refresh } : {}) };
+    await writeFileAtomic(codexAuthPath(owner.configDir), json(next));
+    return "written";
+  }, lock);
 }
 
 async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>[0]): Promise<Omit<SwapResult, "reason">> {
@@ -84,17 +89,16 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
   const poolPath = codexAuthPath(poolDir);
   const notes: string[] = [];
 
-  const targetText = await readCodexAuthText(target.configDir);
-  const targetAuth = parseCodexAuth(targetText);
-  if (targetText === undefined || !hasCodexTokens(targetAuth)) {
-    throw new SwapPoolError(`Account "${target.name}" has no usable Codex login (no ChatGPT tokens in ${target.configDir}); run "codex login" under that identity first.`);
-  }
-  const targetAcct = codexAccountOf(targetAuth);
-  if (!targetAcct.id) {
-    throw new SwapPoolError(`Account "${target.name}" has an inconsistent account id in auth.json (tokens.account_id disagrees with its access token); log in again under that identity.`);
-  }
-
   return withOauthRefreshLock(poolDir, async () => {
+    const targetText = await withOauthRefreshLock(target.configDir, () => readCodexAuthText(target.configDir), lock);
+    const targetAuth = parseCodexAuth(targetText);
+    if (targetText === undefined || !hasCodexTokens(targetAuth)) {
+      throw new SwapPoolError(`Account "${target.name}" has no usable Codex login (no ChatGPT tokens in ${target.configDir}); run "codex login" under that identity first.`);
+    }
+    const targetAcct = codexAccountOf(targetAuth);
+    if (!targetAcct.id) {
+      throw new SwapPoolError(`Account "${target.name}" has an inconsistent account id in auth.json (tokens.account_id disagrees with its access token); log in again under that identity.`);
+    }
     const activeName = pool.swapPool.active ?? null;
     const poolText = await readCodexAuthText(poolDir);
     const poolAuth = parseCodexAuth(poolText);
@@ -160,7 +164,8 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
     const text = await readCodexAuthText(pool.configDir);
     const auth = parseCodexAuth(text);
     const acct = codexAccountOf(auth);
-    const kind = !hasCodexTokens(auth) ? "damaged" : acct.hybrid ? "hybrid" : acct.id === vaultAcct.id ? "ok" : acct.id ? "foreign" : "damaged";
+    const complete = hasCodexTokens(auth) && typeof auth?.tokens?.id_token === "string" && auth.tokens.id_token !== "" && acct.fileId !== undefined;
+    const kind = !complete ? "damaged" : acct.hybrid ? "hybrid" : acct.id === vaultAcct.id ? "ok" : acct.id ? "foreign" : "damaged";
     return { text, auth, acct, kind } as const;
   };
   let state = await classify();
@@ -173,7 +178,11 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
   const notes: string[] = [];
   return withOauthRefreshLock(pool.configDir, async () => {
     // Decide on the file as it is under the lock, not as it was before waiting for it.
-    const now = await classify();
+    let now = await classify();
+    if (now.kind === "damaged") {
+      await sleep(codexTuning.healRetryMs);
+      now = await classify();
+    }
     if (now.kind === "ok") return [];
     if (now.kind === "foreign") {
       const owner = await ownerByAccount(members, now.acct.id!, activeName);

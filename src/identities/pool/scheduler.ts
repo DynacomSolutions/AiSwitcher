@@ -4,7 +4,7 @@ import type { PoolAdapter } from "./adapter.ts";
 import { swapIfLimited, type LimitedOutcome, type PoolOpsDeps } from "./ops.ts";
 import { withPoolLock } from "./lock.ts";
 import { allAdapters } from "./registry.ts";
-import { poolsOf, type PoolIdentity } from "./swap-pool.ts";
+import { poolsOf, requirePool, type PoolIdentity } from "./swap-pool.ts";
 import type { Identity } from "../types.ts";
 
 /**
@@ -77,12 +77,17 @@ export class PoolSwapScheduler {
   private async healPool(adapter: PoolAdapter<any>, pool: PoolIdentity): Promise<void> {
     if (adapter.liveSwap || !adapter.heal) return;
     try {
-      const file = await this.fileOf(adapter);
-      const members = pool.swapPool.accounts
-        .map((name) => file.identities.find((i) => i.name === name))
-        .filter((i): i is Identity => i !== undefined && !isRetired(i));
       const lock = { timeoutMs: 1_500 };
-      for (const note of await withPoolLock(pool.configDir, () => adapter.heal!(pool, members, lock), lock)) this.log(adapter.tool, note);
+      const notes = await withPoolLock(pool.configDir, async () => {
+        // Reload under the lock: a swap that landed while we waited must not be undone.
+        const file = await this.fileOf(adapter);
+        const fresh = requirePool(file, pool.name, adapter.tool);
+        const members = fresh.swapPool.accounts
+          .map((name) => file.identities.find((i) => i.name === name))
+          .filter((i): i is Identity => i !== undefined && !isRetired(i));
+        return adapter.heal!(fresh, members, lock);
+      }, lock);
+      for (const note of notes) this.log(adapter.tool, note);
     } catch (err) {
       this.log(adapter.tool, `pool ${pool.name}: heal failed: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -8,7 +8,9 @@ import { adapterFor } from "../../../src/identities/pool/registry.ts";
 import { PoolSwapScheduler } from "../../../src/identities/pool/scheduler.ts";
 import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
 import { requirePool } from "../../../src/identities/pool/swap-pool.ts";
-import { refreshIdentityOAuthGrant } from "../../../src/identities/oauth-refresh.ts";
+import { convergeClaudePoolStores, refreshIdentityOAuthGrant } from "../../../src/identities/oauth-refresh.ts";
+import { writeProviderGrantCopy } from "../../../src/identities/oauth-reconcile.ts";
+import { withPoolLock } from "../../../src/identities/pool/lock.ts";
 import { loadIdentitiesFile } from "../../../src/identities/store.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
@@ -261,5 +263,75 @@ describe("codex pool refresh integration", () => {
     const rb = await refreshIdentityOAuthGrant("codex", member("b"), { ...opts, fetchImpl: respond("SYNTHETIC_FIXTURE-rt-b-rot1") });
     expect(rb.written.some((w) => w.startsWith("pool:"))).toBe(false);
     expect(await refreshToken("pool")).toBe("SYNTHETIC_FIXTURE-rt-a-rot1");
+  });
+});
+
+describe("review fixes", () => {
+  const member = (name: string): Identity => ({ name, label: name, configDir: dirOf(name) });
+
+  test("a hybrid or partial pool file is never a converge source or target", async () => {
+    await setup();
+    const before = await read("a");
+    await put("pool", auth("acct-b", T0 + 50, { fileAccount: "acct-a", tag: "hybrid" }));
+    await convergeClaudePoolStores(member("a"), registry, false, undefined, "codex");
+    expect(await read("a")).toBe(before);
+    await put("pool", '{"tokens": {"access_tok');
+    await convergeClaudePoolStores(member("a"), registry, false, undefined, "codex");
+    expect(await read("a")).toBe(before);
+    expect(await read("pool")).toBe('{"tokens": {"access_tok');
+  });
+
+  test("writing a grant into an unparsable codex file is refused", async () => {
+    await put("x", '{"tokens": {"acc');
+    const grant = { access_token: jwt("acct-a", T0), refresh_token: "SYNTHETIC_FIXTURE-rt-z" };
+    await expect(writeProviderGrantCopy("codex", dirOf("x"), grant)).rejects.toThrow(/unparsable/);
+    expect(await read("x")).toBe('{"tokens": {"acc');
+  });
+
+  test("heal treats a file without id_token or account_id as damaged", async () => {
+    await setup();
+    const t = JSON.parse(await read("a")) as { tokens: Record<string, unknown> };
+    delete t.tokens.id_token;
+    await put("pool", JSON.stringify(t));
+    expect((await healPool()).join(" ")).toContain('restored "a"');
+    expect(await read("pool")).toBe(await read("a"));
+  });
+
+  test("heal re-reads the registry under the pool lock, so a concurrent swap is not undone", async () => {
+    await setup("a");
+    const logs: string[] = [];
+    const sched = new PoolSwapScheduler({ adapters: () => [codexAdapter], perTool: { codex: { registryPath: registry, ledgerPath: ledger } }, log: (m) => logs.push(m) });
+    const poolDir = dirOf("pool");
+    await withPoolLock(poolDir, async () => {
+      const tick = sched.tick(1_000_000); // loaded active=a, now waits on the lock
+      await new Promise((r) => setTimeout(r, 100));
+      const file = JSON.parse(await readFile(registry, "utf8"));
+      file.identities.find((i: { name: string }) => i.name === "pool").swapPool.active = "b";
+      await writeFile(registry, JSON.stringify(file));
+      await put("pool", await read("b"));
+      (globalThis as { __tick?: Promise<void> }).__tick = tick;
+    });
+    await (globalThis as { __tick?: Promise<void> }).__tick;
+    expect(await read("pool")).toBe(await read("b"));
+    expect(logs).toEqual([]);
+  });
+
+  test("swap reads the owner and target vaults under their locks (no stale write-back over a newer vault)", async () => {
+    await setup();
+    await put("pool", auth("acct-a", T0 + 100, { tag: "a-pool" }));
+    await put("a", auth("acct-a", T0 + 200, { tag: "a-vault-newer" }));
+    await swap("b");
+    expect(await refreshToken("a")).toBe("SYNTHETIC_FIXTURE-rt-a-vault-newer");
+  });
+
+  test("heal re-reads a damaged file after a delay before restoring (mid-truncate)", async () => {
+    await setup();
+    await put("pool", "");
+    codexTuning.healRetryMs = 150;
+    const rotated = auth("acct-a", T0 + 700, { tag: "a-rotated" });
+    setTimeout(() => { void writeFile(join(dirOf("pool"), "auth.json"), rotated); }, 100);
+    const notes = await healPool();
+    expect(await read("pool")).toBe(rotated);
+    expect(notes).toEqual([]);
   });
 });
