@@ -166,7 +166,7 @@ skipped) is copied into the pool.
 
 Rules carried over from Codex: the pool grant is written back to the member that
 owns it (matched by account id) under the pool lock, only when strictly newer
-(Kimi: `expires_at`; Pi: only the `kimi-coding` entry, `expires` ms; other Pi providers carry no account claim and are never copied between vaults, a newer pool copy is kept as a 0600 backup); an unattributable or hybrid pool file is kept as a
+(Kimi: `expires_at`; Pi: `expires` ms per OAuth entry. When the pool file is the owner's own, every entry it rotated goes back; when the pool only holds the owner's account next to parts that may be another member's (foreign capture), just `kimi-coding` moves and a newer other-provider entry is kept as a backup). Backups are `<file>.pre-swap.<stamp>.bak` / `.pre-heal.<stamp>.bak` (0600, newest 10 kept); an unattributable or hybrid pool file is kept as a
 0600 `.pre-swap.bak`/`.pre-heal.bak`; AIS never refreshes the pool identity
 (`fetchKimiLimits`/`fetchPiLimits` return unavailable for a pool, `kimiCredentialStores`
 returns no stores for one, `refreshIdentityOAuthGrant("kimi", pool)` is `no-grant`).

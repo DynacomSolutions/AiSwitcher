@@ -277,17 +277,21 @@ export async function countCodexSessions(configDir: string, procRoot = "/proc"):
   } catch {
     return 0;
   }
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+  // Thousands of processes on a busy host: scan in parallel chunks, a sequential scan took over half a second per swap.
+  const pids = entries.filter((entry) => /^\d+$/.test(entry) && Number(entry) !== process.pid);
+  const isMine = async (entry: string): Promise<boolean> => {
     try {
-      if (uid !== undefined && (await stat(`${procRoot}/${entry}`)).uid !== uid) continue;
+      if (uid !== undefined && (await stat(`${procRoot}/${entry}`)).uid !== uid) return false;
       const argv = (await readFile(`${procRoot}/${entry}/cmdline`, "utf8")).split("\0");
-      if (basename(argv[0] ?? "") !== "codex" && basename(argv[1] ?? "") !== "codex") continue;
+      if (basename(argv[0] ?? "") !== "codex" && basename(argv[1] ?? "") !== "codex") return false;
       const home = (await readFile(`${procRoot}/${entry}/environ`, "utf8")).split("\0").find((kv) => kv.startsWith("CODEX_HOME="));
-      if (home && resolve(expandPath(home.slice("CODEX_HOME=".length))) === want) count++;
+      return home !== undefined && resolve(expandPath(home.slice("CODEX_HOME=".length))) === want;
     } catch {
-      // gone, or not ours to read
+      return false; // gone, or not ours to read
     }
+  };
+  for (let i = 0; i < pids.length; i += 256) {
+    count += (await Promise.all(pids.slice(i, i + 256).map(isMine))).filter(Boolean).length;
   }
   return count;
 }
