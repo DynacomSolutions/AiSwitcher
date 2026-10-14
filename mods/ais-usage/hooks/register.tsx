@@ -7,6 +7,7 @@ import {
   bar,
   entriesFor,
   humanise,
+  memberWindow,
   others,
   parseJson,
   poolProviders,
@@ -76,7 +77,7 @@ export const register: Register = on => {
     }
 
     const refreshStatus = async () => {
-      const v = await fetchJson<SwapStatus>('status', ['claude-swap', 'status', '--json'], 20000)
+      const v = await fetchJson<SwapStatus>('status', ['claude-swap', 'status', '--json', '--no-usage'], 20000)
       if (v) await update($, status, () => v)
       await refreshStatusLine()
     }
@@ -228,7 +229,7 @@ export const register: Register = on => {
             {st.accounts.map(a => (
               <Text key={a.name} dimColor={!a.allowed}>
                 {a.active ? '*' : ' '} {a.name.padEnd(18)} 5h{' '}
-                <P v={a.usage?.fiveHour?.utilization} /> wk <P v={a.usage?.sevenDay?.utilization} />
+                <P v={memberWindow(st, lim, a.name, 'fiveHour')?.pct} /> wk <P v={memberWindow(st, lim, a.name, 'sevenDay')?.pct} />
                 {'  '}30d share {pct(share[a.name])} ({humanise(msgs.get(a.name) ?? 0)} msgs)
               </Text>
             ))}

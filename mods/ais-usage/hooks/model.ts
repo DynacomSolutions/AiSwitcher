@@ -98,6 +98,22 @@ export const shortError = (s: string | undefined, max = 60) => {
 
 const pick = (ws: Win[], cat: string) => ws.find(w => w.category === cat)
 
+const CAT = { fiveHour: 'session', sevenDay: 'week' } as const
+
+/** One member's window: from status when it carries usage, else from its own live `claude` limits entry. */
+export const memberWindow = (
+  status: SwapStatus | null,
+  limits: LimitsEntry[] | null,
+  name: string,
+  key: 'fiveHour' | 'sevenDay',
+): { pct: number; resetsAt?: string | number } | undefined => {
+  const u = status?.accounts.find(a => a.name === name)?.usage?.[key]
+  if (u) return { pct: u.utilization, resetsAt: u.resetsAt }
+  const e = entriesFor(limits, name).find(l => l.toolName === 'claude' && l.status === 'live')
+  const w = e && pick(e.windows, CAT[key])
+  return w ? { pct: w.usedPercent, resetsAt: w.resetsAtMs ?? w.resetsAt } : undefined
+}
+
 /** Status line text, or undefined when there is nothing to show. */
 export const statusLine = (
   r: Resolved,
@@ -108,9 +124,8 @@ export const statusLine = (
   let five: number | undefined
   let week: number | undefined
   if (r.kind === 'pool') {
-    const acc = status?.accounts.find(a => a.name === r.current)
-    five = acc?.usage?.fiveHour?.utilization
-    week = acc?.usage?.sevenDay?.utilization
+    five = memberWindow(status, limits, r.current, 'fiveHour')?.pct
+    week = memberWindow(status, limits, r.current, 'sevenDay')?.pct
   } else {
     const e = entriesFor(limits, r.current).find(l => l.toolName === 'claude')
     five = e && pick(e.windows, 'session')?.usedPercent
@@ -221,18 +236,15 @@ export const bandRows = (r: Resolved, status: SwapStatus | null, limits: LimitsE
   const out: BandRow[] = []
   if (r.kind === 'pool') {
     const accounts = status?.accounts ?? []
-    const me = accounts.find(a => a.name === r.current)
     for (const [name, key] of [['session', 'fiveHour'], ['week', 'sevenDay']] as const) {
-      const w = me?.usage?.[key]
-      const pool = poolWindowPct(accounts, key)
-      if (w) {
-        out.push({ name, active: w.utilization, resets: resetLabel(w.resetsAt, name), pool })
-        continue
-      }
-      // The usage endpoint answers HTTP 429 for every member at times: fall back to the member's own limits entry.
-      const lw = entriesFor(limits, r.current).find(l => l.toolName === 'claude' && l.status === 'live')
-      const f = lw && pick(lw.windows, name)
-      if (f) out.push({ name, active: f.usedPercent, resets: resetLabel(f.resetsAtMs ?? f.resetsAt, name), pool })
+      const w = memberWindow(status, limits, r.current, key)
+      if (!w) continue
+      // Members without usage in status (it is fetched without usage to spare the endpoint) report from limits.
+      const synth = accounts.map(a => {
+        const m = memberWindow(status, limits, a.name, key)
+        return { ...a, usage: m ? { [key]: { utilization: m.pct } } : undefined } as SwapAccount
+      })
+      out.push({ name, active: w.pct, resets: resetLabel(w.resetsAt, name), pool: poolWindowPct(synth, key) })
     }
   } else {
     const e = entriesFor(limits, r.current).find(l => l.toolName === 'claude')

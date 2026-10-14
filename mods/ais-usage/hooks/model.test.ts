@@ -105,6 +105,10 @@ test('bandRows', async () => {
   const rp = bandRows(resolveCurrent(limits, '/c/swap', st), st, limits)
   expect(rp.map(x => x.name)).toEqual(['session', 'week'])
   expect(rp[0]!.pool).toEqual({ pct: 12, reporting: 2, total: 2 })
+  const bare = { active: 'workco', accounts: ['workco', 'personal'].map(name => ({ name, active: name === 'workco', allowed: true })) } as unknown as SwapStatus
+  const rb = bandRows(resolveCurrent(limits, '/c/swap', bare), bare, limits)
+  expect(rb[0]!.active).toBe(4)
+  expect(rb[0]!.pool?.pct).toBeDefined()
   const ri = bandRows(resolveCurrent(limits, '/c/acme', null), null, limits)
   expect(ri.map(x => [x.name, x.active])).toEqual([['session', 4], ['week', 1]])
   expect(bandRows(resolveCurrent(limits, '/nope', null), null, limits)).toEqual([])
