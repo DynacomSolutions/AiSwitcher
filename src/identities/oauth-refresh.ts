@@ -239,6 +239,8 @@ export async function poolStoreDirsFor(identity: Identity, registryPath?: string
 /** The tool's pool adapter, if any. Imported lazily: the adapter registry
  * reaches this module through claude-usage-api, so a static import would be a cycle. */
 async function poolAdapterFor(tool: RefreshableTool) {
+  // kimi keeps its own store layer: member refreshes reach pool copies through kimi-store's write-through.
+  if (tool === "kimi") return undefined;
   return (await import("./pool/registry.ts")).adapterFor(tool as "claude");
 }
 
@@ -584,6 +586,9 @@ export async function refreshIdentityOAuthGrant(
 ): Promise<IdentityGrantRefresh> {
   const pooled = (await poolAdapterFor(tool)) !== undefined;
   const registryPath = registryOf(tool, options);
+  if (tool === "kimi" && isSwapPool(identity)) {
+    return { tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], detail: "kimi swap pool: its credentials are a copy of the active member's grant and are refreshed through that member" };
+  }
   if (!pooled && !isRetired(identity)) {
     // Never-logged-in identity: don't mkdir its configDir (via the lock) every tick.
     if (!options.force && !(await stat(identity.configDir).then(() => true, () => false))) {

@@ -4,6 +4,8 @@ import { withOauthRefreshLock } from "../../identities/claude-swap-lock.ts";
 import { KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { isRetired } from "../../identities/retired.ts";
+import { pairIdentity } from "../../identities/pool/token-account.ts";
+import { poolsHoldingMember } from "../../identities/pool/swap-pool.ts";
 import type { Identity } from "../../identities/types.ts";
 import type { KimiOAuthCredentials } from "./kimi-limits.ts";
 
@@ -141,8 +143,8 @@ async function configDirFor(toolName: "kimi" | "pi", identityName: string): Prom
   try {
     const file = await loadIdentitiesFile(config.identitiesJsonPath);
     const found = findIdentityByNameOrAlias(file.identities, identityName);
-    // A retired counterpart is never a read or write target.
-    return found && !isRetired(found) ? found.configDir : undefined;
+    // A retired counterpart is never a read or write target; a swap pool's copy is only a view of its active member.
+    return found && !isRetired(found) && !found.swapPool ? found.configDir : undefined;
   } catch {
     return undefined;
   }
@@ -155,7 +157,8 @@ async function configDirFor(toolName: "kimi" | "pi", identityName: string): Prom
  * registry — the normal case for credentials imported via pi-auth. */
 export async function kimiCredentialStores(identity: Identity, self: "kimi" | "pi"): Promise<Store[]> {
   const stores: Store[] = [];
-  if (isRetired(identity)) return stores;
+  // A swap pool never owns a grant: its file is a copy of the active member's, refreshed through that member.
+  if (isRetired(identity) || identity.swapPool) return stores;
   const nativeDir = self === "kimi" ? identity.configDir : await configDirFor("kimi", identity.name);
   if (nativeDir) stores.push(storeFor("native", join(nativeDir, NATIVE_FILE_RELPATH)));
   const piDir = self === "pi" ? identity.configDir : await configDirFor("pi", identity.name);
@@ -186,6 +189,46 @@ export async function readFreshestKimiCredentials(identity: Identity, self: "kim
 export async function persistKimiCredentials(identity: Identity, self: "kimi" | "pi", next: KimiOAuthCredentials): Promise<void> {
   for (const store of await kimiCredentialStores(identity, self)) {
     await store.write(next).catch(() => undefined);
+  }
+  await writeThroughPools(identity, next);
+}
+
+/** Pool stores whose active member is this account (the law is name-based,
+ * like the counterpart lookup): kimi pools hold the native file, pi pools
+ * hold the pi auth.json. The rotating refresh token must reach them or a
+ * session running in the pool would replay a spent one. */
+async function poolStoresFor(identity: Identity): Promise<Store[]> {
+  const stores: Store[] = [];
+  for (const kind of ["kimi", "pi"] as const) {
+    try {
+      const file = await loadIdentitiesFile((kind === "kimi" ? KIMI_CONFIG : PI_CONFIG).identitiesJsonPath);
+      for (const pool of poolsHoldingMember(file, identity.name)) {
+        stores.push(kind === "kimi" ? storeFor("native", join(pool.configDir, NATIVE_FILE_RELPATH)) : storeFor("pi", join(pool.configDir, "auth.json")));
+      }
+    } catch {
+      // no registry for that tool yet
+    }
+  }
+  return stores;
+}
+
+/** Writes a member's rotated grant into the pools that hold it, only where
+ * the pool file is still the SAME account (a swap may have landed meanwhile).
+ * A busy pool is skipped and left to the pool heal. */
+async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials): Promise<void> {
+  if (isRetired(identity) || identity.swapPool) return;
+  const mine = pairIdentity(next.access_token, next.refresh_token).id;
+  if (!mine) return;
+  for (const store of await poolStoresFor(identity)) {
+    const sameAccount = async () => {
+      const current = await store.read();
+      return current !== undefined && pairIdentity(current.access_token, current.refresh_token).id === mine;
+    };
+    // The pi store write takes the pool dir's lock itself; the native one does not.
+    const guarded = store.kind === "native"
+      ? () => withOauthRefreshLock(dirname(dirname(store.path)), async () => { if (await sameAccount()) await store.write(next); }, { timeoutMs: 1_500 })
+      : async () => { if (await sameAccount()) await store.write(next); };
+    await guarded().catch(() => undefined);
   }
 }
 

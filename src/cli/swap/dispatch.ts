@@ -2,7 +2,6 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { MemberUsage } from "../../identities/claude-usage-api.ts";
 import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
-import { codexMemberProblem } from "../../identities/pool/codex-adapter.ts";
 import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps } from "../../identities/pool/ops.ts";
 import { adapterFor } from "../../identities/pool/registry.ts";
 import { performPoolSwap } from "../../identities/pool/swap.ts";
@@ -113,7 +112,7 @@ async function mutatePool(
  * set over the generic pool core, driven by the tool's adapter. */
 export async function runSwapCommand(tool: string, positionals: string[], flags: ParsedArgs["flags"], deps: SwapDeps = {}): Promise<void> {
   const adapter = adapterFor(tool as ToolConfig["toolName"]);
-  if (!adapter) throw new CliUsageError(`No swap pool support for "${tool}". Supported: claude, codex.`);
+  if (!adapter) throw new CliUsageError(`No swap pool support for "${tool}". Supported: claude, codex, kimi, pi.`);
   const config = adapter.config;
   const cmd = swapCommandName(tool);
   const USAGE = usageText(cmd, tool);
@@ -209,14 +208,14 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         const requested = listFlag(flags, "accounts");
         if (!requested) throw new CliUsageError("Missing required --accounts=a,b[,c]");
         const file = await loadIdentitiesFile(registryPath);
-        const accounts = validateMembers(file, name, requested, tool, tool === "codex" ? codexMemberProblem : undefined);
+        const accounts = validateMembers(file, name, requested, tool, adapter.memberProblem);
         const configDir = stringFlag(flags, "config-dir") ?? join(config.identitiesRootDir, name);
         const dir = translateHostPath(expandPath(configDir)); // fs form; the registry keeps the host form
         // Two pools sharing one folder would fight over its credentials.
         if (poolsOf(file).some((p) => expandPath(p.configDir) === dir) || file.identities.some((i) => expandPath(i.configDir) === dir)) {
           throw new SwapPoolError(`configDir ${dir} is already used by another identity`);
         }
-        const identity = createIdentity(file, { name, label: name, description: `${tool === "claude" ? "Claude" : "Codex"} swap pool`, configDir });
+        const identity = createIdentity(file, { name, label: name, description: `${tool.charAt(0).toUpperCase()}${tool.slice(1)} swap pool`, configDir });
         identity.swapPool = { accounts };
         await mkdir(dir, { recursive: true });
         if (tool === "claude") await ensureClaudeTranscriptRetention(dir);
@@ -252,6 +251,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
       }
 
       case "usage": {
+        if (tool !== "claude" && tool !== "codex") throw new CliUsageError(`"usage" is not available for ${tool} pools: ${tool} keeps no per-message token log to split by member.`);
         const days = Number(stringFlag(flags, "days") ?? 30);
         const file = await loadIdentitiesFile(registryPath);
         const pool = requirePool(file, rest[0] ?? poolFlag, tool);

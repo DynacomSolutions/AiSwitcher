@@ -423,6 +423,8 @@ export async function fetchKimiUsageForCredentials(
 export async function fetchKimiLimits(identity: Identity): Promise<FetchedLimitResult> {
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "kimi", identity };
   const credentialsPath = join(identity.configDir, "credentials", "kimi-code.json");
+  // A swap pool's file is a copy of its active member's grant: refreshing it here would spend the rotating token.
+  if (identity.swapPool) return { ...base, windows: [], status: "unavailable", error: "swap pool: limits come from its active member (not fetched)" };
 
   let credentials: CredentialsFile;
   try {

@@ -245,6 +245,7 @@ export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
   tool: "codex",
   config: CODEX_CONFIG,
   liveSwap: false,
+  memberProblem: codexMemberProblem,
   hasCredentials: (configDir) => hasCodexTokens(parseCodexAuth(readSyncOrUndefined(codexAuthPath(configDir)))),
   swapCredentials,
   heal,
