@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readdir, readlink, stat } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, sep } from "node:path";
@@ -75,24 +75,32 @@ async function filesEqual(a: string, b: string): Promise<boolean> {
   return Buffer.from(await Bun.file(a).arrayBuffer()).equals(Buffer.from(await Bun.file(b).arrayBuffer()));
 }
 
-async function hasOpenOwner(path: string): Promise<boolean | undefined> {
-  if (!(await exists(path))) return false;
-  const lsof = Bun.which("lsof") ??
-    (process.platform === "darwin" && existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : undefined);
-  if (lsof) {
-    const proc = Bun.spawn([lsof, "-t", path], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    if (stdout.trim()) return true;
-    if (exitCode === 0 || exitCode === 1) return false;
-  }
-  if (process.platform !== "linux") return undefined;
+const OPEN_SNAPSHOT_TTL_MS = 5000;
+// Per-file checks are cheapest for small merges; past this many lookups in one
+// pass a single snapshot of all open files wins (a lookup can cost ~1s on a busy host).
+const PER_FILE_LOOKUPS = 32;
+type OpenSnapshot = { at: number; ttl: number; paths: Set<string> | undefined };
+let openSnapshot: OpenSnapshot | undefined;
+export type OpenPathsScanner = () => Promise<Set<string> | undefined>;
+let openScanner: OpenPathsScanner = scanOpenPaths;
+/** Test hook: swap the snapshot scanner (no argument restores the real one). */
+export function setOpenScanner(scanner?: OpenPathsScanner): void {
+  openScanner = scanner ?? scanOpenPaths;
+  openSnapshot = undefined;
+}
 
+function lsofBinary(): string | undefined {
+  return Bun.which("lsof") ?? (process.platform === "darwin" && existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : undefined);
+}
+
+async function procOpenPaths(): Promise<Set<string> | undefined> {
   let processDirs: string[];
   try {
     processDirs = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
   } catch {
     return undefined;
   }
+  const paths = new Set<string>();
   for (const pid of processDirs) {
     let fds: string[];
     try {
@@ -102,13 +110,68 @@ async function hasOpenOwner(path: string): Promise<boolean | undefined> {
     }
     for (const fd of fds) {
       try {
-        if ((await readlink(join("/proc", pid, "fd", fd))).replace(/ \(deleted\)$/, "") === path) return true;
+        paths.add((await readlink(join("/proc", pid, "fd", fd))).replace(/ \(deleted\)$/, ""));
       } catch {
         // Processes and descriptors can disappear while /proc is read.
       }
     }
   }
-  return false;
+  return paths;
+}
+
+async function lsofOpenPaths(): Promise<Set<string> | undefined> {
+  const lsof = lsofBinary();
+  if (!lsof) return undefined;
+  const proc = Bun.spawn([lsof, "-Fn"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  // lsof exits non-zero on unreadable processes yet still lists the rest;
+  // empty output (a live host always has open files) means it failed.
+  if (!stdout.trim()) return undefined;
+  const paths = new Set<string>();
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("n/")) paths.add(line.slice(1).replace(/ \(deleted\)$/, ""));
+  }
+  return paths;
+}
+
+// /proc is several times faster than lsof on a host with thousands of processes.
+async function scanOpenPaths(): Promise<Set<string> | undefined> {
+  return (process.platform === "linux" ? await procOpenPaths() : undefined) ?? (await lsofOpenPaths());
+}
+
+async function hasOpenOwnerDirect(path: string): Promise<boolean | undefined> {
+  const lsof = lsofBinary();
+  if (lsof) {
+    const proc = Bun.spawn([lsof, "-t", path], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (stdout.trim()) return true;
+    if (exitCode === 0 || exitCode === 1) return false;
+  }
+  if (process.platform !== "linux") return undefined;
+  const paths = await procOpenPaths();
+  return paths && paths.has(path);
+}
+
+/** Per-merge-pass lookup state: the first lookups are per-file, later ones use one snapshot. */
+export interface OpenOwnerPass {
+  lookups: number;
+}
+
+export async function hasOpenOwner(path: string, pass: OpenOwnerPass = { lookups: PER_FILE_LOOKUPS }): Promise<boolean | undefined> {
+  let real: string;
+  try {
+    real = await realpath(path);
+  } catch {
+    return false;
+  }
+  if (pass.lookups++ < PER_FILE_LOOKUPS) return hasOpenOwnerDirect(real);
+  if (!openSnapshot || Date.now() - openSnapshot.at > openSnapshot.ttl) {
+    const started = Date.now();
+    const paths = await openScanner();
+    // A scan on a huge host can take a minute; keep the scans a minority of the merge.
+    openSnapshot = { at: Date.now(), ttl: Math.max(OPEN_SNAPSHOT_TTL_MS, 4 * (Date.now() - started)), paths };
+  }
+  return openSnapshot.paths && openSnapshot.paths.has(real);
 }
 
 function configsForScope(scope: SyncScope): ToolConfig[] {
@@ -248,6 +311,8 @@ export async function mergeIncomingProfileTree(
     join(aisRemoteCacheDir(home), "merge-conflicts", new Date().toISOString().replaceAll(":", "-"));
   const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0 };
   const registries = registryRelPaths(scope, home);
+  const ownerPass: OpenOwnerPass = { lookups: 0 };
+  openSnapshot = undefined;
 
   // Registries have their own semantic union. Merge these first so profiles
   // first seen on the incoming host have a valid local registry entry.
@@ -275,7 +340,7 @@ export async function mergeIncomingProfileTree(
       // Even append-only writes must not interleave with a native tool's own
       // partial record. If ownership cannot be proved absent, retain the
       // incoming bytes and let the post-exit reconciliation retry them.
-      if ((await hasOpenOwner(destination)) !== false) {
+      if ((await hasOpenOwner(destination, ownerPass)) !== false) {
         await preserveFile(source, conflictRoot, "incoming", rel);
         result.preservedConflicts++;
         continue;
