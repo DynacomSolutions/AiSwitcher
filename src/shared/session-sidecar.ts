@@ -1,8 +1,9 @@
-import { existsSync, readFileSync, readlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { ToolConfig } from "../identities/types.ts";
 import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sync/background.ts";
 import { startProfileSyncWatcher } from "../sync/watch.ts";
-import { aisHerdrTabLabelsPath } from "./ais-home.ts";
+import { aisHerdrTabLabelsPath, aisStateDir } from "./ais-home.ts";
 import { execveReal, spawnReal, withUsableCwd } from "./exec.ts";
 import { readHerdrChatTitle, type HerdrChatTool } from "./herdr-chat-source.ts";
 import { HerdrTabTitleWatcher } from "./herdr-tab-title.ts";
@@ -19,6 +20,8 @@ import { HerdrTabTitleWatcher } from "./herdr-tab-title.ts";
 
 export const SIDECAR_ARG = "__session-sidecar";
 export const SIDECAR_SPEC_ENV = "AIS_SESSION_SIDECAR_SPEC";
+/** The title uses about 64 characters; this only bounds the env var (one string holds ~128 KiB). */
+export const MAX_PROMPT_BYTES = 1024;
 const EXEC_WAIT_MS = 3_000;
 const POLL_MS = 500;
 
@@ -207,9 +210,21 @@ export async function spawnSidecar(spec: SessionSpec): Promise<boolean> {
   }
 }
 
+/** One line per fallback to the old spawn path, never to the terminal. Best effort. */
+function logFallback(path: string | undefined, tool: string, message: string): void {
+  try {
+    const file = path ?? join(aisStateDir(), "shim-fallback.log");
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${new Date().toISOString()} ${tool} pid=${process.pid} ${message}\n`);
+  } catch {}
+}
+
 export interface LaunchDeps {
   spawnSidecar: (spec: SessionSpec) => boolean | Promise<boolean>;
-  execve: (real: RealLaunch) => boolean;
+  /** Never returns on success; otherwise the failure reason. */
+  execve: (real: RealLaunch) => string | undefined;
+  /** Where fallbacks are recorded; defaults to the AIS state dir. */
+  logPath?: string;
   spawn: (real: RealLaunch) => Promise<number>;
   startWork: (cfg: ToolConfig, spec: SessionSpec) => Promise<SessionWork>;
 }
@@ -235,17 +250,23 @@ export async function launchWithSession(
   real: RealLaunch,
   deps: LaunchDeps = defaultDeps,
 ): Promise<number> {
+  const title = spec.title?.initialPrompt === undefined
+    ? spec.title
+    : { ...spec.title, initialPrompt: spec.title.initialPrompt.slice(0, MAX_PROMPT_BYTES) };
   const full: SessionSpec = {
     ...spec,
+    ...(title ? { title } : {}),
     toolName: cfg.toolName,
     pid: process.pid,
     ...(procStartTime(process.pid) ? { startTime: procStartTime(process.pid) as string } : {}),
     ...(exeOf(process.pid) ? { initialExe: exeOf(process.pid) as string } : {}),
   };
   if (await deps.spawnSidecar(full)) {
-    deps.execve(real);
+    const reason = deps.execve(real);
+    logFallback(deps.logPath, cfg.toolName, `spawn fallback (sidecar keeps the session work): ${reason}`);
     return await deps.spawn(real);
   }
+  logFallback(deps.logPath, cfg.toolName, "in-process fallback: the sidecar could not be started");
   const work = await deps.startWork(cfg, full);
   const launch = () => deps.spawn(real);
   const exitCode = await (spec.syncAtLaunch ? launchThenStartBackgroundSync(launch) : launch());

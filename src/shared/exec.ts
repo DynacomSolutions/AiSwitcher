@@ -159,12 +159,12 @@ export async function spawnReal(
 /**
  * Replaces the current process image with the real binary (libc `execve`
  * via bun:ffi), so the real tool inherits this PID and terminal and nothing
- * of ours can die underneath it. Never returns on success; returns `false`
- * (unsupported platform, FFI unavailable, execve failed) and the caller
+ * of ours can die underneath it. Never returns on success; returns the failure
+ * reason (unsupported platform, FFI unavailable, execve failed) and the caller
  * falls back to `spawnReal`. Environment is built exactly as `spawnReal`
  * builds it.
  */
-export function execveReal(cmdPath: string, args: string[], extraEnv: Record<string, string>): boolean {
+export function execveReal(cmdPath: string, args: string[], extraEnv: Record<string, string>): string {
   return tryExecve(cmdPath, [cmdPath, ...args], buildChildEnv(extraEnv));
 }
 

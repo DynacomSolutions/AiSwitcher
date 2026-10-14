@@ -117,20 +117,24 @@ function openLibc() {
 }
 
 /**
- * Replaces this process with `path`. Returns `false` (process untouched, or
- * restored) when exec is unavailable or fails; never returns on success.
- * `argv` includes argv[0].
+ * Replaces this process with `path`. Never returns on success; when exec is
+ * unavailable or fails it returns the reason (process untouched, or
+ * restored). `argv` includes argv[0].
  */
-export function tryExecve(path: string, argv: readonly string[], env: Record<string, string | undefined>): boolean {
-  if (process.platform !== "linux") return false;
+export function tryExecve(path: string, argv: readonly string[], env: Record<string, string | undefined>): string {
+  if (process.platform !== "linux") return `execve unsupported on ${process.platform}`;
   try {
     // execve never searches PATH: a bare name (e.g. `bunx`) would run ./bunx.
     if (!path.includes("/")) {
       const found = Bun.which(path, { PATH: env.PATH ?? process.env.PATH ?? "" });
-      if (!found) return false;
+      if (!found) return `${path} not found on PATH`;
       path = found;
     }
-    accessSync(path, constants.X_OK);
+    try {
+      accessSync(path, constants.X_OK);
+    } catch {
+      return `${path} not executable`;
+    }
     const lib = openLibc();
     const block = buildExecBlock(path, argv, buildEnvp(env), (buffer) => BigInt(ptr(buffer)));
 
@@ -154,8 +158,8 @@ export function tryExecve(path: string, argv: readonly string[], env: Record<str
     // Only reached when execve failed: put back what we changed.
     for (const sig of ignored) lib.symbols.signal(sig, SIG_IGN);
     if (blocked) lib.symbols.sigprocmask(SIG_SETMASK, BigInt(ptr(oldset)), 0n);
-    return false;
-  } catch {
-    return false;
+    return `execve(${path}) failed`;
+  } catch (err) {
+    return `execve unavailable: ${err instanceof Error ? err.message : String(err)}`;
   }
 }

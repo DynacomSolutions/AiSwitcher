@@ -68,10 +68,10 @@ describe("buildExecBlock", () => {
 });
 
 describe("tryExecve", () => {
-  test("returns false (process untouched) for a missing or non-executable path", () => {
-    expect(tryExecve("/nonexistent/tool", ["tool"], {})).toBe(false);
-    expect(execveReal("/nonexistent/tool", [], {})).toBe(false);
-    expect(tryExecve("/etc/hostname", ["x"], {})).toBe(false);
+  test("returns the failure reason (process untouched) for a missing or non-executable path", () => {
+    expect(tryExecve("/nonexistent/tool", ["tool"], {})).toContain("not executable");
+    expect(typeof execveReal("/nonexistent/tool", [], {})).toBe("string");
+    expect(tryExecve("/etc/hostname", ["x"], {})).toContain("not executable");
   });
 
   test.skipIf(process.platform !== "linux")("replaces a real process: arguments and env arrive intact", () => {

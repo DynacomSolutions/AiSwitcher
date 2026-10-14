@@ -1,8 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CODEX_CONFIG } from "../../src/identities/tool-configs.ts";
 import {
   isPidRunning,
   launchWithSession,
+  MAX_PROMPT_BYTES,
   procStartTime,
   SIDECAR_ARG,
   SIDECAR_SPEC_ENV,
@@ -72,6 +76,8 @@ describe("sidecar re-entry", () => {
 });
 
 describe("launchWithSession", () => {
+  const logDir = mkdtempSync(join(tmpdir(), "ais-launch-log-"));
+  afterAll(() => rmSync(logDir, { recursive: true, force: true }));
   const real: RealLaunch = { path: "/real/codex", args: ["a"], env: { K: "v" } };
   const base = { configDirValue: "/example/cfg", cwd: "/example/cwd", syncAtLaunch: true };
 
@@ -80,8 +86,9 @@ describe("launchWithSession", () => {
     const seen: { spec?: SessionSpec } = {};
     const d: LaunchDeps = {
       spawnSidecar: (spec) => (calls.push("sidecar"), (seen.spec = spec), true),
-      execve: () => (calls.push("execve"), false),
+      execve: () => (calls.push("execve"), "execve failed"),
       spawn: async () => (calls.push("spawn"), 5),
+      logPath: join(logDir, "fallback.log"),
       startWork: async () => (calls.push("work"), { stop: async () => void calls.push("stop") }),
       ...overrides,
     };
@@ -105,5 +112,31 @@ describe("launchWithSession", () => {
     const { d, calls } = deps({ spawnSidecar: () => (false) });
     expect(await launchWithSession(CODEX_CONFIG, { ...base, syncAtLaunch: false }, real, d)).toBe(5);
     expect(calls).toEqual(["work", "spawn", "stop"]);
+  });
+
+  test("an oversized initial prompt is truncated so the spec can never overflow the env limit", async () => {
+    const { d, seen } = deps();
+    await launchWithSession(CODEX_CONFIG, { ...base, title: { tool: "codex", initialPrompt: "x".repeat(300_000) } }, real, d);
+    expect(seen.spec?.title?.initialPrompt?.length).toBe(MAX_PROMPT_BYTES);
+    expect(JSON.stringify(seen.spec).length).toBeLessThan(10_000);
+  });
+
+  test("every fallback to the old spawn path leaves one log line saying which and why", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ais-fallback-log-"));
+    const log = join(home, "shim-fallback.log");
+    try {
+      const { d } = deps({ execve: () => "execve failed: boom", logPath: log });
+      await launchWithSession(CODEX_CONFIG, base, real, d);
+      const noSidecar = deps({ spawnSidecar: () => false, logPath: log });
+      await launchWithSession(CODEX_CONFIG, base, real, noSidecar.d);
+      const lines = readFileSync(log, "utf8").trim().split("\n");
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toContain("codex");
+      expect(lines[0]).toContain("spawn fallback");
+      expect(lines[0]).toContain("execve failed: boom");
+      expect(lines[1]).toContain("in-process fallback");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
