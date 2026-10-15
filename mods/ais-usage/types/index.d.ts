@@ -39,8 +39,7 @@ declare module 'claude-code' {
       /** Names of expanded "other identities" rows. */
       expanded: string[]
       /** Band toggles: "Other providers" and "Pool members" open. */
-      othersOpen: boolean
-      membersOpen: boolean
+      open: 'others' | 'members' | null
       /** Epoch ms of the last completed fetch, 0 for none. */
       updatedAt: number
       /** Fetches in flight. */

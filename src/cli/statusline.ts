@@ -11,12 +11,13 @@ import {
   barWidth,
   labelPad,
   memberBlocks,
+  memberCards,
   providerBlocks,
   resolveCurrent,
   rowSegments,
   snapshotName,
 } from "../../mods/ais-usage/hooks/model.ts";
-import type { BandRow, Resolved, Snapshot } from "../../mods/ais-usage/hooks/model.ts";
+import type { BandRow, Resolved, Seg, Snapshot } from "../../mods/ais-usage/hooks/model.ts";
 import type { LimitsEntry } from "../../mods/ais-usage/types";
 
 const ESC = "\u001b[";
@@ -38,40 +39,34 @@ function readSnapshot(cacheDir: string, configDir: string | undefined): Snapshot
   }
 }
 
-/** Expanded blocks for the open toggles: a bold title per tool, then its rows (plus member names for Pool members). */
+/** The open section from the snapshot; falls back to the older boolean fields. */
+const openOf = (s: Snapshot) => (s.open !== undefined ? s.open : s.othersOpen ? "others" : s.membersOpen ? "members" : null);
+
+/** Expanded block of the one open section: a bold title per tool, then its rows or member cards, with a rule between tools. */
 function toggleLines(s: Snapshot, configDir: string | undefined, cols: number): string[] {
   const r = resolveCurrent(s.limits, configDir, s.status);
-  const out: string[] = [];
-  const rowsOf = (rows: BandRow[]) => {
-    if (!rows.length) return [paint(CODE.dim, "n/a")];
-    const width = barWidth(r, rows, cols);
-    const pad = labelPad(r, rows);
-    return rows.map((row) => renderRow(r, row, width, pad));
-  };
-  if (s.othersOpen) {
-    for (const g of providerBlocks(s.limits, r)) out.push(paint(BOLD, g.tool), ...rowsOf(g.rows));
-  }
-  if (s.membersOpen && r.kind === "pool") {
-    for (const g of memberBlocks(s.status, s.limits, r)) {
-      // One width per tool so a tool's member rows line up.
-      const all = g.members.flatMap((m) => m.rows);
-      const width = all.length ? barWidth(r, all, cols) : 0;
-      const pad = all.length ? labelPad(r, all) : 0;
-      out.push(paint(BOLD, g.tool));
-      for (const m of g.members) {
-        out.push(paint(CODE.dim, m.name));
-        out.push(...(m.rows.length ? m.rows.map((row) => renderRow(r, row, width, pad)) : [paint(CODE.dim, "n/a")]));
-      }
+  const rule = paint(CODE.dim, "─".repeat(cols));
+  const groups: string[][] = [];
+  const open = openOf(s);
+  if (open === "others") {
+    for (const g of providerBlocks(s.limits, r)) {
+      const width = barWidth(r, g.rows, cols);
+      const pad = labelPad(r, g.rows);
+      groups.push([paint(BOLD, g.tool), ...g.rows.map((row) => renderRow(r, row, width, pad))]);
     }
+  } else if (open === "members" && r.kind === "pool") {
+    for (const g of memberCards(memberBlocks(s.status, s.limits, r), cols)) groups.push(g.map(renderSegs));
   }
-  return out;
+  if (!groups.length) return [];
+  return [rule, ...groups.flatMap((g, i) => (i ? [rule, ...g] : g))];
 }
+
+const renderSegs = (segs: Seg[]): string =>
+  segs.map((g) => (g.bold ? paint(BOLD, g.text) : g.dim ? paint(CODE.dim, g.text) : g.color ? paint(CODE[g.color], g.text) : g.text)).join("");
 
 /** One band row as an ANSI line; `width` is the bar width, `labelPad` the longest label (shorter ones are right-padded). */
 export function renderRow(r: Resolved, row: BandRow, width: number, pad = 0): string {
-  return rowSegments(r, row, width, pad)
-    .map((g) => (g.dim ? paint(CODE.dim, g.text) : g.color ? paint(CODE[g.color], g.text) : g.text))
-    .join("");
+  return renderSegs(rowSegments(r, row, width, pad));
 }
 
 export interface StatuslineDeps {

@@ -81,7 +81,8 @@ const snapshot = (dir: string, over: object | string, name = "swap.json") => {
   const codex = { toolName: "codex", identity: { name: "a", configDir: "/x/a" }, windows: [win("session", 12), win("week", 34)], status: "live" };
   const claude = { toolName: "claude", identity: { name: "a", configDir: "/c/a" }, windows: [win("session", 10), win("week", 20)], status: "live" };
   const pool = { toolName: "claude", identity: { name: "team", configDir: "/c/swap", swapPool: { active: "a", accounts: ["a", "b"] } }, windows: [], status: "unavailable" };
-  const body = typeof over === "string" ? over : JSON.stringify({ othersOpen: false, membersOpen: false, limits: [pool, claude, codex], status: null, updatedAt: Date.now(), ...over });
+  const codexPool = { toolName: "codex", identity: { name: "team", configDir: "/x/team", swapPool: { active: "a", accounts: ["a"] } }, windows: [], status: "unavailable" };
+  const body = typeof over === "string" ? over : JSON.stringify({ othersOpen: false, membersOpen: false, limits: [pool, claude, codex, codexPool], status: null, updatedAt: Date.now(), ...over });
   writeFileSync(join(dir, "ais-usage", name), body);
 };
 const poolRun = async (over: object | string) => {
@@ -94,23 +95,49 @@ const poolRun = async (over: object | string) => {
   return { out, lines: strip(out).trimEnd().split("\n") };
 };
 
-test("snapshot with othersOpen appends a codex block at column 0, full width", async () => {
-  const { out, lines } = await poolRun({ othersOpen: true });
+const RULE = (n: number) => "─".repeat(n);
+
+test("open others: a rule, then a codex block with pool totals at column 0, full width", async () => {
+  const { out, lines } = await poolRun({ open: "others" });
   const i = lines.indexOf("codex");
-  expect(i).toBeGreaterThan(0);
+  expect(i).toBeGreaterThan(1);
+  expect(lines[i - 1]).toBe(RULE(100));
   expect(out).toContain("\u001b[1mcodex\u001b[0m");
   const rows = lines.slice(i + 1);
   expect(rows).toHaveLength(2);
   expect(rows[0]).toMatch(/^session\s+\[█+\]/);
-  const main = lines.find((l) => l.startsWith("session"))!;
-  expect(rows[0]!.length).toBe(main.length);
   expect(rows[0]!.length).toBeGreaterThanOrEqual(90);
+  for (const l of lines) expect(l.length).toBeLessThanOrEqual(100);
 });
 
-test("snapshot with membersOpen shows member names", async () => {
-  const { lines } = await poolRun({ membersOpen: true, status: { pool: "team", active: "a", auto: true, thresholdPercent: 95, accounts: [{ name: "a", active: true, allowed: true }, { name: "b", active: false, allowed: true }] } });
-  expect(lines).toContain("claude");
-  expect(lines).toContain("b");
+test("old othersOpen field still opens the section", async () => {
+  const { lines } = await poolRun({ othersOpen: true });
+  expect(lines).toContain("codex");
+});
+
+const wideStatus = { pool: "team", active: "a", auto: true, thresholdPercent: 95, accounts: ["a", "b", "c", "d"].map((name) => ({ name, active: name === "a", allowed: true })) };
+const membersRun = async (cols: number) => {
+  const cacheDir = cache({ a: [10, 20], b: [30, 40], c: [50, 60], d: [70, 80] });
+  const mk = (name: string) => ({ toolName: "claude", identity: { name, configDir: `/c/${name}` }, windows: [win("session", 10), win("week", 20)], status: "live" });
+  const pool = { toolName: "claude", identity: { name: "team", configDir: "/c/swap", swapPool: { active: "a", accounts: ["a", "b", "c", "d"] } }, windows: [], status: "unavailable" };
+  snapshot(cacheDir, { open: "members", limits: [pool, ...["a", "b", "c", "d"].map(mk)], status: wideStatus });
+  const out = await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/swap", COLUMNS: String(cols) }, {
+    cacheDir,
+    identities: async () => [id("team", "/c/swap", { active: "a", accounts: ["a", "b", "c", "d"] }), ...["a", "b", "c", "d"].map((n) => id(n, `/c/${n}`))],
+  });
+  return strip(out).trimEnd().split("\n");
+};
+
+test("member cards sit side by side at 160 columns and stack at 60; no line exceeds the width", async () => {
+  const wide = await membersRun(160);
+  const nameRow = (ls: string[]) => ls.findIndex((l) => /^a\s/.test(l));
+  expect(wide[nameRow(wide) - 1]).toBe("claude");
+  expect(wide[nameRow(wide)]!.match(/[abcd]/g)).toHaveLength(3); // three per row, fourth wraps
+  const narrow = await membersRun(60);
+  expect(narrow.filter((l) => /^[abcd]$/.test(l))).toHaveLength(4);
+  // Main bars keep their 10-column minimum bar; only the expanded section is bound here.
+  for (const [ls, n] of [[wide, 160], [narrow, 60]] as const) for (const l of ls.slice(ls.findIndex((x) => x.startsWith("─")))) expect(l.length).toBeLessThanOrEqual(n);
+  expect(wide.some((l) => l.startsWith("─"))).toBe(true);
 });
 
 test("snapshot with both toggles closed prints the main bars only", async () => {
