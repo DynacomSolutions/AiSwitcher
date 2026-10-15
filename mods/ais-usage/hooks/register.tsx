@@ -10,6 +10,7 @@ import {
   others,
   parseJson,
   poolProviders,
+  providerBlocks,
   snapshotPath,
   pct,
   resolveCurrent,
@@ -19,6 +20,7 @@ import {
   tone,
   totals,
 } from './model'
+import type { Section } from './model'
 
 const PANE = 'ais-usage'
 
@@ -26,8 +28,8 @@ const status = atom({ plugin: 'ais-usage', key: 'status' } as const, null)
 const usage = atom({ plugin: 'ais-usage', key: 'usage' } as const, null)
 const limits = atom({ plugin: 'ais-usage', key: 'limits' } as const, null)
 const expanded = atom({ plugin: 'ais-usage', key: 'expanded' } as const, [])
-const othersOpen = atom({ plugin: 'ais-usage', key: 'othersOpen' } as const, false)
-const membersOpen = atom({ plugin: 'ais-usage', key: 'membersOpen' } as const, false)
+// The one expanded section; opening one closes the other.
+const open = atom({ plugin: 'ais-usage', key: 'open' } as const, null as Section | null)
 const updatedAt = atom({ plugin: 'ais-usage', key: 'updatedAt' } as const, 0)
 const loading = atom({ plugin: 'ais-usage', key: 'loading' } as const, 0)
 const errors = atom({ plugin: 'ais-usage', key: 'errors' } as const, [])
@@ -45,13 +47,19 @@ const writeSnapshot = async ($: any) => {
   try {
     const home = (await $.env.get('HOME')) ?? ''
     const path = snapshotPath(home, await $.env.get('CLAUDE_CONFIG_DIR'))
+    const lim = await read($, limits)
+    const st = await read($, status)
+    const r = resolveCurrent(lim, await $.env.get('CLAUDE_CONFIG_DIR'), st)
+    const raw = await read($, open)
+    const o = raw === 'others' && !providerBlocks(lim, r).length ? null : raw
     await $.fs.write(
       path,
       JSON.stringify({
-        othersOpen: await read($, othersOpen),
-        membersOpen: await read($, membersOpen),
-        limits: await read($, limits),
-        status: await read($, status),
+        open: o,
+        othersOpen: o === 'others',
+        membersOpen: o === 'members',
+        limits: lim,
+        status: st,
         updatedAt: Date.now(),
       }),
     )
@@ -164,24 +172,27 @@ export const register: Register = on => {
 
     const { Box, Text, Button } = $.ui.resolve(e)
 
-    const isOthers = await read($, othersOpen)
-    const isMembers = await read($, membersOpen)
+    const hasOthers = providerBlocks(lim, r).length > 0
+    const o = await read($, open)
+    // A section that cannot show anything counts as closed.
+    const isOthers = o === 'others' && hasOthers
+    const isMembers = o === 'members' && r.kind === 'pool'
+    const toggle = (s: Section) => async () => {
+      await update($, open, v => (v === s ? null : s))
+      await writeSnapshot($)
+    }
 
     return (
       <Box flexDirection="column" alignSelf="flex-start">
         <Box flexDirection="row">
-          <Button key="others" plain onPress={async () => {
-              await update($, othersOpen, v => !v)
-              await writeSnapshot($)
-            }}>
-            {isOthers ? '▾' : '▸'} Other providers
-          </Button>
-          {r.kind === 'pool' && <Text>{'  '}</Text>}
+          {hasOthers && (
+            <Button key="others" plain onPress={toggle('others')}>
+              {isOthers ? '▾' : '▸'} Other providers
+            </Button>
+          )}
+          {hasOthers && r.kind === 'pool' && <Text>{'  '}</Text>}
           {r.kind === 'pool' && (
-            <Button key="members" plain onPress={async () => {
-              await update($, membersOpen, v => !v)
-              await writeSnapshot($)
-            }}>
+            <Button key="members" plain onPress={toggle('members')}>
               {isMembers ? '▾' : '▸'} Pool members
             </Button>
           )}

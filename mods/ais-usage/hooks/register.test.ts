@@ -73,9 +73,9 @@ const mountBand = async ($: any, on: any, lims: unknown[], cfg: string, columns?
 }
 const poolLimits = [...limits, { ...entry('a', '/x/a'), toolName: 'codex' }, { ...entry('team-pool', '/x/swap', { swapPool: { active: 'a', accounts: ['a', 'b'] } }), toolName: 'codex' }]
 
-test('Pool members button is hidden outside a pool', async ($, on) => {
+test('Both buttons are hidden outside a pool with no other providers', async ($, on) => {
   const ui = await mountBand($, on, [entry('a', '/c/a')], '/c/a')
-  expect(await ui.find({ type: 'Button', text: /Other providers/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /Other providers/ })).toBeUndefined()
   expect(await ui.find({ type: 'Button', text: /Pool members/ })).toBeUndefined()
   await ui.unmount()
 })
@@ -103,22 +103,34 @@ test('PromptHint passes through when there are no rows', async ($, on) => {
   ).rejects.toThrow(/no implementation for ui.render/)
 })
 
-test('pressing Other providers writes the snapshot with othersOpen', async ($, on) => {
+test('pressing Other providers writes the snapshot with open others', async ($, on) => {
   const ui = await mountBand($, on, poolLimits, dir)
   await ui.press({ key: 'others' })
   expect(writes[writes.length - 1]!.path).toBe('/h/.ais/cache/ais-usage/swap.json')
-  expect(lastWrite()).toMatchObject({ othersOpen: true, membersOpen: false })
+  expect(lastWrite()).toMatchObject({ open: 'others', othersOpen: true, membersOpen: false })
   expect(lastWrite().limits).toHaveLength(poolLimits.length)
   await ui.press({ key: 'others' })
-  expect(lastWrite().othersOpen).toBe(false)
+  expect(lastWrite()).toMatchObject({ open: null, othersOpen: false })
   await ui.unmount()
 })
 
-test('pressing Pool members writes the snapshot with membersOpen', async ($, on) => {
+test('opening one section closes the other', async ($, on) => {
   const ui = await mountBand($, on, poolLimits, dir)
+  await ui.press({ key: 'others' })
   await ui.press({ key: 'members' })
-  expect(lastWrite()).toMatchObject({ othersOpen: false, membersOpen: true })
+  expect(lastWrite()).toMatchObject({ open: 'members', othersOpen: false, membersOpen: true })
   expect(typeof lastWrite().updatedAt).toBe('number')
+  await ui.press({ key: 'others' })
+  expect(lastWrite().open).toBe('others')
+  await ui.unmount()
+})
+
+test('Other providers is hidden in a pool with no other-tool pool of the same name', async ($, on) => {
+  const ui = await mountBand($, on, limits, dir)
+  expect(await ui.find({ type: 'Button', text: /Other providers/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', text: /Pool members/ })).toBeDefined()
+  await ui.press({ key: 'members' })
+  expect(lastWrite()).toMatchObject({ open: 'members' })
   await ui.unmount()
 })
 

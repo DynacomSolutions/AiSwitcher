@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks } from './model'
+import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks, memberCards, resetLabel } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -150,37 +150,44 @@ test('memberBlocks: claude first, then providers, per member rows', () => {
   expect(memberBlocks(null, limits, r).map(b => b.tool)).toEqual(['codex', 'kimi'])
 })
 
-test('providerBlocks: codex pool named like the claude pool mirrors its active member', () => {
-  const cx = (name: string, category: string, usedPercent: number, extra: Partial<LimitsEntry> = {}): LimitsEntry => ({
+test('providerBlocks: codex pool totals aggregate week and month over members', () => {
+  const cx = (name: string, category: string, usedPercent: number, resetsAtMs: number): LimitsEntry => ({
     toolName: 'codex',
     identity: { name, configDir: `/x/${name}` },
-    windows: [{ label: category, category, usedPercent, resetsAtMs: 1792652277000 }],
+    windows: [{ label: category, category, usedPercent, resetsAtMs }],
     status: 'live',
-    ...extra,
   })
-  const members = ['alpha', 'personal', 'beta', 'gamma', 'delta', 'teamco']
+  const members = ['alpha', 'personal', 'beta', 'gamma', 'outsider']
   const lim: LimitsEntry[] = [
     live('claude', 'big-pool', '/c/bigpool', true),
-    cx('alpha', 'week', 10),
-    cx('personal', 'week', 20),
-    cx('beta', 'month', 32),
-    cx('gamma', 'month', 0),
-    cx('delta', 'month', 4),
-    cx('teamco', 'week', 30),
+    cx('alpha', 'week', 10, 1792652277000),
+    cx('personal', 'week', 30, 1792552277000),
+    cx('beta', 'month', 32, 1792652277000),
+    cx('gamma', 'month', 0, 1792652277000),
+    cx('stranger', 'week', 99, 1792652277000),
     {
       toolName: 'codex',
-      identity: { name: 'big-pool', configDir: '/x/pool', swapPool: { accounts: members, active: 'gamma' } },
+      identity: { name: 'big-pool', configDir: '/x/pool', swapPool: { accounts: members.slice(0, 4), active: 'gamma' } },
       windows: [],
       status: 'unavailable',
-      error: 'mirrors active member gamma (not fetched)',
     },
   ]
-  lim[0]!.identity.swapPool = { accounts: members, active: 'alpha' }
-  const st = { pool: 'big-pool', active: 'gamma', auto: true, thresholdPercent: 90, accounts: [] } as SwapStatus
-  const r = resolveCurrent(lim, '/c/bigpool', st)
+  const r = resolveCurrent(lim, '/c/bigpool', null)
   const codex = providerBlocks(lim, r).find(g => g.tool === 'codex')!
-  expect(codex.rows.map(x => [x.name, x.active, x.pool?.pct, x.pool?.reporting])).toEqual([['month', 0, 12, 3]])
-  // Current member differs from the mirrored one: the mirrored active member's windows are used.
-  const other = resolveCurrent(lim, '/c/bigpool', { ...st, active: 'nobody' })
-  expect(providerBlocks(lim, other).find(g => g.tool === 'codex')!.rows[0]!.active).toBe(0)
+  expect(codex.rows.map(x => [x.name, x.active])).toEqual([['week', 20], ['month', 16]])
+  expect(codex.rows[0]!.resets).toBe(resetLabel(1792552277000, 'week'))
+  // No same-named pool on the other tool: no block.
+  expect(providerBlocks(lim.filter(l => !l.identity.swapPool || l.toolName === 'claude'), r)).toEqual([])
+})
+
+test('memberCards: side by side when wide, stacked when narrow, never over width', () => {
+  const row = (name: 'session' | 'week', active: number) => ({ name, active, resets: 'Oct 17' })
+  const blocks = [{ tool: 'claude', members: ['a', 'b', 'c', 'd'].map(n => ({ name: n, rows: [row('session', 40), row('week', 100)] })) }]
+  const text = (cols: number) => memberCards(blocks, cols)[0]!.map(l => l.map(g => g.text).join(''))
+  const wide = text(160)
+  expect(wide).toHaveLength(1 + 2 * 3) // three cards per row, the fourth wraps
+  expect(wide[1]!.match(/[abc]/g)).toHaveLength(3)
+  const narrow = text(60)
+  expect(narrow).toHaveLength(1 + 4 * 3)
+  for (const c of [160, 60, 30]) for (const l of text(c)) expect(l.length).toBeLessThanOrEqual(c)
 })

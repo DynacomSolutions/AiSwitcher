@@ -254,7 +254,7 @@ export function barWidth(r: Resolved, rows: BandRow[], cols: number): number {
 export const labelPad = (r: Resolved, rows: BandRow[]): number =>
   Math.max(...rows.map(row => rowText(r, row).labelLen))
 
-export type Seg = { text: string; color?: Tone | 'blue' | 'cyan' | 'gray'; dim?: boolean }
+export type Seg = { text: string; color?: Tone | 'blue' | 'cyan' | 'gray'; dim?: boolean; bold?: boolean }
 
 /** One band row as coloured segments; `width` is the bar width, `pad` the longest label. */
 export function rowSegments(r: Resolved, row: BandRow, width: number, pad = 0): Seg[] {
@@ -289,37 +289,32 @@ export function rowSegments(r: Resolved, row: BandRow, width: number, pad = 0): 
 
 export type ProviderBlock = { tool: string; rows: BandRow[] }
 
-/** Per non-claude tool of the pool (or of the current identity): session and week rows; no rows when it reports no windows. */
+/**
+ * Per other tool: pool totals over its members, one row per category present in any member.
+ * In a pool: the tool's pool of the same name (its accounts). Outside: its identities named like the current one.
+ */
 export const providerBlocks = (limits: LimitsEntry[] | null, r: Resolved): ProviderBlock[] => {
   const all = limits ?? []
   const tools = [...new Set(all.map(l => l.toolName))].filter(t => t !== 'claude').sort()
   const out: ProviderBlock[] = []
   for (const tool of tools) {
     const ofTool = all.filter(l => l.toolName === tool)
-    const members = r.pool ? ofTool.filter(l => !l.identity.swapPool && r.members?.includes(l.identity.name)) : []
-    // A pool entry of this tool mirrors its own active member (empty windows); take that member's windows.
-    const mirror = ofTool.find(l => l.identity.swapPool && l.identity.name === r.pool)?.identity.swapPool?.active
-    const act = r.pool
-      ? (members.find(l => l.identity.name === r.current) ??
-        members.find(l => l.identity.name === mirror) ??
-        ofTool.find(l => l.identity.name === r.pool))
-      : ofTool.find(l => l.identity.name === r.current && !l.identity.swapPool)
-    if (!act && !members.length) continue
+    let members: LimitsEntry[]
+    if (r.pool) {
+      const accounts = ofTool.find(l => l.identity.swapPool && l.identity.name === r.pool)?.identity.swapPool?.accounts
+      members = Array.isArray(accounts) ? ofTool.filter(l => !l.identity.swapPool && accounts.includes(l.identity.name)) : []
+    } else {
+      members = ofTool.filter(l => !l.identity.swapPool && l.identity.name === r.current)
+    }
     const rows: BandRow[] = []
     for (const name of ROW_NAMES) {
-      const w = act && pick(act.windows, name)
-      if (!w) continue
-      const vals = members.flatMap(l => pick(l.windows, name)?.usedPercent ?? [])
-      rows.push({
-        name,
-        active: w.usedPercent,
-        resets: resetLabel(w.resetsAtMs ?? w.resetsAt, name),
-        pool: r.pool
-          ? { pct: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : undefined, reporting: vals.length, total: members.length }
-          : undefined,
-      })
+      const ws = members.flatMap(l => pick(l.windows, name) ?? [])
+      if (!ws.length) continue
+      const ats = ws.map(w => w.resetsAtMs ?? w.resetsAt).filter(a => a !== undefined && a !== '' && !Number.isNaN(new Date(a).getTime()))
+      const first = ats.sort((x, y) => new Date(x!).getTime() - new Date(y!).getTime())[0]
+      rows.push({ name, active: ws.reduce((n, w) => n + w.usedPercent, 0) / ws.length, resets: resetLabel(first, name) })
     }
-    out.push({ tool, rows })
+    if (rows.length) out.push({ tool, rows })
   }
   return out
 }
@@ -364,9 +359,60 @@ export const memberBlocks = (status: SwapStatus | null, limits: LimitsEntry[] | 
   return out
 }
 
+export type Section = 'others' | 'members'
+
+const CARD_FIXED = NAME_COL + 1 + 2 + 4 + 2 + 6 // label, '[', '] ', pct, gap, resets
+const CARD_GAP = 3
+
+/** Member cards side by side as many as fit in `cols`, wrapping to further rows; one titled line group per tool. Every line is at most `cols` wide. */
+export function memberCards(blocks: MemberBlock[], cols: number): Seg[][][] {
+  const bw = Math.min(22, Math.max(6, cols - CARD_FIXED))
+  const w = CARD_FIXED + bw
+  const per = Math.max(1, Math.floor((cols + CARD_GAP) / (w + CARD_GAP)))
+  const fit = (t: string) => (t.length > w ? `${t.slice(0, w - 1)}\u2026` : t)
+  const card = (m: MemberBlock['members'][number]): Seg[][] => [
+    [{ text: fit(m.name), dim: true }],
+    ...(m.rows.length
+      ? m.rows.map((row): Seg[] => {
+          const cur = pct(row.active)
+          const n = cells(row.active, bw)
+          return [
+            { text: row.name.padEnd(NAME_COL) + '[' },
+            { text: '\u2588'.repeat(n), color: tone(row.active) },
+            { text: '\u2588'.repeat(bw - n), color: 'gray' },
+            { text: '] ' },
+            { text: cur.padStart(4), color: tone(row.active) },
+            { text: `  ${row.resets}`.slice(0, 8), dim: true },
+          ]
+        })
+      : [[{ text: 'n/a', dim: true }] as Seg[]]),
+  ]
+  const len = (l: Seg[]) => l.reduce((n, g) => n + g.text.length, 0)
+  return blocks.map(b => {
+    const lines: Seg[][] = [[{ text: b.tool, bold: true }]]
+    const cards = b.members.map(card)
+    for (let i = 0; i < cards.length; i += per) {
+      const group = cards.slice(i, i + per)
+      for (let y = 0; y < Math.max(...group.map(c => c.length)); y++) {
+        const line: Seg[] = []
+        group.forEach((c, x) => {
+          const l = c[y] ?? []
+          if (x) line.push({ text: ' '.repeat(CARD_GAP) })
+          line.push(...l, { text: ' '.repeat(w - len(l)) })
+        })
+        while (line.length && !line[line.length - 1]!.text.trim()) line.pop()
+        lines.push(line)
+      }
+    }
+    return lines
+  })
+}
+
 export type Snapshot = {
-  othersOpen: boolean
-  membersOpen: boolean
+  /** Current field; the two booleans are written for older readers and read when `open` is absent. */
+  open?: Section | null
+  othersOpen?: boolean
+  membersOpen?: boolean
   limits: LimitsEntry[] | null
   status: SwapStatus | null
   updatedAt: number
