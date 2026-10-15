@@ -123,11 +123,11 @@ export async function usageBars(stdin: string, env: Record<string, string | unde
     if (!rows.length) return "";
     const cols = widthFrom(input, env);
     const head = r.pool
-      ? [" ", paint(CODE.dim, `${paint(CODE.blue, BLOCK)} ${r.pool} > ${paint(CODE.cyan, BLOCK)} ${r.current}`)]
+      ? ["\u2800", paint(CODE.dim, `${paint(CODE.blue, BLOCK)} ${r.pool} > ${paint(CODE.cyan, BLOCK)} ${r.current}`)]
       : [];
     const width = barWidth(r, rows, cols);
     const pad = labelPad(r, rows);
-    // The " " spacer line above the key is not empty on purpose: Claude Code may drop truly empty status lines.
+    // The U+2800 (braille blank) spacer above the key is not whitespace on purpose: Claude Code drops whitespace-only status lines, and JS trim() strips even NBSP.
     const lines = [...head, ...rows.map((row) => renderRow(r, row, width, pad)), paint(CODE.dim, "─".repeat(cols))];
     // shortcut: the snapshot is per identity, not per session, so two sessions on one identity share toggles; upgrade if that bites.
     const snap = readSnapshot(deps.cacheDir ?? aisCacheDir(), env.CLAUDE_CONFIG_DIR);

@@ -125,11 +125,11 @@ test("closed: bars then one rule last; open: bars, rule, section, rule, never tw
   }
 });
 
-test("a one-space spacer line sits just before the colour key", async () => {
+test("a braille-blank spacer line sits just before the colour key", async () => {
   const { out, lines } = await poolRun({});
   const k = lines.findIndex((l) => l.includes("team > "));
   expect(k).toBeGreaterThan(0);
-  expect(strip(out).split("\n")[k - 1]).toBe(" ");
+  expect(strip(out).split("\n")[k - 1]).toBe("\u2800");
 });
 
 test("old othersOpen field still opens the section", async () => {
