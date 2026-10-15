@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberRows, memberProviderRows } from './model'
+import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -137,16 +137,15 @@ test('providerBlocks: session and week per tool, none for unknown identity', () 
   expect(providerBlocks(limits, resolveCurrent(limits, '/nope', null))).toEqual([])
 })
 
-test('memberRows and memberProviderRows', () => {
+test('memberBlocks: claude first, then providers, per member rows', () => {
   const st = { ...swap, accounts: [swap.accounts[0], { name: 'acme', active: false, allowed: true }] } as unknown as SwapStatus
-  expect(memberRows(st, limits)).toEqual([
-    { label: 'workco', five: 4, week: 1 },
-    { label: 'acme', five: 4, week: 1 },
-  ])
-  expect(memberRows(null, limits)).toEqual([])
   const r = resolveCurrent(limits, '/c/swap', swap)
-  expect(memberProviderRows(limits, r).map(g => [g.tool, g.rows.map(x => x.label)])).toEqual([
-    ['codex', ['workco', 'personal', 'acme', 'studioco']],
-    ['kimi', ['personal', 'acme']],
+  const bs = memberBlocks(st, limits, r)
+  expect(bs.map(b => b.tool)).toEqual(['claude', 'codex', 'kimi'])
+  expect(bs[0].members.map(m => [m.name, m.rows.map(x => x.name)])).toEqual([
+    ['workco', ['session', 'week']],
+    ['acme', ['session', 'week']],
   ])
+  expect(bs[1].members.map(m => m.name)).toEqual(['workco', 'personal', 'acme', 'studioco'])
+  expect(memberBlocks(null, limits, r).map(b => b.tool)).toEqual(['codex', 'kimi'])
 })
