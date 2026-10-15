@@ -16,13 +16,15 @@ const cache = (used: Record<string, [number, number]>) => {
   }
   return dir;
 };
+const RULE = (n: number) => "─".repeat(n);
 const id = (name: string, configDir: string, swapPool?: object) => ({ name, label: name, configDir, ...(swapPool ? { swapPool } : {}) }) as never;
 
 test("plain identity: one row per window", async () => {
   const cacheDir = cache({ solo: [30, 80] });
   const out = await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/solo/", COLUMNS: "100" }, { cacheDir, identities: async () => [id("solo", "/c/solo")] });
   const lines = strip(out).trimEnd().split("\n");
-  expect(lines).toHaveLength(2);
+  expect(lines).toHaveLength(3);
+  expect(lines[2]).toBe(RULE(100));
   expect(lines[0]).toMatch(/^session\s+\[█+\] 30%/);
   expect(lines[1]).toMatch(/^week\s+\[█+\] 80%\s+resets Oct 1\d/);
   expect(out).toContain("\u001b[32m"); // 30% green
@@ -95,8 +97,6 @@ const poolRun = async (over: object | string) => {
   return { out, lines: strip(out).trimEnd().split("\n") };
 };
 
-const RULE = (n: number) => "─".repeat(n);
-
 test("open others: a rule, then a codex block with pool totals at column 0, full width", async () => {
   const { out, lines } = await poolRun({ open: "others" });
   const i = lines.indexOf("codex");
@@ -110,9 +110,26 @@ test("open others: a rule, then a codex block with pool totals at column 0, full
   for (const l of lines) expect(l.length).toBeLessThanOrEqual(100);
 });
 
-test("open section ends with the rule; closed has none", async () => {
-  for (const open of ["others", "members"]) expect((await poolRun({ open })).lines.at(-1)).toBe(RULE(100));
-  expect((await poolRun({})).lines.some((l) => l.startsWith("─"))).toBe(false);
+test("closed: bars then one rule last; open: bars, rule, section, rule, never two rules in a row", async () => {
+  const closed = (await poolRun({})).lines;
+  expect(closed.at(-1)).toBe(RULE(100));
+  expect(closed.at(-2)).toMatch(/^week\s/);
+  expect(closed.filter((l) => l.startsWith("─"))).toHaveLength(1);
+  for (const open of ["others", "members"]) {
+    const { lines } = await poolRun({ open });
+    expect(lines.at(-1)).toBe(RULE(100));
+    expect(lines.at(-2)).not.toBe(RULE(100));
+    const first = lines.findIndex((l) => l.startsWith("─"));
+    expect(lines[first - 1]).toMatch(/^week\s/);
+    expect(lines[first + 1]).not.toBe(RULE(100));
+  }
+});
+
+test("a one-space spacer line sits just before the colour key", async () => {
+  const { out, lines } = await poolRun({});
+  const k = lines.findIndex((l) => l.includes("team > "));
+  expect(k).toBeGreaterThan(0);
+  expect(strip(out).split("\n")[k - 1]).toBe(" ");
 });
 
 test("old othersOpen field still opens the section", async () => {

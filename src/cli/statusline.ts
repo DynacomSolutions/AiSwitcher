@@ -42,7 +42,7 @@ function readSnapshot(cacheDir: string, configDir: string | undefined): Snapshot
 /** The open section from the snapshot; falls back to the older boolean fields. */
 const openOf = (s: Snapshot) => (s.open !== undefined ? s.open : s.othersOpen ? "others" : s.membersOpen ? "members" : null);
 
-/** Expanded block of the one open section: a bold title per tool, then its rows or member cards, with a rule between tools and under the last. */
+/** Expanded block of the one open section: a bold title per tool, then its rows or member cards, with a rule between tools and under the last (the rule above it is printed by the caller). */
 function toggleLines(s: Snapshot, configDir: string | undefined, cols: number): string[] {
   const r = resolveCurrent(s.limits, configDir, s.status);
   const rule = paint(CODE.dim, "─".repeat(cols));
@@ -58,7 +58,7 @@ function toggleLines(s: Snapshot, configDir: string | undefined, cols: number): 
     for (const g of memberCards(memberBlocks(s.status, s.limits, r), cols)) groups.push(g.map(renderSegs));
   }
   if (!groups.length) return [];
-  return [rule, ...groups.flatMap((g, i) => (i ? [rule, ...g] : g)), rule];
+  return [...groups.flatMap((g, i) => (i ? [rule, ...g] : g)), rule];
 }
 
 const renderSegs = (segs: Seg[]): string =>
@@ -123,11 +123,12 @@ export async function usageBars(stdin: string, env: Record<string, string | unde
     if (!rows.length) return "";
     const cols = widthFrom(input, env);
     const head = r.pool
-      ? [paint(CODE.dim, `${paint(CODE.blue, BLOCK)} ${r.pool} > ${paint(CODE.cyan, BLOCK)} ${r.current}`)]
+      ? [" ", paint(CODE.dim, `${paint(CODE.blue, BLOCK)} ${r.pool} > ${paint(CODE.cyan, BLOCK)} ${r.current}`)]
       : [];
     const width = barWidth(r, rows, cols);
     const pad = labelPad(r, rows);
-    const lines = [...head, ...rows.map((row) => renderRow(r, row, width, pad))];
+    // The " " spacer line above the key is not empty on purpose: Claude Code may drop truly empty status lines.
+    const lines = [...head, ...rows.map((row) => renderRow(r, row, width, pad)), paint(CODE.dim, "─".repeat(cols))];
     // shortcut: the snapshot is per identity, not per session, so two sessions on one identity share toggles; upgrade if that bites.
     const snap = readSnapshot(deps.cacheDir ?? aisCacheDir(), env.CLAUDE_CONFIG_DIR);
     if (snap) {
