@@ -363,3 +363,21 @@ export const memberBlocks = (status: SwapStatus | null, limits: LimitsEntry[] | 
   }
   return out
 }
+
+export type Snapshot = {
+  othersOpen: boolean
+  membersOpen: boolean
+  limits: LimitsEntry[] | null
+  status: SwapStatus | null
+  updatedAt: number
+}
+
+/** Snapshot file name for an identity: the CLAUDE_CONFIG_DIR basename, sanitised. */
+export const snapshotName = (configDir: string | undefined): string => {
+  const base = norm(configDir ?? '').split('/').pop() ?? ''
+  return `${base.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_') || 'default'}.json`
+}
+
+/** Where the mod writes the snapshot `ais statusline` reads. */
+export const snapshotPath = (home: string, configDir: string | undefined): string =>
+  `${norm(home)}/.ais/cache/ais-usage/${snapshotName(configDir)}`

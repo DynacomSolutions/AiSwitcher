@@ -6,15 +6,11 @@ import {
   bandRows,
   entriesFor,
   humanise,
-  memberBlocks,
   memberWindow,
   others,
   parseJson,
   poolProviders,
-  barWidth,
-  labelPad,
-  providerBlocks,
-  rowSegments,
+  snapshotPath,
   pct,
   resolveCurrent,
   shares,
@@ -23,7 +19,6 @@ import {
   tone,
   totals,
 } from './model'
-import type { BandRow } from './model'
 
 const PANE = 'ais-usage'
 
@@ -39,6 +34,31 @@ const errors = atom({ plugin: 'ais-usage', key: 'errors' } as const, [])
 
 // Last pool member seen at a prompt; '' until the first prompt.
 const lastMember = atom({ plugin: 'ais-usage', key: 'lastMember' } as const, '')
+
+/**
+ * Shares toggles and data with `ais statusline`, which draws the expanded blocks.
+ * shortcut: the file is per identity (CLAUDE_CONFIG_DIR), not per session, so two sessions on one identity share toggles
+ * and last writer wins; $.fs has no rename, so the write is not atomic and the reader ignores a torn file.
+ * Upgrade to a per-session key if that bites.
+ */
+const writeSnapshot = async ($: any) => {
+  try {
+    const home = (await $.env.get('HOME')) ?? ''
+    const path = snapshotPath(home, await $.env.get('CLAUDE_CONFIG_DIR'))
+    await $.fs.write(
+      path,
+      JSON.stringify({
+        othersOpen: await read($, othersOpen),
+        membersOpen: await read($, membersOpen),
+        limits: await read($, limits),
+        status: await read($, status),
+        updatedAt: Date.now(),
+      }),
+    )
+  } catch {
+    // The status line is optional; a failed write must never break the mod.
+  }
+}
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 
@@ -81,7 +101,10 @@ export const register: Register = on => {
 
     const refreshStatus = async () => {
       const v = await fetchJson<SwapStatus>('status', ['claude-swap', 'status', '--json', '--no-usage'], 20000)
-      if (v) await update($, status, () => v)
+      if (v) {
+        await update($, status, () => v)
+        await writeSnapshot($)
+      }
     }
     const refreshUsage = async () => {
       const v = await fetchJson<SwapUsage>('usage', ['claude-swap', 'usage', '--json'], 20000)
@@ -92,7 +115,10 @@ export const register: Register = on => {
       isLimitsBusy = true
       try {
         const v = await fetchJson<LimitsEntry[]>('limits', ['limits', '--json'], 60000)
-        if (Array.isArray(v)) await update($, limits, () => v)
+        if (Array.isArray(v)) {
+          await update($, limits, () => v)
+          await writeSnapshot($)
+        }
       } finally {
         isLimitsBusy = false
       }
@@ -138,66 +164,29 @@ export const register: Register = on => {
 
     const { Box, Text, Button } = $.ui.resolve(e)
 
-    const cols = e.viewport?.columns ?? 80
     const isOthers = await read($, othersOpen)
     const isMembers = await read($, membersOpen)
-    const rowLine = (row: BandRow, width: number, pad: number) => (
-      <Text key={row.name}>
-        {rowSegments(r, row, width, pad).map((s, i) => (
-          <Text key={i} color={s.color} dimColor={s.dim}>
-            {s.text}
-          </Text>
-        ))}
-      </Text>
-    )
 
     return (
       <Box flexDirection="column" alignSelf="flex-start">
         <Box flexDirection="row">
-          <Button key="others" plain onPress={() => update($, othersOpen, v => !v)}>
+          <Button key="others" plain onPress={async () => {
+              await update($, othersOpen, v => !v)
+              await writeSnapshot($)
+            }}>
             {isOthers ? '▾' : '▸'} Other providers
           </Button>
           {r.kind === 'pool' && <Text>{'  '}</Text>}
           {r.kind === 'pool' && (
-            <Button key="members" plain onPress={() => update($, membersOpen, v => !v)}>
+            <Button key="members" plain onPress={async () => {
+              await update($, membersOpen, v => !v)
+              await writeSnapshot($)
+            }}>
               {isMembers ? '▾' : '▸'} Pool members
             </Button>
           )}
         </Box>
         <Text dimColor>{e.props.hint}</Text>
-        {isOthers &&
-          providerBlocks(lim, r).map(g => {
-            const width = g.rows.length ? barWidth(r, g.rows, cols) : 0
-            const pad = g.rows.length ? labelPad(r, g.rows) : 0
-            return (
-              <Box key={`o-${g.tool}`} flexDirection="column">
-                <Text bold>{g.tool}</Text>
-                {g.rows.length ? (
-                  g.rows.map(row => rowLine(row, width, pad))
-                ) : (
-                  <Text dimColor>n/a</Text>
-                )}
-              </Box>
-            )
-          })}
-        {r.kind === 'pool' &&
-          isMembers &&
-          memberBlocks(st, lim, r).map(g => {
-            const all = g.members.flatMap(m => m.rows)
-            const width = all.length ? barWidth(r, all, cols) : 0
-            const pad = all.length ? labelPad(r, all) : 0
-            return (
-              <Box key={`m-${g.tool}`} flexDirection="column">
-                <Text bold>{g.tool}</Text>
-                {g.members.map(m => (
-                  <Box key={m.name} flexDirection="column">
-                    <Text dimColor>{m.name}</Text>
-                    {m.rows.length ? m.rows.map(row => rowLine(row, width, pad)) : <Text dimColor>n/a</Text>}
-                  </Box>
-                ))}
-              </Box>
-            )
-          })}
       </Box>
     )
   })

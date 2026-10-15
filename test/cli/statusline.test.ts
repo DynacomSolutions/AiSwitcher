@@ -74,3 +74,55 @@ test("rows share one bar width and start column; it scales with the terminal; no
   for (const l of [s80, w80]) expect(l.length).toBeLessThanOrEqual(80);
   for (const l of [s200, w200]) expect(l.length).toBeLessThanOrEqual(200);
 });
+
+/** Writes the mod's snapshot for config dir `/c/swap` into `dir`. */
+const snapshot = (dir: string, over: object | string, name = "swap.json") => {
+  mkdirSync(join(dir, "ais-usage"), { recursive: true });
+  const codex = { toolName: "codex", identity: { name: "a", configDir: "/x/a" }, windows: [win("session", 12), win("week", 34)], status: "live" };
+  const claude = { toolName: "claude", identity: { name: "a", configDir: "/c/a" }, windows: [win("session", 10), win("week", 20)], status: "live" };
+  const pool = { toolName: "claude", identity: { name: "team", configDir: "/c/swap", swapPool: { active: "a", accounts: ["a", "b"] } }, windows: [], status: "unavailable" };
+  const body = typeof over === "string" ? over : JSON.stringify({ othersOpen: false, membersOpen: false, limits: [pool, claude, codex], status: null, updatedAt: Date.now(), ...over });
+  writeFileSync(join(dir, "ais-usage", name), body);
+};
+const poolRun = async (over: object | string) => {
+  const cacheDir = cache({ a: [10, 20], b: [30, 40] });
+  snapshot(cacheDir, over);
+  const out = await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/swap", COLUMNS: "100" }, {
+    cacheDir,
+    identities: async () => [id("team", "/c/swap", { active: "a", accounts: ["a", "b"] }), id("a", "/c/a"), id("b", "/c/b")],
+  });
+  return { out, lines: strip(out).trimEnd().split("\n") };
+};
+
+test("snapshot with othersOpen appends a codex block at column 0, full width", async () => {
+  const { out, lines } = await poolRun({ othersOpen: true });
+  const i = lines.indexOf("codex");
+  expect(i).toBeGreaterThan(0);
+  expect(out).toContain("\u001b[1mcodex\u001b[0m");
+  const rows = lines.slice(i + 1);
+  expect(rows).toHaveLength(2);
+  expect(rows[0]).toMatch(/^session\s+\[█+\]/);
+  const main = lines.find((l) => l.startsWith("session"))!;
+  expect(rows[0]!.length).toBe(main.length);
+  expect(rows[0]!.length).toBeGreaterThanOrEqual(90);
+});
+
+test("snapshot with membersOpen shows member names", async () => {
+  const { lines } = await poolRun({ membersOpen: true, status: { pool: "team", active: "a", auto: true, thresholdPercent: 95, accounts: [{ name: "a", active: true, allowed: true }, { name: "b", active: false, allowed: true }] } });
+  expect(lines).toContain("claude");
+  expect(lines).toContain("b");
+});
+
+test("snapshot with both toggles closed prints the main bars only", async () => {
+  const { lines } = await poolRun({});
+  expect(lines.some((l) => l === "codex")).toBe(false);
+  expect(lines.filter((l) => /^(session|week)\s/.test(l))).toHaveLength(2);
+});
+
+test("bad, stale or torn snapshot prints the main bars only", async () => {
+  for (const over of ["{not json", JSON.stringify({ othersOpen: true }), { othersOpen: true, updatedAt: 1 }]) {
+    const { lines } = await poolRun(over);
+    expect(lines.some((l) => l === "codex")).toBe(false);
+    expect(lines.filter((l) => /^(session|week)\s/.test(l))).toHaveLength(2);
+  }
+});
