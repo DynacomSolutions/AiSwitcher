@@ -128,15 +128,15 @@ const membersRun = async (cols: number) => {
   return strip(out).trimEnd().split("\n");
 };
 
-test("member cards sit side by side at 160 columns and stack at 60; no line exceeds the width", async () => {
+test("member cards: current tool only, no codex, 4 per row at 160 and one per row at 60; no line exceeds the width", async () => {
   const wide = await membersRun(160);
-  const nameRow = (ls: string[]) => ls.findIndex((l) => /^a\s/.test(l));
-  expect(wide[nameRow(wide) - 1]).toBe("claude");
-  expect(wide[nameRow(wide)]!.match(/[abcd]/g)).toHaveLength(3); // three per row, fourth wraps
+  const sec = (ls: string[]) => ls.slice(ls.findIndex((x) => x.startsWith("─")));
+  expect(wide.some((l) => l === "claude" || l === "codex")).toBe(false);
+  expect(wide.filter((l) => /^a\s+b\s+c\s+d$/.test(l.trim()) || /^a\s+b/.test(l))).toHaveLength(1); // all four on one row
   const narrow = await membersRun(60);
   expect(narrow.filter((l) => /^[abcd]$/.test(l))).toHaveLength(4);
-  // Main bars keep their 10-column minimum bar; only the expanded section is bound here.
-  for (const [ls, n] of [[wide, 160], [narrow, 60]] as const) for (const l of ls.slice(ls.findIndex((x) => x.startsWith("─")))) expect(l.length).toBeLessThanOrEqual(n);
+  expect(sec(narrow).some((l) => l.length === 60)).toBe(true);
+  for (const [ls, n] of [[wide, 160], [narrow, 60]] as const) for (const l of sec(ls)) expect(l.length).toBeLessThanOrEqual(n);
   expect(wide.some((l) => l.startsWith("─"))).toBe(true);
 });
 
