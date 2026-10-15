@@ -333,53 +333,41 @@ const memberBand = (name: RowName, pctUsed: number, at: string | number | undefi
   resets: resetLabel(at, name),
 })
 
-/** Pool case: per tool (claude first, then the other providers), each member's own session and week rows; a member without windows has no rows. */
+/** Pool case: the current pool's members (its member list, in order) with their own session and week rows; a member without windows has no rows. */
 export const memberBlocks = (status: SwapStatus | null, limits: LimitsEntry[] | null, r: Resolved): MemberBlock[] => {
-  const claude = (status?.accounts ?? []).map(a => ({
-    name: a.name,
+  const members = (r.members ?? []).map(name => ({
+    name,
     rows: ([['session', 'fiveHour'], ['week', 'sevenDay']] as const).flatMap(([n, k]) => {
-      const w = memberWindow(status, limits, a.name, k)
+      const w = memberWindow(status, limits, name, k)
       return w ? [memberBand(n, w.pct, w.resetsAt)] : []
     }),
   }))
-  const out: MemberBlock[] = claude.length ? [{ tool: 'claude', members: claude }] : []
-  for (const g of poolProviders(limits, r)) {
-    const names = [...new Set(g.rows.map(l => l.identity.name))]
-    out.push({
-      tool: g.tool,
-      members: names.map(name => ({
-        name,
-        rows: ROW_NAMES.flatMap(n => {
-          const w = g.rows.filter(l => l.identity.name === name).map(l => pick(l.windows, n)).find(Boolean)
-          return w ? [memberBand(n, w.usedPercent, w.resetsAtMs ?? w.resetsAt)] : []
-        }),
-      })),
-    })
-  }
-  return out
+  return members.length ? [{ tool: 'claude', members }] : []
 }
 
 export type Section = 'others' | 'members'
 
 const CARD_FIXED = NAME_COL + 1 + 2 + 4 + 2 + 6 // label, '[', '] ', pct, gap, resets
 const CARD_GAP = 3
+const CARD_MIN = 34
 
-/** Member cards side by side as many as fit in `cols`, wrapping to further rows; one titled line group per tool. Every line is at most `cols` wide. */
+/** Cards filling `cols`: k per row (each at least CARD_MIN wide), equal widths, rows wrap. Every line is at most `cols` wide. */
 export function memberCards(blocks: MemberBlock[], cols: number): Seg[][][] {
-  const bw = Math.min(22, Math.max(6, cols - CARD_FIXED))
-  const w = CARD_FIXED + bw
-  const per = Math.max(1, Math.floor((cols + CARD_GAP) / (w + CARD_GAP)))
+  const n = blocks.reduce((t, b) => t + b.members.length, 0)
+  const per = Math.max(1, Math.min(n, Math.floor((cols + CARD_GAP) / (CARD_MIN + CARD_GAP))))
+  const w = Math.min(cols, Math.floor((cols - CARD_GAP * (per - 1)) / per))
+  const bw = Math.max(1, w - CARD_FIXED)
   const fit = (t: string) => (t.length > w ? `${t.slice(0, w - 1)}\u2026` : t)
   const card = (m: MemberBlock['members'][number]): Seg[][] => [
     [{ text: fit(m.name), dim: true }],
     ...(m.rows.length
       ? m.rows.map((row): Seg[] => {
           const cur = pct(row.active)
-          const n = cells(row.active, bw)
+          const c = cells(row.active, bw)
           return [
             { text: row.name.padEnd(NAME_COL) + '[' },
-            { text: '\u2588'.repeat(n), color: tone(row.active) },
-            { text: '\u2588'.repeat(bw - n), color: 'gray' },
+            { text: '\u2588'.repeat(c), color: tone(row.active) },
+            { text: '\u2588'.repeat(bw - c), color: 'gray' },
             { text: '] ' },
             { text: cur.padStart(4), color: tone(row.active) },
             { text: `  ${row.resets}`.slice(0, 8), dim: true },
@@ -387,9 +375,9 @@ export function memberCards(blocks: MemberBlock[], cols: number): Seg[][][] {
         })
       : [[{ text: 'n/a', dim: true }] as Seg[]]),
   ]
-  const len = (l: Seg[]) => l.reduce((n, g) => n + g.text.length, 0)
+  const len = (l: Seg[]) => l.reduce((t, g) => t + g.text.length, 0)
   return blocks.map(b => {
-    const lines: Seg[][] = [[{ text: b.tool, bold: true }]]
+    const lines: Seg[][] = []
     const cards = b.members.map(card)
     for (let i = 0; i < cards.length; i += per) {
       const group = cards.slice(i, i + per)
@@ -398,7 +386,7 @@ export function memberCards(blocks: MemberBlock[], cols: number): Seg[][][] {
         group.forEach((c, x) => {
           const l = c[y] ?? []
           if (x) line.push({ text: ' '.repeat(CARD_GAP) })
-          line.push(...l, { text: ' '.repeat(w - len(l)) })
+          line.push(...l, { text: ' '.repeat(Math.max(0, w - len(l))) })
         })
         while (line.length && !line[line.length - 1]!.text.trim()) line.pop()
         lines.push(line)

@@ -137,17 +137,12 @@ test('providerBlocks: session and week per tool, none for unknown identity', () 
   expect(providerBlocks(limits, resolveCurrent(limits, '/nope', null))).toEqual([])
 })
 
-test('memberBlocks: claude first, then providers, per member rows', () => {
-  const st = { ...swap, accounts: [swap.accounts[0], { name: 'acme', active: false, allowed: true }] } as unknown as SwapStatus
+test('memberBlocks: only the current pool members of claude, in pool order, no other tool', () => {
   const r = resolveCurrent(limits, '/c/swap', swap)
-  const bs = memberBlocks(st, limits, r)
-  expect(bs.map(b => b.tool)).toEqual(['claude', 'codex', 'kimi'])
-  expect(bs[0].members.map(m => [m.name, m.rows.map(x => x.name)])).toEqual([
-    ['workco', ['session', 'week']],
-    ['acme', ['session', 'week']],
-  ])
-  expect(bs[1].members.map(m => m.name)).toEqual(['workco', 'personal', 'acme', 'studioco'])
-  expect(memberBlocks(null, limits, r).map(b => b.tool)).toEqual(['codex', 'kimi'])
+  const bs = memberBlocks(swap, limits, r)
+  expect(bs.map(b => b.tool)).toEqual(['claude'])
+  expect(bs[0].members.map(m => m.name)).toEqual(r.members)
+  expect(memberBlocks(null, limits, r).map(b => b.tool)).toEqual(['claude'])
 })
 
 test('providerBlocks: codex pool totals aggregate week and month over members', () => {
@@ -180,14 +175,17 @@ test('providerBlocks: codex pool totals aggregate week and month over members', 
   expect(providerBlocks(lim.filter(l => !l.identity.swapPool || l.toolName === 'claude'), r)).toEqual([])
 })
 
-test('memberCards: side by side when wide, stacked when narrow, never over width', () => {
+test('memberCards: k per row, equal widths filling the width, never over width', () => {
   const row = (name: 'session' | 'week', active: number) => ({ name, active, resets: 'Oct 17' })
-  const blocks = [{ tool: 'claude', members: ['a', 'b', 'c', 'd'].map(n => ({ name: n, rows: [row('session', 40), row('week', 100)] })) }]
+  const blocks = [{ tool: 'claude', members: ['a', 'b', 'c', 'd', 'e', 'f'].map(n => ({ name: n, rows: [row('session', 40), row('week', 100)] })) }]
   const text = (cols: number) => memberCards(blocks, cols)[0]!.map(l => l.map(g => g.text).join(''))
-  const wide = text(160)
-  expect(wide).toHaveLength(1 + 2 * 3) // three cards per row, the fourth wraps
-  expect(wide[1]!.match(/[abc]/g)).toHaveLength(3)
+  const wide = text(160) // k = floor(163 / 37) = 4, card = floor(151 / 4) = 37
+  expect(wide).toHaveLength(2 * 3)
+  expect(wide[1]!.length).toBe(4 * 37 + 3 * 3)
+  expect(wide[0]!.match(/[a-f]/g)).toHaveLength(4)
+  expect(wide[4]!.length).toBe(2 * 37 + 3) // last row keeps the card width
   const narrow = text(60)
-  expect(narrow).toHaveLength(1 + 4 * 3)
+  expect(narrow).toHaveLength(6 * 3)
+  expect(narrow[1]!.length).toBe(60)
   for (const c of [160, 60, 30]) for (const l of text(c)) expect(l.length).toBeLessThanOrEqual(c)
 })
