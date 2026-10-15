@@ -27,12 +27,31 @@ const status = {
   })),
 }
 
-test('PromptHint shows the hint and both toggles in a pool', async ($, on) => {
+test('PromptHint shows the toggles row, then the hint, in a pool', async ($, on) => {
   const ui = await mountBand($, on, poolLimits, dir)
   expect(await ui.find({ type: 'Text', text: /\? for shortcuts/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', text: /Other providers/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', text: /Pool members/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /pool 12% used/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Other providers expands to a title plus session and week rows of equal bar width', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir)
+  await ui.press({ key: 'others' })
+  expect(await ui.find({ type: 'Text', text: /^codex$/ })).toBeDefined()
+  const bars = [await ui.find({ type: 'Text', text: /^session\s+\[/ }), await ui.find({ type: 'Text', text: /^week\s+\[/ })]
+  const widths = bars.map(b => (JSON.stringify(b).match(/\\u2588/g) ?? JSON.stringify(b).match(/█/g) ?? []).length)
+  expect(widths[0]).toBeGreaterThan(10)
+  expect(widths[0]).toBe(widths[1])
+  await ui.unmount()
+})
+
+test('a provider added to the limits appears in Other providers', async ($, on) => {
+  const extra = { ...entry('team-pool', '/x/swap', { swapPool: { active: 'a', accounts: ['a', 'b'] } }), toolName: 'grok' }
+  const ui = await mountBand($, on, [...poolLimits, extra], dir)
+  await ui.press({ key: 'others' })
+  expect(await ui.find({ type: 'Text', text: /^grok$/ })).toBeDefined()
   await ui.unmount()
 })
 

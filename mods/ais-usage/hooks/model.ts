@@ -122,12 +122,6 @@ const usageRow = (label: string, ws: Win[]): UsageRow => ({
   week: pick(ws, 'week')?.usedPercent,
 })
 
-/** Non-claude tools whose identity bears the pool's name (in a pool) or the current identity's name. */
-export const otherProviderRows = (limits: LimitsEntry[] | null, r: Resolved): UsageRow[] =>
-  (r.pool ? (limits ?? []).filter(l => l.identity.name === r.pool) : entriesFor(limits, r.current ?? ''))
-    .filter(l => l.toolName !== 'claude')
-    .map(l => usageRow(l.toolName, l.windows))
-
 /** Pool case: every claude member's rows. */
 export const memberRows = (status: SwapStatus | null, limits: LimitsEntry[] | null): UsageRow[] =>
   (status?.accounts ?? []).map(a => ({
@@ -243,6 +237,102 @@ export const bandRows = (r: Resolved, status: SwapStatus | null, limits: LimitsE
       const w = e && pick(e.windows, name)
       if (w) out.push({ name, active: w.usedPercent, resets: resetLabel(w.resetsAtMs ?? w.resetsAt, name) })
     }
+  }
+  return out
+}
+
+/** Plain texts of one row: pool text, current text, label, and the non-bar tail (resets, reporting). */
+export function rowText(r: Resolved, row: BandRow) {
+  const pool = row.pool
+  const left = pool?.pct === undefined ? undefined : Math.max(0, 100 - Math.round(pool.pct))
+  const poolText = pool ? (pool.pct === undefined ? 'pool n/a' : `pool ${pct(pool.pct)} used, ${left}% left`) : ''
+  const curText = pool ? `${r.current} ${pct(row.active)}` : pct(row.active)
+  const labelLen = pool ? poolText.length + 5 + curText.length : curText.length
+  const resets = row.resets ? `  resets ${row.resets}` : ''
+  const reporting = pool && pool.reporting < pool.total ? ` (${pool.reporting}/${pool.total} reporting)` : ''
+  return { pool, poolText, curText, labelLen, resets, reporting }
+}
+
+export const NAME_COL = 8
+const MARGIN = 3 // safety so a row never wraps
+
+/** Bar width shared by every row: the columns left after the longest row's non-bar text. */
+export function barWidth(r: Resolved, rows: BandRow[], cols: number): number {
+  const fixed = Math.max(
+    ...rows.map(row => {
+      const t = rowText(r, row)
+      return NAME_COL + 2 + 1 + t.labelLen + t.resets.length + t.reporting.length
+    }),
+  )
+  return Math.max(10, cols - MARGIN - fixed)
+}
+
+/** Longest label among `rows`; shorter ones are right-padded to it. */
+export const labelPad = (r: Resolved, rows: BandRow[]): number =>
+  Math.max(...rows.map(row => rowText(r, row).labelLen))
+
+export type Seg = { text: string; color?: Tone | 'blue' | 'cyan' | 'gray'; dim?: boolean }
+
+/** One band row as coloured segments; `width` is the bar width, `pad` the longest label. */
+export function rowSegments(r: Resolved, row: BandRow, width: number, pad = 0): Seg[] {
+  const t = rowText(r, row)
+  const pool = t.pool
+  const body: Seg[] = pool
+    ? twoToneBar(row.active, pool.pct, width).map(s => ({
+        text: '\u2588'.repeat(s.len),
+        color: ({ active: 'cyan', pool: 'blue', empty: 'gray' } as const)[s.kind],
+      }))
+    : [
+        { text: bar(row.active, width)[0], color: tone(row.active) },
+        { text: bar(row.active, width)[1], color: 'gray' },
+      ]
+  const label: Seg[] = pool
+    ? [
+        { text: t.poolText, color: tone(pool.pct ?? 0) },
+        { text: '  |  ' },
+        { text: t.curText, color: tone(row.active) },
+      ]
+    : [{ text: t.curText, color: tone(row.active) }]
+  return [
+    { text: row.name.padEnd(NAME_COL) + '[' },
+    ...body,
+    { text: '] ' },
+    ...label,
+    { text: ' '.repeat(Math.max(0, pad - t.labelLen)) },
+    { text: t.resets, dim: true },
+    { text: t.reporting, dim: true },
+  ].filter(g => g.text)
+}
+
+export type ProviderBlock = { tool: string; rows: BandRow[] }
+
+/** Per non-claude tool of the pool (or of the current identity): session and week rows; no rows when it reports no windows. */
+export const providerBlocks = (limits: LimitsEntry[] | null, r: Resolved): ProviderBlock[] => {
+  const all = limits ?? []
+  const tools = [...new Set(all.map(l => l.toolName))].filter(t => t !== 'claude').sort()
+  const out: ProviderBlock[] = []
+  for (const tool of tools) {
+    const ofTool = all.filter(l => l.toolName === tool)
+    const members = r.pool ? ofTool.filter(l => !l.identity.swapPool && r.members?.includes(l.identity.name)) : []
+    const act = r.pool
+      ? (members.find(l => l.identity.name === r.current) ?? ofTool.find(l => l.identity.name === r.pool))
+      : ofTool.find(l => l.identity.name === r.current && !l.identity.swapPool)
+    if (!act && !members.length) continue
+    const rows: BandRow[] = []
+    for (const name of ['session', 'week'] as const) {
+      const w = act && pick(act.windows, name)
+      if (!w) continue
+      const vals = members.flatMap(l => pick(l.windows, name)?.usedPercent ?? [])
+      rows.push({
+        name,
+        active: w.usedPercent,
+        resets: resetLabel(w.resetsAtMs ?? w.resetsAt, name),
+        pool: r.pool
+          ? { pct: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : undefined, reporting: vals.length, total: members.length }
+          : undefined,
+      })
+    }
+    out.push({ tool, rows })
   }
   return out
 }
