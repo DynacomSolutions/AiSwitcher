@@ -21,7 +21,6 @@ import {
   switchNotice,
   tone,
   totals,
-  twoToneBar,
 } from './model'
 import type { UsageRow } from './model'
 
@@ -48,6 +47,9 @@ export const register: Register = on => {
   let refreshHandle: (() => Promise<void>) | undefined
 
   on('session.start', async ($, e, next) => {
+    // Clears a status left by an older loaded version after /reload-plugins.
+    $.ui.status(undefined)
+
     const run = async (args: string[], timeoutMs: number) => {
       try {
         return await $.process.run(['ais', ...args], { timeoutMs })
@@ -127,31 +129,14 @@ export const register: Register = on => {
     return { text: 'AIS usage pane opened.' }
   })
 
-  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
     const st = await read($, status)
     const lim = await read($, limits)
     const r = resolveCurrent(lim, await $.env.get('CLAUDE_CONFIG_DIR'), st)
-    const rows = bandRows(r, st, lim)
-    if (lim && !rows.length) return next(e)
+    if (!lim || !bandRows(r, st, lim).length) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
-    const cols = e.viewport?.columns ?? 80
-    const fill = { active: 'cyan', pool: 'blue', empty: 'gray' } as const
-    const block = '\u2588'
-
-    // Limits not in yet: show the band at once with an empty bar.
-    if (!lim) {
-      return (
-        <Box flexDirection="column">
-          <Text dimColor>{e.props.hint}</Text>
-          {['session', 'week'].map(name => (
-            <Text key={name}>
-              {name.padEnd(8)}[<Text color="gray">{block.repeat(20)}</Text>] <Text dimColor>loading...</Text>
-            </Text>
-          ))}
-        </Box>
-      )
-    }
 
     const isOthers = await read($, othersOpen)
     const isMembers = await read($, membersOpen)
@@ -172,48 +157,7 @@ export const register: Register = on => {
     )
 
     return (
-      <Box flexDirection="column">
-        <Text dimColor>{e.props.hint}</Text>
-        {r.pool && (
-          <Text dimColor>
-            <Text color="blue">{block}</Text> {r.pool} &gt; <Text color="cyan">{block}</Text> {r.current}
-          </Text>
-        )}
-        {rows.map(row => {
-          const pool = row.pool
-          const left = pool?.pct === undefined ? undefined : Math.max(0, 100 - Math.round(pool.pct))
-          const label = pool
-            ? `${pool.pct === undefined ? 'pool n/a' : `pool ${pct(pool.pct)} used, ${left}% left`}  |  ${r.current} ${pct(row.active)}`
-            : pct(row.active)
-          const width = Math.min(40, Math.max(10, cols - 12 - label.length - (row.resets.length + 9) - (pool ? 16 : 0)))
-          return (
-            <Text key={row.name}>
-              {row.name.padEnd(8)}[
-              {pool ? (
-                twoToneBar(row.active, pool.pct, width).map((s, i) => (
-                  <Text key={i} color={fill[s.kind]}>
-                    {block.repeat(s.len)}
-                  </Text>
-                ))
-              ) : (
-                <Text>
-                  <Text color={tone(row.active)}>{bar(row.active, width)[0]}</Text>
-                  <Text color="gray">{bar(row.active, width)[1]}</Text>
-                </Text>
-              )}
-              ]{' '}
-              {pool ? (
-                <Text>
-                  <Text color={tone(pool.pct ?? 0)}>{label.split('  |  ')[0]}</Text>  |  <Text color={tone(row.active)}>{r.current} {pct(row.active)}</Text>
-                </Text>
-              ) : (
-                <Text color={tone(row.active)}>{label}</Text>
-              )}
-              {row.resets ? <Text dimColor>  resets {row.resets}</Text> : null}
-              {pool && pool.reporting < pool.total ? <Text dimColor> ({pool.reporting}/{pool.total} reporting)</Text> : null}
-            </Text>
-          )
-        })}
+      <Box flexDirection="column" width={e.props.bodyColumns}>
         <Button key="others" plain onPress={() => update($, othersOpen, v => !v)}>
           {isOthers ? '▾' : '▸'} Other providers
         </Button>

@@ -20,6 +20,7 @@ import { runHerdrCommand } from "./herdr.ts";
 import { runTuiCommand } from "./tui.ts";
 import { runClaudeSwapCommand } from "./claude-swap/dispatch.ts";
 import { runSwapCommand } from "./swap/dispatch.ts";
+import { runStatuslineCommand } from "./statusline.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
  * and `unretire` are excluded: a sync merging the remote registry while the
@@ -130,6 +131,9 @@ export async function runCli(argv: string[]): Promise<void> {
         await runSwapCommand(tool, toolRest, flags);
         break;
       }
+      case "statusline":
+        // Raw argv: --wrap takes a free-form command that parseArgs would mangle.
+        return await runStatuslineCommand(argv.slice(1));
       case "memory":
         await runMemoryCommand(rest, flags);
         break;
