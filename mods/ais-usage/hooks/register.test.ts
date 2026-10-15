@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 const dir = '/c/swap'
+const HINT = { hint: '? for shortcuts', isDraft: false, isWorking: false }
 const win = (category: string, usedPercent: number) => ({ label: category, category, usedPercent })
 const entry = (name: string, configDir: string, extra = {}) => ({
   toolName: 'claude',
@@ -26,27 +27,20 @@ const status = {
   })),
 }
 
-test('AbovePrompt draws only the toggles, not the bars', async ($, on) => {
-  mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h' })
-  const clock = mock.clock(on)
-  mock.store(on)
-  on('session.start', ($$, e) => ({ cwd: e.cwd }))
-  on('command.register', () => ({ value: { command: 'ais-usage' } }))
-  on('process.run', ($$, e) => {
-    const out = e.argv.includes('limits') ? limits : status
-    return { value: { exitCode: 0, stdout: JSON.stringify(out), stderr: '' } } as never
-  })
-  await $.session.start?.({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
-  await clock.advance(1)
-  const ui = await $.ui.mount({
-    plugin: 'ais-usage',
-    surface: 'terminal',
-    component: 'AbovePrompt',
-    props: { hasSurvey: false, bodyColumns: 80 },
-  } as never)
+test('PromptHint shows the hint and both toggles in a pool', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir)
+  expect(await ui.find({ type: 'Text', text: /\? for shortcuts/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', text: /Other providers/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /Pool members/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /pool 12% used/ })).toBeUndefined()
   await ui.unmount()
+})
+
+test('nothing renders for AbovePrompt', async ($, on) => {
+  await mountBand($, on, poolLimits, dir)
+  await expect(
+    $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 80 } } as never),
+  ).rejects.toThrow(/no implementation for ui.render/)
 })
 
 const mountBand = async ($: any, on: any, lims: unknown[], cfg: string) => {
@@ -64,8 +58,8 @@ const mountBand = async ($: any, on: any, lims: unknown[], cfg: string) => {
   return $.ui.mount({
     plugin: 'ais-usage',
     surface: 'terminal',
-    component: 'AbovePrompt',
-    props: { hasSurvey: false, bodyColumns: 80 },
+    component: 'PromptHint',
+    props: HINT,
   } as never)
 }
 const poolLimits = [...limits, { ...entry('a', '/x/a'), toolName: 'codex' }, { ...entry('team-pool', '/x/swap', { swapPool: { active: 'a', accounts: ['a', 'b'] } }), toolName: 'codex' }]
@@ -99,7 +93,7 @@ test('Pool members button is hidden outside a pool', async ($, on) => {
   await ui.unmount()
 })
 
-test('AbovePrompt passes through when there are no rows', async ($, on) => {
+test('PromptHint passes through when there are no rows', async ($, on) => {
   mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h' })
   const clock = mock.clock(on)
   mock.store(on)
@@ -122,13 +116,6 @@ test('AbovePrompt passes through when there are no rows', async ($, on) => {
   ).rejects.toThrow(/no implementation for ui.render/)
 })
 
-test('AbovePrompt passes through while a survey is shown', async ($, on) => {
-  mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h' })
-  await expect(
-    $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: true, bodyColumns: 80 } } as never),
-  ).rejects.toThrow(/no implementation for ui.render/)
-})
-
 test('a member added to the pool appears at the next refresh, no reload', async ($, on) => {
   mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h' })
   const clock = mock.clock(on)
@@ -147,7 +134,7 @@ test('a member added to the pool appears at the next refresh, no reload', async 
   })
   await $.session.start?.({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
   await clock.advance(1)
-  const ui = await $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 80 } } as never)
+  const ui = await $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'PromptHint', props: HINT } as never)
   await ui.press({ key: 'members' })
   expect(await ui.find({ type: 'Text', text: /^\s*c\s+5h/ })).toBeUndefined()
   members = ['a', 'b', 'c']

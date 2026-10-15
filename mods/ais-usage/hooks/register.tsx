@@ -129,8 +129,7 @@ export const register: Register = on => {
     return { text: 'AIS usage pane opened.' }
   })
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const st = await read($, status)
     const lim = await read($, limits)
     const r = resolveCurrent(lim, await $.env.get('CLAUDE_CONFIG_DIR'), st)
@@ -157,16 +156,21 @@ export const register: Register = on => {
     )
 
     return (
-      <Box flexDirection="column" width={e.props.bodyColumns}>
-        <Button key="others" plain onPress={() => update($, othersOpen, v => !v)}>
-          {isOthers ? '▾' : '▸'} Other providers
-        </Button>
-        {isOthers && otherProviderRows(lim, r).map(u => usageLine(u, `o-${u.label}`))}
-        {r.kind === 'pool' && (
-          <Button key="members" plain onPress={() => update($, membersOpen, v => !v)}>
-            {isMembers ? '▾' : '▸'} Pool members
+      <Box flexDirection="column" alignSelf="flex-start">
+        <Box flexDirection="row">
+          <Text dimColor>{e.props.hint}</Text>
+          <Text>{'  '}</Text>
+          <Button key="others" plain onPress={() => update($, othersOpen, v => !v)}>
+            {isOthers ? '▾' : '▸'} Other providers
           </Button>
-        )}
+          {r.kind === 'pool' && <Text>{'  '}</Text>}
+          {r.kind === 'pool' && (
+            <Button key="members" plain onPress={() => update($, membersOpen, v => !v)}>
+              {isMembers ? '▾' : '▸'} Pool members
+            </Button>
+          )}
+        </Box>
+        {isOthers && otherProviderRows(lim, r).map(u => usageLine(u, `o-${u.label}`))}
         {r.kind === 'pool' && isMembers && memberRows(st, lim).map(u => usageLine(u, `m-${u.label}`))}
         {r.kind === 'pool' &&
           isMembers &&
