@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, otherProviderRows, memberRows, memberProviderRows } from './model'
+import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberRows, memberProviderRows } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -128,16 +128,13 @@ test('switchNotice: first observation, no change, change', () => {
   )
 })
 
-test('otherProviderRows: identity name, or pool name in a pool', () => {
+test('providerBlocks: session and week per tool, none for unknown identity', () => {
   const acme = resolveCurrent(limits, '/c/acme', null)
-  expect(otherProviderRows(limits, acme)).toEqual([
-    { label: 'codex', five: 4, week: 1 },
-    { label: 'kimi', five: 4, week: 1 },
+  expect(providerBlocks(limits, acme).map(g => [g.tool, g.rows.map(x => x.name)])).toEqual([
+    ['codex', ['session', 'week']],
+    ['kimi', ['session', 'week']],
   ])
-  const withPool = [...limits, live('codex', 'workco-team', '/x/swap', true)]
-  const pool = resolveCurrent(withPool, '/c/swap', swap)
-  expect(otherProviderRows(withPool, pool)).toEqual([{ label: 'codex', five: 4, week: 1 }])
-  expect(otherProviderRows(limits, resolveCurrent(limits, '/nope', null))).toEqual([])
+  expect(providerBlocks(limits, resolveCurrent(limits, '/nope', null))).toEqual([])
 })
 
 test('memberRows and memberProviderRows', () => {

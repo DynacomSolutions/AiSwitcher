@@ -10,10 +10,13 @@ import {
   memberProviderRows,
   memberRows,
   memberWindow,
-  otherProviderRows,
   others,
   parseJson,
   poolProviders,
+  barWidth,
+  labelPad,
+  providerBlocks,
+  rowSegments,
   pct,
   resolveCurrent,
   shares,
@@ -137,6 +140,7 @@ export const register: Register = on => {
 
     const { Box, Text, Button } = $.ui.resolve(e)
 
+    const cols = e.viewport?.columns ?? 80
     const isOthers = await read($, othersOpen)
     const isMembers = await read($, membersOpen)
     const mini = (p: number | undefined) =>
@@ -158,8 +162,6 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" alignSelf="flex-start">
         <Box flexDirection="row">
-          <Text dimColor>{e.props.hint}</Text>
-          <Text>{'  '}</Text>
           <Button key="others" plain onPress={() => update($, othersOpen, v => !v)}>
             {isOthers ? '▾' : '▸'} Other providers
           </Button>
@@ -170,7 +172,30 @@ export const register: Register = on => {
             </Button>
           )}
         </Box>
-        {isOthers && otherProviderRows(lim, r).map(u => usageLine(u, `o-${u.label}`))}
+        <Text dimColor>{e.props.hint}</Text>
+        {isOthers &&
+          providerBlocks(lim, r).map(g => {
+            const width = g.rows.length ? barWidth(r, g.rows, cols) : 0
+            const pad = g.rows.length ? labelPad(r, g.rows) : 0
+            return (
+              <Box key={`o-${g.tool}`} flexDirection="column">
+                <Text bold>{g.tool}</Text>
+                {g.rows.length ? (
+                  g.rows.map(row => (
+                    <Text key={row.name}>
+                      {rowSegments(r, row, width, pad).map((s, i) => (
+                        <Text key={i} color={s.color} dimColor={s.dim}>
+                          {s.text}
+                        </Text>
+                      ))}
+                    </Text>
+                  ))
+                ) : (
+                  <Text dimColor>n/a</Text>
+                )}
+              </Box>
+            )
+          })}
         {r.kind === 'pool' && isMembers && memberRows(st, lim).map(u => usageLine(u, `m-${u.label}`))}
         {r.kind === 'pool' &&
           isMembers &&

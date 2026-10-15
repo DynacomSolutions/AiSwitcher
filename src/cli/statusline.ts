@@ -6,11 +6,10 @@ import { aisCacheDir } from "../shared/ais-home.ts";
 import type { Identity } from "../identities/types.ts";
 import {
   bandRows,
-  bar,
-  pct,
+  barWidth,
+  labelPad,
   resolveCurrent,
-  tone,
-  twoToneBar,
+  rowSegments,
 } from "../../mods/ais-usage/hooks/model.ts";
 import type { BandRow, Resolved } from "../../mods/ais-usage/hooks/model.ts";
 import type { LimitsEntry } from "../../mods/ais-usage/types";
@@ -20,46 +19,11 @@ const paint = (code: number, s: string) => (s ? `${ESC}${code}m${s}${ESC}0m` : "
 const CODE = { red: 31, green: 32, yellow: 33, blue: 34, cyan: 36, gray: 90, dim: 2 } as const;
 const BLOCK = "█";
 
-/** Plain texts of one row: pool text, current text, label, and the non-bar tail (resets, reporting). */
-function rowText(r: Resolved, row: BandRow) {
-  const pool = row.pool;
-  const left = pool?.pct === undefined ? undefined : Math.max(0, 100 - Math.round(pool.pct));
-  const poolText = pool ? (pool.pct === undefined ? "pool n/a" : `pool ${pct(pool.pct)} used, ${left}% left`) : "";
-  const curText = pool ? `${r.current} ${pct(row.active)}` : pct(row.active);
-  const labelLen = pool ? poolText.length + 5 + curText.length : curText.length;
-  const resets = row.resets ? `  resets ${row.resets}` : "";
-  const reporting = pool && pool.reporting < pool.total ? ` (${pool.reporting}/${pool.total} reporting)` : "";
-  return { pool, poolText, curText, labelLen, resets, reporting };
-}
-
-const NAME_COL = 8;
-const MARGIN = 3; // safety so a row never wraps
-
-/** Bar width shared by every row: the columns left after the longest row's non-bar text. */
-export function barWidth(r: Resolved, rows: BandRow[], cols: number): number {
-  const fixed = Math.max(...rows.map((row) => {
-    const t = rowText(r, row);
-    return NAME_COL + 2 + 1 + t.labelLen + t.resets.length + t.reporting.length;
-  }));
-  return Math.max(10, cols - MARGIN - fixed);
-}
-
 /** One band row as an ANSI line; `width` is the bar width, `labelPad` the longest label (shorter ones are right-padded). */
-export function renderRow(r: Resolved, row: BandRow, width: number, labelPad = 0): string {
-  const t = rowText(r, row);
-  const pool = t.pool;
-  const body = pool
-    ? twoToneBar(row.active, pool.pct, width)
-        .map((s) => paint({ active: CODE.cyan, pool: CODE.blue, empty: CODE.gray }[s.kind], BLOCK.repeat(s.len)))
-        .join("")
-    : paint(CODE[tone(row.active)], bar(row.active, width)[0]) + paint(CODE.gray, bar(row.active, width)[1]);
-  const label = pool
-    ? `${paint(CODE[tone(pool.pct ?? 0)], t.poolText)}  |  ${paint(CODE[tone(row.active)], t.curText)}`
-    : paint(CODE[tone(row.active)], t.curText);
-  const pad = " ".repeat(Math.max(0, labelPad - t.labelLen));
-  const resets = t.resets ? paint(CODE.dim, t.resets) : "";
-  const reporting = t.reporting ? paint(CODE.dim, t.reporting) : "";
-  return `${row.name.padEnd(NAME_COL)}[${body}] ${label}${pad}${resets}${reporting}`;
+export function renderRow(r: Resolved, row: BandRow, width: number, pad = 0): string {
+  return rowSegments(r, row, width, pad)
+    .map((g) => (g.dim ? paint(CODE.dim, g.text) : g.color ? paint(CODE[g.color], g.text) : g.text))
+    .join("");
 }
 
 export interface StatuslineDeps {
@@ -119,8 +83,8 @@ export async function usageBars(stdin: string, env: Record<string, string | unde
       ? [paint(CODE.dim, `${paint(CODE.blue, BLOCK)} ${r.pool} > ${paint(CODE.cyan, BLOCK)} ${r.current}`)]
       : [];
     const width = barWidth(r, rows, cols);
-    const labelPad = Math.max(...rows.map((row) => rowText(r, row).labelLen));
-    return [...head, ...rows.map((row) => renderRow(r, row, width, labelPad))].join("\n") + "\n";
+    const pad = labelPad(r, rows);
+    return [...head, ...rows.map((row) => renderRow(r, row, width, pad))].join("\n") + "\n";
   } catch {
     return "";
   }
