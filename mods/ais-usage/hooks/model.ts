@@ -114,26 +114,6 @@ export const memberWindow = (
   return w ? { pct: w.usedPercent, resetsAt: w.resetsAtMs ?? w.resetsAt } : undefined
 }
 
-export type UsageRow = { label: string; five?: number; week?: number }
-
-const usageRow = (label: string, ws: Win[]): UsageRow => ({
-  label,
-  five: pick(ws, 'session')?.usedPercent,
-  week: pick(ws, 'week')?.usedPercent,
-})
-
-/** Pool case: every claude member's rows. */
-export const memberRows = (status: SwapStatus | null, limits: LimitsEntry[] | null): UsageRow[] =>
-  (status?.accounts ?? []).map(a => ({
-    label: a.name,
-    five: memberWindow(status, limits, a.name, 'fiveHour')?.pct,
-    week: memberWindow(status, limits, a.name, 'sevenDay')?.pct,
-  }))
-
-/** Pool case: per non-claude tool, the rows of each pool member's identity. */
-export const memberProviderRows = (limits: LimitsEntry[] | null, r: Resolved) =>
-  poolProviders(limits, r).map(g => ({ tool: g.tool, rows: g.rows.map(l => usageRow(l.identity.name, l.windows)) }))
-
 export type ProviderGroup = { tool: string; rows: LimitsEntry[] }
 
 /** Pool case: per non-claude tool, the identities that are members of the pool. */
@@ -342,3 +322,37 @@ export const switchNotice = (prev: string, status: SwapStatus | null): string | 
   status && prev && prev !== status.active
     ? `AIS pool ${status.pool} switched account from ${prev} to ${status.active} since your last turn; limits shown now refer to ${status.active}.`
     : undefined
+
+export type MemberBlock = { tool: string; members: { name: string; rows: BandRow[] }[] }
+
+const memberBand = (name: 'session' | 'week', pctUsed: number, at: string | number | undefined): BandRow => ({
+  name,
+  active: pctUsed,
+  resets: resetLabel(at, name),
+})
+
+/** Pool case: per tool (claude first, then the other providers), each member's own session and week rows; a member without windows has no rows. */
+export const memberBlocks = (status: SwapStatus | null, limits: LimitsEntry[] | null, r: Resolved): MemberBlock[] => {
+  const claude = (status?.accounts ?? []).map(a => ({
+    name: a.name,
+    rows: ([['session', 'fiveHour'], ['week', 'sevenDay']] as const).flatMap(([n, k]) => {
+      const w = memberWindow(status, limits, a.name, k)
+      return w ? [memberBand(n, w.pct, w.resetsAt)] : []
+    }),
+  }))
+  const out: MemberBlock[] = claude.length ? [{ tool: 'claude', members: claude }] : []
+  for (const g of poolProviders(limits, r)) {
+    const names = [...new Set(g.rows.map(l => l.identity.name))]
+    out.push({
+      tool: g.tool,
+      members: names.map(name => ({
+        name,
+        rows: (['session', 'week'] as const).flatMap(n => {
+          const w = g.rows.filter(l => l.identity.name === name).map(l => pick(l.windows, n)).find(Boolean)
+          return w ? [memberBand(n, w.usedPercent, w.resetsAtMs ?? w.resetsAt)] : []
+        }),
+      })),
+    })
+  }
+  return out
+}

@@ -4,11 +4,9 @@ import type { Register } from 'claude-code'
 import type { LimitsEntry, SwapStatus, SwapUsage } from '../types'
 import {
   bandRows,
-  bar,
   entriesFor,
   humanise,
-  memberProviderRows,
-  memberRows,
+  memberBlocks,
   memberWindow,
   others,
   parseJson,
@@ -25,7 +23,7 @@ import {
   tone,
   totals,
 } from './model'
-import type { UsageRow } from './model'
+import type { BandRow } from './model'
 
 const PANE = 'ais-usage'
 
@@ -143,19 +141,13 @@ export const register: Register = on => {
     const cols = e.viewport?.columns ?? 80
     const isOthers = await read($, othersOpen)
     const isMembers = await read($, membersOpen)
-    const mini = (p: number | undefined) =>
-      p === undefined ? (
-        <Text dimColor>n/a</Text>
-      ) : (
-        <Text>
-          <Text color={tone(p)}>{bar(p, 10)[0]}</Text>
-          <Text color="gray">{bar(p, 10)[1]}</Text> {pct(p)}
-        </Text>
-      )
-    const usageLine = (u: UsageRow, key: string) => (
-      <Text key={key}>
-        {'  '}
-        {u.label.padEnd(14)}5h {mini(u.five)}  wk {mini(u.week)}
+    const rowLine = (row: BandRow, width: number, pad: number) => (
+      <Text key={row.name}>
+        {rowSegments(r, row, width, pad).map((s, i) => (
+          <Text key={i} color={s.color} dimColor={s.dim}>
+            {s.text}
+          </Text>
+        ))}
       </Text>
     )
 
@@ -181,30 +173,31 @@ export const register: Register = on => {
               <Box key={`o-${g.tool}`} flexDirection="column">
                 <Text bold>{g.tool}</Text>
                 {g.rows.length ? (
-                  g.rows.map(row => (
-                    <Text key={row.name}>
-                      {rowSegments(r, row, width, pad).map((s, i) => (
-                        <Text key={i} color={s.color} dimColor={s.dim}>
-                          {s.text}
-                        </Text>
-                      ))}
-                    </Text>
-                  ))
+                  g.rows.map(row => rowLine(row, width, pad))
                 ) : (
                   <Text dimColor>n/a</Text>
                 )}
               </Box>
             )
           })}
-        {r.kind === 'pool' && isMembers && memberRows(st, lim).map(u => usageLine(u, `m-${u.label}`))}
         {r.kind === 'pool' &&
           isMembers &&
-          memberProviderRows(lim, r).map(g => (
-            <Box key={`g-${g.tool}`} flexDirection="column">
-              <Text dimColor>{g.tool}</Text>
-              {g.rows.map(u => usageLine(u, `${g.tool}-${u.label}`))}
-            </Box>
-          ))}
+          memberBlocks(st, lim, r).map(g => {
+            const all = g.members.flatMap(m => m.rows)
+            const width = all.length ? barWidth(r, all, cols) : 0
+            const pad = all.length ? labelPad(r, all) : 0
+            return (
+              <Box key={`m-${g.tool}`} flexDirection="column">
+                <Text bold>{g.tool}</Text>
+                {g.members.map(m => (
+                  <Box key={m.name} flexDirection="column">
+                    <Text dimColor>{m.name}</Text>
+                    {m.rows.length ? m.rows.map(row => rowLine(row, width, pad)) : <Text dimColor>n/a</Text>}
+                  </Box>
+                ))}
+              </Box>
+            )
+          })}
       </Box>
     )
   })

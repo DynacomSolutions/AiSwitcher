@@ -62,7 +62,7 @@ test('nothing renders for AbovePrompt', async ($, on) => {
   ).rejects.toThrow(/no implementation for ui.render/)
 })
 
-const mountBand = async ($: any, on: any, lims: unknown[], cfg: string) => {
+const mountBand = async ($: any, on: any, lims: unknown[], cfg: string, columns?: number) => {
   mock.env(on, { CLAUDE_CONFIG_DIR: cfg, HOME: '/h' })
   const clock = mock.clock(on)
   mock.store(on)
@@ -79,6 +79,7 @@ const mountBand = async ($: any, on: any, lims: unknown[], cfg: string) => {
     surface: 'terminal',
     component: 'PromptHint',
     props: HINT,
+    ...(columns ? { viewport: { columns, rows: 40 } } : {}),
   } as never)
 }
 const poolLimits = [...limits, { ...entry('a', '/x/a'), toolName: 'codex' }, { ...entry('team-pool', '/x/swap', { swapPool: { active: 'a', accounts: ['a', 'b'] } }), toolName: 'codex' }]
@@ -96,13 +97,44 @@ test('Other providers toggles open and closed', async ($, on) => {
 
 test('Pool members toggles open and closed in a pool', async ($, on) => {
   const ui = await mountBand($, on, poolLimits, dir)
-  expect(await ui.find({ type: 'Button', text: /Pool members/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^\s*b\s+5h/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeUndefined()
   await ui.press({ key: 'members' })
-  expect(await ui.find({ type: 'Text', text: /^\s*b\s+5h/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeDefined()
   await ui.press({ key: 'members' })
-  expect(await ui.find({ type: 'Text', text: /^\s*b\s+5h/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeUndefined()
   await ui.unmount()
+})
+
+const blocks = (n: { text?: string }) => (n.text?.match(/█/g) ?? []).length
+
+test('Pool members shows title, member name and two rows of equal bar width', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir)
+  await ui.press({ key: 'members' })
+  expect(await ui.find({ type: 'Text', text: /^claude$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeDefined()
+  const rows = await ui.findAll({ type: 'Text', text: /^(session|week)\s+\[/ })
+  const w = rows.filter((r: any) => /%/.test(r.text)).slice(0, 2).map(blocks)
+  expect(w[0]).toBeGreaterThan(10)
+  expect(new Set(w).size).toBe(1)
+  await ui.unmount()
+})
+
+const sessionBar = async ($: any, on: any, columns: number) => {
+  const ui = await mountBand($, on, poolLimits, dir, columns)
+  await ui.press({ key: 'members' })
+  const row = await ui.find({ type: 'Text', text: /^session\s+\[/ })
+  await ui.unmount()
+  return blocks(row)
+}
+let narrow = 0
+
+test('Pool members bar at 80 columns', async ($, on) => {
+  narrow = await sessionBar($, on, 80)
+  expect(narrow).toBeGreaterThan(10)
+})
+
+test('Pool members bar is wider at 200 columns than at 80', async ($, on) => {
+  expect(await sessionBar($, on, 200)).toBeGreaterThan(narrow)
 })
 
 test('Pool members button is hidden outside a pool', async ($, on) => {
@@ -155,9 +187,9 @@ test('a member added to the pool appears at the next refresh, no reload', async 
   await clock.advance(1)
   const ui = await $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'PromptHint', props: HINT } as never)
   await ui.press({ key: 'members' })
-  expect(await ui.find({ type: 'Text', text: /^\s*c\s+5h/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^c$/ })).toBeUndefined()
   members = ['a', 'b', 'c']
   await clock.advance(300_000)
-  expect(await ui.find({ type: 'Text', text: /^\s*c\s+5h/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^c$/ })).toBeDefined()
   await ui.unmount()
 })
