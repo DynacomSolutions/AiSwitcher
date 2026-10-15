@@ -177,10 +177,13 @@ export const twoToneBar = (activePct: number, poolPct: number | undefined, width
 }
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
+/** Window rows a band can show; codex plans report `week` or `month`. */
+export type RowName = 'session' | 'week' | 'month'
+const ROW_NAMES: readonly RowName[] = ['session', 'week', 'month']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 /** Reset moment as `HH:MM` (session) or `Mon D` (week); raw text when unparseable. */
-export const resetLabel = (at: string | number | undefined, kind: 'session' | 'week'): string => {
+export const resetLabel = (at: string | number | undefined, kind: RowName): string => {
   if (at === undefined || at === '') return ''
   const d = new Date(at)
   if (Number.isNaN(d.getTime())) return String(at)
@@ -188,7 +191,7 @@ export const resetLabel = (at: string | number | undefined, kind: 'session' | 'w
 }
 
 export type BandRow = {
-  name: 'session' | 'week'
+  name: RowName
   active: number
   resets: string
   /** Pool case only. */
@@ -294,12 +297,16 @@ export const providerBlocks = (limits: LimitsEntry[] | null, r: Resolved): Provi
   for (const tool of tools) {
     const ofTool = all.filter(l => l.toolName === tool)
     const members = r.pool ? ofTool.filter(l => !l.identity.swapPool && r.members?.includes(l.identity.name)) : []
+    // A pool entry of this tool mirrors its own active member (empty windows); take that member's windows.
+    const mirror = ofTool.find(l => l.identity.swapPool && l.identity.name === r.pool)?.identity.swapPool?.active
     const act = r.pool
-      ? (members.find(l => l.identity.name === r.current) ?? ofTool.find(l => l.identity.name === r.pool))
+      ? (members.find(l => l.identity.name === r.current) ??
+        members.find(l => l.identity.name === mirror) ??
+        ofTool.find(l => l.identity.name === r.pool))
       : ofTool.find(l => l.identity.name === r.current && !l.identity.swapPool)
     if (!act && !members.length) continue
     const rows: BandRow[] = []
-    for (const name of ['session', 'week'] as const) {
+    for (const name of ROW_NAMES) {
       const w = act && pick(act.windows, name)
       if (!w) continue
       const vals = members.flatMap(l => pick(l.windows, name)?.usedPercent ?? [])
@@ -325,7 +332,7 @@ export const switchNotice = (prev: string, status: SwapStatus | null): string | 
 
 export type MemberBlock = { tool: string; members: { name: string; rows: BandRow[] }[] }
 
-const memberBand = (name: 'session' | 'week', pctUsed: number, at: string | number | undefined): BandRow => ({
+const memberBand = (name: RowName, pctUsed: number, at: string | number | undefined): BandRow => ({
   name,
   active: pctUsed,
   resets: resetLabel(at, name),
@@ -347,7 +354,7 @@ export const memberBlocks = (status: SwapStatus | null, limits: LimitsEntry[] | 
       tool: g.tool,
       members: names.map(name => ({
         name,
-        rows: (['session', 'week'] as const).flatMap(n => {
+        rows: ROW_NAMES.flatMap(n => {
           const w = g.rows.filter(l => l.identity.name === name).map(l => pick(l.windows, n)).find(Boolean)
           return w ? [memberBand(n, w.usedPercent, w.resetsAtMs ?? w.resetsAt)] : []
         }),

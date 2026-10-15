@@ -149,3 +149,38 @@ test('memberBlocks: claude first, then providers, per member rows', () => {
   expect(bs[1].members.map(m => m.name)).toEqual(['workco', 'personal', 'acme', 'studioco'])
   expect(memberBlocks(null, limits, r).map(b => b.tool)).toEqual(['codex', 'kimi'])
 })
+
+test('providerBlocks: codex pool named like the claude pool mirrors its active member', () => {
+  const cx = (name: string, category: string, usedPercent: number, extra: Partial<LimitsEntry> = {}): LimitsEntry => ({
+    toolName: 'codex',
+    identity: { name, configDir: `/x/${name}` },
+    windows: [{ label: category, category, usedPercent, resetsAtMs: 1792652277000 }],
+    status: 'live',
+    ...extra,
+  })
+  const members = ['alpha', 'personal', 'beta', 'gamma', 'delta', 'teamco']
+  const lim: LimitsEntry[] = [
+    live('claude', 'big-pool', '/c/bigpool', true),
+    cx('alpha', 'week', 10),
+    cx('personal', 'week', 20),
+    cx('beta', 'month', 32),
+    cx('gamma', 'month', 0),
+    cx('delta', 'month', 4),
+    cx('teamco', 'week', 30),
+    {
+      toolName: 'codex',
+      identity: { name: 'big-pool', configDir: '/x/pool', swapPool: { accounts: members, active: 'gamma' } },
+      windows: [],
+      status: 'unavailable',
+      error: 'mirrors active member gamma (not fetched)',
+    },
+  ]
+  lim[0]!.identity.swapPool = { accounts: members, active: 'alpha' }
+  const st = { pool: 'big-pool', active: 'gamma', auto: true, thresholdPercent: 90, accounts: [] } as SwapStatus
+  const r = resolveCurrent(lim, '/c/bigpool', st)
+  const codex = providerBlocks(lim, r).find(g => g.tool === 'codex')!
+  expect(codex.rows.map(x => [x.name, x.active, x.pool?.pct, x.pool?.reporting])).toEqual([['month', 0, 12, 3]])
+  // Current member differs from the mirrored one: the mirrored active member's windows are used.
+  const other = resolveCurrent(lim, '/c/bigpool', { ...st, active: 'nobody' })
+  expect(providerBlocks(lim, other).find(g => g.tool === 'codex')!.rows[0]!.active).toBe(0)
+})
