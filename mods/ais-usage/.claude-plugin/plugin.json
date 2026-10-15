@@ -1,6 +1,6 @@
 {
   "name": "ais-usage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AIS pool and identity usage pane",
   "types": "./types/index.d.ts",
   "author": {
