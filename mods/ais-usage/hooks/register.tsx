@@ -7,7 +7,10 @@ import {
   bar,
   entriesFor,
   humanise,
+  memberProviderRows,
+  memberRows,
   memberWindow,
+  otherProviderRows,
   others,
   parseJson,
   poolProviders,
@@ -15,12 +18,12 @@ import {
   resolveCurrent,
   shares,
   shortError,
-  statusLine,
   switchNotice,
   tone,
   totals,
   twoToneBar,
 } from './model'
+import type { UsageRow } from './model'
 
 const PANE = 'ais-usage'
 
@@ -28,6 +31,8 @@ const status = atom({ plugin: 'ais-usage', key: 'status' } as const, null)
 const usage = atom({ plugin: 'ais-usage', key: 'usage' } as const, null)
 const limits = atom({ plugin: 'ais-usage', key: 'limits' } as const, null)
 const expanded = atom({ plugin: 'ais-usage', key: 'expanded' } as const, [])
+const othersOpen = atom({ plugin: 'ais-usage', key: 'othersOpen' } as const, false)
+const membersOpen = atom({ plugin: 'ais-usage', key: 'membersOpen' } as const, false)
 const updatedAt = atom({ plugin: 'ais-usage', key: 'updatedAt' } as const, 0)
 const loading = atom({ plugin: 'ais-usage', key: 'loading' } as const, 0)
 const errors = atom({ plugin: 'ais-usage', key: 'errors' } as const, [])
@@ -71,19 +76,9 @@ export const register: Register = on => {
       return value
     }
 
-    const refreshStatusLine = async () => {
-      const r = resolveCurrent(
-        await read($, limits),
-        await $.env.get('CLAUDE_CONFIG_DIR'),
-        await read($, status),
-      )
-      await $.ui.status(statusLine(r, await read($, status), await read($, limits)))
-    }
-
     const refreshStatus = async () => {
       const v = await fetchJson<SwapStatus>('status', ['claude-swap', 'status', '--json', '--no-usage'], 20000)
       if (v) await update($, status, () => v)
-      await refreshStatusLine()
     }
     const refreshUsage = async () => {
       const v = await fetchJson<SwapUsage>('usage', ['claude-swap', 'usage', '--json'], 20000)
@@ -95,12 +90,10 @@ export const register: Register = on => {
       try {
         const v = await fetchJson<LimitsEntry[]>('limits', ['limits', '--json'], 60000)
         if (Array.isArray(v)) await update($, limits, () => v)
-        await refreshStatusLine()
       } finally {
         isLimitsBusy = false
       }
     }
-    // Limits first: it resolves the identity that the status line needs.
     const refreshAll = async () => {
       await Promise.all([refreshLimits(), refreshStatus(), refreshUsage()])
     }
@@ -134,15 +127,15 @@ export const register: Register = on => {
     return { text: 'AIS usage pane opened.' }
   })
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const st = await read($, status)
     const lim = await read($, limits)
     const r = resolveCurrent(lim, await $.env.get('CLAUDE_CONFIG_DIR'), st)
     const rows = bandRows(r, st, lim)
-    if (e.props.hasSurvey || (lim && !rows.length)) return next(e)
+    if (lim && !rows.length) return next(e)
 
-    const { Box, Text } = $.ui.resolve(e)
-    const cols = e.props.bodyColumns ?? e.viewport?.columns ?? 80
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const cols = e.viewport?.columns ?? 80
     const fill = { active: 'cyan', pool: 'blue', empty: 'gray' } as const
     const block = '\u2588'
 
@@ -150,7 +143,7 @@ export const register: Register = on => {
     if (!lim) {
       return (
         <Box flexDirection="column">
-          <Text> </Text>
+          <Text dimColor>{e.props.hint}</Text>
           {['session', 'week'].map(name => (
             <Text key={name}>
               {name.padEnd(8)}[<Text color="gray">{block.repeat(20)}</Text>] <Text dimColor>loading...</Text>
@@ -160,9 +153,27 @@ export const register: Register = on => {
       )
     }
 
+    const isOthers = await read($, othersOpen)
+    const isMembers = await read($, membersOpen)
+    const mini = (p: number | undefined) =>
+      p === undefined ? (
+        <Text dimColor>n/a</Text>
+      ) : (
+        <Text>
+          <Text color={tone(p)}>{bar(p, 10)[0]}</Text>
+          <Text color="gray">{bar(p, 10)[1]}</Text> {pct(p)}
+        </Text>
+      )
+    const usageLine = (u: UsageRow, key: string) => (
+      <Text key={key}>
+        {'  '}
+        {u.label.padEnd(14)}5h {mini(u.five)}  wk {mini(u.week)}
+      </Text>
+    )
+
     return (
       <Box flexDirection="column">
-        <Text> </Text>
+        <Text dimColor>{e.props.hint}</Text>
         {r.pool && (
           <Text dimColor>
             <Text color="blue">{block}</Text> {r.pool} &gt; <Text color="cyan">{block}</Text> {r.current}
@@ -185,10 +196,10 @@ export const register: Register = on => {
                   </Text>
                 ))
               ) : (
-                <>
+                <Text>
                   <Text color={tone(row.active)}>{bar(row.active, width)[0]}</Text>
                   <Text color="gray">{bar(row.active, width)[1]}</Text>
-                </>
+                </Text>
               )}
               ]{' '}
               {pool ? (
@@ -203,6 +214,24 @@ export const register: Register = on => {
             </Text>
           )
         })}
+        <Button key="others" plain onPress={() => update($, othersOpen, v => !v)}>
+          {isOthers ? '▾' : '▸'} Other providers
+        </Button>
+        {isOthers && otherProviderRows(lim, r).map(u => usageLine(u, `o-${u.label}`))}
+        {r.kind === 'pool' && (
+          <Button key="members" plain onPress={() => update($, membersOpen, v => !v)}>
+            {isMembers ? '▾' : '▸'} Pool members
+          </Button>
+        )}
+        {r.kind === 'pool' && isMembers && memberRows(st, lim).map(u => usageLine(u, `m-${u.label}`))}
+        {r.kind === 'pool' &&
+          isMembers &&
+          memberProviderRows(lim, r).map(g => (
+            <Box key={`g-${g.tool}`} flexDirection="column">
+              <Text dimColor>{g.tool}</Text>
+              {g.rows.map(u => usageLine(u, `${g.tool}-${u.label}`))}
+            </Box>
+          ))}
       </Box>
     )
   })

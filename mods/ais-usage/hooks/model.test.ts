@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, statusLine, switchNotice, others, entriesFor } from './model'
+import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, otherProviderRows, memberRows, memberProviderRows } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -39,7 +39,6 @@ test('pool resolution', async () => {
   expect(r.pool).toBe('workco-team')
   expect(r.current).toBe('workco')
   expect(entriesFor(limits, 'workco').map(l => l.toolName)).toContain('codex')
-  expect(statusLine(r, swap, limits)).toBe('workco-team > workco 5h 4% wk 1%')
   const g = poolProviders(limits, r)
   const names = (t: string) => g.find(x => x.tool === t)!.rows.map(l => l.identity.name).sort()
   expect(names('codex')).toEqual(['acme', 'personal', 'studioco', 'workco'])
@@ -50,7 +49,6 @@ test('pool resolution', async () => {
 test('non-pool and unknown', async () => {
   const r = resolveCurrent(limits, '/c/acme', null)
   expect(r.kind).toBe('identity')
-  expect(statusLine(r, null, limits)).toBe('acme 5h 4% wk 1%')
   expect(resolveCurrent(limits, '/nope', null).kind).toBe('unknown')
 })
 
@@ -128,4 +126,30 @@ test('switchNotice: first observation, no change, change', () => {
   expect(switchNotice('a', st)).toBe(
     'AIS pool p switched account from a to b since your last turn; limits shown now refer to b.',
   )
+})
+
+test('otherProviderRows: identity name, or pool name in a pool', () => {
+  const acme = resolveCurrent(limits, '/c/acme', null)
+  expect(otherProviderRows(limits, acme)).toEqual([
+    { label: 'codex', five: 4, week: 1 },
+    { label: 'kimi', five: 4, week: 1 },
+  ])
+  const withPool = [...limits, live('codex', 'workco-team', '/x/swap', true)]
+  const pool = resolveCurrent(withPool, '/c/swap', swap)
+  expect(otherProviderRows(withPool, pool)).toEqual([{ label: 'codex', five: 4, week: 1 }])
+  expect(otherProviderRows(limits, resolveCurrent(limits, '/nope', null))).toEqual([])
+})
+
+test('memberRows and memberProviderRows', () => {
+  const st = { ...swap, accounts: [swap.accounts[0], { name: 'acme', active: false, allowed: true }] } as unknown as SwapStatus
+  expect(memberRows(st, limits)).toEqual([
+    { label: 'workco', five: 4, week: 1 },
+    { label: 'acme', five: 4, week: 1 },
+  ])
+  expect(memberRows(null, limits)).toEqual([])
+  const r = resolveCurrent(limits, '/c/swap', swap)
+  expect(memberProviderRows(limits, r).map(g => [g.tool, g.rows.map(x => x.label)])).toEqual([
+    ['codex', ['workco', 'personal', 'acme', 'studioco']],
+    ['kimi', ['personal', 'acme']],
+  ])
 })

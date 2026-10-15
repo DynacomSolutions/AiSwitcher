@@ -114,29 +114,31 @@ export const memberWindow = (
   return w ? { pct: w.usedPercent, resetsAt: w.resetsAtMs ?? w.resetsAt } : undefined
 }
 
-/** Status line text, or undefined when there is nothing to show. */
-export const statusLine = (
-  r: Resolved,
-  status: SwapStatus | null,
-  limits: LimitsEntry[] | null,
-): string | undefined => {
-  if (!r.current) return undefined
-  let five: number | undefined
-  let week: number | undefined
-  if (r.kind === 'pool') {
-    five = memberWindow(status, limits, r.current, 'fiveHour')?.pct
-    week = memberWindow(status, limits, r.current, 'sevenDay')?.pct
-  } else {
-    const e = entriesFor(limits, r.current).find(l => l.toolName === 'claude')
-    five = e && pick(e.windows, 'session')?.usedPercent
-    week = e && pick(e.windows, 'week')?.usedPercent
-  }
-  const parts = [r.current]
-  if (five !== undefined) parts.push(`5h ${pct(five)}`)
-  if (week !== undefined) parts.push(`wk ${pct(week)}`)
-  const body = parts.join(' ')
-  return r.pool ? `${r.pool} > ${body}` : body
-}
+export type UsageRow = { label: string; five?: number; week?: number }
+
+const usageRow = (label: string, ws: Win[]): UsageRow => ({
+  label,
+  five: pick(ws, 'session')?.usedPercent,
+  week: pick(ws, 'week')?.usedPercent,
+})
+
+/** Non-claude tools whose identity bears the pool's name (in a pool) or the current identity's name. */
+export const otherProviderRows = (limits: LimitsEntry[] | null, r: Resolved): UsageRow[] =>
+  (r.pool ? (limits ?? []).filter(l => l.identity.name === r.pool) : entriesFor(limits, r.current ?? ''))
+    .filter(l => l.toolName !== 'claude')
+    .map(l => usageRow(l.toolName, l.windows))
+
+/** Pool case: every claude member's rows. */
+export const memberRows = (status: SwapStatus | null, limits: LimitsEntry[] | null): UsageRow[] =>
+  (status?.accounts ?? []).map(a => ({
+    label: a.name,
+    five: memberWindow(status, limits, a.name, 'fiveHour')?.pct,
+    week: memberWindow(status, limits, a.name, 'sevenDay')?.pct,
+  }))
+
+/** Pool case: per non-claude tool, the rows of each pool member's identity. */
+export const memberProviderRows = (limits: LimitsEntry[] | null, r: Resolved) =>
+  poolProviders(limits, r).map(g => ({ tool: g.tool, rows: g.rows.map(l => usageRow(l.identity.name, l.windows)) }))
 
 export type ProviderGroup = { tool: string; rows: LimitsEntry[] }
 
