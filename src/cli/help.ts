@@ -31,6 +31,7 @@ const COMMANDS: Array<[string, string]> = [
   ["claude-swap to <account> | next [--if-limited] [--pool=]", "Swap the pool's Claude login to a member (manual), or to the one with most headroom"],
   ["claude-swap pool create <name> --accounts=a,b[,c] [--config-dir=]", "Create a pool identity sharing one Claude folder across accounts"],
   ["claude-swap allow|disallow <account> | auto on|off [--threshold=95] | usage", "Edit allowed accounts, automatic limit swap, per-member usage split"],
+  ["statusline [--wrap <command>]", "Claude Code statusLine.command: runs <command> (same stdin), then prints cached usage bars; offline, always exits 0"],
   ["memory [show|path|init|edit|add] [--stdin]", "Machine-local memory shared by every AIS agent and identity"],
   ["doctor [--identity=] [--tool=] [--json]", "Live responsiveness probe per identity — catches a hung/stuck identity"],
   ["resume [session-id] [--identity=] [--tool=] [--json]", "Interactive tree picker (or direct launch) for resumable sessions"],

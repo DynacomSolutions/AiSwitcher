@@ -192,7 +192,7 @@ async function saveLastGood(identity: Identity, result: FetchedLimitResult, cach
   }
 }
 
-async function loadLastGood(identity: Identity, cacheDir: string): Promise<FetchedLimitResult | undefined> {
+export async function loadLastGood(identity: Identity, cacheDir: string): Promise<FetchedLimitResult | undefined> {
   try {
     const parsed = JSON.parse(await readFile(lastGoodPath(identity, cacheDir), "utf8")) as Omit<FetchedLimitResult, "identity">;
     return Array.isArray(parsed.windows) && parsed.windows.length > 0 ? { ...parsed, identity } : undefined;

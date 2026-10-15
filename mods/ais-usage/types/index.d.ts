@@ -1,5 +1,5 @@
 export type Win = { label: string; category?: string; usedPercent: number; resetsAt?: string; resetsAtMs?: number }
-export type SwapPool = { accounts?: string[]; active?: string; auto?: boolean; thresholdPercent?: number }
+export type SwapPool = { accounts?: string[]; disallowed?: string[]; active?: string; auto?: boolean; thresholdPercent?: number }
 export type LimitsEntry = {
   toolName: string
   provider?: string
