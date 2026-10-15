@@ -36,25 +36,6 @@ test('PromptHint shows the toggles row, then the hint, in a pool', async ($, on)
   await ui.unmount()
 })
 
-test('Other providers expands to a title plus session and week rows of equal bar width', async ($, on) => {
-  const ui = await mountBand($, on, poolLimits, dir)
-  await ui.press({ key: 'others' })
-  expect(await ui.find({ type: 'Text', text: /^codex$/ })).toBeDefined()
-  const bars = [await ui.find({ type: 'Text', text: /^session\s+\[/ }), await ui.find({ type: 'Text', text: /^week\s+\[/ })]
-  const widths = bars.map(b => (JSON.stringify(b).match(/\\u2588/g) ?? JSON.stringify(b).match(/█/g) ?? []).length)
-  expect(widths[0]).toBeGreaterThan(10)
-  expect(widths[0]).toBe(widths[1])
-  await ui.unmount()
-})
-
-test('a provider added to the limits appears in Other providers', async ($, on) => {
-  const extra = { ...entry('team-pool', '/x/swap', { swapPool: { active: 'a', accounts: ['a', 'b'] } }), toolName: 'grok' }
-  const ui = await mountBand($, on, [...poolLimits, extra], dir)
-  await ui.press({ key: 'others' })
-  expect(await ui.find({ type: 'Text', text: /^grok$/ })).toBeDefined()
-  await ui.unmount()
-})
-
 test('nothing renders for AbovePrompt', async ($, on) => {
   await mountBand($, on, poolLimits, dir)
   await expect(
@@ -62,10 +43,18 @@ test('nothing renders for AbovePrompt', async ($, on) => {
   ).rejects.toThrow(/no implementation for ui.render/)
 })
 
+const writes: { path: string; text: string }[] = []
+const lastWrite = () => JSON.parse(writes[writes.length - 1]!.text)
+
 const mountBand = async ($: any, on: any, lims: unknown[], cfg: string, columns?: number) => {
   mock.env(on, { CLAUDE_CONFIG_DIR: cfg, HOME: '/h' })
   const clock = mock.clock(on)
   mock.store(on)
+  writes.length = 0
+  on('fs.write', (_$: any, e: any) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined } as never
+  })
   on('session.start', ($$: any, e: any) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'ais-usage' } }))
   on('process.run', ($$: any, e: any) => {
@@ -83,59 +72,6 @@ const mountBand = async ($: any, on: any, lims: unknown[], cfg: string, columns?
   } as never)
 }
 const poolLimits = [...limits, { ...entry('a', '/x/a'), toolName: 'codex' }, { ...entry('team-pool', '/x/swap', { swapPool: { active: 'a', accounts: ['a', 'b'] } }), toolName: 'codex' }]
-
-test('Other providers toggles open and closed', async ($, on) => {
-  const ui = await mountBand($, on, poolLimits, dir)
-  expect(await ui.find({ type: 'Button', text: /Other providers/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^\s*codex/ })).toBeUndefined()
-  await ui.press({ key: 'others' })
-  expect(await ui.find({ type: 'Text', text: /^\s*codex/ })).toBeDefined()
-  await ui.press({ key: 'others' })
-  expect(await ui.find({ type: 'Text', text: /^\s*codex/ })).toBeUndefined()
-  await ui.unmount()
-})
-
-test('Pool members toggles open and closed in a pool', async ($, on) => {
-  const ui = await mountBand($, on, poolLimits, dir)
-  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeUndefined()
-  await ui.press({ key: 'members' })
-  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeDefined()
-  await ui.press({ key: 'members' })
-  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeUndefined()
-  await ui.unmount()
-})
-
-const blocks = (n: { text?: string }) => (n.text?.match(/█/g) ?? []).length
-
-test('Pool members shows title, member name and two rows of equal bar width', async ($, on) => {
-  const ui = await mountBand($, on, poolLimits, dir)
-  await ui.press({ key: 'members' })
-  expect(await ui.find({ type: 'Text', text: /^claude$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^b$/ })).toBeDefined()
-  const rows = await ui.findAll({ type: 'Text', text: /^(session|week)\s+\[/ })
-  const w = rows.filter((r: any) => /%/.test(r.text)).slice(0, 2).map(blocks)
-  expect(w[0]).toBeGreaterThan(10)
-  expect(new Set(w).size).toBe(1)
-  await ui.unmount()
-})
-
-const sessionBar = async ($: any, on: any, columns: number) => {
-  const ui = await mountBand($, on, poolLimits, dir, columns)
-  await ui.press({ key: 'members' })
-  const row = await ui.find({ type: 'Text', text: /^session\s+\[/ })
-  await ui.unmount()
-  return blocks(row)
-}
-let narrow = 0
-
-test('Pool members bar at 80 columns', async ($, on) => {
-  narrow = await sessionBar($, on, 80)
-  expect(narrow).toBeGreaterThan(10)
-})
-
-test('Pool members bar is wider at 200 columns than at 80', async ($, on) => {
-  expect(await sessionBar($, on, 200)).toBeGreaterThan(narrow)
-})
 
 test('Pool members button is hidden outside a pool', async ($, on) => {
   const ui = await mountBand($, on, [entry('a', '/c/a')], '/c/a')
@@ -167,29 +103,31 @@ test('PromptHint passes through when there are no rows', async ($, on) => {
   ).rejects.toThrow(/no implementation for ui.render/)
 })
 
-test('a member added to the pool appears at the next refresh, no reload', async ($, on) => {
-  mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h' })
-  const clock = mock.clock(on)
-  mock.store(on)
-  let members = ['a', 'b']
-  on('session.start', ($$: any, e: any) => ({ cwd: e.cwd }))
-  on('command.register', () => ({ value: { command: 'ais-usage' } }))
-  on('process.run', ($$: any, e: any) => {
-    const out = e.argv.includes('limits')
-      ? [
-          { ...entry('team-pool', dir, { swapPool: { active: 'a', accounts: members } }), windows: [], status: 'unavailable' },
-          ...members.map(n => entry(n, `/c/${n}`)),
-        ]
-      : { ...status, accounts: members.map(name => ({ name, active: name === 'a', allowed: true })) }
-    return { value: { exitCode: 0, stdout: JSON.stringify(out), stderr: '' } } as never
-  })
-  await $.session.start?.({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
-  await clock.advance(1)
-  const ui = await $.ui.mount({ plugin: 'ais-usage', surface: 'terminal', component: 'PromptHint', props: HINT } as never)
+test('pressing Other providers writes the snapshot with othersOpen', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir)
+  await ui.press({ key: 'others' })
+  expect(writes[writes.length - 1]!.path).toBe('/h/.ais/cache/ais-usage/swap.json')
+  expect(lastWrite()).toMatchObject({ othersOpen: true, membersOpen: false })
+  expect(lastWrite().limits).toHaveLength(poolLimits.length)
+  await ui.press({ key: 'others' })
+  expect(lastWrite().othersOpen).toBe(false)
+  await ui.unmount()
+})
+
+test('pressing Pool members writes the snapshot with membersOpen', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir)
   await ui.press({ key: 'members' })
-  expect(await ui.find({ type: 'Text', text: /^c$/ })).toBeUndefined()
-  members = ['a', 'b', 'c']
-  await clock.advance(300_000)
-  expect(await ui.find({ type: 'Text', text: /^c$/ })).toBeDefined()
+  expect(lastWrite()).toMatchObject({ othersOpen: false, membersOpen: true })
+  expect(typeof lastWrite().updatedAt).toBe('number')
+  await ui.unmount()
+})
+
+test('PromptHint tree has the hint and buttons but no bar rows, open or closed', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir)
+  await ui.press({ key: 'others' })
+  await ui.press({ key: 'members' })
+  expect(await ui.find({ type: 'Text', text: /\? for shortcuts/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^(session|week)\s+\[/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^codex$/ })).toBeUndefined()
   await ui.unmount()
 })

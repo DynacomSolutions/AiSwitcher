@@ -2,22 +2,70 @@ import { foldValuedFlags, parseArgs, stringFlag } from "./args.ts";
 import { loadLastGood } from "./limits/claude-limits.ts";
 import { loadOne } from "./identities/resolve-tool.ts";
 import { TOOL_CONFIGS } from "./identities/resolve-tool.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { aisCacheDir } from "../shared/ais-home.ts";
 import type { Identity } from "../identities/types.ts";
 import {
   bandRows,
   barWidth,
   labelPad,
+  memberBlocks,
+  providerBlocks,
   resolveCurrent,
   rowSegments,
+  snapshotName,
 } from "../../mods/ais-usage/hooks/model.ts";
-import type { BandRow, Resolved } from "../../mods/ais-usage/hooks/model.ts";
+import type { BandRow, Resolved, Snapshot } from "../../mods/ais-usage/hooks/model.ts";
 import type { LimitsEntry } from "../../mods/ais-usage/types";
 
 const ESC = "\u001b[";
 const paint = (code: number, s: string) => (s ? `${ESC}${code}m${s}${ESC}0m` : "");
 const CODE = { red: 31, green: 32, yellow: 33, blue: 34, cyan: 36, gray: 90, dim: 2 } as const;
 const BLOCK = "█";
+const BOLD = 1;
+/** A snapshot older than this is from a dead session. */
+const SNAPSHOT_MAX_AGE_MS = 15 * 60_000;
+
+/** The mod's toggle snapshot for this identity, or undefined when missing, stale or malformed. */
+function readSnapshot(cacheDir: string, configDir: string | undefined): Snapshot | undefined {
+  try {
+    const s = JSON.parse(readFileSync(join(cacheDir, "ais-usage", snapshotName(configDir)), "utf8")) as Snapshot;
+    if (!Array.isArray(s.limits) || typeof s.updatedAt !== "number" || Date.now() - s.updatedAt > SNAPSHOT_MAX_AGE_MS) return undefined;
+    return s;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Expanded blocks for the open toggles: a bold title per tool, then its rows (plus member names for Pool members). */
+function toggleLines(s: Snapshot, configDir: string | undefined, cols: number): string[] {
+  const r = resolveCurrent(s.limits, configDir, s.status);
+  const out: string[] = [];
+  const rowsOf = (rows: BandRow[]) => {
+    if (!rows.length) return [paint(CODE.dim, "n/a")];
+    const width = barWidth(r, rows, cols);
+    const pad = labelPad(r, rows);
+    return rows.map((row) => renderRow(r, row, width, pad));
+  };
+  if (s.othersOpen) {
+    for (const g of providerBlocks(s.limits, r)) out.push(paint(BOLD, g.tool), ...rowsOf(g.rows));
+  }
+  if (s.membersOpen && r.kind === "pool") {
+    for (const g of memberBlocks(s.status, s.limits, r)) {
+      // One width per tool so a tool's member rows line up.
+      const all = g.members.flatMap((m) => m.rows);
+      const width = all.length ? barWidth(r, all, cols) : 0;
+      const pad = all.length ? labelPad(r, all) : 0;
+      out.push(paint(BOLD, g.tool));
+      for (const m of g.members) {
+        out.push(paint(CODE.dim, m.name));
+        out.push(...(m.rows.length ? m.rows.map((row) => renderRow(r, row, width, pad)) : [paint(CODE.dim, "n/a")]));
+      }
+    }
+  }
+  return out;
+}
 
 /** One band row as an ANSI line; `width` is the bar width, `labelPad` the longest label (shorter ones are right-padded). */
 export function renderRow(r: Resolved, row: BandRow, width: number, pad = 0): string {
@@ -84,7 +132,13 @@ export async function usageBars(stdin: string, env: Record<string, string | unde
       : [];
     const width = barWidth(r, rows, cols);
     const pad = labelPad(r, rows);
-    return [...head, ...rows.map((row) => renderRow(r, row, width, pad))].join("\n") + "\n";
+    const lines = [...head, ...rows.map((row) => renderRow(r, row, width, pad))];
+    // shortcut: the snapshot is per identity, not per session, so two sessions on one identity share toggles; upgrade if that bites.
+    const snap = readSnapshot(deps.cacheDir ?? aisCacheDir(), env.CLAUDE_CONFIG_DIR);
+    if (snap) {
+      try { lines.push(...toggleLines(snap, env.CLAUDE_CONFIG_DIR, cols)); } catch { /* bad snapshot: main bars only */ }
+    }
+    return lines.join("\n") + "\n";
   } catch {
     return "";
   }
