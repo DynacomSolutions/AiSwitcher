@@ -42,7 +42,7 @@ function readSnapshot(cacheDir: string, configDir: string | undefined): Snapshot
 /** The open section from the snapshot; falls back to the older boolean fields. */
 const openOf = (s: Snapshot) => (s.open !== undefined ? s.open : s.othersOpen ? "others" : s.membersOpen ? "members" : null);
 
-/** Expanded block of the one open section: a bold title per tool, then its rows or member cards, with a rule between tools. */
+/** Expanded block of the one open section: a bold title per tool, then its rows or member cards, with a rule between tools and under the last. */
 function toggleLines(s: Snapshot, configDir: string | undefined, cols: number): string[] {
   const r = resolveCurrent(s.limits, configDir, s.status);
   const rule = paint(CODE.dim, "─".repeat(cols));
@@ -58,7 +58,7 @@ function toggleLines(s: Snapshot, configDir: string | undefined, cols: number): 
     for (const g of memberCards(memberBlocks(s.status, s.limits, r), cols)) groups.push(g.map(renderSegs));
   }
   if (!groups.length) return [];
-  return [rule, ...groups.flatMap((g, i) => (i ? [rule, ...g] : g))];
+  return [rule, ...groups.flatMap((g, i) => (i ? [rule, ...g] : g)), rule];
 }
 
 const renderSegs = (segs: Seg[]): string =>

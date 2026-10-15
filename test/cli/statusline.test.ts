@@ -103,11 +103,16 @@ test("open others: a rule, then a codex block with pool totals at column 0, full
   expect(i).toBeGreaterThan(1);
   expect(lines[i - 1]).toBe(RULE(100));
   expect(out).toContain("\u001b[1mcodex\u001b[0m");
-  const rows = lines.slice(i + 1);
+  const rows = lines.slice(i + 1, -1);
   expect(rows).toHaveLength(2);
   expect(rows[0]).toMatch(/^session\s+\[█+\]/);
   expect(rows[0]!.length).toBeGreaterThanOrEqual(90);
   for (const l of lines) expect(l.length).toBeLessThanOrEqual(100);
+});
+
+test("open section ends with the rule; closed has none", async () => {
+  for (const open of ["others", "members"]) expect((await poolRun({ open })).lines.at(-1)).toBe(RULE(100));
+  expect((await poolRun({})).lines.some((l) => l.startsWith("─"))).toBe(false);
 });
 
 test("old othersOpen field still opens the section", async () => {
