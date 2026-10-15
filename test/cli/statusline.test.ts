@@ -59,3 +59,18 @@ test("wrap output comes first, unchanged, even with no bars", async () => {
   expect(await new Response(p.stdout).text()).toBe('{"x":1}TAIL');
   expect(await p.exited).toBe(0);
 });
+
+test("rows share one bar width and start column; it scales with the terminal; nothing exceeds it", async () => {
+  const cacheDir = cache({ solo: [30, 80] });
+  const run = async (cols: number) =>
+    strip(await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/solo/", COLUMNS: String(cols) }, { cacheDir, identities: async () => [id("solo", "/c/solo")] })).trimEnd().split("\n");
+  const barLen = (l: string) => l.slice(l.indexOf("[") + 1, l.indexOf("]")).length;
+  const [s80, w80] = await run(80);
+  const [s200, w200] = await run(200);
+  expect(barLen(s80)).toBe(barLen(w80));
+  expect(s80.indexOf("[")).toBe(w80.indexOf("["));
+  expect(barLen(s200)).toBe(barLen(w200));
+  expect(barLen(s200)).toBeGreaterThan(barLen(s80) + 100);
+  for (const l of [s80, w80]) expect(l.length).toBeLessThanOrEqual(80);
+  for (const l of [s200, w200]) expect(l.length).toBeLessThanOrEqual(200);
+});
