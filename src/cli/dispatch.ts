@@ -54,14 +54,11 @@ export async function runCli(argv: string[]): Promise<void> {
     // made `ais limits`/`ais usage` (and `identities`/`doctor`) hang for as
     // long as reconciliation with a slow or unreachable remote took, up to
     // forever. Fixed to spawn the exact same detached `ais sync background`
-    // worker `startBackgroundProfileSync` already uses elsewhere, and to say
-    // so out loud (stderr, so `--json` output stays clean) rather than
-    // leaving reconciliation silently running after this process exits.
+    // worker `startBackgroundProfileSync` already uses elsewhere. Reporting
+    // commands stay quiet so the detached reconciliation does not add noise
+    // to their output.
     if (wantsAutoBackgroundSync(command, rest)) {
-      const started = startBackgroundProfileSync({ direction: "both", scope: { kind: "all" } });
-      if (started) {
-        console.error('ais sync: reconciling with configured SSH remotes in the background (run "ais sync now" to wait for it directly).');
-      }
+      startBackgroundProfileSync({ direction: "both", scope: { kind: "all" } });
     }
 
     switch (command) {
