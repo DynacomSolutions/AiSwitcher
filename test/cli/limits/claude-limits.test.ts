@@ -115,6 +115,12 @@ describe("fetchClaudeLimits rate limiting", () => {
     expect(stale.capturedAt).toBe(live.capturedAt);
   });
 
+  test("extra_usage in the body yields extraUsage through fetchClaudeLimits", async () => {
+    const body = { five_hour: { utilization: 1, resets_at: "2026-10-12T00:00:00Z" }, extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 25, spend_limit_reached: false } };
+    const result = await fetchClaudeLimits(id, { ...common, cacheDir: cacheDir(), fetchBody: async () => ({ body }) });
+    expect(result.extraUsage?.usedPercent).toBe(25);
+  });
+
   test("a 429 with no cache fails fast as unavailable", async () => {
     const result = await fetchClaudeLimits(id, { ...common, cacheDir: cacheDir(), fetchBody: limited });
     expect(result.status).toBe("unavailable");
