@@ -20,17 +20,18 @@ export interface MemberRow<U extends PoolUsage = PoolUsage> {
 }
 
 /** Headroom = 100 - worst window. Unknown usage sorts last and is never
- * chosen when `requireKnown` is set. */
+ * chosen when `requireKnown` is set. Equal headroom: a member with available
+ * extra usage ranks first. */
 export function chooseBest(
   rows: Array<{ name: string; usage?: PoolUsage }>,
   options: { exclude?: string; belowPercent?: number; requireKnown?: boolean },
 ): string | undefined {
   const ranked = rows
     .filter((r) => r.name !== options.exclude)
-    .map((r) => ({ name: r.name, util: r.usage?.status === "live" ? r.usage.maxUtilization : undefined }))
+    .map((r) => ({ name: r.name, util: r.usage?.status === "live" ? r.usage.maxUtilization : undefined, extra: r.usage?.extraUsage?.available === true }))
     .filter((r) => (options.requireKnown ? r.util !== undefined : true))
     .filter((r) => options.belowPercent === undefined || (r.util !== undefined && r.util < options.belowPercent))
-    .sort((a, b) => (a.util ?? 1000) - (b.util ?? 1000));
+    .sort((a, b) => (a.util ?? 1000) - (b.util ?? 1000) || Number(b.extra) - Number(a.extra));
   return ranked[0]?.name;
 }
 
@@ -95,7 +96,12 @@ export type LimitedOutcome =
 /** If the pool's active member is at/over the threshold (or its usage call
  * was itself rate limited, or `assumeLimited` because a 429 was observed),
  * swap to the best allowed member below the threshold (else the least-used
- * member that is under 100% and better than the active one). Honors the cooldown
+ * member that is under 100% and better than the active one). When none of
+ * those exists and the active member is exhausted (100%, rate-limited or
+ * unknown), an active member with available extra usage (Claude extra
+ * usage, Codex credits) stays put, since it already runs on paid capacity;
+ * otherwise the best allowed member with available extra usage is chosen, at
+ * any utilisation. Members under 100% always win over paid capacity. Honors the cooldown
  * recorded in the ledger. Used by the daemon poll, the launch check and the
  * optional in-session hook (`next --if-limited`). */
 export async function swapIfLimited<U extends PoolUsage>(
@@ -142,14 +148,15 @@ export async function swapIfLimited<U extends PoolUsage>(
   const fallback = chooseBest(rows, { belowPercent: 100, requireKnown: true });
   const fallbackUtil = rows.find((r) => r.name === fallback)?.usage?.maxUtilization;
   const target = chooseBest(rows, { belowPercent: threshold, requireKnown: true }) ?? (fallbackUtil !== undefined && fallbackUtil < activeUtil ? fallback : undefined);
-  if (!target) return { action: "no-candidate", ...(usage.maxUtilization !== undefined ? { utilization: usage.maxUtilization } : {}) };
+  const paid = target ?? (activeUtil < 100 || usage.extraUsage?.available ? undefined : chooseBest(rows.filter((r) => r.usage?.extraUsage?.available), {}));
+  if (!paid) return { action: "no-candidate", ...(usage.maxUtilization !== undefined ? { utilization: usage.maxUtilization } : {}) };
   let result: SwapResult;
   try {
     result = await performPoolSwap(adapter, {
       ...(deps.registryPath ? { registryPath: deps.registryPath } : {}),
       ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}),
       pool: pool.name,
-      target,
+      target: paid,
       reason,
       now: () => new Date(now),
       // Decided on a snapshot taken before the usage calls; re-check under the pool lock.

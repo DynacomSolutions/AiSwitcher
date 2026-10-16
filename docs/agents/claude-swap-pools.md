@@ -182,3 +182,27 @@ takes the worst across its fetchable providers). `ais swap kimi|pi usage` is
 rejected: neither keeps a per-message log the ledger can split. Daemon opt-out:
 `AIS_POOL_SWAP_KIMI=0`, `AIS_POOL_SWAP_PI=0`. Not run: a live pool and a real
 kimi/pi session (no real credentials were touched).
+
+
+### Extra usage and credits fallback
+
+Pools use paid capacity (Claude "extra usage", Codex "credits") as a last
+resort. Adapters report it as `PoolUsage.extraUsage` (`ExtraUsageInfo` in
+`cli/limits/types.ts`; Claude: `extraUsageFromBody` over the usage body's
+`extra_usage` block; Codex: `extraUsageFromCredits` over the snapshot's
+`credits`). `ais limits --json` carries it per identity and `ais swap <tool>
+status` adds an `extra` column when any member has it enabled. Rules in
+`pool/ops.ts`:
+- Members under 100% always win over paid capacity: the extra-usage fallback runs
+  only after the normal choice (below threshold, else the best under 100%) found
+  nothing.
+- The fallback only fires once the active member is exhausted (100%,
+  rate-limited or unknown); an active member with standard headroom stays.
+- An active member whose extra usage is available stays put (`no-candidate`): it
+  already runs on paid capacity, and swapping would pay twice.
+- Otherwise the allowed non-active member with available extra usage that
+  `chooseBest` ranks first is chosen, at any utilisation and whether live or
+  rate-limited. Disallowed members are never chosen.
+- `chooseBest` breaks equal headroom in favour of a member with available extra
+  usage.
+Kimi and Pi report no extra usage; their pools are unchanged.

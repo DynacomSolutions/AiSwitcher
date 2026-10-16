@@ -1,4 +1,4 @@
-import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage, Win } from '../types'
+import type { ExtraUsage, LimitsEntry, SwapAccount, SwapStatus, SwapUsage, Win } from '../types'
 
 export type Resolved = {
   kind: 'pool' | 'identity' | 'unknown'
@@ -114,6 +114,11 @@ export const memberWindow = (
   return w ? { pct: w.usedPercent, resetsAt: w.resetsAtMs ?? w.resetsAt } : undefined
 }
 
+/** One member's Claude extra usage: from status when it carries it, else from its own `claude` limits entry. */
+export const memberExtra = (status: SwapStatus | null, limits: LimitsEntry[] | null, name: string): ExtraUsage | undefined =>
+  status?.accounts.find(a => a.name === name)?.usage?.extraUsage ??
+  entriesFor(limits, name).find(l => l.toolName === 'claude' && l.extraUsage)?.extraUsage
+
 export type ProviderGroup = { tool: string; rows: LimitsEntry[] }
 
 /** Pool case: per non-claude tool, the identities that are members of the pool. */
@@ -178,7 +183,7 @@ export const twoToneBar = (activePct: number, poolPct: number | undefined, width
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 /** Window rows a band can show; codex plans report `week` or `month`. */
-export type RowName = 'session' | 'week' | 'month'
+export type RowName = 'session' | 'week' | 'month' | 'extra'
 const ROW_NAMES: readonly RowName[] = ['session', 'week', 'month']
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -196,6 +201,8 @@ export type BandRow = {
   resets: string
   /** Pool case only. */
   pool?: { pct: number | undefined; reporting: number; total: number }
+  /** The current member's extra usage is not enabled: the label reads `off`. */
+  off?: boolean
 }
 
 /** Rows for the band above the prompt, or [] when there is nothing to show. */
@@ -214,12 +221,26 @@ export const bandRows = (r: Resolved, status: SwapStatus | null, limits: LimitsE
       })
       out.push({ name, active: w.pct, resets: resetLabel(w.resetsAt, name), pool: poolWindowPct(synth, key) })
     }
+    const extras = (r.members ?? []).map(n => ({ n, x: memberExtra(status, limits, n) }))
+    if (extras.some(m => m.x?.enabled)) {
+      const on = extras.filter(m => m.x?.enabled && (accounts.find(a => a.name === m.n)?.allowed ?? true))
+      const vals = on.flatMap(m => (typeof m.x?.usedPercent === 'number' ? [m.x.usedPercent] : []))
+      const cur = memberExtra(status, limits, r.current)
+      out.push({
+        name: 'extra',
+        active: cur?.enabled ? (cur.usedPercent ?? 0) : 0,
+        resets: '',
+        off: !cur?.enabled,
+        pool: { pct: vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : undefined, reporting: vals.length, total: on.length },
+      })
+    }
   } else {
     const e = entriesFor(limits, r.current).find(l => l.toolName === 'claude')
     for (const name of ['session', 'week'] as const) {
       const w = e && pick(e.windows, name)
       if (w) out.push({ name, active: w.usedPercent, resets: resetLabel(w.resetsAtMs ?? w.resetsAt, name) })
     }
+    if (e?.extraUsage?.enabled) out.push({ name: 'extra', active: e.extraUsage.usedPercent ?? 0, resets: '' })
   }
   return out
 }
@@ -229,7 +250,8 @@ export function rowText(r: Resolved, row: BandRow) {
   const pool = row.pool
   const left = pool?.pct === undefined ? undefined : Math.max(0, 100 - Math.round(pool.pct))
   const poolText = pool ? (pool.pct === undefined ? 'pool n/a' : `pool ${pct(pool.pct)} used, ${left}% left`) : ''
-  const curText = pool ? `${r.current} ${pct(row.active)}` : pct(row.active)
+  const own = row.off ? 'off' : pct(row.active)
+  const curText = pool ? `${r.current} ${own}` : own
   const labelLen = pool ? poolText.length + 5 + curText.length : curText.length
   const resets = row.resets ? `  resets ${row.resets}` : ''
   const reporting = pool && pool.reporting < pool.total ? ` (${pool.reporting}/${pool.total} reporting)` : ''
@@ -340,7 +362,7 @@ export const memberBlocks = (status: SwapStatus | null, limits: LimitsEntry[] | 
     rows: ([['session', 'fiveHour'], ['week', 'sevenDay']] as const).flatMap(([n, k]) => {
       const w = memberWindow(status, limits, name, k)
       return w ? [memberBand(n, w.pct, w.resetsAt)] : []
-    }),
+    }).concat(memberExtra(status, limits, name)?.enabled ? [memberBand('extra', memberExtra(status, limits, name)?.usedPercent ?? 0, undefined)] : []),
   }))
   return members.length ? [{ tool: 'claude', members }] : []
 }

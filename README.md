@@ -996,6 +996,9 @@ how many are running, and new launches (or `codex resume`) get the new one.
 `ais swap codex usage` splits `<pool>/sessions/**/rollout-*.jsonl` token usage
 per member from the ledger (`~/.ais/state/codex-swap.jsonl`).
 `ais limits` and `ais identities list` show codex pools like claude pools.
+When every member is at its standard limit, a pool falls back to a member with
+extra usage (Claude) or credits (Codex) left, and stays on one that already has
+it; members under 100% always win first. Kimi and Pi pools have no such fallback.
 Kimi and Pi pools (`ais swap kimi|pi pool create shared --accounts=a,b`) take
 OAuth-login members whose token names an account (Pi: a Kimi login in
 `auth.json`); both CLIs re-read their credentials per request, so running
@@ -1112,6 +1115,16 @@ repository's marketplace (`aiswitcher`):
 
 Then run `/ais-usage` to open the pane. It calls the `ais` CLI, so `ais` must
 be on `PATH` (or in `~/.local/bin`).
+
+The bars above the prompt show session and week usage. When a pool member has
+Claude extra usage switched on, an `extra` row follows: the share of the
+monthly cap spent (the pool mean over members with it on, plus the current
+member, or `off` when the current member has it off).
+
+`/ais-swap` switches the pool's active account from inside the session:
+`/ais-swap` or `/ais-swap status` shows the pool, `/ais-swap next` rotates to
+the next account, and `/ais-swap <account>` switches to that account. It never
+forces a swap. A running session picks the new login up on its next message.
 
 ## Commands
 

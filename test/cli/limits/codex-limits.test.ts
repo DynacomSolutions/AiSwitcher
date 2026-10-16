@@ -1,12 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import {
   isCodexAuthRejectionError,
+  extraUsageFromCredits,
   isTransientCodexLimitsError,
   manualResetFromWire,
   overageFromSnapshot,
   type RateLimitResetCreditsWire,
   type RateLimitSnapshotWire,
 } from "../../../src/cli/limits/codex-limits.ts";
+
+describe("extraUsageFromCredits", () => {
+  test("maps the credits block", () => {
+    expect(extraUsageFromCredits({})).toBeUndefined();
+    expect(extraUsageFromCredits({ credits: null })).toBeUndefined();
+    expect(extraUsageFromCredits({ credits: { unlimited: true } })).toEqual({ enabled: true, available: true, label: "unlimited credits" });
+    expect(extraUsageFromCredits({ credits: { hasCredits: true, balance: "12.5" } })).toEqual({ enabled: true, available: true, label: "credits 12.5" });
+    expect(extraUsageFromCredits({ credits: { hasCredits: true, balance: null } })).toEqual({ enabled: true, available: true, label: "credits" });
+    expect(extraUsageFromCredits({ credits: { hasCredits: true, balance: "0" } })?.available).toBe(false);
+    expect(extraUsageFromCredits({ credits: { hasCredits: false, unlimited: false, balance: "0" } })).toEqual({ enabled: false, available: false, label: "no credits" });
+  });
+});
 
 describe("overageFromSnapshot", () => {
   test("neither signal set yields undefined", () => {

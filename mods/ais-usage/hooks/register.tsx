@@ -68,6 +68,18 @@ const writeSnapshot = async ($: any) => {
   }
 }
 
+/** Runs `ais` (on PATH, else ~/.local/bin/ais). */
+const runAis = async ($: any, args: string[], timeoutMs: number) => {
+  try {
+    return await $.process.run(['ais', ...args], { timeoutMs })
+  } catch {
+    return await $.process.run([`${(await $.env.get('HOME')) ?? ''}/.local/bin/ais`, ...args], { timeoutMs })
+  }
+}
+
+const ANSI = /\u001b\[[0-9;]*m/g
+const USAGE = 'Usage: /ais-swap [next | <account>]'
+
 const pad2 = (n: number) => String(n).padStart(2, '0')
 
 export const register: Register = on => {
@@ -79,13 +91,7 @@ export const register: Register = on => {
     // Clears a status left by an older loaded version after /reload-plugins.
     $.ui.status(undefined)
 
-    const run = async (args: string[], timeoutMs: number) => {
-      try {
-        return await $.process.run(['ais', ...args], { timeoutMs })
-      } catch {
-        return await $.process.run([`${(await $.env.get('HOME')) ?? ''}/.local/bin/ais`, ...args], { timeoutMs })
-      }
-    }
+    const run = (args: string[], timeoutMs: number) => runAis($, args, timeoutMs)
 
     const fetchJson = async <T,>(src: string, args: string[], timeoutMs: number) => {
       await update($, loading, n => n + 1)
@@ -139,6 +145,11 @@ export const register: Register = on => {
       name: 'ais-usage',
       description: 'Show AIS pool and identity usage',
     })
+    await $.command.register({
+      name: 'ais-swap',
+      description: 'Switch the active account of the AIS swap pool',
+      argumentHint: '[next | <account>]',
+    })
     void refreshAll()
     $.clock.every(60_000, () => void refreshStatus())
     $.clock.every(600_000, () => void refreshUsage())
@@ -162,6 +173,24 @@ export const register: Register = on => {
     void refreshHandle?.()
 
     return { text: 'AIS usage pane opened.' }
+  })
+
+  on('command.run', { command: 'ais-swap' }, async ($, e) => {
+    const arg = e.args.trim()
+    const words = arg.split(/\s+/).filter(Boolean)
+    if (words.length > 1) return { text: USAGE }
+    const word = words[0] ?? ''
+    const swap = word === '' || word === 'status' ? ['status'] : word === 'next' ? ['next', '--reason=manual'] : ['to', word]
+    const r = await runAis($, ['claude-swap', ...swap], 60000)
+    const out = (r.exitCode === 0 ? r.stdout : r.stderr || r.stdout).replace(ANSI, '').trim()
+    if (r.exitCode !== 0) return { text: out || `ais claude-swap ${swap[0]} failed (exit ${r.exitCode})` }
+    if (swap[0] === 'status') return { text: out }
+    await refreshHandle?.()
+    const active = (await read($, status))?.active ?? (word === 'next' ? '' : word)
+    return {
+      text: `${out}\nA running session picks the new login up on its next message.`,
+      ...(active ? { context: [`The AIS swap pool's active account changed to ${active}.`] } : {}),
+    }
   })
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
