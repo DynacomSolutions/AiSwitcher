@@ -11,7 +11,7 @@ import { ensureClaudeTranscriptRetention } from "./claude-settings.ts";
 import { writeAliAuthFile } from "./ali-auth.ts";
 import { activeIdentities } from "./retired.ts";
 import { readLastIdentity, writeLastIdentity } from "./last-identity.ts";
-import { performSwap } from "./claude-swap.ts";
+import { adapterFor } from "./pool/registry.ts";
 
 // A plain string sentinel rather than a Symbol: identity names are validated
 // elsewhere to be lowercase kebab-case only, so this can never collide with a
@@ -22,16 +22,12 @@ const KIND_IDENTITY = "identity";
 const KIND_POOL = "pool";
 
 export interface PromptDeps {
-  /** Makes `member` the active account of `pool` (manual reason). */
-  switchMember: (pool: Identity, member: string) => Promise<unknown>;
   readLast: (toolName: string) => Promise<string | undefined>;
   writeLast: (toolName: string, name: string) => Promise<void>;
 }
 
-export function defaultPromptDeps(cfg: ToolConfig): PromptDeps {
+export function defaultPromptDeps(): PromptDeps {
   return {
-    switchMember: (pool, member) =>
-      performSwap({ registryPath: cfg.identitiesJsonPath, pool: pool.name, target: member, reason: "manual" }),
     readLast: (toolName) => readLastIdentity(toolName),
     writeLast: (toolName, name) => writeLastIdentity(toolName, name),
   };
@@ -63,7 +59,7 @@ export async function promptForIdentity(
   identitiesFile: IdentitiesFile,
   cfg: ToolConfig,
   timeoutMs: number,
-  deps: PromptDeps = defaultPromptDeps(cfg),
+  deps: PromptDeps = defaultPromptDeps(),
   /** Open only this list (no chooser); undefined = normal chooser flow. */
   only?: "identity" | "pool",
 ): Promise<PromptResult> {
@@ -80,7 +76,7 @@ export async function promptForIdentity(
     clack.intro(`${cfg.toolName}: no identity resolved from flag, env, or cwd`);
 
     const active = activeIdentities(identitiesFile.identities);
-    const pools = cfg.toolName === "claude" ? active.filter((i) => i.swapPool !== undefined) : [];
+    const pools = adapterFor(cfg.toolName) ? active.filter((i) => i.swapPool !== undefined) : [];
     const plain = active.filter((i) => i.swapPool === undefined);
     const remembered = await deps.readLast(cfg.toolName).catch(() => undefined);
     const rememberedPool = remembered !== undefined ? pools.find((p) => p.name === remembered) : undefined;

@@ -19,9 +19,12 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "ais-picker-"));
   memoryPath = join(dir, "state", "last-identity.json");
 });
-afterEach(() => {
+function restorePromptSpies() {
   for (const fn of ["select", "intro", "outro", "isCancel"] as const) spyOn(clack, fn).mockRestore();
   spyOn(clack.log, "error").mockRestore();
+}
+afterEach(() => {
+  restorePromptSpies();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -49,7 +52,6 @@ const CANCEL = Symbol("cancel");
 
 function harness(answers: unknown[]) {
   const calls: SelectOpts[] = [];
-  const switched: Array<[string, string]> = [];
   const errors: string[] = [];
   spyOn(clack, "intro").mockImplementation(() => {});
   spyOn(clack, "outro").mockImplementation(() => {});
@@ -60,11 +62,10 @@ function harness(answers: unknown[]) {
   }) as never);
   spyOn(clack, "isCancel").mockImplementation(((v: unknown) => v === CANCEL) as never);
   const deps: PromptDeps = {
-    switchMember: async (pool, member) => void switched.push([pool.name, member]),
     readLast: (tool) => readLastIdentity(tool, memoryPath),
     writeLast: (tool, name) => writeLastIdentity(tool, name, memoryPath),
   };
-  return { calls, switched, errors, deps };
+  return { calls, errors, deps };
 }
 
 const plainText = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, "");
@@ -102,10 +103,50 @@ test("pool list: one row per pool, hint has member count and active account, no 
   expect(labels(h.calls[1]!)).toEqual(["Shared Pool"]);
   expect(h.calls[1]!.options[0]!.value).toBe("shared-pool");
   expect(h.calls[1]!.options[0]!.hint).toBe("3 accounts, active: Account A");
-  expect(h.switched).toEqual([]);
   expect(result.identity.name).toBe("shared-pool");
   expect(result.created).toBe(false);
   expect(await readLastIdentity("claude", memoryPath)).toBe("shared-pool");
+});
+
+test("registered provider pickers list pools through the same shared UI", async () => {
+  for (const toolName of ["codex", "kimi", "pi"] as const) {
+    const providerCfg = { toolName } as ToolConfig;
+    const h = harness(["pool", "shared-pool"]);
+    const result = await promptForIdentity(registry(), providerCfg, 1000, h.deps);
+    expect(h.calls.map((c) => c.message)).toEqual(["Select an identity or pool", "Select a pool"]);
+    expect(result.identity.name).toBe("shared-pool");
+    restorePromptSpies();
+  }
+});
+
+test("codex identity selection remembers its own choice independently from Claude", async () => {
+  await writeLastIdentity("claude", "shared-pool", memoryPath);
+  await writeLastIdentity("codex", "acct-a", memoryPath);
+  const h = harness(["identity", "acct-b"]);
+  const result = await promptForIdentity(registry(), { toolName: "codex" } as ToolConfig, 1000, h.deps);
+  expect(h.calls[0]!.initialValue).toBe("identity");
+  expect(h.calls[1]!.initialValue).toBe("acct-a");
+  expect(result.identity.name).toBe("acct-b");
+  expect(await readLastIdentity("claude", memoryPath)).toBe("shared-pool");
+  expect(await readLastIdentity("codex", memoryPath)).toBe("acct-b");
+});
+
+test("codex omits retired pools and no-pool launches keep the identity-only picker", async () => {
+  const file = registry();
+  file.identities[file.identities.length - 1]!.retired = true;
+  const h = harness(["solo"]);
+  await promptForIdentity(file, { toolName: "codex" } as ToolConfig, 1000, h.deps);
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]!.message).toBe("Select an identity");
+  expect(labels(h.calls[0]!)).not.toContain("Shared Pool");
+
+  restorePromptSpies();
+  const noPools = registry();
+  noPools.identities.pop();
+  const h2 = harness(["acct-b"]);
+  await promptForIdentity(noPools, { toolName: "codex" } as ToolConfig, 1000, h2.deps);
+  expect(h2.calls).toHaveLength(1);
+  expect(h2.calls[0]!.message).toBe("Select an identity");
 });
 
 test("no pools: no chooser, behaves as before", async () => {
@@ -206,6 +247,13 @@ test("only=pool opens just the pool list, no chooser; esc cancels", async () => 
   const h2 = harness([CANCEL]);
   await expect(promptForIdentity(registry(), cfg, 1000, h2.deps, "pool")).rejects.toThrow();
   expect(h2.calls).toHaveLength(1);
+});
+
+test("a registered provider can explicitly open only its pool list", async () => {
+  const h = harness(["shared-pool"]);
+  const result = await promptForIdentity(registry(), { toolName: "codex" } as ToolConfig, 1000, h.deps, "pool");
+  expect(h.calls.map((c) => c.message)).toEqual(["Select a pool"]);
+  expect(result.identity.name).toBe("shared-pool");
 });
 
 test("only=identity opens just the identity list, no chooser; esc cancels", async () => {
