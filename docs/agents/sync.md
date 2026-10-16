@@ -97,9 +97,7 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 58
   command. Fixed by replacing both with a single call to the same detached
   `startBackgroundProfileSync()` (`sync/background.ts`) `run-wrapper.ts`
   already uses, spawning `ais sync background` and returning immediately
-  regardless of remote latency — and, since a detached job can keep running
-  well after the CLI command that triggered it has already printed its
-  output and exited, a stderr line (`--json` output stays clean) now always
-  announces it, rather than reconciliation silently continuing in the void
-  with no way for the user to know it's still going.
+  regardless of remote latency. Reporting commands do not announce this
+  automatic detached work, keeping their output focused; explicit `ais sync
+  now` continues to report its result or failure.
 
