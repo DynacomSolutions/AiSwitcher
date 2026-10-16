@@ -86,86 +86,92 @@ const USAGE = 'Usage: /ais-swap [next | <account>]'
 
 const pad2 = (n: number) => String(n).padStart(2, '0')
 
-export const register: Register = on => {
-  let isLimitsBusy = false
-  let recoveryTimer: { cancel: () => void } | undefined
-  let recoverySubmitMember: string | undefined
-  const recoveryLifecycle = createRecoveryLifecycle()
-  const continuationLimiter = createContinuationLimiter()
-  const turnRecovery = createTurnRecoveryState()
-  let observedPoolActive: string | undefined
-  let mainTurnId: string | undefined
-  const cancelRecovery = () => {
-    recoveryLifecycle.cancel()
-    recoveryTimer?.cancel()
+let isLimitsBusy = false
+let recoveryTimer: { cancel: () => void } | undefined
+let recoverySubmitMember: string | undefined
+const recoveryLifecycle = createRecoveryLifecycle()
+const continuationLimiter = createContinuationLimiter()
+const turnRecovery = createTurnRecoveryState()
+let observedPoolActive: string | undefined
+let mainTurnId: string | undefined
+
+const cancelRecovery = () => {
+  recoveryLifecycle.cancel()
+  recoveryTimer?.cancel()
+  recoveryTimer = undefined
+  if (recoverySubmitMember) continuationLimiter.cancelled(recoverySubmitMember)
+  recoverySubmitMember = undefined
+}
+
+const poolStatus = async ($: any, configDir: string): Promise<RecoveryStatus | undefined> => {
+  try {
+    const r = await runAis($, ['claude-swap', 'status', '--json', `--config-dir=${configDir}`], 20000)
+    const value = r.exitCode === 0 ? parseJson<RecoveryStatus>(r.stdout) : undefined
+    if (value?.active) observedPoolActive = value.active
+    return value
+  } catch {
+    return undefined
+  }
+}
+
+const queueContinuation = ($: any) => {
+  // Prompt submission from inside a working hook is rejected. The timer
+  // runs after the classic hook chain has returned and the turn is idle.
+  void $.prompt.submit({ text: 'Continue the interrupted request now that an allowed pool member is available.' }).catch(() => undefined)
+}
+
+const scheduleContinuation = ($: any, active: string | undefined) => {
+  if (!active) return
+  if (recoverySubmitMember === active && recoveryTimer) return
+  cancelRecovery()
+  const delay = continuationLimiter.reserve(active, Date.now())
+  if (delay === undefined) return
+  const generation = recoveryLifecycle.capture()
+  recoverySubmitMember = active
+  recoveryTimer = $.clock.after(delay, async () => {
     recoveryTimer = undefined
-    if (recoverySubmitMember) continuationLimiter.cancelled(recoverySubmitMember)
     recoverySubmitMember = undefined
-  }
-  const poolStatus = async ($: any, configDir: string): Promise<RecoveryStatus | undefined> => {
-    try {
-      const r = await runAis($, ['claude-swap', 'status', '--json', `--config-dir=${configDir}`], 20000)
-      const value = r.exitCode === 0 ? parseJson<RecoveryStatus>(r.stdout) : undefined
-      if (value?.active) observedPoolActive = value.active
-      return value
-    } catch {
-      return undefined
-    }
-  }
-  const queueContinuation = ($: any) => {
-    // Prompt submission from inside a working hook is rejected. The timer
-    // runs after the classic hook chain has returned and the turn is idle.
-    void $.prompt.submit({ text: 'Continue the interrupted request now that an allowed pool member is available.' }).catch(() => undefined)
-  }
-  const scheduleContinuation = ($: any, active: string | undefined) => {
-    if (!active) return
-    if (recoverySubmitMember === active && recoveryTimer) return
-    cancelRecovery()
-    const delay = continuationLimiter.reserve(active, Date.now())
-    if (delay === undefined) return
-    const generation = recoveryLifecycle.capture()
-    recoverySubmitMember = active
-    recoveryTimer = $.clock.after(delay, async () => {
-      recoveryTimer = undefined
-      recoverySubmitMember = undefined
-      continuationLimiter.fired(active)
-      if (recoveryLifecycle.isCurrent(generation)) queueContinuation($)
-    })
-  }
-  const scheduleRecovery = ($: any, configDir: string, before: RecoveryStatus, failureAtMs: number, assumeLimited: boolean, retryAtMs?: number, activeRetryAtMs?: number, immediate = false, submitOnly = false, trustLimitEvidence = false) => {
-    if (submitOnly) return scheduleContinuation($, before.active)
-    cancelRecovery()
-    const generation = recoveryLifecycle.capture()
-    recoveryTimer = $.clock.after(recoveryDelay(retryAtMs, Date.now(), immediate ? 0 : 60_000), async () => {
-      recoveryTimer = undefined
-      const isCurrent = () => recoveryLifecycle.isCurrent(generation)
-      void runRecoveryCycle({
-        before,
-        failureAtMs,
-        activeRetryAtMs,
-        trustLimitEvidence,
-        isCurrent,
-        readStatus: () => poolStatus($, configDir),
-        swap: async () => {
-          try {
-            const r = await runAis($, [
-              'claude-swap', 'next', '--if-limited', ...(assumeLimited ? ['--assume-limited'] : []), '--reason=auto', '--json',
-              ...(trustLimitEvidence ? ['--trust-limit-evidence'] : []),
-              `--failure-at-ms=${failureAtMs}`,
-              `--config-dir=${configDir}`, `--expected-active=${before.active}`,
-            ], 60000)
-            return r.exitCode === 0 ? parseJson<{ action?: string; retryAtMs?: number; activeRetryAtMs?: number }>(r.stdout) : undefined
-          } catch {
-            return undefined
-          }
-        },
-        submit: active => { if (isCurrent()) scheduleContinuation($, active) },
-        retry: (nextRetryAtMs, nextActiveRetryAtMs, nextTrustLimitEvidence) => {
-          if (isCurrent()) scheduleRecovery($, configDir, before, failureAtMs, assumeLimited, nextRetryAtMs, nextActiveRetryAtMs, false, false, nextTrustLimitEvidence)
-        },
-      }).catch(() => undefined)
-    })
-  }
+    continuationLimiter.fired(active)
+    if (recoveryLifecycle.isCurrent(generation)) queueContinuation($)
+  })
+}
+
+const scheduleRecovery = ($: any, configDir: string, before: RecoveryStatus, failureAtMs: number, assumeLimited: boolean, retryAtMs?: number, activeRetryAtMs?: number, immediate = false, submitOnly = false, trustLimitEvidence = false) => {
+  if (submitOnly) return scheduleContinuation($, before.active)
+  cancelRecovery()
+  const generation = recoveryLifecycle.capture()
+  recoveryTimer = $.clock.after(recoveryDelay(retryAtMs, Date.now(), immediate ? 0 : 60_000), async () => {
+    recoveryTimer = undefined
+    const isCurrent = () => recoveryLifecycle.isCurrent(generation)
+    void runRecoveryCycle({
+      before,
+      failureAtMs,
+      activeRetryAtMs,
+      trustLimitEvidence,
+      isCurrent,
+      readStatus: () => poolStatus($, configDir),
+      swap: async () => {
+        try {
+          const r = await runAis($, [
+            'claude-swap', 'next', '--if-limited', ...(assumeLimited ? ['--assume-limited'] : []), '--reason=auto', '--json',
+            ...(trustLimitEvidence ? ['--trust-limit-evidence'] : []),
+            `--failure-at-ms=${failureAtMs}`,
+            `--config-dir=${configDir}`, `--expected-active=${before.active}`,
+          ], 60000)
+          return r.exitCode === 0 ? parseJson<{ action?: string; retryAtMs?: number; activeRetryAtMs?: number }>(r.stdout) : undefined
+        } catch {
+          return undefined
+        }
+      },
+      submit: active => { if (isCurrent()) scheduleContinuation($, active) },
+      retry: (nextRetryAtMs, nextActiveRetryAtMs, nextTrustLimitEvidence) => {
+        if (isCurrent()) scheduleRecovery($, configDir, before, failureAtMs, assumeLimited, nextRetryAtMs, nextActiveRetryAtMs, false, false, nextTrustLimitEvidence)
+      },
+    }).catch(() => undefined)
+  })
+}
+
+export const register: Register = on => {
   // Set by session.start; the command and the Refresh button call it.
   let refreshHandle: (() => Promise<void>) | undefined
 
