@@ -27,7 +27,14 @@ export async function readSwapEvents(ledgerPath: string): Promise<SwapEvent[]> {
     try {
       const e = JSON.parse(line) as Partial<SwapEvent>;
       if (typeof e.ts === "string" && typeof e.pool === "string" && typeof e.to === "string" && Number.isFinite(Date.parse(e.ts))) {
-        events.push({ ts: e.ts, pool: e.pool, from: typeof e.from === "string" ? e.from : null, to: e.to, reason: (e.reason ?? "manual") as SwapReason });
+        events.push({
+          ts: e.ts,
+          pool: e.pool,
+          from: typeof e.from === "string" ? e.from : null,
+          to: e.to,
+          reason: (e.reason ?? "manual") as SwapReason,
+          ...(typeof e.hardLimitUntilMs === "number" && Number.isFinite(e.hardLimitUntilMs) ? { hardLimitUntilMs: e.hardLimitUntilMs } : {}),
+        });
       }
     } catch {
       // torn line

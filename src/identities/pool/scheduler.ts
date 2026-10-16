@@ -120,8 +120,13 @@ export class PoolSwapScheduler {
         st.lastOutcome = outcome.action === "skipped" ? `skipped: ${outcome.why}` : outcome.action;
         const base = jitteredDelayMs(this.deps.random);
         if (outcome.action === "no-candidate") {
-          st.backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(base, st.backoffMs * 2));
-          this.log(adapter.tool, `pool ${pool.name}: active account is limited and no allowed account has headroom; backing off ${Math.round(st.backoffMs / 1000)}s`);
+          if (outcome.retryAtMs !== undefined && outcome.retryAtMs > nowMs) {
+            st.backoffMs = Math.max(base, outcome.retryAtMs - nowMs);
+            this.log(adapter.tool, `pool ${pool.name}: no allowed member has headroom; waiting ${Math.round(st.backoffMs / 1000)}s for the earliest reset`);
+          } else {
+            st.backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(base, st.backoffMs * 2));
+            this.log(adapter.tool, `pool ${pool.name}: active account is limited and no allowed account has headroom; backing off ${Math.round(st.backoffMs / 1000)}s`);
+          }
         } else {
           st.backoffMs = 0;
           if (outcome.action === "swapped") {
@@ -138,10 +143,13 @@ export class PoolSwapScheduler {
   start(): void {
     if (this.timer) return;
     const loop = () => {
+      const now = Date.now();
+      const due = [...this.state.values()].map((state) => state.nextAt).filter((at) => at > now);
+      const waitMs = Math.min(MIN_POLL_MS / 2, ...(due.length ? [Math.min(...due) - now] : []));
       this.timer = setTimeout(async () => {
         await this.tick().catch(() => undefined);
         if (!this.stopped) loop();
-      }, MIN_POLL_MS / 2);
+      }, waitMs);
       this.timer.unref?.();
     };
     // First pass soon after boot; afterwards a 30s heartbeat only dispatches

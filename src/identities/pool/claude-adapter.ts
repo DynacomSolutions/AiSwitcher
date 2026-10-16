@@ -15,6 +15,12 @@ export const claudeAdapter: PoolAdapter<MemberUsage> = {
   swapCredentials: (input) => swapCredentialFiles(input),
   fetchUsage: (member, deps) => {
     const d = (deps ?? {}) as FetchUsageDeps & { registryPath?: string };
-    return fetchMemberUsage(member, { ...d, claudeRegistryPath: d.claudeRegistryPath ?? d.registryPath });
+    return fetchMemberUsage(member, { ...d, claudeRegistryPath: d.claudeRegistryPath ?? d.registryPath }).then((usage) => ({
+      ...usage,
+      windows: [
+        ...(usage.fiveHour ? [{ label: "five-hour", utilization: usage.fiveHour.utilization, ...(usage.fiveHour.resetsAt ? { resetsAt: usage.fiveHour.resetsAt } : {}) }] : []),
+        ...(usage.sevenDay ? [{ label: "seven-day", utilization: usage.sevenDay.utilization, ...(usage.sevenDay.resetsAt ? { resetsAt: usage.sevenDay.resetsAt } : {}) }] : []),
+      ],
+    }));
   },
 };

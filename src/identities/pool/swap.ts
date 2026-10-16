@@ -26,6 +26,7 @@ export interface PerformSwapOptions {
   ledgerPath?: string;
   lock?: LockOptions;
   now?: () => Date;
+  hardLimitUntilMs?: number;
   /** Runs under the pool lock after the registry re-read, before any
    * credential is touched; throw `SwapSkipped` to abandon the swap. */
   guard?: (ctx: { pool: PoolIdentity; ledgerPath: string }) => Promise<void>;
@@ -66,7 +67,14 @@ async function swapLocked(adapter: PoolAdapter<any>, options: PerformSwapOptions
   }
   if (!fsResult.noop) {
     await appendSwapEvent(
-      { ts: (options.now?.() ?? new Date()).toISOString(), pool: pool.name, from: fsResult.from, to: target.name, reason: options.reason },
+      {
+        ts: (options.now?.() ?? new Date()).toISOString(),
+        pool: pool.name,
+        from: fsResult.from,
+        to: target.name,
+        reason: options.reason,
+        ...(options.hardLimitUntilMs !== undefined ? { hardLimitUntilMs: options.hardLimitUntilMs } : {}),
+      },
       ledgerPath,
     );
   }
