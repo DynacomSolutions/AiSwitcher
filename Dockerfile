@@ -6,6 +6,7 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
+COPY mods ./mods
 COPY scripts ./scripts
 RUN bun build --compile src/ais.ts --outfile /out/ais
 
