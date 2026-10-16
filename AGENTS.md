@@ -103,10 +103,13 @@ Identity and launch:
   real binary is resolved fresh each run, never cached. One compiled binary per
   tool; no argv0 dispatch (the sidecar is re-entered via argv[2] plus an env spec).
 - The flag is `--identity` (not `--account`/`--profile`; codex owns `-p/--profile`).
-- A nested launch with no `--id` inherits `AI_PROFILE_SWITCHER_SESSION`; only an
-  explicit, different identity is rejected. The Bash hook
-  `~/.ais/hooks/cross-agent-require-id.*` encodes the same policy and must stay
-  in lockstep.
+- A nested launch inherits and validates `AI_PROFILE_SWITCHER_SESSION` only
+  when the parent and target use the same provider tool. Cross-provider
+  launches resolve their own identity while retaining nested-session
+  behaviour. The runtime uses `AI_PROFILE_SWITCHER_TOOL` to identify the
+  parent provider. The machine-local Bash hook
+  `~/.ais/hooks/cross-agent-require-id.*` is outside this repository and
+  applies the same provider-scoped rule.
 - Codex user-preference keys (`model`, `model_reasoning_effort`, `service_tier`)
   must never be sent as `-c` overrides. Never weaken the Codex backfill lease
   guards (repair only when the SQLite owner is provably gone). Never rewrite a
