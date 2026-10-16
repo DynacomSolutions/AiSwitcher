@@ -4,6 +4,7 @@ import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } fro
 import { promptForIdentity } from "./prompt.ts";
 import { NonInteractiveResolutionError, RetiredIdentityError, UnknownIdentityError, UnknownPoolError } from "./errors.ts";
 import { findRetiredByConfigDir, isRetired } from "./retired.ts";
+import { adapterFor } from "./pool/registry.ts";
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
 
@@ -51,10 +52,9 @@ export async function resolveIdentity(
   opts: ResolveOptions,
   deps: ResolveDeps = defaultResolveDeps,
 ): Promise<ResolvedIdentity> {
-  // Single-instance tools (pi) never proxy per identity and never prompt:
-  // one shared config dir launches, and the tool's own extension surface
-  // exposes every AIS identity for in-app switching. A matched/flagged
-  // identity only seeds the in-app default.
+  // Single-instance tools (pi) keep ordinary identities on one shared config
+  // dir. An unresolved interactive launch offers the picker when an active
+  // pool exists; selecting a pool uses its own config directory.
   if (cfg.singleInstanceDir) {
     return resolveSingleInstanceIdentity(cfg, opts, deps);
   }
@@ -73,7 +73,7 @@ export async function resolveIdentity(
     return { identity, configDirValue: expandPath(identity.configDir), source: "flag" };
   }
 
-  // (a2) explicit --pool=<name> launches that pool directly (claude only).
+  // (a2) explicit --pool=<name> launches a registered pool directly.
   if (opts.explicitPoolFlag) {
     const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
     const pools = file.identities.filter((i) => i.swapPool !== undefined && !isRetired(i));
@@ -150,13 +150,11 @@ export async function resolveIdentity(
 
 /**
  * Resolution for single-instance tools (ToolConfig.singleInstanceDir - pi).
- * NEVER prompts and NEVER fails on no-match: the launch always targets the
- * one shared instance dir, and an identity (flag > preset env marker >
- * directory match) only seeds the in-app default via
- * AI_PROFILE_SWITCHER_SESSION. An explicit --identity must still name a real
- * registry entry (a typo should not silently launch a different persona),
- * and a preset PI_CODING_AGENT_DIR remains a power-user override pointing
- * the whole instance somewhere else.
+ * Ordinary identities use the shared instance dir; pool identities use their
+ * configured pool directory. Without active pools or an explicit picker mode,
+ * no-match still launches the shared instance without prompting. An explicit
+ * --identity must still name a real registry entry, and a preset
+ * PI_CODING_AGENT_DIR remains a power-user override of the whole instance.
  */
 export async function resolveSingleInstanceIdentity(
   cfg: ToolConfig,
@@ -168,8 +166,8 @@ export async function resolveSingleInstanceIdentity(
   }
   const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
 
-  // (a) explicit --identity=<name> seeds the in-app default identity; it
-  // must exist. The instance dir stays the shared one.
+  // (a) explicit --identity=<name> must exist. Ordinary identities seed the
+  // in-app default in the shared dir; a pool identity uses its own directory.
   if (opts.explicitIdentityFlag) {
     const identity = findIdentityByNameOrAlias(file.identities, opts.explicitIdentityFlag);
     if (!identity) {
@@ -179,25 +177,41 @@ export async function resolveSingleInstanceIdentity(
       );
     }
     if (isRetired(identity)) throw new RetiredIdentityError(cfg.toolName, identity);
-    return { identity, configDirValue: expandPath(cfg.singleInstanceDir), source: "flag" };
+    return {
+      identity,
+      configDirValue: expandPath(identity.swapPool ? identity.configDir : cfg.singleInstanceDir),
+      source: "flag",
+    };
+  }
+
+  // An explicit pool is a separate runtime config for pi. It must use the
+  // pool's own directory so the pool adapter's credentials are loaded.
+  if (opts.explicitPoolFlag) {
+    const pools = file.identities.filter((i) => i.swapPool !== undefined && !isRetired(i));
+    const pool = findIdentityByNameOrAlias(pools, opts.explicitPoolFlag);
+    if (!adapterFor(cfg.toolName) || !pool) {
+      throw new UnknownPoolError(opts.explicitPoolFlag, pools.map((p) => p.name));
+    }
+    return { identity: pool, configDirValue: expandPath(pool.configDir), source: "flag" };
   }
 
   // (b) preset env var: power-user override of the whole instance dir.
   const presetEnvValue = opts.env[cfg.envVarName];
-  if (presetEnvValue) {
+  if (presetEnvValue && !opts.pickerMode) {
     await assertEnvNotRetired(cfg, presetEnvValue, deps);
     return { identity: undefined, configDirValue: presetEnvValue, source: "env" };
   }
 
-  // (c) directory match seeds the default identity but never changes the
-  // launch target. Ambiguity is demoted to "no seed" (the in-app switcher
-  // resolves it) instead of prompting.
-  const matchResult = deps.matchDirectory(opts.cwd, file.identities);
+  // (c) directory match seeds an ordinary identity in the shared instance; a
+  // matched pool uses its pool directory. Ambiguity is demoted to "no seed".
+  const matchResult = opts.pickerMode ? undefined : deps.matchDirectory(opts.cwd, file.identities);
   // A retired match is ignored: it must never seed the in-app default.
   if (matchResult && !("ambiguous" in matchResult) && !isRetired(matchResult.identity)) {
     return {
       identity: matchResult.identity,
-      configDirValue: expandPath(cfg.singleInstanceDir),
+      configDirValue: expandPath(
+        matchResult.identity.swapPool ? matchResult.identity.configDir : cfg.singleInstanceDir,
+      ),
       source: "directory-match",
     };
   }
@@ -205,10 +219,28 @@ export async function resolveSingleInstanceIdentity(
     console.error(
       `${cfg.toolName}: cwd matches multiple identities [${matchResult.candidates
         .map((c) => c.name)
-        .join(", ")}] - launching the shared instance without a default; use /ais inside the app to pick one.`,
+        .join(", ")}] - no unique default identity; falling back to interactive selection when available.`,
     );
   }
 
-  // (d) no seed - launch the shared instance plain.
+  const hasPools =
+    adapterFor(cfg.toolName) !== undefined && file.identities.some((i) => i.swapPool !== undefined && !isRetired(i));
+  if (opts.pickerMode || (hasPools && !opts.nonInteractiveHint && deps.isInteractive())) {
+    if (opts.nonInteractiveHint || !deps.isInteractive()) {
+      throw new NonInteractiveResolutionError(
+        `${cfg.toolName}: pool or identity selection needs an interactive terminal. Pass --identity=<name> or --pool=<name>.`,
+      );
+    }
+    const timeoutMs = opts.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
+    const { identity, created } = await deps.promptForIdentity(file, cfg, timeoutMs, undefined, opts.pickerMode);
+    return {
+      identity,
+      configDirValue: expandPath(identity.swapPool ? identity.configDir : cfg.singleInstanceDir),
+      source: created ? "interactive-created" : "interactive-existing",
+    };
+  }
+
+  // (d) no picker was requested: launch the shared instance plain. With pools,
+  // this includes noninteractive invocations that cannot open a prompt.
   return { identity: undefined, configDirValue: expandPath(cfg.singleInstanceDir), source: "single-instance" };
 }

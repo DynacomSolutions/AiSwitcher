@@ -96,13 +96,22 @@ the footer must show the identity's real LABEL ("Personal", not "personal"),
 and pi must remember the last-used model across launches. Design:
 
 - **Launch boundary**: `PI_CONFIG.singleInstanceDir` (~/.pi/agent, pi's own
-  default home) makes `resolveIdentity` take `resolveSingleInstanceIdentity`:
-  it NEVER prompts and never errors on no-match. `--identity=<name>` must
-  still name a real registry entry (typos stay loud) but only SEEDS the
-  in-app default; a preset `PI_CODING_AGENT_DIR` remains a power-user
-  override of the whole instance (also the way to launch an OLD per-identity
-  profile with its historical sessions). A dir-pattern match seeds the
-  default identity; ambiguity demotes to "no seed" with one stderr note.
+  default home) makes ordinary pi launches use `resolveSingleInstanceIdentity`.
+  `--identity=<name>` must still name a real registry entry (typos stay loud).
+  An ordinary identity only SEEDS the in-app default; selecting a pool uses
+  its configured directory. A preset `PI_CODING_AGENT_DIR` remains a
+  power-user override of the whole instance (also the way to launch an OLD
+  per-identity profile with its historical sessions). A dir-pattern match
+  seeds the default identity; ambiguity demotes to "no seed" with one stderr
+  note. If active pi pools exist and no explicit identity, env override or
+  unique directory match resolves, an interactive launch uses the shared
+  identity/pool picker. Selecting an ordinary identity still launches the
+  shared instance; selecting a pool launches its configured pool directory.
+  An unresolved noninteractive launch stays on the shared instance.
+  With no active pools, no-match remains a plain shared-instance launch with no
+  prompt. `--identity=<name>` selects an ordinary identity or pool directly;
+  bare `--identity` and `--pool` explicitly open the corresponding picker list
+  and require an interactive terminal.
   When nothing matched, run-wrapper OMITS `AI_PROFILE_SWITCHER_SESSION`
   entirely - a basename pseudo-marker ("agent") would be inherited by nested
   `codex`/`claude` launches and fail there as UnknownIdentityError.

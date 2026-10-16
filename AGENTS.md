@@ -161,8 +161,9 @@ Console, reporting and credentials:
 - OpenCode wrapper never prompts for identity in `run`/`acp`/`serve`; never reuse
   Claude Pro/Max OAuth; never aggregate credentials from unrelated identities
   into one OpenCode profile.
-- pi (single instance) never prompts and never errors on no-match; with no match
-  it omits `AI_PROFILE_SWITCHER_SESSION`.
+- pi uses its shared single instance when no identity resolves; when active
+  pools exist, an unresolved interactive launch offers the identity/pool picker.
+  With no pools and no match it still omits `AI_PROFILE_SWITCHER_SESSION`.
 - herdr is never bundled or installed by ais; the bridge only calls its CLI and
   never kills or signals herdr processes (except killing our own timed-out CLI
   client spawn).

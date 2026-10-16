@@ -205,6 +205,183 @@ describe("single-instance resolution (pi)", () => {
     expect(result.source).toBe("single-instance");
     expect(result.identity).toBeUndefined();
   });
+
+  test("an active pool makes an unresolved interactive pi launch offer pool selection and use its config dir", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/unmatched", env: {} },
+      fakeDeps({
+        loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+        isInteractive: () => true,
+        promptForIdentity: async () => ({ identity: pool, created: false }),
+      }),
+    );
+    expect(result.source).toBe("interactive-existing");
+    expect(result.identity?.name).toBe("pi-team-pool");
+    expect(result.configDirValue).toBe(pool.configDir);
+  });
+
+  test("a pool-enabled pi launch keeps ordinary identities on the shared instance dir", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/unmatched", env: {} },
+      fakeDeps({
+        loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+        isInteractive: () => true,
+        promptForIdentity: async () => ({ identity: IDENTITIES[0]!, created: false }),
+      }),
+    );
+    expect(result.identity?.name).toBe("work");
+    expect(result.configDirValue).toBe(SINGLE_CFG.singleInstanceDir!);
+  });
+
+  test("an explicit pi pool uses the pool config dir while explicit ordinary identities stay shared", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const deps = fakeDeps({ loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }) });
+    const selectedPool = await resolveIdentity(
+      SINGLE_CFG,
+      { explicitPoolFlag: "pi-team-pool", cwd: "/x", env: {} },
+      deps,
+    );
+    expect(selectedPool.configDirValue).toBe(pool.configDir);
+
+    const selectedPoolAsIdentity = await resolveIdentity(
+      SINGLE_CFG,
+      { explicitIdentityFlag: "pi-team-pool", cwd: "/x", env: {} },
+      deps,
+    );
+    expect(selectedPoolAsIdentity.configDirValue).toBe(pool.configDir);
+
+    const selectedIdentity = await resolveIdentity(
+      SINGLE_CFG,
+      { explicitIdentityFlag: "work", cwd: "/x", env: {} },
+      deps,
+    );
+    expect(selectedIdentity.configDirValue).toBe(SINGLE_CFG.singleInstanceDir!);
+  });
+
+  test("a directory match to a pi pool uses its pool config dir", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      directories: ["/tmp/does-not-exist/pi-fixture-dir/*"],
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/tmp/does-not-exist/pi-fixture-dir/subdir", env: {} },
+      fakeDeps({
+        loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+      }),
+    );
+    expect(result.identity?.name).toBe("pi-team-pool");
+    expect(result.configDirValue).toBe(pool.configDir);
+  });
+
+  test("pool presence does not turn unresolved noninteractive Pi launches into errors", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/unmatched", env: {}, nonInteractiveHint: true },
+      fakeDeps({
+        loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+        isInteractive: () => true,
+      }),
+    );
+    expect(result.source).toBe("single-instance");
+    expect(result.configDirValue).toBe(SINGLE_CFG.singleInstanceDir!);
+  });
+
+  test("a bare pool picker bypasses pi env and directory defaults and refuses noninteractive use", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const deps = fakeDeps({
+      loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+      isInteractive: () => true,
+      promptForIdentity: async () => ({ identity: pool, created: false }),
+    });
+    const result = await resolveIdentity(
+      SINGLE_CFG,
+      {
+        pickerMode: "pool",
+        cwd: "/tmp/does-not-exist/proj/anything",
+        env: { PI_CODING_AGENT_DIR: "/custom/instance" },
+      },
+      deps,
+    );
+    expect(result.source).toBe("interactive-existing");
+    expect(result.identity?.name).toBe("pi-team-pool");
+    expect(result.configDirValue).toBe(pool.configDir);
+
+    await expect(
+      resolveIdentity(
+        SINGLE_CFG,
+        { pickerMode: "pool", cwd: "/x", env: {}, nonInteractiveHint: true },
+        fakeDeps({
+          loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+          isInteractive: () => false,
+        }),
+      ),
+    ).rejects.toThrow(NonInteractiveResolutionError);
+  });
+
+  test("a unique directory match and preset instance env keep precedence over pool prompting", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const deps = fakeDeps({
+      loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool] }),
+      isInteractive: () => true,
+      promptForIdentity: async () => {
+        throw new Error("a resolved identity must bypass the picker");
+      },
+    });
+    const matched = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/tmp/does-not-exist/proj/anything", env: {} },
+      deps,
+    );
+    expect(matched.identity?.name).toBe("work");
+    expect(matched.configDirValue).toBe(SINGLE_CFG.singleInstanceDir!);
+
+    const env = await resolveIdentity(
+      SINGLE_CFG,
+      { cwd: "/unmatched", env: { PI_CODING_AGENT_DIR: "/custom/instance" } },
+      deps,
+    );
+    expect(env.source).toBe("env");
+    expect(env.configDirValue).toBe("/custom/instance");
+  });
 });
 
 describe("pool flags", () => {
