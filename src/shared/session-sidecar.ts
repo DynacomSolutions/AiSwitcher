@@ -5,7 +5,13 @@ import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sy
 import { startProfileSyncWatcher } from "../sync/watch.ts";
 import { aisHerdrTabLabelsPath, aisStateDir } from "./ais-home.ts";
 import { darwinExe, darwinProc } from "./darwin-proc.ts";
-import { execveReal, spawnReal, withUsableCwd } from "./exec.ts";
+import {
+  execveReal,
+  IDENTITY_SESSION_MARKER,
+  IDENTITY_SESSION_TOOL_MARKER,
+  spawnReal,
+  withUsableCwd,
+} from "./exec.ts";
 import { readHerdrChatTitle, type HerdrChatTool } from "./herdr-chat-source.ts";
 import { HerdrTabTitleWatcher } from "./herdr-tab-title.ts";
 
@@ -258,6 +264,9 @@ export async function launchWithSession(
   real: RealLaunch,
   deps: LaunchDeps = defaultDeps,
 ): Promise<number> {
+  const launch: RealLaunch = real.env[IDENTITY_SESSION_MARKER]
+    ? { ...real, env: { ...real.env, [IDENTITY_SESSION_TOOL_MARKER]: cfg.toolName } }
+    : real;
   const title = spec.title?.initialPrompt === undefined
     ? spec.title
     : { ...spec.title, initialPrompt: spec.title.initialPrompt.slice(0, MAX_PROMPT_BYTES) };
@@ -270,17 +279,17 @@ export async function launchWithSession(
     ...(exeOf(process.pid) ? { initialExe: exeOf(process.pid) as string } : {}),
   };
   if (await deps.spawnSidecar(full)) {
-    const reason = deps.execve(real);
+    const reason = deps.execve(launch);
     // Elsewhere the spawn path is the normal route, not a fallback worth recording.
     if (["linux", "darwin"].includes(deps.platform ?? process.platform)) {
       logFallback(deps.logPath, cfg.toolName, `spawn fallback (sidecar keeps the session work): ${reason}`);
     }
-    return await deps.spawn(real);
+    return await deps.spawn(launch);
   }
   logFallback(deps.logPath, cfg.toolName, "in-process fallback: the sidecar could not be started");
   const work = await deps.startWork(cfg, full);
-  const launch = () => deps.spawn(real);
-  const exitCode = await (spec.syncAtLaunch ? launchThenStartBackgroundSync(launch) : launch());
+  const spawn = () => deps.spawn(launch);
+  const exitCode = await (spec.syncAtLaunch ? launchThenStartBackgroundSync(spawn) : spawn());
   await work.stop();
   return exitCode;
 }

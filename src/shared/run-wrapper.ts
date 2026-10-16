@@ -3,7 +3,7 @@ import { basename, join } from "node:path";
 import { resolveIdentity } from "../identities/resolve.ts";
 import { PromptCancelledError, RetiredIdentityError } from "../identities/errors.ts";
 import { isRetired } from "../identities/retired.ts";
-import { activeParentIdentity, parseCliArgs, resolveNestedIdentity } from "./cli-args.ts";
+import { parseCliArgs, resolveParentLaunchContext } from "./cli-args.ts";
 import { realpathSync } from "node:fs";
 import { resolveRealBinary, shimExecEnvVar } from "./resolve-binary.ts";
 import { IDENTITY_SESSION_MARKER } from "./exec.ts";
@@ -41,14 +41,9 @@ export async function runWrapper(
     // see migrate-ais-home.ts. Never throws.
     await migrateLegacyAisHome();
     const parsed = parseCliArgs(cfg.toolName, process.argv.slice(2));
-    const parentIdentity = activeParentIdentity(cfg.envVarName, process.env);
-
-    // A nested launch with no --id auto-inherits the parent session's
-    // identity (see resolveNestedIdentity) — only an explicit, DIFFERENT
-    // --id is rejected as cross-identity pollution.
-    const identityFlag = resolveNestedIdentity(
+    const { parentSession, identityFlag } = resolveParentLaunchContext(
       cfg.toolName,
-      parentIdentity,
+      process.env,
       parsed.identityFlag,
     );
 
@@ -101,7 +96,7 @@ export async function runWrapper(
 
     if (parsed.desktopFlag) {
       const launch = () => launchDesktopApp(appName, cfg.envVarName, resolved.configDirValue, cfg.extraEnvVarNames);
-      if (parentIdentity) launch();
+      if (parentSession) launch();
       else launchThenStartBackgroundSync(launch);
       console.error(
         `${cfg.toolName}: launched ${appName}.app directly with ${cfg.envVarName}=${resolved.configDirValue} ` +
@@ -143,13 +138,13 @@ export async function runWrapper(
     const chatTitleTools: HerdrChatTool[] = ["claude", "codex", "grok", "kimi", "zai", "ali", "opencode"];
     const chatTitleTool = chatTitleTools.find((tool): tool is HerdrChatTool => tool === cfg.toolName);
     const inheritedTitleOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
-    const wantsTitles = !parentIdentity && (!inheritedTitleOwner || inheritedTitleOwner === String(process.pid)) && chatTitleTool;
+    const wantsTitles = !parentSession && (!inheritedTitleOwner || inheritedTitleOwner === String(process.pid)) && chatTitleTool;
     // The real tool takes over this PID (execve). A nested launch used to hand
     // its child the wrapper's PID, i.e. "someone else"; keep that meaning by
     // naming the parent, or pi's extension would see its own PID and claim the
     // tab titles.
     const titleOwnerPid = process.env.AIS_HERDR_TITLE_OWNER_PID
-      ?? (parentIdentity ? String(process.ppid) : cfg.toolName !== "pi" ? String(process.pid) : undefined);
+      ?? (parentSession ? String(process.ppid) : cfg.toolName !== "pi" ? String(process.pid) : undefined);
     const initialPrompt = promptFromCliArgs(cfg.toolName, parsed.cleanedArgv);
     // The real agent replaces this process (execve), so in-session work (sync
     // watcher, Herdr tab titles, post-exit sync) lives in a detached sidecar;
@@ -163,7 +158,7 @@ export async function runWrapper(
           : {}),
         configDirValue: resolved.configDirValue,
         cwd: process.cwd(),
-        syncAtLaunch: !parentIdentity,
+        syncAtLaunch: !parentSession,
         ...(wantsTitles && chatTitleTool
           ? { title: { tool: chatTitleTool, ...(initialPrompt !== undefined ? { initialPrompt } : {}) } }
           : {}),

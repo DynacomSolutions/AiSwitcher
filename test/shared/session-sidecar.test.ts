@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CODEX_CONFIG } from "../../src/identities/tool-configs.ts";
+import { CLAUDE_CONFIG, CODEX_CONFIG } from "../../src/identities/tool-configs.ts";
 import {
   isPidRunning,
   launchWithSession,
@@ -18,6 +18,8 @@ import {
   type RealLaunch,
   type SessionSpec,
 } from "../../src/shared/session-sidecar.ts";
+import { IDENTITY_SESSION_MARKER, IDENTITY_SESSION_TOOL_MARKER } from "../../src/shared/exec.ts";
+import { activeParentSession, resolveNestedIdentity } from "../../src/shared/cli-args.ts";
 
 // Start-time and zombie detection exist on both: /proc on Linux, sysctl on macOS.
 const supported = process.platform === "linux" || process.platform === "darwin";
@@ -96,11 +98,11 @@ describe("launchWithSession", () => {
 
   function deps(overrides: Partial<LaunchDeps> = {}) {
     const calls: string[] = [];
-    const seen: { spec?: SessionSpec } = {};
+    const seen: { spec?: SessionSpec; real?: RealLaunch; execve?: RealLaunch } = {};
     const d: LaunchDeps = {
       spawnSidecar: (spec) => (calls.push("sidecar"), (seen.spec = spec), true),
-      execve: () => (calls.push("execve"), "execve failed"),
-      spawn: async () => (calls.push("spawn"), 5),
+      execve: (real) => (calls.push("execve"), (seen.execve = real), "execve failed"),
+      spawn: async (real) => (calls.push("spawn"), (seen.real = real), 5),
       logPath: join(logDir, "fallback.log"),
       startWork: async () => (calls.push("work"), { stop: async () => void calls.push("stop") }),
       ...overrides,
@@ -113,6 +115,70 @@ describe("launchWithSession", () => {
     await launchWithSession(CODEX_CONFIG, base, real, d);
     expect(calls.slice(0, 2)).toEqual(["sidecar", "execve"]);
     expect(seen.spec).toMatchObject({ toolName: "codex", pid: process.pid, syncAtLaunch: true });
+  });
+
+  test("stamps the originating tool beside a seeded session marker before execve", async () => {
+    const { d, seen } = deps();
+    await launchWithSession(CODEX_CONFIG, base, {
+      ...real,
+      env: {
+        ...real.env,
+        CODEX_HOME: "/synthetic/codex/member-a",
+        [IDENTITY_SESSION_MARKER]: "member-a",
+      },
+    }, d);
+    expect(seen.execve?.env).toMatchObject({
+      [IDENTITY_SESSION_MARKER]: "member-a",
+      [IDENTITY_SESSION_TOOL_MARKER]: "codex",
+    });
+    const childContext = activeParentSession("claude", {
+      ...seen.execve!.env,
+      CLAUDE_CONFIG_DIR: "/synthetic/claude/pool-b",
+    });
+    expect(childContext).toEqual({ toolName: "codex", identity: "member-a" });
+    expect(resolveNestedIdentity("claude", undefined, "pool-b")).toBe("pool-b");
+  });
+
+  test("Claude resume launches stamp Claude so a nested Codex launch stays provider-scoped", async () => {
+    const { d, seen } = deps();
+    await launchWithSession(CLAUDE_CONFIG, base, {
+      ...real,
+      env: {
+        CLAUDE_CONFIG_DIR: "/synthetic/claude/pool-a",
+        [IDENTITY_SESSION_MARKER]: "pool-a",
+      },
+    }, d);
+    const childContext = activeParentSession("codex", {
+      ...seen.execve!.env,
+      CODEX_HOME: "/synthetic/codex/member-b",
+    });
+    expect(childContext).toEqual({ toolName: "claude", identity: "pool-a" });
+    expect(resolveNestedIdentity("codex", undefined, "member-b")).toBe("member-b");
+  });
+
+  test("stamps the tool on spawn fallback and leaves an unseeded launch unmarked", async () => {
+    const fallback = deps({ execve: () => "unavailable" });
+    await launchWithSession(CODEX_CONFIG, base, {
+      ...real,
+      env: { ...real.env, [IDENTITY_SESSION_MARKER]: "member-a" },
+    }, fallback.d);
+    expect(fallback.seen.real?.env[IDENTITY_SESSION_TOOL_MARKER]).toBe("codex");
+
+    const unseeded = deps();
+    await launchWithSession(CODEX_CONFIG, base, real, unseeded.d);
+    expect(unseeded.seen.real?.env[IDENTITY_SESSION_TOOL_MARKER]).toBeUndefined();
+  });
+
+  test("stamps the originating tool when the sidecar cannot start", async () => {
+    const noSidecar = deps({ spawnSidecar: () => false });
+    await launchWithSession(CODEX_CONFIG, base, {
+      ...real,
+      env: { ...real.env, [IDENTITY_SESSION_MARKER]: "member-a" },
+    }, noSidecar.d);
+    expect(noSidecar.seen.real?.env).toMatchObject({
+      [IDENTITY_SESSION_MARKER]: "member-a",
+      [IDENTITY_SESSION_TOOL_MARKER]: "codex",
+    });
   });
 
   test("execve unavailable: spawns the child, the sidecar keeps the session work", async () => {

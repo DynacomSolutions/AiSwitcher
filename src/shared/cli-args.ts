@@ -1,5 +1,17 @@
-import { IDENTITY_SESSION_MARKER } from "./exec.ts";
+import { IDENTITY_SESSION_MARKER, IDENTITY_SESSION_TOOL_MARKER } from "./exec.ts";
 import { adapterFor } from "../identities/pool/registry.ts";
+export type IdentitySessionTool = "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode";
+
+const TOOL_ENV_VARS: Record<IdentitySessionTool, string> = {
+  claude: "CLAUDE_CONFIG_DIR",
+  codex: "CODEX_HOME",
+  grok: "GROK_HOME",
+  kimi: "KIMI_CODE_HOME",
+  zai: "CRUSH_GLOBAL_CONFIG",
+  ali: "ALI_CONFIG_DIR",
+  pi: "PI_CODING_AGENT_DIR",
+  opencode: "OPENCODE_CONFIG_DIR",
+};
 
 export interface ParsedCliArgs {
   identityFlag?: string;
@@ -13,34 +25,25 @@ export interface ParsedCliArgs {
 }
 
 /**
- * Reconcile a nested claude/codex/grok launch's explicit --id (if any)
- * against the parent session's own identity, returning the identity that
- * should actually be used.
- *
- * A nested launch with NO --id auto-inherits the parent's identity — this is
- * the overwhelmingly common case (any script/subagent that shells out to
- * claude/codex/grok without knowing or caring about identities at all) and
- * must just work, not force every such caller across every repo to be taught
- * about --id. Only a nested launch that EXPLICITLY names a *different*
- * identity than the parent is rejected — that's the actual cross-identity
- * pollution case (e.g. a hardcoded --id=personal firing from inside a
- * identity-a session), not merely omitting the flag.
+ * Detect nested context from the source tool marker and its config env var.
+ * Legacy launches without a source marker are trusted only against the
+ * target tool's own config env var.
  */
-/**
- * The parent session identity a launch may inherit, or undefined for a
- * top-level launch. The marker is only trusted together with the tool's own
- * config env var: every genuine nested launch carries both (spawnReal sets
- * them as a pair). A marker alone is stale, typically leaked into a fresh
- * shell by a terminal multiplexer or a daemon started from inside a session,
- * and honouring it silently skips the picker and directory matching.
- */
-export function activeParentIdentity(
-  envVarName: string,
+export function activeParentSession(
+  targetTool: IdentitySessionTool,
   env: Record<string, string | undefined>,
-): string | undefined {
-  const marker = env[IDENTITY_SESSION_MARKER];
-  if (!marker) return undefined;
-  return env[envVarName] ? marker : undefined;
+): { toolName: IdentitySessionTool; identity: string } | undefined {
+  const identity = env[IDENTITY_SESSION_MARKER];
+  if (!identity) return undefined;
+
+  const parentTool = env[IDENTITY_SESSION_TOOL_MARKER];
+  if (parentTool) {
+    if (!Object.hasOwn(TOOL_ENV_VARS, parentTool)) return undefined;
+    const toolName = parentTool as IdentitySessionTool;
+    return env[TOOL_ENV_VARS[toolName]] ? { toolName, identity } : undefined;
+  }
+
+  return env[TOOL_ENV_VARS[targetTool]] ? { toolName: targetTool, identity } : undefined;
 }
 
 export function resolveNestedIdentity(
@@ -62,6 +65,24 @@ export function resolveNestedIdentity(
     );
   }
   return requestedIdentity;
+}
+
+/**
+ * Keep nesting context for lifecycle work, but inherit and validate an
+ * explicit identity only when parent and child use the same provider.
+ */
+export function resolveParentLaunchContext(
+  targetTool: IdentitySessionTool,
+  env: Record<string, string | undefined>,
+  requestedIdentity: string | undefined,
+): {
+  parentSession: { toolName: IdentitySessionTool; identity: string } | undefined;
+  identityFlag: string | undefined;
+} {
+  const parentSession = activeParentSession(targetTool, env);
+  const parentIdentity = parentSession?.toolName === targetTool ? parentSession.identity : undefined;
+  const identityFlag = resolveNestedIdentity(targetTool, parentIdentity, requestedIdentity);
+  return { parentSession, identityFlag };
 }
 
 // "--id" (not "-i") is the shorthand: codex already has a native "-i, --image"

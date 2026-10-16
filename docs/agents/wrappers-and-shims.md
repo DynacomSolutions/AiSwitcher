@@ -71,23 +71,16 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 50
   unrelated native `-p/--profile <name>` (layers `$CODEX_HOME/<name>.config.toml`
   on the *same* identity — a config variant, not an account switch). Using a
   different flag name avoids the collision entirely.
-- **A nested claude/codex/grok/kimi/zai launch with no `--id` auto-inherits the parent
-  session's identity — it is never rejected for merely omitting the flag.**
-  `resolveNestedIdentity()` (`src/shared/cli-args.ts`), called from
-  `run-wrapper.ts` before `resolveIdentity()`, only rejects a nested launch
-  that EXPLICITLY names a *different* identity than
-  `AI_PROFILE_SWITCHER_SESSION` — that's the actual cross-identity-pollution
-  case. Bare nested launches must inherit the session so downstream callers
-  need no identity-specific arguments. The companion Bash-level hook,
-  `~/.ais/hooks/cross-agent-require-id.sh` /`.py` (wired into every identity's
-  settings.json/hooks.json as "everywhere" enforcement — NOT part of this
-  repo, lives in the shared `~/.ais/` tree), encodes the identical policy
-  independently at the Bash-tool-call layer and
-  was fixed in lockstep — a bare nested launch is not a violation there
-  either; only an explicit, mismatched `--id=` is. The two enforcement points
-  (this repo's own runtime check, and the Bash-command-level hook) are
-  deliberately redundant (defense in depth — the hook catches it before a
-  process even spawns; the runtime check catches anything that reaches the
-  binary some other way) but MUST be kept in sync — this incident is exactly
-  what happens when they drift.
+- **Nested identity inheritance and validation are scoped to the provider
+  tool.** `launchWithSession()` stamps `AI_PROFILE_SWITCHER_TOOL` alongside
+  `AI_PROFILE_SWITCHER_SESSION`, including direct resume launches. A nested
+  launch from another provider keeps nested-session behaviour such as sync
+  and title ownership, but resolves its identity in its own registry. A
+  launch within the same provider inherits the parent's identity when no
+  `--id` is given and rejects an explicit different identity. Older wrappers
+  without the tool marker retain same-provider protection when the target's
+  own config env var is present. The machine-local Bash hook
+  `~/.ais/hooks/cross-agent-require-id.sh` /`.py` is outside this repository
+  and applies the same rule: it validates `--id` only when the child tool
+  matches the host session's tool.
 
