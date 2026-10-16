@@ -8,11 +8,11 @@ const strip = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, "");
 const win = (category: string, usedPercent: number) => ({ label: category, category, usedPercent, resetsAt: "Oct 17, 8:00 AM" });
 
 /** Cache dir with one claude-limits file per name. */
-const cache = (used: Record<string, [number, number]>) => {
+const cache = (used: Record<string, [number, number]>, extra: Record<string, object> = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "ais-statusline-"));
   mkdirSync(join(dir, "claude-limits"));
   for (const [n, [s, w]] of Object.entries(used)) {
-    writeFileSync(join(dir, "claude-limits", `${n}.json`), JSON.stringify({ toolName: "claude", windows: [win("session", s), win("week", w)], status: "live" }));
+    writeFileSync(join(dir, "claude-limits", `${n}.json`), JSON.stringify({ toolName: "claude", windows: [win("session", s), win("week", w)], status: "live", ...(extra[n] ? { extraUsage: extra[n] } : {}) }));
   }
   return dir;
 };
@@ -174,4 +174,16 @@ test("bad, stale or torn snapshot prints the main bars only", async () => {
     expect(lines.some((l) => l === "codex")).toBe(false);
     expect(lines.filter((l) => /^(session|week)\s/.test(l))).toHaveLength(2);
   }
+});
+
+test("extra row: drawn when enabled, off label when the current member has it off", async () => {
+  const x = (usedPercent: number) => ({ enabled: true, available: true, usedPercent, label: "x" });
+  const cacheDir = cache({ a: [10, 20], b: [30, 40] }, { b: x(60) });
+  const pool = [id("team", "/c/team", { active: "a", accounts: ["a", "b"] }), id("a", "/c/a"), id("b", "/c/b")];
+  const out = strip(await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/team", COLUMNS: "120" }, { cacheDir, identities: async () => pool }));
+  expect(out).toMatch(/^extra\s+\[█+\] pool 60% used, 40% left\s+\|\s+a off/m);
+  const solo = strip(await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/b", COLUMNS: "100" }, { cacheDir, identities: async () => pool }));
+  expect(solo).toMatch(/^extra\s+\[█+\] 60%/m);
+  const none = strip(await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/a", COLUMNS: "100" }, { cacheDir, identities: async () => pool }));
+  expect(none).not.toContain("extra");
 });

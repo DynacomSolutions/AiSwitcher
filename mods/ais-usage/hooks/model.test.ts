@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks, memberCards, resetLabel } from './model'
+import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks, memberCards, resetLabel, rowText } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -188,4 +188,39 @@ test('memberCards: k per row, equal widths filling the width, never over width',
   expect(narrow).toHaveLength(6 * 3)
   expect(narrow[1]!.length).toBe(60)
   for (const c of [160, 60, 30]) for (const l of text(c)) expect(l.length).toBeLessThanOrEqual(c)
+})
+
+const withExtra = (xs: Record<string, { enabled: boolean; usedPercent?: number }>) =>
+  limits.map(l => {
+    const x = l.toolName === 'claude' && !l.identity.swapPool ? xs[l.identity.name] : undefined
+    return x ? { ...l, extraUsage: { available: true, label: 'x', ...x } } : l
+  })
+
+test('extra row: absent unless a member has extra usage enabled', () => {
+  const r = resolveCurrent(limits, '/c/swap', swap)
+  expect(bandRows(r, swap, limits).map(b => b.name)).toEqual(['session', 'week'])
+  expect(bandRows(r, swap, withExtra({ workco: { enabled: false } })).map(b => b.name)).toEqual(['session', 'week'])
+})
+
+test('extra row: pool mean over enabled members, off label when current is not enabled', () => {
+  const lims = withExtra({ acme: { enabled: true, usedPercent: 40 }, workco: { enabled: true, usedPercent: 20 } })
+  const r = resolveCurrent(lims, '/c/swap', swap)
+  const row = bandRows(r, swap, lims).find(b => b.name === 'extra')!
+  expect(row.active).toBe(20)
+  expect(row.pool).toEqual({ pct: 30, reporting: 2, total: 2 })
+  expect(rowText(r, row).curText).toBe('workco 20%')
+  const lims2 = withExtra({ acme: { enabled: true, usedPercent: 40 } })
+  const row2 = bandRows(resolveCurrent(lims2, '/c/swap', swap), swap, lims2).find(b => b.name === 'extra')!
+  expect(row2.active).toBe(0)
+  expect(rowText(resolveCurrent(lims2, '/c/swap', swap), row2).curText).toBe('workco off')
+})
+
+test('extra row: single identity only when enabled; member cards list it', () => {
+  const lims = withExtra({ acme: { enabled: true, usedPercent: 7 } })
+  const row = bandRows(resolveCurrent(lims, '/c/acme', null), null, lims).find(b => b.name === 'extra')
+  expect(row).toMatchObject({ active: 7, resets: '' })
+  expect(bandRows(resolveCurrent(limits, '/c/acme', null), null, limits).map(b => b.name)).toEqual(['session', 'week'])
+  const r = resolveCurrent(lims, '/c/swap', swap)
+  const acme = memberBlocks(swap, lims, r)[0]!.members.find(m => m.name === 'acme')!
+  expect(acme.rows.map(x => x.name)).toEqual(['session', 'week', 'extra'])
 })

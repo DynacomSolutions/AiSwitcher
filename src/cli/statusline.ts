@@ -87,6 +87,7 @@ async function cachedLimits(deps: StatuslineDeps): Promise<LimitsEntry[]> {
         identity: { name: identity.name, configDir: identity.configDir, swapPool: identity.swapPool },
         windows: last?.windows ?? [],
         status: last ? "cached" : "unavailable",
+        ...(last?.extraUsage ? { extraUsage: last.extraUsage } : {}),
       } as LimitsEntry;
     }),
   );

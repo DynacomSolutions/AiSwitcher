@@ -143,3 +143,57 @@ test('PromptHint tree has the hint and buttons but no bar rows, open or closed',
   expect(await ui.find({ type: 'Text', text: /^codex$/ })).toBeUndefined()
   await ui.unmount()
 })
+
+const runSwap = async ($: any, on: any, args: string, reply: { exitCode: number; stdout: string; stderr?: string }) => {
+  mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h' })
+  const clock = mock.clock(on)
+  mock.store(on)
+  const calls: string[][] = []
+  on('fs.write', () => ({ value: undefined }) as never)
+  on('session.start', ($$: any, e: any) => ({ cwd: e.cwd }))
+  on('command.register', () => ({ value: { command: 'ais-usage' } }))
+  on('process.run', ($$: any, e: any) => {
+    if (e.argv.includes('claude-swap') && !e.argv.includes('--json')) {
+      calls.push(e.argv.slice(1))
+      return { value: { stderr: '', ...reply } } as never
+    }
+    const out = e.argv.includes('limits') ? limits : status
+    return { value: { exitCode: 0, stdout: JSON.stringify(out), stderr: '' } } as never
+  })
+  await $.session.start?.({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await clock.advance(1)
+  const res = await $.command.run({ command: 'ais-swap', args })
+  return { res, calls }
+}
+
+test('ais-swap status passes ais output through, stripping colour', async ($, on) => {
+  const { res, calls } = await runSwap($, on, '', { exitCode: 0, stdout: '\u001b[32mactive a\u001b[0m\n' })
+  expect(calls).toEqual([['claude-swap', 'status']])
+  expect(res.text).toBe('active a')
+  expect(res.context).toBeUndefined()
+})
+
+test('ais-swap next swaps manually and tells the model', async ($, on) => {
+  const { res, calls } = await runSwap($, on, ' next ', { exitCode: 0, stdout: 'swapped to b' })
+  expect(calls).toEqual([['claude-swap', 'next', '--reason=manual']])
+  expect(res.text).toMatch(/swapped to b\nA running session picks the new login up on its next message/)
+  expect(res.context?.[0]).toMatch(/active account changed to/)
+})
+
+test('ais-swap to <name> and error passthrough without retry', async ($, on) => {
+  const ok = await runSwap($, on, 'b', { exitCode: 0, stdout: 'ok' })
+  expect(ok.calls).toEqual([['claude-swap', 'to', 'b']])
+})
+
+test('ais-swap error text is returned, no force retry', async ($, on) => {
+  const { res, calls } = await runSwap($, on, 'zed', { exitCode: 1, stdout: '', stderr: 'unknown account zed' })
+  expect(calls).toEqual([['claude-swap', 'to', 'zed']])
+  expect(res.text).toBe('unknown account zed')
+  expect(res.context).toBeUndefined()
+})
+
+test('ais-swap rejects more than one word', async ($, on) => {
+  const { res, calls } = await runSwap($, on, 'a b', { exitCode: 0, stdout: '' })
+  expect(calls).toEqual([])
+  expect(res.text).toMatch(/^Usage: \/ais-swap/)
+})

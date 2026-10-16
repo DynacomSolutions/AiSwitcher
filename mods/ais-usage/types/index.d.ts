@@ -1,5 +1,6 @@
 export type Win = { label: string; category?: string; usedPercent: number; resetsAt?: string; resetsAtMs?: number }
 export type SwapPool = { accounts?: string[]; disallowed?: string[]; active?: string; auto?: boolean; thresholdPercent?: number }
+export type ExtraUsage = { enabled: boolean; available: boolean; usedPercent?: number; label: string }
 export type LimitsEntry = {
   toolName: string
   provider?: string
@@ -8,6 +9,7 @@ export type LimitsEntry = {
   status: string
   error?: string
   capturedAt?: string
+  extraUsage?: ExtraUsage
 }
 export type SwapAccount = {
   name: string
@@ -18,6 +20,7 @@ export type SwapAccount = {
     fiveHour?: { utilization: number; resetsAt?: string }
     sevenDay?: { utilization: number; resetsAt?: string }
     maxUtilization?: number
+    extraUsage?: ExtraUsage
   }
 }
 export type SwapStatus = {
