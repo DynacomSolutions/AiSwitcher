@@ -2,6 +2,8 @@ import { readProviderGrantCopy } from "./oauth-reconcile.ts";
 import { poolStoreDirsFor, refreshIdentityOAuthGrant, type FetchImpl } from "./oauth-refresh.ts";
 import type { ExtraUsageInfo, ManualResetInfo } from "../cli/limits/types.ts";
 import type { Identity } from "./types.ts";
+import { aisCacheDir } from "../shared/ais-home.ts";
+import { loadLastGood, saveLastGood, windowsFromUsageBody } from "../cli/limits/claude-limits.ts";
 
 /**
  * Cheap live limits for one claude account: a single read-only
@@ -96,6 +98,8 @@ export interface FetchUsageDeps {
   now?: () => number;
   /** Test hook: claude registry listing swap pools. */
   claudeRegistryPath?: string;
+  /** Test hook: where the per-member last-good read (shared with `ais limits`) lives. */
+  cacheDir?: string;
 }
 
 /** Freshest stored access token for the account (member store or, while
@@ -163,7 +167,21 @@ export async function fetchUsageBodyWithResets(
   }
 }
 
+// Extra usage is a monthly balance and changes slowly, so a read up to 6 hours old still decides well.
+const EXTRA_USAGE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+/** Live reads refresh the shared last-good file; rate-limited/failed reads inherit its fresh-enough extra usage, marked stale. */
 export async function fetchMemberUsage(member: Identity, deps: FetchUsageDeps = {}): Promise<MemberUsage> {
+  const cacheDir = deps.cacheDir ?? aisCacheDir();
+  const usage = await readMemberUsage(member, deps, cacheDir);
+  if (usage.status === "live") return usage;
+  const last = await loadLastGood(member, cacheDir);
+  const age = Date.parse(usage.capturedAt) - Date.parse(last?.capturedAt ?? "");
+  if (!last?.extraUsage || !(age <= EXTRA_USAGE_MAX_AGE_MS)) return usage;
+  return { ...usage, extraUsage: { ...last.extraUsage, stale: true, capturedAt: last.capturedAt } };
+}
+
+async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir: string): Promise<MemberUsage> {
   const capturedAt = new Date((deps.now?.() ?? Date.now())).toISOString();
   const { token, error } = await usableAccessToken(member, deps);
   if (!token) return { status: "unavailable", error: error ?? "no token", capturedAt };
@@ -184,7 +202,13 @@ export async function fetchMemberUsage(member: Identity, deps: FetchUsageDeps = 
   } catch {
     return { status: "unavailable", error: "usage endpoint returned non-JSON", capturedAt };
   }
-  return parseUsageBody(body, capturedAt);
+  const usage = parseUsageBody(body, capturedAt);
+  if (usage.status === "live") {
+    // Keep ais limits' extra fields (overage, manual reset); replace what this read knows.
+    const { extraUsage: _old, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };
+    await saveLastGood(member, { ...prev, toolName: "claude", identity: member, windows: windowsFromUsageBody(body), status: "live", capturedAt, ...(usage.extraUsage ? { extraUsage: usage.extraUsage } : {}) }, cacheDir);
+  }
+  return usage;
 }
 
 /**

@@ -62,6 +62,12 @@ describe("generic pool core", () => {
       expect(r.action === "swapped" && r.result.to).toBe("c");
     });
 
+    test("a rate-limited member carrying stale extra usage is chosen", async () => {
+      const limited: PoolUsage = { status: "rate-limited", capturedAt: "2026-01-01T00:00:00Z", extraUsage: { enabled: true, available: true, label: "extra usage", stale: true } };
+      const r = await run({ a: live(100), b: live(100), c: limited });
+      expect(r.action === "swapped" && r.result.to).toBe("c");
+    });
+
     test("active with available extra usage stays put", async () => {
       expect((await run({ a: extra(100), b: live(100), c: extra(100) })).action).toBe("no-candidate");
     });

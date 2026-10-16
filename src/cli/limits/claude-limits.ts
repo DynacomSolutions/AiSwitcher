@@ -181,7 +181,7 @@ function lastGoodPath(identity: Identity, cacheDir: string): string {
 }
 
 /** Last successful API read, kept so a 429 can still show (stale) numbers. */
-async function saveLastGood(identity: Identity, result: FetchedLimitResult, cacheDir: string): Promise<void> {
+export async function saveLastGood(identity: Identity, result: FetchedLimitResult, cacheDir: string): Promise<void> {
   try {
     const { identity: _identity, ...rest } = result;
     const path = lastGoodPath(identity, cacheDir);
