@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks, memberCards, resetLabel, rowText } from './model'
+import { snapshotName, bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks, memberCards, resetLabel, rowText } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -223,4 +223,11 @@ test('extra row: single identity only when enabled; member cards list it', () =>
   const r = resolveCurrent(lims, '/c/swap', swap)
   const acme = memberBlocks(swap, lims, r)[0]!.members.find(m => m.name === 'acme')!
   expect(acme.rows.map(x => x.name)).toEqual(['session', 'week', 'extra'])
+})
+
+test('snapshotName: per identity, plus the sanitised session id when given', () => {
+  expect(snapshotName('/c/swap')).toBe('swap.json')
+  expect(snapshotName('/c/swap', 'abc-123')).toBe('swap.abc-123.json')
+  expect(snapshotName('/c/swap', '../x/y')).toBe('swap.__x_y.json')
+  expect(snapshotName('/c/swap', '')).toBe('swap.json')
 })

@@ -46,11 +46,12 @@ test('nothing renders for AbovePrompt', async ($, on) => {
 const writes: { path: string; text: string }[] = []
 const lastWrite = () => JSON.parse(writes[writes.length - 1]!.text)
 
-const mountBand = async ($: any, on: any, lims: unknown[], cfg: string, columns?: number) => {
+const mountBand = async ($: any, on: any, lims: unknown[], cfg: string, columns?: number, sessionId?: string) => {
   mock.env(on, { CLAUDE_CONFIG_DIR: cfg, HOME: '/h' })
   const clock = mock.clock(on)
   mock.store(on)
   writes.length = 0
+  if (sessionId) on('session.id', () => ({ value: sessionId }) as never)
   on('fs.write', (_$: any, e: any) => {
     writes.push({ path: e.path, text: e.text })
     return { value: undefined } as never
@@ -111,6 +112,22 @@ test('pressing Other providers writes the snapshot with open others', async ($, 
   expect(lastWrite().limits).toHaveLength(poolLimits.length)
   await ui.press({ key: 'others' })
   expect(lastWrite()).toMatchObject({ open: null, othersOpen: false })
+  await ui.unmount()
+})
+
+test('sessions on one identity write their own files, so toggles do not cross', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir, undefined, 's-1')
+  await ui.press({ key: 'others' })
+  expect(writes[writes.length - 1]!.path).toBe('/h/.ais/cache/ais-usage/swap.s-1.json')
+  expect(lastWrite().open).toBe('others')
+  await ui.unmount()
+})
+
+test('a second session on the same identity writes its own file with its own toggle', async ($, on) => {
+  const ui = await mountBand($, on, poolLimits, dir, undefined, 's-2')
+  await ui.press({ key: 'members' })
+  expect(writes[writes.length - 1]!.path).toBe('/h/.ais/cache/ais-usage/swap.s-2.json')
+  expect(lastWrite().open).toBe('members')
   await ui.unmount()
 })
 

@@ -428,12 +428,13 @@ export type Snapshot = {
   updatedAt: number
 }
 
-/** Snapshot file name for an identity: the CLAUDE_CONFIG_DIR basename, sanitised. */
-export const snapshotName = (configDir: string | undefined): string => {
-  const base = norm(configDir ?? '').split('/').pop() ?? ''
-  return `${base.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_') || 'default'}.json`
+/** Snapshot file name: the CLAUDE_CONFIG_DIR basename, plus the session id when given (toggles are per session). Sanitised. */
+export const snapshotName = (configDir: string | undefined, sessionId?: string): string => {
+  const clean = (v: string) => v.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_')
+  const base = clean(norm(configDir ?? '').split('/').pop() ?? '') || 'default'
+  return `${base}${sessionId ? `.${clean(sessionId)}` : ''}.json`
 }
 
 /** Where the mod writes the snapshot `ais statusline` reads. */
-export const snapshotPath = (home: string, configDir: string | undefined): string =>
-  `${norm(home)}/.ais/cache/ais-usage/${snapshotName(configDir)}`
+export const snapshotPath = (home: string, configDir: string | undefined, sessionId?: string): string =>
+  `${norm(home)}/.ais/cache/ais-usage/${snapshotName(configDir, sessionId)}`
