@@ -47,17 +47,18 @@ export const KIMI_CONFIG: ToolConfig = {
 // settings, extensions and sessions all live underneath it.
 //
 // SINGLE-INSTANCE MODE (2026-09-13): pi no longer proxies per identity. One
-// shared instance (Pi's own default home, ~/.pi/agent) launches without ever
-// prompting for an AIS identity; the AIS pi extension reads the registry
+// shared instance (Pi's own default home, ~/.pi/agent) normally launches
+// without prompting; if active pools exist and no identity resolves, the
+// identity/pool picker is offered. The AIS pi extension reads the registry
 // below and exposes EVERY identity's credentials as namespaced providers
 // (<provider>--<identity>) with in-app switching (/ais). Per-identity
 // configDirs remain the credential stores (auth.json/models.json) the
-// extension resolves from live - refreshes are written back into the SOURCE
+// extension resolves from; refreshes are written back into the SOURCE
 // identity's auth.json, preserving the one-credential-per-(identity,
 // provider) law. The registered identities below are therefore still the
 // source of truth for credentials, labels and directory patterns; only the
-// launch boundary changed. resolveIdentity never prompts for pi (see
-// resolveSingleInstanceIdentity).
+// launch boundary changed. Ordinary identities keep using the shared instance;
+// a selected pool launches from its configured pool directory.
 export const PI_CONFIG: ToolConfig = {
   toolName: "pi",
   realBinaryName: "pi",

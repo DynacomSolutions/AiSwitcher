@@ -91,6 +91,9 @@ export interface ExtraUsageInfo {
   /** Share of the monthly extra-usage cap spent, 0-100, when the provider reports one. */
   usedPercent?: number;
   label: string;
+  /** Carried over from the last successful read because the current one failed; `capturedAt` is when that read happened. */
+  stale?: boolean;
+  capturedAt?: string;
 }
 
 export interface ToolLimitResult {

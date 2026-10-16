@@ -1,4 +1,5 @@
 import { IDENTITY_SESSION_MARKER, IDENTITY_SESSION_TOOL_MARKER } from "./exec.ts";
+import { adapterFor } from "../identities/pool/registry.ts";
 export type IdentitySessionTool = "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode";
 
 const TOOL_ENV_VARS: Record<IdentitySessionTool, string> = {
@@ -219,7 +220,7 @@ export function detectNonInteractiveHint(toolName: "claude" | "codex" | "grok" |
 
 export function parseCliArgs(toolName: "claude" | "codex" | "grok" | "kimi" | "zai" | "ali" | "pi" | "opencode", argv: string[]): ParsedCliArgs {
   const { identityFlag, poolFlag, pickerMode, desktopFlag, cleanedArgv } = stripOwnFlags(argv, {
-    pools: toolName === "claude",
+    pools: adapterFor(toolName) !== undefined,
   });
   return {
     identityFlag,

@@ -439,12 +439,37 @@ describe("usage api", () => {
       headers = init?.headers ?? {};
       return new Response(JSON.stringify({ five_hour: { utilization: 10 }, seven_day: { utilization: 20 } }), { status: 200 });
     }) as unknown as typeof fetch;
-    const u = await fetchMemberUsage(b, { fetchImpl: ok, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
+    const u = await fetchMemberUsage(b, { fetchImpl: ok, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 });
     expect(u.maxUtilization).toBe(20);
     expect(headers.Authorization).toBe("Bearer at-b1");
     expect(headers["anthropic-beta"]).toBe("oauth-2025-04-20");
     const limited = (async () => new Response("", { status: 429, headers: { "retry-after": "30" } })) as unknown as typeof fetch;
-    expect(await fetchMemberUsage(b, { fetchImpl: limited, claudeRegistryPath: registry, now: () => NOW_S * 1000 })).toMatchObject({ status: "rate-limited", retryAfterSeconds: 30 });
+    expect(await fetchMemberUsage(b, { fetchImpl: limited, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 })).toMatchObject({ status: "rate-limited", retryAfterSeconds: 30 });
+  });
+
+  test("a 429 inherits extra usage from the last good read only within 6 hours", async () => {
+    await writeRegistry();
+    const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+    const cacheDir = join(root, "cache");
+    const good = (async () =>
+      new Response(JSON.stringify({ five_hour: { utilization: 100 }, seven_day: { utilization: 20 }, extra_usage: { is_enabled: true, monthly_limit: 2000, used_credits: 500 } }), { status: 200 })) as unknown as typeof fetch;
+    const limited = (async () => new Response("", { status: 429 })) as unknown as typeof fetch;
+    const deps = { claudeRegistryPath: registry, cacheDir, now: () => NOW_S * 1000 };
+    await fetchMemberUsage(b, { ...deps, fetchImpl: good });
+    // Age the stored read (the token clock stays fixed so no refresh interferes).
+    const file = join(cacheDir, "claude-limits", "b.json");
+    const ageTo = async (hours: number) => {
+      const saved = JSON.parse(await readFile(file, "utf8"));
+      await writeFile(file, JSON.stringify({ ...saved, capturedAt: new Date(NOW_S * 1000 - hours * 3600_000).toISOString() }));
+    };
+    await ageTo(5);
+    const fresh = await fetchMemberUsage(b, { ...deps, fetchImpl: limited });
+    expect(fresh).toMatchObject({ status: "rate-limited", extraUsage: { available: true, stale: true, capturedAt: new Date(NOW_S * 1000 - 5 * 3600_000).toISOString() } });
+    expect(fresh.maxUtilization).toBeUndefined();
+    await ageTo(7);
+    const old = await fetchMemberUsage(b, { ...deps, fetchImpl: limited });
+    expect(old.status).toBe("rate-limited");
+    expect(old.extraUsage).toBeUndefined();
   });
 
   describe("cedar_ember reset grants", () => {
@@ -481,7 +506,7 @@ describe("usage api", () => {
         headers = init?.headers ?? {};
         return new Response(JSON.stringify({ cedar_ember: block({ resets_left: 1, ends_at: "2099-01-01T00:00:00Z" }) }), { status: 200 });
       }) as unknown as typeof fetch;
-      const deps = { claudeRegistryPath: registry, now: () => NOW_S * 1000 };
+      const deps = { claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 };
       expect(await fetchMemberResets(b, { ...deps, fetchImpl: ok })).toMatchObject({ availableCount: 1 });
       expect(headers["User-Agent"]).toBe(CLAUDE_RESETS_USER_AGENT);
       expect(headers.Authorization).toBe("Bearer at-b1");
@@ -498,7 +523,7 @@ describe("usage api", () => {
       url = String(u);
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
-    await fetchUsageBodyWithResets(b, { fetchImpl, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
+    await fetchUsageBodyWithResets(b, { fetchImpl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 });
     expect(url).toContain("cedar_ember=1");
     expect(url).not.toContain("skip_spend");
   });
@@ -513,7 +538,7 @@ describe("usage api", () => {
       auth = init?.headers?.Authorization ?? "";
       return new Response(JSON.stringify({ five_hour: { utilization: 1 } }), { status: 200 });
     }) as unknown as typeof fetch;
-    await fetchMemberUsage(b, { fetchImpl, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
+    await fetchMemberUsage(b, { fetchImpl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 });
     expect(auth).toBe("Bearer at-new");
   });
 });
@@ -542,7 +567,7 @@ describe("usage api: skipped refresh with a still-expired native store", () => {
         auth = init?.headers?.Authorization ?? "";
         return new Response(JSON.stringify({ five_hour: { utilization: 1 } }), { status: 200 });
       }) as unknown as typeof fetch;
-      await fetchMemberUsage(b, { fetchImpl, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
+      await fetchMemberUsage(b, { fetchImpl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 });
       expect(tokenCalls).toBe(1);
       expect(auth).toBe("Bearer at-new");
     } finally {

@@ -57,6 +57,16 @@ describe("stripOwnFlags pool and bare picker flags", () => {
     expect(r.pickerMode).toBeUndefined();
     expect(r.cleanedArgv).toEqual(["--pool=a"]);
   });
+
+  test("registered pool providers parse explicit and bare pool flags", () => {
+    for (const tool of ["codex", "kimi", "pi"] as const) {
+      const explicit = parseCliArgs(tool, ["--pool=team", "hello"]);
+      expect(explicit.poolFlag).toBe("team");
+      expect(explicit.cleanedArgv).toEqual(["hello"]);
+      expect(parseCliArgs(tool, ["--pool"]).pickerMode).toBe("pool");
+    }
+    expect(parseCliArgs("grok", ["--pool=team", "hello"]).cleanedArgv).toEqual(["--pool=team", "hello"]);
+  });
 });
 
 describe("detectNonInteractiveHint", () => {
