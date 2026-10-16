@@ -2,23 +2,31 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activeParentIdentity } from "../src/shared/cli-args.ts";
+import { activeParentSession } from "../src/shared/cli-args.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-test("a session marker without the tool config env var is stale", () => {
-  expect(activeParentIdentity("CLAUDE_CONFIG_DIR", { AI_PROFILE_SWITCHER_SESSION: "acct-a" })).toBeUndefined();
-  expect(activeParentIdentity("CLAUDE_CONFIG_DIR", { AI_PROFILE_SWITCHER_SESSION: "acct-a", CLAUDE_CONFIG_DIR: "" })).toBeUndefined();
+test("a session marker without its source tool config env var is stale", () => {
+  expect(activeParentSession("claude", { AI_PROFILE_SWITCHER_SESSION: "acct-a" })).toBeUndefined();
+  expect(activeParentSession("claude", { AI_PROFILE_SWITCHER_SESSION: "acct-a", CLAUDE_CONFIG_DIR: "" })).toBeUndefined();
 });
 
-test("a marker paired with the config env var is a genuine nested launch", () => {
+test("a marker paired with the source tool config env var is a genuine nested launch", () => {
   expect(
-    activeParentIdentity("CLAUDE_CONFIG_DIR", { AI_PROFILE_SWITCHER_SESSION: "acct-a", CLAUDE_CONFIG_DIR: "/example/acct-a" }),
-  ).toBe("acct-a");
-  expect(activeParentIdentity("CLAUDE_CONFIG_DIR", {})).toBeUndefined();
+    activeParentSession("claude", { AI_PROFILE_SWITCHER_SESSION: "acct-a", CLAUDE_CONFIG_DIR: "/synthetic/claude/acct-a" }),
+  ).toEqual({ toolName: "claude", identity: "acct-a" });
+  expect(activeParentSession("claude", {})).toBeUndefined();
+});
+
+test("a tool-scoped marker remains a nested session across providers", () => {
+  expect(activeParentSession("codex", {
+    AI_PROFILE_SWITCHER_SESSION: "acct-a",
+    AI_PROFILE_SWITCHER_TOOL: "claude",
+    CLAUDE_CONFIG_DIR: "/synthetic/claude/acct-a",
+  })).toEqual({ toolName: "claude", identity: "acct-a" });
 });
 
 // Same entry path as the release binary (src/claude.ts -> runWrapper), run in

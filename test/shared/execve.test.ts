@@ -39,6 +39,23 @@ describe("buildEnvp", () => {
       delete process.env.CODEX_SESSION_LEAK;
     }
   });
+
+  test("does not leak inherited session markers into a child without a seeded identity", () => {
+    const oldIdentity = process.env.AI_PROFILE_SWITCHER_SESSION;
+    const oldTool = process.env.AI_PROFILE_SWITCHER_TOOL;
+    process.env.AI_PROFILE_SWITCHER_SESSION = "stale-synthetic-marker";
+    process.env.AI_PROFILE_SWITCHER_TOOL = "claude";
+    try {
+      const env = buildChildEnv({ CODEX_HOME: "/synthetic/codex/default" });
+      expect(env.AI_PROFILE_SWITCHER_SESSION).toBeUndefined();
+      expect(env.AI_PROFILE_SWITCHER_TOOL).toBeUndefined();
+    } finally {
+      if (oldIdentity === undefined) delete process.env.AI_PROFILE_SWITCHER_SESSION;
+      else process.env.AI_PROFILE_SWITCHER_SESSION = oldIdentity;
+      if (oldTool === undefined) delete process.env.AI_PROFILE_SWITCHER_TOOL;
+      else process.env.AI_PROFILE_SWITCHER_TOOL = oldTool;
+    }
+  });
 });
 
 describe("buildExecBlock", () => {
