@@ -28,15 +28,15 @@ const BOLD = 1;
 /** A snapshot older than this is from a dead session. */
 const SNAPSHOT_MAX_AGE_MS = 15 * 60_000;
 
-/** The mod's toggle snapshot for this identity, or undefined when missing, stale or malformed. */
-function readSnapshot(cacheDir: string, configDir: string | undefined): Snapshot | undefined {
-  try {
-    const s = JSON.parse(readFileSync(join(cacheDir, "ais-usage", snapshotName(configDir)), "utf8")) as Snapshot;
-    if (!Array.isArray(s.limits) || typeof s.updatedAt !== "number" || Date.now() - s.updatedAt > SNAPSHOT_MAX_AGE_MS) return undefined;
-    return s;
-  } catch {
-    return undefined;
+/** The mod's toggle snapshot for this session (older mod versions: for this identity), or undefined when missing, stale or malformed. */
+function readSnapshot(cacheDir: string, configDir: string | undefined, sessionId?: string): Snapshot | undefined {
+  for (const name of sessionId ? [snapshotName(configDir, sessionId), snapshotName(configDir)] : [snapshotName(configDir)]) {
+    try {
+      const s = JSON.parse(readFileSync(join(cacheDir, "ais-usage", name), "utf8")) as Snapshot;
+      if (Array.isArray(s.limits) && typeof s.updatedAt === "number" && Date.now() - s.updatedAt <= SNAPSHOT_MAX_AGE_MS) return s;
+    } catch { /* missing or malformed: try the next name */ }
   }
+  return undefined;
 }
 
 /** The open section from the snapshot; falls back to the older boolean fields. */
@@ -130,8 +130,8 @@ export async function usageBars(stdin: string, env: Record<string, string | unde
     const pad = labelPad(r, rows);
     // The U+2800 (braille blank) spacer above the key is not whitespace on purpose: Claude Code drops whitespace-only status lines, and JS trim() strips even NBSP.
     const lines = [...head, ...rows.map((row) => renderRow(r, row, width, pad)), paint(CODE.dim, "─".repeat(cols))];
-    // shortcut: the snapshot is per identity, not per session, so two sessions on one identity share toggles; upgrade if that bites.
-    const snap = readSnapshot(deps.cacheDir ?? aisCacheDir(), env.CLAUDE_CONFIG_DIR);
+    const sid = (input as { session_id?: unknown } | undefined)?.session_id;
+    const snap = readSnapshot(deps.cacheDir ?? aisCacheDir(), env.CLAUDE_CONFIG_DIR, typeof sid === "string" ? sid : undefined);
     if (snap) {
       try { lines.push(...toggleLines(snap, env.CLAUDE_CONFIG_DIR, cols)); } catch { /* bad snapshot: main bars only */ }
     }

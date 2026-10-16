@@ -187,3 +187,18 @@ test("extra row: drawn when enabled, off label when the current member has it of
   const none = strip(await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/a", COLUMNS: "100" }, { cacheDir, identities: async () => pool }));
   expect(none).not.toContain("extra");
 });
+
+test("two sessions on one identity each draw their own toggle; no session file falls back to the identity file", async () => {
+  const cacheDir = cache({ a: [10, 20], b: [30, 40] });
+  snapshot(cacheDir, { open: "others" }, "swap.s1.json");
+  snapshot(cacheDir, {}, "swap.s2.json");
+  snapshot(cacheDir, { open: "others" }, "swap.json");
+  const run = async (session_id: string) =>
+    strip(await usageBars(JSON.stringify({ session_id }), { CLAUDE_CONFIG_DIR: "/c/swap", COLUMNS: "100" }, {
+      cacheDir,
+      identities: async () => [id("team", "/c/swap", { active: "a", accounts: ["a", "b"] }), id("a", "/c/a"), id("b", "/c/b")],
+    })).split("\n");
+  expect((await run("s1")).includes("codex")).toBe(true);
+  expect((await run("s2")).includes("codex")).toBe(false);
+  expect((await run("old")).includes("codex")).toBe(true);
+});

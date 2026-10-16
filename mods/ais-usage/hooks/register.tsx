@@ -39,14 +39,16 @@ const lastMember = atom({ plugin: 'ais-usage', key: 'lastMember' } as const, '')
 
 /**
  * Shares toggles and data with `ais statusline`, which draws the expanded blocks.
- * shortcut: the file is per identity (CLAUDE_CONFIG_DIR), not per session, so two sessions on one identity share toggles
- * and last writer wins; $.fs has no rename, so the write is not atomic and the reader ignores a torn file.
- * Upgrade to a per-session key if that bites.
+ * One file per session (identity + session id), so sessions on one identity keep their own toggles.
+ * shortcut: $.fs has no rename or delete, so the write is not atomic (the reader ignores a torn file) and dead sessions'
+ * files stay until the reader's staleness check ignores them; upgrade when $.fs can delete.
  */
 const writeSnapshot = async ($: any) => {
   try {
     const home = (await $.env.get('HOME')) ?? ''
-    const path = snapshotPath(home, await $.env.get('CLAUDE_CONFIG_DIR'))
+    // Read per write: /clear starts a new session id without a new session.start. No id: the identity file.
+    const id = await $.session.id().catch(() => undefined)
+    const path = snapshotPath(home, await $.env.get('CLAUDE_CONFIG_DIR'), id || undefined)
     const lim = await read($, limits)
     const st = await read($, status)
     const r = resolveCurrent(lim, await $.env.get('CLAUDE_CONFIG_DIR'), st)
