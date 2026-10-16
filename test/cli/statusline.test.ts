@@ -24,7 +24,7 @@ test("plain identity: one row per window", async () => {
   const out = await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/solo/", COLUMNS: "100" }, { cacheDir, identities: async () => [id("solo", "/c/solo")] });
   const lines = strip(out).trimEnd().split("\n");
   expect(lines).toHaveLength(3);
-  expect(lines[2]).toBe(RULE(100));
+  expect(lines[2]).toBe(RULE(96));
   expect(lines[0]).toMatch(/^session\s+\[█+\] 30%/);
   expect(lines[1]).toMatch(/^week\s+\[█+\] 80%\s+resets Oct 1\d/);
   expect(out).toContain("\u001b[32m"); // 30% green
@@ -73,8 +73,8 @@ test("rows share one bar width and start column; it scales with the terminal; no
   expect(s80.indexOf("[")).toBe(w80.indexOf("["));
   expect(barLen(s200)).toBe(barLen(w200));
   expect(barLen(s200)).toBeGreaterThan(barLen(s80) + 100);
-  for (const l of [s80, w80]) expect(l.length).toBeLessThanOrEqual(80);
-  for (const l of [s200, w200]) expect(l.length).toBeLessThanOrEqual(200);
+  for (const l of [s80, w80]) expect(l.length).toBeLessThanOrEqual(76);
+  for (const l of [s200, w200]) expect(l.length).toBeLessThanOrEqual(196);
 });
 
 /** Writes the mod's snapshot for config dir `/c/swap` into `dir`. */
@@ -87,10 +87,10 @@ const snapshot = (dir: string, over: object | string, name = "swap.json") => {
   const body = typeof over === "string" ? over : JSON.stringify({ othersOpen: false, membersOpen: false, limits: [pool, claude, codex, codexPool], status: null, updatedAt: Date.now(), ...over });
   writeFileSync(join(dir, "ais-usage", name), body);
 };
-const poolRun = async (over: object | string) => {
+const poolRun = async (over: object | string, cols = 100) => {
   const cacheDir = cache({ a: [10, 20], b: [30, 40] });
   snapshot(cacheDir, over);
-  const out = await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/swap", COLUMNS: "100" }, {
+  const out = await usageBars("{}", { CLAUDE_CONFIG_DIR: "/c/swap", COLUMNS: String(cols) }, {
     cacheDir,
     identities: async () => [id("team", "/c/swap", { active: "a", accounts: ["a", "b"] }), id("a", "/c/a"), id("b", "/c/b")],
   });
@@ -101,24 +101,24 @@ test("open others: a rule, then a codex block with pool totals at column 0, full
   const { out, lines } = await poolRun({ open: "others" });
   const i = lines.indexOf("codex");
   expect(i).toBeGreaterThan(1);
-  expect(lines[i - 1]).toBe(RULE(100));
+  expect(lines[i - 1]).toBe(RULE(96));
   expect(out).toContain("\u001b[1mcodex\u001b[0m");
   const rows = lines.slice(i + 1, -1);
   expect(rows).toHaveLength(2);
   expect(rows[0]).toMatch(/^session\s+\[█+\]/);
   expect(rows[0]!.length).toBeGreaterThanOrEqual(90);
-  for (const l of lines) expect(l.length).toBeLessThanOrEqual(100);
+  for (const l of lines) expect(l.length).toBeLessThanOrEqual(96);
 });
 
 test("closed: bars then one rule last; open: bars, rule, section, rule, never two rules in a row", async () => {
   const closed = (await poolRun({})).lines;
-  expect(closed.at(-1)).toBe(RULE(100));
+  expect(closed.at(-1)).toBe(RULE(96));
   expect(closed.at(-2)).toMatch(/^week\s/);
   expect(closed.filter((l) => l.startsWith("─"))).toHaveLength(1);
   for (const open of ["others", "members"]) {
     const { lines } = await poolRun({ open });
-    expect(lines.at(-1)).toBe(RULE(100));
-    expect(lines.at(-2)).not.toBe(RULE(100));
+    expect(lines.at(-1)).toBe(RULE(96));
+    expect(lines.at(-2)).not.toBe(RULE(96));
     const first = lines.findIndex((l) => l.startsWith("─"));
     expect(lines[first - 1]).toMatch(/^week\s/);
     expect(lines[first + 1]).not.toBe(RULE(100));
@@ -135,6 +135,20 @@ test("a braille-blank spacer line sits just before the colour key", async () => 
 test("old othersOpen field still opens the section", async () => {
   const { lines } = await poolRun({ othersOpen: true });
   expect(lines).toContain("codex");
+});
+
+test("every pool snapshot line fits Claude Code's four-column inset at 80 and 120", async () => {
+  for (const cols of [80, 120]) {
+    const { lines } = await poolRun({ open: "others" }, cols);
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(cols - 4);
+  }
+});
+
+test("narrow pool row puts the complete reset label on its own dim line", async () => {
+  const { lines } = await poolRun({}, 64);
+  expect(lines).toContain("  resets 08:00");
+  expect(lines).toContain("  resets Oct 17");
+  expect(lines.filter((line) => line.startsWith("  resets ")).every((line) => line.length < 30)).toBe(true);
 });
 
 const wideStatus = { pool: "team", active: "a", auto: true, thresholdPercent: 95, accounts: ["a", "b", "c", "d"].map((name) => ({ name, active: name === "a", allowed: true })) };
@@ -157,8 +171,8 @@ test("member cards: current tool only, no codex, 4 per row at 160 and one per ro
   expect(wide.filter((l) => /^a\s+b\s+c\s+d$/.test(l.trim()) || /^a\s+b/.test(l))).toHaveLength(1); // all four on one row
   const narrow = await membersRun(60);
   expect(narrow.filter((l) => /^[abcd]$/.test(l))).toHaveLength(4);
-  expect(sec(narrow).some((l) => l.length === 60)).toBe(true);
-  for (const [ls, n] of [[wide, 160], [narrow, 60]] as const) for (const l of sec(ls)) expect(l.length).toBeLessThanOrEqual(n);
+  expect(sec(narrow).some((l) => l.length === 56)).toBe(true);
+  for (const [ls, n] of [[wide, 156], [narrow, 56]] as const) for (const l of sec(ls)) expect(l.length).toBeLessThanOrEqual(n);
   expect(wide.some((l) => l.startsWith("─"))).toBe(true);
 });
 
