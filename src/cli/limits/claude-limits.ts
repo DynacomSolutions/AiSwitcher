@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
-import { fetchUsageBodyWithResets, manualResetFromCedarEmber, fetchMemberResets } from "../../identities/claude-usage-api.ts";
+import { fetchUsageBodyWithResets, manualResetFromCedarEmber, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
@@ -220,6 +220,7 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
   const apiWindows = body === undefined ? [] : windowsFromUsageBody(body);
   if (apiWindows.length > 0) {
     const overage = overageFromUsageBody(body);
+    const extraUsage = extraUsageFromBody(body);
     const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown }).cedar_ember);
     const live: FetchedLimitResult = {
       ...base,
@@ -227,6 +228,7 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
       status: "live",
       capturedAt: new Date().toISOString(),
       ...(overage ? { overage } : {}),
+      ...(extraUsage ? { extraUsage } : {}),
       ...(manualReset ? { manualReset } : {}),
     };
     await saveLastGood(identity, live, cacheDir);

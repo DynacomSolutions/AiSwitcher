@@ -40,6 +40,42 @@ describe("generic pool core", () => {
     expect(chooseBest(rows, { belowPercent: 5, requireKnown: true })).toBeUndefined();
   });
 
+  const extra = (maxUtilization: number, available = true): PoolUsage => ({ ...live(maxUtilization), extraUsage: { enabled: true, available, label: "extra usage" } });
+
+  test("chooseBest prefers available extra usage on equal headroom", () => {
+    expect(chooseBest([{ name: "a", usage: live(100) }, { name: "b", usage: extra(100) }], {})).toBe("b");
+    expect(chooseBest([{ name: "a", usage: live(50) }, { name: "b", usage: extra(60) }], {})).toBe("a");
+    expect(chooseBest([{ name: "a", usage: live(100) }, { name: "b", usage: extra(100, false) }], {})).toBe("a");
+  });
+
+  describe("extra usage fallback", () => {
+    const run = async (usage: Record<string, PoolUsage>) => {
+      const registry = join(root, "claude.json");
+      const member = (name: string) => ({ name, label: name, configDir: join(root, name) });
+      await writeFile(registry, JSON.stringify({ version: 1, identities: [member("a"), member("b"), member("c"), { ...member("pool"), swapPool: { accounts: ["a", "b", "c"], active: "a", auto: true } }] }));
+      const adapter: PoolAdapter = { ...fakeAdapter("claude", registry, {}), fetchUsage: async (m) => usage[m.name] ?? live(100) };
+      return swapIfLimited(adapter, { ledgerPath: join(root, "claude-swap.jsonl") }, "pool", "auto");
+    };
+
+    test("everyone at 100, active without extra usage: swaps to the member that has it", async () => {
+      const r = await run({ a: live(100), b: live(100), c: extra(100) });
+      expect(r.action === "swapped" && r.result.to).toBe("c");
+    });
+
+    test("active with available extra usage stays put", async () => {
+      expect((await run({ a: extra(100), b: live(100), c: extra(100) })).action).toBe("no-candidate");
+    });
+
+    test("active at 96 (still has headroom) does not move to a paid member", async () => {
+      expect((await run({ a: live(96), b: extra(100), c: extra(100) })).action).toBe("no-candidate");
+    });
+
+    test("a member under 100 wins over an extra-usage member", async () => {
+      const r = await run({ a: live(100), b: live(90), c: extra(100) });
+      expect(r.action === "swapped" && r.result.to).toBe("b");
+    });
+  });
+
   test("swapIfLimited swaps through the fake adapter and writes the per-tool ledger", async () => {
     const registry = join(root, "codex.json");
     await writeRegistry(registry);

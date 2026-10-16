@@ -1,6 +1,6 @@
 import { readProviderGrantCopy } from "./oauth-reconcile.ts";
 import { poolStoreDirsFor, refreshIdentityOAuthGrant, type FetchImpl } from "./oauth-refresh.ts";
-import type { ManualResetInfo } from "../cli/limits/types.ts";
+import type { ExtraUsageInfo, ManualResetInfo } from "../cli/limits/types.ts";
 import type { Identity } from "./types.ts";
 
 /**
@@ -31,6 +31,7 @@ export interface MemberUsage {
   sevenDay?: UsageWindowReading;
   /** Highest utilisation of the two windows, when at least one is known. */
   maxUtilization?: number;
+  extraUsage?: ExtraUsageInfo;
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;
@@ -52,6 +53,25 @@ function window(raw: unknown): UsageWindowReading | undefined {
   return { utilization: Math.min(100, Math.max(0, utilization)), ...(resetsAt ? { resetsAt } : {}) };
 }
 
+/** Pure mapping of the `extra_usage` block to an ExtraUsageInfo; undefined when the block is absent. */
+export function extraUsageFromBody(body: unknown): ExtraUsageInfo | undefined {
+  const block = typeof body === "object" && body !== null ? (body as Record<string, unknown>).extra_usage : undefined;
+  if (typeof block !== "object" || block === null) return undefined;
+  const rec = block as Record<string, unknown>;
+  const enabled = rec.is_enabled === true;
+  const limit = num(rec.monthly_limit);
+  const used = num(rec.used_credits);
+  const raw = num(rec.utilization) ?? (used !== undefined && limit !== undefined && limit > 0 ? (used / limit) * 100 : undefined);
+  const usedPercent = raw === undefined ? undefined : Math.min(100, Math.max(0, raw));
+  const available = enabled && rec.spend_limit_reached !== true && (usedPercent === undefined || usedPercent < 100);
+  return {
+    enabled,
+    available,
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    label: !enabled ? "extra usage off" : available ? "extra usage" : "out of extra usage",
+  };
+}
+
 /** Defensive parse of the usage body: unknown/missing windows are skipped. */
 export function parseUsageBody(body: unknown, capturedAt: string = new Date().toISOString()): MemberUsage {
   const rec = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
@@ -59,8 +79,10 @@ export function parseUsageBody(body: unknown, capturedAt: string = new Date().to
   const sevenDay = window(rec.seven_day);
   const values = [fiveHour?.utilization, sevenDay?.utilization].filter((v): v is number => v !== undefined);
   if (values.length === 0) return { status: "unavailable", error: "usage response carried no five_hour/seven_day utilisation", capturedAt };
+  const extraUsage = extraUsageFromBody(body);
   return {
     status: "live",
+    ...(extraUsage ? { extraUsage } : {}),
     ...(fiveHour ? { fiveHour } : {}),
     ...(sevenDay ? { sevenDay } : {}),
     maxUtilization: Math.max(...values),

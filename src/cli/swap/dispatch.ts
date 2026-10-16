@@ -67,15 +67,24 @@ function describeSwap(r: SwapResult): string {
   return `${r.pool}: ${previous ?? "(none)"} -> ${target} (${r.reason})${wb}`;
 }
 
+/** Cell for the optional `extra` column: share spent when known, else the label; yellow when not usable. */
+function extraCell(u: MemberUsage | undefined): string {
+  const x = u?.extraUsage;
+  if (!x) return "-";
+  const text = x.usedPercent !== undefined ? pct(x.usedPercent) : x.label;
+  return x.enabled && !x.available ? yellow(text) : text;
+}
+
 function renderStatus(poolName: string, auto: boolean, threshold: number, rows: MemberRow<MemberUsage>[]): string[] {
   const name = Math.max(7, ...rows.map((r) => r.name.length));
   const lines = [`${bold(poolName)} ${dim(`auto ${auto ? `on (>=${threshold}%)` : "off"}`)}`];
-  lines.push(dim(`  ${" "} ${"account".padEnd(name)}  ${"5h".padStart(5)} ${"reset".padEnd(6)} ${"week".padStart(5)} ${"reset".padEnd(6)} allowed`));
+  const extra = rows.some((r) => r.usage?.extraUsage?.enabled);
+  lines.push(dim(`  ${" "} ${"account".padEnd(name)}  ${"5h".padStart(5)} ${"reset".padEnd(6)} ${"week".padStart(5)} ${"reset".padEnd(6)} ${extra ? "extra  " : ""}allowed`));
   for (const r of rows) {
     const u = r.usage;
     const note = u && u.status !== "live" ? dim(` (${u.error ?? u.status})`) : "";
     lines.push(
-      `  ${r.active ? green("*") : " "} ${r.name.padEnd(name)}  ${pct(u?.fiveHour?.utilization).padStart(5)} ${reset(u?.fiveHour?.resetsAt).padEnd(6)} ${pct(u?.sevenDay?.utilization).padStart(5)} ${reset(u?.sevenDay?.resetsAt).padEnd(6)} ${r.allowed ? "yes" : yellow("no")}${note}`,
+      `  ${r.active ? green("*") : " "} ${r.name.padEnd(name)}  ${pct(u?.fiveHour?.utilization).padStart(5)} ${reset(u?.fiveHour?.resetsAt).padEnd(6)} ${pct(u?.sevenDay?.utilization).padStart(5)} ${reset(u?.sevenDay?.resetsAt).padEnd(6)} ${extra ? extraCell(u) + " " : ""}${r.allowed ? "yes" : yellow("no")}${note}`,
     );
   }
   return lines;
@@ -84,12 +93,13 @@ function renderStatus(poolName: string, auto: boolean, threshold: number, rows: 
 function renderWindowStatus(poolName: string, auto: boolean, threshold: number, rows: MemberRow[]): string[] {
   const name = Math.max(7, ...rows.map((r) => r.name.length));
   const lines = [`${bold(poolName)} ${dim(`auto ${auto ? `on (>=${threshold}%)` : "off"}`)}`];
-  lines.push(dim(`  ${" "} ${"account".padEnd(name)}  usage  allowed`));
+  const extra = rows.some((r) => r.usage?.extraUsage?.enabled);
+  lines.push(dim(`  ${" "} ${"account".padEnd(name)}  usage  ${extra ? "extra  " : ""}allowed`));
   for (const r of rows) {
     const u = r.usage;
     const note = u && u.status !== "live" ? dim(` (${u.error ?? u.status})`) : "";
     const windows = (u?.windows ?? []).map((w) => `${w.label} ${pct(w.utilization)}${w.resetsAt ? ` (${reset(w.resetsAt)})` : ""}`).join("  ") || "-";
-    lines.push(`  ${r.active ? green("*") : " "} ${r.name.padEnd(name)}  ${windows}  ${r.allowed ? "yes" : yellow("no")}${note}`);
+    lines.push(`  ${r.active ? green("*") : " "} ${r.name.padEnd(name)}  ${windows}  ${extra ? extraCell(u as MemberUsage | undefined) + "  " : ""}${r.allowed ? "yes" : yellow("no")}${note}`);
   }
   return lines;
 }

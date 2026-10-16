@@ -315,6 +315,7 @@ export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
         status: maxUtilization >= 100 ? "rate-limited" : "live",
         maxUtilization,
         windows: result.windows.map((w) => ({ label: w.label, utilization: w.usedPercent, ...(w.resetsAt ? { resetsAt: w.resetsAt } : {}) })),
+        ...(result.extraUsage ? { extraUsage: result.extraUsage } : {}),
         capturedAt,
       };
     } catch (err) {

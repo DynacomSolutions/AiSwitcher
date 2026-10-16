@@ -1,5 +1,6 @@
 import type { Identity, ToolConfig } from "../types.ts";
 import type { LockOptions } from "../claude-swap-lock.ts";
+import type { ExtraUsageInfo } from "../../cli/limits/types.ts";
 import type { PoolIdentity } from "./swap-pool.ts";
 
 /**
@@ -49,6 +50,8 @@ export interface PoolUsage {
   maxUtilization?: number;
   /** Optional per-window detail for display; the core never reads it. */
   windows?: Array<{ label: string; utilization: number; resetsAt?: string }>;
+  /** Paid capacity the member can fall back on once its windows are full. */
+  extraUsage?: ExtraUsageInfo;
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;

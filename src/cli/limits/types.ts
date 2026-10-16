@@ -82,6 +82,17 @@ export interface ManualResetInfo {
   expiresAt?: string;
 }
 
+/** Paid capacity past the standard windows: Claude extra usage, Codex credits. */
+export interface ExtraUsageInfo {
+  /** Switched on for the account. */
+  enabled: boolean;
+  /** Enabled and not exhausted: the account keeps working once its windows are at 100%. */
+  available: boolean;
+  /** Share of the monthly extra-usage cap spent, 0-100, when the provider reports one. */
+  usedPercent?: number;
+  label: string;
+}
+
 export interface ToolLimitResult {
   toolName: ToolConfig["toolName"];
   /** The upstream provider these windows belong to — the report's grouping
@@ -108,6 +119,8 @@ export interface ToolLimitResult {
   /** See ManualResetInfo. Present only when the provider reports at least
    * one usable manual reset right now. */
   manualReset?: ManualResetInfo;
+  /** See ExtraUsageInfo. Present only on a live fetch that reported it. */
+  extraUsage?: ExtraUsageInfo;
 }
 
 /** What a single-provider fetcher returns: a complete result EXCEPT the

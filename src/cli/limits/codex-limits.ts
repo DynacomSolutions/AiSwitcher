@@ -2,7 +2,7 @@ import type { Identity } from "../../identities/types.ts";
 import { reconcileOnceForFetch, oauthRefreshHealth } from "../../identities/oauth-refresh.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByMinutes } from "./bucket.ts";
-import type { LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, FetchedLimitResult } from "./types.ts";
+import type { ExtraUsageInfo, LimitCategory, LimitWindow, ManualResetInfo, OverageInfo, FetchedLimitResult } from "./types.ts";
 
 /** Whole handshake budget (spawn + initialize + rateLimits/read) per
  * attempt. Live reads against real identities on this machine come back in
@@ -29,6 +29,8 @@ export interface RateLimitSnapshotWire {
   spendControlReached?: boolean | null;
   planType?: string | null;
   rateLimitReachedType?: string | null;
+  /** v2 CreditsSnapshot. */
+  credits?: { hasCredits?: boolean | null; unlimited?: boolean | null; balance?: string | null } | null;
 }
 
 /** One grantable "spend this to wipe my windows now" credit. Confirmed live
@@ -179,6 +181,18 @@ export function overageFromSnapshot(snapshot: RateLimitSnapshotWire): OverageInf
   }
   if (snapshot.spendControlReached) return { active: false, label: "spend control reached" };
   return undefined;
+}
+
+/** Codex credits as extra usage: they keep the account working once its windows are full. */
+export function extraUsageFromCredits(snapshot: RateLimitSnapshotWire): ExtraUsageInfo | undefined {
+  const credits = snapshot.credits;
+  if (!credits) return undefined;
+  const unlimited = credits.unlimited === true;
+  const enabled = credits.hasCredits === true || unlimited;
+  const balance = credits.balance ?? null;
+  const available = unlimited || (credits.hasCredits === true && (balance === null || !(Number(balance) <= 0)));
+  const label = unlimited ? "unlimited credits" : enabled && balance !== null ? `credits ${balance}` : enabled ? "credits" : "no credits";
+  return { enabled, available, label };
 }
 
 /**
@@ -357,12 +371,14 @@ async function fetchCodexLimitsOnce(identity: Identity): Promise<FetchedLimitRes
 
       const overage = overageFromSnapshot(snapshot);
       const manualReset = manualResetFromWire(payload?.rateLimitResetCredits);
+      const extraUsage = extraUsageFromCredits(snapshot);
       return {
         ...base,
         windows,
         status: "live",
         capturedAt: new Date().toISOString(),
         ...(overage ? { overage } : {}),
+        ...(extraUsage ? { extraUsage } : {}),
         ...(manualReset ? { manualReset } : {}),
       };
     } finally {

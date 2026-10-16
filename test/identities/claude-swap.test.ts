@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { activeMemberAt, decideWriteBack, performSwap, readSwapEvents } from "../../src/identities/claude-swap.ts";
 import { withClaudeLocks, withOauthRefreshLock, SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { chooseBest, swapIfLimited } from "../../src/identities/claude-swap-ops.ts";
-import { parseUsageBody, fetchMemberUsage, fetchMemberResets, manualResetFromCedarEmber, CLAUDE_RESETS_USER_AGENT } from "../../src/identities/claude-usage-api.ts";
+import { parseUsageBody, fetchMemberUsage, fetchMemberResets, manualResetFromCedarEmber, extraUsageFromBody, CLAUDE_RESETS_USER_AGENT } from "../../src/identities/claude-usage-api.ts";
 import { refreshIdentityOAuthGrant, writeGrantThroughStores, convergeClaudePoolStores } from "../../src/identities/oauth-refresh.ts";
 import { PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { chmod, utimes } from "node:fs/promises";
@@ -414,6 +414,21 @@ describe("usage api", () => {
     expect(u).toMatchObject({ status: "live", maxUtilization: 80, fiveHour: { utilization: 42.5, resetsAt: "2026-10-09T12:00:00.000Z" } });
     expect(parseUsageBody({ five_hour: null }).status).toBe("unavailable");
     expect(parseUsageBody("junk").status).toBe("unavailable");
+  });
+
+  test("extraUsageFromBody maps the extra_usage block", () => {
+    const body = (x: object) => ({ extra_usage: { is_enabled: true, monthly_limit: 2000, used_credits: 500, disabled_reason: null, spend_limit_reached: false, ...x } });
+    expect(extraUsageFromBody({})).toBeUndefined();
+    expect(extraUsageFromBody({ extra_usage: "x" })).toBeUndefined();
+    expect(extraUsageFromBody(null)).toBeUndefined();
+    expect(extraUsageFromBody(body({}))).toEqual({ enabled: true, available: true, usedPercent: 25, label: "extra usage" });
+    expect(extraUsageFromBody(body({ utilization: 40 }))?.usedPercent).toBe(40);
+    expect(extraUsageFromBody(body({ is_enabled: false }))).toMatchObject({ enabled: false, available: false, label: "extra usage off" });
+    expect(extraUsageFromBody(body({ spend_limit_reached: true }))).toMatchObject({ enabled: true, available: false, label: "out of extra usage" });
+    expect(extraUsageFromBody(body({ used_credits: 2500 }))).toMatchObject({ usedPercent: 100, available: false });
+    const unknown = extraUsageFromBody(body({ monthly_limit: null }));
+    expect(unknown?.available).toBe(true);
+    expect(unknown && "usedPercent" in unknown).toBe(false);
   });
 
   test("sends the bearer and beta header; 429 is reported", async () => {
