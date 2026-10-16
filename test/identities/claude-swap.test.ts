@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { activeMemberAt, decideWriteBack, performSwap, readSwapEvents } from "../../src/identities/claude-swap.ts";
 import { withClaudeLocks, withOauthRefreshLock, SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { chooseBest, swapIfLimited } from "../../src/identities/claude-swap-ops.ts";
-import { parseUsageBody, fetchMemberUsage, fetchMemberResets, manualResetFromCedarEmber, extraUsageFromBody, CLAUDE_RESETS_USER_AGENT } from "../../src/identities/claude-usage-api.ts";
+import { parseUsageBody, fetchMemberUsage, fetchMemberResets, fetchUsageBodyWithResets, manualResetFromCedarEmber, extraUsageFromBody, CLAUDE_RESETS_USER_AGENT } from "../../src/identities/claude-usage-api.ts";
 import { refreshIdentityOAuthGrant, writeGrantThroughStores, convergeClaudePoolStores } from "../../src/identities/oauth-refresh.ts";
 import { PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { chmod, utimes } from "node:fs/promises";
@@ -488,6 +488,19 @@ describe("usage api", () => {
       const boom = (async () => { throw new Error("down"); }) as unknown as typeof fetch;
       expect(await fetchMemberResets(b, { ...deps, fetchImpl: boom })).toBeUndefined();
     });
+  });
+
+  test("the resets request keeps the spend block (no skip_spend)", async () => {
+    await writeRegistry();
+    const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+    let url = "";
+    const fetchImpl = (async (u: unknown) => {
+      url = String(u);
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    await fetchUsageBodyWithResets(b, { fetchImpl, claudeRegistryPath: registry, now: () => NOW_S * 1000 });
+    expect(url).toContain("cedar_ember=1");
+    expect(url).not.toContain("skip_spend");
   });
 
   test("an expired token is refreshed first", async () => {

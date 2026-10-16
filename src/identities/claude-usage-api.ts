@@ -13,7 +13,8 @@ import type { Identity } from "./types.ts";
 
 export const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 export const CLAUDE_USAGE_BETA = "oauth-2025-04-20";
-export const CLAUDE_RESETS_URL = `${CLAUDE_USAGE_URL}?cedar_ember=1&skip_spend=1`;
+// No `skip_spend=1`: it makes the server omit `extra_usage`, which limits and the pool extra-usage fallback need.
+export const CLAUDE_RESETS_URL = `${CLAUDE_USAGE_URL}?cedar_ember=1`;
 // shortcut: the server gates the reset grants on a claude-cli UA (otherwise `ineligible_reason: "surface"`); upgrade if it starts checking the version.
 export const CLAUDE_RESETS_USER_AGENT = "claude-cli/2.1.296 (external, cli)";
 const USAGE_TIMEOUT_MS = 10_000;
