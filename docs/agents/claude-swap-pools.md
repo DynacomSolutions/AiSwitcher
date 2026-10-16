@@ -205,4 +205,5 @@ status` adds an `extra` column when any member has it enabled. Rules in
   rate-limited. Disallowed members are never chosen.
 - `chooseBest` breaks equal headroom in favour of a member with available extra
   usage.
+- A rate-limited or failed Claude read keeps `extraUsage` from the member's last good read (`cache/claude-limits/<id>.json`, written by `fetchMemberUsage` and `ais limits`) when at most 6 hours old, marked `stale`.
 Kimi and Pi report no extra usage; their pools are unchanged.
