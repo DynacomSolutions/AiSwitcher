@@ -12,9 +12,11 @@ import {
   labelPad,
   memberBlocks,
   memberCards,
+  NAME_COL,
   providerBlocks,
   resolveCurrent,
   rowSegments,
+  rowText,
   snapshotName,
 } from "../../mods/ais-usage/hooks/model.ts";
 import type { BandRow, Resolved, Seg, Snapshot } from "../../mods/ais-usage/hooks/model.ts";
@@ -27,6 +29,7 @@ const BLOCK = "█";
 const BOLD = 1;
 /** A snapshot older than this is from a dead session. */
 const SNAPSHOT_MAX_AGE_MS = 15 * 60_000;
+const STATUSLINE_INSET = 4; // Claude Code reserves horizontal padding around status lines.
 
 /** The mod's toggle snapshot for this session (older mod versions: for this identity), or undefined when missing, stale or malformed. */
 function readSnapshot(cacheDir: string, configDir: string | undefined, sessionId?: string): Snapshot | undefined {
@@ -52,7 +55,7 @@ function toggleLines(s: Snapshot, configDir: string | undefined, cols: number): 
     for (const g of providerBlocks(s.limits, r)) {
       const width = barWidth(r, g.rows, cols);
       const pad = labelPad(r, g.rows);
-      groups.push([paint(BOLD, g.tool), ...g.rows.map((row) => renderRow(r, row, width, pad))]);
+      groups.push([paint(BOLD, g.tool), ...g.rows.map((row) => renderRow(r, row, width, pad, cols))]);
     }
   } else if (open === "members" && r.kind === "pool") {
     for (const g of memberCards(memberBlocks(s.status, s.limits, r), cols)) groups.push(g.map(renderSegs));
@@ -65,8 +68,12 @@ const renderSegs = (segs: Seg[]): string =>
   segs.map((g) => (g.bold ? paint(BOLD, g.text) : g.dim ? paint(CODE.dim, g.text) : g.color ? paint(CODE[g.color], g.text) : g.text)).join("");
 
 /** One band row as an ANSI line; `width` is the bar width, `labelPad` the longest label (shorter ones are right-padded). */
-export function renderRow(r: Resolved, row: BandRow, width: number, pad = 0): string {
-  return renderSegs(rowSegments(r, row, width, pad));
+export function renderRow(r: Resolved, row: BandRow, width: number, pad = 0, cols?: number): string {
+  const t = rowText(r, row);
+  const resetsOwnLine = !!t.resets && cols !== undefined &&
+    NAME_COL + 3 + Math.max(pad, t.labelLen) + width + t.resets.length + t.reporting.length > cols - 3;
+  const line = renderSegs(rowSegments(r, row, width, pad, cols));
+  return resetsOwnLine ? `${line}\n${paint(CODE.dim, t.resets)}` : line;
 }
 
 export interface StatuslineDeps {
@@ -97,13 +104,14 @@ async function cachedLimits(deps: StatuslineDeps): Promise<LimitsEntry[]> {
 const widthFrom = (input: any, env: Record<string, string | undefined>): number => {
   const w = [input?.viewport?.columns, input?.terminal?.columns, input?.terminal?.width, input?.columns, input?.width]
     .find((n) => typeof n === "number" && n > 0);
-  if (w) return w;
+  if (w) return Math.max(20, w - STATUSLINE_INSET);
   try {
     const r = Bun.spawnSync(["sh", "-c", "stty size < /dev/tty"], { stdout: "pipe", stderr: "ignore" });
     const c = Number(new TextDecoder().decode(r.stdout).trim().split(/\s+/)[1]);
-    if (r.exitCode === 0 && c > 0) return c;
+    if (r.exitCode === 0 && c > 0) return Math.max(20, c - STATUSLINE_INSET);
   } catch { /* no controlling terminal */ }
-  return Number(env.COLUMNS) > 0 ? Number(env.COLUMNS) : 80;
+  const cols = Number(env.COLUMNS) > 0 ? Number(env.COLUMNS) : 80;
+  return Math.max(20, cols - STATUSLINE_INSET);
 };
 
 /** The bar rows for `stdin` (statusLine JSON); "" on missing data or any error. */
@@ -129,7 +137,7 @@ export async function usageBars(stdin: string, env: Record<string, string | unde
     const width = barWidth(r, rows, cols);
     const pad = labelPad(r, rows);
     // The U+2800 (braille blank) spacer above the key is not whitespace on purpose: Claude Code drops whitespace-only status lines, and JS trim() strips even NBSP.
-    const lines = [...head, ...rows.map((row) => renderRow(r, row, width, pad)), paint(CODE.dim, "─".repeat(cols))];
+    const lines = [...head, ...rows.map((row) => renderRow(r, row, width, pad, cols)), paint(CODE.dim, "─".repeat(cols))];
     const sid = (input as { session_id?: unknown } | undefined)?.session_id;
     const snap = readSnapshot(deps.cacheDir ?? aisCacheDir(), env.CLAUDE_CONFIG_DIR, typeof sid === "string" ? sid : undefined);
     if (snap) {

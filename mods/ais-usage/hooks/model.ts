@@ -263,13 +263,17 @@ const MARGIN = 3 // safety so a row never wraps
 
 /** Bar width shared by every row: the columns left after the longest row's non-bar text. */
 export function barWidth(r: Resolved, rows: BandRow[], cols: number): number {
+  const pad = labelPad(r, rows)
   const fixed = Math.max(
     ...rows.map(row => {
       const t = rowText(r, row)
-      return NAME_COL + 2 + 1 + t.labelLen + t.resets.length + t.reporting.length
+      return NAME_COL + 2 + 1 + pad + t.resets.length + t.reporting.length
     }),
   )
-  return Math.max(10, cols - MARGIN - fixed)
+  const withResets = cols - MARGIN - fixed
+  if (withResets >= 10) return withResets
+  const withoutResets = Math.max(...rows.map(row => NAME_COL + 3 + pad + rowText(r, row).reporting.length))
+  return Math.max(10, cols - MARGIN - withoutResets)
 }
 
 /** Longest label among `rows`; shorter ones are right-padded to it. */
@@ -279,8 +283,10 @@ export const labelPad = (r: Resolved, rows: BandRow[]): number =>
 export type Seg = { text: string; color?: Tone | 'blue' | 'cyan' | 'gray'; dim?: boolean; bold?: boolean }
 
 /** One band row as coloured segments; `width` is the bar width, `pad` the longest label. */
-export function rowSegments(r: Resolved, row: BandRow, width: number, pad = 0): Seg[] {
+export function rowSegments(r: Resolved, row: BandRow, width: number, pad = 0, cols?: number): Seg[] {
   const t = rowText(r, row)
+  const resetsOwnLine = !!t.resets && cols !== undefined &&
+    NAME_COL + 3 + Math.max(pad, t.labelLen) + width + t.resets.length + t.reporting.length > cols - MARGIN
   const pool = t.pool
   const body: Seg[] = pool
     ? twoToneBar(row.active, pool.pct, width).map(s => ({
@@ -304,7 +310,7 @@ export function rowSegments(r: Resolved, row: BandRow, width: number, pad = 0): 
     { text: '] ' },
     ...label,
     { text: ' '.repeat(Math.max(0, pad - t.labelLen)) },
-    { text: t.resets, dim: true },
+    { text: resetsOwnLine ? '' : t.resets, dim: true },
     { text: t.reporting, dim: true },
   ].filter(g => g.text)
 }
