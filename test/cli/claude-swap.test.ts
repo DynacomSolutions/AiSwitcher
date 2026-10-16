@@ -19,8 +19,8 @@ beforeEach(async () => {
   out = [];
   for (const [n, rt] of [["a", "rt-a"], ["b", "rt-b"]] as const) {
     await mkdir(join(root, n), { recursive: true });
-    await writeFile(join(root, n, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: `at-${n}`, refreshToken: rt, expiresAt: 4_000_000_000_000 } }));
-    await writeFile(join(root, n, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: `u-${n}` } }));
+    await writeFile(join(root, n, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: `SYNTHETIC_FIXTURE_at-${n}`, refreshToken: `SYNTHETIC_FIXTURE_${rt}`, expiresAt: 4_000_000_000_000 } }));
+    await writeFile(join(root, n, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: `SYNTHETIC_FIXTURE_u-${n}` } }));
   }
   await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "a", label: "a", configDir: join(root, "a") }, { name: "b", label: "b", configDir: join(root, "b") }] }));
 });
@@ -31,7 +31,7 @@ test("pool create, status, to, allow/disallow, auto", async () => {
   let file = await loadIdentitiesFile(registry);
   const pool = file.identities.find((i) => i.name === "shared")!;
   expect(pool.swapPool).toEqual({ accounts: ["a", "b"], active: "a" });
-  expect(JSON.parse(await readFile(join(root, "shared", ".credentials.json"), "utf8")).claudeAiOauth.accessToken).toBe("at-a");
+  expect(JSON.parse(await readFile(join(root, "shared", ".credentials.json"), "utf8")).claudeAiOauth.accessToken).toBe("SYNTHETIC_FIXTURE_at-a");
 
   out = [];
   await runClaudeSwapCommand(["status"], { json: true }, deps());
@@ -58,6 +58,79 @@ test("pool create refuses unknown accounts and a reused configDir", async () => 
   await expect(runClaudeSwapCommand(["pool", "create", "p"], { accounts: "a,b", "config-dir": join(root, "a") }, deps())).rejects.toThrow(/already used/);
 });
 
+test("recovery flags resolve by config directory and reject a stale expected active member", async () => {
+  await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
+  out = [];
+  await runClaudeSwapCommand(["next"], {
+    "config-dir": join(root, "shared"),
+    "if-limited": true,
+    "assume-limited": true,
+    "expected-active": "b",
+    json: true,
+  }, deps());
+  expect(JSON.parse(out.join("\n"))).toMatchObject({ action: "skipped", why: 'pool changed to "a" before limit recovery' });
+
+  out = [];
+  await runClaudeSwapCommand(["next"], {
+    "config-dir": join(root, "shared"),
+    "if-limited": true,
+    "assume-limited": true,
+    "expected-active": "a",
+    json: true,
+  }, {
+    ...deps(),
+    fetchUsage: async (member) => {
+      const utilization = member.name === "a" ? 100 : 12;
+      return { status: "live" as const, fiveHour: { utilization }, sevenDay: { utilization }, maxUtilization: utilization, capturedAt: "SYNTHETIC_FIXTURE" };
+    },
+  });
+  expect(JSON.parse(out.join("\n"))).toMatchObject({ action: "swapped", result: { from: "a", to: "b" } });
+});
+
+test("a ledger swap since the failure is reported and prevents a second recovery rotation", async () => {
+  await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
+  const failureAtMs = Date.now() - 1_000;
+  await runClaudeSwapCommand(["to", "b"], {}, deps());
+  out = [];
+  await runClaudeSwapCommand(["status"], { "config-dir": join(root, "shared"), json: true }, deps());
+  expect(Date.parse(JSON.parse(out.join("\n")).lastSwapAt)).toBeGreaterThanOrEqual(failureAtMs);
+
+  out = [];
+  await runClaudeSwapCommand(["next"], {
+    "config-dir": join(root, "shared"),
+    "if-limited": true,
+    "assume-limited": true,
+    "failure-at-ms": String(failureAtMs),
+    json: true,
+  }, deps());
+  expect(JSON.parse(out.join("\n"))).toMatchObject({ action: "skipped", why: "limit failure was already handled by a pool swap" });
+  expect((await loadIdentitiesFile(registry)).identities.find((i) => i.name === "shared")?.swapPool?.active).toBe("b");
+});
+
+test("trust-limit-evidence reaches the pool core despite fresh live headroom", async () => {
+  const baseDeps = deps();
+  const fixtureDeps = { ...baseDeps, now: () => Date.now() };
+  await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, fixtureDeps);
+  const creationEvent = JSON.parse((await readFile(baseDeps.ledgerPath, "utf8")).trim());
+  const afterCreation = Date.parse(creationEvent.ts) + 1;
+  out = [];
+  await runClaudeSwapCommand(["next"], {
+    "config-dir": join(root, "shared"),
+    "if-limited": true,
+    "assume-limited": true,
+    "trust-limit-evidence": true,
+    json: true,
+  }, {
+    ...fixtureDeps,
+    now: () => afterCreation,
+    fetchUsage: async (member) => {
+      const utilization = member.name === "a" ? 60 : 10;
+      return { status: "live" as const, fiveHour: { utilization }, sevenDay: { utilization }, maxUtilization: utilization, capturedAt: "SYNTHETIC_FIXTURE" };
+    },
+  });
+  expect(JSON.parse(out.join("\n"))).toMatchObject({ action: "swapped", result: { from: "a", to: "b" } });
+});
+
 test("sync merge carries swapPool and unions accounts", () => {
   const mk = (accounts: string[], extra = {}) => ({ name: "p", label: "p", configDir: "/x/p", swapPool: { accounts, ...extra } });
   const merged = mergeIdentity(mk(["a", "b"], { auto: true }), mk(["b", "c"], { active: "c" }));
@@ -75,6 +148,7 @@ test("hook on/off edits only its own StopFailure entry", async () => {
   let s = JSON.parse(await readFile(settingsPath, "utf8"));
   expect(s.hooks.StopFailure).toHaveLength(2);
   expect(s.hooks.StopFailure[1].hooks[0].command).toContain("next --if-limited --assume-limited --reason=auto --pool=shared");
+  expect(s.hooks.StopFailure[1].hooks[0].command).not.toContain("--expected-active");
   await runClaudeSwapCommand(["hook", "off"], {}, deps());
   s = JSON.parse(await readFile(settingsPath, "utf8"));
   expect(s.hooks.StopFailure).toHaveLength(1);

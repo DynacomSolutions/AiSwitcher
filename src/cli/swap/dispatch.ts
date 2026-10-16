@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { MemberUsage } from "../../identities/claude-usage-api.ts";
 import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
+import { eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
 import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps } from "../../identities/pool/ops.ts";
 import { adapterFor } from "../../identities/pool/registry.ts";
 import { performPoolSwap } from "../../identities/pool/swap.ts";
@@ -33,7 +34,7 @@ export interface SwapDeps extends PoolOpsDeps<any> {
 const usageText = (cmd: string, tool: string): string => `Usage:
   ${cmd} [status] [pool] [--json] [--no-usage]
   ${cmd} to <account> [--pool=] [--force]
-  ${cmd} next [--pool=] [--if-limited] [--reason=manual|auto|launch]
+  ${cmd} next [--pool=] [--config-dir=] [--if-limited] [--expected-active=] [--trust-limit-evidence] [--reason=manual|auto|launch]
   ${cmd} pool create <name> --accounts=a,b[,c] [--config-dir=]
   ${cmd} allow|disallow <account> [--pool=]
   ${cmd} auto on|off [--pool=] [--threshold=95]${tool === "claude" ? `
@@ -139,6 +140,18 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
   const sub = first === undefined ? "status" : known.has(first) ? first : "status";
   const rest = first !== undefined && known.has(first) ? positionals.slice(1) : positionals;
   const poolFlag = stringFlag(flags, "pool");
+  const configDirFlag = stringFlag(flags, "config-dir");
+  const expectedActive = stringFlag(flags, "expected-active");
+  const failureAtRaw = stringFlag(flags, "failure-at-ms");
+  const failureAtMs = failureAtRaw === undefined ? undefined : Number(failureAtRaw);
+  if (failureAtMs !== undefined && (!Number.isFinite(failureAtMs) || failureAtMs < 0)) throw new CliUsageError("--failure-at-ms must be a non-negative timestamp in milliseconds");
+  let scopedPool = poolFlag;
+  if (!scopedPool && configDirFlag && (sub === "status" || sub === "next")) {
+    const configDir = expandPath(configDirFlag);
+    const matching = poolsOf(await loadIdentitiesFile(registryPath)).filter((pool) => expandPath(pool.configDir) === configDir);
+    if (matching.length !== 1) throw new SwapPoolError(`No unique ${tool} swap pool uses config directory "${configDirFlag}"`);
+    scopedPool = matching[0]!.name;
+  }
 
   {
     switch (sub) {
@@ -146,9 +159,11 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         return log(USAGE);
 
       case "status": {
-        const status = await poolStatus(adapter, opsDeps, rest[0] ?? poolFlag, { usage: !boolFlag(flags, "no-usage") });
+        const status = await poolStatus(adapter, opsDeps, rest[0] ?? scopedPool, { usage: !boolFlag(flags, "no-usage") });
         if (json) {
-          return log(JSON.stringify({ pool: status.pool.name, active: status.pool.swapPool.active ?? null, auto: status.pool.swapPool.auto === true, thresholdPercent: status.thresholdPercent, accounts: status.rows }, null, 2));
+          const events = eventsForPool(await readSwapEvents(deps.ledgerPath ?? aisSwapLedgerPath(tool)), status.pool);
+          const lastSwapAt = events.at(-1)?.ts;
+          return log(JSON.stringify({ pool: status.pool.name, active: status.pool.swapPool.active ?? null, ...(lastSwapAt ? { lastSwapAt } : {}), auto: status.pool.swapPool.auto === true, thresholdPercent: status.thresholdPercent, accounts: status.rows }, null, 2));
         }
         for (const line of (tool === "claude" ? renderStatus : renderWindowStatus)(status.pool.name, status.pool.swapPool.auto === true, status.thresholdPercent, status.rows as MemberRow<MemberUsage>[])) log(line);
         return;
@@ -167,12 +182,17 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
       case "next": {
         const reason = reasonFlag(flags, boolFlag(flags, "if-limited") ? "auto" : "manual");
         if (boolFlag(flags, "if-limited")) {
-          const outcome = await swapIfLimited(adapter, opsDeps, poolFlag, reason, { assumeLimited: boolFlag(flags, "assume-limited") });
+          const outcome = await swapIfLimited(adapter, opsDeps, scopedPool, reason, {
+            assumeLimited: boolFlag(flags, "assume-limited"),
+            trustLimitEvidence: boolFlag(flags, "trust-limit-evidence"),
+            ...(expectedActive ? { expectedActive } : {}),
+            ...(failureAtMs !== undefined ? { failureAtMs } : {}),
+          });
           if (json) return log(JSON.stringify(outcome, null, 2));
           log(outcome.action === "swapped" ? `${green("✔")} ${describeSwap(outcome.result)}` : dim(`${tool}-swap: ${outcome.action}${"why" in outcome ? ` (${outcome.why})` : ""}`));
           return outcome.action === "swapped" ? runningWarning(outcome.result) : undefined;
         }
-        const r = await swapToNext(adapter, opsDeps, poolFlag, reason);
+        const r = await swapToNext(adapter, opsDeps, scopedPool, reason);
         if (!r) throw new SwapPoolError("No other allowed account to switch to.");
         if (json) return log(JSON.stringify(r, null, 2));
         log(`${green("✔")} ${describeSwap(r)}`);

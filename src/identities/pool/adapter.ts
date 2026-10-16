@@ -19,6 +19,8 @@ export interface SwapEvent {
   from: string | null;
   to: string;
   reason: SwapReason;
+  /** A hard provider limit was observed for `from`; suppress it until reset. */
+  hardLimitUntilMs?: number;
 }
 
 export type WriteBackOutcome =
@@ -48,7 +50,7 @@ export interface PoolUsage {
   status: "live" | "rate-limited" | "unavailable";
   /** Highest utilisation percent over the provider's windows, when known. */
   maxUtilization?: number;
-  /** Optional per-window detail for display; the core never reads it. */
+  /** Optional per-window detail for display and generic reset scheduling. */
   windows?: Array<{ label: string; utilization: number; resetsAt?: string }>;
   /** Paid capacity the member can fall back on once its windows are full. */
   extraUsage?: ExtraUsageInfo;

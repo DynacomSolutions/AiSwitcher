@@ -94,6 +94,158 @@ describe("generic pool core", () => {
     expect(again.action).toBe("cooldown");
   });
 
+  test("an exhausted hard limit bypasses cooldown and chooses a non-exhausted member", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "claude-swap.jsonl");
+    const now = Date.now();
+    await appendSwapEvent({ ts: new Date(now).toISOString(), pool: "pool", from: "b", to: "a", reason: "auto" }, ledger);
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => live(member.name === "a" ? 100 : 96),
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: ledger, now: () => now + 1 }, "pool", "auto", { assumeLimited: true });
+    expect(result.action).toBe("swapped");
+    if (result.action === "swapped") expect(result.result.to).toBe("b");
+    expect((await readSwapEvents(ledger)).at(-1)?.hardLimitUntilMs).toBeGreaterThan(now + 1);
+  });
+
+  test("fresh live headroom overrides a generic assumed rate limit", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "claude-swap.jsonl");
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => live(member.name === "a" ? 40 : 10),
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: ledger }, "pool", "auto", { assumeLimited: true });
+    expect(result).toMatchObject({ action: "not-limited", utilization: 40 });
+    expect(await readSwapEvents(ledger)).toHaveLength(0);
+  });
+
+  test("explicit provider limit evidence can override stale live headroom", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => live(member.name === "a" ? 60 : 10),
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: join(root, "claude-swap.jsonl") }, "pool", "auto", {
+      assumeLimited: true,
+      trustLimitEvidence: true,
+      failureAtMs: Date.now(),
+    });
+    expect(result).toMatchObject({ action: "swapped", result: { from: "a", to: "b" } });
+  });
+
+  test("a swap since this failure prevents a second rotation in a three-member pool", async () => {
+    const registry = join(root, "claude.json");
+    const member = (name: string) => ({ name, label: name, configDir: join(root, name) });
+    await writeFile(registry, JSON.stringify({ version: 1, identities: [member("a"), member("b"), member("c"), { ...member("pool"), swapPool: { accounts: ["a", "b", "c"], active: "b" } }] }));
+    const ledger = join(root, "claude-swap.jsonl");
+    const failureAtMs = Date.now() - 10;
+    await appendSwapEvent({ ts: new Date(failureAtMs + 1).toISOString(), pool: "pool", from: "a", to: "b", reason: "auto" }, ledger);
+    const adapter: PoolAdapter = { ...fakeAdapter("claude", registry, {}), fetchUsage: async (m) => live(m.name === "b" ? 100 : 5) };
+    const result = await swapIfLimited(adapter, { ledgerPath: ledger, now: () => failureAtMs + 2 }, "pool", "auto", { assumeLimited: true, trustLimitEvidence: true, failureAtMs });
+    expect(result.action).toBe("skipped");
+    expect(await readSwapEvents(ledger)).toHaveLength(1);
+  });
+
+  test("a recent hard-limit marker keeps an exhausted member out of candidate selection", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "claude-swap.jsonl");
+    const now = Date.now();
+    await appendSwapEvent({ ts: new Date(now - 1_000).toISOString(), pool: "pool", from: "b", to: "a", reason: "auto", hardLimitUntilMs: now + 60_000 }, ledger);
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => live(member.name === "a" ? 100 : 5),
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: ledger, now: () => now }, "pool", "auto", { assumeLimited: true });
+    expect(result.action).toBe("no-candidate");
+  });
+
+  test("all exhausted members return the earliest member reset for scheduler retry", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const ledger = join(root, "claude-swap.jsonl");
+    const now = Date.now();
+    const resetSoon = new Date(now + 90_000).toISOString(); // SYNTHETIC_FIXTURE reset timestamp
+    const resetLater = new Date(now + 180_000).toISOString(); // SYNTHETIC_FIXTURE reset timestamp
+    const exhausted = (resetsAt: string): PoolUsage => ({
+      status: "live",
+      maxUtilization: 100,
+      windows: [{ label: "synthetic-window", utilization: 100, resetsAt }],
+      capturedAt: "SYNTHETIC_FIXTURE",
+    });
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => exhausted(member.name === "b" ? resetSoon : resetLater),
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: ledger, now: () => now }, "pool", "auto");
+    expect(result).toMatchObject({ action: "no-candidate", retryAtMs: now + 90_000 });
+  });
+
+  test("an unknown member does not hide another member's imminent reset", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const now = Date.now();
+    const resetSoon = new Date(now + 15_000).toISOString(); // SYNTHETIC_FIXTURE reset timestamp
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => member.name === "a"
+        ? { ...live(100), windows: [{ label: "synthetic-window", utilization: 100, resetsAt: resetSoon }] }
+        : { status: "unavailable", error: "SYNTHETIC_FIXTURE transient error", capturedAt: "SYNTHETIC_FIXTURE" },
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: join(root, "claude-swap.jsonl"), now: () => now }, "pool", "auto");
+    expect(result).toMatchObject({ action: "no-candidate", retryAtMs: now + 15_000 });
+  });
+
+  test("pool retry time is not reported as the active member's reset", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const now = Date.now();
+    const otherReset = new Date(now + 15_000).toISOString(); // SYNTHETIC_FIXTURE reset timestamp
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => member.name === "a"
+        ? { status: "rate-limited", capturedAt: "SYNTHETIC_FIXTURE" }
+        : { ...live(100), windows: [{ label: "synthetic-window", utilization: 100, resetsAt: otherReset }] },
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: join(root, "claude-swap.jsonl"), now: () => now }, "pool", "auto", { assumeLimited: true });
+    expect(result).toMatchObject({ action: "no-candidate", retryAtMs: now + 15_000 });
+    if (result.action === "no-candidate") expect(result.activeRetryAtMs).toBeUndefined();
+  });
+
+  test("the active Claude member can be usable before its later non-exhausted window resets", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const now = Date.now();
+    const activeSoon = new Date(now + 15_000).toISOString(); // SYNTHETIC_FIXTURE reset timestamp
+    const otherLater = new Date(now + 180_000).toISOString(); // SYNTHETIC_FIXTURE reset timestamp
+    const active: PoolUsage = {
+      status: "live",
+      maxUtilization: 100,
+      windows: [
+        { label: "synthetic-five-hour", utilization: 100, resetsAt: activeSoon },
+        { label: "synthetic-seven-day", utilization: 20, resetsAt: otherLater },
+      ],
+      capturedAt: "SYNTHETIC_FIXTURE",
+    };
+    const full = (resetsAt: string): PoolUsage => ({
+      status: "live",
+      maxUtilization: 100,
+      windows: [{ label: "synthetic-window", utilization: 100, resetsAt }],
+      capturedAt: "SYNTHETIC_FIXTURE",
+    });
+    const adapter: PoolAdapter = {
+      ...fakeAdapter("claude", registry, {}),
+      fetchUsage: async (member) => member.name === "a" ? active : full(otherLater),
+    };
+    const result = await swapIfLimited(adapter, { ledgerPath: join(root, "claude-swap.jsonl"), now: () => now }, "pool", "auto");
+    expect(result).toMatchObject({ action: "no-candidate", retryAtMs: now + 15_000 });
+  });
+
   test("ledger path is per tool and claude stays claude-swap.jsonl", async () => {
     expect(aisSwapLedgerPath("codex", root)).toBe(join(root, ".ais", "state", "codex-swap.jsonl"));
     expect(aisClaudeSwapLedgerPath(root)).toBe(aisSwapLedgerPath("claude", root));
@@ -120,6 +272,24 @@ describe("generic pool core", () => {
     expect(seen).toEqual(["claude:pool", "codex:pool"]);
     const st = await sched.status();
     expect(st.pools.map((p) => p.tool)).toEqual(["claude", "codex"]);
+  });
+
+  test("daemon floors an imminent reset at the jittered poll interval", async () => {
+    const registry = join(root, "claude.json");
+    await writeRegistry(registry);
+    const seen: string[] = [];
+    const sched = new PoolSwapScheduler({
+      adapters: () => [fakeAdapter("claude", registry, {})],
+      random: () => 0,
+      log: () => {},
+      check: async () => { seen.push("check"); return { action: "no-candidate", retryAtMs: 1_030_000 }; },
+    });
+    await sched.tick(1_000_000);
+    expect((await sched.status()).pools[0]?.backoffMs).toBe(60_000);
+    await sched.tick(1_059_999);
+    expect(seen).toHaveLength(1);
+    await sched.tick(1_060_000);
+    expect(seen).toHaveLength(2);
   });
 
   test("liveSwap:false adapter still swaps and notifySwapped runs after the ledger append", async () => {

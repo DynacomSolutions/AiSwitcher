@@ -20,6 +20,8 @@ import {
   tone,
   totals,
 } from './model'
+import { createContinuationLimiter, createRecoveryLifecycle, createTurnRecoveryState, recoveryDelay, runRateLimitRecoveryHook, runRecoveryCycle, runSessionEndHook } from './recovery'
+import type { RecoveryStatus } from './recovery'
 import type { Section } from './model'
 
 const PANE = 'ais-usage'
@@ -86,10 +88,89 @@ const pad2 = (n: number) => String(n).padStart(2, '0')
 
 export const register: Register = on => {
   let isLimitsBusy = false
+  let recoveryTimer: { cancel: () => void } | undefined
+  let recoverySubmitMember: string | undefined
+  const recoveryLifecycle = createRecoveryLifecycle()
+  const continuationLimiter = createContinuationLimiter()
+  const turnRecovery = createTurnRecoveryState()
+  let observedPoolActive: string | undefined
+  let mainTurnId: string | undefined
+  const cancelRecovery = () => {
+    recoveryLifecycle.cancel()
+    recoveryTimer?.cancel()
+    recoveryTimer = undefined
+    if (recoverySubmitMember) continuationLimiter.cancelled(recoverySubmitMember)
+    recoverySubmitMember = undefined
+  }
+  const poolStatus = async ($: any, configDir: string): Promise<RecoveryStatus | undefined> => {
+    try {
+      const r = await runAis($, ['claude-swap', 'status', '--json', `--config-dir=${configDir}`], 20000)
+      const value = r.exitCode === 0 ? parseJson<RecoveryStatus>(r.stdout) : undefined
+      if (value?.active) observedPoolActive = value.active
+      return value
+    } catch {
+      return undefined
+    }
+  }
+  const queueContinuation = ($: any) => {
+    // Prompt submission from inside a working hook is rejected. The timer
+    // runs after the classic hook chain has returned and the turn is idle.
+    void $.prompt.submit({ text: 'Continue the interrupted request now that an allowed pool member is available.' }).catch(() => undefined)
+  }
+  const scheduleContinuation = ($: any, active: string | undefined) => {
+    if (!active) return
+    if (recoverySubmitMember === active && recoveryTimer) return
+    cancelRecovery()
+    const delay = continuationLimiter.reserve(active, Date.now())
+    if (delay === undefined) return
+    const generation = recoveryLifecycle.capture()
+    recoverySubmitMember = active
+    recoveryTimer = $.clock.after(delay, async () => {
+      recoveryTimer = undefined
+      recoverySubmitMember = undefined
+      continuationLimiter.fired(active)
+      if (recoveryLifecycle.isCurrent(generation)) queueContinuation($)
+    })
+  }
+  const scheduleRecovery = ($: any, configDir: string, before: RecoveryStatus, failureAtMs: number, assumeLimited: boolean, retryAtMs?: number, activeRetryAtMs?: number, immediate = false, submitOnly = false, trustLimitEvidence = false) => {
+    if (submitOnly) return scheduleContinuation($, before.active)
+    cancelRecovery()
+    const generation = recoveryLifecycle.capture()
+    recoveryTimer = $.clock.after(recoveryDelay(retryAtMs, Date.now(), immediate ? 0 : 60_000), async () => {
+      recoveryTimer = undefined
+      const isCurrent = () => recoveryLifecycle.isCurrent(generation)
+      void runRecoveryCycle({
+        before,
+        failureAtMs,
+        activeRetryAtMs,
+        trustLimitEvidence,
+        isCurrent,
+        readStatus: () => poolStatus($, configDir),
+        swap: async () => {
+          try {
+            const r = await runAis($, [
+              'claude-swap', 'next', '--if-limited', ...(assumeLimited ? ['--assume-limited'] : []), '--reason=auto', '--json',
+              ...(trustLimitEvidence ? ['--trust-limit-evidence'] : []),
+              `--failure-at-ms=${failureAtMs}`,
+              `--config-dir=${configDir}`, `--expected-active=${before.active}`,
+            ], 60000)
+            return r.exitCode === 0 ? parseJson<{ action?: string; retryAtMs?: number; activeRetryAtMs?: number }>(r.stdout) : undefined
+          } catch {
+            return undefined
+          }
+        },
+        submit: active => { if (isCurrent()) scheduleContinuation($, active) },
+        retry: (nextRetryAtMs, nextActiveRetryAtMs, nextTrustLimitEvidence) => {
+          if (isCurrent()) scheduleRecovery($, configDir, before, failureAtMs, assumeLimited, nextRetryAtMs, nextActiveRetryAtMs, false, false, nextTrustLimitEvidence)
+        },
+      }).catch(() => undefined)
+    })
+  }
   // Set by session.start; the command and the Refresh button call it.
   let refreshHandle: (() => Promise<void>) | undefined
 
   on('session.start', async ($, e, next) => {
+    cancelRecovery()
     // Clears a status left by an older loaded version after /reload-plugins.
     $.ui.status(undefined)
 
@@ -119,6 +200,7 @@ export const register: Register = on => {
       const v = await fetchJson<SwapStatus>('status', ['claude-swap', 'status', '--json', '--no-usage'], 20000)
       if (v) {
         await update($, status, () => v)
+        if (v.active) observedPoolActive = v.active
         await writeSnapshot($)
       }
     }
@@ -161,7 +243,47 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('classic.StopFailure', async ($, e, next) => {
+    let configDir: string | undefined
+    const generation = recoveryLifecycle.capture()
+    const failureAtMs = turnRecovery.stopFailure()
+    return runRateLimitRecoveryHook(e, () => next(e), async () => {
+      try {
+        configDir = await $.env.get('CLAUDE_CONFIG_DIR')
+        return configDir ? await poolStatus($, configDir) : undefined
+      } catch {
+        return undefined
+      }
+    }, (before, failureAtMs, assumeLimited, submitOnly, trustLimitEvidence) => {
+      if (configDir && recoveryLifecycle.isCurrent(generation)) scheduleRecovery($, configDir, before, failureAtMs, assumeLimited, undefined, undefined, true, submitOnly, trustLimitEvidence)
+    }, Date.now, failureAtMs)
+  })
+
+  on('turn.start', ($, e, next) => {
+    mainTurnId = e.turnId
+    turnRecovery.start(Date.now())
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (!e.agentId && e.turnId === mainTurnId) {
+      const st = await read($, status)
+      turnRecovery.complete(e.reason, observedPoolActive ?? st?.active, continuationLimiter)
+      mainTurnId = undefined
+    }
+    return result
+  })
+
+  on('session.end', (_$, e, next) => runSessionEndHook(recoveryLifecycle, e, next, () => {
+    recoveryTimer?.cancel()
+    recoveryTimer = undefined
+    if (recoverySubmitMember) continuationLimiter.cancelled(recoverySubmitMember)
+    recoverySubmitMember = undefined
+  }))
+
   on('prompt.submit', async ($, e, next) => {
+    cancelRecovery()
     const st = await read($, status)
     const notice = switchNotice(await read($, lastMember), st)
     if (st) await update($, lastMember, () => st.active)
