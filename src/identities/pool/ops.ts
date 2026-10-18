@@ -119,6 +119,8 @@ export async function swapIfLimited<U extends PoolUsage>(
   }
   const now = deps.now?.() ?? Date.now();
   const failureAtMs = options.failureAtMs ?? (options.assumeLimited ? now : undefined);
+  // A (possibly cached) reading taken before the failure cannot show headroom after it.
+  const readAfterFailure = (capturedAt: string) => failureAtMs === undefined || !(Date.parse(capturedAt) < failureAtMs);
   const cooldownMs = options.cooldownMs ?? SWAP_COOLDOWN_MS;
   const ledgerPath = deps.ledgerPath ?? ledgerPathFor(adapter.tool);
   const recentEvents = async (p: PoolIdentity) => eventsForPool(await readSwapEvents(ledgerPath), p);
@@ -155,7 +157,7 @@ export async function swapIfLimited<U extends PoolUsage>(
   const threshold = poolThreshold(pool);
   // Fresh live headroom is stronger evidence than a generic StopFailure
   // rate_limit code (for example a server-side throttle).
-  if (options.assumeLimited && !options.trustLimitEvidence && usage.status === "live" && typeof usage.maxUtilization === "number" && usage.maxUtilization < 100) {
+  if (options.assumeLimited && !options.trustLimitEvidence && usage.status === "live" && typeof usage.maxUtilization === "number" && usage.maxUtilization < 100 && readAfterFailure(usage.capturedAt)) {
     return { action: "not-limited", ...(usage.maxUtilization !== undefined ? { utilization: usage.maxUtilization } : {}) };
   }
   const limited = options.assumeLimited || usage.status === "rate-limited" || (usage.status === "live" && (usage.maxUtilization ?? 0) >= threshold);
@@ -222,7 +224,7 @@ export async function swapIfLimited<U extends PoolUsage>(
         }
         if (options.assumeLimited) {
           const againUsage = await fetchUsage(activeMember);
-          if (!options.trustLimitEvidence && againUsage.status === "live" && typeof againUsage.maxUtilization === "number" && againUsage.maxUtilization < 100) throw new SwapSkipped<LimitedOutcome>({ action: "not-limited", utilization: againUsage.maxUtilization });
+          if (!options.trustLimitEvidence && againUsage.status === "live" && typeof againUsage.maxUtilization === "number" && againUsage.maxUtilization < 100 && readAfterFailure(againUsage.capturedAt)) throw new SwapSkipped<LimitedOutcome>({ action: "not-limited", utilization: againUsage.maxUtilization });
         }
         const again = options.assumeLimited ? undefined : await cooldown(current);
         if (again) throw new SwapSkipped<LimitedOutcome>(again);

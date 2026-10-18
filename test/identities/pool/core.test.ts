@@ -123,6 +123,21 @@ describe("generic pool core", () => {
     expect(await readSwapEvents(ledger)).toHaveLength(0);
   });
 
+  test("live headroom refutes an assumed limit only when read at or after the failure", async () => {
+    const failureAtMs = Date.now();
+    const run = async (capturedAt: number) => {
+      const registry = join(root, `claude-${capturedAt}.json`); // fresh each run: a swap rewrites the active member
+      await writeRegistry(registry);
+      const adapter: PoolAdapter = {
+        ...fakeAdapter("claude", registry, {}),
+        fetchUsage: async (member) => ({ ...live(member.name === "a" ? 98 : 10), capturedAt: new Date(capturedAt).toISOString() }),
+      };
+      return swapIfLimited(adapter, { ledgerPath: join(root, `claude-swap-${capturedAt}.jsonl`), now: () => failureAtMs + 5 }, "pool", "auto", { assumeLimited: true, failureAtMs });
+    };
+    expect(await run(failureAtMs - 1000)).toMatchObject({ action: "swapped", result: { from: "a", to: "b" } });
+    expect(await run(failureAtMs + 1)).toMatchObject({ action: "not-limited", utilization: 98 });
+  });
+
   test("explicit provider limit evidence can override stale live headroom", async () => {
     const registry = join(root, "claude.json");
     await writeRegistry(registry);
