@@ -59,6 +59,9 @@ test("pool create refuses unknown accounts and a reused configDir", async () => 
   await expect(runClaudeSwapCommand(["pool", "create", "p"], { accounts: "a,b", "config-dir": join(root, "a") }, deps())).rejects.toThrow(/already used/);
 });
 
+// The assumed failure time is "now"; push it past the pool-create ledger event (same millisecond otherwise).
+const afterLedger = () => Date.now() + 1_000;
+
 test("recovery flags resolve by config directory and reject a stale expected active member", async () => {
   await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
   out = [];
@@ -68,7 +71,7 @@ test("recovery flags resolve by config directory and reject a stale expected act
     "assume-limited": true,
     "expected-active": "b",
     json: true,
-  }, deps());
+  }, { ...deps(), now: afterLedger });
   expect(JSON.parse(out.join("\n"))).toMatchObject({ action: "skipped", why: 'pool changed to "a" before limit recovery' });
 
   out = [];
@@ -80,6 +83,7 @@ test("recovery flags resolve by config directory and reject a stale expected act
     json: true,
   }, {
     ...deps(),
+    now: afterLedger,
     fetchUsage: async (member) => {
       const utilization = member.name === "a" ? 100 : 12;
       return { status: "live" as const, fiveHour: { utilization }, sevenDay: { utilization }, maxUtilization: utilization, capturedAt: "SYNTHETIC_FIXTURE" };
