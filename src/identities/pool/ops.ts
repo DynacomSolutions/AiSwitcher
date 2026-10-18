@@ -185,8 +185,10 @@ export async function swapIfLimited<U extends PoolUsage>(
   const fallbackUtil = rows.find((r) => r.name === fallback)?.usage?.maxUtilization;
   const target = chooseBest(usableRows, { belowPercent: threshold, requireKnown: true }) ??
     (fallbackUtil !== undefined && (options.assumeLimited || fallbackUtil < activeUtil) ? fallback : undefined);
+  // Hard limit evidence and no known headroom (e.g. usage API 429s for all): move to a member not known to be exhausted rather than stay stuck.
+  const unknownTarget = options.assumeLimited && !target ? usableRows.find((r) => r.usage && r.usage.status !== "live")?.name : undefined;
   const paid = options.assumeLimited
-    ? target
+    ? target ?? unknownTarget
     : target ?? (activeUtil < 100 || usage.extraUsage?.available ? undefined : chooseBest(usableRows.filter((r) => r.usage?.extraUsage?.available), {}));
   if (!paid) {
     const resetRows = [...rows, { name: active, usage, blockedUntil: blockedUntil.get(active) }];
