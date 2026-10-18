@@ -632,6 +632,36 @@ describe("selection and auto swap", () => {
     expect(await readSwapEvents(ledger)).toHaveLength(0);
   });
 
+  describe("assume-limited with unknown usage", () => {
+    const limited = (name: string) => name === "a" ? live(100) : { status: "rate-limited" as const, capturedAt: "x" };
+    const base = () => ({ registryPath: registry, ledgerPath: ledger, now: () => NOW_S * 1000 });
+
+    test("swaps to an unknown member when every other usage is rate-limited", async () => {
+      await writeRegistry({ auto: true });
+      const r = await swapIfLimited({ ...base(), fetchUsage: async (m: Identity) => limited(m.name) }, "pool", "auto", { assumeLimited: true });
+      expect(r.action).toBe("swapped");
+    });
+
+    test("skips an unknown member blocked by a ledger hard limit", async () => {
+      await writeRegistry({ auto: true });
+      await writeFile(ledger, `${JSON.stringify({ ts: new Date((NOW_S - 600) * 1000).toISOString(), pool: "pool", from: "b", to: "a", reason: "auto", hardLimitUntilMs: (NOW_S + 3600) * 1000 })}\n`);
+      const r = await swapIfLimited({ ...base(), fetchUsage: async (m: Identity) => limited(m.name) }, "pool", "auto", { assumeLimited: true });
+      expect(r.action === "swapped" && r.result.to).toBe("c");
+    });
+
+    test("still no-candidate when every other member is live at 100", async () => {
+      await writeRegistry({ auto: true });
+      const r = await swapIfLimited({ ...base(), fetchUsage: usageMap({ a: 100, b: 100, c: 100 }) }, "pool", "auto", { assumeLimited: true });
+      expect(r.action).toBe("no-candidate");
+    });
+
+    test("without assumeLimited unknown members are not chosen", async () => {
+      await writeRegistry({ auto: true });
+      const r = await swapIfLimited({ ...base(), fetchUsage: async (m: Identity) => limited(m.name) }, "pool", "auto");
+      expect(r.action).not.toBe("swapped");
+    });
+  });
+
   test("a below-threshold member is preferred over the fallback", async () => {
     await writeRegistry({ auto: true });
     const r = await swapIfLimited({ registryPath: registry, ledgerPath: ledger, fetchUsage: usageMap({ a: 100, b: 99, c: 94 }), now: () => NOW_S * 1000 }, "pool", "auto");
