@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { MemberUsage } from "../../identities/claude-usage-api.ts";
 import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
 import { eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
@@ -146,9 +146,12 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
   const failureAtMs = failureAtRaw === undefined ? undefined : Number(failureAtRaw);
   if (failureAtMs !== undefined && (!Number.isFinite(failureAtMs) || failureAtMs < 0)) throw new CliUsageError("--failure-at-ms must be a non-negative timestamp in milliseconds");
   let scopedPool = poolFlag;
-  if (!scopedPool && configDirFlag && (sub === "status" || sub === "next")) {
-    const configDir = expandPath(configDirFlag);
-    const matching = poolsOf(await loadIdentitiesFile(registryPath)).filter((pool) => expandPath(pool.configDir) === configDir);
+  if (!scopedPool && configDirFlag !== undefined && (sub === "status" || sub === "next")) {
+    // An unset variable in the hook (`--config-dir="$CLAUDE_CONFIG_DIR"`) arrives as "".
+    if (configDirFlag.trim() === "") throw new SwapPoolError("--config-dir is empty (is CLAUDE_CONFIG_DIR set?); pass a pool config directory or use --pool=");
+    const norm = (dir: string) => resolve(expandPath(dir)); // resolve() drops trailing slashes
+    const configDir = norm(configDirFlag);
+    const matching = poolsOf(await loadIdentitiesFile(registryPath)).filter((pool) => norm(pool.configDir) === configDir);
     if (matching.length !== 1) throw new SwapPoolError(`No unique ${tool} swap pool uses config directory "${configDirFlag}"`);
     scopedPool = matching[0]!.name;
   }
@@ -273,7 +276,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         const file = await loadIdentitiesFile(registryPath);
         const pool = requirePool(file, poolFlag, tool);
         if (mode === "on") {
-          await installSwapHook(pool.configDir, pool.name);
+          await installSwapHook(pool.configDir);
           return log(`${green("✔")} StopFailure(rate_limit) hook installed in ${join(pool.configDir, "settings.json")}`);
         }
         const removed = await removeSwapHook(pool.configDir);

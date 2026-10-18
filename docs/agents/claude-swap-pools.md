@@ -120,7 +120,11 @@ codex: `AIS_POOL_SWAP_CODEX=0`.
 lives in `src/cli/swap/dispatch.ts` (`runSwapCommand(tool, ...)`, driven by
 `adapterFor(tool)`); `ais claude-swap` is `runClaudeSwapCommand`, the same
 function bound to claude (same output, flags, exit codes). `hook` is
-Claude-only. Codex `to`/`next` print `SwapResult.runningSessions`; codex
+Claude-only; the installed command is `next --if-limited --assume-limited
+--reason=auto --config-dir="$CLAUDE_CONFIG_DIR"` (no pool name, so renames and
+multiple pools work; `--config-dir` resolves to the unique pool with that
+configDir, an empty value is an error). `hook on --pool=` only selects whose
+`settings.json` is written; re-running it migrates an old `--pool=` hook. Codex `to`/`next` print `SwapResult.runningSessions`; codex
 `pool create` validates members with `codexMemberProblem`. `usage` goes
 through `claude-swap/attribution.ts` `poolMemberUsageSplit(..., {tool})`:
 claude reads `projects/`, codex reads `sessions/**/rollout-*.jsonl`

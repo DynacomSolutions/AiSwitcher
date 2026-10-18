@@ -1025,8 +1025,12 @@ cooldown prevents flapping; with no qualifying member it logs and backs off.
 The claude shim does one bounded (4s) pre-launch check for a pool (reason
 `launch`). `ais claude-swap hook on` installs a `StopFailure` hook
 (matcher `rate_limit`) in the pool's `settings.json` that runs
-`ais claude-swap next --if-limited --assume-limited --reason=auto`, so a hard 429
-swaps at once (needs `ais` on PATH).
+`ais claude-swap next --if-limited --assume-limited --reason=auto --config-dir="$CLAUDE_CONFIG_DIR"`,
+so a hard 429 swaps at once (needs `ais` on PATH). The hook names no pool: it finds
+the pool by the session's config directory, so renaming a pool or using several
+pools is safe. `--pool=` on `hook on` only picks which pool's `settings.json` to
+write. To upgrade an older hook that embeds `--pool=<name>`, re-run
+`ais claude-swap hook on --pool=<pool>`.
 
 While a member is active, the pool's `.credentials.json` is another store of
 that member's grant: the daemon refresh writes through to it and picks the
