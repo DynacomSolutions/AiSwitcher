@@ -441,10 +441,73 @@ describe("usage api", () => {
     }) as unknown as typeof fetch;
     const u = await fetchMemberUsage(b, { fetchImpl: ok, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 });
     expect(u.maxUtilization).toBe(20);
+    const later = () => (NOW_S + 120) * 1000; // past the fresh-read TTL
     expect(headers.Authorization).toBe("Bearer at-b1");
     expect(headers["anthropic-beta"]).toBe("oauth-2025-04-20");
     const limited = (async () => new Response("", { status: 429, headers: { "retry-after": "30" } })) as unknown as typeof fetch;
-    expect(await fetchMemberUsage(b, { fetchImpl: limited, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000 })).toMatchObject({ status: "rate-limited", retryAfterSeconds: 30 });
+    expect(await fetchMemberUsage(b, { fetchImpl: limited, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: later })).toMatchObject({ status: "rate-limited", retryAfterSeconds: 30 });
+  });
+
+  describe("shared fetch throttle", () => {
+    const body = JSON.stringify({ five_hour: { utilization: 10, resets_at: "2030-01-01T00:00:00Z" }, seven_day: { utilization: 96 } });
+    const counting = (make: () => Response) => {
+      const f = { calls: 0, impl: (async () => (f.calls++, make())) as unknown as typeof fetch };
+      return f;
+    };
+
+    test("a live read younger than 60s is reused with no fetch, then refetched", async () => {
+      await writeRegistry();
+      const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+      const f = counting(() => new Response(body, { status: 200 }));
+      let t = NOW_S * 1000;
+      const deps = { claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => t, fetchImpl: f.impl };
+      await fetchMemberUsage(b, deps);
+      t += 30_000;
+      const reused = await fetchMemberUsage(b, deps);
+      expect(f.calls).toBe(1);
+      expect(reused).toMatchObject({ status: "live", maxUtilization: 96, fiveHour: { utilization: 10, resetsAt: "2030-01-01T00:00:00.000Z" }, sevenDay: { utilization: 96 } });
+      t += 60_000;
+      await fetchMemberUsage(b, deps);
+      expect(f.calls).toBe(2);
+    });
+
+    test("429 backs off across calls, honours retry-after, expires, and success clears it", async () => {
+      await writeRegistry();
+      const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+      let t = NOW_S * 1000;
+      const limited = counting(() => new Response("", { status: 429, headers: { "retry-after": "300" } }));
+      const deps = { claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => t };
+      await fetchMemberUsage(b, { ...deps, fetchImpl: limited.impl });
+      t += 200_000;
+      const skipped = await fetchMemberUsage(b, { ...deps, fetchImpl: limited.impl });
+      expect(limited.calls).toBe(1);
+      expect(skipped).toMatchObject({ status: "rate-limited", error: "usage endpoint answered HTTP 429", retryAfterSeconds: 100 });
+      // The resets variant shares the same backoff.
+      expect(await fetchUsageBodyWithResets(b, { ...deps, fetchImpl: limited.impl })).toMatchObject({ status: 429 });
+      expect(limited.calls).toBe(1);
+      t += 101_000;
+      const ok = counting(() => new Response(body, { status: 200 }));
+      expect((await fetchMemberUsage(b, { ...deps, fetchImpl: ok.impl })).status).toBe("live");
+      expect(ok.calls).toBe(1);
+      // Success cleared the backoff: once the fresh read ages out, a new fetch goes out.
+      t += 61_000;
+      await fetchMemberUsage(b, { ...deps, fetchImpl: limited.impl });
+      expect(limited.calls).toBe(2);
+    });
+
+    test("in backoff the last-good windows ride along on the rate-limited result", async () => {
+      await writeRegistry();
+      const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+      let t = NOW_S * 1000;
+      const deps = { claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => t };
+      await fetchMemberUsage(b, { ...deps, fetchImpl: counting(() => new Response(body, { status: 200 })).impl });
+      t += 90_000;
+      const limited = counting(() => new Response("", { status: 429 }));
+      await fetchMemberUsage(b, { ...deps, fetchImpl: limited.impl });
+      const again = await fetchMemberUsage(b, { ...deps, fetchImpl: limited.impl });
+      expect(limited.calls).toBe(1);
+      expect(again).toMatchObject({ status: "rate-limited", maxUtilization: 96, sevenDay: { utilization: 96 } });
+    });
   });
 
   test("a 429 inherits extra usage from the last good read only within 6 hours", async () => {

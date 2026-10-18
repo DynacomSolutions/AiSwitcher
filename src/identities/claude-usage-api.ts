@@ -1,3 +1,5 @@
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { readProviderGrantCopy } from "./oauth-reconcile.ts";
 import { poolStoreDirsFor, refreshIdentityOAuthGrant, type FetchImpl } from "./oauth-refresh.ts";
 import type { ExtraUsageInfo, ManualResetInfo } from "../cli/limits/types.ts";
@@ -21,6 +23,10 @@ export const CLAUDE_RESETS_URL = `${CLAUDE_USAGE_URL}?cedar_ember=1`;
 export const CLAUDE_RESETS_USER_AGENT = "claude-cli/2.1.296 (external, cli)";
 const USAGE_TIMEOUT_MS = 10_000;
 const EXPIRY_SKEW_SECONDS = 60;
+// Every pool member is read by many processes (daemon, hooks, one ais-usage poller per session); share reads and 429 backoff via cacheDir.
+const FRESH_READ_TTL_MS = 60_000;
+const DEFAULT_BACKOFF_SECONDS = 120;
+const MAX_BACKOFF_SECONDS = 15 * 60;
 
 export interface UsageWindowReading {
   /** 0-100 */
@@ -102,6 +108,64 @@ export interface FetchUsageDeps {
   cacheDir?: string;
 }
 
+function backoffPath(member: Identity, cacheDir: string): string {
+  return join(cacheDir, "claude-usage-backoff", `${encodeURIComponent(member.name)}.json`);
+}
+
+/** Epoch ms until which the member's usage endpoint must not be called; 0 when not backing off. */
+async function backoffUntil(member: Identity, cacheDir: string): Promise<number> {
+  try {
+    const parsed = JSON.parse(await readFile(backoffPath(member, cacheDir), "utf8")) as { until?: unknown };
+    return typeof parsed.until === "number" ? parsed.until : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function recordBackoff(member: Identity, cacheDir: string, nowMs: number, retrySeconds: number | undefined): Promise<number> {
+  const seconds = Math.min(MAX_BACKOFF_SECONDS, retrySeconds !== undefined && retrySeconds > 0 ? retrySeconds : DEFAULT_BACKOFF_SECONDS);
+  const path = backoffPath(member, cacheDir);
+  try {
+    await mkdir(join(cacheDir, "claude-usage-backoff"), { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify({ until: nowMs + seconds * 1000 }));
+    await rename(tmp, path);
+  } catch {
+    // Bookkeeping only; never fail a fetch over it.
+  }
+  return seconds;
+}
+
+const clearBackoff = (member: Identity, cacheDir: string) => rm(backoffPath(member, cacheDir), { force: true }).catch(() => {});
+
+/** Rebuilds a live MemberUsage from the shared last-good read (session and week windows only); undefined when it holds neither. */
+function usageFromLastGood(last: Awaited<ReturnType<typeof loadLastGood>>): MemberUsage | undefined {
+  if (!last?.capturedAt) return undefined;
+  const reading = (label: string): UsageWindowReading | undefined => {
+    const w = last.windows.find((x) => x.label === label);
+    return w ? { utilization: Math.min(100, Math.max(0, w.usedPercent)), ...(w.resetsAtMs !== undefined ? { resetsAt: new Date(w.resetsAtMs).toISOString() } : {}) } : undefined;
+  };
+  const fiveHour = reading("session (5h)");
+  const sevenDay = reading("week (all)");
+  const values = [fiveHour?.utilization, sevenDay?.utilization].filter((v): v is number => v !== undefined);
+  if (values.length === 0) return undefined;
+  return {
+    status: "live",
+    ...(last.extraUsage ? { extraUsage: last.extraUsage } : {}),
+    ...(fiveHour ? { fiveHour } : {}),
+    ...(sevenDay ? { sevenDay } : {}),
+    maxUtilization: Math.max(...values),
+    capturedAt: last.capturedAt,
+  };
+}
+
+/** A last-good live read younger than the TTL, shared across processes. */
+export async function freshLastGood(member: Identity, cacheDir: string, nowMs: number) {
+  const last = await loadLastGood(member, cacheDir);
+  const age = nowMs - Date.parse(last?.capturedAt ?? "");
+  return last?.status === "live" && age >= 0 && age < FRESH_READ_TTL_MS ? last : undefined;
+}
+
 /** Freshest stored access token for the account (member store or, while
  * active, the pool store), refreshed first when expired. */
 async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promise<{ token?: string; error?: string }> {
@@ -157,10 +221,15 @@ export async function fetchUsageBodyWithResets(
   deps: FetchUsageDeps = {},
 ): Promise<{ body?: unknown; error?: string; status?: number }> {
   try {
+    const cacheDir = deps.cacheDir ?? aisCacheDir();
+    const nowMs = deps.now?.() ?? Date.now();
+    if ((await backoffUntil(member, cacheDir)) > nowMs) return { error: "usage endpoint answered HTTP 429", status: 429 };
     const { token, error } = await usableAccessToken(member, deps);
     if (!token) return { error: error ?? "no token" };
     const response = await getUsage(token, CLAUDE_RESETS_URL, deps, true);
+    if (response.status === 429) await recordBackoff(member, cacheDir, nowMs, num(response.headers.get("retry-after")));
     if (!response.ok) return { error: `usage endpoint answered HTTP ${response.status}`, status: response.status };
+    await clearBackoff(member, cacheDir);
     return { body: await response.json() };
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -182,7 +251,17 @@ export async function fetchMemberUsage(member: Identity, deps: FetchUsageDeps = 
 }
 
 async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir: string): Promise<MemberUsage> {
-  const capturedAt = new Date((deps.now?.() ?? Date.now())).toISOString();
+  const nowMs = deps.now?.() ?? Date.now();
+  const capturedAt = new Date(nowMs).toISOString();
+  const fresh = usageFromLastGood(await freshLastGood(member, cacheDir, nowMs));
+  if (fresh) return fresh;
+  const until = await backoffUntil(member, cacheDir);
+  if (until > nowMs) {
+    const last = usageFromLastGood(await loadLastGood(member, cacheDir));
+    // extraUsage is left out: fetchMemberUsage re-adds it with its 6h age rule.
+    const { status: _live, error: _e, capturedAt: _c, extraUsage: _x, ...data } = last ?? { status: "live" as const, capturedAt };
+    return { ...data, status: "rate-limited", error: "usage endpoint answered HTTP 429", retryAfterSeconds: Math.ceil((until - nowMs) / 1000), capturedAt };
+  }
   const { token, error } = await usableAccessToken(member, deps);
   if (!token) return { status: "unavailable", error: error ?? "no token", capturedAt };
   let response: Response;
@@ -193,6 +272,7 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
   }
   if (response.status === 429) {
     const retry = num(response.headers.get("retry-after"));
+    await recordBackoff(member, cacheDir, nowMs, retry);
     return { status: "rate-limited", error: "usage endpoint answered HTTP 429", ...(retry !== undefined ? { retryAfterSeconds: retry } : {}), capturedAt };
   }
   if (!response.ok) return { status: "unavailable", error: `usage endpoint answered HTTP ${response.status}`, capturedAt };
@@ -203,6 +283,7 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
     return { status: "unavailable", error: "usage endpoint returned non-JSON", capturedAt };
   }
   const usage = parseUsageBody(body, capturedAt);
+  await clearBackoff(member, cacheDir);
   if (usage.status === "live") {
     // Keep ais limits' extra fields (overage, manual reset); replace what this read knows.
     const { extraUsage: _old, ...prev } = (await loadLastGood(member, cacheDir)) ?? { toolName: "claude" as const };

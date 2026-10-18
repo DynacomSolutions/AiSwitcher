@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
-import { fetchUsageBodyWithResets, manualResetFromCedarEmber, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
+import { freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
@@ -214,6 +214,10 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
   // refresh through to both stores; the reconcile is the same law for the
   // stores AIS can only rewrite wholesale.
   await (deps.reconcile ?? reconcileOnceForFetch)("claude", identity);
+
+  // Shared across processes: a read younger than the TTL (by any caller) answers without touching the endpoint.
+  const fresh = await freshLastGood(identity, cacheDir, Date.now());
+  if (fresh) return fresh;
 
   // Fast path: one HTTP call. Any failure falls through to the spawn path below.
   const { body, status } = await (deps.fetchBody ?? fetchUsageBodyWithResets)(identity);

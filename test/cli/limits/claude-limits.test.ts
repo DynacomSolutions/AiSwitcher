@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fetchClaudeLimits, overageFromUsageBody, overageFromUsageText, windowsFromUsageBody } from "../../../src/cli/limits/claude-limits.ts";
@@ -109,10 +109,18 @@ describe("fetchClaudeLimits rate limiting", () => {
     const dir = cacheDir();
     const live = await fetchClaudeLimits(id, { ...common, cacheDir: dir, fetchBody: ok });
     expect(live.status).toBe("live");
+    // Within the fresh-read TTL a second call reuses the read and never fetches.
+    let calls = 0;
+    const reused = await fetchClaudeLimits(id, { ...common, cacheDir: dir, fetchBody: async () => (calls++, limited()) });
+    expect(reused.status).toBe("live");
+    expect(calls).toBe(0);
+    // Age the stored read past the TTL.
+    const file = join(dir, "claude-limits", "acct.json");
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), capturedAt: new Date(Date.now() - 120_000).toISOString() }));
     const stale = await fetchClaudeLimits(id, { ...common, cacheDir: dir, fetchBody: limited });
     expect(stale.status).toBe("cached");
     expect(stale.windows[0]?.usedPercent).toBe(42);
-    expect(stale.capturedAt).toBe(live.capturedAt);
+    expect(stale.capturedAt).not.toBe(live.capturedAt);
   });
 
   test("extra_usage in the body yields extraUsage through fetchClaudeLimits", async () => {
