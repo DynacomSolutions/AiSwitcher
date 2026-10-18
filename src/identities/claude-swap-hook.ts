@@ -12,8 +12,9 @@ import { join } from "node:path";
 
 const MARK = "ais claude-swap next --if-limited";
 
-export function hookCommand(pool: string): string {
-  return `${MARK} --assume-limited --reason=auto --pool=${pool}`;
+/** No pool name: Claude Code runs the hook with the session's CLAUDE_CONFIG_DIR, which `next --config-dir` maps back to the pool, so renames cannot break it. */
+export function hookCommand(): string {
+  return `${MARK} --assume-limited --reason=auto --config-dir="$CLAUDE_CONFIG_DIR"`;
 }
 
 type HookGroup = { matcher?: string; hooks?: Array<{ type?: string; command?: string }> };
@@ -41,11 +42,11 @@ async function writeSettings(configDir: string, settings: Record<string, unknown
 }
 
 /** Adds (or replaces) the StopFailure hook; every other setting and hook is preserved. */
-export async function installSwapHook(configDir: string, pool: string): Promise<void> {
+export async function installSwapHook(configDir: string): Promise<void> {
   const settings = await readSettings(configDir);
   const hooks = (typeof settings.hooks === "object" && settings.hooks !== null ? settings.hooks : {}) as Record<string, unknown>;
   const groups = ((hooks.StopFailure as HookGroup[] | undefined) ?? []).filter((g) => !isOurs(g));
-  groups.push({ matcher: "rate_limit", hooks: [{ type: "command", command: hookCommand(pool) }] });
+  groups.push({ matcher: "rate_limit", hooks: [{ type: "command", command: hookCommand() }] });
   await writeSettings(configDir, { ...settings, hooks: { ...hooks, StopFailure: groups } });
 }
 

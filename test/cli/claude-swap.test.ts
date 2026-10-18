@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { hookCommand } from "../../src/identities/claude-swap-hook.ts";
 import { runClaudeSwapCommand } from "../../src/cli/claude-swap/dispatch.ts";
 import { loadIdentitiesFile } from "../../src/identities/store.ts";
 import { mergeIdentity } from "../../src/sync/registry.ts";
@@ -58,6 +59,9 @@ test("pool create refuses unknown accounts and a reused configDir", async () => 
   await expect(runClaudeSwapCommand(["pool", "create", "p"], { accounts: "a,b", "config-dir": join(root, "a") }, deps())).rejects.toThrow(/already used/);
 });
 
+// The assumed failure time is "now"; push it past the pool-create ledger event (same millisecond otherwise).
+const afterLedger = () => Date.now() + 1_000;
+
 test("recovery flags resolve by config directory and reject a stale expected active member", async () => {
   await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
   out = [];
@@ -67,7 +71,7 @@ test("recovery flags resolve by config directory and reject a stale expected act
     "assume-limited": true,
     "expected-active": "b",
     json: true,
-  }, deps());
+  }, { ...deps(), now: afterLedger });
   expect(JSON.parse(out.join("\n"))).toMatchObject({ action: "skipped", why: 'pool changed to "a" before limit recovery' });
 
   out = [];
@@ -79,6 +83,7 @@ test("recovery flags resolve by config directory and reject a stale expected act
     json: true,
   }, {
     ...deps(),
+    now: afterLedger,
     fetchUsage: async (member) => {
       const utilization = member.name === "a" ? 100 : 12;
       return { status: "live" as const, fiveHour: { utilization }, sevenDay: { utilization }, maxUtilization: utilization, capturedAt: "SYNTHETIC_FIXTURE" };
@@ -147,10 +152,37 @@ test("hook on/off edits only its own StopFailure entry", async () => {
   await runClaudeSwapCommand(["hook", "on"], {}, deps());
   let s = JSON.parse(await readFile(settingsPath, "utf8"));
   expect(s.hooks.StopFailure).toHaveLength(2);
-  expect(s.hooks.StopFailure[1].hooks[0].command).toContain("next --if-limited --assume-limited --reason=auto --pool=shared");
+  expect(s.hooks.StopFailure[1].hooks[0].command).toBe(hookCommand());
+  expect(s.hooks.StopFailure[1].hooks[0].command).not.toContain("--pool");
   expect(s.hooks.StopFailure[1].hooks[0].command).not.toContain("--expected-active");
   await runClaudeSwapCommand(["hook", "off"], {}, deps());
   s = JSON.parse(await readFile(settingsPath, "utf8"));
   expect(s.hooks.StopFailure).toHaveLength(1);
   expect(s.hooks.StopFailure[0].hooks[0].command).toBe("echo hi");
+});
+
+test("hookCommand carries no pool name and hook on migrates an old --pool= hook in place", async () => {
+  expect(hookCommand()).toBe('ais claude-swap next --if-limited --assume-limited --reason=auto --config-dir="$CLAUDE_CONFIG_DIR"');
+  await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
+  const settingsPath = join(root, "shared", "settings.json");
+  const old = "ais claude-swap next --if-limited --assume-limited --reason=auto --pool=shared";
+  await writeFile(settingsPath, JSON.stringify({ hooks: { StopFailure: [{ matcher: "rate_limit", hooks: [{ type: "command", command: old }] }] } }));
+  await runClaudeSwapCommand(["hook", "on"], { pool: "shared" }, deps());
+  const s = JSON.parse(await readFile(settingsPath, "utf8"));
+  expect(s.hooks.StopFailure).toHaveLength(1);
+  expect(s.hooks.StopFailure[0].hooks[0].command).toBe(hookCommand());
+});
+
+test("next/status --config-dir picks the matching pool among several, tolerating a trailing slash", async () => {
+  await runClaudeSwapCommand(["pool", "create", "one"], { accounts: "a,b", "config-dir": join(root, "one") }, deps());
+  await runClaudeSwapCommand(["pool", "create", "two"], { accounts: "a,b", "config-dir": join(root, "two") }, deps());
+  await runClaudeSwapCommand(["to", "b"], { pool: "two" }, deps());
+  out = [];
+  await runClaudeSwapCommand(["status"], { "config-dir": `${join(root, "two")}/`, json: true }, deps());
+  expect(JSON.parse(out.join("\n")).active).toBe("b");
+  out = [];
+  await runClaudeSwapCommand(["status"], { "config-dir": join(root, "one"), json: true }, deps());
+  expect(JSON.parse(out.join("\n")).active).toBe("a");
+  await expect(runClaudeSwapCommand(["status"], { "config-dir": join(root, "none") }, deps())).rejects.toThrow(/No unique/);
+  await expect(runClaudeSwapCommand(["next"], { "config-dir": "" }, deps())).rejects.toThrow(/--config-dir is empty/);
 });
