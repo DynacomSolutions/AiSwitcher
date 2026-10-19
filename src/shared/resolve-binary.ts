@@ -31,6 +31,11 @@ const LEGACY_MANAGED_REAL_BIN_DIR = process.env.AI_PROFILE_SWITCHER_REAL_BIN_DIR
   ? undefined
   : join(homedir(), ".local", "share", "ais", "npm", "bin");
 
+/** Path of this project's shim for `name` (the file `ais update` installs). */
+export function shimPath(name: string): string {
+  return join(SHIM_DIR, name);
+}
+
 /** Env var a wrapper sets on the real binary it spawns, holding that binary's
  * realpath. A shim started with this equal to its OWN realpath was exec'd as
  * "the real binary" by another shim instance, i.e. it is recursing. */

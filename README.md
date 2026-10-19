@@ -96,6 +96,17 @@ configuration, and Crush's global context paths for both `zai` and `ali`.
 Those integrations are disposable views. The AIS file remains the only
 writable authority.
 
+### Launching and local models
+
+```bash
+ais launch            # pick a tool, then an identity or pool; runs through the shim
+ais local list        # list the on-device llama.cpp model and runner
+ais local start [name]
+```
+
+`ais launch` needs a terminal. It warns when the network is down and offers a
+local model (first in the list) when one is installed with a runner.
+
 ### Memory served from a git-base base checkout
 
 If `~/.ais/memory` resolves into a `git-base` base checkout (a git toplevel
