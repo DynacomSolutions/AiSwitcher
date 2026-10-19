@@ -282,8 +282,21 @@ PY
   mark all complete
 }
 
+# Stub for review item 8 (not yet run in QEMU): confirm the stricter sandbox
+# (ProtectSystem=strict, ProtectKernelTunables, NoExecPaths=/) still lets
+# approved lvm, dmsetup and mdadm calls reach /dev/mapper/control, the /run
+# locks and sysfs. Failure here means the guard fails closed, not open.
+sandbox_probe() {
+  preflight || return
+  mark sandbox-probe stub
+  # TODO(coordinator): run_as_agent lvm pvcreate /dev/vdc, approve the popup,
+  # then repeat for dmsetup ls and mdadm --examine, asserting each exit code.
+  return 0
+}
+
 case "${1:-}" in
   --preflight-only) preflight ;;
+  --sandbox-probe) sandbox_probe ;;
   --run) run_scenarios ;;
   *) printf 'usage: %s --preflight-only|--run\n' "$SELF" >&2; exit 2 ;;
 esac
