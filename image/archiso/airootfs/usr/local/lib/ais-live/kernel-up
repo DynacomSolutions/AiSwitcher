@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Test-only serial handshake. The service condition also gates invocation.
+set -euo pipefail
+cmdline=" $(cat /proc/cmdline) "
+[[ $cmdline == *' ais.test=1 '* ]] || exit 0
+# Keep markers free of journal prefixes on the test console.
+exec >/dev/ttyS0 2>&1
+printf '\nAIS-LIVE: stage=kernel-up status=ok\n'
+if [[ $cmdline == *' ais.smoke=1 '* ]]; then
+    # Other scenario drivers omit ais.smoke=1 and continue into normal boot.
+    # Use the serial device directly while the getty is ordered behind us.
+    stty -F /dev/ttyS0 115200 sane -echo
+    printf 'AIS-LIVE: stage=smoke-ready status=ok\n'
+    IFS= read -r -t 90 reply </dev/ttyS0
+    [[ $reply == AIS-TEST-POWEROFF ]] || exit 1
+    printf 'AIS-LIVE: stage=poweroff status=ok\n'
+    if [[ $cmdline == *' ais.reboot=1 '* ]]; then
+        # Negative QMP scenario: prove a reboot after the acknowledgement is
+        # not accepted as a clean guest poweroff.
+        systemctl --no-block reboot
+        exit 0
+    fi
+    systemctl --no-block poweroff
+fi

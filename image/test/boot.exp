@@ -1,0 +1,55 @@
+#!/usr/bin/expect -f
+# A marker alone is insufficient: require a shutdown acknowledgement, EOF and
+# QEMU exit status zero. An early EOF, failure marker or timeout fails closed.
+if {$argc < 2 || ![string is integer -strict [lindex $argv 0]] || [lindex $argv 0] < 1} {
+    puts stderr {usage: boot.exp <timeout-seconds> <qemu> [arguments]}
+    exit 2
+}
+set timeout [lindex $argv 0]
+set command [lrange $argv 1 end]
+log_user 1
+spawn -noecho {*}$command
+set child [exp_pid]
+
+proc fail {reason} {
+    global child spawn_id
+    puts stderr "boot-test: $reason"
+    # Only the direct process spawned by this driver is signalled.
+    catch {exec kill -KILL -- $child}
+    catch {close}
+    catch {wait}
+    exit 1
+}
+proc stage {name} {
+    global spawn_id timeout
+    set pattern "(^|\[\r\n\])AIS-LIVE: stage=$name status=ok\r*\n"
+    expect {
+        -re {(^|[\r\n])AIS-LIVE: [^\r\n]*status=fail} { fail {guest reported failure} }
+        -re {Kernel panic|You are now being dropped into an emergency shell} { fail {guest failed to boot} }
+        -re $pattern { return }
+        timeout { fail "timeout waiting for $name" }
+        eof { fail "unexpected EOF waiting for $name" }
+    }
+}
+# Keep these guards installed for every stage and the final EOF wait. This also
+# catches failure output already buffered after the last success marker.
+expect_before -i $spawn_id \
+    -re {(^|[\r\n])AIS-LIVE: [^\r\n]*status=fail} { fail {guest reported failure} } \
+    -re {Kernel panic|You are now being dropped into an emergency shell} { fail {guest failed to boot} }
+stage kernel-up
+stage smoke-ready
+send -- "AIS-TEST-POWEROFF\r"
+stage poweroff
+set timeout 120
+expect {
+    -re {(^|[\r\n])AIS-LIVE: [^\r\n]*status=fail} { fail {guest reported failure after shutdown acknowledgement} }
+    -re {Kernel panic|You are now being dropped into an emergency shell} { fail {guest failed after shutdown acknowledgement} }
+    eof {}
+    timeout { fail {guest did not power off} }
+}
+set result [wait]
+if {[llength $result] != 4 || [lindex $result 2] != 0 || [lindex $result 3] != 0} {
+    puts stderr "boot-test: QEMU failed: $result"
+    exit 1
+}
+puts {boot-test: kernel-up and clean poweroff verified}

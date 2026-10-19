@@ -50,6 +50,8 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "getambassador.io", reason: "Emissary-ingress Mapping API group used in apiVersion fields (k8s/*.yaml)" },
   { domain: "w3.org", reason: "SVG namespace URI required by the SVG spec, not a network endpoint (apps/web/index.html)" },
   { domain: "bigmodel.cn", reason: "Zhipu/Z.ai China-region API endpoint, alongside the global z.ai endpoint (AGENTS.md)" },
+  { domain: "archlinux.org", reason: "Arch Linux Archive and mirrors pinned by the live image build recipe (image/pins.env, image/build/bootstrap.sh)" },
+  { domain: "apache.org", reason: "licence-only: the standard licence URL inside the unmodified herdr licence text shipped in the live image (image/archiso/airootfs/usr/share/licenses/herdr/LICENSE); never used as an endpoint" },
   { domain: "command.run", reason: "engine event name in mods/ais-usage, not a host" },
   { domain: "process.run", reason: "engine event name in mods/ais-usage, not a host" },
 ];
