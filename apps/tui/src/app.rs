@@ -1,7 +1,6 @@
 //! Central application state, the async event loop and per-endpoint fetchers.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -426,16 +425,63 @@ fn notify_endpoints(notifies: &[Arc<Notify>], endpoints: &[Endpoint]) {
 
 const READER_POLL: Duration = Duration::from_millis(100);
 
+/// Pause handshake between the main loop and the blocking reader thread:
+/// `pause` returns only once the reader has parked, so nothing reads the
+/// terminal while a child owns it.
+#[derive(Default)]
+struct ReaderGate {
+    state: std::sync::Mutex<(bool, bool)>, // (pause requested, parked)
+    cv: std::sync::Condvar,
+}
+
+impl ReaderGate {
+    /// Reader side: park while a pause is requested, acknowledging it.
+    fn checkpoint(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.0 {
+            st.1 = true;
+            self.cv.notify_all();
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.1 = false;
+    }
+
+    /// Main side: blocks until the reader has acknowledged the pause.
+    fn pause(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.0 = true;
+        while !st.1 {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn resume(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = false;
+        self.cv.notify_all();
+    }
+}
+
 /// Runs `ais local start <name>` with inherited stdio and waits for it.
-/// Blocking is intended: the child owns the terminal. Failures are reported on stderr; the dashboard returns either way.
-fn run_local_start(name: &str) {
-    let status = std::process::Command::new("ais")
+/// Blocking is intended: the child owns the terminal. Returns an error
+/// message when it could not start or exited non-zero.
+fn run_local_start(name: &str) -> Option<String> {
+    match std::process::Command::new("ais")
         .args(["local", "start", name])
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("ais local start exited with {status}"),
-        Err(err) => eprintln!("could not run ais: {err}"),
+        .status()
+    {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(format!("ais local start exited with {status}")),
+        Err(err) => Some(format!("could not run ais: {err}")),
+    }
+}
+
+/// Drops keystrokes typed during the hand-off so they are not replayed.
+fn drain_input(event_rx: &mut mpsc::UnboundedReceiver<Event>) {
+    while event_rx.try_recv().is_ok() {}
+    while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+        if crossterm::event::read().is_err() {
+            break;
+        }
     }
 }
 
@@ -459,14 +505,11 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
     // It polls so it can pause while a child owns the terminal (`ais local
     // start`) instead of stealing the child's keystrokes.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
-    let paused = Arc::new(AtomicBool::new(false));
-    let reader_paused = Arc::clone(&paused);
+    let gate = Arc::new(ReaderGate::default());
+    let reader_gate = Arc::clone(&gate);
     std::thread::spawn(move || {
         loop {
-            if reader_paused.load(Ordering::SeqCst) {
-                std::thread::sleep(READER_POLL);
-                continue;
-            }
+            reader_gate.checkpoint();
             match crossterm::event::poll(READER_POLL) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(event) => {
@@ -501,13 +544,26 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
             break;
         }
         if let Some(name) = app.pending_start.take() {
-            paused.store(true, Ordering::SeqCst);
-            // Let an in-flight poll finish so it cannot swallow child input.
-            tokio::time::sleep(READER_POLL * 2).await;
+            // Catch SIGINT here so Ctrl+C (cooked mode, same process group)
+            // reaches only the child; its handler resets to default on exec.
+            let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("failed to install SIGINT handler")?;
+            let pause_gate = Arc::clone(&gate);
+            tokio::task::spawn_blocking(move || pause_gate.pause())
+                .await
+                .context("reader pause failed")?;
             ratatui::restore();
-            run_local_start(&name);
+            let failure = run_local_start(&name);
+            if let Some(message) = failure {
+                eprintln!("{message}");
+                eprintln!("Press Enter to return to the dashboard.");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+            }
+            drop(sigint);
             terminal = ratatui::init();
-            paused.store(false, Ordering::SeqCst);
+            gate.resume();
+            drain_input(&mut event_rx);
             terminal.clear().context("failed to repaint")?;
         }
         terminal
@@ -577,6 +633,31 @@ mod tests {
             press(&mut app, KeyCode::Char(digit));
             assert_eq!(app.tab, expected, "digit {digit} jumps to tab");
         }
+    }
+
+    #[test]
+    fn reader_gate_pause_waits_for_park_acknowledgement() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let gate = Arc::new(ReaderGate::default());
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (g, t, st) = (Arc::clone(&gate), Arc::clone(&ticks), Arc::clone(&stop));
+        let reader = std::thread::spawn(move || {
+            while !st.load(Ordering::SeqCst) {
+                g.checkpoint();
+                t.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        gate.pause(); // returns only after the reader acknowledged
+        let frozen = ticks.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(ticks.load(Ordering::SeqCst), frozen, "reader is parked");
+        gate.resume();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(ticks.load(Ordering::SeqCst) > frozen, "reader resumed");
+        stop.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
     }
 
     #[test]
