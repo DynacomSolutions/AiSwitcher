@@ -1,0 +1,17 @@
+[Unit]
+Description=Live image serial boot test
+ConditionKernelCommandLine=ais.test=1
+After=local-fs.target
+Wants=getty-pre.target
+Before=getty-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/lib/ais-live/kernel-up
+TimeoutStartSec=120
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
