@@ -210,6 +210,11 @@ def unsafe_options(name, args):
     if name in {'fdisk', 'gdisk', 'gdisk64', 'cgdisk', 'cgdisk64', 'parted', 'sfdisk'}:
         if any(x == '!' or x in {'--command', '-c'} or x.startswith('--command=') for x in a):
             return True
+    # Options that make a root tool execute a program or load attacker-chosen configuration.
+    if any(x.split('=', 1)[0] in {'--config', '--configdir', '--program', '--alert'} for x in a):
+        return True
+    if name == 'mdadm' and any(x.startswith('-c') for x in a if not x.startswith('--')):
+        return True
     if name == 'dmsetup' and any(x == '--exec' or x.startswith('--exec=') for x in a):
         return True
     if name == 'cryptsetup':
