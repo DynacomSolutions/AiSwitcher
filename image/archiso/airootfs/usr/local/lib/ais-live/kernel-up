@@ -14,5 +14,11 @@ if [[ $cmdline == *' ais.smoke=1 '* ]]; then
     IFS= read -r -t 90 reply </dev/ttyS0
     [[ $reply == AIS-TEST-POWEROFF ]] || exit 1
     printf 'AIS-LIVE: stage=poweroff status=ok\n'
+    if [[ $cmdline == *' ais.reboot=1 '* ]]; then
+        # Negative QMP scenario: prove a reboot after the acknowledgement is
+        # not accepted as a clean guest poweroff.
+        systemctl --no-block reboot
+        exit 0
+    fi
     systemctl --no-block poweroff
 fi

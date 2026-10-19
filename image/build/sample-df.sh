@@ -9,7 +9,13 @@ if [ "${1:-}" = "--once" ]; then once=1; shift; fi
 file=${1:?usage: sample-df.sh [--once] <file> [seconds]}
 every=${2:-5}
 while true; do
-  printf '%s %s\n' "$(date +%s)" "$(df -k --output=used,avail / | tail -n 1)" >>"$file"
+  timestamp=$(date +%s)
+  sample=$(df -k --output=used,avail / | tail -n 1)
+  if [[ ! "$timestamp" =~ ^[0-9]+$ || ! "$sample" =~ ^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*$ ]]; then
+    printf 'sample-df: invalid df sample\n' >&2
+    exit 1
+  fi
+  printf '%s %s\n' "$timestamp" "$sample" >>"$file"
   [ "$once" = 1 ] && exit 0
   sleep "$every"
 done
