@@ -77,6 +77,11 @@ let beforeJsonlAppend: JsonlBeforeAppendHook | undefined;
 let beforeJsonlCreate: JsonlBeforeAppendHook | undefined;
 let afterJsonlCreate: ((destination: string) => void) | undefined;
 let beforeJsonlWrite: ((destination: string) => void) | undefined;
+type JsonlWriter = (fd: number, payload: Buffer) => number;
+const nativeJsonlWriter: JsonlWriter = (fd, payload) => writeSync(fd, payload, 0, payload.length);
+let jsonlWriter = nativeJsonlWriter;
+/** Test hook: interleave native writes after the final size or snapshot check. */
+export function setJsonlWriter(writer?: JsonlWriter): void { jsonlWriter = writer ?? nativeJsonlWriter; }
 /** Test hook for deterministic native-writer races. */
 export function setJsonlBeforeAppendHook(hook?: JsonlBeforeAppendHook): void {
   beforeJsonlAppend = hook;
@@ -354,13 +359,17 @@ export async function mergeJsonlFiles(
         const target = openSync(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_APPEND, 0o600);
         try {
           afterJsonlCreate?.(destination);
-          if (fstatSync(target).size !== 0) return "deferred";
+          const preSize = fstatSync(target).size;
+          if (preSize !== 0) return "deferred";
           const payload = Buffer.from(output);
-          if (writeSync(target, payload, 0, payload.length) !== payload.length) return "deferred";
+          // shortcut: a native partial write can follow the size check, upgrade
+          // when vendors expose a write lock or ais owns the writers.
+          const written = jsonlWriter(target, payload);
+          if (written !== payload.length) return "deferred";
           fsyncSync(target);
           const createdSnapshot = fstatSync(target);
           const pathSnapshot = statSync(destination);
-          if (!sameFileSnapshot(createdSnapshot, pathSnapshot)) return "deferred";
+          if (createdSnapshot.size !== preSize + written || !sameFileSnapshot(createdSnapshot, pathSnapshot)) return "deferred";
         }
         finally { closeSync(target); }
       } catch (error) {
@@ -413,13 +422,13 @@ export async function mergeJsonlFiles(
     if ((await hasOpenOwnerBeforeWrite(destination, fd)) !== false) return "deferred";
     // The ownership lookup can yield; reject changes made while it ran.
     if (!sameFileSnapshot(before, fstatSync(fd)) || !sameFileSnapshot(before, statSync(destination))) return "deferred";
-    // shortcut: a writer can still open in the final sub-millisecond check/write
-    // window; upgrade to native-writer coordination when atomic records across
-    // processes are required. O_APPEND protects the existing prefix only.
-    const written = writeSync(fd, payload, 0, payload.length);
+    // shortcut: a native partial write can follow the final snapshot, upgrade
+    // when vendors expose a write lock or ais owns the writers.
+    const written = jsonlWriter(fd, payload);
     if (written !== payload.length) return "deferred";
     fsyncSync(fd);
-    if (!sameFileSnapshot(fstatSync(fd), statSync(destination))) return "deferred";
+    const afterWrite = fstatSync(fd);
+    if (afterWrite.size !== before.size + written || !sameFileSnapshot(afterWrite, statSync(destination))) return "deferred";
   } catch {
     return "deferred";
   } finally { closeSync(fd); }

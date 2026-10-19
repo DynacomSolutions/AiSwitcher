@@ -1,4 +1,5 @@
-import { copyFile, mkdir, readdir, readlink, realpath, rename, stat, utimes } from "node:fs/promises";
+import { copyFile, mkdir, open, readdir, readFile, readlink, realpath, rename, stat, utimes } from "node:fs/promises";
+import { dlopen, FFIType } from "bun:ffi";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -36,6 +37,44 @@ export interface TreeMergeResult {
 
 export interface ArchiveRecoveryResult extends TreeMergeResult {
   archiveRoots: number;
+}
+
+interface ProfileMergeLock { readonly home: string }
+const heldMergeLocks = new WeakSet<ProfileMergeLock>();
+
+/** Serialise all receivers of one destination tree, including staging deletion.
+ * Keep the lock file: unlinking it would let waiters lock different inodes. */
+export async function withProfileMergeLock<T>(home: string, action: (lock: ProfileMergeLock) => Promise<T>): Promise<T> {
+  const canonicalHome = await realpath(home);
+  const state = aisRemoteCacheDir(canonicalHome);
+  await mkdir(state, { recursive: true });
+  const symbols = { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } } as const;
+  const libraries = process.platform === "darwin"
+    ? ["/usr/lib/libSystem.B.dylib"]
+    : [["libc", "so", "6"].join("."), ["libc", "so"].join(".")];
+  const load = () => {
+    try { return dlopen(libraries[0]!, symbols); }
+    catch (error) { if (!libraries[1]) throw error; return dlopen(libraries[1], symbols); }
+  };
+  const native = load();
+  try {
+    const handle = await open(join(state, "profile-merge.lock"), "a", 0o600);
+    const lock = { home: canonicalHome };
+    try {
+      const deadline = Date.now() + 30_000;
+      // LOCK_EX | LOCK_NB avoids blocking the event loop while another merge
+      // in this process (or a separate receiver) is flushing its archives.
+      while (native.symbols.flock(handle.fd, 2 | 4) !== 0) {
+        if (Date.now() >= deadline) throw new Error("Timed out acquiring the profile merge lock");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      heldMergeLocks.add(lock);
+      return await action(lock);
+    } finally {
+      heldMergeLocks.delete(lock);
+      await handle.close(); // Closing releases flock even if the merge failed.
+    }
+  } finally { native.close(); }
 }
 
 function slash(path: string): string {
@@ -92,7 +131,9 @@ const LSOF_TIMEOUT_MS = 5000;
 // pass a single snapshot of all open files wins (a lookup can cost ~1.4s on a busy host,
 // so 32 per-file lsof runs blew a 30s budget).
 const PER_FILE_LOOKUPS = 4;
-export type OpenPathsScanner = (signal: AbortSignal) => Promise<Set<string> | undefined>;
+interface OpenPathSnapshot { paths: Set<string>; inaccessibleUids: Set<number> }
+type OpenPaths = Set<string> | OpenPathSnapshot;
+export type OpenPathsScanner = (signal: AbortSignal) => Promise<OpenPaths | undefined>;
 let openScanner: OpenPathsScanner = scanOpenPaths;
 let openScanTimeoutMs = LSOF_TIMEOUT_MS;
 /** Test hook: swap the snapshot scanner (no argument restores the real one). */
@@ -105,35 +146,73 @@ function lsofBinary(): string | undefined {
   return Bun.which("lsof") ?? (process.platform === "darwin" && existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : undefined);
 }
 
-async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promise<Set<string> | undefined> {
+interface ProcReader {
+  readdir(path: string): Promise<string[]>;
+  readlink(path: string): Promise<string>;
+  readFile(path: string): Promise<string>;
+}
+const nativeProcReader: ProcReader = { readdir, readlink, readFile: (path) => readFile(path, "utf8") };
+let procReader = nativeProcReader;
+/** Test hook: inject filesystem observations while retaining the real /proc scan. */
+export function setProcReader(reader?: ProcReader): void { procReader = reader ?? nativeProcReader; }
+
+async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promise<OpenPathSnapshot | undefined> {
+  const reader = procReader;
   let processDirs: string[];
   try {
-    processDirs = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
+    processDirs = (await reader.readdir("/proc")).filter((name) => /^\d+$/.test(name));
   } catch {
     return undefined;
   }
   const paths = new Set<string>();
+  const inaccessibleUids = new Set<number>();
   for (const pid of processDirs) {
     if (signal.aborted) return undefined;
     let fds: string[];
     try {
-      fds = await readdir(join("/proc", pid, "fd"));
+      fds = await reader.readdir(join("/proc", pid, "fd"));
     } catch (error) {
       if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+      if ((error as NodeJS.ErrnoException).code === "EACCES") {
+        try {
+          // The directory owner can appear as root for a nondumpable process.
+          // Read its actual real, effective, saved and filesystem UIDs instead.
+          const status = await reader.readFile(join("/proc", pid, "status"));
+          const uids = /^Uid:[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]*$/m.exec(status);
+          if (!uids) return undefined;
+          for (const uid of uids.slice(1)) inaccessibleUids.add(Number(uid));
+        }
+        catch (uidError) {
+          if (!["ENOENT", "ESRCH"].includes((uidError as NodeJS.ErrnoException).code ?? "")) return undefined;
+        }
+        continue;
+      }
       return undefined;
     }
     for (const fd of fds) {
       if (signal.aborted) return undefined;
       if (pid === String(process.pid) && fd === String(ownDescriptor)) continue;
       try {
-        paths.add((await readlink(join("/proc", pid, "fd", fd))).replace(/ \(deleted\)$/, ""));
+        paths.add((await reader.readlink(join("/proc", pid, "fd", fd))).replace(/ \(deleted\)$/, ""));
       } catch (error) {
         // Processes and descriptors can disappear while /proc is read.
         if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
       }
     }
   }
-  return paths;
+  return { paths, inaccessibleUids };
+}
+
+async function snapshotHasOwner(snapshot: OpenPaths | undefined, path: string): Promise<boolean | undefined> {
+  if (!snapshot) return undefined;
+  if (snapshot instanceof Set) return snapshot.has(path);
+  if (snapshot.paths.has(path)) return true;
+  if (snapshot.inaccessibleUids.has(0)) return undefined;
+  try {
+    // Other users' unreadable fd directories cannot starve this file. Retain
+    // the UIDs in a shared snapshot because each destination may have a different owner.
+    return snapshot.inaccessibleUids.has((await stat(path)).uid) ? undefined : false;
+  } catch { return undefined; }
 }
 
 async function lsofOpenPaths(signal: AbortSignal): Promise<Set<string> | undefined> {
@@ -152,11 +231,11 @@ async function lsofOpenPaths(signal: AbortSignal): Promise<Set<string> | undefin
 }
 
 // /proc is several times faster than lsof on a host with thousands of processes.
-async function scanOpenPaths(signal: AbortSignal): Promise<Set<string> | undefined> {
+async function scanOpenPaths(signal: AbortSignal): Promise<OpenPaths | undefined> {
   return process.platform === "linux" ? procOpenPaths(signal) : lsofOpenPaths(signal);
 }
 
-async function boundedOpenScan(scanner: OpenPathsScanner = openScanner): Promise<Set<string> | undefined> {
+async function boundedOpenScan(scanner: OpenPathsScanner = openScanner): Promise<OpenPaths | undefined> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -195,7 +274,7 @@ async function hasOpenOwnerDirect(path: string, ownDescriptor?: number): Promise
   }
   if (process.platform !== "linux") return undefined;
   const paths = await boundedOpenScan((signal) => procOpenPaths(signal, ownDescriptor));
-  return paths && paths.has(path);
+  return snapshotHasOwner(paths, path);
 }
 
 /** The final write guard must be fresh even when the pass used its snapshot.
@@ -208,7 +287,7 @@ export async function hasOpenOwnerBeforeWrite(path: string, ownDescriptor: numbe
 /** Per-merge-pass lookup state: the first lookups are per-file, later ones use one snapshot. */
 export interface OpenOwnerPass {
   lookups: number;
-  snapshot?: Promise<Set<string> | undefined>;
+  snapshot?: Promise<OpenPaths | undefined>;
 }
 
 export async function hasOpenOwner(path: string, pass: OpenOwnerPass = { lookups: PER_FILE_LOOKUPS }): Promise<boolean | undefined> {
@@ -223,7 +302,7 @@ export async function hasOpenOwner(path: string, pass: OpenOwnerPass = { lookups
   // A successful scan can distinguish closed files from busy ones; failure
   // remains unknown. Never carry a previous pass's misses into a new merge.
   pass.snapshot ??= boundedOpenScan();
-  return (await pass.snapshot)?.has(real);
+  return snapshotHasOwner(await pass.snapshot, real);
 }
 
 function configsForScope(scope: SyncScope): ToolConfig[] {
@@ -360,27 +439,54 @@ function subsumesJsonl(newer: string, older: string): boolean {
   return true;
 }
 
+async function syncArchiveDirectories(destination: string, home: string): Promise<void> {
+  // Flush the rename and any newly created archive directories before the
+  // receiver may delete staging. A failure leaves staging available to retry.
+  for (let directory = dirname(destination); ; directory = dirname(directory)) {
+    const handle = await open(directory, "r");
+    try { await handle.sync(); }
+    finally { await handle.close(); }
+    if (directory === home || dirname(directory) === directory) break;
+  }
+}
+
+async function writeDurableArchive(destination: string, bytes: Buffer, home: string): Promise<void> {
+  await mkdir(dirname(destination), { recursive: true });
+  const temporary = `${destination}.${crypto.randomUUID()}.tmp`;
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally { await handle.close(); }
+  await rename(temporary, destination);
+  await syncArchiveDirectories(destination, home);
+}
+
 async function preserveDeferredFile(source: string, home: string, rel: string): Promise<void> {
   const root = join(aisRemoteCacheDir(home), "merge-conflicts");
   const destination = join(root, "deferred", "incoming", rel);
   const incoming = Buffer.from(await Bun.file(source).arrayBuffer());
   if (await exists(destination)) {
     const previous = Buffer.from(await Bun.file(destination).arrayBuffer());
-    if (incoming.equals(previous)) return;
+    if (incoming.equals(previous)) {
+      // A previous attempt may have renamed successfully but failed to flush
+      // a directory. Reconfirm durability before allowing staging deletion.
+      const handle = await open(destination, "r");
+      try { await handle.sync(); }
+      finally { await handle.close(); }
+      await syncArchiveDirectories(destination, home);
+      return;
+    }
     // Latin-1 preserves each byte for comparison, including malformed UTF-8.
     if (!subsumesJsonl(incoming.toString("latin1"), previous.toString("latin1"))) {
       // Divergent records and incomplete tails remain recoverable. Identical
       // unresolved copies share a content hash rather than accumulating UUIDs.
       const hash = createHash("sha256").update(previous).digest("hex");
       const unresolved = join(root, "unresolved", hash, "incoming", rel);
-      await mkdir(dirname(unresolved), { recursive: true });
-      await Bun.write(unresolved, previous, { mode: 0o600 });
+      await writeDurableArchive(unresolved, previous, home);
     }
   }
-  await mkdir(dirname(destination), { recursive: true });
-  const temporary = `${destination}.${crypto.randomUUID()}.tmp`;
-  await Bun.write(temporary, incoming, { mode: 0o600 });
-  await rename(temporary, destination);
+  await writeDurableArchive(destination, incoming, home);
 }
 
 /**
@@ -393,9 +499,12 @@ async function preserveDeferredFile(source: string, home: string, rel: string): 
 export async function mergeIncomingProfileTree(
   incomingRoot: string,
   scope: SyncScope,
-  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge; ownerPass?: OpenOwnerPass } = {},
+  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge; ownerPass?: OpenOwnerPass; lock?: ProfileMergeLock } = {},
 ): Promise<TreeMergeResult> {
   const home = options.home ?? homedir();
+  if (!options.lock || !heldMergeLocks.has(options.lock) || options.lock.home !== await realpath(home)) {
+    return withProfileMergeLock(home, (lock) => mergeIncomingProfileTree(incomingRoot, scope, { ...options, lock }));
+  }
   const conflictRoot =
     options.conflictRoot ??
     join(aisRemoteCacheDir(home), "merge-conflicts", new Date().toISOString().replaceAll(":", "-"));

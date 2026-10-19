@@ -19,7 +19,7 @@ import { scheduleAutomaticSync } from "../../sync/auto-schedule.ts";
 import { lowerProcessPriority } from "../../sync/low-priority.ts";
 import { pruneStaging } from "../../sync/staging.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
-import { mergeIncomingProfileTree, recoverProfileArchives } from "../../sync/tree-merge.ts";
+import { mergeIncomingProfileTree, recoverProfileArchives, withProfileMergeLock } from "../../sync/tree-merge.ts";
 import type { SyncScope } from "../../sync/types.ts";
 import { removeSyntheticLegacyRegistryEntries } from "../../sync/registry.ts";
 import { SYNC_TOOL_CONFIGS } from "../../sync/rsync.ts";
@@ -179,10 +179,13 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       if (!scope) throw new CliUsageError("A profile snapshot requires both --tool and --identity, or neither.");
       const root = snapshotRoot("profile-incoming", host);
       await pruneStaging({ keep: host });
-      const merged = await mergeIncomingProfileTree(root, scope);
-      await makeProfileHookConfigsPortable(scope);
-      if (scope.kind === "all") await makeSharedHookScriptsPortable();
-      await rm(root, { recursive: true, force: true });
+      const merged = await withProfileMergeLock(homedir(), async (lock) => {
+        const result = await mergeIncomingProfileTree(root, scope, { lock });
+        await makeProfileHookConfigsPortable(scope);
+        if (scope.kind === "all") await makeSharedHookScriptsPortable();
+        await rm(root, { recursive: true, force: true });
+        return result;
+      });
       console.log(JSON.stringify(merged));
       return;
     }
