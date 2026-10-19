@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cachedOnline, isOnline, offlineWarning } from "../../src/shared/connectivity";
@@ -53,4 +53,13 @@ test("offlineWarning names the subject and points at the local model only when o
   expect(offlineWarning("claude", false)).toContain("claude");
   expect(offlineWarning("claude", false)).not.toContain("ais local");
   expect(offlineWarning("claude", true)).toContain("ais local start");
+});
+
+test("a cache entry from the future is a miss", async () => {
+  writeFileSync(cachePath, JSON.stringify({ at: 10_000, online: false }));
+  let calls = 0;
+  expect(await isOnline({ probe: async () => (calls++, true), now: () => 0, cachePath })).toBe(true);
+  expect(calls).toBe(1);
+  writeFileSync(cachePath, JSON.stringify({ at: 10_000, online: false }));
+  expect(cachedOnline({ now: () => 0, cachePath })).toBeUndefined();
 });

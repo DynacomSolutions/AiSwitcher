@@ -4,7 +4,7 @@ import { PromptCancelledError } from "../identities/errors.ts";
 import { promptForIdentity } from "../identities/prompt.ts";
 import { activeIdentities } from "../identities/retired.ts";
 import type { IdentitiesFile, Identity, ToolConfig } from "../identities/types.ts";
-import { isOnline, offlineWarning } from "../shared/connectivity.ts";
+import { isOnline, OFFLINE_WARNED_ENV, offlineWarning } from "../shared/connectivity.ts";
 import { execReal } from "../shared/exec.ts";
 import {
   discoverLocalModels,
@@ -62,7 +62,7 @@ export interface LaunchDeps {
   selectEntry: (entries: LaunchEntry[], message: string, initialValue?: string) => Promise<string>;
   promptIdentity: typeof promptForIdentity;
   shimExists: (path: string) => boolean;
-  exec: (path: string, args: string[]) => Promise<never>;
+  exec: (path: string, args: string[], extraEnv?: Record<string, string>) => Promise<never>;
   startLocal: (model: LocalModel, runner: string) => Promise<never>;
   isTty: () => boolean;
   log: (line: string) => void;
@@ -81,7 +81,7 @@ const defaultDeps: LaunchDeps = {
   },
   promptIdentity: promptForIdentity,
   shimExists: existsSync,
-  exec: (path, args) => execReal(path, args, {}),
+  exec: (path, args, extraEnv) => execReal(path, args, extraEnv ?? {}),
   startLocal: startLocalModel,
   isTty: () => process.stdin.isTTY === true,
   log: (line) => console.error(line),
@@ -136,7 +136,7 @@ export async function runLaunchCommand(
     const { identity } = await deps.promptIdentity(
       tool.file, tool.cfg, 60_000, undefined, undefined, `Launch ${tool.cfg.toolName}`,
     );
-    await deps.exec(shim, shimLaunchArgs(identity));
+    await deps.exec(shim, shimLaunchArgs(identity), online ? {} : { [OFFLINE_WARNED_ENV]: "1" });
   } catch (err) {
     if (err instanceof PromptCancelledError) process.exit(130);
     throw err;

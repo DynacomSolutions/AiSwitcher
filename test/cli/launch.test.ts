@@ -59,14 +59,14 @@ test("tool then identity then exec through the shim", async () => {
   const t = build();
   await runLaunchCommand([], {}, t.deps);
   expect(t.promptIdentity).toHaveBeenCalledWith(claudeFile, { toolName: "claude" }, 60_000, undefined, undefined, "Launch claude");
-  expect(t.exec).toHaveBeenCalledWith(shimPath("claude"), ["--identity=work"]);
+  expect(t.exec).toHaveBeenCalledWith(shimPath("claude"), ["--identity=work"], {});
 });
 
 test("a chosen pool is exec'd with --pool", async () => {
   const pool = { name: "p", swapPool: { accounts: ["a"] } } as Identity;
   const t = build({ promptIdentity: (async () => ({ identity: pool, created: false })) as never });
   await runLaunchCommand([], {}, t.deps);
-  expect(t.exec).toHaveBeenCalledWith(shimPath("claude"), ["--pool=p"]);
+  expect(t.exec).toHaveBeenCalledWith(shimPath("claude"), ["--pool=p"], {});
 });
 
 test("offline: warns, tags non-local entries, lists the local model first, still allows a tool", async () => {
@@ -75,7 +75,7 @@ test("offline: warns, tags non-local entries, lists the local model first, still
   expect(t.logged.join("\n")).toContain("No internet connection");
   expect(t.entries[0]![0]!.value).toBe("local");
   expect(t.entries[0]![1]!.label).toContain("(needs internet)");
-  expect(t.exec).toHaveBeenCalled();
+  expect(t.exec).toHaveBeenCalledWith(shimPath("claude"), ["--identity=work"], { AIS_LAUNCH_OFFLINE_WARNED: "1" });
 });
 
 test("online: no warning and no tag", async () => {

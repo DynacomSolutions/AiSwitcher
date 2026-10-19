@@ -20,7 +20,7 @@ import { adapterFor } from "../identities/pool/registry.ts";
 import { runLaunchGate } from "../spend/gate.ts";
 import type { HerdrChatTool } from "./herdr-chat-source.ts";
 import { promptFromCliArgs } from "./herdr-tab-title.ts";
-import { shimOfflineNotice } from "./connectivity.ts";
+import { OFFLINE_WARNED_ENV, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 
 export async function runWrapper(
@@ -94,9 +94,10 @@ export async function runWrapper(
     }
 
     // Cached connectivity only: one small sync file read, never a probe or prompt.
-    if (process.stderr.isTTY) {
+    // `ais launch` sets the marker when it already warned.
+    if (process.stderr.isTTY && !process.env[OFFLINE_WARNED_ENV]) {
       try {
-        const notice = shimOfflineNotice();
+        const notice = shimOfflineNotice({ subject: cfg.toolName });
         if (notice) console.error(notice);
       } catch {}
     }

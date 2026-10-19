@@ -13,6 +13,7 @@ export const ONLINE_TTL_MS = 60_000;
 export const OFFLINE_TTL_MS = 5_000;
 export const PROBE_TIMEOUT_MS = 2_500;
 export const DEFAULT_PROBE_URL = "https://github.com";
+export const OFFLINE_WARNED_ENV = "AIS_LAUNCH_OFFLINE_WARNED";
 export const CACHED_MAX_AGE_MS = 120_000;
 
 interface Entry { at: number; online: boolean }
@@ -41,7 +42,7 @@ export async function isOnline(deps: OnlineDeps = {}): Promise<boolean> {
   const now = deps.now ?? Date.now;
   const cachePath = deps.cachePath ?? defaultPath();
   const hit = readEntry(cachePath);
-  if (hit && now() - hit.at < (hit.online ? ONLINE_TTL_MS : OFFLINE_TTL_MS)) return hit.online;
+  if (hit && hit.at <= now() && now() - hit.at < (hit.online ? ONLINE_TTL_MS : OFFLINE_TTL_MS)) return hit.online;
   const url = (deps.env ?? process.env).AIS_ONLINE_PROBE_URL || DEFAULT_PROBE_URL;
   let online = false;
   try {
@@ -64,7 +65,8 @@ export function cachedOnline(
   maxAgeMs: number = CACHED_MAX_AGE_MS,
 ): boolean | undefined {
   const e = readEntry(deps.cachePath ?? defaultPath());
-  return e && (deps.now ?? Date.now)() - e.at <= maxAgeMs ? e.online : undefined;
+  const t = (deps.now ?? Date.now)();
+  return e && e.at <= t && t - e.at <= maxAgeMs ? e.online : undefined;
 }
 
 export function offlineWarning(subject: string, localModelAvailable: boolean): string {
@@ -75,9 +77,9 @@ export function offlineWarning(subject: string, localModelAvailable: boolean): s
 // Shim launches: cached result only. `localModelAvailable` stays false because
 // finding a model is async (discoverLocalModels) and the shim never waits.
 export function shimOfflineNotice(
-  deps: { cached?: () => boolean | undefined; localModelAvailable?: boolean } = {},
+  deps: { cached?: () => boolean | undefined; localModelAvailable?: boolean; subject?: string } = {},
 ): string | undefined {
   return (deps.cached ?? (() => cachedOnline()))() === false
-    ? offlineWarning("this tool", deps.localModelAvailable ?? false)
+    ? offlineWarning(deps.subject ?? "this tool", deps.localModelAvailable ?? false)
     : undefined;
 }

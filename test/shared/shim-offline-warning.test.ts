@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cachedOnline, shimOfflineNotice } from "../../src/shared/connectivity.ts";
+import { cachedOnline, OFFLINE_WARNED_ENV, shimOfflineNotice } from "../../src/shared/connectivity.ts";
 
 test("cached offline yields the warning text", () => {
   expect(shimOfflineNotice({ cached: () => false })).toContain("No internet connection");
@@ -33,4 +33,14 @@ test("a missing or corrupt cache file never throws", () => {
   const cachePath = join(mkdtempSync(join(tmpdir(), "ais-shim-")), "online.json");
   writeFileSync(cachePath, "{not json");
   expect(shimOfflineNotice({ cached: () => cachedOnline({ cachePath }) })).toBeUndefined();
+});
+
+test("the notice names the tool when given a subject", () => {
+  expect(shimOfflineNotice({ cached: () => false, subject: "claude" })).toContain("claude needs one");
+});
+
+test("run-wrapper skips the notice when the launcher already warned", () => {
+  expect(OFFLINE_WARNED_ENV).toBe("AIS_LAUNCH_OFFLINE_WARNED");
+  const src = readFileSync(join(import.meta.dir, "../../src/shared/run-wrapper.ts"), "utf8");
+  expect(src).toContain("!process.env[OFFLINE_WARNED_ENV]");
 });
