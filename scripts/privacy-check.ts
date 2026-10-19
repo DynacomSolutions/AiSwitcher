@@ -11,6 +11,7 @@ const EXAMPLE_HOMES = new Set([
   "fixture-user", "synthetic-user", "user-a", "user-b",
   "ais", // the container image's own account (Dockerfile, k8s/deployment.yaml), not a real machine account
   "me", "ci", "name", // used by this change's own docs/comments/fixtures as placeholders
+  "agent", "live", // the live image's own fixed accounts (image/archiso), not real machine accounts
 ]);
 // Keep aligned with src/identities/tool-configs.ts. Actual OS home, not a
 // vendor identity override or a repository-controlled configuration path.

@@ -39,6 +39,14 @@ export function isAllowedDomain(domain: string): boolean {
   return ALLOWED_DOMAINS.some(entry => lower === entry.domain || lower.endsWith(`.${entry.domain}`));
 }
 
+// `polkit.Result.NO`: a Capitalised member in the middle and an all-caps
+// final segment is a constant access chain. Real hostnames are not written
+// that way; all-lowercase or fully upper-case names are still flagged.
+export const isCodeIdentifierChain = (token: string): boolean => {
+  const labels = token.split(".");
+  return /^[A-Z]{2,}$/.test(labels.at(-1)!) && labels.slice(0, -1).some(label => /^[A-Z][a-z]/.test(label));
+};
+
 export function findDomains(text: string): string[] {
   const found: string[] = [];
   for (const match of text.matchAll(DOMAIN_RE)) {
@@ -48,6 +56,7 @@ export function findDomains(text: string): string[] {
     if (EXCLUDED_TLDS.has(tld)) continue;
     if (!REAL_TLDS.has(tld)) continue;
     if (isAllowedDomain(token)) continue;
+    if (isCodeIdentifierChain(token)) continue;
     found.push(token);
   }
   return found;
@@ -175,9 +184,13 @@ export function findIps(text: string): string[] {
 // ---- emails ------------------------------------------------------------------
 const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,24})\b/g;
 
+// systemd template units (getty on tty1, the serial-getty template) look
+// like a mailbox on a made-up host but are unit names.
+const SYSTEMD_UNIT_RE = /[\w:.-]+@[\w:.-]*\.(?:service|socket|target|timer|mount|path|slice|device)\b/g;
+
 export function findEmails(text: string): string[] {
   const found: string[] = [];
-  for (const match of text.matchAll(EMAIL_RE)) {
+  for (const match of text.replace(SYSTEMD_UNIT_RE, " ").matchAll(EMAIL_RE)) {
     if (isAllowedDomain(match[1]!)) continue;
     found.push(match[0]);
   }
@@ -195,6 +208,8 @@ const EXAMPLE_HOME_USERS = new Set([
   // Established synthetic single-letter/placeholder names already used
   // across this repo's own test fixtures (never a real local account).
   "t", "x", "alice", "bob", "tester", "local-user", "name", "projects",
+  // The live image's own fixed accounts (image/archiso), not real machine accounts.
+  "agent", "live",
 ]);
 const HOME_PATH_RE = /(?:\/(?:home|Users)\/|[A-Za-z]:[\\/]Users[\\/])([^\\/\s"'`<>:;,()[\]{}]+)/gi;
 

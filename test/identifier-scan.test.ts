@@ -117,6 +117,14 @@ describe("findIps", () => {
   });
 });
 
+describe("code identifier chains", () => {
+  test("a constant access chain is not a domain, real domains still are", () => {
+    expect(findDomains('expect(x).toContain("polkit.Result.NO")')).toEqual([]);
+    expect(findDomains("reach corp.internal-example.NO or console.internal-example.dev")).toEqual(["corp.internal-example.NO", "console.internal-example.dev"]);
+    expect(findDomains("INTERNAL-EXAMPLE.DEV")).toEqual(["INTERNAL-EXAMPLE.DEV"]);
+  });
+});
+
 describe("findEmails", () => {
   test("allows example/invalid addresses", () => {
     expect(findEmails("contact fixture@example.invalid or one@example.com")).toEqual([]);
@@ -124,6 +132,12 @@ describe("findEmails", () => {
 
   test("blocks a real-looking address", () => {
     expect(findEmails("contact ops@internal-example-corp.dev")).toEqual(["ops@internal-example-corp.dev"]);
+  });
+
+  test("ignores systemd template unit names but still blocks real addresses beside them", () => {
+    expect(findEmails("getty@tty1.service.d serial-getty@.service container@web.socket")).toEqual([]);
+    expect(findEmails("getty@tty1.service ops@internal-example-corp.dev")).toEqual(["ops@internal-example-corp.dev"]);
+    expect(findEmails("ops@service.dev")).toEqual(["ops@service.dev"]);
   });
 });
 
