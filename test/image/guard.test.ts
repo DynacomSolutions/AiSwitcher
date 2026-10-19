@@ -494,6 +494,23 @@ os.unlink(os.path.join(d,rid+'.json')); os.rmdir(d)
     execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
   });
 
+  test('client execs the real binary with the original argv when the daemon replies local', () => {
+    const script = String.raw`
+import importlib.machinery,importlib.util,json,os,socket,sys,tempfile,threading
+sys.path.insert(0,'image/lib'); l=importlib.machinery.SourceFileLoader('cl','image/lib/ais-guard'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+d=tempfile.mkdtemp(prefix='ais-client-SYNTHETIC_FIXTURE-'); path=os.path.join(d,'s.sock')
+srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); srv.bind(path); srv.listen(1)
+def serve():
+ c,_=srv.accept(); c.recvmsg(4096,64); c.sendall(b'{"approved":true,"reason":"local"}\n'); c.close()
+t=threading.Thread(target=serve); t.start()
+os.environ['AIS_GUARD_SOCKET']=path; calls=[]; m.os.execv=lambda *a:calls.append(a)
+sys.argv=['/usr/local/guard/bin/dd','if=./x','of=./y']; m.main(); t.join()
+assert calls==[('/usr/bin/dd',['dd','if=./x','of=./y'])],calls
+srv.close(); os.unlink(path); os.rmdir(d)
+`;
+    execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
+  });
+
   test('all listed commands have executable PATH wrapper links wired by image profile', () => {
     expect(readFileSync(join(root, 'ais-guard-table'), 'utf8')).toContain('dd destructive');
   });
