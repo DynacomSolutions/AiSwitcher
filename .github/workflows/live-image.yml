@@ -1,0 +1,134 @@
+name: Live image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: live-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Decides whether the image build is needed. Fails open: any doubt builds.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      affected: ${{ steps.filter.outputs.affected }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Select by the dependency graph
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "affected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA") \
+            || ! bun install --frozen-lockfile \
+            || ! bun run build; then
+            echo "affected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "affected=$(printf '%s\n' "$changed" | bun image/build/affected.ts dist/ais.meta.json)" >> "$GITHUB_OUTPUT"
+
+  # GitHub-hosted runner only: this repository is public, never self-hosted.
+  build:
+    needs: changes
+    if: needs.changes.outputs.affected == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test the image scripts
+        run: |
+          bun test test/image
+          shellcheck -x -P SCRIPTDIR image/build/*.sh image/archiso/profiledef.sh
+
+      - name: Free preinstalled toolchains
+        run: |
+          echo "df before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          echo "df after:"; df -h /
+
+      - name: Start disk sampler
+        run: |
+          nohup image/build/sample-df.sh "$RUNNER_TEMP/df-samples.txt" 5 >/dev/null 2>&1 &
+          echo $! > "$RUNNER_TEMP/sampler.pid"
+
+      - name: Build the ISO (bootstrap, archiso, mkarchiso)
+        run: |
+          start=$(date +%s)
+          sudo image/build/build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+          echo "build_seconds=$(( $(date +%s) - start ))" | tee "$RUNNER_TEMP/build-time.txt"
+
+      - name: Stop disk sampler
+        if: always()
+        run: kill "$(cat "$RUNNER_TEMP/sampler.pid")" || true
+
+      - name: Assert peak disk under 80% of free
+        run: image/build/assert-disk.sh "$RUNNER_TEMP/df-samples.txt"
+
+      - name: Assert BIOS and EFI El Torito records
+        run: |
+          xorriso -indev out/archiso.iso -report_el_torito as_mkisofs > "$RUNNER_TEMP/eltorito.txt"
+          cat "$RUNNER_TEMP/eltorito.txt"
+          image/build/assert-eltorito.sh "$RUNNER_TEMP/eltorito.txt"
+
+      - name: Record measurements
+        if: always()
+        run: |
+          {
+            echo "## Live image build measurements"
+            cat "$RUNNER_TEMP/build-time.txt" || true
+            grep -E '^BUILD-(STAGE|DF):' "$RUNNER_TEMP/build.log" || true
+            ls -l out || true
+            echo "first and last disk samples (epoch used_kib avail_kib):"
+            head -n 1 "$RUNNER_TEMP/df-samples.txt" || true
+            tail -n 1 "$RUNNER_TEMP/df-samples.txt" || true
+            awk 'NF==3 && $2>m {m=$2} END {print "max used_kib=" m}' "$RUNNER_TEMP/df-samples.txt" || true
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: archiso
+          path: |
+            out/archiso.iso
+            out/build-info.json
+          retention-days: 3
+
+  # Always reports, so a required check never hangs on skipped jobs.
+  gate:
+    needs: [changes, build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail when a needed job failed or was cancelled
+        run: |
+          [ "${{ needs.changes.result }}" = "success" ] || exit 1
+          case "${{ needs.build.result }}" in success|skipped) ;; *) exit 1 ;; esac
