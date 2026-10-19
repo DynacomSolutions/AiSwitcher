@@ -328,4 +328,43 @@ describe("runBackup integration", () => {
     await runBackup(["grok"], home2); // .grok missing in home2, so no commit
     expect(await Bun.file(join(home2, ".ais", "backups", ".grok", "old")).exists()).toBe(true);
   });
+
+  test("a tracked nested-repo file replaced by a directory (D/F conflict) still backs up", async () => {
+    const home = await makeHome();
+    const nested = join(home, ".codex", "memories");
+    await write(join(nested, "x"), "file\n");
+    await Bun.spawn(["git", "-C", nested, "init", "-q"]).exited;
+    const repoDir = await runBackup(["codex"], home);
+    await rm(join(nested, "x"));
+    await write(join(nested, "x", "y"), "deep\n");
+    await runBackup(["codex"], home);
+    expect(await gitLs(repoDir)).toContain(".codex/memories/x/y");
+    expect(await gitLs(repoDir)).not.toContain(".codex/memories/x");
+  });
+
+  test("a negated root .gitignore (* then !.codex/) does not block the backup", async () => {
+    const home = await makeHome();
+    await write(join(home, ".gitignore"), "*\n!.codex/\n!.codex/**\n");
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    const repoDir = await runBackup(["codex"], home);
+    expect(await gitShow(repoDir, ".codex/a.txt")).toBe("a\n");
+  });
+
+  test("partial root .gitignore rules skip files with a warning", async () => {
+    const home = await makeHome();
+    await write(join(home, ".gitignore"), ".codex/auth.json\n");
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    await write(join(home, ".codex", "auth.json"), "t\n");
+    const orig = console.error;
+    const msgs: string[] = [];
+    console.error = (...a: unknown[]) => void msgs.push(a.join(" "));
+    let repoDir: string;
+    try {
+      repoDir = await runBackup(["codex"], home);
+    } finally {
+      console.error = orig;
+    }
+    expect(await gitShow(repoDir, ".codex/auth.json")).toBeNull();
+    expect(msgs.some((m) => m.includes("1 file(s) skipped") && m.includes(".codex/auth.json"))).toBe(true);
+  });
 });

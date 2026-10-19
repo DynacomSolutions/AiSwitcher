@@ -176,6 +176,7 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 99
   repo inside a config dir is recorded as a gitlink (or skipped with an error
   if it has no commits) instead of its files being copied. The rsync
   details below are historical.
+  Rolling back to a binary older than this change needs `git --git-dir=~/.ais/backups/.git config core.bare false` first (the new code sets `core.bare=true`).
   The previous design (`runBackup()`) mirrors each backed-up directory into a
   single persistent working tree at `~/.ais/backups` via `rsync -a --delete
   --delete-excluded` (replacing tar's "always a fresh full copy" with "the

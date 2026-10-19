@@ -252,8 +252,11 @@ export async function runBackup(
   // control, e.g. `*` in ~/.gitignore, would make `git add` store nothing and
   // still look successful. That file cannot be disabled by config, so fail loudly.
   for (const name of mirrored) {
-    const ignored = await runGit(repoDir, home, ["check-ignore", "-v", "--no-index", "--", name]);
-    if (ignored.exitCode === 0) {
+    // -q decides (exit 0 = ignored, honours negations); -v only words the error,
+    // since it also exits 0 when a negation rule matched.
+    const ignoredQ = await runGit(repoDir, home, ["check-ignore", "-q", "--no-index", "--", name]);
+    if (ignoredQ.exitCode === 0) {
+      const ignored = await runGit(repoDir, home, ["check-ignore", "-v", "--no-index", "--", name]);
       throw new Error(`backup: ${join(home, name)} is ignored by a gitignore rule, nothing would be backed up: ${ignored.stdout.trim()}`);
     }
   }
@@ -277,7 +280,7 @@ export async function runBackup(
     nestedFiles.push(...nested.files);
   }
   if (nestedFiles.length > 0) {
-    const upd = await runGit(repoDir, home, ["update-index", "--add", "-z", "--stdin"], nestedFiles.join("\0") + "\0");
+    const upd = await runGit(repoDir, home, ["update-index", "--add", "--remove", "--replace", "-z", "--stdin"], nestedFiles.join("\0") + "\0");
     if (upd.exitCode !== 0) throw new Error(`backup: git update-index failed in ${repoDir}: ${upd.stderr.trim()}`);
   }
 
@@ -288,6 +291,13 @@ export async function runBackup(
     console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${add.stderr.trim()}`);
   } else if (add.exitCode !== 0) {
     throw new Error(`backup: git add failed in ${repoDir}: ${add.stderr.trim() || `exit ${add.exitCode}`}`);
+  }
+
+  // Partial .gitignore rules outside our control silently skip files; warn, never force-add.
+  const skipped = await runGit(repoDir, home, ["ls-files", "-z", "-o", "-i", "--exclude-per-directory=.gitignore", "--", ...mirrored]);
+  const skippedPaths = skipped.stdout.split("\0").filter(Boolean);
+  if (skippedPaths.length > 0) {
+    console.error(`backup: ${skippedPaths.length} file(s) skipped because a .gitignore rule matches them, e.g. ${skippedPaths.slice(0, 3).join(", ")}`);
   }
 
   // A source directory with nothing trackable (empty, or everything under it
