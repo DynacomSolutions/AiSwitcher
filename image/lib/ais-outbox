@@ -223,16 +223,13 @@ try {
 JS
 }
 
-highest_outbox_seq() {
-  local name seq best=0
-  [[ -d $OUTBOX_DIR && ! -L $OUTBOX_DIR ]] || { printf '0\n'; return; }
-  while IFS= read -r -d '' name; do
-    valid_bundle_name "$name" || continue
-    [[ -f $OUTBOX_DIR/$name && ! -L $OUTBOX_DIR/$name ]] || continue
-    seq=$BUNDLE_SEQ
-    if (( seq > best )); then best=$seq; fi
-  done < <(find "$OUTBOX_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\0')
-  printf '%s\n' "$best"
+log_foreign_outbox_files() {
+  local count=0 _ignored
+  [[ -d $OUTBOX_DIR && ! -L $OUTBOX_DIR ]] || return 0
+  while IFS= read -r -d '' _ignored; do (( count += 1 )); done < <(find "$OUTBOX_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\0')
+  if (( count > 0 )); then
+    printf 'AIS-LIVE: stage=outbox status=ignored-foreign-files count=%s\n' "$count" >&2
+  fi
 }
 
 write_outbox() {
@@ -244,7 +241,8 @@ write_outbox() {
   ensure_state_dir
   current=$(counter read outbox-seq.json) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=state' >&2; return 1; }
   if [[ $current == MISSING ]]; then
-    current=$(highest_outbox_seq)
+    log_foreign_outbox_files
+    current=0
     counter write outbox-seq.json "$current" >/dev/null || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=state-write' >&2; return 1; }
   fi
   (( current < MAX_SAFE_SEQ )) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=sequence-exhausted' >&2; return 1; }
@@ -283,6 +281,13 @@ write_outbox() {
   if [[ ! $cipher_bytes =~ ^[0-9]+$ ]] || (( cipher_bytes > MAX_OUTBOX_BYTES )); then printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=size' >&2; return 1; fi
   sync -f -- "$work_cipher"
   final=$OUTBOX_DIR/bundle-$seq.age
+  while IFS= read -r -d '' name; do
+    valid_bundle_name "$name" || continue
+    if (( BUNDLE_SEQ == seq )); then
+      printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=collision' >&2
+      return 1
+    fi
+  done < <(find "$OUTBOX_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\0')
   [[ ! -e $final && ! -L $final ]] || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=collision' >&2; return 1; }
   mv -T -- "$work_cipher" "$final"
   work_cipher=''

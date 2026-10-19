@@ -126,18 +126,43 @@ export async function newestPersistedMtime(root: FileHandle): Promise<number> {
   return walk(root, "", 0, { value: 0 });
 }
 
-export async function writeHomeFileAtomic(root: FileHandle, path: string, content: Uint8Array, mode = 0o600): Promise<void> {
+export async function writeHomeFileAtomic(
+  root: FileHandle,
+  path: string,
+  content: Uint8Array,
+  mode = 0o600,
+  beforeRename?: (directory: FileHandle, leaf: string) => Promise<void>,
+): Promise<void> {
   const { dir, leaf } = await openParent(root, path.split("/"), true);
   const temporary = `.${leaf}.ais-${crypto.randomUUID()}.tmp`;
   try {
     const file = await open(fdPath(dir.fd, temporary), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), mode);
     try { await file.writeFile(content); await file.sync(); }
     finally { await file.close(); }
+    await beforeRename?.(dir, leaf);
     // rename within the anchored parent directory; no symlink target is followed.
     await rename(fdPath(dir.fd, temporary), fdPath(dir.fd, leaf));
     await dir.sync();
   } catch (error) {
     await unlink(fdPath(dir.fd, temporary)).catch(() => undefined);
     throw error;
+  } finally { if (dir !== root) await dir.close(); }
+}
+
+export async function appendHomeFile(root: FileHandle, path: string, content: Uint8Array, mode = 0o600): Promise<void> {
+  const { dir, leaf } = await openParent(root, path.split("/"), true);
+  try {
+    const file = await open(fdPath(dir.fd, leaf), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0), mode);
+    try {
+      if (!(await file.stat()).isFile()) throw new Error("log target is not a regular file");
+      let offset = 0;
+      while (offset < content.byteLength) {
+        const { bytesWritten } = await file.write(content, offset, content.byteLength - offset, null);
+        if (!bytesWritten) throw new Error("append made no progress");
+        offset += bytesWritten;
+      }
+      await file.sync();
+    } finally { await file.close(); }
+    await dir.sync();
   } finally { if (dir !== root) await dir.close(); }
 }

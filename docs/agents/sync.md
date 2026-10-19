@@ -24,7 +24,13 @@ terminal and is deferred otherwise. Auth writes are deferred until the clock is
 after the image build-time marker, no earlier than the persisted state mtime,
 and within one hour of the online HTTP `Date` response when online. Token grants
 are merged atomically by freshness, and log JSONL uses the existing multiset
-union. SSH material is written with mode `0600`.
+union. Credential replacement retains the cooperating OAuth refresh lock and
+uses a bounded content-hash compare immediately before atomic rename, then
+rereads and remerges if an uncoordinated provider write changed the file.
+Exhausted retries preserve the latest credential, log a deferred result, and do
+not acknowledge the inbox sequence. Log updates append only missing line
+occurrences with `O_APPEND`, preserving existing bytes and concurrent appends.
+SSH material is written with mode `0600`.
 
 `ais live write-outbox` writes only a tar archive to standard output. The root
 service reserves the next sequence in its `/mnt/persist/ais-live-exchange`

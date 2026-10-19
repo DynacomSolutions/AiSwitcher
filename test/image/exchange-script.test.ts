@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, readdir, writeFile, chmod, unlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile, chmod, rename, unlink } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -145,9 +145,13 @@ describe("root exchange wrapper protocol", () => {
 
   test("publishes only a completed encrypted file and removes older sequence files", async () => {
     const { root, path } = await harness();
+    const firstTar = await fixtureTar(1);
+    await writeFile(join(root, "fixture.tar"), firstTar);
+    const first = await run(root, path, ["write-outbox"]);
+    expect(first.exitCode, first.stderr).toBe(0);
+    await rename(join(root, "outbox", "bundle-1.age"), join(root, "outbox", "BUNDLE-1.AGE"));
     const newerTar = await fixtureTar(2);
     await writeFile(join(root, "fixture.tar"), newerTar);
-    await writeFile(join(root, "outbox", "BUNDLE-1.AGE"), "older");
     const result = await run(root, path, ["write-outbox"]);
     expect(result.exitCode, result.stderr).toBe(0);
     expect(result.stderr).toContain("status=written seq=2");
@@ -244,15 +248,45 @@ describe("root exchange wrapper protocol", () => {
     expect((await run(root, path, ["write-outbox"])).exitCode).toBe(0);
     await mkdir(join(root, "home", "agent", ".ais", "live"), { recursive: true });
     await writeFile(join(root, "home", "agent", ".ais", "live", "outbox-seq.json"), '{"version":1,"seq":0}\n');
-    await writeFile(join(root, "outbox", "BUNDLE-1.AGE"), "restored old snapshot");
+    await rename(join(root, "outbox", "bundle-1.age"), join(root, "outbox", "BUNDLE-1.AGE"));
     await writeFile(join(root, "fixture.tar"), await fixtureTar(2));
-    await unlink(join(root, "outbox", "bundle-1.age"));
     const result = await run(root, path, ["write-outbox"]);
     expect(result.exitCode, result.stderr).toBe(0);
     expect(result.stderr).toContain("status=written seq=2");
     expect((await readFile(join(root, "ais-args"), "utf8"))).toContain("--seq=2");
     expect(JSON.parse(await readFile(join(root, "persist", "ais-live-exchange", "outbox-seq.json"), "utf8")).seq).toBe(2);
     expect(await readdir(join(root, "outbox"))).toEqual(["bundle-2.age"]);
+  });
+
+  test("ignores an unauthenticated maximum-sequence filename on first use", async () => {
+    const { root, path } = await harness();
+    await writeFile(join(root, "outbox", "BUNDLE-9007199254740991.AGE"), "");
+    const output = await fixtureTar(1);
+    await writeFile(join(root, "fixture.tar"), output);
+    const result = await run(root, path, ["write-outbox"]);
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stderr).toContain("status=ignored-foreign-files count=1");
+    expect(result.stderr).toContain("status=written seq=1");
+    expect(JSON.parse(await readFile(join(root, "persist", "ais-live-exchange", "outbox-seq.json"), "utf8")).seq).toBe(1);
+    expect(await readFile(join(root, "outbox", "BUNDLE-9007199254740991.AGE"), "utf8")).toBe("");
+    await unlink(join(root, "outbox", "BUNDLE-9007199254740991.AGE"));
+    await writeFile(join(root, "fixture.tar"), await fixtureTar(2));
+    const next = await run(root, path, ["write-outbox"]);
+    expect(next.exitCode, next.stderr).toBe(0);
+    expect(next.stderr).toContain("status=written seq=2");
+    expect(JSON.parse(await readFile(join(root, "persist", "ais-live-exchange", "outbox-seq.json"), "utf8")).seq).toBe(2);
+    expect(await readdir(join(root, "outbox"))).toEqual(["bundle-2.age"]);
+  });
+
+  test("preserves a same-sequence mixed-case outbox collision", async () => {
+    const { root, path } = await harness();
+    await writeFile(join(root, "outbox", "BUNDLE-1.AGE"), "SYNTHETIC_FIXTURE_FOREIGN_BUNDLE");
+    await writeFile(join(root, "fixture.tar"), await fixtureTar(1));
+    const result = await run(root, path, ["write-outbox"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("reason=collision");
+    expect(await readdir(join(root, "outbox"))).toEqual(["BUNDLE-1.AGE"]);
+    expect(await readFile(join(root, "outbox", "BUNDLE-1.AGE"), "utf8")).toBe("SYNTHETIC_FIXTURE_FOREIGN_BUNDLE");
   });
 });
 

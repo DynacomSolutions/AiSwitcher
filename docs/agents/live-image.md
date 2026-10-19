@@ -22,7 +22,10 @@ The agent-side `ais live write-outbox` emits binary tar bytes on standard output
 and sends no status text there. The root service reserves and fsyncs the next
 outbox sequence in `/mnt/persist/ais-live-exchange/outbox-seq.json`, then passes
 `--seq=N --last-inbox-seq=N` to the agent and checks that the returned manifest
-uses the reserved sequence. A failed collection or publish can leave a gap.
+uses the reserved sequence. A failed collection or publish can leave a gap. On
+first use, the root counter starts at zero and ignores exchange-partition
+filenames; it logs that foreign files were ignored because filenames are not
+authenticated sequence state.
 The root service encrypts the tar, publishes only a complete ciphertext through
 a temporary file and atomic rename on the exchange partition, and enforces the
 32 MiB ciphertext ceiling. The keyring

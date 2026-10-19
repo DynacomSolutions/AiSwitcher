@@ -1,8 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 import { applyInbox, configHash } from "../../src/live/inbox.ts";
 import { newestPersistedMtime, openHomeDirectory } from "../../src/live/safe-fs.ts";
 import { withOauthRefreshLock } from "../../src/identities/claude-swap-lock.ts";
@@ -123,7 +122,7 @@ describe("inbox apply", () => {
       const dir = join(home, ".pi");
       const authPath = join(dir, "auth.json");
       await mkdir(dir, { recursive: true });
-      const jwt = (iat: number) => `header.${Buffer.from(JSON.stringify({ iat })).toString("base64url")}.signature`;
+      const jwt = (iat: number) => `SYNTHETIC_FIXTURE_HEADER.${Buffer.from(JSON.stringify({ iat })).toString("base64url")}.SYNTHETIC_FIXTURE_SIGNATURE`;
       await writeFile(authPath, JSON.stringify({ anthropic: { type: "oauth", access: jwt(1_800_000_000), refresh: "SYNTHETIC_FIXTURE_LOCAL_REFRESH", expires: 1_800_000_000_000 } }));
       const incoming = new TextEncoder().encode(JSON.stringify({ anthropic: { type: "oauth", access: jwt(1_700_000_000), refresh: "SYNTHETIC_FIXTURE_OLDER_REFRESH", expires: 2_100_000_000_000 } }));
       await applyInbox({ tar: makeTar({}, [{ path: ".pi/auth.json", class: "auth", bytes: incoming }]), home, clock: goodClock });
@@ -133,7 +132,32 @@ describe("inbox apply", () => {
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
-  test("waits for the refresh lock and merges the grant written while it was held", async () => {
+  test("re-reads and re-merges a non-cooperating provider write before atomic rename", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const dir = join(home, ".pi");
+      const path = join(dir, "auth.json");
+      await mkdir(dir, { recursive: true });
+      await writeFile(path, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_ACCESS_BEFORE", refresh: "SYNTHETIC_FIXTURE_REFRESH_BEFORE", expires: 1_800_000_000_000 } }));
+      const incoming = new TextEncoder().encode(JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_ACCESS_BUNDLE", refresh: "SYNTHETIC_FIXTURE_REFRESH_BUNDLE", expires: 1_700_000_000_000 } }));
+      let attempts = 0;
+      const result = await applyInbox({
+        tar: makeTar({}, [{ path: ".pi/auth.json", class: "auth", bytes: incoming }]), home, clock: goodClock,
+        beforeAuthRename: async (_authPath, attempt) => {
+          attempts++;
+          if (attempt === 0) await writeFile(path, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_ACCESS_REFRESHED", refresh: "SYNTHETIC_FIXTURE_REFRESH_REFRESHED", expires: 2_000_000_000_000 } }));
+        },
+      });
+      expect(result.deferred).toBeUndefined();
+      expect(attempts).toBe(2);
+      const written = JSON.parse(await readFile(path, "utf8"));
+      expect(written.anthropic.access).toBe("SYNTHETIC_FIXTURE_ACCESS_REFRESHED");
+      expect(written.anthropic.refresh).toBe("SYNTHETIC_FIXTURE_REFRESH_REFRESHED");
+      expect(result.lastInboxSeq).toBe(1);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("waits for a cooperating refresh lock and merges the grant written while it is held", async () => {
     const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
     try {
       const dir = join(home, ".pi");
@@ -150,10 +174,34 @@ describe("inbox apply", () => {
         expect(applyFinished).toBe(false);
         await writeFile(path, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_ACCESS_REFRESHED", refresh: "SYNTHETIC_FIXTURE_REFRESH_REFRESHED", expires: 2_000_000_000_000 } }));
       });
-      await applyPromise;
+      const result = await applyPromise;
+      expect(result?.deferred).toBeUndefined();
       const written = JSON.parse(await readFile(path, "utf8"));
       expect(written.anthropic.access).toBe("SYNTHETIC_FIXTURE_ACCESS_REFRESHED");
       expect(written.anthropic.refresh).toBe("SYNTHETIC_FIXTURE_REFRESH_REFRESHED");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("defers and leaves the latest credential intact when concurrent writes exhaust retries", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const dir = join(home, ".codex");
+      const path = join(dir, "auth.json");
+      await mkdir(dir, { recursive: true });
+      await writeFile(path, JSON.stringify({ access_token: "SYNTHETIC_FIXTURE_INITIAL", minted_at: 1_700_000_000 }));
+      const tar = makeTar({ seq: 5 }, [{ path: ".codex/auth.json", class: "auth", bytes: new TextEncoder().encode('{"access_token":"SYNTHETIC_FIXTURE_BUNDLE","minted_at":1800000000}') }]);
+      const log: string[] = [];
+      const result = await applyInbox({
+        tar, home, clock: goodClock, log: (message) => log.push(message),
+        beforeAuthRename: async (_authPath, attempt) => {
+          await writeFile(path, JSON.stringify({ access_token: `SYNTHETIC_FIXTURE_REFRESH_${attempt}`, minted_at: 1_900_000_000 + attempt }));
+        },
+      });
+      expect(result.deferred).toContain("credential changed");
+      expect(result.lastInboxSeq).toBe(0);
+      expect(log.join("\n")).toContain("status=deferred reason=credential-changed");
+      expect(JSON.parse(await readFile(path, "utf8")).access_token).toBe("SYNTHETIC_FIXTURE_REFRESH_2");
+      expect(await Bun.file(join(home, ".ais", "live", "exchange-state.json")).exists()).toBe(false);
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
@@ -180,12 +228,11 @@ describe("inbox apply", () => {
     const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
     try {
       await mkdir(join(home, ".claude"), { recursive: true });
-      const { canonicalConfig } = await import("../../src/live/portable.ts");
       const baseline = new TextEncoder().encode('{"theme":"SYNTHETIC_FIXTURE_BASE"}\n');
       const local = '{"theme":"SYNTHETIC_FIXTURE_LOCAL"}\n';
       await writeFile(join(home, ".claude", "settings.json"), local);
       await mkdir(join(home, ".ais", "live"), { recursive: true });
-      await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 0, hashes: { ".claude/settings.json": createHash("sha256").update(canonicalConfig(".claude/settings.json", baseline)).digest("hex") } }));
+      await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 0, hashes: { ".claude/settings.json": configHash(".claude/settings.json", baseline) } }));
       const changed = new TextEncoder().encode('{"theme":"SYNTHETIC_FIXTURE_HOST_CHANGE"}\n');
       const first = makeTar({ seq: 1 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: changed }]);
       const firstResult = await applyInbox({ tar: first, home, clock: goodClock, isTTY: true, chooseConflict: async () => "drive" });
@@ -195,6 +242,23 @@ describe("inbox apply", () => {
       const nextResult = await applyInbox({ tar: next, home, clock: goodClock });
       expect(nextResult.conflicts).toEqual([]);
       expect(await readFile(join(home, ".claude", "settings.json"), "utf8")).toBe(local);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("applies a drive-only edit from a fresh inbox baseline without a conflict", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const path = join(home, ".claude", "settings.json");
+      const baseline = new TextEncoder().encode('{"theme":"SYNTHETIC_FIXTURE_BASE"}\n');
+      const first = await applyInbox({ tar: makeTar({ seq: 1 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: baseline }]), home, clock: goodClock });
+      expect(first.conflicts).toEqual([]);
+      expect(await readFile(path, "utf8")).toBe(new TextDecoder().decode(baseline));
+      const localDriveEdit = '{"theme":"SYNTHETIC_FIXTURE_DRIVE_EDIT"}\n';
+      await writeFile(path, localDriveEdit);
+      const second = await applyInbox({ tar: makeTar({ seq: 2 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: baseline }]), home, clock: goodClock });
+      expect(second.conflicts).toEqual([]);
+      expect(second.deferred).toBeUndefined();
+      expect(await readFile(path, "utf8")).toBe(localDriveEdit);
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
@@ -263,7 +327,7 @@ describe("inbox apply", () => {
       const local = '{"theme":"SYNTHETIC_FIXTURE_LOCAL"}\n';
       await writeFile(path, local);
       await mkdir(join(home, ".ais", "live"), { recursive: true });
-      await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 0, hashes: { ".claude/settings.json": createHash("sha256").update(baseline).digest("hex") } }));
+      await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 0, hashes: { ".claude/settings.json": configHash(".claude/settings.json", baseline) } }));
       const tar = makeTar({ seq: 1 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: drive }]);
       const deferred = await applyInbox({ tar, home, clock: goodClock, isTTY: false });
       expect(deferred.deferred).toBeDefined();
@@ -297,6 +361,43 @@ describe("inbox apply", () => {
       expect(JSON.parse(await readFile(join(home, ".codex", "auth.json"), "utf8")).access_token).toBe("SYNTHETIC_FIXTURE_NEW_ACCESS");
       expect((await readFile(logPath, "utf8")).match(/SYNTHETIC_FIXTURE_ONE/g)).toHaveLength(1);
       expect(await readFile(logPath, "utf8")).toContain("SYNTHETIC_FIXTURE_TWO");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("appends missing log occurrences without rewriting existing CRLF bytes or losing concurrent appends", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const dir = join(home, ".claude", "projects", "sample", "sessions");
+      await mkdir(dir, { recursive: true });
+      const path = join(dir, "run.jsonl");
+      const original = '{"id":"SYNTHETIC_FIXTURE_EXISTING"}\r\n{"id":"SYNTHETIC_FIXTURE_EXISTING"}\r\n';
+      await writeFile(path, original);
+      const originalStat = await stat(path);
+      const incoming = new TextEncoder().encode('{"id":"SYNTHETIC_FIXTURE_EXISTING"}\n{"id":"SYNTHETIC_FIXTURE_NEW"}\n{"id":"SYNTHETIC_FIXTURE_NEW"}\n');
+      let appendSeamCalls = 0;
+      const result = await applyInbox({
+        tar: makeTar({ seq: 1 }, [{ path: ".claude/projects/sample/sessions/run.jsonl", class: "logs", bytes: incoming }]), home, clock: goodClock,
+        beforeLogAppend: async () => { appendSeamCalls++; await appendFile(path, '{"id":"SYNTHETIC_FIXTURE_CONCURRENT"}\r\n'); },
+      });
+      const afterStat = await stat(path);
+      const final = await readFile(path);
+      expect(result.applied).toBe(1);
+      expect(afterStat.ino).toBe(originalStat.ino);
+      expect(new TextDecoder().decode(final).startsWith(original)).toBe(true);
+      expect(new TextDecoder().decode(final)).toContain('{"id":"SYNTHETIC_FIXTURE_CONCURRENT"}\r\n');
+      expect(new TextDecoder().decode(final).match(/SYNTHETIC_FIXTURE_NEW/g)).toHaveLength(2);
+      expect(new TextDecoder().decode(final).match(/SYNTHETIC_FIXTURE_EXISTING/g)).toHaveLength(2);
+      expect(appendSeamCalls).toBe(1);
+      const second = await applyInbox({
+        tar: makeTar({ seq: 2 }, [{ path: ".claude/projects/sample/sessions/run.jsonl", class: "logs", bytes: incoming }]), home, clock: goodClock,
+        beforeLogAppend: async () => { appendSeamCalls++; },
+      });
+      expect(second.applied).toBe(0);
+      expect(second.skipped).toBe(1);
+      expect(appendSeamCalls).toBe(1);
+      expect(await readFile(path)).toEqual(final);
+      expect((await stat(path)).ino).toBe(afterStat.ino);
+      expect(JSON.parse(await readFile(join(home, ".ais", "live", "exchange-state.json"), "utf8")).lastInboxSeq).toBe(2);
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 

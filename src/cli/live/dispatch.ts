@@ -113,7 +113,7 @@ export async function runLiveCommand(rest: string[], flags: Record<string, strin
     if (flags.stdin !== true) throw new CliUsageError("Usage: ais live apply-inbox --stdin");
     const lastInboxSeq = optionalNumberFlag(flags, "last-inbox-seq", 0);
     const tar = await readInboxStdin();
-    const result = await applyInbox({ tar, home, clock: await clockSnapshot(home), isTTY: hasControllingTerminal(), chooseConflict: conflictPrompt, ...(lastInboxSeq === undefined ? {} : { lastInboxSeq }) });
+    const result = await applyInbox({ tar, home, clock: await clockSnapshot(home), isTTY: hasControllingTerminal(), chooseConflict: conflictPrompt, log: (message) => console.error(message), ...(lastInboxSeq === undefined ? {} : { lastInboxSeq }) });
     if (result.deferred) { process.exitCode = 2; console.error("AIS-LIVE: stage=inbox status=deferred"); }
     else console.error(`AIS-LIVE: stage=inbox status=ok applied=${result.applied} skipped=${result.skipped}`);
     return;

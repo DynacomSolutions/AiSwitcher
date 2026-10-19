@@ -4,12 +4,10 @@ import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { parseBundleTar, type Bundle, type BundleManifest } from "./bundle.ts";
 import { classify } from "./path-classes.ts";
-import { openHomeDirectory, openParent, readHomeFile, writeHomeFileAtomic } from "./safe-fs.ts";
-import { mergeJsonlLineSets } from "../sync/dedupe.ts";
+import { appendHomeFile, openHomeDirectory, openParent, readHomeFile, writeHomeFileAtomic } from "./safe-fs.ts";
 import { decodeJwtPayload, readPiEntry } from "../identities/oauth-reconcile.ts";
 import { canonicalConfig } from "./portable.ts";
 import { hasOpenOwner } from "../sync/tree-merge.ts";
-import { join } from "node:path";
 import { withOauthRefreshLock } from "../identities/claude-swap-lock.ts";
 
 interface InboxState {
@@ -46,6 +44,10 @@ export interface ApplyInboxDeps {
   lastInboxSeq?: number;
   /** Test seam for exercising the active-writer safety check. */
   hasOpenOwner?: (path: string) => Promise<boolean | undefined>;
+  /** Test seam for a non-cooperating provider write after merge and temp fsync. */
+  beforeAuthRename?: (path: string, attempt: number) => Promise<void>;
+  /** Test seam for a concurrent log append after the latest read. */
+  beforeLogAppend?: (path: string) => Promise<void>;
 }
 
 const STATE_REL = ".ais/live/exchange-state.json";
@@ -176,12 +178,23 @@ async function mergeAuth(current: unknown, incoming: unknown, root: FileHandle, 
   return merged;
 }
 
-function mergeLogs(current: Uint8Array | undefined, incoming: Uint8Array): Uint8Array {
-  if (!current?.byteLength) return incoming;
+function missingLogLines(current: Uint8Array | undefined, incoming: Uint8Array): Uint8Array {
   const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes).split(/\r?\n/).filter(Boolean);
-  const lines = mergeJsonlLineSets([decode(current), decode(incoming)]);
-  return new TextEncoder().encode(lines.join("\n") + (lines.length ? "\n" : ""));
+  const existingLines = decode(current ?? new Uint8Array());
+  const counts = new Map<string, number>();
+  for (const line of existingLines) counts.set(line, (counts.get(line) ?? 0) + 1);
+  const additions: string[] = [];
+  for (const line of decode(incoming)) {
+    const count = counts.get(line) ?? 0;
+    if (count > 0) counts.set(line, count - 1);
+    else additions.push(line);
+  }
+  if (!additions.length) return new Uint8Array();
+  const separator = current?.byteLength && current.at(-1) !== 10 ? "\n" : "";
+  return new TextEncoder().encode(`${separator}${additions.join("\n")}\n`);
 }
+
+class AuthTargetChanged extends Error {}
 
 async function readState(root: FileHandle, path: string): Promise<InboxState> {
   const bytes = await readHomeFile(root, path);
@@ -233,7 +246,7 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
 
     let applied = 0;
     const nextHashes = { ...state.hashes };
-    const planned: Array<{ path: string; bytes: Uint8Array; mode?: number; hash: string }> = [];
+    const planned: Array<{ path: string; bytes: Uint8Array; mode?: number; hash: string; class: string }> = [];
     for (const entry of bundle.manifest.entries) {
       if (entry.class === "auth" && !authReady) continue;
       const content = bundle.files.get(entry.path);
@@ -249,38 +262,65 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
         nextHashes[entry.path] = configHash(entry.path, content);
         continue;
       }
-      const bytes = entry.class === "logs" ? mergeLogs(current, content) : entry.class.startsWith("config:") ? canonicalConfig(entry.path, content) : content;
-      planned.push({ path: entry.path, bytes, ...(entry.class === "ssh" ? { mode: 0o600 } : {}), hash: entry.class.startsWith("config:") ? configHash(entry.path, content) : hash(bytes) });
+      const bytes = entry.class.startsWith("config:") ? canonicalConfig(entry.path, content) : content;
+      planned.push({ path: entry.path, bytes, ...(entry.class === "ssh" ? { mode: 0o600 } : {}), hash: entry.class.startsWith("config:") ? configHash(entry.path, content) : hash(bytes), class: entry.class });
     }
     // All paths have been validated and existing contents read before writes begin.
     for (const item of planned) {
       const entry = bundle.manifest.entries.find((candidate) => candidate.path === item.path)!;
+      if (item.class === "logs") {
+        const incoming = bundle.files.get(item.path)!;
+        const current = await readHomeFile(root, item.path);
+        const additions = missingLogLines(current, incoming);
+        if (additions.byteLength) {
+          await deps.beforeLogAppend?.(item.path);
+          await appendHomeFile(root, item.path, additions, item.mode);
+          applied++;
+        }
+        continue;
+      }
       if (entry.class === "auth") {
         const parent = await openParent(root, item.path.split("/"), true);
         try {
-          const configDir = `/proc/self/fd/${parent.dir.fd}`;
-          await withOauthRefreshLock(configDir, async (lock) => {
-            const existing = await readHomeFile(parent.dir, parent.leaf);
-            const ownerPath = `/proc/self/fd/${parent.dir.fd}/${parent.leaf}`;
-            const owner = deps.hasOpenOwner ? await deps.hasOpenOwner(ownerPath) : await hasOpenOwner(ownerPath, { lookups: 0 });
-            if (owner !== false) throw new Error(`credential file is busy or cannot be safely checked: ${item.path}`);
-            const incoming = bundle.files.get(item.path)!;
-            let bytes = incoming;
-            if (existing && item.path.endsWith(".json")) {
-              const oldAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(existing)) as Record<string, unknown>;
-              const newAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(incoming)) as Record<string, unknown>;
-              bytes = new TextEncoder().encode(JSON.stringify(await mergeAuth(oldAuth, newAuth, root)) + "\n");
-            } else if (existing) {
-              bytes = incoming;
+          const ownerPath = `/proc/self/fd/${parent.dir.fd}/${parent.leaf}`;
+          const incoming = bundle.files.get(item.path)!;
+          let completed = false;
+          await withOauthRefreshLock(`/proc/self/fd/${parent.dir.fd}`, async (lock) => {
+            for (let attempt = 0; attempt < 3; attempt++) {
+              const owner = deps.hasOpenOwner ? await deps.hasOpenOwner(ownerPath) : await hasOpenOwner(ownerPath, { lookups: 0 });
+              if (owner !== false) throw new Error(`credential file is busy or cannot be safely checked: ${item.path}`);
+              const existing = await readHomeFile(parent.dir, parent.leaf);
+              const expectedHash = existing === undefined ? undefined : hash(existing);
+              let bytes = incoming;
+              if (existing && item.path.endsWith(".json")) {
+                const oldAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(existing)) as Record<string, unknown>;
+                const newAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(incoming)) as Record<string, unknown>;
+                bytes = new TextEncoder().encode(JSON.stringify(await mergeAuth(oldAuth, newAuth, root)) + "\n");
+              } else if (existing) {
+                bytes = incoming;
+              }
+              try {
+                await writeHomeFileAtomic(parent.dir, parent.leaf, bytes, item.mode, async (directory, leaf) => {
+                  await deps.beforeAuthRename?.(item.path, attempt);
+                  const current = await readHomeFile(directory, leaf);
+                  if ((current === undefined ? undefined : hash(current)) !== expectedHash || lock.isLost()) throw new AuthTargetChanged();
+                });
+                item.hash = hash(bytes);
+                completed = true;
+                break;
+              } catch (error) {
+                if (!(error instanceof AuthTargetChanged)) throw error;
+              }
             }
-            if (lock.isLost()) throw new Error(`credential lock was lost before writing: ${item.path}`);
-            await writeHomeFileAtomic(parent.dir, parent.leaf, bytes, item.mode);
-            item.hash = hash(bytes);
           });
+          if (!completed) {
+            deps.log?.(`AIS-LIVE: stage=inbox status=deferred reason=credential-changed path=${item.path}`);
+            return { applied, skipped: bundle.manifest.entries.length - applied, conflicts, deferred: "credential changed during restore; retry the inbox", lastInboxSeq };
+          }
         } finally { if (parent.dir !== root) await parent.dir.close(); }
       } else await writeHomeFileAtomic(root, item.path, item.bytes, item.mode);
       nextHashes[item.path] = item.hash;
-      applied++;
+      if (entry.class !== "logs") applied++;
     }
     // A deferred auth merge must be retried, so its seq cannot be acknowledged yet.
     if (authReady) {
