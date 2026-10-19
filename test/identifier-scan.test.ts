@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   checkLine, findDomains, findEmails, findHomePaths, findIps, findMachineNicknames, isAllowedDomain,
-  scannableSegments,
+  isPythonShebang, scannableSegments,
 } from "../scripts/identifier-scan.ts";
 
 describe("domain allowlist", () => {
@@ -164,5 +164,37 @@ describe("checkLine integration", () => {
     const rules = checkLine("README.md", "ops@internal-example-corp.dev is reachable at 203.0.114.9");
     expect(rules).toContain("blocked-email");
     expect(rules).toContain("blocked-ip");
+  });
+});
+
+describe("python files", () => {
+  const code = "result = subprocess.run(cmd); m = match.group(1)";
+  test("shebang detection", () => {
+    expect(isPythonShebang("#!/usr/bin/env python3")).toBe(true);
+    expect(isPythonShebang("#!/usr/bin/python")).toBe(true);
+    expect(isPythonShebang("#!/bin/bash")).toBe(false);
+  });
+
+  test("attribute access is ignored for .py and python-shebang files", () => {
+    expect(checkLine("tool.py", code)).toEqual([]);
+    expect(checkLine("image/lib/tool", code, { inBlock: false, python: true })).toEqual([]);
+  });
+
+  test("a real domain inside a python string or comment is still flagged", () => {
+    const state = () => ({ inBlock: false, python: true });
+    expect(checkLine("tool", 'url = "https://internal.example-corp.dev/x"', state())).toContain("blocked-domain");
+    expect(checkLine("tool", "x = 1  # see internal.example-corp.dev", state())).toContain("blocked-domain");
+    expect(checkLine("tool.py", "u = 'internal.example-corp.dev'", { inBlock: false })).toContain("blocked-domain");
+  });
+
+  test("a domain inside a multi-line triple-quoted string is still flagged", () => {
+    const state: { inBlock: boolean; python: boolean; triple?: string } = { inBlock: false, python: true };
+    expect(checkLine("tool", 'doc = """start', state)).toEqual([]);
+    expect(checkLine("tool", "reach internal.example-corp.dev now", state)).toContain("blocked-domain");
+    expect(checkLine("tool", 'end""" + subprocess.run', state)).toEqual([]);
+  });
+
+  test("non-python extensionless files are still scanned in full", () => {
+    expect(checkLine("tool", code.replace("subprocess.run", "internal.example-corp.dev"))).toContain("blocked-domain");
   });
 });
