@@ -183,7 +183,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 99
     same way the old scattered `~/.ais`-adjacent paths did. `node_modules`,
     marketplace/browser caches, logs, worktrees, and similar have zero
     restore value and were the biggest driver of the old design's
-    unbounded growth.
+    unbounded growth. The backup adds `jobs/*/tmp/` (unanchored, so it
+    matches at any depth) on top: agent job scratch directories can hold
+    GBs of throwaway assets and their own `.gitattributes`.
   - **Unlike SSH sync, SQLite/session databases are deliberately NOT
     excluded.** Sync excludes live databases because it has its own
     VACUUM-based snapshot+merge protocol specifically to avoid corrupting a
@@ -302,6 +304,21 @@ described above (same repo content, commits and console output); only the
   fails the local backup. `localRetentionDays` must be a positive integer and is
   ignored (loudly) without a `remote`. `runBackup(groups, home, configPath?)`
   takes the config path as an optional third argument for tests.
+- **Git LFS is never used by the backup repo**, even when the user's global
+  config ran `git lfs install`. Mirrored config trees can contain nested
+  `.gitattributes` files with `filter=lfs`; without a guard `git add` would
+  store pointers instead of content and the LFS pre-push hook would fail every
+  push to a plain remote (`batch request: missing protocol`). Three guards:
+  every git call on the repo passes `-c core.hooksPath=/dev/null -c
+  filter.lfs.required=false` (hooks in `.git/hooks` are left in place but never
+  run); every run writes `.git/info/attributes` (highest attribute precedence)
+  with `* -filter -text -ident -working-tree-encoding`, atomically and only when
+  the content differs; and when that file is first created or changed, tracked
+  paths that still resolve to `filter=lfs` are renormalised after the mirror
+  step (`git add --renormalize`) so real content replaces the pointers in that
+  run's commit. Renormalisation skips paths no longer in the working tree
+  (for example excluded `jobs/*/tmp/` data), which the normal `git add -A`
+  simply drops without hashing them. History is not rewritten.
 - **Operator creates the remote.** Run `git init --bare /srv/ais-backups.git` on
   the backup host once. The backup never creates it.
 - **Push on every run** where a remote is configured, including the "no changes"

@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { aisBackupConfigPath, aisBackupLockPath, aisBackupsDir } from "../src/shared/ais-home.ts";
 import { acquirePidLock } from "../src/shared/pid-lock.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../src/shared/reproducible-paths.ts";
@@ -38,7 +38,9 @@ export function isTolerableRsyncExitCode(exitCode: number): boolean {
 // Unlike SSH sync, SQLite/db files are deliberately NOT excluded here: this
 // is a point-in-time safety-net copy, not a live merge target, so it wants
 // the same full-fidelity content the old tar-based backup always included.
-const BACKUP_EXCLUDES = [...REPRODUCIBLE_JUNK_DIR_NAMES, "*.lock", "*.sock", "*.pid"];
+// "jobs/*/tmp/" (unanchored, so it matches at any depth): agent job scratch
+// dirs hold throwaway checkouts that can carry their own .gitattributes.
+const BACKUP_EXCLUDES = [...REPRODUCIBLE_JUNK_DIR_NAMES, "*.lock", "*.sock", "*.pid", "jobs/*/tmp/"];
 
 function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
@@ -68,11 +70,16 @@ interface GitResult {
   stderr: string;
 }
 
-async function runGit(repoDir: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
+// This repo must never use Git LFS, even when the user's global config ran
+// `git lfs install`: no hooks (the LFS pre-push hook breaks plain remotes) and
+// no required filter. The info/attributes file (ensureAttributes) covers filters.
+const GIT_SAFETY_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "filter.lfs.required=false"];
+
+async function runGit(repoDir: string, args: string[], env?: Record<string, string>, stdin?: string): Promise<GitResult> {
   const git = Bun.which("git");
   if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
-  const proc = Bun.spawn([git, "-C", repoDir, ...args], {
-    stdin: "ignore",
+  const proc = Bun.spawn([git, "-C", repoDir, ...GIT_SAFETY_ARGS, ...args], {
+    stdin: stdin === undefined ? "ignore" : new Blob([stdin]),
     stdout: "pipe",
     stderr: "pipe",
     ...(env ? { env: { ...process.env, ...env } } : {}),
@@ -100,6 +107,75 @@ async function ensureRepo(repoDir: string): Promise<void> {
   await runGit(repoDir, ["config", "user.email", "ai-profile-switcher@localhost"]);
   await runGit(repoDir, ["config", "commit.gpgsign", "false"]);
   console.error(`backup: initialised git repo at ${repoDir}`);
+}
+
+// info/attributes has the highest attribute precedence, so it beats any
+// .gitattributes mirrored in from a config tree.
+const BACKUP_ATTRIBUTES =
+  "# Backups store raw bytes: neutralise filters (LFS) from mirrored .gitattributes files.\n" +
+  "* -filter -text -ident -working-tree-encoding\n";
+
+/** Tracked paths whose attributes currently resolve to the LFS filter. */
+async function trackedLfsPaths(repoDir: string): Promise<string[]> {
+  const files = await runGit(repoDir, ["ls-files", "-z"]);
+  if (files.exitCode !== 0 || files.stdout === "") return [];
+  const attrs = await runGit(repoDir, ["check-attr", "-z", "--stdin", "filter"], undefined, files.stdout);
+  if (attrs.exitCode !== 0) throw new Error(`backup: git check-attr failed in ${repoDir}: ${attrs.stderr.trim()}`);
+  // Output is NUL-separated <path>, <attribute>, <value> triples.
+  const parts = attrs.stdout.split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i + 2 < parts.length; i += 3) if (parts[i + 2] === "lfs") paths.push(parts[i]!);
+  return paths;
+}
+
+/** Writes the neutralising attributes; returns tracked paths still stored through the LFS filter. */
+async function ensureAttributes(repoDir: string): Promise<string[]> {
+  const attributesPath = join(repoDir, ".git", "info", "attributes");
+  let current: string | undefined;
+  try {
+    current = await readFile(attributesPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  if (current === BACKUP_ATTRIBUTES) return [];
+
+  // Before the new attributes take effect, find blobs already stored through
+  // the LFS filter (pointers instead of content) so they can be replaced.
+  const polluted = await trackedLfsPaths(repoDir);
+
+  await mkdir(join(repoDir, ".git", "info"), { recursive: true });
+  const tmpPath = `${attributesPath}.${process.pid}.tmp`;
+  await writeFile(tmpPath, BACKUP_ATTRIBUTES);
+  await rename(tmpPath, attributesPath);
+
+  return polluted;
+}
+
+/** Replaces LFS pointers in the index with real content. Runs AFTER the mirror:
+ * paths the mirror deleted or excluded (e.g. multi-GB jobs/<id>/tmp/ assets)
+ * are skipped here so the normal `git add -A` just drops them, never hashing them. */
+async function renormalise(repoDir: string, polluted: readonly string[]): Promise<void> {
+  const present: string[] = [];
+  for (const path of polluted) if (await pathExists(join(repoDir, path))) present.push(path);
+  if (present.length > 0) {
+    const listPath = join(repoDir, ".git", `ais-renormalize.${process.pid}.tmp`);
+    await writeFile(listPath, present.join("\0") + "\0");
+    try {
+      // Literal pathspecs: tracked names may contain glob characters.
+      const add = await runGit(
+        repoDir,
+        ["add", "--renormalize", `--pathspec-from-file=${listPath}`, "--pathspec-file-nul"],
+        { GIT_LITERAL_PATHSPECS: "1" },
+      );
+      if (add.exitCode !== 0) throw new Error(`backup: git add --renormalize failed in ${repoDir}: ${add.stderr.trim()}`);
+    } finally {
+      await rm(listPath, { force: true });
+    }
+  }
+  console.error(
+    `backup: RENORMALISED ${present.length} tracked path(s) that were stored through the LFS filter ` +
+      `(${polluted.length - present.length} more no longer exist and are dropped); real content replaces the pointers in this run's commit`,
+  );
 }
 
 async function mirrorInto(sourcePath: string, destPath: string): Promise<void> {
@@ -145,6 +221,7 @@ async function mirrorInto(sourcePath: string, destPath: string): Promise<void> {
 async function mirrorAndCommit(groups: readonly BackupGroup[], home: string): Promise<string> {
   const repoDir = aisBackupsDir(home);
   await ensureRepo(repoDir);
+  const polluted = await ensureAttributes(repoDir);
 
   const mirrored: string[] = [];
   for (const name of groups.flatMap((g) => BACKUP_GROUPS[g])) {
@@ -168,6 +245,8 @@ async function mirrorAndCommit(groups: readonly BackupGroup[], home: string): Pr
     console.error(`backup: nothing to mirror, see ${repoDir}`);
     return repoDir;
   }
+
+  if (polluted.length > 0) await renormalise(repoDir, polluted);
 
   const add = await runGit(repoDir, ["add", "-A", "--", ...mirrored]);
   if (add.exitCode !== 0) throw new Error(`backup: git add failed in ${repoDir}: ${add.stderr.trim()}`);

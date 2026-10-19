@@ -392,3 +392,122 @@ describeWithRsync("runBackup off-host push", () => {
     expect(existsSync(join(home, ".ais", "backups.lock"))).toBe(false);
   });
 });
+
+describeWithRsync("runBackup never uses Git LFS", () => {
+  // Simulates a global `git lfs install` with a fake filter, so no git-lfs binary is needed.
+  const saved = process.env.GIT_CONFIG_GLOBAL;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = saved;
+  });
+
+  async function useFakeLfsGlobalConfig(home: string): Promise<void> {
+    const path = join(home, "global.gitconfig");
+    await Bun.write(
+      path,
+      "[filter \"lfs\"]\n\tclean = sed s/^/POINTER:/\n\tsmudge = cat\n\trequired = true\n",
+    );
+    process.env.GIT_CONFIG_GLOBAL = path;
+  }
+
+  const real = "real bytes\n";
+  const lfsAttributes = "*.bin filter=lfs diff=lfs merge=lfs -text\n";
+
+  test("nested .gitattributes with filter=lfs does not turn content into pointers", async () => {
+    const home = await makeHome();
+    await useFakeLfsGlobalConfig(home);
+    await write(join(home, ".codex", "sub", ".gitattributes"), lfsAttributes);
+    await write(join(home, ".codex", "sub", "a.bin"), real);
+
+    const repo = await runBackup(["codex"], home);
+
+    expect(await git(repo, ["show", "HEAD:.codex/sub/a.bin"])).toBe(real.trim());
+    expect(await Bun.file(join(repo, ".git", "info", "attributes")).text()).toContain("* -filter -text -ident -working-tree-encoding\n");
+  });
+
+  test("an already-polluted repo is renormalised to real content", async () => {
+    const home = await makeHome();
+    await useFakeLfsGlobalConfig(home);
+    await write(join(home, ".codex", "sub", ".gitattributes"), lfsAttributes);
+    await write(join(home, ".codex", "sub", "a.bin"), real);
+    const repo = join(home, ".ais", "backups");
+    await mkdir(repo, { recursive: true });
+    await git(repo, ["init", "--quiet"]);
+    await git(repo, ["config", "user.name", "t"]);
+    await git(repo, ["config", "user.email", "t@example.com"]);
+    await git(repo, ["config", "commit.gpgsign", "false"]);
+    await write(join(repo, ".codex", "sub", ".gitattributes"), lfsAttributes);
+    await write(join(repo, ".codex", "sub", "a.bin"), real);
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "--quiet", "-m", "polluted"]);
+    expect(await git(repo, ["show", "HEAD:.codex/sub/a.bin"])).toBe(`POINTER:${real.trim()}`);
+
+    await runBackup(["codex"], home);
+
+    expect(await git(repo, ["show", "HEAD:.codex/sub/a.bin"])).toBe(real.trim());
+    expect(await Bun.file(join(repo, ".git", "info", "attributes")).exists()).toBe(true);
+    expect(await git(repo, ["status", "--porcelain"])).toBe("");
+  });
+
+  test("a polluted path under an excluded jobs/<id>/tmp/ is dropped, never re-hashed into the object store", async () => {
+    const home = await makeHome();
+    await useFakeLfsGlobalConfig(home);
+    const secret = "huge asset bytes that must not enter the store\n";
+    await write(join(home, ".codex", "keep.txt"), "keep\n");
+    await write(join(home, ".codex", "jobs", "j1", "tmp", ".gitattributes"), lfsAttributes);
+    await write(join(home, ".codex", "jobs", "j1", "tmp", "big.bin"), secret);
+    const repo = join(home, ".ais", "backups");
+    await mkdir(repo, { recursive: true });
+    await git(repo, ["init", "--quiet"]);
+    await git(repo, ["config", "user.name", "t"]);
+    await git(repo, ["config", "user.email", "t@example.com"]);
+    await git(repo, ["config", "commit.gpgsign", "false"]);
+    await write(join(repo, ".codex", "keep.txt"), "keep\n");
+    await write(join(repo, ".codex", "jobs", "j1", "tmp", ".gitattributes"), lfsAttributes);
+    await write(join(repo, ".codex", "jobs", "j1", "tmp", "big.bin"), secret);
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "--quiet", "-m", "polluted"]);
+    expect(await git(repo, ["show", "HEAD:.codex/jobs/j1/tmp/big.bin"])).toBe(`POINTER:${secret.trim()}`);
+    const realHash = await git(join(home, ".codex"), ["hash-object", "--no-filters", "jobs/j1/tmp/big.bin"]);
+
+    await runBackup(["codex"], home);
+
+    expect(Bun.spawnSync(["git", "-C", repo, "cat-file", "-e", "HEAD:.codex/jobs/j1/tmp/big.bin"]).exitCode).not.toBe(0);
+    expect(await git(repo, ["show", "HEAD:.codex/keep.txt"])).toBe("keep");
+    expect(Bun.spawnSync(["git", "-C", repo, "cat-file", "-e", realHash]).exitCode).not.toBe(0);
+  });
+
+  test("failing LFS-style hooks neither run nor block the push", async () => {
+    const home = await makeHome();
+    const remote = await makeBareRemote();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    const repo = await runBackup(["codex"], home);
+    const hooks = join(repo, ".git", "hooks");
+    await mkdir(hooks, { recursive: true });
+    await Bun.write(join(hooks, "pre-push"), "#!/bin/sh\nexit 1\n");
+    await Bun.write(join(hooks, "post-commit"), `#!/bin/sh\ntouch "${join(home, "hook-ran")}"\n`);
+    await chmod(join(hooks, "pre-push"), 0o755);
+    await chmod(join(hooks, "post-commit"), 0o755);
+    await write(join(home, ".codex", "identities.json"), '{"changed":true}\n');
+
+    await runBackup(["codex"], home, await writeConfig(home, { remote }));
+
+    expect(await git(remote, ["rev-parse", `refs/heads/${await branchOf(repo)}`])).toBe(await git(repo, ["rev-parse", "HEAD"]));
+    expect(existsSync(join(home, "hook-ran"))).toBe(false);
+  });
+
+  test("excludes jobs/<id>/tmp/ at any depth but keeps other files in jobs/<id>/", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "jobs", "j1", "tmp", "scratch.txt"), "x\n");
+    await write(join(home, ".codex", "jobs", "j1", "other.txt"), "keep\n");
+    await write(join(home, ".codex", "identities", "p", "jobs", "j2", "tmp", "deep", "scratch.txt"), "x\n");
+    await write(join(home, ".codex", "identities", "p", "jobs", "j2", "other.txt"), "keep\n");
+
+    const repo = await runBackup(["codex"], home);
+
+    expect(existsSync(join(repo, ".codex", "jobs", "j1", "tmp"))).toBe(false);
+    expect(existsSync(join(repo, ".codex", "identities", "p", "jobs", "j2", "tmp"))).toBe(false);
+    expect(await Bun.file(join(repo, ".codex", "jobs", "j1", "other.txt")).text()).toBe("keep\n");
+    expect(await Bun.file(join(repo, ".codex", "identities", "p", "jobs", "j2", "other.txt")).text()).toBe("keep\n");
+  });
+});
