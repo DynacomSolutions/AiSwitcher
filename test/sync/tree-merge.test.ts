@@ -105,7 +105,7 @@ describe("mergeIncomingProfileTree", () => {
     expect(await Bun.file(join(conflictRoot, "incoming", rel)).text()).toBe('complete\n{"partial":');
   });
 
-  test("defers an incoming history while a native process still owns the live file", async () => {
+  test("defers an incoming history, without copying it, while a native process still owns the live file", async () => {
     const home = await makeDir("ais-tree-open-home-");
     const incoming = await makeDir("ais-tree-open-incoming-");
     const conflictRoot = join(aisRemoteCacheDir(home), "merge-conflicts", "open-test");
@@ -122,11 +122,32 @@ describe("mergeIncomingProfileTree", () => {
         cfg: codexConfig(home),
         identityName: "personal",
       }, { home, conflictRoot });
-      expect(result.preservedConflicts).toBe(1);
+      expect(result.preservedConflicts).toBe(0);
       expect(await Bun.file(live).text()).toBe('local\n');
-      expect(await Bun.file(join(conflictRoot, "incoming", rel)).text()).toBe('remote\n');
+      expect(await Bun.file(join(conflictRoot, "incoming", rel)).exists()).toBe(false);
     } finally {
       await handle.close();
+    }
+  });
+});
+
+describe("mtime convergence", () => {
+  test("identical files take the newer mtime; contents never change", async () => {
+    const home = await makeDir("ais-tree-mtime-home-");
+    const incoming = await makeDir("ais-tree-mtime-incoming-");
+    await writeRegistry(home, home);
+    await writeRegistry(incoming, home);
+    const dir = join(".codex", "identities", "personal");
+    for (const name of ["a.json", "b.jsonl"]) {
+      await write(join(home, dir, name), "same\n");
+      await write(join(incoming, dir, name), "same\n");
+      await utimes(join(home, dir, name), new Date(1_000_000), new Date(1_000_000));
+      await utimes(join(incoming, dir, name), new Date(2_000_000), new Date(2_000_000));
+    }
+    await mergeIncomingProfileTree(incoming, { kind: "identity", cfg: codexConfig(home), identityName: "personal" }, { home });
+    for (const name of ["a.json", "b.jsonl"]) {
+      expect((await stat(join(home, dir, name))).mtimeMs).toBe(2_000_000);
+      expect(await Bun.file(join(home, dir, name)).text()).toBe("same\n");
     }
   });
 });

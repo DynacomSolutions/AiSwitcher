@@ -45,7 +45,11 @@ export function parseSyncConfig(raw: unknown): SyncConfig {
     validateRemoteHost(host);
     if (!remotes.includes(host)) remotes.push(host);
   }
-  return { version: 2, remotes };
+  const interval = rec.minIntervalMinutes;
+  if (interval !== undefined && (typeof interval !== "number" || !Number.isFinite(interval) || interval < 0)) {
+    throw new Error(`AIS sync config has an invalid "minIntervalMinutes" (expected a non-negative number)`);
+  }
+  return interval === undefined ? { version: 2, remotes } : { version: 2, remotes, minIntervalMinutes: interval };
 }
 
 export async function loadSyncConfig(path: string = syncConfigPath()): Promise<SyncConfig> {

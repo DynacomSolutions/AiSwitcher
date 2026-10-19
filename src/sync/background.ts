@@ -16,9 +16,26 @@ export function resolveInstalledAisBinary(): string | undefined {
   return existsSync(sibling) ? sibling : Bun.which("ais") ?? undefined;
 }
 
+/** Command prefix that starts the worker at the lowest CPU priority and, on
+ * Linux when ionice works here, idle I/O class (setpriority/ionice -p only hit
+ * one thread, so the whole process must start that way). */
+// The ionice probe runs in the child shell: a denied ioprio_set makes util-linux
+// ionice skip the command, and probing here via spawnSync would hold fds open.
+const IONICE_SCRIPT = 'if ionice -c3 true >/dev/null 2>&1; then exec ionice -c3 "$@"; fi; exec "$@"';
+
+export function lowPriorityPrefix(
+  which: (name: string) => string | null = Bun.which,
+  platform: string = process.platform,
+): string[] {
+  const nice = which("nice");
+  const sh = which("sh");
+  const ionice = platform === "linux" && sh && which("ionice");
+  return [...(nice ? [nice, "-n", "19"] : []), ...(ionice ? [sh, "-c", IONICE_SCRIPT, "sh"] : [])];
+}
+
 function spawnDetached(binary: string, args: string[]): void {
   withUsableCwd(() =>
-    Bun.spawn([binary, ...args], {
+    Bun.spawn([...lowPriorityPrefix(), binary, ...args], {
       env: process.env,
       stdio: ["ignore", "ignore", "ignore"],
       detached: true,

@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readdir, readlink, realpath, stat } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readlink, realpath, stat, utimes } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, sep } from "node:path";
@@ -73,6 +73,13 @@ async function filesEqual(a: string, b: string): Promise<boolean> {
   const [aStat, bStat] = await Promise.all([stat(a), stat(b)]);
   if (aStat.size !== bStat.size) return false;
   return Buffer.from(await Bun.file(a).arrayBuffer()).equals(Buffer.from(await Bun.file(b).arrayBuffer()));
+}
+
+/** Byte-identical files must also agree on mtime, or rsync's size+mtime quick
+ * check re-stages them every run. Only the mtime moves, never the contents. */
+async function convergeMtime(source: string, destination: string): Promise<void> {
+  const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
+  if (sourceStat.mtimeMs > destinationStat.mtimeMs) await utimes(destination, destinationStat.atime, sourceStat.mtime);
 }
 
 const OPEN_SNAPSHOT_TTL_MS = 5000;
@@ -338,19 +345,16 @@ export async function mergeIncomingProfileTree(
 
     if (source.endsWith(".jsonl")) {
       // Even append-only writes must not interleave with a native tool's own
-      // partial record. If ownership cannot be proved absent, retain the
-      // incoming bytes and let the post-exit reconciliation retry them.
-      if ((await hasOpenOwner(destination, ownerPass)) !== false) {
-        await preserveFile(source, conflictRoot, "incoming", rel);
-        result.preservedConflicts++;
-        continue;
-      }
+      // partial record. If ownership cannot be proved absent, skip: the bytes
+      // stay on the sending host and are re-staged by the next reconciliation.
+      if ((await hasOpenOwner(destination, ownerPass)) !== false) continue;
       const sourceText = await Bun.file(source).text();
       if (sourceText.length > 0 && !sourceText.endsWith("\n")) {
         await preserveFile(source, conflictRoot, "incoming", rel);
         result.preservedConflicts++;
       }
       if (await mergeJsonlFiles([source], destination, false)) result.mergedJsonlFiles++;
+      if ((await exists(destination)) && (await filesEqual(source, destination))) await convergeMtime(source, destination);
       continue;
     }
 
@@ -360,7 +364,10 @@ export async function mergeIncomingProfileTree(
       result.copiedFiles++;
       continue;
     }
-    if (await filesEqual(source, destination)) continue;
+    if (await filesEqual(source, destination)) {
+      await convergeMtime(source, destination);
+      continue;
+    }
 
     const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
     if (sourceStat.mtimeMs > destinationStat.mtimeMs) {
