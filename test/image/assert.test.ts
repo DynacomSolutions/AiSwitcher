@@ -21,6 +21,9 @@ describe("assert-disk.sh", () => {
   test("fails without samples", () => {
     expect(run("assert-disk.sh", "")).toBe(2);
   });
+  test("fails with a single sample (no final sample)", () => {
+    expect(run("assert-disk.sh", "1 100 1000\n")).toBe(2);
+  });
 });
 
 describe("assert-eltorito.sh", () => {
@@ -34,6 +37,12 @@ describe("assert-eltorito.sh", () => {
   });
   test("fails without an EFI record", () => {
     expect(run("assert-eltorito.sh", bios)).not.toBe(0);
+  });
+  test("fails on an EFI platform id without an -e entry", () => {
+    expect(run("assert-eltorito.sh", bios + "-eltorito-alt-boot\n-eltorito-platform efi\n")).not.toBe(0);
+  });
+  test("fails on an empty -e entry", () => {
+    expect(run("assert-eltorito.sh", bios + "-e ''\n")).not.toBe(0);
   });
 });
 
