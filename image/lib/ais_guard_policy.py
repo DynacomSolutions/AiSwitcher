@@ -205,6 +205,16 @@ def _short(a, letters):
     return any(x.startswith('-') and not x.startswith('--') and any(ch in letters for ch in x[1:]) for x in a)
 
 
+def _long(a, names):
+    """True when any --option, or any prefix of one (getopt_long abbreviation), names a refused option."""
+    for x in a:
+        if x.startswith('--') and len(x) > 2:
+            key = x.split('=', 1)[0]
+            if any(n.startswith(key) for n in names):
+                return True
+    return False
+
+
 def unsafe_options(name, args):
     """Reject root-execution options that write files or expose an escape hatch."""
     if not isinstance(args, (list, tuple)) or any(not isinstance(x, str) for x in args):
@@ -212,44 +222,39 @@ def unsafe_options(name, args):
     a = list(args)
     if any('\x00' in x for x in a):
         return True
+    longs = {'--config', '--configdir', '--program', '--alert'} | _FILE_OUTPUT_OPTIONS
+    shorts = ''
+    if name == 'mdadm':
+        shorts += 'cp'
     if name in {'fdisk', 'gdisk', 'gdisk64', 'cgdisk', 'cgdisk64', 'parted', 'sfdisk'}:
-        if _short(a, 'c') or any(x == '!' or x == '--command' or x.startswith('--command=') for x in a):
+        shorts += 'c'
+        longs |= {'--command'}
+        if '!' in a:
             return True
-    # Options that make a root tool execute a program or load attacker-chosen configuration.
-    if any(x.split('=', 1)[0] in {'--config', '--configdir', '--program', '--alert'} for x in a):
-        return True
-    if name == 'mdadm' and _short(a, 'c'):
-        return True
-    if name == 'dmsetup' and any(x == '--exec' or x.startswith('--exec=') for x in a):
-        return True
+    if name == 'dmsetup':
+        longs |= {'--exec'}
     if name == 'cryptsetup':
-        blocked = {'--header', '--key-file', '--keyfile', '--new-keyfile',
-                   '--master-key-file', '--dump-volume-key', '--volume-key-file',
-                   '--header-backup-file', 'luksHeaderBackup'}
-        if _short(a, 'd') or any(x in blocked or any(x.startswith(option + '=') for option in blocked if option.startswith('--')) for x in a):
-            return True
-        if len(a) >= 2 and a[0] == 'luksHeaderBackup':
+        shorts += 'd'
+        longs |= {'--header', '--key-file', '--keyfile', '--new-keyfile', '--master-key-file',
+                  '--dump-volume-key', '--volume-key-file', '--header-backup-file'}
+        if a and a[0] == 'luksHeaderBackup':
             return True
     if name == 'mkfs' or name.startswith('mkfs.') or name == 'mke2fs':
-        if _short(a, 'Ed'):
-            return True
-    if any(x in _FILE_OUTPUT_OPTIONS or any(x.startswith(option + '=') for option in _FILE_OUTPUT_OPTIONS) for x in a):
-        return True
-    if name == 'sgdisk' or name == 'sgdisk64':
-        if _short(a, 'b') or any(x == '--backup' or x.startswith('--backup=') for x in a):
-            return True
-    if name == 'sfdisk' and (_short(a, 'O') or any(x in {'--backup', '--backup-file'} or x.startswith('--backup-file=') for x in a)):
-        return True
-    if name == 'e2fsck' and (_short(a, 'Ez') or any(
-                                x in {'--output', '--output-log', '--log-file', '--logfile'} or
-                                x.startswith(('--output=', '--output-log=', '--log-file=', '--logfile='))
-                                for x in a)):
-        return True
-    if name == 'badblocks' and (_short(a, 'o') or any(x == '--output' or x.startswith('--output=') for x in a)):
-        return True
-    if name == 'hdparm' and any(x in {'--Istdin'} or x.startswith('--Istdin=') for x in a):
-        return True
-    return False
+        shorts += 'Ed'
+    if name in {'sgdisk', 'sgdisk64'}:
+        shorts += 'b'
+        longs |= {'--backup'}
+    if name == 'sfdisk':
+        shorts += 'O'
+        longs |= {'--backup', '--backup-file'}
+    if name == 'e2fsck':
+        shorts += 'Ez'
+        longs |= {'--output', '--output-log', '--log-file', '--logfile'}
+    if name == 'badblocks':
+        shorts += 'o'
+    if name == 'hdparm':
+        longs |= {'--Istdin'}
+    return (bool(shorts) and _short(a, shorts)) or _long(a, longs) or 'luksHeaderBackup' in a and name == 'cryptsetup'
 
 
 def pacman_args(args):
