@@ -91,7 +91,7 @@ describe("retire / unretire through the registry API", () => {
   });
 
   test("routes require the CSRF header and 404 an unknown tool", async () => {
-    const app = createApp({ token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1" });
+    const app = createApp({ token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.() });
     const headers = { Host: "127.0.0.1:47129" };
     const noCsrf = await app.request("/api/identities/claude/testa/retire", { method: "POST", headers });
     expect(noCsrf.status).toBe(403);

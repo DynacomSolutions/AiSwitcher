@@ -1,14 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { Hono } from "hono";
-import { allowedHost, consoleGuard } from "../../src/server/guard.ts";
+import { allowedHost, consoleGuard, parseProcNetTcp, type GuardDeps } from "../../src/server/guard.ts";
 
-function appWith(token: string, port: number, peerAddress?: string): Hono {
+const ME = process.getuid?.() ?? 0;
+
+function appWith(token: string, port: number, peerAddress?: string, peerUid: GuardDeps["peerUid"] = () => ME): Hono {
   const app = new Hono();
   app.onError((err, c) => {
     const status = (err as { status?: number }).status ?? 500;
     return c.json({ error: err.message }, status as 500);
   });
-  app.use("/api/*", (c, next) => consoleGuard({ token, port, ...(peerAddress ? { peerAddress } : {}) }, c, next));
+  app.use("/api/*", (c, next) => consoleGuard({ token, port, peerUid, peerPort: 50000, ...(peerAddress ? { peerAddress } : {}) }, c, next));
   app.get("/api/ping", (c) => c.json({ ok: true }));
   app.post("/api/ping", (c) => c.json({ ok: true }));
   return app;
@@ -59,6 +61,34 @@ describe("consoleGuard", () => {
     expect(res.status).toBe(200);
   });
 
+  test("rejects a loopback peer running as another uid", async () => {
+    const res = await appWith(TOKEN, 47129, "127.0.0.1", () => ME + 1).request("/api/ping", {
+      headers: { Host: "127.0.0.1:47129" },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("accepts another-uid loopback peer with a valid bearer", async () => {
+    const res = await appWith(TOKEN, 47129, "127.0.0.1", () => ME + 1).request("/api/ping", {
+      headers: { Host: "127.0.0.1:47129", Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("fails closed when the lookup throws or finds nothing", async () => {
+    for (const fn of [
+      () => {
+        throw new Error("EACCES");
+      },
+      () => undefined,
+    ]) {
+      const res = await appWith(TOKEN, 47129, "127.0.0.1", fn).request("/api/ping", {
+        headers: { Host: "127.0.0.1:47129" },
+      });
+      expect(res.status).toBe(401);
+    }
+  });
+
   test("rejects a mutating request without the X-AIS-Console header", async () => {
     const res = await appWith(TOKEN, 47129, "127.0.0.1").request("/api/ping", {
       method: "POST",
@@ -73,6 +103,24 @@ describe("consoleGuard", () => {
       headers: { Host: "127.0.0.1:47129", "X-AIS-Console": "1" },
     });
     expect(res.status).toBe(200);
+  });
+});
+
+describe("parseProcNetTcp", () => {
+  const HEAD = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+  test("parses IPv4 rows", () => {
+    const row = "   0: 0100007F:C350 0100007F:B731 01 00000000:00000000 00:00000000 00000000  1234        0 99 1 0 100 0 0 10 0\n";
+    expect(parseProcNetTcp(HEAD + row)).toEqual([{ localAddress: "127.0.0.1", localPort: 50000, remotePort: 46897, uid: 1234 }]);
+  });
+
+  test("parses IPv6 and IPv4-mapped rows", () => {
+    const rows =
+      "   0: 00000000000000000000000001000000:C350 00000000000000000000000001000000:B731 01 0:0 00:0 0  1000 0 1 1 0\n" +
+      "   1: 0000000000000000FFFF00000100007F:C351 0000000000000000FFFF00000100007F:B731 01 0:0 00:0 0  1001 0 1 1 0\n";
+    expect(parseProcNetTcp(HEAD + rows)).toEqual([
+      { localAddress: "::1", localPort: 50000, remotePort: 46897, uid: 1000 },
+      { localAddress: "127.0.0.1", localPort: 50001, remotePort: 46897, uid: 1001 },
+    ]);
   });
 });
 

@@ -136,7 +136,7 @@ Sync, data and upgrades:
 
 Console, reporting and credentials:
 - The console is a thin HTTP surface over the existing engines. Loopback bind only,
-  loopback Host check, bearer token or loopback peer, `X-AIS-Console: 1` on every
+  loopback Host check, bearer token or same-uid loopback peer (Linux), `X-AIS-Console: 1` on every
   mutating method, secrets write-only, file editing confined to whitelisted roots (dual lexical+realpath containment
   checks and pre-edit backups).
   `parseArgs` reads only `--flag=value`.

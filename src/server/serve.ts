@@ -153,6 +153,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
       // from token-carrying remote ones when a non-loopback bind is used.
       const ip = bunServer.requestIP(req);
       (req as unknown as { __remoteAddress?: string }).__remoteAddress = ip?.address;
+      (req as unknown as { __remotePort?: number }).__remotePort = ip?.port;
       return app.fetch(req);
     },
   });
