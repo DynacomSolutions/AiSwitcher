@@ -1,0 +1,30 @@
+[Unit]
+Description=Write the final AIS outbox before exchange unmount
+Requires=mnt-aisx.mount
+After=mnt-aisx.mount
+Before=shutdown.target umount.target
+Conflicts=shutdown.target
+DefaultDependencies=no
+ConditionPathIsMountPoint=/mnt/persist
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+RuntimeDirectory=ais-live-exchange
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/true
+ExecStop=/usr/local/lib/ais-live/ais-outbox write-outbox
+TimeoutStopSec=3min
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/mnt/aisx /run/ais-live-exchange
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
