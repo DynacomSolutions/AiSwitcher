@@ -24,26 +24,28 @@ export function allowedHost(
   extraHosts?: ReadonlySet<string>,
 ): boolean {
   if (!hostHeader) return false;
-  const bare = hostHeader.toLowerCase().split(":")[0];
+  const m = /^(?:\[([^\]]+)\]|([^:[\]]+))(?::(\d+))?$/.exec(hostHeader.toLowerCase());
+  if (!m) return false;
+  const bare = m[1] ?? m[2];
   if (bare !== "127.0.0.1" && bare !== "localhost" && bare !== "::1" && !extraHosts?.has(bare)) return false;
   // If a port is present it must be ours; a bare host with no port is fine.
-  if (hostHeader.includes(":") && !hostHeader.endsWith(`:${port}`)) {
-    // IPv6 literal [::1]:port form.
-    if (!hostHeader.startsWith("[") || !hostHeader.endsWith(`:${port}]`)) return false;
-  }
-  return true;
+  return m[3] === undefined || m[3] === String(port);
 }
 
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
-  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+  return address.startsWith("127.") ||
+    address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
 export interface ProcNetRow {
   localAddress: string;
   localPort: number;
+  remoteAddress: string;
   remotePort: number;
+  state: string;
   uid: number;
+  inode: number;
 }
 
 /** Decode one /proc/net/tcp{,6} address (little-endian 32-bit words) to the
@@ -65,28 +67,44 @@ export function parseProcNetTcp(text: string): ProcNetRow[] {
     const f = line.trim().split(/\s+/);
     if (f.length < 8) continue;
     const [la, lp] = f[1].split(":");
-    const rp = f[2].split(":")[1];
-    if (!la || !lp || !rp) continue;
+    const [ra, rp] = f[2].split(":");
+    if (!la || !lp || !ra || !rp) continue;
     rows.push({
       localAddress: decodeProcAddress(la),
       localPort: Number.parseInt(lp, 16),
+      remoteAddress: decodeProcAddress(ra),
       remotePort: Number.parseInt(rp, 16),
+      state: f[3],
       uid: Number.parseInt(f[7], 10),
+      inode: Number.parseInt(f[9] ?? "0", 10),
     });
   }
   return rows;
 }
 
-/** uid owning the peer's end of a loopback connection to `serverPort`, or
- * undefined when not found. Throws when /proc is unreadable. */
-export function linuxPeerUid(address: string, peerPort: number, serverPort: number): number | undefined {
+/** uid owning the peer's end of a loopback connection, or undefined unless
+ * exactly one ESTABLISHED, owned row matches the full 4-tuple (peer
+ * address:port -> server address:port). `serverAddress` undefined (wildcard
+ * bind) accepts any loopback destination. Throws when /proc is unreadable. */
+export function linuxPeerUid(
+  address: string,
+  peerPort: number,
+  serverPort: number,
+  serverAddress?: string,
+  files: readonly string[] = ["/proc/net/tcp", "/proc/net/tcp6"],
+): number | undefined {
   const want = address.replace(/^::ffff:/i, "");
-  for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+  const dest = serverAddress?.replace(/^::ffff:/i, "");
+  const hits: ProcNetRow[] = [];
+  for (const file of files) {
     for (const r of parseProcNetTcp(readFileSync(file, "utf8"))) {
-      if (r.localAddress === want && r.localPort === peerPort && r.remotePort === serverPort) return r.uid;
+      if (r.state !== "01" || r.inode === 0) continue;
+      if (r.localAddress !== want || r.localPort !== peerPort || r.remotePort !== serverPort) continue;
+      if (dest ? r.remoteAddress !== dest : !isLoopbackAddress(r.remoteAddress)) continue;
+      hits.push(r);
     }
   }
-  return undefined;
+  return hits.length === 1 ? hits[0].uid : undefined;
 }
 
 export interface GuardDeps {
@@ -104,7 +122,9 @@ export interface GuardDeps {
   peerPort?: number;
   /** Peer socket owner lookup (tests inject; default reads /proc on Linux).
    * May throw or return undefined: both mean "not trusted". */
-  peerUid?: (address: string, peerPort: number, serverPort: number) => number | undefined;
+  peerUid?: (address: string, peerPort: number, serverPort: number, serverAddress?: string) => number | undefined;
+  /** Address the server is bound to (undefined or wildcard: any loopback). */
+  serverAddress?: string;
 }
 
 function sameUserLoopback(deps: GuardDeps, address: string | undefined, peerPort: unknown): boolean {
@@ -114,7 +134,7 @@ function sameUserLoopback(deps: GuardDeps, address: string | undefined, peerPort
   if (!lookup) return true;
   if (typeof peerPort !== "number" || typeof address !== "string") return false;
   try {
-    const uid = lookup(address, peerPort, deps.port);
+    const uid = lookup(address, peerPort, deps.port, deps.serverAddress);
     return uid !== undefined && uid === process.getuid?.();
   } catch {
     return false;

@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { Hono } from "hono";
-import { allowedHost, consoleGuard, parseProcNetTcp, type GuardDeps } from "../../src/server/guard.ts";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { allowedHost, consoleGuard, linuxPeerUid, parseProcNetTcp, type GuardDeps } from "../../src/server/guard.ts";
 
 const ME = process.getuid?.() ?? 0;
 
@@ -110,7 +113,7 @@ describe("parseProcNetTcp", () => {
   const HEAD = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
   test("parses IPv4 rows", () => {
     const row = "   0: 0100007F:C350 0100007F:B731 01 00000000:00000000 00:00000000 00000000  1234        0 99 1 0 100 0 0 10 0\n";
-    expect(parseProcNetTcp(HEAD + row)).toEqual([{ localAddress: "127.0.0.1", localPort: 50000, remotePort: 46897, uid: 1234 }]);
+    expect(parseProcNetTcp(HEAD + row)).toEqual([{ localAddress: "127.0.0.1", localPort: 50000, remoteAddress: "127.0.0.1", remotePort: 46897, state: "01", uid: 1234, inode: 99 }]);
   });
 
   test("parses IPv6 and IPv4-mapped rows", () => {
@@ -118,9 +121,48 @@ describe("parseProcNetTcp", () => {
       "   0: 00000000000000000000000001000000:C350 00000000000000000000000001000000:B731 01 0:0 00:0 0  1000 0 1 1 0\n" +
       "   1: 0000000000000000FFFF00000100007F:C351 0000000000000000FFFF00000100007F:B731 01 0:0 00:0 0  1001 0 1 1 0\n";
     expect(parseProcNetTcp(HEAD + rows)).toEqual([
-      { localAddress: "::1", localPort: 50000, remotePort: 46897, uid: 1000 },
-      { localAddress: "127.0.0.1", localPort: 50001, remotePort: 46897, uid: 1001 },
+      { localAddress: "::1", localPort: 50000, remoteAddress: "::1", remotePort: 46897, state: "01", uid: 1000, inode: 1 },
+      { localAddress: "127.0.0.1", localPort: 50001, remoteAddress: "127.0.0.1", remotePort: 46897, state: "01", uid: 1001, inode: 1 },
     ]);
+  });
+});
+
+describe("linuxPeerUid 4-tuple matching", () => {
+  const HEAD = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+  const row = (lp: string, ra: string, rp: string, st: string, uid: number, inode: number) =>
+    `   0: 0100007F:${lp} ${ra}:${rp} ${st} 00000000:00000000 00:00000000 00000000  ${uid}        0 ${inode} 1 0\n`;
+  function lookup(rows: string, serverAddress?: string): number | undefined {
+    const dir = mkdtempSync(join(tmpdir(), "ais-proc-"));
+    const f = join(dir, "tcp");
+    writeFileSync(f, HEAD + rows);
+    return linuxPeerUid("127.0.0.1", 0xc350, 0xb731, serverAddress, [f]);
+  }
+  test("single established owned row matches", () => {
+    expect(lookup(row("C350", "0100007F", "B731", "01", 1000, 5))).toBe(1000);
+  });
+  test("ownerless TIME_WAIT uid 0 row is rejected", () => {
+    expect(lookup(row("C350", "0100007F", "B731", "06", 0, 0))).toBeUndefined();
+    expect(lookup(row("C350", "0100007F", "B731", "01", 0, 0))).toBeUndefined();
+  });
+  test("ambiguous matches are untrusted", () => {
+    const r = row("C350", "0100007F", "B731", "01", 1000, 5);
+    expect(lookup(r + r)).toBeUndefined();
+  });
+  test("wrong destination address is untrusted", () => {
+    const r = row("C350", "0100007F", "B731", "01", 1000, 5);
+    expect(lookup(r, "127.0.0.2")).toBeUndefined();
+    expect(lookup(r, "127.0.0.1")).toBe(1000);
+    expect(lookup(row("C350", "0100A8C0", "B731", "01", 1000, 5))).toBeUndefined();
+  });
+});
+
+describe("allowedHost bracketed IPv6", () => {
+  test("parses [::1] with and without port", () => {
+    expect(allowedHost("[::1]:47129", 47129)).toBe(true);
+    expect(allowedHost("[::1]", 47129)).toBe(true);
+    expect(allowedHost("[::1]:9999", 47129)).toBe(false);
+    expect(allowedHost("[::2]:47129", 47129)).toBe(false);
+    expect(allowedHost("127.0.0.1:47129x", 47129)).toBe(false);
   });
 });
 
