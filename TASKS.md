@@ -67,10 +67,10 @@ ETA: 2026-10-26 18:00 ICT
 ETA: 2026-11-16 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 57 | A1 Cached connectivity check and offline provider warning (`ais launch`, aistui, shim warn-not-block) | todo | | | | | |
-| 58 | A2 Local model discovery and start (`ais local list\|start`) | todo | | | | | |
-| 59 | A3 `ais launch`: pick tool, then identity or pool, then exec via shim | todo | | | 1.56 | | |
-| 60 | A4 Local Models in console API, web console page and aistui tab | todo | | | 2.58 | | |
+| 57 | A1 Cached connectivity check and offline provider warning (`ais launch`, aistui, shim warn-not-block) | done | | | | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
+| 58 | A2 Local model discovery and start (`ais local list\|start`) | done | | | | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
+| 59 | A3 `ais launch`: pick tool, then identity or pool, then exec via shim | done | | | 1.56 | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
+| 60 | A4 Local Models in console API, web console page and aistui tab | done | | | 2.58 | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
 | 61 | B1 Arch live image build (archiso, x86_64 UEFI + BIOS, CI release assets with checksums) | todo | | | | | |
 | 62 | B2 Immutable base + LUKS2 btrfs persist, pacman overlay, snapshots, boot menu | todo | | | 2.61 | | |
 | 63 | B3 Boot flow: unlock, herdr autologin, internet check with network prompt and optional local model, then `ais launch` | todo | | | 2.57, 2.58, 2.59, 2.62 | | |
