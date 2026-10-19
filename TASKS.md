@@ -61,24 +61,24 @@ ETA: 2026-10-26 18:00 ICT
 | 53 | `ais limits` prints "ais sync: reconciling with configured SSH remotes in the background (run \"ais sync now\" to wait for it directly)." on every run; silence it for read-only commands | done | codex:limits-sync-notice | limits-sync-notice | | | PR #179 merged; CI green. Reporting commands keep the detached reconcile and no longer print the notice; `test/cli/dispatch-sync-notice.test.ts` 5/5. |
 | 54 | `codex` launcher lacks the pool / identity picker that `claude` shows; every provider with a pool must offer the same choice | done | codex:codex-pool-picker | codex-pool-picker | | 2026-10-16 15:30 ICT | PR #180: picker and `--pool` gated on the pool adapter registry instead of claude only; pi pool launches use the pool config dir. Typecheck green; 69 focused tests pass. |
 | 55 | Cross-provider launches of the same pool (including mixed identities) are blocked; launching one pool across providers must be allowed | done | codex:cross-provider-pool-launch | cross-provider-pool-launch | | 2026-10-16 16:30 ICT | `.ais` hook `cross-agent-require-id` fixed and merged (`.ais` PR #75): only same-tool nested launches are checked. AiSwitcher side (`resolveParentLaunchContext`, tool marker) under risky-diff review before PR. |
-| 56 | Tidy CLI help: help at every level (`ais help`, `ais <group> help`, `--help`, `ais help <group>`), much shorter text | in_progress | claude-20261019-cli-help | cli-help-levels |  | 2026-10-23 18:00 ICT |  |
+| 56 | Tidy CLI help: help at every level (`ais help`, `ais <group> help`, `--help`, `ais help <group>`), much shorter text | in_progress | claude-20261019-cli-help | cli-help-levels | | 2026-10-23 18:00 ICT | |
 
 ## 2. Live USB
 ETA: 2026-11-16 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 57 | A1 Cached connectivity check and offline provider warning (`ais launch`, aistui, shim warn-not-block) | todo |  |  |  |  |  |
-| 58 | A2 Local model discovery and start (`ais local list|start`) | todo |  |  |  |  |  |
-| 59 | A3 `ais launch`: pick tool, then identity or pool, then exec via shim | todo |  |  | 1.56 |  |  |
-| 60 | A4 Local Models in console API, web console page and aistui tab | todo |  |  | 2.58 |  |  |
-| 61 | B1 Arch live image build (archiso, x86_64 UEFI + BIOS, CI release assets with checksums) | todo |  |  |  |  |  |
-| 62 | B2 Immutable base + LUKS2 btrfs persist, pacman overlay, snapshots, boot menu | todo |  |  | 2.61 |  |  |
-| 63 | B3 Boot flow: unlock, herdr autologin, internet check with network prompt and optional local model, then `ais launch` | todo |  |  | 2.57, 2.58, 2.59, 2.62 |  |  |
-| 64 | B4 Live agent context: pacman allowed, AUR helper with per-install approval, enforced confirmation guard for destructive disk commands | todo |  |  | 2.57, 2.62 |  |  |
-| 65 | B5 Encrypted exFAT exchange partition (age bundles inbox/outbox) and drive-side `ais sync` peer | todo |  |  | 2.62 |  |  |
-| 66 | C1 Host app (Tauri, glass style): create drive, write image, first inbox bundle, optional local model download | todo |  |  | 2.61, 2.65 |  |  |
-| 67 | C2 Host app: refresh, pull logs, remove instance (each step optional), reset storage, key escrow in OS keychain with retention | todo |  |  | 2.65 |  |  |
-| 68 | C3 Host app: update image keeping persisted packages | todo |  |  | 2.61, 2.62, 2.66 |  |  |
-| 69 | C4 Host app release: macOS signed and notarised; Windows signing deferred; Linux AppImage | todo |  |  | 2.66, 2.67, 2.68 |  |  |
-| 70 | Later: aarch64 (UEFI ARM) | todo |  |  | 2.61 |  |  |
-| 71 | Later: Secure Boot support (v1 requires it disabled) | todo |  |  | 2.61, 2.62 |  |  |
+| 57 | A1 Cached connectivity check and offline provider warning (`ais launch`, aistui, shim warn-not-block) | todo | | | | | |
+| 58 | A2 Local model discovery and start (`ais local list\|start`) | todo | | | | | |
+| 59 | A3 `ais launch`: pick tool, then identity or pool, then exec via shim | todo | | | 1.56 | | |
+| 60 | A4 Local Models in console API, web console page and aistui tab | todo | | | 2.58 | | |
+| 61 | B1 Arch live image build (archiso, x86_64 UEFI + BIOS, CI release assets with checksums) | todo | | | | | |
+| 62 | B2 Immutable base + LUKS2 btrfs persist, pacman overlay, snapshots, boot menu | todo | | | 2.61 | | |
+| 63 | B3 Boot flow: unlock, herdr autologin, internet check with network prompt and optional local model, then `ais launch` | todo | | | 2.57, 2.58, 2.59, 2.62 | | |
+| 64 | B4 Live agent context: pacman allowed, AUR helper with per-install approval, enforced confirmation guard for destructive disk commands | todo | | | 2.57, 2.62 | | |
+| 65 | B5 Encrypted exFAT exchange partition (age bundles inbox/outbox) and drive-side `ais sync` peer | todo | | | 2.62 | | |
+| 66 | C1 Host app (Tauri, glass style): create drive, write image, first inbox bundle, optional local model download | todo | | | 2.61, 2.65 | | |
+| 67 | C2 Host app: refresh, pull logs, remove instance (each step optional), reset storage, key escrow in OS keychain with retention | todo | | | 2.65 | | |
+| 68 | C3 Host app: update image keeping persisted packages | todo | | | 2.61, 2.62, 2.66 | | |
+| 69 | C4 Host app release: macOS signed and notarised; Windows signing deferred; Linux AppImage | todo | | | 2.66, 2.67, 2.68 | | |
+| 70 | Later: aarch64 (UEFI ARM) | todo | | | 2.61 | | |
+| 71 | Later: Secure Boot support (v1 requires it disabled) | todo | | | 2.61, 2.62 | | |
