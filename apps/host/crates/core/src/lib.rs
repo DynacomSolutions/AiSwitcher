@@ -1,6 +1,7 @@
 pub mod bundle;
 pub mod contract;
 pub mod device;
+pub mod fetch;
 #[cfg(feature = "file-test")]
 pub mod file_test;
 pub mod layout;
