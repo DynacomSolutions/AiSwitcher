@@ -1,10 +1,26 @@
+mod escrow_commands;
+
 use std::time::Instant;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(ConfirmationSession::default())
         .setup(|app| {
+            let data = app
+                .path()
+                .app_data_dir()
+                .map_err(|_| "missing application data directory")?
+                .join("escrow");
+            std::fs::create_dir_all(&data)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+            // Without a private registry the create flow refuses to write.
+            if let Ok(state) = escrow_commands::EscrowCommandState::new(data) {
+                let _ = state.purge();
+                app.manage(state);
+            }
             let config = app
                 .config()
                 .app
@@ -23,6 +39,9 @@ pub fn run() {
             confirm_write,
             start_write,
             list_models,
+            escrow_commands::escrow_drive_records,
+            escrow_commands::escrow_purge,
+            escrow_commands::escrow_delete,
             set_create_options,
             invalidate_confirmation,
             disk_write_support,
@@ -425,8 +444,23 @@ impl ConfirmationSession {
             .create
             .take()
             .ok_or("Choose the drive options first.")?;
-        sink.hand_over(&create.passphrase, &current.plan.device().os_identity)
+        sink.hand_over(&create.passphrase, &drive_handle(current.plan.device()))
     }
+}
+
+/// A registry-safe handle for the physical drive: a digest of its identity
+/// fields, so it never exposes a serial or device node.
+fn drive_handle(device: &ais_host_core::device::DeviceObservation) -> String {
+    let mut bytes = Vec::new();
+    for part in [
+        device.os_identity.as_bytes(),
+        device.connection_identity.as_bytes(),
+        device.serial.as_deref().unwrap_or("").as_bytes(),
+    ] {
+        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(part);
+    }
+    ais_host_core::release::hex(&ais_host_core::release::sha256(&bytes))[..32].to_owned()
 }
 
 /// The helper re-derives the plan from its own verified image and native
@@ -568,6 +602,7 @@ const RELEASE_LISTING: &str =
 fn start_write(
     preview_id: String,
     state: tauri::State<'_, ConfirmationSession>,
+    escrow: tauri::State<'_, escrow_commands::EscrowCommandState>,
 ) -> Result<(), String> {
     state.begin_write(
         &preview_id,
@@ -575,7 +610,7 @@ fn start_write(
         &native_write_support(),
         &observe_native,
         &NativeHelper,
-        &ais_host_core::create::SessionOnly,
+        &escrow.sink(),
     )
 }
 
