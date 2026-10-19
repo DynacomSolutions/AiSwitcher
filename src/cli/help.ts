@@ -1,226 +1,202 @@
 import { bold, cyan, dim } from "./colors.ts";
+import { CliUsageError } from "./errors.ts";
 
-const COMMANDS: Array<[string, string]> = [
-  ["version", "Print the installed ais version"],
-  ["update", "Re-download the latest claude/codex/grok/kimi/zai/ali/pi/opencode/open/ais binaries"],
-  ["upgrade", "Install or upgrade every real CLI required by the installed AIS shims, in parallel with a live status list"],
-  ["sync list|add|remove|now|dedupe|recover", "Merge/recover profiles over SSH or locally"],
-  ["identities [list] [--tool=claude|codex|grok|kimi|zai|ali|pi|opencode]", "List identities (default; omit --tool to show all); claude pools are listed apart, with every member"],
-  ["identities show <name> [--tool=]", "Show one identity's full detail"],
-  ["identities create --tool=<t> [--name=] ...", "Create an identity (prompts for anything omitted)"],
-  ["identities update <name> --tool=<t> ...", "Update label/description/configDir"],
-  ["identities delete <name> --tool=<t> --yes", "Remove from the registry (configDir is left on disk)"],
-  ["identities retire <name> [--tool=] [--yes]", "Retire: never launched or selected; deletes stored credentials, keeps usage history"],
-  ["identities unretire <name> [--tool=]", "Restore a retired identity (sign in again; credentials are not restored)"],
-  ["identities add-directory <name> <pattern> --tool=<t>", ""],
-  ["identities remove-directory <name> <pattern> --tool=<t>", ""],
-  ["identities add-alias <name> <alias> --tool=<t>", ""],
-  ["identities remove-alias <name> <alias> --tool=<t>", ""],
-  ["identities chrome-overrides list [--tool=]", ""],
-  ["identities chrome-overrides add --tool=<t> --directories=a,b --target-identity=<name> [--label=]", ""],
-  ["identities chrome-overrides remove --tool=<t> <index>", ""],
-  ["usage [--identity=] [--tool=] [--json]", "Provider-grouped token usage & cost from every client, including Pi"],
-  ["usage breakdown [identity] [--tool=] [--days=30] [--json]", "Per-tool-call breakdown: built-ins, MCP servers, edits; what used the most"],
-  ["usage [--identity=] [--tool=] <tokscale args>", "Full tokscale (tui/graph/monthly/pricing/...), scoped"],
-  ["limits [identity] [--tool=] [--json|--watch|--cached|--compact]", "Live 5h/weekly/monthly rate-limit usage per identity (--compact: one line each)"],
-  ["auth login|enable <identity> --tool=ali", "SSH-only interactive auth browser and 10-minute cookie renewal"],
-  ["auth refresh <identity> [--tool=ali|codex|claude|grok|kimi]", "Renew credentials without re-login: ali cookies, or the OAuth grant (written through to every store)"],
-  ["auth import <pi-id> --tool=pi --claude=<id> ...", "Merge provider credentials into one Pi identity"],
-  ["swap <claude|codex|kimi|pi> [status|to|next|allow|disallow|auto|usage|pool create]", "Swap pool for a tool (same subcommands as claude-swap); codex: ChatGPT logins only, running sessions must relaunch; kimi and pi: OAuth logins, running sessions follow the swap"],
-  ["claude-swap [status] [pool] [--json]", "Alias of \"swap claude\". Claude swap pool: members, active marker, 5h/weekly use, allowed flag"],
-  ["claude-swap to <account> | next [--if-limited] [--pool=]", "Swap the pool's Claude login to a member (manual), or to the one with most headroom"],
-  ["claude-swap pool create <name> --accounts=a,b[,c] [--config-dir=]", "Create a pool identity sharing one Claude folder across accounts"],
-  ["claude-swap allow|disallow <account> | auto on|off [--threshold=95] | usage", "Edit allowed accounts, automatic limit swap, per-member usage split"],
-  ["statusline [--wrap <command>]", "Claude Code statusLine.command: runs <command> (same stdin), then prints cached usage bars; offline, always exits 0"],
-  ["memory [show|path|init|edit|add] [--stdin]", "Machine-local memory shared by every AIS agent and identity"],
-  ["doctor [--identity=] [--tool=] [--json]", "Live responsiveness probe per identity — catches a hung/stuck identity"],
-  ["resume [session-id] [--identity=] [--tool=] [--json]", "Interactive tree picker (or direct launch) for resumable sessions"],
-  ["web [start|stop|status|open] [--port=] [--foreground]", "Local web console (identities, limits, usage, sessions, auth, files)"],
-  ["tui", "Terminal dashboard (ratatui) against the same local console API"],
-  ["herdr [--remote=<ssh-target>] [--remote-ais] [--raw] [--panel-width=N]", "native wrapper: the real herdr client embedded beside the ais usage/limits overview (no tmux)"],
-  ["launch", "Pick a tool, then an identity or pool, and start it"],
-  ["local [list|start [name]] [--json]", "Local models: list the on-device model, or start it"],
-  ["help", "Show this message"],
-];
-
-const NOTES = `--tool is required for "create"; every other name-targeted "identities"
-mutation auto-resolves --tool when the name exists in only one of the
-claude/codex/grok/kimi/zai/ali/pi/opencode registries, and requires --tool when it exists in more than
-one (or none). "list"/"show"/"chrome-overrides list" default to showing all
-registries when --tool is omitted.
-
-"identities retire" marks an identity retired and irreversibly deletes its
-stored credentials (confirms, or pass --yes; required when not interactive).
-Session logs and usage history are kept and still appear in usage reports.
-"unretire" restores selection but not credentials. Retirement syncs between
-hosts: the newest retire/unretire event wins.
-
-"auth import <pi-id> --tool=pi" accepts any of --claude=<id>, --codex=<id>,
---grok=<id>, --kimi=<id>, --zai=<id>, --ali=<id>, and bare --opencode-go.
-The OpenCode Go flag reads OPENCODE_API_KEY or securely prompts for it; the key
-is never accepted in argv. It merges those credentials into Pi's auth.json
-without printing secret values. Alibaba's
-configured Crush model catalogue is translated into Pi's models.json, so no
-third-party Pi extension is required.
-
-"sync add <ssh-host>" stores one or more SSH-config aliases in
-~/.ais/config/sync-v2.json. After every top-level wrapped-tool launch, a
-detached worker pulls, merges, and pushes profile/session files with
-stable-session-ID deduplication without delaying the real agent;
-changes made during a live session are debounced and reconciled again, with a
-detached final pull/merge/push after exit. Authentication is always non-interactive
-(BatchMode=yes), so an unavailable or unauthorised host warns and never
-blocks the real AI CLI. "sync now" runs the same exchange explicitly;
---pull-only and --push-only narrow its direction. Deletes are not propagated,
-copied usage is counted once, and divergent session events are unioned.
-"sync dedupe [--dry-run]" enforces or previews the same invariant locally.
-"sync recover [--dry-run]" additively restores histories retained by older
-AIS conflict/dedupe archives without deleting those recovery copies.
-
-"identities create --tool=zai|ali [--api-key=]" (and "update ... --api-key="
-to rotate it later) writes the key straight into that identity's own Crush
-config (crush.json): neither zai nor ali has an interactive login of its
-own to fall back on the way claude/codex/grok/kimi do, so without a key an
-identity is created but unusable until one is supplied, either now or later
-via update. Omitting --api-key at creation time just prompts for it instead
-(blank is fine, set it up manually later).
-
-"usage" reads each matched identity's local history (tokscale for Claude,
-Codex, Grok, and Kimi; native Crush/Pi records for the others), then merges
-the same provider+identity across clients. The table and --json output name
-providers, not wrapper tools. Omit both flags to report every identity;
---tool remains a collection-source filter. --identity matching more than one
-registry shows every match and merges compatible provider rows, not an error.
-Pi CLI/party adapters are attributed to their upstream providers and are not
-counted again when their native Claude/Codex history is also collected.
-
-"usage <tokscale args>" (e.g. "usage tui") instead execs the real tokscale
-directly with those args (tui, graph, monthly, hourly, pricing, report,
-wrapped, the social commands — anything tokscale supports), with full
-terminal passthrough so the interactive TUI works. A literal "--" before the
-args is optional, only needed if the first arg would otherwise look like one
-of --identity=/--tool=/--json. --identity scopes it to exactly one identity
-(pass --tool= too if that name exists in more than one registry); omit
---identity to merge every configured identity into one process instead of
-tokscale's own empty-by-default scan roots — right for both "show me
-everything" (tui, etc.) and identity-agnostic commands like "pricing".
-
-"resume" scans every configured identity's claude/codex/grok/kimi/zai/ali session
-data directly (no subprocess, no live API) for sessions whose OWN recorded working
-directory matches where you ran "ais resume" from — not a substring/prefix
-match, and not any single tool's own notion of "current directory" (grok's
-own --continue/sessions list silently collapse to the enclosing git root;
-this does not). Run from a real terminal with no session id, it shows the
-same tool/identity tree "limits" does as an interactive picker (arrow keys
-navigate between sessions only, Enter resumes the highlighted one, Ctrl+C
-cancels); piped/redirected, or with nothing to resume, it prints that same
-tree once instead. An exact session id skips the picker and resumes that
-session directly, and is stable across runs. --identity/--tool narrow which
-registries are scanned, same as "usage".
-
-"limits" is a different data source than "usage" — tokscale counts historical
-tokens from local logs; "limits" shows each provider's live server-side quota
-(the same 5h/weekly window "/usage" shows interactively in Claude/Grok, or
-Codex's statusline). claude, codex, kimi, and zai are all fetched live (a
-real, cheap, read-only call per identity — zai's hits Z.ai's own quota API
-with the key from that identity's crush.json); grok has no on-demand API at
-all, so it's a best-effort read of the last observed usage from its own
-local activity log — always flagged as "as of <time> ago", never presented
-as live. Alibaba's Token plan has no API-key quota endpoint, so ali reads the
-same live windows through its OneConsole gateway with the valid console Cookie
-header stored in that identity's console-cookie.txt. "identity" is a
-positional (e.g. "ais limits identity-a"), not
---identity=. --cached skips every live call (claude/codex/kimi/zai report
-"not available" without one; grok is unaffected since it never makes a live
-call anyway). --watch redraws in place on an interval (--interval=<seconds>,
-default 30) instead of printing once; degrades to a single plain run if
-stdout isn't a TTY.
-
-"doctor" is a health check, not a usage/billing report: it sends one real,
-minimal turn per identity (claude/grok: a plain -p prompt, with claude's MCP
-servers disabled via --strict-mcp-config so a slow/misconfigured MCP server
-can't produce a false positive; codex: reuses "limits"'s existing app-server
-handshake) and reports whether the real binary answered within a hard
-timeout (20s for claude/grok, ~9s for codex). "hung" means the process
-itself never responded — not a rate-limit or billing condition, and not
-something "limits" or "usage" can tell you, since both only report data a
-live process actually returned. Confirmed real-world cause of at least one
-incident: too many orphaned/still-running concurrent agent sessions under
-one identity made every subsequent prompt on that identity hang indefinitely
-while auth stayed valid and fast throughout — closing those agents fixed it
-immediately. --identity/--tool narrow which identities are probed, same as
-"usage"/"limits".
-
-"swap <tool>" runs the same pool commands for codex ("ais swap codex pool create
-<name> --accounts=a,b" needs ChatGPT-login members; "hook" is Claude-only). A
-swapped Codex login only reaches new launches: running codex sessions keep the
-old account until relaunched or "codex resume"; "to"/"next" print how many.
-kimi and pi pools need OAuth-login members whose token names an account (Pi:
-a kimi-coding login); their running sessions re-read the credentials on the next
-request, and "usage" (per-member token split) is claude/codex only.
-"ais claude-swap ..." is the same as "ais swap claude ...".
-
-"claude-swap" is for claude swap POOLS only: a pool is a normal claude identity
-(own configDir with the shared settings, history, skills and plugins) whose
-OAuth login is swapped between member identities by copying the member's
-.credentials.json and oauthAccount into it, under Claude Code's own lock
-dirs. Nothing happens to identities that are not pools. A running Claude
-session uses the new account from its next message. "auto on" lets the
-console daemon (AIS_CLAUDE_SWAP=0 opts out) swap when the active account
-reaches --threshold (default 95%) on the 5h or weekly window; "next
---if-limited" does the same check once and is suitable for a Claude Code
-StopFailure hook. Only accounts marked allowed are used by "next"/auto.
-
-"herdr" opens herdr with an ais overview beside it, with no tmux anywhere:
-"aistui herdr" (a single native binary) embeds the REAL herdr client in a
-PTY on the left and renders the compact, width-responsive overview panel
-natively on the right (every identity's estimated cost, session/week limit
-bars, next reset, spend-guard breaches), with a one-line status bar along
-the bottom showing focus, herdr's state and the remote label. herdr is
-never bundled, vendored, or installed by ais: the wrapper only locates the
-installed binary (PATH, ~/.local/bin/herdr, or AIS_HERDR_BIN) and runs it,
-so herdr updates stay independent; "ais upgrade" additionally runs
-"herdr update" when herdr is already installed. Input model: the herdr side
-owns the keyboard by default (everything, q included, goes to herdr); Tab
-moves focus to the panel (j/k or arrows scroll, r refreshes, q quits the
-wrapper); Ctrl+C always reaches herdr, and pressing it twice within a
-second force-quits the wrapper. When herdr exits, its last frame stays
-visible and r restarts it / q quits. Quitting kills only the herdr CLIENT,
-which is safe: sessions live server-side. The panel highlights the
-identities whose herdr panes are open (the focused pane's identity most
-strongly) via the daemon's /api/herdr-bridge. Flags: --remote=<ssh-target>
-points herdr at a remote machine's herdr server; the panel then shows LOCAL
-data with highlighting honestly disabled unless --remote-ais also mirrors
-the remote machine's own console over an ssh -L tunnel (no reachable remote
-console degrades to local data with a note, never a fabricated remote
-view). --panel-width=N (default 42) sizes the panel (it yields before
-herdr gets squeezed, and disappears on very narrow terminals), --raw execs
-plain herdr with no wrapper, and --force overrides the nesting guard
-(refusing to run inside an existing herdr pane by default; running inside
-tmux is fine and needs no flag). The old tmux flags (--new, --panel-cmd,
---tmux-socket) are gone with the tmux architecture.`;
-
-// Column width is computed only from commands that actually carry a
-// description — the long, description-less chrome-overrides commands would
-// otherwise blow the aligned column out to their length instead.
-function formatCommands(): string {
-  const withDesc = COMMANDS.filter(([, desc]) => desc);
-  const width = Math.max(...withDesc.map(([cmd]) => cmd.length));
-  return COMMANDS.map(([cmd, desc]) =>
-    desc ? `  ${cyan(cmd.padEnd(width))}  ${dim(desc)}` : `  ${cyan(cmd)}`,
-  ).join("\n");
+/** One help node: a command group, or a subcommand of one. Single source for
+ * `ais help`, `ais <group> help|--help|-h`, `ais help <group>` and
+ * `ais <group> <sub> --help`. Keep it terse; long prose belongs in docs/. */
+interface HelpNode {
+  usage: string;
+  desc: string;
+  flags?: Array<[string, string]>;
+  examples?: string[];
+  subs?: Record<string, HelpNode>;
 }
 
-export function runHelp(): void {
-  console.log(`${bold("ais")} — manage AiProfileSwitcher identities and installed binaries
+const TOOL = "--tool=<tool>";
+const sub = (usage: string, desc: string): HelpNode => ({ usage, desc });
 
-${bold("Usage:")}
-  ais <command> [subcommand] [args] [flags]
+export const HELP: Record<string, HelpNode> = {
+  version: { usage: "ais version", desc: "Print the installed version" },
+  update: { usage: "ais update", desc: "Re-download the latest ais and wrapper binaries" },
+  upgrade: { usage: "ais upgrade", desc: "Install or upgrade every real CLI the shims need" },
+  identities: {
+    usage: "ais identities [subcommand] [flags]",
+    desc: "Manage identities",
+    flags: [[TOOL, "claude|codex|grok|kimi|zai|ali|pi|opencode; optional when the name is unique"]],
+    examples: ["ais identities list --tool=claude", "ais identities create --tool=codex --name=work"],
+    subs: {
+      list: sub(`ais identities [list] [${TOOL}]`, "List identities (default)"),
+      show: sub(`ais identities show <name> [${TOOL}]`, "Show one identity in full"),
+      create: sub(`ais identities create ${TOOL} [--name=] [--api-key=]`, "Create one (prompts for anything omitted)"),
+      update: sub(`ais identities update <name> ${TOOL} [--label=] [--api-key=]`, "Change label, description, configDir or key"),
+      delete: sub(`ais identities delete <name> ${TOOL} --yes`, "Remove from the registry; configDir stays on disk"),
+      retire: sub(`ais identities retire <name> [${TOOL}] [--yes]`, "Retire: never selected again, credentials deleted"),
+      unretire: sub(`ais identities unretire <name> [${TOOL}]`, "Restore a retired identity (sign in again)"),
+      "add-directory": sub(`ais identities add-directory <name> <pattern> ${TOOL}`, "Select this identity in a directory"),
+      "remove-directory": sub(`ais identities remove-directory <name> <pattern> ${TOOL}`, "Drop a directory pattern"),
+      "add-alias": sub(`ais identities add-alias <name> <alias> ${TOOL}`, "Add an alias"),
+      "remove-alias": sub(`ais identities remove-alias <name> <alias> ${TOOL}`, "Remove an alias"),
+      "chrome-overrides": sub(
+        `ais identities chrome-overrides list|add|remove [${TOOL}] [--directories=a,b] [--target-identity=<name>] [<index>]`,
+        "Per-directory Chrome identity overrides",
+      ),
+    },
+  },
+  usage: {
+    usage: "ais usage [breakdown] [--identity=] [--tool=] [--json]",
+    desc: "Token usage and cost, grouped by provider",
+    flags: [
+      ["--days=30", "breakdown window"],
+      ["<tokscale args>", "anything else runs tokscale, e.g. `ais usage tui`"],
+    ],
+    examples: ["ais usage --json", "ais usage breakdown --days=7"],
+    subs: { breakdown: sub("ais usage breakdown [identity] [--tool=] [--days=30] [--json]", "Per-tool-call breakdown") },
+  },
+  limits: {
+    usage: "ais limits [identity] [--tool=] [--json|--watch|--cached|--compact]",
+    desc: "Live 5h, weekly and monthly rate-limit use",
+    flags: [
+      ["--watch", "redraw every --interval=30 seconds"],
+      ["--cached", "no live calls"],
+      ["--compact", "one line each"],
+    ],
+    examples: ["ais limits --compact", "ais limits work --tool=claude --watch"],
+  },
+  auth: {
+    usage: "ais auth <login|enable|refresh|import> [identity] [flags]",
+    desc: "Credentials: login, renewal, import",
+    examples: ["ais auth refresh work --tool=claude"],
+    subs: {
+      login: sub("ais auth login <identity> --tool=ali", "Interactive SSH auth browser"),
+      enable: sub("ais auth enable <identity> --tool=ali", "Renew the ali cookie every 10 minutes"),
+      refresh: sub("ais auth refresh <identity> --tool=ali|codex|claude|grok|kimi", "Renew credentials without re-login"),
+      import: sub("ais auth import <pi-id> --tool=pi --claude=<id> [--codex= --grok= --kimi= --zai= --ali= --opencode-go]", "Merge provider credentials into a Pi identity"),
+    },
+  },
+  swap: {
+    usage: "ais swap <claude|codex|kimi|pi> [subcommand]",
+    desc: "Swap pools: switch a login between member accounts",
+    examples: ["ais swap claude status", "ais swap claude next --if-limited"],
+    subs: {
+      status: sub("ais swap <tool> [status] [pool] [--json]", "Members, active marker, usage, allowed flag"),
+      to: sub("ais swap <tool> to <account> [--pool=]", "Swap to a member"),
+      next: sub("ais swap <tool> next [--if-limited] [--pool=]", "Swap to the member with most headroom"),
+      "allow|disallow": sub("ais swap <tool> allow|disallow <account>", "Edit the allowed accounts"),
+      auto: sub("ais swap <tool> auto on|off [--threshold=95]", "Automatic swap near the limit"),
+      pool: sub("ais swap <tool> pool create <name> --accounts=a,b [--config-dir=]", "Create a pool identity"),
+      usage: sub("ais swap <tool> usage", "Per-member usage split (claude, codex)"),
+    },
+  },
+  "claude-swap": { usage: "ais claude-swap [subcommand]", desc: 'Alias of "ais swap claude"; see "ais swap help"' },
+  sync: {
+    usage: "ais sync <subcommand>",
+    desc: "Merge and recover profiles over SSH or locally",
+    examples: ["ais sync add my-host", "ais sync now --pull-only"],
+    subs: {
+      list: sub("ais sync list", "List sync hosts"),
+      add: sub("ais sync add <ssh-host>", "Add an SSH-config alias"),
+      remove: sub("ais sync remove <ssh-host>", "Remove a host"),
+      now: sub("ais sync now [--pull-only|--push-only]", "Exchange now"),
+      dedupe: sub("ais sync dedupe [--dry-run]", "Enforce or preview session deduplication"),
+      recover: sub("ais sync recover [--dry-run]", "Restore histories kept by older conflict archives"),
+    },
+  },
+  statusline: { usage: "ais statusline [--wrap <command>]", desc: "Claude Code statusLine: run <command>, then print cached usage bars" },
+  memory: {
+    usage: "ais memory [show|path|init|edit|add] [--stdin]",
+    desc: "Machine-local memory shared by every agent",
+    subs: {
+      show: sub("ais memory [show]", "Print the memory"),
+      path: sub("ais memory path", "Print the file path"),
+      init: sub("ais memory init", "Create the file"),
+      edit: sub("ais memory edit", "Open in $VISUAL or $EDITOR"),
+      add: sub("ais memory add <text...> | --stdin", "Append an entry"),
+    },
+  },
+  doctor: { usage: "ais doctor [--identity=] [--tool=] [--json]", desc: "Probe each identity for a hung or stuck session" },
+  resume: { usage: "ais resume [session-id] [--identity=] [--tool=] [--json]", desc: "Pick or resume a session started in this directory" },
+  web: {
+    usage: "ais web [start|stop|status|open] [--port=] [--foreground]",
+    desc: "Local web console",
+    subs: {
+      start: sub("ais web start [--port=] [--foreground]", "Start the console"),
+      stop: sub("ais web stop", "Stop it"),
+      status: sub("ais web status", "Show state"),
+      open: sub("ais web open", "Open it in a browser"),
+    },
+  },
+  tui: { usage: "ais tui", desc: "Terminal dashboard on the local console API" },
+  launch: { usage: "ais launch", desc: "Pick a tool, then an identity or pool, and start it" },
+  local: {
+    usage: "ais local [list|start [name]] [--json]",
+    desc: "Local models: list them, or start one",
+    subs: {
+      list: sub("ais local [list] [--json]", "List local models and the runner (default)"),
+      start: sub("ais local start [name]", "Start a model (the only one when name is omitted)"),
+    },
+  },
+  herdr: { usage: "ais herdr [--remote=<ssh-target>] [--remote-ais] [--raw] [--panel-width=42]", desc: "herdr beside an ais overview panel" },
+  help: { usage: "ais help [command [subcommand]]", desc: "Show help; also `ais <command> help` or `--help`" },
+};
 
-${bold("Commands:")}
-${formatCommands()}
-
-${bold("Notes:")}
-${NOTES}
-`);
+function table(rows: Array<[string, string]>): string {
+  const width = Math.max(...rows.map(([k]) => k.length));
+  return rows.map(([k, d]) => `  ${cyan(k.padEnd(width))}  ${dim(d)}`).join("\n");
 }
+
+/** Closest valid names first (prefix or substring), else all of them. */
+function nearest(word: string, candidates: string[]): string {
+  const hits = candidates.filter((c) => c.startsWith(word.slice(0, 2)) || c.includes(word) || word.includes(c));
+  return (hits.length ? hits : candidates).join(", ");
+}
+
+/** Resolve a help path (group, then optional subcommand) or throw a one-line error. */
+function resolve(path: string[]): { node: HelpNode; title: string } {
+  const [group, subName] = path;
+  const node = group === undefined ? undefined : HELP[group];
+  if (group === undefined || !node) {
+    throw new CliUsageError(`Unknown command "${group}". Did you mean: ${nearest(group ?? "", Object.keys(HELP))}`);
+  }
+  if (subName === undefined) return { node, title: group };
+  const leaf = node.subs && Object.hasOwn(node.subs, subName) ? node.subs[subName] : undefined;
+  if (!leaf) {
+    throw new CliUsageError(`Unknown ${group} subcommand "${subName}". Valid: ${nearest(subName, Object.keys(node.subs ?? {}))}`);
+  }
+  return { node: leaf, title: `${group} ${subName}` };
+}
+
+export function helpText(path: string[] = []): string {
+  if (path.length === 0) {
+    return [
+      `${bold("ais")}: manage identities and AI CLI binaries`,
+      "",
+      bold("Usage:") + "  ais <command> [subcommand] [flags]",
+      "        ais help <command>   (or: ais <command> help)",
+      "",
+      bold("Commands:"),
+      table(Object.entries(HELP).map(([k, n]): [string, string] => [k, n.desc])),
+    ].join("\n");
+  }
+  const { node } = resolve(path);
+  const out = [`${bold("Usage:")} ${node.usage}`, node.desc];
+  if (node.subs) out.push("", bold("Subcommands:"), table(Object.entries(node.subs).map(([k, n]): [string, string] => [k, n.desc])));
+  if (node.flags) out.push("", bold("Flags:"), table(node.flags));
+  if (node.examples) out.push("", bold("Examples:"), ...node.examples.map((e) => `  ${e}`));
+  return out.join("\n");
+}
+
+/** Help path requested by argv, or undefined when argv is a normal command.
+ * Handles: no args, `help [path]`, `-h`/`--help` anywhere before `--`, and
+ * `<group> help`. */
+export function helpRequest(argv: string[]): string[] | undefined {
+  const end = argv.indexOf("--");
+  const head = end === -1 ? argv : argv.slice(0, end);
+  const words = head.filter((a) => !a.startsWith("-"));
+  if (argv.length === 0) return [];
+  if (words[0] === "help") return words.slice(1);
+  if (head.includes("-h") || head.includes("--help")) return words;
+  if (words[0] && words[0] in HELP && words[1] === "help") return [words[0]];
+  return undefined;
+}
+
+export const validCommands = (): string => Object.keys(HELP).join(", ");

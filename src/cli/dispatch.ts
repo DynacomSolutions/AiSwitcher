@@ -2,7 +2,7 @@ import { boolFlag, parseArgs } from "./args.ts";
 import { bold } from "./colors.ts";
 import { runDoctorCommand } from "./doctor/dispatch.ts";
 import { CliUsageError } from "./errors.ts";
-import { runHelp } from "./help.ts";
+import { helpRequest, helpText, validCommands } from "./help.ts";
 import { runIdentitiesCommand } from "./identities/dispatch.ts";
 import { runLimitsCommand } from "./limits/dispatch.ts";
 import { runResumeCommand } from "./resume/dispatch.ts";
@@ -37,6 +37,10 @@ export async function runCli(argv: string[]): Promise<void> {
   const [command, ...rest] = positionals;
 
   try {
+    // `ais version`/`-v` wins; every other help form shares one text source.
+    const helpPath = command === "version" || command === "-v" ? undefined : helpRequest(argv);
+    if (helpPath) return void console.log(helpText(helpPath));
+
     // Self-healing, idempotent, and must run before anything below reads a
     // path that now defaults under ~/.ais (sync config/cache, the managed
     // npm prefix) — see migrate-ais-home.ts. Never throws.
@@ -44,9 +48,6 @@ export async function runCli(argv: string[]): Promise<void> {
 
     if (command === "version" || command === "-v" || boolFlag(flags, "version")) {
       return runVersion();
-    }
-    if (command === undefined || command === "help" || command === "-h" || boolFlag(flags, "help")) {
-      return runHelp();
     }
 
     // Resume launches must never wait for SSH, and neither may any other
@@ -143,7 +144,7 @@ export async function runCli(argv: string[]): Promise<void> {
         await runLocalCommand(rest, flags);
         break;
       default:
-        throw new CliUsageError(`Unknown command "${command}". Run "ais help" for usage.`);
+        throw new CliUsageError(`Unknown command "${command}". Valid: ${validCommands()}`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
