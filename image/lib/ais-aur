@@ -1,0 +1,217 @@
+#!/usr/bin/python3
+"""Build AUR packages as agent, then request typed approval for each archive."""
+import os
+import json
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+
+
+PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+-]*$")
+DEPENDENCY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+-]*")
+PARU = "/usr/bin/paru"
+MAKEPKG = "/usr/bin/makepkg"
+PACMAN = "/usr/bin/pacman"
+PACMAN_WRAPPER = "/usr/local/lib/ais-live/ais-pacman"
+GUARD = "/usr/local/lib/ais-live/ais-guard"
+
+
+def valid_package_name(value):
+    return isinstance(value, str) and PACKAGE_NAME.fullmatch(value) is not None
+
+
+def parse_args(args):
+    """Accept package install requests; --noconfirm never skips approval."""
+    args = [arg for arg in args if arg != "--noconfirm"]
+    if len(args) < 2 or args[0] not in ("-S", "--sync"):
+        return None
+    packages = args[1:]
+    if any(not valid_package_name(package) for package in packages):
+        return None
+    if len(set(packages)) != len(packages):
+        return None
+    return packages
+
+
+def run(argv, **kwargs):
+    return subprocess.run(argv, check=False, **kwargs)
+
+
+def dependency_name(value):
+    match = DEPENDENCY_NAME.match(value)
+    return match.group(0) if match else None
+
+
+def srcinfo_metadata(source, requested):
+    result = run(
+        [MAKEPKG, "--printsrcinfo"],
+        cwd=source,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    dependencies = set()
+    package_names = set()
+    sources = set()
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        field = key.split("_", 1)[0]
+        if field in {"depends", "makedepends", "checkdepends"}:
+            name = dependency_name(value)
+            if not name:
+                return None
+            dependencies.add((name, value))
+        elif field == "pkgname":
+            if not valid_package_name(value):
+                return None
+            package_names.add(value)
+        elif field == "source":
+            sources.add(value)
+    if not package_names or requested not in package_names:
+        return None
+    return sorted(dependencies), sorted(package_names), sorted(sources)
+
+
+def is_installed(dependency):
+    result = run([PACMAN, "-T", dependency], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
+def is_repository_package(name):
+    result = run([PACMAN, "-Si", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
+def request_archives(source, root):
+    result = run(
+        [MAKEPKG, "--packagelist"],
+        cwd=source,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if result.returncode != 0:
+        return result.returncode
+    archive_paths = result.stdout.splitlines()
+    if not archive_paths:
+        return 126
+    for path in archive_paths:
+        archive = path if os.path.isabs(path) else os.path.join(source, path)
+        if os.path.islink(archive) or not os.path.isfile(archive):
+            return 126
+        archive = os.path.realpath(archive)
+        if os.path.dirname(archive) != source:
+            return 126
+        result = run(
+            [PACMAN, "-Qp", "--", archive],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if result.returncode != 0:
+            return 126
+        metadata = result.stdout.split()
+        if len(metadata) < 2 or not valid_package_name(metadata[0]):
+            return 126
+        name = metadata[0]
+        # The daemon copies and hashes the artifact before displaying install NAME.
+        result = run([GUARD, "ais-aur", "install", name, archive], cwd=root)
+        if result.returncode != 0:
+            return result.returncode
+    return 0
+
+
+def fetch_source(package, root):
+    source = os.path.join(root, package)
+    if os.path.lexists(source):
+        return None
+    result = run([PARU, "-G", package], cwd=root)
+    if result.returncode != 0:
+        return None
+    if os.path.islink(source) or not os.path.isdir(source):
+        return None
+    source = os.path.realpath(source)
+    if os.path.dirname(source) != os.path.realpath(root):
+        return None
+    pkgbuild = os.path.join(source, "PKGBUILD")
+    if os.path.islink(pkgbuild) or not os.path.isfile(pkgbuild):
+        return None
+    return source
+
+
+def build_package(package, root, states):
+    state = states.get(package)
+    if state == "done":
+        return 0
+    if state == "building":
+        return 126
+    states[package] = "building"
+
+    source = fetch_source(package, root)
+    if source is None:
+        return 126
+    metadata = srcinfo_metadata(source, package)
+    if metadata is None:
+        return 126
+    dependencies, package_names, sources = metadata
+    print(
+        "AUR source review: " + json.dumps(
+            {"packages": package_names, "sources": sources}, ensure_ascii=True, separators=(",", ":")
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+    for name, expression in dependencies:
+        if is_installed(expression):
+            continue
+        if is_repository_package(name):
+            result = run([PACMAN_WRAPPER, "-S", name], cwd=root)
+            if result.returncode != 0 or not is_installed(expression):
+                return result.returncode or 126
+            continue
+        result = build_package(name, root, states)
+        if result != 0 or not is_installed(expression):
+            return result or 126
+
+    # The wrapper resolved dependencies first. makepkg runs untrusted build
+    # functions without syncdeps, sudo or installation privileges.
+    result = run([MAKEPKG, "--nodeps", "--noconfirm"], cwd=source)
+    if result.returncode != 0:
+        return result.returncode
+    result = request_archives(source, root)
+    if result != 0:
+        return result
+    states[package] = "done"
+    return 0
+
+
+def main(args=None):
+    try:
+        agent_uid = pwd.getpwnam("agent").pw_uid
+    except KeyError:
+        return 126
+    if os.geteuid() != agent_uid:
+        return 126
+    packages = parse_args(sys.argv[1:] if args is None else args)
+    if packages is None:
+        return 126
+    cache = os.path.join(pwd.getpwuid(agent_uid).pw_dir, ".cache", "ais", "aur")
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+    root = tempfile.mkdtemp(prefix="build-", dir=cache)
+    states = {}
+    for package in packages:
+        result = build_package(package, root, states)
+        if result != 0:
+            return result
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

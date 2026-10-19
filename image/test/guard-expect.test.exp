@@ -1,0 +1,33 @@
+#!/usr/bin/expect -f
+set guard_file [lindex $argv 0]
+source $guard_file
+set sent {}
+rename guard_qmp_key guard_qmp_key_real
+proc guard_qmp_key {socket text} {
+    lappend ::sent [string trim $text]
+}
+
+proc run_case {payload expect_success expected_keys} {
+    set ::sent {}
+    set qmp [file join $::env(AIS_GUARD_TEST_SCRATCH) qmp.sock]
+    close [open $qmp w]
+    spawn -noecho /bin/sh -c "printf '%s' '$payload'"
+    set serial $spawn_id
+    set result [catch {guard_expect_run $serial $qmp 2} message]
+    if {$expect_success && $result} { error "expected success, got: $message" }
+    if {!$expect_success && !$result} { error "expected failure, got success" }
+    if {$::sent ne $expected_keys} { error "unexpected replies: <$::sent>, expected <$expected_keys>" }
+    catch {close -i $serial}
+    catch {wait -i $serial}
+    catch {close $qmp}
+    catch {file delete $qmp}
+}
+
+set success "AIS-GUARD-TEST: case=unanswered-dd status=popup\nAIS-GUARD-TEST: case=destructive-tool status=popup\nAIS-GUARD-TEST: case=raw-read-refusal status=popup\nAIS-GUARD-TEST: case=wrong-target status=popup\nAIS-GUARD-TEST: case=right-target status=popup\nAIS-GUARD-TEST: case=symlink-swap status=popup\nAIS-GUARD-TEST: case=symlink-swap-target-flipped status=ok\nAIS-GUARD-TEST: case=aur-install status=popup\nAIS-GUARD-TEST: case=aur-install status=reply\nAIS-GUARD-TEST: case=all status=complete\n"
+run_case $success 1 [list wrong-target vdb vdb {install synthetic-fixture}]
+run_case "AIS-GUARD-TEST: case=all status=complete\n" 0 {}
+run_case "AIS-GUARD-TEST: case=unanswered-dd status=popup\n" 0 {}
+run_case "AIS-GUARD-TEST: case=symlink-swap-target-flipped status=ok\n" 0 {}
+run_case "AIS-GUARD-TEST: case=aur-install status=reply\n" 0 {}
+run_case "AIS-GUARD-TEST: case=surprise status=popup\n" 0 {}
+puts "guard Expect driver tests passed"

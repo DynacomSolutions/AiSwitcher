@@ -1,0 +1,16 @@
+[Unit]
+Description=AIS live guard daemon
+Requires=ais-guardd.socket
+After=ais-guardd.socket
+
+[Service]
+Type=simple
+User=root
+Group=live
+ExecStart=/usr/local/lib/ais-live/ais-guardd
+Restart=on-failure
+RestartSec=1s
+RuntimeDirectory=ais-guard
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX

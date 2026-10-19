@@ -1,0 +1,10 @@
+id = "ais-guard"
+name = "AIS Guard"
+version = "1.0.0"
+min_herdr_version = "0.9.3"
+
+[[panes]]
+id = "confirm"
+title = "Confirm disk operation"
+placement = "popup"
+command = ["./confirm"]
