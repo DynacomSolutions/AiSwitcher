@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(/usr/bin/id -un)" != live ]]; then
+  echo 'network setup must run as live' >&2
+  exit 126
+fi
+
+if [[ -t 0 && -t 1 ]]; then
+  exec /usr/bin/nmtui
+fi
+echo 'Network setup needs an interactive terminal.' >&2
+exit 1

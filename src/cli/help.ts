@@ -136,6 +136,13 @@ export const HELP: Record<string, HelpNode> = {
       start: sub("ais local start [name]", "Start a model (the only one when name is omitted)"),
     },
   },
+  live: {
+    usage: "ais live net-check [--json] [--fresh]",
+    desc: "Live image diagnostics",
+    subs: {
+      "net-check": sub("ais live net-check [--json] [--fresh]", "Check internet and local model readiness"),
+    },
+  },
   herdr: { usage: "ais herdr [--remote=<ssh-target>] [--remote-ais] [--raw] [--panel-width=42]", desc: "herdr beside an ais overview panel" },
   help: { usage: "ais help [command [subcommand]]", desc: "Show help; also `ais <command> help` or `--help`" },
 };

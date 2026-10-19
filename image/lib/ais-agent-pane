@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Herdr treats its configured default shell like a shell executable and may
+# append login or command flags. Never forward those arguments to sudo.
+operation=boot
+if (($# > 0)); then
+  case "$1" in
+    probe|probe-fresh|upgrade|local-start|launch|pane|test-assertions) operation=$1 ;;
+    -l|-lc|-c) operation=boot ;;
+    *) operation=boot ;;
+  esac
+fi
+
+if [[ "$operation" == boot ]]; then
+  exec /usr/local/lib/ais-live/ais-live-boot
+fi
+exec /usr/bin/sudo -n -u agent /usr/local/lib/ais-live/agent-exec "$operation"

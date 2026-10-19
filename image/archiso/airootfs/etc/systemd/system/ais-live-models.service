@@ -1,0 +1,15 @@
+[Unit]
+Description=Verify and expose exchange partition models
+DefaultDependencies=no
+Requires=ais-live-accounts.service
+After=local-fs.target ais-live-accounts.service
+Before=getty@tty1.service serial-getty@.service
+ConditionPathExists=/mnt/aisx/models/manifest.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ais-live/ais-live-models --mount
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

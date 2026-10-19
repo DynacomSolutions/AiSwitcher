@@ -13,6 +13,7 @@ import {
   resolveGrokChannelLatestVersion,
   resolvePublicNpmLatestVersion,
   runUpgradeWithDeps,
+  upgradeCommandExitCode,
   UpgradeCancelledError,
   type UpgradeDeps,
 } from "../../src/cli/upgrade.ts";
@@ -858,6 +859,18 @@ describe("parallel upgrade behaviour", () => {
 });
 
 describe("herdr row", () => {
+  test("live image skips the bundled herdr updater with a note and no spawn", async () => {
+    const { deps, hooks, events, spawns, logs } = fakeDeps({
+      herdrBinary: () => "/usr/bin/herdr",
+      liveImage: () => true,
+    });
+    const summary = await runUpgradeWithDeps(deps, [], hooks);
+    expect(summary).toEqual({ checked: 0, failed: 0, skipped: 1 });
+    expect(events).toEqual([{ type: "skip", id: "herdr", detail: "skipped (herdr is managed by the live image)" }]);
+    expect(spawns).toEqual([]);
+    expect(logs.some((line) => line.includes("herdr update skipped: herdr is managed by the live image"))).toBe(true);
+  });
+
   test("no herdr binary means no herdr events, spawns, or installs", async () => {
     const { deps, hooks, events, spawns } = fakeDeps({
       herdrBinary: () => null,
@@ -1001,5 +1014,12 @@ describe("herdr row", () => {
     expect(last?.type).toBe("skip");
     expect(last?.type === "skip" && last.detail?.startsWith("skipped (herdr is running")).toBe(true);
     expect(failures).toEqual([]);
+  });
+});
+
+describe("upgrade command exit status", () => {
+  test("reports failed vendor installs as a failing command", () => {
+    expect(upgradeCommandExitCode({ checked: 1, failed: 1, skipped: 0 })).toBe(1);
+    expect(upgradeCommandExitCode({ checked: 1, failed: 0, skipped: 1 })).toBe(0);
   });
 });

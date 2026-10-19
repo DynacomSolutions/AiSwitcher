@@ -7,6 +7,7 @@ import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps
 import { adapterFor } from "../../identities/pool/registry.ts";
 import { performPoolSwap } from "../../identities/pool/swap.ts";
 import { parseHookInput, runContinuation, type ContinueRequest } from "../../identities/claude-swap-continue.ts";
+import { isAisLive, noteLiveFeatureDisabled } from "../../shared/live-mode.ts";
 import { resolveInstalledAisBinary } from "../../sync/background.ts";
 import { resolveHerdrBinary } from "../../shared/herdr-bin.ts";
 import { installSwapHook, removeSwapHook } from "../../identities/claude-swap-hook.ts";
@@ -124,6 +125,10 @@ function defaultSpawnContinuation(req: ContinueRequest): void {
 async function scheduleHookContinuation(deps: SwapDeps, failureAtMs: number): Promise<void> {
   try {
     const env = deps.env ?? process.env;
+    if (isAisLive(env)) {
+      noteLiveFeatureDisabled("Claude swap auto-continue");
+      return;
+    }
     const paneId = env.HERDR_PANE_ID?.trim();
     if (!paneId || !resolveHerdrBinary(env)) return;
     const input = parseHookInput(await (deps.readHookStdin ?? defaultReadHookStdin)());

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { HerdrChatTool } from "./herdr-chat-source.ts";
+import { isAisLive } from "./live-mode.ts";
 
 export interface HerdrAgentSession {
   agent: string;
@@ -76,6 +77,9 @@ function parseResult<T>(stdout: string, key: string): T | undefined {
 }
 
 export async function runTitleHerdr(args: string[], timeoutMs = 900): Promise<{ ok: boolean; stdout: string }> {
+  if (isAisLive()) {
+    return { ok: false, stdout: "" };
+  }
   const bin = resolveHerdrBinary();
   if (!bin) return { ok: false, stdout: "" };
   return await new Promise((resolve) => {

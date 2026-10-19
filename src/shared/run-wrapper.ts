@@ -22,6 +22,21 @@ import type { HerdrChatTool } from "./herdr-chat-source.ts";
 import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
+import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
+
+export function herdrTitleForLaunch(
+  tool: string,
+  parentSession: boolean,
+  inheritedOwner: string | undefined,
+  liveImage: boolean,
+  note: (line: string) => void = console.error,
+): HerdrChatTool | undefined {
+  const chatTitleTools: HerdrChatTool[] = ["claude", "codex", "grok", "kimi", "zai", "ali", "opencode"];
+  const chatTitleTool = chatTitleTools.find((candidate) => candidate === tool);
+  if (liveImage && !parentSession && chatTitleTool) noteLiveFeatureDisabled("herdr tab titles", note);
+  if (parentSession || (inheritedOwner && inheritedOwner !== String(process.pid)) || liveImage) return undefined;
+  return chatTitleTool;
+}
 
 export async function runWrapper(
   cfg: ToolConfig,
@@ -145,10 +160,9 @@ export async function runWrapper(
     const launchArgs = cfg.toolName === "codex"
       ? codexSubcommandConfigArgs(memoryProjection.argv)
       : gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd());
-    const chatTitleTools: HerdrChatTool[] = ["claude", "codex", "grok", "kimi", "zai", "ali", "opencode"];
-    const chatTitleTool = chatTitleTools.find((tool): tool is HerdrChatTool => tool === cfg.toolName);
     const inheritedTitleOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
-    const wantsTitles = !parentSession && (!inheritedTitleOwner || inheritedTitleOwner === String(process.pid)) && chatTitleTool;
+    const liveImage = isAisLive();
+    const chatTitleTool = herdrTitleForLaunch(cfg.toolName, Boolean(parentSession), inheritedTitleOwner, liveImage);
     // The real tool takes over this PID (execve). A nested launch used to hand
     // its child the wrapper's PID, i.e. "someone else"; keep that meaning by
     // naming the parent, or pi's extension would see its own PID and claim the
@@ -169,7 +183,7 @@ export async function runWrapper(
         configDirValue: resolved.configDirValue,
         cwd: process.cwd(),
         syncAtLaunch: !parentSession,
-        ...(wantsTitles && chatTitleTool
+        ...(chatTitleTool
           ? { title: { tool: chatTitleTool, ...(initialPrompt !== undefined ? { initialPrompt } : {}) } }
           : {}),
       },

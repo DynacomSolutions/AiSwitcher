@@ -624,6 +624,33 @@ describe("provider registration", () => {
 });
 
 describe("Pi Herdr chat tab titles", () => {
+  test("live mode disables the standalone title extension with one note and no Herdr calls", async () => {
+    const exitCode = process.exitCode ?? 0;
+    const previousLive = process.env.AIS_LIVE;
+    const previousOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
+    const originalError = console.error;
+    const notes: string[] = [];
+    let calls = 0;
+    process.env.AIS_LIVE = "1";
+    delete process.env.AIS_HERDR_TITLE_OWNER_PID;
+    console.error = (...args: unknown[]) => { notes.push(args.map(String).join(" ")); };
+    try {
+      const h = harness({ runHerdr: async () => { calls += 1; return { ok: false, stdout: "" }; } });
+      await h.promise;
+      await h.handlers.get("session_start")?.({} as never, h.ctx);
+      await h.handlers.get("before_agent_start")?.({ prompt: "Set a synthetic session title" } as never, h.ctx);
+      expect(calls).toBe(0);
+      expect(notes).toEqual(["ais live: herdr tab titles disabled"]);
+      expect(process.exitCode ?? 0).toBe(exitCode);
+    } finally {
+      console.error = originalError;
+      if (previousLive === undefined) delete process.env.AIS_LIVE;
+      else process.env.AIS_LIVE = previousLive;
+      if (previousOwner === undefined) delete process.env.AIS_HERDR_TITLE_OWNER_PID;
+      else process.env.AIS_HERDR_TITLE_OWNER_PID = previousOwner;
+    }
+  });
+
   test("updates the exact Pi session tab from each meaningful prompt and preserves manual labels", async () => {
     const previousOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
     const previousMarker = process.env.AI_PROFILE_SWITCHER_SESSION;

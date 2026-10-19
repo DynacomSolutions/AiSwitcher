@@ -1,6 +1,7 @@
 import type { Context, Next } from "hono";
 import { readFileSync } from "node:fs";
 import { HttpError } from "./types.ts";
+import { isAisLive } from "../shared/live-mode.ts";
 
 /** Request hardening for a server that can read/write real identity state:
  * 1. Host header must be loopback-shaped OR an explicitly allowed vhost
@@ -125,6 +126,8 @@ export interface GuardDeps {
   peerUid?: (address: string, peerPort: number, serverPort: number, serverAddress?: string) => number | undefined;
   /** Address the server is bound to (undefined or wildcard: any loopback). */
   serverAddress?: string;
+  /** Test override; live images always require a bearer token. */
+  requireBearerToken?: boolean;
 }
 
 function sameUserLoopback(deps: GuardDeps, address: string | undefined, peerPort: unknown): boolean {
@@ -152,15 +155,18 @@ export async function consoleGuard(deps: GuardDeps, c: Context, next: Next): Pro
   // serve.ts stamps the Bun peer address onto the raw request before handing
   // it to Hono. When bound to 127.0.0.1 this always matches, which is the
   // intended default trust model, now narrowed to peers running as our own
-  // uid; other local accounts need the token.
+  // uid; other local accounts need the token. Live images always need it.
   const raw = c.req.raw as unknown as { __remoteAddress?: string; __remotePort?: number };
   const remoteAddress = deps.peerAddress ?? raw.__remoteAddress;
+  const requireBearerToken = isAisLive() || deps.requireBearerToken === true;
   const localOk =
     bearerOk ||
-    sameUserLoopback(deps, typeof remoteAddress === "string" ? remoteAddress : undefined, deps.peerPort ?? raw.__remotePort) ||
-    vhostOk;
+    (!requireBearerToken &&
+      (sameUserLoopback(deps, typeof remoteAddress === "string" ? remoteAddress : undefined, deps.peerPort ?? raw.__remotePort) || vhostOk));
   if (!localOk) {
-    throw new HttpError(401, "rejected: missing valid bearer token and peer is not a same-user loopback peer");
+    throw new HttpError(401, requireBearerToken
+      ? "rejected: missing valid bearer token"
+      : "rejected: missing valid bearer token and peer is not a same-user loopback peer");
   }
   if (c.req.method !== "GET" && c.req.method !== "HEAD" && c.req.header("X-AIS-Console") !== "1") {
     throw new HttpError(403, "rejected: mutating requests require the X-AIS-Console header");

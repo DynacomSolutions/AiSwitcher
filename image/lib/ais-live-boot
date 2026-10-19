@@ -1,0 +1,76 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+readonly agent_launcher=/usr/local/lib/ais-live/ais-agent-pane
+stage() { printf 'AIS-LIVE: stage=%s status=%s\n' "$1" "$2"; }
+
+if [[ "$(/usr/bin/id -un)" != live ]]; then
+  echo 'ais-live-boot must run as live' >&2
+  exit 126
+fi
+
+read -r -a kernel_args </proc/cmdline
+clean_mode=false
+test_mode=false
+boot_flow_test=false
+for kernel_arg in "${kernel_args[@]}"; do
+  case "$kernel_arg" in
+    ais.mode=clean) clean_mode=true ;;
+    ais.test=1) test_mode=true ;;
+    ais.scenario=boot-flow) boot_flow_test=true ;;
+  esac
+done
+
+# Clean mode deliberately has no persistent mount. Its account home is created
+# by ais-live-accounts on the writable live overlay. Other modes require the
+# root-only persistent mount; checking mount presence avoids reading it as live.
+if [[ "$clean_mode" == true ]]; then
+  stage persist skip
+elif /usr/bin/mountpoint -q /mnt/persist; then
+  stage persist ok
+else
+  stage persist fail
+  exit 1
+fi
+
+flow_probe() {
+  local mode=$1 output status=0
+  if [[ "$mode" == fresh ]]; then
+    output=$("$agent_launcher" probe-fresh 2>/dev/null) || status=$?
+  else
+    output=$("$agent_launcher" probe 2>/dev/null) || status=$?
+  fi
+  AIS_FLOW_ONLINE=false
+  # shellcheck disable=SC2034
+  ((status == 0)) && AIS_FLOW_ONLINE=true
+  if /usr/bin/python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.stdin.read()).get("localModel") is True else 1)' <<<"$output"; then
+    AIS_FLOW_MODEL=true
+  else
+    # shellcheck disable=SC2034
+    AIS_FLOW_MODEL=false
+  fi
+}
+ais_probe() { flow_probe "$1"; }
+ais_network_prompt() { /usr/local/lib/ais-live/ais-net-prompt; }
+ais_offer_local_model() {
+  [[ -t 0 && -t 1 ]] || return 1
+  printf 'Launch the local model for help? [y/N] '
+  local answer=''
+  IFS= read -r -t 30 answer || answer=''
+  [[ "$answer" == [yY] ]]
+}
+ais_local_start() { "$agent_launcher" local-start; }
+ais_upgrade_once() { "$agent_launcher" upgrade; }
+ais_launch() {
+  if [[ "$test_mode" == true && "$boot_flow_test" == true ]]; then
+    [[ -x /usr/local/lib/ais-live-test/boot-flow-live-checks ]] || {
+      echo 'boot-flow live assertions are missing' >&2
+      exit 1
+    }
+    /usr/local/lib/ais-live-test/boot-flow-live-checks
+  fi
+  exec "$agent_launcher" launch
+}
+# shellcheck disable=SC1091,SC2034
+source /usr/local/lib/ais-live/ais-live-flow
+ais_live_flow

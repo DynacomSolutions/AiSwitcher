@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isAisLive, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
 import { aisStateDir } from "../shared/ais-home.ts";
 
 /**
@@ -60,6 +61,8 @@ export interface ContinueDeps {
   herdr?: (args: string[]) => Promise<number>;
   stateDir?: string;
   delayMs?: number;
+  env?: NodeJS.ProcessEnv;
+  note?: (line: string) => void;
 }
 
 export interface ContinueRequest {
@@ -71,6 +74,10 @@ export interface ContinueRequest {
 
 /** Waits, re-checks the transcript, and types the prompt at most once per failure. Returns what happened. */
 export async function runContinuation(req: ContinueRequest, deps: ContinueDeps): Promise<"sent" | "already-continued" | "already-sent" | "failed"> {
+  if (isAisLive(deps.env)) {
+    noteLiveFeatureDisabled("Claude swap auto-continue", deps.note);
+    return "already-continued";
+  }
   await (deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(deps.delayMs ?? CONTINUE_DELAY_MS);
   const transcript = await (deps.readTranscript ?? ((p) => readFile(p, "utf8")))(req.transcriptPath).catch(() => undefined);
   if (transcript === undefined) return "failed";

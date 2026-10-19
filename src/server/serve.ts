@@ -13,6 +13,7 @@ import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } fr
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
 import { warmUsageCaches } from "./workers.ts";
+import { isAisLive, isLiveImageUser, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
 
 export interface ServeOptions {
   port?: number;
@@ -62,10 +63,38 @@ export function parseAllowedHosts(raw: string | undefined): ReadonlySet<string> 
   );
 }
 
+export function shouldStartHerdrBridge(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !isAisLive(env) && env.AIS_HERDR_BRIDGE !== "0";
+}
+
+export async function startHerdrBridgeIfAllowed(
+  env: NodeJS.ProcessEnv,
+  create: () => Promise<{ start: () => void }>,
+  note: (line: string) => void = console.error,
+): Promise<boolean> {
+  if (!shouldStartHerdrBridge(env)) {
+    if (isAisLive(env)) noteLiveFeatureDisabled("herdr report-metadata bridge", note);
+    return false;
+  }
+  (await create()).start();
+  return true;
+}
+
+export function assertConsoleUserAllowed(
+  env: NodeJS.ProcessEnv = process.env,
+  username?: () => string,
+  markerExists?: (path: string) => boolean,
+): void {
+  if (isLiveImageUser(env, username, markerExists)) {
+    throw new Error("the AIS console server is disabled for the live image user");
+  }
+}
+
 /** Boots the console HTTP server in THIS process. Used directly by
  * `ais web --foreground` and by the detached daemon spawned by
  * `ais web start`; tests call createApp() instead. */
 export async function startConsoleServer(options: ServeOptions = {}): Promise<{ port: number; token: string; stop: () => void }> {
+  assertConsoleUserAllowed();
   // The daemon outlives whatever directory launched it. A deleted cwd makes
   // every child spawn fail with a confusing POSIX permission/ENOENT error
   // (scan workers, sync kick-offs, fix actions), so land on $HOME up front.
@@ -102,10 +131,10 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   // categories come from the machine-local herdr-bridge.json;
   // AIS_HERDR_BRIDGE=0 opts the daemon out entirely.
   let herdrBridge: HerdrBridgeScheduler | undefined;
-  if (process.env.AIS_HERDR_BRIDGE !== "0") {
+  await startHerdrBridgeIfAllowed(process.env, async () => {
     herdrBridge = new HerdrBridgeScheduler({ config: await loadHerdrBridgeConfig() });
-    herdrBridge.start();
-  }
+    return herdrBridge;
+  });
 
   // Daemon-side swap pools: automatic limit-triggered credential swap for
   // pools with auto on, over every tool with a registered pool adapter.

@@ -222,6 +222,26 @@ test("runContinuation sends once, skips when the transcript moved on", async () 
   expect(calls).toHaveLength(2);
 });
 
+test("live mode disables continuation before delay, transcript reads, or Herdr calls", async () => {
+  const exitCode = process.exitCode ?? 0;
+  const calls: string[] = [];
+  const notes: string[] = [];
+  const result = await runContinuation(
+    { paneId: "p1", transcriptPath: "unused", sessionId: "s1", failureAtMs: T0 },
+    {
+      env: { AIS_LIVE: "1" },
+      sleep: async () => { calls.push("sleep"); },
+      readTranscript: async () => { calls.push("read"); return failure; },
+      herdr: async () => { calls.push("herdr"); return 0; },
+      note: (line) => notes.push(line),
+    },
+  );
+  expect(result).toBe("already-continued");
+  expect(calls).toEqual([]);
+  expect(notes).toEqual(["ais live: Claude swap auto-continue disabled"]);
+  expect(process.exitCode ?? 0).toBe(exitCode);
+});
+
 test("hook swap schedules the continuation only with a pane, a transcript and a session", async () => {
   await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
   const stdin = JSON.stringify({ session_id: "s1", transcript_path: "/t.jsonl" });
@@ -246,4 +266,21 @@ test("hook swap schedules the continuation only with a pane, a transcript and a 
   expect(spawned).toEqual([]);
   await runClaudeSwapCommand(["next"], again, { ...base, env: { ...env, HERDR_PANE_ID: "p9" } });
   expect(spawned).toMatchObject([{ paneId: "p9", transcriptPath: "/t.jsonl", sessionId: "s1" }]);
+
+  const liveConfigDir = join(root, "live-shared");
+  await runClaudeSwapCommand(["pool", "create", "live-shared"], { accounts: "a,b", "config-dir": liveConfigDir }, deps());
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    await runClaudeSwapCommand(["next"], { ...flags, "config-dir": liveConfigDir }, {
+      ...base,
+      env: { AIS_LIVE: "1", HERDR_PANE_ID: "p-live" },
+      readHookStdin: async () => { throw new Error("live hook must not read stdin"); },
+    });
+  } finally {
+    console.error = originalError;
+  }
+  expect(spawned).toHaveLength(1);
+  expect(errors).toEqual(["ais live: Claude swap auto-continue disabled"]);
 });

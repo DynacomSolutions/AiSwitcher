@@ -1,0 +1,36 @@
+#!/bin/bash -p
+set -euo pipefail
+
+if (($# != 1)) || [[ "$1" != --mount ]]; then
+  echo 'usage: ais-live-models --mount' >&2
+  exit 2
+fi
+if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+  echo 'model mount requires root' >&2
+  exit 126
+fi
+
+source_dir=/mnt/aisx/models
+target_dir=/opt/ais/models
+fail() { echo 'AIS-LIVE: stage=local-models status=fail' >&2; exit 1; }
+[[ -r "$source_dir/manifest.json" ]] || exit 0
+
+/usr/bin/python3 -B - "$source_dir" <<'PY' || fail
+import importlib.util
+import pwd
+import sys
+
+module_path = "/usr/local/lib/ais-live/ais_live_model_validate.py"
+spec = importlib.util.spec_from_file_location("ais_live_model_validate", module_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.validate(sys.argv[1], "/home/agent", pwd.getpwnam("agent").pw_uid, 0)
+PY
+
+/usr/bin/mkdir -p "$target_dir"
+/usr/bin/mount --bind "$source_dir" "$target_dir" || fail
+if ! /usr/bin/mount -o remount,bind,ro,nosuid,nodev,noexec "$target_dir"; then
+  /usr/bin/umount "$target_dir" || true
+  fail
+fi
+echo 'AIS-LIVE: stage=local-models status=ok'

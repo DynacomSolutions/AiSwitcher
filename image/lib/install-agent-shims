@@ -1,0 +1,28 @@
+#!/bin/bash -p
+set -euo pipefail
+
+if [[ "$(/usr/bin/id -un)" != agent ]]; then
+  echo 'install-agent-shims must run as agent' >&2
+  exit 126
+fi
+
+source_dir=/usr/lib/ais-live/shims
+target_dir=/home/agent/.local/bin
+readonly -a shims=(claude codex grok kimi zai ali pi opencode)
+
+for shim in "${shims[@]}"; do
+  source_file="$source_dir/$shim"
+  [[ -f "$source_file" && ! -L "$source_file" && -x "$source_file" ]] || {
+    echo "missing root-owned image shim: $shim" >&2
+    exit 1
+  }
+  [[ "$(/usr/bin/stat -c '%u:%a' "$source_file")" == 0:* ]] || {
+    echo "image shim is not root-owned: $shim" >&2
+    exit 1
+  }
+done
+
+/usr/bin/install -d -m 0700 "$target_dir"
+for shim in "${shims[@]}"; do
+  /usr/bin/install -m 0755 "$source_dir/$shim" "$target_dir/$shim"
+done
