@@ -23,13 +23,15 @@ Local use needs root (chroot, mounts), so the build is exercised in CI only.
 | Item | Value |
 | --- | --- |
 | Runner disk at job start (`/`) | 145 GB size, 86 GB free (`df -h`) |
-| Free before the build | 85.4 GiB (89 537 820 KiB) |
-| Peak disk growth during the build | 3.75 GiB (3 936 236 KiB), 4.4% of free |
-| Free after the build | 79.9 GiB (83 834 972 KiB) |
+| Free before the build | 85.2 GiB (89 378 688 KiB, synchronous first sample) |
+| Peak disk growth, build plus raw image assembly | 8.68 GiB (9 101 324 KiB), 10.2% of free |
+| Free after the ISO build (before assembly) | 79.8 GiB (83 675 948 KiB) |
 | `build.sh` wall time | 333 s (bootstrap 13 s, archiso install 10 s, package install and `mkarchiso` about 5 min) |
 | Whole build job | 6 min 17 s including the artifact upload |
 | ISO size | 903 163 904 bytes (862 MiB) |
 
 The runner has far more free disk than the 14 GB the plan assumed, so no
-preinstalled toolchains are removed. The peak growth would also fit in 14 GB
-with margin (about 27% of it).
+preinstalled toolchains are removed. The earlier 3.75 GiB figure came from a
+sampler that missed the peak and excluded assembly; the figure above uses
+synchronous first and last samples and covers the assembly work files. It
+would not fit in 14 GB with margin (about 62% of it).
