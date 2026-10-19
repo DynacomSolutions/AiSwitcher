@@ -21,6 +21,7 @@ pub fn run() {
             list_devices,
             preview_write,
             confirm_write,
+            start_write,
             invalidate_confirmation,
             disk_write_support,
             native_smoke_ready
@@ -137,23 +138,31 @@ struct ConfirmationReceipt {
 
 const CONFIRMATION_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
+#[allow(dead_code)] // used by native preview installation
 fn fresh_preview_id() -> Result<String, String> {
     let mut nonce = [0; 32];
     getrandom::fill(&mut nonce).map_err(|_| "Unable to create a preview identifier.")?;
     Ok(ais_host_core::release::hex(&nonce))
 }
 
+#[allow(dead_code)] // installed by native discovery, which is not wired yet
 struct PendingConfirmation {
     preview_id: String,
     plan: ais_host_core::device::WritePlan,
     image: ais_host_core::release::VerifiedImage,
+    /// The published release the verified image came from; the helper selects
+    /// and re-verifies the same assets from it.
+    release: ais_host_core::release::PublishedRelease,
     details: DeviceReviewDetails,
     ticket: Option<ais_host_core::device::ConfirmationTicket>,
+    /// Exact typed text and the moment it was accepted, for the helper request.
+    typed: Option<(String, Instant)>,
 }
 
 /// Presentation fields are collected by the native enumerator. They never
 /// provide authority to create a plan or target a device.
 #[derive(Default)]
+#[allow(dead_code)] // filled by native discovery
 struct DeviceReviewDetails {
     model: Option<String>,
     partitions: Vec<PartitionReview>,
@@ -205,18 +214,21 @@ impl ConfirmationSession {
             .issue(&pending.plan, typed_identifier, now, CONFIRMATION_TTL)
             .map_err(|error| error.to_string())?;
         pending.ticket = Some(ticket);
+        pending.typed = Some((typed_identifier.to_owned(), now));
         Ok(ConfirmationReceipt {
             expires_in_seconds: CONFIRMATION_TTL.as_secs(),
         })
     }
 
+    #[allow(dead_code)] // called by native discovery, which is not wired yet
     fn install_native_preview(
         &self,
         image: ais_host_core::release::VerifiedImage,
+        release: ais_host_core::release::PublishedRelease,
         device: ais_host_core::device::DeviceObservation,
         details: DeviceReviewDetails,
     ) -> Result<WritePreview, String> {
-        let pending = PendingConfirmation::from_native(image, device, details)?;
+        let pending = PendingConfirmation::from_native(image, release, device, details)?;
         let preview = pending.view();
         let mut state = self
             .state
@@ -227,41 +239,146 @@ impl ConfirmationSession {
         Ok(preview)
     }
 
-    fn consume(
+    /// Consume the typed-confirmation ticket against a fresh native observation
+    /// and hand one request to the privileged helper. Writes stay disabled until
+    /// the verified-image support gate reports enabled; every other path consumes
+    /// the ticket and the preview.
+    fn begin_write(
         &self,
         preview_id: &str,
-        current: &ais_host_core::device::DeviceObservation,
         now: Instant,
+        support: &ais_host_core::device::WriteSupport,
+        observe: &dyn Fn(&str) -> Result<ais_host_core::device::DeviceObservation, String>,
+        launcher: &dyn HelperLauncher,
     ) -> Result<(), String> {
+        if !support.enabled {
+            self.invalidate();
+            return Err(support.reason.to_string());
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| "Confirmation state is unavailable.")?;
         let ConfirmationState { pending, approvals } = &mut *state;
-        if pending
-            .as_ref()
-            .is_none_or(|pending| pending.preview_id != preview_id)
-        {
-            pending.take();
+        let Some(mut current) = pending
+            .take()
+            .filter(|pending| pending.preview_id == preview_id)
+        else {
             approvals.invalidate();
             return Err("The preview is unavailable or expired.".to_string());
-        }
-        let pending = pending.as_mut().expect("pending preview checked");
-        let ticket = pending
+        };
+        let ticket = current
             .ticket
             .take()
             .ok_or("Typed confirmation is required.")?;
+        let (typed, confirmed_at) = current
+            .typed
+            .take()
+            .ok_or("Typed confirmation is required.")?;
+        let observation = observe(&current.plan.device().os_identity)?;
         approvals
-            .consume(&ticket, &pending.plan, current, &pending.image, now)
-            .map_err(|error| error.to_string())
+            .consume(&ticket, &current.plan, &observation, &current.image, now)
+            .map_err(|error| error.to_string())?;
+        let remaining =
+            CONFIRMATION_TTL.saturating_sub(now.saturating_duration_since(confirmed_at));
+        launcher.launch(helper_request(&current, typed, remaining)?)
     }
+}
+
+/// The helper re-derives the plan from its own verified image and native
+/// observation, so this carries only identifiers, the digest and the deadline.
+fn helper_request(
+    pending: &PendingConfirmation,
+    typed: String,
+    remaining: std::time::Duration,
+) -> Result<ais_host_helper::protocol::Request, String> {
+    let operation = match pending.plan.operation() {
+        ais_host_core::device::WriteOperation::CreateLayout => {
+            ais_host_helper::protocol::Operation::CreateLayout
+        }
+        ais_host_core::device::WriteOperation::ReplaceBase => {
+            ais_host_helper::protocol::Operation::ReplaceBase
+        }
+        ais_host_core::device::WriteOperation::ResetPersist => {
+            ais_host_helper::protocol::Operation::ResetPersist
+        }
+    };
+    Ok(ais_host_helper::protocol::Request {
+        version: 1,
+        operation,
+        plan_digest: ais_host_core::release::hex(&pending.plan.digest()),
+        // Bound to the helper's session challenge by the launcher.
+        channel_binding: "0".repeat(64),
+        ticket: fresh_preview_id()?,
+        release: pending.release.clone(),
+        device_identity: pending.plan.device().os_identity.clone(),
+        typed_confirmation: typed,
+        confirmation_deadline_boot_ns: deadline_boot_ns(remaining)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn deadline_boot_ns(remaining: std::time::Duration) -> Result<u64, String> {
+    let now = ais_host_helper::protocol::linux_transport::boottime_ns()
+        .map_err(|_| "The boot clock is unavailable.")?;
+    let remaining = u64::try_from(remaining.as_nanos()).map_err(|_| "Invalid expiry.")?;
+    Ok(now + remaining)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn deadline_boot_ns(_remaining: std::time::Duration) -> Result<u64, String> {
+    Err("This operating system has no enabled authenticated helper.".to_string())
+}
+
+/// Starts the per-OS privileged helper for one request.
+trait HelperLauncher {
+    fn launch(&self, request: ais_host_helper::protocol::Request) -> Result<(), String>;
+}
+
+/// Fails closed until the retained image-source transport and installed helper
+/// package exist; see `write_support`.
+struct NativeHelper;
+
+impl HelperLauncher for NativeHelper {
+    fn launch(&self, _request: ais_host_helper::protocol::Request) -> Result<(), String> {
+        Err(ais_host_helper::platform::unavailable_reason().to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_native(identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::platform::collect_linux_by_identity(identity)
+        .map(|disk| disk.observation)
+        .map_err(|_| "The selected device is unavailable.".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observe_native(_identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+    Err("The selected device is unavailable.".to_string())
+}
+
+/// Takes only the preview identifier; the plan, ticket and image stay native.
+#[tauri::command]
+fn start_write(
+    preview_id: String,
+    state: tauri::State<'_, ConfirmationSession>,
+) -> Result<(), String> {
+    state.begin_write(
+        &preview_id,
+        Instant::now(),
+        &ais_host_core::device::write_support(),
+        &observe_native,
+        &NativeHelper,
+    )
 }
 
 impl PendingConfirmation {
     /// This constructor takes only native-owned values and is intentionally
     /// private to the command module. No IPC type can deserialize a plan.
+    #[allow(dead_code)] // called by native discovery, which is not wired yet
     fn from_native(
         image: ais_host_core::release::VerifiedImage,
+        release: ais_host_core::release::PublishedRelease,
         device: ais_host_core::device::DeviceObservation,
         details: DeviceReviewDetails,
     ) -> Result<Self, String> {
@@ -271,11 +388,14 @@ impl PendingConfirmation {
             preview_id: fresh_preview_id()?,
             plan,
             image,
+            release,
             details,
             ticket: None,
+            typed: None,
         })
     }
 
+    #[allow(dead_code)] // called by native discovery, which is not wired yet
     fn view(&self) -> WritePreview {
         WritePreview {
             preview_id: self.preview_id.clone(),
@@ -336,14 +456,72 @@ mod navigation_tests {
     }
 }
 
-#[cfg(all(test, feature = "file-test"))]
+#[cfg(all(test, feature = "file-test", target_os = "linux"))]
 mod confirmation_tests {
-    use super::{ConfirmationSession, DeviceReviewDetails, PendingConfirmation, fresh_preview_id};
+    use super::{
+        ConfirmationSession, DeviceReviewDetails, HelperLauncher, PendingConfirmation,
+        fresh_preview_id,
+    };
     use ais_host_core::{
         device::{DeviceObservation, WritePlan, WriteTarget},
         file_test::{FileTarget, SyntheticRelease},
     };
     use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Recorder(std::cell::RefCell<Vec<ais_host_helper::protocol::Request>>);
+
+    impl HelperLauncher for Recorder {
+        fn launch(&self, request: ais_host_helper::protocol::Request) -> Result<(), String> {
+            self.0.borrow_mut().push(request);
+            Ok(())
+        }
+    }
+
+    fn support(enabled: bool) -> ais_host_core::device::WriteSupport {
+        ais_host_core::device::WriteSupport {
+            enabled,
+            reason: "SYNTHETIC_FIXTURE disabled",
+        }
+    }
+
+    fn published_release() -> ais_host_core::release::PublishedRelease {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "tag": "live-v1.0.0", "publishedAt": 1, "draft": false, "prerelease": false,
+            "assets": [
+                { "id": 1, "name": "ais-live-x86_64-live-v1.0.0.img.zst", "size": 1, "revision": "SYNTHETIC_FIXTURE" },
+                { "id": 2, "name": "SHA256SUMS", "size": 1, "revision": "SYNTHETIC_FIXTURE" },
+                { "id": 3, "name": "SHA256SUMS.minisig", "size": 1, "revision": "SYNTHETIC_FIXTURE" }
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn launch_with(
+        session: &ConfirmationSession,
+        preview_id: &str,
+        device: &DeviceObservation,
+        now: Instant,
+        enabled: bool,
+        launcher: &Recorder,
+    ) -> Result<(), String> {
+        session.begin_write(
+            preview_id,
+            now,
+            &support(enabled),
+            &|_| Ok(device.clone()),
+            launcher,
+        )
+    }
+
+    fn consume(
+        session: &ConfirmationSession,
+        preview_id: &str,
+        device: &DeviceObservation,
+        now: Instant,
+    ) -> Result<(), String> {
+        launch_with(session, preview_id, device, now, true, &Recorder::default())
+    }
 
     fn pending_for(device: DeviceObservation, preview_id: &str) -> PendingConfirmation {
         let release = SyntheticRelease::new(vec![0x53; 512]);
@@ -353,8 +531,10 @@ mod confirmation_tests {
             preview_id: preview_id.to_string(),
             plan,
             image,
+            release: published_release(),
             details: DeviceReviewDetails::default(),
             ticket: None,
+            typed: None,
         }
     }
 
@@ -381,14 +561,22 @@ mod confirmation_tests {
             .unwrap();
         assert_eq!(receipt.expires_in_seconds, 90);
         assert!(
-            session
-                .consume(&preview_id, &device, now + Duration::from_secs(90))
-                .is_err()
+            consume(
+                &session,
+                &preview_id,
+                &device,
+                now + Duration::from_secs(90)
+            )
+            .is_err()
         );
         assert!(
-            session
-                .consume(&preview_id, &device, now + Duration::from_secs(91))
-                .is_err()
+            consume(
+                &session,
+                &preview_id,
+                &device,
+                now + Duration::from_secs(91)
+            )
+            .is_err()
         );
     }
 
@@ -399,8 +587,8 @@ mod confirmation_tests {
         session
             .confirm(&preview_id, &device.display_identifier, now)
             .unwrap();
-        session.consume(&preview_id, &device, now).unwrap();
-        assert!(session.consume(&preview_id, &device, now).is_err());
+        consume(&session, &preview_id, &device, now).unwrap();
+        assert!(consume(&session, &preview_id, &device, now).is_err());
     }
 
     #[test]
@@ -420,7 +608,7 @@ mod confirmation_tests {
                 .confirm(&preview_id, "WRONG_SYNTHETIC_FIXTURE", now)
                 .is_err()
         );
-        assert!(session.consume(&preview_id, &device, now).is_err());
+        assert!(consume(&session, &preview_id, &device, now).is_err());
     }
 
     #[test]
@@ -431,7 +619,7 @@ mod confirmation_tests {
             .confirm(&preview_id, &device.display_identifier, now)
             .unwrap();
         session.invalidate();
-        assert!(session.consume(&preview_id, &device, now).is_err());
+        assert!(consume(&session, &preview_id, &device, now).is_err());
         assert!(
             session
                 .confirm(&preview_id, &device.display_identifier, now)
@@ -467,7 +655,7 @@ mod confirmation_tests {
                 .confirm(&preview_id, &format!(" {}", device.display_identifier), now)
                 .is_err()
         );
-        assert!(session.consume(&preview_id, &device, now).is_err());
+        assert!(consume(&session, &preview_id, &device, now).is_err());
     }
 
     #[test]
@@ -479,6 +667,53 @@ mod confirmation_tests {
         session
             .confirm(&format!("{preview_id}0"), &device.display_identifier, now)
             .unwrap_err();
-        assert!(session.consume(&preview_id, &device, now).is_err());
+        assert!(consume(&session, &preview_id, &device, now).is_err());
+    }
+
+    #[test]
+    fn disabled_write_support_never_reaches_the_helper_and_drops_the_preview() {
+        let (session, device, preview_id) = session_with_fixture();
+        let now = Instant::now();
+        session
+            .confirm(&preview_id, &device.display_identifier, now)
+            .unwrap();
+        let launcher = Recorder::default();
+        let error = launch_with(&session, &preview_id, &device, now, false, &launcher).unwrap_err();
+        assert_eq!(error, "SYNTHETIC_FIXTURE disabled");
+        assert!(launcher.0.borrow().is_empty());
+        assert!(launch_with(&session, &preview_id, &device, now, true, &launcher).is_err());
+    }
+
+    #[test]
+    fn helper_request_carries_the_plan_digest_and_typed_text_once() {
+        let (session, device, preview_id) = session_with_fixture();
+        let now = Instant::now();
+        session
+            .confirm(&preview_id, &device.display_identifier, now)
+            .unwrap();
+        let launcher = Recorder::default();
+        launch_with(&session, &preview_id, &device, now, true, &launcher).unwrap();
+        let requests = launcher.0.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].device_identity, device.os_identity);
+        assert_eq!(requests[0].typed_confirmation, device.display_identifier);
+        assert_eq!(requests[0].plan_digest.len(), 64);
+        drop(requests);
+        assert!(launch_with(&session, &preview_id, &device, now, true, &launcher).is_err());
+        assert_eq!(launcher.0.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_changed_device_observation_refuses_before_the_helper() {
+        let (session, device, preview_id) = session_with_fixture();
+        let now = Instant::now();
+        session
+            .confirm(&preview_id, &device.display_identifier, now)
+            .unwrap();
+        let mut changed = device.clone();
+        changed.table_fingerprint = [0x11; 32];
+        let launcher = Recorder::default();
+        assert!(launch_with(&session, &preview_id, &changed, now, true, &launcher).is_err());
+        assert!(launcher.0.borrow().is_empty());
     }
 }

@@ -70,6 +70,12 @@ export function CreateDrive({ bridge, devices, loading, onRefresh }: { bridge: H
     }
   }
 
+  async function write() {
+    if (!preview) return;
+    try { await bridge.startWrite(preview.previewId); } catch (failure) { setError(messageOf(failure)); }
+    setConfirmedFor(null);
+  }
+
   return <article className="glass-panel">
     <h1>Create a drive</h1>
     <div className="toolbar">
@@ -105,6 +111,7 @@ export function CreateDrive({ bridge, devices, loading, onRefresh }: { bridge: H
       <label htmlFor="confirm-identifier">Type the device identifier to confirm</label>
       <input id="confirm-identifier" autoFocus autoComplete="off" spellCheck={false} value={typed} disabled={expired} onChange={(event) => { setTyped(event.target.value); setConfirmedFor(null); }} aria-invalid={error !== null} />
       <button type="button" disabled={expired || confirmedFor !== null} onClick={() => void confirm()}>Confirm create layout</button>
+      <button type="button" className="primary-button" disabled={confirmedFor === null} onClick={() => void write()}>Write to drive</button>
       {confirmedFor !== null && <p role="status">Confirmation expires in {confirmedFor} seconds</p>}
       {error && <p role="alert" className="error-panel">{error}</p>}
     </section>}

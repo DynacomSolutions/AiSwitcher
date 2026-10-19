@@ -96,7 +96,9 @@ impl DeviceObservation {
         }
         if !matches!(self.sector_bytes, 512 | 4096)
             || self.capacity_bytes == 0
-            || !self.capacity_bytes.is_multiple_of(u64::from(self.sector_bytes))
+            || !self
+                .capacity_bytes
+                .is_multiple_of(u64::from(self.sector_bytes))
         {
             return Err(DeviceError::Bounds);
         }
@@ -619,6 +621,22 @@ pub trait WriteTarget: std::io::Read + std::io::Write + std::io::Seek {
         let result = std::io::Read::read_exact(self, buffer);
         let restore = self.seek(std::io::SeekFrom::Start(position));
         result.and(restore.map(|_| ()))
+    }
+}
+
+/// Lets a caller keep the handle, for example to read a loop file back.
+impl<T: WriteTarget> WriteTarget for &mut T {
+    fn observe(&self) -> std::io::Result<DeviceObservation> {
+        (**self).observe()
+    }
+    fn lock_exclusive(&mut self) -> std::io::Result<()> {
+        (**self).lock_exclusive()
+    }
+    fn flush_durable(&mut self) -> std::io::Result<()> {
+        (**self).flush_durable()
+    }
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
+        (**self).read_at(offset, buffer)
     }
 }
 

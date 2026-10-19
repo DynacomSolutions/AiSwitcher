@@ -38,6 +38,7 @@ export const testBridge: HostBridge = {
     if (previewId !== current || typedIdentifier !== "Synthetic USB Drive") throw new Error("Type the exact displayed device identifier.");
     return { expiresInSeconds: 90 };
   },
+  async startWrite() { throw new Error("Writing is disabled in this build."); },
   async invalidateConfirmation() { current = null; },
   async listDevices() { return devices; },
   subscribeToOperations(listener: (operation: OperationView) => void) {

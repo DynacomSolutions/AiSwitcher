@@ -42,6 +42,8 @@ export interface ConfirmationReceipt { expiresInSeconds: number }
 export interface HostBridge {
   previewWrite(deviceId: string): Promise<WritePreview>;
   confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt>;
+  /** Hands the confirmed native preview to the privileged helper; native code checks every precondition. */
+  startWrite(previewId: string): Promise<void>;
   invalidateConfirmation(): Promise<void>;
   listDevices(): Promise<DeviceSummary[]>;
   subscribeToOperations(listener: (operation: OperationView) => void, onError?: (error: unknown) => void): () => void;

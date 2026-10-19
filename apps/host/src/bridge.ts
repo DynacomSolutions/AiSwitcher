@@ -19,6 +19,7 @@ export const productionBridge: HostBridge = {
   async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
     return native().invoke<ConfirmationReceipt>("confirm_write", { previewId, typedIdentifier });
   },
+  async startWrite(previewId: string) { await native().invoke<void>("start_write", { previewId }); },
   async invalidateConfirmation() { try { await native().invoke<void>("invalidate_confirmation"); } catch { /* no native session to invalidate */ } },
   async listDevices(): Promise<DeviceSummary[]> {
     if (!window.__TAURI__) throw new Error("The native host runtime is unavailable.");

@@ -87,3 +87,22 @@ guest control path, then passes the serial channel and expected case name to
 QEMU boot, RTC changes, partition staging and poweroff. QEMU scenarios remain
 pending until run against the built image. Native Windows x86_64 and macOS arm64
 execution are also pending.
+
+## Write flow and release key
+
+The create route lists only removable, non-system, writable USB drives, shows
+model, size, connection and serial, and requires the exact displayed device
+identifier (90 second expiry; refresh, a changed target or leaving the view
+invalidates the native ticket). `start_write` takes only the preview id: native
+state re-observes the device, consumes the ticket against the retained
+`WritePlan` and verified image, and builds one helper request. Production
+launching fails closed until the retained image-source transport and installed
+helper package exist, and `write_support()` stays disabled until then. The
+Linux final stage, `service::write_confirmed`, is exercised end to end against
+a regular file in `crates/helper/tests/loop_file_write.rs`; no test opens a real
+block device.
+
+The production minisign public key is `image/release-key.pub`, created by the B
+image-release task. Until it exists the bundled key is empty (placeholder), the
+image verifier fails closed, and `crates/core/build.rs` refuses a release-profile
+build unless `AIS_ALLOW_PLACEHOLDER_RELEASE_KEY` is set for development.

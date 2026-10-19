@@ -45,13 +45,10 @@ fn execute_linux(
     sources: [std::fs::File; 3],
 ) -> Result<(), &'static str> {
     use ais_host_core::{
-        device::{ConfirmationBook, WritePlan, write_image},
+        device::WritePlan,
         release::{DownloadedImage, ImageVerifier, PublishedRelease, hex, select_release},
     };
-    use std::{
-        io::{Read, Seek},
-        time::{Duration, Instant},
-    };
+    use std::io::{Read, Seek};
 
     // The bundled verifier is the production trust root. Missing release key
     // or reviewed image contract terminates before native target opening.
@@ -147,7 +144,33 @@ fn execute_linux(
     plan.revalidate(&discovered.observation, &image)
         .map_err(|_| "The native target changed during plan verification.")?;
 
-    let deadline = request.confirmation_deadline_boot_ns;
+    let target =
+        crate::platform::LinuxBlockTarget::open_authenticated(&channel, &discovered.observation)
+            .map_err(|_| "The retained native target could not be opened safely.")?;
+    write_confirmed(
+        target,
+        request.confirmation_deadline_boot_ns,
+        &mut image,
+        &plan,
+        &request.typed_confirmation,
+    )
+    .map(|_| ())
+}
+
+/// Final stage shared by the production block device and loop-file tests. The
+/// helper issues its own ticket, capped by the app's original CLOCK_BOOTTIME
+/// deadline, and then hands the already-open target to the shared writer.
+#[cfg(target_os = "linux")]
+pub fn write_confirmed<T: ais_host_core::device::WriteTarget>(
+    target: T,
+    deadline: u64,
+    image: &mut ais_host_core::release::VerifiedImage,
+    plan: &ais_host_core::device::WritePlan,
+    typed_confirmation: &str,
+) -> Result<u64, &'static str> {
+    use ais_host_core::device::{ConfirmationBook, write_image};
+    use std::time::{Duration, Instant};
+
     let now_boot = crate::protocol::linux_transport::boottime_ns()
         .map_err(|_| "The original confirmation deadline could not be checked.")?;
     let remaining = deadline
@@ -156,29 +179,22 @@ fn execute_linux(
     if remaining == 0 || remaining > 120_000_000_000 {
         return Err("The original confirmation is expired or outside its permitted lifetime.");
     }
-    let target =
-        crate::platform::LinuxBlockTarget::open_authenticated(&channel, &discovered.observation)
-            .map_err(|_| "The retained native target could not be opened safely.")?;
     let mut target = BootDeadlineTarget {
         target,
         deadline,
         first_write_pending: true,
     };
     let mut approvals = ConfirmationBook::default();
-    let ttl = Duration::from_nanos(remaining);
     let ticket = approvals
-        .issue(&plan, &request.typed_confirmation, Instant::now(), ttl)
+        .issue(
+            plan,
+            typed_confirmation,
+            Instant::now(),
+            Duration::from_nanos(remaining),
+        )
         .map_err(|_| "The exact typed confirmation did not match the native plan.")?;
-    write_image(
-        &mut target,
-        &mut image,
-        &plan,
-        &mut approvals,
-        &ticket,
-        || false,
-    )
-    .map_err(|_| "The shared writer refused the native operation.")?;
-    Ok(())
+    write_image(&mut target, image, plan, &mut approvals, &ticket, || false)
+        .map_err(|_| "The shared writer refused the native operation.")
 }
 
 #[cfg(target_os = "linux")]
