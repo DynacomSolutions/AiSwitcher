@@ -639,6 +639,11 @@ contract both frontends build against is `docs/API.md`.
 
 ## CLI (`ais`)
 
+Help works at every level and prints the same text each way: `ais help`,
+`ais help identities`, `ais identities help`, `ais identities --help`,
+`ais identities create --help`. (`ais usage --help` is tokscale's own; use
+`ais usage help`.)
+
 An eighth binary, `ais`, manages `identities.json` so you never have to
 hand-edit it:
 

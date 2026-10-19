@@ -28,6 +28,7 @@ import { boolFlag, listFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { bold, dim, green, yellow } from "../colors.ts";
 import { createIdentity } from "../identities/actions.ts";
 import { CliUsageError } from "../errors.ts";
+import { helpText } from "../help.ts";
 import { poolMemberUsageSplit } from "../claude-swap/attribution.ts";
 
 export interface SwapDeps extends PoolOpsDeps<any> {
@@ -40,15 +41,7 @@ export interface SwapDeps extends PoolOpsDeps<any> {
   env?: Record<string, string | undefined>;
 }
 
-const usageText = (cmd: string, tool: string): string => `Usage:
-  ${cmd} [status] [pool] [--json] [--no-usage]
-  ${cmd} to <account> [--pool=] [--force]
-  ${cmd} next [--pool=] [--config-dir=] [--if-limited] [--expected-active=] [--trust-limit-evidence] [--reason=manual|auto|launch]
-  ${cmd} pool create <name> --accounts=a,b[,c] [--config-dir=]
-  ${cmd} allow|disallow <account> [--pool=]
-  ${cmd} auto on|off [--pool=] [--threshold=95]${tool === "claude" ? `
-  ${cmd} hook on|off [--pool=]   (optional StopFailure rate_limit hook in the pool's settings.json)` : ""}
-  ${cmd} usage [pool] [--days=30] [--json]`;
+const usageText = (cmd: string): string => `Usage: ${cmd} <subcommand>; run "ais swap help" for the list`;
 
 function reasonFlag(flags: ParsedArgs["flags"], fallback: SwapReason): SwapReason {
   const raw = stringFlag(flags, "reason");
@@ -162,7 +155,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
   if (!adapter) throw new CliUsageError(`No swap pool support for "${tool}". Supported: claude, codex, kimi, pi.`);
   const config = adapter.config;
   const cmd = swapCommandName(tool);
-  const USAGE = usageText(cmd, tool);
+  const USAGE = usageText(cmd);
   const log = deps.log ?? ((line: string) => console.log(line));
   // Sessions that cannot follow the swap (liveSwap: false adapters) must relaunch.
   const runningWarning = (r: SwapResult): void => {
@@ -195,7 +188,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
   {
     switch (sub) {
       case "help":
-        return log(USAGE);
+        return log(helpText(["swap"]));
 
       case "status": {
         const status = await poolStatus(adapter, opsDeps, rest[0] ?? scopedPool, { usage: !boolFlag(flags, "no-usage") });
