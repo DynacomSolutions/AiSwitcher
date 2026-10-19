@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fail when the peak disk growth in a df sample file exceeds 80% of the free
+# space at the first sample. Lines: "<epoch> <used_kib> <avail_kib>".
+# Usage: assert-disk.sh <samples>
+set -euo pipefail
+file=${1:?usage: assert-disk.sh <samples>}
+awk '
+  NF == 3 { if (!n++) { used0 = $2; free0 = $3 } if ($2 > max) max = $2 }
+  END {
+    if (!n) { print "assert-disk: no samples" > "/dev/stderr"; exit 2 }
+    peak = max - used0
+    printf "assert-disk: free_at_start_kib=%d peak_growth_kib=%d (%.1f%% of free)\n", free0, peak, 100 * peak / free0
+    if (peak * 100 > 80 * free0) { print "assert-disk: peak above 80% of free disk" > "/dev/stderr"; exit 1 }
+  }' "$file"

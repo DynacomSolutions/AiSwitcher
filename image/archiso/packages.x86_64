@@ -1,0 +1,21 @@
+# Live base (archiso baseline)
+base
+linux
+linux-firmware
+mkinitcpio
+mkinitcpio-archiso
+syslinux
+# Persistence and exchange
+cryptsetup
+btrfs-progs
+exfatprogs
+dosfstools
+age
+# Network and agent runtime
+networkmanager
+sudo
+nodejs
+npm
+# ais sync needs rsync and an SSH client
+rsync
+openssh
