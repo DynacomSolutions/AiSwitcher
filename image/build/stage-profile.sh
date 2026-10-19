@@ -54,6 +54,12 @@ sde=$(date -ud "${ARCH_ARCHIVE_DATE//\//-}" +%s)
 install -d -m 0755 "$root/etc/ais"
 date -ud "@$sde" +%Y-%m-%dT%H:%M:%SZ >"$root/etc/ais/image-build-time"
 
+# mkarchiso resets file modes to 0644 unless profiledef.sh lists them, so
+# record every executable file of the overlay (staged or checked in).
+while IFS= read -r file; do
+  printf 'file_permissions+=(["/%s"]="0:0:755")\n' "${file#"$root"/}" >>"$profile/profiledef.sh"
+done < <(find "$root" -type f -perm /111 | LC_ALL=C sort)
+
 # Test packages only on request: the shipped base stays free of build tools.
 if [[ ${AIS_IMAGE_TEST_PACKAGES:-0} == 1 ]]; then
   grep -Ev '^[[:space:]]*(#|$)' "$repo/image/test/packages.test" >>"$profile/packages.x86_64"

@@ -15,8 +15,9 @@ arg=${4:-}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work=$(mktemp -d "${AIS_QEMU_WORK_ROOT:-$(dirname "$image")}/scenario-$scenario.XXXXXX")
 media=$work/media.img
-# shellcheck disable=SC2054  # QEMU option values contain commas
-extra=(-device ich9-ahci,id=ahci -drive "file=${media//,/,,},if=none,id=aismedia,format=raw" -device ide-hd,drive=aismedia,bus=ahci.0)
+# The media disk is added last (see below) so the image stays the first disk
+# for SeaBIOS and the guard scratch disks stay vdb and vdc.
+extra=()
 http_pid=
 cleanup() { if [[ -n $http_pid ]]; then kill "$http_pid" 2>/dev/null || true; wait "$http_pid" 2>/dev/null || true; fi; }
 trap cleanup EXIT
@@ -55,6 +56,10 @@ case $scenario in
     ;;
   *) die 'unknown scenario' ;;
 esac
+extra+=(-drive "file=${media//,/,,},if=virtio,format=raw")
+# Debugging aid: AIS_EXTRA_KARGS adds kernel parameters (for example journald forwarding).
+AIS_TEST_ARGS="$AIS_TEST_ARGS ${AIS_EXTRA_KARGS:-}"
+export AIS_TEST_ARGS
 export AIS_QEMU_WORK_ROOT=$work
 echo "run-scenario: work files: $work"
 "$here/run-qemu.sh" "$image" "$firmware" "${extra[@]}"

@@ -13,6 +13,7 @@ function fixture(herdr = "SYNTHETIC_FIXTURE_herdr") {
   const stage = join(root, "stage");
   mkdirSync(join(profile, "airootfs"), { recursive: true });
   writeFileSync(join(profile, "packages.x86_64"), "base\n");
+  writeFileSync(join(profile, "profiledef.sh"), "file_permissions=()\n");
   mkdirSync(join(stage, "dist"), { recursive: true });
   for (const tool of tools) {
     writeFileSync(join(stage, "dist", tool), `#!/bin/sh\necho ${tool}\n`);
@@ -44,6 +45,9 @@ describe("stage-profile.sh", () => {
       expect(readFileSync(join(air, "usr/local/bin/herdr"), "utf8")).toBe("SYNTHETIC_FIXTURE_herdr");
       expect(readFileSync(join(air, "etc/ais/image-build-time"), "utf8").trim()).toBe("2026-10-01T00:00:00Z");
       expect(readFileSync(join(f.profile, "packages.x86_64"), "utf8")).toBe("base\n");
+      const def = readFileSync(join(f.profile, "profiledef.sh"), "utf8");
+      expect(def).toContain('["/usr/local/lib/ais-live/ais-guardd"]="0:0:755"');
+      expect(def).toContain('["/usr/local/bin/ais"]="0:0:755"');
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 
