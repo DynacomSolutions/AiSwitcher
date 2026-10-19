@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
-import { access, constants, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { access, constants, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { aisBackupConfigPath, aisBackupLockPath, aisBackupsDir } from "../src/shared/ais-home.ts";
 import { acquirePidLock } from "../src/shared/pid-lock.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../src/shared/reproducible-paths.ts";
@@ -282,8 +282,21 @@ async function findNestedRepoFiles(home: string, name: string): Promise<{ repos:
   return { repos, files };
 }
 
+// Called under the backup pid lock, so no other AIS backup is touching the
+// index: a lock left by a killed git (crash, reboot) would otherwise fail every
+// later backup. The age floor spares a hand-run git command racing us right now.
+const STALE_INDEX_LOCK_MS = 60_000;
+async function removeStaleIndexLock(repoDir: string): Promise<void> {
+  const lock = join(repoDir, ".git", "index.lock");
+  const info = await stat(lock).catch(() => null);
+  if (!info || Date.now() - info.mtimeMs < STALE_INDEX_LOCK_MS) return;
+  console.error(`backup: removing stale ${lock} left by an interrupted git`);
+  await rm(lock, { force: true });
+}
+
 async function backupAndCommit(groups: readonly BackupGroup[], home: string): Promise<string> {
   const repoDir = aisBackupsDir(home);
+  await removeStaleIndexLock(repoDir);
   const polluted = await ensureRepo(repoDir, home);
   await removeLegacyMirrors(repoDir, home);
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, rm, symlink, realpath } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -243,6 +243,20 @@ describe("runBackup integration", () => {
     await write(join(repoDir, ".git", "index.lock"), "");
     await write(join(home, ".codex", "a.txt"), "b\n");
     await expect(runBackup(["codex"], home)).rejects.toThrow(/git add failed/);
+  });
+
+  test("an index.lock older than a minute (killed git) is removed and the backup commits", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    const repoDir = await runBackup(["codex"], home);
+    const lock = join(repoDir, ".git", "index.lock");
+    await write(lock, "");
+    const old = new Date(Date.now() - 2 * 3600_000);
+    await utimes(lock, old, old);
+    await write(join(home, ".codex", "a.txt"), "b\n");
+    await runBackup(["codex"], home);
+    expect(await gitShow(repoDir, ".codex/a.txt")).toBe("b\n");
+    expect(existsSync(lock)).toBe(false);
   });
 
   test("nested git repos are stored as files, not gitlinks", async () => {
