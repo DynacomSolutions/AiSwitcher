@@ -37,7 +37,7 @@ fi
 plugin=/home/live/.config/herdr/plugins/ais-guard
 if [[ -d "$plugin" ]]; then
   live_uid=$(/usr/bin/id -u live)
-  for state_dir in /home/live/.config /home/live/.config/herdr /home/live/.local /home/live/.local/state; do
+  for state_dir in /home/live/.config /home/live/.config/herdr /home/live/.config/herdr/plugins /home/live/.local /home/live/.local/state; do
     /usr/bin/install -d -o live -g live -m 0700 "$state_dir"
   done
   herdr_as_live() {
