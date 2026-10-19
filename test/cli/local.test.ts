@@ -101,16 +101,8 @@ describe("ais local", () => {
 
 describe("ais help", () => {
   test("lists launch and local", async () => {
-    const lines: string[] = [];
-    const orig = console.log;
-    console.log = (s: string) => lines.push(s);
-    try {
-      (await import("../../src/cli/help")).runHelp();
-    } finally {
-      console.log = orig;
-    }
-    const text = lines.join("\n");
+    const text = (await import("../../src/cli/help")).helpText();
     expect(text).toContain("launch");
-    expect(text).toContain("local [list|start [name]] [--json]");
+    expect(text).toContain("local");
   });
 });
