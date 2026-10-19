@@ -19,6 +19,16 @@ age = "=0.11.5"
 chrono = "=0.4.45"
 fs2 = "=0.4.3"
 libc = "=0.2.191"
+zeroize = "=1.9.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service = { version = "=4.1.0", features = ["crypto-rust", "vendored"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "=3.6.0", features = ["OSX_10_15"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
 [features]
 file-test = ["dep:minisign"]
