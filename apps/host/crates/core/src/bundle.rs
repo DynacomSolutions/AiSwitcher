@@ -62,8 +62,10 @@ fn octal(field: &[u8]) -> Result<u64, String> {
     u64::from_str_radix(text, 8).map_err(|_| "tar numeric field is out of range".into())
 }
 
-fn parse_tar(raw: &[u8], limit: usize) -> Result<(BTreeMap<String, Vec<u8>>, Vec<u8>), String> {
-    if raw.len() > limit || raw.len() < BLOCK * 3 || raw.len() % BLOCK != 0 {
+type ParsedTar = (BTreeMap<String, Vec<u8>>, Vec<u8>);
+
+fn parse_tar(raw: &[u8], limit: usize) -> Result<ParsedTar, String> {
+    if raw.len() > limit || raw.len() < BLOCK * 3 || !raw.len().is_multiple_of(BLOCK) {
         return Err("tar size or block alignment is invalid".into());
     }
     let mut files = BTreeMap::new();
@@ -766,9 +768,9 @@ mod tests {
         let (manifest, files) = sample();
         let tar = write_bundle_tar(&manifest, &files).unwrap();
         let manifest_size = serde_json::to_vec(&manifest).unwrap().len();
-        let second_header = BLOCK + ((manifest_size + BLOCK - 1) / BLOCK) * BLOCK;
+        let second_header = BLOCK + manifest_size.div_ceil(BLOCK) * BLOCK;
 
-        for typeflag in [b'1', b'2', b'3', b'4', b'5', b'6'] {
+        for typeflag in *b"123456" {
             let mut altered = tar.clone();
             altered[second_header + 156] = typeflag;
             recalculate_checksum(&mut altered[second_header..second_header + BLOCK]);

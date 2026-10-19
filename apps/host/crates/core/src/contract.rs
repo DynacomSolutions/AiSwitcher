@@ -99,14 +99,12 @@ fn safe_component(part: &str) -> bool {
     if let Some(number) = stem
         .strip_prefix("COM")
         .or_else(|| stem.strip_prefix("LPT"))
-    {
-        if matches!(
+        && matches!(
             number,
             "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
         ) {
             return false;
         }
-    }
     true
 }
 

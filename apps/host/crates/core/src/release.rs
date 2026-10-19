@@ -184,7 +184,7 @@ pub fn parse_checksums(bytes: &[u8]) -> Result<BTreeMap<String, [u8; 32]>, Trust
             return Err(TrustError::Checksums);
         }
         let mut digest = [0; 32];
-        for (index, pair) in bytes[..64].chunks_exact(2).enumerate() {
+        for (index, pair) in bytes[..64].as_chunks::<2>().0.iter().enumerate() {
             let part = std::str::from_utf8(pair).map_err(|_| TrustError::Checksums)?;
             digest[index] = u8::from_str_radix(part, 16).map_err(|_| TrustError::Checksums)?;
         }
@@ -204,9 +204,16 @@ pub struct ImageVerifier {
 
 #[derive(Clone, Copy)]
 enum ReviewedLayout {
+    #[cfg_attr(not(feature = "file-test"), allow(dead_code))] // only synthetic fixtures pin exact bytes
     Exact { hash: [u8; 32], size: u64 },
     LiveX86_64GptV1,
 }
+
+/// PLACEHOLDER: the production minisign public key is `image/release-key.pub`,
+/// created by the B image-release task. While that file is absent the bundled
+/// key is empty, `ImageVerifier::bundled` fails closed, and `build.rs` refuses
+/// to compile a release profile unless a developer sets this variable.
+pub const PLACEHOLDER_KEY_OVERRIDE_ENV: &str = "AIS_ALLOW_PLACEHOLDER_RELEASE_KEY";
 
 impl ImageVerifier {
     pub fn bundled() -> Result<Self, TrustError> {
@@ -225,7 +232,7 @@ impl ImageVerifier {
     pub fn synthetic(public_key: &str, layout_bytes: &[u8]) -> Result<Self, TrustError> {
         if layout_bytes.is_empty()
             || layout_bytes.len() as u64 > MAX_IMAGE_BYTES
-            || layout_bytes.len() % 512 != 0
+            || !layout_bytes.len().is_multiple_of(512)
         {
             return Err(TrustError::Layout);
         }

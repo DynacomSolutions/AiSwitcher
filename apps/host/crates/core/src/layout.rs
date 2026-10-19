@@ -48,7 +48,7 @@ impl LiveImageLayout {
     pub fn parse(bytes: &[u8]) -> Result<Self, TrustError> {
         if bytes.is_empty()
             || bytes.len() as u64 >= MAX_IMAGE_BYTES
-            || bytes.len() as u64 % SECTOR_BYTES != 0
+            || !(bytes.len() as u64).is_multiple_of(SECTOR_BYTES)
             || bytes.len() < (4096 * SECTOR_BYTES) as usize
         {
             return Err(TrustError::Layout);
@@ -285,7 +285,7 @@ fn decode_name(bytes: &[u8]) -> Result<String, TrustError> {
         return Err(TrustError::Layout);
     }
     let mut units = Vec::with_capacity(36);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let unit = u16::from_le_bytes([pair[0], pair[1]]);
         if unit == 0 {
             break;

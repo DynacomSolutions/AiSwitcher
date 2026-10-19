@@ -97,7 +97,7 @@ pub fn require_native_channel() -> Result<AuthenticatedChannel, ProtocolError> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) mod linux_transport {
+pub mod linux_transport {
     use super::*;
     use ais_host_core::release::{hex, sha256};
     use std::{
@@ -224,7 +224,7 @@ pub(crate) mod linux_transport {
             return Err(ProtocolError::PackageTrustUnavailable);
         }
         let mut digest = [0; 32];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             digest[index] = u8::from_str_radix(
                 std::str::from_utf8(pair).map_err(|_| ProtocolError::PackageTrustUnavailable)?,
                 16,
@@ -421,7 +421,7 @@ pub(crate) mod linux_transport {
             if header.level == 1 && header.kind == 1 {
                 rights_records += 1;
                 if header.length > available
-                    || payload_length % std::mem::size_of::<i32>() != 0
+                    || !payload_length.is_multiple_of(std::mem::size_of::<i32>())
                     || header.length != header_length + descriptor_length
                 {
                     rights_shape_valid = false;
@@ -468,9 +468,7 @@ pub(crate) mod linux_transport {
                 break;
             }
             if aligned_length > available {
-                if header.length == available {
-                    offset = parse_length;
-                } else {
+                if header.length != available {
                     rights_shape_valid = false;
                 }
                 break;

@@ -155,31 +155,29 @@ impl ais_host_core::device::WriteTarget for LinuxBlockTarget {
             || metadata.dev() != self.retained_device
             || metadata.rdev() != self.retained_rdev
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "retained device handle changed",
             ));
         }
         let mut snapshot = collect_sysfs_snapshot(&self.name)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "native device recheck failed"))?;
+            .map_err(|_| io::Error::other("native device recheck failed"))?;
         snapshot.table_fingerprint = read_table_fingerprint(
             &self.file,
             snapshot
                 .size_sectors
                 .checked_mul(512)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "native capacity invalid"))?,
+                .ok_or_else(|| io::Error::other("native capacity invalid"))?,
         )
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "native table fingerprint failed"))?;
+        .map_err(|_| io::Error::other("native table fingerprint failed"))?;
         let current = observe(&snapshot)
             .map(|entry| entry.observation)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "native device recheck failed"))?;
+            .map_err(|_| io::Error::other("native device recheck failed"))?;
         if current.os_identity != self.approved.os_identity
             || current.connection_identity != self.approved.connection_identity
             || current.capacity_bytes != self.approved.capacity_bytes
             || current.serial != self.approved.serial
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "native device identity changed",
             ));
         }
@@ -494,7 +492,7 @@ fn read_table_fingerprint(file: &File, capacity_bytes: u64) -> Result<[u8; 32], 
     }
     let mut head = vec![0; WINDOW];
     let mut tail = vec![0; WINDOW];
-    let mut read_region = |offset: u64, output: &mut [u8]| -> Result<(), ObservationError> {
+    let read_region = |offset: u64, output: &mut [u8]| -> Result<(), ObservationError> {
         let mut filled = 0;
         while filled < output.len() {
             let count = file
@@ -514,12 +512,13 @@ fn read_table_fingerprint(file: &File, capacity_bytes: u64) -> Result<[u8; 32], 
     Ok(sha256(&bytes))
 }
 
+#[cfg_attr(not(feature = "file-test"), allow(dead_code))] // exercised by fixtures
 fn parse_hex_32(value: &str) -> Result<[u8; 32], ObservationError> {
     if value.len() != 64 {
         return Err(ObservationError::InvalidInput);
     }
     let mut output = [0; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(chunk).map_err(|_| ObservationError::InvalidInput)?;
         output[index] = u8::from_str_radix(pair, 16).map_err(|_| ObservationError::InvalidInput)?;
     }
@@ -528,6 +527,7 @@ fn parse_hex_32(value: &str) -> Result<[u8; 32], ObservationError> {
 
 /// Bounded strict parser for testable snapshots collected from sysfs and mountinfo.
 /// Duplicate, malformed and unknown keys are rejected instead of guessed.
+#[cfg_attr(not(feature = "file-test"), allow(dead_code))] // exercised by fixtures
 pub fn parse_snapshot(input: &str) -> Result<LinuxDiskSnapshot, ObservationError> {
     if input.is_empty() || input.len() > 64 * 1024 {
         return Err(ObservationError::InvalidInput);
@@ -738,6 +738,7 @@ pub fn observe(snapshot: &LinuxDiskSnapshot) -> Result<LinuxDiskObservation, Obs
 }
 
 /// Recompute all approved identity and topology fields immediately before use.
+#[cfg_attr(not(feature = "file-test"), allow(dead_code))] // exercised by fixtures
 pub fn recheck(
     approved: &LinuxDiskObservation,
     current: &LinuxDiskSnapshot,

@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))] // compiled on every host under file-test fixtures
 //! Windows disk identity parsing and retained-handle adapter.
 //!
 //! Disk mutation is fail-closed until the packaged helper can prove its
@@ -161,7 +162,7 @@ fn validate_snapshot(snapshot: &WindowsDiskSnapshot) -> Result<(), ObservationEr
         // in 512-byte logical sectors. Refuse devices whose geometry cannot
         // match that contract until the core supports them explicitly.
         || snapshot.sector_bytes != 512
-        || snapshot.capacity_bytes % u64::from(snapshot.sector_bytes) != 0
+        || !snapshot.capacity_bytes.is_multiple_of(u64::from(snapshot.sector_bytes))
         || snapshot.pnp_ancestry.is_empty()
         || snapshot.pnp_ancestry.len() > MAX_ANCESTRY_NODES
         || snapshot.pnp_ancestry.iter().any(|node| {
@@ -181,11 +182,10 @@ fn validate_snapshot(snapshot: &WindowsDiskSnapshot) -> Result<(), ObservationEr
     }
     parse_digest(&snapshot.table_fingerprint)?;
     parse_digest(&snapshot.mount_fingerprint)?;
-    if let Some(serial) = &snapshot.serial {
-        if serial.is_empty() || serial.len() > 256 || serial.chars().any(char::is_control) {
+    if let Some(serial) = &snapshot.serial
+        && (serial.is_empty() || serial.len() > 256 || serial.chars().any(char::is_control)) {
             return Err(ObservationError::InvalidInput);
         }
-    }
     if !snapshot.ancestry_complete {
         return Err(ObservationError::Ineligible);
     }
@@ -226,7 +226,7 @@ fn parse_digest(value: &str) -> Result<[u8; 32], ObservationError> {
         return Err(ObservationError::InvalidInput);
     }
     let mut digest = [0; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex(pair[0]).ok_or(ObservationError::InvalidInput)?;
         let low = hex(pair[1]).ok_or(ObservationError::InvalidInput)?;
         digest[index] = (high << 4) | low;

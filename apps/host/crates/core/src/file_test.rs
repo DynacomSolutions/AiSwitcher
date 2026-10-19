@@ -158,7 +158,7 @@ pub struct FileTarget {
 
 impl FileTarget {
     pub fn create(directory: &Path, capacity: u64) -> io::Result<Self> {
-        if capacity == 0 || capacity > 16 * 1024 * 1024 || capacity % 512 != 0 {
+        if capacity == 0 || capacity > 16 * 1024 * 1024 || !capacity.is_multiple_of(512) {
             return Err(io::Error::other("fixture capacity limit"));
         }
         let (path, mut file) = fresh_file(directory, "disk-SYNTHETIC-FIXTURE")?;

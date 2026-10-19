@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))] // compiled on every host under file-test fixtures
 //! macOS disk observation and retained raw-device handle.
 //!
 //! Mutation stays unavailable until the bundled, signed SMAppService helper,
@@ -129,7 +130,7 @@ pub fn parse_snapshot(input: &str) -> Result<MacDiskSnapshot, ObservationError> 
             return Err(ObservationError::InvalidInput);
         }
         let mut out = [0; 32];
-        for (idx, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+        for (idx, pair) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let high = hex(pair[0]).ok_or(ObservationError::InvalidInput)?;
             let low = hex(pair[1]).ok_or(ObservationError::InvalidInput)?;
             out[idx] = (high << 4) | low;
@@ -1059,7 +1060,7 @@ fn validate_snapshot(snapshot: &MacDiskSnapshot) -> Result<(), ObservationError>
         || snapshot.capacity_bytes == 0
         || snapshot.connection_generation == 0
         || !matches!(snapshot.sector_bytes, 512 | 4096)
-        || snapshot.capacity_bytes % u64::from(snapshot.sector_bytes) != 0
+        || !snapshot.capacity_bytes.is_multiple_of(u64::from(snapshot.sector_bytes))
         || snapshot.protocol.is_empty()
         || snapshot.device_tree_path.is_empty()
         || snapshot.partitions.len() > MAX_PARTITIONS

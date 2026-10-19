@@ -95,7 +95,7 @@ impl DeviceObservation {
         }
         if !matches!(self.sector_bytes, 512 | 4096)
             || self.capacity_bytes == 0
-            || self.capacity_bytes % u64::from(self.sector_bytes) != 0
+            || !self.capacity_bytes.is_multiple_of(u64::from(self.sector_bytes))
         {
             return Err(DeviceError::Bounds);
         }
@@ -135,8 +135,8 @@ impl ByteRange {
         let sector = u64::from(device.sector_bytes);
         if sector == 0
             || self.length == 0
-            || self.start % sector != 0
-            || self.length % sector != 0
+            || !self.start.is_multiple_of(sector)
+            || !self.length.is_multiple_of(sector)
             || self
                 .start
                 .checked_add(self.length)
