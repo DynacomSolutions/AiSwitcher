@@ -172,10 +172,10 @@ describe("host adapter", () => {
 
   test("the real entrypoint exits 0 when the reader closes early", async () => {
     const home = await fixture();
-    const proc = Bun.spawn([Bun.which("bun")!, "run", "src/ais.ts", "host", "--stdio"], {
+    // `true` exits at once, so the entrypoint writes into a pipe with no reader.
+    const proc = Bun.spawn(["bash", "-c", `set -o pipefail; exec 3>&1; ${JSON.stringify(Bun.which("bun"))} run src/ais.ts host --stdio | true`], {
       cwd: process.cwd(), env: { ...process.env, HOME: home }, stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
-    await proc.stdout.cancel();
     proc.stdin.write(encodeJsonFrame({ version: 1, operation: "capabilities", payloadBytes: 0 })); proc.stdin.end();
     const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     expect(code, stderr).toBe(0);
