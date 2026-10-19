@@ -1,0 +1,29 @@
+source [file join [file dirname [info script]] exchange.exp]
+
+if {[info exists argv0] && [file normalize $argv0] eq [file normalize [info script]]} {
+  if {$argc < 3 || $argc > 4 || [lindex $argv 0] ne "wait-case"} {
+    puts stderr "usage: host-exchange.exp wait-case <serial-channel> <case-name> ?timeout-seconds?"
+    exit 64
+  }
+  lassign $argv action serial_path case_name timeout_value
+  if {![file readable $serial_path]} {
+    puts stderr "serial channel must be a readable runner-provided endpoint"
+    exit 64
+  }
+  if {$argc == 4} {
+    if {![string is integer -strict $timeout_value] || $timeout_value < 1 || $timeout_value > 900} {
+      puts stderr "timeout must be an integer from 1 through 900 seconds"
+      exit 64
+    }
+    set ::ais_exchange::timeout_seconds $timeout_value
+  }
+  set serial_channel [open $serial_path r]
+  fconfigure $serial_channel -buffering none -blocking 0
+  spawn -open $serial_channel
+  try {
+    ais_exchange::wait_case $spawn_id $case_name
+  } on error {message options} {
+    puts stderr $message
+    exit 1
+  }
+}

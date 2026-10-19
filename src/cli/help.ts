@@ -110,6 +110,10 @@ export const HELP: Record<string, HelpNode> = {
       "write-outbox": sub("ais live write-outbox", "Write a portable outbox tar to standard output"),
     },
   },
+  host: {
+    usage: "ais host --stdio",
+    desc: "Private framed transport endpoint for host-app sync",
+  },
   statusline: { usage: "ais statusline [--wrap <command>]", desc: "Claude Code statusLine: run <command>, then print cached usage bars" },
   memory: {
     usage: "ais memory [show|path|init|edit|add] [--stdin]",

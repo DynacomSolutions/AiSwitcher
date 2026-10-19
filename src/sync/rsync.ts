@@ -56,6 +56,20 @@ const TRANSIENT_EXCLUDES = [
   "active_sessions.json",
 ];
 
+/** Shared file-level counterpart to TRANSIENT_EXCLUDES for bounded host exports. */
+export function isTransientSyncPath(path: string): boolean {
+  const parts = path.split("/");
+  const leaf = parts.at(-1) ?? "";
+  if (parts.some((part) => REPRODUCIBLE_JUNK_DIR_NAMES.some((name) => name.endsWith("/") && name.slice(0, -1) === part))) return true;
+  if (["*.lock", "*.sock", "*.pid", "*.sqlite-shm", "*.sqlite-wal", "*.sqlite-journal", "*.db-shm", "*.db-wal", "*.db-journal", "*.sqlite", "*.db"].some((pattern) => leaf.endsWith(pattern.slice(1)))) return true;
+  if (/^(?:logs|state)_.*\.sqlite(?:-(?:shm|wal|journal))?$/.test(leaf)) return true;
+  if (["models_cache.json", "worktrees.db", "active_sessions.json"].includes(leaf)) return true;
+  // Model weights are large, reproducible from provider/model downloads, and
+  // must never be copied merely because they live under a plugin directory.
+  if (/\.(?:gguf|safetensors|onnx|pt|pth)$/i.test(leaf)) return true;
+  return false;
+}
+
 function slash(path: string): string {
   return path.split(sep).join("/");
 }
