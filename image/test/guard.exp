@@ -1,0 +1,67 @@
+#!/usr/bin/expect -f
+# Source from the QEMU driver. The serial fixture requests user decisions;
+# QMP sends those keys to tty1 and never calls an agent-side approval API.
+set guard_script_dir [file dirname [file normalize [info script]]]
+set guard_replies [dict create \
+    wrong-target wrong-target \
+    right-target vdb \
+    symlink-swap vdb \
+    aur-install {install synthetic-fixture}]
+set guard_no_reply {unanswered-dd destructive-tool raw-read-refusal}
+
+proc guard_qmp_key {socket text} {
+    if {![file exists $socket]} { error "QMP socket unavailable" }
+    set helper [file join $::guard_script_dir guard-qmp.py]
+    if {[catch {exec python3 $helper --socket $socket --text "$text\n"} result]} {
+        error "QMP keyboard input failed: $result"
+    }
+}
+
+proc guard_expect_run {serial_id qmp_socket timeout_sec} {
+    if {![file exists $qmp_socket]} { error "QMP socket unavailable" }
+    set popup_seen [dict create]
+    set complete 0
+    while {1} {
+        expect {
+            -i $serial_id
+            -timeout $timeout_sec
+            -re {AIS-GUARD-TEST: case=([a-z0-9-]+) status=([a-z0-9-]+)} {
+                set scenario $expect_out(1,string)
+                set status $expect_out(2,string)
+                if {$status eq "popup"} {
+                    dict set popup_seen $scenario 1
+                    if {$scenario ni $::guard_no_reply} {
+                        if {$scenario ni {symlink-swap aur-install} && ![dict exists $::guard_replies $scenario]} {
+                            error "no automatic reply configured for $scenario"
+                        }
+                        if {$scenario ni {symlink-swap aur-install}} {
+                            guard_qmp_key $qmp_socket [dict get $::guard_replies $scenario]
+                        }
+                    }
+                } elseif {$scenario eq "symlink-swap-target-flipped" && $status eq "ok"} {
+                    if {![dict exists $popup_seen symlink-swap]} { error "symlink popup was not ready before alias swap" }
+                    guard_qmp_key $qmp_socket vdb
+                } elseif {$status eq "reply"} {
+                    if {![dict exists $popup_seen $scenario]} { error "reply arrived before popup for $scenario" }
+                    if {$scenario ne "aur-install"} { error "unexpected deferred reply marker for $scenario" }
+                    guard_qmp_key $qmp_socket [dict get $::guard_replies $scenario]
+                } elseif {$scenario eq "all" && $status eq "complete"} {
+                    foreach required {unanswered-dd destructive-tool raw-read-refusal wrong-target right-target aur-install symlink-swap} {
+                        if {![dict exists $popup_seen $required]} { error "missing popup for $required" }
+                    }
+                    set complete 1
+                    break
+                }
+                exp_continue
+            }
+            timeout { error "timed out waiting for guard fixture" }
+            eof { error "serial stream closed before guard fixture completed" }
+        }
+        if {$complete} { return }
+    }
+}
+
+if {[info exists argv0] && $argv0 eq [info script]} {
+    puts stderr "usage: source guard.exp; guard_expect_run serialSpawn qmpSocket timeoutSeconds"
+    exit 2
+}

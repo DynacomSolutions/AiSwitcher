@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+agent_record=$(getent passwd agent) || { printf 'ais-live-context: agent account is missing\n' >&2; exit 1; }
+IFS=: read -r _ _ agent_uid _ _ agent_home_from_record <<< "$agent_record"
+[[ $(id -u) == "$agent_uid" ]] || { printf 'ais-live-context: must run as agent\n' >&2; exit 1; }
+
+if [[ ${1:-} == --home && -n ${2:-} ]]; then
+  agent_home=$2
+  shift 2
+  (($# == 0)) || { printf 'usage: ais-live-context [--home DIR]\n' >&2; exit 2; }
+else
+  (($# == 0)) || { printf 'usage: ais-live-context [--home DIR]\n' >&2; exit 2; }
+  agent_home=$agent_home_from_record
+  [[ -n $agent_home ]] || { printf 'ais-live-context: agent account is missing\n' >&2; exit 1; }
+fi
+
+memory_dir="$agent_home/.ais/memory"
+memory_file="$memory_dir/GLOBAL.md"
+install -d -m 0700 "$memory_dir"
+python3 - "$memory_file" <<'PY'
+import os
+import pathlib
+import sys
+import tempfile
+
+path = pathlib.Path(sys.argv[1])
+start = "<!-- ais-live:start -->"
+end = "<!-- ais-live:end -->"
+block = """<!-- ais-live:start -->
+## AIS live USB
+
+You are running on an Arch live USB as the restricted `agent` user. Repository
+package installs are available through pacman. AUR installs require approval.
+Destructive disk commands open a confirmation popup in the user's herdr
+session; tell the user to expect it before requesting one. The encrypted
+persist area keeps agent data across boots, and boot snapshots can be restored
+from the boot menu. Disk and rescue tools are not preinstalled. A local model,
+when supplied on the exchange partition, is available under `/opt/ais/models`.
+<!-- ais-live:end -->
+"""
+block = block.rstrip("\n")
+
+try:
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        original = stream.read()
+except FileNotFoundError:
+    original = ""
+lines = original.splitlines(keepends=True)
+prefix = []
+suffix = []
+inside = False
+seen_start = seen_end = False
+for line in lines:
+    marker = line.rstrip("\r\n")
+    if marker == start:
+        if inside or seen_start:
+            raise SystemExit("ais-live-context: duplicate or nested start marker")
+        inside = seen_start = True
+        continue
+    if marker == end:
+        if not inside:
+            raise SystemExit("ais-live-context: unmatched end marker")
+        inside = False
+        seen_end = True
+        suffix.append(line[len(end):])
+        continue
+    if not inside:
+        (suffix if seen_end else prefix).append(line)
+if inside or seen_start != seen_end:
+    raise SystemExit("ais-live-context: incomplete managed block")
+
+prefix_text = "".join(prefix)
+if not seen_start and prefix_text and not prefix_text.endswith("\n"):
+    prefix_text += "\n"
+content = prefix_text + block + "".join(suffix)
+path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".GLOBAL.md.", dir=path.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
