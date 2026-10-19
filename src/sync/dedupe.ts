@@ -1,4 +1,5 @@
-import { appendFile, copyFile, mkdir, readdir, rename, stat } from "node:fs/promises";
+import { copyFile, mkdir, open, readdir, rename, stat } from "node:fs/promises";
+import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { parseIdentitiesFile } from "../identities/store.ts";
@@ -6,6 +7,7 @@ import type { Identity, ToolConfig } from "../identities/types.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG } from "../identities/tool-configs.ts";
 import { matchDirectory } from "../identities/match.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
+import { hasOpenOwner, type OpenOwnerPass } from "./tree-merge.ts";
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const UUID_FILE_PATTERN = new RegExp(`^(${UUID})\\.jsonl$`, "i");
@@ -49,6 +51,7 @@ export interface DedupeResult {
   duplicateSessions: number;
   divergentSessions: number;
   mergedJsonlFiles: number;
+  deferredJsonlFiles: number;
   copiedFiles: number;
   archivedPaths: number;
   assignedLegacySessions: number;
@@ -65,6 +68,20 @@ export interface DedupeOptions {
   archiveDuplicates?: boolean;
   archiveRoot?: string;
   now?: Date;
+}
+
+export type JsonlMergeResult = "merged" | "unchanged" | "deferred" | "busy";
+// "busy" is a deferral caused only by a live open owner: callers skip it without copying.
+export type JsonlBeforeAppendHook = (destination: string) => Promise<void>;
+let beforeJsonlAppend: JsonlBeforeAppendHook | undefined;
+let beforeJsonlCreate: JsonlBeforeAppendHook | undefined;
+/** Test hook for deterministic native-writer races. */
+export function setJsonlBeforeAppendHook(hook?: JsonlBeforeAppendHook): void {
+  beforeJsonlAppend = hook;
+}
+/** Test hook for deterministic exclusive-create races. */
+export function setJsonlBeforeCreateHook(hook?: JsonlBeforeAppendHook): void {
+  beforeJsonlCreate = hook;
 }
 
 function slash(path: string): string {
@@ -300,9 +317,18 @@ async function filesEqual(paths: string[]): Promise<boolean> {
   return true;
 }
 
-export async function mergeJsonlFiles(paths: string[], destination: string, dryRun: boolean): Promise<boolean> {
+function sameFileSnapshot(a: { dev: number; ino: number; size: number; mtimeMs: number }, b: { dev: number; ino: number; size: number; mtimeMs: number }): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+export async function mergeJsonlFiles(
+  paths: string[],
+  destination: string,
+  dryRun: boolean,
+  ownerPass: OpenOwnerPass = { lookups: 0 },
+): Promise<JsonlMergeResult> {
   const uniquePaths = [...new Set(paths)];
-  if (uniquePaths.length === 0) return false;
+  if (uniquePaths.length === 0) return "unchanged";
   const destinationExists = await exists(destination);
 
   const sources = await Promise.all(uniquePaths.map(readLines));
@@ -311,23 +337,71 @@ export async function mergeJsonlFiles(paths: string[], destination: string, dryR
     const output = merged.length > 0 ? `${merged.join("\n")}\n` : "";
     if (!dryRun) {
       await mkdir(dirname(destination), { recursive: true });
-      await Bun.write(destination, output);
+      await beforeJsonlCreate?.(destination);
+      try {
+        const target = await open(destination, "wx", 0o600);
+        try {
+          await target.writeFile(output);
+          await target.sync();
+          const createdSnapshot = await target.stat();
+          const pathSnapshot = await stat(destination);
+          if (!sameFileSnapshot(createdSnapshot, pathSnapshot)) return "deferred";
+        }
+        finally { await target.close(); }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return "deferred";
+        throw error;
+      }
     }
-    return true;
+    return "merged";
   }
 
-  // Re-read the destination last. appendFile() cannot erase a concurrent
-  // writer's bytes; the old whole-file Bun.write() could and did. Do not
-  // append behind an incomplete final record while the native tool is still
-  // writing it — the next reconciliation will retry once the newline lands.
-  const destinationText = await Bun.file(destination).text();
-  if (destinationText.length > 0 && !destinationText.endsWith("\n")) return false;
+  // Read by path without holding a descriptor so the fresh owner check below
+  // does not mistake this merge's own read handle for a native writer.
+  let before: Awaited<ReturnType<typeof stat>>;
+  let destinationText: string;
+  try {
+    before = await stat(destination);
+    destinationText = await Bun.file(destination).text();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "deferred";
+    throw error;
+  }
+  let afterRead: Awaited<ReturnType<typeof stat>>;
+  try { afterRead = await stat(destination); }
+  catch { return "deferred"; }
+  if (!sameFileSnapshot(before, afterRead)) return "deferred";
+  if (destinationText.length > 0 && !destinationText.endsWith("\n")) return "deferred";
   const destinationLines = destinationText.length > 0 ? destinationText.slice(0, -1).split("\n") : [];
   const merged = mergeJsonlLineSetsOnto(destinationLines, sources);
   const additions = merged.slice(destinationLines.length);
-  if (additions.length === 0) return false;
-  if (!dryRun) await appendFile(destination, `${additions.join("\n")}\n`);
-  return true;
+  if (additions.length === 0) return "unchanged";
+  if (dryRun) return "merged";
+  await beforeJsonlAppend?.(destination);
+  // Check ownership after the destination read and immediately before opening
+  // the append descriptor. Unknown is deferred, as a cached miss is not proof.
+  if ((await hasOpenOwner(destination, ownerPass)) !== false) return "busy";
+
+  let fd: number;
+  try { fd = openSync(destination, constants.O_RDWR | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0)); }
+  catch { return "deferred"; }
+  try {
+    const descriptorSnapshot = fstatSync(fd);
+    const pathSnapshot = statSync(destination);
+    if (!sameFileSnapshot(before, descriptorSnapshot) || !sameFileSnapshot(before, pathSnapshot)) return "deferred";
+    if (descriptorSnapshot.size > 0) {
+      const lastByte = Buffer.alloc(1);
+      if (readSync(fd, lastByte, 0, 1, descriptorSnapshot.size - 1) !== 1 || lastByte[0] !== 10) return "deferred";
+    }
+    const payload = Buffer.from(`${additions.join("\n")}\n`);
+    const written = writeSync(fd, payload, 0, payload.length);
+    if (written !== payload.length) return "deferred";
+    fsyncSync(fd);
+    if (!sameFileSnapshot(fstatSync(fd), statSync(destination))) return "deferred";
+  } catch {
+    return "deferred";
+  } finally { closeSync(fd); }
+  return "merged";
 }
 
 async function listRelativeFiles(root: string): Promise<string[]> {
@@ -357,7 +431,9 @@ async function mergeDirectories(
   for (const [rel, paths] of byRelativePath) {
     const target = join(destination, rel);
     if (rel.endsWith(".jsonl")) {
-      if (await mergeJsonlFiles(paths, target, dryRun)) result.mergedJsonlFiles++;
+      const mergeResult = await mergeJsonlFiles(paths, target, dryRun);
+      if (mergeResult === "merged") result.mergedJsonlFiles++;
+      else if (mergeResult === "deferred" || mergeResult === "busy") result.deferredJsonlFiles++;
       continue;
     }
     const candidates = await Promise.all(
@@ -482,13 +558,16 @@ async function mergeGroup(
 
   const duplicateLiveCopies = liveCopies.filter((copy) => copy.path !== canonical.path);
   if (duplicateLiveCopies.length > 0) result.duplicateSessions++;
+  const deferredBefore = result.deferredJsonlFiles;
 
   if (canonical.toolName === "claude" || canonical.toolName === "codex") {
     const paths = [canonical.path, ...group.map((copy) => copy.path)].filter(
       (path, index, all) => all.indexOf(path) === index && group.some((copy) => copy.path === path),
     );
     if (!(await filesEqual(paths))) result.divergentSessions++;
-    if (await mergeJsonlFiles(paths, canonical.path, dryRun)) result.mergedJsonlFiles++;
+    const mergeResult = await mergeJsonlFiles(paths, canonical.path, dryRun);
+    if (mergeResult === "merged") result.mergedJsonlFiles++;
+    else if (mergeResult === "deferred" || mergeResult === "busy") result.deferredJsonlFiles++;
     if (canonical.toolName === "claude") {
       const sidecars = group.map((copy) => copy.sidecarDir).filter((path): path is string => Boolean(path));
       if (sidecars.length > 0) {
@@ -498,6 +577,8 @@ async function mergeGroup(
   } else {
     await mergeDirectories(group.map((copy) => copy.path), canonical.path, dryRun, result);
   }
+
+  if (result.deferredJsonlFiles > deferredBefore) return;
 
   if (dryRun) {
     result.archivedPaths += duplicateLiveCopies.reduce(
@@ -533,6 +614,7 @@ export async function deduplicateUsageData(options: DedupeOptions = {}): Promise
     duplicateSessions: 0,
     divergentSessions: 0,
     mergedJsonlFiles: 0,
+    deferredJsonlFiles: 0,
     copiedFiles: 0,
     archivedPaths: 0,
     assignedLegacySessions: 0,
