@@ -679,14 +679,9 @@ pub fn parse_snapshot(input: &str) -> Result<LinuxDiskSnapshot, ObservationError
     Ok(snapshot)
 }
 
-/// Re-observe an approved disk without opening the device. The privileged
-/// table fingerprint cannot be re-read here, so it is carried over from the
-/// approval; the helper re-reads it and must match the plan digest.
-pub fn observe_unprivileged(
-    approved: &DeviceObservation,
-) -> Result<DeviceObservation, ObservationError> {
-    let major_minor = approved
-        .os_identity
+/// The kernel name of a whole disk from its native identity, via sysfs only.
+pub fn kernel_name(identity: &str) -> Result<String, ObservationError> {
+    let major_minor = identity
         .strip_prefix("linux:")
         .filter(|value| valid_major_minor(value))
         .ok_or(ObservationError::Ineligible)?;
@@ -699,7 +694,46 @@ pub fn observe_unprivileged(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(ObservationError::InvalidInput)?;
-    let mut snapshot = collect_sysfs_snapshot(name)?;
+    component(name)?;
+    Ok(name.to_owned())
+}
+
+/// The device node of the Nth partition of a whole disk, following the kernel
+/// rule that names ending in a digit take a `p` separator.
+pub fn partition_node(disk: &str, number: u32) -> String {
+    let separator = if disk.ends_with(|c: char| c.is_ascii_digit()) {
+        "p"
+    } else {
+        ""
+    };
+    format!("/dev/{disk}{separator}{number}")
+}
+
+impl LinuxBlockTarget {
+    /// Ask the kernel to re-read the partition table after the layout write.
+    pub fn reread_partitions(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        const BLKRRPART: u64 = 0x125f;
+        unsafe extern "C" {
+            fn ioctl(fd: i32, request: u64, ...) -> i32;
+        }
+        // SAFETY: BLKRRPART takes no argument and the descriptor is retained.
+        if unsafe { ioctl(self.file.as_raw_fd(), BLKRRPART) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+/// Re-observe an approved disk without opening the device. The privileged
+/// table fingerprint cannot be re-read here, so it is carried over from the
+/// approval; the helper re-reads it and must match the plan digest.
+pub fn observe_unprivileged(
+    approved: &DeviceObservation,
+) -> Result<DeviceObservation, ObservationError> {
+    let name = kernel_name(&approved.os_identity)?;
+    let mut snapshot = collect_sysfs_snapshot(&name)?;
     snapshot.table_fingerprint = approved.table_fingerprint;
     observe(&snapshot).map(|entry| entry.observation)
 }
@@ -836,6 +870,13 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_nodes_follow_the_kernel_naming_rule() {
+        assert_eq!(partition_node("sdb", 4), "/dev/sdb4");
+        assert_eq!(partition_node("nvme0n1", 4), "/dev/nvme0n1p4");
+        assert_eq!(partition_node("mmcblk0", 4), "/dev/mmcblk0p4");
+    }
 
     #[test]
     fn candidate_names_skip_virtual_and_optical_disks() {

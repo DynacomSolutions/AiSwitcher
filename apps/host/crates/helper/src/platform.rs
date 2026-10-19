@@ -8,7 +8,8 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub use linux::{
     LinuxBlockTarget, collect_by_identity as collect_linux_by_identity,
-    list_eligible as list_linux_eligible, observe_unprivileged as observe_linux_unprivileged,
+    kernel_name as linux_kernel_name, list_eligible as list_linux_eligible,
+    observe_unprivileged as observe_linux_unprivileged, partition_node as linux_partition_node,
 };
 #[cfg(all(target_os = "linux", feature = "file-test"))]
 pub use linux::{

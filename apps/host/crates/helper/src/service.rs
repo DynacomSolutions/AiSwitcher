@@ -163,14 +163,19 @@ fn execute_linux(
     let target =
         crate::platform::LinuxBlockTarget::open_authenticated(&channel, &discovered.observation)
             .map_err(|_| "The retained native target could not be opened safely.")?;
+    let mut target = target;
     write_confirmed(
-        target,
+        &mut target,
         request.confirmation_deadline_boot_ns,
         &mut image,
         &plan,
         &request.typed_confirmation,
-    )
-    .map(|_| ())
+    )?;
+    // The new layout is only usable by the application once the kernel has
+    // re-read it; failure here does not undo the write but is reported.
+    target
+        .reread_partitions()
+        .map_err(|_| "The kernel could not re-read the new partition table.")
 }
 
 /// Final stage shared by the production block device and loop-file tests. The
