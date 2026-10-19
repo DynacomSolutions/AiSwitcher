@@ -29,6 +29,13 @@ const SSH_TRANSPORT =
   "-o ServerAliveInterval=15 -o ServerAliveCountMax=4 " +
   "-o ControlMaster=auto -o ControlPersist=300 -o ControlPath=~/.ssh/ais-sync-%C";
 
+/** POSIX-sh prefix run by the remote login shell: lowest CPU priority, plus
+ * idle I/O class when ionice exists and works (macOS has none; a denied
+ * ioprio_set makes util-linux ionice skip the command, hence the probe). Whatever
+ * follows it on the command line becomes the wrapped command and its args. */
+export const REMOTE_LOW_PRIORITY =
+  `nice -n 19 sh -c 'if ionice -c3 true >/dev/null 2>&1; then exec ionice -c3 "$@"; fi; exec "$@"' sh`;
+
 const TRANSIENT_EXCLUDES = [
   "*.lock",
   "*.sock",
@@ -189,7 +196,7 @@ export function buildRsyncArgs(
     "--no-group",
     "--no-perms",
     ...(conflictMode ? ["--backup", `--backup-dir=${options.backupDir}`] : ["--update"]),
-    ...(options.compareDest ? ["--checksum", `--compare-dest=${options.compareDest}`] : []),
+    ...(options.compareDest ? [`--compare-dest=${options.compareDest}`] : []),
     "--compress",
     "--delay-updates",
     "--partial",
@@ -197,6 +204,7 @@ export function buildRsyncArgs(
     "--protect-args",
     "--prune-empty-dirs",
     "--timeout=300",
+    `--rsync-path=${REMOTE_LOW_PRIORITY} rsync`,
     "-e",
     SSH_TRANSPORT,
     ...filters,

@@ -3,6 +3,8 @@ import type { ToolConfig } from "../identities/types.ts";
 export interface SyncConfig {
   version: 2;
   remotes: string[];
+  /** Minimum minutes between automatic runs (default 10; 0 disables). */
+  minIntervalMinutes?: number;
 }
 
 export type SyncDirection = "pull" | "push" | "both";

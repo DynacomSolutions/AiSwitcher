@@ -87,12 +87,12 @@ describe("AIS rsync construction", () => {
     expect(args).not.toContain("--update");
   });
 
-  test("staged transfers checksum against the receiver's live home instead of copying identical profiles", () => {
+  test("staged transfers compare (size and mtime, never checksum) against the receiver's live home instead of copying identical profiles", () => {
     const args = buildRsyncArgs("remote1", "push", [], homedir(), {
       remoteRoot: ".cache/ais/profile-incoming/snapshot",
       compareDest: "../../../..",
     });
-    expect(args).toContain("--checksum");
+    expect(args).not.toContain("--checksum");
     expect(args).toContain("--compare-dest=../../../..");
     expect(args.slice(-2)).toEqual([`${homedir()}/`, "remote1:.cache/ais/profile-incoming/snapshot/"]);
   });

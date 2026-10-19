@@ -15,6 +15,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { rm } from "node:fs/promises";
 import { automaticSync } from "../../sync/service.ts";
+import { scheduleAutomaticSync } from "../../sync/auto-schedule.ts";
+import { lowerProcessPriority } from "../../sync/low-priority.ts";
+import { pruneStaging } from "../../sync/staging.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import { mergeIncomingProfileTree, recoverProfileArchives } from "../../sync/tree-merge.ts";
 import type { SyncScope } from "../../sync/types.ts";
@@ -98,12 +101,17 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       const direction = boolFlag(flags, "pull-only") ? "pull" : boolFlag(flags, "push-only") ? "push" : "both";
       const scope = scopeFromFlags(flags);
       if (!scope) return;
-      await automaticSync({
-        direction,
-        scope,
-        waitForLock: boolFlag(flags, "wait"),
-        includeDatabases: !boolFlag(flags, "no-databases"),
-      });
+      lowerProcessPriority();
+      const minIntervalMinutes = await loadSyncConfig().then((c) => c.minIntervalMinutes, () => undefined);
+      await scheduleAutomaticSync(
+        {
+          direction,
+          scope,
+          waitForLock: boolFlag(flags, "wait"),
+          includeDatabases: !boolFlag(flags, "no-databases"),
+        },
+        { minIntervalMinutes, run: automaticSync },
+      );
       return;
     }
     case "dedupe": {
@@ -151,11 +159,17 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       console.log(JSON.stringify({ snapshotId, databases: manifest.databases }));
       return;
     }
+    case "drop-zai-snapshot": {
+      if (!host) throw new CliUsageError("Usage: ais sync drop-zai-snapshot <snapshot-id>");
+      await rm(snapshotRoot("sqlite-snapshots", host), { recursive: true, force: true });
+      return;
+    }
     case "merge-zai-snapshot": {
       if (!host) throw new CliUsageError("Usage: ais sync merge-zai-snapshot <snapshot-id>");
       const root = snapshotRoot("sqlite-incoming", host);
       const manifest = await loadCrushSnapshotManifest(root);
       const merged = await mergeCrushSnapshotTree(manifest);
+      await rm(root, { recursive: true, force: true });
       console.log(JSON.stringify({ merged }));
       return;
     }
@@ -164,6 +178,7 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       const scope = scopeFromFlags(flags);
       if (!scope) throw new CliUsageError("A profile snapshot requires both --tool and --identity, or neither.");
       const root = snapshotRoot("profile-incoming", host);
+      await pruneStaging({ keep: host });
       const merged = await mergeIncomingProfileTree(root, scope);
       await makeProfileHookConfigsPortable(scope);
       if (scope.kind === "all") await makeSharedHookScriptsPortable();

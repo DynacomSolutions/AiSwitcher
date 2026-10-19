@@ -35,3 +35,13 @@ describe("AIS sync config", () => {
     expect(config.remotes).toEqual(["backup"]);
   });
 });
+
+describe("minIntervalMinutes", () => {
+  test("is optional, preserved and validated", () => {
+    expect(parseSyncConfig({ version: 2, remotes: [] }).minIntervalMinutes).toBeUndefined();
+    expect(parseSyncConfig({ version: 2, remotes: [], minIntervalMinutes: 0 }).minIntervalMinutes).toBe(0);
+    for (const bad of [-1, "5", Number.NaN]) {
+      expect(() => parseSyncConfig({ version: 2, remotes: [], minIntervalMinutes: bad })).toThrow();
+    }
+  });
+});
