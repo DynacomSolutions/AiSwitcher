@@ -39,3 +39,7 @@ select, .primary-button { min-height: 2.75rem; padding: .5rem .8rem; border: 1px
 button:not(.primary-button) { min-height: 2.75rem; padding: .5rem .9rem; border: 1px solid #ffffff48; border-radius: .6rem; color: #fff; background: #172338; font: inherit; }
 button:disabled { opacity: .55; cursor: not-allowed; }
 input:focus-visible { outline: 3px solid #ffd166; outline-offset: 3px; }
+.options { margin: 1rem 0; padding: 1rem; border: 1px solid #ffffff32; border-radius: .8rem; }
+.options input[type="password"] { display: block; width: 100%; max-width: 28rem; min-height: 2.75rem; margin: .3rem 0 .8rem; padding: .5rem .8rem; border: 1px solid #ffffff80; border-radius: .6rem; color: #fff; background: #0b1424; font: inherit; }
+.options label { display: block; }
+.licence { max-height: 12rem; overflow: auto; padding: .75rem; white-space: pre-wrap; border: 1px solid #ffffff32; border-radius: .6rem; background: #07101f; }

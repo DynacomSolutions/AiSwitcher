@@ -1,4 +1,4 @@
-import type { ConfirmationReceipt, DeviceSummary, HostBridge, OperationView, WritePreview } from "./contract";
+import type { ConfirmationReceipt, ModelChoice, DeviceSummary, HostBridge, OperationView, WritePreview } from "./contract";
 
 const devices: DeviceSummary[] = [{
   id: "SYNTHETIC_FIXTURE_drive_usb_1",
@@ -23,7 +23,13 @@ const devices: DeviceSummary[] = [{
 }];
 let previews = 0;
 let current: string | null = null;
+const models: ModelChoice[] = [{
+  id: "SYNTHETIC_FIXTURE_model", name: "Synthetic model", quality: "fixture", sizeBytes: 3_000_000_000,
+  licenceName: "Synthetic licence", licenceText: "SYNTHETIC_FIXTURE licence: use only for tests.",
+}];
 export const testBridge: HostBridge = {
+  async listModels() { return models; },
+  async setCreateOptions() {},
   async previewWrite(deviceId: string): Promise<WritePreview> {
     const device = devices.find((item) => item.id === deviceId && !item.system);
     if (!device) throw new Error("The selected device is unavailable.");

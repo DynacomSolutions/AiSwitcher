@@ -22,6 +22,8 @@ pub fn run() {
             preview_write,
             confirm_write,
             start_write,
+            list_models,
+            set_create_options,
             invalidate_confirmation,
             disk_write_support,
             native_smoke_ready
@@ -98,6 +100,17 @@ fn preview_write(
     )
     .map_err(|error| error.to_string())?;
     let observation = preview_native(&device_id)?;
+    let create = state.take_create()?;
+    let catalogue =
+        ais_host_core::create::Catalogue::parse(ais_host_core::create::BUNDLED_CATALOGUE)
+            .map_err(|error| error.to_string())?;
+    ais_host_core::create::check_capacity(
+        &create.options,
+        &catalogue,
+        fetched.image.len(),
+        observation.capacity_bytes,
+    )
+    .map_err(|error| error.to_string())?;
     let details = DeviceReviewDetails {
         model: None,
         partitions: Vec::new(),
@@ -109,7 +122,44 @@ fn preview_write(
         observation,
         details,
         fetched.sources,
+        create,
     )
+}
+
+/// The reviewed model catalogue; empty until verified pins exist.
+#[tauri::command]
+fn list_models() -> Result<Vec<ais_host_core::create::ModelEntry>, String> {
+    ais_host_core::create::Catalogue::parse(ais_host_core::create::BUNDLED_CATALOGUE)
+        .map(|catalogue| catalogue.models)
+        .map_err(|error| error.to_string())
+}
+
+/// Validate the create choices and keep them natively for the next preview.
+/// The passphrase never reaches the helper; it is held only until the write
+/// finishes, then handed to the escrow seam and dropped.
+#[tauri::command]
+fn set_create_options(
+    model_id: Option<String>,
+    licence_accepted: bool,
+    passphrase: String,
+    confirmation: String,
+    state: tauri::State<'_, ConfirmationSession>,
+) -> Result<(), String> {
+    let passphrase = ais_host_core::create::Passphrase::new(passphrase, &confirmation)
+        .map_err(|error| error.to_string())?;
+    let options = ais_host_core::create::CreateOptions {
+        model_id,
+        licence_accepted,
+    };
+    let catalogue =
+        ais_host_core::create::Catalogue::parse(ais_host_core::create::BUNDLED_CATALOGUE)
+            .map_err(|error| error.to_string())?;
+    ais_host_core::create::check_capacity(&options, &catalogue, 0, u64::MAX / 2)
+        .map_err(|error| error.to_string())?;
+    state.set_create(StoredCreate {
+        options,
+        passphrase,
+    })
 }
 
 /// A typed confirmation is checked against a preview retained by native state.
@@ -186,6 +236,11 @@ fn fresh_preview_id() -> Result<String, String> {
     Ok(ais_host_core::release::hex(&nonce))
 }
 
+struct StoredCreate {
+    options: ais_host_core::create::CreateOptions,
+    passphrase: ais_host_core::create::Passphrase,
+}
+
 #[allow(dead_code)] // installed by native discovery, which is not wired yet
 struct PendingConfirmation {
     preview_id: String,
@@ -200,6 +255,7 @@ struct PendingConfirmation {
     typed: Option<(String, Instant)>,
     /// Retained image, checksum and signature files for the helper to re-verify.
     sources: Option<[std::fs::File; 3]>,
+    create: Option<StoredCreate>,
 }
 
 /// Presentation fields are collected by the native enumerator. They never
@@ -222,6 +278,8 @@ struct ConfirmationSession {
 #[derive(Default)]
 struct ConfirmationState {
     pending: Option<PendingConfirmation>,
+    /// Validated create options awaiting a preview; cleared by any invalidation.
+    create: Option<StoredCreate>,
     approvals: ais_host_core::device::ConfirmationBook,
 }
 
@@ -229,6 +287,7 @@ impl ConfirmationSession {
     fn invalidate(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.pending = None;
+            state.create = None;
             state.approvals.invalidate();
         }
     }
@@ -243,7 +302,9 @@ impl ConfirmationSession {
             .state
             .lock()
             .map_err(|_| "Confirmation state is unavailable.")?;
-        let ConfirmationState { pending, approvals } = &mut *state;
+        let ConfirmationState {
+            pending, approvals, ..
+        } = &mut *state;
         if pending
             .as_ref()
             .is_none_or(|pending| pending.preview_id != preview_id)
@@ -271,9 +332,11 @@ impl ConfirmationSession {
         device: ais_host_core::device::DeviceObservation,
         details: DeviceReviewDetails,
         sources: [std::fs::File; 3],
+        create: StoredCreate,
     ) -> Result<WritePreview, String> {
         let mut pending = PendingConfirmation::from_native(image, release, device, details)?;
         pending.sources = Some(sources);
+        pending.create = Some(create);
         let preview = pending.view();
         let mut state = self
             .state
@@ -282,6 +345,26 @@ impl ConfirmationSession {
         state.approvals.invalidate();
         state.pending = Some(pending);
         Ok(preview)
+    }
+
+    fn set_create(&self, create: StoredCreate) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Confirmation state is unavailable.")?;
+        state.pending = None;
+        state.approvals.invalidate();
+        state.create = Some(create);
+        Ok(())
+    }
+
+    fn take_create(&self) -> Result<StoredCreate, String> {
+        self.state
+            .lock()
+            .map_err(|_| "Confirmation state is unavailable.")?
+            .create
+            .take()
+            .ok_or_else(|| "Choose the drive options first.".to_string())
     }
 
     /// Consume the typed-confirmation ticket against a fresh native observation
@@ -297,6 +380,7 @@ impl ConfirmationSession {
             &ais_host_core::device::DeviceObservation,
         ) -> Result<ais_host_core::device::DeviceObservation, String>,
         launcher: &dyn HelperLauncher,
+        sink: &dyn ais_host_core::create::PassphraseSink,
     ) -> Result<(), String> {
         if !support.enabled {
             self.invalidate();
@@ -306,7 +390,9 @@ impl ConfirmationSession {
             .state
             .lock()
             .map_err(|_| "Confirmation state is unavailable.")?;
-        let ConfirmationState { pending, approvals } = &mut *state;
+        let ConfirmationState {
+            pending, approvals, ..
+        } = &mut *state;
         let Some(mut current) = pending
             .take()
             .filter(|pending| pending.preview_id == preview_id)
@@ -333,7 +419,13 @@ impl ConfirmationSession {
             .sources
             .as_ref()
             .ok_or("The verified image sources are unavailable.")?;
-        launcher.launch(request, sources)
+        launcher.launch(request, sources)?;
+        // The one hand-off to key escrow; creation itself keeps no passphrase.
+        let create = current
+            .create
+            .take()
+            .ok_or("Choose the drive options first.")?;
+        sink.hand_over(&create.passphrase, &current.plan.device().os_identity)
     }
 }
 
@@ -483,6 +575,7 @@ fn start_write(
         &native_write_support(),
         &observe_native,
         &NativeHelper,
+        &ais_host_core::create::SessionOnly,
     )
 }
 
@@ -507,6 +600,7 @@ impl PendingConfirmation {
             ticket: None,
             typed: None,
             sources: None,
+            create: None,
         })
     }
 
@@ -621,6 +715,42 @@ mod confirmation_tests {
         .unwrap()
     }
 
+    struct CountingSink;
+
+    impl ais_host_core::create::PassphraseSink for CountingSink {
+        fn hand_over(
+            &self,
+            passphrase: &ais_host_core::create::Passphrase,
+            _drive_id: &str,
+        ) -> Result<(), String> {
+            assert_eq!(passphrase.expose(), "SYNTHETIC_FIXTURE_12");
+            HANDED.with(|count| count.set(count.get() + 1));
+            Ok(())
+        }
+    }
+
+    thread_local! {
+        static HANDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn handed_over() -> u32 {
+        HANDED.with(std::cell::Cell::get)
+    }
+
+    fn stored_create() -> super::StoredCreate {
+        super::StoredCreate {
+            options: ais_host_core::create::CreateOptions {
+                model_id: None,
+                licence_accepted: false,
+            },
+            passphrase: ais_host_core::create::Passphrase::new(
+                "SYNTHETIC_FIXTURE_12".into(),
+                "SYNTHETIC_FIXTURE_12",
+            )
+            .unwrap(),
+        }
+    }
+
     fn launch_with(
         session: &ConfirmationSession,
         preview_id: &str,
@@ -635,6 +765,7 @@ mod confirmation_tests {
             &support(enabled),
             &|_| Ok(device.clone()),
             launcher,
+            &CountingSink,
         )
     }
 
@@ -660,6 +791,7 @@ mod confirmation_tests {
             ticket: None,
             typed: None,
             sources: Some(sources()),
+            create: Some(stored_create()),
         }
     }
 
@@ -806,6 +938,7 @@ mod confirmation_tests {
         let error = launch_with(&session, &preview_id, &device, now, false, &launcher).unwrap_err();
         assert_eq!(error, "SYNTHETIC_FIXTURE disabled");
         assert!(launcher.0.borrow().is_empty());
+        assert_eq!(handed_over(), 0);
         assert!(launch_with(&session, &preview_id, &device, now, true, &launcher).is_err());
     }
 
@@ -824,7 +957,9 @@ mod confirmation_tests {
         assert_eq!(requests[0].typed_confirmation, device.display_identifier);
         assert_eq!(requests[0].plan_digest.len(), 64);
         drop(requests);
+        assert_eq!(handed_over(), 1);
         assert!(launch_with(&session, &preview_id, &device, now, true, &launcher).is_err());
+        assert_eq!(handed_over(), 1);
         assert_eq!(launcher.0.borrow().len(), 1);
     }
 

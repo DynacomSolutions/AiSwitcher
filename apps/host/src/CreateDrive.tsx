@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { DeviceSummary, HostBridge, WritePreview } from "./contract";
+import type { DeviceSummary, HostBridge, ModelChoice, WritePreview } from "./contract";
 
 export function isEligible(device: DeviceSummary): boolean {
   return !device.system && device.writable && device.transport === "usb";
@@ -24,8 +24,21 @@ export function CreateDrive({ bridge, devices, loading, onRefresh }: { bridge: H
   const [confirmedFor, setConfirmedFor] = useState<number | null>(null);
   const [expired, setExpired] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [models, setModels] = useState<ModelChoice[]>([]);
+  const [wantModel, setWantModel] = useState(false);
+  const [modelId, setModelId] = useState("");
+  const [licenceAccepted, setLicenceAccepted] = useState(false);
+  const [passphrase, setPassphrase] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [optionsError, setOptionsError] = useState<string | null>(null);
+  const model = models.find((item) => item.id === modelId);
   const selected = eligible.find((device) => device.id === selectedId);
 
+  useEffect(() => {
+    let alive = true;
+    void bridge.listModels().then((list) => { if (alive) setModels(list); }).catch(() => { if (alive) setModels([]); });
+    return () => { alive = false; };
+  }, [bridge]);
   // The native ticket outlives the view unless told otherwise.
   useEffect(() => () => { void bridge.invalidateConfirmation(); }, [bridge]);
   useEffect(() => {
@@ -49,12 +62,29 @@ export function CreateDrive({ bridge, devices, loading, onRefresh }: { bridge: H
     void bridge.invalidateConfirmation();
   }
 
+  function optionsProblem(): string | null {
+    if (passphrase.length < 12) return "The passphrase must be at least 12 characters.";
+    if (passphrase !== confirmation) return "The passphrase and its confirmation differ.";
+    if (wantModel && !model) return "Choose a model, or decline the optional download.";
+    if (wantModel && !licenceAccepted) return "Accept the model licence to include the model.";
+    return null;
+  }
+
   async function requestPreview() {
+    const problem = optionsProblem();
+    setOptionsError(problem);
+    if (problem) return;
     setError(null);
     setExpired(false);
     setTyped("");
     setConfirmedFor(null);
-    try { setPreview(await bridge.previewWrite(selectedId)); } catch (failure) { setPreview(null); setError(messageOf(failure)); }
+    try {
+      await bridge.setCreateOptions(wantModel ? modelId : null, wantModel && licenceAccepted, passphrase, confirmation);
+      setPreview(await bridge.previewWrite(selectedId));
+    } catch (failure) { setPreview(null); setError(messageOf(failure)); }
+    // Native code holds the validated copy; clear the fields promptly.
+    setPassphrase("");
+    setConfirmation("");
   }
 
   async function confirm() {
@@ -94,6 +124,29 @@ export function CreateDrive({ bridge, devices, loading, onRefresh }: { bridge: H
       <dt>Connection</dt><dd>{selected.transport.toUpperCase()}</dd>
       <dt>Serial</dt><dd>{selected.serial ?? "Not reported"}</dd>
     </dl>}
+    <fieldset className="options">
+      <legend>Drive options</legend>
+      <label htmlFor="drive-passphrase">Passphrase</label>
+      <input id="drive-passphrase" type="password" autoComplete="new-password" spellCheck={false} value={passphrase} onChange={(event) => setPassphrase(event.target.value)} aria-describedby="passphrase-help" />
+      <label htmlFor="drive-passphrase-confirm">Confirm passphrase</label>
+      <input id="drive-passphrase-confirm" type="password" autoComplete="new-password" spellCheck={false} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
+      <p id="passphrase-help">At least 12 characters. First boot uses it to create the encrypted persistent storage. It is kept for this session only.</p>
+      <fieldset>
+        <legend>Include a local model</legend>
+        <label><input type="radio" name="model-choice" checked={!wantModel} onChange={() => { setWantModel(false); setLicenceAccepted(false); }} /> No, do not download a model</label>
+        <label><input type="radio" name="model-choice" checked={wantModel} disabled={models.length === 0} onChange={() => setWantModel(true)} /> Yes, include a pinned model{models.length === 0 ? " (none available in this build)" : ""}</label>
+        {wantModel && <>
+          <label htmlFor="model-select">Model</label>
+          <select id="model-select" value={modelId} onChange={(event) => { setModelId(event.target.value); setLicenceAccepted(false); }}>
+            <option value="">Choose a model</option>
+            {models.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.quality}, {formatSize(item.sizeBytes)})</option>)}
+          </select>
+          {model && <section aria-label="Model licence"><h3>{model.licenceName}</h3><pre className="licence" tabIndex={0}>{model.licenceText}</pre>
+            <label><input type="checkbox" checked={licenceAccepted} onChange={(event) => setLicenceAccepted(event.target.checked)} /> I accept this licence</label></section>}
+        </>}
+      </fieldset>
+      {optionsError && <p role="alert" className="error-panel">{optionsError}</p>}
+    </fieldset>
     <button type="button" className="primary-button" disabled={!selected} onClick={() => void requestPreview()}>Preview create layout</button>
     {!preview && error && <p role="alert" className="error-panel">{error}</p>}
     {preview && <section className="disk-confirmation" aria-label="Device preview">

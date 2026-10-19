@@ -39,7 +39,19 @@ export interface WritePreview {
 
 export interface ConfirmationReceipt { expiresInSeconds: number }
 
+export interface ModelChoice {
+  id: string;
+  name: string;
+  quality: string;
+  sizeBytes: number;
+  licenceName: string;
+  licenceText: string;
+}
+
 export interface HostBridge {
+  listModels(): Promise<ModelChoice[]>;
+  /** Validated natively and held there only until the write finishes. */
+  setCreateOptions(modelId: string | null, licenceAccepted: boolean, passphrase: string, confirmation: string): Promise<void>;
   previewWrite(deviceId: string): Promise<WritePreview>;
   confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt>;
   /** Hands the confirmed native preview to the privileged helper; native code checks every precondition. */

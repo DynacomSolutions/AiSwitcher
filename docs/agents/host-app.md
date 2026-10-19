@@ -106,3 +106,17 @@ The production minisign public key is `image/release-key.pub`, created by the B
 image-release task. Until it exists the bundled key is empty (placeholder), the
 image verifier fails closed, and `crates/core/build.rs` refuses a release-profile
 build unless `AIS_ALLOW_PLACEHOLDER_RELEASE_KEY` is set for development.
+
+## Create flow (Task 4, partial)
+
+The create route collects a session-only passphrase (12 characters minimum,
+confirmed) and an explicit yes/no model choice; the licence text is shown before
+acceptance. `create.rs` validates these and the capacity budget (image, model
+and `PERSIST_RESERVE_BYTES`) before any confirmation. `preview_write` fetches
+and verifies a release, takes the helper's read-only observation and installs
+the native preview; `start_write` runs the pkexec session. The only passphrase
+hand-off is `PassphraseSink::hand_over` after a verified write (`SessionOnly`
+for now); key escrow implements that trait. `model-catalogue.json` is empty:
+real pinned models and the model download, the exFAT inbox/model publish,
+readback and eject are still to do. The Linux helper preview and session
+cannot be exercised without the installed root-owned package.

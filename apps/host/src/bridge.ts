@@ -1,4 +1,4 @@
-import type { ConfirmationReceipt, DeviceSummary, HostBridge, OperationView, WritePreview } from "./contract";
+import type { ConfirmationReceipt, ModelChoice, DeviceSummary, HostBridge, OperationView, WritePreview } from "./contract";
 
 declare global {
   interface Window {
@@ -15,6 +15,10 @@ function native(): NonNullable<Window["__TAURI__"]>["core"] {
 }
 
 export const productionBridge: HostBridge = {
+  async listModels(): Promise<ModelChoice[]> { return native().invoke<ModelChoice[]>("list_models"); },
+  async setCreateOptions(modelId: string | null, licenceAccepted: boolean, passphrase: string, confirmation: string) {
+    await native().invoke<void>("set_create_options", { modelId, licenceAccepted, passphrase, confirmation });
+  },
   async previewWrite(deviceId: string): Promise<WritePreview> { return native().invoke<WritePreview>("preview_write", { deviceId }); },
   async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
     return native().invoke<ConfirmationReceipt>("confirm_write", { previewId, typedIdentifier });

@@ -8,6 +8,8 @@ test("device preview requires the exact identifier and refresh invalidates the o
   await expect(page.getByRole("heading", { name: "Create a drive" })).toBeVisible();
 
   await page.getByLabel("Target device").selectOption("SYNTHETIC_FIXTURE_drive_usb_1");
+  await page.getByLabel("Passphrase", { exact: true }).fill("SYNTHETIC_FIXTURE_12");
+  await page.getByLabel("Confirm passphrase").fill("SYNTHETIC_FIXTURE_12");
   await page.getByRole("button", { name: "Preview create layout" }).click();
 
   const preview = page.getByRole("region", { name: "Device preview" });
@@ -32,6 +34,8 @@ test("device preview requires the exact identifier and refresh invalidates the o
   await page.getByRole("button", { name: "Refresh devices" }).click();
   await expect(preview).toBeHidden();
   await page.getByLabel("Target device").selectOption("SYNTHETIC_FIXTURE_drive_usb_1");
+  await page.getByLabel("Passphrase", { exact: true }).fill("SYNTHETIC_FIXTURE_12");
+  await page.getByLabel("Confirm passphrase").fill("SYNTHETIC_FIXTURE_12");
   await page.getByRole("button", { name: "Preview create layout" }).click();
   await expect(page.getByTestId("preview-id")).not.toHaveText(oldPreviewId ?? "");
 });
