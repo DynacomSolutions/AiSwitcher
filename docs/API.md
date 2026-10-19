@@ -44,6 +44,7 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 |---|---|
 | `/api/status`, `/api/processes` | 3s |
 | `/api/identities`, `/api/auth` | 10s |
+| `/api/local-models` | 10s (connectivity is file-cached: 60s online, 5s offline) |
 | `/api/sessions` | 15s |
 | `/api/sessions/tree` | 30s (server caches 15s) |
 | `/api/sessions/transcript` | 3s for an open chat (server caches 4s; appended lines appear within one poll interval) |
@@ -229,6 +230,18 @@ percentages and gets no push. `push: false` in the machine config
 suppresses the metadata writes only. `focused` mirrors herdr's own
 pane-focus flag (threaded from `herdr pane list`) and is the consumer-side
 highlight source for `aistui --overview`; at most one pane carries it.
+
+### Local models
+
+`GET /api/local-models` (read-only; same guard as every `/api` route)
+
+```jsonc
+{
+  "online": true,                 // false when the probe fails or throws; never a 500
+  "runner": "/usr/bin/llama-cli", // null when no llama.cpp runner is found
+  "models": [{ "name": "tiny", "path": "/home/me/.ais/models/tiny.gguf", "sizeBytes": 12345 }]
+}
+```
 
 ### Identities
 
