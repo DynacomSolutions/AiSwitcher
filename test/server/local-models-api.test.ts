@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp, type ConsoleAppDeps } from "../../src/server/app.ts";
@@ -26,15 +26,17 @@ describe("GET /api/local-models", () => {
     // Default wiring with an unreachable probe URL: isOnline must not surface as a 500.
     const prev = { ...process.env };
     const home = mkdtempSync(join(tmpdir(), "ais-lm-api-"));
-    process.env.HOME = home;
     process.env.AIS_LOCAL_MODELS_DIR = join(home, "none");
     process.env.AIS_ONLINE_PROBE_URL = "http://127.0.0.1:1";
+    // os.homedir() ignores later HOME changes in Bun, so inject the cache path instead.
+    const onlineCachePath = join(home, "cache", "online.json");
     try {
-      const res = await appWith({}).request("/api/local-models", { headers });
+      const res = await appWith({ onlineCachePath }).request("/api/local-models", { headers });
       expect(res.status).toBe(200);
       expect((await res.json() as { online: boolean }).online).toBe(false);
+      expect(JSON.parse(readFileSync(onlineCachePath, "utf8")).online).toBe(false);
     } finally {
-      for (const k of ["HOME", "AIS_LOCAL_MODELS_DIR", "AIS_ONLINE_PROBE_URL"]) {
+      for (const k of ["AIS_LOCAL_MODELS_DIR", "AIS_ONLINE_PROBE_URL"]) {
         if (prev[k] === undefined) delete process.env[k];
         else process.env[k] = prev[k];
       }
