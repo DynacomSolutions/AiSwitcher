@@ -1,0 +1,34 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+kind=${1:-all}
+persist_root=${AIS_LIVE_PERSIST_ROOT:-/mnt/persist}
+root="$persist_root/@snapshots"
+prune_dir() {
+    local dir=$1 pattern=$2 limit=$3 count path
+    local -a paths=()
+    [[ -d "$dir" ]] || return 0
+    mapfile -t paths < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -name "$pattern" -printf '%f\n' | sort -r)
+    count=${#paths[@]}
+    while (( count > limit )); do
+        path=${paths[$((count - 1))]}
+        btrfs subvolume delete "$dir/$path"
+        rm -f "$persist_root/@pkglist/snapshot-meta/$path/base-id" "$persist_root/@pkglist/snapshot-meta/$path/explicit"
+        rmdir "$persist_root/@pkglist/snapshot-meta/$path" 2>/dev/null || true
+        unset 'paths[$((count - 1))]'
+        count=$((count - 1))
+    done
+}
+case "$kind" in
+    boot) prune_dir "$root/boot" 'boot-*' 5 ;;
+    pre-pacman) prune_dir "$root/pre-pacman" 'pre-pacman-*' 10 ;;
+    all) prune_dir "$root/boot" 'boot-*' 5; prune_dir "$root/pre-pacman" 'pre-pacman-*' 10 ;;
+    *) printf 'usage: ais-live-prune [boot|pre-pacman|all]\n' >&2; exit 2 ;;
+esac
+if [[ -d "$persist_root" ]]; then
+    avail=$(df -P "$persist_root" | awk 'NR==2 { print $5 }' | tr -d '%')
+    if [[ $avail =~ ^[0-9]+$ ]] && (( 100 - avail < 15 )); then
+        prune_dir "$root/boot" 'boot-*' 3
+        prune_dir "$root/pre-pacman" 'pre-pacman-*' 5
+    fi
+fi

@@ -1,0 +1,18 @@
+[Unit]
+Description=Guarded AIS live persistence scenario assertions
+ConditionKernelCommandLine=ais.test=1
+ConditionKernelCommandLine=ais.scenario=persist
+ConditionKernelCommandLine=ais.persist-phase
+After=ais-live-persist-ready.service ais-live-snapshot.service ais-live-kernel-up.service
+Wants=getty-pre.target
+Before=getty-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ais-live/persist-test
+TimeoutStartSec=180
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

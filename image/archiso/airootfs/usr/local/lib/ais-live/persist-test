@@ -1,0 +1,89 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+cmdline=" $(cat /proc/cmdline) "
+[[ $cmdline == *' ais.test=1 '* && $cmdline == *' ais.scenario=persist '* ]] || exit 0
+phase=
+for arg in $cmdline; do
+    case "$arg" in ais.persist-phase=*) phase=${arg#*=} ;; esac
+done
+case "$phase" in
+    created|wrong-pass|package|verify-package|clean|pick|retention) ;;
+    *) printf 'AIS-LIVE: stage=persist-test status=fail reason=phase\n' >/dev/ttyS0; exit 1 ;;
+esac
+exec >/dev/ttyS0 2>&1
+fail() { printf 'AIS-LIVE: stage=persist-test status=fail reason=%s\n' "$1"; exit 1; }
+ok() {
+    printf 'AIS-LIVE: stage=persist-test status=ok phase=%s\n' "$phase"
+    systemctl --no-block poweroff
+}
+device=$(cat /run/ais-persist-device 2>/dev/null || true)
+
+case "$phase" in
+    created|wrong-pass|package|verify-package|pick|retention)
+        [[ -n "$device" ]] || fail device
+        cryptsetup isLuks "$device" || fail luks
+        mountpoint -q /mnt/persist || fail mount
+        [[ -d /mnt/persist/@config && -d /mnt/persist/@logs && -d /mnt/persist/@upper && -d /mnt/persist/@pkglist && -d /mnt/persist/@snapshots/boot && -d /mnt/persist/@snapshots/pre-pacman ]] || fail subvolumes
+        ;;
+    clean)
+        [[ ! -e /run/ais-persist-device ]] || fail clean-device
+        ! mountpoint -q /mnt/persist || fail clean-mounted
+        ! pacman -Q tree >/dev/null 2>&1 || fail clean-package-present
+        [[ ! -e /usr/bin/tree ]] || fail clean-package-file-present
+        ok
+        exit 0
+        ;;
+esac
+
+case "$phase" in
+    created)
+        printf '%s\n' 'SYNTHETIC_FIXTURE created' > /mnt/persist/@pkglist/scenario-state
+        ;;
+    wrong-pass)
+        [[ -f /mnt/persist/@pkglist/scenario-state ]] || fail persistence-state-lost
+        ;;
+    package)
+        mkdir -p /mnt/ais-test-cache
+        mountpoint -q /mnt/ais-test-cache || mount -o ro /dev/disk/by-label/AIS_TEST_CACHE /mnt/ais-test-cache
+        before=$(find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' | wc -l)
+        cat > /run/ais-persist-test-pacman.conf <<'EOF'
+[options]
+Architecture = auto
+SigLevel = PackageRequired DatabaseOptional
+[ais-test]
+Server = file:///mnt/ais-test-cache/repo
+EOF
+        pacman --config /run/ais-persist-test-pacman.conf -Sy --noconfirm || fail package-sync
+        pacman --config /run/ais-persist-test-pacman.conf -S --noconfirm tree || fail package-install
+        pacman -Q tree >/dev/null || fail package-query
+        [[ -x /usr/bin/tree ]] || fail package-file
+        after=$(find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' | wc -l)
+        (( after == before + 1 )) || fail package-snapshot-count
+        find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' -printf '%f\n' | sort -r | head -n 1 > /mnt/persist/@pkglist/scenario-pick-target
+        ;;
+    verify-package)
+        pacman -Q tree >/dev/null || fail package-persist-query
+        [[ -x /usr/bin/tree ]] || fail package-persist-file
+        ;;
+    pick)
+        source=$(cat /run/ais-persist-picked-source 2>/dev/null || true)
+        [[ -n "$source" ]] || fail pick-source
+        [[ $(btrfs property get -ts "$source" ro) == 'ro=true' ]] || fail pick-source-writable
+        picked=$(cat /run/ais-persist-selected-upper 2>/dev/null || true)
+        [[ -n "$picked" && "$picked" != "$source" ]] || fail pick-upper
+        printf '%s\n' 'SYNTHETIC_FIXTURE writable-child' > /usr/share/ais-live-persist-pick-test
+        [[ -f /usr/share/ais-live-persist-pick-test ]] || fail pick-overlay-write
+        [[ ! -e "$source/upperdir/usr/share/ais-live-persist-pick-test" ]] || fail pick-mutated-source
+        pacman -Q tree >/dev/null 2>&1 && fail pick-package-present
+        [[ ! -e /usr/bin/tree ]] || fail pick-package-file-present
+        ;;
+    retention)
+        for ((i=0; i<8; i++)); do /usr/local/lib/ais-live/ais-live-snapshot boot; done
+        for ((i=0; i<14; i++)); do /usr/local/lib/ais-live/ais-live-snapshot pre-pacman; done
+        boots=$(find /mnt/persist/@snapshots/boot -mindepth 1 -maxdepth 1 -type d -name 'boot-*' | wc -l)
+        transactions=$(find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' | wc -l)
+        [[ $boots -eq 5 && $transactions -eq 10 ]] || fail retention
+        ;;
+esac
+ok

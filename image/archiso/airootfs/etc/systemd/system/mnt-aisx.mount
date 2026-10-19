@@ -1,0 +1,12 @@
+[Unit]
+Description=Root-only AIS exFAT exchange partition
+Before=basic.target
+
+[Mount]
+What=/dev/disk/by-label/AISX
+Where=/mnt/aisx
+Type=exfat
+Options=rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec
+
+[Install]
+WantedBy=local-fs.target

@@ -1,0 +1,30 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+state=${AIS_LIVE_PERSIST_ROOT:-/mnt/persist}/@pkglist
+[[ -e "$state/reinstall-pending" ]] || exit 0
+next=$(<"$state/next-base-id")
+[[ -n "$next" ]] || { echo 'AIS-LIVE: base-migration status=fail reason=missing-base-id' >&2; exit 1; }
+if [[ -s "$state/migration-explicit" ]] && ! nm-online -q --timeout=15; then
+    echo 'AIS-LIVE: base-migration status=deferred reason=network-unavailable retry=systemctl-restart-ais-live-persist-ready' >&2
+    exit 10
+fi
+failed=0
+while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    if ! pacman -S --noconfirm -- "$package"; then
+        printf 'AIS-LIVE: package-reinstall-failed=%s\n' "$package" >&2
+        failed=1
+    fi
+done < "$state/migration-explicit"
+if (( failed != 0 )); then
+    echo 'AIS-LIVE: base-migration status=partial snapshot-retained=yes' >&2
+    exit 10
+fi
+install -m 0600 "$state/next-base-id" "$state/base-id.tmp"
+mv "$state/base-id.tmp" "$state/base-id"
+LC_ALL=C comm -23 <(LC_ALL=C sort -u "$state/migration-explicit") <(LC_ALL=C sort -u /etc/ais-live/base-packages) >"$state/explicit.tmp"
+chmod 0600 "$state/explicit.tmp"
+mv "$state/explicit.tmp" "$state/explicit"
+rm -f "$state/reinstall-pending" "$state/next-base-id" "$state/fresh-upper-ready" "$state/migration-explicit" "$state/migration-base-id" "$state/migration-snapshot"
+echo 'AIS-LIVE: base-migration status=ok'

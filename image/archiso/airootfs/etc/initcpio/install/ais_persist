@@ -1,0 +1,45 @@
+#!/usr/bin/bash
+
+build() {
+    add_module dm-crypt
+    add_module btrfs
+    add_module overlay
+    add_all_modules '/crypto/'
+    add_module exfat
+    add_binary btrfs
+    add_binary cryptsetup
+    add_binary mkfs.btrfs
+    add_binary lsblk
+    add_binary sfdisk
+    add_binary partx
+    add_binary keyctl
+    add_binary mount
+    add_binary umount
+    add_binary find
+    add_binary sed
+    add_binary head
+    add_binary sort
+    add_binary chmod
+    add_binary mkdir
+    add_binary cp
+    add_binary rm
+    add_binary stty
+    add_binary sleep
+    add_binary udevadm
+    add_binary readlink
+    add_binary date
+    add_binary mv
+    add_binary cat
+    add_binary printf
+    add_runscript
+    if [[ ! -e /etc/ais-live/base-packages ]]; then
+        mkdir -p /etc/ais-live
+        pacman -Qqe | LC_ALL=C sort -u >/etc/ais-live/base-packages
+    fi
+}
+
+help() {
+    cat <<'HELP'
+Unlock or create the encrypted AIS persistent btrfs volume before archiso mounts its overlay.
+HELP
+}

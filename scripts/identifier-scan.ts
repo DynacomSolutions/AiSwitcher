@@ -163,6 +163,8 @@ const EXAMPLE_HOME_USERS = new Set([
   // Established synthetic single-letter/placeholder names already used
   // across this repo's own test fixtures (never a real local account).
   "t", "x", "alice", "bob", "tester", "local-user", "name", "projects",
+  // The live image's own fixed accounts (image/archiso), not real machine accounts.
+  "agent", "live",
 ]);
 const HOME_PATH_RE = /(?:\/(?:home|Users)\/|[A-Za-z]:[\\/]Users[\\/])([^\\/\s"'`<>:;,()[\]{}]+)/gi;
 
