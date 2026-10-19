@@ -10,7 +10,7 @@ interface BackgroundSyncDeps {
   warn?: (message: string) => void;
 }
 
-function resolveInstalledAisBinary(): string | undefined {
+export function resolveInstalledAisBinary(): string | undefined {
   const shimDir = process.env.AI_PROFILE_SWITCHER_SHIM_DIR ?? join(homedir(), ".local", "bin");
   const sibling = join(shimDir, "ais");
   return existsSync(sibling) ? sibling : Bun.which("ais") ?? undefined;

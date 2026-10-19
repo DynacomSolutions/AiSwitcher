@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hookCommand } from "../../src/identities/claude-swap-hook.ts";
 import { runClaudeSwapCommand } from "../../src/cli/claude-swap/dispatch.ts";
+import { continuedSince, runContinuation, CONTINUE_TEXT } from "../../src/identities/claude-swap-continue.ts";
 import { loadIdentitiesFile } from "../../src/identities/store.ts";
 import { mergeIdentity } from "../../src/sync/registry.ts";
 
@@ -11,7 +12,8 @@ const dirs: string[] = [];
 let root = "";
 let registry = "";
 let out: string[] = [];
-const deps = () => ({ registryPath: registry, ledgerPath: join(root, "ledger.jsonl"), log: (l: string) => out.push(l), fetchUsage: async () => ({ status: "live" as const, fiveHour: { utilization: 12 }, sevenDay: { utilization: 30 }, maxUtilization: 30, capturedAt: "x" }) });
+const noEnv: Record<string, string> = {};
+const deps = () => ({ env: noEnv, registryPath: registry, ledgerPath: join(root, "ledger.jsonl"), log: (l: string) => out.push(l), fetchUsage: async () => ({ status: "live" as const, fiveHour: { utilization: 12 }, sevenDay: { utilization: 30 }, maxUtilization: 30, capturedAt: "SYNTHETIC_FIXTURE" }) });
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "ais-cswap-cli-"));
@@ -185,4 +187,63 @@ test("next/status --config-dir picks the matching pool among several, tolerating
   expect(JSON.parse(out.join("\n")).active).toBe("a");
   await expect(runClaudeSwapCommand(["status"], { "config-dir": join(root, "none") }, deps())).rejects.toThrow(/No unique/);
   await expect(runClaudeSwapCommand(["next"], { "config-dir": "" }, deps())).rejects.toThrow(/--config-dir is empty/);
+});
+
+const T0 = Date.parse("2026-10-19T10:00:00Z");
+const line = (o: object) => JSON.stringify(o);
+const failure = line({ type: "assistant", isApiErrorMessage: true, timestamp: "2026-10-19T10:00:00Z" });
+
+test("continuedSince: real user prompt or assistant turn after the failure counts, tool results and errors do not", () => {
+  const later = "2026-10-19T10:01:00Z";
+  expect(continuedSince(failure, T0)).toBe(false);
+  expect(continuedSince(line({ type: "user", timestamp: later, message: { content: [{ type: "tool_result" }] } }), T0)).toBe(false);
+  expect(continuedSince(line({ type: "user", timestamp: later, message: { content: "go" } }), T0)).toBe(true);
+  expect(continuedSince(line({ type: "assistant", timestamp: later }), T0)).toBe(true);
+  expect(continuedSince(line({ type: "user", timestamp: "2026-10-19T09:00:00Z", message: { content: "old" } }), T0)).toBe(false);
+});
+
+test("runContinuation sends once, skips when the transcript moved on", async () => {
+  const calls: string[][] = [];
+  const mk = (transcript: string, slept: number[] = []) => ({
+    sleep: async (ms: number) => { slept.push(ms); },
+    readTranscript: async () => transcript,
+    herdr: async (a: string[]) => { calls.push(a); return 0; },
+    stateDir: root,
+    delayMs: 90_000,
+  });
+  const req = { paneId: "p1", transcriptPath: "t", sessionId: "s1", failureAtMs: T0 };
+  expect(await runContinuation(req, mk(line({ type: "user", timestamp: "2026-10-19T10:01:00Z", message: { content: "hi" } })))).toBe("already-continued");
+  expect(calls).toEqual([]);
+  const slept: number[] = [];
+  expect(await runContinuation(req, mk(failure, slept))).toBe("sent");
+  expect(slept).toEqual([90_000]);
+  expect(calls).toEqual([["pane", "send-text", "p1", CONTINUE_TEXT], ["pane", "send-keys", "p1", "Enter"]]);
+  expect(await runContinuation(req, mk(failure))).toBe("already-sent");
+  expect(calls).toHaveLength(2);
+});
+
+test("hook swap schedules the continuation only with a pane, a transcript and a session", async () => {
+  await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
+  const stdin = JSON.stringify({ session_id: "s1", transcript_path: "/t.jsonl" });
+  const spawned: unknown[] = [];
+  const base = {
+    ...deps(),
+    now: afterLedger,
+    fetchUsage: async (m: { name: string }) => ({ status: "live" as const, fiveHour: { utilization: m.name === "a" ? 60 : 10 }, sevenDay: { utilization: 10 }, maxUtilization: m.name === "a" ? 60 : 10, capturedAt: "SYNTHETIC_FIXTURE" }),
+    readHookStdin: async () => stdin,
+    spawnContinuation: (r: unknown) => { spawned.push(r); },
+  };
+  const env = { AIS_HERDR_BIN: process.execPath };
+  const flags = { "config-dir": join(root, "shared"), "if-limited": true, "assume-limited": true, "trust-limit-evidence": true, reason: "auto", json: true } as Record<string, string | true>;
+  const failureAt = String(Date.now());
+
+  await runClaudeSwapCommand(["next"], flags, { ...base, env }); // swaps a -> b, no pane
+  expect(spawned).toEqual([]);
+
+  // Later hook runs for the same failure see the swap as already recorded, which still counts as handled.
+  const again = { ...flags, "failure-at-ms": failureAt };
+  await runClaudeSwapCommand(["next"], again, { ...base, env: { ...env, HERDR_PANE_ID: "p9" }, readHookStdin: async () => "not json" });
+  expect(spawned).toEqual([]);
+  await runClaudeSwapCommand(["next"], again, { ...base, env: { ...env, HERDR_PANE_ID: "p9" } });
+  expect(spawned).toMatchObject([{ paneId: "p9", transcriptPath: "/t.jsonl", sessionId: "s1" }]);
 });
