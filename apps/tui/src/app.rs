@@ -430,7 +430,7 @@ const READER_POLL: Duration = Duration::from_millis(100);
 /// terminal while a child owns it.
 #[derive(Default)]
 struct ReaderGate {
-    state: std::sync::Mutex<(bool, bool)>, // (pause requested, parked)
+    state: std::sync::Mutex<(bool, bool, bool)>, // (pause requested, parked, reader exited)
     cv: std::sync::Condvar,
 }
 
@@ -450,9 +450,15 @@ impl ReaderGate {
     fn pause(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.0 = true;
-        while !st.1 {
+        while !st.1 && !st.2 {
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
         }
+    }
+
+    /// Reader side: the reader is gone, so `pause` must never wait for it.
+    fn exited(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).2 = true;
+        self.cv.notify_all();
     }
 
     fn resume(&self) {
@@ -470,6 +476,8 @@ fn run_local_start(name: &str) -> Option<String> {
         .status()
     {
         Ok(status) if status.success() => None,
+        // Stopped by a signal (e.g. Ctrl+C): the user chose that, no prompt.
+        Ok(status) if status.code().is_none() => None,
         Ok(status) => Some(format!("ais local start exited with {status}")),
         Err(err) => Some(format!("could not run ais: {err}")),
     }
@@ -523,6 +531,7 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
                 Err(_) => break,
             }
         }
+        reader_gate.exited();
     });
 
     let mut app = App::new(&settings);
@@ -562,8 +571,10 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
             }
             drop(sigint);
             terminal = ratatui::init();
-            gate.resume();
+            // Drain while the reader is still parked, or it could take the
+            // input first and the stale keys would replay.
             drain_input(&mut event_rx);
+            gate.resume();
             terminal.clear().context("failed to repaint")?;
         }
         terminal
@@ -658,6 +669,22 @@ mod tests {
         assert!(ticks.load(Ordering::SeqCst) > frozen, "reader resumed");
         stop.store(true, Ordering::SeqCst);
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn reader_gate_pause_returns_after_reader_exit() {
+        let gate = Arc::new(ReaderGate::default());
+        let g = Arc::clone(&gate);
+        std::thread::spawn(move || g.exited()).join().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            gate.pause();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "pause hung"
+        );
     }
 
     #[test]
