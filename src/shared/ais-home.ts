@@ -47,6 +47,20 @@ export function aisConfigDir(home: string = homedir()): string {
   return join(aisHome(home), "config");
 }
 
+/** Optional off-host backup settings (`remote`, `localRetentionDays`); see
+ * scripts/backup.ts. `AIS_BACKUP_CONFIG` overrides the location. */
+export function aisBackupConfigPath(
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): string {
+  return env.AIS_BACKUP_CONFIG || join(aisConfigDir(home), "backup.json");
+}
+
+/** Lock serialising backup runs; outside the backup repo's working tree. */
+export function aisBackupLockPath(home: string = homedir()): string {
+  return join(aisHome(home), "backups.lock");
+}
+
 /** Canonical, machine-local memory shared by every AIS-managed agent and
  * identity. It is outside every vendor profile, SSH sync tree, and backup
  * group. Vendor files are projections, never the authority. */

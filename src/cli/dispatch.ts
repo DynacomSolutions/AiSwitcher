@@ -2,7 +2,7 @@ import { boolFlag, parseArgs } from "./args.ts";
 import { bold } from "./colors.ts";
 import { runDoctorCommand } from "./doctor/dispatch.ts";
 import { CliUsageError } from "./errors.ts";
-import { runHelp } from "./help.ts";
+import { helpRequest, helpText } from "./help.ts";
 import { runIdentitiesCommand } from "./identities/dispatch.ts";
 import { runLimitsCommand } from "./limits/dispatch.ts";
 import { runResumeCommand } from "./resume/dispatch.ts";
@@ -20,6 +20,8 @@ import { runHerdrCommand } from "./herdr.ts";
 import { runTuiCommand } from "./tui.ts";
 import { runClaudeSwapCommand } from "./claude-swap/dispatch.ts";
 import { runSwapCommand } from "./swap/dispatch.ts";
+import { runLaunchCommand } from "./launch.ts";
+import { runLocalCommand } from "./local/dispatch.ts";
 import { runStatuslineCommand } from "./statusline.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
@@ -35,6 +37,10 @@ export async function runCli(argv: string[]): Promise<void> {
   const [command, ...rest] = positionals;
 
   try {
+    // `ais version`/`-v` wins; every other help form shares one text source.
+    const helpPath = command === "version" || command === "-v" ? undefined : helpRequest(argv);
+    if (helpPath) return void console.log(helpText(helpPath));
+
     // Self-healing, idempotent, and must run before anything below reads a
     // path that now defaults under ~/.ais (sync config/cache, the managed
     // npm prefix) — see migrate-ais-home.ts. Never throws.
@@ -42,9 +48,6 @@ export async function runCli(argv: string[]): Promise<void> {
 
     if (command === "version" || command === "-v" || boolFlag(flags, "version")) {
       return runVersion();
-    }
-    if (command === undefined || command === "help" || command === "-h" || boolFlag(flags, "help")) {
-      return runHelp();
     }
 
     // Resume launches must never wait for SSH, and neither may any other
@@ -134,8 +137,15 @@ export async function runCli(argv: string[]): Promise<void> {
       case "memory":
         await runMemoryCommand(rest, flags);
         break;
+      case "launch":
+        await runLaunchCommand(rest, flags);
+        break;
+      case "local":
+        await runLocalCommand(rest, flags);
+        break;
       default:
-        throw new CliUsageError(`Unknown command "${command}". Run "ais help" for usage.`);
+        helpText([command]); // throws the one-line "did you mean" error for an unknown name
+        throw new CliUsageError(`Unknown command "${command}". Run "ais help" for the list.`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

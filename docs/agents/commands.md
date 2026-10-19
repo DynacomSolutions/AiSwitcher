@@ -34,3 +34,18 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 33
   PATH-ordering risk: there's no real `zai`/`ali` binary anywhere on `PATH`
   to lose a race against.
 
+
+## CLI help
+
+Help for `ais` lives in one table, `HELP` in `src/cli/help.ts` (usage, one-line
+description, key flags, up to two examples, subcommands). Add or change a command
+there; do not write a second usage string in a dispatcher. These forms print the
+same text:
+
+- `ais help`, `ais help <group> [sub]`
+- `ais <group> help`, `ais <group> --help`, `ais <group> -h`
+- `ais <group> <sub> --help`
+
+`ais usage --help` and `-h` are passed to tokscale; use `ais usage help`. An
+unknown command or subcommand gives a one-line error naming the three nearest
+valid names. Keep top-level help under 40 lines.

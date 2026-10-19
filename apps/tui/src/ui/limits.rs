@@ -1,4 +1,4 @@
-//! Tab 3: per-identity quota windows as gauge bars. Polls slowly; `r` forces
+//! Tab 4: per-identity quota windows as gauge bars. Polls slowly; `r` forces
 //! a refresh through the endpoint's notify handle.
 
 use ratatui::Frame;
@@ -12,7 +12,7 @@ use crate::models::{LimitResult, OverageInfo};
 use crate::timefmt;
 use crate::ui::widgets;
 
-const TAB_INDEX: usize = 2;
+const TAB_INDEX: usize = 3;
 const BAR_WIDTH: usize = 22;
 
 pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {

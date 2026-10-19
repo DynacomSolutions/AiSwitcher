@@ -20,6 +20,7 @@ import { adapterFor } from "../identities/pool/registry.ts";
 import { runLaunchGate } from "../spend/gate.ts";
 import type { HerdrChatTool } from "./herdr-chat-source.ts";
 import { promptFromCliArgs } from "./herdr-tab-title.ts";
+import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 
 export async function runWrapper(
@@ -90,6 +91,15 @@ export async function runWrapper(
     if (poolAdapter && resolved.identity) {
       const note = await poolLaunchCheck(poolAdapter, resolved.identity);
       if (note) console.error(note);
+    }
+
+    // Cached connectivity only: one small sync file read, never a probe or prompt.
+    // `ais launch` sets the marker when it already warned.
+    if (!consumeOfflineWarned() && process.stderr.isTTY) {
+      try {
+        const notice = shimOfflineNotice({ subject: cfg.toolName });
+        if (notice) console.error(notice);
+      } catch {}
     }
 
     await beforeLaunch?.(resolved.configDirValue);

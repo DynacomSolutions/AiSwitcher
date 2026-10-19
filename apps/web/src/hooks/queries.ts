@@ -22,6 +22,7 @@ export const qk = {
   identities: ["identities"] as const,
   permissions: ["permissions"] as const,
   limits: ["limits"] as const,
+  localModels: ["local-models"] as const,
   usage: ["usage"] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
@@ -90,6 +91,14 @@ export function usePermissionsQuery() {
     queryKey: qk.permissions,
     queryFn: () => api.getPermissions(),
     refetchInterval: POLL.slow,
+  });
+}
+
+export function useLocalModelsQuery() {
+  return useQuery({
+    queryKey: qk.localModels,
+    queryFn: api.getLocalModels,
+    refetchInterval: POLL.registry,
   });
 }
 

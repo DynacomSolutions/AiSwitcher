@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync } from "node:fs";
@@ -121,6 +122,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   const deps: ConsoleAppDeps = {
     token,
     port,
+    ...(isIP(host) && host !== "0.0.0.0" && host !== "::" ? { serverAddress: host } : {}),
     startedAt: Date.now(),
     allowedHosts: parseAllowedHosts(process.env.AIS_WEB_ALLOWED_HOSTS),
     authRefresh: scheduler,
@@ -153,6 +155,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
       // from token-carrying remote ones when a non-loopback bind is used.
       const ip = bunServer.requestIP(req);
       (req as unknown as { __remoteAddress?: string }).__remoteAddress = ip?.address;
+      (req as unknown as { __remotePort?: number }).__remotePort = ip?.port;
       return app.fetch(req);
     },
   });

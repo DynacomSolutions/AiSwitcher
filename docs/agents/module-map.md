@@ -187,6 +187,10 @@ src/
     dispatch.ts          top-level subcommand routing + uniform error->exit-code handling
     args.ts                minimal argv parser: positionals + --flag=value/--flag
     errors.ts               CliUsageError — bad flags/args, distinct from identities/errors.ts
+    launch.ts                 `ais launch`: tool list (installed + active identity), offline warning,
+                             then promptForIdentity and exec through ~/.local/bin/<tool> shim
+                             with --identity/--pool; or start a local model (no identity)
+    local/dispatch.ts          `ais local list|start`: local llama.cpp model (shared/local-models.ts)
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`
     update.ts                 `ais update`: re-downloads whichever of claude/codex/grok/kimi/
@@ -400,6 +404,9 @@ src/
                             ~/.config/ais, ~/.local/share/ais/npm) into ~/.ais,
                             called at the top of run-wrapper.ts and cli/
                             dispatch.ts on every invocation
+    pid-lock.ts             acquirePidLock(): exclusive pid+token lock file with
+                            dead-pid takeover; used by sync/service.ts (sync.lock)
+                            and scripts/backup.ts (~/.ais/backups.lock)
     reproducible-paths.ts     REPRODUCIBLE_JUNK_DIR_NAMES — directory names
                             with no restore/sync value (caches, clones, logs,
                             worktrees, ...), shared between SSH sync's own
@@ -409,7 +416,8 @@ src/
 scripts/
   backup.ts            snapshots every real config dir into a git-only repo
                        at ~/.ais/backups/.git (work tree $HOME) and commits whatever changed
-                       — see "~/.ais: one consolidated root" below
+                       see "~/.ais: one consolidated root" below; optionally
+                       pushes it off-host (~/.ais/config/backup.json)
   migrate.ts            one-time, interactive, moves existing dirs into identities/<name>/
                         (claude/codex only — see "Adding another wrapped tool later")
   build.ts               bun build --compile for claude/codex/grok/kimi/zai/ali/pi/ais (+ open, darwin only)
