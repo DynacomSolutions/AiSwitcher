@@ -21,6 +21,7 @@ export function LocalModelsPage() {
   const { name } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const filter = readFilter(searchParams);
+  const open = (n: string) => navigate({ pathname: modelPath(n), search: searchParams.toString() });
   const data = query.data;
 
   const needle = filter.trim().toLowerCase();
@@ -93,8 +94,17 @@ export function LocalModelsPage() {
                       <TableRow
                         key={m.name}
                         data-state={m.name === name ? "selected" : undefined}
-                        className="cursor-pointer"
-                        onClick={() => navigate({ pathname: modelPath(m.name), search: searchParams.toString() })}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`Open model: ${m.name}`}
+                        className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring"
+                        onClick={() => open(m.name)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            open(m.name);
+                          }
+                        }}
                       >
                         <TableCell className="font-medium">{m.name}</TableCell>
                         <TableCell className="tabular-nums">{mib(m.sizeBytes)}</TableCell>
