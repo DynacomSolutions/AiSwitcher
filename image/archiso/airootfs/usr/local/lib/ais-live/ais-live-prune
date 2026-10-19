@@ -25,10 +25,12 @@ case "$kind" in
     all) prune_dir "$root/boot" 'boot-*' 5; prune_dir "$root/pre-pacman" 'pre-pacman-*' 10 ;;
     *) printf 'usage: ais-live-prune [boot|pre-pacman|all]\n' >&2; exit 2 ;;
 esac
+prune_dir "$root" 'pick-displaced-*' 3
 if [[ -d "$persist_root" ]]; then
     avail=$(df -P "$persist_root" | awk 'NR==2 { print $5 }' | tr -d '%')
     if [[ $avail =~ ^[0-9]+$ ]] && (( 100 - avail < 15 )); then
         prune_dir "$root/boot" 'boot-*' 3
         prune_dir "$root/pre-pacman" 'pre-pacman-*' 5
+        prune_dir "$root" 'pick-displaced-*' 1
     fi
 fi

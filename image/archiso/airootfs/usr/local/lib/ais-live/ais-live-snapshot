@@ -14,19 +14,25 @@ esac
 [[ -d "$root/@upper" && -d "$parent" ]] || exit 0
 stamp=$(date -u +%Y%m%dT%H%M%S%N)-$$
 target="$parent/$kind-$stamp"
-btrfs subvolume snapshot -r "$root/@upper" "$target"
-meta="$root/@pkglist/snapshot-meta/${target##*/}"
-mkdir -p "$meta"
 base_id="$root/@pkglist/base-id"
 [[ -e "$root/@pkglist/next-base-id" ]] && base_id="$root/@pkglist/next-base-id"
-cp "$base_id" "$meta/base-id"
+metadata_explicit="$root/@pkglist/.snapshot-explicit.$$"
+trap 'rm -f "$metadata_explicit"' EXIT
 if [[ -e "$root/@pkglist/reinstall-pending" ]]; then
     # Replay transactions must retain rollback points with the package state
     # actually installed so far, not the final saved target list.
     export LC_ALL=C
-    pacman -Qqe | sort -u | comm -23 - <(sort -u /etc/ais-live/base-packages) >"$meta/explicit.tmp"
-    mv "$meta/explicit.tmp" "$meta/explicit"
+    pacman -Qqe | sort -u | comm -23 - <(sort -u /etc/ais-live/base-packages) >"$metadata_explicit"
 else
-    cp "$root/@pkglist/explicit" "$meta/explicit"
+    cp "$root/@pkglist/explicit" "$metadata_explicit"
 fi
+if ! btrfs subvolume snapshot -r "$root/@upper" "$target"; then
+    exit 1
+fi
+meta="$root/@pkglist/snapshot-meta/${target##*/}"
+mkdir -p "$meta"
+cp "$base_id" "$meta/base-id.tmp"
+mv "$meta/base-id.tmp" "$meta/base-id"
+mv "$metadata_explicit" "$meta/explicit"
+trap - EXIT
 /usr/local/lib/ais-live/ais-live-prune "$kind"

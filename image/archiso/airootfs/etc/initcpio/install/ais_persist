@@ -10,7 +10,19 @@ build() {
     add_binary cryptsetup
     add_binary mkfs.btrfs
     add_binary lsblk
+    add_binary findmnt
     add_binary sfdisk
+    add_binary blockdev
+    add_binary blkid
+    add_binary stat
+    add_binary dirname
+    add_binary wipefs
+    add_binary grep
+    add_binary chown
+    add_binary awk
+    add_binary tr
+    add_binary cmp
+    add_binary diff
     add_binary partx
     add_binary keyctl
     add_binary mount
@@ -30,8 +42,13 @@ build() {
     add_binary date
     add_binary mv
     add_binary cat
+    add_binary wc
+    add_binary cut
     add_binary printf
     add_runscript
+    [[ -r /etc/ais-live/agent-ids ]] || { error 'Missing required /etc/ais-live/agent-ids'; return 1; }
+    printf 'uid=1001\ngid=1001\n' | cmp -s - /etc/ais-live/agent-ids || { error 'Invalid /etc/ais-live/agent-ids'; return 1; }
+    add_file /etc/ais-live/agent-ids
     if [[ ! -e /etc/ais-live/base-packages ]]; then
         mkdir -p /etc/ais-live
         pacman -Qqe | LC_ALL=C sort -u >/etc/ais-live/base-packages
@@ -40,6 +57,6 @@ build() {
 
 help() {
     cat <<'HELP'
-Unlock or create the encrypted AIS persistent btrfs volume before archiso mounts its overlay.
+Verify the boot disk and prepare encrypted AIS persistence in the late hook before the initramfs mounts its overlay; first boot creates partition 5 after confirmation.
 HELP
 }

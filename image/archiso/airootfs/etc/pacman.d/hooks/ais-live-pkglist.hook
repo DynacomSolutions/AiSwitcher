@@ -8,4 +8,5 @@ Target = *
 [Action]
 Description = Record explicitly installed AIS live packages
 When = PostTransaction
-Exec = /usr/bin/bash -c 'set -euo pipefail; [[ -d /mnt/persist/@pkglist ]] || exit 0; [[ ! -e /mnt/persist/@pkglist/reinstall-pending ]] || exit 0; export LC_ALL=C; pacman -Qqe | sort -u | comm -23 - <(sort -u /etc/ais-live/base-packages) > /mnt/persist/@pkglist/explicit.tmp; chmod 0600 /mnt/persist/@pkglist/explicit.tmp; mv /mnt/persist/@pkglist/explicit.tmp /mnt/persist/@pkglist/explicit'
+NeedsTargets
+Exec = /usr/local/lib/ais-live/ais-live-pkglist

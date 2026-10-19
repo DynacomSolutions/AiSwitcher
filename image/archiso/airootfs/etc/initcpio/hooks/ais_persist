@@ -28,6 +28,7 @@ _persist_prompt() {
             echo 'Passphrases do not match.' >"$PERSIST_CONSOLE"
         else
             keyid=$(printf '%s' "$first" | keyctl padd user ais-live-exchange @u) || { unset first second; return 1; }
+            keyctl setperm "$keyid" 0x003f0000 || { keyctl revoke "$keyid" 2>/dev/null || true; keyctl unlink "$keyid" @u 2>/dev/null || true; unset first second; return 1; }
             unset first second
             [ -n "$keyid" ] && return 0
         fi
@@ -35,29 +36,247 @@ _persist_prompt() {
 }
 
 _persist_find_device() {
-    local bootdev parent candidate
+    local bootdev parent candidate source alias resolved
     udevadm settle --timeout=10 || true
     local retry=0
     while [ "$retry" -lt 5 ]; do
         retry=$((retry + 1))
-        bootdev=$(readlink -f "$(getarg archisodevice /dev/disk/by-label/AISBASE)" 2>/dev/null)
+        source=$(findmnt -n -o SOURCE /run/archiso/bootmnt 2>/dev/null)
+        bootdev=$(readlink -f "$source" 2>/dev/null)
         [ -b "$bootdev" ] && break
         sleep 1
         udevadm settle --timeout=5 || true
     done
     [ -b "$bootdev" ] || return 1
+    # The mounted AISBASE partition is the authority. Resolve its GPT parent,
+    # then retain a stable by-id/by-path alias for all later operations.
     parent=$(lsblk -no PKNAME "$bootdev" 2>/dev/null)
     [ -n "$parent" ] || return 1
     candidate="/dev/$parent"
     [ -b "$candidate" ] || return 1
-    PERSIST_DISK=$candidate
+    PERSIST_DISK=
+    for alias in /dev/disk/by-id/* /dev/disk/by-path/*; do
+        [ -L "$alias" ] || continue
+        resolved=$(readlink -f "$alias" 2>/dev/null) || continue
+        [ "$resolved" = "$candidate" ] || continue
+        PERSIST_DISK=$alias
+        break
+    done
+    [ -n "$PERSIST_DISK" ] || return 1
     PERSIST_PART="${candidate}5"
     PERSIST_EXCHANGE_PART="${candidate}4"
     case "$candidate" in *[0-9]) PERSIST_PART="${candidate}p5"; PERSIST_EXCHANGE_PART="${candidate}p4" ;; esac
 }
 
+# The producer writes this strict tab-separated manifest into AISBASE. It is
+# deliberately mandatory: sizing and partition UUIDs are image-specific.
+_persist_uuid_valid() {
+    printf '%s\n' "$1" | awk 'tolower($0) ~ /^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[1-5][0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/ {ok=1} END {exit !ok}'
+}
+
+_persist_decimal_valid() {
+    case "$1" in ''|*[!0-9]*|0|0?*) return 1 ;; esac
+    [ "${#1}" -le 15 ]
+}
+
+_persist_validate_node() {
+    local node=$1 partition=$2 expected_uuid=$3 expected_start=$4 expected_size=$5
+    local disk_real node_real node_major node_minor disk_major disk_minor sysdev part parentdev actual_uuid sys_start sys_size
+    disk_real=$(readlink -f "$PERSIST_DISK") || return 1
+    node_real=$(readlink -f "$node") || return 1
+    [ -b "$disk_real" ] && [ -b "$node_real" ] || return 1
+    actual_uuid=$(blkid -s PARTUUID -o value "$node_real" 2>/dev/null | tr '[:upper:]' '[:lower:]') || return 1
+    [ "$actual_uuid" = "$expected_uuid" ] || return 1
+    node_major=$(stat -Lc '%t' "$node_real") || return 1
+    node_minor=$(stat -Lc '%T' "$node_real") || return 1
+    disk_major=$(stat -Lc '%t' "$disk_real") || return 1
+    disk_minor=$(stat -Lc '%T' "$disk_real") || return 1
+    node_major=$(printf '%d' "0x$node_major") || return 1
+    node_minor=$(printf '%d' "0x$node_minor") || return 1
+    disk_major=$(printf '%d' "0x$disk_major") || return 1
+    disk_minor=$(printf '%d' "0x$disk_minor") || return 1
+    sysdev=$(readlink -f "/sys/dev/block/$node_major:$node_minor") || return 1
+    [ -r "$sysdev/partition" ] || return 1
+    part=$(cat "$sysdev/partition") || return 1
+    parentdev=$(cat "$(dirname "$sysdev")/dev") || return 1
+    sys_start=$(cat "$sysdev/start") || return 1
+    sys_size=$(cat "$sysdev/size") || return 1
+    [ "$part" = "$partition" ] && [ "$parentdev" = "$disk_major:$disk_minor" ] &&
+        [ "$sys_start" = "$expected_start" ] && [ "$sys_size" = "$expected_size" ]
+}
+
+_persist_verify_gpt() {
+    local dump manifest expected actual full_actual headers disk_guid dump_device current_sectors current_last table_last p4end p5row
+    manifest=/run/archiso/bootmnt/ais-live/gpt-layout
+    [ -r "$manifest" ] || return 1
+    [ "$(wc -l < "$manifest")" -eq 6 ] || return 1
+    awk 'END {if(NR!=6)exit 1}' "$manifest" || return 1
+    [ "$(sed -n '1p' "$manifest")" = "AIS-GPT-LAYOUT$(printf '\t')1" ] || return 1
+    disk_guid=$(awk -F '\t' 'NR==2 && NF==2 && $1=="disk-guid" {print $2}' "$manifest") || return 1
+    _persist_uuid_valid "$disk_guid" || return 1
+    [ "$disk_guid" = "$(printf '%s' "$disk_guid" | tr '[:upper:]' '[:lower:]')" ] || return 1
+    expected=$(sed -n '3,6p' "$manifest") || return 1
+    printf '%s\n' "$expected" | awk -F '\t' -v disk_guid="$disk_guid" '
+      NF!=8 || $1!="part" || $2!=NR || $3!~/^[1-9][0-9]*$/ || length($3)>15 || $4!~/^[1-9][0-9]*$/ || length($4)>15 || length($5)!=36 || $5!=tolower($5) || $5!~/^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/ || length($6)!=36 || $6!=tolower($6) || $6!~/^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/ || $5==disk_guid || $6==disk_guid || uuid[$5]++ || uuid[$6]++ {exit 1}
+      NR==1 && ($5!="21686148-6449-6e6f-744e-656564454649" || $7!="BIOS" || $8!="-") {exit 1}
+      NR==2 && (tolower($5)!="c12a7328-f81f-11d2-ba4b-00a0c93ec93b" || $7!="AISBOOT" || $8!="LegacyBIOSBootable") {exit 1}
+      NR==3 && (tolower($5)!="0fc63daf-8483-4772-8e79-3d69d8477de4" || $7!="AISBASE" || $8!="-") {exit 1}
+      NR==4 && (tolower($5)!="ebd0a0a2-b9e5-4433-87c0-68b6b72699c7" || $7!="AISX" || $8!="-") {exit 1}
+      END {if(NR!=4)exit 1}' || return 1
+    dump=$(LC_ALL=C sfdisk --dump "$PERSIST_DISK") || return 1
+    printf '%s\n' "$dump" | awk '
+      /^[[:space:]]*$/ {next}
+      /^[a-z-]+:/ {k=$1; sub(/:$/, "", k); if(k!="label" && k!="label-id" && k!="device" && k!="unit" && k!="first-lba" && k!="last-lba" && k!="sector-size" && k!="table-length")exit 1; if(seen[k]++)exit 1; next}
+      /^\// {next}
+      {exit 1}' || return 1
+    headers=$(printf '%s\n' "$dump" | awk '
+      /^label:/ {if($0!="label: gpt" || label++)exit 2}
+      /^label-id:/ {v=$0; sub(/^label-id:[[:space:]]*/,"",v); if(guid!="")exit 2; guid=tolower(v)}
+      /^device:/ {v=$0; sub(/^device:[[:space:]]*/,"",v); if(device!="" || v=="")exit 2; device=v}
+      /^unit:/ {if($0!="unit: sectors" || unit++)exit 2}
+      /^first-lba:/ {v=$0; sub(/^first-lba:[[:space:]]*/,"",v); if(v!~/^[1-9][0-9]*$/ || first!="")exit 2; first=v}
+      /^last-lba:/ {v=$0; sub(/^last-lba:[[:space:]]*/,"",v); if(v!~/^[1-9][0-9]*$/ || length(v)>15 || last!="")exit 2; last=v}
+      /^sector-size:/ {if($0!="sector-size: 512" || sector++)exit 2}
+      /^table-length:/ {v=$0; sub(/^table-length:[[:space:]]*/,"",v); if(v!="128" || table++)exit 2}
+      END {if(label!=1 || unit!=1 || sector!=1 || first!="2048" || !last || (table && table!=1) || !guid || !device)exit 2; print guid "\t" last "\t" device}') || return 1
+    [ "${headers%%"$(printf '\t')"*}" = "$disk_guid" ] || return 1
+    local header_rest dump_device_real alias_real
+    header_rest=${headers#*"$(printf '\t')"}
+    table_last=${header_rest%%"$(printf '\t')"*}
+    dump_device=${header_rest#*"$(printf '\t')"}
+    dump_device_real=$(readlink -f "$dump_device") || return 1
+    alias_real=$(readlink -f "$PERSIST_DISK") || return 1
+    [ "$dump_device_real" = "$alias_real" ] || return 1
+    current_sectors=$(blockdev --getsz "$PERSIST_DISK") || return 1
+    _persist_decimal_valid "$current_sectors" || return 1
+    current_last=$((current_sectors - 34))
+    [ "$table_last" -ge 1 ] && [ "$table_last" -le "$current_last" ] || return 1
+    # On a grown image allow only util-linux's precise diagnosis of an old
+    # backup GPT location and PMBR size. Any other verification error rejects
+    # the table before relocation.
+    local verify_output verify_status
+    verify_output=$(LC_ALL=C sfdisk --verify "$PERSIST_DISK" 2>&1)
+    verify_status=$?
+    if [ "$table_last" -lt "$current_last" ] && [ "${PERSIST_GPT_RELOCATED:-0}" != 1 ]; then
+        [ "$verify_status" -eq 0 ] || return 1
+        printf '%s\n' "$verify_output" | awk -v device="$PERSIST_DISK:" -v old="$((table_last + 33))" -v current="$((current_last + 33))" '
+          /^GPT PMBR size mismatch \([0-9]+ != [0-9]+\) will be corrected by write\.$/ {
+            line=$0; sub(/^GPT PMBR size mismatch \(/,"",line); sub(/\) will be corrected by write\.$/,"",line); split(line,numbers," != "); if(numbers[1]!=old || numbers[2]!=current || pmbr++)exit 1; next
+          }
+          /^The backup GPT table is not on the end of the device\.$/ {if(backup++)exit 1; next}
+          $0==device {if(found_device++)exit 1; next}
+          /^MyLBA mismatch with real position at backup header\.$/ {if(mylba++)exit 1; next}
+          /^1 error detected\.$/ {if(errors++)exit 1; next}
+          {exit 1}
+          END {if(pmbr!=1 || backup!=1 || mylba!=1 || errors!=1 || found_device!=1 || NR!=5)exit 1}' || return 1
+    else
+        [ "$verify_status" -eq 0 ] || return 1
+        printf '%s\n' "$verify_output" | awk -v device="$PERSIST_DISK:" '
+          $0==device {if(found_device++)exit 1; next}
+          /^No errors detected\.$/ {if(clean++)exit 1; next}
+          /^Header version: [0-9]+\.[0-9]+$/ {if(header++)exit 1; next}
+          /^Using [0-9]+ out of 128 partitions\.$/ {if(partitions++)exit 1; next}
+          /^A total of [0-9]+ free sectors is available in [0-9]+ segments?( \(the largest is [0-9]+([.][0-9]+)? [A-Z][A-Za-z]*\))?\.$/ {if(free++)exit 1; next}
+          {exit 1}
+          END {if(NR<2 || found_device!=1 || clean!=1 || header>1 || partitions>1 || free>1)exit 1}' || return 1
+    fi
+    if [ "${PERSIST_GPT_RELOCATED:-0}" = 1 ]; then
+        [ "$table_last" = "$current_last" ] || return 1
+    fi
+    full_actual=$(printf '%s\n' "$dump" | awk -v tab="$(printf '\t')" -v disk_guid="$disk_guid" -v last_lba="$table_last" '
+      /^\// {
+        dev=$1; sub(/:$/, "", dev); n=dev; sub(/^.*[^0-9]/,"",n)
+        if(n!~/^[1-5]$/ || seen[n]++)exit 2
+        rest=substr($0,index($0,":")+1); start=size=type=uuid=name=attrs=""; fields=0
+        count=split(rest,parts,",")
+        for(i=1;i<=count;i++){
+          field=parts[i]; sub(/^[[:space:]]+/,"",field); sub(/[[:space:]]+$/, "",field)
+          if(field=="")continue
+          eq=index(field,"="); if(!eq)exit 2
+          key=substr(field,1,eq-1); val=substr(field,eq+1)
+          sub(/^[[:space:]]+/,"",val); sub(/[[:space:]]+$/, "",val)
+          if(val~/^".*"$/){sub(/^"/,"",val);sub(/"$/,"",val)}
+          if(key in got)exit 2
+          got[key]=1; fields++
+          if(key=="start")start=val; else if(key=="size")size=val; else if(key=="type")type=tolower(val); else if(key=="uuid")uuid=tolower(val); else if(key=="name")name=val; else if(key=="attrs")attrs=val; else exit 2
+        }
+        if(start!~/^[1-9][0-9]*$/ || length(start)>15 || size!~/^[1-9][0-9]*$/ || length(size)>15 || length(type)!=36 || type!~/^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/ || length(uuid)!=36 || uuid!~/^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/ || uuid==disk_guid || uuid_seen[uuid]++ || name=="")exit 2
+        if(start+size-1>last_lba)exit 2
+        # Keep overlap arithmetic numeric; extracted substrings otherwise
+        # compare lexicographically under awk mixed string/numeric rules.
+        part_start[n]=start+0; part_size[n]=size+0
+        if(n==1 && fields!=5)exit 2
+        if(n==2 && fields!=6)exit 2
+        if(n>=3 && fields!=5)exit 2
+        if(n==2 && attrs!="LegacyBIOSBootable")exit 2
+        if(n!=2 && fields==6)exit 2
+        if(n==5 && (type!="0fc63daf-8483-4772-8e79-3d69d8477de4" || name!="AISPERSIST"))exit 2
+        delete got
+        printf "part%s%d%s%s%s%s%s%s%s%s%s%s%s%s\n",tab,n,tab,start,tab,size,tab,type,tab,uuid,tab,name,tab,(attrs==""?"-":attrs)
+      }
+      END {count=0;for(i=1;i<=5;i++)if(seen[i])count++;if(count<4||count>5)exit 2;for(i=1;i<=4;i++)if(!seen[i])exit 2;for(i=1;i<=5;i++)if(seen[i])for(j=i+1;j<=5;j++)if(seen[j] && part_start[i]<=part_start[j]+part_size[j]-1 && part_start[j]<=part_start[i]+part_size[i]-1)exit 2}') || return 1
+    actual=$(printf '%s\n' "$full_actual" | sed -n '1,4p')
+    [ "$actual" = "$expected" ] || return 1
+    local p4_start p4_size p5_start p5_size p5_uuid source source_real boot_uuid expected_boot_uuid parent parent_real
+    p4_start=$(awk -F '\t' '$1=="part" && $2==4 {print $3}' "$manifest")
+    p4_size=$(awk -F '\t' '$1=="part" && $2==4 {print $4}' "$manifest")
+    p4end=$((p4_start + p4_size - 1))
+    [ "$table_last" -ge "$p4end" ] || return 1
+    source=$(findmnt -n -o SOURCE /run/archiso/bootmnt 2>/dev/null) || return 1
+    source_real=$(readlink -f "$source") || return 1
+    parent=$(lsblk -no PKNAME "$source_real" 2>/dev/null) || return 1
+    parent_real=$(readlink -f "/dev/$parent") || return 1
+    alias_real=$(readlink -f "$PERSIST_DISK") || return 1
+    [ "$parent_real" = "$alias_real" ] || return 1
+    expected_boot_uuid=$(awk -F '\t' '$1=="part" && $2==3 {print tolower($6)}' "$manifest")
+    boot_uuid=$(blkid -s PARTUUID -o value "$source_real" 2>/dev/null | tr '[:upper:]' '[:lower:]') || return 1
+    [ "$boot_uuid" = "$expected_boot_uuid" ] || return 1
+    local p3_start p3_size p4_uuid
+    p3_start=$(awk -F '\t' '$1=="part" && $2==3 {print $3}' "$manifest")
+    p3_size=$(awk -F '\t' '$1=="part" && $2==3 {print $4}' "$manifest")
+    _persist_validate_node "$source_real" 3 "$expected_boot_uuid" "$p3_start" "$p3_size" || return 1
+    p4_uuid=$(awk -F '\t' '$1=="part" && $2==4 {print tolower($6)}' "$manifest")
+    _persist_validate_node "$PERSIST_EXCHANGE_PART" 4 "$p4_uuid" "$p4_start" "$p4_size" || return 1
+    p5row=$(printf '%s\n' "$full_actual" | awk -F '\t' '$2==5 {print}')
+    if [ -n "$p5row" ]; then
+        p5_start=$(printf '%s\n' "$p5row" | awk -F '\t' '{print $3}')
+        p5_size=$(printf '%s\n' "$p5row" | awk -F '\t' '{print $4}')
+        p5_uuid=$(printf '%s\n' "$p5row" | awk -F '\t' '{print $6}')
+        [ "$p5_start" = "$(( (p4_start + p4_size + 2047) / 2048 * 2048 ))" ] || return 1
+        [ "$p5_size" = "$((current_last - p5_start + 1))" ] || return 1
+        [ "$table_last" = "$current_last" ] || return 1
+        _persist_uuid_valid "$p5_uuid" || return 1
+        if [ -b "$PERSIST_PART" ]; then
+            _persist_validate_node "$PERSIST_PART" 5 "$p5_uuid" "$p5_start" "$p5_size" || return 1
+        fi
+    else
+        [ "$table_last" -ge "$p4end" ] || return 1
+        [ ! -e "$PERSIST_PART" ] && [ ! -L "$PERSIST_PART" ] || return 1
+    fi
+    # Export values parsed from the already checked dump for the caller.
+    PERSIST_GPT_DUMP=$dump
+    PERSIST_P4_START=$p4_start
+    PERSIST_P4_SIZE=$p4_size
+    PERSIST_P5_PRESENT=0
+    [ -n "$p5row" ] && PERSIST_P5_PRESENT=1
+    return 0
+}
+
 _persist_create() {
-    local reply keyid
+    local reply keyid p5_start p5_size new_uuid before after old_disk signatures
+    _persist_verify_gpt || { _persist_die 'GPT does not match the verified boot image manifest; refusing partition changes.'; return 1; }
+    if [ "$PERSIST_P5_PRESENT" -eq 1 ]; then
+        if [ ! -b "$PERSIST_PART" ]; then
+            partx -a --nr 5:5 "$PERSIST_DISK" >/dev/null 2>&1 || { _persist_die 'Could not expose existing partition 5.'; return 1; }
+            udevadm settle --timeout=10 || { _persist_die 'Could not settle existing partition 5.'; return 1; }
+        fi
+        _persist_verify_gpt || { _persist_die 'Existing persistence partition identity could not be verified.'; return 1; }
+        [ -b "$PERSIST_PART" ] || { _persist_die 'Existing persistence partition node is unavailable.'; return 1; }
+        cryptsetup isLuks "$PERSIST_PART" >/dev/null 2>&1 || { _persist_die 'Existing persistence partition has no LUKS header; refusing to format it.'; return 1; }
+        return 0
+    fi
+    [ ! -e "$PERSIST_PART" ] && [ ! -L "$PERSIST_PART" ] || { _persist_die 'A stale persistence device node exists without a GPT p5; refusing to write.'; return 1; }
+    old_disk=$(readlink -f "$PERSIST_DISK") || return 1
     _persist_prompt || return 1
     printf '\nPersistence will partition and format %s. Type the full device path to confirm: ' "$PERSIST_DISK" >"$PERSIST_CONSOLE"
     IFS= read -r reply <"$PERSIST_CONSOLE" || reply=''
@@ -66,16 +285,54 @@ _persist_create() {
         _persist_die 'Device confirmation did not match. No formatting was performed.'
         return 1
     }
-    # Reuse the first-boot confirmation from the keyring. The passphrase is never
-    # written to a file or passed in argv.
-    sfdisk --relocate gpt-bak-std "$PERSIST_DISK" || return 1
-    printf ',,L\n' | sfdisk --append "$PERSIST_DISK" || return 1
-    partx -a "$PERSIST_DISK" || true
-    udevadm settle --timeout=10 || true
-    [ -b "$PERSIST_PART" ] || { _persist_die 'New persistence partition did not appear.'; return 1; }
-    # Refuse any device that already contains a LUKS header, even after an interrupted attempt.
-    if cryptsetup isLuks "$PERSIST_PART" >/dev/null 2>&1; then
-        _persist_die 'An existing LUKS header was found; refusing to format it.'
+    unset reply
+    # Prompts can take arbitrarily long. Re-identify and re-parse the complete
+    # table immediately before any partition write.
+    _persist_find_device || { _persist_die 'Could not re-identify the boot disk after confirmation.'; return 1; }
+    [ "$(readlink -f "$PERSIST_DISK")" = "$old_disk" ] || { _persist_die 'Boot disk identity changed after confirmation.'; return 1; }
+    _persist_verify_gpt || { _persist_die 'GPT changed after confirmation; refusing partition changes.'; return 1; }
+    [ "$PERSIST_P5_PRESENT" -eq 0 ] || { _persist_die 'Partition 5 appeared after confirmation; refusing to write.'; return 1; }
+    [ ! -e "$PERSIST_PART" ] && [ ! -L "$PERSIST_PART" ] || { _persist_die 'A persistence device node appeared after confirmation; refusing to write.'; return 1; }
+    before=$(printf '%s\n' "$PERSIST_GPT_DUMP" | sed -n '/^\//p') || return 1
+    # A larger target may have the image's backup GPT at its original end.
+    # Relocation is safe only after the complete table and boot-disk identity
+    # have been checked, and is revalidated before the p5 write.
+    sfdisk --no-reread --no-tell-kernel --relocate gpt-bak-std "$PERSIST_DISK" || { _persist_die 'Could not relocate the backup GPT safely.'; return 1; }
+    PERSIST_GPT_RELOCATED=1
+    _persist_verify_gpt || { _persist_die 'GPT changed during backup relocation.'; return 1; }
+    [ "$PERSIST_P5_PRESENT" -eq 0 ] || { _persist_die 'Partition 5 appeared during backup relocation.'; return 1; }
+    [ ! -e "$PERSIST_PART" ] && [ ! -L "$PERSIST_PART" ] || { _persist_die 'A persistence device node appeared before partition creation.'; return 1; }
+    after=$(printf '%s\n' "$PERSIST_GPT_DUMP" | sed -n '/^\//p') || return 1
+    [ "$before" = "$after" ] || { _persist_die 'Existing partition entries changed during backup relocation.'; return 1; }
+    p5_start=$(( (PERSIST_P4_START + PERSIST_P4_SIZE + 2047) / 2048 * 2048 ))
+    local disk_sectors
+    disk_sectors=$(blockdev --getsz "$PERSIST_DISK") || return 1
+    _persist_decimal_valid "$disk_sectors" || return 1
+    [ "$disk_sectors" -ge 131072 ] || return 1
+    p5_size=$((disk_sectors - 34 - p5_start + 1))
+    [ "$p5_size" -gt 0 ] || return 1
+    new_uuid=$(cat /proc/sys/kernel/random/uuid) || return 1
+    _persist_uuid_valid "$new_uuid" || return 1
+    if awk -F '\t' -v candidate="$new_uuid" '$1=="disk-guid" && $2==candidate {found=1} $1=="part" && $6==candidate {found=1} END {exit !found}' /run/archiso/bootmnt/ais-live/gpt-layout; then
+        _persist_die 'Generated persistence UUID duplicates an existing GPT UUID.'
+        return 1
+    fi
+    # Final full parse and identity check directly before the single-partition write.
+    _persist_verify_gpt || { _persist_die 'GPT failed final pre-write verification.'; return 1; }
+    [ "$PERSIST_P5_PRESENT" -eq 0 ] && [ "$(readlink -f "$PERSIST_DISK")" = "$old_disk" ] || { _persist_die 'Disk or partition state changed before write.'; return 1; }
+    [ ! -e "$PERSIST_PART" ] && [ ! -L "$PERSIST_PART" ] || { _persist_die 'A persistence device node appeared before partition creation.'; return 1; }
+    after=$(printf '%s\n' "$PERSIST_GPT_DUMP" | sed -n '/^\//p') || return 1
+    [ "$before" = "$after" ] || { _persist_die 'Verified source partitions changed before write.'; return 1; }
+    printf 'start=%s, size=%s, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=%s, name="AISPERSIST"\n' "$p5_start" "$p5_size" "$new_uuid" | sfdisk --no-reread --no-tell-kernel --wipe never --wipe-partitions never -N 5 "$PERSIST_DISK" || return 1
+    _persist_verify_gpt || { _persist_die 'Created GPT does not match the expected layout.'; return 1; }
+    if [ ! -b "$PERSIST_PART" ]; then
+        partx -a --nr 5:5 "$PERSIST_DISK" || return 1
+        udevadm settle --timeout=10 || return 1
+    fi
+    _persist_validate_node "$PERSIST_PART" 5 "$new_uuid" "$p5_start" "$p5_size" || { _persist_die 'New persistence partition device identity is invalid.'; return 1; }
+    signatures=$(wipefs -n "$PERSIST_PART" 2>&1) || { _persist_die 'Could not inspect persistence signatures.'; return 1; }
+    if cryptsetup isLuks "$PERSIST_PART" >/dev/null 2>&1 || [ -n "$signatures" ]; then
+        _persist_die 'An existing signature was found; refusing to format it.'
         return 1
     fi
     keyid=$(keyctl search @u user ais-live-exchange) || return 1
@@ -96,6 +353,7 @@ _persist_keyring_unlock() {
     [ -n "$pass" ] || return 1
     keyid=$(printf '%s' "$pass" | keyctl padd user ais-live-exchange @u) || { unset pass; return 1; }
     unset pass
+    keyctl setperm "$keyid" 0x003f0000 || { keyctl revoke "$keyid" 2>/dev/null || true; keyctl unlink "$keyid" @u 2>/dev/null || true; return 1; }
     [ -n "$keyid" ]
 }
 
@@ -105,6 +363,7 @@ _persist_open() {
     if keyctl pipe "$keyid" | cryptsetup open --key-file=- "$PERSIST_PART" ais-persist; then
         return 0
     fi
+    keyctl revoke "$keyid" || true
     keyctl unlink "$keyid" @u || true
     return 1
 }
@@ -199,6 +458,12 @@ _persist_pick_snapshot() {
     mv "$picked_upper" /run/ais-persist/@upper || return 1
     cp "/run/ais-persist/@pkglist/snapshot-meta/$selected/explicit" /run/ais-persist/@pkglist/explicit.tmp || return 1
     mv /run/ais-persist/@pkglist/explicit.tmp /run/ais-persist/@pkglist/explicit || return 1
+    if [ -e /run/ais-persist/@pkglist/reinstall-pending ]; then
+        [ -s /run/ais-persist/@pkglist/next-base-id ] || return 1
+        cp /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/base-id.tmp || return 1
+        mv /run/ais-persist/@pkglist/base-id.tmp /run/ais-persist/@pkglist/base-id || return 1
+        rm -f /run/ais-persist/@pkglist/reinstall-pending /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/fresh-upper-ready /run/ais-persist/@pkglist/migration-explicit /run/ais-persist/@pkglist/migration-base-id /run/ais-persist/@pkglist/migration-snapshot /run/ais-persist/@pkglist/user-changes /run/ais-persist/@pkglist/migration-user-additions /run/ais-persist/@pkglist/migration-user-removals
+    fi
     rm -f /run/ais-persist/@pkglist/pick-promotion/upper /run/ais-persist/@pkglist/pick-promotion/source
     rmdir /run/ais-persist/@pkglist/pick-promotion || return 1
     PERSIST_UPPER=/run/ais-persist/@upper
@@ -221,6 +486,12 @@ _persist_recover_pick() {
     btrfs subvolume show /run/ais-persist/@upper >/dev/null 2>&1 || return 1
     cp "/run/ais-persist/@pkglist/snapshot-meta/$selected/explicit" /run/ais-persist/@pkglist/explicit.tmp || return 1
     mv /run/ais-persist/@pkglist/explicit.tmp /run/ais-persist/@pkglist/explicit || return 1
+    if [ -e /run/ais-persist/@pkglist/reinstall-pending ]; then
+        [ -s /run/ais-persist/@pkglist/next-base-id ] || return 1
+        cp /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/base-id.tmp || return 1
+        mv /run/ais-persist/@pkglist/base-id.tmp /run/ais-persist/@pkglist/base-id || return 1
+        rm -f /run/ais-persist/@pkglist/reinstall-pending /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/fresh-upper-ready /run/ais-persist/@pkglist/migration-explicit /run/ais-persist/@pkglist/migration-base-id /run/ais-persist/@pkglist/migration-snapshot /run/ais-persist/@pkglist/user-changes /run/ais-persist/@pkglist/migration-user-additions /run/ais-persist/@pkglist/migration-user-removals
+    fi
     rm -f /run/ais-persist/@pkglist/pick-promotion/upper /run/ais-persist/@pkglist/pick-promotion/source
     rmdir /run/ais-persist/@pkglist/pick-promotion || return 1
 }
@@ -229,43 +500,41 @@ run_hook() {
     local mode
     mode=$(getarg ais.mode latest)
     case "$mode" in latest|pick|clean) ;; *) _persist_die "Unknown ais.mode: $mode"; return 1 ;; esac
-    [ "$mode" = clean ] && { echo "AIS-LIVE: stage=persist status=ok mode=clean" >"$PERSIST_CONSOLE"; return 0; }
-    _persist_find_device || { _persist_die 'Could not identify the boot disk for persistence.'; return 1; }
-    printf '%s\n' "$PERSIST_PART" >/run/ais-persist-device
-    printf '%s\n' "$PERSIST_EXCHANGE_PART" >/run/ais-persist-exchange-device
-    if [ ! -b "$PERSIST_PART" ]; then
-        _persist_create || { _persist_die 'Initial persistence creation failed. No existing data was overwritten.'; return 1; }
-    fi
-    if cryptsetup isLuks "$PERSIST_PART" >/dev/null 2>&1; then
-        :
-    elif [ -e "$PERSIST_PART" ]; then
-        _persist_die 'Persistence partition exists without a LUKS header. Refusing to overwrite it.'
-        return 1
-    else
-        _persist_die 'Persistence partition was not created.'
-        return 1
-    fi
-    PERSIST_MAPPER=/dev/mapper/ais-persist
-    if [ ! -e "$PERSIST_MAPPER" ]; then
-      if ! keyctl search @u user ais-live-exchange >/dev/null 2>&1; then
-        while ! _persist_keyring_unlock || ! _persist_open; do
-            echo 'Unable to unlock persistence. Try again.' >"$PERSIST_CONSOLE"
-        done
-      else
-        _persist_open || { _persist_die 'Could not unlock persistence.'; return 1; }
-      fi
-    fi
-    _persist_mount || { _persist_die 'Could not mount persistence filesystem.'; return 1; }
-    _persist_subvolumes || { _persist_die 'Could not initialise persistence subvolumes.'; return 1; }
     printf '%s\n' "$mode" >/run/ais-persist-mode
 }
 
 run_latehook() {
-    local mode upper workdir exchange_part newroot=/sysroot
+    local mode upper workdir exchange_part newroot=/sysroot ids uid gid owner
     mode=$(cat /run/ais-persist-mode 2>/dev/null) || return 0
-    [ "$mode" = clean ] && return 0
+    _persist_find_device || _persist_die 'Could not identify boot disk from the mounted AISBASE.'
+    _persist_verify_gpt || _persist_die 'Boot disk GPT does not match the trusted image manifest.'
+    printf '%s\n' "$PERSIST_EXCHANGE_PART" >/run/ais-persist-exchange-device
+    ln -sfn "$PERSIST_EXCHANGE_PART" /run/ais-live-exchange-device
+    [ "$mode" = clean ] && { echo "AIS-LIVE: stage=persist status=ok mode=clean" >"$PERSIST_CONSOLE"; return 0; }
+    printf '%s\n' "$PERSIST_PART" >/run/ais-persist-device || _persist_die 'Could not record the verified persistence device.'
+    _persist_create || _persist_die 'Persistence verification or initial creation failed. Existing partitions were not formatted.'
+    PERSIST_MAPPER=/dev/mapper/ais-persist
+    if [ ! -e "$PERSIST_MAPPER" ]; then
+        if ! keyctl search @u user ais-live-exchange >/dev/null 2>&1; then
+            while ! _persist_keyring_unlock || ! _persist_open; do echo 'Unable to unlock persistence. Try again.' >"$PERSIST_CONSOLE"; done
+        else
+            _persist_open || _persist_die 'Could not unlock persistence.'
+        fi
+    fi
+    _persist_mount || _persist_die 'Could not mount persistence filesystem.'
+    _persist_subvolumes || _persist_die 'Could not initialise persistence subvolumes.'
     _persist_recover_pick || _persist_die 'Could not recover interrupted snapshot selection.'
     _persist_prepare_base || _persist_die 'Could not prepare persistent upper for the current base.'
+    ids=/run/archiso/airootfs/etc/ais-live/agent-ids
+    [ -r "$ids" ] || _persist_die 'Agent ownership contract is missing.'
+    printf 'uid=1001\ngid=1001\n' | cmp -s - "$ids" || _persist_die 'Agent ownership contract is invalid.'
+    uid=1001; gid=1001
+    owner="$uid:$gid"
+    if [ ! -e /run/ais-persist/@pkglist/config-owner-ready ]; then
+        chown "$owner" /run/ais-persist/@config || _persist_die 'Could not initialise persistent agent home ownership.'
+        : >/run/ais-persist/@pkglist/config-owner-ready
+    fi
+    [ "$(stat -c '%u:%g' /run/ais-persist/@config)" = "$owner" ] || _persist_die 'Persistent agent home ownership does not match the image contract.'
     PERSIST_UPPER=/run/ais-persist/@upper
     if [ "$mode" = pick ]; then _persist_pick_snapshot || _persist_die 'Could not prepare selected snapshot.'; fi
     mkdir -p "$PERSIST_UPPER/upperdir"
@@ -288,6 +557,7 @@ run_latehook() {
     mount -o remount,bind,rw,noexec,nodev,nosuid /run/ais-persist "$newroot/mnt/persist" || _persist_die 'Could not secure persistence mount.'
     chmod 0700 "$newroot/mnt/persist"
     mount --bind /run/ais-persist/@config "$newroot/home/agent" || _persist_die 'Could not mount persistent home.'
+    [ "$(stat -c '%u:%g' /run/ais-persist/@config)" = "$owner" ] || _persist_die 'Bound agent home ownership is invalid.'
     mount --bind /run/ais-persist/@logs "$newroot/var/log/ais" || _persist_die 'Could not mount persistent logs.'
     mount --bind /run/ais-persist/@snapshots "$newroot/.snapshots" || _persist_die 'Could not expose snapshots.'
     mkdir -p "$newroot/mnt/aisx"

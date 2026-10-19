@@ -5,7 +5,7 @@ if {$argc < 2 || ![string is integer -strict [lindex $argv 0]] || [lindex $argv 
 }
 if {![info exists env(AIS_PERSIST_PHASE)]} { puts stderr {persist-test: phase is required}; exit 2 }
 set phase $env(AIS_PERSIST_PHASE)
-if {$phase ni {created wrong-pass package verify-package clean pick retention}} { puts stderr {persist-test: invalid phase}; exit 2 }
+if {$phase ni {created wrong-pass package verify-package retry clean pick verify-pick retention}} { puts stderr {persist-test: invalid phase}; exit 2 }
 set timeout [lindex $argv 0]
 set command [lrange $argv 1 end]
 set passphrase {SYNTHETIC_FIXTURE_ais_live_persist_passphrase}
@@ -35,14 +35,14 @@ proc fail {reason} {
 }
 while {!$phaseReady} {
     expect {
-        -re {(AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell|Unable to unlock persistence|[0-9]+\)[[:space:]]+pre-pacman-[^\r\n]*|Create encrypted persistence\. Enter a passphrase \(at least 12 characters\): |Confirm passphrase: |Persistence will partition and format /dev/[[:alnum:]_.-]+[[:alnum:]_-]\. Type the full device path to confirm: |AIS persistence passphrase: |AIS-LIVE: stage=first-boot-create status=ok|AIS-LIVE: stage=persist status=ok mode=(latest|pick|clean)|AIS-LIVE: prompt=snapshot-selection|Selection: |AIS-LIVE: stage=kernel-up status=ok|AIS-LIVE: stage=persist-test status=ok phase=[a-z-]+(\r|\n|$))} {
+        -re {(AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell|Unable to unlock persistence|[0-9]+\)[[:space:]]+pre-pacman-[^\r\n]*|Create encrypted persistence\. Enter a passphrase \(at least 12 characters\): |Confirm passphrase: |Persistence will partition and format /dev/[^[:space:]]+\. Type the full device path to confirm: |AIS persistence passphrase: |AIS-LIVE: stage=first-boot-create status=ok|AIS-LIVE: stage=persist status=ok mode=(latest|pick|clean)|AIS-LIVE: prompt=snapshot-selection|Selection: |AIS-LIVE: stage=kernel-up status=ok|AIS-LIVE: stage=persist-test status=ok phase=[a-z-]+(\r|\n|$))} {
             set token $expect_out(0,string)
             if {[regexp {AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell} $token]} { fail {guest reported a boot or assertion failure} }
             if {[string first {Unable to unlock persistence} $token] >= 0} {
                 if {$phase ne "wrong-pass"} { fail {unexpected unlock retry} }
                 incr rejectionCount
             } elseif {[regexp {([0-9]+)\)[[:space:]]+pre-pacman-} $token -> choice]} {
-                if {$phase eq "pick" && $prePacmanChoice eq ""} { set prePacmanChoice $choice }
+                if {$phase eq "pick"} { set prePacmanChoice $choice }
             } elseif {[string first {Create encrypted persistence.} $token] >= 0} {
                 if {$phase ne "created" || $firstCreate} { fail {unexpected first-boot create prompt} }
                 send -- "$passphrase\r"
@@ -51,7 +51,7 @@ while {!$phaseReady} {
                 send -- "$passphrase\r"
             } elseif {[string first {Persistence will partition and format} $token] >= 0} {
                 if {$phase ne "created" || $firstCreate} { fail {unexpected device confirmation} }
-                regexp {(/dev/[[:alnum:]_.-]+[[:alnum:]_-])\.} $token -> device
+                regexp {(/dev/[^[:space:]]+)\.} $token -> device
                 send -- "$device\r"
             } elseif {[string first {AIS persistence passphrase:} $token] >= 0} {
                 if {$phase eq "wrong-pass" && $wrongSent < 3} {

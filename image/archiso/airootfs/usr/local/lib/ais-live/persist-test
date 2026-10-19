@@ -1,5 +1,7 @@
 #!/usr/bin/bash
 set -euo pipefail
+# shellcheck disable=SC1091
+source /usr/local/lib/ais-live/persist-assertions
 
 cmdline=" $(cat /proc/cmdline) "
 [[ $cmdline == *' ais.test=1 '* && $cmdline == *' ais.scenario=persist '* ]] || exit 0
@@ -8,7 +10,7 @@ for arg in $cmdline; do
     case "$arg" in ais.persist-phase=*) phase=${arg#*=} ;; esac
 done
 case "$phase" in
-    created|wrong-pass|package|verify-package|clean|pick|retention) ;;
+    created|wrong-pass|package|verify-package|retry|clean|pick|verify-pick|retention) ;;
     *) printf 'AIS-LIVE: stage=persist-test status=fail reason=phase\n' >/dev/ttyS0; exit 1 ;;
 esac
 exec >/dev/ttyS0 2>&1
@@ -20,14 +22,28 @@ ok() {
 device=$(cat /run/ais-persist-device 2>/dev/null || true)
 
 case "$phase" in
-    created|wrong-pass|package|verify-package|pick|retention)
+    created|wrong-pass|package|verify-package|retry|pick|verify-pick|retention)
         [[ -n "$device" ]] || fail device
         cryptsetup isLuks "$device" || fail luks
+        cryptsetup luksDump "$device" > /run/ais-persist-luks-dump || fail luks-dump
+        grep -q '^Version:[[:space:]]*2$' /run/ais-persist-luks-dump || fail luks2
+        persist_assert_luks_dump /run/ais-persist-luks-dump || fail argon2id
         mountpoint -q /mnt/persist || fail mount
         [[ -d /mnt/persist/@config && -d /mnt/persist/@logs && -d /mnt/persist/@upper && -d /mnt/persist/@pkglist && -d /mnt/persist/@snapshots/boot && -d /mnt/persist/@snapshots/pre-pacman ]] || fail subvolumes
+        keyid=$(keyctl search @u user ais-live-exchange) || fail missing-exchange-key
+        key_description=$(keyctl rdescribe "$keyid") || fail exchange-key-description
+        persist_assert_key_description "$key_description" || fail exchange-key-permissions
+        persist_assert_key_unreadable_as agent "$keyid" || fail agent-read-exchange-key
+        [[ $(stat -c '%u:%g' /home/agent) == 1001:1001 ]] || fail agent-home-owner
+        runuser -u agent -- sh -c 'printf "%s\\n" SYNTHETIC_FIXTURE_agent_config_write > /home/agent/.ais-config-write-test' || fail agent-config-write
+        if [[ $phase == created ]]; then
+            labels=$(blkid -o device -t LABEL=AISX | wc -l)
+            (( labels >= 2 )) || fail duplicate-aisx-labels-not-present
+        fi
         ;;
     clean)
-        [[ ! -e /run/ais-persist-device ]] || fail clean-device
+        labels=$(blkid -o device -t LABEL=AISX | wc -l)
+        (( labels >= 2 )) || fail duplicate-aisx-labels-not-present
         ! mountpoint -q /mnt/persist || fail clean-mounted
         ! pacman -Q tree >/dev/null 2>&1 || fail clean-package-present
         [[ ! -e /usr/bin/tree ]] || fail clean-package-file-present
@@ -44,6 +60,15 @@ case "$phase" in
         [[ -f /mnt/persist/@pkglist/scenario-state ]] || fail persistence-state-lost
         ;;
     package)
+        printf '%s\n' tree > /mnt/persist/@pkglist/migration-explicit
+        cp /mnt/persist/@pkglist/base-id /mnt/persist/@pkglist/migration-base-id
+        cat /run/archiso/airootfs/etc/ais-live/base-id > /mnt/persist/@pkglist/next-base-id
+        : > /mnt/persist/@pkglist/reinstall-pending
+        nmcli networking off || fail network-disable
+        migration_rc=0
+        /usr/local/lib/ais-live/ais-live-persist > /run/ais-persist-migration.log 2>&1 || migration_rc=$?
+        [[ $migration_rc == 10 ]] || fail migration-not-deferred
+        grep -q 'status=deferred' /run/ais-persist-migration.log || fail migration-marker
         mkdir -p /mnt/ais-test-cache
         mountpoint -q /mnt/ais-test-cache || mount -o ro /dev/disk/by-label/AIS_TEST_CACHE /mnt/ais-test-cache
         before=$(find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' | wc -l)
@@ -58,6 +83,7 @@ EOF
         pacman --config /run/ais-persist-test-pacman.conf -S --noconfirm tree || fail package-install
         pacman -Q tree >/dev/null || fail package-query
         [[ -x /usr/bin/tree ]] || fail package-file
+        grep -Fxq tree /mnt/persist/@pkglist/migration-user-additions || fail offline-package-addition-not-recorded
         after=$(find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' | wc -l)
         (( after == before + 1 )) || fail package-snapshot-count
         find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' -printf '%f\n' | sort -r | head -n 1 > /mnt/persist/@pkglist/scenario-pick-target
@@ -65,8 +91,85 @@ EOF
     verify-package)
         pacman -Q tree >/dev/null || fail package-persist-query
         [[ -x /usr/bin/tree ]] || fail package-persist-file
+        persist_assert_package_recorded tree /mnt/persist/@pkglist/explicit || fail package-persist-not-recorded
+        [[ -e /mnt/persist/@pkglist/reinstall-pending ]] || fail partial-pending-lost
+        grep -q 'status=partial' /mnt/persist/@pkglist/migration-result || fail partial-replay-not-recorded
+        ;;
+    verify-pick)
+        [[ ! -e /mnt/persist/@pkglist/reinstall-pending && ! -e /mnt/persist/@pkglist/migration-explicit ]] || fail pending-migration-survived-pick
+        pacman -Q tree >/dev/null 2>&1 && fail pick-package-not-restored-from-snapshot
+        [[ ! -e /usr/bin/tree ]] || fail pick-package-file-not-restored-from-snapshot
+        nmcli networking on || fail pick-network-enable
+        systemctl unmask NetworkManager.service || fail pick-network-unmask
+        systemctl start NetworkManager.service || fail pick-network-start
+        timeout 45 nm-online -q || fail pick-network-not-online
+        systemctl start ais-live-persist-retry.service || fail pick-retry-service
+        [[ ! -e /mnt/persist/@pkglist/reinstall-pending ]] || fail pick-retry-created-pending
+        pacman -Q tree >/dev/null 2>&1 && fail pick-retry-restored-package
+        [[ ! -e /usr/bin/tree ]] || fail pick-retry-restored-package-file
+        ;;
+    retry)
+        grep -Fxq tree /mnt/persist/@pkglist/migration-user-additions || fail offline-package-addition-not-recorded
+        [[ -e /mnt/persist/@pkglist/reinstall-pending ]] || fail migration-not-pending
+        migration_rc=0
+        /usr/local/lib/ais-live/ais-live-persist > /run/ais-persist-migration.log 2>&1 || migration_rc=$?
+        [[ $migration_rc == 10 ]] || fail migration-not-deferred
+        grep -q 'status=deferred' /run/ais-persist-migration.log || fail migration-marker
+        nmcli networking on || fail network-enable
+        systemctl unmask NetworkManager.service || fail network-unmask
+        systemctl start NetworkManager.service || fail network-start
+        timeout 45 nm-online -q || fail network-not-online
+        mkdir -p /mnt/ais-test-cache
+        mountpoint -q /mnt/ais-test-cache || mount -o ro /dev/disk/by-label/AIS_TEST_CACHE /mnt/ais-test-cache
+        cat > /run/ais-persist-test-pacman.conf <<'EOF'
+[options]
+Architecture = auto
+SigLevel = PackageRequired DatabaseOptional
+[ais-test]
+Server = file:///mnt/ais-test-cache/repo
+EOF
+        install -m 0644 /run/ais-persist-test-pacman.conf /etc/pacman.conf
+        systemctl start ais-live-persist-retry.service || fail retry-service
+        [[ ! -e /mnt/persist/@pkglist/reinstall-pending ]] || fail replay-pending
+        grep -Fxq tree /mnt/persist/@pkglist/explicit || fail package-persist-not-recorded
+        pacman -Q tree >/dev/null || fail package-persist-query
+        keyctl search @u user ais-live-exchange >/dev/null || fail retry-revoked-exchange-key
+        cp /mnt/persist/@pkglist/explicit /mnt/persist/@pkglist/migration-explicit
+        cp /mnt/persist/@pkglist/base-id /mnt/persist/@pkglist/migration-base-id
+        cp /mnt/persist/@pkglist/base-id /mnt/persist/@pkglist/next-base-id
+        : > /mnt/persist/@pkglist/fresh-upper-ready
+        : > /mnt/persist/@pkglist/reinstall-pending
+        systemctl start ais-live-persist-retry.service || fail next-base-retry-service
+        pacman -Q tree >/dev/null || fail package-lost-after-next-base
+        grep -Fxq tree /mnt/persist/@pkglist/explicit || fail package-not-recorded-after-next-base
+        printf '%s\n' tree SYNTHETIC_FIXTURE_unavailable_package > /mnt/persist/@pkglist/migration-explicit
+        cp /mnt/persist/@pkglist/base-id /mnt/persist/@pkglist/migration-base-id
+        cp /mnt/persist/@pkglist/base-id /mnt/persist/@pkglist/next-base-id
+        : > /mnt/persist/@pkglist/fresh-upper-ready
+        : > /mnt/persist/@pkglist/reinstall-pending
+        partial_rc=0
+        /usr/local/lib/ais-live/ais-live-persist --retry > /run/ais-persist-partial.log 2>&1 || partial_rc=$?
+        [[ $partial_rc == 10 ]] || fail partial-replay-exit
+        grep -q 'status=partial' /run/ais-persist-partial.log || fail partial-replay-not-recorded
+        install -m 0600 /run/ais-persist-partial.log /mnt/persist/@pkglist/migration-result
+        systemctl start ais-live-persist-retry.service > /run/ais-persist-partial.log 2>&1 || :
+        [[ -e /mnt/persist/@pkglist/reinstall-pending ]] || fail partial-replay-cleared-pending
+        grep -q 'status=partial' /mnt/persist/@pkglist/migration-result || fail partial-replay-not-recorded
+        systemctl stop ais-live-outbox.timer || fail outbox-timer-stop
+        systemctl stop ais-live-outbox.service || fail outbox-service-stop
+        systemctl start ais-live-outbox-shutdown.service || fail outbox-start
+        systemctl stop ais-live-outbox-shutdown.service || fail outbox-shutdown
+        shopt -s nullglob
+        outbox_bundles=(/mnt/aisx/outbox/bundle-*.age)
+        ((${#outbox_bundles[@]} > 0)) || fail outbox-not-written
+        keyctl search @u user ais-live-exchange >/dev/null || fail outbox-revoked-exchange-key
+        key_serial=$(keyctl search @u user ais-live-exchange) || fail outbox-revoked-exchange-key
+        systemctl is-active --quiet ais-live-key-lifetime.service || fail key-lifetime-not-active
+        systemctl stop ais-live-key-lifetime.service || fail key-lifetime-stop
+        persist_assert_key_revoked "$key_serial" || fail shutdown-retained-exchange-key
         ;;
     pick)
+        [[ ! -e /mnt/persist/@pkglist/reinstall-pending && ! -e /mnt/persist/@pkglist/migration-explicit ]] || fail pending-migration-survived-pick
         source=$(cat /run/ais-persist-picked-source 2>/dev/null || true)
         [[ -n "$source" ]] || fail pick-source
         [[ $(btrfs property get -ts "$source" ro) == 'ro=true' ]] || fail pick-source-writable
@@ -75,6 +178,12 @@ EOF
         printf '%s\n' 'SYNTHETIC_FIXTURE writable-child' > /usr/share/ais-live-persist-pick-test
         [[ -f /usr/share/ais-live-persist-pick-test ]] || fail pick-overlay-write
         [[ ! -e "$source/upperdir/usr/share/ais-live-persist-pick-test" ]] || fail pick-mutated-source
+        pick_count=0
+        [[ ! -e /mnt/persist/@pkglist/pick-count ]] || pick_count=$(< /mnt/persist/@pkglist/pick-count)
+        pick_count=$((pick_count + 1))
+        printf '%s\n' "$pick_count" > /mnt/persist/@pkglist/pick-count
+        dd if=/dev/urandom of="/usr/share/SYNTHETIC_FIXTURE_pick_data_$pick_count" bs=1M count=4 status=none || fail pick-distinct-data
+        /usr/local/lib/ais-live/ais-live-snapshot pre-pacman || fail pick-retained-snapshot
         pacman -Q tree >/dev/null 2>&1 && fail pick-package-present
         [[ ! -e /usr/bin/tree ]] || fail pick-package-file-present
         ;;
@@ -84,6 +193,24 @@ EOF
         boots=$(find /mnt/persist/@snapshots/boot -mindepth 1 -maxdepth 1 -type d -name 'boot-*' | wc -l)
         transactions=$(find /mnt/persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d -name 'pre-pacman-*' | wc -l)
         [[ $boots -eq 5 && $transactions -eq 10 ]] || fail retention
+        for ((i=0; i<5; i++)); do /usr/local/lib/ais-live/ais-live-snapshot boot; done
+        for ((i=0; i<8; i++)); do /usr/local/lib/ais-live/ais-live-snapshot pre-pacman; done
+        /usr/local/lib/ais-live/ais-live-prune all
+        displaced=$(find /mnt/persist/@snapshots -mindepth 1 -maxdepth 1 -type d -name 'pick-displaced-*' | wc -l)
+        (( displaced <= 3 )) || fail displaced-snapshot-retention
+        sync
+        for ((i=1; i<=5; i++)); do
+            path="/mnt/persist/@snapshots/pick-displaced-SYNTHETIC_FIXTURE_$i"
+            btrfs subvolume create "$path" >/dev/null || fail displaced-fixture-create
+            dd if=/dev/urandom of="$path/unique-$i" bs=1M count=8 status=none || fail displaced-fixture-data
+        done
+        sync
+        available_before=$(df -B1 --output=avail /mnt/persist | tail -n 1)
+        /usr/local/lib/ais-live/ais-live-prune all || fail displaced-fixture-prune
+        btrfs subvolume sync /mnt/persist >/dev/null || fail displaced-subvolume-sync
+        sync
+        available_after=$(df -B1 --output=avail /mnt/persist | tail -n 1)
+        (( available_after >= available_before + 16777216 )) || fail displaced-data-not-reclaimed
         ;;
 esac
 ok
