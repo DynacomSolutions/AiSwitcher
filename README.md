@@ -105,7 +105,8 @@ ais local start [name]
 ```
 
 `ais launch` needs a terminal. It warns when the network is down and offers a
-local model (first in the list) when one is installed with a runner.
+local model when one is installed with a runner: first and pre-selected only
+when offline, last in the list when online.
 
 ### Memory served from a git-base base checkout
 
@@ -602,12 +603,12 @@ one API:
 - **Web**: `ais web start` runs a loopback-only HTTP server (default port
   47129) and serves the shadcn/ui dashboard from `apps/web/dist`. Pages:
   dashboard with live agent processes, identity editing, rate limits, token
-  usage, resumable sessions, auth status and fixes, and a config-file editor
+  usage, resumable sessions, auth status and fixes, local models, and a config-file editor
   for skills/agents/hooks/rules/memory inside whitelisted roots. Every page
   live-polls; nothing is a stale snapshot.
 - **TUI**: `ais tui` launches the ratatui dashboard (`apps/tui`, Rust) against
   the same server, with tick-polled tabs for status, processes, identities,
-  limits, usage, sessions, and auth.
+  limits, usage, sessions, auth, and local models.
 
 ```bash
 ais web start [--port=N]      # background daemon (default)
