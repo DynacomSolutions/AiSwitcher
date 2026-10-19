@@ -282,16 +282,41 @@ PY
   mark all complete
 }
 
-# Stub for review item 8 (not yet run in QEMU): confirm the stricter sandbox
-# (ProtectSystem=strict, ProtectKernelTunables, NoExecPaths=/) still lets
-# approved lvm, dmsetup and mdadm calls reach /dev/mapper/control, the /run
-# locks and sysfs. Failure here means the guard fails closed, not open.
+# Sandbox probe (review item 8). Each approved write run must succeed inside the
+# per-tool sandbox: mdadm needs writable sysfs, cryptsetup needs
+# /dev/mapper/control and /run/cryptsetup. A failure means the guard fails closed
+# but is too tight. Needs a booted image with the scratch disks; the host driver
+# must type each popup reply when it sees "AIS-GUARD-TEST: case=... status=reply".
+probe_approved() {
+  local case_name=$1
+  shift
+  reset_guard || return 1
+  start_guarded "$case_name" "$@" || return 1
+  mark "$case_name" reply
+  wait "$GUARDED_PID" || { mark "$case_name" failed; return 1; }
+  mark "$case_name" ok
+}
+
 sandbox_probe() {
   preflight || return
-  mark sandbox-probe stub
-  # TODO(coordinator): run_as_agent lvm pvcreate /dev/vdc, approve the popup,
-  # then repeat for dmsetup ls and mdadm --examine, asserting each exit code.
-  return 0
+  mkdir -p "$TEST_ROOT"
+  local loop_b loop_c
+  loop_b=$(losetup --find --show /dev/vdb) || return 1
+  loop_c=$(losetup --find --show /dev/vdc) || return 1
+  # shellcheck disable=SC2064
+  trap "mdadm --stop /dev/md/aisprobe >/dev/null 2>&1; losetup -d '$loop_b' '$loop_c' >/dev/null 2>&1" RETURN
+  GUARD_HERDR_SOCKET=$(LIVE_UID=$(id -u live) herdr_socket_path) || refuse 'live herdr socket absent' || return
+  export GUARD_HERDR_SOCKET
+  probe_approved mdadm-create mdadm --create /dev/md/aisprobe --run --level=1 --raid-devices=2 --metadata=1.2 "$loop_b" "$loop_c" || return 1
+  probe_approved mdadm-stop mdadm --stop /dev/md/aisprobe || return 1
+  # cryptsetup reads the key from stdin through the passed descriptor.
+  probe_approved luks-format bash -c "printf '%s' aisprobe-key | cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 /dev/vdb -" || return 1
+  probe_approved luks-open bash -c "printf '%s' aisprobe-key | cryptsetup open /dev/vdb aisprobe -" || return 1
+  [[ -b /dev/mapper/aisprobe ]] || return 1
+  probe_approved luks-close cryptsetup close aisprobe || return 1
+  # TODO(coordinator): lvm pvcreate/vgcreate on /dev/vdc and dmsetup ls once the
+  # host driver can answer two popups in sequence; confirm /run/lock/lvm is enough.
+  mark sandbox-probe complete
 }
 
 case "${1:-}" in
