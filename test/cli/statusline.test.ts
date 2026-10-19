@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { usageBars } from "../../src/cli/statusline.ts";
+import { PLUGIN_VERSION } from "../../mods/ais-usage/hooks/model.ts";
 
 const strip = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, "");
 const win = (category: string, usedPercent: number) => ({ label: category, category, usedPercent, resetsAt: "Oct 17, 8:00 AM" });
@@ -84,7 +85,7 @@ const snapshot = (dir: string, over: object | string, name = "swap.json") => {
   const claude = { toolName: "claude", identity: { name: "a", configDir: "/c/a" }, windows: [win("session", 10), win("week", 20)], status: "live" };
   const pool = { toolName: "claude", identity: { name: "team", configDir: "/c/swap", swapPool: { active: "a", accounts: ["a", "b"] } }, windows: [], status: "unavailable" };
   const codexPool = { toolName: "codex", identity: { name: "team", configDir: "/x/team", swapPool: { active: "a", accounts: ["a"] } }, windows: [], status: "unavailable" };
-  const body = typeof over === "string" ? over : JSON.stringify({ othersOpen: false, membersOpen: false, limits: [pool, claude, codex, codexPool], status: null, updatedAt: Date.now(), ...over });
+  const body = typeof over === "string" ? over : JSON.stringify({ othersOpen: false, membersOpen: false, limits: [pool, claude, codex, codexPool], status: null, updatedAt: Date.now(), pluginVersion: PLUGIN_VERSION, ...over });
   writeFileSync(join(dir, "ais-usage", name), body);
 };
 const poolRun = async (over: object | string, cols = 100) => {
@@ -215,4 +216,16 @@ test("two sessions on one identity each draw their own toggle; no session file f
   expect((await run("s1")).includes("codex")).toBe(true);
   expect((await run("s2")).includes("codex")).toBe(false);
   expect((await run("old")).includes("codex")).toBe(true);
+});
+
+test("plugin version constant matches plugin.json", () => {
+  expect(PLUGIN_VERSION).toBe(JSON.parse(readFileSync(join(import.meta.dir, "../../mods/ais-usage/.claude-plugin/plugin.json"), "utf8")).version);
+});
+
+test("snapshot from an older or versionless mod adds the outdated notice; a current one does not", async () => {
+  const notice = "ais-usage outdated: /reload-plugins or restart";
+  expect((await poolRun({})).lines.join("\n")).not.toContain(notice);
+  expect((await poolRun({ pluginVersion: "0.5.0" })).lines.at(-1)).toBe(notice);
+  expect((await poolRun({ pluginVersion: undefined })).lines.at(-1)).toBe(notice);
+  expect((await poolRun({ pluginVersion: "9.0.0" })).lines.join("\n")).not.toContain(notice);
 });

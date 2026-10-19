@@ -9,6 +9,7 @@ import {
   memberWindow,
   others,
   parseJson,
+  PLUGIN_VERSION,
   poolProviders,
   providerBlocks,
   snapshotPath,
@@ -65,6 +66,7 @@ const writeSnapshot = async ($: any) => {
         limits: lim,
         status: st,
         updatedAt: Date.now(),
+        pluginVersion: PLUGIN_VERSION,
       }),
     )
   } catch {

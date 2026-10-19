@@ -13,6 +13,7 @@ import {
   memberBlocks,
   memberCards,
   NAME_COL,
+  PLUGIN_VERSION,
   providerBlocks,
   resolveCurrent,
   rowSegments,
@@ -142,6 +143,8 @@ export async function usageBars(stdin: string, env: Record<string, string | unde
     const snap = readSnapshot(deps.cacheDir ?? aisCacheDir(), env.CLAUDE_CONFIG_DIR, typeof sid === "string" ? sid : undefined);
     if (snap) {
       try { lines.push(...toggleLines(snap, env.CLAUDE_CONFIG_DIR, cols)); } catch { /* bad snapshot: main bars only */ }
+      // The mod loads once per session: an older (or pre-0.5.3, versionless) one lacks later fixes such as auto-continue.
+      if (!snap.pluginVersion || Bun.semver.order(snap.pluginVersion, PLUGIN_VERSION) < 0) lines.push(paint(CODE.yellow, "ais-usage outdated: /reload-plugins or restart"));
     }
     return lines.join("\n") + "\n";
   } catch {

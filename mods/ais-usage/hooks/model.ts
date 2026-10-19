@@ -424,7 +424,12 @@ export function memberCards(blocks: MemberBlock[], cols: number): Seg[][][] {
   })
 }
 
+/** Version of this mod's source; keep equal to .claude-plugin/plugin.json (a test enforces it). The statusline compares sessions' recorded version against it. */
+export const PLUGIN_VERSION = '0.5.3'
+
 export type Snapshot = {
+  /** Plugin version the session loaded; absent in snapshots from mods older than 0.5.3. */
+  pluginVersion?: string
   /** Current field; the two booleans are written for older readers and read when `open` is absent. */
   open?: Section | null
   othersOpen?: boolean
