@@ -28,7 +28,7 @@ export const RESERVED_DOMAINS: readonly AllowlistEntry[] = [
 // needs, to function. Enumerated from the actual source: every entry below
 // has at least one call site or normative reference in this repository.
 export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
-  { domain: "github.com", reason: "release asset URLs and repo links (src/shared/release-assets.ts)" },
+  { domain: "github.com", reason: "release asset URLs and repo links (src/shared/release-assets.ts) and the connectivity probe (src/shared/connectivity.ts)" },
   { domain: "npmjs.org", reason: "npm registry version check (src/cli/upgrade.ts)" },
   { domain: "googleapis.com", reason: "Grok CLI's public build-artifact bucket (src/cli/upgrade.ts)" },
   { domain: "kimi.com", reason: "Kimi provider API and OAuth (src/cli/limits/kimi-limits.ts, src/identities/oauth-refresh.ts)" },
