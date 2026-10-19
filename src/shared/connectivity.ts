@@ -71,3 +71,13 @@ export function offlineWarning(subject: string, localModelAvailable: boolean): s
   const base = `No internet connection: ${subject} needs one. Check your network and try again.`;
   return localModelAvailable ? `${base} A local model is installed: run "ais local start" for help.` : base;
 }
+
+// Shim launches: cached result only. `localModelAvailable` stays false because
+// finding a model is async (discoverLocalModels) and the shim never waits.
+export function shimOfflineNotice(
+  deps: { cached?: () => boolean | undefined; localModelAvailable?: boolean } = {},
+): string | undefined {
+  return (deps.cached ?? (() => cachedOnline()))() === false
+    ? offlineWarning("this tool", deps.localModelAvailable ?? false)
+    : undefined;
+}
