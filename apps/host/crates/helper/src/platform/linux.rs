@@ -679,6 +679,46 @@ pub fn parse_snapshot(input: &str) -> Result<LinuxDiskSnapshot, ObservationError
     Ok(snapshot)
 }
 
+/// A sysfs-visible whole disk worth considering. Virtual, optical and RAM
+/// devices never carry a removable USB ancestry, so they are skipped early.
+fn is_candidate_disk_name(name: &str) -> bool {
+    !["loop", "ram", "zram", "dm-", "md", "sr", "nbd", "fd"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Unprivileged enumeration for the device selector. Only removable USB disks
+/// that are writable, unmounted and not backing system storage are returned,
+/// with the vendor model string for display. Anything that fails observation is
+/// omitted rather than guessed.
+pub fn list_eligible() -> Vec<(LinuxDiskObservation, Option<String>)> {
+    let Ok(entries) = fs::read_dir("/sys/block") else {
+        return Vec::new();
+    };
+    let mut found = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_candidate_disk_name(&name) {
+                return None;
+            }
+            let snapshot = collect_snapshot(&name).ok()?;
+            let observed = observe(&snapshot).ok()?;
+            let eligible = observed.observation.external_usb
+                && !observed.observation.system_backing
+                && observed.observation.writable;
+            let model =
+                fs::read_to_string(Path::new("/sys/block").join(&name).join("device/model"))
+                    .ok()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty());
+            eligible.then_some((observed, model))
+        })
+        .collect::<Vec<_>>();
+    found.sort_by(|a, b| a.0.kernel_name.cmp(&b.0.kernel_name));
+    found
+}
+
 /// Converts a complete topology snapshot into the core observation format.
 /// USB ancestry and removable status must both be present for eligibility.
 pub fn observe(snapshot: &LinuxDiskSnapshot) -> Result<LinuxDiskObservation, ObservationError> {
@@ -771,6 +811,18 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_names_skip_virtual_and_optical_disks() {
+        for name in [
+            "loop0", "ram1", "zram0", "dm-3", "md127", "sr0", "nbd0", "fd0",
+        ] {
+            assert!(!is_candidate_disk_name(name), "{name}");
+        }
+        for name in ["sda", "nvme0n1", "mmcblk0"] {
+            assert!(is_candidate_disk_name(name), "{name}");
+        }
+    }
 
     const USB: &str = "name=sdx\nmajorMinor=8:16\ndiskSequence=7\nsizeSectors=4000000\nlogicalSectorBytes=512\nremovable=1\ndeviceSyspath=/sys/devices/usb/SYNTHETIC_FIXTURE_DEVICE/block/sdx\nserial=SYNTHETIC_FIXTURE_DISK_01\npartitions=sdx1,8:17,2048,100000,efi;sdx2,8:18,102048,3897952,linux\ntableFingerprint=0000000000000000000000000000000000000000000000000000000000000000\nmountedMajorMinors=-\nsystemMajorMinors=-\nwritable=1";
 

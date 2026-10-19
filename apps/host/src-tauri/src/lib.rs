@@ -49,6 +49,29 @@ fn list_devices(
     state: tauri::State<'_, ConfirmationSession>,
 ) -> Vec<ais_host_core::device::DeviceSummary> {
     state.invalidate();
+    native_devices()
+}
+
+#[cfg(target_os = "linux")]
+fn native_devices() -> Vec<ais_host_core::device::DeviceSummary> {
+    ais_host_helper::platform::list_linux_eligible()
+        .into_iter()
+        .map(|(disk, model)| ais_host_core::device::DeviceSummary {
+            id: disk.observation.os_identity.clone(),
+            display_identifier: disk.observation.display_identifier.clone(),
+            model,
+            capacity_bytes: disk.observation.capacity_bytes,
+            transport: "usb".to_string(),
+            system: disk.observation.system_backing,
+            writable: disk.observation.writable,
+            serial: disk.observation.serial.clone(),
+            layout_status: "unknown".to_string(),
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_devices() -> Vec<ais_host_core::device::DeviceSummary> {
     Vec::new()
 }
 

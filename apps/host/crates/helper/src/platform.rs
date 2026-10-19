@@ -6,7 +6,10 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxBlockTarget, collect_by_identity as collect_linux_by_identity};
+pub use linux::{
+    LinuxBlockTarget, collect_by_identity as collect_linux_by_identity,
+    list_eligible as list_linux_eligible,
+};
 #[cfg(all(target_os = "linux", feature = "file-test"))]
 pub use linux::{
     LinuxDiskObservation, LinuxDiskSnapshot, LinuxPartition,
