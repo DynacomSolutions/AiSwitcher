@@ -194,6 +194,19 @@ export function findMachineNicknames(text: string): string[] {
   return [...text.matchAll(MACHINE_NICKNAME_RE)].map(match => match[0]);
 }
 
+// ---- Apple entitlement identifiers -------------------------------------------
+// Entitlement plists use Apple reverse-DNS keys and values (com.apple.*) that
+// parse as domains. Only that prefix, only inside <key>/<string> elements of
+// .plist/.entitlements files; any other token in those elements is still scanned.
+const PLIST_EXTENSIONS = new Set([".plist", ".entitlements"]);
+const PLIST_ELEMENT_RE = /(<(key|string)>)([^<]*)(<\/\2>)/g;
+const APPLE_ID_RE = /\bcom\.apple(?:\.[A-Za-z0-9-]+)+/g;
+
+export function stripAppleEntitlementIds(path: string, line: string): string {
+  if (!PLIST_EXTENSIONS.has(extname(path))) return line;
+  return line.replace(PLIST_ELEMENT_RE, (_m, open, _tag, body, close) => open + body.replace(APPLE_ID_RE, "") + close);
+}
+
 // ---- per-line rule aggregation -----------------------------------------------
 
 // This scanner's own unit tests deliberately contain non-allowlisted
@@ -208,7 +221,7 @@ export function checkLine(path: string, text: string, state: CommentState = { in
   if (findHomePaths(text).length) rules.add("identifying-home-path");
   if (findEmails(text).length) rules.add("blocked-email");
   if (findIps(text).length) rules.add("blocked-ip");
-  for (const segment of scannableSegments(path, text, state)) {
+  for (const segment of scannableSegments(path, stripAppleEntitlementIds(path, text), state)) {
     if (findDomains(segment).length) rules.add("blocked-domain");
     if (findMachineNicknames(segment).length) rules.add("personal-machine-nickname");
   }
