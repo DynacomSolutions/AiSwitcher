@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "toolRoots": [".claude", ".codex", ".grok", ".kimi-code", ".pi", ".opencode", ".zai", ".ali"],
+  "sshRoot": ".ssh",
+  "protectedPaths": [".ais/memory/GLOBAL.md"],
+  "authNames": [".credentials.json", "auth.json", "credentials.json", "auth.toml", "kimi-code.json", "crush.json", "console-cookie.txt"],
+  "authPaths": [".opencode/data/opencode/auth.json", ".opencode/opencode/auth.json"],
+  "identityRegistryPaths": [".ais/identities.json"],
+  "configPaths": {
+    ".ais/config/sync-v2.json": "config:settings",
+    ".claude/identities.json": "config:identity",
+    ".codex/identities.json": "config:identity",
+    ".grok/identities.json": "config:identity",
+    ".kimi-code/identities.json": "config:identity",
+    ".pi/identities.json": "config:identity",
+    ".opencode/identities.json": "config:identity",
+    ".zai/identities.json": "config:identity",
+    ".ali/identities.json": "config:identity"
+  },
+  "identityConfigNames": ["settings.json", "config.toml", "config.json", "models.json", "hooks.json", "identities.json"],
+  "rootConfigPaths": {
+    ".claude/settings.json": "config:settings",
+    ".codex/config.toml": "config:settings"
+  },
+  "sharedConfigDirectories": [".ais/hooks"],
+  "pluginDirectories": ["plugins"],
+  "logDirectories": ["projects", "sessions", "logs"],
+  "sharedLogDirectories": [".ais/logs"]
+}

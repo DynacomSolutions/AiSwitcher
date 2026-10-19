@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry deferred AIS inbox merges
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Unit=ais-live-inbox.service
+
+[Install]
+WantedBy=timers.target

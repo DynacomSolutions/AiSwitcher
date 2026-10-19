@@ -23,6 +23,7 @@ import { runSwapCommand } from "./swap/dispatch.ts";
 import { runLaunchCommand } from "./launch.ts";
 import { runLocalCommand } from "./local/dispatch.ts";
 import { runStatuslineCommand } from "./statusline.ts";
+import { runLiveCommand } from "./live/dispatch.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
  * and `unretire` are excluded: a sync merging the remote registry while the
@@ -89,6 +90,8 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "sync":
         return await runSyncCommand(rest, flags);
+      case "live":
+        return await runLiveCommand(rest, flags);
       case "__scan_worker":
         // Dynamic import: a static one here drags the whole scan-engine
         // graph into every entrypoint's init and segfaults bun --compile
