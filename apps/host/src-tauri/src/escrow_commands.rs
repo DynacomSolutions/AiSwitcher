@@ -63,6 +63,27 @@ pub async fn escrow_purge(
         .map_err(|error| error.to_string())
 }
 
+/// Wire only to the user's explicit clock-correction confirmation. No startup,
+/// clock-change event, refresh or retry may acknowledge suspicion on their behalf.
+#[tauri::command]
+pub async fn escrow_resolve_clock(
+    confirmed: bool,
+    state: tauri::State<'_, EscrowCommandState>,
+) -> Result<PurgeResult, String> {
+    if !confirmed {
+        return Err(EscrowError::ClockUntrusted.to_string());
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut registry = FileRegistry::open(&state.directory)?;
+        EscrowService::new(&mut NativeStore, &mut registry, &state.clock)
+            .resolve_clock_after_user_confirmation()
+    })
+    .await
+    .map_err(|_| EscrowError::Unavailable.to_string())?
+    .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn escrow_delete(
     drive_id: String,

@@ -1,6 +1,6 @@
 mod escrow_support;
 use ais_host_core::{
-    escrow::{EscrowError, EscrowPolicy, EscrowService, RetentionClock, purge_expired},
+    escrow::{EscrowError, EscrowPolicy, EscrowService, ItemRef, RetentionClock, purge_expired},
     registry::{EscrowState, FileRegistry, RegistryData, RegistryStorage},
 };
 use escrow_support::*;
@@ -180,6 +180,167 @@ fn invalid_json_is_not_replaced_by_an_empty_registry() {
     let mut registry = FileRegistry::open(&directory).unwrap();
     assert!(matches!(registry.load(), Err(EscrowError::InvalidRegistry)));
     assert_eq!(fs::read(directory.join("drives.json")).unwrap(), b"{");
+}
+
+/// Model a successful replacement followed by a failed directory sync. Every
+/// compensating registry save fails too, until the process is restarted.
+struct AmbiguousActivation {
+    inner: FileRegistry,
+    failed: bool,
+}
+impl RegistryStorage for AmbiguousActivation {
+    fn begin_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError> {
+        self.inner.begin_creation(item)
+    }
+    fn creation_pending(&mut self, item: &ItemRef) -> Result<bool, EscrowError> {
+        self.inner.creation_pending(item)
+    }
+    fn finish_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError> {
+        self.inner.finish_creation(item)
+    }
+    fn load(&mut self) -> Result<RegistryData, EscrowError> {
+        self.inner.load()
+    }
+    fn save(&mut self, data: &RegistryData) -> Result<(), EscrowError> {
+        if self.failed {
+            return Err(EscrowError::RegistryUnavailable);
+        }
+        self.inner.save(data)?;
+        if data
+            .records()
+            .any(|record| record.escrow_state() == EscrowState::Active)
+        {
+            self.failed = true;
+            return Err(EscrowError::RegistryUnavailable);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn failed_activation_cannot_be_read_after_replacement_and_failed_rollback() {
+    let directory = directory();
+    let mut backend = FakeStore {
+        fail_delete: true,
+        ..FakeStore::default()
+    };
+    let clock = RetentionClock::new(FakeClock::new(100));
+    {
+        let mut registry = AmbiguousActivation {
+            inner: FileRegistry::open(&directory).unwrap(),
+            failed: false,
+        };
+        assert!(matches!(
+            EscrowService::new(&mut backend, &mut registry, &clock).create_drive(
+                DRIVE,
+                EscrowPolicy::Until(200),
+                vec![],
+                Some(&secret())
+            ),
+            Err(EscrowError::RegistryUnavailable)
+        ));
+        assert_eq!(
+            registry
+                .load()
+                .unwrap()
+                .record(DRIVE)
+                .unwrap()
+                .escrow_state(),
+            EscrowState::Active
+        );
+        let item = registry
+            .load()
+            .unwrap()
+            .record(DRIVE)
+            .unwrap()
+            .item()
+            .cloned()
+            .unwrap();
+        assert!(registry.creation_pending(&item).unwrap());
+        assert_eq!(backend.values.len(), 1);
+    }
+    let restarted = RetentionClock::new(FakeClock::new(101));
+    let mut registry = FileRegistry::open(&directory).unwrap();
+    assert!(matches!(
+        EscrowService::new(&mut backend, &mut registry, &restarted).retrieve(DRIVE),
+        Err(EscrowError::Missing)
+    ));
+    assert_eq!(backend.gets, 0);
+    assert_eq!(
+        purge_expired(&mut backend, &mut registry, &restarted)
+            .unwrap()
+            .deletion_pending,
+        1
+    );
+    backend.fail_delete = false;
+    assert_eq!(
+        purge_expired(&mut backend, &mut registry, &restarted)
+            .unwrap()
+            .deleted,
+        1
+    );
+    assert!(backend.values.is_empty());
+    assert_eq!(backend.gets, 0);
+    assert_eq!(
+        registry
+            .load()
+            .unwrap()
+            .record(DRIVE)
+            .unwrap()
+            .escrow_state(),
+        EscrowState::Deleted
+    );
+}
+
+#[test]
+fn clock_suspicion_is_durable_until_explicit_resolution() {
+    let directory = directory();
+    let mut backend = FakeStore::default();
+    for wall in [100, 90, 110] {
+        let mut registry = FileRegistry::open(&directory).unwrap();
+        let clock = RetentionClock::new(FakeClock::new(wall));
+        if wall == 100 {
+            EscrowService::new(&mut backend, &mut registry, &clock)
+                .create_drive(DRIVE, EscrowPolicy::Until(200), vec![], Some(&secret()))
+                .unwrap();
+        } else {
+            assert!(matches!(
+                EscrowService::new(&mut backend, &mut registry, &clock).retrieve(DRIVE),
+                Err(EscrowError::ClockUntrusted)
+            ));
+            assert!(registry.load().unwrap().clock_untrusted());
+        }
+    }
+    assert_eq!(backend.gets, 0);
+    {
+        let mut registry = FileRegistry::open(&directory).unwrap();
+        let clock = RetentionClock::new(FakeClock::new(110));
+        EscrowService::new(&mut backend, &mut registry, &clock)
+            .resolve_clock_after_user_confirmation()
+            .unwrap();
+    }
+    let mut registry = FileRegistry::open(&directory).unwrap();
+    let clock = RetentionClock::new(FakeClock::new(111));
+    assert!(!registry.load().unwrap().clock_untrusted());
+    EscrowService::new(&mut backend, &mut registry, &clock)
+        .retrieve(DRIVE)
+        .unwrap();
+    assert_eq!(backend.gets, 1);
+    assert_eq!(
+        registry.load().unwrap().record(DRIVE).unwrap().retention(),
+        EscrowPolicy::Until(200)
+    );
+}
+
+#[test]
+fn legacy_registry_defaults_to_trusted_until_a_rollback_is_observed() {
+    let data = RegistryData::new().unwrap();
+    let mut json = serde_json::to_value(data).unwrap();
+    json.as_object_mut().unwrap().remove("clockUntrusted");
+    json.as_object_mut().unwrap().remove("clockResolution");
+    let legacy: RegistryData = serde_json::from_value(json).unwrap();
+    legacy.validate().unwrap();
+    assert!(!legacy.clock_untrusted());
 }
 
 #[test]

@@ -8,7 +8,10 @@ use crate::registry::{DriveRecord, EscrowState, RegistryData, RegistryStorage, v
 pub use age::secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Mutex,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,7 +60,9 @@ pub enum EscrowError {
     Missing,
     #[error("The retention period has expired. Deletion will be retried if necessary.")]
     Expired,
-    #[error("The local clock moved backwards. Correct it before retrieving a retained passphrase.")]
+    #[error(
+        "The local clock is untrusted. Correct it and explicitly confirm before retrieving a retained passphrase."
+    )]
     ClockUntrusted,
     #[error("An explicit future expiry is required when the drive is created.")]
     InvalidRetention,
@@ -116,32 +121,70 @@ impl Clock for SystemClock {
 /// registry operations. A monotonic deadline cannot be extended by wall rollback.
 pub struct RetentionClock<C: Clock> {
     clock: C,
-    wall_start: u64,
-    mono_start: u64,
+    anchor: Mutex<ClockAnchor>,
+}
+struct ClockAnchor {
+    effective: u64,
+    monotonic: u64,
+    untrusted: bool,
+    resolution: u64,
 }
 impl<C: Clock> RetentionClock<C> {
     pub fn new(clock: C) -> Self {
-        let wall_start = clock.wall_seconds();
-        let mono_start = clock.monotonic_seconds();
+        let anchor = ClockAnchor {
+            effective: clock.wall_seconds(),
+            monotonic: clock.monotonic_seconds(),
+            untrusted: false,
+            resolution: 0,
+        };
         Self {
             clock,
-            wall_start,
-            mono_start,
+            anchor: Mutex::new(anchor),
         }
     }
 
     fn observe(&self, data: &mut RegistryData) -> (u64, bool) {
+        let mut anchor = self.anchor.lock().unwrap_or_else(|poisoned| {
+            let mut anchor = poisoned.into_inner();
+            anchor.untrusted = true;
+            anchor
+        });
         let wall = self.clock.wall_seconds();
         let mono = self.clock.monotonic_seconds();
-        let suspicious = wall < data.last_observed_at || mono < self.mono_start;
+        // Another process may have saved an explicit user resolution. Honour
+        // it without resetting this process's effective monotonic deadline.
+        if data.clock_resolution > anchor.resolution {
+            anchor.resolution = data.clock_resolution;
+            anchor.untrusted = false;
+        }
+        anchor.untrusted |= self.anchor.is_poisoned()
+            || data.clock_untrusted
+            || wall < data.last_observed_at
+            || mono < anchor.monotonic;
         let effective = wall
             .max(
-                self.wall_start
-                    .saturating_add(mono.saturating_sub(self.mono_start)),
+                anchor
+                    .effective
+                    .saturating_add(mono.saturating_sub(anchor.monotonic)),
             )
             .max(data.last_observed_at);
+        // Re-anchor after every forward adjustment, including creation. The
+        // remaining lifetime must always decrease with elapsed monotonic time.
+        anchor.effective = effective;
+        anchor.monotonic = mono;
         data.last_observed_at = effective;
-        (effective, suspicious)
+        data.clock_untrusted = anchor.untrusted;
+        (effective, anchor.untrusted)
+    }
+
+    fn acknowledge(&self, resolution: u64) -> Result<(), EscrowError> {
+        let mut anchor = self
+            .anchor
+            .lock()
+            .map_err(|_| EscrowError::ClockUntrusted)?;
+        anchor.untrusted = false;
+        anchor.resolution = resolution;
+        Ok(())
     }
 }
 
@@ -171,8 +214,13 @@ pub fn purge_expired<D: EscrowDelete, R: RegistryStorage, C: Clock>(
     };
     for record in data.drives.values_mut() {
         let expired = matches!(record.retention, EscrowPolicy::Until(expiry) if expiry <= now);
+        let incomplete_creation = match &record.item {
+            Some(item) => repository.creation_pending(item)?,
+            None => false,
+        };
         if record.item.is_some()
             && (expired
+                || incomplete_creation
                 || record.escrow_state == EscrowState::PendingWrite
                 || record.forget_pending)
         {
@@ -192,6 +240,8 @@ pub fn purge_expired<D: EscrowDelete, R: RegistryStorage, C: Clock>(
             result.deletion_pending += 1;
             continue;
         }
+        // Clear the independent intent only after native deletion succeeded.
+        repository.finish_creation(&item)?;
         let record = data
             .drives
             .get_mut(&id)
@@ -289,6 +339,7 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
         validate_handle(id)?;
         let (now, suspicious) = self.clock.observe(data);
         if suspicious {
+            self.repository.save(data)?;
             return Err(EscrowError::ClockUntrusted);
         }
         let item = match policy {
@@ -325,6 +376,9 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
         data.validate()?;
         self.repository.save(data)?;
         if let Some(item) = item {
+            // This independent intent survives an Active replacement whose
+            // final sync fails, even when every compensating save also fails.
+            self.repository.begin_creation(&item)?;
             if let Err(error) = self
                 .backend
                 .put(&item, secret.ok_or(EscrowError::InvalidRetention)?)
@@ -350,6 +404,10 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
                 self.clean_failed_put(data, id, &item);
                 return Err(error);
             }
+            if let Err(error) = self.repository.finish_creation(&item) {
+                self.clean_failed_put(data, id, &item);
+                return Err(error);
+            }
         }
         data.drives
             .get(id)
@@ -361,7 +419,7 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
         let record = data.drives.get_mut(id).expect("created record");
         record.escrow_state = EscrowState::DeletionPending;
         let _ = self.repository.save(data);
-        if self.backend.delete(item).is_ok() {
+        if self.backend.delete(item).is_ok() && self.repository.finish_creation(item).is_ok() {
             let record = data.drives.get_mut(id).expect("created record");
             record.item = None;
             record.escrow_state = EscrowState::Deleted;
@@ -373,6 +431,10 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
         let mut data = self.repository.load()?;
         data.validate()?;
         let (now, suspicious) = self.clock.observe(&mut data);
+        // Persist suspicion even when the requested record cannot be read.
+        if suspicious {
+            self.repository.save(&data)?;
+        }
         let record = data.drives.get(id).ok_or(EscrowError::Missing)?;
         if !record.created_here {
             return Err(EscrowError::NotCreator);
@@ -387,13 +449,15 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
             return Err(EscrowError::Expired);
         }
         if suspicious {
-            self.repository.save(&data)?;
             return Err(EscrowError::ClockUntrusted);
         }
         if record.escrow_state != EscrowState::Active || record.forget_pending {
             return Err(EscrowError::Missing);
         }
         let item = record.item.clone().ok_or(EscrowError::InvalidRegistry)?;
+        if self.repository.creation_pending(&item)? {
+            return Err(EscrowError::Missing);
+        }
         self.repository.save(&data)?;
         let secret = self.backend.retrieve(&item)?;
         let (now, suspicious) = self.clock.observe(&mut data);
@@ -407,6 +471,28 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
             return Err(EscrowError::ClockUntrusted);
         }
         Ok(secret)
+    }
+
+    /// Invoke only after the user has corrected the clock and explicitly
+    /// confirmed that action. Catch-up, startup and refresh must never call it
+    /// automatically. Existing expiry timestamps and monotonic anchors remain
+    /// unchanged; due credentials are still deleted before this returns.
+    pub fn resolve_clock_after_user_confirmation(&mut self) -> Result<PurgeResult, EscrowError> {
+        let mut data = self.repository.load()?;
+        data.validate()?;
+        let (now, _) = self.clock.observe(&mut data);
+        if self.clock.clock.wall_seconds() < now {
+            self.repository.save(&data)?;
+            return Err(EscrowError::ClockUntrusted);
+        }
+        data.clock_untrusted = false;
+        data.clock_resolution = data
+            .clock_resolution
+            .checked_add(1)
+            .ok_or(EscrowError::InvalidRegistry)?;
+        self.repository.save(&data)?;
+        self.clock.acknowledge(data.clock_resolution)?;
+        purge_expired(self.backend, self.repository, self.clock)
     }
 
     pub fn delete(&mut self, id: &str) -> Result<(), EscrowError> {
@@ -485,6 +571,7 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
         data.validate()?;
         let (now, suspicious) = self.clock.observe(&mut data);
         if suspicious {
+            self.repository.save(&data)?;
             return Err(EscrowError::ClockUntrusted);
         }
         let record = data.drives.get_mut(id).ok_or(EscrowError::Missing)?;

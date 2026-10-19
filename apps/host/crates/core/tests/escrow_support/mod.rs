@@ -41,6 +41,8 @@ pub struct MemoryRegistry {
     pub data: RegistryData,
     pub saves: usize,
     pub fail_save: Option<usize>,
+    pub pending: Vec<ItemRef>,
+    pub fail_finish: bool,
 }
 impl Default for MemoryRegistry {
     fn default() -> Self {
@@ -48,10 +50,26 @@ impl Default for MemoryRegistry {
             data: RegistryData::new().unwrap(),
             saves: 0,
             fail_save: None,
+            pending: Vec::new(),
+            fail_finish: false,
         }
     }
 }
 impl RegistryStorage for MemoryRegistry {
+    fn begin_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError> {
+        self.pending.push(item.clone());
+        Ok(())
+    }
+    fn creation_pending(&mut self, item: &ItemRef) -> Result<bool, EscrowError> {
+        Ok(self.pending.contains(item))
+    }
+    fn finish_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError> {
+        if self.fail_finish {
+            return Err(EscrowError::RegistryUnavailable);
+        }
+        self.pending.retain(|pending| pending != item);
+        Ok(())
+    }
     fn load(&mut self) -> Result<RegistryData, EscrowError> {
         Ok(self.data.clone())
     }

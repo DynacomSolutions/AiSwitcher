@@ -216,6 +216,286 @@ fn clock_rollback_cannot_extend_monotonic_deadline_or_restart() {
 }
 
 #[test]
+fn forward_adjustment_before_creation_cannot_extend_its_monotonic_deadline() {
+    for retrieve_first in [true, false] {
+        let mut backend = FakeStore::default();
+        let mut registry = MemoryRegistry::default();
+        let time = FakeClock::new(100);
+        let clock = RetentionClock::new(time.clone());
+        time.wall.set(1_000);
+        service!(backend, registry, clock)
+            .create_drive(DRIVE, EscrowPolicy::Until(1_010), vec![], Some(&secret()))
+            .unwrap();
+        // The wall clock is still above the last observation after rolling
+        // back, but the ten-second deadline from creation has already elapsed.
+        time.advance(20);
+        time.wall.set(1_001);
+        if retrieve_first {
+            assert!(matches!(
+                service!(backend, registry, clock).retrieve(DRIVE),
+                Err(EscrowError::Expired)
+            ));
+        } else {
+            assert_eq!(
+                purge_expired(&mut backend, &mut registry, &clock)
+                    .unwrap()
+                    .deleted,
+                1
+            );
+        }
+        assert_eq!(backend.gets, 0);
+        assert!(backend.values.is_empty());
+    }
+}
+
+#[test]
+fn detected_rollback_stays_blocked_after_restart_and_wall_clock_catch_up() {
+    let mut backend = FakeStore::default();
+    let mut registry = MemoryRegistry::default();
+    let clock = RetentionClock::new(FakeClock::new(100));
+    service!(backend, registry, clock)
+        .create_drive(DRIVE, EscrowPolicy::Until(200), vec![], Some(&secret()))
+        .unwrap();
+    let rollback = RetentionClock::new(FakeClock::new(90));
+    assert!(matches!(
+        service!(backend, registry, rollback).retrieve(DRIVE),
+        Err(EscrowError::ClockUntrusted)
+    ));
+    // Serialise and reload so a process-local latch cannot satisfy this test.
+    registry.data = serde_json::from_slice(&serde_json::to_vec(&registry.data).unwrap()).unwrap();
+    let caught_up = RetentionClock::new(FakeClock::new(110));
+    assert!(matches!(
+        service!(backend, registry, caught_up).retrieve(DRIVE),
+        Err(EscrowError::ClockUntrusted)
+    ));
+    assert_eq!(backend.gets, 0);
+    assert_eq!(
+        registry.data.record(DRIVE).unwrap().retention(),
+        EscrowPolicy::Until(200)
+    );
+}
+
+#[test]
+fn explicit_clock_resolution_requires_correction_and_never_renews_expiry() {
+    let mut backend = FakeStore::default();
+    let mut registry = MemoryRegistry::default();
+    let clock = RetentionClock::new(FakeClock::new(100));
+    service!(backend, registry, clock)
+        .create_drive(DRIVE, EscrowPolicy::Until(200), vec![], Some(&secret()))
+        .unwrap();
+    let time = FakeClock::new(90);
+    let restarted = RetentionClock::new(time.clone());
+    assert!(matches!(
+        service!(backend, registry, restarted).resolve_clock_after_user_confirmation(),
+        Err(EscrowError::ClockUntrusted)
+    ));
+    assert!(registry.data.clock_untrusted());
+    time.wall.set(110);
+    assert!(matches!(
+        service!(backend, registry, restarted).retrieve(DRIVE),
+        Err(EscrowError::ClockUntrusted)
+    ));
+    service!(backend, registry, restarted)
+        .resolve_clock_after_user_confirmation()
+        .unwrap();
+    assert!(!registry.data.clock_untrusted());
+    service!(backend, registry, restarted)
+        .retrieve(DRIVE)
+        .unwrap();
+    assert_eq!(
+        registry.data.record(DRIVE).unwrap().retention(),
+        EscrowPolicy::Until(200)
+    );
+    // Correction cannot move the deadline or reset its monotonic countdown.
+    time.mono.set(90);
+    assert!(matches!(
+        service!(backend, registry, restarted).retrieve(DRIVE),
+        Err(EscrowError::Expired)
+    ));
+    assert_eq!(backend.gets, 1);
+    assert!(backend.values.is_empty());
+}
+
+#[test]
+fn running_helper_honours_explicit_resolution_without_resetting_its_deadline() {
+    let mut backend = FakeStore::default();
+    let mut registry = MemoryRegistry::default();
+    let time = FakeClock::new(100);
+    let app = RetentionClock::new(time.clone());
+    let helper = RetentionClock::new(time.clone());
+    service!(backend, registry, app)
+        .create_drive(DRIVE, EscrowPolicy::Until(120), vec![], Some(&secret()))
+        .unwrap();
+    time.wall.set(90);
+    assert!(
+        purge_expired(&mut backend, &mut registry, &helper)
+            .unwrap()
+            .clock_untrusted
+    );
+    time.wall.set(110);
+    assert!(
+        purge_expired(&mut backend, &mut registry, &helper)
+            .unwrap()
+            .clock_untrusted
+    );
+    service!(backend, registry, app)
+        .resolve_clock_after_user_confirmation()
+        .unwrap();
+    assert!(
+        !purge_expired(&mut backend, &mut registry, &helper)
+            .unwrap()
+            .clock_untrusted
+    );
+    service!(backend, registry, app).retrieve(DRIVE).unwrap();
+    // A helper running since before confirmation must retain its old anchor.
+    time.mono.set(10);
+    assert_eq!(
+        purge_expired(&mut backend, &mut registry, &helper)
+            .unwrap()
+            .deleted,
+        1
+    );
+    assert_eq!(backend.gets, 1);
+    assert!(backend.values.is_empty());
+    assert_eq!(
+        registry.data.record(DRIVE).unwrap().retention(),
+        EscrowPolicy::Until(120)
+    );
+}
+
+#[test]
+fn clock_resolution_after_expiry_only_deletes() {
+    let mut backend = FakeStore::default();
+    let mut registry = MemoryRegistry::default();
+    let time = FakeClock::new(100);
+    let clock = RetentionClock::new(time.clone());
+    service!(backend, registry, clock)
+        .create_drive(DRIVE, EscrowPolicy::Until(120), vec![], Some(&secret()))
+        .unwrap();
+    time.wall.set(90);
+    assert!(
+        purge_expired(&mut backend, &mut registry, &clock)
+            .unwrap()
+            .clock_untrusted
+    );
+    time.wall.set(120);
+    assert_eq!(
+        service!(backend, registry, clock)
+            .resolve_clock_after_user_confirmation()
+            .unwrap()
+            .deleted,
+        1
+    );
+    assert!(matches!(
+        service!(backend, registry, clock).retrieve(DRIVE),
+        Err(EscrowError::Expired)
+    ));
+    assert_eq!(backend.gets, 0);
+    assert!(backend.values.is_empty());
+}
+
+#[test]
+fn creation_and_refresh_persist_clock_suspicion_before_returning_an_error() {
+    for create in [true, false] {
+        let mut backend = FakeStore::default();
+        let mut registry = MemoryRegistry::default();
+        let time = FakeClock::new(100);
+        let clock = RetentionClock::new(time.clone());
+        service!(backend, registry, clock)
+            .create_drive(DRIVE, EscrowPolicy::Until(200), vec![], Some(&secret()))
+            .unwrap();
+        time.wall.set(90);
+        let result = if create {
+            service!(backend, registry, clock)
+                .create_drive(
+                    "SYNTHETIC_FIXTURE_new",
+                    EscrowPolicy::Disabled,
+                    vec![],
+                    None,
+                )
+                .map(|_| ())
+        } else {
+            service!(backend, registry, clock).record_refresh(DRIVE, 1, 0, 0)
+        };
+        assert_eq!(result, Err(EscrowError::ClockUntrusted));
+        assert!(registry.data.clock_untrusted());
+        let restarted = RetentionClock::new(FakeClock::new(110));
+        assert!(matches!(
+            service!(backend, registry, restarted).retrieve(DRIVE),
+            Err(EscrowError::ClockUntrusted)
+        ));
+        assert_eq!(backend.gets, 0);
+    }
+}
+
+#[test]
+fn failed_clock_state_save_cannot_clear_the_process_latch() {
+    let mut backend = FakeStore::default();
+    let mut registry = MemoryRegistry::default();
+    let time = FakeClock::new(100);
+    let clock = RetentionClock::new(time.clone());
+    service!(backend, registry, clock)
+        .create_drive(DRIVE, EscrowPolicy::Until(200), vec![], Some(&secret()))
+        .unwrap();
+    time.wall.set(90);
+    registry.fail_save = Some(registry.saves + 1);
+    assert!(matches!(
+        service!(backend, registry, clock).retrieve(DRIVE),
+        Err(EscrowError::RegistryUnavailable)
+    ));
+    time.wall.set(110);
+    assert!(matches!(
+        service!(backend, registry, clock).retrieve(DRIVE),
+        Err(EscrowError::ClockUntrusted)
+    ));
+    assert!(registry.data.clock_untrusted());
+    assert_eq!(backend.gets, 0);
+}
+
+#[test]
+fn failed_creation_commit_keeps_intent_until_cleanup_can_finish() {
+    let mut backend = FakeStore {
+        fail_delete: true,
+        ..FakeStore::default()
+    };
+    let mut registry = MemoryRegistry {
+        fail_finish: true,
+        ..MemoryRegistry::default()
+    };
+    let clock = RetentionClock::new(FakeClock::new(100));
+    assert!(matches!(
+        service!(backend, registry, clock).create_drive(
+            DRIVE,
+            EscrowPolicy::Until(200),
+            vec![],
+            Some(&secret())
+        ),
+        Err(EscrowError::RegistryUnavailable)
+    ));
+    assert_eq!(registry.pending.len(), 1);
+    assert!(matches!(
+        service!(backend, registry, clock).retrieve(DRIVE),
+        Err(EscrowError::Missing)
+    ));
+    backend.fail_delete = false;
+    assert!(matches!(
+        purge_expired(&mut backend, &mut registry, &clock),
+        Err(EscrowError::RegistryUnavailable)
+    ));
+    assert!(backend.values.is_empty());
+    assert_eq!(registry.pending.len(), 1);
+    registry.fail_finish = false;
+    assert_eq!(
+        purge_expired(&mut backend, &mut registry, &clock)
+            .unwrap()
+            .deleted,
+        1
+    );
+    assert!(registry.pending.is_empty());
+    assert_eq!(backend.gets, 0);
+}
+
+#[test]
 fn failed_put_after_native_success_is_cleaned_up() {
     let mut backend = FakeStore {
         fail_put_after_write: true,

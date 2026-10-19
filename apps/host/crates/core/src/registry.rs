@@ -91,6 +91,10 @@ pub struct RegistryData {
     version: u32,
     pub(crate) installation_id: String,
     pub(crate) last_observed_at: u64,
+    #[serde(default)]
+    pub(crate) clock_untrusted: bool,
+    #[serde(default)]
+    pub(crate) clock_resolution: u64,
     pub(crate) drives: BTreeMap<String, DriveRecord>,
 }
 
@@ -100,6 +104,8 @@ impl RegistryData {
             version: 1,
             installation_id: random_id()?,
             last_observed_at: 0,
+            clock_untrusted: false,
+            clock_resolution: 0,
             drives: BTreeMap::new(),
         })
     }
@@ -109,6 +115,9 @@ impl RegistryData {
     }
     pub fn record(&self, id: &str) -> Option<&DriveRecord> {
         self.drives.get(id)
+    }
+    pub fn clock_untrusted(&self) -> bool {
+        self.clock_untrusted
     }
 
     pub fn validate(&self) -> Result<(), EscrowError> {
@@ -194,6 +203,13 @@ pub(crate) fn random_id() -> Result<String, EscrowError> {
 pub trait RegistryStorage {
     fn load(&mut self) -> Result<RegistryData, EscrowError>;
     fn save(&mut self, data: &RegistryData) -> Result<(), EscrowError>;
+    /// Persist independently of registry replacement, before writing a secret.
+    fn begin_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError>;
+    fn creation_pending(&mut self, item: &ItemRef) -> Result<bool, EscrowError>;
+    /// Commit activation, or finish a confirmed native deletion. An error MUST
+    /// leave the intent present. After removal, report success: a crash may
+    /// resurrect an unsynced intent, which can only cause conservative deletion.
+    fn finish_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError>;
 }
 
 pub struct FileRegistry {
@@ -223,6 +239,11 @@ fn private_options() -> OpenOptions {
 }
 
 impl FileRegistry {
+    fn creation_path(&self, item: &ItemRef) -> Result<PathBuf, EscrowError> {
+        Ok(self
+            .directory
+            .join(format!("creation-{}.pending", item.account()?)))
+    }
     pub fn open(directory: &Path) -> Result<Self, EscrowError> {
         // The caller creates the private app directory. Do not follow an
         // exchange-media path or create a second data root implicitly.
@@ -256,6 +277,52 @@ impl FileRegistry {
 }
 
 impl RegistryStorage for FileRegistry {
+    fn begin_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError> {
+        let path = self.creation_path(item)?;
+        regular_file(&path)?;
+        let file = private_options()
+            .create_new(true)
+            .open(path)
+            .map_err(|_| EscrowError::RegistryUnavailable)?;
+        file.sync_all()
+            .map_err(|_| EscrowError::RegistryUnavailable)?;
+        #[cfg(unix)]
+        File::open(&self.directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| EscrowError::RegistryUnavailable)?;
+        Ok(())
+    }
+
+    fn creation_pending(&mut self, item: &ItemRef) -> Result<bool, EscrowError> {
+        let path = self.creation_path(item)?;
+        regular_file(&path)?;
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(EscrowError::RegistryUnavailable),
+        }
+    }
+
+    fn finish_creation(&mut self, item: &ItemRef) -> Result<(), EscrowError> {
+        let path = self.creation_path(item)?;
+        regular_file(&path)?;
+        // Open before unlink so an access failure cannot publish activation.
+        #[cfg(unix)]
+        let directory =
+            File::open(&self.directory).map_err(|_| EscrowError::RegistryUnavailable)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(EscrowError::RegistryUnavailable),
+        }
+        // Unlink is the commit point. A later durability error must not turn a
+        // published activation into a reported failure. Resurrected intent after
+        // power loss fails closed and is purged, never silently made readable.
+        #[cfg(unix)]
+        let _ = directory.sync_all();
+        Ok(())
+    }
+
     fn load(&mut self) -> Result<RegistryData, EscrowError> {
         let path = self.directory.join("drives.json");
         regular_file(&path)?;

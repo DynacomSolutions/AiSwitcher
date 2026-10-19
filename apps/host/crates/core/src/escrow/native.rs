@@ -10,6 +10,10 @@ mod linux;
 use linux as platform;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_attributes;
+#[cfg(target_os = "macos")]
+mod macos_entitlements;
 #[cfg(target_os = "macos")]
 use macos as platform;
 #[cfg(target_os = "windows")]
