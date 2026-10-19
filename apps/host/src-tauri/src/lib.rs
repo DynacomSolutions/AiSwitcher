@@ -14,7 +14,11 @@ pub fn run() {
                 .build()?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_devices, native_smoke_ready])
+        .invoke_handler(tauri::generate_handler![
+            list_devices,
+            disk_write_support,
+            native_smoke_ready
+        ])
         .run(tauri::generate_context!())
         .expect("host app runtime failed");
 }
@@ -36,6 +40,11 @@ fn is_allowed_navigation(url: &tauri::Url) -> bool {
 #[tauri::command]
 fn list_devices() -> Vec<ais_host_core::device::DeviceSummary> {
     Vec::new()
+}
+
+#[tauri::command]
+fn disk_write_support() -> ais_host_core::device::WriteSupport {
+    ais_host_core::device::write_support()
 }
 
 #[tauri::command]

@@ -8,4 +8,21 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.9"
+getrandom = "=0.3.4"
+minisign-verify = "=0.3.0"
+zstd = "=0.14.3"
+minisign = { version = "=0.10.0", optional = true }
+
+[features]
+file-test = ["dep:minisign"]
+
+[[bin]]
+name = "host-file-check"
+path = "src/bin/host-file-check.rs"
+required-features = ["file-test"]
+
+[dev-dependencies]
+minisign = "=0.10.0"
 

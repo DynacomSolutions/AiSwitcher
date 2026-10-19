@@ -1,0 +1,349 @@
+//! Release trust is independent of download transport. No downloaded key can
+//! authorise an image. Production writes require a bundled key and reviewed layout.
+use minisign_verify::{PublicKey, Signature};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    time::{Duration, Instant},
+};
+use thiserror::Error;
+
+pub const MAX_COMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const MAX_SUMS_BYTES: usize = 1024 * 1024;
+const MAX_SIGNATURE_BYTES: usize = 4096;
+
+#[derive(Debug, Error)]
+pub enum TrustError {
+    #[error("The bundled image trust key and reviewed layout are unavailable.")]
+    ContractUnavailable,
+    #[error("The release or asset identity is invalid or changed.")]
+    AssetIdentity,
+    #[error("Image signature verification failed.")]
+    Signature,
+    #[error("The checksum file is invalid or ambiguous.")]
+    Checksums,
+    #[error("The image checksum changed or does not match.")]
+    Checksum,
+    #[error("The image exceeds its permitted size or time budget.")]
+    Limit,
+    #[error("The image layout has not been approved.")]
+    Layout,
+    #[error("The image source is not a regular file.")]
+    Source,
+    #[error("Image input failed.")]
+    Io(#[from] std::io::Error),
+}
+
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssetIdentity {
+    pub id: u64,
+    pub name: String,
+    pub size: u64,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublishedRelease {
+    pub id: u64,
+    pub tag: String,
+    pub published_at: u64,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub assets: Vec<AssetIdentity>,
+}
+
+/// An operation keeps this selection even if a newer release is published.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseSelection {
+    release_id: u64,
+    tag: String,
+    image: AssetIdentity,
+    sums: AssetIdentity,
+    signature: AssetIdentity,
+}
+
+impl ReleaseSelection {
+    pub fn image(&self) -> &AssetIdentity {
+        &self.image
+    }
+    pub fn sums(&self) -> &AssetIdentity {
+        &self.sums
+    }
+    pub fn signature(&self) -> &AssetIdentity {
+        &self.signature
+    }
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+pub fn select_release(releases: &[PublishedRelease]) -> Result<ReleaseSelection, TrustError> {
+    let release = releases
+        .iter()
+        .filter(|release| {
+            !release.draft
+                && !release.prerelease
+                && release.id != 0
+                && release.published_at != 0
+                && release.tag.starts_with("live-v")
+                && release.tag.len() > 6
+                && release.tag.len() <= 80
+                && release
+                    .tag
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c))
+        })
+        .max_by_key(|release| (release.published_at, release.id))
+        .ok_or(TrustError::AssetIdentity)?;
+    let mut names = BTreeMap::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for asset in &release.assets {
+        if asset.id == 0
+            || asset.size == 0
+            || asset.revision.is_empty()
+            || !ids.insert(asset.id)
+            || names.insert(asset.name.as_str(), asset).is_some()
+        {
+            return Err(TrustError::AssetIdentity);
+        }
+    }
+    let lookup = |name: &str, maximum: u64| -> Result<AssetIdentity, TrustError> {
+        let asset = names.get(name).ok_or(TrustError::AssetIdentity)?;
+        if asset.size > maximum {
+            return Err(TrustError::Limit);
+        }
+        Ok((*asset).clone())
+    };
+    Ok(ReleaseSelection {
+        release_id: release.id,
+        tag: release.tag.clone(),
+        image: lookup(
+            &format!("ais-live-x86_64-{}.img.zst", release.tag),
+            MAX_COMPRESSED_BYTES,
+        )?,
+        sums: lookup("SHA256SUMS", MAX_SUMS_BYTES as u64)?,
+        signature: lookup("SHA256SUMS.minisig", MAX_SIGNATURE_BYTES as u64)?,
+    })
+}
+
+pub fn parse_checksums(bytes: &[u8]) -> Result<BTreeMap<String, [u8; 32]>, TrustError> {
+    if bytes.is_empty() || bytes.len() > MAX_SUMS_BYTES {
+        return Err(TrustError::Checksums);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| TrustError::Checksums)?;
+    let mut sums = BTreeMap::new();
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        if bytes.len() < 67 || bytes[64] != b' ' || !b" *".contains(&bytes[65]) {
+            return Err(TrustError::Checksums);
+        }
+        let name = &line[66..];
+        if name.starts_with('.')
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        {
+            return Err(TrustError::Checksums);
+        }
+        let mut digest = [0; 32];
+        for (index, pair) in bytes[..64].chunks_exact(2).enumerate() {
+            let part = std::str::from_utf8(pair).map_err(|_| TrustError::Checksums)?;
+            digest[index] = u8::from_str_radix(part, 16).map_err(|_| TrustError::Checksums)?;
+        }
+        if sums.insert(name.to_owned(), digest).is_some() {
+            return Err(TrustError::Checksums);
+        }
+    }
+    Ok(sums)
+}
+
+/// Fields and constructors are private outside the explicitly non-release harness.
+/// A missing bundled trust anchor must not be replaced by one from a download.
+pub struct ImageVerifier {
+    key: PublicKey,
+    reviewed_image_hash: [u8; 32],
+    reviewed_image_size: u64,
+}
+
+impl ImageVerifier {
+    pub fn bundled() -> Result<Self, TrustError> {
+        Err(TrustError::ContractUnavailable)
+    }
+
+    /// A synthetic byte-exact layout pin, separate from production GPT validation.
+    #[cfg(feature = "file-test")]
+    pub fn synthetic(public_key: &str, layout_bytes: &[u8]) -> Result<Self, TrustError> {
+        if layout_bytes.is_empty()
+            || layout_bytes.len() as u64 > MAX_IMAGE_BYTES
+            || layout_bytes.len() % 512 != 0
+        {
+            return Err(TrustError::Layout);
+        }
+        Ok(Self {
+            key: PublicKey::decode(public_key).map_err(|_| TrustError::Signature)?,
+            reviewed_image_hash: sha256(layout_bytes),
+            reviewed_image_size: layout_bytes.len() as u64,
+        })
+    }
+
+    pub fn verify(
+        &self,
+        selection: &ReleaseSelection,
+        download: DownloadedImage,
+    ) -> Result<VerifiedImage, TrustError> {
+        let DownloadedImage {
+            mut source,
+            image_identity,
+            sums_identity,
+            signature_identity,
+            sums,
+            signature,
+        } = download;
+        if image_identity != selection.image
+            || sums_identity != selection.sums
+            || signature_identity != selection.signature
+            || sums.len() as u64 != selection.sums.size
+            || signature.len() as u64 != selection.signature.size
+        {
+            return Err(TrustError::AssetIdentity);
+        }
+        if sums.len() > MAX_SUMS_BYTES || signature.len() > MAX_SIGNATURE_BYTES {
+            return Err(TrustError::Limit);
+        }
+        let signed =
+            Signature::decode(std::str::from_utf8(&signature).map_err(|_| TrustError::Signature)?)
+                .map_err(|_| TrustError::Signature)?;
+        self.key
+            .verify(&sums, &signed, false)
+            .map_err(|_| TrustError::Signature)?;
+        let digest = *parse_checksums(&sums)?
+            .get(&selection.image.name)
+            .ok_or(TrustError::Checksums)?;
+        let compressed = read_source(&mut source, selection.image.size)?;
+        if sha256(&compressed) != digest {
+            return Err(TrustError::Checksum);
+        }
+        let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
+        decoder.window_log_max(27)?;
+        let bytes = read_bounded(
+            &mut decoder,
+            self.reviewed_image_size,
+            Duration::from_secs(120),
+        )?;
+        if bytes.len() as u64 != self.reviewed_image_size
+            || sha256(&bytes) != self.reviewed_image_hash
+        {
+            return Err(TrustError::Layout);
+        }
+        Ok(VerifiedImage {
+            source,
+            source_digest: digest,
+            source_size: selection.image.size,
+            bytes,
+            digest: self.reviewed_image_hash,
+            selection: selection.clone(),
+        })
+    }
+}
+
+/// Download transports must retain the selected asset identities, enforce their
+/// size and request deadlines, and supply the opened regular file here.
+pub struct DownloadedImage {
+    pub source: File,
+    pub image_identity: AssetIdentity,
+    pub sums_identity: AssetIdentity,
+    pub signature_identity: AssetIdentity,
+    pub sums: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+/// Cannot be deserialised or built from a claimed checksum by an IPC client.
+pub struct VerifiedImage {
+    source: File,
+    source_digest: [u8; 32],
+    source_size: u64,
+    bytes: Vec<u8>,
+    digest: [u8; 32],
+    selection: ReleaseSelection,
+}
+
+impl VerifiedImage {
+    pub fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+    pub fn compressed_digest(&self) -> [u8; 32] {
+        self.source_digest
+    }
+    pub fn selection(&self) -> &ReleaseSelection {
+        &self.selection
+    }
+    pub fn revalidate_source(&mut self) -> Result<(), TrustError> {
+        if sha256(&read_source(&mut self.source, self.source_size)?) != self.source_digest {
+            return Err(TrustError::Checksum);
+        }
+        Ok(())
+    }
+    #[cfg(feature = "file-test")]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn read_source(file: &mut File, size: u64) -> Result<Vec<u8>, TrustError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(TrustError::Source);
+    }
+    if size == 0 || size > MAX_COMPRESSED_BYTES || metadata.len() != size {
+        return Err(TrustError::Limit);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let bytes = read_bounded(file, size, Duration::from_secs(120))?;
+    if bytes.len() as u64 != size {
+        return Err(TrustError::Limit);
+    }
+    Ok(bytes)
+}
+
+fn read_bounded(
+    reader: &mut impl Read,
+    maximum: u64,
+    budget: Duration,
+) -> Result<Vec<u8>, TrustError> {
+    let start = Instant::now();
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        if start.elapsed() >= budget {
+            return Err(TrustError::Limit);
+        }
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() as u64 + read as u64 > maximum {
+            return Err(TrustError::Limit);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
