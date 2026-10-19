@@ -75,6 +75,9 @@ pub struct ModelEntry {
     pub size_bytes: u64,
     pub licence_name: String,
     pub licence_text: String,
+    /// Source repository (`owner/name`) and file; the revision pins both.
+    pub repository: String,
+    pub file: String,
     pub revision: String,
     pub sha256: String,
 }
@@ -110,8 +113,8 @@ impl Catalogue {
     }
 }
 
-/// The reviewed catalogue shipped with the app. It is empty until real,
-/// verified pins exist, so no model can be offered or downloaded.
+/// The reviewed catalogue shipped with the app. Each entry carries a real,
+/// immutable pin (commit and SHA-256) taken from the official repository.
 pub const BUNDLED_CATALOGUE: &str = include_str!("model-catalogue.json");
 
 #[derive(Debug)]

@@ -12,6 +12,7 @@ pub mod flow_adapter;
 pub mod flow_state;
 pub mod layout;
 pub mod logs;
+pub mod model;
 pub mod operation;
 pub mod refresh;
 pub mod registry;

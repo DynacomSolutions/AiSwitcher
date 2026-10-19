@@ -39,32 +39,71 @@ pub trait Http {
     fn get(&self, url: &str, limit: u64, out: &mut dyn Write) -> Result<(), FetchError>;
 }
 
-/// Production client: HTTPS only, at most five redirects, no cookies.
-pub struct UreqHttp(ureq::Agent);
+/// Production client: HTTPS only. Redirects are followed by hand, at most five
+/// hops, and every hop must stay on the approved hosts for this client.
+pub struct UreqHttp {
+    agent: ureq::Agent,
+    hosts: &'static [&'static str],
+}
+
+pub const RELEASE_HOSTS: &[&str] = &["github.com", "githubusercontent.com"];
 
 impl Default for UreqHttp {
     fn default() -> Self {
-        Self(
-            ureq::AgentBuilder::new()
-                .https_only(true)
-                .redirects(5)
+        Self::for_hosts(RELEASE_HOSTS)
+    }
+}
+
+impl UreqHttp {
+    pub fn for_hosts(hosts: &'static [&'static str]) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new()
+                .redirects(0)
                 .timeout_connect(std::time::Duration::from_secs(15))
                 .timeout_read(std::time::Duration::from_secs(60))
                 .user_agent("ais-host")
                 .build(),
-        )
+            hosts,
+        }
     }
+}
+
+fn redirect_target(current: &str, location: &str) -> Option<String> {
+    if location.starts_with("https://") {
+        return Some(location.to_owned());
+    }
+    let origin_end = current["https://".len()..]
+        .find('/')
+        .map_or(current.len(), |index| index + "https://".len());
+    (location.starts_with('/') && !location.starts_with("//"))
+        .then(|| format!("{}{location}", &current[..origin_end]))
 }
 
 impl Http for UreqHttp {
     fn get(&self, url: &str, limit: u64, out: &mut dyn Write) -> Result<(), FetchError> {
-        let response = self.0.get(url).call().map_err(|_| FetchError::Network)?;
-        let mut body = response.into_reader().take(limit + 1);
-        let copied = std::io::copy(&mut body, out).map_err(|_| FetchError::Network)?;
-        if copied > limit {
-            return Err(FetchError::Size);
+        let mut url = url.to_owned();
+        for _ in 0..=5 {
+            if !approved_address_on(&url, self.hosts) {
+                return Err(FetchError::Address);
+            }
+            let response = self
+                .agent
+                .get(&url)
+                .call()
+                .map_err(|_| FetchError::Network)?;
+            if matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
+                let location = response.header("location").ok_or(FetchError::Network)?;
+                url = redirect_target(&url, location).ok_or(FetchError::Address)?;
+                continue;
+            }
+            let mut body = response.into_reader().take(limit + 1);
+            let copied = std::io::copy(&mut body, out).map_err(|_| FetchError::Network)?;
+            if copied > limit {
+                return Err(FetchError::Size);
+            }
+            return Ok(());
         }
-        Ok(())
+        Err(FetchError::Network)
     }
 }
 
@@ -97,13 +136,17 @@ pub struct Listing {
 
 /// Only HTTPS addresses on the release hosts are ever requested.
 pub fn approved_address(url: &str) -> bool {
+    approved_address_on(url, RELEASE_HOSTS)
+}
+
+pub fn approved_address_on(url: &str, hosts: &[&str]) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     !host.is_empty()
         && !host.contains(['@', ':'])
-        && ["github.com", "githubusercontent.com"]
+        && hosts
             .iter()
             .any(|apex| host == *apex || host.ends_with(&format!(".{apex}")))
 }
@@ -272,6 +315,24 @@ mod tests {
         ] {
             assert!(!approved_address(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn redirects_stay_https_and_resolve_relative_locations() {
+        assert_eq!(
+            redirect_target("https://github.com/a/b", "/c").as_deref(),
+            Some("https://github.com/c")
+        );
+        assert_eq!(
+            redirect_target(
+                "https://github.com/a",
+                "https://objects.githubusercontent.com/x"
+            )
+            .as_deref(),
+            Some("https://objects.githubusercontent.com/x")
+        );
+        assert!(redirect_target("https://github.com/a", "http://github.com/x").is_none());
+        assert!(redirect_target("https://github.com/a", "//other.example/x").is_none());
     }
 
     #[test]

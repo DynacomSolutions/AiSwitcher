@@ -41,6 +41,18 @@ pub enum TrustError {
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
+/// Streaming digest for files too large to hold in memory.
+pub fn sha256_reader(reader: &mut impl std::io::Read) -> std::io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(hasher.finalize().into());
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

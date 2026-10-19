@@ -14,7 +14,9 @@ fn catalogue() -> Catalogue {
             size_bytes: 3 * GIB,
             licence_name: "Synthetic licence".into(),
             licence_text: "SYNTHETIC_FIXTURE licence text".into(),
-            revision: "r1".into(),
+            repository: "owner/name".into(),
+            file: "synthetic.gguf".into(),
+            revision: "b".repeat(40),
             sha256: "a".repeat(64),
         }],
     }
@@ -37,10 +39,15 @@ fn declining_a_model_needs_no_catalogue_entry_and_no_model_bytes() {
 }
 
 #[test]
-fn the_bundled_catalogue_is_valid_and_offers_nothing_unpinned() {
+fn the_bundled_catalogue_is_valid_and_fully_pinned() {
     let parsed = Catalogue::parse(BUNDLED_CATALOGUE).unwrap();
-    assert!(parsed.models.is_empty());
-    let unpinned = r#"{"models":[{"id":"x","name":"x","quality":"q","sizeBytes":1,"licenceName":"l","licenceText":"t","revision":"","sha256":"zz"}]}"#;
+    assert_eq!(parsed.models.len(), 1);
+    let entry = &parsed.models[0];
+    assert_eq!(entry.repository, "Qwen/Qwen2.5-1.5B-Instruct-GGUF");
+    assert_eq!(entry.file, "qwen2.5-1.5b-instruct-q4_k_m.gguf");
+    assert_eq!(entry.licence_name, "Apache License 2.0");
+    assert!(entry.licence_text.contains("Apache License"));
+    let unpinned = r#"{"models":[{"id":"x","name":"x","quality":"q","sizeBytes":1,"licenceName":"l","licenceText":"t","repository":"o/n","file":"f","revision":"","sha256":"zz"}]}"#;
     assert_eq!(Catalogue::parse(unpinned), Err(CreateError::UnknownModel));
 }
 
