@@ -52,6 +52,8 @@ describe("CLI automatic sync reporting", () => {
       pulled: ["fixture"],
       pushed: [],
       skipped: false,
+      preservedConflicts: 0,
+      preservedConflictPaths: [],
     }));
     const log = spyOn(console, "log").mockImplementation((...args: unknown[]) => void stdout.push(args.join(" ")));
     restorers.push(() => log.mockRestore());

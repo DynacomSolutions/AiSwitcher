@@ -2,12 +2,15 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { appendFileSync, closeSync, openSync } from "node:fs";
 import {
   deduplicateUsageData,
   mergeJsonlFiles,
   mergeJsonlLineSets,
   setJsonlBeforeAppendHook,
   setJsonlBeforeCreateHook,
+  setJsonlAfterCreateHook,
+  setJsonlBeforeWriteHook,
 } from "../../src/sync/dedupe.ts";
 
 const tempDirs: string[] = [];
@@ -15,6 +18,8 @@ const tempDirs: string[] = [];
 afterEach(async () => {
   setJsonlBeforeAppendHook();
   setJsonlBeforeCreateHook();
+  setJsonlAfterCreateHook();
+  setJsonlBeforeWriteHook();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -57,6 +62,46 @@ describe("mergeJsonlLineSets", () => {
 });
 
 describe("mergeJsonlFiles races", () => {
+  test("defers when a writer opens after the final newline check", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, "SYNTHETIC_FIXTURE_imported\n");
+    await writeFile(destination, "SYNTHETIC_FIXTURE_native\n");
+    let nativeWriter: number | undefined;
+    // Leave the bytes unchanged: only the fresh owner check can detect this.
+    setJsonlBeforeWriteHook((path) => { nativeWriter = openSync(path, "a"); });
+    try {
+      expect(await mergeJsonlFiles([source], destination, false, { lookups: 4 })).toBe("deferred");
+      expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
+    } finally { if (nativeWriter !== undefined) closeSync(nativeWriter); }
+    setJsonlBeforeWriteHook();
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+  });
+
+  test("preserves native bytes written after exclusive creation", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, "SYNTHETIC_FIXTURE_imported\n");
+    setJsonlAfterCreateHook((path) => appendFileSync(path, "SYNTHETIC_FIXTURE_native\n"));
+
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("deferred");
+    expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
+    setJsonlAfterCreateHook();
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+    expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\nSYNTHETIC_FIXTURE_imported\n");
+  });
+
+  test("writes a missing destination through its exclusive handle", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, "SYNTHETIC_FIXTURE_imported\n");
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+    expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_imported\n");
+  });
+
   test("defers an exclusive-create collision without replacing the native file", async () => {
     const home = await makeHome();
     const source = join(home, "source.jsonl");

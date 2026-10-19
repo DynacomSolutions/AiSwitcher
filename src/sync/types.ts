@@ -30,4 +30,6 @@ export interface SyncRunResult {
   pulled: string[];
   pushed: string[];
   skipped: boolean;
+  preservedConflicts: number;
+  preservedConflictPaths: string[];
 }
