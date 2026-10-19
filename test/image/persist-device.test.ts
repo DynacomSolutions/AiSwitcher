@@ -1,252 +1,498 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
-const scratch = mkdtempSync(join(tmpdir(), "ais-gpt-device-SYNTHETIC_FIXTURE-"));
+const scratch = mkdtempSync(join(tmpdir(), "ais-live-persist-test-"));
 const hookSource = readFileSync(resolve("image/archiso/airootfs/etc/initcpio/hooks/ais_persist"), "utf8");
+const generator = resolve("image/archiso/persist-contracts.sh");
 const type = ["21686148-6449-6e6f-744e-656564454649", "c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "0fc63daf-8483-4772-8e79-3d69d8477de4", "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"];
-const partGuids = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"];
+const guids = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"];
 const names = ["BIOS", "AISBOOT", "AISBASE", "AISX"];
+const starts = ["2048", "4096", "32768", "196608"];
+const sizes = ["2048", "28672", "163840", "32768"];
 
-function fixture(name: string, extra = "", diskSize = "128M", grow = true) {
-  const dir = join(scratch, name);
+function fixture(name: string, options: { extra?: string; rows?: { starts?: string[]; sizes?: string[]; names?: string[] } } = {}) {
+  const dir = join(scratch, `device-${name}`);
   mkdirSync(dir, { recursive: true });
   const disk = join(dir, "disk.img");
-  Bun.spawnSync(["truncate", "-s", diskSize, disk]);
-  const starts = ["2048", "4096", "32768", "196608"];
-  const sizes = ["2048", "28672", "163840", "32768"];
-  const rows = names.map((n, i) => `start=${starts[i]}, size=${sizes[i]}, type=${type[i]}, uuid=${partGuids[i]}, name="${n}"${i === 1 ? ', attrs="LegacyBIOSBootable"' : ""}`).join("\n");
-  const table = `label: gpt\nunit: sectors\nsector-size: 512\n\n${rows}${extra}`;
+  Bun.spawnSync(["truncate", "-s", "192M", disk]);
+  const ss = options.rows?.starts ?? starts;
+  const sz = options.rows?.sizes ?? sizes;
+  const ns = options.rows?.names ?? names;
+  const rows = ns.map((n, i) => `start=${ss[i]}, size=${sz[i]}, type=${type[i]}, uuid=${guids[i]}, name="${n}"${i === 1 ? ', attrs="LegacyBIOSBootable"' : ""}`).join("\n");
   const input = join(dir, "table.txt");
-  writeFileSync(input, table);
-  const write = Bun.spawnSync(["bash", "-c", `sfdisk '${disk}' < '${input}'`], { stdout: "pipe", stderr: "pipe" });
-  if (write.exitCode !== 0) throw new Error(write.stderr.toString());
-  if (grow) Bun.spawnSync(["truncate", "-s", "192M", disk]);
-  const guid = Bun.spawnSync(["sfdisk", "--disk-id", disk], { stdout: "pipe" }).stdout.toString().trim().toLowerCase();
+  writeFileSync(input, `label: gpt\nunit: sectors\nsector-size: 512\n\n${rows}${options.extra ?? ""}\n`);
+  const written = Bun.spawnSync(["bash", "-c", `sfdisk '${disk}' < '${input}'`], { stdout: "pipe", stderr: "pipe" });
+  if (written.exitCode !== 0) throw new Error(written.stderr.toString());
   const manifest = join(dir, "gpt-layout");
-  const rowsManifest = names.map((n, i) => `part\t${i + 1}\t${starts[i]}\t${sizes[i]}\t${type[i]}\t${partGuids[i]}\t${n}\t${i === 1 ? "LegacyBIOSBootable" : "-"}`).join("\n");
-  writeFileSync(manifest, `AIS-GPT-LAYOUT\t1\ndisk-guid\t${guid}\n${rowsManifest}\n`);
-  return { dir, disk, manifest, starts, sizes, table, guid };
+  const dump = join(dir, "gpt.json");
+  const generated = Bun.spawnSync(["bash", generator, "gpt-layout", disk, manifest, dump], { stdout: "pipe", stderr: "pipe" });
+  return { dir, disk, manifest, dump, generated, ss, sz, ns };
 }
 
-function hashSlice(disk: string, start: number, size: number) {
+function sliceHash(disk: string, start: number, size: number) {
   const bytes = Bun.spawnSync(["dd", `if=${disk}`, "bs=512", `skip=${start}`, `count=${size}`, "status=none"], { stdout: "pipe" }).stdout;
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function hashImage(disk: string) {
+function imageHash(disk: string) {
   return Bun.spawnSync(["sha256sum", disk], { stdout: "pipe" }).stdout.toString().split(/\s+/)[0];
 }
 
-function actualNodeValidator(f: ReturnType<typeof fixture>, values: { uuid?: string; partition?: string; parent?: string; start?: string; size?: string; missing?: boolean } = {}) {
-  const start = hookSource.indexOf("_persist_validate_node() {");
-  const end = hookSource.indexOf("\n}\n\n_persist_verify_gpt", start) + 2;
-  const fn = hookSource.slice(start, end).replaceAll('[ -b "$disk_real" ]', '[ -e "$disk_real" ]').replaceAll('[ -b "$node_real" ]', '[ -e "$node_real" ]');
-  const dir = join(f.dir, "node-validator");
+function ambiguityHarness(name: string, disks: Array<{ seq: string; fixture: ReturnType<typeof fixture>; label?: string; fstype?: string }>) {
+  const dir = join(scratch, `ambiguity-${name}`);
   const bin = join(dir, "bin");
-  const parent = join(dir, "parent");
-  const sysdev = join(parent, "child");
+  const sysblock = join(dir, "sys-block");
+  const devices = join(dir, "devices");
+  const bySeq = join(dir, "by-diskseq");
+  const devBlock = join(dir, "dev-block");
+  const bootmnt = join(dir, "bootmnt");
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(sysblock, { recursive: true });
+  mkdirSync(devices, { recursive: true });
+  mkdirSync(bySeq, { recursive: true });
+  mkdirSync(devBlock, { recursive: true });
+  mkdirSync(join(bootmnt, "ais-live"), { recursive: true });
+  writeFileSync(join(bootmnt, "ais-live", "gpt-layout"), readFileSync(disks[0].fixture.manifest));
+  const aliases: string[] = [];
+  for (const [index, item] of disks.entries()) {
+    const sysdir = join(sysblock, `sd${String.fromCharCode(97 + index)}`);
+    mkdirSync(sysdir, { recursive: true });
+    writeFileSync(join(sysdir, "diskseq"), `${item.seq}\n`);
+    writeFileSync(join(sysdir, "dev"), `8:${index * 16}\n`);
+    mkdirSync(join(sysdir, "device"), { recursive: true });
+    Bun.spawnSync(["ln", "-sfn", sysdir, join(devBlock, `8:${index * 16}`)]);
+    const diskAlias = join(bySeq, item.seq);
+    Bun.spawnSync(["ln", "-sfn", item.fixture.disk, diskAlias]);
+    aliases.push(diskAlias);
+    for (let partition = 1; partition <= 4; partition++) {
+      const node = join(devices, `disk-${item.seq}-part${partition}`);
+      writeFileSync(node, "SYNTHETIC_FIXTURE_partition-node");
+      Bun.spawnSync(["ln", "-sfn", node, `${diskAlias}-part${partition}`]);
+      const child = join(sysdir, `sd${String.fromCharCode(97 + index)}${partition}`);
+      mkdirSync(child, { recursive: true });
+      writeFileSync(join(child, "partition"), `${partition}\n`);
+      writeFileSync(join(child, "dev"), `8:${index * 16 + partition}\n`);
+      Bun.spawnSync(["ln", "-sfn", child, join(devBlock, `8:${index * 16 + partition}`)]);
+    }
+  }
+  const source = `${aliases[0]}-part3`;
+  writeFileSync(join(bin, "findmnt"), `#!/bin/sh\nprintf '%s\\n' '${source}'\n`);
+  const statCases = disks.map((item, index) => [
+    `    '${bySeq}/${item.seq}') printf '8:${(index * 16).toString(16)}\\n' ;;`,
+    ...[1, 2, 3, 4].map((partition) => `    '${bySeq}/${item.seq}-part${partition}') printf '8:${(index * 16 + partition).toString(16)}\\n' ;;`),
+  ].join("\n")).join("\n");
+  writeFileSync(join(bin, "stat"), `#!/bin/sh\n[ "$1" = -Lc ] && [ "$2" = '%t:%T' ] || exec /usr/bin/stat "$@"\ncase "$3" in\n${statCases}\n    *) exit 1 ;;\nesac\n`);
+  writeFileSync(join(bin, "blkid"), `#!/bin/sh\nflag= node=\nwhile [ "$#" -gt 0 ]; do case "$1" in -s) flag=$2; shift 2;; -o) shift 2;; -p|-c) shift;; *) node=$1; shift;; esac; done\ncase "$flag:$node" in\n  LABEL:*${disks[1]?.seq}*) value='${disks[1]?.label ?? ""}' ;;\n  LABEL:*) value=AISBASE ;;\n  TYPE:*${disks[1]?.seq}*) value='${disks[1]?.fstype ?? (disks[1]?.label === "AISBASE" ? "ext4" : "")}' ;;\n  TYPE:*) value=vfat ;;\n  *) exit 3 ;;\nesac\n[ -n "$value" ] || exit 2\nprintf '%s\\n' "$value"\n`);
+  writeFileSync(join(bin, "mount"), `#!/bin/sh\ntarget=\nfor arg do target=$arg; done\nmkdir -p "$target/ais-live"\ncp '${disks[1]?.fixture.manifest}' "$target/ais-live/gpt-layout"\n`);
+  writeFileSync(join(bin, "umount"), "#!/bin/sh\nexit 0\n");
+  writeFileSync(join(bin, "sfdisk"), `#!/bin/sh\nexec /usr/bin/sfdisk "$@"\n`);
+  for (const executable of ["findmnt", "stat", "blkid", "mount", "umount", "sfdisk"]) chmodSync(join(bin, executable), 0o755);
+
+  let sourceText = hookSource
+    .replaceAll("/run/archiso/bootmnt", bootmnt)
+    .replaceAll("/run/ais-persist-ambiguity-probe", join(dir, "probe"))
+    .replaceAll("/dev/disk/by-diskseq", bySeq)
+    .replaceAll("/sys/block/*", `${sysblock}/*`)
+    .replaceAll("/sys/dev/block", devBlock)
+    .replaceAll('[ -b "$part" ]', '[ -e "$part" ]')
+    .replaceAll('[ -b "$PERSIST_PROBE_DISK" ]', '[ -e "$PERSIST_PROBE_DISK" ]');
+  const start = sourceText.indexOf("_persist_reject_ambiguous_media() {");
+  const end = sourceText.indexOf("\n}\n", start) + 3;
+  sourceText = sourceText.slice(start, end);
+  const script = join(dir, "ambiguity.sh");
+  writeFileSync(script, `${sourceText}\n_persist_reject_ambiguous_media '${disks[0].seq}'\n`);
+  return { result: Bun.spawnSync(["bash", script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" }), aliases };
+}
+
+function validateNode(f: ReturnType<typeof fixture>, changes: Record<string, string> = {}) {
+  const dir = join(f.dir, `validate-${Math.random().toString(16).slice(2)}`);
+  const bin = join(dir, "bin");
+  const sysdev = join(dir, "sysfs", "disk", "part3");
   mkdirSync(bin, { recursive: true });
   mkdirSync(sysdev, { recursive: true });
-  mkdirSync(parent, { recursive: true });
-  writeFileSync(join(sysdev, "partition"), `${values.partition ?? "5"}\n`);
-  writeFileSync(join(sysdev, "start"), `${values.start ?? "229376"}\n`);
-  writeFileSync(join(sysdev, "size"), `${values.size ?? "163807"}\n`);
-  writeFileSync(join(parent, "dev"), `${values.parent ?? "8:0"}\n`);
-  const node = join(dir, "node");
-  if (!values.missing) writeFileSync(node, "SYNTHETIC_FIXTURE_node");
-  writeFileSync(join(bin, "readlink"), `#!/bin/sh\ncase "$2" in '${f.disk}') printf '%s\\n' '${f.disk}' ;; '${node}') printf '%s\\n' '${node}' ;; /sys/dev/block/8:5) printf '%s\\n' '${sysdev}' ;; *) printf '%s\\n' "$2" ;; esac\n`);
-  writeFileSync(join(bin, "blkid"), `#!/bin/sh\nprintf '%s\\n' '${values.uuid ?? "55555555-5555-4555-8555-555555555555"}'\n`);
-  writeFileSync(join(bin, "stat"), `#!/bin/sh\ncase "$2:$3" in %t:${node}) printf '8\\n' ;; %T:${node}) printf '5\\n' ;; %t:${f.disk}) printf '8\\n' ;; %T:${f.disk}) printf '0\\n' ;; *) exit 1 ;; esac\n`);
-  for (const name of ["readlink", "blkid", "stat"]) chmodSync(join(bin, name), 0o755);
-  const script = join(dir, "validator.sh");
-  writeFileSync(script, `${fn}\nPERSIST_DISK='${f.disk}'\n_persist_validate_node '${node}' 5 '55555555-5555-4555-8555-555555555555' 229376 163807\n`);
+  const parent = join(dir, "sysfs", "disk");
+  writeFileSync(join(sysdev, "partition"), `${changes.partition ?? "3"}\n`);
+  writeFileSync(join(sysdev, "start"), `${changes.start ?? starts[2]}\n`);
+  writeFileSync(join(sysdev, "size"), `${changes.size ?? sizes[2]}\n`);
+  writeFileSync(join(parent, "dev"), `${changes.parent ?? "8:0"}\n`);
+  writeFileSync(join(parent, "diskseq"), `${changes.diskseq ?? "73"}\n`);
+  const diskNode = join(dir, "disk-node");
+  const partNode = join(dir, "part-node");
+  writeFileSync(diskNode, "SYNTHETIC_FIXTURE_disk-node");
+  writeFileSync(partNode, "SYNTHETIC_FIXTURE_part-node");
+  const diskAlias = join(dir, "by-diskseq-73");
+  const partAlias = join(dir, "by-partuuid", changes.aliasUuid ?? guids[2]);
+  mkdirSync(join(dir, "by-partuuid"), { recursive: true });
+  Bun.spawnSync(["ln", "-sfn", diskNode, diskAlias]);
+  Bun.spawnSync(["ln", "-sfn", partNode, partAlias]);
+  const expectedNode = `/dev/disk/by-partuuid/${guids[2]}`;
+  const expectedDisk = "/dev/disk/by-diskseq/73";
+  writeFileSync(join(bin, "readlink"), `#!/bin/sh\ncase "$2" in '${expectedDisk}') printf '%s\\n' '${diskNode}' ;; '${expectedNode}') [ '${existsSync(join(dir, "by-partuuid", guids[2]))}' = true ] || exit 1; printf '%s\\n' '${partNode}' ;; /sys/dev/block/8:5) printf '%s\\n' '${sysdev}' ;; *) exec /usr/bin/readlink "$@" ;; esac\n`);
+  writeFileSync(join(bin, "stat"), `#!/bin/sh\ncase "$2:$3" in %t:${diskNode}) printf '8\\n' ;; %T:${diskNode}) printf '0\\n' ;; %t:${partNode}) printf '8\\n' ;; %T:${partNode}) printf '5\\n' ;; *) exit 1 ;; esac\n`);
+  writeFileSync(join(bin, "blkid"), `#!/bin/sh\n[ "$1" = -p ] && [ "$2" = -c ] && [ "$3" = /dev/null ] && [ "$4" = -s ] && [ "$5" = PART_ENTRY_UUID ] && [ "$6" = -o ] && [ "$7" = value ] && [ "$8" = '${expectedNode}' ] || exit 9\nprintf '%s\\n' '${changes.uuid ?? guids[2]}'\n`);
+  for (const executable of ["readlink", "stat", "blkid"]) chmodSync(join(bin, executable), 0o755);
+  const fnStart = hookSource.indexOf("_persist_validate_node() {");
+  const fnEnd = hookSource.indexOf("\n}\n", fnStart) + 3;
+  const functionSource = hookSource.slice(fnStart, fnEnd).replaceAll('[ -b "$disk_real" ]', '[ -e "$disk_real" ]').replaceAll('[ -b "$node_real" ]', '[ -e "$node_real" ]');
+  const script = join(dir, "validate.sh");
+  writeFileSync(script, `${functionSource}\nPERSIST_DISK='${expectedDisk}'\nPERSIST_DISKSEQ='${changes.expectedDiskseq ?? "73"}'\nPERSIST_DISK_DEV='${changes.expectedDev ?? "8:0"}'\nPERSIST_DISK_SYSFS='${changes.expectedSysfs ?? parent}'\n_persist_validate_node '${expectedNode}' 3 '${guids[2]}' '${starts[2]}' '${sizes[2]}'\n`);
   return Bun.spawnSync(["bash", script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
 }
 
-function verifier(f: ReturnType<typeof fixture>) {
-  const bin = join(f.dir, "bin");
+function verifyGpt(f: ReturnType<typeof fixture>, manifestPath = f.manifest, changedUuid = "") {
+  const dir = join(f.dir, `verify-${Math.random().toString(16).slice(2)}`);
+  const bin = join(dir, "bin");
+  const aliases = join(dir, "by-diskseq");
   mkdirSync(bin, { recursive: true });
-  const source = `${f.disk}3`;
-  writeFileSync(join(bin, "findmnt"), `#!/bin/sh\nprintf '%s\\n' '${source}'\n`);
-  writeFileSync(join(bin, "blkid"), `#!/bin/sh\nprintf '%s\\n' '${partGuids[2]}'\n`);
-  writeFileSync(join(bin, "lsblk"), "#!/bin/sh\nprintf 'synthetic-disk\\n'\n");
-  writeFileSync(join(bin, "readlink"), `#!/bin/sh\ncase "$2" in '${f.disk}') printf '%s\\n' '${f.disk}' ;; /dev/synthetic-disk) printf '%s\\n' '${f.disk}' ;; *) printf '%s\\n' "$2" ;; esac\n`);
-  writeFileSync(join(bin, "sfdisk"), `#!/bin/sh\nif [ "$1" = --dump ]; then /usr/bin/sfdisk --dump "$2" | sed 's|${f.disk}|/dev/synthetic-disk|g'; else exec /usr/bin/sfdisk "$@"; fi\n`);
-  writeFileSync(join(bin, "blockdev"), "#!/bin/sh\nprintf '393216\\n'\n");
-  for (const name of ["findmnt", "blkid", "lsblk", "readlink", "blockdev", "sfdisk"]) chmodSync(join(bin, name), 0o755);
-  const script = join(f.dir, "verify.sh");
-  const copy = hookSource
-    .replaceAll("/run/archiso/bootmnt/ais-live/gpt-layout", f.manifest)
-    .replaceAll("/run/archiso/bootmnt", f.dir);
-  writeFileSync(script, `${copy}\n_persist_die(){ echo "$*" >&2; return 1; }\nPERSIST_DISK='${f.disk}'\nPERSIST_EXCHANGE_PART='/dev/synthetic-disk4'\n_persist_validate_node(){ return 0; }\n_persist_verify_gpt\n`);
-  chmodSync(script, 0o755);
-  return Bun.spawnSync(["bash", script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
-}
-
-function createPersist(f: ReturnType<typeof fixture>, options: { nodeExists?: boolean; partxDoesNotCreate?: boolean; validateNodeFails?: boolean } = {}) {
-  const bin = join(f.dir, "create-bin");
-  mkdirSync(bin, { recursive: true });
-  const node = join(f.dir, "persist-node");
-  const log = join(f.dir, "format.log");
-  const source = "/dev/synthetic-disk3";
-  const scripts: Record<string, string> = {
-    findmnt: `#!/bin/sh\nprintf '%s\\n' '${source}'\n`,
-    blkid: `#!/bin/sh\ncase "$*" in *synthetic-disk3*) printf '%s\\n' '${partGuids[2]}';; *synthetic-disk4*) printf '%s\\n' '${partGuids[3]}';; *) /usr/bin/sfdisk --dump '${f.disk}' | sed -n 's/.*uuid=\\([^,]*\\).*name="AISPERSIST".*/\\1/p';; esac\n`,
-    lsblk: "#!/bin/sh\nprintf 'synthetic-disk\\n'\n",
-    readlink: `#!/bin/sh\ncase "$2" in '${f.disk}'|/dev/synthetic-disk) printf '%s\\n' '${f.disk}' ;; *) printf '%s\\n' "$2" ;; esac\n`,
-    blockdev: "#!/bin/sh\nprintf '393216\\n'\n",
-    partx: `#!/bin/sh\n${options.nodeExists || options.partxDoesNotCreate ? "" : `touch '${node}'`}\n`,
-    udevadm: "#!/bin/sh\nexit 0\n",
-    cryptsetup: `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n[ "$1" = isLuks ] && exit 1\nexit 0\n`,
-    wipefs: "#!/bin/sh\nexit 0\n",
-    keyctl: "#!/bin/sh\n[ \"$1\" = pipe ] && printf 'SYNTHETIC_FIXTURE_key_material' || printf '77\\n'\n",
-    "mkfs.btrfs": `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n`,
-    sfdisk: `#!/bin/sh\nif [ "$1" = --dump ]; then /usr/bin/sfdisk --dump "$2" | sed 's|${f.disk}|/dev/synthetic-disk|g'; else exec /usr/bin/sfdisk "$@"; fi\n`,
+  mkdirSync(aliases, { recursive: true });
+  const bootPart = join(aliases, "73-part3");
+  const p4Alias = join(dir, "by-partuuid", guids[3]);
+  mkdirSync(join(dir, "by-partuuid"), { recursive: true });
+  writeFileSync(join(dir, "p3-node"), "SYNTHETIC_FIXTURE_boot-partition");
+  writeFileSync(join(dir, "p4-node"), "SYNTHETIC_FIXTURE_exchange-partition");
+  Bun.spawnSync(["ln", "-sfn", join(dir, "p3-node"), bootPart]);
+  Bun.spawnSync(["ln", "-sfn", join(dir, "p4-node"), p4Alias]);
+  const manifest = join(dir, "gpt-layout");
+  writeFileSync(manifest, readFileSync(manifestPath));
+  const fn = (name: string) => {
+    const start = hookSource.indexOf(`${name}() {`);
+    const end = hookSource.indexOf("\n}\n", start) + 3;
+    return hookSource.slice(start, end);
   };
-  for (const [name, body] of Object.entries(scripts)) {
-    writeFileSync(join(bin, name), body);
-    chmodSync(join(bin, name), 0o755);
-  }
-  const console = join(f.dir, "console");
-  writeFileSync(console, `${f.disk}\n`);
-  const copy = hookSource
-    .replaceAll("/run/archiso/bootmnt/ais-live/gpt-layout", f.manifest)
-    .replaceAll("/run/archiso/bootmnt", f.dir)
-    .replaceAll("/dev/console", console)
-    .replace("printf '\\nPersistence will partition and format %s. Type the full device path to confirm: ' \"$PERSIST_DISK\" >\"$PERSIST_CONSOLE\"", ":")
-    .replaceAll('PERSIST_PART="${candidate}5"', `PERSIST_PART='${node}'`)
-    .replaceAll('PERSIST_PART="${candidate}p5"', `PERSIST_PART='${node}'`)
-    .replaceAll('PERSIST_EXCHANGE_PART="${candidate}4"', "PERSIST_EXCHANGE_PART='/dev/synthetic-disk4'")
-    .replaceAll('PERSIST_EXCHANGE_PART="${candidate}p4"', "PERSIST_EXCHANGE_PART='/dev/synthetic-disk4'")
-    .replaceAll('PERSIST_PART="${candidate}p5"', `PERSIST_PART='${node}'`)
-    .replaceAll('[ -b "$PERSIST_PART" ]', '[ -e "$PERSIST_PART" ]');
-  const script = join(f.dir, "create.sh");
-  if (options.nodeExists) writeFileSync(node, "SYNTHETIC_FIXTURE_stale_node");
-  writeFileSync(script, `${copy}\nPERSIST_DISK='${f.disk}'\nPERSIST_PART='${node}'\nPERSIST_EXCHANGE_PART='/dev/synthetic-disk4'\nPERSIST_CONSOLE='${console}'\n_persist_die(){ printf '%s\\n' "$*"; return 1; }\n_persist_prompt(){ return 0; }\n_persist_find_device(){ return 0; }\n_persist_validate_node(){ [ "$2" = 5 ] && ${options.validateNodeFails ? "return 1" : "return 0"}; return 0; }\n_persist_create\n`);
-  chmodSync(script, 0o755);
-  return { result: Bun.spawnSync(["bash", script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" }), log, node };
+  const verify = fn("_persist_verify_gpt")
+    .replaceAll("/run/archiso/bootmnt/ais-live/gpt-layout", manifest)
+    .replaceAll("/dev/disk/by-diskseq", aliases)
+    .replaceAll("/dev/disk/by-partuuid", join(dir, "by-partuuid"))
+    .replaceAll('[ -b "$boot_part_real" ]', '[ -e "$boot_part_real" ]');
+  const blkid = join(bin, "blkid");
+  writeFileSync(blkid, `#!/bin/sh\n[ "$1" = -p ] && [ "$2" = -c ] && [ "$3" = /dev/null ] && [ "$4" = -s ] && [ "$5" = PART_ENTRY_UUID ] && [ "$6" = -o ] && [ "$7" = value ] && [ "$8" = '${bootPart}' ] || exit 9\nprintf '%s\\n' '${changedUuid || guids[2]}'\n`);
+  const blockdev = join(bin, "blockdev");
+  writeFileSync(blockdev, `#!/bin/sh\n[ "$1" = --getsz ] && [ "$2" = '${f.disk}' ] || exit 9\nprintf '393216\\n'\n`);
+  const findmnt = join(bin, "findmnt");
+  writeFileSync(findmnt, `#!/bin/sh\nprintf '%s\\n' '${bootPart}'\n`);
+  for (const executable of [blkid, blockdev, findmnt]) chmodSync(executable, 0o755);
+  const script = join(dir, "verify.sh");
+  writeFileSync(script, `${fn("_persist_uuid_valid")}\n${fn("_persist_decimal_valid")}\n_persist_check_diskseq(){ return 0; }\n_persist_validate_node(){ return 0; }\n_persist_refresh_part_node(){ PERSIST_RESOLVED_PART='${p4Alias}'; }\n${verify}\nPERSIST_DISK='${f.disk}'\nPERSIST_DISKSEQ=73\nPERSIST_DISK_DEV=8:0\nPERSIST_DISK_SYSFS=/sys/devices/fixture\nPERSIST_ALLOW_P5_NODE_MISSING=0\n_persist_verify_gpt\n`);
+  return Bun.spawnSync(["bash", script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
 }
 
-describe("persistent disk GPT contract", () => {
-  test("accepts only the exact four-entry manifest and rejects extra entries", () => {
-    const valid = fixture("valid");
-    const validResult = verifier(valid);
-    expect(validResult.exitCode, `${validResult.stdout.toString()} ${validResult.stderr.toString()}`).toBe(0);
-    const extra = fixture("unexpected", `\nstart=229376, size=2048, type=${type[2]}, uuid=55555555-5555-4555-8555-555555555555, name="unexpected"`);
-    expect(verifier(extra).exitCode).not.toBe(0);
-    const malformed = fixture("manifest-extra");
-    writeFileSync(malformed.manifest, readFileSync(malformed.manifest, "utf8") + "unexpected\n");
-    expect(verifier(malformed).exitCode).not.toBe(0);
-  }, 30000);
+type CreateMutation = "none" | "diskseq" | "partuuid" | "stale-p5" | "existing-p5-no-node" | "bad-p5-guid" | "bad-p5-extent" | "bad-p5-name" | "corrupt-primary" | "corrupt-backup";
 
-  test("real sparse image has stable bytes for all existing partitions before and after validation", () => {
-    const f = fixture("bytes");
-    const before = f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])));
-    const result = verifier(f);
-    expect(result.exitCode, `${result.stdout.toString()} ${result.stderr.toString()}`).toBe(0);
-    const after = f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])));
-    expect(after).toEqual(before);
+function createTransition(name: string, mutation: CreateMutation = "none") {
+  const p5Entries: Partial<Record<CreateMutation, string>> = {
+    "existing-p5-no-node": '\nstart=229376, size=163807, type=0fc63daf-8483-4772-8e79-3d69d8477de4, uuid=55555555-5555-4555-8555-555555555555, name="AISPERSIST"',
+    "bad-p5-guid": '\nstart=229376, size=163807, type=0fc63daf-8483-4772-8e79-3d69d8477de4, uuid=44444444-4444-4444-8444-444444444444, name="AISPERSIST"',
+    "bad-p5-extent": '\nstart=229377, size=163806, type=0fc63daf-8483-4772-8e79-3d69d8477de4, uuid=55555555-5555-4555-8555-555555555555, name="AISPERSIST"',
+    "bad-p5-name": '\nstart=229376, size=163807, type=0fc63daf-8483-4772-8e79-3d69d8477de4, uuid=55555555-5555-4555-8555-555555555555, name="unexpected"',
+  };
+  const f = fixture(`create-${name}`, { extra: p5Entries[mutation] ?? "" });
+  const manifestFixture = p5Entries[mutation] ? fixture(`create-manifest-${name}`) : f;
+  const randomizedDiskGuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const randomizedParts = [
+    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4",
+  ];
+  Bun.spawnSync(["sfdisk", "--disk-id", f.disk, randomizedDiskGuid]);
+  randomizedParts.forEach((uuid, index) => Bun.spawnSync(["sfdisk", "--part-uuid", f.disk, String(index + 1), uuid]));
+  const contract = manifestFixture.manifest;
+  const sourceHashes = starts.map((start, index) => sliceHash(f.disk, Number(start), Number(sizes[index])));
+
+  const dir = join(f.dir, `transition-${mutation}`);
+  const bin = join(dir, "bin");
+  const bySeq = join(dir, "by-diskseq");
+  const byPart = join(dir, "by-partuuid");
+  const devBlock = join(dir, "dev-block");
+  const sysRoot = join(dir, "sys-block");
+  const sysdir = join(sysRoot, "sda");
+  const partNodes = join(dir, "part-nodes");
+  const bootmnt = join(dir, "bootmnt");
+  const consolePath = join(dir, "console");
+  const uuidFile = join(dir, "uuid");
+  const log = join(dir, "format.log");
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(bySeq, { recursive: true });
+  mkdirSync(byPart, { recursive: true });
+  mkdirSync(devBlock, { recursive: true });
+  mkdirSync(partNodes, { recursive: true });
+  mkdirSync(sysdir, { recursive: true });
+  mkdirSync(join(bootmnt, "ais-live"), { recursive: true });
+  writeFileSync(join(bootmnt, "ais-live", "gpt-layout"), readFileSync(contract));
+  writeFileSync(consolePath, "");
+  writeFileSync(uuidFile, "cccccccc-cccc-4ccc-8ccc-cccccccccccc\n");
+  writeFileSync(join(sysdir, "diskseq"), "73\n");
+  writeFileSync(join(sysdir, "dev"), "8:0\n");
+  const diskAlias = join(bySeq, "73");
+  Bun.spawnSync(["ln", "-sfn", f.disk, diskAlias]);
+  Bun.spawnSync(["ln", "-sfn", sysdir, join(devBlock, "8:0")]);
+  const partStart = [...starts];
+  const partSize = [...sizes];
+  for (let partition = 1; partition <= 4; partition++) {
+    const node = join(partNodes, `part${partition}`);
+    writeFileSync(node, `SYNTHETIC_FIXTURE_part${partition}`);
+    const child = join(sysdir, `sda${partition}`);
+    mkdirSync(child, { recursive: true });
+    writeFileSync(join(child, "partition"), `${partition}\n`);
+    writeFileSync(join(child, "dev"), `8:${partition}\n`);
+    writeFileSync(join(child, "start"), `${partStart[partition - 1]}\n`);
+    writeFileSync(join(child, "size"), `${partSize[partition - 1]}\n`);
+    Bun.spawnSync(["ln", "-sfn", child, join(devBlock, `8:${partition}`)]);
+    Bun.spawnSync(["ln", "-sfn", node, `${diskAlias}-part${partition}`]);
+    Bun.spawnSync(["ln", "-sfn", node, join(byPart, randomizedParts[partition - 1])]);
+  }
+  if (mutation === "stale-p5") {
+    const stale = join(partNodes, "stale-part5");
+    writeFileSync(stale, "SYNTHETIC_FIXTURE_stale_partition_node");
+    Bun.spawnSync(["ln", "-sfn", stale, `${diskAlias}-part5`]);
+  }
+  if (mutation === "corrupt-primary" || mutation === "corrupt-backup") {
+    const sector = mutation === "corrupt-primary" ? 1 : 393215;
+    const corrupt = Bun.spawnSync(["bash", "-c", `printf '\\132' | dd of='${f.disk}' bs=1 seek=${sector * 512 + 16} conv=notrunc status=none`]);
+    if (corrupt.exitCode !== 0) throw new Error(`Could not corrupt GPT fixture: ${corrupt.stderr.toString()}`);
+  }
+  const wholeImageBefore = imageHash(f.disk);
+  const sfdisk = join(bin, "sfdisk");
+  // After the real sfdisk write, publish the new UUID alias and its exact geometry.
+  const sfdiskAdapter = `#!/bin/sh
+/usr/bin/sfdisk "$@" || exit $?
+case " $* " in *" -N 5 "*)
+  uuid=$(printf '%s\\n' "$PERSIST_EXPECTED_P5_UUID")
+  start=$(printf '%s\\n' "$PERSIST_EXPECTED_P5_START")
+  size=$(printf '%s\\n' "$PERSIST_EXPECTED_P5_SIZE")
+  node='${join(partNodes, "part5")}'
+  mkdir -p '${join(sysdir, "sda5")}'
+  printf '5\\n' >'${join(sysdir, "sda5", "partition")}'
+  printf '8:5\\n' >'${join(sysdir, "sda5", "dev")}'
+  printf '%s\\n' "$start" >'${join(sysdir, "sda5", "start")}'
+  printf '%s\\n' "$size" >'${join(sysdir, "sda5", "size")}'
+  printf 'SYNTHETIC_FIXTURE_part5\\n' >"$node"
+  ln -sfn '${join(sysdir, "sda5")}' '${join(devBlock, "8:5")}'
+  ln -sfn "$node" '${join(bySeq, "73-part5")}'
+  ln -sfn "$node" "${byPart}/$uuid"
+  ;;
+esac
+`;
+  writeFileSync(sfdisk, sfdiskAdapter);
+  const stat = join(bin, "stat");
+  writeFileSync(stat, `#!/bin/sh
+if [ "$1" = -Lc ]; then
+  format=$2
+  path=$(readlink -f "$3") || exit 1
+  case "$path" in
+    '${f.disk}') minor=0 ;;
+    '${join(partNodes, "part1")}') minor=1 ;;
+    '${join(partNodes, "part2")}') minor=2 ;;
+    '${join(partNodes, "part3")}') minor=3 ;;
+    '${join(partNodes, "part4")}') minor=4 ;;
+    '${join(partNodes, "part5")}') minor=5 ;;
+    *) exit 1 ;;
+  esac
+  case "$format" in
+    '%t:%T') printf '8:%x\\n' "$minor" ;;
+    '%t') printf '8\\n' ;;
+    '%T') printf '%x\\n' "$minor" ;;
+    *) exit 1 ;;
+  esac
+else
+  exec /usr/bin/stat "$@"
+fi
+`);
+  const blkid = join(bin, "blkid");
+  writeFileSync(blkid, `#!/bin/sh
+[ "$1" = -p ] && [ "$2" = -c ] && [ "$3" = /dev/null ] && [ "$4" = -s ] && [ "$5" = PART_ENTRY_UUID ] && [ "$6" = -o ] && [ "$7" = value ] || exit 9
+case "$8" in '${bySeq}/73-part3') /usr/bin/sfdisk --part-uuid '${f.disk}' 3;; '${bySeq}/73-part4') /usr/bin/sfdisk --part-uuid '${f.disk}' 4;; '${bySeq}/73-part5') /usr/bin/sfdisk --part-uuid '${f.disk}' 5;; '${byPart}/'*) printf '%s\\n' "\${8##*/}";; *) exit 2;; esac
+`);
+  const blockdev = join(bin, "blockdev");
+  writeFileSync(blockdev, `#!/bin/sh\n[ "$1" = --getsz ] && [ "$2" = '${diskAlias}' ] && printf '393216\\n'\n`);
+  const findmnt = join(bin, "findmnt");
+  writeFileSync(findmnt, `#!/bin/sh\nprintf '%s\\n' '${diskAlias}-part3'\n`);
+  const keyctl = join(bin, "keyctl");
+  writeFileSync(keyctl, `#!/bin/sh
+case "$1" in
+  search) printf '12345\\n'; if [ '${mutation}' = diskseq ]; then printf '74\\n' >'${join(sysdir, "diskseq")}'; fi; if [ '${mutation}' = partuuid ]; then ln -sfn '${join(partNodes, "part4")}' '${byPart}/'"$PERSIST_EXPECTED_P5_UUID"; fi ;;
+  pipe) printf 'SYNTHETIC_FIXTURE_key\\n' ;;
+  *) exit 0 ;;
+esac
+`);
+  const cryptsetup = join(bin, "cryptsetup");
+  writeFileSync(cryptsetup, `#!/bin/sh
+case "$1" in
+  isLuks) [ -e '${join(dir, "luks-created")}' ] ;;
+  luksFormat) printf 'luksFormat\\n' >>'${log}'; touch '${join(dir, "luks-created")}';;
+  open) printf 'open\\n' >>'${log}';;
+  *) exit 0 ;;
+esac
+`);
+  const mkfs = join(bin, "mkfs.btrfs");
+  writeFileSync(mkfs, `#!/bin/sh\nprintf 'mkfs.btrfs\\n' >>'${log}'\n`);
+  const generic = ["wipefs", "udevadm"];
+  writeFileSync(join(bin, "wipefs"), "#!/bin/sh\nexit 0\n");
+  writeFileSync(join(bin, "udevadm"), "#!/bin/sh\nexit 0\n");
+  writeFileSync(join(bin, "partx"), "#!/bin/sh\nexit 0\n");
+  const executablePaths = [sfdisk, stat, blkid, blockdev, findmnt, keyctl, cryptsetup, mkfs, join(bin, "partx"), ...generic.map((name) => join(bin, name))];
+  executablePaths.forEach((path) => chmodSync(path, 0o755));
+
+  const names = ["_persist_uuid_valid", "_persist_decimal_valid", "_persist_check_diskseq", "_persist_validate_node", "_persist_refresh_part_node", "_persist_verify_gpt", "_persist_create"];
+  const functions = names.map((name) => {
+    const start = hookSource.indexOf(`${name}() {`);
+    const end = hookSource.indexOf("\n}\n", start) + 3;
+    return hookSource.slice(start, end);
+  }).join("\n");
+  const adapted = functions
+    .replaceAll("/run/archiso/bootmnt/ais-live/gpt-layout", join(bootmnt, "ais-live/gpt-layout"))
+    .replaceAll("/dev/disk/by-diskseq", bySeq)
+    .replaceAll("/dev/disk/by-partuuid", byPart)
+    .replaceAll("/sys/dev/block", devBlock)
+    .replaceAll("/proc/sys/kernel/random/uuid", uuidFile)
+    .replaceAll('[ -b "$resolved" ]', '[ -e "$resolved" ]')
+    .replaceAll('[ -b "$boot_part_real" ]', '[ -e "$boot_part_real" ]')
+    .replaceAll('[ -b "$disk_real" ]', '[ -e "$disk_real" ]')
+    .replaceAll('[ -b "$node_real" ]', '[ -e "$node_real" ]')
+    .replaceAll('[ -b "$boot_part_real" ]', '[ -e "$boot_part_real" ]');
+  const script = join(dir, "create.sh");
+  writeFileSync(script, `${adapted}
+_persist_prompt(){ return 0; }
+_persist_find_device(){ _persist_check_diskseq; }
+_persist_die(){ printf '%s\\n' "$*" >&2; exit 99; }
+read(){ reply=$PERSIST_DISK; return 0; }
+PERSIST_CONSOLE='${consolePath}'
+PERSIST_DISK='${diskAlias}'
+PERSIST_DISKSEQ=73
+PERSIST_DISK_DEV=8:0
+PERSIST_DISK_SYSFS='${sysdir}'
+PERSIST_ALLOW_P5_NODE_MISSING=0
+PERSIST_EXPECTED_P5_UUID=
+PERSIST_EXPECTED_P5_START=
+PERSIST_EXPECTED_P5_SIZE=
+export PERSIST_EXPECTED_P5_UUID PERSIST_EXPECTED_P5_START PERSIST_EXPECTED_P5_SIZE
+_persist_create
+`);
+  return {
+    f,
+    log,
+    sourceHashes,
+    wholeImageBefore,
+    currentImageHash: () => imageHash(f.disk),
+    currentSourceHashes: () => starts.map((start, index) => sliceHash(f.disk, Number(start), Number(sizes[index]))),
+    result: Bun.spawnSync(["bash", script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" }),
+    getLog: () => existsSync(log) ? readFileSync(log, "utf8") : "",
+  };
+}
+
+describe("persistent disk identity contract", () => {
+  test("the production generator emits the strict image manifest and existing partition bytes remain unchanged", () => {
+    const f = fixture("manifest");
+    expect(f.generated.exitCode, f.generated.stderr.toString()).toBe(0);
+    const manifest = readFileSync(f.manifest, "utf8");
+    expect(manifest.split("\n")).toHaveLength(7);
+    expect(manifest).toContain("AIS-GPT-LAYOUT\t1\n");
+    expect(manifest).toContain("part\t3\t32768\t163840\t0fc63daf-8483-4772-8e79-3d69d8477de4\t33333333-3333-4333-8333-333333333333\tAISBASE\t-\n");
+    const before = starts.map((start, i) => sliceHash(f.disk, Number(start), Number(sizes[i])));
     expect(Bun.spawnSync(["sfdisk", "--verify", f.disk]).exitCode).toBe(0);
+    expect(starts.map((start, i) => sliceHash(f.disk, Number(start), Number(sizes[i])))).toEqual(before);
   }, 30000);
 
-  test("actual slot-5 creation preserves every p1-p4 byte and only then requests LUKS formatting", () => {
-    const f = fixture("create-happy");
-    for (let i = 0; i < 4; i++) {
-      const payload = join(f.dir, `payload-${i + 1}`);
-      writeFileSync(payload, Buffer.alloc(4096, `SYNTHETIC_FIXTURE_PART_${i + 1}`));
-      Bun.spawnSync(["dd", `if=${payload}`, `of=${f.disk}`, "bs=1", `seek=${Number(f.starts[i]) * 512}`, "conv=notrunc", "status=none"]);
-    }
-    const before = f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])));
-    const created = createPersist(f);
-    expect(created.result.exitCode, `${created.result.stdout.toString()} ${created.result.stderr.toString()}`).toBe(0);
-    const after = f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])));
-    expect(after).toEqual(before);
-    const dump = Bun.spawnSync(["sfdisk", "--dump", f.disk], { stdout: "pipe" }).stdout.toString();
-    expect(dump.match(/name="AISPERSIST"/g)).toHaveLength(1);
-    expect(readFileSync(created.log, "utf8")).toContain("luksFormat");
+  test("ambiguity scan accepts one boot disk and refuses duplicate manifest or duplicate AISBASE media", () => {
+    const valid = fixture("single");
+    const duplicate = fixture("duplicate");
+    const singleScan = ambiguityHarness("single", [{ seq: "73", fixture: valid }]);
+    expect(singleScan.result.exitCode, `${singleScan.result.stdout.toString()} ${singleScan.result.stderr.toString()}`).toBe(0);
+    const unrelated = ambiguityHarness("unrelated", [
+      { seq: "73", fixture: valid },
+      { seq: "74", fixture: duplicate },
+    ]);
+    expect(unrelated.result.exitCode, `${unrelated.result.stdout.toString()} ${unrelated.result.stderr.toString()}`).toBe(0);
+
+    const duplicateManifest = ambiguityHarness("duplicate-manifest", [
+      { seq: "73", fixture: valid },
+      { seq: "74", fixture: duplicate, fstype: "ext4" },
+    ]);
+    expect(duplicateManifest.result.exitCode, `${duplicateManifest.result.stdout.toString()} ${duplicateManifest.result.stderr.toString()}`).not.toBe(0);
+
+    const relabelled = fixture("relabelled", { rows: { names: ["BIOS", "AISBOOT", "OTHERBASE", "AISX"] } });
+    const duplicateLabel = ambiguityHarness("duplicate-label", [
+      { seq: "73", fixture: valid },
+      { seq: "74", fixture: relabelled, label: "AISBASE" },
+    ]);
+    expect(duplicateLabel.result.exitCode).not.toBe(0);
   }, 30000);
 
-  test("stale p5 node without a GPT entry is refused before prompting or writing", () => {
-    const f = fixture("stale-node");
-    const created = createPersist(f, { nodeExists: true });
-    expect(created.result.exitCode).not.toBe(0);
-    expect(existsSync(created.log) ? readFileSync(created.log, "utf8") : "").not.toContain("luksFormat");
-    expect(Bun.spawnSync(["sfdisk", "--dump", f.disk], { stdout: "pipe" }).stdout.toString()).not.toContain("AISPERSIST");
-  }, 30000);
-
-  test("a p5 device that fails identity validation is never formatted", () => {
-    const f = fixture("node-identity");
-    const created = createPersist(f, { validateNodeFails: true });
-    expect(created.result.exitCode).not.toBe(0);
-    expect(existsSync(created.log) ? readFileSync(created.log, "utf8") : "").not.toContain("luksFormat");
-    expect(Bun.spawnSync(["sfdisk", "--dump", f.disk], { stdout: "pipe" }).stdout.toString()).toContain("AISPERSIST");
-  }, 30000);
-
-  test("existing GPT p5 remains unformatted when partx succeeds but its node stays absent", () => {
-    const f = fixture("existing-p5-no-node", `\nstart=229376, size=163807, type=${type[2]}, uuid=55555555-5555-4555-8555-555555555555, name="AISPERSIST"`, "192M", false);
-    const before = f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])));
-    const created = createPersist(f, { partxDoesNotCreate: true });
-    expect(created.result.exitCode).not.toBe(0);
-    expect(`${created.result.stdout.toString()} ${created.result.stderr.toString()}`).toContain("Existing persistence partition node is unavailable");
-    expect(existsSync(created.log) ? readFileSync(created.log, "utf8") : "").not.toContain("luksFormat");
-    expect(f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])))).toEqual(before);
-    expect(Bun.spawnSync(["sfdisk", "--dump", f.disk], { stdout: "pipe" }).stdout.toString()).toContain("AISPERSIST");
-  }, 30000);
-
-  test("the actual node validator accepts the exact GPT identity and rejects every mismatched identity field", () => {
-    const f = fixture("node-validator");
-    expect(actualNodeValidator(f).exitCode).toBe(0);
-    const failures = [
-      { uuid: "66666666-6666-4666-8666-666666666666" },
-      { start: "229377" },
-      { size: "163806" },
+  test("the production node validator binds blkid UUID, partition geometry, parent diskseq, devno and disk sysfs", () => {
+    const f = fixture("node-validation");
+    expect(validateNode(f).exitCode).toBe(0);
+    const mismatches: Array<Record<string, string>> = [
+      { uuid: "55555555-5555-4555-8555-555555555555" },
       { partition: "4" },
+      { start: "32769" },
+      { size: "163839" },
       { parent: "8:1" },
-      { missing: true },
+      { diskseq: "74" },
+      { expectedDiskseq: "74" },
+      { expectedSysfs: "/sys/devices/pci0000:00/other" },
+      { aliasUuid: "55555555-5555-4555-8555-555555555555" },
     ];
-    for (const [index, mismatch] of failures.entries()) {
-      expect(actualNodeValidator(fixture(`node-validator-${index}`), mismatch).exitCode).not.toBe(0);
+    for (const [index, mismatch] of mismatches.entries()) {
+      expect(validateNode(f, mismatch).exitCode, `mismatch ${index}: ${JSON.stringify(mismatch)}`).not.toBe(0);
     }
   }, 30000);
 
-  test("pre-existing p5 with a duplicate GUID, wrong extent, or name is rejected by the complete-table verifier", () => {
-    const variants = [
-      `\nstart=229376, size=32735, type=${type[2]}, uuid=${partGuids[3]}, name="AISPERSIST"`,
-      `\nstart=229377, size=32734, type=${type[2]}, uuid=55555555-5555-4555-8555-555555555555, name="AISPERSIST"`,
-      `\nstart=229376, size=32735, type=${type[2]}, uuid=55555555-5555-4555-8555-555555555555, name="unexpected"`,
-    ];
-    for (const [index, extra] of variants.entries()) {
-      const f = fixture(`existing-p5-${index}`, extra);
-      const result = verifier(f);
-      expect(result.exitCode, `${result.stdout.toString()} ${result.stderr.toString()}`).not.toBe(0);
-    }
+  test("the production GPT verifier rejects missing, malformed, overlapping, wrong-type, and mismatched identity contracts", () => {
+    const f = fixture("gpt-verification");
+    expect(verifyGpt(f).exitCode).toBe(0);
+    const missing = join(f.dir, "missing-gpt-layout");
+    writeFileSync(missing, "");
+    expect(verifyGpt(f, missing).exitCode).not.toBe(0);
+
+    const manifest = readFileSync(f.manifest, "utf8");
+    const malformed = join(f.dir, "malformed-gpt-layout");
+    writeFileSync(malformed, manifest.replace("AIS-GPT-LAYOUT\t1", "AIS-GPT-LAYOUT\t2"));
+    expect(verifyGpt(f, malformed).exitCode).not.toBe(0);
+    const overlap = join(f.dir, "overlap-gpt-layout");
+    writeFileSync(overlap, manifest.replace("part\t4\t196608", "part\t4\t32769"));
+    expect(verifyGpt(f, overlap).exitCode).not.toBe(0);
+    const wrongType = join(f.dir, "wrong-type-gpt-layout");
+    writeFileSync(wrongType, manifest.replace("0fc63daf-8483-4772-8e79-3d69d8477de4", "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"));
+    expect(verifyGpt(f, wrongType).exitCode).not.toBe(0);
+    expect(verifyGpt(f, f.manifest, "55555555-5555-4555-8555-555555555555").exitCode).not.toBe(0);
   }, 30000);
 
-  test("an unexpected p5 entry is rejected before any formatting request", () => {
-    const f = fixture("unexpected-before-write", `\nstart=229376, size=32735, type=${type[2]}, uuid=55555555-5555-4555-8555-555555555555, name="unexpected"`);
-    const created = createPersist(f);
-    expect(created.result.exitCode).not.toBe(0);
-    expect(existsSync(created.log) ? readFileSync(created.log, "utf8") : "").not.toContain("luksFormat");
-  }, 30000);
+  test("guarded creation preserves source partition bytes and refuses disk or partition-node substitution before LUKS formatting", () => {
+    const success = createTransition("positive");
+    expect(success.result.exitCode, `${success.result.stdout.toString()} ${success.result.stderr.toString()}`).toBe(0);
+    expect(success.getLog()).toContain("luksFormat");
+    expect(success.getLog()).toContain("mkfs.btrfs");
+    expect(success.currentSourceHashes()).toEqual(success.sourceHashes);
 
-  test("corrupt primary and backup GPT headers are refused before any partition write", () => {
-    for (const [index, headerSector] of [1, 262143].entries()) {
-      const f = fixture(`corrupt-gpt-${index}`);
-      const fd = openSync(f.disk, "r+");
-      const changed = Buffer.from([0x5a]);
-      writeSync(fd, changed, 0, 1, headerSector * 512 + 16);
-      closeSync(fd);
-      const wholeImageBefore = hashImage(f.disk);
-      const before = f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])));
-      const created = createPersist(f);
-      expect(created.result.exitCode).not.toBe(0);
-      expect(existsSync(created.log) ? readFileSync(created.log, "utf8") : "").not.toContain("luksFormat");
-      expect(f.starts.map((s, i) => hashSlice(f.disk, Number(s), Number(f.sizes[i])))).toEqual(before);
-      expect(hashImage(f.disk)).toBe(wholeImageBefore);
-      expect(Bun.spawnSync(["sfdisk", "--dump", f.disk], { stdout: "pipe" }).stdout.toString()).not.toContain("AISPERSIST");
+    for (const mutation of ["diskseq", "partuuid"] as const) {
+      const refusal = createTransition(mutation, mutation);
+      expect(refusal.result.exitCode, `${mutation}: ${refusal.result.stdout.toString()} ${refusal.result.stderr.toString()}`).not.toBe(0);
+      expect(refusal.getLog()).not.toContain("luksFormat");
+      expect(refusal.getLog()).not.toContain("mkfs.btrfs");
+      expect(refusal.currentSourceHashes()).toEqual(refusal.sourceHashes);
     }
-  }, 30000);
+  }, 60000);
+
+  test("guarded creation refuses stale or invalid existing partition 5 without changing the image or formatting", () => {
+    for (const mutation of ["stale-p5", "existing-p5-no-node", "bad-p5-guid", "bad-p5-extent", "bad-p5-name"] as const) {
+      const refusal = createTransition(mutation, mutation);
+      expect(refusal.result.exitCode, `${mutation}: ${refusal.result.stdout.toString()} ${refusal.result.stderr.toString()}`).not.toBe(0);
+      expect(refusal.getLog(), mutation).not.toContain("luksFormat");
+      expect(refusal.getLog(), mutation).not.toContain("mkfs.btrfs");
+      expect(refusal.currentImageHash(), mutation).toBe(refusal.wholeImageBefore);
+      expect(refusal.currentSourceHashes(), mutation).toEqual(refusal.sourceHashes);
+    }
+  }, 120000);
+
+  test("guarded creation refuses corrupt primary or backup GPT headers before writes or formatting", () => {
+    for (const mutation of ["corrupt-primary", "corrupt-backup"] as const) {
+      const refusal = createTransition(mutation, mutation);
+      expect(refusal.result.exitCode, `${mutation}: ${refusal.result.stdout.toString()} ${refusal.result.stderr.toString()}`).not.toBe(0);
+      expect(refusal.getLog(), mutation).not.toContain("luksFormat");
+      expect(refusal.getLog(), mutation).not.toContain("mkfs.btrfs");
+      expect(refusal.currentImageHash(), mutation).toBe(refusal.wholeImageBefore);
+      expect(refusal.currentSourceHashes(), mutation).toEqual(refusal.sourceHashes);
+    }
+  }, 60000);
 });

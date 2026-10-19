@@ -5,7 +5,10 @@ if {$argc < 2 || ![string is integer -strict [lindex $argv 0]] || [lindex $argv 
 }
 if {![info exists env(AIS_PERSIST_PHASE)]} { puts stderr {persist-test: phase is required}; exit 2 }
 set phase $env(AIS_PERSIST_PHASE)
-if {$phase ni {created wrong-pass package verify-package retry clean pick verify-pick retention}} { puts stderr {persist-test: invalid phase}; exit 2 }
+if {$phase ni {created wrong-pass package verify-package retry clean pick verify-pick retention ambiguous}} { puts stderr {persist-test: invalid phase}; exit 2 }
+set requestedMode latest
+if {[info exists env(AIS_TEST_MODE)]} { set requestedMode $env(AIS_TEST_MODE) }
+if {$phase eq "ambiguous" && $requestedMode ni {latest clean}} { puts stderr {persist-test: invalid ambiguity mode}; exit 2 }
 set timeout [lindex $argv 0]
 set command [lrange $argv 1 end]
 set passphrase {SYNTHETIC_FIXTURE_ais_live_persist_passphrase}
@@ -22,6 +25,21 @@ if {[info exists env(AIS_PERSIST_GROW)] && $env(AIS_PERSIST_GROW) eq "4G"} {
     if {![info exists env(AIS_QEMU_IMAGE_COPY)]} { puts stderr {persist-test: image copy is missing}; exit 2 }
     if {[catch {exec truncate -s 4G -- $env(AIS_QEMU_IMAGE_COPY)} reason]} { puts stderr "persist-test: disk growth failed: $reason"; exit 2 }
 }
+if {$phase eq "ambiguous"} {
+    foreach name {AIS_QEMU_IMAGE_COPY AIS_PERSIST_CLONE_PATH AIS_PERSIST_BASELINE_FILE} {
+        if {![info exists env($name)]} { puts stderr "persist-test: $name is required for ambiguity checks"; exit 2 }
+    }
+    if {[catch {exec cp -- $env(AIS_QEMU_IMAGE_COPY) $env(AIS_PERSIST_CLONE_PATH)} reason]} {
+        puts stderr "persist-test: could not clone prepared boot disk: $reason"
+        exit 2
+    }
+    set hashline [exec sha256sum -- $env(AIS_QEMU_IMAGE_COPY)]
+    set baseline [lindex $hashline 0]
+    set output [open $env(AIS_PERSIST_BASELINE_FILE) w]
+    puts $output $baseline
+    close $output
+    puts "persist-test: ambiguity clone made after QEMU preparation; baseline=$baseline"
+}
 log_user 1
 spawn -noecho {*}$command
 set child [exp_pid]
@@ -32,6 +50,24 @@ proc fail {reason} {
     catch {close}
     catch {wait}
     exit 1
+}
+if {$phase eq "ambiguous"} {
+    expect {
+        -re {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=(latest|clean)} {
+            set actualMode $expect_out(1,string)
+            if {$actualMode ne $requestedMode} { fail "wrong ambiguity refusal mode: $actualMode" }
+            puts "persist-test: phase=ambiguous mode=$actualMode refusal verified"
+            catch {exec kill -TERM -- $child}
+            catch {close}
+            catch {wait}
+            exit 0
+        }
+        -re {AIS-LIVE: stage=persist status=ok|AIS-LIVE: stage=first-boot-create status=ok|Kernel panic|emergency shell} {
+            fail {ambiguous boot disk was not refused before persistence setup}
+        }
+        timeout { fail {timeout waiting for ambiguous boot disk refusal} }
+        eof { fail {QEMU exited before ambiguous boot disk refusal} }
+    }
 }
 while {!$phaseReady} {
     expect {

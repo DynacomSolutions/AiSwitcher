@@ -12,6 +12,7 @@ build() {
     add_binary lsblk
     add_binary findmnt
     add_binary sfdisk
+    add_binary sgdisk
     add_binary blockdev
     add_binary blkid
     add_binary stat
@@ -47,8 +48,10 @@ build() {
     add_binary printf
     add_runscript
     [[ -r /etc/ais-live/agent-ids ]] || { error 'Missing required /etc/ais-live/agent-ids'; return 1; }
-    printf 'uid=1001\ngid=1001\n' | cmp -s - /etc/ais-live/agent-ids || { error 'Invalid /etc/ais-live/agent-ids'; return 1; }
+    awk 'NR==1 && $0 ~ /^uid=[1-9][0-9]*$/ {uid=substr($0,5); next} NR==2 && $0 ~ /^gid=[1-9][0-9]*$/ {gid=substr($0,5); next} END {if(NR!=2 || !uid || !gid || uid>4294967294 || gid>4294967294) exit 1}' /etc/ais-live/agent-ids || { error 'Invalid /etc/ais-live/agent-ids'; return 1; }
     add_file /etc/ais-live/agent-ids
+    [[ -r /usr/lib/udev/rules.d/60-persistent-storage.rules ]] || { error 'Missing diskseq udev rule'; return 1; }
+    add_file /usr/lib/udev/rules.d/60-persistent-storage.rules /usr/lib/udev/rules.d/60-persistent-storage.rules
     if [[ ! -e /etc/ais-live/base-packages ]]; then
         mkdir -p /etc/ais-live
         pacman -Qqe | LC_ALL=C sort -u >/etc/ais-live/base-packages

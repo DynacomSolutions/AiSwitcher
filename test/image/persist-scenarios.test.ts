@@ -8,11 +8,19 @@ let fixtureIndex = 0;
 const expectBin = process.env.AIS_EXPECT_BIN ?? "expect";
 const expectAvailable = Boolean(Bun.which(expectBin));
 
-function fakeQemu(body: string, phase: string) {
+function fakeQemu(body: string, phase: string, mode = "latest") {
   const fixture = join(scratch, `serial-${fixtureIndex++}.tcl`);
   writeFileSync(fixture, body);
+  const env: Record<string, string> = { ...process.env, AIS_PERSIST_PHASE: phase, AIS_TEST_MODE: mode } as Record<string, string>;
+  if (phase === "ambiguous") {
+    const prepared = join(scratch, `prepared-${fixtureIndex++}.img`);
+    writeFileSync(prepared, "SYNTHETIC_FIXTURE_prepared_image");
+    env.AIS_QEMU_IMAGE_COPY = prepared;
+    env.AIS_PERSIST_CLONE_PATH = join(scratch, `clone-${fixtureIndex++}.img`);
+    env.AIS_PERSIST_BASELINE_FILE = join(scratch, `baseline-${fixtureIndex++}.sha256`);
+  }
   return Bun.spawnSync([expectBin, "image/test/persist.exp", "5", "tclsh", fixture], {
-    env: { ...process.env, AIS_PERSIST_PHASE: phase, AIS_SERIAL_LOG: `${fixture}.output` },
+    env,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -178,6 +186,7 @@ exec "$@"
       expect(driver).toContain(phase);
       expect(guest).toContain(phase);
     }
+    expect(driver).toContain("ambiguous");
     for (const reason of ["luks2", "argon2id", "exchange-key-permissions", "agent-read-exchange-key", "offline-package-addition-not-recorded", "pending-migration-survived-pick", "outbox-not-written", "shutdown-retained-exchange-key", "displaced-data-not-reclaimed"]) {
       const broken = fakeQemu(`${fakePoweroff}
 puts {AIS-LIVE: stage=persist status=ok mode=latest}
@@ -206,11 +215,106 @@ flush stdout
 
   test("creates a byte-checked duplicate-label disk for create and clean", () => {
     const host = readFileSync(resolve("image/test/run-persist-scenarios.sh"), "utf8");
-    expect(host).toContain("duplicate-ais-labels.img");
-    expect(host).toContain("SYNTHETIC_FIXTURE_duplicate_AIS_labels_sentinel");
-    expect(host).toContain("run_phase created latest \"$image\" 4G \"$duplicate_disk\"");
-    expect(host).toContain("run_phase clean clean \"$current\" '' \"$duplicate_disk\"");
-    expect(host).toContain("modified duplicate-label disk");
+    expect(host).toContain("run_ambiguity_refusal latest");
+    expect(host).toContain("run_ambiguity_refusal clean");
+    expect(host).toContain("prepare_scenario_disk \"$image\" \"$prepared\" \"$mode\" ambiguous");
+    const driver = readFileSync(resolve("image/test/persist.exp"), "utf8");
+    expect(host).toContain("AIS_PERSIST_CLONE_PATH=$duplicate AIS_PERSIST_BASELINE_FILE=$baseline_file");
+    expect(driver).toContain('exec cp -- $env(AIS_QEMU_IMAGE_COPY) $env(AIS_PERSIST_CLONE_PATH)');
+    expect(driver).toContain('exec sha256sum -- $env(AIS_QEMU_IMAGE_COPY)');
+    expect(host).toContain('sha256sum "$work/live.img"');
+    expect(host).toContain('sha256sum "$duplicate"');
+    expect(host).toContain('gpt_identity()');
+    expect(host).toContain('first-boot creation did not randomise every existing GPT identity');
+    expect(host).toContain('reboot phase $phase changed disk or partition GUIDs');
+    expect(host).not.toContain('sgdisk -G');
+    expect(host).not.toContain('SYNTHETIC_FIXTURE_duplicate_AIS_labels_sentinel');
+  });
+
+  test("ambiguity fixtures reject missing refusal, success markers, and any image write", () => {
+    const checker = resolve("image/test/check-persist-serial.sh");
+    const fixture = join(scratch, `ambiguity-fixture-${fixtureIndex++}`);
+    Bun.spawnSync(["mkdir", "-p", fixture]);
+    const serial = join(fixture, "serial.log");
+    const boot = join(fixture, "boot.img");
+    const clone = join(fixture, "clone.img");
+    for (const disk of [boot, clone]) writeFileSync(disk, "SYNTHETIC_FIXTURE_unmodified_disk");
+    const baseline = Bun.spawnSync(["sha256sum", boot], { stdout: "pipe" }).stdout.toString().split(" ")[0];
+    const check = () => Bun.spawnSync(["bash", checker, serial, "--ambiguity", "latest", baseline, boot, clone], {
+      stdout: "pipe", stderr: "pipe",
+    });
+
+    writeFileSync(serial, "AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest\r\n");
+    expect(check().exitCode).toBe(0);
+
+    writeFileSync(serial, "boot completed without an ambiguity decision\n");
+    expect(check().exitCode).not.toBe(0);
+    writeFileSync(serial, "AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=clean\n");
+    expect(check().exitCode).not.toBe(0);
+    writeFileSync(serial, "AIS-LIVE: stage=persist status=ok mode=latest\n");
+    expect(check().exitCode).not.toBe(0);
+    writeFileSync(serial, "AIS-LIVE: stage=first-boot-create status=ok\n");
+    expect(check().exitCode).not.toBe(0);
+    writeFileSync(serial, "AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest\n");
+    writeFileSync(clone, "SYNTHETIC_FIXTURE_modified_disk");
+    expect(check().exitCode).not.toBe(0);
+  });
+
+  test.skipIf(!expectAvailable || !Bun.which("tclsh"))("Expect accepts only an ambiguity refusal for the requested mode", () => {
+      const accepted = fakeQemu(`${fakePoweroff}
+puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest}
+flush stdout
+exec sleep 30
+`, "ambiguous");
+      expect(accepted.exitCode).toBe(0);
+
+      const acceptedClean = fakeQemu(`${fakePoweroff}
+puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=clean}
+flush stdout
+exec sleep 30
+`, "ambiguous", "clean");
+      expect(acceptedClean.exitCode).toBe(0);
+
+      for (const output of [
+        "puts {AIS-LIVE: stage=persist status=ok mode=latest}",
+        "puts {AIS-LIVE: stage=first-boot-create status=ok}",
+        "puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=clean}",
+      ]) {
+        const rejected = fakeQemu(`${fakePoweroff}\n${output}\nflush stdout\nexec sleep 30\n`, "ambiguous");
+        expect(rejected.exitCode).not.toBe(0);
+      }
+  });
+
+  test.skipIf(!expectAvailable || !Bun.which("tclsh"))("clones and hashes the image after mocked boot-menu preparation", () => {
+    const primary = join(scratch, `prepared-primary-${fixtureIndex++}.img`);
+    const clone = join(scratch, `prepared-clone-${fixtureIndex++}.img`);
+    const baseline = join(scratch, `prepared-baseline-${fixtureIndex++}.sha256`);
+    const guest = join(scratch, `prepared-guest-${fixtureIndex++}.tcl`);
+    // This represents the byte state after run-qemu.sh has patched its boot menu.
+    const preparedBytes = "SYNTHETIC_FIXTURE_gpt-guid=12345678-1234-4234-8234-123456789abc\nAIS_MENU_ARGS=ais.persist-phase=ambiguous\n";
+    writeFileSync(primary, preparedBytes);
+    writeFileSync(guest, `${fakePoweroff}
+puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest}
+flush stdout
+exec sleep 30
+`);
+    const result = Bun.spawnSync([expectBin, "image/test/persist.exp", "5", "tclsh", guest], {
+      env: {
+        ...process.env,
+        AIS_PERSIST_PHASE: "ambiguous",
+        AIS_TEST_MODE: "latest",
+        AIS_QEMU_IMAGE_COPY: primary,
+        AIS_PERSIST_CLONE_PATH: clone,
+        AIS_PERSIST_BASELINE_FILE: baseline,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) throw new Error(`${result.stderr.toString()}\n${result.stdout.toString()}`);
+    expect(readFileSync(clone, "utf8")).toBe(preparedBytes);
+    const digest = Bun.spawnSync(["sha256sum", primary], { stdout: "pipe" }).stdout.toString().split(" ")[0];
+    expect(readFileSync(baseline, "utf8").trim()).toBe(digest);
+    expect(readFileSync(clone, "utf8")).toContain("SYNTHETIC_FIXTURE_gpt-guid=12345678-1234-4234-8234-123456789abc");
   });
 
   test("gives online replay phases a restricted network interface", () => {

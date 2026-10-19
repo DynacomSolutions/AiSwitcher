@@ -19,7 +19,12 @@ ok() {
     printf 'AIS-LIVE: stage=persist-test status=ok phase=%s\n' "$phase"
     systemctl --no-block poweroff
 }
-device=$(cat /run/ais-persist-device 2>/dev/null || true)
+device=$(/usr/local/lib/ais-live/resolve-boot-partition persist 2>/dev/null || true)
+read -r agent_uid agent_gid < <(awk '
+    NR==1 && $0 ~ /^uid=[1-9][0-9]*$/ {uid=substr($0,5); next}
+    NR==2 && $0 ~ /^gid=[1-9][0-9]*$/ {gid=substr($0,5); next}
+    END {if(NR!=2 || !uid || !gid || uid>4294967294 || gid>4294967294) exit 1; print uid, gid}
+' /etc/ais-live/agent-ids) || fail agent-owner-contract
 
 case "$phase" in
     created|wrong-pass|package|verify-package|retry|pick|verify-pick|retention)
@@ -34,7 +39,7 @@ case "$phase" in
         key_description=$(keyctl rdescribe "$keyid") || fail exchange-key-description
         persist_assert_key_description "$key_description" || fail exchange-key-permissions
         persist_assert_key_unreadable_as agent "$keyid" || fail agent-read-exchange-key
-        [[ $(stat -c '%u:%g' /home/agent) == 1001:1001 ]] || fail agent-home-owner
+        [[ $(stat -c '%u:%g' /home/agent) == "$agent_uid:$agent_gid" ]] || fail agent-home-owner
         runuser -u agent -- sh -c 'printf "%s\\n" SYNTHETIC_FIXTURE_agent_config_write > /home/agent/.ais-config-write-test' || fail agent-config-write
         if [[ $phase == created ]]; then
             labels=$(blkid -o device -t LABEL=AISX | wc -l)

@@ -1,0 +1,14 @@
+[Unit]
+Description=Mount the verified AIS exFAT exchange partition
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ais-live/resolve-boot-partition exchange
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

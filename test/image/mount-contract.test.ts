@@ -1,69 +1,86 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const scratch = mkdtempSync(join(tmpdir(), "ais-mount-contract-SYNTHETIC_FIXTURE-"));
+const scratch = tmpdir();
 const root = "image/archiso/airootfs";
 
 function unit(path: string) { return readFileSync(resolve(root, path), "utf8"); }
 
 describe("persistent image mount contract", () => {
-  test("mount fragments match the fixed Revision 2 destinations and restrictions", () => {
-    const hook = readFileSync(resolve("image/archiso/airootfs/etc/initcpio/hooks/ais_persist"), "utf8");
-    const exchange = unit("etc/systemd/system/mnt-aisx.mount");
+  test("persistent mounts retain their fixed destinations and restrictions", () => {
+    const hook = unit("etc/initcpio/hooks/ais_persist");
     expect(hook).toContain('mount -o remount,bind,rw,noexec,nodev,nosuid /run/ais-persist "$newroot/mnt/persist"');
     expect(hook).toContain('mount --bind /run/ais-persist/@config "$newroot/home/agent"');
     expect(hook).toContain('mount --bind /run/ais-persist/@logs "$newroot/var/log/ais"');
     expect(hook).toContain('mount --bind /run/ais-persist/@snapshots "$newroot/.snapshots"');
-    expect(hook).toContain('mount -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$exchange_part" "$newroot/mnt/aisx"');
-    expect(exchange).toContain("Where=/mnt/aisx");
-    expect(exchange).toContain("What=/run/ais-live-exchange-device");
-    expect(exchange).not.toMatch(/LABEL=|UUID=/);
     expect(hook).not.toContain("/opt/ais/models");
   });
 
-  test("fresh persistent config ownership uses the fixed synthetic agent contract and rejects invalid IDs", () => {
-    const hook = readFileSync(resolve("image/archiso/airootfs/etc/initcpio/hooks/ais_persist"), "utf8");
+  test("fresh config ownership uses the generated agent ID contract", () => {
+    const hook = unit("etc/initcpio/hooks/ais_persist");
     const start = hook.indexOf("    ids=/run/archiso/airootfs/etc/ais-live/agent-ids");
     const end = hook.indexOf("    PERSIST_UPPER=", start);
     const ownership = hook.slice(start, end);
-    expect(ownership).toContain("chown \"$owner\" /run/ais-persist/@config");
-    expect(ownership).toContain("printf 'uid=1001\\ngid=1001\\n' | cmp -s - \"$ids\"");
-    const dir = mkdtempSync(join(tmpdir(), "ais-owner-SYNTHETIC_FIXTURE-"));
+    expect(ownership).toContain('awk ');
+    expect(ownership).toContain('chown "$owner" /run/ais-persist/@config');
+    expect(ownership).toContain('stat -c \'%u:%g\' /run/ais-persist/@config');
+    expect(ownership).not.toContain("1001");
+
+    const dir = join(scratch, "generated-agent-contract");
     mkdirSync(join(dir, "@pkglist"), { recursive: true });
     mkdirSync(join(dir, "@config"), { recursive: true });
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    const passwd = join(dir, "passwd");
+    const group = join(dir, "group");
     const ids = join(dir, "agent-ids");
     const log = join(dir, "chown.log");
-    const bin = join(dir, "bin");
-    mkdirSync(bin);
-    const chown = join(bin, "chown");
+    const generator = resolve("image/archiso/persist-contracts.sh");
+    writeFileSync(passwd, "agent:x:2468:2469:SYNTHETIC_FIXTURE_agent:/var/empty/agent:/bin/sh\n");
+    writeFileSync(group, "agent:x:2469:\n");
+    const generated = Bun.spawnSync(["bash", generator, "agent-ids", passwd, group, ids], { stdout: "pipe", stderr: "pipe" });
+    expect(generated.exitCode, generated.stderr.toString()).toBe(0);
+    expect(readFileSync(ids, "utf8")).toBe("uid=2468\ngid=2469\n");
+
+    const chown = join(dir, "bin/chown");
+    const stat = join(dir, "bin/stat");
     writeFileSync(chown, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n`);
+    writeFileSync(stat, "#!/bin/sh\nprintf '2468:2469\\n'\n");
     chmodSync(chown, 0o755);
-    writeFileSync(join(bin, "stat"), "#!/bin/sh\nprintf '1001:1001\\n'\n");
-    chmodSync(join(bin, "stat"), 0o755);
+    chmodSync(stat, 0o755);
     const snippet = ownership
       .replace("/run/archiso/airootfs/etc/ais-live/agent-ids", ids)
+      .replaceAll("/run/ais-agent-ids", join(dir, "parsed-agent-ids"))
       .replaceAll("/run/ais-persist", dir);
-    writeFileSync(join(dir, "ownership.sh"), `#!/bin/bash\n_persist_die(){ exit 20; }\n${snippet}`);
-    const validate = (value: string) => {
-      writeFileSync(ids, value);
-      return Bun.spawnSync(["bash", join(dir, "ownership.sh")], {
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe",
-      });
-    };
-    expect(validate("uid=1001\ngid=1001\n").exitCode).toBe(0);
-    expect(readFileSync(log, "utf8")).toContain("1001:1001");
-    expect(validate("uid=1001\ngid=1002\n").exitCode).not.toBe(0);
-    expect(validate("").exitCode).not.toBe(0);
+    const script = join(dir, "ownership.sh");
+    writeFileSync(script, `#!/bin/bash\n_persist_die(){ printf '%s\\n' "$*" >&2; exit 20; }\n${snippet}`);
+    const validate = () => Bun.spawnSync(["bash", script], {
+      env: { ...process.env, PATH: `${join(dir, "bin")}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe",
+    });
+    const ownerResult = validate();
+    expect(ownerResult.exitCode, `${ownerResult.stdout.toString()} ${ownerResult.stderr.toString()}`).toBe(0);
+    expect(readFileSync(log, "utf8")).toContain("2468:2469");
+
+    writeFileSync(passwd, "agent:x:2468:2470:SYNTHETIC_FIXTURE_agent:/var/empty/agent:/bin/sh\n");
+    expect(Bun.spawnSync(["bash", generator, "agent-ids", passwd, group, ids], { stdout: "pipe", stderr: "pipe" }).exitCode).not.toBe(0);
   });
 
-  test("exchange mount resolves the boot disk p4 device and has no global label discovery", () => {
-    const exchange = unit("etc/systemd/system/mnt-aisx.mount");
-    const hook = readFileSync(resolve("image/archiso/airootfs/etc/initcpio/hooks/ais_persist"), "utf8");
-    expect(exchange).toContain("What=/run/ais-live-exchange-device");
-    expect(exchange).not.toMatch(/LABEL=|UUID=/);
-    expect(hook).toContain("PERSIST_EXCHANGE_PART=\"${candidate}4\"");
-    expect(hook).toContain("/run/ais-live-exchange-device");
+  test("exchange service resolves and verifies the boot disk p4 afresh", () => {
+    const service = unit("etc/systemd/system/ais-live-exchange.service");
+    const resolver = unit("usr/local/lib/ais-live/resolve-boot-partition");
+    const hook = unit("etc/initcpio/hooks/ais_persist");
+    expect(service).toContain("ExecStart=/usr/local/lib/ais-live/resolve-boot-partition exchange");
+    expect(service).toContain("DefaultDependencies=no");
+    expect(service).toContain("After=local-fs.target");
+    expect(service).toContain("WantedBy=multi-user.target");
+    expect(service).not.toContain("What=");
+    expect(resolver).toContain("_persist_find_device");
+    expect(resolver).toContain("_persist_refresh_part_node 4");
+    expect(resolver).toContain('mount -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$PERSIST_RESOLVED_PART" /mnt/aisx');
+    expect(resolver).toContain("! _persist_check_diskseq || ! _persist_verify_gpt || ! _persist_refresh_part_node 4");
+    expect(resolver).not.toContain("PERSIST_EXCHANGE_PART");
+    expect(hook).toContain("_persist_refresh_part_node 4");
+    expect(hook).not.toContain("/dev/disk/by-label/AISX");
   });
 });

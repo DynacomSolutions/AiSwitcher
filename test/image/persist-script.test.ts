@@ -424,7 +424,7 @@ exit 1
     const commands = join(fixture, "commands");
     executable(join(bin, "keyctl"), "#!/bin/sh\ncase $1 in search) printf '123\\n';; pipe) printf 'SYNTHETIC_FIXTURE_passphrase';; esac\n");
     executable(join(bin, "cryptsetup"), `#!/bin/sh\nprintf 'cryptsetup %s\\n' "$*" >> '${commands}'\n[ "$1" = open ]\n`);
-    const result = Bun.spawnSync(["bash", "-c", `source '${hook}'; PERSIST_PART=/dev/synthetic-disk5; _persist_open`], {
+    const result = Bun.spawnSync(["bash", "-c", `source '${hook}'; _persist_verify_gpt() { return 0; }; _persist_refresh_part_node() { PERSIST_RESOLVED_PART=$PERSIST_PART; }; _persist_check_diskseq() { return 0; }; PERSIST_PART=/dev/synthetic-disk5; _persist_open`], {
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe",
     });
     const log = readFileSync(commands, "utf8");
