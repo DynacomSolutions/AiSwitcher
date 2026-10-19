@@ -1,12 +1,27 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deduplicateUsageData, mergeJsonlLineSets } from "../../src/sync/dedupe.ts";
+import { appendFileSync, closeSync, openSync, writeSync } from "node:fs";
+import {
+  deduplicateUsageData,
+  mergeJsonlFiles,
+  mergeJsonlLineSets,
+  setJsonlBeforeAppendHook,
+  setJsonlBeforeCreateHook,
+  setJsonlAfterCreateHook,
+  setJsonlBeforeWriteHook,
+  setJsonlWriter,
+} from "../../src/sync/dedupe.ts";
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+  setJsonlBeforeAppendHook();
+  setJsonlBeforeCreateHook();
+  setJsonlAfterCreateHook();
+  setJsonlBeforeWriteHook();
+  setJsonlWriter();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -45,6 +60,114 @@ describe("mergeJsonlLineSets", () => {
       "b",
       "c",
     ]);
+  });
+});
+
+describe("mergeJsonlFiles races", () => {
+  for (const existing of [false, true]) {
+    test(`defers a partial native write after the final ${existing ? "append snapshot" : "create size check"}`, async () => {
+      const home = await makeHome();
+      const source = join(home, "source.jsonl");
+      const destination = join(home, "destination.jsonl");
+      const prefix = existing ? "SYNTHETIC_FIXTURE_local\n" : "";
+      const incoming = "SYNTHETIC_FIXTURE_imported_é\n";
+      await writeFile(source, incoming);
+      if (existing) await writeFile(destination, prefix);
+      let writes = 0;
+      setJsonlWriter((fd, payload) => {
+        writes++;
+        appendFileSync(destination, "SYNTHETIC_FIXTURE_partial");
+        return writeSync(fd, payload, 0, payload.length);
+      });
+
+      expect(await mergeJsonlFiles([source], destination, false)).toBe("deferred");
+      expect(writes).toBe(1);
+      expect(await Bun.file(destination).text()).toBe(`${prefix}SYNTHETIC_FIXTURE_partial${incoming}`);
+      expect(await Bun.file(source).text()).toBe(incoming);
+    });
+
+    test(`accepts the exact byte size after ${existing ? "appending" : "creating"} a multibyte record`, async () => {
+      const home = await makeHome();
+      const source = join(home, "source.jsonl");
+      const destination = join(home, "destination.jsonl");
+      const prefix = existing ? "SYNTHETIC_FIXTURE_local_é\n" : "";
+      const incoming = "SYNTHETIC_FIXTURE_imported_é\n";
+      await writeFile(source, incoming);
+      if (existing) await writeFile(destination, prefix);
+      expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+      expect(await Bun.file(destination).text()).toBe(`${prefix}${incoming}`);
+    });
+  }
+
+  test("defers when a writer opens after the final newline check", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, "SYNTHETIC_FIXTURE_imported\n");
+    await writeFile(destination, "SYNTHETIC_FIXTURE_native\n");
+    let nativeWriter: number | undefined;
+    // Leave the bytes unchanged: only the fresh owner check can detect this.
+    setJsonlBeforeWriteHook((path) => { nativeWriter = openSync(path, "a"); });
+    try {
+      expect(await mergeJsonlFiles([source], destination, false, { lookups: 4 })).toBe("busy");
+      expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
+    } finally { if (nativeWriter !== undefined) closeSync(nativeWriter); }
+    setJsonlBeforeWriteHook();
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+  });
+
+  test("preserves native bytes written after exclusive creation", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, "SYNTHETIC_FIXTURE_imported\n");
+    setJsonlAfterCreateHook((path) => appendFileSync(path, "SYNTHETIC_FIXTURE_native\n"));
+
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("deferred");
+    expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
+    setJsonlAfterCreateHook();
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+    expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\nSYNTHETIC_FIXTURE_imported\n");
+  });
+
+  test("writes a missing destination through its exclusive handle", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, "SYNTHETIC_FIXTURE_imported\n");
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+    expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_imported\n");
+  });
+
+  test("defers an exclusive-create collision without replacing the native file", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, 'SYNTHETIC_FIXTURE_imported\n');
+    setJsonlBeforeCreateHook(async (path) => { await Bun.write(path, 'SYNTHETIC_FIXTURE_native\n'); });
+
+    expect(await mergeJsonlFiles([source], destination, false)).toBe("deferred");
+    expect(await Bun.file(destination).text()).toBe('SYNTHETIC_FIXTURE_native\n');
+    expect(await Bun.file(source).text()).toBe('SYNTHETIC_FIXTURE_imported\n');
+  });
+
+  test("defers a read-then-split-write interleaving with a real append descriptor", async () => {
+    const home = await makeHome();
+    const source = join(home, "source.jsonl");
+    const destination = join(home, "destination.jsonl");
+    await writeFile(source, 'SYNTHETIC_FIXTURE_imported\n');
+    await writeFile(destination, 'SYNTHETIC_FIXTURE_local\n');
+    let nativeWriter: Awaited<ReturnType<typeof open>> | undefined;
+    setJsonlBeforeAppendHook(async (path) => {
+      nativeWriter = await open(path, "a");
+      await nativeWriter.write('SYNTHETIC_FIXTURE_partial');
+    });
+
+    try {
+      expect(await mergeJsonlFiles([source], destination, false)).toBe("busy");
+      expect(await Bun.file(destination).text()).toBe('SYNTHETIC_FIXTURE_local\nSYNTHETIC_FIXTURE_partial');
+      expect(await Bun.file(source).text()).toBe('SYNTHETIC_FIXTURE_imported\n');
+    } finally { await nativeWriter?.close(); }
   });
 });
 
@@ -121,5 +244,27 @@ describe("deduplicateUsageData", () => {
     expect(await Bun.file(join(assigned, "state.json")).exists()).toBe(true);
     expect(await Bun.file(join(assigned, "agents", "main", "wire.jsonl")).exists()).toBe(true);
     expect(await Bun.file(join(legacyDir, "state.json")).exists()).toBe(false);
+  });
+
+  test("does not archive a duplicate native session when its destination changes after read", async () => {
+    const home = await makeHome();
+    await writeRegistry(home, ".codex", ["personal"]);
+    const id = "019c6bae-53b5-7423-a82b-9ef199147d04";
+    const fileName = `rollout-2026-07-22T01-02-03-${id}.jsonl`;
+    const canonical = join(home, ".codex", "identities", "personal", "sessions", "2026", "07", "22", fileName);
+    const legacy = join(home, ".codex", "sessions", "2026", "07", "22", fileName);
+    await writeFile(canonical, 'SYNTHETIC_FIXTURE_local\n');
+    await writeFile(legacy, 'SYNTHETIC_FIXTURE_remote\n');
+    let nativeWriter: Awaited<ReturnType<typeof open>> | undefined;
+    setJsonlBeforeAppendHook(async (path) => {
+      nativeWriter = await open(path, "a");
+      await nativeWriter.write('SYNTHETIC_FIXTURE_split');
+    });
+    try {
+      const result = await deduplicateUsageData({ home, archiveRoot: join(home, "archive") });
+      expect(result.deferredJsonlFiles).toBeGreaterThan(0);
+      expect(result.archivedPaths).toBe(0);
+      expect(await Bun.file(legacy).exists()).toBe(true);
+    } finally { await nativeWriter?.close(); }
   });
 });
