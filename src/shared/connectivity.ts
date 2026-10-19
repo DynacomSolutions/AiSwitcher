@@ -14,6 +14,13 @@ export const OFFLINE_TTL_MS = 5_000;
 export const PROBE_TIMEOUT_MS = 2_500;
 export const DEFAULT_PROBE_URL = "https://github.com";
 export const OFFLINE_WARNED_ENV = "AIS_LAUNCH_OFFLINE_WARNED";
+
+/** Read and remove the launcher's marker so it never reaches the child tool's env. */
+export function consumeOfflineWarned(env: NodeJS.ProcessEnv = process.env): boolean {
+  const warned = !!env[OFFLINE_WARNED_ENV];
+  delete env[OFFLINE_WARNED_ENV];
+  return warned;
+}
 export const CACHED_MAX_AGE_MS = 120_000;
 
 interface Entry { at: number; online: boolean }
