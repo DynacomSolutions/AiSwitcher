@@ -9,6 +9,7 @@ import type {
   FileTreeResponse,
   HerdrBridgeResponse,
   LimitsResponse,
+  LocalModelsResponse,
   LoginFlow,
   LoginFlowsResponse,
   LoginStartResult,
@@ -102,6 +103,8 @@ export const api = {
   getHerdrBridge: () => request<HerdrBridgeResponse>("/api/herdr-bridge"),
 
   getPermissions: (refresh = false) => request<PermissionsDto>(refresh ? "/api/permissions?refresh=1" : "/api/permissions"),
+
+  getLocalModels: () => request<LocalModelsResponse>("/api/local-models"),
 
   getIdentities: () => request<RegistriesResponse>("/api/identities"),
   createIdentity: (tool: ToolName, body: CreateIdentityBody) =>

@@ -187,6 +187,10 @@ src/
     dispatch.ts          top-level subcommand routing + uniform error->exit-code handling
     args.ts                minimal argv parser: positionals + --flag=value/--flag
     errors.ts               CliUsageError — bad flags/args, distinct from identities/errors.ts
+    launch.ts                 `ais launch`: tool list (installed + active identity), offline warning,
+                             then promptForIdentity and exec through ~/.local/bin/<tool> shim
+                             with --identity/--pool; or start a local model (no identity)
+    local/dispatch.ts          `ais local list|start`: local llama.cpp model (shared/local-models.ts)
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`
     update.ts                 `ais update`: re-downloads whichever of claude/codex/grok/kimi/

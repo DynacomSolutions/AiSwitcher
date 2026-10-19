@@ -38,6 +38,8 @@ const COMMANDS: Array<[string, string]> = [
   ["web [start|stop|status|open] [--port=] [--foreground]", "Local web console (identities, limits, usage, sessions, auth, files)"],
   ["tui", "Terminal dashboard (ratatui) against the same local console API"],
   ["herdr [--remote=<ssh-target>] [--remote-ais] [--raw] [--panel-width=N]", "native wrapper: the real herdr client embedded beside the ais usage/limits overview (no tmux)"],
+  ["launch", "Pick a tool, then an identity or pool, and start it"],
+  ["local [list|start [name]] [--json]", "Local models: list the on-device model, or start it"],
   ["help", "Show this message"],
 ];
 

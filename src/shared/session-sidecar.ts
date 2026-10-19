@@ -4,6 +4,7 @@ import type { ToolConfig } from "../identities/types.ts";
 import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sync/background.ts";
 import { startProfileSyncWatcher } from "../sync/watch.ts";
 import { aisHerdrTabLabelsPath, aisStateDir } from "./ais-home.ts";
+import { isOnline } from "./connectivity.ts";
 import { darwinExe, darwinProc } from "./darwin-proc.ts";
 import {
   execveReal,
@@ -157,6 +158,8 @@ export async function startSessionWork(cfg: ToolConfig, spec: SessionSpec): Prom
 
 /** Body of the detached `__session-sidecar` process. Never reads or writes the terminal. */
 export async function runSessionSidecar(cfg: ToolConfig, spec: SessionSpec): Promise<void> {
+  // Keeps the connectivity cache warm for the next shim launch; fire and forget.
+  void isOnline().catch(() => {});
   if (spec.syncAtLaunch) {
     await waitForExec(spec);
     startBackgroundProfileSync();

@@ -7,6 +7,8 @@ import { runBackup } from "../../scripts/backup.ts";
 import { TOOL_CONFIGS, loadAll } from "../cli/identities/resolve-tool.ts";
 import { resolveRealBinary } from "../shared/resolve-binary.ts";
 import { aisHome } from "../shared/ais-home.ts";
+import { isOnline } from "../shared/connectivity.ts";
+import { discoverLocalModels, resolveLlamaRunner } from "../shared/local-models.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { type AuthRefreshScheduler } from "./auth-refresh.ts";
@@ -34,6 +36,17 @@ import { scanProcesses } from "./processes.ts";
 import * as filesApi from "./files.ts";
 import { buildPermissions } from "./permissions.ts";
 
+export interface LocalModelsDto {
+  online: boolean;
+  runner: string | null;
+  models: Array<{ name: string; path: string; sizeBytes: number }>;
+}
+
+async function defaultLocalModels(): Promise<LocalModelsDto> {
+  const online = await isOnline().catch(() => false);
+  return { online, runner: resolveLlamaRunner() ?? null, models: await discoverLocalModels() };
+}
+
 export interface ConsoleAppDeps extends GuardDeps {
   startedAt: number;
   /** apps/web/dist when present; the SPA plus its assets are served from here. */
@@ -50,6 +63,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   claudeSwap?: { status(): Promise<ClaudeSwapStatusDto | PoolSwapStatusDto> };
   /** Daemon-managed per-identity login flows; absent in bare-app tests. */
   loginFlows?: LoginFlowManagerLike;
+  /** Test seam for GET /api/local-models; defaults to the real discovery and probe. */
+  localModels?: () => Promise<LocalModelsDto>;
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {
@@ -163,6 +178,10 @@ export function createApp(deps: ConsoleAppDeps): Hono {
       );
     });
   }
+
+  /* ------------------------------ local models ----------------------------- */
+
+  app.get("/api/local-models", async (c) => c.json(await (deps.localModels ?? defaultLocalModels)()));
 
   /* ---------------------------- limits / usage ----------------------------- */
   // Heavy scans run on worker threads (see workers.ts): a stalled scan must

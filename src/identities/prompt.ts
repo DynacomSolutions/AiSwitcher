@@ -62,6 +62,7 @@ export async function promptForIdentity(
   deps: PromptDeps = defaultPromptDeps(),
   /** Open only this list (no chooser); undefined = normal chooser flow. */
   only?: "identity" | "pool",
+  intro: string = `${cfg.toolName}: no identity resolved from flag, env, or cwd`,
 ): Promise<PromptResult> {
   const controller = new AbortController();
   let timedOut = false;
@@ -73,7 +74,7 @@ export async function promptForIdentity(
   (timer as unknown as { unref?: () => void }).unref?.();
 
   try {
-    clack.intro(`${cfg.toolName}: no identity resolved from flag, env, or cwd`);
+    clack.intro(intro);
 
     const active = activeIdentities(identitiesFile.identities);
     const pools = adapterFor(cfg.toolName) ? active.filter((i) => i.swapPool !== undefined) : [];

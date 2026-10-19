@@ -418,3 +418,23 @@ mod retired_tests {
         assert_eq!(usage.display_name(), "c (retired)");
     }
 }
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LocalModelsResponse {
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
+    pub models: Vec<LocalModelEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LocalModelEntry {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default, rename = "sizeBytes")]
+    pub size_bytes: u64,
+}

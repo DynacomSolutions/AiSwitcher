@@ -7,6 +7,7 @@ import { DashboardPage } from "@/pages/dashboard";
 import { FilesPage } from "@/pages/files";
 import { IdentitiesPage } from "@/pages/identities";
 import { LimitsPage } from "@/pages/limits";
+import { LocalModelsPage } from "@/pages/local-models";
 import { NotFoundPage } from "@/pages/not-found";
 import { PermissionsPage } from "@/pages/permissions";
 import { SessionsPage } from "@/pages/sessions";
@@ -18,6 +19,8 @@ export function AppRoutes() {
       <Route element={<AppShell />}>
         <Route index element={<DashboardPage />} />
         <Route path="identities" element={<IdentitiesPage />} />
+        <Route path="local-models" element={<LocalModelsPage />} />
+        <Route path="local-models/:name" element={<LocalModelsPage />} />
         <Route path="limits" element={<LimitsPage />} />
         <Route path="usage" element={<UsagePage />} />
         <Route path="breakdown" element={<BreakdownPage />} />

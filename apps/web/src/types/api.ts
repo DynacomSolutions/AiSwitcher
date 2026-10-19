@@ -634,3 +634,9 @@ export interface PermissionsDto {
   cache: PermissionCacheStatsDto;
   tools: PermissionToolNode[];
 }
+
+export interface LocalModelsResponse {
+  online: boolean;
+  runner: string | null;
+  models: Array<{ name: string; path: string; sizeBytes: number }>;
+}
