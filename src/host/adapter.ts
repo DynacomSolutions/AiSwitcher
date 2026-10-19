@@ -74,22 +74,30 @@ export async function handleHostRequest(request: { operation: string; payloadByt
   throw new Error("unsupported host operation");
 }
 
+/** A peer that closes its read end after reading the frame it needs is not an error. */
+async function writeFrame(deps: AdapterDeps, bytes: Uint8Array): Promise<void> {
+  try {
+    if (deps.stdout) deps.stdout.write(bytes); else await Bun.stdout.write(bytes);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "EPIPE" || /EPIPE/.test(String(error))) return;
+    throw error;
+  }
+}
+
 export async function runHostStdio(deps: AdapterDeps = {}): Promise<void> {
   const reader = (deps.stdin ?? Bun.stdin.stream()).getReader();
-  let payload: Uint8Array<ArrayBufferLike> = new Uint8Array();
+  let frames: Uint8Array[];
   try {
-    const { request, payload: body } = await readRequest(reader);
-    payload = body;
+    const { request, payload } = await readRequest(reader);
     await assertEnd(reader);
     const response = await handleHostRequest(request, payload, deps.home ?? homedir());
-    if (deps.stdout) { deps.stdout.write(response.header); if (response.payload.byteLength) deps.stdout.write(response.payload); }
-    else { await Bun.stdout.write(response.header); if (response.payload.byteLength) await Bun.stdout.write(response.payload); }
-  } catch (error) {
+    frames = response.payload.byteLength ? [response.header, response.payload] : [response.header];
+  } catch {
     // Do not reflect parser text, paths, or payload excerpts to a peer.
-    const bytes = encodeJsonFrame(responseHeader(false, 0, undefined, "host request failed"));
-    if (deps.stdout) deps.stdout.write(bytes); else await Bun.stdout.write(bytes);
+    frames = [encodeJsonFrame(responseHeader(false, 0, undefined, "host request failed"))];
     process.exitCode = 2;
   } finally { reader.releaseLock(); }
+  for (const frame of frames) await writeFrame(deps, frame);
 }
 
 if (import.meta.main) await runHostStdio();

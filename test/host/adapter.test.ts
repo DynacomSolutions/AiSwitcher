@@ -161,6 +161,26 @@ describe("host adapter", () => {
     expect(response.header.byteLength).toBeGreaterThan(4);
   });
 
+  test("a closed stdout after the request was read is a clean exit", async () => {
+    const home = await fixture();
+    const request = encodeJsonFrame({ version: 1, operation: "capabilities", payloadBytes: 0 });
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(request); controller.close(); } });
+    const previous = process.exitCode;
+    await runHostStdio({ home, stdin: stream, stdout: { write() { throw Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" }); } } });
+    expect(process.exitCode).toBe(previous);
+  });
+
+  test("the real entrypoint exits 0 when the reader closes early", async () => {
+    const home = await fixture();
+    const proc = Bun.spawn([Bun.which("bun")!, "run", "src/ais.ts", "host", "--stdio"], {
+      cwd: process.cwd(), env: { ...process.env, HOME: home }, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    await proc.stdout.cancel();
+    proc.stdin.write(encodeJsonFrame({ version: 1, operation: "capabilities", payloadBytes: 0 })); proc.stdin.end();
+    const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    expect(code, stderr).toBe(0);
+  }, 20_000);
+
   test("actual ais host stdio entrypoint emits a framed capabilities response", async () => {
     const home = await fixture();
     const proc = Bun.spawn([Bun.which("bun")!, "run", "src/ais.ts", "host", "--stdio"], {
