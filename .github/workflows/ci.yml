@@ -77,6 +77,12 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # The live-image script tests drive expect and node.
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends expect nodejs
+
       - name: Test
         run: bun test
 
