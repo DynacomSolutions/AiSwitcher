@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isTolerableRsyncExitCode, runBackup } from "../scripts/backup.ts";
+import { runBackup } from "../scripts/backup.ts";
 
 const tempDirs: string[] = [];
 
@@ -21,22 +21,21 @@ async function write(path: string, contents: string): Promise<void> {
   await Bun.write(path, contents);
 }
 
+async function gitShow(repoDir: string, path: string): Promise<string | null> {
+  const proc = Bun.spawn(["git", `--git-dir=${join(repoDir, ".git")}`, "show", `HEAD:${path}`], { stdout: "pipe", stderr: "pipe" });
+  const stdout = await new Response(proc.stdout).text();
+  return (await proc.exited) === 0 ? stdout : null;
+}
+
 async function gitLog(repoDir: string): Promise<string[]> {
-  const proc = Bun.spawn(["git", "-C", repoDir, "log", "--format=%s"], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(["git", `--git-dir=${join(repoDir, ".git")}`, "log", "--format=%s"], { stdout: "pipe", stderr: "pipe" });
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
   return stdout.trim().split("\n").filter(Boolean);
 }
 
-test("runBackup tolerates only rsync's partial-file and live-tree-race exit codes", () => {
-  expect(isTolerableRsyncExitCode(23)).toBe(true);
-  expect(isTolerableRsyncExitCode(24)).toBe(true);
-  expect(isTolerableRsyncExitCode(12)).toBe(false);
-});
-
-const describeWithRsync = Bun.which("rsync") ? describe : describe.skip;
-describeWithRsync("runBackup integration", () => {
-  test("mirrors a config directory into a git repo under ~/.ais/backups and commits it", async () => {
+describe("runBackup integration", () => {
+  test("commits a config directory into the git-only repo under ~/.ais/backups with no plain copy", async () => {
     const home = await makeHome();
     await write(join(home, ".codex", "identities.json"), '{"version":1,"identities":[]}\n');
     await write(join(home, ".codex", "identities", "personal", "config.toml"), "x = 1\n");
@@ -45,9 +44,10 @@ describeWithRsync("runBackup integration", () => {
 
     expect(repoDir).toBe(join(home, ".ais", "backups"));
     expect(await Bun.file(join(repoDir, ".git", "HEAD")).exists()).toBe(true);
-    expect(await Bun.file(join(repoDir, ".codex", "identities.json")).text()).toBe('{"version":1,"identities":[]}\n');
-    expect(await Bun.file(join(repoDir, ".codex", "identities", "personal", "config.toml")).text()).toBe("x = 1\n");
+    expect(await gitShow(repoDir, ".codex/identities.json")).toBe('{"version":1,"identities":[]}\n');
+    expect(await gitShow(repoDir, ".codex/identities/personal/config.toml")).toBe("x = 1\n");
     expect(await gitLog(repoDir)).toHaveLength(1);
+    expect(await Bun.file(join(repoDir, ".codex")).exists()).toBe(false);
   });
 
   test("a second run with no changes does not create an empty commit", async () => {
@@ -72,7 +72,7 @@ describeWithRsync("runBackup integration", () => {
     await runBackup(["codex"], home);
 
     expect(await gitLog(repoDir)).toHaveLength(2);
-    expect(await Bun.file(join(repoDir, ".codex", "identities.json")).text()).toBe('{"changed":true}\n');
+    expect(await gitShow(repoDir, ".codex/identities.json")).toBe('{"changed":true}\n');
   });
 
   test("a file deleted from the live source is removed from the next backup", async () => {
@@ -81,12 +81,12 @@ describeWithRsync("runBackup integration", () => {
     const stale = join(home, ".codex", "stale.txt");
     await write(stale, "gone soon\n");
     const repoDir = await runBackup(["codex"], home);
-    expect(await Bun.file(join(repoDir, ".codex", "stale.txt")).exists()).toBe(true);
+    expect(await gitShow(repoDir, ".codex/stale.txt")).not.toBeNull();
 
     await rm(stale);
     await runBackup(["codex"], home);
 
-    expect(await Bun.file(join(repoDir, ".codex", "stale.txt")).exists()).toBe(false);
+    expect(await gitShow(repoDir, ".codex/stale.txt")).toBeNull();
   });
 
   test("excludes reproducible junk (node_modules, caches) from the mirrored tree", async () => {
@@ -97,9 +97,9 @@ describeWithRsync("runBackup integration", () => {
 
     const repoDir = await runBackup(["codex"], home);
 
-    expect(await Bun.file(join(repoDir, ".codex", "node_modules", "pkg", "index.js")).exists()).toBe(false);
-    expect(await Bun.file(join(repoDir, ".codex", "cache", "big.bin")).exists()).toBe(false);
-    expect(await Bun.file(join(repoDir, ".codex", "identities.json")).exists()).toBe(true);
+    expect(await gitShow(repoDir, ".codex/node_modules/pkg/index.js")).toBeNull();
+    expect(await gitShow(repoDir, ".codex/cache/big.bin")).toBeNull();
+    expect(await gitShow(repoDir, ".codex/identities.json")).not.toBeNull();
   });
 
   test("still includes SQLite databases, unlike SSH sync's own exclude list", async () => {
@@ -109,7 +109,7 @@ describeWithRsync("runBackup integration", () => {
 
     const repoDir = await runBackup(["zai"], home);
 
-    expect(await Bun.file(join(repoDir, ".zai", "identities", "identity-a", "data", "session.db")).exists()).toBe(true);
+    expect(await gitShow(repoDir, ".zai/identities/identity-a/data/session.db")).not.toBeNull();
   });
 
   test("has a backup group for ali (the second crush-backed tool), mirroring zai's shape", async () => {
@@ -119,7 +119,7 @@ describeWithRsync("runBackup integration", () => {
 
     const repoDir = await runBackup(["ali"], home);
 
-    expect(await Bun.file(join(repoDir, ".ali", "identities", "identity-a", "data", "session.db")).exists()).toBe(true);
+    expect(await gitShow(repoDir, ".ali/identities/identity-a/data/session.db")).not.toBeNull();
   });
 
   test("has a backup group for pi", async () => {
@@ -129,10 +129,10 @@ describeWithRsync("runBackup integration", () => {
 
     const repoDir = await runBackup(["pi"], home);
 
-    expect(await Bun.file(join(repoDir, ".pi", "identities", "all", "auth.json")).exists()).toBe(true);
+    expect(await gitShow(repoDir, ".pi/identities/all/auth.json")).not.toBeNull();
   });
 
-  test("tolerates an individual unreadable file (rsync exit 23) instead of aborting the whole mirror", async () => {
+  test("tolerates an individual unreadable file and still commits", async () => {
     const home = await makeHome();
     await write(join(home, ".codex", "identities.json"), "{}\n");
     const unreadable = join(home, ".codex", "no-read.txt");
@@ -141,7 +141,8 @@ describeWithRsync("runBackup integration", () => {
 
     try {
       const repoDir = await runBackup(["codex"], home);
-      expect(await Bun.file(join(repoDir, ".codex", "identities.json")).exists()).toBe(true);
+      expect(await gitShow(repoDir, ".codex/identities.json")).not.toBeNull();
+      expect(await gitShow(repoDir, ".codex/no-read.txt")).toBeNull();
     } finally {
       await chmod(unreadable, 0o644);
     }
@@ -154,7 +155,7 @@ describeWithRsync("runBackup integration", () => {
 
     const repoDir = await runBackup(["codex"], home);
 
-    expect(await Bun.file(join(repoDir, ".codex")).exists()).toBe(false);
+    expect(await gitShow(repoDir, ".codex")).toBeNull();
   });
 
   test("an empty (but real, non-missing, non-symlink) directory in the group doesn't break the commit for the others", async () => {
@@ -170,7 +171,7 @@ describeWithRsync("runBackup integration", () => {
 
     const repoDir = await runBackup(["claude"], home);
 
-    expect(await Bun.file(join(repoDir, ".claude", "identities.json")).exists()).toBe(true);
+    expect(await gitShow(repoDir, ".claude/identities.json")).not.toBeNull();
     expect(await gitLog(repoDir)).toHaveLength(1);
   });
 
@@ -179,12 +180,29 @@ describeWithRsync("runBackup integration", () => {
     await write(join(home, ".codex", "identities.json"), "{}\n");
     await write(join(home, ".grok", "identities.json"), "{}\n");
 
-    const first = await runBackup(["codex"], home);
+    const repoDir = await runBackup(["codex"], home);
     const second = await runBackup(["grok"], home);
 
-    expect(first).toBe(second);
-    expect(await Bun.file(join(first, ".codex", "identities.json")).exists()).toBe(true);
-    expect(await Bun.file(join(first, ".grok", "identities.json")).exists()).toBe(true);
-    expect(await gitLog(first)).toHaveLength(2);
+    expect(repoDir).toBe(second);
+    expect(await gitShow(repoDir, ".codex/identities.json")).not.toBeNull();
+    expect(await gitShow(repoDir, ".grok/identities.json")).not.toBeNull();
+    expect(await gitLog(repoDir)).toHaveLength(2);
+  });
+
+  test("migration deletes old plain mirror dirs but keeps history", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    const repoDir = await runBackup(["codex"], home);
+    // Simulate the old design's leftovers.
+    await write(join(repoDir, ".codex", "identities.json"), "{}\n");
+    await write(join(repoDir, "keep-me.txt"), "not a group dir\n");
+
+    await write(join(home, ".codex", "identities.json"), '{"v":2}\n');
+    await runBackup(["codex"], home);
+
+    expect(await Bun.file(join(repoDir, ".codex")).exists()).toBe(false);
+    expect(await Bun.file(join(repoDir, "keep-me.txt")).exists()).toBe(true);
+    expect(await gitLog(repoDir)).toHaveLength(2);
+    expect(await gitShow(repoDir, ".codex/identities.json")).toBe('{"v":2}\n');
   });
 });

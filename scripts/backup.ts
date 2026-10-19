@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { lstat, mkdir } from "node:fs/promises";
+import { lstat, mkdir, rm } from "node:fs/promises";
 import { aisBackupsDir } from "../src/shared/ais-home.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../src/shared/reproducible-paths.ts";
 
@@ -24,12 +24,6 @@ const BACKUP_GROUPS = {
 } as const;
 
 type BackupGroup = keyof typeof BACKUP_GROUPS;
-
-export function isTolerableRsyncExitCode(exitCode: number): boolean {
-  // 23: an individual file could not be transferred (commonly permissions).
-  // 24: a source file vanished while rsync was scanning a live config tree.
-  return exitCode === 23 || exitCode === 24;
-}
 
 // Meaningless (or actively harmful) to restore, on top of the reproducible
 // junk shared with SSH sync — a stale lock/socket file "restored" into a
@@ -67,10 +61,18 @@ interface GitResult {
   stderr: string;
 }
 
-async function runGit(repoDir: string, args: string[]): Promise<GitResult> {
+// Every backup git command runs with the git dir at <backups>/.git and the
+// work tree at the real home, so files are snapshotted in place and stored
+// exactly once (as git objects). Index paths stay `.claude/...` relative to
+// home, identical to the earlier plain-mirror layout, so history stays valid.
+async function runGit(repoDir: string, home: string, args: string[]): Promise<GitResult> {
   const git = Bun.which("git");
   if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
-  const proc = Bun.spawn([git, "-C", repoDir, ...args], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([git, `--git-dir=${join(repoDir, ".git")}`, `--work-tree=${home}`, ...args], {
+    cwd: home,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -79,95 +81,83 @@ async function runGit(repoDir: string, args: string[]): Promise<GitResult> {
   return { exitCode, stdout, stderr };
 }
 
-async function ensureRepo(repoDir: string): Promise<void> {
+async function ensureRepo(repoDir: string, home: string): Promise<void> {
   await mkdir(repoDir, { recursive: true });
-  if (await pathExists(join(repoDir, ".git"))) return;
-  const init = await runGit(repoDir, ["init", "--quiet"]);
-  if (init.exitCode !== 0) throw new Error(`backup: git init failed in ${repoDir}: ${init.stderr.trim()}`);
-  // Local-only identity, scoped to this one repo — never touches the user's
-  // global gitconfig, and never depends on it being set at all. This repo is
-  // a storage engine for automated snapshots, not a place for human commits,
-  // so gpg-signing (which could hang an automated `install`/`update` run on
-  // a passphrase prompt if the user's global config demands it) is disabled
-  // locally too.
-  await runGit(repoDir, ["config", "user.name", "AiProfileSwitcher"]);
-  await runGit(repoDir, ["config", "user.email", "ai-profile-switcher@localhost"]);
-  await runGit(repoDir, ["config", "commit.gpgsign", "false"]);
-  console.error(`backup: initialised git repo at ${repoDir}`);
+  if (!(await pathExists(join(repoDir, ".git")))) {
+    // Plain init (no --work-tree): the work tree is passed per command instead.
+    const git = Bun.which("git");
+    if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
+    const proc = Bun.spawn([git, "init", "--quiet", repoDir], { stdout: "pipe", stderr: "pipe" });
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    if (exitCode !== 0) throw new Error(`backup: git init failed in ${repoDir}: ${stderr.trim()}`);
+    // Local-only identity, scoped to this one repo — never touches the user's
+    // global gitconfig, and never depends on it being set at all. This repo is
+    // a storage engine for automated snapshots, not a place for human commits,
+    // so gpg-signing (which could hang an automated `install`/`update` run on
+    // a passphrase prompt if the user's global config demands it) is disabled
+    // locally too.
+    await runGit(repoDir, home, ["config", "user.name", "AiProfileSwitcher"]);
+    await runGit(repoDir, home, ["config", "user.email", "ai-profile-switcher@localhost"]);
+    await runGit(repoDir, home, ["config", "commit.gpgsign", "false"]);
+    console.error(`backup: initialised git repo at ${repoDir}`);
+  }
+  // The work tree is all of home, so untracked noise in `git status` is
+  // meaningless and slow to compute.
+  await runGit(repoDir, home, ["config", "status.showUntrackedFiles", "no"]);
+  // Rewritten every run so a changed BACKUP_EXCLUDES takes effect. Trailing-slash
+  // names match a directory of that name anywhere; globs match anywhere.
+  await mkdir(join(repoDir, ".git", "info"), { recursive: true });
+  await Bun.write(join(repoDir, ".git", "info", "exclude"), `${BACKUP_EXCLUDES.join("\n")}\n`);
 }
 
-async function mirrorInto(sourcePath: string, destPath: string): Promise<void> {
-  const rsync = Bun.which("rsync");
-  if (!rsync) throw new Error("backup: rsync is required to mirror config directories into the git-managed backup repo");
-  await mkdir(destPath, { recursive: true });
-  const args = [
-    "-a",
-    "--delete",
-    "--delete-excluded",
-    ...BACKUP_EXCLUDES.map((pattern) => `--exclude=${pattern}`),
-    `${sourcePath}/`,
-    `${destPath}/`,
-  ];
-  const proc = Bun.spawn([rsync, ...args], { stdio: ["ignore", "inherit", "inherit"] });
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) {
-    // rsync exits 23 ("partial transfer due to error") when it skips an
-    // individual unreadable file (e.g. root-owned or otherwise
-    // permission-denied) but still transfers everything else — the same
-    // "some files skipped, not a hard failure" shape the old tar-based
-    // backup explicitly tolerated (BSD tar's own non-zero-but-still-
-    // produced-an-archive exit). Confirmed live: this real machine has a
-    // pre-existing permission-denied file under ~/.codex/backups/, and a
-    // hard failure here would make backup.ts strictly LESS tolerant of
-    // real-world unreadable files than the design it replaced. Any other
-    // Exit 24 is the corresponding benign live-tree race: a process removed
-    // a cache/session file after rsync enumerated it but before it could copy
-    // it. The next backup reconciles the final state. Any other exit code
-    // (rsync missing, destination unwritable, etc.) stays fatal.
-    if (isTolerableRsyncExitCode(exitCode)) {
-      console.error(
-        `backup: rsync exited ${exitCode} for ${sourcePath} -> ${destPath} ` +
-          `(an individual file was unreadable or vanished during the live scan) — ` +
-          `mirror was still produced, continuing`,
-      );
-    } else {
-      throw new Error(`backup: rsync failed mirroring ${sourcePath} -> ${destPath} (exit ${exitCode})`);
-    }
+// One-off cleanup of the old plain rsync mirrors (<backups>/<name>). Only the
+// literal known group names are removed, and only once the git dir is valid,
+// so history is never at risk.
+async function removeLegacyMirrors(repoDir: string, home: string): Promise<void> {
+  const valid = await runGit(repoDir, home, ["rev-parse", "--git-dir"]);
+  if (valid.exitCode !== 0) return;
+  for (const name of Object.values(BACKUP_GROUPS).flat()) {
+    const legacy = join(repoDir, name);
+    if (!(await pathExists(legacy))) continue;
+    await rm(legacy, { recursive: true, force: true });
+    console.error(`backup: removed legacy plain mirror ${legacy} (contents now live in git only)`);
   }
 }
 
 /**
- * Mirrors the given config-directory group(s) (default: every group) into a
- * single, persistent git repository at ~/.ais/backups and commits whatever
- * changed since the last backup. Replaces the old per-run tar.gz snapshot
- * design (~/.ai-switcher-backups/<timestamp>/*.tar.gz — one full archive
- * tree per invocation, nothing ever pruned) — that grew without bound, and
- * every run paid for a full copy even when almost nothing had changed since
- * the last one. Git's content-addressable object store instead stores each
- * distinct blob once no matter how many commits reference it, so two
- * backups taken minutes apart (the common case around an install/update)
- * cost close to nothing beyond the first; `git gc --auto` after each commit
- * keeps loose objects packed and delta-compressed rather than accumulating
- * unbounded. Reproducible/machine-local junk (node_modules, marketplace and
- * browser caches, logs, worktrees, ...) is excluded via rsync — see
- * reproducible-paths.ts, shared with SSH sync's own exclude list — since
- * none of it has restore value and it's what drove most of the old design's
- * size growth. SQLite/session databases are still mirrored in full (unlike
- * SSH sync, which excludes live databases in favour of its own
- * VACUUM-based merge protocol): this is a point-in-time safety net taken
- * synchronously before install/update/migrate touch anything, not a live
- * merge target, so a plain file copy carries the same small, accepted risk
- * of catching a database mid-write that the old tar-based backup always
- * had — no worse than before. Symlinks (post-migration compatibility
- * shims) are skipped at the top level, same as before — their target is
- * already covered by the container directory's own mirror.
+ * Snapshots the given config-directory group(s) (default: every group) into a
+ * single, persistent, git-only repository whose git dir is ~/.ais/backups/.git
+ * and whose work tree is the home directory itself (`--git-dir` plus
+ * `--work-tree=<home>` on every command). Nothing is copied: git reads the
+ * live files and stores each distinct blob once as an object, so there is no
+ * second plain-file mirror (the earlier rsync-into-~/.ais/backups/<name>
+ * design stored every file twice). Index paths are `.claude/...`,
+ * `.codex/...` relative to home. Replaces the older per-run tar.gz snapshots
+ * (~/.ai-switcher-backups/<timestamp>/*.tar.gz, never pruned); `git gc
+ * --auto` after each commit keeps loose objects packed and delta-compressed.
+ * Reproducible/machine-local junk (node_modules, marketplace and browser
+ * caches, logs, worktrees, ...) is excluded through <gitdir>/info/exclude,
+ * rewritten every run from BACKUP_EXCLUDES — see reproducible-paths.ts,
+ * shared with SSH sync's own exclude list — since none of it has restore
+ * value. SQLite/session databases are still stored in full (unlike SSH sync):
+ * this is a point-in-time safety net taken synchronously before
+ * install/update/migrate touch anything, so it carries the same small,
+ * accepted risk of catching a database mid-write that every earlier design
+ * had. `git add --ignore-errors` skips unreadable (permission-denied) or
+ * vanished files with a warning instead of failing. Restore with
+ * `git --git-dir=~/.ais/backups/.git show HEAD:<path>` or `checkout`.
+ * Symlinks (post-migration compatibility shims) are skipped at the top level
+ * — their target is already covered by the container directory. On the first
+ * run after upgrading, leftover plain mirror directories from the old design
+ * are deleted (history is untouched).
  */
 export async function runBackup(
   groups: readonly BackupGroup[] = Object.keys(BACKUP_GROUPS) as BackupGroup[],
   home: string = homedir(),
 ): Promise<string> {
   const repoDir = aisBackupsDir(home);
-  await ensureRepo(repoDir);
+  await ensureRepo(repoDir, home);
+  await removeLegacyMirrors(repoDir, home);
 
   const mirrored: string[] = [];
   for (const name of groups.flatMap((g) => BACKUP_GROUPS[g])) {
@@ -181,23 +171,24 @@ export async function runBackup(
       console.error(`backup: ${sourcePath} is a symlink (compatibility shim), skipping — its target is backed up separately`);
       continue;
     }
-
-    await mirrorInto(sourcePath, join(repoDir, name));
     mirrored.push(name);
-    console.error(`backup: mirrored ${sourcePath} -> ${join(repoDir, name)}`);
   }
 
   if (mirrored.length === 0) {
-    console.error(`backup: nothing to mirror, see ${repoDir}`);
+    console.error(`backup: nothing to back up, see ${repoDir}`);
     return repoDir;
   }
 
-  const add = await runGit(repoDir, ["add", "-A", "--", ...mirrored]);
-  if (add.exitCode !== 0) throw new Error(`backup: git add failed in ${repoDir}: ${add.stderr.trim()}`);
+  const add = await runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored]);
+  if (add.exitCode !== 0) {
+    // --ignore-errors stages everything it can read and still exits non-zero
+    // for the skipped files (permission-denied, vanished mid-scan).
+    console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${add.stderr.trim()}`);
+  }
 
-  // A source directory that mirrored zero files (empty, or everything under
-  // it matched BACKUP_EXCLUDES) has nothing for git to know about — `git add
-  // -A` silently no-ops for it, but `git commit -- <pathspec>` is stricter
+  // A source directory with nothing trackable (empty, or everything under
+  // it excluded) has nothing for git to know about — `git add -A` silently
+  // no-ops for it, but `git commit -- <pathspec>` is stricter
   // and fails outright the moment ANY of its pathspecs matches nothing at
   // all, in the index OR in history (confirmed live, 2026-07-31: an empty,
   // root-owned ~/.claude-personal broke the whole backup this way). `git
@@ -207,16 +198,16 @@ export async function runBackup(
   // predicts whether `commit -- <path>` will accept that pathspec.
   const trackable: string[] = [];
   for (const name of mirrored) {
-    const lsFiles = await runGit(repoDir, ["ls-files", "--", name]);
+    const lsFiles = await runGit(repoDir, home, ["ls-files", "--", name]);
     if (lsFiles.stdout.trim().length > 0) trackable.push(name);
-    else console.error(`backup: ${join(repoDir, name)} has no trackable content (source is empty or fully excluded), skipping`);
+    else console.error(`backup: ${join(home, name)} has no trackable content (source is empty or fully excluded), skipping`);
   }
   if (trackable.length === 0) {
     console.error(`backup: nothing new to commit, see ${repoDir}`);
     return repoDir;
   }
 
-  const diff = await runGit(repoDir, ["diff", "--cached", "--quiet", "--", ...trackable]);
+  const diff = await runGit(repoDir, home, ["diff", "--cached", "--quiet", "--", ...trackable]);
   if (diff.exitCode === 0) {
     console.error(`backup: no changes since the last backup, see ${repoDir}`);
     return repoDir;
@@ -227,7 +218,7 @@ export async function runBackup(
   // content from an earlier, interrupted run that touched OTHER groups this
   // run never re-mirrored. `git commit -- <pathspec>` instead commits only
   // the matching changes and leaves the rest staged for a future run.
-  const commit = await runGit(repoDir, [
+  const commit = await runGit(repoDir, home, [
     "commit",
     "--quiet",
     "-m",
@@ -238,10 +229,10 @@ export async function runBackup(
   if (commit.exitCode !== 0) {
     throw new Error(`backup: git commit failed in ${repoDir}: ${commit.stderr.trim() || `exit ${commit.exitCode}`}`);
   }
-  const rev = await runGit(repoDir, ["rev-parse", "--short", "HEAD"]);
+  const rev = await runGit(repoDir, home, ["rev-parse", "--short", "HEAD"]);
   console.error(`backup: committed ${rev.stdout.trim()} in ${repoDir}`);
 
-  await runGit(repoDir, ["gc", "--auto", "--quiet"]);
+  await runGit(repoDir, home, ["gc", "--auto", "--quiet"]);
 
   console.error(`backup: complete, see ${repoDir}`);
   return repoDir;

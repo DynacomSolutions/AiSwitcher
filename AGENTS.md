@@ -55,8 +55,8 @@ design decision without reading why in the topic file first.
 - `bun run build`: `bun build --compile` all eight proxy entrypoints (`claude`,
   `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `opencode`) plus `open` (darwin
   only), `ais`, and the installer into `dist/`.
-- `bun run backup`: mirrors every tool config dir into the git-managed repo at
-  `~/.ais/backups`.
+- `bun run backup`: snapshots every tool config dir into the git-only repo at
+  `~/.ais/backups/.git` (work tree is `$HOME`, no plain copy).
 - `bun run migrate`: one-time, DESTRUCTIVE; claude/codex only. Refuses to run
   while a `claude`/`codex` process runs (`pgrep`); run from a plain terminal,
   never inside an agent session. Takes a fresh backup first.
