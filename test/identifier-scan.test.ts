@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   checkLine, findDomains, findEmails, findHomePaths, findIps, findMachineNicknames, isAllowedDomain,
-  scannableSegments,
+  scannableSegments, scan,
 } from "../scripts/identifier-scan.ts";
 
 describe("domain allowlist", () => {
@@ -164,5 +168,22 @@ describe("checkLine integration", () => {
     const rules = checkLine("README.md", "ops@internal-example-corp.dev is reachable at 203.0.114.9");
     expect(rules).toContain("blocked-email");
     expect(rules).toContain("blocked-ip");
+  });
+});
+
+describe("staged scan skips generated lockfiles like tree mode", () => {
+  test("Cargo.lock registry line is ignored, unknown domain in a normal file is flagged", () => {
+    const root = mkdtempSync(join(tmpdir(), "idscan-"));
+    try {
+      const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
+      git("init", "-q");
+      mkdirSync(join(root, "apps"));
+      writeFileSync(join(root, "apps/Cargo.lock"), 'source = "registry+https://github.com/rust-lang/crates.io-index"\n');
+      git("add", ".");
+      expect(scan(root, "staged")).toEqual([]);
+      writeFileSync(join(root, "notes.txt"), "see console.internal-example.dev\n");
+      git("add", ".");
+      expect(scan(root, "staged").length).toBe(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
