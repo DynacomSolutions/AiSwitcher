@@ -3,7 +3,7 @@ name: Live image
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, ais-live-image-spike]
   workflow_dispatch:
 
 concurrency:
