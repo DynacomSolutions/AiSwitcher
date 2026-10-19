@@ -28,6 +28,7 @@ export interface TreeMergeResult {
   mergedJsonlFiles: number;
   copiedFiles: number;
   preservedConflicts: number;
+  preservedConflictPaths: string[];
 }
 
 export interface ArchiveRecoveryResult extends TreeMergeResult {
@@ -174,7 +175,9 @@ export async function hasOpenOwner(path: string, pass: OpenOwnerPass = { lookups
     // A scan on a huge host can take a minute; keep the scans a minority of the merge.
     openSnapshot = { at: Date.now(), ttl: Math.max(OPEN_SNAPSHOT_TTL_MS, 4 * (Date.now() - started)), paths };
   }
-  return openSnapshot.paths && openSnapshot.paths.has(real);
+  // A cached miss cannot prove that no writer opened the path after the
+  // snapshot. Only a fresh direct lookup can establish closed ownership.
+  return openSnapshot.paths?.has(real) ? true : undefined;
 }
 
 function configsForScope(scope: SyncScope): ToolConfig[] {
@@ -306,15 +309,15 @@ async function preserveFile(source: string, root: string, side: "local" | "incom
 export async function mergeIncomingProfileTree(
   incomingRoot: string,
   scope: SyncScope,
-  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge } = {},
+  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge; ownerPass?: OpenOwnerPass } = {},
 ): Promise<TreeMergeResult> {
   const home = options.home ?? homedir();
   const conflictRoot =
     options.conflictRoot ??
     join(aisRemoteCacheDir(home), "merge-conflicts", new Date().toISOString().replaceAll(":", "-"));
-  const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0 };
+  const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [] };
   const registries = registryRelPaths(scope, home);
-  const ownerPass: OpenOwnerPass = { lookups: 0 };
+  const ownerPass = options.ownerPass ?? { lookups: 0 };
   openSnapshot = undefined;
 
   // Registries have their own semantic union. Merge these first so profiles
@@ -340,20 +343,22 @@ export async function mergeIncomingProfileTree(
     const destination = join(home, rel);
 
     if (source.endsWith(".jsonl")) {
-      // Even append-only writes must not interleave with a native tool's own
-      // partial record. If ownership cannot be proved absent, retain the
-      // incoming bytes and let the post-exit reconciliation retry them.
-      if ((await hasOpenOwner(destination, ownerPass)) !== false) {
-        await preserveFile(source, conflictRoot, "incoming", rel);
-        result.preservedConflicts++;
-        continue;
-      }
+      // mergeJsonlFiles checks ownership only when there is an actual append
+      // to make, so an unchanged replay does not become a false conflict.
       const sourceText = await Bun.file(source).text();
-      if (sourceText.length > 0 && !sourceText.endsWith("\n")) {
+      const incompleteSource = sourceText.length > 0 && !sourceText.endsWith("\n");
+      if (incompleteSource) {
         await preserveFile(source, conflictRoot, "incoming", rel);
         result.preservedConflicts++;
+        result.preservedConflictPaths.push(rel);
       }
-      if (await mergeJsonlFiles([source], destination, false)) result.mergedJsonlFiles++;
+      const mergeResult = await mergeJsonlFiles([source], destination, false, ownerPass);
+      if (mergeResult === "merged") result.mergedJsonlFiles++;
+      else if (mergeResult === "deferred" && !incompleteSource) {
+        await preserveFile(source, conflictRoot, "incoming", rel);
+        result.preservedConflicts++;
+        result.preservedConflictPaths.push(rel);
+      }
       continue;
     }
 
@@ -405,11 +410,13 @@ export async function recoverProfileArchives(
   const home = options.home ?? homedir();
   const dryRun = options.dryRun ?? false;
   const roots = await archiveRoots(home);
+  const ownerPass: OpenOwnerPass = { lookups: 0 };
   const result: ArchiveRecoveryResult = {
     archiveRoots: roots.length,
     mergedJsonlFiles: 0,
     copiedFiles: 0,
     preservedConflicts: 0,
+    preservedConflictPaths: [],
   };
 
   for (const root of roots) {
@@ -418,7 +425,14 @@ export async function recoverProfileArchives(
       if (!rel || RECOVERY_SKIP_PATTERN.test(rel) || basename(rel) === "identities.json") continue;
       const destination = join(home, rel);
       if (source.endsWith(".jsonl")) {
-        if (await mergeJsonlFiles([source], destination, dryRun)) result.mergedJsonlFiles++;
+        const mergeResult = await mergeJsonlFiles([source], destination, dryRun, ownerPass);
+        if (mergeResult === "merged") result.mergedJsonlFiles++;
+        else if (mergeResult === "deferred") {
+          // Archives remain untouched; the recovery pass will retry once the
+          // destination is stable and closed.
+          result.preservedConflicts++;
+          result.preservedConflictPaths.push(rel);
+        }
       } else if (!(await exists(destination))) {
         if (!dryRun) {
           await mkdir(dirname(destination), { recursive: true });

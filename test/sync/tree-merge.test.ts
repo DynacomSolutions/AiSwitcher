@@ -105,6 +105,28 @@ describe("mergeIncomingProfileTree", () => {
     expect(await Bun.file(join(conflictRoot, "incoming", rel)).text()).toBe('complete\n{"partial":');
   });
 
+  test("defers a closed destination with an incomplete native tail and reports its path", async () => {
+    const home = await makeDir("ais-tree-closed-partial-home-");
+    const incoming = await makeDir("ais-tree-closed-partial-incoming-");
+    const conflictRoot = join(aisRemoteCacheDir(home), "merge-conflicts", "closed-partial-test");
+    await writeRegistry(home, home);
+    await writeRegistry(incoming, home);
+    const rel = join(".codex", "identities", "personal", "history.jsonl");
+    await write(join(home, rel), 'complete\nSYNTHETIC_FIXTURE_partial');
+    await write(join(incoming, rel), 'complete\nSYNTHETIC_FIXTURE_remote\n');
+
+    const result = await mergeIncomingProfileTree(incoming, {
+      kind: "identity",
+      cfg: codexConfig(home),
+      identityName: "personal",
+    }, { home, conflictRoot });
+
+    expect(result.preservedConflicts).toBe(1);
+    expect(result.preservedConflictPaths).toEqual([rel]);
+    expect(await Bun.file(join(home, rel)).text()).toBe('complete\nSYNTHETIC_FIXTURE_partial');
+    expect(await Bun.file(join(conflictRoot, "incoming", rel)).text()).toBe('complete\nSYNTHETIC_FIXTURE_remote\n');
+  });
+
   test("defers an incoming history while a native process still owns the live file", async () => {
     const home = await makeDir("ais-tree-open-home-");
     const incoming = await makeDir("ais-tree-open-incoming-");
@@ -321,8 +343,22 @@ describe("hasOpenOwner", () => {
     });
     const pass = { lookups: 1000 };
     expect(await hasOpenOwner(held, pass)).toBe(true);
-    for (let i = 0; i < 50; i++) expect(await hasOpenOwner(closed, pass)).toBe(false);
+    for (let i = 0; i < 50; i++) expect(await hasOpenOwner(closed, pass)).toBeUndefined();
     expect(scans).toBe(1);
+  });
+
+  test("a cached miss stays unknown if a native descriptor opens after the snapshot", async () => {
+    const dir = await makeDir("ais-open-owner-after-snapshot-");
+    const path = join(dir, "history.jsonl");
+    await Bun.write(path, "SYNTHETIC_FIXTURE_line\n");
+    setOpenScanner(async () => new Set());
+    const cachedPass = { lookups: 1000 };
+    expect(await hasOpenOwner(path, cachedPass)).toBeUndefined();
+    const handle = await open(path, "a");
+    try {
+      expect(await hasOpenOwner(path, cachedPass)).toBeUndefined();
+      expect(await hasOpenOwner(path, { lookups: 0 })).toBe(true);
+    } finally { await handle.close(); }
   });
 
   test("an unverifiable snapshot answers undefined", async () => {

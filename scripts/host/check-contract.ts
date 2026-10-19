@@ -37,7 +37,7 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 function hash(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
-async function writeAge(tar: Uint8Array): Promise<Uint8Array> {
+async function writeAge(tar: Uint8Array, passphrase: string): Promise<Uint8Array> {
   const age = Bun.which("age");
   assert(age, "age preflight invariant failed");
   const process = Bun.spawn([age, "-e", "-j", "batchpass"], {
@@ -46,7 +46,7 @@ async function writeAge(tar: Uint8Array): Promise<Uint8Array> {
   });
   const fd = process.stdio[3];
   assert(fd !== null, "age passphrase descriptor is unavailable");
-  writeSync(fd, `${MARKED_PASSPHRASE}\n`);
+  writeSync(fd, `${passphrase}\n`);
   closeSync(fd);
   process.stdin.write(tar);
   process.stdin.end();
@@ -110,7 +110,7 @@ await mkdir(scratch, { recursive: true, mode: 0o700 });
   const inboxTar = makeTar({ version: 1, seq: 7, kind: "inbox", createdAt: "2026-10-19T00:00:00.000Z" }, [
     { path: ".claude/settings.json", class: "config:settings", bytes: new TextEncoder().encode('{"theme":"synthetic"}\n') },
   ]);
-  const inboxCipher = await writeAge(inboxTar);
+  const inboxCipher = await writeAge(inboxTar, MARKED_PASSPHRASE);
   const inboxCipherPath = join(scratch, "inbox-b.age");
   const rustInboxPath = join(scratch, "rust-inbox.tar");
   await writeFile(inboxCipherPath, inboxCipher, { mode: 0o600 });
@@ -166,6 +166,28 @@ await mkdir(scratch, { recursive: true, mode: 0o700 });
   });
   assert(rustApplied.applied === 1 && rustApplied.lastInboxSeq === 7, "B did not apply and acknowledge the Rust-authored inbox sequence");
 
+  // Exercise exact passphrase bytes in both directions, including multibyte
+  // UTF-8, significant surrounding spaces, and the Rust minimum length.
+  const passphraseCases = [
+    { label: "unicode", passphrase: "SYNTHETIC_FIXTURE_日本語_passphrase" },
+    { label: "whitespace", passphrase: "  SYNTHETIC_FIXTURE_spaced  " },
+    { label: "boundary", passphrase: "SYNTHETIC_FIXTURE".slice(0, 12) },
+  ];
+  for (const { label, passphrase } of passphraseCases) {
+    const casePassphrasePath = join(scratch, `SYNTHETIC_FIXTURE-${label}-passphrase.txt`);
+    await writeFile(casePassphrasePath, passphrase, { mode: 0o600 });
+    const bCipherPath = join(scratch, `SYNTHETIC_FIXTURE-${label}-b.age`);
+    const rustPlainPath = join(scratch, `SYNTHETIC_FIXTURE-${label}-rust.tar`);
+    await writeFile(bCipherPath, await writeAge(inboxTar, passphrase), { mode: 0o600 });
+    await runRust(["read", bCipherPath, rustPlainPath, casePassphrasePath, "inbox"]);
+    assert(hash(new Uint8Array(await readFile(rustPlainPath))) === hash(inboxTar), `Rust did not decrypt the ${label} B passphrase case`);
+
+    const rustCipherPath = join(scratch, `SYNTHETIC_FIXTURE-${label}-rust.age`);
+    await runRust(["write", join(scratch, "inbox.tar"), rustCipherPath, casePassphrasePath, "inbox"]);
+    const bBundle = await readBundle(rustCipherPath, passphrase, "inbox");
+    assert(hash(bBundle.tarBytes) === hash(inboxTar), `B did not decrypt the ${label} Rust passphrase case`);
+  }
+
   // Ask B's real outbox collector to hash synthetic configuration and carry
   // logs. Its configuration entries are manifest-only by contract.
   const outboxHome = join(scratch, "outbox-home");
@@ -184,7 +206,7 @@ await mkdir(scratch, { recursive: true, mode: 0o700 });
   const outboxCipherPath = join(scratch, "b-outbox.age");
   const rustOutboxTarPath = join(scratch, "rust-outbox.tar");
   await writeFile(outboxTarPath, outbox.tarBytes, { mode: 0o600 });
-  await writeAge(outbox.tarBytes).then((cipher) => writeFile(outboxCipherPath, cipher, { mode: 0o600 }));
+  await writeAge(outbox.tarBytes, MARKED_PASSPHRASE).then((cipher) => writeFile(outboxCipherPath, cipher, { mode: 0o600 }));
   await runRust(["read", outboxCipherPath, rustOutboxTarPath, passphrasePath, "outbox"]);
   assert(hash(new Uint8Array(await readFile(rustOutboxTarPath))) === hash(outbox.tarBytes), "Rust did not recover B-authored outbox tar bytes exactly");
 

@@ -1,13 +1,25 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, open, readdir, rm, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { exportSnapshot } from "../../src/host/export.ts";
 import { handleHostRequest, runHostStdio } from "../../src/host/adapter.ts";
 import { parseBundleTar } from "../../src/live/bundle.ts";
 import { encodeJsonFrame, readExact, readRequest, assertEnd } from "../../src/host/protocol.ts";
 import { setOpenScanner } from "../../src/sync/tree-merge.ts";
 import { importLogs } from "../../src/host/import.ts";
+import { setJsonlBeforeCreateHook } from "../../src/sync/dedupe.ts";
+
+async function findFileEndingAt(root: string, suffix: string): Promise<string | undefined> {
+  for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      const found = await findFileEndingAt(path, suffix);
+      if (found) return found;
+    } else if (entry.isFile() && path.endsWith(suffix)) return path;
+  }
+  return undefined;
+}
 import { createHash } from "node:crypto";
 import { canonicalConfig } from "../../src/live/portable.ts";
 
@@ -200,11 +212,14 @@ describe("host adapter", () => {
     const conflictBase = join(home, ".ais", "cache", "host-import-conflicts");
     expect((await readdir(conflictBase)).length).toBeGreaterThan(0);
     const conflictHash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-    expect(await Bun.file(join(conflictBase, rollout) + `.${conflictHash(jsonl)}`).exists()).toBe(true);
+    const preservedRollout = await findFileEndingAt(conflictBase, `/incoming/${rollout}`);
+    expect(preservedRollout && await Bun.file(preservedRollout).text()).toBe(new TextDecoder().decode(jsonl));
     expect(await Bun.file(join(conflictBase, ".claude/projects/SYNTHETIC_FIXTURE/rollout.json") + `.${conflictHash(incomingConfig)}`).exists()).toBe(true);
     expect(await Bun.file(join(conflictBase, ".claude/projects/SYNTHETIC_FIXTURE/metadata.json") + `.${conflictHash(sharedMetadata)}`).exists()).toBe(false);
     expect(second.conflicts).toEqual(first.conflicts);
-    expect((await readdir(join(conflictBase, ".claude", "projects", "SYNTHETIC_FIXTURE"))).length).toBe(2);
+    expect(await readdir(join(conflictBase, ".claude", "projects", "SYNTHETIC_FIXTURE"))).toEqual([
+      `rollout.json.${conflictHash(incomingConfig)}`,
+    ]);
   }, 30000);
 
   test("counts absent non-JSONL imports and skips equal files on replay", async () => {
@@ -218,6 +233,41 @@ describe("host adapter", () => {
     expect(second.applied).toBe(0);
     expect(second.conflicts).toEqual([]);
     expect(await readdir(join(home, ".ais", "cache", "host-import-conflicts")).catch(() => [])).toEqual([]);
+  });
+
+  test("reports and durably preserves an import against a closed incomplete JSONL destination", async () => {
+    const home = await fixture();
+    const rel = ".claude/projects/SYNTHETIC_FIXTURE/history.jsonl";
+    const destination = join(home, rel);
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, "SYNTHETIC_FIXTURE_local_partial");
+    const incoming = new TextEncoder().encode("SYNTHETIC_FIXTURE_remote\n");
+
+    const result = await importLogs(outbox([{ path: rel, bytes: incoming }]), home);
+
+    expect(result.conflicts).toContain(rel);
+    const preserved = await findFileEndingAt(join(home, ".ais", "cache", "host-import-conflicts"), `/incoming/${rel}`);
+    expect(preserved && await Bun.file(preserved).text()).toBe(new TextDecoder().decode(incoming));
+    expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_local_partial");
+  });
+
+  test("reports and preserves an EEXIST race while creating a JSONL destination", async () => {
+    const home = await fixture();
+    const rel = ".claude/projects/SYNTHETIC_FIXTURE/raced.jsonl";
+    const destination = join(home, rel);
+    const incoming = new TextEncoder().encode("SYNTHETIC_FIXTURE_imported\n");
+    setJsonlBeforeCreateHook(async (path) => {
+      await mkdir(dirname(path), { recursive: true });
+      await Bun.write(path, "SYNTHETIC_FIXTURE_native\n");
+    });
+
+    try {
+      const result = await importLogs(outbox([{ path: rel, bytes: incoming }]), home);
+      expect(result.conflicts).toContain(rel);
+      expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
+      const preserved = await findFileEndingAt(join(home, ".ais", "cache", "host-import-conflicts"), `/incoming/${rel}`);
+      expect(preserved && await Bun.file(preserved).text()).toBe(new TextDecoder().decode(incoming));
+    } finally { setJsonlBeforeCreateHook(); }
   });
 
   test("import rejects transient log payloads and symlink parents before writing", async () => {

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { parseBundleTar } from "../live/bundle.ts";
 import { SYNC_TOOL_CONFIGS, isTransientSyncPath } from "../sync/rsync.ts";
-import { hasOpenOwner, mergeIncomingProfileTree } from "../sync/tree-merge.ts";
+import { mergeIncomingProfileTree } from "../sync/tree-merge.ts";
 import { aisCacheDir } from "../shared/ais-home.ts";
 import { readHostFileBounded } from "./export.ts";
 
@@ -138,7 +138,7 @@ export async function importLogs(tar: Uint8Array, home = homedir(), signal?: Abo
         conflicts.push(entry.path);
         continue;
       }
-      if (entry.path.endsWith(".jsonl") && ((current && (await hasOpenOwner(target)) !== false) || bytes[bytes.byteLength - 1] !== 10)) {
+      if (entry.path.endsWith(".jsonl") && bytes[bytes.byteLength - 1] !== 10) {
         await preserveConflict(home, conflictDestinations.get(entry.path)!, conflictRelativePath(entry.path, bytes), bytes, signal);
         conflicts.push(entry.path);
         continue;
@@ -176,11 +176,12 @@ export async function importLogs(tar: Uint8Array, home = homedir(), signal?: Abo
       home,
       conflictRoot: resolve(stageParent, "host-import-conflicts", randomUUID()),
       purgeRetired: async () => ({ removed: [], failures: [], warnings: [] }),
-    }) : { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0 };
+    }) : { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [] };
     const stageReal = await realpath(stage);
     const stageRel = relative(rootReal, stageReal);
     if (stageRel.startsWith(`..${sep}`) || isAbsolute(stageRel)) throw new Error("host import staging escaped its home");
     const applied = directlyApplied + result.mergedJsonlFiles + result.copiedFiles;
-    return { applied, skipped: conflicts.length + result.preservedConflicts, conflicts: [...new Set(conflicts)] };
+    conflicts.push(...result.preservedConflictPaths);
+    return { applied, skipped: new Set(conflicts).size, conflicts: [...new Set(conflicts)] };
   } finally { await rm(stage, { recursive: true, force: true }); }
 }
