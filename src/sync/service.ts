@@ -1,10 +1,11 @@
-import { open, mkdir, readFile, rm, unlink } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { join, relative, sep } from "node:path";
 import { expandPath } from "../identities/match.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { AIS_REMOTE_CACHE_REL, aisRemoteCacheDir } from "../shared/ais-home.ts";
+import { acquirePidLock } from "../shared/pid-lock.ts";
 import { loadSyncConfig } from "./config.ts";
 import { makeRegistryPortable } from "./registry.ts";
 import { makeProfileHookConfigsPortable, makeSharedHookScriptsPortable } from "./portable-config.ts";
@@ -53,49 +54,8 @@ function syncLockPath(home: string = homedir()): string {
   return join(aisRemoteCacheDir(home), "sync.lock");
 }
 
-async function processIsAlive(pid: number): Promise<boolean> {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function acquireSyncLock(wait: boolean, home: string = homedir()): Promise<(() => Promise<void>) | undefined> {
-  const path = syncLockPath(home);
-  await mkdir(dirname(path), { recursive: true });
-  const token = `${process.pid}:${crypto.randomUUID()}`;
-  const deadline = Date.now() + (wait ? LOCK_WAIT_MS : 0);
-
-  for (;;) {
-    try {
-      const handle = await open(path, "wx", 0o600);
-      await handle.writeFile(`${JSON.stringify({ pid: process.pid, token, startedAt: new Date().toISOString() })}\n`);
-      await handle.close();
-      return async () => {
-        try {
-          const current = JSON.parse(await readFile(path, "utf8")) as { token?: string };
-          if (current.token === token) await unlink(path);
-        } catch {
-          // Already removed or replaced by a newer owner.
-        }
-      };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      try {
-        const current = JSON.parse(await readFile(path, "utf8")) as { pid?: number };
-        if (typeof current.pid !== "number" || !(await processIsAlive(current.pid))) {
-          await unlink(path);
-          continue;
-        }
-      } catch (readErr) {
-        if ((readErr as NodeJS.ErrnoException).code === "ENOENT") continue;
-      }
-      if (!wait || Date.now() >= deadline) return undefined;
-      await Bun.sleep(LOCK_RETRY_MS);
-    }
-  }
+  return acquirePidLock(syncLockPath(home), { waitMs: wait ? LOCK_WAIT_MS : 0, retryMs: LOCK_RETRY_MS });
 }
 
 interface CrushProjectsFile {

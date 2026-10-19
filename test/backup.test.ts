@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isTolerableRsyncExitCode, runBackup } from "../scripts/backup.ts";
+import { isTolerableRsyncExitCode, loadBackupConfig, runBackup } from "../scripts/backup.ts";
+import { acquirePidLock } from "../src/shared/pid-lock.ts";
 
 const tempDirs: string[] = [];
 
@@ -186,5 +188,207 @@ describeWithRsync("runBackup integration", () => {
     expect(await Bun.file(join(first, ".codex", "identities.json")).exists()).toBe(true);
     expect(await Bun.file(join(first, ".grok", "identities.json")).exists()).toBe(true);
     expect(await gitLog(first)).toHaveLength(2);
+  });
+});
+
+async function git(dir: string, args: string[], env: Record<string, string> = {}): Promise<string> {
+  const proc = Bun.spawn(["git", "-C", dir, ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, ...env },
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed (${exitCode}): ${stderr}`);
+  return stdout.trim();
+}
+
+async function makeBareRemote(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "ais-backup-remote-"));
+  tempDirs.push(dir);
+  await git(dir, ["init", "--bare", "--quiet"]);
+  return dir;
+}
+
+async function writeConfig(home: string, config: unknown): Promise<string> {
+  const path = join(home, "backup.json");
+  await Bun.write(path, typeof config === "string" ? config : JSON.stringify(config));
+  return path;
+}
+
+const count = async (dir: string) => Number(await git(dir, ["rev-list", "--count", "HEAD"]));
+const branchOf = (repo: string) => git(repo, ["symbolic-ref", "--short", "HEAD"]);
+
+/** Pre-seeds the backup repo with commits dated N days ago, so the next runBackup lands on top of old history. */
+async function seedOldHistory(home: string, daysAgo: number[]): Promise<string> {
+  const repo = join(home, ".ais", "backups");
+  await mkdir(repo, { recursive: true });
+  await git(repo, ["init", "--quiet"]);
+  await git(repo, ["config", "user.name", "t"]);
+  await git(repo, ["config", "user.email", "t@example.com"]);
+  await git(repo, ["config", "commit.gpgsign", "false"]);
+  for (const days of daysAgo) {
+    const date = new Date(Date.now() - days * 86_400_000).toISOString();
+    await write(join(repo, ".codex", "seed.txt"), `seed ${days}\n`);
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "--quiet", "-m", `old ${days}`], { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date });
+  }
+  return repo;
+}
+
+describe("loadBackupConfig", () => {
+  test("missing file means no remote and is silent", async () => {
+    const home = await makeHome();
+    expect(await loadBackupConfig(join(home, "nope.json"))).toEqual({});
+  });
+
+  test("bad JSON, wrong types and retention without a remote never throw", async () => {
+    const home = await makeHome();
+    expect(await loadBackupConfig(await writeConfig(home, "{ not json"))).toEqual({});
+    expect(await loadBackupConfig(await writeConfig(home, { remote: 5 }))).toEqual({});
+    expect(await loadBackupConfig(await writeConfig(home, { remote: "--upload-pack=x" }))).toEqual({});
+    expect(await loadBackupConfig(await writeConfig(home, { localRetentionDays: 7 }))).toEqual({});
+    expect(await loadBackupConfig(await writeConfig(home, { remote: "/r", localRetentionDays: 0 }))).toEqual({ remote: "/r" });
+    expect(await loadBackupConfig(await writeConfig(home, { remote: "/r", localRetentionDays: 1.5 }))).toEqual({ remote: "/r" });
+    expect(await loadBackupConfig(await writeConfig(home, { remote: "backup@backup.example:/srv/ais-backups.git", localRetentionDays: 14 }))).toEqual({
+      remote: "backup@backup.example:/srv/ais-backups.git",
+      localRetentionDays: 14,
+    });
+  });
+});
+
+describe("pid lock", () => {
+  test("a live holder blocks, release frees, a dead holder is taken over", async () => {
+    const home = await makeHome();
+    const path = join(home, "x.lock");
+    const release = await acquirePidLock(path, { waitMs: 0, retryMs: 10 });
+    expect(release).toBeDefined();
+    expect(await acquirePidLock(path, { waitMs: 50, retryMs: 10 })).toBeUndefined();
+    await release!();
+    expect(existsSync(path)).toBe(false);
+
+    const dead = Bun.spawn(["true"]);
+    await dead.exited;
+    await Bun.write(path, JSON.stringify({ pid: dead.pid, token: "stale" }));
+    const taken = await acquirePidLock(path, { waitMs: 0, retryMs: 10 });
+    expect(taken).toBeDefined();
+    await taken!();
+  });
+});
+
+describeWithRsync("runBackup off-host push", () => {
+  test("no backup.json: no remote, no shallow file, no lock left behind", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+
+    const repo = await runBackup(["codex"], home, join(home, "absent.json"));
+
+    expect(await gitLog(repo)).toHaveLength(1);
+    expect(await Bun.file(join(repo, ".git", "config")).text()).not.toContain("[remote");
+    expect(existsSync(join(repo, ".git", "shallow"))).toBe(false);
+    expect(existsSync(join(home, ".ais", "backups.lock"))).toBe(false);
+  });
+
+  test("pushes the current branch to the remote", async () => {
+    const home = await makeHome();
+    const remote = await makeBareRemote();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+
+    const repo = await runBackup(["codex"], home, await writeConfig(home, { remote }));
+
+    expect(await git(remote, ["rev-parse", `refs/heads/${await branchOf(repo)}`])).toBe(await git(repo, ["rev-parse", "HEAD"]));
+    expect(await Bun.file(join(repo, ".git", "config")).text()).not.toContain("[remote");
+  });
+
+  test("an unreachable remote does not throw and the local commit is still made", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+
+    const repo = await runBackup(["codex"], home, await writeConfig(home, { remote: join(home, "missing.git") }));
+
+    expect(await gitLog(repo)).toHaveLength(1);
+  });
+
+  test("catch-up: a later run with no source changes pushes the earlier commit", async () => {
+    const home = await makeHome();
+    const remote = await makeBareRemote();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+
+    const repo = await runBackup(["codex"], home, await writeConfig(home, { remote: join(home, "missing.git") }));
+    const branch = await branchOf(repo);
+    expect(Bun.spawnSync(["git", "-C", remote, "rev-parse", `refs/heads/${branch}`]).exitCode).not.toBe(0);
+
+    await runBackup(["codex"], home, await writeConfig(home, { remote }));
+
+    expect(await gitLog(repo)).toHaveLength(1);
+    expect(await git(remote, ["rev-parse", `refs/heads/${branch}`])).toBe(await git(repo, ["rev-parse", "HEAD"]));
+  });
+
+  test("no trim while the remote is unreachable or not at local HEAD", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    const repo = await seedOldHistory(home, [40, 30, 20]);
+
+    await runBackup(["codex"], home, await writeConfig(home, { remote: join(home, "missing.git"), localRetentionDays: 25 }));
+    expect(await count(repo)).toBe(4);
+    expect(existsSync(join(repo, ".git", "shallow"))).toBe(false);
+
+    // Remote holds unrelated history on the same branch: the push is rejected (never forced), so no trim.
+    const remote = await makeBareRemote();
+    const other = await mkdtemp(join(tmpdir(), "ais-backup-other-"));
+    tempDirs.push(other);
+    await git(other, ["init", "--quiet"]);
+    await git(other, ["config", "user.name", "t"]);
+    await git(other, ["config", "user.email", "t@example.com"]);
+    await Bun.write(join(other, "f"), "x");
+    await git(other, ["add", "-A"]);
+    await git(other, ["commit", "--quiet", "-m", "other"]);
+    await git(other, ["push", "--quiet", remote, `HEAD:refs/heads/${await branchOf(repo)}`]);
+
+    await runBackup(["codex"], home, await writeConfig(home, { remote, localRetentionDays: 25 }));
+    expect(await count(repo)).toBe(4);
+    expect(existsSync(join(repo, ".git", "shallow"))).toBe(false);
+    expect(await git(remote, ["rev-parse", `refs/heads/${await branchOf(repo)}`])).not.toBe(await git(repo, ["rev-parse", "HEAD"]));
+  });
+
+  test("trims after the remote is confirmed, and a later push needs no force and keeps full remote history", async () => {
+    const home = await makeHome();
+    const remote = await makeBareRemote();
+    const file = join(home, ".codex", "identities.json");
+    await write(file, "{}\n");
+    const repo = await seedOldHistory(home, [40, 30, 20]);
+    const configPath = await writeConfig(home, { remote, localRetentionDays: 25 });
+    const branch = await branchOf(repo);
+
+    await runBackup(["codex"], home, configPath);
+
+    expect(existsSync(join(repo, ".git", "shallow"))).toBe(true);
+    expect(await count(repo)).toBe(2);
+    expect(Number(await git(remote, ["rev-list", "--count", `refs/heads/${branch}`]))).toBe(4);
+
+    await write(file, '{"changed":true}\n');
+    await runBackup(["codex"], home, configPath);
+
+    expect(await git(remote, ["rev-parse", `refs/heads/${branch}`])).toBe(await git(repo, ["rev-parse", "HEAD"]));
+    expect(Number(await git(remote, ["rev-list", "--count", `refs/heads/${branch}`]))).toBe(5);
+    await git(remote, ["fsck", "--strict"]);
+  });
+
+  test("concurrent runs serialise on the lock and leave a consistent repo", async () => {
+    const home = await makeHome();
+    const remote = await makeBareRemote();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    const configPath = await writeConfig(home, { remote });
+
+    const [a, b] = await Promise.all([runBackup(["codex"], home, configPath), runBackup(["codex"], home, configPath)]);
+
+    expect(a).toBe(b);
+    expect(await gitLog(a)).toHaveLength(1);
+    expect(await git(a, ["status", "--porcelain"])).toBe("");
+    expect(await git(remote, ["rev-parse", `refs/heads/${await branchOf(a)}`])).toBe(await git(a, ["rev-parse", "HEAD"]));
+    expect(existsSync(join(home, ".ais", "backups.lock"))).toBe(false);
   });
 });

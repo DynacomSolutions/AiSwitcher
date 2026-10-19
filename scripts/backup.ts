@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { lstat, mkdir } from "node:fs/promises";
-import { aisBackupsDir } from "../src/shared/ais-home.ts";
+import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { aisBackupConfigPath, aisBackupLockPath, aisBackupsDir } from "../src/shared/ais-home.ts";
+import { acquirePidLock } from "../src/shared/pid-lock.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../src/shared/reproducible-paths.ts";
 
 // Grouped by which wrapped-tool proxy actually reads/writes each directory —
@@ -67,10 +68,15 @@ interface GitResult {
   stderr: string;
 }
 
-async function runGit(repoDir: string, args: string[]): Promise<GitResult> {
+async function runGit(repoDir: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
   const git = Bun.which("git");
   if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
-  const proc = Bun.spawn([git, "-C", repoDir, ...args], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([git, "-C", repoDir, ...args], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    ...(env ? { env: { ...process.env, ...env } } : {}),
+  });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -136,36 +142,7 @@ async function mirrorInto(sourcePath: string, destPath: string): Promise<void> {
   }
 }
 
-/**
- * Mirrors the given config-directory group(s) (default: every group) into a
- * single, persistent git repository at ~/.ais/backups and commits whatever
- * changed since the last backup. Replaces the old per-run tar.gz snapshot
- * design (~/.ai-switcher-backups/<timestamp>/*.tar.gz — one full archive
- * tree per invocation, nothing ever pruned) — that grew without bound, and
- * every run paid for a full copy even when almost nothing had changed since
- * the last one. Git's content-addressable object store instead stores each
- * distinct blob once no matter how many commits reference it, so two
- * backups taken minutes apart (the common case around an install/update)
- * cost close to nothing beyond the first; `git gc --auto` after each commit
- * keeps loose objects packed and delta-compressed rather than accumulating
- * unbounded. Reproducible/machine-local junk (node_modules, marketplace and
- * browser caches, logs, worktrees, ...) is excluded via rsync — see
- * reproducible-paths.ts, shared with SSH sync's own exclude list — since
- * none of it has restore value and it's what drove most of the old design's
- * size growth. SQLite/session databases are still mirrored in full (unlike
- * SSH sync, which excludes live databases in favour of its own
- * VACUUM-based merge protocol): this is a point-in-time safety net taken
- * synchronously before install/update/migrate touch anything, not a live
- * merge target, so a plain file copy carries the same small, accepted risk
- * of catching a database mid-write that the old tar-based backup always
- * had — no worse than before. Symlinks (post-migration compatibility
- * shims) are skipped at the top level, same as before — their target is
- * already covered by the container directory's own mirror.
- */
-export async function runBackup(
-  groups: readonly BackupGroup[] = Object.keys(BACKUP_GROUPS) as BackupGroup[],
-  home: string = homedir(),
-): Promise<string> {
+async function mirrorAndCommit(groups: readonly BackupGroup[], home: string): Promise<string> {
   const repoDir = aisBackupsDir(home);
   await ensureRepo(repoDir);
 
@@ -245,6 +222,193 @@ export async function runBackup(
 
   console.error(`backup: complete, see ${repoDir}`);
   return repoDir;
+}
+
+const LOCK_WAIT_MS = 600_000;
+const LOCK_RETRY_MS = 200;
+
+// BatchMode: never prompt; the timeouts bound a dead or silent host so a
+// backup (often run inside install/update) cannot hang on the network.
+const SSH_COMMAND =
+  "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=yes";
+const GIT_REMOTE_ENV = { GIT_TERMINAL_PROMPT: "0" };
+
+export interface BackupConfig {
+  remote?: string;
+  localRetentionDays?: number;
+}
+
+/** Reads the optional off-host config. Never throws: a bad file is reported
+ * loudly and treated as "no remote", so it can never fail the local backup. */
+export async function loadBackupConfig(path: string): Promise<BackupConfig> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+    console.error(`backup: cannot read ${path} (${(err as Error).message}), off-host push disabled`);
+    return {};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.error(`backup: ${path} is not valid JSON (${(err as Error).message}), off-host push disabled`);
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    console.error(`backup: ${path} must be a JSON object, off-host push disabled`);
+    return {};
+  }
+  const { remote, localRetentionDays } = parsed as Record<string, unknown>;
+  const config: BackupConfig = {};
+  // A leading "-" would be parsed by git as an option, not a destination.
+  if (typeof remote === "string" && remote.trim() !== "" && !remote.trim().startsWith("-")) config.remote = remote.trim();
+  else if (remote !== undefined) console.error(`backup: ${path}: "remote" must be a non-empty string, off-host push disabled`);
+  if (localRetentionDays !== undefined) {
+    if (typeof localRetentionDays !== "number" || !Number.isInteger(localRetentionDays) || localRetentionDays < 1) {
+      console.error(`backup: ${path}: "localRetentionDays" must be a positive integer, ignoring it`);
+    } else if (!config.remote) {
+      console.error(`backup: ${path}: "localRetentionDays" needs a "remote", ignoring it`);
+    } else {
+      config.localRetentionDays = localRetentionDays;
+    }
+  }
+  return config;
+}
+
+/** Trimmed git stderr with the remote (which may embed credentials) redacted. */
+function failureText(result: GitResult, remote: string): string {
+  const text = (result.stderr.trim() || result.stdout.trim()).split(remote).join("<remote>");
+  return `exit ${result.exitCode}${text ? `: ${text.slice(-500)}` : ""}`;
+}
+
+async function runRemoteGit(repoDir: string, args: string[]): Promise<GitResult> {
+  return runGit(repoDir, ["-c", `core.sshCommand=${SSH_COMMAND}`, ...args], GIT_REMOTE_ENV);
+}
+
+/** Pushes the current branch (never forced), then optionally trims local
+ * history. Failures are loud but never thrown: the local backup already
+ * succeeded and the next run retries (the push always sends the whole branch). */
+async function pushAndTrim(repoDir: string, remote: string, retentionDays: number | undefined): Promise<void> {
+  try {
+    const head = await runGit(repoDir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
+    if (head.exitCode !== 0) {
+      console.error(`backup: no commits yet, nothing to push to the off-host remote`);
+      return;
+    }
+    const headSha = head.stdout.trim();
+    const branchResult = await runGit(repoDir, ["symbolic-ref", "--short", "HEAD"]);
+    const branch = branchResult.stdout.trim();
+    if (branchResult.exitCode !== 0 || !branch) {
+      console.error(`backup: off-host push skipped, HEAD is not on a branch`);
+      return;
+    }
+
+    const push = await runRemoteGit(repoDir, ["push", "--quiet", remote, `HEAD:refs/heads/${branch}`]);
+    if (push.exitCode !== 0) {
+      console.error(`backup: off-host push FAILED (${failureText(push, remote)}); local backup is intact, next run retries`);
+      if (retentionDays) console.error("backup: local trim skipped, the push did not succeed");
+      return;
+    }
+    console.error(`backup: pushed ${headSha.slice(0, 7)} to the off-host remote (${branch})`);
+
+    if (retentionDays) await trimLocalHistory(repoDir, remote, branch, headSha, retentionDays);
+  } catch (err) {
+    console.error(`backup: off-host step FAILED (${(err as Error).message.split(remote).join("<remote>")}); local backup is intact`);
+  }
+}
+
+async function trimLocalHistory(
+  repoDir: string,
+  remote: string,
+  branch: string,
+  headSha: string,
+  days: number,
+): Promise<void> {
+  const ls = await runRemoteGit(repoDir, ["ls-remote", remote, `refs/heads/${branch}`]);
+  if (ls.exitCode !== 0) {
+    console.error(`backup: local trim skipped, remote unreachable (${failureText(ls, remote)})`);
+    return;
+  }
+  const remoteSha = ls.stdout.trim().split(/\s+/)[0] ?? "";
+  if (remoteSha !== headSha) {
+    console.error(
+      `backup: local trim skipped, remote ${remoteSha ? "differs from or is behind local HEAD" : "has no such branch"}`,
+    );
+    return;
+  }
+
+  const since = await runGit(repoDir, ["rev-list", "--first-parent", `--since=${days} days ago`, "HEAD"]);
+  if (since.exitCode !== 0) {
+    console.error(`backup: local trim skipped, rev-list failed (${failureText(since, remote)})`);
+    return;
+  }
+  const recent = since.stdout.trim().split("\n").filter(Boolean);
+  const boundary = recent.length > 0 ? recent[recent.length - 1]! : headSha;
+  // Already a root or already the shallow boundary: nothing older to drop.
+  const parent = await runGit(repoDir, ["rev-parse", "--verify", "--quiet", `${boundary}^`]);
+  if (parent.exitCode !== 0) return;
+
+  const before = (await runGit(repoDir, ["rev-list", "--count", "HEAD"])).stdout.trim();
+  // History is linear, so the new boundary is always newer than any existing one: replace.
+  const shallowPath = join(repoDir, ".git", "shallow");
+  const tmpPath = `${shallowPath}.${process.pid}.tmp`;
+  await writeFile(tmpPath, `${boundary}\n`);
+  await rename(tmpPath, shallowPath);
+  const expire = await runGit(repoDir, ["reflog", "expire", "--expire=now", "--all"]);
+  const gc = await runGit(repoDir, ["gc", "--prune=now", "--quiet"]);
+  if (expire.exitCode !== 0 || gc.exitCode !== 0) {
+    console.error(`backup: local trim set the boundary but cleanup failed (${failureText(expire.exitCode !== 0 ? expire : gc, remote)})`);
+    return;
+  }
+  const after = (await runGit(repoDir, ["rev-list", "--count", "HEAD"])).stdout.trim();
+  console.error(
+    `backup: trimmed local history older than ${days} days (${before} -> ${after} commits, boundary ${boundary.slice(0, 7)}); the off-host remote keeps the full history`,
+  );
+}
+
+/**
+ * Mirrors the given config-directory group(s) (default: every group) into a
+ * single, persistent git repository at ~/.ais/backups and commits whatever
+ * changed since the last backup. Replaces the old per-run tar.gz snapshot
+ * design (~/.ai-switcher-backups/<timestamp>/*.tar.gz — one full archive
+ * tree per invocation, nothing ever pruned) — that grew without bound, and
+ * every run paid for a full copy even when almost nothing had changed since
+ * the last one. Git's content-addressable object store instead stores each
+ * distinct blob once no matter how many commits reference it, so two
+ * backups taken minutes apart (the common case around an install/update)
+ * cost close to nothing beyond the first; `git gc --auto` after each commit
+ * keeps loose objects packed and delta-compressed rather than accumulating
+ * unbounded. Reproducible/machine-local junk (node_modules, marketplace and
+ * browser caches, logs, worktrees, ...) is excluded via rsync — see
+ * reproducible-paths.ts, shared with SSH sync's own exclude list — since
+ * none of it has restore value and it's what drove most of the old design's
+ * size growth. SQLite/session databases are still mirrored in full (unlike
+ * SSH sync, which excludes live databases in favour of its own
+ * VACUUM-based merge protocol): this is a point-in-time safety net taken
+ * synchronously before install/update/migrate touch anything, not a live
+ * merge target, so a plain file copy carries the same small, accepted risk
+ * of catching a database mid-write that the old tar-based backup always
+ * had — no worse than before. Symlinks (post-migration compatibility
+ * shims) are skipped at the top level, same as before — their target is
+ * already covered by the container directory's own mirror.
+ */
+export async function runBackup(
+  groups: readonly BackupGroup[] = Object.keys(BACKUP_GROUPS) as BackupGroup[],
+  home: string = homedir(),
+  configPath: string = aisBackupConfigPath(process.env, home),
+): Promise<string> {
+  const release = await acquirePidLock(aisBackupLockPath(home), { waitMs: LOCK_WAIT_MS, retryMs: LOCK_RETRY_MS });
+  if (!release) throw new Error(`backup: another backup still holds ${aisBackupLockPath(home)} after 10 minutes`);
+  try {
+    const repoDir = await mirrorAndCommit(groups, home);
+    const config = await loadBackupConfig(configPath);
+    if (config.remote) await pushAndTrim(repoDir, config.remote, config.localRetentionDays);
+    return repoDir;
+  } finally {
+    await release();
+  }
 }
 
 if (import.meta.main) {
