@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, open, readdir, realpath, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { appendFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
 import {
@@ -9,7 +10,9 @@ import {
   recoverProfileArchives,
   setDirectOwnerProbe,
   setOpenScanner,
+  setProcReader,
 } from "../../src/sync/tree-merge.ts";
+import { setJsonlWriter } from "../../src/sync/dedupe.ts";
 import { aisRemoteCacheDir } from "../../src/shared/ais-home.ts";
 
 const tempDirs: string[] = [];
@@ -17,6 +20,8 @@ const tempDirs: string[] = [];
 afterEach(async () => {
   setDirectOwnerProbe();
   setOpenScanner();
+  setProcReader();
+  setJsonlWriter();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -58,8 +63,65 @@ async function writeRegistry(root: string, home: string): Promise<void> {
   );
 }
 
+function injectInaccessibleProcess(uid: number | number[], openPaths: string[] = []): void {
+  const uids = typeof uid === "number" ? [uid, uid, uid, uid] : uid;
+  setProcReader({
+    async readdir(path) {
+      if (path === "/proc") return ["2147483646", "2147483645"];
+      if (path === "/proc/2147483646/fd") throw Object.assign(new Error("SYNTHETIC_FIXTURE_access"), { code: "EACCES" });
+      return openPaths.map((_, index) => String(index));
+    },
+    async readlink(path) { return openPaths[Number(path.split("/").at(-1))]!; },
+    async readFile() { return `Name:\tSYNTHETIC_FIXTURE_process\nUid:\t${uids.join("\t")}\n`; },
+  });
+}
+
+describe.skipIf(process.platform !== "linux")("inaccessible /proc entries", () => {
+  for (const owner of ["other", "same", "root"] as const) {
+    test(`${owner}-uid fd access failure ${owner === "other" ? "does not starve" : "defers"} a closed file`, async () => {
+      const home = await makeDir("ais-proc-owner-");
+      const path = join(home, "history.jsonl");
+      await write(path, "SYNTHETIC_FIXTURE_local\n");
+      const uid = (await stat(path)).uid;
+      injectInaccessibleProcess(owner === "other" ? uid + 1 : owner === "same" ? uid : 0);
+      // Exercise the real scanner, including its /proc traversal and UID
+      // decision, with only the filesystem reader injected.
+      expect(await hasOpenOwner(path, { lookups: 4 })).toBe(owner === "other" ? false : undefined);
+    });
+  }
+
+  test("an inaccessible process with a matching filesystem UID remains unknown", async () => {
+    const home = await makeDir("ais-proc-filesystem-uid-");
+    const path = join(home, "history.jsonl");
+    await write(path, "SYNTHETIC_FIXTURE_local\n");
+    const uid = (await stat(path)).uid;
+    injectInaccessibleProcess([uid + 1, uid + 1, uid + 1, uid]);
+    expect(await hasOpenOwner(path, { lookups: 4 })).toBeUndefined();
+  });
+
+  test("missing or unreadable process UIDs remain unknown", async () => {
+    const home = await makeDir("ais-proc-unknown-uid-");
+    const path = join(home, "history.jsonl");
+    await write(path, "SYNTHETIC_FIXTURE_local\n");
+    for (const unreadable of [false, true]) {
+      setProcReader({
+        async readdir(path) {
+          if (path === "/proc") return ["2147483646"];
+          throw Object.assign(new Error("SYNTHETIC_FIXTURE_access"), { code: "EACCES" });
+        },
+        async readlink() { throw new Error("SYNTHETIC_FIXTURE_unexpected_link"); },
+        async readFile() {
+          if (unreadable) throw Object.assign(new Error("SYNTHETIC_FIXTURE_status_access"), { code: "EACCES" });
+          return "Name:\tSYNTHETIC_FIXTURE_process\n";
+        },
+      });
+      expect(await hasOpenOwner(path, { lookups: 4 })).toBeUndefined();
+    }
+  });
+});
+
 describe("mergeIncomingProfileTree", () => {
-  test("four busy logs do not starve ten later closed logs needing additions", async () => {
+  test.skipIf(process.platform !== "linux")("four busy logs and an unreadable unrelated process do not starve ten later closed logs", async () => {
     const home = await makeDir("ais-tree-budget-home-");
     const incoming = await makeDir("ais-tree-budget-incoming-");
     const paths = Array.from({ length: 14 }, (_, i) => join(".codex", "identities", "personal", `${i.toString().padStart(2, "0")}.jsonl`));
@@ -70,9 +132,8 @@ describe("mergeIncomingProfileTree", () => {
         await write(join(incoming, rel), "SYNTHETIC_FIXTURE_remote\n");
         if (i < 4) handles.push(await open(join(home, rel), "a"));
       }
-      const busy = new Set(await Promise.all(paths.slice(0, 4).map((rel) => realpath(join(home, rel)))));
-      setDirectOwnerProbe(async (path) => busy.has(path));
-      setOpenScanner(async () => busy);
+      const busy = await Promise.all(paths.slice(0, 4).map((rel) => realpath(join(home, rel))));
+      injectInaccessibleProcess((await stat(home)).uid + 1, busy);
       const result = await mergeIncomingProfileTree(incoming, {
         kind: "identity", cfg: codexConfig(home), identityName: "personal",
       }, { home });
@@ -84,6 +145,31 @@ describe("mergeIncomingProfileTree", () => {
       }
     } finally { await Promise.all(handles.map((handle) => handle.close())); }
   }, 30_000);
+
+  for (const existing of [false, true]) {
+    test(`retains the incoming copy after a post-check ${existing ? "append" : "create"} size mismatch`, async () => {
+      const home = await makeDir("ais-tree-post-write-home-");
+      const incoming = await makeDir("ais-tree-post-write-incoming-");
+      const rel = join(".codex", "identities", "personal", "history.jsonl");
+      const live = join(home, rel);
+      const remote = "SYNTHETIC_FIXTURE_imported\n";
+      await write(join(incoming, rel), remote);
+      if (existing) await write(live, "SYNTHETIC_FIXTURE_local\n");
+      let writes = 0;
+      setJsonlWriter((fd, payload) => {
+        writes++;
+        appendFileSync(live, "SYNTHETIC_FIXTURE_partial");
+        return writeSync(fd, payload, 0, payload.length);
+      });
+      const result = await mergeIncomingProfileTree(incoming, {
+        kind: "identity", cfg: codexConfig(home), identityName: "personal",
+      }, { home });
+      expect(writes).toBe(1);
+      expect(result.mergedJsonlFiles).toBe(0);
+      expect(result.preservedConflictPaths).toEqual([rel]);
+      expect(await Bun.file(deferredPath(home, rel)).text()).toBe(remote);
+    });
+  }
 
   test("stages a pull and appends divergent JSONL events without replacing the live prefix", async () => {
     const home = await makeDir("ais-tree-home-");

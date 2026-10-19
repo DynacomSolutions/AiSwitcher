@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendFileSync, closeSync, openSync } from "node:fs";
+import { appendFileSync, closeSync, openSync, writeSync } from "node:fs";
 import {
   deduplicateUsageData,
   mergeJsonlFiles,
@@ -11,6 +11,7 @@ import {
   setJsonlBeforeCreateHook,
   setJsonlAfterCreateHook,
   setJsonlBeforeWriteHook,
+  setJsonlWriter,
 } from "../../src/sync/dedupe.ts";
 
 const tempDirs: string[] = [];
@@ -20,6 +21,7 @@ afterEach(async () => {
   setJsonlBeforeCreateHook();
   setJsonlAfterCreateHook();
   setJsonlBeforeWriteHook();
+  setJsonlWriter();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -62,6 +64,41 @@ describe("mergeJsonlLineSets", () => {
 });
 
 describe("mergeJsonlFiles races", () => {
+  for (const existing of [false, true]) {
+    test(`defers a partial native write after the final ${existing ? "append snapshot" : "create size check"}`, async () => {
+      const home = await makeHome();
+      const source = join(home, "source.jsonl");
+      const destination = join(home, "destination.jsonl");
+      const prefix = existing ? "SYNTHETIC_FIXTURE_local\n" : "";
+      const incoming = "SYNTHETIC_FIXTURE_imported_é\n";
+      await writeFile(source, incoming);
+      if (existing) await writeFile(destination, prefix);
+      let writes = 0;
+      setJsonlWriter((fd, payload) => {
+        writes++;
+        appendFileSync(destination, "SYNTHETIC_FIXTURE_partial");
+        return writeSync(fd, payload, 0, payload.length);
+      });
+
+      expect(await mergeJsonlFiles([source], destination, false)).toBe("deferred");
+      expect(writes).toBe(1);
+      expect(await Bun.file(destination).text()).toBe(`${prefix}SYNTHETIC_FIXTURE_partial${incoming}`);
+      expect(await Bun.file(source).text()).toBe(incoming);
+    });
+
+    test(`accepts the exact byte size after ${existing ? "appending" : "creating"} a multibyte record`, async () => {
+      const home = await makeHome();
+      const source = join(home, "source.jsonl");
+      const destination = join(home, "destination.jsonl");
+      const prefix = existing ? "SYNTHETIC_FIXTURE_local_é\n" : "";
+      const incoming = "SYNTHETIC_FIXTURE_imported_é\n";
+      await writeFile(source, incoming);
+      if (existing) await writeFile(destination, prefix);
+      expect(await mergeJsonlFiles([source], destination, false)).toBe("merged");
+      expect(await Bun.file(destination).text()).toBe(`${prefix}${incoming}`);
+    });
+  }
+
   test("defers when a writer opens after the final newline check", async () => {
     const home = await makeHome();
     const source = join(home, "source.jsonl");
