@@ -395,10 +395,13 @@ describeWithRsync("runBackup off-host push", () => {
 
 describeWithRsync("runBackup never uses Git LFS", () => {
   // Simulates a global `git lfs install` with a fake filter, so no git-lfs binary is needed.
-  const saved = process.env.GIT_CONFIG_GLOBAL;
+  // GIT_CONFIG_NOSYSTEM keeps a real system-level filter.lfs.process from overriding the fake clean filter.
+  const saved = { global: process.env.GIT_CONFIG_GLOBAL, nosystem: process.env.GIT_CONFIG_NOSYSTEM };
   afterEach(() => {
-    if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL;
-    else process.env.GIT_CONFIG_GLOBAL = saved;
+    if (saved.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = saved.global;
+    if (saved.nosystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+    else process.env.GIT_CONFIG_NOSYSTEM = saved.nosystem;
   });
 
   async function useFakeLfsGlobalConfig(home: string): Promise<void> {
@@ -408,6 +411,7 @@ describeWithRsync("runBackup never uses Git LFS", () => {
       "[filter \"lfs\"]\n\tclean = sed s/^/POINTER:/\n\tsmudge = cat\n\trequired = true\n",
     );
     process.env.GIT_CONFIG_GLOBAL = path;
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
   }
 
   const real = "real bytes\n";
