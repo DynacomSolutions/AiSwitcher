@@ -1,4 +1,4 @@
-//! Tab 7 (index 6): per-tool-call token & cost breakdown, bar style.
+//! Tab 8 (index 7): per-tool-call token & cost breakdown, bar style.
 //!
 //! The endpoint answers one result per (tool, identity) pair; `,` / `.`
 //! cycle the pair this view renders. Every number is an ESTIMATE off local

@@ -1,4 +1,4 @@
-//! Tab 6: per-identity auth health. Read-only in v1; fixes live in the web
+//! Tab 7: per-identity auth health. Read-only in v1; fixes live in the web
 //! UI and CLI.
 
 use ratatui::Frame;

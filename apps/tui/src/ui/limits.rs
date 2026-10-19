@@ -1,4 +1,4 @@
-//! Tab 3: per-identity quota windows as gauge bars. Polls slowly; `r` forces
+//! Tab 4: per-identity quota windows as gauge bars. Polls slowly; `r` forces
 //! a refresh through the endpoint's notify handle.
 
 use ratatui::Frame;

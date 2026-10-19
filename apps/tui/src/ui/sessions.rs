@@ -1,4 +1,4 @@
-//! Tab 5: resumable sessions for the console's default cwd, grouped per
+//! Tab 6: resumable sessions for the console's default cwd, grouped per
 //! tool and identity. Scrollable.
 
 use ratatui::Frame;

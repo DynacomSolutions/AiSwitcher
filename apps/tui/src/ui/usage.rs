@@ -1,4 +1,4 @@
-//! Tab 4: provider-first usage totals.
+//! Tab 5: provider-first usage totals.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Rect};
