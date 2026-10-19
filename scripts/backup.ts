@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { lstat, mkdir, rm } from "node:fs/promises";
+import { join, sep } from "node:path";
+import { access, constants, lstat, mkdir, readdir, realpath, rm } from "node:fs/promises";
 import { aisBackupsDir } from "../src/shared/ais-home.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../src/shared/reproducible-paths.ts";
 
@@ -65,11 +65,23 @@ interface GitResult {
 // work tree at the real home, so files are snapshotted in place and stored
 // exactly once (as git objects). Index paths stay `.claude/...` relative to
 // home, identical to the earlier plain-mirror layout, so history stays valid.
-async function runGit(repoDir: string, home: string, args: string[]): Promise<GitResult> {
+// Hooks, fsmonitor, a global/root excludes file and attributes (autocrlf,
+// filters) must never act on a snapshot of $HOME: they could run arbitrary
+// code from the user's global config or silently change what is stored.
+const SAFE_GIT_CONFIG = [
+  "core.hooksPath=/dev/null",
+  "core.fsmonitor=false",
+  "core.excludesFile=/dev/null",
+  "core.attributesFile=/dev/null",
+  "core.autocrlf=false",
+].flatMap((kv) => ["-c", kv]);
+
+async function runGit(repoDir: string, home: string, args: string[], input?: string): Promise<GitResult> {
   const git = Bun.which("git");
   if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
-  const proc = Bun.spawn([git, `--git-dir=${join(repoDir, ".git")}`, `--work-tree=${home}`, ...args], {
+  const proc = Bun.spawn([git, ...SAFE_GIT_CONFIG, `--git-dir=${join(repoDir, ".git")}`, `--work-tree=${home}`, ...args], {
     cwd: home,
+    stdin: input === undefined ? "ignore" : new TextEncoder().encode(input),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -87,7 +99,7 @@ async function ensureRepo(repoDir: string, home: string): Promise<void> {
     // Plain init (no --work-tree): the work tree is passed per command instead.
     const git = Bun.which("git");
     if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
-    const proc = Bun.spawn([git, "init", "--quiet", repoDir], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([git, "init", "--template=", "--quiet", repoDir], { stdout: "pipe", stderr: "pipe" });
     const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     if (exitCode !== 0) throw new Error(`backup: git init failed in ${repoDir}: ${stderr.trim()}`);
     // Local-only identity, scoped to this one repo — never touches the user's
@@ -101,6 +113,10 @@ async function ensureRepo(repoDir: string, home: string): Promise<void> {
     await runGit(repoDir, home, ["config", "commit.gpgsign", "false"]);
     console.error(`backup: initialised git repo at ${repoDir}`);
   }
+  // Bare in config so running plain git inside ~/.ais/backups does not see
+  // $HOME-relative index paths as ~500k deletions; every backup command passes
+  // --work-tree explicitly, which overrides this.
+  await runGit(repoDir, home, ["config", "core.bare", "true"]);
   // The work tree is all of home, so untracked noise in `git status` is
   // meaningless and slow to compute.
   await runGit(repoDir, home, ["config", "status.showUntrackedFiles", "no"]);
@@ -111,17 +127,67 @@ async function ensureRepo(repoDir: string, home: string): Promise<void> {
 }
 
 // One-off cleanup of the old plain rsync mirrors (<backups>/<name>). Only the
-// literal known group names are removed, and only once the git dir is valid,
-// so history is never at risk.
+// literal known group names are removed, only once history exists (HEAD
+// resolves), and never if the backups dir resolves to $HOME or into one of
+// the group dirs (a symlinked ~/.ais would otherwise delete live config).
 async function removeLegacyMirrors(repoDir: string, home: string): Promise<void> {
-  const valid = await runGit(repoDir, home, ["rev-parse", "--git-dir"]);
-  if (valid.exitCode !== 0) return;
-  for (const name of Object.values(BACKUP_GROUPS).flat()) {
+  const names = Object.values(BACKUP_GROUPS).flat();
+  const [realRepo, realHome] = await Promise.all([realpath(repoDir), realpath(home)]);
+  if (realRepo === realHome || names.some((n) => realRepo === join(realHome, n) || realRepo.startsWith(join(realHome, n) + sep))) {
+    console.error(`backup: ${repoDir} resolves to ${realRepo}, inside a backed-up location, not removing legacy mirrors`);
+    return;
+  }
+  const head = await runGit(repoDir, home, ["rev-parse", "--verify", "-q", "HEAD"]);
+  if (head.exitCode !== 0) return;
+  for (const name of names) {
     const legacy = join(repoDir, name);
     if (!(await pathExists(legacy))) continue;
     await rm(legacy, { recursive: true, force: true });
     console.error(`backup: removed legacy plain mirror ${legacy} (contents now live in git only)`);
   }
+}
+
+// git records a directory containing its own .git as a content-less gitlink
+// (or skips it when it has no commits). Walk each group for such nested
+// repos and return their non-.git files so they can be indexed directly.
+// Junk dirs and lock/sock/pid files are filtered here because
+// `update-index --add` bypasses the exclude file.
+const JUNK_DIRS = new Set(REPRODUCIBLE_JUNK_DIR_NAMES.map((n) => n.replace(/\/$/, "")).filter((n) => n !== ".git"));
+async function findNestedRepoFiles(home: string, name: string): Promise<{ repos: string[]; files: string[] }> {
+  const repos: string[] = [];
+  const files: string[] = [];
+  const walk = async (rel: string, inRepo: boolean): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(join(home, rel), { withFileTypes: true });
+    } catch {
+      console.error(`backup: cannot read directory ${join(home, rel)}, skipping`);
+      return;
+    }
+    if (entries.some((e) => e.name === ".git")) {
+      repos.push(rel);
+      inRepo = true;
+    }
+    for (const e of entries) {
+      if (e.name === ".git") continue;
+      const child = `${rel}/${e.name}`;
+      if (e.isDirectory()) {
+        if (!JUNK_DIRS.has(e.name)) await walk(child, inRepo);
+      } else if (inRepo && (e.isFile() || e.isSymbolicLink()) && !/\.(lock|sock|pid)$/.test(e.name)) {
+        if (e.isFile()) {
+          try {
+            await access(join(home, child), constants.R_OK);
+          } catch {
+            console.error(`backup: ${join(home, child)} is unreadable, skipping`);
+            continue;
+          }
+        }
+        files.push(child);
+      }
+    }
+  };
+  await walk(name, false);
+  return { repos, files };
 }
 
 /**
@@ -144,8 +210,11 @@ async function removeLegacyMirrors(repoDir: string, home: string): Promise<void>
  * install/update/migrate touch anything, so it carries the same small,
  * accepted risk of catching a database mid-write that every earlier design
  * had. `git add --ignore-errors` skips unreadable (permission-denied) or
- * vanished files with a warning instead of failing. Restore with
- * `git --git-dir=~/.ais/backups/.git show HEAD:<path>` or `checkout`.
+ * vanished files with a warning instead of failing. Restore by reading, not
+ * by running plain git in ~/.ais/backups: `git --git-dir=$HOME/.ais/backups/.git
+ * show HEAD:<path>`, or into a scratch dir with `git --git-dir=... 
+ * --work-tree=<tempdir> checkout HEAD -- <path>`. Always spell out
+ * `--work-tree`; never point it at the live $HOME unless you mean to overwrite.
  * Symlinks (post-migration compatibility shims) are skipped at the top level
  * — their target is already covered by the container directory. On the first
  * run after upgrading, leftover plain mirror directories from the old design
@@ -179,23 +248,51 @@ export async function runBackup(
     return repoDir;
   }
 
-  const add = await runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored]);
-  if (add.exitCode !== 0) {
-    // --ignore-errors stages everything it can read and still exits non-zero
-    // for the skipped files (permission-denied, vanished mid-scan).
-    console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${add.stderr.trim()}`);
+  // A group dir (or anything above it) matched by a .gitignore outside our
+  // control, e.g. `*` in ~/.gitignore, would make `git add` store nothing and
+  // still look successful. That file cannot be disabled by config, so fail loudly.
+  for (const name of mirrored) {
+    const ignored = await runGit(repoDir, home, ["check-ignore", "-v", "--no-index", "--", name]);
+    if (ignored.exitCode === 0) {
+      throw new Error(`backup: ${join(home, name)} is ignored by a gitignore rule, nothing would be backed up: ${ignored.stdout.trim()}`);
+    }
   }
 
-  // A source directory with nothing trackable (empty, or everything under
-  // it excluded) has nothing for git to know about — `git add -A` silently
-  // no-ops for it, but `git commit -- <pathspec>` is stricter
-  // and fails outright the moment ANY of its pathspecs matches nothing at
-  // all, in the index OR in history (confirmed live, 2026-07-31: an empty,
-  // root-owned ~/.claude-personal broke the whole backup this way). `git
-  // ls-files` reports the CURRENT INDEX content for a path regardless of
-  // whether it's newly staged or already committed unchanged, so filtering
-  // on it — rather than reusing `mirrored` directly — is what actually
-  // predicts whether `commit -- <path>` will accept that pathspec.
+  // Already-tracked files that now match BACKUP_EXCLUDES leave the index.
+  const excluded = await runGit(repoDir, home, ["ls-files", "-ci", `--exclude-from=${join(repoDir, ".git", "info", "exclude")}`, "-z", "--", ...mirrored]);
+  if (excluded.exitCode === 0 && excluded.stdout.length > 0) {
+    await runGit(repoDir, home, ["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"], excluded.stdout);
+  }
+
+  // Nested repos: swap content-less gitlinks for their real files.
+  const nestedFiles: string[] = [];
+  for (const name of mirrored) {
+    const nested = await findNestedRepoFiles(home, name);
+    if (nested.repos.length === 0) continue;
+    const links = await runGit(repoDir, home, ["ls-files", "-s", "-z", "--", name]);
+    const gitlinks = links.stdout.split("\0").filter((l) => l.startsWith("160000 ")).map((l) => l.slice(l.indexOf("\t") + 1));
+    if (gitlinks.length > 0) {
+      await runGit(repoDir, home, ["rm", "-q", "-f", "--cached", "--pathspec-from-file=-", "--pathspec-file-nul"], gitlinks.join("\0") + "\0");
+    }
+    nestedFiles.push(...nested.files);
+  }
+  if (nestedFiles.length > 0) {
+    const upd = await runGit(repoDir, home, ["update-index", "--add", "-z", "--stdin"], nestedFiles.join("\0") + "\0");
+    if (upd.exitCode !== 0) throw new Error(`backup: git update-index failed in ${repoDir}: ${upd.stderr.trim()}`);
+  }
+
+  // Exit 1 is --ignore-errors reporting files it skipped (permission-denied,
+  // vanished mid-scan); anything else (e.g. 128, a stale index.lock) is fatal.
+  const add = await runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored]);
+  if (add.exitCode === 1) {
+    console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${add.stderr.trim()}`);
+  } else if (add.exitCode !== 0) {
+    throw new Error(`backup: git add failed in ${repoDir}: ${add.stderr.trim() || `exit ${add.exitCode}`}`);
+  }
+
+  // A source directory with nothing trackable (empty, or everything under it
+  // excluded) has nothing for git to know about; filter on the CURRENT INDEX
+  // (`ls-files`) so the diff check below only sees groups git knows.
   const trackable: string[] = [];
   for (const name of mirrored) {
     const lsFiles = await runGit(repoDir, home, ["ls-files", "--", name]);
@@ -213,18 +310,14 @@ export async function runBackup(
     return repoDir;
   }
 
-  // Scoped to `trackable`, same as the add/diff above: a bare `git commit`
-  // commits the WHOLE index, which would silently sweep in stale staged
-  // content from an earlier, interrupted run that touched OTHER groups this
-  // run never re-mirrored. `git commit -- <pathspec>` instead commits only
-  // the matching changes and leaves the rest staged for a future run.
+  // Plain commit of the index as built by the scoped `git add` above. A
+  // pathspec commit would re-read the live $HOME: an unreadable tracked file
+  // would make it throw, and an unreadable tracked dir would commit deletions.
   const commit = await runGit(repoDir, home, [
     "commit",
     "--quiet",
     "-m",
     `backup: ${timestamp()} (${trackable.join(", ")})`,
-    "--",
-    ...trackable,
   ]);
   if (commit.exitCode !== 0) {
     throw new Error(`backup: git commit failed in ${repoDir}: ${commit.stderr.trim() || `exit ${commit.exitCode}`}`);

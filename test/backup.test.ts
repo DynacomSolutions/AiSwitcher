@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, symlink, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runBackup } from "../scripts/backup.ts";
@@ -26,6 +26,15 @@ async function gitShow(repoDir: string, path: string): Promise<string | null> {
   const stdout = await new Response(proc.stdout).text();
   return (await proc.exited) === 0 ? stdout : null;
 }
+
+async function gitOut(repoDir: string, args: string[]): Promise<string> {
+  const proc = Bun.spawn(["git", `--git-dir=${join(repoDir, ".git")}`, ...args], { stdout: "pipe", stderr: "pipe" });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return out;
+}
+const gitLs = async (repoDir: string): Promise<string[]> => (await gitOut(repoDir, ["ls-tree", "-r", "--name-only", "HEAD"])).split("\n").filter(Boolean);
+const gitStage = (repoDir: string): Promise<string> => gitOut(repoDir, ["ls-files", "-s"]);
 
 async function gitLog(repoDir: string): Promise<string[]> {
   const proc = Bun.spawn(["git", `--git-dir=${join(repoDir, ".git")}`, "log", "--format=%s"], { stdout: "pipe", stderr: "pipe" });
@@ -204,5 +213,119 @@ describe("runBackup integration", () => {
     expect(await Bun.file(join(repoDir, "keep-me.txt")).exists()).toBe(true);
     expect(await gitLog(repoDir)).toHaveLength(2);
     expect(await gitShow(repoDir, ".codex/identities.json")).toBe('{"v":2}\n');
+  });
+
+  test("an unreadable tracked file or dir does not break later backups or drop history", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "ok.txt"), "ok\n");
+    await write(join(home, ".codex", "secret.txt"), "s\n");
+    await write(join(home, ".codex", "sub", "deep.txt"), "d\n");
+    const repoDir = await runBackup(["codex"], home);
+    await write(join(home, ".codex", "ok.txt"), "changed\n");
+    await chmod(join(home, ".codex", "secret.txt"), 0o000);
+    await chmod(join(home, ".codex", "sub"), 0o000);
+    try {
+      await runBackup(["codex"], home);
+    } finally {
+      await chmod(join(home, ".codex", "sub"), 0o755);
+      await chmod(join(home, ".codex", "secret.txt"), 0o644);
+    }
+    expect(await gitLs(repoDir)).toEqual(expect.arrayContaining([".codex/secret.txt", ".codex/sub/deep.txt", ".codex/ok.txt"]));
+    expect(await gitShow(repoDir, ".codex/ok.txt")).toBe("changed\n");
+  });
+
+  test("a fatal git add error (stale index.lock) rejects", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    const repoDir = await runBackup(["codex"], home);
+    await write(join(repoDir, ".git", "index.lock"), "");
+    await write(join(home, ".codex", "a.txt"), "b\n");
+    await expect(runBackup(["codex"], home)).rejects.toThrow(/git add failed/);
+  });
+
+  test("nested git repos are stored as files, not gitlinks", async () => {
+    const home = await makeHome();
+    const nested = join(home, ".codex", "memories");
+    await write(join(nested, "m.md"), "memo\n");
+    await write(join(home, ".codex", "x.txt"), "x\n");
+    for (const args of [["init", "-q"], ["add", "."], ["-c", "user.name=a", "-c", "user.email=a@b", "commit", "-qm", "c"]]) {
+      expect(await Bun.spawn(["git", "-C", nested, ...args], { stdout: "ignore", stderr: "ignore" }).exited).toBe(0);
+    }
+    const repoDir = await runBackup(["codex"], home);
+    expect(await gitShow(repoDir, ".codex/memories/m.md")).toBe("memo\n");
+    expect(await gitStage(repoDir)).not.toContain("160000");
+    expect(await gitLs(repoDir)).not.toContain(".codex/memories/.git/HEAD");
+    // Group root itself being a repo works too.
+    const home2 = await makeHome();
+    await write(join(home2, ".pi", "a.txt"), "a\n");
+    await Bun.spawn(["git", "-C", join(home2, ".pi"), "init", "-q"]).exited;
+    const repo2 = await runBackup(["pi"], home2);
+    expect(await gitShow(repo2, ".pi/a.txt")).toBe("a\n");
+    expect(await gitStage(repo2)).not.toContain("160000");
+  });
+
+  test("git hooks from global config do not run", async () => {
+    const home = await makeHome();
+    const hooks = join(home, "hooks");
+    const marker = join(home, "marker");
+    await write(join(hooks, "pre-commit"), `#!/bin/sh\ntouch ${marker}\n`);
+    await chmod(join(hooks, "pre-commit"), 0o755);
+    await write(join(home, "gitconfig"), `[core]\n\thooksPath = ${hooks}\n`);
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    const prev = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = join(home, "gitconfig");
+    try {
+      await runBackup(["codex"], home);
+    } finally {
+      if (prev === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = prev;
+    }
+    expect(await Bun.file(marker).exists()).toBe(false);
+  });
+
+  test("a root .gitignore that ignores the group dir makes the backup fail loudly", async () => {
+    const home = await makeHome();
+    await write(join(home, ".gitignore"), "*\n");
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    await expect(runBackup(["codex"], home)).rejects.toThrow(/ignored by a gitignore rule/);
+  });
+
+  test("files that newly match the excludes leave the index", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    await write(join(home, ".codex", "x.lock"), "l\n");
+    const repoDir = await runBackup(["codex"], home);
+    // Force-track a now-excluded file, as an older version could have.
+    await Bun.spawn(["git", `--git-dir=${join(repoDir, ".git")}`, `--work-tree=${home}`, "add", "-f", ".codex/x.lock"]).exited;
+    await write(join(home, ".codex", "a.txt"), "b\n");
+    await runBackup(["codex"], home);
+    expect(await gitLs(repoDir)).not.toContain(".codex/x.lock");
+  });
+
+  test("core.bare is set so plain git in the backups dir does not show deletions", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    const repoDir = await runBackup(["codex"], home);
+    const out = await new Response(Bun.spawn(["git", `--git-dir=${join(repoDir, ".git")}`, "config", "core.bare"], { stdout: "pipe" }).stdout).text();
+    expect(out.trim()).toBe("true");
+  });
+
+  test("legacy mirrors are not removed when the backups dir resolves into a config dir or no history exists", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    // Backups dir symlinked into the live .codex: deleting <backups>/.codex would hit live data.
+    await mkdir(join(home, ".ais"), { recursive: true });
+    await mkdir(join(home, ".codex", "bk", ".codex"), { recursive: true });
+    await write(join(home, ".codex", "bk", ".codex", "precious"), "p\n");
+    await symlink(join(home, ".codex", "bk"), join(home, ".ais", "backups"));
+    expect(await realpath(join(home, ".ais", "backups"))).toBe(join(await realpath(home), ".codex", "bk"));
+    await runBackup(["codex"], home).catch(() => {});
+    expect(await Bun.file(join(home, ".codex", "bk", ".codex", "precious")).exists()).toBe(true);
+
+    // No history yet: leftovers stay.
+    const home2 = await makeHome();
+    await write(join(home2, ".ais", "backups", ".grok", "old"), "o\n");
+    await runBackup(["grok"], home2); // .grok missing in home2, so no commit
+    expect(await Bun.file(join(home2, ".ais", "backups", ".grok", "old")).exists()).toBe(true);
   });
 });
