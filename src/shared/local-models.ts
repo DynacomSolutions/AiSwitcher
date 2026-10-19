@@ -12,7 +12,7 @@
  * Start command: `<runner> -m <path> -cnv` (interactive conversation mode),
  * exec'd with `execReal` so the terminal belongs to the model.
  */
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -69,7 +69,7 @@ export function resolveLlamaRunner(deps: LocalModelsDeps = {}): string | undefin
   if (bin) {
     try {
       accessSync(bin, constants.X_OK);
-      return bin;
+      if (statSync(bin).isFile()) return bin;
     } catch {
       // not executable: fall back to PATH
     }

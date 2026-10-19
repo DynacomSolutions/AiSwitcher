@@ -60,6 +60,9 @@ test("runner: AIS_LLAMA_BIN wins when executable, else which('llama-cli'), else 
   expect(resolveLlamaRunner({ env: { AIS_LLAMA_BIN: plain }, which: () => "/usr/bin/llama-cli" })).toBe(
     "/usr/bin/llama-cli",
   );
+  expect(resolveLlamaRunner({ env: { AIS_LLAMA_BIN: tmp }, which: () => "/usr/bin/llama-cli" })).toBe(
+    "/usr/bin/llama-cli",
+  );
   expect(resolveLlamaRunner({ env: {}, which: () => "/usr/bin/llama-cli" })).toBe("/usr/bin/llama-cli");
   expect(resolveLlamaRunner({ env: {}, which: () => null })).toBeUndefined();
 });
