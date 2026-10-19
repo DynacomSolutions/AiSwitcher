@@ -68,11 +68,13 @@ jobs:
           bun test test/image
           shellcheck -x -P SCRIPTDIR image/build/*.sh image/archiso/profiledef.sh
 
-      - name: Free preinstalled toolchains
-        run: |
-          echo "df before:"; df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          echo "df after:"; df -h /
+      # Measured: the standard runner has far more than the build needs, so
+      # no preinstalled toolchains are removed. Kept as a record per run.
+      - name: Record free disk
+        run: df -h /
+
+      - name: Install xorriso for the El Torito check
+        run: sudo apt-get install -y --no-install-recommends xorriso
 
       - name: Start disk sampler
         run: |
