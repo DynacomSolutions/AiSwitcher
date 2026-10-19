@@ -2,7 +2,7 @@ import { boolFlag, parseArgs } from "./args.ts";
 import { bold } from "./colors.ts";
 import { runDoctorCommand } from "./doctor/dispatch.ts";
 import { CliUsageError } from "./errors.ts";
-import { helpRequest, helpText, validCommands } from "./help.ts";
+import { helpRequest, helpText } from "./help.ts";
 import { runIdentitiesCommand } from "./identities/dispatch.ts";
 import { runLimitsCommand } from "./limits/dispatch.ts";
 import { runResumeCommand } from "./resume/dispatch.ts";
@@ -144,7 +144,8 @@ export async function runCli(argv: string[]): Promise<void> {
         await runLocalCommand(rest, flags);
         break;
       default:
-        throw new CliUsageError(`Unknown command "${command}". Valid: ${validCommands()}`);
+        helpText([command]); // throws the one-line "did you mean" error for an unknown name
+        throw new CliUsageError(`Unknown command "${command}". Run "ais help" for the list.`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

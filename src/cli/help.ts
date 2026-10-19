@@ -84,6 +84,7 @@ export const HELP: Record<string, HelpNode> = {
       "allow|disallow": sub("ais swap <tool> allow|disallow <account>", "Edit the allowed accounts"),
       auto: sub("ais swap <tool> auto on|off [--threshold=95]", "Automatic swap near the limit"),
       pool: sub("ais swap <tool> pool create <name> --accounts=a,b [--config-dir=]", "Create a pool identity"),
+      hook: sub("ais swap claude hook on|off [--pool=]", "Optional StopFailure rate-limit hook (claude only)"),
       usage: sub("ais swap <tool> usage", "Per-member usage split (claude, codex)"),
     },
   },
@@ -144,10 +145,20 @@ function table(rows: Array<[string, string]>): string {
   return rows.map(([k, d]) => `  ${cyan(k.padEnd(width))}  ${dim(d)}`).join("\n");
 }
 
-/** Closest valid names first (prefix or substring), else all of them. */
+function distance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j++) row[j] = Math.min(prev[j]! + 1, row[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = row;
+  }
+  return prev[b.length]!;
+}
+
+/** The 3 closest names: prefix or substring matches rank first, then edit distance. */
 function nearest(word: string, candidates: string[]): string {
-  const hits = candidates.filter((c) => c.startsWith(word.slice(0, 2)) || c.includes(word) || word.includes(c));
-  return (hits.length ? hits : candidates).join(", ");
+  const score = (c: string): number => (c.startsWith(word) || c.includes(word) ? 0 : distance(word, c));
+  return [...candidates].sort((a, b) => score(a) - score(b)).slice(0, 3).join(", ");
 }
 
 /** Resolve a help path (group, then optional subcommand) or throw a one-line error. */
@@ -160,7 +171,7 @@ function resolve(path: string[]): { node: HelpNode; title: string } {
   if (subName === undefined) return { node, title: group };
   const leaf = node.subs && Object.hasOwn(node.subs, subName) ? node.subs[subName] : undefined;
   if (!leaf) {
-    throw new CliUsageError(`Unknown ${group} subcommand "${subName}". Valid: ${nearest(subName, Object.keys(node.subs ?? {}))}`);
+    throw new CliUsageError(`Unknown ${group} subcommand "${subName}". Did you mean: ${nearest(subName, Object.keys(node.subs ?? {}))}`);
   }
   return { node: leaf, title: `${group} ${subName}` };
 }
@@ -194,9 +205,9 @@ export function helpRequest(argv: string[]): string[] | undefined {
   const words = head.filter((a) => !a.startsWith("-"));
   if (argv.length === 0) return [];
   if (words[0] === "help") return words.slice(1);
+  // `ais usage --help` belongs to tokscale; only our own `breakdown` has ais help.
+  if (words[0] && Object.hasOwn(HELP, words[0]) && words[1] === "help") return [words[0]];
+  if (words[0] === "usage" && words[1] !== "breakdown") return undefined;
   if (head.includes("-h") || head.includes("--help")) return words;
-  if (words[0] && words[0] in HELP && words[1] === "help") return [words[0]];
   return undefined;
 }
-
-export const validCommands = (): string => Object.keys(HELP).join(", ");

@@ -56,6 +56,31 @@ describe("ais help levels", () => {
     expect(badSub).toContain("create");
   });
 
+  test("usage --help is left to tokscale, usage help is ours", async () => {
+    const usage = await import("../../src/cli/usage/dispatch.ts");
+    const seen: string[][] = [];
+    const spy = spyOn(usage, "runUsageCommand").mockImplementation(async (a: string[]) => void seen.push(a));
+    restorers.push(() => spy.mockRestore());
+    expect((await run("usage", "--help")).out).toBe("");
+    expect((await run("usage", "-h")).out).toBe("");
+    expect(seen).toEqual([["--help"], ["-h"]]);
+    expect((await run("usage", "help")).out).toBe(helpText(["usage"]));
+    expect((await run("help", "usage")).out).toBe(helpText(["usage"]));
+    expect((await run("usage", "breakdown", "--help")).out).toContain("ais usage breakdown");
+  });
+
+  test("swap help comes from the table", async () => {
+    expect((await run("swap", "help")).out).toBe(helpText(["swap"]));
+    expect((await run("claude-swap", "--help")).out).toContain("claude-swap");
+  });
+
+  test("unknown group lists only the nearest 3", async () => {
+    const msg = (await run("identitis", "help")).err;
+    expect(msg).toContain("identities");
+    expect(msg.split("Did you mean: ")[1]!.split(", ")).toHaveLength(3);
+    expect((await run("bogus")).err.split("Did you mean: ")[1]!.split(", ")).toHaveLength(3);
+  });
+
   test("no em dashes in help data", () => {
     expect(JSON.stringify(HELP)).not.toContain("—");
   });
