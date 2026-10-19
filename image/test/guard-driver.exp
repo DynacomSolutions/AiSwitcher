@@ -1,0 +1,40 @@
+#!/usr/bin/expect -f
+# Plays the user in the guard popups: serial markers say when a popup is up,
+# QMP keyboard events type the reply into tty1 (see guard.exp).
+set driverDir [file dirname [file normalize [info script]]]
+source [file join $driverDir guard.exp]
+if {$argc < 2} { puts stderr "usage: guard-driver.exp <timeout> <qemu> \[args\]"; exit 2 }
+set boot_timeout [lindex $argv 0]
+set command [lrange $argv 1 end]
+set qmp [file join $env(AIS_QEMU_RUN_DIR) guard.qmp]
+log_user 1
+spawn -noecho {*}$command -qmp "unix:$qmp,server=on,wait=off"
+set child [exp_pid]
+proc fail {reason} {
+    global child
+    puts stderr "guard-driver: $reason"
+    catch {exec kill -KILL -- $child}
+    catch {close}
+    catch {wait}
+    exit 1
+}
+if {[catch {guard_expect_run $spawn_id $qmp 600} err]} { fail $err }
+set timeout 900
+set probes {mdadm-create mdadm-stop luks-format luks-open luks-close}
+expect {
+    -re {AIS-GUARD-TEST: case=run status=ok} { exp_continue }
+    -re {AIS-GUARD-TEST: case=([a-z-]+) status=reply} {
+        set name $expect_out(1,string)
+        if {$name ni $probes} { fail "unexpected reply request $name" }
+        guard_qmp_key $qmp [dict get {mdadm-create vdb\ vdc mdadm-stop md0 luks-format vdb luks-open vdb luks-close vdb} $name]
+        exp_continue
+    }
+    -re {AIS-GUARD-TEST: case=[a-z-]+ status=(failed|missing-popup)} { fail "guard probe failed: $expect_out(0,string)" }
+    -re {AIS-GUARD-TEST: case=orchestrator status=done} { exp_continue }
+    -re {AIS-GUARD-TEST: case=orchestrator status=([a-z-]+)} { fail "orchestrator ended with $expect_out(1,string)" }
+    timeout { fail "timed out waiting for guard completion" }
+    eof {}
+}
+set result [wait]
+if {[lindex $result 2] != 0 || [lindex $result 3] != 0} { fail "QEMU exited with $result" }
+puts "guard-driver: guard scenarios complete"

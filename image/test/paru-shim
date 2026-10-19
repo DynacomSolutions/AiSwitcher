@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Test-only stand-in for `paru -G`: the upstream release links a libalpm the
+# image does not ship. It clones the package from the AurUrl of PARU_CONF.
+set -euo pipefail
+[[ ${1:-} == -G && $# == 2 ]] || { echo 'paru shim: only -G <package> is supported' >&2; exit 2; }
+conf=${PARU_CONF:?PARU_CONF is required}
+url=$(sed -n 's/^AurUrl[[:space:]]*=[[:space:]]*//p' "$conf")
+[[ -n $url ]] || { echo 'paru shim: AurUrl missing' >&2; exit 2; }
+exec /usr/bin/git clone -q -- "$url/$2.git" "$2"

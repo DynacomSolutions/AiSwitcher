@@ -1,0 +1,15 @@
+[Unit]
+Description=Stage AIS test media (explicit test boots only)
+DefaultDependencies=no
+Requires=mnt-aisx.mount
+After=local-fs.target mnt-aisx.mount
+Before=ais-live-inbox.service ais-live-models.service ais-live-test-fixtures.service ais-live-accounts.service
+ConditionKernelCommandLine=ais.test=1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ais-live/ais-live-test-media
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

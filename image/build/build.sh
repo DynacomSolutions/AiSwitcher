@@ -51,6 +51,9 @@ log archiso-installed
 rm -rf "$root/build"
 mkdir -p "$root/build/out"
 cp -a "$repo/image/archiso" "$root/build/profile"
+# AIS_STAGE_DIR holds the compiled ais tools and herdr (see stage-profile.sh).
+[ -n "${AIS_STAGE_DIR:-}" ] || { echo "build: AIS_STAGE_DIR is required" >&2; exit 1; }
+"$here/stage-profile.sh" "$root/build/profile" "$AIS_STAGE_DIR"
 in_root mkarchiso -v -w /build/work -o /build/out /build/profile
 log mkarchiso-done
 
@@ -59,7 +62,7 @@ iso=$(find "$root/build/out" -maxdepth 1 -name '*.iso' | head -n 1)
 [ -n "$iso" ] || { echo "build: mkarchiso produced no ISO" >&2; exit 1; }
 cp "$iso" "$out/archiso.iso"
 
-profile_hash=$(cd "$repo/image/archiso" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
+profile_hash=$(cd "$root/build/profile" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
 jq -n --arg baseId "${ARCH_ARCHIVE_DATE//\//-}+$profile_hash" \
   --rawfile pkgs "$root/build/work/iso/arch/pkglist.x86_64.txt" \
   '{ "base-id": $baseId, packages: ($pkgs | split("\n") | map(select(length > 0))) }' >"$out/build-info.json"

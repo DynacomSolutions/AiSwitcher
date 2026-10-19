@@ -83,8 +83,9 @@ jobs:
         run: |
           set -euo pipefail
           bun test test/image
-          shellcheck -x -P SCRIPTDIR image/build/*.sh image/test/*.sh \
-            image/archiso/profiledef.sh image/archiso/airootfs/usr/local/lib/ais-live/kernel-up
+          git ls-files image | while read -r f; do
+            if [ -f "$f" ] && [ ! -L "$f" ] && head -n 1 "$f" | grep -Eq '^#!.*(bash|/sh)'; then echo "$f"; fi
+          done | xargs shellcheck -x -P SCRIPTDIR image/archiso/airootfs/etc/profile.d/ais-live-boot.sh image/archiso/airootfs/etc/profile.d/ais-guard.sh
 
       # Measured: the standard runner has far more than the build needs, so
       # no preinstalled toolchains are removed. Kept as a record per run.
@@ -100,11 +101,28 @@ jobs:
           nohup image/build/sample-df.sh "$RUNNER_TEMP/df-samples.txt" 5 >/dev/null 2>&1 &
           echo $! > "$RUNNER_TEMP/sampler.pid"
 
+      # Same-commit ais tools and the pinned herdr go into the image.
+      - name: Stage the runtime (ais tools, herdr)
+        run: |
+          set -euo pipefail
+          bun run build
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          cp -r dist "$stage/dist"
+          # shellcheck source=image/pins.env
+          . image/pins.env
+          curl --fail --silent --show-error --location "$HERDR_URL" --output "$stage/herdr"
+          echo "$HERDR_SHA256  $stage/herdr" | sha256sum --check
+          echo "AIS_STAGE_DIR=$stage" >> "$GITHUB_ENV"
+
+      # CI images are test images: they carry the extra packages in
+      # image/test/packages.test that the scenarios need.
       - name: Build the ISO (bootstrap, archiso, mkarchiso)
         run: |
           set -euo pipefail
           start=$(date +%s)
-          sudo image/build/build.sh >"$RUNNER_TEMP/build.log" 2>&1 || { tail -n 200 "$RUNNER_TEMP/build.log"; exit 1; }
+          sudo env AIS_STAGE_DIR="$AIS_STAGE_DIR" AIS_IMAGE_TEST_PACKAGES=1 \
+            image/build/build.sh >"$RUNNER_TEMP/build.log" 2>&1 || { tail -n 200 "$RUNNER_TEMP/build.log"; exit 1; }
           tail -n 30 "$RUNNER_TEMP/build.log"
           echo "build_seconds=$(( $(date +%s) - start ))" | tee "$RUNNER_TEMP/build-time.txt"
 
@@ -230,9 +248,78 @@ jobs:
           retention-days: 3
           if-no-files-found: warn
 
+  # Task 4 boot flow and user split, Task 5 disk guard, Task 6 exchange.
+  # GitHub-hosted runners only; no schedule.
+  scenario:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: boot-flow-online-first-bios, scenario: boot-flow, arg: online-first, firmware: bios }
+          - { name: boot-flow-online-first-uefi, scenario: boot-flow, arg: online-first, firmware: uefi }
+          - { name: boot-flow-online-second, scenario: boot-flow, arg: online-second, firmware: bios }
+          - { name: boot-flow-online-retry, scenario: boot-flow, arg: online-retry, firmware: bios }
+          - { name: boot-flow-offline-model-yes, scenario: boot-flow, arg: offline-model-yes, firmware: bios }
+          - { name: boot-flow-offline-model-no, scenario: boot-flow, arg: offline-model-no, firmware: bios }
+          - { name: boot-flow-offline-model-timeout, scenario: boot-flow, arg: offline-model-timeout, firmware: bios }
+          - { name: boot-flow-offline-no-model, scenario: boot-flow, arg: offline-no-model, firmware: bios }
+          - { name: guard-bios, scenario: guard, arg: probe, firmware: bios }
+          - { name: guard-uefi, scenario: guard, arg: probe, firmware: uefi }
+          - { name: exchange-basic-bios, scenario: exchange, arg: basic, firmware: bios }
+          - { name: exchange-basic-uefi, scenario: exchange, arg: basic, firmware: uefi }
+          - { name: exchange-auth-bios, scenario: exchange, arg: auth, firmware: bios }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install scenario tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq expect mtools python3 qemu-system-x86 ovmf dosfstools
+
+      # The hosted runner exposes /dev/kvm but not to the runner user.
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ais-live-image
+          path: out
+
+      - name: Scenario ${{ matrix.name }}
+        env:
+          FIRMWARE: ${{ matrix.firmware }}
+          SCENARIO: ${{ matrix.scenario }}
+          SCENARIO_ARG: ${{ matrix.arg }}
+        run: |
+          set -euo pipefail
+          image/test/run-scenario.sh out/ais-live.img "$FIRMWARE" "$SCENARIO" "$SCENARIO_ARG"
+
+      - name: Upload serial logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scenario-${{ matrix.name }}
+          path: |
+            out/scenario-*/qemu-*/serial.log
+            out/scenario-*/qemu-*/qmp.log
+            out/scenario-*/http.log
+          retention-days: 3
+          if-no-files-found: warn
+
   # Always reports, so a required check never hangs on skipped jobs.
   gate:
-    needs: [changes, build, boot-test]
+    needs: [changes, build, boot-test, scenario]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -242,8 +329,10 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           BUILD: ${{ needs.build.result }}
           BOOT: ${{ needs.boot-test.result }}
+          SCENARIO: ${{ needs.scenario.result }}
         run: |
           set -euo pipefail
           [ "$CHANGES" = "success" ] || exit 1
           case "$BUILD" in success|skipped) ;; *) exit 1 ;; esac
           case "$BOOT" in success|skipped) ;; *) exit 1 ;; esac
+          case "$SCENARIO" in success|skipped) ;; *) exit 1 ;; esac

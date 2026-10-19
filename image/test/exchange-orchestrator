@@ -1,0 +1,58 @@
+#!/usr/bin/bash
+# Guest side of the exchange scenario (root test unit). Cases follow the
+# contract in exchange-contract.md; the host driver only watches the serial
+# markers. Outbox verification and the exFAT read-back run in the guest, which
+# has the same age and node versions as the services under test.
+set -uo pipefail
+exec >/dev/ttyS0 2>&1
+tests=/usr/local/lib/ais-live-test
+export AIS_EXCHANGE_TEST_PASSPHRASE=SYNTHETIC_FIXTURE_exchange_passphrase
+marker() { printf 'AIS-EXCHANGE-TEST: case=%s status=%s\n' "$1" "$2"; }
+finish() { marker orchestrator "$1"; /usr/bin/systemctl --no-block poweroff; exit 0; }
+
+read -r -a kernel_args </proc/cmdline
+group=basic
+for kernel_arg in "${kernel_args[@]}"; do
+  case "$kernel_arg" in ais.exchange=*) group=${kernel_arg#ais.exchange=} ;; esac
+done
+
+run_case() { "$tests/exchange-scenarios.sh" "$1" || finish "case-$1-failed"; }
+stage() { "$tests/exchange-host.sh" fixture "$1" /mnt/aisx >/dev/null || finish "fixture-$1-failed"; }
+highest_outbox() {
+  find /mnt/aisx/outbox -maxdepth 1 -name 'bundle-*.age' -printf '%f\n' | sort -t- -k2 -n | tail -n 1
+}
+
+case $group in
+  basic)
+    run_case boot
+    run_case replay
+    stage tamper
+    run_case tamper
+    stage crafted
+    run_case crafted
+    run_case symlink
+    run_case periodic
+    latest=$(highest_outbox)
+    if "$tests/exchange-host.sh" verify-outbox "/mnt/aisx/outbox/$latest" 1; then marker outbox pass; else marker outbox fail; finish outbox-failed; fi
+    run_case shutdown
+    # The service stop above leaves the partition mounted; read it back cold.
+    latest=$(highest_outbox)
+    if systemctl stop ais-live-inbox.timer ais-live-outbox.timer \
+      && umount /mnt/aisx \
+      && "$tests/exchange-host.sh" exfat-readback /dev/disk/by-label/AISX "$latest"; then
+      marker exfat-readback pass
+    else
+      marker exfat-readback fail
+      finish exfat-readback-failed
+    fi
+    ;;
+  auth)
+    run_case boot
+    stage auth
+    run_case auth-deferred
+    date -s "@$(cat /usr/local/lib/ais-live-test/now)" >/dev/null
+    run_case auth-plausible
+    ;;
+  *) finish unknown-group ;;
+esac
+finish "done"

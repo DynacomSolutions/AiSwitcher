@@ -1,0 +1,38 @@
+#!/usr/bin/expect -f
+# Waits for the exchange case markers in order, then for the guest poweroff.
+set driverDir [file dirname [file normalize [info script]]]
+source [file join $driverDir exchange.exp]
+if {$argc < 2} { puts stderr "usage: exchange-driver.exp <timeout> <qemu> \[args\]"; exit 2 }
+set command [lrange $argv 1 end]
+log_user 1
+spawn -noecho {*}$command
+set child [exp_pid]
+proc fail {reason} {
+    global child
+    puts stderr "exchange-driver: $reason"
+    catch {exec kill -KILL -- $child}
+    catch {close}
+    catch {wait}
+    exit 1
+}
+set ::ais_exchange::timeout_seconds 240
+set cases {boot replay tamper crafted symlink periodic shutdown}
+if {$env(AIS_EXCHANGE_GROUP) eq "auth"} { set cases {boot auth-deferred auth-plausible} }
+foreach name $cases {
+    if {[catch {ais_exchange::wait_case $spawn_id $name} err]} { fail $err }
+}
+if {$env(AIS_EXCHANGE_GROUP) ne "auth"} {
+    foreach name {outbox exfat-readback} {
+        if {[catch {ais_exchange::wait_case $spawn_id $name} err]} { fail $err }
+    }
+}
+set timeout 240
+expect {
+    -re {AIS-EXCHANGE-TEST: case=orchestrator status=done} { exp_continue }
+    -re {AIS-EXCHANGE-TEST: case=orchestrator status=([a-z0-9-]+)} { fail "orchestrator ended with $expect_out(1,string)" }
+    timeout { fail "guest did not power off" }
+    eof {}
+}
+set result [wait]
+if {[lindex $result 2] != 0 || [lindex $result 3] != 0} { fail "QEMU exited with $result" }
+puts "exchange-driver: exchange scenarios complete"
