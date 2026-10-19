@@ -83,9 +83,12 @@ async function convergeMtime(source: string, destination: string): Promise<void>
 }
 
 const OPEN_SNAPSHOT_TTL_MS = 5000;
+// A hung lsof is killed; the lookup then falls back to /proc or reports unknown (callers treat unknown as open).
+const LSOF_TIMEOUT_MS = 5000;
 // Per-file checks are cheapest for small merges; past this many lookups in one
-// pass a single snapshot of all open files wins (a lookup can cost ~1s on a busy host).
-const PER_FILE_LOOKUPS = 32;
+// pass a single snapshot of all open files wins (a lookup can cost ~1.4s on a busy host,
+// so 32 per-file lsof runs blew a 30s budget).
+const PER_FILE_LOOKUPS = 4;
 type OpenSnapshot = { at: number; ttl: number; paths: Set<string> | undefined };
 let openSnapshot: OpenSnapshot | undefined;
 export type OpenPathsScanner = () => Promise<Set<string> | undefined>;
@@ -129,7 +132,7 @@ async function procOpenPaths(): Promise<Set<string> | undefined> {
 async function lsofOpenPaths(): Promise<Set<string> | undefined> {
   const lsof = lsofBinary();
   if (!lsof) return undefined;
-  const proc = Bun.spawn([lsof, "-Fn"], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const proc = Bun.spawn([lsof, "-Fn"], { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 12 * LSOF_TIMEOUT_MS });
   const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
   // lsof exits non-zero on unreadable processes yet still lists the rest;
   // empty output (a live host always has open files) means it failed.
@@ -149,7 +152,7 @@ async function scanOpenPaths(): Promise<Set<string> | undefined> {
 async function hasOpenOwnerDirect(path: string): Promise<boolean | undefined> {
   const lsof = lsofBinary();
   if (lsof) {
-    const proc = Bun.spawn([lsof, "-t", path], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const proc = Bun.spawn([lsof, "-t", path], { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: LSOF_TIMEOUT_MS });
     const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     if (stdout.trim()) return true;
     if (exitCode === 0 || exitCode === 1) return false;
