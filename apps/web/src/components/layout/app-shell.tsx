@@ -1,6 +1,7 @@
 import {
   ArrowLeftRight,
   BarChart3,
+  Cpu,
   FolderOpen,
   Gauge,
   History,
@@ -21,6 +22,7 @@ import { cn } from "@/lib/utils";
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/identities", label: "Identities", icon: IdCard, end: false },
+  { to: "/local-models", label: "Local Models", icon: Cpu, end: false },
   { to: "/limits", label: "Limits", icon: Gauge, end: false },
   { to: "/usage", label: "Usage", icon: BarChart3, end: false },
   { to: "/breakdown", label: "Breakdown", icon: PieChart, end: false },
