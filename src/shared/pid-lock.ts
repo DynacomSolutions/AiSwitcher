@@ -76,11 +76,14 @@ export async function acquirePidLock(
       try {
         await writeFile(tmp, body, { mode: 0o600 });
         await link(tmp, claim);
-        won = true;
         try {
           if ((await readFile(path, "utf8")) === seen) await unlink(path);
+          won = true; // Removed, or already gone (ENOENT is caught below).
+        } catch (rmErr) {
+          // Any other failure (e.g. immutable file): release the claim and wait out the deadline.
+          won = (rmErr as NodeJS.ErrnoException).code === "ENOENT";
         } finally {
-          await unlink(claim);
+          await unlink(claim).catch(() => {});
         }
       } catch (claimErr) {
         if ((claimErr as NodeJS.ErrnoException).code === "EEXIST") {
