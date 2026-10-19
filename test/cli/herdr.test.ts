@@ -252,6 +252,17 @@ function harness(env: NodeJS.ProcessEnv = {}): Harness {
 }
 
 describe("runHerdrCommand", () => {
+  test("live mode uses raw herdr without starting the console", async () => {
+    const exitCode = process.exitCode ?? 0;
+    const h = harness({ AIS_LIVE: "1" });
+    await runHerdrCommand(["--remote=synthetic-target"], h.deps());
+    expect(h.raw).toEqual([["--remote", "synthetic-target"]]);
+    expect(h.tuiRuns).toEqual([]);
+    expect(h.consoleEnsured).toBe(0);
+    expect(h.logs).toEqual(["ais live: ais herdr overview disabled; using raw herdr"]);
+    expect(process.exitCode ?? 0).toBe(exitCode);
+  });
+
   test("--raw execs plain herdr with no wrapper (and honours --remote)", async () => {
     const h = harness();
     await runHerdrCommand(["--raw"], h.deps());

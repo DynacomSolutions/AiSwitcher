@@ -1,0 +1,17 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+counter=${AIS_TEST_VENDOR_COUNTER:-}
+mode=${AIS_TEST_VENDOR_MODE:-}
+[[ "$counter" == /home/agent/.ais/live/vendor-stub.calls ]] || exit 126
+[[ "$mode" == success || "$mode" == fail-first ]] || exit 126
+/usr/bin/install -d -m 0755 /home/agent/.ais/live
+calls=0
+[[ ! -f "$counter" ]] || calls=$(/usr/bin/cat "$counter")
+[[ "$calls" =~ ^[0-9]+$ ]] || exit 126
+calls=$((calls + 1))
+/usr/bin/printf '%s\n' "$calls" > "$counter"
+if [[ "$mode" == fail-first && "$calls" == 1 ]]; then
+  exit 1
+fi
+exit 0

@@ -31,6 +31,12 @@ test("offline result is re-probed after 5s", async () => {
   t = 5_001; await isOnline(deps);
   expect(calls).toBe(2);
 });
+test("fresh probes bypass a still-valid cached offline result", async () => {
+  let calls = 0;
+  await isOnline({ probe: async () => (calls++, false), cachePath });
+  expect(await isOnline({ probe: async () => (calls++, true), cachePath, refresh: true })).toBe(true);
+  expect(calls).toBe(2);
+});
 test("unwritable or corrupt cache never throws and still probes", async () => {
   await Bun.write(cachePath, "not json");
   expect(await isOnline({ probe: async () => true, cachePath })).toBe(true);

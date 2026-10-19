@@ -55,6 +55,19 @@ describe("findDomains", () => {
   test("does not flag macOS .app bundle paths", () => {
     expect(findDomains("/Applications/Codex.app/Contents/Resources")).toEqual([]);
   });
+
+  test("does not exempt mixed-case domains in URLs, email-shaped strings, comments or Markdown", () => {
+    for (const text of [
+      'const url = "https://Customer.COM";',
+      'const address = "ops@Customer.service.DEV";',
+      "// https://Customer.COM and ops@Customer.service.DEV",
+      "See https://Customer.COM and ops@Customer.service.DEV",
+    ]) {
+      const path = text.startsWith("See ") ? "README.md" : "src/sample.ts";
+      expect(checkLine(path, text)).toContain("blocked-domain");
+      if (text.includes("ops@")) expect(checkLine(path, text)).toContain("blocked-email");
+    }
+  });
 });
 
 describe("scannableSegments code-awareness", () => {
@@ -67,14 +80,14 @@ describe("scannableSegments code-awareness", () => {
   test("still catches a real domain inside a string literal", () => {
     const state = { inBlock: false };
     const segments = scannableSegments("src/example.ts", 'const url = "https://internal.example-corp.dev/api";', state);
-    const found = segments.flatMap(findDomains);
+    const found = segments.flatMap(segment => findDomains(segment));
     expect(found).toContain("internal.example-corp.dev");
   });
 
   test("still catches a real domain inside a comment", () => {
     const state = { inBlock: false };
     const segments = scannableSegments("src/example.ts", "// see internal.example-corp.dev for the dashboard", state);
-    const found = segments.flatMap(findDomains);
+    const found = segments.flatMap(segment => findDomains(segment));
     expect(found).toContain("internal.example-corp.dev");
   });
 
@@ -84,13 +97,30 @@ describe("scannableSegments code-awareness", () => {
     expect(state.inBlock).toBe(true);
     const second = scannableSegments("src/example.ts", " internal.example-corp.dev */ const x = 1;", state);
     expect(state.inBlock).toBe(false);
-    expect([...first, ...second].flatMap(findDomains)).toContain("internal.example-corp.dev");
+    expect([...first, ...second].flatMap(segment => findDomains(segment))).toContain("internal.example-corp.dev");
+  });
+
+  test("lexes repeated comments and quoted comment delimiters by segment kind", () => {
+    const state = { inBlock: false };
+    const parts = scannableSegments("src/example.ts", '/* first */ /* "polkit.Result.NO" */ const value = "/* // https://internal.example-corp.dev */";', state);
+    expect(parts.flatMap(segment => findDomains(segment))).toContain("polkit.Result.NO");
+    expect(checkLine("src/example.ts", '/* first */ /* "polkit.Result.NO" */')).toContain("blocked-domain");
+    expect(checkLine("src/example.ts", 'const value = "/* // https://internal.example-corp.dev */";')).toContain("blocked-domain");
+  });
+
+  test("keeps multiline template strings and scans JavaScript strings and comments", () => {
+    const state = { inBlock: false };
+    expect(checkLine("src/example.js", 'const url = "https://Customer.COM";')).toContain("blocked-domain");
+    expect(checkLine("src/example.js", "// https://Customer.COM")).toContain("blocked-domain");
+    expect(checkLine("src/example.ts", "const url = `", state)).toEqual([]);
+    expect(checkLine("src/example.ts", "https://Customer.COM", state)).toContain("blocked-domain");
+    expect(checkLine("src/example.ts", "`;", state)).toEqual([]);
   });
 
   test("plain text/config files are scanned in full", () => {
     const state = { inBlock: false };
     const segments = scannableSegments("k8s/deployment.yaml", "hostname: internal.example-corp.dev", state);
-    expect(segments.flatMap(findDomains)).toContain("internal.example-corp.dev");
+    expect(segments.flatMap(segment => findDomains(segment))).toContain("internal.example-corp.dev");
   });
 });
 
@@ -117,6 +147,26 @@ describe("findIps", () => {
   });
 });
 
+describe("code identifier chains", () => {
+  test("a constant access chain is not a domain, real domains still are", () => {
+    expect(findDomains("polkit.Result.NO")).toEqual(["polkit.Result.NO"]);
+    expect(findDomains('expect(x).toContain("polkit.Result.NO")')).toEqual(["polkit.Result.NO"]);
+    expect(findDomains("reach corp.internal-example.NO or console.internal-example.dev")).toEqual(["corp.internal-example.NO", "console.internal-example.dev"]);
+    expect(findDomains("INTERNAL-EXAMPLE.DEV")).toEqual(["INTERNAL-EXAMPLE.DEV"]);
+    for (const prefix of ["@", "scheme://", "https:", "mailto:"]) {
+      expect(findDomains(`${prefix}polkit.Result.NO`, true)).toEqual(["polkit.Result.NO"]);
+    }
+  });
+
+  test("only a complete systemd template token is exempt", () => {
+    expect(findEmails("getty@tty1.service serial-getty@.service container@web.socket")).toEqual([]);
+    expect(findEmails("getty@tty1.service.d")).toEqual(["getty@tty1.service.d"]);
+    expect(findEmails("getty@tty1.service ops@Customer.service.DEV")).toEqual(["ops@Customer.service.DEV"]);
+    expect(findEmails("+ops@tty1.service")).toEqual(["ops@tty1.service"]);
+    expect(findEmails("prefix:ops@tty1.service")).toEqual(["ops@tty1.service"]);
+  });
+});
+
 describe("findEmails", () => {
   test("allows example/invalid addresses", () => {
     expect(findEmails("contact fixture@example.invalid or one@example.com")).toEqual([]);
@@ -124,6 +174,13 @@ describe("findEmails", () => {
 
   test("blocks a real-looking address", () => {
     expect(findEmails("contact ops@internal-example-corp.dev")).toEqual(["ops@internal-example-corp.dev"]);
+  });
+
+  test("ignores systemd template unit names but still blocks real addresses beside them", () => {
+    expect(findEmails("getty@tty1.service serial-getty@.service container@web.socket")).toEqual([]);
+    expect(findEmails("getty@tty1.service ops@internal-example-corp.dev")).toEqual(["ops@internal-example-corp.dev"]);
+    expect(findEmails("ops@service.dev")).toEqual(["ops@service.dev"]);
+    expect(findEmails("getty@tty1.service ops@Customer.service.DEV")).toEqual(["ops@Customer.service.DEV"]);
   });
 });
 
@@ -168,6 +225,17 @@ describe("checkLine integration", () => {
     const rules = checkLine("README.md", "ops@internal-example-corp.dev is reachable at 203.0.114.9");
     expect(rules).toContain("blocked-email");
     expect(rules).toContain("blocked-ip");
+  });
+
+  test("code-chain exception applies only to tagged strings, including Python strings", () => {
+    expect(checkLine("src/example.ts", 'const result = "polkit.Result.NO";')).toEqual([]);
+    expect(checkLine("src/example.ts", '/* "polkit.Result.NO" */')).toContain("blocked-domain");
+    const state = { inBlock: false };
+    expect(checkLine("src/example.ts", "/* comment begins", state)).toEqual([]);
+    expect(checkLine("src/example.ts", '"polkit.Result.NO"', state)).toContain("blocked-domain");
+    expect(checkLine("example.py", 'result = "polkit.Result.NO"')).toEqual([]);
+    expect(checkLine("example.py", "# polkit.Result.NO")).toContain("blocked-domain");
+    expect(checkLine("src/example.ts", 'const url = "https://polkit.Result.NO";')).toContain("blocked-domain");
   });
 });
 

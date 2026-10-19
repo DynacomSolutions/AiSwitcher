@@ -1,0 +1,131 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+fail() { echo "AIS-LIVE-TEST: live-checks=fail reason=$1" >&2; exit 1; }
+tty_path=$(/usr/bin/tty 2>/dev/null || true)
+[[ "$tty_path" == /dev/ttyS* ]] || exit 0
+[[ "$(/usr/bin/id -un)" == live ]] || fail wrong-user
+live_groups=$(/usr/bin/id -nG live)
+agent_groups=$(/usr/bin/id -nG agent)
+/usr/bin/getent group proc >/dev/null || fail proc-group
+[[ " $live_groups " == *' proc '* && " $agent_groups " != *' proc '* ]] || fail first-boot-proc-membership
+if ! /usr/bin/systemctl is-active --quiet systemd-logind || ! /usr/bin/systemctl is-active --quiet polkit; then
+  fail systemd-dependency-order
+fi
+
+live_uid=$(/usr/bin/id -u live)
+runtime_dir="/run/user/$live_uid"
+[[ -d "$runtime_dir" && ! -L "$runtime_dir" ]] || fail runtime-directory
+[[ "$(/usr/bin/stat -c '%u:%a' "$runtime_dir")" == "$live_uid:700" ]] || fail runtime-directory-mode
+/usr/bin/python3 - "$live_uid" <<'PY' || fail herdr-socket
+import os, socket, stat, sys
+uid = int(sys.argv[1])
+herdr_inodes = set()
+for entry in os.scandir('/proc'):
+    if not entry.name.isdecimal():
+        continue
+    try:
+        if os.stat(entry.path).st_uid != uid:
+            continue
+        args = open(os.path.join(entry.path, 'cmdline'), 'rb').read().replace(b'\0', b' ').decode(errors='replace')
+        if 'herdr' not in args:
+            continue
+        for fd in os.scandir(os.path.join(entry.path, 'fd')):
+            target = os.readlink(fd.path)
+            if target.startswith('socket:['):
+                herdr_inodes.add(target[8:-1])
+    except OSError:
+        continue
+if not herdr_inodes:
+    raise SystemExit(1)
+for line in open('/proc/net/unix', encoding='utf-8'):
+    fields = line.rstrip().split(maxsplit=7)
+    if len(fields) != 8 or fields[6] not in herdr_inodes or not fields[7].startswith('/'):
+        continue
+    path = fields[7]
+    if not path.startswith(f'/run/user/{uid}/'):
+        continue
+    try:
+        info = os.stat(path)
+    except OSError:
+        continue
+    if stat.S_ISSOCK(info.st_mode) and info.st_uid == uid and stat.S_IMODE(info.st_mode) == 0o600:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+
+# `ais herdr` is expected as live; only the local console server is forbidden.
+if ! /usr/bin/python3 - "$live_uid" <<'PY'
+import os, sys
+uid = int(sys.argv[1])
+for entry in os.scandir('/proc'):
+    if not entry.name.isdecimal():
+        continue
+    try:
+        if os.stat(entry.path).st_uid != uid:
+            continue
+        args = open(os.path.join(entry.path, 'cmdline'), 'rb').read().replace(b'\0', b' ').decode(errors='replace')
+    except OSError:
+        continue
+    if 'ais web' in args or 'ais --serve-internal' in args:
+        raise SystemExit(1)
+PY
+then fail console-process-as-live; fi
+
+herdr=/usr/local/bin/herdr
+snapshot=$($herdr api snapshot 2>/dev/null) || fail herdr-snapshot
+old_ids=$(/usr/bin/python3 -c '
+import json,sys
+root=json.load(sys.stdin); found=set()
+def visit(x):
+    if isinstance(x,dict):
+        v=x.get("pane_id")
+        if isinstance(v,str) and v: found.add(v)
+        for y in x.values(): visit(y)
+    elif isinstance(x,list):
+        for y in x: visit(y)
+visit(root); print("\n".join(sorted(found)))
+' <<<"$snapshot") || fail herdr-snapshot-json
+[[ -n "$old_ids" ]] || fail no-herdr-panes
+$herdr pane split --current --direction right --ratio 0.5 --no-focus >/dev/null 2>&1 || fail default-pane-split
+
+agent_pane=false
+for _ in {1..40}; do
+    snapshot=$($herdr api snapshot 2>/dev/null) || { /usr/bin/sleep 0.25; continue; }
+    new_ids=$(/usr/bin/python3 -c '
+import json,sys
+old=set(sys.argv[1].splitlines()); root=json.load(sys.stdin); found=set()
+def visit(x):
+    if isinstance(x,dict):
+        v=x.get("pane_id")
+        if isinstance(v,str) and v: found.add(v)
+        for y in x.values(): visit(y)
+    elif isinstance(x,list):
+        for y in x: visit(y)
+visit(root); print("\n".join(sorted(found-old)))
+' "$old_ids" <<<"$snapshot") || fail herdr-snapshot-json
+    while IFS= read -r pane_id; do
+        [[ -n "$pane_id" ]] || continue
+        process_info=$($herdr pane process-info --pane "$pane_id" 2>/dev/null) || continue
+        shell_pid=$(/usr/bin/python3 -c '
+import json,sys
+root=json.load(sys.stdin)
+def visit(x):
+    if isinstance(x,dict):
+        v=x.get("shell_pid")
+        if isinstance(v,int) and v>0: print(v); raise SystemExit(0)
+        for y in x.values(): visit(y)
+    elif isinstance(x,list):
+        for y in x: visit(y)
+visit(root); raise SystemExit(1)
+' <<<"$process_info") || continue
+        pane_user=$(/usr/bin/ps -o user= -p "$shell_pid" | /usr/bin/tr -d '[:space:]') || continue
+        if [[ "$pane_user" == agent ]]; then agent_pane=true; break; fi
+    done <<<"$new_ids"
+    [[ "$agent_pane" == true ]] && break
+    /usr/bin/sleep 0.25
+done
+[[ "$agent_pane" == true ]] || fail new-default-pane-not-agent
+
+/usr/local/lib/ais-live/ais-agent-pane test-assertions
+printf 'AIS-LIVE-TEST: live-checks=ok\n'

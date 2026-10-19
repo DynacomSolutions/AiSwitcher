@@ -1,0 +1,4 @@
+#!/usr/bin/bash
+set -euo pipefail
+printf 'AIS-LIVE-TEST: local-model=started\n'
+printf 'synthetic llama fixture arguments=%s\n' "$*"

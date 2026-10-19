@@ -1,0 +1,47 @@
+#!/bin/bash -p
+set -euo pipefail
+
+if (($# != 1)) || [[ "$1" != --mount ]]; then
+  echo 'usage: ais-live-models --mount' >&2
+  exit 2
+fi
+if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+  echo 'model mount requires root' >&2
+  exit 126
+fi
+
+source_dir=/mnt/aisx/models
+staging_dir=/opt/ais/.model-validation-root/models
+target_dir=/opt/ais/models
+fail() { echo 'AIS-LIVE: stage=local-models status=fail' >&2; exit 1; }
+[[ -r "$source_dir/manifest.json" ]] || exit 0
+cleanup_failed() {
+  local status=$?
+  if ((status != 0)); then
+    /usr/bin/umount "$target_dir" 2>/dev/null || true
+    /usr/bin/rm -rf -- "$staging_dir"
+  fi
+}
+trap cleanup_failed EXIT
+
+/usr/bin/install -d -o root -g root -m 0755 /opt/ais "$target_dir"
+# The exchange partition remains root-only. Publish a verified copy into the
+# root-controlled image tree so the agent can read, but never modify, weights.
+/usr/bin/install -d -o root -g root -m 0700 /opt/ais/.model-validation-root
+/usr/bin/python3 -B - "$source_dir" "$staging_dir" <<'PY' || fail
+import importlib.util
+import sys
+module_path = "/usr/local/lib/ais-live/ais_live_model_validate.py"
+spec = importlib.util.spec_from_file_location("ais_live_model_validate", module_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.stage_verified(sys.argv[1], sys.argv[2], "/opt/ais/.model-validation-root", 0, 0, 0, 0)
+PY
+if /usr/bin/find "$target_dir" -mindepth 1 -maxdepth 1 -print -quit | /usr/bin/grep -q .; then fail; fi
+/usr/bin/mount --bind "$staging_dir" "$target_dir" || fail
+if ! /usr/bin/mount -o remount,bind,ro,nosuid,nodev,noexec "$target_dir"; then
+  /usr/bin/umount "$target_dir" || true
+  fail
+fi
+trap - EXIT
+echo 'AIS-LIVE: stage=local-models status=ok'

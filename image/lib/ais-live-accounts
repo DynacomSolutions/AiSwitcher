@@ -1,0 +1,84 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+  echo 'ais-live-accounts must run as root' >&2
+  exit 126
+fi
+
+/usr/bin/getent group proc >/dev/null || /usr/bin/groupadd --system proc
+/usr/bin/id live >/dev/null 2>&1 || /usr/bin/useradd --create-home --home-dir /home/live --shell /bin/bash live
+/usr/bin/id agent >/dev/null 2>&1 || /usr/bin/useradd --no-create-home --home-dir /home/agent --shell /bin/bash agent
+/usr/bin/usermod --lock root
+/usr/bin/usermod --lock live
+/usr/bin/usermod --lock agent
+/usr/bin/usermod --groups proc live
+/usr/bin/usermod --groups '' agent
+
+read -r -a kernel_args </proc/cmdline
+clean_mode=false
+for kernel_arg in "${kernel_args[@]}"; do
+  [[ "$kernel_arg" == ais.mode=clean ]] && clean_mode=true
+done
+if [[ "$clean_mode" == true && ! -e /home/agent ]]; then
+  /usr/bin/install -d -o agent -g agent -m 0700 /home/agent
+fi
+if [[ -e /home/agent ]]; then
+  [[ -d /home/agent && ! -L /home/agent ]] || {
+    echo 'agent home is not a real directory' >&2
+    exit 1
+  }
+fi
+/usr/bin/install -d -o live -g live -m 0700 /home/live
+
+# The guard confirmation plugin ships root-owned in the live herdr config.
+# Link and enable it as live, which only needs writable herdr state, not a
+# running server. The plugin files themselves stay root-owned.
+plugin=/home/live/.config/herdr/plugins/ais-guard
+if [[ -d "$plugin" ]]; then
+  live_uid=$(/usr/bin/id -u live)
+  for state_dir in /home/live/.config /home/live/.config/herdr /home/live/.local /home/live/.local/state; do
+    /usr/bin/install -d -o live -g live -m 0700 "$state_dir"
+  done
+  herdr_as_live() {
+    /usr/bin/runuser -u live -- /usr/bin/env -i HOME=/home/live PATH=/usr/local/bin:/usr/bin \
+      HERDR_SOCKET_PATH="/run/user/$live_uid/herdr.sock" /usr/local/bin/herdr "$@"
+  }
+  if ! herdr_as_live plugin list 2>/dev/null | /usr/bin/grep -q ais-guard; then
+    herdr_as_live plugin link "$plugin" --enabled >/dev/null
+  fi
+  herdr_as_live plugin list | /usr/bin/grep -q ais-guard || { echo 'guard plugin is not linked' >&2; exit 1; }
+fi
+
+live_groups=$(/usr/bin/id -nG live)
+agent_groups=$(/usr/bin/id -nG agent)
+[[ " $live_groups " == *' proc '* && " $live_groups " != *' wheel '* && " $live_groups " != *' disk '* ]] || {
+  echo 'live supplementary groups violate image policy' >&2
+  exit 1
+}
+[[ " $agent_groups " != *' proc '* && " $agent_groups " != *' disk '* && " $agent_groups " != *' wheel '* ]] || {
+  echo 'agent supplementary groups violate image policy' >&2
+  exit 1
+}
+
+# Disallow empty-password login paths, including any package defaults.
+for pam_file in /etc/pam.d/*; do
+  [[ -f "$pam_file" ]] || continue
+  /usr/bin/sed -i 's/\<nullok\>//g' "$pam_file"
+done
+
+if ! /usr/bin/grep -Eq '^auth[[:space:]]+(required|requisite)[[:space:]]+pam_wheel\.so\b' /etc/pam.d/su; then
+  /usr/bin/grep -Eq '^auth[[:space:]]+sufficient[[:space:]]+pam_rootok\.so([[:space:]]|$)' /etc/pam.d/su || {
+    echo 'cannot safely add required pam_wheel rule to su' >&2
+    exit 1
+  }
+  /usr/bin/sed -i '/^auth[[:space:]]\+sufficient[[:space:]]\+pam_rootok\.so/a auth\trequired\tpam_wheel.so use_uid' /etc/pam.d/su
+fi
+/usr/bin/grep -Eq '^auth[[:space:]]+(required|requisite)[[:space:]]+pam_wheel\.so\b' /etc/pam.d/su || {
+  echo 'required pam_wheel rule missing after account setup' >&2
+  exit 1
+}
+
+/usr/bin/install -d -m 0755 /etc/sudoers.d
+/usr/bin/install -m 0440 /usr/local/lib/ais-live/sudoers-ais-live /etc/sudoers.d/ais-live
+/usr/bin/visudo -cf /etc/sudoers

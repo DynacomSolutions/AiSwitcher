@@ -1,0 +1,1 @@
+live ALL=(agent) NOPASSWD: /usr/local/lib/ais-live/agent-exec

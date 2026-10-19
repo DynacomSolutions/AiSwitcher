@@ -102,6 +102,15 @@ export const HELP: Record<string, HelpNode> = {
       recover: sub("ais sync recover [--dry-run]", "Restore histories kept by older conflict archives"),
     },
   },
+  live: {
+    usage: "ais live <net-check|apply-inbox --stdin|write-outbox>",
+    desc: "Live image diagnostics, inbox and outbox",
+    subs: {
+      "net-check": sub("ais live net-check [--json] [--fresh]", "Check internet and local model readiness"),
+      "apply-inbox": sub("ais live apply-inbox --stdin", "Apply a verified inbox tar from standard input"),
+      "write-outbox": sub("ais live write-outbox", "Write a portable outbox tar to standard output"),
+    },
+  },
   statusline: { usage: "ais statusline [--wrap <command>]", desc: "Claude Code statusLine: run <command>, then print cached usage bars" },
   memory: {
     usage: "ais memory [show|path|init|edit|add] [--stdin]",

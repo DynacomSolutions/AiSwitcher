@@ -3,6 +3,7 @@ import { yellow } from "./colors.ts";
 import { CliUsageError } from "./errors.ts";
 import { resolveHerdrBinary } from "../shared/herdr-bin.ts";
 import { ensureAistuiBinary, resolveTuiBinary } from "../shared/aistui-bin.ts";
+import { isAisLive } from "../shared/live-mode.ts";
 
 /**
  * `ais herdr`: the native wrapper around the third-party herdr client.
@@ -368,7 +369,8 @@ export async function runHerdrCommand(
   const { positionals: rest, flags } = parseArgs(foldValuedFlags(subArgv, HERDR_VALUED_FLAGS));
   const inv = parseHerdrArgs(rest, flags);
 
-  if (inv.raw) {
+  if (inv.raw || isAisLive(deps.env)) {
+    if (!inv.raw && isAisLive(deps.env)) deps.log("ais live: ais herdr overview disabled; using raw herdr");
     const herdr = requireBinary(
       deps.herdrPath(),
       "herdr",

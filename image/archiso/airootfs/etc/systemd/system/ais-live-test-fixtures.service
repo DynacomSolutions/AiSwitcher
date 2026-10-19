@@ -1,0 +1,13 @@
+[Unit]
+Description=Stage AIS live test fixtures only for explicit test boots
+DefaultDependencies=no
+After=local-fs.target
+Before=getty@tty1.service serial-getty@.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ais-live/ais-live-test-fixtures
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+#!/bin/bash -p
+set -euo pipefail
+
+operation=${1:-pane}
+if (($# > 1)); then echo 'agent-exec accepts one fixed operation' >&2; exit 126; fi
+case "$operation" in
+  probe|probe-fresh|upgrade|local-start|launch|pane|test-assertions) ;;
+  *) echo 'agent-exec refused an unknown operation' >&2; exit 126 ;;
+esac
+
+exec /usr/bin/env -i \
+  HOME=/home/agent USER=agent LOGNAME=agent SHELL=/bin/bash \
+  TERM=xterm-256color \
+  PATH=/usr/local/guard/bin:/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
+  AIS_LIVE=1 \
+  /usr/local/lib/ais-live/agent-exec-clean "$operation"
