@@ -250,7 +250,10 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
   const includeDatabases = options.includeDatabases ?? true;
   const home = homedir();
   const config = await loadSyncConfig();
-  const result: SyncRunResult = { remotes: config.remotes, pulled: [], pushed: [], skipped: false };
+  const result: SyncRunResult = {
+    remotes: config.remotes, pulled: [], pushed: [], skipped: false,
+    preservedConflicts: 0, preservedConflictPaths: [],
+  };
   if (config.remotes.length === 0) return result;
 
   const release = await acquireSyncLock(options.waitForLock ?? false);
@@ -290,7 +293,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           });
           if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
 
-          await mergeIncomingProfileTree(incomingDir, scope, {
+          const merged = await mergeIncomingProfileTree(incomingDir, scope, {
             home,
             conflictRoot: join(
               aisRemoteCacheDir(home),
@@ -298,6 +301,11 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
               `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
             ),
           });
+          result.preservedConflicts += merged.preservedConflicts;
+          result.preservedConflictPaths = [...new Set([...result.preservedConflictPaths, ...merged.preservedConflictPaths])];
+          if (merged.preservedConflicts > 0 && !options.quiet) {
+            console.warn(`AIS sync preserved ${merged.preservedConflicts} conflict(s), including deferred imports: ${merged.preservedConflictPaths.join(", ")}. Run ais sync recover to retry retained histories.`);
+          }
           for (const cfg of scope.kind === "all" ? SYNC_TOOL_CONFIGS : [scope.cfg]) {
             await makeRegistryPortable(cfg, home);
           }
