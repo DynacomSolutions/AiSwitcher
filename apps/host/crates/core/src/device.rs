@@ -25,8 +25,8 @@ pub struct DeviceSummary {
 
 /// Observations must come from native ancestry inspection, never webview input.
 /// A connection identity is required even where the hardware has no serial.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeviceObservation {
     pub os_identity: String,
     pub connection_identity: String,

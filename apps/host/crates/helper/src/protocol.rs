@@ -611,24 +611,10 @@ pub mod linux_transport {
         Ok(())
     }
 
-    /// Start only the fixed installed helper through pkexec. The caller owns
-    /// the private runtime socket and must bind its request to the challenge.
-    /// Missing root-owned package trust intentionally prevents invocation.
-    pub fn launch_pkexec(
-        channel_path: &Path,
-        invoking_uid: u32,
-    ) -> Result<std::process::Child, ProtocolError> {
-        let directory = channel_path.parent().ok_or(ProtocolError::UntrustedPeer)?;
-        validate_runtime_directory(directory, invoking_uid)?;
-        let metadata =
-            fs::symlink_metadata(channel_path).map_err(|_| ProtocolError::UntrustedPeer)?;
+    /// The installed package must be root-owned: client pin, polkit policy,
+    /// pkexec and the fixed helper path. Absence is a hard refusal.
+    pub fn verify_installation() -> Result<(), ProtocolError> {
         use std::os::unix::fs::MetadataExt;
-        if !metadata.file_type().is_socket()
-            || metadata.uid() != invoking_uid
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(ProtocolError::UntrustedPeer);
-        }
         pinned_client_digest()?;
         let policy_path = "/usr/share/polkit-1/actions/org.ais.host-helper.policy";
         let policy_metadata =
@@ -653,6 +639,225 @@ pub mod linux_transport {
                 return Err(ProtocolError::PackageTrustUnavailable);
             }
         }
+        Ok(())
+    }
+
+    /// True only when the whole root-owned installation verifies.
+    pub fn helper_installed() -> bool {
+        verify_installation().is_ok()
+    }
+
+    /// Ask the installed helper (through pkexec) for a read-only observation of
+    /// one disk, including its partition-table fingerprint. Output is bounded
+    /// and strictly parsed; the caller still revalidates the observation.
+    pub fn preview_observation(
+        identity: &str,
+    ) -> Result<ais_host_core::device::DeviceObservation, ProtocolError> {
+        verify_installation()?;
+        let mut child = Command::new(PKEXEC_PATH)
+            .arg("--disable-internal-agent")
+            .arg(HELPER_PATH)
+            .arg("--preview")
+            .arg(identity)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ProtocolError::PackageTrustUnavailable)?;
+        let mut output = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .ok_or(ProtocolError::Transport)?
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut output);
+        let status = child.wait().map_err(|_| ProtocolError::Transport)?;
+        if read.is_err() || !status.success() || output.len() > 16 * 1024 {
+            return Err(ProtocolError::Transport);
+        }
+        let observation: ais_host_core::device::DeviceObservation =
+            serde_json::from_slice(&output).map_err(|_| ProtocolError::Request)?;
+        observation.validate().map_err(|_| ProtocolError::Request)?;
+        Ok(observation)
+    }
+
+    /// Attach exactly three retained source files to a one-byte marker.
+    pub fn send_source_descriptors(
+        stream: &UnixStream,
+        files: [&File; 3],
+    ) -> Result<(), ProtocolError> {
+        unsafe extern "C" {
+            fn sendmsg(socket: i32, message: *const MessageHeader, flags: i32) -> isize;
+        }
+        let mut marker = [1u8];
+        let mut iov = Iovec {
+            base: marker.as_mut_ptr(),
+            length: 1,
+        };
+        let header_length = std::mem::size_of::<ControlHeader>();
+        let descriptor_length = SOURCE_DESCRIPTOR_COUNT * std::mem::size_of::<i32>();
+        let alignment = std::mem::size_of::<usize>();
+        let control_length = (header_length + descriptor_length + alignment - 1) & !(alignment - 1);
+        let mut control = vec![0usize; control_length / alignment];
+        let header = ControlHeader {
+            length: header_length + descriptor_length,
+            level: 1, // SOL_SOCKET
+            kind: 1,  // SCM_RIGHTS
+        };
+        // SAFETY: the control buffer is aligned and large enough for one header
+        // and three descriptors; fields are written within its bounds.
+        unsafe {
+            let base = control.as_mut_ptr().cast::<u8>();
+            std::ptr::write_unaligned(base.cast::<ControlHeader>(), header);
+            for (index, file) in files.iter().enumerate() {
+                std::ptr::write_unaligned(
+                    base.add(header_length + index * std::mem::size_of::<i32>())
+                        .cast::<i32>(),
+                    file.as_raw_fd(),
+                );
+            }
+        }
+        let message = MessageHeader {
+            name: std::ptr::null_mut(),
+            name_length: 0,
+            iov: &mut iov,
+            iov_length: 1,
+            control: control.as_mut_ptr().cast(),
+            control_length,
+            flags: 0,
+        };
+        // SAFETY: message and referenced storage are live for the call.
+        let sent = unsafe { sendmsg(stream.as_raw_fd(), &message, 0) };
+        if sent == 1 {
+            Ok(())
+        } else {
+            Err(ProtocolError::Transport)
+        }
+    }
+
+    /// Serve one helper connection: send the retained sources, read the
+    /// session challenge, bind and send the request, then half-close.
+    pub fn serve_request(
+        stream: &mut UnixStream,
+        files: [&File; 3],
+        mut request: Request,
+    ) -> Result<(), ProtocolError> {
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+            .map_err(|_| ProtocolError::Transport)?;
+        send_source_descriptors(stream, files)?;
+        let mut challenge = [0u8; 32];
+        stream
+            .read_exact(&mut challenge)
+            .map_err(|_| ProtocolError::Transport)?;
+        request.channel_binding = binding_for_client(&challenge, &request);
+        let body = serde_json::to_vec(&request).map_err(|_| ProtocolError::Request)?;
+        if body.is_empty() || body.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::Frame);
+        }
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        stream
+            .write_all(&frame)
+            .and_then(|_| stream.shutdown(std::net::Shutdown::Write))
+            .map_err(|_| ProtocolError::Transport)
+    }
+
+    /// Full privileged session: private socket, pkexec launch, one request.
+    pub fn run_session(
+        invoking_uid: u32,
+        files: [&File; 3],
+        request: Request,
+    ) -> Result<(), ProtocolError> {
+        use std::os::unix::{fs::DirBuilderExt, net::UnixListener};
+        let directory = Path::new("/run/user")
+            .join(invoking_uid.to_string())
+            .join("ais-host-helper");
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(ProtocolError::UntrustedPeer),
+        }
+        validate_runtime_directory(&directory, invoking_uid)?;
+        let mut name = [0u8; 8];
+        File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut name))
+            .map_err(|_| ProtocolError::Transport)?;
+        let socket = directory.join(format!("{}.sock", hex(&name)));
+        let listener = UnixListener::bind(&socket).map_err(|_| ProtocolError::Transport)?;
+        let _cleanup = RemoveOnDrop(socket.clone());
+        fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|_| ProtocolError::Transport)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| ProtocolError::Transport)?;
+        let mut child = launch_pkexec(&socket, invoking_uid)?;
+        // The user may be typing a password, so wait generously for the connect.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if child
+                        .try_wait()
+                        .map_err(|_| ProtocolError::Transport)?
+                        .is_some()
+                        || Instant::now() >= deadline
+                    {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(ProtocolError::Transport);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ProtocolError::Transport);
+                }
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .map_err(|_| ProtocolError::Transport)?;
+        let served = serve_request(&mut stream, files, request);
+        let status = child.wait().map_err(|_| ProtocolError::Transport)?;
+        served?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(ProtocolError::Transport)
+        }
+    }
+
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// Start only the fixed installed helper through pkexec. The caller owns
+    /// the private runtime socket and must bind its request to the challenge.
+    /// Missing root-owned package trust intentionally prevents invocation.
+    pub fn launch_pkexec(
+        channel_path: &Path,
+        invoking_uid: u32,
+    ) -> Result<std::process::Child, ProtocolError> {
+        let directory = channel_path.parent().ok_or(ProtocolError::UntrustedPeer)?;
+        validate_runtime_directory(directory, invoking_uid)?;
+        let metadata =
+            fs::symlink_metadata(channel_path).map_err(|_| ProtocolError::UntrustedPeer)?;
+        use std::os::unix::fs::MetadataExt;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != invoking_uid
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        verify_installation()?;
         Command::new(PKEXEC_PATH)
             .arg("--disable-internal-agent")
             .arg(HELPER_PATH)
@@ -711,6 +916,56 @@ pub mod linux_transport {
             assert_ne!(
                 operation_binding(&challenge, &first),
                 operation_binding(&[8u8; 32], &first)
+            );
+        }
+
+        #[test]
+        fn source_descriptors_round_trip_through_the_server_envelope() {
+            use std::os::unix::net::UnixStream;
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            let dir = std::env::temp_dir();
+            let make = |name: &str, bytes: &[u8]| {
+                let path = dir.join(format!("ais-fd-{}-{name}", std::process::id()));
+                fs::write(&path, bytes).unwrap();
+                let file = File::open(&path).unwrap();
+                fs::remove_file(&path).unwrap();
+                file
+            };
+            let files = [make("a", b"one"), make("b", b"22"), make("c", b"333")];
+            send_source_descriptors(&sender, [&files[0], &files[1], &files[2]]).unwrap();
+            let received = receive_source_descriptors(&receiver).unwrap();
+            let sizes: Vec<u64> = received
+                .iter()
+                .map(|f| f.metadata().unwrap().len())
+                .collect();
+            assert_eq!(sizes, [3, 2, 3]);
+        }
+
+        #[test]
+        fn served_request_is_bound_to_the_challenge_and_decodes() {
+            use std::os::unix::net::UnixStream;
+            let (mut server, mut peer) = UnixStream::pair().unwrap();
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("ais-fd-{}-req", std::process::id()));
+            fs::write(&path, b"x").unwrap();
+            let file = File::open(&path).unwrap();
+            fs::remove_file(&path).unwrap();
+            let challenge = [7u8; 32];
+            let helper = std::thread::spawn(move || {
+                let files = receive_source_descriptors(&peer).unwrap();
+                peer.write_all(&challenge).unwrap();
+                let frame =
+                    read_one_request(&mut peer, Instant::now() + Duration::from_secs(2)).unwrap();
+                (files.len(), decode_frame(&frame).unwrap())
+            });
+            serve_request(&mut server, [&file, &file, &file], sample_request()).unwrap();
+            let (count, request) = helper.join().unwrap();
+            assert_eq!(count, 3);
+            let mut expected = sample_request();
+            expected.channel_binding = String::new();
+            assert_eq!(
+                request.channel_binding,
+                binding_for_client(&challenge, &expected)
             );
         }
 

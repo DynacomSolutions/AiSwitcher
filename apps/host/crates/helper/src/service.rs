@@ -38,6 +38,22 @@ pub fn run_linux(socket: std::path::PathBuf, invoking_uid: u32) -> Result<(), &'
     execute_linux(channel, request, sources)
 }
 
+/// Read-only privileged preview: report the disk, including its partition-table
+/// fingerprint, as one JSON line. The app builds its reviewable plan from this
+/// and the helper re-reads and must match the plan digest before any write.
+#[cfg(target_os = "linux")]
+pub fn preview_linux(identity: &str) -> Result<(), &'static str> {
+    use std::io::Write;
+    let observed = crate::platform::collect_linux_by_identity(identity)
+        .map_err(|_| "The native target could not be observed.")?;
+    let mut line = serde_json::to_vec(&observed.observation)
+        .map_err(|_| "The observation could not be encoded.")?;
+    line.push(b'\n');
+    std::io::stdout()
+        .write_all(&line)
+        .map_err(|_| "The observation could not be reported.")
+}
+
 #[cfg(target_os = "linux")]
 fn execute_linux(
     channel: crate::protocol::AuthenticatedChannel,

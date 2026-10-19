@@ -679,6 +679,31 @@ pub fn parse_snapshot(input: &str) -> Result<LinuxDiskSnapshot, ObservationError
     Ok(snapshot)
 }
 
+/// Re-observe an approved disk without opening the device. The privileged
+/// table fingerprint cannot be re-read here, so it is carried over from the
+/// approval; the helper re-reads it and must match the plan digest.
+pub fn observe_unprivileged(
+    approved: &DeviceObservation,
+) -> Result<DeviceObservation, ObservationError> {
+    let major_minor = approved
+        .os_identity
+        .strip_prefix("linux:")
+        .filter(|value| valid_major_minor(value))
+        .ok_or(ObservationError::Ineligible)?;
+    let sysfs = fs::canonicalize(Path::new("/sys/dev/block").join(major_minor))
+        .map_err(|_| ObservationError::Changed)?;
+    if sysfs.join("partition").exists() {
+        return Err(ObservationError::Ineligible);
+    }
+    let name = sysfs
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(ObservationError::InvalidInput)?;
+    let mut snapshot = collect_sysfs_snapshot(name)?;
+    snapshot.table_fingerprint = approved.table_fingerprint;
+    observe(&snapshot).map(|entry| entry.observation)
+}
+
 /// A sysfs-visible whole disk worth considering. Virtual, optical and RAM
 /// devices never carry a removable USB ancestry, so they are skipped early.
 fn is_candidate_disk_name(name: &str) -> bool {
@@ -702,7 +727,7 @@ pub fn list_eligible() -> Vec<(LinuxDiskObservation, Option<String>)> {
             if !is_candidate_disk_name(&name) {
                 return None;
             }
-            let snapshot = collect_snapshot(&name).ok()?;
+            let snapshot = collect_sysfs_snapshot(&name).ok()?;
             let observed = observe(&snapshot).ok()?;
             let eligible = observed.observation.external_usb
                 && !observed.observation.system_backing

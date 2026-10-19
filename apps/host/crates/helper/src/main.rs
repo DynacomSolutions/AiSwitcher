@@ -7,8 +7,13 @@ fn main() {
     }
 }
 
+enum Command {
+    Serve(PathBuf),
+    Preview(String),
+}
+
 fn run() -> Result<(), &'static str> {
-    let socket = parse_args(std::env::args_os().skip(1))?;
+    let command = parse_args(std::env::args_os().skip(1))?;
     #[cfg(target_os = "linux")]
     {
         let invoking_uid = std::env::var("PKEXEC_UID")
@@ -19,54 +24,84 @@ fn run() -> Result<(), &'static str> {
             fn geteuid() -> u32;
         }
         // SAFETY: geteuid has no arguments and returns the effective uid.
-        if unsafe { geteuid() } != 0 || !socket.is_absolute() || socket.as_os_str().len() > 160 {
+        if unsafe { geteuid() } != 0 {
             return Err("The privileged helper invocation is invalid.");
         }
-        ais_host_helper::service::run_linux(socket, invoking_uid)
+        match command {
+            Command::Serve(socket) => {
+                if !socket.is_absolute() || socket.as_os_str().len() > 160 {
+                    return Err("The privileged helper invocation is invalid.");
+                }
+                ais_host_helper::service::run_linux(socket, invoking_uid)
+            }
+            Command::Preview(identity) => ais_host_helper::service::preview_linux(&identity),
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = socket;
+        let _ = command;
         Err("This operating system has no enabled authenticated helper service.")
     }
 }
 
-fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<PathBuf, &'static str> {
+fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Command, &'static str> {
     let mut args = args.into_iter();
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--serve")) {
-        return Err("This helper accepts only its fixed native service operation.");
-    }
-    let socket = PathBuf::from(
-        args.next()
-            .ok_or("The private helper channel is missing.")?,
-    );
+    let mode = args.next();
+    let value = args
+        .next()
+        .ok_or("The helper operation argument is missing.")?;
     if args.next().is_some() {
         return Err("Unexpected helper arguments.");
     }
-    if !socket.is_absolute() || socket.as_os_str().len() > 160 {
-        return Err("The private helper socket path is invalid.");
+    match mode.as_deref().and_then(|mode| mode.to_str()) {
+        Some("--serve") => {
+            let socket = PathBuf::from(value);
+            if !socket.is_absolute() || socket.as_os_str().len() > 160 {
+                return Err("The private helper socket path is invalid.");
+            }
+            Ok(Command::Serve(socket))
+        }
+        Some("--preview") => {
+            let identity = value
+                .into_string()
+                .map_err(|_| "The device identity is invalid.")?;
+            if identity.len() > 32 || !identity.starts_with("linux:") {
+                return Err("The device identity is invalid.");
+            }
+            Ok(Command::Preview(identity))
+        }
+        _ => Err("This helper accepts only its fixed native service operations."),
     }
-    Ok(socket)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{Command, parse_args};
     use std::ffi::OsString;
 
     #[test]
-    fn accepts_only_fixed_absolute_service_arguments() {
-        assert!(
+    fn accepts_only_fixed_service_arguments() {
+        assert!(matches!(
             parse_args([
                 OsString::from("--serve"),
                 OsString::from("/run/user/1000/ais-host-helper/request.sock")
-            ])
-            .is_ok()
-        );
+            ]),
+            Ok(Command::Serve(_))
+        ));
+        assert!(matches!(
+            parse_args([OsString::from("--preview"), OsString::from("linux:8:16")]),
+            Ok(Command::Preview(_))
+        ));
         for args in [
             vec![OsString::from("createLayout")],
             vec![OsString::from("--serve")],
             vec![OsString::from("--serve"), OsString::from("relative.sock")],
+            vec![OsString::from("--preview"), OsString::from("/dev/sda")],
+            vec![
+                OsString::from("--preview"),
+                OsString::from("linux:8:16"),
+                OsString::from("--exec"),
+            ],
             vec![
                 OsString::from("--serve"),
                 OsString::from("/run/user/1000/socket"),
