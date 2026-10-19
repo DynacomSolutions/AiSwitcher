@@ -1026,7 +1026,7 @@ The claude shim does one bounded (4s) pre-launch check for a pool (reason
 `launch`). `ais claude-swap hook on` installs a `StopFailure` hook
 (matcher `rate_limit`) in the pool's `settings.json` that runs
 `ais claude-swap next --if-limited --assume-limited --reason=auto --config-dir="$CLAUDE_CONFIG_DIR"`,
-so a hard 429 swaps at once (needs `ais` on PATH). The hook names no pool: it finds
+so a hard 429 swaps at once (needs `ais` on PATH). Inside herdr it also types a continue prompt into the pane after about 90 s if the session has not resumed itself. The hook names no pool: it finds
 the pool by the session's config directory, so renaming a pool or using several
 pools is safe. `--pool=` on `hook on` only picks which pool's `settings.json` to
 write. To upgrade an older hook that embeds `--pool=<name>`, re-run

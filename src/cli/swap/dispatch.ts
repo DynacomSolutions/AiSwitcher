@@ -6,6 +6,9 @@ import { eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
 import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps } from "../../identities/pool/ops.ts";
 import { adapterFor } from "../../identities/pool/registry.ts";
 import { performPoolSwap } from "../../identities/pool/swap.ts";
+import { parseHookInput, runContinuation, type ContinueRequest } from "../../identities/claude-swap-continue.ts";
+import { resolveInstalledAisBinary } from "../../sync/background.ts";
+import { resolveHerdrBinary } from "../../shared/herdr-bin.ts";
 import { installSwapHook, removeSwapHook } from "../../identities/claude-swap-hook.ts";
 import { ensureClaudeTranscriptRetention } from "../../identities/claude-settings.ts";
 import { expandPath, isValidIdentityKey, translateHostPath } from "../../identities/match.ts";
@@ -29,6 +32,12 @@ import { poolMemberUsageSplit } from "../claude-swap/attribution.ts";
 
 export interface SwapDeps extends PoolOpsDeps<any> {
   log?: (line: string) => void;
+  /** Hook stdin (Claude Code's hook input JSON); default: stdin unless it is a TTY, capped at 500 ms. */
+  readHookStdin?: () => Promise<string>;
+  /** Starts the detached delayed continuation; default: a background `ais claude-swap continue`. */
+  spawnContinuation?: (req: ContinueRequest) => void;
+  /** Environment for HERDR_PANE_ID; default process.env. */
+  env?: Record<string, string | undefined>;
 }
 
 const usageText = (cmd: string, tool: string): string => `Usage:
@@ -105,6 +114,33 @@ function renderWindowStatus(poolName: string, auto: boolean, threshold: number, 
   return lines;
 }
 
+async function defaultReadHookStdin(): Promise<string> {
+  if (process.stdin.isTTY) return "";
+  return Promise.race([Bun.stdin.text(), new Promise<string>((r) => setTimeout(() => r(""), 500))]);
+}
+
+function defaultSpawnContinuation(req: ContinueRequest): void {
+  // detached: own session, so it survives the hook's process group being signalled. execPath is the compiled ais when none is installed.
+  const child = Bun.spawn([resolveInstalledAisBinary() ?? process.execPath, "claude-swap", "continue", `--pane=${req.paneId}`, `--transcript=${req.transcriptPath}`, `--session=${req.sessionId}`, `--failure-at-ms=${req.failureAtMs}`], {
+    stdin: "ignore", stdout: "ignore", stderr: "ignore", detached: true,
+  });
+  child.unref();
+}
+
+/** After a hook-driven swap, arranges a delayed "continue" for sessions whose mod cannot do it. Never throws. */
+async function scheduleHookContinuation(deps: SwapDeps, failureAtMs: number): Promise<void> {
+  try {
+    const env = deps.env ?? process.env;
+    const paneId = env.HERDR_PANE_ID?.trim();
+    if (!paneId || !resolveHerdrBinary(env)) return;
+    const input = parseHookInput(await (deps.readHookStdin ?? defaultReadHookStdin)());
+    if (!input.transcriptPath || !input.sessionId) return;
+    (deps.spawnContinuation ?? defaultSpawnContinuation)({ paneId, transcriptPath: input.transcriptPath, sessionId: input.sessionId, failureAtMs });
+  } catch (error) {
+    console.error(`claude-swap: continuation fallback skipped (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
 async function mutatePool(
   config: ToolConfig,
   deps: SwapDeps,
@@ -135,7 +171,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
   const json = boolFlag(flags, "json");
   const opsDeps = { ...deps };
   const registryPath = deps.registryPath ?? config.identitiesJsonPath;
-  const known = new Set(["status", "to", "next", "pool", "allow", "disallow", "auto", "usage", "hook", "help"]);
+  const known = new Set(["status", "to", "next", "pool", "allow", "disallow", "auto", "usage", "hook", "continue", "help"]);
   const first = positionals[0];
   const sub = first === undefined ? "status" : known.has(first) ? first : "status";
   const rest = first !== undefined && known.has(first) ? positionals.slice(1) : positionals;
@@ -185,12 +221,15 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
       case "next": {
         const reason = reasonFlag(flags, boolFlag(flags, "if-limited") ? "auto" : "manual");
         if (boolFlag(flags, "if-limited")) {
+          const startedAtMs = Date.now();
           const outcome = await swapIfLimited(adapter, opsDeps, scopedPool, reason, {
             assumeLimited: boolFlag(flags, "assume-limited"),
             trustLimitEvidence: boolFlag(flags, "trust-limit-evidence"),
             ...(expectedActive ? { expectedActive } : {}),
             ...(failureAtMs !== undefined ? { failureAtMs } : {}),
           });
+          const handled = outcome.action === "swapped" || (outcome.action === "skipped" && /already handled/.test(outcome.why));
+          if (tool === "claude" && reason === "auto" && handled) await scheduleHookContinuation(deps, failureAtMs ?? startedAtMs);
           if (json) return log(JSON.stringify(outcome, null, 2));
           log(outcome.action === "swapped" ? `${green("✔")} ${describeSwap(outcome.result)}` : dim(`${tool}-swap: ${outcome.action}${"why" in outcome ? ` (${outcome.why})` : ""}`));
           return outcome.action === "swapped" ? runningWarning(outcome.result) : undefined;
@@ -200,6 +239,20 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         if (json) return log(JSON.stringify(r, null, 2));
         log(`${green("✔")} ${describeSwap(r)}`);
         return runningWarning(r);
+      }
+
+      case "continue": {
+        // Hidden: started detached by the StopFailure hook; waits, then types the continuation prompt into the herdr pane.
+        const paneId = stringFlag(flags, "pane");
+        const transcriptPath = stringFlag(flags, "transcript");
+        const sessionId = stringFlag(flags, "session");
+        if (tool !== "claude" || !paneId || !transcriptPath || !sessionId || failureAtMs === undefined) throw new CliUsageError("continue is internal: --pane, --transcript, --session and --failure-at-ms are required");
+        const bin = resolveHerdrBinary();
+        if (!bin) return;
+        const result = await runContinuation({ paneId, transcriptPath, sessionId, failureAtMs }, {
+          herdr: async (args) => (await Bun.spawn([bin, ...args], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }).exited),
+        });
+        return log(dim(`claude-swap: continuation ${result}`));
       }
 
       case "allow":

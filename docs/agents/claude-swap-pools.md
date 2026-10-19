@@ -124,7 +124,13 @@ Claude-only; the installed command is `next --if-limited --assume-limited
 --reason=auto --config-dir="$CLAUDE_CONFIG_DIR"` (no pool name, so renames and
 multiple pools work; `--config-dir` resolves to the unique pool with that
 configDir, an empty value is an error). `hook on --pool=` only selects whose
-`settings.json` is written; re-running it migrates an old `--pool=` hook. Codex `to`/`next` print `SwapResult.runningSessions`; codex
+`settings.json` is written; re-running it migrates an old `--pool=` hook.
+After a hook swap inside herdr (`HERDR_PANE_ID`), the hook also starts a detached
+`ais claude-swap continue` (`claude-swap-continue.ts`) that waits 90 s and, unless the
+transcript shows a newer user or assistant turn, types the continue prompt into the pane
+once per failure (marker under `~/.ais/state/continue`); this covers sessions whose
+ais-usage mod predates its own recovery. The status line adds "ais-usage outdated" when a
+session's snapshot `pluginVersion` is missing or below `PLUGIN_VERSION` (keep it equal to `plugin.json`). Codex `to`/`next` print `SwapResult.runningSessions`; codex
 `pool create` validates members with `codexMemberProblem`. `usage` goes
 through `claude-swap/attribution.ts` `poolMemberUsageSplit(..., {tool})`:
 claude reads `projects/`, codex reads `sessions/**/rollout-*.jsonl`
