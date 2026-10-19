@@ -15,7 +15,7 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   Security model, decided up front because this server can write real
   identity state: binds loopback only; Host header must be loopback-shaped
   (DNS-rebinding guard); requests authenticate via the per-boot bearer token
-  in ~/.ais/web/server.json OR by being loopback peers; every mutating method
+  in ~/.ais/web/server.json OR by being loopback peers running as the server's own uid (Linux, via /proc/net/tcp{,6}; unknown fails closed); every mutating method
   additionally requires `X-AIS-Console: 1`, a custom header cross-site pages
   cannot attach without a CORS preflight this server never answers (this is
   the CSRF story); secrets are WRITE-ONLY through the API (keys/cookies can

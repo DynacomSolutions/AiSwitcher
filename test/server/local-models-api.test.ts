@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp, type ConsoleAppDeps } from "../../src/server/app.ts";
 
-const base = { token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1" };
+const base = { token: "t", port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1", peerPort: 50000, peerUid: () => process.getuid?.() };
 const headers = { Host: "127.0.0.1:47129" };
 const dto = { online: false, runner: null, models: [{ name: "tiny", path: "/m/tiny.gguf", sizeBytes: 12 }] };
 const appWith = (extra: Partial<ConsoleAppDeps>) => createApp({ ...base, ...extra });

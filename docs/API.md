@@ -20,8 +20,12 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
     reads it from this file).
 - Client authentication (either suffices):
   - `Authorization: Bearer <token>` from `server.json`, or
-  - request originates from loopback **and** its `Host` header is
-    `127.0.0.1[:port]` or `localhost[:port]` (DNS-rebinding guard).
+  - request originates from a loopback peer **running as the same user as the
+    server** (Linux: peer socket uid from `/proc/net/tcp{,6}`; unknown or
+    unreadable is untrusted, so 401) **and** its `Host` header is
+    `127.0.0.1[:port]` or `localhost[:port]` (DNS-rebinding guard). Other
+    local accounts must present the bearer token. Off Linux the uid check is
+    skipped.
 - Mutating requests (`POST`/`PUT`/`PATCH`/`DELETE`) additionally require the
   custom header `X-AIS-Console: 1`. Browsers cannot attach custom headers to
   cross-origin "simple" requests without a CORS preflight (never granted), so
