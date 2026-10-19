@@ -20,6 +20,7 @@ import { runHerdrCommand } from "./herdr.ts";
 import { runTuiCommand } from "./tui.ts";
 import { runClaudeSwapCommand } from "./claude-swap/dispatch.ts";
 import { runSwapCommand } from "./swap/dispatch.ts";
+import { runLocalCommand } from "./local/dispatch.ts";
 import { runStatuslineCommand } from "./statusline.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
@@ -133,6 +134,9 @@ export async function runCli(argv: string[]): Promise<void> {
         return await runStatuslineCommand(argv.slice(1));
       case "memory":
         await runMemoryCommand(rest, flags);
+        break;
+      case "local":
+        await runLocalCommand(rest, flags);
         break;
       default:
         throw new CliUsageError(`Unknown command "${command}". Run "ais help" for usage.`);
