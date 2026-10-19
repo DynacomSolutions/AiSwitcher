@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, rm, symlink, realpath } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadBackupConfig, runBackup } from "../scripts/backup.ts";
+import { addRetryingVanished, loadBackupConfig, runBackup } from "../scripts/backup.ts";
 import { acquirePidLock } from "../src/shared/pid-lock.ts";
 
 const tempDirs: string[] = [];
@@ -722,5 +722,67 @@ describe("runBackup never uses Git LFS", () => {
     expect(await git(repo, ["show", "HEAD:.codex/a.txt"])).toBe(real.trim());
     expect(await Bun.file(join(home, ".gitattributes")).text()).toBe("* filter=lfs\n");
     expect(existsSync(join(home, ".git"))).toBe(false);
+  });
+});
+
+describe("runBackup shallow push and vanished files", () => {
+  test("shallow source is rejected by a fresh bare remote with a specific hint, then accepted after receive.shallowUpdate", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    const repo = await seedOldHistory(home, [40, 30, 20]);
+    const first = await makeBareRemote();
+    await runBackup(["codex"], home, await writeConfig(home, { remote: first, localRetentionDays: 25 }));
+    expect(existsSync(join(repo, ".git", "shallow"))).toBe(true);
+
+    const fresh = await makeBareRemote();
+    const configPath = await writeConfig(home, { remote: fresh });
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => void errors.push(a.join(" "));
+    try {
+      await runBackup(["codex"], home, configPath);
+    } finally {
+      console.error = orig;
+    }
+    expect(errors.join("\n")).toContain("receive.shallowUpdate true");
+    expect(Bun.spawnSync(["git", "-C", fresh, "rev-parse", `refs/heads/${await branchOf(repo)}`]).exitCode).not.toBe(0);
+
+    await git(fresh, ["config", "receive.shallowUpdate", "true"]);
+    await runBackup(["codex"], home, configPath);
+    expect(await git(fresh, ["rev-parse", `refs/heads/${await branchOf(repo)}`])).toBe(await git(repo, ["rev-parse", "HEAD"]));
+  });
+
+  test("a 128 'unable to stat ... No such file' is retried and warned; other 128s are returned", async () => {
+    const vanished = { exitCode: 128, stdout: "", stderr: "fatal: unable to stat 'x/gone.txt': No such file or directory" };
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (...a: unknown[]) => void errors.push(a.join(" "));
+    try {
+      let calls = 0;
+      const ok = await addRetryingVanished("/r", async () => (++calls === 1 ? vanished : { exitCode: 0, stdout: "", stderr: "" }));
+      expect(ok.exitCode).toBe(0);
+      expect(calls).toBe(2);
+      expect(errors.join("\n")).toContain("skipped unreadable or vanished files");
+
+      calls = 0;
+      const lock = await addRetryingVanished("/r", async () => (calls++, { exitCode: 128, stdout: "", stderr: "fatal: Unable to create index.lock" }));
+      expect(lock.exitCode).toBe(128);
+      expect(calls).toBe(1);
+
+      calls = 0;
+      const stuck = await addRetryingVanished("/r", async () => (calls++, vanished));
+      expect(stuck.exitCode).toBe(128);
+      expect(calls).toBe(3);
+    } finally {
+      console.error = orig;
+    }
+  });
+
+  test(".caveman-sessions content is not committed", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    await write(join(home, ".codex", ".caveman-sessions", "s1.json"), "{}\n");
+    const repo = await runBackup(["codex"], home);
+    expect(await gitLs(repo)).toEqual([".codex/identities.json"]);
   });
 });
