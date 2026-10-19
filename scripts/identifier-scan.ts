@@ -62,9 +62,41 @@ export function findDomains(text: string): string[] {
 // scanned in full since they have no such ambiguity.
 const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".rs"]);
 
-export interface CommentState { inBlock: boolean }
+// `python` is set for extensionless scripts with a python shebang; `.py`
+// files are recognised by extension. `triple` carries an open triple-quoted
+// string across lines.
+export interface CommentState { inBlock: boolean; python?: boolean; triple?: string }
+
+export const isPythonShebang = (firstLine: string): boolean => /^#!.*\bpython/.test(firstLine);
+
+// Python: only string and comment content can hold a hostname; plain code
+// such as a call chain is attribute access.
+function pythonSegments(line: string, state: CommentState): string[] {
+  const segments: string[] = [];
+  let i = 0;
+  while (i < line.length) {
+    if (state.triple) {
+      const end = line.indexOf(state.triple, i);
+      if (end === -1) { segments.push(line.slice(i)); return segments; }
+      segments.push(line.slice(i, end));
+      i = end + 3;
+      state.triple = undefined;
+      continue;
+    }
+    const c = line[i]!;
+    if (c === "#") { segments.push(line.slice(i)); break; }
+    if (c !== '"' && c !== "'") { i++; continue; }
+    if (line.startsWith(c.repeat(3), i)) { state.triple = c.repeat(3); i += 3; continue; }
+    let j = i + 1;
+    while (j < line.length && line[j] !== c) j += line[j] === "\\" ? 2 : 1;
+    segments.push(line.slice(i + 1, j));
+    i = j + 1;
+  }
+  return segments;
+}
 
 export function scannableSegments(path: string, line: string, state: CommentState): string[] {
+  if (state.python || extname(path) === ".py") return pythonSegments(line, state);
   if (!CODE_EXTENSIONS.has(extname(path))) return [line];
   const segments: string[] = [];
   let work = line;
@@ -221,17 +253,19 @@ const BINARY_OR_GENERATED = new Set([
   "bun.lock", "Cargo.lock", "pnpm-lock.yaml", "package-lock.json",
 ]);
 
+const skipPath = (path: string): boolean => BINARY_OR_GENERATED.has(path.split("/").pop() ?? "");
+
 export function scanTree(root: string): Finding[] {
   const findings: Finding[] = [];
   const files = git(root, ["ls-files"]).trim().split("\n").filter(Boolean);
   for (const path of files) {
-    if (BINARY_OR_GENERATED.has(path.split("/").pop() ?? "")) continue;
+    if (skipPath(path)) continue;
     let buffer: Buffer;
     try { buffer = readFileSync(`${root}/${path}`); } catch { continue; }
     if (buffer.includes(0)) continue; // binary file
     const text = buffer.toString("utf8");
-    const state: CommentState = { inBlock: false };
     const lines = text.split("\n");
+    const state: CommentState = { inBlock: false, python: isPythonShebang(lines[0]!) };
     for (let i = 0; i < lines.length; i++) {
       for (const rule of checkLine(path, lines[i]!, state)) {
         findings.push({ location: `${path}:${i + 1}`, rule, detail: "" });
@@ -258,7 +292,8 @@ function addedLines(diff: string): AddedLine[] {
       if (!match) fail();
       line = Number(match[1]); inHunk = true;
     } else if (inHunk && text.startsWith("+")) {
-      lines.push({ path, line: line++, text: text.slice(1), file });
+      if (!skipPath(path)) lines.push({ path, line: line++, text: text.slice(1), file });
+      else line++;
     } else if (inHunk && text.startsWith(" ")) line++;
   }
   return lines;
@@ -269,6 +304,9 @@ const zero = (sha: string): boolean => /^0+$/.test(sha);
 function sha(value: string): string {
   if (!/^[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?$/.test(value)) fail();
   return value;
+}
+function firstLineOf(root: string, id: string, path: string): string {
+  try { return git(root, ["show", `${id === "staged" ? "" : id}:${path}`]).split("\n", 1)[0]!; } catch { return ""; }
 }
 function commit(root: string, ref: string): string {
   return git(root, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]).trim();
@@ -326,8 +364,13 @@ export function scan(root: string, commits: string[] | "staged", label = "change
     const diff = id === "staged"
       ? git(root, ["diff", "--cached", ...DIFF, "--"])
       : git(root, ["show", "--format=", "--root", "-m", ...DIFF, sha(id), "--"]);
-    const state: CommentState = { inBlock: false };
+    const states = new Map<number, CommentState>();
     for (const line of addedLines(diff)) {
+      let state = states.get(line.file);
+      if (!state) {
+        state = { inBlock: false, python: isPythonShebang(firstLineOf(root, id, line.path)) };
+        states.set(line.file, state);
+      }
       for (const rule of checkLine(line.path, line.text, state)) {
         findings.push({ location: `${label}-${index + 1}/file-${line.file}:${line.line}`, rule, detail: "" });
       }
