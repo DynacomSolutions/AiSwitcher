@@ -13,6 +13,10 @@ concurrency:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # Decides whether the image build is needed. Fails open: any doubt builds.
   changes:
@@ -21,11 +25,11 @@ jobs:
     outputs:
       affected: ${{ steps.filter.outputs.affected }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
@@ -35,67 +39,87 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
-            echo "affected=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          set -euo pipefail
+          result=true
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
+            && changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA") \
+            && bun install --frozen-lockfile \
+            && bun run build \
+            && picked=$(printf '%s\n' "$changed" | bun image/build/affected.ts dist/ais.meta.json) \
+            && [ "$picked" = false ]; then
+            result=false
           fi
-          if ! changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA") \
-            || ! bun install --frozen-lockfile \
-            || ! bun run build; then
-            echo "affected=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "affected=$(printf '%s\n' "$changed" | bun image/build/affected.ts dist/ais.meta.json)" >> "$GITHUB_OUTPUT"
+          echo "affected=$result" >> "$GITHUB_OUTPUT"
 
   # GitHub-hosted runner only: this repository is public, never self-hosted.
   build:
     needs: changes
-    if: needs.changes.outputs.affected == 'true'
+    if: needs.changes.outputs.affected != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
 
       - name: Test the image scripts
         run: |
+          set -euo pipefail
           bun test test/image
           shellcheck -x -P SCRIPTDIR image/build/*.sh image/archiso/profiledef.sh
 
       # Measured: the standard runner has far more than the build needs, so
       # no preinstalled toolchains are removed. Kept as a record per run.
       - name: Record free disk
-        run: df -h /
+        run: |
+          set -euo pipefail
+          df -h /
 
       - name: Install xorriso for the El Torito check
-        run: sudo apt-get install -y --no-install-recommends xorriso
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends xorriso
 
       - name: Start disk sampler
         run: |
+          set -euo pipefail
+          image/build/sample-df.sh --once "$RUNNER_TEMP/df-samples.txt"
           nohup image/build/sample-df.sh "$RUNNER_TEMP/df-samples.txt" 5 >/dev/null 2>&1 &
           echo $! > "$RUNNER_TEMP/sampler.pid"
 
       - name: Build the ISO (bootstrap, archiso, mkarchiso)
         run: |
+          set -euo pipefail
           start=$(date +%s)
-          sudo image/build/build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+          sudo image/build/build.sh >"$RUNNER_TEMP/build.log" 2>&1 || { tail -n 200 "$RUNNER_TEMP/build.log"; exit 1; }
+          tail -n 30 "$RUNNER_TEMP/build.log"
           echo "build_seconds=$(( $(date +%s) - start ))" | tee "$RUNNER_TEMP/build-time.txt"
 
       - name: Stop disk sampler
         if: always()
-        run: kill "$(cat "$RUNNER_TEMP/sampler.pid")" || true
+        run: |
+          set -euo pipefail
+          pid=$(cat "$RUNNER_TEMP/sampler.pid")
+          # A dead sampler would leave gaps in the peak figure.
+          kill -0 "$pid" || { echo "disk sampler died"; exit 1; }
+          kill "$pid"
+          image/build/sample-df.sh --once "$RUNNER_TEMP/df-samples.txt"
 
       - name: Assert peak disk under 80% of free
-        run: image/build/assert-disk.sh "$RUNNER_TEMP/df-samples.txt"
+        run: |
+          set -euo pipefail
+          image/build/assert-disk.sh "$RUNNER_TEMP/df-samples.txt"
 
       - name: Assert BIOS and EFI El Torito records
         run: |
+          set -euo pipefail
           xorriso -indev out/archiso.iso -report_el_torito as_mkisofs > "$RUNNER_TEMP/eltorito.txt"
           cat "$RUNNER_TEMP/eltorito.txt"
           image/build/assert-eltorito.sh "$RUNNER_TEMP/eltorito.txt"
@@ -103,6 +127,7 @@ jobs:
       - name: Record measurements
         if: always()
         run: |
+          set -euo pipefail
           {
             echo "## Live image build measurements"
             cat "$RUNNER_TEMP/build-time.txt" || true
@@ -115,7 +140,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the ISO
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: archiso
           path: |
@@ -131,6 +156,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Fail when a needed job failed or was cancelled
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          BUILD: ${{ needs.build.result }}
         run: |
-          [ "${{ needs.changes.result }}" = "success" ] || exit 1
-          case "${{ needs.build.result }}" in success|skipped) ;; *) exit 1 ;; esac
+          set -euo pipefail
+          [ "$CHANGES" = "success" ] || exit 1
+          case "$BUILD" in success|skipped) ;; *) exit 1 ;; esac
