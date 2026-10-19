@@ -2,6 +2,36 @@
 
 _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 589-688). Read before touching this area._
 
+## Live-drive peer
+
+The live image uses an authenticated exchange partition as another transport
+peer. `ais live apply-inbox --stdin` consumes a fully decrypted and authenticated
+tar stream from standard input. The root service must finish age authentication
+into a bounded root-only temporary file before starting this command as the
+agent user; piping age directly into the command could expose valid early tar
+entries before a late authentication failure. The command never opens a bundle
+path itself. It validates the complete manifest and tar before planning writes,
+and rejects links, duplicate names, traversal, and non-regular tar entries.
+
+Inbox state under `.ais/live` records the last applied sequence and portable
+configuration hashes. Replayed or older sequences are a no-op. Configuration
+uses a three-way comparison; an unresolved conflict needs a controlling
+terminal and is deferred otherwise. Auth writes are deferred until the clock is
+after the image build-time marker, no earlier than the persisted state mtime,
+and within one hour of the online HTTP `Date` response when online. Token grants
+are merged atomically by freshness, and log JSONL uses the existing multiset
+union. SSH material is written with mode `0600`.
+
+`ais live write-outbox` writes only a tar archive to standard output. It carries
+configuration hashes, selected recent logs, a truncation marker, and the last
+inbox sequence; it does not include configuration payloads or credentials.
+Collection is limited to known tool and AIS roots, uses descriptor-anchored
+no-follow reads, and caps the archive at 32 MiB. The root service encrypts the
+completed output and publishes it to the exchange partition atomically. Neither
+live command starts a new SSH sync path: after inbox application, the ordinary
+detached sidecar and configured `ais sync` peers remain responsible for SSH
+reconciliation.
+
 - **SSH sync is a direct home-to-home merge, not a password protocol.**
   `~/.ais/config/sync-v2.json` (formerly `~/.config/ais/sync-v2.json` — see
   "~/.ais: one consolidated root" below) contains validated SSH config

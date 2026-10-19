@@ -1,0 +1,22 @@
+[Unit]
+Description=Write an encrypted AIS outbox bundle
+Requires=mnt-aisx.mount
+After=mnt-aisx.mount
+ConditionPathIsMountPoint=/mnt/persist
+
+[Service]
+Type=oneshot
+RuntimeDirectory=ais-live-exchange
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/lib/ais-live/ais-outbox write-outbox
+TimeoutStartSec=3min
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/mnt/aisx /run/ais-live-exchange
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
