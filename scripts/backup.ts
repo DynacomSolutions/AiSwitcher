@@ -294,8 +294,18 @@ export async function runBackup(
   }
 
   // Partial .gitignore rules outside our control silently skip files; warn, never force-add.
-  const skipped = await runGit(repoDir, home, ["ls-files", "-z", "-o", "-i", "--exclude-per-directory=.gitignore", "--", ...mirrored]);
-  const skippedPaths = skipped.stdout.split("\0").filter(Boolean);
+  // Only the root ~/.gitignore is outside our control; per-directory ones
+  // inside a group were obeyed by the old rsync design too. Junk we exclude
+  // anyway is dropped from the report.
+  const skippedPaths: string[] = [];
+  if (await pathExists(join(home, ".gitignore"))) {
+    const skipped = await runGit(repoDir, home, ["ls-files", "-z", "-o", "-i", "--directory", `--exclude-from=${join(home, ".gitignore")}`, "--", ...mirrored]);
+    for (const p of skipped.stdout.split("\0").filter(Boolean)) {
+      const parts = p.split("/").filter(Boolean);
+      if (parts.some((seg) => JUNK_DIRS.has(seg)) || /\.(lock|sock|pid)\/?$/.test(p)) continue;
+      skippedPaths.push(p);
+    }
+  }
   if (skippedPaths.length > 0) {
     console.error(`backup: ${skippedPaths.length} file(s) skipped because a .gitignore rule matches them, e.g. ${skippedPaths.slice(0, 3).join(", ")}`);
   }

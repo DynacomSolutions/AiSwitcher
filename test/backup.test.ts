@@ -367,4 +367,20 @@ describe("runBackup integration", () => {
     expect(await gitShow(repoDir, ".codex/auth.json")).toBeNull();
     expect(msgs.some((m) => m.includes("1 file(s) skipped") && m.includes(".codex/auth.json"))).toBe(true);
   });
+
+  test("an in-group .gitignore with no root .gitignore gives no skipped-files warning", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "plugin", ".gitignore"), "node_modules/\n");
+    await write(join(home, ".codex", "plugin", "node_modules", "m.js"), "m\n");
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    const orig = console.error;
+    const msgs: string[] = [];
+    console.error = (...a: unknown[]) => void msgs.push(a.join(" "));
+    try {
+      await runBackup(["codex"], home);
+    } finally {
+      console.error = orig;
+    }
+    expect(msgs.some((m) => m.includes("skipped because a .gitignore"))).toBe(false);
+  });
 });
