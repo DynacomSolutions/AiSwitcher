@@ -4,10 +4,11 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import stat
 
 
-def validate(source, home, home_uid, cache_uid):
+def validate(source, home, home_uid, cache_uid, use_cache=True):
     flags_dir = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     flags_file = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
@@ -76,7 +77,7 @@ def validate(source, home, home_uid, cache_uid):
         pass
     manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
     cached_by_name = {}
-    if isinstance(cached, dict) and cached.get("manifestSha256") == manifest_digest:
+    if use_cache and isinstance(cached, dict) and cached.get("manifestSha256") == manifest_digest:
         cached_by_name = {row.get("file"): row for row in cached.get("files", []) if isinstance(row, dict)}
 
     records = []
@@ -111,3 +112,36 @@ def validate(source, home, home_uid, cache_uid):
     os.close(cache_fd)
     os.close(home_fd)
     os.close(source_fd)
+
+
+def stage_verified(source, destination, validation_home, home_uid, cache_uid, owner_uid=None, owner_gid=None):
+    """Copy privately, validate copied bytes without cache, then publish modes."""
+    owner_uid = os.getuid() if owner_uid is None else owner_uid
+    owner_gid = os.getgid() if owner_gid is None else owner_gid
+    if os.path.lexists(destination):
+        if os.path.islink(destination) or not os.path.isdir(destination):
+            raise ValueError("unsafe staging destination")
+        shutil.rmtree(destination)
+    os.mkdir(destination, 0o700)
+    try:
+        shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+        os.chmod(destination, 0o700, follow_symlinks=False)
+        validate(destination, validation_home, home_uid, cache_uid, use_cache=False)
+        for root, directories, files in os.walk(destination, topdown=True, followlinks=False):
+            os.chown(root, owner_uid, owner_gid, follow_symlinks=False)
+            os.chmod(root, 0o755, follow_symlinks=False)
+            for name in directories:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    continue
+                os.chown(path, owner_uid, owner_gid, follow_symlinks=False)
+                os.chmod(path, 0o755, follow_symlinks=False)
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    continue
+                os.chown(path, owner_uid, owner_gid, follow_symlinks=False)
+                os.chmod(path, 0o644, follow_symlinks=False)
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise

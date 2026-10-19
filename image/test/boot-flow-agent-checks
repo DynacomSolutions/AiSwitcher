@@ -13,6 +13,16 @@ live_uid=$(/usr/bin/id -u live)
 if [[ -x "/run/user/$live_uid" ]]; then fail herdr-runtime-readable; fi
 if /usr/local/bin/herdr api snapshot >/dev/null 2>&1; then fail herdr-api-access; fi
 
+if [[ -f /opt/ais/models/manifest.json ]]; then
+  [[ -r /opt/ais/models/model.gguf && ! -w /opt/ais/models/model.gguf ]] || fail model-read-write
+  [[ "$(/usr/bin/stat -c '%U:%a' /opt/ais/models/model.gguf)" == root:644 ]] || fail model-owner-mode
+  /usr/bin/cat /opt/ais/models/model.gguf >/dev/null || fail model-readable
+  if /usr/bin/cat /mnt/aisx/models/model.gguf >/dev/null 2>&1; then fail model-source-isolation; fi
+  if printf 'synthetic mutation' >> /opt/ais/models/model.gguf 2>/dev/null; then fail model-write-denied; fi
+  if printf 'synthetic mutation' > /opt/ais/models/agent-write-test 2>/dev/null; then fail model-create-denied; fi
+  if printf 'synthetic mutation' >> /mnt/aisx/models/model.gguf 2>/dev/null; then fail model-source-write-denied; fi
+fi
+
 web_started=false
 cleanup() {
   if [[ "$web_started" == true ]]; then /usr/bin/ais web stop >/dev/null 2>&1 || true; fi

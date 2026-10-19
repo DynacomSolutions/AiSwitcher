@@ -5,6 +5,13 @@ fail() { echo "AIS-LIVE-TEST: live-checks=fail reason=$1" >&2; exit 1; }
 tty_path=$(/usr/bin/tty 2>/dev/null || true)
 [[ "$tty_path" == /dev/ttyS* ]] || exit 0
 [[ "$(/usr/bin/id -un)" == live ]] || fail wrong-user
+live_groups=$(/usr/bin/id -nG live)
+agent_groups=$(/usr/bin/id -nG agent)
+/usr/bin/getent group proc >/dev/null || fail proc-group
+[[ " $live_groups " == *' proc '* && " $agent_groups " != *' proc '* ]] || fail first-boot-proc-membership
+if ! /usr/bin/systemctl is-active --quiet systemd-logind || ! /usr/bin/systemctl is-active --quiet polkit; then
+  fail systemd-dependency-order
+fi
 
 live_uid=$(/usr/bin/id -u live)
 runtime_dir="/run/user/$live_uid"
@@ -105,9 +112,8 @@ import json,sys
 root=json.load(sys.stdin)
 def visit(x):
     if isinstance(x,dict):
-        for key in ("shell_pid","pid"):
-            v=x.get(key)
-            if isinstance(v,int) and v>0: print(v); raise SystemExit(0)
+        v=x.get("shell_pid")
+        if isinstance(v,int) and v>0: print(v); raise SystemExit(0)
         for y in x.values(): visit(y)
     elif isinstance(x,list):
         for y in x: visit(y)

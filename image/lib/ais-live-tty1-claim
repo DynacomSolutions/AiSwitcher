@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (($# != 1)) || [[ "${AIS_LIVE_TTY1_BOOT:-}" != 1 ]]; then exit 1; fi
+runtime_dir=$1
+[[ -d "$runtime_dir" && ! -L "$runtime_dir" ]] || exit 1
+[[ "$(/usr/bin/stat -c '%u:%a' "$runtime_dir")" == "$(/usr/bin/id -u):700" ]] || exit 1
+/usr/bin/mkdir -m 0700 "$runtime_dir/ais-live-tty1-booted" 2>/dev/null
