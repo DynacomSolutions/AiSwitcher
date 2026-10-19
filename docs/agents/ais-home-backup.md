@@ -334,8 +334,13 @@ described above (same repo content, commits and console output); only the
   run's commit. Renormalisation skips paths no longer in the working tree
   (for example excluded `jobs/*/tmp/` data), which the normal `git add -A`
   simply drops without hashing them. History is not rewritten.
-- **Operator creates the remote.** Run `git init --bare /srv/ais-backups.git` on
-  the backup host once. The backup never creates it.
+- **Operator creates the remote.** Run `git init --bare /srv/ais-backups.git`
+  and then `git -C /srv/ais-backups.git config receive.shallowUpdate true` on
+  the backup host once. The setting is required because the `localRetentionDays`
+  trim makes the local repo shallow (`.git/shallow`), and a bare remote rejects
+  pushes from a shallow repo with `shallow update not allowed` unless it
+  accepts shallow updates. The backup prints this fix when it sees that error.
+  The backup never creates the remote.
 - **Push on every run** where a remote is configured, including the "no changes"
   and "nothing new to commit" runs, so a commit made while the remote was down
   is sent by the next run (catch-up). It pushes the whole current branch to the

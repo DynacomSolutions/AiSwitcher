@@ -35,7 +35,8 @@ type BackupGroup = keyof typeof BACKUP_GROUPS;
 // "**/jobs/*/tmp/": agent job scratch dirs hold throwaway checkouts that can
 // carry their own .gitattributes. The leading "**/" is what makes it match at
 // any depth in gitignore syntax (rsync matched unanchored).
-const BACKUP_EXCLUDES = [...REPRODUCIBLE_JUNK_DIR_NAMES, "*.lock", "*.sock", "*.pid", "**/jobs/*/tmp/"];
+// ".caveman-sessions/": transient per-session scratch state that churns while the backup runs.
+const BACKUP_EXCLUDES = [...REPRODUCIBLE_JUNK_DIR_NAMES, "*.lock", "*.sock", "*.pid", "**/jobs/*/tmp/", ".caveman-sessions/"];
 
 function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
@@ -98,6 +99,21 @@ async function runGit(repoDir: string, home: string, args: string[], stdin?: str
     proc.exited,
   ]);
   return { exitCode, stdout, stderr };
+}
+
+const VANISHED_RE = /unable to stat '[^']*': No such file or directory/;
+
+/** Runs a `git add` attempt, retrying (max 3 tries) when git exits 128 because a
+ * file vanished between listing and staging; `--ignore-errors` does not cover that
+ * lstat failure. Each retry re-lists, so the gone file is no longer seen. Any other
+ * failure is returned unchanged for the caller to treat as fatal. */
+export async function addRetryingVanished(repoDir: string, attempt: () => Promise<GitResult>): Promise<GitResult> {
+  let result = await attempt();
+  for (let n = 1; n < 3 && result.exitCode === 128 && VANISHED_RE.test(result.stderr); n++) {
+    console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${result.stderr.trim()}`);
+    result = await attempt();
+  }
+  return result;
 }
 
 async function ensureRepo(repoDir: string, home: string): Promise<string[]> {
@@ -185,12 +201,14 @@ async function renormalise(repoDir: string, home: string, polluted: readonly str
   for (const path of polluted) if (tracked.has(path) && (await pathExists(join(home, path)))) present.push(path);
   if (present.length > 0) {
     // Literal pathspecs: tracked names may contain glob characters.
-    const add = await runGit(
-      repoDir,
-      home,
-      ["add", "--renormalize", "--ignore-errors", "--pathspec-from-file=-", "--pathspec-file-nul"],
-      present.join("\0") + "\0",
-      { GIT_LITERAL_PATHSPECS: "1" },
+    const add = await addRetryingVanished(repoDir, () =>
+      runGit(
+        repoDir,
+        home,
+        ["add", "--renormalize", "--ignore-errors", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        present.join("\0") + "\0",
+        { GIT_LITERAL_PATHSPECS: "1" },
+      ),
     );
     if (add.exitCode > 1) throw new Error(`backup: git add --renormalize failed in ${repoDir}: ${add.stderr.trim()}`);
   }
@@ -226,7 +244,7 @@ async function removeLegacyMirrors(repoDir: string, home: string): Promise<void>
 // repos and return their non-.git files so they can be indexed directly.
 // Junk dirs and lock/sock/pid files are filtered here because
 // `update-index --add` bypasses the exclude file.
-const JUNK_DIRS = new Set(REPRODUCIBLE_JUNK_DIR_NAMES.map((n) => n.replace(/\/$/, "")).filter((n) => n !== ".git"));
+const JUNK_DIRS = new Set([...REPRODUCIBLE_JUNK_DIR_NAMES, ".caveman-sessions/"].map((n) => n.replace(/\/$/, "")).filter((n) => n !== ".git"));
 async function findNestedRepoFiles(home: string, name: string): Promise<{ repos: string[]; files: string[] }> {
   const repos: string[] = [];
   const files: string[] = [];
@@ -329,7 +347,7 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
 
   // Exit 1 is --ignore-errors reporting files it skipped (permission-denied,
   // vanished mid-scan); anything else (e.g. 128, a stale index.lock) is fatal.
-  const add = await runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored]);
+  const add = await addRetryingVanished(repoDir, () => runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored]));
   if (add.exitCode === 1) {
     console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${add.stderr.trim()}`);
   } else if (add.exitCode !== 0) {
@@ -479,6 +497,11 @@ async function pushAndTrim(repoDir: string, home: string, remote: string, retent
     const push = await runRemoteGit(repoDir, home, ["push", "--quiet", remote, `HEAD:refs/heads/${branch}`]);
     if (push.exitCode !== 0) {
       console.error(`backup: off-host push FAILED (${failureText(push, remote)}); local backup is intact, next run retries`);
+      if (push.stderr.includes("shallow update not allowed")) {
+        console.error(
+          "backup: the remote refuses pushes from this shallow backup repo (localRetentionDays trim); run `git config receive.shallowUpdate true` inside the bare remote repository, then the next run will succeed",
+        );
+      }
       if (retentionDays) console.error("backup: local trim skipped, the push did not succeed");
       return;
     }
