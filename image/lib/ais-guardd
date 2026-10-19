@@ -2,7 +2,7 @@
 import array, hashlib, json, os, pwd, re, secrets, select, socket, stat, struct, subprocess, sys, threading, time
 from ais_guard_policy import COMMANDS, readonly, resolve_devices, unsafe_options, pacman_args, timeout_for, escape_display
 SOCK='/run/ais-guard.sock'; R='/run/ais-guard/requests'; P='/run/ais-guard/packages'; MAX=65536
-RATE={}; SLOTS=threading.BoundedSemaphore(16); PKG_MAX=268435456
+RATE={}; RATE_LOCK=threading.Lock(); POPUP_LOCK=threading.Lock(); PKG_LOCK=threading.Lock(); SLOTS=threading.BoundedSemaphore(16); PKG_MAX=268435456
 def uid_for(name): return pwd.getpwnam(name).pw_uid
 def gid_for(name): return pwd.getpwnam(name).pw_gid
 def recv_req(c):
@@ -34,9 +34,10 @@ def send(c,ok,reason,code=None):
     c.sendall((json.dumps(d,separators=(',',':'))+'\n').encode())
 
 def rate_check(uid):
-    now=time.monotonic(); stamps=[t for t in RATE.get(uid,[]) if now-t<60]
-    if len(stamps)>=6: raise ValueError('rate limited')
-    RATE[uid]=stamps+[now]
+    with RATE_LOCK:
+        now=time.monotonic(); stamps=[t for t in RATE.get(uid,[]) if now-t<60]
+        if len(stamps)>=6: raise ValueError('rate limited')
+        RATE[uid]=stamps+[now]
 
 def device_info(path):
     p=subprocess.run(['/usr/bin/lsblk','--json','--bytes','--output','PATH,MODEL,SIZE,MOUNTPOINTS',path],capture_output=True,text=True,timeout=3,env={'PATH':'/usr/bin:/bin','LANG':'C'})
@@ -77,6 +78,10 @@ def with_code(expected):
     return (expected+' '+secrets.token_hex(2)).strip()
 
 def popup(command,devs,expected,timeout):
+    # One approval pane at a time; other requests queue here (at most SLOTS threads).
+    with POPUP_LOCK: return _popup(command,devs,expected,timeout)
+
+def _popup(command,devs,expected,timeout):
     expected=with_code(expected)
     os.makedirs(R,mode=0o750,exist_ok=True); os.chown(R,0,gid_for('live')); os.chmod(R,0o750)
     rid=secrets.token_hex(16); nonce=secrets.token_urlsafe(24); path=R+'/'+rid+'.sock'; request=R+'/'+rid+'.json'
@@ -167,20 +172,34 @@ def pkg_name(dest):
     kw={'user':'nobody','group':'nobody','extra_groups':[]} if os.geteuid()==0 else {}
     with open(dest,'rb') as f:
         p=subprocess.Popen(['/usr/bin/bsdtar','-xOf','-','.PKGINFO'],stdin=f,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,cwd='/',env={'PATH':'/usr/bin:/bin','LANG':'C'},**kw)
+        timer=threading.Timer(30,p.kill); timer.start()
         try:
             out=p.stdout.read(1048576)
             if p.stdout.read(1): raise ValueError('package metadata too large')
         finally:
-            p.stdout.close()
+            timer.cancel(); p.stdout.close()
             if p.poll() is None: p.kill()
             code=p.wait()
     names=re.findall(rb'^pkgname = (\S+)$',out,re.M)
     if code or len(names)!=1 or not re.fullmatch(rb'[A-Za-z0-9@._+-]+',names[0]): raise ValueError('package metadata invalid')
     return names[0].decode()
 
+_DM_TOOLS=('cryptsetup','dmsetup','lvm','lvmdevices')
+def sandbox_props(name,readonly_mode=False):
+    """systemd properties for a root run. NoExecPaths/ExecPaths and the kernel module block apply to every tool."""
+    props=['ProtectSystem=strict','ProtectHome=read-only','PrivateTmp=yes','NoNewPrivileges=yes','RestrictSUIDSGID=yes','DevicePolicy=closed','NoExecPaths=/','ExecPaths=/usr','ProtectControlGroups=yes','ProtectKernelModules=yes']
+    if readonly_mode: return props+['ProtectKernelTunables=yes','RuntimeMaxSec=30']
+    if name=='mdadm':
+        # md assembly and creation write sysfs, so kernel tunables stay writable for this tool only.
+        return props+['DeviceAllow=/dev/md* rw','DeviceAllow=block-md rw','ReadWritePaths=-/run/mdadm']
+    props.append('ProtectKernelTunables=yes')
+    if name in _DM_TOOLS or name.startswith(('lv','pv','vg')):
+        props+=['DeviceAllow=/dev/mapper/control rw','DeviceAllow=/dev/mapper/* rw','DeviceAllow=block-device-mapper rw','ReadWritePaths=-/run/cryptsetup -/run/lock/lvm -/run/lvm -/etc/lvm']
+    return props
+
 def run_root(argv,fds,devices=(),readonly_mode=False,cwd='/'):
-    cmd=['/usr/bin/systemd-run','--wait','--pipe','--collect','-p','ProtectSystem=strict','-p','ProtectHome=read-only','-p','PrivateTmp=yes','-p','NoNewPrivileges=yes','-p','RestrictSUIDSGID=yes','-p','DevicePolicy=closed','-p','NoExecPaths=/','-p','ExecPaths=/usr','-p','ProtectKernelTunables=yes','-p','ProtectControlGroups=yes','-p','ProtectKernelModules=yes']
-    if readonly_mode: cmd += ['-p','RuntimeMaxSec=30']
+    cmd=['/usr/bin/systemd-run','--wait','--pipe','--collect']
+    for prop in sandbox_props(os.path.basename(argv[0]),readonly_mode): cmd += ['-p',prop]
     if readonly_mode and not devices: cmd += ['-p','DeviceAllow=block-* r']
     for _,p,_ in devices:cmd += ['-p','DeviceAllow='+p+(' r' if readonly_mode else ' rw')]
     cmd += ['--working-directory='+cwd,'--',argv[0],*argv[1:]]
@@ -199,6 +218,8 @@ def handle(c):
             name=os.path.basename(a[0]); args=a[1:]
             if name not in COMMANDS:raise ValueError('command absent from guard table')
             rewritten,devs=resolve_devices(name,args,cwd)
+            if devs and (cwd in ('/tmp','/var/tmp') or cwd.startswith(('/tmp/','/var/tmp/'))):
+                raise ValueError('working directory under /tmp is not visible to the root sandbox; run from another directory')
             # Operand-free read-only forms may read every block device as root. Any
             # other device-free request is run by the client as agent ("local").
             if readonly(name,args):
@@ -230,9 +251,9 @@ def handle(c):
             if op=='pacman':
                 mode,pacargv=pacman_args(args)
                 if mode=='query':
-                    p=subprocess.run(['/usr/bin/pacman',*pacargv],cwd='/',stdin=fds[0],stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True);send(c,True,'query',p.returncode);return
+                    p=subprocess.run(['/usr/bin/pacman',*pacargv],cwd='/',timeout=300,stdin=subprocess.DEVNULL,stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True);send(c,True,'query',p.returncode);return
                 if mode=='repository':
-                    p=subprocess.run(['/usr/bin/systemd-run','--wait','--pipe','--collect','--working-directory=/','--','/usr/bin/pacman',*pacargv],stdin=fds[0],stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True)
+                    p=subprocess.run(['/usr/bin/systemd-run','--wait','--pipe','--collect','-p','RuntimeMaxSec=1800','--working-directory=/','--','/usr/bin/pacman',*pacargv],timeout=1860,stdin=subprocess.DEVNULL,stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True)
                     send(c,True,'pacman',p.returncode);return
             if op=='aur-install':
                 files=[args[2]] if len(args)==3 and args[0]=='install' else []
@@ -241,26 +262,27 @@ def handle(c):
             if not files:raise ValueError('package file missing')
             code=0
             for index,source in enumerate(files):
-                rid=secrets.token_hex(16); dest,digest=copy_pkg(source,uid,rid,cwd)
-                try:
-                    pkg=pkg_name(dest)
-                    expected=req.get('expected_package') if op=='aur-install' else None
-                    if op=='aur-install' and expected!=pkg:raise ValueError('package name mismatch')
-                    approval='install '+pkg if op=='aur-install' else pkg
-                    rate_check(uid)
-                    display='Source archive: '+json.dumps(source,ensure_ascii=True)+'; copied package: '+json.dumps(dest,ensure_ascii=True)+'; command: '+json.dumps(['/usr/bin/pacman','--noconfirm','-U','--',dest],ensure_ascii=True,separators=(',',':'))+'; package='+json.dumps(pkg)+'; sha256:'+digest
-                    if not popup(escape_display(display),[],approval,timeout_for(open('/proc/cmdline').read())):raise ValueError('package approval refused')
-                    # The archive has just received an exact popup approval. Use
-                    # noninteractive pacman only after that approval so stdin
-                    # from socket activation cannot hang or weaken consent.
-                    p=subprocess.run(['/usr/bin/systemd-run','--wait','--pipe','--collect','--','/usr/bin/pacman','--noconfirm','-U','--',dest],stdin=fds[0],stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True)
-                    code=p.returncode
-                    if code:break
-                finally:
-                    try:os.unlink(dest)
-                    except OSError:pass
-                    try:os.rmdir(os.path.dirname(dest))
-                    except OSError:pass
+                with PKG_LOCK:
+                    rid=secrets.token_hex(16); dest,digest=copy_pkg(source,uid,rid,cwd)
+                    try:
+                        pkg=pkg_name(dest)
+                        expected=req.get('expected_package') if op=='aur-install' else None
+                        if op=='aur-install' and expected!=pkg:raise ValueError('package name mismatch')
+                        approval='install '+pkg if op=='aur-install' else pkg
+                        rate_check(uid)
+                        display='Source archive: '+json.dumps(source,ensure_ascii=True)+'; copied package: '+json.dumps(dest,ensure_ascii=True)+'; command: '+json.dumps(['/usr/bin/pacman','--noconfirm','-U','--',dest],ensure_ascii=True,separators=(',',':'))+'; package='+json.dumps(pkg)+'; sha256:'+digest
+                        if not popup(escape_display(display),[],approval,timeout_for(open('/proc/cmdline').read())):raise ValueError('package approval refused')
+                        # The archive has just received an exact popup approval. Use
+                        # noninteractive pacman only after that approval so stdin
+                        # from socket activation cannot hang or weaken consent.
+                        p=subprocess.run(['/usr/bin/systemd-run','--wait','--pipe','--collect','-p','RuntimeMaxSec=1800','--','/usr/bin/pacman','--noconfirm','-U','--',dest],timeout=1860,stdin=subprocess.DEVNULL,stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True)
+                        code=p.returncode
+                        if code:break
+                    finally:
+                        try:os.unlink(dest)
+                        except OSError:pass
+                        try:os.rmdir(os.path.dirname(dest))
+                        except OSError:pass
             send(c,True,'package',code);return
         raise ValueError('unsupported operation')
     except Exception as e:

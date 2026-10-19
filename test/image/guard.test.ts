@@ -511,6 +511,75 @@ srv.close(); os.unlink(path); os.rmdir(d)
     execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
   });
 
+  test('approvals are serialised: one popup at a time, and rate checks are thread safe', () => {
+    const script = String.raw`
+import importlib.machinery,importlib.util,sys,threading,time
+sys.path.insert(0,'image/lib'); l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+live=[0]; peak=[0]; lk=threading.Lock()
+def fake(*a):
+ with lk: live[0]+=1; peak[0]=max(peak[0],live[0])
+ time.sleep(0.1)
+ with lk: live[0]-=1
+ return True
+m._popup=fake
+ts=[threading.Thread(target=m.popup,args=('c',[],'e',5)) for _ in range(4)]
+[t.start() for t in ts]; [t.join() for t in ts]
+assert peak[0]==1,peak
+m.RATE.clear(); ok=[]; bad=[]
+def hit():
+ try: m.rate_check(7); ok.append(1)
+ except ValueError: bad.append(1)
+orig=m.time.monotonic
+ts=[threading.Thread(target=hit) for _ in range(7)]
+[t.start() for t in ts]; [t.join() for t in ts]
+assert len(ok)==6 and len(bad)==1,(ok,bad)
+`;
+    execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
+  });
+
+  test('sandbox profiles are per tool, /tmp cwd is refused, and pacman never reads stdin', () => {
+    const script = String.raw`
+import importlib.machinery,importlib.util,json,os,struct,sys,types
+sys.path.insert(0,'image/lib'); l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+for n in ('mdadm','cryptsetup','lvcreate','dd','blkid'):
+ for ro in (False,True):
+  p=m.sandbox_props(n,ro)
+  assert 'NoExecPaths=/' in p and 'ExecPaths=/usr' in p and 'ProtectKernelModules=yes' in p and 'ProtectSystem=strict' in p,(n,p)
+md=m.sandbox_props('mdadm'); assert 'ProtectKernelTunables=yes' not in md and 'DeviceAllow=/dev/md* rw' in md
+for n in ('cryptsetup','lvcreate','lvm','dmsetup'):
+ p=m.sandbox_props(n); assert 'DeviceAllow=/dev/mapper/control rw' in p and 'ProtectKernelTunables=yes' in p
+ assert any('/run/cryptsetup' in x and '/run/lock/lvm' in x for x in p if x.startswith('ReadWritePaths=')),n
+assert 'ProtectKernelTunables=yes' in m.sandbox_props('dd') and not any(x.startswith('ReadWritePaths') for x in m.sandbox_props('dd'))
+class C:
+ def __init__(self,req): self.req=req; self.sent=[]
+ def settimeout(self,x): pass
+ def getsockopt(self,*a): return struct.pack('3i',1,os.getuid(),os.getgid())
+ def sendall(self,b): self.sent.append(json.loads(b))
+ def close(self): pass
+m.uid_for=lambda n:os.getuid(); m.recv_req=lambda c:(c.req,[os.dup(0),os.dup(1),os.dup(2)])
+m.resolve_devices=lambda n,a,c:(a,[('/dev/fake','/dev/fake',5)]); calls=[]
+m.popup=lambda *a:(calls.append(a) or True); m.run_root=lambda *a,**k:calls.append(a)
+os.makedirs('/tmp/ais-cwd-probe',exist_ok=True)
+c=C({'op':'disk','argv':['dd','of=/dev/fake'],'cwd':'/tmp/ais-cwd-probe'}); m.handle(c)
+os.rmdir('/tmp/ais-cwd-probe')
+assert not calls and c.sent[-1]['approved'] is False and '/tmp' in c.sent[-1]['reason'],c.sent
+runs=[]
+class R: returncode=0
+m.subprocess.run=lambda argv,**kw:(runs.append((argv,kw)) or R())
+for args in (['-Q'],['-S','synthetic-fixture']):
+ c=C({'op':'pacman','argv':['pacman',*args],'cwd':'/'}); m.handle(c)
+assert len(runs)==2 and all(kw['stdin']==m.subprocess.DEVNULL and kw.get('timeout') for _,kw in runs),runs
+assert 'RuntimeMaxSec=1800' in runs[1][0]
+`;
+    execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
+  });
+
+  test('package handling is one at a time and bsdtar is bounded', () => {
+    const src = readFileSync(join(root, 'ais-guardd'), 'utf8');
+    expect(src).toContain('with PKG_LOCK:');
+    expect(src).toContain('threading.Timer(30,p.kill)');
+  });
+
   test('all listed commands have executable PATH wrapper links wired by image profile', () => {
     expect(readFileSync(join(root, 'ais-guard-table'), 'utf8')).toContain('dd destructive');
   });
