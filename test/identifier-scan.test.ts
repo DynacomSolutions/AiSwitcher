@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   checkLine, findDomains, findEmails, findHomePaths, findIps, findMachineNicknames, isAllowedDomain,
-  isPythonShebang, scannableSegments,
+  isPythonShebang, scannableSegments, scan,
 } from "../scripts/identifier-scan.ts";
 
 describe("domain allowlist", () => {
@@ -196,5 +200,22 @@ describe("python files", () => {
 
   test("non-python extensionless files are still scanned in full", () => {
     expect(checkLine("tool", code.replace("subprocess.run", "internal.example-corp.dev"))).toContain("blocked-domain");
+  });
+});
+
+describe("staged scan skips generated lockfiles like tree mode", () => {
+  test("Cargo.lock registry line is ignored, unknown domain in a normal file is flagged", () => {
+    const root = mkdtempSync(join(tmpdir(), "idscan-"));
+    try {
+      const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
+      git("init", "-q");
+      mkdirSync(join(root, "apps"));
+      writeFileSync(join(root, "apps/Cargo.lock"), 'source = "registry+https://github.com/rust-lang/crates.io-index"\n');
+      git("add", ".");
+      expect(scan(root, "staged")).toEqual([]);
+      writeFileSync(join(root, "notes.txt"), "see console.internal-example.dev\n");
+      git("add", ".");
+      expect(scan(root, "staged").length).toBe(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

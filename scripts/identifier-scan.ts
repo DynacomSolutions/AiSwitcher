@@ -253,11 +253,13 @@ const BINARY_OR_GENERATED = new Set([
   "bun.lock", "Cargo.lock", "pnpm-lock.yaml", "package-lock.json",
 ]);
 
+const skipPath = (path: string): boolean => BINARY_OR_GENERATED.has(path.split("/").pop() ?? "");
+
 export function scanTree(root: string): Finding[] {
   const findings: Finding[] = [];
   const files = git(root, ["ls-files"]).trim().split("\n").filter(Boolean);
   for (const path of files) {
-    if (BINARY_OR_GENERATED.has(path.split("/").pop() ?? "")) continue;
+    if (skipPath(path)) continue;
     let buffer: Buffer;
     try { buffer = readFileSync(`${root}/${path}`); } catch { continue; }
     if (buffer.includes(0)) continue; // binary file
@@ -290,7 +292,8 @@ function addedLines(diff: string): AddedLine[] {
       if (!match) fail();
       line = Number(match[1]); inHunk = true;
     } else if (inHunk && text.startsWith("+")) {
-      lines.push({ path, line: line++, text: text.slice(1), file });
+      if (!skipPath(path)) lines.push({ path, line: line++, text: text.slice(1), file });
+      else line++;
     } else if (inHunk && text.startsWith(" ")) line++;
   }
   return lines;
