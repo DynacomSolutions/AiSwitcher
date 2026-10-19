@@ -75,10 +75,9 @@ fn native_devices() -> Vec<ais_host_core::device::DeviceSummary> {
     Vec::new()
 }
 
-/// The webview supplies only the native device selector. Device observations,
-/// verified image bytes and the resulting plan are retained and constructed by
-/// the native process. Discovery and the bundled image contract currently fail
-/// closed, so this command cannot produce a preview in this build.
+/// The webview supplies only the native device selector. The verified image
+/// comes from the bundled-key release path and the device observation from the
+/// privileged helper's read-only preview, so the plan is built natively.
 #[tauri::command]
 fn preview_write(
     device_id: String,
@@ -88,9 +87,28 @@ fn preview_write(
     if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
         return Err("The selected device is unavailable.".to_string());
     }
-    Err(
-        "Verified image support and native device discovery are unavailable in this build."
-            .to_string(),
+    // Fail closed before any prompt or download when no trusted key is bundled.
+    let verifier =
+        ais_host_core::release::ImageVerifier::bundled().map_err(|error| error.to_string())?;
+    let fetched = ais_host_core::fetch::fetch_verified(
+        &ais_host_core::fetch::UreqHttp::default(),
+        &verifier,
+        RELEASE_LISTING,
+        &std::env::temp_dir(),
+    )
+    .map_err(|error| error.to_string())?;
+    let observation = preview_native(&device_id)?;
+    let details = DeviceReviewDetails {
+        model: None,
+        partitions: Vec::new(),
+        partition_details_available: false,
+    };
+    state.install_native_preview(
+        fetched.image,
+        fetched.release,
+        observation,
+        details,
+        fetched.sources,
     )
 }
 
@@ -115,7 +133,7 @@ fn invalidate_confirmation(state: tauri::State<'_, ConfirmationSession>) {
 
 #[tauri::command]
 fn disk_write_support() -> ais_host_core::device::WriteSupport {
-    ais_host_core::device::write_support()
+    native_write_support()
 }
 
 #[tauri::command]
@@ -180,6 +198,8 @@ struct PendingConfirmation {
     ticket: Option<ais_host_core::device::ConfirmationTicket>,
     /// Exact typed text and the moment it was accepted, for the helper request.
     typed: Option<(String, Instant)>,
+    /// Retained image, checksum and signature files for the helper to re-verify.
+    sources: Option<[std::fs::File; 3]>,
 }
 
 /// Presentation fields are collected by the native enumerator. They never
@@ -250,8 +270,10 @@ impl ConfirmationSession {
         release: ais_host_core::release::PublishedRelease,
         device: ais_host_core::device::DeviceObservation,
         details: DeviceReviewDetails,
+        sources: [std::fs::File; 3],
     ) -> Result<WritePreview, String> {
-        let pending = PendingConfirmation::from_native(image, release, device, details)?;
+        let mut pending = PendingConfirmation::from_native(image, release, device, details)?;
+        pending.sources = Some(sources);
         let preview = pending.view();
         let mut state = self
             .state
@@ -271,7 +293,9 @@ impl ConfirmationSession {
         preview_id: &str,
         now: Instant,
         support: &ais_host_core::device::WriteSupport,
-        observe: &dyn Fn(&str) -> Result<ais_host_core::device::DeviceObservation, String>,
+        observe: &dyn Fn(
+            &ais_host_core::device::DeviceObservation,
+        ) -> Result<ais_host_core::device::DeviceObservation, String>,
         launcher: &dyn HelperLauncher,
     ) -> Result<(), String> {
         if !support.enabled {
@@ -298,13 +322,18 @@ impl ConfirmationSession {
             .typed
             .take()
             .ok_or("Typed confirmation is required.")?;
-        let observation = observe(&current.plan.device().os_identity)?;
+        let observation = observe(current.plan.device())?;
         approvals
             .consume(&ticket, &current.plan, &observation, &current.image, now)
             .map_err(|error| error.to_string())?;
         let remaining =
             CONFIRMATION_TTL.saturating_sub(now.saturating_duration_since(confirmed_at));
-        launcher.launch(helper_request(&current, typed, remaining)?)
+        let request = helper_request(&current, typed, remaining)?;
+        let sources = current
+            .sources
+            .as_ref()
+            .ok_or("The verified image sources are unavailable.")?;
+        launcher.launch(request, sources)
     }
 }
 
@@ -355,30 +384,92 @@ fn deadline_boot_ns(_remaining: std::time::Duration) -> Result<u64, String> {
 
 /// Starts the per-OS privileged helper for one request.
 trait HelperLauncher {
-    fn launch(&self, request: ais_host_helper::protocol::Request) -> Result<(), String>;
+    fn launch(
+        &self,
+        request: ais_host_helper::protocol::Request,
+        sources: &[std::fs::File; 3],
+    ) -> Result<(), String>;
 }
 
-/// Fails closed until the retained image-source transport and installed helper
-/// package exist; see `write_support`.
+/// The installed per-OS helper. Only Linux has an authenticated transport.
 struct NativeHelper;
 
 impl HelperLauncher for NativeHelper {
-    fn launch(&self, _request: ais_host_helper::protocol::Request) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    fn launch(
+        &self,
+        request: ais_host_helper::protocol::Request,
+        sources: &[std::fs::File; 3],
+    ) -> Result<(), String> {
+        let uid = ais_host_helper::protocol::linux_transport::current_uid();
+        ais_host_helper::protocol::linux_transport::run_session(
+            uid,
+            [&sources[0], &sources[1], &sources[2]],
+            request,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn launch(
+        &self,
+        _request: ais_host_helper::protocol::Request,
+        _sources: &[std::fs::File; 3],
+    ) -> Result<(), String> {
         Err(ais_host_helper::platform::unavailable_reason().to_string())
     }
 }
 
+/// Writes are offered only when the root-owned helper package verifies and the
+/// bundled production release key exists. The placeholder key keeps this off.
+fn native_write_support() -> ais_host_core::device::WriteSupport {
+    let key_present = ais_host_core::release::ImageVerifier::bundled().is_ok();
+    #[cfg(target_os = "linux")]
+    let helper = ais_host_helper::protocol::linux_transport::helper_installed();
+    #[cfg(not(target_os = "linux"))]
+    let helper = false;
+    let (enabled, reason) = match (key_present, helper) {
+        (true, true) => (true, "Ready."),
+        (false, _) => (
+            false,
+            "The production image signing key is not bundled in this build.",
+        ),
+        (_, false) => (
+            false,
+            "The ais host helper package is not installed or does not verify.",
+        ),
+    };
+    ais_host_core::device::WriteSupport { enabled, reason }
+}
+
 #[cfg(target_os = "linux")]
-fn observe_native(identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
-    ais_host_helper::platform::collect_linux_by_identity(identity)
-        .map(|disk| disk.observation)
+fn observe_native(
+    approved: &ais_host_core::device::DeviceObservation,
+) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::platform::observe_linux_unprivileged(approved)
         .map_err(|_| "The selected device is unavailable.".to_string())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn observe_native(_identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+fn observe_native(
+    _approved: &ais_host_core::device::DeviceObservation,
+) -> Result<ais_host_core::device::DeviceObservation, String> {
     Err("The selected device is unavailable.".to_string())
 }
+
+#[cfg(target_os = "linux")]
+fn preview_native(identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::protocol::linux_transport::preview_observation(identity)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preview_native(_identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+    Err(ais_host_helper::platform::unavailable_reason().to_string())
+}
+
+const RELEASE_LISTING: &str =
+    "https://api.github.com/repos/DynacomSolutions/AiSwitcher/releases?per_page=30";
 
 /// Takes only the preview identifier; the plan, ticket and image stay native.
 #[tauri::command]
@@ -389,7 +480,7 @@ fn start_write(
     state.begin_write(
         &preview_id,
         Instant::now(),
-        &ais_host_core::device::write_support(),
+        &native_write_support(),
         &observe_native,
         &NativeHelper,
     )
@@ -415,6 +506,7 @@ impl PendingConfirmation {
             details,
             ticket: None,
             typed: None,
+            sources: None,
         })
     }
 
@@ -495,7 +587,11 @@ mod confirmation_tests {
     struct Recorder(std::cell::RefCell<Vec<ais_host_helper::protocol::Request>>);
 
     impl HelperLauncher for Recorder {
-        fn launch(&self, request: ais_host_helper::protocol::Request) -> Result<(), String> {
+        fn launch(
+            &self,
+            request: ais_host_helper::protocol::Request,
+            _sources: &[std::fs::File; 3],
+        ) -> Result<(), String> {
             self.0.borrow_mut().push(request);
             Ok(())
         }
@@ -506,6 +602,11 @@ mod confirmation_tests {
             enabled,
             reason: "SYNTHETIC_FIXTURE disabled",
         }
+    }
+
+    fn sources() -> [std::fs::File; 3] {
+        let open = || std::fs::File::open("/dev/null").unwrap();
+        [open(), open(), open()]
     }
 
     fn published_release() -> ais_host_core::release::PublishedRelease {
@@ -558,6 +659,7 @@ mod confirmation_tests {
             details: DeviceReviewDetails::default(),
             ticket: None,
             typed: None,
+            sources: Some(sources()),
         }
     }
 

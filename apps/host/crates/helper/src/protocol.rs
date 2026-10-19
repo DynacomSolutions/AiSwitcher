@@ -642,6 +642,14 @@ pub mod linux_transport {
         Ok(())
     }
 
+    pub fn current_uid() -> u32 {
+        unsafe extern "C" {
+            fn getuid() -> u32;
+        }
+        // SAFETY: getuid has no arguments and cannot fail.
+        unsafe { getuid() }
+    }
+
     /// True only when the whole root-owned installation verifies.
     pub fn helper_installed() -> bool {
         verify_installation().is_ok()
