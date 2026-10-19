@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-import json,os,socket,sys,select,time
+import json,os,socket,sys,select,termios,time
 from ais_guard_policy import escape_display
 D='/run/ais-guard/requests'
 def main():
@@ -20,6 +20,10 @@ def main():
         expected=escape_display(req.get('expected',''))
         prompt='Type exactly: '+expected if expected else 'Type each device identifier separated by spaces: '
         print(prompt,end='',flush=True)
+        # Discard anything typed before or just after the prompt appeared.
+        time.sleep(1.0)
+        try: termios.tcflush(sys.stdin.fileno(),termios.TCIFLUSH)
+        except (termios.error,OSError,ValueError): pass
         remaining=float(req.get('deadline',0))-time.monotonic()
         if remaining<=0 or not select.select([sys.stdin],[],[],remaining)[0]: return 126
         text=sys.stdin.readline(8193)

@@ -102,7 +102,7 @@ assert '\\x1b' in escape_display('\x1b[31m')
     execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
   });
 
-  test('daemon routes no-device execution as agent and refuses invalid read-only argv', () => {
+  test('daemon replies run-locally for no-device execution and refuses invalid read-only argv', () => {
     const script = String.raw`
 import importlib.machinery, importlib.util, json, os, socket, struct, sys
 sys.path.insert(0,'image/lib')
@@ -119,11 +119,10 @@ m.recv_req=lambda c:(c.req,[os.dup(0),os.dup(1),os.dup(2)])
 m.COMMANDS={'dd','lsblk'}
 m.resolve_devices=lambda name,args,cwd:(args,[])
 calls=[]
-m.run_agent=lambda argv,cwd,fds,uid:(calls.append((argv,cwd,uid)) or 17)
+m.run_root=lambda *a,**kw:calls.append(a)
 c=Conn({'op':'disk','argv':['dd','if=/dev/zero'],'cwd':'/'})
 m.handle(c)
-assert calls and calls[0][0]==['/usr/bin/dd','if=/dev/zero']
-assert c.sent[-1]['approved'] is True and c.sent[-1]['exit_code']==17 and c.closed
+assert not calls and c.sent[-1]=={'approved':True,'reason':'local'} and c.closed
 calls.clear(); c=Conn({'op':'disk','argv':['lsblk','--unsafe'],'cwd':'/'})
 m.handle(c)
 assert not calls and c.sent[-1]['approved'] is False and c.closed
@@ -154,7 +153,7 @@ m.resolve_devices=lambda n,a,c:(a,[('/dev/fake','/dev/fake',99)])
 m.popup=lambda *a: True
 oldstat=os.stat
 os.stat=lambda p,*a,**kw:(types.SimpleNamespace(st_rdev=99) if p=='/dev/fake' else oldstat(p,*a,**kw))
-calls=[]; m.run_root=lambda argv,fds,devs,readonly_mode=False:(calls.append((argv,list(fds),devs,readonly_mode)) or 23)
+calls=[]; m.run_root=lambda argv,fds,devs,readonly_mode=False,cwd='/':(calls.append((argv,list(fds),devs,readonly_mode)) or 23)
 c=Conn({'op':'disk','argv':['dd','of=/dev/fake'],'cwd':'/'})
 m.handle(c)
 assert len(calls)==1 and calls[0][0]==['/usr/bin/dd','of=/dev/fake']
@@ -185,6 +184,10 @@ m.subprocess.run=lambda *a,**kw:(calls.append((a,kw)) or Result())
 m.run_root(['/usr/bin/blkid','/dev/fake'],[0,1,2],[('/dev/fake','/dev/fake',10)],True)
 ro=' '.join(calls[-1][0][0]); assert 'DeviceAllow=/dev/fake r' in ro and 'DeviceAllow=/dev/fake rw' not in ro
 assert 'ProtectSystem=strict' in ro and 'PrivateTmp=yes' in ro
+for opt in ('NoExecPaths=/','ExecPaths=/usr','ProtectKernelTunables=yes','ProtectControlGroups=yes','ProtectKernelModules=yes'): assert opt in ro,opt
+assert '--working-directory=/ ' in ro+' '
+m.run_root(['/usr/bin/dd','if=./a'],[0,1,2],[('/dev/fake','/dev/fake',10)],False,'/srv/work')
+assert '--working-directory=/srv/work' in calls[-1][0][0]
 m.run_root(['/usr/bin/dd','of=/dev/fake'],[0,1,2],[('/dev/fake','/dev/fake',10)])
 rw=' '.join(calls[-1][0][0]); assert 'DeviceAllow=/dev/fake rw' in rw
 assert calls[-1][1]['env']=={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'}
@@ -219,7 +222,7 @@ m.uid_for=lambda n:os.getuid(); m.recv_req=lambda c:(c.req,[os.dup(0),os.dup(1),
 m.rate_check=lambda uid:None
 m.resolve_devices=lambda n,a,c:(a,[('/dev/fake','/dev/fake',44)])
 oldstat=os.stat; os.stat=lambda p,*a,**kw:(types.SimpleNamespace(st_rdev=44) if p=='/dev/fake' else oldstat(p,*a,**kw))
-calls=[]; m.run_root=lambda argv,fds,devs=(),readonly_mode=False:(calls.append((argv,list(fds))) or 0)
+calls=[]; m.run_root=lambda argv,fds,devs=(),readonly_mode=False,cwd='/':(calls.append((argv,list(fds))) or 0)
 m.popup=lambda *a:True
 rows=[line.split() for line in open('image/lib/ais-guard-table') if line.strip() and not line.lstrip().startswith('#')]
 for name,classification,target in rows:
@@ -257,7 +260,7 @@ os.mkdir(m.P)
 m.os.chown=lambda *a:None
 m.pwd.getpwuid=lambda uid:types.SimpleNamespace(pw_gid=os.getgid(),pw_dir=os.path.dirname(src))
 real_popen=m.subprocess.Popen
-m.subprocess.Popen=lambda *a,**kw:real_popen(*a,**{k:v for k,v in kw.items() if k!='preexec_fn'})
+m.subprocess.Popen=lambda *a,**kw:real_popen(*a,**{k:v for k,v in kw.items() if k not in ('user','group','extra_groups')})
 dest,digest=m.copy_pkg(src,os.getuid(),'copytest-SYNTHETIC_FIXTURE','/')
 with open(src,'wb') as f:f.write(b'mutated-SYNTHETIC_FIXTURE')
 assert open(dest,'rb').read()==b'original-SYNTHETIC_FIXTURE'
@@ -284,15 +287,13 @@ class C:
  def sendall(self,b): self.sent.append(json.loads(b))
  def close(self): pass
 m.uid_for=lambda n:os.getuid(); m.recv_req=lambda c:(c.req,[os.dup(0),os.dup(1),os.dup(2)]); m.rate_check=lambda u:None
+m.pkg_name=lambda dest:'pkg-one' if 'one' in dest else 'pkg-two'
 m.copy_pkg=lambda source,uid,rid,cwd:('/immutable/'+source,'hash-'+source)
 approved=[]; m.popup=lambda command,devs,expected,timeout:(approved.append((command,expected)) or True)
 class R: returncode=0
 count=0
 def run(argv,**kw):
  global count
- if argv[1:3]==['-Qp','--']:
-  count+=1
-  return type('Q',(),{'returncode':0,'stdout':('pkg-one' if count==1 else 'pkg-two')+' 1.0\n'})()
  assert '--noconfirm' in argv and '-U' in argv and '--' in argv
  return R()
 m.subprocess.run=run; m.os.unlink=lambda p:None; m.os.rmdir=lambda p:None
@@ -352,6 +353,143 @@ calls=[]; m.subprocess.run=lambda *a,**kw:calls.append(a); m.run_root=lambda *a,
 for args in (['--config','synthetic-fixture'],['-S','https://example.invalid/pkg'],['-U','https://example.invalid/pkg.pkg.tar.zst']):
  c=C({'op':'pacman','argv':['pacman',*args],'cwd':'/'}); m.handle(c); assert c.sent[-1]['approved'] is False
 assert calls==[]
+`;
+    execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
+  });
+
+  test('read-only requests with a non-device path operand never take the root path', () => {
+    const script = String.raw`
+import importlib.machinery, importlib.util, json, os, struct, sys, tempfile
+sys.path.insert(0,'image/lib')
+l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+class C:
+ def __init__(self,req): self.req=req; self.sent=[]
+ def settimeout(self,x): pass
+ def getsockopt(self,*a): return struct.pack('3i',1,os.getuid(),os.getgid())
+ def sendall(self,b): self.sent.append(json.loads(b))
+ def close(self): pass
+m.uid_for=lambda n:os.getuid(); m.recv_req=lambda c:(c.req,[os.dup(0),os.dup(1),os.dup(2)])
+calls=[]; m.run_root=lambda *a,**kw:(calls.append(a) or 0)
+d=tempfile.mkdtemp(dir='/dev/shm' if os.path.isdir('/dev/shm') else None); f=os.path.join(d,'x'); open(f,'w').close()
+for argv in (['sfdisk','-l',f],['btrfs','filesystem','show',f],['parted',f,'print']):
+ c=C({'op':'disk','argv':argv,'cwd':'/'}); m.handle(c)
+ assert not calls and c.sent[-1]=={'approved':True,'reason':'local'},(argv,c.sent)
+for argv in (['sfdisk','-l'],['blkid'],['btrfs','filesystem','show']):
+ c=C({'op':'disk','argv':argv,'cwd':'/'}); m.handle(c)
+ assert len(calls)==1 and c.sent[-1]['reason']=='readonly',argv
+ calls.clear()
+os.unlink(f); os.rmdir(d)
+`;
+    execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
+  });
+
+  test('root runs keep the checked cwd, and the popup shows the rewritten command', () => {
+    const script = String.raw`
+import importlib.machinery, importlib.util, json, os, struct, sys, types
+sys.path.insert(0,'image/lib')
+l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+class C:
+ def __init__(self,req): self.req=req; self.sent=[]
+ def settimeout(self,x): pass
+ def getsockopt(self,*a): return struct.pack('3i',1,os.getuid(),os.getgid())
+ def sendall(self,b): self.sent.append(json.loads(b))
+ def close(self): pass
+m.uid_for=lambda n:os.getuid(); m.recv_req=lambda c:(c.req,[os.dup(0),os.dup(1),os.dup(2)]); m.rate_check=lambda u:None
+m.resolve_devices=lambda n,a,c:(['if=./image.img','of=/dev/real-target'],[('/dev/link','/dev/real-target',7)])
+oldstat=os.stat; os.stat=lambda p,*a,**kw:(types.SimpleNamespace(st_rdev=7) if p=='/dev/real-target' else oldstat(p,*a,**kw))
+shown=[]; m.popup=lambda command,devs,expected,timeout:(shown.append(command) or True)
+calls=[]; m.run_root=lambda argv,fds,devs=(),readonly_mode=False,cwd='/':(calls.append((argv,cwd)) or 0)
+cwd=os.path.realpath('/usr')
+c=C({'op':'disk','argv':['dd','if=./image.img','of=/dev/link'],'cwd':cwd}); m.handle(c)
+assert calls[0][1]==cwd and calls[0][0]==['/usr/bin/dd','if=./image.img','of=/dev/real-target']
+assert '/dev/real-target' in shown[0] and '/dev/link' not in shown[0] and cwd in shown[0],shown
+`;
+    execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
+  });
+
+  test('a stalled client does not block other guarded calls', () => {
+    const script = String.raw`
+import importlib.machinery, importlib.util, os, socket, sys, threading, time
+sys.path.insert(0,'image/lib')
+l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+gate=threading.Event(); done=[]
+m.handle=lambda c:(gate.wait(5) if c.tag=='slow' else None, done.append(c.tag))
+class Cn:
+ def __init__(self,tag): self.tag=tag
+ def close(self): pass
+class L:
+ def __init__(self): self.q=[Cn('slow'),Cn('fast')]
+ def accept(self):
+  if self.q: return self.q.pop(0),None
+  raise KeyboardInterrupt
+ def settimeout(self,x): pass
+m.socket.socket=lambda fileno=None:L()
+os.environ['LISTEN_PID']=str(os.getpid()); os.environ['LISTEN_FDS']='1'
+m.os.geteuid=lambda:0
+try: m.main()
+except KeyboardInterrupt: pass
+t=time.monotonic()
+while 'fast' not in done and time.monotonic()-t<3: time.sleep(0.02)
+assert done==['fast'],done
+gate.set()
+`;
+    execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
+  });
+
+  test('package name comes from an unprivileged .PKGINFO read and archives are capped', () => {
+    const scratch = process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir();
+    const script = String.raw`
+import importlib.machinery, importlib.util, io, os, shutil, sys, tarfile, tempfile
+sys.path.insert(0,'image/lib')
+l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+assert '268435456' in open('image/lib/ais-guardd').read() and '2147483648' not in open('image/lib/ais-guardd').read()
+if not shutil.which('bsdtar'): sys.exit(0)
+d=tempfile.mkdtemp(dir=sys.argv[1])
+def pkg(name,info):
+ p=os.path.join(d,name)
+ with tarfile.open(p,'w') as t:
+  b=info.encode(); i=tarfile.TarInfo('.PKGINFO'); i.size=len(b); t.addfile(i,io.BytesIO(b))
+ return p
+assert m.pkg_name(pkg('a.pkg.tar','pkgname = synthetic-fixture\npkgver = 1-1\n'))=='synthetic-fixture'
+for bad in ('pkgname = a\npkgname = b\n','pkgver = 1\n','pkgname = a;b\n'):
+ try: m.pkg_name(pkg('b.pkg.tar',bad))
+ except ValueError: pass
+ else: raise AssertionError(bad)
+shutil.rmtree(d)
+`;
+    execFileSync('python3', ['-B', '-c', script, scratch], { cwd: join(import.meta.dir, '../..') });
+  });
+
+  test('popup requests carry a random code and discard pre-typed input', () => {
+    const script = String.raw`
+import importlib.machinery, importlib.util, json, os, sys, tempfile, types
+sys.path.insert(0,'image/lib')
+l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
+seen=[]
+for _ in range(2):
+ d=tempfile.mkdtemp(prefix='ais-popup-code-SYNTHETIC_FIXTURE-'); m.R=d
+ m.os.chown=m.os.fchown=lambda *a:None; m.uid_for=m.gid_for=lambda n:os.getuid()
+ m.pwd.getpwnam=lambda n:types.SimpleNamespace(pw_gid=os.getgid(),pw_dir='/',pw_uid=os.getuid())
+ m.herdr_socket=lambda u:'/x'; m.device_info=lambda p:{'path':p}
+ def run(argv,**kw):
+  doc=json.load(open([os.path.join(d,f) for f in os.listdir(d) if f.endswith('.json')][0])); seen.append(doc['expected']); raise RuntimeError('stop')
+ m.subprocess.run=run
+ try: m.popup('cmd',[('/dev/a','/dev/vdb',1)],'vdb',5)
+ except RuntimeError: pass
+ for f in os.listdir(d): os.unlink(os.path.join(d,f))
+ os.rmdir(d)
+assert all(x.startswith('vdb ') and len(x)==8 for x in seen) and seen[0]!=seen[1],seen
+# pop-up pane: sleeps, then flushes the tty input queue before reading
+import importlib
+pl=importlib.machinery.SourceFileLoader('pop','image/lib/ais-guard-popup'); ps=importlib.util.spec_from_loader(pl.name,pl); p=importlib.util.module_from_spec(ps); pl.exec_module(p)
+order=[]; p.time.sleep=lambda x:order.append(('sleep',x)); p.termios.tcflush=lambda fd,q:order.append(('flush',q))
+d=tempfile.mkdtemp(); p.D=d; rid='b'*32
+json.dump({'nonce':'n'*24,'command':'x','devices':[],'reply':os.path.join(d,rid+'.sock'),'expected':'vdb ab12','deadline':p.time.monotonic()+30},open(os.path.join(d,rid+'.json'),'w'))
+os.environ['AIS_GUARD_REQ']=rid; os.environ['AIS_GUARD_NONCE']='n'*24; sys.stdin=open('/dev/null'); so=sys.stdout; sys.stdout=open(os.devnull,'w')
+try: p.main()
+finally: sys.stdout=so
+assert order[0][0]=='sleep' and order[0][1]>=1 and order[1]==('flush',p.termios.TCIFLUSH),order
+os.unlink(os.path.join(d,rid+'.json')); os.rmdir(d)
 `;
     execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
   });

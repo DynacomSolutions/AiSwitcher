@@ -1,8 +1,8 @@
 #!/usr/bin/python3
-import array, hashlib, json, os, pwd, secrets, socket, stat, struct, subprocess, sys, time, re, shutil, select, errno
+import array, hashlib, json, os, pwd, re, secrets, select, socket, stat, struct, subprocess, sys, threading, time
 from ais_guard_policy import COMMANDS, readonly, resolve_devices, unsafe_options, pacman_args, timeout_for, escape_display
 SOCK='/run/ais-guard.sock'; R='/run/ais-guard/requests'; P='/run/ais-guard/packages'; MAX=65536
-RATE={}
+RATE={}; SLOTS=threading.BoundedSemaphore(16); PKG_MAX=268435456
 def uid_for(name): return pwd.getpwnam(name).pw_uid
 def gid_for(name): return pwd.getpwnam(name).pw_gid
 def recv_req(c):
@@ -72,7 +72,12 @@ def herdr_socket(uid):
     if len(found)!=1: raise ValueError('live herdr socket unavailable or ambiguous')
     return found[0]
 
+def with_code(expected):
+    # A per-request code means input typed ahead of the prompt can never match.
+    return (expected+' '+secrets.token_hex(2)).strip()
+
 def popup(command,devs,expected,timeout):
+    expected=with_code(expected)
     os.makedirs(R,mode=0o750,exist_ok=True); os.chown(R,0,gid_for('live')); os.chmod(R,0o750)
     rid=secrets.token_hex(16); nonce=secrets.token_urlsafe(24); path=R+'/'+rid+'.sock'; request=R+'/'+rid+'.json'
     deadline=time.monotonic()+timeout
@@ -120,10 +125,8 @@ def validate_reply(c,nonce,expected):
 
 def copy_pkg(src,uid,rid,cwd):
     # Source is opened by the unprivileged requester identity with O_NOFOLLOW.
-    helper="import os,stat,sys; p=sys.argv[1]; fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK); s=os.fstat(fd); (s.st_size<=2147483648 and stat.S_ISREG(s.st_mode)) or sys.exit(23);"
-    def drop():
-        os.setgroups([]); os.setgid(pwd.getpwuid(uid).pw_gid); os.setuid(uid)
-    proc=subprocess.Popen(['/usr/bin/python3','-c',helper+"\nos.write(1,b'')\nn=0\nwhile True:\n b=os.read(fd,1048576)\n if not b:break\n n+=len(b)\n if n>2147483648:sys.exit(24)\n v=memoryview(b)\n while v:\n  k=os.write(1,v)\n  v=v[k:]\n" ,src],cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,preexec_fn=drop,env={'PATH':'/usr/bin:/bin','HOME':pwd.getpwuid(uid).pw_dir})
+    helper="import os,stat,sys; p=sys.argv[1]; fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK); s=os.fstat(fd); (s.st_size<=268435456 and stat.S_ISREG(s.st_mode)) or sys.exit(23);"
+    proc=subprocess.Popen(['/usr/bin/python3','-c',helper+"\nos.write(1,b'')\nn=0\nwhile True:\n b=os.read(fd,1048576)\n if not b:break\n n+=len(b)\n if n>268435456:sys.exit(24)\n v=memoryview(b)\n while v:\n  k=os.write(1,v)\n  v=v[k:]\n" ,src],cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,user=uid,group=pwd.getpwuid(uid).pw_gid,extra_groups=[],env={'PATH':'/usr/bin:/bin','HOME':pwd.getpwuid(uid).pw_dir})
     os.makedirs(P+'/'+rid,mode=0o700,exist_ok=True); dest=P+'/'+rid+'/'+secrets.token_hex(8)+'.pkg'
     out=os.open(dest,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400); h=hashlib.sha256()
     try:
@@ -159,17 +162,29 @@ def copy_pkg(src,uid,rid,cwd):
         raise ValueError('invalid package file')
     os.chown(dest,0,0); return dest,h.hexdigest()
 
-def run_root(argv,fds,devices=(),readonly_mode=False):
-    cmd=['/usr/bin/systemd-run','--wait','--pipe','--collect','-p','ProtectSystem=strict','-p','ProtectHome=read-only','-p','PrivateTmp=yes','-p','NoNewPrivileges=yes','-p','RestrictSUIDSGID=yes','-p','DevicePolicy=closed']
+def pkg_name(dest):
+    # .PKGINFO is read by an unprivileged account through an inherited descriptor, never by root.
+    kw={'user':'nobody','group':'nobody','extra_groups':[]} if os.geteuid()==0 else {}
+    with open(dest,'rb') as f:
+        p=subprocess.Popen(['/usr/bin/bsdtar','-xOf','-','.PKGINFO'],stdin=f,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,cwd='/',env={'PATH':'/usr/bin:/bin','LANG':'C'},**kw)
+        try:
+            out=p.stdout.read(1048576)
+            if p.stdout.read(1): raise ValueError('package metadata too large')
+        finally:
+            p.stdout.close()
+            if p.poll() is None: p.kill()
+            code=p.wait()
+    names=re.findall(rb'^pkgname = (\S+)$',out,re.M)
+    if code or len(names)!=1 or not re.fullmatch(rb'[A-Za-z0-9@._+-]+',names[0]): raise ValueError('package metadata invalid')
+    return names[0].decode()
+
+def run_root(argv,fds,devices=(),readonly_mode=False,cwd='/'):
+    cmd=['/usr/bin/systemd-run','--wait','--pipe','--collect','-p','ProtectSystem=strict','-p','ProtectHome=read-only','-p','PrivateTmp=yes','-p','NoNewPrivileges=yes','-p','RestrictSUIDSGID=yes','-p','DevicePolicy=closed','-p','NoExecPaths=/','-p','ExecPaths=/usr','-p','ProtectKernelTunables=yes','-p','ProtectControlGroups=yes','-p','ProtectKernelModules=yes']
+    if readonly_mode: cmd += ['-p','RuntimeMaxSec=30']
     if readonly_mode and not devices: cmd += ['-p','DeviceAllow=block-* r']
     for _,p,_ in devices:cmd += ['-p','DeviceAllow='+p+(' r' if readonly_mode else ' rw')]
-    cmd += ['--working-directory=/','--',argv[0],*argv[1:]]
+    cmd += ['--working-directory='+cwd,'--',argv[0],*argv[1:]]
     return subprocess.run(cmd,stdin=fds[0],stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'},close_fds=True).returncode
-
-def run_agent(argv,cwd,fds,uid):
-    def drop():
-        os.setgroups([]);os.setgid(pwd.getpwuid(uid).pw_gid);os.setuid(uid);os.chdir(cwd)
-    return subprocess.run(argv,cwd=cwd,stdin=fds[0],stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/local/guard/bin:/usr/local/bin:/usr/bin:/bin','HOME':pwd.getpwuid(uid).pw_dir,'USER':'agent','LOGNAME':'agent','LANG':'C'},preexec_fn=drop,close_fds=True).returncode
 
 def handle(c):
     fds=[]
@@ -184,29 +199,31 @@ def handle(c):
             name=os.path.basename(a[0]); args=a[1:]
             if name not in COMMANDS:raise ValueError('command absent from guard table')
             rewritten,devs=resolve_devices(name,args,cwd)
+            # Operand-free read-only forms may read every block device as root. Any
+            # other device-free request is run by the client as agent ("local").
             if readonly(name,args):
                 if devs:
-                    code=run_root(['/usr/bin/'+name,*rewritten],fds,[(o,p,r) for o,p,r in devs],True)
-                elif name in {'blkid','sfdisk','btrfs'}:
+                    code=run_root(['/usr/bin/'+name,*rewritten],fds,devs,True,cwd)
+                elif name=='blkid' or (name=='sfdisk' and len(args)==1) or (name=='btrfs' and len(args)==2):
                     code=run_root(['/usr/bin/'+name,*rewritten],fds,(),True)
                 else:
-                    code=run_agent(['/usr/bin/'+name,*rewritten],cwd,fds,uid)
+                    send(c,True,'local');return
                 send(c,True,'readonly',code);return
             if any(line.split()[0]==name and line.split()[1]=='readonly-subcommands:all'
-                   for line in open(os.path.join(os.path.dirname(__file__),'ais-guard-table'),encoding='utf-8')
+                   for line in open(os.path.join(os.path.dirname(os.path.abspath(__file__)),'ais-guard-table'),encoding='utf-8')
                    if line.strip() and not line.lstrip().startswith('#')):
                 raise ValueError('read-only command grammar refused')
-            # A no-device request is always dropped to agent. It can never gain root.
+            # A no-device request never gains root: the client execs it as agent.
             if not devs:
-                code=run_agent(['/usr/bin/'+name,*args],cwd,fds,uid);send(c,True,'agent-exec',code);return
+                send(c,True,'local');return
             if unsafe_options(name,args):raise ValueError('unsafe command option')
             rate_check(uid)
-            cmd=escape_display(json.dumps(a,ensure_ascii=True,separators=(',',':')))
+            cmd=escape_display(json.dumps(['/usr/bin/'+name,*rewritten],ensure_ascii=True,separators=(',',':'))+' in '+json.dumps(cwd,ensure_ascii=True))
             timeout=timeout_for(open('/proc/cmdline').read())
             if not popup(cmd,devs,' '.join(os.path.basename(x[1]) for x in devs),timeout):raise ValueError('popup rejected or failed')
             for original,path,rdev in devs:
                 if os.stat(path).st_rdev!=rdev:raise ValueError('device changed after approval')
-            code=run_root(['/usr/bin/'+name,*rewritten],fds,devs);send(c,True,'root-exec',code);return
+            code=run_root(['/usr/bin/'+name,*rewritten],fds,devs,False,cwd);send(c,True,'root-exec',code);return
         if op in {'pacman','aur-install'}:
             args=a[1:] if a[0]=='pacman' else a
             if not args: raise ValueError('pacman arguments missing')
@@ -226,9 +243,7 @@ def handle(c):
             for index,source in enumerate(files):
                 rid=secrets.token_hex(16); dest,digest=copy_pkg(source,uid,rid,cwd)
                 try:
-                    q=subprocess.run(['/usr/bin/pacman','-Qp','--',dest],capture_output=True,text=True,env={'PATH':'/usr/bin:/bin','LANG':'C'},timeout=30)
-                    if q.returncode or not q.stdout.strip():raise ValueError('package metadata invalid')
-                    pkg=q.stdout.strip().split()[0]
+                    pkg=pkg_name(dest)
                     expected=req.get('expected_package') if op=='aur-install' else None
                     if op=='aur-install' and expected!=pkg:raise ValueError('package name mismatch')
                     approval='install '+pkg if op=='aur-install' else pkg
@@ -257,11 +272,19 @@ def handle(c):
             except OSError:pass
         c.close()
 
+def serve(c):
+    try:handle(c)
+    finally:SLOTS.release()
+
 def main():
     if os.geteuid()!=0 or os.environ.get('LISTEN_PID')!=str(os.getpid()) or os.environ.get('LISTEN_FDS')!='1':return 126
     s=socket.socket(fileno=3);s.settimeout(130)
     while True:
         try:c,_=s.accept()
         except socket.timeout:continue
-        handle(c)
+        if not SLOTS.acquire(blocking=False):
+            try:send(c,False,'guard busy')
+            except OSError:pass
+            c.close();continue
+        threading.Thread(target=serve,args=(c,),daemon=True).start()
 if __name__=='__main__':sys.exit(main())
