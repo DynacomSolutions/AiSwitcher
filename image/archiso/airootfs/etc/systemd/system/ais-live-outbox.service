@@ -1,7 +1,8 @@
 [Unit]
 Description=Write an encrypted AIS outbox bundle
 Requires=mnt-aisx.mount
-After=mnt-aisx.mount
+RequiresMountsFor=/mnt/persist
+After=mnt-aisx.mount mnt-persist.mount
 ConditionPathIsMountPoint=/mnt/persist
 
 [Service]
@@ -17,6 +18,6 @@ UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ReadWritePaths=/mnt/aisx /run/ais-live-exchange
+ReadWritePaths=/mnt/aisx -/mnt/persist/ais-live-exchange /run/ais-live-exchange
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

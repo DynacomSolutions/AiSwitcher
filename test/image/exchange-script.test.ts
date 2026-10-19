@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, readdir, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile, chmod, unlink } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,9 +44,9 @@ function tarConcat(...chunks: Uint8Array[]): Uint8Array {
   return result;
 }
 
-async function fixtureTar(seq: number): Promise<Uint8Array> {
+async function fixtureTar(seq: number, kind: "inbox" | "outbox" = "outbox"): Promise<Uint8Array> {
   const manifest = new TextEncoder().encode(JSON.stringify({
-    version: 1, seq, createdAt: "2026-10-19T00:00:00.000Z", kind: "outbox", entries: [], lastInboxSeq: 7,
+    version: 1, seq, createdAt: "2026-10-19T00:00:00.000Z", kind, entries: [], lastInboxSeq: 7,
   }));
   return tarConcat(tarFile("manifest.json", manifest));
 }
@@ -56,6 +56,7 @@ async function harness(): Promise<{ root: string; path: string; tar: Uint8Array 
   const path = join(root, "bin");
   await mkdir(path);
   await mkdir(join(root, "run"));
+  await mkdir(join(root, "persist"));
   await mkdir(join(root, "inbox"));
   await mkdir(join(root, "outbox"));
   const tar = await fixtureTar(1);
@@ -63,8 +64,9 @@ async function harness(): Promise<{ root: string; path: string; tar: Uint8Array 
   const helpers: Record<string, string> = {
     keyctl: `#!/bin/bash\ncase $1 in search) printf '73\\n' ;; pipe) [[ \${AIS_TEST_KEY_PIPE_FAIL:-0} == 1 ]] && exit 71; printf '${fixtureCredential}' ;; *) exit 64 ;; esac\n`,
     age: `#!/bin/bash\npassphrase=$(cat <&3) || exit 65\n[[ $passphrase == '${fixtureCredential}' ]] || exit 66\nif [[ \${AIS_TEST_AGE_PARTIAL_FAIL:-0} == 1 ]]; then head -c 512; exit 67; fi\nif [[ \${AIS_TEST_AGE_FAIL:-0} == 1 ]]; then exit 67; fi\nif [[ \${AIS_TEST_AGE_OVERFLOW:-0} == 1 ]]; then head -c 67108865 /dev/zero; else cat; fi\n`,
+    sync: `#!/bin/bash\nprintf '%s\\n' "$*" >>"$AIS_TEST_SYNC_LOG"\n`,
     runuser: `#!/bin/bash\n[[ $1 == -u && $2 == agent && $3 == -- ]] || exit 68\nshift 3\nif [[ \${AIS_TEST_COLLECT_OVERFLOW:-0} == 1 ]]; then head -c 33554433 /dev/zero; else exec "$@"; fi\n`,
-    ais: `#!/bin/bash\ncase "$2" in write-outbox) cat "$AIS_TEST_FIXTURE_TAR" ;; apply-inbox) cat >"$AIS_TEST_APPLIED"; code=\${AIS_TEST_APPLY_STATUS:-0}; if [[ $code == 0 ]]; then printf 'AIS-LIVE: stage=inbox status=ok applied=1 skipped=0\\n' >&2; fi; exit "$code" ;; *) exit 69 ;; esac\n`,
+    ais: `#!/bin/bash\nprintf '%s\\n' "$@" >>"$AIS_TEST_ARGS"\ncase "$2" in write-outbox) cat "$AIS_TEST_FIXTURE_TAR" ;; apply-inbox) cat >"$AIS_TEST_APPLIED"; code=\${AIS_TEST_APPLY_STATUS:-0}; if [[ $code == 0 ]]; then printf 'AIS-LIVE: stage=inbox status=ok applied=1 skipped=0\\n' >&2; fi; exit "$code" ;; *) exit 69 ;; esac\n`,
   };
   for (const [name, body] of Object.entries(helpers)) {
     const file = join(path, name);
@@ -83,6 +85,8 @@ async function run(root: string, path: string, args: string[], extra: Record<str
       AIS_LIVE_TEST_ROOT: root,
       AIS_TEST_FIXTURE_TAR: join(root, "fixture.tar"),
       AIS_TEST_APPLIED: join(root, "applied.tar"),
+      AIS_TEST_ARGS: join(root, "ais-args"),
+      AIS_TEST_SYNC_LOG: join(root, "sync.log"),
       ...extra,
     },
     stdout: "pipe", stderr: "pipe",
@@ -95,38 +99,43 @@ async function run(root: string, path: string, args: string[], extra: Record<str
 
 describe("root exchange wrapper protocol", () => {
   test("authenticates to a private temporary tar before invoking the agent apply command", async () => {
-    const { root, path, tar } = await harness();
-    await writeFile(join(root, "inbox", "bundle-4.age"), tar);
+    const { root, path } = await harness();
+    const inbox = await fixtureTar(4, "inbox");
+    await writeFile(join(root, "inbox", "BUNDLE-4.AGE"), inbox);
     const result = await run(root, path, ["apply-inbox"]);
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain("stage=inbox status=ok applied=");
-    expect(Buffer.from(await readFile(join(root, "applied.tar")))).toEqual(Buffer.from(tar));
+    expect(Buffer.from(await readFile(join(root, "applied.tar")))).toEqual(Buffer.from(inbox));
+    expect((await readFile(join(root, "ais-args"), "utf8"))).toContain("--last-inbox-seq=0");
+    expect(JSON.parse(await readFile(join(root, "persist", "ais-live-exchange", "applied-inbox-seq.json"), "utf8")).seq).toBe(4);
     expect(await readdir(join(root, "run", "ais-live-exchange"))).toEqual(["exchange.lock"]);
   });
 
   test("does not invoke the agent or retain plaintext when age rejects an inbox", async () => {
-    const { root, path, tar } = await harness();
-    await writeFile(join(root, "inbox", "bundle-5.age"), tar);
+    const { root, path } = await harness();
+    await writeFile(join(root, "inbox", "bundle-5.age"), await fixtureTar(5, "inbox"));
     const result = await run(root, path, ["apply-inbox"], { AIS_TEST_AGE_FAIL: "1" });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("status=rejected reason=authentication");
     await expect(readFile(join(root, "applied.tar"))).rejects.toThrow();
     expect(await readdir(join(root, "run", "ais-live-exchange"))).toEqual(["exchange.lock"]);
+    await expect(readFile(join(root, "persist", "ais-live-exchange", "applied-inbox-seq.json"))).rejects.toThrow();
   });
 
   test("does not apply partially emitted plaintext when age authentication fails", async () => {
-    const { root, path, tar } = await harness();
-    await writeFile(join(root, "inbox", "bundle-5.age"), tar);
+    const { root, path } = await harness();
+    await writeFile(join(root, "inbox", "bundle-5.age"), await fixtureTar(5, "inbox"));
     const result = await run(root, path, ["apply-inbox"], { AIS_TEST_AGE_PARTIAL_FAIL: "1" });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("status=rejected reason=authentication");
     await expect(readFile(join(root, "applied.tar"))).rejects.toThrow();
     expect(await readdir(join(root, "run", "ais-live-exchange"))).toEqual(["exchange.lock"]);
+    await expect(readFile(join(root, "persist", "ais-live-exchange", "applied-inbox-seq.json"))).rejects.toThrow();
   });
 
   test("bounds authenticated plaintext before invoking the agent", async () => {
     const { root, path, tar } = await harness();
-    await writeFile(join(root, "inbox", "bundle-5.age"), tar);
+    await writeFile(join(root, "inbox", "bundle-5.age"), await fixtureTar(5, "inbox"));
     const result = await run(root, path, ["apply-inbox"], { AIS_TEST_AGE_OVERFLOW: "1" });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("reason=size");
@@ -138,7 +147,7 @@ describe("root exchange wrapper protocol", () => {
     const { root, path } = await harness();
     const newerTar = await fixtureTar(2);
     await writeFile(join(root, "fixture.tar"), newerTar);
-    await writeFile(join(root, "outbox", "bundle-1.age"), "older");
+    await writeFile(join(root, "outbox", "BUNDLE-1.AGE"), "older");
     const result = await run(root, path, ["write-outbox"]);
     expect(result.exitCode, result.stderr).toBe(0);
     expect(result.stderr).toContain("status=written seq=2");
@@ -191,11 +200,59 @@ describe("root exchange wrapper protocol", () => {
   });
 
   test("defers clock or console conflicts using the CLI exit contract", async () => {
-    const { root, path, tar } = await harness();
-    await writeFile(join(root, "inbox", "bundle-6.age"), tar);
+    const { root, path } = await harness();
+    await writeFile(join(root, "inbox", "bundle-6.age"), await fixtureTar(6, "inbox"));
     const result = await run(root, path, ["apply-inbox"], { AIS_TEST_APPLY_STATUS: "2" });
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("status=deferred reason=clock-or-conflict");
+    await expect(readFile(join(root, "persist", "ais-live-exchange", "applied-inbox-seq.json"))).rejects.toThrow();
+  });
+
+  test("does not advance applied highwater after a failed merge", async () => {
+    const { root, path } = await harness();
+    await writeFile(join(root, "inbox", "bundle-8.age"), await fixtureTar(8, "inbox"));
+    const result = await run(root, path, ["apply-inbox"], { AIS_TEST_APPLY_STATUS: "1" });
+    expect(result.exitCode).toBe(1);
+    await expect(readFile(join(root, "persist", "ais-live-exchange", "applied-inbox-seq.json"))).rejects.toThrow();
+  });
+
+  test("prevents inbox replay after restoring stale agent-home state", async () => {
+    const { root, path } = await harness();
+    const state = join(root, "persist", "ais-live-exchange");
+    const restoredHomeState = join(root, "home", "agent", ".ais", "live");
+    await mkdir(restoredHomeState, { recursive: true });
+    await writeFile(join(restoredHomeState, "exchange-state.json"), '{"version":1,"lastInboxSeq":0,"hashes":{}}\n');
+    await writeFile(join(root, "inbox", "bundle-9.age"), await fixtureTar(9, "inbox"));
+    const first = await run(root, path, ["apply-inbox"]);
+    expect(first.exitCode).toBe(0);
+    expect(first.stderr).toContain("status=ok");
+    const invoked = await readFile(join(root, "ais-args"), "utf8");
+    expect(invoked).toContain("--last-inbox-seq=0");
+    expect(JSON.parse(await readFile(join(state, "applied-inbox-seq.json"), "utf8")).seq).toBe(9);
+    // Restoring the agent snapshot cannot restore the root-owned counter.
+    await writeFile(join(restoredHomeState, "exchange-state.json"), '{"version":1,"lastInboxSeq":0,"hashes":{}}\n');
+    const replay = await run(root, path, ["apply-inbox"]);
+    expect(replay.exitCode).toBe(0);
+    expect(replay.stderr).toContain("reason=stale");
+    expect(await readFile(join(root, "ais-args"), "utf8")).toBe(invoked);
+    expect((await readFile(join(state, "applied-inbox-seq.json"), "utf8"))).toContain('"seq":9');
+  });
+
+  test("reserves a root outbox sequence across deletion of the visible bundle", async () => {
+    const { root, path } = await harness();
+    await writeFile(join(root, "fixture.tar"), await fixtureTar(1));
+    expect((await run(root, path, ["write-outbox"])).exitCode).toBe(0);
+    await mkdir(join(root, "home", "agent", ".ais", "live"), { recursive: true });
+    await writeFile(join(root, "home", "agent", ".ais", "live", "outbox-seq.json"), '{"version":1,"seq":0}\n');
+    await writeFile(join(root, "outbox", "BUNDLE-1.AGE"), "restored old snapshot");
+    await writeFile(join(root, "fixture.tar"), await fixtureTar(2));
+    await unlink(join(root, "outbox", "bundle-1.age"));
+    const result = await run(root, path, ["write-outbox"]);
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stderr).toContain("status=written seq=2");
+    expect((await readFile(join(root, "ais-args"), "utf8"))).toContain("--seq=2");
+    expect(JSON.parse(await readFile(join(root, "persist", "ais-live-exchange", "outbox-seq.json"), "utf8")).seq).toBe(2);
+    expect(await readdir(join(root, "outbox"))).toEqual(["bundle-2.age"]);
   });
 });
 

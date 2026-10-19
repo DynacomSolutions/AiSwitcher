@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { constants } from "node:fs";
-import { mkdtemp, mkdir, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseBundleTar } from "../../src/live/bundle.ts";
@@ -96,6 +96,34 @@ describe("outbox writer", () => {
       await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 27, hashes: {} }));
       const result = await writeOutbox({ home });
       expect(result.manifest.lastInboxSeq).toBe(27);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("uses a supplied root sequence without consulting the home cache and prunes mixed-case bundles", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-outbox-"));
+    const exchange = await mkdtemp(join(tmpdir(), "ais-live-exchange-"));
+    try {
+      await mkdir(join(home, ".ais", "live"), { recursive: true });
+      await writeFile(join(home, ".ais", "live", "outbox-seq.json"), '{"version":1,"seq":99}\n');
+      await mkdir(join(exchange, "outbox"));
+      await writeFile(join(exchange, "outbox", "BUNDLE-1.AGE"), "old");
+      const result = await writeOutbox({
+        home, exchangeDir: exchange, seq: 2, lastInboxSeq: 17,
+        encrypt: async (tar) => tar,
+      });
+      expect(result.seq).toBe(2);
+      expect(result.manifest.lastInboxSeq).toBe(17);
+      expect(await readdir(join(exchange, "outbox"))).toEqual(["bundle-2.age"]);
+      expect(JSON.parse(await readFile(join(home, ".ais", "live", "outbox-seq.json"), "utf8")).seq).toBe(99);
+    } finally { await rm(home, { recursive: true, force: true }); await rm(exchange, { recursive: true, force: true }); }
+  });
+
+  test("rejects supplied outbox sequences outside the positive safe integer range", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-outbox-"));
+    try {
+      for (const seq of [0, -1, Number.MAX_SAFE_INTEGER + 1, Number.NaN]) {
+        await expect(writeOutbox({ home, seq })).rejects.toThrow("positive safe integer");
+      }
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 });

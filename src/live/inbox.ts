@@ -1,12 +1,16 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { open as openFile, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { parseBundleTar, type Bundle, type BundleManifest } from "./bundle.ts";
 import { classify } from "./path-classes.ts";
-import { openHomeDirectory, readHomeFile, writeHomeFileAtomic } from "./safe-fs.ts";
+import { openHomeDirectory, openParent, readHomeFile, writeHomeFileAtomic } from "./safe-fs.ts";
 import { mergeJsonlLineSets } from "../sync/dedupe.ts";
-import { decodeJwtPayload } from "../identities/oauth-reconcile.ts";
+import { decodeJwtPayload, readPiEntry } from "../identities/oauth-reconcile.ts";
 import { canonicalConfig } from "./portable.ts";
+import { hasOpenOwner } from "../sync/tree-merge.ts";
+import { join } from "node:path";
+import { withOauthRefreshLock } from "../identities/claude-swap-lock.ts";
 
 interface InboxState {
   version: 1;
@@ -39,18 +43,30 @@ export interface ApplyInboxDeps {
   isTTY?: boolean;
   chooseConflict?: (path: string) => Promise<"drive" | "bundle">;
   log?: (message: string) => void;
+  lastInboxSeq?: number;
+  /** Test seam for exercising the active-writer safety check. */
+  hasOpenOwner?: (path: string) => Promise<boolean | undefined>;
 }
 
 const STATE_REL = ".ais/live/exchange-state.json";
 
 function hash(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
-function configHash(path: string, bytes: Uint8Array): string { return hash(canonicalConfig(path, bytes)); }
+function stable(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, stable(item)]));
+  return value;
+}
+export function configHash(path: string, bytes: Uint8Array): string {
+  const canonical = canonicalConfig(path, bytes);
+  if (!path.endsWith(".json")) return hash(canonical);
+  return hash(new TextEncoder().encode(JSON.stringify(stable(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(canonical))))));
+}
 
 function plausible(clock: InboxClock): boolean {
   if (![clock.nowMs, clock.imageBuildTimeMs, clock.newestPersistedMtimeMs].every(Number.isFinite)) return false;
   if (clock.nowMs <= clock.imageBuildTimeMs) return false;
   if (clock.nowMs < clock.newestPersistedMtimeMs) return false;
-  if (clock.online && (clock.httpDateMs === undefined || !Number.isFinite(clock.httpDateMs))) return false;
+  if (clock.online && (clock.httpDateMs === undefined || !Number.isFinite(clock.httpDateMs) || Math.abs(clock.nowMs - clock.httpDateMs) > 60 * 60 * 1000)) return false;
   if (clock.httpDateMs !== undefined && Math.abs(clock.nowMs - clock.httpDateMs) > 60 * 60 * 1000) return false;
   return true;
 }
@@ -71,7 +87,7 @@ function grantMintedTime(value: Record<string, unknown>): number | undefined {
     const stamp = seconds(value[key], key);
     if (stamp !== undefined) stamps.push(stamp);
   }
-  for (const key of ["access_token", "accessToken", "token"]) {
+  for (const key of ["access_token", "accessToken", "access", "token"]) {
     const token = value[key];
     if (typeof token === "string") {
       const claims = decodeJwtPayload(token);
@@ -109,7 +125,7 @@ function grantTime(value: Record<string, unknown>): number {
 }
 
 function containsGrant(value: Record<string, unknown>): boolean {
-  return ["access_token", "accessToken", "refresh_token", "refreshToken", "token", "apiKey", "api_key"].some((key) => key in value);
+  return ["access_token", "accessToken", "access", "refresh_token", "refreshToken", "refresh", "token", "apiKey", "api_key"].some((key) => key in value);
 }
 
 function isAtomicGrant(value: Record<string, unknown>): boolean {
@@ -121,23 +137,43 @@ function isAtomicGrant(value: Record<string, unknown>): boolean {
   return false;
 }
 
-function mergeAuth(current: unknown, incoming: unknown): unknown {
+async function piGrantTime(root: FileHandle, provider: string, entry: Record<string, unknown>): Promise<number> {
+  const path = `.ais/live/.grant-snapshot-${randomUUID()}.json`;
+  const parent = await openParent(root, path.split("/"), true);
+  const bytes = new TextEncoder().encode(JSON.stringify({ [provider]: entry }));
+  const tempName = `.${parent.leaf}.tmp-${randomUUID()}`;
+  let created = false;
+  try {
+    const file = await openFile(`/proc/self/fd/${parent.dir.fd}/${tempName}`, "wx", 0o600);
+    try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
+    await rename(`/proc/self/fd/${parent.dir.fd}/${tempName}`, `/proc/self/fd/${parent.dir.fd}/${parent.leaf}`);
+    created = true;
+    const copy = await readPiEntry(`/proc/self/fd/${parent.dir.fd}/${parent.leaf}`, provider);
+    return copy?.grant.minted_at ?? copy?.grant.expires_at ?? -1;
+  } finally {
+    await unlink(`/proc/self/fd/${parent.dir.fd}/${created ? parent.leaf : tempName}`).catch(() => undefined);
+    if (parent.dir !== root) await parent.dir.close();
+  }
+}
+
+async function mergeAuth(current: unknown, incoming: unknown, root: FileHandle, provider?: string): Promise<unknown> {
   if (!current || typeof current !== "object" || Array.isArray(current) || !incoming || typeof incoming !== "object" || Array.isArray(incoming)) return incoming;
   const oldRecord = current as Record<string, unknown>;
   const newRecord = incoming as Record<string, unknown>;
-  if (isAtomicGrant(oldRecord) && isAtomicGrant(newRecord)) return grantTime(oldRecord) > grantTime(newRecord) ? current : incoming;
+  if (isAtomicGrant(oldRecord) && isAtomicGrant(newRecord)) {
+    const oldTime = provider && oldRecord.type === "oauth" ? await piGrantTime(root, provider, oldRecord) : grantTime(oldRecord);
+    const newTime = provider && newRecord.type === "oauth" ? await piGrantTime(root, provider, newRecord) : grantTime(newRecord);
+    return oldTime >= newTime ? current : incoming;
+  }
   const merged: Record<string, unknown> = { ...oldRecord };
   for (const [key, value] of Object.entries(newRecord)) {
-    merged[key] = key in oldRecord ? mergeAuth(oldRecord[key], value) : value;
+    const oldValue = oldRecord[key];
+    if (oldValue && typeof oldValue === "object" && !Array.isArray(oldValue) && value && typeof value === "object" && !Array.isArray(value)) {
+      const oldNested = oldValue as Record<string, unknown>; const newNested = value as Record<string, unknown>;
+      merged[key] = await mergeAuth(oldNested, newNested, root, key);
+    } else merged[key] = key in oldRecord ? await mergeAuth(oldValue, value, root) : value;
   }
   return merged;
-}
-
-function authFreshness(bytes: Uint8Array): number {
-  try {
-    const parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as Record<string, unknown>;
-    return grantTime(parsed);
-  } catch { return -1; }
 }
 
 function mergeLogs(current: Uint8Array | undefined, incoming: Uint8Array): Uint8Array {
@@ -165,14 +201,16 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
   const root = await openHomeDirectory(home);
   try {
     const state = await readState(root, statePath);
-    if (bundle.manifest.seq <= state.lastInboxSeq) {
-      return { applied: 0, skipped: bundle.manifest.entries.length, conflicts: [], lastInboxSeq: state.lastInboxSeq };
+    if (deps.lastInboxSeq !== undefined && (!Number.isSafeInteger(deps.lastInboxSeq) || deps.lastInboxSeq < 0)) throw new Error("lastInboxSeq must be a non-negative safe integer");
+    const lastInboxSeq = Math.max(state.lastInboxSeq, deps.lastInboxSeq ?? 0);
+    if (bundle.manifest.seq <= lastInboxSeq) {
+      return { applied: 0, skipped: bundle.manifest.entries.length, conflicts: [], lastInboxSeq };
     }
     const authEntries = bundle.manifest.entries.filter((entry) => entry.class === "auth");
     const authReady = authEntries.length === 0 || plausible(deps.clock);
     if (!authReady) {
       deps.log?.("AIS-LIVE: stage=inbox status=deferred");
-      return { applied: 0, skipped: bundle.manifest.entries.length, conflicts: [], deferred: "clock is not plausible for credential merge", lastInboxSeq: state.lastInboxSeq };
+      return { applied: 0, skipped: bundle.manifest.entries.length, conflicts: [], deferred: "clock is not plausible for credential merge", lastInboxSeq };
     }
 
     const conflicts: string[] = [];
@@ -181,14 +219,15 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
       if (!entry.class.startsWith("config:")) continue;
       const current = await readHomeFile(root, entry.path);
       const baseline = state.hashes[entry.path];
-      if (current && baseline && configHash(entry.path, current) !== baseline && entry.sha256 !== baseline && configHash(entry.path, current) !== entry.sha256) conflicts.push(entry.path);
+      const incoming = bundle.files.get(entry.path);
+      if (current && incoming && baseline && configHash(entry.path, current) !== baseline && configHash(entry.path, incoming) !== baseline && configHash(entry.path, current) !== configHash(entry.path, incoming)) conflicts.push(entry.path);
     }
     if (conflicts.length && !deps.isTTY) {
       deps.log?.("AIS-LIVE: stage=inbox status=deferred");
-      return { applied: 0, skipped: bundle.manifest.entries.length, conflicts, deferred: "configuration conflicts need a terminal", lastInboxSeq: state.lastInboxSeq };
+      return { applied: 0, skipped: bundle.manifest.entries.length, conflicts, deferred: "configuration conflicts need a terminal", lastInboxSeq };
     }
     for (const path of conflicts) {
-      if (!deps.chooseConflict) return { applied: 0, skipped: bundle.manifest.entries.length, conflicts, deferred: "configuration conflict choice is unavailable", lastInboxSeq: state.lastInboxSeq };
+      if (!deps.chooseConflict) return { applied: 0, skipped: bundle.manifest.entries.length, conflicts, deferred: "configuration conflict choice is unavailable", lastInboxSeq };
       decisions.set(path, await deps.chooseConflict(path));
     }
 
@@ -201,27 +240,51 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
       if (!content) continue;
       const decision = decisions.get(entry.path);
       const current = await readHomeFile(root, entry.path);
-      if (decision === "drive") { nextHashes[entry.path] = entry.sha256; continue; }
-      if (entry.class.startsWith("config:") && current && state.hashes[entry.path] && configHash(entry.path, current) !== state.hashes[entry.path] && entry.sha256 === state.hashes[entry.path]) {
-        nextHashes[entry.path] = entry.sha256;
+      if (decision === "drive") { nextHashes[entry.path] = configHash(entry.path, content); continue; }
+      if (entry.class.startsWith("config:") && current && configHash(entry.path, current) === configHash(entry.path, content)) {
+        nextHashes[entry.path] = configHash(entry.path, content);
         continue;
       }
-      let bytes = entry.class === "logs" ? mergeLogs(current, content) : entry.class.startsWith("config:") ? canonicalConfig(entry.path, content) : content;
-      if (entry.class === "auth" && current) {
-        try { bytes = new TextEncoder().encode(JSON.stringify(mergeAuth(JSON.parse(new TextDecoder().decode(current)), JSON.parse(new TextDecoder().decode(content)))) + "\n"); }
-        catch { bytes = authFreshness(current) > authFreshness(content) ? current : content; }
+      if (entry.class.startsWith("config:") && current && state.hashes[entry.path] && configHash(entry.path, current) !== state.hashes[entry.path] && configHash(entry.path, content) === state.hashes[entry.path]) {
+        nextHashes[entry.path] = configHash(entry.path, content);
+        continue;
       }
-      planned.push({ path: entry.path, bytes, ...(entry.class === "ssh" ? { mode: 0o600 } : {}), hash: hash(bytes) });
+      const bytes = entry.class === "logs" ? mergeLogs(current, content) : entry.class.startsWith("config:") ? canonicalConfig(entry.path, content) : content;
+      planned.push({ path: entry.path, bytes, ...(entry.class === "ssh" ? { mode: 0o600 } : {}), hash: entry.class.startsWith("config:") ? configHash(entry.path, content) : hash(bytes) });
     }
     // All paths have been validated and existing contents read before writes begin.
     for (const item of planned) {
-      await writeHomeFileAtomic(root, item.path, item.bytes, item.mode);
+      const entry = bundle.manifest.entries.find((candidate) => candidate.path === item.path)!;
+      if (entry.class === "auth") {
+        const parent = await openParent(root, item.path.split("/"), true);
+        try {
+          const configDir = `/proc/self/fd/${parent.dir.fd}`;
+          await withOauthRefreshLock(configDir, async (lock) => {
+            const existing = await readHomeFile(parent.dir, parent.leaf);
+            const ownerPath = `/proc/self/fd/${parent.dir.fd}/${parent.leaf}`;
+            const owner = deps.hasOpenOwner ? await deps.hasOpenOwner(ownerPath) : await hasOpenOwner(ownerPath, { lookups: 0 });
+            if (owner !== false) throw new Error(`credential file is busy or cannot be safely checked: ${item.path}`);
+            const incoming = bundle.files.get(item.path)!;
+            let bytes = incoming;
+            if (existing && item.path.endsWith(".json")) {
+              const oldAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(existing)) as Record<string, unknown>;
+              const newAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(incoming)) as Record<string, unknown>;
+              bytes = new TextEncoder().encode(JSON.stringify(await mergeAuth(oldAuth, newAuth, root)) + "\n");
+            } else if (existing) {
+              bytes = incoming;
+            }
+            if (lock.isLost()) throw new Error(`credential lock was lost before writing: ${item.path}`);
+            await writeHomeFileAtomic(parent.dir, parent.leaf, bytes, item.mode);
+            item.hash = hash(bytes);
+          });
+        } finally { if (parent.dir !== root) await parent.dir.close(); }
+      } else await writeHomeFileAtomic(root, item.path, item.bytes, item.mode);
       nextHashes[item.path] = item.hash;
       applied++;
     }
     // A deferred auth merge must be retried, so its seq cannot be acknowledged yet.
     if (authReady) {
-      const next: InboxState = { version: 1, lastInboxSeq: bundle.manifest.seq, hashes: nextHashes };
+      const next: InboxState = { version: 1, lastInboxSeq: Math.max(lastInboxSeq, bundle.manifest.seq), hashes: nextHashes };
       await writeHomeFileAtomic(root, statePath, new TextEncoder().encode(JSON.stringify(next) + "\n"));
     }
     return {
@@ -229,7 +292,7 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
       skipped: bundle.manifest.entries.length - applied,
       conflicts,
       ...(authReady ? {} : { deferred: "clock is not plausible for credential merge" }),
-      lastInboxSeq: authReady ? bundle.manifest.seq : state.lastInboxSeq,
+      lastInboxSeq: authReady ? Math.max(lastInboxSeq, bundle.manifest.seq) : lastInboxSeq,
     };
   } finally { await root.close(); }
 }

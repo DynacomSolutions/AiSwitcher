@@ -3,8 +3,9 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { applyInbox } from "../../src/live/inbox.ts";
+import { applyInbox, configHash } from "../../src/live/inbox.ts";
 import { newestPersistedMtime, openHomeDirectory } from "../../src/live/safe-fs.ts";
+import { withOauthRefreshLock } from "../../src/identities/claude-swap-lock.ts";
 import { makeTar } from "./fixtures.ts";
 
 describe("inbox apply", () => {
@@ -93,6 +94,69 @@ describe("inbox apply", () => {
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
+  test("keeps Pi and OpenCode access and refresh grants atomic", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      await mkdir(join(home, ".pi"), { recursive: true });
+      const authPath = join(home, ".pi", "auth.json");
+      await writeFile(authPath, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_ACCESS_NEW", refresh: "SYNTHETIC_FIXTURE_PI_REFRESH_NEW", expires: 1_900_000_000_000 } }));
+      const oldPi = new TextEncoder().encode(JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_ACCESS_OLD", refresh: "SYNTHETIC_FIXTURE_PI_REFRESH_OLD", expires: 1_800_000_000_000 } }));
+      await applyInbox({ tar: makeTar({}, [{ path: ".pi/auth.json", class: "auth", bytes: oldPi }]), home, clock: goodClock });
+      const pi = JSON.parse(await readFile(authPath, "utf8"));
+      expect(pi.anthropic.access).toBe("SYNTHETIC_FIXTURE_PI_ACCESS_NEW");
+      expect(pi.anthropic.refresh).toBe("SYNTHETIC_FIXTURE_PI_REFRESH_NEW");
+
+      await mkdir(join(home, ".opencode"), { recursive: true });
+      const openCodePath = join(home, ".opencode", "auth.json");
+      await writeFile(openCodePath, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_OC_ACCESS_NEW", refresh: "SYNTHETIC_FIXTURE_OC_REFRESH_NEW", expires: 1_900_000_000_000 } }));
+      const oldOpenCode = new TextEncoder().encode(JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_OC_ACCESS_OLD", refresh: "SYNTHETIC_FIXTURE_OC_REFRESH_OLD", expires: 1_800_000_000_000 } }));
+      await applyInbox({ tar: makeTar({ seq: 2 }, [{ path: ".opencode/auth.json", class: "auth", bytes: oldOpenCode }]), home, clock: goodClock });
+      const openCode = JSON.parse(await readFile(openCodePath, "utf8"));
+      expect(openCode.anthropic.access).toBe("SYNTHETIC_FIXTURE_OC_ACCESS_NEW");
+      expect(openCode.anthropic.refresh).toBe("SYNTHETIC_FIXTURE_OC_REFRESH_NEW");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("uses the existing Pi reader JWT minted time when the newer grant expires sooner", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const dir = join(home, ".pi");
+      const authPath = join(dir, "auth.json");
+      await mkdir(dir, { recursive: true });
+      const jwt = (iat: number) => `header.${Buffer.from(JSON.stringify({ iat })).toString("base64url")}.signature`;
+      await writeFile(authPath, JSON.stringify({ anthropic: { type: "oauth", access: jwt(1_800_000_000), refresh: "SYNTHETIC_FIXTURE_LOCAL_REFRESH", expires: 1_800_000_000_000 } }));
+      const incoming = new TextEncoder().encode(JSON.stringify({ anthropic: { type: "oauth", access: jwt(1_700_000_000), refresh: "SYNTHETIC_FIXTURE_OLDER_REFRESH", expires: 2_100_000_000_000 } }));
+      await applyInbox({ tar: makeTar({}, [{ path: ".pi/auth.json", class: "auth", bytes: incoming }]), home, clock: goodClock });
+      const written = JSON.parse(await readFile(authPath, "utf8"));
+      expect(written.anthropic.refresh).toBe("SYNTHETIC_FIXTURE_LOCAL_REFRESH");
+      expect(written.anthropic.expires).toBe(1_800_000_000_000);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("waits for the refresh lock and merges the grant written while it was held", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const dir = join(home, ".pi");
+      const path = join(dir, "auth.json");
+      await mkdir(dir, { recursive: true });
+      await writeFile(path, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_ACCESS_BEFORE", refresh: "SYNTHETIC_FIXTURE_REFRESH_BEFORE", expires: 1_800_000_000_000 } }));
+      const incoming = new TextEncoder().encode(JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_ACCESS_BUNDLE", refresh: "SYNTHETIC_FIXTURE_REFRESH_BUNDLE", expires: 1_700_000_000_000 } }));
+      let applyPromise: ReturnType<typeof applyInbox> | undefined;
+      let applyFinished = false;
+      await withOauthRefreshLock(dir, async (lock) => {
+        expect(lock.isLost()).toBe(false);
+        applyPromise = applyInbox({ tar: makeTar({}, [{ path: ".pi/auth.json", class: "auth", bytes: incoming }]), home, clock: goodClock }).finally(() => { applyFinished = true; });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(applyFinished).toBe(false);
+        await writeFile(path, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_ACCESS_REFRESHED", refresh: "SYNTHETIC_FIXTURE_REFRESH_REFRESHED", expires: 2_000_000_000_000 } }));
+      });
+      await applyPromise;
+      const written = JSON.parse(await readFile(path, "utf8"));
+      expect(written.anthropic.access).toBe("SYNTHETIC_FIXTURE_ACCESS_REFRESHED");
+      expect(written.anthropic.refresh).toBe("SYNTHETIC_FIXTURE_REFRESH_REFRESHED");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
   test("defers auth when a persisted portable file is newer than the clock", async () => {
     const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
     try {
@@ -116,16 +180,76 @@ describe("inbox apply", () => {
     const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
     try {
       await mkdir(join(home, ".claude"), { recursive: true });
+      const { canonicalConfig } = await import("../../src/live/portable.ts");
       const baseline = new TextEncoder().encode('{"theme":"SYNTHETIC_FIXTURE_BASE"}\n');
       const local = '{"theme":"SYNTHETIC_FIXTURE_LOCAL"}\n';
       await writeFile(join(home, ".claude", "settings.json"), local);
       await mkdir(join(home, ".ais", "live"), { recursive: true });
-      await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 0, hashes: { ".claude/settings.json": createHash("sha256").update(baseline).digest("hex") } }));
-      for (const seq of [1, 2]) {
-        const tar = makeTar({ seq }, [{ path: ".claude/settings.json", class: "config:settings", bytes: baseline }]);
-        await applyInbox({ tar, home, clock: goodClock });
-        expect(await readFile(join(home, ".claude", "settings.json"), "utf8")).toBe(local);
+      await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 0, hashes: { ".claude/settings.json": createHash("sha256").update(canonicalConfig(".claude/settings.json", baseline)).digest("hex") } }));
+      const changed = new TextEncoder().encode('{"theme":"SYNTHETIC_FIXTURE_HOST_CHANGE"}\n');
+      const first = makeTar({ seq: 1 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: changed }]);
+      const firstResult = await applyInbox({ tar: first, home, clock: goodClock, isTTY: true, chooseConflict: async () => "drive" });
+      expect(firstResult.conflicts).toEqual([".claude/settings.json"]);
+      expect(await readFile(join(home, ".claude", "settings.json"), "utf8")).toBe(local);
+      const next = makeTar({ seq: 2 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: new TextEncoder().encode('{ "theme" : "SYNTHETIC_FIXTURE_HOST_CHANGE" }') }]);
+      const nextResult = await applyInbox({ tar: next, home, clock: goodClock });
+      expect(nextResult.conflicts).toEqual([]);
+      expect(await readFile(join(home, ".claude", "settings.json"), "utf8")).toBe(local);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("uses canonical config hashes when comparing formatting-only local changes", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const path = join(home, ".claude", "settings.json");
+      await mkdir(join(home, ".claude"), { recursive: true });
+      const baseline = new TextEncoder().encode('{\n  "hooks": {\n    "SYNTHETIC_FIXTURE": true\n  }\n}\n');
+      const local = '{"hooks":{"SYNTHETIC_FIXTURE":true}}\n';
+      await writeFile(path, local);
+      await mkdir(join(home, ".ais", "live"), { recursive: true });
+      const digest = configHash(".claude/settings.json", baseline);
+      await writeFile(join(home, ".ais", "live", "exchange-state.json"), JSON.stringify({ version: 1, lastInboxSeq: 0, hashes: { ".claude/settings.json": digest } }));
+      const result = await applyInbox({ tar: makeTar({ seq: 1 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: baseline }]), home, clock: goodClock });
+      expect(result.conflicts).toEqual([]);
+      expect(await readFile(path, "utf8")).toBe(local);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("uses an external inbox sequence high-water mark when the home state was restored", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const target = join(home, ".claude", "settings.json");
+      const tar = makeTar({ seq: 7 }, [{ path: ".claude/settings.json", class: "config:settings", bytes: new TextEncoder().encode('{"value":"SYNTHETIC_FIXTURE_OLD"}') }]);
+      const result = await applyInbox({ tar, home, clock: goodClock, lastInboxSeq: 8 });
+      expect(result.applied).toBe(0);
+      expect(result.lastInboxSeq).toBe(8);
+      expect(await Bun.file(target).exists()).toBe(false);
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("accepts HTTP clock dates exactly one hour away on either side, and rejects dates beyond", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const token = new TextEncoder().encode('{"access_token":"SYNTHETIC_FIXTURE_ACCESS","refresh_token":"SYNTHETIC_FIXTURE_REFRESH","minted_at":1800000000}');
+      for (const [index, delta] of [-3_600_001, -3_600_000, 3_600_000, 3_600_001].entries()) {
+        const result = await applyInbox({ tar: makeTar({ seq: index + 1 }, [{ path: ".codex/auth.json", class: "auth", bytes: token }]), home, clock: { ...goodClock, online: true, httpDateMs: goodClock.nowMs + delta } });
+        expect(Boolean(result.deferred)).toBe(Math.abs(delta) > 3_600_000);
       }
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("does not acknowledge auth when the active-writer check is uncertain", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const original = '{"access_token":"SYNTHETIC_FIXTURE_ORIGINAL","minted_at":1700000000}\n';
+      const path = join(home, ".codex", "auth.json");
+      await mkdir(join(home, ".codex"), { recursive: true });
+      await writeFile(path, original);
+      const tar = makeTar({ seq: 4 }, [{ path: ".codex/auth.json", class: "auth", bytes: new TextEncoder().encode('{"access_token":"SYNTHETIC_FIXTURE_INCOMING","minted_at":1800000000}') }]);
+      await expect(applyInbox({ tar, home, clock: goodClock, hasOpenOwner: async () => undefined })).rejects.toThrow("busy or cannot be safely checked");
+      expect(await readFile(path, "utf8")).toBe(original);
+      const statePath = join(home, ".ais", "live", "exchange-state.json");
+      expect(await Bun.file(statePath).exists()).toBe(false);
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
