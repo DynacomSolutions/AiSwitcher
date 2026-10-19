@@ -1,3 +1,6 @@
+use crate::layout::{
+    GPT_ARRAY_BYTES, GPT_ARRAY_SECTORS, GPT_TRAILER_SECTORS, LiveImageLayout, SECTOR_BYTES,
+};
 use crate::release::{VerifiedImage, sha256};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -56,6 +59,24 @@ pub enum DeviceError {
     Entropy,
     #[error("This operation needs a reviewed image layout contract.")]
     LayoutUnavailable,
+    #[error("The target does not leave aligned space for the next creation phase.")]
+    InsufficientCapacity,
+    #[error("The bounded partition-table snapshot is invalid.")]
+    TableFingerprint,
+}
+
+pub const TABLE_WINDOW_SECTORS: u64 = 34;
+pub const TABLE_WINDOW_BYTES: usize = (TABLE_WINDOW_SECTORS * 512) as usize;
+
+/// Canonical bounded GPT fingerprint shared by native observers and the writer.
+pub fn table_fingerprint(head: &[u8], tail: &[u8]) -> Result<[u8; 32], DeviceError> {
+    if head.len() != TABLE_WINDOW_BYTES || tail.len() != TABLE_WINDOW_BYTES {
+        return Err(DeviceError::TableFingerprint);
+    }
+    let mut bytes = Vec::with_capacity(TABLE_WINDOW_BYTES * 2);
+    bytes.extend_from_slice(head);
+    bytes.extend_from_slice(tail);
+    Ok(sha256(&bytes))
 }
 
 impl DeviceObservation {
@@ -79,6 +100,18 @@ impl DeviceObservation {
             return Err(DeviceError::Bounds);
         }
         Ok(())
+    }
+
+    /// Stable identity fields used while the planned table changes during a
+    /// write. Mutable mount and partition fingerprints are checked before the
+    /// first byte, then the native adapter must retain the same open handle.
+    pub fn same_physical_identity(&self, other: &Self) -> bool {
+        self.os_identity == other.os_identity
+            && self.connection_identity == other.connection_identity
+            && self.serial == other.serial
+            && self.capacity_bytes == other.capacity_bytes
+            && self.sector_bytes == other.sector_bytes
+            && self.ancestry_fingerprint == other.ancestry_fingerprint
     }
 }
 
@@ -125,16 +158,154 @@ pub struct WritePlan {
     compressed_digest: [u8; 32],
     release: crate::release::ReleaseSelection,
     ranges: Vec<ByteRange>,
+    writes: Vec<PlannedWrite>,
+    remaining_bytes: u64,
+    phase_aware: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedWrite {
+    range: ByteRange,
+    source: WriteSource,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+enum WriteSource {
+    Image { offset: u64 },
+    Bytes(Vec<u8>),
 }
 
 impl WritePlan {
-    /// Production creation additionally needs a reviewed GPT/exchange transformation.
-    /// Do not turn this unavailable contract into a raw-image-only create flow.
     pub fn create_layout(
-        _image: &VerifiedImage,
-        _device: DeviceObservation,
+        image: &VerifiedImage,
+        device: DeviceObservation,
     ) -> Result<Self, DeviceError> {
-        Err(DeviceError::LayoutUnavailable)
+        device.validate()?;
+        if device.sector_bytes as u64 != SECTOR_BYTES {
+            return Err(DeviceError::Bounds);
+        }
+        let layout =
+            LiveImageLayout::parse(image.bytes()).map_err(|_| DeviceError::LayoutUnavailable)?;
+        let target_sectors = device.capacity_bytes / SECTOR_BYTES;
+        let p4_end = layout.p4_end_lba();
+        let target_last_usable = target_sectors
+            .checked_sub(GPT_TRAILER_SECTORS + 1)
+            .ok_or(DeviceError::InsufficientCapacity)?;
+        let remaining_bytes = target_last_usable
+            .checked_add(1)
+            .and_then(|end| end.checked_sub(p4_end))
+            .and_then(|sectors| sectors.checked_mul(SECTOR_BYTES))
+            .filter(|bytes| *bytes >= SECTOR_BYTES && bytes % SECTOR_BYTES == 0)
+            .ok_or(DeviceError::InsufficientCapacity)?;
+
+        let source = image.bytes();
+        let mut primary_header = source
+            .get(SECTOR_BYTES as usize..(2 * SECTOR_BYTES) as usize)
+            .ok_or(DeviceError::LayoutUnavailable)?
+            .to_vec();
+        crate::layout::put_u64(&mut primary_header, 32, target_sectors - 1)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        crate::layout::put_u64(&mut primary_header, 48, target_last_usable)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        primary_header[16..20].fill(0);
+        let primary_crc = crate::layout::crc32(&primary_header[..92]);
+        crate::layout::put_u32(&mut primary_header, 16, primary_crc)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+
+        let backup_entries_lba = target_sectors - GPT_ARRAY_SECTORS - 1;
+        let source_layout = layout;
+        let source_entries_start =
+            usize::try_from(source_layout.primary_entries_lba * SECTOR_BYTES)
+                .map_err(|_| DeviceError::LayoutUnavailable)?;
+        let entries = source
+            .get(source_entries_start..source_entries_start + GPT_ARRAY_BYTES)
+            .ok_or(DeviceError::LayoutUnavailable)?
+            .to_vec();
+        let backup_source_start = usize::try_from(source_layout.backup_entries_lba * SECTOR_BYTES)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        let backup_source_end = source.len();
+        let mut backup_header = source
+            .get(backup_source_end - SECTOR_BYTES as usize..)
+            .ok_or(DeviceError::LayoutUnavailable)?
+            .to_vec();
+        crate::layout::put_u64(&mut backup_header, 24, target_sectors - 1)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        crate::layout::put_u64(&mut backup_header, 32, 1)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        crate::layout::put_u64(&mut backup_header, 40, 2048)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        crate::layout::put_u64(&mut backup_header, 48, target_last_usable)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        crate::layout::put_u64(&mut backup_header, 72, backup_entries_lba)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+        backup_header[16..20].fill(0);
+        let backup_crc = crate::layout::crc32(&backup_header[..92]);
+        crate::layout::put_u32(&mut backup_header, 16, backup_crc)
+            .map_err(|_| DeviceError::LayoutUnavailable)?;
+
+        let mut mbr = source
+            .get(..SECTOR_BYTES as usize)
+            .ok_or(DeviceError::LayoutUnavailable)?
+            .to_vec();
+        let mbr_size = (target_sectors - 1).min(u32::MAX as u64) as u32;
+        mbr[458..462].copy_from_slice(&mbr_size.to_le_bytes());
+
+        let mut new_head = source
+            .get(..TABLE_WINDOW_BYTES)
+            .ok_or(DeviceError::LayoutUnavailable)?
+            .to_vec();
+        new_head[..SECTOR_BYTES as usize].copy_from_slice(&mbr);
+        new_head[SECTOR_BYTES as usize..(2 * SECTOR_BYTES) as usize]
+            .copy_from_slice(&primary_header);
+        let mut new_tail = vec![0; TABLE_WINDOW_BYTES];
+        let tail_entries_at = SECTOR_BYTES as usize;
+        new_tail[tail_entries_at..tail_entries_at + GPT_ARRAY_BYTES].copy_from_slice(&entries);
+        new_tail[TABLE_WINDOW_BYTES - SECTOR_BYTES as usize..].copy_from_slice(&backup_header);
+        let data_start = TABLE_WINDOW_BYTES as u64;
+        let data_end = backup_source_start as u64;
+        if data_end <= data_start {
+            return Err(DeviceError::LayoutUnavailable);
+        }
+        let writes = vec![
+            PlannedWrite {
+                range: ByteRange {
+                    start: data_start,
+                    length: data_end - data_start,
+                },
+                source: WriteSource::Image { offset: data_start },
+            },
+            PlannedWrite {
+                range: ByteRange {
+                    start: 0,
+                    length: TABLE_WINDOW_BYTES as u64,
+                },
+                source: WriteSource::Bytes(new_head),
+            },
+            PlannedWrite {
+                range: ByteRange {
+                    start: (target_sectors - TABLE_WINDOW_SECTORS) * SECTOR_BYTES,
+                    length: TABLE_WINDOW_BYTES as u64,
+                },
+                source: WriteSource::Bytes(new_tail),
+            },
+        ];
+        for write in &writes {
+            write.range.validate(&device)?;
+        }
+        let ranges = merge_ranges(writes.iter().map(|write| write.range).collect());
+        Ok(Self {
+            operation: WriteOperation::CreateLayout,
+            device,
+            source_digest: image.digest(),
+            compressed_digest: image.compressed_digest(),
+            release: image.selection().clone(),
+            ranges,
+            writes,
+            remaining_bytes,
+            phase_aware: true,
+        })
     }
 
     /// Regular-file harness only. It does not claim to create a bootable layout.
@@ -156,6 +327,12 @@ impl WritePlan {
             compressed_digest: image.compressed_digest(),
             release: image.selection().clone(),
             ranges: vec![range],
+            writes: vec![PlannedWrite {
+                range,
+                source: WriteSource::Image { offset: 0 },
+            }],
+            remaining_bytes: 0,
+            phase_aware: false,
         })
     }
 
@@ -167,6 +344,10 @@ impl WritePlan {
     }
     pub fn operation(&self) -> WriteOperation {
         self.operation
+    }
+    /// Capacity left after p4 for Task 4's separately agreed sizing policy.
+    pub fn remaining_bytes(&self) -> u64 {
+        self.remaining_bytes
     }
     pub fn digest(&self) -> [u8; 32] {
         // Only fixed struct fields, ordered vectors and integer values are encoded.
@@ -184,15 +365,120 @@ impl WritePlan {
         if image.digest() != self.source_digest
             || image.compressed_digest() != self.compressed_digest
             || image.selection() != &self.release
-            || self.ranges.len() != 1
-            || self.ranges[0].length != image.len()
+            || self.writes.is_empty()
         {
             return Err(DeviceError::Changed);
         }
         for range in &self.ranges {
             range.validate(current)?;
         }
+        for write in &self.writes {
+            let expected_len = match &write.source {
+                WriteSource::Image { offset } => offset
+                    .checked_add(write.range.length)
+                    .is_some_and(|end| end <= image.len()),
+                WriteSource::Bytes(bytes) => bytes.len() as u64 == write.range.length,
+            };
+            if !expected_len {
+                return Err(DeviceError::Changed);
+            }
+        }
         Ok(())
+    }
+}
+
+fn merge_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<ByteRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let end = range.start.saturating_add(range.length);
+        if let Some(last) = merged.last_mut() {
+            let last_end = last.start.saturating_add(last.length);
+            if range.start <= last_end {
+                last.length = last_end.max(end).saturating_sub(last.start);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+#[cfg(all(test, feature = "file-test"))]
+mod tests {
+    use super::*;
+    use crate::{file_test::SyntheticRelease, layout::synthetic_sfdisk_contract_fixture};
+
+    #[test]
+    fn create_layout_relocates_backup_gpt_and_preserves_boot_code_and_legacy_attribute() {
+        let raw = synthetic_sfdisk_contract_fixture();
+        let fixture = SyntheticRelease::new(raw.clone());
+        let (_, image) = fixture
+            .verify_live_layout(&std::env::temp_dir())
+            .expect("synthetic signed B layout verifies");
+        let capacity = image.len() + 8 * 1024 * 1024;
+        let observation = DeviceObservation {
+            os_identity: "SYNTHETIC_FIXTURE_OS_ID".into(),
+            connection_identity: "SYNTHETIC_FIXTURE_CONNECTION".into(),
+            display_identifier: "SYNTHETIC_FIXTURE_DISK".into(),
+            serial: Some("SYNTHETIC_FIXTURE_SERIAL".into()),
+            capacity_bytes: capacity,
+            sector_bytes: 512,
+            table_fingerprint: table_fingerprint(
+                &vec![0; TABLE_WINDOW_BYTES],
+                &vec![0; TABLE_WINDOW_BYTES],
+            )
+            .unwrap(),
+            ancestry_fingerprint: sha256(b"SYNTHETIC_FIXTURE_ANCESTRY"),
+            mount_fingerprint: sha256(b"SYNTHETIC_FIXTURE_MOUNTS"),
+            external_usb: true,
+            internal: false,
+            system_backing: false,
+            ancestry_complete: true,
+            writable: true,
+        };
+        let plan = WritePlan::create_layout(&image, observation).unwrap();
+        assert_eq!(plan.operation, WriteOperation::CreateLayout);
+        assert_eq!(plan.ranges.len(), 2);
+        assert_eq!(plan.ranges[0].start, 0);
+        assert!(plan.remaining_bytes > 0);
+
+        let WriteSource::Bytes(head) = &plan.writes[1].source else {
+            panic!("primary table range must contain planned transition bytes");
+        };
+        assert_eq!(&head[..440], &raw[..440]);
+        let p2_attribute = u64::from_le_bytes(
+            head[2 * 512 + 128 + 48..2 * 512 + 128 + 56]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(p2_attribute, 1 << 2);
+        let target_sectors = capacity / SECTOR_BYTES;
+        assert_eq!(
+            u64::from_le_bytes(head[512 + 32..512 + 40].try_into().unwrap()),
+            target_sectors - 1
+        );
+        assert_eq!(
+            u64::from_le_bytes(head[512 + 48..512 + 56].try_into().unwrap()),
+            target_sectors - 34
+        );
+
+        let WriteSource::Bytes(tail) = &plan.writes[2].source else {
+            panic!("backup table range must contain planned transition bytes");
+        };
+        let backup_header = &tail[TABLE_WINDOW_BYTES - 512..];
+        assert_eq!(
+            u64::from_le_bytes(backup_header[24..32].try_into().unwrap()),
+            target_sectors - 1
+        );
+        assert_eq!(
+            u64::from_le_bytes(backup_header[72..80].try_into().unwrap()),
+            target_sectors - 33
+        );
+        let stored_crc = u32::from_le_bytes(backup_header[16..20].try_into().unwrap());
+        let mut crc_bytes = backup_header[..92].to_vec();
+        crc_bytes[16..20].fill(0);
+        assert_eq!(stored_crc, crate::layout::crc32(&crc_bytes));
     }
 }
 
@@ -203,6 +489,30 @@ struct Approval {
     plan: [u8; 32],
     identifier: String,
     expires: Instant,
+}
+
+struct ApprovalPermit {
+    plan: [u8; 32],
+    identifier: String,
+    expires: Instant,
+}
+
+impl ApprovalPermit {
+    fn validate_before_mutation(
+        &self,
+        plan: &WritePlan,
+        current: &DeviceObservation,
+        image: &VerifiedImage,
+        now: Instant,
+    ) -> Result<(), DeviceError> {
+        if now >= self.expires
+            || self.plan != plan.digest()
+            || self.identifier != current.display_identifier
+        {
+            return Err(DeviceError::Stale);
+        }
+        plan.revalidate(current, image)
+    }
 }
 
 /// Keep one book per app session. Refreshes and changed choices call invalidate.
@@ -252,18 +562,29 @@ impl ConfirmationBook {
         image: &VerifiedImage,
         now: Instant,
     ) -> Result<(), DeviceError> {
-        // Remove before checking, so even a refused attempt cannot be replayed.
+        let permit = self.reserve(ticket, plan, now)?;
+        permit.validate_before_mutation(plan, current, image, now)
+    }
+
+    fn reserve(
+        &mut self,
+        ticket: &ConfirmationTicket,
+        plan: &WritePlan,
+        now: Instant,
+    ) -> Result<ApprovalPermit, DeviceError> {
+        // Remove before checking, so every refused attempt consumes approval.
         let approval = self
             .approvals
             .remove(&ticket.nonce)
             .ok_or(DeviceError::Stale)?;
-        if now >= approval.expires
-            || approval.plan != plan.digest()
-            || approval.identifier != current.display_identifier
-        {
+        if now >= approval.expires || approval.plan != plan.digest() {
             return Err(DeviceError::Stale);
         }
-        plan.revalidate(current, image)
+        Ok(ApprovalPermit {
+            plan: approval.plan,
+            identifier: approval.identifier,
+            expires: approval.expires,
+        })
     }
 }
 
@@ -278,7 +599,7 @@ pub struct WriteSupport {
 pub fn write_support() -> WriteSupport {
     WriteSupport {
         enabled: false,
-        reason: "Image layout verification and native helper authorisation are not available in this build.",
+        reason: "The reviewed image trust anchor and native helper authorisation are unavailable in this build.",
     }
 }
 
@@ -287,6 +608,17 @@ pub trait WriteTarget: std::io::Read + std::io::Write + std::io::Seek {
     fn observe(&self) -> std::io::Result<DeviceObservation>;
     fn lock_exclusive(&mut self) -> std::io::Result<()>;
     fn flush_durable(&mut self) -> std::io::Result<()>;
+
+    /// Positional read used for bounded partition-table rechecks. Native
+    /// implementations should use pread/ReadFile-at-offset so it cannot move
+    /// the writer cursor. The default exists for regular-file test targets.
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
+        let position = self.stream_position()?;
+        self.seek(std::io::SeekFrom::Start(offset))?;
+        let result = std::io::Read::read_exact(self, buffer);
+        let restore = self.seek(std::io::SeekFrom::Start(position));
+        result.and(restore.map(|_| ()))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -301,22 +633,19 @@ pub enum WriteFailure {
 
 /// Callers own the OS-authorised channel and operation lock. This routine is the
 /// shared bounded byte writer, not an elevation or device-discovery mechanism.
-#[cfg(feature = "file-test")]
 pub fn write_image(
     target: &mut impl WriteTarget,
     image: &mut VerifiedImage,
     plan: &WritePlan,
     approvals: &mut ConfirmationBook,
     ticket: &ConfirmationTicket,
-    now: Instant,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<u64, WriteFailure> {
     use std::io::SeekFrom;
-    let current = target
-        .observe()
-        .map_err(|_| WriteFailure::Refused("device observation"))?;
-    approvals
-        .consume(ticket, plan, &current, image, now)
+    // Reserve immediately so every failure from this point consumes the
+    // single-use approval. Expiry is checked again at the mutation boundary.
+    let permit = approvals
+        .reserve(ticket, plan, Instant::now())
         .map_err(|_| WriteFailure::Refused("confirmation"))?;
     if cancelled() {
         return Err(WriteFailure::Refused("cancelled"));
@@ -332,13 +661,21 @@ pub fn write_image(
         .map_err(|_| WriteFailure::Refused("device observation"))?;
     plan.revalidate(&current, image)
         .map_err(|_| WriteFailure::Refused("device changed"))?;
+    let mut expected_table = if plan.phase_aware {
+        let (head, tail) = read_table_windows(target, &current)
+            .map_err(|_| WriteFailure::Refused("partition table read"))?;
+        let observed = table_fingerprint(&head, &tail)
+            .map_err(|_| WriteFailure::Refused("partition table read"))?;
+        if observed != plan.device.table_fingerprint || current.table_fingerprint != observed {
+            return Err(WriteFailure::Refused("partition table changed"));
+        }
+        Some(ExpectedTable { head, tail })
+    } else {
+        None
+    };
     if cancelled() {
         return Err(WriteFailure::Refused("cancelled"));
     }
-    let range = plan.ranges[0];
-    target
-        .seek(SeekFrom::Start(range.start))
-        .map_err(|_| WriteFailure::Refused("seek"))?;
     let mut written = 0_u64;
     let budget = Instant::now();
     let failure = |written, reason| {
@@ -351,74 +688,201 @@ pub fn write_image(
             }
         }
     };
-    for chunk in image.bytes().chunks(64 * 1024) {
-        if cancelled() || budget.elapsed() >= Duration::from_secs(600) {
-            let _ = target.flush_durable();
-            return Err(failure(written, "cancelled or timed out"));
+    for write in &plan.writes {
+        // Hash the retained source before borrowing its decoded bytes. The final
+        // device observation and table check happen at the mutation boundary.
+        if written == 0 {
+            image
+                .revalidate_source()
+                .map_err(|_| failure(written, "image source changed"))?;
         }
-        let current = target
-            .observe()
-            .map_err(|_| failure(written, "device disconnected"))?;
-        // Synthetic files have no partition table. Production phase fingerprints
-        // must follow the reviewed image transformation before writes are enabled.
-        plan.revalidate(&current, image)
-            .map_err(|_| failure(written, "device changed"))?;
-        let mut remaining = chunk;
-        while !remaining.is_empty() {
+        let expected_bytes: &[u8] = match &write.source {
+            WriteSource::Image { offset } => {
+                let start =
+                    usize::try_from(*offset).map_err(|_| failure(written, "source bounds"))?;
+                let end = start
+                    .checked_add(write.range.length as usize)
+                    .ok_or_else(|| failure(written, "source bounds"))?;
+                image
+                    .bytes()
+                    .get(start..end)
+                    .ok_or_else(|| failure(written, "source bounds"))?
+            }
+            WriteSource::Bytes(bytes) => bytes,
+        };
+        target
+            .seek(SeekFrom::Start(write.range.start))
+            .map_err(|_| failure(written, "seek"))?;
+        for (chunk_index, chunk) in expected_bytes.chunks(64 * 1024).enumerate() {
             if cancelled() || budget.elapsed() >= Duration::from_secs(600) {
                 let _ = target.flush_durable();
                 return Err(failure(written, "cancelled or timed out"));
             }
-            match target.write(remaining) {
-                Ok(0) => return Err(failure(written, "zero-length write")),
-                Ok(count) if count <= remaining.len() => {
-                    written += count as u64;
-                    remaining = &remaining[count..];
+            let current = target
+                .observe()
+                .map_err(|_| failure(written, "device disconnected"))?;
+            if !observation_stable(plan, &current) {
+                return Err(failure(written, "device changed"));
+            }
+            if let Some(expected) = expected_table.as_ref() {
+                verify_expected_table(target, &current, expected)
+                    .map_err(|_| failure(written, "partition table changed"))?;
+            }
+            let mut remaining = chunk;
+            let mut chunk_offset = write
+                .range
+                .start
+                .checked_add((chunk_index * 64 * 1024) as u64)
+                .ok_or_else(|| failure(written, "write bounds"))?;
+            while !remaining.is_empty() {
+                if cancelled() || budget.elapsed() >= Duration::from_secs(600) {
+                    let _ = target.flush_durable();
+                    return Err(failure(written, "cancelled or timed out"));
                 }
-                Ok(_) => {
-                    return Err(WriteFailure::Incomplete {
-                        confirmed_bytes: written,
-                        reason: "invalid write result",
-                    });
+                if written == 0 {
+                    let current = target
+                        .observe()
+                        .map_err(|_| failure(written, "device disconnected"))?;
+                    if !observation_stable(plan, &current) {
+                        return Err(failure(written, "device changed"));
+                    }
+                    if let Some(expected) = expected_table.as_ref() {
+                        verify_expected_table(target, &current, expected)
+                            .map_err(|_| failure(written, "partition table changed"))?;
+                    }
+                    permit
+                        .validate_before_mutation(plan, &current, image, Instant::now())
+                        .map_err(|_| failure(written, "confirmation"))?;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    return Err(WriteFailure::Incomplete {
-                        confirmed_bytes: written,
-                        reason: "write failed",
-                    });
+                match target.write(remaining) {
+                    Ok(0) => return Err(failure(written, "zero-length write")),
+                    Ok(count) if count <= remaining.len() => {
+                        if let Some(expected) = expected_table.as_mut() {
+                            let data = &remaining[..count];
+                            expected.overlay(chunk_offset, data, current.capacity_bytes);
+                        }
+                        written += count as u64;
+                        chunk_offset += count as u64;
+                        remaining = &remaining[count..];
+                    }
+                    Ok(_) => return Err(failure(written, "invalid write result")),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return Err(failure(written, "write failed")),
                 }
+            }
+            let current = target
+                .observe()
+                .map_err(|_| failure(written, "device disconnected"))?;
+            if !observation_stable(plan, &current) {
+                return Err(failure(written, "device changed"));
+            }
+            if let Some(expected) = expected_table.as_ref() {
+                verify_expected_table(target, &current, expected)
+                    .map_err(|_| failure(written, "partition table changed"))?;
+            }
+        }
+        target
+            .flush_durable()
+            .map_err(|_| failure(written, "flush failed"))?;
+        target
+            .seek(SeekFrom::Start(write.range.start))
+            .map_err(|_| failure(written, "readback seek"))?;
+        let mut readback = [0; 64 * 1024];
+        for expected in expected_bytes.chunks(readback.len()) {
+            if cancelled() || budget.elapsed() >= Duration::from_secs(600) {
+                return Err(failure(written, "readback cancelled or timed out"));
+            }
+            target
+                .read_exact(&mut readback[..expected.len()])
+                .map_err(|_| failure(written, "readback failed"))?;
+            if readback[..expected.len()] != *expected {
+                return Err(failure(written, "readback mismatch"));
             }
         }
     }
-    target
-        .flush_durable()
-        .map_err(|_| WriteFailure::Incomplete {
-            confirmed_bytes: written,
-            reason: "flush failed",
-        })?;
-    let current = target
-        .observe()
-        .map_err(|_| failure(written, "device disconnected"))?;
-    plan.revalidate(&current, image)
-        .map_err(|_| failure(written, "device changed"))?;
     image
         .revalidate_source()
         .map_err(|_| failure(written, "image source changed"))?;
-    target
-        .seek(SeekFrom::Start(range.start))
-        .map_err(|_| failure(written, "readback seek"))?;
-    let mut readback = [0; 64 * 1024];
-    for expected in image.bytes().chunks(readback.len()) {
-        if cancelled() || budget.elapsed() >= Duration::from_secs(600) {
-            return Err(failure(written, "readback cancelled or timed out"));
-        }
-        target
-            .read_exact(&mut readback[..expected.len()])
-            .map_err(|_| failure(written, "readback failed"))?;
-        if readback[..expected.len()] != *expected {
-            return Err(failure(written, "readback mismatch"));
-        }
+    let current = target
+        .observe()
+        .map_err(|_| failure(written, "device disconnected"))?;
+    if !observation_stable(plan, &current) {
+        return Err(failure(written, "device changed"));
+    }
+    if let Some(expected) = expected_table.as_ref() {
+        verify_expected_table(target, &current, expected)
+            .map_err(|_| failure(written, "partition table changed"))?;
     }
     Ok(written)
+}
+
+struct ExpectedTable {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+impl ExpectedTable {
+    fn overlay(&mut self, offset: u64, bytes: &[u8], capacity: u64) {
+        overlay_window(&mut self.head, 0, offset, bytes);
+        let tail_start = capacity.saturating_sub(TABLE_WINDOW_BYTES as u64);
+        overlay_window(&mut self.tail, tail_start, offset, bytes);
+    }
+}
+
+fn overlay_window(window: &mut [u8], window_start: u64, offset: u64, bytes: &[u8]) {
+    let Some(write_end) = offset.checked_add(bytes.len() as u64) else {
+        return;
+    };
+    let Some(window_end) = window_start.checked_add(window.len() as u64) else {
+        return;
+    };
+    let start = offset.max(window_start);
+    let end = write_end.min(window_end);
+    if start >= end {
+        return;
+    }
+    let dst_start = (start - window_start) as usize;
+    let src_start = (start - offset) as usize;
+    let count = (end - start) as usize;
+    window[dst_start..dst_start + count].copy_from_slice(&bytes[src_start..src_start + count]);
+}
+
+fn observation_stable(plan: &WritePlan, current: &DeviceObservation) -> bool {
+    plan.device.same_physical_identity(current)
+        && current.validate().is_ok()
+        && current.mount_fingerprint == plan.device.mount_fingerprint
+}
+
+fn read_table_windows(
+    target: &mut impl WriteTarget,
+    current: &DeviceObservation,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    if current.capacity_bytes < (TABLE_WINDOW_BYTES as u64) * 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "device is smaller than bounded table windows",
+        ));
+    }
+    let mut head = vec![0; TABLE_WINDOW_BYTES];
+    let mut tail = vec![0; TABLE_WINDOW_BYTES];
+    target.read_at(0, &mut head)?;
+    target.read_at(
+        current.capacity_bytes - TABLE_WINDOW_BYTES as u64,
+        &mut tail,
+    )?;
+    Ok((head, tail))
+}
+
+fn verify_expected_table(
+    target: &mut impl WriteTarget,
+    current: &DeviceObservation,
+    expected: &ExpectedTable,
+) -> Result<(), DeviceError> {
+    let (head, tail) = read_table_windows(target, current).map_err(|_| DeviceError::Changed)?;
+    let actual = table_fingerprint(&head, &tail)?;
+    let expected_fingerprint = table_fingerprint(&expected.head, &expected.tail)?;
+    if actual != expected_fingerprint || actual != current.table_fingerprint {
+        return Err(DeviceError::Changed);
+    }
+    Ok(())
 }

@@ -60,10 +60,23 @@ impl SyntheticRelease {
         Self::from_compressed(raw, compressed)
     }
 
+    pub fn new_with_key(raw: Vec<u8>, keys: &minisign::KeyPair) -> Self {
+        let compressed = zstd::stream::encode_all(raw.as_slice(), 1).expect("compress fixture");
+        Self::from_compressed_with_key(raw, compressed, keys)
+    }
+
     pub fn from_compressed(raw: Vec<u8>, compressed: Vec<u8>) -> Self {
         let keys =
             minisign::KeyPair::generate_unencrypted_keypair().expect("synthetic signing key");
-        let name = "ais-live-x86_64-live-vsynthetic-fixture.img.zst";
+        Self::from_compressed_with_key(raw, compressed, &keys)
+    }
+
+    fn from_compressed_with_key(
+        raw: Vec<u8>,
+        compressed: Vec<u8>,
+        keys: &minisign::KeyPair,
+    ) -> Self {
+        let name = "ais-live-x86_64-live-v1.0.0.img.zst";
         let sums = format!("{}  {name}\n", hex(&sha256(&compressed))).into_bytes();
         let signature = minisign::sign(None, &keys.sk, Cursor::new(&sums), None, None)
             .expect("sign fixture")
@@ -77,7 +90,7 @@ impl SyntheticRelease {
         };
         let selection = select_release(&[PublishedRelease {
             id: 1,
-            tag: "live-vsynthetic-fixture".to_owned(),
+            tag: "live-v1.0.0".to_owned(),
             published_at: 1,
             draft: false,
             prerelease: false,
@@ -121,6 +134,16 @@ impl SyntheticRelease {
             .verify(&self.selection, download)?;
         Ok((path, image))
     }
+
+    pub fn verify_live_layout(
+        &self,
+        directory: &Path,
+    ) -> Result<(PathBuf, VerifiedImage), TrustError> {
+        let (path, download) = self.download(directory)?;
+        let image = ImageVerifier::synthetic_live_layout(&self.public_key)?
+            .verify(&self.selection, download)?;
+        Ok((path, image))
+    }
 }
 
 pub struct FileTarget {
@@ -128,6 +151,9 @@ pub struct FileTarget {
     path: PathBuf,
     observation: DeviceObservation,
     locked: bool,
+    lock_delay: std::time::Duration,
+    tamper_mount_after_write: bool,
+    interrupt_writes: usize,
 }
 
 impl FileTarget {
@@ -164,6 +190,9 @@ impl FileTarget {
             path,
             observation,
             locked: false,
+            lock_delay: std::time::Duration::ZERO,
+            tamper_mount_after_write: false,
+            interrupt_writes: 0,
         })
     }
     pub fn path(&self) -> &Path {
@@ -179,6 +208,15 @@ impl FileTarget {
     pub fn competing_lock(&self) -> io::Result<()> {
         let second = OpenOptions::new().read(true).write(true).open(&self.path)?;
         second.try_lock().map_err(io::Error::from)
+    }
+    pub fn delay_lock(&mut self, duration: std::time::Duration) {
+        self.lock_delay = duration;
+    }
+    pub fn tamper_mount_after_write(&mut self) {
+        self.tamper_mount_after_write = true;
+    }
+    pub fn interrupt_writes(&mut self, count: usize) {
+        self.interrupt_writes = count;
     }
 }
 
@@ -214,6 +252,7 @@ impl WriteTarget for FileTarget {
         }
         self.file.try_lock().map_err(io::Error::from)?;
         self.locked = true;
+        std::thread::sleep(self.lock_delay);
         Ok(())
     }
     fn flush_durable(&mut self) -> io::Result<()> {
@@ -227,7 +266,16 @@ impl Read for FileTarget {
 }
 impl Write for FileTarget {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.file.write(bytes)
+        if self.interrupt_writes > 0 {
+            self.interrupt_writes -= 1;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        let count = self.file.write(bytes)?;
+        if count > 0 && self.tamper_mount_after_write {
+            self.observation.mount_fingerprint[0] ^= 1;
+            self.tamper_mount_after_write = false;
+        }
+        Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
@@ -345,7 +393,11 @@ pub fn run_write_safety(directory: &Path) -> Result<usize, String> {
             .issue(
                 &plan,
                 &observed.display_identifier,
-                now,
+                if scenario == 3 {
+                    now - Duration::from_secs(11)
+                } else {
+                    now
+                },
                 Duration::from_secs(10),
             )
             .map_err(|e| e.to_string())?;
@@ -389,22 +441,10 @@ pub fn run_write_safety(directory: &Path) -> Result<usize, String> {
             target.observed = Some(changed);
         }
         let mut checks = 0;
-        let result = write_image(
-            &mut target,
-            &mut image,
-            &plan,
-            &mut book,
-            &ticket,
-            if scenario == 3 {
-                now + Duration::from_secs(10)
-            } else {
-                now
-            },
-            || {
-                checks += 1;
-                scenario == 4 || (scenario == 22 && checks >= 5)
-            },
-        );
+        let result = write_image(&mut target, &mut image, &plan, &mut book, &ticket, || {
+            checks += 1;
+            scenario == 4 || (scenario == 22 && checks >= 5)
+        });
         let after = target.inner.read_all().map_err(|e| e.to_string())?;
         let end = image.len() as usize;
         if after[end..] != before[end..] {

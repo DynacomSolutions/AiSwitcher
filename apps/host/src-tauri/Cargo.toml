@@ -9,12 +9,14 @@ build = "build.rs"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+file-test = ["ais-host-core/file-test"]
 
 [build-dependencies]
 tauri-build.workspace = true
 
 [dependencies]
 ais-host-core = { path = "../crates/core" }
+getrandom = "=0.3.4"
 serde.workspace = true
 tauri.workspace = true
 

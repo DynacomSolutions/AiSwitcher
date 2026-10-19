@@ -10,7 +10,14 @@ fn frame(value: serde_json::Value) -> Vec<u8> {
 }
 fn request() -> serde_json::Value {
     serde_json::json!({ "version": 1, "operation": "createLayout", "planDigest": "0".repeat(64),
-        "channelBinding": "1".repeat(64), "ticket": "2".repeat(64) })
+        "channelBinding": "1".repeat(64), "ticket": "2".repeat(64),
+        "release": { "id": 1, "tag": "live-v1", "publishedAt": 1, "draft": false, "prerelease": false,
+            "assets": [
+                { "id": 1, "name": "SYNTHETIC_FIXTURE_IMAGE", "size": 1, "revision": "SYNTHETIC_FIXTURE_REVISION" },
+                { "id": 2, "name": "SYNTHETIC_FIXTURE_SUMS", "size": 1, "revision": "SYNTHETIC_FIXTURE_REVISION" },
+                { "id": 3, "name": "SYNTHETIC_FIXTURE_SIGNATURE", "size": 1, "revision": "SYNTHETIC_FIXTURE_REVISION" }
+            ] }, "deviceIdentity": "linux:8:0", "typedConfirmation": "SYNTHETIC_FIXTURE_DISK",
+        "confirmationDeadlineBootNs": 1 })
 }
 
 #[test]
@@ -92,7 +99,7 @@ fn helper_invoked_directly_refuses_without_reading_a_target() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("authorised native request channel")
+            .contains("fixed native service operation")
     );
     assert!(!ais_host_helper::writer::available());
 }

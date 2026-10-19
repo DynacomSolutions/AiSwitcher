@@ -1,9 +1,37 @@
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "file-test"))]
 mod macos;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", feature = "file-test"))]
 mod windows;
+
+#[cfg(target_os = "linux")]
+pub use linux::{LinuxBlockTarget, collect_by_identity as collect_linux_by_identity};
+#[cfg(all(target_os = "linux", feature = "file-test"))]
+pub use linux::{
+    LinuxDiskObservation, LinuxDiskSnapshot, LinuxPartition,
+    ObservationError as LinuxObservationError, collect_snapshot as collect_linux_snapshot,
+    observe as observe_linux_snapshot, parse_snapshot as parse_linux_snapshot,
+    recheck as recheck_linux_snapshot,
+};
+
+#[cfg(target_os = "macos")]
+pub use macos::{MacBlockTarget, collect_snapshot as collect_macos_snapshot};
+#[cfg(feature = "file-test")]
+pub use macos::{
+    MacDiskObservation, MacDiskSnapshot, MacPartition, ObservationError as MacObservationError,
+    observe as observe_macos_snapshot, parse_snapshot as parse_macos_snapshot,
+    recheck as recheck_macos_snapshot,
+};
+
+#[cfg(target_os = "windows")]
+pub use windows::WindowsBlockTarget;
+#[cfg(feature = "file-test")]
+pub use windows::{
+    ObservationError as WindowsObservationError, WindowsDiskObservation, WindowsDiskSnapshot,
+    collect_windows_snapshot, observe_windows_snapshot, parse_windows_snapshot,
+    recheck_windows_snapshot,
+};
 
 pub fn unavailable_reason() -> &'static str {
     #[cfg(target_os = "linux")]

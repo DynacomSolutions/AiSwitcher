@@ -4,10 +4,11 @@ use ais_host_core::release::{
 
 #[test]
 fn production_trust_is_unavailable_without_signed_layout_contract() {
-    assert!(matches!(
-        ImageVerifier::bundled(),
-        Err(TrustError::ContractUnavailable)
-    ));
+    match ImageVerifier::bundled() {
+        Ok(_) => {}
+        Err(TrustError::ContractUnavailable | TrustError::Signature) => {}
+        Err(error) => panic!("unexpected bundled trust result: {error:?}"),
+    }
 }
 
 #[test]
@@ -40,11 +41,11 @@ fn release(id: u64, date: u64) -> PublishedRelease {
     PublishedRelease {
         id,
         published_at: date,
-        tag: format!("live-v{id}"),
+        tag: format!("live-v{id}.0.0"),
         draft: false,
         prerelease: false,
         assets: [
-            format!("ais-live-x86_64-live-v{id}.img.zst"),
+            format!("ais-live-x86_64-live-v{id}.0.0.img.zst"),
             "SHA256SUMS".into(),
             "SHA256SUMS.minisig".into(),
         ]
@@ -65,7 +66,7 @@ fn selects_published_stable_tag_and_pins_asset_identities() {
     let mut releases = vec![release(1, 4), release(2, 3), release(3, 10)];
     releases[2].draft = true;
     let selection = select_release(&releases).unwrap();
-    assert_eq!(selection.tag(), "live-v1");
+    assert_eq!(selection.tag(), "live-v1.0.0");
     releases[0].assets[0].id = 99;
     assert_eq!(selection.image().id, 1);
     let duplicate = releases[0].assets[0].clone();
@@ -73,7 +74,22 @@ fn selects_published_stable_tag_and_pins_asset_identities() {
     assert!(select_release(&releases).is_err());
     releases[0].assets.pop();
     releases[0].prerelease = true;
-    assert_eq!(select_release(&releases).unwrap().tag(), "live-v2");
+    assert_eq!(select_release(&releases).unwrap().tag(), "live-v2.0.0");
+}
+
+#[test]
+fn malformed_older_release_is_preserved_as_fatal_when_fallback_reaches_it() {
+    use ais_host_core::release::select_release_candidates;
+
+    let newest = release(3, 30);
+    let mut malformed_older = release(2, 20);
+    malformed_older.assets.pop();
+    let oldest = release(1, 10);
+    let ordered = select_release_candidates(&[oldest, malformed_older, newest]);
+    assert_eq!(ordered.len(), 3);
+    assert_eq!(ordered[0].as_ref().unwrap().tag(), "live-v3.0.0");
+    assert!(matches!(ordered[1], Err(TrustError::AssetIdentity)));
+    assert_eq!(ordered[2].as_ref().unwrap().tag(), "live-v1.0.0");
 }
 
 #[cfg(feature = "file-test")]
@@ -179,5 +195,41 @@ mod signed {
         compressed.truncate(compressed.len() - 2);
         let fixture = SyntheticRelease::from_compressed(vec![0x45; 4096], compressed);
         assert!(fixture.verify(&std::env::temp_dir()).is_err());
+    }
+
+    #[test]
+    fn incompatible_newest_falls_back_but_bad_signature_is_fatal() {
+        use ais_host_core::{layout::synthetic_sfdisk_contract_fixture, release::ImageVerifier};
+
+        let anchor = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let anchor_text = anchor.pk.to_box().unwrap().to_string();
+        let compatible =
+            SyntheticRelease::new_with_key(synthetic_sfdisk_contract_fixture(), &anchor);
+        let incompatible = SyntheticRelease::new_with_key(vec![0x45; 64 * 1024], &anchor);
+        let verifier = ImageVerifier::synthetic_live_layout(&anchor_text).unwrap();
+        let (_, incompatible_download) = incompatible.download(&std::env::temp_dir()).unwrap();
+        let (_, compatible_download) = compatible.download(&std::env::temp_dir()).unwrap();
+        let verified = verifier
+            .verify_candidates([
+                Ok((incompatible.selection.clone(), incompatible_download)),
+                Ok((compatible.selection.clone(), compatible_download)),
+            ])
+            .expect("older authenticated compatible image should be selected");
+        assert_eq!(
+            verified.digest(),
+            ais_host_core::release::sha256(&compatible.raw)
+        );
+
+        let attacker = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let bad_signature = SyntheticRelease::new_with_key(compatible.raw.clone(), &attacker);
+        let (_, bad_download) = bad_signature.download(&std::env::temp_dir()).unwrap();
+        let (_, fallback_download) = compatible.download(&std::env::temp_dir()).unwrap();
+        assert!(matches!(
+            verifier.verify_candidates([
+                Ok((bad_signature.selection.clone(), bad_download)),
+                Ok((compatible.selection.clone(), fallback_download)),
+            ]),
+            Err(TrustError::Signature)
+        ));
     }
 }

@@ -11,7 +11,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const MAX_COMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_COMPRESSED_BYTES: u64 = 2_040_109_465; // 1.9 GiB, rounded down.
 pub const MAX_IMAGE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const MAX_SUMS_BYTES: usize = 1024 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 4096;
@@ -92,23 +92,47 @@ impl ReleaseSelection {
 }
 
 pub fn select_release(releases: &[PublishedRelease]) -> Result<ReleaseSelection, TrustError> {
-    let release = releases
+    select_release_candidates(releases)
+        .into_iter()
+        .next()
+        .unwrap_or(Err(TrustError::AssetIdentity))
+}
+
+/// Stable candidates are ordered by publication time and then release id.
+/// Tag versions are intentionally not used as an ordering signal.
+pub fn select_release_candidates(
+    releases: &[PublishedRelease],
+) -> Vec<Result<ReleaseSelection, TrustError>> {
+    let mut ordered: Vec<_> = releases
         .iter()
         .filter(|release| {
             !release.draft
                 && !release.prerelease
                 && release.id != 0
                 && release.published_at != 0
-                && release.tag.starts_with("live-v")
-                && release.tag.len() > 6
-                && release.tag.len() <= 80
-                && release
-                    .tag
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c))
+                && valid_live_tag(&release.tag)
         })
-        .max_by_key(|release| (release.published_at, release.id))
-        .ok_or(TrustError::AssetIdentity)?;
+        .collect();
+    ordered.sort_by_key(|release| {
+        (
+            std::cmp::Reverse(release.published_at),
+            std::cmp::Reverse(release.id),
+        )
+    });
+    ordered.into_iter().map(select_release_assets).collect()
+}
+
+fn valid_live_tag(tag: &str) -> bool {
+    tag.strip_prefix("live-v").is_some_and(|version| {
+        !version.is_empty()
+            && version.len() <= 70
+            && version
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c))
+    })
+}
+
+fn select_release_assets(release: &PublishedRelease) -> Result<ReleaseSelection, TrustError> {
     let mut names = BTreeMap::new();
     let mut ids = std::collections::BTreeSet::new();
     for asset in &release.assets {
@@ -175,13 +199,25 @@ pub fn parse_checksums(bytes: &[u8]) -> Result<BTreeMap<String, [u8; 32]>, Trust
 /// A missing bundled trust anchor must not be replaced by one from a download.
 pub struct ImageVerifier {
     key: PublicKey,
-    reviewed_image_hash: [u8; 32],
-    reviewed_image_size: u64,
+    layout: ReviewedLayout,
+}
+
+#[derive(Clone, Copy)]
+enum ReviewedLayout {
+    Exact { hash: [u8; 32], size: u64 },
+    LiveX86_64GptV1,
 }
 
 impl ImageVerifier {
     pub fn bundled() -> Result<Self, TrustError> {
-        Err(TrustError::ContractUnavailable)
+        let key = include_str!(concat!(env!("OUT_DIR"), "/bundled-image-key.txt"));
+        if key.trim().is_empty() {
+            return Err(TrustError::ContractUnavailable);
+        }
+        Ok(Self {
+            key: PublicKey::decode(key.trim()).map_err(|_| TrustError::ContractUnavailable)?,
+            layout: ReviewedLayout::LiveX86_64GptV1,
+        })
     }
 
     /// A synthetic byte-exact layout pin, separate from production GPT validation.
@@ -195,9 +231,43 @@ impl ImageVerifier {
         }
         Ok(Self {
             key: PublicKey::decode(public_key).map_err(|_| TrustError::Signature)?,
-            reviewed_image_hash: sha256(layout_bytes),
-            reviewed_image_size: layout_bytes.len() as u64,
+            layout: ReviewedLayout::Exact {
+                hash: sha256(layout_bytes),
+                size: layout_bytes.len() as u64,
+            },
         })
+    }
+
+    /// Test-only structural verifier for synthetic GPT fixtures.
+    #[cfg(feature = "file-test")]
+    pub fn synthetic_live_layout(public_key: &str) -> Result<Self, TrustError> {
+        Ok(Self {
+            key: PublicKey::decode(public_key).map_err(|_| TrustError::Signature)?,
+            layout: ReviewedLayout::LiveX86_64GptV1,
+        })
+    }
+
+    /// Verify candidate releases in publication order. Only a structurally
+    /// unsupported but otherwise authenticated image permits trying an older
+    /// candidate. A signature, checksum or asset failure is always fatal.
+    pub fn verify_candidates(
+        &self,
+        candidates: impl IntoIterator<Item = Result<(ReleaseSelection, DownloadedImage), TrustError>>,
+    ) -> Result<VerifiedImage, TrustError> {
+        let mut last_layout_error = false;
+        for candidate in candidates {
+            let (selection, download) = candidate?;
+            match self.verify(&selection, download) {
+                Ok(image) => return Ok(image),
+                Err(TrustError::Layout) => last_layout_error = true,
+                Err(error) => return Err(error),
+            }
+        }
+        if last_layout_error {
+            Err(TrustError::Layout)
+        } else {
+            Err(TrustError::AssetIdentity)
+        }
     }
 
     pub fn verify(
@@ -239,22 +309,29 @@ impl ImageVerifier {
         }
         let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
         decoder.window_log_max(27)?;
-        let bytes = read_bounded(
-            &mut decoder,
-            self.reviewed_image_size,
-            Duration::from_secs(120),
-        )?;
-        if bytes.len() as u64 != self.reviewed_image_size
-            || sha256(&bytes) != self.reviewed_image_hash
-        {
-            return Err(TrustError::Layout);
-        }
+        let maximum = match self.layout {
+            ReviewedLayout::Exact { size, .. } => size,
+            ReviewedLayout::LiveX86_64GptV1 => MAX_IMAGE_BYTES,
+        };
+        let bytes = read_bounded(&mut decoder, maximum, Duration::from_secs(120))?;
+        let verified_digest = match self.layout {
+            ReviewedLayout::Exact { hash, size }
+                if bytes.len() as u64 == size && sha256(&bytes) == hash =>
+            {
+                hash
+            }
+            ReviewedLayout::LiveX86_64GptV1 => {
+                crate::layout::LiveImageLayout::parse(&bytes)?;
+                sha256(&bytes)
+            }
+            _ => return Err(TrustError::Layout),
+        };
         Ok(VerifiedImage {
             source,
             source_digest: digest,
             source_size: selection.image.size,
             bytes,
-            digest: self.reviewed_image_hash,
+            digest: verified_digest,
             selection: selection.clone(),
         })
     }
@@ -303,7 +380,6 @@ impl VerifiedImage {
         }
         Ok(())
     }
-    #[cfg(feature = "file-test")]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
