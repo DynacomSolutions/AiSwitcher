@@ -286,3 +286,52 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 99
     correctness risk, and stops recurring the moment the last old-binary
     background worker exits.
 
+
+## Off-host push of the git-managed backup
+
+Optional. Without `~/.ais/config/backup.json` the backup behaves exactly as
+described above (same repo content, commits and console output); only the
+`~/.ais/backups.lock` serialisation is added.
+
+- **Config:** `~/.ais/config/backup.json` (`aisBackupConfigPath()` in
+  `src/shared/ais-home.ts`), overridable with `AIS_BACKUP_CONFIG`. Shape:
+  `{ "remote"?: string, "localRetentionDays"?: number }`, for example
+  `{ "remote": "backup@backup.example:/srv/ais-backups.git", "localRetentionDays": 30 }`.
+  A missing file means no remote and no trim. Invalid JSON or wrong types are
+  reported with `console.error` and treated as "no remote"; a bad config never
+  fails the local backup. `localRetentionDays` must be a positive integer and is
+  ignored (loudly) without a `remote`. `runBackup(groups, home, configPath?)`
+  takes the config path as an optional third argument for tests.
+- **Operator creates the remote.** Run `git init --bare /srv/ais-backups.git` on
+  the backup host once. The backup never creates it.
+- **Push on every run** where a remote is configured, including the "no changes"
+  and "nothing new to commit" runs, so a commit made while the remote was down
+  is sent by the next run (catch-up). It pushes the whole current branch to the
+  URL directly (no named remote is written to `.git/config`):
+  `git push --quiet <remote> HEAD:refs/heads/<branch>`. It is never forced
+  (no `--force`, no `+refspec`). The spawn uses stdin ignored,
+  `GIT_TERMINAL_PROMPT=0` and `core.sshCommand` with `BatchMode=yes`,
+  `ConnectTimeout=10`, `ServerAliveInterval=15`, `ServerAliveCountMax=2` and
+  `StrictHostKeyChecking=yes`, so a dead or silent host cannot stall a backup
+  beyond those bounds and an unknown host key fails loudly instead of
+  prompting. Any failure (non-zero exit, git missing, an exception) logs the
+  exit code and trimmed stderr with `console.error` and returns normally; the
+  push step never throws out of `runBackup`.
+- **Local trim** (only with `localRetentionDays`). After a push attempt, `git
+  ls-remote` must show the remote branch at exactly the local `HEAD`; if the
+  remote is unreachable, behind or different, the trim is skipped with a
+  logged reason. The boundary is the oldest commit of `git rev-list
+  --first-parent --since=<N days ago> HEAD`, or `HEAD` when every commit is
+  older. If the boundary has no local parent (already a root or already the
+  shallow boundary) nothing happens. Otherwise the boundary sha replaces the
+  contents of `.git/shallow` (written atomically; history is linear, so the new
+  boundary supersedes the old), then `git reflog expire --expire=now --all` and
+  `git gc --prune=now --quiet` drop the older objects. The remote keeps the full
+  history, and because it already holds the boundary commit later pushes stay
+  fast-forwards. Any trim failure is loud and non-fatal.
+- **Lock:** `~/.ais/backups.lock` (`aisBackupLockPath()`, outside the repo
+  tree) is held for the whole run via `src/shared/pid-lock.ts`, the same
+  pid+token helper as the sync lock. A second run waits up to 10 minutes, then
+  logs and throws like any other backup failure. A lock whose pid is dead is
+  taken over.
+- **Manual trigger:** `bun run backup` from a checkout.
