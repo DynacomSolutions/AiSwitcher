@@ -34,4 +34,6 @@ export interface SyncRunResult {
   skipped: boolean;
   preservedConflicts: number;
   preservedConflictPaths: string[];
+  /** Logs skipped because a native process owns them; re-staged next run. */
+  busyPaths: string[];
 }

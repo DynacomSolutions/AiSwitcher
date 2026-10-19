@@ -252,7 +252,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
   const config = await loadSyncConfig();
   const result: SyncRunResult = {
     remotes: config.remotes, pulled: [], pushed: [], skipped: false,
-    preservedConflicts: 0, preservedConflictPaths: [],
+    preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [],
   };
   if (config.remotes.length === 0) return result;
 
@@ -303,6 +303,10 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           });
           result.preservedConflicts += merged.preservedConflicts;
           result.preservedConflictPaths = [...new Set([...result.preservedConflictPaths, ...merged.preservedConflictPaths])];
+          result.busyPaths = [...new Set([...result.busyPaths, ...merged.busyPaths])];
+          if (merged.busyPaths.length > 0 && !options.quiet) {
+            console.warn(`AIS sync deferred ${merged.busyPaths.length} log(s) still open in a running tool: ${merged.busyPaths.join(", ")}. They sync on the next run.`);
+          }
           if (merged.preservedConflicts > 0 && !options.quiet) {
             console.warn(`AIS sync preserved ${merged.preservedConflicts} conflict(s), including deferred imports: ${merged.preservedConflictPaths.join(", ")}. Run ais sync recover to retry retained histories.`);
           }
