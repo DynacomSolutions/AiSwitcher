@@ -1,0 +1,39 @@
+namespace eval ais_exchange {
+  variable timeout_seconds 90
+  variable case_names {boot replay tamper auth-deferred auth-plausible crafted symlink periodic shutdown outbox exfat-readback}
+}
+
+proc ais_exchange::wait_case {serial_channel case_name} {
+  variable timeout_seconds
+  variable case_names
+  if {[lsearch -exact $case_names $case_name] < 0} {
+    error "unknown exchange case: $case_name"
+  }
+  set timeout $timeout_seconds
+  set pass_pattern [format {AIS-EXCHANGE-TEST: case=%s status=pass\r?\n} $case_name]
+  set fail_pattern [format {AIS-EXCHANGE-TEST: case=%s status=fail reason=([^\r\n]+)} $case_name]
+  expect -i $serial_channel \
+    -re $pass_pattern { return 0 } \
+    -re $fail_pattern { error "exchange case $case_name failed: $expect_out(1,string)" } \
+    timeout { error "timed out waiting for exchange case $case_name" } \
+    eof { error "serial channel closed before exchange case $case_name completed" }
+}
+
+proc ais_exchange::assert_rejected {serial_channel marker} {
+  variable timeout_seconds
+  set timeout $timeout_seconds
+  expect -i $serial_channel \
+    -re $marker { return 0 } \
+    timeout { error "timed out waiting for rejected marker" } \
+    eof { error "serial channel closed before rejected marker" }
+}
+
+proc ais_exchange::expect_scenario_order {serial_channel scenario} {
+  set phases {
+    basic {boot replay tamper}
+    auth {boot auth-deferred auth-plausible}
+    path-safety {boot crafted symlink periodic shutdown}
+  }
+  if {![dict exists $phases $scenario]} { error "unknown exchange scenario group: $scenario" }
+  foreach phase [dict get $phases $scenario] { ais_exchange::wait_case $serial_channel $phase }
+}
