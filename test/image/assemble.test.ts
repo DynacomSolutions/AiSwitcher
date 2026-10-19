@@ -49,13 +49,28 @@ describe.skipIf(!available)("raw GPT assembly", () => {
 
   test.skipIf(!Bun.which("expect"))("patches only disposable copies and keeps private OVMF variable stores", () => {
     const fake = join(scratch, "qemu-fixture");
-    writeFileSync(fake, `#!/usr/bin/env tclsh
-puts "AIS-LIVE: stage=kernel-up status=ok"
-puts "AIS-LIVE: stage=smoke-ready status=ok"
-flush stdout
-if {[gets stdin line] < 0 || $line ne "AIS-TEST-POWEROFF"} {exit 4}
-puts "AIS-LIVE: stage=poweroff status=ok"
-exit 0
+    writeFileSync(fake, `#!/usr/bin/env python3
+import json, socket, sys
+args = sys.argv[1:]
+qmp = next(arg[5:] for arg in args if arg.startswith("unix:"))
+qmp_path = qmp.split(",", 1)[0]
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(qmp_path)
+server.listen(1)
+connection, _ = server.accept()
+stream = connection.makefile("rwb", buffering=0)
+stream.write(b'{"QMP":{"version":{},"capabilities":[]}}\\r\\n')
+while True:
+    command = json.loads(stream.readline())
+    stream.write(json.dumps({"return": {}, "id": command["id"]}).encode() + b"\\r\\n")
+    if command["execute"] == "cont": break
+print("AIS-LIVE: stage=kernel-up status=ok", flush=True)
+print("AIS-LIVE: stage=smoke-ready status=ok", flush=True)
+if sys.stdin.readline().strip() != "AIS-TEST-POWEROFF": sys.exit(4)
+print("AIS-LIVE: stage=poweroff status=ok", flush=True)
+stream.write(b'{"event":"SHUTDOWN","data":{"guest":true,"reason":"guest-shutdown"}}\\r\\n')
+connection.close()
+server.close()
 `, { mode: 0o755 });
     const code = join(scratch, "CODE.fd"), vars = join(scratch, "VARS.fd");
     writeFileSync(code, "SYNTHETIC_FIXTURE");

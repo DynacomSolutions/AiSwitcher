@@ -54,7 +54,7 @@ jobs:
   # GitHub-hosted runner only: this repository is public, never self-hosted.
   build:
     needs: changes
-    if: needs.changes.outputs.affected != 'false'
+    if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

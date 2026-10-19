@@ -20,8 +20,26 @@ describe("live-image workflow", () => {
     expect(uses.length).toBeGreaterThan(0);
     for (const l of uses) expect(l).toMatch(/uses: [\w.-]+\/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$/);
   });
-  test("builds on anything but an explicit false and never schedules", () => {
-    expect(text).toContain("needs.changes.outputs.affected != 'false'");
+  test("builds after selector failure or timeout, skips only affected=false, and never schedules", () => {
+    const condition = lines.find((line) => /^    if:.*needs\.changes\.outputs\.affected/.test(line));
+    expect(condition).toBe("    if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}");
+    const expression = condition?.match(/\$\{\{\s*(.*?)\s*\}\}/)?.[1];
+    expect(expression).toBeDefined();
+    const evaluate = (cancelled: boolean, selectorResult: "success" | "failure" | "timed_out", affected: string) => {
+      const value = expression
+        ?.replace(/!cancelled\(\)/g, String(!cancelled))
+        .replace(/needs\.changes\.outputs\.affected/g, JSON.stringify(affected))
+        .replace(/!=/g, "!==");
+      const implicitSuccess = expression?.includes("!cancelled()")
+        ? true
+        : selectorResult === "success";
+      return implicitSuccess && Boolean(value && Function(`return (${value})`)());
+    };
+    expect(evaluate(false, "failure", "")).toBe(true);
+    expect(evaluate(false, "timed_out", "")).toBe(true);
+    expect(evaluate(false, "success", "true")).toBe(true);
+    expect(evaluate(false, "success", "false")).toBe(false);
+    expect(evaluate(true, "success", "true")).toBe(false);
     expect(text).not.toMatch(/^\s*schedule:/m);
     expect(text).not.toMatch(/runs-on: (?!ubuntu-latest)/);
   });

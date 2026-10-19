@@ -24,19 +24,26 @@ proc stage {name} {
     global spawn_id timeout
     set pattern "(^|\[\r\n\])AIS-LIVE: stage=$name status=ok\r*\n"
     expect {
-        -re $pattern { return }
         -re {(^|[\r\n])AIS-LIVE: [^\r\n]*status=fail} { fail {guest reported failure} }
         -re {Kernel panic|You are now being dropped into an emergency shell} { fail {guest failed to boot} }
+        -re $pattern { return }
         timeout { fail "timeout waiting for $name" }
         eof { fail "unexpected EOF waiting for $name" }
     }
 }
+# Keep these guards installed for every stage and the final EOF wait. This also
+# catches failure output already buffered after the last success marker.
+expect_before -i $spawn_id \
+    -re {(^|[\r\n])AIS-LIVE: [^\r\n]*status=fail} { fail {guest reported failure} } \
+    -re {Kernel panic|You are now being dropped into an emergency shell} { fail {guest failed to boot} }
 stage kernel-up
 stage smoke-ready
 send -- "AIS-TEST-POWEROFF\r"
 stage poweroff
 set timeout 120
 expect {
+    -re {(^|[\r\n])AIS-LIVE: [^\r\n]*status=fail} { fail {guest reported failure after shutdown acknowledgement} }
+    -re {Kernel panic|You are now being dropped into an emergency shell} { fail {guest failed after shutdown acknowledgement} }
     eof {}
     timeout { fail {guest did not power off} }
 }

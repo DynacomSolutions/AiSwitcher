@@ -12,10 +12,23 @@ shift 2
 [[ -f $image ]] || die 'image must be a regular file'
 case $firmware in bios|uefi) ;; *) die 'firmware must be bios or uefi' ;; esac
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+driver=${AIS_QEMU_DRIVER:-$here/boot.exp}
+if [[ $driver != /* ]]; then driver=$(realpath -e -- "$driver"); fi
 work=$(mktemp -d "${AIS_QEMU_WORK_ROOT:-$(dirname "$image")}/qemu-$firmware.XXXXXX")
+work=$(cd -- "$work" && pwd -P)
 copy=$work/live.img
 cp --reflink=auto --sparse=always -- "$image" "$copy"
 printf 'qemu-test: work files: %s\n' "$work"
+qmp_socket=qmp.sock
+qmp_evidence=$work/qmp-shutdown.json
+qmp_pid=
+cleanup_qmp() {
+    if [[ -n $qmp_pid ]]; then
+        kill "$qmp_pid" 2>/dev/null || true
+        wait "$qmp_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup_qmp EXIT INT TERM
 
 esp_start=$(sfdisk --json "$copy" | jq -er '.partitiontable | select(.label == "gpt" and .sectorsize == 512) | .partitions[1] | select(.name == "AISBOOT" and (.type | ascii_upcase) == "C12A7328-F81F-11D2-BA4B-00A0C93EC93B") | .start')
 fat="$copy@@$((esp_start * 512))"
@@ -65,6 +78,23 @@ if [[ $firmware == uefi ]]; then
         -drive "if=pflash,format=raw,file=${work//,/,,}/OVMF_VARS.fd")
 fi
 printf 'qemu-test: firmware=%s accelerator=%s timeout=%s\n' "$firmware" "$accel" "$boot_timeout"
+# QEMU starts paused and waits for a QMP client. Negotiate and continue before
+# any guest instruction can run, then retain the shutdown event as evidence.
+cd -- "$work"
+python3 "$here/qmp-watch.py" "$qmp_socket" "$qmp_evidence" >"$work/qmp.log" 2>&1 &
+qmp_pid=$!
 # Preserve driver status through tee. Scenarios may inspect the copy afterwards.
 export AIS_QEMU_IMAGE_COPY=$copy AIS_QEMU_RUN_DIR=$work
-expect "${AIS_QEMU_DRIVER:-$here/boot.exp}" "$boot_timeout" "$qemu" "${args[@]}" "$@" 2>&1 | tee "$work/serial.log"
+if expect "$driver" "$boot_timeout" "$qemu" "${args[@]}" \
+    -S -qmp "unix:$qmp_socket,server=on,wait=on" "$@" 2>&1 | tee "$work/serial.log"; then
+    driver_status=0
+else
+    driver_status=$?
+fi
+if wait "$qmp_pid"; then qmp_status=0; else qmp_status=$?; fi
+qmp_pid=
+cat "$work/qmp.log"
+(( driver_status == 0 )) || die "serial boot driver failed with status $driver_status"
+(( qmp_status == 0 )) || die "QMP watcher failed with status $qmp_status"
+jq -e '.event == "SHUTDOWN" and .data.guest == true and .data.reason == "guest-shutdown"' \
+    "$qmp_evidence" >/dev/null || die 'missing guest-shutdown evidence'
