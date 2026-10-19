@@ -12,7 +12,7 @@ use crate::models::ToolResumeGroup;
 use crate::timefmt;
 use crate::ui::widgets;
 
-const TAB_INDEX: usize = 4;
+const TAB_INDEX: usize = 5;
 
 pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = widgets::panel("Sessions");

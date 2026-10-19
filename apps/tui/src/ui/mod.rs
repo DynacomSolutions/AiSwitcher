@@ -5,6 +5,7 @@ mod breakdown;
 mod help;
 mod identities;
 mod limits;
+mod local_models;
 mod sessions;
 mod status;
 mod usage;
@@ -105,11 +106,12 @@ fn render_content(f: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect)
     match app.tab {
         0 => status::render(f, app, area),
         1 => identities::render(f, app, area),
-        2 => limits::render(f, app, area),
-        3 => usage::render(f, app, area),
-        4 => sessions::render(f, app, area),
-        5 => auth::render(f, app, area),
-        6 => breakdown::render(f, app, area),
+        2 => local_models::render(f, app, area),
+        3 => limits::render(f, app, area),
+        4 => usage::render(f, app, area),
+        5 => sessions::render(f, app, area),
+        6 => auth::render(f, app, area),
+        7 => breakdown::render(f, app, area),
         _ => help::render(f, app, area),
     }
 }
@@ -118,11 +120,12 @@ fn render_footer(f: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let specific: &[&str] = match app.tab {
         0 => &["auto 3s", "costs/limits auto 60s", "j/k scroll"],
         1 => &["read-only: edits via web UI or ais CLI"],
-        2 => &["r force refresh", "auto 60s"],
-        3 => &["auto 60s"],
-        4 => &["j/k scroll", "PgUp/PgDn page"],
-        5 => &["read-only: fixes via web UI or ais CLI"],
-        6 => &["r refresh", ",/. identity", "auto 5m", "estimates"],
+        2 => &["Enter start model", "r refresh", "auto 10s"],
+        3 => &["r force refresh", "auto 60s"],
+        4 => &["auto 60s"],
+        5 => &["j/k scroll", "PgUp/PgDn page"],
+        6 => &["read-only: fixes via web UI or ais CLI"],
+        7 => &["r refresh", ",/. identity", "auto 5m", "estimates"],
         _ => &[],
     };
 

@@ -11,7 +11,7 @@ use crate::models::{DateSpan, UsageResult};
 use crate::timefmt;
 use crate::ui::widgets;
 
-const TAB_INDEX: usize = 3;
+const TAB_INDEX: usize = 4;
 
 pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = widgets::panel("Usage");

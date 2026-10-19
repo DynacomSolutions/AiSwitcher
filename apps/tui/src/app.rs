@@ -1,6 +1,7 @@
 //! Central application state, the async event loop and per-endpoint fetchers.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -19,10 +20,13 @@ use crate::ui;
 /// cold first scan can approach this.
 pub const USAGE_SCAN_CEILING_SECS: u64 = 11 * 60;
 
-pub const TAB_COUNT: usize = 8;
+pub const TAB_COUNT: usize = 9;
+pub const TAB_LOCAL_MODELS: usize = 2;
+pub const TAB_BREAKDOWN: usize = 7;
 pub const TAB_NAMES: [&str; TAB_COUNT] = [
     "Status",
     "Identities",
+    "Local Models",
     "Limits",
     "Usage",
     "Sessions",
@@ -42,9 +46,10 @@ enum Endpoint {
     Sessions,
     Auth,
     Breakdown,
+    LocalModels,
 }
 
-const ENDPOINTS: [Endpoint; 8] = [
+const ENDPOINTS: [Endpoint; 9] = [
     Endpoint::Status,
     Endpoint::Processes,
     Endpoint::Identities,
@@ -53,6 +58,7 @@ const ENDPOINTS: [Endpoint; 8] = [
     Endpoint::Sessions,
     Endpoint::Auth,
     Endpoint::Breakdown,
+    Endpoint::LocalModels,
 ];
 
 const PENDING_REPOLL: Duration = Duration::from_secs(3);
@@ -61,7 +67,7 @@ impl Endpoint {
     const fn interval(self) -> Duration {
         match self {
             Self::Status | Self::Processes => Duration::from_secs(3),
-            Self::Identities | Self::Auth => Duration::from_secs(10),
+            Self::Identities | Self::Auth | Self::LocalModels => Duration::from_secs(10),
             Self::Sessions => Duration::from_secs(15),
             Self::Limits | Self::Usage => Duration::from_secs(60),
             // The breakdown scan streams raw session JSONL: the heaviest
@@ -93,6 +99,7 @@ impl Endpoint {
             Self::Sessions => "/api/sessions",
             Self::Auth => "/api/auth",
             Self::Breakdown => "/api/usage/breakdown?days=30",
+            Self::LocalModels => "/api/local-models",
         }
     }
 
@@ -106,6 +113,7 @@ impl Endpoint {
             Self::Sessions => 5,
             Self::Auth => 6,
             Self::Breakdown => 7,
+            Self::LocalModels => 8,
         }
     }
 
@@ -116,11 +124,12 @@ impl Endpoint {
         match tab {
             0 => &[Self::Status, Self::Processes, Self::Limits, Self::Usage],
             1 => &[Self::Identities],
-            2 => &[Self::Limits],
-            3 => &[Self::Usage],
-            4 => &[Self::Sessions],
-            5 => &[Self::Auth],
-            6 => &[Self::Breakdown],
+            2 => &[Self::LocalModels],
+            3 => &[Self::Limits],
+            4 => &[Self::Usage],
+            5 => &[Self::Sessions],
+            6 => &[Self::Auth],
+            7 => &[Self::Breakdown],
             _ => &[],
         }
     }
@@ -135,6 +144,7 @@ enum Msg {
     Sessions(Result<models::SessionsResponse, ApiError>),
     Auth(Result<models::AuthResponse, ApiError>),
     Breakdown(Result<models::BreakdownResponse, ApiError>),
+    LocalModels(Result<models::LocalModelsResponse, ApiError>),
 }
 
 #[derive(Debug)]
@@ -187,6 +197,9 @@ pub struct App {
     pub sessions: FetchState<models::SessionsResponse>,
     pub auth: FetchState<models::AuthResponse>,
     pub breakdown: FetchState<models::BreakdownResponse>,
+    pub local_models: FetchState<models::LocalModelsResponse>,
+    /// Model name the run loop must hand the terminal to (`ais local start`).
+    pub pending_start: Option<String>,
     /// Which breakdown result (one per tool/identity pair) the Breakdown tab
     /// is showing; cycled with `,` / `.` and clamped at render time.
     pub breakdown_selection: usize,
@@ -212,6 +225,8 @@ impl App {
             sessions: FetchState::default(),
             auth: FetchState::default(),
             breakdown: FetchState::default(),
+            local_models: FetchState::default(),
+            pending_start: None,
             breakdown_selection: 0,
             next_retry: None,
             quitting: false,
@@ -256,6 +271,9 @@ impl App {
             Msg::Sessions(result) => record!(sessions, Endpoint::Sessions, result),
             Msg::Auth(result) => record!(auth, Endpoint::Auth, result),
             Msg::Breakdown(result) => record!(breakdown, Endpoint::Breakdown, result),
+            Msg::LocalModels(result) => {
+                record!(local_models, Endpoint::LocalModels, result)
+            }
         }
     }
 
@@ -271,6 +289,17 @@ impl App {
 
     fn prev_tab(&mut self) {
         self.tab = Self::cycle_tab(self.tab, -1);
+    }
+
+    /// Enter on Local Models: start the first model, only with a runner.
+    fn request_start(&mut self) {
+        self.pending_start = self
+            .local_models
+            .data
+            .as_ref()
+            .filter(|data| data.runner.is_some())
+            .and_then(|data| data.models.first())
+            .map(|model| model.name.clone());
     }
 
     fn scroll_up(&mut self, amount: usize) {
@@ -340,6 +369,9 @@ async fn fetch_loop(
             Endpoint::Breakdown => {
                 Msg::Breakdown(client.get_json(endpoint.path(), endpoint.timeout()).await)
             }
+            Endpoint::LocalModels => {
+                Msg::LocalModels(client.get_json(endpoint.path(), endpoint.timeout()).await)
+            }
         };
         repoll = matches!(&msg, Msg::Usage(Ok(r)) if r.pending)
             || matches!(&msg, Msg::Breakdown(Ok(r)) if r.pending);
@@ -369,13 +401,14 @@ fn handle_key(app: &mut App, key: KeyEvent, notifies: &[Arc<Notify>]) {
         // top level owns them for tab cycling while Up/Down keep scrolling.
         KeyCode::Right => app.next_tab(),
         KeyCode::Left => app.prev_tab(),
-        KeyCode::Char(digit @ '1'..='8') => {
+        KeyCode::Char(digit @ '1'..='9') => {
             app.tab = digit.to_digit(10).unwrap_or(1) as usize - 1;
         }
-        // Breakdown identity cycling (tab 6 only, so typing these elsewhere
-        // stays inert).
-        KeyCode::Char(',') if app.tab == 6 => app.breakdown_select_prev(),
-        KeyCode::Char('.') if app.tab == 6 => app.breakdown_select_next(),
+        // Breakdown identity cycling (breakdown tab only, so typing these
+        // elsewhere stays inert).
+        KeyCode::Char(',') if app.tab == TAB_BREAKDOWN => app.breakdown_select_prev(),
+        KeyCode::Char('.') if app.tab == TAB_BREAKDOWN => app.breakdown_select_next(),
+        KeyCode::Enter if app.tab == TAB_LOCAL_MODELS => app.request_start(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(1),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(1),
         KeyCode::PageDown => app.scroll_down(10),
@@ -388,6 +421,21 @@ fn handle_key(app: &mut App, key: KeyEvent, notifies: &[Arc<Notify>]) {
 fn notify_endpoints(notifies: &[Arc<Notify>], endpoints: &[Endpoint]) {
     for endpoint in endpoints {
         notifies[endpoint.index()].notify_one();
+    }
+}
+
+const READER_POLL: Duration = Duration::from_millis(100);
+
+/// Runs `ais local start <name>` with inherited stdio and waits for it.
+/// Blocking is intended: the child owns the terminal. Failures are reported on stderr; the dashboard returns either way.
+fn run_local_start(name: &str) {
+    let status = std::process::Command::new("ais")
+        .args(["local", "start", name])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("ais local start exited with {status}"),
+        Err(err) => eprintln!("could not run ais: {err}"),
     }
 }
 
@@ -408,11 +456,28 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
 
     // Blocking reader thread bridged into the async world; it dies with the
     // process, which is fine since nothing else uses the terminal by then.
+    // It polls so it can pause while a child owns the terminal (`ais local
+    // start`) instead of stealing the child's keystrokes.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
+    let paused = Arc::new(AtomicBool::new(false));
+    let reader_paused = Arc::clone(&paused);
     std::thread::spawn(move || {
-        while let Ok(event) = crossterm::event::read() {
-            if event_tx.send(event).is_err() {
-                break;
+        loop {
+            if reader_paused.load(Ordering::SeqCst) {
+                std::thread::sleep(READER_POLL);
+                continue;
+            }
+            match crossterm::event::poll(READER_POLL) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(event) => {
+                        if event_tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
             }
         }
     });
@@ -434,6 +499,16 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
         }
         if app.quitting {
             break;
+        }
+        if let Some(name) = app.pending_start.take() {
+            paused.store(true, Ordering::SeqCst);
+            // Let an in-flight poll finish so it cannot swallow child input.
+            tokio::time::sleep(READER_POLL * 2).await;
+            ratatui::restore();
+            run_local_start(&name);
+            terminal = ratatui::init();
+            paused.store(false, Ordering::SeqCst);
+            terminal.clear().context("failed to repaint")?;
         }
         terminal
             .draw(|frame| ui::draw(frame, &mut app))
@@ -498,16 +573,88 @@ mod tests {
     #[test]
     fn number_keys_still_jump_to_tabs() {
         let mut app = test_app();
-        for (digit, expected) in [('1', 0), ('4', 3), ('7', 6), ('8', TAB_COUNT - 1)] {
+        for (digit, expected) in [('1', 0), ('4', 3), ('7', 6), ('9', TAB_COUNT - 1)] {
             press(&mut app, KeyCode::Char(digit));
             assert_eq!(app.tab, expected, "digit {digit} jumps to tab");
         }
     }
 
     #[test]
+    fn tab_names_put_local_models_beside_identities() {
+        assert_eq!(TAB_NAMES[1], "Identities");
+        assert_eq!(TAB_NAMES[2], "Local Models");
+    }
+
+    #[test]
+    fn number_keys_jump_including_local_models() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.tab, 2);
+        press(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.tab, TAB_COUNT - 1);
+    }
+
+    #[test]
+    fn comma_dot_still_cycle_breakdown_on_its_new_index() {
+        let mut app = test_app();
+        app.tab = TAB_BREAKDOWN;
+        press(&mut app, KeyCode::Char('.'));
+        assert_eq!(app.breakdown_selection, 1);
+        press(&mut app, KeyCode::Char(','));
+        assert_eq!(app.breakdown_selection, 0);
+    }
+
+    fn with_models(app: &mut App, runner: Option<&str>, names: &[&str]) {
+        app.local_models.data = Some(models::LocalModelsResponse {
+            online: true,
+            runner: runner.map(str::to_string),
+            models: names
+                .iter()
+                .map(|name| models::LocalModelEntry {
+                    name: (*name).to_string(),
+                    path: format!("/synthetic/{name}.gguf"),
+                    size_bytes: 1024,
+                })
+                .collect(),
+        });
+    }
+
+    #[test]
+    fn enter_on_local_models_requests_start_of_first_model() {
+        let mut app = test_app();
+        app.tab = TAB_LOCAL_MODELS;
+        with_models(&mut app, Some("llama-cli"), &["tiny", "other"]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_start.as_deref(), Some("tiny"));
+    }
+
+    #[test]
+    fn enter_without_runner_or_model_requests_nothing() {
+        let mut app = test_app();
+        app.tab = TAB_LOCAL_MODELS;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_start, None, "nothing fetched");
+        with_models(&mut app, None, &["tiny"]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_start, None, "no runner");
+        with_models(&mut app, Some("llama-cli"), &[]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_start, None, "no model");
+    }
+
+    #[test]
+    fn enter_on_other_tabs_requests_nothing() {
+        let mut app = test_app();
+        app.tab = 1;
+        with_models(&mut app, Some("llama-cli"), &["tiny"]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_start, None);
+    }
+
+    #[test]
     fn comma_dot_cycle_breakdown_identity_selection() {
         let mut app = test_app();
-        app.tab = 6;
+        app.tab = TAB_BREAKDOWN;
         press(&mut app, KeyCode::Char('.'));
         press(&mut app, KeyCode::Char('.'));
         assert_eq!(app.breakdown_selection, 2);
@@ -527,14 +674,14 @@ mod tests {
     #[test]
     fn vertical_keys_keep_scrolling_without_changing_tab() {
         let mut app = test_app();
-        app.tab = 4;
+        app.tab = 5;
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.scrolls[4], 2);
+        assert_eq!(app.scrolls[5], 2);
         press(&mut app, KeyCode::Up);
         press(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.scrolls[4], 0);
-        assert_eq!(app.tab, 4, "Up/Down never switch tabs");
+        assert_eq!(app.scrolls[5], 0);
+        assert_eq!(app.tab, 5, "Up/Down never switch tabs");
         assert_eq!(app.scrolls[0], 0, "only the active tab scrolls");
     }
 

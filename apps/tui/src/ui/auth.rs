@@ -10,7 +10,7 @@ use ratatui::widgets::{Cell, Row, Table};
 use crate::app::App;
 use crate::ui::widgets;
 
-const TAB_INDEX: usize = 5;
+const TAB_INDEX: usize = 6;
 
 pub fn render(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = widgets::panel("Auth");

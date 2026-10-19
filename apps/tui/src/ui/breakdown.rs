@@ -16,7 +16,7 @@ use crate::app::App;
 use crate::models::{BreakdownCategory, BreakdownResult};
 use crate::ui::widgets;
 
-const TAB_INDEX: usize = 6;
+const TAB_INDEX: usize = 7;
 /// Top consumers rendered before the list truncates.
 const MAX_ROWS: usize = 12;
 const BAR_WIDTH: usize = 18;
