@@ -162,7 +162,22 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 99
   wrote a fresh, independent `~/.ai-switcher-backups/<timestamp>/*.tar.gz`
   tree on every `install`/`update`/`migrate` run, and nothing ever pruned
   old ones, allowing redundant full snapshots to accumulate.
-  The new design (`runBackup()`) mirrors each backed-up directory into a
+  **Superseded 2026-10-19: the backup is now git-only.** The rsync mirror
+  described next stored every file twice (plain copy plus git objects; 3.3G
+  on a real host, 2.5G of it the mirror). `runBackup()` now runs git with
+  `--git-dir=~/.ais/backups/.git --work-tree=$HOME`, writes
+  `BACKUP_EXCLUDES` to `.git/info/exclude` every run, and stages with
+  `git add -A --ignore-errors` (unreadable or vanished files are skipped
+  with a warning, replacing the rsync 23/24 tolerance; `isTolerableRsyncExitCode`
+  is gone). Index paths are unchanged (`.claude/...` relative to home), so
+  history stays valid. The first run after upgrading deletes the old plain
+  `~/.ais/backups/<group dir>` mirrors, only the exact known group names and
+  only once `git rev-parse --git-dir` succeeds. Known limit: a nested git
+  repo inside a config dir is recorded as a gitlink (or skipped with an error
+  if it has no commits) instead of its files being copied. The rsync
+  details below are historical.
+  Rolling back to a binary older than this change needs `git --git-dir=~/.ais/backups/.git config core.bare false` first (the new code sets `core.bare=true`).
+  The previous design (`runBackup()`) mirrors each backed-up directory into a
   single persistent working tree at `~/.ais/backups` via `rsync -a --delete
   --delete-excluded` (replacing tar's "always a fresh full copy" with "the
   working tree always exactly matches the live source, minus excludes"),
