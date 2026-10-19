@@ -109,7 +109,7 @@ describe("mergeJsonlFiles races", () => {
     // Leave the bytes unchanged: only the fresh owner check can detect this.
     setJsonlBeforeWriteHook((path) => { nativeWriter = openSync(path, "a"); });
     try {
-      expect(await mergeJsonlFiles([source], destination, false, { lookups: 4 })).toBe("deferred");
+      expect(await mergeJsonlFiles([source], destination, false, { lookups: 4 })).toBe("busy");
       expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
     } finally { if (nativeWriter !== undefined) closeSync(nativeWriter); }
     setJsonlBeforeWriteHook();
@@ -164,7 +164,7 @@ describe("mergeJsonlFiles races", () => {
     });
 
     try {
-      expect(await mergeJsonlFiles([source], destination, false)).toBe("deferred");
+      expect(await mergeJsonlFiles([source], destination, false)).toBe("busy");
       expect(await Bun.file(destination).text()).toBe('SYNTHETIC_FIXTURE_local\nSYNTHETIC_FIXTURE_partial');
       expect(await Bun.file(source).text()).toBe('SYNTHETIC_FIXTURE_imported\n');
     } finally { await nativeWriter?.close(); }

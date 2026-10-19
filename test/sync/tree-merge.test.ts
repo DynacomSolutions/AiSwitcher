@@ -138,7 +138,8 @@ describe("mergeIncomingProfileTree", () => {
         kind: "identity", cfg: codexConfig(home), identityName: "personal",
       }, { home });
       expect(result.mergedJsonlFiles).toBe(10);
-      expect(result.preservedConflictPaths).toEqual(paths.slice(0, 4));
+      expect(result.busyPaths).toEqual(paths.slice(0, 4));
+      expect(result.preservedConflictPaths).toEqual([]);
       for (const [i, rel] of paths.entries()) {
         expect(await Bun.file(join(home, rel)).text()).toBe(i < 4
           ? "SYNTHETIC_FIXTURE_local\n" : "SYNTHETIC_FIXTURE_local\nSYNTHETIC_FIXTURE_remote\n");
