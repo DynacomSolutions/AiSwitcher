@@ -1,5 +1,5 @@
-import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { link, mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 function processIsAlive(pid: number): boolean {
   try {
@@ -33,6 +33,13 @@ export async function acquirePidLock(
     }
   };
 
+  // Best effort: reap temp files left by crashed acquirers (pid in the name is dead).
+  const tmpName = new RegExp(`^${basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.(\\d+)-[0-9a-f-]+\\.tmp$`);
+  for (const name of await readdir(dirname(path)).catch(() => [] as string[])) {
+    const m = tmpName.exec(name);
+    if (m && !processIsAlive(Number(m[1]))) await unlink(join(dirname(path), name)).catch(() => {});
+  }
+
   for (;;) {
     // link() publishes a complete file atomically and fails with EEXIST if the lock exists.
     await writeFile(tmp, body, { mode: 0o600 });
@@ -54,17 +61,22 @@ export async function acquirePidLock(
     let seen: string;
     try {
       seen = await readFile(path, "utf8");
-    } catch {
-      continue; // Vanished between link and read.
+    } catch (readErr) {
+      if ((readErr as NodeJS.ErrnoException).code === "ENOENT") continue; // Vanished between link and read.
+      if (Date.now() >= deadline) return undefined; // Unreadable (e.g. root-owned): honour waitMs.
+      await Bun.sleep(retryMs);
+      continue;
     }
     if (isStale(seen)) {
       // Claim this exact stale content by linking our own file to a name derived from it: only one
       // claimant succeeds. Only the claimant ever removes that stale file, and a fresh lock can only
       // appear after it is gone, so the unlink below can never hit someone else's new lock.
       const claim = `${path}.claim-${new Bun.CryptoHasher("sha1").update(seen).digest("hex")}`;
+      let won = false;
       try {
         await writeFile(tmp, body, { mode: 0o600 });
         await link(tmp, claim);
+        won = true;
         try {
           if ((await readFile(path, "utf8")) === seen) await unlink(path);
         } finally {
@@ -82,7 +94,7 @@ export async function acquirePidLock(
       } finally {
         await unlink(tmp).catch(() => {});
       }
-      continue;
+      if (won) continue;
     }
     if (Date.now() >= deadline) return undefined;
     await Bun.sleep(retryMs);

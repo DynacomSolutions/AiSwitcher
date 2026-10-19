@@ -42,8 +42,8 @@ export interface LocalModelsDto {
   models: Array<{ name: string; path: string; sizeBytes: number }>;
 }
 
-async function defaultLocalModels(): Promise<LocalModelsDto> {
-  const online = await isOnline().catch(() => false);
+async function defaultLocalModels(onlineCachePath?: string): Promise<LocalModelsDto> {
+  const online = await isOnline({ cachePath: onlineCachePath }).catch(() => false);
   return { online, runner: resolveLlamaRunner() ?? null, models: await discoverLocalModels() };
 }
 
@@ -65,6 +65,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   loginFlows?: LoginFlowManagerLike;
   /** Test seam for GET /api/local-models; defaults to the real discovery and probe. */
   localModels?: () => Promise<LocalModelsDto>;
+  /** Online-probe cache file for the default localModels; tests inject a temp path. */
+  onlineCachePath?: string;
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {
@@ -181,7 +183,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
 
   /* ------------------------------ local models ----------------------------- */
 
-  app.get("/api/local-models", async (c) => c.json(await (deps.localModels ?? defaultLocalModels)()));
+  app.get("/api/local-models", async (c) => c.json(await (deps.localModels ?? (() => defaultLocalModels(deps.onlineCachePath)))()));
 
   /* ---------------------------- limits / usage ----------------------------- */
   // Heavy scans run on worker threads (see workers.ts): a stalled scan must
