@@ -171,25 +171,23 @@ describe("checkLine integration", () => {
   });
 });
 
-describe("Apple entitlement identifiers in plist files", () => {
+describe("com.apple. reverse-DNS identifiers", () => {
   const lines = [
     "<key>com.apple.developer.team-identifier</key>",
-    "<key>com.apple.application-identifier</key>",
     "<string>com.apple.security.app-sandbox</string>",
+    'let k = "com.apple.application-identifier"; // com.apple.x',
   ];
-  test("pass in .plist and .entitlements", () => {
-    for (const path of ["a.entitlements.plist", "b.entitlements"]) {
+  test("pass in every file type", () => {
+    for (const path of ["a.plist", "b.entitlements", "c.ts", "d.rs", "e.md"]) {
       for (const line of lines) expect(checkLine(path, line)).toEqual([]);
     }
   });
-  test("still blocked in .ts and .md", () => {
-    expect(checkLine("a.md", lines[0]!)).toContain("blocked-domain");
-    expect(checkLine("a.ts", 'const k = "com.apple.developer.team-identifier";')).toContain("blocked-domain");
-  });
-  test("real domain in a plist string is still blocked", () => {
-    expect(checkLine("a.plist", "<string>console.internal-example.dev</string>")).toContain("blocked-domain");
-    expect(checkLine("a.plist", "<string>com.apple.x console.internal-example.dev</string>")).toContain("blocked-domain");
-    expect(checkLine("a.plist", "<string>com.other.org</string>")).toContain("blocked-domain");
+  test("real domains are still blocked in every file type", () => {
+    for (const path of ["a.plist", "c.ts", "d.rs", "e.md"]) {
+      expect(checkLine(path, '"console.internal-example.dev"')).toContain("blocked-domain");
+      expect(checkLine(path, '"com.apple.x console.internal-example.dev"')).toContain("blocked-domain");
+      expect(checkLine(path, '"com.other.org"')).toContain("blocked-domain");
+    }
   });
 });
 

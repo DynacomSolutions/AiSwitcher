@@ -194,17 +194,14 @@ export function findMachineNicknames(text: string): string[] {
   return [...text.matchAll(MACHINE_NICKNAME_RE)].map(match => match[0]);
 }
 
-// ---- Apple entitlement identifiers -------------------------------------------
-// Entitlement plists use Apple reverse-DNS keys and values (com.apple.*) that
-// parse as domains. Only that prefix, only inside <key>/<string> elements of
-// .plist/.entitlements files; any other token in those elements is still scanned.
-const PLIST_EXTENSIONS = new Set([".plist", ".entitlements"]);
-const PLIST_ELEMENT_RE = /(<(key|string)>)([^<]*)(<\/\2>)/g;
+// ---- Apple reverse-DNS identifiers --------------------------------------------
+// A token starting with com.apple. (entitlement keys, bundle ids) is an
+// identifier, never a hostname. Only that prefix is skipped; other tokens on
+// the same line are still scanned.
 const APPLE_ID_RE = /\bcom\.apple(?:\.[A-Za-z0-9-]+)+/g;
 
-export function stripAppleEntitlementIds(path: string, line: string): string {
-  if (!PLIST_EXTENSIONS.has(extname(path))) return line;
-  return line.replace(PLIST_ELEMENT_RE, (_m, open, _tag, body, close) => open + body.replace(APPLE_ID_RE, "") + close);
+export function stripAppleEntitlementIds(_path: string, line: string): string {
+  return line.replace(APPLE_ID_RE, "");
 }
 
 // ---- per-line rule aggregation -----------------------------------------------
