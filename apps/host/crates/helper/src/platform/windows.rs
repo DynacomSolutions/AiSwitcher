@@ -183,9 +183,10 @@ fn validate_snapshot(snapshot: &WindowsDiskSnapshot) -> Result<(), ObservationEr
     parse_digest(&snapshot.table_fingerprint)?;
     parse_digest(&snapshot.mount_fingerprint)?;
     if let Some(serial) = &snapshot.serial
-        && (serial.is_empty() || serial.len() > 256 || serial.chars().any(char::is_control)) {
-            return Err(ObservationError::InvalidInput);
-        }
+        && (serial.is_empty() || serial.len() > 256 || serial.chars().any(char::is_control))
+    {
+        return Err(ObservationError::InvalidInput);
+    }
     if !snapshot.ancestry_complete {
         return Err(ObservationError::Ineligible);
     }

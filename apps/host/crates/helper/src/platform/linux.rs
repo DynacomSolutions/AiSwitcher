@@ -155,9 +155,7 @@ impl ais_host_core::device::WriteTarget for LinuxBlockTarget {
             || metadata.dev() != self.retained_device
             || metadata.rdev() != self.retained_rdev
         {
-            return Err(io::Error::other(
-                "retained device handle changed",
-            ));
+            return Err(io::Error::other("retained device handle changed"));
         }
         let mut snapshot = collect_sysfs_snapshot(&self.name)
             .map_err(|_| io::Error::other("native device recheck failed"))?;
@@ -177,9 +175,7 @@ impl ais_host_core::device::WriteTarget for LinuxBlockTarget {
             || current.capacity_bytes != self.approved.capacity_bytes
             || current.serial != self.approved.serial
         {
-            return Err(io::Error::other(
-                "native device identity changed",
-            ));
+            return Err(io::Error::other("native device identity changed"));
         }
         Ok(current)
     }

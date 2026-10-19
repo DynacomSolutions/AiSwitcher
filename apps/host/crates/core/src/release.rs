@@ -204,8 +204,12 @@ pub struct ImageVerifier {
 
 #[derive(Clone, Copy)]
 enum ReviewedLayout {
-    #[cfg_attr(not(feature = "file-test"), allow(dead_code))] // only synthetic fixtures pin exact bytes
-    Exact { hash: [u8; 32], size: u64 },
+    #[cfg_attr(not(feature = "file-test"), allow(dead_code))]
+    // only synthetic fixtures pin exact bytes
+    Exact {
+        hash: [u8; 32],
+        size: u64,
+    },
     LiveX86_64GptV1,
 }
 

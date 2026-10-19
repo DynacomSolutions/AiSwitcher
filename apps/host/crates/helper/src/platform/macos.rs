@@ -1060,7 +1060,9 @@ fn validate_snapshot(snapshot: &MacDiskSnapshot) -> Result<(), ObservationError>
         || snapshot.capacity_bytes == 0
         || snapshot.connection_generation == 0
         || !matches!(snapshot.sector_bytes, 512 | 4096)
-        || !snapshot.capacity_bytes.is_multiple_of(u64::from(snapshot.sector_bytes))
+        || !snapshot
+            .capacity_bytes
+            .is_multiple_of(u64::from(snapshot.sector_bytes))
         || snapshot.protocol.is_empty()
         || snapshot.device_tree_path.is_empty()
         || snapshot.partitions.len() > MAX_PARTITIONS
