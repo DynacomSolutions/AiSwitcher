@@ -69,11 +69,22 @@ jobs:
           set -euo pipefail
           bun install --frozen-lockfile
 
+      # Assembly and boot-test tools; the unit tests exercise them for real.
+      - name: Install image tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorriso jq expect tcl dosfstools mtools e2fsprogs exfatprogs \
+            syslinux syslinux-common grub-common grub-efi-amd64-bin \
+            qemu-system-x86 ovmf
+
       - name: Test the image scripts
         run: |
           set -euo pipefail
           bun test test/image
-          shellcheck -x -P SCRIPTDIR image/build/*.sh image/archiso/profiledef.sh
+          shellcheck -x -P SCRIPTDIR image/build/*.sh image/test/*.sh \
+            image/archiso/profiledef.sh image/archiso/airootfs/usr/local/lib/ais-live/kernel-up
 
       # Measured: the standard runner has far more than the build needs, so
       # no preinstalled toolchains are removed. Kept as a record per run.
@@ -81,11 +92,6 @@ jobs:
         run: |
           set -euo pipefail
           df -h /
-
-      - name: Install xorriso for the El Torito check
-        run: |
-          set -euo pipefail
-          sudo apt-get install -y --no-install-recommends xorriso
 
       - name: Start disk sampler
         run: |
@@ -101,6 +107,13 @@ jobs:
           sudo image/build/build.sh >"$RUNNER_TEMP/build.log" 2>&1 || { tail -n 200 "$RUNNER_TEMP/build.log"; exit 1; }
           tail -n 30 "$RUNNER_TEMP/build.log"
           echo "build_seconds=$(( $(date +%s) - start ))" | tee "$RUNNER_TEMP/build-time.txt"
+
+      - name: Assemble the raw disk image
+        run: |
+          set -euo pipefail
+          sudo chown -R "$USER" out
+          image/build/assemble.sh out/archiso.iso out/ais-live.img
+          ls -l out/ais-live.img
 
       - name: Stop disk sampler
         if: always()
@@ -148,9 +161,67 @@ jobs:
             out/build-info.json
           retention-days: 3
 
+      - name: Upload the raw disk image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ais-live-image
+          path: out/ais-live.img
+          retention-days: 3
+          compression-level: 6
+
+  # Boots the raw image under QEMU with SeaBIOS (bios) and OVMF (uefi).
+  boot-test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        firmware: [bios, uefi]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install boot-test tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq expect mtools qemu-system-x86 ovmf
+
+      # The hosted runner exposes /dev/kvm but not to the runner user.
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ais-live-image
+          path: out
+
+      - name: Boot (${{ matrix.firmware }})
+        env:
+          FIRMWARE: ${{ matrix.firmware }}
+        run: |
+          set -euo pipefail
+          image/test/run-qemu.sh out/ais-live.img "$FIRMWARE"
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: serial-${{ matrix.firmware }}
+          path: out/qemu-*/serial.log
+          retention-days: 3
+          if-no-files-found: warn
+
   # Always reports, so a required check never hangs on skipped jobs.
   gate:
-    needs: [changes, build]
+    needs: [changes, build, boot-test]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -159,7 +230,9 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           BUILD: ${{ needs.build.result }}
+          BOOT: ${{ needs.boot-test.result }}
         run: |
           set -euo pipefail
           [ "$CHANGES" = "success" ] || exit 1
           case "$BUILD" in success|skipped) ;; *) exit 1 ;; esac
+          case "$BOOT" in success|skipped) ;; *) exit 1 ;; esac
