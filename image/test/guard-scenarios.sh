@@ -211,7 +211,7 @@ PY
   mark typed-target-write ok
   printf '%s' "$pattern_vdb" | dd of=/dev/vdb bs=1 seek=4096 conv=notrunc status=none
 
-  run_as_agent /usr/bin/dd if=/dev/zero of=/dev/vdb bs=1 seek=4096 count=8 status=none >/dev/null 2>&1 && return 1 || true
+  if run_as_agent /usr/bin/dd if=/dev/zero of=/dev/vdb bs=1 seek=4096 count=8 status=none >/dev/null 2>&1; then return 1; fi
   check_pattern /dev/vdb "$pattern_vdb" || return 1
   mark absolute-path-denial ok
 
