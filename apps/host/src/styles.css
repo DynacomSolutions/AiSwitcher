@@ -33,3 +33,9 @@ select, .primary-button { min-height: 2.75rem; padding: .5rem .8rem; border: 1px
 @media (prefers-contrast: more) { :root, body, .native-glass, .native-glass body { background: #050a12; } .glass-panel, .navigation, .topbar, .empty-state, .error-panel, .disk-confirmation { border-color: #fff; background: #050a12; color: #fff; backdrop-filter: none; } }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .native-glass, .native-glass body { background: #0b1220; } .glass-panel, .navigation, .topbar { background: #152238; } }
 @media (max-width: 700px) { .layout { grid-template-columns: 1fr; } .navigation { flex-direction: row; } }
+.identity, .disk-confirmation dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .25rem 1rem; }
+.identity dd, .disk-confirmation dd { margin: 0; overflow-wrap: anywhere; }
+.disk-confirmation input { display: block; width: 100%; min-height: 2.75rem; margin: .4rem 0 .8rem; padding: .5rem .8rem; border: 1px solid #ffffff80; border-radius: .6rem; color: #fff; background: #0b1424; font: inherit; }
+button:not(.primary-button) { min-height: 2.75rem; padding: .5rem .9rem; border: 1px solid #ffffff48; border-radius: .6rem; color: #fff; background: #172338; font: inherit; }
+button:disabled { opacity: .55; cursor: not-allowed; }
+input:focus-visible { outline: 3px solid #ffd166; outline-offset: 3px; }

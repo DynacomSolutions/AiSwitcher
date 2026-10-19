@@ -3,6 +3,7 @@ import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } fr
 import type { DeviceSummary, HostBridge, OperationView } from "./contract";
 import { contentRoute, filterRoute } from "./routes";
 import { acceptOperationProgress } from "./operation";
+import { CreateDrive } from "./CreateDrive";
 
 export function App({ bridge }: { bridge: HostBridge }) {
   const [devices, setDevices] = useState<DeviceSummary[]>([]);
@@ -34,7 +35,7 @@ export function App({ bridge }: { bridge: HostBridge }) {
           <Route path="/" element={<Navigate to="/drives" replace />} />
           <Route path="/drives" element={loadError ? <Page title="Drives"><div role="alert" className="error-panel"><p>{loadError}</p><button type="button" onClick={() => { setLoading(true); setReload((value) => value + 1); }}>Retry</button></div></Page> : <DriveList devices={devices} loading={loading} />} />
           <Route path="/drives/:id" element={<DriveDetail devices={devices} loading={loading} />} />
-          <Route path="/create" element={<Page title="Create a drive"><p>Connect a removable drive to begin.</p></Page>} />
+          <Route path="/create" element={<CreateDrive key={reload} bridge={bridge} devices={devices} loading={loading} onRefresh={() => setReload((value) => value + 1)} />} />
           <Route path="/settings" element={<Page title="Settings"><p>Host app settings.</p></Page>} />
           <Route path="*" element={<Page title="Page not found"><Link to="/drives">Return to drives</Link></Page>} />
         </Routes>

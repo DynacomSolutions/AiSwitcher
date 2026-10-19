@@ -1,15 +1,25 @@
-import type { DeviceSummary, HostBridge, OperationView } from "./contract";
+import type { ConfirmationReceipt, DeviceSummary, HostBridge, OperationView, WritePreview } from "./contract";
 
 declare global {
   interface Window {
     __TAURI__?: {
-      core: { invoke<T>(command: string): Promise<T> };
+      core: { invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> };
       event: { listen<T>(event: string, listener: (event: { payload: T }) => void): Promise<() => void> };
     };
   }
 }
 
+function native(): NonNullable<Window["__TAURI__"]>["core"] {
+  if (!window.__TAURI__) throw new Error("The native host runtime is unavailable.");
+  return window.__TAURI__.core;
+}
+
 export const productionBridge: HostBridge = {
+  async previewWrite(deviceId: string): Promise<WritePreview> { return native().invoke<WritePreview>("preview_write", { deviceId }); },
+  async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
+    return native().invoke<ConfirmationReceipt>("confirm_write", { previewId, typedIdentifier });
+  },
+  async invalidateConfirmation() { try { await native().invoke<void>("invalidate_confirmation"); } catch { /* no native session to invalidate */ } },
   async listDevices(): Promise<DeviceSummary[]> {
     if (!window.__TAURI__) throw new Error("The native host runtime is unavailable.");
     return window.__TAURI__.core.invoke<DeviceSummary[]>("list_devices");

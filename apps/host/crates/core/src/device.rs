@@ -19,6 +19,7 @@ pub struct DeviceSummary {
     pub transport: String,
     pub system: bool,
     pub writable: bool,
+    pub serial: Option<String>,
     pub layout_status: String,
 }
 

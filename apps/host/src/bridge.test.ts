@@ -1,4 +1,4 @@
-import type { DeviceSummary, HostBridge, OperationView } from "./contract";
+import type { ConfirmationReceipt, DeviceSummary, HostBridge, OperationView, WritePreview } from "./contract";
 
 const devices: DeviceSummary[] = [{
   id: "SYNTHETIC_FIXTURE_drive_usb_1",
@@ -8,9 +8,37 @@ const devices: DeviceSummary[] = [{
   transport: "usb",
   system: false,
   writable: true,
+  serial: "SYNTHETIC_FIXTURE_serial_1",
   layoutStatus: "ready",
+}, {
+  id: "SYNTHETIC_FIXTURE_drive_system_1",
+  displayIdentifier: "Synthetic System Disk",
+  model: "Synthetic internal",
+  capacityBytes: 512_000_000_000,
+  transport: "nvme",
+  system: true,
+  writable: true,
+  serial: null,
+  layoutStatus: "unknown",
 }];
+let previews = 0;
+let current: string | null = null;
 export const testBridge: HostBridge = {
+  async previewWrite(deviceId: string): Promise<WritePreview> {
+    const device = devices.find((item) => item.id === deviceId && !item.system);
+    if (!device) throw new Error("The selected device is unavailable.");
+    current = `SYNTHETIC_FIXTURE_preview_${++previews}`;
+    return {
+      previewId: current, operation: "createLayout", displayIdentifier: device.displayIdentifier, model: device.model,
+      capacityBytes: device.capacityBytes, partitions: [{ name: "SYNTHETIC_FIXTURE_part_1", sizeBytes: 1_000_000, kind: "data" }],
+      partitionDetailsAvailable: true, ranges: [{ start: 0, length: 17_408 }], imageDigest: "0".repeat(64), confirmationTtlSeconds: 90,
+    };
+  },
+  async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
+    if (previewId !== current || typedIdentifier !== "Synthetic USB Drive") throw new Error("Type the exact displayed device identifier.");
+    return { expiresInSeconds: 90 };
+  },
+  async invalidateConfirmation() { current = null; },
   async listDevices() { return devices; },
   subscribeToOperations(listener: (operation: OperationView) => void) {
     const event: OperationView = { id: "SYNTHETIC_FIXTURE_operation_1", phase: "running", completedBytes: 2, totalBytes: 4, canCancel: true, errorCode: null };
