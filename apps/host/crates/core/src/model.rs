@@ -57,7 +57,7 @@ fn matches_pin(file: &mut File, entry: &ModelEntry) -> Result<bool, ModelError> 
 }
 
 #[cfg(unix)]
-fn free_bytes(directory: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(directory: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(directory.as_os_str().as_bytes()).ok()?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
@@ -72,7 +72,7 @@ fn free_bytes(directory: &Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn free_bytes(_directory: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(_directory: &Path) -> Option<u64> {
     None
 }
 
