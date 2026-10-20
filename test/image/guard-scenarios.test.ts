@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
-import { mkdirSync, unlinkSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -154,7 +154,7 @@ describe("live guard scenario fixtures", () => {
       expect(result).toBe(0);
     } finally {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-      unlinkSync(socket);
+      rmSync(socket, { force: true }); // server.close() usually removes it already
     }
   });
 
