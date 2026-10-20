@@ -72,21 +72,21 @@ ETA: 2026-10-26 18:00 ICT
 | 79 | `bun run backup` fails hard when a file vanishes between listing and `git add` (exit 128, `unable to stat`); treat it as a skipped vanished file, and exclude transient `.caveman-sessions/` | done | claude-20261019-sync-io-cost | backup-shallow-vanish | 1.74 |  | Reported by the .cluster session. PR https://github.com/DynacomSolutions/AiSwitcher/pull/223. Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/223 (7da0d34), CI green; released in v0.5.6. |
 
 ## 2. Live USB
-ETA: 2026-10-23 18:00 ICT
+ETA: 2026-10-25 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 57 | A1 Cached connectivity check and offline provider warning (`ais launch`, aistui, shim warn-not-block) | done | | | | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
 | 58 | A2 Local model discovery and start (`ais local list\|start`) | done | | | | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
 | 59 | A3 `ais launch`: pick tool, then identity or pool, then exec via shim | done | | | 1.56 | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
 | 60 | A4 Local Models in console API, web console page and aistui tab | done | | | 2.58 | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/199 (2026-10-19). |
-| 61 | B1 Arch live image build (archiso, x86_64 UEFI + BIOS, CI release assets with checksums) | in_progress | claude-20261019-live-image | ais-live-image | | 2026-10-19 18:00 ICT | Image builds and boots on BIOS and UEFI under QEMU in CI; harness fix round running; release assets in B Task 7. |
-| 62 | B2 Immutable base + LUKS2 btrfs persist, pacman overlay, snapshots, boot menu | in_progress | claude-20261019-live-persist | ais-live-persist | 2.61 | 2026-10-19 23:00 ICT | |
-| 63 | B3 Boot flow: unlock, herdr autologin, internet check with network prompt and optional local model, then `ais launch` | in_progress | claude-20261019-live-bootflow | ais-live-bootflow | 2.57, 2.58, 2.59, 2.62 | 2026-10-20 03:00 ICT | Review fixes running; boot proof needs 2.62. |
-| 64 | B4 Live agent context: pacman allowed, AUR helper with per-install approval, enforced confirmation guard for destructive disk commands | in_progress | claude-20261019-live-guard | ais-live-guard | 2.57, 2.62 | 2026-10-20 03:00 ICT | Security review fixes round 3; sandbox check needs a booted image. |
-| 65 | B5 Encrypted exFAT exchange partition (age bundles inbox/outbox) and drive-side `ais sync` peer | in_progress | claude-20261019-live-exchange | ais-live-exchange | 2.62 | 2026-10-20 01:00 ICT | |
-| 66 | C1 Host app (Tauri, glass style): create drive, write image, first inbox bundle, optional local model download | in_progress | claude-20261019-host-app-shell | host-app-shell | 2.61, 2.65 | 2026-10-21 18:00 ICT | Shell and verified-image checks done; per-OS disk writing in progress; first real USB write needs the owner with a spare drive. |
-| 67 | C2 Host app: refresh, pull logs, remove instance (each step optional), reset storage, key escrow in OS keychain with retention | in_progress | claude-20261019-host-app-core | host-app-core | 2.65 | 2026-10-21 18:00 ICT | |
-| 68 | C3 Host app: update image keeping persisted packages | todo | | | 2.61, 2.62, 2.66 | 2026-10-22 12:00 ICT | |
-| 69 | C4 Host app release: macOS signed and notarised; Windows signing deferred; Linux AppImage | todo | | | 2.66, 2.67, 2.68 | 2026-10-23 18:00 ICT | Needs native runs on macOS, Windows and Linux. |
+| 61 | B1 Arch live image build (archiso, x86_64 UEFI + BIOS, CI release assets with checksums) | in_progress | claude-20261019-live-image | ais-live-image | | 2026-10-21 18:00 ICT | Image build and BIOS/UEFI boot done (PR #218); release workflow part still open. |
+| 62 | B2 Immutable base + LUKS2 btrfs persist, pacman overlay, snapshots, boot menu | in_progress | claude-20261019-live-persist | ais-live-persist | 2.61 | 2026-10-20 12:00 ICT | Third wrong-disk safety round. |
+| 63 | B3 Boot flow: unlock, herdr autologin, internet check with network prompt and optional local model, then `ais launch` | in_progress | claude-20261019-live-bootflow | ais-live-bootflow | 2.57, 2.58, 2.59, 2.62 | 2026-10-20 06:00 ICT | In review in PR #221; QEMU scenarios failing, being fixed. |
+| 64 | B4 Live agent context: pacman allowed, AUR helper with per-install approval, enforced confirmation guard for destructive disk commands | in_progress | claude-20261019-live-guard | ais-live-guard | 2.57, 2.62 | 2026-10-20 06:00 ICT | In review in PR #221; QEMU scenarios failing, being fixed. |
+| 65 | B5 Encrypted exFAT exchange partition (age bundles inbox/outbox) and drive-side `ais sync` peer | in_progress | claude-20261019-live-exchange | ais-live-exchange | 2.62 | 2026-10-20 06:00 ICT | In review in PR #221; QEMU scenarios failing, being fixed. |
+| 66 | C1 Host app (Tauri, glass style): create drive, write image, first inbox bundle, optional local model download | in_progress | claude-20261019-host-app-shell | host-app-shell | 2.61, 2.65 | 2026-10-22 18:00 ICT | Shell and verified-image checks done; per-OS disk writing in progress; first real USB write needs the owner with a spare drive. |
+| 67 | C2 Host app: refresh, pull logs, remove instance (each step optional), reset storage, key escrow in OS keychain with retention | in_progress | claude-20261019-host-app-core | host-app-core | 2.65 | 2026-10-22 18:00 ICT | |
+| 68 | C3 Host app: update image keeping persisted packages | todo | | | 2.61, 2.62, 2.66 | 2026-10-23 18:00 ICT | |
+| 69 | C4 Host app release: macOS signed and notarised; Windows signing deferred; Linux AppImage | todo | | | 2.66, 2.67, 2.68 | 2026-10-25 18:00 ICT | Needs native runs on macOS, Windows and Linux. |
 | 70 | Later: aarch64 (UEFI ARM) | todo | | | 2.61 | | |
 | 71 | Later: Secure Boot support (v1 requires it disabled) | todo | | | 2.61, 2.62 | | |
