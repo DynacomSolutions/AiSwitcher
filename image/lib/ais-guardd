@@ -104,7 +104,11 @@ def _popup(command,devs,expected,timeout):
         finally:os.close(fd)
         live_uid=uid_for('live')
         env={'PATH':'/usr/bin:/bin','HOME':pwd.getpwnam('live').pw_dir,'XDG_RUNTIME_DIR':'/run/user/'+str(live_uid),'HERDR_SOCKET_PATH':herdr_socket(live_uid)}
-        subprocess.run(['/usr/bin/runuser','-u','live','--','/usr/local/bin/herdr','plugin','pane','open','--plugin','ais-guard','--entrypoint','confirm','--placement','overlay','--env','AIS_GUARD_NONCE='+nonce,'--env','AIS_GUARD_REQ='+rid],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=min(15,max(1,deadline-time.monotonic())),check=True)
+        opened=subprocess.run(['/usr/bin/runuser','-u','live','--','/usr/local/bin/herdr','plugin','pane','open','--plugin','ais-guard','--entrypoint','confirm','--placement','overlay','--env','AIS_GUARD_NONCE='+nonce,'--env','AIS_GUARD_REQ='+rid],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=min(15,max(1,deadline-time.monotonic())),check=False)
+        if opened.returncode!=0:
+            # Log herdr's own reason (never the argv, which carries the nonce) so a failed popup is diagnosable.
+            sys.stderr.write('ais-guardd: herdr popup open failed (exit %d): %s\n'%(opened.returncode,opened.stderr.decode('utf-8','replace')[:400].replace('\n',' ')))
+            raise subprocess.CalledProcessError(opened.returncode,'herdr plugin pane open')
         s.settimeout(max(0.1,deadline-time.monotonic()))
         c,_=s.accept()
         try:
