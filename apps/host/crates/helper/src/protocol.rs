@@ -17,6 +17,8 @@ pub struct Request {
     pub ticket: String,
     pub release: PublishedRelease,
     pub drive_identity: ais_host_core::drive_identity::DriveIdentity,
+    #[serde(default)]
+    pub installed_image: Option<ais_host_core::update::InstalledImage>,
     pub device_identity: String,
     pub typed_confirmation: String,
     /// CLOCK_BOOTTIME nanoseconds from the app's exact-typing confirmation.
@@ -71,6 +73,10 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, ProtocolError> {
     };
     if request.version != 1
         || request.drive_identity.validate().is_err()
+        || (request.operation == Operation::ReplaceBase) != request.installed_image.is_some()
+        || request.installed_image.as_ref().is_some_and(|installed| {
+            installed.validate().is_err() || installed.identity != request.drive_identity
+        })
         || !digest(&request.plan_digest)
         || !digest(&request.channel_binding)
         || !digest(&request.ticket)
@@ -373,6 +379,10 @@ pub mod linux_transport {
         append_field(
             &mut binding,
             &serde_json::to_vec(&request.drive_identity).unwrap_or_default(),
+        );
+        append_field(
+            &mut binding,
+            &serde_json::to_vec(&request.installed_image).unwrap_or_default(),
         );
         sha256(&binding)
     }
@@ -770,6 +780,34 @@ pub mod linux_transport {
             serde_json::from_slice(&output).map_err(|_| ProtocolError::Request)?;
         observation.validate().map_err(|_| ProtocolError::Request)?;
         Ok(observation)
+    }
+
+    pub fn preview_update(
+        identity: &str,
+    ) -> Result<ais_host_core::update::DriveSnapshot, ProtocolError> {
+        verify_installation()?;
+        let mut child = Command::new(PKEXEC_PATH)
+            .arg("--disable-internal-agent")
+            .arg(HELPER_PATH)
+            .arg("--preview-update")
+            .arg(identity)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ProtocolError::PackageTrustUnavailable)?;
+        let mut output = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .ok_or(ProtocolError::Transport)?
+            .take(160 * 1024 + 1)
+            .read_to_end(&mut output);
+        let status = child.wait().map_err(|_| ProtocolError::Transport)?;
+        if read.is_err() || !status.success() || output.len() > 160 * 1024 {
+            return Err(ProtocolError::Transport);
+        }
+        serde_json::from_slice(&output).map_err(|_| ProtocolError::Request)
     }
 
     /// Attach exactly three retained source files to a one-byte marker.

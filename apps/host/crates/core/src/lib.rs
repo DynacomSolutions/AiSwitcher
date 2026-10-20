@@ -25,3 +25,5 @@ pub mod remove;
 pub mod reset;
 pub mod revocation;
 pub mod sequence;
+
+pub mod update;

@@ -10,6 +10,7 @@ fn main() {
 enum Command {
     Serve(PathBuf),
     Preview(String),
+    PreviewUpdate(String),
 }
 
 fn run() -> Result<(), &'static str> {
@@ -35,6 +36,9 @@ fn run() -> Result<(), &'static str> {
                 ais_host_helper::service::run_linux(socket, invoking_uid)
             }
             Command::Preview(identity) => ais_host_helper::service::preview_linux(&identity),
+            Command::PreviewUpdate(identity) => {
+                ais_host_helper::service::preview_update_linux(&identity)
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -61,14 +65,18 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
             }
             Ok(Command::Serve(socket))
         }
-        Some("--preview") => {
+        Some("--preview") | Some("--preview-update") => {
             let identity = value
                 .into_string()
                 .map_err(|_| "The device identity is invalid.")?;
             if identity.len() > 32 || !identity.starts_with("linux:") {
                 return Err("The device identity is invalid.");
             }
-            Ok(Command::Preview(identity))
+            if mode.as_deref().and_then(|value| value.to_str()) == Some("--preview-update") {
+                Ok(Command::PreviewUpdate(identity))
+            } else {
+                Ok(Command::Preview(identity))
+            }
         }
         _ => Err("This helper accepts only its fixed native service operations."),
     }

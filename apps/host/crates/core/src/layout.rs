@@ -117,16 +117,16 @@ impl LiveImageLayout {
     }
 }
 
-struct Header {
-    current_lba: u64,
-    backup_lba: u64,
-    first_usable: u64,
-    last_usable: u64,
-    disk_guid: [u8; 16],
-    entries_lba: u64,
-    entry_count: u32,
-    entry_size: u32,
-    entries_crc: u32,
+pub(crate) struct Header {
+    pub(crate) current_lba: u64,
+    pub(crate) backup_lba: u64,
+    pub(crate) first_usable: u64,
+    pub(crate) last_usable: u64,
+    pub(crate) disk_guid: [u8; 16],
+    pub(crate) entries_lba: u64,
+    pub(crate) entry_count: u32,
+    pub(crate) entry_size: u32,
+    pub(crate) entries_crc: u32,
 }
 
 fn parse_header(bytes: &[u8], lba: u64, sectors: u64) -> Result<Header, TrustError> {
@@ -135,6 +135,13 @@ fn parse_header(bytes: &[u8], lba: u64, sectors: u64) -> Result<Header, TrustErr
     let header = bytes
         .get(start..start + SECTOR_BYTES as usize)
         .ok_or(TrustError::Layout)?;
+    parse_header_sector(header, sectors)
+}
+
+pub(crate) fn parse_header_sector(header: &[u8], sectors: u64) -> Result<Header, TrustError> {
+    if header.len() != 512 {
+        return Err(TrustError::Layout);
+    }
     if &header[..8] != b"EFI PART"
         || u32_at(header, 8)? != 0x0001_0000
         || u32_at(header, 12)? != 92
@@ -167,7 +174,7 @@ fn parse_header(bytes: &[u8], lba: u64, sectors: u64) -> Result<Header, TrustErr
     Ok(result)
 }
 
-fn parse_partition(
+pub(crate) fn parse_partition(
     entries: &[u8],
     index: usize,
     expected_name: &str,
@@ -262,7 +269,7 @@ fn validate_partitions(parts: &[Partition; 4], sectors: u64) -> Result<(), Trust
     Ok(())
 }
 
-fn validate_mbr(bytes: &[u8], sectors: u64) -> Result<(), TrustError> {
+pub(crate) fn validate_mbr(bytes: &[u8], sectors: u64) -> Result<(), TrustError> {
     let mbr = bytes.get(..512).ok_or(TrustError::Layout)?;
     if mbr[510..512] != [0x55, 0xaa] {
         return Err(TrustError::Layout);
@@ -345,9 +352,14 @@ pub(crate) fn crc32(bytes: &[u8]) -> u32 {
 
 #[cfg(feature = "file-test")]
 pub fn synthetic_sfdisk_contract_fixture() -> Vec<u8> {
+    synthetic_sfdisk_contract_with_base(MIN_BASE_PARTITION_MIB)
+}
+
+#[cfg(feature = "file-test")]
+pub fn synthetic_sfdisk_contract_with_base(base_mib: u64) -> Vec<u8> {
     let esp_start = 4096_u64;
     let esp_end = esp_start + 128 * 2048;
-    let base_end = esp_end + MIN_BASE_PARTITION_MIB * 2048;
+    let base_end = esp_end + base_mib * 2048;
     let exchange_end = base_end + 32 * 2048;
     let sectors = exchange_end + 2048;
     let mut image = vec![0; (sectors * 512) as usize];

@@ -21,17 +21,35 @@ fn request() -> serde_json::Value {
         "confirmationDeadlineBootNs": 1 })
 }
 
+fn update_request() -> serde_json::Value {
+    let mut value = request();
+    value["operation"] = "replaceBase".into();
+    value["installedImage"] = serde_json::json!({
+        "identity": value["driveIdentity"],
+        "releaseOrder": [1, 1],
+        "tag": "live-v1",
+        "imageDigest": vec![0u8; 32],
+        "hardwareHint": "a".repeat(64),
+    });
+    value
+}
+
 #[test]
 fn parses_only_bounded_structured_operations() {
     assert_eq!(
         decode_frame(&frame(request())).unwrap().operation,
         Operation::CreateLayout
     );
-    for operation in ["replaceBase", "resetPersist"] {
-        let mut value = request();
-        value["operation"] = operation.into();
-        assert!(decode_frame(&frame(value)).is_ok());
-    }
+    assert_eq!(
+        decode_frame(&frame(update_request())).unwrap().operation,
+        Operation::ReplaceBase
+    );
+    let mut reset = request();
+    reset["operation"] = "resetPersist".into();
+    assert_eq!(
+        decode_frame(&frame(reset)).unwrap().operation,
+        Operation::ResetPersist
+    );
     for key in [
         "command",
         "path",
@@ -48,6 +66,23 @@ fn parses_only_bounded_structured_operations() {
         let mut value = request();
         value["operation"] = operation.into();
         assert!(decode_frame(&frame(value)).is_err());
+    }
+}
+
+#[test]
+fn updates_require_matching_installed_image_metadata() {
+    let mut missing = update_request();
+    missing.as_object_mut().unwrap().remove("installedImage");
+    assert!(decode_frame(&frame(missing)).is_err());
+    let mut mismatched = update_request();
+    mismatched["installedImage"]["identity"] =
+        serde_json::to_value(ais_host_core::drive_identity::DriveIdentity::fresh().unwrap())
+            .unwrap();
+    assert!(decode_frame(&frame(mismatched)).is_err());
+    for operation in ["createLayout", "resetPersist"] {
+        let mut unexpected = update_request();
+        unexpected["operation"] = operation.into();
+        assert!(decode_frame(&frame(unexpected)).is_err());
     }
 }
 

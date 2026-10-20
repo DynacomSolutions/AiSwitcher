@@ -119,7 +119,9 @@ shows that plan's observation. It consumes
 the chosen options once; refresh or edits cancel a preview still being prepared.
 Both GPT copies describe the expanded p4 and a Linux LUKS-type p5 occupying the
 remaining reserve. Creation generates a fresh disk GUID and five fresh PARTUUIDs.
-The writer zeroes all of p5 without creating a header or filesystem and patches
+The writer zeroes exactly the first 16 MiB of p5 without creating a LUKS header
+or filesystem, verifies those bytes by readback, and leaves the rest untouched.
+The backup GPT write starts after the last p5 sector. The writer patches
 the three GRUB and three Syslinux ESP entries with the p3/p4/p5 identities,
 the base PARTUUID path and `copytoram=n`. Readback checks both GPT copies and
 both menus. All image, ESP, exchange and persistence ranges and generated IDs
@@ -155,3 +157,46 @@ They require exfatprogs on PATH or `AIS_HOST_TEST_EXFAT_TOOLS` pointing at its
 binary directory. They do not exercise native mounting, elevation, eject,
 credential stores or first boot. Native checks still require the installed
 root-owned package and a real release key.
+
+## Image update flow
+
+A drive created here records its verified release, disk GUID and five PARTUUIDs
+locally. Its Update action requires the existing passphrase, a fresh helper
+preview, exact typed device confirmation and another observation before writing.
+Unknown installed releases fail closed. The app and privileged helper each
+verify the newer release and reconstruct the same plan. Newer means a later
+publication time/release identifier, with a different tag and image digest.
+
+The update planner accepts only the supported five-partition, 512-byte-sector
+GPT layout with valid, matching primary and backup tables. It requires unchanged
+BIOS bootstrap code, compatible partition types and attributes, identical boot
+boundaries and a new base that fits p3. It writes p3, p1 and personalised p2 in
+that order, flushing and reading back each region. All three GRUB and three
+Syslinux entries receive the existing per-drive `ais.base`, `ais.exchange`,
+`ais.drive`, `archisodevice` and `copytoram=n` settings. GPT, p4 and p5 are outside
+every raw image write range. There is no repartitioning or persist formatting.
+
+After imaging, the app mounts the existing exchange through the create flow's
+validated directory descriptor. Under the existing inbox publication lock, it
+authenticates the latest encrypted bundle and reserves a durable sequence above
+both local and authenticated inbox state. It adds an encrypted inbox bundle
+containing only `.ais/logs/image-updated.jsonl`, using a staged, flushed and
+readback-verified atomic publication. Existing bundles, credentials, settings
+and model files are retained. This marker publication is the only intentional
+exchange change; the raw writer leaves p4 byte-identical.
+
+Before writing, the registry durably records `updating`. A failed write consumes
+confirmation and requires a fresh preview and confirmation to retry the verified
+replacement. The previous release record remains until the marker is published.
+There is no automatic rollback or atomic boot-slot switch: interrupted boot/base
+writes can leave the drive unbootable until retried. A completed host update is
+`writtenAwaitingBoot`, not proof of package restoration. The image owns package
+reinstallation after detecting its changed base. `lastInboxSeq` is not an image
+or package acknowledgement.
+
+File-backed tests compare full p4/p5 hashes and both GPT windows before and after
+successful and interrupted writes, reject oversized or incompatible releases,
+and verify all six boot entries. The create/update orchestration smoke uses the
+actual helper writer with synthetic releases and a directory mount seam. Guest
+snapshot ordering, package restoration and native device execution require
+separate image-side validation.

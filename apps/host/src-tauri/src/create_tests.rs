@@ -89,6 +89,24 @@ impl HelperLauncher for FileHelper {
             .verify(&selection, download)
             .unwrap();
         let mut target = self.target.borrow_mut();
+        if let Some(installed) = request.installed_image.as_ref() {
+            let snapshot = ais_host_core::update::DriveSnapshot::read(
+                target.observe().unwrap(),
+                |offset, bytes| target.read_at(offset, bytes),
+            )
+            .unwrap();
+            let plan = WritePlan::update_drive(&image, &snapshot, installed).unwrap();
+            assert_eq!(request.plan_digest, hex(&plan.digest()));
+            return ais_host_helper::service::write_confirmed(
+                &mut *target,
+                request.confirmation_deadline_boot_ns,
+                &mut image,
+                &plan,
+                &request.typed_confirmation,
+            )
+            .map(|_| ())
+            .map_err(str::to_owned);
+        }
         let plan = WritePlan::create_drive_with_identity(
             &image,
             target.observe().unwrap(),
@@ -124,7 +142,7 @@ impl HelperLauncher for FileHelper {
             u64::from_le_bytes(boot[64..72].try_into().unwrap()),
             range.start / 512
         );
-        // Persist is a distinct, zeroed Linux LUKS partition, without a header.
+        // Persist has a zeroed header area and no LUKS header until first boot.
         target
             .read_at(range.start + range.length, &mut boot)
             .unwrap();
@@ -274,6 +292,137 @@ fn create_smoke(with_model: bool) {
             .is_err()
     );
     assert_eq!(helper.calls.get(), 1);
+    if !with_model {
+        update_smoke(
+            helper.target.into_inner().reopen().unwrap(),
+            record.installed_image().unwrap().clone(),
+            &volume,
+            &escrow,
+            &directory,
+        );
+    }
+}
+
+fn update_smoke(
+    mut target: FileTarget,
+    previous: ais_host_core::update::InstalledImage,
+    volume: &Volume,
+    escrow: &super::escrow_commands::EscrowCommandState,
+    registry_directory: &std::path::Path,
+) {
+    let directory = std::env::temp_dir();
+    let snapshot =
+        ais_host_core::update::DriveSnapshot::read(target.observe().unwrap(), |offset, bytes| {
+            target.read_at(offset, bytes)
+        })
+        .unwrap();
+    let original_inbox = fs::read(volume.directory.join("inbox/bundle-1.age")).unwrap();
+    let mut raw = ais_host_core::layout::synthetic_sfdisk_contract_fixture();
+    let layout = ais_host_core::layout::LiveImageLayout::parse(&raw).unwrap();
+    raw[(layout.partitions[2].first_lba * 512) as usize] = 0x72;
+    let fixture = SyntheticRelease::new_version(raw, 2);
+    let helper = FileHelper {
+        target: RefCell::new(target),
+        public_key: fixture.public_key.clone(),
+        calls: Cell::new(0),
+    };
+    let failing = Launcher {
+        fail: true,
+        calls: Cell::new(0),
+    };
+    for fail in [true, false] {
+        let (_, image) = fixture.verify_live_layout(&directory).unwrap();
+        let plan = WritePlan::update_drive(&image, &snapshot, &previous).unwrap();
+        let handle = super::drive_handle(&plan).unwrap();
+        let sources = [&fixture.compressed, &fixture.sums, &fixture.signature].map(|body| {
+            let (_, mut file) = fresh_file(&directory, "update-source-SYNTHETIC-FIXTURE").unwrap();
+            file.write_all(body).unwrap();
+            file.rewind().unwrap();
+            file
+        });
+        let session = ConfirmationSession::default();
+        let preview_id = super::fresh_preview_id().unwrap();
+        let pending = super::PendingConfirmation {
+            preview_id: preview_id.clone(),
+            plan,
+            image,
+            release: PublishedRelease {
+                id: 2,
+                published_at: 2,
+                tag: fixture.selection.tag().into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![
+                    fixture.selection.image().clone(),
+                    fixture.selection.sums().clone(),
+                    fixture.selection.signature().clone(),
+                ],
+            },
+            details: DeviceReviewDetails::default(),
+            ticket: None,
+            typed: None,
+            sources: Some(sources),
+            create: Some(stored_create()),
+            installed: Some(previous.clone()),
+        };
+        session.state.lock().unwrap().pending = Some(pending);
+        let now = Instant::now();
+        session
+            .confirm(&preview_id, &snapshot.observation.display_identifier, now)
+            .unwrap();
+        let result = session.begin_write(
+            &preview_id,
+            now,
+            &mut WriteEnv {
+                support: support(true),
+                observe: &|_| Ok(snapshot.observation.clone()),
+                launcher: if fail { &failing } else { &helper },
+                volume,
+                // Updating must never export and replay the host's credentials.
+                adapter: &mut Adapter { fail: true },
+                sink: &escrow.sink(),
+            },
+        );
+        assert_eq!(result.is_err(), fail, "{result:?}");
+        let data = FileRegistry::open(registry_directory)
+            .unwrap()
+            .load()
+            .unwrap();
+        let record = data.record(&handle).unwrap();
+        assert_eq!(
+            record.image_update_status(),
+            Some(if fail {
+                "updating"
+            } else {
+                "writtenAwaitingBoot"
+            })
+        );
+        assert_eq!(
+            record.installed_image().unwrap().tag,
+            if fail { "live-v1.0.0" } else { "live-v2.0.0" }
+        );
+        if fail {
+            assert!(!volume.directory.join("inbox/bundle-2.age").exists());
+        } else {
+            assert_eq!(record.inbox_issued(), 2);
+            let marker = ais_host_core::bundle::read_bundle_file(
+                &volume.directory.join("inbox/bundle-2.age"),
+                "SYNTHETIC_FIXTURE_12",
+                ais_host_core::contract::BundleKind::Inbox,
+            )
+            .unwrap();
+            assert_eq!(marker.files.len(), 1);
+            assert!(marker.files.contains_key(".ais/logs/image-updated.jsonl"));
+        }
+        assert_eq!(
+            fs::read(volume.directory.join("inbox/bundle-1.age")).unwrap(),
+            original_inbox
+        );
+        assert!(session.state.lock().unwrap().pending.is_none());
+    }
+    assert_eq!(failing.calls.get(), 1);
+    assert_eq!(helper.calls.get(), 1);
+    assert_eq!(volume.ejected.get(), 2);
 }
 
 #[test]
@@ -281,7 +430,7 @@ fn file_create_smoke_with_model() {
     create_smoke(true);
 }
 #[test]
-fn file_create_smoke_without_model() {
+fn file_create_and_update_smoke_without_model() {
     create_smoke(false);
 }
 

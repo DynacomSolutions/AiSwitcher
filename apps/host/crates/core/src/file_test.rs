@@ -60,23 +60,32 @@ impl SyntheticRelease {
         Self::from_compressed(raw, compressed)
     }
 
+    pub fn new_version(raw: Vec<u8>, version: u64) -> Self {
+        let compressed = zstd::stream::encode_all(raw.as_slice(), 1).expect("compress fixture");
+        let keys =
+            minisign::KeyPair::generate_unencrypted_keypair().expect("synthetic signing key");
+        Self::from_compressed_with_key(raw, compressed, &keys, version)
+    }
+
     pub fn new_with_key(raw: Vec<u8>, keys: &minisign::KeyPair) -> Self {
         let compressed = zstd::stream::encode_all(raw.as_slice(), 1).expect("compress fixture");
-        Self::from_compressed_with_key(raw, compressed, keys)
+        Self::from_compressed_with_key(raw, compressed, keys, 1)
     }
 
     pub fn from_compressed(raw: Vec<u8>, compressed: Vec<u8>) -> Self {
         let keys =
             minisign::KeyPair::generate_unencrypted_keypair().expect("synthetic signing key");
-        Self::from_compressed_with_key(raw, compressed, &keys)
+        Self::from_compressed_with_key(raw, compressed, &keys, 1)
     }
 
     fn from_compressed_with_key(
         raw: Vec<u8>,
         compressed: Vec<u8>,
         keys: &minisign::KeyPair,
+        version: u64,
     ) -> Self {
-        let name = "ais-live-x86_64-live-v1.0.0.img.zst";
+        let tag = format!("live-v{version}.0.0");
+        let name = format!("ais-live-x86_64-{tag}.img.zst");
         let sums = format!("{}  {name}\n", hex(&sha256(&compressed))).into_bytes();
         let signature = minisign::sign(None, &keys.sk, Cursor::new(&sums), None, None)
             .expect("sign fixture")
@@ -89,13 +98,13 @@ impl SyntheticRelease {
             revision: "SYNTHETIC_FIXTURE".to_owned(),
         };
         let selection = select_release(&[PublishedRelease {
-            id: 1,
-            tag: "live-v1.0.0".to_owned(),
-            published_at: 1,
+            id: version,
+            tag,
+            published_at: version,
             draft: false,
             prerelease: false,
             assets: vec![
-                asset(1, name, compressed.len() as u64),
+                asset(1, &name, compressed.len() as u64),
                 asset(2, "SHA256SUMS", sums.len() as u64),
                 asset(3, "SHA256SUMS.minisig", signature.len() as u64),
             ],
@@ -212,6 +221,11 @@ impl FileTarget {
         target.observation.capacity_bytes = capacity;
         target.live_table = true;
         Ok(target)
+    }
+    pub fn reopen(mut self) -> io::Result<Self> {
+        fs2::FileExt::unlock(&self.file)?;
+        self.locked = false;
+        Ok(self)
     }
     pub fn path(&self) -> &Path {
         &self.path

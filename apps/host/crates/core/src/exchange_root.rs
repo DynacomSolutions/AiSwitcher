@@ -89,6 +89,42 @@ impl ExchangeRoot {
         Ok(file)
     }
 
+    pub(crate) fn bundle_lock(&self) -> Result<File, String> {
+        use std::os::unix::fs::MetadataExt;
+        let file = self.at(".bundle-operation.lock", libc::O_RDWR | libc::O_CREAT)?;
+        let metadata = file.metadata().map_err(|_| "Cannot inspect bundle lock.")?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err("Invalid bundle lock.".into());
+        }
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|_| "The inbox is busy.")?;
+        Ok(file)
+    }
+    pub(crate) fn names(&self) -> Result<Vec<String>, String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let entries = std::fs::read_dir(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+                .map_err(|_| "Cannot list retained inbox.")?;
+            let mut names = Vec::new();
+            for entry in entries.take(50_001) {
+                let name = entry
+                    .map_err(|_| "Cannot list inbox.")?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| "Invalid inbox filename.")?;
+                names.push(name);
+            }
+            if names.len() > 50_000 {
+                return Err("Too many inbox entries.".into());
+            }
+            Ok(names)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("Image updates are unavailable on this platform.".into())
+        }
+    }
+
     pub(crate) fn directory(&self, name: &str, create: bool) -> Result<Self, String> {
         use std::os::fd::AsRawFd;
         let c_name = Self::component(name)?;
@@ -173,6 +209,12 @@ impl ExchangeRoot {
 // Native creation is currently Linux-only; other platforms fail closed.
 #[cfg(not(unix))]
 impl ExchangeRoot {
+    pub(crate) fn bundle_lock(&self) -> Result<File, String> {
+        Err("Unsupported platform.".into())
+    }
+    pub(crate) fn names(&self) -> Result<Vec<String>, String> {
+        Err("Unsupported platform.".into())
+    }
     pub(crate) fn directory(&self, _: &str, _: bool) -> Result<Self, String> {
         Err("Unsupported platform.".into())
     }

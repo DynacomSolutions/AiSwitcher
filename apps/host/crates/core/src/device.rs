@@ -181,8 +181,16 @@ struct PlannedWrite {
 #[serde(rename_all = "camelCase", tag = "kind", content = "value")]
 enum WriteSource {
     Image { offset: u64 },
-    Bytes(Vec<u8>),
+    Bytes(#[serde(serialize_with = "serialize_write_digest")] Vec<u8>),
     Zeroes,
+}
+
+fn serialize_write_digest<S: serde::Serializer>(
+    bytes: &[u8],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // Bind every replacement byte without serialising an entire ESP into each confirmation.
+    sha256(bytes).serialize(serializer)
 }
 
 impl WritePlan {
@@ -267,10 +275,10 @@ impl WritePlan {
         new_head[..SECTOR_BYTES as usize].copy_from_slice(&mbr);
         new_head[SECTOR_BYTES as usize..(2 * SECTOR_BYTES) as usize]
             .copy_from_slice(&primary_header);
-        let mut new_tail = vec![0; TABLE_WINDOW_BYTES];
-        let tail_entries_at = SECTOR_BYTES as usize;
+        let mut new_tail = vec![0; GPT_TRAILER_SECTORS as usize * 512];
+        let tail_entries_at = 0;
         new_tail[tail_entries_at..tail_entries_at + GPT_ARRAY_BYTES].copy_from_slice(&entries);
-        new_tail[TABLE_WINDOW_BYTES - SECTOR_BYTES as usize..].copy_from_slice(&backup_header);
+        new_tail[GPT_ARRAY_BYTES..].copy_from_slice(&backup_header);
         let data_start = TABLE_WINDOW_BYTES as u64;
         let data_end = backup_source_start as u64;
         if data_end <= data_start {
@@ -293,8 +301,8 @@ impl WritePlan {
             },
             PlannedWrite {
                 range: ByteRange {
-                    start: (target_sectors - TABLE_WINDOW_SECTORS) * SECTOR_BYTES,
-                    length: TABLE_WINDOW_BYTES as u64,
+                    start: (target_sectors - GPT_TRAILER_SECTORS) * SECTOR_BYTES,
+                    length: GPT_TRAILER_SECTORS * SECTOR_BYTES,
                 },
                 source: WriteSource::Bytes(new_tail),
             },
@@ -319,7 +327,7 @@ impl WritePlan {
     }
 
     /// Personalise both GPT copies and boot menus, grow exchange and create
-    /// an entirely zeroed, unformatted persistence partition.
+    /// an unformatted persistence partition with an empty header area.
     pub fn create_drive(
         image: &VerifiedImage,
         device: DeviceObservation,
@@ -361,11 +369,7 @@ impl WritePlan {
         exchange.validate(&plan.device)?;
         for (index, entries_at, header_at) in [
             (1, 2 * SECTOR_BYTES as usize, SECTOR_BYTES as usize),
-            (
-                2,
-                SECTOR_BYTES as usize,
-                TABLE_WINDOW_BYTES - SECTOR_BYTES as usize,
-            ),
+            (2, 0, GPT_ARRAY_BYTES),
         ] {
             let WriteSource::Bytes(bytes) = &mut plan.writes[index].source else {
                 return Err(DeviceError::LayoutUnavailable);
@@ -428,7 +432,8 @@ impl WritePlan {
         }
         let persist = ByteRange {
             start: end * SECTOR_BYTES,
-            length: plan.remaining_bytes,
+            // First boot only requires an empty 16 MiB header area before creating LUKS.
+            length: 16 * 1024 * 1024,
         };
         persist.validate(&plan.device)?;
         plan.writes.push(PlannedWrite {
@@ -441,6 +446,67 @@ impl WritePlan {
         plan.ranges = merge_ranges(plan.ranges);
         plan.exchange = Some(exchange);
         Ok(plan)
+    }
+
+    /// Replace only p3, p1 and the personalised p2. GPT, exchange and persist
+    /// are outside every raw write range, including on a partial failure.
+    pub fn update_drive(
+        image: &VerifiedImage,
+        snapshot: &crate::update::DriveSnapshot,
+        installed: &crate::update::InstalledImage,
+    ) -> Result<Self, DeviceError> {
+        installed.require_newer(image)?;
+        let parts = snapshot.partitions(&installed.identity)?;
+        let source =
+            LiveImageLayout::parse(image.bytes()).map_err(|_| DeviceError::LayoutUnavailable)?;
+        // The MBR is preserved, so a release requiring different BIOS bootstrap code cannot fit this update.
+        if snapshot.head[..440] != image.bytes()[..440] {
+            return Err(DeviceError::LayoutUnavailable);
+        }
+        for (index, (old, new)) in parts.iter().zip(&source.partitions).enumerate() {
+            if old.type_guid != new.type_guid
+                || old.attributes != new.attributes
+                || (index < 3 && old.first_lba != new.first_lba)
+                || (index < 2 && old.last_lba != new.last_lba)
+                || (index == 2 && new.last_lba > old.last_lba)
+            {
+                return Err(DeviceError::LayoutUnavailable);
+            }
+        }
+        let mut writes = Vec::new();
+        for index in [2, 0, 1] {
+            let range = crate::update::partition_range(&source.partitions[index]);
+            range.validate(&snapshot.observation)?;
+            let data = if index == 1 {
+                let bytes =
+                    &image.bytes()[range.start as usize..(range.start + range.length) as usize];
+                WriteSource::Bytes(crate::drive_identity::patch_esp(
+                    bytes,
+                    &installed.identity,
+                )?)
+            } else {
+                WriteSource::Image {
+                    offset: range.start,
+                }
+            };
+            writes.push(PlannedWrite {
+                range,
+                source: data,
+            });
+        }
+        Ok(Self {
+            operation: WriteOperation::ReplaceBase,
+            device: snapshot.observation.clone(),
+            source_digest: image.digest(),
+            compressed_digest: image.compressed_digest(),
+            release: image.selection().clone(),
+            ranges: merge_ranges(writes.iter().map(|write| write.range).collect()),
+            writes,
+            remaining_bytes: crate::update::partition_range(&parts[4]).length,
+            phase_aware: true,
+            exchange: Some(crate::update::partition_range(&parts[3])),
+            identity: Some(installed.identity.clone()),
+        })
     }
 
     pub fn exchange_range(&self) -> Option<ByteRange> {
@@ -459,12 +525,15 @@ impl WritePlan {
         else {
             return Err(DeviceError::LayoutUnavailable);
         };
+        let (_, mut expected_tail) =
+            read_table_windows(target, &current).map_err(|_| DeviceError::Changed)?;
+        expected_tail[512..].copy_from_slice(tail);
         verify_expected_table(
             target,
             &current,
             &ExpectedTable {
                 head: head.clone(),
-                tail: tail.clone(),
+                tail: expected_tail,
             },
         )
     }
@@ -656,7 +725,8 @@ mod tests {
         let WriteSource::Bytes(tail) = &plan.writes[2].source else {
             panic!("backup table range must contain planned transition bytes");
         };
-        let backup_header = &tail[TABLE_WINDOW_BYTES - 512..];
+        assert_eq!(tail.len(), GPT_ARRAY_BYTES + 512);
+        let backup_header = &tail[GPT_ARRAY_BYTES..];
         assert_eq!(
             u64::from_le_bytes(backup_header[24..32].try_into().unwrap()),
             target_sectors - 1
@@ -669,6 +739,17 @@ mod tests {
         let mut crc_bytes = backup_header[..92].to_vec();
         crc_bytes[16..20].fill(0);
         assert_eq!(stored_crc, crate::layout::crc32(&crc_bytes));
+        let mut plan = plan;
+        let original_digest = plan.digest();
+        let WriteSource::Bytes(head) = &mut plan.writes[1].source else {
+            unreachable!();
+        };
+        head[0] ^= 1;
+        assert_ne!(
+            original_digest,
+            plan.digest(),
+            "replacement bytes are bound"
+        );
     }
 }
 

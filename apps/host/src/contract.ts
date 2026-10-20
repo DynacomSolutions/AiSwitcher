@@ -55,6 +55,7 @@ export interface HostBridge {
   /** Validated natively and held there only until the write finishes. */
   setCreateOptions(modelId: string | null, licenceAccepted: boolean, passphrase: string, confirmation: string): Promise<void>;
   previewWrite(deviceId: string): Promise<WritePreview>;
+  previewUpdate(deviceId: string): Promise<WritePreview>;
   confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt>;
   /** Hands the confirmed native preview to the privileged helper; native code checks every precondition. */
   startWrite(previewId: string): Promise<void>;

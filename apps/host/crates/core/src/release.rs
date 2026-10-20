@@ -82,6 +82,7 @@ pub struct PublishedRelease {
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseSelection {
     release_id: u64,
+    published_at: u64,
     tag: String,
     image: AssetIdentity,
     sums: AssetIdentity,
@@ -89,6 +90,9 @@ pub struct ReleaseSelection {
 }
 
 impl ReleaseSelection {
+    pub fn order(&self) -> (u64, u64) {
+        (self.published_at, self.release_id)
+    }
     pub fn image(&self) -> &AssetIdentity {
         &self.image
     }
@@ -134,7 +138,7 @@ pub fn select_release_candidates(
     ordered.into_iter().map(select_release_assets).collect()
 }
 
-fn valid_live_tag(tag: &str) -> bool {
+pub(crate) fn valid_live_tag(tag: &str) -> bool {
     tag.strip_prefix("live-v").is_some_and(|version| {
         !version.is_empty()
             && version.len() <= 70
@@ -166,6 +170,7 @@ fn select_release_assets(release: &PublishedRelease) -> Result<ReleaseSelection,
     };
     Ok(ReleaseSelection {
         release_id: release.id,
+        published_at: release.published_at,
         tag: release.tag.clone(),
         image: lookup(
             &format!("ais-live-x86_64-{}.img.zst", release.tag),

@@ -150,6 +150,18 @@ pub fn check_capacity(
 /// The single hand-off point between the create flow and key escrow.
 /// Creation never persists the passphrase itself.
 pub trait PassphraseSink {
+    fn remember_image(
+        &self,
+        _drive_id: &str,
+        _image: &crate::update::InstalledImage,
+        _status: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn reserve_update_sequence(&self, _drive_id: &str, _minimum: u64) -> Result<u64, String> {
+        Err("An update sequence registry is required.".into())
+    }
+
     /// Called once, after the drive is written and verified. `drive_id` is the
     /// physical identity used for the local drive record.
     fn hand_over(&self, passphrase: &Passphrase, drive_id: &str) -> Result<(), String>;

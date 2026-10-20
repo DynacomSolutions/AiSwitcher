@@ -318,6 +318,8 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
             inbox_acknowledged: 0,
             outbox_issued: 0,
             source_references: sources,
+            installed_image: None,
+            image_update_status: None,
         };
         data.drives.insert(id.into(), record);
         // Journal intent before calling a store that may succeed then return an

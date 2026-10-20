@@ -73,7 +73,7 @@ fn execute_linux(
     if channel.peer_uid == 0 || channel.peer_pid == 0 || channel.request_binding == [0; 32] {
         return Err("The authenticated application channel is invalid.");
     }
-    if request.operation != crate::protocol::Operation::CreateLayout {
+    if request.operation == crate::protocol::Operation::ResetPersist {
         return Err("This helper operation is not enabled.");
     }
     if request.confirmation_deadline_boot_ns
@@ -152,23 +152,51 @@ fn execute_linux(
         .map_err(|_| "The source image did not pass bundled trust verification.")?;
     let discovered = crate::platform::collect_linux_by_identity(&request.device_identity)
         .map_err(|_| "The native target could not be re-observed.")?;
-    let plan = WritePlan::create_drive_with_identity(
-        &image,
-        discovered.observation.clone(),
-        request.drive_identity.clone(),
-    )
-    .map_err(|_| "A native write plan could not be reconstructed.")?;
+    let mut target =
+        crate::platform::LinuxBlockTarget::open_authenticated(&channel, &discovered.observation)
+            .map_err(|_| "The retained native target could not be opened safely.")?;
+    let plan = match request.operation {
+        crate::protocol::Operation::CreateLayout => WritePlan::create_drive_with_identity(
+            &image,
+            discovered.observation.clone(),
+            request.drive_identity.clone(),
+        ),
+        crate::protocol::Operation::ReplaceBase => {
+            use ais_host_core::device::WriteTarget;
+            let snapshot = ais_host_core::update::DriveSnapshot::read(
+                discovered.observation.clone(),
+                |offset, bytes| target.read_at(offset, bytes),
+            )
+            .map_err(|_| "The installed GPT could not be re-observed.")?;
+            WritePlan::update_drive(
+                &image,
+                &snapshot,
+                request
+                    .installed_image
+                    .as_ref()
+                    .ok_or("The installed release is unknown.")?,
+            )
+        }
+        _ => return Err("This helper operation is not enabled."),
+    }
+    .map_err(|_| "A compatible native write plan could not be reconstructed.")?;
     if hex(&plan.digest()) != request.plan_digest {
         return Err("The app and helper write plans do not match.");
     }
     plan.revalidate(&discovered.observation, &image)
         .map_err(|_| "The native target changed during plan verification.")?;
 
+    if request.operation == crate::protocol::Operation::ReplaceBase {
+        return write_confirmed(
+            &mut target,
+            request.confirmation_deadline_boot_ns,
+            &mut image,
+            &plan,
+            &request.typed_confirmation,
+        )
+        .map(|_| ());
+    }
     let mut exchange = crate::exchange::PreparedExchange::native(&plan)?;
-    let target =
-        crate::platform::LinuxBlockTarget::open_authenticated(&channel, &discovered.observation)
-            .map_err(|_| "The retained native target could not be opened safely.")?;
-    let mut target = target;
     create_confirmed(
         &mut target,
         request.confirmation_deadline_boot_ns,
@@ -376,6 +404,19 @@ impl<T: ais_host_core::device::WriteTarget> ais_host_core::device::WriteTarget
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
         self.target.read_at(offset, buffer)
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn preview_update_linux(identity: &str) -> Result<(), &'static str> {
+    use std::io::Write;
+    let snapshot = crate::platform::linux_update_snapshot(identity)
+        .map_err(|_| "The drive could not be observed.")?;
+    let mut line =
+        serde_json::to_vec(&snapshot).map_err(|_| "The preview could not be encoded.")?;
+    line.push(b'\n');
+    std::io::stdout()
+        .write_all(&line)
+        .map_err(|_| "The preview could not be reported.")
 }
 
 #[cfg(all(test, target_os = "linux"))]

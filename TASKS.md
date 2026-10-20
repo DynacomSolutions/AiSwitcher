@@ -79,7 +79,7 @@ ETA: 2026-11-16 18:00 ICT
 | 65 | B5 Encrypted exFAT exchange partition (age bundles inbox/outbox) and drive-side `ais sync` peer | todo | | | 2.62 | | |
 | 66 | C1 Host app (Tauri, glass style): create drive, write image, first inbox bundle, optional local model download | todo | | | 2.61, 2.65 | | |
 | 67 | C2 Host app: refresh, pull logs, remove instance (each step optional), reset storage, key escrow in OS keychain with retention | todo | | | 2.65 | | |
-| 68 | C3 Host app: update image keeping persisted packages | todo | | | 2.61, 2.62, 2.66 | | |
+| 68 | C3 Host app: update image keeping persisted packages | blocked | codex | host-app-shell | 2.61, 2.62, 2.66 | | Host update implemented and file-tested: verified newer release, bounded p3/p1/p2 writes, preserved GPT identities and byte-identical p4/p5, encrypted inbox marker and fresh confirmation on retry. Rust app/core suites passed; a stale helper protocol fixture was corrected and the helper suite passed on rerun. Strict clippy, typecheck, lint, host Bun tests and eight UI tests passed; one Expect-dependent Bun test skipped. Guest package-restoration acceptance remains dependent on 2.61 and 2.62. Changes intentionally uncommitted. |
 | 69 | C4 Host app release: macOS signed and notarised; Windows signing deferred; Linux AppImage | todo | | | 2.66, 2.67, 2.68 | | |
 | 70 | Later: aarch64 (UEFI ARM) | todo | | | 2.61 | | |
 | 71 | Later: Secure Boot support (v1 requires it disabled) | todo | | | 2.61, 2.62 | | |

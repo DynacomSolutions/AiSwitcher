@@ -40,9 +40,26 @@ impl EscrowCommandState {
 }
 
 impl EscrowCommandState {
-    /// The create flow's passphrase sink. Retention stays disabled until the
-    /// opt-in expiry choice and the per-user cleanup component are offered, so
-    /// the passphrase is dropped and only a secret-free drive record is kept.
+    pub fn known_images(
+        &self,
+    ) -> Result<Vec<(ais_host_core::update::InstalledImage, String)>, String> {
+        let mut registry =
+            FileRegistry::open(&self.directory).map_err(|error| error.to_string())?;
+        let data = registry.load().map_err(|error| error.to_string())?;
+        Ok(data
+            .records()
+            .filter(|record| record.created_here() && !record.forget_pending())
+            .filter_map(|record| {
+                record.installed_image().map(|image| {
+                    (
+                        image.clone(),
+                        record.image_update_status().unwrap_or("created").into(),
+                    )
+                })
+            })
+            .collect())
+    }
+    /// Retention stays disabled, so creation keeps only a secret-free drive record.
     pub fn sink(&self) -> EscrowSink {
         EscrowSink {
             state: self.clone(),
@@ -57,6 +74,30 @@ pub struct EscrowSink {
 }
 
 impl PassphraseSink for EscrowSink {
+    fn remember_image(
+        &self,
+        drive_id: &str,
+        image: &ais_host_core::update::InstalledImage,
+        status: &str,
+    ) -> Result<(), String> {
+        let mut registry =
+            FileRegistry::open(&self.state.directory).map_err(|error| error.to_string())?;
+        let mut data = registry.load().map_err(|error| error.to_string())?;
+        data.record_image(drive_id, image.clone(), status)
+            .map_err(|error| error.to_string())?;
+        registry.save(&data).map_err(|error| error.to_string())
+    }
+    fn reserve_update_sequence(&self, drive_id: &str, minimum: u64) -> Result<u64, String> {
+        let mut registry =
+            FileRegistry::open(&self.state.directory).map_err(|error| error.to_string())?;
+        let mut data = registry.load().map_err(|error| error.to_string())?;
+        let seq = data
+            .reserve_update_inbox(drive_id, minimum)
+            .map_err(|error| error.to_string())?;
+        registry.save(&data).map_err(|error| error.to_string())?;
+        Ok(seq)
+    }
+
     fn hand_over(&self, passphrase: &Passphrase, drive_id: &str) -> Result<(), String> {
         let mut registry =
             FileRegistry::open(&self.state.directory).map_err(|error| error.to_string())?;

@@ -218,9 +218,187 @@ pub fn verify_published(
     Ok(())
 }
 
+/// Publish only an informational marker, without replaying old credentials or settings.
+/// The guest detects its changed base and reinstalls its own recorded packages.
+pub fn publish_image_updated(
+    exchange: &ExchangeRoot,
+    passphrase: &str,
+    image: &crate::update::InstalledImage,
+    reserve: impl FnOnce(u64) -> Result<u64, String>,
+) -> Result<u64, String> {
+    use crate::contract::{BundleEntry, MAX_INBOX_BYTES, MAX_SAFE_SEQUENCE, PathClass};
+    image
+        .validate()
+        .map_err(|_| "The updated image record is invalid.")?;
+    let inbox = exchange.directory("inbox", false)?;
+    let _lock = inbox.bundle_lock()?;
+    let mut latest = None;
+    for name in inbox.names()? {
+        if !name.starts_with("bundle-") || !name.ends_with(".age") {
+            continue;
+        }
+        let seq = crate::bundle::bundle_sequence_from_filename(std::path::Path::new(&name))?;
+        if latest.as_ref().is_none_or(|(current, _)| seq > *current) {
+            latest = Some((seq, name));
+        }
+    }
+    let (previous, name) = latest.ok_or("The existing encrypted inbox is unavailable.")?;
+    let mut ciphertext = Vec::new();
+    inbox
+        .open_file(&name, false)?
+        .take(MAX_INBOX_BYTES as u64 + 1)
+        .read_to_end(&mut ciphertext)
+        .map_err(|_| "Cannot read the existing inbox.")?;
+    let mut bundle = decrypt_bundle(&ciphertext, passphrase, BundleKind::Inbox)?;
+    if bundle.manifest.seq != previous {
+        return Err("The inbox sequence does not match its filename.".into());
+    }
+    let seq = reserve(previous)?;
+    if seq <= previous || seq > MAX_SAFE_SEQUENCE {
+        return Err("Invalid reserved inbox sequence.".into());
+    }
+    let marker_path = ".ais/logs/image-updated.jsonl";
+    let mut marker = serde_json::to_vec(&serde_json::json!({"version": 1, "event": "image updated", "release": image.tag, "imageDigest": hex(&image.image_digest)})).map_err(|_| "Cannot encode image marker.")?;
+    marker.push(b'\n');
+    bundle.manifest.seq = seq;
+    bundle.manifest.created_at = chrono::Utc::now().to_rfc3339();
+    bundle.manifest.entries.clear();
+    for bytes in bundle.files.values_mut() {
+        bytes.fill(0);
+    }
+    bundle.files.clear();
+    bundle.manifest.entries.push(BundleEntry {
+        path: marker_path.into(),
+        class: PathClass::Logs,
+        sha256: hex(&crate::release::sha256(&marker)),
+        size: marker.len() as u64,
+    });
+    bundle.files.insert(marker_path.into(), marker);
+    let mut tar = write_bundle_tar(&bundle.manifest, &bundle.files)?;
+    let encrypted = encrypt_bundle_tar(&tar, passphrase, BundleKind::Inbox);
+    tar.fill(0);
+    for bytes in bundle.files.values_mut() {
+        bytes.fill(0);
+    }
+    bundle.tar_bytes.fill(0);
+    let encrypted = encrypted?;
+    publish_atomic(&inbox, &format!("bundle-{seq}.age"), |file| {
+        file.write_all(&encrypted)
+            .and_then(|_| file.sync_all())
+            .and_then(|_| file.rewind())
+            .map_err(|_| "Cannot flush image marker.")?;
+        let mut readback = Vec::new();
+        file.take(encrypted.len() as u64 + 1)
+            .read_to_end(&mut readback)
+            .map_err(|_| "Cannot verify image marker.")?;
+        if readback != encrypted {
+            return Err("Image marker readback differs.".into());
+        }
+        Ok(())
+    })?;
+    exchange.sync()?;
+    Ok(seq)
+}
+
 #[cfg(all(test, feature = "file-test", target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_marker_is_encrypted_monotonic_and_does_not_replay_or_replace_existing_data() {
+        use crate::contract::{BundleEntry, BundleManifest, PathClass};
+        use std::collections::BTreeMap;
+        let (path, file) =
+            crate::file_test::fresh_file(&std::env::temp_dir(), "marker-SYNTHETIC-FIXTURE")
+                .unwrap();
+        drop(file);
+        let directory = path.with_extension("exchange");
+        std::fs::create_dir(&directory).unwrap();
+        let root = ExchangeRoot::test_directory(&directory).unwrap();
+        let inbox = root.directory("inbox", true).unwrap();
+        let bytes = br#"{"theme":"SYNTHETIC_FIXTURE"}"#.to_vec();
+        let entry = BundleEntry {
+            path: ".claude/settings.json".into(),
+            class: PathClass::ConfigSettings,
+            sha256: hex(&crate::release::sha256(&bytes)),
+            size: bytes.len() as u64,
+        };
+        let manifest = BundleManifest {
+            version: 1,
+            seq: 3,
+            created_at: "2026-10-19T00:00:00Z".into(),
+            kind: BundleKind::Inbox,
+            entries: vec![entry.clone()],
+            last_inbox_seq: None,
+            truncated: None,
+            skipped_symlinks: None,
+        };
+        let tar = write_bundle_tar(&manifest, &BTreeMap::from([(entry.path, bytes)])).unwrap();
+        let passphrase = "SYNTHETIC_FIXTURE_marker_passphrase";
+        let ciphertext = encrypt_bundle_tar(&tar, passphrase, BundleKind::Inbox).unwrap();
+        inbox
+            .open_file("bundle-3.age", true)
+            .unwrap()
+            .write_all(&ciphertext)
+            .unwrap();
+        // A failed earlier publication must not be mistaken for a completed bundle.
+        inbox
+            .open_file(".ais-SYNTHETIC_FIXTURE.partial", true)
+            .unwrap()
+            .write_all(b"partial")
+            .unwrap();
+        let installed = crate::update::InstalledImage {
+            identity: crate::drive_identity::DriveIdentity::fresh().unwrap(),
+            release_order: (2, 2),
+            tag: "live-v2.0.0".into(),
+            image_digest: [0x72; 32],
+            hardware_hint: "a7".repeat(32),
+        };
+        let lock = inbox.bundle_lock().unwrap();
+        assert!(
+            publish_image_updated(&root, passphrase, &installed, |_| panic!("locked")).is_err()
+        );
+        drop(lock);
+        assert!(
+            publish_image_updated(&root, "SYNTHETIC_FIXTURE_wrong", &installed, |_| panic!(
+                "unauthenticated"
+            ))
+            .is_err()
+        );
+        assert!(publish_image_updated(&root, passphrase, &installed, |_| Ok(3)).is_err());
+        let seq = publish_image_updated(&root, passphrase, &installed, |previous| {
+            assert_eq!(previous, 3);
+            Ok(8)
+        })
+        .unwrap();
+        assert_eq!(seq, 8);
+        assert_eq!(
+            std::fs::read(directory.join("inbox/bundle-3.age")).unwrap(),
+            ciphertext
+        );
+        let marker_ciphertext = std::fs::read(directory.join("inbox/bundle-8.age")).unwrap();
+        assert!(
+            !marker_ciphertext
+                .windows(b"image updated".len())
+                .any(|bytes| bytes == b"image updated")
+        );
+        let bundle = decrypt_bundle(&marker_ciphertext, passphrase, BundleKind::Inbox).unwrap();
+        assert_eq!(bundle.manifest.seq, 8);
+        assert_eq!(bundle.files.len(), 1);
+        let marker: serde_json::Value =
+            serde_json::from_slice(&bundle.files[".ais/logs/image-updated.jsonl"]).unwrap();
+        assert_eq!(marker["event"], "image updated");
+        assert_eq!(marker["release"], installed.tag);
+        assert_eq!(marker["imageDigest"], hex(&installed.image_digest));
+        assert_eq!(
+            std::fs::read_dir(directory.join("inbox")).unwrap().count(),
+            4
+        );
+        drop(inbox);
+        drop(root);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn model_snapshot_is_sealed_and_corrupt_or_partial_staging_is_removed() {

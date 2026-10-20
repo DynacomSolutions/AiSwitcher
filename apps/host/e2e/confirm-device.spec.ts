@@ -43,3 +43,35 @@ test("device preview requires the exact identifier and refresh invalidates the o
   await page.getByRole("button", { name: "Preview create layout" }).click();
   await expect(page.getByTestId("preview-id")).not.toHaveText(oldPreviewId ?? "");
 });
+
+test("known drive update requires exact confirmation and expires", async ({ page }: { page: any }) => {
+  await page.clock.install({ time: new Date("2026-10-19T00:00:00Z") });
+  await page.goto("/drives/SYNTHETIC_FIXTURE_drive_usb_1");
+  await page.getByRole("link", { name: "Update", exact: true }).click();
+  await expect(page).toHaveURL(/\/drives\/SYNTHETIC_FIXTURE_drive_usb_1\/update$/);
+  await page.getByLabel("Passphrase", { exact: true }).fill("SYNTHETIC_FIXTURE_12");
+  await page.getByRole("button", { name: "Preview update", exact: true }).click();
+  const preview = page.getByRole("region", { name: "Update preview" });
+  await expect(preview).toBeVisible();
+  await expect(preview).toContainText("AISX: 600,000,000 bytes preserved");
+  await expect(preview).toContainText("AISPERSIST: 2,147,483,648 bytes preserved");
+  await expect(page.getByRole("button", { name: "Write update", exact: true })).toBeDisabled();
+  await page.getByLabel("Type the device identifier to confirm").fill("SYNTHETIC_FIXTURE_wrong");
+  await page.getByRole("button", { name: "Confirm image update" }).click();
+  await expect(page.getByRole("alert")).toContainText("exact displayed device identifier");
+  await page.getByLabel("Type the device identifier to confirm").fill("Synthetic USB Drive");
+  await page.getByRole("button", { name: "Confirm image update" }).click();
+  await expect(page.getByRole("button", { name: "Write update", exact: true })).toBeEnabled();
+  await page.clock.fastForward(90_000);
+  await expect(preview).toBeHidden();
+  await expect(page.getByRole("alert")).toContainText("Confirmation expired");
+
+  await page.getByLabel("Passphrase", { exact: true }).fill("SYNTHETIC_FIXTURE_12");
+  await page.getByRole("button", { name: "Preview update", exact: true }).click();
+  await expect(preview).toBeVisible();
+  await page.getByLabel("Passphrase", { exact: true }).fill("SYNTHETIC_FIXTURE_changed");
+  await expect(preview).toBeHidden();
+  await page.getByRole("link", { name: "Back to drives", exact: true }).click();
+  await page.goto("/drives/SYNTHETIC_FIXTURE_drive_system_1");
+  await expect(page.getByRole("link", { name: "Update", exact: true })).toHaveCount(0);
+});

@@ -20,6 +20,7 @@ export const productionBridge: HostBridge = {
     await native().invoke<void>("set_create_options", { modelId, licenceAccepted, passphrase, confirmation });
   },
   async previewWrite(deviceId: string): Promise<WritePreview> { return native().invoke<WritePreview>("preview_write", { deviceId }); },
+  async previewUpdate(deviceId: string): Promise<WritePreview> { return native().invoke<WritePreview>("preview_update", { deviceId }); },
   async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
     return native().invoke<ConfirmationReceipt>("confirm_write", { previewId, typedIdentifier });
   },

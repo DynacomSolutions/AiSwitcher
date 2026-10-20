@@ -44,9 +44,19 @@ pub struct DriveRecord {
     pub(crate) outbox_issued: u64,
     /// Opaque source registry handles, never SSH addresses or credentials.
     pub(crate) source_references: Vec<String>,
+    #[serde(default)]
+    pub(crate) installed_image: Option<crate::update::InstalledImage>,
+    #[serde(default)]
+    pub(crate) image_update_status: Option<String>,
 }
 
 impl DriveRecord {
+    pub fn installed_image(&self) -> Option<&crate::update::InstalledImage> {
+        self.installed_image.as_ref()
+    }
+    pub fn image_update_status(&self) -> Option<&str> {
+        self.image_update_status.as_deref()
+    }
     pub fn drive_id(&self) -> &str {
         &self.drive_id
     }
@@ -64,6 +74,9 @@ impl DriveRecord {
     }
     pub fn created_here(&self) -> bool {
         self.created_here
+    }
+    pub fn forget_pending(&self) -> bool {
+        self.forget_pending
     }
     pub fn item(&self) -> Option<&ItemRef> {
         self.item.as_ref()
@@ -111,6 +124,46 @@ impl RegistryData {
         self.drives.get(id)
     }
 
+    pub fn record_image(
+        &mut self,
+        id: &str,
+        image: crate::update::InstalledImage,
+        status: &str,
+    ) -> Result<(), EscrowError> {
+        image.validate().map_err(|_| EscrowError::InvalidRegistry)?;
+        if !matches!(status, "created" | "updating" | "writtenAwaitingBoot") {
+            return Err(EscrowError::InvalidRegistry);
+        }
+        let record = self
+            .drives
+            .get_mut(id)
+            .ok_or(EscrowError::InvalidRegistry)?;
+        if record.forget_pending {
+            return Err(EscrowError::InvalidRegistry);
+        }
+        record.installed_image = Some(image);
+        record.image_update_status = Some(status.into());
+        Ok(())
+    }
+    pub fn reserve_update_inbox(&mut self, id: &str, minimum: u64) -> Result<u64, EscrowError> {
+        let record = self
+            .drives
+            .get_mut(id)
+            .ok_or(EscrowError::InvalidRegistry)?;
+        if record.forget_pending || minimum > MAX_SAFE_SEQUENCE {
+            return Err(EscrowError::InvalidRegistry);
+        }
+        let seq = record
+            .inbox_issued
+            .max(record.inbox_acknowledged)
+            .max(minimum)
+            .checked_add(1)
+            .filter(|seq| *seq <= MAX_SAFE_SEQUENCE)
+            .ok_or(EscrowError::InvalidRegistry)?;
+        record.inbox_issued = seq;
+        Ok(seq)
+    }
+
     pub fn validate(&self) -> Result<(), EscrowError> {
         if self.version != 1
             || self.installation_id.len() != 64
@@ -121,7 +174,14 @@ impl RegistryData {
         }
         for (id, record) in &self.drives {
             validate_handle(id)?;
-            if id != &record.drive_id
+            if record
+                .installed_image
+                .as_ref()
+                .is_some_and(|image| image.validate().is_err())
+                || record.image_update_status.as_deref().is_some_and(|status| {
+                    !matches!(status, "created" | "updating" | "writtenAwaitingBoot")
+                })
+                || id != &record.drive_id
                 || record.generation == 0
                 || record.created_at > self.last_observed_at
                 || record

@@ -41,6 +41,17 @@ export const testBridge: HostBridge = {
       partitionDetailsAvailable: true, ranges: [{ start: 0, length: 17_408 }], imageDigest: "0".repeat(64), confirmationTtlSeconds: 90,
     };
   },
+  async previewUpdate(deviceId: string): Promise<WritePreview> {
+    return {
+      ...await this.previewWrite(deviceId), operation: "replaceBase",
+      ranges: [{ start: 1_048_576, length: 200_000_000 }],
+      partitions: [
+        { name: "AISBASE", sizeBytes: 100_000_000, kind: "replace" },
+        { name: "AISX", sizeBytes: 600_000_000, kind: "preserve" },
+        { name: "AISPERSIST", sizeBytes: 2_147_483_648, kind: "preserve" },
+      ],
+    };
+  },
   async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
     if (previewId !== current || typedIdentifier !== "Synthetic USB Drive") throw new Error("Type the exact displayed device identifier.");
     return { expiresInSeconds: 90 };

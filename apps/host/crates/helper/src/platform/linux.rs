@@ -900,6 +900,39 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Bounded read-only GPT preview, pinned to the same whole-device observation.
+pub fn update_snapshot(
+    identity: &str,
+) -> Result<ais_host_core::update::DriveSnapshot, ObservationError> {
+    use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+    let observed = collect_by_identity(identity)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(std::path::Path::new("/dev").join(&observed.kernel_name))
+        .map_err(|_| ObservationError::InvalidInput)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ObservationError::InvalidInput)?;
+    let device = format!(
+        "linux:{}:{}",
+        libc::major(metadata.rdev()),
+        libc::minor(metadata.rdev())
+    );
+    if !metadata.file_type().is_block_device() || device != identity {
+        return Err(ObservationError::Changed);
+    }
+    let snapshot = ais_host_core::update::DriveSnapshot::read(
+        observed.observation.clone(),
+        |offset, bytes| file.read_exact_at(bytes, offset),
+    )
+    .map_err(|_| ObservationError::Changed)?;
+    if collect_by_identity(identity)?.observation != observed.observation {
+        return Err(ObservationError::Changed);
+    }
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

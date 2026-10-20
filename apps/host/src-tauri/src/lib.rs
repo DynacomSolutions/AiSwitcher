@@ -36,6 +36,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_devices,
             preview_write,
+            preview_update,
             confirm_write,
             start_write,
             list_models,
@@ -68,8 +69,30 @@ fn is_allowed_navigation(url: &tauri::Url) -> bool {
 #[tauri::command]
 fn list_devices(
     state: tauri::State<'_, ConfirmationSession>,
+    registry: tauri::State<'_, escrow_commands::EscrowCommandState>,
 ) -> Vec<ais_host_core::device::DeviceSummary> {
-    state.retain_listed(native_devices())
+    let devices = native_devices();
+    let images = registry.known_images().unwrap_or_default();
+    let hints: Vec<_> = devices
+        .iter()
+        .map(ais_host_core::update::hardware_hint)
+        .collect();
+    let mut summaries = state.retain_listed(devices);
+    for (summary, hint) in summaries.iter_mut().zip(hints) {
+        let matches: Vec<_> = images
+            .iter()
+            .filter(|(image, _)| image.hardware_hint == hint)
+            .collect();
+        if let [(_, status)] = matches.as_slice() {
+            summary.layout_status = match status.as_str() {
+                "updating" => "update incomplete",
+                "writtenAwaitingBoot" => "awaiting boot",
+                _ => "ready",
+            }
+            .into();
+        }
+    }
+    summaries
 }
 
 #[cfg(target_os = "linux")]
@@ -152,6 +175,95 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
         fetched.sources,
         preparation,
     )
+}
+
+/// The stored release and actual GPT must both identify a drive created here.
+#[tauri::command]
+async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<WritePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ConfirmationSession>();
+        let preparation = state.begin_preview(&device_id)?;
+        let snapshot = preview_update_native(&device_id)?;
+        preparation.check_observation(&snapshot.observation)?;
+        let images = app
+            .state::<escrow_commands::EscrowCommandState>()
+            .known_images()?;
+        let matches: Vec<_> = images
+            .into_iter()
+            .filter(|(image, _)| snapshot.partitions(&image.identity).is_ok())
+            .collect();
+        if matches.len() != 1 {
+            return Err("The drive's installed release is unknown or its layout changed.".into());
+        }
+        let (installed, _) = matches.into_iter().next().expect("one known drive");
+        let verifier =
+            ais_host_core::release::ImageVerifier::bundled().map_err(|error| error.to_string())?;
+        let fetched = ais_host_core::fetch::fetch_verified(
+            &ais_host_core::fetch::UreqHttp::default(),
+            &verifier,
+            RELEASE_LISTING,
+            &std::env::temp_dir(),
+        )
+        .map_err(|error| error.to_string())?;
+        let snapshot = preview_update_native(&device_id)?;
+        preparation.check_observation(&snapshot.observation)?;
+        let plan =
+            ais_host_core::device::WritePlan::update_drive(&fetched.image, &snapshot, &installed)
+                .map_err(|_| {
+                "A newer compatible image is required. Its base must fit the existing partition."
+                    .to_string()
+            })?;
+        let parts = snapshot
+            .partitions(&installed.identity)
+            .map_err(|_| "The drive layout changed.")?;
+        let details = DeviceReviewDetails {
+            partitions: parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| PartitionReview {
+                    name: ["BIOS", "AISBOOT", "AISBASE", "AISX", "AISPERSIST"][index].into(),
+                    size_bytes: ais_host_core::update::partition_range(part).length,
+                    kind: if index < 3 { "replace" } else { "preserve" }.into(),
+                })
+                .collect(),
+            partition_details_available: true,
+        };
+        let pending = PendingConfirmation {
+            preview_id: fresh_preview_id()?,
+            plan,
+            image: fetched.image,
+            release: fetched.release,
+            details,
+            ticket: None,
+            typed: None,
+            sources: Some(fetched.sources),
+            create: Some(preparation.create),
+            installed: Some(installed),
+        };
+        let view = pending.view();
+        let mut locked = state
+            .state
+            .lock()
+            .map_err(|_| "Confirmation state is unavailable.")?;
+        if locked.preparing.as_deref() != Some(&preparation.id) {
+            return Err("The update choices changed during preparation.".into());
+        }
+        locked.preparing = None;
+        locked.approvals.invalidate();
+        locked.pending = Some(pending);
+        Ok(view)
+    })
+    .await
+    .map_err(|_| "The update preview could not be prepared.".to_string())?
+}
+#[cfg(target_os = "linux")]
+fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
+    ais_host_helper::protocol::linux_transport::preview_update(id)
+        .map_err(|error| error.to_string())
+}
+#[cfg(not(target_os = "linux"))]
+fn preview_update_native(_: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
+    Err("Image updates are unavailable on this platform.".into())
 }
 
 /// The reviewed model catalogue with immutable download pins.
@@ -308,6 +420,7 @@ struct PendingConfirmation {
     /// Retained image, checksum and signature files for the helper to re-verify.
     sources: Option<[std::fs::File; 3]>,
     create: Option<StoredCreate>,
+    installed: Option<ais_host_core::update::InstalledImage>,
 }
 
 /// Presentation fields are collected by the native enumerator. They never
@@ -509,6 +622,16 @@ impl ConfirmationSession {
             .consume(&ticket, &current.plan, &observation, &current.image, now)
             .map_err(|error| error.to_string())?;
         drop(state);
+        if current.installed.is_some() {
+            return perform_update(
+                current,
+                typed,
+                CONFIRMATION_TTL
+                    .saturating_sub(now.saturating_duration_since(confirmed_at))
+                    .saturating_sub(started.elapsed()),
+                env,
+            );
+        }
         let mut create = current
             .create
             .take()
@@ -568,9 +691,73 @@ impl ConfirmationSession {
                 .to_string()
         })?;
         // The one hand-off to key escrow; creation itself keeps no passphrase.
-        env.sink
-            .hand_over(&create.passphrase, &drive_handle(&current.plan)?)
+        let handle = drive_handle(&current.plan)?;
+        env.sink.hand_over(&create.passphrase, &handle)?;
+        let installed = ais_host_core::update::InstalledImage::new(
+            &current.image,
+            current
+                .plan
+                .identity()
+                .ok_or("Missing drive identity.")?
+                .clone(),
+            current.plan.device(),
+        );
+        env.sink.remember_image(&handle, &installed, "created")
     }
+}
+
+fn perform_update(
+    current: PendingConfirmation,
+    typed: String,
+    remaining: std::time::Duration,
+    env: &mut WriteEnv<'_>,
+) -> Result<(), String> {
+    let previous = current
+        .installed
+        .as_ref()
+        .ok_or("The installed release is unknown.")?;
+    let passphrase = &current
+        .create
+        .as_ref()
+        .ok_or("Enter the existing drive passphrase.")?
+        .passphrase;
+    let handle = drive_handle(&current.plan)?;
+    let request = helper_request(&current, typed, remaining)?;
+    let sources = current
+        .sources
+        .as_ref()
+        .ok_or("The verified image sources are unavailable.")?;
+    // Persist intent first. A crash or helper failure must never look successful.
+    env.sink.remember_image(&handle, previous, "updating")?;
+    env.launcher.launch(request, sources).map_err(|_| "The image update did not finish. Boot and base may be incomplete; encrypted storage is preserved. Preview and retry the update.".to_string())?;
+    let installed = ais_host_core::update::InstalledImage::new(
+        &current.image,
+        previous.identity.clone(),
+        current.plan.device(),
+    );
+    let device = current.plan.device();
+    let exchange = match env.volume.mount(&current.plan) {
+        Ok(exchange) => exchange,
+        Err(_) => {
+            let _ = env.volume.eject(device);
+            return Err("The image was updated, but its inbox could not be opened. Package restoration is awaiting the next boot.".into());
+        }
+    };
+    let publication = ais_host_core::publish::publish_image_updated(
+        &exchange,
+        passphrase.expose(),
+        &installed,
+        |minimum| env.sink.reserve_update_sequence(&handle, minimum),
+    );
+    drop(exchange);
+    let ejected = env.volume.eject(device);
+    publication.map_err(|_| "The image was updated, but the encrypted inbox marker could not be published. Package restoration is awaiting the next boot.".to_string())?;
+    env.sink
+        .remember_image(&handle, &installed, "writtenAwaitingBoot")?;
+    ejected.map_err(|_| {
+        "The image and inbox marker were verified, but safe eject failed.".to_string()
+    })?;
+    Ok(())
 }
 
 /// Everything `begin_write` needs from the operating system, so the same
@@ -635,6 +822,7 @@ fn helper_request(
         ticket: fresh_preview_id()?,
         release: pending.release.clone(),
         device_identity: pending.plan.device().os_identity.clone(),
+        installed_image: pending.installed.clone(),
         drive_identity: pending
             .plan
             .identity()
@@ -1011,6 +1199,7 @@ impl PendingConfirmation {
             typed: None,
             sources: None,
             create: None,
+            installed: None,
         })
     }
 
@@ -1290,6 +1479,7 @@ mod confirmation_tests {
             typed: None,
             sources: Some(sources()),
             create: Some(stored_create()),
+            installed: None,
         }
     }
 

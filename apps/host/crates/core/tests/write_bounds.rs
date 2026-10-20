@@ -189,7 +189,7 @@ fn test_crc32(bytes: &[u8]) -> u32 {
 }
 
 #[test]
-fn file_backed_creation_personalises_both_gpts_and_menus_and_zeroes_all_persist() {
+fn file_backed_creation_personalises_both_gpts_and_menus_and_zeroes_only_persist_header() {
     use ais_host_core::{
         device::TABLE_WINDOW_BYTES,
         drive_identity::verify_esp,
@@ -252,7 +252,7 @@ fn file_backed_creation_personalises_both_gpts_and_menus_and_zeroes_all_persist(
     let persist_len = plan.remaining_bytes();
     assert!(persist_len >= 2 * 1024 * 1024 * 1024);
     // Old data in the header area, beyond 16 MiB, the middle and final sector.
-    for offset in [0, 17 * 1024 * 1024, persist_len / 2, persist_len - 512] {
+    for offset in [0, 16 * 1024 * 1024, persist_len / 2, persist_len - 512] {
         target
             .seek(SeekFrom::Start(persist_start + offset))
             .unwrap();
@@ -313,8 +313,8 @@ fn file_backed_creation_personalises_both_gpts_and_menus_and_zeroes_all_persist(
     assert_eq!((number(p5, 40) - number(p5, 32) + 1) * 512, persist_len);
     let mut zeroes = [0; 64 * 1024];
     let mut position = 0;
-    while position < persist_len {
-        let length = (persist_len - position).min(zeroes.len() as u64) as usize;
+    while position < 16 * 1024 * 1024 {
+        let length = (16 * 1024 * 1024 - position).min(zeroes.len() as u64) as usize;
         target
             .read_at(persist_start + position, &mut zeroes[..length])
             .unwrap();
@@ -323,6 +323,13 @@ fn file_backed_creation_personalises_both_gpts_and_menus_and_zeroes_all_persist(
             "persist offset {position}"
         );
         position += length as u64;
+    }
+    for offset in [16 * 1024 * 1024, persist_len / 2, persist_len - 512] {
+        let mut preserved = [0; 512];
+        target
+            .read_at(persist_start + offset, &mut preserved)
+            .unwrap();
+        assert_eq!(preserved, [0xa7; 512]);
     }
     for index in [0, 2] {
         let entry = &entries[index * 128..(index + 1) * 128];
