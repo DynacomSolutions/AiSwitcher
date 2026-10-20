@@ -130,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo chown -R "$USER" out
-          image/build/assemble.sh out/archiso.iso out/ais-live.img
+          AIS_GRUB_MODULE_DIR=out/grub-x86_64-efi image/build/assemble.sh out/archiso.iso out/ais-live.img
           ls -l out/ais-live.img
 
       - name: Stop disk sampler

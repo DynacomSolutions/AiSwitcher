@@ -64,6 +64,9 @@ mkdir -p "$out"
 iso=$(find "$root/build/out" -maxdepth 1 -name '*.iso' | head -n 1)
 [ -n "$iso" ] || { echo "build: mkarchiso produced no ISO" >&2; exit 1; }
 cp "$iso" "$out/archiso.iso"
+# Distribution GRUB builds differ: Ubuntu's standalone EFI leaves $cmdpath
+# empty, which the boot-partition check needs, so assemble uses Arch's modules.
+cp -a "$root/usr/lib/grub/x86_64-efi" "$out/grub-x86_64-efi"
 
 profile_hash=$(cd "$root/build/profile" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
 jq -n --arg baseId "${ARCH_ARCHIVE_DATE//\//-}+$profile_hash" \

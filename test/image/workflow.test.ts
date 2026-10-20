@@ -44,3 +44,9 @@ describe("live-image workflow", () => {
     expect(text).not.toMatch(/runs-on: (?!ubuntu-latest)/);
   });
 });
+
+test("the EFI loader is built from the image's own Arch GRUB modules", () => {
+  // Ubuntu's standalone GRUB leaves $cmdpath empty and the boot-partition check halts.
+  expect(text).toContain("AIS_GRUB_MODULE_DIR=out/grub-x86_64-efi image/build/assemble.sh");
+  expect(readFileSync("image/build/build.sh", "utf8")).toContain('cp -a "$root/usr/lib/grub/x86_64-efi" "$out/grub-x86_64-efi"');
+});
