@@ -37,7 +37,7 @@ describe("live boot flow", () => {
     }
   });
 
-  it("runs online install and launch in order and retries a failed install", async () => {
+  it("runs online install and launch in order and retains the successful install marker", async () => {
     const success = runFlow("online-first");
     expect(success.status).toBe(0);
     expect(success.stdout.trim().split("\n")).toEqual([
@@ -57,16 +57,11 @@ describe("live boot flow", () => {
       const fixture = new URL("test/image/fixtures/upgrade-once-stubs.sh", root).pathname;
       const state = join(tempRoot, "live", "vendor-cli-installed");
       const counter = join(tempRoot, "success-count");
-      const successful = spawnSync("/bin/bash", [fixture, helper, state, counter, "false"], { encoding: "utf8" });
-      expect(successful.status).toBe(0);
-      expect(successful.stdout.trim()).toBe("1");
-
-      const retryState = join(tempRoot, "retry", "vendor-cli-installed");
-      const retryCounter = join(tempRoot, "retry-count");
-      const retried = spawnSync("/bin/bash", [fixture, helper, retryState, retryCounter, "true"], { encoding: "utf8" });
-      expect(retried.status).toBe(0);
-      expect(retried.stdout.trim()).toBe("2");
-      expect(await readText(retryState, "utf8")).toBe("");
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const successful = spawnSync("/bin/bash", [fixture, helper, state, counter, "false"], { encoding: "utf8" });
+        expect(successful.status).toBe(0);
+        expect(successful.stdout.trim()).toBe("1");
+      }
 
       const invalidParent = join(tempRoot, "not-a-directory");
       await writeFile(invalidParent, "synthetic blocker");
@@ -147,7 +142,7 @@ describe("live boot flow", () => {
     }
   });
 
-  it("serialises real concurrent upgrade-once callers and retries after failure", async () => {
+  it("serialises real concurrent successful upgrade-once callers", async () => {
     const tempRoot = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "ais-upgrade-concurrent-"));
     try {
       const helper = new URL("image/lib/ais-upgrade-once.sh", root).pathname;
@@ -165,5 +160,45 @@ describe("live boot flow", () => {
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  it("reports failure to competing consoles and retries only once on the next online boot", async () => {
+    const tempRoot = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "ais-upgrade-reboot-"));
+    try {
+      const flow = new URL("image/lib/ais-live-flow", root).pathname;
+      const helper = new URL("image/lib/ais-upgrade-once.sh", root).pathname;
+      const fixture = new URL("test/image/fixtures/upgrade-once-stubs.sh", root).pathname;
+      const state = join(tempRoot, "live", "vendor-cli-installed");
+      const counter = join(tempRoot, "install-count");
+      const invoke = async (boot: string, online = "true") => {
+        const proc = Bun.spawn(["/bin/bash", "-c", `
+          source "$1"
+          ais_network_prompt() { :; }
+          stage() { printf 'AIS-LIVE: stage=%s status=%s\\n' "$1" "$2"; }
+          ais_launch() { :; }
+          fixture=$2 helper=$3 state=$4 counter=$5 boot=$6 online=$7
+          ais_probe() { AIS_FLOW_ONLINE=$online; }
+          ais_upgrade_once() { /bin/bash "$fixture" "$helper" "$state" "$counter" true "$boot"; }
+          ais_live_flow
+        `, "_", flow, fixture, helper, state, counter, boot, online], { stdout: "pipe", stderr: "pipe" });
+        const [stdout, stderr, status] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+        expect(status, stderr).toBe(0);
+        expect(stdout).toContain("AIS-LIVE: stage=launch status=ok");
+        return stdout;
+      };
+      const first = await Promise.all([invoke("SYNTHETIC_FIXTURE_boot_one"), invoke("SYNTHETIC_FIXTURE_boot_one")]);
+      for (const output of first) expect(output).toContain("AIS-LIVE: stage=vendor-cli-install status=fail");
+      expect((await readText(counter, "utf8")).trim()).toBe("1");
+      expect(await Bun.file(state).exists()).toBe(false);
+      expect(await invoke("SYNTHETIC_FIXTURE_boot_one")).toContain("stage=vendor-cli-install status=fail");
+      expect(await invoke("SYNTHETIC_FIXTURE_boot_two", "false")).toContain("stage=vendor-cli-install status=skip");
+      expect((await readText(counter, "utf8")).trim()).toBe("1");
+      const second = await Promise.all([invoke("SYNTHETIC_FIXTURE_boot_two"), invoke("SYNTHETIC_FIXTURE_boot_two")]);
+      for (const output of second) expect(output).toContain("AIS-LIVE: stage=vendor-cli-install status=ok");
+      expect((await readText(counter, "utf8")).trim()).toBe("2");
+      expect(await readText(state, "utf8")).toBe("");
+      expect(await invoke("SYNTHETIC_FIXTURE_boot_three")).toContain("stage=vendor-cli-install status=ok");
+      expect((await readText(counter, "utf8")).trim()).toBe("2");
+    } finally { await rm(tempRoot, { recursive: true, force: true }); }
   });
 });

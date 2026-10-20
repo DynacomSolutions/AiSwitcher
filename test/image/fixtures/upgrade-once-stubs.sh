@@ -5,6 +5,10 @@ source "$1"
 state=$2
 counter=$3
 failure=$4
+if [[ -n "${5:-}" ]]; then
+  fixture_boot_id=$5
+  ais_upgrade_boot_id() { printf '%s\n' "$fixture_boot_id"; }
+fi
 upgrade_stub() {
   if [[ "$failure" == concurrent ]]; then
     # shellcheck disable=SC2016 # This script must expand positional arguments in the child shell.
@@ -23,7 +27,7 @@ upgrade_stub() {
   printf '%s\n' "$count" > "$counter"
   [[ "$failure" != true || "$count" -ne 1 ]]
 }
-ais_upgrade_once "$state" upgrade_stub || true
-ais_upgrade_once "$state" upgrade_stub
-[[ -f "$counter" ]]
-cat "$counter"
+result=0
+ais_upgrade_once "$state" upgrade_stub || result=$?
+[[ ! -f "$counter" ]] || cat "$counter"
+exit "$result"
