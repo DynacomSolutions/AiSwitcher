@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 const scratch = mkdtempSync(join(tmpdir(), "ais-persist-script-tests-"));
 const persistLib = resolve("image/archiso/airootfs/usr/local/lib/ais-live");
 const hook = resolve("image/archiso/airootfs/etc/initcpio/hooks/ais_persist");
-const pkglistHook = resolve("image/archiso/airootfs/etc/pacman.d/hooks/ais-live-pkglist.hook");
+const pkglistHook = resolve("image/archiso/airootfs/usr/local/share/ais-live/pacman-hooks/ais-live-pkglist.hook");
 const expectBin = process.env.AIS_EXPECT_BIN ?? "expect";
 
 function executable(path: string, contents: string) {
@@ -480,4 +480,12 @@ if {[lindex $result 3] != 0} { exit 12 }
     expect(output).not.toContain("SYNTHETIC_FIXTURE_valid_passphrase");
     expect(readFileSync(keylog, "utf8")).toBe("SYNTHETIC_FIXTURE_valid_passphrase");
   }, 15000);
+});
+
+test("pacman hooks stay out of the build hook directory and are linked at boot", () => {
+  expect(existsSync(resolve("image/archiso/airootfs/etc/pacman.d/hooks"))).toBe(false);
+  const links = readFileSync(resolve("image/archiso/airootfs/etc/tmpfiles.d/ais-live-pacman-hooks.conf"), "utf8");
+  for (const hook of ["ais-live-pkglist.hook", "ais-live-snapshot.hook"]) {
+    expect(links).toContain(`L /etc/pacman.d/hooks/${hook} - - - - /usr/local/share/ais-live/pacman-hooks/${hook}`);
+  }
 });
