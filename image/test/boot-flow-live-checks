@@ -166,7 +166,15 @@ PY
     [[ "$agent_pane" == true ]] && break
     /usr/bin/sleep 0.25
 done
-[[ "$agent_pane" == true ]] || fail new-default-pane-not-agent
+if [[ "$agent_pane" != true ]]; then
+    # Diagnostic: show who owns each new pane's shell tree before failing.
+    while IFS= read -r pane_id; do
+        [[ -n "$pane_id" ]] || continue
+        printf 'AIS-LIVE-DIAG: pane=%s info=%s\n' "$pane_id" "$($herdr pane process-info --pane "$pane_id" 2>&1 | /usr/bin/tr -d '\n' | /usr/bin/cut -c1-300)"
+    done <<<"$new_ids"
+    /usr/bin/ps -eo pid,ppid,user,args --forest 2>/dev/null | /usr/bin/grep -E 'herdr|agent|ais-' | /usr/bin/grep -v grep | /usr/bin/cut -c1-160 | /usr/bin/sed 's/^/AIS-LIVE-DIAG: /' >&2
+    fail new-default-pane-not-agent
+fi
 
 /usr/local/lib/ais-live/ais-agent-pane test-assertions
 printf 'AIS-LIVE-TEST: live-checks=ok\n'

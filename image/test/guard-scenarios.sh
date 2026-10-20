@@ -26,6 +26,7 @@ run_as_agent() {
   runuser -u agent -- env -i HOME="$agent_home" USER=agent LOGNAME=agent PATH=/usr/local/guard/bin:/usr/local/bin:/usr/bin:/bin "$@"
 }
 
+guard_diag() { journalctl -b -u ais-guardd.service --no-pager -o cat 2>/dev/null | tail -n 8 | sed 's/^/AIS-GUARD-DIAG: /'; }
 mark() { printf 'AIS-GUARD-TEST: case=%s status=%s\n' "$1" "$2"; }
 reset_guard() { systemctl restart ais-guardd.service; }
 
@@ -99,17 +100,18 @@ start_guarded() {
       done < <(find "$REQUESTS" -maxdepth 1 -type f -name '*.json' -print)
     fi
     if [[ -n $request ]]; then
-      if ! wait_for_popup_text "${GUARD_HERDR_SOCKET:?}"; then mark "$case_name" popup-pane-not-found; journalctl -b -u ais-guardd.service --no-pager -o cat 2>/dev/null | tail -n 8 | sed 's/^/AIS-GUARD-DIAG: /'; return 1; fi
+      if ! wait_for_popup_text "${GUARD_HERDR_SOCKET:?}"; then mark "$case_name" popup-pane-not-found; guard_diag; return 1; fi
       if ! read_popup_reply "${GUARD_HERDR_SOCKET:?}" "$GUARD_POPUP_PANE"; then mark "$case_name" popup-reply-unreadable; return 1; fi
       GUARDED_REQUEST=$request
       mark "$case_name" popup
       printf 'AIS-GUARD-TEST: case=%s status=prompt reply=%s\n' "$case_name" "$GUARD_POPUP_REPLY"
       return 0
     fi
-    if ! kill -0 "$GUARDED_PID" 2>/dev/null; then mark "$case_name" exited-before-request; wait "$GUARDED_PID" || return 2; return 2; fi
+    if ! kill -0 "$GUARDED_PID" 2>/dev/null; then mark "$case_name" exited-before-request; guard_diag; wait "$GUARDED_PID" || return 2; return 2; fi
     sleep 0.1
   done
   mark "$case_name" no-request
+  guard_diag
   return 1
 }
 
