@@ -413,7 +413,7 @@ pub fn collect_snapshot(identifier: &str) -> Result<MacDiskSnapshot, Observation
         let table_fingerprint = read_table_fingerprint(&disk, capacity_bytes)?;
         let snapshot = MacDiskSnapshot {
             identifier: identifier.to_owned(),
-            device_node: node,
+            device_node: node.to_owned(),
             capacity_bytes,
             connection_generation,
             ancestry_complete: root_ancestry_complete,
@@ -685,9 +685,10 @@ fn run_bounded(
         let _ = output_tx.send((result, bytes));
     });
     let writer = input.map(|input| {
+        let input = input.to_vec();
         let mut stdin = child.stdin.take();
         thread::spawn(move || match stdin.as_mut() {
-            Some(stdin) => stdin.write_all(input),
+            Some(stdin) => stdin.write_all(&input),
             None => Err(io::Error::other("subprocess stdin unavailable")),
         })
     });

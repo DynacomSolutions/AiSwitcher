@@ -71,7 +71,24 @@ pub(crate) fn free_bytes(directory: &Path) -> Option<u64> {
     Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn free_bytes(directory: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let path: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: path is NUL-terminated, free is writable and the unused outputs may be null.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn free_bytes(_directory: &Path) -> Option<u64> {
     None
 }
