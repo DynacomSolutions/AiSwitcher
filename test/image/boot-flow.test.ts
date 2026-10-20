@@ -108,6 +108,7 @@ describe("live boot flow", () => {
     expect(profile).toContain("/dev/tty1) export AIS_LIVE_TTY1_BOOT=1; exec /usr/bin/ais herdr");
     expect(profile).toContain("/dev/ttyS*) exec /usr/local/lib/ais-live/ais-live-boot");
     expect(herdr).toContain('default_shell = "/usr/local/lib/ais-live/ais-agent-pane"');
+    expect(herdr).toMatch(/^onboarding = false$/m);
     expect(pane).toContain('operation=pane');
     expect(pane).toContain('sudo -n -u agent');
     expect(pane).toContain('ais-live-tty1-claim');
