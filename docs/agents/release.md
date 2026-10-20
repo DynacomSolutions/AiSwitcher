@@ -2,6 +2,24 @@
 
 _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 3289-3315). Read before touching this area._
 
+### Live image releases
+
+`release-live-image.yml` accepts only raw `live-v*` tags. It calls the shared
+`live-image.yml` workflow with `release: true`, which builds the CI test image
+and a separate production image without test-only packages, then boots
+both flavours under BIOS and UEFI. The release job checks that the tag commit
+is on `main`, writes the exact `ais-live.img` SHA256 manifest and signs it when
+`MINISIGN_SECRET_KEY` is configured. `MINISIGN_PASSWORD` is required for a
+password-protected key and may be empty only for an unencrypted key. Without
+the key, the signing and publish path reports a notice and skips. The
+minisign public key is `image/release/minisign.pub`. Live releases are marked
+non-latest so they do not change the CLI release selected by `ais update`,
+which uses GitHub's latest-release lookup.
+
+The host app is not part of this release. The asset name `ais-live.img` is an
+assumed host input contract. `image/docs/drive-identity.md` specifies
+partitioning, but does not define release asset names.
+
 ### aistui ships in releases; `ais tui`/`ais herdr` self-heal (2026-09-15)
 
 - release.yml builds the Rust TUI alongside the bun binaries:

@@ -229,5 +229,6 @@ then run the real command once. Full recipe: `docs/agents/adding-a-tool.md`.
 - AWS Bedrock reporting, spend guard: `docs/agents/bedrock-spend.md`
 - Claude swap pools: `docs/agents/claude-swap-pools.md`
 - Release pipeline, aistui release assets and self-heal: `docs/agents/release.md`
+- Live image release workflow and signed assets: `docs/agents/live-image.md`, `docs/agents/release.md`
 - `ais tui` status page, herdr bridge, `ais herdr`: `docs/agents/tui-herdr.md`
 - History, retired designs, duplicated sections (zai takes 1-2): `docs/agents/history.md`

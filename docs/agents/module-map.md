@@ -424,6 +424,11 @@ scripts/
   install.ts              backup + copy compiled binaries to ~/.local/bin
 ```
 
+`image/build/release-assets.sh` checks the shared raw-image size limit and
+creates the live image checksum and optional minisign signature. The live
+image release workflow and verification contract are documented in
+`docs/agents/release.md`.
+
 `identities/*` and `shared/*` never import from each other in the wrong
 direction: `shared/run-wrapper.ts` imports `identities/*`, never the reverse.
 `cli/*` follows the same rule relative to `identities/*` — it depends on
