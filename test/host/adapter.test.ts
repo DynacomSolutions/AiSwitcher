@@ -266,7 +266,7 @@ describe("host adapter", () => {
     const result = await importLogs(outbox([{ path: rel, bytes: incoming }]), home);
 
     expect(result.conflicts).toContain(rel);
-    const preserved = await findFileEndingAt(join(home, ".ais", "cache", "host-import-conflicts"), `/incoming/${rel}`);
+    const preserved = await findFileEndingAt(join(home, ".ais"), `/incoming/${rel}`);
     expect(preserved && await Bun.file(preserved).text()).toBe(new TextDecoder().decode(incoming));
     expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_local_partial");
   });
@@ -285,7 +285,7 @@ describe("host adapter", () => {
       const result = await importLogs(outbox([{ path: rel, bytes: incoming }]), home);
       expect(result.conflicts).toContain(rel);
       expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
-      const preserved = await findFileEndingAt(join(home, ".ais", "cache", "host-import-conflicts"), `/incoming/${rel}`);
+      const preserved = await findFileEndingAt(join(home, ".ais"), `/incoming/${rel}`);
       expect(preserved && await Bun.file(preserved).text()).toBe(new TextDecoder().decode(incoming));
     } finally { setJsonlBeforeCreateHook(); }
   });

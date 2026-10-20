@@ -291,7 +291,7 @@ fn file_backed_creation_personalises_both_gpts_and_menus_and_zeroes_only_persist
         ids.disk
     );
     assert_ne!(&head[568..584], &raw[568..584]);
-    for (index, entry) in entries.chunks_exact(128).take(5).enumerate() {
+    for (index, entry) in entries.as_chunks::<128>().0.iter().take(5).enumerate() {
         assert_eq!(uuid(&entry[16..32]), ids.partitions[index]);
         assert_ne!(
             &entry[16..32],

@@ -172,16 +172,26 @@ export async function importLogs(tar: Uint8Array, home = homedir(), signal?: Abo
     // The shared tree merge is a multi-file mutation without an abort hook.
     // Honour cancellation immediately before entering that non-atomic boundary.
     checkCancelled(signal);
+    const conflictRoot = resolve(stageParent, "host-import-conflicts", randomUUID());
     const result = toStage.length ? await mergeIncomingProfileTree(stage, { kind: "identity", cfg, identityName: "host-import" }, {
       home,
-      conflictRoot: resolve(stageParent, "host-import-conflicts", randomUUID()),
+      conflictRoot,
       purgeRetired: async () => ({ removed: [], failures: [], warnings: [] }),
-    }) : { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [] };
+    }) : { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [] };
     const stageReal = await realpath(stage);
     const stageRel = relative(rootReal, stageReal);
     if (stageRel.startsWith(`..${sep}`) || isAbsolute(stageRel)) throw new Error("host import staging escaped its home");
     const applied = directlyApplied + result.mergedJsonlFiles + result.copiedFiles;
     conflicts.push(...result.preservedConflictPaths);
+    // The staging copy is deleted below, so a log still open in a native tool
+    // must be kept durably rather than left for a later sync to retry.
+    for (const rel of result.busyPaths) {
+      checkCancelled(signal);
+      const kept = resolve(conflictRoot, "incoming", ...rel.split("/"));
+      await mkdir(dirname(kept), { recursive: true, mode: 0o700 });
+      await writeFile(kept, bundle.files.get(rel)!, { mode: 0o600 });
+      conflicts.push(rel);
+    }
     return { applied, skipped: new Set(conflicts).size, conflicts: [...new Set(conflicts)] };
   } finally { await rm(stage, { recursive: true, force: true }); }
 }
