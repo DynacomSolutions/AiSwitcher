@@ -34,9 +34,9 @@ function confirmedOffline(error: unknown, interfaces: typeof networkInterfaces):
   const values = [error as { code?: unknown }, (error as { cause?: { code?: unknown } }).cause];
   const codes = values.flatMap((value) => typeof value?.code === "string" ? [value.code] : []);
   if (codes.some((code) => ["ENETUNREACH", "EHOSTUNREACH", "ENETDOWN"].includes(code))) return true;
-  // Bun can report DNS failure as ConnectionRefused on a guest without a NIC.
-  // A refusal alone is not offline evidence, and TLS errors must stay unsafe.
-  if (!codes.some((code) => ["ConnectionRefused", "ECONNREFUSED", "DNSLookupFailed", "ENOTFOUND", "EAI_AGAIN"].includes(code))) return false;
+  // A TLS failure means something answered, possibly a local proxy, so it never proves offline.
+  if (codes.some((code) => /CERT|TLS|SSL/i.test(code))) return false;
+  // Otherwise, with no non-loopback interface no fetch can reach a server, whatever code Bun reports.
   try {
     return Object.values(interfaces()).every((addresses) => !addresses?.some((address) => !address.internal));
   } catch { return false; }

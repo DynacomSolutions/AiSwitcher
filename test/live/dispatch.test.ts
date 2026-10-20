@@ -93,7 +93,7 @@ describe("live stdin contract", () => {
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
-  test("requires offline interface evidence for refusals and DNS errors and keeps TLS errors unsafe", async () => {
+  test("treats any non-TLS failure as offline only without a non-loopback interface", async () => {
     const home = await mkdtemp(join(tmpdir(), "ais-live-clock-network-"));
     try {
       const buildTimeFile = join(home, "build-time");
@@ -105,12 +105,12 @@ describe("live stdin contract", () => {
         buildTimeFile, synchronizedProbe: async () => false, networkInterfaces,
         fetchImpl: async () => { throw Object.assign(new Error("probe failed"), { code }); },
       });
-      for (const code of ["ConnectionRefused", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "DNSLookupFailed"]) {
+      for (const code of ["ConnectionRefused", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "DNSLookupFailed", "UNKNOWN", "TimeoutError"]) {
         expect((await snapshot(code)).online).toBe(false);
         expect((await snapshot(code, () => interfaces(false))).online).toBe(true);
         expect((await snapshot(code, () => { throw new Error("interface query failed"); })).online).toBe(true);
       }
-      for (const code of ["CERT_HAS_EXPIRED", "ERR_TLS_CERT_ALTNAME_INVALID", "UNKNOWN"]) {
+      for (const code of ["CERT_HAS_EXPIRED", "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_SSL_WRONG_VERSION_NUMBER"]) {
         expect((await snapshot(code)).online).toBe(true);
       }
     } finally { await rm(home, { recursive: true, force: true }); }
