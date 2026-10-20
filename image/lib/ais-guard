@@ -30,7 +30,9 @@ def main():
   if r.get('approved') and r.get('reason')=='local' and op=='disk':
    # The daemon found no device operand: run the real binary here, as the calling user.
    s.close(); os.execv('/usr/bin/'+os.path.basename(name),[os.path.basename(name),*args])
-  return int(r.get('exit_code',126)) if r.get('approved') else 126
+  if not r.get('approved'):
+   print('ais-guard: refused: '+str(r.get('reason','unknown'))[:200],file=sys.stderr); return 126
+  return int(r.get('exit_code',126))
  except Exception:return 126
  finally:s.close()
 if __name__=='__main__':sys.exit(main())
