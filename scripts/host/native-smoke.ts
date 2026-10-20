@@ -1,18 +1,15 @@
-import { accessSync, constants, readdirSync, statSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { accessSync, constants, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 export function selectPackagedExecutable(appPath: string, platform = process.platform): string {
   const selected = resolve(appPath);
   const stat = statSync(selected);
   if (stat.isDirectory() && platform === "darwin" && selected.endsWith(".app")) {
     const executableDir = join(selected, "Contents", "MacOS");
-    const candidates = readdirSync(executableDir).map((name) => join(executableDir, name)).filter((candidate) => {
-      try { return statSync(candidate).isFile() && (statSync(candidate).mode & 0o111) !== 0; }
-      catch { return false; }
-    });
-    if (candidates.length !== 1) throw new Error("The app bundle must contain exactly one executable in Contents/MacOS.");
-    accessSync(candidates[0], constants.X_OK);
-    return candidates[0];
+    const executable = join(executableDir, "ais-host-app");
+    if (!statSync(executable).isFile()) throw new Error("The app bundle has no host executable.");
+    accessSync(executable, constants.X_OK);
+    return executable;
   }
   if (!stat.isFile()) throw new Error("HOST_APP_PATH must name a packaged executable or a macOS app bundle.");
   if (platform !== "win32") accessSync(selected, constants.X_OK);
@@ -41,7 +38,7 @@ if (import.meta.main) {
   if (!appPath) throw new Error("Set HOST_APP_PATH or pass --app=<packaged executable or macOS app bundle>.");
   const executable = selectPackagedExecutable(appPath);
   const child = Bun.spawn([executable, "--native-smoke"], {
-    cwd: process.cwd(),
+    cwd: dirname(executable),
     stdout: "pipe",
     stderr: "pipe",
     env: process.env,

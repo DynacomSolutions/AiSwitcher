@@ -213,3 +213,61 @@ identity mismatches, reject oversized or incompatible releases and verify all
 six boot entries. The create/update orchestration smoke uses the actual helper
 writer with synthetic releases. Guest snapshot ordering, package restoration
 and native mount or device execution require separate validation.
+
+## Portable release verification
+
+Host packages target macOS arm64, Windows x86_64 and Linux x86_64 only.
+They always prepare x86_64 live drives with Secure Boot disabled.
+Intel macOS is not a release target. Minimum OS versions remain unverified;
+the macOS bundle deployment setting alone is not tested platform support.
+Record actual OS versions and outcomes when native acceptance runs.
+
+Use `.github/workflows/host-app.yml` for dependency-selected PR checks and
+full checks on `main`. The host release workflow calls that same workflow
+for the exact tagged commit with production trust-key checks enabled.
+Public builds run natively on GitHub-hosted runners only.
+
+Each package contains `ais-host-app`, the matching `ais-host-adapter`,
+`ais-host-helper`, `ais-host-escrow-purge`, `release-key.pub`, build metadata,
+the project licence and dependency notices. Windows executables have the
+`.exe` suffix and metadata explicitly records unsigned status. Packaging
+never enables `file-test` or includes the file checker or bundle bridge.
+The app locates its local adapter beside its own executable. Linux elevation
+continues to require the root-owned installed helper, policy and digest pin;
+the packaged copy is not an elevation target.
+
+Run the portable checks before release:
+
+```sh
+bun test test/host
+bun run typecheck
+bun run lint
+bun run scripts/host/check-workflows.ts
+cargo fmt --manifest-path apps/host/Cargo.toml --all -- --check
+cargo test --manifest-path apps/host/Cargo.toml --locked --workspace
+cargo clippy --manifest-path apps/host/Cargo.toml --locked --workspace --all-targets -- -D warnings
+```
+
+Run the frontend typecheck, build and browser smoke from `apps/host`.
+The workflow sets isolated build directories, installs pinned tools, then
+runs `scripts/host/build-release.ts`. Production builds require
+`--production` and the reviewed image trust key. Missing macOS credentials
+permit unsigned development checks but prevent release creation.
+
+`scripts/host/release-assets.ts --checksums --dir=<assets>` creates
+`SHA256SUMS` only after signing and stapling. `--verify --dir=<assets>`
+checks every distributed asset and rejects missing, changed or unlisted bytes.
+Use `--smoke --production --target=<target> --asset=<archive>
+--destination=<fresh-directory>` for package inspection and native launch.
+The smoke extracts the AppImage without FUSE, makes the payload read-only,
+and verifies that launching does not alter the package. macOS additionally
+requires successful `codesign --verify --deep --strict --verbose=2`,
+`spctl --assess --type execute --verbose=2` and `xcrun stapler validate`.
+
+Development shell and file-image tests do not establish native USB access,
+elevation, credential-store expiry, first boot or recovery. No native
+packaged-app, signing or notarisation result is recorded yet. The image trust
+key and native privilege integration are release prerequisites. Retention is
+session-only; the packaged cleanup utility is not registered automatically.
+Do not mark the existing creation, management, update or release board rows
+complete until their corresponding native and interoperability evidence exists.

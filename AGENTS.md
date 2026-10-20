@@ -74,7 +74,9 @@ sync), `src/server/` (local console API for `ais web`; thin wrappers over the
 existing engines; contract in `docs/API.md`), `src/cli/` (the `ais` CLI; no
 identity-resolution logic of its own), one entrypoint per tool at `src/<tool>.ts`
 (`src/open.ts` darwin only, `src/ais.ts`), `scripts/` (build, install, backup,
-migrate), `apps/web` (Vite/React), `apps/tui` (Rust ratatui), `test/`.
+migrate), `apps/web` (Vite/React), `apps/tui` (Rust ratatui),
+`apps/host` (Tauri/Rust and React), `scripts/host` (native packaging and checks),
+`test/`.
 Import direction: `shared/run-wrapper.ts` imports `identities/*`, never the
 reverse; `cli/*` depends on `identities/*`, never the reverse, and adds no
 resolution logic of its own. Full per-file map: `docs/agents/module-map.md`.
@@ -195,6 +197,8 @@ then run the real command once. Full recipe: `docs/agents/adding-a-tool.md`.
 - `src/cli/usage/**`: usage-tokscale.md, provider-first.md, crush-tools.md, bedrock-spend.md
 - `src/cli/limits/**`: provider-first.md, bedrock-spend.md, crush-tools.md
 - `src/server/**`: console-web.md
+- `apps/host/**`, `src/host/**`, `scripts/host/**`, `test/host/**`: host-app.md
+- `.github/workflows/host-app.yml`, `.github/workflows/release-host-app.yml`: host-app.md, release.md
 - `src/spend/**`: bedrock-spend.md
 - `src/identities/*auth*`, `src/identities/oauth-*`: provider-first.md, pi.md
 - `src/identities/claude-swap*`, `src/identities/pool/**`, `src/cli/claude-swap/**`, `src/cli/swap/**`: claude-swap-pools.md
@@ -230,5 +234,6 @@ then run the real command once. Full recipe: `docs/agents/adding-a-tool.md`.
 - Claude swap pools: `docs/agents/claude-swap-pools.md`
 - Release pipeline, aistui release assets and self-heal: `docs/agents/release.md`
 - Live image release workflow and signed assets: `docs/agents/live-image.md`, `docs/agents/release.md`
+- Portable host app, packaging and native acceptance: `docs/agents/host-app.md`
 - `ais tui` status page, herdr bridge, `ais herdr`: `docs/agents/tui-herdr.md`
 - History, retired designs, duplicated sections (zai takes 1-2): `docs/agents/history.md`

@@ -1080,7 +1080,22 @@ async fn start_write(preview_id: String, app: tauri::AppHandle) -> Result<(), St
         let escrow = app
             .try_state::<escrow_commands::EscrowCommandState>()
             .ok_or("The local drive registry is unavailable.")?;
-        let mut adapter = ais_host_core::local_adapter::LocalHostAdapter::default();
+        let executable = std::env::current_exe()
+            .map_err(|_| "The bundled host adapter could not be located.")?;
+        let adapter_path = executable
+            .parent()
+            .ok_or("The application directory is unavailable.")?
+            .join(if cfg!(target_os = "windows") {
+                "ais-host-adapter.exe"
+            } else {
+                "ais-host-adapter"
+            });
+        if !adapter_path.is_file() {
+            return Err("The bundled host adapter is missing.".to_string());
+        }
+        let mut adapter = ais_host_core::local_adapter::LocalHostAdapter::with_program(
+            adapter_path.to_string_lossy(),
+        );
         state.begin_write(
             &preview_id,
             Instant::now(),

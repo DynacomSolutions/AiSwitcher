@@ -10,6 +10,73 @@ runs real GLM models (see "ZAI" below), `ali` pointed at Alibaba Cloud Model
 Studio's Token plan (see "ALI" below), each kept in its own separate
 `~/.zai` / `~/.ali` set of profiles.
 
+## Portable host app
+
+ais Host provides a desktop interface for preparing encrypted live USB drives
+from local or configured SSH sources. It reviews the selected USB drive,
+verifies image signatures, prepares an encrypted configuration bundle and
+offers an optional local model. The host app never opens the encrypted
+filesystem on the drive.
+
+| Host platform | Portable package | Requirements |
+| --- | --- | --- |
+| macOS arm64 | Application ZIP | Developer ID signing, notarisation and stapling are required for release |
+| Windows x86_64 | Portable ZIP | WebView2; Windows signing is deferred, so the archive is unsigned |
+| Linux x86_64 | AppImage | Compatible WebKitGTK; use `--appimage-extract` and `squashfs-root/AppRun` without FUSE |
+
+Intel macOS packages are not provided. The live USB target is x86_64 on every
+host platform, and Secure Boot must be disabled. Native USB and privilege
+acceptance checks are pending; development packages are not ready for creating
+production drives. macOS and Windows device writing, retained passphrases,
+refresh, removal and image-update integration remain pending. Release drafts
+stay unpublished until the platform acceptance checks pass. Minimum supported
+OS versions have not yet been established by native testing.
+
+Download only the matching `host-v*` release assets and verify their
+`SHA256SUMS` before opening the app. An unsigned Windows build may trigger
+SmartScreen or an unknown-publisher warning; no Windows signing service is
+required. AppImage extraction supports read-only application files, with state
+in the user's application-data directory.
+
+The app requests access to the selected configuration source and removable
+drive. Configured SSH sources use existing SSH authentication and strict host
+verification. A destructive operation requires the exact typed device
+identifier, then an administrator authorisation prompt for a restricted disk
+helper. The Linux helper also needs a separately authorised installation;
+the app never elevates a helper from a writable AppImage extraction directory.
+Optional passphrase retention would request the operating system's credential
+store. These permissions do not grant access to the drive's encrypted files.
+
+Choose a passphrase of at least 12 characters and enter it twice. The drive's
+first boot uses that same passphrase to create encrypted persistent storage.
+Accept the displayed model licence before downloading optional weights.
+Encrypted outbox bundles normally appear every 15 minutes and at shutdown:
+logs can be stale after an unclean unplug, and a truncated bundle omits older
+logs. Writing an inbox does not prove the drive has applied it.
+
+Passphrases currently remain session-only. The package includes an escrow
+cleanup utility, but it is not automatically installed as a background
+component. Retention must remain disabled until registration, disclosure and
+removal of that per-user cleanup component work on the platform. An expiry
+deadline cannot guarantee execution while the computer is asleep or offline;
+overdue retained secrets must be rejected and removed when it resumes.
+Closing the window alone cannot enforce expiry.
+
+When removal becomes available, each choice must remain independent: erase
+encrypted drive storage, remove exchanged bundles, revoke provider access,
+or forget the local drive record and retained passphrase. Provider revocation
+requires connectivity and may also invalidate a shared login elsewhere.
+Deleting local files is not provider revocation. A lost passphrase cannot be
+recovered; a confirmed reset destroys the encrypted storage metadata and the
+next boot creates fresh storage.
+
+Image updates must preserve exchange and encrypted storage, keep a recovery
+snapshot and reinstall recorded packages at first boot. Offline or failed
+package restoration must preserve the snapshot and package list for retry.
+UI and file-image tests alone do not establish native USB, credential-store
+or recovery support. See [host operating and verification guidance](docs/agents/host-app.md)
+for the evidence required before these features can be released.
+
 ## Why
 
 If you use Claude Code, Codex, Grok, Kimi Code, Pi, or Crush pointed at Z.ai's

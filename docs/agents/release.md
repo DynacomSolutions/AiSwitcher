@@ -1,6 +1,60 @@
 # Release assets and aistui self-heal
 
-_Moved unchanged from the former monolithic AGENTS.md (original line numbers: 3289-3315). Read before touching this area._
+Read before touching either release pipeline.
+
+## Portable host releases
+
+`host-app.yml` uses GitHub-hosted `macos-latest` arm64, `windows-latest`
+x86_64 and `ubuntu-latest` x86_64 runners. It uses no schedules, containers
+or legacy cross-build jobs. PR selection follows `scripts/host/affected.ts`;
+shared inputs, unknown changes, default-branch pushes and release calls run
+the full suite. The always-running `gate` accepts intentional skips only
+when selection is `skip`; failed, cancelled or unexpectedly skipped jobs fail.
+
+`release-host-app.yml` runs on `host-v*` tags or manual dispatch with an
+existing tag. The tag must equal `host-v` plus the host package version,
+resolve to the exact workflow commit, and belong to `main` history. Full
+production checks run again at that SHA. Bun, the native Tauri CLI and Cargo
+inputs are pinned; builds use the lockfiles and the host Rust toolchain.
+The image trust key is `image/release/minisign.pub`.
+Unsigned development builds may use the explicit development placeholder;
+production packages reject it.
+
+Default permissions are `contents: read`. Only the draft-release creation
+job receives `contents: write`. PR checks never receive signing secrets.
+The signing job reads only these repository secret names:
+
+- `DYNACOM_APPLE_DEVELOPER_ID_P12_BASE64`
+- `DYNACOM_APPLE_DEVELOPER_ID_P12_PASSWORD`
+- `DYNACOM_APPLE_ASC_KEY_P8_BASE64`
+- `DYNACOM_APPLE_ASC_KEY_ID`
+- `DYNACOM_APPLE_ASC_ISSUER_ID`
+
+Missing credentials emit a notice, skip signing cleanly and prevent release
+creation. An isolated temporary keychain holds the Developer ID certificate.
+Passwords reach `security` through standard input; the notary account IDs
+reach its credential prompt through a private terminal. Tool output containing
+certificate or account details is suppressed. No credential value goes in
+command arguments or release metadata.
+
+Nested executables are signed before the application, with hardened runtime.
+Only the Bun adapter needs the documented JIT entitlement. Notarisation must
+return `Accepted`, then stapling, signature validation and Gatekeeper
+assessment must pass. The final ZIP is created after stapling.
+
+Assets are the macOS arm64 application ZIP, unsigned Windows x86_64 portable
+ZIP, Linux x86_64 AppImage, per-platform dependency notices and `SHA256SUMS`.
+Checksums cover the final signed and stapled bytes. Windows signing remains
+deferred and WebView2 is required. The Linux privileged helper installation
+is separate from its portable package.
+
+The workflow creates a draft prerelease and downloads it afresh on all three
+native runners to verify hashes, package contents and launch. Linux tests the
+extracted read-only payload without FUSE; all targets use a fresh path with
+spaces and non-ASCII characters. Keep the draft unpublished until those checks
+and the real privilege/USB acceptance evidence in `host-app.md` pass.
+
+## CLI release history
 
 ### Live image releases
 
@@ -24,10 +78,11 @@ partitioning, but does not define release asset names.
 
 - release.yml builds the Rust TUI alongside the bun binaries:
   `aistui-darwin-arm64`/`aistui-darwin-x64` (aarch64-apple-darwin and
-  x86_64-apple-darwin, natively on the org's `apple-builder` macOS runners),
+  x86_64-apple-darwin, requiring appropriate GitHub-hosted macOS runners),
   `aistui-linux-x64` (x86_64-unknown-linux-gnu on ubuntu) and
   `aistui-linux-arm64` (aarch64-unknown-linux-gnu via `cross`, the pinned
-  Docker toolchain being the least fragile CI path for that target). Same
+  container toolchain from the historical CLI pipeline). This is historical
+  context, not an allowed host-app build path. Same
   `<tool>-<platform>` asset convention the installer downloads by.
 - The installer binary fetches `aistui-<platform>` during fresh installs. It
   is the one tolerated failure: releases older than aistui have no such

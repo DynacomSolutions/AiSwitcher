@@ -1,0 +1,185 @@
+name: Release host app
+
+on:
+  push:
+    tags: ["host-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing host-v tag at the selected workflow commit on main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - id: tag
+        env:
+          HOST_TAG: ${{ inputs.tag || github.ref_name }}
+        run: bun run scripts/host/validate-tag.ts
+
+  checks:
+    needs: validate
+    uses: ./.github/workflows/host-app.yml
+    with:
+      production: true
+      ref: ${{ needs.validate.outputs.sha }}
+
+  sign:
+    needs: [validate, checks]
+    runs-on: macos-latest
+    timeout-minutes: 40
+    outputs:
+      ready: ${{ steps.sign.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Set isolated signing directory
+        run: echo "HOST_SIGN_DIR=$RUNNER_TEMP/host-sign" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-unsigned-macos-arm64
+          path: ${{ runner.temp }}/host-unsigned
+      - name: Sign, notarise and staple when credentials are available
+        id: sign
+        env:
+          HOST_UNSIGNED_ARCHIVE: ${{ runner.temp }}/host-unsigned/ais-host-macos-arm64.zip
+          DYNACOM_APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.DYNACOM_APPLE_DEVELOPER_ID_P12_BASE64 }}
+          DYNACOM_APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DYNACOM_APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          DYNACOM_APPLE_ASC_KEY_P8_BASE64: ${{ secrets.DYNACOM_APPLE_ASC_KEY_P8_BASE64 }}
+          DYNACOM_APPLE_ASC_KEY_ID: ${{ secrets.DYNACOM_APPLE_ASC_KEY_ID }}
+          DYNACOM_APPLE_ASC_ISSUER_ID: ${{ secrets.DYNACOM_APPLE_ASC_ISSUER_ID }}
+        run: python3 scripts/host/sign-macos.py
+      - name: Verify the final archived Mac application
+        if: steps.sign.outputs.ready == 'true'
+        run: >
+          bun run scripts/host/release-assets.ts --smoke --production
+          --target=macos-arm64
+          "--asset=$HOST_SIGN_DIR/signed/ais-host-macos-arm64.zip"
+          "--destination=$HOST_SIGN_DIR/clean signed launch é"
+      - uses: actions/upload-artifact@v4
+        if: steps.sign.outputs.ready == 'true'
+        with:
+          name: host-signed-macos-arm64
+          path: ${{ runner.temp }}/host-sign/signed/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [validate, checks, sign]
+    if: ${{ needs.sign.outputs.ready == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOST_TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Set isolated release directory
+        run: echo "HOST_RELEASE_DIR=$RUNNER_TEMP/release" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-signed-macos-arm64
+          path: ${{ runner.temp }}/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-unsigned-windows-x64
+          path: ${{ runner.temp }}/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-unsigned-linux-x64
+          path: ${{ runner.temp }}/release
+      - name: Hash final bytes and create a draft prerelease
+        run: |
+          bun run scripts/host/release-assets.ts --checksums
+          bun run scripts/host/release-assets.ts --verify
+          gh release create "$HOST_TAG" "$HOST_RELEASE_DIR"/* --verify-tag --draft --prerelease \
+            --title "ais Host $HOST_TAG" --notes-file apps/host/packaging/release-notes.md
+
+  verify-download:
+    needs: [validate, release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+            filename: ais-host-macos-arm64.zip
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-x64
+            filename: ais-host-windows-x64.zip
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x64
+            filename: ais-host-linux-x64.AppImage
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOST_TAG: ${{ needs.validate.outputs.tag }}
+      ASSET_TARGET: ${{ matrix.asset }}
+      ASSET_FILENAME: ${{ matrix.filename }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Set isolated download directory
+        run: echo "HOST_RELEASE_DIR=$RUNNER_TEMP/download" >> "$GITHUB_ENV"
+      - name: Linux display and webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libwebkit2gtk-4.1-0
+      - name: Download afresh and verify distributed bytes
+        run: |
+          gh release download "$HOST_TAG" --dir "$HOST_RELEASE_DIR"
+          bun run scripts/host/release-assets.ts --verify
+          args=(--smoke --production "--target=$ASSET_TARGET"
+                "--asset=$HOST_RELEASE_DIR/$ASSET_FILENAME"
+                "--destination=$RUNNER_TEMP/downloaded launch é")
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a bun run scripts/host/release-assets.ts "${args[@]}"
+          else
+            bun run scripts/host/release-assets.ts "${args[@]}"
+          fi
