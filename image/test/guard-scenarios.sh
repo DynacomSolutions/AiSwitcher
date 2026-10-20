@@ -33,16 +33,18 @@ wait_for_popup_text() {
   local socket_path=$1 deadline=$((SECONDS + WAIT_BUDGET)) snapshot pane_ids pane_id
   while (( SECONDS < deadline )); do
     snapshot=$(runuser -u live -- env HERDR_SOCKET_PATH="$socket_path" herdr api snapshot 2>/dev/null) || { sleep 0.1; continue; }
+    # herdr 0.9.3 snapshots carry no plugin pane title, so find the popup by its own banner.
     pane_ids=$(python3 -B -c 'import json,sys; d=json.load(sys.stdin); todo=[d]; out=[]
 while todo:
  x=todo.pop()
  if isinstance(x,dict):
-  if isinstance(x.get("pane_id"),str) and any("confirm disk operation" in str(x.get(k," ")).lower() for k in ("title","label")): out.append(x["pane_id"])
+  if isinstance(x.get("pane_id"),str): out.append(x["pane_id"])
   todo.extend(x.values())
  elif isinstance(x,list): todo.extend(x)
 print(chr(10).join(dict.fromkeys(out)))' <<<"$snapshot") || return 1
     while IFS= read -r pane_id; do
       [[ -n $pane_id ]] || continue
+      runuser -u live -- env HERDR_SOCKET_PATH="$socket_path" herdr pane read --source recent --lines 80 --format text "$pane_id" 2>/dev/null | grep -Fq 'AIS DISK APPROVAL' || continue
       if runuser -u live -- env HERDR_SOCKET_PATH="$socket_path" herdr pane wait-output --match 'Type exactly:' --source recent --timeout 900 "$pane_id" >/dev/null 2>&1; then
         GUARD_POPUP_PANE=$pane_id
         return 0
@@ -97,16 +99,17 @@ start_guarded() {
       done < <(find "$REQUESTS" -maxdepth 1 -type f -name '*.json' -print)
     fi
     if [[ -n $request ]]; then
-      if ! wait_for_popup_text "${GUARD_HERDR_SOCKET:?}"; then return 1; fi
-      if ! read_popup_reply "${GUARD_HERDR_SOCKET:?}" "$GUARD_POPUP_PANE"; then return 1; fi
+      if ! wait_for_popup_text "${GUARD_HERDR_SOCKET:?}"; then mark "$case_name" popup-pane-not-found; return 1; fi
+      if ! read_popup_reply "${GUARD_HERDR_SOCKET:?}" "$GUARD_POPUP_PANE"; then mark "$case_name" popup-reply-unreadable; return 1; fi
       GUARDED_REQUEST=$request
       mark "$case_name" popup
       printf 'AIS-GUARD-TEST: case=%s status=prompt reply=%s\n' "$case_name" "$GUARD_POPUP_REPLY"
       return 0
     fi
-    if ! kill -0 "$GUARDED_PID" 2>/dev/null; then wait "$GUARDED_PID" || return 2; return 2; fi
+    if ! kill -0 "$GUARDED_PID" 2>/dev/null; then mark "$case_name" exited-before-request; wait "$GUARDED_PID" || return 2; return 2; fi
     sleep 0.1
   done
+  mark "$case_name" no-request
   return 1
 }
 
