@@ -49,7 +49,7 @@ proc fail {reason} {
 }
 if {$phase eq "ambiguous"} {
     expect {
-        -re {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=(latest|clean)} {
+        -re {AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=(latest|clean)} {
             set actualMode $expect_out(1,string)
             if {$actualMode ne $requestedMode} { fail "wrong ambiguity refusal mode: $actualMode" }
             puts "persist-test: phase=ambiguous mode=$actualMode refusal verified"

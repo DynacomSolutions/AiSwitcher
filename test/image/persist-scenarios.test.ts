@@ -227,32 +227,32 @@ flush stdout
       stdout: "pipe", stderr: "pipe",
     });
 
-    writeFileSync(serial, "AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest\r\n");
+    writeFileSync(serial, "AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=latest\r\n");
     expect(check().exitCode).toBe(0);
 
     writeFileSync(serial, "boot completed without an ambiguity decision\n");
     expect(check().exitCode).not.toBe(0);
-    writeFileSync(serial, "AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=clean\n");
+    writeFileSync(serial, "AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=clean\n");
     expect(check().exitCode).not.toBe(0);
     writeFileSync(serial, "AIS-LIVE: stage=persist status=ok mode=latest\n");
     expect(check().exitCode).not.toBe(0);
     writeFileSync(serial, "AIS-LIVE: stage=first-boot-create status=ok\n");
     expect(check().exitCode).not.toBe(0);
-    writeFileSync(serial, "AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest\n");
+    writeFileSync(serial, "AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=latest\n");
     writeFileSync(clone, "SYNTHETIC_FIXTURE_modified_disk");
     expect(check().exitCode).not.toBe(0);
   });
 
   test.skipIf(!expectAvailable || !Bun.which("tclsh"))("Expect accepts only an ambiguity refusal for the requested mode", () => {
       const accepted = fakeQemu(`${fakePoweroff}
-puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest}
+puts {AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=latest}
 flush stdout
 exec sleep 30
 `, "ambiguous");
       expect(accepted.exitCode).toBe(0);
 
       const acceptedClean = fakeQemu(`${fakePoweroff}
-puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=clean}
+puts {AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=clean}
 flush stdout
 exec sleep 30
 `, "ambiguous", "clean");
@@ -261,7 +261,7 @@ exec sleep 30
       for (const output of [
         "puts {AIS-LIVE: stage=persist status=ok mode=latest}",
         "puts {AIS-LIVE: stage=first-boot-create status=ok}",
-        "puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=clean}",
+        "puts {AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=clean}",
       ]) {
         const rejected = fakeQemu(`${fakePoweroff}\n${output}\nflush stdout\nexec sleep 30\n`, "ambiguous");
         expect(rejected.exitCode).not.toBe(0);
@@ -277,7 +277,7 @@ exec sleep 30
     const preparedBytes = "SYNTHETIC_FIXTURE_gpt-guid=12345678-1234-4234-8234-123456789abc\nAIS_MENU_ARGS=ais.persist-phase=ambiguous\n";
     writeFileSync(primary, preparedBytes);
     writeFileSync(guest, `${fakePoweroff}
-puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest}
+puts {AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=latest}
 flush stdout
 exec sleep 30
 `);

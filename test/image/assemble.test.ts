@@ -36,14 +36,26 @@ describe.skipIf(!available)("raw GPT assembly", () => {
       const offset = String(table.partitions[index].start * 512);
       expect(run(["blkid", "-p", "-O", offset, "-s", "LABEL", "-o", "value", output]).stdout.toString().trim()).toBe(label);
     }
+    // Inspect the built filesystem, not just the mke2fs arguments: ext4's
+    // feature_compat bit 0x4 would allow journal replay on a read-only mount.
+    const baseFd = openSync(output, "r");
+    try {
+      const superblock = Buffer.alloc(1024);
+      expect(readSync(baseFd, superblock, 0, superblock.length, table.partitions[2].start * 512 + 1024)).toBe(1024);
+      expect(superblock.readUInt16LE(56)).toBe(0xef53);
+      expect(superblock.readUInt32LE(92) & 0x4).toBe(0);
+    } finally { closeSync(baseFd); }
     const fat = `${output}@@${table.partitions[1].start * 512}`;
     for (const file of ["/EFI/BOOT/BOOTX64.EFI", "/syslinux/ldlinux.sys", "/syslinux/ldlinux.c32"]) {
       expect(run(["mdir", "-a", "-i", fat, `::${file}`]).exitCode).toBe(0);
     }
     for (const path of ["boot/grub/grub.cfg", "syslinux/syslinux.cfg"]) {
       const config = run(["mtype", "-i", fat, `::/${path}`]).stdout.toString();
-      expect(config).toContain("archisodevice=/dev/disk/by-label/AISBASE");
-      expect(config.match(/ais\.drive=HOST_APP_REQUIRED/g)).toHaveLength(3);
+      expect(config.match(/archisodevice=\/dev\/disk\/by-partuuid\/HOST_APP_REQUIRED/g)).toHaveLength(3);
+      for (const key of ["base", "exchange", "drive"]) {
+        expect(config.match(new RegExp(`ais\\.${key}=HOST_APP_REQUIRED`, "g"))).toHaveLength(3);
+      }
+      expect(config.match(/\bcopytoram=n\b/g)).toHaveLength(3);
       expect(config).not.toContain("ais.test=");
       expect(config).not.toContain("console=ttyS0");
     }
@@ -95,7 +107,14 @@ describe.skipIf(!available)("raw GPT assembly", () => {
       const lines = menu.stdout.toString().split("\n").filter((line) => /^\s*(linux|APPEND)\s/.test(line));
       expect(lines).toHaveLength(3);
       for (const line of lines) {
+        const base = after.partitions[2].uuid.toLowerCase();
+        const exchange = after.partitions[3].uuid.toLowerCase();
+        expect(line.match(/ais\.base=\S+/g)).toEqual([`ais.base=${base}`]);
+        expect(line.match(/ais\.exchange=\S+/g)).toEqual([`ais.exchange=${exchange}`]);
         expect(line.match(/ais\.drive=\S+/g)).toEqual([`ais.drive=${persist.uuid.toLowerCase()}`]);
+        expect(line.match(/archisodevice=\S+/g)).toEqual([`archisodevice=/dev/disk/by-partuuid/${base}`]);
+        expect(line.match(/\bcopytoram=\S+/g)).toEqual(["copytoram=n"]);
+        expect(line).not.toContain("HOST_APP_REQUIRED");
       }
     }
     expect(run(["sgdisk", "-v", personalised]).stdout.toString()).toContain("No problems found");
@@ -103,7 +122,7 @@ describe.skipIf(!available)("raw GPT assembly", () => {
     expect(run(["bash", "image/test/prepare-persist-drive.sh", output, personalised]).exitCode).not.toBe(0);
   }, 120_000);
 
-  test.skipIf(!Bun.which("expect"))("patches only disposable copies and keeps private OVMF variable stores", () => {
+  test.skipIf(!Bun.which("expect") || !Bun.which("sgdisk"))("patches only disposable copies and keeps private OVMF variable stores", () => {
     const fake = join(scratch, "qemu-fixture");
     writeFileSync(fake, `#!/usr/bin/env tclsh
 puts "AIS-LIVE: stage=kernel-up status=ok"
@@ -130,6 +149,8 @@ exit 0
         const text = run(["mtype", "-i", `${work}/live.img@@2097152`, `::${path}`]).stdout.toString();
         expect(text.match(/console=ttyS0,115200 ais.test=1 ais.smoke=1/g)).toHaveLength(3);
         expect(text).not.toContain("ais.mode=latest");
+        expect(text).not.toContain("HOST_APP_REQUIRED");
+        expect(text.match(/\bcopytoram=n\b/g)).toHaveLength(3);
       }
       if (firmware === "uefi") {
         expect(readFileSync(`${work}/OVMF_VARS.fd`, "utf8")).toBe("SYNTHETIC_FIXTURE");

@@ -14,7 +14,12 @@ case $firmware in bios|uefi) ;; *) die 'firmware must be bios or uefi' ;; esac
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work=$(mktemp -d "${AIS_QEMU_WORK_ROOT:-$(dirname "$image")}/qemu-$firmware.XXXXXX")
 copy=$work/live.img
-cp --reflink=auto --sparse=always -- "$image" "$copy"
+if [[ $(sfdisk --json "$image" | jq -er '.partitiontable.partitions | length') == 4 ]]; then
+    # Smoke boots also need a host-assigned base identity before archiso runs.
+    bash "$here/prepare-persist-drive.sh" "$image" "$copy"
+else
+    cp --reflink=auto --sparse=always -- "$image" "$copy"
+fi
 printf 'qemu-test: work files: %s\n' "$work"
 
 esp_start=$(sfdisk --json "$copy" | jq -er '.partitiontable | select(.label == "gpt" and .sectorsize == 512) | .partitions[1] | select(.name == "AISBOOT" and (.type | ascii_upcase) == "C12A7328-F81F-11D2-BA4B-00A0C93EC93B") | .start')

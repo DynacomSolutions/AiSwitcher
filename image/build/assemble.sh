@@ -97,7 +97,7 @@ syslinux --install --offset "$((esp_start * 512))" --directory /syslinux "$out"
 dd if="$gptmbr" of="$out" bs=440 count=1 conv=notrunc status=none
 
 truncate -s "$((base_sectors * 512))" "$work/base.img"
-mke2fs -q -t ext4 -F -L AISBASE -m 0 -d "$work/base" "$work/base.img"
+mke2fs -q -t ext4 -F -O ^has_journal -L AISBASE -m 0 -d "$work/base" "$work/base.img"
 dd if="$work/base.img" of="$out" bs=512 seek="$base_start" conv=notrunc,sparse status=none
 truncate -s "$((exchange_sectors * 512))" "$work/exchange.img"
 mkfs.exfat -L AISX "$work/exchange.img"

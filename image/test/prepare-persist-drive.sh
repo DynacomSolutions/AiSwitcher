@@ -14,6 +14,8 @@ cp --sparse=always -- "$source_image" "$target"
 truncate -s 4G "$target"
 sgdisk -e -n 5:0:0 -t 5:8309 -c 5:AISPERSIST -G "$target" >/dev/null
 table=$(sfdisk --json "$target")
+base=$(jq -er '.partitiontable.partitions[2].uuid | ascii_downcase' <<<"$table")
+exchange=$(jq -er '.partitiontable.partitions[3].uuid | ascii_downcase' <<<"$table")
 drive=$(jq -er '.partitiontable.partitions[4].uuid | ascii_downcase' <<<"$table")
 start=$(jq -er '.partitiontable.partitions[4].start' <<<"$table")
 size=$(jq -er '.partitiontable.partitions[4].size' <<<"$table")
@@ -27,9 +29,13 @@ for config in syslinux/syslinux.cfg boot/grub/grub.cfg; do
     original=$target.${config//\//-}.original
     patched=$target.${config//\//-}.patched
     mcopy -i "$fat" "::$config" "$original"
-    awk -v drive="$drive" '
+    awk -v base="$base" -v exchange="$exchange" -v drive="$drive" '
         /^[[:space:]]*(APPEND|linux)[[:space:]]/ {
+            if (gsub(/archisodevice=\/dev\/disk\/by-partuuid\/HOST_APP_REQUIRED/, "archisodevice=/dev/disk/by-partuuid/" base) != 1) exit 1
+            if (gsub(/ais[.]base=HOST_APP_REQUIRED/, "ais.base=" base) != 1) exit 1
+            if (gsub(/ais[.]exchange=HOST_APP_REQUIRED/, "ais.exchange=" exchange) != 1) exit 1
             if (gsub(/ais[.]drive=HOST_APP_REQUIRED/, "ais.drive=" drive) != 1) exit 1
+            if ($0 !~ /(^|[[:space:]])copytoram=n([[:space:]]|$)/) exit 1
             count++
         }
         {print}
@@ -37,4 +43,4 @@ for config in syslinux/syslinux.cfg boot/grub/grub.cfg; do
     ' "$original" >"$patched"
     mcopy -o -i "$fat" "$patched" "::$config"
 done
-printf 'persist-drive: prepared ais.drive=%s\n' "$drive"
+printf 'persist-drive: prepared ais.base=%s ais.exchange=%s ais.drive=%s\n' "$base" "$exchange" "$drive"

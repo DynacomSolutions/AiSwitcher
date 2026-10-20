@@ -11,6 +11,7 @@ build() {
     add_binary mkfs.btrfs
     add_binary findmnt
     add_binary blkid
+    add_binary blockdev
     add_binary stat
     add_binary dirname
     add_binary grep
@@ -53,6 +54,6 @@ build() {
 
 help() {
     cat <<'HELP'
-Verify the boot disk and prepare encrypted AIS persistence in the late hook before the initramfs mounts its overlay; the host app must create partition 5 and set ais.drive before boot.
+Validate ais.base and archiso parameters before any disk mount, then prepare encrypted AIS persistence in the late hook. The host app must create partition 5 and set ais.base, ais.exchange and ais.drive before boot.
 HELP
 }

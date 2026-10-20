@@ -10,7 +10,7 @@ for secret in SYNTHETIC_FIXTURE_ais_live_persist_passphrase SYNTHETIC_FIXTURE_ai
 done
 if [[ $# == 6 ]]; then
     [[ $2 == --ambiguity && ( $3 == latest || $3 == clean ) ]] || { printf 'persist-serial: invalid ambiguity assertion\n' >&2; exit 2; }
-    marker="AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=$3"
+    marker="AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=$3"
     tr -d '\r' <"$1" | grep -Fqx -- "$marker" || { printf 'persist-serial: expected ambiguity refusal marker is missing\n' >&2; exit 1; }
     if tr -d '\r' <"$1" | grep -Eq 'AIS-LIVE: stage=persist status=ok|AIS-LIVE: stage=first-boot-create status=ok'; then
         printf 'persist-serial: ambiguous boot continued into persistence setup\n' >&2

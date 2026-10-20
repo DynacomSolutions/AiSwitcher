@@ -1,8 +1,11 @@
 # Host app drive identity contract
 
-The released image is a template with GPT partitions 1 to 4. Every boot menu
-entry ships `ais.drive=HOST_APP_REQUIRED`. Writing it with another tool boots
-with temporary persistence in RAM and a message to use the AIS host app.
+The released image is a template with GPT partitions 1 to 4. Every kernel menu
+entry ships `ais.base=HOST_APP_REQUIRED`, `ais.exchange=HOST_APP_REQUIRED` and
+`ais.drive=HOST_APP_REQUIRED`, plus
+`archisodevice=/dev/disk/by-partuuid/HOST_APP_REQUIRED` and `copytoram=n`.
+An unpersonalised template stops with an emergency message before archiso
+mounts any disk. The labels AISBASE and AISX are descriptive only.
 
 Sub-project C must finish these steps on the destination drive before boot:
 
@@ -15,25 +18,67 @@ Sub-project C must finish these steps on the destination drive before boot:
 3. Zero partition 5, including at least its first 16 MiB. Do not create a LUKS
    header or filesystem. Old destination contents must not survive as an
    apparently empty persistence area.
-4. On the ESP, replace the placeholder in every kernel entry in
-   `boot/grub/grub.cfg` and `syslinux/syslinux.cfg` with
-   `ais.drive=<partition-5-PARTUUID>`, in canonical lower-case UUID form.
-   Each kernel command line must contain exactly one `ais.drive` argument,
-   including latest, pick and clean modes. Read back the GPT and both menus
-   and verify they agree before reporting success.
+4. Mount partition 2, the FAT ESP, and patch **all three** kernel command lines
+   in each of these files, including latest, pick and clean modes:
 
-The initramfs never repairs or writes GPT metadata. It accepts the named
-partition only when its PARTUUID is unique among attached partitions, it is
-partition 5, and its parent disk also contains the mounted base partition 3.
-Missing, placeholder, invalid, ambiguous or mismatched identity uses tmpfs.
-There is no label, ESP UUID or whole-disk fallback.
+   | ESP file | Lines to patch |
+   | --- | --- |
+   | `/boot/grub/grub.cfg` | Each `linux /arch/boot/x86_64/vmlinuz-linux ...` line inside the `latest`, `pick` and `clean` menu entries |
+   | `/syslinux/syslinux.cfg` | Each `APPEND ...` line under `LABEL latest`, `LABEL pick` and `LABEL clean` |
+
+   Write these exact argument forms, with canonical lower-case, non-zero UUIDs
+   read back from the newly randomised GPT:
+
+   ```text
+   archisobasedir=arch archisodevice=/dev/disk/by-partuuid/<partition-3-PARTUUID> copytoram=n ais.base=<partition-3-PARTUUID> ais.exchange=<partition-4-PARTUUID> ais.drive=<partition-5-PARTUUID>
+   ```
+
+   Replace each placeholder once per line. Keep `copytoram=n`, the existing
+   kernel/initrd paths, `systemd.firstboot=off` and the corresponding `ais.mode`.
+   Do not add quotes, escapes, duplicate arguments or label/search fallbacks.
+   The embedded EFI loader and `INITRD`/`initrd` lines need no identity patch.
+   Flush the ESP, read back both menus and the GPT, and verify that every entry
+   contains exactly one of each required argument and agrees with the GPT
+   before reporting success.
+
+The AIS initramfs hook runs before the archiso hook. It refuses to continue,
+with an emergency message and no disk mount, if `ais.base` is missing,
+placeholder, invalid or ambiguous, or does not identify partition 3. The
+`archisodevice` value must exactly match its PARTUUID path, `archisobasedir`
+must be `arch`, and `copytoram` must be `n`, each appearing exactly once.
+Every `cow_*`, `img_*`, other `archiso*` or `copytoram*` parameter, and
+`dm_snap_prefix`, is refused, including `cow_device`, `cow_label`, `img_dev`,
+`img_loop`, `archisolabel`, search overrides and `copytoram=y` or `auto`.
+AISBASE is built as ext4 without a journal (`-O ^has_journal`) and mounted
+read-only, so base mounting has no journal to replay.
+
+The initramfs never repairs or writes GPT metadata. After the base mounts, it
+accepts persistence only when `ais.drive` is unique among attached partitions,
+identifies partition 5, and belongs to the same disk as the verified base.
+Missing, placeholder, invalid, ambiguous or mismatched persistence identity
+uses tmpfs. There is no label, partition-order or whole-disk fallback.
 
 First boot formats only a partition without a LUKS header whose first 16 MiB
-read entirely as zero. It checks identity again after the passphrase prompt,
-and checks PARTUUID and LUKS state after formatting. Existing LUKS is opened
-without reformatting. Non-zero unrecognised contents are refused. Interrupted
-creation is never repaired by rewriting the partition table or reformatting
-an existing LUKS container.
+read entirely as zero. After the passphrase prompt it resolves the persistence
+symlink once and opens the node on fd 8. It verifies the open descriptor's
+`st_rdev` against the unique sysfs/GPT PARTUUID target, partition number 5,
+base parent disk and disk sequence, plus the size against sysfs. Both the
+LUKS probe and full 16 MiB zero comparison read `/proc/self/fd/8`; formatting
+also uses `/proc/self/fd/8`. It checks identity and LUKS state afterwards.
+Existing LUKS is opened without reformatting. Non-zero unrecognised contents
+are refused. Interrupted creation never rewrites GPT or reformats existing LUKS.
+
+The accepted residual hot-plug window between opening and formatting requires
+a deliberately cloned random 128-bit PARTUUID identity; the format code records
+this decision in a `shortcut:` comment.
+
+Exchange is intentionally writable after a successful persistent boot. The
+runtime resolver accepts only the unique `ais.exchange` PARTUUID identifying
+partition 4 on the same disk as `ais.base`, and mounts it read-write with
+root-only permissions. A missing, placeholder, duplicated, ambiguous or
+mismatched value means no exchange mount. Partition order alone never selects
+exchange, and writable state is confined to the verified persistence and
+exchange partitions.
 
 Clean mode uses temporary storage and leaves persistence and exchange
 unmounted. The runtime exchange service also refuses writable access on

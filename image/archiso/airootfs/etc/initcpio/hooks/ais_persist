@@ -13,10 +13,35 @@ _persist_uuid_valid() {
     printf '%s\n' "$1" | awk -F- 'NF!=5 {exit 1} {for(i=1;i<=5;i++) if($i !~ /^[0-9a-f]+$/) exit 1; if(length($1)!=8 || length($2)!=4 || length($3)!=4 || length($4)!=4 || length($5)!=12) exit 1; if($0=="00000000-0000-0000-0000-000000000000") exit 1}'
 }
 
+_persist_arg() {
+    awk -v key="$1" '{for(i=1;i<=NF;i++) if(index($i,key "=")==1) {n++; value=substr($i,length(key)+2)}} END {if(n!=1) exit 1; print value}' /proc/cmdline
+}
+
+# Runs before archiso can search, mount a base, or choose a writable cow device.
+# The host writes plain, unquoted tokens. Reject alternate parsing and all
+# archiso device overrides, including label/search and loop-image selection.
+_persist_cmdline() {
+    local base
+    base=$(_persist_arg ais.base) && _persist_uuid_valid "$base" || return 1
+    awk -v device="archisodevice=/dev/disk/by-partuuid/$base" '
+        /["\047\\]/ {exit 1}
+        {
+            for(i=1;i<=NF;i++) {
+                split($i, arg, "="); key=arg[1]
+                if(key=="archisodevice") {if($i!=device) exit 1; devices++; continue}
+                if(key=="archisobasedir") {if($i!="archisobasedir=arch") exit 1; bases++; continue}
+                if(key=="copytoram") {if($i!="copytoram=n") exit 1; copies++; continue}
+                if(key ~ /^(cow_|img_|archiso|copytoram)/ || key=="dm_snap_prefix") exit 1
+            }
+        }
+        END {if(devices!=1 || bases!=1 || copies!=1) exit 1}
+    ' /proc/cmdline
+}
+
 _persist_read_drive() {
     local drive
     PERSIST_REASON=invalid-drive
-    drive=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^ais[.]drive=/) {n++; value=substr($i,11)}} END {if(n!=1) exit 1; print value}' /proc/cmdline) || return 1
+    drive=$(_persist_arg ais.drive) || return 1
     if [ "$drive" = HOST_APP_REQUIRED ]; then PERSIST_REASON=host-app-required; return 1; fi
     _persist_uuid_valid "$drive" || return 1
     PERSIST_DRIVE=$drive
@@ -33,6 +58,7 @@ _persist_device_number() {
 # A by-partuuid symlink alone hides duplicate GPT identifiers. Probe every
 # current partition without the blkid cache before accepting its unique target.
 _persist_unique_target() {
+    local wanted=${1:-$PERSIST_DRIVE} node=${2:-$PERSIST_PART}
     local entry dev uuid rc count=0 found=
     PERSIST_REASON=missing-drive
     for entry in /sys/class/block/*; do
@@ -41,28 +67,48 @@ _persist_unique_target() {
         rc=0
         uuid=$(blkid -p -c /dev/null -s PART_ENTRY_UUID -o value "/dev/block/$dev" 2>/dev/null) || rc=$?
         case "$rc" in 0|2) ;; *) PERSIST_REASON=unreadable-drive; return 1 ;; esac
-        if [ "$uuid" = "$PERSIST_DRIVE" ]; then
+        if [ "$uuid" = "$wanted" ]; then
             count=$((count + 1)); found=$dev
         fi
     done
     if [ "$count" -gt 1 ]; then PERSIST_REASON=ambiguous-drive; return 1; fi
     [ "$count" -eq 1 ] || return 1
-    [ "$(_persist_device_number "$PERSIST_PART")" = "$found" ] || return 1
+    [ "$(_persist_device_number "$node")" = "$found" ] || return 1
     PERSIST_TARGET_DEV=$found
 }
 
-_persist_resolve() {
+_persist_base_resolve() {
     local base part disk seq identity
+    PERSIST_REASON=wrong-drive
+    base=$(_persist_arg ais.base) && _persist_uuid_valid "$base" || return 1
+    if ! _persist_unique_target "$base" "/dev/disk/by-partuuid/$base"; then
+        PERSIST_REASON=${PERSIST_REASON%-drive}-base
+        return 1
+    fi
+    PERSIST_REASON=wrong-drive
+    part=$(readlink -f "/sys/dev/block/$PERSIST_TARGET_DEV") || return 1
+    [ "$(cat "$part/partition")" = 3 ] || return 1
+    disk=$(dirname "$part")
+    seq=$(cat "$disk/diskseq") || return 1
+    case "$seq" in ''|*[!0-9]*|0) return 1 ;; esac
+    identity="$disk:$seq:$PERSIST_TARGET_DEV"
+    [ -z "${PERSIST_BASE_IDENTITY:-}" ] || [ "$identity" = "$PERSIST_BASE_IDENTITY" ] || return 1
+    PERSIST_BASE_IDENTITY=$identity
+    PERSIST_BASE_DEV=$PERSIST_TARGET_DEV
+    PERSIST_BASE_DISK=$disk
+}
+
+_persist_resolve() {
+    local part disk seq identity
     udevadm settle --timeout=10 || return 1
-    _persist_unique_target || return 1
+    _persist_base_resolve || return 1
+    _persist_unique_target "$PERSIST_DRIVE" "${1:-$PERSIST_PART}" || return 1
     PERSIST_REASON=wrong-drive
     part=$(readlink -f "/sys/dev/block/$PERSIST_TARGET_DEV") || return 1
     [ "$(cat "$part/partition")" = 5 ] || return 1
-    base=$(findmnt -n -o MAJ:MIN /run/archiso/bootmnt) || return 1
-    base=$(readlink -f "/sys/dev/block/$base") || return 1
-    [ "$(cat "$base/partition")" = 3 ] || return 1
+    [ "$(findmnt -n -o MAJ:MIN /run/archiso/bootmnt)" = "$PERSIST_BASE_DEV" ] || return 1
     disk=$(dirname "$part")
-    [ "$(dirname "$base")" = "$disk" ] || return 1
+    [ "$PERSIST_BASE_DISK" = "$disk" ] || return 1
     seq=$(cat "$disk/diskseq") || return 1
     case "$seq" in ''|*[!0-9]*|0) return 1 ;; esac
     # Detect observed replacement across checks; this is not a claim that an
@@ -80,6 +126,30 @@ _persist_empty() {
     # A short read or I/O error fails closed, as does any non-zero byte.
     cmp -n 16777216 /dev/zero "$PERSIST_PART" >/dev/null 2>&1
 }
+
+# The subshell closes fd 8 on every exit. No format operation reopens the
+# by-partuuid symlink: every final check and luksFormat uses the open descriptor.
+_persist_format() (
+    node=$(readlink -f "$PERSIST_PART") || exit 1
+    exec 8<>"$node" || exit 1
+    # stat -L on /proc/self/fd/8 reads the open node's st_rdev, not the
+    # potentially replaced pathname, and matches it to the unique sysfs entry.
+    _persist_resolve /proc/self/fd/8 || exit 1
+    part=$(readlink -f "/sys/dev/block/$PERSIST_TARGET_DEV") || exit 1
+    sectors=$(cat "$part/size") || exit 1
+    bytes=$(blockdev --getsize64 /proc/self/fd/8) || exit 1
+    case "$sectors:$bytes" in *[!0-9:]*|:*|*:) exit 1 ;; esac
+    [ "$sectors" -ge 32768 ] && [ "$bytes" -eq "$((sectors * 512))" ] || exit 1
+    # isLuks must report "not LUKS"; other probe failures are not permission.
+    rc=0
+    cryptsetup isLuks /proc/self/fd/8 || rc=$?
+    [ "$rc" -eq 1 ] || exit 1
+    cmp -n 16777216 /dev/zero /proc/self/fd/8 >/dev/null 2>&1 || exit 1
+    # shortcut: a device hot-plugged with the same random 128-bit PARTUUID
+    # between open and format requires a deliberately cloned identity.
+    keyctl pipe "$1" | cryptsetup luksFormat --batch-mode --type luks2 --pbkdf argon2id --key-file=- /proc/self/fd/8 || exit 1
+    _persist_resolve /proc/self/fd/8 && cryptsetup isLuks /proc/self/fd/8
+)
 
 _persist_mapper() {
     local dev sys slave count=0
@@ -108,9 +178,8 @@ _persist_create() {
     PERSIST_REASON=nonempty-drive
     _persist_empty || return 1
     keyid=$(keyctl search @u user ais-live-exchange) || return 1
-    _persist_resolve || return 1
-    keyctl pipe "$keyid" | cryptsetup luksFormat --batch-mode --type luks2 --pbkdf argon2id --key-file=- "$PERSIST_PART" || return 1
     PERSIST_REASON=format-verification
+    _persist_format "$keyid" || return 1
     _persist_resolve && cryptsetup isLuks "$PERSIST_PART" || return 1
     _persist_open && _persist_mapper || return 1
     mkfs.btrfs "$PERSIST_MAPPER" || return 1
@@ -323,6 +392,12 @@ run_hook() {
     local mode
     mode=$(getarg ais.mode latest)
     case "$mode" in latest|pick|clean) ;; *) _persist_die "Unknown ais.mode: $mode"; return 1 ;; esac
+    PERSIST_REASON=unsafe-cmdline
+    if ! _persist_cmdline || ! udevadm settle --timeout=10 || ! _persist_base_resolve; then
+        echo "AIS-LIVE: stage=boot-identity status=refused reason=$PERSIST_REASON mode=$mode" >"$PERSIST_CONSOLE"
+        _persist_die 'Emergency: unsafe boot parameters or invalid AIS base identity. No disk was mounted. Create this drive with the AIS host app.'
+        return 1
+    fi
     printf '%s\n' "$mode" >/run/ais-persist-mode
 }
 
