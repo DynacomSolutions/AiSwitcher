@@ -32,7 +32,7 @@ reset_guard() { systemctl restart ais-guardd.service; }
 wait_for_popup_text() {
   local socket_path=$1 deadline=$((SECONDS + WAIT_BUDGET)) snapshot pane_ids pane_id
   while (( SECONDS < deadline )); do
-    snapshot=$(runuser -u live -- env HERDR_SOCKET_PATH="$socket_path" herdr api snapshot --json 2>/dev/null) || { sleep 0.1; continue; }
+    snapshot=$(runuser -u live -- env HERDR_SOCKET_PATH="$socket_path" herdr api snapshot 2>/dev/null) || { sleep 0.1; continue; }
     pane_ids=$(python3 -B -c 'import json,sys; d=json.load(sys.stdin); todo=[d]; out=[]
 while todo:
  x=todo.pop()
@@ -203,7 +203,7 @@ run_scenarios() {
   pane=w1:p1
   assert_herdr_denied "$herdr_socket" send-keys "$pane" || return 1
   assert_herdr_denied "$herdr_socket" send-text "$pane" || return 1
-  if output=$(run_as_agent env HERDR_SOCKET_PATH="$herdr_socket" herdr api snapshot --json 2>&1); then
+  if output=$(run_as_agent env HERDR_SOCKET_PATH="$herdr_socket" herdr api snapshot 2>&1); then
     printf 'guard-scenarios: Herdr API snapshot unexpectedly succeeded\n' >&2
     return 1
   fi

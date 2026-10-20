@@ -68,7 +68,7 @@ describe("live guard scenario fixtures", () => {
     const scenario = readFileSync(guest, "utf8");
     expect(scenario).toContain('herdr pane "$operation" "$pane" x 2>&1');
     expect(scenario).toContain("Herdr pane %s failed without a permission-denial response");
-    expect(scenario).toContain('herdr api snapshot --json 2>&1');
+    expect(scenario).toContain('herdr api snapshot 2>&1');
     expect(scenario).toContain("$output != *'permission denied'*");
     expect(scenario).toContain("Herdr API snapshot failed without a permission-denial response");
     expect(scenario).toContain('herdr pane "$operation" "$pane" x 2>&1');
