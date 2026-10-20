@@ -21,6 +21,7 @@ fs2 = "=0.4.3"
 libc = "=0.2.191"
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
 zeroize = "=1.9.1"
+fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus-secret-service = { version = "=4.1.0", features = ["crypto-rust", "vendored"] }

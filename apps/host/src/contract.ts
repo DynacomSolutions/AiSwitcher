@@ -29,6 +29,8 @@ export interface WritePreview {
   operation: "createLayout" | "replaceBase" | "resetPersist";
   displayIdentifier: string;
   model: string | null;
+  serial: string | null;
+  connectionIdentity: string;
   capacityBytes: number;
   partitions: PartitionReview[];
   partitionDetailsAvailable: boolean;

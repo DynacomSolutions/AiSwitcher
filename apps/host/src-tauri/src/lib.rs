@@ -69,30 +69,19 @@ fn is_allowed_navigation(url: &tauri::Url) -> bool {
 fn list_devices(
     state: tauri::State<'_, ConfirmationSession>,
 ) -> Vec<ais_host_core::device::DeviceSummary> {
-    state.invalidate();
-    native_devices()
+    state.retain_listed(native_devices())
 }
 
 #[cfg(target_os = "linux")]
-fn native_devices() -> Vec<ais_host_core::device::DeviceSummary> {
+fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
     ais_host_helper::platform::list_linux_eligible()
         .into_iter()
-        .map(|(disk, model)| ais_host_core::device::DeviceSummary {
-            id: disk.observation.os_identity.clone(),
-            display_identifier: disk.observation.display_identifier.clone(),
-            model,
-            capacity_bytes: disk.observation.capacity_bytes,
-            transport: "usb".to_string(),
-            system: disk.observation.system_backing,
-            writable: disk.observation.writable,
-            serial: disk.observation.serial.clone(),
-            layout_status: "unknown".to_string(),
-        })
+        .map(|(disk, _)| disk.observation)
         .collect()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn native_devices() -> Vec<ais_host_core::device::DeviceSummary> {
+fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
     Vec::new()
 }
 
@@ -108,7 +97,7 @@ async fn preview_write(device_id: String, app: tauri::AppHandle) -> Result<Write
 
 fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePreview, String> {
     let state = app.state::<ConfirmationSession>();
-    let mut preparation = state.begin_preview()?;
+    let mut preparation = state.begin_preview(device_id)?;
     if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
         return Err("The selected device is unavailable.".to_string());
     }
@@ -123,6 +112,7 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
     )
     .map_err(|error| error.to_string())?;
     let observation = preview_native(device_id)?;
+    preparation.check_observation(&observation)?;
     let catalogue =
         ais_host_core::create::Catalogue::parse(ais_host_core::create::BUNDLED_CATALOGUE)
             .map_err(|error| error.to_string())?;
@@ -151,14 +141,13 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
         );
     }
     let details = DeviceReviewDetails {
-        model: None,
         partitions: Vec::new(),
         partition_details_available: false,
     };
     state.install_native_preview(
         fetched.image,
         fetched.release,
-        observation,
+        preview_native(device_id)?,
         details,
         fetched.sources,
         preparation,
@@ -245,6 +234,8 @@ struct WritePreview {
     operation: ais_host_core::device::WriteOperation,
     display_identifier: String,
     model: Option<String>,
+    serial: Option<String>,
+    connection_identity: String,
     capacity_bytes: u64,
     partitions: Vec<PartitionReview>,
     partition_details_available: bool,
@@ -286,6 +277,21 @@ struct StoredCreate {
 struct PreviewPreparation {
     id: String,
     create: StoredCreate,
+    listed: ais_host_core::device::DeviceObservation,
+}
+
+impl PreviewPreparation {
+    fn check_observation(
+        &self,
+        current: &ais_host_core::device::DeviceObservation,
+    ) -> Result<(), String> {
+        if !self.listed.same_physical_identity(current) {
+            return Err(
+                "The listed drive changed. Refresh the devices and select it again.".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 struct PendingConfirmation {
@@ -309,7 +315,6 @@ struct PendingConfirmation {
 #[derive(Default)]
 #[allow(dead_code)] // filled by native discovery
 struct DeviceReviewDetails {
-    model: Option<String>,
     partitions: Vec<PartitionReview>,
     partition_details_available: bool,
 }
@@ -323,6 +328,7 @@ struct ConfirmationSession {
 
 #[derive(Default)]
 struct ConfirmationState {
+    listed: Vec<ais_host_core::device::DeviceObservation>,
     pending: Option<PendingConfirmation>,
     /// Invalidating the session also cancels any preview still downloading.
     preparing: Option<String>,
@@ -332,6 +338,32 @@ struct ConfirmationState {
 }
 
 impl ConfirmationSession {
+    fn retain_listed(
+        &self,
+        devices: Vec<ais_host_core::device::DeviceObservation>,
+    ) -> Vec<ais_host_core::device::DeviceSummary> {
+        self.invalidate();
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state.listed = devices;
+        state
+            .listed
+            .iter()
+            .map(|device| ais_host_core::device::DeviceSummary {
+                id: device.os_identity.clone(),
+                display_identifier: device.display_identifier.clone(),
+                model: device.model.clone(),
+                capacity_bytes: device.capacity_bytes,
+                transport: "usb".into(),
+                system: device.system_backing,
+                writable: device.writable,
+                serial: device.serial.clone(),
+                layout_status: "unknown".into(),
+            })
+            .collect()
+    }
+
     fn invalidate(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.pending = None;
@@ -382,6 +414,7 @@ impl ConfirmationSession {
         sources: [std::fs::File; 3],
         preparation: PreviewPreparation,
     ) -> Result<WritePreview, String> {
+        preparation.check_observation(&device)?;
         let mut pending = PendingConfirmation::from_native(image, release, device, details)?;
         pending.sources = Some(sources);
         pending.create = Some(preparation.create);
@@ -411,7 +444,7 @@ impl ConfirmationSession {
         Ok(())
     }
 
-    fn begin_preview(&self) -> Result<PreviewPreparation, String> {
+    fn begin_preview(&self, device_id: &str) -> Result<PreviewPreparation, String> {
         let mut state = self
             .state
             .lock()
@@ -419,13 +452,19 @@ impl ConfirmationSession {
         state.pending = None;
         state.preparing = None;
         state.approvals.invalidate();
+        let listed = state
+            .listed
+            .iter()
+            .find(|device| device.os_identity == device_id)
+            .cloned()
+            .ok_or("Refresh the devices and select a listed drive.")?;
         let create = state
             .create
             .take()
             .ok_or_else(|| "Choose the drive options first.".to_string())?;
         let id = fresh_preview_id()?;
         state.preparing = Some(id.clone());
-        Ok(PreviewPreparation { id, create })
+        Ok(PreviewPreparation { id, create, listed })
     }
 
     /// Consume the typed-confirmation ticket against a fresh native observation
@@ -481,9 +520,11 @@ impl ConfirmationSession {
         let inbox =
             ais_host_core::publish::prepare_first_inbox(&snapshot, create.passphrase.expose())?;
         drop(snapshot);
-        if let Some(model) = create.model.as_mut() {
-            ais_host_core::publish::verify_model_source(model)?;
-        }
+        let mut model_snapshot = create
+            .model
+            .as_mut()
+            .map(ais_host_core::publish::snapshot_model)
+            .transpose()?;
         let remaining = CONFIRMATION_TTL
             .saturating_sub(now.saturating_duration_since(confirmed_at))
             .saturating_sub(started.elapsed());
@@ -510,15 +551,16 @@ impl ConfirmationSession {
         };
         let publication = (|| {
             inbox.publish(&exchange)?;
-            if let Some(model) = create.model.as_mut() {
+            if let Some(model) = model_snapshot.as_mut() {
                 ais_host_core::publish::publish_model(&exchange, model)?;
             }
             ais_host_core::publish::verify_published(
                 &exchange,
                 create.passphrase.expose(),
-                create.model.as_ref().map(|model| &model.entry),
+                model_snapshot.as_ref().map(|model| &model.entry),
             )
         })();
+        drop(exchange);
         let ejected = env.volume.eject(device);
         publication.map_err(not_ready)?;
         ejected.map_err(|_| {
@@ -527,7 +569,7 @@ impl ConfirmationSession {
         })?;
         // The one hand-off to key escrow; creation itself keeps no passphrase.
         env.sink
-            .hand_over(&create.passphrase, &drive_handle(device))
+            .hand_over(&create.passphrase, &drive_handle(&current.plan)?)
     }
 }
 
@@ -547,23 +589,23 @@ struct WriteEnv<'a> {
 /// Opens the freshly written exchange partition as a directory and ejects the
 /// drive afterwards.
 trait ExchangeVolume {
-    fn mount(&self, plan: &ais_host_core::device::WritePlan) -> Result<std::path::PathBuf, String>;
+    fn mount(
+        &self,
+        plan: &ais_host_core::device::WritePlan,
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String>;
     fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String>;
 }
 
 /// A registry-safe handle for the physical drive: a digest of its identity
 /// fields, so it never exposes a serial or device node.
-fn drive_handle(device: &ais_host_core::device::DeviceObservation) -> String {
-    let mut bytes = Vec::new();
-    for part in [
-        device.os_identity.as_bytes(),
-        device.connection_identity.as_bytes(),
-        device.serial.as_deref().unwrap_or("").as_bytes(),
-    ] {
-        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(part);
-    }
-    ais_host_core::release::hex(&ais_host_core::release::sha256(&bytes))[..32].to_owned()
+fn drive_handle(plan: &ais_host_core::device::WritePlan) -> Result<String, String> {
+    let identity = plan
+        .identity()
+        .ok_or("The drive identity is unavailable.")?;
+    Ok(identity.record_handle(
+        plan.device().serial.as_deref(),
+        plan.device().model.as_deref(),
+    ))
 }
 
 /// The helper re-derives the plan from its own verified image and native
@@ -593,6 +635,11 @@ fn helper_request(
         ticket: fresh_preview_id()?,
         release: pending.release.clone(),
         device_identity: pending.plan.device().os_identity.clone(),
+        drive_identity: pending
+            .plan
+            .identity()
+            .ok_or("The drive identity is unavailable.")?
+            .clone(),
         typed_confirmation: typed,
         confirmation_deadline_boot_ns: deadline_boot_ns(remaining)?,
     })
@@ -835,7 +882,11 @@ impl UdisksVolume {
 
 #[cfg(target_os = "linux")]
 impl ExchangeVolume for UdisksVolume {
-    fn mount(&self, plan: &ais_host_core::device::WritePlan) -> Result<std::path::PathBuf, String> {
+    fn mount(
+        &self,
+        plan: &ais_host_core::device::WritePlan,
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let device = plan.device();
         let (_, node) = Self::node(device)?;
         // The kernel needs a moment to publish the re-read partition table.
@@ -890,10 +941,30 @@ impl ExchangeVolume for UdisksVolume {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
             .map_err(|_| "The exchange mount point is unavailable.")?;
         let path = Self::mount_point(&mountinfo, major_minor.trim())?;
-        if !path.is_dir() {
-            return Err("The exchange mount point is unavailable.".into());
+        let partition =
+            std::fs::metadata(&node).map_err(|_| "The exchange device is unavailable.")?;
+        let identity = plan
+            .identity()
+            .ok_or("The drive identity is unavailable.")?;
+        let by_uuid =
+            std::fs::metadata(format!("/dev/disk/by-partuuid/{}", identity.partitions[3]))
+                .map_err(|_| "The exchange partition identity is unavailable.")?;
+        if !partition.file_type().is_block_device()
+            || !by_uuid.file_type().is_block_device()
+            || by_uuid.rdev() != partition.rdev()
+            || major_minor.trim()
+                != format!(
+                    "{}:{}",
+                    libc::major(partition.rdev()),
+                    libc::minor(partition.rdev())
+                )
+        {
+            return Err("The exchange partition identity changed.".into());
         }
-        Ok(path)
+        let root =
+            ais_host_core::exchange_root::ExchangeRoot::open_verified(&path, partition.rdev())?;
+        Self::node(device)?;
+        Ok(root)
     }
 
     fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
@@ -909,7 +980,7 @@ impl ExchangeVolume for UdisksVolume {
     fn mount(
         &self,
         _plan: &ais_host_core::device::WritePlan,
-    ) -> Result<std::path::PathBuf, String> {
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
         Err("This operating system cannot open the exchange partition yet.".to_string())
     }
 
@@ -949,7 +1020,9 @@ impl PendingConfirmation {
             preview_id: self.preview_id.clone(),
             operation: self.plan.operation(),
             display_identifier: self.plan.device().display_identifier.clone(),
-            model: self.details.model.clone(),
+            model: self.plan.device().model.clone(),
+            serial: self.plan.device().serial.clone(),
+            connection_identity: self.plan.device().connection_identity.clone(),
             capacity_bytes: self.plan.device().capacity_bytes,
             partitions: self
                 .details
@@ -1105,8 +1178,11 @@ mod confirmation_tests {
     }
 
     impl super::ExchangeVolume for DirectoryVolume {
-        fn mount(&self, _plan: &WritePlan) -> Result<std::path::PathBuf, String> {
-            Ok(self.directory.clone())
+        fn mount(
+            &self,
+            _plan: &WritePlan,
+        ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+            ais_host_core::exchange_root::ExchangeRoot::test_directory(&self.directory)
         }
         fn eject(&self, _device: &DeviceObservation) -> Result<(), String> {
             self.ejected.set(self.ejected.get() + 1);

@@ -32,6 +32,7 @@ pub struct DeviceObservation {
     pub connection_identity: String,
     pub display_identifier: String,
     pub serial: Option<String>,
+    pub model: Option<String>,
     pub capacity_bytes: u64,
     pub sector_bytes: u32,
     pub table_fingerprint: [u8; 32],
@@ -112,6 +113,7 @@ impl DeviceObservation {
         self.os_identity == other.os_identity
             && self.connection_identity == other.connection_identity
             && self.serial == other.serial
+            && self.model == other.model
             && self.capacity_bytes == other.capacity_bytes
             && self.sector_bytes == other.sector_bytes
             && self.ancestry_fingerprint == other.ancestry_fingerprint
@@ -165,6 +167,7 @@ pub struct WritePlan {
     remaining_bytes: u64,
     phase_aware: bool,
     exchange: Option<ByteRange>,
+    identity: Option<crate::drive_identity::DriveIdentity>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -179,6 +182,7 @@ struct PlannedWrite {
 enum WriteSource {
     Image { offset: u64 },
     Bytes(Vec<u8>),
+    Zeroes,
 }
 
 impl WritePlan {
@@ -310,16 +314,29 @@ impl WritePlan {
             remaining_bytes,
             phase_aware: true,
             exchange: None,
+            identity: None,
         })
     }
 
-    /// Grow only the empty exchange partition, leaving aligned space for first
-    /// boot to create persist. Both GPT copies and the format range are bound
-    /// into the same confirmation digest as the image write.
+    /// Personalise both GPT copies and boot menus, grow exchange and create
+    /// an entirely zeroed, unformatted persistence partition.
     pub fn create_drive(
         image: &VerifiedImage,
         device: DeviceObservation,
     ) -> Result<Self, DeviceError> {
+        Self::create_drive_with_identity(
+            image,
+            device,
+            crate::drive_identity::DriveIdentity::fresh()?,
+        )
+    }
+
+    pub fn create_drive_with_identity(
+        image: &VerifiedImage,
+        device: DeviceObservation,
+        identity: crate::drive_identity::DriveIdentity,
+    ) -> Result<Self, DeviceError> {
+        identity.validate()?;
         let layout =
             LiveImageLayout::parse(image.bytes()).map_err(|_| DeviceError::LayoutUnavailable)?;
         let mut plan = Self::create_layout(image, device)?;
@@ -353,8 +370,27 @@ impl WritePlan {
             let WriteSource::Bytes(bytes) = &mut plan.writes[index].source else {
                 return Err(DeviceError::LayoutUnavailable);
             };
+            bytes[header_at + 56..header_at + 72]
+                .copy_from_slice(&crate::drive_identity::gpt_guid(&identity.disk)?);
+            for (partition, id) in identity.partitions.iter().enumerate() {
+                let offset = entries_at + partition * 128;
+                bytes[offset + 16..offset + 32]
+                    .copy_from_slice(&crate::drive_identity::gpt_guid(id)?);
+            }
             crate::layout::put_u64(bytes, entries_at + 3 * 128 + 40, end - 1)
                 .map_err(|_| DeviceError::LayoutUnavailable)?;
+            let p5 = entries_at + 4 * 128;
+            bytes[p5..p5 + 16].copy_from_slice(&crate::drive_identity::gpt_guid(
+                "ca7d7ccb-63ed-4c53-861c-1742536059cc",
+            )?);
+            crate::layout::put_u64(bytes, p5 + 32, end)
+                .map_err(|_| DeviceError::LayoutUnavailable)?;
+            crate::layout::put_u64(bytes, p5 + 40, last_exclusive - 1)
+                .map_err(|_| DeviceError::LayoutUnavailable)?;
+            for (index, word) in "AISPERSIST".encode_utf16().enumerate() {
+                bytes[p5 + 56 + index * 2..p5 + 58 + index * 2]
+                    .copy_from_slice(&word.to_le_bytes());
+            }
             let crc = crate::layout::crc32(&bytes[entries_at..entries_at + GPT_ARRAY_BYTES]);
             crate::layout::put_u32(bytes, header_at + 88, crc)
                 .map_err(|_| DeviceError::LayoutUnavailable)?;
@@ -364,6 +400,43 @@ impl WritePlan {
                 .map_err(|_| DeviceError::LayoutUnavailable)?;
         }
         plan.remaining_bytes = (last_exclusive - end) * SECTOR_BYTES;
+        let esp = &layout.partitions[1];
+        let esp_start = (esp.first_lba * SECTOR_BYTES) as usize;
+        let esp_end = ((esp.last_lba + 1) * SECTOR_BYTES) as usize;
+        let original = image
+            .bytes()
+            .get(esp_start..esp_end)
+            .ok_or(DeviceError::LayoutUnavailable)?;
+        let patched = crate::drive_identity::patch_esp(original, &identity)?;
+        // Bind only changed sectors, preserving all other ESP contents.
+        for (sector, (before, after)) in original
+            .as_chunks::<512>()
+            .0
+            .iter()
+            .zip(patched.as_chunks::<512>().0)
+            .enumerate()
+        {
+            if before != after {
+                plan.writes.push(PlannedWrite {
+                    range: ByteRange {
+                        start: (esp_start + sector * 512) as u64,
+                        length: 512,
+                    },
+                    source: WriteSource::Bytes(after.to_vec()),
+                });
+            }
+        }
+        let persist = ByteRange {
+            start: end * SECTOR_BYTES,
+            length: plan.remaining_bytes,
+        };
+        persist.validate(&plan.device)?;
+        plan.writes.push(PlannedWrite {
+            range: persist,
+            source: WriteSource::Zeroes,
+        });
+        plan.ranges.push(persist);
+        plan.identity = Some(identity);
         plan.ranges.push(exchange);
         plan.ranges = merge_ranges(plan.ranges);
         plan.exchange = Some(exchange);
@@ -376,7 +449,7 @@ impl WritePlan {
 
     /// Check the final GPT and the original physical/mount identity before any
     /// additional exchange metadata writes through the retained target.
-    pub fn verify_created_target(&self, target: &mut impl WriteTarget) -> Result<(), DeviceError> {
+    pub fn verify_created_layout(&self, target: &mut impl WriteTarget) -> Result<(), DeviceError> {
         let current = target.observe().map_err(|_| DeviceError::Changed)?;
         if self.exchange.is_none() || !observation_stable(self, &current) {
             return Err(DeviceError::Changed);
@@ -394,6 +467,28 @@ impl WritePlan {
                 tail: tail.clone(),
             },
         )
+    }
+
+    /// Read back both boot menus between GPT and physical identity checks.
+    /// This full ESP read is needed at phase boundaries, not for each p4 chunk.
+    pub fn verify_created_target(&self, target: &mut impl WriteTarget) -> Result<(), DeviceError> {
+        self.verify_created_layout(target)?;
+        let WriteSource::Bytes(head) = &self.writes[1].source else {
+            return Err(DeviceError::LayoutUnavailable);
+        };
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or(DeviceError::LayoutUnavailable)?;
+        let p2 = 1024 + 128;
+        let first = u64::from_le_bytes(head[p2 + 32..p2 + 40].try_into().unwrap());
+        let last = u64::from_le_bytes(head[p2 + 40..p2 + 48].try_into().unwrap());
+        let mut esp = vec![0; ((last - first + 1) * SECTOR_BYTES) as usize];
+        target
+            .read_at(first * SECTOR_BYTES, &mut esp)
+            .map_err(|_| DeviceError::Changed)?;
+        crate::drive_identity::verify_esp(&esp, identity)?;
+        self.verify_created_layout(target)
     }
 
     /// Regular-file harness only. It does not claim to create a bootable layout.
@@ -422,11 +517,15 @@ impl WritePlan {
             remaining_bytes: 0,
             phase_aware: false,
             exchange: None,
+            identity: Some(crate::drive_identity::DriveIdentity::fresh()?),
         })
     }
 
     pub fn device(&self) -> &DeviceObservation {
         &self.device
+    }
+    pub fn identity(&self) -> Option<&crate::drive_identity::DriveIdentity> {
+        self.identity.as_ref()
     }
     pub fn ranges(&self) -> &[ByteRange] {
         &self.ranges
@@ -434,7 +533,7 @@ impl WritePlan {
     pub fn operation(&self) -> WriteOperation {
         self.operation
     }
-    /// Capacity left after p4 for Task 4's separately agreed sizing policy.
+    /// Capacity after p4, assigned to the empty persistence partition on creation.
     pub fn remaining_bytes(&self) -> u64 {
         self.remaining_bytes
     }
@@ -467,6 +566,7 @@ impl WritePlan {
                     .checked_add(write.range.length)
                     .is_some_and(|end| end <= image.len()),
                 WriteSource::Bytes(bytes) => bytes.len() as u64 == write.range.length,
+                WriteSource::Zeroes => true,
             };
             if !expected_len {
                 return Err(DeviceError::Changed);
@@ -511,6 +611,7 @@ mod tests {
             connection_identity: "SYNTHETIC_FIXTURE_CONNECTION".into(),
             display_identifier: "SYNTHETIC_FIXTURE_DISK".into(),
             serial: Some("SYNTHETIC_FIXTURE_SERIAL".into()),
+            model: Some("SYNTHETIC_FIXTURE_MODEL".into()),
             capacity_bytes: capacity,
             sector_bytes: 512,
             table_fingerprint: table_fingerprint(
@@ -814,11 +915,23 @@ pub fn write_image(
                     .ok_or_else(|| failure(written, "source bounds"))?
             }
             WriteSource::Bytes(bytes) => bytes,
+            WriteSource::Zeroes => &[],
+        };
+        let zeroes = [0u8; 64 * 1024];
+        let chunks = || {
+            (0..write.range.length).step_by(zeroes.len()).map(|offset| {
+                let length = (write.range.length - offset).min(zeroes.len() as u64) as usize;
+                if matches!(write.source, WriteSource::Zeroes) {
+                    &zeroes[..length]
+                } else {
+                    &expected_bytes[offset as usize..offset as usize + length]
+                }
+            })
         };
         target
             .seek(SeekFrom::Start(write.range.start))
             .map_err(|_| failure(written, "seek"))?;
-        for (chunk_index, chunk) in expected_bytes.chunks(64 * 1024).enumerate() {
+        for (chunk_index, chunk) in chunks().enumerate() {
             if cancelled() || budget.elapsed() >= Duration::from_secs(600) {
                 let _ = target.flush_durable();
                 return Err(failure(written, "cancelled or timed out"));
@@ -893,7 +1006,7 @@ pub fn write_image(
             .seek(SeekFrom::Start(write.range.start))
             .map_err(|_| failure(written, "readback seek"))?;
         let mut readback = [0; 64 * 1024];
-        for expected in expected_bytes.chunks(readback.len()) {
+        for expected in chunks() {
             if cancelled() || budget.elapsed() >= Duration::from_secs(600) {
                 return Err(failure(written, "readback cancelled or timed out"));
             }

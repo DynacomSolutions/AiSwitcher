@@ -152,8 +152,12 @@ fn execute_linux(
         .map_err(|_| "The source image did not pass bundled trust verification.")?;
     let discovered = crate::platform::collect_linux_by_identity(&request.device_identity)
         .map_err(|_| "The native target could not be re-observed.")?;
-    let plan = WritePlan::create_drive(&image, discovered.observation.clone())
-        .map_err(|_| "A native write plan could not be reconstructed.")?;
+    let plan = WritePlan::create_drive_with_identity(
+        &image,
+        discovered.observation.clone(),
+        request.drive_identity.clone(),
+    )
+    .map_err(|_| "A native write plan could not be reconstructed.")?;
     if hex(&plan.digest()) != request.plan_digest {
         return Err("The app and helper write plans do not match.");
     }

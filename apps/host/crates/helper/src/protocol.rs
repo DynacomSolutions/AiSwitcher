@@ -16,6 +16,7 @@ pub struct Request {
     pub channel_binding: String,
     pub ticket: String,
     pub release: PublishedRelease,
+    pub drive_identity: ais_host_core::drive_identity::DriveIdentity,
     pub device_identity: String,
     pub typed_confirmation: String,
     /// CLOCK_BOOTTIME nanoseconds from the app's exact-typing confirmation.
@@ -69,6 +70,7 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, ProtocolError> {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
     if request.version != 1
+        || request.drive_identity.validate().is_err()
         || !digest(&request.plan_digest)
         || !digest(&request.channel_binding)
         || !digest(&request.ticket)
@@ -90,6 +92,15 @@ pub struct AuthenticatedChannel {
     pub(crate) peer_uid: u32,
     pub(crate) request_binding: [u8; 32],
     pub(crate) _single_use: (),
+    #[cfg(target_os = "linux")]
+    pub(crate) executable: std::fs::File,
+}
+
+impl AuthenticatedChannel {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn revalidate_sender(&self) -> Result<(), ProtocolError> {
+        linux_transport::verify_pid_executable(self.peer_pid, &self.executable)
+    }
 }
 
 pub fn require_native_channel() -> Result<AuthenticatedChannel, ProtocolError> {
@@ -290,9 +301,13 @@ pub mod linux_transport {
         peer: Peer,
         retained: &File,
     ) -> Result<(), ProtocolError> {
+        verify_pid_executable(peer.pid, retained)
+    }
+
+    pub(crate) fn verify_pid_executable(pid: u32, retained: &File) -> Result<(), ProtocolError> {
         use std::os::unix::fs::MetadataExt;
-        let current = File::open(format!("/proc/{}/exe", peer.pid))
-            .map_err(|_| ProtocolError::UntrustedPeer)?;
+        let current =
+            File::open(format!("/proc/{pid}/exe")).map_err(|_| ProtocolError::UntrustedPeer)?;
         let retained_metadata = retained
             .metadata()
             .map_err(|_| ProtocolError::UntrustedPeer)?;
@@ -355,22 +370,48 @@ pub mod linux_transport {
         append_field(&mut binding, request.device_identity.as_bytes());
         append_field(&mut binding, request.typed_confirmation.as_bytes());
         append_field(&mut binding, &release);
+        append_field(
+            &mut binding,
+            &serde_json::to_vec(&request.drive_identity).unwrap_or_default(),
+        );
         sha256(&binding)
     }
 
     /// The application sends a one-byte marker with exactly three source files
     /// attached. This keeps source authority in retained descriptors rather
     /// than renderer-controlled paths.
-    pub fn receive_source_descriptors(stream: &UnixStream) -> Result<[File; 3], ProtocolError> {
-        let mut marker = [0u8; 1];
+    fn enable_sender_credentials(stream: &UnixStream) -> Result<(), ProtocolError> {
+        let enabled: libc::c_int = 1;
+        // SAFETY: enabled is a live integer of the advertised length.
+        if unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(ProtocolError::Transport);
+        }
+        Ok(())
+    }
+
+    fn receive_message(
+        stream: &UnixStream,
+        buffer: &mut [u8],
+        peer: Peer,
+        expected_files: usize,
+    ) -> Result<(usize, Vec<File>), ProtocolError> {
         let mut iov = Iovec {
-            base: marker.as_mut_ptr(),
-            length: 1,
+            base: buffer.as_mut_ptr(),
+            length: buffer.len(),
         };
         let header_length = std::mem::size_of::<ControlHeader>();
-        let descriptor_length = SOURCE_DESCRIPTOR_COUNT * std::mem::size_of::<i32>();
+        let descriptor_length = expected_files * std::mem::size_of::<i32>();
         let alignment = std::mem::size_of::<usize>();
-        let control_length = (header_length + descriptor_length + alignment - 1) & !(alignment - 1);
+        let control_length = 4096;
         let mut control = vec![0usize; control_length / alignment];
         let mut message = MessageHeader {
             name: std::ptr::null_mut(),
@@ -392,7 +433,7 @@ pub mod linux_transport {
         let parse_length = returned_length.min(allocated_length);
         let mut files = Vec::new();
         let mut offset = 0usize;
-        let mut records = 0usize;
+        let mut credentials = None;
         let mut rights_records = 0usize;
         let mut rights_shape_valid = true;
         while offset < parse_length {
@@ -411,10 +452,32 @@ pub mod linux_transport {
                         .cast::<ControlHeader>(),
                 )
             };
-            records += 1;
             if header.length < header_length {
                 rights_shape_valid = false;
                 break;
+            } else if header.level == libc::SOL_SOCKET
+                && header.kind == libc::SCM_CREDENTIALS
+                && header.length == header_length + std::mem::size_of::<UCred>()
+                && header.length <= available
+                && credentials.is_none()
+            {
+                // SAFETY: the checked record contains one complete ucred.
+                let credential = unsafe {
+                    std::ptr::read_unaligned(
+                        control
+                            .as_ptr()
+                            .cast::<u8>()
+                            .add(offset + header_length)
+                            .cast::<UCred>(),
+                    )
+                };
+                credentials = Some(Peer {
+                    pid: credential.pid as u32,
+                    uid: credential.uid,
+                    gid: credential.gid,
+                });
+            } else if header.level != libc::SOL_SOCKET || header.kind != libc::SCM_RIGHTS {
+                rights_shape_valid = false;
             }
             let bounded_length = header.length.min(available);
             let payload_length = bounded_length - header_length;
@@ -475,16 +538,31 @@ pub mod linux_transport {
             }
             offset += aligned_length;
         }
-        if count != 1
-            || marker != [1]
-            || message.flags & 0x8 != 0
-            || returned_length != allocated_length
-            || records != 1
-            || rights_records != 1
+        // Linux may attach anonymous credentials to EOF after SHUT_WR.
+        // There are no sender bytes to authenticate in that case. Ancillary
+        // shape checks still reject truncation or unexpected descriptors.
+        if count != 0 && credentials != Some(peer) {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        if message.flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+            || returned_length > allocated_length
+            || rights_records != usize::from(expected_files != 0)
             || !rights_shape_valid
-            || files.len() != SOURCE_DESCRIPTOR_COUNT
+            || files.len() != expected_files
         {
             drop(files);
+            return Err(ProtocolError::Request);
+        }
+        Ok((count as usize, files))
+    }
+
+    fn receive_source_descriptors(
+        stream: &UnixStream,
+        peer: Peer,
+    ) -> Result<[File; 3], ProtocolError> {
+        let mut marker = [0u8; 1];
+        let (count, files) = receive_message(stream, &mut marker, peer, SOURCE_DESCRIPTOR_COUNT)?;
+        if count != 1 || marker != [1] {
             return Err(ProtocolError::Request);
         }
         files.try_into().map_err(|_| ProtocolError::Request)
@@ -494,6 +572,7 @@ pub mod linux_transport {
         stream: &mut UnixStream,
         mut buffer: &mut [u8],
         deadline: Instant,
+        peer: Peer,
     ) -> Result<(), ProtocolError> {
         while !buffer.is_empty() {
             let remaining = deadline
@@ -503,7 +582,7 @@ pub mod linux_transport {
             stream
                 .set_read_timeout(Some(remaining))
                 .map_err(|_| ProtocolError::Transport)?;
-            let count = stream.read(buffer).map_err(|_| ProtocolError::Transport)?;
+            let (count, _) = receive_message(stream, buffer, peer, 0)?;
             if count == 0 {
                 return Err(ProtocolError::Transport);
             }
@@ -515,9 +594,10 @@ pub mod linux_transport {
     fn read_one_request(
         stream: &mut UnixStream,
         deadline: Instant,
+        peer: Peer,
     ) -> Result<Vec<u8>, ProtocolError> {
         let mut header = [0; 4];
-        read_exact_before(stream, &mut header, deadline)?;
+        read_exact_before(stream, &mut header, deadline, peer)?;
         let length = u32::from_be_bytes(header) as usize;
         if length == 0 || length > MAX_REQUEST_BYTES {
             return Err(ProtocolError::Frame);
@@ -525,7 +605,7 @@ pub mod linux_transport {
         let mut frame = Vec::with_capacity(4 + length);
         frame.extend_from_slice(&header);
         frame.resize(4 + length, 0);
-        read_exact_before(stream, &mut frame[4..], deadline)?;
+        read_exact_before(stream, &mut frame[4..], deadline, peer)?;
         let mut trailing = [0; 1];
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -534,8 +614,9 @@ pub mod linux_transport {
         stream
             .set_read_timeout(Some(remaining))
             .map_err(|_| ProtocolError::Transport)?;
-        match stream.read(&mut trailing) {
-            Ok(0) => Ok(frame),
+        match receive_message(stream, &mut trailing, peer, 0) {
+            Ok((0, _)) => Ok(frame),
+            Err(error) => Err(error),
             _ => Err(ProtocolError::Frame),
         }
     }
@@ -555,8 +636,8 @@ pub mod linux_transport {
             return Err(ProtocolError::UntrustedPeer);
         }
         let pinned_executable = verify_peer_executable(peer)?;
+        enable_sender_credentials(&stream)?;
         let request_deadline = Instant::now() + IO_TIMEOUT;
-        let sources = receive_source_descriptors(&stream)?;
         let mut challenge = [0; 32];
         File::open("/dev/urandom")
             .and_then(|mut random| random.read_exact(&mut challenge))
@@ -564,7 +645,8 @@ pub mod linux_transport {
         stream
             .write_all(&challenge)
             .map_err(|_| ProtocolError::Transport)?;
-        let frame = read_one_request(&mut stream, request_deadline)?;
+        let sources = receive_source_descriptors(&stream, peer)?;
+        let frame = read_one_request(&mut stream, request_deadline, peer)?;
         if peer_credentials(&stream)? != peer {
             return Err(ProtocolError::UntrustedPeer);
         }
@@ -586,6 +668,7 @@ pub mod linux_transport {
                 peer_uid: peer.uid,
                 request_binding: expected,
                 _single_use: (),
+                executable: pinned_executable,
             },
             request,
             sources,
@@ -754,11 +837,11 @@ pub mod linux_transport {
             .set_read_timeout(Some(IO_TIMEOUT))
             .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
             .map_err(|_| ProtocolError::Transport)?;
-        send_source_descriptors(stream, files)?;
         let mut challenge = [0u8; 32];
         stream
             .read_exact(&mut challenge)
             .map_err(|_| ProtocolError::Transport)?;
+        send_source_descriptors(stream, files)?;
         request.channel_binding = binding_for_client(&challenge, &request);
         let body = serde_json::to_vec(&request).map_err(|_| ProtocolError::Request)?;
         if body.is_empty() || body.len() > MAX_REQUEST_BYTES {
@@ -883,12 +966,15 @@ pub mod linux_transport {
         use super::*;
 
         fn sample_request() -> Request {
+            static IDENTITY: std::sync::OnceLock<ais_host_core::drive_identity::DriveIdentity> =
+                std::sync::OnceLock::new();
             serde_json::from_value(serde_json::json!({
                 "version": 1,
                 "operation": "createLayout",
                 "planDigest": "a".repeat(64),
                 "channelBinding": "b".repeat(64),
                 "ticket": "c".repeat(64),
+                "driveIdentity": IDENTITY.get_or_init(|| ais_host_core::drive_identity::DriveIdentity::fresh().unwrap()),
                 "release": {
                     "id": 1,
                     "tag": "synthetic-v1",
@@ -931,6 +1017,8 @@ pub mod linux_transport {
         fn source_descriptors_round_trip_through_the_server_envelope() {
             use std::os::unix::net::UnixStream;
             let (sender, receiver) = UnixStream::pair().unwrap();
+            enable_sender_credentials(&receiver).unwrap();
+            let peer = peer_credentials(&receiver).unwrap();
             let dir = std::env::temp_dir();
             let make = |name: &str, bytes: &[u8]| {
                 let path = dir.join(format!("ais-fd-{}-{name}", std::process::id()));
@@ -941,7 +1029,7 @@ pub mod linux_transport {
             };
             let files = [make("a", b"one"), make("b", b"22"), make("c", b"333")];
             send_source_descriptors(&sender, [&files[0], &files[1], &files[2]]).unwrap();
-            let received = receive_source_descriptors(&receiver).unwrap();
+            let received = receive_source_descriptors(&receiver, peer).unwrap();
             let sizes: Vec<u64> = received
                 .iter()
                 .map(|f| f.metadata().unwrap().len())
@@ -960,10 +1048,13 @@ pub mod linux_transport {
             fs::remove_file(&path).unwrap();
             let challenge = [7u8; 32];
             let helper = std::thread::spawn(move || {
-                let files = receive_source_descriptors(&peer).unwrap();
+                enable_sender_credentials(&peer).unwrap();
+                let sender = peer_credentials(&peer).unwrap();
                 peer.write_all(&challenge).unwrap();
+                let files = receive_source_descriptors(&peer, sender).unwrap();
                 let frame =
-                    read_one_request(&mut peer, Instant::now() + Duration::from_secs(2)).unwrap();
+                    read_one_request(&mut peer, Instant::now() + Duration::from_secs(2), sender)
+                        .unwrap();
                 (files.len(), decode_frame(&frame).unwrap())
             });
             serve_request(&mut server, [&file, &file, &file], sample_request()).unwrap();
@@ -981,9 +1072,25 @@ pub mod linux_transport {
         fn malformed_or_truncated_descriptor_envelopes_are_refused() {
             use std::os::unix::net::UnixStream;
             let (mut sender, receiver) = UnixStream::pair().unwrap();
+            enable_sender_credentials(&receiver).unwrap();
             sender.write_all(&[1]).unwrap();
             assert!(matches!(
-                receive_source_descriptors(&receiver),
+                receive_source_descriptors(&receiver, peer_credentials(&receiver).unwrap()),
+                Err(ProtocolError::Request)
+            ));
+        }
+
+        #[test]
+        fn empty_eof_is_not_a_request_or_an_unauthenticated_payload() {
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            enable_sender_credentials(&receiver).unwrap();
+            let peer = peer_credentials(&receiver).unwrap();
+            sender.shutdown(std::net::Shutdown::Write).unwrap();
+            let (count, files) = receive_message(&receiver, &mut [0], peer, 0).unwrap();
+            assert_eq!(count, 0);
+            assert!(files.is_empty());
+            assert!(matches!(
+                receive_source_descriptors(&receiver, peer),
                 Err(ProtocolError::Request)
             ));
         }
@@ -992,14 +1099,111 @@ pub mod linux_transport {
         fn request_reads_use_one_absolute_deadline() {
             use std::os::unix::net::UnixStream;
             let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+            enable_sender_credentials(&receiver).unwrap();
+            let peer = peer_credentials(&receiver).unwrap();
             let writer = std::thread::spawn(move || {
                 sender.write_all(&[0]).unwrap();
                 std::thread::sleep(Duration::from_millis(80));
             });
-            let result =
-                read_one_request(&mut receiver, Instant::now() + Duration::from_millis(20));
+            let result = read_one_request(
+                &mut receiver,
+                Instant::now() + Duration::from_millis(20),
+                peer,
+            );
             writer.join().unwrap();
             assert!(matches!(result, Err(ProtocolError::Transport)));
+        }
+
+        #[test]
+        fn inherited_socket_cannot_supply_any_request_fragment() {
+            // SO_PEERCRED deliberately remains the parent on this socketpair.
+            // Fork uses only async-signal-safe syscalls in the child.
+            for prefix in [b"".as_slice(), b"\0\0".as_slice(), b"\0\0\0\x04".as_slice()] {
+                let (mut sender, receiver) = UnixStream::pair().unwrap();
+                receiver.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+                enable_sender_credentials(&receiver).unwrap();
+                let parent = peer_credentials(&receiver).unwrap();
+                if !prefix.is_empty() {
+                    sender.write_all(prefix).unwrap();
+                    let mut bytes = vec![0; prefix.len()];
+                    assert_eq!(
+                        receive_message(&receiver, &mut bytes, parent, 0).unwrap().0,
+                        prefix.len()
+                    );
+                }
+                // SAFETY: the child performs write and _exit only.
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0);
+                if pid == 0 {
+                    unsafe {
+                        libc::write(sender.as_raw_fd(), b"x".as_ptr().cast(), 1);
+                        libc::_exit(0);
+                    }
+                }
+                let result = receive_message(&receiver, &mut [0; 1], parent, 0);
+                // SAFETY: reap only the child created above.
+                assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+                assert_eq!(peer_credentials(&receiver).unwrap(), parent);
+                assert!(matches!(result, Err(ProtocolError::UntrustedPeer)));
+            }
+        }
+
+        #[test]
+        fn inherited_socket_cannot_supply_source_descriptors() {
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            receiver.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            enable_sender_credentials(&receiver).unwrap();
+            let parent = peer_credentials(&receiver).unwrap();
+            let file = File::open("/dev/null").unwrap();
+            // Construct the message before forking, avoiding allocation in the child.
+            let header_length = std::mem::size_of::<ControlHeader>();
+            let alignment = std::mem::size_of::<usize>();
+            let length = header_length + 3 * std::mem::size_of::<i32>();
+            let mut control = vec![0usize; length.div_ceil(alignment)];
+            let header = ControlHeader {
+                length,
+                level: 1,
+                kind: 1,
+            };
+            let descriptors = [file.as_raw_fd(); 3];
+            unsafe {
+                std::ptr::write(control.as_mut_ptr().cast::<ControlHeader>(), header);
+                std::ptr::copy_nonoverlapping(
+                    descriptors.as_ptr(),
+                    control.as_mut_ptr().cast::<u8>().add(header_length).cast(),
+                    3,
+                );
+            }
+            let mut marker = [1u8];
+            let mut iov = Iovec {
+                base: marker.as_mut_ptr(),
+                length: 1,
+            };
+            let message = MessageHeader {
+                name: std::ptr::null_mut(),
+                name_length: 0,
+                iov: &mut iov,
+                iov_length: 1,
+                control: control.as_mut_ptr().cast(),
+                control_length: control.len() * alignment,
+                flags: 0,
+            };
+            // SAFETY: child sends the prebuilt message and exits without Rust cleanup.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                unsafe {
+                    libc::sendmsg(
+                        sender.as_raw_fd(),
+                        (&message as *const MessageHeader).cast(),
+                        0,
+                    );
+                    libc::_exit(0);
+                }
+            }
+            let result = receive_source_descriptors(&receiver, parent);
+            assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+            assert!(matches!(result, Err(ProtocolError::UntrustedPeer)));
         }
     }
 }

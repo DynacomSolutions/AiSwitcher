@@ -36,6 +36,7 @@ export const testBridge: HostBridge = {
     current = `SYNTHETIC_FIXTURE_preview_${++previews}`;
     return {
       previewId: current, operation: "createLayout", displayIdentifier: device.displayIdentifier, model: device.model,
+      serial: device.serial, connectionIdentity: "SYNTHETIC_FIXTURE_CONNECTION",
       capacityBytes: device.capacityBytes, partitions: [{ name: "SYNTHETIC_FIXTURE_part_1", sizeBytes: 1_000_000, kind: "data" }],
       partitionDetailsAvailable: true, ranges: [{ start: 0, length: 17_408 }], imageDigest: "0".repeat(64), confirmationTtlSeconds: 90,
     };

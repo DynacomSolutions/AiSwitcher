@@ -11,6 +11,7 @@ fn frame(value: serde_json::Value) -> Vec<u8> {
 fn request() -> serde_json::Value {
     serde_json::json!({ "version": 1, "operation": "createLayout", "planDigest": "0".repeat(64),
         "channelBinding": "1".repeat(64), "ticket": "2".repeat(64),
+        "driveIdentity": ais_host_core::drive_identity::DriveIdentity::fresh().unwrap(),
         "release": { "id": 1, "tag": "live-v1", "publishedAt": 1, "draft": false, "prerelease": false,
             "assets": [
                 { "id": 1, "name": "SYNTHETIC_FIXTURE_IMAGE", "size": 1, "revision": "SYNTHETIC_FIXTURE_REVISION" },

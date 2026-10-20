@@ -248,6 +248,7 @@ pub fn observe(snapshot: &MacDiskSnapshot) -> Result<MacDiskObservation, Observa
         connection_identity: hex_bytes(&sha256(&connection)),
         display_identifier: snapshot.identifier.clone(),
         serial: snapshot.serial.clone(),
+        model: None,
         capacity_bytes: snapshot.capacity_bytes,
         sector_bytes: snapshot.sector_bytes,
         table_fingerprint: snapshot.table_fingerprint,

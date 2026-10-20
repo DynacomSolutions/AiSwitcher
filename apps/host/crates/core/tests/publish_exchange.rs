@@ -1,13 +1,15 @@
+#![cfg(all(feature = "file-test", target_os = "linux"))]
 use ais_host_core::{
     bundle::write_bundle_tar,
     contract::{BundleEntry, BundleKind, BundleManifest, PathClass, sha256_hex},
     create::ModelEntry,
+    exchange_root::ExchangeRoot,
     flow_adapter::SourceSnapshot,
     local_adapter::{decode_response, encode_export_request},
     model::VerifiedModel,
     publish::{
-        prepare_first_inbox, publish_first_inbox, publish_model, verify_model_source,
-        verify_published,
+        prepare_first_inbox, publish_first_inbox, publish_model, snapshot_model,
+        verify_model_source, verify_published,
     },
     release::{hex, sha256},
 };
@@ -67,10 +69,11 @@ fn model(body: &[u8], dir: &std::path::Path) -> VerifiedModel {
 #[test]
 fn the_first_inbox_is_sequence_one_and_decrypts_with_the_passphrase() {
     let exchange = directory("inbox");
-    let path = publish_first_inbox(&exchange, &snapshot(), PASS).unwrap();
+    let root = ExchangeRoot::test_directory(&exchange).unwrap();
+    let path = publish_first_inbox(&root, &snapshot(), PASS).unwrap();
     assert_eq!(path, exchange.join("inbox/bundle-1.age"));
-    verify_published(&exchange, PASS, None).unwrap();
-    assert!(verify_published(&exchange, "SYNTHETIC_FIXTURE_99", None).is_err());
+    verify_published(&root, PASS, None).unwrap();
+    assert!(verify_published(&root, "SYNTHETIC_FIXTURE_99", None).is_err());
     assert!(
         !exchange.join("models").exists(),
         "no model, no model directory"
@@ -83,19 +86,21 @@ fn a_selected_model_is_published_atomically_and_checked_against_its_pin() {
     let exchange = directory("model");
     let scratch = directory("model-src");
     let mut verified = model(b"SYNTHETIC_FIXTURE model bytes", &scratch);
-    publish_first_inbox(&exchange, &snapshot(), PASS).unwrap();
-    let published = publish_model(&exchange, &mut verified).unwrap();
+    let root = ExchangeRoot::test_directory(&exchange).unwrap();
+    let mut model_snapshot = snapshot_model(&mut verified).unwrap();
+    publish_first_inbox(&root, &snapshot(), PASS).unwrap();
+    let published = publish_model(&root, &mut model_snapshot).unwrap();
     assert_eq!(
         fs::read(&published).unwrap(),
         b"SYNTHETIC_FIXTURE model bytes"
     );
     assert!(!exchange.join("models/.synthetic.gguf.tmp").exists());
-    verify_published(&exchange, PASS, Some(&verified.entry)).unwrap();
+    verify_published(&root, PASS, Some(&verified.entry)).unwrap();
 
     fs::write(&published, b"SYNTHETIC_FIXTURE model byteX").unwrap();
-    assert!(verify_published(&exchange, PASS, Some(&verified.entry)).is_err());
+    assert!(verify_published(&root, PASS, Some(&verified.entry)).is_err());
     fs::remove_file(&published).unwrap();
-    assert!(verify_published(&exchange, PASS, Some(&verified.entry)).is_err());
+    assert!(verify_published(&root, PASS, Some(&verified.entry)).is_err());
     fs::remove_dir_all(&exchange).unwrap();
     fs::remove_dir_all(&scratch).unwrap();
 }
@@ -125,17 +130,17 @@ fn adapter_frames_are_strict() {
 #[test]
 fn a_partial_or_completed_first_inbox_is_never_overwritten() {
     let exchange = directory("interrupted");
+    let root = ExchangeRoot::test_directory(&exchange).unwrap();
     let prepared = prepare_first_inbox(&snapshot(), PASS).unwrap();
     fs::create_dir(exchange.join("inbox")).unwrap();
     let temporary = exchange.join("inbox/.bundle-1.age.tmp");
     fs::write(&temporary, b"SYNTHETIC_FIXTURE partial").unwrap();
-    assert!(prepared.publish(&exchange).is_err());
-    assert!(!exchange.join("inbox/bundle-1.age").exists());
-    fs::remove_file(temporary).unwrap();
-    let path = prepared.publish(&exchange).unwrap();
+    let path = prepared.publish(&root).unwrap();
+    assert_eq!(fs::read(&temporary).unwrap(), b"SYNTHETIC_FIXTURE partial");
     let before = fs::read(&path).unwrap();
-    assert!(prepared.publish(&exchange).is_err());
+    assert!(prepared.publish(&root).is_err());
     assert_eq!(fs::read(path).unwrap(), before);
+    assert_eq!(fs::read_dir(exchange.join("inbox")).unwrap().count(), 2);
 }
 
 #[test]
@@ -145,4 +150,51 @@ fn changed_retained_model_is_rejected_before_publication() {
     verify_model_source(&mut verified).unwrap();
     fs::write(&verified.path, b"SYNTHETIC_FIXTURE model byteX").unwrap();
     assert!(verify_model_source(&mut verified).is_err());
+    assert!(snapshot_model(&mut verified).is_err());
+}
+
+#[test]
+fn publication_stays_on_the_retained_root_after_mount_path_replacement() {
+    let path = directory("original-root");
+    let held = path.with_extension("held");
+    let root = ExchangeRoot::test_directory(&path).unwrap();
+    fs::rename(&path, &held).unwrap();
+    fs::create_dir(&path).unwrap();
+    let scratch = directory("snapshot-source");
+    let mut source = model(b"SYNTHETIC_FIXTURE model bytes", &scratch);
+    let mut frozen = snapshot_model(&mut source).unwrap();
+    // In-place rewrite and unbounded growth of the retained source inode.
+    fs::write(
+        &source.path,
+        vec![0xff; source.entry.size_bytes as usize * 10],
+    )
+    .unwrap();
+    publish_first_inbox(&root, &snapshot(), PASS).unwrap();
+    publish_model(&root, &mut frozen).unwrap();
+    verify_published(&root, PASS, Some(&frozen.entry)).unwrap();
+    assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    assert_eq!(
+        fs::read(held.join("models/synthetic.gguf")).unwrap(),
+        b"SYNTHETIC_FIXTURE model bytes"
+    );
+    drop(root);
+    for directory in [path, held, scratch] {
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn publication_rejects_symlink_directories_and_unverified_filesystems() {
+    use std::os::unix::{fs::MetadataExt, fs::symlink};
+    let path = directory("symlink-root");
+    let outside = directory("outside-root");
+    assert!(ExchangeRoot::open_verified(&path, fs::metadata(&path).unwrap().dev()).is_err());
+    assert!(ExchangeRoot::open_verified(&path, u64::MAX).is_err());
+    symlink(&outside, path.join("inbox")).unwrap();
+    symlink(&outside, path.join("models")).unwrap();
+    let root = ExchangeRoot::test_directory(&path).unwrap();
+    assert!(publish_first_inbox(&root, &snapshot(), PASS).is_err());
+    let mut source = model(b"SYNTHETIC_FIXTURE bytes", &path);
+    assert!(publish_model(&root, &mut snapshot_model(&mut source).unwrap()).is_err());
+    assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
 }

@@ -94,6 +94,7 @@ fn production_layout_writer_relocates_gpt_and_keeps_out_of_range_sentinel() {
         connection_identity: "SYNTHETIC_FIXTURE_CONNECTION".into(),
         display_identifier: "SYNTHETIC_FIXTURE_DISK".into(),
         serial: Some("SYNTHETIC_FIXTURE_SERIAL".into()),
+        model: Some("SYNTHETIC_FIXTURE_MODEL".into()),
         capacity_bytes: capacity,
         sector_bytes: 512,
         table_fingerprint: table_fingerprint(
@@ -185,6 +186,217 @@ fn test_crc32(bytes: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+#[test]
+fn file_backed_creation_personalises_both_gpts_and_menus_and_zeroes_all_persist() {
+    use ais_host_core::{
+        device::TABLE_WINDOW_BYTES,
+        drive_identity::verify_esp,
+        layout::{GPT_ARRAY_BYTES, synthetic_sfdisk_contract_fixture},
+    };
+    use std::io::{Cursor, SeekFrom, Write};
+
+    fn uuid(bytes: &[u8]) -> String {
+        let mut bytes = bytes.to_vec();
+        bytes[..4].reverse();
+        bytes[4..6].reverse();
+        bytes[6..8].reverse();
+        let value = ais_host_core::release::hex(&bytes);
+        format!(
+            "{}-{}-{}-{}-{}",
+            &value[..8],
+            &value[8..12],
+            &value[12..16],
+            &value[16..20],
+            &value[20..]
+        )
+    }
+    fn number(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+    fn check_header(header: &[u8], entries: &[u8]) {
+        let mut copy = header[..92].to_vec();
+        let crc = u32::from_le_bytes(copy[16..20].try_into().unwrap());
+        copy[16..20].fill(0);
+        assert_eq!(crc, test_crc32(&copy));
+        assert_eq!(
+            u32::from_le_bytes(header[88..92].try_into().unwrap()),
+            test_crc32(entries)
+        );
+    }
+
+    let raw = synthetic_sfdisk_contract_fixture();
+    let fixture = SyntheticRelease::new(raw.clone());
+    let (_, mut image) = fixture.verify_live_layout(&std::env::temp_dir()).unwrap();
+    let capacity = 3 * 1024 * 1024 * 1024;
+    let mut target = FileTarget::create_sparse(&std::env::temp_dir(), capacity).unwrap();
+    let observation = target.observe().unwrap();
+    let plan = WritePlan::create_drive(&image, observation.clone()).unwrap();
+    let ids = plan.identity().unwrap();
+    let replay =
+        WritePlan::create_drive_with_identity(&image, observation.clone(), ids.clone()).unwrap();
+    assert_eq!(
+        plan.digest(),
+        replay.digest(),
+        "helper reconstruction must be deterministic"
+    );
+    let another = WritePlan::create_drive(&image, observation).unwrap();
+    assert_ne!(ids.disk, another.identity().unwrap().disk);
+    for id in &ids.partitions {
+        assert!(!another.identity().unwrap().partitions.contains(id));
+    }
+
+    let exchange = plan.exchange_range().unwrap();
+    let persist_start = exchange.start + exchange.length;
+    let persist_len = plan.remaining_bytes();
+    assert!(persist_len >= 2 * 1024 * 1024 * 1024);
+    // Old data in the header area, beyond 16 MiB, the middle and final sector.
+    for offset in [0, 17 * 1024 * 1024, persist_len / 2, persist_len - 512] {
+        target
+            .seek(SeekFrom::Start(persist_start + offset))
+            .unwrap();
+        target.write_all(&[0xa7; 512]).unwrap();
+    }
+    // Seed before the approved observation: the final persistence sector is
+    // also part of the bounded GPT tail snapshot checked before the first write.
+    let plan =
+        WritePlan::create_drive_with_identity(&image, target.observe().unwrap(), ids.clone())
+            .unwrap();
+    let mut book = ConfirmationBook::default();
+    let ticket = book
+        .issue(
+            &plan,
+            &plan.device().display_identifier,
+            Instant::now(),
+            Duration::from_secs(120),
+        )
+        .unwrap();
+    write_image(&mut target, &mut image, &plan, &mut book, &ticket, || false).unwrap();
+    plan.verify_created_target(&mut target).unwrap();
+
+    let mut head = vec![0; TABLE_WINDOW_BYTES];
+    let mut tail = vec![0; TABLE_WINDOW_BYTES];
+    target.read_at(0, &mut head).unwrap();
+    target
+        .read_at(capacity - TABLE_WINDOW_BYTES as u64, &mut tail)
+        .unwrap();
+    let entries = &head[1024..1024 + GPT_ARRAY_BYTES];
+    assert_eq!(entries, &tail[512..512 + GPT_ARRAY_BYTES]);
+    check_header(&head[512..1024], entries);
+    check_header(&tail[TABLE_WINDOW_BYTES - 512..], entries);
+    assert_eq!(uuid(&head[568..584]), ids.disk);
+    assert_eq!(
+        uuid(&tail[TABLE_WINDOW_BYTES - 512 + 56..TABLE_WINDOW_BYTES - 512 + 72]),
+        ids.disk
+    );
+    assert_ne!(&head[568..584], &raw[568..584]);
+    for (index, entry) in entries.chunks_exact(128).take(5).enumerate() {
+        assert_eq!(uuid(&entry[16..32]), ids.partitions[index]);
+        assert_ne!(
+            &entry[16..32],
+            &raw[1024 + index * 128 + 16..1024 + index * 128 + 32]
+        );
+        if index < 4 {
+            let original = &raw[1024 + index * 128..1024 + (index + 1) * 128];
+            assert_eq!(&entry[..16], &original[..16], "partition type");
+            assert_eq!(&entry[48..128], &original[48..128], "attributes and name");
+            assert_eq!(number(entry, 32), number(original, 32), "partition start");
+            if index < 3 {
+                assert_eq!(number(entry, 40), number(original, 40), "partition end");
+            }
+        }
+    }
+    let p5 = &entries[4 * 128..5 * 128];
+    assert_eq!(uuid(&p5[..16]), "ca7d7ccb-63ed-4c53-861c-1742536059cc");
+    assert_eq!(number(p5, 32) * 512, persist_start);
+    assert_eq!((number(p5, 40) - number(p5, 32) + 1) * 512, persist_len);
+    let mut zeroes = [0; 64 * 1024];
+    let mut position = 0;
+    while position < persist_len {
+        let length = (persist_len - position).min(zeroes.len() as u64) as usize;
+        target
+            .read_at(persist_start + position, &mut zeroes[..length])
+            .unwrap();
+        assert!(
+            zeroes[..length].iter().all(|byte| *byte == 0),
+            "persist offset {position}"
+        );
+        position += length as u64;
+    }
+    for index in [0, 2] {
+        let entry = &entries[index * 128..(index + 1) * 128];
+        let start = number(entry, 32) * 512;
+        let length = (number(entry, 40) - number(entry, 32) + 1) * 512;
+        let mut bytes = vec![0; length as usize];
+        target.read_at(start, &mut bytes).unwrap();
+        assert_eq!(bytes, raw[start as usize..(start + length) as usize]);
+    }
+    let p2 = &entries[128..256];
+    let mut esp = vec![0; ((number(p2, 40) - number(p2, 32) + 1) * 512) as usize];
+    target.read_at(number(p2, 32) * 512, &mut esp).unwrap();
+    verify_esp(&esp, ids).unwrap();
+    let fs = fatfs::FileSystem::new(Cursor::new(&mut esp), fatfs::FsOptions::new()).unwrap();
+    for (name, command, initrd) in [
+        (
+            "boot/grub/grub.cfg",
+            "linux ",
+            "initrd /arch/boot/x86_64/initramfs-linux.img",
+        ),
+        (
+            "syslinux/syslinux.cfg",
+            "APPEND ",
+            "INITRD /arch/boot/x86_64/initramfs-linux.img",
+        ),
+    ] {
+        let mut menu = String::new();
+        fs.root_dir()
+            .open_file(name)
+            .unwrap()
+            .read_to_string(&mut menu)
+            .unwrap();
+        assert_eq!(
+            menu.lines()
+                .filter(|line| line.trim_start().starts_with(initrd))
+                .count(),
+            3
+        );
+        let lines: Vec<_> = menu
+            .lines()
+            .filter(|line| line.trim_start().starts_with(command))
+            .collect();
+        assert_eq!(lines.len(), 3);
+        for (line, mode) in lines.into_iter().zip(["latest", "pick", "clean"]) {
+            let words: Vec<_> = line.split_whitespace().collect();
+            for expected in [
+                format!("ais.base={}", ids.partitions[2]),
+                format!("ais.exchange={}", ids.partitions[3]),
+                format!("ais.drive={}", ids.partitions[4]),
+                format!("archisodevice=/dev/disk/by-partuuid/{}", ids.partitions[2]),
+                "archisobasedir=arch".into(),
+                "copytoram=n".into(),
+                "systemd.firstboot=off".into(),
+                format!("ais.mode={mode}"),
+            ] {
+                assert_eq!(words.iter().filter(|word| **word == expected).count(), 1);
+            }
+            assert!(!line.contains("HOST_APP_REQUIRED"));
+        }
+    }
+    // Post-write menu corruption must also prevent a successful final check.
+    fs.unmount().unwrap();
+    let at = esp
+        .windows(ids.partitions[4].len())
+        .position(|window| window == ids.partitions[4].as_bytes())
+        .unwrap();
+    esp[at] = b'X';
+    target.seek(SeekFrom::Start(number(p2, 32) * 512)).unwrap();
+    target.write_all(&esp).unwrap();
+    assert!(plan.verify_created_target(&mut target).is_err());
+    target.seek(SeekFrom::Start(568)).unwrap();
+    target.write_all(&[0xff; 16]).unwrap();
+    assert!(plan.verify_created_target(&mut target).is_err());
+    std::fs::remove_file(target.path()).unwrap();
 }
 
 #[test]

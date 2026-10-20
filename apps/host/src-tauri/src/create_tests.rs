@@ -29,11 +29,11 @@ struct Volume {
 }
 
 impl ExchangeVolume for Volume {
-    fn mount(&self, _: &WritePlan) -> Result<PathBuf, String> {
+    fn mount(&self, _: &WritePlan) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
         if self.fail_mount {
             Err("SYNTHETIC_FIXTURE mount failure".into())
         } else {
-            Ok(self.directory.clone())
+            ais_host_core::exchange_root::ExchangeRoot::test_directory(&self.directory)
         }
     }
     fn eject(&self, _: &DeviceObservation) -> Result<(), String> {
@@ -89,7 +89,12 @@ impl HelperLauncher for FileHelper {
             .verify(&selection, download)
             .unwrap();
         let mut target = self.target.borrow_mut();
-        let plan = WritePlan::create_drive(&image, target.observe().unwrap()).unwrap();
+        let plan = WritePlan::create_drive_with_identity(
+            &image,
+            target.observe().unwrap(),
+            request.drive_identity,
+        )
+        .unwrap();
         assert_eq!(request.plan_digest, hex(&plan.digest()));
         let directory = std::env::var_os("AIS_HOST_TEST_EXFAT_TOOLS").map(PathBuf::from);
         let tool = |name: &str| {
@@ -119,13 +124,14 @@ impl HelperLauncher for FileHelper {
             u64::from_le_bytes(boot[64..72].try_into().unwrap()),
             range.start / 512
         );
-        // Persist space remains untouched and p5 remains absent.
+        // Persist is a distinct, zeroed Linux LUKS partition, without a header.
         target
             .read_at(range.start + range.length, &mut boot)
             .unwrap();
         assert!(boot.iter().all(|byte| *byte == 0));
         target.read_at(1024 + 4 * 128, &mut boot[..128]).unwrap();
-        assert!(boot[..128].iter().all(|byte| *byte == 0));
+        assert!(boot[..16].iter().any(|byte| *byte != 0));
+        assert!(boot[16..32].iter().any(|byte| *byte != 0));
         Ok(())
     }
 }
@@ -195,8 +201,9 @@ fn create_smoke(with_model: bool) {
         create.model = Some(ais_host_core::model::VerifiedModel { entry, file, path });
     }
     let session = ConfirmationSession::default();
+    session.retain_listed(vec![device.clone()]);
     session.set_create(create).unwrap();
-    let preparation = session.begin_preview().unwrap();
+    let preparation = session.begin_preview(&device.os_identity).unwrap();
     let preview = session
         .install_native_preview(
             image,
@@ -207,6 +214,8 @@ fn create_smoke(with_model: bool) {
             preparation,
         )
         .unwrap();
+    let drive_handle =
+        super::drive_handle(&session.state.lock().unwrap().pending.as_ref().unwrap().plan).unwrap();
     let now = Instant::now();
     session
         .confirm(&preview.preview_id, &device.display_identifier, now)
@@ -245,7 +254,7 @@ fn create_smoke(with_model: bool) {
         );
     }
     let data = FileRegistry::open(&directory).unwrap().load().unwrap();
-    let record = data.record(&super::drive_handle(&device)).unwrap();
+    let record = data.record(&drive_handle).unwrap();
     assert!(record.created_here());
     assert!(record.item().is_none());
     assert!(
@@ -425,8 +434,12 @@ fn exchange_mount_requires_one_writable_exfat_root_for_the_expected_partition() 
 fn preview_preparation_keeps_choices_and_rejects_results_after_refresh_or_edit() {
     for refresh in [true, false] {
         let session = ConfirmationSession::default();
+        let dir = std::env::temp_dir();
+        let target = FileTarget::create_sparse(&dir, 3 * 1024 * 1024 * 1024).unwrap();
+        let device = target.observe().unwrap();
+        session.retain_listed(vec![device.clone()]);
         session.set_create(stored_create()).unwrap();
-        let preparation = session.begin_preview().unwrap();
+        let preparation = session.begin_preview(&device.os_identity).unwrap();
         assert_eq!(
             preparation.create.passphrase.expose(),
             "SYNTHETIC_FIXTURE_12"
@@ -434,12 +447,10 @@ fn preview_preparation_keeps_choices_and_rejects_results_after_refresh_or_edit()
         assert!(session.state.lock().unwrap().create.is_none());
         if refresh {
             session.invalidate();
-            assert!(session.begin_preview().is_err());
+            assert!(session.begin_preview(&device.os_identity).is_err());
         } else {
             session.set_create(stored_create()).unwrap();
         }
-        let dir = std::env::temp_dir();
-        let target = FileTarget::create_sparse(&dir, 3 * 1024 * 1024 * 1024).unwrap();
         let fixture =
             SyntheticRelease::new(ais_host_core::layout::synthetic_sfdisk_contract_fixture());
         let (_, image) = fixture.verify_live_layout(&dir).unwrap();
@@ -474,7 +485,86 @@ fn preview_preparation_keeps_choices_and_rejects_results_after_refresh_or_edit()
         );
         assert!(session.state.lock().unwrap().pending.is_none());
         if !refresh {
-            assert!(session.begin_preview().is_ok());
+            assert!(session.begin_preview(&device.os_identity).is_ok());
         }
     }
+}
+
+#[test]
+fn listed_device_replacement_is_rejected_before_installing_confirmation() {
+    let target = FileTarget::create(&std::env::temp_dir(), 4096).unwrap();
+    let listed = target.observe().unwrap();
+    for changed_field in ["serial", "model", "size", "connection"] {
+        let session = ConfirmationSession::default();
+        session.retain_listed(vec![listed.clone()]);
+        session.set_create(stored_create()).unwrap();
+        let preparation = session.begin_preview(&listed.os_identity).unwrap();
+        let mut replacement = listed.clone();
+        match changed_field {
+            "serial" => replacement.serial = Some("SYNTHETIC_FIXTURE_REPLACEMENT".into()),
+            "model" => replacement.model = Some("SYNTHETIC_FIXTURE_REPLACEMENT".into()),
+            "size" => replacement.capacity_bytes += 512,
+            _ => replacement.connection_identity.push_str("-replacement"),
+        }
+        let fixture = SyntheticRelease::new(vec![0x53; 512]);
+        let (_, image) = fixture.verify(&std::env::temp_dir()).unwrap();
+        let release = PublishedRelease {
+            id: 1,
+            tag: fixture.selection.tag().into(),
+            published_at: 1,
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                fixture.selection.image().clone(),
+                fixture.selection.sums().clone(),
+                fixture.selection.signature().clone(),
+            ],
+        };
+        let sources = std::array::from_fn(|_| {
+            fresh_file(&std::env::temp_dir(), "observation-SYNTHETIC-FIXTURE")
+                .unwrap()
+                .1
+        });
+        assert!(
+            session
+                .install_native_preview(
+                    image,
+                    release,
+                    replacement,
+                    DeviceReviewDetails::default(),
+                    sources,
+                    preparation
+                )
+                .unwrap_err()
+                .contains("listed drive changed")
+        );
+        assert!(session.state.lock().unwrap().pending.is_none());
+    }
+}
+
+#[test]
+fn preview_presents_bound_identity_and_drive_record_survives_reconnection() {
+    let (session, original, _) = session_with_fixture();
+    let mut state = session.state.lock().unwrap();
+    let pending = state.pending.as_mut().unwrap();
+    let preview = pending.view();
+    assert_eq!(preview.serial, original.serial);
+    assert_eq!(preview.model, original.model);
+    assert_eq!(preview.connection_identity, original.connection_identity);
+    let handle = super::drive_handle(&pending.plan).unwrap();
+    let identity = pending.plan.identity().unwrap().clone();
+    let mut reconnected = original.clone();
+    reconnected.os_identity = "SYNTHETIC_FIXTURE_OTHER_NODE".into();
+    reconnected.connection_identity = "SYNTHETIC_FIXTURE_NEW_DISKSEQ".into();
+    assert!(!original.same_physical_identity(&reconnected));
+    assert_eq!(
+        handle,
+        identity.record_handle(reconnected.serial.as_deref(), reconnected.model.as_deref())
+    );
+    assert_ne!(
+        handle,
+        ais_host_core::drive_identity::DriveIdentity::fresh()
+            .unwrap()
+            .record_handle(reconnected.serial.as_deref(), reconnected.model.as_deref())
+    );
 }

@@ -24,6 +24,7 @@ pub struct LinuxDiskSnapshot {
     pub removable: bool,
     pub device_syspath: String,
     pub serial: Option<String>,
+    pub model: Option<String>,
     pub partitions: Vec<LinuxPartition>,
     pub table_fingerprint: [u8; 32],
     pub mounted_major_minors: Vec<String>,
@@ -57,13 +58,18 @@ pub struct LinuxBlockTarget {
     retained_inode: u64,
     retained_device: u64,
     retained_rdev: u64,
+    sender_pid: u32,
+    sender_executable: File,
 }
 
 impl LinuxBlockTarget {
     pub fn open_authenticated(
-        _channel: &crate::protocol::AuthenticatedChannel,
+        channel: &crate::protocol::AuthenticatedChannel,
         approved: &DeviceObservation,
     ) -> Result<Self, ObservationError> {
+        channel
+            .revalidate_sender()
+            .map_err(|_| ObservationError::Changed)?;
         approved
             .validate()
             .map_err(|_| ObservationError::Ineligible)?;
@@ -125,6 +131,11 @@ impl LinuxBlockTarget {
             retained_inode,
             retained_device,
             retained_rdev,
+            sender_pid: channel.peer_pid,
+            sender_executable: channel
+                .executable
+                .try_clone()
+                .map_err(|_| ObservationError::Changed)?,
         })
     }
 }
@@ -136,6 +147,11 @@ impl io::Read for LinuxBlockTarget {
 }
 impl io::Write for LinuxBlockTarget {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        crate::protocol::linux_transport::verify_pid_executable(
+            self.sender_pid,
+            &self.sender_executable,
+        )
+        .map_err(|_| io::Error::other("authenticated sender changed"))?;
         io::Write::write(&mut self.file, buffer)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -399,6 +415,10 @@ fn collect_sysfs_snapshot(name: &str) -> Result<LinuxDiskSnapshot, ObservationEr
         removable,
         device_syspath,
         serial,
+        model: fs::read_to_string(class.join("device/model"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
         partitions,
         table_fingerprint: [0; 32],
         mounted_major_minors: mounted.into_iter().collect(),
@@ -660,6 +680,7 @@ pub fn parse_snapshot(input: &str) -> Result<LinuxDiskSnapshot, ObservationError
         removable: boolean("removable")?,
         device_syspath: get("deviceSyspath")?.to_owned(),
         serial,
+        model: None,
         partitions,
         table_fingerprint,
         mounted_major_minors: major_minors("mountedMajorMinors")?,
@@ -781,11 +802,7 @@ pub fn list_eligible() -> Vec<(LinuxDiskObservation, Option<String>)> {
             let eligible = observed.observation.external_usb
                 && !observed.observation.system_backing
                 && observed.observation.writable;
-            let model =
-                fs::read_to_string(Path::new("/sys/block").join(&name).join("device/model"))
-                    .ok()
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty());
+            let model = snapshot.model.clone();
             eligible.then_some((observed, model))
         })
         .collect::<Vec<_>>();
@@ -826,6 +843,7 @@ pub fn observe(snapshot: &LinuxDiskSnapshot) -> Result<LinuxDiskObservation, Obs
         connection_identity: hex(&sha256(&ancestry)),
         display_identifier: format!("{} ({capacity_bytes} bytes)", snapshot.name),
         serial: snapshot.serial.clone(),
+        model: snapshot.model.clone(),
         capacity_bytes,
         sector_bytes: snapshot.logical_sector_bytes,
         table_fingerprint: snapshot.table_fingerprint,

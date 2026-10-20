@@ -101,6 +101,7 @@ pub fn observe_windows_snapshot(
         connection_identity: hex_bytes(&sha256(&connection)),
         display_identifier: format!("PhysicalDrive{}", snapshot.disk_number),
         serial: snapshot.serial.clone(),
+        model: None,
         capacity_bytes: snapshot.capacity_bytes,
         sector_bytes: snapshot.sector_bytes,
         table_fingerprint,

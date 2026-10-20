@@ -112,15 +112,24 @@ The create route collects a session-only passphrase (12 characters minimum,
 confirmed) and an explicit yes/no model choice; the licence text is shown before
 acceptance. `create.rs` validates these and the capacity budget: image, selected
 model, 512 MiB of exchange headroom and the existing 2 GiB persist reserve.
-`preview_write` verifies the release and optional pinned model download, takes
-the helper's read-only observation and installs the native preview. It consumes
+`preview_write` verifies the release and optional pinned model download, compares
+the helper's fresh observation with the retained listing (including serial,
+model, size and connection identity), and installs the native preview. The UI
+shows that plan's observation. It consumes
 the chosen options once; refresh or edits cancel a preview still being prepared.
-Both GPT
-copies describe the expanded p4; p5 remains absent and the persist reserve stays
-untouched. All image and exchange ranges belong to the confirmation digest.
+Both GPT copies describe the expanded p4 and a Linux LUKS-type p5 occupying the
+remaining reserve. Creation generates a fresh disk GUID and five fresh PARTUUIDs.
+The writer zeroes all of p5 without creating a header or filesystem and patches
+the three GRUB and three Syslinux ESP entries with the p3/p4/p5 identities,
+the base PARTUUID path and `copytoram=n`. Readback checks both GPT copies and
+both menus. All image, ESP, exchange and persistence ranges and generated IDs
+belong to the confirmation digest.
 
 Before launching the helper, `start_write` exports and encrypts the first inbox
-and rechecks the retained model. The Linux helper prepares exFAT using the
+and copies the retained model into a sealed private snapshot, checking the copy's
+size and hash. The Linux helper checks every received frame's SCM_CREDENTIALS
+against SO_PEERCRED and rechecks the pinned executable before every target write.
+It prepares exFAT using the
 system `mkfs.exfat` and `fsck.exfat`, verifies and seals a fresh anonymous regular
 file, then writes only its metadata extents through the approved, locked target.
 It flushes and reads back every extent, checks the final GPT and asks the kernel
@@ -128,9 +137,14 @@ to re-read the partition table. Missing or failed formatting tools stop before
 imaging. Formatter processes never receive a device path.
 
 The app checks the connection, partition bounds, AISX label and exFAT type before
-mounting with udisks. It publishes `inbox/bundle-1.age` and optional public weights
-under `models/` through temporary files, flushes them, decrypts the inbox and
-checks the model hash on readback, then unmounts and powers off the drive.
+mounting with udisks. It retains a directory descriptor whose filesystem type and
+device match the formatted partition. All publication uses no-follow,
+descriptor-relative operations. It publishes `inbox/bundle-1.age` and optional
+public weights under `models/` through private staging files, bounds the model
+copy, flushes and verifies staged bytes before rename, and removes failed partial
+files. It decrypts the inbox and checks the model hash on readback, then unmounts
+and powers off the drive. Records use USB serial/model and generated GPT IDs,
+so reconnecting with a new disk sequence does not change the drive handle.
 Only then does `PassphraseSink::hand_over` record it through the escrow service.
 Retention remains disabled by default, so the passphrase stays session-only.
 Every failed stage consumes confirmation and leaves no ready drive record.

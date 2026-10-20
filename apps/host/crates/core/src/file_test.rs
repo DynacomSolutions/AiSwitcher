@@ -175,6 +175,7 @@ impl FileTarget {
                 .into_owned(),
             display_identifier: "SYNTHETIC_FIXTURE_DISK".to_owned(),
             serial: None,
+            model: Some("SYNTHETIC_FIXTURE_MODEL".into()),
             capacity_bytes: capacity,
             sector_bytes: 512,
             table_fingerprint: sha256(b"SYNTHETIC_FIXTURE_TABLE"),

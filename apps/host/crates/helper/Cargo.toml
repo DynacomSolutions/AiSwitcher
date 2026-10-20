@@ -10,6 +10,7 @@ ais-host-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+libc = "=0.2.191"
 
 [features]
 file-test = ["ais-host-core/file-test"]

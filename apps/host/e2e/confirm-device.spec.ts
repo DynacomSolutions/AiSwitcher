@@ -16,6 +16,10 @@ test("device preview requires the exact identifier and refresh invalidates the o
   await expect(preview).toBeVisible();
   await expect(preview.getByText("Create layout", { exact: true })).toBeVisible();
   await expect(preview.getByText("Current partitions")).toBeVisible();
+  await expect(preview.getByText("Synthetic device", { exact: true })).toBeVisible();
+  await expect(preview.getByText("SYNTHETIC_FIXTURE_serial_1", { exact: true })).toBeVisible();
+  await expect(preview.getByText("SYNTHETIC_FIXTURE_CONNECTION", { exact: true })).toBeVisible();
+  await expect(page.getByRole("definition").filter({ hasText: "SYNTHETIC_FIXTURE_serial_1" })).toHaveCount(1);
 
   const typedIdentifier = await preview.getByTestId("device-identifier").textContent();
   // This is the fixture's displayed device identifier, not its separate model label.

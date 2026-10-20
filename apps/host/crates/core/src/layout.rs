@@ -407,6 +407,9 @@ pub fn synthetic_sfdisk_contract_fixture() -> Vec<u8> {
         let crc = crc32(&header[..92]);
         header[16..20].copy_from_slice(&crc.to_le_bytes());
     }
+    crate::drive_identity::fixture_esp(
+        &mut image[(esp_start * 512) as usize..(esp_end * 512) as usize],
+    );
     image
 }
 

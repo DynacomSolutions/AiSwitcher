@@ -137,6 +137,8 @@ impl PreparedExchange {
         plan: &WritePlan,
     ) -> Result<(), &'static str> {
         self.validate_plan(plan)?;
+        plan.verify_created_target(target)
+            .map_err(|_| "The drive changed before formatting.")?;
         let deadline = Instant::now() + Duration::from_secs(120);
         let mut expected = [0u8; 64 * 1024];
         let mut actual = [0u8; 64 * 1024];
@@ -146,7 +148,7 @@ impl PreparedExchange {
                 if Instant::now() >= deadline {
                     return Err("The exchange write timed out.");
                 }
-                plan.verify_created_target(target)
+                plan.verify_created_layout(target)
                     .map_err(|_| "The drive changed during formatting.")?;
                 let count = ((extent.start + extent.length - offset) as usize).min(expected.len());
                 self.file
@@ -265,8 +267,6 @@ mod tests {
         let plan = WritePlan::create_drive(&image, observation.clone()).unwrap();
         let range = plan.exchange_range().unwrap();
         let reserve_start = range.start + range.length;
-        target.seek(SeekFrom::Start(reserve_start)).unwrap();
-        target.write_all(&[0xa7; 512]).unwrap();
         let tools = std::env::var_os("AIS_HOST_TEST_EXFAT_TOOLS").map(std::path::PathBuf::from);
         let tool = |name: &str| {
             tools
@@ -302,6 +302,12 @@ mod tests {
         assert_eq!(bytes, [0; 512], "formatting refusals precede imaging");
 
         crate::service::write_confirmed(&mut target, deadline, &mut image, &plan, &name).unwrap();
+        target.read_at(reserve_start, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 512], "creation clears persistence");
+        // The sentinel covers the exchange-formatting phase. Creation must
+        // first clear old persistence bytes under the drive identity contract.
+        target.seek(SeekFrom::Start(reserve_start)).unwrap();
+        target.write_all(&[0xa7; 512]).unwrap();
         let mut target = FaultTarget::new(target);
         let mut changed = target.observe().unwrap();
         changed.mount_fingerprint[0] ^= 1;

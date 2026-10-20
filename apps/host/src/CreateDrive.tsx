@@ -118,7 +118,7 @@ export function CreateDrive({ bridge, devices, loading, onRefresh }: { bridge: H
     </div>
     <p id="target-help">Only removable drives that are not in use by this computer are listed.</p>
     {!loading && eligible.length === 0 && <div className="empty-state" role="status"><h2>No eligible drive</h2><p>Connect a removable USB drive, then refresh the list.</p></div>}
-    {selected && <dl className="identity" aria-label="Selected device">
+    {selected && !preview && <dl className="identity" aria-label="Selected device">
       <dt>Model</dt><dd>{selected.model ?? "Unknown"}</dd>
       <dt>Size</dt><dd>{formatSize(selected.capacityBytes)}</dd>
       <dt>Connection</dt><dd>{selected.transport.toUpperCase()}</dd>
@@ -155,6 +155,9 @@ export function CreateDrive({ bridge, devices, loading, onRefresh }: { bridge: H
       <dl>
         <dt>Operation</dt><dd>{preview.operation === "createLayout" ? "Create layout" : preview.operation}</dd>
         <dt>Device</dt><dd data-testid="device-identifier">{preview.displayIdentifier}</dd>
+        <dt>Model</dt><dd>{preview.model ?? "Unknown"}</dd>
+        <dt>Serial</dt><dd>{preview.serial ?? "Not reported"}</dd>
+        <dt>Connection</dt><dd>{preview.connectionIdentity}</dd>
         <dt>Size</dt><dd>{formatSize(preview.capacityBytes)}</dd>
         <dt>Preview</dt><dd data-testid="preview-id">{preview.previewId}</dd>
         <dt>Image digest</dt><dd>{preview.imageDigest}</dd>

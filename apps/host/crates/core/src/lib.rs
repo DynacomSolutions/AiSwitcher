@@ -3,8 +3,10 @@ pub mod conflicts;
 pub mod contract;
 pub mod create;
 pub mod device;
+pub mod drive_identity;
 pub mod escrow;
 pub mod exchange;
+pub mod exchange_root;
 pub mod fetch;
 #[cfg(feature = "file-test")]
 pub mod file_test;
