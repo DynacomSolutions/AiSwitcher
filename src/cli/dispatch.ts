@@ -23,6 +23,7 @@ import { runSwapCommand } from "./swap/dispatch.ts";
 import { runLaunchCommand } from "./launch.ts";
 import { runLocalCommand } from "./local/dispatch.ts";
 import { runStatuslineCommand } from "./statusline.ts";
+import { runLiveCommand } from "./live/dispatch.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
  * and `unretire` are excluded: a sync merging the remote registry while the
@@ -142,6 +143,9 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "local":
         await runLocalCommand(rest, flags);
+        break;
+      case "live":
+        await runLiveCommand(rest, flags);
         break;
       default:
         helpText([command]); // throws the one-line "did you mean" error for an unknown name

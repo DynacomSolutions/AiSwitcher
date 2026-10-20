@@ -1,0 +1,50 @@
+#!/usr/bin/bash
+# Stage the optional AISTEST disk on explicit test boots. Test payloads stay in
+# RAM unless the verified exchange resolver has mounted the selected p4.
+set -euo pipefail
+
+read -r -a kernel_args </proc/cmdline
+test_mode=false
+for kernel_arg in "${kernel_args[@]}"; do
+  [[ "$kernel_arg" == ais.test=1 ]] && test_mode=true
+done
+[[ "$test_mode" == true ]] || exit 0
+
+device=/dev/disk/by-label/AISTEST
+for _ in $(seq 1 50); do
+  [[ -b "$device" ]] && break
+  /usr/bin/udevadm settle --timeout=1 || true
+done
+[[ -b "$device" ]] || exit 0
+
+media=/run/ais-test-media
+/usr/bin/install -d -m 0700 "$media"
+/usr/bin/mount -o ro,nosuid,nodev,noexec "$device" "$media"
+trap '/usr/bin/umount "$media"' EXIT
+
+if [[ -d "$media/scripts" ]]; then
+  /usr/bin/install -d -m 0755 /usr/local/lib/ais-live-test
+  /usr/bin/cp -r --no-preserve=all -- "$media/scripts/." /usr/local/lib/ais-live-test/
+  /usr/bin/find /usr/local/lib/ais-live-test -type f -exec /usr/bin/chmod 0755 {} +
+fi
+if [[ -d "$media/exchange" ]]; then
+  /usr/bin/install -d -m 0700 /run/ais-live-test-media/exchange
+  /usr/bin/cp -r --no-preserve=all -- "$media/exchange/." /run/ais-live-test-media/exchange/
+fi
+if [[ -f "$media/passphrase" ]]; then
+  /usr/bin/keyctl padd user ais-live-exchange @u <"$media/passphrase" >/dev/null
+  if [[ -f "$media/gen-inbox" ]]; then
+    /usr/local/lib/ais-live/resolve-boot-partition exchange
+    /usr/bin/mountpoint -q /mnt/aisx || {
+      echo 'exchange fixture staging requires a verified exchange mount' >&2
+      exit 1
+    }
+    AIS_EXCHANGE_TEST_PASSPHRASE=$(</"$media/passphrase") \
+      /usr/local/lib/ais-live-test/exchange-host.sh fixture inbox /mnt/aisx >/dev/null
+  fi
+fi
+if [[ -f "$media/persist-tmpfs" ]]; then
+  /usr/bin/install -d -m 0700 /mnt/persist
+  /usr/bin/mountpoint -q /mnt/persist || /usr/bin/mount -t tmpfs -o mode=0700 tmpfs /mnt/persist
+fi
+printf 'AIS-LIVE-TEST: media=staged\n' >/dev/ttyS0 || true

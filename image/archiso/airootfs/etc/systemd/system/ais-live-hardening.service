@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply AIS live process isolation before login
+Requires=ais-live-accounts.service
+After=proc.mount ais-live-accounts.service
+Before=getty@tty1.service serial-getty@.service
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+ExecStart=/usr/bin/sysctl --system
+ExecStart=/usr/bin/mount -o remount,nosuid,nodev,noexec,hidepid=2,gid=proc /proc
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

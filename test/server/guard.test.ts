@@ -7,13 +7,13 @@ import { allowedHost, consoleGuard, linuxPeerUid, parseProcNetTcp, type GuardDep
 
 const ME = process.getuid?.() ?? 0;
 
-function appWith(token: string, port: number, peerAddress?: string, peerUid: GuardDeps["peerUid"] = () => ME): Hono {
+function appWith(token: string, port: number, peerAddress?: string, peerUid: GuardDeps["peerUid"] = () => ME, requireBearerToken = false): Hono {
   const app = new Hono();
   app.onError((err, c) => {
     const status = (err as { status?: number }).status ?? 500;
     return c.json({ error: err.message }, status as 500);
   });
-  app.use("/api/*", (c, next) => consoleGuard({ token, port, peerUid, peerPort: 50000, ...(peerAddress ? { peerAddress } : {}) }, c, next));
+  app.use("/api/*", (c, next) => consoleGuard({ token, port, peerUid, peerPort: 50000, requireBearerToken, ...(peerAddress ? { peerAddress } : {}) }, c, next));
   app.get("/api/ping", (c) => c.json({ ok: true }));
   app.post("/api/ping", (c) => c.json({ ok: true }));
   return app;
@@ -48,6 +48,19 @@ describe("consoleGuard", () => {
       headers: { Host: "127.0.0.1:47129" },
     });
     expect(res.status).toBe(200);
+  });
+
+  test("live marker requires a bearer token even for loopback peers", async () => {
+    const previousLive = process.env.AIS_LIVE;
+    process.env.AIS_LIVE = "1";
+    try {
+      const app = appWith(TOKEN, 47129, "127.0.0.1");
+      expect((await app.request("/api/ping", { headers: { Host: "127.0.0.1:47129" } })).status).toBe(401);
+      expect((await app.request("/api/ping", { headers: { Host: "127.0.0.1:47129", Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+    } finally {
+      if (previousLive === undefined) delete process.env.AIS_LIVE;
+      else process.env.AIS_LIVE = previousLive;
+    }
   });
 
   test("rejects an unauthenticated peer with no loopback stamp", async () => {
@@ -218,5 +231,20 @@ describe("/api/health liveness route", () => {
     const body = (await res.json()) as { ok: boolean; version: string };
     expect(body.ok).toBe(true);
     expect(typeof body.version).toBe("string");
+  });
+
+  test("requires the live console bearer token even for loopback health probes", async () => {
+    const previousLive = process.env.AIS_LIVE;
+    process.env.AIS_LIVE = "1";
+    try {
+      const { createApp } = await import("../../src/server/app.ts");
+      const app = createApp({ token: TOKEN, port: 47129, startedAt: Date.now(), peerAddress: "127.0.0.1" });
+      const headers = { Host: "127.0.0.1:47129" };
+      expect((await app.request("/api/health", { headers })).status).toBe(401);
+      expect((await app.request("/api/health", { headers: { ...headers, Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+    } finally {
+      if (previousLive === undefined) delete process.env.AIS_LIVE;
+      else process.env.AIS_LIVE = previousLive;
+    }
   });
 });

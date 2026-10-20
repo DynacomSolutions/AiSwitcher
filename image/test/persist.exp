@@ -1,0 +1,133 @@
+#!/usr/bin/expect -f
+if {$argc < 2 || ![string is integer -strict [lindex $argv 0]] || [lindex $argv 0] < 1} {
+    puts stderr {persist-test: usage: persist.exp <timeout-seconds> <qemu> [arguments]}
+    exit 2
+}
+if {![info exists env(AIS_PERSIST_PHASE)]} { puts stderr {persist-test: phase is required}; exit 2 }
+set phase $env(AIS_PERSIST_PHASE)
+if {$phase ni {created wrong-pass package verify-package retry clean pick verify-pick retention ambiguous}} { puts stderr {persist-test: invalid phase}; exit 2 }
+set requestedMode latest
+if {[info exists env(AIS_TEST_MODE)]} { set requestedMode $env(AIS_TEST_MODE) }
+if {$phase eq "ambiguous" && $requestedMode ni {latest clean}} { puts stderr {persist-test: invalid ambiguity mode}; exit 2 }
+set timeout [lindex $argv 0]
+set command [lrange $argv 1 end]
+set passphrase {SYNTHETIC_FIXTURE_ais_live_persist_passphrase}
+set wrongPassphrase {SYNTHETIC_FIXTURE_ais_live_wrong_passphrase}
+set firstCreate 0
+set persistReady 0
+set kernelUp 0
+set phaseReady 0
+set wrongSent 0
+set rejectionCount 0
+set snapshotChoice 0
+set prePacmanChoice ""
+if {$phase eq "ambiguous"} {
+    foreach name {AIS_QEMU_IMAGE_COPY AIS_PERSIST_CLONE_PATH AIS_PERSIST_BASELINE_FILE} {
+        if {![info exists env($name)]} { puts stderr "persist-test: $name is required for ambiguity checks"; exit 2 }
+    }
+    if {[catch {exec cp -- $env(AIS_QEMU_IMAGE_COPY) $env(AIS_PERSIST_CLONE_PATH)} reason]} {
+        puts stderr "persist-test: could not clone prepared boot disk: $reason"
+        exit 2
+    }
+    set hashline [exec sha256sum -- $env(AIS_QEMU_IMAGE_COPY)]
+    set baseline [lindex $hashline 0]
+    set output [open $env(AIS_PERSIST_BASELINE_FILE) w]
+    puts $output $baseline
+    close $output
+    puts "persist-test: ambiguity clone made after QEMU preparation; baseline=$baseline"
+}
+log_user 1
+spawn -noecho {*}$command
+set child [exp_pid]
+proc fail {reason} {
+    global child spawn_id
+    puts stderr "persist-test: $reason"
+    catch {exec kill -KILL -- $child}
+    catch {close}
+    catch {wait}
+    exit 1
+}
+if {$phase eq "ambiguous"} {
+    expect {
+        -re {AIS-LIVE: stage=boot-identity status=refused reason=ambiguous-base mode=(latest|clean)} {
+            set actualMode $expect_out(1,string)
+            if {$actualMode ne $requestedMode} { fail "wrong ambiguity refusal mode: $actualMode" }
+            puts "persist-test: phase=ambiguous mode=$actualMode refusal verified"
+            catch {exec kill -TERM -- $child}
+            catch {close}
+            catch {wait}
+            exit 0
+        }
+        -re {AIS-LIVE: stage=persist status=ok|AIS-LIVE: stage=first-boot-create status=ok|Kernel panic|emergency shell} {
+            fail {ambiguous boot disk was not refused before persistence setup}
+        }
+        timeout { fail {timeout waiting for ambiguous boot disk refusal} }
+        eof { fail {QEMU exited before ambiguous boot disk refusal} }
+    }
+}
+while {!$phaseReady} {
+    expect {
+        -re {(AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell|Unable to unlock persistence|[0-9]+\)[[:space:]]+pre-pacman-[^\r\n]*|Create encrypted persistence\. Enter a passphrase \(at least 12 characters\): |Confirm passphrase: |AIS persistence passphrase: |AIS-LIVE: stage=first-boot-create status=ok|AIS-LIVE: stage=persist status=ok mode=(latest|pick|clean)|AIS-LIVE: prompt=snapshot-selection|Selection: |AIS-LIVE: stage=kernel-up status=ok|AIS-LIVE: stage=persist-test status=ok phase=[a-z-]+(\r|\n|$))} {
+            set token $expect_out(0,string)
+            if {[regexp {AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell} $token]} { fail {guest reported a boot or assertion failure} }
+            if {[string first {Unable to unlock persistence} $token] >= 0} {
+                if {$phase ne "wrong-pass"} { fail {unexpected unlock retry} }
+                incr rejectionCount
+            } elseif {[regexp {([0-9]+)\)[[:space:]]+pre-pacman-} $token -> choice]} {
+                if {$phase eq "pick"} { set prePacmanChoice $choice }
+            } elseif {[string first {Create encrypted persistence.} $token] >= 0} {
+                if {$phase ne "created" || $firstCreate} { fail {unexpected first-boot create prompt} }
+                send -- "$passphrase\r"
+            } elseif {[string first {Confirm passphrase:} $token] >= 0} {
+                if {$phase ne "created" || $firstCreate} { fail {unexpected passphrase confirmation} }
+                send -- "$passphrase\r"
+            } elseif {[string first {AIS persistence passphrase:} $token] >= 0} {
+                if {$phase eq "wrong-pass" && $wrongSent < 3} {
+                    send -- "$wrongPassphrase\r"
+                    incr wrongSent
+                } else {
+                    send -- "$passphrase\r"
+                }
+            } elseif {[string first {AIS-LIVE: stage=first-boot-create status=ok} $token] >= 0} {
+                if {$phase ne "created" || $firstCreate} { fail {unexpected reformat marker} }
+                set firstCreate 1
+            } elseif {[regexp {AIS-LIVE: stage=persist status=ok mode=(latest|pick|clean)} $token -> mode]} {
+                set wanted latest
+                if {$phase eq "pick"} { set wanted pick }
+                if {$phase eq "clean"} { set wanted clean }
+                if {$mode ne $wanted} { fail "wrong persist mode: $mode" }
+                set persistReady 1
+            } elseif {[string first {AIS-LIVE: prompt=snapshot-selection} $token] >= 0} {
+                if {$phase ne "pick" || $snapshotChoice} { fail {unexpected snapshot chooser} }
+            } elseif {[string first {Selection: } $token] >= 0} {
+                if {$phase ne "pick" || $snapshotChoice} { fail {unexpected snapshot selection} }
+                if {$prePacmanChoice eq ""} { fail {no pre-pacman snapshot was listed} }
+                send -- "$prePacmanChoice\r"
+                set snapshotChoice 1
+            } elseif {[string first {AIS-LIVE: stage=kernel-up status=ok} $token] >= 0} {
+                set kernelUp 1
+            } elseif {[string first {AIS-LIVE: stage=persist-test status=ok} $token] >= 0} {
+                if {![regexp "phase=($phase)(\\r|\\n|$)" $token]} { fail {guest reported the wrong persistence scenario phase} }
+                set phaseReady 1
+            }
+        }
+        timeout { fail {timeout waiting for persistence scenario} }
+        eof { fail {QEMU exited before persistence assertions completed} }
+    }
+}
+if {!$kernelUp || !$persistReady} { fail {required kernel or persistence marker was absent} }
+if {$phase eq "created" && !$firstCreate} { fail {first boot did not create persistence} }
+if {$phase ne "created" && $firstCreate} { fail {existing persistence was re-created} }
+if {$phase eq "wrong-pass" && ($wrongSent != 3 || $rejectionCount != 3)} { fail {three wrong passphrases were not rejected} }
+if {$phase eq "pick" && !$snapshotChoice} { fail {snapshot selection was not exercised} }
+set timeout 120
+expect {
+    eof {}
+    timeout { fail {guest did not power off after assertions} }
+}
+set result [wait]
+if {[llength $result] != 4 || [lindex $result 2] != 0 || [lindex $result 3] != 0} {
+    puts stderr "persist-test: QEMU failed: $result"
+    exit 1
+}
+puts "persist-test: phase=$phase verified"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the staged AIS test scenario (explicit test boots only)
+After=ais-live-test-media.service ais-live-inbox.service ais-guardd.socket getty@tty1.service
+Wants=ais-live-test-media.service
+ConditionKernelCommandLine=ais.test=1
+ConditionPathExists=/usr/local/lib/ais-live-test/orchestrator
+
+[Service]
+Type=simple
+StandardError=journal+console
+ExecStart=/usr/local/lib/ais-live-test/orchestrator
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

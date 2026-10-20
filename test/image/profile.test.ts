@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { checkLine } from "../../scripts/identifier-scan.ts";
+import { checkLine, isPythonShebang } from "../../scripts/identifier-scan.ts";
 
 const profile = "image/archiso";
 const packages = readFileSync(`${profile}/packages.x86_64`, "utf8")
@@ -12,7 +12,7 @@ const profiledef = readFileSync(`${profile}/profiledef.sh`, "utf8");
 
 describe("packages.x86_64", () => {
   test("has the required set", () => {
-    for (const p of ["base", "linux", "mkinitcpio-archiso", "syslinux", "cryptsetup", "btrfs-progs", "exfatprogs", "age", "networkmanager", "sudo", "nodejs", "npm"]) {
+    for (const p of ["base", "linux", "mkinitcpio-archiso", "syslinux", "cryptsetup", "gptfdisk", "util-linux", "btrfs-progs", "exfatprogs", "age", "networkmanager", "sudo", "nodejs", "npm"]) {
       expect(packages).toContain(p);
     }
   });
@@ -49,14 +49,16 @@ describe("herdr licence", () => {
 });
 
 function files(dir: string): string[] {
-  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? files(join(dir, e.name)) : [join(dir, e.name)]));
+  // Symlinks (the guard wrapper directory) point at absolute guest paths.
+  return readdirSync(dir, { withFileTypes: true }).filter((e) => !e.isSymbolicLink()).flatMap((e) => (e.isDirectory() ? files(join(dir, e.name)) : [join(dir, e.name)]));
 }
 
 test("no line under image/ trips the identifier scan", () => {
   const hits: string[] = [];
   for (const f of files("image")) {
-    const state = { inBlock: false };
-    readFileSync(f, "utf8").split("\n").forEach((line, i) => {
+    const lines = readFileSync(f, "utf8").split("\n");
+    const state = { inBlock: false, python: isPythonShebang(lines[0] ?? "") };
+    lines.forEach((line, i) => {
       for (const rule of checkLine(f, line, state)) hits.push(`${f}:${i + 1} ${rule}`);
     });
   }

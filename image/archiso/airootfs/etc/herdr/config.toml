@@ -1,0 +1,6 @@
+# The config is read-only, so herdr cannot save the onboarding choice itself;
+# without this the first-run dialog reopens every boot and captures all keys.
+onboarding = false
+
+[terminal]
+default_shell = "/usr/local/lib/ais-live/ais-agent-pane"

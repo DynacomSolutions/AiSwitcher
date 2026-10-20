@@ -1,0 +1,317 @@
+#!/usr/bin/bash
+set -Eeuo pipefail
+umask 077
+
+readonly MAX_BUNDLE_BYTES=$((64 * 1024 * 1024))
+readonly MAX_OUTBOX_BYTES=$((32 * 1024 * 1024))
+readonly MAX_SAFE_SEQ=9007199254740991
+
+if [[ ${AIS_LIVE_TEST_MODE:-} == 1 && $EUID -ne 0 && -n ${AIS_LIVE_TEST_ROOT:-} ]]; then
+  readonly AISX_ROOT=${AIS_LIVE_TEST_ROOT:?}
+  readonly RUN_ROOT=${AIS_LIVE_TEST_ROOT:?}/run
+  readonly PERSIST_ROOT=${AIS_LIVE_TEST_ROOT:?}/persist
+  readonly AIS_BIN=${AIS_BIN:-ais}
+  readonly SETPRIV_BIN=${AIS_TEST_SETPRIV_BIN:-setpriv}
+else
+  [[ $EUID -eq 0 ]] || { printf '%s\n' 'ais-outbox must run as root' >&2; exit 1; }
+  readonly AISX_ROOT=/mnt/aisx
+  readonly RUN_ROOT=/run
+  readonly PERSIST_ROOT=/mnt/persist
+  readonly AIS_BIN=/usr/local/bin/ais
+  readonly SETPRIV_BIN=/usr/bin/setpriv
+fi
+
+readonly INBOX_DIR=$AISX_ROOT/inbox
+readonly OUTBOX_DIR=$AISX_ROOT/outbox
+readonly PRIVATE_RUN=$RUN_ROOT/ais-live-exchange
+readonly LOCK_FILE=$PRIVATE_RUN/exchange.lock
+readonly STATE_DIR=$PERSIST_ROOT/ais-live-exchange
+
+work_tar=''
+work_plain=''
+work_cipher=''
+cleanup() {
+  [[ -z $work_tar ]] || rm -f -- "$work_tar"
+  [[ -z $work_plain ]] || rm -f -- "$work_plain"
+  [[ -z $work_cipher ]] || rm -f -- "$work_cipher"
+}
+trap cleanup EXIT
+
+run_as_agent() {
+  "$SETPRIV_BIN" --reuid=agent --regid=agent --init-groups \
+    /usr/bin/env -i \
+    HOME=/home/agent USER=agent LOGNAME=agent SHELL=/bin/bash \
+    PATH=/usr/local/bin:/usr/bin:/bin AIS_LIVE=1 \
+    "$@"
+}
+
+key_id() {
+  keyctl search @u user ais-live-exchange
+}
+
+valid_bundle_name() {
+  local lower=${1,,} digits
+  [[ $lower =~ ^bundle-([1-9][0-9]{0,15})\.age$ ]] || return 1
+  digits=${BASH_REMATCH[1]}
+  (( 10#$digits <= MAX_SAFE_SEQ )) || return 1
+  BUNDLE_SEQ=$((10#$digits))
+}
+
+counter() {
+  local action=$1 name=$2 value=${3:-}
+  node - "$STATE_DIR" "$name" "$action" "$value" <<'JS'
+const fs = require("node:fs");
+const path = require("node:path");
+const { constants } = fs;
+const [directory, name, action, rawValue] = process.argv.slice(2);
+if (!/^(?:applied-inbox|outbox)-seq\.json$/.test(name)) throw new Error("invalid exchange state name");
+let dir;
+try {
+  dir = fs.openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const dst = fs.fstatSync(dir);
+  if (!dst.isDirectory() || dst.uid !== process.getuid() || (dst.mode & 0o077) !== 0) throw new Error("exchange state directory ownership or mode is unsafe");
+  const filePath = `/proc/self/fd/${dir}/${name}`;
+  let current;
+  try {
+    const fd = fs.openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o077) !== 0 || st.size > 4096) throw new Error("exchange state file is unsafe");
+      const parsed = JSON.parse(fs.readFileSync(fd, "utf8"));
+      if (parsed.version !== 1 || !Number.isSafeInteger(parsed.seq) || parsed.seq < 0) throw new Error("exchange state value is invalid");
+      current = parsed.seq;
+    } finally { fs.closeSync(fd); }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (action === "read") {
+    process.stdout.write(current === undefined ? "MISSING\n" : `${current}\n`);
+  } else if (action === "write") {
+    const value = Number(rawValue);
+    if (!Number.isSafeInteger(value) || value < 0 || (current !== undefined && value < current)) throw new Error("exchange state may not move backwards");
+    const temp = path.join(`/proc/self/fd/${dir}`, `.${name}.${process.pid}.${require("node:crypto").randomUUID()}.tmp`);
+    const fd = fs.openSync(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify({ version: 1, seq: value }) + "\n"); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(temp, filePath);
+    fs.fsyncSync(dir);
+    process.stdout.write(`${value}\n`);
+  } else throw new Error("invalid exchange state action");
+} catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
+} finally { if (dir !== undefined) fs.closeSync(dir); }
+JS
+}
+
+ensure_state_dir() {
+  local created=0 persist_owner
+  [[ -d $PERSIST_ROOT && ! -L $PERSIST_ROOT ]] || { printf '%s\n' 'AIS-LIVE: persist directory is unavailable or unsafe' >&2; return 1; }
+  persist_owner=$(stat -c '%u' -- "$PERSIST_ROOT")
+  [[ $persist_owner == "$EUID" ]] || { printf '%s\n' 'AIS-LIVE: persist directory is not owned by the service user' >&2; return 1; }
+  if [[ -e $STATE_DIR || -L $STATE_DIR ]]; then
+    [[ -d $STATE_DIR && ! -L $STATE_DIR ]] || { printf '%s\n' 'AIS-LIVE: exchange state directory is unsafe' >&2; return 1; }
+  else
+    mkdir -m 0700 -- "$STATE_DIR"
+    created=1
+  fi
+  [[ $(stat -c '%u:%a' -- "$STATE_DIR") == "$EUID:700" ]] || { printf '%s\n' 'AIS-LIVE: exchange state directory ownership or mode is unsafe' >&2; return 1; }
+  (( created == 0 )) || sync -f -- "$PERSIST_ROOT"
+}
+
+highest_inbox() {
+  local best='' best_seq=0 name seq
+  [[ -d $INBOX_DIR && ! -L $INBOX_DIR ]] || return 1
+  while IFS= read -r -d '' name; do
+    valid_bundle_name "$name" || continue
+    seq=$BUNDLE_SEQ
+    [[ -f $INBOX_DIR/$name && ! -L $INBOX_DIR/$name ]] || continue
+    if (( seq > best_seq )); then best=$INBOX_DIR/$name; best_seq=$seq; fi
+  done < <(find "$INBOX_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\0')
+  [[ -n $best ]] || return 1
+  printf '%s\n' "$best"
+}
+
+apply_inbox() {
+  local source size key inbox_seq last_seq
+  mkdir -p -- "$PRIVATE_RUN"
+  chmod 0700 "$PRIVATE_RUN"
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+  ensure_state_dir
+  source=$(highest_inbox) || { printf '%s\n' 'AIS-LIVE: stage=inbox status=skip reason=no-bundle' >&2; return 0; }
+  size=$(stat -c '%s' -- "$source")
+  if [[ ! $size =~ ^[0-9]+$ ]] || (( size > MAX_BUNDLE_BYTES )); then printf '%s\n' 'AIS-LIVE: stage=inbox status=rejected reason=size' >&2; return 1; fi
+  key=$(key_id) || { printf '%s\n' 'AIS-LIVE: stage=inbox status=deferred reason=key-unavailable' >&2; return 2; }
+  work_plain=$(mktemp "$PRIVATE_RUN/ais-inbox.XXXXXXXX")
+  chmod 0600 "$work_plain"
+  local key_writer
+  exec 3< <(keyctl pipe "$key" || exit; printf '\n')
+  key_writer=$!
+  if ! env -u AGE_PASSPHRASE -u AGE_PASSPHRASE_WORK_FACTOR AGE_PASSPHRASE_FD=3 \
+    age -d -j batchpass <"$source" | head -c "$((MAX_BUNDLE_BYTES + 1))" >"$work_plain"; then
+    exec 3<&-
+    wait "$key_writer" || { printf '%s\n' 'AIS-LIVE: stage=inbox status=deferred reason=key-unavailable' >&2; return 2; }
+    local plain_bytes
+    plain_bytes=$(stat -c '%s' -- "$work_plain")
+    if [[ $plain_bytes =~ ^[0-9]+$ ]] && (( plain_bytes > MAX_BUNDLE_BYTES )); then
+      printf '%s\n' 'AIS-LIVE: stage=inbox status=rejected reason=size' >&2
+    else
+      printf '%s\n' 'AIS-LIVE: stage=inbox status=rejected reason=authentication' >&2
+    fi
+    return 1
+  fi
+  exec 3<&-
+  wait "$key_writer" || { printf '%s\n' 'AIS-LIVE: stage=inbox status=deferred reason=key-unavailable' >&2; return 2; }
+  size=$(stat -c '%s' -- "$work_plain")
+  if [[ ! $size =~ ^[0-9]+$ ]] || (( size > MAX_BUNDLE_BYTES )); then printf '%s\n' 'AIS-LIVE: stage=inbox status=rejected reason=size' >&2; return 1; fi
+  inbox_seq=$(read_manifest_seq "$work_plain" inbox) || { printf '%s\n' 'AIS-LIVE: stage=inbox status=rejected reason=manifest' >&2; return 1; }
+  last_seq=$(counter read applied-inbox-seq.json) || { printf '%s\n' 'AIS-LIVE: stage=inbox status=failed reason=state' >&2; return 1; }
+  [[ $last_seq != MISSING ]] || last_seq=0
+  if (( inbox_seq <= last_seq )); then
+    printf 'AIS-LIVE: stage=inbox status=skip reason=stale seq=%s last=%s\n' "$inbox_seq" "$last_seq" >&2
+    return 0
+  fi
+  if run_as_agent "$AIS_BIN" live apply-inbox --stdin "--last-inbox-seq=$last_seq" <"$work_plain"; then
+    counter write applied-inbox-seq.json "$inbox_seq" >/dev/null || { printf '%s\n' 'AIS-LIVE: stage=inbox status=failed reason=state-write' >&2; return 1; }
+    return 0
+  else
+    local code=$?
+    if (( code == 2 )); then
+      printf '%s\n' 'AIS-LIVE: stage=inbox status=deferred reason=clock-or-conflict' >&2
+      return 2
+    fi
+    printf '%s\n' 'AIS-LIVE: stage=inbox status=rejected reason=apply' >&2
+    return 1
+  fi
+}
+
+read_manifest_seq() {
+  local limit=$MAX_OUTBOX_BYTES
+  [[ $2 != inbox ]] || limit=$MAX_BUNDLE_BYTES
+  node - "$1" "$limit" "$2" <<'JS'
+const fs = require("node:fs");
+const path = process.argv[2];
+const limit = Number(process.argv[3]);
+const expectedKind = process.argv[4];
+let fd;
+function fail(message) { throw new Error(message); }
+function octal(field, label) {
+  const text = field.toString("ascii").replace(/\0.*$/, "").trim();
+  if (!/^[0-7]+$/.test(text)) fail(`invalid tar ${label}`);
+  return Number.parseInt(text, 8);
+}
+try {
+  fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  const info = fs.fstatSync(fd);
+  if (!info.isFile() || info.size > limit) fail("outbox tar is not a bounded regular file");
+  const header = Buffer.alloc(512);
+  if (fs.readSync(fd, header, 0, header.length, 0) !== 512) fail("truncated tar header");
+  if (header[156] !== 0 && header[156] !== 48) fail("outbox manifest must be a regular tar entry");
+  const name = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
+  const prefix = header.subarray(345, 500).toString("utf8").replace(/\0.*$/, "");
+  if (name !== "manifest.json" || prefix !== "") fail("outbox manifest must be the first tar entry");
+  const expected = octal(header.subarray(148, 156), "checksum");
+  const checkHeader = Buffer.from(header);
+  checkHeader.fill(32, 148, 156);
+  if (checkHeader.reduce((sum, byte) => sum + byte, 0) !== expected) fail("invalid tar header checksum");
+  const size = octal(header.subarray(124, 136), "size");
+  if (size > 1024 * 1024) fail("manifest exceeds limit");
+  const payload = Buffer.alloc(size);
+  if (fs.readSync(fd, payload, 0, size, 512) !== size) fail("truncated manifest");
+  const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
+  if (!manifest || Array.isArray(manifest) || typeof manifest !== "object" ||
+      manifest.version !== 1 || manifest.kind !== expectedKind ||
+      !Number.isSafeInteger(manifest.seq) || manifest.seq < 1) fail("bundle manifest sequence is invalid");
+  process.stdout.write(`${manifest.seq}\n`);
+} catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
+} finally {
+  if (fd !== undefined) fs.closeSync(fd);
+}
+JS
+}
+
+log_foreign_outbox_files() {
+  local count=0 _ignored
+  [[ -d $OUTBOX_DIR && ! -L $OUTBOX_DIR ]] || return 0
+  while IFS= read -r -d '' _ignored; do (( count += 1 )); done < <(find "$OUTBOX_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\0')
+  if (( count > 0 )); then
+    printf 'AIS-LIVE: stage=outbox status=ignored-foreign-files count=%s\n' "$count" >&2
+  fi
+}
+
+write_outbox() {
+  local key seq reserved_seq current final last_inbox name
+  mkdir -p -- "$OUTBOX_DIR" "$PRIVATE_RUN"
+  chmod 0700 "$OUTBOX_DIR" "$PRIVATE_RUN"
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+  ensure_state_dir
+  current=$(counter read outbox-seq.json) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=state' >&2; return 1; }
+  if [[ $current == MISSING ]]; then
+    log_foreign_outbox_files
+    current=0
+    counter write outbox-seq.json "$current" >/dev/null || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=state-write' >&2; return 1; }
+  fi
+  (( current < MAX_SAFE_SEQ )) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=sequence-exhausted' >&2; return 1; }
+  reserved_seq=$((current + 1))
+  counter write outbox-seq.json "$reserved_seq" >/dev/null || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=state-write' >&2; return 1; }
+  last_inbox=$(counter read applied-inbox-seq.json) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=state' >&2; return 1; }
+  [[ $last_inbox != MISSING ]] || last_inbox=0
+  work_tar=$(mktemp "$PRIVATE_RUN/ais-outbox.XXXXXXXX.tar")
+  chmod 0600 "$work_tar"
+  if ! run_as_agent "$AIS_BIN" live write-outbox "--seq=$reserved_seq" "--last-inbox-seq=$last_inbox" | head -c "$((MAX_OUTBOX_BYTES + 1))" >"$work_tar"; then
+    printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=collect' >&2
+    return 1
+  fi
+  local bytes
+  bytes=$(stat -c '%s' -- "$work_tar")
+  if [[ ! $bytes =~ ^[0-9]+$ ]] || (( bytes > MAX_OUTBOX_BYTES )); then printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=size' >&2; return 1; fi
+  seq=$(read_manifest_seq "$work_tar" outbox) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=manifest' >&2; return 1; }
+  (( seq == reserved_seq )) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=sequence' >&2; return 1; }
+  key=$(key_id) || { printf '%s\n' 'AIS-LIVE: stage=outbox status=deferred reason=key-unavailable' >&2; return 2; }
+  work_cipher=$(mktemp "$OUTBOX_DIR/.ais-outbox.XXXXXXXX.tmp")
+  chmod 0600 "$work_cipher"
+  local key_writer
+  exec 3< <(keyctl pipe "$key" || exit; printf '\n')
+  key_writer=$!
+  if ! env -u AGE_PASSPHRASE -u AGE_PASSPHRASE_WORK_FACTOR AGE_PASSPHRASE_FD=3 \
+    age -e -j batchpass <"$work_tar" | head -c "$((MAX_OUTBOX_BYTES + 1))" >"$work_cipher"; then
+    exec 3<&-
+    wait "$key_writer" || { printf '%s\n' 'AIS-LIVE: stage=outbox status=deferred reason=key-unavailable' >&2; return 2; }
+    printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=encryption' >&2
+    return 1
+  fi
+  exec 3<&-
+  wait "$key_writer" || { printf '%s\n' 'AIS-LIVE: stage=outbox status=deferred reason=key-unavailable' >&2; return 2; }
+  local cipher_bytes
+  cipher_bytes=$(stat -c '%s' -- "$work_cipher")
+  if [[ ! $cipher_bytes =~ ^[0-9]+$ ]] || (( cipher_bytes > MAX_OUTBOX_BYTES )); then printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=size' >&2; return 1; fi
+  sync -f -- "$work_cipher"
+  final=$OUTBOX_DIR/bundle-$seq.age
+  while IFS= read -r -d '' name; do
+    valid_bundle_name "$name" || continue
+    if (( BUNDLE_SEQ == seq )); then
+      printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=collision' >&2
+      return 1
+    fi
+  done < <(find "$OUTBOX_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\0')
+  [[ ! -e $final && ! -L $final ]] || { printf '%s\n' 'AIS-LIVE: stage=outbox status=failed reason=collision' >&2; return 1; }
+  mv -T -- "$work_cipher" "$final"
+  work_cipher=''
+  sync -f -- "$OUTBOX_DIR"
+  while IFS= read -r -d '' name; do
+    valid_bundle_name "$name" || continue
+    if [[ -f $OUTBOX_DIR/$name && ! -L $OUTBOX_DIR/$name ]] && (( BUNDLE_SEQ < seq )); then rm -f -- "$OUTBOX_DIR/$name"; fi
+  done < <(find "$OUTBOX_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\0')
+  sync -f -- "$OUTBOX_DIR"
+  printf 'AIS-LIVE: stage=outbox status=written seq=%s\n' "$seq" >&2
+}
+
+case ${1:-} in
+  apply-inbox) apply_inbox ;;
+  write-outbox) write_outbox ;;
+  *) printf '%s\n' 'usage: ais-outbox apply-inbox|write-outbox' >&2; exit 64 ;;
+esac

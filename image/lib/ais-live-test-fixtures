@@ -1,0 +1,29 @@
+#!/bin/bash -p
+set -euo pipefail
+
+if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+  echo 'test fixture staging requires root' >&2
+  exit 126
+fi
+
+read -r -a kernel_args </proc/cmdline
+test_mode=false
+for kernel_arg in "${kernel_args[@]}"; do
+  [[ "$kernel_arg" == ais.test=1 ]] && test_mode=true
+done
+[[ "$test_mode" == true ]] || exit 0
+
+source_dir=/run/ais-live-test-media/exchange/test-fixtures
+target_dir=/run/ais-live-test
+for fixture in vendor-upgrade llama-cli; do
+  source_file="$source_dir/$fixture"
+  [[ -f "$source_file" && ! -L "$source_file" && -r "$source_file" ]] || {
+    echo "required test fixture is unavailable: $fixture" >&2
+    exit 1
+  }
+done
+
+/usr/bin/install -d -o root -g root -m 0755 "$target_dir"
+for fixture in vendor-upgrade llama-cli; do
+  /usr/bin/install -o root -g root -m 0755 "$source_dir/$fixture" "$target_dir/$fixture"
+done

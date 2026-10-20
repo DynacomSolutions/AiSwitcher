@@ -1,0 +1,19 @@
+[Unit]
+Description=AIS live guard daemon
+Requires=ais-guardd.socket
+After=ais-guardd.socket
+
+[Service]
+Type=simple
+User=root
+Group=live
+ExecStart=/usr/local/lib/ais-live/ais-guardd
+Restart=on-failure
+RestartSec=1s
+RuntimeDirectory=ais-guard
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+# With NoNewPrivileges and RestrictAddressFamilies, systemd drops CAP_SETUID;
+# guardd needs it to run helpers and the confirmation as agent or live.
+AmbientCapabilities=CAP_SETUID
+RestrictAddressFamilies=AF_UNIX

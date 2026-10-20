@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Herdr treats its configured default shell like a shell executable and may
+# append login or command flags. Never forward those arguments to sudo.
+operation=pane
+if (($# > 0)); then
+  case "$1" in
+    probe|probe-fresh|upgrade|local-start|launch|pane|test-assertions) operation=$1 ;;
+    -l|-lc|-c) operation=pane ;;
+    *) operation=pane ;;
+  esac
+fi
+
+# The tty1 Herdr server exports this marker to its first default pane. Consume
+# it once in the user runtime directory, so later panes remain direct agent
+# shells even though they inherit the server environment.
+if [[ "$operation" == pane && "${AIS_LIVE_TTY1_BOOT:-}" == 1 ]]; then
+  runtime_dir="/run/user/$(/usr/bin/id -u)"
+  if /usr/local/lib/ais-live/ais-live-tty1-claim "$runtime_dir"; then
+    exec /usr/local/lib/ais-live/ais-live-boot
+  fi
+fi
+
+started=$SECONDS
+status=0
+/usr/bin/sudo -n -u agent /usr/local/lib/ais-live/agent-exec "$operation" || status=$?
+# A pane that dies within two seconds never reached a usable shell; leave a reason in the journal.
+if ((status != 0 && SECONDS - started < 2)); then
+  /usr/bin/logger -t ais-agent-pane "agent $operation exited with status $status within 2s"
+fi
+exit "$status"

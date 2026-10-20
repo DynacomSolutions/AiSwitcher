@@ -14,7 +14,7 @@ out=$(realpath -m -- "$2")
 [[ -f $source_path || -d $source_path ]] || die 'source must be a regular ISO or directory'
 [[ ! -e $out && ! -L $out ]] || die 'output already exists'
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for tool in sfdisk mkfs.fat mcopy mke2fs mkfs.exfat syslinux grub-mkstandalone dd; do
+for tool in sfdisk jq mkfs.fat mcopy mke2fs mkfs.exfat syslinux grub-mkstandalone dd; do
     command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 
@@ -48,7 +48,7 @@ sfs=$tree/arch/x86_64/airootfs.sfs
 for path in "$kernel" "$initrd" "$sfs"; do [[ -s $path ]] || die "missing payload: ${path##*/}"; done
 
 # Align every partition to a MiB. Reserve room for FAT metadata, bootloaders
-# and ext4 metadata. p5 deliberately does not exist until first boot.
+# and ext4 metadata. The host app creates p5 when it writes the drive.
 mib=$((1024 * 1024))
 esp_mib=$(( ( $(stat -c %s "$kernel") + $(stat -c %s "$initrd") + mib - 1 ) / mib + 64 ))
 (( esp_mib >= 128 )) || esp_mib=128
@@ -83,7 +83,7 @@ cp "$here/../archiso/grub/raw.cfg" "$work/esp/boot/grub/grub.cfg"
 grub_args=()
 if [[ -n ${AIS_GRUB_MODULE_DIR:-} ]]; then grub_args+=(-d "$AIS_GRUB_MODULE_DIR"); fi
 grub-mkstandalone "${grub_args[@]}" -O x86_64-efi --locales='' --fonts='' \
-    --modules='part_gpt fat search search_label configfile linux normal serial' \
+    --modules='part_gpt fat regexp configfile linux normal serial halt' \
     -o "$work/esp/EFI/BOOT/BOOTX64.EFI" "boot/grub/grub.cfg=$here/../archiso/efiboot/grub.cfg"
 
 truncate -s "$((esp_sectors * 512))" "$work/esp.img"
@@ -97,7 +97,7 @@ syslinux --install --offset "$((esp_start * 512))" --directory /syslinux "$out"
 dd if="$gptmbr" of="$out" bs=440 count=1 conv=notrunc status=none
 
 truncate -s "$((base_sectors * 512))" "$work/base.img"
-mke2fs -q -t ext4 -F -L AISBASE -m 0 -d "$work/base" "$work/base.img"
+mke2fs -q -t ext4 -F -O ^has_journal -L AISBASE -m 0 -d "$work/base" "$work/base.img"
 dd if="$work/base.img" of="$out" bs=512 seek="$base_start" conv=notrunc,sparse status=none
 truncate -s "$((exchange_sectors * 512))" "$work/exchange.img"
 mkfs.exfat -L AISX "$work/exchange.img"

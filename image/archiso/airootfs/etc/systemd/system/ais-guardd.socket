@@ -1,0 +1,13 @@
+[Unit]
+Description=AIS live guard request socket
+
+[Socket]
+ListenStream=/run/ais-guard.sock
+Backlog=8
+SocketMode=0666
+SocketUser=root
+SocketGroup=root
+Accept=no
+
+[Install]
+WantedBy=sockets.target

@@ -4,3 +4,4 @@ dist/
 .crush/
 .claude/
 mods/**/.claude-plugin/types/
+__pycache__/

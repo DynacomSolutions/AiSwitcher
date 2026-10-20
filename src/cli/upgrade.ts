@@ -19,6 +19,7 @@ import type { ToolConfig } from "../identities/types.ts";
 import { cyan, dim, green, red, yellow } from "./colors.ts";
 import { spinnerChar, withLiveRender } from "./live.ts";
 import { insideHerdrPane } from "./herdr.ts";
+import { isAisLive } from "../shared/live-mode.ts";
 import {
   applyUpgradeEvent,
   createUpgradeRows,
@@ -210,6 +211,7 @@ export interface UpgradeDeps {
    * runner pre-checks it and skips the row instead of counting a failure
    * herdr's own contract guarantees. */
   insideHerdr?(): boolean;
+  liveImage?(): boolean;
   /** Fully-captured installer run (see spawnCaptured): output is buffered
    * per tool and only surfaced on failure or in non-TTY failure reports,
    * never streamed into the live status list. */
@@ -296,6 +298,10 @@ export interface UpgradeSummary {
   checked: number;
   failed: number;
   skipped: number;
+}
+
+export function upgradeCommandExitCode(summary: UpgradeSummary): 0 | 1 {
+  return summary.failed > 0 ? 1 : 0;
 }
 
 function stripAnsi(value: string): string {
@@ -393,6 +399,7 @@ function defaultDeps(log: (message: string) => void = console.log): UpgradeDeps 
     resolve: (binaryName) => resolveRealBinary(binaryName),
     herdrBinary: () => resolveHerdrBinary() ?? null,
     insideHerdr: () => insideHerdrPane(process.env),
+    liveImage: () => isAisLive(),
     spawn: async (command, args) => await spawnCaptured(command, args, {}),
     capture: async (command, args) => await spawnCapturedBounded(command, args, {}, 10_000),
     managedBinaryExists: async (binaryName) =>
@@ -884,6 +891,13 @@ export async function runUpgradeWithDeps(
       deps.log(`${prefix} ${yellow(logReason)}`);
       emit(hooks, { type: "skip", id: name, detail: skipDetail });
     };
+    if (deps.liveImage?.()) {
+      summary.skipped++;
+      const detail = "skipped (herdr is managed by the live image)";
+      deps.log(`${prefix} herdr update skipped: herdr is managed by the live image`);
+      emit(hooks, { type: "skip", id: name, detail });
+      return;
+    }
     // Pre-check: herdr's updater refuses while this process sits in a herdr
     // pane (HERDR_* env), and that refusal is herdr's contract, not an
     // upgrade failure. Skip before spawning anything.
@@ -1054,4 +1068,5 @@ export async function runUpgrade(): Promise<void> {
   const elapsed = formatSeconds(Date.now() - startedAt);
   for (const failure of failures) printFailureDetails(failure, prefix, live);
   printUpgradeSummary(prefix, summary, elapsed);
+  if (upgradeCommandExitCode(summary) !== 0) process.exitCode = 1;
 }

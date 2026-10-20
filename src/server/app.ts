@@ -11,6 +11,7 @@ import { isOnline } from "../shared/connectivity.ts";
 import { discoverLocalModels, resolveLlamaRunner } from "../shared/local-models.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { consoleGuard, type GuardDeps } from "./guard.ts";
+import { isAisLive } from "../shared/live-mode.ts";
 import { type AuthRefreshScheduler } from "./auth-refresh.ts";
 import { type SpendGuardScheduler } from "./spend-guard.ts";
 import { type HerdrBridgeScheduler } from "./herdr-bridge.ts";
@@ -78,10 +79,13 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     return c.json({ error: err instanceof Error ? err.message : "internal error" }, 500);
   });
 
-  // Unauthenticated liveness probe BEFORE the guard: k8s probes and uptime
-  // checks have no per-boot bearer token, and this must leak nothing beyond
-  // what an HTTP response line already does.
-  app.get("/api/health", (c) => c.json({ ok: true as const, version: pkg.version }));
+  // Normal deployments keep the public liveness probe for k8s and uptime
+  // checks. Live images require the same bearer token as every other API path.
+  app.get(
+    "/api/health",
+    (c, next) => isAisLive() ? consoleGuard(deps, c, next) : next(),
+    (c) => c.json({ ok: true as const, version: pkg.version }),
+  );
 
   app.use("/api/*", (c, next) => consoleGuard(deps, c, next));
 

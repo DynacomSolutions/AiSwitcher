@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+import os,sys
+from ais_guard_policy import pacman_args
+
+def main():
+    try:
+        # This is a convenience-side validation only. The root daemon repeats
+        # the grammar check before any transaction.
+        pacman_args(sys.argv[1:])
+    except (ValueError, IndexError):
+        return 126
+    os.execv('/usr/local/lib/ais-live/ais-guard', ['/usr/local/lib/ais-live/ais-guard','pacman',*sys.argv[1:]])
+
+if __name__=='__main__': sys.exit(main())

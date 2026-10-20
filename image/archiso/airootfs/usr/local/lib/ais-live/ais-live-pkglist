@@ -1,0 +1,33 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+state=${AIS_LIVE_PERSIST_ROOT:-/mnt/persist}/@pkglist
+replay_marker=${AIS_LIVE_REPLAY_MARKER:-/run/ais-live-persist-replay}
+[[ -d "$state" ]] || exit 0
+[[ ! -e "$replay_marker" ]] || exit 0
+exec 9>"$state/package-state.lock"
+flock 9
+export LC_ALL=C
+explicit=$(mktemp "$state/.explicit.XXXXXX")
+trap 'rm -f "$explicit"' EXIT
+pacman -Qqe | sort -u | comm -23 - <(sort -u /etc/ais-live/base-packages) >"$explicit"
+if [[ -e "$state/reinstall-pending" && ! -e "$replay_marker" ]]; then
+    touch "$state/migration-user-additions" "$state/migration-user-removals"
+    while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
+        if grep -Fxq "$package" "$explicit"; then
+            printf '%s\n' "$package" >>"$state/migration-user-additions"
+            awk -v package="$package" '$0 != package' "$state/migration-user-removals" >"$state/migration-user-removals.tmp"
+            mv "$state/migration-user-removals.tmp" "$state/migration-user-removals"
+        else
+            printf '%s\n' "$package" >>"$state/migration-user-removals"
+            awk -v package="$package" '$0 != package' "$state/migration-user-additions" >"$state/migration-user-additions.tmp"
+            mv "$state/migration-user-additions.tmp" "$state/migration-user-additions"
+        fi
+    done
+    sort -u -o "$state/migration-user-additions" "$state/migration-user-additions"
+    sort -u -o "$state/migration-user-removals" "$state/migration-user-removals"
+else
+    install -m 0600 "$explicit" "$state/explicit.tmp"
+    mv "$state/explicit.tmp" "$state/explicit"
+fi
