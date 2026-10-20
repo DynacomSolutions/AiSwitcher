@@ -580,6 +580,15 @@ assert 'RuntimeMaxSec=1800' in runs[1][0]
     expect(src).toContain('threading.Timer(30,p.kill)');
   });
 
+  test('the unit keeps CAP_SETUID so guardd can run helpers as agent or live', () => {
+    const unit = readFileSync(join(import.meta.dir, '../../image/archiso/airootfs/etc/systemd/system/ais-guardd.service'), 'utf8');
+    expect(unit).toMatch(/^AmbientCapabilities=CAP_SETUID$/m);
+  });
+
+  test('repository installs never wait on the closed stdin', () => {
+    expect(daemon).toContain("'/usr/bin/pacman','--noconfirm',*pacargv]");
+  });
+
   test('the confirmation opens focused so typed keys reach it, not the agent pane', () => {
     expect(daemon).toContain("'--placement','overlay','--focus'");
   });

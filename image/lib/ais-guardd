@@ -103,13 +103,8 @@ def _popup(command,devs,expected,timeout):
                 written=os.write(fd,view); view=view[written:]
         finally:os.close(fd)
         live_uid=uid_for('live')
-        home=pwd.getpwnam('live').pw_dir
-        # PID 1 starts the popup as live: runuser's setuid is refused inside this unit.
-        # The nonce is visible in the transient unit's properties; replies are still bound to live by SO_PEERCRED.
-        opened=subprocess.run(['/usr/bin/systemd-run','--uid=live','--gid=live','--wait','--pipe','--collect','--quiet','-p','RuntimeMaxSec=15',
-            '--setenv=PATH=/usr/bin:/bin','--setenv=HOME='+home,'--setenv=XDG_RUNTIME_DIR=/run/user/'+str(live_uid),'--setenv=HERDR_SOCKET_PATH='+herdr_socket(live_uid),
-            '--','/usr/local/bin/herdr','plugin','pane','open','--plugin','ais-guard','--entrypoint','confirm','--placement','overlay','--focus','--env','AIS_GUARD_NONCE='+nonce,'--env','AIS_GUARD_REQ='+rid],
-            env={'PATH':'/usr/bin:/bin'},stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=min(15,max(1,deadline-time.monotonic())),check=False)
+        env={'PATH':'/usr/bin:/bin','HOME':pwd.getpwnam('live').pw_dir,'XDG_RUNTIME_DIR':'/run/user/'+str(live_uid),'HERDR_SOCKET_PATH':herdr_socket(live_uid)}
+        opened=subprocess.run(['/usr/bin/runuser','-u','live','--','/usr/local/bin/herdr','plugin','pane','open','--plugin','ais-guard','--entrypoint','confirm','--placement','overlay','--focus','--env','AIS_GUARD_NONCE='+nonce,'--env','AIS_GUARD_REQ='+rid],env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=min(15,max(1,deadline-time.monotonic())),check=False)
         if opened.returncode!=0:
             # Log herdr's own reason (never the argv, which carries the nonce) so a failed popup is diagnosable.
             sys.stderr.write('ais-guardd: herdr popup open failed (exit %d): %s\n'%(opened.returncode,opened.stderr.decode('utf-8','replace')[:400].replace('\n',' ')))
@@ -262,7 +257,7 @@ def handle(c):
                 if mode=='query':
                     p=subprocess.run(['/usr/bin/pacman',*pacargv],cwd='/',timeout=300,stdin=subprocess.DEVNULL,stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True);send(c,True,'query',p.returncode);return
                 if mode=='repository':
-                    p=subprocess.run(['/usr/bin/systemd-run','--wait','--pipe','--collect','-p','RuntimeMaxSec=1800','--working-directory=/','--','/usr/bin/pacman',*pacargv],timeout=1860,stdin=subprocess.DEVNULL,stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True)
+                    p=subprocess.run(['/usr/bin/systemd-run','--wait','--pipe','--collect','-p','RuntimeMaxSec=1800','--working-directory=/','--','/usr/bin/pacman','--noconfirm',*pacargv],timeout=1860,stdin=subprocess.DEVNULL,stdout=fds[1],stderr=fds[2],env={'PATH':'/usr/bin:/bin','LANG':'C'},close_fds=True)
                     send(c,True,'pacman',p.returncode);return
             if op=='aur-install':
                 files=[args[2]] if len(args)==3 and args[0]=='install' else []
@@ -295,6 +290,7 @@ def handle(c):
             send(c,True,'package',code);return
         raise ValueError('unsupported operation')
     except Exception as e:
+        print('refused: '+str(e)[:200],file=sys.stderr,flush=True)
         try:send(c,False,str(e)[:200])
         except OSError:pass
     finally:
