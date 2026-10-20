@@ -172,6 +172,8 @@ if [[ "$agent_pane" != true ]]; then
         [[ -n "$pane_id" ]] || continue
         printf 'AIS-LIVE-DIAG: pane=%s info=%s\n' "$pane_id" "$($herdr pane process-info --pane "$pane_id" 2>&1 | /usr/bin/tr -d '\n' | /usr/bin/cut -c1-300)"
     done <<<"$new_ids"
+    printf 'AIS-LIVE-DIAG: panes=%s\n' "$($herdr api snapshot 2>&1 | /usr/bin/tr -d '\n' | /usr/bin/cut -c1-400)" >&2
+    /usr/bin/journalctl -b --no-pager -o cat -t ais-agent-pane -t sudo -n 20 2>&1 | /usr/bin/sed 's/^/AIS-LIVE-DIAG: /' >&2
     /usr/bin/ps -eo pid,ppid,user,args --forest 2>/dev/null | /usr/bin/grep -E 'herdr|agent|ais-' | /usr/bin/grep -v grep | /usr/bin/cut -c1-160 | /usr/bin/sed 's/^/AIS-LIVE-DIAG: /' >&2
     fail new-default-pane-not-agent
 fi

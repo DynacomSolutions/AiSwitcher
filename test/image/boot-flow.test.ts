@@ -113,7 +113,7 @@ describe("live boot flow", () => {
     expect(pane).toContain('sudo -n -u agent');
     expect(pane).toContain('ais-live-tty1-claim');
     expect(pane).toContain('exec /usr/local/lib/ais-live/ais-live-boot');
-    expect(pane).toContain('exec /usr/bin/sudo -n -u agent');
+    expect(pane).toContain('/usr/bin/sudo -n -u agent /usr/local/lib/ais-live/agent-exec');
   });
 
   it("claims tty1 boot once only from a protected live runtime directory", async () => {
