@@ -34,6 +34,11 @@ SigLevel = Optional TrustAll
 Server = file://$REPO
 PACMAN
 /usr/bin/pacman --config /run/ais-guard-test/pacman-synthetic.conf -Sy --noconfirm
+# The scenario runs offline: give the image's own repositories empty sync
+# databases so pacman can resolve the synthetic package without a mirror.
+for repo in $(/usr/bin/pacman-conf --repo-list); do
+  [[ -e /var/lib/pacman/sync/$repo.db ]] || bsdtar -czf "/var/lib/pacman/sync/$repo.db" --files-from /dev/null
+done
 
 cp -R "$SOURCES/guard-aur/synthetic-fixture" "$FIXTURES/aur-src/"
 chown -R agent:agent "$FIXTURES/aur-src"

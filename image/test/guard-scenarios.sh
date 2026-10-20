@@ -89,7 +89,7 @@ start_guarded() {
   shift
   : >"$before"
   if [[ -d $REQUESTS ]]; then find "$REQUESTS" -maxdepth 1 -type f -name '*.json' -printf '%f\n' | sort >"$before"; fi
-  run_as_agent "$@" >/dev/null 2>&1 &
+  run_as_agent "$@" >"$TEST_ROOT/guarded.out" 2>&1 &
   GUARDED_PID=$!
   deadline=$((SECONDS + WAIT_BUDGET))
   while (( SECONDS < deadline )); do
@@ -107,7 +107,7 @@ start_guarded() {
       printf 'AIS-GUARD-TEST: case=%s status=prompt reply=%s\n' "$case_name" "$GUARD_POPUP_REPLY"
       return 0
     fi
-    if ! kill -0 "$GUARDED_PID" 2>/dev/null; then mark "$case_name" exited-before-request; guard_diag; wait "$GUARDED_PID" || return 2; return 2; fi
+    if ! kill -0 "$GUARDED_PID" 2>/dev/null; then mark "$case_name" exited-before-request; tail -n 15 "$TEST_ROOT/guarded.out" | sed 's/^/AIS-GUARD-DIAG: /'; guard_diag; wait "$GUARDED_PID" || return 2; return 2; fi
     sleep 0.1
   done
   mark "$case_name" no-request
@@ -274,14 +274,19 @@ PY
 
   if run_as_agent sudo -n true >/dev/null 2>&1; then return 1; else mark sudo-refusal ok; fi
 
-  local fixture_dir=${AIS_GUARD_FIXTURE_DIR:-/var/tmp/ais-guard-test/fixtures}
+  local out fixture_dir=${AIS_GUARD_FIXTURE_DIR:-/var/tmp/ais-guard-test/fixtures}
   local agent_home agent_cache
   agent_home=$(getent passwd agent | cut -d: -f6)
   [[ -n $agent_home ]] || refuse 'agent account is absent' || return
   agent_cache=$agent_home/.cache
   [[ -d $fixture_dir ]] || refuse 'synthetic package fixtures are required' || return
   if [[ -d $fixture_dir ]]; then
-    printf 'y\n' | run_as_agent env PARU_CONF="$fixture_dir/paru.conf" pacman -S synthetic-repo-probe >/dev/null 2>&1 || return 1
+    if ! out=$(printf 'y\n' | run_as_agent env PARU_CONF="$fixture_dir/paru.conf" pacman -S synthetic-repo-probe 2>&1); then
+      mark pacman-repository-install failed
+      printf '%s\n' "$out" | tail -n 15 | sed 's/^/AIS-GUARD-DIAG: /'
+      guard_diag
+      return 1
+    fi
     mark pacman-repository-install ok
     reset_guard || return 1
     before_aur="$TEST_ROOT/aur-before"
