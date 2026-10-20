@@ -73,6 +73,10 @@ export async function clockSnapshot(home: string, deps: ClockSnapshotDeps = {}):
     }
   } catch (error) {
     if (confirmedOffline(error, deps.networkInterfaces ?? networkInterfaces)) online = false;
+    else {
+      const detail = error as { name?: unknown; code?: unknown; cause?: { code?: unknown } } | undefined;
+      console.error(`AIS-LIVE: stage=clock status=online-assumed name=${String(detail?.name)} code=${String(detail?.code)} cause=${String(detail?.cause?.code)}`);
+    }
   }
   return { synchronized, imageBuildTimeMs: buildTimeMs, newestPersistedMtimeMs, ...(httpDateMs === undefined ? {} : { httpDateMs }), online, nowMs: (deps.nowMs ?? Date.now)() };
 }
