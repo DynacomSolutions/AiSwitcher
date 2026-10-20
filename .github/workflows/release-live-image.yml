@@ -1,0 +1,81 @@
+name: Release live image
+
+on:
+  push:
+    tags:
+      - 'live-v*'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  signing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          SIGNING_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$SIGNING_KEY" ]]; then enabled=true; else enabled=false; fi
+          if [[ "$enabled" == false ]]; then echo '::notice::Live image signing and publishing skipped because MINISIGN_SECRET_KEY is not configured.'; fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+  image:
+    uses: ./.github/workflows/live-image.yml
+    with:
+      release: true
+
+  publish:
+    needs: [image, signing]
+    if: ${{ needs.signing.outputs.enabled == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Require tag commit on main
+        run: |
+          set -euo pipefail
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ais-live-release-image
+          path: out/release
+
+      - name: Install minisign
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+
+      - name: Prepare checksums and optional signature
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bash image/build/release-assets.sh out/release/ais-live-production.img out/assets
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cp image/release/notes.md out/release-notes.md
+          gh release create "$TAG" out/assets/ais-live.img out/assets/SHA256SUMS out/assets/SHA256SUMS.minisig \
+            --title "AIS Live $TAG" --notes-file out/release-notes.md --latest=false --verify-tag

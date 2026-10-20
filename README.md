@@ -1158,5 +1158,21 @@ forces a swap. A running session picks the new login up on its next message.
 | `bun run migrate` | One-time, destructive: restructure into `identities/<name>/` (claude/codex only, see above) |
 | `bun run install:shims` | Backup, then copy compiled binaries to `~/.local/bin` |
 
+## Live USB image
+
+Live image releases use `live-v*` tags and publish `ais-live.img`,
+`SHA256SUMS`, and `SHA256SUMS.minisig` when signing is configured. The raw
+image template supports x86_64 legacy BIOS and UEFI. Secure Boot must be
+disabled. The host application personalises the template before boot as
+specified in [the drive identity contract](image/docs/drive-identity.md).
+
+In the downloaded-assets directory, first verify the checksum manifest against
+the trusted published key, then verify the image checksum:
+`minisign -Vm SHA256SUMS -p path/to/checkout/image/release/minisign.pub && sha256sum -c SHA256SUMS`.
+`image/release/minisign.pub` is the release public key. Releases are skipped when
+the `MINISIGN_SECRET_KEY` Actions secret is absent. `MINISIGN_PASSWORD` is
+required for a password-protected key and may be empty only for an unencrypted
+key.
+
 See `AGENTS.md` for full internal design rationale and the key
 decisions-not-to-relitigate.

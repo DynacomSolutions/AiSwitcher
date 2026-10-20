@@ -1,6 +1,12 @@
 name: Live image
 
 on:
+  workflow_call:
+    inputs:
+      release:
+        description: Build and boot-check the production release image
+        required: false
+        type: boolean
   pull_request:
   push:
     branches: [main]
@@ -57,6 +63,10 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        flavour: ${{ inputs.release && fromJSON('["test","production"]') || fromJSON('["test"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -121,7 +131,7 @@ jobs:
         run: |
           set -euo pipefail
           start=$(date +%s)
-          sudo env AIS_STAGE_DIR="$AIS_STAGE_DIR" AIS_IMAGE_TEST_PACKAGES=1 \
+          sudo env AIS_STAGE_DIR="$AIS_STAGE_DIR" AIS_IMAGE_TEST_PACKAGES=${{ matrix.flavour == 'test' && '1' || '0' }} \
             image/build/build.sh >"$RUNNER_TEMP/build.log" 2>&1 || { tail -n 200 "$RUNNER_TEMP/build.log"; exit 1; }
           tail -n 30 "$RUNNER_TEMP/build.log"
           echo "build_seconds=$(( $(date +%s) - start ))" | tee "$RUNNER_TEMP/build-time.txt"
@@ -130,8 +140,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo chown -R "$USER" out
-          AIS_GRUB_MODULE_DIR=out/grub-x86_64-efi image/build/assemble.sh out/archiso.iso out/ais-live.img
-          ls -l out/ais-live.img
+          image_name='ais-live.img'
+          if [[ '${{ matrix.flavour }}' == production ]]; then image_name='ais-live-production.img'; fi
+          AIS_GRUB_MODULE_DIR=out/grub-x86_64-efi image/build/assemble.sh out/archiso.iso "out/$image_name"
+          ls -l "out/$image_name"
 
       - name: Stop disk sampler
         if: always()
@@ -173,7 +185,7 @@ jobs:
       - name: Upload the ISO
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: archiso
+          name: archiso-${{ matrix.flavour }}
           path: |
             out/archiso.iso
             out/build-info.json
@@ -182,8 +194,8 @@ jobs:
       - name: Upload the raw disk image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ais-live-image
-          path: out/ais-live.img
+          name: ais-live-${{ matrix.flavour == 'test' && 'image' || 'release-image' }}
+          path: out/${{ matrix.flavour == 'test' && 'ais-live.img' || 'ais-live-production.img' }}
           retention-days: 3
           compression-level: 6
 
@@ -195,6 +207,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        flavour: ${{ inputs.release && fromJSON('["test","production"]') || fromJSON('["test"]') }}
         firmware: [bios, uefi]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -218,7 +231,7 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ais-live-image
+          name: ais-live-${{ matrix.flavour == 'test' && 'image' || 'release-image' }}
           path: out
 
       - name: Boot (${{ matrix.firmware }})
@@ -226,7 +239,9 @@ jobs:
           FIRMWARE: ${{ matrix.firmware }}
         run: |
           set -euo pipefail
-          image/test/run-qemu.sh out/ais-live.img "$FIRMWARE"
+          image_name='ais-live.img'
+          if [[ '${{ matrix.flavour }}' == production ]]; then image_name='ais-live-production.img'; fi
+          image/test/run-qemu.sh "out/$image_name" "$FIRMWARE"
 
       # Negative scenario for both firmwares: a reboot after the poweroff
       # acknowledgement must fail the harness.
@@ -234,13 +249,15 @@ jobs:
         if: matrix.firmware == 'bios'
         run: |
           set -euo pipefail
-          bash image/test/reboot-after-ack.sh out/ais-live.img
+          image_name='ais-live.img'
+          if [[ '${{ matrix.flavour }}' == production ]]; then image_name='ais-live-production.img'; fi
+          bash image/test/reboot-after-ack.sh "out/$image_name"
 
       - name: Upload serial log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: serial-${{ matrix.firmware }}
+          name: serial-${{ matrix.flavour }}-${{ matrix.firmware }}
           path: |
             out/qemu-*/serial.log
             out/qemu-*/qmp.log
