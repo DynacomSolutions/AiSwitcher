@@ -31,7 +31,7 @@ describe.skipIf(!available)("raw GPT assembly", () => {
       "0FC63DAF-8483-4772-8E79-3D69D8477DE4", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
     ]);
     expect(run(["sfdisk", "--verify", output]).exitCode).toBe(0);
-    expect(statSync(output).size).toBeLessThan(3 * 1024 ** 3);
+    expect(statSync(output).size).toBeLessThan(2 * 1024 ** 3);
     for (const [index, label] of [[1, "AISBOOT"], [2, "AISBASE"], [3, "AISX"]] as const) {
       const offset = String(table.partitions[index].start * 512);
       expect(run(["blkid", "-p", "-O", offset, "-s", "LABEL", "-o", "value", output]).stdout.toString().trim()).toBe(label);

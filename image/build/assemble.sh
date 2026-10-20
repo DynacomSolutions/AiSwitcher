@@ -60,7 +60,7 @@ base_sectors=$((base_mib * 2048))
 exchange_start=$((base_start + base_sectors))
 exchange_sectors=$((32 * 2048))
 image_sectors=$((exchange_start + exchange_sectors + 2048))
-(( image_sectors * 512 < 3 * 1024 * mib )) || die 'image exceeds the 3 GiB assembly budget'
+bash "$here/assert-image-size.sh" "$((image_sectors * 512))"
 (set -o noclobber; : > "$out") || die 'cannot create output exclusively'
 truncate -s "$((image_sectors * 512))" "$out"
 sfdisk "$out" <<EOF
