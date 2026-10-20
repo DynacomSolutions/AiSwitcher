@@ -64,13 +64,14 @@ export function configHash(path: string, bytes: Uint8Array): string {
   return hash(new TextEncoder().encode(JSON.stringify(stable(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(canonical))))));
 }
 
-function plausible(clock: InboxClock): boolean {
-  if (![clock.nowMs, clock.imageBuildTimeMs, clock.newestPersistedMtimeMs].every(Number.isFinite)) return false;
-  if (clock.nowMs <= clock.imageBuildTimeMs) return false;
-  if (clock.nowMs < clock.newestPersistedMtimeMs) return false;
-  if (clock.online && (clock.httpDateMs === undefined || !Number.isFinite(clock.httpDateMs) || Math.abs(clock.nowMs - clock.httpDateMs) > 60 * 60 * 1000)) return false;
-  if (clock.httpDateMs !== undefined && Math.abs(clock.nowMs - clock.httpDateMs) > 60 * 60 * 1000) return false;
-  return true;
+// Names the first failed check so a deferral can say why; undefined means plausible.
+function implausibleReason(clock: InboxClock): string | undefined {
+  if (![clock.nowMs, clock.imageBuildTimeMs, clock.newestPersistedMtimeMs].every(Number.isFinite)) return "clock-input";
+  if (clock.nowMs <= clock.imageBuildTimeMs) return "before-image-build";
+  if (clock.nowMs < clock.newestPersistedMtimeMs) return "before-persisted-write";
+  if (clock.online && (clock.httpDateMs === undefined || !Number.isFinite(clock.httpDateMs))) return "online-without-http-date";
+  if (clock.httpDateMs !== undefined && Math.abs(clock.nowMs - clock.httpDateMs) > 60 * 60 * 1000) return "http-date-skew";
+  return undefined;
 }
 
 function seconds(value: unknown, key: string): number | undefined {
@@ -220,9 +221,11 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
       return { applied: 0, skipped: bundle.manifest.entries.length, conflicts: [], lastInboxSeq };
     }
     const authEntries = bundle.manifest.entries.filter((entry) => entry.class === "auth");
-    const authReady = authEntries.length === 0 || plausible(deps.clock);
+    const clockProblem = authEntries.length === 0 ? undefined : implausibleReason(deps.clock);
+    const authReady = clockProblem === undefined;
     if (!authReady) {
-      deps.log?.("AIS-LIVE: stage=inbox status=deferred");
+      const { online } = deps.clock;
+      deps.log?.(`AIS-LIVE: stage=inbox status=deferred reason=clock-${clockProblem} online=${online}`);
       return { applied: 0, skipped: bundle.manifest.entries.length, conflicts: [], deferred: "clock is not plausible for credential merge", lastInboxSeq };
     }
 
