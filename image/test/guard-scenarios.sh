@@ -353,7 +353,7 @@ probe_approved() {
 sandbox_probe() {
   preflight || return
   mkdir -p "$TEST_ROOT"
-  trap 'cryptsetup close aisprobe >/dev/null 2>&1' RETURN
+  trap 'cryptsetup close aisprobe >/dev/null 2>&1 || true' RETURN
   GUARD_HERDR_SOCKET=$(LIVE_UID=$(id -u live) herdr_socket_path) || refuse 'live herdr socket absent' || return
   export GUARD_HERDR_SOCKET
   # cryptsetup reads the key from stdin through the passed descriptor.
