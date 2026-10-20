@@ -136,6 +136,22 @@ def _mdadm_new_array_index(args):
     return None
 
 
+_MAPPING_NAME = re.compile(r'[A-Za-z0-9_.-]+')
+
+
+def _cryptsetup_close_mapping(args):
+    """Mapping name for cryptsetup close, luksClose or remove, or None."""
+    positional = [a for a in args if not a.startswith('-')]
+    if len(positional) >= 2 and positional[0] in ('close', 'luksClose', 'remove'):
+        name = positional[1]
+        if name.startswith('/dev/mapper/'):
+            return None
+        if not _MAPPING_NAME.fullmatch(name) or name in ('.', '..'):
+            raise ValueError('invalid mapping name')
+        return name
+    return None
+
+
 def _candidate_refs(name, args):
     """Yield (index, prefix, path) only for syntactically plausible device operands."""
     refs = []
@@ -179,6 +195,7 @@ def resolve_devices(name, args, cwd):
     devices = []
     seen_rdev = set()
     new_array = _mdadm_new_array_index(rewritten) if name == 'mdadm' else None
+    mapping = _cryptsetup_close_mapping(rewritten) if name == 'cryptsetup' else None
     for index, prefix, original in _candidate_refs(name, rewritten):
         if not original or '\x00' in original:
             continue
@@ -215,6 +232,17 @@ def resolve_devices(name, args, cwd):
         if rdev not in seen_rdev:
             devices.append((original, canonical, rdev))
             seen_rdev.add(rdev)
+    if mapping is not None:
+        # close/luksClose/remove name a mapping, not a path; approve the mapped device without rewriting argv.
+        canonical = os.path.realpath('/dev/mapper/' + mapping)
+        try:
+            info = os.stat(canonical)
+        except OSError:
+            raise ValueError('device path does not resolve')
+        if not stat.S_ISBLK(info.st_mode) or os.path.commonpath(('/dev', canonical)) != '/dev':
+            raise ValueError('device path does not resolve')
+        if int(info.st_rdev) not in seen_rdev:
+            devices.append((mapping, canonical, int(info.st_rdev)))
     return rewritten, devices
 
 

@@ -106,6 +106,7 @@ class FakePath:
             '/work/link': '/dev/mockblk',
             '/work/relative-link': '/dev/mockblk',
             '/dev/escape': '/outside/file',
+            '/dev/mapper/vault': '/dev/mockblk2',
         }.get(path, path)
     @staticmethod
     def join(*paths): return old_path.join(*paths)
@@ -144,6 +145,14 @@ try:
             raise AssertionError(bad)
         except ValueError as e:
             assert str(e) == 'device path does not resolve', (bad, e)
+    argv, devices = p.resolve_devices('cryptsetup', ['close', 'vault'], '/work')
+    assert argv == ['close', 'vault'] and devices == [('vault', '/dev/mockblk2', 78)]
+    for bad, why in ((['close', 'gone'], 'device path does not resolve'), (['luksClose', '../x'], 'invalid mapping name')):
+        try:
+            p.resolve_devices('cryptsetup', bad, '/work')
+            raise AssertionError(bad)
+        except ValueError as e:
+            assert str(e) == why, (bad, e)
     argv, devices = p.resolve_devices('cat', ['/dev/mockblk', '/dev/mockblk2'], '/work')
     assert argv == ['/dev/mockblk', '/dev/mockblk2']
     assert devices == [('/dev/mockblk', '/dev/mockblk', 77), ('/dev/mockblk2', '/dev/mockblk2', 78)]
