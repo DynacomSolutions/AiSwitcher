@@ -122,6 +122,20 @@ def _is_dev_path(path):
     return isinstance(path, str) and path.startswith('/dev/') and '\x00' not in path
 
 
+_MDADM_ARRAY = re.compile(r'/dev/(md[0-9]+|md/[A-Za-z0-9_.-]+)')
+
+
+def _mdadm_new_array_index(args):
+    """Index of the array operand that follows --create or --build, or None."""
+    for i, token in enumerate(args):
+        if token in ('--create', '-C', '--build', '-B'):
+            for j in range(i + 1, len(args)):
+                if not args[j].startswith('-'):
+                    return j
+            return None
+    return None
+
+
 def _candidate_refs(name, args):
     """Yield (index, prefix, path) only for syntactically plausible device operands."""
     refs = []
@@ -164,6 +178,7 @@ def resolve_devices(name, args, cwd):
     rewritten = list(args)
     devices = []
     seen_rdev = set()
+    new_array = _mdadm_new_array_index(rewritten) if name == 'mdadm' else None
     for index, prefix, original in _candidate_refs(name, rewritten):
         if not original or '\x00' in original:
             continue
@@ -179,6 +194,9 @@ def resolve_devices(name, args, cwd):
         except OSError:
             # A spelled /dev target that is missing or inaccessible must not fall back
             # to an unprivileged execution path as if it were an ordinary file.
+            # mdadm --create and --build name an array that does not exist yet; its members are the approved targets.
+            if index == new_array and _MDADM_ARRAY.fullmatch(canonical):
+                continue
             if spelled_in_dev:
                 raise ValueError('device path does not resolve')
             continue

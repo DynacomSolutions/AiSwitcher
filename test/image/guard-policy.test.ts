@@ -135,6 +135,15 @@ try:
     argv, devices = p.resolve_devices('hdparm', ['-s', '/dev/mockblk'], '/work')
     assert argv == ['-s', '/dev/mockblk']
     assert devices == [('/dev/mockblk', '/dev/mockblk', 77)]
+    argv, devices = p.resolve_devices('mdadm', ['--create', '/dev/md/new', '--level=1', '/dev/mockblk', '/dev/mockblk2'], '/work')
+    assert argv == ['--create', '/dev/md/new', '--level=1', '/dev/mockblk', '/dev/mockblk2']
+    assert devices == [('/dev/mockblk', '/dev/mockblk', 77), ('/dev/mockblk2', '/dev/mockblk2', 78)]
+    for bad in (['--stop', '/dev/md/missing'], ['--create', '/dev/md/new', '/dev/missing'], ['--create', '/dev/sdz', '/dev/mockblk']):
+        try:
+            p.resolve_devices('mdadm', bad, '/work')
+            raise AssertionError(bad)
+        except ValueError as e:
+            assert str(e) == 'device path does not resolve', (bad, e)
     argv, devices = p.resolve_devices('cat', ['/dev/mockblk', '/dev/mockblk2'], '/work')
     assert argv == ['/dev/mockblk', '/dev/mockblk2']
     assert devices == [('/dev/mockblk', '/dev/mockblk', 77), ('/dev/mockblk2', '/dev/mockblk2', 78)]
