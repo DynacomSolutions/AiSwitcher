@@ -99,7 +99,7 @@ start_guarded() {
       done < <(find "$REQUESTS" -maxdepth 1 -type f -name '*.json' -print)
     fi
     if [[ -n $request ]]; then
-      if ! wait_for_popup_text "${GUARD_HERDR_SOCKET:?}"; then mark "$case_name" popup-pane-not-found; return 1; fi
+      if ! wait_for_popup_text "${GUARD_HERDR_SOCKET:?}"; then mark "$case_name" popup-pane-not-found; journalctl -b -u ais-guardd.service --no-pager -o cat 2>/dev/null | tail -n 8 | sed 's/^/AIS-GUARD-DIAG: /'; return 1; fi
       if ! read_popup_reply "${GUARD_HERDR_SOCKET:?}" "$GUARD_POPUP_PANE"; then mark "$case_name" popup-reply-unreadable; return 1; fi
       GUARDED_REQUEST=$request
       mark "$case_name" popup

@@ -59,6 +59,8 @@ case $group in
     date -s '@946684800' >/dev/null || finish clock-set-failed
     run_case auth-deferred
     date -s "@$plausible_now" >/dev/null || finish clock-set-failed
+    # Diagnostic: the offline rule depends on which interfaces carry a non-loopback address.
+    printf 'AIS-EXCHANGE-DIAG: interfaces=%s\n' "$(ip -o addr show 2>/dev/null | awk '{print $2"/"$4}' | paste -sd, -)"
     run_case auth-plausible
     ;;
   *) finish unknown-group ;;
