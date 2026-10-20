@@ -103,16 +103,13 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   live: {
-    usage: "ais live <apply-inbox --stdin|write-outbox>",
-    desc: "Apply an authenticated live-drive inbox or collect an outbox",
+    usage: "ais live <net-check|apply-inbox --stdin|write-outbox>",
+    desc: "Live image diagnostics, inbox and outbox",
     subs: {
+      "net-check": sub("ais live net-check [--json] [--fresh]", "Check internet and local model readiness"),
       "apply-inbox": sub("ais live apply-inbox --stdin", "Apply a verified inbox tar from standard input"),
       "write-outbox": sub("ais live write-outbox", "Write a portable outbox tar to standard output"),
     },
-  },
-  host: {
-    usage: "ais host --stdio",
-    desc: "Private framed transport endpoint for host-app sync",
   },
   statusline: { usage: "ais statusline [--wrap <command>]", desc: "Claude Code statusLine: run <command>, then print cached usage bars" },
   memory: {
@@ -139,6 +136,10 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   tui: { usage: "ais tui", desc: "Terminal dashboard on the local console API" },
+  host: {
+    usage: "ais host --stdio",
+    desc: "Private framed transport endpoint for host-app sync",
+  },
   launch: { usage: "ais launch", desc: "Pick a tool, then an identity or pool, and start it" },
   local: {
     usage: "ais local [list|start [name]] [--json]",

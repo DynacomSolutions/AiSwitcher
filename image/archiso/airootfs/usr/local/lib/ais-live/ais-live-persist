@@ -1,0 +1,57 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+state=${AIS_LIVE_PERSIST_ROOT:-/mnt/persist}/@pkglist
+replay_marker=${AIS_LIVE_REPLAY_MARKER:-/run/ais-live-persist-replay}
+[[ $# -le 1 && ( $# -eq 0 || $1 == --retry ) ]] || exit 2
+exec 9>"$state/package-state.lock"
+flock 9
+[[ -e "$state/reinstall-pending" ]] || exit 0
+next=$(<"$state/next-base-id")
+[[ -n "$next" ]] || { echo 'AIS-LIVE: base-migration status=fail reason=missing-base-id' >&2; exit 1; }
+if [[ -s "$state/migration-explicit" ]] && ! nm-online -q --timeout=15; then
+    echo 'AIS-LIVE: base-migration status=deferred reason=network-unavailable retry=systemctl-start-ais-live-persist-retry.service' >&2
+    exit 10
+fi
+failed=0
+touch "$replay_marker"
+trap 'rm -f "$replay_marker"' EXIT
+while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    if [[ -f "$state/migration-user-removals" ]] && grep -Fxq "$package" "$state/migration-user-removals"; then
+        continue
+    fi
+    if ! pacman -S --noconfirm -- "$package"; then
+        printf 'AIS-LIVE: package-reinstall-failed=%s\n' "$package" >&2
+        failed=1
+    fi
+done < "$state/migration-explicit"
+if (( failed != 0 )); then
+    echo 'AIS-LIVE: base-migration status=partial snapshot-retained=yes' >&2
+    exit 10
+fi
+if [[ -s "$state/migration-user-removals" ]]; then
+    while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
+        pacman -Q "$package" >/dev/null 2>&1 || continue
+        pacman -R --noconfirm -- "$package" || { printf 'AIS-LIVE: package-reconcile-failed=%s\n' "$package" >&2; exit 10; }
+    done < "$state/migration-user-removals"
+fi
+if [[ -s "$state/migration-user-additions" ]]; then
+    while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
+        pacman -Q "$package" >/dev/null 2>&1 && continue
+        pacman -S --noconfirm -- "$package" || { printf 'AIS-LIVE: package-reconcile-failed=%s\n' "$package" >&2; exit 10; }
+    done < "$state/migration-user-additions"
+fi
+export LC_ALL=C
+if ! pacman -Qqe | sort -u | comm -23 - <(sort -u /etc/ais-live/base-packages) >"$state/explicit.tmp"; then
+    echo 'AIS-LIVE: base-migration status=partial reason=package-query-failed snapshot-retained=yes' >&2
+    exit 10
+fi
+chmod 0600 "$state/explicit.tmp"
+mv "$state/explicit.tmp" "$state/explicit"
+install -m 0600 "$state/next-base-id" "$state/base-id.tmp"
+mv "$state/base-id.tmp" "$state/base-id"
+rm -f "$state/reinstall-pending" "$state/next-base-id" "$state/fresh-upper-ready" "$state/migration-explicit" "$state/migration-base-id" "$state/migration-snapshot" "$state/user-changes" "$state/migration-user-additions" "$state/migration-user-removals"
+echo 'AIS-LIVE: base-migration status=ok'

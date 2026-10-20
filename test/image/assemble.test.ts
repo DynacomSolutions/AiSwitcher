@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const tools = ["sfdisk", "mkfs.fat", "mcopy", "mke2fs", "mkfs.exfat", "syslinux", "grub-mkstandalone"];
+const tools = ["sfdisk", "sgdisk", "fallocate", "jq", "mkfs.fat", "mcopy", "mke2fs", "mkfs.exfat", "syslinux", "grub-mkstandalone"];
 const available = tools.every((tool) => Bun.which(tool));
 const scratch = mkdtempSync(join(tmpdir(), "ais-assemble-"));
 const source = join(scratch, "iso");
@@ -11,7 +11,7 @@ const output = join(scratch, "live.img");
 const run = (args: string[], env = {}) => Bun.spawnSync(args, { env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe" });
 
 describe.skipIf(!available)("raw GPT assembly", () => {
-  test("creates the four labelled partitions and installs both bootloaders without a loop device", () => {
+  test("creates the four-partition host template and installs both bootloaders without a loop device", () => {
     mkdirSync(join(source, "arch/boot/x86_64"), { recursive: true });
     mkdirSync(join(source, "arch/x86_64"), { recursive: true });
     for (const file of ["arch/boot/x86_64/vmlinuz-linux", "arch/boot/x86_64/initramfs-linux.img", "arch/x86_64/airootfs.sfs"]) {
@@ -41,9 +41,12 @@ describe.skipIf(!available)("raw GPT assembly", () => {
       expect(run(["mdir", "-a", "-i", fat, `::${file}`]).exitCode).toBe(0);
     }
     const config = run(["mtype", "-i", fat, "::/syslinux/syslinux.cfg"]).stdout.toString();
-    expect(config).toContain("archisodevice=/dev/disk/by-label/AISBASE");
+    expect(config).toContain("archisodevice=/dev/disk/by-partuuid/HOST_APP_REQUIRED");
+    expect(config).toContain("ais.base=HOST_APP_REQUIRED ais.exchange=HOST_APP_REQUIRED ais.drive=HOST_APP_REQUIRED");
+    expect(config).toContain("copytoram=n");
     expect(config).not.toContain("ais.test=");
     expect(config).not.toContain("console=ttyS0");
+    expect(readFileSync("image/build/assemble.sh", "utf8")).toContain("-O ^has_journal -L AISBASE");
     expect(run(["bash", "image/build/assemble.sh", source, output]).exitCode).not.toBe(0);
   }, 120_000);
 
@@ -85,6 +88,9 @@ server.close()
       expect(boot.exitCode).toBe(0);
       const work = boot.stdout.toString().match(/qemu-test: work files: ([^\n]+)/)?.[1];
       expect(work).toBeDefined();
+      const prepared = JSON.parse(run(["sfdisk", "--json", `${work}/live.img`]).stdout.toString()).partitiontable;
+      expect(prepared.partitions).toHaveLength(5);
+      expect(prepared.partitions.map((part: { uuid: string }) => part.uuid)).not.toContain("HOST_APP_REQUIRED");
       for (const path of ["syslinux/syslinux.cfg", "boot/grub/grub.cfg"]) {
         const text = run(["mtype", "-i", `${work}/live.img@@2097152`, `::${path}`]).stdout.toString();
         expect(text.match(/console=ttyS0,115200 ais.test=1 ais.smoke=1/g)).toHaveLength(3);

@@ -1,6 +1,6 @@
 namespace eval ais_exchange {
   variable timeout_seconds 90
-  variable case_names {boot replay tamper auth-deferred auth-plausible crafted symlink periodic shutdown}
+  variable case_names {boot replay tamper auth-deferred auth-plausible crafted symlink periodic shutdown outbox exfat-readback}
 }
 
 proc ais_exchange::wait_case {serial_channel case_name} {
@@ -10,13 +10,35 @@ proc ais_exchange::wait_case {serial_channel case_name} {
     error "unknown exchange case: $case_name"
   }
   set timeout $timeout_seconds
-  set pass_pattern [format {AIS-EXCHANGE-TEST: case=%s status=pass\r?\n} $case_name]
-  set fail_pattern [format {AIS-EXCHANGE-TEST: case=%s status=fail reason=([^\r\n]+)} $case_name]
+  set pass_pattern [format {AIS-EXCHANGE-TEST: case=%s status=pass\r*\n} $case_name]
+  set fail_pattern [format {AIS-EXCHANGE-TEST: case=%s status=fail reason=([^\r\n]+)\r*\n} $case_name]
   expect -i $serial_channel \
     -re $pass_pattern { return 0 } \
     -re $fail_pattern { error "exchange case $case_name failed: $expect_out(1,string)" } \
+    -re {AIS-EXCHANGE-TEST: case=orchestrator status=([a-z0-9-]+)\r*\n} { error "exchange orchestrator failed before case $case_name: $expect_out(1,string)" } \
     timeout { error "timed out waiting for exchange case $case_name" } \
     eof { error "serial channel closed before exchange case $case_name completed" }
+}
+
+proc ais_exchange::wait_agent_capability {serial_channel} {
+  variable timeout_seconds
+  set timeout $timeout_seconds
+  expect -i $serial_channel \
+    -re {AIS-EXCHANGE-TEST: case=agent-capability status=pass\r*\n} { return 0 } \
+    -re {AIS-EXCHANGE-TEST: case=agent-capability status=fail reason=([^\r\n]+)\r*\n} { error "agent capability probe failed: $expect_out(1,string)" } \
+    -re {AIS-EXCHANGE-TEST: case=orchestrator status=([a-z0-9-]+)\r*\n} { error "exchange orchestrator failed before capability probe: $expect_out(1,string)" } \
+    timeout { error "timed out waiting for agent capability probe" } \
+    eof { error "serial channel closed before agent capability probe completed" }
+}
+
+proc ais_exchange::wait_orchestrator_done {serial_channel} {
+  variable timeout_seconds
+  set timeout $timeout_seconds
+  expect -i $serial_channel \
+    -re {AIS-EXCHANGE-TEST: case=orchestrator status=done\r*\n} { return 0 } \
+    -re {AIS-EXCHANGE-TEST: case=orchestrator status=([a-z0-9-]+)\r*\n} { error "exchange orchestrator ended with $expect_out(1,string)" } \
+    timeout { error "timed out waiting for exchange orchestrator completion" } \
+    eof { error "serial channel closed before exchange orchestrator completion" }
 }
 
 proc ais_exchange::assert_rejected {serial_channel marker} {

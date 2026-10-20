@@ -7,6 +7,8 @@ export interface OnlineDeps {
   now?: () => number;
   cachePath?: string;
   env?: NodeJS.ProcessEnv;
+  /** Skip the shared online cache for an explicit fresh probe. */
+  refresh?: boolean;
 }
 
 export const ONLINE_TTL_MS = 60_000;
@@ -48,7 +50,7 @@ async function defaultProbe(url: string, timeoutMs: number): Promise<boolean> {
 export async function isOnline(deps: OnlineDeps = {}): Promise<boolean> {
   const now = deps.now ?? Date.now;
   const cachePath = deps.cachePath ?? defaultPath();
-  const hit = readEntry(cachePath);
+  const hit = deps.refresh ? undefined : readEntry(cachePath);
   if (hit && hit.at <= now() && now() - hit.at < (hit.online ? ONLINE_TTL_MS : OFFLINE_TTL_MS)) return hit.online;
   const url = (deps.env ?? process.env).AIS_ONLINE_PROBE_URL || DEFAULT_PROBE_URL;
   let online = false;

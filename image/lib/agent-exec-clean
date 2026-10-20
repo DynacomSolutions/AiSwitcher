@@ -1,0 +1,72 @@
+#!/bin/bash -p
+set -euo pipefail
+
+operation=${1:-pane}
+if (($# != 1)); then echo 'agent-exec-clean accepts one fixed operation' >&2; exit 126; fi
+if [[ "$(/usr/bin/id -un)" != agent ]]; then echo 'agent-exec must run as agent' >&2; exit 126; fi
+cd -- "$HOME"
+
+test_mode=false
+test_probe_port=''
+vendor_mode=''
+read -r -a kernel_args < /proc/cmdline
+for kernel_arg in "${kernel_args[@]}"; do
+  case "$kernel_arg" in
+    ais.test=1) test_mode=true ;;
+    ais.probe=gateway:*) test_probe_port=${kernel_arg#ais.probe=gateway:} ;;
+    ais.probe=*) test_probe_port=invalid ;;
+    ais.vendor=stub) vendor_mode=success ;;
+    ais.vendor=stub-fail-first) vendor_mode=fail-first ;;
+    ais.vendor=*) vendor_mode=invalid ;;
+  esac
+done
+if [[ "$test_mode" == true ]]; then
+  [[ "$vendor_mode" != invalid ]] || { echo 'invalid test vendor policy' >&2; exit 126; }
+  if [[ -n "$test_probe_port" ]]; then
+    [[ "$test_probe_port" =~ ^[0-9]{1,5}$ ]] || { echo 'invalid test probe port' >&2; exit 126; }
+    ((10#$test_probe_port > 0 && 10#$test_probe_port <= 65535)) || { echo 'invalid test probe port' >&2; exit 126; }
+    gateway=$(/usr/bin/ip -color=never -4 route show default | /usr/bin/awk '$1 == "default" { for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }')
+    [[ "$gateway" =~ ^[0-9.]+$ ]] || { echo 'test gateway could not be resolved' >&2; exit 126; }
+    export AIS_ONLINE_PROBE_URL="http://$gateway:$((10#$test_probe_port))/"
+  fi
+  [[ ! -x /run/ais-live-test/llama-cli ]] || export AIS_LLAMA_BIN=/run/ais-live-test/llama-cli
+  if [[ -n "$vendor_mode" && ! -x /run/ais-live-test/vendor-upgrade ]]; then
+    echo 'test vendor fixture is unavailable' >&2
+    exit 126
+  fi
+else
+  [[ -z "$test_probe_port" && -z "$vendor_mode" ]] || {
+    echo 'test-only kernel option requires ais.test=1' >&2
+    exit 126
+  }
+fi
+
+case "$operation" in
+  probe) exec /usr/bin/ais live net-check --json ;;
+  probe-fresh) exec /usr/bin/ais live net-check --json --fresh ;;
+  upgrade)
+    # shellcheck disable=SC1091
+    source /usr/local/lib/ais-live/ais-upgrade-once.sh
+    if [[ "$test_mode" == true && -n "$vendor_mode" ]]; then
+      AIS_TEST_VENDOR_MODE="$vendor_mode" \
+        AIS_TEST_VENDOR_COUNTER=/home/agent/.ais/live/vendor-stub.calls \
+        ais_upgrade_once /home/agent/.ais/live/vendor-cli-installed /run/ais-live-test/vendor-upgrade
+    else
+      ais_upgrade_once /home/agent/.ais/live/vendor-cli-installed /usr/bin/ais upgrade
+    fi
+    exit $?
+    ;;
+  local-start) exec /usr/bin/ais local start ;;
+  test-assertions)
+    [[ "$test_mode" == true ]] || { echo 'test assertion operation requires ais.test=1' >&2; exit 126; }
+    [[ -x /usr/local/lib/ais-live-test/boot-flow-agent-checks ]] || {
+      echo 'boot-flow agent assertions are missing' >&2
+      exit 1
+    }
+    exec /usr/local/lib/ais-live-test/boot-flow-agent-checks
+    ;;
+  launch) exec /usr/bin/ais launch ;;
+  # A pane outlives ais launch, so "Nothing to launch" or a finished tool leaves an agent shell instead of a closed pane.
+  pane) /usr/bin/ais launch || true; exec /bin/bash -l ;;
+  *) echo 'agent-exec-clean refused an unknown operation' >&2; exit 126 ;;
+esac

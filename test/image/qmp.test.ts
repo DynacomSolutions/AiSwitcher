@@ -6,46 +6,51 @@ import { join } from "node:path";
 const scratch = mkdtempSync(join(tmpdir(), "ais-qmp-tests-"));
 const qmpServer = `
 import json, socket, sys
-path, ready, event_json, before_reply, close_without_event = sys.argv[1:]
-server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-server.bind(path)
-server.listen(1)
-open(ready, "w").close()
-connection, _ = server.accept()
-stream = connection.makefile("rwb", buffering=0)
-stream.write(b'{"QMP":{"version":{},"capabilities":[]}}\\r\\n')
-while True:
-    line = stream.readline()
-    if not line:
-        break
-    command = json.loads(line)
-    if command.get("execute") == "qmp_capabilities":
-        stream.write(json.dumps({"return": {}, "id": command["id"]}).encode() + b"\\r\\n")
-    elif command.get("execute") == "cont":
-        if close_without_event == "yes":
-            connection.close()
+path, ready, event_json, before_reply, close_without_event, sessions = sys.argv[1:]
+events = json.loads(event_json)
+if not isinstance(events, list): events = [events]
+for index in range(int(sessions)):
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen(1)
+    open(ready, "w").close()
+    connection, _ = server.accept()
+    stream = connection.makefile("rwb", buffering=0)
+    stream.write(b'{"QMP":{"version":{},"capabilities":[]}}\\r\\n')
+    while True:
+        line = stream.readline()
+        if not line:
             break
-        event = json.loads(event_json)
-        if before_reply == "yes":
-            stream.write(json.dumps(event).encode() + b"\\r\\n")
-        stream.write(json.dumps({"return": {}, "id": command["id"]}).encode() + b"\\r\\n")
-        if before_reply != "yes":
-            stream.write(json.dumps(event).encode() + b"\\r\\n")
-        break
-connection.close()
-server.close()
+        command = json.loads(line)
+        if command.get("execute") == "qmp_capabilities":
+            stream.write(json.dumps({"return": {}, "id": command["id"]}).encode() + b"\\r\\n")
+        elif command.get("execute") == "cont":
+            if close_without_event == "yes":
+                connection.close()
+                break
+            event = events[index]
+            if before_reply == "yes":
+                stream.write(json.dumps(event).encode() + b"\\r\\n")
+            stream.write(json.dumps({"return": {}, "id": command["id"]}).encode() + b"\\r\\n")
+            if before_reply != "yes":
+                stream.write(json.dumps(event).encode() + b"\\r\\n")
+            break
+    stream.close()
+    connection.close()
+    server.close()
+    if index + 1 < int(sessions): __import__("os").unlink(path)
 `;
 writeFileSync(join(scratch, "qmp-server.py"), qmpServer);
 let sequence = 0;
 
-async function scenario(event: unknown, options: { beforeContinueReply?: boolean; closeWithoutEvent?: boolean } = {}) {
+async function scenario(event: unknown, options: { beforeContinueReply?: boolean; closeWithoutEvent?: boolean; expectedBoots?: number } = {}) {
   const directory = join(scratch, `case-${sequence++}`);
   mkdirSync(directory);
   const ready = join(directory, "ready");
   const evidence = join(directory, "shutdown.json");
   const server = Bun.spawn([
     "python3", join(scratch, "qmp-server.py"), "qmp.sock", ready, JSON.stringify(event ?? null),
-    options.beforeContinueReply ? "yes" : "no", options.closeWithoutEvent ? "yes" : "no",
+    options.beforeContinueReply ? "yes" : "no", options.closeWithoutEvent ? "yes" : "no", String(options.expectedBoots ?? 1),
   ], { cwd: directory, stdout: "pipe", stderr: "pipe" });
   const serverOut = new Response(server.stdout).text();
   const serverErr = new Response(server.stderr).text();
@@ -59,6 +64,7 @@ async function scenario(event: unknown, options: { beforeContinueReply?: boolean
 
   const watcher = Bun.spawn([
     "python3", join(process.cwd(), "image/test/qmp-watch.py"), "qmp.sock", evidence,
+    String(options.expectedBoots ?? 1),
   ], { cwd: directory, stdout: "pipe", stderr: "pipe" });
   const watcherOut = new Response(watcher.stdout).text();
   const watcherErr = new Response(watcher.stderr).text();
@@ -82,7 +88,10 @@ async function scenario(event: unknown, options: { beforeContinueReply?: boolean
     if (server.exitCode === null) server.kill();
   }
   if (serverStatus !== 0) throw new Error(`QMP fixture failed: ${fixtureOut} ${fixtureErr}`);
-  return { status: watcherStatus, stdout, stderr, evidence: existsSync(evidence) };
+  return {
+    status: watcherStatus, stdout, stderr, evidence: existsSync(evidence),
+    boots: existsSync(evidence) ? JSON.parse(readFileSync(evidence, "utf8")).boots.length : 0,
+  };
 }
 
 describe.skipIf(!Bun.which("python3"))("QMP shutdown evidence", () => {
@@ -91,6 +100,15 @@ describe.skipIf(!Bun.which("python3"))("QMP shutdown evidence", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("QMP confirmed guest-shutdown");
     expect(result.evidence).toBe(true);
+  });
+
+  test("reconnects and records clean shutdown evidence for every boot", async () => {
+    const shutdown = { event: "SHUTDOWN", data: { guest: true, reason: "guest-shutdown" } };
+    const result = await scenario([shutdown, shutdown], { expectedBoots: 2 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("boot=1");
+    expect(result.stdout).toContain("boot=2");
+    expect(result.boots).toBe(2);
   });
 
   test.each([

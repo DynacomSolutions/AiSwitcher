@@ -66,6 +66,8 @@ const IDENTITY_ENV_VAR = "AI_PROFILE_SWITCHER_SESSION";
 /** AIS's complete-profile boundary for Pi (src/identities/tool-configs.ts). */
 const CONFIG_DIR_ENV_VAR = "PI_CODING_AGENT_DIR";
 const HERDR_TITLE_OWNER_ENV_VAR = "AIS_HERDR_TITLE_OWNER_PID";
+const AIS_LIVE_MARKER = "/etc/ais-live";
+let liveTitleNoteWritten = false;
 
 /** Separator between base provider id and identity name in namespaced
  * provider ids: `anthropic--personal`. Base provider ids and identity names
@@ -1025,6 +1027,13 @@ export default async function aisIdentityExtension(
   let titleLabel: string | undefined;
   const inheritedTitleOwner = process.env[HERDR_TITLE_OWNER_ENV_VAR];
   let titleDisabled = inheritedTitleOwner !== undefined && inheritedTitleOwner !== String(process.pid);
+  if (process.env.AIS_LIVE === "1" || existsSync(AIS_LIVE_MARKER)) {
+    titleDisabled = true;
+    if (!liveTitleNoteWritten) {
+      liveTitleNoteWritten = true;
+      console.error("ais live: herdr tab titles disabled");
+    }
+  }
   // Descendant wrappers can now distinguish this Pi process from the root
   // plugin instance. The PID remains stable across /reload, so reloading the
   // extension does not suppress its own title updates.

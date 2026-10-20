@@ -1,0 +1,10 @@
+pkgname=synthetic-fixture
+pkgver=1
+pkgrel=1
+pkgdesc='Synthetic AIS guard integration package SYNTHETIC_FIXTURE'
+arch=('any')
+license=('custom')
+options=('!debug')
+package() {
+  install -Dm644 /dev/null "$pkgdir/usr/share/ais-guard/synthetic-fixture"
+}

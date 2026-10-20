@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Runtime exchange access is available only after successful persistent boot.
+set -euo pipefail
+mode=${1:?usage: resolve-boot-partition persist|exchange}
+case "$mode" in persist|exchange) ;; *) exit 2 ;; esac
+_resolve_fail() {
+    printf 'AIS-LIVE: stage=boot-partition status=fail mode=%s phase=%s reason=%s\n' \
+        "$mode" "$1" "${PERSIST_REASON:-validation-failed}" >&2
+    exit 1
+}
+if [[ $(cat /run/ais-persist-mode 2>/dev/null) == clean || -e /run/ais-persist-ephemeral ]]; then
+    [[ $mode == exchange ]]
+    exit $?
+fi
+identity_file=/run/ais-persist-identity
+[[ -f $identity_file && ! -L $identity_file && $(stat -c '%u:%a' "$identity_file") == 0:600 ]] || _resolve_fail persistence-identity-file
+# shellcheck source=../../../../etc/initcpio/hooks/ais_persist
+source /etc/initcpio/hooks/ais_persist
+_persist_read_drive || _resolve_fail read-drive
+_persist_resolve || _resolve_fail resolve-persist-drive
+_persist_mapper || _resolve_fail persistence-mapper
+[[ $(cat "$identity_file") == "$PERSIST_IDENTITY" ]] || _resolve_fail persistence-identity-mismatch
+
+if [[ $mode == persist ]]; then
+    cryptsetup isLuks "$PERSIST_PART" &&
+        cryptsetup luksDump "$PERSIST_PART" && _persist_resolve
+    exit $?
+fi
+
+_exchange_resolve() {
+    local entry uuid identity
+    _persist_mapper || return 1
+    uuid=$(_persist_arg ais.exchange) && _persist_uuid_valid "$uuid" || return 1
+    EXCHANGE_PART=/dev/disk/by-partuuid/$uuid
+    # A subshell preserves the persistence target used by mapper validation.
+    EXCHANGE_DEV=$(_persist_unique_target "$uuid" "$EXCHANGE_PART" && printf '%s\n' "$PERSIST_TARGET_DEV") || return 1
+    entry=$(readlink -f "/sys/dev/block/$EXCHANGE_DEV") || return 1
+    [[ $(cat "$entry/partition") == 4 && $(dirname "$entry") == "$PERSIST_DISK_SYSFS" ]] || return 1
+    identity=$EXCHANGE_PART:$EXCHANGE_DEV
+    [[ -z ${EXCHANGE_IDENTITY:-} || $identity == "$EXCHANGE_IDENTITY" ]] || return 1
+    EXCHANGE_IDENTITY=$identity
+}
+
+_exchange_resolve || _resolve_fail resolve-exchange-drive
+if mountpoint -q /mnt/aisx; then
+    [[ $(findmnt -rn -o MAJ:MIN /mnt/aisx) == "$EXCHANGE_DEV" ]] || _resolve_fail mounted-exchange-device
+    _exchange_resolve || _resolve_fail revalidate-mounted-exchange
+    exit 0
+fi
+mkdir -p /mnt/aisx
+_exchange_resolve || _resolve_fail revalidate-exchange-before-mount
+if ! mount -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$EXCHANGE_PART" /mnt/aisx; then
+    _resolve_fail mount-exchange
+fi
+if ! _exchange_resolve || [[ $(findmnt -rn -o MAJ:MIN /mnt/aisx) != "$EXCHANGE_DEV" ]]; then
+    umount /mnt/aisx
+    _resolve_fail validate-mounted-exchange
+fi

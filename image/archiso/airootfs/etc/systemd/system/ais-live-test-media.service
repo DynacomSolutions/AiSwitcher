@@ -1,0 +1,15 @@
+[Unit]
+Description=Stage AIS test media (explicit test boots only)
+DefaultDependencies=no
+After=local-fs.target ais-live-exchange.service
+Before=ais-live-inbox.service ais-live-models.service ais-live-test-fixtures.service ais-live-accounts.service
+ConditionKernelCommandLine=ais.test=1
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+ExecStart=/usr/local/lib/ais-live/ais-live-test-media
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

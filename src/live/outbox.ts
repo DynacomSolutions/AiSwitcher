@@ -23,6 +23,7 @@ export interface OutboxResult {
 export interface WriteOutboxDeps {
   home?: string;
   exchangeDir?: string;
+  seq?: number;
   lastInboxSeq?: number;
   now?: Date;
   readFile?: (path: string) => Promise<Uint8Array | undefined>;
@@ -151,7 +152,11 @@ function joinBytes(chunks: Uint8Array[]): Uint8Array {
   return result;
 }
 
-async function nextSequence(root: FileHandle): Promise<number> {
+async function nextSequence(root: FileHandle, supplied?: number): Promise<number> {
+  if (supplied !== undefined) {
+    if (!Number.isSafeInteger(supplied) || supplied < 1) throw new Error("seq must be a positive safe integer");
+    return supplied;
+  }
   const { dir, leaf } = await openParent(root, [".ais", "live", "outbox-seq.json"], true);
   const statePath = `${procDir(dir.fd)}/${leaf}`;
   const lockPath = `${procDir(dir.fd)}/.outbox.lock`;
@@ -193,6 +198,9 @@ async function nextSequence(root: FileHandle): Promise<number> {
 
 /** Collect a snapshot as agent, then optionally encrypt and atomically publish it. */
 export async function writeOutbox(deps: WriteOutboxDeps = {}): Promise<OutboxResult> {
+  if (deps.seq !== undefined && (!Number.isSafeInteger(deps.seq) || deps.seq < 1)) {
+    throw new Error("seq must be a positive safe integer");
+  }
   if (deps.lastInboxSeq !== undefined && (!Number.isSafeInteger(deps.lastInboxSeq) || deps.lastInboxSeq < 0)) {
     throw new Error("lastInboxSeq must be a non-negative safe integer");
   }
@@ -200,7 +208,7 @@ export async function writeOutbox(deps: WriteOutboxDeps = {}): Promise<OutboxRes
   const exchange = deps.exchangeDir;
   const root = await openHomeDirectory(home);
   let seq: number;
-  try { seq = await nextSequence(root); }
+  try { seq = await nextSequence(root, deps.seq); }
   catch (error) { await root.close(); throw error; }
   const collected: CollectedFile[] = [];
   const skipped = { symlinks: 0, omitted: 0, seen: 0 };
@@ -291,8 +299,8 @@ export async function writeOutbox(deps: WriteOutboxDeps = {}): Promise<OutboxRes
     const publishedDir = await open(directory, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0));
     try { await publishedDir.sync(); } finally { await publishedDir.close(); }
     for (const name of await readdir(directory)) {
-      const match = /^bundle-(\d+)\.age$/.exec(name);
-      if (match && Number(match[1]) < seq) await unlink(join(directory, name)).catch(() => undefined);
+      const match = /^bundle-([1-9][0-9]{0,15})\.age$/i.exec(name);
+      if (match && Number.isSafeInteger(Number(match[1])) && Number(match[1]) < seq) await unlink(join(directory, name)).catch(() => undefined);
     }
     encryptedPath = finalPath;
   }

@@ -1,11 +1,15 @@
-import { openSync, closeSync } from "node:fs";
+import { openSync, closeSync, readdirSync } from "node:fs";
 import { createReadStream, createWriteStream } from "node:fs";
 import { createInterface } from "node:readline/promises";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { CliUsageError } from "../errors.ts";
 import { applyInbox, readInboxStdin, type InboxClock } from "../../live/inbox.ts";
 import { writeOutbox } from "../../live/outbox.ts";
 import { newestPersistedMtime, openHomeDirectory } from "../../live/safe-fs.ts";
+import { boolFlag } from "../args.ts";
+import type { ParsedArgs } from "../args.ts";
+import { isOnline } from "../../shared/connectivity.ts";
+import { discoverLocalModels, resolveLlamaRunner } from "../../shared/local-models.ts";
 
 const BUILD_TIME_FILE = "/etc/ais/image-build-time";
 
@@ -17,15 +21,41 @@ function parseBuildTime(value: string): number {
   return parsed;
 }
 
-async function clockSnapshot(home: string): Promise<InboxClock> {
-  const buildTimeMs = parseBuildTime(await Bun.file(BUILD_TIME_FILE).text());
+export interface ClockSnapshotDeps {
+  buildTimeFile?: string;
+  fetchImpl?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  nowMs?: () => number;
+  synchronizedProbe?: () => Promise<boolean>;
+  networkInterfaces?: typeof networkInterfaces;
+  netDevices?: () => string[];
+}
+
+function confirmedOffline(error: unknown, interfaces: typeof networkInterfaces, devices: () => string[]): boolean {
+  if (!error || typeof error !== "object") return false;
+  const values = [error as { code?: unknown }, (error as { cause?: { code?: unknown } }).cause];
+  const codes = values.flatMap((value) => typeof value?.code === "string" ? [value.code] : []);
+  if (codes.some((code) => ["ENETUNREACH", "EHOSTUNREACH", "ENETDOWN"].includes(code))) return true;
+  // A TLS failure means something answered, possibly a local proxy, so it never proves offline.
+  if (codes.some((code) => /CERT|TLS|SSL/i.test(code))) return false;
+  // Otherwise, with no non-loopback interface no fetch can reach a server, whatever code Bun reports.
+  try {
+    return Object.values(interfaces()).every((addresses) => !addresses?.some((address) => !address.internal));
+  } catch {
+    // The inbox unit's address-family filter blocks the netlink lookup; sysfs still lists every device.
+    try { return devices().every((name) => name === "lo"); } catch { return false; }
+  }
+}
+
+export async function clockSnapshot(home: string, deps: ClockSnapshotDeps = {}): Promise<InboxClock> {
+  const buildTimeMs = parseBuildTime(await Bun.file(deps.buildTimeFile ?? BUILD_TIME_FILE).text());
   const root = await openHomeDirectory(home);
   let newestPersistedMtimeMs = 0;
   try { newestPersistedMtimeMs = await newestPersistedMtime(root); }
   finally { await root.close(); }
 
   let synchronized = false;
-  try {
+  if (deps.synchronizedProbe) synchronized = await deps.synchronizedProbe().catch(() => false);
+  else try {
     const probe = Bun.spawn(["timedatectl", "show", "--property=NTPSynchronized", "--value"], { stdout: "pipe", stderr: "ignore" });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const result = await Promise.race([
@@ -35,18 +65,33 @@ async function clockSnapshot(home: string): Promise<InboxClock> {
     synchronized = result.code === 0 && result.output.trim() === "yes";
   } catch { /* absent timedatectl means unsynchronised */ }
 
-  let online = false;
+  let online = true;
   let httpDateMs: number | undefined;
   try {
-    const response = await fetch("https://example.com/", { method: "HEAD", signal: AbortSignal.timeout(2500) });
+    const response = await (deps.fetchImpl ?? fetch)("https://example.com/", { method: "HEAD", signal: AbortSignal.timeout(2500) });
     online = true;
     const header = response.headers.get("date");
     if (header) {
       const parsed = Date.parse(header);
       if (Number.isFinite(parsed)) httpDateMs = parsed;
     }
-  } catch { /* offline or probe unavailable */ }
-  return { synchronized, imageBuildTimeMs: buildTimeMs, newestPersistedMtimeMs, ...(httpDateMs === undefined ? {} : { httpDateMs }), online, nowMs: Date.now() };
+  } catch (error) {
+    if (confirmedOffline(error, deps.networkInterfaces ?? networkInterfaces, deps.netDevices ?? (() => readdirSync("/sys/class/net")))) online = false;
+    else {
+      const detail = error as { name?: unknown; code?: unknown; cause?: { code?: unknown } } | undefined;
+      console.error(`AIS-LIVE: stage=clock status=online-assumed name=${String(detail?.name)} code=${String(detail?.code)} cause=${String(detail?.cause?.code)}`);
+    }
+  }
+  return { synchronized, imageBuildTimeMs: buildTimeMs, newestPersistedMtimeMs, ...(httpDateMs === undefined ? {} : { httpDateMs }), online, nowMs: (deps.nowMs ?? Date.now)() };
+}
+
+export function optionalNumberFlag(flags: Record<string, string | true>, name: string, minimum: number): number | undefined {
+  const value = flags[name];
+  if (value === undefined) return undefined;
+  if (value === true || !/^\d+$/.test(value)) throw new CliUsageError(`--${name} must be an integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) throw new CliUsageError(`--${name} is out of range`);
+  return parsed;
 }
 
 async function conflictPrompt(path: string): Promise<"drive" | "bundle"> {
@@ -79,24 +124,55 @@ function ensureOnly(flags: Record<string, string | true>, allowed: string[]): vo
   if (unknown) throw new CliUsageError(`Unknown live flag --${unknown}`);
 }
 
-export async function runLiveCommand(rest: string[], flags: Record<string, string | true>): Promise<void> {
-  const [operation, ...extra] = rest;
+export interface LiveNetCheckDeps {
+  online: (refresh: boolean) => Promise<boolean>;
+  discover: () => ReturnType<typeof discoverLocalModels>;
+  runner: () => string | undefined;
+  write: (line: string) => void;
+}
+
+const realDeps: LiveNetCheckDeps = {
+  online: (refresh) => isOnline({ refresh }),
+  discover: () => discoverLocalModels(),
+  runner: () => resolveLlamaRunner(),
+  write: (line) => console.log(line),
+};
+
+export async function runLiveCommand(
+  args: string[],
+  flags: ParsedArgs["flags"],
+  deps: LiveNetCheckDeps = realDeps,
+): Promise<void> {
+  const [subcommand, ...extra] = args;
+  if (subcommand === "net-check") {
+    if (extra.length) throw new CliUsageError('Usage: ais live net-check [--json] [--fresh]');
+    const online = await deps.online(boolFlag(flags, "fresh"));
+    const localModel = deps.runner() !== undefined && (await deps.discover()).length > 0;
+    if (boolFlag(flags, "json")) deps.write(JSON.stringify({ online, localModel }));
+    else deps.write(`Internet: ${online ? "available" : "unavailable"}; local model: ${localModel ? "available" : "unavailable"}`);
+    if (!online) process.exitCode = 1;
+    return;
+  }
+  const operation = subcommand;
   if (extra.length) throw new CliUsageError("Unexpected live command argument");
   const home = homedir();
   if (operation === "apply-inbox") {
-    ensureOnly(flags, ["stdin"]);
+    ensureOnly(flags, ["stdin", "last-inbox-seq"]);
     if (flags.stdin !== true) throw new CliUsageError("Usage: ais live apply-inbox --stdin");
+    const lastInboxSeq = optionalNumberFlag(flags, "last-inbox-seq", 0);
     const tar = await readInboxStdin();
-    const result = await applyInbox({ tar, home, clock: await clockSnapshot(home), isTTY: hasControllingTerminal(), chooseConflict: conflictPrompt });
+    const result = await applyInbox({ tar, home, clock: await clockSnapshot(home), isTTY: hasControllingTerminal(), chooseConflict: conflictPrompt, log: (message) => console.error(message), ...(lastInboxSeq === undefined ? {} : { lastInboxSeq }) });
     if (result.deferred) { process.exitCode = 2; console.error("AIS-LIVE: stage=inbox status=deferred"); }
     else console.error(`AIS-LIVE: stage=inbox status=ok applied=${result.applied} skipped=${result.skipped}`);
     return;
   }
   if (operation === "write-outbox") {
-    ensureOnly(flags, []);
-    const result = await writeOutbox({ home });
+    ensureOnly(flags, ["seq", "last-inbox-seq"]);
+    const seq = optionalNumberFlag(flags, "seq", 1);
+    const lastInboxSeq = optionalNumberFlag(flags, "last-inbox-seq", 0);
+    const result = await writeOutbox({ home, ...(seq === undefined ? {} : { seq }), ...(lastInboxSeq === undefined ? {} : { lastInboxSeq }) });
     process.stdout.write(result.tarBytes);
     return;
   }
-  throw new CliUsageError("Usage: ais live <apply-inbox --stdin|write-outbox>");
+  throw new CliUsageError("Usage: ais live <net-check|apply-inbox --stdin|write-outbox>");
 }

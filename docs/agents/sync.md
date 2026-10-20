@@ -9,9 +9,13 @@ peer. `ais live apply-inbox --stdin` consumes a fully decrypted and authenticate
 tar stream from standard input. The root service must finish age authentication
 into a bounded root-only temporary file before starting this command as the
 agent user; piping age directly into the command could expose valid early tar
-entries before a late authentication failure. The command never opens a bundle
-path itself. It validates the complete manifest and tar before planning writes,
-and rejects links, duplicate names, traversal, and non-regular tar entries.
+entries before a late authentication failure. Root reads only the bounded first
+manifest entry to obtain its sequence, then passes its independently persisted
+applied-inbox highwater as `--last-inbox-seq=N`. The counter lives under
+`/mnt/persist/ais-live-exchange`, outside `@config`, and advances only after
+successful application. The command never opens a bundle path itself. It
+validates the complete manifest and tar before planning writes, and rejects
+links, duplicate names, traversal, and non-regular tar entries.
 
 Inbox state under `.ais/live` records the last applied sequence and portable
 configuration hashes. Replayed or older sequences are a no-op. Configuration
@@ -20,11 +24,23 @@ terminal and is deferred otherwise. Auth writes are deferred until the clock is
 after the image build-time marker, no earlier than the persisted state mtime,
 and within one hour of the online HTTP `Date` response when online. Token grants
 are merged atomically by freshness, and log JSONL uses the existing multiset
-union. SSH material is written with mode `0600`.
+union. Credential replacement retains the cooperating OAuth refresh lock and
+uses a bounded content-hash compare immediately before atomic rename, then
+rereads and remerges if an uncoordinated provider write changed the file.
+Exhausted retries preserve the latest credential, log a deferred result, and do
+not acknowledge the inbox sequence. Log updates append only missing line
+occurrences with `O_APPEND`, preserving existing bytes and concurrent appends.
+SSH material is written with mode `0600`.
 
-`ais live write-outbox` writes only a tar archive to standard output. It carries
-configuration hashes, selected recent logs, a truncation marker, and the last
-inbox sequence; it does not include configuration payloads or credentials.
+`ais live write-outbox` writes only a tar archive to standard output. The root
+service reserves the next sequence in its `/mnt/persist/ais-live-exchange`
+counter and passes `--seq=N --last-inbox-seq=N`; the agent's home sequence cache
+is only a standalone CLI fallback. The root verifies the returned manifest
+sequence before publishing. Reservations are durable before collection, so
+failed writes can leave gaps, while deletion or restoration of exchange bundle
+files cannot lower the highwater. The bundle carries configuration hashes,
+selected recent logs, a truncation marker, and the last inbox sequence; it does
+not include configuration payloads or credentials.
 Collection is limited to known tool and AIS roots, uses descriptor-anchored
 no-follow reads, and caps the archive at 32 MiB. The root service encrypts the
 completed output and publishes it to the exchange partition atomically. Neither

@@ -42,7 +42,6 @@ export async function runCli(argv: string[]): Promise<void> {
     // `ais version`/`-v` wins; every other help form shares one text source.
     const helpPath = command === "version" || command === "-v" ? undefined : helpRequest(argv);
     if (helpPath) return void console.log(helpText(helpPath));
-
     // Raw host transport must not trigger home migration or launch background
     // sync before consuming its framed stdin/stdout protocol.
     if (command === "host") return await runHostCommand(rest, flags);
@@ -95,8 +94,6 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "sync":
         return await runSyncCommand(rest, flags);
-      case "live":
-        return await runLiveCommand(rest, flags);
       case "__scan_worker":
         // Dynamic import: a static one here drags the whole scan-engine
         // graph into every entrypoint's init and segfaults bun --compile
@@ -150,6 +147,9 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "local":
         await runLocalCommand(rest, flags);
+        break;
+      case "live":
+        await runLiveCommand(rest, flags);
         break;
       default:
         helpText([command]); // throws the one-line "did you mean" error for an unknown name

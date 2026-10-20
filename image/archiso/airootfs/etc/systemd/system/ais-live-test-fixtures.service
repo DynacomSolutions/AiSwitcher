@@ -1,0 +1,15 @@
+[Unit]
+Description=Stage AIS live test fixtures only for explicit test boots
+DefaultDependencies=no
+Requires=ais-live-test-media.service
+After=local-fs.target ais-live-test-media.service
+Before=getty@tty1.service serial-getty@.service
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+ExecStart=/usr/local/lib/ais-live/ais-live-test-fixtures
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

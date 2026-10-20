@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically prune AIS live snapshots
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

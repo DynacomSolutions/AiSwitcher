@@ -1,0 +1,15 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+if (($# != 3)); then
+  echo 'usage: install-herdr BINARY SHA256 ROOTFS' >&2
+  exit 2
+fi
+binary=$1 expected=$2 rootfs=$3
+[[ "$expected" =~ ^[a-f0-9]{64}$ ]] || { echo 'invalid pinned Herdr digest' >&2; exit 2; }
+[[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] || { echo 'pinned Herdr binary is missing' >&2; exit 1; }
+actual=$(/usr/bin/sha256sum "$binary")
+actual=${actual%% *}
+[[ "$actual" == "$expected" ]] || { echo 'Herdr binary digest mismatch' >&2; exit 1; }
+
+/usr/bin/install -D -m 0755 "$binary" "$rootfs/usr/local/bin/herdr"

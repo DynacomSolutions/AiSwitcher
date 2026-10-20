@@ -1,0 +1,19 @@
+[Unit]
+Description=Prepare writable AIS live persistence before login
+DefaultDependencies=no
+After=local-fs.target NetworkManager.service
+Wants=NetworkManager.service
+Conflicts=shutdown.target
+Before=getty-pre.target shutdown.target
+ConditionPathIsMountPoint=/mnt/persist
+ConditionPathExists=!/run/ais-persist-ephemeral
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+ExecStart=/usr/local/lib/ais-live/ais-live-persist
+SuccessExitStatus=10
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

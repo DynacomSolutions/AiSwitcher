@@ -1,0 +1,9 @@
+# Extra packages for test builds only; the shipped base stays free of them.
+parted
+gptfdisk
+mdadm
+lvm2
+git
+fakeroot
+binutils
+file

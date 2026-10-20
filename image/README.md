@@ -39,7 +39,12 @@ measured 9,101,324 KiB peak is 10.2% of the measured initial free space and
 of 10,937,500 KiB. This leaves 1,836,176 KiB (about 1.75 GiB) before reaching
 the threshold.
 
-## Live image notes
+## Exchange partition notes
+
+Drive creation must assign fresh GPT identifiers, add and zero the persistence
+partition, and patch all boot entries before use. See
+[the host app drive identity contract](docs/drive-identity.md) for the exact
+procedure and validation rules.
 
 ### Non-interactive age passphrases
 

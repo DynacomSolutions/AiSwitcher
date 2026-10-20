@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+# Guest side of the guard scenario (root test unit). The serial console carries
+# the AIS-GUARD-TEST markers; the host driver types the popup replies.
+set -uo pipefail
+exec >/dev/ttyS0 2>&1
+tests=/usr/local/lib/ais-live-test
+
+finish() { printf 'AIS-GUARD-TEST: case=orchestrator status=%s\n' "$1"; /usr/bin/systemctl --no-block poweroff; exit 0; }
+
+read -r -a kernel_args </proc/cmdline
+probe=false
+for kernel_arg in "${kernel_args[@]}"; do
+  [[ "$kernel_arg" == ais.guard-probe=1 ]] && probe=true
+done
+
+# The test AUR helper stands in for the upstream binary (see paru-shim).
+install -m 0755 "$tests/paru-shim" /usr/bin/paru
+live_uid=$(id -u live)
+for _ in $(seq 1 240); do
+  find "/run/user/$live_uid" -name herdr.sock -type s 2>/dev/null | grep -q . && break
+  sleep 0.5
+done
+find "/run/user/$live_uid" -name herdr.sock -type s 2>/dev/null | grep -q . || finish no-herdr-socket
+# Give herdr a moment to draw tty1 before the first popup.
+sleep 5
+
+"$tests/guard-fixtures.sh" setup || finish fixtures-failed
+if "$tests/guard-scenarios.sh" --run; then
+  printf 'AIS-GUARD-TEST: case=run status=ok\n'
+else
+  finish run-failed
+fi
+if [[ "$probe" == true ]]; then
+  if "$tests/guard-scenarios.sh" --sandbox-probe; then
+    printf 'AIS-GUARD-TEST: case=probe status=ok\n'
+  else
+    finish probe-failed
+  fi
+fi
+finish "done"

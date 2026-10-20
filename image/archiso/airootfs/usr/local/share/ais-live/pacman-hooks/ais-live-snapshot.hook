@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Snapshot AIS live state before package transaction
+When = PreTransaction
+AbortOnFail
+Exec = /usr/local/lib/ais-live/ais-live-snapshot pre-pacman

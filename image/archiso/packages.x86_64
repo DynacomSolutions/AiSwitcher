@@ -7,6 +7,9 @@ mkinitcpio-archiso
 syslinux
 # Persistence and exchange
 cryptsetup
+gptfdisk
+util-linux
+keyutils
 btrfs-progs
 exfatprogs
 dosfstools
@@ -19,3 +22,7 @@ npm
 # ais sync needs rsync and an SSH client
 rsync
 openssh
+# Live runtime: helper scripts, guard daemon, exchange services, polkit rules
+python
+keyutils
+polkit

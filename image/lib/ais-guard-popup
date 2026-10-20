@@ -1,0 +1,37 @@
+#!/usr/bin/python3
+import json,os,socket,sys,select,termios,time
+from ais_guard_policy import escape_display
+D='/run/ais-guard/requests'
+def main():
+    rid=os.environ.get('AIS_GUARD_REQ','')
+    nonce=os.environ.get('AIS_GUARD_NONCE','')
+    if len(rid)!=32 or any(c not in '0123456789abcdef' for c in rid) or len(nonce)<24: return 126
+    try:
+        req=json.load(open(os.path.join(D,rid+'.json'),encoding='utf8'))
+        if req.get('nonce')!=nonce: return 126
+        print('AIS DISK APPROVAL')
+        print('Command: '+escape_display(req.get('command','')))
+        print('Approval runs the full displayed command as root. Review every argument.')
+        for d in req.get('devices',[]):
+            print('Device: {} | {} bytes | {} | mounted at {}'.format(
+                escape_display(d.get('path','')),escape_display(d.get('size',0)),
+                escape_display(d.get('model','unknown')),
+                escape_display(', '.join(x for x in d.get('mounts',[]) if x))))
+        expected=escape_display(req.get('expected',''))
+        prompt='Type exactly: '+expected if expected else 'Type each device identifier separated by spaces: '
+        print(prompt,end='',flush=True)
+        # Discard anything typed before or just after the prompt appeared.
+        time.sleep(1.0)
+        try: termios.tcflush(sys.stdin.fileno(),termios.TCIFLUSH)
+        except (termios.error,OSError,ValueError): pass
+        remaining=float(req.get('deadline',0))-time.monotonic()
+        if remaining<=0 or not select.select([sys.stdin],[],[],remaining)[0]: return 126
+        text=sys.stdin.readline(8193)
+        if not text or len(text)>8192 or not text.endswith('\n'): return 126
+        text=text[:-1]
+        reply=req.get('reply','')
+        if reply!=os.path.join(D,rid+'.sock'): return 126
+        s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(5); s.connect(reply)
+        s.sendall(json.dumps({'nonce':nonce,'text':text}).encode()+b'\n'); s.close(); return 0
+    except Exception: return 126
+if __name__=='__main__': sys.exit(main())

@@ -1,0 +1,49 @@
+#!/usr/bin/expect -f
+# Waits for the exchange case markers in order, then for the guest poweroff.
+set driverDir [file dirname [file normalize [info script]]]
+source [file join $driverDir exchange.exp]
+if {$argc < 2 || ![string is integer -strict [lindex $argv 0]] || [lindex $argv 0] < 1} {
+    puts stderr "usage: exchange-driver.exp <timeout-seconds> <qemu> \[args\]"
+    exit 2
+}
+set bootTimeout [lindex $argv 0]
+set command [lrange $argv 1 end]
+log_user 1
+spawn -noecho {*}$command
+set child [exp_pid]
+set persistPassphrase {SYNTHETIC_FIXTURE_ais_live_persist_passphrase}
+proc fail {reason} {
+    global child
+    puts stderr "exchange-driver: $reason"
+    catch {exec kill -KILL -- $child}
+    catch {close}
+    catch {wait}
+    exit 1
+}
+set timeout $bootTimeout
+expect {
+    -re {Create encrypted persistence\. Enter a passphrase \(at least 12 characters\): } { send -- "$persistPassphrase\r"; exp_continue }
+    -re {Confirm passphrase: } { send -- "$persistPassphrase\r"; exp_continue }
+    -re {AIS persistence passphrase: } { send -- "$persistPassphrase\r"; exp_continue }
+    -re {AIS-LIVE: stage=persist status=ok mode=latest} {}
+    -re {AIS-LIVE: stage=[^\r\n]* status=fail} { fail "guest reported persistence failure: $expect_out(0,string)" }
+    -re {Kernel panic|emergency shell} { fail "guest failed before persistence was ready" }
+    timeout { fail "timed out waiting for latest persistence" }
+    eof { fail "guest exited before latest persistence was ready" }
+}
+set ::ais_exchange::timeout_seconds $bootTimeout
+if {[catch {ais_exchange::wait_agent_capability $spawn_id} err]} { fail $err }
+set cases {boot replay tamper crafted symlink periodic outbox shutdown exfat-readback}
+if {$env(AIS_EXCHANGE_GROUP) eq "auth"} { set cases {boot auth-deferred auth-plausible} }
+foreach name $cases {
+    if {[catch {ais_exchange::wait_case $spawn_id $name} err]} { fail $err }
+}
+if {[catch {ais_exchange::wait_orchestrator_done $spawn_id} err]} { fail $err }
+set timeout $bootTimeout
+expect {
+    timeout { fail "guest did not power off" }
+    eof {}
+}
+set result [wait]
+if {[lindex $result 2] != 0 || [lindex $result 3] != 0} { fail "QEMU exited with $result" }
+puts "exchange-driver: exchange scenarios complete"

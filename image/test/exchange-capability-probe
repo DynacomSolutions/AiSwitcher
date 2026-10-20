@@ -1,0 +1,44 @@
+#!/usr/bin/bash
+# Test-media-only check for the exact privilege hand-off used by exchange units.
+set -euo pipefail
+
+marker() { printf 'AIS-EXCHANGE-TEST: case=agent-capability status=%s%s\n' "$1" "${2:+ reason=$2}"; }
+
+case ${1:-} in
+  child)
+    agent_uid=$(/usr/bin/id -u agent)
+    [[ $EUID -eq $agent_uid ]] || { marker fail wrong-agent-uid; exit 1; }
+    caps=$(/usr/bin/awk '
+      /^CapEff:/ { effective = $2 }
+      /^CapPrm:/ { permitted = $2 }
+      /^CapAmb:/ { ambient = $2 }
+      END { if (effective == "0000000000000000" && permitted == "0000000000000000" && ambient == "0000000000000000") print "empty"; else exit 1 }
+    ' /proc/self/status) || { marker fail agent-retained-capabilities; exit 1; }
+    [[ $caps == empty ]] || { marker fail capability-check-invalid; exit 1; }
+    marker pass
+    ;;
+  launch)
+    tests=/usr/local/lib/ais-live-test
+    if /usr/bin/systemd-run \
+      --unit=ais-live-test-agent-capability.service --collect --wait --pipe \
+      --property=User=root \
+      --property=Group=root \
+      --property=UMask=0077 \
+      --property=NoNewPrivileges=yes \
+      --property=PrivateTmp=yes \
+      --property=ProtectSystem=full \
+      --property='ReadWritePaths=/mnt/aisx -/mnt/persist/ais-live-exchange /run/ais-live-exchange' \
+      --property='CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID' \
+      --property=AmbientCapabilities=CAP_SETUID \
+      --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
+      /usr/bin/setpriv --reuid=agent --regid=agent --init-groups "$tests/exchange-capability-probe" child; then
+      exit 0
+    fi
+    marker fail transient-unit-failed
+    exit 1
+    ;;
+  *)
+    echo 'usage: exchange-capability-probe <launch|child>' >&2
+    exit 64
+    ;;
+esac

@@ -1,0 +1,489 @@
+#!/usr/bin/ash
+# shellcheck shell=dash
+
+PERSIST_CONSOLE=${AIS_INITCPIO_CONSOLE:-/dev/console}
+
+_persist_die() {
+    echo "ERROR: $*" >"$PERSIST_CONSOLE"
+    echo "AIS-LIVE: stage=persist status=fail" >"$PERSIST_CONSOLE"
+    while :; do sleep 3600; done
+}
+
+_persist_uuid_valid() {
+    printf '%s\n' "$1" | awk -F- 'NF!=5 {exit 1} {for(i=1;i<=5;i++) if($i !~ /^[0-9a-f]+$/) exit 1; if(length($1)!=8 || length($2)!=4 || length($3)!=4 || length($4)!=4 || length($5)!=12) exit 1; if($0=="00000000-0000-0000-0000-000000000000") exit 1}'
+}
+
+_persist_arg() {
+    awk -v key="$1" '{for(i=1;i<=NF;i++) if(index($i,key "=")==1) {n++; value=substr($i,length(key)+2)}} END {if(n!=1) exit 1; print value}' /proc/cmdline
+}
+
+# Runs before archiso can search, mount a base, or choose a writable cow device.
+# The host writes plain, unquoted tokens. Reject alternate parsing and all
+# archiso device overrides, including label/search and loop-image selection.
+_persist_cmdline() {
+    local base
+    base=$(_persist_arg ais.base) && _persist_uuid_valid "$base" || return 1
+    awk -v device="archisodevice=/dev/disk/by-partuuid/$base" '
+        /["\047\\]/ {exit 1}
+        {
+            for(i=1;i<=NF;i++) {
+                split($i, arg, "="); key=arg[1]
+                if(key=="archisodevice") {if($i!=device) exit 1; devices++; continue}
+                if(key=="archisobasedir") {if($i!="archisobasedir=arch") exit 1; bases++; continue}
+                if(key=="copytoram") {if($i!="copytoram=n") exit 1; copies++; continue}
+                if(key ~ /^(cow_|img_|archiso|copytoram)/ || key=="dm_snap_prefix") exit 1
+            }
+        }
+        END {if(devices!=1 || bases!=1 || copies!=1) exit 1}
+    ' /proc/cmdline
+}
+
+_persist_read_drive() {
+    local drive
+    PERSIST_REASON=invalid-drive
+    drive=$(_persist_arg ais.drive) || return 1
+    if [ "$drive" = HOST_APP_REQUIRED ]; then PERSIST_REASON=host-app-required; return 1; fi
+    _persist_uuid_valid "$drive" || return 1
+    PERSIST_DRIVE=$drive
+    PERSIST_PART=/dev/disk/by-partuuid/$drive
+}
+
+_persist_device_number() {
+    local dev
+    [ -b "$1" ] || return 1
+    dev=$(stat -Lc '%t:%T' "$1") || return 1
+    printf '%d:%d\n' "0x${dev%%:*}" "0x${dev#*:}"
+}
+
+# A by-partuuid symlink alone hides duplicate GPT identifiers. Probe every
+# current partition without the blkid cache before accepting its unique target.
+_persist_unique_target() {
+    local wanted=${1:-$PERSIST_DRIVE} node=${2:-$PERSIST_PART}
+    local entry dev uuid rc count=0 found=
+    PERSIST_REASON=missing-drive
+    for entry in /sys/class/block/*; do
+        [ -f "$entry/partition" ] || continue
+        dev=$(cat "$entry/dev") || return 1
+        [ -b "/dev/block/$dev" ] || { PERSIST_REASON=unreadable-drive; return 1; }
+        rc=0
+        uuid=$(blkid -p -c /dev/null -s PART_ENTRY_UUID -o value "/dev/block/$dev" 2>/dev/null) || rc=$?
+        case "$rc" in 0|2) ;; *) PERSIST_REASON=unreadable-drive; return 1 ;; esac
+        if [ "$uuid" = "$wanted" ]; then
+            count=$((count + 1)); found=$dev
+        fi
+    done
+    if [ "$count" -gt 1 ]; then PERSIST_REASON=ambiguous-drive; return 1; fi
+    [ "$count" -eq 1 ] || return 1
+    [ "$(_persist_device_number "$node")" = "$found" ] || return 1
+    PERSIST_TARGET_DEV=$found
+}
+
+_persist_base_resolve() {
+    local base part disk seq identity
+    PERSIST_REASON=wrong-drive
+    base=$(_persist_arg ais.base) && _persist_uuid_valid "$base" || return 1
+    if ! _persist_unique_target "$base" "/dev/disk/by-partuuid/$base"; then
+        PERSIST_REASON=${PERSIST_REASON%-drive}-base
+        return 1
+    fi
+    PERSIST_REASON=wrong-drive
+    part=$(readlink -f "/sys/dev/block/$PERSIST_TARGET_DEV") || return 1
+    [ "$(cat "$part/partition")" = 3 ] || return 1
+    disk=$(dirname "$part")
+    seq=$(cat "$disk/diskseq") || return 1
+    case "$seq" in ''|*[!0-9]*|0) return 1 ;; esac
+    identity="$disk:$seq:$PERSIST_TARGET_DEV"
+    [ -z "${PERSIST_BASE_IDENTITY:-}" ] || [ "$identity" = "$PERSIST_BASE_IDENTITY" ] || return 1
+    PERSIST_BASE_IDENTITY=$identity
+    PERSIST_BASE_DEV=$PERSIST_TARGET_DEV
+    PERSIST_BASE_DISK=$disk
+}
+
+_persist_resolve() {
+    local part disk seq identity
+    # settle is only a readiness hint: its global queue can contain unrelated
+    # device work. The identity checks below probe current sysfs entries and
+    # PARTUUIDs directly, and remain mandatory even when settle times out.
+    udevadm settle --timeout=10 || :
+    _persist_base_resolve || return 1
+    _persist_unique_target "$PERSIST_DRIVE" "${1:-$PERSIST_PART}" || return 1
+    PERSIST_REASON=wrong-drive
+    part=$(readlink -f "/sys/dev/block/$PERSIST_TARGET_DEV") || return 1
+    [ "$(cat "$part/partition")" = 5 ] || return 1
+    [ "$(findmnt -rn -o MAJ:MIN /run/archiso/bootmnt)" = "$PERSIST_BASE_DEV" ] || return 1
+    disk=$(dirname "$part")
+    [ "$PERSIST_BASE_DISK" = "$disk" ] || return 1
+    seq=$(cat "$disk/diskseq") || return 1
+    case "$seq" in ''|*[!0-9]*|0) return 1 ;; esac
+    # Detect observed replacement across checks; this is not a claim that an
+    # open descriptor prevents device-number reuse on every block driver.
+    identity="$disk:$seq:$PERSIST_TARGET_DEV"
+    [ -z "${PERSIST_IDENTITY:-}" ] || [ "$identity" = "$PERSIST_IDENTITY" ] || return 1
+    PERSIST_IDENTITY=$identity
+    # Shared with the runtime exchange resolver.
+    # shellcheck disable=SC2034
+    PERSIST_DISK_SYSFS=$disk
+    PERSIST_REASON=unverified-drive
+}
+
+_persist_empty() {
+    # A short read or I/O error fails closed, as does any non-zero byte.
+    cmp -n 16777216 /dev/zero "$PERSIST_PART" >/dev/null 2>&1
+}
+
+# The subshell closes fd 8 on every exit. No format operation reopens the
+# by-partuuid symlink: every final check and luksFormat uses the open descriptor.
+_persist_format() (
+    node=$(readlink -f "$PERSIST_PART") || exit 1
+    exec 8<>"$node" || exit 1
+    # stat -L on /proc/self/fd/8 reads the open node's st_rdev, not the
+    # potentially replaced pathname, and matches it to the unique sysfs entry.
+    _persist_resolve /proc/self/fd/8 || exit 1
+    part=$(readlink -f "/sys/dev/block/$PERSIST_TARGET_DEV") || exit 1
+    sectors=$(cat "$part/size") || exit 1
+    bytes=$(blockdev --getsize64 /proc/self/fd/8) || exit 1
+    case "$sectors:$bytes" in *[!0-9:]*|:*|*:) exit 1 ;; esac
+    [ "$sectors" -ge 32768 ] && [ "$bytes" -eq "$((sectors * 512))" ] || exit 1
+    # isLuks must report "not LUKS"; other probe failures are not permission.
+    rc=0
+    cryptsetup isLuks /proc/self/fd/8 || rc=$?
+    [ "$rc" -eq 1 ] || exit 1
+    cmp -n 16777216 /dev/zero /proc/self/fd/8 >/dev/null 2>&1 || exit 1
+    # shortcut: a device hot-plugged with the same random 128-bit PARTUUID
+    # between open and format requires a deliberately cloned identity.
+    keyctl pipe "$1" | cryptsetup luksFormat --batch-mode --type luks2 --pbkdf argon2id --key-file=- /proc/self/fd/8 || exit 1
+    _persist_resolve /proc/self/fd/8 && cryptsetup isLuks /proc/self/fd/8
+)
+
+_persist_mapper() {
+    local dev sys slave count=0
+    _persist_resolve || return 1
+    dev=$(_persist_device_number /dev/mapper/ais-persist) || return 1
+    sys=$(readlink -f "/sys/dev/block/$dev") || return 1
+    [ "$(cat "$sys/dm/name")" = ais-persist ] || return 1
+    for slave in "$sys"/slaves/*; do
+        [ "$(cat "$slave/dev")" = "$PERSIST_TARGET_DEV" ] || return 1
+        count=$((count + 1))
+    done
+    [ "$count" -eq 1 ] || return 1
+    PERSIST_MAPPER=/dev/mapper/ais-persist
+}
+
+_persist_create() {
+    local keyid
+    _persist_resolve || return 1
+    cryptsetup isLuks "$PERSIST_PART" && return 0
+    PERSIST_REASON=nonempty-drive
+    _persist_empty || return 1
+    _persist_prompt || return 1
+    # The user can leave the prompt open while disks are changed.
+    _persist_resolve || return 1
+    cryptsetup isLuks "$PERSIST_PART" && return 0
+    PERSIST_REASON=nonempty-drive
+    _persist_empty || return 1
+    keyid=$(keyctl search @u user ais-live-exchange) || return 1
+    PERSIST_REASON=format-verification
+    _persist_format "$keyid" || return 1
+    _persist_resolve && cryptsetup isLuks "$PERSIST_PART" || return 1
+    _persist_open && _persist_mapper || return 1
+    mkfs.btrfs "$PERSIST_MAPPER" || return 1
+    _persist_mapper || return 1
+    echo 'AIS-LIVE: stage=first-boot-create status=ok' >"$PERSIST_CONSOLE"
+}
+
+_persist_open() {
+    local keyid
+    keyid=$(keyctl search @u user ais-live-exchange) || return 1
+    _persist_resolve && cryptsetup isLuks "$PERSIST_PART" || return 1
+    if keyctl pipe "$keyid" | cryptsetup open --key-file=- "$PERSIST_PART" ais-persist; then
+        _persist_resolve && cryptsetup isLuks "$PERSIST_PART" && _persist_mapper
+        return $?
+    fi
+    keyctl revoke "$keyid" || true
+    keyctl unlink "$keyid" @u || true
+    return 1
+}
+
+_persist_mount() {
+    _persist_mapper || return 1
+    mkdir -p /run/ais-persist
+    mount -t btrfs -o x-initrd.mount,subvolid=5,noatime "$PERSIST_MAPPER" /run/ais-persist || return 1
+    chmod 0700 /run/ais-persist
+}
+
+_persist_ephemeral() {
+    local mode=$1 reason=$2 keyid
+    # /sysroot still has archiso's disposable root overlay. Only RAM is mounted.
+    mkdir -p /sysroot/mnt/persist
+    mount -t tmpfs -o mode=0700,nosuid,nodev,noexec tmpfs /sysroot/mnt/persist || return 1
+    : >/run/ais-persist-ephemeral
+    if keyid=$(keyctl search @u user ais-live-exchange 2>/dev/null); then
+        keyctl revoke "$keyid" 2>/dev/null || true
+        keyctl unlink "$keyid" @u 2>/dev/null || true
+    fi
+    {
+        if [ "$reason" != clean ]; then
+            echo 'Persistence unavailable. Create this drive with the AIS host app. Continuing with temporary storage in RAM.'
+        fi
+        echo "AIS-LIVE: stage=persist status=ephemeral reason=$reason mode=$mode"
+    } >"$PERSIST_CONSOLE"
+}
+
+_persist_prompt() {
+    local first second keyid
+    set +x
+    while :; do
+        stty -echo <"$PERSIST_CONSOLE" 2>/dev/null || return 1
+        printf '\nCreate encrypted persistence. Enter a passphrase (at least 12 characters): ' >"$PERSIST_CONSOLE"
+        IFS= read -r first <"$PERSIST_CONSOLE" || first=''
+        stty echo <"$PERSIST_CONSOLE" 2>/dev/null || return 1
+        stty -echo <"$PERSIST_CONSOLE" 2>/dev/null || { unset first; return 1; }
+        printf '\nConfirm passphrase: ' >"$PERSIST_CONSOLE"
+        IFS= read -r second <"$PERSIST_CONSOLE" || second=''
+        stty echo <"$PERSIST_CONSOLE" 2>/dev/null || { unset first second; return 1; }
+        printf '\n' >"$PERSIST_CONSOLE"
+        if [ "${#first}" -lt 12 ]; then
+            echo 'Passphrase must contain at least 12 characters.' >"$PERSIST_CONSOLE"
+        elif [ "$first" != "$second" ]; then
+            echo 'Passphrases do not match.' >"$PERSIST_CONSOLE"
+        else
+            keyid=$(printf '%s' "$first" | keyctl padd user ais-live-exchange @u) || { unset first second; return 1; }
+            keyctl setperm "$keyid" 0x003f0000 || { keyctl revoke "$keyid" 2>/dev/null || true; keyctl unlink "$keyid" @u 2>/dev/null || true; unset first second; return 1; }
+            unset first second
+            [ -n "$keyid" ] && return 0
+        fi
+    done
+}
+
+_persist_keyring_unlock() {
+    local pass keyid
+    set +x
+    stty -echo <"$PERSIST_CONSOLE" 2>/dev/null || return 1
+    printf '\nAIS persistence passphrase: ' >"$PERSIST_CONSOLE"
+    IFS= read -r pass <"$PERSIST_CONSOLE" || pass=''
+    stty echo <"$PERSIST_CONSOLE" 2>/dev/null || { unset pass; return 1; }
+    printf '\n' >"$PERSIST_CONSOLE"
+    [ -n "$pass" ] || return 1
+    keyid=$(printf '%s' "$pass" | keyctl padd user ais-live-exchange @u) || { unset pass; return 1; }
+    unset pass
+    keyctl setperm "$keyid" 0x003f0000 || { keyctl revoke "$keyid" 2>/dev/null || true; keyctl unlink "$keyid" @u 2>/dev/null || true; return 1; }
+    [ -n "$keyid" ]
+}
+
+_persist_subvolumes() {
+    local name
+    for name in @config @logs @upper @pkglist @snapshots @snapshots/boot @snapshots/pre-pacman @pkglist/snapshot-meta; do
+        if ! btrfs subvolume show "/run/ais-persist/$name" >/dev/null 2>&1; then
+            btrfs subvolume create "/run/ais-persist/$name" || return 1
+        fi
+    done
+    [ -e /run/ais-persist/@pkglist/base-id ] || : > /run/ais-persist/@pkglist/base-id
+    [ -e /run/ais-persist/@pkglist/explicit ] || : > /run/ais-persist/@pkglist/explicit
+    chmod 0700 /run/ais-persist/@snapshots
+}
+
+_persist_prepare_base() {
+    local base_id stored archive pending
+    base_id=$(cat /run/archiso/airootfs/etc/ais-live/base-id 2>/dev/null) || return 1
+    [ -n "$base_id" ] || return 1
+    PERSIST_BASE_ID=$base_id
+    stored=$(cat /run/ais-persist/@pkglist/base-id 2>/dev/null || true)
+    [ "$stored" = "$base_id" ] && return 0
+    pending=/run/ais-persist/@pkglist/reinstall-pending
+    if [ -e "$pending" ] && [ "$(cat /run/ais-persist/@pkglist/next-base-id 2>/dev/null)" = "$base_id" ]; then
+        if [ ! -e /run/ais-persist/@pkglist/fresh-upper-ready ]; then
+            if btrfs subvolume show /run/ais-persist/@upper >/dev/null 2>&1; then
+                btrfs subvolume delete /run/ais-persist/@upper || return 1
+            fi
+            btrfs subvolume create /run/ais-persist/@upper || return 1
+            : >/run/ais-persist/@pkglist/fresh-upper-ready
+        fi
+        PERSIST_BASE_ID=$base_id
+        return 0
+    fi
+    [ -n "$stored" ] || { printf '%s\n' "$base_id" >/run/ais-persist/@pkglist/base-id; return 0; }
+    archive="/run/ais-persist/@snapshots/base-mismatch-$(date -u +%Y%m%dT%H%M%S)-$$"
+    btrfs subvolume snapshot -r /run/ais-persist/@upper "$archive" || return 1
+    cp /run/ais-persist/@pkglist/explicit /run/ais-persist/@pkglist/migration-explicit.tmp || return 1
+    mv /run/ais-persist/@pkglist/migration-explicit.tmp /run/ais-persist/@pkglist/migration-explicit || return 1
+    printf '%s\n' "$stored" >/run/ais-persist/@pkglist/migration-base-id
+    printf '%s\n' "${archive##*/}" >/run/ais-persist/@pkglist/migration-snapshot
+    printf '%s\n' "$base_id" >/run/ais-persist/@pkglist/next-base-id.tmp
+    mv /run/ais-persist/@pkglist/next-base-id.tmp /run/ais-persist/@pkglist/next-base-id
+    : >"$pending"
+    btrfs subvolume delete /run/ais-persist/@upper || return 1
+    btrfs subvolume create /run/ais-persist/@upper || return 1
+    : >/run/ais-persist/@pkglist/fresh-upper-ready
+    PERSIST_BASE_ID=$base_id
+}
+
+_persist_pick_snapshot() {
+    local files filtered choice i snap_base
+    files=$(find /run/ais-persist/@snapshots/boot /run/ais-persist/@snapshots/pre-pacman -mindepth 1 -maxdepth 1 -type d \( -name 'boot-*' -o -name 'pre-pacman-*' \) -printf '%p\n' | sort -r)
+    filtered=
+    for name in $files; do
+        snap_base=$(cat "/run/ais-persist/@pkglist/snapshot-meta/${name##*/}/base-id" 2>/dev/null || true)
+        [ "$snap_base" = "$PERSIST_BASE_ID" ] && filtered="$filtered\n$name"
+    done
+    files=$(printf '%b\n' "$filtered" | sed '/^$/d')
+    [ -n "$files" ] || { echo 'No boot snapshots exist; using current upper.' >"$PERSIST_CONSOLE"; return 0; }
+    echo 'Choose a boot snapshot:' >"$PERSIST_CONSOLE"
+    i=1
+    for name in $files; do echo "  $i) ${name##*/}" >"$PERSIST_CONSOLE"; i=$((i + 1)); done
+    echo 'AIS-LIVE: prompt=snapshot-selection' >"$PERSIST_CONSOLE"
+    printf 'Selection: ' >"$PERSIST_CONSOLE"
+    IFS= read -r choice <"$PERSIST_CONSOLE" || choice=1
+    case "$choice" in ''|*[!0-9]*) choice=1 ;; esac
+    name=$(printf '%s\n' "$files" | sed -n "${choice}p")
+    [ -n "$name" ] || name=$(printf '%s\n' "$files" | head -n1)
+    local selected=${name##*/}
+    local picked_upper
+    picked_upper="/run/ais-persist/@upper-picked-$(date -u +%Y%m%dT%H%M%S)-$$"
+    [ ! -e /run/ais-persist/@pkglist/pick-promotion ] || return 1
+    btrfs subvolume snapshot "$name" "$picked_upper" || return 1
+    # Promote the selected writable clone to the canonical active upper so boot
+    # and pacman snapshots continue to capture the state users actually run.
+    btrfs subvolume snapshot -r /run/ais-persist/@upper "/run/ais-persist/@snapshots/pick-displaced-$(date -u +%Y%m%dT%H%M%S)-$$" || return 1
+    rm -f /run/ais-persist/@pkglist/pick-promotion.tmp/upper /run/ais-persist/@pkglist/pick-promotion.tmp/source
+    rmdir /run/ais-persist/@pkglist/pick-promotion.tmp 2>/dev/null || true
+    mkdir -p /run/ais-persist/@pkglist/pick-promotion.tmp || return 1
+    printf '%s\n' "${picked_upper##*/}" >/run/ais-persist/@pkglist/pick-promotion.tmp/upper || return 1
+    printf '%s\n' "$selected" >/run/ais-persist/@pkglist/pick-promotion.tmp/source || return 1
+    mv /run/ais-persist/@pkglist/pick-promotion.tmp /run/ais-persist/@pkglist/pick-promotion || return 1
+    btrfs subvolume delete /run/ais-persist/@upper || return 1
+    mv "$picked_upper" /run/ais-persist/@upper || return 1
+    cp "/run/ais-persist/@pkglist/snapshot-meta/$selected/explicit" /run/ais-persist/@pkglist/explicit.tmp || return 1
+    mv /run/ais-persist/@pkglist/explicit.tmp /run/ais-persist/@pkglist/explicit || return 1
+    if [ -e /run/ais-persist/@pkglist/reinstall-pending ]; then
+        [ -s /run/ais-persist/@pkglist/next-base-id ] || return 1
+        cp /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/base-id.tmp || return 1
+        mv /run/ais-persist/@pkglist/base-id.tmp /run/ais-persist/@pkglist/base-id || return 1
+        rm -f /run/ais-persist/@pkglist/reinstall-pending /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/fresh-upper-ready /run/ais-persist/@pkglist/migration-explicit /run/ais-persist/@pkglist/migration-base-id /run/ais-persist/@pkglist/migration-snapshot /run/ais-persist/@pkglist/user-changes /run/ais-persist/@pkglist/migration-user-additions /run/ais-persist/@pkglist/migration-user-removals
+    fi
+    rm -f /run/ais-persist/@pkglist/pick-promotion/upper /run/ais-persist/@pkglist/pick-promotion/source
+    rmdir /run/ais-persist/@pkglist/pick-promotion || return 1
+    PERSIST_UPPER=/run/ais-persist/@upper
+    printf '%s\n' "$name" >/run/ais-persist-picked-source
+}
+
+_persist_recover_pick() {
+    local picked selected
+    [ -e /run/ais-persist/@pkglist/pick-promotion/upper ] || return 0
+    picked=$(cat /run/ais-persist/@pkglist/pick-promotion/upper) || return 1
+    selected=$(cat /run/ais-persist/@pkglist/pick-promotion/source) || return 1
+    case "$picked" in @upper-picked-[0-9T-]*-*) ;; *) return 1 ;; esac
+    case "$selected" in boot-[A-Za-z0-9T-]*|pre-pacman-[A-Za-z0-9T-]*) ;; *) return 1 ;; esac
+    if btrfs subvolume show "/run/ais-persist/$picked" >/dev/null 2>&1; then
+        if btrfs subvolume show /run/ais-persist/@upper >/dev/null 2>&1; then
+            btrfs subvolume delete /run/ais-persist/@upper || return 1
+        fi
+        mv "/run/ais-persist/$picked" /run/ais-persist/@upper || return 1
+    fi
+    btrfs subvolume show /run/ais-persist/@upper >/dev/null 2>&1 || return 1
+    cp "/run/ais-persist/@pkglist/snapshot-meta/$selected/explicit" /run/ais-persist/@pkglist/explicit.tmp || return 1
+    mv /run/ais-persist/@pkglist/explicit.tmp /run/ais-persist/@pkglist/explicit || return 1
+    if [ -e /run/ais-persist/@pkglist/reinstall-pending ]; then
+        [ -s /run/ais-persist/@pkglist/next-base-id ] || return 1
+        cp /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/base-id.tmp || return 1
+        mv /run/ais-persist/@pkglist/base-id.tmp /run/ais-persist/@pkglist/base-id || return 1
+        rm -f /run/ais-persist/@pkglist/reinstall-pending /run/ais-persist/@pkglist/next-base-id /run/ais-persist/@pkglist/fresh-upper-ready /run/ais-persist/@pkglist/migration-explicit /run/ais-persist/@pkglist/migration-base-id /run/ais-persist/@pkglist/migration-snapshot /run/ais-persist/@pkglist/user-changes /run/ais-persist/@pkglist/migration-user-additions /run/ais-persist/@pkglist/migration-user-removals
+    fi
+    rm -f /run/ais-persist/@pkglist/pick-promotion/upper /run/ais-persist/@pkglist/pick-promotion/source
+    rmdir /run/ais-persist/@pkglist/pick-promotion || return 1
+}
+
+run_hook() {
+    local mode
+    mode=$(getarg ais.mode latest)
+    case "$mode" in latest|pick|clean) ;; *) _persist_die "Unknown ais.mode: $mode"; return 1 ;; esac
+    PERSIST_REASON=unsafe-cmdline
+    # Keep boot bounded if unrelated udev work remains; base resolution below
+    # still requires a unique direct sysfs/blkid identity match.
+    if ! _persist_cmdline; then
+        PERSIST_REASON=unsafe-cmdline
+    else
+        # Keep boot bounded if unrelated udev work remains; base resolution
+        # still requires a unique direct sysfs/blkid identity match.
+        udevadm settle --timeout=10 || :
+        if _persist_base_resolve; then
+            printf '%s\n' "$mode" >/run/ais-persist-mode
+            return 0
+        fi
+    fi
+    echo "AIS-LIVE: stage=boot-identity status=refused reason=$PERSIST_REASON mode=$mode" >"$PERSIST_CONSOLE"
+    _persist_die 'Emergency: unsafe boot parameters or invalid AIS base identity. No disk was mounted. Create this drive with the AIS host app.'
+    return 1
+}
+
+run_latehook() {
+    local mode upper workdir newroot=/sysroot ids uid gid owner
+    mode=$(cat /run/ais-persist-mode 2>/dev/null) || return 0
+    if ! _persist_read_drive || ! _persist_resolve; then
+        _persist_ephemeral "$mode" "$PERSIST_REASON" || _persist_die 'Could not mount temporary persistence.'
+        return 0
+    fi
+    if [ "$mode" = clean ]; then
+        _persist_ephemeral "$mode" clean || _persist_die 'Could not mount temporary persistence.'
+        echo 'AIS-LIVE: stage=persist status=ok mode=clean' >"$PERSIST_CONSOLE"
+        return 0
+    fi
+    if ! _persist_create; then
+        _persist_ephemeral "$mode" "$PERSIST_REASON" || _persist_die 'Could not mount temporary persistence.'
+        return 0
+    fi
+    PERSIST_MAPPER=/dev/mapper/ais-persist
+    if [ ! -e "$PERSIST_MAPPER" ]; then
+        if ! keyctl search @u user ais-live-exchange >/dev/null 2>&1; then
+            while ! _persist_keyring_unlock || ! _persist_open; do
+                if ! _persist_resolve; then
+                    _persist_ephemeral "$mode" "$PERSIST_REASON" || _persist_die 'Could not mount temporary persistence.'
+                    return 0
+                fi
+                echo 'Unable to unlock persistence. Try again.' >"$PERSIST_CONSOLE"
+            done
+        else
+            _persist_open || _persist_die 'Could not unlock persistence.'
+        fi
+    fi
+    _persist_mapper || _persist_die 'Persistence mapping does not belong to the selected partition.'
+    _persist_mount || _persist_die 'Could not mount persistence filesystem.'
+    _persist_subvolumes || _persist_die 'Could not initialise persistence subvolumes.'
+    _persist_recover_pick || _persist_die 'Could not recover interrupted snapshot selection.'
+    _persist_prepare_base || _persist_die 'Could not prepare persistent upper for the current base.'
+    ids=/run/archiso/airootfs/etc/ais-live/agent-ids
+    [ -r "$ids" ] || _persist_die 'Agent ownership contract is missing.'
+    awk 'NR==1 && $0 ~ /^uid=[1-9][0-9]*$/ {uid=substr($0,5); next} NR==2 && $0 ~ /^gid=[1-9][0-9]*$/ {gid=substr($0,5); next} END {if(NR!=2 || !uid || !gid || uid>4294967294 || gid>4294967294) exit 1; print uid; print gid}' "$ids" > /run/ais-agent-ids || _persist_die 'Agent ownership contract is invalid.'
+    uid=$(sed -n '1p' /run/ais-agent-ids); gid=$(sed -n '2p' /run/ais-agent-ids)
+    owner="$uid:$gid"
+    if [ ! -e /run/ais-persist/@pkglist/config-owner-ready ]; then
+        chown "$owner" /run/ais-persist/@config || _persist_die 'Could not initialise persistent agent home ownership.'
+        : >/run/ais-persist/@pkglist/config-owner-ready
+    fi
+    [ "$(stat -c '%u:%g' /run/ais-persist/@config)" = "$owner" ] || _persist_die 'Persistent agent home ownership does not match the image contract.'
+    PERSIST_UPPER=/run/ais-persist/@upper
+    if [ "$mode" = pick ]; then _persist_pick_snapshot || _persist_die 'Could not prepare selected snapshot.'; fi
+    mkdir -p "$PERSIST_UPPER/upperdir"
+    workdir="$PERSIST_UPPER/.work-$mode-$(date -u +%Y%m%dT%H%M%S)-$$"
+    mkdir -p "$workdir"
+    printf '%s\n' "$PERSIST_UPPER" >/run/ais-persist-selected-upper
+    printf '%s\n' "$workdir" >/run/ais-persist-selected-workdir
+    upper=$(cat /run/ais-persist-selected-upper) || _persist_die 'Selected upper metadata is missing.'
+    workdir=$(cat /run/ais-persist-selected-workdir) || _persist_die 'Selected workdir metadata is missing.'
+    # Replace archiso's disposable overlay before switch_root or any userspace starts.
+    umount "$newroot" || _persist_die 'Could not remove archiso temporary overlay.'
+    mkdir -p "$newroot"
+    mkdir -p "$upper/upperdir" "$workdir"
+    rm -f "$upper/upperdir/var/lib/pacman/db.lck" || _persist_die 'Could not clear stale pacman transaction lock.'
+    mount -t overlay -o "lowerdir=/run/archiso/airootfs,upperdir=$upper/upperdir,workdir=$workdir" airootfs "$newroot" || _persist_die 'Could not mount persistent overlay.'
+    mkdir -p "$newroot/mnt/persist" "$newroot/home/agent" "$newroot/var/log/ais" "$newroot/.snapshots"
+    chmod 0700 "$newroot/.snapshots"
+    mount --bind /run/ais-persist "$newroot/mnt/persist" || _persist_die 'Could not expose persistence.'
+    mount -o remount,bind,rw,noexec,nodev,nosuid /run/ais-persist "$newroot/mnt/persist" || _persist_die 'Could not secure persistence mount.'
+    chmod 0700 "$newroot/mnt/persist"
+    mount --bind /run/ais-persist/@config "$newroot/home/agent" || _persist_die 'Could not mount persistent home.'
+    [ "$(stat -c '%u:%g' /run/ais-persist/@config)" = "$owner" ] || _persist_die 'Bound agent home ownership is invalid.'
+    mount --bind /run/ais-persist/@logs "$newroot/var/log/ais" || _persist_die 'Could not mount persistent logs.'
+    mount --bind /run/ais-persist/@snapshots "$newroot/.snapshots" || _persist_die 'Could not expose snapshots.'
+    (umask 077; printf '%s\n' "$PERSIST_IDENTITY" >/run/ais-persist-identity)
+    echo "AIS-LIVE: stage=persist status=ok mode=$mode" >"$PERSIST_CONSOLE"
+}

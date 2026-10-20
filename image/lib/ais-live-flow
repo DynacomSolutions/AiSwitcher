@@ -1,0 +1,40 @@
+#!/bin/bash
+set -euo pipefail
+
+# The caller supplies fixed-operation functions. Keeping the decision flow pure
+# lets the same code run under stubbed tests without a test-only privilege path.
+ais_live_flow() {
+  local result_online=false
+  ais_probe initial || true
+  [[ "${AIS_FLOW_ONLINE:-false}" == true ]] && result_online=true
+  stage net ok
+
+  if [[ "$result_online" != true ]]; then
+    # nmtui can be cancelled after connectivity has changed. Always perform
+    # the bounded fresh probe once the dialog exits, regardless of its status.
+    ais_network_prompt || true
+    ais_probe fresh || true
+    [[ "${AIS_FLOW_ONLINE:-false}" == true ]] && result_online=true
+    stage net-prompt ok
+  else
+    stage net-prompt skip
+  fi
+
+  if [[ "$result_online" != true && "${AIS_FLOW_MODEL:-false}" == true ]]; then
+    if ais_offer_local_model; then
+      if ais_local_start; then :; else stage local-model-start fail; fi
+    fi
+    stage local-model-offer ok
+  else
+    stage local-model-offer skip
+  fi
+
+  if [[ "$result_online" == true ]]; then
+    if ais_upgrade_once; then stage vendor-cli-install ok; else stage vendor-cli-install fail; fi
+  else
+    stage vendor-cli-install skip
+  fi
+
+  stage launch ok
+  ais_launch
+}

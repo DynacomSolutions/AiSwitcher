@@ -1,0 +1,68 @@
+#!/usr/bin/bash
+# Guest side of the exchange scenario (root test unit). Cases follow the
+# contract in exchange-contract.md; the host driver only watches the serial
+# markers. Outbox verification and the exFAT read-back run in the guest, which
+# has the same age and node versions as the services under test.
+set -uo pipefail
+exec >/dev/ttyS0 2>&1
+tests=/usr/local/lib/ais-live-test
+export AIS_EXCHANGE_TEST_PASSPHRASE=SYNTHETIC_FIXTURE_exchange_passphrase
+marker() { printf 'AIS-EXCHANGE-TEST: case=%s status=%s\n' "$1" "$2"; }
+finish() { marker orchestrator "$1"; /usr/bin/systemctl --no-block poweroff; exit 0; }
+
+group=$(<"$tests/exchange-group")
+
+"$tests/exchange-capability-probe" launch || finish agent-capability-probe-failed
+
+run_case() { "$tests/exchange-scenarios.sh" "$1" || finish "case-$1-failed"; }
+stage() { "$tests/exchange-host.sh" fixture "$1" /mnt/aisx >/dev/null || finish "fixture-$1-failed"; }
+highest_outbox() {
+  find /mnt/aisx/outbox -maxdepth 1 -name 'bundle-*.age' -printf '%f\n' | sort -t- -k2 -n | tail -n 1
+}
+case $group in
+  basic)
+    run_case boot
+    run_case replay
+    stage tamper
+    run_case tamper
+    stage crafted
+    run_case crafted
+    run_case symlink
+    run_case periodic
+    latest=$(highest_outbox)
+    if "$tests/exchange-host.sh" verify-outbox "/mnt/aisx/outbox/$latest" 1; then marker outbox pass; else marker outbox fail; finish outbox-failed; fi
+    run_case shutdown
+    # The service stop above leaves the partition mounted; read it back cold.
+    exchange_device=$(findmnt -nro SOURCE --target /mnt/aisx) || finish exchange-source-unavailable
+    [[ -b $exchange_device ]] || finish exchange-source-not-block-device
+    latest=$(highest_outbox)
+    if systemctl stop ais-live-inbox.timer ais-live-outbox.timer \
+      && umount /mnt/aisx \
+      && "$tests/exchange-host.sh" exfat-readback "$exchange_device" "$latest"; then
+      marker exfat-readback pass
+    else
+      marker exfat-readback fail
+      finish exfat-readback-failed
+    fi
+    ;;
+  auth)
+    run_case boot
+    # systemd may advance an old RTC to its build-time floor during startup.
+    # Hold retries and clock synchronisation while testing both clock states.
+    systemctl stop ais-live-inbox.timer systemd-timesyncd.service || finish clock-sync-stop-failed
+    stage auth
+    media_now=$(<"$tests/now")
+    guest_now=$(date +%s) || finish clock-read-failed
+    [[ $media_now =~ ^[0-9]+$ && $guest_now =~ ^[0-9]+$ ]] || finish clock-read-failed
+    # Keep the restored time beyond writes made since the test media was built.
+    plausible_now=$(( (media_now > guest_now ? media_now : guest_now) + 1 ))
+    date -s '@946684800' >/dev/null || finish clock-set-failed
+    run_case auth-deferred
+    date -s "@$plausible_now" >/dev/null || finish clock-set-failed
+    # Diagnostic: the offline rule depends on which interfaces carry a non-loopback address.
+    printf 'AIS-EXCHANGE-DIAG: interfaces=%s\n' "$(ip -o addr show 2>/dev/null | awk '{print $2"/"$4}' | paste -sd, -)"
+    run_case auth-plausible
+    ;;
+  *) finish unknown-group ;;
+esac
+finish "done"

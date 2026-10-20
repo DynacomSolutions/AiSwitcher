@@ -1,0 +1,210 @@
+#!/usr/bin/expect -f
+
+set childPid ""
+proc fail {message} {
+  global childPid
+  puts stderr "boot-flow.exp: $message"
+  if {$childPid ne "" && [catch {exec kill -0 $childPid}] == 0} {
+    catch {exec kill -TERM $childPid}
+    after 1000
+    if {[catch {exec kill -0 $childPid}] == 0} { catch {exec kill -KILL $childPid} }
+  }
+  exit 1
+}
+
+if {$argc < 2 || ![string is integer -strict [lindex $argv 0]]} {
+  fail "usage: boot-flow.exp <timeout-seconds> <qemu> [qemu-arg ...]"
+}
+set timeout [lindex $argv 0]
+set runTimeout $timeout
+set qemu [lrange $argv 1 end]
+if {![info exists env(AIS_QEMU_BOOT_FLOW_SCENARIO)]} {
+  fail "AIS_QEMU_BOOT_FLOW_SCENARIO must name a prepared case"
+}
+set scenario $env(AIS_QEMU_BOOT_FLOW_SCENARIO)
+set persistCreateCount 0
+set persistReadyCount 0
+switch -- $scenario {
+  online-first - online-second - accounts - vendor - c7 {
+    set expectedVendor ok
+    set offer 0
+  }
+  online-retry {
+    set expectedVendor fail
+    set offer 0
+  }
+  offline-model-yes {
+    set expectedVendor skip
+    set offer 1
+    set offerAnswer y
+  }
+  offline-model-no {
+    set expectedVendor skip
+    set offer 1
+    set offerAnswer n
+  }
+  offline-model-timeout {
+    set expectedVendor skip
+    set offer 1
+    set offerAnswer timeout
+  }
+  offline-no-model {
+    set expectedVendor skip
+    set offer 0
+  }
+  default { fail "unknown scenario '$scenario'" }
+}
+
+proc waitFor {pattern description} {
+  global spawn_id timeout passphrase persistCreateCount persistReadyCount scenario
+  expect {
+    -re {You are required to change your password immediately} {
+      fail "guest account is blocked by forced password expiry"
+    }
+    -re {Login incorrect} { fail "guest account login failed" }
+    -re {Create encrypted persistence\. Enter a passphrase \(at least 12 characters\): } {
+      incr persistCreateCount
+      send -- "SYNTHETIC_FIXTURE_ais_live_persist_passphrase\r"
+      exp_continue
+    }
+    -re {Confirm passphrase: } {
+      send -- "SYNTHETIC_FIXTURE_ais_live_persist_passphrase\r"
+      exp_continue
+    }
+    -re {AIS persistence passphrase: } {
+      send -- "SYNTHETIC_FIXTURE_ais_live_persist_passphrase\r"
+      exp_continue
+    }
+    -re {AIS-LIVE: stage=persist status=ok mode=latest} {
+      incr persistReadyCount
+      exp_continue
+    }
+    -re {AIS-LIVE: stage=persist status=ok mode=(pick|clean)} {
+      exp_continue
+    }
+    -re {AIS-LIVE: stage=persist status=ephemeral reason=wrong-drive mode=(latest|pick|clean)} {
+      fail "guest lost validated persistence identity in $expect_out(1,string) mode"
+    }
+    -re $pattern { return }
+    -re {AIS-LIVE: stage=[^\r\n]* status=fail\r*\n} { fail "guest reported failure while waiting for $description: $expect_out(0,string)" }
+    -re {AIS-LIVE-TEST: (?:agent-checks|live-checks)=fail[^\r\n]*\r*\n} { fail "guest live checks failed: $expect_out(0,string)" }
+    timeout { fail "timed out waiting for $description" }
+    eof { fail "runner exited before $description" }
+  }
+}
+
+proc stopQemu {} {
+  global spawn_id timeout env runTimeout childPid
+  if {[info exists env(AIS_QEMU_RUN_DIR)]} {
+    set qmp boot-flow.qmp
+    if {[catch {exec python3 -c {
+import json, socket, sys, time
+path = sys.argv[1]
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(1)
+for _ in range(50):
+    try:
+        client.connect(path)
+        break
+    except OSError:
+        time.sleep(0.1)
+else:
+    raise SystemExit('QMP socket did not appear')
+reader = client.makefile('r', encoding='utf-8')
+writer = client.makefile('w', encoding='utf-8')
+def read_response():
+    while True:
+        line = reader.readline()
+        if not line:
+            raise RuntimeError('QMP closed before command response')
+        value = json.loads(line)
+        if isinstance(value, dict) and ('return' in value or 'error' in value):
+            if 'error' in value:
+                raise RuntimeError(value['error'])
+            return value
+def command(name):
+    writer.write(json.dumps({'execute': name}) + '\n')
+    writer.flush()
+    return read_response()
+greeting_line = reader.readline()
+if not greeting_line or 'QMP' not in json.loads(greeting_line):
+    raise RuntimeError('invalid QMP greeting')
+command('qmp_capabilities')
+command('system_powerdown')
+} $qmp} error]} {
+      fail "could not request clean guest shutdown: $error"
+    }
+  } else {
+    # Synthetic process fixtures have no QMP socket and consume this escape.
+    send -- "\001x"
+  }
+  set timeout $runTimeout
+  expect {
+    eof {}
+    timeout { fail "guest did not shut down cleanly after QMP request" }
+  }
+  set result [wait]
+  set childPid ""
+  if {[llength $result] != 4 || [lindex $result 2] != 0 || [lindex $result 3] != 0} {
+    fail "QEMU exited unsuccessfully: $result"
+  }
+}
+
+proc driveRun {attempt vendorStatus offer offerAnswer} {
+  global qemu scenario timeout runTimeout env spawn_id childPid
+  set env(AIS_QEMU_BOOT_FLOW_ATTEMPT) $attempt
+  set env(AIS_QEMU_BOOT_FLOW_VENDOR_STATUS) $vendorStatus
+  set command $qemu
+  if {[info exists env(AIS_QEMU_RUN_DIR)]} {
+    lappend command -qmp "unix:boot-flow.qmp,server=on,wait=off"
+  }
+  spawn -noecho {*}$command
+  set childPid [exp_pid]
+  set timeout $runTimeout
+  waitFor {AIS-LIVE: stage=net status=ok} "initial network stage"
+  if {$scenario ni {online-first online-second online-retry accounts vendor c7}} {
+    waitFor {NetworkManager TUI} "NetworkManager TUI readiness"
+    # Escape closes nmtui; the boot flow then performs its fresh probe.
+    send -- "\033"
+  }
+  if {$offer} {
+    waitFor {AIS-LIVE: stage=net-prompt status=ok} "post-prompt network stage"
+    waitFor {Launch the local model for help\? \[y/N\]} "local model offer"
+    if {$offerAnswer eq "timeout"} {
+      waitFor {AIS-LIVE: stage=local-model-offer status=ok} "local model offer timeout"
+    } else {
+      send -- "$offerAnswer\r"
+      if {$offerAnswer eq "y"} { waitFor {AIS-LIVE-TEST: local-model=started} "synthetic local model runner" }
+      waitFor {AIS-LIVE: stage=local-model-offer status=ok} "local model offer result"
+    }
+  } else {
+    waitFor {AIS-LIVE: stage=net-prompt status=(skip|ok)} "network prompt stage"
+    waitFor {AIS-LIVE: stage=local-model-offer status=skip} "local model skip stage"
+  }
+  waitFor "AIS-LIVE: stage=vendor-cli-install status=$vendorStatus" "vendor install stage"
+  waitFor {AIS-LIVE: stage=launch status=ok} "launch stage"
+  waitFor {AIS-LIVE-TEST: agent-checks=ok} "agent account, socket, sync and console checks"
+  if {$vendorStatus eq "ok"} { waitFor {AIS-LIVE-TEST: vendor-shims=ok} "vendor shim ownership check" }
+  waitFor {AIS-LIVE-TEST: live-checks=ok} "live process and Herdr pane checks"
+  if {$scenario in {offline-no-model online-first online-second online-retry accounts vendor c7}} {
+    waitFor {Nothing to launch: no installed tool has an active identity} "empty launch-state diagnostic"
+  } else {
+    waitFor {What do you want to launch\?} "actual ais launch menu"
+  }
+  stopQemu
+}
+
+if {$scenario eq "online-retry"} {
+  driveRun 1 fail 0 ""
+  driveRun 2 ok 0 ""
+  if {$persistCreateCount != 1 || $persistReadyCount != 2} { fail {retry scenario did not reuse encrypted persistence across both boots} }
+} elseif {$scenario eq "online-second"} {
+  # The Task2 harness creates one image copy for this driver invocation.
+  # Reboot it twice so the persisted first-online marker is exercised.
+  driveRun 1 ok 0 ""
+  driveRun 2 ok 0 ""
+  if {$persistCreateCount != 1 || $persistReadyCount != 2} { fail {second-boot scenario did not reuse encrypted persistence across both boots} }
+} else {
+  driveRun 1 $expectedVendor $offer [expr {[info exists offerAnswer] ? $offerAnswer : ""}]
+}
+exit 0

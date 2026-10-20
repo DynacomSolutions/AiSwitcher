@@ -1,0 +1,17 @@
+[Unit]
+Description=Hold the AIS exchange key until shutdown work completes
+After=ais-live-persist-ready.service
+Before=ais-live-outbox-shutdown.service shutdown.target
+Conflicts=shutdown.target
+ConditionPathIsMountPoint=/mnt/persist
+ConditionPathExists=!/run/ais-persist-ephemeral
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+ExecStart=/usr/bin/true
+ExecStop=/usr/bin/bash -c 'keyid=$(/usr/bin/keyctl search @u user ais-live-exchange) && /usr/bin/keyctl revoke "$keyid" || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

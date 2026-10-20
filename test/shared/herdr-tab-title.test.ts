@@ -2,9 +2,20 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HerdrTabTitleWatcher, formatHerdrChatTitle } from "../../src/shared/herdr-tab-title.ts";
+import { HerdrTabTitleWatcher, formatHerdrChatTitle, runTitleHerdr } from "../../src/shared/herdr-tab-title.ts";
 
 describe("Herdr chat tab titles", () => {
+  test("live mode blocks sidecar title calls before resolving or spawning Herdr", async () => {
+    const previousLive = process.env.AIS_LIVE;
+    process.env.AIS_LIVE = "1";
+    try {
+      expect(await runTitleHerdr(["tab", "rename", "synthetic-pane", "Synthetic title"])).toEqual({ ok: false, stdout: "" });
+    } finally {
+      if (previousLive === undefined) delete process.env.AIS_LIVE;
+      else process.env.AIS_LIVE = previousLive;
+    }
+  });
+
   test("cleans controls, bounds length, and rejects command-only prompts", () => {
     expect(formatHerdrChatTitle("\u001b[31mFix the \u0000 router\u001b[0m")).toBe("Fix the router");
     expect(formatHerdrChatTitle("status")).toBeUndefined();

@@ -1,0 +1,17 @@
+[Unit]
+Description=Install image shims into the mounted agent configuration
+DefaultDependencies=no
+Requires=ais-live-accounts.service
+After=local-fs.target ais-live-accounts.service
+Before=getty@tty1.service serial-getty@.service
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+User=agent
+Group=agent
+ExecStart=/usr/local/lib/ais-live/install-agent-shims
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+import array,json,os,socket,sys
+SOCK='/run/ais-guard.sock'
+def main():
+ name=os.path.basename(sys.argv[0]); args=sys.argv[1:]
+ if name=='ais-guard':
+  if len(args)<1:return 126
+  name=args[0];args=args[1:]
+ op='disk'; expected=None
+ if name in {'ais-pacman','pacman'}:
+  op='pacman'; name='pacman'
+ if name=='ais-aur':
+  if len(args)!=3 or args[0]!='install': return 126
+  op='aur-install'; argv=['install',args[1],args[2]]; expected=args[1]
+ else: argv=[name,*args]
+ s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+ try:
+  s.settimeout(1200);s.connect(os.environ.get('AIS_GUARD_SOCKET',SOCK))
+  req=json.dumps({'op':op,'argv':argv,'cwd':os.getcwd(),'expected_package':expected if op=='aur-install' else None},separators=(',',':')).encode()+b'\n'
+  fds=array.array('i',[0,1,2])
+  sent=s.sendmsg([req],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,fds)])
+  if sent!=len(req):
+   s.sendall(req[sent:])
+  data=bytearray()
+  while b'\n' not in data and len(data)<8192:
+   b=s.recv(2048)
+   if not b:break
+   data.extend(b)
+  r=json.loads(bytes(data).split(b'\n',1)[0])
+  if r.get('approved') and r.get('reason')=='local' and op=='disk':
+   # The daemon found no device operand: run the real binary here, as the calling user.
+   s.close(); os.execv('/usr/bin/'+os.path.basename(name),[os.path.basename(name),*args])
+  if not r.get('approved'):
+   print('ais-guard: refused: '+str(r.get('reason','unknown'))[:200],file=sys.stderr); return 126
+  return int(r.get('exit_code',126))
+ except Exception:return 126
+ finally:s.close()
+if __name__=='__main__':sys.exit(main())

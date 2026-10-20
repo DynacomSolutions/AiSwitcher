@@ -39,7 +39,12 @@ export function isAllowedDomain(domain: string): boolean {
   return ALLOWED_DOMAINS.some(entry => lower === entry.domain || lower.endsWith(`.${entry.domain}`));
 }
 
-export function findDomains(text: string): string[] {
+// A narrow allowlist for a known three-part enum access shape. It is only
+// applied to string literals in code files by checkLine, never plain text.
+export const isCodeIdentifierChain = (token: string): boolean =>
+  /^[a-z][a-z0-9_]*\.[A-Z][a-z0-9_]*\.[A-Z]{2,}$/.test(token);
+
+export function findDomains(text: string, allowCodeIdentifierChain = false): string[] {
   const found: string[] = [];
   for (const match of text.matchAll(DOMAIN_RE)) {
     const token = match[0];
@@ -48,6 +53,10 @@ export function findDomains(text: string): string[] {
     if (EXCLUDED_TLDS.has(tld)) continue;
     if (!REAL_TLDS.has(tld)) continue;
     if (isAllowedDomain(token)) continue;
+    const before = text.slice(0, match.index);
+    const after = text.slice(match.index + token.length, match.index + token.length + 1);
+    const prefix = before.match(/(?:^|[^A-Za-z0-9+.-])([^\s"'`<>]*)$/)?.[1] ?? "";
+    if (allowCodeIdentifierChain && isCodeIdentifierChain(token) && !prefix.includes("@") && !/[A-Za-z][A-Za-z0-9+.-]*:(?:\/\/)?$/.test(prefix) && !/[A-Za-z0-9_-]/.test(after)) continue;
     found.push(token);
   }
   return found;
@@ -60,74 +69,92 @@ export function findDomains(text: string): string[] {
 // files removes that whole false-positive class without needing a full
 // parser; plain-text/config files (README, YAML, Dockerfile, ...) are
 // scanned in full since they have no such ambiguity.
-const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".rs"]);
+const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".rules"]);
 
 // `python` is set for extensionless scripts with a python shebang; `.py`
 // files are recognised by extension. `triple` carries an open triple-quoted
 // string across lines.
 export interface CommentState { inBlock: boolean; python?: boolean; triple?: string }
+type SegmentKind = "string" | "comment" | "text";
+interface ScannableSegment { text: string; kind: SegmentKind }
 
 export const isPythonShebang = (firstLine: string): boolean => /^#!.*\bpython/.test(firstLine);
 
 // Python: only string and comment content can hold a hostname; plain code
 // such as a call chain is attribute access.
-function pythonSegments(line: string, state: CommentState): string[] {
-  const segments: string[] = [];
+function pythonSegments(line: string, state: CommentState): ScannableSegment[] {
+  const segments: ScannableSegment[] = [];
   let i = 0;
   while (i < line.length) {
     if (state.triple) {
       const end = line.indexOf(state.triple, i);
-      if (end === -1) { segments.push(line.slice(i)); return segments; }
-      segments.push(line.slice(i, end));
+      if (end === -1) { segments.push({ text: line.slice(i), kind: "string" }); return segments; }
+      segments.push({ text: line.slice(i, end), kind: "string" });
       i = end + 3;
       state.triple = undefined;
       continue;
     }
     const c = line[i]!;
-    if (c === "#") { segments.push(line.slice(i)); break; }
+    if (c === "#") { segments.push({ text: line.slice(i), kind: "comment" }); break; }
     if (c !== '"' && c !== "'") { i++; continue; }
     if (line.startsWith(c.repeat(3), i)) { state.triple = c.repeat(3); i += 3; continue; }
     let j = i + 1;
     while (j < line.length && line[j] !== c) j += line[j] === "\\" ? 2 : 1;
-    segments.push(line.slice(i + 1, j));
+    segments.push({ text: line.slice(i + 1, j), kind: "string" });
     i = j + 1;
   }
   return segments;
 }
 
-export function scannableSegments(path: string, line: string, state: CommentState): string[] {
+function scannableTaggedSegments(path: string, line: string, state: CommentState): ScannableSegment[] {
   if (state.python || extname(path) === ".py") return pythonSegments(line, state);
-  if (!CODE_EXTENSIONS.has(extname(path))) return [line];
-  const segments: string[] = [];
-  let work = line;
-  if (state.inBlock) {
-    const end = work.indexOf("*/");
-    if (end === -1) { segments.push(work); return segments; }
-    segments.push(work.slice(0, end));
-    work = work.slice(end + 2);
-    state.inBlock = false;
-  }
-  const blockStart = work.indexOf("/*");
-  if (blockStart !== -1) {
-    const blockEnd = work.indexOf("*/", blockStart + 2);
-    if (blockEnd === -1) {
-      segments.push(work.slice(blockStart + 2));
-      state.inBlock = true;
-      work = work.slice(0, blockStart);
-    } else {
-      segments.push(work.slice(blockStart + 2, blockEnd));
-      work = work.slice(0, blockStart) + work.slice(blockEnd + 2);
+  if (!CODE_EXTENSIONS.has(extname(path))) return [{ text: line, kind: "text" }];
+  const segments: ScannableSegment[] = [];
+  let i = 0;
+  while (i < line.length) {
+    if (state.triple === "`") {
+      const start = i;
+      while (i < line.length && line[i] !== "`") {
+        if (line[i] === "\\") i += 2;
+        else i++;
+      }
+      segments.push({ text: line.slice(start, i), kind: "string" });
+      if (i === line.length) return segments;
+      i++;
+      state.triple = undefined;
+      continue;
     }
+    if (state.inBlock) {
+      const start = i;
+      while (i < line.length && !line.startsWith("*/", i)) i++;
+      segments.push({ text: line.slice(start, i), kind: "comment" });
+      if (i === line.length) return segments;
+      i += 2;
+      state.inBlock = false;
+      continue;
+    }
+    if (line.startsWith("/*", i)) { state.inBlock = true; i += 2; continue; }
+    if (line.startsWith("//", i)) { segments.push({ text: line.slice(i), kind: "comment" }); break; }
+    const quote = line[i]!;
+    if (quote === '"' || quote === "'" || quote === "`") {
+      if (quote === "`") { state.triple = "`"; i++; continue; }
+      const start = ++i;
+      while (i < line.length) {
+        if (line[i] === "\\") { i += 2; continue; }
+        if (line[i] === quote) break;
+        i++;
+      }
+      segments.push({ text: line.slice(start, i), kind: "string" });
+      if (i < line.length) i++;
+      continue;
+    }
+    i++;
   }
-  const lineCommentIdx = work.indexOf("//");
-  if (lineCommentIdx !== -1) {
-    segments.push(work.slice(lineCommentIdx));
-    work = work.slice(0, lineCommentIdx);
-  }
-  const stringRe = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g;
-  let match: RegExpExecArray | null;
-  while ((match = stringRe.exec(work))) segments.push(match[0]);
   return segments;
+}
+
+export function scannableSegments(path: string, line: string, state: CommentState): string[] {
+  return scannableTaggedSegments(path, line, state).map(segment => segment.text);
 }
 
 // ---- IP literals ------------------------------------------------------------
@@ -173,11 +200,20 @@ export function findIps(text: string): string[] {
 }
 
 // ---- emails ------------------------------------------------------------------
-const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,24})\b/g;
+const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{1,24})\b/g;
+
+// systemd template units (getty on tty1, the serial-getty template) look
+// like a mailbox on a made-up host but are unit names.
+const SYSTEMD_UNIT_RE = /(?:^|[^A-Za-z0-9_.@+%:-])([a-z0-9_-]+@[A-Za-z0-9_:.-]*\.(?:service|socket|target|timer|mount|path|slice|device))(?=$|[^A-Za-z0-9_.@+%:-])/g;
 
 export function findEmails(text: string): string[] {
   const found: string[] = [];
+  const unitSpans = [...text.matchAll(SYSTEMD_UNIT_RE)].map(match => ({
+    token: match[1]!, start: match.index + match[0].indexOf(match[1]!),
+    end: match.index + match[0].indexOf(match[1]!) + match[1]!.length,
+  }));
   for (const match of text.matchAll(EMAIL_RE)) {
+    if (unitSpans.some(unit => unit.start === match.index && unit.end === match.index + match[0].length && unit.token === match[0])) continue;
     if (isAllowedDomain(match[1]!)) continue;
     found.push(match[0]);
   }
@@ -195,6 +231,8 @@ const EXAMPLE_HOME_USERS = new Set([
   // Established synthetic single-letter/placeholder names already used
   // across this repo's own test fixtures (never a real local account).
   "t", "x", "alice", "bob", "tester", "local-user", "name", "projects",
+  // The live image's own fixed accounts (image/archiso), not real machine accounts.
+  "agent", "live",
 ]);
 const HOME_PATH_RE = /(?:\/(?:home|Users)\/|[A-Za-z]:[\\/]Users[\\/])([^\\/\s"'`<>:;,()[\]{}]+)/gi;
 
@@ -240,12 +278,14 @@ export function checkLine(path: string, text: string, state: CommentState = { in
   if (findHomePaths(text).length) rules.add("identifying-home-path");
   if (findEmails(text).length) rules.add("blocked-email");
   if (findIps(text).length) rules.add("blocked-ip");
-  for (const segment of scannableSegments(path, text, state)) {
-    if (findDomains(segment).length) rules.add("blocked-domain");
-    if (findMachineNicknames(segment).length) rules.add("personal-machine-nickname");
+  for (const segment of scannableTaggedSegments(path, text, state)) {
+    const allowCodeChain = segment.kind === "string" && (CODE_EXTENSIONS.has(extname(path)) || state.python || extname(path) === ".py");
+    if (findDomains(segment.text, allowCodeChain).length) rules.add("blocked-domain");
+    if (findMachineNicknames(segment.text).length) rules.add("personal-machine-nickname");
   }
   return [...rules];
 }
+
 
 // ---- tree mode: scan every tracked file's current working-tree content ----
 
