@@ -117,7 +117,7 @@ describe("AIS live agent context", () => {
     const guardd = await readFile(join(root, "lib/ais-guardd"), "utf8");
 
     expect(manifest).toContain('id = "ais-guard"');
-    expect(manifest).toContain('placement = "popup"');
+    expect(manifest).toContain('placement = "overlay"');
     expect(manifest).toContain('command = ["./confirm"]');
     expect(entrypoint).toContain("/usr/local/lib/ais-live/ais-guard-popup");
     expect(socket).toContain("ListenStream=/run/ais-guard.sock");
