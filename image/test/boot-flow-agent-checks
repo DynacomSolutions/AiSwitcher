@@ -28,8 +28,11 @@ cleanup() {
   if [[ "$web_started" == true ]]; then /usr/bin/ais web stop >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
-/usr/bin/ais web start >/dev/null 2>&1 || fail console-start
 web_started=true
+if ! /usr/bin/ais web start >/dev/null; then
+  /usr/bin/ais web status >&2 || true
+  fail console-start
+fi
 status=''
 for _ in {1..40}; do
   status=$(/usr/bin/curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time 2 http://localhost:47129/api/health 2>/dev/null || true)

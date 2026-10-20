@@ -37,6 +37,18 @@ describe("image account split", () => {
     expect(units).toContain("hidepid=2");
   });
 
+  it("checks logind directly and verifies polkit through bounded D-Bus activation", async () => {
+    const [checks, agentChecks] = await Promise.all([
+      read("image/test/boot-flow-live-checks"),
+      read("image/test/boot-flow-agent-checks"),
+    ]);
+    expect(checks).toContain("systemctl is-active --quiet systemd-logind || fail systemd-logind-readiness");
+    expect(checks).toContain("timeout --foreground 5 /usr/bin/busctl --system call");
+    expect(checks).toContain("org.freedesktop.DBus.Peer Ping >/dev/null || fail polkit-dbus-activation");
+    expect(checks.indexOf("org.freedesktop.DBus.Peer Ping")).toBeLessThan(checks.indexOf("systemctl is-active --quiet polkit"));
+    expect(agentChecks).toContain("if /usr/bin/pkexec true </dev/null >/dev/null 2>&1; then fail pkexec; fi");
+  });
+
   it("resets and verifies live and agent supplementary groups", async () => {
     const accounts = await read("image/lib/ais-live-accounts");
     expect(accounts).toContain("usermod --groups proc live");
@@ -86,6 +98,12 @@ describe("image account split", () => {
       expect(check).toContain("| /usr/bin/grep -F ais-guard >/dev/null");
       expect(check).not.toContain("grep -q");
     }
+    const helper = accounts.split("herdr_as_live() {")[1]?.split("\n  }", 1)[0] ?? "";
+    expect(helper).toContain("/usr/bin/setpriv --reuid=live --regid=live --init-groups");
+    expect(helper).toContain("/usr/bin/env -i");
+    expect(helper).toContain("HERDR_SOCKET_PATH=\"$runtime_dir/herdr.sock\"");
+    expect(helper).toContain("/usr/local/bin/herdr \"$@\"");
+    expect(helper).not.toContain("runuser");
   });
 
   it("keeps both login consoles available after shim failure without bypassing isolation", async () => {
@@ -99,6 +117,20 @@ describe("image account split", () => {
       for (const dependency of ["ais-live-accounts.service", "ais-live-hardening.service", "ais-live-agent-shims.service"]) {
         expect(values("After")).toContain(dependency);
       }
+      if (getty === "serial-getty@") {
+        expect(dropIn.split("\n").filter((line) => line === "After=ais-live-accounts.service ais-live-hardening.service ais-live-agent-shims.service ais-live-models.service ais-live-test-fixtures.service ais-live-test-media.service")).toHaveLength(1);
+        expect(dropIn).toContain("ConditionPathExists=!/usr/local/lib/ais-live-test/orchestrator");
+      }
+    }
+  });
+
+  it("retains only the ambient setuid capability for isolated exchange operations", async () => {
+    for (const service of ["ais-live-inbox", "ais-live-outbox", "ais-live-outbox-shutdown"]) {
+      const unit = await read(`image/archiso/airootfs/etc/systemd/system/${service}.service`);
+      expect(unit.split("\n").filter((line) => line === "AmbientCapabilities=CAP_SETUID")).toHaveLength(1);
+      expect(unit).toContain("NoNewPrivileges=yes");
+      expect(unit).toContain("CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID");
+      expect(unit).toContain("RestrictAddressFamilies=");
     }
   });
 
@@ -124,8 +156,10 @@ describe("image account split", () => {
     expect(clean).toContain("AIS_TEST_VENDOR_MODE=\"$vendor_mode\"");
     expect(clean).toContain("AIS_TEST_VENDOR_COUNTER=/home/agent/.ais/live/vendor-stub.calls");
     expect(clean).toContain("test assertion operation requires ais.test=1");
+    expect(clean).toContain('cd -- "$HOME"');
+    expect(clean.indexOf('[[ "$(/usr/bin/id -un)" != agent ]]')).toBeLessThan(clean.indexOf('cd -- "$HOME"'));
     expect(fixture).toContain("ais.test=1");
-    expect(fixture).toContain("/mnt/aisx/test-fixtures");
+    expect(fixture).toContain("/run/ais-live-test-media/exchange/test-fixtures");
     expect(fixture).toContain('[[ -f "$source_file" && ! -L "$source_file" && -r "$source_file" ]]');
     expect(fixture).not.toContain('-x "$source_file"');
     expect(fixture).toContain('/usr/bin/install -o root -g root -m 0755 "$source_dir/$fixture" "$target_dir/$fixture"');

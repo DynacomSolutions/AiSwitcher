@@ -2,12 +2,8 @@
 # Source from the QEMU driver. The serial fixture requests user decisions;
 # QMP sends those keys to tty1 and never calls an agent-side approval API.
 set guard_script_dir [file dirname [file normalize [info script]]]
-set guard_replies [dict create \
-    wrong-target wrong-target \
-    right-target vdb \
-    symlink-swap vdb \
-    aur-install {install synthetic-fixture}]
 set guard_no_reply {unanswered-dd destructive-tool raw-read-refusal}
+set guard_interactive_scenarios {unanswered-dd destructive-tool raw-read-refusal wrong-target right-target symlink-swap aur-install}
 
 proc guard_qmp_key {socket text} {
     if {![file exists $socket]} { error "QMP socket unavailable" }
@@ -21,39 +17,53 @@ proc guard_expect_run {serial_id qmp_socket timeout_sec} {
     # QEMU creates its sockets asynchronously after spawn. Wait for the guest's
     # popup marker; guard_qmp_key checks the socket when a reply is needed.
     set popup_seen [dict create]
+    set prompt_replies [dict create]
     set complete 0
     while {1} {
         expect {
             -i $serial_id
             -timeout $timeout_sec
-            -re {AIS-GUARD-TEST: case=([a-z0-9-]+) status=([a-z0-9-]+)} {
+            -re {AIS-GUARD-TEST: case=([a-z0-9-]+) status=([a-z0-9-]+)( reply=([A-Za-z0-9 /._-]+))?\r*\n} {
                 set scenario $expect_out(1,string)
                 set status $expect_out(2,string)
                 if {$status eq "popup"} {
+                    if {$scenario ni $::guard_interactive_scenarios} { error "unexpected popup scenario $scenario" }
                     dict set popup_seen $scenario 1
-                    if {$scenario ni $::guard_no_reply} {
-                        if {$scenario ni {symlink-swap aur-install} && ![dict exists $::guard_replies $scenario]} {
-                            error "no automatic reply configured for $scenario"
-                        }
-                        if {$scenario ni {symlink-swap aur-install}} {
-                            guard_qmp_key $qmp_socket [dict get $::guard_replies $scenario]
-                        }
+                } elseif {$status eq "prompt"} {
+                    if {$scenario ni $::guard_interactive_scenarios} { error "unexpected prompt scenario $scenario" }
+                    if {![dict exists $popup_seen $scenario]} { error "prompt arrived before popup for $scenario" }
+                    if {![info exists expect_out(4,string)] || $expect_out(4,string) eq ""} {
+                        error "invalid rendered prompt relay for $scenario"
+                    }
+                    set reply $expect_out(4,string)
+                    dict set prompt_replies $scenario $reply
+                    if {$scenario ni $::guard_no_reply && $scenario ni {symlink-swap aur-install}} {
+                        if {$scenario eq "wrong-target"} { guard_qmp_key $qmp_socket wrong-target } else { guard_qmp_key $qmp_socket $reply }
                     }
                 } elseif {$scenario eq "symlink-swap-target-flipped" && $status eq "ok"} {
                     if {![dict exists $popup_seen symlink-swap]} { error "symlink popup was not ready before alias swap" }
-                    guard_qmp_key $qmp_socket vdb
+                    if {![dict exists $prompt_replies symlink-swap]} { error "symlink prompt was not relayed" }
+                    guard_qmp_key $qmp_socket [dict get $prompt_replies symlink-swap]
                 } elseif {$status eq "reply"} {
+                    if {$scenario ni $::guard_interactive_scenarios} { error "unexpected reply scenario $scenario" }
                     if {![dict exists $popup_seen $scenario]} { error "reply arrived before popup for $scenario" }
+                    if {![dict exists $prompt_replies $scenario]} { error "reply arrived before rendered prompt for $scenario" }
                     if {$scenario ne "aur-install"} { error "unexpected deferred reply marker for $scenario" }
-                    guard_qmp_key $qmp_socket [dict get $::guard_replies $scenario]
+                    guard_qmp_key $qmp_socket [dict get $prompt_replies $scenario]
                 } elseif {$scenario eq "all" && $status eq "complete"} {
                     foreach required {unanswered-dd destructive-tool raw-read-refusal wrong-target right-target aur-install symlink-swap} {
                         if {![dict exists $popup_seen $required]} { error "missing popup for $required" }
+                        if {![dict exists $prompt_replies $required]} { error "missing rendered prompt for $required" }
                     }
                     set complete 1
                     break
+                } elseif {$status in {popup prompt reply}} {
+                    error "unsupported guard marker $scenario/$status"
                 }
                 exp_continue
+            }
+            -re {AIS-GUARD-TEST: case=orchestrator status=(no-herdr-socket|fixtures-failed|run-failed|probe-failed)\r*\n} {
+                error "guard orchestrator failed with $expect_out(1,string)"
             }
             timeout { error "timed out waiting for guard fixture" }
             eof { error "serial stream closed before guard fixture completed" }

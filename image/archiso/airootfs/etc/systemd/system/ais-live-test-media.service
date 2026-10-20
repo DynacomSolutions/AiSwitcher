@@ -1,8 +1,7 @@
 [Unit]
 Description=Stage AIS test media (explicit test boots only)
 DefaultDependencies=no
-Requires=mnt-aisx.mount
-After=local-fs.target mnt-aisx.mount
+After=local-fs.target ais-live-exchange.service
 Before=ais-live-inbox.service ais-live-models.service ais-live-test-fixtures.service ais-live-accounts.service
 ConditionKernelCommandLine=ais.test=1
 

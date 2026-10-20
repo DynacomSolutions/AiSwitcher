@@ -26,20 +26,20 @@ case "$scenario" in
     network=user
     vendor_mode=stub
     [[ "$scenario" != online-retry ]] || vendor_mode=stub-fail-first
-    kernel_args=(ais.test=1 ais.scenario=boot-flow "ais.probe=gateway:$((10#$gateway_port))" "ais.vendor=$vendor_mode")
+    kernel_args=(ais.scenario=boot-flow "ais.probe=gateway:$((10#$gateway_port))" "ais.vendor=$vendor_mode")
     fixtures=(vendor-upgrade llama-cli)
     [[ "$scenario" != online-retry && "$scenario" != online-second ]] || runs=2
     ;;
   offline-model-yes|offline-model-no|offline-model-timeout)
     [[ -z "$gateway_port" ]] || usage
     network=none
-    kernel_args=(ais.test=1 ais.scenario=boot-flow ais.mode=clean ais.vendor=stub)
+    kernel_args=(ais.scenario=boot-flow ais.vendor=stub)
     fixtures=(vendor-upgrade llama-cli model)
     ;;
   offline-no-model)
     [[ -z "$gateway_port" ]] || usage
     network=none
-    kernel_args=(ais.test=1 ais.scenario=boot-flow ais.mode=clean ais.vendor=stub)
+    kernel_args=(ais.scenario=boot-flow ais.vendor=stub)
     fixtures=(vendor-upgrade llama-cli)
     ;;
   *) usage ;;

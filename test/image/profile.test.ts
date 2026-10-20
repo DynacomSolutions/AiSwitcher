@@ -12,7 +12,7 @@ const profiledef = readFileSync(`${profile}/profiledef.sh`, "utf8");
 
 describe("packages.x86_64", () => {
   test("has the required set", () => {
-    for (const p of ["base", "linux", "mkinitcpio-archiso", "syslinux", "cryptsetup", "btrfs-progs", "exfatprogs", "age", "networkmanager", "sudo", "nodejs", "npm"]) {
+    for (const p of ["base", "linux", "mkinitcpio-archiso", "syslinux", "cryptsetup", "gptfdisk", "util-linux", "btrfs-progs", "exfatprogs", "age", "networkmanager", "sudo", "nodejs", "npm"]) {
       expect(packages).toContain(p);
     }
   });

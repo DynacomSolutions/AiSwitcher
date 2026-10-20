@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, readdir, writeFile, chmod, rename, unlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile, chmod, rename, unlink, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +8,33 @@ import { describe, expect, test } from "bun:test";
 const script = new URL("../../image/lib/ais-outbox", import.meta.url).pathname;
 const fixtureCredential = "SYNTHETIC_FIXTURE_age_probe";
 const expectBin = process.env.AIS_EXPECT_BIN ?? Bun.which("expect") ?? "";
+
+test("exchange outbox sequence treats only a missing directory as empty", async () => {
+  const root = await mkdtemp(join(process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir(), "ais-exchange-sequence-"));
+  try {
+    const helper = new URL("../../image/test/exchange-highest-outbox.mjs", import.meta.url).pathname;
+    const missing = spawnSync("node", [helper, join(root, "not-created")], { encoding: "utf8" });
+    expect(missing.status, missing.stderr).toBe(0);
+    expect(missing.stdout).toBe("0\n");
+
+    const outbox = join(root, "outbox");
+    await mkdir(outbox);
+    await writeFile(join(outbox, "bundle-2.age"), "SYNTHETIC_FIXTURE_bundle_two");
+    await writeFile(join(outbox, "bundle-11.age"), "SYNTHETIC_FIXTURE_bundle_eleven");
+    await writeFile(join(outbox, "foreign-file"), "SYNTHETIC_FIXTURE_foreign_file");
+    const present = spawnSync("node", [helper, outbox], { encoding: "utf8" });
+    expect(present.status, present.stderr).toBe(0);
+    expect(present.stdout).toBe("11\n");
+
+    const notDirectory = join(root, "regular-file");
+    await writeFile(notDirectory, "SYNTHETIC_FIXTURE_not_a_directory");
+    const invalid = spawnSync("node", [helper, notDirectory], { encoding: "utf8" });
+    expect(invalid.status).not.toBe(0);
+    expect(invalid.stderr).toContain("ENOTDIR");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function octal(value: number, width: number): Uint8Array {
   return new TextEncoder().encode(`${value.toString(8).padStart(width - 1, "0")}\0`);
@@ -65,7 +92,7 @@ async function harness(): Promise<{ root: string; path: string; tar: Uint8Array 
     keyctl: `#!/bin/bash\ncase $1 in search) printf '73\\n' ;; pipe) [[ \${AIS_TEST_KEY_PIPE_FAIL:-0} == 1 ]] && exit 71; printf '${fixtureCredential}' ;; *) exit 64 ;; esac\n`,
     age: `#!/bin/bash\npassphrase=$(cat <&3) || exit 65\n[[ $passphrase == '${fixtureCredential}' ]] || exit 66\nif [[ \${AIS_TEST_AGE_PARTIAL_FAIL:-0} == 1 ]]; then head -c 512; exit 67; fi\nif [[ \${AIS_TEST_AGE_FAIL:-0} == 1 ]]; then exit 67; fi\nif [[ \${AIS_TEST_AGE_OVERFLOW:-0} == 1 ]]; then head -c 67108865 /dev/zero; else cat; fi\n`,
     sync: `#!/bin/bash\nprintf '%s\\n' "$*" >>"$AIS_TEST_SYNC_LOG"\n`,
-    runuser: `#!/bin/bash\n[[ $1 == -u && $2 == agent && $3 == -- ]] || exit 68\nshift 3\nif [[ \${AIS_TEST_COLLECT_OVERFLOW:-0} == 1 ]]; then head -c 33554433 /dev/zero; else exec "$@"; fi\n`,
+    setpriv: `#!/bin/bash\n[[ $1 == --reuid=agent && $2 == --regid=agent && $3 == --init-groups ]] || exit 68\nprintf '%s\\n' "$*" >>"$AIS_TEST_SETPRIV_ARGS"\nshift 3\n[[ $1 == /usr/bin/env && $2 == -i ]] || exit 69\nshift 2\nwhile [[ $# -gt 0 && $1 == *=* ]]; do shift; done\nif [[ \${AIS_TEST_COLLECT_OVERFLOW:-0} == 1 ]]; then head -c 33554433 /dev/zero; else exec "$@"; fi\n`,
     ais: `#!/bin/bash\nprintf '%s\\n' "$@" >>"$AIS_TEST_ARGS"\ncase "$2" in write-outbox) cat "$AIS_TEST_FIXTURE_TAR" ;; apply-inbox) cat >"$AIS_TEST_APPLIED"; code=\${AIS_TEST_APPLY_STATUS:-0}; if [[ $code == 0 ]]; then printf 'AIS-LIVE: stage=inbox status=ok applied=1 skipped=0\\n' >&2; fi; exit "$code" ;; *) exit 69 ;; esac\n`,
   };
   for (const [name, body] of Object.entries(helpers)) {
@@ -87,6 +114,9 @@ async function run(root: string, path: string, args: string[], extra: Record<str
       AIS_TEST_APPLIED: join(root, "applied.tar"),
       AIS_TEST_ARGS: join(root, "ais-args"),
       AIS_TEST_SYNC_LOG: join(root, "sync.log"),
+      AIS_TEST_SETPRIV_ARGS: join(root, "setpriv-args"),
+      AIS_TEST_SETPRIV_BIN: join(path, "setpriv"),
+      AIS_BIN: join(path, "ais"),
       ...extra,
     },
     stdout: "pipe", stderr: "pipe",
@@ -107,6 +137,7 @@ describe("root exchange wrapper protocol", () => {
     expect(result.stderr).toContain("stage=inbox status=ok applied=");
     expect(Buffer.from(await readFile(join(root, "applied.tar")))).toEqual(Buffer.from(inbox));
     expect((await readFile(join(root, "ais-args"), "utf8"))).toContain("--last-inbox-seq=0");
+    expect(await readFile(join(root, "setpriv-args"), "utf8")).toContain("--reuid=agent --regid=agent --init-groups /usr/bin/env -i HOME=/home/agent USER=agent LOGNAME=agent SHELL=/bin/bash PATH=/usr/local/bin:/usr/bin:/bin AIS_LIVE=1");
     expect(JSON.parse(await readFile(join(root, "persist", "ais-live-exchange", "applied-inbox-seq.json"), "utf8")).seq).toBe(4);
     expect(await readdir(join(root, "run", "ais-live-exchange"))).toEqual(["exchange.lock"]);
   });
@@ -290,16 +321,46 @@ describe("root exchange wrapper protocol", () => {
   });
 });
 
-test.skipIf(!expectBin || !existsSync(expectBin))("Expect matcher accepts pass and rejects failure and EOF", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ais-exchange-expect-"));
+test.skipIf(!expectBin || !existsSync(expectBin))("Expect matcher accepts pass and CRCRLF failure markers and rejects EOF", async () => {
+  const root = await mkdtemp(join(process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir(), "ais-exchange-expect-"));
   const source = new URL("../../image/test/exchange.exp", import.meta.url).pathname;
   const driver = join(root, "expect-probe.exp");
-  await writeFile(driver, `source {${source}}\nset timeout 5\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=boot status=pass\\n'}\nset channel $spawn_id\nif {[catch {ais_exchange::wait_case $channel boot} message] || $message ne "0"} { error "pass marker failed: $message" }\nwait\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=boot status=fail reason=SYNTHETIC_FIXTURE_expect_failure\\n'}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_case $channel boot} message] || ![string match {*SYNTHETIC_FIXTURE_expect_failure*} $message]} { error "failure marker was not rejected: $message" }\nwait\nspawn -noecho bash -c {exit 0}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_case $channel boot} message] || ![string match {*serial channel closed*} $message]} { error "EOF was not rejected: $message" }\nwait\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: rejected reason=SYNTHETIC_FIXTURE_expect_rejected\\n'}\nset channel $spawn_id\nif {[catch {ais_exchange::assert_rejected $channel {AIS-EXCHANGE-TEST: rejected reason=SYNTHETIC_FIXTURE_expect_rejected}} message] || $message ne "0"} { error "rejected marker was not observed: $message" }\nwait\nspawn -noecho bash -c {exit 0}\nset channel $spawn_id\nif {![catch {ais_exchange::assert_rejected $channel {AIS-EXCHANGE-TEST: rejected reason=SYNTHETIC_FIXTURE_expect_rejected}} message] || ![string match {*serial channel closed*} $message]} { error "rejected-marker EOF was not rejected: $message" }\nwait\nputs "expect matcher pass/fail/eof verified"\n`);
+  await writeFile(driver, `source {${source}}\nset timeout 5\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=boot status=pass\\n'}\nset channel $spawn_id\nif {[catch {ais_exchange::wait_case $channel boot} message] || $message ne "0"} { error "pass marker failed: $message" }\nwait\nspawn -noecho bash -c {stty -opost; printf 'AIS-EXCHANGE-TEST: case=boot status=fail reason=SYNTHETIC_FIXTURE_expect_failure\\r\\r\\n'}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_case $channel boot} message] || ![string match {*SYNTHETIC_FIXTURE_expect_failure*} $message]} { error "failure marker was not rejected: $message" }\nwait\nspawn -noecho bash -c {exit 0}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_case $channel boot} message] || ![string match {*serial channel closed*} $message]} { error "EOF was not rejected: $message" }\nwait\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: rejected reason=SYNTHETIC_FIXTURE_expect_rejected\\n'}\nset channel $spawn_id\nif {[catch {ais_exchange::assert_rejected $channel {AIS-EXCHANGE-TEST: rejected reason=SYNTHETIC_FIXTURE_expect_rejected}} message] || $message ne "0"} { error "rejected marker was not observed: $message" }\nwait\nspawn -noecho bash -c {exit 0}\nset channel $spawn_id\nif {![catch {ais_exchange::assert_rejected $channel {AIS-EXCHANGE-TEST: rejected reason=SYNTHETIC_FIXTURE_expect_rejected}} message] || ![string match {*serial channel closed*} $message]} { error "rejected-marker EOF was not rejected: $message" }\nwait\nputs "expect matcher pass/CRCRLF-fail/eof verified"\n`);
   const result = spawnSync(expectBin, [driver], {
     encoding: "utf8",
     env: { ...process.env, ...(process.env.AIS_EXPECT_LD_LIBRARY_PATH ? { LD_LIBRARY_PATH: process.env.AIS_EXPECT_LD_LIBRARY_PATH } : {}) },
   });
   expect(result.error?.message).toBeUndefined();
   expect(result.status, result.stderr).toBe(0);
-  expect(result.stdout).toContain("expect matcher pass/fail/eof verified");
+  expect(result.stdout).toContain("expect matcher pass/CRCRLF-fail/eof verified");
+});
+
+test.skipIf(!expectBin || !existsSync(expectBin))("exchange waiters fail immediately on orchestrator failure", async () => {
+  const root = await mkdtemp(join(process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir(), "ais-exchange-orchestrator-expect-"));
+  const source = new URL("../../image/test/exchange.exp", import.meta.url).pathname;
+  const driver = join(root, "expect-orchestrator-probe.exp");
+  await writeFile(driver, `source {${source}}\nset timeout 5\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=orchestrator status=case-periodic-failed\\r\\r\\n'}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_case $channel periodic} message] || ![string match {*case-periodic-failed*} $message]} { error "wait_case ignored orchestrator failure: $message" }\nwait\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=orchestrator status=agent-capability-probe-failed\\r\\r\\n'}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_agent_capability $channel} message] || ![string match {*agent-capability-probe-failed*} $message]} { error "wait_agent_capability ignored orchestrator failure: $message" }\nwait\nputs "orchestrator failure markers rejected immediately"\n`);
+  const result = spawnSync(expectBin, [driver], {
+    encoding: "utf8",
+    env: { ...process.env, ...(process.env.AIS_EXPECT_LD_LIBRARY_PATH ? { LD_LIBRARY_PATH: process.env.AIS_EXPECT_LD_LIBRARY_PATH } : {}) },
+  });
+  expect(result.error?.message).toBeUndefined();
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toContain("orchestrator failure markers rejected immediately");
+  await rm(root, { recursive: true, force: true });
+});
+
+test.skipIf(!expectBin || !existsSync(expectBin))("orchestrator completion requires a complete marker line", async () => {
+  const root = await mkdtemp(join(process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir(), "ais-exchange-done-expect-"));
+  const source = new URL("../../image/test/exchange.exp", import.meta.url).pathname;
+  const driver = join(root, "expect-done-probe.exp");
+  await writeFile(driver, `source {${source}}\nset timeout 5\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=orchestrator status=done'; sleep 0.2; printf '\\r\\r\\n'}\nset channel $spawn_id\nif {[catch {ais_exchange::wait_orchestrator_done $channel} message] || $message ne "0"} { error "complete done marker was rejected: $message" }\nwait\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=orchestrator status=done'; sleep 0.2; exit 0}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_orchestrator_done $channel} message] || ![string match {*serial channel closed*} $message]} { error "partial done marker was accepted: $message" }\nwait\nspawn -noecho bash -c {printf 'AIS-EXCHANGE-TEST: case=orchestrator status=case-periodic-failed\\r\\r\\n'}\nset channel $spawn_id\nif {![catch {ais_exchange::wait_orchestrator_done $channel} message] || ![string match {*case-periodic-failed*} $message]} { error "complete failure marker was accepted: $message" }\nwait\nputs "orchestrator completion marker line endings verified"\n`);
+  const result = spawnSync(expectBin, [driver], {
+    encoding: "utf8",
+    env: { ...process.env, ...(process.env.AIS_EXPECT_LD_LIBRARY_PATH ? { LD_LIBRARY_PATH: process.env.AIS_EXPECT_LD_LIBRARY_PATH } : {}) },
+  });
+  expect(result.error?.message).toBeUndefined();
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toContain("orchestrator completion marker line endings verified");
+  await rm(root, { recursive: true, force: true });
 });

@@ -31,9 +31,11 @@ case $scenario in
     cp -- "$here/guard-orchestrator" "$work/scripts/orchestrator"
     ;;
   exchange)
+    [[ $case_name == basic || $case_name == auth ]] || die 'exchange needs the basic or auth group'
     fixture_source
-    cp -- "$here/exchange-scenarios.sh" "$here/exchange-host.sh" "$here/exchange-fixtures.mjs" "$work/scripts/"
+    cp -- "$here/exchange-scenarios.sh" "$here/exchange-host.sh" "$here/exchange-fixtures.mjs" "$here/exchange-highest-outbox.mjs" "$here/exchange-capability-probe" "$work/scripts/"
     cp -- "$here/exchange-orchestrator" "$work/scripts/orchestrator"
+    printf '%s\n' "$case_name" >"$work/scripts/exchange-group"
     printf '%s' SYNTHETIC_FIXTURE_exchange_passphrase >"$work/passphrase"
     : >"$work/gen-inbox"
     : >"$work/persist-tmpfs"

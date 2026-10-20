@@ -4,6 +4,7 @@ set -euo pipefail
 operation=${1:-pane}
 if (($# != 1)); then echo 'agent-exec-clean accepts one fixed operation' >&2; exit 126; fi
 if [[ "$(/usr/bin/id -un)" != agent ]]; then echo 'agent-exec must run as agent' >&2; exit 126; fi
+cd -- "$HOME"
 
 test_mode=false
 test_probe_port=''
@@ -24,7 +25,7 @@ if [[ "$test_mode" == true ]]; then
   if [[ -n "$test_probe_port" ]]; then
     [[ "$test_probe_port" =~ ^[0-9]{1,5}$ ]] || { echo 'invalid test probe port' >&2; exit 126; }
     ((10#$test_probe_port > 0 && 10#$test_probe_port <= 65535)) || { echo 'invalid test probe port' >&2; exit 126; }
-    gateway=$(/usr/bin/ip -4 route show default | /usr/bin/awk '$1 == "default" { for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit }')
+    gateway=$(/usr/bin/ip -color=never -4 route show default | /usr/bin/awk '$1 == "default" { for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }')
     [[ "$gateway" =~ ^[0-9.]+$ ]] || { echo 'test gateway could not be resolved' >&2; exit 126; }
     export AIS_ONLINE_PROBE_URL="http://$gateway:$((10#$test_probe_port))/"
   fi

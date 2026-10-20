@@ -1,0 +1,59 @@
+#!/usr/bin/bash
+
+build() {
+    add_module dm-crypt
+    add_module btrfs
+    add_module overlay
+    add_all_modules '/crypto/'
+    add_module exfat
+    add_binary btrfs
+    add_binary cryptsetup
+    add_binary mkfs.btrfs
+    add_binary findmnt
+    add_binary blkid
+    add_binary blockdev
+    add_binary stat
+    add_binary dirname
+    add_binary grep
+    add_binary chown
+    add_binary awk
+    add_binary tr
+    add_binary cmp
+    add_binary keyctl
+    add_binary mount
+    add_binary umount
+    add_binary find
+    add_binary sed
+    add_binary head
+    add_binary sort
+    add_binary chmod
+    add_binary mkdir
+    add_binary cp
+    add_binary rm
+    add_binary stty
+    add_binary sleep
+    add_binary udevadm
+    add_binary readlink
+    add_binary date
+    add_binary mv
+    add_binary cat
+    add_binary wc
+    add_binary cut
+    add_binary printf
+    add_runscript
+    [[ -r /etc/ais-live/agent-ids ]] || { error 'Missing required /etc/ais-live/agent-ids'; return 1; }
+    awk 'NR==1 && $0 ~ /^uid=[1-9][0-9]*$/ {uid=substr($0,5); next} NR==2 && $0 ~ /^gid=[1-9][0-9]*$/ {gid=substr($0,5); next} END {if(NR!=2 || !uid || !gid || uid>4294967294 || gid>4294967294) exit 1}' /etc/ais-live/agent-ids || { error 'Invalid /etc/ais-live/agent-ids'; return 1; }
+    add_file /etc/ais-live/agent-ids
+    [[ -r /usr/lib/udev/rules.d/60-persistent-storage.rules ]] || { error 'Missing diskseq udev rule'; return 1; }
+    add_file /usr/lib/udev/rules.d/60-persistent-storage.rules /usr/lib/udev/rules.d/60-persistent-storage.rules
+    if [[ ! -e /etc/ais-live/base-packages ]]; then
+        mkdir -p /etc/ais-live
+        pacman -Qqe | LC_ALL=C sort -u >/etc/ais-live/base-packages
+    fi
+}
+
+help() {
+    cat <<'HELP'
+Validate ais.base and archiso parameters before any disk mount, then prepare encrypted AIS persistence in the late hook. The host app must create partition 5 and set ais.base, ais.exchange and ais.drive before boot.
+HELP
+}

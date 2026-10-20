@@ -11,6 +11,10 @@ if [[ "$(/usr/bin/id -u)" != 0 ]]; then
 fi
 
 source_dir=/mnt/aisx/models
+read -r -a kernel_args </proc/cmdline
+if [[ " ${kernel_args[*]} " == *' ais.test=1 '* && -d /run/ais-live-test-media/exchange/models ]]; then
+  source_dir=/run/ais-live-test-media/exchange/models
+fi
 staging_dir=/opt/ais/.model-validation-root/models
 target_dir=/opt/ais/models
 fail() { echo 'AIS-LIVE: stage=local-models status=fail' >&2; exit 1; }

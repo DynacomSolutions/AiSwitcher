@@ -45,12 +45,15 @@ sde=$(date -ud "${ARCH_ARCHIVE_DATE//\//-}" +%s)
 
 in_root pacman-key --init
 in_root pacman-key --populate archlinux
-in_root pacman -Syu --noconfirm archiso grub
+in_root pacman -Syu --noconfirm archiso grub gcc
 log archiso-installed
 
 rm -rf "$root/build"
 mkdir -p "$root/build/out"
 cp -a "$repo/image/archiso" "$root/build/profile"
+# Create the synthetic image accounts and password database before profile
+# metadata generates their initramfs ownership contract.
+"$repo/image/archiso/prepare-profile.sh" "$root/build/profile"
 # AIS_STAGE_DIR holds the compiled ais tools and herdr (see stage-profile.sh).
 [ -n "${AIS_STAGE_DIR:-}" ] || { echo "build: AIS_STAGE_DIR is required" >&2; exit 1; }
 "$here/stage-profile.sh" "$root/build/profile" "$AIS_STAGE_DIR"

@@ -4,6 +4,7 @@ umask 077
 
 readonly MARKER_PREFIX='AIS-EXCHANGE-TEST:'
 readonly STATE_REL='.ais/live/exchange-state.json'
+readonly HERE=/usr/local/lib/ais-live-test
 
 fail() {
   printf '%s case=%s status=fail reason=%s\n' "$MARKER_PREFIX" "${CASE_NAME:-unknown}" "$1"
@@ -32,15 +33,7 @@ JS
 }
 
 outbox_seq() {
-  node - /mnt/aisx/outbox <<'JS'
-const fs = require("node:fs");
-let highest = 0;
-for (const name of fs.readdirSync(process.argv[2])) {
-  const match = /^bundle-([1-9][0-9]{0,17})\.age$/.exec(name);
-  if (match && Number.isSafeInteger(Number(match[1]))) highest = Math.max(highest, Number(match[1]));
-}
-process.stdout.write(`${highest}\n`);
-JS
+  node "$HERE/exchange-highest-outbox.mjs" /mnt/aisx/outbox
 }
 
 start_inbox() {
@@ -60,7 +53,7 @@ case $CASE_NAME in
     start_inbox
     after=$(state_seq) || fail inbox-state-missing-after-replay
     [[ $before == 1 && $after == 1 ]] || fail replay-changed-sequence
-    journalctl -b -u ais-live-inbox.service --no-pager | grep -q 'stage=inbox status=ok applied=0 skipped=' || fail replay-skip-marker-missing
+    journalctl -b -u ais-live-inbox.service --no-pager | grep -q 'stage=inbox status=skip reason=stale' || fail replay-skip-marker-missing
     pass
     ;;
   tamper)

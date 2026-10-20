@@ -41,6 +41,11 @@ the threshold.
 
 ## Exchange partition notes
 
+Drive creation must assign fresh GPT identifiers, add and zero the persistence
+partition, and patch all boot entries before use. See
+[the host app drive identity contract](docs/drive-identity.md) for the exact
+procedure and validation rules.
+
 ### Non-interactive age passphrases
 
 The exchange services use age's batchpass plugin mode. Require age 1.3 or

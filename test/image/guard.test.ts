@@ -467,7 +467,7 @@ sys.path.insert(0,'image/lib')
 l=importlib.machinery.SourceFileLoader('g','image/lib/ais-guardd'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
 seen=[]
 for _ in range(2):
- d=tempfile.mkdtemp(prefix='ais-popup-code-SYNTHETIC_FIXTURE-'); m.R=d
+ d='ais-popup-code-'+str(os.getpid())+'-'+str(_); m.R=d
  m.os.chown=m.os.fchown=lambda *a:None; m.uid_for=m.gid_for=lambda n:os.getuid()
  m.pwd.getpwnam=lambda n:types.SimpleNamespace(pw_gid=os.getgid(),pw_dir='/',pw_uid=os.getuid())
  m.herdr_socket=lambda u:'/x'; m.device_info=lambda p:{'path':p}
@@ -498,7 +498,7 @@ os.unlink(os.path.join(d,rid+'.json')); os.rmdir(d)
     const script = String.raw`
 import importlib.machinery,importlib.util,json,os,socket,sys,tempfile,threading
 sys.path.insert(0,'image/lib'); l=importlib.machinery.SourceFileLoader('cl','image/lib/ais-guard'); s=importlib.util.spec_from_loader(l.name,l); m=importlib.util.module_from_spec(s); l.exec_module(m)
-d=tempfile.mkdtemp(prefix='ais-client-SYNTHETIC_FIXTURE-'); path=os.path.join(d,'s.sock')
+path='ais-client-'+str(os.getpid())+'.sock'
 srv=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); srv.bind(path); srv.listen(1)
 def serve():
  c,_=srv.accept(); c.recvmsg(4096,64); c.sendall(b'{"approved":true,"reason":"local"}\n'); c.close()
@@ -506,7 +506,7 @@ t=threading.Thread(target=serve); t.start()
 os.environ['AIS_GUARD_SOCKET']=path; calls=[]; m.os.execv=lambda *a:calls.append(a)
 sys.argv=['/usr/local/guard/bin/dd','if=./x','of=./y']; m.main(); t.join()
 assert calls==[('/usr/bin/dd',['dd','if=./x','of=./y'])],calls
-srv.close(); os.unlink(path); os.rmdir(d)
+srv.close(); os.unlink(path)
 `;
     execFileSync('python3', ['-B', '-c', script], { cwd: join(import.meta.dir, '../..') });
   });

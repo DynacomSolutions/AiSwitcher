@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -41,18 +41,67 @@ describe("live guard scenario fixtures", () => {
   test("driver supports the scenario's whitelisted keys and fails without QMP", () => {
     const source = readFileSync(expectDriver, "utf8");
     expect(source).toContain("wrong-target");
-    expect(source).toContain("right-target vdb");
-    expect(source).toContain("install synthetic-fixture");
+    const scenario = readFileSync(guest, "utf8");
+    expect(scenario).toContain("herdr pane read --source recent --lines 80 --format text");
+    expect(scenario).toContain("sleep 1.1");
+    expect(scenario).toContain("status=prompt reply=%s");
+    expect(source).toContain('elseif {$status eq "prompt"}');
+    expect(source).toContain("reply arrived before rendered prompt");
+    expect(source).toContain("prompt arrived before popup");
+    expect(source).toContain("wrong-target");
     expect(source).toContain("QMP socket unavailable");
     expect(source).toContain("proc guard_expect_run {serial_id qmp_socket timeout_sec}");
+    expect(source).toContain("set guard_interactive_scenarios {unanswered-dd destructive-tool raw-read-refusal wrong-target right-target symlink-swap aur-install}");
+    expect(source).toContain("unexpected popup scenario $scenario");
+    expect(source).toContain('if {$scenario ne "aur-install"}');
+    expect(source).toContain("set prompt_replies [dict create]");
+    expect(source).not.toContain("set guard_prompt_replies");
+    const fullDriver = readFileSync(resolve(root, "image/test/guard-driver.exp"), "utf8");
+    expect(source).toContain("guard orchestrator failed with $expect_out(1,string)");
+    expect(fullDriver).toContain("case=run status=ok\\r*\\n");
+    expect(fullDriver).toContain("case=([a-z-]+) status=reply\\r*\\n");
     expect(source).not.toContain("herdr plugin pane send-keys");
     expect(source).not.toContain("herdr plugin pane send-text");
+  });
+
+  test("Herdr denial checks use the v0.9.3 positional CLI and explain unexpected errors", () => {
+    const scenario = readFileSync(guest, "utf8");
+    expect(scenario).toContain('herdr pane "$operation" "$pane" x 2>&1');
+    expect(scenario).toContain("Herdr pane %s failed without a permission-denial response");
+    expect(scenario).toContain('herdr api snapshot --json 2>&1');
+    expect(scenario).toContain("$output != *'permission denied'*");
+    expect(scenario).toContain("Herdr API snapshot failed without a permission-denial response");
+    expect(scenario).toContain('herdr pane "$operation" "$pane" x 2>&1');
+  });
+
+  test("synthetic makepkg fixtures do not require debugedit", () => {
+    for (const fixture of [
+      "image/test/fixtures/guard-repo/synthetic-repo-probe/PKGBUILD",
+      "image/test/fixtures/guard-aur/synthetic-fixture/PKGBUILD",
+    ]) {
+      expect(readFileSync(resolve(root, fixture), "utf8")).toContain("options=('!debug')");
+    }
+  });
+
+  test("guard driver requires completed orchestration and every requested sandbox probe", () => {
+    const driver = readFileSync(resolve(root, "image/test/guard-driver.exp"), "utf8");
+    const scenario = readFileSync(resolve(root, "image/test/run-scenario.sh"), "utf8");
+    expect(scenario).toContain("if [[ $arg == probe ]]; then export AIS_GUARD_PROBE_EXPECTED=1");
+    expect(driver).toContain("set expect_probe [expr {[info exists env(AIS_GUARD_PROBE_EXPECTED)]");
+    expect(driver).toContain("sandbox-probe status=complete\\r*\\n");
+    expect(driver).toContain("mdadm-create|mdadm-stop|luks-format|luks-open|luks-close");
+    expect(driver).toContain("case=probe status=ok\\r*\\n");
+    expect(driver).toContain("orchestrator completed before requested sandbox probe succeeded");
+    expect(driver).toContain("serial stream closed before orchestrator completion");
   });
 
   test("guard QMP uses a short path relative to the runner's working directory", () => {
     const driver = readFileSync(resolve(root, "image/test/guard-driver.exp"), "utf8");
     const runner = readFileSync(resolve(root, "image/test/run-qemu.sh"), "utf8");
     expect(driver).toContain("set qmp guard.qmp");
+    expect(driver).toContain("guard_expect_run $spawn_id $qmp $boot_timeout");
+    expect(driver).toContain("set timeout $boot_timeout");
+    expect(driver).not.toMatch(/guard_expect_run \$spawn_id \$qmp 600|set timeout 900/);
     expect(driver).not.toContain("file join $env(AIS_QEMU_RUN_DIR)");
     expect(runner).toContain('cd -- "$work"');
     expect(runner).toContain('expect "$driver"');
@@ -75,9 +124,7 @@ describe("live guard scenario fixtures", () => {
   });
 
   test("QMP client frames fragmented responses and sends shifted keys as chords", async () => {
-    const scratch = process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir();
-    mkdirSync(scratch, { recursive: true });
-    const socket = `${scratch}/q${process.pid}.sock`;
+    const socket = `q${process.pid}.sock`;
     const server = createServer((connection) => {
       connection.write('{"QMP":{');
       setTimeout(() => connection.write('"version":{}}}\r\n'), 2);
@@ -107,6 +154,7 @@ describe("live guard scenario fixtures", () => {
       expect(result).toBe(0);
     } finally {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      unlinkSync(socket);
     }
   });
 

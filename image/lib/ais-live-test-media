@@ -1,7 +1,6 @@
 #!/usr/bin/bash
-# Stage the optional AISTEST disk on explicit test boots: scenario scripts,
-# exchange-partition fixtures, the exchange passphrase and a stand-in for the
-# persistent mount. Smoke boots have no such disk and are unaffected.
+# Stage the optional AISTEST disk on explicit test boots. Test payloads stay in
+# RAM unless the verified exchange resolver has mounted the selected p4.
 set -euo pipefail
 
 read -r -a kernel_args </proc/cmdline
@@ -29,12 +28,17 @@ if [[ -d "$media/scripts" ]]; then
   /usr/bin/find /usr/local/lib/ais-live-test -type f -exec /usr/bin/chmod 0755 {} +
 fi
 if [[ -d "$media/exchange" ]]; then
-  /usr/bin/cp -r --no-preserve=all -- "$media/exchange/." /mnt/aisx/
-  /usr/bin/sync -f /mnt/aisx
+  /usr/bin/install -d -m 0700 /run/ais-live-test-media/exchange
+  /usr/bin/cp -r --no-preserve=all -- "$media/exchange/." /run/ais-live-test-media/exchange/
 fi
 if [[ -f "$media/passphrase" ]]; then
   /usr/bin/keyctl padd user ais-live-exchange @u <"$media/passphrase" >/dev/null
   if [[ -f "$media/gen-inbox" ]]; then
+    /usr/local/lib/ais-live/resolve-boot-partition exchange
+    /usr/bin/mountpoint -q /mnt/aisx || {
+      echo 'exchange fixture staging requires a verified exchange mount' >&2
+      exit 1
+    }
     AIS_EXCHANGE_TEST_PASSPHRASE=$(</"$media/passphrase") \
       /usr/local/lib/ais-live-test/exchange-host.sh fixture inbox /mnt/aisx >/dev/null
   fi

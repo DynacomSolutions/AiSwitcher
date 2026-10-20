@@ -44,12 +44,28 @@ print(chr(10).join(dict.fromkeys(out)))' <<<"$snapshot") || return 1
     while IFS= read -r pane_id; do
       [[ -n $pane_id ]] || continue
       if runuser -u live -- env HERDR_SOCKET_PATH="$socket_path" herdr pane wait-output --match 'Type exactly:' --source recent --timeout 900 "$pane_id" >/dev/null 2>&1; then
+        GUARD_POPUP_PANE=$pane_id
         return 0
       fi
     done <<<"$pane_ids"
     sleep 0.1
   done
   return 1
+}
+
+read_popup_reply() {
+  local socket_path=$1 pane_id=$2 snapshot reply
+  # The popup deliberately flushes input for one second after displaying the
+  # prompt. Read the rendered prompt only after that window has elapsed.
+  sleep 1.1
+  snapshot=$(runuser -u live -- env HERDR_SOCKET_PATH="$socket_path" herdr pane read --source recent --lines 80 --format text "$pane_id") || return 1
+  reply=$(python3 -B -c 'import re,sys
+lines=[line for line in sys.stdin.read().splitlines() if "Type exactly: " in line]
+if not lines: raise SystemExit(1)
+reply=lines[-1].split("Type exactly: ",1)[1]
+if not reply or len(reply)>160 or re.fullmatch(r"[A-Za-z0-9 /._-]+",reply) is None: raise SystemExit(1)
+print(reply)' <<<"$snapshot") || return 1
+  GUARD_POPUP_REPLY=$reply
 }
 
 wait_popup() {
@@ -82,8 +98,10 @@ start_guarded() {
     fi
     if [[ -n $request ]]; then
       if ! wait_for_popup_text "${GUARD_HERDR_SOCKET:?}"; then return 1; fi
+      if ! read_popup_reply "${GUARD_HERDR_SOCKET:?}" "$GUARD_POPUP_PANE"; then return 1; fi
       GUARDED_REQUEST=$request
       mark "$case_name" popup
+      printf 'AIS-GUARD-TEST: case=%s status=prompt reply=%s\n' "$case_name" "$GUARD_POPUP_REPLY"
       return 0
     fi
     if ! kill -0 "$GUARDED_PID" 2>/dev/null; then wait "$GUARDED_PID" || return 2; return 2; fi
@@ -114,8 +132,16 @@ PY
 
 assert_herdr_denied() {
   local socket_path=$1 operation=$2 pane=$3 output
-  if output=$(run_as_agent env HERDR_SOCKET_PATH="$socket_path" herdr pane "$operation" "$pane" x 2>&1); then return 1; fi
-  [[ $output == *'Permission denied'* || $output == *'permission denied'* || $output == *'EACCES'* ]]
+  if output=$(run_as_agent env HERDR_SOCKET_PATH="$socket_path" herdr pane "$operation" "$pane" x 2>&1); then
+    printf 'guard-scenarios: Herdr pane %s unexpectedly succeeded\n' "$operation" >&2
+    return 1
+  fi
+  if [[ $output == *'Permission denied'* || $output == *'permission denied'* || $output == *'EACCES'* ]]; then
+    return 0
+  fi
+  printf 'guard-scenarios: Herdr pane %s failed without a permission-denial response: %s\n' \
+    "$operation" "${output:0:240}" >&2
+  return 1
 }
 
 test_tiocsti_denied() {
@@ -177,8 +203,15 @@ run_scenarios() {
   pane=w1:p1
   assert_herdr_denied "$herdr_socket" send-keys "$pane" || return 1
   assert_herdr_denied "$herdr_socket" send-text "$pane" || return 1
-  if output=$(run_as_agent env HERDR_SOCKET_PATH="$herdr_socket" herdr api snapshot --json 2>&1); then return 1; fi
-  [[ $output == *'Permission denied'* || $output == *'EACCES'* ]] || return 1
+  if output=$(run_as_agent env HERDR_SOCKET_PATH="$herdr_socket" herdr api snapshot --json 2>&1); then
+    printf 'guard-scenarios: Herdr API snapshot unexpectedly succeeded\n' >&2
+    return 1
+  fi
+  if [[ $output != *'Permission denied'* && $output != *'permission denied'* && $output != *'EACCES'* ]]; then
+    printf 'guard-scenarios: Herdr API snapshot failed without a permission-denial response: %s\n' \
+      "${output:0:240}" >&2
+    return 1
+  fi
   mark pane-api-denial ok
   run_as_agent python3 -B - "$herdr_socket" <<'PY'
 import errno, socket, sys

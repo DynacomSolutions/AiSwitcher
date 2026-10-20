@@ -1,12 +1,13 @@
 [Unit]
 Description=Write the final AIS outbox before exchange unmount
-Requires=mnt-aisx.mount
+Requires=ais-live-exchange.service
 RequiresMountsFor=/mnt/persist
-After=mnt-aisx.mount mnt-persist.mount
+After=ais-live-exchange.service mnt-persist.mount
 Before=shutdown.target umount.target
 Conflicts=shutdown.target
 DefaultDependencies=no
 ConditionPathIsMountPoint=/mnt/persist
+ConditionPathIsMountPoint=/mnt/aisx
 
 [Service]
 Type=oneshot
@@ -26,6 +27,7 @@ PrivateTmp=yes
 ProtectSystem=full
 ReadWritePaths=/mnt/aisx -/mnt/persist/ais-live-exchange /run/ais-live-exchange
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_SETUID
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

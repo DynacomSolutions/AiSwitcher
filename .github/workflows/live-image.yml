@@ -75,7 +75,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xorriso jq expect tcl dosfstools mtools e2fsprogs exfatprogs \
+            xorriso jq expect tcl gdisk dosfstools mtools e2fsprogs exfatprogs \
             syslinux syslinux-common grub-common grub-efi-amd64-bin \
             python3 qemu-system-x86 ovmf nodejs
 
@@ -204,7 +204,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            jq expect mtools python3 qemu-system-x86 ovmf
+            jq expect mtools python3 qemu-system-x86 ovmf gdisk
 
       # The hosted runner exposes /dev/kvm but not to the runner user.
       - name: Enable KVM
@@ -279,7 +279,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            jq expect mtools python3 qemu-system-x86 ovmf dosfstools
+            jq expect mtools python3 qemu-system-x86 ovmf dosfstools gdisk
 
       # The hosted runner exposes /dev/kvm but not to the runner user.
       - name: Enable KVM

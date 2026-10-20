@@ -2,9 +2,11 @@
 Description=Verify and expose exchange partition models
 DefaultDependencies=no
 Requires=ais-live-accounts.service
-After=local-fs.target ais-live-accounts.service
+Wants=ais-live-exchange.service
+After=local-fs.target ais-live-exchange.service ais-live-accounts.service
 Before=getty@tty1.service serial-getty@.service
-ConditionPathExists=/mnt/aisx/models/manifest.json
+# The helper selects the validated persistent exchange or staged test media,
+# and exits cleanly when neither source contains a model manifest.
 
 [Service]
 Type=oneshot

@@ -5,6 +5,10 @@ set driverDir [file dirname [file normalize [info script]]]
 source [file join $driverDir guard.exp]
 if {$argc < 2} { puts stderr "usage: guard-driver.exp <timeout> <qemu> \[args\]"; exit 2 }
 set boot_timeout [lindex $argv 0]
+if {![string is integer -strict $boot_timeout] || $boot_timeout < 1} {
+    puts stderr "usage: guard-driver.exp <positive-timeout-seconds> <qemu> \[args\]"
+    exit 2
+}
 set command [lrange $argv 1 end]
 # run-qemu.sh enters its work directory. Keep the socket name short enough for
 # sockaddr_un even when the checkout or artifact directory has a long path.
@@ -20,23 +24,54 @@ proc fail {reason} {
     catch {wait}
     exit 1
 }
-if {[catch {guard_expect_run $spawn_id $qmp 600} err]} { fail $err }
-set timeout 900
+if {[catch {guard_expect_run $spawn_id $qmp $boot_timeout} err]} { fail $err }
+set timeout $boot_timeout
 set probes {mdadm-create mdadm-stop luks-format luks-open luks-close}
+set expect_probe [expr {[info exists env(AIS_GUARD_PROBE_EXPECTED)] && $env(AIS_GUARD_PROBE_EXPECTED) eq "1"}]
+set probe_ok [dict create]
+set probe_prompts [dict create]
+set orchestrator_done 0
 expect {
-    -re {AIS-GUARD-TEST: case=run status=ok} { exp_continue }
-    -re {AIS-GUARD-TEST: case=([a-z-]+) status=reply} {
-        set name $expect_out(1,string)
-        if {$name ni $probes} { fail "unexpected reply request $name" }
-        guard_qmp_key $qmp [dict get {mdadm-create vdb\ vdc mdadm-stop md0 luks-format vdb luks-open vdb luks-close vdb} $name]
+    -re {AIS-GUARD-TEST: case=run status=ok\r*\n} { exp_continue }
+    -re {AIS-GUARD-TEST: case=([a-z-]+) status=prompt reply=([A-Za-z0-9 /._-]+)\r*\n} {
+        dict set probe_prompts $expect_out(1,string) $expect_out(2,string)
         exp_continue
     }
-    -re {AIS-GUARD-TEST: case=[a-z-]+ status=(failed|missing-popup)} { fail "guard probe failed: $expect_out(0,string)" }
-    -re {AIS-GUARD-TEST: case=orchestrator status=done} { exp_continue }
-    -re {AIS-GUARD-TEST: case=orchestrator status=([a-z-]+)} { fail "orchestrator ended with $expect_out(1,string)" }
+    -re {AIS-GUARD-TEST: case=([a-z-]+) status=reply\r*\n} {
+        set name $expect_out(1,string)
+        if {$name ni $probes} { fail "unexpected reply request $name" }
+        if {![dict exists $probe_prompts $name]} { fail "reply requested before rendered prompt for $name" }
+        guard_qmp_key $qmp [dict get $probe_prompts $name]
+        exp_continue
+    }
+    -re {AIS-GUARD-TEST: case=(mdadm-create|mdadm-stop|luks-format|luks-open|luks-close) status=ok\r*\n} {
+        dict set probe_ok $expect_out(1,string) 1
+        exp_continue
+    }
+    -re {AIS-GUARD-TEST: case=sandbox-probe status=complete\r*\n} {
+        if {!$expect_probe} { fail "unexpected sandbox probe completion" }
+        foreach name $probes {
+            if {![dict exists $probe_ok $name]} { fail "sandbox probe completed before $name succeeded" }
+        }
+        set probe_complete 1
+        exp_continue
+    }
+    -re {AIS-GUARD-TEST: case=probe status=ok\r*\n} {
+        if {!$expect_probe || ![info exists probe_complete]} { fail "probe success marker arrived without a completed requested probe" }
+        set probe_marker 1
+        exp_continue
+    }
+    -re {AIS-GUARD-TEST: case=[a-z-]+ status=(failed|missing-popup)\r*\n} { fail "guard probe failed: $expect_out(0,string)" }
+    -re {AIS-GUARD-TEST: case=orchestrator status=done\r*\n} {
+        if {$expect_probe && (![info exists probe_complete] || ![info exists probe_marker])} { fail "orchestrator completed before requested sandbox probe succeeded" }
+        set orchestrator_done 1
+        exp_continue
+    }
+    -re {AIS-GUARD-TEST: case=orchestrator status=([a-z-]+)\r*\n} { fail "orchestrator ended with $expect_out(1,string)" }
     timeout { fail "timed out waiting for guard completion" }
     eof {}
 }
+if {!$orchestrator_done} { fail "serial stream closed before orchestrator completion" }
 set result [wait]
 if {[lindex $result 2] != 0 || [lindex $result 3] != 0} { fail "QEMU exited with $result" }
 puts "guard-driver: guard scenarios complete"

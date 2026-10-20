@@ -30,6 +30,7 @@ case $scenario in
     plan=$("$here/boot-flow-scenario.sh" "$arg" ${port:+"$port"})
     kernel_args=$(sed -n 's/^kernel_arg=//p' <<<"$plan" | tr '\n' ' ')
     network=$(sed -n 's/^network=//p' <<<"$plan" | head -n 1)
+    boots=$(sed -n 's/^runs=//p' <<<"$plan" | head -n 1)
     "$here/make-test-media.sh" "$media" boot-flow "$arg" ${port:+"$port"} >/dev/null
     if [[ $network == user ]]; then
       mkdir "$work/www"
@@ -38,21 +39,26 @@ case $scenario in
       extra+=(-nic user)
     fi
     export AIS_QEMU_DRIVER=$here/boot-flow.exp AIS_QEMU_BOOT_FLOW_SCENARIO=$arg
+    case $arg in online-second|online-retry) export AIS_TEST_MODE=latest ;; esac
     export AIS_TEST_ARGS="$kernel_args"
+    export AIS_QMP_EXPECT_BOOTS=${boots:-1}
     ;;
   guard)
     "$here/make-test-media.sh" "$media" guard >/dev/null
     for disk in vdb vdc; do truncate -s 64M "$work/$disk.img"; extra+=(-drive "file=${work//,/,,}/$disk.img,if=virtio,format=raw"); done
     extra+=(-m 3072)
     export AIS_QEMU_DRIVER=$here/guard-driver.exp
-    export AIS_TEST_ARGS="ais.guard_timeout=30 cow_spacesize=1G${arg:+ ais.guard-probe=1}"
+    export AIS_TEST_ARGS="ais.guard_timeout=30${arg:+ ais.guard-probe=1}"
+    if [[ $arg == probe ]]; then export AIS_GUARD_PROBE_EXPECTED=1; else export AIS_GUARD_PROBE_EXPECTED=0; fi
     ;;
   exchange)
     group=${arg:-basic}
-    "$here/make-test-media.sh" "$media" exchange >/dev/null
+    [[ $group == basic || $group == auth ]] || die 'exchange group must be basic or auth'
+    "$here/make-test-media.sh" "$media" exchange "$group" >/dev/null
     [[ $group != auth ]] || extra+=(-rtc base=2000-01-01T00:00:00)
     export AIS_QEMU_DRIVER=$here/exchange-driver.exp AIS_EXCHANGE_GROUP=$group
-    export AIS_TEST_ARGS="ais.exchange=$group"
+    export AIS_TEST_MODE=latest
+    export AIS_TEST_ARGS=""
     ;;
   *) die 'unknown scenario' ;;
 esac

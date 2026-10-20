@@ -113,6 +113,8 @@ describe("AIS live agent context", () => {
     const unit = await readFile(join(tree, "etc/systemd/system/ais-guardd.service"), "utf8");
     const udev = await readFile(join(tree, "etc/udev/rules.d/99-ais-guard.rules"), "utf8");
     const profile = await readFile(join(tree, "etc/profile.d/ais-guard.sh"), "utf8");
+    const bootProfile = await readFile(join(tree, "etc/profile.d/ais-live-boot.sh"), "utf8");
+    const guardd = await readFile(join(root, "lib/ais-guardd"), "utf8");
 
     expect(manifest).toContain('id = "ais-guard"');
     expect(manifest).toContain('placement = "popup"');
@@ -133,6 +135,9 @@ describe("AIS live agent context", () => {
     expect(unit).not.toMatch(/^Environment(?:File)?=/m);
     expect(udev).toContain('MODE="0600", OWNER="root", GROUP="root"');
     expect(profile).toContain("/usr/local/guard/bin:$PATH");
+    expect(bootProfile).toContain('HERDR_SOCKET_PATH="/run/user/$(/usr/bin/id -u)/herdr.sock"');
+    expect(bootProfile).toContain("  export HERDR_SOCKET_PATH\n");
+    expect(guardd).toContain("'/usr/local/bin/herdr'");
 
     const table = await Bun.file(join(root, "lib/ais-guard-table")).text();
     const names = table.split("\n").filter((line) => line && !line.startsWith("#"));

@@ -1,0 +1,31 @@
+#!/usr/bin/bash
+
+persist_assert_luks_dump() {
+    local dump=$1
+    grep -q '^Version:[[:space:]]*2$' "$dump" && grep -qi 'argon2id' "$dump"
+}
+
+persist_assert_key_description() {
+    local description=$1 uid gid permissions
+    uid=$(cut -d ';' -f 2 <<<"$description")
+    gid=$(cut -d ';' -f 3 <<<"$description")
+    permissions=$(cut -d ';' -f 4 <<<"$description")
+    [[ $uid == 0 && $gid == 0 ]] || return 1
+    [[ $((16#$permissions)) == $((16#003f0000)) ]]
+}
+
+persist_assert_key_unreadable_as() {
+    local user=$1 serial=$2
+    ! runuser -u "$user" -- keyctl read "$serial" >/dev/null 2>&1
+}
+
+persist_assert_key_revoked() {
+    local serial=$1
+    ! keyctl search @u user ais-live-exchange >/dev/null 2>&1 &&
+        ! keyctl read "$serial" >/dev/null 2>&1
+}
+
+persist_assert_package_recorded() {
+    local package=$1 explicit=$2
+    pacman -Q "$package" >/dev/null 2>&1 && grep -Fxq -- "$package" "$explicit"
+}

@@ -37,12 +37,15 @@ fi
 plugin=/home/live/.config/herdr/plugins/ais-guard
 if [[ -d "$plugin" ]]; then
   live_uid=$(/usr/bin/id -u live)
+  runtime_dir="/run/user/$live_uid"
   for state_dir in /home/live/.config /home/live/.config/herdr /home/live/.config/herdr/plugins /home/live/.local /home/live/.local/state; do
     /usr/bin/install -d -o live -g live -m 0700 "$state_dir"
   done
   herdr_as_live() {
-    /usr/bin/runuser -u live -- /usr/bin/env -i HOME=/home/live PATH=/usr/local/bin:/usr/bin \
-      HERDR_SOCKET_PATH="/run/user/$live_uid/herdr.sock" /usr/local/bin/herdr "$@"
+    /usr/bin/setpriv --reuid=live --regid=live --init-groups /usr/bin/env -i \
+      HOME=/home/live PATH=/usr/local/bin:/usr/bin:/bin \
+      XDG_RUNTIME_DIR="$runtime_dir" HERDR_CONFIG_PATH=/etc/herdr/config.toml \
+      HERDR_SOCKET_PATH="$runtime_dir/herdr.sock" /usr/local/bin/herdr "$@"
   }
   # Drain the listing so herdr cannot fail with a broken pipe after a match.
   # With pipefail, grep -q can turn a linked plugin into a failed account setup.

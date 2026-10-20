@@ -9,14 +9,23 @@ live_groups=$(/usr/bin/id -nG live)
 agent_groups=$(/usr/bin/id -nG agent)
 /usr/bin/getent group proc >/dev/null || fail proc-group
 [[ " $live_groups " == *' proc '* && " $agent_groups " != *' proc '* ]] || fail first-boot-proc-membership
-if ! /usr/bin/systemctl is-active --quiet systemd-logind || ! /usr/bin/systemctl is-active --quiet polkit; then
-  fail systemd-dependency-order
-fi
+/usr/bin/systemctl is-active --quiet systemd-logind || fail systemd-logind-readiness
+# polkit is D-Bus activated when authorization is first requested. Trigger its
+# public Peer.Ping method within a bound, then verify the activated service.
+/usr/bin/timeout --foreground 5 /usr/bin/busctl --system call \
+  org.freedesktop.PolicyKit1 /org/freedesktop/PolicyKit1 \
+  org.freedesktop.DBus.Peer Ping >/dev/null || fail polkit-dbus-activation
+/usr/bin/systemctl is-active --quiet polkit || fail polkit-dbus-activation
 
 live_uid=$(/usr/bin/id -u live)
 runtime_dir="/run/user/$live_uid"
 [[ -d "$runtime_dir" && ! -L "$runtime_dir" ]] || fail runtime-directory
 [[ "$(/usr/bin/stat -c '%u:%a' "$runtime_dir")" == "$live_uid:700" ]] || fail runtime-directory-mode
+for _ in {1..40}; do
+  [[ -S "$runtime_dir/herdr.sock" ]] && break
+  /usr/bin/sleep 0.25
+done
+[[ -S "$runtime_dir/herdr.sock" ]] || fail herdr-socket-timeout
 /usr/bin/python3 - "$live_uid" <<'PY' || fail herdr-socket
 import os, socket, stat, sys
 uid = int(sys.argv[1])
@@ -49,7 +58,7 @@ for line in open('/proc/net/unix', encoding='utf-8'):
         info = os.stat(path)
     except OSError:
         continue
-    if stat.S_ISSOCK(info.st_mode) and info.st_uid == uid and stat.S_IMODE(info.st_mode) == 0o600:
+    if path == f'/run/user/{uid}/herdr.sock' and stat.S_ISSOCK(info.st_mode) and info.st_uid == uid and stat.S_IMODE(info.st_mode) == 0o600:
         raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -87,9 +96,13 @@ def visit(x):
 visit(root); print("\n".join(sorted(found)))
 ' <<<"$snapshot") || fail herdr-snapshot-json
 [[ -n "$old_ids" ]] || fail no-herdr-panes
-$herdr pane split --current --direction right --ratio 0.5 --no-focus >/dev/null 2>&1 || fail default-pane-split
+# This check runs from the serial login shell, outside any Herdr pane. Omitting
+# a pane selector asks Herdr to split its focused pane; --current requires
+# HERDR_PANE_ID and fails in this context.
+$herdr pane split --direction right --ratio 0.5 --no-focus >/dev/null 2>&1 || fail default-pane-split
 
 agent_pane=false
+agent_uid=$(/usr/bin/id -u agent)
 for _ in {1..40}; do
     snapshot=$($herdr api snapshot 2>/dev/null) || { /usr/bin/sleep 0.25; continue; }
     new_ids=$(/usr/bin/python3 -c '
@@ -119,8 +132,36 @@ def visit(x):
         for y in x: visit(y)
 visit(root); raise SystemExit(1)
 ' <<<"$process_info") || continue
-        pane_user=$(/usr/bin/ps -o user= -p "$shell_pid" | /usr/bin/tr -d '[:space:]') || continue
-        if [[ "$pane_user" == agent ]]; then agent_pane=true; break; fi
+        if /usr/bin/python3 - "$shell_pid" "$agent_uid" <<'PY'
+import os, sys
+root = int(sys.argv[1])
+agent_uid = int(sys.argv[2])
+processes = {}
+for entry in os.scandir('/proc'):
+    if not entry.name.isdecimal():
+        continue
+    try:
+        pid = int(entry.name)
+        status = open(os.path.join(entry.path, 'status'), encoding='ascii').read().splitlines()
+        parent = next(int(line.split()[1]) for line in status if line.startswith('PPid:'))
+        effective_uid = next(int(line.split()[2]) for line in status if line.startswith('Uid:'))
+        processes[pid] = (parent, effective_uid)
+    except (OSError, StopIteration, ValueError):
+        continue
+descendants = {root}
+while True:
+    children = {pid for pid, (parent, _) in processes.items() if parent in descendants}
+    if children <= descendants:
+        break
+    descendants.update(children)
+if any(processes.get(pid, (-1, -1))[1] == agent_uid for pid in descendants):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+        then
+            agent_pane=true
+            break
+        fi
     done <<<"$new_ids"
     [[ "$agent_pane" == true ]] && break
     /usr/bin/sleep 0.25

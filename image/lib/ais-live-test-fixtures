@@ -13,7 +13,7 @@ for kernel_arg in "${kernel_args[@]}"; do
 done
 [[ "$test_mode" == true ]] || exit 0
 
-source_dir=/mnt/aisx/test-fixtures
+source_dir=/run/ais-live-test-media/exchange/test-fixtures
 target_dir=/run/ais-live-test
 for fixture in vendor-upgrade llama-cli; do
   source_file="$source_dir/$fixture"

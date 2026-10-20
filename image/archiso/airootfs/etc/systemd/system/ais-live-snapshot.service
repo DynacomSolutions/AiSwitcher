@@ -1,0 +1,13 @@
+[Unit]
+Description=Snapshot AIS live state at boot
+DefaultDependencies=no
+After=ais-live-persist-ready.service
+Requires=ais-live-persist-ready.service
+Before=getty-pre.target ais-live-boot.service
+ConditionPathIsMountPoint=/mnt/persist
+ConditionPathExists=!/run/ais-persist-ephemeral
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+ExecStart=/usr/local/lib/ais-live/ais-live-snapshot boot

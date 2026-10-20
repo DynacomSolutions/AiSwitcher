@@ -1,0 +1,11 @@
+[Unit]
+Description=Prune old AIS live snapshots
+After=ais-live-persist-ready.service
+Requires=ais-live-persist-ready.service
+ConditionPathIsMountPoint=/mnt/persist
+ConditionPathExists=!/run/ais-persist-ephemeral
+
+[Service]
+Type=oneshot
+StandardError=journal+console
+ExecStart=/usr/local/lib/ais-live/ais-live-prune all
