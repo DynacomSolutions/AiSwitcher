@@ -9,7 +9,7 @@ build = "build.rs"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-file-test = ["ais-host-core/file-test"]
+file-test = ["ais-host-core/file-test", "ais-host-helper/file-test"]
 
 [build-dependencies]
 tauri-build.workspace = true

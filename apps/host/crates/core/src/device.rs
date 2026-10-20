@@ -164,6 +164,7 @@ pub struct WritePlan {
     writes: Vec<PlannedWrite>,
     remaining_bytes: u64,
     phase_aware: bool,
+    exchange: Option<ByteRange>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -308,7 +309,91 @@ impl WritePlan {
             writes,
             remaining_bytes,
             phase_aware: true,
+            exchange: None,
         })
+    }
+
+    /// Grow only the empty exchange partition, leaving aligned space for first
+    /// boot to create persist. Both GPT copies and the format range are bound
+    /// into the same confirmation digest as the image write.
+    pub fn create_drive(
+        image: &VerifiedImage,
+        device: DeviceObservation,
+    ) -> Result<Self, DeviceError> {
+        let layout =
+            LiveImageLayout::parse(image.bytes()).map_err(|_| DeviceError::LayoutUnavailable)?;
+        let mut plan = Self::create_layout(image, device)?;
+        let last_exclusive = plan.device.capacity_bytes / SECTOR_BYTES - GPT_TRAILER_SECTORS;
+        let end = last_exclusive
+            .checked_sub(crate::create::PERSIST_RESERVE_BYTES / SECTOR_BYTES)
+            .ok_or(DeviceError::InsufficientCapacity)?
+            / 2048
+            * 2048;
+        let start = layout.partitions[3].first_lba;
+        let length = end
+            .checked_sub(start)
+            .ok_or(DeviceError::InsufficientCapacity)?
+            * SECTOR_BYTES;
+        if length < crate::create::EXCHANGE_HEADROOM_BYTES {
+            return Err(DeviceError::InsufficientCapacity);
+        }
+        let exchange = ByteRange {
+            start: start * SECTOR_BYTES,
+            length,
+        };
+        exchange.validate(&plan.device)?;
+        for (index, entries_at, header_at) in [
+            (1, 2 * SECTOR_BYTES as usize, SECTOR_BYTES as usize),
+            (
+                2,
+                SECTOR_BYTES as usize,
+                TABLE_WINDOW_BYTES - SECTOR_BYTES as usize,
+            ),
+        ] {
+            let WriteSource::Bytes(bytes) = &mut plan.writes[index].source else {
+                return Err(DeviceError::LayoutUnavailable);
+            };
+            crate::layout::put_u64(bytes, entries_at + 3 * 128 + 40, end - 1)
+                .map_err(|_| DeviceError::LayoutUnavailable)?;
+            let crc = crate::layout::crc32(&bytes[entries_at..entries_at + GPT_ARRAY_BYTES]);
+            crate::layout::put_u32(bytes, header_at + 88, crc)
+                .map_err(|_| DeviceError::LayoutUnavailable)?;
+            bytes[header_at + 16..header_at + 20].fill(0);
+            let crc = crate::layout::crc32(&bytes[header_at..header_at + 92]);
+            crate::layout::put_u32(bytes, header_at + 16, crc)
+                .map_err(|_| DeviceError::LayoutUnavailable)?;
+        }
+        plan.remaining_bytes = (last_exclusive - end) * SECTOR_BYTES;
+        plan.ranges.push(exchange);
+        plan.ranges = merge_ranges(plan.ranges);
+        plan.exchange = Some(exchange);
+        Ok(plan)
+    }
+
+    pub fn exchange_range(&self) -> Option<ByteRange> {
+        self.exchange
+    }
+
+    /// Check the final GPT and the original physical/mount identity before any
+    /// additional exchange metadata writes through the retained target.
+    pub fn verify_created_target(&self, target: &mut impl WriteTarget) -> Result<(), DeviceError> {
+        let current = target.observe().map_err(|_| DeviceError::Changed)?;
+        if self.exchange.is_none() || !observation_stable(self, &current) {
+            return Err(DeviceError::Changed);
+        }
+        let (WriteSource::Bytes(head), WriteSource::Bytes(tail)) =
+            (&self.writes[1].source, &self.writes[2].source)
+        else {
+            return Err(DeviceError::LayoutUnavailable);
+        };
+        verify_expected_table(
+            target,
+            &current,
+            &ExpectedTable {
+                head: head.clone(),
+                tail: tail.clone(),
+            },
+        )
     }
 
     /// Regular-file harness only. It does not claim to create a bootable layout.
@@ -336,6 +421,7 @@ impl WritePlan {
             }],
             remaining_bytes: 0,
             phase_aware: false,
+            exchange: None,
         })
     }
 

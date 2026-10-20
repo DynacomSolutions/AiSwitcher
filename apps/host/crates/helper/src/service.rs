@@ -152,7 +152,7 @@ fn execute_linux(
         .map_err(|_| "The source image did not pass bundled trust verification.")?;
     let discovered = crate::platform::collect_linux_by_identity(&request.device_identity)
         .map_err(|_| "The native target could not be re-observed.")?;
-    let plan = WritePlan::create_layout(&image, discovered.observation.clone())
+    let plan = WritePlan::create_drive(&image, discovered.observation.clone())
         .map_err(|_| "A native write plan could not be reconstructed.")?;
     if hex(&plan.digest()) != request.plan_digest {
         return Err("The app and helper write plans do not match.");
@@ -160,22 +160,40 @@ fn execute_linux(
     plan.revalidate(&discovered.observation, &image)
         .map_err(|_| "The native target changed during plan verification.")?;
 
+    let mut exchange = crate::exchange::PreparedExchange::native(&plan)?;
     let target =
         crate::platform::LinuxBlockTarget::open_authenticated(&channel, &discovered.observation)
             .map_err(|_| "The retained native target could not be opened safely.")?;
     let mut target = target;
-    write_confirmed(
+    create_confirmed(
         &mut target,
         request.confirmation_deadline_boot_ns,
         &mut image,
         &plan,
         &request.typed_confirmation,
+        &mut exchange,
     )?;
     // The new layout is only usable by the application once the kernel has
     // re-read it; failure here does not undo the write but is reported.
     target
         .reread_partitions()
         .map_err(|_| "The kernel could not re-read the new partition table.")
+}
+
+/// One confirmed create transaction on a retained target. Preparing exFAT must
+/// succeed before imaging; any subsequent failure leaves the drive incomplete.
+#[cfg(target_os = "linux")]
+pub fn create_confirmed<T: ais_host_core::device::WriteTarget>(
+    target: &mut T,
+    deadline: u64,
+    image: &mut ais_host_core::release::VerifiedImage,
+    plan: &ais_host_core::device::WritePlan,
+    typed_confirmation: &str,
+    exchange: &mut crate::exchange::PreparedExchange,
+) -> Result<(), &'static str> {
+    exchange.validate_plan(plan)?;
+    write_confirmed(&mut *target, deadline, image, plan, typed_confirmation)?;
+    exchange.write(target, plan)
 }
 
 /// Final stage shared by the production block device and loop-file tests. The

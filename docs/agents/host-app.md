@@ -96,27 +96,48 @@ identifier (90 second expiry; refresh, a changed target or leaving the view
 invalidates the native ticket). `start_write` takes only the preview id: native
 state re-observes the device, consumes the ticket against the retained
 `WritePlan` and verified image, and builds one helper request. Production
-launching fails closed until the retained image-source transport and installed
-helper package exist, and `write_support()` stays disabled until then. The
-Linux final stage, `service::write_confirmed`, is exercised end to end against
-a regular file in `crates/helper/tests/loop_file_write.rs`; no test opens a real
-block device.
+launching requires the retained image-source transport, installed helper package
+and release trust anchor. The Linux final stages, `service::write_confirmed`
+and `service::create_confirmed`, share the retained-target writer with the
+regular-file tests; no test target is a device node.
 
 The production minisign public key is `image/release-key.pub`, created by the B
 image-release task. Until it exists the bundled key is empty (placeholder), the
 image verifier fails closed, and `crates/core/build.rs` refuses a release-profile
 build unless `AIS_ALLOW_PLACEHOLDER_RELEASE_KEY` is set for development.
 
-## Create flow (Task 4, partial)
+## Create flow
 
 The create route collects a session-only passphrase (12 characters minimum,
 confirmed) and an explicit yes/no model choice; the licence text is shown before
-acceptance. `create.rs` validates these and the capacity budget (image, model
-and `PERSIST_RESERVE_BYTES`) before any confirmation. `preview_write` fetches
-and verifies a release, takes the helper's read-only observation and installs
-the native preview; `start_write` runs the pkexec session. The only passphrase
-hand-off is `PassphraseSink::hand_over` after a verified write (`SessionOnly`
-for now); key escrow implements that trait. `model-catalogue.json` is empty:
-real pinned models and the model download, the exFAT inbox/model publish,
-readback and eject are still to do. The Linux helper preview and session
-cannot be exercised without the installed root-owned package.
+acceptance. `create.rs` validates these and the capacity budget: image, selected
+model, 512 MiB of exchange headroom and the existing 2 GiB persist reserve.
+`preview_write` verifies the release and optional pinned model download, takes
+the helper's read-only observation and installs the native preview. It consumes
+the chosen options once; refresh or edits cancel a preview still being prepared.
+Both GPT
+copies describe the expanded p4; p5 remains absent and the persist reserve stays
+untouched. All image and exchange ranges belong to the confirmation digest.
+
+Before launching the helper, `start_write` exports and encrypts the first inbox
+and rechecks the retained model. The Linux helper prepares exFAT using the
+system `mkfs.exfat` and `fsck.exfat`, verifies and seals a fresh anonymous regular
+file, then writes only its metadata extents through the approved, locked target.
+It flushes and reads back every extent, checks the final GPT and asks the kernel
+to re-read the partition table. Missing or failed formatting tools stop before
+imaging. Formatter processes never receive a device path.
+
+The app checks the connection, partition bounds, AISX label and exFAT type before
+mounting with udisks. It publishes `inbox/bundle-1.age` and optional public weights
+under `models/` through temporary files, flushes them, decrypts the inbox and
+checks the model hash on readback, then unmounts and powers off the drive.
+Only then does `PassphraseSink::hand_over` record it through the escrow service.
+Retention remains disabled by default, so the passphrase stays session-only.
+Every failed stage consumes confirmation and leaves no ready drive record.
+
+The Linux file smoke tests exercise the actual image/exFAT helper writer with
+signed synthetic releases, regular target files and a directory mount seam.
+They require exfatprogs on PATH or `AIS_HOST_TEST_EXFAT_TOOLS` pointing at its
+binary directory. They do not exercise native mounting, elevation, eject,
+credential stores or first boot. Native checks still require the installed
+root-owned package and a real release key.

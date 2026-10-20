@@ -100,11 +100,15 @@ fn native_devices() -> Vec<ais_host_core::device::DeviceSummary> {
 /// comes from the bundled-key release path and the device observation from the
 /// privileged helper's read-only preview, so the plan is built natively.
 #[tauri::command]
-fn preview_write(
-    device_id: String,
-    state: tauri::State<'_, ConfirmationSession>,
-) -> Result<WritePreview, String> {
-    state.invalidate();
+async fn preview_write(device_id: String, app: tauri::AppHandle) -> Result<WritePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || preview_blocking(&device_id, &app))
+        .await
+        .map_err(|_| "The preview could not be prepared.".to_string())?
+}
+
+fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePreview, String> {
+    let state = app.state::<ConfirmationSession>();
+    let mut preparation = state.begin_preview()?;
     if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
         return Err("The selected device is unavailable.".to_string());
     }
@@ -118,18 +122,34 @@ fn preview_write(
         &std::env::temp_dir(),
     )
     .map_err(|error| error.to_string())?;
-    let observation = preview_native(&device_id)?;
-    let create = state.take_create()?;
+    let observation = preview_native(device_id)?;
     let catalogue =
         ais_host_core::create::Catalogue::parse(ais_host_core::create::BUNDLED_CATALOGUE)
             .map_err(|error| error.to_string())?;
-    ais_host_core::create::check_capacity(
-        &create.options,
+    let model = ais_host_core::create::check_capacity(
+        &preparation.create.options,
         &catalogue,
         fetched.image.len(),
         observation.capacity_bytes,
     )
     .map_err(|error| error.to_string())?;
+    // The model is downloaded and verified before the user can confirm, so a
+    // bad pin, short download or full disk never reaches the destructive step.
+    if let Some(entry) = model {
+        let cache = app
+            .path()
+            .app_cache_dir()
+            .map_err(|_| "The cache directory is unavailable.".to_string())?
+            .join("models");
+        preparation.create.model = Some(
+            ais_host_core::model::obtain_model(
+                &ais_host_core::fetch::UreqHttp::for_hosts(ais_host_core::model::MODEL_HOSTS),
+                &entry,
+                &cache,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
     let details = DeviceReviewDetails {
         model: None,
         partitions: Vec::new(),
@@ -141,11 +161,11 @@ fn preview_write(
         observation,
         details,
         fetched.sources,
-        create,
+        preparation,
     )
 }
 
-/// The reviewed model catalogue; empty until verified pins exist.
+/// The reviewed model catalogue with immutable download pins.
 #[tauri::command]
 fn list_models() -> Result<Vec<ais_host_core::create::ModelEntry>, String> {
     ais_host_core::create::Catalogue::parse(ais_host_core::create::BUNDLED_CATALOGUE)
@@ -178,6 +198,7 @@ fn set_create_options(
     state.set_create(StoredCreate {
         options,
         passphrase,
+        model: None,
     })
 }
 
@@ -258,9 +279,15 @@ fn fresh_preview_id() -> Result<String, String> {
 struct StoredCreate {
     options: ais_host_core::create::CreateOptions,
     passphrase: ais_host_core::create::Passphrase,
+    /// The pinned model, downloaded and verified before confirmation.
+    model: Option<ais_host_core::model::VerifiedModel>,
 }
 
-#[allow(dead_code)] // installed by native discovery, which is not wired yet
+struct PreviewPreparation {
+    id: String,
+    create: StoredCreate,
+}
+
 struct PendingConfirmation {
     preview_id: String,
     plan: ais_host_core::device::WritePlan,
@@ -297,6 +324,8 @@ struct ConfirmationSession {
 #[derive(Default)]
 struct ConfirmationState {
     pending: Option<PendingConfirmation>,
+    /// Invalidating the session also cancels any preview still downloading.
+    preparing: Option<String>,
     /// Validated create options awaiting a preview; cleared by any invalidation.
     create: Option<StoredCreate>,
     approvals: ais_host_core::device::ConfirmationBook,
@@ -306,6 +335,7 @@ impl ConfirmationSession {
     fn invalidate(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.pending = None;
+            state.preparing = None;
             state.create = None;
             state.approvals.invalidate();
         }
@@ -343,7 +373,6 @@ impl ConfirmationSession {
         })
     }
 
-    #[allow(dead_code)] // called by native discovery, which is not wired yet
     fn install_native_preview(
         &self,
         image: ais_host_core::release::VerifiedImage,
@@ -351,16 +380,20 @@ impl ConfirmationSession {
         device: ais_host_core::device::DeviceObservation,
         details: DeviceReviewDetails,
         sources: [std::fs::File; 3],
-        create: StoredCreate,
+        preparation: PreviewPreparation,
     ) -> Result<WritePreview, String> {
         let mut pending = PendingConfirmation::from_native(image, release, device, details)?;
         pending.sources = Some(sources);
-        pending.create = Some(create);
+        pending.create = Some(preparation.create);
         let preview = pending.view();
         let mut state = self
             .state
             .lock()
             .map_err(|_| "Confirmation state is unavailable.")?;
+        if state.preparing.as_deref() != Some(&preparation.id) {
+            return Err("The create choices changed while the preview was being prepared.".into());
+        }
+        state.preparing = None;
         state.approvals.invalidate();
         state.pending = Some(pending);
         Ok(preview)
@@ -372,18 +405,27 @@ impl ConfirmationSession {
             .lock()
             .map_err(|_| "Confirmation state is unavailable.")?;
         state.pending = None;
+        state.preparing = None;
         state.approvals.invalidate();
         state.create = Some(create);
         Ok(())
     }
 
-    fn take_create(&self) -> Result<StoredCreate, String> {
-        self.state
+    fn begin_preview(&self) -> Result<PreviewPreparation, String> {
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| "Confirmation state is unavailable.")?
+            .map_err(|_| "Confirmation state is unavailable.")?;
+        state.pending = None;
+        state.preparing = None;
+        state.approvals.invalidate();
+        let create = state
             .create
             .take()
-            .ok_or_else(|| "Choose the drive options first.".to_string())
+            .ok_or_else(|| "Choose the drive options first.".to_string())?;
+        let id = fresh_preview_id()?;
+        state.preparing = Some(id.clone());
+        Ok(PreviewPreparation { id, create })
     }
 
     /// Consume the typed-confirmation ticket against a fresh native observation
@@ -394,16 +436,12 @@ impl ConfirmationSession {
         &self,
         preview_id: &str,
         now: Instant,
-        support: &ais_host_core::device::WriteSupport,
-        observe: &dyn Fn(
-            &ais_host_core::device::DeviceObservation,
-        ) -> Result<ais_host_core::device::DeviceObservation, String>,
-        launcher: &dyn HelperLauncher,
-        sink: &dyn ais_host_core::create::PassphraseSink,
+        env: &mut WriteEnv<'_>,
     ) -> Result<(), String> {
-        if !support.enabled {
+        let started = Instant::now();
+        if !env.support.enabled {
             self.invalidate();
-            return Err(support.reason.to_string());
+            return Err(env.support.reason.to_string());
         }
         let mut state = self
             .state
@@ -427,25 +465,90 @@ impl ConfirmationSession {
             .typed
             .take()
             .ok_or("Typed confirmation is required.")?;
-        let observation = observe(current.plan.device())?;
+        let observation = (env.observe)(current.plan.device())?;
         approvals
             .consume(&ticket, &current.plan, &observation, &current.image, now)
             .map_err(|error| error.to_string())?;
-        let remaining =
-            CONFIRMATION_TTL.saturating_sub(now.saturating_duration_since(confirmed_at));
+        drop(state);
+        let mut create = current
+            .create
+            .take()
+            .ok_or("Choose the drive options first.")?;
+        let snapshot = ais_host_core::flow_adapter::SourceSnapshot::read(
+            env.adapter,
+            &ais_host_core::flow_adapter::HostTarget::new("local")?,
+        )?;
+        let inbox =
+            ais_host_core::publish::prepare_first_inbox(&snapshot, create.passphrase.expose())?;
+        drop(snapshot);
+        if let Some(model) = create.model.as_mut() {
+            ais_host_core::publish::verify_model_source(model)?;
+        }
+        let remaining = CONFIRMATION_TTL
+            .saturating_sub(now.saturating_duration_since(confirmed_at))
+            .saturating_sub(started.elapsed());
         let request = helper_request(&current, typed, remaining)?;
         let sources = current
             .sources
             .as_ref()
             .ok_or("The verified image sources are unavailable.")?;
-        launcher.launch(request, sources)?;
+        env.launcher.launch(request, sources)?;
+        // Past this point the drive is written but not ready: nothing is
+        // registered and the user must start again with a new confirmation.
+        let device = current.plan.device();
+        let exchange = match env.volume.mount(&current.plan) {
+            Ok(path) => path,
+            Err(_) => {
+                // A mount can succeed before its verification fails. Attempt
+                // safe cleanup against the same connection in either case.
+                let _ = env.volume.eject(device);
+                return Err("The drive was written, but its exchange partition could not be opened. Reconnect it and create the drive again.".into());
+            }
+        };
+        let not_ready = |_: String| {
+            "The drive was written, but its configuration could not be published and verified. Create the drive again.".to_string()
+        };
+        let publication = (|| {
+            inbox.publish(&exchange)?;
+            if let Some(model) = create.model.as_mut() {
+                ais_host_core::publish::publish_model(&exchange, model)?;
+            }
+            ais_host_core::publish::verify_published(
+                &exchange,
+                create.passphrase.expose(),
+                create.model.as_ref().map(|model| &model.entry),
+            )
+        })();
+        let ejected = env.volume.eject(device);
+        publication.map_err(not_ready)?;
+        ejected.map_err(|_| {
+            "The drive was verified, but safe eject failed. No ready drive was recorded."
+                .to_string()
+        })?;
         // The one hand-off to key escrow; creation itself keeps no passphrase.
-        let create = current
-            .create
-            .take()
-            .ok_or("Choose the drive options first.")?;
-        sink.hand_over(&create.passphrase, &drive_handle(current.plan.device()))
+        env.sink
+            .hand_over(&create.passphrase, &drive_handle(device))
     }
+}
+
+/// Everything `begin_write` needs from the operating system, so the same
+/// transaction runs against real hardware or against a file and a directory.
+struct WriteEnv<'a> {
+    support: ais_host_core::device::WriteSupport,
+    observe: &'a dyn Fn(
+        &ais_host_core::device::DeviceObservation,
+    ) -> Result<ais_host_core::device::DeviceObservation, String>,
+    launcher: &'a dyn HelperLauncher,
+    volume: &'a dyn ExchangeVolume,
+    adapter: &'a mut dyn ais_host_core::flow_adapter::HostAdapter,
+    sink: &'a dyn ais_host_core::create::PassphraseSink,
+}
+
+/// Opens the freshly written exchange partition as a directory and ejects the
+/// drive afterwards.
+trait ExchangeVolume {
+    fn mount(&self, plan: &ais_host_core::device::WritePlan) -> Result<std::path::PathBuf, String>;
+    fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String>;
 }
 
 /// A registry-safe handle for the physical drive: a digest of its identity
@@ -599,19 +702,220 @@ const RELEASE_LISTING: &str =
 
 /// Takes only the preview identifier; the plan, ticket and image stay native.
 #[tauri::command]
-fn start_write(
-    preview_id: String,
-    state: tauri::State<'_, ConfirmationSession>,
-    escrow: tauri::State<'_, escrow_commands::EscrowCommandState>,
-) -> Result<(), String> {
-    state.begin_write(
-        &preview_id,
-        Instant::now(),
-        &native_write_support(),
-        &observe_native,
-        &NativeHelper,
-        &escrow.sink(),
-    )
+async fn start_write(preview_id: String, app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ConfirmationSession>();
+        // A drive is never written without a registry to record it in.
+        let escrow = app
+            .try_state::<escrow_commands::EscrowCommandState>()
+            .ok_or("The local drive registry is unavailable.")?;
+        let mut adapter = ais_host_core::local_adapter::LocalHostAdapter::default();
+        state.begin_write(
+            &preview_id,
+            Instant::now(),
+            &mut WriteEnv {
+                support: native_write_support(),
+                observe: &observe_native,
+                launcher: &NativeHelper,
+                volume: &UdisksVolume,
+                adapter: &mut adapter,
+                sink: &escrow.sink(),
+            },
+        )
+    })
+    .await
+    .map_err(|_| "The write could not be started.".to_string())?
+}
+
+/// Mounts and ejects the exchange partition (partition 4) through udisks,
+/// which authorises removable drives for the active user without elevation.
+struct UdisksVolume;
+
+#[cfg(target_os = "linux")]
+impl UdisksVolume {
+    fn node(device: &ais_host_core::device::DeviceObservation) -> Result<(String, String), String> {
+        ais_host_helper::platform::verify_linux_connection(device)
+            .map_err(|_| "The drive connection changed.".to_string())?;
+        let disk = ais_host_helper::platform::linux_kernel_name(&device.os_identity)
+            .map_err(|_| "The drive is unavailable.".to_string())?;
+        let node = ais_host_helper::platform::linux_partition_node(&disk, 4);
+        Ok((disk, node))
+    }
+
+    fn run(arguments: &[&str]) -> Result<String, String> {
+        use std::{io::Read, process::Stdio, time::Duration};
+        let mut command = std::process::Command::new("/usr/bin/udisksctl");
+        command
+            .env("LC_ALL", "C")
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if arguments.first() != Some(&"info") {
+            command.arg("--no-user-interaction");
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| "udisksctl is unavailable.".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("udisksctl output is unavailable.")?;
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let result = stdout
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut output)
+                .map(|_| output);
+            let _ = send.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(_)) => return Err("udisksctl refused the request.".into()),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("udisksctl did not complete.".into());
+                }
+            }
+        }
+        let output = receive
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "udisksctl output is unavailable.")?
+            .map_err(|_| "udisksctl output is unreadable.")?;
+        if output.len() > 64 * 1024 {
+            return Err("udisksctl output exceeds its size limit.".into());
+        }
+        String::from_utf8(output).map_err(|_| "udisksctl returned invalid text.".to_string())
+    }
+
+    /// Derive the mounted directory from the kernel, not command output.
+    fn mount_point(mountinfo: &str, major_minor: &str) -> Result<std::path::PathBuf, String> {
+        let mut found = None;
+        for line in mountinfo.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.get(2) != Some(&major_minor) {
+                continue;
+            }
+            let separator = fields
+                .iter()
+                .position(|field| *field == "-")
+                .ok_or("The exchange mount is invalid.")?;
+            if fields.get(3) != Some(&"/")
+                || fields.get(separator + 1) != Some(&"exfat")
+                || !fields
+                    .get(5)
+                    .is_some_and(|options| options.split(',').any(|option| option == "rw"))
+                || found.is_some()
+            {
+                return Err("The exchange mount is ambiguous or not writable exFAT.".into());
+            }
+            let path = fields
+                .get(4)
+                .ok_or("The exchange mount is invalid.")?
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\");
+            let path = std::path::PathBuf::from(path);
+            if !path.is_absolute() || path.parent().is_none() {
+                return Err("The exchange mount point is invalid.".into());
+            }
+            found = Some(path);
+        }
+        found.ok_or("The exchange mount point is unavailable.".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ExchangeVolume for UdisksVolume {
+    fn mount(&self, plan: &ais_host_core::device::WritePlan) -> Result<std::path::PathBuf, String> {
+        let device = plan.device();
+        let (_, node) = Self::node(device)?;
+        // The kernel needs a moment to publish the re-read partition table.
+        for _ in 0..75 {
+            if std::path::Path::new(&node).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Self::node(device)?;
+        let range = plan
+            .exchange_range()
+            .ok_or("The exchange range is unavailable.")?;
+        let name = std::path::Path::new(&node)
+            .file_name()
+            .ok_or("Invalid partition name.")?;
+        let sysfs = std::path::Path::new("/sys/class/block").join(name);
+        let field = |key: &str| -> Result<u64, String> {
+            std::fs::read_to_string(sysfs.join(key))
+                .map_err(|_| "The exchange layout is unavailable.")?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "The exchange layout is invalid.".into())
+        };
+        if field("start")? != range.start / 512 || field("size")? != range.length / 512 {
+            return Err("The exchange layout changed.".into());
+        }
+        let info = Self::run(&["info", "-b", &node])?;
+        let labelled = info.lines().any(|line| {
+            line.split_once(':')
+                .is_some_and(|(key, value)| key.trim() == "IdLabel" && value.trim() == "AISX")
+        });
+        let exfat = info.lines().any(|line| {
+            line.split_once(':')
+                .is_some_and(|(key, value)| key.trim() == "IdType" && value.trim() == "exfat")
+        });
+        if !labelled || !exfat {
+            return Err("The exchange partition is not an AISX exFAT volume.".to_string());
+        }
+        Self::run(&[
+            "mount",
+            "-b",
+            &node,
+            "-t",
+            "exfat",
+            "-o",
+            "nosuid,nodev,noexec",
+        ])?;
+        Self::node(device)?;
+        let major_minor = std::fs::read_to_string(sysfs.join("dev"))
+            .map_err(|_| "The exchange identity is unavailable.")?;
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|_| "The exchange mount point is unavailable.")?;
+        let path = Self::mount_point(&mountinfo, major_minor.trim())?;
+        if !path.is_dir() {
+            return Err("The exchange mount point is unavailable.".into());
+        }
+        Ok(path)
+    }
+
+    fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        let (disk, node) = Self::node(device)?;
+        Self::run(&["unmount", "-b", &node])?;
+        Self::node(device)?;
+        Self::run(&["power-off", "-b", &format!("/dev/{disk}")]).map(|_| ())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ExchangeVolume for UdisksVolume {
+    fn mount(
+        &self,
+        _plan: &ais_host_core::device::WritePlan,
+    ) -> Result<std::path::PathBuf, String> {
+        Err("This operating system cannot open the exchange partition yet.".to_string())
+    }
+
+    fn eject(&self, _device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        Err("This operating system cannot eject the drive yet.".to_string())
+    }
 }
 
 impl PendingConfirmation {
@@ -624,7 +928,7 @@ impl PendingConfirmation {
         device: ais_host_core::device::DeviceObservation,
         details: DeviceReviewDetails,
     ) -> Result<Self, String> {
-        let plan = ais_host_core::device::WritePlan::create_layout(&image, device)
+        let plan = ais_host_core::device::WritePlan::create_drive(&image, device)
             .map_err(|error| error.to_string())?;
         Ok(Self {
             preview_id: fresh_preview_id()?,
@@ -701,6 +1005,9 @@ mod navigation_tests {
 }
 
 #[cfg(all(test, feature = "file-test", target_os = "linux"))]
+mod create_tests;
+
+#[cfg(all(test, feature = "file-test", target_os = "linux"))]
 mod confirmation_tests {
     use super::{
         ConfirmationSession, DeviceReviewDetails, HelperLauncher, PendingConfirmation,
@@ -726,7 +1033,7 @@ mod confirmation_tests {
         }
     }
 
-    fn support(enabled: bool) -> ais_host_core::device::WriteSupport {
+    pub(super) fn support(enabled: bool) -> ais_host_core::device::WriteSupport {
         ais_host_core::device::WriteSupport {
             enabled,
             reason: "SYNTHETIC_FIXTURE disabled",
@@ -734,7 +1041,11 @@ mod confirmation_tests {
     }
 
     fn sources() -> [std::fs::File; 3] {
-        let open = || std::fs::File::open("/dev/null").unwrap();
+        let open = || {
+            ais_host_core::file_test::fresh_file(&std::env::temp_dir(), "source-SYNTHETIC-FIXTURE")
+                .unwrap()
+                .1
+        };
         [open(), open(), open()]
     }
 
@@ -772,8 +1083,9 @@ mod confirmation_tests {
         HANDED.with(std::cell::Cell::get)
     }
 
-    fn stored_create() -> super::StoredCreate {
+    pub(super) fn stored_create() -> super::StoredCreate {
         super::StoredCreate {
+            model: None,
             options: ais_host_core::create::CreateOptions {
                 model_id: None,
                 licence_accepted: false,
@@ -786,22 +1098,97 @@ mod confirmation_tests {
         }
     }
 
+    /// A directory standing in for the mounted exchange partition.
+    struct DirectoryVolume {
+        directory: std::path::PathBuf,
+        ejected: std::cell::Cell<u32>,
+    }
+
+    impl super::ExchangeVolume for DirectoryVolume {
+        fn mount(&self, _plan: &WritePlan) -> Result<std::path::PathBuf, String> {
+            Ok(self.directory.clone())
+        }
+        fn eject(&self, _device: &DeviceObservation) -> Result<(), String> {
+            self.ejected.set(self.ejected.get() + 1);
+            Ok(())
+        }
+    }
+
+    pub(super) struct FakeAdapter;
+
+    impl ais_host_core::flow_adapter::HostAdapter for FakeAdapter {
+        fn export_snapshot(
+            &mut self,
+            _target: &ais_host_core::flow_adapter::HostTarget,
+        ) -> Result<Vec<u8>, String> {
+            use ais_host_core::contract::{
+                BundleEntry, BundleKind, BundleManifest, PathClass, sha256_hex,
+            };
+            let bytes = b"{\"theme\":\"SYNTHETIC_FIXTURE\"}".to_vec();
+            let manifest = BundleManifest {
+                version: 1,
+                seq: 7,
+                created_at: "2026-10-19T00:00:00Z".into(),
+                kind: BundleKind::Inbox,
+                entries: vec![BundleEntry {
+                    path: ".claude/settings.json".into(),
+                    class: PathClass::ConfigSettings,
+                    sha256: sha256_hex(&bytes),
+                    size: bytes.len() as u64,
+                }],
+                last_inbox_seq: None,
+                truncated: None,
+                skipped_symlinks: None,
+            };
+            let files =
+                std::collections::BTreeMap::from([(".claude/settings.json".to_string(), bytes)]);
+            ais_host_core::bundle::write_bundle_tar(&manifest, &files)
+        }
+        fn import_logs(
+            &mut self,
+            _target: &ais_host_core::flow_adapter::HostTarget,
+            _tar: &[u8],
+        ) -> Result<ais_host_core::flow_adapter::ImportSummary, String> {
+            Err("unused".into())
+        }
+    }
+
+    pub(super) fn exchange_directory(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ais-app-exchange-{tag}-{}",
+            fresh_preview_id().unwrap()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     fn launch_with(
         session: &ConfirmationSession,
         preview_id: &str,
         device: &DeviceObservation,
         now: Instant,
         enabled: bool,
-        launcher: &Recorder,
+        launcher: &dyn HelperLauncher,
     ) -> Result<(), String> {
-        session.begin_write(
+        let directory = exchange_directory("unit");
+        let volume = DirectoryVolume {
+            directory: directory.clone(),
+            ejected: std::cell::Cell::new(0),
+        };
+        let result = session.begin_write(
             preview_id,
             now,
-            &support(enabled),
-            &|_| Ok(device.clone()),
-            launcher,
-            &CountingSink,
-        )
+            &mut super::WriteEnv {
+                support: support(enabled),
+                observe: &|_| Ok(device.clone()),
+                launcher,
+                volume: &volume,
+                adapter: &mut FakeAdapter,
+                sink: &CountingSink,
+            },
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+        result
     }
 
     fn consume(
@@ -836,7 +1223,7 @@ mod confirmation_tests {
         (pending_for(device.clone(), preview_id), device)
     }
 
-    fn session_with_fixture() -> (ConfirmationSession, DeviceObservation, String) {
+    pub(super) fn session_with_fixture() -> (ConfirmationSession, DeviceObservation, String) {
         let (pending, device) = fixture("PREVIEW_SYNTHETIC_FIXTURE_1");
         let preview_id = pending.preview_id.clone();
         let session = ConfirmationSession::default();

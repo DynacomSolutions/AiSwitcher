@@ -3,7 +3,7 @@
 //! The directory is whatever the operating system mounted for the exchange
 //! partition; no filesystem driver or privileged access is involved.
 use crate::{
-    bundle::{read_bundle_file, write_bundle_file},
+    bundle::{encrypt_bundle_tar, read_bundle_file, write_bundle_tar},
     contract::BundleKind,
     flow_adapter::SourceSnapshot,
     model::{VerifiedModel, free_bytes},
@@ -18,15 +18,72 @@ use std::{
 /// The first inbox always carries sequence 1; the drive applies it once.
 pub const FIRST_INBOX_SEQUENCE: u64 = 1;
 
+/// Only ciphertext survives preparation. Source reading, validation and
+/// encryption finish before the privileged image write is launched.
+pub struct PreparedInbox(Vec<u8>);
+
+pub fn prepare_first_inbox(
+    snapshot: &SourceSnapshot,
+    passphrase: &str,
+) -> Result<PreparedInbox, String> {
+    let mut manifest = snapshot.bundle.manifest.clone();
+    manifest.seq = FIRST_INBOX_SEQUENCE;
+    manifest.kind = BundleKind::Inbox;
+    let mut tar = write_bundle_tar(&manifest, &snapshot.bundle.files)?;
+    let encrypted = encrypt_bundle_tar(&tar, passphrase, BundleKind::Inbox);
+    tar.fill(0);
+    encrypted.map(PreparedInbox)
+}
+
+impl PreparedInbox {
+    pub fn publish(&self, exchange: &Path) -> Result<PathBuf, String> {
+        let directory = exchange.join("inbox");
+        fs::create_dir_all(&directory).map_err(|_| "cannot create the inbox directory")?;
+        let destination = directory.join("bundle-1.age");
+        let temporary = directory.join(".bundle-1.age.tmp");
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err("The first inbox already exists.".into());
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| "cannot create the first inbox")?;
+        file.write_all(&self.0)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "cannot flush the first inbox")?;
+        drop(file);
+        fs::rename(&temporary, &destination).map_err(|_| "cannot publish the first inbox")?;
+        sync_directory(&directory)?;
+        sync_directory(exchange)?;
+        let readback = fs::read(&destination).map_err(|_| "cannot read the first inbox")?;
+        if readback != self.0 {
+            return Err("The first inbox failed readback verification.".into());
+        }
+        Ok(destination)
+    }
+}
+
 pub fn publish_first_inbox(
     exchange: &Path,
     snapshot: &SourceSnapshot,
     passphrase: &str,
 ) -> Result<PathBuf, String> {
-    let mut manifest = snapshot.bundle.manifest.clone();
-    manifest.seq = FIRST_INBOX_SEQUENCE;
-    manifest.kind = BundleKind::Inbox;
-    write_bundle_file(exchange, &manifest, &snapshot.bundle.files, passphrase)
+    prepare_first_inbox(snapshot, passphrase)?.publish(exchange)
+}
+
+pub fn verify_model_source(model: &mut VerifiedModel) -> Result<(), String> {
+    model.file.rewind().map_err(|_| "cannot read the model")?;
+    if !model
+        .file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() == model.entry.size_bytes)
+        || hex(&sha256_reader(&mut model.file).map_err(|_| "cannot read the model")?)
+            != model.entry.sha256
+    {
+        return Err("The selected model no longer matches its pin.".into());
+    }
+    Ok(())
 }
 
 /// Copy the verified model to `models/<file>` through a temporary name and an
@@ -57,7 +114,19 @@ pub fn publish_model(exchange: &Path, model: &mut VerifiedModel) -> Result<PathB
         return Err(error);
     }
     fs::rename(&temporary, &destination).map_err(|_| "cannot publish the model")?;
+    sync_directory(&directory)?;
+    sync_directory(exchange)?;
     Ok(destination)
+}
+
+fn sync_directory(directory: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| "cannot flush the exchange directory")?;
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 /// Readback: the inbox decrypts with the passphrase and has the expected
@@ -67,7 +136,9 @@ pub fn verify_published(
     passphrase: &str,
     model: Option<&crate::create::ModelEntry>,
 ) -> Result<(), String> {
-    let inbox = exchange.join(format!("bundle-{FIRST_INBOX_SEQUENCE}.age"));
+    let inbox = exchange
+        .join("inbox")
+        .join(format!("bundle-{FIRST_INBOX_SEQUENCE}.age"));
     let bundle = read_bundle_file(&inbox, passphrase, BundleKind::Inbox)?;
     if bundle.manifest.seq != FIRST_INBOX_SEQUENCE {
         return Err("The published inbox has an unexpected sequence.".into());

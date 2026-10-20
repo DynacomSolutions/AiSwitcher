@@ -5,7 +5,10 @@ use ais_host_core::{
     flow_adapter::SourceSnapshot,
     local_adapter::{decode_response, encode_export_request},
     model::VerifiedModel,
-    publish::{publish_first_inbox, publish_model, verify_published},
+    publish::{
+        prepare_first_inbox, publish_first_inbox, publish_model, verify_model_source,
+        verify_published,
+    },
     release::{hex, sha256},
 };
 use std::{collections::BTreeMap, fs};
@@ -65,7 +68,7 @@ fn model(body: &[u8], dir: &std::path::Path) -> VerifiedModel {
 fn the_first_inbox_is_sequence_one_and_decrypts_with_the_passphrase() {
     let exchange = directory("inbox");
     let path = publish_first_inbox(&exchange, &snapshot(), PASS).unwrap();
-    assert_eq!(path.file_name().unwrap(), "bundle-1.age");
+    assert_eq!(path, exchange.join("inbox/bundle-1.age"));
     verify_published(&exchange, PASS, None).unwrap();
     assert!(verify_published(&exchange, "SYNTHETIC_FIXTURE_99", None).is_err());
     assert!(
@@ -117,4 +120,29 @@ fn adapter_frames_are_strict() {
     let mut bad = (failed.len() as u32).to_be_bytes().to_vec();
     bad.extend_from_slice(failed);
     assert!(decode_response(&bad).is_err());
+}
+
+#[test]
+fn a_partial_or_completed_first_inbox_is_never_overwritten() {
+    let exchange = directory("interrupted");
+    let prepared = prepare_first_inbox(&snapshot(), PASS).unwrap();
+    fs::create_dir(exchange.join("inbox")).unwrap();
+    let temporary = exchange.join("inbox/.bundle-1.age.tmp");
+    fs::write(&temporary, b"SYNTHETIC_FIXTURE partial").unwrap();
+    assert!(prepared.publish(&exchange).is_err());
+    assert!(!exchange.join("inbox/bundle-1.age").exists());
+    fs::remove_file(temporary).unwrap();
+    let path = prepared.publish(&exchange).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(prepared.publish(&exchange).is_err());
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn changed_retained_model_is_rejected_before_publication() {
+    let scratch = directory("changed-model");
+    let mut verified = model(b"SYNTHETIC_FIXTURE model bytes", &scratch);
+    verify_model_source(&mut verified).unwrap();
+    fs::write(&verified.path, b"SYNTHETIC_FIXTURE model byteX").unwrap();
+    assert!(verify_model_source(&mut verified).is_err());
 }

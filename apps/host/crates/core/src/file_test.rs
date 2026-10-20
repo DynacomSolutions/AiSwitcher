@@ -154,6 +154,7 @@ pub struct FileTarget {
     lock_delay: std::time::Duration,
     tamper_mount_after_write: bool,
     interrupt_writes: usize,
+    live_table: bool,
 }
 
 impl FileTarget {
@@ -193,7 +194,23 @@ impl FileTarget {
             lock_delay: std::time::Duration::ZERO,
             tamper_mount_after_write: false,
             interrupt_writes: 0,
+            live_table: false,
         })
+    }
+    /// Sparse regular file for the real GPT and exFAT pipeline. The basename
+    /// is generated internally and no caller-supplied target path is opened.
+    pub fn create_sparse(directory: &Path, capacity: u64) -> io::Result<Self> {
+        if !(1024 * 1024..=16 * 1024 * 1024 * 1024).contains(&capacity)
+            || !capacity.is_multiple_of(512)
+        {
+            return Err(io::Error::other("fixture capacity limit"));
+        }
+        let mut target = Self::create(directory, 1024 * 1024)?;
+        target.file.set_len(0)?;
+        target.file.set_len(capacity)?;
+        target.observation.capacity_bytes = capacity;
+        target.live_table = true;
+        Ok(target)
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -244,7 +261,22 @@ impl WriteTarget for FileTarget {
         {
             return Err(io::Error::other("fixture target changed"));
         }
-        Ok(self.observation.clone())
+        let mut observation = self.observation.clone();
+        if self.live_table {
+            use crate::device::{TABLE_WINDOW_BYTES, table_fingerprint};
+            let mut file = self.file.try_clone()?;
+            let position = file.stream_position()?;
+            let mut head = vec![0; TABLE_WINDOW_BYTES];
+            let mut tail = vec![0; TABLE_WINDOW_BYTES];
+            file.rewind()?;
+            file.read_exact(&mut head)?;
+            file.seek(SeekFrom::End(-(TABLE_WINDOW_BYTES as i64)))?;
+            file.read_exact(&mut tail)?;
+            file.seek(SeekFrom::Start(position))?;
+            observation.table_fingerprint =
+                table_fingerprint(&head, &tail).map_err(io::Error::other)?;
+        }
+        Ok(observation)
     }
     fn lock_exclusive(&mut self) -> io::Result<()> {
         if self.locked {

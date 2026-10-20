@@ -1,6 +1,6 @@
 use ais_host_core::create::{
-    BUNDLED_CATALOGUE, Catalogue, CreateError, CreateOptions, ModelEntry, PERSIST_RESERVE_BYTES,
-    Passphrase, check_capacity,
+    BUNDLED_CATALOGUE, Catalogue, CreateError, CreateOptions, EXCHANGE_HEADROOM_BYTES, ModelEntry,
+    PERSIST_RESERVE_BYTES, Passphrase, check_capacity,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -32,7 +32,7 @@ fn declining_a_model_needs_no_catalogue_entry_and_no_model_bytes() {
         &options,
         &Catalogue { models: vec![] },
         2 * GIB,
-        2 * GIB + PERSIST_RESERVE_BYTES,
+        2 * GIB + PERSIST_RESERVE_BYTES + EXCHANGE_HEADROOM_BYTES,
     )
     .unwrap();
     assert!(model.is_none());
@@ -104,7 +104,7 @@ fn undersized_disks_and_reserve_shortfalls_are_refused() {
         licence_accepted: true,
     };
     let image = 2 * GIB;
-    let exact = image + 3 * GIB + PERSIST_RESERVE_BYTES;
+    let exact = image + 3 * GIB + PERSIST_RESERVE_BYTES + EXCHANGE_HEADROOM_BYTES;
     assert!(check_capacity(&with_model, &c, image, exact).is_ok());
     assert_eq!(
         check_capacity(&with_model, &c, image, exact - 1).unwrap_err(),

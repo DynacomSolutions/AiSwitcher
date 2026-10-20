@@ -7,6 +7,8 @@ use thiserror::Error;
 /// and any selected model. The agreed reserve is a product decision; this is
 /// the conservative value used until it is changed in one place.
 pub const PERSIST_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Room for inboxes, outboxes, exFAT metadata and alignment, besides a model.
+pub const EXCHANGE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 pub const MIN_PASSPHRASE_CHARS: usize = 12;
 pub const MAX_PASSPHRASE_BYTES: usize = 1024;
 
@@ -27,7 +29,7 @@ pub enum CreateError {
 }
 
 /// A passphrase that cannot be printed or serialised by accident.
-pub struct Passphrase(String);
+pub struct Passphrase(crate::escrow::SecretString);
 
 impl Passphrase {
     pub fn new(value: String, confirmation: &str) -> Result<Self, CreateError> {
@@ -40,27 +42,19 @@ impl Passphrase {
         if value != confirmation {
             return Err(CreateError::PassphraseMismatch);
         }
-        Ok(Self(value))
+        Ok(Self(value.into()))
     }
 
     /// For the encrypted-inbox builder only.
     pub fn expose(&self) -> &str {
-        &self.0
+        use crate::escrow::ExposeSecret;
+        self.0.expose_secret()
     }
 }
 
 impl std::fmt::Debug for Passphrase {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Passphrase(redacted)")
-    }
-}
-
-impl Drop for Passphrase {
-    fn drop(&mut self) {
-        // Best effort: overwrite in place before the allocation is released.
-        // shortcut: not guaranteed against copies, replace with a zeroizing type when escrow lands.
-        // SAFETY: writing zero bytes keeps the string valid UTF-8.
-        unsafe { self.0.as_bytes_mut().fill(0) };
     }
 }
 
@@ -145,6 +139,7 @@ pub fn check_capacity(
     let needed = image_bytes
         .checked_add(model.as_ref().map_or(0, |entry| entry.size_bytes))
         .and_then(|sum| sum.checked_add(PERSIST_RESERVE_BYTES))
+        .and_then(|sum| sum.checked_add(EXCHANGE_HEADROOM_BYTES))
         .ok_or(CreateError::UndersizedDisk)?;
     if capacity_bytes < needed {
         return Err(CreateError::UndersizedDisk);
@@ -152,9 +147,8 @@ pub fn check_capacity(
     Ok(model)
 }
 
-/// The single hand-off point between the create flow and key escrow. Task 5
-/// provides the retaining implementation; creation never persists the
-/// passphrase itself.
+/// The single hand-off point between the create flow and key escrow.
+/// Creation never persists the passphrase itself.
 pub trait PassphraseSink {
     /// Called once, after the drive is written and verified. `drive_id` is the
     /// physical identity used for the local drive record.

@@ -738,6 +738,21 @@ pub fn observe_unprivileged(
     observe(&snapshot).map(|entry| entry.observation)
 }
 
+/// Recheck the physical connection for mounting/ejecting our newly written
+/// partition. Its expected mount is allowed; system backing remains forbidden.
+pub fn verify_connection(approved: &DeviceObservation) -> Result<(), ObservationError> {
+    let name = kernel_name(&approved.os_identity)?;
+    let mut snapshot = collect_sysfs_snapshot(&name)?;
+    snapshot.mounted_major_minors.clear();
+    snapshot.table_fingerprint = approved.table_fingerprint;
+    let current = observe(&snapshot)?.observation;
+    if approved.same_physical_identity(&current) {
+        Ok(())
+    } else {
+        Err(ObservationError::Changed)
+    }
+}
+
 /// A sysfs-visible whole disk worth considering. Virtual, optical and RAM
 /// devices never carry a removable USB ancestry, so they are skipped early.
 fn is_candidate_disk_name(name: &str) -> bool {
