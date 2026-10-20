@@ -21,10 +21,6 @@ set wrongSent 0
 set rejectionCount 0
 set snapshotChoice 0
 set prePacmanChoice ""
-if {[info exists env(AIS_PERSIST_GROW)] && $env(AIS_PERSIST_GROW) eq "4G"} {
-    if {![info exists env(AIS_QEMU_IMAGE_COPY)]} { puts stderr {persist-test: image copy is missing}; exit 2 }
-    if {[catch {exec truncate -s 4G -- $env(AIS_QEMU_IMAGE_COPY)} reason]} { puts stderr "persist-test: disk growth failed: $reason"; exit 2 }
-}
 if {$phase eq "ambiguous"} {
     foreach name {AIS_QEMU_IMAGE_COPY AIS_PERSIST_CLONE_PATH AIS_PERSIST_BASELINE_FILE} {
         if {![info exists env($name)]} { puts stderr "persist-test: $name is required for ambiguity checks"; exit 2 }
@@ -53,7 +49,7 @@ proc fail {reason} {
 }
 if {$phase eq "ambiguous"} {
     expect {
-        -re {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=(latest|clean)} {
+        -re {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=(latest|clean)} {
             set actualMode $expect_out(1,string)
             if {$actualMode ne $requestedMode} { fail "wrong ambiguity refusal mode: $actualMode" }
             puts "persist-test: phase=ambiguous mode=$actualMode refusal verified"
@@ -71,7 +67,7 @@ if {$phase eq "ambiguous"} {
 }
 while {!$phaseReady} {
     expect {
-        -re {(AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell|Unable to unlock persistence|[0-9]+\)[[:space:]]+pre-pacman-[^\r\n]*|Create encrypted persistence\. Enter a passphrase \(at least 12 characters\): |Confirm passphrase: |Persistence will partition and format /dev/[^[:space:]]+\. Type the full device path to confirm: |AIS persistence passphrase: |AIS-LIVE: stage=first-boot-create status=ok|AIS-LIVE: stage=persist status=ok mode=(latest|pick|clean)|AIS-LIVE: prompt=snapshot-selection|Selection: |AIS-LIVE: stage=kernel-up status=ok|AIS-LIVE: stage=persist-test status=ok phase=[a-z-]+(\r|\n|$))} {
+        -re {(AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell|Unable to unlock persistence|[0-9]+\)[[:space:]]+pre-pacman-[^\r\n]*|Create encrypted persistence\. Enter a passphrase \(at least 12 characters\): |Confirm passphrase: |AIS persistence passphrase: |AIS-LIVE: stage=first-boot-create status=ok|AIS-LIVE: stage=persist status=ok mode=(latest|pick|clean)|AIS-LIVE: prompt=snapshot-selection|Selection: |AIS-LIVE: stage=kernel-up status=ok|AIS-LIVE: stage=persist-test status=ok phase=[a-z-]+(\r|\n|$))} {
             set token $expect_out(0,string)
             if {[regexp {AIS-LIVE: [^\r\n]*status=fail|Kernel panic|emergency shell} $token]} { fail {guest reported a boot or assertion failure} }
             if {[string first {Unable to unlock persistence} $token] >= 0} {
@@ -85,10 +81,6 @@ while {!$phaseReady} {
             } elseif {[string first {Confirm passphrase:} $token] >= 0} {
                 if {$phase ne "created" || $firstCreate} { fail {unexpected passphrase confirmation} }
                 send -- "$passphrase\r"
-            } elseif {[string first {Persistence will partition and format} $token] >= 0} {
-                if {$phase ne "created" || $firstCreate} { fail {unexpected device confirmation} }
-                regexp {(/dev/[^[:space:]]+)\.} $token -> device
-                send -- "$device\r"
             } elseif {[string first {AIS persistence passphrase:} $token] >= 0} {
                 if {$phase eq "wrong-pass" && $wrongSent < 3} {
                     send -- "$wrongPassphrase\r"

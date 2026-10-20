@@ -3,6 +3,7 @@ Description=Retry deferred AIS live base migration
 After=network-online.target ais-live-persist-ready.service
 Wants=network-online.target
 ConditionPathExists=/mnt/persist/@pkglist/reinstall-pending
+ConditionPathExists=!/run/ais-persist-ephemeral
 
 [Service]
 Type=oneshot

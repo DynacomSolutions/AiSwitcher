@@ -38,9 +38,6 @@ prompt {Create encrypted persistence. Enter a passphrase (at least 12 characters
 line
 prompt {Confirm passphrase: }
 line
-prompt {Persistence will partition and format /dev/vda. Type the full device path to confirm: }
-set device [line]
-if {$device ne "/dev/vda"} { puts stderr "unexpected device confirmation: <$device>"; exit 5 }
 puts {AIS-LIVE: stage=first-boot-create status=ok}
 `;
   }
@@ -64,20 +61,6 @@ if {[line] ne "1"} { exit 6 }
 `;
   }
   return fakePoweroff;
-}
-
-function successByPath() {
-  return `${fakePoweroff}
-exec stty -echo <@stdin
-prompt {Create encrypted persistence. Enter a passphrase (at least 12 characters): }
-line
-prompt {Confirm passphrase: }
-line
-prompt {Persistence will partition and format /dev/disk/by-path/pci-0000:00:04.0-virtio0. Type the full device path to confirm: }
-set device [line]
-if {$device ne "/dev/disk/by-path/pci-0000:00:04.0-virtio0"} { puts stderr "unexpected device confirmation: <$device>"; exit 5 }
-puts {AIS-LIVE: stage=first-boot-create status=ok}
-`;
 }
 
 function markers(phase: string, mode = "latest", extras = "") {
@@ -178,7 +161,7 @@ exec "$@"
     expect(script).toContain("btrfs subvolume sync");
   });
 
-  test("expect driver admits every guest phase and refuses broken invariant markers", () => {
+  test.skipIf(!expectAvailable || !Bun.which("tclsh"))("expect driver admits every guest phase and refuses broken invariant markers", () => {
     const driver = readFileSync(resolve("image/test/persist.exp"), "utf8");
     const guest = readFileSync(resolve("image/archiso/airootfs/usr/local/lib/ais-live/persist-test"), "utf8");
     const phases = ["created", "wrong-pass", "package", "verify-package", "retry", "clean", "pick", "verify-pick", "retention"];
@@ -217,7 +200,7 @@ flush stdout
     const host = readFileSync(resolve("image/test/run-persist-scenarios.sh"), "utf8");
     expect(host).toContain("run_ambiguity_refusal latest");
     expect(host).toContain("run_ambiguity_refusal clean");
-    expect(host).toContain("prepare_scenario_disk \"$image\" \"$prepared\" \"$mode\" ambiguous");
+    expect(host).toContain("prepare_scenario_disk \"$personalised\" \"$prepared\" \"$mode\" ambiguous");
     const driver = readFileSync(resolve("image/test/persist.exp"), "utf8");
     expect(host).toContain("AIS_PERSIST_CLONE_PATH=$duplicate AIS_PERSIST_BASELINE_FILE=$baseline_file");
     expect(driver).toContain('exec cp -- $env(AIS_QEMU_IMAGE_COPY) $env(AIS_PERSIST_CLONE_PATH)');
@@ -225,7 +208,7 @@ flush stdout
     expect(host).toContain('sha256sum "$work/live.img"');
     expect(host).toContain('sha256sum "$duplicate"');
     expect(host).toContain('gpt_identity()');
-    expect(host).toContain('first-boot creation did not randomise every existing GPT identity');
+    expect(host).toContain('host preparation did not randomise every existing GPT identity');
     expect(host).toContain('reboot phase $phase changed disk or partition GUIDs');
     expect(host).not.toContain('sgdisk -G');
     expect(host).not.toContain('SYNTHETIC_FIXTURE_duplicate_AIS_labels_sentinel');
@@ -244,32 +227,32 @@ flush stdout
       stdout: "pipe", stderr: "pipe",
     });
 
-    writeFileSync(serial, "AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest\r\n");
+    writeFileSync(serial, "AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest\r\n");
     expect(check().exitCode).toBe(0);
 
     writeFileSync(serial, "boot completed without an ambiguity decision\n");
     expect(check().exitCode).not.toBe(0);
-    writeFileSync(serial, "AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=clean\n");
+    writeFileSync(serial, "AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=clean\n");
     expect(check().exitCode).not.toBe(0);
     writeFileSync(serial, "AIS-LIVE: stage=persist status=ok mode=latest\n");
     expect(check().exitCode).not.toBe(0);
     writeFileSync(serial, "AIS-LIVE: stage=first-boot-create status=ok\n");
     expect(check().exitCode).not.toBe(0);
-    writeFileSync(serial, "AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest\n");
+    writeFileSync(serial, "AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest\n");
     writeFileSync(clone, "SYNTHETIC_FIXTURE_modified_disk");
     expect(check().exitCode).not.toBe(0);
   });
 
   test.skipIf(!expectAvailable || !Bun.which("tclsh"))("Expect accepts only an ambiguity refusal for the requested mode", () => {
       const accepted = fakeQemu(`${fakePoweroff}
-puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest}
+puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest}
 flush stdout
 exec sleep 30
 `, "ambiguous");
       expect(accepted.exitCode).toBe(0);
 
       const acceptedClean = fakeQemu(`${fakePoweroff}
-puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=clean}
+puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=clean}
 flush stdout
 exec sleep 30
 `, "ambiguous", "clean");
@@ -278,7 +261,7 @@ exec sleep 30
       for (const output of [
         "puts {AIS-LIVE: stage=persist status=ok mode=latest}",
         "puts {AIS-LIVE: stage=first-boot-create status=ok}",
-        "puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=clean}",
+        "puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=clean}",
       ]) {
         const rejected = fakeQemu(`${fakePoweroff}\n${output}\nflush stdout\nexec sleep 30\n`, "ambiguous");
         expect(rejected.exitCode).not.toBe(0);
@@ -294,7 +277,7 @@ exec sleep 30
     const preparedBytes = "SYNTHETIC_FIXTURE_gpt-guid=12345678-1234-4234-8234-123456789abc\nAIS_MENU_ARGS=ais.persist-phase=ambiguous\n";
     writeFileSync(primary, preparedBytes);
     writeFileSync(guest, `${fakePoweroff}
-puts {AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=latest}
+puts {AIS-LIVE: stage=persist status=ephemeral reason=ambiguous-drive mode=latest}
 flush stdout
 exec sleep 30
 `);
@@ -331,19 +314,13 @@ exec sleep 30
     expect(checked.stderr.toString()).toContain("synthetic passphrase leaked to serial output");
   });
 
-  test.skipIf(!expectAvailable || !Bun.which("tclsh"))("accepts the first-create prompt sequence and full device confirmation", () => {
+  test.skipIf(!expectAvailable || !Bun.which("tclsh"))("accepts the first-create passphrase prompt sequence", () => {
     const result = fakeQemu(success("created") + markers("created", "latest", ""), "created");
     if (result.exitCode !== 0) throw new Error(`${result.stderr.toString()}\n${result.stdout.toString()}`);
     expect(result.exitCode).toBe(0);
     expect(result.stderr.toString()).toBe("");
     expect(result.stdout.toString()).toContain("persist-test: phase=created verified");
     expect(result.stdout.toString()).not.toContain("SYNTHETIC_FIXTURE_ais_live_persist_passphrase");
-  });
-
-  test.skipIf(!expectAvailable || !Bun.which("tclsh"))("accepts colon-bearing PCI by-path aliases in the device confirmation", () => {
-    const result = fakeQemu(successByPath() + markers("created"), "created");
-    if (result.exitCode !== 0) throw new Error(`${result.stderr.toString()}\n${result.stdout.toString()}`);
-    expect(result.exitCode).toBe(0);
   });
 
   test.skipIf(!expectAvailable || !Bun.which("tclsh"))("requires three wrong-password retries before unlock succeeds", () => {

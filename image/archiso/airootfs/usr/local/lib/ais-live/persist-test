@@ -46,7 +46,8 @@ case "$phase" in
     clean)
         labels=$(blkid -o device -t LABEL=AISX | wc -l)
         (( labels >= 2 )) || fail duplicate-aisx-labels-not-present
-        ! mountpoint -q /mnt/persist || fail clean-mounted
+        [[ $(findmnt -n -o FSTYPE /mnt/persist) == tmpfs ]] || fail clean-not-tmpfs
+        ! mountpoint -q /mnt/aisx || fail clean-exchange-mounted
         ! pacman -Q tree >/dev/null 2>&1 || fail clean-package-present
         [[ ! -e /usr/bin/tree ]] || fail clean-package-file-present
         ok

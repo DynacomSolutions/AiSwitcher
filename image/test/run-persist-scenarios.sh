@@ -36,7 +36,7 @@ prepare_scenario_disk() {
     esp_start=$(sfdisk --json "$target" | jq -er '.partitiontable | select(.label == "gpt" and .sectorsize == 512) | .partitions[1].start')
     fat="$target@@$((esp_start * 512))"
     for config in syslinux/syslinux.cfg boot/grub/grub.cfg; do
-        local original="$target.menu.original" patched="$target.menu.patched"
+        local original="$target.${config//\//-}.original" patched="$target.${config//\//-}.patched"
         mcopy -i "$fat" "::$config" "$original"
         AIS_MENU_MODE=$mode AIS_MENU_ARGS="console=ttyS0,115200 ais.test=1 ais.scenario=persist ais.persist-phase=$phase" awk '
             /^[[:space:]]*(APPEND|linux)[[:space:]]/ {
@@ -57,7 +57,7 @@ run_ambiguity_refusal() {
     duplicate=$scratch/$firmware-ambiguity-$mode-clone.img
     baseline_file=$scratch/$firmware-ambiguity-$mode-baseline.sha256
     log=$scratch/$firmware-ambiguity-$mode.log
-    prepare_scenario_disk "$image" "$prepared" "$mode" ambiguous
+    prepare_scenario_disk "$personalised" "$prepared" "$mode" ambiguous
     if AIS_PERSIST_PHASE=ambiguous AIS_TEST_MODE=$mode \
         AIS_TEST_ARGS="ais.scenario=persist ais.persist-phase=ambiguous" \
         AIS_PERSIST_CLONE_PATH=$duplicate AIS_PERSIST_BASELINE_FILE=$baseline_file \
@@ -82,14 +82,13 @@ run_ambiguity_refusal() {
 
 qemu=${AIS_QEMU_BIN:-qemu-system-x86_64}
 run_phase() {
-    local phase=$1 mode=$2 input=$3 grow=${4:-} log work
+    local phase=$1 mode=$2 input=$3 log work
     log=$scratch/$firmware-$phase.log
-    local -a qemu_extra=()
-    if [[ $phase != clean ]]; then qemu_extra+=(-drive "file=$cache_image,if=virtio,format=raw,readonly=on"); fi
+    local -a qemu_extra=(-drive "file=$cache_image,if=virtio,format=raw,readonly=on")
     if [[ $phase == retry || $phase == verify-pick ]]; then
         qemu_extra+=('-netdev' 'user,id=persisttest,restrict=on' '-device' 'virtio-net-pci,netdev=persisttest')
     fi
-    if AIS_PERSIST_PHASE=$phase AIS_PERSIST_GROW=$grow AIS_TEST_MODE=$mode \
+    if AIS_PERSIST_PHASE=$phase AIS_TEST_MODE=$mode \
         AIS_TEST_ARGS="ais.scenario=persist ais.persist-phase=$phase" \
         AIS_QEMU_DRIVER="$here/persist.exp" AIS_QEMU_BIN=$qemu \
         "$repo/image/test/run-qemu.sh" "$input" "$firmware" "${qemu_extra[@]}" >"$log" 2>&1; then
@@ -105,22 +104,26 @@ run_phase() {
     printf '%s\n' "$work/live.img"
 }
 
+personalised=$scratch/$firmware-host-created.img
+bash "$here/prepare-persist-drive.sh" "$image" "$personalised"
+original_ids=$(gpt_identity "$image")
+prepared_ids=$(gpt_identity "$personalised")
+while IFS= read -r identity; do
+    [[ -n $identity ]] || continue
+    ! grep -Fxq -- "$identity" <<<"$prepared_ids" || die 'host preparation did not randomise every existing GPT identity'
+done <<<"$original_ids"
 run_ambiguity_refusal latest
 run_ambiguity_refusal clean
 # p4 is AISX, which shutdown legitimately updates with the final outbox.
 # The ambiguity checks above compare full disk images after QEMU preparation.
 declare -a original_partition_hashes=()
 for partition in 0 2; do original_partition_hashes[partition]=$(partition_hash "$image" "$partition"); done
-original_ids=$(gpt_identity "$image")
-current=$(run_phase created latest "$image" 4G | tail -n 1)
+current=$(run_phase created latest "$personalised" | tail -n 1)
 for partition in 0 2; do
     [[ $(partition_hash "$current" "$partition") == "${original_partition_hashes[$partition]}" ]] || die "first-boot creation modified existing partition $((partition + 1))"
 done
 created_ids=$(gpt_identity "$current")
-while IFS= read -r identity; do
-    [[ -n $identity ]] || continue
-    ! grep -Fxq -- "$identity" <<<"$created_ids" || die 'first-boot creation did not randomise every existing GPT identity'
-done <<<"$original_ids"
+[[ $created_ids == "$prepared_ids" ]] || die 'first boot changed host-assigned GPT identifiers'
 [[ $(stat -c %s "$current") -eq 4294967296 ]] || die 'grown test disk is not exactly 4 GiB'
 table=$(sfdisk --json "$current")
 sectorsize=$(jq -er '.partitiontable.sectorsize' <<<"$table")
@@ -140,10 +143,12 @@ done
 
 persist_start=$(sfdisk --json "$current" | jq -er '.partitiontable.partitions[4].start')
 persist_size=$(sfdisk --json "$current" | jq -er '.partitiontable.partitions[4].size')
-before_hash=$(dd if="$current" bs=512 skip="$persist_start" count="$persist_size" iflag=fullblock status=none | sha256sum | cut -d ' ' -f 1)
+before_hash=$(partition_hash "$current" 4)
+exchange_hash=$(partition_hash "$current" 3)
 clean_copy=$(run_phase clean clean "$current" | tail -n 1)
 after_hash=$(dd if="$clean_copy" bs=512 skip="$persist_start" count="$persist_size" iflag=fullblock status=none | sha256sum | cut -d ' ' -f 1)
 [[ $before_hash == "$after_hash" ]] || die 'clean mode changed the persistence partition'
+[[ $(partition_hash "$clean_copy" 3) == "$exchange_hash" ]] || die 'clean mode changed the exchange partition'
 current=$(run_phase pick pick "$clean_copy" | tail -n 1)
 for ((pick_round=1; pick_round<=4; pick_round++)); do
     current=$(run_phase pick pick "$current" | tail -n 1)

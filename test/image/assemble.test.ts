@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -36,28 +36,71 @@ describe.skipIf(!available)("raw GPT assembly", () => {
       const offset = String(table.partitions[index].start * 512);
       expect(run(["blkid", "-p", "-O", offset, "-s", "LABEL", "-o", "value", output]).stdout.toString().trim()).toBe(label);
     }
-    // Inspect the actual ext4 payload staged and written by the real assembler.
-    const work = built.stdout.toString().match(/assemble: work files: ([^\n]+)/)?.[1];
-    expect(work).toBeDefined();
-    const contract = run(["debugfs", "-R", "cat /ais-live/gpt-layout", `${work}/base.img`]).stdout.toString();
-    expect(contract).toBe(readFileSync(`${work}/base/ais-live/gpt-layout`, "utf8"));
-    expect(contract.trimEnd().split("\n")).toEqual([
-      "AIS-GPT-LAYOUT\t1", `disk-guid\t${table.id.toLowerCase()}`,
-      ...table.partitions.map((p: {start: number; size: number; type: string; uuid: string; name: string; attrs?: string}, n: number) =>
-        ["part", n + 1, p.start, p.size, p.type.toLowerCase(), p.uuid.toLowerCase(), p.name, p.attrs ?? "-"].join("\t")),
-    ]);
-    const extracted = join(scratch, "actual-base.img");
-    expect(run(["dd", `if=${output}`, `of=${extracted}`, "bs=512", `skip=${table.partitions[2].start}`, `count=${table.partitions[2].size}`, "status=none"]).exitCode).toBe(0);
-    expect(run(["debugfs", "-R", "cat /ais-live/gpt-layout", extracted]).stdout.toString()).toBe(contract);
     const fat = `${output}@@${table.partitions[1].start * 512}`;
     for (const file of ["/EFI/BOOT/BOOTX64.EFI", "/syslinux/ldlinux.sys", "/syslinux/ldlinux.c32"]) {
       expect(run(["mdir", "-a", "-i", fat, `::${file}`]).exitCode).toBe(0);
     }
-    const config = run(["mtype", "-i", fat, "::/syslinux/syslinux.cfg"]).stdout.toString();
-    expect(config).toContain("archisodevice=/dev/disk/by-label/AISBASE");
-    expect(config).not.toContain("ais.test=");
-    expect(config).not.toContain("console=ttyS0");
+    for (const path of ["boot/grub/grub.cfg", "syslinux/syslinux.cfg"]) {
+      const config = run(["mtype", "-i", fat, `::/${path}`]).stdout.toString();
+      expect(config).toContain("archisodevice=/dev/disk/by-label/AISBASE");
+      expect(config.match(/ais\.drive=HOST_APP_REQUIRED/g)).toHaveLength(3);
+      expect(config).not.toContain("ais.test=");
+      expect(config).not.toContain("console=ttyS0");
+    }
     expect(run(["bash", "image/build/assemble.sh", source, output]).exitCode).not.toBe(0);
+  }, 120_000);
+
+  test.skipIf(!Bun.which("sgdisk"))("host preparation assigns every GUID, zeros p5 and patches both boot menus", () => {
+    const personalised = join(scratch, "host-created.img");
+    const originalHash = run(["sha256sum", output]).stdout.toString();
+    const before = JSON.parse(run(["sfdisk", "--json", output]).stdout.toString()).partitiontable;
+    const result = run(["bash", "image/test/prepare-persist-drive.sh", output, personalised]);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const after = JSON.parse(run(["sfdisk", "--json", personalised]).stdout.toString()).partitiontable;
+    const oldIds = [before.id, ...before.partitions.map((p: { uuid: string }) => p.uuid)];
+    const newIds = [after.id, ...after.partitions.map((p: { uuid: string }) => p.uuid)];
+    expect(after.partitions).toHaveLength(5);
+    expect(new Set(newIds).size).toBe(6);
+    for (const id of newIds) expect(oldIds).not.toContain(id);
+    for (let index = 0; index < 4; index++) {
+      const { start, size, type, attrs } = before.partitions[index];
+      expect(after.partitions[index]).toMatchObject({ start, size, type, ...(attrs ? { attrs } : {}) });
+      if (index === 1) continue; // The ESP must change to carry the assigned identity.
+      const hash = (image: string) => {
+        const checked = run(["bash", "-o", "pipefail", "-c",
+          'dd if="$1" bs=512 skip="$2" count="$3" status=none | sha256sum',
+          "partition-hash", image, String(start), String(size)]);
+        expect(checked.exitCode).toBe(0);
+        return checked.stdout.toString();
+      };
+      expect(hash(personalised)).toBe(hash(output));
+    }
+    const persist = after.partitions[4];
+    expect(persist.type.toUpperCase()).toBe("CA7D7CCB-63ED-4C53-861C-1742536059CC");
+    expect(persist.start + persist.size - 1).toBe(after.lastlba);
+    const fd = openSync(personalised, "r");
+    try {
+      const bytes = Buffer.alloc(16 * 1024 * 1024, 255);
+      expect(readSync(fd, bytes, 0, bytes.length, persist.start * 512)).toBe(bytes.length);
+      expect(bytes.every((byte) => byte === 0)).toBe(true);
+      // The old backup GPT falls inside p5 and must also have been erased.
+      const backup = Buffer.alloc(33 * 512, 255);
+      expect(readSync(fd, backup, 0, backup.length, statSync(output).size - backup.length)).toBe(backup.length);
+      expect(backup.every((byte) => byte === 0)).toBe(true);
+    } finally { closeSync(fd); }
+    const fat = `${personalised}@@${after.partitions[1].start * 512}`;
+    for (const config of ["boot/grub/grub.cfg", "syslinux/syslinux.cfg"]) {
+      const menu = run(["mtype", "-i", fat, `::${config}`]);
+      expect(menu.exitCode).toBe(0);
+      const lines = menu.stdout.toString().split("\n").filter((line) => /^\s*(linux|APPEND)\s/.test(line));
+      expect(lines).toHaveLength(3);
+      for (const line of lines) {
+        expect(line.match(/ais\.drive=\S+/g)).toEqual([`ais.drive=${persist.uuid.toLowerCase()}`]);
+      }
+    }
+    expect(run(["sgdisk", "-v", personalised]).stdout.toString()).toContain("No problems found");
+    expect(run(["sha256sum", output]).stdout.toString()).toBe(originalHash);
+    expect(run(["bash", "image/test/prepare-persist-drive.sh", output, personalised]).exitCode).not.toBe(0);
   }, 120_000);
 
   test.skipIf(!Bun.which("expect"))("patches only disposable copies and keeps private OVMF variable stores", () => {
@@ -95,6 +138,10 @@ exit 0
     expect(hash()).toBe(original);
     expect(readFileSync(vars, "utf8")).toBe("SYNTHETIC_FIXTURE");
   }, 120_000);
+});
+
+test.skipIf(!process.env.CI)("CI requires sgdisk for host preparation tests", () => {
+  expect(Bun.which("sgdisk")).not.toBeNull();
 });
 
 test("refuses a missing source before creating an output", () => {

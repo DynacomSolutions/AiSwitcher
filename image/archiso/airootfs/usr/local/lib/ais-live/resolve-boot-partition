@@ -1,93 +1,54 @@
-#!/usr/bin/bash
-set -eu
-
-mode=${1:-}
+#!/usr/bin/env bash
+# Runtime exchange access is available only after successful persistent boot.
+set -euo pipefail
+mode=${1:?usage: resolve-boot-partition persist|exchange}
 case "$mode" in persist|exchange) ;; *) exit 2 ;; esac
-
-PERSIST_CONSOLE=/dev/null
-export PERSIST_CONSOLE
-# shellcheck disable=SC1091
-. /etc/initcpio/hooks/ais_persist
-
-_persist_die() {
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
-}
-_persist_die_ambiguous() {
-    printf '%s\n' 'Unplug the other AIS live drive before using persistence or exchange storage.' >&2
-    printf 'AIS-LIVE: stage=persist status=refused reason=ambiguous-boot-disk mode=%s\n' "$(cat /run/ais-persist-mode 2>/dev/null || printf latest)" >&2
-    exit 1
-}
-
+if [[ $(cat /run/ais-persist-mode 2>/dev/null) == clean || -e /run/ais-persist-ephemeral ]]; then
+    [[ $mode == exchange ]]
+    exit $?
+fi
 identity_file=/run/ais-persist-identity
-[ -r "$identity_file" ] || _persist_die 'Verified boot disk identity record is missing.'
-[ "$(wc -l < "$identity_file")" -eq 8 ] || _persist_die 'Verified boot disk identity record is malformed.'
-awk -F '\t' '
-  NR==1 && NF==2 && $1=="AIS-PERSIST-IDENTITY" && $2=="1" {next}
-  NR==2 && NF==2 && $1=="diskseq" && $2~/^[1-9][0-9]*$/ {next}
-  NR==3 && NF==2 && $1=="dev" && $2~/^[0-9]+:[0-9]+$/ {next}
-  NR==4 && NF==2 && $1=="sysfs" && $2~/^\/sys\/devices\/[A-Za-z0-9_./:-]+$/ {next}
-  NR==5 && NF==2 && $1=="guids" && split($2,g,",")==5 {for(i=1;i<=5;i++)if(length(g[i])!=36 || g[i] !~ /^[0-9a-f-]+$/)exit 1; next}
-  NR==6 && NF==2 && $1=="part4-uuid" && length($2)==36 && $2~/^[0-9a-f-]+$/ {next}
-  NR==7 && NF==2 && $1=="part4-start" && $2~/^[1-9][0-9]*$/ {next}
-  NR==8 && NF==2 && $1=="part4-size" && $2~/^[1-9][0-9]*$/ {next}
-  {exit 1}
-  END {if(NR!=8)exit 1}' "$identity_file" || _persist_die 'Verified boot disk identity record is malformed.'
-identity_diskseq=$(awk -F '\t' 'NR==2 {print $2}' "$identity_file")
-identity_dev=$(awk -F '\t' 'NR==3 {print $2}' "$identity_file")
-identity_sysfs=$(awk -F '\t' 'NR==4 {print $2}' "$identity_file")
-identity_guids=$(awk -F '\t' 'NR==5 {print $2}' "$identity_file")
-identity_p4_uuid=$(awk -F '\t' 'NR==6 {print $2}' "$identity_file")
-identity_p4_start=$(awk -F '\t' 'NR==7 {print $2}' "$identity_file")
-identity_p4_size=$(awk -F '\t' 'NR==8 {print $2}' "$identity_file")
-IFS=',' read -r -a identity_guid_rows <<<"$identity_guids"
-[ "${#identity_guid_rows[@]}" -eq 5 ] || _persist_die 'Verified boot disk GUID record is malformed.'
-for identity_guid in "${identity_guid_rows[@]}" "$identity_p4_uuid"; do
-    _persist_uuid_valid "$identity_guid" || _persist_die 'Verified boot disk GUID record is malformed.'
-    [ "$identity_guid" = "${identity_guid,,}" ] || _persist_die 'Verified boot disk GUID record is not canonical.'
-done
-PERSIST_DISKSEQ=$identity_diskseq
-PERSIST_DISK_DEV=$identity_dev
+[[ -f $identity_file && ! -L $identity_file && $(stat -c '%u:%a' "$identity_file") == 0:600 ]] || exit 1
+# shellcheck source=../../../../etc/initcpio/hooks/ais_persist
+source /etc/initcpio/hooks/ais_persist
+_persist_read_drive && _persist_resolve && _persist_mapper || exit 1
+[[ $(cat "$identity_file") == "$PERSIST_IDENTITY" ]] || exit 1
 
-_persist_find_device || _persist_die_ambiguous
-{ [ "$PERSIST_DISKSEQ" = "$identity_diskseq" ] && [ "$PERSIST_DISK_DEV" = "$identity_dev" ] && [ "$PERSIST_DISK_SYSFS" = "$identity_sysfs" ]; } || _persist_die 'Boot disk changed since initramfs identity verification.'
-# Initramfs already bound the firmware UUID before randomisation. Its root-only
-# runtime record contains the resulting UUIDs; the kernel command line still
-# contains the original ESP UUID on the first boot.
-# shellcheck disable=SC2034 # Read by the sourced _persist_verify_gpt function.
-PERSIST_BOOT_PARTUUID=${identity_guid_rows[2]}
-_persist_verify_gpt || _persist_die 'Boot disk GPT does not match the trusted image manifest.'
-_persist_verify_gpt || _persist_die 'Boot disk identity changed during verification.'
-[ "$PERSIST_GUID_SNAPSHOT" = "$(printf '%s\n' "$identity_guids" | tr ',' '\n')" ] || _persist_die 'Boot disk GPT identifiers changed since initramfs verification.'
-row=$(printf '%s\n' "$PERSIST_GPT_DUMP" | awk -F '\t' '$1=="part" && $2==4 {print}')
-[ "$(printf '%s\n' "$row" | awk -F '\t' '{print $6}')" = "$identity_p4_uuid" ] &&
-    [ "$(printf '%s\n' "$row" | awk -F '\t' '{print $3}')" = "$identity_p4_start" ] &&
-    [ "$(printf '%s\n' "$row" | awk -F '\t' '{print $4}')" = "$identity_p4_size" ] || _persist_die 'Exchange partition changed since initramfs verification.'
-
-if [ "$mode" = persist ]; then
-    [ "$PERSIST_P5_PRESENT" -eq 1 ] || exit 1
-    _persist_refresh_part_node 5 || exit 1
-    # Run the guest diagnostic while fd 8 is held. A /proc/self/fd path cannot
-    # be passed back to a parent process after this resolver exits.
-    cryptsetup isLuks "$PERSIST_RESOLVED_PART" || exit 1
-    cryptsetup luksDump "$PERSIST_RESOLVED_PART" || exit 1
-    _persist_check_diskseq && _persist_refresh_part_node 5
+if [[ $mode == persist ]]; then
+    cryptsetup isLuks "$PERSIST_PART" &&
+        cryptsetup luksDump "$PERSIST_PART" && _persist_resolve
     exit $?
 fi
 
-_persist_refresh_part_node 4 || _persist_die 'Could not freshly resolve the exchange partition.'
+_exchange_resolve() {
+    local entry dev uuid count=0 identity
+    _persist_mapper || return 1
+    for entry in "$PERSIST_DISK_SYSFS"/*; do
+        [[ -f $entry/partition && $(cat "$entry/partition") == 4 ]] || continue
+        count=$((count + 1))
+        dev=$(cat "$entry/dev") || return 1
+        uuid=$(blkid -p -c /dev/null -s PART_ENTRY_UUID -o value "/dev/block/$dev") || return 1
+        _persist_uuid_valid "$uuid" || return 1
+        EXCHANGE_PART=/dev/disk/by-partuuid/$uuid
+        EXCHANGE_DEV=$dev
+        # Count duplicates too; a symlink is not evidence of uniqueness.
+        (PERSIST_DRIVE=$uuid; PERSIST_PART=$EXCHANGE_PART; _persist_unique_target) || return 1
+    done
+    [[ $count == 1 ]] || return 1
+    identity=$EXCHANGE_PART:$EXCHANGE_DEV
+    [[ -z ${EXCHANGE_IDENTITY:-} || $identity == "$EXCHANGE_IDENTITY" ]] || return 1
+    EXCHANGE_IDENTITY=$identity
+}
+
+_exchange_resolve || exit 1
 if mountpoint -q /mnt/aisx; then
-    mounted_dev=$(findmnt -n -o MAJ:MIN /mnt/aisx) || _persist_die 'Could not identify the mounted exchange partition.'
-    held_dev=$(stat -Lc '%t:%T' "$PERSIST_RESOLVED_PART") || exit 1
-    held_dev=$(printf '%d:%d' "0x${held_dev%%:*}" "0x${held_dev#*:}") || exit 1
-    if [ "$mounted_dev" != "$held_dev" ] || ! _persist_check_diskseq; then
-        _persist_die 'Mounted exchange partition does not match the verified boot disk.'
-    fi
-    exit 0
+    [[ $(findmnt -n -o MAJ:MIN /mnt/aisx) == "$EXCHANGE_DEV" ]] && _exchange_resolve
+    exit $?
 fi
 mkdir -p /mnt/aisx
-_persist_write mount --no-canonicalize -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$PERSIST_RESOLVED_PART" /mnt/aisx || exit 1
-if ! _persist_check_diskseq || ! _persist_verify_gpt || ! _persist_refresh_part_node 4; then
-    umount /mnt/aisx 2>/dev/null || true
-    _persist_die 'Exchange partition identity changed during mount.'
+_exchange_resolve || exit 1
+mount -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$EXCHANGE_PART" /mnt/aisx
+if ! _exchange_resolve || [[ $(findmnt -n -o MAJ:MIN /mnt/aisx) != "$EXCHANGE_DEV" ]]; then
+    umount /mnt/aisx
+    exit 1
 fi

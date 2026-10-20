@@ -48,7 +48,7 @@ sfs=$tree/arch/x86_64/airootfs.sfs
 for path in "$kernel" "$initrd" "$sfs"; do [[ -s $path ]] || die "missing payload: ${path##*/}"; done
 
 # Align every partition to a MiB. Reserve room for FAT metadata, bootloaders
-# and ext4 metadata. p5 deliberately does not exist until first boot.
+# and ext4 metadata. The host app creates p5 when it writes the drive.
 mib=$((1024 * 1024))
 esp_mib=$(( ( $(stat -c %s "$kernel") + $(stat -c %s "$initrd") + mib - 1 ) / mib + 64 ))
 (( esp_mib >= 128 )) || esp_mib=128
@@ -75,7 +75,6 @@ start=$exchange_start, size=$exchange_sectors, type=EBD0A0A2-B9E5-4433-87C0-68B6
 EOF
 
 mkdir -p "$work/esp/arch/boot/x86_64" "$work/esp/syslinux" "$work/esp/boot/grub" "$work/esp/EFI/BOOT" "$work/base/arch/x86_64"
-bash "$here/../archiso/persist-contracts.sh" gpt-layout "$out" "$work/base/ais-live/gpt-layout" "$work/gpt-layout.json"
 cp "$kernel" "$initrd" "$work/esp/arch/boot/x86_64/"
 cp "$tree/arch/x86_64/"* "$work/base/arch/x86_64/"
 cp "${modules[@]}" "$work/esp/syslinux/"
@@ -84,7 +83,7 @@ cp "$here/../archiso/grub/raw.cfg" "$work/esp/boot/grub/grub.cfg"
 grub_args=()
 if [[ -n ${AIS_GRUB_MODULE_DIR:-} ]]; then grub_args+=(-d "$AIS_GRUB_MODULE_DIR"); fi
 grub-mkstandalone "${grub_args[@]}" -O x86_64-efi --locales='' --fonts='' \
-    --modules='part_gpt fat probe regexp configfile linux normal serial halt' \
+    --modules='part_gpt fat regexp configfile linux normal serial halt' \
     -o "$work/esp/EFI/BOOT/BOOTX64.EFI" "boot/grub/grub.cfg=$here/../archiso/efiboot/grub.cfg"
 
 truncate -s "$((esp_sectors * 512))" "$work/esp.img"

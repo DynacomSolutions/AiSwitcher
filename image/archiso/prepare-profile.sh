@@ -24,5 +24,3 @@ GROUPS
 umask 077
 awk -F: '{print $1 ":!:0:0:99999:7:::"}' "$etc/passwd" >"$etc/shadow"
 awk -F: '{print $1 ":!::"}' "$etc/group" >"$etc/gshadow"
-cc -std=c11 -O2 -Wall -Wextra -Werror "$profile/ais-gpt-check.c" -o "$profile/airootfs/usr/local/bin/ais-gpt-check"
-chmod 0755 "$profile/airootfs/usr/local/bin/ais-gpt-check"

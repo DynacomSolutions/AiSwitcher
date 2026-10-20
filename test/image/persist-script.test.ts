@@ -41,23 +41,6 @@ function packageListCommand(root: string, baseFile: string) {
 }
 
 describe("persistent image scripts", () => {
-  test("GPT guard refuses partition work when the boot manifest is absent", () => {
-    const fixture = join(scratch, "create-refusal");
-    mkdirSync(fixture, { recursive: true });
-    const consolePath = join(fixture, "console");
-    const log = join(fixture, "sfdisk.log");
-    const bin = join(fixture, "bin");
-    mkdirSync(bin);
-    writeFileSync(consolePath, "/dev/synthetic-other\n");
-    executable(join(bin, "sfdisk"), `#!/bin/sh\nprintf called >> '${log}'\n`);
-    const result = Bun.spawnSync([
-      "bash", "-c",
-      `source '${hook}'; _persist_verify_gpt`,
-    ], { env: { ...process.env, AIS_INITCPIO_CONSOLE: consolePath, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
-    expect(result.exitCode).not.toBe(0);
-    expect(existsSync(log)).toBe(false);
-  }, 15000);
-
   test("pruning enforces ordinary and low-space retention caps", () => {
     const fixture = join(scratch, "prune-caps");
     const root = join(fixture, "persist");
@@ -423,8 +406,8 @@ exit 1
     mkdirSync(bin, { recursive: true });
     const commands = join(fixture, "commands");
     executable(join(bin, "keyctl"), "#!/bin/sh\ncase $1 in search) printf '123\\n';; pipe) printf 'SYNTHETIC_FIXTURE_passphrase';; esac\n");
-    executable(join(bin, "cryptsetup"), `#!/bin/sh\nprintf 'cryptsetup %s\\n' "$*" >> '${commands}'\n[ "$1" = open ]\n`);
-    const result = Bun.spawnSync(["bash", "-c", `source '${hook}'; _persist_verify_gpt() { return 0; }; _persist_refresh_part_node() { PERSIST_RESOLVED_PART=$PERSIST_PART; }; _persist_check_diskseq() { return 0; }; PERSIST_PART=/dev/synthetic-disk5; _persist_open`], {
+    executable(join(bin, "cryptsetup"), `#!/bin/sh\nprintf 'cryptsetup %s\\n' "$*" >> '${commands}'\n[ "$1" = open ] || [ "$1" = isLuks ]\n`);
+    const result = Bun.spawnSync(["bash", "-c", `source '${hook}'; _persist_resolve() { return 0; }; _persist_mapper() { return 0; }; PERSIST_PART=/dev/synthetic-disk5; _persist_open`], {
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe",
     });
     const log = readFileSync(commands, "utf8");

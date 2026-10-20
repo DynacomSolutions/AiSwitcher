@@ -75,12 +75,11 @@ describe("persistent image mount contract", () => {
     expect(service).toContain("After=local-fs.target");
     expect(service).toContain("WantedBy=multi-user.target");
     expect(service).not.toContain("What=");
-    expect(resolver).toContain("_persist_find_device");
-    expect(resolver).toContain("_persist_refresh_part_node 4");
-    expect(resolver).toContain('_persist_write mount --no-canonicalize -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$PERSIST_RESOLVED_PART" /mnt/aisx');
-    expect(resolver).toContain("! _persist_check_diskseq || ! _persist_verify_gpt || ! _persist_refresh_part_node 4");
-    expect(resolver).not.toContain("PERSIST_EXCHANGE_PART");
-    expect(hook).toContain("_persist_refresh_part_node 4");
+    expect(resolver).toContain("_persist_resolve");
+    expect(resolver).toContain("_exchange_resolve");
+    expect(resolver).toContain('mount -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$EXCHANGE_PART" /mnt/aisx');
+    expect(resolver).toContain("ais-persist-ephemeral");
+    expect(hook).not.toContain("-t exfat");
     expect(hook).not.toContain("/dev/disk/by-label/AISX");
   });
 });

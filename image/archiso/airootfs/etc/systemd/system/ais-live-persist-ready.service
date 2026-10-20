@@ -6,6 +6,7 @@ Wants=NetworkManager.service
 Conflicts=shutdown.target
 Before=getty-pre.target shutdown.target
 ConditionPathIsMountPoint=/mnt/persist
+ConditionPathExists=!/run/ais-persist-ephemeral
 
 [Service]
 Type=oneshot

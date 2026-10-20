@@ -4,6 +4,7 @@ After=ais-live-persist-ready.service
 Before=ais-live-outbox-shutdown.service shutdown.target
 Conflicts=shutdown.target
 ConditionPathIsMountPoint=/mnt/persist
+ConditionPathExists=!/run/ais-persist-ephemeral
 
 [Service]
 Type=oneshot
