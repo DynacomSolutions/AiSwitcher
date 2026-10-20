@@ -65,6 +65,8 @@ case "$operation" in
     }
     exec /usr/local/lib/ais-live-test/boot-flow-agent-checks
     ;;
-  launch|pane) exec /usr/bin/ais launch ;;
+  launch) exec /usr/bin/ais launch ;;
+  # A pane outlives ais launch, so "Nothing to launch" or a finished tool leaves an agent shell instead of a closed pane.
+  pane) /usr/bin/ais launch || true; exec /bin/bash -l ;;
   *) echo 'agent-exec-clean refused an unknown operation' >&2; exit 126 ;;
 esac

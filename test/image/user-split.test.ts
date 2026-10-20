@@ -13,6 +13,7 @@ describe("image account split", () => {
     ]);
     expect(sudoers.trim().split("\n")).toEqual(["live ALL=(agent) NOPASSWD: /usr/local/lib/ais-live/agent-exec"]);
     expect(launcher).toContain("probe|probe-fresh|upgrade|local-start|launch|pane");
+    expect(clean).toContain("pane) /usr/bin/ais launch || true; exec /bin/bash -l ;;");
     expect(launcher).not.toContain('"$@"');
     expect(clean).toContain("id -un)\" != agent");
   });
