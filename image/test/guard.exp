@@ -7,6 +7,8 @@ set guard_interactive_scenarios {unanswered-dd destructive-tool raw-read-refusal
 
 proc guard_qmp_key {socket text} {
     if {![file exists $socket]} { error "QMP socket unavailable" }
+    # The popup flushes input typed in the first second after its prompt.
+    after 1500
     set helper [file join $::guard_script_dir guard-qmp.py]
     if {[catch {exec python3 $helper --socket $socket --text "$text\n"} result]} {
         error "QMP keyboard input failed: $result"
