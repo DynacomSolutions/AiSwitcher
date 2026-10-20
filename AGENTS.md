@@ -55,8 +55,8 @@ design decision without reading why in the topic file first.
 - `bun run build`: `bun build --compile` all eight proxy entrypoints (`claude`,
   `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `opencode`) plus `open` (darwin
   only), `ais`, and the installer into `dist/`.
-- `bun run backup`: mirrors every tool config dir into the git-managed repo at
-  `~/.ais/backups`.
+- `bun run backup`: snapshots every tool config dir into the git-only repo at
+  `~/.ais/backups/.git` (work tree is `$HOME`, no plain copy).
 - `bun run migrate`: one-time, DESTRUCTIVE; claude/codex only. Refuses to run
   while a `claude`/`codex` process runs (`pgrep`); run from a plain terminal,
   never inside an agent session. Takes a fresh backup first.
@@ -136,7 +136,7 @@ Sync, data and upgrades:
 
 Console, reporting and credentials:
 - The console is a thin HTTP surface over the existing engines. Loopback bind only,
-  loopback Host check, bearer token or loopback peer, `X-AIS-Console: 1` on every
+  loopback Host check, bearer token or same-uid loopback peer (Linux), `X-AIS-Console: 1` on every
   mutating method, secrets write-only, file editing confined to whitelisted roots (dual lexical+realpath containment
   checks and pre-edit backups).
   `parseArgs` reads only `--flag=value`.

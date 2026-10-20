@@ -332,8 +332,8 @@ src/
 └── ais.ts                entrypoint: the `ais` management CLI
 
 scripts/
-├── backup.ts    mirrors every real config dir into a persistent git repo at
-│               ~/.ais/backups and commits whatever changed
+├── backup.ts    snapshots every real config dir into a git-only repo at
+│               ~/.ais/backups/.git and commits whatever changed
 ├── migrate.ts   one-time, interactive, moves existing dirs into identities/<name>/
 ├── build.ts     bun build --compile for all seven entrypoints
 └── install.ts   backup + copy compiled binaries to ~/.local/bin
@@ -366,7 +366,7 @@ bun run install:shims
 
 > **`bun run migrate` restructures your live `~/.claude` and `~/.codex`
 > directories** into the `identities/<name>/` layout above. It takes a full
-> backup first (a git commit in the persistent repo at `~/.ais/backups`) and
+> backup first (a git commit in the git-only repo at `~/.ais/backups/.git`; restore with `git --git-dir=~/.ais/backups/.git show HEAD:<path>`) and
 > refuses to
 > run if a `claude`/`codex` process is currently active — close every running
 > session first, and run it from a plain terminal, not from inside an active
@@ -619,7 +619,8 @@ ais tui                       # ratatui frontend
 
 Security model: the server binds `127.0.0.1` only; requests must carry the
 per-boot bearer token from `~/.ais/web/server.json` OR come from a loopback
-peer with a loopback `Host` header (DNS-rebinding guard); every mutating
+peer running as the same user as the server (Linux; other local accounts need
+the token) with a loopback `Host` header (DNS-rebinding guard); every mutating
 request additionally requires an `X-AIS-Console` header, which cross-site
 pages cannot forge without a CORS preflight this server never grants.
 Secrets are never returned by the API: keys/tokens/cookies can be written,
@@ -1153,7 +1154,7 @@ forces a swap. A running session picks the new login up on its next message.
 |---|---|
 | `bun test` | Run the unit test suite |
 | `bun run build` | Compile all proxies and management entrypoints into `dist/` (`claude`, `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `open` on darwin, `ais`, `install`) |
-| `bun run backup` | mirrors every real config dir into the persistent git repo at `~/.ais/backups` and commits whatever changed |
+| `bun run backup` | snapshots every real config dir into the git-only repo at `~/.ais/backups/.git` (no plain copy) and commits whatever changed |
 | `bun run migrate` | One-time, destructive: restructure into `identities/<name>/` (claude/codex only, see above) |
 | `bun run install:shims` | Backup, then copy compiled binaries to `~/.local/bin` |
 

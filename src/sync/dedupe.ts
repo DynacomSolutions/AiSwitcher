@@ -1,4 +1,4 @@
-import { copyFile, mkdir, open, readdir, rename, stat } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rename, stat } from "node:fs/promises";
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
@@ -7,7 +7,7 @@ import type { Identity, ToolConfig } from "../identities/types.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG } from "../identities/tool-configs.ts";
 import { matchDirectory } from "../identities/match.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
-import { hasOpenOwner, type OpenOwnerPass } from "./tree-merge.ts";
+import { hasOpenOwner, hasOpenOwnerBeforeWrite, type OpenOwnerPass } from "./tree-merge.ts";
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const UUID_FILE_PATTERN = new RegExp(`^(${UUID})\\.jsonl$`, "i");
@@ -70,10 +70,18 @@ export interface DedupeOptions {
   now?: Date;
 }
 
-export type JsonlMergeResult = "merged" | "unchanged" | "deferred";
+export type JsonlMergeResult = "merged" | "unchanged" | "deferred" | "busy";
+// "busy" is a deferral caused only by a live open owner: callers skip it without copying.
 export type JsonlBeforeAppendHook = (destination: string) => Promise<void>;
 let beforeJsonlAppend: JsonlBeforeAppendHook | undefined;
 let beforeJsonlCreate: JsonlBeforeAppendHook | undefined;
+let afterJsonlCreate: ((destination: string) => void) | undefined;
+let beforeJsonlWrite: ((destination: string) => void) | undefined;
+type JsonlWriter = (fd: number, payload: Buffer) => number;
+const nativeJsonlWriter: JsonlWriter = (fd, payload) => writeSync(fd, payload, 0, payload.length);
+let jsonlWriter = nativeJsonlWriter;
+/** Test hook: interleave native writes after the final size or snapshot check. */
+export function setJsonlWriter(writer?: JsonlWriter): void { jsonlWriter = writer ?? nativeJsonlWriter; }
 /** Test hook for deterministic native-writer races. */
 export function setJsonlBeforeAppendHook(hook?: JsonlBeforeAppendHook): void {
   beforeJsonlAppend = hook;
@@ -81,6 +89,14 @@ export function setJsonlBeforeAppendHook(hook?: JsonlBeforeAppendHook): void {
 /** Test hook for deterministic exclusive-create races. */
 export function setJsonlBeforeCreateHook(hook?: JsonlBeforeAppendHook): void {
   beforeJsonlCreate = hook;
+}
+/** Test hook for a native write between exclusive creation and our write. */
+export function setJsonlAfterCreateHook(hook?: (destination: string) => void): void {
+  afterJsonlCreate = hook;
+}
+/** Test hook after the final newline check, before the fresh owner check. */
+export function setJsonlBeforeWriteHook(hook?: (destination: string) => void): void {
+  beforeJsonlWrite = hook;
 }
 
 function slash(path: string): string {
@@ -338,15 +354,24 @@ export async function mergeJsonlFiles(
       await mkdir(dirname(destination), { recursive: true });
       await beforeJsonlCreate?.(destination);
       try {
-        const target = await open(destination, "wx", 0o600);
+        // Exclusive creation and the write use the same handle. O_APPEND also
+        // protects native bytes written after creation from an offset-zero write.
+        const target = openSync(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_APPEND, 0o600);
         try {
-          await target.writeFile(output);
-          await target.sync();
-          const createdSnapshot = await target.stat();
-          const pathSnapshot = await stat(destination);
-          if (!sameFileSnapshot(createdSnapshot, pathSnapshot)) return "deferred";
+          afterJsonlCreate?.(destination);
+          const preSize = fstatSync(target).size;
+          if (preSize !== 0) return "deferred";
+          const payload = Buffer.from(output);
+          // shortcut: a native partial write can follow the size check, upgrade
+          // when vendors expose a write lock or ais owns the writers.
+          const written = jsonlWriter(target, payload);
+          if (written !== payload.length) return "deferred";
+          fsyncSync(target);
+          const createdSnapshot = fstatSync(target);
+          const pathSnapshot = statSync(destination);
+          if (createdSnapshot.size !== preSize + written || !sameFileSnapshot(createdSnapshot, pathSnapshot)) return "deferred";
         }
-        finally { await target.close(); }
+        finally { closeSync(target); }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") return "deferred";
         throw error;
@@ -377,9 +402,9 @@ export async function mergeJsonlFiles(
   if (additions.length === 0) return "unchanged";
   if (dryRun) return "merged";
   await beforeJsonlAppend?.(destination);
-  // Check ownership after the destination read and immediately before opening
-  // the append descriptor. Unknown is deferred, as a cached miss is not proof.
-  if ((await hasOpenOwner(destination, ownerPass)) !== false) return "deferred";
+  // Filter busy files with the pass's budgeted lookup before opening a handle.
+  // A snapshot miss still needs a fresh ownership check before writing below.
+  if ((await hasOpenOwner(destination, ownerPass)) !== false) return "busy";
 
   let fd: number;
   try { fd = openSync(destination, constants.O_RDWR | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0)); }
@@ -393,10 +418,17 @@ export async function mergeJsonlFiles(
       if (readSync(fd, lastByte, 0, 1, descriptorSnapshot.size - 1) !== 1 || lastByte[0] !== 10) return "deferred";
     }
     const payload = Buffer.from(`${additions.join("\n")}\n`);
-    const written = writeSync(fd, payload, 0, payload.length);
+    beforeJsonlWrite?.(destination);
+    if ((await hasOpenOwnerBeforeWrite(destination, fd)) !== false) return "deferred";
+    // The ownership lookup can yield; reject changes made while it ran.
+    if (!sameFileSnapshot(before, fstatSync(fd)) || !sameFileSnapshot(before, statSync(destination))) return "deferred";
+    // shortcut: a native partial write can follow the final snapshot, upgrade
+    // when vendors expose a write lock or ais owns the writers.
+    const written = jsonlWriter(fd, payload);
     if (written !== payload.length) return "deferred";
     fsyncSync(fd);
-    if (!sameFileSnapshot(fstatSync(fd), statSync(destination))) return "deferred";
+    const afterWrite = fstatSync(fd);
+    if (afterWrite.size !== before.size + written || !sameFileSnapshot(afterWrite, statSync(destination))) return "deferred";
   } catch {
     return "deferred";
   } finally { closeSync(fd); }
@@ -432,7 +464,7 @@ async function mergeDirectories(
     if (rel.endsWith(".jsonl")) {
       const mergeResult = await mergeJsonlFiles(paths, target, dryRun);
       if (mergeResult === "merged") result.mergedJsonlFiles++;
-      else if (mergeResult === "deferred") result.deferredJsonlFiles++;
+      else if (mergeResult === "deferred" || mergeResult === "busy") result.deferredJsonlFiles++;
       continue;
     }
     const candidates = await Promise.all(
@@ -566,7 +598,7 @@ async function mergeGroup(
     if (!(await filesEqual(paths))) result.divergentSessions++;
     const mergeResult = await mergeJsonlFiles(paths, canonical.path, dryRun);
     if (mergeResult === "merged") result.mergedJsonlFiles++;
-    else if (mergeResult === "deferred") result.deferredJsonlFiles++;
+    else if (mergeResult === "deferred" || mergeResult === "busy") result.deferredJsonlFiles++;
     if (canonical.toolName === "claude") {
       const sidecars = group.map((copy) => copy.sidecarDir).filter((path): path is string => Boolean(path));
       if (sidecars.length > 0) {

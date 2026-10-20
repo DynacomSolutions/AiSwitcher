@@ -1,19 +1,27 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, open, readdir, realpath, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { appendFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
 import {
   hasOpenOwner,
   mergeIncomingProfileTree,
   recoverProfileArchives,
+  setDirectOwnerProbe,
   setOpenScanner,
+  setProcReader,
 } from "../../src/sync/tree-merge.ts";
+import { setJsonlWriter } from "../../src/sync/dedupe.ts";
 import { aisRemoteCacheDir } from "../../src/shared/ais-home.ts";
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+  setDirectOwnerProbe();
+  setOpenScanner();
+  setProcReader();
+  setJsonlWriter();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -26,6 +34,10 @@ async function makeDir(prefix: string): Promise<string> {
 async function write(path: string, contents: string): Promise<void> {
   await mkdir(join(path, ".."), { recursive: true });
   await Bun.write(path, contents);
+}
+
+function deferredPath(home: string, rel: string): string {
+  return join(aisRemoteCacheDir(home), "merge-conflicts", "deferred", "incoming", rel);
 }
 
 function codexConfig(home: string): ToolConfig {
@@ -51,7 +63,115 @@ async function writeRegistry(root: string, home: string): Promise<void> {
   );
 }
 
+function injectInaccessibleProcess(uid: number | number[], openPaths: string[] = []): void {
+  const uids = typeof uid === "number" ? [uid, uid, uid, uid] : uid;
+  setProcReader({
+    async readdir(path) {
+      if (path === "/proc") return ["2147483646", "2147483645"];
+      if (path === "/proc/2147483646/fd") throw Object.assign(new Error("SYNTHETIC_FIXTURE_access"), { code: "EACCES" });
+      return openPaths.map((_, index) => String(index));
+    },
+    async readlink(path) { return openPaths[Number(path.split("/").at(-1))]!; },
+    async readFile() { return `Name:\tSYNTHETIC_FIXTURE_process\nUid:\t${uids.join("\t")}\n`; },
+  });
+}
+
+describe.skipIf(process.platform !== "linux")("inaccessible /proc entries", () => {
+  for (const owner of ["other", "same", "root"] as const) {
+    test(`${owner}-uid fd access failure ${owner === "other" ? "does not starve" : "defers"} a closed file`, async () => {
+      const home = await makeDir("ais-proc-owner-");
+      const path = join(home, "history.jsonl");
+      await write(path, "SYNTHETIC_FIXTURE_local\n");
+      const uid = (await stat(path)).uid;
+      injectInaccessibleProcess(owner === "other" ? uid + 1 : owner === "same" ? uid : 0);
+      // Exercise the real scanner, including its /proc traversal and UID
+      // decision, with only the filesystem reader injected.
+      expect(await hasOpenOwner(path, { lookups: 4 })).toBe(owner === "other" ? false : undefined);
+    });
+  }
+
+  test("an inaccessible process with a matching filesystem UID remains unknown", async () => {
+    const home = await makeDir("ais-proc-filesystem-uid-");
+    const path = join(home, "history.jsonl");
+    await write(path, "SYNTHETIC_FIXTURE_local\n");
+    const uid = (await stat(path)).uid;
+    injectInaccessibleProcess([uid + 1, uid + 1, uid + 1, uid]);
+    expect(await hasOpenOwner(path, { lookups: 4 })).toBeUndefined();
+  });
+
+  test("missing or unreadable process UIDs remain unknown", async () => {
+    const home = await makeDir("ais-proc-unknown-uid-");
+    const path = join(home, "history.jsonl");
+    await write(path, "SYNTHETIC_FIXTURE_local\n");
+    for (const unreadable of [false, true]) {
+      setProcReader({
+        async readdir(path) {
+          if (path === "/proc") return ["2147483646"];
+          throw Object.assign(new Error("SYNTHETIC_FIXTURE_access"), { code: "EACCES" });
+        },
+        async readlink() { throw new Error("SYNTHETIC_FIXTURE_unexpected_link"); },
+        async readFile() {
+          if (unreadable) throw Object.assign(new Error("SYNTHETIC_FIXTURE_status_access"), { code: "EACCES" });
+          return "Name:\tSYNTHETIC_FIXTURE_process\n";
+        },
+      });
+      expect(await hasOpenOwner(path, { lookups: 4 })).toBeUndefined();
+    }
+  });
+});
+
 describe("mergeIncomingProfileTree", () => {
+  test.skipIf(process.platform !== "linux")("four busy logs and an unreadable unrelated process do not starve ten later closed logs", async () => {
+    const home = await makeDir("ais-tree-budget-home-");
+    const incoming = await makeDir("ais-tree-budget-incoming-");
+    const paths = Array.from({ length: 14 }, (_, i) => join(".codex", "identities", "personal", `${i.toString().padStart(2, "0")}.jsonl`));
+    const handles: Awaited<ReturnType<typeof open>>[] = [];
+    try {
+      for (const [i, rel] of paths.entries()) {
+        await write(join(home, rel), "SYNTHETIC_FIXTURE_local\n");
+        await write(join(incoming, rel), "SYNTHETIC_FIXTURE_remote\n");
+        if (i < 4) handles.push(await open(join(home, rel), "a"));
+      }
+      const busy = await Promise.all(paths.slice(0, 4).map((rel) => realpath(join(home, rel))));
+      injectInaccessibleProcess((await stat(home)).uid + 1, busy);
+      const result = await mergeIncomingProfileTree(incoming, {
+        kind: "identity", cfg: codexConfig(home), identityName: "personal",
+      }, { home });
+      expect(result.mergedJsonlFiles).toBe(10);
+      expect(result.busyPaths).toEqual(paths.slice(0, 4));
+      expect(result.preservedConflictPaths).toEqual([]);
+      for (const [i, rel] of paths.entries()) {
+        expect(await Bun.file(join(home, rel)).text()).toBe(i < 4
+          ? "SYNTHETIC_FIXTURE_local\n" : "SYNTHETIC_FIXTURE_local\nSYNTHETIC_FIXTURE_remote\n");
+      }
+    } finally { await Promise.all(handles.map((handle) => handle.close())); }
+  }, 30_000);
+
+  for (const existing of [false, true]) {
+    test(`retains the incoming copy after a post-check ${existing ? "append" : "create"} size mismatch`, async () => {
+      const home = await makeDir("ais-tree-post-write-home-");
+      const incoming = await makeDir("ais-tree-post-write-incoming-");
+      const rel = join(".codex", "identities", "personal", "history.jsonl");
+      const live = join(home, rel);
+      const remote = "SYNTHETIC_FIXTURE_imported\n";
+      await write(join(incoming, rel), remote);
+      if (existing) await write(live, "SYNTHETIC_FIXTURE_local\n");
+      let writes = 0;
+      setJsonlWriter((fd, payload) => {
+        writes++;
+        appendFileSync(live, "SYNTHETIC_FIXTURE_partial");
+        return writeSync(fd, payload, 0, payload.length);
+      });
+      const result = await mergeIncomingProfileTree(incoming, {
+        kind: "identity", cfg: codexConfig(home), identityName: "personal",
+      }, { home });
+      expect(writes).toBe(1);
+      expect(result.mergedJsonlFiles).toBe(0);
+      expect(result.preservedConflictPaths).toEqual([rel]);
+      expect(await Bun.file(deferredPath(home, rel)).text()).toBe(remote);
+    });
+  }
+
   test("stages a pull and appends divergent JSONL events without replacing the live prefix", async () => {
     const home = await makeDir("ais-tree-home-");
     const incoming = await makeDir("ais-tree-incoming-");
@@ -102,7 +222,7 @@ describe("mergeIncomingProfileTree", () => {
 
     expect(await Bun.file(join(home, rel)).text()).toBe('complete\n');
     expect(result.preservedConflicts).toBe(1);
-    expect(await Bun.file(join(conflictRoot, "incoming", rel)).text()).toBe('complete\n{"partial":');
+    expect(await Bun.file(deferredPath(home, rel)).text()).toBe('complete\n{"partial":');
   });
 
   test("defers a closed destination with an incomplete native tail and reports its path", async () => {
@@ -124,10 +244,10 @@ describe("mergeIncomingProfileTree", () => {
     expect(result.preservedConflicts).toBe(1);
     expect(result.preservedConflictPaths).toEqual([rel]);
     expect(await Bun.file(join(home, rel)).text()).toBe('complete\nSYNTHETIC_FIXTURE_partial');
-    expect(await Bun.file(join(conflictRoot, "incoming", rel)).text()).toBe('complete\nSYNTHETIC_FIXTURE_remote\n');
+    expect(await Bun.file(deferredPath(home, rel)).text()).toBe('complete\nSYNTHETIC_FIXTURE_remote\n');
   });
 
-  test("defers an incoming history while a native process still owns the live file", async () => {
+  test("defers an incoming history, without copying it, while a native process still owns the live file", async () => {
     const home = await makeDir("ais-tree-open-home-");
     const incoming = await makeDir("ais-tree-open-incoming-");
     const conflictRoot = join(aisRemoteCacheDir(home), "merge-conflicts", "open-test");
@@ -144,16 +264,111 @@ describe("mergeIncomingProfileTree", () => {
         cfg: codexConfig(home),
         identityName: "personal",
       }, { home, conflictRoot });
-      expect(result.preservedConflicts).toBe(1);
+      expect(result.preservedConflicts).toBe(0);
+      expect(result.busyPaths).toEqual([rel]);
       expect(await Bun.file(live).text()).toBe('local\n');
-      expect(await Bun.file(join(conflictRoot, "incoming", rel)).text()).toBe('remote\n');
+      expect(await Bun.file(deferredPath(home, rel)).exists()).toBe(false);
     } finally {
       await handle.close();
+    }
+  });
+
+  test("repeated and growing deferrals keep one latest copy per destination across runs", async () => {
+    const home = await makeDir("ais-tree-bounded-home-");
+    const incoming = await makeDir("ais-tree-bounded-incoming-");
+    setDirectOwnerProbe(async () => false);
+    setOpenScanner(async () => new Set());
+    const rel = join(".codex", "identities", "personal", "history.jsonl");
+    await write(join(home, rel), "SYNTHETIC_FIXTURE_incomplete");
+    const scope = { kind: "identity" as const, cfg: codexConfig(home), identityName: "personal" };
+    let contents = "";
+    for (let i = 0; i < 6; i++) {
+      contents += `SYNTHETIC_FIXTURE_event_${i}\n`;
+      await write(join(incoming, rel), contents);
+      for (let repeat = 0; repeat < 2; repeat++) {
+        const result = await mergeIncomingProfileTree(incoming, scope, {
+          home, conflictRoot: join(aisRemoteCacheDir(home), "merge-conflicts", `run-${i}-${repeat}`),
+        });
+        expect(result.preservedConflictPaths).toEqual([rel]);
+      }
+    }
+    const root = join(aisRemoteCacheDir(home), "merge-conflicts");
+    const files = (await readdir(root, { recursive: true })).filter((path) => path.endsWith(".jsonl"));
+    expect(files).toEqual([join("deferred", "incoming", rel)]);
+    expect(await Bun.file(deferredPath(home, rel)).text()).toBe(contents);
+    await write(join(home, rel), "SYNTHETIC_FIXTURE_local\n");
+    const recovered = await recoverProfileArchives({ home });
+    expect(recovered.mergedJsonlFiles).toBe(1);
+    expect(await Bun.file(join(home, rel)).text()).toBe(`SYNTHETIC_FIXTURE_local\n${contents}`);
+    expect(await Bun.file(deferredPath(home, rel)).text()).toBe(contents);
+  });
+
+  test("retains divergent deferrals once each and recovers their original paths", async () => {
+    const home = await makeDir("ais-tree-unresolved-home-");
+    setDirectOwnerProbe(async () => false);
+    setOpenScanner(async () => new Set());
+    const incoming = await makeDir("ais-tree-unresolved-incoming-");
+    const rel = join(".codex", "identities", "personal", "history.jsonl");
+    await write(join(home, rel), "SYNTHETIC_FIXTURE_incomplete");
+    const scope = { kind: "identity" as const, cfg: codexConfig(home), identityName: "personal" };
+    for (const event of ["one", "two", "one", "two", "one", "two"]) {
+      await write(join(incoming, rel), `SYNTHETIC_FIXTURE_${event}\n`);
+      await mergeIncomingProfileTree(incoming, scope, { home });
+    }
+    const root = join(aisRemoteCacheDir(home), "merge-conflicts");
+    expect((await readdir(root, { recursive: true })).filter((path) => path.endsWith(".jsonl"))).toHaveLength(3);
+    await write(join(home, rel), "SYNTHETIC_FIXTURE_local\n");
+    await recoverProfileArchives({ home });
+    expect((await Bun.file(join(home, rel)).text()).trim().split("\n").sort()).toEqual([
+      "SYNTHETIC_FIXTURE_local", "SYNTHETIC_FIXTURE_one", "SYNTHETIC_FIXTURE_two",
+    ]);
+  });
+});
+
+describe("mtime convergence", () => {
+  test("identical files take the newer mtime; contents never change", async () => {
+    const home = await makeDir("ais-tree-mtime-home-");
+    const incoming = await makeDir("ais-tree-mtime-incoming-");
+    await writeRegistry(home, home);
+    await writeRegistry(incoming, home);
+    const dir = join(".codex", "identities", "personal");
+    for (const name of ["a.json", "b.jsonl"]) {
+      await write(join(home, dir, name), "same\n");
+      await write(join(incoming, dir, name), "same\n");
+      await utimes(join(home, dir, name), new Date(1_000_000), new Date(1_000_000));
+      await utimes(join(incoming, dir, name), new Date(2_000_000), new Date(2_000_000));
+    }
+    await mergeIncomingProfileTree(incoming, { kind: "identity", cfg: codexConfig(home), identityName: "personal" }, { home });
+    for (const name of ["a.json", "b.jsonl"]) {
+      expect((await stat(join(home, dir, name))).mtimeMs).toBe(2_000_000);
+      expect(await Bun.file(join(home, dir, name)).text()).toBe("same\n");
     }
   });
 });
 
 describe("recoverProfileArchives", () => {
+  test("recovers earlier merge-conflicts side roots and UUID-suffixed histories", async () => {
+    const home = await makeDir("ais-recover-merge-conflicts-");
+    setDirectOwnerProbe(async () => false);
+    setOpenScanner(async () => new Set());
+    const rel = join(".codex", "identities", "personal", "history.jsonl");
+    const root = join(aisRemoteCacheDir(home), "merge-conflicts", "earlier-run");
+    await write(join(root, "incoming", rel), "SYNTHETIC_FIXTURE_incoming\n");
+    await write(join(root, "incoming", `${rel}.11111111-1111-4111-8111-111111111111`), "SYNTHETIC_FIXTURE_duplicate\n");
+    const interrupted = `${rel}.22222222-2222-4222-8222-222222222222.tmp`;
+    await write(join(root, "incoming", interrupted), "SYNTHETIC_FIXTURE_partial");
+    await write(join(root, "local", rel), "SYNTHETIC_FIXTURE_local\n");
+    const result = await recoverProfileArchives({ home });
+    expect(result.archiveRoots).toBe(2);
+    expect((await Bun.file(join(home, rel)).text()).trim().split("\n").sort()).toEqual([
+      "SYNTHETIC_FIXTURE_duplicate", "SYNTHETIC_FIXTURE_incoming", "SYNTHETIC_FIXTURE_local",
+    ]);
+    expect(await Bun.file(join(home, "incoming", rel)).exists()).toBe(false);
+    expect(await Bun.file(join(home, interrupted)).exists()).toBe(false);
+    expect(await Bun.file(join(root, "incoming", interrupted)).exists()).toBe(true);
+    expect(await Bun.file(join(root, "incoming", rel)).exists()).toBe(true);
+  });
+
   test("restores a longer cached history additively and retains its recovery copy", async () => {
     const home = await makeDir("ais-recover-home-");
     const rel = join(".codex", "identities", "personal", "sessions", "2026", "07", "22", "rollout.jsonl");
@@ -343,20 +558,22 @@ describe("hasOpenOwner", () => {
     });
     const pass = { lookups: 1000 };
     expect(await hasOpenOwner(held, pass)).toBe(true);
-    for (let i = 0; i < 50; i++) expect(await hasOpenOwner(closed, pass)).toBeUndefined();
+    for (let i = 0; i < 50; i++) expect(await hasOpenOwner(closed, pass)).toBe(false);
     expect(scans).toBe(1);
+    expect(await hasOpenOwner(closed, { lookups: 4 })).toBe(false);
+    expect(scans).toBe(2);
   });
 
-  test("a cached miss stays unknown if a native descriptor opens after the snapshot", async () => {
+  test("a fresh direct check catches a writer that opened after a snapshot miss", async () => {
     const dir = await makeDir("ais-open-owner-after-snapshot-");
     const path = join(dir, "history.jsonl");
     await Bun.write(path, "SYNTHETIC_FIXTURE_line\n");
     setOpenScanner(async () => new Set());
     const cachedPass = { lookups: 1000 };
-    expect(await hasOpenOwner(path, cachedPass)).toBeUndefined();
+    expect(await hasOpenOwner(path, cachedPass)).toBe(false);
     const handle = await open(path, "a");
     try {
-      expect(await hasOpenOwner(path, cachedPass)).toBeUndefined();
+      expect(await hasOpenOwner(path, cachedPass)).toBe(false);
       expect(await hasOpenOwner(path, { lookups: 0 })).toBe(true);
     } finally { await handle.close(); }
   });
@@ -367,5 +584,23 @@ describe("hasOpenOwner", () => {
     await Bun.write(file, "x\n");
     setOpenScanner(async () => undefined);
     expect(await hasOpenOwner(file, { lookups: 1000 })).toBeUndefined();
+  });
+
+  test("a stalled snapshot is aborted and remains unknown for the pass", async () => {
+    const dir = await makeDir("ais-open-owner-timeout-");
+    const file = join(dir, "history.jsonl");
+    await Bun.write(file, "SYNTHETIC_FIXTURE_line\n");
+    let scans = 0;
+    let signal: AbortSignal | undefined;
+    setOpenScanner(async (scanSignal) => {
+      scans++;
+      signal = scanSignal;
+      return new Promise(() => {});
+    }, 20);
+    const pass = { lookups: 4 };
+    expect(await hasOpenOwner(file, pass)).toBeUndefined();
+    expect(signal?.aborted).toBe(true);
+    expect(await hasOpenOwner(file, pass)).toBeUndefined();
+    expect(scans).toBe(1);
   });
 });

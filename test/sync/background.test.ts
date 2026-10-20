@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   backgroundSyncArgs,
+  lowPriorityPrefix,
   launchThenStartBackgroundSync,
   startBackgroundProfileSync,
 } from "../../src/sync/background.ts";
@@ -54,5 +55,22 @@ describe("background profile sync", () => {
 
     expect(order).toEqual(["agent", "sync"]);
     expect(result).toBe(childExit);
+  });
+});
+
+describe("lowPriorityPrefix", () => {
+  const which = (name: string) => `/bin/${name}`;
+  test("nice plus an ionice-probing sh wrapper on Linux", () => {
+    const prefix = lowPriorityPrefix(which, "linux");
+    expect(prefix.slice(0, 5)).toEqual(["/bin/nice", "-n", "19", "/bin/sh", "-c"]);
+    expect(prefix.at(-1)).toBe("sh");
+  });
+  test("only nice off Linux or without ionice", () => {
+    expect(lowPriorityPrefix(which, "darwin")).toEqual(["/bin/nice", "-n", "19"]);
+    expect(lowPriorityPrefix((n) => (n === "ionice" ? null : `/bin/${n}`), "linux")).toEqual(["/bin/nice", "-n", "19"]);
+  });
+  test("the real prefix still runs the command", async () => {
+    const proc = Bun.spawn([...lowPriorityPrefix(), "echo", "ok"], { stdout: "pipe" });
+    expect((await new Response(proc.stdout).text()).trim()).toBe("ok");
   });
 });

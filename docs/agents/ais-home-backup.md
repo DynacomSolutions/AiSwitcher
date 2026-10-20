@@ -162,7 +162,22 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 99
   wrote a fresh, independent `~/.ai-switcher-backups/<timestamp>/*.tar.gz`
   tree on every `install`/`update`/`migrate` run, and nothing ever pruned
   old ones, allowing redundant full snapshots to accumulate.
-  The new design (`runBackup()`) mirrors each backed-up directory into a
+  **Superseded 2026-10-19: the backup is now git-only.** The rsync mirror
+  described next stored every file twice (plain copy plus git objects; 3.3G
+  on a real host, 2.5G of it the mirror). `runBackup()` now runs git with
+  `--git-dir=~/.ais/backups/.git --work-tree=$HOME`, writes
+  `BACKUP_EXCLUDES` to `.git/info/exclude` every run, and stages with
+  `git add -A --ignore-errors` (unreadable or vanished files are skipped
+  with a warning, replacing the rsync 23/24 tolerance; `isTolerableRsyncExitCode`
+  is gone). Index paths are unchanged (`.claude/...` relative to home), so
+  history stays valid. The first run after upgrading deletes the old plain
+  `~/.ais/backups/<group dir>` mirrors, only the exact known group names and
+  only once `git rev-parse --git-dir` succeeds. Known limit: a nested git
+  repo inside a config dir is recorded as a gitlink (or skipped with an error
+  if it has no commits) instead of its files being copied. The rsync
+  details below are historical.
+  Rolling back to a binary older than this change needs `git --git-dir=~/.ais/backups/.git config core.bare false` first (the new code sets `core.bare=true`).
+  The previous design (`runBackup()`) mirrors each backed-up directory into a
   single persistent working tree at `~/.ais/backups` via `rsync -a --delete
   --delete-excluded` (replacing tar's "always a fresh full copy" with "the
   working tree always exactly matches the live source, minus excludes"),
@@ -183,7 +198,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 99
     same way the old scattered `~/.ais`-adjacent paths did. `node_modules`,
     marketplace/browser caches, logs, worktrees, and similar have zero
     restore value and were the biggest driver of the old design's
-    unbounded growth.
+    unbounded growth. The backup adds `jobs/*/tmp/` (unanchored, so it
+    matches at any depth) on top: agent job scratch directories can hold
+    GBs of throwaway assets and their own `.gitattributes`.
   - **Unlike SSH sync, SQLite/session databases are deliberately NOT
     excluded.** Sync excludes live databases because it has its own
     VACUUM-based snapshot+merge protocol specifically to avoid corrupting a
@@ -302,8 +319,28 @@ described above (same repo content, commits and console output); only the
   fails the local backup. `localRetentionDays` must be a positive integer and is
   ignored (loudly) without a `remote`. `runBackup(groups, home, configPath?)`
   takes the config path as an optional third argument for tests.
-- **Operator creates the remote.** Run `git init --bare /srv/ais-backups.git` on
-  the backup host once. The backup never creates it.
+- **Git LFS is never used by the backup repo**, even when the user's global
+  config ran `git lfs install`. Mirrored config trees can contain nested
+  `.gitattributes` files with `filter=lfs`; without a guard `git add` would
+  store pointers instead of content and the LFS pre-push hook would fail every
+  push to a plain remote (`batch request: missing protocol`). Three guards:
+  every git call on the repo passes `-c core.hooksPath=/dev/null -c
+  filter.lfs.required=false` (hooks in `.git/hooks` are left in place but never
+  run); every run writes `.git/info/attributes` (highest attribute precedence)
+  with `* -filter -text -ident -working-tree-encoding`, atomically and only when
+  the content differs; and when that file is first created or changed, tracked
+  paths that still resolve to `filter=lfs` are renormalised after the mirror
+  step (`git add --renormalize`) so real content replaces the pointers in that
+  run's commit. Renormalisation skips paths no longer in the working tree
+  (for example excluded `jobs/*/tmp/` data), which the normal `git add -A`
+  simply drops without hashing them. History is not rewritten.
+- **Operator creates the remote.** Run `git init --bare /srv/ais-backups.git`
+  and then `git -C /srv/ais-backups.git config receive.shallowUpdate true` on
+  the backup host once. The setting is required because the `localRetentionDays`
+  trim makes the local repo shallow (`.git/shallow`), and a bare remote rejects
+  pushes from a shallow repo with `shallow update not allowed` unless it
+  accepts shallow updates. The backup prints this fix when it sees that error.
+  The backup never creates the remote.
 - **Push on every run** where a remote is configured, including the "no changes"
   and "nothing new to commit" runs, so a commit made while the remote was down
   is sent by the next run (catch-up). It pushes the whole current branch to the

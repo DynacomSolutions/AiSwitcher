@@ -57,9 +57,24 @@ reconciliation.
   `~/.ais/remote-cache/dedupe-backups/` (formerly
   `~/.cache/ais/dedupe-backups/`). Pulls and pushes both land in isolated
   incoming trees; the receiver merges from staging, so rsync never overwrites
-  a live history. Staging uses checksummed `--compare-dest=../../../..`
-  against the receiver's live home, so the isolated tree contains only
-  byte-different files rather than another multi-gigabyte profile copy.
+  a live history. Staging uses `--compare-dest=../../../..`
+  against the receiver's live home (rsync's size+mtime quick check, never
+  `--checksum`, which would read the whole tree every run), so the isolated tree
+  contains only changed files. To keep merged-but-identical files from
+  re-transferring forever, the merge raises a byte-identical live file's mtime
+  to the incoming one (contents never change). A JSONL with an open owner is
+  skipped, not copied to conflicts: the sender still has it and re-stages it.
+  Automatic runs (`ais sync background`) are rate limited by `minIntervalMinutes`
+  in `sync-v2.json` (default 10, 0 disables): a request inside the interval is
+  queued as one file per request in `remote-cache/sync-pending/` (a coalesced run skipped by the sync lock is requeued) and one lock holder
+  (`sync-pending.lock`) later runs a single scope-`all` pass; `last-auto-sync`
+  stamps the last start. `ais sync now` is never delayed. The background worker
+  runs at nice 19 and (Linux) ionice idle; remote rsync and AIS commands run
+  under `nice -n 19` plus `ionice -c3` when the remote has it. Staging is
+  bounded: snapshots are removed after use, and a prune pass (start of each
+  locked run, and inside remote `merge-profile-snapshot`) deletes
+  `profile-incoming`, `sqlite-incoming`, `sqlite-snapshots` entries older than 6
+  hours and `merge-conflicts` older than 30 days; `dedupe-backups` is never pruned.
   Non-mergeable file conflicts retain the losing bytes.
   `ais sync dedupe [--dry-run] [--json]` exposes the same local invariant.
   `ais sync recover [--dry-run] [--json]` additively restores histories and

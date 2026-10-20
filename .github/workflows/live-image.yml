@@ -1,0 +1,249 @@
+name: Live image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: live-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Decides whether the image build is needed. Fails open: any doubt builds.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      affected: ${{ steps.filter.outputs.affected }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Select by the dependency graph
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          result=true
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
+            && changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA") \
+            && bun install --frozen-lockfile \
+            && bun run build \
+            && picked=$(printf '%s\n' "$changed" | bun image/build/affected.ts dist/ais.meta.json) \
+            && [ "$picked" = false ]; then
+            result=false
+          fi
+          echo "affected=$result" >> "$GITHUB_OUTPUT"
+
+  # GitHub-hosted runner only: this repository is public, never self-hosted.
+  build:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+
+      # Assembly and boot-test tools; the unit tests exercise them for real.
+      - name: Install image tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xorriso jq expect tcl dosfstools mtools e2fsprogs exfatprogs \
+            syslinux syslinux-common grub-common grub-efi-amd64-bin \
+            python3 qemu-system-x86 ovmf
+
+      - name: Test the image scripts
+        run: |
+          set -euo pipefail
+          bun test test/image
+          shellcheck -x -P SCRIPTDIR image/build/*.sh image/test/*.sh \
+            image/archiso/profiledef.sh image/archiso/airootfs/usr/local/lib/ais-live/kernel-up
+
+      # Measured: the standard runner has far more than the build needs, so
+      # no preinstalled toolchains are removed. Kept as a record per run.
+      - name: Record free disk
+        run: |
+          set -euo pipefail
+          df -h /
+
+      - name: Start disk sampler
+        run: |
+          set -euo pipefail
+          image/build/sample-df.sh --once "$RUNNER_TEMP/df-samples.txt"
+          nohup image/build/sample-df.sh "$RUNNER_TEMP/df-samples.txt" 5 >/dev/null 2>&1 &
+          echo $! > "$RUNNER_TEMP/sampler.pid"
+
+      - name: Build the ISO (bootstrap, archiso, mkarchiso)
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          sudo image/build/build.sh >"$RUNNER_TEMP/build.log" 2>&1 || { tail -n 200 "$RUNNER_TEMP/build.log"; exit 1; }
+          tail -n 30 "$RUNNER_TEMP/build.log"
+          echo "build_seconds=$(( $(date +%s) - start ))" | tee "$RUNNER_TEMP/build-time.txt"
+
+      - name: Assemble the raw disk image
+        run: |
+          set -euo pipefail
+          sudo chown -R "$USER" out
+          image/build/assemble.sh out/archiso.iso out/ais-live.img
+          ls -l out/ais-live.img
+
+      - name: Stop disk sampler
+        if: always()
+        run: |
+          set -euo pipefail
+          pid=$(cat "$RUNNER_TEMP/sampler.pid")
+          # A dead sampler would leave gaps in the peak figure.
+          kill -0 "$pid" || { echo "disk sampler died"; exit 1; }
+          kill "$pid"
+          image/build/sample-df.sh --once "$RUNNER_TEMP/df-samples.txt"
+
+      - name: Assert peak disk under 80% of free
+        run: |
+          set -euo pipefail
+          image/build/assert-disk.sh "$RUNNER_TEMP/df-samples.txt"
+
+      - name: Assert BIOS and EFI El Torito records
+        run: |
+          set -euo pipefail
+          xorriso -indev out/archiso.iso -report_el_torito as_mkisofs > "$RUNNER_TEMP/eltorito.txt"
+          cat "$RUNNER_TEMP/eltorito.txt"
+          image/build/assert-eltorito.sh "$RUNNER_TEMP/eltorito.txt"
+
+      - name: Record measurements
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Live image build measurements"
+            cat "$RUNNER_TEMP/build-time.txt" || true
+            grep -E '^BUILD-(STAGE|DF):' "$RUNNER_TEMP/build.log" || true
+            ls -l out || true
+            echo "first and last disk samples (epoch used_kib avail_kib):"
+            head -n 1 "$RUNNER_TEMP/df-samples.txt" || true
+            tail -n 1 "$RUNNER_TEMP/df-samples.txt" || true
+            awk 'NF==3 && $2>m {m=$2} END {print "max used_kib=" m}' "$RUNNER_TEMP/df-samples.txt" || true
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the ISO
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: archiso
+          path: |
+            out/archiso.iso
+            out/build-info.json
+          retention-days: 3
+
+      - name: Upload the raw disk image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ais-live-image
+          path: out/ais-live.img
+          retention-days: 3
+          compression-level: 6
+
+  # Boots the raw image under QEMU with SeaBIOS (bios) and OVMF (uefi).
+  boot-test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        firmware: [bios, uefi]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install boot-test tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq expect mtools python3 qemu-system-x86 ovmf
+
+      # The hosted runner exposes /dev/kvm but not to the runner user.
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ais-live-image
+          path: out
+
+      - name: Boot (${{ matrix.firmware }})
+        env:
+          FIRMWARE: ${{ matrix.firmware }}
+        run: |
+          set -euo pipefail
+          image/test/run-qemu.sh out/ais-live.img "$FIRMWARE"
+
+      # Negative scenario for both firmwares: a reboot after the poweroff
+      # acknowledgement must fail the harness.
+      - name: Reboot after acknowledgement is rejected
+        if: matrix.firmware == 'bios'
+        run: |
+          set -euo pipefail
+          bash image/test/reboot-after-ack.sh out/ais-live.img
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: serial-${{ matrix.firmware }}
+          path: |
+            out/qemu-*/serial.log
+            out/qemu-*/qmp.log
+            out/qemu-*/qmp-shutdown.json
+          retention-days: 3
+          if-no-files-found: warn
+
+  # Always reports, so a required check never hangs on skipped jobs.
+  gate:
+    needs: [changes, build, boot-test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail when a needed job failed or was cancelled
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          BUILD: ${{ needs.build.result }}
+          BOOT: ${{ needs.boot-test.result }}
+        run: |
+          set -euo pipefail
+          [ "$CHANGES" = "success" ] || exit 1
+          case "$BUILD" in success|skipped) ;; *) exit 1 ;; esac
+          case "$BOOT" in success|skipped) ;; *) exit 1 ;; esac

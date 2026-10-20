@@ -414,8 +414,8 @@ src/
                             backup's (scripts/backup.ts), so the two can't
                             silently drift apart
 scripts/
-  backup.ts            mirrors every real config dir into a single persistent
-                       git repo at ~/.ais/backups and commits whatever changed
+  backup.ts            snapshots every real config dir into a git-only repo
+                       at ~/.ais/backups/.git (work tree $HOME) and commits whatever changed
                        see "~/.ais: one consolidated root" below; optionally
                        pushes it off-host (~/.ais/config/backup.json)
   migrate.ts            one-time, interactive, moves existing dirs into identities/<name>/

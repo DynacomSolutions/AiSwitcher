@@ -3,6 +3,8 @@ import type { ToolConfig } from "../identities/types.ts";
 export interface SyncConfig {
   version: 2;
   remotes: string[];
+  /** Minimum minutes between automatic runs (default 10; 0 disables). */
+  minIntervalMinutes?: number;
 }
 
 export type SyncDirection = "pull" | "push" | "both";
@@ -30,4 +32,8 @@ export interface SyncRunResult {
   pulled: string[];
   pushed: string[];
   skipped: boolean;
+  preservedConflicts: number;
+  preservedConflictPaths: string[];
+  /** Logs skipped because a native process owns them; re-staged next run. */
+  busyPaths: string[];
 }

@@ -9,9 +9,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 33
 - `bun run build`: `bun build --compile` all eight proxy entrypoints (`claude`,
   `codex`, `grok`, `kimi`, `zai`, `ali`, `pi`, `opencode`) plus `open`
   (darwin only), `ais`, and the installer into `dist/`.
-- `bun run backup` — mirrors `~/.claude`, `~/.claude-identity-a`,
+- `bun run backup` — snapshots `~/.claude`, `~/.claude-identity-a`,
   `~/.claude-personal`, `~/.codex`, `~/.grok`, `~/.kimi-code`, `~/.zai`,
-  `~/.ali`, `~/.pi`, and `~/.opencode` into the persistent git-managed repo at `~/.ais/backups` and
+  `~/.ali`, `~/.pi`, and `~/.opencode` into the git-only repo at `~/.ais/backups/.git` (work tree `$HOME`, no plain copy) and
   commits whatever changed since the last backup (see "~/.ais: one
   consolidated root" above).
 - `bun run migrate` — **one-time, destructive.** Restructures the real

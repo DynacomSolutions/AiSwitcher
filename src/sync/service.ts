@@ -14,8 +14,10 @@ import {
   buildSyncFilterArgs,
   runRsync,
   CRUSH_BACKED_TOOL_CONFIGS,
+  REMOTE_LOW_PRIORITY,
   SYNC_TOOL_CONFIGS,
 } from "./rsync.ts";
+import { pruneStaging } from "./staging.ts";
 import {
   createCrushSnapshotTree,
   loadCrushSnapshotManifest,
@@ -139,7 +141,7 @@ function safeHostSegment(host: string): string {
 }
 
 async function runRemoteAis(host: string, args: string[]): Promise<string> {
-  const proc = Bun.spawn(["ssh", ...SSH_ARGS, host, REMOTE_AIS, ...args], {
+  const proc = Bun.spawn(["ssh", ...SSH_ARGS, host, `${REMOTE_LOW_PRIORITY} ${REMOTE_AIS}`, ...args], {
     stdout: "pipe",
     stderr: "pipe",
     env: process.env,
@@ -189,26 +191,36 @@ function parseRemoteSnapshot(raw: string, host: string): RemoteSnapshotResponse 
 async function pullCrushSnapshots(host: string, home: string): Promise<void> {
   const remote = parseRemoteSnapshot(await runRemoteAis(host, ["sync", "snapshot-zai"]), host);
   const localRoot = join(aisRemoteCacheDir(home), "sqlite-incoming", `${safeHostSegment(host)}-${remote.snapshotId}`);
-  await mkdir(localRoot, { recursive: true });
-  const pulled = await runRsync(host, "pull", buildCrushSnapshotFilterArgs(remote.databases), home, {
-    localRoot,
-    remoteRoot: `${AIS_REMOTE_CACHE_REL}/sqlite-snapshots/${remote.snapshotId}`,
-  });
-  if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
-  const manifest = await loadCrushSnapshotManifest(localRoot);
-  await mergeCrushSnapshotTree(manifest, home);
+  try {
+    await mkdir(localRoot, { recursive: true });
+    const pulled = await runRsync(host, "pull", buildCrushSnapshotFilterArgs(remote.databases), home, {
+      localRoot,
+      remoteRoot: `${AIS_REMOTE_CACHE_REL}/sqlite-snapshots/${remote.snapshotId}`,
+    });
+    if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
+    const manifest = await loadCrushSnapshotManifest(localRoot);
+    await mergeCrushSnapshotTree(manifest, home);
+  } finally {
+    await rm(localRoot, { recursive: true, force: true });
+    // Best effort: the remote also prunes stale staging on every profile merge.
+    await runRemoteAis(host, ["sync", "drop-zai-snapshot", remote.snapshotId]).catch(() => undefined);
+  }
 }
 
 async function pushCrushSnapshots(host: string, home: string): Promise<void> {
   const snapshotId = crypto.randomUUID();
   const localRoot = join(aisRemoteCacheDir(home), "sqlite-snapshots", snapshotId);
-  const manifest = await createCrushSnapshotTree(localRoot, home);
-  const pushed = await runRsync(host, "push", buildCrushSnapshotFilterArgs(manifest.databases), home, {
-    localRoot,
-    remoteRoot: `${AIS_REMOTE_CACHE_REL}/sqlite-incoming/${snapshotId}`,
-  });
-  if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
-  await runRemoteAis(host, ["sync", "merge-zai-snapshot", snapshotId]);
+  try {
+    const manifest = await createCrushSnapshotTree(localRoot, home);
+    const pushed = await runRsync(host, "push", buildCrushSnapshotFilterArgs(manifest.databases), home, {
+      localRoot,
+      remoteRoot: `${AIS_REMOTE_CACHE_REL}/sqlite-incoming/${snapshotId}`,
+    });
+    if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
+    await runRemoteAis(host, ["sync", "merge-zai-snapshot", snapshotId]);
+  } finally {
+    await rm(localRoot, { recursive: true, force: true });
+  }
 }
 
 function scopeArgs(scope: SyncScope): string[] {
@@ -238,7 +250,10 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
   const includeDatabases = options.includeDatabases ?? true;
   const home = homedir();
   const config = await loadSyncConfig();
-  const result: SyncRunResult = { remotes: config.remotes, pulled: [], pushed: [], skipped: false };
+  const result: SyncRunResult = {
+    remotes: config.remotes, pulled: [], pushed: [], skipped: false,
+    preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [],
+  };
   if (config.remotes.length === 0) return result;
 
   const release = await acquireSyncLock(options.waitForLock ?? false);
@@ -246,6 +261,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
 
   const errors: Error[] = [];
   try {
+    await pruneStaging({ home });
     // Portability is a transport invariant, not a one-off migration. Run it
     // before either direction so no host can export an absolute username.
     await makeSyncStatePortable(scope, home);
@@ -277,7 +293,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           });
           if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
 
-          await mergeIncomingProfileTree(incomingDir, scope, {
+          const merged = await mergeIncomingProfileTree(incomingDir, scope, {
             home,
             conflictRoot: join(
               aisRemoteCacheDir(home),
@@ -285,14 +301,24 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
               `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
             ),
           });
+          result.preservedConflicts += merged.preservedConflicts;
+          result.preservedConflictPaths = [...new Set([...result.preservedConflictPaths, ...merged.preservedConflictPaths])];
+          result.busyPaths = [...new Set([...result.busyPaths, ...merged.busyPaths])];
+          if (merged.busyPaths.length > 0 && !options.quiet) {
+            console.warn(`AIS sync deferred ${merged.busyPaths.length} log(s) still open in a running tool: ${merged.busyPaths.join(", ")}. They sync on the next run.`);
+          }
+          if (merged.preservedConflicts > 0 && !options.quiet) {
+            console.warn(`AIS sync preserved ${merged.preservedConflicts} conflict(s), including deferred imports: ${merged.preservedConflictPaths.join(", ")}. Run ais sync recover to retry retained histories.`);
+          }
           for (const cfg of scope.kind === "all" ? SYNC_TOOL_CONFIGS : [scope.cfg]) {
             await makeRegistryPortable(cfg, home);
           }
           await makeSyncStatePortable(scope, home);
-          await rm(incomingDir, { recursive: true, force: true });
           result.pulled.push(host);
         } catch (err) {
           errors.push(err instanceof Error ? err : new Error(String(err)));
+        } finally {
+          await rm(incomingDir, { recursive: true, force: true });
         }
       }
     }
