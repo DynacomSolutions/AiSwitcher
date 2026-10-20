@@ -242,7 +242,12 @@ PY
   check_pattern /dev/vdb "$pattern_vdb" || return 1
   reset_guard || return 1
   start_guarded right-target dd if=/dev/zero of=/dev/vdb bs=1 seek=4096 count=16 status=none || return 1
-  wait "$GUARDED_PID" || return 1
+  if ! wait "$GUARDED_PID"; then
+    mark right-target refused
+    guard_diag
+    runuser -u live -- env HERDR_SOCKET_PATH="$GUARD_HERDR_SOCKET" herdr pane read --source recent --lines 20 --format text "$GUARD_POPUP_PANE" 2>&1 | sed 's/^/AIS-GUARD-DIAG: pane: /'
+    return 1
+  fi
   dd if=/dev/vdb of="$TEST_ROOT/actual" bs=1 skip=4096 count=16 status=none
   dd if=/dev/zero of="$TEST_ROOT/expected" bs=1 count=16 status=none
   cmp -s "$TEST_ROOT/actual" "$TEST_ROOT/expected" || return 1

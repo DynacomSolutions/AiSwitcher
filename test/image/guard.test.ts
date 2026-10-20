@@ -580,6 +580,10 @@ assert 'RuntimeMaxSec=1800' in runs[1][0]
     expect(src).toContain('threading.Timer(30,p.kill)');
   });
 
+  test('the confirmation opens focused so typed keys reach it, not the agent pane', () => {
+    expect(daemon).toContain("'--placement','overlay','--focus'");
+  });
+
   test('all listed commands have executable PATH wrapper links wired by image profile', () => {
     expect(readFileSync(join(root, 'ais-guard-table'), 'utf8')).toContain('dd destructive');
   });

@@ -108,7 +108,7 @@ def _popup(command,devs,expected,timeout):
         # The nonce is visible in the transient unit's properties; replies are still bound to live by SO_PEERCRED.
         opened=subprocess.run(['/usr/bin/systemd-run','--uid=live','--gid=live','--wait','--pipe','--collect','--quiet','-p','RuntimeMaxSec=15',
             '--setenv=PATH=/usr/bin:/bin','--setenv=HOME='+home,'--setenv=XDG_RUNTIME_DIR=/run/user/'+str(live_uid),'--setenv=HERDR_SOCKET_PATH='+herdr_socket(live_uid),
-            '--','/usr/local/bin/herdr','plugin','pane','open','--plugin','ais-guard','--entrypoint','confirm','--placement','overlay','--env','AIS_GUARD_NONCE='+nonce,'--env','AIS_GUARD_REQ='+rid],
+            '--','/usr/local/bin/herdr','plugin','pane','open','--plugin','ais-guard','--entrypoint','confirm','--placement','overlay','--focus','--env','AIS_GUARD_NONCE='+nonce,'--env','AIS_GUARD_REQ='+rid],
             env={'PATH':'/usr/bin:/bin'},stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=min(15,max(1,deadline-time.monotonic())),check=False)
         if opened.returncode!=0:
             # Log herdr's own reason (never the argv, which carries the nonce) so a failed popup is diagnosable.
