@@ -21,7 +21,7 @@ live_uid=$(/usr/bin/id -u live)
 runtime_dir="/run/user/$live_uid"
 [[ -d "$runtime_dir" && ! -L "$runtime_dir" ]] || fail runtime-directory
 [[ "$(/usr/bin/stat -c '%u:%a' "$runtime_dir")" == "$live_uid:700" ]] || fail runtime-directory-mode
-for _ in {1..40}; do
+for _ in {1..120}; do
   [[ -S "$runtime_dir/herdr.sock" ]] && break
   /usr/bin/sleep 0.25
 done
@@ -103,7 +103,7 @@ $herdr pane split --direction right --ratio 0.5 --no-focus >/dev/null 2>&1 || fa
 
 agent_pane=false
 agent_uid=$(/usr/bin/id -u agent)
-for _ in {1..40}; do
+for _ in {1..120}; do
     snapshot=$($herdr api snapshot 2>/dev/null) || { /usr/bin/sleep 0.25; continue; }
     new_ids=$(/usr/bin/python3 -c '
 import json,sys

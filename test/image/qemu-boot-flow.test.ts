@@ -303,7 +303,7 @@ describe("QEMU boot flow driver", () => {
     const bootFlowMedia = mediaBuilder.split("  boot-flow)")[1]?.split("  guard)")[0] ?? "";
     expect(bootFlowMedia).not.toContain("orchestrator");
     expect(bootFlowMedia).not.toContain("exchange-orchestrator");
-    expect(checks).toContain("for _ in {1..40}");
+    expect(checks).toContain("for _ in {1..120}");
     expect(agentChecks).toContain("web_started=true\nif ! /usr/bin/ais web start >/dev/null; then");
     expect(agentChecks).toContain("/usr/bin/ais web status >&2 || true");
     expect(agentChecks).not.toContain("/usr/bin/ais web --foreground");
