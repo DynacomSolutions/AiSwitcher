@@ -2,7 +2,7 @@
 use ais_host_core::{
     fetch::{FetchError, Http, fetch_verified},
     file_test::SyntheticRelease,
-    release::{ImageVerifier, TrustError},
+    release::ImageVerifier,
 };
 use std::{collections::BTreeMap, io::Write};
 
@@ -74,9 +74,8 @@ fn altered_checksums_are_fatal() {
 }
 
 #[test]
-fn the_placeholder_production_key_fails_closed() {
-    let verifier = ImageVerifier::bundled();
-    assert!(matches!(verifier, Err(TrustError::ContractUnavailable)));
+fn the_bundled_production_key_decodes() {
+    assert!(ImageVerifier::bundled().is_ok());
 }
 
 #[test]

@@ -520,8 +520,7 @@ fn source_helper_mount_publish_and_eject_failures_never_register_a_drive() {
 }
 
 #[test]
-fn placeholder_release_key_still_blocks_the_write_step_before_launch() {
-    assert!(ImageVerifier::bundled().is_err());
+fn missing_helper_blocks_the_write_step_before_launch() {
     let (session, device, preview_id) = session_with_fixture();
     let now = Instant::now();
     session

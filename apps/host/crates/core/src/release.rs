@@ -230,10 +230,9 @@ enum ReviewedLayout {
     LiveX86_64GptV1,
 }
 
-/// PLACEHOLDER: the production minisign public key is `image/release-key.pub`,
-/// created by the B image-release task. While that file is absent the bundled
-/// key is empty, `ImageVerifier::bundled` fails closed, and `build.rs` refuses
-/// to compile a release profile unless a developer sets this variable.
+/// The production minisign public key is `image/release/minisign.pub`. If that
+/// file is absent the bundled key is empty, `ImageVerifier::bundled` fails
+/// closed, and `build.rs` refuses a release profile unless this variable is set.
 pub const PLACEHOLDER_KEY_OVERRIDE_ENV: &str = "AIS_ALLOW_PLACEHOLDER_RELEASE_KEY";
 
 impl ImageVerifier {

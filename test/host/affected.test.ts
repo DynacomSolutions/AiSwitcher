@@ -21,7 +21,7 @@ describe("host dependency selection", () => {
     expect(affectedHostChecks(["apps/host/src/App.tsx", "apps/other/unknown.txt"])).toEqual(["all"]);
     expect(affectedHostChecks(["src/sync/service.ts"])).toEqual(["all"]);
     expect(affectedHostChecks(["src/live/dispatch.ts"])).toEqual(["all"]);
-    expect(affectedHostChecks(["image/release-key.pub"])).toEqual(["all"]);
+    expect(affectedHostChecks(["image/release/minisign.pub"])).toEqual(["all"]);
     expect(affectedHostChecks(["apps/web/pnpm-lock.yaml"])).toEqual(["all"]);
     expect(affectedHostChecks(["apps/host/bun.lock"])).toEqual(["all"]);
     expect(affectedHostChecks(["Cargo.lock"])).toEqual(["all"]);

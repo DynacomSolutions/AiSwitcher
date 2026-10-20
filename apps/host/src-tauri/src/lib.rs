@@ -885,7 +885,7 @@ impl HelperLauncher for NativeHelper {
 }
 
 /// Writes are offered only when the root-owned helper package verifies and the
-/// bundled production release key exists. The placeholder key keeps this off.
+/// bundled production release key decodes.
 fn native_write_support() -> ais_host_core::device::WriteSupport {
     let key_present = ais_host_core::release::ImageVerifier::bundled().is_ok();
     #[cfg(target_os = "linux")]

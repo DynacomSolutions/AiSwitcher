@@ -2,7 +2,7 @@ use std::{env, fs, path::PathBuf};
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let anchor = manifest_dir.join("../../../../image/release-key.pub");
+    let anchor = manifest_dir.join("../../../../image/release/minisign.pub");
     println!("cargo:rerun-if-changed={}", anchor.display());
     let value = match fs::read_to_string(&anchor) {
         Ok(value) => value,
@@ -14,7 +14,7 @@ fn main() {
                 && env::var_os(OVERRIDE).is_none()
             {
                 panic!(
-                    "image/release-key.pub is missing: refusing to build a release with the placeholder production minisign key"
+                    "image/release/minisign.pub is missing: refusing to build a release with the placeholder production minisign key"
                 );
             }
             String::new()

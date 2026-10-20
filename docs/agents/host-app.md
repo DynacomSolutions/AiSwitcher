@@ -101,9 +101,8 @@ and release trust anchor. The Linux final stages, `service::write_confirmed`
 and `service::create_confirmed`, share the retained-target writer with the
 regular-file tests; no test target is a device node.
 
-The production minisign public key is `image/release-key.pub`, created by the B
-image-release task. Until it exists the bundled key is empty (placeholder), the
-image verifier fails closed, and `crates/core/build.rs` refuses a release-profile
+The production minisign public key is `image/release/minisign.pub`. If it is
+missing the bundled key is empty, the image verifier fails closed, and `crates/core/build.rs` refuses a release-profile
 build unless `AIS_ALLOW_PLACEHOLDER_RELEASE_KEY` is set for development.
 
 ## Create flow
