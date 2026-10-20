@@ -177,6 +177,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             exfatprogs libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev \
             libssl-dev libdbus-1-dev pkg-config
+          # The package installs into an sbin directory the test process may not have on PATH.
+          mkfs=$(dpkg -L exfatprogs | grep -m1 '/mkfs\.exfat$')
+          echo "AIS_HOST_TEST_EXFAT_TOOLS=$(dirname "$mkfs")" >> "$GITHUB_ENV"
 
       # rust-toolchain.toml pins the toolchain and its components; rustup installs them on first use.
       - name: Clippy
