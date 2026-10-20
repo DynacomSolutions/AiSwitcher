@@ -51,6 +51,11 @@ PERSIST_DISK_DEV=$identity_dev
 
 _persist_find_device || _persist_die_ambiguous
 { [ "$PERSIST_DISKSEQ" = "$identity_diskseq" ] && [ "$PERSIST_DISK_DEV" = "$identity_dev" ] && [ "$PERSIST_DISK_SYSFS" = "$identity_sysfs" ]; } || _persist_die 'Boot disk changed since initramfs identity verification.'
+# Initramfs already bound the firmware UUID before randomisation. Its root-only
+# runtime record contains the resulting UUIDs; the kernel command line still
+# contains the original ESP UUID on the first boot.
+# shellcheck disable=SC2034 # Read by the sourced _persist_verify_gpt function.
+PERSIST_BOOT_PARTUUID=${identity_guid_rows[2]}
 _persist_verify_gpt || _persist_die 'Boot disk GPT does not match the trusted image manifest.'
 _persist_verify_gpt || _persist_die 'Boot disk identity changed during verification.'
 [ "$PERSIST_GUID_SNAPSHOT" = "$(printf '%s\n' "$identity_guids" | tr ',' '\n')" ] || _persist_die 'Boot disk GPT identifiers changed since initramfs verification.'
@@ -62,18 +67,26 @@ row=$(printf '%s\n' "$PERSIST_GPT_DUMP" | awk -F '\t' '$1=="part" && $2==4 {prin
 if [ "$mode" = persist ]; then
     [ "$PERSIST_P5_PRESENT" -eq 1 ] || exit 1
     _persist_refresh_part_node 5 || exit 1
-    printf '%s\n' "$PERSIST_RESOLVED_PART"
-    exit 0
+    # Run the guest diagnostic while fd 8 is held. A /proc/self/fd path cannot
+    # be passed back to a parent process after this resolver exits.
+    cryptsetup isLuks "$PERSIST_RESOLVED_PART" || exit 1
+    cryptsetup luksDump "$PERSIST_RESOLVED_PART" || exit 1
+    _persist_check_diskseq && _persist_refresh_part_node 5
+    exit $?
 fi
 
 _persist_refresh_part_node 4 || _persist_die 'Could not freshly resolve the exchange partition.'
 if mountpoint -q /mnt/aisx; then
-    mounted_source=$(findmnt -n -o SOURCE /mnt/aisx) || _persist_die 'Could not identify the mounted exchange partition.'
-    [ "$(readlink -f "$mounted_source")" = "$(readlink -f "$PERSIST_RESOLVED_PART")" ] || _persist_die 'Mounted exchange partition does not match the verified boot disk.'
+    mounted_dev=$(findmnt -n -o MAJ:MIN /mnt/aisx) || _persist_die 'Could not identify the mounted exchange partition.'
+    held_dev=$(stat -Lc '%t:%T' "$PERSIST_RESOLVED_PART") || exit 1
+    held_dev=$(printf '%d:%d' "0x${held_dev%%:*}" "0x${held_dev#*:}") || exit 1
+    if [ "$mounted_dev" != "$held_dev" ] || ! _persist_check_diskseq; then
+        _persist_die 'Mounted exchange partition does not match the verified boot disk.'
+    fi
     exit 0
 fi
 mkdir -p /mnt/aisx
-mount -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$PERSIST_RESOLVED_PART" /mnt/aisx || exit 1
+_persist_write mount --no-canonicalize -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$PERSIST_RESOLVED_PART" /mnt/aisx || exit 1
 if ! _persist_check_diskseq || ! _persist_verify_gpt || ! _persist_refresh_part_node 4; then
     umount /mnt/aisx 2>/dev/null || true
     _persist_die 'Exchange partition identity changed during mount.'

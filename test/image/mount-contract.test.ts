@@ -77,7 +77,7 @@ describe("persistent image mount contract", () => {
     expect(service).not.toContain("What=");
     expect(resolver).toContain("_persist_find_device");
     expect(resolver).toContain("_persist_refresh_part_node 4");
-    expect(resolver).toContain('mount -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$PERSIST_RESOLVED_PART" /mnt/aisx');
+    expect(resolver).toContain('_persist_write mount --no-canonicalize -t exfat -o rw,uid=0,gid=0,dmask=0077,fmask=0177,nosuid,nodev,noexec "$PERSIST_RESOLVED_PART" /mnt/aisx');
     expect(resolver).toContain("! _persist_check_diskseq || ! _persist_verify_gpt || ! _persist_refresh_part_node 4");
     expect(resolver).not.toContain("PERSIST_EXCHANGE_PART");
     expect(hook).toContain("_persist_refresh_part_node 4");

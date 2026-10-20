@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -61,22 +61,22 @@ describe("persist build contracts", () => {
     expect(existsSync(join(profile, "airootfs/etc/ais-live/agent-ids"))).toBe(false);
   });
 
-  test("profile embeds the account's non-default numeric IDs", () => {
-    const profile = join(root, "build/profile-with-accounts");
-    mkdirSync(join(profile, "airootfs/etc"), { recursive: true });
-    cpSync(resolve("image/archiso/profiledef.sh"), join(profile, "profiledef.sh"));
-    cpSync(resolve("image/archiso/persist-contracts.sh"), join(profile, "persist-contracts.sh"));
-    writeFileSync(join(profile, "airootfs/etc/passwd"), "root:x:0:0:root:/var/empty/root:/bin/bash\nagent:x:2501:2502:Agent:/var/empty/agent:/bin/bash\n");
-    writeFileSync(join(profile, "airootfs/etc/group"), "root:x:0:\nagent:x:2502:\n");
-    mkdirSync(join(profile, "airootfs/etc/systemd/system/local-fs.target.wants"), { recursive: true });
-    writeFileSync(join(profile, "airootfs/etc/systemd/system/ais-live-exchange.service"), "SYNTHETIC_FIXTURE\n");
-    symlinkSync("../mnt-aisx.mount", join(profile, "airootfs/etc/systemd/system/local-fs.target.wants/mnt-aisx.mount"));
-
+  test("the real build preparation supplies accounts and the compiled recovery gate before profile generation", () => {
+    const profile = join(root, "build/production-profile");
+    cpSync(resolve("image/archiso"), profile, { recursive: true });
+    const prepared = run(["bash", join(profile, "prepare-profile.sh"), profile]);
+    expect(prepared.exitCode, prepared.stderr.toString()).toBe(0);
     const result = run(["bash", join(profile, "profiledef.sh")], { SOURCE_DATE_EPOCH: "1792368000" });
-    expect(result.exitCode).toBe(0);
-    expect(readFileSync(join(profile, "airootfs/etc/ais-live/agent-ids"), "utf8")).toBe("uid=2501\ngid=2502\n");
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(readFileSync(join(profile, "airootfs/etc/ais-live/agent-ids"), "utf8")).toBe("uid=1001\ngid=1001\n");
+    expect(readFileSync(join(profile, "airootfs/etc/passwd"), "utf8")).toContain("agent:x:1001:1001:");
+    expect(readFileSync(join(profile, "airootfs/etc/group"), "utf8")).toContain("agent:x:1001:");
+    expect(readFileSync(join(profile, "airootfs/etc/shadow"), "utf8")).toContain("agent:!:");
+    expect(run([join(profile, "airootfs/usr/local/bin/ais-gpt-check")]).stderr.toString()).toContain("usage: ais-gpt-check");
     expect(readlinkSync(join(profile, "airootfs/etc/systemd/system/multi-user.target.wants/ais-live-exchange.service"))).toBe("../ais-live-exchange.service");
-    expect(existsSync(join(profile, "airootfs/etc/systemd/system/local-fs.target.wants/mnt-aisx.mount"))).toBe(false);
+    const build = readFileSync("image/build/build.sh", "utf8");
+    expect(build.indexOf("in_root bash /build/profile/prepare-profile.sh")).toBeLessThan(build.indexOf("in_root mkarchiso"));
+    expect(run(["bash", join(profile, "prepare-profile.sh"), profile]).exitCode).not.toBe(0);
   });
 
   test("gpt-layout is rendered from the assembled image's actual partition table", () => {

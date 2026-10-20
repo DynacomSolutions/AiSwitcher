@@ -14,7 +14,7 @@ out=$(realpath -m -- "$2")
 [[ -f $source_path || -d $source_path ]] || die 'source must be a regular ISO or directory'
 [[ ! -e $out && ! -L $out ]] || die 'output already exists'
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for tool in sfdisk mkfs.fat mcopy mke2fs mkfs.exfat syslinux grub-mkstandalone dd; do
+for tool in sfdisk jq mkfs.fat mcopy mke2fs mkfs.exfat syslinux grub-mkstandalone dd; do
     command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 
@@ -75,6 +75,7 @@ start=$exchange_start, size=$exchange_sectors, type=EBD0A0A2-B9E5-4433-87C0-68B6
 EOF
 
 mkdir -p "$work/esp/arch/boot/x86_64" "$work/esp/syslinux" "$work/esp/boot/grub" "$work/esp/EFI/BOOT" "$work/base/arch/x86_64"
+bash "$here/../archiso/persist-contracts.sh" gpt-layout "$out" "$work/base/ais-live/gpt-layout" "$work/gpt-layout.json"
 cp "$kernel" "$initrd" "$work/esp/arch/boot/x86_64/"
 cp "$tree/arch/x86_64/"* "$work/base/arch/x86_64/"
 cp "${modules[@]}" "$work/esp/syslinux/"
@@ -83,7 +84,7 @@ cp "$here/../archiso/grub/raw.cfg" "$work/esp/boot/grub/grub.cfg"
 grub_args=()
 if [[ -n ${AIS_GRUB_MODULE_DIR:-} ]]; then grub_args+=(-d "$AIS_GRUB_MODULE_DIR"); fi
 grub-mkstandalone "${grub_args[@]}" -O x86_64-efi --locales='' --fonts='' \
-    --modules='part_gpt fat search search_label configfile linux normal serial' \
+    --modules='part_gpt fat probe regexp configfile linux normal serial halt' \
     -o "$work/esp/EFI/BOOT/BOOTX64.EFI" "boot/grub/grub.cfg=$here/../archiso/efiboot/grub.cfg"
 
 truncate -s "$((esp_sectors * 512))" "$work/esp.img"

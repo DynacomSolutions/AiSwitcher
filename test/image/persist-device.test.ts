@@ -46,7 +46,7 @@ function ambiguityHarness(name: string, disks: Array<{ seq: string; fixture: Ret
   const bin = join(dir, "bin");
   const sysblock = join(dir, "sys-block");
   const devices = join(dir, "devices");
-  const bySeq = join(dir, "by-diskseq");
+  const bySeq = join(dir, "block-nodes");
   const devBlock = join(dir, "dev-block");
   const bootmnt = join(dir, "bootmnt");
   mkdirSync(bin, { recursive: true });
@@ -64,13 +64,13 @@ function ambiguityHarness(name: string, disks: Array<{ seq: string; fixture: Ret
     writeFileSync(join(sysdir, "dev"), `8:${index * 16}\n`);
     mkdirSync(join(sysdir, "device"), { recursive: true });
     Bun.spawnSync(["ln", "-sfn", sysdir, join(devBlock, `8:${index * 16}`)]);
-    const diskAlias = join(bySeq, item.seq);
+    const diskAlias = join(bySeq, `8:${index * 16}`);
     Bun.spawnSync(["ln", "-sfn", item.fixture.disk, diskAlias]);
     aliases.push(diskAlias);
     for (let partition = 1; partition <= 4; partition++) {
       const node = join(devices, `disk-${item.seq}-part${partition}`);
       writeFileSync(node, "SYNTHETIC_FIXTURE_partition-node");
-      Bun.spawnSync(["ln", "-sfn", node, `${diskAlias}-part${partition}`]);
+      Bun.spawnSync(["ln", "-sfn", node, join(bySeq, `8:${index * 16 + partition}`)]);
       const child = join(sysdir, `sd${String.fromCharCode(97 + index)}${partition}`);
       mkdirSync(child, { recursive: true });
       writeFileSync(join(child, "partition"), `${partition}\n`);
@@ -78,14 +78,14 @@ function ambiguityHarness(name: string, disks: Array<{ seq: string; fixture: Ret
       Bun.spawnSync(["ln", "-sfn", child, join(devBlock, `8:${index * 16 + partition}`)]);
     }
   }
-  const source = `${aliases[0]}-part3`;
+  const source = join(bySeq, "8:3");
   writeFileSync(join(bin, "findmnt"), `#!/bin/sh\nprintf '%s\\n' '${source}'\n`);
   const statCases = disks.map((item, index) => [
-    `    '${bySeq}/${item.seq}') printf '8:${(index * 16).toString(16)}\\n' ;;`,
-    ...[1, 2, 3, 4].map((partition) => `    '${bySeq}/${item.seq}-part${partition}') printf '8:${(index * 16 + partition).toString(16)}\\n' ;;`),
+    `    '${bySeq}/8:${index * 16}') printf '8:${(index * 16).toString(16)}\\n' ;;`,
+    ...[1, 2, 3, 4].map((partition) => `    '${bySeq}/8:${index * 16 + partition}') printf '8:${(index * 16 + partition).toString(16)}\\n' ;;`),
   ].join("\n")).join("\n");
   writeFileSync(join(bin, "stat"), `#!/bin/sh\n[ "$1" = -Lc ] && [ "$2" = '%t:%T' ] || exec /usr/bin/stat "$@"\ncase "$3" in\n${statCases}\n    *) exit 1 ;;\nesac\n`);
-  writeFileSync(join(bin, "blkid"), `#!/bin/sh\nflag= node=\nwhile [ "$#" -gt 0 ]; do case "$1" in -s) flag=$2; shift 2;; -o) shift 2;; -p|-c) shift;; *) node=$1; shift;; esac; done\ncase "$flag:$node" in\n  LABEL:*${disks[1]?.seq}*) value='${disks[1]?.label ?? ""}' ;;\n  LABEL:*) value=AISBASE ;;\n  TYPE:*${disks[1]?.seq}*) value='${disks[1]?.fstype ?? (disks[1]?.label === "AISBASE" ? "ext4" : "")}' ;;\n  TYPE:*) value=vfat ;;\n  *) exit 3 ;;\nesac\n[ -n "$value" ] || exit 2\nprintf '%s\\n' "$value"\n`);
+  writeFileSync(join(bin, "blkid"), `#!/bin/sh\nflag= node=\nwhile [ "$#" -gt 0 ]; do case "$1" in -s) flag=$2; shift 2;; -o) shift 2;; -p|-c) shift;; *) node=$1; shift;; esac; done\ncase "$flag:$node" in\n  LABEL:*:1[6-9]|LABEL:*:20) value='${disks[1]?.label ?? ""}' ;;\n  LABEL:*) value=AISBASE ;;\n  TYPE:*:1[6-9]|TYPE:*:20) value='${disks[1]?.fstype ?? (disks[1]?.label === "AISBASE" ? "ext4" : "")}' ;;\n  TYPE:*) value=vfat ;;\n  *) exit 3 ;;\nesac\n[ -n "$value" ] || exit 2\nprintf '%s\\n' "$value"\n`);
   writeFileSync(join(bin, "mount"), `#!/bin/sh\ntarget=\nfor arg do target=$arg; done\nmkdir -p "$target/ais-live"\ncp '${disks[1]?.fixture.manifest}' "$target/ais-live/gpt-layout"\n`);
   writeFileSync(join(bin, "umount"), "#!/bin/sh\nexit 0\n");
   writeFileSync(join(bin, "sfdisk"), `#!/bin/sh\nexec /usr/bin/sfdisk "$@"\n`);
@@ -94,9 +94,9 @@ function ambiguityHarness(name: string, disks: Array<{ seq: string; fixture: Ret
   let sourceText = hookSource
     .replaceAll("/run/archiso/bootmnt", bootmnt)
     .replaceAll("/run/ais-persist-ambiguity-probe", join(dir, "probe"))
-    .replaceAll("/dev/disk/by-diskseq", bySeq)
     .replaceAll("/sys/block/*", `${sysblock}/*`)
     .replaceAll("/sys/dev/block", devBlock)
+    .replaceAll("/dev/block", bySeq)
     .replaceAll('[ -b "$part" ]', '[ -e "$part" ]')
     .replaceAll('[ -b "$PERSIST_PROBE_DISK" ]', '[ -e "$PERSIST_PROBE_DISK" ]');
   const start = sourceText.indexOf("_persist_reject_ambiguous_media() {");
@@ -128,12 +128,12 @@ function validateNode(f: ReturnType<typeof fixture>, changes: Record<string, str
   mkdirSync(join(dir, "by-partuuid"), { recursive: true });
   Bun.spawnSync(["ln", "-sfn", diskNode, diskAlias]);
   Bun.spawnSync(["ln", "-sfn", partNode, partAlias]);
-  const expectedNode = `/dev/disk/by-partuuid/${guids[2]}`;
-  const expectedDisk = "/dev/disk/by-diskseq/73";
+  const expectedNode = join(dir, "by-partuuid", guids[2]);
+  const expectedDisk = diskAlias;
   writeFileSync(join(bin, "readlink"), `#!/bin/sh\ncase "$2" in '${expectedDisk}') printf '%s\\n' '${diskNode}' ;; '${expectedNode}') [ '${existsSync(join(dir, "by-partuuid", guids[2]))}' = true ] || exit 1; printf '%s\\n' '${partNode}' ;; /sys/dev/block/8:5) printf '%s\\n' '${sysdev}' ;; *) exec /usr/bin/readlink "$@" ;; esac\n`);
-  writeFileSync(join(bin, "stat"), `#!/bin/sh\ncase "$2:$3" in %t:${diskNode}) printf '8\\n' ;; %T:${diskNode}) printf '0\\n' ;; %t:${partNode}) printf '8\\n' ;; %T:${partNode}) printf '5\\n' ;; *) exit 1 ;; esac\n`);
-  writeFileSync(join(bin, "blkid"), `#!/bin/sh\n[ "$1" = -p ] && [ "$2" = -c ] && [ "$3" = /dev/null ] && [ "$4" = -s ] && [ "$5" = PART_ENTRY_UUID ] && [ "$6" = -o ] && [ "$7" = value ] && [ "$8" = '${expectedNode}' ] || exit 9\nprintf '%s\\n' '${changes.uuid ?? guids[2]}'\n`);
-  for (const executable of ["readlink", "stat", "blkid"]) chmodSync(join(bin, executable), 0o755);
+  writeFileSync(join(bin, "stat"), `#!/bin/sh\npath=$(/usr/bin/readlink -f "$3") || exit 1\ncase "$2:$path" in %t:${diskNode}) printf '8\\n' ;; %T:${diskNode}) printf '0\\n' ;; %t:${partNode}) printf '8\\n' ;; %T:${partNode}) printf '5\\n' ;; *) exit 1 ;; esac\n`);
+  writeFileSync(join(bin, "sfdisk"), `#!/bin/sh\n[ "$1" = --part-uuid ] && [ "$2" = '${expectedDisk}' ] && [ "$3" = 3 ] || exit 9\nprintf '%s\\n' '${changes.uuid ?? guids[2]}'\n`);
+  for (const executable of ["readlink", "stat", "sfdisk"]) chmodSync(join(bin, executable), 0o755);
   const fnStart = hookSource.indexOf("_persist_validate_node() {");
   const fnEnd = hookSource.indexOf("\n}\n", fnStart) + 3;
   const functionSource = hookSource.slice(fnStart, fnEnd).replaceAll('[ -b "$disk_real" ]', '[ -e "$disk_real" ]').replaceAll('[ -b "$node_real" ]', '[ -e "$node_real" ]');
@@ -172,10 +172,12 @@ function verifyGpt(f: ReturnType<typeof fixture>, manifestPath = f.manifest, cha
   const blockdev = join(bin, "blockdev");
   writeFileSync(blockdev, `#!/bin/sh\n[ "$1" = --getsz ] && [ "$2" = '${f.disk}' ] || exit 9\nprintf '393216\\n'\n`);
   const findmnt = join(bin, "findmnt");
-  writeFileSync(findmnt, `#!/bin/sh\nprintf '%s\\n' '${bootPart}'\n`);
-  for (const executable of [blkid, blockdev, findmnt]) chmodSync(executable, 0o755);
+  writeFileSync(findmnt, `#!/bin/sh\nprintf '8:3\\n'\n`);
+  const stat = join(bin, "stat");
+  writeFileSync(stat, `#!/bin/sh\n[ "$3" = '${bootPart}' ] && printf '8:3\\n'\n`);
+  for (const executable of [blkid, blockdev, findmnt, stat]) chmodSync(executable, 0o755);
   const script = join(dir, "verify.sh");
-  writeFileSync(script, `${fn("_persist_uuid_valid")}\n${fn("_persist_decimal_valid")}\n_persist_check_diskseq(){ return 0; }\n_persist_validate_node(){ return 0; }\n_persist_refresh_part_node(){ PERSIST_RESOLVED_PART='${p4Alias}'; }\n${verify}\nPERSIST_DISK='${f.disk}'\nPERSIST_DISKSEQ=73\nPERSIST_DISK_DEV=8:0\nPERSIST_DISK_SYSFS=/sys/devices/fixture\nPERSIST_ALLOW_P5_NODE_MISSING=0\n_persist_verify_gpt\n`);
+  writeFileSync(script, `${fn("_persist_uuid_valid")}\n${fn("_persist_decimal_valid")}\n_persist_check_diskseq(){ return 0; }\n_persist_validate_node(){ return 0; }\n_persist_refresh_part_node(){ case $1 in 3) PERSIST_RESOLVED_PART='${bootPart}';; 4) PERSIST_RESOLVED_PART='${p4Alias}';; *) return 1;; esac; }\n_persist_no_part5(){ return 0; }\n${verify}\nPERSIST_DISK='${f.disk}'\nPERSIST_DISKSEQ=73\nPERSIST_DISK_DEV=8:0\nPERSIST_DISK_SYSFS=/sys/devices/fixture\nPERSIST_ALLOW_P5_NODE_MISSING=0\nPERSIST_BOOT_PARTUUID='${changedUuid || guids[1]}'\n_persist_verify_gpt\n`);
   return Bun.spawnSync(["bash", script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
 }
 
@@ -205,9 +207,11 @@ function createTransition(name: string, mutation: CreateMutation = "none") {
   const bySeq = join(dir, "by-diskseq");
   const byPart = join(dir, "by-partuuid");
   const devBlock = join(dir, "dev-block");
+  const blockNodes = join(dir, "block-nodes");
   const sysRoot = join(dir, "sys-block");
   const sysdir = join(sysRoot, "sda");
   const partNodes = join(dir, "part-nodes");
+  const mapper = join(dir, "mapper");
   const bootmnt = join(dir, "bootmnt");
   const consolePath = join(dir, "console");
   const uuidFile = join(dir, "uuid");
@@ -216,6 +220,7 @@ function createTransition(name: string, mutation: CreateMutation = "none") {
   mkdirSync(bySeq, { recursive: true });
   mkdirSync(byPart, { recursive: true });
   mkdirSync(devBlock, { recursive: true });
+  mkdirSync(blockNodes, { recursive: true });
   mkdirSync(partNodes, { recursive: true });
   mkdirSync(sysdir, { recursive: true });
   mkdirSync(join(bootmnt, "ais-live"), { recursive: true });
@@ -224,8 +229,16 @@ function createTransition(name: string, mutation: CreateMutation = "none") {
   writeFileSync(uuidFile, "cccccccc-cccc-4ccc-8ccc-cccccccccccc\n");
   writeFileSync(join(sysdir, "diskseq"), "73\n");
   writeFileSync(join(sysdir, "dev"), "8:0\n");
+  const dm = join(sysRoot, "dm-0");
+  mkdirSync(join(dm, "dm"), { recursive: true });
+  mkdirSync(join(dm, "slaves"));
+  writeFileSync(join(dm, "dm/name"), "ais-persist\n");
+  writeFileSync(mapper, "SYNTHETIC_FIXTURE_mapper");
+  Bun.spawnSync(["ln", "-sfn", dm, join(devBlock, "253:0")]);
+  Bun.spawnSync(["ln", "-sfn", join(sysdir, "sda5"), join(dm, "slaves/sda5")]);
   const diskAlias = join(bySeq, "73");
   Bun.spawnSync(["ln", "-sfn", f.disk, diskAlias]);
+  Bun.spawnSync(["ln", "-sfn", f.disk, join(blockNodes, "8:0")]);
   Bun.spawnSync(["ln", "-sfn", sysdir, join(devBlock, "8:0")]);
   const partStart = [...starts];
   const partSize = [...sizes];
@@ -240,9 +253,12 @@ function createTransition(name: string, mutation: CreateMutation = "none") {
     writeFileSync(join(child, "size"), `${partSize[partition - 1]}\n`);
     Bun.spawnSync(["ln", "-sfn", child, join(devBlock, `8:${partition}`)]);
     Bun.spawnSync(["ln", "-sfn", node, `${diskAlias}-part${partition}`]);
+    Bun.spawnSync(["ln", "-sfn", node, join(blockNodes, `8:${partition}`)]);
     Bun.spawnSync(["ln", "-sfn", node, join(byPart, randomizedParts[partition - 1])]);
   }
   if (mutation === "stale-p5") {
+    mkdirSync(join(sysdir, "sda5"));
+    writeFileSync(join(sysdir, "sda5", "partition"), "5\n");
     const stale = join(partNodes, "stale-part5");
     writeFileSync(stale, "SYNTHETIC_FIXTURE_stale_partition_node");
     Bun.spawnSync(["ln", "-sfn", stale, `${diskAlias}-part5`]);
@@ -271,6 +287,7 @@ case " $* " in *" -N 5 "*)
   ln -sfn '${join(sysdir, "sda5")}' '${join(devBlock, "8:5")}'
   ln -sfn "$node" '${join(bySeq, "73-part5")}'
   ln -sfn "$node" "${byPart}/$uuid"
+  ln -sfn "$node" '${join(blockNodes, "8:5")}'
   ;;
 esac
 `;
@@ -280,8 +297,10 @@ esac
 if [ "$1" = -Lc ]; then
   format=$2
   path=$(readlink -f "$3") || exit 1
+  major=8
   case "$path" in
     '${f.disk}') minor=0 ;;
+    '${mapper}') major=253; minor=0 ;;
     '${join(partNodes, "part1")}') minor=1 ;;
     '${join(partNodes, "part2")}') minor=2 ;;
     '${join(partNodes, "part3")}') minor=3 ;;
@@ -290,7 +309,7 @@ if [ "$1" = -Lc ]; then
     *) exit 1 ;;
   esac
   case "$format" in
-    '%t:%T') printf '8:%x\\n' "$minor" ;;
+    '%t:%T') printf '%x:%x\\n' "$major" "$minor" ;;
     '%t') printf '8\\n' ;;
     '%T') printf '%x\\n' "$minor" ;;
     *) exit 1 ;;
@@ -302,12 +321,12 @@ fi
   const blkid = join(bin, "blkid");
   writeFileSync(blkid, `#!/bin/sh
 [ "$1" = -p ] && [ "$2" = -c ] && [ "$3" = /dev/null ] && [ "$4" = -s ] && [ "$5" = PART_ENTRY_UUID ] && [ "$6" = -o ] && [ "$7" = value ] || exit 9
-case "$8" in '${bySeq}/73-part3') /usr/bin/sfdisk --part-uuid '${f.disk}' 3;; '${bySeq}/73-part4') /usr/bin/sfdisk --part-uuid '${f.disk}' 4;; '${bySeq}/73-part5') /usr/bin/sfdisk --part-uuid '${f.disk}' 5;; '${byPart}/'*) printf '%s\\n' "\${8##*/}";; *) exit 2;; esac
+case "$8" in /proc/self/fd/6) /usr/bin/sfdisk --part-uuid '${f.disk}' 3;; /proc/self/fd/7) /usr/bin/sfdisk --part-uuid '${f.disk}' 4;; /proc/self/fd/8) /usr/bin/sfdisk --part-uuid '${f.disk}' 5;; '${byPart}/'*) printf '%s\\n' "\${8##*/}";; *) exit 2;; esac
 `);
   const blockdev = join(bin, "blockdev");
-  writeFileSync(blockdev, `#!/bin/sh\n[ "$1" = --getsz ] && [ "$2" = '${diskAlias}' ] && printf '393216\\n'\n`);
+  writeFileSync(blockdev, `#!/bin/sh\n[ "$1" = --getsz ] && [ "$2" = /proc/self/fd/9 ] && printf '393216\\n'\n`);
   const findmnt = join(bin, "findmnt");
-  writeFileSync(findmnt, `#!/bin/sh\nprintf '%s\\n' '${diskAlias}-part3'\n`);
+  writeFileSync(findmnt, `#!/bin/sh\nprintf '8:3\\n'\n`);
   const keyctl = join(bin, "keyctl");
   writeFileSync(keyctl, `#!/bin/sh
 case "$1" in
@@ -334,7 +353,7 @@ esac
   const executablePaths = [sfdisk, stat, blkid, blockdev, findmnt, keyctl, cryptsetup, mkfs, join(bin, "partx"), ...generic.map((name) => join(bin, name))];
   executablePaths.forEach((path) => chmodSync(path, 0o755));
 
-  const names = ["_persist_uuid_valid", "_persist_decimal_valid", "_persist_check_diskseq", "_persist_validate_node", "_persist_refresh_part_node", "_persist_verify_gpt", "_persist_create"];
+  const names = ["_persist_uuid_valid", "_persist_decimal_valid", "_persist_check_diskseq", "_persist_write", "_persist_no_part5", "_persist_pin_mapper", "_persist_validate_node", "_persist_refresh_part_node", "_persist_verify_gpt", "_persist_create"];
   const functions = names.map((name) => {
     const start = hookSource.indexOf(`${name}() {`);
     const end = hookSource.indexOf("\n}\n", start) + 3;
@@ -345,6 +364,10 @@ esac
     .replaceAll("/dev/disk/by-diskseq", bySeq)
     .replaceAll("/dev/disk/by-partuuid", byPart)
     .replaceAll("/sys/dev/block", devBlock)
+    .replaceAll("/dev/block", blockNodes)
+    .replaceAll("/dev/mapper/ais-persist", mapper)
+    .replaceAll('[ -b "$PERSIST_MAPPER" ]', '[ -e "$PERSIST_MAPPER" ]')
+    .replaceAll('[ -b "$PERSIST_DISK" ]', '[ -e "$PERSIST_DISK" ]')
     .replaceAll("/proc/sys/kernel/random/uuid", uuidFile)
     .replaceAll('[ -b "$resolved" ]', '[ -e "$resolved" ]')
     .replaceAll('[ -b "$boot_part_real" ]', '[ -e "$boot_part_real" ]')
@@ -356,9 +379,11 @@ esac
 _persist_prompt(){ return 0; }
 _persist_find_device(){ _persist_check_diskseq; }
 _persist_die(){ printf '%s\\n' "$*" >&2; exit 99; }
-read(){ reply=$PERSIST_DISK; return 0; }
+read(){ reply=$PERSIST_CONFIRM_DISK; return 0; }
 PERSIST_CONSOLE='${consolePath}'
-PERSIST_DISK='${diskAlias}'
+exec 9<> '${diskAlias}'
+PERSIST_DISK=/proc/self/fd/9
+PERSIST_CONFIRM_DISK='${diskAlias}'
 PERSIST_DISKSEQ=73
 PERSIST_DISK_DEV=8:0
 PERSIST_DISK_SYSFS='${sysdir}'
@@ -419,7 +444,7 @@ describe("persistent disk identity contract", () => {
     expect(duplicateLabel.result.exitCode).not.toBe(0);
   }, 30000);
 
-  test("the production node validator binds blkid UUID, partition geometry, parent diskseq, devno and disk sysfs", () => {
+  test("the production node validator binds the on-disk PARTUUID, partition geometry, parent diskseq, devno and disk sysfs", () => {
     const f = fixture("node-validation");
     expect(validateNode(f).exitCode).toBe(0);
     const mismatches: Array<Record<string, string>> = [
@@ -465,7 +490,12 @@ describe("persistent disk identity contract", () => {
     expect(success.getLog()).toContain("mkfs.btrfs");
     expect(success.currentSourceHashes()).toEqual(success.sourceHashes);
 
-    for (const mutation of ["diskseq", "partuuid"] as const) {
+    const aliasSwap = createTransition("ignored-alias-swap", "partuuid");
+    expect(aliasSwap.result.exitCode, aliasSwap.result.stderr.toString()).toBe(0);
+    expect(aliasSwap.getLog()).toContain("luksFormat");
+    expect(aliasSwap.currentSourceHashes()).toEqual(aliasSwap.sourceHashes);
+
+    for (const mutation of ["diskseq"] as const) {
       const refusal = createTransition(mutation, mutation);
       expect(refusal.result.exitCode, `${mutation}: ${refusal.result.stdout.toString()} ${refusal.result.stderr.toString()}`).not.toBe(0);
       expect(refusal.getLog()).not.toContain("luksFormat");

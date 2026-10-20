@@ -75,7 +75,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xorriso jq expect tcl dosfstools mtools e2fsprogs exfatprogs \
+            xorriso jq expect tcl gcc gdisk dosfstools mtools e2fsprogs exfatprogs \
             syslinux syslinux-common grub-common grub-efi-amd64-bin \
             qemu-system-x86 ovmf
 
@@ -84,7 +84,8 @@ jobs:
           set -euo pipefail
           bun test test/image
           shellcheck -x -P SCRIPTDIR image/build/*.sh image/test/*.sh \
-            image/archiso/profiledef.sh image/archiso/airootfs/usr/local/lib/ais-live/kernel-up
+            image/archiso/*.sh image/archiso/airootfs/etc/initcpio/{hooks,install}/ais_persist \
+            image/archiso/airootfs/usr/local/lib/ais-live/*
 
       # Measured: the standard runner has far more than the build needs, so
       # no preinstalled toolchains are removed. Kept as a record per run.

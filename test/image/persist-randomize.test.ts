@@ -99,17 +99,19 @@ _persist_find_device() {
   printf 'find\\n' >> '${eventLog}'
   _persist_reject_ambiguous_media 73
 }
+_persist_repair_gpt() { return 0; }
 _persist_record_runtime_identity() { printf 'record\\n' >> '${eventLog}'; return 0; }
 _persist_create() { printf 'create\\n' >> '${eventLog}'; return 0; }
 _persist_die() { printf 'die:%s\\n' "$*" >> '${eventLog}'; exit 42; }
 `;
   let source = `# shellcheck disable=SC2034
+${functionSource("_persist_write")}
 ${functionSource("_persist_uuid_valid")}
 ${functionSource("_persist_randomize_gpt")}
 ${options.mode ? `${functionSource("run_latehook")}` : ""}
 ${verifier}
 ${reject}
-PERSIST_DISK='/dev/disk/by-diskseq/73'
+PERSIST_DISK='/proc/self/fd/9'
 PERSIST_DISKSEQ=73
 PERSIST_DISK_SYSFS=/sys/devices/SYNTHETIC_FIXTURE
 PERSIST_DISK_DEV=8:0
@@ -130,7 +132,7 @@ PERSIST_GPT_RELOCATED=0
 }
 
 describe("first-boot GPT randomisation", () => {
-  test("writes generated disk and partition GUIDs through the diskseq alias", () => {
+  test("writes generated disk and partition GUIDs through the held descriptor", () => {
     const h = harness("writes-identities");
     expect(h.result.exitCode, h.result.stderr.toString()).toBe(0);
     const args = readFileSync(h.sgdiskLog, "utf8").trimEnd().split("\n");
@@ -140,7 +142,7 @@ describe("first-boot GPT randomisation", () => {
       "-u", `2:${generated[2]}`,
       "-u", `3:${generated[3]}`,
       "-u", `4:${generated[4]}`,
-      "/dev/disk/by-diskseq/73",
+      "/proc/self/fd/9",
     ]);
     expect(readFileSync(h.eventLog, "utf8")).toContain("udevadm:trigger --subsystem-match=block\nudevadm:settle --timeout=10\n");
   });
@@ -166,7 +168,7 @@ describe("first-boot GPT randomisation", () => {
     const wrong = [generated[0], generated[1], generated[2], generated[3], template[4]].join("\n");
     const h = harness("wrong-post-write", { verifyActual: wrong });
     expect(h.result.exitCode).not.toBe(0);
-    expect(readFileSync(h.sgdiskLog, "utf8")).toContain("/dev/disk/by-diskseq/73");
+    expect(readFileSync(h.sgdiskLog, "utf8")).toContain("/proc/self/fd/9");
   });
 });
 

@@ -19,7 +19,6 @@ ok() {
     printf 'AIS-LIVE: stage=persist-test status=ok phase=%s\n' "$phase"
     systemctl --no-block poweroff
 }
-device=$(/usr/local/lib/ais-live/resolve-boot-partition persist 2>/dev/null || true)
 read -r agent_uid agent_gid < <(awk '
     NR==1 && $0 ~ /^uid=[1-9][0-9]*$/ {uid=substr($0,5); next}
     NR==2 && $0 ~ /^gid=[1-9][0-9]*$/ {gid=substr($0,5); next}
@@ -28,9 +27,7 @@ read -r agent_uid agent_gid < <(awk '
 
 case "$phase" in
     created|wrong-pass|package|verify-package|retry|pick|verify-pick|retention)
-        [[ -n "$device" ]] || fail device
-        cryptsetup isLuks "$device" || fail luks
-        cryptsetup luksDump "$device" > /run/ais-persist-luks-dump || fail luks-dump
+        /usr/local/lib/ais-live/resolve-boot-partition persist > /run/ais-persist-luks-dump || fail luks-dump
         grep -q '^Version:[[:space:]]*2$' /run/ais-persist-luks-dump || fail luks2
         persist_assert_luks_dump /run/ais-persist-luks-dump || fail argon2id
         mountpoint -q /mnt/persist || fail mount

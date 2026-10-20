@@ -36,6 +36,19 @@ describe.skipIf(!available)("raw GPT assembly", () => {
       const offset = String(table.partitions[index].start * 512);
       expect(run(["blkid", "-p", "-O", offset, "-s", "LABEL", "-o", "value", output]).stdout.toString().trim()).toBe(label);
     }
+    // Inspect the actual ext4 payload staged and written by the real assembler.
+    const work = built.stdout.toString().match(/assemble: work files: ([^\n]+)/)?.[1];
+    expect(work).toBeDefined();
+    const contract = run(["debugfs", "-R", "cat /ais-live/gpt-layout", `${work}/base.img`]).stdout.toString();
+    expect(contract).toBe(readFileSync(`${work}/base/ais-live/gpt-layout`, "utf8"));
+    expect(contract.trimEnd().split("\n")).toEqual([
+      "AIS-GPT-LAYOUT\t1", `disk-guid\t${table.id.toLowerCase()}`,
+      ...table.partitions.map((p: {start: number; size: number; type: string; uuid: string; name: string; attrs?: string}, n: number) =>
+        ["part", n + 1, p.start, p.size, p.type.toLowerCase(), p.uuid.toLowerCase(), p.name, p.attrs ?? "-"].join("\t")),
+    ]);
+    const extracted = join(scratch, "actual-base.img");
+    expect(run(["dd", `if=${output}`, `of=${extracted}`, "bs=512", `skip=${table.partitions[2].start}`, `count=${table.partitions[2].size}`, "status=none"]).exitCode).toBe(0);
+    expect(run(["debugfs", "-R", "cat /ais-live/gpt-layout", extracted]).stdout.toString()).toBe(contract);
     const fat = `${output}@@${table.partitions[1].start * 512}`;
     for (const file of ["/EFI/BOOT/BOOTX64.EFI", "/syslinux/ldlinux.sys", "/syslinux/ldlinux.c32"]) {
       expect(run(["mdir", "-a", "-i", fat, `::${file}`]).exitCode).toBe(0);

@@ -13,6 +13,7 @@ build() {
     add_binary findmnt
     add_binary sfdisk
     add_binary sgdisk
+    add_binary /usr/local/bin/ais-gpt-check
     add_binary blockdev
     add_binary blkid
     add_binary stat

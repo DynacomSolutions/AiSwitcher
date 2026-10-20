@@ -7,6 +7,8 @@ mkinitcpio-archiso
 syslinux
 # Persistence and exchange
 cryptsetup
+gptfdisk
+keyutils
 btrfs-progs
 exfatprogs
 dosfstools

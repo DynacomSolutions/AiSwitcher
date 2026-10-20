@@ -45,12 +45,13 @@ sde=$(date -ud "${ARCH_ARCHIVE_DATE//\//-}" +%s)
 
 in_root pacman-key --init
 in_root pacman-key --populate archlinux
-in_root pacman -Syu --noconfirm archiso grub
+in_root pacman -Syu --noconfirm archiso grub gcc
 log archiso-installed
 
 rm -rf "$root/build"
 mkdir -p "$root/build/out"
 cp -a "$repo/image/archiso" "$root/build/profile"
+in_root bash /build/profile/prepare-profile.sh /build/profile
 in_root mkarchiso -v -w /build/work -o /build/out /build/profile
 log mkarchiso-done
 
