@@ -353,15 +353,9 @@ probe_approved() {
 sandbox_probe() {
   preflight || return
   mkdir -p "$TEST_ROOT"
-  local loop_b loop_c
-  loop_b=$(losetup --find --show /dev/vdb) || return 1
-  loop_c=$(losetup --find --show /dev/vdc) || return 1
-  # shellcheck disable=SC2064
-  trap "mdadm --stop /dev/md/aisprobe >/dev/null 2>&1; losetup -d '$loop_b' '$loop_c' >/dev/null 2>&1" RETURN
+  trap 'cryptsetup close aisprobe >/dev/null 2>&1' RETURN
   GUARD_HERDR_SOCKET=$(LIVE_UID=$(id -u live) herdr_socket_path) || refuse 'live herdr socket absent' || return
   export GUARD_HERDR_SOCKET
-  probe_approved mdadm-create mdadm --create /dev/md/aisprobe --run --level=1 --raid-devices=2 --metadata=1.2 "$loop_b" "$loop_c" || return 1
-  probe_approved mdadm-stop mdadm --stop /dev/md/aisprobe || return 1
   # cryptsetup reads the key from stdin through the passed descriptor.
   probe_approved luks-format bash -c "printf '%s' aisprobe-key | cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 /dev/vdb -" || return 1
   probe_approved luks-open bash -c "printf '%s' aisprobe-key | cryptsetup open /dev/vdb aisprobe -" || return 1

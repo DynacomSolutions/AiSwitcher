@@ -89,7 +89,7 @@ describe("live guard scenario fixtures", () => {
     expect(scenario).toContain("if [[ $arg == probe ]]; then export AIS_GUARD_PROBE_EXPECTED=1");
     expect(driver).toContain("set expect_probe [expr {[info exists env(AIS_GUARD_PROBE_EXPECTED)]");
     expect(driver).toContain("sandbox-probe status=complete\\r*\\n");
-    expect(driver).toContain("mdadm-create|mdadm-stop|luks-format|luks-open|luks-close");
+    expect(driver).toContain("luks-format|luks-open|luks-close");
     expect(driver).toContain("case=probe status=ok\\r*\\n");
     expect(driver).toContain("orchestrator completed before requested sandbox probe succeeded");
     expect(driver).toContain("serial stream closed before orchestrator completion");

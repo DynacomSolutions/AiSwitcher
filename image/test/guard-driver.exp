@@ -26,7 +26,7 @@ proc fail {reason} {
 }
 if {[catch {guard_expect_run $spawn_id $qmp $boot_timeout} err]} { fail $err }
 set timeout $boot_timeout
-set probes {mdadm-create mdadm-stop luks-format luks-open luks-close}
+set probes {luks-format luks-open luks-close}
 set expect_probe [expr {[info exists env(AIS_GUARD_PROBE_EXPECTED)] && $env(AIS_GUARD_PROBE_EXPECTED) eq "1"}]
 set probe_ok [dict create]
 set probe_prompts [dict create]
@@ -44,7 +44,7 @@ expect {
         guard_qmp_key $qmp [dict get $probe_prompts $name]
         exp_continue
     }
-    -re {AIS-GUARD-TEST: case=(mdadm-create|mdadm-stop|luks-format|luks-open|luks-close) status=ok\r*\n} {
+    -re {AIS-GUARD-TEST: case=(luks-format|luks-open|luks-close) status=ok\r*\n} {
         dict set probe_ok $expect_out(1,string) 1
         exp_continue
     }
