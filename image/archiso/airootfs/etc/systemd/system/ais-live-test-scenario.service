@@ -7,6 +7,7 @@ ConditionPathExists=/usr/local/lib/ais-live-test/orchestrator
 
 [Service]
 Type=simple
+StandardError=journal+console
 ExecStart=/usr/local/lib/ais-live-test/orchestrator
 TimeoutStartSec=infinity
 

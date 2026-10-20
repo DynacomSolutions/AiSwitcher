@@ -4,14 +4,16 @@ source $guard_file
 set sent {}
 rename guard_qmp_key guard_qmp_key_real
 proc guard_qmp_key {socket text} {
+    if {![file exists $socket]} { error "reply attempted before QMP was ready" }
     lappend ::sent [string trim $text]
 }
 
 proc run_case {payload expect_success expected_keys} {
     set ::sent {}
     set qmp [file join $::env(AIS_GUARD_TEST_SCRATCH) qmp.sock]
-    close [open $qmp w]
-    spawn -noecho /bin/sh -c "printf '%s' '$payload'"
+    # Reproduce QEMU's startup: the socket does not exist when spawn returns.
+    # It becomes available before the guest can request keyboard input.
+    spawn -noecho /bin/sh -c {sleep 0.1; : > "$1"; printf '%s' "$2"} synthetic-guard $qmp $payload
     set serial $spawn_id
     set result [catch {guard_expect_run $serial $qmp 2} message]
     if {$expect_success && $result} { error "expected success, got: $message" }
@@ -30,4 +32,8 @@ run_case "AIS-GUARD-TEST: case=unanswered-dd status=popup\n" 0 {}
 run_case "AIS-GUARD-TEST: case=symlink-swap-target-flipped status=ok\n" 0 {}
 run_case "AIS-GUARD-TEST: case=aur-install status=reply\n" 0 {}
 run_case "AIS-GUARD-TEST: case=surprise status=popup\n" 0 {}
+if {![catch {guard_qmp_key_real [file join $::env(AIS_GUARD_TEST_SCRATCH) missing.qmp] vdb} message]
+    || $message ne "QMP socket unavailable"} {
+    error "missing QMP socket did not fail at reply time"
+}
 puts "guard Expect driver tests passed"

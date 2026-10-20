@@ -23,6 +23,9 @@ for shim in "${shims[@]}"; do
 done
 
 /usr/bin/install -d -m 0700 "$target_dir"
+# Each compiled shim includes its runtime. Copying all eight into the clean
+# boot's 256 MiB writable overlay exhausts it. Keep the binaries in the image;
+# agent owns the links and can replace them when updating its configuration.
 for shim in "${shims[@]}"; do
-  /usr/bin/install -m 0755 "$source_dir/$shim" "$target_dir/$shim"
+  /usr/bin/ln -sfnT -- "$source_dir/$shim" "$target_dir/$shim"
 done

@@ -10,6 +10,7 @@ ConditionPathIsMountPoint=/mnt/persist
 
 [Service]
 Type=oneshot
+StandardError=journal+console
 RemainAfterExit=yes
 RuntimeDirectory=ais-live-exchange
 RuntimeDirectoryMode=0700

@@ -44,10 +44,12 @@ if [[ -d "$plugin" ]]; then
     /usr/bin/runuser -u live -- /usr/bin/env -i HOME=/home/live PATH=/usr/local/bin:/usr/bin \
       HERDR_SOCKET_PATH="/run/user/$live_uid/herdr.sock" /usr/local/bin/herdr "$@"
   }
-  if ! herdr_as_live plugin list 2>/dev/null | /usr/bin/grep -q ais-guard; then
+  # Drain the listing so herdr cannot fail with a broken pipe after a match.
+  # With pipefail, grep -q can turn a linked plugin into a failed account setup.
+  if ! herdr_as_live plugin list 2>/dev/null | /usr/bin/grep -F ais-guard >/dev/null; then
     herdr_as_live plugin link "$plugin" --enabled >/dev/null
   fi
-  herdr_as_live plugin list | /usr/bin/grep -q ais-guard || { echo 'guard plugin is not linked' >&2; exit 1; }
+  herdr_as_live plugin list | /usr/bin/grep -F ais-guard >/dev/null || { echo 'guard plugin is not linked' >&2; exit 1; }
 fi
 
 live_groups=$(/usr/bin/id -nG live)

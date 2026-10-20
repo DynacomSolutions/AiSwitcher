@@ -48,6 +48,12 @@ describe("stage-profile.sh", () => {
       const def = readFileSync(join(f.profile, "profiledef.sh"), "utf8");
       expect(def).toContain('["/usr/local/lib/ais-live/ais-guardd"]="0:0:755"');
       expect(def).toContain('["/usr/local/bin/ais"]="0:0:755"');
+      for (const tool of tools.slice(1)) {
+        const shim = join(air, "usr/lib/ais-live/shims", tool);
+        expect(lstatSync(shim).isFile()).toBe(true);
+        expect(statSync(shim).mode & 0o777).toBe(0o755);
+        expect(def).toContain(`["/usr/lib/ais-live/shims/${tool}"]="0:0:755"`);
+      }
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   });
 

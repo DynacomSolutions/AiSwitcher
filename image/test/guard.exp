@@ -18,7 +18,8 @@ proc guard_qmp_key {socket text} {
 }
 
 proc guard_expect_run {serial_id qmp_socket timeout_sec} {
-    if {![file exists $qmp_socket]} { error "QMP socket unavailable" }
+    # QEMU creates its sockets asynchronously after spawn. Wait for the guest's
+    # popup marker; guard_qmp_key checks the socket when a reply is needed.
     set popup_seen [dict create]
     set complete 0
     while {1} {

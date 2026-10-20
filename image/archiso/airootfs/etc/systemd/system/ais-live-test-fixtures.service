@@ -6,6 +6,7 @@ Before=getty@tty1.service serial-getty@.service
 
 [Service]
 Type=oneshot
+StandardError=journal+console
 ExecStart=/usr/local/lib/ais-live/ais-live-test-fixtures
 RemainAfterExit=yes
 

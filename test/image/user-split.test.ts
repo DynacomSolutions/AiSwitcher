@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 
 const root = new URL("../../", import.meta.url);
 const read = (path: string) => readFile(new URL(path, root), "utf8");
@@ -45,6 +45,72 @@ describe("image account split", () => {
     expect(accounts).toContain("$live_groups \" != *' disk '*");
     expect(accounts).toContain("$agent_groups \" != *' disk '*");
     expect(accounts).toContain("$agent_groups \" != *' proc '*");
+  });
+
+  it("creates the clean home as agent before installing shims as that user", async () => {
+    const [accounts, service, installer, qemu] = await Promise.all([
+      read("image/lib/ais-live-accounts"),
+      read("image/archiso/airootfs/etc/systemd/system/ais-live-agent-shims.service"),
+      read("image/lib/install-agent-shims"),
+      read("image/test/run-qemu.sh"),
+    ]);
+    expect(qemu).toContain("mode=${AIS_TEST_MODE:-clean}");
+    expect(accounts).toContain('[[ "$kernel_arg" == ais.mode=clean ]]');
+    expect(accounts).toContain('[[ "$clean_mode" == true && ! -e /home/agent ]]');
+    expect(accounts).toContain("/usr/bin/install -d -o agent -g agent -m 0700 /home/agent");
+    expect(service).toContain("Requires=ais-live-accounts.service");
+    expect(service).toContain("After=local-fs.target ais-live-accounts.service");
+    expect(service).toContain("User=agent\nGroup=agent");
+    expect(installer).toStartWith("#!/bin/bash -p\n");
+    expect(installer).toContain('[[ "$(/usr/bin/id -un)" != agent ]]');
+    expect(installer).toContain('[[ -f "$source_file" && ! -L "$source_file" && -x "$source_file" ]]');
+    expect(installer).toContain('[[ "$(/usr/bin/stat -c \'%u:%a\' "$source_file")" == 0:* ]]');
+  });
+
+  it("links bundled shims without copying their runtimes into the small clean overlay", async () => {
+    const installer = await read("image/lib/install-agent-shims");
+    expect(installer).toContain("source_dir=/usr/lib/ais-live/shims");
+    expect(installer).toContain("target_dir=/home/agent/.local/bin");
+    expect(installer).toContain("readonly -a shims=(claude codex grok kimi zai ali pi opencode)");
+    expect(installer).toContain('/usr/bin/install -d -m 0700 "$target_dir"');
+    expect(installer).toContain('/usr/bin/ln -sfnT -- "$source_dir/$shim" "$target_dir/$shim"');
+    expect(installer).not.toContain('/usr/bin/install -m 0755 "$source_dir/$shim"');
+    expect(installer.indexOf("image shim is not root-owned")).toBeLessThan(installer.indexOf("/usr/bin/ln"));
+  });
+
+  it("drains herdr plugin listings so pipefail cannot mistake a match for failure", async () => {
+    const accounts = await read("image/lib/ais-live-accounts");
+    const checks = accounts.split("\n").filter((line) => line.includes("herdr_as_live plugin list"));
+    expect(checks).toHaveLength(2);
+    for (const check of checks) {
+      expect(check).toContain("| /usr/bin/grep -F ais-guard >/dev/null");
+      expect(check).not.toContain("grep -q");
+    }
+  });
+
+  it("keeps both login consoles available after shim failure without bypassing isolation", async () => {
+    for (const getty of ["getty@tty1", "serial-getty@"]) {
+      const dropIn = await read(`image/archiso/airootfs/etc/systemd/system/${getty}.service.d/ais-live-autologin.conf`);
+      const values = (key: string) => dropIn.split("\n")
+        .filter((line) => line.startsWith(`${key}=`))
+        .flatMap((line) => line.slice(key.length + 1).trim().split(/\s+/));
+      expect(values("Requires")).toEqual(["ais-live-accounts.service", "ais-live-hardening.service"]);
+      expect(values("Wants")).toContain("ais-live-agent-shims.service");
+      for (const dependency of ["ais-live-accounts.service", "ais-live-hardening.service", "ais-live-agent-shims.service"]) {
+        expect(values("After")).toContain(dependency);
+      }
+    }
+  });
+
+  it("sends every live service's errors to the journal and boot console", async () => {
+    const unitDir = "image/archiso/airootfs/etc/systemd/system";
+    const services = (await readdir(new URL(unitDir, root))).filter((name) => /^ais-live-.*\.service$/.test(name));
+    expect(services.length).toBeGreaterThan(0);
+    for (const service of services) {
+      const unit = await read(`${unitDir}/${service}`);
+      const serviceSection = unit.split("[Service]\n")[1]?.split(/\n\[/)[0];
+      expect(serviceSection).toContain("StandardError=journal+console\n");
+    }
   });
 
   it("gates fixed test fixture operations on the exact kernel token", async () => {

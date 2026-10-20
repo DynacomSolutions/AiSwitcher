@@ -8,6 +8,7 @@ ConditionKernelCommandLine=ais.test=1
 
 [Service]
 Type=oneshot
+StandardError=journal+console
 ExecStart=/usr/local/lib/ais-live/ais-live-test-media
 RemainAfterExit=yes
 

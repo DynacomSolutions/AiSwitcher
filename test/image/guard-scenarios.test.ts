@@ -49,6 +49,16 @@ describe("live guard scenario fixtures", () => {
     expect(source).not.toContain("herdr plugin pane send-text");
   });
 
+  test("guard QMP uses a short path relative to the runner's working directory", () => {
+    const driver = readFileSync(resolve(root, "image/test/guard-driver.exp"), "utf8");
+    const runner = readFileSync(resolve(root, "image/test/run-qemu.sh"), "utf8");
+    expect(driver).toContain("set qmp guard.qmp");
+    expect(driver).not.toContain("file join $env(AIS_QEMU_RUN_DIR)");
+    expect(runner).toContain('cd -- "$work"');
+    expect(runner).toContain('expect "$driver"');
+    expect(runner.indexOf('cd -- "$work"')).toBeLessThan(runner.indexOf('expect "$driver"'));
+  });
+
   const expectBin = process.env.AIS_TEST_EXPECT_BIN ?? "expect";
   const hasExpect = process.env.CI === "true" || Bun.which(expectBin) !== null;
   // Outside CI a missing host tool skips (reason: `expect` not on PATH); in CI it must run and fail loudly.

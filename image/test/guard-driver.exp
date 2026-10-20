@@ -6,7 +6,9 @@ source [file join $driverDir guard.exp]
 if {$argc < 2} { puts stderr "usage: guard-driver.exp <timeout> <qemu> \[args\]"; exit 2 }
 set boot_timeout [lindex $argv 0]
 set command [lrange $argv 1 end]
-set qmp [file join $env(AIS_QEMU_RUN_DIR) guard.qmp]
+# run-qemu.sh enters its work directory. Keep the socket name short enough for
+# sockaddr_un even when the checkout or artifact directory has a long path.
+set qmp guard.qmp
 log_user 1
 spawn -noecho {*}$command -qmp "unix:$qmp,server=on,wait=off"
 set child [exp_pid]
