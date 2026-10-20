@@ -13,7 +13,8 @@ export function canUpdate(drive: DeviceSummary) {
 }
 
 function UpdateDriveForm({ id, bridge, devices, loading }: { id: string; bridge: HostBridge; devices: DeviceSummary[]; loading: boolean }) {
-  const drive = devices.find((item) => item.id === id && canUpdate(item));
+  const selected = devices.find((item) => item.id === id);
+  const drive = selected && canUpdate(selected) ? selected : undefined;
   const [passphrase, setPassphrase] = useState("");
   const [preview, setPreview] = useState<WritePreview | null>(null);
   const [typed, setTyped] = useState("");
@@ -71,17 +72,17 @@ function UpdateDriveForm({ id, bridge, devices, loading }: { id: string; bridge:
   return <article className="glass-panel">
     <h1>Update drive image</h1>
     <Link to="/drives">Back to drives</Link>
-    {loading ? <p role="status">Checking connected drives</p> : !drive ? <p role="alert">Connect a known, writable USB drive to update its image.</p> : <>
+    {loading ? <p role="status">Checking connected drives</p> : !drive ? <p role="alert">{selected?.updateError ?? "Connect a known, writable USB drive to update its image."}</p> : <>
       <h2>{drive.displayIdentifier}</h2>
-      {drive.layoutStatus === "update incomplete" && <p role="alert">An earlier update did not finish. Preview and confirm a retry before booting this drive.</p>}
+      {drive.layoutStatus === "update incomplete" && <p role="alert">An earlier update did not finish. Finish update re-verifies the recorded release and rewrites its boot and base partitions. Enter the passphrase used when starting that update.</p>}
       {drive.layoutStatus === "awaiting boot" && <p>The previous image update was written. Package restoration still needs verification after boot.</p>}
-      <p>Replace the boot and base image with a verified newer release. Encrypted storage and drive identities are preserved. A small encrypted notification is added to the exchange inbox.</p>
-      <p>The drive reinstalls its recorded packages on next boot. Keep it connected until the update finishes; an interrupted write can leave it unable to boot until retried.</p>
+      <p>Replace the boot and base image with a verified release. Encrypted storage, exchange files and drive identities are preserved.</p>
+      <p>Keep the drive connected until the update finishes. If disconnected, reconnect it, refresh the drive list and choose Finish update before booting.</p>
       {!done && <fieldset disabled={busy}>
         <legend>Existing drive passphrase</legend>
         <label htmlFor="update-passphrase">Passphrase</label>
         <input id="update-passphrase" type="password" autoComplete="current-password" value={passphrase} onChange={(event) => { setPassphrase(event.target.value); setPreview(null); setConfirmedFor(null); void bridge.invalidateConfirmation(); }} />
-        <button type="button" disabled={passphrase.length < 12} onClick={() => void requestPreview()}>Preview update</button>
+        <button type="button" disabled={passphrase.length < 12} onClick={() => void requestPreview()}>{drive.layoutStatus === "update incomplete" ? "Finish update" : "Preview update"}</button>
       </fieldset>}
       {preview && <section className="disk-confirmation" aria-label="Update preview">
         <h2>Review image update</h2>
@@ -102,7 +103,7 @@ function UpdateDriveForm({ id, bridge, devices, loading }: { id: string; bridge:
         {confirmedFor !== null && <p role="status">Confirmation expires in {confirmedFor} seconds</p>}
       </section>}
       {busy && <p role="status">Working on the image update</p>}
-      {done && <p role="status">Image and inbox marker verified. Boot the drive to restore its recorded packages.</p>}
+      {done && <p role="status">Image partitions written and read back. The update journal has been removed.</p>}
     </>}
     {error && <p role="alert" className="error-panel">{error}</p>}
   </article>;

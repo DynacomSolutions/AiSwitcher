@@ -34,7 +34,7 @@ export function App({ bridge }: { bridge: HostBridge }) {
         {subscriptionError && <p role="alert" className="error-panel">Live operation updates are unavailable. Reopen the app to restore updates.</p>}
         <Routes>
           <Route path="/" element={<Navigate to="/drives" replace />} />
-          <Route path="/drives" element={loadError ? <Page title="Drives"><div role="alert" className="error-panel"><p>{loadError}</p><button type="button" onClick={() => { setLoading(true); setReload((value) => value + 1); }}>Retry</button></div></Page> : <DriveList devices={devices} loading={loading} />} />
+          <Route path="/drives" element={loadError ? <Page title="Drives"><div role="alert" className="error-panel"><p>{loadError}</p><button type="button" onClick={() => { setLoading(true); setReload((value) => value + 1); }}>Retry</button></div></Page> : <DriveList devices={devices} loading={loading} onRefresh={() => { setLoading(true); setReload((value) => value + 1); }} />} />
           <Route path="/drives/:id" element={<DriveDetail devices={devices} loading={loading} />} />
           <Route path="/drives/:id/update" element={<UpdateDrive key={reload} bridge={bridge} devices={devices} loading={loading} />} />
           <Route path="/create" element={<CreateDrive key={reload} bridge={bridge} devices={devices} loading={loading} onRefresh={() => setReload((value) => value + 1)} />} />
@@ -47,7 +47,7 @@ export function App({ bridge }: { bridge: HostBridge }) {
   </main>;
 }
 
-function DriveList({ devices, loading }: { devices: DeviceSummary[]; loading: boolean }) {
+function DriveList({ devices, loading, onRefresh }: { devices: DeviceSummary[]; loading: boolean; onRefresh: () => void }) {
   const location = useLocation();
   const navigate = useNavigate();
   const status = new URLSearchParams(location.search).get("status") ?? "all";
@@ -55,8 +55,8 @@ function DriveList({ devices, loading }: { devices: DeviceSummary[]; loading: bo
   return <Page title="Drives">
     <div className="toolbar"><label htmlFor="drive-status">Filter drives</label><select id="drive-status" value={status} onChange={(event) => navigate(filterRoute(location.pathname, "status", event.target.value === "all" ? null : event.target.value, location.search), { replace: true })}>
       <option value="all">All</option><option value="ready">Ready</option><option value="unknown">Needs review</option><option value="update incomplete">Update incomplete</option><option value="awaiting boot">Awaiting boot</option>
-    </select><Link className="primary-button" to="/create">Create a drive</Link></div>
-    {loading ? <div className="empty-state" role="status">Loading drives</div> : shown.length === 0 ? <div className="empty-state" role="status"><h2>No drives detected</h2><p>Connect a removable drive, or create one to get started.</p></div> : <ul className="drive-list">{shown.map((drive) => <li key={drive.id}><Link to={contentRoute(drive.id)}>{drive.displayIdentifier}</Link><span>{drive.layoutStatus}</span></li>)}</ul>}
+    </select><button type="button" disabled={loading} onClick={onRefresh}>Refresh drives</button><Link className="primary-button" to="/create">Create a drive</Link></div>
+    {loading ? <div className="empty-state" role="status">Loading drives</div> : shown.length === 0 ? <div className="empty-state" role="status"><h2>No drives detected</h2><p>Connect a removable drive, or create one to get started.</p></div> : <ul className="drive-list">{shown.map((drive) => <li key={drive.id}><Link to={contentRoute(drive.id)}>{drive.displayIdentifier}</Link><span>{drive.layoutStatus}</span>{drive.layoutStatus === "update incomplete" && <Link to={`${contentRoute(drive.id)}/update`}>Finish update</Link>}{drive.updateError && <p role="alert">{drive.updateError}</p>}</li>)}</ul>}
   </Page>;
 }
 
@@ -65,7 +65,7 @@ function DriveDetail({ devices, loading }: { devices: DeviceSummary[]; loading: 
   const drive = devices.find((device) => device.id === id);
   if (loading) return <Page title="Loading drive"><p role="status">Checking connected drives</p></Page>;
   if (!drive) return <Page title="Drive unavailable"><div className="error-panel" role="alert"><p>This drive is not available. Reconnect it and refresh the drive list.</p><Link to="/drives">Return to drives</Link></div></Page>;
-  return <Page title={drive.displayIdentifier}><p>{drive.model ?? "Removable drive"}</p><Link to="/drives">Back to drives</Link>{canUpdate(drive) && <Link className="primary-button" to={`${contentRoute(drive.id)}/update`}>Update</Link>}</Page>;
+  return <Page title={drive.displayIdentifier}><p>{drive.model ?? "Removable drive"}</p><Link to="/drives">Back to drives</Link>{drive.updateError && <p role="alert">{drive.updateError}</p>}{canUpdate(drive) && <Link className="primary-button" to={`${contentRoute(drive.id)}/update`}>{drive.layoutStatus === "update incomplete" ? "Finish update" : "Update"}</Link>}</Page>;
 }
 
 function Page({ title, children }: { title: string; children: React.ReactNode }) {

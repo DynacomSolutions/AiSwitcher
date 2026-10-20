@@ -28,6 +28,10 @@ pub enum FetchError {
     Size,
     #[error("No compatible published release was found.")]
     NoRelease,
+    #[error(
+        "The interrupted release does not match the journal's tag and SHA-256. No image was written."
+    )]
+    JournalMismatch,
     #[error(transparent)]
     Trust(#[from] TrustError),
     #[error("Local file handling failed.")]
@@ -153,6 +157,10 @@ pub fn approved_address_on(url: &str, hosts: &[&str]) -> bool {
 
 pub fn parse_listing(json: &[u8]) -> Result<Listing, FetchError> {
     let raw: Vec<ApiRelease> = serde_json::from_slice(json).map_err(|_| FetchError::Listing)?;
+    listing_from_releases(raw)
+}
+
+fn listing_from_releases(raw: Vec<ApiRelease>) -> Result<Listing, FetchError> {
     let mut releases = Vec::new();
     let mut urls = BTreeMap::new();
     for release in raw {
@@ -244,6 +252,46 @@ pub fn fetch_verified(
     let mut body = Vec::new();
     http.get(listing_url, MAX_LISTING_BYTES, &mut body)?;
     let listing = parse_listing(&body)?;
+    verify_listing(http, verifier, listing, work_base)
+}
+
+/// Recovery uses the exact tag endpoint, including releases older than the
+/// discovery page. It never falls back to a different release.
+pub fn fetch_verified_tag(
+    http: &dyn Http,
+    verifier: &ImageVerifier,
+    tag: &str,
+    digest: [u8; 32],
+    work_base: &Path,
+) -> Result<Fetched, FetchError> {
+    if !crate::release::valid_live_tag(tag) {
+        return Err(FetchError::JournalMismatch);
+    }
+    let url = format!("https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}");
+    let mut body = Vec::new();
+    http.get(&url, MAX_LISTING_BYTES, &mut body)?;
+    let release: ApiRelease = serde_json::from_slice(&body).map_err(|_| FetchError::Listing)?;
+    if release.tag_name != tag {
+        return Err(FetchError::JournalMismatch);
+    }
+    let fetched = verify_listing(
+        http,
+        verifier,
+        listing_from_releases(vec![release])?,
+        work_base,
+    )?;
+    if fetched.image.digest() != digest {
+        return Err(FetchError::JournalMismatch);
+    }
+    Ok(fetched)
+}
+
+fn verify_listing(
+    http: &dyn Http,
+    verifier: &ImageVerifier,
+    listing: Listing,
+    work_base: &Path,
+) -> Result<Fetched, FetchError> {
     let directory = private_directory(work_base)?;
     let mut layout_rejected = false;
     for candidate in select_release_candidates(&listing.releases) {

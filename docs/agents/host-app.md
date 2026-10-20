@@ -175,27 +175,41 @@ Syslinux entries receive the existing per-drive `ais.base`, `ais.exchange`,
 `ais.drive`, `archisodevice` and `copytoram=n` settings. GPT, p4 and p5 are outside
 every raw image write range. There is no repartitioning or persist formatting.
 
-After imaging, the app mounts the existing exchange through the create flow's
-validated directory descriptor. Under the existing inbox publication lock, it
-authenticates the latest encrypted bundle and reserves a durable sequence above
-both local and authenticated inbox state. It adds an encrypted inbox bundle
-containing only `.ais/logs/image-updated.jsonl`, using a staged, flushed and
-readback-verified atomic publication. Existing bundles, credentials, settings
-and model files are retained. This marker publication is the only intentional
-exchange change; the raw writer leaves p4 byte-identical.
+Before imaging, the app mounts the existing exchange through the create flow's
+validated directory descriptor. It publishes `.ais-image-update.age` using a
+private temporary file, file fsync, a no-replace atomic rename and directory
+fsync. All journal access stays relative to the retained descriptor. The bounded
+journal records the target tag, verified image SHA-256, partition write order,
+disk GUID, all five PARTUUIDs and previous installed release. Existing age
+passphrase encryption authenticates the complete record. The passphrase never
+enters the journal or privileged helper request. No dependency is added.
 
-Before writing, the registry durably records `updating`. A failed write consumes
-confirmation and requires a fresh preview and confirmation to retry the verified
-replacement. The previous release record remains until the marker is published.
-There is no automatic rollback or atomic boot-slot switch: interrupted boot/base
-writes can leave the drive unbootable until retried. A completed host update is
-`writtenAwaitingBoot`, not proof of package restoration. The image owns package
-reinstallation after detecting its changed base. `lastInboxSeq` is not an image
-or package acknowledgement.
+The registry then records `updating` and the app unmounts exchange before the
+helper writes. Refreshing connected drives checks the same GPT identity and
+detects a retained journal, offering **Finish update**. Recovery authenticates
+the journal with the passphrase used to start the update, downloads its exact
+release tag, re-verifies with the bundled key and requires the recorded SHA-256.
+There is no fallback to a different release. A mismatched drive, altered journal,
+missing journal for an interrupted update or failed image verification is refused.
+Fresh typed confirmation is required, and the exact journal is checked again
+before writing. The helper independently re-verifies the image and write plan.
 
-File-backed tests compare full p4/p5 hashes and both GPT windows before and after
-successful and interrupted writes, reject oversized or incompatible releases,
-and verify all six boot entries. The create/update orchestration smoke uses the
-actual helper writer with synthetic releases and a directory mount seam. Guest
-snapshot ordering, package restoration and native device execution require
-separate image-side validation.
+Only after all three partitions have been written and read back does the app
+record the replacement release and remove the journal with directory fsync.
+If removal is interrupted after the registry advances, the journal's previous
+release still permits recovery of the same target. Existing inbox bundles,
+models and other exchange data are never changed, and no inbox sequence is
+reserved. Persist is never opened or formatted. An interrupted boot/base write
+can leave the drive unbootable until **Finish update** completes.
+A completed host update is `writtenAwaitingBoot`, not proof of package
+restoration. The image owns package reinstallation after detecting its changed
+base. `lastInboxSeq` is not an image or package acknowledgement.
+
+File-backed tests disconnect after each partition write and within partitions,
+then authenticate the retained journal and re-verify the same signed image to
+finish. They compare full raw p4/p5 hashes and both GPT windows, check unchanged
+exchange files through a directory mount seam, reject altered journals and
+identity mismatches, reject oversized or incompatible releases and verify all
+six boot entries. The create/update orchestration smoke uses the actual helper
+writer with synthetic releases. Guest snapshot ordering, package restoration
+and native mount or device execution require separate validation.

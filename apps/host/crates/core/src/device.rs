@@ -21,6 +21,8 @@ pub struct DeviceSummary {
     pub writable: bool,
     pub serial: Option<String>,
     pub layout_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_error: Option<String>,
 }
 
 /// Observations must come from native ancestry inspection, never webview input.

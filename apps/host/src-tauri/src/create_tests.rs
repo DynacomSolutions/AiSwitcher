@@ -28,13 +28,32 @@ struct Volume {
     ejected: Cell<usize>,
 }
 
-impl ExchangeVolume for Volume {
-    fn mount(&self, _: &WritePlan) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+impl Volume {
+    fn retained_root(&self) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
         if self.fail_mount {
             Err("SYNTHETIC_FIXTURE mount failure".into())
         } else {
             ais_host_core::exchange_root::ExchangeRoot::test_directory(&self.directory)
         }
+    }
+}
+
+impl ExchangeVolume for Volume {
+    // Failure fixtures also exercise confirmation without a partition table.
+    fn mount(&self, _: &WritePlan) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+        self.retained_root()
+    }
+
+    fn mount_parts(
+        &self,
+        _: &DeviceObservation,
+        _: ais_host_core::device::ByteRange,
+        _: &ais_host_core::drive_identity::DriveIdentity,
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+        self.retained_root()
+    }
+    fn unmount(&self, _: &DeviceObservation) -> Result<(), String> {
+        Ok(())
     }
     fn eject(&self, _: &DeviceObservation) -> Result<(), String> {
         self.ejected.set(self.ejected.get() + 1);
@@ -332,8 +351,25 @@ fn update_smoke(
     };
     for fail in [true, false] {
         let (_, image) = fixture.verify_live_layout(&directory).unwrap();
+        let existing = super::inspect_journal(volume, &snapshot, &previous).unwrap();
+        assert_eq!(existing.is_some(), !fail);
+        let journal = match &existing {
+            Some(sealed) => sealed.authenticate("SYNTHETIC_FIXTURE_12").unwrap(),
+            None => {
+                ais_host_core::update_journal::UpdateJournal::new(&image, previous.clone()).unwrap()
+            }
+        };
+        journal.check_drive(&snapshot, &previous).unwrap();
+        journal.check_image(&image).unwrap();
         let plan = WritePlan::update_drive(&image, &snapshot, &previous).unwrap();
         let handle = super::drive_handle(&plan).unwrap();
+        let original_sequence = FileRegistry::open(registry_directory)
+            .unwrap()
+            .load()
+            .unwrap()
+            .record(&handle)
+            .unwrap()
+            .inbox_issued();
         let sources = [&fixture.compressed, &fixture.sums, &fixture.signature].map(|body| {
             let (_, mut file) = fresh_file(&directory, "update-source-SYNTHETIC-FIXTURE").unwrap();
             file.write_all(body).unwrap();
@@ -364,6 +400,7 @@ fn update_smoke(
             sources: Some(sources),
             create: Some(stored_create()),
             installed: Some(previous.clone()),
+            update: Some(super::PreparedUpdate { journal, existing }),
         };
         session.state.lock().unwrap().pending = Some(pending);
         let now = Instant::now();
@@ -401,19 +438,15 @@ fn update_smoke(
             record.installed_image().unwrap().tag,
             if fail { "live-v1.0.0" } else { "live-v2.0.0" }
         );
-        if fail {
-            assert!(!volume.directory.join("inbox/bundle-2.age").exists());
-        } else {
-            assert_eq!(record.inbox_issued(), 2);
-            let marker = ais_host_core::bundle::read_bundle_file(
-                &volume.directory.join("inbox/bundle-2.age"),
-                "SYNTHETIC_FIXTURE_12",
-                ais_host_core::contract::BundleKind::Inbox,
-            )
-            .unwrap();
-            assert_eq!(marker.files.len(), 1);
-            assert!(marker.files.contains_key(".ais/logs/image-updated.jsonl"));
-        }
+        assert!(!volume.directory.join("inbox/bundle-2.age").exists());
+        assert_eq!(record.inbox_issued(), original_sequence);
+        assert_eq!(
+            volume
+                .directory
+                .join(ais_host_core::update_journal::JOURNAL_NAME)
+                .exists(),
+            fail,
+        );
         assert_eq!(
             fs::read(volume.directory.join("inbox/bundle-1.age")).unwrap(),
             original_inbox

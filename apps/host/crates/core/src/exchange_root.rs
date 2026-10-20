@@ -161,6 +161,39 @@ impl ExchangeRoot {
         Ok(file)
     }
 
+    pub(crate) fn optional_file(&self, name: &str) -> Result<Option<File>, String> {
+        use std::os::fd::AsRawFd;
+        let component = Self::component(name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: live directory descriptor, single component and writable stat.
+        let result = unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                component.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                Ok(None)
+            } else {
+                Err("Cannot inspect the exchange file.".into())
+            };
+        }
+        self.open_file(name, false).map(Some)
+    }
+
+    pub(crate) fn remove_file(&self, name: &str) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        let name = Self::component(name)?;
+        // SAFETY: the single component is confined to the retained directory.
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err("The update journal could not be removed.".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), String> {
         use std::os::fd::AsRawFd;
         let from = Self::component(from)?;
@@ -219,6 +252,12 @@ impl ExchangeRoot {
         Err("Unsupported platform.".into())
     }
     pub(crate) fn open_file(&self, _: &str, _: bool) -> Result<File, String> {
+        Err("Unsupported platform.".into())
+    }
+    pub(crate) fn optional_file(&self, _: &str) -> Result<Option<File>, String> {
+        Err("Unsupported platform.".into())
+    }
+    pub(crate) fn remove_file(&self, _: &str) -> Result<(), String> {
         Err("Unsupported platform.".into())
     }
     pub(crate) fn rename(&self, _: &str, _: &str) -> Result<(), String> {

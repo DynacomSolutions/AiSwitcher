@@ -67,10 +67,24 @@ fn is_allowed_navigation(url: &tauri::Url) -> bool {
 }
 
 #[tauri::command]
-fn list_devices(
-    state: tauri::State<'_, ConfirmationSession>,
-    registry: tauri::State<'_, escrow_commands::EscrowCommandState>,
-) -> Vec<ais_host_core::device::DeviceSummary> {
+async fn list_devices(
+    app: tauri::AppHandle,
+) -> Result<Vec<ais_host_core::device::DeviceSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = app
+            .try_state::<escrow_commands::EscrowCommandState>()
+            .ok_or("The local drive registry is unavailable.")?;
+        inspect_devices(&app.state::<ConfirmationSession>(), &registry)
+    })
+    .await
+    .map_err(|_| "Connected drives could not be inspected.".to_string())?
+}
+
+fn inspect_devices(
+    state: &ConfirmationSession,
+    registry: &escrow_commands::EscrowCommandState,
+) -> Result<Vec<ais_host_core::device::DeviceSummary>, String> {
+    let _media = state.lock_media()?;
     let devices = native_devices();
     let images = registry.known_images().unwrap_or_default();
     let hints: Vec<_> = devices
@@ -83,16 +97,26 @@ fn list_devices(
             .iter()
             .filter(|(image, _)| image.hardware_hint == hint)
             .collect();
-        if let [(_, status)] = matches.as_slice() {
-            summary.layout_status = match status.as_str() {
-                "updating" => "update incomplete",
-                "writtenAwaitingBoot" => "awaiting boot",
-                _ => "ready",
+        if let [(installed, status)] = matches.as_slice() {
+            let journal = preview_update_native(&summary.id)
+                .and_then(|snapshot| inspect_journal(&UdisksVolume, &snapshot, installed));
+            summary.layout_status = match journal {
+                Ok(Some(_)) => "update incomplete",
+                Ok(None) if status == "updating" => {
+                    summary.update_error = Some("The update journal is missing. The interrupted release cannot be identified safely.".into());
+                    "update refused"
+                }
+                Ok(None) if status == "writtenAwaitingBoot" => "awaiting boot",
+                Ok(None) => "ready",
+                Err(error) => {
+                    summary.update_error = Some(error);
+                    "update refused"
+                }
             }
             .into();
         }
     }
-    summaries
+    Ok(summaries)
 }
 
 #[cfg(target_os = "linux")]
@@ -182,11 +206,13 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
 async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<WritePreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<ConfirmationSession>();
+        let _media = state.lock_media()?;
         let preparation = state.begin_preview(&device_id)?;
         let snapshot = preview_update_native(&device_id)?;
         preparation.check_observation(&snapshot.observation)?;
         let images = app
-            .state::<escrow_commands::EscrowCommandState>()
+            .try_state::<escrow_commands::EscrowCommandState>()
+            .ok_or("The local drive registry is unavailable.")?
             .known_images()?;
         let matches: Vec<_> = images
             .into_iter()
@@ -195,18 +221,50 @@ async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<Writ
         if matches.len() != 1 {
             return Err("The drive's installed release is unknown or its layout changed.".into());
         }
-        let (installed, _) = matches.into_iter().next().expect("one known drive");
+        let (registered, status) = matches.into_iter().next().expect("one known drive");
+        let existing = inspect_journal(&UdisksVolume, &snapshot, &registered)?;
+        if existing.is_none() && status == "updating" {
+            return Err("The update journal is missing. The interrupted release cannot be identified safely.".into());
+        }
+        let interrupted = existing
+            .as_ref()
+            .map(|sealed| {
+                let journal = sealed.authenticate(preparation.create.passphrase.expose())?;
+                journal.check_drive(&snapshot, &registered)?;
+                Ok::<_, String>(journal)
+            })
+            .transpose()?;
         let verifier =
             ais_host_core::release::ImageVerifier::bundled().map_err(|error| error.to_string())?;
-        let fetched = ais_host_core::fetch::fetch_verified(
-            &ais_host_core::fetch::UreqHttp::default(),
-            &verifier,
-            RELEASE_LISTING,
-            &std::env::temp_dir(),
-        )
+        let http = ais_host_core::fetch::UreqHttp::default();
+        let fetched = match &interrupted {
+            Some(journal) => ais_host_core::fetch::fetch_verified_tag(
+                &http,
+                &verifier,
+                journal.tag(),
+                journal.image_digest(),
+                &std::env::temp_dir(),
+            ),
+            None => ais_host_core::fetch::fetch_verified(
+                &http,
+                &verifier,
+                RELEASE_LISTING,
+                &std::env::temp_dir(),
+            ),
+        }
         .map_err(|error| error.to_string())?;
         let snapshot = preview_update_native(&device_id)?;
         preparation.check_observation(&snapshot.observation)?;
+        let journal = match interrupted {
+            Some(journal) => journal,
+            None => ais_host_core::update_journal::UpdateJournal::new(
+                &fetched.image,
+                registered.clone(),
+            )?,
+        };
+        journal.check_drive(&snapshot, &registered)?;
+        journal.check_image(&fetched.image)?;
+        let installed = journal.previous().clone();
         let plan =
             ais_host_core::device::WritePlan::update_drive(&fetched.image, &snapshot, &installed)
                 .map_err(|_| {
@@ -239,6 +297,7 @@ async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<Writ
             sources: Some(fetched.sources),
             create: Some(preparation.create),
             installed: Some(installed),
+            update: Some(PreparedUpdate { journal, existing }),
         };
         let view = pending.view();
         let mut locked = state
@@ -421,6 +480,35 @@ struct PendingConfirmation {
     sources: Option<[std::fs::File; 3]>,
     create: Option<StoredCreate>,
     installed: Option<ais_host_core::update::InstalledImage>,
+    update: Option<PreparedUpdate>,
+}
+
+struct PreparedUpdate {
+    journal: ais_host_core::update_journal::UpdateJournal,
+    existing: Option<ais_host_core::update_journal::SealedJournal>,
+}
+
+/// Read only through the verified partition handle, and release the mount
+/// before the helper re-observes the unmounted disk.
+fn inspect_journal(
+    volume: &dyn ExchangeVolume,
+    snapshot: &ais_host_core::update::DriveSnapshot,
+    installed: &ais_host_core::update::InstalledImage,
+) -> Result<Option<ais_host_core::update_journal::SealedJournal>, String> {
+    let parts = snapshot
+        .partitions(&installed.identity)
+        .map_err(|_| "The drive's disk or partition identities changed.")?;
+    let root = volume.mount_parts(
+        &snapshot.observation,
+        ais_host_core::update::partition_range(&parts[3]),
+        &installed.identity,
+    )?;
+    let result = ais_host_core::update_journal::SealedJournal::load(&root);
+    drop(root);
+    let unmounted = volume.unmount(&snapshot.observation);
+    let journal = result?;
+    unmounted?;
+    Ok(journal)
 }
 
 /// Presentation fields are collected by the native enumerator. They never
@@ -437,6 +525,8 @@ struct DeviceReviewDetails {
 #[derive(Default)]
 struct ConfirmationSession {
     state: std::sync::Mutex<ConfirmationState>,
+    /// Journal inspection mounts exchange, so it must not overlap a raw write.
+    media: std::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -451,6 +541,12 @@ struct ConfirmationState {
 }
 
 impl ConfirmationSession {
+    fn lock_media(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        self.media.try_lock().map_err(|_| {
+            "Drive inspection or writing is already in progress. Try again when it finishes.".into()
+        })
+    }
+
     fn retain_listed(
         &self,
         devices: Vec<ais_host_core::device::DeviceObservation>,
@@ -473,6 +569,7 @@ impl ConfirmationSession {
                 writable: device.writable,
                 serial: device.serial.clone(),
                 layout_status: "unknown".into(),
+                update_error: None,
             })
             .collect()
     }
@@ -590,6 +687,7 @@ impl ConfirmationSession {
         now: Instant,
         env: &mut WriteEnv<'_>,
     ) -> Result<(), String> {
+        let _media = self.lock_media()?;
         let started = Instant::now();
         if !env.support.enabled {
             self.invalidate();
@@ -727,36 +825,59 @@ fn perform_update(
         .sources
         .as_ref()
         .ok_or("The verified image sources are unavailable.")?;
-    // Persist intent first. A crash or helper failure must never look successful.
-    env.sink.remember_image(&handle, previous, "updating")?;
-    env.launcher.launch(request, sources).map_err(|_| "The image update did not finish. Boot and base may be incomplete; encrypted storage is preserved. Preview and retry the update.".to_string())?;
+    let prepared = current
+        .update
+        .as_ref()
+        .ok_or("The update journal is unavailable.")?;
+    prepared.journal.check_image(&current.image)?;
+    if prepared.journal.previous() != previous {
+        return Err("The installed release changed during preparation.".into());
+    }
+    let exchange = env.volume.mount(&current.plan)?;
+    let publication = (|| {
+        let sealed = match &prepared.existing {
+            Some(sealed) => {
+                sealed.check_current(&exchange)?;
+                sealed.clone()
+            }
+            None => ais_host_core::update_journal::SealedJournal::publish(
+                &exchange,
+                &prepared.journal,
+                passphrase.expose(),
+            )?,
+        };
+        env.sink.remember_image(&handle, previous, "updating")?;
+        Ok::<_, String>(sealed)
+    })();
+    drop(exchange);
+    // The privileged writer requires exclusive access to an unmounted disk.
+    let unmounted = env.volume.unmount(current.plan.device());
+    let sealed = publication?;
+    unmounted?;
+    env.launcher.launch(request, sources).map_err(|_| "The image update did not finish. Reconnect this drive and choose Finish update. Boot and base may be incomplete; encrypted storage is preserved.".to_string())?;
     let installed = ais_host_core::update::InstalledImage::new(
         &current.image,
         previous.identity.clone(),
         current.plan.device(),
     );
     let device = current.plan.device();
-    let exchange = match env.volume.mount(&current.plan) {
-        Ok(exchange) => exchange,
-        Err(_) => {
-            let _ = env.volume.eject(device);
-            return Err("The image was updated, but its inbox could not be opened. Package restoration is awaiting the next boot.".into());
-        }
-    };
-    let publication = ais_host_core::publish::publish_image_updated(
-        &exchange,
-        passphrase.expose(),
-        &installed,
-        |minimum| env.sink.reserve_update_sequence(&handle, minimum),
-    );
+    let exchange = env.volume.mount(&current.plan).map_err(|_| {
+        "The image was written and read back, but the update journal could not be reopened. Reconnect and choose Finish update."
+            .to_string()
+    })?;
+    let completion = (|| {
+        sealed.check_current(&exchange)?;
+        // If removal is interrupted, the journal retains the previous release
+        // and permits re-verifying the same target after this registry update.
+        env.sink
+            .remember_image(&handle, &installed, "writtenAwaitingBoot")?;
+        sealed.finish(&exchange)
+    })();
     drop(exchange);
     let ejected = env.volume.eject(device);
-    publication.map_err(|_| "The image was updated, but the encrypted inbox marker could not be published. Package restoration is awaiting the next boot.".to_string())?;
-    env.sink
-        .remember_image(&handle, &installed, "writtenAwaitingBoot")?;
-    ejected.map_err(|_| {
-        "The image and inbox marker were verified, but safe eject failed.".to_string()
-    })?;
+    completion?;
+    ejected
+        .map_err(|_| "The image was written and read back, but safe eject failed.".to_string())?;
     Ok(())
 }
 
@@ -773,13 +894,28 @@ struct WriteEnv<'a> {
     sink: &'a dyn ais_host_core::create::PassphraseSink,
 }
 
-/// Opens the freshly written exchange partition as a directory and ejects the
-/// drive afterwards.
+/// Opens the verified exchange partition as a retained directory, unmounts it
+/// before raw writes and ejects the drive after completion.
 trait ExchangeVolume {
     fn mount(
         &self,
         plan: &ais_host_core::device::WritePlan,
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+        self.mount_parts(
+            plan.device(),
+            plan.exchange_range()
+                .ok_or("The exchange range is unavailable.")?,
+            plan.identity()
+                .ok_or("The drive identity is unavailable.")?,
+        )
+    }
+    fn mount_parts(
+        &self,
+        device: &ais_host_core::device::DeviceObservation,
+        range: ais_host_core::device::ByteRange,
+        identity: &ais_host_core::drive_identity::DriveIdentity,
     ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String>;
+    fn unmount(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String>;
     fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String>;
 }
 
@@ -1070,12 +1206,13 @@ impl UdisksVolume {
 
 #[cfg(target_os = "linux")]
 impl ExchangeVolume for UdisksVolume {
-    fn mount(
+    fn mount_parts(
         &self,
-        plan: &ais_host_core::device::WritePlan,
+        device: &ais_host_core::device::DeviceObservation,
+        range: ais_host_core::device::ByteRange,
+        identity: &ais_host_core::drive_identity::DriveIdentity,
     ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        let device = plan.device();
         let (_, node) = Self::node(device)?;
         // The kernel needs a moment to publish the re-read partition table.
         for _ in 0..75 {
@@ -1085,9 +1222,6 @@ impl ExchangeVolume for UdisksVolume {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         Self::node(device)?;
-        let range = plan
-            .exchange_range()
-            .ok_or("The exchange range is unavailable.")?;
         let name = std::path::Path::new(&node)
             .file_name()
             .ok_or("Invalid partition name.")?;
@@ -1123,41 +1257,54 @@ impl ExchangeVolume for UdisksVolume {
             "-o",
             "nosuid,nodev,noexec",
         ])?;
-        Self::node(device)?;
-        let major_minor = std::fs::read_to_string(sysfs.join("dev"))
-            .map_err(|_| "The exchange identity is unavailable.")?;
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
-            .map_err(|_| "The exchange mount point is unavailable.")?;
-        let path = Self::mount_point(&mountinfo, major_minor.trim())?;
-        let partition =
-            std::fs::metadata(&node).map_err(|_| "The exchange device is unavailable.")?;
-        let identity = plan
-            .identity()
-            .ok_or("The drive identity is unavailable.")?;
-        let by_uuid =
-            std::fs::metadata(format!("/dev/disk/by-partuuid/{}", identity.partitions[3]))
-                .map_err(|_| "The exchange partition identity is unavailable.")?;
-        if !partition.file_type().is_block_device()
-            || !by_uuid.file_type().is_block_device()
-            || by_uuid.rdev() != partition.rdev()
-            || major_minor.trim()
-                != format!(
-                    "{}:{}",
-                    libc::major(partition.rdev()),
-                    libc::minor(partition.rdev())
-                )
-        {
-            return Err("The exchange partition identity changed.".into());
+        let retained = (|| {
+            Self::node(device)?;
+            let major_minor = std::fs::read_to_string(sysfs.join("dev"))
+                .map_err(|_| "The exchange identity is unavailable.")?;
+            let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+                .map_err(|_| "The exchange mount point is unavailable.")?;
+            let path = Self::mount_point(&mountinfo, major_minor.trim())?;
+            let partition =
+                std::fs::metadata(&node).map_err(|_| "The exchange device is unavailable.")?;
+            let by_uuid =
+                std::fs::metadata(format!("/dev/disk/by-partuuid/{}", identity.partitions[3]))
+                    .map_err(|_| "The exchange partition identity is unavailable.")?;
+            if !partition.file_type().is_block_device()
+                || !by_uuid.file_type().is_block_device()
+                || by_uuid.rdev() != partition.rdev()
+                || major_minor.trim()
+                    != format!(
+                        "{}:{}",
+                        libc::major(partition.rdev()),
+                        libc::minor(partition.rdev())
+                    )
+            {
+                return Err("The exchange partition identity changed.".into());
+            }
+            let root =
+                ais_host_core::exchange_root::ExchangeRoot::open_verified(&path, partition.rdev())?;
+            Self::node(device)?;
+            Ok(root)
+        })();
+        if retained.is_err() {
+            // Release only the mount we just made, and only while this exact
+            // device connection still matches. Never leave a failed inspection
+            // mounted and therefore hidden from the next eligible-drive scan.
+            let _ = self.unmount(device);
         }
-        let root =
-            ais_host_core::exchange_root::ExchangeRoot::open_verified(&path, partition.rdev())?;
+        retained
+    }
+
+    fn unmount(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        let (_, node) = Self::node(device)?;
+        Self::run(&["unmount", "-b", &node])?;
         Self::node(device)?;
-        Ok(root)
+        Ok(())
     }
 
     fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
-        let (disk, node) = Self::node(device)?;
-        Self::run(&["unmount", "-b", &node])?;
+        let (disk, _) = Self::node(device)?;
+        self.unmount(device)?;
         Self::node(device)?;
         Self::run(&["power-off", "-b", &format!("/dev/{disk}")]).map(|_| ())
     }
@@ -1165,11 +1312,17 @@ impl ExchangeVolume for UdisksVolume {
 
 #[cfg(not(target_os = "linux"))]
 impl ExchangeVolume for UdisksVolume {
-    fn mount(
+    fn mount_parts(
         &self,
-        _plan: &ais_host_core::device::WritePlan,
+        _device: &ais_host_core::device::DeviceObservation,
+        _range: ais_host_core::device::ByteRange,
+        _identity: &ais_host_core::drive_identity::DriveIdentity,
     ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
         Err("This operating system cannot open the exchange partition yet.".to_string())
+    }
+
+    fn unmount(&self, _device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        Err("This operating system cannot unmount the exchange partition yet.".to_string())
     }
 
     fn eject(&self, _device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
@@ -1200,6 +1353,7 @@ impl PendingConfirmation {
             sources: None,
             create: None,
             installed: None,
+            update: None,
         })
     }
 
@@ -1367,11 +1521,24 @@ mod confirmation_tests {
     }
 
     impl super::ExchangeVolume for DirectoryVolume {
+        // Confirmation-only fixtures deliberately have no partition table.
         fn mount(
             &self,
             _plan: &WritePlan,
         ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
             ais_host_core::exchange_root::ExchangeRoot::test_directory(&self.directory)
+        }
+
+        fn mount_parts(
+            &self,
+            _device: &DeviceObservation,
+            _range: ais_host_core::device::ByteRange,
+            _identity: &ais_host_core::drive_identity::DriveIdentity,
+        ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+            ais_host_core::exchange_root::ExchangeRoot::test_directory(&self.directory)
+        }
+        fn unmount(&self, _device: &DeviceObservation) -> Result<(), String> {
+            Ok(())
         }
         fn eject(&self, _device: &DeviceObservation) -> Result<(), String> {
             self.ejected.set(self.ejected.get() + 1);
@@ -1480,6 +1647,7 @@ mod confirmation_tests {
             sources: Some(sources()),
             create: Some(stored_create()),
             installed: None,
+            update: None,
         }
     }
 
@@ -1495,6 +1663,25 @@ mod confirmation_tests {
         let session = ConfirmationSession::default();
         session.state.lock().unwrap().pending = Some(pending);
         (session, device, preview_id)
+    }
+
+    #[test]
+    fn journal_inspection_cannot_overlap_a_write() {
+        let (session, device, preview_id) = session_with_fixture();
+        let now = Instant::now();
+        session
+            .confirm(&preview_id, &device.display_identifier, now)
+            .unwrap();
+        let inspection = session.lock_media().unwrap();
+        let recorder = Recorder::default();
+        assert!(
+            launch_with(&session, &preview_id, &device, now, true, &recorder)
+                .unwrap_err()
+                .contains("already in progress")
+        );
+        assert!(recorder.0.borrow().is_empty());
+        drop(inspection);
+        assert!(session.lock_media().is_ok());
     }
 
     #[test]

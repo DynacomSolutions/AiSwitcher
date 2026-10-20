@@ -27,3 +27,4 @@ pub mod revocation;
 pub mod sequence;
 
 pub mod update;
+pub mod update_journal;

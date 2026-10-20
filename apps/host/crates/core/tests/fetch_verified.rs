@@ -1,6 +1,6 @@
 #![cfg(feature = "file-test")]
 use ais_host_core::{
-    fetch::{FetchError, Http, fetch_verified},
+    fetch::{FetchError, Http, fetch_verified, fetch_verified_tag},
     file_test::SyntheticRelease,
     release::ImageVerifier,
 };
@@ -18,6 +18,55 @@ impl Http for Fake {
         }
         out.write_all(body).map_err(|_| FetchError::Network)
     }
+}
+
+#[test]
+fn resume_fetches_only_the_recorded_tag_and_reverifies_digest_and_signature() {
+    let release = SyntheticRelease::new(vec![0x53; 512]);
+    let mut http = serve(&release, release.sums.clone());
+    let listing: serde_json::Value =
+        serde_json::from_slice(&http.0.remove(LISTING).unwrap()).unwrap();
+    let url = format!(
+        "https://api.github.com/repos/DynacomSolutions/AiSwitcher/releases/tags/{}",
+        release.selection.tag()
+    );
+    http.0
+        .insert(url.clone(), serde_json::to_vec(&listing[0]).unwrap());
+    let verifier = ImageVerifier::synthetic(&release.public_key, &release.raw).unwrap();
+    let digest = ais_host_core::release::sha256(&release.raw);
+    let fetched =
+        fetch_verified_tag(&http, &verifier, release.selection.tag(), digest, &base()).unwrap();
+    assert_eq!(fetched.image.digest(), digest);
+    assert!(matches!(
+        fetch_verified_tag(&http, &verifier, release.selection.tag(), [0; 32], &base()),
+        Err(FetchError::JournalMismatch)
+    ));
+    // A different valid signing key is still refused on recovery.
+    let other = SyntheticRelease::new(vec![0x53; 512]);
+    let wrong_key = ImageVerifier::synthetic(&other.public_key, &release.raw).unwrap();
+    assert!(
+        fetch_verified_tag(&http, &wrong_key, release.selection.tag(), digest, &base()).is_err()
+    );
+    let signature_url = "https://github.com/o/r/releases/download/x/3";
+    let signature = http.0.get_mut(signature_url).unwrap();
+    // The first line is an unsigned comment. Alter the encoded signature.
+    let offset = signature.iter().position(|byte| *byte == b'\n').unwrap() + 21;
+    signature[offset] = if signature[offset] == b'A' {
+        b'B'
+    } else {
+        b'A'
+    };
+    assert!(
+        fetch_verified_tag(&http, &verifier, release.selection.tag(), digest, &base()).is_err()
+    );
+    http.0.remove(&url);
+    assert!(
+        matches!(
+            fetch_verified_tag(&http, &verifier, release.selection.tag(), digest, &base()),
+            Err(FetchError::Network)
+        ),
+        "no fallback when the recorded release is unavailable"
+    );
 }
 
 fn serve(release: &SyntheticRelease, sums: Vec<u8>) -> Fake {

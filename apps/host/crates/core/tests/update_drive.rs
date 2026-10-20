@@ -8,6 +8,7 @@ use ais_host_core::{
     },
     release::sha256_reader,
     update::{DriveSnapshot, InstalledImage, partition_range},
+    update_journal::{JOURNAL_NAME, SealedJournal, UpdateJournal},
 };
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -20,7 +21,7 @@ fn digest(target: &mut FileTarget, range: ByteRange) -> [u8; 32] {
 }
 
 #[test]
-fn update_preserves_data_and_all_identities_and_refuses_unsafe_plans() {
+fn update_resumes_each_partition_without_changing_exchange_persist_or_identity() {
     let directory = std::env::temp_dir();
     let fixture = SyntheticRelease::new(synthetic_sfdisk_contract_fixture());
     let (_, mut old) = fixture.verify_live_layout(&directory).unwrap();
@@ -167,12 +168,66 @@ fn update_preserves_data_and_all_identities_and_refuses_unsafe_plans() {
     ));
     assert_eq!(fault.written, 0, "re-observe refuses before any write");
     let mut target = fault.inner.reopen().unwrap();
-    // Interrupt within base, between base and boot, and within the ESP, then retry.
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).unwrap();
+    let exchange_path = directory.join(format!(
+        "exchange-SYNTHETIC-FIXTURE-{}",
+        ais_host_core::release::hex(&nonce)
+    ));
+    std::fs::create_dir(&exchange_path).unwrap();
+    std::fs::write(exchange_path.join("model.bin"), b"SYNTHETIC_FIXTURE_MODEL").unwrap();
+    std::fs::write(exchange_path.join("inbox.age"), b"SYNTHETIC_FIXTURE_INBOX").unwrap();
+    let exchange =
+        ais_host_core::exchange_root::ExchangeRoot::test_directory(&exchange_path).unwrap();
+    let journal = UpdateJournal::new(&image, installed.clone()).unwrap();
+    journal.check_drive(&snapshot, &installed).unwrap();
+    assert!(
+        journal
+            .check_drive(&snapshot, &unknown)
+            .unwrap_err()
+            .contains("identities")
+    );
+    assert!(journal.check_image(&old).unwrap_err().contains("SHA-256"));
+    // An intact, authenticated journal copied from a different drive is refused.
+    let other_journal = UpdateJournal::new(&image, unknown.clone()).unwrap();
+    let other_sealed =
+        SealedJournal::publish(&exchange, &other_journal, "SYNTHETIC_FIXTURE_12").unwrap();
+    let copied = other_sealed.authenticate("SYNTHETIC_FIXTURE_12").unwrap();
+    assert!(
+        copied
+            .check_drive(&snapshot, &installed)
+            .unwrap_err()
+            .contains("identities")
+    );
+    assert_eq!(
+        before,
+        [
+            digest(&mut target, partition_range(&parts[3])),
+            digest(&mut target, partition_range(&parts[4])),
+        ]
+    );
+    assert!(SealedJournal::load(&exchange).unwrap().is_some());
+    // Test-only removal of the deliberately foreign fixture.
+    std::fs::remove_file(exchange_path.join(JOURNAL_NAME)).unwrap();
+    // Power loss after the registry advance must still permit the same recovery.
+    let completed = InstalledImage::new(&image, identity.clone(), &snapshot.observation);
+    journal.check_drive(&snapshot, &completed).unwrap();
+
+    // Disconnect immediately after each complete partition write, including the
+    // final ESP before its readback, and also exercise partially written data.
     let base_bytes = partition_range(&source.partitions[2]).length as usize;
     let bios_bytes = partition_range(&source.partitions[0]).length as usize;
-    for limit in [64 * 1024, base_bytes, base_bytes + bios_bytes + 64 * 1024] {
+    let esp_bytes = partition_range(&source.partitions[1]).length as usize;
+    for limit in [
+        64 * 1024,
+        base_bytes,
+        base_bytes + bios_bytes,
+        base_bytes + bios_bytes + 64 * 1024,
+        base_bytes + bios_bytes + esp_bytes,
+    ] {
+        let sealed = SealedJournal::publish(&exchange, &journal, "SYNTHETIC_FIXTURE_12").unwrap();
         let mut fault = FaultTarget::new(target);
-        fault.fail_after = Some(limit);
+        fault.disconnect_after = Some(limit);
         let ticket = approvals
             .issue(
                 &plan,
@@ -194,6 +249,7 @@ fn update_preserves_data_and_all_identities_and_refuses_unsafe_plans() {
         ));
         assert_eq!(fault.written, limit);
         target = fault.inner.reopen().unwrap();
+        assert!(SealedJournal::load(&exchange).unwrap().is_some());
         assert_eq!(
             before,
             [
@@ -222,7 +278,106 @@ fn update_preserves_data_and_all_identities_and_refuses_unsafe_plans() {
             ),
             "interruption consumes the old confirmation"
         );
+        // Reconnect and re-verify the original signed image, not a newer release.
+        let sealed_after_reconnect = SealedJournal::load(&exchange).unwrap().unwrap();
+        let recovered = sealed_after_reconnect
+            .authenticate("SYNTHETIC_FIXTURE_12")
+            .unwrap();
+        recovered.check_drive(&interrupted, &installed).unwrap();
+        let (_, mut resumed_image) = newer.verify_live_layout(&directory).unwrap();
+        recovered.check_image(&resumed_image).unwrap();
+        let resume =
+            WritePlan::update_drive(&resumed_image, &interrupted, recovered.previous()).unwrap();
+        let ticket = approvals
+            .issue(
+                &resume,
+                &resume.device().display_identifier,
+                Instant::now(),
+                Duration::from_secs(120),
+            )
+            .unwrap();
+        write_image(
+            &mut target,
+            &mut resumed_image,
+            &resume,
+            &mut approvals,
+            &ticket,
+            || false,
+        )
+        .unwrap();
+        sealed.finish(&exchange).unwrap();
+        assert!(SealedJournal::load(&exchange).unwrap().is_none());
+        assert_eq!(
+            before,
+            [
+                digest(&mut target, partition_range(&parts[3])),
+                digest(&mut target, partition_range(&parts[4])),
+            ]
+        );
+        assert_eq!(
+            std::fs::read(exchange_path.join("model.bin")).unwrap(),
+            b"SYNTHETIC_FIXTURE_MODEL"
+        );
+        assert_eq!(
+            std::fs::read(exchange_path.join("inbox.age")).unwrap(),
+            b"SYNTHETIC_FIXTURE_INBOX"
+        );
+        assert_eq!(std::fs::read_dir(&exchange_path).unwrap().count(), 2);
+        target = target.reopen().unwrap();
     }
+    // Authenticated intent refuses a changed drive and any ciphertext edits.
+    // Replacing the mount path must never redirect journal I/O from its handle.
+    let retained_path = exchange_path.with_extension("retained");
+    std::fs::rename(&exchange_path, &retained_path).unwrap();
+    std::fs::create_dir(&exchange_path).unwrap();
+    let sealed = SealedJournal::publish(&exchange, &journal, "SYNTHETIC_FIXTURE_12").unwrap();
+    assert!(!exchange_path.join(JOURNAL_NAME).exists());
+    assert!(sealed.authenticate("SYNTHETIC_FIXTURE_WRONG").is_err());
+    assert!(SealedJournal::publish(&exchange, &journal, "SYNTHETIC_FIXTURE_12").is_err());
+    let original = std::fs::read(retained_path.join(JOURNAL_NAME)).unwrap();
+    let mut altered = original.clone();
+    *altered.last_mut().unwrap() ^= 1;
+    std::fs::write(retained_path.join(JOURNAL_NAME), &altered).unwrap();
+    assert!(
+        SealedJournal::load(&exchange)
+            .unwrap()
+            .unwrap()
+            .authenticate("SYNTHETIC_FIXTURE_12")
+            .is_err()
+    );
+    assert!(
+        sealed.finish(&exchange).is_err(),
+        "a changed journal is retained"
+    );
+    assert_eq!(
+        std::fs::read(retained_path.join(JOURNAL_NAME)).unwrap(),
+        altered
+    );
+    std::fs::write(retained_path.join(JOURNAL_NAME), &original).unwrap();
+    sealed.finish(&exchange).unwrap();
+    // Refuse a structurally changed intent even if it could be authenticated.
+    let mut changed = serde_json::to_value(&journal).unwrap();
+    changed["partitions"] = serde_json::json!([3, 4, 5]);
+    let changed: UpdateJournal = serde_json::from_value(changed).unwrap();
+    assert!(SealedJournal::publish(&exchange, &changed, "SYNTHETIC_FIXTURE_12").is_err());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("model.bin", retained_path.join(JOURNAL_NAME)).unwrap();
+        assert!(SealedJournal::load(&exchange).is_err());
+        std::fs::remove_file(retained_path.join(JOURNAL_NAME)).unwrap();
+        std::fs::hard_link(
+            retained_path.join("model.bin"),
+            retained_path.join(JOURNAL_NAME),
+        )
+        .unwrap();
+        assert!(SealedJournal::load(&exchange).is_err());
+        std::fs::remove_file(retained_path.join(JOURNAL_NAME)).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(retained_path.join("model.bin")).unwrap(),
+        b"SYNTHETIC_FIXTURE_MODEL"
+    );
+    assert_eq!(std::fs::read_dir(&retained_path).unwrap().count(), 2);
     let ticket = approvals
         .issue(
             &plan,
@@ -274,6 +429,9 @@ fn update_preserves_data_and_all_identities_and_refuses_unsafe_plans() {
     target.read_at(esp.start, &mut bytes).unwrap();
     verify_esp(&bytes, &identity).unwrap();
     std::fs::remove_file(target.path()).unwrap();
+    drop(exchange);
+    std::fs::remove_dir_all(exchange_path).unwrap();
+    std::fs::remove_dir_all(retained_path).unwrap();
 }
 
 fn fix_crcs(snapshot: &mut DriveSnapshot) {

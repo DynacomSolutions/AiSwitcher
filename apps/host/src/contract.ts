@@ -8,6 +8,7 @@ export interface DeviceSummary {
   writable: boolean;
   serial: string | null;
   layoutStatus: string;
+  updateError?: string;
 }
 
 export type OperationPhase = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
