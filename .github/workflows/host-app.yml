@@ -119,6 +119,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2t64 xvfb exfatprogs
+          # The package installs into an sbin directory the test process may not have on PATH.
+          mkfs=$(dpkg -L exfatprogs | grep -m1 '/mkfs\.exfat$')
+          echo "AIS_HOST_TEST_EXFAT_TOOLS=$(dirname "$mkfs")" >> "$GITHUB_ENV"
       - name: Install locked dependencies and native toolchain
         run: |
           bun install --frozen-lockfile

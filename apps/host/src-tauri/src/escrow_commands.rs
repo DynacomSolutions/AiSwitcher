@@ -157,11 +157,14 @@ mod tests {
 
     #[test]
     fn handing_over_records_the_drive_without_retaining_the_passphrase() {
-        use std::os::unix::fs::PermissionsExt;
         let directory =
             std::env::temp_dir().join(format!("ais-escrow-sink-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let state = EscrowCommandState::new(directory.clone()).unwrap();
         let passphrase =
             Passphrase::new("SYNTHETIC_FIXTURE_12".into(), "SYNTHETIC_FIXTURE_12").unwrap();

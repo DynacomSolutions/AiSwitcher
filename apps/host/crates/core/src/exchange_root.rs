@@ -235,7 +235,9 @@ impl ExchangeRoot {
             return Err("Cannot inspect exchange free space.".into());
         }
         let stat = unsafe { stat.assume_init() };
-        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+        // fsblkcnt_t is u32 on macOS and u64 on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
     }
 }
 
