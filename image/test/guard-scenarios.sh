@@ -341,7 +341,12 @@ probe_approved() {
   reset_guard || return 1
   start_guarded "$case_name" "$@" || return 1
   mark "$case_name" reply
-  wait "$GUARDED_PID" || { mark "$case_name" failed; return 1; }
+  wait "$GUARDED_PID" || {
+    mark "$case_name" failed
+    tail -n 20 "$TEST_ROOT/guarded.out" | sed 's/^/AIS-GUARD-DIAG: /' >&2
+    journalctl -b --no-pager -o cat -u ais-guardd -n 15 | sed 's/^/AIS-GUARD-DIAG: /' >&2
+    return 1
+  }
   mark "$case_name" ok
 }
 
