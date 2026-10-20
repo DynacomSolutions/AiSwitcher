@@ -36,7 +36,19 @@ type BackupGroup = keyof typeof BACKUP_GROUPS;
 // carry their own .gitattributes. The leading "**/" is what makes it match at
 // any depth in gitignore syntax (rsync matched unanchored).
 // ".caveman-sessions/": transient per-session scratch state that churns while the backup runs.
-const BACKUP_EXCLUDES = [...REPRODUCIBLE_JUNK_DIR_NAMES, "*.lock", "*.sock", "*.pid", "**/jobs/*/tmp/", ".caveman-sessions/"];
+// "*-shm" (SQLite's rebuildable shared-memory index, never data; -wal stays) and
+// ".claude.json.backup.*" (Claude's own rotating copies) appear and vanish faster
+// than git add's retries, failing the backup.
+const BACKUP_EXCLUDES = [
+  ...REPRODUCIBLE_JUNK_DIR_NAMES,
+  "*.lock",
+  "*.sock",
+  "*.pid",
+  "**/jobs/*/tmp/",
+  ".caveman-sessions/",
+  "*-shm",
+  ".claude.json.backup.*",
+];
 
 function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");

@@ -113,6 +113,21 @@ describe("runBackup integration", () => {
     expect(await gitShow(repoDir, ".codex/identities.json")).not.toBeNull();
   });
 
+  test("excludes churning SQLite -shm files and Claude's rotating .claude.json backups, keeps -wal", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "state.sqlite-wal"), "wal\n");
+    await write(join(home, ".codex", "state.sqlite-shm"), "shm\n");
+    await write(join(home, ".claude", "backups", ".claude.json.backup.1792420307980"), "{}\n");
+    await write(join(home, ".claude", "settings.json"), "{}\n");
+
+    const repoDir = await runBackup(["codex", "claude"], home);
+
+    expect(await gitShow(repoDir, ".codex/state.sqlite-wal")).toBe("wal\n");
+    expect(await gitShow(repoDir, ".codex/state.sqlite-shm")).toBeNull();
+    expect(await gitShow(repoDir, ".claude/backups/.claude.json.backup.1792420307980")).toBeNull();
+    expect(await gitShow(repoDir, ".claude/settings.json")).not.toBeNull();
+  });
+
   test("still includes SQLite databases, unlike SSH sync's own exclude list", async () => {
     const home = await makeHome();
     await write(join(home, ".zai", "identities.json"), "{}\n");
