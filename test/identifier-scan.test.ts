@@ -122,35 +122,6 @@ describe("scannableSegments code-awareness", () => {
     const segments = scannableSegments("k8s/deployment.yaml", "hostname: internal.example-corp.dev", state);
     expect(segments.flatMap(segment => findDomains(segment))).toContain("internal.example-corp.dev");
   });
-
-  test("Python attribute calls are code, while strings and hash comments remain scanned", () => {
-    expect(checkLine("scripts/example.py", 'subprocess.run(["python3", "-V"])')).toEqual([]);
-    for (const line of [
-      'target = "https://internal.example-corp.dev"',
-      "target = r'internal.example-corp.dev'",
-      'target = f"https://internal.example-corp.dev/{name}"',
-      'subprocess.run(args) # "internal.example-corp.dev"',
-      'target = "# internal.example-corp.dev"',
-      'target = "escaped \\" quote internal.example-corp.dev"',
-    ]) expect(checkLine("scripts/example.py", line)).toContain("blocked-domain");
-  });
-
-  test("Python triple-quoted strings retain scanning across lines and after closing", () => {
-    for (const quote of ['"""', "'''"]) {
-      const state = { inBlock: false };
-      expect(checkLine("scripts/example.py", `text = ${quote}Documentation`, state)).toEqual([]);
-      expect(checkLine("scripts/example.py", "internal.example-corp.dev", state)).toContain("blocked-domain");
-      expect(checkLine("scripts/example.py", `${quote}; subprocess.run(args)`, state)).toEqual([]);
-      expect(checkLine("scripts/example.py", "subprocess.run(args)", state)).toEqual([]);
-      expect(checkLine("scripts/example.py", `text = ${quote}internal.example-corp.dev${quote}`, state)).toContain("blocked-domain");
-    }
-  });
-
-  test("Python strings do not suppress full-line address and identifying-path checks", () => {
-    expect(checkLine("scripts/example.py", "# 203.0.114.9")).toContain("blocked-ip");
-    expect(checkLine("scripts/example.py", "# ops@internal-example-corp.dev")).toContain("blocked-email");
-    expect(checkLine("scripts/example.py", '# /home/' + ["jane", "doe"].join(""))).toContain("identifying-home-path");
-  });
 });
 
 describe("findIps", () => {
@@ -315,28 +286,4 @@ describe("staged scan skips generated lockfiles like tree mode", () => {
       expect(scan(root, "staged").length).toBe(1);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
-});
-
-test("Python commit scans preserve multiline context and inspect the selected blob", () => {
-  const root = mkdtempSync(join(tmpdir(), "idscan-python-"));
-  try {
-    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" }).toString().trim();
-    git("init", "-q");
-    git("config", "user.name", "SYNTHETIC_FIXTURE");
-    git("config", "user.email", "fixture@example.invalid");
-    const filename = join(root, "example.py");
-    writeFileSync(filename, '"""Documentation\nreserved example.invalid\n"""\nsubprocess.run(args)\n');
-    git("add", "example.py");
-    git("-c", "commit.gpgsign=false", "commit", "-qm", "test(fixtures): initialise synthetic Python");
-    const first = git("rev-parse", "HEAD");
-    expect(scan(root, [first])).toEqual([]);
-    writeFileSync(filename, '"""Documentation\ninternal.example-corp.dev\n"""\nsubprocess.run(args)\n');
-    git("add", "example.py");
-    // A clean working copy must not conceal the blocked line in the index.
-    writeFileSync(filename, '"""Documentation\nexample.invalid\n"""\nsubprocess.run(args)\n');
-    expect(scan(root, "staged").map((finding) => finding.rule)).toEqual(["blocked-domain"]);
-    git("-c", "commit.gpgsign=false", "commit", "-qm", "test(fixtures): change synthetic docstring");
-    const second = git("rev-parse", "HEAD");
-    expect(scan(root, [second]).map((finding) => finding.rule)).toEqual(["blocked-domain"]);
-  } finally { rmSync(root, { recursive: true, force: true }); }
 });

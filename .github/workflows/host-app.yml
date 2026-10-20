@@ -72,14 +72,8 @@ jobs:
           sudo apt-get install -y expect
           echo "HOST_TEST_SCRATCH=$RUNNER_TEMP/host-exchange" >> "$GITHUB_ENV"
       - name: Tests selected by dependencies
-        env:
-          SELECTION: ${{ needs.changes.outputs.selection }}
-        run: |
-          if [ "$SELECTION" = all ]; then
-            bun test
-          else
-            bun test test/host
-          fi
+        # The full suite already runs in CI; this job covers the host tests only.
+        run: bun test test/host
 
   native:
     needs: changes
@@ -132,6 +126,12 @@ jobs:
           cd apps/host
           rustup show
           cargo install tauri-cli --version 2.12.3 --locked
+      # generate_context! needs the built frontend before any cargo step.
+      - name: Frontend typecheck and build
+        working-directory: apps/host
+        run: |
+          bun run typecheck
+          bun run build
       - name: Rust format, tests and lint
         working-directory: apps/host
         run: |
@@ -142,11 +142,6 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: apps/host
         run: cargo test --locked --workspace --features file-test
-      - name: Frontend typecheck and build
-        working-directory: apps/host
-        run: |
-          bun run typecheck
-          bun run build
       - name: Browser smoke
         if: runner.os == 'Linux'
         run: |
