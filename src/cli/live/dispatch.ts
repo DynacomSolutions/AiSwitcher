@@ -1,7 +1,7 @@
 import { openSync, closeSync } from "node:fs";
 import { createReadStream, createWriteStream } from "node:fs";
 import { createInterface } from "node:readline/promises";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { CliUsageError } from "../errors.ts";
 import { applyInbox, readInboxStdin, type InboxClock } from "../../live/inbox.ts";
 import { writeOutbox } from "../../live/outbox.ts";
@@ -26,12 +26,20 @@ export interface ClockSnapshotDeps {
   fetchImpl?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   nowMs?: () => number;
   synchronizedProbe?: () => Promise<boolean>;
+  networkInterfaces?: typeof networkInterfaces;
 }
 
-function confirmedOffline(error: unknown): boolean {
+function confirmedOffline(error: unknown, interfaces: typeof networkInterfaces): boolean {
   if (!error || typeof error !== "object") return false;
   const values = [error as { code?: unknown }, (error as { cause?: { code?: unknown } }).cause];
-  return values.some((value) => value && typeof value.code === "string" && ["ENETUNREACH", "EHOSTUNREACH", "ENETDOWN"].includes(value.code));
+  const codes = values.flatMap((value) => typeof value?.code === "string" ? [value.code] : []);
+  if (codes.some((code) => ["ENETUNREACH", "EHOSTUNREACH", "ENETDOWN"].includes(code))) return true;
+  // Bun can report DNS failure as ConnectionRefused on a guest without a NIC.
+  // A refusal alone is not offline evidence, and TLS errors must stay unsafe.
+  if (!codes.some((code) => ["ConnectionRefused", "ECONNREFUSED", "DNSLookupFailed", "ENOTFOUND", "EAI_AGAIN"].includes(code))) return false;
+  try {
+    return Object.values(interfaces()).every((addresses) => !addresses?.some((address) => !address.internal));
+  } catch { return false; }
 }
 
 export async function clockSnapshot(home: string, deps: ClockSnapshotDeps = {}): Promise<InboxClock> {
@@ -64,7 +72,7 @@ export async function clockSnapshot(home: string, deps: ClockSnapshotDeps = {}):
       if (Number.isFinite(parsed)) httpDateMs = parsed;
     }
   } catch (error) {
-    if (confirmedOffline(error)) online = false;
+    if (confirmedOffline(error, deps.networkInterfaces ?? networkInterfaces)) online = false;
   }
   return { synchronized, imageBuildTimeMs: buildTimeMs, newestPersistedMtimeMs, ...(httpDateMs === undefined ? {} : { httpDateMs }), online, nowMs: (deps.nowMs ?? Date.now)() };
 }

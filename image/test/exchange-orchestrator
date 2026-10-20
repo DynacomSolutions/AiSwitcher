@@ -47,9 +47,18 @@ case $group in
     ;;
   auth)
     run_case boot
+    # systemd may advance an old RTC to its build-time floor during startup.
+    # Hold retries and clock synchronisation while testing both clock states.
+    systemctl stop ais-live-inbox.timer systemd-timesyncd.service || finish clock-sync-stop-failed
     stage auth
+    media_now=$(<"$tests/now")
+    guest_now=$(date +%s) || finish clock-read-failed
+    [[ $media_now =~ ^[0-9]+$ && $guest_now =~ ^[0-9]+$ ]] || finish clock-read-failed
+    # Keep the restored time beyond writes made since the test media was built.
+    plausible_now=$(( (media_now > guest_now ? media_now : guest_now) + 1 ))
+    date -s '@946684800' >/dev/null || finish clock-set-failed
     run_case auth-deferred
-    date -s "@$(cat /usr/local/lib/ais-live-test/now)" >/dev/null
+    date -s "@$plausible_now" >/dev/null || finish clock-set-failed
     run_case auth-plausible
     ;;
   *) finish unknown-group ;;

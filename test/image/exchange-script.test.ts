@@ -9,6 +9,62 @@ const script = new URL("../../image/lib/ais-outbox", import.meta.url).pathname;
 const fixtureCredential = "SYNTHETIC_FIXTURE_age_probe";
 const expectBin = process.env.AIS_EXPECT_BIN ?? Bun.which("expect") ?? "";
 
+test("auth scenario rewinds the guest clock explicitly and restores a time after persisted writes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ais-exchange-clock-scenario-"));
+  try {
+    const bin = join(root, "bin");
+    await mkdir(bin);
+    await writeFile(join(root, "exchange-group"), "auth\n");
+    await writeFile(join(root, "now"), "1800000000\n");
+    const helpers = {
+      "exchange-capability-probe": "#!/bin/bash\nexit 0\n",
+      "exchange-host.sh": "#!/bin/bash\nexit 0\n",
+      "exchange-scenarios.sh": `#!/bin/bash
+case $1 in
+  auth-deferred) [[ $(<"$AIS_TEST_CLOCK") == 946684800 ]] || exit 1 ;;
+  auth-plausible) (( $(<"$AIS_TEST_CLOCK") >= 1800000100 )) || exit 1 ;;
+esac
+printf 'checked:%s\\n' "$1"
+`,
+      "bin/date": `#!/bin/bash
+case $1 in
+  +%s) cat "$AIS_TEST_CLOCK" ;;
+  -s)
+    [[ \${AIS_TEST_DATE_FAIL:-0} != 1 ]] || exit 1
+    printf '%s\\n' "\${2#@}" >"$AIS_TEST_CLOCK"
+    ;;
+  *) exit 2 ;;
+esac
+`,
+      "bin/systemctl": "#!/bin/bash\nprintf 'systemctl:%s\\n' \"$*\"\n",
+    };
+    for (const [name, text] of Object.entries(helpers)) {
+      await writeFile(join(root, name), text, { mode: 0o700 });
+    }
+    const orchestrator = await readFile(new URL("../../image/test/exchange-orchestrator", import.meta.url), "utf8");
+    // Only redirect the guest's absolute I/O endpoints; execute its real ordering.
+    const isolated = orchestrator.replace("exec >/dev/ttyS0 2>&1", "exec 2>&1")
+      .replace("tests=/usr/local/lib/ais-live-test", 'tests=$1')
+      .replaceAll("/usr/local/lib/ais-live-test/now", '"$tests/now"')
+      .replaceAll("/usr/bin/systemctl", "systemctl");
+    const run = async (dateFails = false) => {
+      await writeFile(join(root, "clock"), "1800000100\n");
+      return spawnSync("/bin/bash", ["-c", isolated, "_", root], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, AIS_TEST_CLOCK: join(root, "clock"), AIS_TEST_DATE_FAIL: dateFails ? "1" : "0" },
+      });
+    };
+    const good = await run();
+    expect(good.status, good.stderr).toBe(0);
+    expect(good.stdout).toContain("checked:auth-deferred");
+    expect(good.stdout).toContain("checked:auth-plausible");
+    expect(good.stdout).toContain("case=orchestrator status=done");
+    const failedSet = await run(true);
+    expect(failedSet.stdout).toContain("case=orchestrator status=clock-set-failed");
+    expect(failedSet.stdout).not.toContain("checked:auth-deferred");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("exchange outbox sequence treats only a missing directory as empty", async () => {
   const root = await mkdtemp(join(process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir(), "ais-exchange-sequence-"));
   try {
