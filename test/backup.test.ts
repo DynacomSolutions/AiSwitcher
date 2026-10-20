@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, rm, symlink, realpath } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -111,6 +111,21 @@ describe("runBackup integration", () => {
     expect(await gitShow(repoDir, ".codex/node_modules/pkg/index.js")).toBeNull();
     expect(await gitShow(repoDir, ".codex/cache/big.bin")).toBeNull();
     expect(await gitShow(repoDir, ".codex/identities.json")).not.toBeNull();
+  });
+
+  test("excludes churning SQLite -shm files and Claude's rotating .claude.json backups, keeps -wal", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "state.sqlite-wal"), "wal\n");
+    await write(join(home, ".codex", "state.sqlite-shm"), "shm\n");
+    await write(join(home, ".claude", "backups", ".claude.json.backup.1792420307980"), "{}\n");
+    await write(join(home, ".claude", "settings.json"), "{}\n");
+
+    const repoDir = await runBackup(["codex", "claude"], home);
+
+    expect(await gitShow(repoDir, ".codex/state.sqlite-wal")).toBe("wal\n");
+    expect(await gitShow(repoDir, ".codex/state.sqlite-shm")).toBeNull();
+    expect(await gitShow(repoDir, ".claude/backups/.claude.json.backup.1792420307980")).toBeNull();
+    expect(await gitShow(repoDir, ".claude/settings.json")).not.toBeNull();
   });
 
   test("still includes SQLite databases, unlike SSH sync's own exclude list", async () => {
@@ -243,6 +258,20 @@ describe("runBackup integration", () => {
     await write(join(repoDir, ".git", "index.lock"), "");
     await write(join(home, ".codex", "a.txt"), "b\n");
     await expect(runBackup(["codex"], home)).rejects.toThrow(/git add failed/);
+  });
+
+  test("an index.lock older than a minute (killed git) is removed and the backup commits", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    const repoDir = await runBackup(["codex"], home);
+    const lock = join(repoDir, ".git", "index.lock");
+    await write(lock, "");
+    const old = new Date(Date.now() - 2 * 3600_000);
+    await utimes(lock, old, old);
+    await write(join(home, ".codex", "a.txt"), "b\n");
+    await runBackup(["codex"], home);
+    expect(await gitShow(repoDir, ".codex/a.txt")).toBe("b\n");
+    expect(existsSync(lock)).toBe(false);
   });
 
   test("nested git repos are stored as files, not gitlinks", async () => {
