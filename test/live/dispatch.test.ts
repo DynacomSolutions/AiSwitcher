@@ -101,14 +101,16 @@ describe("live stdin contract", () => {
       const interfaces = (internal: boolean) => ({
         synthetic: [{ internal, address: "127.0.0.1", netmask: "", family: "IPv4" as const, mac: "", cidr: null }],
       });
-      const snapshot = (code: string, networkInterfaces = () => interfaces(true)) => clockSnapshot(home, {
-        buildTimeFile, synchronizedProbe: async () => false, networkInterfaces,
+      const snapshot = (code: string, networkInterfaces = () => interfaces(true), netDevices = () => ["lo"]) => clockSnapshot(home, {
+        buildTimeFile, synchronizedProbe: async () => false, networkInterfaces, netDevices,
         fetchImpl: async () => { throw Object.assign(new Error("probe failed"), { code }); },
       });
       for (const code of ["ConnectionRefused", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "DNSLookupFailed", "UNKNOWN", "TimeoutError"]) {
         expect((await snapshot(code)).online).toBe(false);
         expect((await snapshot(code, () => interfaces(false))).online).toBe(true);
-        expect((await snapshot(code, () => { throw new Error("interface query failed"); })).online).toBe(true);
+        expect((await snapshot(code, () => { throw new Error("interface query failed"); }, () => { throw new Error("no sysfs"); })).online).toBe(true);
+        expect((await snapshot(code, () => { throw new Error("interface query failed"); }, () => ["lo"])).online).toBe(false);
+        expect((await snapshot(code, () => { throw new Error("interface query failed"); }, () => ["lo", "eth0"])).online).toBe(true);
       }
       for (const code of ["CERT_HAS_EXPIRED", "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_SSL_WRONG_VERSION_NUMBER"]) {
         expect((await snapshot(code)).online).toBe(true);

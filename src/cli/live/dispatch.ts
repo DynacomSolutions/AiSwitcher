@@ -1,4 +1,4 @@
-import { openSync, closeSync } from "node:fs";
+import { openSync, closeSync, readdirSync } from "node:fs";
 import { createReadStream, createWriteStream } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { homedir, networkInterfaces } from "node:os";
@@ -27,9 +27,10 @@ export interface ClockSnapshotDeps {
   nowMs?: () => number;
   synchronizedProbe?: () => Promise<boolean>;
   networkInterfaces?: typeof networkInterfaces;
+  netDevices?: () => string[];
 }
 
-function confirmedOffline(error: unknown, interfaces: typeof networkInterfaces): boolean {
+function confirmedOffline(error: unknown, interfaces: typeof networkInterfaces, devices: () => string[]): boolean {
   if (!error || typeof error !== "object") return false;
   const values = [error as { code?: unknown }, (error as { cause?: { code?: unknown } }).cause];
   const codes = values.flatMap((value) => typeof value?.code === "string" ? [value.code] : []);
@@ -39,7 +40,10 @@ function confirmedOffline(error: unknown, interfaces: typeof networkInterfaces):
   // Otherwise, with no non-loopback interface no fetch can reach a server, whatever code Bun reports.
   try {
     return Object.values(interfaces()).every((addresses) => !addresses?.some((address) => !address.internal));
-  } catch { return false; }
+  } catch {
+    // The inbox unit's address-family filter blocks the netlink lookup; sysfs still lists every device.
+    try { return devices().every((name) => name === "lo"); } catch { return false; }
+  }
 }
 
 export async function clockSnapshot(home: string, deps: ClockSnapshotDeps = {}): Promise<InboxClock> {
@@ -72,7 +76,7 @@ export async function clockSnapshot(home: string, deps: ClockSnapshotDeps = {}):
       if (Number.isFinite(parsed)) httpDateMs = parsed;
     }
   } catch (error) {
-    if (confirmedOffline(error, deps.networkInterfaces ?? networkInterfaces)) online = false;
+    if (confirmedOffline(error, deps.networkInterfaces ?? networkInterfaces, deps.netDevices ?? (() => readdirSync("/sys/class/net")))) online = false;
     else {
       const detail = error as { name?: unknown; code?: unknown; cause?: { code?: unknown } } | undefined;
       console.error(`AIS-LIVE: stage=clock status=online-assumed name=${String(detail?.name)} code=${String(detail?.code)} cause=${String(detail?.cause?.code)}`);
