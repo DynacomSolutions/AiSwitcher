@@ -467,7 +467,7 @@ impl MacBlockTarget {
         // service and peer policy are packaged. The private constructor below
         // contains the native sequence for that future reviewed bridge.
         let _ = identifier;
-        return Err(ObservationError::NativeUnavailable);
+        Err(ObservationError::NativeUnavailable)
     }
 
     fn open_after_native_authorisation(
@@ -729,11 +729,11 @@ fn run_bounded(
         }
         thread::sleep(Duration::from_millis(10));
     };
-    if let Some(writer) = writer {
-        if writer.join().map_or(true, |result| result.is_err()) {
-            let _ = reader.join();
-            return Err(ObservationError::NativeUnavailable);
-        }
+    if let Some(writer) = writer
+        && writer.join().map_or(true, |result| result.is_err())
+    {
+        let _ = reader.join();
+        return Err(ObservationError::NativeUnavailable);
     }
     let (read_result, bytes) = output_rx
         .recv_timeout(Duration::from_secs(1))
@@ -1027,7 +1027,7 @@ fn collect_partition_ids(value: &Value, out: &mut Vec<String>) -> Result<(), Obs
 
 #[cfg(target_os = "macos")]
 fn read_table_fingerprint(file: &File, capacity_bytes: u64) -> Result<[u8; 32], ObservationError> {
-    if capacity_bytes < (TABLE_WINDOW_BYTES * 2) as u64 || capacity_bytes % 512 != 0 {
+    if capacity_bytes < (TABLE_WINDOW_BYTES * 2) as u64 || !capacity_bytes.is_multiple_of(512) {
         return Err(ObservationError::InvalidInput);
     }
     let mut head = vec![0; TABLE_WINDOW_BYTES];

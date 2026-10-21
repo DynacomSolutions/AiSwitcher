@@ -559,10 +559,10 @@ mod native_observation {
                 device,
             )
         };
-        if first != 0 || required < 8 || required > 64 * 1024 {
+        if first != 0 || !(8..=64 * 1024).contains(&required) {
             return Err(ObservationError::NativeUnavailable);
         }
-        let mut aligned = vec![0_u64; (required as usize + 7) / 8];
+        let mut aligned = vec![0_u64; (required as usize).div_ceil(8)];
         let buffer = aligned.as_mut_ptr().cast::<u8>();
         unsafe {
             *(buffer.cast::<u32>()) = 8;
@@ -703,8 +703,7 @@ mod native_observation {
                 ptr::null_mut(),
             )
         } == 0
-            || returned < 8
-            || returned > 12
+            || !(8..=12).contains(&returned)
         {
             return Err(ObservationError::NativeUnavailable);
         }
@@ -752,8 +751,7 @@ mod native_observation {
                 ptr::null_mut(),
             )
         } == 0
-            || returned < 20
-            || returned > 28
+            || !(20..=28).contains(&returned)
         {
             return Err(ObservationError::NativeUnavailable);
         }
