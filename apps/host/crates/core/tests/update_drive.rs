@@ -180,7 +180,9 @@ fn update_resumes_each_partition_without_changing_exchange_persist_or_identity()
     let exchange =
         ais_host_core::exchange_root::ExchangeRoot::test_directory(&exchange_path).unwrap();
     let journal = UpdateJournal::new(&image, installed.clone()).unwrap();
-    journal.check_drive(&snapshot, &installed, "updating").unwrap();
+    journal
+        .check_drive(&snapshot, &installed, "updating")
+        .unwrap();
     assert!(
         journal
             .check_drive(&snapshot, &unknown, "updating")
