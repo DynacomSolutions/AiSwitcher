@@ -335,7 +335,8 @@ fn trusted_tool(name: &str) -> Result<std::path::PathBuf, &'static str> {
     #[cfg(target_os = "linux")]
     const DIRECTORIES: [&str; 2] = ["/usr/sbin", "/usr/bin"];
     #[cfg(target_os = "macos")]
-    const DIRECTORIES: [&str; 3] = ["/usr/sbin", "/usr/bin", "/sbin"];
+    // newfs_exfat ships in /sbin on current macOS.
+    const DIRECTORIES: [&str; 1] = ["/sbin"];
     for directory in DIRECTORIES {
         let Ok(path) = Path::new(directory).join(name).canonicalize() else {
             continue;

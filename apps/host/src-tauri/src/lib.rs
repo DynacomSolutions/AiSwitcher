@@ -1058,16 +1058,18 @@ fn native_write_support() -> ais_host_core::device::WriteSupport {
     let helper = ais_host_helper::protocol::macos_transport::helper_installed();
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let helper = false;
+    let missing_helper = if cfg!(target_os = "macos") {
+        "Writing needs the signed, notarised application with its bundled helper; this build is unsigned or a development build."
+    } else {
+        "The ais host helper package is not installed or does not verify."
+    };
     let (enabled, reason) = match (key_present, helper) {
         (true, true) => (true, "Ready."),
         (false, _) => (
             false,
             "The production image signing key is not bundled in this build.",
         ),
-        (_, false) => (
-            false,
-            "The ais host helper package is not installed or does not verify.",
-        ),
+        (_, false) => (false, missing_helper),
     };
     ais_host_core::device::WriteSupport { enabled, reason }
 }
