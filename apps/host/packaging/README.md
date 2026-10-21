@@ -21,16 +21,34 @@ user's process whose kernel audit token passes the same requirement (checked
 again before every write). Unsigned or development builds list drives but
 refuse to write.
 
-Windows x86_64 uses a portable ZIP with adjacent executables and resource
-files. Windows signing is deferred. WebView2 must already be available.
-Listing USB drives needs no elevation. The helper starts elevated through UAC
-(`runas`) only when a preview or write begins, and only from the executable
-next to the application. It creates a named pipe whose DACL admits the
-launching user's SID alone (first instance, no remote clients) and accepts one
-client: the process whose image is the application beside it, rechecked before
-each volume is locked. It takes a disk number, never a path, and re-validates
-the disk itself. Creating and updating drives stay unavailable on Windows
-because the exFAT exchange partition cannot yet be opened there.
+Windows x86_64 ships a per-machine NSIS installer (`ais-host-windows-x64-setup.exe`,
+installed under `%ProgramFiles%`) and a portable ZIP. Windows signing is
+deferred, so neither carries an Authenticode signature yet and SmartScreen or
+the UAC prompt shows an unknown publisher. WebView2 must already be available.
+
+Listing USB drives needs no elevation and works from either package. Writing
+works only from the installer. Before it shows a UAC prompt the application
+reads the DACLs of the helper, its directory and every directory above it, and
+refuses unless only SYSTEM, Administrators and TrustedInstaller own them and
+can write, delete or re-permission them (the C:\ root's "create folders" for
+Authenticated Users is tolerated, as it cannot replace entries). A portable
+copy in a user-writable folder therefore cannot elevate a replaced helper. The
+helper is also linked with `/DEPENDENTLOADFLAG:0x800` (checked by the release
+build) and restricts its own DLL search to System32.
+
+The helper starts elevated through UAC (`runas`) only when a preview or write
+begins. It creates a named pipe whose DACL admits the launching user's SID
+alone (first instance, no remote clients) and accepts one client: the process
+whose image is the application beside it, rechecked before each volume is
+locked. The application accepts only the process it launched. Other processes
+running as the same user are inside the trust boundary: they can run the
+application too, as the user, and the typed confirmation, single-use ticket and
+plan digest are what stand between that and a write. The helper takes a disk
+number, never a path, re-validates the disk itself and checks the device number
+again on the handle it writes. After a create it formats the new exchange
+partition (found by its host-assigned GPT partition GUID, disk and byte range)
+as exFAT with the system `format` tool, and the application opens that volume
+by its volume GUID path, without a drive letter, refusing reparse points.
 
 Linux x86_64 uses AppImage. Extracting with `--appimage-extract` supports
 computers without FUSE. The app directory may be read-only; ais state remains

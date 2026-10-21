@@ -81,6 +81,54 @@ pub mod windows_wire {
         !left.is_empty() && left == right
     }
 
+    /// Rights that let a principal change a file or plant files beside it:
+    /// write data / add file, append / add subdirectory, extended attributes,
+    /// delete child, write attributes, delete, change DACL, change owner, and
+    /// the generic write and all rights.
+    pub const WRITE_FILE: u32 = 0x0002
+        | 0x0004
+        | 0x0010
+        | 0x0040
+        | 0x0100
+        | 0x0001_0000
+        | 0x0004_0000
+        | 0x0008_0000
+        | 0x4000_0000
+        | 0x1000_0000;
+    /// For directories above the helper's own: adding children there cannot
+    /// replace the helper, but deleting entries or changing the ACL can.
+    pub const WRITE_ANCESTOR: u32 = 0x0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x1000_0000;
+
+    /// SYSTEM, the Administrators group and TrustedInstaller.
+    pub fn is_trusted_principal(sid: &str) -> bool {
+        matches!(
+            sid,
+            "S-1-5-18"
+                | "S-1-5-32-544"
+                | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        )
+    }
+
+    /// One access-allowed ACE of a DACL.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Ace {
+        pub sid: String,
+        pub mask: u32,
+        /// Applies to children only, not to the object itself.
+        pub inherit_only: bool,
+    }
+
+    /// True when only trusted principals own the object and hold any of the
+    /// `forbidden` rights on it. Users, Authenticated Users, Everyone,
+    /// INTERACTIVE, CREATOR OWNER and the current user are never trusted.
+    /// Deny entries are ignored: they cannot make another grant safe.
+    pub fn acl_is_protected(owner: &str, aces: &[Ace], forbidden: u32) -> bool {
+        is_trusted_principal(owner)
+            && aces.iter().all(|ace| {
+                ace.inherit_only || ace.mask & forbidden == 0 || is_trusted_principal(&ace.sid)
+            })
+    }
+
     /// Bytes of one whole-sector read that covers `offset..offset + length`:
     /// the aligned start, the window length and the bytes to skip.
     pub fn covering_window(sector: u64, offset: u64, length: usize) -> Option<(u64, usize, usize)> {
@@ -105,7 +153,8 @@ pub mod windows_transport {
         operation_binding,
     };
     use super::windows_wire::{
-        PIPE_PREFIX, pipe_sddl, same_path, sid_rid, valid_pipe_name, valid_sid,
+        Ace, PIPE_PREFIX, WRITE_ANCESTOR, WRITE_FILE, acl_is_protected, pipe_sddl, same_path,
+        sid_rid, valid_pipe_name, valid_sid,
     };
     use ais_host_core::release::hex;
     use std::{
@@ -115,7 +164,7 @@ pub mod windows_transport {
         os::windows::{
             ffi::{OsStrExt, OsStringExt},
             fs::OpenOptionsExt,
-            io::{AsRawHandle, FromRawHandle, RawHandle},
+            io::{FromRawHandle, RawHandle},
         },
         path::{Path, PathBuf},
         ptr,
@@ -131,12 +180,14 @@ pub mod windows_transport {
             GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_TIMEOUT,
         },
         Security::{
+            ACL,
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                SDDL_REVISION_1,
+                GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
             },
             Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
-            GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+            DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+            SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
@@ -244,24 +295,130 @@ pub mod windows_transport {
         }
         // SAFETY: the call filled a TOKEN_USER at the start of the aligned buffer.
         let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        sid_string(user.User.Sid)
+            .filter(|sid| valid_sid(sid))
+            .ok_or(ProtocolError::Transport)
+    }
+
+    /// The string form of a SID, or None when it cannot be converted.
+    fn sid_string(sid: *mut std::ffi::c_void) -> Option<String> {
         let mut text: *mut u16 = ptr::null_mut();
-        // SAFETY: the SID belongs to the buffer above; the output is a valid slot.
-        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 || text.is_null() {
-            return Err(ProtocolError::Transport);
+        // SAFETY: the caller passes a valid SID; the output is a valid slot.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return None;
         }
         let mut length = 0;
         // SAFETY: the API returned a NUL-terminated string that LocalFree releases.
-        let sid = unsafe {
+        unsafe {
             while *text.add(length) != 0 {
                 length += 1;
             }
             let sid = String::from_utf16(std::slice::from_raw_parts(text, length));
             LocalFree(text.cast());
-            sid
+            sid.ok()
+        }
+    }
+
+    /// Owner and allow entries of one file or directory. A missing DACL (full
+    /// access for everyone) and any entry kind that is not a plain allow or
+    /// deny are reported as unprotected by returning None.
+    fn read_acl(path: &Path) -> Option<(String, Vec<Ace>)> {
+        let name = wide(path);
+        let mut owner: *mut std::ffi::c_void = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: *mut std::ffi::c_void = ptr::null_mut();
+        // SAFETY: the path is NUL-terminated; the outputs are valid slots.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
         };
-        sid.ok()
-            .filter(|sid| valid_sid(sid))
-            .ok_or(ProtocolError::Transport)
+        if status != 0 || descriptor.is_null() {
+            return None;
+        }
+        let result = (|| {
+            if dacl.is_null() || owner.is_null() {
+                return None;
+            }
+            let owner = sid_string(owner)?;
+            // SAFETY: the DACL belongs to the descriptor, which is still alive.
+            let count = unsafe { (*dacl).AceCount };
+            let mut aces = Vec::new();
+            for index in 0..u32::from(count) {
+                let mut entry: *mut std::ffi::c_void = ptr::null_mut();
+                // SAFETY: the index is below the ACE count of this ACL.
+                if unsafe { GetAce(dacl, index, &mut entry) } == 0 || entry.is_null() {
+                    return None;
+                }
+                // SAFETY: every ACE starts with a four-byte header and a mask.
+                let (kind, flags, mask) = unsafe {
+                    let bytes = entry.cast::<u8>();
+                    (
+                        *bytes,
+                        *bytes.add(1),
+                        bytes.add(4).cast::<u32>().read_unaligned(),
+                    )
+                };
+                match kind {
+                    // ACCESS_ALLOWED_ACE_TYPE: the SID follows the mask.
+                    0 => {
+                        // SAFETY: an allowed ACE holds its SID at offset 8.
+                        let sid = sid_string(unsafe { entry.cast::<u8>().add(8) }.cast())?;
+                        aces.push(Ace {
+                            sid,
+                            mask,
+                            inherit_only: flags & 0x08 != 0,
+                        });
+                    }
+                    // Plain, object and callback denies cannot grant anything.
+                    1 | 6 | 10 | 12 => {}
+                    // Any other allow-like entry is not understood: unsafe.
+                    _ => return None,
+                }
+            }
+            Some((owner, aces))
+        })();
+        // SAFETY: the descriptor was allocated by GetNamedSecurityInfoW.
+        unsafe { LocalFree(descriptor) };
+        result
+    }
+
+    fn protected(path: &Path, forbidden: u32) -> bool {
+        read_acl(path).is_some_and(|(owner, aces)| acl_is_protected(&owner, &aces, forbidden))
+    }
+
+    /// The helper runs elevated, so it must come from a location non-admin
+    /// code cannot write: the file and its directory (where DLLs would be
+    /// searched) refuse every write right to anyone but SYSTEM, Administrators
+    /// and TrustedInstaller, and so does the chain above against deleting or
+    /// re-permissioning entries. A per-machine installer produces this layout.
+    fn verify_protected_install(helper: &Path) -> Result<(), ProtocolError> {
+        let helper =
+            std::fs::canonicalize(helper).map_err(|_| ProtocolError::PackageTrustUnavailable)?;
+        // Win32 form: the verbatim prefix is not accepted by the security API.
+        let plain = helper.to_string_lossy();
+        let helper = PathBuf::from(plain.strip_prefix(r"\\?\").unwrap_or(&plain));
+        let mut ok = protected(&helper, WRITE_FILE);
+        for (depth, directory) in helper.ancestors().skip(1).enumerate() {
+            let forbidden = if depth == 0 {
+                WRITE_FILE
+            } else {
+                WRITE_ANCESTOR
+            };
+            ok &= protected(directory, forbidden);
+        }
+        if ok {
+            Ok(())
+        } else {
+            Err(ProtocolError::PackageTrustUnavailable)
+        }
     }
 
     fn image_path(process: HANDLE) -> Option<PathBuf> {
@@ -317,10 +474,15 @@ pub mod windows_transport {
     }
 
     fn installation() -> Result<(PathBuf, PathBuf), ProtocolError> {
-        bundle_paths(&std::env::current_exe().map_err(|_| ProtocolError::PackageTrustUnavailable)?)
+        let (application, helper) = bundle_paths(
+            &std::env::current_exe().map_err(|_| ProtocolError::PackageTrustUnavailable)?,
+        )?;
+        verify_protected_install(&helper)?;
+        Ok((application, helper))
     }
 
-    /// True when the application and its helper sit side by side.
+    /// True when the application and its helper sit side by side in a
+    /// location only administrators can write.
     pub fn helper_installed() -> bool {
         installation().is_ok()
     }
@@ -435,15 +597,6 @@ pub mod windows_transport {
         Ok(process)
     }
 
-    fn client_pid(stream: &File) -> Result<u32, ProtocolError> {
-        let mut pid = 0u32;
-        // SAFETY: the handle belongs to the stream; the output is a writable u32.
-        if unsafe { GetNamedPipeClientProcessId(stream.as_raw_handle() as HANDLE, &mut pid) } == 0 {
-            return Err(ProtocolError::UntrustedPeer);
-        }
-        Ok(pid)
-    }
-
     /// A private file nobody else can open: exclusive from creation and
     /// deleted when the last handle closes.
     fn private_file() -> Result<File, ProtocolError> {
@@ -528,9 +681,6 @@ pub mod windows_transport {
             return Err(ProtocolError::ExpiredOrReplayed);
         }
         let sources = receive_sources(&mut stream)?;
-        if client_pid(&stream)? != pid {
-            return Err(ProtocolError::UntrustedPeer);
-        }
         verify_peer(&peer, &application)?;
         Ok((
             AuthenticatedChannel {
@@ -820,6 +970,87 @@ mod tests {
         assert!(!same_path(r"C:\Ais\app.exe", r"C:\Ais\other.exe"));
         assert!(!same_path(r"C:\Ais\app.exe", r"D:\Ais\app.exe"));
         assert!(!same_path("", ""));
+    }
+
+    fn ace(sid: &str, mask: u32) -> Ace {
+        Ace {
+            sid: sid.into(),
+            mask,
+            inherit_only: false,
+        }
+    }
+
+    #[test]
+    fn only_admin_owned_and_admin_writable_paths_are_protected() {
+        const READ_EXECUTE: u32 = 0x0012_00A9;
+        const MODIFY: u32 = 0x0013_01BF;
+        let system = "S-1-5-18";
+        let admins = "S-1-5-32-544";
+        let users = "S-1-5-32-545";
+        let program_files = [
+            ace(system, 0x001F_01FF),
+            ace(admins, 0x001F_01FF),
+            ace(users, READ_EXECUTE),
+        ];
+        assert!(acl_is_protected(admins, &program_files, WRITE_FILE));
+        assert!(acl_is_protected(
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+            &program_files,
+            WRITE_FILE
+        ));
+        // Each unsafe principal, and an unsafe owner, makes the path unsafe.
+        for who in [
+            users,
+            "S-1-5-11",
+            "S-1-1-0",
+            "S-1-5-4",
+            "S-1-3-0",
+            "S-1-5-21-1-2-3-1001",
+        ] {
+            let mut acl = program_files.to_vec();
+            acl.push(ace(who, MODIFY));
+            assert!(!acl_is_protected(admins, &acl, WRITE_FILE), "{who}");
+            for single in [0x2, 0x4, 0x40, 0x1_0000, 0x4_0000, 0x8_0000, 0x4000_0000] {
+                let acl = [ace(admins, 0x1F_01FF), ace(who, single)];
+                assert!(
+                    !acl_is_protected(admins, &acl, WRITE_FILE),
+                    "{who} {single:#x}"
+                );
+            }
+        }
+        assert!(
+            !acl_is_protected(users, &program_files, WRITE_FILE),
+            "user owner"
+        );
+        assert!(!acl_is_protected(
+            "S-1-5-21-1-2-3-1001",
+            &program_files,
+            WRITE_FILE
+        ));
+        // An inherit-only grant does not touch the object itself.
+        let mut children_only = program_files.to_vec();
+        children_only.push(Ace {
+            inherit_only: true,
+            ..ace("S-1-5-11", MODIFY)
+        });
+        assert!(acl_is_protected(admins, &children_only, WRITE_FILE));
+        // Above the install directory, adding children (the C:\ root's
+        // "create folders" for Authenticated Users) is not a risk, deleting is.
+        assert!(acl_is_protected(
+            admins,
+            &[ace("S-1-5-11", 0x4), ace(admins, 0x1F_01FF)],
+            WRITE_ANCESTOR
+        ));
+        assert!(!acl_is_protected(
+            admins,
+            &[ace("S-1-5-11", 0x40)],
+            WRITE_ANCESTOR
+        ));
+        assert!(!acl_is_protected(
+            admins,
+            &[ace("S-1-1-0", 0x4_0000)],
+            WRITE_ANCESTOR
+        ));
     }
 
     #[test]

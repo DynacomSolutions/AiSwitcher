@@ -224,6 +224,124 @@ pub fn list_eligible() -> Vec<WindowsDiskObservation> {
     }
 }
 
+/// What a mounted volume reports about itself, read through its own handle
+/// with no access rights: the partition it is (GPT identity and extent) and
+/// the disk extent it occupies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeProbe {
+    /// `\\?\Volume{GUID}\`.
+    pub id: String,
+    pub extent_disk: u32,
+    pub extent_start: u64,
+    pub extent_length: u64,
+    /// The GPT partition GUID in on-disk byte order; absent for MBR volumes.
+    pub gpt_guid: Option<[u8; 16]>,
+    pub partition_start: u64,
+    pub partition_length: u64,
+}
+
+/// The exchange partition being looked for. The GUID is the host-assigned
+/// partition GUID; the disk and byte range are checked when known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExchangeWanted {
+    pub guid: [u8; 16],
+    pub disk: Option<u32>,
+    /// `(start, length)` in bytes.
+    pub range: Option<(u64, u64)>,
+}
+
+impl ExchangeWanted {
+    pub fn new(
+        partition_uuid: &str,
+        disk: Option<u32>,
+        range: Option<(u64, u64)>,
+    ) -> Result<Self, ObservationError> {
+        let guid = ais_host_core::drive_identity::gpt_guid(partition_uuid)
+            .map_err(|_| ObservationError::InvalidInput)?;
+        Ok(Self { guid, disk, range })
+    }
+}
+
+/// Choose the one volume that is exactly the wanted partition: same GUID, the
+/// partition and disk extent agree with each other, and the disk and range
+/// match where they were given. Zero or several matches are refused.
+pub fn select_exchange_volume<'a>(
+    probes: &'a [VolumeProbe],
+    wanted: &ExchangeWanted,
+) -> Result<&'a VolumeProbe, ObservationError> {
+    let mut matches = probes.iter().filter(|probe| {
+        probe.gpt_guid == Some(wanted.guid)
+            && valid_volume_id(&probe.id)
+            && probe.extent_start == probe.partition_start
+            && probe.extent_length == probe.partition_length
+            && wanted.disk.is_none_or(|disk| disk == probe.extent_disk)
+            && wanted.range.is_none_or(|(start, length)| {
+                (start, length) == (probe.extent_start, probe.extent_length)
+            })
+    });
+    match (matches.next(), matches.next()) {
+        (Some(probe), None) => Ok(probe),
+        (None, _) => Err(ObservationError::Changed),
+        _ => Err(ObservationError::Ineligible),
+    }
+}
+
+/// The volume GUID path of the wanted exchange partition, looked for until
+/// `timeout` because Windows publishes new partitions a moment after a write.
+pub fn find_exchange_volume(
+    wanted: &ExchangeWanted,
+    timeout: std::time::Duration,
+) -> Result<String, ObservationError> {
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let found = native_observation::probe_volumes()
+                .and_then(|probes| select_exchange_volume(&probes, wanted).map(|p| p.id.clone()));
+            match found {
+                Ok(id) => return Ok(id),
+                Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(250)),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (wanted, timeout);
+        Err(ObservationError::NativeUnavailable)
+    }
+}
+
+/// Format the exchange volume as exFAT labelled AISX with the system `format`
+/// tool, then open it again to prove the result. Only the helper calls this,
+/// right after it wrote the layout.
+pub fn format_exchange(volume: &str) -> Result<(), ObservationError> {
+    if !valid_volume_id(volume) {
+        return Err(ObservationError::InvalidInput);
+    }
+    #[cfg(windows)]
+    {
+        native::format_volume(volume)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(ObservationError::NativeUnavailable)
+    }
+}
+
+/// Ask Windows to eject the disk's device, as the signed-in user.
+pub fn eject_disk(disk_number: u32) -> Result<(), ObservationError> {
+    #[cfg(windows)]
+    {
+        native_observation::eject_disk(disk_number)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = disk_number;
+        Err(ObservationError::NativeUnavailable)
+    }
+}
+
 /// Bounded read-only GPT preview, pinned to the same whole-disk observation.
 pub fn update_snapshot(
     identity: &str,
@@ -363,6 +481,8 @@ mod native_observation {
     const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
     const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
     const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
+    // CTL_CODE(IOCTL_DISK_BASE, 0x0012, METHOD_BUFFERED, FILE_ANY_ACCESS).
+    const IOCTL_DISK_GET_PARTITION_INFO_EX: u32 = 0x0007_0048;
     const STORAGE_DEVICE_PROPERTY: u32 = 0;
     const STORAGE_ACCESS_ALIGNMENT_PROPERTY: u32 = 6;
     const REG_MULTI_SZ: u32 = 7;
@@ -480,6 +600,13 @@ mod native_observation {
         fn CM_Get_Device_ID_Size(length: *mut u32, dev_inst: u32, flags: u32) -> u32;
         fn CM_Get_Device_IDW(dev_inst: u32, buffer: *mut u16, length: u32, flags: u32) -> u32;
         fn CM_Get_Parent(parent: *mut u32, dev_inst: u32, flags: u32) -> u32;
+        fn CM_Request_Device_EjectW(
+            dev_inst: u32,
+            veto_type: *mut u32,
+            veto_name: *mut u16,
+            name_length: u32,
+            flags: u32,
+        ) -> u32;
         fn CM_Get_DevNode_PropertyW(
             dev_inst: u32,
             key: *const DevPropKey,
@@ -521,6 +648,105 @@ mod native_observation {
     struct DevPropKey {
         fmtid: Guid,
         pid: u32,
+    }
+
+    /// Probe every mounted volume for its partition and extent. A volume that
+    /// does not answer is not a candidate and is left out.
+    pub(super) fn probe_volumes() -> Result<Vec<super::VolumeProbe>, ObservationError> {
+        Ok(enumerate_volumes()?
+            .iter()
+            .filter_map(|volume| probe_volume(&volume.id))
+            .collect())
+    }
+
+    fn probe_volume(id: &str) -> Option<super::VolumeProbe> {
+        let handle = open_handle(id, 0).ok()?;
+        let raw = handle.as_raw_handle() as isize;
+        // PARTITION_INFORMATION_EX is 144 bytes: style @0, start @8, length @16,
+        // and for GPT the partition GUID @48.
+        let mut info = vec![0_u64; 32];
+        let mut returned = 0;
+        // SAFETY: the buffer is aligned and the stated size is its length.
+        let ok = unsafe {
+            DeviceIoControl(
+                raw,
+                IOCTL_DISK_GET_PARTITION_INFO_EX,
+                ptr::null(),
+                0,
+                info.as_mut_ptr().cast(),
+                (info.len() * 8) as u32,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned < 144 {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), 144) };
+        let style = i32::from_ne_bytes(bytes[0..4].try_into().ok()?);
+        let partition_start =
+            u64::try_from(i64::from_ne_bytes(bytes[8..16].try_into().ok()?)).ok()?;
+        let partition_length =
+            u64::try_from(i64::from_ne_bytes(bytes[16..24].try_into().ok()?)).ok()?;
+        // PARTITION_STYLE_GPT is 1.
+        let gpt_guid = (style == 1)
+            .then(|| <[u8; 16]>::try_from(&bytes[48..64]).ok())
+            .flatten();
+        // One extent only: a spanned volume is never the exchange partition.
+        let mut extents = vec![0_u64; 16];
+        // SAFETY: as above.
+        let ok = unsafe {
+            DeviceIoControl(
+                raw,
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                ptr::null(),
+                0,
+                extents.as_mut_ptr().cast(),
+                (extents.len() * 8) as u32,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        let bytes = unsafe { std::slice::from_raw_parts(extents.as_ptr().cast::<u8>(), 128) };
+        if ok == 0 || returned < 32 || u32::from_ne_bytes(bytes[0..4].try_into().ok()?) != 1 {
+            return None;
+        }
+        Some(super::VolumeProbe {
+            id: id.to_owned(),
+            extent_disk: u32::from_ne_bytes(bytes[8..12].try_into().ok()?),
+            extent_start: u64::try_from(i64::from_ne_bytes(bytes[16..24].try_into().ok()?)).ok()?,
+            extent_length: u64::try_from(i64::from_ne_bytes(bytes[24..32].try_into().ok()?))
+                .ok()?,
+            gpt_guid,
+            partition_start,
+            partition_length,
+        })
+    }
+
+    /// Request ejection of the disk's device node (the unprivileged "safe
+    /// remove"); a veto from a program holding the drive is an error.
+    pub(super) fn eject_disk(disk_number: u32) -> Result<(), ObservationError> {
+        let disk = enumerate_disks()?
+            .into_iter()
+            .find(|disk| disk.number == disk_number)
+            .ok_or(ObservationError::Changed)?;
+        let mut veto = 0;
+        let mut name = [0_u16; 260];
+        // SAFETY: the veto outputs are writable and sized as stated.
+        let status = unsafe {
+            CM_Request_Device_EjectW(
+                disk.dev_inst,
+                &mut veto,
+                name.as_mut_ptr(),
+                name.len() as u32,
+                0,
+            )
+        };
+        if status == CR_SUCCESS {
+            Ok(())
+        } else {
+            Err(ObservationError::NativeUnavailable)
+        }
     }
 
     /// Disk numbers of every present disk device that answers a query.
@@ -1276,6 +1502,7 @@ mod native {
     const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
     // CTL_CODE(IOCTL_DISK_BASE, 0x0050, METHOD_BUFFERED, FILE_ANY_ACCESS).
     const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x0007_0140;
+    const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1338,6 +1565,8 @@ mod native {
             // handle permits existing volume handles while those locks are
             // acquired; the exclusive volume locks provide the exclusion.
             let disk = open_with_share(&path, GENERIC_READ | GENERIC_WRITE, 0x3)?;
+            // The handle just opened by path must be the disk we validated.
+            verify_device_number(disk.as_raw_handle(), disk_number)?;
             verify_geometry(disk.as_raw_handle(), &snapshot)?;
             let mut volumes = Vec::with_capacity(snapshot.volume_ids.len());
             for volume in &snapshot.volume_ids {
@@ -1502,6 +1731,55 @@ mod native {
         }
     }
 
+    /// the system format tool on the volume GUID path: exFAT, quick, label AISX. The
+    /// tool path comes from the system directory; the environment is minimal.
+    pub(super) fn format_volume(volume: &str) -> Result<(), ObservationError> {
+        use std::{
+            path::{Path, PathBuf},
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let system = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .ok_or(ObservationError::NativeUnavailable)?;
+        let tool = system.join("System32").join("format").with_extension("com");
+        if !tool.is_file() {
+            return Err(ObservationError::NativeUnavailable);
+        }
+        let mut child = Command::new(tool)
+            .arg(volume)
+            .args(["/FS:exFAT", "/Q", "/V:AISX", "/Y"])
+            .env_clear()
+            .env("SystemRoot", &system)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ObservationError::NativeUnavailable)?;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ObservationError::NativeUnavailable);
+                }
+            }
+        };
+        if !status.success() {
+            return Err(ObservationError::NativeUnavailable);
+        }
+        // Proves exFAT and the label by opening the formatted volume.
+        ais_host_core::exchange_root::ExchangeRoot::open_verified(Path::new(volume))
+            .map(drop)
+            .map_err(|_| ObservationError::Changed)
+    }
+
     /// Update-preview: the GPT windows of one disk, read through whole sectors,
     /// pinned to the same observation before and after.
     pub(super) fn update_snapshot(
@@ -1634,6 +1912,28 @@ mod native {
             {
                 return Err(ObservationError::Ineligible);
             }
+        }
+        Ok(())
+    }
+
+    fn verify_device_number(handle: RawHandle, expected: u32) -> Result<(), ObservationError> {
+        let mut output = [0_u32; 3];
+        let mut returned = 0;
+        // SAFETY: STORAGE_DEVICE_NUMBER is three u32 values.
+        let success = unsafe {
+            DeviceIoControl(
+                handle as isize,
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                ptr::null(),
+                0,
+                output.as_mut_ptr().cast(),
+                12,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if success == 0 || returned < 8 || output[1] != expected {
+            return Err(ObservationError::Changed);
         }
         Ok(())
     }
@@ -1777,6 +2077,65 @@ mod tests {
         ] {
             assert_eq!(disk_number(bad), Err(ObservationError::Ineligible), "{bad}");
         }
+    }
+
+    const PARTITION_UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn probe(id: u8, disk: u32, start: u64, length: u64, uuid: Option<&str>) -> VolumeProbe {
+        VolumeProbe {
+            id: format!(r"\\?\Volume{{01234567-89ab-cdef-0123-4567890123{id:02x}}}\"),
+            extent_disk: disk,
+            extent_start: start,
+            extent_length: length,
+            gpt_guid: uuid.map(|uuid| ais_host_core::drive_identity::gpt_guid(uuid).unwrap()),
+            partition_start: start,
+            partition_length: length,
+        }
+    }
+
+    #[test]
+    fn the_exchange_volume_is_the_one_exact_partition_guid_disk_and_range() {
+        let wanted =
+            ExchangeWanted::new(PARTITION_UUID, Some(3), Some((1 << 20, 32 << 20))).unwrap();
+        let other = "99999999-2222-4333-8444-555555555555";
+        let good = probe(1, 3, 1 << 20, 32 << 20, Some(PARTITION_UUID));
+        let probes = [
+            probe(2, 3, 1 << 20, 32 << 20, Some(other)),
+            probe(3, 4, 1 << 20, 32 << 20, Some(PARTITION_UUID)),
+            probe(4, 3, 2 << 20, 32 << 20, Some(PARTITION_UUID)),
+            probe(5, 3, 1 << 20, 16 << 20, Some(PARTITION_UUID)),
+            probe(6, 3, 1 << 20, 32 << 20, None),
+            good.clone(),
+        ];
+        assert_eq!(select_exchange_volume(&probes, &wanted), Ok(&good));
+        // Nothing matching, or two matches, is refused rather than guessed.
+        assert_eq!(
+            select_exchange_volume(&probes[..5], &wanted),
+            Err(ObservationError::Changed)
+        );
+        let twin = probe(7, 3, 1 << 20, 32 << 20, Some(PARTITION_UUID));
+        assert_eq!(
+            select_exchange_volume(&[good.clone(), twin], &wanted),
+            Err(ObservationError::Ineligible)
+        );
+        // A volume whose own extent disagrees with its partition is never chosen.
+        let mut skewed = good.clone();
+        skewed.partition_start += 512;
+        assert_eq!(
+            select_exchange_volume(&[skewed], &wanted),
+            Err(ObservationError::Changed)
+        );
+        // Without a disk or range (the flows locator) the GUID alone decides.
+        let loose = ExchangeWanted::new(PARTITION_UUID, None, None).unwrap();
+        assert_eq!(
+            select_exchange_volume(&probes, &loose).map(|p| p.id.clone()),
+            Err(ObservationError::Ineligible)
+        );
+        assert_eq!(
+            select_exchange_volume(std::slice::from_ref(&good), &loose),
+            Ok(&good)
+        );
+        assert!(ExchangeWanted::new("not-a-guid", None, None).is_err());
     }
 
     #[test]

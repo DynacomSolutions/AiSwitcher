@@ -181,12 +181,6 @@ fn execute(
     {
         return Err("An image source exceeds its permitted size.");
     }
-    // The exFAT exchange partition cannot be prepared or reopened on Windows
-    // yet, so a create is refused before anything is read or written.
-    #[cfg(windows)]
-    if request.operation == crate::protocol::Operation::CreateLayout {
-        return Err("Creating a drive is not supported on Windows yet.");
-    }
     let mut sources = seal_source_files(sources, selected_assets.map(|asset| asset.size))?;
     let sums_size =
         usize::try_from(selection.sums().size).map_err(|_| "Checksum input is too large.")?;
@@ -270,6 +264,23 @@ fn execute(
             .map_err(|_| "The partition table could not be re-read.")?;
         return Ok(());
     }
+    // Windows has no staging formatter: it writes the layout, re-reads it,
+    // releases the locks and then formats the new exchange volume in place.
+    #[cfg(windows)]
+    {
+        write_confirmed(
+            &mut target,
+            request.confirmation_deadline_boot_ns,
+            &mut image,
+            &plan,
+            &request.typed_confirmation,
+        )?;
+        target
+            .reread_partitions()
+            .map_err(|_| "The partition table could not be re-read.")?;
+        drop(target);
+        format_exchange(&observation, &plan, &request.drive_identity)
+    }
     #[cfg(not(windows))]
     {
         let mut exchange = crate::exchange::PreparedExchange::native(&plan)?;
@@ -283,8 +294,31 @@ fn execute(
         )?;
         finish_create(target)
     }
-    #[cfg(windows)]
-    Err("Creating a drive is not supported on Windows yet.")
+}
+
+/// Find the new exchange partition by its host-assigned GPT GUID, on exactly
+/// this disk and byte range, and format it as exFAT.
+#[cfg(windows)]
+fn format_exchange(
+    observation: &ais_host_core::device::DeviceObservation,
+    plan: &ais_host_core::device::WritePlan,
+    identity: &ais_host_core::drive_identity::DriveIdentity,
+) -> Result<(), &'static str> {
+    use crate::platform::{ExchangeWanted, find_exchange_volume, format_exchange};
+    let range = plan
+        .exchange_range()
+        .ok_or("The exchange range is unavailable.")?;
+    let disk = crate::protocol::windows_wire::physical_drive_number(&observation.os_identity)
+        .ok_or("The native target could not be re-observed.")?;
+    let wanted = ExchangeWanted::new(
+        &identity.partitions[3],
+        Some(disk),
+        Some((range.start, range.length)),
+    )
+    .map_err(|_| "The exchange partition identity is invalid.")?;
+    let volume = find_exchange_volume(&wanted, std::time::Duration::from_secs(60))
+        .map_err(|_| "The exchange partition did not appear.")?;
+    format_exchange(&volume).map_err(|_| "The exchange partition could not be formatted.")
 }
 
 /// One confirmed create transaction on a retained target. Preparing exFAT must

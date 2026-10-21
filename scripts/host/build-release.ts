@@ -1,5 +1,6 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { requireSearchSystem32 } from "./pe-load-flags";
 import { components, digest, run, smokeArchive, validateTrustKey, verifyPayload, type Target } from "./release-assets";
 
 const repository = resolve(import.meta.dir, "../..");
@@ -70,6 +71,8 @@ if (import.meta.main) {
   run(["cargo", "build", "--manifest-path", join(host, "Cargo.toml"), "--locked", "--release", "--target", triple,
     "-p", "ais-host-helper", "-p", "ais-host-core", "--bin", "ais-host-helper", "--bin", "ais-host-escrow-purge"], host, 2_400_000);
   const binaryDir = join(resolve(process.env.CARGO_TARGET_DIR), triple, "release");
+  // The helper runs elevated: its imports must come from System32 only.
+  if (target === "windows-x64") requireSearchSystem32(join(binaryDir, "ais-host-helper.exe"));
   for (const name of ["ais-host-helper", "ais-host-escrow-purge"]) cpSync(join(binaryDir, `${name}${extension}`), join(sidecars, `${name}-${triple}${extension}`));
   run(["bun", "build", "src/host/adapter.ts", "--compile", "--outfile", join(sidecars, `ais-host-adapter-${triple}${extension}`)], repository);
   writeFileSync(join(resources, "release-key.pub"), key);
@@ -107,6 +110,16 @@ if (import.meta.main) {
     for (const name of readdirSync(resources)) cpSync(join(resources, name), join(portable, name));
     for (const name of readdirSync(binaryDir).filter((name) => name.endsWith(".dll"))) cpSync(join(binaryDir, name), join(portable, name));
     verifyPayload(portable, target, production);
+    // The per-machine installer is the only Windows layout whose helper sits in
+    // a location non-admin code cannot write, so it is the one that may write
+    // drives. The portable archive lists drives and refuses to elevate.
+    const installer = join(root, "tauri-installer.json");
+    writeFileSync(installer, JSON.stringify({ mainBinaryName: "ais-host-app", bundle: { windows: { nsis: { installMode: "perMachine" } } } }));
+    run(["cargo", "tauri", "build", "--target", triple, "--config", overlay, "--config", installer, "--bundles", "nsis", "--", "--locked"], host, 2_400_000);
+    const setupDir = join(binaryDir, "bundle/nsis");
+    const setups = readdirSync(setupDir).filter((name) => name.endsWith("-setup.exe"));
+    if (setups.length !== 1) throw new Error("Expected one NSIS installer.");
+    cpSync(join(setupDir, setups[0]!), join(assets, "ais-host-windows-x64-setup.exe"));
     asset = join(assets, "ais-host-windows-x64.zip");
     run(["pwsh", "-NoProfile", "-Command", "Compress-Archive -Path (Join-Path $env:HOST_PORTABLE '*') -DestinationPath $env:HOST_ARCHIVE"], repository, 120_000,
       { ...process.env, HOST_PORTABLE: portable, HOST_ARCHIVE: asset });

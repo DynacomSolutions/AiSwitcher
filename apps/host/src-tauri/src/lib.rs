@@ -184,12 +184,6 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
     if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
         return Err("The selected device is unavailable.".to_string());
     }
-    // Creating a drive ends by opening its exFAT exchange partition, which
-    // Windows cannot do yet. Refuse before any prompt or download, so no drive
-    // is ever written and then left unfinished.
-    if cfg!(windows) {
-        return Err("Creating a drive is not supported on Windows yet.".to_string());
-    }
     // Fail closed before any prompt or download when no trusted key is bundled.
     let verifier =
         ais_host_core::release::ImageVerifier::bundled().map_err(|error| error.to_string())?;
@@ -247,11 +241,6 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
 #[tauri::command]
 async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<WritePreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        // An update journals on the exchange partition, which Windows cannot
-        // open yet, so it is refused before any elevation prompt.
-        if cfg!(windows) {
-            return Err("Updating a drive is not supported on Windows yet.".to_string());
-        }
         let state = app.state::<ConfirmationSession>();
         let _media = state.lock_media()?;
         let preparation = state.begin_preview(&device_id)?;
@@ -387,6 +376,20 @@ async fn preview_reset(device_id: String, app: tauri::AppHandle) -> Result<Write
         let state = app.state::<ConfirmationSession>();
         let _media = state.lock_media()?;
         let (preparation, listed) = state.begin_reset_preview(&device_id)?;
+        // Refuse a drive this computer never created before any elevation prompt.
+        let hint = ais_host_core::update::hardware_hint(&listed);
+        let registered = app
+            .try_state::<escrow_commands::EscrowCommandState>()
+            .ok_or("The local drive registry is unavailable.")?
+            .known_images()?;
+        if !registered
+            .iter()
+            .any(|(image, _)| image.hardware_hint == hint)
+        {
+            return Err(
+                "The drive was not created on this computer, or its layout changed.".into(),
+            );
+        }
         let snapshot = preview_update_native(&device_id)?;
         if !listed.same_physical_identity(&snapshot.observation) {
             return Err(
@@ -1308,7 +1311,7 @@ fn native_write_support() -> ais_host_core::device::WriteSupport {
     let missing_helper = if cfg!(target_os = "macos") {
         "Writing needs the signed, notarised application with its bundled helper; this build is unsigned or a development build."
     } else if cfg!(windows) {
-        "Writing needs ais-host-helper.exe next to the application; this copy is incomplete."
+        "Install the app with the installer to write drives."
     } else {
         "The ais host helper package is not installed or does not verify."
     };
@@ -1690,7 +1693,63 @@ impl ExchangeVolume for UdisksVolume {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+impl UdisksVolume {
+    /// The disk number, after proving the same physical drive is still there.
+    fn disk(device: &ais_host_core::device::DeviceObservation) -> Result<u32, String> {
+        let current = ais_host_helper::platform::observe_windows_unprivileged(device)
+            .map_err(|_| "The drive connection changed.".to_string())?;
+        if !device.same_physical_identity(&current) {
+            return Err("The drive connection changed.".into());
+        }
+        ais_host_helper::protocol::windows_wire::physical_drive_number(&device.os_identity)
+            .ok_or_else(|| "The drive is unavailable.".to_string())
+    }
+}
+
+/// Windows has no mount step: the exchange partition is already a volume, found
+/// by its host-assigned partition GUID on this disk and byte range, and opened
+/// by its volume GUID path without any drive letter.
+#[cfg(windows)]
+impl ExchangeVolume for UdisksVolume {
+    fn mount_parts(
+        &self,
+        device: &ais_host_core::device::DeviceObservation,
+        range: ais_host_core::device::ByteRange,
+        identity: &ais_host_core::drive_identity::DriveIdentity,
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+        let disk = Self::disk(device)?;
+        let wanted = ais_host_helper::platform::ExchangeWanted::new(
+            &identity.partitions[3],
+            Some(disk),
+            Some((range.start, range.length)),
+        )
+        .map_err(|_| "The exchange partition identity is invalid.".to_string())?;
+        let volume = ais_host_helper::platform::find_exchange_volume(
+            &wanted,
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|_| "The exchange partition could not be found.".to_string())?;
+        let root = ais_host_core::exchange_root::ExchangeRoot::open_verified(std::path::Path::new(
+            &volume,
+        ));
+        // The drive must still be the same one after the volume was opened.
+        Self::disk(device).and(root)
+    }
+
+    fn unmount(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        // Nothing is mounted by us; the helper locks and dismounts the volumes.
+        Self::disk(device).map(|_| ())
+    }
+
+    fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        let disk = Self::disk(device)?;
+        ais_host_helper::platform::eject_windows_disk(disk)
+            .map_err(|_| "The drive could not be ejected.".to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl ExchangeVolume for UdisksVolume {
     fn mount_parts(
         &self,

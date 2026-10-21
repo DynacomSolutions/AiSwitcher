@@ -37,17 +37,19 @@ pub use macos::{
     recheck as recheck_macos_snapshot,
 };
 
+#[cfg(target_os = "windows")]
+pub use windows::{
+    ExchangeWanted, VolumeProbe, WindowsBlockTarget,
+    collect_by_identity as collect_windows_by_identity, eject_disk as eject_windows_disk,
+    find_exchange_volume, format_exchange, list_eligible as list_windows_eligible,
+    observe_unprivileged as observe_windows_unprivileged, select_exchange_volume,
+    update_snapshot as windows_update_snapshot,
+};
 #[cfg(feature = "file-test")]
 pub use windows::{
     ObservationError as WindowsObservationError, WindowsDiskObservation, WindowsDiskSnapshot,
     collect_windows_snapshot, observe_windows_snapshot, parse_windows_snapshot,
     recheck_windows_snapshot,
-};
-#[cfg(target_os = "windows")]
-pub use windows::{
-    WindowsBlockTarget, collect_by_identity as collect_windows_by_identity,
-    list_eligible as list_windows_eligible, observe_unprivileged as observe_windows_unprivileged,
-    update_snapshot as windows_update_snapshot,
 };
 
 pub fn unavailable_reason() -> &'static str {

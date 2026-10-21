@@ -1,6 +1,19 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Delay-loaded and runtime-loaded libraries come from System32 only, never
+    // from the application directory.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{
+            LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+        };
+        // SAFETY: plain process-wide setting with a documented constant.
+        if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
+            eprintln!("The library search path could not be restricted.");
+            std::process::exit(77);
+        }
+    }
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(77);

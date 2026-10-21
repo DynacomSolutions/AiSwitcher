@@ -27,9 +27,8 @@ filesystem on the drive.
 Intel macOS packages are not provided. The live USB target is x86_64 on every
 host platform, and Secure Boot must be disabled. Native USB and privilege
 acceptance checks are pending; development packages are not ready for creating
-production drives. Windows lists USB drives and has a UAC-elevated write helper,
-but creating and updating drives there stay disabled until the exchange
-partition can be opened. Retained passphrases,
+production drives. Windows writes drives through a UAC-elevated helper, only
+from the per-machine installer; hardware acceptance is pending. Retained passphrases,
 refresh, removal and image-update integration remain pending. Release drafts
 stay unpublished until the platform acceptance checks pass. Minimum supported
 OS versions have not yet been established by native testing.

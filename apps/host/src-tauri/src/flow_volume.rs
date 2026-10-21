@@ -15,8 +15,6 @@ pub struct MountedVolume {
 }
 
 impl MountedVolume {
-    // Only the Linux and macOS locators mount; Windows has no exchange locator.
-    #[cfg_attr(windows, allow(dead_code))]
     pub fn new(path: PathBuf, release: impl FnOnce() + Send + 'static) -> Self {
         Self {
             path,
@@ -45,7 +43,7 @@ impl Drop for MountedVolume {
 pub type LocateExchange =
     Arc<dyn Fn(&InstalledImage) -> Result<MountedVolume, String> + Send + Sync>;
 
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 pub fn unavailable() -> LocateExchange {
     Arc::new(|_| Err("The drive's exchange volume is not available.".into()))
 }
@@ -130,7 +128,41 @@ pub fn native_locator(_app: tauri::AppHandle) -> LocateExchange {
     Arc::new(|installed| crate::macos_volume::mount(&installed.identity))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows: the connected disk is chosen by the registry's hardware hint among
+/// the eligible USB disks, and partition 4 is found by the recorded partition
+/// GUID on that disk and opened through its volume GUID path.
+#[cfg(windows)]
+pub fn native_locator(_app: tauri::AppHandle) -> LocateExchange {
+    Arc::new(|installed| {
+        let mut matches = crate::native_devices().into_iter().filter(|device| {
+            ais_host_core::update::hardware_hint(device) == installed.hardware_hint
+        });
+        let (Some(device), None) = (matches.next(), matches.next()) else {
+            return Err("The drive is not connected, or more than one drive matches.".into());
+        };
+        let disk =
+            ais_host_helper::protocol::windows_wire::physical_drive_number(&device.os_identity)
+                .ok_or("The drive is unavailable.")?;
+        let wanted = ais_host_helper::platform::ExchangeWanted::new(
+            &installed.identity.partitions[3],
+            Some(disk),
+            None,
+        )
+        .map_err(|_| "The drive's partition identities are invalid.".to_string())?;
+        let volume = ais_host_helper::platform::find_exchange_volume(
+            &wanted,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|_| "The drive's exchange volume is not available.".to_string())?;
+        let root = ais_host_core::exchange_root::ExchangeRoot::open_verified(
+            std::path::Path::new(&volume),
+        )?;
+        let path = root.mount_path().to_owned();
+        Ok(MountedVolume::new(path, move || drop(root)))
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn native_locator(_app: tauri::AppHandle) -> LocateExchange {
     unavailable()
 }
