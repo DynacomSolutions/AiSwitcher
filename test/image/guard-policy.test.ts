@@ -107,6 +107,7 @@ class FakePath:
             '/work/relative-link': '/dev/mockblk',
             '/dev/escape': '/outside/file',
             '/dev/mapper/vault': '/dev/mockblk2',
+            '/dev/vg0/lv': '/dev/mockblk2',
         }.get(path, path)
     @staticmethod
     def join(*paths): return old_path.join(*paths)
@@ -147,6 +148,14 @@ try:
             assert str(e) == 'device path does not resolve', (bad, e)
     argv, devices = p.resolve_devices('cryptsetup', ['close', 'vault'], '/work')
     assert argv == ['close', 'vault'] and devices == [('vault', '/dev/mockblk2', 78)]
+    # Operations naming a mapping by bare name list its device alongside the others.
+    argv, devices = p.resolve_devices('dmsetup', ['remove', '--force', 'vault', '/dev/mockblk'], '/work')
+    assert argv == ['remove', '--force', 'vault', '/dev/mockblk']
+    assert devices == [('vault', '/dev/mockblk2', 78), ('/dev/mockblk', '/dev/mockblk', 77)]
+    _, devices = p.resolve_devices('cryptsetup', ['luksSuspend', 'vault', '/dev/mockblk'], '/work')
+    assert ('vault', '/dev/mockblk2', 78) in devices
+    _, devices = p.resolve_devices('lvremove', ['-y', 'vg0/lv', '/dev/mockblk'], '/work')
+    assert ('vg0/lv', '/dev/mockblk2', 78) in devices
     for bad, why in ((['close', 'gone'], 'device path does not resolve'), (['luksClose', '../x'], 'invalid mapping name')):
         try:
             p.resolve_devices('cryptsetup', bad, '/work')

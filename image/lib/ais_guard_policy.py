@@ -152,6 +152,23 @@ def _cryptsetup_close_mapping(args):
     return None
 
 
+_DM_TOOLS = ('cryptsetup', 'dmsetup', 'lvm', 'lvmdevices')
+_LV_NAME = re.compile(r'[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+')
+
+
+def _named_mapping(name, operand):
+    """/dev path for a bare device-mapper or LVM name given to a dm tool, or None."""
+    if name not in _DM_TOOLS and not name.startswith(('lv', 'pv', 'vg')):
+        return None
+    if operand in ('.', '..'):
+        return None
+    if _MAPPING_NAME.fullmatch(operand):
+        return '/dev/mapper/' + operand
+    if _LV_NAME.fullmatch(operand) and '..' not in operand.split('/'):
+        return '/dev/' + operand
+    return None
+
+
 def _candidate_refs(name, args):
     """Yield (index, prefix, path) only for syntactically plausible device operands."""
     refs = []
@@ -216,6 +233,21 @@ def resolve_devices(name, args, cwd):
                 continue
             if spelled_in_dev:
                 raise ValueError('device path does not resolve')
+            # dm tools act on mappings by name through /dev/mapper/control, so a
+            # bare name must still show its device in the approval.
+            mapped = _named_mapping(name, original) if not os.path.isabs(original) else None
+            if mapped is None:
+                continue
+            canonical = os.path.realpath(mapped)
+            try:
+                info = os.stat(canonical)
+            except OSError:
+                continue
+            if not stat.S_ISBLK(info.st_mode) or os.path.commonpath(('/dev', canonical)) != '/dev':
+                raise ValueError('device path does not resolve')
+            if int(info.st_rdev) not in seen_rdev:
+                devices.append((original, canonical, int(info.st_rdev)))
+                seen_rdev.add(int(info.st_rdev))
             continue
         if stat.S_ISBLK(info.st_mode) and not canonical_in_dev:
             raise ValueError('block device outside /dev')
