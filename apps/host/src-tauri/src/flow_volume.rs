@@ -15,8 +15,6 @@ pub struct MountedVolume {
 }
 
 impl MountedVolume {
-    // Only the Linux and macOS locators mount; Windows has no exchange locator.
-    #[cfg_attr(windows, allow(dead_code))]
     pub fn new(path: PathBuf, release: impl FnOnce() + Send + 'static) -> Self {
         Self {
             path,
@@ -45,17 +43,17 @@ impl Drop for MountedVolume {
 pub type LocateExchange =
     Arc<dyn Fn(&InstalledImage) -> Result<MountedVolume, String> + Send + Sync>;
 
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 pub fn unavailable() -> LocateExchange {
     Arc::new(|_| Err("The drive's exchange volume is not available.".into()))
 }
 
 /// An owned hold on the session's media lock. A dedicated thread owns the
 /// guard (a std guard cannot outlive its borrow) until the lease is dropped.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub struct MediaLease(Option<std::sync::mpsc::Sender<()>>);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl MediaLease {
     pub fn acquire(app: tauri::AppHandle) -> Result<Self, String> {
         use tauri::Manager;
@@ -79,7 +77,7 @@ impl MediaLease {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl Drop for MediaLease {
     fn drop(&mut self) {
         if let Some(release) = self.0.take() {
@@ -88,11 +86,12 @@ impl Drop for MediaLease {
     }
 }
 
-/// Linux: the same steps as an update. The connected disk is chosen by the
+/// Linux and Windows: the same steps as an update. The connected disk is chosen by the
 /// registry's hardware hint, its GPT is read through the helper's read-only
-/// preview, and partition 4 is mounted through udisks and verified against the
-/// recorded partition identities.
-#[cfg(target_os = "linux")]
+/// preview, and partition 4 is opened through the platform's `ExchangeVolume`
+/// (udisks, or the volume found by partition GUID on Windows) and verified
+/// against the recorded partition identities.
+#[cfg(any(target_os = "linux", windows))]
 pub fn native_locator(app: tauri::AppHandle) -> LocateExchange {
     Arc::new(move |installed| {
         // Held until the volume is released, so an update write cannot start
@@ -130,7 +129,7 @@ pub fn native_locator(_app: tauri::AppHandle) -> LocateExchange {
     Arc::new(|installed| crate::macos_volume::mount(&installed.identity))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn native_locator(_app: tauri::AppHandle) -> LocateExchange {
     unavailable()
 }

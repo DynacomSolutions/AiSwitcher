@@ -155,7 +155,15 @@ fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
+    ais_host_helper::platform::list_windows_eligible()
+        .into_iter()
+        .map(|disk| disk.observation)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
     Vec::new()
 }
@@ -368,6 +376,20 @@ async fn preview_reset(device_id: String, app: tauri::AppHandle) -> Result<Write
         let state = app.state::<ConfirmationSession>();
         let _media = state.lock_media()?;
         let (preparation, listed) = state.begin_reset_preview(&device_id)?;
+        // Refuse a drive this computer never created before any elevation prompt.
+        let hint = ais_host_core::update::hardware_hint(&listed);
+        let registered = app
+            .try_state::<escrow_commands::EscrowCommandState>()
+            .ok_or("The local drive registry is unavailable.")?
+            .known_images()?;
+        if !registered
+            .iter()
+            .any(|(image, _)| image.hardware_hint == hint)
+        {
+            return Err(
+                "The drive was not created on this computer, or its layout changed.".into(),
+            );
+        }
         let snapshot = preview_update_native(&device_id)?;
         if !listed.same_physical_identity(&snapshot.observation) {
             return Err(
@@ -468,7 +490,12 @@ fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapsho
     ais_host_helper::protocol::macos_transport::preview_update(id)
         .map_err(|error| error.to_string())
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
+    ais_host_helper::protocol::windows_transport::preview_update(id)
+        .map_err(|error| error.to_string())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn preview_update_native(_: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
     Err("Image updates are unavailable on this platform.".into())
 }
@@ -1190,7 +1217,15 @@ fn deadline_boot_ns(remaining: std::time::Duration) -> Result<u64, String> {
     Ok(now + remaining)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn deadline_boot_ns(remaining: std::time::Duration) -> Result<u64, String> {
+    let now = ais_host_helper::protocol::windows_transport::boottime_ns()
+        .map_err(|_| "The boot clock is unavailable.")?;
+    let remaining = u64::try_from(remaining.as_nanos()).map_err(|_| "Invalid expiry.")?;
+    Ok(now + remaining)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn deadline_boot_ns(_remaining: std::time::Duration) -> Result<u64, String> {
     Err("This operating system has no enabled authenticated helper.".to_string())
 }
@@ -1204,7 +1239,7 @@ trait HelperLauncher {
     ) -> Result<(), String>;
 }
 
-/// The installed per-OS helper. Linux and macOS have authenticated transports.
+/// The installed per-OS helper. Every supported OS has an authenticated transport.
 struct NativeHelper;
 
 impl HelperLauncher for NativeHelper {
@@ -1238,7 +1273,20 @@ impl HelperLauncher for NativeHelper {
         .map_err(|error| error.to_string())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    fn launch(
+        &self,
+        request: ais_host_helper::protocol::Request,
+        sources: &[std::fs::File; 3],
+    ) -> Result<(), String> {
+        ais_host_helper::protocol::windows_transport::run_session(
+            [&sources[0], &sources[1], &sources[2]],
+            request,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn launch(
         &self,
         _request: ais_host_helper::protocol::Request,
@@ -1256,10 +1304,14 @@ fn native_write_support() -> ais_host_core::device::WriteSupport {
     let helper = ais_host_helper::protocol::linux_transport::helper_installed();
     #[cfg(target_os = "macos")]
     let helper = ais_host_helper::protocol::macos_transport::helper_installed();
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    let helper = ais_host_helper::protocol::windows_transport::helper_installed();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let helper = false;
     let missing_helper = if cfg!(target_os = "macos") {
         "Writing needs the signed, notarised application with its bundled helper; this build is unsigned or a development build."
+    } else if cfg!(windows) {
+        "Install the app with the installer to write drives."
     } else {
         "The ais host helper package is not installed or does not verify."
     };
@@ -1290,7 +1342,15 @@ fn observe_native(
         .map_err(|_| "The selected device is unavailable.".to_string())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn observe_native(
+    approved: &ais_host_core::device::DeviceObservation,
+) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::platform::observe_windows_unprivileged(approved)
+        .map_err(|_| "The selected device is unavailable.".to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn observe_native(
     _approved: &ais_host_core::device::DeviceObservation,
 ) -> Result<ais_host_core::device::DeviceObservation, String> {
@@ -1309,7 +1369,13 @@ fn preview_native(identity: &str) -> Result<ais_host_core::device::DeviceObserva
         .map_err(|error| error.to_string())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn preview_native(identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::protocol::windows_transport::preview_observation(identity)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn preview_native(_identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
     Err(ais_host_helper::platform::unavailable_reason().to_string())
 }
@@ -1627,7 +1693,63 @@ impl ExchangeVolume for UdisksVolume {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+impl UdisksVolume {
+    /// The disk number, after proving the same physical drive is still there.
+    fn disk(device: &ais_host_core::device::DeviceObservation) -> Result<u32, String> {
+        let current = ais_host_helper::platform::observe_windows_unprivileged(device)
+            .map_err(|_| "The drive connection changed.".to_string())?;
+        if !device.same_physical_identity(&current) {
+            return Err("The drive connection changed.".into());
+        }
+        ais_host_helper::protocol::windows_wire::physical_drive_number(&device.os_identity)
+            .ok_or_else(|| "The drive is unavailable.".to_string())
+    }
+}
+
+/// Windows has no mount step: the exchange partition is already a volume, found
+/// by its host-assigned partition GUID on this disk and byte range, and opened
+/// by its volume GUID path without any drive letter.
+#[cfg(windows)]
+impl ExchangeVolume for UdisksVolume {
+    fn mount_parts(
+        &self,
+        device: &ais_host_core::device::DeviceObservation,
+        range: ais_host_core::device::ByteRange,
+        identity: &ais_host_core::drive_identity::DriveIdentity,
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+        let disk = Self::disk(device)?;
+        let wanted = ais_host_helper::platform::ExchangeWanted::new(
+            &identity.partitions[3],
+            Some(disk),
+            Some((range.start, range.length)),
+        )
+        .map_err(|_| "The exchange partition identity is invalid.".to_string())?;
+        let volume = ais_host_helper::platform::find_exchange_volume(
+            &wanted,
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|_| "The exchange partition could not be found.".to_string())?;
+        let root = ais_host_core::exchange_root::ExchangeRoot::open_verified(std::path::Path::new(
+            &volume,
+        ));
+        // The drive must still be the same one after the volume was opened.
+        Self::disk(device).and(root)
+    }
+
+    fn unmount(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        // Nothing is mounted by us; the helper locks and dismounts the volumes.
+        Self::disk(device).map(|_| ())
+    }
+
+    fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        let disk = Self::disk(device)?;
+        ais_host_helper::platform::eject_windows_disk(disk)
+            .map_err(|_| "The drive could not be ejected.".to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl ExchangeVolume for UdisksVolume {
     fn mount_parts(
         &self,

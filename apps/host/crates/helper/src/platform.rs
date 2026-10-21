@@ -2,7 +2,8 @@
 mod linux;
 #[cfg(any(target_os = "macos", feature = "file-test"))]
 mod macos;
-#[cfg(any(target_os = "windows", feature = "file-test"))]
+// Compiled everywhere: the snapshot parsing and eligibility rules are portable
+// and tested on every platform; only Windows reaches the native collectors.
 mod windows;
 
 #[cfg(target_os = "linux")]
@@ -37,7 +38,13 @@ pub use macos::{
 };
 
 #[cfg(target_os = "windows")]
-pub use windows::WindowsBlockTarget;
+pub use windows::{
+    ExchangeWanted, VolumeProbe, WindowsBlockTarget,
+    collect_by_identity as collect_windows_by_identity, eject_disk as eject_windows_disk,
+    find_exchange_volume, format_exchange, list_eligible as list_windows_eligible,
+    observe_unprivileged as observe_windows_unprivileged, select_exchange_volume,
+    update_snapshot as windows_update_snapshot,
+};
 #[cfg(feature = "file-test")]
 pub use windows::{
     ObservationError as WindowsObservationError, WindowsDiskObservation, WindowsDiskSnapshot,

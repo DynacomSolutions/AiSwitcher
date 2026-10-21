@@ -5,7 +5,7 @@ import { encodeJsonFrame } from "../../src/host/protocol";
 
 export type Target = "macos-arm64" | "windows-x64" | "linux-x64";
 export const components = ["ais-host-app", "ais-host-adapter", "ais-host-helper", "ais-host-escrow-purge"];
-export const releaseFiles = ["ais-host-macos-arm64.zip", "ais-host-windows-x64.zip", "ais-host-linux-x64.AppImage",
+export const releaseFiles = ["ais-host-macos-arm64.zip", "ais-host-windows-x64.zip", "ais-host-windows-x64-setup.exe", "ais-host-linux-x64.AppImage",
   ...["macos-arm64", "windows-x64", "linux-x64"].map((target) => `THIRD-PARTY-NOTICES-${target}.txt`)];
 export const digest = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 

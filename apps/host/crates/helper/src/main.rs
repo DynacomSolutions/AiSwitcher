@@ -1,12 +1,27 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Delay-loaded and runtime-loaded libraries come from System32 only, never
+    // from the application directory.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{
+            LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+        };
+        // SAFETY: plain process-wide setting with a documented constant.
+        if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
+            eprintln!("The library search path could not be restricted.");
+            std::process::exit(77);
+        }
+    }
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(77);
     }
 }
 
+// Windows is driven by the pipe commands alone; the Unix commands stay parsed
+// (and tested) there but are never run.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 enum Command {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -21,11 +36,29 @@ enum Command {
     },
     Preview(String),
     PreviewUpdate(String),
+    /// Windows: the helper is started elevated through UAC and serves one
+    /// client over a pipe it creates for the launching user's SID.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Pipe {
+        name: String,
+        sid: String,
+        action: PipeAction,
+    },
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum PipeAction {
+    Serve,
+    Preview(String),
+    PreviewUpdate(String),
 }
 
 /// The native identity scheme this build's helper accepts.
 const IDENTITY_PREFIX: &str = if cfg!(target_os = "macos") {
     "macos:"
+} else if cfg!(windows) {
+    "windows:"
 } else {
     "linux:"
 };
@@ -55,7 +88,9 @@ fn run() -> Result<(), &'static str> {
                 }
                 ais_host_helper::service::run_linux(socket, invoking_uid)
             }
-            Command::ServeAs { .. } => Err("The privileged helper invocation is invalid."),
+            Command::ServeAs { .. } | Command::Pipe { .. } => {
+                Err("The privileged helper invocation is invalid.")
+            }
             Command::Preview(identity) => ais_host_helper::service::preview_linux(&identity),
             Command::PreviewUpdate(identity) => {
                 ais_host_helper::service::preview_update_linux(&identity)
@@ -76,19 +111,77 @@ fn run() -> Result<(), &'static str> {
             Command::PreviewUpdate(identity) => {
                 ais_host_helper::service::preview_update_macos(&identity)
             }
-            Command::Serve(_) => Err("The privileged helper invocation is invalid."),
+            Command::Serve(_) | Command::Pipe { .. } => {
+                Err("The privileged helper invocation is invalid.")
+            }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        use ais_host_helper::service;
+        match command {
+            Command::Pipe { name, sid, action } => match action {
+                PipeAction::Serve => service::run_windows(&name, &sid),
+                PipeAction::Preview(identity) => service::preview_windows(&name, &sid, &identity),
+                PipeAction::PreviewUpdate(identity) => {
+                    service::preview_update_windows(&name, &sid, &identity)
+                }
+            },
+            _ => Err("The privileged helper invocation is invalid."),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = command;
         Err("This operating system has no enabled authenticated helper service.")
     }
 }
 
+/// `--pipe-serve NAME SID` and `--pipe-preview[-update] NAME SID IDENTITY`.
+/// Every value is validated here, before anything is created.
+fn parse_pipe_args(
+    mode: &str,
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<Command, &'static str> {
+    use ais_host_helper::protocol::windows_wire::{
+        physical_drive_number, valid_pipe_name, valid_sid,
+    };
+    let name = args.next().and_then(|name| name.into_string().ok());
+    let sid = args.next().and_then(|sid| sid.into_string().ok());
+    let (Some(name), Some(sid)) = (name, sid) else {
+        return Err("Unexpected helper arguments.");
+    };
+    if !valid_pipe_name(&name) || !valid_sid(&sid) {
+        return Err("The private helper pipe is invalid.");
+    }
+    let action = if mode == "--pipe-serve" {
+        PipeAction::Serve
+    } else {
+        let identity = args
+            .next()
+            .and_then(|identity| identity.into_string().ok())
+            .filter(|identity| physical_drive_number(identity).is_some())
+            .ok_or("The device identity is invalid.")?;
+        if mode == "--pipe-preview" {
+            PipeAction::Preview(identity)
+        } else {
+            PipeAction::PreviewUpdate(identity)
+        }
+    };
+    if args.next().is_some() {
+        return Err("Unexpected helper arguments.");
+    }
+    Ok(Command::Pipe { name, sid, action })
+}
+
 fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Command, &'static str> {
     let mut args = args.into_iter();
     let mode = args.next();
+    if let Some(mode @ ("--pipe-serve" | "--pipe-preview" | "--pipe-preview-update")) =
+        mode.as_deref().and_then(|mode| mode.to_str())
+    {
+        return parse_pipe_args(mode, args);
+    }
     if mode.as_deref().and_then(|mode| mode.to_str()) == Some("--serve-as") {
         let (Some(socket), Some(uid), Some(team), None) =
             (args.next(), args.next(), args.next(), args.next())
@@ -148,7 +241,7 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, IDENTITY_PREFIX, parse_args};
+    use super::{Command, IDENTITY_PREFIX, PipeAction, parse_args};
     use std::ffi::OsString;
 
     #[test]
@@ -179,6 +272,49 @@ mod tests {
             ]),
             Ok(Command::ServeAs { uid: 501, .. })
         ));
+        let pipe = format!("ais-host-{}", "0123456789abcdef".repeat(2));
+        let sid = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        let parsed = |args: &[&str]| parse_args(args.iter().map(OsString::from));
+        assert!(matches!(
+            parsed(&["--pipe-serve", &pipe, sid]),
+            Ok(Command::Pipe {
+                action: PipeAction::Serve,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parsed(&["--pipe-preview", &pipe, sid, "windows:PhysicalDrive3"]),
+            Ok(Command::Pipe {
+                action: PipeAction::Preview(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parsed(&[
+                "--pipe-preview-update",
+                &pipe,
+                sid,
+                "windows:PhysicalDrive3"
+            ]),
+            Ok(Command::Pipe {
+                action: PipeAction::PreviewUpdate(_),
+                ..
+            })
+        ));
+        for args in [
+            // The pipe, the user and the disk are fixed shapes; nothing extra.
+            vec!["--pipe-serve"],
+            vec!["--pipe-serve", &pipe],
+            vec!["--pipe-serve", "evil", sid],
+            vec!["--pipe-serve", &pipe, "S-1-1-0"],
+            vec!["--pipe-serve", &pipe, sid, "extra"],
+            vec!["--pipe-preview", &pipe, sid],
+            vec!["--pipe-preview", &pipe, sid, r"\\.\PhysicalDrive3"],
+            vec!["--pipe-preview", &pipe, sid, "windows:PhysicalDrive03"],
+            vec!["--pipe-preview", &pipe, sid, "windows:PhysicalDrive3", "x"],
+        ] {
+            assert!(parsed(&args).is_err(), "{args:?}");
+        }
         for args in [
             vec![OsString::from("createLayout")],
             vec![OsString::from("--serve")],

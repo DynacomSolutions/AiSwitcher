@@ -64,7 +64,7 @@ impl DriveIdentity {
     }
 }
 
-pub(crate) fn gpt_guid(uuid: &str) -> Result<[u8; 16], DeviceError> {
+pub fn gpt_guid(uuid: &str) -> Result<[u8; 16], DeviceError> {
     if uuid.len() != 36
         || uuid.bytes().enumerate().any(|(i, b)| {
             if [8, 13, 18, 23].contains(&i) {

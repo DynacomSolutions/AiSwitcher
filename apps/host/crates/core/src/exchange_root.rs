@@ -318,8 +318,8 @@ impl ExchangeRoot {
     }
 }
 
-// Native creation is currently Linux-only; other platforms fail closed.
-#[cfg(not(unix))]
+// Other platforms fail closed.
+#[cfg(not(any(unix, windows)))]
 impl ExchangeRoot {
     pub(crate) fn bundle_lock(&self) -> Result<File, String> {
         Err("Unsupported platform.".into())
@@ -348,6 +348,9 @@ impl ExchangeRoot {
     }
 }
 
+#[cfg(windows)]
+mod windows_root;
+
 impl ExchangeRoot {
     /// The kernel-reported mount point this capability was opened on.
     pub fn mount_path(&self) -> &std::path::Path {
@@ -360,5 +363,83 @@ impl ExchangeRoot {
     }
     pub(crate) fn display_path(&self, name: &str) -> PathBuf {
         self.path.join(name)
+    }
+}
+
+/// One plain entry name: no separators, drive or stream syntax, control
+/// characters, reserved trailing dot or space. Compiled everywhere so it is
+/// tested everywhere; only the Windows root uses it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_component(name: &str) -> Result<&str, String> {
+    if name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name.ends_with(['.', ' '])
+        || name
+            .chars()
+            .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c))
+    {
+        return Err("Invalid exchange filename.".into());
+    }
+    Ok(name)
+}
+
+/// `\\?\Volume{GUID}\` and nothing else.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn valid_volume_guid_path(path: &str) -> bool {
+    let Some(guid) = path
+        .strip_prefix("\\\\?\\Volume{")
+        .and_then(|rest| rest.strip_suffix("}\\"))
+    else {
+        return false;
+    };
+    guid.len() == 36
+        && guid.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(test)]
+mod windows_name_tests {
+    use super::*;
+
+    #[test]
+    fn entry_names_are_single_plain_components() {
+        for good in [
+            "inbox",
+            "bundle-1.age",
+            ".bundle-operation.lock",
+            ".ais-x.partial",
+        ] {
+            assert_eq!(windows_component(good), Ok(good));
+        }
+        for bad in [
+            "", ".", "..", "a/b", "a\\b", "C:x", "a:stream", "name.", "name ", "a*b", "a?b",
+            "a\u{0}b", "con<",
+        ] {
+            assert!(windows_component(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_volume_guid_paths_are_exchange_roots() {
+        assert!(valid_volume_guid_path(
+            "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\"
+        ));
+        for bad in [
+            "",
+            "C:\\",
+            "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}",
+            "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdeg}\\",
+            "\\\\?\\Volume{0123}\\",
+            "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\x",
+        ] {
+            assert!(!valid_volume_guid_path(bad), "{bad}");
+        }
     }
 }

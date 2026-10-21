@@ -7,6 +7,11 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+mod windows;
+#[cfg(windows)]
+pub use windows::windows_transport;
+pub use windows::windows_wire;
+
 pub const MAX_REQUEST_BYTES: usize = 4096;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -93,7 +98,7 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, ProtocolError> {
     Ok(request)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn operation_binding(challenge: &[u8; 32], request: &Request) -> [u8; 32] {
     fn append_field(output: &mut Vec<u8>, value: &[u8]) {
         output.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -132,7 +137,10 @@ fn operation_binding(challenge: &[u8; 32], request: &Request) -> [u8; 32] {
 
 /// No public constructor. Only an authenticated native transport may establish this proof
 /// after checking peer credentials, the client pin and one request.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 pub struct AuthenticatedChannel {
     pub(crate) peer_pid: u32,
     pub(crate) peer_uid: u32,
@@ -145,6 +153,12 @@ pub struct AuthenticatedChannel {
     pub(crate) peer_token: [u8; 32],
     #[cfg(target_os = "macos")]
     pub(crate) team: String,
+    /// Retained handle of the authenticated peer, so its process id cannot be
+    /// recycled, and the application image the peer was matched against.
+    #[cfg(windows)]
+    pub(crate) peer_process: windows_transport::ProcessHandle,
+    #[cfg(windows)]
+    pub(crate) peer_image: std::path::PathBuf,
 }
 
 impl AuthenticatedChannel {
@@ -156,6 +170,11 @@ impl AuthenticatedChannel {
     #[cfg(target_os = "macos")]
     pub(crate) fn revalidate_sender(&self) -> Result<(), ProtocolError> {
         macos_transport::verify_peer_token(&self.peer_token, &self.team)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn revalidate_sender(&self) -> Result<(), ProtocolError> {
+        windows_transport::verify_peer(&self.peer_process, &self.peer_image)
     }
 }
 

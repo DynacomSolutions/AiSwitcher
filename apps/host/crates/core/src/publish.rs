@@ -154,7 +154,41 @@ pub fn snapshot_model(model: &mut VerifiedModel) -> Result<ModelSnapshot, String
             file,
         })
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // An exclusively created, share-nothing file that Windows deletes when
+        // the last handle closes, so no other process can open or alter it.
+        let mut name = [0u8; 8];
+        getrandom::fill(&mut name).map_err(|_| "Cannot create the private model snapshot.")?;
+        let path = std::env::temp_dir().join(format!("ais-model-snapshot-{}.tmp", hex(&name)));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(0x8000_0000 | 0x4000_0000 | 0x0001_0000)
+            .share_mode(0)
+            .custom_flags(0x0400_0000) // FILE_FLAG_DELETE_ON_CLOSE
+            .open(path)
+            .map_err(|_| "Cannot create the private model snapshot.")?;
+        model.file.rewind().map_err(|_| "Cannot read the model.")?;
+        let limit = model
+            .entry
+            .size_bytes
+            .checked_add(1)
+            .ok_or("Invalid model size.")?;
+        let copied = std::io::copy(&mut (&mut model.file).take(limit), &mut file)
+            .map_err(|_| "Cannot snapshot the model.")?;
+        if copied != model.entry.size_bytes {
+            return Err("The model size changed.".into());
+        }
+        verify_file(&mut file, &model.entry)?;
+        Ok(ModelSnapshot {
+            entry: model.entry.clone(),
+            file,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = model;
         Err("Immutable model snapshots are unavailable on this platform.".into())
