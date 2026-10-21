@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "ais-host-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ais-host-core",
  "ais-host-helper",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "ais-host-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "age",
  "chrono",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ais-host-helper"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ais-host-core",
  "libc",

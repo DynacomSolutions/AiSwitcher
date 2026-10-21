@@ -29,7 +29,11 @@ class StepFailed(RuntimeError):
 def call(args, *, data=None, timeout=120, step=None):
     result = subprocess.run(args, input=data, capture_output=True, timeout=timeout)
     if result.returncode:
-        raise StepFailed(step or Path(args[0]).name)
+        # Only fixed Apple error tokens are surfaced, never free-form output.
+        codes = sorted(set(re.findall(rb"errSec[A-Za-z]+|CSSMERR_[A-Z_]+|-?\b(?:25294|25300|67030|67062)\b",
+                                      result.stderr + result.stdout)))
+        detail = f" [{', '.join(code.decode() for code in codes)}]" if codes else ""
+        raise StepFailed((step or Path(args[0]).name) + detail)
     return result.stdout
 
 
@@ -112,8 +116,15 @@ def main():
             os.chmod(path, 0o600)
         keychain = private / "signing.keychain-db"
         password = env[SECRET_NAMES[1]]
+        original_list = None
         try:
             security_command("create-keychain", "-p", password, str(keychain))
+            # codesign resolves the private key through the user search list.
+            original_list = [line.strip().strip('"') for line in
+                             call(["security", "list-keychains", "-d", "user"]).decode().splitlines()
+                             if line.strip()]
+            call(["security", "list-keychains", "-d", "user", "-s", str(keychain), *original_list],
+                 step="list-keychains")
             security_command("set-keychain-settings", "-lut", "3600", str(keychain))
             security_command("unlock-keychain", "-p", password, str(keychain))
             security_command("import", str(cert), "-k", str(keychain), "-P", password,
@@ -141,9 +152,9 @@ def main():
             for name in sorted(expected - {"ais-host-app"}):
                 entitlements = (["--entitlements", "apps/host/packaging/adapter.entitlements.plist"]
                                 if name == "ais-host-adapter" else [])
-                call([*options, *entitlements, str(binaries / name)])
-            call([*options, str(app)])
-            call(["codesign", "--verify", "--deep", "--strict", str(app)])
+                call([*options, *entitlements, str(binaries / name)], step=f"codesign {name}")
+            call([*options, str(app)], step="codesign app")
+            call(["codesign", "--verify", "--deep", "--strict", str(app)], step="codesign verify")
             submission = private / "submission.zip"
             call(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(submission)])
             store_notary_profile(api_key, keychain, env)
@@ -166,6 +177,9 @@ def main():
             with output.open("a") as handle:
                 handle.write("ready=true\n")
         finally:
+            if original_list is not None:
+                call(["security", "list-keychains", "-d", "user", "-s", *original_list],
+                     step="restore list-keychains")
             if keychain.exists():
                 call(["security", "delete-keychain", str(keychain)])
     print("macOS Developer ID signing, notarisation and stapling passed.")
