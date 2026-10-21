@@ -2106,7 +2106,17 @@ end run"#;
 
         #[test]
         fn peer_credentials_name_this_process_and_its_token_fails_a_foreign_team() {
-            let (_, receiver) = UnixStream::pair().unwrap();
+            // XNU records peer credentials on connect(), not for socketpair().
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("ais-peer-{}-{nanos}.sock", std::process::id()));
+            let listener = UnixListener::bind(&path).unwrap();
+            let _client = UnixStream::connect(&path).unwrap();
+            let (receiver, _) = listener.accept().unwrap();
+            let _ = fs::remove_file(&path);
             let peer = peer_of(&receiver).unwrap();
             assert_eq!(peer.uid, current_uid());
             assert_eq!(peer.pid, std::process::id());
