@@ -86,6 +86,8 @@ describe("steady-state merge cost", () => {
     try {
       const result = await mergeIncomingProfileTree(incoming, scope(home), { home });
       expect(result.copiedFiles).toBe(0);
+      // Recorded so sync excludes them from later transfers instead of re-staging them each run.
+      expect([...result.deniedPaths!].sort()).toEqual([join(dir, "diff.sh"), join(dir, "same.sh")]);
     } finally {
       console.warn = warn;
     }

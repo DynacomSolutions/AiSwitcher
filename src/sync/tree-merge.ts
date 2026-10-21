@@ -33,6 +33,8 @@ export interface TreeMergeResult {
   preservedConflictPaths: string[];
   /** Logs skipped only because a native process owns them; not copied, re-staged next run. */
   busyPaths: string[];
+  /** Paths this user cannot re-time or overwrite (root-owned); sync excludes them from later runs. */
+  deniedPaths?: string[];
 }
 
 export interface ArchiveRecoveryResult extends TreeMergeResult {
@@ -153,11 +155,12 @@ export function setFsOps(ops?: Partial<FsOps>): void { fsOps = { ...nativeFsOps,
 
 /** Root-owned (or otherwise read-only to this user) files cannot be re-timed or overwritten.
  * Warn per file and carry on: failing the whole sync would re-stage everything next run. */
-async function tolerateDenied(rel: string, action: () => Promise<void>): Promise<boolean> {
+async function tolerateDenied(rel: string, action: () => Promise<void>, denied?: string[]): Promise<boolean> {
   try { await action(); return true; }
   catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "EPERM" && code !== "EACCES") throw error;
+    denied?.push(rel);
     console.warn(`AIS sync skipped ${rel}: ${code} (not writable by this user, e.g. root-owned); left unchanged.`);
     return false;
   }
@@ -165,10 +168,10 @@ async function tolerateDenied(rel: string, action: () => Promise<void>): Promise
 
 /** Byte-identical files must also agree on mtime, or rsync's size+mtime quick
  * check re-stages them every run. Only the mtime moves, never the contents. */
-async function convergeMtime(source: string, destination: string, rel: string): Promise<void> {
+async function convergeMtime(source: string, destination: string, rel: string, denied?: string[]): Promise<void> {
   const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
   if (sourceStat.mtimeMs > destinationStat.mtimeMs) {
-    await tolerateDenied(rel, () => fsOps.utimes(destination, destinationStat.atime, sourceStat.mtime));
+    await tolerateDenied(rel, () => fsOps.utimes(destination, destinationStat.atime, sourceStat.mtime), denied);
   }
 }
 
@@ -555,7 +558,7 @@ export async function mergeIncomingProfileTree(
   const conflictRoot =
     options.conflictRoot ??
     join(aisRemoteCacheDir(home), "merge-conflicts", new Date().toISOString().replaceAll(":", "-"));
-  const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [] };
+  const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [], deniedPaths: [] };
   const registries = registryRelPaths(scope, home);
   const ownerPass = options.ownerPass ?? { lookups: 0 };
 
@@ -584,7 +587,7 @@ export async function mergeIncomingProfileTree(
     if (source.endsWith(".jsonl")) {
       // Identical complete history: no merge needed, so skip reading it whole.
       if ((await exists(destination)) && (await filesEqual(source, destination, false)) && (await endsWithNewlineOrEmpty(source, (await stat(source)).size))) {
-        await convergeMtime(source, destination, rel);
+        await convergeMtime(source, destination, rel, result.deniedPaths);
         continue;
       }
       // mergeJsonlFiles checks ownership only when there is an actual append
@@ -604,24 +607,24 @@ export async function mergeIncomingProfileTree(
         result.preservedConflicts++;
         result.preservedConflictPaths.push(rel);
       }
-      if ((await exists(destination)) && (await filesEqual(source, destination, false))) await convergeMtime(source, destination, rel);
+      if ((await exists(destination)) && (await filesEqual(source, destination, false))) await convergeMtime(source, destination, rel, result.deniedPaths);
       continue;
     }
 
     if (!(await exists(destination))) {
       await mkdir(dirname(destination), { recursive: true });
-      if (await tolerateDenied(rel, () => fsOps.copyFile(source, destination))) result.copiedFiles++;
+      if (await tolerateDenied(rel, () => fsOps.copyFile(source, destination), result.deniedPaths)) result.copiedFiles++;
       continue;
     }
     if (await filesEqual(source, destination)) {
-      await convergeMtime(source, destination, rel);
+      await convergeMtime(source, destination, rel, result.deniedPaths);
       continue;
     }
 
     const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
     if (sourceStat.mtimeMs > destinationStat.mtimeMs) {
       await preserveFile(destination, conflictRoot, "local", rel);
-      if (!(await tolerateDenied(rel, () => fsOps.copyFile(source, destination)))) continue;
+      if (!(await tolerateDenied(rel, () => fsOps.copyFile(source, destination), result.deniedPaths))) continue;
     } else {
       await preserveFile(source, conflictRoot, "incoming", rel);
     }

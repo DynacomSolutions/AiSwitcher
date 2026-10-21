@@ -19,6 +19,7 @@ import { scheduleAutomaticSync } from "../../sync/auto-schedule.ts";
 import { lowerProcessPriority } from "../../sync/low-priority.ts";
 import { pruneStaging } from "../../sync/staging.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
+import { crushFingerprint } from "../../sync/steady-state.ts";
 import { mergeIncomingProfileTree, recoverProfileArchives, withProfileMergeLock } from "../../sync/tree-merge.ts";
 import type { SyncScope } from "../../sync/types.ts";
 import { removeSyntheticLegacyRegistryEntries } from "../../sync/registry.ts";
@@ -153,10 +154,16 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
     // Internal SSH protocol used by sync/service.ts. Snapshots are created
     // and merged through SQLite itself; rsync never touches a live database.
     case "snapshot-zai": {
+      // The token is taken before the snapshot, so a concurrent write only causes a redundant later run.
+      const token = await crushFingerprint(homedir());
+      if (token && stringFlag(flags, "if-changed") === token) {
+        console.log(JSON.stringify({ unchanged: true, token }));
+        return;
+      }
       const snapshotId = crypto.randomUUID();
       const root = snapshotRoot("sqlite-snapshots", snapshotId);
       const manifest = await createCrushSnapshotTree(root);
-      console.log(JSON.stringify({ snapshotId, databases: manifest.databases }));
+      console.log(JSON.stringify({ snapshotId, databases: manifest.databases, token }));
       return;
     }
     case "drop-zai-snapshot": {
@@ -170,7 +177,7 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       const manifest = await loadCrushSnapshotManifest(root);
       const merged = await mergeCrushSnapshotTree(manifest);
       await rm(root, { recursive: true, force: true });
-      console.log(JSON.stringify({ merged }));
+      console.log(JSON.stringify({ merged, token: await crushFingerprint(homedir()) }));
       return;
     }
     case "merge-profile-snapshot": {
