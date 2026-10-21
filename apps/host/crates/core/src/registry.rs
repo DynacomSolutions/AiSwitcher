@@ -307,7 +307,15 @@ impl FileRegistry {
             .truncate(false)
             .open(lock_path)
             .map_err(|_| EscrowError::RegistryUnavailable)?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| EscrowError::RegistryBusy)?;
+        // A child forked by another thread keeps the lock until its exec, so a
+        // brief wait avoids reporting a spurious "in progress" error.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+            if std::time::Instant::now() >= deadline {
+                return Err(EscrowError::RegistryBusy);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         Ok(Self {
             directory,
             _lock: lock,

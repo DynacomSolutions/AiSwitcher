@@ -22,10 +22,14 @@ SECRET_NAMES = (
 )
 
 
-def call(args, *, data=None, timeout=120):
+class StepFailed(RuntimeError):
+    """Carries only a fixed step name, never tool output or arguments."""
+
+
+def call(args, *, data=None, timeout=120, step=None):
     result = subprocess.run(args, input=data, capture_output=True, timeout=timeout)
     if result.returncode:
-        raise RuntimeError("macOS signing or assessment failed; private diagnostics suppressed.")
+        raise StepFailed(step or Path(args[0]).name)
     return result.stdout
 
 
@@ -36,7 +40,8 @@ def security_command(*args):
         if "\n" in value or "\r" in value or "\0" in value:
             raise RuntimeError("Unsupported keychain input.")
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    call(["security", "-i"], data=(" ".join(map(quote, args)) + "\n").encode())
+    call(["security", "-i"], data=(" ".join(map(quote, args)) + "\n").encode(),
+         step=f"security {args[0]}")
 
 
 def store_notary_profile(key, keychain, env):
@@ -74,7 +79,7 @@ def store_notary_profile(key, keychain, env):
                     os.write(master, (value + "\n").encode())
                     captured = b""
         if pending or child.wait(timeout=5) != 0:
-            raise RuntimeError("Notary credential registration failed.")
+            raise StepFailed("notarytool store-credentials")
     finally:
         if child.poll() is None:
             child.kill()
@@ -113,12 +118,16 @@ def main():
             security_command("unlock-keychain", "-p", password, str(keychain))
             security_command("import", str(cert), "-k", str(keychain), "-P", password,
                              "-T", "/usr/bin/codesign", "-T", "/usr/bin/security")
+            # The .p12 holds only the leaf; codesign needs Apple's intermediate
+            # in the keychain to build a valid chain.
+            call(["security", "import", "apps/host/packaging/DeveloperIDG2CA.cer",
+                  "-k", str(keychain)], step="import intermediate")
             security_command("set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
                              "-s", "-k", password, str(keychain))
             identities = call(["security", "find-identity", "-v", "-p", "codesigning", str(keychain)]).decode()
             fingerprints = re.findall(r'([A-F0-9]{40}) "Developer ID Application:', identities)
             if len(fingerprints) != 1:
-                raise RuntimeError("Expected one valid Developer ID Application identity.")
+                raise StepFailed(f"find-identity ({len(fingerprints)} valid identities)")
             fingerprint = fingerprints[0]
             unpacked = root / "unpacked"
             call(["ditto", "-x", "-k", str(archive), str(unpacked)])
@@ -126,7 +135,7 @@ def main():
             binaries = app / "Contents" / "MacOS"
             expected = {"ais-host-app", "ais-host-helper", "ais-host-adapter", "ais-host-escrow-purge"}
             if {path.name for path in binaries.iterdir()} != expected:
-                raise RuntimeError("Unexpected nested executable layout.")
+                raise StepFailed("nested executable layout")
             options = ["codesign", "--force", "--timestamp", "--options", "runtime",
                        "--keychain", str(keychain), "--sign", fingerprint]
             for name in sorted(expected - {"ais-host-app"}):
@@ -143,7 +152,7 @@ def main():
                  "ais-host-notary", "--keychain", str(keychain), "--wait",
                  "--timeout", "30m", "--output-format", "json"], timeout=1900))
             if receipt.get("status") != "Accepted":
-                raise RuntimeError("Notarisation was not accepted.")
+                raise StepFailed(f"notarisation status {receipt.get('status')!r}")
             call(["xcrun", "stapler", "staple", str(app)])
             call(["xcrun", "stapler", "validate", str(app)])
             call(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)])
@@ -165,6 +174,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        print("::error::macOS signing failed; credential material and private diagnostics were not logged.")
+    except StepFailed as failure:
+        print(f"::error::macOS signing failed at step: {failure}. Credential material and tool output were not logged.")
+        sys.exit(1)
+    except Exception as failure:
+        print(f"::error::macOS signing failed ({type(failure).__name__}); credential material and private diagnostics were not logged.")
         sys.exit(1)
