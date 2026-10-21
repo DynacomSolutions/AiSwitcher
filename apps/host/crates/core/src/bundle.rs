@@ -521,6 +521,8 @@ fn lock_bundle_directory(directory: &Path) -> Result<File, String> {
 }
 
 fn sync_directory(directory: &Path) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = directory;
     #[cfg(unix)]
     {
         File::open(directory)

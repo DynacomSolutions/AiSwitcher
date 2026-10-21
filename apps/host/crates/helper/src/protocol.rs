@@ -1,7 +1,9 @@
 //! A bounded request description. Decoding is not authentication or approval.
 use ais_host_core::release::PublishedRelease;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 use thiserror::Error;
 

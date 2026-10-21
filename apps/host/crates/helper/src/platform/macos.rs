@@ -11,7 +11,7 @@ use ais_host_core::device::WriteTarget;
 use ais_host_core::{device::DeviceObservation, release::sha256};
 use serde_json::Value;
 #[cfg(target_os = "macos")]
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, SeekFrom, Write};
 #[cfg(target_os = "macos")]
 use std::{
     fs::{File, OpenOptions},

@@ -11,7 +11,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs,
     io::Write,
     path::PathBuf,
 };
@@ -303,7 +303,7 @@ impl FlowStore for FileFlowStore {
         drop(file);
         fs::rename(&temporary, &target).map_err(|_| "cannot publish flow state")?;
         #[cfg(unix)]
-        File::open(&self.directory)
+        fs::File::open(&self.directory)
             .and_then(|f| f.sync_all())
             .map_err(|_| "cannot flush flow state directory")?;
         Ok(())

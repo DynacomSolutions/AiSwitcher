@@ -24,7 +24,8 @@ fn options(account: &str) -> PasswordOptions {
 }
 
 pub(super) fn availability() -> Result<(), EscrowError> {
-    Ok(())
+    // Unsigned builds lack the keychain entitlement; probe with a delete, which reads no data.
+    delete("availability-probe")
 }
 
 pub(super) fn put(account: &str, bytes: &[u8]) -> Result<(), EscrowError> {

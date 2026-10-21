@@ -89,6 +89,8 @@ mod tests {
 
     #[test]
     fn accepts_only_fixed_service_arguments() {
+        // The socket path is only absolute on Unix; the service is Linux-only.
+        #[cfg(unix)]
         assert!(matches!(
             parse_args([
                 OsString::from("--serve"),

@@ -1,8 +1,7 @@
 //! A retained mount capability. No publication operation re-resolves its path.
-use std::{
-    fs::File,
-    path::{Path, PathBuf},
-};
+#[cfg(unix)]
+use std::path::Path;
+use std::{fs::File, path::PathBuf};
 
 pub struct ExchangeRoot {
     file: File,
@@ -195,6 +194,7 @@ impl ExchangeRoot {
     }
 
     pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
         use std::os::fd::AsRawFd;
         let from = Self::component(from)?;
         let to = Self::component(to)?;
@@ -210,7 +210,10 @@ impl ExchangeRoot {
             )
         };
         #[cfg(not(target_os = "linux"))]
-        let result = -1;
+        let result = {
+            let _ = (from, to);
+            -1
+        };
         if result != 0 {
             return Err("Cannot publish the exchange file without replacement.".into());
         }
