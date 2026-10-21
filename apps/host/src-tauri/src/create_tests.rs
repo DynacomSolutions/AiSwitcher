@@ -359,7 +359,7 @@ fn update_smoke(
                 ais_host_core::update_journal::UpdateJournal::new(&image, previous.clone()).unwrap()
             }
         };
-        journal.check_drive(&snapshot, &previous).unwrap();
+        journal.check_drive(&snapshot, &previous, "updating").unwrap();
         journal.check_image(&image).unwrap();
         let plan = WritePlan::update_drive(&image, &snapshot, &previous).unwrap();
         let handle = super::drive_handle(&plan).unwrap();

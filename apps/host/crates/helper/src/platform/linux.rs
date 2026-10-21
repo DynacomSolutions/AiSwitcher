@@ -360,40 +360,61 @@ fn collect_sysfs_snapshot(name: &str) -> Result<LinuxDiskSnapshot, ObservationEr
     }
     partitions.sort();
 
+    // Trigger automounts first so an autofs placeholder at a system mount
+    // point is followed by the real mount that names its device.
+    for point in SYSTEM_MOUNTS {
+        let _ = fs::read_dir(point);
+    }
     let mountinfo =
         fs::read_to_string("/proc/self/mountinfo").map_err(|_| ObservationError::InvalidInput)?;
     let mut mounted = BTreeSet::new();
     let mut system_roots = BTreeSet::new();
+    let mut resolved_points = BTreeSet::new();
+    let mut unresolved_points = BTreeSet::new();
     for line in mountinfo.lines() {
         let fields = line.split(' ').collect::<Vec<_>>();
         if fields.len() < 10 || !valid_major_minor(fields[2]) {
             return Err(ObservationError::InvalidInput);
         }
-        let is_system_mount = matches!(fields[4], "/" | "/boot" | "/boot/efi");
+        let is_system_mount = SYSTEM_MOUNTS.contains(&fields[4]);
         let separator = fields
             .iter()
             .position(|field| *field == "-")
             .ok_or(ObservationError::InvalidInput)?;
-        let fs_type = fields
-            .get(separator + 1)
+        let source = fields
+            .get(separator + 2)
             .ok_or(ObservationError::InvalidInput)?;
         let major = fields[2]
             .split_once(':')
             .ok_or(ObservationError::InvalidInput)?
             .0;
-        if major == "0" {
-            if is_known_pseudo_filesystem(fs_type) {
-                if is_system_mount {
-                    return Err(ObservationError::InvalidInput);
-                }
-                continue;
+        // btrfs, fuseblk and similar report an anonymous 0:N device; their
+        // source names the backing block device instead.
+        let device = if major != "0" {
+            fields[2].to_owned()
+        } else if source.starts_with("/dev/") {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let metadata = fs::metadata(source).map_err(|_| ObservationError::InvalidInput)?;
+            if !metadata.file_type().is_block_device() {
+                return Err(ObservationError::InvalidInput);
             }
-            return Err(ObservationError::InvalidInput);
-        }
-        mounted.insert(fields[2].to_owned());
+            linux_rdev(metadata.rdev())
+        } else {
+            if is_system_mount {
+                unresolved_points.insert(fields[4].to_owned());
+            }
+            continue;
+        };
+        mounted.insert(device.clone());
         if is_system_mount {
-            system_roots.insert(fields[2].to_owned());
+            resolved_points.insert(fields[4].to_owned());
+            system_roots.insert(device);
         }
+    }
+    // A system mount point backed only by a pseudo filesystem (for example an
+    // untriggered autofs) hides its disk, so fail closed.
+    if !unresolved_points.is_subset(&resolved_points) {
+        return Err(ObservationError::InvalidInput);
     }
     // Traverse stacked block devices in both directions so backing disks and
     // holders of root/boot devices are all treated as system storage.
@@ -477,28 +498,7 @@ fn expand_device_graph(roots: BTreeSet<String>) -> Result<BTreeSet<String>, Obse
     Ok(found)
 }
 
-fn is_known_pseudo_filesystem(fs_type: &str) -> bool {
-    matches!(
-        fs_type,
-        "autofs"
-            | "bpf"
-            | "cgroup"
-            | "cgroup2"
-            | "configfs"
-            | "debugfs"
-            | "overlay"
-            | "devpts"
-            | "devtmpfs"
-            | "fusectl"
-            | "mqueue"
-            | "proc"
-            | "pstore"
-            | "securityfs"
-            | "sysfs"
-            | "tmpfs"
-            | "tracefs"
-    )
-}
+const SYSTEM_MOUNTS: [&str; 4] = ["/", "/boot", "/boot/efi", "/efi"];
 
 fn read_table_fingerprint(file: &File, capacity_bytes: u64) -> Result<[u8; 32], ObservationError> {
     use std::os::unix::fs::FileExt;
@@ -936,6 +936,21 @@ pub fn update_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real host's mount table (btrfs, fuse, efivarfs, ...) must not
+    /// make every disk unobservable.
+    #[test]
+    fn host_disks_are_observable() {
+        let names = fs::read_dir("/sys/block")
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| is_candidate_disk_name(name))
+            .collect::<Vec<_>>();
+        for name in names {
+            assert!(collect_sysfs_snapshot(&name).is_ok(), "{name}");
+        }
+    }
 
     #[test]
     fn partition_nodes_follow_the_kernel_naming_rule() {

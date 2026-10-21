@@ -180,10 +180,10 @@ fn update_resumes_each_partition_without_changing_exchange_persist_or_identity()
     let exchange =
         ais_host_core::exchange_root::ExchangeRoot::test_directory(&exchange_path).unwrap();
     let journal = UpdateJournal::new(&image, installed.clone()).unwrap();
-    journal.check_drive(&snapshot, &installed).unwrap();
+    journal.check_drive(&snapshot, &installed, "updating").unwrap();
     assert!(
         journal
-            .check_drive(&snapshot, &unknown)
+            .check_drive(&snapshot, &unknown, "updating")
             .unwrap_err()
             .contains("identities")
     );
@@ -195,7 +195,7 @@ fn update_resumes_each_partition_without_changing_exchange_persist_or_identity()
     let copied = other_sealed.authenticate("SYNTHETIC_FIXTURE_12").unwrap();
     assert!(
         copied
-            .check_drive(&snapshot, &installed)
+            .check_drive(&snapshot, &installed, "updating")
             .unwrap_err()
             .contains("identities")
     );
@@ -211,7 +211,16 @@ fn update_resumes_each_partition_without_changing_exchange_persist_or_identity()
     std::fs::remove_file(exchange_path.join(JOURNAL_NAME)).unwrap();
     // Power loss after the registry advance must still permit the same recovery.
     let completed = InstalledImage::new(&image, identity.clone(), &snapshot.observation);
-    journal.check_drive(&snapshot, &completed).unwrap();
+    journal
+        .check_drive(&snapshot, &completed, "writtenAwaitingBoot")
+        .unwrap();
+    // A journal replayed while a later update is in progress is refused.
+    assert!(
+        journal
+            .check_drive(&snapshot, &completed, "updating")
+            .unwrap_err()
+            .contains("identities")
+    );
 
     // Disconnect immediately after each complete partition write, including the
     // final ESP before its readback, and also exercise partially written data.
@@ -283,7 +292,9 @@ fn update_resumes_each_partition_without_changing_exchange_persist_or_identity()
         let recovered = sealed_after_reconnect
             .authenticate("SYNTHETIC_FIXTURE_12")
             .unwrap();
-        recovered.check_drive(&interrupted, &installed).unwrap();
+        recovered
+            .check_drive(&interrupted, &installed, "updating")
+            .unwrap();
         let (_, mut resumed_image) = newer.verify_live_layout(&directory).unwrap();
         recovered.check_image(&resumed_image).unwrap();
         let resume =

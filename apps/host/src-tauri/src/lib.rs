@@ -97,21 +97,13 @@ fn inspect_devices(
             .iter()
             .filter(|(image, _)| image.hardware_hint == hint)
             .collect();
-        if let [(installed, status)] = matches.as_slice() {
-            let journal = preview_update_native(&summary.id)
-                .and_then(|snapshot| inspect_journal(&UdisksVolume, &snapshot, installed));
-            summary.layout_status = match journal {
-                Ok(Some(_)) => "update incomplete",
-                Ok(None) if status == "updating" => {
-                    summary.update_error = Some("The update journal is missing. The interrupted release cannot be identified safely.".into());
-                    "update refused"
-                }
-                Ok(None) if status == "writtenAwaitingBoot" => "awaiting boot",
-                Ok(None) => "ready",
-                Err(error) => {
-                    summary.update_error = Some(error);
-                    "update refused"
-                }
+        // Registry status only: the journal is read and authenticated when the
+        // user starts the update, so refreshing the list never prompts for root.
+        if let [(_, status)] = matches.as_slice() {
+            summary.layout_status = match status.as_str() {
+                "updating" => "update incomplete",
+                "writtenAwaitingBoot" => "awaiting boot",
+                _ => "ready",
             }
             .into();
         }
@@ -194,7 +186,7 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
     state.install_native_preview(
         fetched.image,
         fetched.release,
-        preview_native(device_id)?,
+        observation,
         details,
         fetched.sources,
         preparation,
@@ -230,7 +222,7 @@ async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<Writ
             .as_ref()
             .map(|sealed| {
                 let journal = sealed.authenticate(preparation.create.passphrase.expose())?;
-                journal.check_drive(&snapshot, &registered)?;
+                journal.check_drive(&snapshot, &registered, &status)?;
                 Ok::<_, String>(journal)
             })
             .transpose()?;
@@ -262,7 +254,7 @@ async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<Writ
                 registered.clone(),
             )?,
         };
-        journal.check_drive(&snapshot, &registered)?;
+        journal.check_drive(&snapshot, &registered, &status)?;
         journal.check_image(&fetched.image)?;
         let installed = journal.previous().clone();
         let plan =

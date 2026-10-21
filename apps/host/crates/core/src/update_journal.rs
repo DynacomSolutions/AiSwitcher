@@ -76,9 +76,13 @@ impl UpdateJournal {
         &self,
         snapshot: &DriveSnapshot,
         registered: &InstalledImage,
+        status: &str,
     ) -> Result<(), String> {
         self.validate()?;
-        let completed = registered.identity == self.drive_identity
+        // Only an advanced registry may match the target; otherwise an older
+        // journal replayed during a later update would pass as completed.
+        let completed = status == "writtenAwaitingBoot"
+            && registered.identity == self.drive_identity
             && registered.hardware_hint == self.previous.hardware_hint
             && registered.tag == self.target_tag
             && registered.image_digest == self.image_sha256
