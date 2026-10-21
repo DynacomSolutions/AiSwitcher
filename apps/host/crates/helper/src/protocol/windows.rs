@@ -129,6 +129,15 @@ pub mod windows_wire {
             })
     }
 
+    /// The system format tool inside the given system directory (the value of
+    /// GetSystemDirectoryW). Takes the directory as input so no environment
+    /// variable can influence it; a relative directory is refused.
+    pub fn format_tool_path(system_directory: &std::path::Path) -> Option<std::path::PathBuf> {
+        system_directory
+            .is_absolute()
+            .then(|| system_directory.join("format").with_extension("com"))
+    }
+
     /// Bytes of one whole-sector read that covers `offset..offset + length`:
     /// the aligned start, the window length and the bytes to skip.
     pub fn covering_window(sector: u64, offset: u64, length: usize) -> Option<(u64, usize, usize)> {
@@ -190,11 +199,12 @@ pub mod windows_transport {
             SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
         },
         Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+            CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
             FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_ANONYMOUS,
             SECURITY_SQOS_PRESENT,
         },
         System::{
+            Com::CoTaskMemFree,
             Pipes::{
                 ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
                 GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
@@ -209,7 +219,8 @@ pub mod windows_transport {
         },
         UI::{
             Shell::{
-                SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+                FOLDERID_ProgramData, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+                SHGetKnownFolderPath, ShellExecuteExW,
             },
             WindowsAndMessaging::SW_HIDE,
         },
@@ -597,11 +608,70 @@ pub mod windows_transport {
         Ok(process)
     }
 
+    /// `%ProgramData%\\ais-host`, from the shell's known-folder API rather than
+    /// the user-controlled environment, created with a protected DACL that
+    /// admits only SYSTEM and Administrators. An existing directory is used
+    /// only if its owner and DACL are that protected.
+    fn private_directory() -> Result<PathBuf, ProtocolError> {
+        let mut folder: *mut u16 = ptr::null_mut();
+        // SAFETY: the output is a valid slot; the API allocates the string.
+        let status =
+            unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, ptr::null_mut(), &mut folder) };
+        if status != 0 || folder.is_null() {
+            return Err(ProtocolError::Transport);
+        }
+        let mut length = 0;
+        // SAFETY: the API returned a NUL-terminated string freed by CoTaskMemFree.
+        let base = unsafe {
+            while *folder.add(length) != 0 {
+                length += 1;
+            }
+            let base = String::from_utf16(std::slice::from_raw_parts(folder, length));
+            CoTaskMemFree(folder.cast());
+            base
+        }
+        .map_err(|_| ProtocolError::Transport)?;
+        let directory = PathBuf::from(base).join("ais-host");
+        if !directory.is_absolute() {
+            return Err(ProtocolError::Transport);
+        }
+        let sddl = wide("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)");
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: the SDDL is NUL-terminated; the descriptor is freed below.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(ProtocolError::Transport);
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let path = wide(&directory);
+        // SAFETY: the path is NUL-terminated and the attributes outlive the call.
+        let created = unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } != 0;
+        // SAFETY: the descriptor was allocated by the conversion call above.
+        unsafe { LocalFree(descriptor.cast()) };
+        // An existing directory could have been made by anyone: check its ACL.
+        if created || protected(&directory, WRITE_FILE) {
+            Ok(directory)
+        } else {
+            Err(ProtocolError::Transport)
+        }
+    }
+
     /// A private file nobody else can open: exclusive from creation and
     /// deleted when the last handle closes.
     fn private_file() -> Result<File, ProtocolError> {
         let name = random::<8>()?;
-        let path = std::env::temp_dir().join(format!("ais-host-source-{}.tmp", hex(&name)));
+        let path = private_directory()?.join(format!("ais-host-source-{}.tmp", hex(&name)));
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -1051,6 +1121,48 @@ mod tests {
             &[ace("S-1-1-0", 0x4_0000)],
             WRITE_ANCESTOR
         ));
+    }
+
+    #[test]
+    fn the_format_tool_comes_from_the_given_system_directory_only() {
+        use std::path::Path;
+        let system = Path::new(if cfg!(windows) {
+            r"C:\Windows\System32"
+        } else {
+            "/windows/system32"
+        });
+        let tool = format_tool_path(system).unwrap();
+        assert_eq!(tool.parent(), Some(system));
+        assert_eq!(tool.file_name().unwrap(), concat!("format", ".", "com"));
+        assert!(format_tool_path(Path::new("System32")).is_none());
+        assert!(format_tool_path(Path::new("")).is_none());
+    }
+
+    /// The elevated helper inherits the invoking user's environment, which that
+    /// user controls. Its Windows code must not read it, nor use the temp
+    /// directory or the current directory, nor search PATH with a bare name.
+    #[test]
+    fn the_elevated_windows_code_consults_no_user_controlled_location() {
+        let sources = [
+            ("protocol/windows.rs", include_str!("windows.rs")),
+            (
+                "platform/windows.rs",
+                include_str!("../platform/windows.rs"),
+            ),
+        ];
+        let forbidden = [
+            concat!("env", "::var"),
+            concat!("temp", "_dir"),
+            concat!("current", "_dir"),
+            concat!("env", "::vars"),
+        ];
+        for (name, text) in sources {
+            // Only the code before the test module is production code.
+            let production = text.split("#[cfg(test)]").next().unwrap();
+            for needle in forbidden {
+                assert!(!production.contains(needle), "{name} uses {needle}");
+            }
+        }
     }
 
     #[test]

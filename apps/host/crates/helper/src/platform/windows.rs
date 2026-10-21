@@ -1731,19 +1731,39 @@ mod native {
         }
     }
 
-    /// the system format tool on the volume GUID path: exFAT, quick, label AISX. The
-    /// tool path comes from the system directory; the environment is minimal.
+    /// A system directory from the OS itself, never from the environment: the
+    /// elevated helper inherits the user's variables, which the user can edit.
+    fn system_directory(
+        query: unsafe extern "system" fn(*mut u16, u32) -> u32,
+    ) -> Result<std::path::PathBuf, ObservationError> {
+        let mut buffer = vec![0_u16; 32768];
+        // SAFETY: the buffer length is passed and the call NUL-terminates on success.
+        let length = unsafe { query(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if length == 0 || length >= buffer.len() {
+            return Err(ObservationError::NativeUnavailable);
+        }
+        Ok(std::path::PathBuf::from(
+            String::from_utf16(&buffer[..length]).map_err(|_| ObservationError::InvalidInput)?,
+        ))
+    }
+
+    /// The system format tool on the volume GUID path: exFAT, quick, label
+    /// AISX. The tool is located through GetSystemDirectoryW and the child gets
+    /// a minimal environment with SystemRoot from GetSystemWindowsDirectoryW.
     pub(super) fn format_volume(volume: &str) -> Result<(), ObservationError> {
         use std::{
-            path::{Path, PathBuf},
+            path::Path,
             process::{Command, Stdio},
             time::{Duration, Instant},
         };
-        let system = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .filter(|root| root.is_absolute())
-            .ok_or(ObservationError::NativeUnavailable)?;
-        let tool = system.join("System32").join("format").with_extension("com");
+        use windows_sys::Win32::System::SystemInformation::{
+            GetSystemDirectoryW, GetSystemWindowsDirectoryW,
+        };
+        let tool = crate::protocol::windows_wire::format_tool_path(&system_directory(
+            GetSystemDirectoryW,
+        )?)
+        .ok_or(ObservationError::NativeUnavailable)?;
+        let system = system_directory(GetSystemWindowsDirectoryW)?;
         if !tool.is_file() {
             return Err(ObservationError::NativeUnavailable);
         }
