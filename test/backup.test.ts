@@ -781,7 +781,7 @@ describe("runBackup shallow push and vanished files", () => {
     expect(await git(fresh, ["rev-parse", `refs/heads/${await branchOf(repo)}`])).toBe(await git(repo, ["rev-parse", "HEAD"]));
   });
 
-  test("a 128 'unable to stat ... No such file' is retried and warned; other 128s are returned", async () => {
+  test("a 128 'unable to stat ... No such file' is retried with the path skipped; other 128s are returned", async () => {
     const vanished = { exitCode: 128, stdout: "", stderr: "fatal: unable to stat 'x/gone.txt': No such file or directory" };
     const errors: string[] = [];
     const orig = console.error;
@@ -798,13 +798,33 @@ describe("runBackup shallow push and vanished files", () => {
       expect(lock.exitCode).toBe(128);
       expect(calls).toBe(1);
 
+      // Continuous churn: a new file vanishes on every attempt; backup still completes.
+      calls = 0;
+      const churn = await addRetryingVanished("/r", async (skip) => {
+        calls++;
+        return calls <= 50
+          ? { exitCode: 128, stdout: "", stderr: `fatal: unable to stat 'f${calls}': No such file or directory` }
+          : { exitCode: 0, stdout: "", stderr: String(skip.length) };
+      });
+      expect(churn.exitCode).toBe(0);
+      expect(churn.stderr).toBe("50");
+
+      // Same path reported again despite being skipped: no progress, returned (terminates).
       calls = 0;
       const stuck = await addRetryingVanished("/r", async () => (calls++, vanished));
       expect(stuck.exitCode).toBe(128);
-      expect(calls).toBe(3);
+      expect(calls).toBe(2);
     } finally {
       console.error = orig;
     }
+  });
+
+  test(".claude/identities/*/sessions files are not committed", async () => {
+    const home = await makeHome();
+    await write(join(home, ".claude", "identities", "a", "settings.json"), "{}\n");
+    await write(join(home, ".claude", "identities", "a", "sessions", "123.abc.key"), "k\n");
+    const repo = await runBackup(["claude"], home);
+    expect(await gitLs(repo)).toEqual([".claude/identities/a/settings.json"]);
   });
 
   test(".caveman-sessions content is not committed", async () => {

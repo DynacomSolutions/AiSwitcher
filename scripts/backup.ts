@@ -39,6 +39,7 @@ type BackupGroup = keyof typeof BACKUP_GROUPS;
 // "*-shm" (SQLite's rebuildable shared-memory index, never data; -wal stays) and
 // ".claude.json.backup.*" (Claude's own rotating copies) appear and vanish faster
 // than git add's retries, failing the backup.
+// ".claude/identities/*/sessions/": per-pid <pid>.<hash>.key runtime files that churn constantly.
 const BACKUP_EXCLUDES = [
   ...REPRODUCIBLE_JUNK_DIR_NAMES,
   "*.lock",
@@ -48,6 +49,7 @@ const BACKUP_EXCLUDES = [
   ".caveman-sessions/",
   "*-shm",
   ".claude.json.backup.*",
+  ".claude/identities/*/sessions/",
 ];
 
 function timestamp(): string {
@@ -113,19 +115,24 @@ async function runGit(repoDir: string, home: string, args: string[], stdin?: str
   return { exitCode, stdout, stderr };
 }
 
-const VANISHED_RE = /unable to stat '[^']*': No such file or directory/;
+const VANISHED_RE = /unable to stat '([^']*)': No such file or directory/g;
 
-/** Runs a `git add` attempt, retrying (max 3 tries) when git exits 128 because a
- * file vanished between listing and staging; `--ignore-errors` does not cover that
- * lstat failure. Each retry re-lists, so the gone file is no longer seen. Any other
- * failure is returned unchanged for the caller to treat as fatal. */
-export async function addRetryingVanished(repoDir: string, attempt: () => Promise<GitResult>): Promise<GitResult> {
-  let result = await attempt();
-  for (let n = 1; n < 3 && result.exitCode === 128 && VANISHED_RE.test(result.stderr); n++) {
+/** Runs a `git add` attempt, retrying when git exits 128 because a file vanished
+ * between listing and staging; `--ignore-errors` does not cover that lstat failure.
+ * Every vanished path git names is handed to the next attempt in `skip` so it can be
+ * left out. Each retry must skip a path not seen before, so continuous churn cannot
+ * exhaust a retry cap yet the loop always terminates (finite paths). Any other
+ * failure, or a vanished path that was already skipped, is returned for the caller. */
+export async function addRetryingVanished(repoDir: string, attempt: (skip: string[]) => Promise<GitResult>): Promise<GitResult> {
+  const skip = new Set<string>();
+  for (;;) {
+    const result = await attempt([...skip]);
+    if (result.exitCode !== 128) return result;
+    const gone = [...result.stderr.matchAll(VANISHED_RE)].map((m) => m[1]!);
+    if (gone.length === 0 || gone.every((p) => skip.has(p))) return result;
     console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${result.stderr.trim()}`);
-    result = await attempt();
+    for (const p of gone) skip.add(p);
   }
-  return result;
 }
 
 async function ensureRepo(repoDir: string, home: string): Promise<string[]> {
@@ -213,12 +220,12 @@ async function renormalise(repoDir: string, home: string, polluted: readonly str
   for (const path of polluted) if (tracked.has(path) && (await pathExists(join(home, path)))) present.push(path);
   if (present.length > 0) {
     // Literal pathspecs: tracked names may contain glob characters.
-    const add = await addRetryingVanished(repoDir, () =>
+    const add = await addRetryingVanished(repoDir, (skip) =>
       runGit(
         repoDir,
         home,
         ["add", "--renormalize", "--ignore-errors", "--pathspec-from-file=-", "--pathspec-file-nul"],
-        present.join("\0") + "\0",
+        present.filter((p) => !skip.includes(p)).join("\0") + "\0",
         { GIT_LITERAL_PATHSPECS: "1" },
       ),
     );
@@ -372,7 +379,9 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
 
   // Exit 1 is --ignore-errors reporting files it skipped (permission-denied,
   // vanished mid-scan); anything else (e.g. 128, a stale index.lock) is fatal.
-  const add = await addRetryingVanished(repoDir, () => runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored]));
+  const add = await addRetryingVanished(repoDir, (skip) =>
+    runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored, ...skip.map((p) => `:(exclude,literal)${p}`)]),
+  );
   if (add.exitCode === 1) {
     console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${add.stderr.trim()}`);
   } else if (add.exitCode !== 0) {
