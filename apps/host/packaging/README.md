@@ -13,6 +13,12 @@ memory exception is granted. Signing starts with nested executables, signs
 the application last, notarises a temporary archive, staples the application,
 then creates the final archive. No application contents change afterwards.
 
+On macOS the helper runs as root only after the system administrator prompt
+(`osascript`, fixed argv). It accepts one peer: the invoking user's running
+`ais-host-app`, byte-identical to the one beside the helper, with both
+executables signed by the same Developer ID team. Unsigned or development
+builds list drives but refuse to write.
+
 Windows x86_64 uses a portable ZIP with adjacent executables and resource
 files. Windows signing is deferred. WebView2 must already be available.
 

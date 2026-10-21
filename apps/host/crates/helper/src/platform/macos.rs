@@ -1,11 +1,10 @@
-// shortcut: the native write path is unwired until this platform's helper authentication lands; drop the allow then.
-#![allow(dead_code)]
 //! macOS disk observation and retained raw-device handle.
 //!
-//! Mutation stays unavailable until the bundled, signed SMAppService helper,
-//! peer authentication and the immutable plan/ticket bridge are packaged and
-//! verified. This module deliberately has no legacy Authorization Services or
-//! shell-prompt path.
+//! The raw device is only opened by the root helper, after the authenticated
+//! channel has pinned the application and the helper has re-resolved the disk
+//! from its identity. Mount state is deliberately not part of the observed
+//! identity: macOS mounts every volume, and the helper unmounts the whole disk
+//! itself before it opens the device.
 
 #[cfg(target_os = "macos")]
 use ais_host_core::device::WriteTarget;
@@ -30,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) const REASON: &str = "macOS disk observation is available; signed SMAppService registration, authenticated plan tickets and packaged raw-write proof are pending.";
+pub(super) const REASON: &str = "macOS writes need the bundled helper next to the signed application and an administrator authorisation.";
 
 const MAX_PLIST_BYTES: usize = 1024 * 1024;
 const MAX_PARTITIONS: usize = 256;
@@ -82,6 +81,7 @@ pub enum ObservationError {
 
 /// Strict, synthetic snapshot parser used by CI. Values contain no live host
 /// identifiers. Unknown, duplicated, malformed and missing fields fail closed.
+#[cfg_attr(not(feature = "file-test"), allow(dead_code))] // exercised by fixtures
 pub fn parse_snapshot(input: &str) -> Result<MacDiskSnapshot, ObservationError> {
     if input.is_empty() || input.len() > MAX_PLIST_BYTES {
         return Err(ObservationError::InvalidInput);
@@ -282,13 +282,22 @@ pub fn recheck(
     Ok(observed)
 }
 
-/// Native enumeration uses diskutil's structured plist output. The privileged
-/// registration and the immutable ticket bridge remain mandatory before this
-/// target can be constructed in a distributed app.
+/// Native enumeration uses diskutil's structured plist output. The partition
+/// table is read through the raw device, which only the root helper can open.
 pub fn collect_snapshot(identifier: &str) -> Result<MacDiskSnapshot, ObservationError> {
+    collect_native(identifier, true)
+}
+
+/// The same snapshot without the raw-device table read, so an unprivileged
+/// process can list and re-observe disks. The table fingerprint is zero.
+pub fn collect_unprivileged(identifier: &str) -> Result<MacDiskSnapshot, ObservationError> {
+    collect_native(identifier, false)
+}
+
+fn collect_native(identifier: &str, with_table: bool) -> Result<MacDiskSnapshot, ObservationError> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = identifier;
+        let _ = (identifier, with_table);
         Err(ObservationError::NativeUnavailable)
     }
     #[cfg(target_os = "macos")]
@@ -395,23 +404,25 @@ pub fn collect_snapshot(identifier: &str) -> Result<MacDiskSnapshot, Observation
         }
         ancestry_material.push(u8::from(internal));
         ancestry_material.push(u8::from(removable));
+        // Partition identities only: volumes mount and unmount on their own,
+        // and that must not change what the user approved.
         let mut mount_material = Vec::new();
         for part in &partitions {
             mount_material.extend_from_slice(part.identifier.as_bytes());
-            mount_material.push(u8::from(part.mounted));
-            if let Some(path) = &part.mount_point {
-                mount_material.extend_from_slice(path.as_bytes());
-            }
             mount_material.push(0);
         }
-        const O_CLOEXEC: i32 = 0x0100_0000;
-        const O_NOFOLLOW: i32 = 0x0000_0100;
-        let disk = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_CLOEXEC | O_NOFOLLOW)
-            .open(format!("/dev/r{identifier}"))
-            .map_err(|_| ObservationError::NativeUnavailable)?;
-        let table_fingerprint = read_table_fingerprint(&disk, capacity_bytes)?;
+        let table_fingerprint = if with_table {
+            const O_CLOEXEC: i32 = 0x0100_0000;
+            const O_NOFOLLOW: i32 = 0x0000_0100;
+            let disk = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_CLOEXEC | O_NOFOLLOW)
+                .open(format!("/dev/r{identifier}"))
+                .map_err(|_| ObservationError::NativeUnavailable)?;
+            read_table_fingerprint(&disk, capacity_bytes)?
+        } else {
+            [0; 32]
+        };
         let snapshot = MacDiskSnapshot {
             identifier: identifier.to_owned(),
             device_node: node.to_owned(),
@@ -436,42 +447,38 @@ pub fn collect_snapshot(identifier: &str) -> Result<MacDiskSnapshot, Observation
     }
 }
 
-/// This entry point is intentionally disabled. No signed SMAppService
-/// bootstrap, peer-authentication implementation or immutable ticket bridge
-/// exists in this repository yet, so an authenticated channel alone is not
-/// sufficient authority to unmount or open a raw disk. The private native
-/// sequence is not reachable from production code.
+/// A retained raw-device handle. Construction needs the helper's
+/// non-constructible authenticated-channel proof.
 #[cfg(target_os = "macos")]
 pub struct MacBlockTarget {
     file: File,
     approved: DeviceObservation,
     identifier: String,
+    sender_pid: u32,
+    sender_executable: File,
     _claim: DiskClaim,
 }
 
 #[cfg(target_os = "macos")]
 impl MacBlockTarget {
     pub fn open_authenticated(
-        _channel: &crate::protocol::AuthenticatedChannel,
+        channel: &crate::protocol::AuthenticatedChannel,
         approved: &DeviceObservation,
     ) -> Result<Self, ObservationError> {
-        approved
-            .validate()
-            .map_err(|_| ObservationError::Ineligible)?;
-        let identifier = approved
-            .os_identity
-            .strip_prefix("macos:")
-            .ok_or(ObservationError::InvalidInput)?;
-        validate_identifier(identifier)?;
-        // The public authenticated route remains disabled until the signed
-        // service and peer policy are packaged. The private constructor below
-        // contains the native sequence for that future reviewed bridge.
-        let _ = identifier;
-        Err(ObservationError::NativeUnavailable)
+        channel
+            .revalidate_sender()
+            .map_err(|_| ObservationError::Changed)?;
+        let sender_executable = channel
+            .executable
+            .try_clone()
+            .map_err(|_| ObservationError::Changed)?;
+        Self::open_after_native_authorisation(approved, channel.peer_pid, sender_executable)
     }
 
     fn open_after_native_authorisation(
         approved: &DeviceObservation,
+        sender_pid: u32,
+        sender_executable: File,
     ) -> Result<Self, ObservationError> {
         approved
             .validate()
@@ -547,6 +554,8 @@ impl MacBlockTarget {
             file,
             approved: approved_after,
             identifier: identifier.to_owned(),
+            sender_pid,
+            sender_executable,
             _claim: claim,
         })
     }
@@ -561,6 +570,11 @@ impl io::Read for MacBlockTarget {
 #[cfg(target_os = "macos")]
 impl io::Write for MacBlockTarget {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        crate::protocol::macos_transport::verify_pid_executable(
+            self.sender_pid,
+            &self.sender_executable,
+        )
+        .map_err(|_| io::Error::other("authenticated sender changed"))?;
         self.file.write(buffer)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -598,20 +612,12 @@ impl WriteTarget for MacBlockTarget {
         Ok(current)
     }
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
-        let mut read = 0;
-        while read < buffer.len() {
-            let count = self
-                .file
-                .read_at(&mut buffer[read..], offset + read as u64)?;
-            if count == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "short raw-device read",
-                ));
-            }
-            read += count;
-        }
-        Ok(())
+        read_aligned(
+            &self.file,
+            u64::from(self.approved.sector_bytes),
+            offset,
+            buffer,
+        )
     }
     fn lock_exclusive(&mut self) -> io::Result<()> {
         const LOCK_EX: i32 = 2;
@@ -627,8 +633,243 @@ impl WriteTarget for MacBlockTarget {
         }
     }
     fn flush_durable(&mut self) -> io::Result<()> {
+        // F_FULLFSYNC asks the drive itself to flush; plain fsync need not.
+        // SAFETY: fcntl operates on this retained descriptor.
+        if unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+            return Ok(());
+        }
         self.file.sync_all()
     }
+}
+
+/// The whole-disk identifier named by a native identity. Never a path.
+pub fn disk_identifier(identity: &str) -> Result<&str, ObservationError> {
+    let identifier = identity
+        .strip_prefix("macos:")
+        .ok_or(ObservationError::Ineligible)?;
+    validate_identifier(identifier)?;
+    Ok(identifier)
+}
+
+/// The device node of the Nth slice of a whole disk.
+pub fn partition_node(disk: &str, number: u32) -> String {
+    format!("/dev/{disk}s{number}")
+}
+
+/// Discover one whole disk from its native identity, including the table
+/// fingerprint. The helper derives everything itself and accepts no client path.
+pub fn collect_by_identity(identity: &str) -> Result<MacDiskObservation, ObservationError> {
+    observe(&collect_snapshot(disk_identifier(identity)?)?)
+}
+
+/// Re-observe an approved disk without opening the device. The privileged
+/// table fingerprint cannot be re-read here, so it is carried over from the
+/// approval; the helper re-reads it and must match the plan digest.
+pub fn observe_unprivileged(
+    approved: &DeviceObservation,
+) -> Result<DeviceObservation, ObservationError> {
+    let mut snapshot = collect_unprivileged(disk_identifier(&approved.os_identity)?)?;
+    snapshot.table_fingerprint = approved.table_fingerprint;
+    observe(&snapshot).map(|entry| entry.observation)
+}
+
+/// Recheck the physical connection before mounting or ejecting our newly
+/// written partition. Mount state is not part of the identity.
+pub fn verify_connection(approved: &DeviceObservation) -> Result<(), ObservationError> {
+    let current = observe_unprivileged(approved)?;
+    if approved.same_physical_identity(&current) {
+        Ok(())
+    } else {
+        Err(ObservationError::Changed)
+    }
+}
+
+/// Whole-disk identifiers from `diskutil list -plist`, in natural order.
+fn whole_disk_ids(listing: &Value) -> Vec<String> {
+    let mut ids = listing
+        .get("WholeDisks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|id| validate_identifier(id).is_ok())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    ids.sort_by_key(|id| (id.len(), id.clone()));
+    ids.dedup();
+    ids
+}
+
+/// Unprivileged enumeration for the device selector. Only external USB whole
+/// disks that are writable, not internal and not backing system storage pass
+/// `observe`; anything that fails observation is omitted rather than guessed.
+pub fn list_eligible() -> Vec<MacDiskObservation> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(listing) = diskutil_plist(&["list", "-plist", "external", "physical"]) else {
+            return Vec::new();
+        };
+        whole_disk_ids(&listing)
+            .iter()
+            .filter_map(|id| observe(&collect_unprivileged(id).ok()?).ok())
+            .collect()
+    }
+}
+
+/// Bounded read-only GPT preview, pinned to the same whole-device observation.
+pub fn update_snapshot(
+    identity: &str,
+) -> Result<ais_host_core::update::DriveSnapshot, ObservationError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = identity;
+        Err(ObservationError::NativeUnavailable)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let observed = collect_by_identity(identity)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0100_0000 | 0x0000_0100 | 0x0000_0004) // CLOEXEC, NOFOLLOW, NONBLOCK.
+            .open(format!("/dev/r{}", observed.identifier))
+            .map_err(|_| ObservationError::InvalidInput)?;
+        if !file
+            .metadata()
+            .map_err(|_| ObservationError::InvalidInput)?
+            .file_type()
+            .is_char_device()
+        {
+            return Err(ObservationError::Changed);
+        }
+        let sector = u64::from(observed.observation.sector_bytes);
+        let snapshot = ais_host_core::update::DriveSnapshot::read(
+            observed.observation.clone(),
+            |offset, bytes| read_aligned(&file, sector, offset, bytes),
+        )
+        .map_err(|_| ObservationError::Changed)?;
+        if collect_by_identity(identity)?.observation != observed.observation {
+            return Err(ObservationError::Changed);
+        }
+        Ok(snapshot)
+    }
+}
+
+/// Raw macOS devices only accept whole-sector transfers, so read the covering
+/// sectors and copy out the requested bytes.
+#[cfg(unix)]
+fn read_aligned(
+    file: &std::fs::File,
+    sector: u64,
+    offset: u64,
+    buffer: &mut [u8],
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let end = offset
+        .checked_add(buffer.len() as u64)
+        .ok_or_else(|| std::io::Error::other("read range overflows"))?;
+    let start = offset - offset % sector;
+    let mut window = vec![0; (end.div_ceil(sector) * sector - start) as usize];
+    file.read_exact_at(&mut window, start)?;
+    let skip = (offset - start) as usize;
+    buffer.copy_from_slice(&window[skip..skip + buffer.len()]);
+    Ok(())
+}
+
+/// Mount the exchange slice (slice 4) and return its mount point. The slice
+/// must be the exFAT volume named AISX with exactly the planned size, and,
+/// where diskutil reports them, the planned partition GUID and offset.
+#[cfg(target_os = "macos")]
+pub fn mount_exchange(
+    disk: &str,
+    length: u64,
+    start: u64,
+    partition_guid: &str,
+) -> Result<(String, std::path::PathBuf), ObservationError> {
+    validate_identifier(disk)?;
+    let node = partition_node(disk, 4);
+    // The system probes a freshly written table asynchronously.
+    let mut info = None;
+    for _ in 0..75 {
+        if let Ok(value) = diskutil_plist(&["info", "-plist", &node]) {
+            info = Some(value);
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let slice = |info: &Value| -> Result<(), ObservationError> {
+        let info = info.as_object().ok_or(ObservationError::InvalidInput)?;
+        let size = u64_value(info, "TotalSize").or_else(|_| u64_value(info, "Size"))?;
+        let filesystem = string(info, "FilesystemType")
+            .or_else(|_| string(info, "FilesystemName"))?
+            .to_ascii_lowercase();
+        let uuid_matches = info
+            .get("DiskUUID")
+            .and_then(Value::as_str)
+            .is_none_or(|uuid| uuid.eq_ignore_ascii_case(partition_guid));
+        let offset_matches = info
+            .get("PartitionMapPartitionOffset")
+            .and_then(Value::as_u64)
+            .is_none_or(|offset| offset == start);
+        if size != length
+            || filesystem != "exfat"
+            || string(info, "VolumeName")? != "AISX"
+            || !uuid_matches
+            || !offset_matches
+        {
+            return Err(ObservationError::Changed);
+        }
+        Ok(())
+    };
+    slice(&info.ok_or(ObservationError::NativeUnavailable)?)?;
+    let (status, _) = run_bounded(
+        "/usr/sbin/diskutil",
+        &["mount", "-mountOptions", "nosuid,nodev", &node],
+        None,
+    )?;
+    if !status.success() {
+        return Err(ObservationError::NativeUnavailable);
+    }
+    // Derive the mount point from the system after mounting, not from output.
+    let info = diskutil_plist(&["info", "-plist", &node])?;
+    slice(&info)?;
+    let mount_point = string(
+        info.as_object().ok_or(ObservationError::InvalidInput)?,
+        "MountPoint",
+    )?;
+    let mount_point = std::path::PathBuf::from(mount_point);
+    if !mount_point.is_absolute() || mount_point.parent().is_none() {
+        return Err(ObservationError::InvalidInput);
+    }
+    Ok((node, mount_point))
+}
+
+/// Unmount one slice by its device node.
+#[cfg(target_os = "macos")]
+pub fn unmount_slice(node: &str) -> Result<(), ObservationError> {
+    let (status, _) = run_bounded("/usr/sbin/diskutil", &["unmount", node], None)?;
+    status
+        .success()
+        .then_some(())
+        .ok_or(ObservationError::NativeUnavailable)
+}
+
+/// Eject a whole disk after unmounting it.
+#[cfg(target_os = "macos")]
+pub fn eject_disk(disk: &str) -> Result<(), ObservationError> {
+    validate_identifier(disk)?;
+    let (status, _) = run_bounded(
+        "/usr/sbin/diskutil",
+        &["eject", &format!("/dev/{disk}")],
+        None,
+    )?;
+    status
+        .success()
+        .then_some(())
+        .ok_or(ObservationError::NativeUnavailable)
 }
 
 #[cfg(target_os = "macos")]
@@ -694,7 +935,7 @@ fn run_bounded(
         })
     });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if output_overflow.load(Ordering::Acquire) {
             let _ = child.kill();
@@ -1142,10 +1383,92 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod native_logic_tests {
     use super::{
-        MacDiskSnapshot, MacPartition, expected_unmount_transition, find_apfs_container,
-        physical_store_matches_candidate,
+        MacDiskSnapshot, MacPartition, ObservationError, disk_identifier,
+        expected_unmount_transition, find_apfs_container, observe, partition_node,
+        physical_store_matches_candidate, whole_disk_ids,
     };
     use serde_json::json;
+
+    #[test]
+    fn only_external_writable_usb_disks_outside_the_system_are_eligible() {
+        let eligible = observe(&snapshot(false)).unwrap();
+        assert_eq!(eligible.observation.os_identity, "macos:disk42");
+        assert!(eligible.observation.external_usb);
+        let refused = |change: fn(&mut MacDiskSnapshot)| {
+            let mut disk = snapshot(false);
+            change(&mut disk);
+            observe(&disk).unwrap_err()
+        };
+        assert_eq!(refused(|d| d.internal = true), ObservationError::Ineligible);
+        assert_eq!(
+            refused(|d| d.removable = false),
+            ObservationError::Ineligible
+        );
+        assert_eq!(
+            refused(|d| d.protocol = "Apple Fabric".into()),
+            ObservationError::Ineligible
+        );
+        assert_eq!(
+            refused(|d| d.writable = false),
+            ObservationError::Ineligible
+        );
+        assert_eq!(
+            refused(|d| d.system_backing = true),
+            ObservationError::Ineligible
+        );
+        assert_eq!(
+            refused(|d| d.ancestry_complete = false),
+            ObservationError::Ineligible
+        );
+        assert_eq!(
+            refused(|d| d.sector_bytes = 1024),
+            ObservationError::InvalidInput
+        );
+    }
+
+    #[test]
+    fn identities_are_whole_disk_names_never_paths() {
+        assert_eq!(disk_identifier("macos:disk7"), Ok("disk7"));
+        for bad in [
+            "disk7",
+            "macos:",
+            "macos:disk",
+            "macos:disk7s1",
+            "macos:/dev/disk7",
+            "macos:../disk7",
+            "macos:disk7 ",
+            "linux:8:16",
+        ] {
+            assert!(disk_identifier(bad).is_err(), "{bad}");
+        }
+        assert_eq!(partition_node("disk7", 4), "/dev/disk7s4");
+    }
+
+    #[test]
+    fn lists_only_well_formed_whole_disks_in_numeric_order() {
+        let listing = json!({
+            "WholeDisks": ["disk10", "disk2", "disk2", "../disk1", "disk3s1", 7, "disk"]
+        });
+        assert_eq!(whole_disk_ids(&listing), ["disk2", "disk10"]);
+        assert!(whole_disk_ids(&json!({})).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_reads_cover_whole_sectors_and_return_only_the_requested_bytes() {
+        let path = std::env::temp_dir().join(format!("ais-aligned-{}", std::process::id()));
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        for (offset, length) in [(0, 512), (3, 5), (510, 4), (1000, 1500), (4090, 6)] {
+            let mut buffer = vec![0; length];
+            super::read_aligned(&file, 512, offset as u64, &mut buffer).unwrap();
+            assert_eq!(buffer, bytes[offset..offset + length]);
+        }
+        let mut past = [0; 8];
+        assert!(super::read_aligned(&file, 512, 4092, &mut past).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn maps_apfs_partition_store_back_to_its_whole_disk() {
@@ -1212,5 +1535,77 @@ mod native_logic_tests {
             ancestry_fingerprint: [2; 32],
             mount_fingerprint: if mounted { [3; 32] } else { [4; 32] },
         }
+    }
+}
+
+/// Exercises the real diskutil and IOKit paths on an attached, unmounted disk
+/// image. An image is not USB hardware, so the point is that it is observed
+/// without privilege yet never listed or accepted as a write target.
+#[cfg(all(test, target_os = "macos"))]
+mod disk_image_tests {
+    use super::{ObservationError, collect_unprivileged, list_eligible, observe};
+    use std::{fs::File, process::Command};
+
+    struct Attached {
+        node: String,
+        image: std::path::PathBuf,
+    }
+
+    impl Attached {
+        fn new() -> Self {
+            let image = std::env::temp_dir().join(format!("ais-host-{}.img", std::process::id()));
+            File::create(&image)
+                .unwrap()
+                .set_len(16 * 1024 * 1024)
+                .unwrap();
+            let output = Command::new("/usr/bin/hdiutil")
+                .args([
+                    "attach",
+                    "-nomount",
+                    "-imagekey",
+                    "diskimage-class=CRawDiskImage",
+                ])
+                .arg(&image)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "hdiutil attach failed");
+            let text = String::from_utf8(output.stdout).unwrap();
+            let node = text.split_whitespace().next().unwrap().to_owned();
+            assert!(node.starts_with("/dev/disk"), "{text}");
+            Self { node, image }
+        }
+    }
+
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            let _ = Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force", &self.node])
+                .status();
+            let _ = std::fs::remove_file(&self.image);
+        }
+    }
+
+    #[test]
+    fn an_attached_disk_image_is_observed_but_never_eligible() {
+        let attached = Attached::new();
+        let identifier = attached.node.trim_start_matches("/dev/").to_owned();
+        match collect_unprivileged(&identifier) {
+            Ok(snapshot) => {
+                assert_eq!(snapshot.identifier, identifier);
+                assert_eq!(snapshot.capacity_bytes, 16 * 1024 * 1024);
+                assert!(!snapshot.system_backing);
+                assert_eq!(
+                    observe(&snapshot).unwrap_err(),
+                    ObservationError::Ineligible
+                );
+            }
+            // diskutil gives images no device tree path; refusing is also correct.
+            Err(error) => assert_eq!(error, ObservationError::InvalidInput),
+        }
+        assert!(
+            list_eligible()
+                .iter()
+                .all(|disk| disk.identifier != identifier)
+        );
     }
 }
