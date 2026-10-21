@@ -2,7 +2,8 @@
 mod linux;
 #[cfg(any(target_os = "macos", feature = "file-test"))]
 mod macos;
-#[cfg(any(target_os = "windows", feature = "file-test"))]
+// Compiled everywhere: the snapshot parsing and eligibility rules are portable
+// and tested on every platform; only Windows reaches the native collectors.
 mod windows;
 
 #[cfg(target_os = "linux")]
@@ -36,13 +37,17 @@ pub use macos::{
     recheck as recheck_macos_snapshot,
 };
 
-#[cfg(target_os = "windows")]
-pub use windows::WindowsBlockTarget;
 #[cfg(feature = "file-test")]
 pub use windows::{
     ObservationError as WindowsObservationError, WindowsDiskObservation, WindowsDiskSnapshot,
     collect_windows_snapshot, observe_windows_snapshot, parse_windows_snapshot,
     recheck_windows_snapshot,
+};
+#[cfg(target_os = "windows")]
+pub use windows::{
+    WindowsBlockTarget, collect_by_identity as collect_windows_by_identity,
+    list_eligible as list_windows_eligible, observe_unprivileged as observe_windows_unprivileged,
+    update_snapshot as windows_update_snapshot,
 };
 
 pub fn unavailable_reason() -> &'static str {

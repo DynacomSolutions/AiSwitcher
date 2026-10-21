@@ -23,6 +23,14 @@ refuse to write.
 
 Windows x86_64 uses a portable ZIP with adjacent executables and resource
 files. Windows signing is deferred. WebView2 must already be available.
+Listing USB drives needs no elevation. The helper starts elevated through UAC
+(`runas`) only when a preview or write begins, and only from the executable
+next to the application. It creates a named pipe whose DACL admits the
+launching user's SID alone (first instance, no remote clients) and accepts one
+client: the process whose image is the application beside it, rechecked before
+each volume is locked. It takes a disk number, never a path, and re-validates
+the disk itself. Creating and updating drives stay unavailable on Windows
+because the exFAT exchange partition cannot yet be opened there.
 
 Linux x86_64 uses AppImage. Extracting with `--appimage-extract` supports
 computers without FUSE. The app directory may be read-only; ais state remains

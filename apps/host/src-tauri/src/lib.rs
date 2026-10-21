@@ -155,7 +155,15 @@ fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
+    ais_host_helper::platform::list_windows_eligible()
+        .into_iter()
+        .map(|disk| disk.observation)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
     Vec::new()
 }
@@ -175,6 +183,12 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
     let mut preparation = state.begin_preview(device_id)?;
     if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
         return Err("The selected device is unavailable.".to_string());
+    }
+    // Creating a drive ends by opening its exFAT exchange partition, which
+    // Windows cannot do yet. Refuse before any prompt or download, so no drive
+    // is ever written and then left unfinished.
+    if cfg!(windows) {
+        return Err("Creating a drive is not supported on Windows yet.".to_string());
     }
     // Fail closed before any prompt or download when no trusted key is bundled.
     let verifier =
@@ -233,6 +247,11 @@ fn preview_blocking(device_id: &str, app: &tauri::AppHandle) -> Result<WritePrev
 #[tauri::command]
 async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<WritePreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // An update journals on the exchange partition, which Windows cannot
+        // open yet, so it is refused before any elevation prompt.
+        if cfg!(windows) {
+            return Err("Updating a drive is not supported on Windows yet.".to_string());
+        }
         let state = app.state::<ConfirmationSession>();
         let _media = state.lock_media()?;
         let preparation = state.begin_preview(&device_id)?;
@@ -468,7 +487,12 @@ fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapsho
     ais_host_helper::protocol::macos_transport::preview_update(id)
         .map_err(|error| error.to_string())
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
+    ais_host_helper::protocol::windows_transport::preview_update(id)
+        .map_err(|error| error.to_string())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn preview_update_native(_: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
     Err("Image updates are unavailable on this platform.".into())
 }
@@ -1190,7 +1214,15 @@ fn deadline_boot_ns(remaining: std::time::Duration) -> Result<u64, String> {
     Ok(now + remaining)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn deadline_boot_ns(remaining: std::time::Duration) -> Result<u64, String> {
+    let now = ais_host_helper::protocol::windows_transport::boottime_ns()
+        .map_err(|_| "The boot clock is unavailable.")?;
+    let remaining = u64::try_from(remaining.as_nanos()).map_err(|_| "Invalid expiry.")?;
+    Ok(now + remaining)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn deadline_boot_ns(_remaining: std::time::Duration) -> Result<u64, String> {
     Err("This operating system has no enabled authenticated helper.".to_string())
 }
@@ -1204,7 +1236,7 @@ trait HelperLauncher {
     ) -> Result<(), String>;
 }
 
-/// The installed per-OS helper. Linux and macOS have authenticated transports.
+/// The installed per-OS helper. Every supported OS has an authenticated transport.
 struct NativeHelper;
 
 impl HelperLauncher for NativeHelper {
@@ -1238,7 +1270,20 @@ impl HelperLauncher for NativeHelper {
         .map_err(|error| error.to_string())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    fn launch(
+        &self,
+        request: ais_host_helper::protocol::Request,
+        sources: &[std::fs::File; 3],
+    ) -> Result<(), String> {
+        ais_host_helper::protocol::windows_transport::run_session(
+            [&sources[0], &sources[1], &sources[2]],
+            request,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn launch(
         &self,
         _request: ais_host_helper::protocol::Request,
@@ -1256,10 +1301,14 @@ fn native_write_support() -> ais_host_core::device::WriteSupport {
     let helper = ais_host_helper::protocol::linux_transport::helper_installed();
     #[cfg(target_os = "macos")]
     let helper = ais_host_helper::protocol::macos_transport::helper_installed();
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    let helper = ais_host_helper::protocol::windows_transport::helper_installed();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let helper = false;
     let missing_helper = if cfg!(target_os = "macos") {
         "Writing needs the signed, notarised application with its bundled helper; this build is unsigned or a development build."
+    } else if cfg!(windows) {
+        "Writing needs ais-host-helper.exe next to the application; this copy is incomplete."
     } else {
         "The ais host helper package is not installed or does not verify."
     };
@@ -1290,7 +1339,15 @@ fn observe_native(
         .map_err(|_| "The selected device is unavailable.".to_string())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn observe_native(
+    approved: &ais_host_core::device::DeviceObservation,
+) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::platform::observe_windows_unprivileged(approved)
+        .map_err(|_| "The selected device is unavailable.".to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn observe_native(
     _approved: &ais_host_core::device::DeviceObservation,
 ) -> Result<ais_host_core::device::DeviceObservation, String> {
@@ -1309,7 +1366,13 @@ fn preview_native(identity: &str) -> Result<ais_host_core::device::DeviceObserva
         .map_err(|error| error.to_string())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn preview_native(identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::protocol::windows_transport::preview_observation(identity)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn preview_native(_identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
     Err(ais_host_helper::platform::unavailable_reason().to_string())
 }

@@ -5,6 +5,8 @@
 type NativeTarget = crate::platform::LinuxBlockTarget;
 #[cfg(target_os = "macos")]
 type NativeTarget = crate::platform::MacBlockTarget;
+#[cfg(windows)]
+type NativeTarget = crate::platform::WindowsBlockTarget;
 
 /// The clock that bounds the original confirmation, including time asleep.
 #[cfg(target_os = "linux")]
@@ -15,6 +17,11 @@ fn boottime_ns() -> Result<u64, crate::protocol::ProtocolError> {
 #[cfg(target_os = "macos")]
 fn boottime_ns() -> Result<u64, crate::protocol::ProtocolError> {
     crate::protocol::macos_transport::boottime_ns()
+}
+
+#[cfg(windows)]
+fn boottime_ns() -> Result<u64, crate::protocol::ProtocolError> {
+    crate::protocol::windows_transport::boottime_ns()
 }
 
 /// Re-resolve the device from its identity alone; no client path is involved.
@@ -32,7 +39,14 @@ fn rediscover(identity: &str) -> Result<ais_host_core::device::DeviceObservation
         .map_err(|_| "The native target could not be re-observed.")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(windows)]
+fn rediscover(identity: &str) -> Result<ais_host_core::device::DeviceObservation, &'static str> {
+    crate::platform::collect_windows_by_identity(identity)
+        .map(|discovered| discovered.observation)
+        .map_err(|_| "The native target could not be re-observed.")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn open_target(
     channel: &crate::protocol::AuthenticatedChannel,
     observation: &ais_host_core::device::DeviceObservation,
@@ -110,7 +124,7 @@ pub fn preview_linux(identity: &str) -> Result<(), &'static str> {
         .map_err(|_| "The observation could not be reported.")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn execute(
     channel: crate::protocol::AuthenticatedChannel,
     request: crate::protocol::Request,
@@ -166,6 +180,12 @@ fn execute(
             > 4096
     {
         return Err("An image source exceeds its permitted size.");
+    }
+    // The exFAT exchange partition cannot be prepared or reopened on Windows
+    // yet, so a create is refused before anything is read or written.
+    #[cfg(windows)]
+    if request.operation == crate::protocol::Operation::CreateLayout {
+        return Err("Creating a drive is not supported on Windows yet.");
     }
     let mut sources = seal_source_files(sources, selected_assets.map(|asset| asset.size))?;
     let sums_size =
@@ -236,25 +256,35 @@ fn execute(
         .map_err(|_| "The native target changed during plan verification.")?;
 
     if request.operation != crate::protocol::Operation::CreateLayout {
-        return write_confirmed(
+        write_confirmed(
             &mut target,
             request.confirmation_deadline_boot_ns,
             &mut image,
             &plan,
             &request.typed_confirmation,
-        )
-        .map(|_| ());
+        )?;
+        // Windows keeps the partitions of a written disk cached until asked.
+        #[cfg(windows)]
+        target
+            .reread_partitions()
+            .map_err(|_| "The partition table could not be re-read.")?;
+        return Ok(());
     }
-    let mut exchange = crate::exchange::PreparedExchange::native(&plan)?;
-    create_confirmed(
-        &mut target,
-        request.confirmation_deadline_boot_ns,
-        &mut image,
-        &plan,
-        &request.typed_confirmation,
-        &mut exchange,
-    )?;
-    finish_create(target)
+    #[cfg(not(windows))]
+    {
+        let mut exchange = crate::exchange::PreparedExchange::native(&plan)?;
+        create_confirmed(
+            &mut target,
+            request.confirmation_deadline_boot_ns,
+            &mut image,
+            &plan,
+            &request.typed_confirmation,
+            &mut exchange,
+        )?;
+        finish_create(target)
+    }
+    #[cfg(windows)]
+    Err("Creating a drive is not supported on Windows yet.")
 }
 
 /// One confirmed create transaction on a retained target. Preparing exFAT must
@@ -276,7 +306,7 @@ pub fn create_confirmed<T: ais_host_core::device::WriteTarget>(
 /// Final stage shared by the production block device and loop-file tests. The
 /// helper issues its own ticket, capped by the app's original CLOCK_BOOTTIME
 /// deadline, and then hands the already-open target to the shared writer.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn write_confirmed<T: ais_host_core::device::WriteTarget>(
     target: T,
     deadline: u64,
@@ -311,6 +341,25 @@ pub fn write_confirmed<T: ais_host_core::device::WriteTarget>(
         .map_err(|_| "The exact typed confirmation did not match the native plan.")?;
     write_image(&mut target, image, plan, &mut approvals, &ticket, || false)
         .map_err(|_| "The shared writer refused the native operation.")
+}
+
+/// The Windows transport receives every source into a private file that only
+/// this process holds open, so no further copy is needed; only the sizes are
+/// checked again.
+#[cfg(windows)]
+fn seal_source_files(
+    sources: [std::fs::File; 3],
+    sizes: [u64; 3],
+) -> Result<[std::fs::File; 3], &'static str> {
+    for (source, size) in sources.iter().zip(sizes) {
+        let metadata = source
+            .metadata()
+            .map_err(|_| "A retained image source is invalid.")?;
+        if !metadata.is_file() || metadata.len() != size || size == 0 {
+            return Err("A retained source does not match the published asset size.");
+        }
+    }
+    Ok(sources)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -415,21 +464,21 @@ fn seal_file(_: &std::fs::File) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 struct BootDeadlineTarget<T> {
     target: T,
     deadline: u64,
     first_write_pending: bool,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl<T: std::io::Read> std::io::Read for BootDeadlineTarget<T> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.target.read(buffer)
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl<T: std::io::Write> std::io::Write for BootDeadlineTarget<T> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if self.first_write_pending {
@@ -454,14 +503,14 @@ impl<T: std::io::Write> std::io::Write for BootDeadlineTarget<T> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl<T: std::io::Seek> std::io::Seek for BootDeadlineTarget<T> {
     fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
         self.target.seek(position)
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl<T: ais_host_core::device::WriteTarget> ais_host_core::device::WriteTarget
     for BootDeadlineTarget<T>
 {
@@ -541,6 +590,46 @@ pub fn preview_update_macos(identity: &str) -> Result<(), &'static str> {
     std::io::stdout()
         .write_all(&line)
         .map_err(|_| "The preview could not be reported.")
+}
+
+/// The Windows helper, started elevated by the application through UAC. It
+/// creates a pipe only the launching user can open, serves the one
+/// application executable beside it, and runs exactly one request.
+#[cfg(windows)]
+pub fn run_windows(pipe: &str, sid: &str) -> Result<(), &'static str> {
+    use crate::protocol::windows_transport as transport;
+    let (stream, pid) = transport::listen(pipe, sid)
+        .and_then(transport::Listening::accept)
+        .map_err(|_| "The private helper channel is unavailable.")?;
+    let (channel, request, sources) = transport::authenticate_one(stream, pid, sid).map_err(
+        |_| "The installed application or one-operation request could not be authenticated.",
+    )?;
+    execute(channel, request, sources)
+}
+
+/// Read-only elevated preview of the disk, as one JSON line, over the pipe.
+#[cfg(windows)]
+pub fn preview_windows(pipe: &str, sid: &str, identity: &str) -> Result<(), &'static str> {
+    crate::protocol::windows_transport::serve_preview(pipe, sid, || {
+        let observed = crate::platform::collect_windows_by_identity(identity)
+            .map_err(|_| "The native target could not be observed.")?;
+        let mut line = serde_json::to_vec(&observed.observation)
+            .map_err(|_| "The observation could not be encoded.")?;
+        line.push(b'\n');
+        Ok(line)
+    })
+}
+
+#[cfg(windows)]
+pub fn preview_update_windows(pipe: &str, sid: &str, identity: &str) -> Result<(), &'static str> {
+    crate::protocol::windows_transport::serve_preview(pipe, sid, || {
+        let snapshot = crate::platform::windows_update_snapshot(identity)
+            .map_err(|_| "The drive could not be observed.")?;
+        let mut line =
+            serde_json::to_vec(&snapshot).map_err(|_| "The preview could not be encoded.")?;
+        line.push(b'\n');
+        Ok(line)
+    })
 }
 
 #[cfg(all(test, target_os = "linux"))]
