@@ -162,6 +162,12 @@ pub trait PassphraseSink {
         Err("An update sequence registry is required.".into())
     }
 
+    /// Called only after the helper has confirmed the persist header area is
+    /// zeroed: drop the retained passphrase and start a new key generation.
+    fn reset_drive(&self, _drive_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Called once, after the drive is written and verified. `drive_id` is the
     /// physical identity used for the local drive record.
     fn hand_over(&self, passphrase: &Passphrase, drive_id: &str) -> Result<(), String>;

@@ -134,6 +134,16 @@ impl PassphraseSink for EscrowSink {
         Ok(seq)
     }
 
+    fn reset_drive(&self, drive_id: &str) -> Result<(), String> {
+        let mut registry =
+            FileRegistry::open(&self.state.directory).map_err(|error| error.to_string())?;
+        // The new passphrase is chosen at the next boot and is never seen here.
+        EscrowService::new(&mut NativeStore, &mut registry, &self.state.clock)
+            .reset_drive(drive_id, EscrowPolicy::Disabled, None)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     fn hand_over(&self, passphrase: &Passphrase, drive_id: &str) -> Result<(), String> {
         let mut registry =
             FileRegistry::open(&self.state.directory).map_err(|error| error.to_string())?;
@@ -264,6 +274,44 @@ mod tests {
             state.with_native_escrow().native_escrow,
             cfg!(any(target_os = "linux", target_os = "macos"))
         );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn reset_starts_a_new_generation_and_keeps_the_installed_release() {
+        let directory =
+            std::env::temp_dir().join(format!("ais-escrow-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let state = EscrowCommandState::new(directory.clone()).unwrap();
+        let passphrase =
+            Passphrase::new("SYNTHETIC_FIXTURE_12".into(), "SYNTHETIC_FIXTURE_12").unwrap();
+        let sink = state.sink();
+        sink.hand_over(&passphrase, "synthetic-drive-1").unwrap();
+        let installed = ais_host_core::update::InstalledImage {
+            identity: ais_host_core::drive_identity::DriveIdentity::fresh().unwrap(),
+            release_order: (1, 1),
+            tag: "live-v1".into(),
+            image_digest: [7; 32],
+            hardware_hint: "a".repeat(64),
+        };
+        sink.remember_image("synthetic-drive-1", &installed, "created")
+            .unwrap();
+        assert!(sink.reset_drive("synthetic-drive-2").is_err());
+        sink.reset_drive("synthetic-drive-1").unwrap();
+        let mut registry = FileRegistry::open(&directory).unwrap();
+        let data = registry.load().unwrap();
+        let record = data.record("synthetic-drive-1").unwrap();
+        assert_eq!(record.generation(), 2);
+        assert!(record.item().is_none() && record.created_here());
+        assert_eq!(record.installed_image(), Some(&installed));
+        assert_eq!(record.image_update_status(), Some("created"));
+        assert_eq!(record.source_references(), ["local"]);
+        drop(registry);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

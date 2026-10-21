@@ -149,9 +149,11 @@ _persist_format() (
     cryptsetup isLuks /proc/self/fd/8 || rc=$?
     [ "$rc" -eq 1 ] || exit 1
     cmp -n 16777216 /dev/zero /proc/self/fd/8 >/dev/null 2>&1 || exit 1
+    # The geometry is pinned: both LUKS2 headers and every keyslot sit inside the
+    # first 16 MiB, which the host app zeroes to reset persist (LUKS_HEADER_BYTES).
     # shortcut: a device hot-plugged with the same random 128-bit PARTUUID
     # between open and format requires a deliberately cloned identity.
-    keyctl pipe "$1" | cryptsetup luksFormat --batch-mode --type luks2 --pbkdf argon2id --key-file=- /proc/self/fd/8 || exit 1
+    keyctl pipe "$1" | cryptsetup luksFormat --batch-mode --type luks2 --pbkdf argon2id --offset 32768 --luks2-metadata-size 16k --luks2-keyslots-size 16744448 --key-file=- /proc/self/fd/8 || exit 1
     _persist_resolve /proc/self/fd/8 && cryptsetup isLuks /proc/self/fd/8
 )
 

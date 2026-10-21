@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import type { DriveRecordView, FlowTarget, HostBridge, PullLogsResult, RefreshCommandPreview, RefreshResult, RemovalCommandPreview, RemoveOptions, RemoveResult, ResetSupport, StepResult } from "./contract";
 
 const NO_STEPS: RemoveOptions = { pullLogs: false, eraseStorage: false, revokeCredentials: false, forgetDrive: false };
@@ -27,8 +28,6 @@ export function ManageDrives({ bridge }: { bridge: HostBridge }) {
   const [removal, setRemoval] = useState<RemovalCommandPreview | null>(null);
   const [consent, setConsent] = useState(false);
   const [removed, setRemoved] = useState<RemoveResult | null>(null);
-  const [resetConfirmed, setResetConfirmed] = useState(false);
-  const [resetDone, setResetDone] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -103,11 +102,9 @@ export function ManageDrives({ bridge }: { bridge: HostBridge }) {
 
       <section aria-labelledby="reset-heading">
         <h2 id="reset-heading">Reset storage</h2>
-        <p>Erase the drive's persistent storage so it can be set up again with a new passphrase.</p>
+        <p>Erase the drive's encrypted storage and its keys so it can be set up again with a new passphrase. The drive must be connected, and the reset has its own confirmation.</p>
         {reset && !reset.supported && <p role="alert">{reset.reason}</p>}
-        <input id="reset-confirm" type="checkbox" checked={resetConfirmed} disabled={busy || !reset?.supported} onChange={(event) => setResetConfirmed(event.target.checked)} /><label htmlFor="reset-confirm">I understand this permanently erases the drive's persistent data</label>
-        <button type="button" disabled={busy || !reset?.supported || !resetConfirmed} onClick={() => run(async () => { await bridge.resetStorage(); setResetConfirmed(false); setResetDone(true); })}>Reset storage</button>
-        {resetDone && <p role="status">Storage was reset.</p>}
+        {reset?.supported && <Link className="primary-button" to="/drives">Choose the connected drive</Link>}
       </section>
     </>}
   </article>;

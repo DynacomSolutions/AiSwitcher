@@ -471,7 +471,17 @@ impl<'a, B: EscrowStore, R: RegistryStorage, C: Clock> EscrowService<'a, B, R, C
             policy,
             previous.source_references,
             secret,
-        )
+        )?;
+        // The physical drive and its installed release are unchanged by a reset.
+        let record = data
+            .drives
+            .get_mut(id)
+            .ok_or(EscrowError::InvalidRegistry)?;
+        record.installed_image = previous.installed_image;
+        record.image_update_status = previous.image_update_status;
+        let record = record.clone();
+        self.repository.save(&data)?;
+        Ok(record)
     }
 
     /// Metadata for successful publication; acknowledgement must come from an

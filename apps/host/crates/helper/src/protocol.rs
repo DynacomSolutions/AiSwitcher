@@ -75,7 +75,7 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, ProtocolError> {
     };
     if request.version != 1
         || request.drive_identity.validate().is_err()
-        || (request.operation == Operation::ReplaceBase) != request.installed_image.is_some()
+        || (request.operation != Operation::CreateLayout) != request.installed_image.is_some()
         || request.installed_image.as_ref().is_some_and(|installed| {
             installed.validate().is_err() || installed.identity != request.drive_identity
         })

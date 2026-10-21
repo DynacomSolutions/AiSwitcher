@@ -393,11 +393,6 @@ pub fn flow_reset_support() -> reset::ResetSupport {
     reset::support()
 }
 
-#[tauri::command]
-pub fn flow_reset() -> Result<(), String> {
-    reset::require_supported_reset()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,8 +600,8 @@ mod tests {
     }
 
     #[test]
-    fn reset_is_visible_as_unsupported_without_a_runtime_or_key() {
-        assert!(!flow_reset_support().supported);
-        assert!(flow_reset().unwrap_err().contains("not yet supported"));
+    fn reset_support_follows_the_platform_and_removal_defers_to_it() {
+        assert_eq!(flow_reset_support().supported, cfg!(target_os = "linux"));
+        assert!(!reset::removal_support().supported);
     }
 }

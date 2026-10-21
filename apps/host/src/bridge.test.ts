@@ -52,6 +52,13 @@ export const testBridge: HostBridge = {
       ],
     };
   },
+  async previewReset(deviceId: string): Promise<WritePreview> {
+    return {
+      ...await this.previewWrite(deviceId), operation: "resetPersist",
+      ranges: [{ start: 2_000_000_000, length: 16_777_216 }],
+      partitions: [{ name: "AISX", sizeBytes: 600_000_000, kind: "preserve" }, { name: "AISPERSIST", sizeBytes: 2_147_483_648, kind: "erase" }],
+    };
+  },
   async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
     if (previewId !== current || typedIdentifier !== "Synthetic USB Drive") throw new Error("Type the exact displayed device identifier.");
     return { expiresInSeconds: 90 };
@@ -80,6 +87,5 @@ export const testBridge: HostBridge = {
     return { pullLogs: skipped, eraseStorage: skipped, revokeCredentials: skipped, forgetDrive: { status: "completed" }, providers: [], pausedForLogs: false };
   },
   async invalidateFlowPreview() {},
-  async resetSupport() { return { supported: false, reason: "Persist erasure and lost-key reset are not yet supported." }; },
-  async resetStorage() { throw new Error("Persist erasure and lost-key reset are not yet supported."); },
+  async resetSupport() { return { supported: true, reason: "Erases the encrypted storage and its keys." }; },
 };

@@ -73,9 +73,6 @@ fn execute_linux(
     if channel.peer_uid == 0 || channel.peer_pid == 0 || channel.request_binding == [0; 32] {
         return Err("The authenticated application channel is invalid.");
     }
-    if request.operation == crate::protocol::Operation::ResetPersist {
-        return Err("This helper operation is not enabled.");
-    }
     if request.confirmation_deadline_boot_ns
         <= crate::protocol::linux_transport::boottime_ns()
             .map_err(|_| "The original confirmation has expired.")?
@@ -161,23 +158,23 @@ fn execute_linux(
             discovered.observation.clone(),
             request.drive_identity.clone(),
         ),
-        crate::protocol::Operation::ReplaceBase => {
+        crate::protocol::Operation::ReplaceBase | crate::protocol::Operation::ResetPersist => {
             use ais_host_core::device::WriteTarget;
             let snapshot = ais_host_core::update::DriveSnapshot::read(
                 discovered.observation.clone(),
                 |offset, bytes| target.read_at(offset, bytes),
             )
             .map_err(|_| "The installed GPT could not be re-observed.")?;
-            WritePlan::update_drive(
-                &image,
-                &snapshot,
-                request
-                    .installed_image
-                    .as_ref()
-                    .ok_or("The installed release is unknown.")?,
-            )
+            let installed = request
+                .installed_image
+                .as_ref()
+                .ok_or("The installed release is unknown.")?;
+            if request.operation == crate::protocol::Operation::ResetPersist {
+                WritePlan::reset_persist(&image, &snapshot, installed)
+            } else {
+                WritePlan::update_drive(&image, &snapshot, installed)
+            }
         }
-        _ => return Err("This helper operation is not enabled."),
     }
     .map_err(|_| "A compatible native write plan could not be reconstructed.")?;
     if hex(&plan.digest()) != request.plan_digest {
@@ -186,7 +183,7 @@ fn execute_linux(
     plan.revalidate(&discovered.observation, &image)
         .map_err(|_| "The native target changed during plan verification.")?;
 
-    if request.operation == crate::protocol::Operation::ReplaceBase {
+    if request.operation != crate::protocol::Operation::CreateLayout {
         return write_confirmed(
             &mut target,
             request.confirmation_deadline_boot_ns,

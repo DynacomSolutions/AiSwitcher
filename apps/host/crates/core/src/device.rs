@@ -122,6 +122,11 @@ impl DeviceObservation {
     }
 }
 
+/// Both LUKS2 headers and every keyslot of partition 5 lie in its first 16 MiB.
+/// The image pins this geometry in ais_persist (see image/docs/drive-identity.md),
+/// and the first boot formats only a partition whose first 16 MiB are zero.
+pub const LUKS_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WriteOperation {
@@ -505,6 +510,43 @@ impl WritePlan {
             ranges: merge_ranges(writes.iter().map(|write| write.range).collect()),
             writes,
             remaining_bytes: crate::update::partition_range(&parts[4]).length,
+            phase_aware: true,
+            exchange: Some(crate::update::partition_range(&parts[3])),
+            identity: Some(installed.identity.clone()),
+        })
+    }
+
+    /// Zero the LUKS2 header area of partition 5 and nothing else. The GPT and
+    /// partitions 1 to 4 are outside every write range, and the range is
+    /// strictly inside partition 5, so no data of another partition is touched.
+    /// The image only carries the release trust the helper re-verifies.
+    pub fn reset_persist(
+        image: &VerifiedImage,
+        snapshot: &crate::update::DriveSnapshot,
+        installed: &crate::update::InstalledImage,
+    ) -> Result<Self, DeviceError> {
+        let parts = snapshot.partitions(&installed.identity)?;
+        let persist = crate::update::partition_range(&parts[4]);
+        let zeroed = ByteRange {
+            start: persist.start,
+            length: LUKS_HEADER_BYTES,
+        };
+        if persist.length < LUKS_HEADER_BYTES {
+            return Err(DeviceError::Bounds);
+        }
+        zeroed.validate(&snapshot.observation)?;
+        Ok(Self {
+            operation: WriteOperation::ResetPersist,
+            device: snapshot.observation.clone(),
+            source_digest: image.digest(),
+            compressed_digest: image.compressed_digest(),
+            release: image.selection().clone(),
+            ranges: vec![zeroed],
+            writes: vec![PlannedWrite {
+                range: zeroed,
+                source: WriteSource::Zeroes,
+            }],
+            remaining_bytes: persist.length,
             phase_aware: true,
             exchange: Some(crate::update::partition_range(&parts[3])),
             identity: Some(installed.identity.clone()),

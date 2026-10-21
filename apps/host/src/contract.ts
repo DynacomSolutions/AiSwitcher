@@ -109,6 +109,8 @@ export interface HostBridge {
   setCreateOptions(modelId: string | null, licenceAccepted: boolean, passphrase: string, confirmation: string): Promise<void>;
   previewWrite(deviceId: string): Promise<WritePreview>;
   previewUpdate(deviceId: string): Promise<WritePreview>;
+  /** Lost-key reset of a drive created here; needs no passphrase. */
+  previewReset(deviceId: string): Promise<WritePreview>;
   confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt>;
   /** Hands the confirmed native preview to the privileged helper; native code checks every precondition. */
   startWrite(previewId: string): Promise<void>;
@@ -125,5 +127,4 @@ export interface HostBridge {
   executeRemoval(previewId: string, reviewDigest: string, consentedIdentities: string[], resume: ResumeRemoval): Promise<RemoveResult>;
   invalidateFlowPreview(): Promise<void>;
   resetSupport(): Promise<ResetSupport>;
-  resetStorage(): Promise<void>;
 }

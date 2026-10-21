@@ -21,6 +21,7 @@ export const productionBridge: HostBridge = {
   },
   async previewWrite(deviceId: string): Promise<WritePreview> { return native().invoke<WritePreview>("preview_write", { deviceId }); },
   async previewUpdate(deviceId: string): Promise<WritePreview> { return native().invoke<WritePreview>("preview_update", { deviceId }); },
+  async previewReset(deviceId: string): Promise<WritePreview> { return native().invoke<WritePreview>("preview_reset", { deviceId }); },
   async confirmWrite(previewId: string, typedIdentifier: string): Promise<ConfirmationReceipt> {
     return native().invoke<ConfirmationReceipt>("confirm_write", { previewId, typedIdentifier });
   },
@@ -62,6 +63,5 @@ export const productionBridge: HostBridge = {
     return native().invoke<RemoveResult>("flow_remove_execute", { previewId, reviewDigest, consentedIdentities, resume });
   },
   async invalidateFlowPreview() { try { await native().invoke<void>("flow_invalidate_preview"); } catch { /* no native session to invalidate */ } },
-  async resetSupport(): Promise<ResetSupport> { return native().invoke<ResetSupport>("flow_reset_support"); },
-  async resetStorage() { await native().invoke<void>("flow_reset"); }
+  async resetSupport(): Promise<ResetSupport> { return native().invoke<ResetSupport>("flow_reset_support"); }
 };

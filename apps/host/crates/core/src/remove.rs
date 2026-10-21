@@ -1,5 +1,5 @@
 //! Independently selected removal actions. Raw persist operations deliberately
-//! have no backend capability until reset::require_supported_reset allows them.
+//! are never performed here: they use the confirmed Reset storage flow.
 
 use crate::{
     contract::sha256_hex,
@@ -192,7 +192,7 @@ pub fn prepare_removal(
             options,
             credentials,
             digest,
-            erase_support: reset::support(),
+            erase_support: reset::removal_support(),
         },
         issued_at: now,
     })
@@ -214,7 +214,7 @@ pub fn resume_removal_review(
             options: journal.options,
             credentials: journal.credentials,
             digest: journal.review_digest,
-            erase_support: reset::support(),
+            erase_support: reset::removal_support(),
         },
         issued_at: now,
     })
@@ -331,11 +331,8 @@ pub fn execute_removal(
         return Ok(journal.result);
     }
     if options.erase_storage && !journal.result.erase_storage.completed() {
-        journal.result.erase_storage = match reset::require_supported_reset() {
-            Ok(()) => {
-                return Err("reset support requires the confirmed write helper integration".into());
-            }
-            Err(reason) => StepResult::Failed { reason },
+        journal.result.erase_storage = StepResult::Failed {
+            reason: reset::removal_support().reason.into(),
         };
         journal.failures_seen = false;
         persist(&journal, &mut state, store)?;
