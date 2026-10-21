@@ -230,6 +230,31 @@ fn publish_atomic(
     result
 }
 
+/// Public routing manifest read back by MountedExchange before any flow. It
+/// names the drive's registry handle and carries no secret.
+pub const IDENTITY_MANIFEST: &str = "identity.json";
+
+pub fn publish_identity(exchange: &ExchangeRoot, drive_id: &str) -> Result<(), String> {
+    let bytes = serde_json::to_vec(&serde_json::json!({ "version": 1, "driveId": drive_id }))
+        .map_err(|_| "Cannot encode the drive identity.")?;
+    publish_atomic(exchange, IDENTITY_MANIFEST, |file| {
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "cannot flush the drive identity")?;
+        file.rewind()
+            .map_err(|_| "cannot read the drive identity")?;
+        let mut readback = Vec::new();
+        file.take(bytes.len() as u64 + 1)
+            .read_to_end(&mut readback)
+            .map_err(|_| "cannot read the drive identity")?;
+        if readback != bytes {
+            return Err("The drive identity failed readback verification.".into());
+        }
+        Ok(())
+    })?;
+    exchange.sync()
+}
+
 /// Readback: the inbox decrypts with the passphrase and has the expected
 /// sequence, and a published model matches its pin byte for byte.
 pub fn verify_published(

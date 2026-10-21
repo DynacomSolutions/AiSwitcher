@@ -5,6 +5,8 @@ import { contentRoute, filterRoute } from "./routes";
 import { acceptOperationProgress } from "./operation";
 import { UpdateDrive, canUpdate } from "./UpdateDrive";
 import { CreateDrive } from "./CreateDrive";
+import { ManageDrives } from "./ManageDrives";
+import { ResetDrive, canReset } from "./ResetDrive";
 
 export function App({ bridge }: { bridge: HostBridge }) {
   const [devices, setDevices] = useState<DeviceSummary[]>([]);
@@ -29,7 +31,7 @@ export function App({ bridge }: { bridge: HostBridge }) {
   return <main className="app-shell">
     <header className="topbar"><Link className="brand" to="/drives" aria-label="ais Host home">ais Host</Link><span>Portable drive manager</span></header>
     <div className="layout">
-      <nav aria-label="Main navigation" className="navigation"><Link to="/drives">Drives</Link><Link to="/create">Create</Link><Link to="/settings">Settings</Link></nav>
+      <nav aria-label="Main navigation" className="navigation"><Link to="/drives">Drives</Link><Link to="/create">Create</Link><Link to="/manage">Manage</Link><Link to="/settings">Settings</Link></nav>
       <section className="content" aria-live="off">
         {subscriptionError && <p role="alert" className="error-panel">Live operation updates are unavailable. Reopen the app to restore updates.</p>}
         <Routes>
@@ -37,7 +39,9 @@ export function App({ bridge }: { bridge: HostBridge }) {
           <Route path="/drives" element={loadError ? <Page title="Drives"><div role="alert" className="error-panel"><p>{loadError}</p><button type="button" onClick={() => { setLoading(true); setReload((value) => value + 1); }}>Retry</button></div></Page> : <DriveList devices={devices} loading={loading} onRefresh={() => { setLoading(true); setReload((value) => value + 1); }} />} />
           <Route path="/drives/:id" element={<DriveDetail devices={devices} loading={loading} />} />
           <Route path="/drives/:id/update" element={<UpdateDrive key={reload} bridge={bridge} devices={devices} loading={loading} />} />
+          <Route path="/drives/:id/reset" element={<ResetDrive key={reload} bridge={bridge} devices={devices} loading={loading} />} />
           <Route path="/create" element={<CreateDrive key={reload} bridge={bridge} devices={devices} loading={loading} onRefresh={() => setReload((value) => value + 1)} />} />
+          <Route path="/manage" element={<ManageDrives bridge={bridge} />} />
           <Route path="/settings" element={<Page title="Settings"><p>Host app settings.</p></Page>} />
           <Route path="*" element={<Page title="Page not found"><Link to="/drives">Return to drives</Link></Page>} />
         </Routes>
@@ -65,7 +69,7 @@ function DriveDetail({ devices, loading }: { devices: DeviceSummary[]; loading: 
   const drive = devices.find((device) => device.id === id);
   if (loading) return <Page title="Loading drive"><p role="status">Checking connected drives</p></Page>;
   if (!drive) return <Page title="Drive unavailable"><div className="error-panel" role="alert"><p>This drive is not available. Reconnect it and refresh the drive list.</p><Link to="/drives">Return to drives</Link></div></Page>;
-  return <Page title={drive.displayIdentifier}><p>{drive.model ?? "Removable drive"}</p><Link to="/drives">Back to drives</Link>{drive.updateError && <p role="alert">{drive.updateError}</p>}{canUpdate(drive) && <Link className="primary-button" to={`${contentRoute(drive.id)}/update`}>{drive.layoutStatus === "update incomplete" ? "Finish update" : "Update"}</Link>}</Page>;
+  return <Page title={drive.displayIdentifier}><p>{drive.model ?? "Removable drive"}</p><Link to="/drives">Back to drives</Link>{drive.updateError && <p role="alert">{drive.updateError}</p>}{canUpdate(drive) && <Link className="primary-button" to={`${contentRoute(drive.id)}/update`}>{drive.layoutStatus === "update incomplete" ? "Finish update" : "Update"}</Link>}{canReset(drive) && <Link to={`${contentRoute(drive.id)}/reset`}>Reset storage</Link>}</Page>;
 }
 
 function Page({ title, children }: { title: string; children: React.ReactNode }) {

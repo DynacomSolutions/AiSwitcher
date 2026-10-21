@@ -9,15 +9,11 @@ use removal_support::FakeRemoval;
 use std::{collections::BTreeSet, fs};
 
 #[test]
-fn lost_key_reset_is_unavailable_without_reading_a_key_or_requesting_device_authority() {
+fn reset_is_supported_only_where_the_helper_can_write() {
     let support = reset::support();
-    assert!(!support.supported);
-    assert!(support.reason.contains("not yet supported"));
-    assert!(support.reason.contains("LUKS"));
-    assert_eq!(
-        reset::require_supported_reset().unwrap_err(),
-        support.reason
-    );
+    assert_eq!(support.supported, cfg!(target_os = "linux"));
+    assert_eq!(reset::require_supported_reset().is_ok(), support.supported);
+    assert!(!reset::removal_support().supported);
 }
 
 #[test]

@@ -44,7 +44,7 @@ fn parses_only_bounded_structured_operations() {
         decode_frame(&frame(update_request())).unwrap().operation,
         Operation::ReplaceBase
     );
-    let mut reset = request();
+    let mut reset = update_request();
     reset["operation"] = "resetPersist".into();
     assert_eq!(
         decode_frame(&frame(reset)).unwrap().operation,
@@ -79,11 +79,13 @@ fn updates_require_matching_installed_image_metadata() {
         serde_json::to_value(ais_host_core::drive_identity::DriveIdentity::fresh().unwrap())
             .unwrap();
     assert!(decode_frame(&frame(mismatched)).is_err());
-    for operation in ["createLayout", "resetPersist"] {
-        let mut unexpected = update_request();
-        unexpected["operation"] = operation.into();
-        assert!(decode_frame(&frame(unexpected)).is_err());
-    }
+    let mut unexpected = update_request();
+    unexpected["operation"] = "createLayout".into();
+    assert!(decode_frame(&frame(unexpected)).is_err());
+    // A reset also names the drive's recorded release; without it the helper cannot plan.
+    let mut reset = request();
+    reset["operation"] = "resetPersist".into();
+    assert!(decode_frame(&frame(reset)).is_err());
 }
 
 #[test]

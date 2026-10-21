@@ -87,8 +87,10 @@ version = "0.1.0"
 dependencies = [
  "ais-host-core",
  "ais-host-helper",
+ "chrono",
  "getrandom 0.3.4",
  "libc",
+ "plist",
  "serde",
  "serde_json",
  "tauri",

@@ -30,17 +30,31 @@ use std::{
 /// the drive's selected log receiver from durable native state, so reopening a
 /// journal cannot silently select another receiver. Its revoke operation must
 /// recheck grant fingerprints while holding the existing provider auth lock.
+/// A configured place to read from or write logs to. The id is the only thing
+/// IPC ever sends back; labels are for display.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowTarget {
+    pub id: String,
+    pub label: String,
+    pub kind: &'static str,
+}
+
 pub trait FlowRuntime: Send {
     /// Include journal-only bindings from FileFlowStore after forgetting, so
     /// retained failures remain reviewable without recreating a drive record.
     fn resolve_drive(&mut self, handle: &str) -> Result<DriveBinding, String>;
     fn resolve_target(&mut self, handle: &str) -> Result<HostTarget, String>;
+    fn targets(&mut self) -> Result<Vec<FlowTarget>, String>;
     fn open_exchange(&mut self, drive: &DriveBinding) -> Result<MountedExchange, String>;
     fn open_store(&mut self, drive: &DriveBinding) -> Result<Box<dyn FlowStore>, String>;
     fn adapter(&mut self) -> &mut dyn HostAdapter;
     fn removal_backend(&mut self, drive: &DriveBinding) -> Result<Box<dyn RemovalBackend>, String>;
     fn freshness(&self) -> FreshnessPolicy;
     fn created_at(&self) -> String;
+    /// Called after every command, success or failure: unmount anything the
+    /// command mounted. Previews hold no handle to a mounted volume.
+    fn release(&mut self) {}
 }
 
 #[derive(Clone)]
@@ -98,7 +112,9 @@ impl FlowCommandState {
         let state = self.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut session = state.0.lock().map_err(|_| "Flow session is unavailable.")?;
-            action(&mut session)
+            let result = action(&mut session);
+            session.runtime.release();
+            result
         })
         .await
         .map_err(|_| "Flow operation did not complete.".to_string())?
@@ -246,6 +262,13 @@ impl FlowSession {
 }
 
 #[tauri::command]
+pub async fn flow_list_targets(
+    state: tauri::State<'_, FlowCommandState>,
+) -> Result<Vec<FlowTarget>, String> {
+    state.run(|session| session.runtime.targets()).await
+}
+
+#[tauri::command]
 pub async fn flow_refresh_preview(
     drive_id: String,
     source_id: String,
@@ -370,11 +393,6 @@ pub fn flow_reset_support() -> reset::ResetSupport {
     reset::support()
 }
 
-#[tauri::command]
-pub fn flow_reset() -> Result<(), String> {
-    reset::require_supported_reset()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +452,13 @@ mod tests {
         }
         fn resolve_target(&mut self, handle: &str) -> Result<HostTarget, String> {
             HostTarget::new(handle)
+        }
+        fn targets(&mut self) -> Result<Vec<FlowTarget>, String> {
+            Ok(vec![FlowTarget {
+                id: "local".into(),
+                label: "This computer".into(),
+                kind: "local",
+            }])
         }
         fn open_exchange(&mut self, _: &DriveBinding) -> Result<MountedExchange, String> {
             panic!("no mounted volume needed")
@@ -564,8 +589,19 @@ mod tests {
     }
 
     #[test]
-    fn reset_is_visible_as_unsupported_without_a_runtime_or_key() {
-        assert!(!flow_reset_support().supported);
-        assert!(flow_reset().unwrap_err().contains("not yet supported"));
+    fn targets_are_listed_by_opaque_id_and_label_only() {
+        let mut session = session();
+        let targets = session.runtime.targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        let json = serde_json::to_value(&targets[0]).unwrap();
+        assert_eq!(json["id"], "local");
+        assert_eq!(json["kind"], "local");
+        assert_eq!(json.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reset_support_follows_the_platform_and_removal_defers_to_it() {
+        assert_eq!(flow_reset_support().supported, cfg!(target_os = "linux"));
+        assert!(!reset::removal_support().supported);
     }
 }

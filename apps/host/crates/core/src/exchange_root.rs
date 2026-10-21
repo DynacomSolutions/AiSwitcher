@@ -349,6 +349,10 @@ impl ExchangeRoot {
 }
 
 impl ExchangeRoot {
+    /// The kernel-reported mount point this capability was opened on.
+    pub fn mount_path(&self) -> &std::path::Path {
+        &self.path
+    }
     pub(crate) fn sync(&self) -> Result<(), String> {
         self.file
             .sync_all()

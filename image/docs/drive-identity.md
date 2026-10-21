@@ -68,6 +68,15 @@ also uses `/proc/self/fd/8`. It checks identity and LUKS state afterwards.
 Existing LUKS is opened without reformatting. Non-zero unrecognised contents
 are refused. Interrupted creation never rewrites GPT or reformats existing LUKS.
 
+Format pins the LUKS2 geometry: data offset 16 MiB (`--offset 32768`), 16 KiB
+metadata areas and a 16744448-byte keyslot area. The primary header, the
+secondary header (at 16 KiB) and every keyslot therefore lie inside the first
+16 MiB of partition 5, and LUKS2 keeps nothing at the end of the partition.
+The host app's lost-key reset zeroes exactly those 16 MiB (`LUKS_HEADER_BYTES`
+in `apps/host/crates/core/src/device.rs`), so the next boot sees no LUKS header
+and an all-zero area, and formats persistence again. Change the pinned values
+and that constant together.
+
 The accepted residual hot-plug window between opening and formatting requires
 a deliberately cloned random 128-bit PARTUUID identity; the format code records
 this decision in a `shortcut:` comment.

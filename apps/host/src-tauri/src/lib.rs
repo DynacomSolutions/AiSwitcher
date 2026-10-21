@@ -1,4 +1,10 @@
+mod escrow_agent;
 mod escrow_commands;
+mod flow_commands;
+mod flow_runtime;
+mod flow_volume;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macos_volume;
 
 use std::time::Instant;
 use tauri::Manager;
@@ -18,7 +24,18 @@ pub fn run() {
             std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             // Without a private registry the create flow refuses to write.
             if let Ok(state) = escrow_commands::EscrowCommandState::new(data) {
+                let state = match escrow_agent::NativeAgent::bundled() {
+                    Ok(agent) => state.with_native_escrow(std::sync::Arc::new(agent)),
+                    // Without the bundled purge agent retention is never offered.
+                    Err(_) => state,
+                };
                 let _ = state.purge();
+                app.manage(flow_commands::FlowCommandState::new(Box::new(
+                    flow_runtime::NativeFlowRuntime::new(
+                        state.clone(),
+                        flow_volume::native_locator(app.handle().clone()),
+                    ),
+                )));
                 app.manage(state);
             }
             let config = app
@@ -37,12 +54,23 @@ pub fn run() {
             list_devices,
             preview_write,
             preview_update,
+            preview_reset,
             confirm_write,
             start_write,
             list_models,
             escrow_commands::escrow_drive_records,
             escrow_commands::escrow_purge,
             escrow_commands::escrow_delete,
+            flow_commands::flow_list_targets,
+            flow_commands::flow_refresh_preview,
+            flow_commands::flow_refresh_publish,
+            flow_commands::flow_pull_logs,
+            flow_commands::flow_remove_preview,
+            flow_commands::flow_remove_execute,
+            flow_commands::flow_removal_journal,
+            flow_commands::flow_acknowledge_failures,
+            flow_commands::flow_invalidate_preview,
+            flow_commands::flow_reset_support,
             set_create_options,
             invalidate_confirmation,
             disk_write_support,
@@ -315,6 +343,121 @@ async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<Writ
     .await
     .map_err(|_| "The update preview could not be prepared.".to_string())?
 }
+/// The registry key of a drive derives from its serial and model. If those
+/// differ from the recorded drive, the key record could not be reset after the
+/// erase, so the erase must not start.
+fn check_reset_target(
+    observation: &ais_host_core::device::DeviceObservation,
+    registered: &ais_host_core::update::InstalledImage,
+) -> Result<(), String> {
+    if ais_host_core::update::hardware_hint(observation) != registered.hardware_hint {
+        return Err(
+            "This drive's hardware no longer matches its local record. Storage was not reset."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Lost-key reset: zero the LUKS header area of a drive created here. No
+/// passphrase is needed (the key may be lost); the release recorded for the
+/// drive is re-fetched only as the trust anchor the helper re-verifies.
+#[tauri::command]
+async fn preview_reset(device_id: String, app: tauri::AppHandle) -> Result<WritePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ConfirmationSession>();
+        let _media = state.lock_media()?;
+        let (preparation, listed) = state.begin_reset_preview(&device_id)?;
+        let snapshot = preview_update_native(&device_id)?;
+        if !listed.same_physical_identity(&snapshot.observation) {
+            return Err(
+                "The listed drive changed. Refresh the devices and select it again.".into(),
+            );
+        }
+        let images = app
+            .try_state::<escrow_commands::EscrowCommandState>()
+            .ok_or("The local drive registry is unavailable.")?
+            .known_images()?;
+        let matches: Vec<_> = images
+            .into_iter()
+            .filter(|(image, _)| snapshot.partitions(&image.identity).is_ok())
+            .collect();
+        if matches.len() != 1 {
+            return Err(
+                "The drive was not created on this computer, or its layout changed.".into(),
+            );
+        }
+        let (registered, status) = matches.into_iter().next().expect("one known drive");
+        check_reset_target(&snapshot.observation, &registered)?;
+        if status == "updating" {
+            return Err("Finish the interrupted image update before resetting storage.".into());
+        }
+        let verifier =
+            ais_host_core::release::ImageVerifier::bundled().map_err(|error| error.to_string())?;
+        let fetched = ais_host_core::fetch::fetch_verified_tag(
+            &ais_host_core::fetch::UreqHttp::default(),
+            &verifier,
+            &registered.tag,
+            registered.image_digest,
+            &std::env::temp_dir(),
+        )
+        .map_err(|error| error.to_string())?;
+        let snapshot = preview_update_native(&device_id)?;
+        if !listed.same_physical_identity(&snapshot.observation) {
+            return Err(
+                "The listed drive changed. Refresh the devices and select it again.".into(),
+            );
+        }
+        let plan =
+            ais_host_core::device::WritePlan::reset_persist(&fetched.image, &snapshot, &registered)
+                .map_err(|_| {
+                    "The persistent storage area could not be planned safely.".to_string()
+                })?;
+        let parts = snapshot
+            .partitions(&registered.identity)
+            .map_err(|_| "The drive layout changed.")?;
+        let details = DeviceReviewDetails {
+            partitions: parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| PartitionReview {
+                    name: ["BIOS", "AISBOOT", "AISBASE", "AISX", "AISPERSIST"][index].into(),
+                    size_bytes: ais_host_core::update::partition_range(part).length,
+                    kind: if index < 4 { "preserve" } else { "erase" }.into(),
+                })
+                .collect(),
+            partition_details_available: true,
+        };
+        let pending = PendingConfirmation {
+            preview_id: fresh_preview_id()?,
+            plan,
+            image: fetched.image,
+            release: fetched.release,
+            details,
+            ticket: None,
+            typed: None,
+            sources: Some(fetched.sources),
+            create: None,
+            installed: Some(registered),
+            update: None,
+        };
+        let view = pending.view();
+        let mut locked = state
+            .state
+            .lock()
+            .map_err(|_| "Confirmation state is unavailable.")?;
+        if locked.preparing.as_deref() != Some(&preparation) {
+            return Err("The reset choices changed during preparation.".into());
+        }
+        locked.preparing = None;
+        locked.approvals.invalidate();
+        locked.pending = Some(pending);
+        Ok(view)
+    })
+    .await
+    .map_err(|_| "The reset preview could not be prepared.".to_string())?
+}
+
 #[cfg(target_os = "linux")]
 fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
     ais_host_helper::protocol::linux_transport::preview_update(id)
@@ -659,6 +802,30 @@ impl ConfirmationSession {
         Ok(())
     }
 
+    /// Like begin_preview, but a reset needs no create choices or passphrase.
+    fn begin_reset_preview(
+        &self,
+        device_id: &str,
+    ) -> Result<(String, ais_host_core::device::DeviceObservation), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Confirmation state is unavailable.")?;
+        state.pending = None;
+        state.preparing = None;
+        state.create = None;
+        state.approvals.invalidate();
+        let listed = state
+            .listed
+            .iter()
+            .find(|device| device.os_identity == device_id)
+            .cloned()
+            .ok_or("Refresh the devices and select a listed drive.")?;
+        let id = fresh_preview_id()?;
+        state.preparing = Some(id.clone());
+        Ok((id, listed))
+    }
+
     fn begin_preview(&self, device_id: &str) -> Result<PreviewPreparation, String> {
         let mut state = self
             .state
@@ -725,6 +892,16 @@ impl ConfirmationSession {
             .consume(&ticket, &current.plan, &observation, &current.image, now)
             .map_err(|error| error.to_string())?;
         drop(state);
+        if current.plan.operation() == ais_host_core::device::WriteOperation::ResetPersist {
+            return perform_reset(
+                &current,
+                typed,
+                CONFIRMATION_TTL
+                    .saturating_sub(now.saturating_duration_since(confirmed_at))
+                    .saturating_sub(started.elapsed()),
+                env,
+            );
+        }
         if current.installed.is_some() {
             return perform_update(
                 current,
@@ -775,8 +952,10 @@ impl ConfirmationSession {
         let not_ready = |_: String| {
             "The drive was written, but its configuration could not be published and verified. Create the drive again.".to_string()
         };
+        let handle = drive_handle(&current.plan)?;
         let publication = (|| {
             inbox.publish(&exchange)?;
+            ais_host_core::publish::publish_identity(&exchange, &handle)?;
             if let Some(model) = model_snapshot.as_mut() {
                 ais_host_core::publish::publish_model(&exchange, model)?;
             }
@@ -794,7 +973,6 @@ impl ConfirmationSession {
                 .to_string()
         })?;
         // The one hand-off to key escrow; creation itself keeps no passphrase.
-        let handle = drive_handle(&current.plan)?;
         env.sink.hand_over(&create.passphrase, &handle)?;
         let installed = ais_host_core::update::InstalledImage::new(
             &current.image,
@@ -807,6 +985,28 @@ impl ConfirmationSession {
         );
         env.sink.remember_image(&handle, &installed, "created")
     }
+}
+
+/// The helper zeroes the LUKS header area and reads it back; only then is the
+/// retained key and its flow state replaced by a new, empty generation.
+fn perform_reset(
+    current: &PendingConfirmation,
+    typed: String,
+    remaining: std::time::Duration,
+    env: &mut WriteEnv<'_>,
+) -> Result<(), String> {
+    let handle = drive_handle(&current.plan)?;
+    let request = helper_request(current, typed, remaining)?;
+    let sources = current
+        .sources
+        .as_ref()
+        .ok_or("The verified image sources are unavailable.")?;
+    env.launcher.launch(request, sources).map_err(|_| {
+        "The storage reset did not finish. Reconnect the drive and try again; the storage may be partly erased and cannot be unlocked.".to_string()
+    })?;
+    env.sink.reset_drive(&handle).map_err(|_| {
+        "The storage was erased, but the local key record could not be reset. Remove and re-register this drive.".to_string()
+    })
 }
 
 fn perform_update(
@@ -1967,5 +2167,46 @@ mod confirmation_tests {
         let launcher = Recorder::default();
         assert!(launch_with(&session, &preview_id, &changed, now, true, &launcher).is_err());
         assert!(launcher.0.borrow().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reset_target_tests {
+    use super::check_reset_target;
+    use ais_host_core::{device::DeviceObservation, update::InstalledImage};
+
+    fn observation(serial: &str) -> DeviceObservation {
+        DeviceObservation {
+            os_identity: "SYNTHETIC_FIXTURE_OS_ID".into(),
+            connection_identity: "SYNTHETIC_FIXTURE_CONNECTION".into(),
+            display_identifier: "SYNTHETIC_FIXTURE_DISK".into(),
+            serial: Some(serial.into()),
+            model: Some("SYNTHETIC_FIXTURE_MODEL".into()),
+            capacity_bytes: 16_000_000_000,
+            sector_bytes: 512,
+            table_fingerprint: [0; 32],
+            ancestry_fingerprint: [0; 32],
+            mount_fingerprint: [0; 32],
+            external_usb: true,
+            internal: false,
+            system_backing: false,
+            ancestry_complete: true,
+            writable: true,
+        }
+    }
+
+    #[test]
+    fn reset_requires_the_recorded_hardware_so_the_key_record_can_be_reset() {
+        let original = observation("SYNTHETIC_FIXTURE_SERIAL_1");
+        let installed = InstalledImage {
+            identity: ais_host_core::drive_identity::DriveIdentity::fresh().unwrap(),
+            release_order: (1, 1),
+            tag: "live-v1".into(),
+            image_digest: [0; 32],
+            hardware_hint: ais_host_core::update::hardware_hint(&original),
+        };
+        assert!(check_reset_target(&original, &installed).is_ok());
+        let changed = observation("SYNTHETIC_FIXTURE_SERIAL_2");
+        assert!(check_reset_target(&changed, &installed).is_err());
     }
 }
