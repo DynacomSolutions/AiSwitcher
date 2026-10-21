@@ -184,7 +184,8 @@ async function run(root: string, path: string, args: string[], extra: Record<str
 }
 
 // The wrapper runs under node on the live image; skip where node is absent unless CI requires it.
-const hasNode = process.env.AIS_REQUIRE_LIVE_TEST_TOOLS === "1" || Bun.which("node") !== null;
+// The harness PATH is `<bin>:/usr/bin:/bin`, so look for node exactly there.
+const hasNode = process.env.AIS_REQUIRE_LIVE_TEST_TOOLS === "1" || Bun.which("node", { PATH: "/usr/bin:/bin" }) !== null;
 describe.skipIf(!hasNode)("root exchange wrapper protocol", () => {
   test("authenticates to a private temporary tar before invoking the agent apply command", async () => {
     const { root, path } = await harness();
