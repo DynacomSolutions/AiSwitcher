@@ -3,15 +3,11 @@ import base64
 import json
 import os
 from pathlib import Path
-import pty
 import re
-import select
 import shutil
 import subprocess
 import sys
 import tempfile
-import termios
-import time
 
 SECRET_NAMES = (
     "DYNACOM_APPLE_DEVELOPER_ID_P12_BASE64",
@@ -46,49 +42,6 @@ def security_command(*args):
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     call(["security", "-i"], data=(" ".join(map(quote, args)) + "\n").encode(),
          step=f"security {args[0]}")
-
-
-def store_notary_profile(key, keychain, env):
-    # Interactive API credentials stay off argv. A PTY with echo disabled
-    # prevents terminal echo; prompts and responses are never logged.
-    master, slave = pty.openpty()
-    settings = termios.tcgetattr(slave)
-    settings[3] &= ~termios.ECHO
-    termios.tcsetattr(slave, termios.TCSANOW, settings)
-    child = subprocess.Popen(
-        ["xcrun", "notarytool", "store-credentials", "ais-host-notary",
-         "--keychain", str(keychain)],
-        stdin=slave, stdout=slave, stderr=slave,
-        env={**os.environ, "LC_ALL": "C"},
-    )
-    os.close(slave)
-    pending = [
-        (rb"(?i)path to .*private key\s*:", str(key)),
-        (rb"(?i)(?:api\s+)?key\s+id\s*:", env["DYNACOM_APPLE_ASC_KEY_ID"]),
-        (rb"(?i)(?:api\s+)?issuer(?:\s+id)?\s*:", env["DYNACOM_APPLE_ASC_ISSUER_ID"]),
-    ]
-    captured = b""
-    deadline = time.monotonic() + 120
-    try:
-        while child.poll() is None and time.monotonic() < deadline:
-            if select.select([master], [], [], 1)[0]:
-                try:
-                    captured = (captured + os.read(master, 4096))[-16384:]
-                except OSError:
-                    break
-                if pending and re.search(pending[0][0], captured):
-                    _, value = pending.pop(0)
-                    if "\n" in value or "\r" in value:
-                        raise RuntimeError("Invalid notary credential input.")
-                    os.write(master, (value + "\n").encode())
-                    captured = b""
-        if pending or child.wait(timeout=5) != 0:
-            raise StepFailed("notarytool store-credentials")
-    finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
-        os.close(master)
 
 
 def main():
@@ -157,11 +110,12 @@ def main():
             call(["codesign", "--verify", "--deep", "--strict", str(app)], step="codesign verify")
             submission = private / "submission.zip"
             call(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(submission)])
-            store_notary_profile(api_key, keychain, env)
+            # Key ID and issuer are identifiers, not secrets; the private key stays a 0600 file.
             receipt = json.loads(call(
-                ["xcrun", "notarytool", "submit", str(submission), "--keychain-profile",
-                 "ais-host-notary", "--keychain", str(keychain), "--wait",
-                 "--timeout", "30m", "--output-format", "json"], timeout=1900))
+                ["xcrun", "notarytool", "submit", str(submission),
+                 "--key", str(api_key), "--key-id", env["DYNACOM_APPLE_ASC_KEY_ID"],
+                 "--issuer", env["DYNACOM_APPLE_ASC_ISSUER_ID"], "--wait",
+                 "--timeout", "30m", "--output-format", "json"], timeout=1900, step="notarytool submit"))
             if receipt.get("status") != "Accepted":
                 raise StepFailed(f"notarisation status {receipt.get('status')!r}")
             call(["xcrun", "stapler", "staple", str(app)])
