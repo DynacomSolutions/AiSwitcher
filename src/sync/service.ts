@@ -18,6 +18,7 @@ import {
   SYNC_TOOL_CONFIGS,
 } from "./rsync.ts";
 import { pruneStaging } from "./staging.ts";
+import { crushFingerprint, ignoredPathFilters, loadSteadyState, saveSteadyState, type SteadyState } from "./steady-state.ts";
 import {
   createCrushSnapshotTree,
   loadCrushSnapshotManifest,
@@ -171,6 +172,9 @@ async function makeSyncStatePortable(scope: SyncScope, home: string): Promise<vo
 interface RemoteSnapshotResponse {
   snapshotId: string;
   databases: string[];
+  /** The remote databases match the token we sent: nothing to snapshot, copy or merge. */
+  unchanged?: boolean;
+  token?: string;
 }
 
 function parseRemoteSnapshot(raw: string, host: string): RemoteSnapshotResponse {
@@ -182,14 +186,19 @@ function parseRemoteSnapshot(raw: string, host: string): RemoteSnapshotResponse 
   }
   if (typeof value !== "object" || value === null) throw new Error(`remote AIS snapshot on ${host} is invalid`);
   const rec = value as Record<string, unknown>;
+  const token = typeof rec.token === "string" ? rec.token : undefined;
+  if (rec.unchanged === true) return { snapshotId: "", databases: [], unchanged: true, token };
   if (typeof rec.snapshotId !== "string" || !Array.isArray(rec.databases) || rec.databases.some((p) => typeof p !== "string")) {
     throw new Error(`remote AIS snapshot on ${host} is invalid`);
   }
-  return { snapshotId: rec.snapshotId, databases: rec.databases as string[] };
+  return { snapshotId: rec.snapshotId, databases: rec.databases as string[], token };
 }
 
-async function pullCrushSnapshots(host: string, home: string): Promise<void> {
-  const remote = parseRemoteSnapshot(await runRemoteAis(host, ["sync", "snapshot-zai"]), host);
+async function pullCrushSnapshots(host: string, home: string, state: SteadyState): Promise<void> {
+  // An unchanged remote costs one tiny command instead of a VACUUM INTO, a full rsync and an ATTACH merge.
+  const known = state.crush[host]?.remote;
+  const remote = parseRemoteSnapshot(await runRemoteAis(host, ["sync", "snapshot-zai", ...(known ? [`--if-changed=${known}`] : [])]), host);
+  if (remote.unchanged) return;
   const localRoot = join(aisRemoteCacheDir(home), "sqlite-incoming", `${safeHostSegment(host)}-${remote.snapshotId}`);
   try {
     await mkdir(localRoot, { recursive: true });
@@ -200,6 +209,7 @@ async function pullCrushSnapshots(host: string, home: string): Promise<void> {
     if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
     const manifest = await loadCrushSnapshotManifest(localRoot);
     await mergeCrushSnapshotTree(manifest, home);
+    state.crush[host] = { ...state.crush[host], remote: remote.token };
   } finally {
     await rm(localRoot, { recursive: true, force: true });
     // Best effort: the remote also prunes stale staging on every profile merge.
@@ -207,7 +217,9 @@ async function pullCrushSnapshots(host: string, home: string): Promise<void> {
   }
 }
 
-async function pushCrushSnapshots(host: string, home: string): Promise<void> {
+async function pushCrushSnapshots(host: string, home: string, state: SteadyState): Promise<void> {
+  const token = await crushFingerprint(home);
+  if (token && state.crush[host]?.local === token) return;
   const snapshotId = crypto.randomUUID();
   const localRoot = join(aisRemoteCacheDir(home), "sqlite-snapshots", snapshotId);
   try {
@@ -217,10 +229,18 @@ async function pushCrushSnapshots(host: string, home: string): Promise<void> {
       remoteRoot: `${AIS_REMOTE_CACHE_REL}/sqlite-incoming/${snapshotId}`,
     });
     if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
-    await runRemoteAis(host, ["sync", "merge-zai-snapshot", snapshotId]);
+    const merged = await runRemoteAis(host, ["sync", "merge-zai-snapshot", snapshotId]);
+    state.crush[host] = { local: token, remote: parseJson(merged)?.token };
   } finally {
     await rm(localRoot, { recursive: true, force: true });
   }
+}
+
+function parseJson(raw: string): { token?: string; deniedPaths?: string[] } | undefined {
+  try {
+    const value = JSON.parse(raw.trim().split("\n").at(-1) ?? "");
+    return typeof value === "object" && value !== null ? value : undefined;
+  } catch { return undefined; }
 }
 
 function scopeArgs(scope: SyncScope): string[] {
@@ -228,7 +248,7 @@ function scopeArgs(scope: SyncScope): string[] {
   return [`--tool=${scope.cfg.toolName}`, `--identity=${scope.identityName}`];
 }
 
-async function pushProfileSnapshot(host: string, filters: string[], scope: SyncScope, home: string): Promise<void> {
+async function pushProfileSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState): Promise<void> {
   const snapshotId = crypto.randomUUID();
   const remoteRoot = `${AIS_REMOTE_CACHE_REL}/profile-incoming/${snapshotId}`;
   const pushed = await runRsync(host, "push", filters, home, {
@@ -239,7 +259,12 @@ async function pushProfileSnapshot(host: string, filters: string[], scope: SyncS
     compareDest: "../../../..",
   });
   if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
-  await runRemoteAis(host, ["sync", "merge-profile-snapshot", snapshotId, ...scopeArgs(scope)]);
+  const merged = await runRemoteAis(host, ["sync", "merge-profile-snapshot", snapshotId, ...scopeArgs(scope)]);
+  noteDenied(state, parseJson(merged)?.deniedPaths);
+}
+
+function noteDenied(state: SteadyState, paths: string[] | undefined): void {
+  for (const rel of paths ?? []) if (!state.ignored.includes(rel)) state.ignored.push(rel);
 }
 
 /** Pull from every configured SSH host, merge by stable session ID and
@@ -260,6 +285,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
   if (!release) return { ...result, skipped: true };
 
   const errors: Error[] = [];
+  const state = await loadSteadyState(home);
   try {
     await pruneStaging({ home });
     // Portability is a transport invariant, not a one-off migration. Run it
@@ -270,7 +296,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
       ...(await collectProfileDataDirs(scope)),
       ...(await collectProjectDataDirs(scope)),
     ];
-    const filters = buildSyncFilterArgs(scope, extraDataDirs);
+    const filters = [...ignoredPathFilters(state), ...buildSyncFilterArgs(scope, extraDataDirs)];
 
     if (direction === "pull" || direction === "both") {
       for (const host of config.remotes) {
@@ -280,7 +306,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
         );
         try {
-          if (includeDatabases && syncsCrush(scope)) await pullCrushSnapshots(host, home);
+          if (includeDatabases && syncsCrush(scope)) await pullCrushSnapshots(host, home, state);
 
           // Pull into an isolated snapshot, never over a live native profile.
           // The previous implementation replaced live JSONL first and tried
@@ -301,6 +327,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
               `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
             ),
           });
+          noteDenied(state, merged.deniedPaths);
           result.preservedConflicts += merged.preservedConflicts;
           result.preservedConflictPaths = [...new Set([...result.preservedConflictPaths, ...merged.preservedConflictPaths])];
           result.busyPaths = [...new Set([...result.busyPaths, ...merged.busyPaths])];
@@ -337,8 +364,8 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
         try {
           // Push to a remote snapshot and ask remote AIS to merge it. No
           // transport direction writes over a live history any more.
-          await pushProfileSnapshot(host, filters, scope, home);
-          if (includeDatabases && syncsCrush(scope)) await pushCrushSnapshots(host, home);
+          await pushProfileSnapshot(host, filters, scope, home, state);
+          if (includeDatabases && syncsCrush(scope)) await pushCrushSnapshots(host, home, state);
           result.pushed.push(host);
         } catch (err) {
           errors.push(err instanceof Error ? err : new Error(String(err)));
@@ -346,6 +373,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
       }
     }
   } finally {
+    await saveSteadyState(state, home).catch(() => undefined);
     await release();
   }
 
