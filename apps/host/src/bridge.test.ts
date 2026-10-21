@@ -1,4 +1,4 @@
-import type { ConfirmationReceipt, ModelChoice, DeviceSummary, HostBridge, OperationView, WritePreview } from "./contract";
+import type { ConfirmationReceipt, ModelChoice, DeviceSummary, HostBridge, OperationView, WritePreview, RemoveResult } from "./contract";
 
 const devices: DeviceSummary[] = [{
   id: "SYNTHETIC_FIXTURE_drive_usb_1",
@@ -65,4 +65,21 @@ export const testBridge: HostBridge = {
     return () => undefined;
   },
   async reportReady() {},
+  async listDriveRecords() { return [{ driveId: "SYNTHETIC_FIXTURE_record_1", generation: 1, escrowState: "disabled" }]; },
+  async listFlowTargets() { return [{ id: "local", label: "This computer", kind: "local" }]; },
+  async previewRefresh() {
+    return { previewId: "SYNTHETIC_FIXTURE_refresh_1", preview: { acknowledgedSeq: 0, pendingSeq: null, outboxCreatedAt: null, conflicts: [], sourceDigest: "0".repeat(64), disposition: "ready", replacesPending: false, deferredPaths: [], outboxCurrent: true } };
+  },
+  async publishRefresh() { return { sequence: 1, acknowledged: false, reusedPending: false, deferredPaths: [] }; },
+  async pullLogs() { return { imported: 1, duplicates: 0, truncated: false, capturedAt: "2026-10-19T00:00:00.000Z", freshness: "unknown", conflicts: [], complete: true }; },
+  async previewRemoval(driveId, options) {
+    return { previewId: "SYNTHETIC_FIXTURE_removal_1", review: { drive: { driveId, generation: 1 }, options, credentials: { scopes: [], digest: "0".repeat(64) }, digest: "1".repeat(64), eraseSupport: { supported: false, reason: "Not yet supported." } } };
+  },
+  async executeRemoval(): Promise<RemoveResult> {
+    const skipped = { status: "skipped", reason: "Not selected." } as const;
+    return { pullLogs: skipped, eraseStorage: skipped, revokeCredentials: skipped, forgetDrive: { status: "completed" }, providers: [], pausedForLogs: false };
+  },
+  async invalidateFlowPreview() {},
+  async resetSupport() { return { supported: false, reason: "Persist erasure and lost-key reset are not yet supported." }; },
+  async resetStorage() { throw new Error("Persist erasure and lost-key reset are not yet supported."); },
 };

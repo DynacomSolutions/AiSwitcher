@@ -4,7 +4,7 @@
 //! no command accepts a passphrase, caller-supplied directory or retention edit.
 
 use ais_host_core::create::{Passphrase, PassphraseSink};
-use ais_host_core::escrow::{EscrowPolicy, SecretString};
+use ais_host_core::escrow::{Clock, EscrowPolicy, SecretString};
 use ais_host_core::{
     escrow::{
         EscrowError, EscrowService, PurgeResult, RetentionClock, SystemClock,
@@ -15,10 +15,29 @@ use ais_host_core::{
 };
 use std::{path::PathBuf, sync::Arc};
 
+/// How long the creating computer keeps a drive passphrase for refresh and log
+/// pulls. The expiry is fixed at creation and cannot be extended.
+pub const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// Windows stays disabled until its Credential Manager path is exercised on a
+/// real machine; Linux uses Secret Service, macOS the login keychain.
+const NATIVE_ESCROW_PLATFORM: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+/// Retain only when the platform backend is supported and currently usable;
+/// otherwise creation keeps a secret-free record and the passphrase is session-only.
+pub fn select_policy(platform_supported: bool, store_usable: bool, now: u64) -> EscrowPolicy {
+    if platform_supported && store_usable {
+        EscrowPolicy::Until(now.saturating_add(RETENTION_SECONDS))
+    } else {
+        EscrowPolicy::Disabled
+    }
+}
+
 #[derive(Clone)]
 pub struct EscrowCommandState {
     directory: PathBuf,
     clock: Arc<RetentionClock<SystemClock>>,
+    native_escrow: bool,
 }
 
 impl EscrowCommandState {
@@ -28,7 +47,21 @@ impl EscrowCommandState {
         Ok(Self {
             directory: native_directory,
             clock: Arc::new(RetentionClock::new(SystemClock::default())),
+            native_escrow: false,
         })
+    }
+
+    /// Production only: tests and unsupported platforms never touch a credential store.
+    pub fn with_native_escrow(mut self) -> Self {
+        self.native_escrow = NATIVE_ESCROW_PLATFORM;
+        self
+    }
+
+    pub(crate) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+    pub(crate) fn clock(&self) -> &RetentionClock<SystemClock> {
+        &self.clock
     }
 
     /// Also call on startup, resume and credential-store availability. Keeping
@@ -59,11 +92,14 @@ impl EscrowCommandState {
             })
             .collect())
     }
-    /// Retention stays disabled, so creation keeps only a secret-free drive record.
+    /// Checked per creation so a locked or absent credential store degrades to
+    /// a secret-free drive record instead of failing the create flow.
     pub fn sink(&self) -> EscrowSink {
+        let usable = self.native_escrow && NativeStore.availability().is_ok();
+        let now = SystemClock::default().wall_seconds();
         EscrowSink {
             state: self.clone(),
-            policy: EscrowPolicy::Disabled,
+            policy: select_policy(self.native_escrow, usable, now),
         }
     }
 }
@@ -176,6 +212,7 @@ mod tests {
         let data = registry.load().unwrap();
         let record = data.record("synthetic-drive-1").unwrap();
         assert!(record.item().is_none());
+        assert_eq!(record.retention(), EscrowPolicy::Disabled);
         assert!(record.created_here());
         // A second hand-over for the same drive is refused rather than replaced.
         drop(registry);
@@ -184,6 +221,41 @@ mod tests {
                 .sink()
                 .hand_over(&passphrase, "synthetic-drive-1")
                 .is_err()
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn policy_retains_only_with_a_supported_usable_store() {
+        let now = 1_000;
+        assert_eq!(
+            select_policy(true, true, now),
+            EscrowPolicy::Until(now + RETENTION_SECONDS)
+        );
+        assert_eq!(select_policy(true, false, now), EscrowPolicy::Disabled);
+        assert_eq!(select_policy(false, true, now), EscrowPolicy::Disabled);
+        assert_eq!(select_policy(false, false, now), EscrowPolicy::Disabled);
+        assert_eq!(
+            select_policy(true, true, u64::MAX),
+            EscrowPolicy::Until(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn native_escrow_is_off_unless_requested_and_off_on_windows() {
+        let directory =
+            std::env::temp_dir().join(format!("ais-escrow-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let state = EscrowCommandState::new(directory.clone()).unwrap();
+        assert_eq!(state.sink().policy, EscrowPolicy::Disabled);
+        assert_eq!(
+            state.with_native_escrow().native_escrow,
+            cfg!(any(target_os = "linux", target_os = "macos"))
         );
         std::fs::remove_dir_all(&directory).unwrap();
     }

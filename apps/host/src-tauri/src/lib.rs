@@ -1,4 +1,6 @@
 mod escrow_commands;
+mod flow_commands;
+mod flow_runtime;
 
 use std::time::Instant;
 use tauri::Manager;
@@ -18,7 +20,11 @@ pub fn run() {
             std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             // Without a private registry the create flow refuses to write.
             if let Ok(state) = escrow_commands::EscrowCommandState::new(data) {
+                let state = state.with_native_escrow();
                 let _ = state.purge();
+                app.manage(flow_commands::FlowCommandState::new(Box::new(
+                    flow_runtime::NativeFlowRuntime::new(state.clone()),
+                )));
                 app.manage(state);
             }
             let config = app
@@ -43,6 +49,17 @@ pub fn run() {
             escrow_commands::escrow_drive_records,
             escrow_commands::escrow_purge,
             escrow_commands::escrow_delete,
+            flow_commands::flow_list_targets,
+            flow_commands::flow_refresh_preview,
+            flow_commands::flow_refresh_publish,
+            flow_commands::flow_pull_logs,
+            flow_commands::flow_remove_preview,
+            flow_commands::flow_remove_execute,
+            flow_commands::flow_removal_journal,
+            flow_commands::flow_acknowledge_failures,
+            flow_commands::flow_invalidate_preview,
+            flow_commands::flow_reset_support,
+            flow_commands::flow_reset,
             set_create_options,
             invalidate_confirmation,
             disk_write_support,

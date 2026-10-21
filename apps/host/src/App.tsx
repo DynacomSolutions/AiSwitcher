@@ -5,6 +5,7 @@ import { contentRoute, filterRoute } from "./routes";
 import { acceptOperationProgress } from "./operation";
 import { UpdateDrive, canUpdate } from "./UpdateDrive";
 import { CreateDrive } from "./CreateDrive";
+import { ManageDrives } from "./ManageDrives";
 
 export function App({ bridge }: { bridge: HostBridge }) {
   const [devices, setDevices] = useState<DeviceSummary[]>([]);
@@ -29,7 +30,7 @@ export function App({ bridge }: { bridge: HostBridge }) {
   return <main className="app-shell">
     <header className="topbar"><Link className="brand" to="/drives" aria-label="ais Host home">ais Host</Link><span>Portable drive manager</span></header>
     <div className="layout">
-      <nav aria-label="Main navigation" className="navigation"><Link to="/drives">Drives</Link><Link to="/create">Create</Link><Link to="/settings">Settings</Link></nav>
+      <nav aria-label="Main navigation" className="navigation"><Link to="/drives">Drives</Link><Link to="/create">Create</Link><Link to="/manage">Manage</Link><Link to="/settings">Settings</Link></nav>
       <section className="content" aria-live="off">
         {subscriptionError && <p role="alert" className="error-panel">Live operation updates are unavailable. Reopen the app to restore updates.</p>}
         <Routes>
@@ -38,6 +39,7 @@ export function App({ bridge }: { bridge: HostBridge }) {
           <Route path="/drives/:id" element={<DriveDetail devices={devices} loading={loading} />} />
           <Route path="/drives/:id/update" element={<UpdateDrive key={reload} bridge={bridge} devices={devices} loading={loading} />} />
           <Route path="/create" element={<CreateDrive key={reload} bridge={bridge} devices={devices} loading={loading} onRefresh={() => setReload((value) => value + 1)} />} />
+          <Route path="/manage" element={<ManageDrives bridge={bridge} />} />
           <Route path="/settings" element={<Page title="Settings"><p>Host app settings.</p></Page>} />
           <Route path="*" element={<Page title="Page not found"><Link to="/drives">Return to drives</Link></Page>} />
         </Routes>

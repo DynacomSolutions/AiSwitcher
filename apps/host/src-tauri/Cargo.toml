@@ -17,11 +17,9 @@ tauri-build.workspace = true
 [dependencies]
 ais-host-core = { path = "../crates/core" }
 ais-host-helper = { path = "../crates/helper" }
+chrono = "=0.4.45"
 getrandom = "=0.3.4"
 libc = "=0.2.191"
 serde.workspace = true
-tauri.workspace = true
-
-
-[dev-dependencies]
 serde_json.workspace = true
+tauri.workspace = true
