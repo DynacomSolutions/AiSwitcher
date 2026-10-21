@@ -109,8 +109,9 @@ describe("live guard scenario fixtures", () => {
   });
 
   const expectBin = process.env.AIS_TEST_EXPECT_BIN ?? "expect";
-  const hasExpect = process.env.CI === "true" || Bun.which(expectBin) !== null;
-  // Outside CI a missing host tool skips (reason: `expect` not on PATH); in CI it must run and fail loudly.
+  const hasExpect = process.env.AIS_REQUIRE_LIVE_TEST_TOOLS === "1" || Bun.which(expectBin) !== null;
+  // A missing host tool skips (reason: `expect` not on PATH); the main CI job sets
+  // AIS_REQUIRE_LIVE_TEST_TOOLS so it must run and fail loudly there.
   (hasExpect ? test : test.skip)("Expect driver handles reply, no-reply, deferred, missing and unexpected cases", async () => {
     const scratch = process.env.AIS_TEST_SCRATCH_DIR ?? tmpdir();
     mkdirSync(scratch, { recursive: true });

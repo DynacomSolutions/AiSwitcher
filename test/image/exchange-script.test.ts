@@ -183,7 +183,9 @@ async function run(root: string, path: string, args: string[], extra: Record<str
   return { stdout, stderr, exitCode };
 }
 
-describe("root exchange wrapper protocol", () => {
+// The wrapper runs under node on the live image; skip where node is absent unless CI requires it.
+const hasNode = process.env.AIS_REQUIRE_LIVE_TEST_TOOLS === "1" || Bun.which("node") !== null;
+describe.skipIf(!hasNode)("root exchange wrapper protocol", () => {
   test("authenticates to a private temporary tar before invoking the agent apply command", async () => {
     const { root, path } = await harness();
     const inbox = await fixtureTar(4, "inbox");
