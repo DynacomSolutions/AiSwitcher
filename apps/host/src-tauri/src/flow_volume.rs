@@ -15,6 +15,8 @@ pub struct MountedVolume {
 }
 
 impl MountedVolume {
+    // Only the Linux and macOS locators mount; Windows has no exchange locator.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn new(path: PathBuf, release: impl FnOnce() + Send + 'static) -> Self {
         Self {
             path,
