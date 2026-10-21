@@ -127,6 +127,26 @@ jobs:
           bun run scripts/host/release-assets.ts --verify
           gh release create "$HOST_TAG" "$HOST_RELEASE_DIR"/* --verify-tag --draft --prerelease \
             --title "ais Host $HOST_TAG" --notes-file apps/host/packaging/release-notes.md
+      # Draft releases are invisible to tag lookups and to read-only tokens, so this job
+      # re-downloads the distributed bytes by asset ID and hands them to the launch checks.
+      - name: Download the draft release afresh
+        run: |
+          downloaded="$RUNNER_TEMP/downloaded"
+          mkdir -p "$downloaded"
+          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name == \"$HOST_TAG\" and .draft)][0].id")
+          test -n "$release_id" && test "$release_id" != null
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" --jq '.[] | "\(.id) \(.name)"' |
+            while read -r asset_id asset_name; do
+              gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                > "$downloaded/$asset_name"
+            done
+          HOST_RELEASE_DIR="$downloaded" bun run scripts/host/release-assets.ts --verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-release-downloaded
+          path: ${{ runner.temp }}/downloaded
+          if-no-files-found: error
 
   verify-download:
     needs: [validate, release]
@@ -152,7 +172,6 @@ jobs:
       run:
         shell: bash
     env:
-      GH_TOKEN: ${{ github.token }}
       HOST_TAG: ${{ needs.validate.outputs.tag }}
       ASSET_TARGET: ${{ matrix.asset }}
       ASSET_FILENAME: ${{ matrix.filename }}
@@ -171,9 +190,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb libwebkit2gtk-4.1-0
-      - name: Download afresh and verify distributed bytes
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-release-downloaded
+          path: ${{ runner.temp }}/download
+      - name: Verify distributed bytes and launch the downloaded app
         run: |
-          gh release download "$HOST_TAG" --dir "$HOST_RELEASE_DIR"
           bun run scripts/host/release-assets.ts --verify
           args=(--smoke --production "--target=$ASSET_TARGET"
                 "--asset=$HOST_RELEASE_DIR/$ASSET_FILENAME"
