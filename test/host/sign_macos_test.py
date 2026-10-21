@@ -52,7 +52,8 @@ class SigningTests(unittest.TestCase):
             def fake_call(args, **_kwargs):
                 nonlocal stapled
                 calls.append(args)
-                for secret in signing.SECRET_NAMES:
+                # Key ID and issuer are identifiers passed to notarytool; credentials never are.
+                for secret in signing.SECRET_NAMES[:3]:
                     self.assertNotIn(env[secret], args)
                 if args[:2] == ["security", "find-identity"]:
                     return (f'1) {"A" * 40} "Developer ID Application: SYNTHETIC_FIXTURE"\n').encode()
@@ -72,7 +73,7 @@ class SigningTests(unittest.TestCase):
                 return b""
 
             with patch.dict(os.environ, env, clear=True), patch.object(signing.sys, "platform", "darwin"):
-                with patch.object(signing, "call", side_effect=fake_call), patch.object(signing, "store_notary_profile"):
+                with patch.object(signing, "call", side_effect=fake_call):
                     with contextlib.redirect_stdout(io.StringIO()):
                         if accepted and not altered:
                             signing.main()
