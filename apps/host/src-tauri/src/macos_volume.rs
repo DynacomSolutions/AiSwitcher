@@ -244,7 +244,7 @@ pub fn mount(
     Ok(volume)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // unix absolute paths
 mod tests {
     use super::*;
 

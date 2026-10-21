@@ -138,7 +138,7 @@ impl AgentInstaller for NativeAgent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // unix absolute paths
 mod tests {
     use super::*;
 
