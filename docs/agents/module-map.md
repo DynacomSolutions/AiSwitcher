@@ -438,3 +438,22 @@ around `identities/store.ts`'s existing load/save/validate). This keeps the
 resolution engine pure and unit-testable (see `test/`) without any
 process/TTY/filesystem mocking beyond a plain `ResolveDeps` object.
 
+## Portable host app
+
+`apps/host/src` contains the React interface; `apps/host/src-tauri` owns the
+unprivileged native commands. `apps/host/crates/core` owns image verification,
+bundle handling and escrow cleanup. `apps/host/crates/helper` owns bounded
+privileged operations. Read `host-app.md` before modifying these boundaries.
+
+`src/host/adapter.ts` compiles to the platform's adjacent `ais-host-adapter`
+executable. Local launches resolve it beside the app executable; configured
+SSH sources still invoke `ais host --stdio` remotely.
+
+`scripts/host/affected.ts` selects checks from changed dependencies.
+`check-workflows.ts` validates runner, permission and aggregate-gate policy.
+`build-release.ts` assembles native packages; `release-assets.ts` checks
+architectures, payloads, final hashes and extracted native launch.
+`sign-macos.py` owns the temporary signing keychain and notarisation sequence.
+`validate-tag.ts` ties a release to the checked commit on `main`.
+`apps/host/packaging` documents entitlements and package limitations.
+

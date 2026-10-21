@@ -136,6 +136,10 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   tui: { usage: "ais tui", desc: "Terminal dashboard on the local console API" },
+  host: {
+    usage: "ais host --stdio",
+    desc: "Private framed transport endpoint for host-app sync",
+  },
   launch: { usage: "ais launch", desc: "Pick a tool, then an identity or pool, and start it" },
   local: {
     usage: "ais local [list|start [name]] [--json]",

@@ -1,0 +1,35 @@
+{
+  "productName": "ais Host",
+  "version": "0.1.0",
+  "identifier": "invalid.example.ais-host",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "withGlobalTauri": true,
+    "windows": [{
+      "create": false,
+      "title": "ais Host",
+      "width": 1120,
+      "height": 760,
+      "minWidth": 820,
+      "minHeight": 600,
+      "transparent": true,
+      "windowEffects": {
+        "effects": ["acrylic", "underWindowBackground"],
+        "state": "active",
+        "radius": 14
+      }
+    }],
+    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"]
+  }
+}

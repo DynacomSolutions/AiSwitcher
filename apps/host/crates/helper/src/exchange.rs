@@ -1,0 +1,340 @@
+//! Linux exFAT preparation. The formatter sees only a fresh anonymous regular
+//! file. Device writes use the already approved, locked target and bounded p4.
+use ais_host_core::device::{ByteRange, WritePlan, WriteTarget};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    os::fd::FromRawFd,
+    os::unix::fs::MetadataExt,
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+unsafe extern "C" {
+    fn memfd_create(name: *const std::ffi::c_char, flags: u32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+    fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
+}
+
+pub struct PreparedExchange {
+    file: File,
+    range: ByteRange,
+    extents: Vec<ByteRange>,
+}
+
+impl PreparedExchange {
+    pub fn native(plan: &WritePlan) -> Result<Self, &'static str> {
+        let mkfs = trusted_tool("mkfs.exfat")?;
+        let fsck = trusted_tool("fsck.exfat")?;
+        Self::prepare(plan, &mkfs, &fsck)
+    }
+
+    /// Explicit test seam for installed exfatprogs. The target is still a new
+    /// anonymous regular file; these paths name executables, never devices.
+    #[cfg(feature = "file-test")]
+    pub fn fixture(plan: &WritePlan, mkfs: &Path, fsck: &Path) -> Result<Self, &'static str> {
+        Self::prepare(plan, mkfs, fsck)
+    }
+
+    fn prepare(plan: &WritePlan, mkfs: &Path, fsck: &Path) -> Result<Self, &'static str> {
+        let range = plan
+            .exchange_range()
+            .ok_or("The exchange range is unavailable.")?;
+        // SAFETY: the name is terminated and flags request CLOEXEC and sealing.
+        let descriptor = unsafe { memfd_create(c"ais-exchange".as_ptr(), 3) };
+        if descriptor < 0 {
+            return Err("The exchange staging file is unavailable.");
+        }
+        // SAFETY: this descriptor was just created and has one owner.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        file.set_len(range.length)
+            .map_err(|_| "The exchange staging size is invalid.")?;
+        let path = format!("/proc/{}/fd/{descriptor}", std::process::id());
+        run_tool(mkfs, &["-L", "AISX", &path])?;
+        // The formatter sees a standalone volume. Record its final partition
+        // offset in both boot regions, updating the exFAT boot checksums.
+        let mut boot = vec![0; 12 * 512];
+        file.rewind()
+            .and_then(|_| file.read_exact(&mut boot))
+            .map_err(|_| "The exchange boot region is unreadable.")?;
+        if &boot[3..11] != b"EXFAT   "
+            || boot[108] != 9
+            || u64::from_le_bytes(boot[72..80].try_into().unwrap()) != range.length / 512
+        {
+            return Err("The formatter returned an unexpected exchange layout.");
+        }
+        boot[64..72].copy_from_slice(&(range.start / 512).to_le_bytes());
+        let mut checksum = 0u32;
+        for (index, byte) in boot[..11 * 512].iter().enumerate() {
+            if !matches!(index, 106 | 107 | 112) {
+                checksum = checksum.rotate_right(1).wrapping_add(u32::from(*byte));
+            }
+        }
+        for word in boot[11 * 512..].as_chunks_mut::<4>().0 {
+            word.copy_from_slice(&checksum.to_le_bytes());
+        }
+        file.rewind()
+            .and_then(|_| file.write_all(&boot))
+            .and_then(|_| file.write_all(&boot))
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "The exchange boot regions could not be prepared.")?;
+        run_tool(fsck, &["-n", &path])?;
+        // SAFETY: this owned regular descriptor supports seals. Prevent any
+        // further write, resize or seal changes to the verified output.
+        if unsafe { fcntl(descriptor, 1033, 15) } < 0 {
+            return Err("The verified exchange could not be sealed.");
+        }
+        let mut extents = Vec::new();
+        let mut offset = 0;
+        let mut total = 0;
+        while offset < range.length {
+            // SAFETY: the descriptor is open and the bounded offset fits i64.
+            // SEEK_DATA/SEEK_HOLE touch the anonymous regular file, never a disk.
+            let start = unsafe { lseek(descriptor, offset as i64, 3) };
+            if start < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(6) {
+                    break;
+                }
+                return Err("The exchange metadata extents are unavailable.");
+            }
+            // SAFETY: start is a valid offset just returned for this descriptor.
+            let end = unsafe { lseek(descriptor, start, 4) };
+            if end <= start || end as u64 > range.length {
+                return Err("The exchange metadata exceeds its range.");
+            }
+            let extent = ByteRange {
+                start: start as u64,
+                length: (end - start) as u64,
+            };
+            total += extent.length;
+            if total > 128 * 1024 * 1024 || extents.len() >= 4096 {
+                return Err("The exchange metadata exceeds its size limit.");
+            }
+            extents.push(extent);
+            offset = end as u64;
+        }
+        if extents.is_empty() {
+            return Err("The formatted exchange has no metadata.");
+        }
+        Ok(Self {
+            file,
+            range,
+            extents,
+        })
+    }
+
+    pub(crate) fn validate_plan(&self, plan: &WritePlan) -> Result<(), &'static str> {
+        if plan.exchange_range() != Some(self.range) {
+            return Err("The formatted exchange does not match the confirmed plan.");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write(
+        &mut self,
+        target: &mut impl WriteTarget,
+        plan: &WritePlan,
+    ) -> Result<(), &'static str> {
+        self.validate_plan(plan)?;
+        plan.verify_created_target(target)
+            .map_err(|_| "The drive changed before formatting.")?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut expected = [0u8; 64 * 1024];
+        let mut actual = [0u8; 64 * 1024];
+        for extent in &self.extents {
+            let mut offset = extent.start;
+            while offset < extent.start + extent.length {
+                if Instant::now() >= deadline {
+                    return Err("The exchange write timed out.");
+                }
+                plan.verify_created_layout(target)
+                    .map_err(|_| "The drive changed during formatting.")?;
+                let count = ((extent.start + extent.length - offset) as usize).min(expected.len());
+                self.file
+                    .seek(SeekFrom::Start(offset))
+                    .and_then(|_| self.file.read_exact(&mut expected[..count]))
+                    .map_err(|_| "The verified exchange metadata is unreadable.")?;
+                target
+                    .seek(SeekFrom::Start(self.range.start + offset))
+                    .and_then(|_| target.write_all(&expected[..count]))
+                    .and_then(|_| target.flush_durable())
+                    .and_then(|_| target.read_at(self.range.start + offset, &mut actual[..count]))
+                    .map_err(|_| "The exchange metadata could not be written and read back.")?;
+                if actual[..count] != expected[..count] {
+                    return Err("The exchange metadata failed readback verification.");
+                }
+                offset += count as u64;
+            }
+        }
+        plan.verify_created_target(target)
+            .map_err(|_| "The drive changed after formatting.")
+    }
+}
+
+fn trusted_tool(name: &str) -> Result<std::path::PathBuf, &'static str> {
+    for directory in ["/usr/sbin", "/usr/bin"] {
+        let Ok(path) = Path::new(directory).join(name).canonicalize() else {
+            continue;
+        };
+        let trusted = path.ancestors().all(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0)
+        });
+        if trusted && path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err("Install the system exfatprogs formatter and checker before creating a drive.")
+}
+
+fn run_tool(program: &Path, args: &[&str]) -> Result<(), &'static str> {
+    let mut child = Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "The exFAT tool could not be started.")?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err("The exFAT tool refused the exchange file.")
+                };
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("The exFAT tool did not complete.");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "file-test"))]
+mod tests {
+    use super::*;
+    use ais_host_core::file_test::{FaultTarget, FileTarget, SyntheticRelease};
+
+    struct CorruptAfterWrite(FaultTarget);
+    impl Read for CorruptAfterWrite {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(bytes)
+        }
+    }
+    impl Seek for CorruptAfterWrite {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(position)
+        }
+    }
+    impl Write for CorruptAfterWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let count = self.0.write(bytes)?;
+            self.0.corrupt_readback = true;
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+    impl WriteTarget for CorruptAfterWrite {
+        fn observe(&self) -> std::io::Result<ais_host_core::device::DeviceObservation> {
+            self.0.observe()
+        }
+        fn lock_exclusive(&mut self) -> std::io::Result<()> {
+            self.0.lock_exclusive()
+        }
+        fn flush_durable(&mut self) -> std::io::Result<()> {
+            self.0.flush_durable()
+        }
+    }
+
+    #[test]
+    fn formatting_refusals_and_readback_faults_preserve_the_reserved_region() {
+        let directory = std::env::temp_dir();
+        let (_, mut image) =
+            SyntheticRelease::new(ais_host_core::layout::synthetic_sfdisk_contract_fixture())
+                .verify_live_layout(&directory)
+                .unwrap();
+        let mut target = FileTarget::create_sparse(&directory, 3 * 1024 * 1024 * 1024).unwrap();
+        let observation = target.observe().unwrap();
+        let plan = WritePlan::create_drive(&image, observation.clone()).unwrap();
+        let range = plan.exchange_range().unwrap();
+        let reserve_start = range.start + range.length;
+        let tools = std::env::var_os("AIS_HOST_TEST_EXFAT_TOOLS").map(std::path::PathBuf::from);
+        let tool = |name: &str| {
+            tools
+                .as_ref()
+                .map_or_else(|| name.into(), |path| path.join(name))
+        };
+        assert!(
+            PreparedExchange::fixture(
+                &plan,
+                Path::new("missing-SYNTHETIC_FIXTURE"),
+                &tool("fsck.exfat")
+            )
+            .is_err()
+        );
+        let mut exchange =
+            PreparedExchange::fixture(&plan, &tool("mkfs.exfat"), &tool("fsck.exfat")).unwrap();
+        let deadline = crate::protocol::linux_transport::boottime_ns().unwrap() + 90_000_000_000;
+        let name = observation.display_identifier.clone();
+        let wrong_plan = WritePlan::create_layout(&image, observation).unwrap();
+        assert!(
+            crate::service::create_confirmed(
+                &mut target,
+                deadline,
+                &mut image,
+                &wrong_plan,
+                &name,
+                &mut exchange
+            )
+            .is_err()
+        );
+        let mut bytes = [1; 512];
+        target.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 512], "formatting refusals precede imaging");
+
+        crate::service::write_confirmed(&mut target, deadline, &mut image, &plan, &name).unwrap();
+        target.read_at(reserve_start, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 512], "creation clears persistence");
+        // The sentinel covers the exchange-formatting phase. Creation must
+        // first clear old persistence bytes under the drive identity contract.
+        target.seek(SeekFrom::Start(reserve_start)).unwrap();
+        target.write_all(&[0xa7; 512]).unwrap();
+        let mut target = FaultTarget::new(target);
+        let mut changed = target.observe().unwrap();
+        changed.mount_fingerprint[0] ^= 1;
+        target.observed = Some(changed);
+        assert!(exchange.write(&mut target, &plan).is_err());
+        assert_eq!(target.written, 0, "changed mount refuses before formatting");
+        target.observed = None;
+        target.fail_flush = true;
+        assert!(exchange.write(&mut target, &plan).is_err());
+        assert!(target.written > 0);
+        target.fail_flush = false;
+        let mut corrupt = CorruptAfterWrite(target);
+        assert_eq!(
+            exchange.write(&mut corrupt, &plan),
+            Err("The exchange metadata failed readback verification.")
+        );
+        let mut target = corrupt.0;
+        target.corrupt_readback = false;
+        target.maximum_write = 4096;
+        exchange.write(&mut target, &plan).unwrap();
+        target.read_at(reserve_start, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa7; 512]);
+        target.read_at(range.start, &mut bytes).unwrap();
+        assert_eq!(&bytes[3..11], b"EXFAT   ");
+        assert_eq!(
+            u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            range.length / 512
+        );
+    }
+}

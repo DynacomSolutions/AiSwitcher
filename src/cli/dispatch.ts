@@ -24,6 +24,7 @@ import { runLaunchCommand } from "./launch.ts";
 import { runLocalCommand } from "./local/dispatch.ts";
 import { runStatuslineCommand } from "./statusline.ts";
 import { runLiveCommand } from "./live/dispatch.ts";
+import { runHostCommand } from "./host/dispatch.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
  * and `unretire` are excluded: a sync merging the remote registry while the
@@ -41,6 +42,9 @@ export async function runCli(argv: string[]): Promise<void> {
     // `ais version`/`-v` wins; every other help form shares one text source.
     const helpPath = command === "version" || command === "-v" ? undefined : helpRequest(argv);
     if (helpPath) return void console.log(helpText(helpPath));
+    // Raw host transport must not trigger home migration or launch background
+    // sync before consuming its framed stdin/stdout protocol.
+    if (command === "host") return await runHostCommand(rest, flags);
 
     // Self-healing, idempotent, and must run before anything below reads a
     // path that now defaults under ~/.ais (sync config/cache, the managed

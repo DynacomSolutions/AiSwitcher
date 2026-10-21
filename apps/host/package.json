@@ -1,0 +1,27 @@
+{
+  "name": "@ais/host",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "bun@1.3.11",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "dev:test": "vite --config vite.test.config.ts",
+    "typecheck": "tsc --noEmit",
+    "test:smoke": "bun run scripts/shell-smoke.ts",
+    "native:smoke": "bun run ../../scripts/host/native-smoke.ts --case=packaged"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.1.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-router-dom": "7.18.2",
+    "vite": "8.2.2",
+    "typescript": "7.0.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5"
+  }
+}

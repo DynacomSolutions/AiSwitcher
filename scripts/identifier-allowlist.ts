@@ -29,6 +29,10 @@ export const RESERVED_DOMAINS: readonly AllowlistEntry[] = [
 // has at least one call site or normative reference in this repository.
 export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "github.com", reason: "release asset URLs and repo links (src/shared/release-assets.ts) and the connectivity probe (src/shared/connectivity.ts)" },
+  { domain: "huggingface.co", reason: "pinned local model download host (apps/host/crates/core/src/model.rs)" },
+  { domain: "hf.co", reason: "download redirect hosts used by huggingface.co for pinned model files (apps/host/crates/core/src/model.rs)" },
+  { domain: "apache.org", reason: "normative address inside the verbatim Apache-2.0 text shown before model acceptance (apps/host/crates/core/src/model-catalogue.json)" },
+  { domain: "githubusercontent.com", reason: "release asset download redirects accepted by the host app fetcher (apps/host/crates/core/src/fetch.rs)" },
   { domain: "npmjs.org", reason: "npm registry version check (src/cli/upgrade.ts)" },
   { domain: "googleapis.com", reason: "Grok CLI's public build-artifact bucket (src/cli/upgrade.ts)" },
   { domain: "kimi.com", reason: "Kimi provider API and OAuth (src/cli/limits/kimi-limits.ts, src/identities/oauth-refresh.ts)" },

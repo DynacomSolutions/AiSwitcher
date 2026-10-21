@@ -1,0 +1,189 @@
+name: Host app
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      production:
+        type: boolean
+        default: false
+      ref:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      selection: ${{ steps.paths.outputs.selection }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HOST_PRODUCTION: ${{ inputs.production }}
+        run: bun run scripts/host/affected.ts --github
+
+  checks:
+    needs: changes
+    if: needs.changes.outputs.selection != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      - name: Check privacy across incoming commits
+        run: |
+          if [ -z "$PRIVACY_BASE_SHA" ]; then
+            PRIVACY_BASE_SHA="$(git rev-parse "$PRIVACY_HEAD_SHA^")"
+            export PRIVACY_BASE_SHA
+          fi
+          bun run privacy:check --ci
+        env:
+          PRIVACY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PRIVACY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: bun run scripts/host/check-workflows.ts
+      - name: Prepare exchange-driver regression
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+          echo "HOST_TEST_SCRATCH=$RUNNER_TEMP/host-exchange" >> "$GITHUB_ENV"
+      - name: Tests selected by dependencies
+        # The full suite already runs in CI; this job covers the host tests only.
+        run: bun test test/host
+
+  native:
+    needs: changes
+    if: needs.changes.outputs.selection != 'skip'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-x64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 2
+      HOST_PRODUCTION: ${{ inputs.production }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Set isolated build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/host-cargo" >> "$GITHUB_ENV"
+          echo "HOST_BUILD_DIR=$RUNNER_TEMP/host-build" >> "$GITHUB_ENV"
+      - name: Install Linux native build and smoke dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2t64 xvfb exfatprogs
+          # The package installs into an sbin directory the test process may not have on PATH.
+          mkfs=$(dpkg -L exfatprogs | grep -m1 '/mkfs\.exfat$')
+          echo "AIS_HOST_TEST_EXFAT_TOOLS=$(dirname "$mkfs")" >> "$GITHUB_ENV"
+      - name: Install locked dependencies and native toolchain
+        run: |
+          bun install --frozen-lockfile
+          bun install --cwd apps/host --frozen-lockfile
+          cd apps/host
+          rustup show
+          cargo install tauri-cli --version 2.12.3 --locked
+      # generate_context! needs the built frontend before any cargo step.
+      - name: Frontend typecheck and build
+        working-directory: apps/host
+        run: |
+          bun run typecheck
+          bun run build
+      - name: Rust format, tests and lint
+        working-directory: apps/host
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --workspace
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: File-backed integration tests
+        if: runner.os == 'Linux'
+        working-directory: apps/host
+        run: cargo test --locked --workspace --features file-test
+      - name: Browser smoke
+        if: runner.os == 'Linux'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/host-playwright" --no-audit --no-fund @playwright/test@1.58.2
+          node "$RUNNER_TEMP/host-playwright/node_modules/playwright/cli.js" install --with-deps chromium
+          export HOST_PLAYWRIGHT_MODULE="$RUNNER_TEMP/host-playwright/node_modules/@playwright/test"
+          bun run --cwd apps/host test:smoke
+      - name: Package and smoke the native app
+        run: |
+          args=()
+          if [ "$HOST_PRODUCTION" = true ]; then args+=(--production); fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a bun run scripts/host/build-release.ts "${args[@]}"
+          else
+            bun run scripts/host/build-release.ts "${args[@]}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-unsigned-${{ matrix.asset }}
+          path: ${{ runner.temp }}/host-build/assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    if: ${{ always() }}
+    needs: [changes, checks, native]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SELECTION: ${{ needs.changes.outputs.selection }}
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          NATIVE_RESULT: ${{ needs.native.result }}
+        run: bun run scripts/host/check-workflows.ts --gate

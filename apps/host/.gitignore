@@ -1,0 +1,8 @@
+/node_modules/
+/dist/
+/target/
+/gen/
+/src-tauri/gen/
+/test-results/
+/playwright-report/
+/playwright/.cache/

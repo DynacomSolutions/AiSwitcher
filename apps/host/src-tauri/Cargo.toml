@@ -1,0 +1,27 @@
+[package]
+name = "ais-host-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+file-test = ["ais-host-core/file-test", "ais-host-helper/file-test"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+ais-host-core = { path = "../crates/core" }
+ais-host-helper = { path = "../crates/helper" }
+getrandom = "=0.3.4"
+libc = "=0.2.191"
+serde.workspace = true
+tauri.workspace = true
+
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -8,6 +8,8 @@
     "privacy:install": "bun run scripts/install-privacy-hooks.ts",
     "identifiers:check": "bun run scripts/identifier-scan.ts",
     "secrets:check": "bun run scripts/secret-scan.ts",
+    "host:check-contract": "bun run scripts/host/check-contract.ts",
+    "host:test-ssh": "bun run scripts/host/test-ssh.ts",
     "lint": "bun run scripts/identifier-scan.ts --tree && bun run scripts/secret-scan.ts --tree",
     "typecheck": "tsc --noEmit",
     "build": "bun run scripts/build.ts",
