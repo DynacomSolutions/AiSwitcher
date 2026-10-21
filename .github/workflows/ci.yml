@@ -84,6 +84,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends expect nodejs
 
       - name: Test
+        env:
+          AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
         run: bun test
 
   # Decides whether the macOS and host app jobs are needed. Pushes to main always run them.
