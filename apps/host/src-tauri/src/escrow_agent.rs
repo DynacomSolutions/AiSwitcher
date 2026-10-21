@@ -3,6 +3,9 @@
 //! Nothing here handles a secret; it only writes a service definition and
 //! registers it with the user's own service manager (never elevated).
 
+// Windows keeps escrow disabled, so the installer is unused there.
+#![cfg_attr(windows, allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
