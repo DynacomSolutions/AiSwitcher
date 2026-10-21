@@ -46,6 +46,77 @@ pub fn exchange_candidates(list: &[u8]) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
+/// "disk4s4" -> "disk4". Only plain whole-disk numbers are accepted.
+pub fn parent_disk(partition_id: &str) -> Option<String> {
+    let (disk, number) = partition_id.rsplit_once('s')?;
+    let digits = disk.strip_prefix("disk")?;
+    (!digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| disk.to_owned())
+}
+
+/// Every partition of one disk in partition-number order, from `diskutil list -plist`.
+pub fn sibling_ids(list: &[u8], disk: &str) -> Result<Vec<String>, String> {
+    let list = dictionary(list)?;
+    let mut found: Vec<(u32, String)> = Vec::new();
+    for entry in list
+        .get("AllDisksAndPartitions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_dictionary)
+        .filter(|entry| entry.get("DeviceIdentifier").and_then(Value::as_string) == Some(disk))
+    {
+        for part in entry
+            .get("Partitions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_dictionary)
+        {
+            let id = part.get("DeviceIdentifier").and_then(Value::as_string);
+            if let Some((id, number)) = id.and_then(|id| {
+                let number = id
+                    .strip_prefix(disk)?
+                    .strip_prefix('s')?
+                    .parse::<u32>()
+                    .ok()?;
+                Some((id, number))
+            }) {
+                found.push((number, id.to_owned()));
+            }
+        }
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, id)| id).collect())
+}
+
+/// All five partition UUIDs (in order) must equal the registry identity, and the
+/// disk GUID too when diskutil reports one. A foreign sibling refuses the drive.
+pub fn siblings_match(
+    partition_infos: &[Vec<u8>],
+    disk_info: &[u8],
+    identity: &ais_host_core::drive_identity::DriveIdentity,
+) -> Result<bool, String> {
+    if partition_infos.len() != identity.partitions.len() {
+        return Ok(false);
+    }
+    let uuid = |bytes: &[u8]| -> Result<Option<String>, String> {
+        Ok(dictionary(bytes)?
+            .get("DiskUUID")
+            .and_then(Value::as_string)
+            .map(str::to_ascii_lowercase))
+    };
+    for (info, expected) in partition_infos.iter().zip(&identity.partitions) {
+        if uuid(info)?.as_deref() != Some(&expected.to_ascii_lowercase()) {
+            return Ok(false);
+        }
+    }
+    Ok(uuid(disk_info)?.is_none_or(|disk| disk == identity.disk.to_ascii_lowercase()))
+}
+
 pub struct PartitionInfo {
     pub node: String,
     pub mount_point: Option<PathBuf>,
@@ -123,7 +194,10 @@ fn diskutil(arguments: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn mount(partition_uuid: &str) -> Result<crate::flow_volume::MountedVolume, String> {
+pub fn mount(
+    identity: &ais_host_core::drive_identity::DriveIdentity,
+) -> Result<crate::flow_volume::MountedVolume, String> {
+    let partition_uuid = &identity.partitions[3];
     let mut found = None;
     for id in exchange_candidates(&diskutil(&["list", "-plist"])?)? {
         if let Some(info) =
@@ -136,6 +210,16 @@ pub fn mount(partition_uuid: &str) -> Result<crate::flow_volume::MountedVolume, 
         }
     }
     let (id, info) = found.ok_or("The drive is not connected.")?;
+    // The partition 4 UUID alone is not enough: the whole disk must match.
+    let disk = parent_disk(&id).ok_or("The drive identifier is invalid.")?;
+    let siblings = sibling_ids(&diskutil(&["list", "-plist"])?, &disk)?;
+    let infos = siblings
+        .iter()
+        .map(|sibling| diskutil(&["info", "-plist", sibling]))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !siblings_match(&infos, &diskutil(&["info", "-plist", &disk])?, identity)? {
+        return Err("The drive's disk or partition identities changed.".into());
+    }
     let mounted_here = info.mount_point.is_none();
     if mounted_here {
         diskutil(&["mount", &id])?;
@@ -155,8 +239,8 @@ pub fn mount(partition_uuid: &str) -> Result<crate::flow_volume::MountedVolume, 
         .mount_point
         .ok_or("The exchange mount point is unavailable.")?;
     let root = ais_host_core::exchange_root::ExchangeRoot::open_verified(&path, &info.node)?;
-    drop(root);
-    volume.path = path;
+    // The verified root stays open until the volume is released, as on Linux.
+    volume.hold(path, root);
     Ok(volume)
 }
 
@@ -210,5 +294,56 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn foreign_siblings_refuse_a_drive_with_the_right_partition_four_uuid() {
+        let identity = ais_host_core::drive_identity::DriveIdentity::fresh().unwrap();
+        let info = |uuid: &str| {
+            plist(&format!(
+                "<key>DiskUUID</key><string>{}</string>",
+                uuid.to_uppercase()
+            ))
+        };
+        let good: Vec<_> = identity.partitions.iter().map(|uuid| info(uuid)).collect();
+        let disk = info(&identity.disk);
+        assert!(siblings_match(&good, &disk, &identity).unwrap());
+        // No disk GUID reported: the partition UUIDs still decide.
+        assert!(siblings_match(&good, &plist(""), &identity).unwrap());
+        let mut foreign = good.clone();
+        foreign[0] = info("11111111-1111-4111-8111-111111111111");
+        assert!(!siblings_match(&foreign, &disk, &identity).unwrap());
+        assert!(
+            !siblings_match(
+                &good,
+                &info("22222222-2222-4222-8222-222222222222"),
+                &identity
+            )
+            .unwrap()
+        );
+        assert!(!siblings_match(&good[..4], &disk, &identity).unwrap());
+        let mut swapped = good.clone();
+        swapped.swap(0, 1);
+        assert!(!siblings_match(&swapped, &disk, &identity).unwrap());
+    }
+
+    #[test]
+    fn siblings_are_ordered_by_partition_number_and_scoped_to_one_disk() {
+        let list = plist(
+            "<key>AllDisksAndPartitions</key><array>\
+             <dict><key>DeviceIdentifier</key><string>disk4</string><key>Partitions</key><array>\
+             <dict><key>DeviceIdentifier</key><string>disk4s10</string></dict>\
+             <dict><key>DeviceIdentifier</key><string>disk4s2</string></dict>\
+             <dict><key>DeviceIdentifier</key><string>disk4s1</string></dict></array></dict>\
+             <dict><key>DeviceIdentifier</key><string>disk5</string><key>Partitions</key><array>\
+             <dict><key>DeviceIdentifier</key><string>disk5s1</string></dict></array></dict></array>",
+        );
+        assert_eq!(
+            sibling_ids(&list, "disk4").unwrap(),
+            ["disk4s1", "disk4s2", "disk4s10"]
+        );
+        assert_eq!(parent_disk("disk4s4").as_deref(), Some("disk4"));
+        assert_eq!(parent_disk("../s4"), None);
+        assert_eq!(parent_disk("disk4"), None);
     }
 }

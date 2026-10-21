@@ -1,3 +1,4 @@
+mod escrow_agent;
 mod escrow_commands;
 mod flow_commands;
 mod flow_runtime;
@@ -23,7 +24,11 @@ pub fn run() {
             std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             // Without a private registry the create flow refuses to write.
             if let Ok(state) = escrow_commands::EscrowCommandState::new(data) {
-                let state = state.with_native_escrow();
+                let state = match escrow_agent::NativeAgent::bundled() {
+                    Ok(agent) => state.with_native_escrow(std::sync::Arc::new(agent)),
+                    // Without the bundled purge agent retention is never offered.
+                    Err(_) => state,
+                };
                 let _ = state.purge();
                 app.manage(flow_commands::FlowCommandState::new(Box::new(
                     flow_runtime::NativeFlowRuntime::new(
@@ -330,6 +335,22 @@ async fn preview_update(device_id: String, app: tauri::AppHandle) -> Result<Writ
     .await
     .map_err(|_| "The update preview could not be prepared.".to_string())?
 }
+/// The registry key of a drive derives from its serial and model. If those
+/// differ from the recorded drive, the key record could not be reset after the
+/// erase, so the erase must not start.
+fn check_reset_target(
+    observation: &ais_host_core::device::DeviceObservation,
+    registered: &ais_host_core::update::InstalledImage,
+) -> Result<(), String> {
+    if ais_host_core::update::hardware_hint(observation) != registered.hardware_hint {
+        return Err(
+            "This drive's hardware no longer matches its local record. Storage was not reset."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Lost-key reset: zero the LUKS header area of a drive created here. No
 /// passphrase is needed (the key may be lost); the release recorded for the
 /// drive is re-fetched only as the trust anchor the helper re-verifies.
@@ -359,6 +380,7 @@ async fn preview_reset(device_id: String, app: tauri::AppHandle) -> Result<Write
             );
         }
         let (registered, status) = matches.into_iter().next().expect("one known drive");
+        check_reset_target(&snapshot.observation, &registered)?;
         if status == "updating" {
             return Err("Finish the interrupted image update before resetting storage.".into());
         }
@@ -2035,5 +2057,46 @@ mod confirmation_tests {
         let launcher = Recorder::default();
         assert!(launch_with(&session, &preview_id, &changed, now, true, &launcher).is_err());
         assert!(launcher.0.borrow().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reset_target_tests {
+    use super::check_reset_target;
+    use ais_host_core::{device::DeviceObservation, update::InstalledImage};
+
+    fn observation(serial: &str) -> DeviceObservation {
+        DeviceObservation {
+            os_identity: "SYNTHETIC_FIXTURE_OS_ID".into(),
+            connection_identity: "SYNTHETIC_FIXTURE_CONNECTION".into(),
+            display_identifier: "SYNTHETIC_FIXTURE_DISK".into(),
+            serial: Some(serial.into()),
+            model: Some("SYNTHETIC_FIXTURE_MODEL".into()),
+            capacity_bytes: 16_000_000_000,
+            sector_bytes: 512,
+            table_fingerprint: [0; 32],
+            ancestry_fingerprint: [0; 32],
+            mount_fingerprint: [0; 32],
+            external_usb: true,
+            internal: false,
+            system_backing: false,
+            ancestry_complete: true,
+            writable: true,
+        }
+    }
+
+    #[test]
+    fn reset_requires_the_recorded_hardware_so_the_key_record_can_be_reset() {
+        let original = observation("SYNTHETIC_FIXTURE_SERIAL_1");
+        let installed = InstalledImage {
+            identity: ais_host_core::drive_identity::DriveIdentity::fresh().unwrap(),
+            release_order: (1, 1),
+            tag: "live-v1".into(),
+            image_digest: [0; 32],
+            hardware_hint: ais_host_core::update::hardware_hint(&original),
+        };
+        assert!(check_reset_target(&original, &installed).is_ok());
+        let changed = observation("SYNTHETIC_FIXTURE_SERIAL_2");
+        assert!(check_reset_target(&changed, &installed).is_err());
     }
 }

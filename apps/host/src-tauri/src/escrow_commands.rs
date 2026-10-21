@@ -25,8 +25,15 @@ const NATIVE_ESCROW_PLATFORM: bool = cfg!(any(target_os = "linux", target_os = "
 
 /// Retain only when the platform backend is supported and currently usable;
 /// otherwise creation keeps a secret-free record and the passphrase is session-only.
-pub fn select_policy(platform_supported: bool, store_usable: bool, now: u64) -> EscrowPolicy {
-    if platform_supported && store_usable {
+/// `agent_registered` is true only when the expiry agent is installed, so a
+/// retained passphrase is always deleted on time even while the app is closed.
+pub fn select_policy(
+    platform_supported: bool,
+    store_usable: bool,
+    agent_registered: bool,
+    now: u64,
+) -> EscrowPolicy {
+    if platform_supported && store_usable && agent_registered {
         EscrowPolicy::Until(now.saturating_add(RETENTION_SECONDS))
     } else {
         EscrowPolicy::Disabled
@@ -38,6 +45,7 @@ pub struct EscrowCommandState {
     directory: PathBuf,
     clock: Arc<RetentionClock<SystemClock>>,
     native_escrow: bool,
+    agent: Option<Arc<dyn crate::escrow_agent::AgentInstaller>>,
 }
 
 impl EscrowCommandState {
@@ -48,12 +56,17 @@ impl EscrowCommandState {
             directory: native_directory,
             clock: Arc::new(RetentionClock::new(SystemClock::default())),
             native_escrow: false,
+            agent: None,
         })
     }
 
     /// Production only: tests and unsupported platforms never touch a credential store.
-    pub fn with_native_escrow(mut self) -> Self {
+    pub fn with_native_escrow(
+        mut self,
+        agent: Arc<dyn crate::escrow_agent::AgentInstaller>,
+    ) -> Self {
         self.native_escrow = NATIVE_ESCROW_PLATFORM;
+        self.agent = Some(agent);
         self
     }
 
@@ -96,10 +109,16 @@ impl EscrowCommandState {
     /// a secret-free drive record instead of failing the create flow.
     pub fn sink(&self) -> EscrowSink {
         let usable = self.native_escrow && NativeStore.availability().is_ok();
+        // Only installed (or re-checked) once retention would otherwise be used.
+        let registered = usable
+            && self
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.ensure_installed(&self.directory).is_ok());
         let now = SystemClock::default().wall_seconds();
         EscrowSink {
             state: self.clone(),
-            policy: select_policy(self.native_escrow, usable, now),
+            policy: select_policy(self.native_escrow, usable, registered, now),
         }
     }
 }
@@ -242,18 +261,51 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    struct FailingAgent;
+    impl crate::escrow_agent::AgentInstaller for FailingAgent {
+        fn ensure_installed(&self, _: &std::path::Path) -> Result<(), String> {
+            Err("no agent".into())
+        }
+    }
+
+    #[test]
+    fn an_agent_that_cannot_be_installed_disables_retention() {
+        let directory =
+            std::env::temp_dir().join(format!("ais-escrow-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let state = EscrowCommandState::new(directory.clone())
+            .unwrap()
+            .with_native_escrow(std::sync::Arc::new(FailingAgent));
+        // Whatever the credential store reports, a failed agent never yields Until.
+        assert_eq!(state.sink().policy, EscrowPolicy::Disabled);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[test]
     fn policy_retains_only_with_a_supported_usable_store() {
         let now = 1_000;
         assert_eq!(
-            select_policy(true, true, now),
+            select_policy(true, true, true, now),
             EscrowPolicy::Until(now + RETENTION_SECONDS)
         );
-        assert_eq!(select_policy(true, false, now), EscrowPolicy::Disabled);
-        assert_eq!(select_policy(false, true, now), EscrowPolicy::Disabled);
-        assert_eq!(select_policy(false, false, now), EscrowPolicy::Disabled);
+        for (platform, store, agent) in [
+            (true, false, true),
+            (false, true, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                select_policy(platform, store, agent, now),
+                EscrowPolicy::Disabled
+            );
+        }
         assert_eq!(
-            select_policy(true, true, u64::MAX),
+            select_policy(true, true, true, u64::MAX),
             EscrowPolicy::Until(u64::MAX)
         );
     }
@@ -271,7 +323,9 @@ mod tests {
         let state = EscrowCommandState::new(directory.clone()).unwrap();
         assert_eq!(state.sink().policy, EscrowPolicy::Disabled);
         assert_eq!(
-            state.with_native_escrow().native_escrow,
+            state
+                .with_native_escrow(std::sync::Arc::new(FailingAgent))
+                .native_escrow,
             cfg!(any(target_os = "linux", target_os = "macos"))
         );
         std::fs::remove_dir_all(&directory).unwrap();

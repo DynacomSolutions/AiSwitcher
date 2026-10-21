@@ -9,6 +9,8 @@ use std::{path::PathBuf, sync::Arc};
 /// that fails or panics still unmounts what it mounted.
 pub struct MountedVolume {
     pub path: PathBuf,
+    /// The verified, retained mount capability; closed before the release step.
+    held: Option<Box<dyn std::any::Any + Send>>,
     release: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -16,13 +18,21 @@ impl MountedVolume {
     pub fn new(path: PathBuf, release: impl FnOnce() + Send + 'static) -> Self {
         Self {
             path,
+            held: None,
             release: Some(Box::new(release)),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn hold(&mut self, path: PathBuf, root: impl std::any::Any + Send) {
+        self.path = path;
+        self.held = Some(Box::new(root));
     }
 }
 
 impl Drop for MountedVolume {
     fn drop(&mut self) {
+        self.held.take();
         if let Some(release) = self.release.take() {
             release();
         }
@@ -38,16 +48,54 @@ pub fn unavailable() -> LocateExchange {
     Arc::new(|_| Err("The drive's exchange volume is not available.".into()))
 }
 
+/// An owned hold on the session's media lock. A dedicated thread owns the
+/// guard (a std guard cannot outlive its borrow) until the lease is dropped.
+#[cfg(target_os = "linux")]
+pub struct MediaLease(Option<std::sync::mpsc::Sender<()>>);
+
+#[cfg(target_os = "linux")]
+impl MediaLease {
+    pub fn acquire(app: tauri::AppHandle) -> Result<Self, String> {
+        use tauri::Manager;
+        let (ready, wait) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let state = app.state::<crate::ConfirmationSession>();
+            match state.lock_media() {
+                Ok(_guard) => {
+                    let _ = ready.send(Ok(()));
+                    let _ = released.recv();
+                }
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                }
+            }
+        });
+        wait.recv()
+            .map_err(|_| "Drive access is unavailable.".to_string())??;
+        Ok(Self(Some(release)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MediaLease {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
 /// Linux: the same steps as an update. The connected disk is chosen by the
 /// registry's hardware hint, its GPT is read through the helper's read-only
 /// preview, and partition 4 is mounted through udisks and verified against the
 /// recorded partition identities.
 #[cfg(target_os = "linux")]
 pub fn native_locator(app: tauri::AppHandle) -> LocateExchange {
-    use tauri::Manager;
     Arc::new(move |installed| {
-        let state = app.state::<crate::ConfirmationSession>();
-        let _media = state.lock_media()?;
+        // Held until the volume is released, so an update write cannot start
+        // while the exchange is mounted.
+        let lease = MediaLease::acquire(app.clone())?;
         let mut matches = crate::native_devices().into_iter().filter(|device| {
             ais_host_core::update::hardware_hint(device) == installed.hardware_hint
         });
@@ -70,13 +118,14 @@ pub fn native_locator(app: tauri::AppHandle) -> LocateExchange {
             // The retained directory must be closed before the unmount.
             drop(root);
             let _ = crate::ExchangeVolume::unmount(&crate::UdisksVolume, &observation);
+            drop(lease);
         }))
     })
 }
 
 #[cfg(target_os = "macos")]
 pub fn native_locator(_app: tauri::AppHandle) -> LocateExchange {
-    Arc::new(|installed| crate::macos_volume::mount(&installed.identity.partitions[3]))
+    Arc::new(|installed| crate::macos_volume::mount(&installed.identity))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
