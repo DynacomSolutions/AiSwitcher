@@ -6,6 +6,9 @@
 //! identity: macOS mounts every volume, and the helper unmounts the whole disk
 //! itself before it opens the device.
 
+// The file-test build compiles this module on Linux for its parsing tests only.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 #[cfg(target_os = "macos")]
 use ais_host_core::device::WriteTarget;
 use ais_host_core::{device::DeviceObservation, release::sha256};
