@@ -12,7 +12,7 @@ pub struct ExchangeRoot {
 
 #[cfg(unix)]
 impl ExchangeRoot {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     fn open(path: &Path) -> Result<Self, String> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let file = std::fs::OpenOptions::new()
@@ -46,8 +46,7 @@ impl ExchangeRoot {
         Ok(root)
     }
 
-    /// macOS has no stable partition device number for a mounted volume, so
-    /// the retained directory must sit on an exFAT mount of the expected node.
+    /// The mount must be the exFAT filesystem of exactly this device node.
     #[cfg(target_os = "macos")]
     pub fn open_verified(path: &Path, device_node: &str) -> Result<Self, String> {
         use std::os::fd::AsRawFd;
@@ -55,17 +54,13 @@ impl ExchangeRoot {
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
         // SAFETY: stat is writable and initialised only after a successful call.
         if unsafe { libc::fstatfs(root.file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err("The retained exchange root is not the formatted partition.".into());
+            return Err("The retained exchange root cannot be inspected.".into());
         }
+        // SAFETY: fstatfs succeeded, and both names are NUL-terminated.
         let stat = unsafe { stat.assume_init() };
-        // SAFETY: the kernel fills both fields with NUL-terminated names.
-        let (kind, from) = unsafe {
-            (
-                std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()),
-                std::ffi::CStr::from_ptr(stat.f_mntfromname.as_ptr()),
-            )
-        };
-        if kind.to_bytes() != b"exfat" || from.to_bytes() != device_node.as_bytes() {
+        let filesystem = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
+        let source = unsafe { std::ffi::CStr::from_ptr(stat.f_mntfromname.as_ptr()) };
+        if filesystem.to_bytes() != b"exfat" || source.to_bytes() != device_node.as_bytes() {
             return Err("The retained exchange root is not the formatted partition.".into());
         }
         Ok(root)
@@ -144,7 +139,49 @@ impl ExchangeRoot {
             }
             Ok(names)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the duplicate is handed to the directory stream, which owns it.
+            let descriptor = unsafe { libc::dup(self.file.as_raw_fd()) };
+            if descriptor < 0 {
+                return Err("Cannot list retained inbox.".into());
+            }
+            // SAFETY: descriptor is a live directory descriptor owned here.
+            let stream = unsafe { libc::fdopendir(descriptor) };
+            if stream.is_null() {
+                // SAFETY: fdopendir failed, so the descriptor is still ours.
+                unsafe { libc::close(descriptor) };
+                return Err("Cannot list retained inbox.".into());
+            }
+            // SAFETY: the duplicate shares its offset with the retained directory.
+            unsafe { libc::rewinddir(stream) };
+            let mut names = Vec::new();
+            let result = loop {
+                // SAFETY: stream is open; the entry is read before the next call.
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    break Ok(());
+                }
+                // SAFETY: d_name is NUL-terminated within the entry.
+                let raw = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                let Ok(name) = raw.to_str() else {
+                    break Err("Invalid inbox filename.");
+                };
+                if name == "." || name == ".." {
+                    continue;
+                }
+                names.push(name.to_owned());
+                if names.len() > 50_000 {
+                    break Err("Too many inbox entries.");
+                }
+            };
+            // SAFETY: closes the stream and its duplicated descriptor.
+            unsafe { libc::closedir(stream) };
+            result?;
+            Ok(names)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Err("Image updates are unavailable on this platform.".into())
         }
@@ -220,7 +257,7 @@ impl ExchangeRoot {
     }
 
     pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), String> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         use std::os::fd::AsRawFd;
         let from = Self::component(from)?;
         let to = Self::component(to)?;
@@ -235,7 +272,18 @@ impl ExchangeRoot {
                 libc::RENAME_NOREPLACE,
             )
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        // SAFETY: both names are confined to the retained directory.
+        let result = unsafe {
+            libc::renameatx_np(
+                self.file.as_raw_fd(),
+                from.as_ptr(),
+                self.file.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let result = {
             let _ = (from, to);
             -1

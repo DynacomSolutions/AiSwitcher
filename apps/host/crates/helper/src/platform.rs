@@ -21,7 +21,14 @@ pub use linux::{
 };
 
 #[cfg(target_os = "macos")]
-pub use macos::{MacBlockTarget, collect_snapshot as collect_macos_snapshot};
+pub use macos::{
+    MacBlockTarget, collect_by_identity as collect_macos_by_identity,
+    collect_snapshot as collect_macos_snapshot, disk_identifier as macos_disk_identifier,
+    eject_disk as eject_macos_disk, list_eligible as list_macos_eligible,
+    mount_exchange as mount_macos_exchange, observe_unprivileged as observe_macos_unprivileged,
+    partition_node as macos_partition_node, unmount_slice as unmount_macos_slice,
+    update_snapshot as macos_update_snapshot, verify_connection as verify_macos_connection,
+};
 #[cfg(feature = "file-test")]
 pub use macos::{
     MacDiskObservation, MacDiskSnapshot, MacPartition, ObservationError as MacObservationError,

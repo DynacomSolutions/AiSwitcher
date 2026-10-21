@@ -1,5 +1,61 @@
 //! Privileged, one-request operation dispatch. This remains behind the
-//! authenticated Linux transport and a fixed executable entry point.
+//! authenticated native transport and a fixed executable entry point.
+
+#[cfg(target_os = "linux")]
+type NativeTarget = crate::platform::LinuxBlockTarget;
+#[cfg(target_os = "macos")]
+type NativeTarget = crate::platform::MacBlockTarget;
+
+/// The clock that bounds the original confirmation, including time asleep.
+#[cfg(target_os = "linux")]
+fn boottime_ns() -> Result<u64, crate::protocol::ProtocolError> {
+    crate::protocol::linux_transport::boottime_ns()
+}
+
+#[cfg(target_os = "macos")]
+fn boottime_ns() -> Result<u64, crate::protocol::ProtocolError> {
+    crate::protocol::macos_transport::boottime_ns()
+}
+
+/// Re-resolve the device from its identity alone; no client path is involved.
+#[cfg(target_os = "linux")]
+fn rediscover(identity: &str) -> Result<ais_host_core::device::DeviceObservation, &'static str> {
+    crate::platform::collect_linux_by_identity(identity)
+        .map(|discovered| discovered.observation)
+        .map_err(|_| "The native target could not be re-observed.")
+}
+
+#[cfg(target_os = "macos")]
+fn rediscover(identity: &str) -> Result<ais_host_core::device::DeviceObservation, &'static str> {
+    crate::platform::collect_macos_by_identity(identity)
+        .map(|discovered| discovered.observation)
+        .map_err(|_| "The native target could not be re-observed.")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_target(
+    channel: &crate::protocol::AuthenticatedChannel,
+    observation: &ais_host_core::device::DeviceObservation,
+) -> Result<NativeTarget, &'static str> {
+    NativeTarget::open_authenticated(channel, observation)
+        .map_err(|_| "The retained native target could not be opened safely.")
+}
+
+/// The new layout is only usable by the application once the kernel has
+/// re-read it; failure here does not undo the write but is reported.
+#[cfg(target_os = "linux")]
+fn finish_create(target: NativeTarget) -> Result<(), &'static str> {
+    target
+        .reread_partitions()
+        .map_err(|_| "The kernel could not re-read the new partition table.")
+}
+
+/// macOS re-probes the media when the last writer closes the raw device.
+#[cfg(target_os = "macos")]
+fn finish_create(target: NativeTarget) -> Result<(), &'static str> {
+    drop(target);
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 pub fn run_linux(socket: std::path::PathBuf, invoking_uid: u32) -> Result<(), &'static str> {
@@ -35,7 +91,7 @@ pub fn run_linux(socket: std::path::PathBuf, invoking_uid: u32) -> Result<(), &'
         crate::protocol::linux_transport::authenticate_one(stream, invoking_uid).map_err(
             |_| "The installed application or one-operation request could not be authenticated.",
         )?;
-    execute_linux(channel, request, sources)
+    execute(channel, request, sources)
 }
 
 /// Read-only privileged preview: report the disk, including its partition-table
@@ -54,8 +110,8 @@ pub fn preview_linux(identity: &str) -> Result<(), &'static str> {
         .map_err(|_| "The observation could not be reported.")
 }
 
-#[cfg(target_os = "linux")]
-fn execute_linux(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn execute(
     channel: crate::protocol::AuthenticatedChannel,
     request: crate::protocol::Request,
     sources: [std::fs::File; 3],
@@ -74,8 +130,7 @@ fn execute_linux(
         return Err("The authenticated application channel is invalid.");
     }
     if request.confirmation_deadline_boot_ns
-        <= crate::protocol::linux_transport::boottime_ns()
-            .map_err(|_| "The original confirmation has expired.")?
+        <= boottime_ns().map_err(|_| "The original confirmation has expired.")?
     {
         return Err("The original confirmation has expired.");
     }
@@ -147,24 +202,21 @@ fn execute_linux(
     let mut image = verifier
         .verify(&selection, downloaded)
         .map_err(|_| "The source image did not pass bundled trust verification.")?;
-    let discovered = crate::platform::collect_linux_by_identity(&request.device_identity)
-        .map_err(|_| "The native target could not be re-observed.")?;
-    let mut target =
-        crate::platform::LinuxBlockTarget::open_authenticated(&channel, &discovered.observation)
-            .map_err(|_| "The retained native target could not be opened safely.")?;
+    let observation = rediscover(&request.device_identity)?;
+    let mut target = open_target(&channel, &observation)?;
     let plan = match request.operation {
         crate::protocol::Operation::CreateLayout => WritePlan::create_drive_with_identity(
             &image,
-            discovered.observation.clone(),
+            observation.clone(),
             request.drive_identity.clone(),
         ),
         crate::protocol::Operation::ReplaceBase | crate::protocol::Operation::ResetPersist => {
             use ais_host_core::device::WriteTarget;
-            let snapshot = ais_host_core::update::DriveSnapshot::read(
-                discovered.observation.clone(),
-                |offset, bytes| target.read_at(offset, bytes),
-            )
-            .map_err(|_| "The installed GPT could not be re-observed.")?;
+            let snapshot =
+                ais_host_core::update::DriveSnapshot::read(observation.clone(), |offset, bytes| {
+                    target.read_at(offset, bytes)
+                })
+                .map_err(|_| "The installed GPT could not be re-observed.")?;
             let installed = request
                 .installed_image
                 .as_ref()
@@ -180,7 +232,7 @@ fn execute_linux(
     if hex(&plan.digest()) != request.plan_digest {
         return Err("The app and helper write plans do not match.");
     }
-    plan.revalidate(&discovered.observation, &image)
+    plan.revalidate(&observation, &image)
         .map_err(|_| "The native target changed during plan verification.")?;
 
     if request.operation != crate::protocol::Operation::CreateLayout {
@@ -202,16 +254,12 @@ fn execute_linux(
         &request.typed_confirmation,
         &mut exchange,
     )?;
-    // The new layout is only usable by the application once the kernel has
-    // re-read it; failure here does not undo the write but is reported.
-    target
-        .reread_partitions()
-        .map_err(|_| "The kernel could not re-read the new partition table.")
+    finish_create(target)
 }
 
 /// One confirmed create transaction on a retained target. Preparing exFAT must
 /// succeed before imaging; any subsequent failure leaves the drive incomplete.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn create_confirmed<T: ais_host_core::device::WriteTarget>(
     target: &mut T,
     deadline: u64,
@@ -228,7 +276,7 @@ pub fn create_confirmed<T: ais_host_core::device::WriteTarget>(
 /// Final stage shared by the production block device and loop-file tests. The
 /// helper issues its own ticket, capped by the app's original CLOCK_BOOTTIME
 /// deadline, and then hands the already-open target to the shared writer.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn write_confirmed<T: ais_host_core::device::WriteTarget>(
     target: T,
     deadline: u64,
@@ -239,8 +287,8 @@ pub fn write_confirmed<T: ais_host_core::device::WriteTarget>(
     use ais_host_core::device::{ConfirmationBook, write_image};
     use std::time::{Duration, Instant};
 
-    let now_boot = crate::protocol::linux_transport::boottime_ns()
-        .map_err(|_| "The original confirmation deadline could not be checked.")?;
+    let now_boot =
+        boottime_ns().map_err(|_| "The original confirmation deadline could not be checked.")?;
     let remaining = deadline
         .checked_sub(now_boot)
         .ok_or("The original confirmation has expired.")?;
@@ -265,20 +313,12 @@ pub fn write_confirmed<T: ais_host_core::device::WriteTarget>(
         .map_err(|_| "The shared writer refused the native operation.")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn seal_source_files(
     mut sources: [std::fs::File; 3],
     sizes: [u64; 3],
 ) -> Result<[std::fs::File; 3], &'static str> {
-    use std::{
-        io::{Read, Seek, SeekFrom, Write},
-        os::fd::{AsRawFd, FromRawFd},
-    };
-    unsafe extern "C" {
-        fn memfd_create(name: *const std::ffi::c_char, flags: u32) -> i32;
-        fn fcntl(fd: i32, command: i32, ...) -> i32;
-    }
-    let name = std::ffi::CString::new("ais-host-source").expect("static name");
+    use std::io::{Read, Seek, SeekFrom, Write};
     let mut sealed = Vec::with_capacity(3);
     for (source, size) in sources.iter_mut().zip(sizes) {
         let metadata = source
@@ -287,12 +327,7 @@ fn seal_source_files(
         if !metadata.is_file() || metadata.len() != size || size == 0 {
             return Err("A retained source does not match the published asset size.");
         }
-        let descriptor = unsafe { memfd_create(name.as_ptr(), 0x0001 | 0x0002) };
-        if descriptor < 0 {
-            return Err("A sealed source copy could not be created.");
-        }
-        // SAFETY: memfd_create returned a new owned descriptor.
-        let mut destination = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mut destination = anonymous_file()?;
         source
             .seek(SeekFrom::Start(0))
             .map_err(|_| "A retained source could not be rewound.")?;
@@ -317,17 +352,7 @@ fn seal_source_files(
         {
             return Err("A retained source changed while it was copied.");
         }
-        // F_ADD_SEALS, F_SEAL_SEAL|SHRINK|GROW|WRITE.
-        if unsafe {
-            fcntl(
-                destination.as_raw_fd(),
-                1033,
-                0x0001 | 0x0002 | 0x0004 | 0x0008,
-            )
-        } != 0
-        {
-            return Err("A sealed source copy could not be made immutable.");
-        }
+        seal_file(&destination)?;
         destination
             .seek(SeekFrom::Start(0))
             .map_err(|_| "A sealed source could not be rewound.")?;
@@ -339,25 +364,76 @@ fn seal_source_files(
 }
 
 #[cfg(target_os = "linux")]
+fn anonymous_file() -> Result<std::fs::File, &'static str> {
+    use std::os::fd::FromRawFd;
+    unsafe extern "C" {
+        fn memfd_create(name: *const std::ffi::c_char, flags: u32) -> i32;
+    }
+    let name = std::ffi::CString::new("ais-host-source").expect("static name");
+    let descriptor = unsafe { memfd_create(name.as_ptr(), 0x0001 | 0x0002) };
+    if descriptor < 0 {
+        return Err("A sealed source copy could not be created.");
+    }
+    // SAFETY: memfd_create returned a new owned descriptor.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(target_os = "linux")]
+fn seal_file(file: &std::fs::File) -> Result<(), &'static str> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, command: i32, ...) -> i32;
+    }
+    // F_ADD_SEALS, F_SEAL_SEAL|SHRINK|GROW|WRITE.
+    if unsafe { fcntl(file.as_raw_fd(), 1033, 0x0001 | 0x0002 | 0x0004 | 0x0008) } != 0 {
+        return Err("A sealed source copy could not be made immutable.");
+    }
+    Ok(())
+}
+
+/// A file in root's own directory that is unlinked at once. Nobody else can
+/// name it again, and this process never writes to it after the copy.
+#[cfg(target_os = "macos")]
+fn anonymous_file() -> Result<std::fs::File, &'static str> {
+    use std::os::fd::FromRawFd;
+    let mut template = *b"/private/var/root/.ais-host-source-XXXXXX\0";
+    // SAFETY: the template is a writable NUL-terminated string.
+    let descriptor = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+    if descriptor < 0 {
+        return Err("A sealed source copy could not be created.");
+    }
+    // SAFETY: mkstemp returned a new owned descriptor; the name is ours.
+    unsafe {
+        libc::unlink(template.as_ptr().cast());
+        libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC);
+        Ok(std::fs::File::from_raw_fd(descriptor))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn seal_file(_: &std::fs::File) -> Result<(), &'static str> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct BootDeadlineTarget<T> {
     target: T,
     deadline: u64,
     first_write_pending: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<T: std::io::Read> std::io::Read for BootDeadlineTarget<T> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.target.read(buffer)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<T: std::io::Write> std::io::Write for BootDeadlineTarget<T> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if self.first_write_pending {
-            if crate::protocol::linux_transport::boottime_ns()
-                .map_err(|_| std::io::Error::other("clock unavailable"))?
+            if boottime_ns().map_err(|_| std::io::Error::other("clock unavailable"))?
                 >= self.deadline
             {
                 return Err(std::io::Error::new(
@@ -378,14 +454,14 @@ impl<T: std::io::Write> std::io::Write for BootDeadlineTarget<T> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<T: std::io::Seek> std::io::Seek for BootDeadlineTarget<T> {
     fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
         self.target.seek(position)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<T: ais_host_core::device::WriteTarget> ais_host_core::device::WriteTarget
     for BootDeadlineTarget<T>
 {
@@ -407,6 +483,57 @@ impl<T: ais_host_core::device::WriteTarget> ais_host_core::device::WriteTarget
 pub fn preview_update_linux(identity: &str) -> Result<(), &'static str> {
     use std::io::Write;
     let snapshot = crate::platform::linux_update_snapshot(identity)
+        .map_err(|_| "The drive could not be observed.")?;
+    let mut line =
+        serde_json::to_vec(&snapshot).map_err(|_| "The preview could not be encoded.")?;
+    line.push(b'\n');
+    std::io::stdout()
+        .write_all(&line)
+        .map_err(|_| "The preview could not be reported.")
+}
+
+/// The macOS helper, started as root by the administrator prompt. It listens
+/// for the one application the prompt was started from and then runs exactly
+/// one request, like the Linux helper.
+#[cfg(target_os = "macos")]
+pub fn run_macos(
+    socket: std::path::PathBuf,
+    invoking_uid: u32,
+    team: &str,
+) -> Result<(), &'static str> {
+    use crate::protocol::macos_transport as transport;
+    // SAFETY: geteuid has no arguments and returns the effective uid.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("The privileged helper invocation is invalid.");
+    }
+    let listener = transport::listen_as(&socket, invoking_uid)
+        .map_err(|_| "The private helper channel is unavailable.")?;
+    let authenticated = transport::authenticate_one(&listener.listener, invoking_uid, team)
+        .map_err(
+            |_| "The installed application or one-operation request could not be authenticated.",
+        );
+    drop(listener);
+    let (channel, request, sources) = authenticated?;
+    execute(channel, request, sources)
+}
+
+#[cfg(target_os = "macos")]
+pub fn preview_macos(identity: &str) -> Result<(), &'static str> {
+    use std::io::Write;
+    let observed = crate::platform::collect_macos_by_identity(identity)
+        .map_err(|_| "The native target could not be observed.")?;
+    let mut line = serde_json::to_vec(&observed.observation)
+        .map_err(|_| "The observation could not be encoded.")?;
+    line.push(b'\n');
+    std::io::stdout()
+        .write_all(&line)
+        .map_err(|_| "The observation could not be reported.")
+}
+
+#[cfg(target_os = "macos")]
+pub fn preview_update_macos(identity: &str) -> Result<(), &'static str> {
+    use std::io::Write;
+    let snapshot = crate::platform::macos_update_snapshot(identity)
         .map_err(|_| "The drive could not be observed.")?;
     let mut line =
         serde_json::to_vec(&snapshot).map_err(|_| "The preview could not be encoded.")?;

@@ -147,7 +147,15 @@ fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
         .collect()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
+    ais_host_helper::platform::list_macos_eligible()
+        .into_iter()
+        .map(|disk| disk.observation)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn native_devices() -> Vec<ais_host_core::device::DeviceObservation> {
     Vec::new()
 }
@@ -455,7 +463,12 @@ fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapsho
     ais_host_helper::protocol::linux_transport::preview_update(id)
         .map_err(|error| error.to_string())
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn preview_update_native(id: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
+    ais_host_helper::protocol::macos_transport::preview_update(id)
+        .map_err(|error| error.to_string())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn preview_update_native(_: &str) -> Result<ais_host_core::update::DriveSnapshot, String> {
     Err("Image updates are unavailable on this platform.".into())
 }
@@ -1169,7 +1182,15 @@ fn deadline_boot_ns(remaining: std::time::Duration) -> Result<u64, String> {
     Ok(now + remaining)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn deadline_boot_ns(remaining: std::time::Duration) -> Result<u64, String> {
+    let now = ais_host_helper::protocol::macos_transport::boottime_ns()
+        .map_err(|_| "The boot clock is unavailable.")?;
+    let remaining = u64::try_from(remaining.as_nanos()).map_err(|_| "Invalid expiry.")?;
+    Ok(now + remaining)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn deadline_boot_ns(_remaining: std::time::Duration) -> Result<u64, String> {
     Err("This operating system has no enabled authenticated helper.".to_string())
 }
@@ -1183,7 +1204,7 @@ trait HelperLauncher {
     ) -> Result<(), String>;
 }
 
-/// The installed per-OS helper. Only Linux has an authenticated transport.
+/// The installed per-OS helper. Linux and macOS have authenticated transports.
 struct NativeHelper;
 
 impl HelperLauncher for NativeHelper {
@@ -1202,7 +1223,22 @@ impl HelperLauncher for NativeHelper {
         .map_err(|error| error.to_string())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn launch(
+        &self,
+        request: ais_host_helper::protocol::Request,
+        sources: &[std::fs::File; 3],
+    ) -> Result<(), String> {
+        let uid = ais_host_helper::protocol::macos_transport::current_uid();
+        ais_host_helper::protocol::macos_transport::run_session(
+            uid,
+            [&sources[0], &sources[1], &sources[2]],
+            request,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn launch(
         &self,
         _request: ais_host_helper::protocol::Request,
@@ -1218,18 +1254,22 @@ fn native_write_support() -> ais_host_core::device::WriteSupport {
     let key_present = ais_host_core::release::ImageVerifier::bundled().is_ok();
     #[cfg(target_os = "linux")]
     let helper = ais_host_helper::protocol::linux_transport::helper_installed();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let helper = ais_host_helper::protocol::macos_transport::helper_installed();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let helper = false;
+    let missing_helper = if cfg!(target_os = "macos") {
+        "Writing needs the signed, notarised application with its bundled helper; this build is unsigned or a development build."
+    } else {
+        "The ais host helper package is not installed or does not verify."
+    };
     let (enabled, reason) = match (key_present, helper) {
         (true, true) => (true, "Ready."),
         (false, _) => (
             false,
             "The production image signing key is not bundled in this build.",
         ),
-        (_, false) => (
-            false,
-            "The ais host helper package is not installed or does not verify.",
-        ),
+        (_, false) => (false, missing_helper),
     };
     ais_host_core::device::WriteSupport { enabled, reason }
 }
@@ -1242,7 +1282,15 @@ fn observe_native(
         .map_err(|_| "The selected device is unavailable.".to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn observe_native(
+    approved: &ais_host_core::device::DeviceObservation,
+) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::platform::observe_macos_unprivileged(approved)
+        .map_err(|_| "The selected device is unavailable.".to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn observe_native(
     _approved: &ais_host_core::device::DeviceObservation,
 ) -> Result<ais_host_core::device::DeviceObservation, String> {
@@ -1255,7 +1303,13 @@ fn preview_native(identity: &str) -> Result<ais_host_core::device::DeviceObserva
         .map_err(|error| error.to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn preview_native(identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
+    ais_host_helper::protocol::macos_transport::preview_observation(identity)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn preview_native(_identity: &str) -> Result<ais_host_core::device::DeviceObservation, String> {
     Err(ais_host_helper::platform::unavailable_reason().to_string())
 }
@@ -1517,7 +1571,63 @@ impl ExchangeVolume for UdisksVolume {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+impl UdisksVolume {
+    fn disk(device: &ais_host_core::device::DeviceObservation) -> Result<String, String> {
+        ais_host_helper::platform::verify_macos_connection(device)
+            .map_err(|_| "The drive connection changed.".to_string())?;
+        ais_host_helper::platform::macos_disk_identifier(&device.os_identity)
+            .map(str::to_owned)
+            .map_err(|_| "The drive is unavailable.".to_string())
+    }
+}
+
+// The name is historical: on macOS the same seam is served by diskutil, which
+// authorises external media for the active user without elevation.
+#[cfg(target_os = "macos")]
+impl ExchangeVolume for UdisksVolume {
+    fn mount_parts(
+        &self,
+        device: &ais_host_core::device::DeviceObservation,
+        range: ais_host_core::device::ByteRange,
+        identity: &ais_host_core::drive_identity::DriveIdentity,
+    ) -> Result<ais_host_core::exchange_root::ExchangeRoot, String> {
+        let disk = Self::disk(device)?;
+        let (node, path) = ais_host_helper::platform::mount_macos_exchange(
+            &disk,
+            range.length,
+            range.start,
+            &identity.partitions[3],
+        )
+        .map_err(|_| "The exchange partition could not be mounted.".to_string())?;
+        let retained = Self::disk(device)
+            .and_then(|_| ais_host_core::exchange_root::ExchangeRoot::open_verified(&path, &node));
+        if retained.is_err() {
+            // Never leave a failed inspection mounted and hidden from the
+            // next eligible-drive scan.
+            let _ = self.unmount(device);
+        }
+        retained
+    }
+
+    fn unmount(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        let disk = Self::disk(device)?;
+        ais_host_helper::platform::unmount_macos_slice(
+            &ais_host_helper::platform::macos_partition_node(&disk, 4),
+        )
+        .map_err(|_| "The exchange partition could not be unmounted.".to_string())?;
+        Self::disk(device).map(|_| ())
+    }
+
+    fn eject(&self, device: &ais_host_core::device::DeviceObservation) -> Result<(), String> {
+        let disk = Self::disk(device)?;
+        self.unmount(device)?;
+        ais_host_helper::platform::eject_macos_disk(&disk)
+            .map_err(|_| "The drive could not be ejected.".to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl ExchangeVolume for UdisksVolume {
     fn mount_parts(
         &self,
