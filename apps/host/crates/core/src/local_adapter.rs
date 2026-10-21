@@ -164,7 +164,7 @@ type Resolver = Box<dyn FnMut(&HostTarget) -> Result<HostSource, String> + Send>
 pub struct ProcessHostAdapter {
     resolve: Resolver,
     ssh: String,
-    ais: String,
+    ais: Option<String>,
     timeout: Duration,
 }
 
@@ -175,9 +175,16 @@ impl ProcessHostAdapter {
         Self {
             resolve: Box::new(resolve),
             ssh: "ssh".into(),
-            ais: "ais".into(),
+            ais: Some("ais".into()),
             timeout: Duration::from_secs(120),
         }
+    }
+
+    /// The program for this computer, or None when `ais` is not installed.
+    /// Remote hosts are unaffected: they resolve `ais` in their own login shell.
+    pub fn with_local_program(mut self, program: Option<String>) -> Self {
+        self.ais = program;
+        self
     }
 
     fn call(
@@ -188,7 +195,13 @@ impl ProcessHostAdapter {
     ) -> Result<Vec<u8>, String> {
         let fail = || "the host adapter failed".to_string();
         let source = (self.resolve)(target)?;
-        let argv = host_argv(&source, &self.ssh, &self.ais)?;
+        let ais = match (&source, &self.ais) {
+            (HostSource::Local, None) => {
+                return Err("ais is not installed for this user; install it and try again.".into());
+            }
+            (_, ais) => ais.as_deref().unwrap_or("ais"),
+        };
+        let argv = host_argv(&source, &self.ssh, ais)?;
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::piped())
@@ -273,6 +286,17 @@ mod tests {
         assert_eq!(
             host_argv(&HostSource::Local, "ssh", "ais").unwrap(),
             ["ais", "host", "--stdio"]
+        );
+    }
+
+    #[test]
+    fn a_missing_local_program_is_a_fixed_error_but_ssh_is_unaffected() {
+        let mut adapter =
+            ProcessHostAdapter::new(|_| Ok(HostSource::Local)).with_local_program(None);
+        let target = HostTarget::new("local").unwrap();
+        assert_eq!(
+            adapter.export_snapshot(&target).unwrap_err(),
+            "ais is not installed for this user; install it and try again."
         );
     }
 

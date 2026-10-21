@@ -52,6 +52,9 @@ pub trait FlowRuntime: Send {
     fn removal_backend(&mut self, drive: &DriveBinding) -> Result<Box<dyn RemovalBackend>, String>;
     fn freshness(&self) -> FreshnessPolicy;
     fn created_at(&self) -> String;
+    /// Called after every command, success or failure: unmount anything the
+    /// command mounted. Previews hold no handle to a mounted volume.
+    fn release(&mut self) {}
 }
 
 #[derive(Clone)]
@@ -109,7 +112,9 @@ impl FlowCommandState {
         let state = self.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut session = state.0.lock().map_err(|_| "Flow session is unavailable.")?;
-            action(&mut session)
+            let result = action(&mut session);
+            session.runtime.release();
+            result
         })
         .await
         .map_err(|_| "Flow operation did not complete.".to_string())?

@@ -1,6 +1,9 @@
 mod escrow_commands;
 mod flow_commands;
 mod flow_runtime;
+mod flow_volume;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macos_volume;
 
 use std::time::Instant;
 use tauri::Manager;
@@ -23,7 +26,10 @@ pub fn run() {
                 let state = state.with_native_escrow();
                 let _ = state.purge();
                 app.manage(flow_commands::FlowCommandState::new(Box::new(
-                    flow_runtime::NativeFlowRuntime::new(state.clone()),
+                    flow_runtime::NativeFlowRuntime::new(
+                        state.clone(),
+                        flow_volume::native_locator(app.handle().clone()),
+                    ),
                 )));
                 app.manage(state);
             }
@@ -779,8 +785,10 @@ impl ConfirmationSession {
         let not_ready = |_: String| {
             "The drive was written, but its configuration could not be published and verified. Create the drive again.".to_string()
         };
+        let handle = drive_handle(&current.plan)?;
         let publication = (|| {
             inbox.publish(&exchange)?;
+            ais_host_core::publish::publish_identity(&exchange, &handle)?;
             if let Some(model) = model_snapshot.as_mut() {
                 ais_host_core::publish::publish_model(&exchange, model)?;
             }
@@ -798,7 +806,6 @@ impl ConfirmationSession {
                 .to_string()
         })?;
         // The one hand-off to key escrow; creation itself keeps no passphrase.
-        let handle = drive_handle(&current.plan)?;
         env.sink.hand_over(&create.passphrase, &handle)?;
         let installed = ais_host_core::update::InstalledImage::new(
             &current.image,

@@ -140,7 +140,13 @@ impl PassphraseSink for EscrowSink {
         let secret = matches!(self.policy, EscrowPolicy::Until(_))
             .then(|| SecretString::from(passphrase.expose().to_owned()));
         EscrowService::new(&mut NativeStore, &mut registry, &self.state.clock)
-            .create_drive(drive_id, self.policy, Vec::new(), secret.as_ref())
+            .create_drive(
+                drive_id,
+                self.policy,
+                // Logs pull to the install that created the drive unless another receiver is chosen.
+                vec![crate::flow_runtime::LOCAL_TARGET.to_owned()],
+                secret.as_ref(),
+            )
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -213,6 +219,7 @@ mod tests {
         let record = data.record("synthetic-drive-1").unwrap();
         assert!(record.item().is_none());
         assert_eq!(record.retention(), EscrowPolicy::Disabled);
+        assert_eq!(record.source_references(), ["local"]);
         assert!(record.created_here());
         // A second hand-over for the same drive is refused rather than replaced.
         drop(registry);

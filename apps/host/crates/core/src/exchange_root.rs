@@ -46,6 +46,31 @@ impl ExchangeRoot {
         Ok(root)
     }
 
+    /// macOS has no stable partition device number for a mounted volume, so
+    /// the retained directory must sit on an exFAT mount of the expected node.
+    #[cfg(target_os = "macos")]
+    pub fn open_verified(path: &Path, device_node: &str) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+        let root = Self::open(path)?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: stat is writable and initialised only after a successful call.
+        if unsafe { libc::fstatfs(root.file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err("The retained exchange root is not the formatted partition.".into());
+        }
+        let stat = unsafe { stat.assume_init() };
+        // SAFETY: the kernel fills both fields with NUL-terminated names.
+        let (kind, from) = unsafe {
+            (
+                std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()),
+                std::ffi::CStr::from_ptr(stat.f_mntfromname.as_ptr()),
+            )
+        };
+        if kind.to_bytes() != b"exfat" || from.to_bytes() != device_node.as_bytes() {
+            return Err("The retained exchange root is not the formatted partition.".into());
+        }
+        Ok(root)
+    }
+
     #[cfg(any(test, feature = "file-test"))]
     pub fn test_directory(path: &Path) -> Result<Self, String> {
         Self::open(path)
@@ -276,6 +301,10 @@ impl ExchangeRoot {
 }
 
 impl ExchangeRoot {
+    /// The kernel-reported mount point this capability was opened on.
+    pub fn mount_path(&self) -> &std::path::Path {
+        &self.path
+    }
     pub(crate) fn sync(&self) -> Result<(), String> {
         self.file
             .sync_all()

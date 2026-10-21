@@ -5,6 +5,7 @@
 use crate::{
     escrow_commands::EscrowCommandState,
     flow_commands::{FlowRuntime, FlowTarget},
+    flow_volume::{LocateExchange, MountedVolume},
 };
 use ais_host_core::{
     escrow::{EscrowService, native::NativeStore},
@@ -18,22 +19,14 @@ use ais_host_core::{
     remove::{RemovalBackend, forget_drive_record},
     revocation::{CredentialScope, RevocationBackend},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 pub const LOCAL_TARGET: &str = "local";
 const SSH_PREFIX: &str = "ssh-";
 const MAX_OUTBOX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
-
-/// Resolves the mounted exchange volume and its public identity manifest for a
-/// drive. Neither the renderer nor the registry supplies a path.
-pub type LocateExchange = fn(&DriveBinding) -> Result<(PathBuf, String), String>;
-
-/// shortcut: volume discovery is not implemented, because creation does not yet
-/// write the public identity manifest this lookup would read; wire it up with
-/// that manifest (and a mount lookup) rather than guessing a location.
-pub fn exchange_volume_unavailable(_: &DriveBinding) -> Result<(PathBuf, String), String> {
-    Err("The drive's exchange volume is not available.".into())
-}
 
 fn hex_encode(text: &str) -> String {
     text.bytes().map(|b| format!("{b:02x}")).collect()
@@ -108,26 +101,83 @@ fn current_source(handle: &str) -> Result<HostSource, String> {
     resolve_source(handle, &remotes)
 }
 
+/// `ais` for this computer: the bundled adapter beside the app, then the
+/// installer's `~/.local/bin/ais` (a GUI app on macOS has a minimal PATH),
+/// then PATH. Remote hosts resolve it themselves, as src/host/remote.ts does.
+pub fn resolve_local_ais(
+    bundled: Option<PathBuf>,
+    home: Option<PathBuf>,
+    path: Option<std::ffi::OsString>,
+) -> Option<String> {
+    let name = if cfg!(windows) { "ais.exe" } else { "ais" };
+    bundled
+        .into_iter()
+        .chain(home.map(|home| home.join(".local/bin").join(name)))
+        .chain(std::env::split_paths(&path.unwrap_or_default()).map(|dir| dir.join(name)))
+        .find(|candidate| candidate.is_absolute() && candidate.is_file())
+        .map(|found| found.to_string_lossy().into_owned())
+}
+
+fn local_ais() -> Option<String> {
+    let adapter = if cfg!(windows) {
+        "ais-host-adapter.exe"
+    } else {
+        "ais-host-adapter"
+    };
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(adapter)));
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    resolve_local_ais(bundled, home.map(PathBuf::from), std::env::var_os("PATH"))
+}
+
 fn process_adapter() -> ProcessHostAdapter {
     ProcessHostAdapter::new(|target: &HostTarget| current_source(target.handle()))
+        .with_local_program(local_ais())
 }
 
 #[derive(Clone)]
 struct Parts {
     escrow: EscrowCommandState,
     locate: LocateExchange,
+    mounted: Arc<Mutex<Vec<MountedVolume>>>,
 }
 
 impl Parts {
     fn open_exchange(&self, drive: &DriveBinding) -> Result<MountedExchange, String> {
-        let (mount, manifest) = (self.locate)(drive)?;
         let mut registry = FileRegistry::open(self.escrow.directory())
             .map_err(|_| "The private drive registry is unavailable.".to_string())?;
+        let installed = registry
+            .load()
+            .map_err(|_| "The private drive registry is unavailable.".to_string())?
+            .record(drive.drive_id())
+            .and_then(|record| record.installed_image().cloned())
+            .ok_or("This drive was not created on this computer.")?;
+        // The passphrase is fetched before anything is mounted.
         let passphrase = EscrowService::new(&mut NativeStore, &mut registry, self.escrow.clock())
             .retrieve(drive.drive_id())
             .map_err(|error| error.to_string())?;
         drop(registry);
-        MountedExchange::open(mount, &manifest, drive.clone(), passphrase)
+        let volume = (self.locate)(&installed)?;
+        let exchange = MountedExchange::open(
+            volume.path.clone(),
+            ais_host_core::publish::IDENTITY_MANIFEST,
+            drive.clone(),
+            passphrase,
+        );
+        // A failed open drops (and so unmounts) the volume; a good one waits for release.
+        let exchange = exchange?;
+        self.mounted
+            .lock()
+            .map_err(|_| "The exchange volume is unavailable.".to_string())?
+            .push(volume);
+        Ok(exchange)
+    }
+
+    fn release(&self) {
+        if let Ok(mut mounted) = self.mounted.lock() {
+            mounted.clear();
+        }
     }
 
     fn receiver(&self, drive: &DriveBinding) -> Result<HostTarget, String> {
@@ -141,7 +191,9 @@ impl Parts {
             .map(|record| record.source_references())
         {
             Some([only]) => HostTarget::new(only.as_str()),
-            _ => Err("No log receiver was selected for this drive.".into()),
+            // Drives without a selected receiver pull to this computer.
+            Some([]) => HostTarget::new(LOCAL_TARGET),
+            _ => Err("The log receiver for this drive is not unique.".into()),
         }
     }
 }
@@ -152,13 +204,13 @@ pub struct NativeFlowRuntime {
 }
 
 impl NativeFlowRuntime {
-    pub fn new(escrow: EscrowCommandState) -> Self {
-        Self::with_locator(escrow, exchange_volume_unavailable)
-    }
-
-    pub fn with_locator(escrow: EscrowCommandState, locate: LocateExchange) -> Self {
+    pub fn new(escrow: EscrowCommandState, locate: LocateExchange) -> Self {
         Self {
-            parts: Parts { escrow, locate },
+            parts: Parts {
+                escrow,
+                locate,
+                mounted: Arc::default(),
+            },
             adapter: process_adapter(),
         }
     }
@@ -220,7 +272,13 @@ impl FlowRuntime for NativeFlowRuntime {
     }
 
     fn adapter(&mut self) -> &mut dyn HostAdapter {
+        // Rebuilt so an `ais` installed while the app runs is found.
+        self.adapter = process_adapter();
         &mut self.adapter
+    }
+
+    fn release(&mut self) {
+        self.parts.release();
     }
 
     fn removal_backend(&mut self, _: &DriveBinding) -> Result<Box<dyn RemovalBackend>, String> {
@@ -348,18 +406,66 @@ mod tests {
             "synthetic-drive-1",
         )
         .unwrap();
-        let mut runtime = NativeFlowRuntime::new(escrow);
+        let mut runtime = NativeFlowRuntime::new(escrow, crate::flow_volume::unavailable());
         let drive = runtime.resolve_drive("synthetic-drive-1").unwrap();
         assert_eq!(
             (drive.drive_id(), drive.generation()),
             ("synthetic-drive-1", 1)
         );
         assert!(runtime.resolve_drive("synthetic-drive-2").is_err());
-        // With no mounted volume the exchange stays closed with a fixed message.
+        // Without a retained passphrase nothing is located or mounted.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        runtime.parts.locate = Arc::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("The drive's exchange volume is not available.".into())
+        });
+        assert!(runtime.open_exchange(&drive).is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The record from this test has no installed image, so it cannot be located either.
         assert_eq!(
             runtime.open_exchange(&drive).err().unwrap(),
-            "The drive's exchange volume is not available."
+            "This drive was not created on this computer."
         );
+        // Drives created without a chosen receiver default to this computer.
+        assert_eq!(runtime.parts.receiver(&drive).unwrap().handle(), "local");
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn local_ais_prefers_the_bundled_adapter_then_the_installer_path_then_path() {
+        let root = std::env::temp_dir().join(format!("ais-flow-ais-{}", std::process::id()));
+        let (bundled, home, other) = (root.join("app"), root.join("home"), root.join("bin"));
+        for dir in [&bundled, &home.join(".local/bin"), &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let name = if cfg!(windows) { "ais.exe" } else { "ais" };
+        let (a, h, o) = (
+            bundled.join(name),
+            home.join(".local/bin").join(name),
+            other.join(name),
+        );
+        let path = Some(other.clone().into_os_string());
+        assert_eq!(
+            resolve_local_ais(Some(a.clone()), Some(home.clone()), path.clone()),
+            None
+        );
+        std::fs::write(&o, b"").unwrap();
+        assert_eq!(
+            resolve_local_ais(Some(a.clone()), Some(home.clone()), path.clone()),
+            Some(o.to_string_lossy().into())
+        );
+        std::fs::write(&h, b"").unwrap();
+        assert_eq!(
+            resolve_local_ais(Some(a.clone()), Some(home.clone()), path.clone()),
+            Some(h.to_string_lossy().into())
+        );
+        std::fs::write(&a, b"").unwrap();
+        assert_eq!(
+            resolve_local_ais(Some(a.clone()), Some(home), path),
+            Some(a.to_string_lossy().into())
+        );
+        assert_eq!(resolve_local_ais(None, None, Some("relative".into())), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
