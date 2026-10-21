@@ -115,7 +115,46 @@ pub fn snapshot_model(model: &mut VerifiedModel) -> Result<ModelSnapshot, String
             file,
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::FromRawFd;
+        // No memfd or seals here: the copy lives in an exclusively created file
+        // in the user's private temporary directory whose name is removed at
+        // once, so no other process can open it again.
+        let mut template = std::env::temp_dir()
+            .join("ais-model-snapshot-XXXXXX")
+            .into_os_string()
+            .into_encoded_bytes();
+        template.push(0);
+        // SAFETY: the template is a writable NUL-terminated string.
+        let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+        if fd < 0 {
+            return Err("Cannot create the private model snapshot.".into());
+        }
+        // SAFETY: mkstemp returned a new owned descriptor; the name is ours.
+        let mut file = unsafe {
+            libc::unlink(template.as_ptr().cast());
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            File::from_raw_fd(fd)
+        };
+        model.file.rewind().map_err(|_| "Cannot read the model.")?;
+        let limit = model
+            .entry
+            .size_bytes
+            .checked_add(1)
+            .ok_or("Invalid model size.")?;
+        let copied = std::io::copy(&mut (&mut model.file).take(limit), &mut file)
+            .map_err(|_| "Cannot snapshot the model.")?;
+        if copied != model.entry.size_bytes {
+            return Err("The model size changed.".into());
+        }
+        verify_file(&mut file, &model.entry)?;
+        Ok(ModelSnapshot {
+            entry: model.entry.clone(),
+            file,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = model;
         Err("Immutable model snapshots are unavailable on this platform.".into())

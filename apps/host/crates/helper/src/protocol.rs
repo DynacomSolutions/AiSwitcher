@@ -93,9 +93,46 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, ProtocolError> {
     Ok(request)
 }
 
-/// No public constructor. Only the Linux transport may establish this proof
-/// after checking peer credentials, the installed client pin and one request.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn operation_binding(challenge: &[u8; 32], request: &Request) -> [u8; 32] {
+    fn append_field(output: &mut Vec<u8>, value: &[u8]) {
+        output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        output.extend_from_slice(value);
+    }
+    let operation = match request.operation {
+        Operation::CreateLayout => 1u32,
+        Operation::ReplaceBase => 2u32,
+        Operation::ResetPersist => 3u32,
+    };
+    let release = serde_json::to_vec(&request.release).unwrap_or_default();
+    let mut binding = Vec::with_capacity(1024);
+    append_field(&mut binding, b"AIS-HOST-HELPER-OPERATION-V1");
+    append_field(&mut binding, challenge);
+    append_field(&mut binding, &request.version.to_be_bytes());
+    append_field(&mut binding, &operation.to_be_bytes());
+    append_field(&mut binding, request.plan_digest.as_bytes());
+    append_field(&mut binding, request.ticket.as_bytes());
+    append_field(
+        &mut binding,
+        &request.confirmation_deadline_boot_ns.to_be_bytes(),
+    );
+    append_field(&mut binding, request.device_identity.as_bytes());
+    append_field(&mut binding, request.typed_confirmation.as_bytes());
+    append_field(&mut binding, &release);
+    append_field(
+        &mut binding,
+        &serde_json::to_vec(&request.drive_identity).unwrap_or_default(),
+    );
+    append_field(
+        &mut binding,
+        &serde_json::to_vec(&request.installed_image).unwrap_or_default(),
+    );
+    ais_host_core::release::sha256(&binding)
+}
+
+/// No public constructor. Only an authenticated native transport may establish this proof
+/// after checking peer credentials, the client pin and one request.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub struct AuthenticatedChannel {
     pub(crate) peer_pid: u32,
     pub(crate) peer_uid: u32,
@@ -103,12 +140,22 @@ pub struct AuthenticatedChannel {
     pub(crate) _single_use: (),
     #[cfg(target_os = "linux")]
     pub(crate) executable: std::fs::File,
+    /// Audit token of the authenticated peer; its pid version changes on exec.
+    #[cfg(target_os = "macos")]
+    pub(crate) peer_token: [u8; 32],
+    #[cfg(target_os = "macos")]
+    pub(crate) team: String,
 }
 
 impl AuthenticatedChannel {
     #[cfg(target_os = "linux")]
     pub(crate) fn revalidate_sender(&self) -> Result<(), ProtocolError> {
         linux_transport::verify_pid_executable(self.peer_pid, &self.executable)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn revalidate_sender(&self) -> Result<(), ProtocolError> {
+        macos_transport::verify_peer_token(&self.peer_token, &self.team)
     }
 }
 
@@ -352,42 +399,6 @@ pub mod linux_transport {
 
     fn current_boottime_ns() -> Result<u64, ProtocolError> {
         boottime_ns()
-    }
-
-    fn operation_binding(challenge: &[u8; 32], request: &Request) -> [u8; 32] {
-        fn append_field(output: &mut Vec<u8>, value: &[u8]) {
-            output.extend_from_slice(&(value.len() as u64).to_be_bytes());
-            output.extend_from_slice(value);
-        }
-        let operation = match request.operation {
-            Operation::CreateLayout => 1u32,
-            Operation::ReplaceBase => 2u32,
-            Operation::ResetPersist => 3u32,
-        };
-        let release = serde_json::to_vec(&request.release).unwrap_or_default();
-        let mut binding = Vec::with_capacity(1024);
-        append_field(&mut binding, b"AIS-HOST-HELPER-OPERATION-V1");
-        append_field(&mut binding, challenge);
-        append_field(&mut binding, &request.version.to_be_bytes());
-        append_field(&mut binding, &operation.to_be_bytes());
-        append_field(&mut binding, request.plan_digest.as_bytes());
-        append_field(&mut binding, request.ticket.as_bytes());
-        append_field(
-            &mut binding,
-            &request.confirmation_deadline_boot_ns.to_be_bytes(),
-        );
-        append_field(&mut binding, request.device_identity.as_bytes());
-        append_field(&mut binding, request.typed_confirmation.as_bytes());
-        append_field(&mut binding, &release);
-        append_field(
-            &mut binding,
-            &serde_json::to_vec(&request.drive_identity).unwrap_or_default(),
-        );
-        append_field(
-            &mut binding,
-            &serde_json::to_vec(&request.installed_image).unwrap_or_default(),
-        );
-        sha256(&binding)
     }
 
     /// The application sends a one-byte marker with exactly three source files
@@ -1245,6 +1256,937 @@ pub mod linux_transport {
             let result = receive_source_descriptors(&receiver, parent);
             assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
             assert!(matches!(result, Err(ProtocolError::UntrustedPeer)));
+        }
+    }
+}
+
+/// The macOS transport. The root helper is started through the system's own
+/// administrator authorisation prompt and listens on a socket in a private
+/// directory of the invoking user. It accepts one peer: the invoking user's
+/// running application, identified by the kernel audit token of the socket
+/// peer and validated by the Security framework against the team requirement.
+/// The root command line copies the helper into a root-owned directory and
+/// verifies that copy before running it. The helper path is derived from the
+/// running application, never taken from the webview.
+#[cfg(target_os = "macos")]
+pub mod macos_transport {
+    use super::*;
+    use ais_host_core::release::hex;
+    use std::{
+        ffi::{c_int, c_void},
+        fs::{self, File},
+        io::{Read, Write},
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::fs::{FileTypeExt, MetadataExt},
+        os::unix::net::{UnixListener, UnixStream},
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    const OSASCRIPT_PATH: &str = "/usr/bin/osascript";
+    const CODESIGN_PATH: &str = "/usr/bin/codesign";
+    const HELPER_NAME: &str = "ais-host-helper";
+    const APPLICATION_NAME: &str = "ais-host-app";
+    const SOCKET_DIRECTORY: &str = "ais-host-helper";
+    const MAX_SOCKET_PATH_BYTES: usize = 100;
+    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+    const SOURCE_DESCRIPTOR_COUNT: usize = 3;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Peer {
+        pid: u32,
+        uid: u32,
+        token: [u8; 32],
+    }
+
+    type CfRef = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        fn CFDataCreate(allocator: CfRef, bytes: *const u8, length: isize) -> CfRef;
+        fn CFStringCreateWithCString(allocator: CfRef, text: *const i8, encoding: u32) -> CfRef;
+        fn CFDictionaryCreate(
+            allocator: CfRef,
+            keys: *const CfRef,
+            values: *const CfRef,
+            count: isize,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CfRef;
+        fn CFRelease(object: CfRef);
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        static kSecGuestAttributeAudit: CfRef;
+        fn SecCodeCopyGuestWithAttributes(
+            host: CfRef,
+            attributes: CfRef,
+            flags: u32,
+            guest: *mut CfRef,
+        ) -> i32;
+        fn SecRequirementCreateWithString(text: CfRef, flags: u32, requirement: *mut CfRef) -> i32;
+        fn SecCodeCheckValidity(code: CfRef, flags: u32, requirement: CfRef) -> i32;
+    }
+
+    pub fn current_uid() -> u32 {
+        // SAFETY: getuid has no arguments and cannot fail.
+        unsafe { libc::getuid() }
+    }
+
+    /// CLOCK_MONOTONIC on macOS keeps counting while the computer sleeps, so a
+    /// confirmation still expires across suspend.
+    pub fn boottime_ns() -> Result<u64, ProtocolError> {
+        let mut value = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: value is a valid writable timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0
+            || value.tv_sec < 0
+            || value.tv_nsec < 0
+        {
+            return Err(ProtocolError::Transport);
+        }
+        (value.tv_sec as u64)
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(value.tv_nsec as u64))
+            .ok_or(ProtocolError::Transport)
+    }
+
+    /// Credentials of the process that owns the other end: uid by getpeereid,
+    /// and its audit token, which names one exact process incarnation.
+    fn peer_of(stream: &UnixStream) -> Result<Peer, ProtocolError> {
+        // LOCAL_PEERTOKEN is not exported by the libc crate.
+        const LOCAL_PEERTOKEN: c_int = 0x006;
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: both outputs are valid writable integers.
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        let mut pid: c_int = 0;
+        let mut length = std::mem::size_of::<c_int>() as libc::socklen_t;
+        // SAFETY: pid and length are valid writable buffers for getsockopt.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut c_int).cast::<c_void>(),
+                &mut length,
+            )
+        };
+        let mut token = [0u8; 32];
+        let mut token_length = token.len() as libc::socklen_t;
+        // SAFETY: token and token_length are valid writable buffers.
+        let token_result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                LOCAL_PEERTOKEN,
+                token.as_mut_ptr().cast::<c_void>(),
+                &mut token_length,
+            )
+        };
+        if result != 0 || pid <= 0 || token_result != 0 || token_length as usize != token.len() {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        Ok(Peer {
+            pid: pid as u32,
+            uid,
+            token,
+        })
+    }
+
+    /// True only when the process named by this audit token is validly signed
+    /// by a Developer ID certificate of exactly this team. The token fails to
+    /// resolve once the process has exec'd, so a descriptor handed on before
+    /// an exec cannot borrow the identity of the program it later runs.
+    pub(crate) fn peer_satisfies_team(token: &[u8; 32], team: &str) -> bool {
+        const UTF8: u32 = 0x0800_0100;
+        if team.is_empty() || team.len() > 16 || !team.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+        let Ok(requirement) = std::ffi::CString::new(format!(
+            "anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
+        )) else {
+            return false;
+        };
+        let mut valid = false;
+        // SAFETY: every object created here is released below; the Security and
+        // CoreFoundation calls only read the buffers passed to them.
+        unsafe {
+            let text = CFStringCreateWithCString(std::ptr::null(), requirement.as_ptr(), UTF8);
+            let data = CFDataCreate(std::ptr::null(), token.as_ptr(), token.len() as isize);
+            let keys = [kSecGuestAttributeAudit];
+            let values = [data];
+            let attributes = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
+            let mut requirement_ref: CfRef = std::ptr::null();
+            let mut guest: CfRef = std::ptr::null();
+            if !text.is_null()
+                && !data.is_null()
+                && !attributes.is_null()
+                && SecRequirementCreateWithString(text, 0, &mut requirement_ref) == 0
+                && SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes, 0, &mut guest) == 0
+            {
+                valid = SecCodeCheckValidity(guest, 0, requirement_ref) == 0;
+            }
+            for object in [guest, requirement_ref, text, data, attributes] {
+                if !object.is_null() {
+                    CFRelease(object);
+                }
+            }
+        }
+        valid
+    }
+
+    /// Per-write recheck of the exact peer incarnation.
+    pub(crate) fn verify_peer_token(token: &[u8; 32], team: &str) -> Result<(), ProtocolError> {
+        if peer_satisfies_team(token, team) {
+            Ok(())
+        } else {
+            Err(ProtocolError::UntrustedPeer)
+        }
+    }
+
+    /// A listening socket in the invoking user's private directory. Dropping it
+    /// unlinks the socket through the retained directory descriptor.
+    pub struct Listening {
+        pub listener: UnixListener,
+        directory: File,
+        name: std::ffi::CString,
+    }
+
+    impl Drop for Listening {
+        fn drop(&mut self) {
+            // SAFETY: unlinkat names an entry of the directory we hold open.
+            unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+        }
+    }
+
+    /// Helper side: validate the private directory through one descriptor
+    /// opened without following links, then listen on a socket in it. The
+    /// socket stays owned by root (no chown into the user's directory); the
+    /// directory is the user's, so only that user can reach it.
+    pub fn listen_as(socket: &Path, invoking_uid: u32) -> Result<Listening, ProtocolError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if invoking_uid == 0 || socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        let directory = socket.parent().ok_or(ProtocolError::UntrustedPeer)?;
+        let name = socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                name.ends_with(".sock")
+                    && name.len() <= 32
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+            })
+            .ok_or(ProtocolError::UntrustedPeer)?;
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(directory)
+            .map_err(|_| ProtocolError::UntrustedPeer)?;
+        let metadata = handle
+            .metadata()
+            .map_err(|_| ProtocolError::UntrustedPeer)?;
+        if directory.file_name().and_then(|name| name.to_str()) != Some(SOCKET_DIRECTORY)
+            || !metadata.is_dir()
+            || metadata.uid() != invoking_uid
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        let name = std::ffi::CString::new(name).map_err(|_| ProtocolError::UntrustedPeer)?;
+        // SAFETY: umask only changes this process's creation mask; 0o111 leaves
+        // a 0666 socket that the user can connect to.
+        let previous = unsafe { libc::umask(0o111) };
+        let listener = UnixListener::bind(socket);
+        // SAFETY: restores the mask saved above.
+        unsafe { libc::umask(previous) };
+        let listener = listener.map_err(|_| ProtocolError::Transport)?;
+        let listening = Listening {
+            listener,
+            directory: handle,
+            name,
+        };
+        // The bind went through a path, so confirm through the checked
+        // descriptor that the new socket really is an entry of that directory
+        // and is ours (root's, in production).
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: valid directory descriptor and name; stat is writable.
+        let found = unsafe {
+            libc::fstatat(
+                listening.directory.as_raw_fd(),
+                listening.name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        // SAFETY: fstatat succeeded, so stat is initialised.
+        let stat = unsafe { stat.assume_init() };
+        // SAFETY: geteuid has no arguments.
+        if found != 0
+            || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+            || stat.st_uid != unsafe { libc::geteuid() }
+        {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        listening
+            .listener
+            .set_nonblocking(true)
+            .map_err(|_| ProtocolError::Transport)?;
+        Ok(listening)
+    }
+
+    fn read_exact_before(
+        stream: &mut UnixStream,
+        mut buffer: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), ProtocolError> {
+        while !buffer.is_empty() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or(ProtocolError::Transport)?;
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|_| ProtocolError::Transport)?;
+            let count = stream.read(buffer).map_err(|_| ProtocolError::Transport)?;
+            if count == 0 {
+                return Err(ProtocolError::Transport);
+            }
+            buffer = &mut buffer[count..];
+        }
+        Ok(())
+    }
+
+    fn control_space() -> usize {
+        let bytes = (SOURCE_DESCRIPTOR_COUNT * std::mem::size_of::<c_int>()) as u32;
+        // SAFETY: CMSG_SPACE is pure arithmetic.
+        (unsafe { libc::CMSG_SPACE(bytes) }) as usize
+    }
+
+    /// The marker byte must arrive with exactly three descriptors and nothing
+    /// else attached. Every delivered descriptor is owned immediately, so each
+    /// refusal path closes them.
+    fn receive_source_descriptors(stream: &UnixStream) -> Result<[File; 3], ProtocolError> {
+        let mut marker = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: marker.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut control = vec![0u64; control_space().div_ceil(8)];
+        // SAFETY: an all-zero msghdr is a valid empty message header.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_space() as libc::socklen_t;
+        // SAFETY: message and all referenced storage are live and writable.
+        let count = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, 0) };
+        let mut files = Vec::new();
+        let mut records = 0;
+        let mut shape_valid = true;
+        // SAFETY: the control buffer was filled by recvmsg and is walked with
+        // the platform macros, which stay inside msg_controllen.
+        unsafe {
+            let mut header = libc::CMSG_FIRSTHDR(&message);
+            while !header.is_null() {
+                let length = (*header).cmsg_len as usize;
+                let data_length = length.saturating_sub(libc::CMSG_LEN(0) as usize);
+                if (*header).cmsg_level == libc::SOL_SOCKET
+                    && (*header).cmsg_type == libc::SCM_RIGHTS
+                    && data_length.is_multiple_of(std::mem::size_of::<c_int>())
+                {
+                    records += 1;
+                    let data = libc::CMSG_DATA(header).cast::<c_int>();
+                    for index in 0..data_length / std::mem::size_of::<c_int>() {
+                        let descriptor = std::ptr::read_unaligned(data.add(index));
+                        if descriptor < 0 {
+                            shape_valid = false;
+                        } else {
+                            libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC);
+                            files.push(File::from_raw_fd(descriptor));
+                        }
+                    }
+                } else {
+                    shape_valid = false;
+                }
+                header = libc::CMSG_NXTHDR(&message, header);
+            }
+        }
+        if count != 1
+            || marker != [1]
+            || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+            || records != 1
+            || !shape_valid
+            || files.len() != SOURCE_DESCRIPTOR_COUNT
+        {
+            drop(files);
+            return Err(ProtocolError::Request);
+        }
+        files.try_into().map_err(|_| ProtocolError::Request)
+    }
+
+    /// Attach exactly three retained source files to a one-byte marker.
+    fn send_source_descriptors(
+        stream: &UnixStream,
+        files: [&File; 3],
+    ) -> Result<(), ProtocolError> {
+        let mut marker = [1u8];
+        let mut iov = libc::iovec {
+            iov_base: marker.as_mut_ptr().cast(),
+            iov_len: 1,
+        };
+        let mut control = vec![0u64; control_space().div_ceil(8)];
+        // SAFETY: an all-zero msghdr is a valid empty message header.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control_space() as libc::socklen_t;
+        // SAFETY: the control buffer is aligned and large enough for one header
+        // and three descriptors; fields are written within its bounds.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len =
+                libc::CMSG_LEN((SOURCE_DESCRIPTOR_COUNT * std::mem::size_of::<c_int>()) as u32)
+                    as _;
+            let data = libc::CMSG_DATA(header).cast::<c_int>();
+            for (index, file) in files.iter().enumerate() {
+                std::ptr::write_unaligned(data.add(index), file.as_raw_fd());
+            }
+        }
+        // SAFETY: message and referenced storage are live for the call.
+        if unsafe { libc::sendmsg(stream.as_raw_fd(), &message, 0) } == 1 {
+            Ok(())
+        } else {
+            Err(ProtocolError::Transport)
+        }
+    }
+
+    /// Helper side: accept one connection and authenticate it. The peer must
+    /// be a process signed by the team the administrator prompt was started
+    /// for; a peer running anything else is refused.
+    pub fn authenticate_one(
+        listener: &UnixListener,
+        invoking_uid: u32,
+        team: &str,
+    ) -> Result<(AuthenticatedChannel, Request, [File; 3]), ProtocolError> {
+        let accept_deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= accept_deadline {
+                        return Err(ProtocolError::Transport);
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return Err(ProtocolError::Transport),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .and_then(|_| stream.set_read_timeout(Some(IO_TIMEOUT)))
+            .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+            .map_err(|_| ProtocolError::Transport)?;
+        let peer = peer_of(&stream)?;
+        if peer.uid != invoking_uid {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        verify_peer_token(&peer.token, team)?;
+        let request_deadline = Instant::now() + IO_TIMEOUT;
+        let mut challenge = [0; 32];
+        File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut challenge))
+            .map_err(|_| ProtocolError::Transport)?;
+        stream
+            .write_all(&challenge)
+            .map_err(|_| ProtocolError::Transport)?;
+        let sources = receive_source_descriptors(&stream)?;
+        let mut header = [0; 4];
+        read_exact_before(&mut stream, &mut header, request_deadline)?;
+        let length = u32::from_be_bytes(header) as usize;
+        if length == 0 || length > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::Frame);
+        }
+        let mut frame = vec![0; 4 + length];
+        frame[..4].copy_from_slice(&header);
+        read_exact_before(&mut stream, &mut frame[4..], request_deadline)?;
+        // The sender half-closes after its one request; anything more is refused.
+        let mut trailing = [0; 1];
+        let remaining = request_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(ProtocolError::Transport)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| ProtocolError::Transport)?;
+        if stream
+            .read(&mut trailing)
+            .map_err(|_| ProtocolError::Transport)?
+            != 0
+        {
+            return Err(ProtocolError::Frame);
+        }
+        if peer_of(&stream)? != peer {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        verify_peer_token(&peer.token, team)?;
+        let request = decode_frame(&frame)?;
+        let now = boottime_ns()?;
+        if request.confirmation_deadline_boot_ns <= now
+            || request.confirmation_deadline_boot_ns - now > 120_000_000_000
+        {
+            return Err(ProtocolError::ExpiredOrReplayed);
+        }
+        let expected = operation_binding(&challenge, &request);
+        if hex(&expected) != request.channel_binding {
+            return Err(ProtocolError::ExpiredOrReplayed);
+        }
+        Ok((
+            AuthenticatedChannel {
+                peer_pid: peer.pid,
+                peer_uid: peer.uid,
+                request_binding: expected,
+                _single_use: (),
+                peer_token: peer.token,
+                team: team.to_owned(),
+            },
+            request,
+            sources,
+        ))
+    }
+
+    /// The application and helper are the two executables of one bundle
+    /// directory. Both are derived from the running executable.
+    fn bundle_paths(running: &Path) -> Result<(PathBuf, PathBuf), ProtocolError> {
+        let directory = fs::canonicalize(running)
+            .map_err(|_| ProtocolError::PackageTrustUnavailable)?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(ProtocolError::PackageTrustUnavailable)?;
+        let (application, helper) = (
+            directory.join(APPLICATION_NAME),
+            directory.join(HELPER_NAME),
+        );
+        for path in [&application, &helper] {
+            let metadata =
+                fs::symlink_metadata(path).map_err(|_| ProtocolError::PackageTrustUnavailable)?;
+            if !metadata.is_file() {
+                return Err(ProtocolError::PackageTrustUnavailable);
+            }
+        }
+        Ok((application, helper))
+    }
+
+    /// The Team ID of a signed executable, or None when it is unsigned or
+    /// only ad-hoc signed or fails strict verification.
+    fn team_identifier(path: &Path) -> Option<String> {
+        let verified = Command::new(CODESIGN_PATH)
+            .env_clear()
+            .args(["--verify", "--strict"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if !verified.success() {
+            return None;
+        }
+        let details = Command::new(CODESIGN_PATH)
+            .env_clear()
+            .args(["-d", "--verbose=2"])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .ok()?;
+        parse_team_identifier(&String::from_utf8_lossy(&details.stderr))
+    }
+
+    fn parse_team_identifier(details: &str) -> Option<String> {
+        details
+            .lines()
+            .find_map(|line| line.strip_prefix("TeamIdentifier="))
+            .map(str::trim)
+            .filter(|team| {
+                !team.is_empty()
+                    && team.len() <= 16
+                    && team.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .map(str::to_owned)
+    }
+
+    /// The helper may be started only when it and the running application are
+    /// both Developer ID signed by the same team.
+    fn verify_bundle(running: &Path) -> Result<(PathBuf, PathBuf, String), ProtocolError> {
+        let (application, helper) = bundle_paths(running)?;
+        match (team_identifier(&application), team_identifier(&helper)) {
+            (Some(app), Some(helper_team)) if app == helper_team => Ok((application, helper, app)),
+            _ => Err(ProtocolError::PackageTrustUnavailable),
+        }
+    }
+
+    fn verify_installation() -> Result<(PathBuf, PathBuf, String), ProtocolError> {
+        verify_bundle(&std::env::current_exe().map_err(|_| ProtocolError::PackageTrustUnavailable)?)
+    }
+
+    /// True only when the signed application and its helper verify.
+    pub fn helper_installed() -> bool {
+        verify_installation().is_ok()
+    }
+
+    /// Runs as root after the prompt. The helper is first copied into a fresh
+    /// root-owned directory and that copy, which no user can alter, must satisfy
+    /// the team requirement before it runs; the bundle path is never executed.
+    /// Every argument is quoted by AppleScript itself, so none is parsed by a
+    /// shell. The team was validated as alphanumeric by the caller.
+    const ADMINISTRATOR_SCRIPT: &str = r#"on run argv
+set helperPath to item 1 of argv
+set teamId to item 2 of argv
+set helperArguments to ""
+repeat with index from 3 to count of argv
+set helperArguments to helperArguments & " " & quoted form of (item index of argv)
+end repeat
+set requirementText to "=anchor apple generic and certificate leaf[subject.OU] = \"" & teamId & "\""
+set shellText to "d=$(/usr/bin/mktemp -d /private/var/root/ais-host-helper.XXXXXXXX) || exit 1; /bin/cp " & quoted form of helperPath & " \"$d/helper\" && /usr/bin/codesign --verify --strict -R " & quoted form of requirementText & " \"$d/helper\" && \"$d/helper\"" & helperArguments & "; s=$?; /bin/rm -rf \"$d\"; exit $s"
+with timeout of 3600 seconds
+do shell script shellText with administrator privileges
+end timeout
+end run"#;
+
+    /// Run the helper as root through the system administrator prompt.
+    fn administrator_command(helper: &Path, team: &str, arguments: &[&str]) -> Command {
+        let mut command = Command::new(OSASCRIPT_PATH);
+        command
+            .arg("-e")
+            .arg(ADMINISTRATOR_SCRIPT)
+            .arg("--")
+            .arg(helper)
+            .arg(team)
+            .args(arguments)
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// Read-only privileged preview whose single output line is bounded.
+    fn preview(flag: &str, identity: &str, limit: usize) -> Result<Vec<u8>, ProtocolError> {
+        let (_, helper, team) = verify_installation()?;
+        let mut child = administrator_command(&helper, &team, &[flag, identity])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ProtocolError::PackageTrustUnavailable)?;
+        let mut output = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .ok_or(ProtocolError::Transport)?
+            .take(limit as u64 + 1)
+            .read_to_end(&mut output);
+        let status = child.wait().map_err(|_| ProtocolError::Transport)?;
+        if read.is_err() || !status.success() || output.len() > limit {
+            return Err(ProtocolError::Transport);
+        }
+        Ok(output)
+    }
+
+    pub fn preview_observation(
+        identity: &str,
+    ) -> Result<ais_host_core::device::DeviceObservation, ProtocolError> {
+        let observation: ais_host_core::device::DeviceObservation =
+            serde_json::from_slice(&preview("--preview", identity, 16 * 1024)?)
+                .map_err(|_| ProtocolError::Request)?;
+        observation.validate().map_err(|_| ProtocolError::Request)?;
+        Ok(observation)
+    }
+
+    pub fn preview_update(
+        identity: &str,
+    ) -> Result<ais_host_core::update::DriveSnapshot, ProtocolError> {
+        serde_json::from_slice(&preview("--preview-update", identity, 160 * 1024)?)
+            .map_err(|_| ProtocolError::Request)
+    }
+
+    /// Full privileged session: private socket directory, administrator
+    /// prompt, then one request over the helper's socket.
+    pub fn run_session(
+        invoking_uid: u32,
+        files: [&File; 3],
+        mut request: Request,
+    ) -> Result<(), ProtocolError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let (_, helper, team) = verify_installation()?;
+        let directory = std::env::temp_dir().join(SOCKET_DIRECTORY);
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(ProtocolError::UntrustedPeer),
+        }
+        let directory = fs::canonicalize(&directory).map_err(|_| ProtocolError::UntrustedPeer)?;
+        let metadata =
+            fs::symlink_metadata(&directory).map_err(|_| ProtocolError::UntrustedPeer)?;
+        if !metadata.is_dir() || metadata.uid() != invoking_uid || metadata.mode() & 0o077 != 0 {
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        let mut name = [0u8; 8];
+        File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut name))
+            .map_err(|_| ProtocolError::Transport)?;
+        let socket = directory.join(format!("{}.sock", hex(&name)));
+        if socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+            return Err(ProtocolError::Transport);
+        }
+        let _cleanup = RemoveOnDrop(socket.clone());
+        let uid = invoking_uid.to_string();
+        let socket_argument = socket.to_str().ok_or(ProtocolError::Transport)?;
+        let mut child = administrator_command(
+            &helper,
+            &team,
+            &["--serve-as", socket_argument, &uid, &team],
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ProtocolError::PackageTrustUnavailable)?;
+        // The user may be typing a password, so wait generously for the socket.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut stream = loop {
+            // The helper binds as root; a socket owned by anyone else is a squatter.
+            let ready = fs::symlink_metadata(&socket)
+                .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == 0);
+            if ready && let Ok(stream) = UnixStream::connect(&socket) {
+                break stream;
+            }
+            if child
+                .try_wait()
+                .map_err(|_| ProtocolError::Transport)?
+                .is_some()
+                || Instant::now() >= deadline
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProtocolError::Transport);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Only the root helper may answer; a socket squatted by the user is refused.
+        let (mut euid, mut egid) = (!0, !0);
+        // SAFETY: both outputs are valid writable integers.
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) } != 0 || euid != 0 {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProtocolError::UntrustedPeer);
+        }
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+            .map_err(|_| ProtocolError::Transport)?;
+        let mut challenge = [0u8; 32];
+        let served = stream
+            .read_exact(&mut challenge)
+            .map_err(|_| ProtocolError::Transport)
+            .and_then(|_| send_source_descriptors(&stream, files))
+            .and_then(|_| {
+                request.channel_binding = hex(&operation_binding(&challenge, &request));
+                let body = serde_json::to_vec(&request).map_err(|_| ProtocolError::Request)?;
+                if body.is_empty() || body.len() > MAX_REQUEST_BYTES {
+                    return Err(ProtocolError::Frame);
+                }
+                let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(&body);
+                stream
+                    .write_all(&frame)
+                    .and_then(|_| stream.shutdown(std::net::Shutdown::Write))
+                    .map_err(|_| ProtocolError::Transport)
+            });
+        let status = child.wait().map_err(|_| ProtocolError::Transport)?;
+        served?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(ProtocolError::Transport)
+        }
+    }
+
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn team_identifier_is_read_only_from_a_signed_description() {
+            assert_eq!(
+                parse_team_identifier("Identifier=x\nTeamIdentifier=ABCDE12345\n").as_deref(),
+                Some("ABCDE12345")
+            );
+            for unsigned in [
+                "TeamIdentifier=not set",
+                "TeamIdentifier=",
+                "Identifier=x",
+                "TeamIdentifier=ABCDE12345ABCDE12345",
+            ] {
+                assert!(parse_team_identifier(unsigned).is_none(), "{unsigned}");
+            }
+        }
+
+        #[test]
+        fn the_bundle_is_the_two_named_executables_of_one_directory() {
+            let directory = fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("ais-bundle-{}", std::process::id()));
+            fs::create_dir_all(&directory).unwrap();
+            let running = directory.join(APPLICATION_NAME);
+            assert!(bundle_paths(&running).is_err(), "nothing installed");
+            fs::write(&running, b"app").unwrap();
+            assert!(bundle_paths(&running).is_err(), "helper missing");
+            fs::write(directory.join(HELPER_NAME), b"helper").unwrap();
+            let (application, helper) = bundle_paths(&running).unwrap();
+            assert_eq!(application, running);
+            assert_eq!(helper, directory.join(HELPER_NAME));
+            // An unsigned bundle never authorises the helper.
+            assert!(verify_bundle(&running).is_err());
+            let _ = fs::remove_dir_all(&directory);
+        }
+
+        #[test]
+        fn source_descriptors_round_trip_and_odd_shapes_are_refused() {
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            let make = |bytes: &[u8]| {
+                let path = std::env::temp_dir().join(format!(
+                    "ais-fd-{}-{}",
+                    std::process::id(),
+                    bytes.len()
+                ));
+                fs::write(&path, bytes).unwrap();
+                let file = File::open(&path).unwrap();
+                fs::remove_file(&path).unwrap();
+                file
+            };
+            let files = [make(b"one"), make(b"22"), make(b"333")];
+            send_source_descriptors(&sender, [&files[0], &files[1], &files[2]]).unwrap();
+            let sizes: Vec<u64> = receive_source_descriptors(&receiver)
+                .unwrap()
+                .iter()
+                .map(|file| file.metadata().unwrap().len())
+                .collect();
+            assert_eq!(sizes, [3, 2, 3]);
+            // A bare marker without descriptors is not a source envelope.
+            let (mut sender, receiver) = UnixStream::pair().unwrap();
+            sender.write_all(&[1]).unwrap();
+            assert!(receive_source_descriptors(&receiver).is_err());
+        }
+
+        #[test]
+        fn peer_credentials_name_this_process_and_its_token_fails_a_foreign_team() {
+            // XNU records peer credentials on connect(), not for socketpair().
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("ais-peer-{}-{nanos}.sock", std::process::id()));
+            let listener = UnixListener::bind(&path).unwrap();
+            let _client = UnixStream::connect(&path).unwrap();
+            let (receiver, _) = listener.accept().unwrap();
+            let _ = fs::remove_file(&path);
+            let peer = peer_of(&receiver).unwrap();
+            assert_eq!(peer.uid, current_uid());
+            assert_eq!(peer.pid, std::process::id());
+            // The test binary is not signed by this team, nor any team at all.
+            assert!(!peer_satisfies_team(&peer.token, "ZZZZZZZZZZ"));
+            assert!(verify_peer_token(&peer.token, "ZZZZZZZZZZ").is_err());
+            // Malformed teams are never interpolated into a requirement.
+            for team in ["", "A\" or anchor apple", "a b", &"A".repeat(17)] {
+                assert!(!peer_satisfies_team(&peer.token, team));
+            }
+            // A token that names no process resolves to nothing.
+            assert!(!peer_satisfies_team(&[0; 32], "ZZZZZZZZZZ"));
+        }
+
+        #[test]
+        fn the_administrator_script_verifies_the_copy_before_running_it() {
+            let copy = ADMINISTRATOR_SCRIPT.find("/bin/cp").unwrap();
+            let verify = ADMINISTRATOR_SCRIPT
+                .find("codesign --verify --strict")
+                .unwrap();
+            let run = ADMINISTRATOR_SCRIPT.rfind("$d/helper").unwrap();
+            assert!(copy < verify && verify < run);
+            assert!(ADMINISTRATOR_SCRIPT.contains("/private/var/root/"));
+            // The bundle path is only ever the source of the copy.
+            assert_eq!(
+                ADMINISTRATOR_SCRIPT.matches("helperPath").count(),
+                2 /* set + copy */
+            );
+            assert!(
+                !ADMINISTRATOR_SCRIPT.contains("set line")
+                    && !ADMINISTRATOR_SCRIPT.contains("part")
+            );
+        }
+
+        #[test]
+        fn the_socket_directory_must_be_private_and_owned_by_the_user() {
+            let base = fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("ais-listen-{}", std::process::id()));
+            let directory = base.join(SOCKET_DIRECTORY);
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("a.sock");
+            fs::set_permissions(
+                &directory,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+            assert!(listen_as(&socket, current_uid()).is_err(), "open directory");
+            assert!(
+                listen_as(&socket, 0).is_err(),
+                "root is not an invoking user"
+            );
+            fs::set_permissions(
+                &directory,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+            assert!(
+                listen_as(&base.join("elsewhere").join("a.sock"), current_uid()).is_err(),
+                "wrong directory name"
+            );
+            let _listener = listen_as(&socket, current_uid()).unwrap();
+            let metadata = fs::symlink_metadata(&socket).unwrap();
+            assert!(metadata.file_type().is_socket());
+            // Not chowned into the user's directory: 0666 and owned by the binder.
+            assert_eq!(metadata.mode() & 0o777, 0o666);
+            assert_eq!(metadata.uid(), current_uid());
+            drop(_listener);
+            assert!(fs::symlink_metadata(&socket).is_err(), "unlinked on drop");
+            let _ = fs::remove_dir_all(&base);
         }
     }
 }
