@@ -1167,7 +1167,7 @@ impl DiskClaim {
             ) -> Dissenter;
         }
         // DiskArbitration enum value (err_local | err_local_diskarbitration | 0x0D), not a symbol.
-        const DA_RETURN_NOT_PERMITTED: i32 = 0xF800_000Du32 as i32;
+        const DA_RETURN_NOT_PERMITTED: i32 = 0xF8DA_000Du32 as i32;
         struct ClaimResult(mpsc::SyncSender<bool>);
         unsafe extern "C" fn claimed(_: Ref, dissenter: Dissenter, context: *mut std::ffi::c_void) {
             // SAFETY: the callback owns the raw Arc reference created below.
