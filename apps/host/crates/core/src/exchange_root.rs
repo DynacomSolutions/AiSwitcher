@@ -12,6 +12,7 @@ pub struct ExchangeRoot {
 
 #[cfg(unix)]
 impl ExchangeRoot {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn open(path: &Path) -> Result<Self, String> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let file = std::fs::OpenOptions::new()

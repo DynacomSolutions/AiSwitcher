@@ -205,6 +205,7 @@ fn private_directory(base: &Path) -> std::io::Result<PathBuf> {
     let mut nonce = [0; 8];
     getrandom::fill(&mut nonce).map_err(|_| std::io::Error::other("entropy unavailable"))?;
     let path = base.join(format!("ais-host-{}", crate::release::hex(&nonce)));
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

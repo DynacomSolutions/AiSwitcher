@@ -7,6 +7,7 @@ fn main() {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum Command {
     Serve(PathBuf),
     Preview(String),

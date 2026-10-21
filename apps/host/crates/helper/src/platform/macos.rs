@@ -1,4 +1,5 @@
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))] // compiled on every host under file-test fixtures
+// shortcut: the native write path is unwired until this platform's helper authentication lands; drop the allow then.
+#![allow(dead_code)]
 //! macOS disk observation and retained raw-device handle.
 //!
 //! Mutation stays unavailable until the bundled, signed SMAppService helper,

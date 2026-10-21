@@ -280,6 +280,15 @@ pub(crate) fn check_directory(path: &Path) -> Result<(), String> {
         }
         let metadata =
             fs::symlink_metadata(&current).map_err(|_| "native directory is unavailable")?;
+        // A root-owned link such as macOS /var cannot be planted by another user.
+        #[cfg(unix)]
+        let trusted_link =
+            is_link(&metadata) && std::os::unix::fs::MetadataExt::uid(&metadata) == 0;
+        #[cfg(not(unix))]
+        let trusted_link = false;
+        if trusted_link {
+            continue;
+        }
         if is_link(&metadata) || !metadata.is_dir() {
             return Err("native directory contains a link or non-directory".into());
         }

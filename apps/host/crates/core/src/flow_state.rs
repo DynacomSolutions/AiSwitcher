@@ -198,6 +198,7 @@ impl FileFlowStore {
         );
         let directory = native_registry_directory.join("flows");
         if !directory.exists() {
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             {

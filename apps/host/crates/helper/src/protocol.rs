@@ -95,6 +95,7 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, ProtocolError> {
 
 /// No public constructor. Only the Linux transport may establish this proof
 /// after checking peer credentials, the installed client pin and one request.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct AuthenticatedChannel {
     pub(crate) peer_pid: u32,
     pub(crate) peer_uid: u32,

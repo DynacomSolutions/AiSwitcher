@@ -1,4 +1,5 @@
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))] // compiled on every host under file-test fixtures
+// shortcut: the native write path is unwired until this platform's helper authentication lands; drop the allow then.
+#![allow(dead_code)]
 //! Windows disk identity parsing and retained-handle adapter.
 //!
 //! Disk mutation is fail-closed until the packaged helper can prove its
@@ -1246,7 +1247,7 @@ mod native {
             if self
                 .volumes
                 .iter()
-                .any(|volume| unsafe { volume.as_raw_handle() }.is_null())
+                .any(|volume| volume.as_raw_handle().is_null())
             {
                 return Err(io::Error::other("volume lock handle invalid"));
             }
