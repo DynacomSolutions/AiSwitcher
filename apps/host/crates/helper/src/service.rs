@@ -499,20 +499,23 @@ pub fn preview_update_linux(identity: &str) -> Result<(), &'static str> {
 /// for the one application the prompt was started from and then runs exactly
 /// one request, like the Linux helper.
 #[cfg(target_os = "macos")]
-pub fn run_macos(socket: std::path::PathBuf, invoking_uid: u32) -> Result<(), &'static str> {
+pub fn run_macos(
+    socket: std::path::PathBuf,
+    invoking_uid: u32,
+    team: &str,
+) -> Result<(), &'static str> {
     use crate::protocol::macos_transport as transport;
     // SAFETY: geteuid has no arguments and returns the effective uid.
     if unsafe { libc::geteuid() } != 0 {
         return Err("The privileged helper invocation is invalid.");
     }
-    let pin = transport::installed_client_pin()
-        .map_err(|_| "The signed application beside this helper could not be verified.")?;
     let listener = transport::listen_as(&socket, invoking_uid)
         .map_err(|_| "The private helper channel is unavailable.")?;
-    let authenticated = transport::authenticate_one(&listener, invoking_uid, &pin).map_err(
-        |_| "The installed application or one-operation request could not be authenticated.",
-    );
-    let _ = std::fs::remove_file(&socket);
+    let authenticated = transport::authenticate_one(&listener.listener, invoking_uid, team)
+        .map_err(
+            |_| "The installed application or one-operation request could not be authenticated.",
+        );
+    drop(listener);
     let (channel, request, sources) = authenticated?;
     execute(channel, request, sources)
 }

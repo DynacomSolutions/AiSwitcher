@@ -454,8 +454,8 @@ pub struct MacBlockTarget {
     file: File,
     approved: DeviceObservation,
     identifier: String,
-    sender_pid: u32,
-    sender_executable: File,
+    sender_token: [u8; 32],
+    sender_team: String,
     _claim: DiskClaim,
 }
 
@@ -468,17 +468,13 @@ impl MacBlockTarget {
         channel
             .revalidate_sender()
             .map_err(|_| ObservationError::Changed)?;
-        let sender_executable = channel
-            .executable
-            .try_clone()
-            .map_err(|_| ObservationError::Changed)?;
-        Self::open_after_native_authorisation(approved, channel.peer_pid, sender_executable)
+        Self::open_after_native_authorisation(approved, channel.peer_token, channel.team.clone())
     }
 
     fn open_after_native_authorisation(
         approved: &DeviceObservation,
-        sender_pid: u32,
-        sender_executable: File,
+        sender_token: [u8; 32],
+        sender_team: String,
     ) -> Result<Self, ObservationError> {
         approved
             .validate()
@@ -554,8 +550,8 @@ impl MacBlockTarget {
             file,
             approved: approved_after,
             identifier: identifier.to_owned(),
-            sender_pid,
-            sender_executable,
+            sender_token,
+            sender_team,
             _claim: claim,
         })
     }
@@ -570,11 +566,8 @@ impl io::Read for MacBlockTarget {
 #[cfg(target_os = "macos")]
 impl io::Write for MacBlockTarget {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        crate::protocol::macos_transport::verify_pid_executable(
-            self.sender_pid,
-            &self.sender_executable,
-        )
-        .map_err(|_| io::Error::other("authenticated sender changed"))?;
+        crate::protocol::macos_transport::verify_peer_token(&self.sender_token, &self.sender_team)
+            .map_err(|_| io::Error::other("authenticated sender changed"))?;
         self.file.write(buffer)
     }
     fn flush(&mut self) -> io::Result<()> {

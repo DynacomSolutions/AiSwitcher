@@ -138,8 +138,13 @@ pub struct AuthenticatedChannel {
     pub(crate) peer_uid: u32,
     pub(crate) request_binding: [u8; 32],
     pub(crate) _single_use: (),
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     pub(crate) executable: std::fs::File,
+    /// Audit token of the authenticated peer; its pid version changes on exec.
+    #[cfg(target_os = "macos")]
+    pub(crate) peer_token: [u8; 32],
+    #[cfg(target_os = "macos")]
+    pub(crate) team: String,
 }
 
 impl AuthenticatedChannel {
@@ -150,7 +155,7 @@ impl AuthenticatedChannel {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn revalidate_sender(&self) -> Result<(), ProtocolError> {
-        macos_transport::verify_pid_executable(self.peer_pid, &self.executable)
+        macos_transport::verify_peer_token(&self.peer_token, &self.team)
     }
 }
 
@@ -1258,14 +1263,15 @@ pub mod linux_transport {
 /// The macOS transport. The root helper is started through the system's own
 /// administrator authorisation prompt and listens on a socket in a private
 /// directory of the invoking user. It accepts one peer: the invoking user's
-/// running application, whose executable must be byte-identical to the
-/// application next to the helper, with both Developer ID signed by the same
-/// team. The helper path is derived from the running application, never taken
-/// from the webview, and no pin or path comes from the caller.
+/// running application, identified by the kernel audit token of the socket
+/// peer and validated by the Security framework against the team requirement.
+/// The root command line copies the helper into a root-owned directory and
+/// verifies that copy before running it. The helper path is derived from the
+/// running application, never taken from the webview.
 #[cfg(target_os = "macos")]
 pub mod macos_transport {
     use super::*;
-    use ais_host_core::release::{hex, sha256};
+    use ais_host_core::release::hex;
     use std::{
         ffi::{c_int, c_void},
         fs::{self, File},
@@ -1283,7 +1289,6 @@ pub mod macos_transport {
     const HELPER_NAME: &str = "ais-host-helper";
     const APPLICATION_NAME: &str = "ais-host-app";
     const SOCKET_DIRECTORY: &str = "ais-host-helper";
-    const MAX_PEER_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
     const MAX_SOCKET_PATH_BYTES: usize = 100;
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const SOURCE_DESCRIPTOR_COUNT: usize = 3;
@@ -1292,6 +1297,39 @@ pub mod macos_transport {
     struct Peer {
         pid: u32,
         uid: u32,
+        token: [u8; 32],
+    }
+
+    type CfRef = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        fn CFDataCreate(allocator: CfRef, bytes: *const u8, length: isize) -> CfRef;
+        fn CFStringCreateWithCString(allocator: CfRef, text: *const i8, encoding: u32) -> CfRef;
+        fn CFDictionaryCreate(
+            allocator: CfRef,
+            keys: *const CfRef,
+            values: *const CfRef,
+            count: isize,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CfRef;
+        fn CFRelease(object: CfRef);
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        static kSecGuestAttributeAudit: CfRef;
+        fn SecCodeCopyGuestWithAttributes(
+            host: CfRef,
+            attributes: CfRef,
+            flags: u32,
+            guest: *mut CfRef,
+        ) -> i32;
+        fn SecRequirementCreateWithString(text: CfRef, flags: u32, requirement: *mut CfRef) -> i32;
+        fn SecCodeCheckValidity(code: CfRef, flags: u32, requirement: CfRef) -> i32;
     }
 
     pub fn current_uid() -> u32 {
@@ -1319,7 +1357,11 @@ pub mod macos_transport {
             .ok_or(ProtocolError::Transport)
     }
 
+    /// Credentials of the process that owns the other end: uid by getpeereid,
+    /// and its audit token, which names one exact process incarnation.
     fn peer_of(stream: &UnixStream) -> Result<Peer, ProtocolError> {
+        // LOCAL_PEERTOKEN is not exported by the libc crate.
+        const LOCAL_PEERTOKEN: c_int = 0x006;
         let (mut uid, mut gid) = (0, 0);
         // SAFETY: both outputs are valid writable integers.
         if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
@@ -1337,106 +1379,177 @@ pub mod macos_transport {
                 &mut length,
             )
         };
-        if result != 0 || pid <= 0 {
+        let mut token = [0u8; 32];
+        let mut token_length = token.len() as libc::socklen_t;
+        // SAFETY: token and token_length are valid writable buffers.
+        let token_result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                LOCAL_PEERTOKEN,
+                token.as_mut_ptr().cast::<c_void>(),
+                &mut token_length,
+            )
+        };
+        if result != 0 || pid <= 0 || token_result != 0 || token_length as usize != token.len() {
             return Err(ProtocolError::UntrustedPeer);
         }
         Ok(Peer {
             pid: pid as u32,
             uid,
+            token,
         })
     }
 
-    fn executable_path(pid: u32) -> Result<PathBuf, ProtocolError> {
-        use std::os::unix::ffi::OsStrExt;
-        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        // SAFETY: the buffer is writable for the stated length.
-        let length = unsafe {
-            libc::proc_pidpath(
-                pid as c_int,
-                buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
-            )
+    /// True only when the process named by this audit token is validly signed
+    /// by a Developer ID certificate of exactly this team. The token fails to
+    /// resolve once the process has exec'd, so a descriptor handed on before
+    /// an exec cannot borrow the identity of the program it later runs.
+    pub(crate) fn peer_satisfies_team(token: &[u8; 32], team: &str) -> bool {
+        const UTF8: u32 = 0x0800_0100;
+        if team.is_empty() || team.len() > 16 || !team.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+        let Ok(requirement) = std::ffi::CString::new(format!(
+            "anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
+        )) else {
+            return false;
         };
-        if length <= 0 {
-            return Err(ProtocolError::UntrustedPeer);
+        let mut valid = false;
+        // SAFETY: every object created here is released below; the Security and
+        // CoreFoundation calls only read the buffers passed to them.
+        unsafe {
+            let text = CFStringCreateWithCString(std::ptr::null(), requirement.as_ptr(), UTF8);
+            let data = CFDataCreate(std::ptr::null(), token.as_ptr(), token.len() as isize);
+            let keys = [kSecGuestAttributeAudit];
+            let values = [data];
+            let attributes = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            );
+            let mut requirement_ref: CfRef = std::ptr::null();
+            let mut guest: CfRef = std::ptr::null();
+            if !text.is_null()
+                && !data.is_null()
+                && !attributes.is_null()
+                && SecRequirementCreateWithString(text, 0, &mut requirement_ref) == 0
+                && SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes, 0, &mut guest) == 0
+            {
+                valid = SecCodeCheckValidity(guest, 0, requirement_ref) == 0;
+            }
+            for object in [guest, requirement_ref, text, data, attributes] {
+                if !object.is_null() {
+                    CFRelease(object);
+                }
+            }
         }
-        buffer.truncate(length as usize);
-        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer)))
+        valid
     }
 
-    /// Open the peer's running executable and require it to hash to the pin.
-    fn verify_peer_executable(peer: Peer, expected: &[u8; 32]) -> Result<File, ProtocolError> {
-        let mut executable =
-            File::open(executable_path(peer.pid)?).map_err(|_| ProtocolError::UntrustedPeer)?;
-        let metadata = executable
-            .metadata()
-            .map_err(|_| ProtocolError::UntrustedPeer)?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PEER_EXECUTABLE_BYTES
-        {
-            return Err(ProtocolError::UntrustedPeer);
+    /// Per-write recheck of the exact peer incarnation.
+    pub(crate) fn verify_peer_token(token: &[u8; 32], team: &str) -> Result<(), ProtocolError> {
+        if peer_satisfies_team(token, team) {
+            Ok(())
+        } else {
+            Err(ProtocolError::UntrustedPeer)
         }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        Read::take(&mut executable, MAX_PEER_EXECUTABLE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ProtocolError::UntrustedPeer)?;
-        if bytes.len() as u64 != metadata.len() || sha256(&bytes) != *expected {
-            return Err(ProtocolError::UntrustedPeer);
-        }
-        Ok(executable)
     }
 
-    /// The process must still run the file that was hashed.
-    pub(crate) fn verify_pid_executable(pid: u32, retained: &File) -> Result<(), ProtocolError> {
-        let current =
-            File::open(executable_path(pid)?).map_err(|_| ProtocolError::UntrustedPeer)?;
-        let (retained, current) = (
-            retained
-                .metadata()
-                .map_err(|_| ProtocolError::UntrustedPeer)?,
-            current
-                .metadata()
-                .map_err(|_| ProtocolError::UntrustedPeer)?,
-        );
-        if retained.dev() != current.dev() || retained.ino() != current.ino() {
-            return Err(ProtocolError::UntrustedPeer);
-        }
-        Ok(())
+    /// A listening socket in the invoking user's private directory. Dropping it
+    /// unlinks the socket through the retained directory descriptor.
+    pub struct Listening {
+        pub listener: UnixListener,
+        directory: File,
+        name: std::ffi::CString,
     }
 
-    /// Helper side: validate the private directory, then listen on a socket
-    /// that only the invoking user can open.
-    pub fn listen_as(socket: &Path, invoking_uid: u32) -> Result<UnixListener, ProtocolError> {
+    impl Drop for Listening {
+        fn drop(&mut self) {
+            // SAFETY: unlinkat names an entry of the directory we hold open.
+            unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+        }
+    }
+
+    /// Helper side: validate the private directory through one descriptor
+    /// opened without following links, then listen on a socket in it. The
+    /// socket stays owned by root (no chown into the user's directory); the
+    /// directory is the user's, so only that user can reach it.
+    pub fn listen_as(socket: &Path, invoking_uid: u32) -> Result<Listening, ProtocolError> {
+        use std::os::unix::fs::OpenOptionsExt;
         if invoking_uid == 0 || socket.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
             return Err(ProtocolError::UntrustedPeer);
         }
         let directory = socket.parent().ok_or(ProtocolError::UntrustedPeer)?;
-        let metadata = fs::symlink_metadata(directory).map_err(|_| ProtocolError::UntrustedPeer)?;
+        let name = socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| {
+                name.ends_with(".sock")
+                    && name.len() <= 32
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+            })
+            .ok_or(ProtocolError::UntrustedPeer)?;
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(directory)
+            .map_err(|_| ProtocolError::UntrustedPeer)?;
+        let metadata = handle
+            .metadata()
+            .map_err(|_| ProtocolError::UntrustedPeer)?;
         if directory.file_name().and_then(|name| name.to_str()) != Some(SOCKET_DIRECTORY)
-            || fs::canonicalize(directory).ok().as_deref() != Some(directory)
             || !metadata.is_dir()
             || metadata.uid() != invoking_uid
             || metadata.mode() & 0o077 != 0
         {
             return Err(ProtocolError::UntrustedPeer);
         }
-        // SAFETY: umask only changes this process's creation mask.
-        let previous = unsafe { libc::umask(0o177) };
+        let name = std::ffi::CString::new(name).map_err(|_| ProtocolError::UntrustedPeer)?;
+        // SAFETY: umask only changes this process's creation mask; 0o111 leaves
+        // a 0666 socket that the user can connect to.
+        let previous = unsafe { libc::umask(0o111) };
         let listener = UnixListener::bind(socket);
         // SAFETY: restores the mask saved above.
         unsafe { libc::umask(previous) };
         let listener = listener.map_err(|_| ProtocolError::Transport)?;
-        let path =
-            std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(socket.as_os_str()))
-                .map_err(|_| ProtocolError::Transport)?;
-        // SAFETY: path is a NUL-terminated string; a gid of -1 is unchanged.
-        if unsafe { libc::lchown(path.as_ptr(), invoking_uid, !0) } != 0 {
-            let _ = fs::remove_file(socket);
-            return Err(ProtocolError::Transport);
+        let listening = Listening {
+            listener,
+            directory: handle,
+            name,
+        };
+        // The bind went through a path, so confirm through the checked
+        // descriptor that the new socket really is an entry of that directory
+        // and is ours (root's, in production).
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: valid directory descriptor and name; stat is writable.
+        let found = unsafe {
+            libc::fstatat(
+                listening.directory.as_raw_fd(),
+                listening.name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        // SAFETY: fstatat succeeded, so stat is initialised.
+        let stat = unsafe { stat.assume_init() };
+        // SAFETY: geteuid has no arguments.
+        if found != 0
+            || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+            || stat.st_uid != unsafe { libc::geteuid() }
+        {
+            return Err(ProtocolError::UntrustedPeer);
         }
-        listener
+        listening
+            .listener
             .set_nonblocking(true)
             .map_err(|_| ProtocolError::Transport)?;
-        Ok(listener)
+        Ok(listening)
     }
 
     fn read_exact_before(
@@ -1568,13 +1681,13 @@ pub mod macos_transport {
         }
     }
 
-    /// Helper side: accept one connection and authenticate it. The pin is the
-    /// SHA-256 of the application executable the administrator prompt was
-    /// started from; a peer running anything else is refused.
+    /// Helper side: accept one connection and authenticate it. The peer must
+    /// be a process signed by the team the administrator prompt was started
+    /// for; a peer running anything else is refused.
     pub fn authenticate_one(
         listener: &UnixListener,
         invoking_uid: u32,
-        client_pin: &[u8; 32],
+        team: &str,
     ) -> Result<(AuthenticatedChannel, Request, [File; 3]), ProtocolError> {
         let accept_deadline = Instant::now() + Duration::from_secs(60);
         let mut stream = loop {
@@ -1598,7 +1711,7 @@ pub mod macos_transport {
         if peer.uid != invoking_uid {
             return Err(ProtocolError::UntrustedPeer);
         }
-        let pinned_executable = verify_peer_executable(peer, client_pin)?;
+        verify_peer_token(&peer.token, team)?;
         let request_deadline = Instant::now() + IO_TIMEOUT;
         let mut challenge = [0; 32];
         File::open("/dev/urandom")
@@ -1636,7 +1749,7 @@ pub mod macos_transport {
         if peer_of(&stream)? != peer {
             return Err(ProtocolError::UntrustedPeer);
         }
-        verify_pid_executable(peer.pid, &pinned_executable)?;
+        verify_peer_token(&peer.token, team)?;
         let request = decode_frame(&frame)?;
         let now = boottime_ns()?;
         if request.confirmation_deadline_boot_ns <= now
@@ -1654,7 +1767,8 @@ pub mod macos_transport {
                 peer_uid: peer.uid,
                 request_binding: expected,
                 _single_use: (),
-                executable: pinned_executable,
+                peer_token: peer.token,
+                team: team.to_owned(),
             },
             request,
             sources,
@@ -1687,6 +1801,7 @@ pub mod macos_transport {
     /// only ad-hoc signed or fails strict verification.
     fn team_identifier(path: &Path) -> Option<String> {
         let verified = Command::new(CODESIGN_PATH)
+            .env_clear()
             .args(["--verify", "--strict"])
             .arg(path)
             .stdin(Stdio::null())
@@ -1698,6 +1813,7 @@ pub mod macos_transport {
             return None;
         }
         let details = Command::new(CODESIGN_PATH)
+            .env_clear()
             .args(["-d", "--verbose=2"])
             .arg(path)
             .stdin(Stdio::null())
@@ -1723,15 +1839,15 @@ pub mod macos_transport {
 
     /// The helper may be started only when it and the running application are
     /// both Developer ID signed by the same team.
-    fn verify_bundle(running: &Path) -> Result<(PathBuf, PathBuf), ProtocolError> {
+    fn verify_bundle(running: &Path) -> Result<(PathBuf, PathBuf, String), ProtocolError> {
         let (application, helper) = bundle_paths(running)?;
         match (team_identifier(&application), team_identifier(&helper)) {
-            (Some(app), Some(helper_team)) if app == helper_team => Ok((application, helper)),
+            (Some(app), Some(helper_team)) if app == helper_team => Ok((application, helper, app)),
             _ => Err(ProtocolError::PackageTrustUnavailable),
         }
     }
 
-    fn verify_installation() -> Result<(PathBuf, PathBuf), ProtocolError> {
+    fn verify_installation() -> Result<(PathBuf, PathBuf, String), ProtocolError> {
         verify_bundle(&std::env::current_exe().map_err(|_| ProtocolError::PackageTrustUnavailable)?)
     }
 
@@ -1740,44 +1856,34 @@ pub mod macos_transport {
         verify_installation().is_ok()
     }
 
-    /// Helper side: the only client is the application beside this helper,
-    /// which must carry the same Developer ID team as the helper itself.
-    pub fn installed_client_pin() -> Result<[u8; 32], ProtocolError> {
-        let (application, _) = verify_installation()?;
-        let bytes = fs::read(application).map_err(|_| ProtocolError::PackageTrustUnavailable)?;
-        if bytes.is_empty() || bytes.len() as u64 > MAX_PEER_EXECUTABLE_BYTES {
-            return Err(ProtocolError::PackageTrustUnavailable);
-        }
-        Ok(sha256(&bytes))
-    }
+    /// Runs as root after the prompt. The helper is first copied into a fresh
+    /// root-owned directory and that copy, which no user can alter, must satisfy
+    /// the team requirement before it runs; the bundle path is never executed.
+    /// Every argument is quoted by AppleScript itself, so none is parsed by a
+    /// shell. The team was validated as alphanumeric by the caller.
+    const ADMINISTRATOR_SCRIPT: &str = r#"on run argv
+set helperPath to item 1 of argv
+set teamId to item 2 of argv
+set helperArguments to ""
+repeat with index from 3 to count of argv
+set helperArguments to helperArguments & " " & quoted form of (item index of argv)
+end repeat
+set requirementText to "=anchor apple generic and certificate leaf[subject.OU] = \"" & teamId & "\""
+set shellText to "d=$(/usr/bin/mktemp -d /private/var/root/ais-host-helper.XXXXXXXX) || exit 1; /bin/cp " & quoted form of helperPath & " \"$d/helper\" && /usr/bin/codesign --verify --strict -R " & quoted form of requirementText & " \"$d/helper\" && \"$d/helper\"" & helperArguments & "; s=$?; /bin/rm -rf \"$d\"; exit $s"
+with timeout of 3600 seconds
+do shell script shellText with administrator privileges
+end timeout
+end run"#;
 
-    /// Run the helper as root through the system administrator prompt. Every
-    /// argument is quoted by AppleScript itself, so none is parsed by a shell.
-    fn administrator_command(helper: &Path, arguments: &[&str]) -> Command {
+    /// Run the helper as root through the system administrator prompt.
+    fn administrator_command(helper: &Path, team: &str, arguments: &[&str]) -> Command {
         let mut command = Command::new(OSASCRIPT_PATH);
         command
-            .args([
-                "-e",
-                "on run argv",
-                "-e",
-                "set line to \"\"",
-                "-e",
-                "repeat with part in argv",
-                "-e",
-                "set line to line & quoted form of (contents of part) & \" \"",
-                "-e",
-                "end repeat",
-                "-e",
-                "with timeout of 3600 seconds",
-                "-e",
-                "do shell script line with administrator privileges",
-                "-e",
-                "end timeout",
-                "-e",
-                "end run",
-                "--",
-            ])
+            .arg("-e")
+            .arg(ADMINISTRATOR_SCRIPT)
+            .arg("--")
             .arg(helper)
+            .arg(team)
             .args(arguments)
             .stdin(Stdio::null());
         command
@@ -1785,8 +1891,8 @@ pub mod macos_transport {
 
     /// Read-only privileged preview whose single output line is bounded.
     fn preview(flag: &str, identity: &str, limit: usize) -> Result<Vec<u8>, ProtocolError> {
-        let (_, helper) = verify_installation()?;
-        let mut child = administrator_command(&helper, &[flag, identity])
+        let (_, helper, team) = verify_installation()?;
+        let mut child = administrator_command(&helper, &team, &[flag, identity])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -1830,7 +1936,7 @@ pub mod macos_transport {
         mut request: Request,
     ) -> Result<(), ProtocolError> {
         use std::os::unix::fs::DirBuilderExt;
-        let (_, helper) = verify_installation()?;
+        let (_, helper, team) = verify_installation()?;
         let directory = std::env::temp_dir().join(SOCKET_DIRECTORY);
         match fs::DirBuilder::new().mode(0o700).create(&directory) {
             Ok(()) => {}
@@ -1854,19 +1960,21 @@ pub mod macos_transport {
         let _cleanup = RemoveOnDrop(socket.clone());
         let uid = invoking_uid.to_string();
         let socket_argument = socket.to_str().ok_or(ProtocolError::Transport)?;
-        let mut child = administrator_command(&helper, &["--serve-as", socket_argument, &uid])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| ProtocolError::PackageTrustUnavailable)?;
+        let mut child = administrator_command(
+            &helper,
+            &team,
+            &["--serve-as", socket_argument, &uid, &team],
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ProtocolError::PackageTrustUnavailable)?;
         // The user may be typing a password, so wait generously for the socket.
         let deadline = Instant::now() + Duration::from_secs(120);
         let mut stream = loop {
-            let ready = fs::symlink_metadata(&socket).is_ok_and(|metadata| {
-                metadata.file_type().is_socket()
-                    && metadata.uid() == invoking_uid
-                    && metadata.mode() & 0o077 == 0
-            });
+            // The helper binds as root; a socket owned by anyone else is a squatter.
+            let ready = fs::symlink_metadata(&socket)
+                .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == 0);
             if ready && let Ok(stream) = UnixStream::connect(&socket) {
                 break stream;
             }
@@ -1997,26 +2105,40 @@ pub mod macos_transport {
         }
 
         #[test]
-        fn peer_credentials_name_this_process() {
+        fn peer_credentials_name_this_process_and_its_token_fails_a_foreign_team() {
             let (_, receiver) = UnixStream::pair().unwrap();
             let peer = peer_of(&receiver).unwrap();
             assert_eq!(peer.uid, current_uid());
             assert_eq!(peer.pid, std::process::id());
-            let path = executable_path(peer.pid).unwrap();
-            assert_eq!(
-                path,
-                std::env::current_exe().unwrap().canonicalize().unwrap()
-            );
+            // The test binary is not signed by this team, nor any team at all.
+            assert!(!peer_satisfies_team(&peer.token, "ZZZZZZZZZZ"));
+            assert!(verify_peer_token(&peer.token, "ZZZZZZZZZZ").is_err());
+            // Malformed teams are never interpolated into a requirement.
+            for team in ["", "A\" or anchor apple", "a b", &"A".repeat(17)] {
+                assert!(!peer_satisfies_team(&peer.token, team));
+            }
+            // A token that names no process resolves to nothing.
+            assert!(!peer_satisfies_team(&[0; 32], "ZZZZZZZZZZ"));
         }
 
         #[test]
-        fn only_the_pinned_executable_authenticates() {
-            let (_, receiver) = UnixStream::pair().unwrap();
-            let peer = peer_of(&receiver).unwrap();
-            let own = fs::read(std::env::current_exe().unwrap()).unwrap();
-            let retained = verify_peer_executable(peer, &sha256(&own)).unwrap();
-            verify_pid_executable(peer.pid, &retained).unwrap();
-            assert!(verify_peer_executable(peer, &[0; 32]).is_err());
+        fn the_administrator_script_verifies_the_copy_before_running_it() {
+            let copy = ADMINISTRATOR_SCRIPT.find("/bin/cp").unwrap();
+            let verify = ADMINISTRATOR_SCRIPT
+                .find("codesign --verify --strict")
+                .unwrap();
+            let run = ADMINISTRATOR_SCRIPT.rfind("$d/helper").unwrap();
+            assert!(copy < verify && verify < run);
+            assert!(ADMINISTRATOR_SCRIPT.contains("/private/var/root/"));
+            // The bundle path is only ever the source of the copy.
+            assert_eq!(
+                ADMINISTRATOR_SCRIPT.matches("helperPath").count(),
+                2 /* set + copy */
+            );
+            assert!(
+                !ADMINISTRATOR_SCRIPT.contains("set line")
+                    && !ADMINISTRATOR_SCRIPT.contains("part")
+            );
         }
 
         #[test]
@@ -2049,8 +2171,11 @@ pub mod macos_transport {
             let _listener = listen_as(&socket, current_uid()).unwrap();
             let metadata = fs::symlink_metadata(&socket).unwrap();
             assert!(metadata.file_type().is_socket());
-            assert_eq!(metadata.mode() & 0o077, 0);
+            // Not chowned into the user's directory: 0666 and owned by the binder.
+            assert_eq!(metadata.mode() & 0o777, 0o666);
             assert_eq!(metadata.uid(), current_uid());
+            drop(_listener);
+            assert!(fs::symlink_metadata(&socket).is_err(), "unlinked on drop");
             let _ = fs::remove_dir_all(&base);
         }
     }

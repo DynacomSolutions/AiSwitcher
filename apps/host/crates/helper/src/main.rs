@@ -17,6 +17,7 @@ enum Command {
     ServeAs {
         socket: PathBuf,
         uid: u32,
+        team: String,
     },
     Preview(String),
     PreviewUpdate(String),
@@ -68,7 +69,9 @@ fn run() -> Result<(), &'static str> {
             return Err("The privileged helper invocation is invalid.");
         }
         match command {
-            Command::ServeAs { socket, uid } => ais_host_helper::service::run_macos(socket, uid),
+            Command::ServeAs { socket, uid, team } => {
+                ais_host_helper::service::run_macos(socket, uid, &team)
+            }
             Command::Preview(identity) => ais_host_helper::service::preview_macos(&identity),
             Command::PreviewUpdate(identity) => {
                 ais_host_helper::service::preview_update_macos(&identity)
@@ -87,7 +90,9 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
     let mut args = args.into_iter();
     let mode = args.next();
     if mode.as_deref().and_then(|mode| mode.to_str()) == Some("--serve-as") {
-        let (Some(socket), Some(uid), None) = (args.next(), args.next(), args.next()) else {
+        let (Some(socket), Some(uid), Some(team), None) =
+            (args.next(), args.next(), args.next(), args.next())
+        else {
             return Err("Unexpected helper arguments.");
         };
         let socket = PathBuf::from(socket);
@@ -96,10 +101,19 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
             .and_then(|uid| uid.parse::<u32>().ok())
             .filter(|uid| *uid != 0)
             .ok_or("The invoking identity is invalid.")?;
+        let team = team
+            .into_string()
+            .ok()
+            .filter(|team| {
+                !team.is_empty()
+                    && team.len() <= 16
+                    && team.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or("The signing team is invalid.")?;
         if !socket.is_absolute() || socket.as_os_str().len() > MAX_SOCKET_BYTES {
             return Err("The private helper socket path is invalid.");
         }
-        return Ok(Command::ServeAs { socket, uid });
+        return Ok(Command::ServeAs { socket, uid, team });
     }
     let value = args
         .next()
@@ -161,6 +175,7 @@ mod tests {
                 OsString::from("--serve-as"),
                 OsString::from("/var/folders/x/T/ais-host-helper/a.sock"),
                 OsString::from("501"),
+                OsString::from("ABCDE12345"),
             ]),
             Ok(Command::ServeAs { uid: 501, .. })
         ));
@@ -174,22 +189,31 @@ mod tests {
                 OsString::from(format!("{IDENTITY_PREFIX}8:16")),
                 OsString::from("--exec"),
             ],
-            // Root is never an invoking user, and no pin or extra argument is accepted.
+            // Root is never an invoking user; the team is alphanumeric; nothing extra is accepted.
             vec![
                 OsString::from("--serve-as"),
                 OsString::from("/var/folders/x/T/ais-host-helper/a.sock"),
                 OsString::from("0"),
+                OsString::from("ABCDE12345"),
             ],
             vec![
                 OsString::from("--serve-as"),
                 OsString::from("/var/folders/x/T/ais-host-helper/a.sock"),
                 OsString::from("501"),
-                OsString::from("a".repeat(64)),
+                OsString::from("ABCDE12345"),
+                OsString::from("--exec"),
+            ],
+            vec![
+                OsString::from("--serve-as"),
+                OsString::from("/var/folders/x/T/ais-host-helper/a.sock"),
+                OsString::from("501"),
+                OsString::from("A\" or anchor"),
             ],
             vec![
                 OsString::from("--serve-as"),
                 OsString::from("relative.sock"),
                 OsString::from("501"),
+                OsString::from("ABCDE12345"),
             ],
             vec![
                 OsString::from("--serve"),

@@ -238,10 +238,47 @@ fn staging_file(length: u64) -> Result<(File, String, StagingName), &'static str
 /// image with no mounting, formatted, and detached again before it is read.
 #[cfg(target_os = "macos")]
 fn format_staging(mkfs: &Path, path: &str) -> Result<(), &'static str> {
-    use std::io::Read;
-    let mut child = Command::new("/usr/bin/hdiutil")
-        .args([
+    let attached = attach_whole_disk(path)?;
+    let formatted = run_tool(
+        mkfs,
+        &["-v", "AISX", &attached.replacen("/dev/", "/dev/r", 1)],
+    );
+    let detached = run_tool(Path::new("/usr/bin/hdiutil"), &["detach", &attached]);
+    formatted?;
+    detached
+}
+
+/// Attach with `-plist`, convert it to JSON and take the whole-disk entry.
+#[cfg(target_os = "macos")]
+fn attach_whole_disk(path: &str) -> Result<String, &'static str> {
+    const FAILED: &str = "The exchange staging image could not be attached.";
+    let run = |program: &str, args: &[&str], input: Option<&[u8]>| {
+        let mut child = Command::new(program)
+            .args(args)
+            .env_clear()
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| FAILED)?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input).map_err(|_| FAILED)?;
+        }
+        let output = child.wait_with_output().map_err(|_| FAILED)?;
+        if !output.status.success() || output.stdout.len() > 64 * 1024 {
+            return Err(FAILED);
+        }
+        Ok::<_, &'static str>(output.stdout)
+    };
+    let plist = run(
+        "/usr/bin/hdiutil",
+        &[
             "attach",
+            "-plist",
             "-nomount",
             "-noverify",
             "-noautofsck",
@@ -249,41 +286,32 @@ fn format_staging(mkfs: &Path, path: &str) -> Result<(), &'static str> {
             "-imagekey",
             "diskimage-class=CRawDiskImage",
             path,
-        ])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "The exchange staging image could not be attached.")?;
-    let mut output = String::new();
-    let read = child
-        .stdout
-        .take()
-        .ok_or("The exchange staging image could not be attached.")?
-        .take(4096)
-        .read_to_string(&mut output);
-    let status = child
-        .wait()
-        .map_err(|_| "The exchange staging image could not be attached.")?;
-    // The first token of the first line names the whole attached disk.
-    let node = output
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().next())
-        .filter(|node| {
+        ],
+        None,
+    )?;
+    let json = run(
+        "/usr/bin/plutil",
+        &["-convert", "json", "-o", "-", "-"],
+        Some(&plist),
+    )?;
+    whole_disk_entry(&json).ok_or(FAILED)
+}
+
+/// The `/dev/diskN` entry (not a slice) among the attached system entities.
+#[cfg(any(target_os = "macos", test))]
+fn whole_disk_entry(json: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    value
+        .get("system-entities")?
+        .as_array()?
+        .iter()
+        .filter_map(|entity| entity.get("dev-entry")?.as_str())
+        .find(|node| {
             node.strip_prefix("/dev/disk").is_some_and(|digits| {
                 !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
             })
         })
-        .map(str::to_owned);
-    let (Some(node), true, true) = (node, read.is_ok(), status.success()) else {
-        return Err("The exchange staging image could not be attached.");
-    };
-    let formatted = run_tool(mkfs, &["-v", "AISX", &node.replacen("/dev/", "/dev/r", 1)]);
-    let detached = run_tool(Path::new("/usr/bin/hdiutil"), &["detach", &node]);
-    formatted?;
-    detached
+        .map(str::to_owned)
 }
 
 /// The boot-region layout is checked below and the app re-mounts and verifies
@@ -500,5 +528,25 @@ mod tests {
             u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
             range.length / 512
         );
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::whole_disk_entry;
+
+    #[test]
+    fn the_whole_disk_is_chosen_by_name_not_by_position() {
+        let json =
+            br#"{"system-entities":[{"dev-entry":"/dev/disk9s1"},{"dev-entry":"/dev/disk9"}]}"#;
+        assert_eq!(whole_disk_entry(json).as_deref(), Some("/dev/disk9"));
+        for bad in [
+            &br#"{"system-entities":[{"dev-entry":"/dev/disk9s1"}]}"#[..],
+            br#"{"system-entities":[{"dev-entry":"/tmp/disk9"}]}"#,
+            br#"{}"#,
+            b"not json",
+        ] {
+            assert!(whole_disk_entry(bad).is_none());
+        }
     }
 }
