@@ -204,7 +204,8 @@ test.skipIf(process.platform !== "linux" || !rsync)("conflict-prone trees conver
   // costs about 4 MB of runtime start-up. The ~40 MB of history this fixture used to re-stage would show here.
   const localEntry = steady.entries.find((e) => e.argv === "sync now")!;
   const remoteAis = steady.entries.filter((e) => e.argv.startsWith("sync ") && e.argv !== "sync now");
-  expect(bytes(localEntry)).toBeLessThan(30_000_000);
+  // The fake ssh runs the remote tail-plan and merge as children, so their start-up (about 5 MB each) lands here too.
+  expect(bytes(localEntry)).toBeLessThan(50_000_000);
   expect(localEntry.write_bytes).toBeLessThan(1_000_000);
   expect(remoteAis.length).toBeGreaterThan(0);
   for (const e of remoteAis) {
