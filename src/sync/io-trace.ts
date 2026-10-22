@@ -21,8 +21,9 @@ export function ioTraceEnabled(): boolean {
   return process.env.AIS_SYNC_IO_TRACE === "1" && process.platform === "linux";
 }
 
-function sample(): number[] {
-  const io = readFileSync("/proc/self/io", "utf8");
+export function sample(path = "/proc/self/io"): number[] {
+  let io: string;
+  try { io = readFileSync(path, "utf8"); } catch { return [0, 0, 0, 0]; }
   return ["rchar", "wchar", "read_bytes", "write_bytes"].map((key) => Number(new RegExp(`^${key}: (\\d+)`, "m").exec(io)?.[1] ?? 0));
 }
 

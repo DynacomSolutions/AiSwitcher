@@ -18,6 +18,8 @@ import {
   type PurgeOptions,
   type PurgeReport,
 } from "../identities/retire-credentials.ts";
+import { withClaudeLocks } from "../identities/claude-swap-lock.ts";
+import { writeFileAtomic } from "../identities/pool/fs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
@@ -181,7 +183,8 @@ async function convergeMtime(source: string, destination: string, rel: string, d
 async function copyKeepingMtime(source: string, destination: string): Promise<void> {
   await fsOps.copyFile(source, destination);
   const info = await stat(source);
-  await fsOps.utimes(destination, info.atime, info.mtime);
+  // rsync's quick check compares whole seconds: a same-size rewrite within the source's second would never resync.
+  await fsOps.utimes(destination, info.atime, Date.now() - info.mtimeMs >= 2000 ? info.mtime : new Date());
 }
 
 /** After a JSONL merge both hosts hold the same set of lines, but a different order or append time:
@@ -206,29 +209,43 @@ async function sourceWinsTie(source: string, destination: string): Promise<boole
 /** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict. */
 const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at)$/;
 
-/** A per-identity `.claude.json` is rewritten constantly by every running Claude Code on every host. The newest
- * copy wins key by key (and project by project); keys only the older copy has are kept, so nothing is dropped. */
-async function mergeClaudeJson(source: string, destination: string, rel: string, denied?: string[]): Promise<boolean> {
-  let incoming: Record<string, unknown>;
-  let live: Record<string, unknown>;
-  try {
-    [incoming, live] = await Promise.all([source, destination].map(async (path) => JSON.parse(await readFile(path, "utf8")))) as Array<Record<string, unknown>>;
-  } catch { return false; }
+/** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
+const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|changelogLastFetched|cached.*|.*Cache.*)$/;
+
+/** A per-identity `.claude.json` is rewritten constantly by every running Claude Code on every host. Self-changing
+ * keys merge key by key; every other key follows the newest file whole (deletions included) and, when the older
+ * file held a different value, that file is preserved and counted as a conflict. */
+async function mergeClaudeJson(source: string, destination: string, rel: string, conflictRoot: string, result: TreeMergeResult): Promise<boolean> {
   const plain = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-  if (!plain(incoming) || !plain(live)) return false;
-  const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
-  const sourceWins = sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination);
-  const [winner, loser] = sourceWins ? [incoming, live] : [live, incoming];
-  const merged: Record<string, unknown> = { ...loser, ...winner };
-  if (plain(winner.projects) && plain(loser.projects)) merged.projects = { ...loser.projects, ...winner.projects };
-  if (isDeepStrictEqual(merged, live)) return true;
-  await tolerateDenied(rel, async () => {
-    if (isDeepStrictEqual(merged, incoming)) await copyKeepingMtime(source, destination);
+  const read = async (path: string): Promise<Record<string, unknown> | undefined> => {
+    try { const v = JSON.parse(await readFile(path, "utf8")); return plain(v) ? v : undefined; } catch { return undefined; }
+  };
+  if (!(await read(source)) || !(await read(destination))) return false;
+  await tolerateDenied(rel, () => withClaudeLocks(dirname(destination), async () => {
+    // Re-read under the lock: Claude Code may have rewritten the live file meanwhile.
+    const [incoming, live] = await Promise.all([read(source), read(destination)]);
+    if (!incoming || !live) return;
+    const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
+    const sourceWins = sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination);
+    const [winner, loser] = sourceWins ? [incoming, live] : [live, incoming];
+    const merged: Record<string, unknown> = { ...winner };
+    let conflict = false;
+    for (const [key, value] of Object.entries(loser)) {
+      if (SELF_CHANGING_CLAUDE_KEYS.test(key)) { if (!(key in winner)) merged[key] = value; }
+      else if (!isDeepStrictEqual(value, winner[key])) conflict = true;
+    }
+    if (conflict) {
+      await preserveFile(sourceWins ? destination : source, conflictRoot, sourceWins ? "local" : "incoming", rel);
+      result.preservedConflicts++;
+      result.preservedConflictPaths.push(rel);
+    }
+    if (sourceWins && isDeepStrictEqual(merged, incoming)) await copyKeepingMtime(source, destination);
+    else if (isDeepStrictEqual(merged, live)) return;
     else {
-      await writeFile(destination, `${JSON.stringify(merged, null, 2)}\n`);
+      await writeFileAtomic(destination, `${JSON.stringify(merged, null, 2)}\n`);
       await fsOps.utimes(destination, destinationStat.atime, new Date(Math.max(sourceStat.mtimeMs, destinationStat.mtimeMs)));
     }
-  }, denied);
+  }), result.deniedPaths);
   return true;
 }
 
@@ -663,7 +680,7 @@ export async function mergeIncomingProfileTree(
         result.preservedConflicts++;
         result.preservedConflictPaths.push(rel);
       }
-      if (mergeResult === "merged" || mergeResult === "unchanged") await alignMergedMtime(source, destination, rel, result.deniedPaths);
+      if (!incompleteSource && (mergeResult === "merged" || mergeResult === "unchanged")) await alignMergedMtime(source, destination, rel, result.deniedPaths);
       continue;
     }
 
@@ -676,7 +693,7 @@ export async function mergeIncomingProfileTree(
       await convergeMtime(source, destination, rel, result.deniedPaths);
       continue;
     }
-    if (basename(rel) === ".claude.json" && (await mergeClaudeJson(source, destination, rel, result.deniedPaths))) continue;
+    if (basename(rel) === ".claude.json" && (await mergeClaudeJson(source, destination, rel, conflictRoot, result))) continue;
 
     const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
     const volatile = VOLATILE_STATE.test(rel);

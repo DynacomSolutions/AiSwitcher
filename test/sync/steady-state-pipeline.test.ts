@@ -141,8 +141,8 @@ test.skipIf(process.platform !== "linux" || !rsync)("conflict-prone trees conver
   await put(local, `${a}/only-local.bin`, Buffer.alloc(8 * MB, 1), T + 5);
   await put(remote, `${a}/only-remote.bin`, Buffer.alloc(8 * MB, 2), T + 5);
   // Per-identity state that both hosts rewrite, in both mtime orders.
-  await put(local, `${a}/.claude.json`, JSON.stringify({ n: 1, onlyLocal: true, projects: { "/l": 1, "/both": "local" } }), T + 30);
-  await put(remote, `${a}/.claude.json`, JSON.stringify({ n: 2, onlyRemote: true, projects: { "/r": 1, "/both": "remote" } }), T + 20);
+  await put(local, `${a}/.claude.json`, JSON.stringify({ n: 1, onlyLocal: true, numStartups: 5, projects: { "/l": 1, "/both": "local" } }), T + 30);
+  await put(remote, `${a}/.claude.json`, JSON.stringify({ n: 2, onlyRemote: true, cachedFlags: { f: 1 }, projects: { "/r": 1, "/both": "remote" } }), T + 20);
   await put(local, `${a}/.last-cleanup`, "local", T + 30);
   await put(remote, `${a}/.last-cleanup`, "remote", T + 20);
   // A shared hook that differs between hosts yet carries the very same mtime: a true conflict that must still keep both versions.
@@ -176,7 +176,7 @@ test.skipIf(process.platform !== "linux" || !rsync)("conflict-prone trees conver
   const seconds = async (home: string) => Math.floor((await Bun.file(join(home, a, "projects/p/s1.jsonl")).stat()).mtimeMs / 1000);
   expect(await seconds(local)).toBe(await seconds(remote));
   expect(await readFile(join(local, ".ais/hooks/x.sh"), "utf8")).toBe(await readFile(join(remote, ".ais/hooks/x.sh"), "utf8"));
-  expect(JSON.parse(await readFile(join(remote, a, ".claude.json"), "utf8"))).toEqual({ n: 1, onlyLocal: true, onlyRemote: true, projects: { "/l": 1, "/r": 1, "/both": "local" } });
+  expect(JSON.parse(await readFile(join(remote, a, ".claude.json"), "utf8"))).toEqual({ n: 1, onlyLocal: true, numStartups: 5, cachedFlags: { f: 1 }, projects: { "/l": 1, "/both": "local" } });
   expect(await readFile(join(remote, a, ".claude.json"), "utf8")).toBe(await readFile(join(local, a, ".claude.json"), "utf8"));
   expect(await readFile(join(remote, a, ".last-cleanup"), "utf8")).toBe("local");
   expect(await Bun.file(join(remote, a, "sessions/100.json")).exists()).toBe(false);
