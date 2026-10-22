@@ -74,12 +74,12 @@ jobs:
           DYNACOM_APPLE_ASC_KEY_ID: ${{ secrets.DYNACOM_APPLE_ASC_KEY_ID }}
           DYNACOM_APPLE_ASC_ISSUER_ID: ${{ secrets.DYNACOM_APPLE_ASC_ISSUER_ID }}
         run: python3 scripts/host/sign-macos.py
-      - name: Verify the final archived Mac application
+      - name: Verify the final Mac disk image
         if: steps.sign.outputs.ready == 'true'
         run: >
           bun run scripts/host/release-assets.ts --smoke --production
           --target=macos-arm64
-          "--asset=$HOST_SIGN_DIR/signed/ais-host-macos-arm64.zip"
+          "--asset=$HOST_SIGN_DIR/signed/ais-host-macos-arm64.dmg"
           "--destination=$HOST_SIGN_DIR/clean signed launch é"
       - uses: actions/upload-artifact@v4
         if: steps.sign.outputs.ready == 'true'
@@ -157,7 +157,7 @@ jobs:
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: macos-arm64
-            filename: ais-host-macos-arm64.zip
+            filename: ais-host-macos-arm64.dmg
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             asset: windows-x64

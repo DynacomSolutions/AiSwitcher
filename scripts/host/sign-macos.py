@@ -1,4 +1,4 @@
-"""Sign nested code, notarise, staple, then archive. Never log tool diagnostics."""
+"""Sign nested code, notarise and staple the app, then the DMG. Never log tool diagnostics."""
 import base64
 import json
 import os
@@ -108,22 +108,47 @@ def main():
                 call([*options, *entitlements, str(binaries / name)], step=f"codesign {name}")
             call([*options, str(app)], step="codesign app")
             call(["codesign", "--verify", "--deep", "--strict", str(app)], step="codesign verify")
+
+            def notarise(path, label):
+                # Key ID and issuer are identifiers, not secrets; the private key stays a 0600 file.
+                receipt = json.loads(call(
+                    ["xcrun", "notarytool", "submit", str(path),
+                     "--key", str(api_key), "--key-id", env["DYNACOM_APPLE_ASC_KEY_ID"],
+                     "--issuer", env["DYNACOM_APPLE_ASC_ISSUER_ID"], "--wait",
+                     "--timeout", "30m", "--output-format", "json"], timeout=1900,
+                    step=f"notarytool submit {label}"))
+                if receipt.get("status") != "Accepted":
+                    raise StepFailed(f"{label} notarisation status {receipt.get('status')!r}")
+
             submission = private / "submission.zip"
             call(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(submission)])
-            # Key ID and issuer are identifiers, not secrets; the private key stays a 0600 file.
-            receipt = json.loads(call(
-                ["xcrun", "notarytool", "submit", str(submission),
-                 "--key", str(api_key), "--key-id", env["DYNACOM_APPLE_ASC_KEY_ID"],
-                 "--issuer", env["DYNACOM_APPLE_ASC_ISSUER_ID"], "--wait",
-                 "--timeout", "30m", "--output-format", "json"], timeout=1900, step="notarytool submit"))
-            if receipt.get("status") != "Accepted":
-                raise StepFailed(f"notarisation status {receipt.get('status')!r}")
+            # The app is stapled itself so a copy dragged out of the DMG verifies offline.
+            notarise(submission, "app")
             call(["xcrun", "stapler", "staple", str(app)])
             call(["xcrun", "stapler", "validate", str(app)])
             call(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)])
             call(["spctl", "--assess", "--type", "execute", "--verbose=2", str(app)])
-            final = destination / "ais-host-macos-arm64.zip"
-            call(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(final)])
+            staging = private / "dmg"
+            staging.mkdir()
+            call(["ditto", str(app), str(staging / app.name)])
+            (staging / "Applications").symlink_to("/Applications")
+            final = destination / "ais-host-macos-arm64.dmg"
+            for attempt in range(3):
+                # hdiutil intermittently reports a busy resource on hosted runners.
+                try:
+                    call(["hdiutil", "create", "-volname", "ais Host", "-srcfolder", str(staging),
+                          "-fs", "HFS+", "-format", "UDZO", "-ov", str(final)], timeout=600, step="hdiutil create")
+                    break
+                except StepFailed:
+                    if attempt == 2:
+                        raise
+            call(["codesign", "--force", "--timestamp", "--keychain", str(keychain), "--sign", fingerprint,
+                  str(final)], step="codesign dmg")
+            notarise(final, "dmg")
+            call(["xcrun", "stapler", "staple", str(final)], step="stapler staple dmg")
+            call(["xcrun", "stapler", "validate", str(final)], step="stapler validate dmg")
+            call(["spctl", "--assess", "--type", "open", "--context", "context:primary-signature",
+                  "--verbose=2", str(final)], step="spctl dmg")
             shutil.copyfile(archive.parent / "THIRD-PARTY-NOTICES-macos-arm64.txt",
                             destination / "THIRD-PARTY-NOTICES-macos-arm64.txt")
             # No signing output, certificate names or notary account IDs are

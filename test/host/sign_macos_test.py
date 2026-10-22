@@ -68,7 +68,7 @@ class SigningTests(unittest.TestCase):
                     stapled = True
                 if args[:2] == ["codesign", "--verify"] and stapled and altered:
                     raise RuntimeError("SYNTHETIC_FIXTURE signature invalidated")
-                if args[:3] == ["ditto", "-c", "-k"]:
+                if args[:3] == ["ditto", "-c", "-k"] or args[:2] == ["hdiutil", "create"]:
                     Path(args[-1]).write_text("SYNTHETIC_FIXTURE archive")
                 return b""
 
@@ -80,7 +80,7 @@ class SigningTests(unittest.TestCase):
                         else:
                             with self.assertRaises(RuntimeError):
                                 signing.main()
-            published = root / "work/signed/ais-host-macos-arm64.zip"
+            published = root / "work/signed/ais-host-macos-arm64.dmg"
             self.assertEqual(published.exists(), accepted and not altered)
             self.assertEqual((root / "outputs").read_text(), "ready=false\nready=true\n" if accepted and not altered else "ready=false\n")
             self.assertEqual(list(root.glob("host-sign-*")), [])
@@ -90,12 +90,17 @@ class SigningTests(unittest.TestCase):
         calls = self.exercise_signing()
         signed = [args[-1] for args in calls if args[:2] == ["codesign", "--force"]]
         self.assertEqual([Path(path).name for path in signed], [
-            "ais-host-adapter", "ais-host-escrow-purge", "ais-host-helper", "ais Host.app"])
-        final_archive = next(i for i, args in enumerate(calls) if args[-1].endswith("/signed/ais-host-macos-arm64.zip"))
-        staple = next(i for i, args in enumerate(calls) if args[:3] == ["xcrun", "stapler", "staple"])
+            "ais-host-adapter", "ais-host-escrow-purge", "ais-host-helper", "ais Host.app", "ais-host-macos-arm64.dmg"])
+        image = next(i for i, args in enumerate(calls) if args[:2] == ["hdiutil", "create"])
+        staples = [i for i, args in enumerate(calls) if args[:3] == ["xcrun", "stapler", "staple"]]
         assessment = next(i for i, args in enumerate(calls) if args[0] == "spctl")
-        self.assertGreater(final_archive, staple)
-        self.assertGreater(final_archive, assessment)
+        self.assertGreater(image, staples[0])
+        self.assertGreater(image, assessment)
+        # The DMG is signed, then notarised, then stapled, after it is built.
+        dmg_sign = next(i for i, args in enumerate(calls) if args[:2] == ["codesign", "--force"] and args[-1].endswith(".dmg"))
+        dmg_notary = [i for i, args in enumerate(calls) if args[:3] == ["xcrun", "notarytool", "submit"]][1]
+        self.assertTrue(image < dmg_sign < dmg_notary < staples[1])
+        self.assertTrue(calls[staples[1]][-1].endswith("/signed/ais-host-macos-arm64.dmg"))
 
     def test_rejected_notarisation_cannot_produce_release(self):
         self.exercise_signing(accepted=False)
