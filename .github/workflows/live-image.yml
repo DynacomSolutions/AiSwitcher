@@ -62,7 +62,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -182,43 +182,8 @@ jobs:
             awk 'NF==3 && $2>m {m=$2} END {print "max used_kib=" m}' "$RUNNER_TEMP/df-samples.txt" || true
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload the ISO
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: archiso-${{ matrix.flavour }}
-          path: |
-            out/archiso.iso
-            out/build-info.json
-          retention-days: 3
-
-      - name: Upload the raw disk image
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ais-live-${{ matrix.flavour == 'test' && 'image' || 'release-image' }}
-          path: out/${{ matrix.flavour == 'test' && 'ais-live.img' || 'ais-live-production.img' }}
-          retention-days: 3
-          compression-level: 6
-
-  # Boots the raw image under QEMU with SeaBIOS (bios) and OVMF (uefi).
-  boot-test:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        flavour: ${{ inputs.release && fromJSON('["test","production"]') || fromJSON('["test"]') }}
-        firmware: [bios, uefi]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Install boot-test tools
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            jq expect mtools python3 qemu-system-x86 ovmf gdisk
-
+      # The image stays on this runner's disk: boot tests and scenarios run
+      # here, so no multi-gigabyte disk image goes through Actions storage.
       # The hosted runner exposes /dev/kvm but not to the runner user.
       - name: Enable KVM
         run: |
@@ -229,114 +194,103 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ais-live-${{ matrix.flavour == 'test' && 'image' || 'release-image' }}
-          path: out
+      # The ISO is not needed after the El Torito check; free its space.
+      - name: Drop the ISO
+        run: |
+          set -euo pipefail
+          rm -f out/archiso.iso
 
-      - name: Boot (${{ matrix.firmware }})
-        env:
-          FIRMWARE: ${{ matrix.firmware }}
+      # Boots the raw image under QEMU with SeaBIOS (bios) and OVMF (uefi).
+      - name: Boot (bios and uefi)
         run: |
           set -euo pipefail
           image_name='ais-live.img'
           if [[ '${{ matrix.flavour }}' == production ]]; then image_name='ais-live-production.img'; fi
-          image/test/run-qemu.sh "out/$image_name" "$FIRMWARE"
+          for firmware in bios uefi; do
+            echo "::group::Boot ($firmware)"
+            image/test/run-qemu.sh "out/$image_name" "$firmware"
+            find out -name live.img -delete
+            echo "::endgroup::"
+          done
 
-      # Negative scenario for both firmwares: a reboot after the poweroff
-      # acknowledgement must fail the harness.
+      # Negative scenario: a reboot after the poweroff acknowledgement must
+      # fail the harness.
       - name: Reboot after acknowledgement is rejected
-        if: matrix.firmware == 'bios'
         run: |
           set -euo pipefail
           image_name='ais-live.img'
           if [[ '${{ matrix.flavour }}' == production ]]; then image_name='ais-live-production.img'; fi
           bash image/test/reboot-after-ack.sh "out/$image_name"
+          find out -name live.img -delete
 
-      - name: Upload serial log
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: serial-${{ matrix.flavour }}-${{ matrix.firmware }}
-          path: |
-            out/qemu-*/serial.log
-            out/qemu-*/qmp.log
-            out/qemu-*/qmp-shutdown.json
-          retention-days: 3
-          if-no-files-found: warn
-
-  # Task 4 boot flow and user split, Task 5 disk guard, Task 6 exchange.
-  # GitHub-hosted runners only; no schedule.
-  scenario:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: boot-flow-online-first-bios, scenario: boot-flow, arg: online-first, firmware: bios }
-          - { name: boot-flow-online-first-uefi, scenario: boot-flow, arg: online-first, firmware: uefi }
-          - { name: boot-flow-online-second, scenario: boot-flow, arg: online-second, firmware: bios }
-          - { name: boot-flow-online-retry, scenario: boot-flow, arg: online-retry, firmware: bios }
-          - { name: boot-flow-offline-model-yes, scenario: boot-flow, arg: offline-model-yes, firmware: bios }
-          - { name: boot-flow-offline-model-no, scenario: boot-flow, arg: offline-model-no, firmware: bios }
-          - { name: boot-flow-offline-model-timeout, scenario: boot-flow, arg: offline-model-timeout, firmware: bios }
-          - { name: boot-flow-offline-no-model, scenario: boot-flow, arg: offline-no-model, firmware: bios }
-          - { name: guard-bios, scenario: guard, arg: probe, firmware: bios }
-          - { name: guard-uefi, scenario: guard, arg: probe, firmware: uefi }
-          - { name: exchange-basic-bios, scenario: exchange, arg: basic, firmware: bios }
-          - { name: exchange-basic-uefi, scenario: exchange, arg: basic, firmware: uefi }
-          - { name: exchange-auth-bios, scenario: exchange, arg: auth, firmware: bios }
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Install scenario tools
+      # Task 4 boot flow and user split, Task 5 disk guard, Task 6 exchange.
+      # Every scenario runs; any failure fails the step after the last one.
+      - name: Scenarios
+        if: matrix.flavour == 'test'
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            jq expect mtools python3 qemu-system-x86 ovmf dosfstools gdisk
+          scenarios=(
+            "boot-flow online-first bios"
+            "boot-flow online-first uefi"
+            "boot-flow online-second bios"
+            "boot-flow online-retry bios"
+            "boot-flow offline-model-yes bios"
+            "boot-flow offline-model-no bios"
+            "boot-flow offline-model-timeout bios"
+            "boot-flow offline-no-model bios"
+            "guard probe bios"
+            "guard probe uefi"
+            "exchange basic bios"
+            "exchange basic uefi"
+            "exchange auth bios"
+          )
+          failed=()
+          for entry in "${scenarios[@]}"; do
+            read -r scenario arg firmware <<<"$entry"
+            echo "::group::Scenario $scenario $arg ($firmware)"
+            if ! image/test/run-scenario.sh out/ais-live.img "$firmware" "$scenario" "$arg"; then
+              failed+=("$entry")
+            fi
+            find out -name live.img -delete
+            find out -name media.img -delete
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf 'FAILED scenario: %s\n' "${failed[@]}"
+            exit 1
+          fi
 
-      # The hosted runner exposes /dev/kvm but not to the runner user.
-      - name: Enable KVM
-        run: |
-          set -euo pipefail
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ais-live-image
-          path: out
-
-      - name: Scenario ${{ matrix.name }}
-        env:
-          FIRMWARE: ${{ matrix.firmware }}
-          SCENARIO: ${{ matrix.scenario }}
-          SCENARIO_ARG: ${{ matrix.arg }}
-        run: |
-          set -euo pipefail
-          image/test/run-scenario.sh out/ais-live.img "$FIRMWARE" "$SCENARIO" "$SCENARIO_ARG"
-
+      # Small logs only; the image itself never leaves the runner.
       - name: Upload serial logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: scenario-${{ matrix.name }}
+          name: logs-${{ matrix.flavour }}
           path: |
+            out/qemu-*/serial.log
+            out/qemu-*/qmp.log
+            out/qemu-*/qmp-shutdown.json
             out/scenario-*/qemu-*/serial.log
             out/scenario-*/qemu-*/qmp.log
             out/scenario-*/http.log
+            out/build-info.json
           retention-days: 3
           if-no-files-found: warn
 
+      # Tag releases only: the signed release job is a separate, write-scoped
+      # job and needs the production image. One short-lived artifact, on tags only.
+      - name: Hand the production image to the release job
+        if: inputs.release && matrix.flavour == 'production'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ais-live-release-image
+          path: out/ais-live-production.img
+          retention-days: 1
+          compression-level: 6
+
   # Always reports, so a required check never hangs on skipped jobs.
   gate:
-    needs: [changes, build, boot-test, scenario]
+    needs: [changes, build]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -345,11 +299,7 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           BUILD: ${{ needs.build.result }}
-          BOOT: ${{ needs.boot-test.result }}
-          SCENARIO: ${{ needs.scenario.result }}
         run: |
           set -euo pipefail
           [ "$CHANGES" = "success" ] || exit 1
           case "$BUILD" in success|skipped) ;; *) exit 1 ;; esac
-          case "$BOOT" in success|skipped) ;; *) exit 1 ;; esac
-          case "$SCENARIO" in success|skipped) ;; *) exit 1 ;; esac

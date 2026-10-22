@@ -166,7 +166,7 @@ jobs:
           name: host-unsigned-${{ matrix.asset }}
           path: ${{ runner.temp }}/host-build/assets/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   gate:
     if: ${{ always() }}
