@@ -88,44 +88,36 @@ jobs:
           AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
         run: bun test
 
-  # Decides whether the macOS and host app jobs are needed. Pushes to main always run them.
+  # Decides whether the macOS job is needed. Pushes to main always run it.
+  # The host app is built and tested by host-app.yml.
   changes:
     runs-on: ubuntu-latest
     outputs:
       macos: ${{ steps.filter.outputs.macos }}
-      host: ${{ steps.filter.outputs.host }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Filter paths that can affect execve on macOS or the host app
+      - name: Filter paths that can affect execve on macOS
         id: filter
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Fails open: any doubt about the diff runs both jobs.
+          # Fails open: any doubt about the diff runs the job.
           if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
             echo "macos=true" >> "$GITHUB_OUTPUT"
-            echo "host=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA"); then
             echo "macos=true" >> "$GITHUB_OUTPUT"
-            echo "host=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if printf '%s\n' "$changed" | grep -Eq '^(src/|test/|\.github/workflows/ci\.yml$|package\.json$|bun\.lock$|tsconfig\.json$)'; then
             echo "macos=true" >> "$GITHUB_OUTPUT"
           else
             echo "macos=false" >> "$GITHUB_OUTPUT"
-          fi
-          # The host crates also build from image/release-key.pub and src/live/path-classes.json.
-          if printf '%s\n' "$changed" | grep -Eq '^(apps/host/|image/release-key\.pub$|src/live/path-classes\.json$|\.github/workflows/ci\.yml$)'; then
-            echo "host=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "host=false" >> "$GITHUB_OUTPUT"
           fi
 
   # GitHub-hosted runner only: this repository is public, never self-hosted.
@@ -150,52 +142,3 @@ jobs:
       # The shim replaces itself with the real tool via posix_spawn(SETEXEC).
       - name: Test execve, session sidecar and shim end to end
         run: bun test test/shim-execve.test.ts test/shared/execve.test.ts test/shared/session-sidecar.test.ts
-
-  # GitHub-hosted runner only: this repository is public, never self-hosted.
-  test-host:
-    needs: changes
-    if: needs.changes.outputs.host == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-        working-directory: apps/host
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: latest
-
-      # The Tauri crate embeds the built frontend (../dist), which is not tracked.
-      - name: Build the frontend
-        run: |
-          set -euo pipefail
-          bun install --frozen-lockfile
-          bun run build
-
-      # exfatprogs provides mkfs.exfat and fsck.exfat for the file_create tests.
-      - name: Install Tauri Linux build dependencies and exfatprogs
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            exfatprogs libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev \
-            libssl-dev libdbus-1-dev pkg-config
-          # The package installs into an sbin directory the test process may not have on PATH.
-          mkfs=$(dpkg -L exfatprogs | grep -m1 '/mkfs\.exfat$')
-          echo "AIS_HOST_TEST_EXFAT_TOOLS=$(dirname "$mkfs")" >> "$GITHUB_ENV"
-
-      # rust-toolchain.toml pins the toolchain and its components; rustup installs them on first use.
-      - name: Clippy
-        run: |
-          set -euo pipefail
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Test
-        run: |
-          set -euo pipefail
-          cargo test --workspace --all-features

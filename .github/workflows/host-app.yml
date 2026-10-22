@@ -16,6 +16,11 @@ on:
 permissions:
   contents: read
 
+# Supersede stale pull-request runs only; pushes and release calls always finish.
+concurrency:
+  group: host-app-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   changes:
     runs-on: ubuntu-latest
@@ -122,6 +127,13 @@ jobs:
           # The package installs into an sbin directory the test process may not have on PATH.
           mkfs=$(dpkg -L exfatprogs | grep -m1 '/mkfs\.exfat$')
           echo "AIS_HOST_TEST_EXFAT_TOOLS=$(dirname "$mkfs")" >> "$GITHUB_ENV"
+      # Skipped for production builds: release artefacts never reuse cached binaries.
+      - name: Cache Cargo registry, tauri-cli and build output
+        if: inputs.production != true
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/host
+          key: ${{ matrix.target }}
       - name: Install locked dependencies and native toolchain
         run: |
           bun install --frozen-lockfile
@@ -141,6 +153,11 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked --workspace
           cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Moved from ci.yml test-host: lints the file-test code the default clippy run skips.
+      - name: Clippy with all features
+        if: runner.os == 'Linux'
+        working-directory: apps/host
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: File-backed integration tests
         if: runner.os == 'Linux'
         working-directory: apps/host
