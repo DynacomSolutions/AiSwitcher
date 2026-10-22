@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { expandPath } from "../identities/match.ts";
@@ -25,11 +25,13 @@ import {
   loadCrushSnapshotManifest,
   mergeCrushSnapshotTree,
 } from "./sqlite-merge.ts";
-import { mergeIncomingProfileTree } from "./tree-merge.ts";
+import { listHistories, planTails, restrictTo, TAIL_MIN_BYTES, TAIL_PLAN_FILE, tailExcludeFilters, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
+import { mergeIncomingProfileTree, type TreeMergeResult } from "./tree-merge.ts";
 import type { SyncRunOptions, SyncRunResult, SyncScope } from "./types.ts";
 
 const LOCK_RETRY_MS = 100;
-const LOCK_WAIT_MS = 30_000;
+/** A foreground `sync now` queues behind a running sync (often a hook's background run) for this long. */
+export const LOCK_WAIT_MS = 10 * 60_000;
 const REMOTE_AIS = "$HOME/.local/bin/ais";
 const SSH_ARGS = [
   "-o",
@@ -58,8 +60,20 @@ function syncLockPath(home: string = homedir()): string {
   return join(aisRemoteCacheDir(home), "sync.lock");
 }
 
-async function acquireSyncLock(wait: boolean, home: string = homedir()): Promise<(() => Promise<void>) | undefined> {
-  return acquirePidLock(syncLockPath(home), { waitMs: wait ? LOCK_WAIT_MS : 0, retryMs: LOCK_RETRY_MS });
+/** Try once; when a foreground caller must wait, say who holds the lock, then keep waiting. */
+export async function acquireSyncLock(
+  wait: boolean,
+  home: string = homedir(),
+  waitMs: number = Number(process.env.AIS_SYNC_LOCK_WAIT_MS) || LOCK_WAIT_MS,
+): Promise<(() => Promise<void>) | undefined> {
+  const path = syncLockPath(home);
+  const first = await acquirePidLock(path, { waitMs: 0, retryMs: LOCK_RETRY_MS });
+  if (first || !wait) return first;
+  const holder = await Bun.file(path).json().then((v: { pid?: number; startedAt?: string }) => v, () => undefined);
+  console.error(
+    `AIS sync: another sync${holder?.pid ? ` (pid ${holder.pid}${holder.startedAt ? `, started ${holder.startedAt}` : ""})` : ""} is running; waiting up to ${Math.round(waitMs / 60_000)} min for it, then this one runs.`,
+  );
+  return acquirePidLock(path, { waitMs, retryMs: LOCK_RETRY_MS });
 }
 
 interface CrushProjectsFile {
@@ -142,9 +156,10 @@ function safeHostSegment(host: string): string {
   return host.replace(/[^A-Za-z0-9._@-]/g, "_");
 }
 
-async function runRemoteAis(host: string, args: string[]): Promise<string> {
+async function runRemoteAis(host: string, args: string[], input?: string): Promise<string> {
   const remoteAis = ioTraceEnabled() ? `env AIS_SYNC_IO_TRACE=1 ${REMOTE_AIS}` : REMOTE_AIS;
   const proc = Bun.spawn(["ssh", ...SSH_ARGS, host, `${REMOTE_LOW_PRIORITY} ${remoteAis}`, ...args], {
+    ...(input === undefined ? {} : { stdin: new Blob([input]) }),
     stdout: "pipe",
     stderr: "pipe",
     env: process.env,
@@ -242,7 +257,7 @@ async function pushCrushSnapshots(host: string, home: string, state: SteadyState
   }
 }
 
-function parseJson(raw: string): { token?: string; deniedPaths?: string[]; io?: unknown } | undefined {
+function parseJson(raw: string): { token?: string; deniedPaths?: string[]; io?: unknown; planned?: number; needsFull?: string[]; manifest?: HistoryManifest } | undefined {
   try {
     const value = JSON.parse(raw.trim().split("\n").at(-1) ?? "");
     return typeof value === "object" && value !== null ? value : undefined;
@@ -261,10 +276,40 @@ function scopeArgs(scope: SyncScope): string[] {
   return [`--tool=${scope.cfg.toolName}`, `--identity=${scope.identityName}`];
 }
 
-async function pushProfileSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState): Promise<void> {
+/** Everything the local side prepared for one tail-only exchange of append-only histories. */
+interface PushTails { id: string; outDir: string; plan: TailPlan }
+
+/** Ask the remote which histories it holds, then ship only the bytes it lacks. Undefined when there is nothing to
+ * ship or the remote predates this command (the bulk transfer then carries those histories whole, as before). */
+async function pushTails(host: string, scope: SyncScope, home: string, state: SteadyState): Promise<PushTails | undefined> {
+  // No large local history, nothing worth a round trip.
+  if (Object.keys(await listHistories(home, scope, new Set(state.ignored), TAIL_MIN_BYTES)).length === 0) return undefined;
+  const raw = await runRemoteAis(host, ["sync", "tail-manifest", ...scopeArgs(scope)]).catch(() => undefined);
+  const manifest = raw ? parseJson(raw)?.manifest : undefined;
+  if (!manifest || Object.keys(manifest).length === 0) return undefined;
+  noteRemoteIo(host, raw!);
+  const id = crypto.randomUUID();
+  const outDir = join(aisRemoteCacheDir(home), "tail-outgoing", id);
+  try {
+    const plan = await planTails(home, scope, manifest, outDir, new Set(state.ignored));
+    if (Object.keys(plan).length === 0) { await rm(outDir, { recursive: true, force: true }); return undefined; }
+    const pushed = await runRsync(host, "push", [], home, { localRoot: outDir, remoteRoot: `${AIS_REMOTE_CACHE_REL}/tail-incoming/${id}` });
+    if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
+    return { id, outDir, plan };
+  } catch (error) {
+    await rm(outDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** One staged push plus the remote merge. `tailsId` names tail files already shipped for the same merge. */
+async function pushSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState, tailsId?: string): Promise<string[]> {
   const snapshotId = crypto.randomUUID();
   const remoteRoot = `${AIS_REMOTE_CACHE_REL}/profile-incoming/${snapshotId}`;
-  const pushed = await ioPhase("push-rsync", () => runRsync(host, "push", filters, home, {
+  // rsync -a ships a symlinked ~/.ais/hooks as a bare link, so newer hook scripts never arrived. Exclude the
+  // link from the main transfer (it would stage a link pointing at this host's path) and send its target as a tree.
+  const hooksLink = scope.kind === "all" && !filters.some((f) => f.startsWith("--files-from")) && (await lstat(join(home, ".ais", "hooks")).catch(() => undefined))?.isSymbolicLink();
+  const pushed = await ioPhase("push-rsync", () => runRsync(host, "push", hooksLink ? ["--exclude=/.ais/hooks", ...filters] : filters, home, {
     remoteRoot,
     // The incoming root is ~/.ais/remote-cache/profile-incoming/<uuid>. Omit
     // files byte-identical to the receiver's live home so staging is sparse
@@ -272,9 +317,67 @@ async function pushProfileSnapshot(host: string, filters: string[], scope: SyncS
     compareDest: "../../../..",
   }));
   if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
-  const merged = await runRemoteAis(host, ["sync", "merge-profile-snapshot", snapshotId, ...scopeArgs(scope)]);
+  if (hooksLink) {
+    const hooks = await runRsync(host, "push", [], home, {
+      localRoot: await realpath(join(home, ".ais", "hooks")),
+      remoteRoot: `${remoteRoot}/.ais/hooks`,
+      compareDest: "../../../../../../.ais/hooks",
+    });
+    if (hooks.exitCode !== 0) throw syncError(host, "push", hooks.stderr, hooks.exitCode);
+  }
+  const merged = await runRemoteAis(host, ["sync", "merge-profile-snapshot", snapshotId, ...scopeArgs(scope), ...(tailsId ? [`--tails=${tailsId}`] : [])]);
   noteRemoteIo(host, merged);
-  noteDenied(state, parseJson(merged)?.deniedPaths);
+  const parsed = parseJson(merged);
+  noteDenied(state, parsed?.deniedPaths);
+  return parsed?.needsFull ?? [];
+}
+
+/** rsync `--files-from` list naming exactly these home-relative paths. */
+async function writeFileList(home: string, rels: string[]): Promise<string> {
+  const path = join(aisRemoteCacheDir(home), "tail-incoming", `${crypto.randomUUID()}.full-list`);
+  await mkdir(join(aisRemoteCacheDir(home), "tail-incoming"), { recursive: true });
+  await writeFile(path, `${rels.join("\n")}\n`);
+  return path;
+}
+
+async function pushProfileSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState): Promise<void> {
+  const tails = await ioPhase("push-tails", () => pushTails(host, scope, home, state));
+  try {
+    const needsFull = restrictTo(await pushSnapshot(host, [...tailExcludeFilters(tails?.plan ?? {}), ...filters], scope, home, state, tails?.id), Object.keys(tails?.plan ?? {}));
+    // A tail whose prefix did not verify on the remote is staged whole and merged the ordinary way.
+    if (needsFull.length > 0) {
+      const list = await writeFileList(home, needsFull);
+      try { await pushSnapshot(host, [`--files-from=${list}`], scope, home, state); }
+      finally { await rm(list, { force: true }); }
+    }
+  } finally {
+    if (tails) await rm(tails.outDir, { recursive: true, force: true });
+  }
+}
+
+/** Fetch the bytes this host lacks of histories it already holds. Undefined when there are none or the remote
+ * cannot plan them (an older version): the bulk transfer then stages those histories whole, as before. */
+async function pullTails(host: string, scope: SyncScope, home: string, state: SteadyState): Promise<{ dir: string; plan: TailPlan; manifest: HistoryManifest } | undefined> {
+  const manifest = await listHistories(home, scope, new Set(state.ignored), TAIL_MIN_BYTES);
+  if (Object.keys(manifest).length === 0) return undefined;
+  const id = crypto.randomUUID();
+  const dir = join(aisRemoteCacheDir(home), "tail-incoming", id);
+  try {
+    const planned = await runRemoteAis(host, ["sync", "tail-plan", id, ...scopeArgs(scope)], JSON.stringify(manifest)).catch(() => undefined);
+    if (!planned || !parseJson(planned)?.planned) return undefined;
+    noteRemoteIo(host, planned);
+    await mkdir(dir, { recursive: true });
+    const pulled = await runRsync(host, "pull", [], home, { localRoot: dir, remoteRoot: `${AIS_REMOTE_CACHE_REL}/tail-outgoing/${id}` });
+    if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
+    const plan = JSON.parse(await readFile(join(dir, TAIL_PLAN_FILE), "utf8")) as TailPlan;
+    return { dir, plan: Object.fromEntries(Object.entries(plan).filter(([rel]) => rel in manifest)), manifest };
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  } finally {
+    await runRemoteAis(host, ["sync", "drop-tail-plan", id]).catch(() => undefined);
+  }
 }
 
 function noteDenied(state: SteadyState, paths: string[] | undefined): void {
@@ -319,6 +422,8 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           "profile-incoming",
           `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
         );
+        let tails: { dir: string; plan: TailPlan; manifest: HistoryManifest } | undefined;
+        let fullDir: string | undefined;
         try {
           if (includeDatabases && syncsCrush(scope)) await ioPhase("pull-crush", () => pullCrushSnapshots(host, home, state));
 
@@ -326,30 +431,50 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           // The previous implementation replaced live JSONL first and tried
           // to reconstruct it from an rsync backup afterwards; a failed or
           // concurrent merge could leave the shorter remote copy active.
+          // Append-only histories this host already holds come as tails; the bulk pull leaves them out.
+          tails = await ioPhase("pull-tails", () => pullTails(host, scope, home, state));
           await mkdir(incomingDir, { recursive: true });
-          const pulled = await ioPhase("pull-rsync", () => runRsync(host, "pull", filters, home, {
+          const pulled = await ioPhase("pull-rsync", () => runRsync(host, "pull", [...tailExcludeFilters(tails?.plan ?? {}), ...filters], home, {
             localRoot: incomingDir,
             compareDest: "../../../..",
           }), () => stagedSummary(incomingDir));
           if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
 
-          const merged = await ioPhase("pull-merge", () => mergeIncomingProfileTree(incomingDir, scope, {
+          const merge = (root: string, tailsDir?: string, tailsManifest?: HistoryManifest) => mergeIncomingProfileTree(root, scope, {
+            tailsManifest,
             home,
+            tailsDir,
             conflictRoot: join(
               aisRemoteCacheDir(home),
               "merge-conflicts",
               `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
             ),
-          }));
-          noteDenied(state, merged.deniedPaths);
-          result.preservedConflicts += merged.preservedConflicts;
-          result.preservedConflictPaths = [...new Set([...result.preservedConflictPaths, ...merged.preservedConflictPaths])];
-          result.busyPaths = [...new Set([...result.busyPaths, ...merged.busyPaths])];
-          if (merged.busyPaths.length > 0 && !options.quiet) {
-            console.warn(`AIS sync deferred ${merged.busyPaths.length} log(s) still open in a running tool: ${merged.busyPaths.join(", ")}. They sync on the next run.`);
-          }
-          if (merged.preservedConflicts > 0 && !options.quiet) {
-            console.warn(`AIS sync preserved ${merged.preservedConflicts} conflict(s), including deferred imports: ${merged.preservedConflictPaths.join(", ")}. Run ais sync recover to retry retained histories.`);
+          });
+          const absorb = (merged: TreeMergeResult) => {
+            noteDenied(state, merged.deniedPaths);
+            result.preservedConflicts += merged.preservedConflicts;
+            result.preservedConflictPaths = [...new Set([...result.preservedConflictPaths, ...merged.preservedConflictPaths])];
+            result.busyPaths = [...new Set([...result.busyPaths, ...merged.busyPaths])];
+            if (merged.busyPaths.length > 0 && !options.quiet) {
+              console.warn(`AIS sync deferred ${merged.busyPaths.length} log(s) still open in a running tool: ${merged.busyPaths.join(", ")}. They sync on the next run.`);
+            }
+            if (merged.preservedConflicts > 0 && !options.quiet) {
+              console.warn(`AIS sync preserved ${merged.preservedConflicts} conflict(s), including deferred imports: ${merged.preservedConflictPaths.join(", ")}. Run ais sync recover to retry retained histories.`);
+            }
+          };
+          const merged = await ioPhase("pull-merge", () => merge(incomingDir, tails?.dir, tails?.manifest));
+          absorb(merged);
+          // A tail whose prefix did not verify here is staged whole and merged the ordinary way.
+          const wanted = restrictTo(merged.needsFull, Object.keys(tails?.manifest ?? {}));
+          if (wanted.length > 0) {
+            const list = await writeFileList(home, wanted);
+            fullDir = `${incomingDir}-full`;
+            try {
+              await mkdir(fullDir, { recursive: true });
+              const full = await ioPhase("pull-rsync-full", () => runRsync(host, "pull", [`--files-from=${list}`], home, { localRoot: fullDir, compareDest: "../../../.." }), () => stagedSummary(fullDir!));
+              if (full.exitCode !== 0) throw syncError(host, "pull", full.stderr, full.exitCode);
+              absorb(await ioPhase("pull-merge-full", () => merge(fullDir!)));
+            } finally { await rm(list, { force: true }); }
           }
           await ioPhase("portable-post-pull", async () => {
             for (const cfg of scope.kind === "all" ? SYNC_TOOL_CONFIGS : [scope.cfg]) {
@@ -362,6 +487,8 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           errors.push(err instanceof Error ? err : new Error(String(err)));
         } finally {
           await rm(incomingDir, { recursive: true, force: true });
+          if (fullDir) await rm(fullDir, { recursive: true, force: true });
+          if (tails) await rm(tails.dir, { recursive: true, force: true });
         }
       }
     }

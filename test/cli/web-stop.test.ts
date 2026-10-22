@@ -19,7 +19,9 @@ const children: Bun.Subprocess<"ignore", "ignore", "ignore">[] = [];
 const originalEnv = process.env.AIS_WEB_STATE_DIR;
 
 afterEach(async () => {
-  process.env.AIS_WEB_STATE_DIR = originalEnv;
+  // Assigning undefined would store the string "undefined" and leak into later test files.
+  if (originalEnv === undefined) delete process.env.AIS_WEB_STATE_DIR;
+  else process.env.AIS_WEB_STATE_DIR = originalEnv;
   for (const child of children.splice(0)) {
     child.kill(9);
     await child.exited;

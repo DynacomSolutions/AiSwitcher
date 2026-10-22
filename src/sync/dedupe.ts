@@ -1,5 +1,5 @@
-import { copyFile, mkdir, readdir, rename, stat } from "node:fs/promises";
-import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, statSync, writeSync } from "node:fs";
+import { copyFile, mkdir, open, readdir, rename, stat } from "node:fs/promises";
+import { type Stats, closeSync, constants, fstatSync, fsyncSync, openSync, readSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { parseIdentitiesFile } from "../identities/store.ts";
@@ -7,6 +7,7 @@ import type { Identity, ToolConfig } from "../identities/types.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG } from "../identities/tool-configs.ts";
 import { matchDirectory } from "../identities/match.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
+import { hashPrefix } from "./tail-sync.ts";
 import { hasOpenOwner, hasOpenOwnerBeforeWrite, type OpenOwnerPass } from "./tree-merge.ts";
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -401,6 +402,17 @@ export async function mergeJsonlFiles(
   const additions = merged.slice(destinationLines.length);
   if (additions.length === 0) return "unchanged";
   if (dryRun) return "merged";
+  return appendJsonlPayload(destination, before, Buffer.from(`${additions.join("\n")}\n`), ownerPass);
+}
+
+/** Append `payload` to a JSONL history that still matches `before`: only when no native process owns it,
+ * its last byte is a newline and nothing changed while we looked. Anything else is deferred, never forced. */
+async function appendJsonlPayload(
+  destination: string,
+  before: Stats,
+  payload: Buffer,
+  ownerPass: OpenOwnerPass,
+): Promise<JsonlMergeResult> {
   await beforeJsonlAppend?.(destination);
   // Filter busy files with the pass's budgeted lookup before opening a handle.
   // A snapshot miss still needs a fresh ownership check before writing below.
@@ -417,7 +429,6 @@ export async function mergeJsonlFiles(
       const lastByte = Buffer.alloc(1);
       if (readSync(fd, lastByte, 0, 1, descriptorSnapshot.size - 1) !== 1 || lastByte[0] !== 10) return "deferred";
     }
-    const payload = Buffer.from(`${additions.join("\n")}\n`);
     beforeJsonlWrite?.(destination);
     if ((await hasOpenOwnerBeforeWrite(destination, fd)) !== false) return "deferred";
     // The ownership lookup can yield; reject changes made while it ran.
@@ -433,6 +444,44 @@ export async function mergeJsonlFiles(
     return "deferred";
   } finally { closeSync(fd); }
   return "merged";
+}
+
+export type JsonlTailResult = JsonlMergeResult | "diverged";
+
+/** Merge the bytes a sender holds beyond `offset` into a live history. The sender proved that the first
+ * `offset` bytes of its file hash to `prefix`; this checks the destination's do too. Both then hold the same
+ * prefix P: destination = P+X, sender = P+T, and the multiset union is P+X+(T minus X). Only the complete
+ * lines of T the destination lacks are appended, so anything written to it meanwhile stays untouched.
+ * "diverged" means the prefixes differ or the file shrank: the caller falls back to a full transfer. */
+export async function mergeJsonlTail(
+  destination: string,
+  offset: number,
+  prefix: string,
+  tail: Buffer,
+  ownerPass: OpenOwnerPass = { lookups: 0 },
+): Promise<JsonlTailResult> {
+  let before: Stats;
+  try { before = await stat(destination); } catch { return "diverged"; }
+  if (before.size < offset) return "diverged";
+  const complete = tail.subarray(0, tail.lastIndexOf(10) + 1);
+  // Cheap busy check first: a history a native tool has open cannot be appended to, so skip the prefix hash.
+  if (complete.length > 0 && (await hasOpenOwner(destination, ownerPass)) !== false) return "busy";
+  if ((await hashPrefix(destination, offset)) !== prefix) return "diverged";
+  if (complete.length === 0) return "unchanged"; // the sender holds nothing beyond what we verified
+  let extra: Buffer;
+  try {
+    extra = Buffer.alloc(Number(before.size) - offset);
+    const handle = await open(destination, "r");
+    try { await handle.read(extra, 0, extra.length, offset); } finally { await handle.close(); }
+    if (!sameFileSnapshot(before, await stat(destination))) return "deferred";
+  } catch { return "deferred"; }
+  if (extra.length > 0 && extra[extra.length - 1] !== 10) return "deferred";
+  // latin1 keeps every byte intact, including malformed UTF-8.
+  const have = extra.length > 0 ? extra.toString("latin1").slice(0, -1).split("\n") : [];
+  const incoming = complete.length > 0 ? complete.toString("latin1").slice(0, -1).split("\n") : [];
+  const additions = mergeJsonlLineSetsOnto(have, [incoming]).slice(have.length);
+  if (additions.length === 0) return "unchanged";
+  return appendJsonlPayload(destination, before, Buffer.from(`${additions.join("\n")}\n`, "latin1"), ownerPass);
 }
 
 async function listRelativeFiles(root: string): Promise<string[]> {

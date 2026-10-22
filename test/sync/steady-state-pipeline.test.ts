@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { appendFile, chmod, symlink, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -204,7 +204,8 @@ test.skipIf(process.platform !== "linux" || !rsync)("conflict-prone trees conver
   // costs about 4 MB of runtime start-up. The ~40 MB of history this fixture used to re-stage would show here.
   const localEntry = steady.entries.find((e) => e.argv === "sync now")!;
   const remoteAis = steady.entries.filter((e) => e.argv.startsWith("sync ") && e.argv !== "sync now");
-  expect(bytes(localEntry)).toBeLessThan(30_000_000);
+  // The fake ssh runs the remote tail-plan and merge as children, so their start-up (about 5 MB each) lands here too.
+  expect(bytes(localEntry)).toBeLessThan(50_000_000);
   expect(localEntry.write_bytes).toBeLessThan(1_000_000);
   expect(remoteAis.length).toBeGreaterThan(0);
   for (const e of remoteAis) {
@@ -213,3 +214,89 @@ test.skipIf(process.platform !== "linux" || !rsync)("conflict-prone trees conver
   }
   for (const e of steady.entries.filter((e) => e.argv.startsWith("rsync"))) expect(bytes(e)).toBeLessThan(1_000_000);
 }, 300_000);
+
+const sizeOf = async (path: string) => (await Bun.file(path).stat()).size;
+const human = (text: string) => {
+  const m = /^(\d+(?:\.\d+)?)([KMG]?)$/.exec(text)!;
+  return Number(m[1]) * ({ "": 1, K: 1e3, M: 1e6, G: 1e9 } as Record<string, number>)[m[2]!]!;
+};
+/** Bytes the bulk transfer staged for the named phase, from the AIS_SYNC_IO_TRACE line. */
+const stagedBytes = (text: string, phase: string) => human(new RegExp(`${phase}: .*staged=\\d+ files (\\S+)`).exec(text)![1]!);
+
+test.skipIf(process.platform !== "linux" || !rsync)("an appended 50 MB history moves and writes only its new bytes in both directions; diverged histories keep every line", async () => {
+  const { local, remote, run } = await harness();
+  const MB = 1_000_000;
+  const T = 1_700_000_000;
+  const a = ".claude/identities/a";
+  const lines = (tag: string, n: number) => Array.from({ length: n }, (_, i) => `{"t":"${tag}${i}","pad":"${"p".repeat(990)}"}\n`).join("");
+  await put(local, ".claude/identities.json", claudeRegistry);
+  await put(remote, ".claude/identities.json", claudeRegistry);
+  const big = `${a}/projects/p/big.jsonl`;
+  const forked = `${a}/projects/p/forked.jsonl`;
+  await put(local, big, lines("b", 50_000), T);
+  await put(local, forked, lines("f", 3000), T);
+
+  // Run 1 copies the 50 MB history whole (the remote has none); run 2 settles mtimes.
+  for (let i = 0; i < 2; i++) expect((await run()).exitCode).toBe(0);
+  const first = await sizeOf(join(local, big));
+  expect(await sizeOf(join(remote, big))).toBe(first);
+
+  // Local appends 4 MB: the remote must receive and write about that much, not 54 MB.
+  await appendFile(join(local, big), lines("local", 4000));
+  // Both hosts append different lines to the other history: a diverged prefix falls back to full staging.
+  await appendFile(join(local, forked), lines("fl", 500));
+  await appendFile(join(remote, forked), lines("fr", 400));
+  const push = await run({ AIS_SYNC_IO_TRACE: "1" });
+  expect(push.exitCode).toBe(0);
+  expect(await sizeOf(join(remote, big))).toBe(await sizeOf(join(local, big)));
+  expect(await sizeOf(join(local, big))).toBeGreaterThan(first + 3 * MB);
+  expect(await readFile(join(remote, big), "utf8")).toBe(await readFile(join(local, big), "utf8"));
+  // Every rsync wrote about the appended bytes (plus the diverged 4 MB history, staged whole), never the 54 MB.
+  // ais processes are not bounded: the open-file ownership lookup (lsof, a reaped child) adds machine-dependent I/O.
+  for (const e of push.entries.filter((e) => e.argv.startsWith("rsync"))) expect({ argv: e.argv, wchar: e.wchar < 12 * MB }).toEqual({ argv: e.argv, wchar: true });
+  expect(stagedBytes(push.text, "pull-rsync")).toBeLessThan(8 * MB);
+  for (const home of [local, remote]) {
+    const text = await readFile(join(home, forked), "utf8");
+    const set = new Set(text.split("\n").filter(Boolean));
+    expect(set.size).toBe(3900);
+    expect(text).toContain('"fl499"');
+    expect(text).toContain('"fr399"');
+  }
+
+  // Remote appends 3 MB: pulled as a tail the same way.
+  await appendFile(join(remote, big), lines("remote", 3000));
+  const pull = await run({ AIS_SYNC_IO_TRACE: "1" });
+  expect(pull.exitCode).toBe(0);
+  expect(await sizeOf(join(local, big))).toBe(await sizeOf(join(remote, big)));
+  expect(await readFile(join(local, big), "utf8")).toBe(await readFile(join(remote, big), "utf8"));
+  expect(stagedBytes(pull.text, "pull-rsync")).toBeLessThan(8 * MB);
+  for (const e of pull.entries.filter((e) => e.argv.startsWith("rsync"))) expect({ argv: e.argv, wchar: e.wchar < 12 * MB }).toEqual({ argv: e.argv, wchar: true });
+
+  // Nothing changed since: the next run moves almost nothing and keeps both copies byte-identical.
+  const steady = await run();
+  expect(steady.exitCode).toBe(0);
+  expect(steady.text).not.toContain("preserved");
+  for (const e of steady.entries) expect(e.wchar).toBeLessThan(10 * MB);
+  expect(await sizeOf(join(remote, big))).toBe(await sizeOf(join(local, big)));
+}, 600_000);
+
+test.skipIf(process.platform !== "linux" || !rsync)("newer shared hook scripts reach the remote and conflicts reach zero by the second run", async () => {
+  const { local, remote, run } = await harness();
+  const T = 1_700_000_000;
+  await put(local, ".claude/identities.json", claudeRegistry);
+  await put(remote, ".claude/identities.json", claudeRegistry);
+  const hooks = ["a.sh", "b.py", "c.sh"];
+  for (const h of hooks) {
+    await put(remote, `.ais/hooks/${h}`, `#!/bin/sh\necho old ${h}\n`, T);
+    await put(local, `shared-hooks/${h}`, `#!/bin/sh\necho new and longer ${h}\n`, T + 1000);
+  }
+  // As on a real host: ~/.ais/hooks is a symlink to a shared tree, which rsync -a would send as a bare link.
+  await mkdir(join(local, ".ais"), { recursive: true });
+  await symlink(join(local, "shared-hooks"), join(local, ".ais", "hooks"));
+  const first = await run();
+  expect(first.exitCode).toBe(0);
+  for (const h of hooks) expect(await readFile(join(remote, `.ais/hooks/${h}`), "utf8")).toBe(await readFile(join(local, `.ais/hooks/${h}`), "utf8"));
+  const second = await run();
+  expect(second.exitCode).toBe(0);
+  expect(second.text).not.toContain("preserved");
+}, 120_000);

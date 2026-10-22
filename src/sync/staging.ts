@@ -11,6 +11,8 @@ const PRUNED: Array<{ dir: string; maxAgeMs: number }> = [
   { dir: "profile-incoming", maxAgeMs: STAGING_MAX_AGE_MS },
   { dir: "sqlite-incoming", maxAgeMs: STAGING_MAX_AGE_MS },
   { dir: "sqlite-snapshots", maxAgeMs: STAGING_MAX_AGE_MS },
+  { dir: "tail-incoming", maxAgeMs: STAGING_MAX_AGE_MS },
+  { dir: "tail-outgoing", maxAgeMs: STAGING_MAX_AGE_MS },
   { dir: "merge-conflicts", maxAgeMs: CONFLICT_MAX_AGE_MS },
 ];
 

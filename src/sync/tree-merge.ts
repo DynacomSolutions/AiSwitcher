@@ -24,7 +24,8 @@ import { writeFileAtomic } from "../identities/pool/fs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
-import { mergeJsonlFiles } from "./dedupe.ts";
+import { mergeJsonlFiles, mergeJsonlTail } from "./dedupe.ts";
+import { listHistories, TAIL_PLAN_FILE, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
 import { mergeRegistryConflict } from "./registry.ts";
 import { isDeepStrictEqual } from "node:util";
 import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
@@ -39,6 +40,8 @@ export interface TreeMergeResult {
   busyPaths: string[];
   /** Paths this user cannot re-time or overwrite (root-owned); sync excludes them from later runs. */
   deniedPaths?: string[];
+  /** Tail transfers whose prefix did not match: the sender must stage these histories whole. */
+  needsFull?: string[];
 }
 
 export interface ArchiveRecoveryResult extends TreeMergeResult {
@@ -557,6 +560,40 @@ async function preserveFile(source: string, root: string, side: "local" | "incom
   await copyFile(source, destination);
 }
 
+/** Apply the tail transfers staged in `dir`: append each verified suffix to its live history.
+ * The plan is untrusted input from the other host: only histories in `expected` (the manifest this side sent,
+ * or its own current listing) are touched, at an offset that manifest allows. Everything else, and every tail
+ * that does not verify or cannot be applied now, is returned in `needsFull` for the ordinary full transfer. */
+async function applyTails(dir: string, home: string, expected: HistoryManifest, strict: boolean, ownerPass: OpenOwnerPass, result: TreeMergeResult): Promise<void> {
+  const full = (rel: string) => { (result.needsFull ??= []).push(rel); };
+  let plan: TailPlan;
+  try { plan = JSON.parse(await readFile(join(dir, TAIL_PLAN_FILE), "utf8")) as TailPlan; }
+  catch { for (const rel of Object.keys(expected)) full(rel); return; }
+  for (const [rel, entry] of Object.entries(plan)) {
+    const known = expected[rel];
+    const offsetOk = known !== undefined && (strict ? entry.offset === Math.min(entry.size, known.size) : entry.offset <= Math.min(entry.size, known.size));
+    if (!rel.endsWith(".jsonl") || rel.startsWith("/") || rel.split("/").includes("..") || !offsetOk) { full(rel); continue; }
+    const destination = join(home, rel);
+    const tail = await readFile(join(dir, rel)).catch(() => undefined);
+    if (!tail || tail.length !== entry.size - entry.offset) { full(rel); continue; }
+    const outcome = await mergeJsonlTail(destination, entry.offset, entry.prefix, tail, ownerPass);
+    if (outcome === "diverged" || outcome === "deferred") { full(rel); continue; }
+    if (outcome === "busy") { result.busyPaths.push(rel); continue; }
+    if (outcome === "merged") result.mergedJsonlFiles++;
+    const terminated = tail.length === 0 || tail[tail.length - 1] === 10;
+    if (!terminated) {
+      // The sender's last line is unfinished: it was not copied, exactly like an incomplete staged history.
+      result.preservedConflicts++;
+      result.preservedConflictPaths.push(rel);
+    }
+    // Same size as the sender and a complete tail: same content, so adopt its mtime and the next quick check sees equality.
+    const info = await stat(destination).catch(() => undefined);
+    if (terminated && info && info.size === entry.size && Math.floor(info.mtimeMs / 1000) !== Math.floor(entry.mtimeMs / 1000)) {
+      await tolerateDenied(rel, () => fsOps.utimes(destination, info.atime, new Date(entry.mtimeMs)), result.deniedPaths);
+    }
+  }
+}
+
 /** A newer snapshot supersedes an older one only when it retains every byte
  * of an incomplete tail, or every occurrence of each complete record. */
 function subsumesJsonl(newer: string, older: string): boolean {
@@ -632,7 +669,7 @@ async function preserveDeferredFile(source: string, home: string, rel: string): 
 export async function mergeIncomingProfileTree(
   incomingRoot: string,
   scope: SyncScope,
-  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge; ownerPass?: OpenOwnerPass; lock?: ProfileMergeLock } = {},
+  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge; ownerPass?: OpenOwnerPass; lock?: ProfileMergeLock; tailsDir?: string; tailsManifest?: HistoryManifest } = {},
 ): Promise<TreeMergeResult> {
   const home = options.home ?? homedir();
   if (!options.lock || !heldMergeLocks.has(options.lock) || options.lock.home !== await realpath(home)) {
@@ -660,6 +697,12 @@ export async function mergeIncomingProfileTree(
       await copyFile(incoming, livePath);
       result.copiedFiles++;
     }
+  }
+
+  if (options.tailsDir) {
+    // The pulling side checks against the manifest it sent; the pushed-to side against what it holds now.
+    const strict = options.tailsManifest !== undefined;
+    await applyTails(options.tailsDir, home, options.tailsManifest ?? await listHistories(home, scope), strict, ownerPass, result);
   }
 
   for await (const source of walkFiles(incomingRoot)) {

@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { chmod } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { runBackup } from "../../scripts/backup.ts";
 import { downloadAssetAtomic, platformKey } from "../shared/release-assets.ts";
 import { cyan, dim, green, yellow } from "./colors.ts";
@@ -34,6 +34,33 @@ export interface UpdateOptions {
   backup?: () => Promise<string>;
   heartbeatMs?: number;
   shimDir?: string;
+  /** Test seam for the release download. */
+  fetchImpl?: typeof fetch;
+}
+
+async function installedVersion(binary: string): Promise<string | undefined> {
+  try {
+    const proc = Bun.spawn([binary, "version"], { stdout: "pipe", stderr: "ignore" });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return code === 0 ? out.trim() || undefined : undefined;
+  } catch { return undefined; }
+}
+
+/** `ais` must run and print a version. The proxy shims would launch the real tool, so they only get a header check. */
+async function verifyDownload(name: string, tmp: string): Promise<void> {
+  if (name === "ais") {
+    if (!(await installedVersion(tmp))) throw new Error(`the downloaded ais does not run ("ais version" failed); the installed ${name} was left unchanged`);
+    return;
+  }
+  const handle = await open(tmp, "r");
+  try {
+    const head = Buffer.alloc(4);
+    await handle.read(head, 0, 4, 0);
+    const hex = head.toString("hex");
+    if (!(hex === "7f454c46" || hex.startsWith("2321") || ["feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe"].includes(hex))) {
+      throw new Error(`the downloaded ${name} is not an executable; the installed ${name} was left unchanged`);
+    }
+  } finally { await handle.close(); }
 }
 
 export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
@@ -50,6 +77,9 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     );
     try {
       console.log(`${prefix} backup complete: ${await (options.backup ?? runBackup)()}`);
+    } catch (error) {
+      // Nothing was downloaded yet: say so, so a failed backup is never mistaken for an update.
+      throw new Error(`backup failed, so NOTHING was updated: ${error instanceof Error ? error.message : String(error)}. Fix that, or run "ais update --no-backup" to update without a snapshot.`);
     } finally {
       clearInterval(timer);
     }
@@ -58,6 +88,7 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
   const shimDir = options.shimDir ?? join(homedir(), ".local", "bin");
   const platformSuffix = platformKey();
 
+  const before = await installedVersion(join(shimDir, "ais"));
   let updated = 0;
   for (const name of MANAGED_BINARIES) {
     const dest = join(shimDir, name);
@@ -67,9 +98,14 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     }
     const assetName = `${name}-${platformSuffix}`;
     console.log(`${prefix} downloading ${cyan(assetName)} -> ${dest}`);
-    await downloadAssetAtomic(assetName, dest);
-    await chmod(dest, 0o755);
+    // Verified before it replaces the installed file, so a bad download leaves the working binary in place.
+    await downloadAssetAtomic(assetName, dest, { fetchImpl: options.fetchImpl, mode: 0o755, verify: (tmp) => verifyDownload(name, tmp) });
     updated++;
+  }
+
+  if (updated > 0 && (await Bun.file(join(shimDir, "ais")).exists())) {
+    const after = await installedVersion(join(shimDir, "ais"));
+    console.log(`${prefix} ais ${before && after && before !== after ? `${before} -> ${after}` : `${after ?? "?"} (already the latest release)`}`);
   }
 
   console.log(
