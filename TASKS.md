@@ -80,7 +80,7 @@ ETA: 2026-10-23 18:00 ICT
 | 90 | Actions artifact storage: AiSwitcher artifacts filled the org's Actions storage (277 GB); stop storing live images/ISOs as artifacts and set short retention everywhere | done | claude | ci-artifact-storage |  |  | PR #264 merged 2026-10-22. 641 artifacts (275 GB) deleted with Thomas's approval; 2.76 GB remain. `live-image.yml` builds and tests in one job with no image upload on PR/main runs (logs only, 3 days); tag releases upload one image for 1 day. Intermediates in `release.yml`, `host-app.yml` and `release-host-app.yml` kept 1 day. First `live-v*` tag run with this change not yet exercised. |
 
 ## 2. Live USB
-ETA: 2026-10-22 14:00 ICT
+ETA: 2026-10-23 18:00 ICT
 
 UK 16:00 BST on 2026-10-24; owner check after.
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -98,7 +98,7 @@ UK 16:00 BST on 2026-10-24; owner check after.
 | 67 | C2 Host app: refresh, pull logs, remove instance (each step optional), reset storage, key escrow in OS keychain with retention | done |  |  | 2.65 |  | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/242 (2026-10-21): Refresh, Pull logs, Remove, Reset storage and keychain escrow (Linux, macOS). Drives created before #242 lack the identity file, so these flows need a newly created drive. |
 | 68 | C3 Host app: update image keeping persisted packages | done |  |  | 2.61, 2.62, 2.66 |  | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/232 (2026-10-21); review fix binds update-journal recovery to the registry status. |
 | 69 | C4 Host app release: tag `host-v0.1.4`; macOS signed and notarised; Linux AppImage; Windows installer | done |  |  | 2.66, 2.67, 2.68, 2.85 |  | `host-v0.1.4` draft prerelease built 2026-10-22 (run 39673430298): macOS signed and notarised, Linux AppImage, Windows installer and portable zip; post-release download and launch checks green on all three platforms. |
-| 88 | Ship the macOS host app as a signed, notarised and stapled DMG (`host-v0.1.5`) instead of a zip | in_review | claude | host-macos-dmg | 2.69 | 2026-10-22 14:30 ICT | PR #262 merged; `host-v0.1.5` tagged 12:49 ICT, release run 39730256735 in progress. Tagged before the CI speed-up (1.89), so its Linux job still takes ~63 min. First run of DMG notarisation. |
+| 88 | Ship the macOS host app as a signed, notarised and stapled DMG (`host-v0.1.5`) instead of a zip | done | claude | host-macos-dmg | 2.69 | | `host-v0.1.5` draft prerelease built 2026-10-22 (run 39730256735): macOS DMG signed, notarised and stapled (app stapled too); post-release download and launch checks green on macOS (from the DMG), Windows and Linux. |
 | 70 | aarch64 (UEFI ARM) image | parked | | | 2.61 | | Parked by owner. No work planned. |
 | 71 | Secure Boot support (v1 requires it disabled) | parked | | | 2.61, 2.62 | | Parked by owner. No work planned. |
 | 85 | C5 Host app on macOS: list USB drives, privileged write helper with macOS authorisation, create and update drives | done |  |  | 2.66 |  | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/243 (2026-10-21) after security review fixes; CI green on macOS, Linux and Windows. Admin prompt and a real stick write are first exercised in row 86. |
