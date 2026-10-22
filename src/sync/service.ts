@@ -17,6 +17,7 @@ import {
   REMOTE_LOW_PRIORITY,
   SYNC_TOOL_CONFIGS,
 } from "./rsync.ts";
+import { formatIo, ioPhase, ioSnapshot, ioTraceEnabled, isPhaseList, stagedSummary, type PhaseIo } from "./io-trace.ts";
 import { pruneStaging } from "./staging.ts";
 import { crushFingerprint, ignoredPathFilters, loadSteadyState, saveSteadyState, type SteadyState } from "./steady-state.ts";
 import {
@@ -142,7 +143,8 @@ function safeHostSegment(host: string): string {
 }
 
 async function runRemoteAis(host: string, args: string[]): Promise<string> {
-  const proc = Bun.spawn(["ssh", ...SSH_ARGS, host, `${REMOTE_LOW_PRIORITY} ${REMOTE_AIS}`, ...args], {
+  const remoteAis = ioTraceEnabled() ? `env AIS_SYNC_IO_TRACE=1 ${REMOTE_AIS}` : REMOTE_AIS;
+  const proc = Bun.spawn(["ssh", ...SSH_ARGS, host, `${REMOTE_LOW_PRIORITY} ${remoteAis}`, ...args], {
     stdout: "pipe",
     stderr: "pipe",
     env: process.env,
@@ -197,7 +199,9 @@ function parseRemoteSnapshot(raw: string, host: string): RemoteSnapshotResponse 
 async function pullCrushSnapshots(host: string, home: string, state: SteadyState): Promise<void> {
   // An unchanged remote costs one tiny command instead of a VACUUM INTO, a full rsync and an ATTACH merge.
   const known = state.crush[host]?.remote;
-  const remote = parseRemoteSnapshot(await runRemoteAis(host, ["sync", "snapshot-zai", ...(known ? [`--if-changed=${known}`] : [])]), host);
+  const rawSnapshot = await runRemoteAis(host, ["sync", "snapshot-zai", ...(known ? [`--if-changed=${known}`] : [])]);
+  noteRemoteIo(host, rawSnapshot);
+  const remote = parseRemoteSnapshot(rawSnapshot, host);
   if (remote.unchanged) return;
   const localRoot = join(aisRemoteCacheDir(home), "sqlite-incoming", `${safeHostSegment(host)}-${remote.snapshotId}`);
   try {
@@ -219,7 +223,8 @@ async function pullCrushSnapshots(host: string, home: string, state: SteadyState
 
 async function pushCrushSnapshots(host: string, home: string, state: SteadyState): Promise<void> {
   const token = await crushFingerprint(home);
-  if (token && state.crush[host]?.local === token) return;
+  // No token means no local Crush database: there is nothing to snapshot, push or ask the remote to merge.
+  if (!token || state.crush[host]?.local === token) return;
   const snapshotId = crypto.randomUUID();
   const localRoot = join(aisRemoteCacheDir(home), "sqlite-snapshots", snapshotId);
   try {
@@ -230,17 +235,25 @@ async function pushCrushSnapshots(host: string, home: string, state: SteadyState
     });
     if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
     const merged = await runRemoteAis(host, ["sync", "merge-zai-snapshot", snapshotId]);
+    noteRemoteIo(host, merged);
     state.crush[host] = { local: token, remote: parseJson(merged)?.token };
   } finally {
     await rm(localRoot, { recursive: true, force: true });
   }
 }
 
-function parseJson(raw: string): { token?: string; deniedPaths?: string[] } | undefined {
+function parseJson(raw: string): { token?: string; deniedPaths?: string[]; io?: unknown } | undefined {
   try {
     const value = JSON.parse(raw.trim().split("\n").at(-1) ?? "");
     return typeof value === "object" && value !== null ? value : undefined;
   } catch { return undefined; }
+}
+
+/** Remote-side phases arrive in the JSON of an AIS_SYNC_IO_TRACE=1 command. */
+const remoteIo: PhaseIo[] = [];
+function noteRemoteIo(host: string, raw: string): void {
+  const io = parseJson(raw)?.io;
+  if (isPhaseList(io)) remoteIo.push(...io.map((p) => ({ ...p, phase: `${host}:${p.phase}` })));
 }
 
 function scopeArgs(scope: SyncScope): string[] {
@@ -251,15 +264,16 @@ function scopeArgs(scope: SyncScope): string[] {
 async function pushProfileSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState): Promise<void> {
   const snapshotId = crypto.randomUUID();
   const remoteRoot = `${AIS_REMOTE_CACHE_REL}/profile-incoming/${snapshotId}`;
-  const pushed = await runRsync(host, "push", filters, home, {
+  const pushed = await ioPhase("push-rsync", () => runRsync(host, "push", filters, home, {
     remoteRoot,
     // The incoming root is ~/.ais/remote-cache/profile-incoming/<uuid>. Omit
     // files byte-identical to the receiver's live home so staging is sparse
     // rather than another multi-gigabyte profile copy.
     compareDest: "../../../..",
-  });
+  }));
   if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
   const merged = await runRemoteAis(host, ["sync", "merge-profile-snapshot", snapshotId, ...scopeArgs(scope)]);
+  noteRemoteIo(host, merged);
   noteDenied(state, parseJson(merged)?.deniedPaths);
 }
 
@@ -287,15 +301,15 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
   const errors: Error[] = [];
   const state = await loadSteadyState(home);
   try {
-    await pruneStaging({ home });
+    await ioPhase("prune-staging", () => pruneStaging({ home }));
     // Portability is a transport invariant, not a one-off migration. Run it
     // before either direction so no host can export an absolute username.
-    await makeSyncStatePortable(scope, home);
+    await ioPhase("portable-pre", () => makeSyncStatePortable(scope, home));
 
-    const extraDataDirs = [
+    const extraDataDirs = await ioPhase("collect-dirs", async () => [
       ...(await collectProfileDataDirs(scope)),
       ...(await collectProjectDataDirs(scope)),
-    ];
+    ]);
     const filters = [...ignoredPathFilters(state), ...buildSyncFilterArgs(scope, extraDataDirs)];
 
     if (direction === "pull" || direction === "both") {
@@ -306,27 +320,27 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
         );
         try {
-          if (includeDatabases && syncsCrush(scope)) await pullCrushSnapshots(host, home, state);
+          if (includeDatabases && syncsCrush(scope)) await ioPhase("pull-crush", () => pullCrushSnapshots(host, home, state));
 
           // Pull into an isolated snapshot, never over a live native profile.
           // The previous implementation replaced live JSONL first and tried
           // to reconstruct it from an rsync backup afterwards; a failed or
           // concurrent merge could leave the shorter remote copy active.
           await mkdir(incomingDir, { recursive: true });
-          const pulled = await runRsync(host, "pull", filters, home, {
+          const pulled = await ioPhase("pull-rsync", () => runRsync(host, "pull", filters, home, {
             localRoot: incomingDir,
             compareDest: "../../../..",
-          });
+          }), () => stagedSummary(incomingDir));
           if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
 
-          const merged = await mergeIncomingProfileTree(incomingDir, scope, {
+          const merged = await ioPhase("pull-merge", () => mergeIncomingProfileTree(incomingDir, scope, {
             home,
             conflictRoot: join(
               aisRemoteCacheDir(home),
               "merge-conflicts",
               `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
             ),
-          });
+          }));
           noteDenied(state, merged.deniedPaths);
           result.preservedConflicts += merged.preservedConflicts;
           result.preservedConflictPaths = [...new Set([...result.preservedConflictPaths, ...merged.preservedConflictPaths])];
@@ -337,10 +351,12 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           if (merged.preservedConflicts > 0 && !options.quiet) {
             console.warn(`AIS sync preserved ${merged.preservedConflicts} conflict(s), including deferred imports: ${merged.preservedConflictPaths.join(", ")}. Run ais sync recover to retry retained histories.`);
           }
-          for (const cfg of scope.kind === "all" ? SYNC_TOOL_CONFIGS : [scope.cfg]) {
-            await makeRegistryPortable(cfg, home);
-          }
-          await makeSyncStatePortable(scope, home);
+          await ioPhase("portable-post-pull", async () => {
+            for (const cfg of scope.kind === "all" ? SYNC_TOOL_CONFIGS : [scope.cfg]) {
+              await makeRegistryPortable(cfg, home);
+            }
+            await makeSyncStatePortable(scope, home);
+          });
           result.pulled.push(host);
         } catch (err) {
           errors.push(err instanceof Error ? err : new Error(String(err)));
@@ -354,7 +370,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
     // /Users/name. Standard profile and directory paths become ~/... before
     // resolution reads them or they are pushed to another host.
     try {
-      await makeSyncStatePortable(scope, home);
+      await ioPhase("portable-mid", () => makeSyncStatePortable(scope, home));
     } catch (err) {
       errors.push(err instanceof Error ? err : new Error(String(err)));
     }
@@ -365,7 +381,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           // Push to a remote snapshot and ask remote AIS to merge it. No
           // transport direction writes over a live history any more.
           await pushProfileSnapshot(host, filters, scope, home, state);
-          if (includeDatabases && syncsCrush(scope)) await pushCrushSnapshots(host, home, state);
+          if (includeDatabases && syncsCrush(scope)) await ioPhase("push-crush", () => pushCrushSnapshots(host, home, state));
           result.pushed.push(host);
         } catch (err) {
           errors.push(err instanceof Error ? err : new Error(String(err)));
@@ -375,6 +391,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
   } finally {
     await saveSteadyState(state, home).catch(() => undefined);
     await release();
+    if (ioTraceEnabled()) for (const line of [...formatIo("local", ioSnapshot()), ...formatIo("remote", remoteIo)]) console.error(line);
   }
 
   if (errors.length > 0) {

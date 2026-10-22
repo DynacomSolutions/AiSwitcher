@@ -56,6 +56,10 @@ const TRANSIENT_EXCLUDES = [
   // native artefacts on Linux. Their durable configuration remains synced.
   ...REPRODUCIBLE_JUNK_DIR_NAMES,
   "backups/",
+  // Per-host process markers (<pid>.json) and the system skills Codex regenerates from its own binary:
+  // each host rewrites them, so syncing them only manufactures conflicts.
+  "/.claude/identities/*/sessions/*.json",
+  "/.codex/identities/*/skills/.system/",
   "logs_*.sqlite*",
   "state_*.sqlite*",
   "models_cache.json",
