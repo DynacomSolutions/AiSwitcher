@@ -1,6 +1,6 @@
 Portable ais Host release candidate.
 
-- macOS arm64: Developer ID signed, notarised and stapled application archive.
+- macOS arm64: Developer ID signed, notarised and stapled disk image (`.dmg`); open it and drag ais Host to Applications.
 - Windows x86_64: unsigned portable archive; WebView2 is required.
 - Linux x86_64: AppImage, with extraction mode for computers without FUSE.
 - SHA256SUMS covers the final archives, AppImage and dependency notices.

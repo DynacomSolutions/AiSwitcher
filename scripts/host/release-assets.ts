@@ -5,7 +5,7 @@ import { encodeJsonFrame } from "../../src/host/protocol";
 
 export type Target = "macos-arm64" | "windows-x64" | "linux-x64";
 export const components = ["ais-host-app", "ais-host-adapter", "ais-host-helper", "ais-host-escrow-purge"];
-export const releaseFiles = ["ais-host-macos-arm64.zip", "ais-host-windows-x64.zip", "ais-host-windows-x64-setup.exe", "ais-host-linux-x64.AppImage",
+export const releaseFiles = ["ais-host-macos-arm64.dmg", "ais-host-windows-x64.zip", "ais-host-windows-x64-setup.exe", "ais-host-linux-x64.AppImage",
   ...["macos-arm64", "windows-x64", "linux-x64"].map((target) => `THIRD-PARTY-NOTICES-${target}.txt`)];
 export const digest = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 
@@ -128,9 +128,23 @@ export function smokeArchive(asset: string, target: Target, destination: string,
   let payload = destination;
   let app: string;
   if (target === "macos-arm64") {
-    run(["ditto", "-x", "-k", resolve(asset), destination]);
     app = join(destination, "ais Host.app");
     payload = app;
+    if (asset.endsWith(".dmg")) {
+      if (assessMac) {
+        run(["spctl", "--assess", "--type", "open", "--context", "context:primary-signature", "--verbose=2", resolve(asset)]);
+        run(["xcrun", "stapler", "validate", resolve(asset)]);
+      }
+      const volume = join(destination, "volume");
+      mkdirSync(volume);
+      run(["hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", volume, resolve(asset)]);
+      try {
+        if (!lstatSync(join(volume, "Applications")).isSymbolicLink()) throw new Error("DMG lacks the Applications link.");
+        run(["ditto", join(volume, "ais Host.app"), app]);
+      } finally {
+        run(["hdiutil", "detach", volume]);
+      }
+    } else run(["ditto", "-x", "-k", resolve(asset), destination]);
     if (assessMac) {
       for (const command of [
         ["codesign", "--verify", "--deep", "--strict", "--verbose=2", app],
