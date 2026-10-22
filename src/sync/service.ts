@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { expandPath } from "../identities/match.ts";
@@ -306,7 +306,10 @@ async function pushTails(host: string, scope: SyncScope, home: string, state: St
 async function pushSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState, tailsId?: string): Promise<string[]> {
   const snapshotId = crypto.randomUUID();
   const remoteRoot = `${AIS_REMOTE_CACHE_REL}/profile-incoming/${snapshotId}`;
-  const pushed = await ioPhase("push-rsync", () => runRsync(host, "push", filters, home, {
+  // rsync -a ships a symlinked ~/.ais/hooks as a bare link, so newer hook scripts never arrived. Exclude the
+  // link from the main transfer (it would stage a link pointing at this host's path) and send its target as a tree.
+  const hooksLink = scope.kind === "all" && !filters.some((f) => f.startsWith("--files-from")) && (await lstat(join(home, ".ais", "hooks")).catch(() => undefined))?.isSymbolicLink();
+  const pushed = await ioPhase("push-rsync", () => runRsync(host, "push", hooksLink ? ["--exclude=/.ais/hooks", ...filters] : filters, home, {
     remoteRoot,
     // The incoming root is ~/.ais/remote-cache/profile-incoming/<uuid>. Omit
     // files byte-identical to the receiver's live home so staging is sparse
@@ -314,6 +317,14 @@ async function pushSnapshot(host: string, filters: string[], scope: SyncScope, h
     compareDest: "../../../..",
   }));
   if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
+  if (hooksLink) {
+    const hooks = await runRsync(host, "push", [], home, {
+      localRoot: await realpath(join(home, ".ais", "hooks")),
+      remoteRoot: `${remoteRoot}/.ais/hooks`,
+      compareDest: "../../../../../../.ais/hooks",
+    });
+    if (hooks.exitCode !== 0) throw syncError(host, "push", hooks.stderr, hooks.exitCode);
+  }
   const merged = await runRemoteAis(host, ["sync", "merge-profile-snapshot", snapshotId, ...scopeArgs(scope), ...(tailsId ? [`--tails=${tailsId}`] : [])]);
   noteRemoteIo(host, merged);
   const parsed = parseJson(merged);

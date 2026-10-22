@@ -553,37 +553,11 @@ async function scrubRetiredConflictCopies(configs: ToolConfig[], home: string, c
   }
 }
 
-async function preserveFile(source: string, root: string, side: "local" | "incoming", rel: string): Promise<string> {
+async function preserveFile(source: string, root: string, side: "local" | "incoming", rel: string): Promise<void> {
   let destination = join(root, side, rel);
   if (await exists(destination)) destination = `${destination}.${crypto.randomUUID()}`;
   await mkdir(dirname(destination), { recursive: true });
   await copyFile(source, destination);
-  return destination;
-}
-
-/** The losing incoming copy of a persistent disagreement (a file the other host keeps rewriting, or cannot be
- * overwritten) used to be archived and counted as a new conflict on every run. Remember which exact content
- * was archived for each path and, while that archive still exists, count and archive it once. */
-interface PreservedIndex { entries: Record<string, { sha: string; archive: string }>; dirty: boolean }
-const preservedIndexPath = (home: string) => join(aisRemoteCacheDir(home), "preserved-incoming.json");
-
-async function loadPreservedIndex(home: string): Promise<PreservedIndex> {
-  try {
-    const raw = JSON.parse(await readFile(preservedIndexPath(home), "utf8")) as Record<string, { sha: string; archive: string }>;
-    return { entries: raw && typeof raw === "object" ? raw : {}, dirty: false };
-  } catch { return { entries: {}, dirty: false }; }
-}
-
-async function savePreservedIndex(home: string, index: PreservedIndex): Promise<void> {
-  if (!index.dirty) return;
-  await mkdir(aisRemoteCacheDir(home), { recursive: true });
-  await writeFile(preservedIndexPath(home), `${JSON.stringify(index.entries)}\n`);
-}
-
-/** True when this exact incoming content was already archived for `rel` and the archive is still there. */
-async function alreadyPreserved(index: PreservedIndex, rel: string, sha: string): Promise<boolean> {
-  const known = index.entries[rel];
-  return known?.sha === sha && (await exists(known.archive));
 }
 
 /** Apply the tail transfers staged in `dir`: append each verified suffix to its live history. */
@@ -713,7 +687,6 @@ export async function mergeIncomingProfileTree(
   }
 
   if (options.tailsDir) await applyTails(options.tailsDir, home, ownerPass, result);
-  const preserved = await loadPreservedIndex(home);
 
   for await (const source of walkFiles(incomingRoot)) {
     const rel = pathWithin(incomingRoot, source);
@@ -764,17 +737,13 @@ export async function mergeIncomingProfileTree(
       if (!volatile) await preserveFile(destination, conflictRoot, "local", rel);
       if (!(await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths))) continue;
     } else if (!volatile) {
-      const sha = createHash("sha256").update(await readFile(source)).digest("hex");
-      if (await alreadyPreserved(preserved, rel, sha)) continue;
-      preserved.entries[rel] = { sha, archive: await preserveFile(source, conflictRoot, "incoming", rel) };
-      preserved.dirty = true;
+      await preserveFile(source, conflictRoot, "incoming", rel);
     }
     if (volatile) continue;
     result.preservedConflicts++;
     result.preservedConflictPaths.push(rel);
   }
 
-  await savePreservedIndex(home, preserved);
   await purgeRetiredCredentialsAfterSync(configsForScope(scope), home, options.purgeRetired);
   await scrubRetiredConflictCopies(configsForScope(scope), home, conflictRoot);
   return result;

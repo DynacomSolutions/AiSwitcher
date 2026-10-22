@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { appendFile, chmod, symlink, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -279,3 +279,24 @@ test.skipIf(process.platform !== "linux" || !rsync)("an appended 50 MB history m
   for (const e of steady.entries) expect(e.wchar).toBeLessThan(10 * MB);
   expect(await sizeOf(join(remote, big))).toBe(await sizeOf(join(local, big)));
 }, 600_000);
+
+test.skipIf(process.platform !== "linux" || !rsync)("newer shared hook scripts reach the remote and conflicts reach zero by the second run", async () => {
+  const { local, remote, run } = await harness();
+  const T = 1_700_000_000;
+  await put(local, ".claude/identities.json", claudeRegistry);
+  await put(remote, ".claude/identities.json", claudeRegistry);
+  const hooks = ["a.sh", "b.py", "c.sh"];
+  for (const h of hooks) {
+    await put(remote, `.ais/hooks/${h}`, `#!/bin/sh\necho old ${h}\n`, T);
+    await put(local, `shared-hooks/${h}`, `#!/bin/sh\necho new and longer ${h}\n`, T + 1000);
+  }
+  // As on a real host: ~/.ais/hooks is a symlink to a shared tree, which rsync -a would send as a bare link.
+  await mkdir(join(local, ".ais"), { recursive: true });
+  await symlink(join(local, "shared-hooks"), join(local, ".ais", "hooks"));
+  const first = await run();
+  expect(first.exitCode).toBe(0);
+  for (const h of hooks) expect(await readFile(join(remote, `.ais/hooks/${h}`), "utf8")).toBe(await readFile(join(local, `.ais/hooks/${h}`), "utf8"));
+  const second = await run();
+  expect(second.exitCode).toBe(0);
+  expect(second.text).not.toContain("preserved");
+}, 120_000);
