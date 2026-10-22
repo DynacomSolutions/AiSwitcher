@@ -40,6 +40,8 @@ type BackupGroup = keyof typeof BACKUP_GROUPS;
 // ".claude.json.backup.*" (Claude's own rotating copies) appear and vanish faster
 // than git add's retries, failing the backup.
 // ".claude/identities/*/sessions/": per-pid <pid>.<hash>.key runtime files that churn constantly.
+// ".codex/tmp/", ".codex/identities/*/tmp/": codex scratch (arg0 symlink farms, apply_patch shims) that
+// vanishes mid-add and makes git abort; nothing there is worth restoring (see TMP_PATH_RE).
 const BACKUP_EXCLUDES = [
   ...REPRODUCIBLE_JUNK_DIR_NAMES,
   "*.lock",
@@ -50,7 +52,11 @@ const BACKUP_EXCLUDES = [
   "*-shm",
   ".claude.json.backup.*",
   ".claude/identities/*/sessions/",
+  ".codex/tmp/",
+  ".codex/identities/*/tmp/",
 ];
+/** Home-relative paths under the volatile tmp trees above; mirrors BACKUP_EXCLUDES for code that bypasses the exclude file. */
+const TMP_PATH_RE = /^\.codex\/(identities\/[^/]+\/)?tmp(\/|$)/;
 
 function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
@@ -97,9 +103,17 @@ const SAFE_GIT_CONFIG = [
   "filter.lfs.required=false",
 ].flatMap((kv) => ["-c", kv]);
 
+/** Thrown when the overall backup time budget runs out and the running git was killed. */
+class BackupTimeoutError extends Error {}
+
+// Epoch ms after which every backup git command is killed; set by runBackup around the local backup only.
+let deadlineAt: number | undefined;
+
 async function runGit(repoDir: string, home: string, args: string[], stdin?: string, env?: Record<string, string>): Promise<GitResult> {
-  const git = Bun.which("git");
+  const git = Bun.which("git", { PATH: process.env.PATH ?? "" });
   if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
+  const left = deadlineAt === undefined ? undefined : deadlineAt - Date.now();
+  if (left !== undefined && left <= 0) throw new BackupTimeoutError();
   const proc = Bun.spawn([git, ...SAFE_GIT_CONFIG, `--git-dir=${join(repoDir, ".git")}`, `--work-tree=${home}`, ...args], {
     cwd: home,
     stdin: stdin === undefined ? "ignore" : new Blob([stdin]),
@@ -107,49 +121,61 @@ async function runGit(repoDir: string, home: string, args: string[], stdin?: str
     stdout: "pipe",
     stderr: "pipe",
   });
+  let timedOut = false;
+  let hardKill: ReturnType<typeof setTimeout> | undefined;
+  // SIGTERM lets git release its index.lock and stop children; SIGKILL if it ignores that.
+  const softKill = left === undefined ? undefined : setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGTERM");
+    hardKill = setTimeout(() => proc.kill("SIGKILL"), 5000);
+  }, left);
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
+  clearTimeout(softKill);
+  clearTimeout(hardKill);
+  if (timedOut) throw new BackupTimeoutError();
   return { exitCode, stdout, stderr };
 }
 
-const VANISHED_RE = /unable to stat '([^']*)': No such file or directory/g;
+const VANISHED_RE = /unable to stat '[^']*': No such file or directory/;
 
-/** Runs a `git add` attempt, retrying when git exits 128 because a file vanished
- * between listing and staging; `--ignore-errors` does not cover that lstat failure.
- * Every vanished path git names is handed to the next attempt in `skip` so it can be
- * left out. Each retry must skip a path not seen before, so continuous churn cannot
- * exhaust a retry cap yet the loop always terminates (finite paths). Any other
- * failure, or a vanished path that was already skipped, is returned for the caller. */
 /** git aborts with this, naming only an object id, when a file changes while it is being hashed. */
 const UNSTABLE_RE = /confused by unstable object source data/;
-const UNSTABLE_RETRIES = 3;
+const UNSTABLE_RETRIES = 1;
+const VANISHED_RETRIES = 20;
 
-/** A file written to during the attempt is what git tripped over. `changedSince` lists the files modified after the
- * attempt began; they are left out of the retry (the next backup picks them up) and everything else is kept. */
+/** Runs a `git add` attempt, retrying when git exits 128 for a race with live writers.
+ * `--ignore-errors` does not cover either race, and an aborted add never writes the index,
+ * so a retry is a clean re-run, not a resume.
+ * - A file vanished between listing and staging: the retry's fresh walk no longer sees it,
+ *   so it needs no exclusion. Capped at VANISHED_RETRIES (the time budget also bounds it).
+ * - A file changed while being hashed: retried ONCE with the files written since the attempt
+ *   began (`changedSince`) passed as `skip`; the next backup picks them up. The list is
+ *   replaced, never accumulated, so the pathspec set stays bounded.
+ * Any other failure, or an exhausted cap, is returned for the caller. */
 export async function addRetryingVanished(
   repoDir: string,
-  attempt: (skip: string[]) => Promise<GitResult>,
+  attempt: (skip: readonly string[]) => Promise<GitResult>,
   changedSince: (sinceMs: number) => Promise<string[]> = async () => [],
 ): Promise<GitResult> {
-  const skip = new Set<string>();
+  let skip: string[] = [];
   let unstable = 0;
+  let vanished = 0;
   for (;;) {
     const started = Date.now() - 2000;
-    const result = await attempt([...skip]);
+    const result = await attempt(skip);
     if (result.exitCode !== 128) return result;
-    if (UNSTABLE_RE.test(result.stderr) && unstable++ < UNSTABLE_RETRIES) {
-      const changed = (await changedSince(started)).filter((p) => !skip.has(p));
-      console.error(`backup: a file changed while git was hashing it in ${repoDir}; leaving ${changed.length} just-written file(s) for the next backup and retrying`);
-      for (const p of changed) skip.add(p);
+    if (UNSTABLE_RE.test(result.stderr)) {
+      if (unstable++ >= UNSTABLE_RETRIES) return result;
+      skip = await changedSince(started);
+      console.error(`backup: a file changed while git was hashing it in ${repoDir}; leaving ${skip.length} just-written file(s) for the next backup and retrying once`);
       continue;
     }
-    const gone = [...result.stderr.matchAll(VANISHED_RE)].map((m) => m[1]!);
-    if (gone.length === 0 || gone.every((p) => skip.has(p))) return result;
-    console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${result.stderr.trim()}`);
-    for (const p of gone) skip.add(p);
+    if (!VANISHED_RE.test(result.stderr) || vanished++ >= VANISHED_RETRIES) return result;
+    console.error(`backup: git add hit a vanished file in ${repoDir}, retrying: ${result.stderr.trim()}`);
   }
 }
 
@@ -164,7 +190,7 @@ async function ensureRepo(repoDir: string, home: string): Promise<string[]> {
   await mkdir(repoDir, { recursive: true });
   if (!(await pathExists(join(repoDir, ".git")))) {
     // Plain init (no --work-tree): the work tree is passed per command instead.
-    const git = Bun.which("git");
+    const git = Bun.which("git", { PATH: process.env.PATH ?? "" });
     if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
     const proc = Bun.spawn([git, "init", "--template=", "--quiet", repoDir], { stdout: "pipe", stderr: "pipe" });
     const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
@@ -187,6 +213,11 @@ async function ensureRepo(repoDir: string, home: string): Promise<string[]> {
   // The work tree is all of home, so untracked noise in `git status` is
   // meaningless and slow to compute.
   await runGit(repoDir, home, ["config", "status.showUntrackedFiles", "no"]);
+  // Keep `git add -A` over ~500k files fast: cached directory scans, index v4,
+  // parallel stat, and cheap zlib for the multi-GB SQLite blobs hashed every run.
+  for (const [k, v] of [["core.untrackedCache", "true"], ["feature.manyFiles", "true"], ["core.preloadIndex", "true"], ["core.looseCompression", "1"]] as const) {
+    await runGit(repoDir, home, ["config", k, v]);
+  }
   // Rewritten every run so a changed BACKUP_EXCLUDES takes effect. Trailing-slash
   // names match a directory of that name anywhere; globs match anywhere.
   await mkdir(join(repoDir, ".git", "info"), { recursive: true });
@@ -308,7 +339,7 @@ async function findNestedRepoFiles(home: string, name: string): Promise<{ repos:
       if (e.name === ".git") continue;
       const child = `${rel}/${e.name}`;
       if (e.isDirectory()) {
-        if (!JUNK_DIRS.has(e.name) && !/(^|\/)jobs\/[^/]+\/tmp$/.test(child)) await walk(child, inRepo);
+        if (!JUNK_DIRS.has(e.name) && !/(^|\/)jobs\/[^/]+\/tmp$/.test(child) && !TMP_PATH_RE.test(child)) await walk(child, inRepo);
       } else if (inRepo && (e.isFile() || e.isSymbolicLink()) && !/\.(lock|sock|pid)$/.test(e.name)) {
         if (e.isFile()) {
           try {
@@ -338,9 +369,32 @@ async function removeStaleIndexLock(repoDir: string): Promise<void> {
   await rm(lock, { force: true });
 }
 
+const DEFAULT_BACKUP_TIMEOUT_MS = 20 * 60_000;
+
+/** Runs the local backup under a time budget (AIS_BACKUP_TIMEOUT_MS, default 20 min). On expiry the
+ * running git is killed and the backup fails cleanly; an index.lock is removed only if this run's git created it. */
 async function backupAndCommit(groups: readonly BackupGroup[], home: string): Promise<string> {
   const repoDir = aisBackupsDir(home);
   await removeStaleIndexLock(repoDir);
+  const lock = join(repoDir, ".git", "index.lock");
+  const lockBefore = await pathExists(lock);
+  const parsed = Number(process.env.AIS_BACKUP_TIMEOUT_MS);
+  const budgetMs = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BACKUP_TIMEOUT_MS;
+  deadlineAt = Date.now() + budgetMs;
+  try {
+    return await backupAndCommitInner(groups, home, repoDir);
+  } catch (err) {
+    if (!(err instanceof BackupTimeoutError)) throw err;
+    if (!lockBefore) await rm(lock, { force: true });
+    throw new Error(
+      `backup: aborted after the ${Math.round(budgetMs / 1000)} s time budget (set AIS_BACKUP_TIMEOUT_MS to change it); git was stopped and nothing was committed by this run`,
+    );
+  } finally {
+    deadlineAt = undefined;
+  }
+}
+
+async function backupAndCommitInner(groups: readonly BackupGroup[], home: string, repoDir: string): Promise<string> {
   const polluted = await ensureRepo(repoDir, home);
   await removeLegacyMirrors(repoDir, home);
 
@@ -404,8 +458,14 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
 
   // Exit 1 is --ignore-errors reporting files it skipped (permission-denied,
   // vanished mid-scan); anything else (e.g. 128, a stale index.lock) is fatal.
+  // Pathspecs go over stdin (NUL-separated): no ARG_MAX limit however long `skip` is.
   const add = await addRetryingVanished(repoDir, (skip) =>
-    runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored, ...skip.map((p) => `:(exclude,literal)${p}`)]),
+    runGit(
+      repoDir,
+      home,
+      ["add", "-A", "--ignore-errors", "--pathspec-from-file=-", "--pathspec-file-nul"],
+      [...mirrored, ...skip.map((p) => `:(exclude,literal)${p}`)].join("\0") + "\0",
+    ),
     (sinceMs) => filesChangedSince(home, mirrored, sinceMs),
   );
   if (add.exitCode === 1) {
@@ -423,7 +483,7 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
     const skipped = await runGit(repoDir, home, ["ls-files", "-z", "-o", "-i", "--directory", `--exclude-from=${join(home, ".gitignore")}`, "--", ...mirrored]);
     for (const p of skipped.stdout.split("\0").filter(Boolean)) {
       const parts = p.split("/").filter(Boolean);
-      if (parts.some((seg) => JUNK_DIRS.has(seg)) || /(^|\/)jobs\/[^/]+\/tmp(\/|$)/.test(p) || /\.(lock|sock|pid)\/?$/.test(p)) continue;
+      if (parts.some((seg) => JUNK_DIRS.has(seg)) || /(^|\/)jobs\/[^/]+\/tmp(\/|$)/.test(p) || TMP_PATH_RE.test(p) || /\.(lock|sock|pid)\/?$/.test(p)) continue;
       skippedPaths.push(p);
     }
   }
@@ -466,7 +526,13 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
   const rev = await runGit(repoDir, home, ["rev-parse", "--short", "HEAD"]);
   console.error(`backup: committed ${rev.stdout.trim()} in ${repoDir}`);
 
-  await runGit(repoDir, home, ["gc", "--auto", "--quiet"]);
+  // The commit is safe by now; a gc that outruns the budget is only skipped.
+  try {
+    await runGit(repoDir, home, ["gc", "--auto", "--quiet"]);
+  } catch (err) {
+    if (!(err instanceof BackupTimeoutError)) throw err;
+    console.error(`backup: git gc stopped by the time budget; the next backup retries it`);
+  }
 
   console.error(`backup: complete, see ${repoDir}`);
   return repoDir;

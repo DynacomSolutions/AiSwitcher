@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -782,50 +782,44 @@ describe("runBackup shallow push and vanished files", () => {
     expect(await git(fresh, ["rev-parse", `refs/heads/${await branchOf(repo)}`])).toBe(await git(repo, ["rev-parse", "HEAD"]));
   });
 
-  test("a 128 'unable to stat ... No such file' is retried with the path skipped; other 128s are returned", async () => {
+  test("a vanished-file 128 is retried without any exclude pathspec; other 128s are returned", async () => {
     const vanished = { exitCode: 128, stdout: "", stderr: "fatal: unable to stat 'x/gone.txt': No such file or directory" };
-    const errors: string[] = [];
     const orig = console.error;
-    console.error = (...a: unknown[]) => void errors.push(a.join(" "));
+    console.error = () => {};
     try {
       let calls = 0;
-      const ok = await addRetryingVanished("/r", async () => (++calls === 1 ? vanished : { exitCode: 0, stdout: "", stderr: "" }));
+      const seen: string[][] = [];
+      const ok = await addRetryingVanished("/r", async (skip) => (seen.push([...skip]), ++calls === 1 ? vanished : { exitCode: 0, stdout: "", stderr: "" }));
       expect(ok.exitCode).toBe(0);
-      expect(calls).toBe(2);
-      expect(errors.join("\n")).toContain("skipped unreadable or vanished files");
+      expect(seen).toEqual([[], []]);
 
       calls = 0;
       const lock = await addRetryingVanished("/r", async () => (calls++, { exitCode: 128, stdout: "", stderr: "fatal: Unable to create index.lock" }));
       expect(lock.exitCode).toBe(128);
       expect(calls).toBe(1);
 
-      // Continuous churn: a new file vanishes on every attempt; backup still completes.
+      // Continuous churn: a new file vanishes each attempt; the exclude list never grows and the loop ends.
       calls = 0;
+      let maxSkip = 0;
       const churn = await addRetryingVanished("/r", async (skip) => {
         calls++;
-        return calls <= 50
-          ? { exitCode: 128, stdout: "", stderr: `fatal: unable to stat 'f${calls}': No such file or directory` }
-          : { exitCode: 0, stdout: "", stderr: String(skip.length) };
+        maxSkip = Math.max(maxSkip, skip.length);
+        return { exitCode: 128, stdout: "", stderr: `fatal: unable to stat 'f${calls}': No such file or directory` };
       });
-      expect(churn.exitCode).toBe(0);
-      expect(churn.stderr).toBe("50");
-
-      // Same path reported again despite being skipped: no progress, returned (terminates).
-      calls = 0;
-      const stuck = await addRetryingVanished("/r", async () => (calls++, vanished));
-      expect(stuck.exitCode).toBe(128);
-      expect(calls).toBe(2);
+      expect(churn.exitCode).toBe(128);
+      expect(maxSkip).toBe(0);
+      expect(calls).toBeLessThan(50);
     } finally {
       console.error = orig;
     }
   });
 
-  test("'unstable object source data' retries with just-written files left out; a persistent one is returned", async () => {
+  test("'unstable object source data' retries once with the just-written files left out, never accumulating", async () => {
     const unstable = { exitCode: 128, stdout: "", stderr: "fatal: confused by unstable object source data for 3c8e35525cf171156cf9c010bc72c6aed133e27e" };
     const orig = console.error;
     console.error = () => {};
     try {
-      let seen: string[] = [];
+      let seen: readonly string[] = [];
       let calls = 0;
       const ok = await addRetryingVanished("/r", async (skip) => (++calls === 1 ? unstable : (seen = skip, { exitCode: 0, stdout: "", stderr: "" })), async () => [".claude/projects/live.jsonl"]);
       expect(ok.exitCode).toBe(0);
@@ -834,8 +828,50 @@ describe("runBackup shallow push and vanished files", () => {
       calls = 0;
       const stuck = await addRetryingVanished("/r", async () => (calls++, unstable), async () => []);
       expect(stuck.exitCode).toBe(128);
-      expect(calls).toBe(4);
+      expect(calls).toBe(2);
     } finally { console.error = orig; }
+  });
+
+  test(".codex tmp trees are not committed, other .codex content is", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    await write(join(home, ".codex", "identities", "a", "config.toml"), "x\n");
+    await write(join(home, ".codex", "identities", "a", "tmp", "arg0-linux", "codex-arg0X", "apply_patch"), "x\n");
+    await write(join(home, ".codex", "tmp", "arg0", "y"), "x\n");
+    const repo = await runBackup(["codex"], home);
+    expect((await gitLs(repo)).sort()).toEqual([".codex/identities.json", ".codex/identities/a/config.toml"]);
+    expect((await gitOut(repo, ["config", "core.untrackedCache"])).trim()).toBe("true");
+    expect((await gitOut(repo, ["config", "feature.manyFiles"])).trim()).toBe("true");
+  });
+
+  test("a git that outruns the time budget is killed; backup fails cleanly without leaving an index.lock", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "identities.json"), "{}\n");
+    const shim = await mkdtemp(join(tmpdir(), "ais-slowgit-"));
+    tempDirs.push(shim);
+    const real = Bun.which("git")!;
+    // A slow `add` that holds the index lock, as a real git add would.
+    await writeFile(
+      join(shim, "git"),
+      `#!/bin/sh\nfor a in "$@"; do if [ "$a" = add ]; then touch "$AIS_TEST_LOCK"; exec sleep 30; fi; done\nexec ${real} "$@"\n`,
+      { mode: 0o755 },
+    );
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shim}:${oldPath}`;
+    process.env.AIS_BACKUP_TIMEOUT_MS = "1500";
+    process.env.AIS_TEST_LOCK = join(home, ".ais", "backups", ".git", "index.lock");
+    const started = Date.now();
+    try {
+      await expect(runBackup(["codex"], home)).rejects.toThrow(/time budget/);
+    } finally {
+      process.env.PATH = oldPath;
+      delete process.env.AIS_BACKUP_TIMEOUT_MS;
+      delete process.env.AIS_TEST_LOCK;
+    }
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(existsSync(join(home, ".ais", "backups", ".git", "index.lock"))).toBe(false);
+    // Budget off again: the next run succeeds.
+    expect(await gitLs(await runBackup(["codex"], home))).toEqual([".codex/identities.json"]);
   });
 
   test("a real backup completes while a session history is rewritten during git add", async () => {
