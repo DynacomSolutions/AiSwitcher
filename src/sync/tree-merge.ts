@@ -211,7 +211,7 @@ async function sourceWinsTie(source: string, destination: string): Promise<boole
 }
 
 /** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict. */
-const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at)$/;
+const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$/;
 
 /** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
 const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|changelogLastFetched|cached.*|.*Cache.*)$/;
@@ -267,7 +267,7 @@ const LSOF_TIMEOUT_MS = 5000;
 // pass a single snapshot of all open files wins (a lookup can cost ~1.4s on a busy host,
 // so 32 per-file lsof runs blew a 30s budget).
 const PER_FILE_LOOKUPS = 4;
-interface OpenPathSnapshot { paths: Set<string>; inaccessibleUids: Set<number> }
+interface OpenPathSnapshot { paths: Set<string> }
 type OpenPaths = Set<string> | OpenPathSnapshot;
 export type OpenPathsScanner = (signal: AbortSignal) => Promise<OpenPaths | undefined>;
 let openScanner: OpenPathsScanner = scanOpenPaths;
@@ -279,7 +279,7 @@ export function setOpenScanner(scanner?: OpenPathsScanner, timeoutMs = LSOF_TIME
 }
 
 function lsofBinary(): string | undefined {
-  return Bun.which("lsof") ?? (process.platform === "darwin" && existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : undefined);
+  return Bun.which("lsof", { PATH: process.env.PATH ?? "" }) ?? (process.platform === "darwin" && existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : undefined);
 }
 
 interface ProcReader {
@@ -301,7 +301,6 @@ async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promi
     return undefined;
   }
   const paths = new Set<string>();
-  const inaccessibleUids = new Set<number>();
   for (const pid of processDirs) {
     if (signal.aborted) return undefined;
     let fds: string[];
@@ -309,20 +308,9 @@ async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promi
       fds = await reader.readdir(join("/proc", pid, "fd"));
     } catch (error) {
       if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
-      if ((error as NodeJS.ErrnoException).code === "EACCES") {
-        try {
-          // The directory owner can appear as root for a nondumpable process.
-          // Read its actual real, effective, saved and filesystem UIDs instead.
-          const status = await reader.readFile(join("/proc", pid, "status"));
-          const uids = /^Uid:[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]*$/m.exec(status);
-          if (!uids) return undefined;
-          for (const uid of uids.slice(1)) inaccessibleUids.add(Number(uid));
-        }
-        catch (uidError) {
-          if (!["ENOENT", "ESRCH"].includes((uidError as NodeJS.ErrnoException).code ?? "")) return undefined;
-        }
-        continue;
-      }
+      // An unreadable fd directory belongs to another user or a privileged process. Our tools run as us and are
+      // readable, so it cannot own our files; letting it turn the whole answer into "unknown" deferred every history.
+      if (["EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
       return undefined;
     }
     for (const fd of fds) {
@@ -332,23 +320,18 @@ async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promi
         paths.add((await reader.readlink(join("/proc", pid, "fd", fd))).replace(/ \(deleted\)$/, ""));
       } catch (error) {
         // Processes and descriptors can disappear while /proc is read.
-        if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
+        if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
       }
     }
   }
-  return { paths, inaccessibleUids };
+  return { paths };
 }
 
 async function snapshotHasOwner(snapshot: OpenPaths | undefined, path: string): Promise<boolean | undefined> {
   if (!snapshot) return undefined;
   if (snapshot instanceof Set) return snapshot.has(path);
   if (snapshot.paths.has(path)) return true;
-  if (snapshot.inaccessibleUids.has(0)) return undefined;
-  try {
-    // Other users' unreadable fd directories cannot starve this file. Retain
-    // the UIDs in a shared snapshot because each destination may have a different owner.
-    return snapshot.inaccessibleUids.has((await stat(path)).uid) ? undefined : false;
-  } catch { return undefined; }
+  return false;
 }
 
 async function lsofOpenPaths(signal: AbortSignal): Promise<Set<string> | undefined> {
@@ -424,6 +407,8 @@ export async function hasOpenOwnerBeforeWrite(path: string, ownDescriptor: numbe
 export interface OpenOwnerPass {
   lookups: number;
   snapshot?: Promise<OpenPaths | undefined>;
+  /** Answers already settled for this pass by prefetchOpenOwners (real path -> open by some process). */
+  known?: Map<string, boolean>;
 }
 
 export async function hasOpenOwner(path: string, pass: OpenOwnerPass = { lookups: PER_FILE_LOOKUPS }): Promise<boolean | undefined> {
@@ -433,12 +418,40 @@ export async function hasOpenOwner(path: string, pass: OpenOwnerPass = { lookups
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : undefined;
   }
+  const settled = pass.known?.get(real);
+  if (settled !== undefined) return settled;
   if (pass.lookups++ < PER_FILE_LOOKUPS) return hasOpenOwnerDirect(real);
   // Each pass gets one fresh, bounded snapshot after its per-file budget.
   // A successful scan can distinguish closed files from busy ones; failure
   // remains unknown. Never carry a previous pass's misses into a new merge.
   pass.snapshot ??= boundedOpenScan();
   return snapshotHasOwner(await pass.snapshot, real);
+}
+
+const PREFETCH_TIMEOUT_MS = 60_000;
+const PREFETCH_CHUNK = 400;
+
+/** Settle ownership of many files with a few lsof runs, one per chunk of names. Asking per file costs a full
+ * process scan each (seconds on a busy host), and a /proc snapshot can time out or be blocked by unreadable
+ * processes; either left every file after the first few "busy" on every run. Failure leaves `pass` untouched. */
+export async function prefetchOpenOwners(paths: string[], pass: OpenOwnerPass): Promise<void> {
+  const lsof = lsofBinary();
+  // A handful of files is cheaper through the per-file lookups.
+  if (!lsof || paths.length <= PER_FILE_LOOKUPS) return;
+  const reals = new Set<string>();
+  for (const path of paths) { try { reals.add(await realpath(path)); } catch { /* gone: asked again, answered false */ } }
+  const list = [...reals];
+  const known = new Map(pass.known);
+  for (let i = 0; i < list.length; i += PREFETCH_CHUNK) {
+    const chunk = list.slice(i, i + PREFETCH_CHUNK);
+    const proc = Bun.spawn([lsof, "-Fn", "--", ...chunk], { stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: PREFETCH_TIMEOUT_MS });
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    // 0: some are open; 1: none are (lsof also exits 1 when it could not read some processes). Anything else is a failure.
+    if (exitCode !== 0 && exitCode !== 1) return;
+    const open = new Set(stdout.split("\n").filter((l) => l.startsWith("n")).map((l) => l.slice(1).replace(/ \(deleted\)$/, "")));
+    for (const real of chunk) known.set(real, open.has(real));
+  }
+  pass.known = known;
 }
 
 function configsForScope(scope: SyncScope): ToolConfig[] {
@@ -569,6 +582,7 @@ async function applyTails(dir: string, home: string, expected: HistoryManifest, 
   let plan: TailPlan;
   try { plan = JSON.parse(await readFile(join(dir, TAIL_PLAN_FILE), "utf8")) as TailPlan; }
   catch { for (const rel of Object.keys(expected)) full(rel); return; }
+  await prefetchOpenOwners(Object.keys(plan).filter((rel) => expected[rel]).map((rel) => join(home, rel)), ownerPass);
   for (const [rel, entry] of Object.entries(plan)) {
     const known = expected[rel];
     const offsetOk = known !== undefined && (strict ? entry.offset === Math.min(entry.size, known.size) : entry.offset <= Math.min(entry.size, known.size));
@@ -632,7 +646,8 @@ async function writeDurableArchive(destination: string, bytes: Buffer, home: str
   await syncArchiveDirectories(destination, home);
 }
 
-async function preserveDeferredFile(source: string, home: string, rel: string): Promise<void> {
+/** Archives the incoming copy durably. False when an identical copy was already archived (nothing new to report). */
+async function preserveDeferredFile(source: string, home: string, rel: string): Promise<boolean> {
   const root = join(aisRemoteCacheDir(home), "merge-conflicts");
   const destination = join(root, "deferred", "incoming", rel);
   const incoming = Buffer.from(await Bun.file(source).arrayBuffer());
@@ -645,7 +660,7 @@ async function preserveDeferredFile(source: string, home: string, rel: string): 
       try { await handle.sync(); }
       finally { await handle.close(); }
       await syncArchiveDirectories(destination, home);
-      return;
+      return false;
     }
     // Latin-1 preserves each byte for comparison, including malformed UTF-8.
     if (!subsumesJsonl(incoming.toString("latin1"), previous.toString("latin1"))) {
@@ -657,6 +672,7 @@ async function preserveDeferredFile(source: string, home: string, rel: string): 
     }
   }
   await writeDurableArchive(destination, incoming, home);
+  return true;
 }
 
 /**
@@ -705,6 +721,14 @@ export async function mergeIncomingProfileTree(
     await applyTails(options.tailsDir, home, options.tailsManifest ?? await listHistories(home, scope), strict, ownerPass, result);
   }
 
+  // One lsof run per few hundred staged histories instead of a process scan (or a deferral) per file.
+  const stagedHistories: string[] = [];
+  for await (const source of walkFiles(incomingRoot)) {
+    const rel = pathWithin(incomingRoot, source);
+    if (rel && source.endsWith(".jsonl") && !registries.has(rel)) stagedHistories.push(join(home, rel));
+  }
+  await prefetchOpenOwners(stagedHistories, ownerPass);
+
   for await (const source of walkFiles(incomingRoot)) {
     const rel = pathWithin(incomingRoot, source);
     if (!rel || registries.has(rel)) continue;
@@ -719,8 +743,8 @@ export async function mergeIncomingProfileTree(
       // mergeJsonlFiles checks ownership only when there is an actual append
       // to make, so an unchanged replay does not become a false conflict.
       const incompleteSource = !(await endsWithNewlineOrEmpty(source, (await stat(source)).size));
-      if (incompleteSource) {
-        await preserveDeferredFile(source, home, rel);
+      if (incompleteSource && (await preserveDeferredFile(source, home, rel))) {
+        // A live writer's unfinished line stays archived; only a changed copy is news, so the count converges.
         result.preservedConflicts++;
         result.preservedConflictPaths.push(rel);
       }

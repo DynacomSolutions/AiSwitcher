@@ -300,3 +300,42 @@ test.skipIf(process.platform !== "linux" || !rsync)("newer shared hook scripts r
   expect(second.exitCode).toBe(0);
   expect(second.text).not.toContain("preserved");
 }, 120_000);
+
+/** rchar/wchar of one traced phase line, e.g. phase "local push-tails" or "remote fake-host:tail-plan". */
+const phaseIo = (text: string, phase: string) => {
+  const m = new RegExp(`AIS sync io ${phase}: rchar=(\\S+) wchar=(\\S+)`).exec(text);
+  return m ? { rchar: human(m[1]!), wchar: human(m[2]!) } : undefined;
+};
+
+test.skipIf(process.platform !== "linux" || !rsync)("many large histories converge on push, then a no-append run writes and reads almost nothing", async () => {
+  const { root, local, remote, run } = await harness();
+  // lsof is hidden (a stub that fails like a missing or blocked tool): ownership must come from /proc alone, as on a host without lsof.
+  await writeFile(join(root, "shim", "lsof"), "#!/bin/sh\nexit 127\n");
+  await chmod(join(root, "shim", "lsof"), 0o755);
+  const T = 1_700_000_000;
+  const a = ".claude/identities/a";
+  const line = (n: number) => `{"n":${n},"pad":"${"p".repeat(1000)}"}\n`;
+  const lines = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => line(from + i)).join("");
+  await put(local, ".claude/identities.json", claudeRegistry);
+  await put(remote, ".claude/identities.json", claudeRegistry);
+  // Twenty-four 1.5 MB histories the remote already holds the first 70% of: each needs an appended tail.
+  const names = Array.from({ length: 24 }, (_, i) => `${a}/projects/p/h${i}.jsonl`);
+  for (const name of names) {
+    await put(local, name, lines(0, 1500), T + 50);
+    await put(remote, name, lines(0, 1050), T + 10);
+  }
+  for (let i = 0; i < 3; i++) expect((await run()).exitCode).toBe(0);
+  const whole = (await sizeOf(join(local, names[0]!))) * names.length;
+  for (const name of names) expect(await readFile(join(remote, name), "utf8")).toBe(await readFile(join(local, name), "utf8"));
+
+  // Nothing was appended since: the push must not rebuild or send tails, and the remote must not re-hash.
+  const steady = await run({ AIS_SYNC_IO_TRACE: "1" });
+  expect(steady.exitCode).toBe(0);
+  const push = phaseIo(steady.text, "local push-tails");
+  const pull = phaseIo(steady.text, "local pull-tails");
+  const plan = phaseIo(steady.text, "remote fake-host:tail-plan");
+  console.log(`before/after: history bytes ${whole}; push-tails ${JSON.stringify(push)}; pull-tails ${JSON.stringify(pull)}; tail-plan ${JSON.stringify(plan)}`);
+  expect(push!.wchar).toBeLessThan(whole * 0.01);
+  if (plan) expect(plan.rchar).toBeLessThan(whole * 0.1);
+  expect(steady.text).not.toContain("preserved");
+}, 300_000);

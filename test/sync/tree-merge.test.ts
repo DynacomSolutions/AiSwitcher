@@ -78,7 +78,7 @@ function injectInaccessibleProcess(uid: number | number[], openPaths: string[] =
 
 describe.skipIf(process.platform !== "linux")("inaccessible /proc entries", () => {
   for (const owner of ["other", "same", "root"] as const) {
-    test(`${owner}-uid fd access failure ${owner === "other" ? "does not starve" : "defers"} a closed file`, async () => {
+    test(`${owner}-uid fd access failure does not starve a closed file`, async () => {
       const home = await makeDir("ais-proc-owner-");
       const path = join(home, "history.jsonl");
       await write(path, "SYNTHETIC_FIXTURE_local\n");
@@ -86,37 +86,48 @@ describe.skipIf(process.platform !== "linux")("inaccessible /proc entries", () =
       injectInaccessibleProcess(owner === "other" ? uid + 1 : owner === "same" ? uid : 0);
       // Exercise the real scanner, including its /proc traversal and UID
       // decision, with only the filesystem reader injected.
-      expect(await hasOpenOwner(path, { lookups: 4 })).toBe(owner === "other" ? false : undefined);
+      expect(await hasOpenOwner(path, { lookups: 4 })).toBe(false);
     });
   }
 
-  test("an inaccessible process with a matching filesystem UID remains unknown", async () => {
-    const home = await makeDir("ais-proc-filesystem-uid-");
-    const path = join(home, "history.jsonl");
-    await write(path, "SYNTHETIC_FIXTURE_local\n");
-    const uid = (await stat(path)).uid;
-    injectInaccessibleProcess([uid + 1, uid + 1, uid + 1, uid]);
-    expect(await hasOpenOwner(path, { lookups: 4 })).toBeUndefined();
+  test("one pid with an unreadable fd directory does not stop the other histories from merging", async () => {
+    const home = await makeDir("ais-proc-eacces-home-");
+    const incoming = await makeDir("ais-proc-eacces-incoming-");
+    const paths = Array.from({ length: 8 }, (_, i) => join(".codex", "identities", "personal", `${i}.jsonl`));
+    for (const rel of paths) {
+      await write(join(home, rel), "SYNTHETIC_FIXTURE_local\n");
+      await write(join(incoming, rel), "SYNTHETIC_FIXTURE_local\nSYNTHETIC_FIXTURE_remote\n");
+    }
+    const busy = await realpath(join(home, paths[0]!));
+    setProcReader({
+      async readdir(path) {
+        if (path === "/proc") return ["2147483646", "2147483645"];
+        if (path === "/proc/2147483646/fd") throw Object.assign(new Error("SYNTHETIC_FIXTURE_access"), { code: "EACCES" });
+        return ["0"];
+      },
+      async readlink() { return busy; },
+      async readFile() { return ""; },
+    });
+    // No lsof on PATH: the /proc reader alone must decide.
+    const savedPath = process.env.PATH;
+    process.env.PATH = "/nonexistent";
+    try {
+      const result = await mergeIncomingProfileTree(incoming, { kind: "identity", cfg: codexConfig(home), identityName: "personal" }, { home });
+      expect(result.busyPaths).toEqual([paths[0]!]);
+      expect(result.mergedJsonlFiles).toBe(7);
+    } finally { process.env.PATH = savedPath; }
   });
 
-  test("missing or unreadable process UIDs remain unknown", async () => {
-    const home = await makeDir("ais-proc-unknown-uid-");
+  test("only an unreadable /proc itself is unknown", async () => {
+    const home = await makeDir("ais-proc-unreadable-");
     const path = join(home, "history.jsonl");
     await write(path, "SYNTHETIC_FIXTURE_local\n");
-    for (const unreadable of [false, true]) {
-      setProcReader({
-        async readdir(path) {
-          if (path === "/proc") return ["2147483646"];
-          throw Object.assign(new Error("SYNTHETIC_FIXTURE_access"), { code: "EACCES" });
-        },
-        async readlink() { throw new Error("SYNTHETIC_FIXTURE_unexpected_link"); },
-        async readFile() {
-          if (unreadable) throw Object.assign(new Error("SYNTHETIC_FIXTURE_status_access"), { code: "EACCES" });
-          return "Name:\tSYNTHETIC_FIXTURE_process\n";
-        },
-      });
-      expect(await hasOpenOwner(path, { lookups: 4 })).toBeUndefined();
-    }
+    setProcReader({
+      async readdir() { throw Object.assign(new Error("SYNTHETIC_FIXTURE_access"), { code: "EACCES" }); },
+      async readlink() { throw new Error("SYNTHETIC_FIXTURE_unexpected_link"); },
+      async readFile() { return ""; },
+    });
+    expect(await hasOpenOwner(path, { lookups: 4 })).toBeUndefined();
   });
 });
 
