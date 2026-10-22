@@ -123,16 +123,41 @@ const VANISHED_RE = /unable to stat '([^']*)': No such file or directory/g;
  * left out. Each retry must skip a path not seen before, so continuous churn cannot
  * exhaust a retry cap yet the loop always terminates (finite paths). Any other
  * failure, or a vanished path that was already skipped, is returned for the caller. */
-export async function addRetryingVanished(repoDir: string, attempt: (skip: string[]) => Promise<GitResult>): Promise<GitResult> {
+/** git aborts with this, naming only an object id, when a file changes while it is being hashed. */
+const UNSTABLE_RE = /confused by unstable object source data/;
+const UNSTABLE_RETRIES = 3;
+
+/** A file written to during the attempt is what git tripped over. `changedSince` lists the files modified after the
+ * attempt began; they are left out of the retry (the next backup picks them up) and everything else is kept. */
+export async function addRetryingVanished(
+  repoDir: string,
+  attempt: (skip: string[]) => Promise<GitResult>,
+  changedSince: (sinceMs: number) => Promise<string[]> = async () => [],
+): Promise<GitResult> {
   const skip = new Set<string>();
+  let unstable = 0;
   for (;;) {
+    const started = Date.now() - 2000;
     const result = await attempt([...skip]);
     if (result.exitCode !== 128) return result;
+    if (UNSTABLE_RE.test(result.stderr) && unstable++ < UNSTABLE_RETRIES) {
+      const changed = (await changedSince(started)).filter((p) => !skip.has(p));
+      console.error(`backup: a file changed while git was hashing it in ${repoDir}; leaving ${changed.length} just-written file(s) for the next backup and retrying`);
+      for (const p of changed) skip.add(p);
+      continue;
+    }
     const gone = [...result.stderr.matchAll(VANISHED_RE)].map((m) => m[1]!);
     if (gone.length === 0 || gone.every((p) => skip.has(p))) return result;
     console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${result.stderr.trim()}`);
     for (const p of gone) skip.add(p);
   }
+}
+
+/** Home-relative regular files under `roots` modified at or after `sinceMs`, found with find(1) (fast on huge trees). */
+async function filesChangedSince(home: string, roots: string[], sinceMs: number): Promise<string[]> {
+  const proc = Bun.spawn(["find", ...roots, "-type", "f", "-newermt", `@${(sinceMs / 1000).toFixed(3)}`, "-print0"], { cwd: home, stdout: "pipe", stderr: "ignore" });
+  const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  return out.split("\0").filter(Boolean).map((p) => p.replace(/^\.\//, ""));
 }
 
 async function ensureRepo(repoDir: string, home: string): Promise<string[]> {
@@ -381,6 +406,7 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
   // vanished mid-scan); anything else (e.g. 128, a stale index.lock) is fatal.
   const add = await addRetryingVanished(repoDir, (skip) =>
     runGit(repoDir, home, ["add", "-A", "--ignore-errors", "--", ...mirrored, ...skip.map((p) => `:(exclude,literal)${p}`)]),
+    (sinceMs) => filesChangedSince(home, mirrored, sinceMs),
   );
   if (add.exitCode === 1) {
     console.error(`backup: git add skipped unreadable or vanished files in ${repoDir}: ${add.stderr.trim()}`);

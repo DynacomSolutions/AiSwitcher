@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -817,6 +818,36 @@ describe("runBackup shallow push and vanished files", () => {
     } finally {
       console.error = orig;
     }
+  });
+
+  test("'unstable object source data' retries with just-written files left out; a persistent one is returned", async () => {
+    const unstable = { exitCode: 128, stdout: "", stderr: "fatal: confused by unstable object source data for 3c8e35525cf171156cf9c010bc72c6aed133e27e" };
+    const orig = console.error;
+    console.error = () => {};
+    try {
+      let seen: string[] = [];
+      let calls = 0;
+      const ok = await addRetryingVanished("/r", async (skip) => (++calls === 1 ? unstable : (seen = skip, { exitCode: 0, stdout: "", stderr: "" })), async () => [".claude/projects/live.jsonl"]);
+      expect(ok.exitCode).toBe(0);
+      expect(seen).toEqual([".claude/projects/live.jsonl"]);
+
+      calls = 0;
+      const stuck = await addRetryingVanished("/r", async () => (calls++, unstable), async () => []);
+      expect(stuck.exitCode).toBe(128);
+      expect(calls).toBe(4);
+    } finally { console.error = orig; }
+  });
+
+  test("a real backup completes while a session history is rewritten during git add", async () => {
+    const home = await makeHome();
+    await write(join(home, ".claude", "identities", "a", "settings.json"), "{}\n");
+    const live = join(home, ".claude", "identities", "a", "projects", "p", "s.jsonl");
+    await write(live, "x".repeat(2_000_000));
+    const writer = setInterval(() => { try { appendFileSync(live, "y".repeat(50_000)); } catch { /* ignore */ } }, 2);
+    try {
+      const repo = await runBackup(["claude"], home);
+      expect(await gitLs(repo)).toContain(".claude/identities/a/settings.json");
+    } finally { clearInterval(writer); }
   });
 
   test(".claude/identities/*/sessions files are not committed", async () => {
