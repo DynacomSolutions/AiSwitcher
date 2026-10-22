@@ -18,7 +18,8 @@ import {
   type PurgeOptions,
   type PurgeReport,
 } from "../identities/retire-credentials.ts";
-import { withClaudeLocks } from "../identities/claude-swap-lock.ts";
+import { SwapLockError, withClaudeLocks } from "../identities/claude-swap-lock.ts";
+import type { LockOptions } from "../identities/pool/lock.ts";
 import { writeFileAtomic } from "../identities/pool/fs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
@@ -212,6 +213,10 @@ const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|[^/
 /** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
 const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|changelogLastFetched|cached.*|.*Cache.*)$/;
 
+let claudeLockOptions: LockOptions = {};
+/** Test hook: shorten the `.claude.json` lock wait (no argument restores the default). */
+export function setClaudeLockOptions(options: LockOptions = {}): void { claudeLockOptions = options; }
+
 /** A per-identity `.claude.json` is rewritten constantly by every running Claude Code on every host. Self-changing
  * keys merge key by key; every other key follows the newest file whole (deletions included) and, when the older
  * file held a different value, that file is preserved and counted as a conflict. */
@@ -245,6 +250,10 @@ async function mergeClaudeJson(source: string, destination: string, rel: string,
       await writeFileAtomic(destination, `${JSON.stringify(merged, null, 2)}\n`);
       await fsOps.utimes(destination, destinationStat.atime, new Date(Math.max(sourceStat.mtimeMs, destinationStat.mtimeMs)));
     }
+  }, claudeLockOptions).catch((error) => {
+    // A busy Claude Code session must not abort the sync: leave the file alone and merge next time.
+    if (!(error instanceof SwapLockError && error.timedOut)) throw error;
+    console.warn(`.claude.json for ${basename(dirname(rel))} busy; will merge next sync`);
   }), result.deniedPaths);
   return true;
 }

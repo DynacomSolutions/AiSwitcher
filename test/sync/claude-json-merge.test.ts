@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ToolConfig } from "../../src/identities/types.ts";
 import { sample } from "../../src/sync/io-trace.ts";
-import { mergeIncomingProfileTree } from "../../src/sync/tree-merge.ts";
+import { mergeIncomingProfileTree, setClaudeLockOptions } from "../../src/sync/tree-merge.ts";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
+  setClaudeLockOptions();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -62,6 +63,24 @@ describe("claude.json merge", () => {
     const result = await merge();
     expect("oauthAccount" in JSON.parse(await readFile(live(), "utf8"))).toBe(false);
     expect(result.preservedConflicts).toBe(1);
+  });
+
+  test("a busy .claude.json lock warns, leaves both files untouched and does not abort the sync", async () => {
+    const { home, put, merge, live, incoming } = await setup();
+    await put(home, ".claude.json", JSON.stringify({ mcpServers: { x: 1 } }), T);
+    await put(incoming, ".claude.json", JSON.stringify({ mcpServers: {} }), T + 100);
+    const before = await stat(live());
+    await mkdir(join(home, REL, ".claude.json.lock"));
+    setClaudeLockOptions({ timeoutMs: 200, pollMs: 20, staleMs: 60_000 });
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+    try { var result = await merge(); } finally { console.warn = original; }
+    expect(warnings).toEqual([".claude.json for a busy; will merge next sync"]);
+    expect(result.preservedConflicts).toBe(0);
+    expect(JSON.parse(await readFile(live(), "utf8"))).toEqual({ mcpServers: { x: 1 } });
+    expect(JSON.parse(await readFile(join(incoming, REL, ".claude.json"), "utf8"))).toEqual({ mcpServers: {} });
+    expect((await stat(live())).mtimeMs).toBe(before.mtimeMs);
   });
 
   test("L5: a newer incoming file equal to the merge settles bytes and mtime", async () => {
