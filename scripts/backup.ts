@@ -428,7 +428,7 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
     }
   }
   if (skippedPaths.length > 0) {
-    console.error(`backup: ${skippedPaths.length} file(s) skipped because a .gitignore rule matches them, e.g. ${skippedPaths.slice(0, 3).join(", ")}`);
+    console.error(`backup: ${skippedPaths.length} file(s) skipped because a .gitignore rule matches them: ${skippedPaths.slice(0, 10).join(", ")}${skippedPaths.length > 10 ? ", ..." : ""}`);
   }
 
   // A source directory with nothing trackable (empty, or everything under it

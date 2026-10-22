@@ -308,7 +308,10 @@ const phaseIo = (text: string, phase: string) => {
 };
 
 test.skipIf(process.platform !== "linux" || !rsync)("many large histories converge on push, then a no-append run writes and reads almost nothing", async () => {
-  const { local, remote, run } = await harness();
+  const { root, local, remote, run } = await harness();
+  // lsof is hidden (a stub that fails like a missing or blocked tool): ownership must come from /proc alone, as on a host without lsof.
+  await writeFile(join(root, "shim", "lsof"), "#!/bin/sh\nexit 127\n");
+  await chmod(join(root, "shim", "lsof"), 0o755);
   const T = 1_700_000_000;
   const a = ".claude/identities/a";
   const line = (n: number) => `{"n":${n},"pad":"${"p".repeat(1000)}"}\n`;

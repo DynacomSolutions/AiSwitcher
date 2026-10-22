@@ -267,7 +267,7 @@ const LSOF_TIMEOUT_MS = 5000;
 // pass a single snapshot of all open files wins (a lookup can cost ~1.4s on a busy host,
 // so 32 per-file lsof runs blew a 30s budget).
 const PER_FILE_LOOKUPS = 4;
-interface OpenPathSnapshot { paths: Set<string>; inaccessibleUids: Set<number> }
+interface OpenPathSnapshot { paths: Set<string> }
 type OpenPaths = Set<string> | OpenPathSnapshot;
 export type OpenPathsScanner = (signal: AbortSignal) => Promise<OpenPaths | undefined>;
 let openScanner: OpenPathsScanner = scanOpenPaths;
@@ -279,7 +279,7 @@ export function setOpenScanner(scanner?: OpenPathsScanner, timeoutMs = LSOF_TIME
 }
 
 function lsofBinary(): string | undefined {
-  return Bun.which("lsof") ?? (process.platform === "darwin" && existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : undefined);
+  return Bun.which("lsof", { PATH: process.env.PATH ?? "" }) ?? (process.platform === "darwin" && existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : undefined);
 }
 
 interface ProcReader {
@@ -301,7 +301,6 @@ async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promi
     return undefined;
   }
   const paths = new Set<string>();
-  const inaccessibleUids = new Set<number>();
   for (const pid of processDirs) {
     if (signal.aborted) return undefined;
     let fds: string[];
@@ -309,20 +308,9 @@ async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promi
       fds = await reader.readdir(join("/proc", pid, "fd"));
     } catch (error) {
       if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
-      if ((error as NodeJS.ErrnoException).code === "EACCES") {
-        try {
-          // The directory owner can appear as root for a nondumpable process.
-          // Read its actual real, effective, saved and filesystem UIDs instead.
-          const status = await reader.readFile(join("/proc", pid, "status"));
-          const uids = /^Uid:[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]*$/m.exec(status);
-          if (!uids) return undefined;
-          for (const uid of uids.slice(1)) inaccessibleUids.add(Number(uid));
-        }
-        catch (uidError) {
-          if (!["ENOENT", "ESRCH"].includes((uidError as NodeJS.ErrnoException).code ?? "")) return undefined;
-        }
-        continue;
-      }
+      // An unreadable fd directory belongs to another user or a privileged process. Our tools run as us and are
+      // readable, so it cannot own our files; letting it turn the whole answer into "unknown" deferred every history.
+      if (["EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
       return undefined;
     }
     for (const fd of fds) {
@@ -332,23 +320,18 @@ async function procOpenPaths(signal: AbortSignal, ownDescriptor?: number): Promi
         paths.add((await reader.readlink(join("/proc", pid, "fd", fd))).replace(/ \(deleted\)$/, ""));
       } catch (error) {
         // Processes and descriptors can disappear while /proc is read.
-        if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
+        if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
       }
     }
   }
-  return { paths, inaccessibleUids };
+  return { paths };
 }
 
 async function snapshotHasOwner(snapshot: OpenPaths | undefined, path: string): Promise<boolean | undefined> {
   if (!snapshot) return undefined;
   if (snapshot instanceof Set) return snapshot.has(path);
   if (snapshot.paths.has(path)) return true;
-  if (snapshot.inaccessibleUids.has(0)) return undefined;
-  try {
-    // Other users' unreadable fd directories cannot starve this file. Retain
-    // the UIDs in a shared snapshot because each destination may have a different owner.
-    return snapshot.inaccessibleUids.has((await stat(path)).uid) ? undefined : false;
-  } catch { return undefined; }
+  return false;
 }
 
 async function lsofOpenPaths(signal: AbortSignal): Promise<Set<string> | undefined> {

@@ -106,10 +106,10 @@ describe("mergeJsonlFiles races", () => {
     await writeFile(source, "SYNTHETIC_FIXTURE_imported\n");
     await writeFile(destination, "SYNTHETIC_FIXTURE_native\n");
     let nativeWriter: number | undefined;
-    // Leave the bytes unchanged: only the fresh owner check can detect this.
+    // Leave the bytes unchanged: only the fresh owner check (after the pass lookup saw no owner) can detect this.
     setJsonlBeforeWriteHook((path) => { nativeWriter = openSync(path, "a"); });
     try {
-      expect(await mergeJsonlFiles([source], destination, false, { lookups: 4 })).toBe("busy");
+      expect(await mergeJsonlFiles([source], destination, false, { lookups: 4 })).toBe("deferred");
       expect(await Bun.file(destination).text()).toBe("SYNTHETIC_FIXTURE_native\n");
     } finally { if (nativeWriter !== undefined) closeSync(nativeWriter); }
     setJsonlBeforeWriteHook();
