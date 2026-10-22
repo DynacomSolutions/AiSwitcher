@@ -71,7 +71,7 @@ export async function runCli(argv: string[]): Promise<void> {
 
     switch (command) {
       case "update":
-        return await runUpdate();
+        return await runUpdate({ skipBackup: boolFlag(flags, "no-backup") });
       case "upgrade":
         return await runUpgrade();
       case "identities":

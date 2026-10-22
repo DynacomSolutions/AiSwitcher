@@ -17,7 +17,7 @@ const sub = (usage: string, desc: string): HelpNode => ({ usage, desc });
 
 export const HELP: Record<string, HelpNode> = {
   version: { usage: "ais version", desc: "Print the installed version" },
-  update: { usage: "ais update", desc: "Re-download the latest ais and wrapper binaries" },
+  update: { usage: "ais update [--no-backup]", desc: "Re-download the latest ais and wrapper binaries (backs up tool configs first unless --no-backup)" },
   upgrade: { usage: "ais upgrade", desc: "Install or upgrade every real CLI the shims need" },
   identities: {
     usage: "ais identities [subcommand] [flags]",

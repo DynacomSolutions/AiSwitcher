@@ -26,12 +26,36 @@ const MANAGED_BINARIES = [
   "aistui",
 ];
 
-export async function runUpdate(): Promise<void> {
-  const prefix = dim("ais update:");
-  const backupDir = await runBackup();
-  console.log(`${prefix} backup complete: ${backupDir}`);
+const HEARTBEAT_MS = 15_000;
 
-  const shimDir = join(homedir(), ".local", "bin");
+export interface UpdateOptions {
+  /** `--no-backup`: skip the safety-net snapshot of every tool config directory. */
+  skipBackup?: boolean;
+  backup?: () => Promise<string>;
+  heartbeatMs?: number;
+  shimDir?: string;
+}
+
+export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
+  const prefix = dim("ais update:");
+  if (options.skipBackup) {
+    console.log(`${prefix} ${yellow("skipping backup (--no-backup)")}`);
+  } else {
+    // A snapshot of tens of GB of tool state can take minutes; never go silent while it runs.
+    console.log(`${prefix} backing up tool config directories first (can take minutes on large profiles; --no-backup skips it)`);
+    const started = Date.now();
+    const timer = setInterval(
+      () => console.log(`${prefix} still backing up (${Math.round((Date.now() - started) / 1000)}s)`),
+      options.heartbeatMs ?? HEARTBEAT_MS,
+    );
+    try {
+      console.log(`${prefix} backup complete: ${await (options.backup ?? runBackup)()}`);
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
+  const shimDir = options.shimDir ?? join(homedir(), ".local", "bin");
   const platformSuffix = platformKey();
 
   let updated = 0;

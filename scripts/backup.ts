@@ -633,7 +633,15 @@ export async function runBackup(
   configPath: string = aisBackupConfigPath(process.env, home),
 ): Promise<string> {
   // The lock covers everything, including legacy-mirror deletion and the trim.
-  const release = await acquirePidLock(aisBackupLockPath(home), { waitMs: LOCK_WAIT_MS, retryMs: LOCK_RETRY_MS });
+  // Try once, so a held lock is reported instead of waiting up to 10 minutes in silence.
+  const lockPath = aisBackupLockPath(home);
+  const release =
+    (await acquirePidLock(lockPath, { waitMs: 0, retryMs: LOCK_RETRY_MS })) ??
+    (await (async () => {
+      const holder = await readFile(lockPath, "utf8").then((raw) => (JSON.parse(raw) as { pid?: number }).pid, () => undefined);
+      console.error(`backup: another backup${holder ? ` (pid ${holder})` : ""} holds ${lockPath}; waiting up to 10 minutes for it`);
+      return acquirePidLock(lockPath, { waitMs: LOCK_WAIT_MS, retryMs: LOCK_RETRY_MS });
+    })());
   if (!release) throw new Error(`backup: another backup still holds ${aisBackupLockPath(home)} after 10 minutes`);
   try {
     const repoDir = await backupAndCommit(groups, home);
