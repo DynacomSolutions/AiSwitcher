@@ -38,6 +38,8 @@ export interface DownloadAssetOptions {
   /** chmod applied to the file before it lands at its final name
    * (downloadAssetAtomic only; 0o755 for executables). */
   mode?: number;
+  /** downloadAssetAtomic only: runs on the executable temp file before it replaces dest; a throw keeps dest as it was. */
+  verify?: (tmpPath: string) => Promise<void>;
 }
 
 /**
@@ -128,6 +130,8 @@ export async function downloadAssetAtomic(assetName: string, dest: string, optio
   const tmpDest = `${dest}.download-tmp`;
   await downloadAsset(assetName, tmpDest, options);
   if (options.mode !== undefined) await chmod(tmpDest, options.mode);
+  try { await options.verify?.(tmpDest); }
+  catch (error) { await rm(tmpDest, { force: true }); throw error; }
   const existing = await lstat(dest).catch(() => undefined);
   if (existing?.isSymbolicLink()) await rm(dest, { force: true });
   await rename(tmpDest, dest);

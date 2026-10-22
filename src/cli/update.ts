@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { chmod } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { runBackup } from "../../scripts/backup.ts";
 import { downloadAssetAtomic, platformKey } from "../shared/release-assets.ts";
 import { cyan, dim, green, yellow } from "./colors.ts";
@@ -46,6 +46,23 @@ async function installedVersion(binary: string): Promise<string | undefined> {
   } catch { return undefined; }
 }
 
+/** `ais` must run and print a version. The proxy shims would launch the real tool, so they only get a header check. */
+async function verifyDownload(name: string, tmp: string): Promise<void> {
+  if (name === "ais") {
+    if (!(await installedVersion(tmp))) throw new Error(`the downloaded ais does not run ("ais version" failed); the installed ${name} was left unchanged`);
+    return;
+  }
+  const handle = await open(tmp, "r");
+  try {
+    const head = Buffer.alloc(4);
+    await handle.read(head, 0, 4, 0);
+    const hex = head.toString("hex");
+    if (!(hex === "7f454c46" || hex.startsWith("2321") || ["feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe"].includes(hex))) {
+      throw new Error(`the downloaded ${name} is not an executable; the installed ${name} was left unchanged`);
+    }
+  } finally { await handle.close(); }
+}
+
 export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
   const prefix = dim("ais update:");
   if (options.skipBackup) {
@@ -81,16 +98,14 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     }
     const assetName = `${name}-${platformSuffix}`;
     console.log(`${prefix} downloading ${cyan(assetName)} -> ${dest}`);
-    await downloadAssetAtomic(assetName, dest, { fetchImpl: options.fetchImpl });
-    await chmod(dest, 0o755);
+    // Verified before it replaces the installed file, so a bad download leaves the working binary in place.
+    await downloadAssetAtomic(assetName, dest, { fetchImpl: options.fetchImpl, mode: 0o755, verify: (tmp) => verifyDownload(name, tmp) });
     updated++;
   }
 
-  // The shim that was just written must run; a corrupt or wrong-platform download fails here, not at next use.
   if (updated > 0 && (await Bun.file(join(shimDir, "ais")).exists())) {
     const after = await installedVersion(join(shimDir, "ais"));
-    if (!after) throw new Error(`the downloaded ${join(shimDir, "ais")} does not run ("ais version" failed); the previous version${before ? ` ${before}` : ""} was replaced, reinstall it`);
-    console.log(`${prefix} ais ${before && before !== after ? `${before} -> ${after}` : `${after} (already the latest release)`}`);
+    console.log(`${prefix} ais ${before && after && before !== after ? `${before} -> ${after}` : `${after ?? "?"} (already the latest release)`}`);
   }
 
   console.log(

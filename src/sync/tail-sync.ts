@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, open, readdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../shared/reproducible-paths.ts";
 import { configHomeRoot, SYNC_TOOL_CONFIGS } from "./rsync.ts";
@@ -52,26 +52,28 @@ export async function listHistories(home: string, scope: SyncScope, skip: Readon
   return manifest;
 }
 
-/** SHA-256 of the first `length` bytes, or undefined when the file is shorter. Streams; never holds the file. */
-export async function hashPrefix(path: string, length: number): Promise<string | undefined> {
+async function hashHandlePrefix(handle: FileHandle, length: number): Promise<string | undefined> {
   const hash = createHash("sha256");
-  const handle = await open(path, "r").catch(() => undefined);
-  if (!handle) return undefined;
-  try {
-    const buffer = Buffer.allocUnsafe(1 << 22);
-    for (let position = 0; position < length;) {
-      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, length - position), position);
-      if (bytesRead === 0) return undefined;
-      hash.update(buffer.subarray(0, bytesRead));
-      position += bytesRead;
-    }
-    return hash.digest("hex");
-  } finally { await handle.close(); }
+  const buffer = Buffer.allocUnsafe(1 << 22);
+  for (let position = 0; position < length;) {
+    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, length - position), position);
+    if (bytesRead === 0) return undefined;
+    hash.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return hash.digest("hex");
 }
 
-async function copyRange(source: string, destination: string, start: number, end: number): Promise<void> {
+/** SHA-256 of the first `length` bytes, or undefined when the file is shorter. Streams; never holds the file. */
+export async function hashPrefix(path: string, length: number): Promise<string | undefined> {
+  const handle = await open(path, "r").catch(() => undefined);
+  if (!handle) return undefined;
+  try { return await hashHandlePrefix(handle, length); } finally { await handle.close(); }
+}
+
+async function copyRange(from: FileHandle, destination: string, start: number, end: number): Promise<void> {
   await mkdir(dirname(destination), { recursive: true });
-  const [from, to] = [await open(source, "r"), await open(destination, "w", 0o600)];
+  const to = await open(destination, "w", 0o600);
   try {
     const buffer = Buffer.allocUnsafe(1 << 22);
     for (let position = start; position < end;) {
@@ -80,34 +82,57 @@ async function copyRange(source: string, destination: string, start: number, end
       await to.write(buffer, 0, bytesRead);
       position += bytesRead;
     }
-  } finally { await Promise.all([from.close(), to.close()]); }
+  } finally { await to.close(); }
 }
+
+let beforeTailCopy: ((rel: string) => Promise<void>) | undefined;
+/** Test hook: runs between hashing and copying one history, to swap the file under the sender. */
+export function setBeforeTailCopyHook(hook?: (rel: string) => Promise<void>): void { beforeTailCopy = hook; }
 
 /** Sender side. For every history the receiver also has that is not already equal by size and
  * whole-second mtime, write the missing bytes to `outDir/<rel>` and record the prefix hash in
- * `outDir/tails.json`. Returns the plan; its paths are exactly the ones the bulk transfer must leave out. */
+ * `outDir/tails.json`. Returns the plan; its paths are exactly the ones the bulk transfer must leave out.
+ * Hash and copy read one open handle, and a file replaced or truncated meanwhile is left to the bulk transfer. */
 export async function planTails(
   home: string,
   scope: SyncScope,
   receiver: HistoryManifest,
   outDir: string,
   skip: ReadonlySet<string> = new Set(),
+  /** Test seam: the histories to consider instead of walking the tool trees. */
+  listing?: HistoryManifest,
 ): Promise<TailPlan> {
   const plan: TailPlan = {};
-  const mine = await listHistories(home, scope, skip);
+  const mine = listing ?? await listHistories(home, scope, skip);
   for (const [rel, theirs] of Object.entries(receiver)) {
-    const info = mine[rel];
-    if (!info || info.size < TAIL_MIN_BYTES) continue;
-    if (info.size === theirs.size && Math.floor(info.mtimeMs / 1000) === Math.floor(theirs.mtimeMs / 1000)) continue;
-    // A receiver that is already ahead needs no bytes at all: proving our whole file is its prefix is enough.
-    const offset = Math.min(info.size, theirs.size);
-    const prefix = await hashPrefix(join(home, rel), offset);
-    if (!prefix) continue;
-    await copyRange(join(home, rel), join(outDir, rel), offset, info.size);
-    plan[rel] = { offset, size: info.size, mtimeMs: info.mtimeMs, prefix };
+    if (!mine[rel]) continue;
+    const path = join(home, rel);
+    const handle = await open(path, "r").catch(() => undefined);
+    if (!handle) continue;
+    try {
+      const info = await handle.stat();
+      if (info.size < TAIL_MIN_BYTES) continue;
+      if (info.size === theirs.size && Math.floor(info.mtimeMs / 1000) === Math.floor(theirs.mtimeMs / 1000)) continue;
+      // A receiver that is already ahead needs no bytes at all: proving our whole file is its prefix is enough.
+      const offset = Math.min(info.size, theirs.size);
+      const prefix = await hashHandlePrefix(handle, offset);
+      if (!prefix) continue;
+      await beforeTailCopy?.(rel);
+      await copyRange(handle, join(outDir, rel), offset, info.size);
+      const [again, now] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)]);
+      // Appends only grow the file; a different inode or a shorter file means the bytes read are not one snapshot.
+      if (!now || now.ino !== info.ino || again.size < info.size) { await rm(join(outDir, rel), { force: true }); continue; }
+      plan[rel] = { offset, size: info.size, mtimeMs: info.mtimeMs, prefix };
+    } finally { await handle.close(); }
   }
   if (Object.keys(plan).length > 0) await writeFile(join(outDir, TAIL_PLAN_FILE), JSON.stringify(plan));
   return plan;
+}
+
+/** Paths a peer asked to be sent whole, limited to the ones we negotiated: a peer must not widen a `--files-from` list. */
+export function restrictTo(requested: readonly string[] | undefined, allowed: Iterable<string>): string[] {
+  const ok = new Set(allowed);
+  return (requested ?? []).filter((rel) => ok.has(rel));
 }
 
 /** Rsync exclude filters that keep planned histories out of the bulk transfer. */

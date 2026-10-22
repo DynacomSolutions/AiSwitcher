@@ -55,5 +55,8 @@ test("a downloaded binary that does not run is an error, not a silent success", 
       skipBackup: true,
       fetchImpl: (async () => new Response("not a program")) as unknown as typeof fetch,
     })).rejects.toThrow(/does not run/);
+    // The working binary was never replaced.
+    expect((await Bun.$`${join(shimDir, "ais")} version`.text()).trim()).toBe("0.0.1");
+    expect(await Bun.file(`${join(shimDir, "ais")}.download-tmp`).exists()).toBe(false);
   } finally { log.mockRestore(); }
 });

@@ -25,7 +25,7 @@ import {
   loadCrushSnapshotManifest,
   mergeCrushSnapshotTree,
 } from "./sqlite-merge.ts";
-import { listHistories, planTails, TAIL_MIN_BYTES, TAIL_PLAN_FILE, tailExcludeFilters, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
+import { listHistories, planTails, restrictTo, TAIL_MIN_BYTES, TAIL_PLAN_FILE, tailExcludeFilters, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
 import { mergeIncomingProfileTree, type TreeMergeResult } from "./tree-merge.ts";
 import type { SyncRunOptions, SyncRunResult, SyncScope } from "./types.ts";
 
@@ -343,7 +343,7 @@ async function writeFileList(home: string, rels: string[]): Promise<string> {
 async function pushProfileSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState): Promise<void> {
   const tails = await ioPhase("push-tails", () => pushTails(host, scope, home, state));
   try {
-    const needsFull = await pushSnapshot(host, [...tailExcludeFilters(tails?.plan ?? {}), ...filters], scope, home, state, tails?.id);
+    const needsFull = restrictTo(await pushSnapshot(host, [...tailExcludeFilters(tails?.plan ?? {}), ...filters], scope, home, state, tails?.id), Object.keys(tails?.plan ?? {}));
     // A tail whose prefix did not verify on the remote is staged whole and merged the ordinary way.
     if (needsFull.length > 0) {
       const list = await writeFileList(home, needsFull);
@@ -357,7 +357,7 @@ async function pushProfileSnapshot(host: string, filters: string[], scope: SyncS
 
 /** Fetch the bytes this host lacks of histories it already holds. Undefined when there are none or the remote
  * cannot plan them (an older version): the bulk transfer then stages those histories whole, as before. */
-async function pullTails(host: string, scope: SyncScope, home: string, state: SteadyState): Promise<{ dir: string; plan: TailPlan } | undefined> {
+async function pullTails(host: string, scope: SyncScope, home: string, state: SteadyState): Promise<{ dir: string; plan: TailPlan; manifest: HistoryManifest } | undefined> {
   const manifest = await listHistories(home, scope, new Set(state.ignored), TAIL_MIN_BYTES);
   if (Object.keys(manifest).length === 0) return undefined;
   const id = crypto.randomUUID();
@@ -370,7 +370,7 @@ async function pullTails(host: string, scope: SyncScope, home: string, state: St
     const pulled = await runRsync(host, "pull", [], home, { localRoot: dir, remoteRoot: `${AIS_REMOTE_CACHE_REL}/tail-outgoing/${id}` });
     if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
     const plan = JSON.parse(await readFile(join(dir, TAIL_PLAN_FILE), "utf8")) as TailPlan;
-    return { dir, plan };
+    return { dir, plan: Object.fromEntries(Object.entries(plan).filter(([rel]) => rel in manifest)), manifest };
   } catch (error) {
     await rm(dir, { recursive: true, force: true });
     if (error instanceof SyntaxError) return undefined;
@@ -422,7 +422,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           "profile-incoming",
           `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
         );
-        let tails: { dir: string; plan: TailPlan } | undefined;
+        let tails: { dir: string; plan: TailPlan; manifest: HistoryManifest } | undefined;
         let fullDir: string | undefined;
         try {
           if (includeDatabases && syncsCrush(scope)) await ioPhase("pull-crush", () => pullCrushSnapshots(host, home, state));
@@ -440,7 +440,8 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           }), () => stagedSummary(incomingDir));
           if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
 
-          const merge = (root: string, tailsDir?: string) => mergeIncomingProfileTree(root, scope, {
+          const merge = (root: string, tailsDir?: string, tailsManifest?: HistoryManifest) => mergeIncomingProfileTree(root, scope, {
+            tailsManifest,
             home,
             tailsDir,
             conflictRoot: join(
@@ -461,11 +462,12 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
               console.warn(`AIS sync preserved ${merged.preservedConflicts} conflict(s), including deferred imports: ${merged.preservedConflictPaths.join(", ")}. Run ais sync recover to retry retained histories.`);
             }
           };
-          const merged = await ioPhase("pull-merge", () => merge(incomingDir, tails?.dir));
+          const merged = await ioPhase("pull-merge", () => merge(incomingDir, tails?.dir, tails?.manifest));
           absorb(merged);
           // A tail whose prefix did not verify here is staged whole and merged the ordinary way.
-          if (merged.needsFull?.length) {
-            const list = await writeFileList(home, merged.needsFull);
+          const wanted = restrictTo(merged.needsFull, Object.keys(tails?.manifest ?? {}));
+          if (wanted.length > 0) {
+            const list = await writeFileList(home, wanted);
             fullDir = `${incomingDir}-full`;
             try {
               await mkdir(fullDir, { recursive: true });
