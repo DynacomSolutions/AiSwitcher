@@ -74,6 +74,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ai-profile-switcher-${{ matrix.target.name }}
+          retention-days: 1
           path: |
             claude-${{ matrix.target.name }}
             codex-${{ matrix.target.name }}
@@ -135,6 +136,7 @@ jobs:
         with:
           name: aistui-${{ matrix.target.name }}
           path: aistui-${{ matrix.target.name }}
+          retention-days: 1
 
   release:
     needs: [build, build-tui]

@@ -47,8 +47,10 @@ describe("live image release contract", () => {
     expect(buildWorkflow).toContain("AIS_IMAGE_TEST_PACKAGES=${{ matrix.flavour == 'test' && '1' || '0' }}");
     expect(buildWorkflow).toContain("ais-live.img");
     expect(buildWorkflow).toContain("ais-live-production.img");
-    expect(buildWorkflow).toContain("ais-live-${{ matrix.flavour == 'test' && 'image' || 'release-image' }}");
-    expect(buildWorkflow).toContain("firmware: [bios, uefi]");
+    expect(buildWorkflow).toContain("name: ais-live-release-image");
+    expect(buildWorkflow).not.toContain("name: ais-live-image");
+    expect(buildWorkflow).not.toContain("name: archiso");
+    expect(buildWorkflow).toContain("for firmware in bios uefi");
     expect(buildWorkflow).not.toContain("inputs.release != true");
     expect(readFileSync(join(root, "README.md"), "utf8")).toContain("Secure Boot must be");
     expect(readFileSync(join(root, "image/release/notes.md"), "utf8")).toContain("Apache-2.0");

@@ -87,7 +87,7 @@ jobs:
           name: host-signed-macos-arm64
           path: ${{ runner.temp }}/host-sign/signed/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   release:
     needs: [validate, checks, sign]
@@ -147,6 +147,7 @@ jobs:
           name: host-release-downloaded
           path: ${{ runner.temp }}/downloaded
           if-no-files-found: error
+          retention-days: 1
 
   verify-download:
     needs: [validate, release]
