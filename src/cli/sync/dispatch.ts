@@ -17,6 +17,7 @@ import { rm } from "node:fs/promises";
 import { automaticSync } from "../../sync/service.ts";
 import { scheduleAutomaticSync } from "../../sync/auto-schedule.ts";
 import { lowerProcessPriority } from "../../sync/low-priority.ts";
+import { ioPhase, ioSnapshot, stagedSummary } from "../../sync/io-trace.ts";
 import { pruneStaging } from "../../sync/staging.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import { crushFingerprint } from "../../sync/steady-state.ts";
@@ -155,15 +156,16 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
     // and merged through SQLite itself; rsync never touches a live database.
     case "snapshot-zai": {
       // The token is taken before the snapshot, so a concurrent write only causes a redundant later run.
-      const token = await crushFingerprint(homedir());
-      if (token && stringFlag(flags, "if-changed") === token) {
-        console.log(JSON.stringify({ unchanged: true, token }));
+      const token = await ioPhase("snapshot-fingerprint", () => crushFingerprint(homedir()));
+      // No token means no database: an empty snapshot would only cost a copy, a pull and a drop each run.
+      if (!token || stringFlag(flags, "if-changed") === token) {
+        console.log(JSON.stringify({ unchanged: true, token, io: ioSnapshot() }));
         return;
       }
       const snapshotId = crypto.randomUUID();
       const root = snapshotRoot("sqlite-snapshots", snapshotId);
-      const manifest = await createCrushSnapshotTree(root);
-      console.log(JSON.stringify({ snapshotId, databases: manifest.databases, token }));
+      const manifest = await ioPhase("snapshot-create", () => createCrushSnapshotTree(root));
+      console.log(JSON.stringify({ snapshotId, databases: manifest.databases, token, io: ioSnapshot() }));
       return;
     }
     case "drop-zai-snapshot": {
@@ -175,9 +177,9 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       if (!host) throw new CliUsageError("Usage: ais sync merge-zai-snapshot <snapshot-id>");
       const root = snapshotRoot("sqlite-incoming", host);
       const manifest = await loadCrushSnapshotManifest(root);
-      const merged = await mergeCrushSnapshotTree(manifest);
+      const merged = await ioPhase("crush-merge", () => mergeCrushSnapshotTree(manifest));
       await rm(root, { recursive: true, force: true });
-      console.log(JSON.stringify({ merged, token: await crushFingerprint(homedir()) }));
+      console.log(JSON.stringify({ merged, token: await crushFingerprint(homedir()), io: ioSnapshot() }));
       return;
     }
     case "merge-profile-snapshot": {
@@ -185,15 +187,17 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       const scope = scopeFromFlags(flags);
       if (!scope) throw new CliUsageError("A profile snapshot requires both --tool and --identity, or neither.");
       const root = snapshotRoot("profile-incoming", host);
-      await pruneStaging({ keep: host });
+      await ioPhase("prune-staging", () => pruneStaging({ keep: host }));
       const merged = await withProfileMergeLock(homedir(), async (lock) => {
-        const result = await mergeIncomingProfileTree(root, scope, { lock });
-        await makeProfileHookConfigsPortable(scope);
-        if (scope.kind === "all") await makeSharedHookScriptsPortable();
+        const result = await ioPhase("profile-merge", () => mergeIncomingProfileTree(root, scope, { lock }), () => stagedSummary(root));
+        await ioPhase("portable", async () => {
+          await makeProfileHookConfigsPortable(scope);
+          if (scope.kind === "all") await makeSharedHookScriptsPortable();
+        });
         await rm(root, { recursive: true, force: true });
         return result;
       });
-      console.log(JSON.stringify(merged));
+      console.log(JSON.stringify({ ...merged, io: ioSnapshot() }));
       return;
     }
     default:

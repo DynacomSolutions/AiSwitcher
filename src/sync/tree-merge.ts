@@ -1,4 +1,4 @@
-import { copyFile, mkdir, open, readdir, readFile, readlink, realpath, rename, stat, utimes } from "node:fs/promises";
+import { copyFile, mkdir, open, readdir, readFile, readlink, realpath, rename, stat, utimes, writeFile } from "node:fs/promises";
 import { dlopen, FFIType } from "bun:ffi";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -18,11 +18,15 @@ import {
   type PurgeOptions,
   type PurgeReport,
 } from "../identities/retire-credentials.ts";
+import { SwapLockError, withClaudeLocks } from "../identities/claude-swap-lock.ts";
+import type { LockOptions } from "../identities/pool/lock.ts";
+import { writeFileAtomic } from "../identities/pool/fs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
 import { mergeJsonlFiles } from "./dedupe.ts";
 import { mergeRegistryConflict } from "./registry.ts";
+import { isDeepStrictEqual } from "node:util";
 import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
 import type { SyncScope } from "./types.ts";
 
@@ -173,6 +177,85 @@ async function convergeMtime(source: string, destination: string, rel: string, d
   if (sourceStat.mtimeMs > destinationStat.mtimeMs) {
     await tolerateDenied(rel, () => fsOps.utimes(destination, destinationStat.atime, sourceStat.mtime), denied);
   }
+}
+
+/** copyFile stamps "now" on the copy. The sender then differs from the receiver in rsync's
+ * size+mtime quick check, so every copied file was staged and compared again on the next run. */
+async function copyKeepingMtime(source: string, destination: string): Promise<void> {
+  await fsOps.copyFile(source, destination);
+  const info = await stat(source);
+  // rsync's quick check compares whole seconds: a same-size rewrite within the source's second would never resync.
+  await fsOps.utimes(destination, info.atime, Date.now() - info.mtimeMs >= 2000 ? info.mtime : new Date());
+}
+
+/** After a JSONL merge both hosts hold the same set of lines, but a different order or append time:
+ * same size, different mtime, so the file was re-staged and re-read on every run. Equal size after a
+ * merge that added nothing missing means equal content, so adopting the sender's mtime is safe. */
+async function alignMergedMtime(source: string, destination: string, rel: string, denied?: string[]): Promise<void> {
+  const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
+  if (sourceStat.size !== destinationStat.size || Math.floor(sourceStat.mtimeMs / 1000) === Math.floor(destinationStat.mtimeMs / 1000)) return;
+  await tolerateDenied(rel, () => fsOps.utimes(destination, destinationStat.atime, sourceStat.mtime), denied);
+}
+
+/** Equal mtimes with different content (for example files provisioned with preserved timestamps) used to
+ * keep each host's own version and preserve the other, forever. Both hosts must pick the same winner:
+ * the larger file, then the greater digest. */
+async function sourceWinsTie(source: string, destination: string): Promise<boolean> {
+  const [a, b] = await Promise.all([stat(source), stat(destination)]);
+  if (a.size !== b.size) return a.size > b.size;
+  const digest = async (path: string) => createHash("sha256").update(await readFile(path)).digest("hex");
+  return (await digest(source)) > (await digest(destination));
+}
+
+/** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict. */
+const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at)$/;
+
+/** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
+const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|changelogLastFetched|cached.*|.*Cache.*)$/;
+
+let claudeLockOptions: LockOptions = {};
+/** Test hook: shorten the `.claude.json` lock wait (no argument restores the default). */
+export function setClaudeLockOptions(options: LockOptions = {}): void { claudeLockOptions = options; }
+
+/** A per-identity `.claude.json` is rewritten constantly by every running Claude Code on every host. Self-changing
+ * keys merge key by key; every other key follows the newest file whole (deletions included) and, when the older
+ * file held a different value, that file is preserved and counted as a conflict. */
+async function mergeClaudeJson(source: string, destination: string, rel: string, conflictRoot: string, result: TreeMergeResult): Promise<boolean> {
+  const plain = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  const read = async (path: string): Promise<Record<string, unknown> | undefined> => {
+    try { const v = JSON.parse(await readFile(path, "utf8")); return plain(v) ? v : undefined; } catch { return undefined; }
+  };
+  if (!(await read(source)) || !(await read(destination))) return false;
+  await tolerateDenied(rel, () => withClaudeLocks(dirname(destination), async () => {
+    // Re-read under the lock: Claude Code may have rewritten the live file meanwhile.
+    const [incoming, live] = await Promise.all([read(source), read(destination)]);
+    if (!incoming || !live) return;
+    const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
+    const sourceWins = sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination);
+    const [winner, loser] = sourceWins ? [incoming, live] : [live, incoming];
+    const merged: Record<string, unknown> = { ...winner };
+    let conflict = false;
+    for (const [key, value] of Object.entries(loser)) {
+      if (SELF_CHANGING_CLAUDE_KEYS.test(key)) { if (!(key in winner)) merged[key] = value; }
+      else if (!isDeepStrictEqual(value, winner[key])) conflict = true;
+    }
+    if (conflict) {
+      await preserveFile(sourceWins ? destination : source, conflictRoot, sourceWins ? "local" : "incoming", rel);
+      result.preservedConflicts++;
+      result.preservedConflictPaths.push(rel);
+    }
+    if (sourceWins && isDeepStrictEqual(merged, incoming)) await copyKeepingMtime(source, destination);
+    else if (isDeepStrictEqual(merged, live)) return;
+    else {
+      await writeFileAtomic(destination, `${JSON.stringify(merged, null, 2)}\n`);
+      await fsOps.utimes(destination, destinationStat.atime, new Date(Math.max(sourceStat.mtimeMs, destinationStat.mtimeMs)));
+    }
+  }, claudeLockOptions).catch((error) => {
+    // A busy Claude Code session must not abort the sync: leave the file alone and merge next time.
+    if (!(error instanceof SwapLockError && error.timedOut)) throw error;
+    console.warn(`.claude.json for ${basename(dirname(rel))} busy; will merge next sync`);
+  }), result.deniedPaths);
+  return true;
 }
 
 // A hung lsof is killed; the lookup then falls back to /proc or reports unknown (callers treat unknown as open).
@@ -585,15 +668,14 @@ export async function mergeIncomingProfileTree(
     const destination = join(home, rel);
 
     if (source.endsWith(".jsonl")) {
-      // Identical complete history: no merge needed, so skip reading it whole.
-      if ((await exists(destination)) && (await filesEqual(source, destination, false)) && (await endsWithNewlineOrEmpty(source, (await stat(source)).size))) {
+      // Identical history (even with the same unterminated tail on both hosts): nothing to merge.
+      if ((await exists(destination)) && (await filesEqual(source, destination, false))) {
         await convergeMtime(source, destination, rel, result.deniedPaths);
         continue;
       }
       // mergeJsonlFiles checks ownership only when there is an actual append
       // to make, so an unchanged replay does not become a false conflict.
-      const sourceText = await Bun.file(source).text();
-      const incompleteSource = sourceText.length > 0 && !sourceText.endsWith("\n");
+      const incompleteSource = !(await endsWithNewlineOrEmpty(source, (await stat(source)).size));
       if (incompleteSource) {
         await preserveDeferredFile(source, home, rel);
         result.preservedConflicts++;
@@ -607,27 +689,31 @@ export async function mergeIncomingProfileTree(
         result.preservedConflicts++;
         result.preservedConflictPaths.push(rel);
       }
-      if ((await exists(destination)) && (await filesEqual(source, destination, false))) await convergeMtime(source, destination, rel, result.deniedPaths);
+      if (!incompleteSource && (mergeResult === "merged" || mergeResult === "unchanged")) await alignMergedMtime(source, destination, rel, result.deniedPaths);
       continue;
     }
 
     if (!(await exists(destination))) {
       await mkdir(dirname(destination), { recursive: true });
-      if (await tolerateDenied(rel, () => fsOps.copyFile(source, destination), result.deniedPaths)) result.copiedFiles++;
+      if (await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths)) result.copiedFiles++;
       continue;
     }
     if (await filesEqual(source, destination)) {
       await convergeMtime(source, destination, rel, result.deniedPaths);
       continue;
     }
+    if (basename(rel) === ".claude.json" && (await mergeClaudeJson(source, destination, rel, conflictRoot, result))) continue;
 
     const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
-    if (sourceStat.mtimeMs > destinationStat.mtimeMs) {
-      await preserveFile(destination, conflictRoot, "local", rel);
-      if (!(await tolerateDenied(rel, () => fsOps.copyFile(source, destination), result.deniedPaths))) continue;
-    } else {
+    const volatile = VOLATILE_STATE.test(rel);
+    const sourceWins = sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination);
+    if (sourceWins) {
+      if (!volatile) await preserveFile(destination, conflictRoot, "local", rel);
+      if (!(await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths))) continue;
+    } else if (!volatile) {
       await preserveFile(source, conflictRoot, "incoming", rel);
     }
+    if (volatile) continue;
     result.preservedConflicts++;
     result.preservedConflictPaths.push(rel);
   }
