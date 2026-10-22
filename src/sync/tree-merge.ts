@@ -24,7 +24,8 @@ import { writeFileAtomic } from "../identities/pool/fs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
-import { mergeJsonlFiles } from "./dedupe.ts";
+import { mergeJsonlFiles, mergeJsonlTail } from "./dedupe.ts";
+import { TAIL_PLAN_FILE, type TailPlan } from "./tail-sync.ts";
 import { mergeRegistryConflict } from "./registry.ts";
 import { isDeepStrictEqual } from "node:util";
 import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
@@ -39,6 +40,8 @@ export interface TreeMergeResult {
   busyPaths: string[];
   /** Paths this user cannot re-time or overwrite (root-owned); sync excludes them from later runs. */
   deniedPaths?: string[];
+  /** Tail transfers whose prefix did not match: the sender must stage these histories whole. */
+  needsFull?: string[];
 }
 
 export interface ArchiveRecoveryResult extends TreeMergeResult {
@@ -550,11 +553,58 @@ async function scrubRetiredConflictCopies(configs: ToolConfig[], home: string, c
   }
 }
 
-async function preserveFile(source: string, root: string, side: "local" | "incoming", rel: string): Promise<void> {
+async function preserveFile(source: string, root: string, side: "local" | "incoming", rel: string): Promise<string> {
   let destination = join(root, side, rel);
   if (await exists(destination)) destination = `${destination}.${crypto.randomUUID()}`;
   await mkdir(dirname(destination), { recursive: true });
   await copyFile(source, destination);
+  return destination;
+}
+
+/** The losing incoming copy of a persistent disagreement (a file the other host keeps rewriting, or cannot be
+ * overwritten) used to be archived and counted as a new conflict on every run. Remember which exact content
+ * was archived for each path and, while that archive still exists, count and archive it once. */
+interface PreservedIndex { entries: Record<string, { sha: string; archive: string }>; dirty: boolean }
+const preservedIndexPath = (home: string) => join(aisRemoteCacheDir(home), "preserved-incoming.json");
+
+async function loadPreservedIndex(home: string): Promise<PreservedIndex> {
+  try {
+    const raw = JSON.parse(await readFile(preservedIndexPath(home), "utf8")) as Record<string, { sha: string; archive: string }>;
+    return { entries: raw && typeof raw === "object" ? raw : {}, dirty: false };
+  } catch { return { entries: {}, dirty: false }; }
+}
+
+async function savePreservedIndex(home: string, index: PreservedIndex): Promise<void> {
+  if (!index.dirty) return;
+  await mkdir(aisRemoteCacheDir(home), { recursive: true });
+  await writeFile(preservedIndexPath(home), `${JSON.stringify(index.entries)}\n`);
+}
+
+/** True when this exact incoming content was already archived for `rel` and the archive is still there. */
+async function alreadyPreserved(index: PreservedIndex, rel: string, sha: string): Promise<boolean> {
+  const known = index.entries[rel];
+  return known?.sha === sha && (await exists(known.archive));
+}
+
+/** Apply the tail transfers staged in `dir`: append each verified suffix to its live history. */
+async function applyTails(dir: string, home: string, ownerPass: OpenOwnerPass, result: TreeMergeResult): Promise<void> {
+  let plan: TailPlan;
+  try { plan = JSON.parse(await readFile(join(dir, TAIL_PLAN_FILE), "utf8")) as TailPlan; } catch { return; }
+  for (const [rel, entry] of Object.entries(plan)) {
+    if (!rel.endsWith(".jsonl") || rel.startsWith("/") || rel.split("/").includes("..")) continue;
+    const destination = join(home, rel);
+    const tail = await readFile(join(dir, rel)).catch(() => undefined);
+    if (!tail || tail.length !== entry.size - entry.offset) { (result.needsFull ??= []).push(rel); continue; }
+    const outcome = await mergeJsonlTail(destination, entry.offset, entry.prefix, tail, ownerPass);
+    if (outcome === "diverged") { (result.needsFull ??= []).push(rel); continue; }
+    if (outcome === "busy" || outcome === "deferred") { result.busyPaths.push(rel); continue; }
+    if (outcome === "merged") result.mergedJsonlFiles++;
+    // Same size as the sender now: same content, so adopt its mtime and the next run's quick check sees equality.
+    const info = await stat(destination).catch(() => undefined);
+    if (info && info.size === entry.size && Math.floor(info.mtimeMs / 1000) !== Math.floor(entry.mtimeMs / 1000)) {
+      await tolerateDenied(rel, () => fsOps.utimes(destination, info.atime, new Date(entry.mtimeMs)), result.deniedPaths);
+    }
+  }
 }
 
 /** A newer snapshot supersedes an older one only when it retains every byte
@@ -632,7 +682,7 @@ async function preserveDeferredFile(source: string, home: string, rel: string): 
 export async function mergeIncomingProfileTree(
   incomingRoot: string,
   scope: SyncScope,
-  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge; ownerPass?: OpenOwnerPass; lock?: ProfileMergeLock } = {},
+  options: { home?: string; conflictRoot?: string; purgeRetired?: RetiredPurge; ownerPass?: OpenOwnerPass; lock?: ProfileMergeLock; tailsDir?: string } = {},
 ): Promise<TreeMergeResult> {
   const home = options.home ?? homedir();
   if (!options.lock || !heldMergeLocks.has(options.lock) || options.lock.home !== await realpath(home)) {
@@ -661,6 +711,9 @@ export async function mergeIncomingProfileTree(
       result.copiedFiles++;
     }
   }
+
+  if (options.tailsDir) await applyTails(options.tailsDir, home, ownerPass, result);
+  const preserved = await loadPreservedIndex(home);
 
   for await (const source of walkFiles(incomingRoot)) {
     const rel = pathWithin(incomingRoot, source);
@@ -711,13 +764,17 @@ export async function mergeIncomingProfileTree(
       if (!volatile) await preserveFile(destination, conflictRoot, "local", rel);
       if (!(await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths))) continue;
     } else if (!volatile) {
-      await preserveFile(source, conflictRoot, "incoming", rel);
+      const sha = createHash("sha256").update(await readFile(source)).digest("hex");
+      if (await alreadyPreserved(preserved, rel, sha)) continue;
+      preserved.entries[rel] = { sha, archive: await preserveFile(source, conflictRoot, "incoming", rel) };
+      preserved.dirty = true;
     }
     if (volatile) continue;
     result.preservedConflicts++;
     result.preservedConflictPaths.push(rel);
   }
 
+  await savePreservedIndex(home, preserved);
   await purgeRetiredCredentialsAfterSync(configsForScope(scope), home, options.purgeRetired);
   await scrubRetiredConflictCopies(configsForScope(scope), home, conflictRoot);
   return result;

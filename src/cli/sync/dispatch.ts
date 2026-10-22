@@ -19,6 +19,7 @@ import { scheduleAutomaticSync } from "../../sync/auto-schedule.ts";
 import { lowerProcessPriority } from "../../sync/low-priority.ts";
 import { ioPhase, ioSnapshot, stagedSummary } from "../../sync/io-trace.ts";
 import { pruneStaging } from "../../sync/staging.ts";
+import { listHistories, planTails, TAIL_MIN_BYTES, type HistoryManifest } from "../../sync/tail-sync.ts";
 import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
 import { crushFingerprint } from "../../sync/steady-state.ts";
 import { mergeIncomingProfileTree, recoverProfileArchives, withProfileMergeLock } from "../../sync/tree-merge.ts";
@@ -29,7 +30,7 @@ import { aisRemoteCacheDir } from "../../shared/ais-home.ts";
 
 const SNAPSHOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function snapshotRoot(kind: "sqlite-snapshots" | "sqlite-incoming" | "profile-incoming", id: string): string {
+function snapshotRoot(kind: "sqlite-snapshots" | "sqlite-incoming" | "profile-incoming" | "tail-incoming" | "tail-outgoing", id: string): string {
   if (!SNAPSHOT_ID_PATTERN.test(id)) throw new CliUsageError(`Invalid sync snapshot id "${id}".`);
   return join(aisRemoteCacheDir(homedir()), kind, id);
 }
@@ -86,7 +87,7 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       });
       if (result.remotes.length === 0) throw new CliUsageError('No SSH sync remotes configured. Run "ais sync add <host>" first.');
       if (result.skipped) {
-        throw new Error("AIS sync is already running; the 30-second wait for its lock expired.");
+        throw new Error("AIS sync is still held by another running sync after the 10-minute wait; nothing was synced. Retry once it finishes.");
       }
       const actions = [
         ...(result.pulled.length ? [`pulled from ${result.pulled.join(", ")}`] : []),
@@ -182,19 +183,44 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       console.log(JSON.stringify({ merged, token: await crushFingerprint(homedir()), io: ioSnapshot() }));
       return;
     }
+    // Tail-only exchange of append-only histories (see sync/tail-sync.ts).
+    case "tail-manifest": {
+      const scope = scopeFromFlags(flags);
+      if (!scope) throw new CliUsageError("A tail manifest requires both --tool and --identity, or neither.");
+      const manifest = await ioPhase("tail-manifest", () => listHistories(homedir(), scope, undefined, TAIL_MIN_BYTES));
+      console.log(JSON.stringify({ manifest, io: ioSnapshot() }));
+      return;
+    }
+    case "tail-plan": {
+      if (!host) throw new CliUsageError("Usage: ais sync tail-plan <id> (receiver manifest on stdin)");
+      const scope = scopeFromFlags(flags);
+      if (!scope) throw new CliUsageError("A tail plan requires both --tool and --identity, or neither.");
+      const manifest = JSON.parse(await Bun.stdin.text()) as HistoryManifest;
+      const plan = await ioPhase("tail-plan", () => planTails(homedir(), scope, manifest, snapshotRoot("tail-outgoing", host)));
+      console.log(JSON.stringify({ planned: Object.keys(plan).length, io: ioSnapshot() }));
+      return;
+    }
+    case "drop-tail-plan": {
+      if (!host) throw new CliUsageError("Usage: ais sync drop-tail-plan <id>");
+      await rm(snapshotRoot("tail-outgoing", host), { recursive: true, force: true });
+      return;
+    }
     case "merge-profile-snapshot": {
       if (!host) throw new CliUsageError("Usage: ais sync merge-profile-snapshot <snapshot-id>");
       const scope = scopeFromFlags(flags);
       if (!scope) throw new CliUsageError("A profile snapshot requires both --tool and --identity, or neither.");
       const root = snapshotRoot("profile-incoming", host);
+      const tailsId = stringFlag(flags, "tails");
+      const tailsDir = tailsId ? snapshotRoot("tail-incoming", tailsId) : undefined;
       await ioPhase("prune-staging", () => pruneStaging({ keep: host }));
       const merged = await withProfileMergeLock(homedir(), async (lock) => {
-        const result = await ioPhase("profile-merge", () => mergeIncomingProfileTree(root, scope, { lock }), () => stagedSummary(root));
+        const result = await ioPhase("profile-merge", () => mergeIncomingProfileTree(root, scope, { lock, tailsDir }), () => stagedSummary(root));
         await ioPhase("portable", async () => {
           await makeProfileHookConfigsPortable(scope);
           if (scope.kind === "all") await makeSharedHookScriptsPortable();
         });
         await rm(root, { recursive: true, force: true });
+        if (tailsDir) await rm(tailsDir, { recursive: true, force: true });
         return result;
       });
       console.log(JSON.stringify({ ...merged, io: ioSnapshot() }));

@@ -34,6 +34,16 @@ export interface UpdateOptions {
   backup?: () => Promise<string>;
   heartbeatMs?: number;
   shimDir?: string;
+  /** Test seam for the release download. */
+  fetchImpl?: typeof fetch;
+}
+
+async function installedVersion(binary: string): Promise<string | undefined> {
+  try {
+    const proc = Bun.spawn([binary, "version"], { stdout: "pipe", stderr: "ignore" });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return code === 0 ? out.trim() || undefined : undefined;
+  } catch { return undefined; }
 }
 
 export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
@@ -50,6 +60,9 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     );
     try {
       console.log(`${prefix} backup complete: ${await (options.backup ?? runBackup)()}`);
+    } catch (error) {
+      // Nothing was downloaded yet: say so, so a failed backup is never mistaken for an update.
+      throw new Error(`backup failed, so NOTHING was updated: ${error instanceof Error ? error.message : String(error)}. Fix that, or run "ais update --no-backup" to update without a snapshot.`);
     } finally {
       clearInterval(timer);
     }
@@ -58,6 +71,7 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
   const shimDir = options.shimDir ?? join(homedir(), ".local", "bin");
   const platformSuffix = platformKey();
 
+  const before = await installedVersion(join(shimDir, "ais"));
   let updated = 0;
   for (const name of MANAGED_BINARIES) {
     const dest = join(shimDir, name);
@@ -67,9 +81,16 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     }
     const assetName = `${name}-${platformSuffix}`;
     console.log(`${prefix} downloading ${cyan(assetName)} -> ${dest}`);
-    await downloadAssetAtomic(assetName, dest);
+    await downloadAssetAtomic(assetName, dest, { fetchImpl: options.fetchImpl });
     await chmod(dest, 0o755);
     updated++;
+  }
+
+  // The shim that was just written must run; a corrupt or wrong-platform download fails here, not at next use.
+  if (updated > 0 && (await Bun.file(join(shimDir, "ais")).exists())) {
+    const after = await installedVersion(join(shimDir, "ais"));
+    if (!after) throw new Error(`the downloaded ${join(shimDir, "ais")} does not run ("ais version" failed); the previous version${before ? ` ${before}` : ""} was replaced, reinstall it`);
+    console.log(`${prefix} ais ${before && before !== after ? `${before} -> ${after}` : `${after} (already the latest release)`}`);
   }
 
   console.log(
