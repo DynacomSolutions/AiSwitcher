@@ -213,7 +213,7 @@ async function sourceWinsTie(source: string, destination: string): Promise<boole
 /** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict.
  * Credentials are in it deliberately: every host refreshes its own OAuth tokens, and an archived stale token is a
  * liability rather than a recovery aid. */
-const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|settings_cache\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$|(?:^|\/)identities\/[^/]+\/(?:\.credentials\.json|credentials\.json|auth\.(?:json|toml)|credentials\/kimi-code\.json|(?:data\/)?opencode\/auth\.json)$/;
+const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|settings_cache\.json|\.last_inuse_sweep|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$|(?:^|\/)identities\/[^/]+\/(?:\.credentials\.json|credentials\.json|auth\.(?:json|toml)|credentials\/kimi-code\.json|(?:data\/)?opencode\/auth\.json)$/;
 
 /** Content digests already archived per path, so a conflict whose losing copy was preserved before is neither
  * archived nor counted again. Without it a file both hosts keep rewriting reports itself on every run. */
@@ -245,7 +245,7 @@ class ConflictLedger {
 }
 
 /** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
-const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|pluginUsage|changelogLastFetched|cached.*|.*Cache.*)$/;
+const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tips?[A-Z].*|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|pluginUsage|changelogLastFetched|cached.*|.*Cache.*)$/;
 
 let claudeLockOptions: LockOptions = {};
 /** Test hook: shorten the `.claude.json` lock wait (no argument restores the default). */

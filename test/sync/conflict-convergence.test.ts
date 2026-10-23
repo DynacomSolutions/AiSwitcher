@@ -99,10 +99,10 @@ test(".claude.json differing only in per-session stats converges; a real key con
   expect(logged.some((m) => m.includes("differs in: theme"))).toBe(true);
 });
 
-test(".claude.json differing only in pluginUsage counters is not a conflict", async () => {
+test(".claude.json differing only in plugin and tip counters is not a conflict", async () => {
   const f = await fixture();
   const rel = ".claude/identities/a3/.claude.json";
-  const doc = (uses: number) => JSON.stringify({ theme: "dark", pluginUsage: { "p@m": { usageCount: uses } } });
+  const doc = (uses: number) => JSON.stringify({ theme: "dark", pluginUsage: { "p@m": { usageCount: uses } }, tipLifetimeShownCounts: { t: uses }, tipsHistoryByCommand: { c: uses } });
   await f.put(f.home, rel, doc(5), T + 10);
   await f.put(f.incoming, rel, doc(9), T);
   expect((await f.merge()).preservedConflicts).toBe(0);
@@ -132,4 +132,12 @@ test("a staged history that extends a large live one is merged as a tail without
   expect(await readFile(join(f.home, rel), "utf8")).toBe(await readFile(join(f.incoming, rel), "utf8"));
   // The staged file (6 MB) is read once to prove the prefix; the live one is not read again.
   expect(read).toBeLessThan(size * 1.6);
+});
+
+test("the plugin in-use sweep stamp is volatile state, not a conflict", async () => {
+  const f = await fixture();
+  const rel = ".claude/identities/a3/plugins/.last_inuse_sweep";
+  await f.put(f.home, rel, "1", T + 10);
+  await f.put(f.incoming, rel, "2", T);
+  expect((await f.merge()).preservedConflicts).toBe(0);
 });
