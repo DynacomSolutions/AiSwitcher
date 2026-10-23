@@ -4,9 +4,14 @@ Read before touching either release pipeline.
 
 ## Portable host releases
 
-`host-app.yml` uses GitHub-hosted `macos-latest` arm64, `windows-latest`
-x86_64 and `ubuntu-latest` x86_64 runners. It uses no schedules, containers
-or legacy cross-build jobs. PR selection follows `scripts/host/affected.ts`;
+`host-app.yml` uses GitHub-hosted `macos-latest` arm64 and `ubuntu-latest`
+x86_64 runners. Windows x86_64 is compiled, linted, packaged (NSIS installer
+and portable zip) and test-built on `ubuntu-latest` with a pinned `cargo-xwin`
+(`windows-build`); `windows-latest` only runs the resulting test executables
+and the package launch smoke (`windows-test`, via `scripts/host/windows-tests.ts`).
+Integration tests find their spawned binaries through `AIS_TEST_BIN_DIR`
+because `CARGO_BIN_EXE_*` is baked in at compile time. It uses no schedules
+or containers. PR selection follows `scripts/host/affected.ts`;
 shared inputs, unknown changes, default-branch pushes and release calls run
 the full suite. The always-running `gate` accepts intentional skips only
 when selection is `skip`; failed, cancelled or unexpectedly skipped jobs fail.

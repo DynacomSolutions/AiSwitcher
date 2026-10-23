@@ -451,7 +451,8 @@ SSH sources still invoke `ais host --stdio` remotely.
 
 `scripts/host/affected.ts` selects checks from changed dependencies.
 `check-workflows.ts` validates runner, permission and aggregate-gate policy.
-`build-release.ts` assembles native packages; `release-assets.ts` checks
+`build-release.ts` assembles native packages (`--windows` cross-builds on Linux);
+`windows-tests.ts` collects and runs cross-built Windows test executables; `release-assets.ts` checks
 architectures, payloads, final hashes and extracted native launch.
 `sign-macos.py` owns the temporary signing keychain and notarisation sequence.
 `validate-tag.ts` ties a release to the checked commit on `main`.

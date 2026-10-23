@@ -52,9 +52,15 @@ function notices(): string {
 }
 
 if (import.meta.main) {
-  const selected = targets[`${process.platform}-${process.arch}`];
+  // --windows builds the Windows package on Linux with cargo-xwin; the launch smoke
+  // then runs on a Windows runner against the produced archive.
+  const cross = Bun.argv.includes("--windows");
+  if (cross && process.platform !== "linux") throw new Error("--windows builds on Linux only.");
+  const selected = targets[cross ? "win32-x64" : `${process.platform}-${process.arch}`];
   if (!selected) throw new Error("Build on a supported native runner.");
   const { target, triple } = selected;
+  const cargo = cross ? ["cargo", "xwin"] : ["cargo"];
+  const runner = cross ? ["--runner", "cargo-xwin"] : [];
   const production = Bun.argv.includes("--production");
   const work = process.env.HOST_BUILD_DIR;
   if (!work || !process.env.CARGO_TARGET_DIR) throw new Error("Set isolated HOST_BUILD_DIR and CARGO_TARGET_DIR.");
@@ -67,14 +73,14 @@ if (import.meta.main) {
   const key = existsSync(keyPath) ? readFileSync(keyPath, "utf8") : "";
   if (production) validateTrustKey(key);
   else if (!key) process.env.AIS_ALLOW_PLACEHOLDER_RELEASE_KEY = "development-only";
-  const extension = process.platform === "win32" ? ".exe" : "";
-  run(["cargo", "build", "--manifest-path", join(host, "Cargo.toml"), "--locked", "--release", "--target", triple,
+  const extension = target === "windows-x64" ? ".exe" : "";
+  run([...cargo, "build", "--manifest-path", join(host, "Cargo.toml"), "--locked", "--release", "--target", triple,
     "-p", "ais-host-helper", "-p", "ais-host-core", "--bin", "ais-host-helper", "--bin", "ais-host-escrow-purge"], host, 2_400_000);
   const binaryDir = join(resolve(process.env.CARGO_TARGET_DIR), triple, "release");
   // The helper runs elevated: its imports must come from System32 only.
   if (target === "windows-x64") requireSearchSystem32(join(binaryDir, "ais-host-helper.exe"));
   for (const name of ["ais-host-helper", "ais-host-escrow-purge"]) cpSync(join(binaryDir, `${name}${extension}`), join(sidecars, `${name}-${triple}${extension}`));
-  run(["bun", "build", "src/host/adapter.ts", "--compile", "--outfile", join(sidecars, `ais-host-adapter-${triple}${extension}`)], repository);
+  run(["bun", "build", "src/host/adapter.ts", "--compile", ...(cross ? ["--target=bun-windows-x64"] : []), "--outfile", join(sidecars, `ais-host-adapter-${triple}${extension}`)], repository);
   writeFileSync(join(resources, "release-key.pub"), key);
   cpSync(join(repository, "LICENSE"), join(resources, "LICENSE"));
   writeFileSync(join(resources, "THIRD-PARTY-NOTICES.txt"), notices());
@@ -92,7 +98,7 @@ if (import.meta.main) {
       macOS: { hardenedRuntime: true, minimumSystemVersion: "11.0" },
     },
   }));
-  const args = ["cargo", "tauri", "build", "--target", triple, "--config", overlay];
+  const args = ["cargo", "tauri", "build", ...runner, "--target", triple, "--config", overlay];
   if (target === "windows-x64") args.push("--no-bundle");
   else args.push("--bundles", target === "macos-arm64" ? "app" : "appimage");
   args.push("--", "--locked");
@@ -115,14 +121,17 @@ if (import.meta.main) {
     // drives. The portable archive lists drives and refuses to elevate.
     const installer = join(root, "tauri-installer.json");
     writeFileSync(installer, JSON.stringify({ mainBinaryName: "ais-host-app", bundle: { windows: { nsis: { installMode: "perMachine" } } } }));
-    run(["cargo", "tauri", "build", "--target", triple, "--config", overlay, "--config", installer, "--bundles", "nsis", "--", "--locked"], host, 2_400_000);
+    run(["cargo", "tauri", "build", ...runner, "--target", triple, "--config", overlay, "--config", installer, "--bundles", "nsis", "--", "--locked"], host, 2_400_000);
     const setupDir = join(binaryDir, "bundle/nsis");
     const setups = readdirSync(setupDir).filter((name) => name.endsWith("-setup.exe"));
     if (setups.length !== 1) throw new Error("Expected one NSIS installer.");
     cpSync(join(setupDir, setups[0]!), join(assets, "ais-host-windows-x64-setup.exe"));
     asset = join(assets, "ais-host-windows-x64.zip");
-    run(["pwsh", "-NoProfile", "-Command", "Compress-Archive -Path (Join-Path $env:HOST_PORTABLE '*') -DestinationPath $env:HOST_ARCHIVE"], repository, 120_000,
-      { ...process.env, HOST_PORTABLE: portable, HOST_ARCHIVE: asset });
+    if (cross) run(["zip", "-q", "-r", asset, "."], portable);
+    else {
+      run(["pwsh", "-NoProfile", "-Command", "Compress-Archive -Path (Join-Path $env:HOST_PORTABLE '*') -DestinationPath $env:HOST_ARCHIVE"], repository, 120_000,
+        { ...process.env, HOST_PORTABLE: portable, HOST_ARCHIVE: asset });
+    }
   } else {
     const imageDir = join(binaryDir, "bundle/appimage");
     const images = readdirSync(imageDir).filter((name) => name.endsWith(".AppImage"));
@@ -131,7 +140,7 @@ if (import.meta.main) {
     cpSync(join(imageDir, images[0]!), asset);
   }
   // macOS production assessment follows Developer ID signing and stapling.
-  smokeArchive(asset, target, join(root, "clean launch \u00e9"), production, false);
+  if (!cross) smokeArchive(asset, target, join(root, "clean launch \u00e9"), production, false);
   cpSync(join(resources, "THIRD-PARTY-NOTICES.txt"), join(assets, `THIRD-PARTY-NOTICES-${target}.txt`));
-  console.log(`Packaged and smoke-tested ${target}; ${production ? "awaiting release verification" : "development-only, unsigned"}.`);
+  console.log(`Packaged${cross ? "" : " and smoke-tested"} ${target}; ${production ? "awaiting release verification" : "development-only, unsigned"}.`);
 }
