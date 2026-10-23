@@ -8,11 +8,25 @@ import {
   collectTargets,
   providerReportsFromTokscale,
   runUsageQueryForTargets,
+  shouldIncludeDefaultOpencodeProfile,
   usageResultsForJson,
   type UsageResult,
 } from "../../../src/cli/usage/run.ts";
 import type { ToolConfig } from "../../../src/identities/types.ts";
 import type { TokscaleEntry, TokscaleReport } from "../../../src/cli/usage/tokscale.ts";
+
+describe("shouldIncludeDefaultOpencodeProfile", () => {
+  test("includes it for unscoped queries and an OpenCode tool filter", () => {
+    expect(shouldIncludeDefaultOpencodeProfile({})).toBe(true);
+    expect(shouldIncludeDefaultOpencodeProfile({ tool: "opencode" })).toBe(true);
+  });
+
+  test("excludes it for identity filters and unrelated tool filters", () => {
+    expect(shouldIncludeDefaultOpencodeProfile({ identity: "alice" })).toBe(false);
+    expect(shouldIncludeDefaultOpencodeProfile({ tool: "claude" })).toBe(false);
+    expect(shouldIncludeDefaultOpencodeProfile({ identity: "alice", tool: "opencode" })).toBe(false);
+  });
+});
 
 // Mirrors test/cli/resolve-tool.test.ts's makeRegistry — collectTargets does
 // real Bun.file I/O via loadIdentitiesFile, so exercise it against real temp
