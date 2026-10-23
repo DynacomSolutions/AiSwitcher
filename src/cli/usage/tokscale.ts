@@ -1,9 +1,13 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
+import { lstat, mkdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { isRetired } from "../../identities/retired.ts";
 import { readZaiApiKey } from "../../identities/zai-auth.ts";
 import { aisHome } from "../../shared/ais-home.ts";
+import { defaultOpencodeProfileDbPath } from "./opencode-usage.ts";
 
 /**
  * How to point tokscale (github.com/junhoyeo/tokscale) at exactly one
@@ -172,14 +176,152 @@ function tokscaleSupportsClient(toolName: string): toolName is "claude" | "codex
  * this var and DOES return real Z.ai quota data (the default aggregate
  * report doesn't go through tokscale for zai at all — see zai-usage.ts).
  *
- * opencode has the same at-most-one limitation, for a different reason: its
- * scan root resolves through XDG_DATA_HOME (see tokscaleInvocationFor), a
- * single root that — unlike TOKSCALE_EXTRA_DIRS — can only ever point at
- * one identity's data dir. Same resolution: with exactly one opencode
- * target in the set its data root is included via `XDG_DATA_HOME`; with
- * zero or more than one, opencode is silently dropped from the merge.
+ * OpenCode SQLite files and legacy message roots are configured through
+ * scanner.opencodeDbPaths and scanner.extraScanPaths.opencode. TOKSCALE_CONFIG_DIR
+ * points Tokscale at an AIS-managed settings overlay that retains existing
+ * Tokscale settings and links its other files/directories back to the user's
+ * normal config directory. This permits one process to scan every configured
+ * OpenCode identity without rewriting user settings or copying credentials.
  */
-export async function buildMergedEnv(targets: Array<{ toolName: string; identity: Identity }>): Promise<Record<string, string>> {
+export interface MergedEnvOptions {
+  /** Test seam; production uses TOKSCALE_CONFIG_DIR or Tokscale's default. */
+  sourceConfigDir?: string;
+  /** Test seam; production stores its durable overlay below ~/.ais/usage. */
+  overlayConfigDir?: string;
+  /** Include the user's default OpenCode profile in unscoped usage parity. */
+  includeDefaultOpencodeProfile?: boolean;
+}
+
+function defaultTokscaleConfigDir(): string {
+  if (process.env.TOKSCALE_CONFIG_DIR) return resolve(process.env.TOKSCALE_CONFIG_DIR);
+  return resolve(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "tokscale");
+}
+
+async function prepareTokscaleConfigOverlay(
+  sourceConfigDir: string,
+  overlayConfigDir: string,
+  dbPaths: string[],
+  legacyMessageRoots: string[],
+): Promise<void> {
+  await mkdir(overlayConfigDir, { recursive: true });
+
+  // Tokscale 4.20 config state directories documented in its README. Link
+  // only these known cache/state paths, plus documented credential files
+  // when they already exist. This keeps existing state in place without
+  // copying secrets or blindly importing future files into the overlay.
+  const stateDirectories = [
+    "cache",
+    "cursor-cache",
+    "amp-cache",
+    "antigravity-cache",
+    "trae-cache",
+    "warp-cache",
+    "headless",
+    "autosubmit",
+  ];
+  const stateFiles = ["star-cache.json", "credentials.json", "cursor-credentials.json", "recovered-usage-v1.json"];
+  await mkdir(sourceConfigDir, { recursive: true });
+  for (const name of stateDirectories) {
+    const source = join(sourceConfigDir, name);
+    await mkdir(source, { recursive: true });
+    await ensureTokscaleStateLink(source, join(overlayConfigDir, name), true);
+  }
+  for (const name of stateFiles) {
+    const source = join(sourceConfigDir, name);
+    try {
+      await lstat(source);
+      await ensureTokscaleStateLink(source, join(overlayConfigDir, name), false);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  const readSettings = async (path: string): Promise<Record<string, unknown>> => {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : {};
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return {};
+    }
+  };
+  const sourceSettings = await readSettings(join(sourceConfigDir, "settings.json"));
+  const overlaySettings = await readSettings(join(overlayConfigDir, "settings.json"));
+  // Once created, the persistent overlay is Tokscale's active settings file.
+  // This preserves changes the TUI makes there between AIS invocations.
+  const settings = { ...sourceSettings, ...overlaySettings };
+
+  const sourceScanner = sourceSettings.scanner && typeof sourceSettings.scanner === "object" && !Array.isArray(sourceSettings.scanner)
+    ? sourceSettings.scanner as Record<string, unknown>
+    : {};
+  const overlayScanner = overlaySettings.scanner && typeof overlaySettings.scanner === "object" && !Array.isArray(overlaySettings.scanner)
+    ? overlaySettings.scanner as Record<string, unknown>
+    : {};
+  const scanner = { ...sourceScanner, ...overlayScanner };
+  const configuredPaths = Array.isArray(sourceScanner.opencodeDbPaths)
+    ? sourceScanner.opencodeDbPaths.filter((path): path is string => typeof path === "string")
+    : [];
+  const mergedPaths = [...new Set(await Promise.all([...configuredPaths, ...dbPaths].map(canonicalPathOrResolved)))];
+  const configuredLegacyRoots = scanner.extraScanPaths && typeof scanner.extraScanPaths === "object" && !Array.isArray(scanner.extraScanPaths)
+    ? scanner.extraScanPaths as Record<string, unknown>
+    : {};
+  const opencodeRoots = Array.isArray(configuredLegacyRoots.opencode)
+    ? configuredLegacyRoots.opencode.filter((path): path is string => typeof path === "string")
+    : [];
+  const mergedLegacyRoots = [...new Set(await Promise.all([...opencodeRoots, ...legacyMessageRoots].map(canonicalPathOrResolved)))];
+  settings.scanner = {
+    ...scanner,
+    opencodeDbPaths: mergedPaths,
+    extraScanPaths: { ...configuredLegacyRoots, opencode: mergedLegacyRoots },
+  };
+
+  const currentPaths = Array.isArray(overlayScanner.opencodeDbPaths)
+    ? overlayScanner.opencodeDbPaths.filter((path): path is string => typeof path === "string").map((path) => resolve(path))
+    : [];
+  const currentLegacyRoots = Array.isArray((overlayScanner.extraScanPaths as Record<string, unknown> | undefined)?.opencode)
+    ? ((overlayScanner.extraScanPaths as Record<string, unknown>).opencode as unknown[]).filter((path): path is string => typeof path === "string").map((path) => resolve(path))
+    : [];
+  if (JSON.stringify(currentPaths) !== JSON.stringify(mergedPaths) || JSON.stringify(currentLegacyRoots) !== JSON.stringify(mergedLegacyRoots)) {
+    const settingsPath = join(overlayConfigDir, "settings.json");
+    const tempPath = `${settingsPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(tempPath, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+    await rename(tempPath, settingsPath);
+  }
+}
+
+async function canonicalPathOrResolved(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return resolve(path);
+  }
+}
+
+async function ensureTokscaleStateLink(sourcePath: string, destinationPath: string, sourceIsDirectory: boolean): Promise<void> {
+  try {
+    const existing = await lstat(destinationPath);
+    if (!existing.isSymbolicLink()) return;
+    const existingTarget = await readlink(destinationPath);
+    if (resolve(dirname(destinationPath), existingTarget) === resolve(sourcePath)) return;
+    await unlink(destinationPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    await symlink(sourcePath, destinationPath, sourceIsDirectory ? "dir" : "file");
+  } catch (error) {
+    // Another invocation can establish the same link concurrently.
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+}
+
+export async function buildMergedEnv(
+  targets: Array<{ toolName: string; identity: Identity }>,
+  options: MergedEnvOptions = {},
+): Promise<Record<string, string>> {
   const entries: string[] = [];
   for (const t of targets) {
     if (tokscaleSupportsClient(t.toolName)) entries.push(tokscaleExtraDirEntry(t.toolName, t.identity));
@@ -202,10 +344,43 @@ export async function buildMergedEnv(targets: Array<{ toolName: string; identity
   }
 
   const opencodeTargets = targets.filter((t) => t.toolName === "opencode");
-  if (opencodeTargets.length === 1) {
-    env.XDG_DATA_HOME = join(opencodeTargets[0]!.identity.configDir, "data");
+  if (opencodeTargets.length > 0 || options.includeDefaultOpencodeProfile) {
+    const sourceConfigDir = options.sourceConfigDir ?? defaultTokscaleConfigDir();
+    const dbPaths = opencodeTargets.map((t) => resolve(join(t.identity.configDir, "data", "opencode", "opencode.db")));
+    const legacyMessageRoots = opencodeTargets.map((t) => resolve(join(t.identity.configDir, "data", "opencode", "storage", "message")));
+    if (options.includeDefaultOpencodeProfile) {
+      const defaultDbPath = defaultOpencodeProfileDbPath();
+      dbPaths.push(resolve(defaultDbPath));
+      legacyMessageRoots.push(resolve(join(dirname(defaultDbPath), "storage", "message")));
+    }
+    const overlayRoot = options.overlayConfigDir ?? join(aisHome(), "usage", "tokscale-config");
+    const targetSetHash = createHash("sha256")
+      .update([resolve(sourceConfigDir), ...dbPaths.sort(), ...legacyMessageRoots.sort()].join("\0"))
+      .digest("hex")
+      .slice(0, 16);
+    const overlayConfigDir = options.overlayConfigDir ?? join(overlayRoot, targetSetHash);
+    await prepareTokscaleConfigOverlay(sourceConfigDir, overlayConfigDir, dbPaths, legacyMessageRoots);
+    env.TOKSCALE_CONFIG_DIR = overlayConfigDir;
+    // Configured DB paths are additive to Tokscale auto-discovery. Keep its
+    // ambient XDG root empty so the caller's personal OpenCode data is not
+    // pulled into an all-identities report.
+    env.XDG_DATA_HOME = empty;
   }
   return env;
+}
+
+/** Prepares an unscoped Tokscale invocation without executing it. The same
+ * output is consumed by passthrough's execve path and can be tested with
+ * noninteractive arguments such as --json. */
+export async function prepareMergedPassthrough(
+  targets: Array<{ toolName: string; identity: Identity }>,
+  args: string[],
+  options: MergedEnvOptions = {},
+): Promise<{ args: string[]; env: Record<string, string> }> {
+  return {
+    args,
+    env: targets.length === 0 && !options.includeDefaultOpencodeProfile ? {} : await buildMergedEnv(targets, options),
+  };
 }
 
 /** One row of tokscale's `--json` `entries` array — usage broken down by model. */
