@@ -116,7 +116,33 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-function normalizedPriorMessages(prior: NativeMessage[], candidate: NativeMessage[]): { retained: NativeMessage[]; removed: NativeMessage[] } | undefined {
+function aggregateIdentity(row: NativeMessage): string {
+  return JSON.stringify([row.client, row.provider_id, row.model_id, row.session_id]);
+}
+
+function isGrokSessionAggregate(row: NativeMessage): boolean {
+  return isProviderReportedGrokLegacy(row) &&
+    new RegExp(`^grok:${row.session_id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:prompt:[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$`, "i").test(row.dedup_key);
+}
+
+function aggregateRepresentsPriorUnifiedRows(aggregate: NativeMessage, rows: NativeMessage[]): boolean {
+  if (rows.length === 0 || !isGrokSessionAggregate(aggregate) || !Number.isSafeInteger(aggregate.message_count) || aggregate.message_count <= 1) return false;
+  const expected = Object.fromEntries(TOKEN_FIELDS.map((field) => [field, 0])) as Record<(typeof TOKEN_FIELDS)[number], number>;
+  let messageCount = 0;
+  for (const row of rows) {
+    if (!isGrokUnified(row) || aggregateIdentity(row) !== aggregateIdentity(aggregate) || row.message_count !== 1) return false;
+    messageCount += row.message_count;
+    for (const field of TOKEN_FIELDS) {
+      if (!Number.isSafeInteger(row.tokens[field])) return false;
+      expected[field] += row.tokens[field];
+      if (!Number.isSafeInteger(expected[field])) return false;
+    }
+  }
+  return Number.isSafeInteger(messageCount) && aggregate.message_count === messageCount &&
+    TOKEN_FIELDS.every((field) => Number.isSafeInteger(aggregate.tokens[field]) && aggregate.tokens[field] === expected[field]);
+}
+
+function normalizedPriorMessages(prior: NativeMessage[], candidate: NativeMessage[]): { retained: NativeMessage[]; removed: NativeMessage[]; representedAggregate: boolean } | undefined {
   const oldUnified = prior.filter(isGrokUnified);
   const oldLegacy = prior.filter(isProviderReportedGrokLegacy);
   const candidateLegacyCounts = new Map<string, number>();
@@ -149,15 +175,43 @@ function normalizedPriorMessages(prior: NativeMessage[], candidate: NativeMessag
     const key = `${stableRowKey(row)}\0${payloadKey(row)}`;
     candidateCounts.set(key, (candidateCounts.get(key) ?? 0) + 1);
   }
-  const requiredCounts = new Map<string, number>();
   const removedSet = new Set(removed);
-  const retained = prior.filter((row) => !removedSet.has(row));
+  const representedByAggregate = new Set<NativeMessage>();
+  const priorUnifiedByIdentity = new Map<string, NativeMessage[]>();
+  for (const row of prior.filter(isGrokUnified)) {
+    const key = aggregateIdentity(row);
+    priorUnifiedByIdentity.set(key, [...(priorUnifiedByIdentity.get(key) ?? []), row]);
+  }
+  for (const [identity, rows] of priorUnifiedByIdentity) {
+    const unmatched = rows.filter((row) => !removedSet.has(row));
+    if (unmatched.length === 0) continue;
+    const presentCount = unmatched.reduce((count, row) => {
+      const key = `${stableRowKey(row)}\0${payloadKey(row)}`;
+      return count + Math.min(1, candidateCounts.get(key) ?? 0);
+    }, 0);
+    if (presentCount === unmatched.length) continue;
+    if (presentCount > 0) return undefined;
+    // Aggregate replacement is allowed only when every old unified row for
+    // this identity is missing. Mixing paired and aggregated rows would make
+    // candidate reuse or partial overlap difficult to prove safely.
+    if (unmatched.length !== rows.length) return undefined;
+    const candidateForIdentity = candidate.filter((row) => aggregateIdentity(row) === identity);
+    if (candidateForIdentity.some(isGrokUnified)) return undefined;
+    const candidateAggregates = candidateForIdentity.filter(isGrokSessionAggregate);
+    if (candidateAggregates.length !== 1 || !aggregateRepresentsPriorUnifiedRows(candidateAggregates[0]!, rows)) return undefined;
+    // A prior provider-reported row for the same identity makes it impossible
+    // to prove this is a new representation of only the missing unified rows.
+    if (prior.some((row) => isProviderReportedGrokLegacy(row) && aggregateIdentity(row) === identity)) return undefined;
+    for (const row of rows) representedByAggregate.add(row);
+  }
+  const retained = prior.filter((row) => !removedSet.has(row) && !representedByAggregate.has(row));
+  const requiredCounts = new Map<string, number>();
   for (const row of retained) {
     const key = `${stableRowKey(row)}\0${payloadKey(row)}`;
     requiredCounts.set(key, (requiredCounts.get(key) ?? 0) + 1);
   }
   for (const [key, count] of requiredCounts) if ((candidateCounts.get(key) ?? 0) < count) return undefined;
-  return { retained, removed };
+  return { retained, removed, representedAggregate: representedByAggregate.size > 0 };
 }
 
 function correctedAggregateIsNonRegressing(previous: UsageResult[], incoming: UsageResult[], removed: NativeMessage[]): boolean {
@@ -166,7 +220,7 @@ function correctedAggregateIsNonRegressing(previous: UsageResult[], incoming: Us
   if (!before || !after) return false;
   const correctedTokens = before.tokens - removed.reduce((sum, row) =>
     sum + row.tokens.input + row.tokens.output + row.tokens.cache_read + row.tokens.cache_write, 0);
-  const correctedMessages = before.messages - removed.length;
+  const correctedMessages = before.messages - removed.reduce((sum, row) => sum + row.message_count, 0);
   if (correctedTokens < 0 || correctedMessages < 0) return false;
   return after.tokens >= correctedTokens && after.messages >= correctedMessages;
 }
@@ -184,8 +238,9 @@ function totals(results: UsageResult[]): { tokens: number; messages: number } | 
 
 /**
  * A Grok-only exception for the known unified/legacy duplicate transition.
- * Every path, batch hash, envelope, one-to-one duplicate, retained old row,
- * and adjusted aggregate must validate; any uncertainty keeps the guard.
+ * Every path, batch hash, envelope, duplicate correction or exact session
+ * aggregate replacement, retained old row, and adjusted aggregate must
+ * validate; any uncertainty keeps the guard.
  */
 export function grokDuplicateBaselineIsSafe(input: {
   priorRef: NativeBatchRef;
@@ -200,5 +255,6 @@ export function grokDuplicateBaselineIsSafe(input: {
   if (!prior || !candidate) return false;
   const normalized = normalizedPriorMessages(prior, candidate);
   if (!normalized) return false;
-  return normalized.removed.length > 0 && correctedAggregateIsNonRegressing(input.previous, input.incoming, normalized.removed);
+  return (normalized.removed.length > 0 || normalized.representedAggregate) &&
+    correctedAggregateIsNonRegressing(input.previous, input.incoming, normalized.removed);
 }
