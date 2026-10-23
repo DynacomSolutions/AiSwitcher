@@ -49,6 +49,7 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "opencode.ai", reason: "OpenCode provider usage API (src/cli/limits/opencode-limits.ts)" },
   { domain: "models.dev", reason: "public model pricing/catalogue data source (src/identities/model-pricing.ts)" },
   { domain: "no-color.org", reason: "NO_COLOR convention this CLI implements, cited in a comment (src/cli/colors.ts)" },
+  { domain: "tokscale.ai", reason: "upstream Tokscale Pi client logo URL preserved in the pinned v4.20.0 patch (vendor/tokscale/patches/v4.20.0-ais.patch)" },
   { domain: "k8s.io", reason: "official Kubernetes release download used by the image build (Dockerfile)" },
   { domain: "kubernetes.io", reason: "well-known Kubernetes label-key namespace, e.g. kubernetes.io/hostname (k8s/deployment.yaml)" },
   { domain: "getambassador.io", reason: "Emissary-ingress Mapping API group used in apiVersion fields (k8s/*.yaml)" },
