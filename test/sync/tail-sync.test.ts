@@ -49,7 +49,7 @@ test("an incomplete sender tail is never appended", async () => {
 });
 
 import { mkdir, rename, utimes } from "node:fs/promises";
-import { planTails, restrictTo, setBeforeTailCopyHook, TAIL_PLAN_FILE, type HistoryManifest } from "../../src/sync/tail-sync.ts";
+import { planTails, restrictTo, setBeforeTailCopyHook, TAIL_DEFERRED_FILE, TAIL_PLAN_FILE, tailExcludeFilters, type HistoryManifest } from "../../src/sync/tail-sync.ts";
 import { mergeIncomingProfileTree } from "../../src/sync/tree-merge.ts";
 
 const REL = ".claude/identities/a/projects/p/h.jsonl";
@@ -68,7 +68,7 @@ async function homes() {
 const noPurge = async () => ({ removed: [], warnings: [] });
 const all = { kind: "all" } as const;
 
-test("a file replaced between hashing and copying is not planned", async () => {
+test("a file replaced between hashing and copying is deferred, not planned or sent whole", async () => {
   const { home, tails } = await homes();
   const base = lines(0, 1200);
   await writeFile(join(home, REL), base + lines(1200, 1300));
@@ -81,8 +81,14 @@ test("a file replaced between hashing and copying is not planned", async () => {
     await rename(join(home, "swap"), join(home, REL));
   });
   try {
-    expect(await planTails(home, all, receiver, join(tails, "swapped"), new Set(), listing)).toEqual({});
+    const deferred: string[] = [];
+    const plan = await planTails(home, all, receiver, join(tails, "swapped"), new Set(), listing, deferred);
+    expect(plan).toEqual({});
     expect(await Bun.file(join(tails, "swapped", REL)).exists()).toBe(false);
+    // The bulk transfer must leave it out too, or it is staged whole (the intermittent full re-pull).
+    expect(deferred).toEqual([REL]);
+    expect(JSON.parse(await readFile(join(tails, "swapped", TAIL_DEFERRED_FILE), "utf8"))).toEqual([REL]);
+    expect(tailExcludeFilters(plan, deferred)).toEqual([`--exclude=/${REL}`]);
   } finally { setBeforeTailCopyHook(); }
 });
 
