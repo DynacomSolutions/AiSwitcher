@@ -28,6 +28,11 @@ export function aisBackupsDir(home: string = homedir()): string {
   return join(aisHome(home), "backups");
 }
 
+/** Consistent online-backup copies of live SQLite databases kept out of the git backup, one timestamped set per run. */
+export function aisBackupsSqliteDir(home: string = homedir()): string {
+  return join(aisHome(home), "backups-sqlite");
+}
+
 /** Home-relative form of aisRemoteCacheDir(), for building the equivalent
  * path on a remote host reached over SSH (sync/service.ts constructs both a
  * local absolute path and a remote home-relative path for the same
