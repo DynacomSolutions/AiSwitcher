@@ -24,41 +24,38 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     additive extra scan root tokscale supports without symlinks. Its default
     scan root remains active, so the top-level `~/.claude/projects` must be
     empty to avoid including unrelated sessions.
-  - **bunx concurrency race, also found empirically, not in any doc — and
-    the fix went through two designs; the current one (2026-08-07) is
-    "bypass bunx for the actual calls," not "serialize the calls":** when
+  - **bunx concurrency race, also found empirically, not in any doc:** when
     tokscale isn't already on `PATH` and runs via `bunx tokscale@latest`,
     firing several of those processes at once — the natural way to query N
-    identities in parallel — can fail with `error: Failed to link
+    identities concurrently — can fail with `error: Failed to link
     @tokscale/cli: EEXIST`. A one-shot "warm the cache first, then
     parallelize" attempt did NOT fix it (reproduced the same failure on an
     already-warm cache); the race is in bunx's global `.bin` link step
     itself, not just the first-ever download — re-confirmed still
     reproducible on bun 1.3.11 (8 parallel warm invocations, 2/8 failed)
-    right before the redesign below, so it is NOT something a bun upgrade
-    quietly fixed. The FIRST design worked around it by fully serializing
+    right before the cached-binary redesign, so it is NOT something a bun upgrade
+    quietly fixed. The earlier design worked around it by fully serializing
     every tokscale invocation whenever `resolveTokscaleCommand()` resolved
     to `bunx` (parallelizing only when tokscale was on `PATH`). That was
-    correct but made the aggregate report crawl — every target paid ~2 tokscale
-    scans (main report + hourly/daily) strictly one after another, so a
-    12-target run took over a minute. The CURRENT design
+    correct but made the aggregate report crawl. The cached-binary design
     (`resolveTokscaleCachedBinary()` in `src/cli/usage/tokscale.ts`)
-    sidesteps the race instead of throttling around it: bunx's own install
+    avoids that race: bunx's own install
     already materializes tokscale's real per-platform native binary at
     `~/.bun/install/cache/@tokscale/cli-<os>-<arch>-<libc>@<ver>/bin/tokscale`,
     so after a one-time `bunx tokscale@latest --version` warm-up per CLI
     run (`ensureTokscaleCacheFresh()`, itself serialized through a tiny
     bunx promise-queue since it IS a bunx call), every actual scan spawn
     goes DIRECTLY at that cached binary (`runTokscaleProcess`) — no bunx,
-    no `.bin` link step, no race, and therefore full parallelism across
-    all targets even without tokscale on `PATH`.
+    no `.bin` link step, and no bunx link race. Independently, every
+    tokscale invocation is serialized through a process-wide slot so native
+    scans and bunx fallback cannot fan out memory use across targets.
     Candidates are probed for actual executability
     (`spawnSync --version`) not just file existence, so a wrong-libc or
     corrupt cache entry falls through to the next variant or ultimately to
     the old serialized-bunx fallback; the resolution result is memoized
     per process. If tokscale's own bunx/npm packaging changes its cache
     layout later, re-verify `findCachedTokscaleBinary` still finds the
-    real binary before trusting the parallel path.
+    real binary before trusting the cached-binary path.
   - tokscale is deliberately not a `package.json` dependency of this project
     (see `resolveTokscaleCommand()`) — it ships heavy platform-specific
     native optional-deps that don't belong bundled into a thin-wrapper

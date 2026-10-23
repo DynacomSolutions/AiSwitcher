@@ -1,5 +1,5 @@
 import { isIP } from "node:net";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync } from "node:fs";
 import { createApp } from "./app.ts";
@@ -12,8 +12,9 @@ import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
-import { warmUsageCaches } from "./workers.ts";
+import { stopScanWorkers, warmUsageCaches } from "./workers.ts";
 import { isAisLive, isLiveImageUser, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
+import { ServerLifecycle, trackResponseBody } from "./lifecycle.ts";
 
 export interface ServeOptions {
   port?: number;
@@ -48,6 +49,28 @@ export function isIdleTooLong(lastActivityMs: number, nowMs: number, idleShutdow
  * 30s regardless of how large idleShutdownMs is. */
 export function idleCheckIntervalMs(idleShutdownMs: number): number {
   return Math.min(30_000, Math.max(1_000, Math.floor(idleShutdownMs / 4)));
+}
+
+/** Validate the real SPA shell and every local executable/style asset it names. */
+export function validateWarmHtml(html: string, contentType: string, distDir: string): void {
+  if (!contentType.toLowerCase().includes("text/html")) {
+    throw new Error(`console warm render returned unexpected content type: ${contentType || "missing"}`);
+  }
+  if (!/^\s*<!doctype\s+html\b/i.test(html) || !/<html\b/i.test(html)) {
+    throw new Error("console warm render did not return an HTML document");
+  }
+
+  const references: string[] = [];
+  for (const match of html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi)) references.push(match[1]);
+  for (const match of html.matchAll(/<link\b(?=[^>]*\brel=["'][^"']*stylesheet[^"']*["'])[^>]*\bhref=["']([^"']+)["'][^>]*>/gi)) references.push(match[1]);
+  for (const reference of references) {
+    if (/^(?:[a-z][a-z\d+.-]*:|\/\/|#)/i.test(reference)) continue;
+    const pathname = decodeURIComponent(reference.split(/[?#]/, 1)[0]).replace(/^\/+/, "");
+    const assetPath = resolve(distDir, pathname);
+    if (!pathname || (relative(resolve(distDir), assetPath).startsWith("..")) || !existsSync(assetPath)) {
+      throw new Error(`console warm render references a missing asset: ${reference}`);
+    }
+  }
 }
 
 /** AIS_WEB_ALLOWED_HOSTS: comma-separated extra vhostnames the guard trusts
@@ -162,6 +185,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
   const app = createApp(deps);
+  const lifecycle = new ServerLifecycle();
 
   // Tracks the last time ANY request hit this daemon, for idleShutdownMs
   // below. Every request counts, from every consumer (WebUI, TUI, herdr's
@@ -169,6 +193,23 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   // point is "is anything still using this console", not "did the caller
   // that spawned it exit".
   let lastActivityMs = Date.now();
+
+  // Make readiness reflect a real render. With the WebUI installed, render
+  // and consume the root document. Headless installs have no distDir, so
+  // exercise the API app itself through its existing liveness route.
+  const warmPath = options.distDir ? "/" : "/api/health";
+  const warmResponse = await app.fetch(new Request(`http://127.0.0.1${warmPath}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }));
+  if (warmResponse.status < 200 || warmResponse.status >= 400) {
+    throw new Error(`console warm render failed with HTTP ${warmResponse.status}`);
+  }
+  if (options.distDir) {
+    validateWarmHtml(await warmResponse.text(), warmResponse.headers.get("content-type") ?? "", options.distDir);
+  } else {
+    await warmResponse.arrayBuffer();
+  }
+  lifecycle.markReady();
 
   const server = Bun.serve({
     port,
@@ -180,12 +221,23 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     idleTimeout: Math.min(120, 255),
     fetch(req, bunServer) {
       lastActivityMs = Date.now();
+      const finishRequest = lifecycle.beginRequest();
+      if (!finishRequest) return Response.json({ ok: false, draining: true }, { status: 503 });
       // Stamp the peer address so the guard can distinguish loopback peers
       // from token-carrying remote ones when a non-loopback bind is used.
       const ip = bunServer.requestIP(req);
       (req as unknown as { __remoteAddress?: string }).__remoteAddress = ip?.address;
       (req as unknown as { __remotePort?: number }).__remotePort = ip?.port;
-      return app.fetch(req);
+      const url = new URL(req.url);
+      if (url.pathname === "/api/ready" && req.method === "GET") {
+        return trackResponseBody(Response.json({ ok: lifecycle.isReady, draining: lifecycle.isDraining }, { status: lifecycle.isReady ? 200 : 503 }), finishRequest);
+      }
+      return Promise.resolve()
+        .then(() => app.fetch(req))
+        .then((response) => trackResponseBody(response, finishRequest), (error) => {
+          finishRequest();
+          throw error;
+        });
     },
   });
 
@@ -200,15 +252,23 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     // what actually makes `ais web start`'s child survive its parent's
     // whole session.
     process.on("SIGHUP", () => {});
+    let shutdownStarted = false;
+    const finishShutdownWhenDrained = async () => {
+      await lifecycle.waitForDrain();
+      await stopScanWorkers();
+      await clearServerState();
+      process.exitCode = 0;
+    };
     const shutdown = () => {
+      if (shutdownStarted) return;
+      shutdownStarted = true;
+      lifecycle.beginDrain();
       scheduler.stop();
       spendGuard?.stop();
       herdrBridge?.stop();
       claudeSwap?.stop();
       loginFlows.stop();
-      void clearServerState();
-      server.stop(true);
-      setTimeout(() => process.exit(0), 50);
+      void Promise.all([server.stop(false), lifecycle.waitForDrain()]).then(finishShutdownWhenDrained);
     };
     process.on("SIGTERM", shutdown);
     process.on("SIGINT", shutdown);

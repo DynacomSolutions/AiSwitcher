@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ConcurrencyLimiter, isCachedScanKind, scanWorkerConcurrencyLimit } from "../../src/server/workers.ts";
+import { ConcurrencyLimiter, isCachedScanKind, scanWorkerConcurrencyLimit, terminateScanProcess } from "../../src/server/workers.ts";
 
 /**
  * `usage`/`limits`/`breakdown` used to spawn a brand-new `ais __scan_worker`
@@ -26,17 +26,17 @@ describe("isCachedScanKind", () => {
 });
 
 describe("scanWorkerConcurrencyLimit", () => {
-  test("defaults to 4 and honours AIS_SCAN_WORKER_CONCURRENCY", () => {
+  test("defaults to 1 and honours AIS_SCAN_WORKER_CONCURRENCY", () => {
     const original = process.env.AIS_SCAN_WORKER_CONCURRENCY;
     try {
       delete process.env.AIS_SCAN_WORKER_CONCURRENCY;
-      expect(scanWorkerConcurrencyLimit()).toBe(4);
+      expect(scanWorkerConcurrencyLimit()).toBe(1);
       process.env.AIS_SCAN_WORKER_CONCURRENCY = "2";
       expect(scanWorkerConcurrencyLimit()).toBe(2);
       process.env.AIS_SCAN_WORKER_CONCURRENCY = "0";
-      expect(scanWorkerConcurrencyLimit()).toBe(4);
+      expect(scanWorkerConcurrencyLimit()).toBe(1);
       process.env.AIS_SCAN_WORKER_CONCURRENCY = "not-a-number";
-      expect(scanWorkerConcurrencyLimit()).toBe(4);
+      expect(scanWorkerConcurrencyLimit()).toBe(1);
     } finally {
       if (original === undefined) delete process.env.AIS_SCAN_WORKER_CONCURRENCY;
       else process.env.AIS_SCAN_WORKER_CONCURRENCY = original;
@@ -85,4 +85,58 @@ describe("ConcurrencyLimiter", () => {
     await expect(first).rejects.toThrow("boom");
     expect(await second).toBe("recovered");
   });
+
+  test("stop rejects queued and future jobs while allowing the active job to finish", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    let finish!: () => void;
+    const active = limiter.run(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const queued = limiter.run(async () => "should not run");
+    limiter.stop();
+    await expect(queued).rejects.toThrow("scan worker is stopping");
+    await expect(limiter.run(async () => "also should not run")).rejects.toThrow("scan worker is stopping");
+    finish();
+    await active;
+  });
+});
+
+describe("scan process cleanup", () => {
+  test("kills descendants before the next queued scan starts", async () => {
+    if (!Bun.which("setsid") || !Bun.which("sh")) return;
+    const limiter = new ConcurrencyLimiter(1);
+    const proc = Bun.spawn(["setsid", "sh", "-c", "trap '' TERM; sleep 30 & echo $!; wait"], {
+      stdin: "ignore", stdout: "pipe", stderr: "ignore",
+    });
+    const reader = proc.stdout.getReader();
+    let line = "";
+    while (!line.includes("\n")) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      line += new TextDecoder().decode(chunk.value);
+    }
+    const childPid = Number.parseInt(line.trim(), 10);
+    // Recreate the worker case: successful output is ready, but a descendant
+    // remains alive and inherits the worker's output descriptor.
+    const order: string[] = [];
+    const first = limiter.run(async () => {
+      await terminateScanProcess(proc, true);
+      order.push("cleaned");
+    });
+    const second = limiter.run(async () => {
+      let live = false;
+      try {
+        const stat = await Bun.file(`/proc/${childPid}/stat`).text();
+        live = !/^[ZX]$/.test(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]!);
+      } catch { /* gone */ }
+      expect(live).toBe(false);
+      order.push("next");
+    });
+    await Promise.all([first, second]);
+    expect(order).toEqual(["cleaned", "next"]);
+    let running = false;
+    try {
+      const stat = await Bun.file(`/proc/${childPid}/stat`).text();
+      running = !/^[ZX]$/.test(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]!);
+    } catch { /* process is gone */ }
+    expect(running).toBe(false);
+  }, 5000);
 });
