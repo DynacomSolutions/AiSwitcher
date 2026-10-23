@@ -2,20 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { ConcurrencyLimiter, isCachedScanKind, scanWorkerConcurrencyLimit, terminateScanProcess } from "../../src/server/workers.ts";
 
 /**
- * `usage`/`limits`/`breakdown` used to spawn a brand-new `ais __scan_worker`
- * child (a full disk scan plus, for usage, tokscale spawns) on EVERY single
- * request: scan-worker.ts's own PollCache instances live in that child's
- * module scope, so they reset on every process and never actually cached
- * anything across requests, even though the code read as if it did. This
- * covers the two structural fixes: routing those kinds through the SAME
- * daemon-side cache tree/transcript already used (isCachedScanKind), and
- * bounding how many scan children can run at once (ConcurrencyLimiter).
+ * Usage and breakdown reads now consume canonical persisted snapshots and
+ * queue marker-only refresh requests. PollCache remains for the API-backed
+ * limits path and the daemon's other cacheable scans.
  */
 describe("isCachedScanKind", () => {
-  test("usage/limits/breakdown/tree/transcript are all daemon-cached now", () => {
-    expect(isCachedScanKind("usage")).toBe(true);
+  test("usage and breakdown bypass request-local caches", () => {
+    expect(isCachedScanKind("usage")).toBe(false);
     expect(isCachedScanKind("limits")).toBe(true);
-    expect(isCachedScanKind("breakdown")).toBe(true);
+    expect(isCachedScanKind("breakdown")).toBe(false);
     expect(isCachedScanKind("tree")).toBe(true);
     expect(isCachedScanKind("transcript")).toBe(true);
   });

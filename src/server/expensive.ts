@@ -1,8 +1,14 @@
 import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runLimitsQuery } from "../cli/limits/collect.ts";
-import { runUsageQuery, usageResultsForJson } from "../cli/usage/run.ts";
-import { runBreakdownQuery, type BreakdownDeps, type BreakdownResult } from "../cli/usage/breakdown.ts";
+import { collectTargets } from "../cli/usage/run.ts";
+import { readUsageSnapshotEnvelope, requestUsageSnapshotRefresh } from "../cli/usage/snapshot.ts";
+import type { BreakdownQuery } from "../cli/usage/breakdown.ts";
+import {
+  readUsageBreakdownEnvelope,
+  requestUsageBreakdownRefresh,
+  type UsageBreakdownEnvelope,
+} from "../cli/usage/breakdown-snapshot.ts";
 import type { ParsedArgs } from "../cli/args.ts";
 import type { LimitsEnvelope, UsageEnvelope } from "./types.ts";
 
@@ -189,22 +195,14 @@ export async function limitsEnvelope(
   return { results: value as unknown[], cached, fetchedAt: new Date().toISOString() };
 }
 
-const USAGE_TTL_MS = 45_000;
-
 export async function usageEnvelope(cache: PollCache, tool: string | undefined, identity: string | undefined): Promise<UsageEnvelope> {
-  const key = `usage:${tool ?? "*"}:${identity ?? "*"}`;
-  const { value } = await cache.get(key, () => runUsageQuery(flagsFor(tool, identity)), USAGE_TTL_MS);
-  return { results: usageResultsForJson(value as never[]), generatedAt: new Date().toISOString() };
-}
-
-/** Breakdown scans stream raw JSONL, so they cache a little longer than the
- * live-API envelopes; still short enough that the view's own slow poll sees
- * fresh-ish data after a session ends. */
-const BREAKDOWN_TTL_MS = 60_000;
-
-export interface BreakdownEnvelope {
-  results: BreakdownResult[];
-  generatedAt: string;
+  void cache;
+  // Keep request validation consistent with the CLI, but never start a
+  // source scan from an API read. The daemon sampler owns refreshes.
+  await collectTargets(flagsFor(tool, identity));
+  const envelope = readUsageSnapshotEnvelope(tool, identity);
+  if (!envelope || envelope.stale) requestUsageSnapshotRefresh();
+  return envelope ?? { results: [], generatedAt: new Date(0).toISOString(), stale: true, pending: true };
 }
 
 export async function breakdownEnvelope(
@@ -212,9 +210,13 @@ export async function breakdownEnvelope(
   tool: string | undefined,
   identity: string | undefined,
   days: number,
-  deps: BreakdownDeps = {},
-): Promise<BreakdownEnvelope> {
-  const key = `breakdown:${tool ?? "*"}:${identity ?? "*"}:${days}`;
-  const { value } = await cache.get(key, () => runBreakdownQuery({ ...(tool ? { tool } : {}), ...(identity ? { identity } : {}), days }, deps), BREAKDOWN_TTL_MS);
-  return { results: value, generatedAt: new Date().toISOString() };
+): Promise<UsageBreakdownEnvelope> {
+  void cache;
+  const query: BreakdownQuery = { ...(tool ? { tool } : {}), ...(identity ? { identity } : {}), days };
+  let envelope = readUsageBreakdownEnvelope(query);
+  if (envelope.stale || envelope.pending) {
+    requestUsageBreakdownRefresh(query);
+    envelope = readUsageBreakdownEnvelope(query);
+  }
+  return envelope;
 }

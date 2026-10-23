@@ -23,7 +23,7 @@ process.on("exit", () => {
 `;
 
 interface IoEntry { argv: string; rchar: number; wchar: number; read_bytes: number; write_bytes: number }
-interface RunResult { exitCode: number; text: string; entries: IoEntry[] }
+interface RunResult { exitCode: number; text: string; entries: IoEntry[]; transferredBytes: number; transferredFiles: string[] }
 
 async function writeCrushFixture(home: string, bytes: number): Promise<void> {
   const data = join(home, ".zai", "identities", "a", "data");
@@ -51,6 +51,7 @@ async function harness() {
   roots.push(root);
   const [local, remote, shim] = [join(root, "local"), join(root, "remote"), join(root, "shim")];
   const log = join(root, "io.log");
+  const rsyncStats = join(root, "rsync-stats.log");
   await mkdir(shim, { recursive: true });
   await mkdir(join(remote, ".local", "bin"), { recursive: true });
   await mkdir(local, { recursive: true });
@@ -62,7 +63,14 @@ shift
 cd "${remote}" && HOME="${remote}" exec sh -c "$*"
 `);
   await writeFile(join(shim, "rsync"), `#!/bin/sh
-${rsync} "$@"; rc=$?
+case "$1" in
+  --server) exec "${rsync}" "$@" ;;
+esac
+stats="$AIS_RSYNC_STATS_LOG.$$"
+${rsync} "$@" --stats --itemize-changes > "$stats" 2>&1; rc=$?
+cat "$stats" >> "$AIS_RSYNC_STATS_LOG"
+cat "$stats"
+rm -f "$stats"
 awk -v h="$HOME" '/^rchar/{r=$2}/^wchar/{w=$2}/^read_bytes/{rb=$2}/^write_bytes/{wb=$2}END{printf "{\\"argv\\":\\"rsync %s\\",\\"rchar\\":%s,\\"wchar\\":%s,\\"read_bytes\\":%s,\\"write_bytes\\":%s}\\n",h,r,w,rb,wb}' /proc/$$/io >> "$AIS_IO_LOG"
 exit $rc
 `);
@@ -70,13 +78,19 @@ exit $rc
   for (const file of [join(shim, "ssh"), join(shim, "rsync"), join(remote, ".local", "bin", "ais")]) await chmod(file, 0o755);
   const syncConfig = join(root, "sync.json");
   await writeFile(syncConfig, JSON.stringify({ version: 2, remotes: ["fake-host"] }));
-  const env = { ...process.env, HOME: local, PATH: `${shim}:${process.env.PATH}`, AIS_SYNC_CONFIG: syncConfig, AIS_IO_LOG: log };
+  const env = { ...process.env, HOME: local, PATH: `${shim}:${process.env.PATH}`, AIS_SYNC_CONFIG: syncConfig, AIS_IO_LOG: log, AIS_RSYNC_STATS_LOG: rsyncStats };
   const run = async (extra: Record<string, string> = {}): Promise<RunResult> => {
     await writeFile(log, "");
+    await writeFile(rsyncStats, "");
     const proc = Bun.spawn([process.execPath, "--preload", join(root, "preload.ts"), entry, "sync", "now"], { env: { ...env, ...extra }, stdout: "pipe", stderr: "pipe" });
     const [out, err, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     const entries = (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as IoEntry);
-    return { exitCode, text: out + err, entries };
+    const stats = await readFile(rsyncStats, "utf8");
+    const statsRecords = [...stats.matchAll(/Total transferred file size:\s*([\d,]+)\s+bytes/g)];
+    if (!statsRecords.length) throw new Error("rsync completed without producing transfer statistics");
+    const transferredBytes = statsRecords.reduce((sum, match) => sum + Number(match[1]!.replaceAll(",", "")), 0);
+    const transferredFiles = [...stats.matchAll(/^[<>][^\s]{10}\s+(.+)$/gm)].map((match) => match[1]!);
+    return { exitCode, text: out + err, entries, transferredBytes, transferredFiles };
   };
   return { root, local, remote, run };
 }
@@ -107,16 +121,18 @@ test.skipIf(process.platform !== "linux" || !rsync)("a no-change ais sync moves 
   for (let i = 0; i < 3; i++) {
     first = await run();
     expect({ run: i, code: first.exitCode, text: first.exitCode ? first.text : "" }).toEqual({ run: i, code: 0, text: "" });
+    if (i === 0) expect(first.transferredBytes).toBeGreaterThan(4_000_000);
   }
 
   // Steady state: nothing changed since the last run.
   const before = await Bun.file(join(profile, "history.jsonl")).stat();
   const steady = await run();
   expect({ code: steady.exitCode, text: steady.exitCode ? steady.text : "" }).toEqual({ code: 0, text: "" });
-  const total = steady.entries.filter((e) => !e.argv.startsWith("rsync")).reduce((sum, e) => sum + e.rchar + e.wchar, 0);
-  // Local and remote ais processes together. About 4 MB of each process is runtime start-up;
-  // re-snapshotting the 40 MB database alone would read and write over 120 MB.
-  expect(total).toBeLessThan(30_000_000);
+  // Bun rchar/wchar includes runtime startup and IPC and varies by release. Rsync
+  // reports 271 bytes here, all in the two small identity registries; no profile
+  // data, history, or Crush database files may be transferred on a no-change run.
+  expect(steady.transferredFiles.every((path) => [".claude/identities.json", ".zai/identities.json"].includes(path))).toBe(true);
+  expect(steady.transferredBytes).toBeLessThan(1_000);
   expect(steady.entries.some((e) => e.argv.includes("merge-zai-snapshot"))).toBe(false);
   expect((await Bun.file(join(profile, "history.jsonl")).stat()).mtimeMs).toBe(before.mtimeMs);
 }, 120_000);

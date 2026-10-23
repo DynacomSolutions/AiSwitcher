@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import type { ToolConfig } from "../identities/types.ts";
 import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sync/background.ts";
 import { startProfileSyncWatcher } from "../sync/watch.ts";
+import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
 import { aisHerdrTabLabelsPath, aisStateDir } from "./ais-home.ts";
 import { isOnline } from "./connectivity.ts";
 import { darwinExe, darwinProc } from "./darwin-proc.ts";
@@ -125,6 +126,13 @@ export interface SessionWork {
 
 /** The in-session watchers, shared by the sidecar and the in-process fallback. */
 export async function startSessionWork(cfg: ToolConfig, spec: SessionSpec): Promise<SessionWork> {
+  const markDirty = () => {
+    if (!spec.identity) return;
+    try {
+      markUsageSnapshotDirty(usageSnapshotTargetKey(cfg.toolName, spec.identity.name));
+    } catch { /* freshness markers are best-effort */ }
+  };
+  markDirty();
   const watcher = spec.identity
     ? startProfileSyncWatcher(cfg, spec.identity.name, spec.identity.configDir, spec.cwd)
     : undefined;
@@ -143,6 +151,7 @@ export async function startSessionWork(cfg: ToolConfig, spec: SessionSpec): Prom
   await titleWatcher?.start();
   return {
     async stop() {
+      markDirty();
       titleWatcher?.stop();
       if (watcher) {
         await watcher.stop();

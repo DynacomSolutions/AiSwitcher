@@ -19,6 +19,8 @@ import { claudeSchedulerView, type ClaudeSwapStatusDto } from "./claude-swap-aut
 import type { PoolSwapStatusDto } from "../identities/pool/scheduler.ts";
 import { poolStatus } from "../identities/claude-swap-ops.ts";
 import { HttpError } from "./types.ts";
+import { readUsageBreakdownEnvelope, requestUsageBreakdownRefresh } from "../cli/usage/breakdown-snapshot.ts";
+import { collectTargets } from "../cli/usage/run.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
@@ -213,18 +215,24 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
     return c.json(result.payload);
   });
-  // Breakdown streams raw session JSONL (the heaviest local scan), so it
-  // runs in the same isolated scan child with a ceiling to match. Very
-  // large stores (10GB+) can still exceed it: the error is explicit and a
-  // smaller ?days= window scans proportionally less.
+  // The shared breakdown snapshot is read immediately; this API request only
+  // queues a refresh marker. The host collector owns all history scans.
   app.get("/api/usage/breakdown", async (c) => {
-    const result = await runScanIsolated("breakdown", {
+    const query = {
       ...(queryValue(c, "tool") ? { tool: queryValue(c, "tool") } : {}),
       ...(queryValue(c, "identity") ? { identity: queryValue(c, "identity") } : {}),
       days: numberQuery(c, "days", 30),
-    }, scanTimeoutAboveTokscale(240_000));
-    if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "breakdown scan failed");
-    return c.json(result.payload);
+    };
+    await collectTargets({
+      ...(query.tool ? { tool: query.tool } : {}),
+      ...(query.identity ? { identity: query.identity } : {}),
+    }); // validate registry filters without reading usage history
+    let envelope = readUsageBreakdownEnvelope(query);
+    if (envelope.stale || envelope.pending) {
+      requestUsageBreakdownRefresh(query);
+      envelope = readUsageBreakdownEnvelope(query);
+    }
+    return c.json(envelope);
   });
 
   /* -------------------------------- sessions ------------------------------- */

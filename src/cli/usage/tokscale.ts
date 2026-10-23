@@ -2,11 +2,12 @@ import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { lstat, mkdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { access, constants as fsConstants, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
 import { isRetired } from "../../identities/retired.ts";
 import { readZaiApiKey } from "../../identities/zai-auth.ts";
-import { aisHome } from "../../shared/ais-home.ts";
+import { aisCacheDir, aisHome } from "../../shared/ais-home.ts";
 import { defaultOpencodeProfileDbPath } from "./opencode-usage.ts";
 
 /**
@@ -120,6 +121,110 @@ export async function tokscaleInvocationFor(
     case "pi":
       return undefined;
   }
+}
+
+export interface AisTokscaleExportTarget {
+  toolName: ToolConfig["toolName"];
+  identity?: Identity;
+  partitionId: string;
+  exportPath: string;
+  signal?: AbortSignal;
+}
+
+export interface AisTokscaleExportInvocation {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd: string;
+  signal?: AbortSignal;
+}
+
+/** Build one isolated invocation of AIS-patched Tokscale's native message
+ * exporter. It never falls back to PATH or bunx, because those binaries may
+ * not implement the export contract. */
+export async function buildAisTokscaleExportInvocation(
+  target: AisTokscaleExportTarget,
+  env: Record<string, string | undefined> = process.env,
+): Promise<AisTokscaleExportInvocation | undefined> {
+  if (!/^[a-f0-9]{64}$/.test(target.partitionId) || !isAbsolute(target.exportPath)) {
+    throw new Error("invalid-native-export-target");
+  }
+  const command = env.AIS_TOKSCALE_SHARED_BIN || join(aisCacheDir(), "usage", "native-tokscale", "tokscale");
+  if (!isAbsolute(command)) throw new Error("invalid-native-export-binary-path");
+  try {
+    const info = await stat(command);
+    await access(command, fsConstants.X_OK);
+    if (!info.isFile()) throw new Error("invalid-native-export-binary");
+  } catch {
+    throw new Error("native-export-binary-unavailable");
+  }
+
+  let sourceEnv: Record<string, string>;
+  let clientArgs: string[];
+  if (target.toolName === "opencode" && !target.identity) {
+    sourceEnv = { XDG_DATA_HOME: join(homedir(), ".local", "share") };
+    clientArgs = ["--client", "opencode"];
+  } else if (target.toolName === "pi" && target.identity) {
+    sourceEnv = { PI_CODING_AGENT_DIR: target.identity.configDir };
+    clientArgs = ["--client", "pi"];
+  } else {
+    if (!target.identity) throw new Error("native-export-identity-required");
+    const invocation = await tokscaleInvocationFor(target.toolName, target.identity);
+    if (!invocation || target.toolName === "ali" || target.toolName === "zai") return undefined;
+    sourceEnv = invocation.env;
+    clientArgs = invocation.clientArgs;
+  }
+
+  // The native exporter runs with an isolated config directory. Pass the
+  // caller's pre-isolation Tokscale config root separately so its one-time
+  // Claude message-cache seed can read only the historical source cache.
+  const sourceTokscaleConfigDir = env.TOKSCALE_CONFIG_DIR ||
+    join(env.XDG_CONFIG_HOME || join(homedir(), ".config"), "tokscale");
+
+  return {
+    command,
+    args: clientArgs,
+    env: {
+      ...sourceEnv,
+      TOKSCALE_EXTRA_DIRS: "",
+      TOKSCALE_AIS_SOURCE_CONFIG_DIR: resolve(sourceTokscaleConfigDir),
+      TOKSCALE_CONFIG_DIR: join(aisCacheDir(), "usage", "native-tokscale", "isolated-config"),
+      TOKSCALE_AIS_EXPORT_PATH: target.exportPath,
+      TOKSCALE_AIS_PARTITION_ID: target.partitionId,
+    },
+    cwd: process.cwd(),
+    ...(target.signal ? { signal: target.signal } : {}),
+  };
+}
+
+/** The snapshot worker owns this bounded process call and validates the
+ * separately written export envelope before it can become visible. */
+export async function runAisTokscaleExportInvocation(invocation: AisTokscaleExportInvocation): Promise<string> {
+  if (invocation.signal?.aborted) throw new Error("native-export-aborted");
+  return withTokscaleProcessSlot(() =>
+    spawnTokscaleProcess(invocation.command, [], [...invocation.args, "--json"], invocation.env));
+}
+
+/** Resolve the installed AIS-patched binary and authoritative manifest for
+ * shared TUI mode. This path deliberately has no PATH/bunx fallback. */
+export async function resolveAisTokscaleSharedTui(
+  env: Record<string, string | undefined> = process.env,
+): Promise<{ command: string; args: string[] }> {
+  const command = env.AIS_TOKSCALE_SHARED_BIN || join(aisCacheDir(), "usage", "native-tokscale", "tokscale");
+  if (!isAbsolute(command)) throw new Error("AIS_TOKSCALE_SHARED_BIN must be an absolute path");
+
+  try {
+    const info = await stat(command);
+    await access(command, fsConstants.X_OK);
+    if (!info.isFile()) throw new Error("shared Tokscale binary is not a file");
+  } catch {
+    throw new Error(`AIS shared Tokscale binary is missing or not executable: ${command}`);
+  }
+
+  return {
+    command,
+    args: ["--ais-shared-snapshot", join(aisCacheDir(), "usage", "snapshot.json")],
+  };
 }
 
 /** The relative path tokscale itself appends to each client's scan root

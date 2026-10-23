@@ -148,6 +148,21 @@ describe("splitEvenly", () => {
 });
 
 describe("claude breakdown", () => {
+  test("marks a Claude result incomplete when a stream fails after a valid usage row", async () => {
+    const files = {
+      "/synthetic/SYNTHETIC_FIXTURE/config/projects/proj/a.jsonl": { mtimeMs: NOW_MS, lines: [] },
+    };
+    const deps = fakeDeps(files);
+    deps.readLines = async function* () {
+      yield claudeAssistantLine({ at: day(1), input: 100, output: 20, tools: ["Bash"] });
+      throw new Error("private source path");
+    };
+
+    const result = await collectIdentityBreakdown("claude", identity(), 30, deps);
+    expect(category(result, "conversation").inputTokens).toBe(100);
+    expect(result.sourceError).toBe("source-error");
+  });
+
   test("attributes input/cache to conversation and splits output across tool calls", async () => {
     const result = await claudeResult({
       "/synthetic/SYNTHETIC_FIXTURE/config/projects/proj/a.jsonl": {
@@ -257,6 +272,25 @@ describe("claude breakdown", () => {
 });
 
 describe("codex breakdown", () => {
+  test("marks a Codex result incomplete when a stream fails after a valid usage row", async () => {
+    const files = {
+      "/synthetic/SYNTHETIC_FIXTURE/config/sessions/2026/09/09/rollout.jsonl": { mtimeMs: NOW_MS, lines: [] },
+    };
+    const deps = fakeDeps(files);
+    deps.readLines = async function* () {
+      yield JSON.stringify({
+        timestamp: day(1),
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: { input_tokens: 25, output_tokens: 5 } } },
+      });
+      throw new Error("private source path");
+    };
+
+    const result = await collectIdentityBreakdown("codex", identity(), 30, deps);
+    expect(category(result, "conversation").inputTokens).toBe(25);
+    expect(result.sourceError).toBe("source-error");
+  });
+
   test("splits a turn's output deltas across the turn's calls", async () => {
     const result = await codexResult({
       "/synthetic/SYNTHETIC_FIXTURE/config/sessions/2026/09/09/rollout.jsonl": {
@@ -359,6 +393,30 @@ describe("misc", () => {
     const result = await claudeResult({});
     expect(result.unavailable).toBeUndefined();
     expect(result.categories).toHaveLength(0);
+  });
+
+  test("distinguishes an absent source root from denied or failed source discovery", async () => {
+    const absentDeps = fakeDeps({});
+    absentDeps.readdir = () => { throw Object.assign(new Error("missing"), { code: "ENOENT" }); };
+    const absent = await collectIdentityBreakdown("claude", identity(), 30, absentDeps);
+    expect(absent.unavailable).toContain("no local session logs");
+    expect(absent.sourceError).toBeUndefined();
+
+    const deniedDeps = fakeDeps({});
+    deniedDeps.readdir = () => { throw Object.assign(new Error("denied"), { code: "EACCES" }); };
+    const denied = await collectIdentityBreakdown("claude", identity(), 30, deniedDeps);
+    expect(denied.sourceError).toBe("source-error");
+    expect(denied.unavailable).toBeUndefined();
+
+    const statDeps = fakeDeps({
+      "/synthetic/SYNTHETIC_FIXTURE/config/projects/proj/a.jsonl": { mtimeMs: NOW_MS, lines: [] },
+    });
+    statDeps.isDirectory = (path) => {
+      if (path.endsWith("/projects/proj")) throw Object.assign(new Error("io"), { code: "EIO" });
+      return path.endsWith("/projects/proj");
+    };
+    const statFailed = await collectIdentityBreakdown("claude", identity(), 30, statDeps);
+    expect(statFailed.sourceError).toBe("source-error");
   });
 
   test("categories sort cost-desc and the render lists rows plus unavailable", async () => {

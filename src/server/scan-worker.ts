@@ -1,4 +1,5 @@
 import { limitsEnvelope, PollCache, usageEnvelope, breakdownEnvelope, flagsFor } from "./expensive.ts";
+import { refreshUsageSnapshot } from "../cli/usage/snapshot.ts";
 import { HttpError } from "./types.ts";
 import { collectResumeTargets, runResumeQuery } from "../cli/resume/collect.ts";
 import { CliUsageError } from "../cli/errors.ts";
@@ -44,7 +45,7 @@ const treeCache = new PollCache(15_000);
 // lines within one poll interval (the reads themselves stream to EOF).
 const transcriptCache = new PollCache(4_000);
 
-export type ScanKind = "usage" | "limits" | "sessions" | "breakdown" | "tree" | "transcript";
+export type ScanKind = "usage" | "usageSnapshotRefresh" | "limits" | "sessions" | "breakdown" | "tree" | "transcript";
 
 export interface ScanRequest {
   kind: ScanKind;
@@ -79,6 +80,9 @@ export async function runScan<T>(req: ScanRequest): Promise<ScanResult<T>> {
     switch (req.kind) {
       case "usage":
         payload = await usageEnvelope(cache, req.tool, req.identity);
+        break;
+      case "usageSnapshotRefresh":
+        payload = await refreshUsageSnapshot();
         break;
       case "limits":
         payload = await limitsEnvelope(cache, req.tool, req.identity, req.maxAgeS ?? 45);

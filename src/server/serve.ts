@@ -12,7 +12,7 @@ import { LoginFlowManager } from "./login-flows.ts";
 import { clearServerState, consoleWebDir, newConsoleToken, writeServerState } from "./state.ts";
 import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
-import { stopScanWorkers, warmUsageCaches } from "./workers.ts";
+import { stopScanWorkers, stopUsageSnapshotSampler, warmUsageCaches } from "./workers.ts";
 import { isAisLive, isLiveImageUser, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
 import { ServerLifecycle, stopServerAfterDrain, trackResponseBody } from "./lifecycle.ts";
 
@@ -271,6 +271,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     const shutdown = () => {
       if (shutdownStarted) return;
       shutdownStarted = true;
+      stopUsageSnapshotSampler();
       lifecycle.beginDrain();
       scheduler.stop();
       spendGuard?.stop();
@@ -298,7 +299,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     }
   }
 
-  return { port: server.port ?? port, token, stop: () => { scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); loginFlows.stop(); server.stop(true); } };
+  return { port: server.port ?? port, token, stop: () => { stopUsageSnapshotSampler(); scheduler.stop(); spendGuard?.stop(); herdrBridge?.stop(); claudeSwap?.stop(); loginFlows.stop(); server.stop(true); } };
 }
 
 /** Best-effort discovery of the built WebUI dist relative to wherever this

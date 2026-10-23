@@ -1,0 +1,1825 @@
+diff --git a/crates/tokscale-cli/src/main.rs b/crates/tokscale-cli/src/main.rs
+index eb9a897..0e2530d 100644
+--- a/crates/tokscale-cli/src/main.rs
++++ b/crates/tokscale-cli/src/main.rs
+@@ -105,6 +105,14 @@ struct Cli {
+ 
+     #[arg(long, help = "Disable spinner (for AI agents and scripts)")]
+     no_spinner: bool,
++
++    #[arg(
++        long,
++        value_name = "PATH",
++        global = true,
++        help = "Read AIS report aggregates and manifest-listed native batches without scanning local sources"
++    )]
++    ais_shared_snapshot: Option<String>,
+ }
+ 
+ #[derive(Subcommand)]
+@@ -666,6 +674,9 @@ fn main() -> Result<()> {
+     use std::io::IsTerminal;
+ 
+     let cli = Cli::parse();
++    if let Some(snapshot) = cli.ais_shared_snapshot.as_deref() {
++        std::env::set_var("TOKSCALE_AIS_SHARED_SNAPSHOT", snapshot);
++    }
+     // Install user-configured model aliases once, before any report/graph/TUI
+     // path runs, so model-name variants fold consistently across every command.
+     // Honors the global `--home` override exactly like scanner settings; an
+@@ -695,6 +706,16 @@ fn main() -> Result<()> {
+     );
+     tokscale_core::opencode_model_name::set_global(opencode_model_names);
+     let can_use_tui = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
++    if cli.ais_shared_snapshot.is_some() {
++        let supported = match cli.command.as_ref() {
++            None => cli.json && !cli.light && !cli.hide_zero,
++            Some(Commands::Tui { .. }) => can_use_tui && !cli.json && !cli.light && !cli.hide_zero,
++            _ => false,
++        };
++        if !supported {
++            anyhow::bail!("--ais-shared-snapshot supports only the interactive `tui` view or the all-time `--json` report; other report commands could scan local sources");
++        }
++    }
+ 
+     if cli.test_data {
+         return tui::test_data_loading();
+@@ -896,11 +917,16 @@ fn main() -> Result<()> {
+             run_import_command(file, format, output, dry_run, submit, importer)
+         }
+         Some(Commands::Tui { clients, date }) => {
++            if let Some(path) = cli.ais_shared_snapshot.as_deref() {
++                std::env::set_var("TOKSCALE_AIS_SHARED_SNAPSHOT", path);
++            }
+             ensure_home_supported_for_tui(&cli.home)?;
+             let (since, until) = build_date_filter(&date, &cli.home);
+             let year = normalize_year_filter(&date);
+             let clients = build_client_filter(clients, &cli.home);
+-            auto_sync_cursor_before_tui(&cli.home, &clients)?;
++            if cli.ais_shared_snapshot.is_none() {
++                auto_sync_cursor_before_tui(&cli.home, &clients)?;
++            }
+             tui::run(
+                 cli.theme.as_deref().unwrap_or(""),
+                 cli.refresh,
+@@ -1068,6 +1094,7 @@ fn main() -> Result<()> {
+             })
+         }
+         None => {
++            let has_explicit_client_filter = !cli.clients.clients.is_empty();
+             let clients = build_client_filter(cli.clients, &cli.home);
+             let group_by: tokscale_core::GroupBy = cli.group_by.parse().unwrap_or_else(|e| {
+                 eprintln!("Error: {}", e);
+@@ -1077,6 +1104,35 @@ fn main() -> Result<()> {
+             let worktree_rollup = worktree_rollup_from_flag(cli.merge_worktrees);
+ 
+             if cli.json {
++                if let Some(snapshot) = cli.ais_shared_snapshot.as_deref() {
++                    if cli.date.today
++                        || cli.date.yesterday
++                        || cli.date.week
++                        || cli.date.month
++                        || cli.date.since.is_some()
++                        || cli.date.until.is_some()
++                        || cli.date.year.is_some()
++                    {
++                        anyhow::bail!("shared snapshot --json is an all-time report; date-filtered costs are available only from native detail views");
++                    }
++                    let client_names = if !has_explicit_client_filter {
++                        None
++                    } else {
++                        clients.as_ref().map(|values| {
++                            values
++                                .iter()
++                                .map(|client| client.as_str().to_string())
++                                .collect::<Vec<_>>()
++                        })
++                    };
++                    let report = tokscale_core::ais_shared_snapshot_report(
++                        snapshot,
++                        client_names.as_deref(),
++                    )
++                    .map_err(anyhow::Error::msg)?;
++                    println!("{}", serde_json::to_string_pretty(&report)?);
++                    return Ok(());
++                }
+                 run_models_report(
+                     cli.json,
+                     cli.home.clone(),
+@@ -1857,6 +1913,9 @@ fn auto_sync_cursor_before_tui(
+     home_dir: &Option<String>,
+     clients: &Option<Vec<String>>,
+ ) -> Result<()> {
++    if std::env::var_os("TOKSCALE_AIS_SHARED_SNAPSHOT").is_some() {
++        return Ok(());
++    }
+     let had_cursor_cache = has_cursor_usage_cache_for_report(home_dir);
+     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(clients);
+     let cursor_sync_result = auto_sync_cursor_for_local_report(home_dir, clients);
+@@ -2518,7 +2577,10 @@ fn run_models_report(
+         emit_client_diagnostics(&diagnostics);
+ 
+         if undated_tokens.total() > 0 {
+-            eprintln!("  Claude Desktop: {} tokens included in all-time totals have no known usage date. They are excluded from dated reports and submissions.", undated_tokens.total());
++            eprintln!(
++                "  Claude Desktop: {} tokens included in all-time totals have no known usage date. They are excluded from dated reports and submissions.",
++                undated_tokens.total()
++            );
+         }
+         if let Some(coverage) = desktop_cache {
+             if coverage.decode_errors > 0 {
+@@ -3908,7 +3970,9 @@ fn run_pricing_lookup(
+ 
+     if model_id.eq_ignore_ascii_case("explain") {
+         if provider.is_some() {
+-            anyhow::bail!("--source/--provider applies to model queries; explain reports the active local pricing configuration");
++            anyhow::bail!(
++                "--source/--provider applies to model queries; explain reports the active local pricing configuration"
++            );
+         }
+         let svc = PricingService::load_cached_any_age().unwrap_or_else(|| {
+             PricingService::new_with_custom(
+@@ -3937,7 +4001,20 @@ fn run_pricing_lookup(
+             println!("{}", serde_json::to_string_pretty(&explanations)?);
+         } else {
+             for row in explanations {
+-                println!("{} / {} billing={} {:?}: ${:.8} source={} scope={} matched={} normalized={} base ×{} coverage={}", row.client, row.raw_model_id, row.billing_provider_id.as_deref().unwrap_or("unknown"), row.estimate_status, row.final_estimate, row.price_source.as_deref().unwrap_or("unpriced"), row.scope, row.matched_model_id.as_deref().unwrap_or("none"), row.normalized, row.effective_multiplier, row.coverage);
++                println!(
++                    "{} / {} billing={} {:?}: ${:.8} source={} scope={} matched={} normalized={} base ×{} coverage={}",
++                    row.client,
++                    row.raw_model_id,
++                    row.billing_provider_id.as_deref().unwrap_or("unknown"),
++                    row.estimate_status,
++                    row.final_estimate,
++                    row.price_source.as_deref().unwrap_or("unpriced"),
++                    row.scope,
++                    row.matched_model_id.as_deref().unwrap_or("none"),
++                    row.normalized,
++                    row.effective_multiplier,
++                    row.coverage
++                );
+             }
+         }
+         return Ok(());
+diff --git a/crates/tokscale-cli/src/tui/app.rs b/crates/tokscale-cli/src/tui/app.rs
+index 864c780..7e8cc1e 100644
+--- a/crates/tokscale-cli/src/tui/app.rs
++++ b/crates/tokscale-cli/src/tui/app.rs
+@@ -477,7 +477,10 @@ impl App {
+             ClientFilter::default_set()
+         };
+ 
+-        let auto_refresh_interval = if config.refresh > 0 {
++        let shared_snapshot_mode = std::env::var_os("TOKSCALE_AIS_SHARED_SNAPSHOT").is_some();
++        let auto_refresh_interval = if shared_snapshot_mode && config.refresh == 0 {
++            Duration::from_secs(5)
++        } else if config.refresh > 0 {
+             Duration::from_secs(config.refresh)
+         } else if let Some(interval) = settings.get_auto_refresh_interval() {
+             interval
+@@ -485,7 +488,8 @@ impl App {
+             Duration::from_secs(30)
+         };
+ 
+-        let auto_refresh = config.refresh > 0 || settings.auto_refresh_enabled;
++        let auto_refresh =
++            shared_snapshot_mode || config.refresh > 0 || settings.auto_refresh_enabled;
+ 
+         let data_loader = DataLoader::with_filters(
+             config.sessions_path.map(std::path::PathBuf::from),
+@@ -709,7 +713,12 @@ impl App {
+         }
+ 
+         if self.auto_refresh && self.last_auto_refresh.elapsed() >= self.auto_refresh_interval {
+-            if self.current_tab == Tab::Usage {
++            if std::env::var_os("TOKSCALE_AIS_SHARED_SNAPSHOT").is_some() {
++                if !self.background_loading {
++                    self.last_auto_refresh = Instant::now();
++                    self.needs_reload = true;
++                }
++            } else if self.current_tab == Tab::Usage {
+                 self.last_auto_refresh = Instant::now();
+                 // Auto-refresh is a silent background poll, not a user action,
+                 // so it must not overwrite the current status message (e.g. a
+@@ -2488,6 +2497,11 @@ impl App {
+         self.status_message_time = Some(Instant::now());
+     }
+ 
++    pub fn set_persistent_status(&mut self, message: &str) {
++        self.status_message = Some(message.to_string());
++        self.status_message_time = None;
++    }
++
+     pub fn get_sorted_models(&self) -> Vec<&ModelUsage> {
+         let mut models: Vec<&ModelUsage> = self.data.models.iter().collect();
+ 
+diff --git a/crates/tokscale-cli/src/tui/data/mod.rs b/crates/tokscale-cli/src/tui/data/mod.rs
+index 9da29c4..19e9267 100644
+--- a/crates/tokscale-cli/src/tui/data/mod.rs
++++ b/crates/tokscale-cli/src/tui/data/mod.rs
+@@ -12,6 +12,13 @@ use tokscale_core::{
+     ModelPerformance, PendingSourceCacheSave, WorktreeRollup,
+ };
+ 
++fn ais_report_overlay_supports_group(group_by: &GroupBy) -> bool {
++    matches!(
++        group_by,
++        GroupBy::Model | GroupBy::ClientModel | GroupBy::ClientProviderModel
++    )
++}
++
+ /// Returns the scanner settings that `DataLoader` should use when building
+ /// `LocalParseOptions`. Under `#[cfg(test)]` this intentionally ignores
+ /// `~/.config/tokscale/settings.json` so data-loader unit tests stay
+@@ -650,7 +657,7 @@ impl DataLoader {
+         let opts = LocalParseOptions {
+             home_dir: Some(home),
+             use_env_roots: true,
+-            clients: Some(sources),
++            clients: Some(sources.clone()),
+             since: self.since.clone(),
+             until: self.until.clone(),
+             year: self.year.clone(),
+@@ -671,7 +678,9 @@ impl DataLoader {
+         }
+         .map_err(anyhow::Error::msg)?;
+ 
+-        self.aggregate_messages(messages, group_by)
++        let mut data = self.aggregate_messages(messages, group_by)?;
++        self.apply_ais_report_overlay(&mut data, &sources, group_by)?;
++        Ok(data)
+     }
+ 
+     /// Build complete TUI data while leaving only the durable source-cache
+@@ -699,7 +708,7 @@ impl DataLoader {
+         let opts = LocalParseOptions {
+             home_dir: Some(home),
+             use_env_roots: true,
+-            clients: Some(sources),
++            clients: Some(sources.clone()),
+             since: self.since.clone(),
+             until: self.until.clone(),
+             year: self.year.clone(),
+@@ -721,7 +730,13 @@ impl DataLoader {
+         .map_err(anyhow::Error::msg)?;
+ 
+         match self.aggregate_messages(messages, group_by) {
+-            Ok(data) => Ok((data, pending_save)),
++            Ok(mut data) => {
++                if let Err(error) = self.apply_ais_report_overlay(&mut data, &sources, group_by) {
++                    pending_save.persist();
++                    return Err(error);
++                }
++                Ok((data, pending_save))
++            }
+             Err(error) => {
+                 // Parsing has already mutated the owned source cache. Do not
+                 // throw that work away merely because TUI aggregation failed.
+@@ -731,6 +746,114 @@ impl DataLoader {
+         }
+     }
+ 
++    fn apply_ais_report_overlay(
++        &self,
++        data: &mut UsageData,
++        clients: &[String],
++        group_by: &GroupBy,
++    ) -> Result<()> {
++        if !ais_report_overlay_supports_group(group_by) {
++            return Ok(());
++        }
++        let Ok(snapshot) = std::env::var("TOKSCALE_AIS_SHARED_SNAPSHOT") else {
++            return Ok(());
++        };
++        if self.since.is_some() || self.until.is_some() || self.year.is_some() {
++            return Ok(());
++        }
++        let selected: HashSet<&str> = clients.iter().map(String::as_str).collect();
++        let defaults = crate::tui::ais_default_snapshot_clients();
++        let default_selection: HashSet<&str> = defaults.iter().map(String::as_str).collect();
++        let client_filter = if selected == default_selection {
++            None
++        } else {
++            Some(clients)
++        };
++        self.apply_ais_report_overlay_from_path(data, client_filter, &snapshot)
++    }
++
++    fn apply_ais_report_overlay_from_path(
++        &self,
++        data: &mut UsageData,
++        clients: Option<&[String]>,
++        snapshot: &str,
++    ) -> Result<()> {
++        let report = tokscale_core::ais_shared_snapshot_report_from_loaded(snapshot, clients)
++            .map_err(anyhow::Error::msg)?;
++        let entries = report
++            .get("entries")
++            .and_then(serde_json::Value::as_array)
++            .ok_or_else(|| anyhow::anyhow!("AIS shared aggregate entries missing"))?;
++        let mut models = Vec::with_capacity(entries.len());
++        let mut total_tokens = 0u64;
++        for entry in entries {
++            let client = entry
++                .get("client")
++                .and_then(serde_json::Value::as_str)
++                .unwrap_or("unknown")
++                .to_string();
++            let model = entry
++                .get("model")
++                .and_then(serde_json::Value::as_str)
++                .unwrap_or("unknown")
++                .to_string();
++            let provider = entry
++                .get("provider")
++                .and_then(serde_json::Value::as_str)
++                .unwrap_or("unknown")
++                .to_string();
++            let tokens = TokenBreakdown {
++                input: entry
++                    .get("input")
++                    .and_then(serde_json::Value::as_u64)
++                    .unwrap_or(0),
++                output: entry
++                    .get("output")
++                    .and_then(serde_json::Value::as_u64)
++                    .unwrap_or(0),
++                cache_read: entry
++                    .get("cacheRead")
++                    .and_then(serde_json::Value::as_u64)
++                    .unwrap_or(0),
++                cache_write: entry
++                    .get("cacheWrite")
++                    .and_then(serde_json::Value::as_u64)
++                    .unwrap_or(0),
++                reasoning: entry
++                    .get("reasoning")
++                    .and_then(serde_json::Value::as_u64)
++                    .unwrap_or(0),
++            };
++            total_tokens = total_tokens.saturating_add(tokens.total());
++            let group_model = model_name_for_grouping(&client, &provider, &model);
++            let color_key = normalize_model_for_grouping(&model);
++            models.push(ModelUsage {
++                model: group_model,
++                color_key,
++                provider: provider.clone(),
++                client: client.clone(),
++                workspace_key: None,
++                workspace_label: None,
++                tokens,
++                cost: entry
++                    .get("cost")
++                    .and_then(serde_json::Value::as_f64)
++                    .unwrap_or(0.0),
++                performance: ModelPerformance::default(),
++                session_count: 0,
++                group_key: format!("{client}:{provider}:{model}"),
++                daily: Vec::new(),
++            });
++        }
++        data.models = models;
++        data.total_tokens = total_tokens;
++        data.total_cost = report
++            .get("totalCost")
++            .and_then(serde_json::Value::as_f64)
++            .unwrap_or(0.0);
++        Ok(())
++    }
++
+     #[cfg(test)]
+     #[allow(dead_code)]
+     fn load_with_pricing(
+@@ -2095,6 +2218,61 @@ mod tests {
+     use tokscale_core::pricing::{ModelPricing, PricingService};
+     use tokscale_core::TokenBreakdown as CoreTokenBreakdown;
+ 
++    #[test]
++    #[serial]
++    fn ais_shared_overlay_matches_canonical_json_totals_and_filters_clients() {
++        let temp = TempDir::new().unwrap();
++        let usage_dir = temp.path().join("usage");
++        fs::create_dir_all(&usage_dir).unwrap();
++        let snapshot_path = usage_dir.join("snapshot.json");
++        let snapshot = serde_json::json!({
++            "schemaVersion": 1,
++            "aggregateGeneratedAt": "2026-10-23T00:00:00Z",
++            "partitions": {},
++            "aggregateResults": [{"provider":"openai","report":{"entries":[
++                {"client":"codex","model":"gpt-5","provider":"openai","input":10,"output":2,"cacheRead":3,"cacheWrite":1,"reasoning":1,"messageCount":1,"cost":2.5},
++                {"client":"pi","model":"gpt-5","provider":"openai","input":7,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":3.0},
++                {"client":"ali","model":"qwen","provider":"alibaba","input":11,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":4.0},
++                {"client":"zai","model":"glm","provider":"zai","input":13,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":6.0}
++            ]}}]
++        });
++        fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
++        let json_report =
++            tokscale_core::ais_shared_snapshot_report(snapshot_path.to_str().unwrap(), None)
++                .unwrap();
++        env::set_var("TOKSCALE_AIS_SHARED_SNAPSHOT", &snapshot_path);
++        let mut ui_data = UsageData::default();
++        let default_clients = crate::tui::ais_default_snapshot_clients();
++        DataLoader::new(None)
++            .apply_ais_report_overlay(&mut ui_data, &default_clients, &GroupBy::Model)
++            .unwrap();
++        env::remove_var("TOKSCALE_AIS_SHARED_SNAPSHOT");
++        assert_eq!(
++            ui_data.total_cost,
++            json_report["totalCost"].as_f64().unwrap()
++        );
++        assert_eq!(
++            ui_data.models.len(),
++            json_report["entries"].as_array().unwrap().len()
++        );
++        assert!(ui_data.models.iter().any(|row| row.client == "ali"));
++        assert!(ui_data.models.iter().any(|row| row.client == "zai"));
++        assert_eq!(json_report["totalInput"], 41);
++        assert_eq!(json_report["totalCost"], 15.5);
++        assert_eq!(json_report["entries"].as_array().unwrap().len(), 4);
++
++        let filtered = tokscale_core::ais_shared_snapshot_report(
++            snapshot_path.to_str().unwrap(),
++            Some(&["codex".to_string()]),
++        )
++        .unwrap();
++        assert_eq!(filtered["totalInput"], 10);
++        assert_eq!(filtered["entries"].as_array().unwrap().len(), 1);
++        assert!(!ais_report_overlay_supports_group(&GroupBy::Session));
++        assert!(!ais_report_overlay_supports_group(&GroupBy::WorkspaceModel));
++        assert!(ais_report_overlay_supports_group(&GroupBy::ClientModel));
++    }
++
+     #[test]
+     fn accumulate_session_entry_normalizes_and_deduplicates_agents() {
+         let mut entry = SessionUsage::new("opencode", "sess-test");
+diff --git a/crates/tokscale-cli/src/tui/mod.rs b/crates/tokscale-cli/src/tui/mod.rs
+index bbe8a5f..41099ec 100644
+--- a/crates/tokscale-cli/src/tui/mod.rs
++++ b/crates/tokscale-cli/src/tui/mod.rs
+@@ -52,6 +52,14 @@ use crate::ClientFilter;
+ 
+ const BACKGROUND_LOADER_THREAD_NAME: &str = "tokscale-tui-data-loader";
+ 
++pub(crate) fn ais_default_snapshot_clients() -> Vec<String> {
++    ClientFilter::default_set()
++        .into_iter()
++        .filter_map(ClientFilter::to_client_id)
++        .map(|client| client.as_str().to_string())
++        .collect()
++}
++
+ fn panic_should_restore_terminal(thread_name: Option<&str>) -> bool {
+     thread_name != Some(BACKGROUND_LOADER_THREAD_NAME)
+ }
+@@ -215,7 +223,11 @@ fn drain_background_events(
+                 app.set_background_loading(false);
+                 app.source_cache_persisting = false;
+                 if state.mark_persisted() {
+-                    app.set_status("Data loaded");
++                    if let Some(coverage) = tokscale_core::ais_shared_snapshot_coverage_status() {
++                        app.set_persistent_status(&coverage);
++                    } else {
++                        app.set_status("Data loaded");
++                    }
+                 }
+             }
+             Err(TryRecvError::Empty) => break,
+@@ -315,11 +327,18 @@ pub fn run(
+     // silently invalidate the cache on every launch after `submit`.
+     let initial_group_by = TUI_DEFAULT_GROUP_BY;
+     let initial_report_scope = background_cache_scope(&since, &until, &year);
+-    let (cached_data, needs_background_load) = decide_initial_data(load_cache(
+-        &enabled_clients,
+-        &initial_group_by,
+-        &initial_report_scope,
+-    ));
++    let shared_snapshot_mode = std::env::var_os("TOKSCALE_AIS_SHARED_SNAPSHOT").is_some();
++    let (cached_data, needs_background_load) = if shared_snapshot_mode {
++        // AIS's manifest is authoritative. Never paint or save the ordinary
++        // TUI cache in shared mode, since it may contain a different generation.
++        (None, true)
++    } else {
++        decide_initial_data(load_cache(
++            &enabled_clients,
++            &initial_group_by,
++            &initial_report_scope,
++        ))
++    };
+ 
+     let original_hook = panic::take_hook();
+     panic::set_hook(Box::new(move |info| {
+@@ -425,7 +444,9 @@ pub fn run(
+                 loader.load_deferred(&bg_clients, &bg_group_by, bg_include_synthetic)
+             },
+             move |data| {
+-                save_cached_data(data, &bg_enabled_clients, &cache_group_by, &bg_report_scope);
++                if !shared_snapshot_mode {
++                    save_cached_data(data, &bg_enabled_clients, &cache_group_by, &bg_report_scope);
++                }
+             },
+         ));
+     }
+@@ -541,7 +562,9 @@ fn run_loop_with_background(
+                     // Rolled-up rows are a different aggregation of the same
+                     // messages, so caching them under the plain workspace scope
+                     // would serve merged rows to a later un-merged view.
+-                    if worktree_rollup == tokscale_core::WorktreeRollup::Separate {
++                    if !std::env::var_os("TOKSCALE_AIS_SHARED_SNAPSHOT").is_some()
++                        && worktree_rollup == tokscale_core::WorktreeRollup::Separate
++                    {
+                         save_cached_data(data, &enabled_clients, &cache_group_by, &report_scope);
+                     }
+                 },
+diff --git a/crates/tokscale-core/src/clients.rs b/crates/tokscale-core/src/clients.rs
+index f8143f2..4b0a166 100644
+--- a/crates/tokscale-core/src/clients.rs
++++ b/crates/tokscale-core/src/clients.rs
+@@ -483,8 +483,11 @@ define_clients!(
+     Pi = 8 => {
+         id: "pi",
+         display: "Pi",
+-        logo: Some("https://tokscale.ai/assets/logos/pi.png"),root: PathRoot::Home,
+-        relative: ".pi/agent/sessions",
++        logo: Some("https://tokscale.ai/assets/logos/pi.png"),root: PathRoot::EnvVar {
++            var: "PI_CODING_AGENT_DIR",
++            fallback_relative: ".pi/agent",
++        },
++        relative: "sessions",
+         pattern: "*.jsonl",
+         headless: false,
+         parse_local: true,
+@@ -1269,6 +1272,20 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    #[serial]
++    fn test_pi_root_honors_pi_coding_agent_dir() {
++        let mut env = EnvGuard::capture(&["PI_CODING_AGENT_DIR"]);
++        env.set("PI_CODING_AGENT_DIR", "/tmp/ais-pi-profile");
++
++        let client = ClientId::from_str("pi").expect("pi client should be registered");
++        assert_eq!(client.data().relative_path, "sessions");
++        assert_eq!(
++            client.data().resolve_path("/tmp/ambient-home"),
++            native_join(std::path::Path::new("/tmp/ais-pi-profile"), "sessions")
++        );
++    }
++
+     #[test]
+     fn test_mcode_registered_as_headless_local_source() {
+         let client = ClientId::from_str("mcode").expect("mcode client should be registered");
+diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
+index c68471a..771e05f 100644
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -44,6 +44,13 @@ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex, OnceLock};
+ use std::time::Instant;
+ 
++static AIS_SHARED_COVERAGE_STATUS: OnceLock<Mutex<Option<String>>> = OnceLock::new();
++static AIS_SHARED_PARSED_MANIFEST: OnceLock<Mutex<Option<(PathBuf, serde_json::Value)>>> =
++    OnceLock::new();
++static AIS_SHARED_NATIVE_BATCH_CACHE: OnceLock<
++    Mutex<std::collections::HashMap<(PathBuf, String, String, String), Vec<UnifiedMessage>>>,
++> = OnceLock::new();
++
+ /// Counts Claude cache entries rebuilt because they predate retention
+ /// provenance. Tests assert the rebuild is a one-time upgrade cost: the count
+ /// must stop growing once every entry carries the marker.
+@@ -246,9 +253,10 @@ impl std::str::FromStr for GroupBy {
+             "client,provider,model" | "client-provider-model" => Ok(GroupBy::ClientProviderModel),
+             "workspace,model" | "workspace-model" => Ok(GroupBy::WorkspaceModel),
+             "session" | "session,model" | "session-model" => Ok(GroupBy::Session),
+-            "client,session" | "client-session" | "client,session,model" | "client-session-model" => {
+-                Ok(GroupBy::ClientSession)
+-            }
++            "client,session"
++            | "client-session"
++            | "client,session,model"
++            | "client-session-model" => Ok(GroupBy::ClientSession),
+             _ => Err(format!(
+                 "Invalid group-by value: '{}'. Valid options: model, client,model, client,provider,model, workspace,model, session,model, client,session,model",
+                 s
+@@ -929,16 +937,24 @@ enum SourceCachePolicy {
+ #[doc(hidden)]
+ #[must_use = "source cache persistence is pending"]
+ pub struct PendingSourceCacheSave {
+-    source_cache: message_cache::SourceMessageCache,
++    source_cache: Option<message_cache::SourceMessageCache>,
+ }
+ 
+ impl PendingSourceCacheSave {
+     fn new(source_cache: message_cache::SourceMessageCache) -> Self {
+-        Self { source_cache }
++        Self {
++            source_cache: Some(source_cache),
++        }
++    }
++
++    pub fn no_op() -> Self {
++        Self { source_cache: None }
+     }
+ 
+     pub fn persist(mut self) {
+-        persist_source_cache(&mut self.source_cache);
++        if let Some(mut source_cache) = self.source_cache.take() {
++            persist_source_cache(&mut source_cache);
++        }
+     }
+ }
+ 
+@@ -1403,7 +1419,11 @@ fn codex_archive_failure_warning(
+         "Warning: skipped {total} unreadable compressed Codex rollout file{} ({}). Recorded token totals may omit {}. Example{}: {examples}.",
+         if total == 1 { "" } else { "s" },
+         categories.join("; "),
+-        if total == 1 { "this file" } else { "these files" },
++        if total == 1 {
++            "this file"
++        } else {
++            "these files"
++        },
+         if total == 1 { "" } else { "s" },
+     ))
+ }
+@@ -6480,6 +6500,427 @@ fn resolve_local_parse_request(
+     Ok((home_dir, clients))
+ }
+ 
++#[derive(serde::Serialize, serde::Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct AisBatchEnvelope {
++    schema_version: u32,
++    partition_id: String,
++    generated_at: String,
++    complete: bool,
++    messages: Vec<UnifiedMessage>,
++}
++
++fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), String> {
++    let path = std::env::var_os("TOKSCALE_AIS_EXPORT_PATH");
++    let partition_id = std::env::var("TOKSCALE_AIS_PARTITION_ID").ok();
++    let (path, partition_id) = match (path, partition_id) {
++        (None, None) => return Ok(()),
++        (Some(path), Some(partition_id)) => (path, partition_id),
++        _ => return Err("AIS export path and partition id must be set together".into()),
++    };
++    if partition_id.is_empty() {
++        return Err("AIS partition id is empty".into());
++    }
++    let path = std::path::PathBuf::from(path);
++    let parent = path.parent().ok_or("AIS export path has no parent")?;
++    std::fs::create_dir_all(parent).map_err(|e| format!("AIS export directory: {e}"))?;
++    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
++    let envelope = AisBatchEnvelope {
++        schema_version: 1,
++        partition_id,
++        generated_at,
++        complete: true,
++        messages: messages.to_vec(),
++    };
++    let bytes = serde_json::to_vec(&envelope).map_err(|e| format!("AIS batch encode: {e}"))?;
++    let temp = parent.join(format!(
++        ".ais-batch-{}-{}.tmp",
++        std::process::id(),
++        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
++    ));
++    use std::io::Write;
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&temp)
++        .map_err(|e| format!("AIS batch temp: {e}"))?;
++    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
++        drop(file);
++        let _ = std::fs::remove_file(&temp);
++        return Err(format!("AIS batch write: {error}"));
++    }
++    drop(file);
++    std::fs::rename(&temp, &path).map_err(|e| {
++        let _ = std::fs::remove_file(&temp);
++        format!("AIS batch publish: {e}")
++    })?;
++    Ok(())
++}
++
++/// Load only complete immutable batches named by AIS's authoritative manifest.
++/// Relative batch paths are rooted at the cache directory above `usage/`.
++/// Canonical AIS all-time aggregate derived from report rows, separate from
++/// native messages so no synthetic dates, sessions, or costs are invented.
++pub fn ais_shared_snapshot_report(
++    path: &str,
++    clients: Option<&[String]>,
++) -> Result<serde_json::Value, String> {
++    ais_shared_snapshot_report_impl(path, clients, false)
++}
++
++/// TUI overlay variant: reuse the exact manifest already parsed with native
++/// batches, keeping aggregate and detail on one generation without rereading
++/// the snapshot or its potentially large immutable batch files.
++pub fn ais_shared_snapshot_report_from_loaded(
++    path: &str,
++    clients: Option<&[String]>,
++) -> Result<serde_json::Value, String> {
++    ais_shared_snapshot_report_impl(path, clients, true)
++}
++
++fn ais_shared_snapshot_report_impl(
++    path: &str,
++    clients: Option<&[String]>,
++    use_loaded_manifest: bool,
++) -> Result<serde_json::Value, String> {
++    let manifest_path = PathBuf::from(path);
++    let cached = if use_loaded_manifest {
++        AIS_SHARED_PARSED_MANIFEST
++            .get_or_init(|| Mutex::new(None))
++            .lock()
++            .unwrap()
++            .as_ref()
++            .filter(|(cached_path, _)| cached_path == &manifest_path)
++            .map(|(_, manifest)| manifest.clone())
++    } else {
++        None
++    };
++    let manifest: serde_json::Value = match cached {
++        Some(manifest) => manifest,
++        None => serde_json::from_slice(
++            &std::fs::read(path).map_err(|e| format!("AIS snapshot read: {e}"))?,
++        )
++        .map_err(|e| format!("AIS snapshot JSON: {e}"))?,
++    };
++    if manifest.get("schemaVersion").and_then(|v| v.as_u64()) != Some(1) {
++        return Err("unsupported AIS snapshot schema".into());
++    }
++    let partitions = manifest
++        .get("partitions")
++        .and_then(|v| v.as_object())
++        .ok_or("AIS snapshot partitions missing")?;
++    let mut totals = (0i64, 0i64, 0i64, 0i64, 0i64, 0.0f64);
++    let mut entries = std::collections::BTreeMap::<
++        (String, String, String),
++        (i64, i64, i64, i64, i64, i64, f64),
++    >::new();
++    let results = manifest
++        .get("aggregateResults")
++        .and_then(|v| v.as_array())
++        .ok_or("AIS snapshot aggregateResults missing or invalid")?;
++    let aggregate_generated_at = manifest
++        .get("aggregateGeneratedAt")
++        .and_then(|v| v.as_str())
++        .ok_or("AIS snapshot aggregateGeneratedAt missing or invalid")?;
++    if chrono::DateTime::parse_from_rfc3339(aggregate_generated_at).is_err() {
++        return Err("AIS snapshot aggregateGeneratedAt invalid".into());
++    }
++    for result in results {
++        let Some(report) = result.get("report") else {
++            continue;
++        };
++        let Some(rows) = report.get("entries").and_then(|v| v.as_array()) else {
++            continue;
++        };
++        for row in rows {
++            let client = row
++                .get("client")
++                .and_then(|v| v.as_str())
++                .ok_or("AIS aggregate report client missing or invalid")?
++                .to_string();
++            if clients.is_some_and(|filter| !filter.iter().any(|requested| requested == &client)) {
++                continue;
++            }
++            let model = row
++                .get("model")
++                .and_then(|v| v.as_str())
++                .unwrap_or("unknown")
++                .to_string();
++            let provider = row
++                .get("provider")
++                .and_then(|v| v.as_str())
++                .or_else(|| result.get("provider").and_then(|v| v.as_str()))
++                .unwrap_or("unknown")
++                .to_string();
++            let n = |key: &str| row.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
++            let cost = row.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
++            let e = entries.entry((client, model, provider)).or_default();
++            e.0 = e.0.saturating_add(n("input"));
++            e.1 = e.1.saturating_add(n("output"));
++            e.2 = e.2.saturating_add(n("cacheRead"));
++            e.3 = e.3.saturating_add(n("cacheWrite"));
++            e.4 = e.4.saturating_add(n("reasoning"));
++            e.5 = e.5.saturating_add(n("messageCount"));
++            e.6 += cost;
++        }
++    }
++    let entries: Vec<_> = entries.into_iter().map(|((client, model, provider), e)| {
++        totals.0 = totals.0.saturating_add(e.0); totals.1 = totals.1.saturating_add(e.1);
++        totals.2 = totals.2.saturating_add(e.2); totals.3 = totals.3.saturating_add(e.3);
++        totals.4 = totals.4.saturating_add(e.5); totals.5 += e.6;
++        serde_json::json!({"client":client,"model":model,"provider":provider,"input":e.0,"output":e.1,"cacheRead":e.2,"cacheWrite":e.3,"reasoning":e.4,"messageCount":e.5,"cost":e.6})
++    }).collect();
++    let native_coverage = manifest.get("nativeCoverage").cloned().unwrap_or_else(|| {
++        let mut counts = std::collections::BTreeMap::<String, usize>::new();
++        for partition in partitions.values() {
++            let state = if partition
++                .get("nativeBatch")
++                .is_some_and(|value| !value.is_null())
++            {
++                "supported"
++            } else {
++                "unsupported-or-pending"
++            };
++            *counts.entry(state.to_string()).or_default() += 1;
++        }
++        serde_json::to_value(counts).unwrap_or_else(|_| serde_json::json!({}))
++    });
++    let coverage = format!(
++        "Native details are available only from manifest-listed batches; JSON does not load native detail ({native_coverage})"
++    );
++    Ok(
++        serde_json::json!({"entries":entries,"totalInput":totals.0,"totalOutput":totals.1,"totalCacheRead":totals.2,"totalCacheWrite":totals.3,"totalMessages":totals.4,"totalCost":totals.5,"coverage":coverage,"aggregateGeneratedAt":aggregate_generated_at,"detailCoverage":"manifest-native-batches-listed; not-loaded-by-json","dateFilteredCostCoverage":"native-only; not-projected-in-all-time-json"}),
++    )
++}
++
++pub fn parse_ais_shared_snapshot(
++    path: &str,
++    options: &LocalParseOptions,
++) -> Result<Vec<UnifiedMessage>, String> {
++    parse_ais_shared_snapshot_inner(path, options, true)
++}
++
++fn parse_ais_shared_snapshot_inner(
++    path: &str,
++    options: &LocalParseOptions,
++    retry_changed_manifest: bool,
++) -> Result<Vec<UnifiedMessage>, String> {
++    use sha2::{Digest, Sha256};
++    let manifest_path = std::path::Path::new(path);
++    let cache_root = manifest_path
++        .parent()
++        .and_then(std::path::Path::parent)
++        .ok_or("AIS snapshot path must be under usage/")?;
++    let manifest_bytes =
++        std::fs::read(manifest_path).map_err(|e| format!("AIS snapshot read: {e}"))?;
++    let manifest: serde_json::Value =
++        serde_json::from_slice(&manifest_bytes).map_err(|e| format!("AIS snapshot JSON: {e}"))?;
++    if manifest.get("schemaVersion").and_then(|v| v.as_u64()) != Some(1) {
++        return Err("unsupported AIS snapshot schema".into());
++    }
++    let partitions = manifest
++        .get("partitions")
++        .and_then(|v| v.as_object())
++        .ok_or("AIS snapshot partitions missing")?;
++    if manifest
++        .get("aggregateResults")
++        .and_then(serde_json::Value::as_array)
++        .is_none()
++    {
++        return Err("AIS snapshot aggregateResults missing or invalid".into());
++    }
++    let aggregate_generated_at = manifest
++        .get("aggregateGeneratedAt")
++        .and_then(serde_json::Value::as_str)
++        .ok_or("AIS snapshot aggregateGeneratedAt missing or invalid")?;
++    if chrono::DateTime::parse_from_rfc3339(aggregate_generated_at).is_err() {
++        return Err("AIS snapshot aggregateGeneratedAt invalid".into());
++    }
++    let mut unsupported_tools = std::collections::BTreeMap::<String, usize>::new();
++    for partition in partitions.values() {
++        if partition
++            .get("nativeBatch")
++            .is_none_or(serde_json::Value::is_null)
++        {
++            let tool = partition
++                .get("tool")
++                .and_then(serde_json::Value::as_str)
++                .unwrap_or("unknown");
++            *unsupported_tools.entry(tool.to_string()).or_default() += 1;
++        }
++    }
++    let mut combined = Vec::new();
++    let mut unavailable_tools = unsupported_tools;
++    let mut manifest_cache_keys = HashSet::new();
++    let mut saw_missing_batch = false;
++    for (_partition_key, partition) in partitions {
++        let Some(batch) = partition.get("nativeBatch").filter(|v| !v.is_null()) else {
++            continue;
++        };
++        let tool = partition
++            .get("tool")
++            .and_then(serde_json::Value::as_str)
++            .unwrap_or("unknown")
++            .to_string();
++        let rel = batch
++            .get("path")
++            .and_then(|v| v.as_str())
++            .ok_or("native batch path missing")?;
++        let rel_path = std::path::Path::new(rel);
++        if rel_path.is_absolute()
++            || rel_path.components().any(|c| {
++                matches!(
++                    c,
++                    std::path::Component::ParentDir
++                        | std::path::Component::RootDir
++                        | std::path::Component::Prefix(_)
++                )
++            })
++        {
++            *unavailable_tools.entry(tool).or_default() += 1;
++            continue;
++        }
++        let expected_partition_id = batch
++            .get("partitionId")
++            .and_then(serde_json::Value::as_str)
++            .ok_or("native batch partition id missing")?;
++        if expected_partition_id.len() != 64
++            || !expected_partition_id
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++        {
++            *unavailable_tools.entry(tool).or_default() += 1;
++            continue;
++        }
++        let expected_digest = batch
++            .get("sha256")
++            .and_then(serde_json::Value::as_str)
++            .ok_or("native batch checksum missing")?;
++        let expected_generated_at = batch
++            .get("generatedAt")
++            .and_then(serde_json::Value::as_str)
++            .ok_or("native batch generatedAt missing")?;
++        let batch_path = cache_root.join(rel_path);
++        let cache_key = (
++            batch_path.clone(),
++            expected_partition_id.to_string(),
++            expected_digest.to_string(),
++            expected_generated_at.to_string(),
++        );
++        manifest_cache_keys.insert(cache_key.clone());
++        if let Some(messages) = AIS_SHARED_NATIVE_BATCH_CACHE
++            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
++            .lock()
++            .unwrap()
++            .get(&cache_key)
++            .cloned()
++        {
++            combined.extend(messages);
++            continue;
++        }
++        let loaded = (|| -> Result<AisBatchEnvelope, String> {
++            let bytes = std::fs::read(&batch_path).map_err(|e| {
++                if e.kind() == std::io::ErrorKind::NotFound {
++                    saw_missing_batch = true;
++                }
++                format!("native batch read: {e}")
++            })?;
++            let digest = format!("{:x}", Sha256::digest(&bytes));
++            if expected_digest != digest {
++                return Err("native batch checksum mismatch".into());
++            }
++            let envelope: AisBatchEnvelope =
++                serde_json::from_slice(&bytes).map_err(|e| format!("native batch JSON: {e}"))?;
++            if expected_partition_id.len() != 64
++                || !expected_partition_id
++                    .bytes()
++                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++            {
++                return Err("native batch partition id invalid".into());
++            }
++            if envelope.schema_version != 1
++                || !envelope.complete
++                || envelope.partition_id != expected_partition_id
++            {
++                return Err("native batch envelope mismatch".into());
++            }
++            if chrono::DateTime::parse_from_rfc3339(&envelope.generated_at).is_err() {
++                return Err("native batch timestamp invalid".into());
++            }
++            if expected_generated_at != envelope.generated_at {
++                return Err("native batch generation mismatch".into());
++            }
++            Ok(envelope)
++        })();
++        match loaded {
++            Ok(envelope) => {
++                AIS_SHARED_NATIVE_BATCH_CACHE
++                    .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
++                    .lock()
++                    .unwrap()
++                    .insert(cache_key, envelope.messages.clone());
++                combined.extend(envelope.messages)
++            }
++            Err(_) => *unavailable_tools.entry(tool).or_default() += 1,
++        }
++    }
++    if retry_changed_manifest && saw_missing_batch {
++        if let Ok(latest_bytes) = std::fs::read(manifest_path) {
++            if latest_bytes != manifest_bytes {
++                return parse_ais_shared_snapshot_inner(path, options, false);
++            }
++        }
++    }
++    AIS_SHARED_NATIVE_BATCH_CACHE
++        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
++        .lock()
++        .unwrap()
++        .retain(|key, _| manifest_cache_keys.contains(key));
++    let aggregate_generated_at = manifest
++        .get("aggregateGeneratedAt")
++        .and_then(serde_json::Value::as_str)
++        .unwrap_or("unknown generation");
++    let coverage_status = Some(format!(
++        "AIS snapshot aggregate {aggregate_generated_at}: all-time models/totals use report rows; daily, session, and project detail uses available native batches only; date-filtered cost is native-only.{}",
++        if unavailable_tools.is_empty() { String::new() } else {
++            format!(" Native detail unavailable: {}", unavailable_tools.iter().map(|(tool,count)| format!("{tool}: {count}")).collect::<Vec<_>>().join(", "))
++        }
++    ));
++    *AIS_SHARED_COVERAGE_STATUS
++        .get_or_init(|| Mutex::new(None))
++        .lock()
++        .unwrap() = coverage_status;
++    *AIS_SHARED_PARSED_MANIFEST
++        .get_or_init(|| Mutex::new(None))
++        .lock()
++        .unwrap() = Some((manifest_path.to_path_buf(), manifest));
++    let mut seen = HashSet::new();
++    combined.retain(|message| should_keep_deduped_message(&mut seen, message));
++    if let Some(clients) = options.clients.as_ref() {
++        let requested: HashSet<&str> = clients.iter().map(String::as_str).collect();
++        combined.retain(|message| {
++            retain_for_requested_clients(
++                &message.client,
++                &message.model_id,
++                &message.provider_id,
++                &requested,
++            )
++        });
++    }
++    Ok(filter_unified_messages(combined, options))
++}
++
++/// Coverage note from the most recent shared-snapshot load, for the TUI's
++/// persistent status line. `None` means every manifest partition has a native
++/// batch. It describes omission without inventing native messages.
++pub fn ais_shared_snapshot_coverage_status() -> Option<String> {
++    AIS_SHARED_COVERAGE_STATUS
++        .get_or_init(|| Mutex::new(None))
++        .lock()
++        .unwrap()
++        .clone()
++}
++
+ fn parse_local_unified_messages_resolved(
+     options: LocalParseOptions,
+     home_dir: &str,
+@@ -6495,7 +6936,9 @@ fn parse_local_unified_messages_resolved(
+         &options.scanner_settings,
+         cache_policy,
+     );
+-    Ok(filter_unified_messages(messages, &options))
++    let messages = filter_unified_messages(messages, &options);
++    write_ais_export_if_requested(&messages)?;
++    Ok(messages)
+ }
+ 
+ fn parse_local_unified_messages_deferred_resolved(
+@@ -7925,6 +8368,10 @@ pub async fn parse_local_unified_messages(
+ pub async fn parse_local_unified_messages_deferred(
+     options: LocalParseOptions,
+ ) -> Result<(Vec<UnifiedMessage>, PendingSourceCacheSave), String> {
++    if let Ok(path) = std::env::var("TOKSCALE_AIS_SHARED_SNAPSHOT") {
++        let messages = parse_ais_shared_snapshot(&path, &options)?;
++        return Ok((messages, PendingSourceCacheSave::no_op()));
++    }
+     let (home_dir, clients) = resolve_local_parse_request(&options)?;
+     let pricing = load_pricing_for_local_parse().await;
+     parse_local_unified_messages_deferred_resolved(options, &home_dir, &clients, pricing.as_deref())
+@@ -9384,7 +9831,12 @@ mod tests {
+             + &record("2026-10-01T23:58:05Z", "turn-1", "resp-1", (100, 80, 10))
+             + &token_count("2026-10-01T23:58:05.005Z", (100, 80, 10), (100, 80, 10))
+             + &turn("2026-10-01T23:59:00Z", "turn-2")
+-            + &record("2026-10-01T23:59:59.500Z", "turn-2", "resp-2", (500, 200, 40));
++            + &record(
++                "2026-10-01T23:59:59.500Z",
++                "turn-2",
++                "resp-2",
++                (500, 200, 40),
++            );
+         let next_turn = turn("2026-10-02T00:00:01Z", "turn-3");
+         let tail = token_count("2026-10-02T00:00:01.500Z", (600, 280, 50), (500, 200, 40))
+             + &record("2026-10-02T00:00:05Z", "turn-3", "resp-3", (30, 0, 3))
+@@ -10262,6 +10714,303 @@ mod tests {
+         msg
+     }
+ 
++    #[test]
++    #[serial]
++    fn ais_shared_snapshot_uses_complete_manifest_batches_deduplicates_and_reloads() {
++        use super::{parse_ais_shared_snapshot, AisBatchEnvelope};
++        use sha2::{Digest, Sha256};
++
++        let (_temp, root) = crate::sessions::canonical_tempdir();
++        let usage = root.join("usage");
++        let batch_dir = usage.join("native");
++        std::fs::create_dir_all(&batch_dir).unwrap();
++        let manifest_path = usage.join("snapshot.json");
++        let generation = "2026-10-23T08:00:00.000Z";
++
++        let mut first = make_workspace_message("codex", "gpt-5", "openai", "s1", 2.5, None, None);
++        first.dedup_key = Some("shared-key".into());
++        let mut duplicate =
++            make_workspace_message("claude", "sonnet", "anthropic", "s2", 99.0, None, None);
++        duplicate.dedup_key = Some("shared-key".into());
++        let second = make_workspace_message("pi", "gpt-5", "openai", "s3", 3.0, None, None);
++
++        let write_batch = |partition_id: &str, file_name: &str, messages: Vec<UnifiedMessage>| {
++            let bytes = serde_json::to_vec(&AisBatchEnvelope {
++                schema_version: 1,
++                partition_id: partition_id.into(),
++                generated_at: generation.into(),
++                complete: true,
++                messages,
++            })
++            .unwrap();
++            let path = batch_dir.join(file_name);
++            std::fs::write(&path, &bytes).unwrap();
++            let digest = format!("{:x}", Sha256::digest(&bytes));
++            (path, digest)
++        };
++        let first_id = "a".repeat(64);
++        let second_id = "b".repeat(64);
++        let (first_path, first_digest) = write_batch(&first_id, "p1.json", vec![first, duplicate]);
++        let (second_path, second_digest) = write_batch(&second_id, "p2.json", vec![second.clone()]);
++
++        let manifest = |include_second: bool| {
++            let mut partitions = serde_json::Map::new();
++            partitions.insert("partition-map-key-1".into(), serde_json::json!({ "nativeBatch": {
++                "path": "usage/native/p1.json", "sha256": first_digest, "generatedAt": generation, "partitionId": first_id
++            }, "tool":"codex", "results":[{"provider":"openai","report":{"entries":[{"client":"codex","model":"gpt-5","provider":"openai","input":10,"output":2,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":2.5}]}}]}));
++            if include_second {
++                partitions.insert("partition-map-key-2".into(), serde_json::json!({ "nativeBatch": {
++                    "path": "usage/native/p2.json", "sha256": second_digest, "generatedAt": generation, "partitionId": second_id
++                }, "tool":"pi", "results":[{"provider":"openai","report":{"entries":[{"client":"pi","model":"gpt-5","provider":"openai","input":7,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":3.0}]}}]}));
++            }
++            partitions.insert(
++                "report-only-ali".into(),
++                serde_json::json!({ "tool":"ali", "results":[] }),
++            );
++            partitions.insert(
++                "report-only-zai".into(),
++                serde_json::json!({ "tool":"zai", "results":[] }),
++            );
++            serde_json::json!({ "schemaVersion": 1, "aggregateGeneratedAt": generation, "partitions": partitions, "aggregateResults": [
++                {"provider":"openai","report":{"entries":[{"client":"codex","model":"gpt-5","provider":"openai","input":10,"output":2,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":2.5}]}},
++                {"provider":"openai","report":{"entries":[{"client":"pi","model":"gpt-5","provider":"openai","input":7,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":3.0}]}},
++                {"provider":"alibaba","report":{"entries":[{"client":"ali","model":"qwen","provider":"alibaba","input":11,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":4.0}]}},
++                {"provider":"zai","report":{"entries":[{"client":"zai","model":"glm","provider":"zai","input":13,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,"messageCount":1,"cost":6.0}]}}
++            ] })
++        };
++
++        std::fs::write(
++            &manifest_path,
++            serde_json::to_vec(&manifest(false)).unwrap(),
++        )
++        .unwrap();
++        let first_load = parse_ais_shared_snapshot(
++            &manifest_path.to_string_lossy(),
++            &LocalParseOptions::default(),
++        )
++        .unwrap();
++        assert_eq!(first_load.len(), 1);
++        assert_eq!(first_load[0].cost, 2.5);
++
++        let first_bytes = std::fs::read(&first_path).unwrap();
++        std::fs::remove_file(&first_path).unwrap();
++        let unchanged_generation = parse_ais_shared_snapshot(
++            &manifest_path.to_string_lossy(),
++            &LocalParseOptions::default(),
++        )
++        .unwrap();
++        assert_eq!(unchanged_generation.len(), 1);
++        std::fs::write(&first_path, first_bytes).unwrap();
++
++        std::fs::write(&manifest_path, serde_json::to_vec(&manifest(true)).unwrap()).unwrap();
++        let reloaded = parse_ais_shared_snapshot(
++            &manifest_path.to_string_lossy(),
++            &LocalParseOptions::default(),
++        )
++        .unwrap();
++        assert_eq!(reloaded.len(), 2);
++        assert!(reloaded.iter().any(|message| message.client == "pi"));
++        let report =
++            super::ais_shared_snapshot_report(&manifest_path.to_string_lossy(), None).unwrap();
++        assert_eq!(report["totalInput"], 41);
++        assert_eq!(report["totalMessages"], 4);
++        assert_eq!(report["totalCost"], 15.5);
++        assert_eq!(report["entries"].as_array().unwrap().len(), 4);
++        assert!(report["entries"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|row| row["client"] == "ali"));
++        assert!(report["entries"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|row| row["client"] == "zai"));
++        assert_eq!(report["aggregateGeneratedAt"], generation);
++        assert_eq!(
++            report["detailCoverage"],
++            "manifest-native-batches-listed; not-loaded-by-json"
++        );
++        assert_eq!(
++            report["dateFilteredCostCoverage"],
++            "native-only; not-projected-in-all-time-json"
++        );
++        let pi_report = super::ais_shared_snapshot_report(
++            &manifest_path.to_string_lossy(),
++            Some(&["pi".to_string()]),
++        )
++        .unwrap();
++        assert_eq!(pi_report["totalInput"], 7);
++        assert_eq!(pi_report["entries"].as_array().unwrap().len(), 1);
++        let ali_report = super::ais_shared_snapshot_report(
++            &manifest_path.to_string_lossy(),
++            Some(&["ali".to_string()]),
++        )
++        .unwrap();
++        assert_eq!(ali_report["totalInput"], 11);
++        assert_eq!(ali_report["entries"].as_array().unwrap().len(), 1);
++
++        let pi_only = parse_ais_shared_snapshot(
++            &manifest_path.to_string_lossy(),
++            &LocalParseOptions {
++                clients: Some(vec!["pi".into()]),
++                ..LocalParseOptions::default()
++            },
++        )
++        .unwrap();
++        assert_eq!(pi_only.len(), 1);
++        assert_eq!(pi_only[0].client, "pi");
++
++        let corrupt_bytes = b"corrupt";
++        std::fs::write(&second_path, corrupt_bytes).unwrap();
++        let mut corrupt_manifest = manifest(true);
++        corrupt_manifest["partitions"]["partition-map-key-2"]["nativeBatch"]["sha256"] =
++            serde_json::json!(format!("{:x}", Sha256::digest(corrupt_bytes)));
++        std::fs::write(
++            &manifest_path,
++            serde_json::to_vec(&corrupt_manifest).unwrap(),
++        )
++        .unwrap();
++        let pending_native = parse_ais_shared_snapshot(
++            &manifest_path.to_string_lossy(),
++            &LocalParseOptions::default(),
++        )
++        .unwrap();
++        assert_eq!(pending_native.len(), 1);
++        assert!(super::ais_shared_snapshot_coverage_status()
++            .unwrap()
++            .contains("pi: 1"));
++        let mut missing_aggregate = manifest(true);
++        missing_aggregate
++            .as_object_mut()
++            .unwrap()
++            .remove("aggregateResults");
++        std::fs::write(
++            &manifest_path,
++            serde_json::to_vec(&missing_aggregate).unwrap(),
++        )
++        .unwrap();
++        assert!(
++            super::ais_shared_snapshot_report(&manifest_path.to_string_lossy(), None)
++                .unwrap_err()
++                .contains("aggregateResults")
++        );
++
++        let mut clientless = manifest(true);
++        clientless["aggregateResults"][0]["report"]["entries"][0]
++            .as_object_mut()
++            .unwrap()
++            .remove("client");
++        std::fs::write(&manifest_path, serde_json::to_vec(&clientless).unwrap()).unwrap();
++        assert!(
++            super::ais_shared_snapshot_report(&manifest_path.to_string_lossy(), None)
++                .unwrap_err()
++                .contains("report client")
++        );
++
++        let (_p2, _second_digest) = write_batch(&second_id, "p2.json", vec![second]);
++        let mut unsupported = manifest(true);
++        unsupported["partitions"]["unsupported"] =
++            serde_json::json!({ "tool": "zai", "results": [] });
++        std::fs::write(&manifest_path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
++        let partial = parse_ais_shared_snapshot(
++            &manifest_path.to_string_lossy(),
++            &LocalParseOptions::default(),
++        )
++        .unwrap();
++        assert_eq!(partial.len(), 2);
++        assert!(super::ais_shared_snapshot_coverage_status()
++            .unwrap()
++            .contains("zai: 2"));
++    }
++
++    #[test]
++    #[serial]
++    fn ais_shared_snapshot_native_batch_cache_tracks_only_current_manifest_generation() {
++        use super::{
++            parse_ais_shared_snapshot, AisBatchEnvelope, AIS_SHARED_NATIVE_BATCH_CACHE,
++        };
++        use sha2::{Digest, Sha256};
++
++        let cache = AIS_SHARED_NATIVE_BATCH_CACHE
++            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
++        cache.lock().unwrap().clear();
++
++        let (_temp, root) = crate::sessions::canonical_tempdir();
++        let usage = root.join("usage");
++        let batch_dir = usage.join("native");
++        std::fs::create_dir_all(&batch_dir).unwrap();
++        let manifest_path = usage.join("snapshot.json");
++        let partition_id = "c".repeat(64);
++
++        for generation_index in 0..6 {
++            let generation = format!("2026-10-23T08:00:{generation_index:02}.000Z");
++            let file_name = format!("generation-{generation_index}.json");
++            let batch_path = batch_dir.join(&file_name);
++            let message = make_workspace_message(
++                "codex", "gpt-5", "openai", "cache-test", 1.0 + generation_index as f64,
++                None, None,
++            );
++            let bytes = serde_json::to_vec(&AisBatchEnvelope {
++                schema_version: 1,
++                partition_id: partition_id.clone(),
++                generated_at: generation.clone(),
++                complete: true,
++                messages: vec![message],
++            })
++            .unwrap();
++            std::fs::write(&batch_path, &bytes).unwrap();
++            let digest = format!("{:x}", Sha256::digest(&bytes));
++            let manifest = serde_json::json!({
++                "schemaVersion": 1,
++                "aggregateGeneratedAt": generation,
++                "aggregateResults": [],
++                "partitions": {
++                    "cache-test": {
++                        "tool": "codex",
++                        "results": [],
++                        "nativeBatch": {
++                            "path": format!("usage/native/{file_name}"),
++                            "sha256": digest,
++                            "generatedAt": generation,
++                            "partitionId": partition_id
++                        }
++                    }
++                }
++            });
++            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
++
++            let loaded = parse_ais_shared_snapshot(
++                &manifest_path.to_string_lossy(),
++                &LocalParseOptions::default(),
++            )
++            .unwrap();
++            assert_eq!(loaded.len(), 1);
++            assert_eq!(cache.lock().unwrap().len(), 1, "generation {generation_index}");
++
++            // The exact manifest key must be served from cache even if its
++            // immutable file is temporarily unavailable during a retry.
++            std::fs::remove_file(&batch_path).unwrap();
++            let reused = parse_ais_shared_snapshot(
++                &manifest_path.to_string_lossy(),
++                &LocalParseOptions::default(),
++            )
++            .unwrap();
++            assert_eq!(reused.len(), 1);
++            assert_eq!(cache.lock().unwrap().len(), 1);
++        }
++
++        // Invalid authoritative metadata fails closed and does not mutate the
++        // last successful generation's bounded cache.
++        std::fs::write(&manifest_path, br#"{"schemaVersion":1,"partitions":{}}"#).unwrap();
++        assert!(parse_ais_shared_snapshot(
++            &manifest_path.to_string_lossy(),
++            &LocalParseOptions::default(),
++        )
++        .is_err());
++        assert_eq!(cache.lock().unwrap().len(), 1);
++    }
++
+     fn make_workbuddy_message(
+         session_id: &str,
+         timestamp: i64,
+@@ -24508,8 +25257,8 @@ mod tests {
+             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+             let record = |input| {
+                 format!(
+-            "{{\"type\":\"init\",\"model\":\"gemini-2.5-pro\",\"session_id\":\"session\"}}\n{{\"type\":\"result\",\"stats\":{{\"input_tokens\":{input},\"output_tokens\":5}}}}\n"
+-        )
++                    "{{\"type\":\"init\",\"model\":\"gemini-2.5-pro\",\"session_id\":\"session\"}}\n{{\"type\":\"result\",\"stats\":{{\"input_tokens\":{input},\"output_tokens\":5}}}}\n"
++                )
+             };
+             let scan = || {
+                 parse_all_messages_with_pricing_with_env_strategy(
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -5128,0 +5129,5 @@
++    if std::env::var_os("TOKSCALE_AIS_EXPORT_PATH").is_some() {
++        let source_config = std::env::var_os("TOKSCALE_AIS_SOURCE_CONFIG_DIR")
++            .ok_or("AIS export requires TOKSCALE_AIS_SOURCE_CONFIG_DIR")?;
++        message_cache::seed_ais_claude_cache(std::path::Path::new(&source_config))?;
++    }
+@@ -5136,0 +5137 @@
++    write_ais_export_if_requested(&all_messages)?;
+--- a/crates/tokscale-cli/tests/cli_tests.rs
++++ b/crates/tokscale-cli/tests/cli_tests.rs
+@@ -2360,0 +2361,52 @@
++fn ais_native_export_from_json_model_report_uses_report_parser_vector() {
++    let tmp = create_codex_fixture_dir();
++    let export_path = tmp.path().join("native-batch.json");
++    let partition_id = "a".repeat(64);
++    let output = cmd_with_home(tmp.path())
++        .env("TOKSCALE_AIS_EXPORT_PATH", &export_path)
++        .env("TOKSCALE_AIS_PARTITION_ID", &partition_id)
++        .env(
++            "TOKSCALE_AIS_SOURCE_CONFIG_DIR",
++            tmp.path().join("original-tokscale-config"),
++        )
++        .args(["--json", "--client", "codex", "--no-spinner"])
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "stderr: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++
++    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++    let batch: serde_json::Value = serde_json::from_slice(&fs::read(export_path).unwrap()).unwrap();
++    assert_eq!(batch["schemaVersion"], 1);
++    assert_eq!(batch["partitionId"], partition_id);
++    assert_eq!(batch["complete"], true);
++    let messages = batch["messages"].as_array().unwrap();
++    assert!(!messages.is_empty(), "native batch must contain real parsed rows");
++
++    let sum = |key: &str| -> i64 {
++        messages
++            .iter()
++            .map(|message| message["tokens"][key].as_i64().unwrap_or_default())
++            .sum()
++    };
++    let message_count: i64 = messages
++        .iter()
++        .map(|message| message["message_count"].as_i64().unwrap_or(1))
++        .sum();
++    let total_cost: f64 = messages
++        .iter()
++        .map(|message| message["cost"].as_f64().unwrap_or_default())
++        .sum();
++
++    assert_eq!(report["totalInput"].as_i64().unwrap(), sum("input"));
++    assert_eq!(report["totalOutput"].as_i64().unwrap(), sum("output"));
++    assert_eq!(report["totalCacheRead"].as_i64().unwrap(), sum("cache_read"));
++    assert_eq!(report["totalCacheWrite"].as_i64().unwrap(), sum("cache_write"));
++    assert_eq!(report["totalMessages"].as_i64().unwrap(), message_count);
++    assert!((report["totalCost"].as_f64().unwrap() - total_cost).abs() < 1e-9);
++}
++
++#[test]
+
+diff --git a/crates/tokscale-core/Cargo.toml b/crates/tokscale-core/Cargo.toml
+--- a/crates/tokscale-core/Cargo.toml
++++ b/crates/tokscale-core/Cargo.toml
+@@ -30,6 +30,7 @@
+ sha2 = { workspace = true }
+ libc = { workspace = true }
+ fs2 = { workspace = true }
++tempfile = "3"
+ # Read Chromium's local conversation cache without opening or modifying its DB.
+ leveldb-core = "0.1.2"
+ snap = "1"
+@@ -50,4 +51,3 @@
+ [dev-dependencies]
+ jsonschema = { version = "0.33", default-features = false }
+-tempfile = "3"
+ serial_test = "3"
+diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/src/message_cache.rs
+--- a/crates/tokscale-core/src/message_cache.rs
++++ b/crates/tokscale-core/src/message_cache.rs
+@@ -96,0 +97,195 @@
++
++const AIS_CLAUDE_SEED_MARKER: &str = "ais-claude-cache-seed-v1.json";
++
++#[derive(Debug, serde::Serialize, serde::Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct AisClaudeSeedMarker {
++    schema_version: u32,
++    source_present: bool,
++    imported_shard_count: usize,
++    destination_already_present: bool,
++}
++
++/// Copy only the Claude retained-history namespace from the real Tokscale
++/// profile into the isolated AIS profile. The source is never written to.
++pub(crate) fn seed_ais_claude_cache(source_config_dir: &Path) -> Result<(), String> {
++    seed_ais_claude_cache_between(source_config_dir, &crate::paths::get_cache_dir())
++}
++
++fn seed_ais_claude_cache_between(
++    source_config_dir: &Path,
++    destination_cache: &Path,
++) -> Result<(), String> {
++    let source_cache = source_config_dir.join("cache");
++    let source_shards = source_cache
++        .join(CACHE_SHARD_DIRNAME)
++        .join(ClientId::Claude.as_str());
++    let source_lock = source_cache.join(CACHE_LOCK_FILENAME);
++    ensure_cache_dir(destination_cache)
++        .map_err(|e| format!("AIS Claude cache destination: {e}"))?;
++    let marker_path = destination_cache.join(AIS_CLAUDE_SEED_MARKER);
++    let destination_lock_path = destination_cache.join(CACHE_LOCK_FILENAME);
++    let destination_lock = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create(true)
++        .truncate(false)
++        .open(&destination_lock_path)
++        .map_err(|e| format!("AIS Claude cache destination lock: {e}"))?;
++    fs2::FileExt::lock_exclusive(&destination_lock)
++        .map_err(|e| format!("AIS Claude cache destination lock: {e}"))?;
++
++    match fs::symlink_metadata(&marker_path) {
++        Ok(metadata) if metadata.file_type().is_file() => {
++            let marker: AisClaudeSeedMarker = serde_json::from_reader(
++                File::open(&marker_path)
++                    .map_err(|e| format!("AIS Claude cache seed marker: {e}"))?,
++            )
++            .map_err(|e| format!("AIS Claude cache seed marker is invalid: {e}"))?;
++            if marker.schema_version != 1 {
++                return Err("AIS Claude cache seed marker has unsupported schema".into());
++            }
++            return Ok(());
++        }
++        Ok(_) => return Err("AIS Claude cache seed marker is not a regular file".into()),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++        Err(error) => return Err(format!("AIS Claude cache seed marker: {error}")),
++    }
++
++    let source_present = match fs::symlink_metadata(&source_shards) {
++        Ok(metadata) if metadata.file_type().is_dir() => true,
++        Ok(_) => return Err("AIS Claude source cache namespace is not a real directory".into()),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
++        Err(error) => return Err(format!("AIS Claude source cache namespace: {error}")),
++    };
++    let destination_shards = destination_cache.join(CACHE_SHARD_DIRNAME);
++    let destination_claude = destination_shards.join(ClientId::Claude.as_str());
++    let destination_already_present = match fs::symlink_metadata(&destination_claude) {
++        Ok(metadata) if metadata.file_type().is_dir() => true,
++        Ok(_) => {
++            return Err("AIS Claude cache destination namespace is not a real directory".into())
++        }
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
++        Err(error) => return Err(format!("AIS Claude cache destination namespace: {error}")),
++    };
++
++    let mut imported_shard_count = 0usize;
++    if source_present && !destination_already_present {
++        let lock_metadata = fs::symlink_metadata(&source_lock)
++            .map_err(|e| format!("AIS Claude source cache lock: {e}"))?;
++        if !lock_metadata.file_type().is_file() {
++            return Err("AIS Claude source cache lock is not a regular file".into());
++        }
++        let source_lock_file = OpenOptions::new()
++            .read(true)
++            .open(&source_lock)
++            .map_err(|e| format!("AIS Claude source cache lock: {e}"))?;
++        fs2::FileExt::lock_shared(&source_lock_file)
++            .map_err(|e| format!("AIS Claude source cache lock: {e}"))?;
++
++        let mut shards = Vec::new();
++        for entry in fs::read_dir(&source_shards)
++            .map_err(|e| format!("AIS Claude source cache namespace: {e}"))?
++        {
++            let entry = entry.map_err(|e| format!("AIS Claude source cache shard listing: {e}"))?;
++            let name = entry.file_name();
++            let Some(index) = parse_shard_filename(&name) else {
++                continue;
++            };
++            if name.to_str() != Some(shard_filename(index).as_str()) {
++                continue;
++            }
++            let metadata = fs::symlink_metadata(entry.path())
++                .map_err(|e| format!("AIS Claude source shard metadata: {e}"))?;
++            if !metadata.file_type().is_file() {
++                return Err("AIS Claude source shard is not a regular file".into());
++            }
++            match read_shard(&entry.path(), CacheIdentity::for_client(ClientId::Claude)) {
++                ShardReadStatus::Loaded(_) | ShardReadStatus::Migrated(_) => {}
++                ShardReadStatus::Missing => {
++                    return Err("AIS Claude source shard disappeared during seed".into())
++                }
++                ShardReadStatus::Stale => {
++                    return Err("AIS Claude source shard has a stale parser version".into())
++                }
++                ShardReadStatus::Invalid(error) => {
++                    return Err(format!("AIS Claude source shard is invalid: {error}"))
++                }
++            }
++            shards.push((index, entry.path()));
++        }
++        shards.sort_by_key(|(index, _)| *index);
++
++        ensure_cache_dir(&destination_shards)
++            .map_err(|e| format!("AIS Claude cache destination shard directory: {e}"))?;
++        let staged = tempfile::Builder::new()
++            .prefix(".ais-claude-seed-")
++            .tempdir_in(&destination_shards)
++            .map_err(|e| format!("AIS Claude cache seed staging: {e}"))?;
++        for (index, source) in &shards {
++            let mut input =
++                File::open(source).map_err(|e| format!("AIS Claude source shard read: {e}"))?;
++            let target = staged.path().join(shard_filename(*index));
++            let mut output_options = OpenOptions::new();
++            output_options.write(true).create_new(true);
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::OpenOptionsExt;
++                output_options.mode(0o600);
++            }
++            let mut output = output_options
++                .open(&target)
++                .map_err(|e| format!("AIS Claude staged shard create: {e}"))?;
++            std::io::copy(&mut input, &mut output)
++                .and_then(|_| output.sync_all())
++                .map_err(|e| format!("AIS Claude staged shard copy: {e}"))?;
++            imported_shard_count += 1;
++        }
++        if destination_claude.exists() {
++            return Err("AIS Claude cache destination appeared during seed".into());
++        }
++        fs::rename(staged.path(), &destination_claude)
++            .map_err(|e| format!("AIS Claude cache seed publish: {e}"))?;
++        File::open(&destination_shards)
++            .and_then(|dir| dir.sync_all())
++            .map_err(|e| format!("AIS Claude cache seed directory sync: {e}"))?;
++    }
++
++    let marker = AisClaudeSeedMarker {
++        schema_version: 1,
++        source_present,
++        imported_shard_count,
++        destination_already_present,
++    };
++    let marker_temp = destination_cache.join(format!(
++        ".{AIS_CLAUDE_SEED_MARKER}.{}.tmp",
++        std::process::id()
++    ));
++    let mut marker_options = OpenOptions::new();
++    marker_options.write(true).create_new(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        marker_options.mode(0o600);
++    }
++    let mut marker_file = marker_options
++        .open(&marker_temp)
++        .map_err(|e| format!("AIS Claude cache seed marker temp: {e}"))?;
++    let write_result = serde_json::to_writer(&mut marker_file, &marker)
++        .map_err(std::io::Error::other)
++        .and_then(|_| marker_file.sync_all());
++    if let Err(error) = write_result {
++        drop(marker_file);
++        let _ = fs::remove_file(&marker_temp);
++        return Err(format!("AIS Claude cache seed marker write: {error}"));
++    }
++    drop(marker_file);
++    if let Err(error) = fs::rename(&marker_temp, &marker_path) {
++        let _ = fs::remove_file(&marker_temp);
++        return Err(format!("AIS Claude cache seed marker publish: {error}"));
++    }
++    File::open(destination_cache)
++        .and_then(|dir| dir.sync_all())
++        .map_err(|e| format!("AIS Claude cache seed marker directory sync: {e}"))?;
++    Ok(())
++}
+@@ -5316,0 +5512,117 @@
++    fn ais_shared_snapshot_claude_seed_preserves_history_for_only_matching_profile_and_is_idempotent(
++    ) {
++        let source_home = TempDir::new().unwrap();
++        let destination_home = TempDir::new().unwrap();
++        let profile_a = source_home.path().join("profile-a");
++        let profile_b = source_home.path().join("profile-b");
++        std::fs::create_dir_all(&profile_a).unwrap();
++        std::fs::create_dir_all(&profile_b).unwrap();
++        let source_a = profile_a.join("session-a.jsonl");
++        std::fs::write(&source_a, b"retained profile a").unwrap();
++        let index_a = CacheKey::new(CacheIdentity::for_client(ClientId::Claude), &source_a)
++            .shard()
++            .index;
++        let source_b = (0..CACHE_SHARD_COUNT)
++            .map(|index| profile_b.join(format!("session-b-{index}.jsonl")))
++            .find(|path| {
++                CacheKey::new(CacheIdentity::for_client(ClientId::Claude), path)
++                    .shard()
++                    .index
++                    != index_a
++            })
++            .expect("find a profile-b path in a distinct cache shard");
++        std::fs::write(&source_b, b"retained profile b").unwrap();
++        let identity = CacheIdentity::for_client(ClientId::Claude);
++        let index_b = CacheKey::new(identity, &source_b).shard().index;
++        assert_ne!(index_a, index_b);
++        let mut entry_a = test_entry(identity, &source_a, "retained-a");
++        let mut entry_b = test_entry(identity, &source_b, "retained-b");
++        entry_a.fallback_timestamp_indices = vec![0];
++        entry_b.fallback_timestamp_indices = vec![0];
++        std::fs::remove_file(&source_a).unwrap();
++        std::fs::remove_file(&source_b).unwrap();
++
++        let source_config = source_home.path().join("original-config");
++        let source_cache = source_config.join("cache");
++        let source_namespace = source_cache
++            .join(CACHE_SHARD_DIRNAME)
++            .join(ClientId::Claude.as_str());
++        ensure_cache_dir(&source_namespace).unwrap();
++        std::fs::write(source_cache.join(CACHE_LOCK_FILENAME), b"").unwrap();
++        write_shard_with_limit(
++            &source_namespace.join(shard_filename(index_a)),
++            identity,
++            &[entry_a],
++            MAX_CACHE_SHARD_BYTES,
++        )
++        .unwrap();
++        write_shard_with_limit(
++            &source_namespace.join(shard_filename(index_b)),
++            identity,
++            &[entry_b],
++            MAX_CACHE_SHARD_BYTES,
++        )
++        .unwrap();
++
++        let _env = sandbox_cache_env(destination_home.path());
++        let destination_cache = cache_dir().unwrap();
++        seed_ais_claude_cache_between(&source_config, &destination_cache).unwrap();
++        let destination_namespace = destination_cache
++            .join(CACHE_SHARD_DIRNAME)
++            .join(ClientId::Claude.as_str());
++        let seeded_bytes = [index_a, index_b]
++            .map(|index| std::fs::read(destination_namespace.join(shard_filename(index))).unwrap());
++        assert_eq!(
++            serde_json::from_reader::<_, AisClaudeSeedMarker>(
++                File::open(destination_cache.join(AIS_CLAUDE_SEED_MARKER)).unwrap()
++            )
++            .unwrap()
++            .imported_shard_count,
++            2
++        );
++
++        let cache = SourceMessageCache::load();
++        assert_eq!(cache.missing_claude_history(&[profile_a.clone()]).len(), 1);
++        assert_eq!(cache.missing_claude_history(&[profile_b.clone()]).len(), 1);
++        assert_eq!(
++            cache.missing_claude_history(&[profile_a, profile_b]).len(),
++            2
++        );
++
++        std::fs::write(
++            source_namespace.join(shard_filename(index_a)),
++            b"changed after seed",
++        )
++        .unwrap();
++        seed_ais_claude_cache_between(&source_config, &destination_cache).unwrap();
++        assert_eq!(
++            [index_a, index_b].map(|index| {
++                std::fs::read(destination_namespace.join(shard_filename(index))).unwrap()
++            }),
++            seeded_bytes
++        );
++    }
++
++    #[test]
++    #[serial_test::serial]
++    fn ais_shared_snapshot_claude_seed_records_success_when_original_cache_is_absent() {
++        let source_home = TempDir::new().unwrap();
++        let destination_home = TempDir::new().unwrap();
++        let _env = sandbox_cache_env(destination_home.path());
++        let destination_cache = cache_dir().unwrap();
++        seed_ais_claude_cache_between(
++            &source_home.path().join("missing-original-config"),
++            &destination_cache,
++        )
++        .unwrap();
++        let marker: AisClaudeSeedMarker = serde_json::from_reader(
++            File::open(destination_cache.join(AIS_CLAUDE_SEED_MARKER)).unwrap(),
++        )
++        .unwrap();
++        assert!(!marker.source_present);
++        assert_eq!(marker.imported_shard_count, 0);
++        assert!(!marker.destination_already_present);
++    }
++
++    #[test]
++    #[serial_test::serial]
+diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs

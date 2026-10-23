@@ -104,6 +104,17 @@ export async function runCli(argv: string[]): Promise<void> {
           await runScanWorkerStdio();
           break;
         }
+      case "__usage_snapshot_daemon":
+        // Kept out of the ordinary CLI startup graph. The host service
+        // supervises this persistent dirty-marker/TTL producer.
+        {
+          // Service installation can probe the exact entrypoint without
+          // starting a long-running process.
+          if (boolFlag(flags, "check")) break;
+          const { runUsageSnapshotDaemon } = await import("../server/workers.ts");
+          await runUsageSnapshotDaemon();
+          break;
+        }
       case "__spend_refresh":
         // Same dynamic-import discipline as __scan_worker: the spend
         // refresh drags the AWS SDK clients in, which must never load in

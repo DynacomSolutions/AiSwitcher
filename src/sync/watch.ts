@@ -3,6 +3,7 @@ import { join, relative, sep } from "node:path";
 import { expandPath } from "../identities/match.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { startBackgroundProfileSync } from "./background.ts";
+import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
 
 const DEBOUNCE_MS = 3_000;
 // How often the identity tree is re-scanned for sync-relevant changes.
@@ -132,7 +133,12 @@ export function startProfileSyncWatcher(
         const next = await scanTree(root);
         const previous = snapshots.get(root);
         snapshots.set(root, next);
-        if (previous && snapshotsDiffer(previous, next)) schedule();
+        if (previous && snapshotsDiffer(previous, next)) {
+          schedule();
+          try {
+            markUsageSnapshotDirty(usageSnapshotTargetKey(cfg.toolName, identityName));
+          } catch { /* source freshness must never interfere with the agent */ }
+        }
       } catch {}
     }
     if (!stopped) {

@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PollCache } from "./expensive.ts";
 import { aisCacheDir } from "../shared/ais-home.ts";
@@ -8,6 +8,11 @@ import { tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
 import { scanMetric } from "./scan-metrics.ts";
+import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
+import { externalUsageCollectorOwnsRefreshes, USAGE_SNAPSHOT_REFRESH_INTERVAL_MS } from "../cli/usage/snapshot.ts";
+import { defaultOpencodeProfileDbPath } from "../cli/usage/opencode-usage.ts";
+import { requestStaleUsageBreakdowns, refreshQueuedUsageBreakdowns } from "../cli/usage/breakdown-snapshot.ts";
+import { runBreakdownQuery } from "../cli/usage/breakdown.ts";
 
 /** Child-process runner for expensive scans. Every scan executes in a fresh
  * `ais __scan_worker` child (same entrypoint trick as the web daemon:
@@ -22,35 +27,13 @@ export interface ScanSpawn {
   requestedPort?: undefined;
 }
 
-/** DAEMON-side result caches for the poll-heavy scans. The child is
- * short-lived, so scan-worker.ts's own PollCache can never carry a result
- * across HTTP requests; these hold it in the daemon instead.
- *
- * usage/limits/breakdown used to skip this entirely: only tree/transcript
- * were cached here, so every /api/usage and /api/limits request (WebUI
- * polls both on an interval, plus react-query's own refetch-on-focus/
- * reconnect) spawned a brand-new `__scan_worker` child that re-ran the full
- * scan from scratch - including, for usage, a fresh tokscale invocation
- * per target (main report + hourly) PLUS the (now-fixed, see
- * cli/usage/tokscale.ts) `--version` cache-freshness check, every single
- * time. scan-worker.ts's own module-level PollCache instances for these
- * kinds were never actually reachable across requests (a new process means
- * a new module scope), so the "cached" flag they produced was always a lie.
- * Bringing usage/limits/breakdown into this SAME daemon-side cache (the
- * mechanism tree/transcript already use, and the one scan-worker.ts's own
- * doc comments describe as the intended design) is what makes repeated
- * polls inside the TTL actually skip the child entirely, instead of
- * silently re-scanning every time. The transcript TTL is deliberately just
- * under the WebUI's 3s chat poll: a poll is cheap (no child spawned) while
- * appended lines surface within one interval, keeping an in-progress
- * transcript live. usage/limits TTLs match the values scan-worker.ts's own
- * (previously dead) caching already documented as the intended budget. */
+/** Request-local SWR caches for tree, transcript, sessions and limits.
+ * Usage and breakdown have durable shared stores with collector-owned
+ * refreshes, so this process cache must not mask their freshness state. */
 const treeCache = new PollCache(15_000);
 const transcriptCache = new PollCache(4_000);
 const sessionsCache = new PollCache(15_000);
-const usageCache = new PollCache(45_000, join(aisCacheDir(), "swr", "usage"));
 const limitsCache = new PollCache(45_000);
-const breakdownCache = new PollCache(60_000, join(aisCacheDir(), "swr", "breakdown"));
 
 async function pendingPayload(kind: "usage" | "breakdown", params: Omit<ScanRequest, "kind">): Promise<ScanResult<unknown>> {
   let results: unknown[] = [];
@@ -77,12 +60,8 @@ function cacheFor(kind: ScanKind): PollCache | undefined {
       return transcriptCache;
     case "sessions":
       return sessionsCache;
-    case "usage":
-      return usageCache;
     case "limits":
       return limitsCache;
-    case "breakdown":
-      return breakdownCache;
     default:
       return undefined;
   }
@@ -96,7 +75,7 @@ function cacheFor(kind: ScanKind): PollCache | undefined {
  * scan-worker.ts's own limitsEnvelope did) rather than the fixed default,
  * since that is a documented API parameter, not an internal cache detail. */
 async function cachedScan<T>(
-  kind: "tree" | "transcript" | "usage" | "limits" | "breakdown" | "sessions",
+  kind: "tree" | "transcript" | "limits" | "sessions",
   params: Omit<ScanRequest, "kind">,
   timeoutMs: number,
 ): Promise<ScanResult<T>> {
@@ -112,13 +91,10 @@ async function cachedScan<T>(
   // minutes; tree/sessions walk every transcript): serve the last-good value
   // immediately and refresh in the background. Only usage/breakdown have a
   // "pending" seed; a cold tree/sessions request waits for its first scan.
-  if (kind === "usage" || kind === "breakdown" || kind === "tree" || kind === "sessions") {
+  if (kind === "tree" || kind === "sessions") {
     let swr;
     try {
       swr = await cache.getSwr(key, fetcher, undefined, {
-        ...(kind === "usage" || kind === "breakdown"
-          ? { pending: () => pendingPayload(kind, params) as Promise<ScanResult<T>> }
-          : {}),
       });
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error), status: error instanceof CliUsageError ? 400 : 500 };
@@ -162,13 +138,11 @@ function baseArgs(): string[] {
   return setsid ? [setsid, ...inner] : inner;
 }
 
-/** Every poll-driven kind (tree/transcript, and now usage/limits/
- * breakdown) serves repeats from the daemon cache instead of spawning a
- * fresh child per request; see cachedScan's doc comment above. "sessions"
- * is cached with the same stale-while-revalidate read as tree. Exported as a pure predicate so the routing
+/** Tree/transcript/sessions/limits use request-local SWR. Usage and
+ * breakdown read shared snapshot stores instead. Exported as a pure predicate so the routing
  * decision itself is unit-testable without spawning anything. */
-const CACHED_SCAN_KINDS = new Set<ScanKind>(["tree", "transcript", "usage", "limits", "breakdown", "sessions"]);
-export function isCachedScanKind(kind: ScanKind): kind is "tree" | "transcript" | "usage" | "limits" | "breakdown" | "sessions" {
+const CACHED_SCAN_KINDS = new Set<ScanKind>(["tree", "transcript", "limits", "sessions"]);
+export function isCachedScanKind(kind: ScanKind): kind is "tree" | "transcript" | "limits" | "sessions" {
   return CACHED_SCAN_KINDS.has(kind);
 }
 
@@ -181,15 +155,141 @@ export function scanTimeoutAboveTokscale(baseMs: number): number {
 }
 
 let warmed = false;
+let snapshotSampler: ReturnType<typeof setInterval> | undefined;
+let snapshotSourcePoller: ReturnType<typeof setInterval> | undefined;
+let snapshotRefreshInFlight: Promise<unknown> | undefined;
+let collectorCycleInFlight: Promise<void> | undefined;
+let snapshotSourcePollInFlight: Promise<void> | undefined;
+let knownOpencodeDbSignatures = new Map<string, string>();
 
-/** Daemon start: one background refresh of the keys the TUI and web request by
- * default (/api/usage, /api/usage/breakdown?days=30), so the cache is warm
- * before the first client. Never awaited; the scan limiter still applies. */
+function dbSignature(path: string): string {
+  try {
+    const info = statSync(path);
+    const device = Reflect.get(info, "dev");
+    return `${device}:${info.ino}:${info.size}:${info.mtimeMs}`;
+  } catch {
+    return "absent";
+  }
+}
+
+/** SQLite sources are intentionally outside the sync watcher's bounded
+ * directory snapshots. Probe only the known database and WAL paths, never
+ * enumerate their transcript trees. A changed signature marks its source
+ * partition dirty; the two-minute collector spacing coalesces active writes. */
+async function pollKnownUsageDatabases(): Promise<void> {
+  let targets;
+  try {
+    targets = await collectTargets({ tool: "opencode" });
+  } catch {
+    return; // discovery errors must not turn into deletions or marker churn
+  }
+  const sources = [
+    { key: "special:opencode-default", db: defaultOpencodeProfileDbPath() },
+    ...targets.map((target) => ({
+      key: usageSnapshotTargetKey(target.toolName, target.identity.name),
+      db: join(target.identity.configDir, "data", "opencode", "opencode.db"),
+    })),
+  ];
+  const next = new Map<string, string>();
+  for (const source of sources) {
+    const signature = `${dbSignature(source.db)}|${dbSignature(`${source.db}-wal`)}`;
+    next.set(source.key, signature);
+    const prior = knownOpencodeDbSignatures.get(source.key);
+    if (prior !== undefined && prior !== signature) {
+      try { markUsageSnapshotDirty(source.key); } catch { /* periodic TTL remains the safety fallback */ }
+    }
+  }
+  // Keep disappeared identities' baseline for one cycle so a transient
+  // registry error cannot silently forget their source history.
+  for (const [key, signature] of knownOpencodeDbSignatures) {
+    if (!next.has(key)) next.set(key, signature);
+  }
+  knownOpencodeDbSignatures = next;
+}
+
+export function startUsageSnapshotSourcePoller(intervalMs = 15_000): void {
+  if (snapshotSourcePoller) return;
+  knownOpencodeDbSignatures.clear();
+  const poll = () => {
+    if (snapshotSourcePollInFlight) return;
+    snapshotSourcePollInFlight = pollKnownUsageDatabases().finally(() => { snapshotSourcePollInFlight = undefined; });
+  };
+  poll();
+  snapshotSourcePoller = setInterval(poll, intervalMs);
+}
+
+export function stopUsageSnapshotSourcePoller(): void {
+  if (snapshotSourcePoller) clearInterval(snapshotSourcePoller);
+  snapshotSourcePoller = undefined;
+}
+
+function scheduleUsageSnapshotRefresh(run: typeof runScanIsolated): void {
+  if (collectorCycleInFlight) return;
+  collectorCycleInFlight = (async () => {
+    // The collector owns the default window even when no UI has requested it.
+    // This only queues a marker when its durable last-good cache is missing or stale.
+    requestStaleUsageBreakdowns();
+    if (!snapshotRefreshInFlight) {
+      snapshotRefreshInFlight = run("usageSnapshotRefresh", {}, scanTimeoutAboveTokscale(60_000))
+        .catch(() => undefined)
+        .finally(() => { snapshotRefreshInFlight = undefined; });
+    }
+    await snapshotRefreshInFlight;
+    await refreshQueuedUsageBreakdowns(
+      (query) => scanWorkerLimiter.run(() => runBreakdownQuery(query)),
+    ).catch(() => 0);
+  })().finally(() => { collectorCycleInFlight = undefined; });
+}
+
+/** One bounded background collector per daemon. Busy ticks are dropped, so
+ * a slow source scan cannot build an unbounded queue of full history reads. */
+export function startUsageSnapshotSampler(
+  run: typeof runScanIsolated = runScanIsolated,
+  intervalMs = USAGE_SNAPSHOT_REFRESH_INTERVAL_MS,
+): void {
+  if (snapshotSampler) return;
+  scheduleUsageSnapshotRefresh(run);
+  snapshotSampler = setInterval(() => scheduleUsageSnapshotRefresh(run), intervalMs);
+}
+
+export function stopUsageSnapshotSampler(): void {
+  if (snapshotSampler) clearInterval(snapshotSampler);
+  snapshotSampler = undefined;
+  stopUsageSnapshotSourcePoller();
+}
+
+/** Long-running host producer entrypoint. A service manager supervises this
+ * command; SIGTERM stops new ticks and waits for the one bounded collector
+ * already in flight before returning. */
+export async function runUsageSnapshotDaemon(): Promise<void> {
+  const markerPath = join(aisCacheDir(), "usage", "collector.external");
+  mkdirSync(join(aisCacheDir(), "usage"), { recursive: true, mode: 0o700 });
+  writeFileSync(markerPath, `${process.pid}\n`, { mode: 0o600 });
+  chmodSync(markerPath, 0o600);
+  let stop!: () => void;
+  const stopped = new Promise<void>((resolve) => { stop = resolve; });
+  const onSignal = () => {
+    stopUsageSnapshotSampler();
+    void (collectorCycleInFlight ?? snapshotRefreshInFlight ?? Promise.resolve()).finally(stop);
+  };
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
+  startUsageSnapshotSourcePoller();
+  requestStaleUsageBreakdowns();
+  startUsageSnapshotSampler();
+  await stopped;
+  process.off("SIGTERM", onSignal);
+  process.off("SIGINT", onSignal);
+}
+
+/** Web start: enqueue the default breakdown window. A supervised external
+ * collector owns production scans; an unmanaged daemon may run the bounded
+ * sampler as a fallback. */
 export function warmUsageCaches(run: typeof runScanIsolated = runScanIsolated): void {
   if (warmed) return;
   warmed = true;
-  void run("usage", {}, scanTimeoutAboveTokscale(60_000)).catch(() => undefined);
-  void run("breakdown", { days: 30 }, scanTimeoutAboveTokscale(240_000)).catch(() => undefined);
+  requestStaleUsageBreakdowns();
+  if (!externalUsageCollectorOwnsRefreshes()) startUsageSnapshotSampler(run);
 }
 
 export async function runScanIsolated<T>(

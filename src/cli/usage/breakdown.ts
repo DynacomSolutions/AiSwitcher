@@ -1,4 +1,5 @@
 import { isRetired } from "../../identities/retired.ts";
+import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
@@ -71,6 +72,8 @@ export interface BreakdownResult {
   categories: BreakdownCategory[];
   /** Set when the tool's local logs cannot support a per-call breakdown. */
   unavailable?: string;
+  /** A source failed while streaming after discovery. Partial totals are not cacheable. */
+  sourceError?: "source-error";
   /** Non-fatal notes (models with tokens but no list price, and so on). */
   notes?: string[];
 }
@@ -85,6 +88,40 @@ export interface BreakdownDeps extends LocalEstimateDeps {
 export const DEFAULT_BREAKDOWN_DAYS = 30;
 export const MIN_BREAKDOWN_DAYS = 1;
 export const MAX_BREAKDOWN_DAYS = 365;
+
+function isMissingPath(error: unknown): boolean {
+  return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
+}
+
+function listingDeps(deps: BreakdownDeps, sourceFailure: { value: boolean }): BreakdownDeps {
+  return {
+    ...deps,
+    readdir(path) {
+      try {
+        return deps.readdir ? deps.readdir(path) : readdirSync(path, { encoding: "utf8" });
+      } catch (error) {
+        if (!isMissingPath(error)) sourceFailure.value = true;
+        throw error;
+      }
+    },
+    isDirectory(path) {
+      try {
+        return deps.isDirectory ? deps.isDirectory(path) : statSync(path).isDirectory();
+      } catch (error) {
+        if (!isMissingPath(error)) sourceFailure.value = true;
+        throw error;
+      }
+    },
+    mtimeMs(path) {
+      try {
+        return deps.mtimeMs ? deps.mtimeMs(path) : statSync(path).mtimeMs;
+      } catch (error) {
+        if (!isMissingPath(error)) sourceFailure.value = true;
+        throw error;
+      }
+    },
+  };
+}
 
 export function clampBreakdownDays(days: number): number {
   if (!Number.isFinite(days)) return DEFAULT_BREAKDOWN_DAYS;
@@ -366,10 +403,12 @@ async function collectClaudeBreakdown(
   identity: Identity,
   windowStartMs: number,
   deps: BreakdownDeps,
-): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean }> {
-  const { files, unreadable } = listRecentFiles(join(identity.configDir, "projects"), new Date(windowStartMs), deps, false);
+): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
+  const sourceFailure = { value: false };
+  const { files, unreadable } = listRecentFiles(join(identity.configDir, "projects"), new Date(windowStartMs), listingDeps(deps, sourceFailure), false);
   const acc = new BreakdownAccumulator();
   const readLines = deps.readLines ?? streamLines;
+  let sourceError = sourceFailure.value;
   for (const file of files) {
     try {
       for await (const line of readLines(file)) {
@@ -410,12 +449,14 @@ async function collectClaudeBreakdown(
           acc.countCall(classified.kind, classified.detail, atMs, classified.server);
         });
       }
-    } catch {
-      // A file that vanished or became unreadable mid-scan: keep the rest.
+    } catch (readError) {
+      // The result may still be useful to display, but it is incomplete and
+      // must not replace a persisted last-good snapshot.
+      if (!isMissingPath(readError)) sourceError = true;
     }
   }
   const finished = acc.finish();
-  return { ...finished, filesRead: files.length, unreadable };
+  return { ...finished, filesRead: files.length, unreadable, sourceError };
 }
 
 /* -------------------------------- codex ----------------------------------- */
@@ -460,10 +501,12 @@ async function collectCodexBreakdown(
   identity: Identity,
   windowStartMs: number,
   deps: BreakdownDeps,
-): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean }> {
-  const { files, unreadable } = listRecentFiles(join(identity.configDir, "sessions"), new Date(windowStartMs), deps, true);
+): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
+  const sourceFailure = { value: false };
+  const { files, unreadable } = listRecentFiles(join(identity.configDir, "sessions"), new Date(windowStartMs), listingDeps(deps, sourceFailure), true);
   const acc = new BreakdownAccumulator();
   const readLines = deps.readLines ?? streamLines;
+  let sourceError = sourceFailure.value;
 
   for (const file of files) {
     let model = "unknown";
@@ -555,14 +598,16 @@ async function collectCodexBreakdown(
           turn.pendingOutput.push({ model, output: usage.output_tokens ?? 0, atMs });
         }
       }
-    } catch {
-      // Unreadable mid-scan: keep the rest of the scan.
+    } catch (readError) {
+      // Keep any partial display rows, while marking the generation unsafe
+      // for replacement of a persisted last-good snapshot.
+      if (!isMissingPath(readError)) sourceError = true;
     }
     flushTurn();
   }
 
   const finished = acc.finish();
-  return { ...finished, filesRead: files.length, unreadable };
+  return { ...finished, filesRead: files.length, unreadable, sourceError };
 }
 
 /* ------------------------------ unavailable -------------------------------- */
@@ -620,6 +665,9 @@ export async function collectIdentityBreakdown(
     // A tool added to the registry before this module learned about it.
     return { ...meta, filesRead: 0, categories: [], unavailable: `no breakdown reader for tool "${toolName}"` };
   }
+  if (outcome.sourceError) {
+    return { ...meta, filesRead: outcome.filesRead, categories: outcome.categories, sourceError: "source-error" };
+  }
   if (outcome.unreadable) {
     return { ...meta, filesRead: 0, categories: [], unavailable: "no local session logs found for this identity" };
   }
@@ -628,6 +676,7 @@ export async function collectIdentityBreakdown(
     ...meta,
     filesRead: outcome.filesRead,
     categories: outcome.categories,
+    ...(outcome.sourceError ? { sourceError: "source-error" as const } : {}),
     ...(note ? { notes: [note] } : {}),
   };
 }
