@@ -4,6 +4,7 @@ import { CliUsageError } from "../errors.ts";
 import { collectTargets, shouldIncludeDefaultOpencodeProfile } from "./run.ts";
 import {
   prepareMergedPassthrough,
+  resolveAisTokscaleSharedTui,
   resolveTokscaleCommand,
   tokscaleInvocationFor,
 } from "./tokscale.ts";
@@ -35,6 +36,18 @@ import {
  * configured for more than one tool.
  */
 export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: string[]): Promise<never> {
+  if (tokscaleArgs[0] === "tui") {
+    if (stringFlag(flags, "identity")) {
+      throw new CliUsageError("AIS shared-snapshot TUI displays all manifest-listed identities; --identity cannot select one partition.");
+    }
+    let shared: Awaited<ReturnType<typeof resolveAisTokscaleSharedTui>>;
+    try {
+      shared = await resolveAisTokscaleSharedTui();
+    } catch (error) {
+      throw new CliUsageError(error instanceof Error ? error.message : String(error));
+    }
+    return execReal(shared.command, [...tokscaleArgs, ...shared.args], {});
+  }
   const [cmd, ...prefixArgs] = resolveTokscaleCommand();
   const identityFilter = stringFlag(flags, "identity");
 

@@ -6,9 +6,11 @@ import { writeZaiAuthFile } from "../../../src/identities/zai-auth.ts";
 import { defaultOpencodeProfileDbPath } from "../../../src/cli/usage/opencode-usage.ts";
 import {
   buildMergedEnv,
+  buildAisTokscaleExportInvocation,
   dailyUsageFromHourlyEntries,
   findCachedTokscaleBinary,
   prepareMergedPassthrough,
+  resolveAisTokscaleSharedTui,
   shouldRefreshTokscaleCache,
   tokscaleInvocationFor,
   tokscalePlatformVariants,
@@ -26,6 +28,64 @@ function identity(configDir: string): Identity {
 const tempDirs: string[] = [];
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+describe("resolveAisTokscaleSharedTui", () => {
+  test("uses an executable pinned binary and authoritative manifest path", async () => {
+    const result = await resolveAisTokscaleSharedTui({ AIS_TOKSCALE_SHARED_BIN: process.execPath });
+    expect(result.command).toBe(process.execPath);
+    expect(result.args).toEqual(["--ais-shared-snapshot", expect.stringMatching(/\/\.ais\/cache\/usage\/snapshot\.json$/)]);
+  });
+
+  test("honours only an absolute existing executable override", async () => {
+    expect((await resolveAisTokscaleSharedTui({ AIS_TOKSCALE_SHARED_BIN: process.execPath })).command).toBe(process.execPath);
+    await expect(resolveAisTokscaleSharedTui({ AIS_TOKSCALE_SHARED_BIN: "tokscale" })).rejects.toThrow("must be an absolute path");
+    await expect(resolveAisTokscaleSharedTui({ AIS_TOKSCALE_SHARED_BIN: "/missing/ais-tokscale" })).rejects.toThrow("missing or not executable");
+  });
+});
+
+describe("buildAisTokscaleExportInvocation", () => {
+  test("builds an exact identity-scoped native parser export without ambient extra dirs", async () => {
+    const signal = new AbortController().signal;
+    const result = await buildAisTokscaleExportInvocation({
+      toolName: "claude",
+      identity: identity("/profiles/claude/pool-a"),
+      partitionId: "a".repeat(64),
+      exportPath: "/cache/usage/native/attempt.json",
+      signal,
+    }, { AIS_TOKSCALE_SHARED_BIN: process.execPath });
+    expect(result).toEqual({
+      command: process.execPath,
+      args: ["--client", "claude"],
+      env: {
+        CLAUDE_CONFIG_DIR: "/profiles/claude/pool-a",
+        TOKSCALE_EXTRA_DIRS: "",
+        TOKSCALE_CONFIG_DIR: expect.stringMatching(/\/\.ais\/cache\/usage\/native-tokscale\/isolated-config$/),
+        TOKSCALE_AIS_EXPORT_PATH: "/cache/usage/native/attempt.json",
+        TOKSCALE_AIS_PARTITION_ID: "a".repeat(64),
+      },
+      cwd: process.cwd(),
+      signal,
+    });
+  });
+
+  test("uses only the default OpenCode data root and marks non-native clients unsupported", async () => {
+    const result = await buildAisTokscaleExportInvocation({
+      toolName: "opencode",
+      partitionId: "b".repeat(64),
+      exportPath: "/cache/usage/native/default.json",
+    }, { AIS_TOKSCALE_SHARED_BIN: process.execPath });
+    expect(result?.args).toEqual(["--client", "opencode"]);
+    expect(result?.env.XDG_DATA_HOME).toBe(dirname(dirname(defaultOpencodeProfileDbPath())));
+    expect(result?.env.TOKSCALE_EXTRA_DIRS).toBe("");
+    expect(result?.env.TOKSCALE_CONFIG_DIR).toMatch(/\/\.ais\/cache\/usage\/native-tokscale\/isolated-config$/);
+    expect(await buildAisTokscaleExportInvocation({
+      toolName: "ali",
+      identity: identity("/profiles/ali/a"),
+      partitionId: "c".repeat(64),
+      exportPath: "/cache/usage/native/ali.json",
+    }, { AIS_TOKSCALE_SHARED_BIN: process.execPath })).toBeUndefined();
+  });
 });
 
 async function makeConfigDir(): Promise<string> {
@@ -94,6 +154,12 @@ describe("tokscaleInvocationFor", () => {
     expect(clientArgs).toEqual(["--client", "opencode"]);
   });
 
+  test("pi: scopes native Tokscale to the AIS profile directory", async () => {
+    const { env, clientArgs } = (await tokscaleInvocationFor("pi", identity("/home/user/.pi/identities/identity-a")))!;
+    expect(env).toEqual({ PI_CODING_AGENT_DIR: "/home/user/.pi/identities/identity-a" });
+    expect(clientArgs).toEqual(["--client", "pi"]);
+  });
+
   test("zai: sets ZAI_API_KEY from the identity's own crush.json, not a directory scan, and no --client (never a valid value for zai)", async () => {
     const configDir = await makeConfigDir();
     await writeZaiAuthFile(configDir, "sk-zai-key");
@@ -119,8 +185,10 @@ describe("tokscaleInvocationFor", () => {
     expect(await tokscaleInvocationFor("ali", identity(configDir))).toBeUndefined();
   });
 
-  test("pi: returns undefined because AIS reads Pi's provider-tagged JSONL directly", async () => {
-    expect(await tokscaleInvocationFor("pi", identity("/Users/alice/.pi/identities/all"))).toBeUndefined();
+  test("pi: exposes the exact AIS profile root to the native parser", async () => {
+    const invocation = await tokscaleInvocationFor("pi", identity("/profiles/pi/identities/all"));
+    expect(invocation?.env).toEqual({ PI_CODING_AGENT_DIR: "/profiles/pi/identities/all" });
+    expect(invocation?.clientArgs).toEqual(["--client", "pi"]);
   });
 });
 
