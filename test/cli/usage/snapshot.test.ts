@@ -175,6 +175,89 @@ describe("shared usage snapshot", () => {
     expect(await readFile(path, "utf8")).not.toContain("secret-like-provider-error");
   });
 
+  test("a successful smaller report preserves the last-good report and native batch", async () => {
+    const path = await snapshotFile();
+    const now = Date.UTC(2026, 0, 1);
+    const key = usageSnapshotTargetKey("claude", "work");
+    await refreshUsageSnapshot(deps(path, { now, results: [result(12)] }));
+    const persisted = JSON.parse(await readFile(path, "utf8")) as {
+      partitions: Record<string, { results: UsageResult[]; nativeBatch?: unknown; lastSuccessAt?: string }>;
+    };
+    const prior = persisted.partitions[key];
+    const nativeBatch = {
+      path: "usage/native/fixture/last-good.json", partitionId: "a".repeat(64),
+      generatedAt: new Date(now).toISOString(), sha256: "b".repeat(64),
+    };
+    prior.nativeBatch = nativeBatch;
+    await writeFile(path, JSON.stringify(persisted));
+
+    await refreshUsageSnapshot({
+      ...deps(path, { now: now + 1, results: [result(8)] }),
+      forcePartitionKeys: [key],
+    });
+    const next = JSON.parse(await readFile(path, "utf8")) as {
+      partitions: Record<string, { results: UsageResult[]; nativeBatch?: unknown; lastSuccessAt?: string; lastError?: string }>;
+    };
+    const retained = next.partitions[key];
+    expect(retained.results[0]?.report?.totalInput).toBe(12);
+    expect(retained.nativeBatch).toEqual(nativeBatch);
+    expect(retained.lastSuccessAt).toBe(new Date(now).toISOString());
+    expect(retained.lastError).toBe("suspected-history-regression");
+    const envelope = readUsageSnapshotEnvelope("claude", "work", path, now + 2);
+    expect(envelope?.stale).toBe(true);
+    expect(envelope?.lastError).toBe("suspected-history-regression");
+  });
+
+  test("a successful empty scan cannot erase a non-empty last-good partition", async () => {
+    const path = await snapshotFile();
+    const now = Date.UTC(2026, 0, 1);
+    const key = usageSnapshotTargetKey("claude", "work");
+    await refreshUsageSnapshot(deps(path, { now, results: [result(3)] }));
+    await refreshUsageSnapshot({
+      ...deps(path, { now: now + 1, results: [] }),
+      forcePartitionKeys: [key],
+    });
+
+    const envelope = readUsageSnapshotEnvelope("claude", "work", path, now + 2);
+    expect(envelope?.results).toHaveLength(1);
+    expect(envelope?.lastError).toBe("suspected-history-regression");
+    expect(envelope?.stale).toBe(true);
+  });
+
+  test("cost-only repricing decreases are accepted when counts are unchanged", async () => {
+    const path = await snapshotFile();
+    const now = Date.UTC(2026, 0, 1);
+    const key = usageSnapshotTargetKey("claude", "work");
+    await refreshUsageSnapshot(deps(path, { now, results: [result(7)] }));
+    const lowerCost = result(7);
+    lowerCost.report!.totalCost = 0.01;
+    await refreshUsageSnapshot({
+      ...deps(path, { now: now + 1, results: [lowerCost] }),
+      forcePartitionKeys: [key],
+    });
+
+    const persisted = JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, { results: UsageResult[] }> };
+    const envelope = readUsageSnapshotEnvelope("claude", "work", path, now + 2);
+    expect(persisted.partitions[key]?.results[0]?.report?.totalCost).toBe(0.01);
+    expect(envelope?.lastSuccessAt).toBe(new Date(now + 1).toISOString());
+    expect(envelope?.lastError).toBeUndefined();
+  });
+
+  test("an empty first scan establishes a valid initial baseline", async () => {
+    const path = await snapshotFile();
+    const now = Date.UTC(2026, 0, 1);
+    const key = usageSnapshotTargetKey("claude", "work");
+    await refreshUsageSnapshot({
+      ...deps(path, { now, results: [] }),
+      forcePartitionKeys: [key],
+    });
+
+    const envelope = readUsageSnapshotEnvelope("claude", "work", path, now + 1);
+    expect(envelope?.results).toHaveLength(0);
+    expect(envelope?.lastSuccessAt).toBe(new Date(now).toISOString());
+    expect(envelope?.lastError).toBeUndefined();
+  });
+
   test("successful report-only refresh removes an obsolete native batch pointer", async () => {
     const path = await snapshotFile();
     const now = Date.UTC(2026, 0, 1);

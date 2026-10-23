@@ -431,6 +431,30 @@ function hasCollectorError(results: UsageResult[]): boolean {
   return results.some((result) => result.error !== undefined || result.sourceOnlyError === true || !isValidUsageResult(result));
 }
 
+function reportCountTotals(results: UsageResult[]): { tokens?: number; messages?: number } {
+  const reports = results.map((result) => result.report);
+  if (reports.some((report) => report === undefined)) return {};
+  const concrete = reports as NonNullable<UsageResult["report"]>[];
+  const tokenParts = concrete.flatMap((report) => [report.totalInput, report.totalOutput, report.totalCacheRead, report.totalCacheWrite]);
+  const tokens = tokenParts.every((value) => Number.isFinite(value) && value >= 0)
+    ? tokenParts.reduce((total, value) => total + value, 0)
+    : undefined;
+  const messages = concrete.every((report) => Number.isFinite(report.totalMessages) && report.totalMessages >= 0)
+    ? concrete.reduce((total, report) => total + report.totalMessages, 0)
+    : undefined;
+  return { ...(tokens === undefined ? {} : { tokens }), ...(messages === undefined ? {} : { messages }) };
+}
+
+function isSuspectedHistoryRegression(previous: UsageResult[], incoming: UsageResult[]): boolean {
+  // An empty successful scan is a real zero, not missing count metadata. Keep
+  // a valid non-empty source partition until an operator reconciles a reset.
+  if (previous.length > 0 && incoming.length === 0) return true;
+  const before = reportCountTotals(previous);
+  const after = reportCountTotals(incoming);
+  return (before.tokens !== undefined && after.tokens !== undefined && after.tokens < before.tokens) ||
+    (before.messages !== undefined && after.messages !== undefined && after.messages < before.messages);
+}
+
 function isValidUsageResult(value: UsageResult): boolean {
   if (!value || typeof value !== "object" || typeof value.provider !== "string" || !value.identity || typeof value.identity.name !== "string") return false;
   if (value.report === undefined) return true;
@@ -558,6 +582,26 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
         lastAttemptAt: attemptedAt,
         ...(prior?.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
         lastError: errorCategory(results),
+        lastErrorAt: attemptedAt,
+      };
+      writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+      return;
+    }
+    if (prior?.lastSuccessAt && isSuspectedHistoryRegression(prior.results, results)) {
+      producer.sourceScanFailuresTotal++;
+      if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
+      // There is deliberately no force-refresh bypass. To reconcile an
+      // intentional source-history reset, back up the manifest, explicitly
+      // remove the affected partition, then enqueue a fresh scan to establish
+      // its new baseline. Ordinary TTL and dirty refreshes stay protective.
+      partitions[key] = {
+        ...(tool ? { tool } : {}), ...(identity ? { identity } : {}),
+        nativeCoverage: "error",
+        results: prior.results,
+        ...(prior.nativeBatch ? { nativeBatch: prior.nativeBatch } : {}),
+        lastAttemptAt: attemptedAt,
+        ...(prior.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
+        lastError: "suspected-history-regression",
         lastErrorAt: attemptedAt,
       };
       writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
