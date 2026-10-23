@@ -63,6 +63,7 @@ describe("usage summary metadata", () => {
       ["tokscale timed out after 20s at /private/path", "timeout", "Source timed out"],
       ["process exited with code 1: /private/path", "process-failure", "Source process failed"],
       ["explicit out of memory failure at /private/path", "out-of-memory", "Source ran out of memory"],
+      ["failed to read /private/room/session", "source-error", "Source error"],
       ["pricing unavailable for model secret-model", "unpriced", "Pricing unavailable"],
       ["source unavailable at /private/path", "unavailable", "Source unavailable"],
       ["arbitrary secret /private/path", "source-error", "Source error"],

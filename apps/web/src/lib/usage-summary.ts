@@ -18,7 +18,7 @@ export type UsageErrorKind = "timeout" | "out-of-memory" | "process-failure" | "
 /** Return a short category only; source error text can contain paths or other identifiers. */
 export function classifyUsageError(error: string | undefined): UsageErrorKind {
   if (!error) return "source-error";
-  if (/out of memory|oom(?:-killed)?/i.test(error)) return "out-of-memory";
+  if (/out of memory|\boom(?:-killed)?\b/i.test(error)) return "out-of-memory";
   if (/timed?\s*out|timeout/i.test(error)) return "timeout";
   if (/unpriced|pricing (?:is )?unavailable|no pricing/i.test(error)) return "unpriced";
   if (/unavailable|not available|no .* data yet|could not read/i.test(error)) return "unavailable";
