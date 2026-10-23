@@ -54,10 +54,26 @@ function aggregate(messages: Message[], additional = 0): UsageResult[] {
       totalOutput: sum("output"),
       totalCacheRead: sum("cache_read"),
       totalCacheWrite: sum("cache_write"),
-      totalMessages: messages.length + additional,
+      totalMessages: messages.reduce((total, row) => total + row.message_count, 0) + additional,
       totalCost: 0,
     },
   }];
+}
+
+function sessionAggregate(rows: Message[], _id: string): Message {
+  const sum = (key: keyof Message["tokens"]) => rows.reduce((total, row) => total + row.tokens[key], 0);
+  return {
+    ...rows[0]!,
+    timestamp: Math.max(...rows.map((row) => row.timestamp)),
+    tokens: {
+      input: sum("input"), output: sum("output"), cache_read: sum("cache_read"), cache_write: sum("cache_write"),
+      cache_write_1h: sum("cache_write_1h"), reasoning: sum("reasoning"),
+    },
+    cost: 0.14,
+    cost_source: "providerReported",
+    message_count: rows.reduce((total, row) => total + row.message_count, 0),
+    dedup_key: `grok:${rows[0]!.session_id}:prompt:123e4567-e89b-42d3-a456-426614174000`,
+  };
 }
 
 async function fixture(priorMessages: Message[], candidateMessages: Message[]) {
@@ -249,6 +265,122 @@ describe("Grok unified duplicate baseline correction", () => {
     const unified = message("legacy-provider");
     const legacy = { ...message("legacy-provider", "legacy", 100), provider_id: "other-provider" };
     const f = await fixture([unified, legacy], [legacy]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts one provider-reported session aggregate representing all missing unified rows", async () => {
+    const oldMessages = Array.from({ length: 18 }, (_, index) => ({
+      ...message(`aggregate-${index}`, "unified", index * 1000),
+      session_id: "session-aggregate",
+      tokens: {
+        input: 100 + index, output: 10 + index, cache_read: 200 + index, cache_write: index,
+        cache_write_1h: 2 * index, reasoning: 3 + index,
+      },
+    }));
+    const retained = message("retained-after-aggregate", "unified", 40_000);
+    const session = sessionAggregate(oldMessages, "aggregate-session");
+    const f = await fixture([...oldMessages, retained], [session, retained]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(true);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a session aggregate with a one-token counter mismatch", async () => {
+    const oldMessages = Array.from({ length: 3 }, (_, index) => ({
+      ...message(`bad-sum-${index}`, "unified", index * 1000), session_id: "session-bad-sum",
+    }));
+    const session = sessionAggregate(oldMessages, "bad-sum");
+    session.tokens.reasoning += 1;
+    const f = await fixture(oldMessages, [session]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects aggregate message counts that do not equal the prior session count", async () => {
+    const oldMessages = Array.from({ length: 3 }, (_, index) => ({
+      ...message(`bad-count-${index}`, "unified", index * 1000), session_id: "session-bad-count",
+    }));
+    const session = sessionAggregate(oldMessages, "bad-count");
+    session.message_count -= 1;
+    const f = await fixture(oldMessages, [session]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects candidate aggregate reuse and ambiguous duplicate aggregates", async () => {
+    const oldMessages = Array.from({ length: 3 }, (_, index) => ({
+      ...message(`reuse-${index}`, "unified", index * 1000), session_id: "session-reuse",
+    }));
+    const session = sessionAggregate(oldMessages, "reuse");
+    const f = await fixture(oldMessages, [session, session]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("requires the native Grok prompt dedup key shape for aggregate replacement", async () => {
+    const oldMessages = Array.from({ length: 3 }, (_, index) => ({
+      ...message(`wrong-key-${index}`, "unified", index * 1000), session_id: "session-wrong-key",
+    }));
+    const aggregate = sessionAggregate(oldMessages, "wrong-key");
+    aggregate.dedup_key = "grok:session-wrong-key";
+    const f = await fixture(oldMessages, [aggregate]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an aggregate while an estimated unified subset remains in the candidate", async () => {
+    const oldMessages = Array.from({ length: 3 }, (_, index) => ({
+      ...message(`mixed-${index}`, "unified", index * 1000), session_id: "session-mixed",
+    }));
+    const aggregate = sessionAggregate(oldMessages, "mixed");
+    const f = await fixture(oldMessages, [aggregate, oldMessages[0]!]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects aggregate normalization when prior already contains provider-reported session data", async () => {
+    const oldMessages = Array.from({ length: 3 }, (_, index) => ({
+      ...message(`already-aggregate-${index}`, "unified", index * 1000), session_id: "session-already-aggregate",
+    }));
+    const session = sessionAggregate(oldMessages, "already-aggregate");
+    const f = await fixture([...oldMessages, session], [session]);
+    try {
+      expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects aggregate overlap with a prior one-to-one duplicate pair", async () => {
+    const sessionId = "session-overlap";
+    const unified = { ...message("overlap-pair"), session_id: sessionId };
+    const legacy = { ...message("overlap-pair", "legacy", 100), session_id: sessionId };
+    const oldMessages = Array.from({ length: 3 }, (_, index) => ({
+      ...message(`overlap-${index}`, "unified", (index + 2) * 1000), session_id: sessionId,
+    }));
+    const session = sessionAggregate([unified, ...oldMessages], "overlap-session");
+    const f = await fixture([unified, legacy, ...oldMessages], [legacy, session]);
     try {
       expect(grokDuplicateBaselineIsSafe(f.input)).toBe(false);
     } finally {
