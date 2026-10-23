@@ -99,6 +99,17 @@ test(".claude.json differing only in per-session stats converges; a real key con
   expect(logged.some((m) => m.includes("differs in: theme"))).toBe(true);
 });
 
+test(".claude.json differing only in pluginUsage counters is not a conflict", async () => {
+  const f = await fixture();
+  const rel = ".claude/identities/a3/.claude.json";
+  const doc = (uses: number) => JSON.stringify({ theme: "dark", pluginUsage: { "p@m": { usageCount: uses } } });
+  await f.put(f.home, rel, doc(5), T + 10);
+  await f.put(f.incoming, rel, doc(9), T);
+  expect((await f.merge()).preservedConflicts).toBe(0);
+  await f.put(f.incoming, rel, doc(12), T);
+  expect((await f.merge()).preservedConflicts).toBe(0);
+});
+
 test("a staged history that extends a large live one is merged as a tail without reading the live file", async () => {
   const f = await fixture();
   const rel = ".claude/identities/a3/projects/p/s.jsonl";

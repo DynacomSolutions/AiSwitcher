@@ -245,7 +245,7 @@ class ConflictLedger {
 }
 
 /** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
-const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|changelogLastFetched|cached.*|.*Cache.*)$/;
+const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|pluginUsage|changelogLastFetched|cached.*|.*Cache.*)$/;
 
 let claudeLockOptions: LockOptions = {};
 /** Test hook: shorten the `.claude.json` lock wait (no argument restores the default). */
