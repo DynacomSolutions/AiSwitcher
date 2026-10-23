@@ -339,3 +339,40 @@ test.skipIf(process.platform !== "linux" || !rsync)("many large histories conver
   if (plan) expect(plan.rchar).toBeLessThan(whole * 0.1);
   expect(steady.text).not.toContain("preserved");
 }, 300_000);
+
+test.skipIf(process.platform !== "linux" || !rsync)("appends to large histories on both hosts cost reads proportional to the appended bytes, not the history size", async () => {
+  const { root, local, remote, run } = await harness();
+  await writeFile(join(root, "shim", "lsof"), "#!/bin/sh\nexit 127\n");
+  await chmod(join(root, "shim", "lsof"), 0o755);
+  const T = 1_700_000_000;
+  const a = ".claude/identities/a";
+  const line = (n: number) => `{"n":${n},"pad":"${"p".repeat(1000)}"}\n`;
+  const lines = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => line(from + i)).join("");
+  await put(local, ".claude/identities.json", claudeRegistry);
+  await put(remote, ".claude/identities.json", claudeRegistry);
+  const names = Array.from({ length: 8 }, (_, i) => `${a}/projects/p/h${i}.jsonl`);
+  for (const name of names) await put(local, name, lines(0, 8000), T);
+  for (let i = 0; i < 3; i++) expect((await run()).exitCode).toBe(0);
+  const whole = (await sizeOf(join(local, names[0]!))) * names.length;
+
+  // 20 small appends per history: even histories grow on the local host, odd ones on the remote.
+  const appended = 20 * 1020 * names.length;
+  const round = async (base: number, trace: boolean) => {
+    for (const [i, name] of names.entries()) await appendFile(join(i % 2 ? remote : local, name), lines(base + i * 100, base + 20 + i * 100));
+    const result = await run(trace ? { AIS_SYNC_IO_TRACE: "1" } : {});
+    expect(result.exitCode).toBe(0);
+    for (const name of names) expect(await readFile(join(remote, name), "utf8")).toBe(await readFile(join(local, name), "utf8"));
+    return result;
+  };
+  // The first round fills each host's prefix cache (a cold history is hashed whole once); the second is steady state.
+  const cold = await round(10_000, true);
+  const warm = await round(20_000, true);
+
+  // Runtime start-up and the ssh/lsof children are the fixed part; the history reads must not scale with 64 MB.
+  const budget = appended * 10 + 20_000_000;
+  const phases = ["local pull-tails", "local push-tails", "local pull-merge", "remote fake-host:tail-plan", "remote fake-host:profile-merge"];
+  const measured = Object.fromEntries(phases.map((p) => [p, phaseIo(warm.text, p)?.rchar]));
+  console.log(`reads: history ${whole} appended ${appended} budget ${budget}; cold ${JSON.stringify(Object.fromEntries(phases.map((p) => [p, phaseIo(cold.text, p)?.rchar])))}; warm ${JSON.stringify(measured)}`);
+  for (const p of phases) expect({ p, ok: (measured[p] ?? 0) < budget }).toEqual({ p, ok: true });
+  expect(whole).toBeGreaterThan(budget);
+}, 600_000);

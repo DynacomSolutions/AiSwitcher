@@ -25,7 +25,7 @@ import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/sto
 import type { ToolConfig } from "../identities/types.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
 import { mergeJsonlFiles, mergeJsonlTail } from "./dedupe.ts";
-import { listHistories, TAIL_PLAN_FILE, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
+import { listHistories, PrefixCache, hashPrefix, TAIL_MIN_BYTES, TAIL_PLAN_FILE, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
 import { mergeRegistryConflict } from "./registry.ts";
 import { isDeepStrictEqual } from "node:util";
 import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
@@ -210,8 +210,39 @@ async function sourceWinsTie(source: string, destination: string): Promise<boole
   return (await digest(source)) > (await digest(destination));
 }
 
-/** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict. */
-const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$/;
+/** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict.
+ * Credentials are in it deliberately: every host refreshes its own OAuth tokens, and an archived stale token is a
+ * liability rather than a recovery aid. */
+const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|settings_cache\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$|(?:^|\/)identities\/[^/]+\/(?:\.credentials\.json|credentials\.json|auth\.(?:json|toml)|credentials\/kimi-code\.json|(?:data\/)?opencode\/auth\.json)$/;
+
+/** Content digests already archived per path, so a conflict whose losing copy was preserved before is neither
+ * archived nor counted again. Without it a file both hosts keep rewriting reports itself on every run. */
+class ConflictLedger {
+  private dirty = false;
+  private constructor(private readonly file: string, private readonly seen: Record<string, string[]>) {}
+  static async load(home: string): Promise<ConflictLedger> {
+    const file = join(aisRemoteCacheDir(home), "merge-conflict-seen.json");
+    try {
+      const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, string[]>;
+      return new ConflictLedger(file, raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {});
+    } catch { return new ConflictLedger(file, {}); }
+  }
+  /** True when this loser content is new for `rel`; it is recorded. */
+  async isNew(rel: string, loser: string): Promise<boolean> {
+    const digest = createHash("sha256").update(await readFile(loser)).digest("hex");
+    const list = this.seen[rel] ?? [];
+    if (list.includes(digest)) return false;
+    this.seen[rel] = [...list, digest].slice(-8);
+    this.dirty = true;
+    return true;
+  }
+  async save(): Promise<void> {
+    if (!this.dirty) return;
+    await mkdir(dirname(this.file), { recursive: true });
+    await writeFileAtomic(this.file, JSON.stringify(this.seen));
+    this.dirty = false;
+  }
+}
 
 /** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
 const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|changelogLastFetched|cached.*|.*Cache.*)$/;
@@ -220,10 +251,18 @@ let claudeLockOptions: LockOptions = {};
 /** Test hook: shorten the `.claude.json` lock wait (no argument restores the default). */
 export function setClaudeLockOptions(options: LockOptions = {}): void { claudeLockOptions = options; }
 
+/** Claude Code stamps `last*` figures (cost, duration, session id, token counts) into every project entry of
+ * `.claude.json` at the end of each session; two hosts running sessions always differ there. */
+function withoutSessionStats(key: string, value: unknown): unknown {
+  if (key !== "projects" || typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([path, entry]) => [path,
+    typeof entry === "object" && entry !== null && !Array.isArray(entry) ? Object.fromEntries(Object.entries(entry).filter(([k]) => !/^last[A-Z]/.test(k))) : entry]));
+}
+
 /** A per-identity `.claude.json` is rewritten constantly by every running Claude Code on every host. Self-changing
  * keys merge key by key; every other key follows the newest file whole (deletions included) and, when the older
  * file held a different value, that file is preserved and counted as a conflict. */
-async function mergeClaudeJson(source: string, destination: string, rel: string, conflictRoot: string, result: TreeMergeResult): Promise<boolean> {
+async function mergeClaudeJson(source: string, destination: string, rel: string, conflictRoot: string, result: TreeMergeResult, ledger: ConflictLedger): Promise<boolean> {
   const plain = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   const read = async (path: string): Promise<Record<string, unknown> | undefined> => {
     try { const v = JSON.parse(await readFile(path, "utf8")); return plain(v) ? v : undefined; } catch { return undefined; }
@@ -237,15 +276,19 @@ async function mergeClaudeJson(source: string, destination: string, rel: string,
     const sourceWins = sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination);
     const [winner, loser] = sourceWins ? [incoming, live] : [live, incoming];
     const merged: Record<string, unknown> = { ...winner };
-    let conflict = false;
+    const differing: string[] = [];
     for (const [key, value] of Object.entries(loser)) {
       if (SELF_CHANGING_CLAUDE_KEYS.test(key)) { if (!(key in winner)) merged[key] = value; }
-      else if (!isDeepStrictEqual(value, winner[key])) conflict = true;
+      else if (!isDeepStrictEqual(withoutSessionStats(key, value), withoutSessionStats(key, winner[key]))) differing.push(key);
     }
-    if (conflict) {
-      await preserveFile(sourceWins ? destination : source, conflictRoot, sourceWins ? "local" : "incoming", rel);
-      result.preservedConflicts++;
-      result.preservedConflictPaths.push(rel);
+    if (differing.length > 0) {
+      console.warn(`AIS sync ${rel} differs in: ${differing.join(", ")}`);
+      const loserPath = sourceWins ? destination : source;
+      if (await ledger.isNew(rel, loserPath)) {
+        await preserveFile(loserPath, conflictRoot, sourceWins ? "local" : "incoming", rel);
+        result.preservedConflicts++;
+        result.preservedConflictPaths.push(rel);
+      }
     }
     if (sourceWins && isDeepStrictEqual(merged, incoming)) await copyKeepingMtime(source, destination);
     else if (isDeepStrictEqual(merged, live)) return;
@@ -577,7 +620,7 @@ async function preserveFile(source: string, root: string, side: "local" | "incom
  * The plan is untrusted input from the other host: only histories in `expected` (the manifest this side sent,
  * or its own current listing) are touched, at an offset that manifest allows. Everything else, and every tail
  * that does not verify or cannot be applied now, is returned in `needsFull` for the ordinary full transfer. */
-async function applyTails(dir: string, home: string, expected: HistoryManifest, strict: boolean, ownerPass: OpenOwnerPass, result: TreeMergeResult): Promise<void> {
+async function applyTails(dir: string, home: string, expected: HistoryManifest, strict: boolean, ownerPass: OpenOwnerPass, result: TreeMergeResult, cache: PrefixCache): Promise<void> {
   const full = (rel: string) => { (result.needsFull ??= []).push(rel); };
   let plan: TailPlan;
   try { plan = JSON.parse(await readFile(join(dir, TAIL_PLAN_FILE), "utf8")) as TailPlan; }
@@ -590,7 +633,7 @@ async function applyTails(dir: string, home: string, expected: HistoryManifest, 
     const destination = join(home, rel);
     const tail = await readFile(join(dir, rel)).catch(() => undefined);
     if (!tail || tail.length !== entry.size - entry.offset) { full(rel); continue; }
-    const outcome = await mergeJsonlTail(destination, entry.offset, entry.prefix, tail, ownerPass);
+    const outcome = await mergeJsonlTail(destination, entry.offset, entry.prefix, tail, ownerPass, cache);
     if (outcome === "diverged" || outcome === "deferred") { full(rel); continue; }
     if (outcome === "busy") { result.busyPaths.push(rel); continue; }
     if (outcome === "merged") result.mergedJsonlFiles++;
@@ -697,6 +740,8 @@ export async function mergeIncomingProfileTree(
   const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [], deniedPaths: [] };
   const registries = registryRelPaths(scope, home);
   const ownerPass = options.ownerPass ?? { lookups: 0 };
+  const cache = await PrefixCache.load(home);
+  const ledger = await ConflictLedger.load(home);
 
   // Registries have their own semantic union. Merge these first so profiles
   // first seen on the incoming host have a valid local registry entry.
@@ -718,7 +763,7 @@ export async function mergeIncomingProfileTree(
   if (options.tailsDir) {
     // The pulling side checks against the manifest it sent; the pushed-to side against what it holds now.
     const strict = options.tailsManifest !== undefined;
-    await applyTails(options.tailsDir, home, options.tailsManifest ?? await listHistories(home, scope), strict, ownerPass, result);
+    await applyTails(options.tailsDir, home, options.tailsManifest ?? await listHistories(home, scope), strict, ownerPass, result, cache);
   }
 
   // One lsof run per few hundred staged histories instead of a process scan (or a deferral) per file.
@@ -742,7 +787,24 @@ export async function mergeIncomingProfileTree(
       }
       // mergeJsonlFiles checks ownership only when there is an actual append
       // to make, so an unchanged replay does not become a false conflict.
-      const incompleteSource = !(await endsWithNewlineOrEmpty(source, (await stat(source)).size));
+      const sourceSize = (await stat(source)).size;
+      const incompleteSource = !(await endsWithNewlineOrEmpty(source, sourceSize));
+      // A big destination that the staged copy extends is merged as a tail: the cache vouches for its prefix
+      // without reading it. Anything else (unverified, busy, deferred) takes the ordinary whole-file merge below.
+      const liveSize = incompleteSource ? 0 : (await stat(destination).catch(() => undefined))?.size ?? 0;
+      if (liveSize >= TAIL_MIN_BYTES && liveSize <= sourceSize) {
+        const prefix = await hashPrefix(source, liveSize);
+        const handle = await open(source, "r");
+        const tail = Buffer.alloc(sourceSize - liveSize);
+        try { await handle.read(tail, 0, tail.length, liveSize); } finally { await handle.close(); }
+        const outcome = prefix ? await mergeJsonlTail(destination, liveSize, prefix, tail, ownerPass, cache) : "diverged";
+        if (outcome === "merged" || outcome === "unchanged") {
+          if (outcome === "merged") result.mergedJsonlFiles++;
+          await alignMergedMtime(source, destination, rel, result.deniedPaths);
+          continue;
+        }
+        if (outcome === "busy") { result.busyPaths.push(rel); continue; }
+      }
       if (incompleteSource && (await preserveDeferredFile(source, home, rel))) {
         // A live writer's unfinished line stays archived; only a changed copy is news, so the count converges.
         result.preservedConflicts++;
@@ -751,8 +813,8 @@ export async function mergeIncomingProfileTree(
       const mergeResult = await mergeJsonlFiles([source], destination, false, ownerPass);
       if (mergeResult === "merged") result.mergedJsonlFiles++;
       else if (mergeResult === "busy") result.busyPaths.push(rel);
-      else if (mergeResult === "deferred" && !incompleteSource) {
-        await preserveDeferredFile(source, home, rel);
+      else if (mergeResult === "deferred" && !incompleteSource && (await preserveDeferredFile(source, home, rel))) {
+        // Only a copy not archived before is news: a destination that stays unmergeable must not recount every run.
         result.preservedConflicts++;
         result.preservedConflictPaths.push(rel);
       }
@@ -769,22 +831,25 @@ export async function mergeIncomingProfileTree(
       await convergeMtime(source, destination, rel, result.deniedPaths);
       continue;
     }
-    if (basename(rel) === ".claude.json" && (await mergeClaudeJson(source, destination, rel, conflictRoot, result))) continue;
+    if (basename(rel) === ".claude.json" && (await mergeClaudeJson(source, destination, rel, conflictRoot, result, ledger))) continue;
 
     const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
     const volatile = VOLATILE_STATE.test(rel);
     const sourceWins = sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination);
+    const fresh = !volatile && (await ledger.isNew(rel, sourceWins ? destination : source));
     if (sourceWins) {
-      if (!volatile) await preserveFile(destination, conflictRoot, "local", rel);
+      if (fresh) await preserveFile(destination, conflictRoot, "local", rel);
       if (!(await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths))) continue;
-    } else if (!volatile) {
+    } else if (fresh) {
       await preserveFile(source, conflictRoot, "incoming", rel);
     }
-    if (volatile) continue;
+    if (!fresh) continue;
     result.preservedConflicts++;
     result.preservedConflictPaths.push(rel);
   }
 
+  await cache.save();
+  await ledger.save();
   await purgeRetiredCredentialsAfterSync(configsForScope(scope), home, options.purgeRetired);
   await scrubRetiredConflictCopies(configsForScope(scope), home, conflictRoot);
   return result;

@@ -7,7 +7,7 @@ import type { Identity, ToolConfig } from "../identities/types.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG } from "../identities/tool-configs.ts";
 import { matchDirectory } from "../identities/match.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
-import { hashPrefix } from "./tail-sync.ts";
+import { hashPrefix, type PrefixCache } from "./tail-sync.ts";
 import { hasOpenOwner, hasOpenOwnerBeforeWrite, type OpenOwnerPass } from "./tree-merge.ts";
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -459,6 +459,7 @@ export async function mergeJsonlTail(
   prefix: string,
   tail: Buffer,
   ownerPass: OpenOwnerPass = { lookups: 0 },
+  cache?: PrefixCache,
 ): Promise<JsonlTailResult> {
   let before: Stats;
   try { before = await stat(destination); } catch { return "diverged"; }
@@ -466,7 +467,7 @@ export async function mergeJsonlTail(
   const complete = tail.subarray(0, tail.lastIndexOf(10) + 1);
   // Cheap busy check first: a history a native tool has open cannot be appended to, so skip the prefix hash.
   if (complete.length > 0 && (await hasOpenOwner(destination, ownerPass)) !== false) return "busy";
-  if ((await hashPrefix(destination, offset)) !== prefix) return "diverged";
+  if ((await hashPrefix(destination, offset, cache)) !== prefix) return "diverged";
   if (complete.length === 0) return "unchanged"; // the sender holds nothing beyond what we verified
   let extra: Buffer;
   try {
