@@ -31,7 +31,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: 1.4.4
       - id: tag
         env:
           HOST_TAG: ${{ inputs.tag || github.ref_name }}
@@ -57,7 +57,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: 1.4.4
       - name: Set isolated signing directory
         run: echo "HOST_SIGN_DIR=$RUNNER_TEMP/host-sign" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
@@ -106,7 +106,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: 1.4.4
       - name: Set isolated release directory
         run: echo "HOST_RELEASE_DIR=$RUNNER_TEMP/release" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
@@ -183,7 +183,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: 1.4.4
       - name: Set isolated download directory
         run: echo "HOST_RELEASE_DIR=$RUNNER_TEMP/download" >> "$GITHUB_ENV"
       - name: Linux display and webview dependencies

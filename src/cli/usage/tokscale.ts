@@ -1,7 +1,7 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { lstat, mkdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { isRetired } from "../../identities/retired.ts";
@@ -426,10 +426,10 @@ export function resolveTokscaleCommand(): string[] {
  * prior run), spawn the cached native binary DIRECTLY instead of going through
  * `bunx` again. That bypasses bunx's per-call `.bin` link step entirely —
  * the exact step that races under concurrency (EEXIST, see the bunxQueue doc
- * below) — so once the binary is cached, every tokscale call can run in
- * parallel with no serialization at all. Returns undefined when nothing is
- * resolvable yet (cold cache + caller must fall back to `bunx`, which is the
- * only path that downloads). Memoized per process: resolution doesn't change
+ * below). Cached-native execution avoids that bunx link race; a separate
+ * process-wide limiter still serializes tokscale work to bound memory.
+ * Returns undefined when nothing is resolvable yet (cold cache + caller must
+ * fall back to `bunx`, which is the only path that downloads). Memoized per process: resolution doesn't change
  * within one CLI run (runUsageQueryForTargets refreshes the cache BEFORE any
  * call here can happen), and memoizing also avoids re-probing executability
  * on every one of the ~2N spawns in a full report. */
@@ -522,15 +522,23 @@ function compareSemver(a: string, b: string): number {
  * against an already-warm package cache (reproduced directly on bun 1.3.11,
  * 2026-08-07 — see the historical note on run.ts's runUsageQueryForTargets
  * for the full empirical background). This queue serializes bunx spawns one
- * at a time, but it is now only ever reached on a COLD cache (nothing
- * cached yet, so the very first invocation on a machine must still go
- * through bunx to download) — once the native binary is in Bun's install
- * cache, resolveTokscaleCachedBinary finds it and every subsequent spawn
- * bypasses bunx entirely, running fully in parallel. Everything OUTSIDE the
- * spawn (env resolution, JSON parsing, the per-target extraCost probes in
- * run.ts) runs concurrently either way; only bunx process creation itself
- * is serialized, which is the narrowest possible fix. */
+ * at a time. On a cold cache the first invocation still goes through bunx
+ * to download; after that the native binary is used directly. A separate
+ * process-wide slot serializes every native or bunx invocation because they
+ * have the same per-process memory cost. Env resolution, JSON parsing and
+ * per-target extraCost probes in run.ts can still run concurrently. */
 let bunxQueue: Promise<unknown> = Promise.resolve();
+// One scan worker can launch tokscale once per target plus an hourly report.
+// Serialize every invocation, including cached native binaries, so the pod's
+// memory ceiling is independent of target count. The slot is held through
+// child and process-group cleanup, including timeouts and read failures.
+let tokscaleProcessQueue: Promise<unknown> = Promise.resolve();
+
+export function withTokscaleProcessSlot<T>(job: () => Promise<T>): Promise<T> {
+  const run = tokscaleProcessQueue.then(job, job);
+  tokscaleProcessQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
 
 /** Runs tokscale with one set of args plus the given per-identity env, and
  * returns its stdout when it exits 0. Throws with tokscale's own stderr (or
@@ -538,18 +546,18 @@ let bunxQueue: Promise<unknown> = Promise.resolve();
  * JSON.parse does — the two existing callers (runTokscale in usage/run.ts,
  * fetchTokscaleDailyUsage below) keep their exact prior error semantics,
  * they just share this one spawn now instead of each re-implementing it.
- * Splitting the spawn out is what lets usage/run.ts run every target's work
- * concurrently while this module alone guarantees bunx spawn safety. */
+ * Splitting the spawn out is what lets usage/run.ts resolve targets
+ * concurrently while this module bounds tokscale process memory. */
 export async function runTokscaleProcess(args: string[], env: Record<string, string>): Promise<string> {
-  const cached = resolveTokscaleCachedBinary();
-  if (cached) {
-    return spawnTokscaleProcess(cached[0]!, [], args, env);
-  }
-  const [cmd, ...prefixArgs] = resolveTokscaleCommand();
-  const spawn = (): Promise<string> => spawnTokscaleProcess(cmd!, prefixArgs, args, env);
-  const run = bunxQueue.then(spawn, spawn);
-  bunxQueue = run.catch(() => undefined);
-  return run;
+  return withTokscaleProcessSlot(async () => {
+    const cached = resolveTokscaleCachedBinary();
+    if (cached) return spawnTokscaleProcess(cached[0]!, [], args, env);
+    const [cmd, ...prefixArgs] = resolveTokscaleCommand();
+    const spawn = (): Promise<string> => spawnTokscaleProcess(cmd!, prefixArgs, args, env);
+    const run = bunxQueue.then(spawn, spawn);
+    bunxQueue = run.catch(() => undefined);
+    return run;
+  });
 }
 
 /** Hard ceiling for any single tokscale/bunx child. Without it a wedged
@@ -579,31 +587,35 @@ export function tokscaleTimeoutMessage(command: string, timeoutMs: number): stri
   return `${command} timed out after ${timeoutMs / 1000}s (raise the limit with AIS_TOKSCALE_TIMEOUT_MS, in milliseconds)`;
 }
 
-async function spawnTokscaleProcess(
+export async function spawnTokscaleProcess(
   cmd: string,
   prefixArgs: string[],
   args: string[],
   env: Record<string, string>,
+  timeoutOverrideMs?: number,
 ): Promise<string> {
+  // Keep tokscale in the scan worker's process group so an outer scan
+  // deadline can terminate the entire scan tree with one group signal.
   const proc = Bun.spawn([cmd, ...prefixArgs, ...args], {
+    stdin: "ignore",
     env: { ...process.env, ...env },
     stdout: "pipe",
     stderr: "pipe",
   });
+  // Snapshot descendants while the leader is still alive. A child can exit
+  // normally while a grandchild keeps running, at which point ancestry alone
+  // can no longer identify that owned process.
+  const knownDescendants = new Map<number, string>();
+  const tracker = setInterval(() => collectTokscaleDescendants(proc.pid, knownDescendants), 10);
   const collect = Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  const timeoutMs = tokscaleSpawnTimeoutMs();
+  const timeoutMs = timeoutOverrideMs ?? tokscaleSpawnTimeoutMs();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      try {
-        proc.kill();
-      } catch {
-        // already exited
-      }
       reject(
         new Error(tokscaleTimeoutMessage(`${cmd}${prefixArgs.length ? ` ${prefixArgs.join(" ")}` : ""}`, timeoutMs)),
       );
@@ -615,7 +627,125 @@ async function spawnTokscaleProcess(
     return stdout;
   } finally {
     if (timer) clearTimeout(timer);
+    clearInterval(tracker);
+    await terminateTokscaleProcess(proc, false, knownDescendants);
   }
+}
+
+const TOKSCALE_DESCENDANT_LIMIT = 4096;
+const TOKSCALE_DESCENDANT_DEPTH_LIMIT = 128;
+const TOKSCALE_TASK_LIMIT_PER_PROCESS = 256;
+
+function collectTokscaleDescendants(parentPid: number | undefined, descendants: Map<number, string>): void {
+  if (process.platform !== "linux" || !parentPid) return;
+  const queue: Array<{ pid: number; depth: number }> = [{ pid: parentPid, depth: 0 }];
+  const visited = new Set<number>([parentPid]);
+  let discovered = 0;
+  while (queue.length > 0 && discovered < TOKSCALE_DESCENDANT_LIMIT) {
+    const current = queue.shift()!;
+    if (current.depth >= TOKSCALE_DESCENDANT_DEPTH_LIMIT) continue;
+
+    let tasks: string[];
+    try {
+      tasks = readdirSync(`/proc/${current.pid}/task`).slice(0, TOKSCALE_TASK_LIMIT_PER_PROCESS);
+    } catch { /* process exited while /proc was read */ continue; }
+
+    for (const task of tasks) {
+      let children: string[];
+      try {
+        children = readFileSync(`/proc/${current.pid}/task/${task}/children`, "utf8").trim().split(/\s+/);
+      } catch { /* thread exited while /proc was read */ continue; }
+      for (const child of children) {
+        if (!/^\d+$/.test(child)) continue;
+        const pid = Number(child);
+        if (!pid || visited.has(pid)) continue;
+        visited.add(pid);
+        try {
+          const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+          const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+          // The task children file is authoritative for ancestry, while this
+          // check protects against a process exiting and its PID being reused.
+          if (Number(fields[1]) !== current.pid || !fields[19]) continue;
+          descendants.set(pid, fields[19]);
+          discovered++;
+          if (discovered >= TOKSCALE_DESCENDANT_LIMIT) break;
+          queue.push({ pid, depth: current.depth + 1 });
+        } catch { /* child exited while /proc was read */ }
+      }
+      if (discovered >= TOKSCALE_DESCENDANT_LIMIT) break;
+    }
+  }
+}
+
+export async function terminateTokscaleProcess(
+  proc: Bun.Subprocess<any, "pipe", "pipe">,
+  isolatedGroup: boolean,
+  descendants = new Map<number, string>(),
+): Promise<void> {
+  let signalFailure: unknown;
+  const signalDescendants = (value: "SIGTERM" | "SIGKILL") => {
+    collectTokscaleDescendants(proc.pid, descendants);
+    for (const [pid, startTime] of descendants) {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        if (fields[19] === startTime && fields[0] !== "Z" && fields[0] !== "X") process.kill(pid, value);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH" && code !== "ENOENT") signalFailure = error;
+      }
+    }
+  };
+  const descendantsAlive = () => {
+    for (const [pid, startTime] of descendants) {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        if (fields[19] === startTime && fields[0] !== "Z" && fields[0] !== "X") return true;
+      } catch { /* process exited */ }
+    }
+    return false;
+  };
+  const signal = (value: "SIGTERM" | "SIGKILL") => {
+    try {
+      if (isolatedGroup && proc.pid) process.kill(-proc.pid, value);
+      else {
+        signalDescendants(value);
+        proc.kill(value);
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH" && code !== "ENOENT") signalFailure = error;
+    }
+  };
+  const groupHasLiveMembers = () => {
+    if (!isolatedGroup || !proc.pid) return false;
+    if (process.platform === "linux") {
+      for (const entry of readdirSync("/proc")) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+          const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+          const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+          if (Number(fields[2]) === proc.pid && fields[0] !== "Z" && fields[0] !== "X") return true;
+        } catch { /* process exited while /proc was read */ }
+      }
+      return false;
+    }
+    try { process.kill(-proc.pid, 0); return true; } catch { return false; }
+  };
+  signal("SIGTERM");
+  collectTokscaleDescendants(proc.pid, descendants);
+  const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(500).then(() => false)]);
+  if (!exited || groupHasLiveMembers() || descendantsAlive()) {
+    signal("SIGKILL");
+    while (groupHasLiveMembers() || descendantsAlive()) {
+      await Bun.sleep(250);
+      signal("SIGKILL");
+    }
+  }
+  await proc.exited;
+  if (groupHasLiveMembers() || descendantsAlive()) throw new Error(`tokscale process tree ${proc.pid} still has live members after SIGKILL`);
+  if (signalFailure !== undefined) throw signalFailure;
 }
 
 /** Where the last successful cache-refresh time is persisted, so the
@@ -695,18 +825,14 @@ export function ensureTokscaleCacheFresh(): Promise<void> {
 }
 
 async function warmUpTokscaleCache(): Promise<void> {
-  const warmUp = (): Promise<string> =>
-    // bunx resolves @latest over the NETWORK; bound it far tighter than
-    // real scans so an offline/stalled registry cannot hold a whole
-    // usage report hostage (the cached binary still serves afterwards).
-    Promise.race([
-      spawnTokscaleProcess("bunx", ["tokscale@latest"], ["--version"], {}),
-      Bun.sleep(8_000).then(() => {
-        throw new Error("bunx cache warm-up timed out after 8s");
-      }),
-    ]);
-  const run = bunxQueue.then(warmUp, warmUp);
-  bunxQueue = run.catch(() => undefined);
+  // Enforce the short network warm-up ceiling inside the spawn helper, so
+  // timeout includes child cleanup before its serialized slot is released.
+  const warmUp = (): Promise<string> => spawnTokscaleProcess("bunx", ["tokscale@latest"], ["--version"], {}, 8_000);
+  const run = withTokscaleProcessSlot(() => {
+    const queued = bunxQueue.then(warmUp, warmUp);
+    bunxQueue = queued.catch(() => undefined);
+    return queued;
+  });
   await run
     .then(() => writeLastRefreshMs(Date.now()))
     .catch(() => undefined);
