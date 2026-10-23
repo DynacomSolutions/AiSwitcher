@@ -304,6 +304,12 @@ export interface UsageResult {
 export interface UsageResponse {
   results: UsageResult[];
   generatedAt: string;
+  /** True while a stale-while-revalidate refresh is running. */
+  stale?: boolean;
+  /** Present when a background refresh failed; the UI must not display its raw text. */
+  lastError?: string;
+  lastErrorAt?: string;
+  cached?: boolean;
   /** First scan still running; keep polling. */
   pending?: boolean;
 }
