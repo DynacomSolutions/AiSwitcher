@@ -3,6 +3,9 @@ import { dirname, join } from "node:path";
 import { chmod, copyFile, lstat, mkdir, rename, rm } from "node:fs/promises";
 import { runBackup } from "./backup.ts";
 import { aisManifestPath } from "../src/shared/ais-home.ts";
+import {
+  configureUsageCollectorServiceForFullInstall,
+} from "../src/cli/usage/collector-service.ts";
 
 // "open" (shadows macOS's /usr/bin/open) is a macOS-only concept — see
 // scripts/build.ts's matching platform gate. "ais" (the management CLI)
@@ -46,6 +49,33 @@ async function migrateLegacyManifest(): Promise<void> {
   console.error(`install: migrated ${LEGACY_MANIFEST_PATH} -> ${MANIFEST_PATH}`);
 }
 
+async function configureUsageCollectorService(aisBinaryChanged: boolean): Promise<void> {
+  if (process.platform !== "linux") return;
+
+  const aisPath = join(homedir(), ".local", "bin", "ais");
+  const result = await configureUsageCollectorServiceForFullInstall({ aisPath, aisBinaryChanged });
+  if (result.status === "unsupported-entrypoint") {
+    console.error(
+      "install: usage collector service skipped because the installed ais does not support it; rebuild and reinstall ais, then run `ais usage service install`.",
+    );
+  } else if (result.status === "no-user-manager") {
+    console.error(
+      "install: no reachable systemd user manager; the usage collector service was not installed or started. When a user manager is available, run `ais usage service install`.",
+    );
+  } else if (result.status === "installed" || result.status === "verified") {
+    console.error(`install: usage collector service ${result.status}: ${result.path}`);
+    console.error("install: usage collector service is enabled and active.");
+  }
+}
+
+export async function finalizeInstall(
+  configureService: () => Promise<void>,
+  writeManifest: () => Promise<void>,
+): Promise<void> {
+  await configureService();
+  await writeManifest();
+}
+
 async function runInstall(): Promise<void> {
   const shimDir = join(homedir(), ".local", "bin");
   await mkdir(shimDir, { recursive: true });
@@ -73,9 +103,11 @@ async function runInstall(): Promise<void> {
     }
     pending.push({ name, hash });
   }
+  const aisBinaryChanged = pending.some((item) => item.name === "ais");
 
   if (pending.length === 0) {
     console.error("install: everything already up to date, nothing to do.");
+    await configureUsageCollectorService(false);
     return;
   }
 
@@ -109,7 +141,15 @@ async function runInstall(): Promise<void> {
     console.error(`install: dist/${name} -> ${dest}`);
   }
 
-  await Bun.write(MANIFEST_PATH, JSON.stringify(manifest, null, 2));
+  // The collector is part of a successful Linux install when a user manager
+  // is available. Keep the manifest as the final completion marker so a
+  // failed service setup remains retryable on the next install.
+  await finalizeInstall(
+    () => configureUsageCollectorService(aisBinaryChanged),
+    async () => {
+      await Bun.write(MANIFEST_PATH, JSON.stringify(manifest, null, 2));
+    },
+  );
 
   console.error(
     "install: done. Open a NEW terminal (or run `hash -r`) so PATH resolution picks up the shims.",
