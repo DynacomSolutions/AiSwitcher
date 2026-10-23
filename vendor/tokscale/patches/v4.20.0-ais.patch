@@ -1321,7 +1321,7 @@ index c68471a..771e05f 100644
 +
 +    #[test]
 +    #[serial]
-+    fn ais_shared_native_batch_cache_tracks_only_current_manifest_generation() {
++    fn ais_shared_snapshot_native_batch_cache_tracks_only_current_manifest_generation() {
 +        use super::{
 +            parse_ais_shared_snapshot, AisBatchEnvelope, AIS_SHARED_NATIVE_BATCH_CACHE,
 +        };
