@@ -18,6 +18,8 @@ import type { SyncScope } from "./types.ts";
 /** Smaller histories are cheaper to stage whole than to negotiate. */
 export const TAIL_MIN_BYTES = 1 << 20;
 export const TAIL_PLAN_FILE = "tails.json";
+/** Histories the sender could not snapshot this run; both bulk transfers leave them out until the next run. */
+export const TAIL_DEFERRED_FILE = "deferred.json";
 
 export interface HistoryInfo { size: number; mtimeMs: number }
 export type HistoryManifest = Record<string, HistoryInfo>;
@@ -175,6 +177,8 @@ export async function planTails(
   skip: ReadonlySet<string> = new Set(),
   /** Test seam: the histories to consider instead of walking the tool trees. */
   listing?: HistoryManifest,
+  /** Receives histories that changed under the sender mid-plan; the bulk transfer must not carry them whole. */
+  deferred: string[] = [],
 ): Promise<TailPlan> {
   const plan: TailPlan = {};
   const cache = await PrefixCache.load(home);
@@ -183,7 +187,7 @@ export async function planTails(
     if (!mine[rel]) continue;
     const path = join(home, rel);
     const handle = await open(path, "r").catch(() => undefined);
-    if (!handle) continue;
+    if (!handle) { deferred.push(rel); continue; }
     try {
       const info = await handle.stat();
       if (info.size < TAIL_MIN_BYTES) continue;
@@ -191,17 +195,21 @@ export async function planTails(
       // A receiver that is already ahead needs no bytes at all: proving our whole file is its prefix is enough.
       const offset = Math.min(info.size, theirs.size);
       const prefix = await cache.prefix(handle, path, offset);
-      if (!prefix) continue;
+      if (!prefix) { deferred.push(rel); continue; }
       await beforeTailCopy?.(rel);
       await copyRange(handle, join(outDir, rel), offset, info.size);
       const [again, now] = await Promise.all([handle.stat(), lstat(path).catch(() => undefined)]);
       // Appends only grow the file; a different inode or a shorter file means the bytes read are not one snapshot.
-      if (!now || now.ino !== info.ino || again.size < info.size) { await rm(join(outDir, rel), { force: true }); continue; }
+      if (!now || now.ino !== info.ino || again.size < info.size) { await rm(join(outDir, rel), { force: true }); deferred.push(rel); continue; }
       plan[rel] = { offset, size: info.size, mtimeMs: info.mtimeMs, prefix };
     } finally { await handle.close(); }
   }
   await cache.save();
-  if (Object.keys(plan).length > 0) await writeFile(join(outDir, TAIL_PLAN_FILE), JSON.stringify(plan));
+  if (Object.keys(plan).length > 0 || deferred.length > 0) {
+    await mkdir(outDir, { recursive: true });
+    await writeFile(join(outDir, TAIL_PLAN_FILE), JSON.stringify(plan));
+    if (deferred.length > 0) await writeFile(join(outDir, TAIL_DEFERRED_FILE), JSON.stringify(deferred));
+  }
   return plan;
 }
 
@@ -212,7 +220,7 @@ export function restrictTo(requested: readonly string[] | undefined, allowed: It
 }
 
 /** Rsync exclude filters that keep planned histories out of the bulk transfer. */
-export function tailExcludeFilters(plan: TailPlan): string[] {
-  return Object.keys(plan).map((rel) => `--exclude=/${rel.replace(/[*?[\\]/g, "\\$&")}`);
+export function tailExcludeFilters(plan: TailPlan, deferred: readonly string[] = []): string[] {
+  return [...Object.keys(plan), ...deferred].map((rel) => `--exclude=/${rel.replace(/[*?[\\]/g, "\\$&")}`);
 }
 
