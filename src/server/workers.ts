@@ -9,7 +9,12 @@ import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
 import { scanMetric } from "./scan-metrics.ts";
 import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
-import { externalUsageCollectorOwnsRefreshes, USAGE_SNAPSHOT_REFRESH_INTERVAL_MS } from "../cli/usage/snapshot.ts";
+import {
+  externalUsageCollectorOwnsRefreshes,
+  recordUsageSnapshotRefreshFailure,
+  USAGE_SNAPSHOT_REFRESH_INTERVAL_MS,
+  type UsageSnapshotRefreshFailureCategory,
+} from "../cli/usage/snapshot.ts";
 import { defaultOpencodeProfileDbPath } from "../cli/usage/opencode-usage.ts";
 import { requestStaleUsageBreakdowns, refreshQueuedUsageBreakdowns } from "../cli/usage/breakdown-snapshot.ts";
 import { runBreakdownQuery } from "../cli/usage/breakdown.ts";
@@ -154,11 +159,81 @@ export function scanTimeoutAboveTokscale(baseMs: number): number {
   return Math.max(baseMs, tokscaleSpawnTimeoutMs() + 30_000);
 }
 
+export function usageSnapshotRefreshTimeoutMs(): number {
+  return scanTimeoutAboveTokscale(30 * 60_000);
+}
+
+/** Run one source cycle and turn transport failures into a safe persisted
+ * category. The isolated worker promise settles only after spawnScanWorkerNow
+ * has completed process-group cleanup, so the failure marker never races a
+ * still-running source child. */
+export async function runUsageSnapshotRefreshCycle(
+  run: () => Promise<{ ok: boolean; status?: number }>,
+  recordFailure: (category: UsageSnapshotRefreshFailureCategory) => Promise<unknown> = recordUsageSnapshotRefreshFailure,
+  logFailure: (category: UsageSnapshotRefreshFailureCategory) => void = (category) => {
+    console.warn("Usage snapshot refresh did not complete", { category });
+  },
+  logPersistenceFailure: (category: UsageSnapshotRefreshFailureCategory) => void = (category) => {
+    console.warn("Usage snapshot refresh failure could not be recorded", { category });
+  },
+): Promise<void> {
+  let category: UsageSnapshotRefreshFailureCategory | undefined;
+  try {
+    const result = await run();
+    if (!result.ok) category = result.status === 504 ? "collector-timeout" : "collector-failed";
+  } catch {
+    category = "collector-rejected";
+  }
+  if (!category) return;
+  try { logFailure(category); } catch { /* reporting must not prevent persistence */ }
+  try {
+    await recordFailure(category);
+  } catch {
+    try { logPersistenceFailure(category); } catch { /* safe logging is best effort */ }
+  }
+}
+
+export interface UsageSnapshotScheduledJobs {
+  source?: Promise<void>;
+  breakdown?: Promise<unknown>;
+}
+
+/** Start at most one source cycle and one drain. The drain waits for the
+ * source cycle so failure persistence finishes first, while later sampler
+ * ticks can schedule a new source even if the previous drain is still busy. */
+export function scheduleUsageSnapshotJobs(
+  jobs: UsageSnapshotScheduledJobs,
+  startSource: () => Promise<void>,
+  startBreakdown: () => Promise<unknown>,
+): void {
+  if (!jobs.source) {
+    let source!: Promise<void>;
+    source = Promise.resolve().then(startSource).finally(() => {
+      if (jobs.source === source) jobs.source = undefined;
+    });
+    jobs.source = source;
+  }
+  if (!jobs.breakdown) {
+    const sourceCycle = jobs.source!;
+    let breakdown!: Promise<unknown>;
+    breakdown = sourceCycle
+      .then(startBreakdown)
+      .catch(() => 0)
+      .finally(() => {
+        if (jobs.breakdown === breakdown) jobs.breakdown = undefined;
+      });
+    jobs.breakdown = breakdown;
+  }
+}
+
+export async function waitForUsageSnapshotJobs(jobs: UsageSnapshotScheduledJobs): Promise<void> {
+  await Promise.allSettled([jobs.source, jobs.breakdown].filter((job): job is Promise<unknown> => job !== undefined));
+}
+
 let warmed = false;
 let snapshotSampler: ReturnType<typeof setInterval> | undefined;
 let snapshotSourcePoller: ReturnType<typeof setInterval> | undefined;
-let snapshotRefreshInFlight: Promise<unknown> | undefined;
-let collectorCycleInFlight: Promise<void> | undefined;
+const snapshotJobs: UsageSnapshotScheduledJobs = {};
 let snapshotSourcePollInFlight: Promise<void> | undefined;
 let knownOpencodeDbSignatures = new Map<string, string>();
 
@@ -224,25 +299,21 @@ export function stopUsageSnapshotSourcePoller(): void {
 }
 
 function scheduleUsageSnapshotRefresh(run: typeof runScanIsolated): void {
-  if (collectorCycleInFlight) return;
-  collectorCycleInFlight = (async () => {
-    // The collector owns the default window even when no UI has requested it.
-    // This only queues a marker when its durable last-good cache is missing or stale.
-    requestStaleUsageBreakdowns();
-    if (!snapshotRefreshInFlight) {
-      snapshotRefreshInFlight = run("usageSnapshotRefresh", {}, scanTimeoutAboveTokscale(60_000))
-        .catch(() => undefined)
-        .finally(() => { snapshotRefreshInFlight = undefined; });
-    }
-    await snapshotRefreshInFlight;
-    await refreshQueuedUsageBreakdowns(
-      (query) => scanWorkerLimiter.run(() => runBreakdownQuery(query)),
-    ).catch(() => 0);
-  })().finally(() => { collectorCycleInFlight = undefined; });
+  // The collector owns the default window even when no UI has requested it.
+  // This only queues a marker when its durable last-good cache is missing or stale.
+  requestStaleUsageBreakdowns();
+  scheduleUsageSnapshotJobs(snapshotJobs,
+    () => runUsageSnapshotRefreshCycle(
+      () => run("usageSnapshotRefresh", {}, usageSnapshotRefreshTimeoutMs()),
+    ),
+    () => refreshQueuedUsageBreakdowns(
+        (query) => scanWorkerLimiter.run(() => runBreakdownQuery(query)),
+    ),
+  );
 }
 
-/** One bounded background collector per daemon. Busy ticks are dropped, so
- * a slow source scan cannot build an unbounded queue of full history reads. */
+/** One source refresh and one breakdown drain may run per daemon. Busy ticks
+ * are dropped per job, so slow work cannot build an unbounded queue. */
 export function startUsageSnapshotSampler(
   run: typeof runScanIsolated = runScanIsolated,
   intervalMs = USAGE_SNAPSHOT_REFRESH_INTERVAL_MS,
@@ -259,8 +330,8 @@ export function stopUsageSnapshotSampler(): void {
 }
 
 /** Long-running host producer entrypoint. A service manager supervises this
- * command; SIGTERM stops new ticks and waits for the one bounded collector
- * already in flight before returning. */
+ * command; SIGTERM stops new ticks and waits for bounded source, breakdown,
+ * and database-poll work already in flight before returning. */
 export async function runUsageSnapshotDaemon(): Promise<void> {
   const markerPath = join(aisCacheDir(), "usage", "collector.external");
   mkdirSync(join(aisCacheDir(), "usage"), { recursive: true, mode: 0o700 });
@@ -270,7 +341,10 @@ export async function runUsageSnapshotDaemon(): Promise<void> {
   const stopped = new Promise<void>((resolve) => { stop = resolve; });
   const onSignal = () => {
     stopUsageSnapshotSampler();
-    void (collectorCycleInFlight ?? snapshotRefreshInFlight ?? Promise.resolve()).finally(stop);
+    void Promise.allSettled([
+      waitForUsageSnapshotJobs(snapshotJobs),
+      snapshotSourcePollInFlight,
+    ].filter((job): job is Promise<void> => job !== undefined)).finally(stop);
   };
   process.once("SIGTERM", onSignal);
   process.once("SIGINT", onSignal);

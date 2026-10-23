@@ -1823,3 +1823,382 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
 --- a/crates/tokscale-core/src/lib.rs
 +++ b/crates/tokscale-core/src/lib.rs
+--- a/crates/tokscale-core/src/sessions/grok.rs
++++ b/crates/tokscale-core/src/sessions/grok.rs
+@@ -18 +18 @@
+-use crate::TokenBreakdown;
++use crate::{CostSource, TokenBreakdown};
+@@ -27,0 +28 @@
++const LEGACY_UNIFIED_TIMESTAMP_TOLERANCE_MS: u64 = 250;
+@@ -1092,10 +1093,12 @@
+-fn unified_turn_coverage(messages: &[UnifiedMessage]) -> HashMap<GrokAggregateCoverageKey, usize> {
+-    let mut by_session: HashMap<&str, Vec<&UnifiedMessage>> = HashMap::new();
+-    for message in messages
+-        .iter()
+-        .filter(|message| is_unified_log_message(message))
+-    {
+-        by_session
+-            .entry(&message.session_id)
+-            .or_default()
+-            .push(message);
++fn unified_turn_coverage(
++    messages: &[UnifiedMessage],
++    excluded_unified: &HashSet<usize>,
++) -> HashMap<GrokAggregateCoverageKey, usize> {
++    let mut by_session: HashMap<&str, Vec<(usize, &UnifiedMessage)>> = HashMap::new();
++    for (index, message) in messages.iter().enumerate() {
++        if is_unified_log_message(message) {
++            by_session
++                .entry(&message.session_id)
++                .or_default()
++                .push((index, message));
++        }
+@@ -1106 +1109 @@
+-        session_messages.sort_by_key(|message| message.timestamp);
++        session_messages.sort_by_key(|(_, message)| message.timestamp);
+@@ -1108,0 +1112 @@
++        let mut turn_contains_excluded = false;
+@@ -1110 +1114 @@
+-        for message in session_messages {
++        for (index, message) in session_messages {
+@@ -1112,4 +1116,6 @@
+-                if let Some(tokens) = turn_tokens.take() {
+-                    *coverage
+-                        .entry(aggregate_coverage_key(session_id, &tokens, turn_calls))
+-                        .or_insert(0) += 1;
++                if !turn_contains_excluded {
++                    if let Some(tokens) = turn_tokens.take() {
++                        *coverage
++                            .entry(aggregate_coverage_key(session_id, &tokens, turn_calls))
++                            .or_insert(0) += 1;
++                    }
+@@ -1118,0 +1125,5 @@
++                turn_contains_excluded = false;
++            }
++            if excluded_unified.contains(&index) {
++                turn_contains_excluded = true;
++                continue;
+@@ -1129,4 +1140,6 @@
+-        if let Some(tokens) = turn_tokens {
+-            *coverage
+-                .entry(aggregate_coverage_key(session_id, &tokens, turn_calls))
+-                .or_insert(0) += 1;
++        if !turn_contains_excluded {
++            if let Some(tokens) = turn_tokens {
++                *coverage
++                    .entry(aggregate_coverage_key(session_id, &tokens, turn_calls))
++                    .or_insert(0) += 1;
++            }
+@@ -1141,0 +1155 @@
++    let (jitter_covered_unified, jitter_matched_legacy) = jitter_covered_message_indices(&messages);
+@@ -1213 +1227 @@
+-    let mut covered_turn_aggregates = unified_turn_coverage(&messages);
++    let mut covered_turn_aggregates = unified_turn_coverage(&messages, &jitter_covered_unified);
+@@ -1216,4 +1230,3 @@
+-    for message in messages
+-        .iter()
+-        .filter(|message| is_unified_log_message(message))
+-    {
++    for (index, message) in messages.iter().enumerate().filter(|(index, message)| {
++        is_unified_log_message(message) && !jitter_covered_unified.contains(index)
++    }) {
+@@ -1233 +1246 @@
+-    for message in messages {
++    for (index, message) in messages.into_iter().enumerate() {
+@@ -1234,0 +1248,6 @@
++            if !jitter_covered_unified.contains(&index) {
++                selected.push(message);
++            }
++            continue;
++        }
++        if jitter_matched_legacy.contains(&index) {
+@@ -1287,0 +1307,94 @@
++fn jitter_covered_message_indices(messages: &[UnifiedMessage]) -> (HashSet<usize>, HashSet<usize>) {
++    type MatchKey = (String, String, String, String, i64, i64, i64, i64, i64, i64);
++
++    let match_key = |message: &UnifiedMessage| -> MatchKey {
++        (
++            message.client.clone(),
++            message.provider_id.clone(),
++            message.session_id.clone(),
++            message.model_id.clone(),
++            message.tokens.input,
++            message.tokens.output,
++            message.tokens.cache_read,
++            message.tokens.cache_write,
++            message.tokens.cache_write_1h,
++            message.tokens.reasoning,
++        )
++    };
++    let mut legacy_by_key: HashMap<MatchKey, Vec<usize>> = HashMap::new();
++    let mut unified_by_key: HashMap<MatchKey, Vec<usize>> = HashMap::new();
++    for (index, message) in messages.iter().enumerate() {
++        if message.model_id == UNKNOWN_MODEL
++            || message.message_count != 1
++            || message.client != CLIENT_ID
++            || message.provider_id != PROVIDER_ID
++            || message
++                .dedup_key
++                .as_deref()
++                .is_some_and(|key| key.ends_with(":signals"))
++        {
++            continue;
++        }
++        if is_unified_log_message(message) && message.cost_source == CostSource::Estimated {
++            unified_by_key
++                .entry(match_key(message))
++                .or_default()
++                .push(index);
++        } else if !is_unified_log_message(message)
++            && message
++                .dedup_key
++                .as_deref()
++                .is_some_and(|key| key.starts_with("grok:") && !key.ends_with(":signals"))
++            && message.cost_source == CostSource::ProviderReported
++        {
++            legacy_by_key
++                .entry(match_key(message))
++                .or_default()
++                .push(index);
++        }
++    }
++
++    let mut candidates_by_legacy: HashMap<usize, Vec<usize>> = HashMap::new();
++    let mut candidates_by_unified: HashMap<usize, Vec<usize>> = HashMap::new();
++    for (key, legacy_indices) in legacy_by_key {
++        let Some(unified_indices) = unified_by_key.get(&key) else {
++            continue;
++        };
++        for legacy_index in legacy_indices {
++            for &unified_index in unified_indices {
++                if messages[legacy_index]
++                    .timestamp
++                    .abs_diff(messages[unified_index].timestamp)
++                    <= LEGACY_UNIFIED_TIMESTAMP_TOLERANCE_MS
++                {
++                    candidates_by_legacy
++                        .entry(legacy_index)
++                        .or_default()
++                        .push(unified_index);
++                    candidates_by_unified
++                        .entry(unified_index)
++                        .or_default()
++                        .push(legacy_index);
++                }
++            }
++        }
++    }
++
++    let mut covered_unified = HashSet::new();
++    let mut matched_legacy = HashSet::new();
++    for (unified_index, legacy_indices) in candidates_by_unified {
++        if legacy_indices.len() != 1 {
++            continue;
++        }
++        let legacy_index = legacy_indices[0];
++        if candidates_by_legacy
++            .get(&legacy_index)
++            .is_some_and(|unified_indices| unified_indices.len() == 1)
++        {
++            covered_unified.insert(unified_index);
++            matched_legacy.insert(legacy_index);
++        }
++    }
++    (covered_unified, matched_legacy)
++}
++
+@@ -1831,0 +1945,28 @@
++    fn jitter_pair(
++        session_id: &str,
++        legacy_timestamp: i64,
++        unified_timestamp: i64,
++    ) -> (UnifiedMessage, UnifiedMessage) {
++        let mut legacy = test_message(session_id, &format!("grok:{session_id}:usage:0:turn-0"));
++        legacy.model_id = "grok-4.6".to_string();
++        legacy.timestamp = legacy_timestamp;
++        legacy.tokens = TokenBreakdown {
++            input: 100,
++            output: 20,
++            cache_read: 40,
++            cache_write: 5,
++            cache_write_1h: 2,
++            reasoning: 3,
++        };
++        legacy.cost = 0.02;
++        legacy.mark_provider_reported_cost();
++
++        let mut unified = test_message(session_id, &format!("grok-unified:{session_id}:event"));
++        unified.model_id = "grok-4.6".to_string();
++        unified.timestamp = unified_timestamp;
++        unified.tokens = legacy.tokens.clone();
++        unified.cost = 0.06;
++        unified.mark_estimated_cost();
++        (legacy, unified)
++    }
++
+@@ -2135,0 +2277,165 @@
++    }
++
++    #[test]
++    fn selector_deduplicates_unique_provider_reported_pair_with_timestamp_jitter() {
++        let (legacy, unified) = jitter_pair("jitter", 1_700_000_000_000, 1_700_000_000_187);
++
++        let messages = prefer_unified_log_messages(vec![unified, legacy]);
++
++        assert_eq!(messages.len(), 1);
++        assert_eq!(
++            messages[0].dedup_key.as_deref(),
++            Some("grok:jitter:usage:0:turn-0")
++        );
++        assert_eq!(messages[0].cost, 0.02);
++        assert_eq!(messages[0].cost_source, CostSource::ProviderReported);
++    }
++
++    #[test]
++    fn selector_retains_ambiguous_repeated_identical_calls() {
++        let (legacy_a, unified_a) = jitter_pair("repeat", 1_700_000_000_000, 1_700_000_000_050);
++        let (mut legacy_b, mut unified_b) =
++            jitter_pair("repeat", 1_700_000_000_100, 1_700_000_000_150);
++        legacy_b.dedup_key = Some("grok:repeat:usage:1:turn-1".to_string());
++        unified_b.dedup_key = Some("grok-unified:repeat:event-2".to_string());
++
++        let messages = prefer_unified_log_messages(vec![legacy_a, unified_a, legacy_b, unified_b]);
++
++        assert_eq!(messages.len(), 4);
++    }
++
++    #[test]
++    fn selector_rejects_unknown_models_and_signal_rows_for_jitter_matching() {
++        let (mut unknown_legacy, mut unknown_unified) =
++            jitter_pair("unknown", 1_700_000_000_000, 1_700_000_000_100);
++        unknown_legacy.model_id = UNKNOWN_MODEL.to_string();
++        unknown_unified.model_id = UNKNOWN_MODEL.to_string();
++
++        let (mut signal_legacy, mut signal_unified) =
++            jitter_pair("signals", 1_700_000_000_000, 1_700_000_000_100);
++        signal_legacy.dedup_key = Some("grok:signals:signals".to_string());
++        signal_unified.dedup_key = Some("grok-unified:signals:signals".to_string());
++
++        let messages = prefer_unified_log_messages(vec![
++            unknown_legacy,
++            unknown_unified,
++            signal_legacy,
++            signal_unified,
++        ]);
++
++        assert_eq!(messages.len(), 4);
++    }
++
++    #[test]
++    fn selector_deduplicates_at_jitter_window_boundary() {
++        let (legacy, unified) = jitter_pair("boundary", 1_700_000_000_000, 1_700_000_000_250);
++
++        let messages = prefer_unified_log_messages(vec![legacy, unified]);
++
++        assert_eq!(messages.len(), 1);
++    }
++
++    #[test]
++    fn selector_retains_timestamp_outside_jitter_window() {
++        let (legacy, unified) = jitter_pair("late", 1_700_000_000_000, 1_700_000_000_251);
++
++        let messages = prefer_unified_log_messages(vec![legacy, unified]);
++
++        assert_eq!(messages.len(), 2);
++    }
++
++    #[test]
++    fn selector_preserves_matched_legacy_when_unified_timestamp_covers_other_row() {
++        let (legacy, unified) = jitter_pair("coverage", 1_700_000_000_000, 1_700_000_000_000);
++        let mut other_legacy = test_message("coverage", "grok:coverage:usage:other:turn");
++        other_legacy.model_id = "grok-4.6".to_string();
++        other_legacy.timestamp = 1_700_000_000_000;
++        other_legacy.tokens = TokenBreakdown {
++            input: 120,
++            output: 0,
++            cache_read: 45,
++            cache_write: 0,
++            cache_write_1h: 0,
++            reasoning: 5,
++        };
++        other_legacy.mark_provider_reported_cost();
++
++        let messages = prefer_unified_log_messages(vec![legacy, unified, other_legacy]);
++
++        assert_eq!(messages.len(), 2);
++        assert!(messages
++            .iter()
++            .all(|message| message.cost_source == CostSource::ProviderReported));
++    }
++
++    #[test]
++    fn selector_does_not_use_partial_turn_after_jitter_suppression() {
++        let (legacy, mut duplicate) =
++            jitter_pair("partial-turn", 1_700_000_000_000, 1_700_000_000_100);
++        duplicate.is_turn_start = true;
++
++        let mut unified_a = test_message("partial-turn", "grok-unified:partial-turn:remaining-a");
++        unified_a.model_id = "grok-4.6".to_string();
++        unified_a.timestamp = 1_700_000_000_200;
++        unified_a.tokens.input = 10;
++        unified_a.mark_estimated_cost();
++        let mut unified_b = test_message("partial-turn", "grok-unified:partial-turn:remaining-b");
++        unified_b.model_id = "grok-4.6".to_string();
++        unified_b.timestamp = 1_700_000_000_300;
++        unified_b.tokens.output = 5;
++        unified_b.mark_estimated_cost();
++
++        let mut unrelated_aggregate =
++            test_message("partial-turn", "grok:partial-turn:usage:aggregate:turn");
++        unrelated_aggregate.model_id = "grok-4.6".to_string();
++        unrelated_aggregate.tokens = TokenBreakdown {
++            input: 10,
++            output: 5,
++            cache_read: 0,
++            cache_write: 0,
++            cache_write_1h: 0,
++            reasoning: 0,
++        };
++        unrelated_aggregate.message_count = 2;
++        unrelated_aggregate.mark_provider_reported_cost();
++
++        let messages = prefer_unified_log_messages(vec![
++            legacy,
++            duplicate,
++            unified_a,
++            unified_b,
++            unrelated_aggregate,
++        ]);
++
++        assert_eq!(messages.len(), 4);
++        assert!(messages.iter().any(|message| message.dedup_key.as_deref()
++            == Some("grok:partial-turn:usage:aggregate:turn")));
++    }
++
++    #[test]
++    fn selector_retains_token_or_model_mismatch() {
++        let (legacy, mut different_tokens) =
++            jitter_pair("tokens", 1_700_000_000_000, 1_700_000_000_100);
++        different_tokens.tokens.cache_write += 1;
++        let (legacy_model, mut different_model) =
++            jitter_pair("model", 1_700_000_000_000, 1_700_000_000_100);
++        different_model.model_id = "grok-4.5".to_string();
++
++        let messages = prefer_unified_log_messages(vec![
++            legacy,
++            different_tokens,
++            legacy_model,
++            different_model,
++        ]);
++
++        assert_eq!(messages.len(), 4);
++    }
++
++    #[test]
++    fn selector_retains_provider_reported_legacy_when_unified_source_disappears() {
++        let (legacy, _) = jitter_pair("rotated", 1_700_000_000_000, 1_700_000_000_100);
++
++        let messages = prefer_unified_log_messages(vec![legacy]);
++
++        assert_eq!(messages.len(), 1);
++        assert_eq!(messages[0].cost_source, CostSource::ProviderReported);

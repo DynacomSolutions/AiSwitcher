@@ -10,6 +10,12 @@ import { runBatched } from "../limits/collect.ts";
 import { borderRow, padRow } from "../table.ts";
 import { formatCost, formatNumber } from "./report.ts";
 import { collectTargets, type UsageTarget } from "./run.ts";
+import {
+  breakdownProjectionCachePath,
+  readBreakdownProjectionCache,
+  sourceFingerprint,
+  writeBreakdownProjectionCache,
+} from "./breakdown-projection-cache.ts";
 
 /**
  * Per-identity breakdown of WHAT consumed tokens and estimated cost: built-in
@@ -82,6 +88,12 @@ export interface BreakdownDeps extends LocalEstimateDeps {
   /** Streams one file line by line. Defaults to streaming the real file;
    * injected by tests so collector suites never touch the real home. */
   readLines?: (path: string) => AsyncIterable<string>;
+  /** Test seam for isolated persistent projection-cache fixtures. */
+  projectionCacheDir?: string;
+  /** Test seam for deterministic source fingerprints. */
+  sourceFingerprint?: (path: string) => string;
+  /** Counts actual transcript opens in cache regression tests. */
+  onSourceFileRead?: (path: string) => void;
   now?: () => Date;
 }
 
@@ -93,14 +105,14 @@ function isMissingPath(error: unknown): boolean {
   return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
 
-function listingDeps(deps: BreakdownDeps, sourceFailure: { value: boolean }): BreakdownDeps {
+function listingDeps(deps: BreakdownDeps, sourceFailure: { value: boolean }, root: string): BreakdownDeps {
   return {
     ...deps,
     readdir(path) {
       try {
         return deps.readdir ? deps.readdir(path) : readdirSync(path, { encoding: "utf8" });
       } catch (error) {
-        if (!isMissingPath(error)) sourceFailure.value = true;
+        if (!isMissingPath(error) || path !== root) sourceFailure.value = true;
         throw error;
       }
     },
@@ -108,7 +120,7 @@ function listingDeps(deps: BreakdownDeps, sourceFailure: { value: boolean }): Br
       try {
         return deps.isDirectory ? deps.isDirectory(path) : statSync(path).isDirectory();
       } catch (error) {
-        if (!isMissingPath(error)) sourceFailure.value = true;
+        if (!isMissingPath(error) || path !== root) sourceFailure.value = true;
         throw error;
       }
     },
@@ -116,7 +128,7 @@ function listingDeps(deps: BreakdownDeps, sourceFailure: { value: boolean }): Br
       try {
         return deps.mtimeMs ? deps.mtimeMs(path) : statSync(path).mtimeMs;
       } catch (error) {
-        if (!isMissingPath(error)) sourceFailure.value = true;
+        if (!isMissingPath(error) || path !== root) sourceFailure.value = true;
         throw error;
       }
     },
@@ -371,6 +383,84 @@ function parseTimestampMs(raw: unknown): number | undefined {
   return Number.isFinite(ms) ? ms : undefined;
 }
 
+type ProjectedFile = { events: unknown[][]; sourceError: boolean };
+
+async function projectedFileEvents(
+  tool: ToolConfig["toolName"],
+  identity: Identity,
+  file: string,
+  deps: BreakdownDeps,
+  project: (path: string, readLines: NonNullable<BreakdownDeps["readLines"]>) => Promise<unknown[][] | { events: unknown[][]; sourceError: boolean }>,
+): Promise<ProjectedFile> {
+  // Injected readers remain uncached unless a test explicitly supplies an
+  // isolated cache. Production reads always use the durable machine cache.
+  const enabled = !deps.readLines || deps.projectionCacheDir !== undefined;
+  if (!enabled) {
+    try {
+      deps.onSourceFileRead?.(file);
+      const result = await project(file, deps.readLines ?? streamLines);
+      return Array.isArray(result) ? { events: result, sourceError: false } : result;
+    } catch {
+      return { events: [], sourceError: true };
+    }
+  }
+
+  const cachePath = breakdownProjectionCachePath(tool, identity.name, identity.configDir, file, { cacheDir: deps.projectionCacheDir });
+  const fingerprint = deps.sourceFingerprint ?? sourceFingerprint;
+  let before: string;
+  try {
+    before = fingerprint(file);
+  } catch {
+    return { events: [], sourceError: true };
+  }
+  const cached = readBreakdownProjectionCache(cachePath, tool === "claude" ? validClaudeProjection : validCodexProjection);
+  if (cached?.fingerprint === before) return { events: cached.events, sourceError: false };
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let start: string;
+    try {
+      start = fingerprint(file);
+      deps.onSourceFileRead?.(file);
+      const result = await project(file, deps.readLines ?? streamLines);
+      const end = fingerprint(file);
+      if (start !== end) continue;
+      const parsed = Array.isArray(result) ? { events: result, sourceError: false } : result;
+      if (!parsed.sourceError) {
+        try { writeBreakdownProjectionCache(cachePath, end, parsed.events); } catch { /* advisory cache failure */ }
+      }
+      return parsed;
+    } catch {
+      return { events: [], sourceError: true };
+    }
+  }
+  return { events: [], sourceError: true };
+}
+
+function shouldIncludeEvent(atMs: number | null, windowStartMs: number): boolean {
+  return atMs === null || atMs >= windowStartMs;
+}
+
+function finiteNumbers(values: unknown[]): boolean {
+  return values.every((value) => typeof value === "number" && Number.isFinite(value));
+}
+
+function validClaudeProjection(events: unknown[]): events is unknown[][] {
+  return events.every((value) => Array.isArray(value) && value.length === 7 &&
+    (value[0] === null || (typeof value[0] === "number" && Number.isFinite(value[0]))) &&
+    typeof value[1] === "string" && finiteNumbers(value.slice(2, 6)) &&
+    Array.isArray(value[6]) && value[6].every((name) => typeof name === "string"));
+}
+
+function validCodexProjection(events: unknown[]): events is unknown[][] {
+  return events.every((value) => Array.isArray(value) && (
+    (value[0] === "c" && value.length === 3 && typeof value[1] === "string" && typeof value[2] === "string") ||
+    (value[0] === "t" && value.length === 3 &&
+      (value[1] === null || (typeof value[1] === "number" && Number.isFinite(value[1]))) && typeof value[2] === "string") ||
+    (value[0] === "u" && value.length === 7 && typeof value[2] === "string" &&
+      (value[1] === null || (typeof value[1] === "number" && Number.isFinite(value[1]))) && finiteNumbers(value.slice(3)))
+  ));
+}
+
 /* ------------------------------- claude ----------------------------------- */
 
 interface ClaudeLine {
@@ -405,54 +495,51 @@ async function collectClaudeBreakdown(
   deps: BreakdownDeps,
 ): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
   const sourceFailure = { value: false };
-  const { files, unreadable } = listRecentFiles(join(identity.configDir, "projects"), new Date(windowStartMs), listingDeps(deps, sourceFailure), false);
+  const root = join(identity.configDir, "projects");
+  const { files, unreadable } = listRecentFiles(root, new Date(windowStartMs), listingDeps(deps, sourceFailure, root), false);
   const acc = new BreakdownAccumulator();
-  const readLines = deps.readLines ?? streamLines;
   let sourceError = sourceFailure.value;
   for (const file of files) {
-    try {
-      for await (const line of readLines(file)) {
-        // Cheap pre-filter: only assistant lines carry message.usage.
+    const projected = await projectedFileEvents("claude", identity, file, deps, async (path, readLines) => {
+      const events: unknown[][] = [];
+      let sourceError = false;
+      try { for await (const line of readLines(path)) {
         if (!line.includes('"usage"')) continue;
         let parsed: ClaudeLine;
-        try {
-          parsed = JSON.parse(line) as ClaudeLine;
-        } catch {
-          continue; // torn/truncated line: never sink the breakdown
-        }
+        try { parsed = JSON.parse(line) as ClaudeLine; } catch { continue; }
         const usage = parsed.message?.usage;
         if (!usage) continue;
-        const atMs = parseTimestampMs(parsed.timestamp);
-        if (atMs !== undefined && atMs < windowStartMs) continue;
-        const model = parsed.message?.model ?? "unknown";
-        const lot: UsageLot = {
-          input: usage.input_tokens ?? 0,
-          output: usage.output_tokens ?? 0,
-          cacheRead: usage.cache_read_input_tokens ?? 0,
-          cacheWrite: usage.cache_creation_input_tokens ?? 0,
-        };
-        // Rule 1: prompt-side tokens always belong to the conversation row.
-        acc.add("conversation", "conversation", model, { ...lot, output: 0 }, atMs);
-        acc.countCall("conversation", "conversation", atMs);
-        // Rule 2: output splits evenly across this message's tool calls.
-        const names = toolUseNames(parsed.message?.content);
-        if (names.length === 0) {
-          acc.add("conversation", "conversation", model, { input: 0, output: lot.output, cacheRead: 0, cacheWrite: 0 }, atMs);
-          continue;
-        }
-        const shares = splitEvenly(lot.output, names.length);
-        names.forEach((rawName, i) => {
-          const classified = classifyToolCall(rawName);
-          // Bucket MCP calls under their full per-tool name; the rollup row
-          // (mcp:<server>) is summed by finish() from these detail rows.
-          acc.add(classified.kind, classified.detail, model, { input: 0, output: shares[i] ?? 0, cacheRead: 0, cacheWrite: 0 }, atMs, classified.server);
-          acc.countCall(classified.kind, classified.detail, atMs, classified.server);
-        });
+        events.push([
+          parseTimestampMs(parsed.timestamp) ?? null,
+          parsed.message?.model ?? "unknown",
+          usage.input_tokens ?? 0,
+          usage.output_tokens ?? 0,
+          usage.cache_read_input_tokens ?? 0,
+          usage.cache_creation_input_tokens ?? 0,
+          toolUseNames(parsed.message?.content),
+        ]);
+      } } catch { sourceError = true; }
+      return { events, sourceError };
+    });
+    sourceError ||= projected.sourceError;
+    for (const event of projected.events) {
+      const [atValue, modelValue, input, output, cacheRead, cacheWrite, callNames] = event;
+      const atMs = typeof atValue === "number" ? atValue : undefined;
+      if (!shouldIncludeEvent(atValue === null ? null : atMs ?? null, windowStartMs)) continue;
+      const model = typeof modelValue === "string" ? modelValue : "unknown";
+      const names = Array.isArray(callNames) ? callNames.filter((name): name is string => typeof name === "string") : [];
+      acc.add("conversation", "conversation", model, { input: input as number, output: 0, cacheRead: cacheRead as number, cacheWrite: cacheWrite as number }, atMs);
+      acc.countCall("conversation", "conversation", atMs);
+      if (names.length === 0) {
+        acc.add("conversation", "conversation", model, { input: 0, output: output as number, cacheRead: 0, cacheWrite: 0 }, atMs);
+        continue;
       }
-    } catch (readError) {
-      // The result may still be useful to display, but it is incomplete and
-      // must not replace a persisted last-good snapshot.
-      if (!isMissingPath(readError)) sourceError = true;
+      const shares = splitEvenly(output as number, names.length);
+      names.forEach((rawName, i) => {
+        const classified = classifyToolCall(rawName);
+        acc.add(classified.kind, classified.detail, model, { input: 0, output: shares[i] ?? 0, cacheRead: 0, cacheWrite: 0 }, atMs, classified.server);
+        acc.countCall(classified.kind, classified.detail, atMs, classified.server);
+      });
     }
   }
   const finished = acc.finish();
@@ -503,12 +590,59 @@ async function collectCodexBreakdown(
   deps: BreakdownDeps,
 ): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
   const sourceFailure = { value: false };
-  const { files, unreadable } = listRecentFiles(join(identity.configDir, "sessions"), new Date(windowStartMs), listingDeps(deps, sourceFailure), true);
+  const root = join(identity.configDir, "sessions");
+  const { files, unreadable } = listRecentFiles(root, new Date(windowStartMs), listingDeps(deps, sourceFailure, root), true);
   const acc = new BreakdownAccumulator();
-  const readLines = deps.readLines ?? streamLines;
   let sourceError = sourceFailure.value;
 
   for (const file of files) {
+    const projected = await projectedFileEvents("codex", identity, file, deps, async (path, readLines) => {
+      const events: unknown[][] = [];
+      let model = "unknown";
+      let sourceError = false;
+      try { for await (const line of readLines(path)) {
+        if (
+          !line.includes("token_count") &&
+          !line.includes("turn_context") &&
+          !line.includes("function_call") &&
+          !line.includes("custom_tool_call") &&
+          !line.includes("local_shell_call")
+        ) continue;
+        let parsed: (CodexTokenCountLine | CodexCallLine) & { type?: string };
+        try { parsed = JSON.parse(line) as (CodexTokenCountLine | CodexCallLine) & { type?: string }; } catch { continue; }
+        const atMs = parseTimestampMs(parsed.timestamp) ?? null;
+        if (parsed.type === "turn_context") {
+          const payload = (parsed as { payload?: { model?: unknown; turn_id?: unknown } }).payload;
+          if (!payload) continue;
+          const turnKey = typeof payload.turn_id === "string" ? payload.turn_id : String(parsed.timestamp ?? "");
+          if (typeof payload.model === "string") model = payload.model;
+          events.push(["c", turnKey, model]);
+          continue;
+        }
+        if (parsed.type === "response_item") {
+          const payload = (parsed as CodexCallLine).payload;
+          if (!payload) continue;
+          let rawName: string | undefined;
+          if (payload.type === "function_call" || payload.type === "custom_tool_call") {
+            rawName = typeof payload.name === "string" ? payload.name : undefined;
+          } else if (payload.type === "local_shell_call") {
+            rawName = typeof payload.action?.type === "string" ? payload.action.type : "exec";
+          }
+          if (rawName) events.push(["t", atMs, rawName]);
+          continue;
+        }
+        if (parsed.type === "event_msg" && (parsed as CodexTokenCountLine).payload?.type === "token_count") {
+          const usage = (parsed as CodexTokenCountLine).payload?.info?.last_token_usage;
+          if (!usage) continue;
+          const input = usage.input_tokens ?? 0;
+          const cached = Math.min(usage.cached_input_tokens ?? 0, input);
+          const cacheWrite = Math.min(usage.cache_write_input_tokens ?? 0, input - cached);
+          events.push(["u", atMs, model, Math.max(0, input - cached - cacheWrite), cached, cacheWrite, usage.output_tokens ?? 0]);
+        }
+      } } catch { sourceError = true; }
+      return { events, sourceError };
+    });
+    sourceError ||= projected.sourceError;
     let model = "unknown";
     let turn: CodexTurnState | undefined;
     const flushTurn = (): void => {
@@ -528,80 +662,43 @@ async function collectCodexBreakdown(
       turn = undefined;
     };
 
-    try {
-      for await (const line of readLines(file)) {
-        if (
-          !line.includes("token_count") &&
-          !line.includes("turn_context") &&
-          !line.includes("function_call") &&
-          !line.includes("custom_tool_call") &&
-          !line.includes("local_shell_call")
-        ) {
-          continue;
+    for (const event of projected.events) {
+      if (event[0] === "c") {
+        const turnKey = event[1] as string;
+        if (!turn || turn.key !== turnKey) {
+          flushTurn();
+          turn = { key: turnKey, calls: [], pendingOutput: [] };
         }
-        let parsed: (CodexTokenCountLine | CodexCallLine) & { type?: string };
-        try {
-          parsed = JSON.parse(line) as (CodexTokenCountLine | CodexCallLine) & { type?: string };
-        } catch {
-          continue;
-        }
-        const atMs = parseTimestampMs(parsed.timestamp);
-
-        if (parsed.type === "turn_context") {
-          const payload = (parsed as { payload?: { model?: unknown; turn_id?: unknown } }).payload;
-          if (!payload) continue;
-          const turnKey = typeof payload.turn_id === "string" ? payload.turn_id : String(parsed.timestamp ?? "");
-          if (!turn || turn.key !== turnKey) {
-            flushTurn();
-            turn = { key: turnKey, calls: [], pendingOutput: [] };
-          }
-          if (typeof payload.model === "string") model = payload.model;
-          continue;
-        }
-
-        if (parsed.type === "response_item") {
-          const payload = (parsed as CodexCallLine).payload;
-          if (!payload) continue;
-          const payloadType = payload.type;
-          let rawName: string | undefined;
-          if (payloadType === "function_call" || payloadType === "custom_tool_call") {
-            rawName = typeof payload.name === "string" ? payload.name : undefined;
-          } else if (payloadType === "local_shell_call") {
-            rawName = typeof payload.action?.type === "string" ? payload.action.type : "exec";
-          }
-          if (!rawName) continue;
-          if (atMs !== undefined && atMs < windowStartMs) continue;
-          turn ??= { key: "", calls: [], pendingOutput: [] };
-          const classified = classifyToolCall(rawName);
-          turn.calls.push({ classified, atMs });
-          acc.countCall(classified.kind, classified.detail, atMs, classified.server);
-          continue;
-        }
-
-        if (parsed.type === "event_msg" && (parsed as CodexTokenCountLine).payload?.type === "token_count") {
-          const usage = (parsed as CodexTokenCountLine).payload?.info?.last_token_usage;
-          if (!usage) continue;
-          if (atMs !== undefined && atMs < windowStartMs) continue;
-          const input = usage.input_tokens ?? 0;
-          const cached = Math.min(usage.cached_input_tokens ?? 0, input);
-          const cacheWrite = Math.min(usage.cache_write_input_tokens ?? 0, input - cached);
+        model = event[2] as string;
+        continue;
+      }
+      const atValue = event[1];
+      const atMs = typeof atValue === "number" ? atValue : undefined;
+      if (event[0] === "t") {
+        if (atMs !== undefined && atMs < windowStartMs) continue;
+        turn ??= { key: "", calls: [], pendingOutput: [] };
+        const classified = classifyToolCall(event[2] as string);
+        turn.calls.push({ classified, atMs });
+        acc.countCall(classified.kind, classified.detail, atMs, classified.server);
+      } else if (event[0] === "u") {
+        if (atMs !== undefined && atMs < windowStartMs) continue;
+        model = event[2] as string;
+        const input = event[3] as number;
+        const cached = event[4] as number;
+        const cacheWrite = event[5] as number;
+        const output = event[6] as number;
           // Rule 1: the prompt side is conversation, exactly like Claude.
           acc.add(
             "conversation",
             "conversation",
             model,
-            { input: Math.max(0, input - cached - cacheWrite), output: 0, cacheRead: cached, cacheWrite },
+            { input, output: 0, cacheRead: cached, cacheWrite },
             atMs,
           );
           acc.countCall("conversation", "conversation", atMs);
           turn ??= { key: "", calls: [], pendingOutput: [] };
-          turn.pendingOutput.push({ model, output: usage.output_tokens ?? 0, atMs });
-        }
+          turn.pendingOutput.push({ model, output, atMs });
       }
-    } catch (readError) {
-      // Keep any partial display rows, while marking the generation unsafe
-      // for replacement of a persisted last-good snapshot.
-      if (!isMissingPath(readError)) sourceError = true;
     }
     flushTurn();
   }

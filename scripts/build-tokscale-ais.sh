@@ -50,6 +50,7 @@ cmp -- "$repo_root/vendor/tokscale/LICENSE" "$source_dir/LICENSE"
 patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais.patch"
 
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_shared_snapshot)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib selector_)
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --bin tokscale ais_shared_overlay)
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --test cli_tests ais_native_export_from_json_model_report_uses_report_parser_vector)
 (cd "$source_dir" && cargo build --locked --release --package tokscale-cli --bin tokscale)

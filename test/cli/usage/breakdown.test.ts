@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   classifyToolCall,
@@ -9,6 +11,7 @@ import {
   type BreakdownDeps,
   type BreakdownResult,
 } from "../../../src/cli/usage/breakdown.ts";
+import { breakdownProjectionCachePath } from "../../../src/cli/usage/breakdown-projection-cache.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
 /** A synthetic in-memory "configDir": collector suites never touch the real
@@ -47,6 +50,8 @@ function identity(configDir = "/synthetic/SYNTHETIC_FIXTURE/config"): Identity {
 }
 
 const NOW_MS = Date.parse("2026-09-10T12:00:00.000Z");
+const projectionDirs: string[] = [];
+afterEach(() => { for (const dir of projectionDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const day = (offset: number, hour = 12) => new Date(NOW_MS - offset * 86_400_000 - (12 - hour) * 3_600_000).toISOString();
 
 function claudeAssistantLine(opts: {
@@ -438,5 +443,85 @@ describe("misc", () => {
     expect(rendered).toContain("EST. COST");
     expect(rendered).toContain("Unavailable:");
     expect(rendered).toContain("grok/fixture");
+  });
+});
+
+describe("durable breakdown projections", () => {
+  function cachedDeps(files: Record<string, FakeFile>, cacheDir: string, fingerprints: Record<string, string>, reads: string[]): BreakdownDeps {
+    return {
+      ...fakeDeps(files),
+      projectionCacheDir: cacheDir,
+      sourceFingerprint: (path) => fingerprints[path]!,
+      onSourceFileRead: (path) => reads.push(path),
+    };
+  }
+
+  test("Claude cached projection matches uncached windows without losing boundary timestamps", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "ais-breakdown-cache-"));
+    projectionDirs.push(cacheDir);
+    const path = `${identity().configDir}/projects/proj/a.jsonl`;
+    const files = { [path]: { mtimeMs: NOW_MS, lines: [claudeAssistantLine({ at: day(0), input: 20, output: 3, tools: ["Bash"] }), claudeAssistantLine({ at: day(2), input: 40, output: 5, tools: ["Read"] }), claudeAssistantLine({ at: day(31), input: 80, output: 7 })] } };
+    const fingerprints = { [path]: "claude-v1" };
+    const reads: string[] = [];
+    for (const days of [1, 30]) {
+      const uncached = await claudeResult(files, days);
+      const first = await collectIdentityBreakdown("claude", identity(), days, cachedDeps(files, cacheDir, fingerprints, reads));
+      const restarted = await collectIdentityBreakdown("claude", identity(), days, cachedDeps(files, cacheDir, fingerprints, reads));
+      expect(first).toEqual(uncached);
+      expect(restarted).toEqual(uncached);
+    }
+    expect(reads).toEqual([path]);
+  });
+
+  test("Codex cached projection preserves model, call split, and exact window filtering", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "ais-breakdown-cache-"));
+    projectionDirs.push(cacheDir);
+    const path = `${identity().configDir}/sessions/a.jsonl`;
+    const lines = [
+      ...codexRolloutLines({ model: "gpt-5", turnId: "in", calls: [{ name: "Bash", at: day(0) }, { name: "Read", at: day(0) }], deltas: [{ at: day(0), input: 100, cached: 20, cacheWrite: 10, output: 9 }] }),
+      ...codexRolloutLines({ model: "gpt-5", turnId: "out", calls: [{ name: "Write", at: day(2) }], deltas: [{ at: day(2), input: 50, cached: 0, cacheWrite: 0, output: 4 }] }),
+    ];
+    const files = { [path]: { mtimeMs: NOW_MS, lines } };
+    const fingerprints = { [path]: "codex-v1" };
+    const reads: string[] = [];
+    for (const days of [1, 30]) {
+      const uncached = await codexResult(files, days);
+      const cached = await collectIdentityBreakdown("codex", identity(), days, cachedDeps(files, cacheDir, fingerprints, reads));
+      expect(cached).toEqual(uncached);
+    }
+    expect(reads).toEqual([path]);
+  });
+
+  test("changed files, including a completed trailing partial line, are reparsed", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "ais-breakdown-cache-"));
+    projectionDirs.push(cacheDir);
+    const path = `${identity().configDir}/projects/proj/a.jsonl`;
+    const complete = claudeAssistantLine({ at: day(0), input: 10 });
+    const added = claudeAssistantLine({ at: day(0), input: 30 });
+    const files = { [path]: { mtimeMs: NOW_MS, lines: [complete, '{"message":'] } };
+    const fingerprints: Record<string, string> = { [path]: "v1" };
+    const reads: string[] = [];
+    const options = () => cachedDeps(files, cacheDir, fingerprints, reads);
+    expect(category(await collectIdentityBreakdown("claude", identity(), 30, options()), "conversation").inputTokens).toBe(10);
+    files[path]!.lines = [complete, added];
+    fingerprints[path] = "v2";
+    expect(category(await collectIdentityBreakdown("claude", identity(), 30, options()), "conversation").inputTokens).toBe(40);
+    expect(reads).toEqual([path, path]);
+  });
+
+  test("malformed matching-fingerprint cache is rebuilt from the source", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "ais-breakdown-cache-"));
+    projectionDirs.push(cacheDir);
+    const path = `${identity().configDir}/projects/proj/a.jsonl`;
+    const files = { [path]: { mtimeMs: NOW_MS, lines: [claudeAssistantLine({ at: day(0), input: 22 })] } };
+    const fingerprints = { [path]: "stable" };
+    const reads: string[] = [];
+    const cachePath = breakdownProjectionCachePath("claude", identity().name, identity().configDir, path, { cacheDir });
+    await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
+    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 1, fingerprint: "stable", events: [[null, "bad", "not-a-number"]] }));
+    const result = await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
+    expect(category(result, "conversation").inputTokens).toBe(22);
+    expect(reads).toEqual([path, path]);
+    expect(JSON.parse(readFileSync(cachePath, "utf8")).events[0]).toHaveLength(7);
   });
 });
