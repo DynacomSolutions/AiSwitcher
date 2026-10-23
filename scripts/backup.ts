@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
-import { access, constants, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { aisBackupConfigPath, aisBackupLockPath, aisBackupsDir } from "../src/shared/ais-home.ts";
+import { Database } from "bun:sqlite";
+import { access, appendFile, chmod, constants, link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { aisBackupConfigPath, aisBackupLockPath, aisBackupsDir, aisBackupsSqliteDir } from "../src/shared/ais-home.ts";
 import { acquirePidLock } from "../src/shared/pid-lock.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../src/shared/reproducible-paths.ts";
 
@@ -29,9 +30,8 @@ type BackupGroup = keyof typeof BACKUP_GROUPS;
 // Meaningless (or actively harmful) to restore, on top of the reproducible
 // junk shared with SSH sync — a stale lock/socket file "restored" into a
 // live directory later would just confuse whatever's watching for one.
-// Unlike SSH sync, SQLite/db files are deliberately NOT excluded here: this
-// is a point-in-time safety-net copy, not a live merge target, so it wants
-// the same full-fidelity content the old tar-based backup always included.
+// SQLite databases are found per run by header (see findSqliteFiles) and added to
+// info/exclude; they are snapshotted with SQLite's online backup instead of via git.
 // "**/jobs/*/tmp/": agent job scratch dirs hold throwaway checkouts that can
 // carry their own .gitattributes. The leading "**/" is what makes it match at
 // any depth in gitignore syntax (rsync matched unanchored).
@@ -418,6 +418,18 @@ async function backupAndCommitInner(groups: readonly BackupGroup[], home: string
     return repoDir;
   }
 
+  // SQLite files stay out of git (hashing multi-GB live DBs is slow and can capture them
+  // mid-write); they are snapshotted consistently after the commit instead.
+  const sqlite = await findSqliteFiles(home, mirrored);
+  await appendFile(join(repoDir, ".git", "info", "exclude"), sqlite.excludes.map((p) => `${gitignoreEscape(p)}\n`).join(""));
+  try {
+    return await commitMirrored(home, repoDir, mirrored, polluted, sqlite.all);
+  } finally {
+    await snapshotSqlite(home, sqlite.dbs);
+  }
+}
+
+async function commitMirrored(home: string, repoDir: string, mirrored: string[], polluted: readonly string[], sqliteAll: ReadonlySet<string>): Promise<string> {
   // A group dir (or anything above it) matched by a .gitignore outside our
   // control, e.g. `*` in ~/.gitignore, would make `git add` store nothing and
   // still look successful. That file cannot be disabled by config, so fail loudly.
@@ -431,10 +443,11 @@ async function backupAndCommitInner(groups: readonly BackupGroup[], home: string
     }
   }
 
-  // Already-tracked files that now match BACKUP_EXCLUDES leave the index.
+  // Already-tracked files that now match BACKUP_EXCLUDES leave the index; this is also the
+  // one-time migration that stops tracking SQLite files (history is not rewritten).
   const excluded = await runGit(repoDir, home, ["ls-files", "-ci", `--exclude-from=${join(repoDir, ".git", "info", "exclude")}`, "-z", "--", ...mirrored]);
   if (excluded.exitCode === 0 && excluded.stdout.length > 0) {
-    await runGit(repoDir, home, ["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"], excluded.stdout);
+    await runGit(repoDir, home, ["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"], excluded.stdout, { GIT_LITERAL_PATHSPECS: "1" });
   }
 
   if (polluted.length > 0) await renormalise(repoDir, home, polluted);
@@ -449,7 +462,7 @@ async function backupAndCommitInner(groups: readonly BackupGroup[], home: string
     if (gitlinks.length > 0) {
       await runGit(repoDir, home, ["rm", "-q", "-f", "--cached", "--pathspec-from-file=-", "--pathspec-file-nul"], gitlinks.join("\0") + "\0");
     }
-    nestedFiles.push(...nested.files);
+    nestedFiles.push(...nested.files.filter((f) => !sqliteAll.has(f)));
   }
   if (nestedFiles.length > 0) {
     const upd = await runGit(repoDir, home, ["update-index", "--add", "--remove", "--replace", "-z", "--stdin"], nestedFiles.join("\0") + "\0");
@@ -536,6 +549,130 @@ async function backupAndCommitInner(groups: readonly BackupGroup[], home: string
 
   console.error(`backup: complete, see ${repoDir}`);
   return repoDir;
+}
+
+const SQLITE_MAGIC = "SQLite format 3\0";
+const SQLITE_SIBLINGS = ["-wal", "-shm", "-journal"];
+const DEFAULT_SQLITE_KEEP = 3;
+const SQLITE_BUSY_TIMEOUT_MS = 3000;
+
+/** Home-relative SQLite databases (by header) under `names`: `dbs` to snapshot, `all` = dbs plus
+ * their -wal/-shm/-journal siblings (kept out of git), `excludes` = anchored info/exclude lines. */
+async function findSqliteFiles(home: string, names: string[]): Promise<{ dbs: string[]; all: Set<string>; excludes: string[] }> {
+  const dbs: string[] = [];
+  const walk = async (rel: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(join(home, rel), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const child = `${rel}/${e.name}`;
+      if (e.isDirectory()) {
+        if (e.name !== ".git" && !JUNK_DIRS.has(e.name) && !/(^|\/)jobs\/[^/]+\/tmp$/.test(child) && !TMP_PATH_RE.test(child)) await walk(child);
+      } else if (e.isFile() && !/\.(lock|sock|pid)$/.test(e.name)) {
+        // A SQLite file is a whole number of pages (>= 512 bytes); skip the header read otherwise.
+        const size = await stat(join(home, child)).then((s) => s.size, () => 0);
+        if (size < 512 || size % 512 !== 0) continue;
+        try {
+          const fh = await open(join(home, child), "r");
+          try {
+            const buf = Buffer.alloc(16);
+            await fh.read(buf, 0, 16, 0);
+            if (buf.toString("latin1") === SQLITE_MAGIC) dbs.push(child);
+          } finally {
+            await fh.close();
+          }
+        } catch { /* unreadable: git add reports it */ }
+      }
+    }
+  };
+  for (const name of names) await walk(name);
+  const all = new Set(dbs.flatMap((d) => [d, ...SQLITE_SIBLINGS.map((s) => d + s)]));
+  return { dbs, all, excludes: [...all].map((p) => `/${p}`) };
+}
+
+function gitignoreEscape(line: string): string {
+  return line.replace(/[\\*?[\]]/g, "\\$&").replace(/ +$/, (m) => "\\ ".repeat(m.length));
+}
+
+/** Size/mtime of the DB and its -wal: unchanged means the previous snapshot is still current. */
+async function sqliteFingerprint(path: string): Promise<string> {
+  const part = async (p: string): Promise<string> => {
+    const s = await stat(p).catch(() => null);
+    return s ? `${s.size}:${s.mtimeMs}` : "-";
+  };
+  return `${await part(path)}|${await part(path + "-wal")}`;
+}
+
+/** Snapshots each database with SQLite's online backup (VACUUM INTO) into
+ * ~/.ais/backups-sqlite/<timestamp>/<same relative path>, hard-linking the previous snapshot
+ * when nothing changed, then prunes old sets. A locked, failing or over-budget database is
+ * skipped with a warning; this never throws. */
+async function snapshotSqlite(home: string, dbs: string[]): Promise<void> {
+  if (dbs.length === 0) return;
+  const root = aisBackupsSqliteDir(home);
+  try {
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const sets = (await readdir(root, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name).sort();
+    let prev: { dir: string; manifest: Record<string, string> } | undefined;
+    for (const name of sets.reverse()) {
+      try {
+        prev = { dir: join(root, name), manifest: JSON.parse(await readFile(join(root, name, ".manifest.json"), "utf8")) };
+        break;
+      } catch { /* incomplete set */ }
+    }
+    const setDir = join(root, timestamp());
+    await mkdir(setDir, { mode: 0o700 });
+    const manifest: Record<string, string> = {};
+    let copied = 0;
+    let linked = 0;
+    let skipped = 0;
+    for (const rel of dbs) {
+      const src = join(home, rel);
+      const dest = join(setDir, rel);
+      try {
+        if (deadlineAt !== undefined && Date.now() >= deadlineAt) throw new Error("backup time budget used up");
+        const fp = await sqliteFingerprint(src);
+        await mkdir(join(dest, ".."), { recursive: true, mode: 0o700 });
+        if (prev?.manifest[rel] === fp) {
+          try {
+            await link(join(prev.dir, rel), dest);
+            manifest[rel] = fp;
+            linked++;
+            continue;
+          } catch { /* previous file gone: take a fresh copy */ }
+        }
+        const db = new Database(src, { readonly: true });
+        try {
+          db.run(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+          db.run(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+        } finally {
+          db.close();
+        }
+        await chmod(dest, 0o600);
+        manifest[rel] = fp;
+        copied++;
+      } catch (err) {
+        await rm(dest, { force: true });
+        skipped++;
+        console.error(`backup: WARNING: SQLite snapshot of ${src} skipped (${(err as Error).message}); the previous snapshot, if any, is kept`);
+      }
+    }
+    await writeFile(join(setDir, ".manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+
+    const parsed = Number(process.env.AIS_BACKUP_SQLITE_KEEP);
+    const keep = Number.isInteger(parsed) && parsed >= 1 ? parsed : DEFAULT_SQLITE_KEEP;
+    const all = (await readdir(root, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name).sort();
+    for (const old of all.slice(0, Math.max(0, all.length - keep))) await rm(join(root, old), { recursive: true, force: true });
+    console.error(
+      `backup: SQLite databases are kept out of git; ${copied} snapshotted, ${linked} unchanged (hard-linked), ${skipped} skipped in ${setDir}. ` +
+        `Restore one by copying <set>/<same path under home> back (stop the tool first, remove any stale -wal/-shm); newest set is the last directory in ${root}`,
+    );
+  } catch (err) {
+    console.error(`backup: WARNING: SQLite snapshot step failed (${(err as Error).message}); git backup is unaffected`);
+  }
 }
 
 

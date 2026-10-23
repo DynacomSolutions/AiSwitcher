@@ -1,7 +1,8 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readdirSync, statSync } from "node:fs";
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addRetryingVanished, loadBackupConfig, runBackup } from "../scripts/backup.ts";
@@ -900,5 +901,106 @@ describe("runBackup shallow push and vanished files", () => {
     await write(join(home, ".codex", ".caveman-sessions", "s1.json"), "{}\n");
     const repo = await runBackup(["codex"], home);
     expect(await gitLs(repo)).toEqual([".codex/identities.json"]);
+  });
+
+  describe("SQLite snapshots", () => {
+    const makeDb = (path: string, wal = false): Database => {
+      mkdirSync(join(path, ".."), { recursive: true });
+      const db = new Database(path);
+      if (wal) db.run("PRAGMA journal_mode = WAL");
+      db.run("CREATE TABLE IF NOT EXISTS t (v TEXT)");
+      for (let i = 0; i < 200; i++) db.run("INSERT INTO t VALUES (?)", ["row" + i]);
+      return db;
+    };
+    const setsOf = (home: string): string[] => readdirSync(join(home, ".ais", "backups-sqlite")).sort();
+
+    test("detected by header (any extension), kept out of git, snapshotted valid under 0700/0600", async () => {
+      const home = await makeHome();
+      await write(join(home, ".codex", "config.toml"), "x = 1\n");
+      const db = makeDb(join(home, ".codex", "identities", "a", "history.bin"), true);
+      db.close();
+      await write(join(home, ".codex", "identities", "a", "history.bin-wal"), "");
+      const repo = await runBackup(["codex"], home);
+      expect(await gitLs(repo)).toEqual([".codex/config.toml"]);
+      const [set] = setsOf(home);
+      const snap = join(home, ".ais", "backups-sqlite", set!, ".codex", "identities", "a", "history.bin");
+      const copy = new Database(snap, { readonly: true });
+      expect(copy.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+      expect(copy.query("SELECT count(*) AS n FROM t").get()).toEqual({ n: 200 });
+      copy.close();
+      expect(statSync(snap).mode & 0o777).toBe(0o600);
+      expect(statSync(join(home, ".ais", "backups-sqlite", set!)).mode & 0o777).toBe(0o700);
+    }, 60_000);
+
+    test("already-tracked SQLite files are dropped from the index on the next run", async () => {
+      const home = await makeHome();
+      await write(join(home, ".codex", "config.toml"), "x = 1\n");
+      const dbPath = join(home, ".codex", "state.sqlite");
+      makeDb(dbPath).close();
+      const repo = await runBackup(["codex"], home);
+      // Simulate the pre-change history by force-adding the file, then back up again.
+      await Bun.spawn(["git", `--git-dir=${join(repo, ".git")}`, `--work-tree=${home}`, "add", "-f", ".codex/state.sqlite"], { cwd: home }).exited;
+      await Bun.spawn(["git", `--git-dir=${join(repo, ".git")}`, `--work-tree=${home}`, "commit", "-q", "-m", "old"], { cwd: home }).exited;
+      expect(await gitLs(repo)).toContain(".codex/state.sqlite");
+      await runBackup(["codex"], home);
+      expect(await gitLs(repo)).toEqual([".codex/config.toml"]);
+    }, 60_000);
+
+    test("snapshot stays valid while another connection writes in WAL mode", async () => {
+      const home = await makeHome();
+      const db = makeDb(join(home, ".opencode", "data", "opencode.db"), true);
+      const writer = setInterval(() => { try { db.run("INSERT INTO t VALUES ('live')"); } catch { /* busy */ } }, 1);
+      try {
+        await runBackup(["opencode"], home);
+      } finally { clearInterval(writer); db.close(); }
+      const snap = join(home, ".ais", "backups-sqlite", setsOf(home)[0]!, ".opencode", "data", "opencode.db");
+      const copy = new Database(snap, { readonly: true });
+      expect(copy.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+      copy.close();
+    }, 60_000);
+
+    test("unchanged DB is hard-linked to the previous snapshot; a changed one is copied", async () => {
+      const home = await makeHome();
+      const dbPath = join(home, ".codex", "s.sqlite");
+      const db = makeDb(dbPath, true);
+      await runBackup(["codex"], home);
+      await new Promise((r) => setTimeout(r, 1100));
+      await runBackup(["codex"], home);
+      const [a, b] = setsOf(home);
+      const at = (set: string) => statSync(join(home, ".ais", "backups-sqlite", set, ".codex", "s.sqlite"));
+      expect(at(b!).ino).toBe(at(a!).ino);
+      await new Promise((r) => setTimeout(r, 1100));
+      db.run("INSERT INTO t VALUES ('new')");
+      await runBackup(["codex"], home);
+      const c = setsOf(home)[2]!;
+      expect(at(c).ino).not.toBe(at(b!).ino);
+      db.close();
+    }, 60_000);
+
+    test("keeps the last 3 sets (AIS_BACKUP_SQLITE_KEEP overrides)", async () => {
+      const home = await makeHome();
+      makeDb(join(home, ".codex", "s.sqlite")).close();
+      for (let i = 0; i < 5; i++) { await runBackup(["codex"], home); await new Promise((r) => setTimeout(r, 5)); }
+      expect(setsOf(home)).toHaveLength(3);
+      process.env.AIS_BACKUP_SQLITE_KEEP = "1";
+      try { await runBackup(["codex"], home); } finally { delete process.env.AIS_BACKUP_SQLITE_KEEP; }
+      expect(setsOf(home)).toHaveLength(1);
+    }, 60_000);
+
+    test("a DB locked by a writer is skipped with a warning; the backup still succeeds", async () => {
+      const home = await makeHome();
+      await write(join(home, ".codex", "config.toml"), "x = 1\n");
+      const db = makeDb(join(home, ".codex", "locked.sqlite"));
+      db.run("BEGIN EXCLUSIVE");
+      const errs: string[] = [];
+      const orig = console.error;
+      console.error = (...a: unknown[]) => { errs.push(a.join(" ")); };
+      try {
+        const repo = await runBackup(["codex"], home);
+        expect(await gitLs(repo)).toEqual([".codex/config.toml"]);
+      } finally { console.error = orig; db.run("ROLLBACK"); db.close(); }
+      expect(errs.some((l) => l.includes("WARNING: SQLite snapshot of") && l.includes("locked.sqlite"))).toBe(true);
+      expect(existsSync(join(home, ".ais", "backups-sqlite", setsOf(home)[0]!, ".codex", "locked.sqlite"))).toBe(false);
+    }, 60_000);
   });
 });
