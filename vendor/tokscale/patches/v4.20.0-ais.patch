@@ -1342,7 +1342,7 @@ index c68471a..771e05f 100644
 +            let generation = format!("2026-10-23T08:00:{generation_index:02}.000Z");
 +            let file_name = format!("generation-{generation_index}.json");
 +            let batch_path = batch_dir.join(&file_name);
-+            let message = super::make_workspace_message(
++            let message = make_workspace_message(
 +                "codex", "gpt-5", "openai", "cache-test", 1.0 + generation_index as f64,
 +                None, None,
 +            );
