@@ -283,6 +283,8 @@ jobs:
     env:
       HOST_PRODUCTION: ${{ inputs.production }}
     steps:
+      # LF checkout: the packaged trust key was built on Linux and is compared byte for byte.
+      - run: git config --global core.autocrlf false
       # The sources supply each test's working directory and the smoke scripts.
       - uses: actions/checkout@v4
         with:
