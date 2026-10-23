@@ -62,7 +62,7 @@ describe("claude.json merge", () => {
     await put(incoming, ".claude.json", JSON.stringify({ numStartups: 0, oauthAccount: { id: 1 } }), T);
     const result = await merge();
     expect("oauthAccount" in JSON.parse(await readFile(live(), "utf8"))).toBe(false);
-    expect(result.preservedConflicts).toBe(1);
+    expect(result.preservedConflicts).toBe(0); // account bookkeeping follows the newest file, like the credentials
   });
 
   test("a busy .claude.json lock warns, leaves both files untouched and does not abort the sync", async () => {
