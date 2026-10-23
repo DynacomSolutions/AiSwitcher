@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { poolMemberModelUsage } from "../../../src/cli/claude-swap/attribution.ts";
@@ -46,7 +46,7 @@ describe("swap pool usage folds into members", () => {
 
     expect(eventsForPool(await Bun.file(ledger).text().then((t) => t.split("\n").map((l) => JSON.parse(l))), pool).map((e) => e.to)).toEqual(["alice", "bob"]);
 
-    const usage = await poolMemberModelUsage(pool, [id("alice"), id("bob")], ledger);
+    const usage = await poolMemberModelUsage(pool, [id("alice"), id("bob")], ledger, { cachePath: join(root, "pool-cache.json") });
     const byMember = Object.fromEntries(usage.map((u) => [u.member, u]));
     expect(Object.keys(byMember).sort()).toEqual(["alice", "bob"]);
     expect(byMember.alice!.entries[0]).toMatchObject({ messageCount: 2, input: 2000000, output: 3, provider: "anthropic" });
@@ -66,8 +66,178 @@ describe("swap pool usage folds into members", () => {
       join(configDir, "projects", "s.jsonl"),
       JSON.stringify({ timestamp: "2026-10-03T00:00:00Z", message: { id: "x", model: "m", usage: { output_tokens: 1 } } }),
     );
-    const usage = await poolMemberModelUsage(pool, [id("alice")], ledger);
+    const usage = await poolMemberModelUsage(pool, [id("alice")], ledger, { cachePath: join(root, "pool-cache.json") });
     expect(usage.map((u) => u.member)).toEqual([undefined]);
+  });
+});
+
+describe("swap pool usage attribution cache", () => {
+  async function fixture() {
+    const root = await mkdtemp(join(tmpdir(), "ais-pool-cache-"));
+    dirs.push(root);
+    const configDir = join(root, "swap");
+    const projects = join(configDir, "projects", "p");
+    await mkdir(projects, { recursive: true });
+    const ledger = join(root, "ledger.jsonl");
+    await writeFile(ledger, "");
+    const pool: PoolIdentity = { name: "pool-x", label: "Pool", configDir, swapPool: { accounts: ["alice", "bob"], active: "alice" } };
+    const transcript = join(projects, "s.jsonl");
+    const cachePath = join(root, "cache", "pool.json");
+    const msg = (id: string, output: number, model = "claude-opus-4-8") => JSON.stringify({ timestamp: "2026-10-03T00:00:00Z", message: { id, model, usage: { input_tokens: 10, output_tokens: output } } });
+    return { root, pool, ledger, transcript, cachePath, msg };
+  }
+
+  test("reuses unchanged files after restart without reopening transcripts", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n`);
+    const reads: string[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (path: string) => reads.push(path) };
+    const first = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    const second = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    expect(reads).toEqual([f.transcript]);
+    expect(second).toEqual(first);
+  });
+
+  test("append reparses changed file, including a previously incomplete trailing line", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n{"timestamp":`);
+    const reads: string[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (path: string) => reads.push(path) };
+    const first = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    expect(first[0]?.entries[0]?.messageCount).toBe(1);
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n${f.msg("two", 7)}\n`);
+    const second = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    expect(reads).toEqual([f.transcript, f.transcript]);
+    expect(second[0]?.entries[0]?.messageCount).toBe(2);
+    expect(second[0]?.entries[0]?.output).toBe(9);
+  });
+
+  test("same-size rewrite is detected and reparsed", async () => {
+    const f = await fixture();
+    const original = f.msg("same-id", 2);
+    const replacement = f.msg("same-id", 9);
+    expect(replacement.length).toBe(original.length);
+    await writeFile(f.transcript, original);
+    const reads: string[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (path: string) => reads.push(path) };
+    await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    const fixedMtime = new Date("2026-10-03T00:00:00.000Z");
+    await utimes(f.transcript, fixedMtime, fixedMtime);
+    await writeFile(f.transcript, replacement);
+    await utimes(f.transcript, fixedMtime, fixedMtime);
+    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    expect(reads).toEqual([f.transcript, f.transcript]);
+    expect(usage[0]?.entries[0]?.output).toBe(9);
+  });
+
+  test("ledger changes reattribute cached hits without reopening source files", async () => {
+    const f = await fixture();
+    await writeFile(f.ledger, `${JSON.stringify({ ts: "2026-10-02T00:00:00Z", pool: "pool-x", from: null, to: "alice", reason: "manual" })}\n`);
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n`);
+    const reads: string[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (path: string) => reads.push(path) };
+    const first = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    await writeFile(f.ledger, `${JSON.stringify({ ts: "2026-10-02T00:00:00Z", pool: "pool-x", from: null, to: "bob", reason: "manual" })}\n`);
+    const second = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    expect(first[0]?.member).toBe("alice");
+    expect(second[0]?.member).toBe("bob");
+    expect(reads).toEqual([f.transcript]);
+  });
+
+  test("duplicate ids stay deduplicated and source read failures preserve cache", async () => {
+    const f = await fixture();
+    const duplicate = f.msg("repeat", 2);
+    await writeFile(f.transcript, `${duplicate}\n${duplicate}\n`);
+    const options = { cachePath: f.cachePath };
+    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    expect(usage[0]?.entries[0]?.messageCount).toBe(1);
+    const prior = await readFile(f.cachePath, "utf8");
+    await writeFile(f.transcript, `${f.msg("changed", 8)}\n`);
+    await expect(poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { ...options, onSourceFileRead: () => { throw Object.assign(new Error("source unavailable"), { code: "EACCES" }); } })).rejects.toThrow("source unavailable");
+    expect(await readFile(f.cachePath, "utf8")).toBe(prior);
+  });
+
+  test("cache write failures do not fail computed attribution or replace the prior cache", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("before", 2)}\n`);
+    const options = { cachePath: f.cachePath };
+    await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    const prior = await readFile(f.cachePath, "utf8");
+
+    await writeFile(f.transcript, `${f.msg("after", 7)}\n`);
+    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, {
+      ...options,
+      writeCache: async () => { throw Object.assign(new Error("cache is read-only"), { code: "EACCES" }); },
+    });
+
+    expect(usage[0]?.entries[0]?.messageCount).toBe(1);
+    expect(usage[0]?.entries[0]?.output).toBe(7);
+    expect(await readFile(f.cachePath, "utf8")).toBe(prior);
+  });
+
+  test("unreadable acceleration cache falls back to transcript parsing", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("source", 5)}\n`);
+    await mkdir(f.cachePath, { recursive: true });
+    const reads: string[] = [];
+
+    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, {
+      cachePath: f.cachePath,
+      onSourceFileRead: (path) => reads.push(path),
+    });
+
+    expect(usage[0]?.entries[0]?.output).toBe(5);
+    expect(reads).toEqual([f.transcript]);
+  });
+
+  test("duplicate IDs are deduplicated across transcript files", async () => {
+    const f = await fixture();
+    await writeFile(join(f.pool.configDir, "projects", "p", "a.jsonl"), `${f.msg("same", 2)}\n`);
+    await writeFile(join(f.pool.configDir, "projects", "p", "b.jsonl"), `${f.msg("same", 9)}\n`);
+    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath });
+    expect(usage[0]?.entries[0]?.messageCount).toBe(1);
+    expect([2, 9]).toContain(usage[0]?.entries[0]?.output);
+  });
+
+  test("discovery ENOENT races preserve the prior cache generation", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n`);
+    await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath });
+    const previous = await readFile(f.cachePath, "utf8");
+    const root = join(f.pool.configDir, "projects");
+    const options = {
+      cachePath: f.cachePath,
+      readdir: async (path: string) => {
+        if (path === root) return [{ name: "p", isDirectory: () => true }];
+        throw Object.assign(new Error("directory vanished after discovery"), { code: "ENOENT" });
+      },
+    };
+    await expect(poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(f.cachePath, "utf8")).toBe(previous);
+
+    const listedFile = f.transcript;
+    await expect(poolMemberModelUsage(f.pool, [id("alice")], f.ledger, {
+      cachePath: f.cachePath,
+      fingerprint: async (path: string) => path === listedFile ? undefined : undefined,
+    })).rejects.toThrow("disappeared during discovery");
+    expect(await readFile(f.cachePath, "utf8")).toBe(previous);
+  });
+
+  test("corrupt cache is rebuilt, and disappeared files do not reappear from stale cache", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n`);
+    await mkdir(join(f.root, "cache"), { recursive: true });
+    await writeFile(f.cachePath, "not-json");
+    const reads: string[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (path: string) => reads.push(path) };
+    const first = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    expect(first[0]?.entries[0]?.messageCount).toBe(1);
+    const repaired = await readFile(f.cachePath, "utf8");
+    expect(JSON.parse(repaired).schemaVersion).toBe(1);
+    await unlink(f.transcript);
+    const afterRemoval = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
+    expect(afterRemoval).toEqual([]);
+    expect(reads).toEqual([f.transcript]);
   });
 });
 

@@ -1,6 +1,7 @@
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { SwapEvent } from "../../identities/pool/adapter.ts";
 import { activeMemberAt, eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
@@ -9,6 +10,7 @@ import type { PoolIdentity } from "../../identities/pool/swap-pool.ts";
 import type { Identity } from "../../identities/types.ts";
 import { localDateKey } from "../usage/local-day.ts";
 import type { TokscaleEntry } from "../usage/tokscale.ts";
+import { aisCacheDir } from "../../shared/ais-home.ts";
 
 /**
  * Per-member split of a swap pool's transcript usage. A pool shares one
@@ -157,6 +159,155 @@ export interface PoolMemberUsage {
   dailyUsage: Record<string, number>;
 }
 
+// A tuple keeps the durable cache substantially smaller than the source JSONL
+// rows and avoids storing member attribution or derived pricing.
+type CachedUsageHit = [at: number, model: string | null, id: string | null, input: number, output: number, cacheRead: number, cacheWrite: number];
+interface CachedUsageFile {
+  key: string;
+  fingerprint: string;
+  hits: CachedUsageHit[];
+}
+interface PoolUsageCache {
+  schemaVersion: 1;
+  files: CachedUsageFile[];
+}
+
+/** Test hooks for proving unchanged transcript files are not reopened. */
+export interface PoolMemberModelUsageOptions {
+  cachePath?: string;
+  onSourceFileRead?: (path: string) => void;
+  /** Injectable discovery hooks for deterministic race/error tests. */
+  readdir?: (path: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
+  fingerprint?: (path: string) => Promise<string | undefined>;
+  writeCache?: (path: string, cache: PoolUsageCache) => Promise<void>;
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function defaultPoolUsageCachePath(pool: PoolIdentity): string {
+  const key = createHash("sha256").update(`ais-pool-usage-cache-v1\0${pool.name}\0${pool.configDir}`).digest("hex");
+  return join(aisCacheDir(), "usage", "pool-attribution", `${key}.json`);
+}
+
+async function sourceFingerprint(path: string): Promise<string | undefined> {
+  try {
+    const info = await stat(path, { bigint: true });
+    return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String).join(":");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+async function* usageJsonlFiles(
+  dir: string,
+  root: string,
+  rootMissingIsEmpty: boolean,
+  options: PoolMemberModelUsageOptions,
+): AsyncGenerator<{ path: string; key: string; fingerprint: string }> {
+  let entries;
+  try {
+    entries = options.readdir ? await options.readdir(dir) : await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (isErrno(error, "ENOENT") && rootMissingIsEmpty && dir === root) return;
+    throw error;
+  }
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      yield* usageJsonlFiles(path, root, false, options);
+    } else if (entry.name.endsWith(".jsonl")) {
+      const fingerprint = options.fingerprint ? await options.fingerprint(path) : await sourceFingerprint(path);
+      if (fingerprint === undefined) throw new Error("usage source disappeared during discovery");
+      const relative = path.slice(root.length + 1);
+      const key = createHash("sha256").update(relative).digest("hex");
+      yield { path, key, fingerprint };
+    }
+  }
+}
+
+function validPoolUsageCache(value: unknown): value is PoolUsageCache {
+  if (!value || typeof value !== "object") return false;
+  const cache = value as Partial<PoolUsageCache>;
+  return cache.schemaVersion === 1 && Array.isArray(cache.files) && cache.files.every((file) =>
+    !!file && typeof file.key === "string" && typeof file.fingerprint === "string" && Array.isArray(file.hits) && file.hits.every((hit) =>
+      Array.isArray(hit) && hit.length === 7 && typeof hit[0] === "number" && Number.isFinite(hit[0]) &&
+      (hit[1] === null || typeof hit[1] === "string") && (hit[2] === null || typeof hit[2] === "string") &&
+      hit.slice(3).every((n) => typeof n === "number" && Number.isFinite(n)),
+    ),
+  );
+}
+
+async function readPoolUsageCache(path: string): Promise<PoolUsageCache | undefined> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    // This is an acceleration cache. Any read error falls back to source files.
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return validPoolUsageCache(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writePoolUsageCache(path: string, cache: PoolUsageCache): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const handle = await open(temporary, "wx", 0o600);
+  let pending = "";
+  const append = async (value: string) => {
+    pending += value;
+    if (pending.length >= 64 * 1024) {
+      await handle.writeFile(pending);
+      pending = "";
+    }
+  };
+  try {
+    try {
+      await append('{"schemaVersion":1,"files":[');
+      for (let fileIndex = 0; fileIndex < cache.files.length; fileIndex += 1) {
+        const file = cache.files[fileIndex]!;
+        if (fileIndex > 0) await append(",");
+        await append(`{"key":${JSON.stringify(file.key)},"fingerprint":${JSON.stringify(file.fingerprint)},"hits":[`);
+        for (let hitIndex = 0; hitIndex < file.hits.length; hitIndex += 1) {
+          if (hitIndex > 0) await append(",");
+          await append(JSON.stringify(file.hits[hitIndex]));
+        }
+        await append("]}");
+      }
+      await append("]}");
+      if (pending) await handle.writeFile(pending);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, path);
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+async function parseUsageFile(path: string, events: SwapEvent[], poolName: string, onSourceFileRead?: (path: string) => void): Promise<CachedUsageHit[]> {
+  onSourceFileRead?.(path);
+  const hits: CachedUsageHit[] = [];
+  const rl = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const line of rl) {
+    const hit = attributeLine(line, events, poolName, 0);
+    if (hit) {
+      const opaqueId = hit.id ? createHash("sha256").update(hit.id).digest("hex").slice(0, 32) : null;
+      hits.push([hit.at, hit.model ?? null, opaqueId, hit.usage.input, hit.usage.output, hit.usage.cacheRead, hit.usage.cacheWrite]);
+    }
+  }
+  return hits;
+}
+
 /** Per-member, per-model usage of a pool's whole transcript history, for
  * `ais usage`: a pool is not an account, so its messages are charged to the
  * member active at each timestamp. Messages before the first ledger event go
@@ -164,41 +315,80 @@ export interface PoolMemberUsage {
  * member; a member no longer in the pool is reported as unattributed.
  * Costs are list-price estimates; callers with a real figure (tokscale) override them.
  * Messages are de-duplicated by message id, as transcripts repeat them. */
-export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity[], ledgerPath: string): Promise<PoolMemberUsage[]> {
+export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity[], ledgerPath: string, options: PoolMemberModelUsageOptions = {}): Promise<PoolMemberUsage[]> {
   const events = eventsForPool(await readSwapEvents(ledgerPath), pool);
   const fallback = events[0] ? events[0].from ?? events[0].to : pool.swapPool.active ?? pool.swapPool.accounts[0];
   const known = new Set(members.map((m) => m.name));
   const byMember = new Map<string | undefined, PoolMemberUsage>();
   const seen = new Set<string>();
-  for await (const file of jsonlFiles(join(pool.configDir, "projects"), 0)) {
-    const rl = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
-    for await (const line of rl) {
-      const hit = attributeLine(line, events, pool.name, 0);
-      if (!hit) continue;
-      if (hit.id) {
-        if (seen.has(hit.id)) continue;
-        seen.add(hit.id);
+  const projectsDir = join(pool.configDir, "projects");
+  const cachePath = options.cachePath ?? defaultPoolUsageCachePath(pool);
+  const previous = await readPoolUsageCache(cachePath);
+  const previousByKey = new Map((previous?.files ?? []).map((file) => [file.key, file]));
+  const files: CachedUsageFile[] = [];
+  let cacheDirty = previous === undefined;
+  for await (const source of usageJsonlFiles(projectsDir, projectsDir, true, options)) {
+    const cached = previousByKey.get(source.key);
+    if (cached?.fingerprint === source.fingerprint) {
+      files.push(cached);
+      continue;
+    }
+    cacheDirty = true;
+    let fingerprint = source.fingerprint;
+    let hits: CachedUsageHit[] | undefined;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      hits = await parseUsageFile(source.path, events, pool.name, options.onSourceFileRead);
+      const fingerprintAfterRead = await sourceFingerprint(source.path);
+      if (fingerprintAfterRead === undefined) {
+        throw new Error("usage source changed during attribution scan");
       }
-      const name = hit.member === "(before first swap)" ? fallback : hit.member;
-      const member = name !== undefined && known.has(name) ? name : undefined;
-      const row = byMember.get(member) ?? { member, entries: [], firstMs: hit.at, lastMs: hit.at, dailyUsage: {} };
+      if (fingerprintAfterRead === fingerprint) break;
+      if (attempt === 1) throw new Error("usage source changed during attribution scan");
+      fingerprint = fingerprintAfterRead;
+    }
+    if (!hits) throw new Error("usage source could not be read");
+    if (cached) {
+      cached.fingerprint = fingerprint;
+      cached.hits = hits;
+      files.push(cached);
+    } else {
+      files.push({ key: source.key, fingerprint, hits });
+    }
+  }
+  if (previous && previous.files.length !== files.length) cacheDirty = true;
+  if (cacheDirty) {
+    try {
+      const cache = { schemaVersion: 1 as const, files };
+      if (options.writeCache) await options.writeCache(cachePath, cache);
+      else await writePoolUsageCache(cachePath, cache);
+    } catch { /* cache is advisory */ }
+  }
+  for (const file of files) {
+    for (const raw of file.hits) {
+      const [at, modelName, messageId, input, output, cacheRead, cacheWrite] = raw;
+      if (messageId) {
+        if (seen.has(messageId)) continue;
+        seen.add(messageId);
+      }
+      const actualName = activeMemberAt(events, pool.name, at) ?? fallback;
+      const member = actualName !== undefined && known.has(actualName) ? actualName : undefined;
+      const row = byMember.get(member) ?? { member, entries: [], firstMs: at, lastMs: at, dailyUsage: {} };
       byMember.set(member, row);
-      const model = hit.model ?? "unknown";
+      const model = modelName ?? "unknown";
       let entry = row.entries.find((e) => e.model === model);
       if (!entry) {
         entry = { client: "claude", provider: "anthropic", model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, messageCount: 0, cost: 0 };
         row.entries.push(entry);
       }
-      const { input, output, cacheRead, cacheWrite } = hit.usage;
       entry.input += input;
       entry.output += output;
       entry.cacheRead += cacheRead;
       entry.cacheWrite += cacheWrite;
       entry.messageCount += 1;
       entry.cost += estimateChatModelTokenCost(model, input, output, cacheRead, cacheWrite) ?? 0;
-      row.firstMs = Math.min(row.firstMs, hit.at);
-      row.lastMs = Math.max(row.lastMs, hit.at);
-      const day = localDateKey(hit.at);
+      row.firstMs = Math.min(row.firstMs, at);
+      row.lastMs = Math.max(row.lastMs, at);
+      const day = localDateKey(at);
       row.dailyUsage[day] = (row.dailyUsage[day] ?? 0) + input + output;
     }
   }
