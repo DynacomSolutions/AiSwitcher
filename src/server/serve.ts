@@ -73,6 +73,17 @@ export function validateWarmHtml(html: string, contentType: string, distDir: str
   }
 }
 
+/** Build the authenticated loopback request used to warm the app before bind. */
+export function createConsoleWarmRequest(path: string, port: number, token: string): Request {
+  const host = `127.0.0.1:${port}`;
+  return new Request(`http://${host}${path}`, {
+    headers: {
+      Host: host,
+      Authorization: `Bearer ${token}`,
+    },
+  });
+}
+
 /** AIS_WEB_ALLOWED_HOSTS: comma-separated extra vhostnames the guard trusts
  * like loopback peers (e.g. `ais.localhost` in front of a reverse proxy,
  * where every peer address is the proxy). Empty/absent keeps the default
@@ -198,9 +209,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
   // and consume the root document. Headless installs have no distDir, so
   // exercise the API app itself through its existing liveness route.
   const warmPath = options.distDir ? "/" : "/api/health";
-  const warmResponse = await app.fetch(new Request(`http://127.0.0.1${warmPath}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  }));
+  const warmResponse = await app.fetch(createConsoleWarmRequest(warmPath, port, token));
   if (warmResponse.status < 200 || warmResponse.status >= 400) {
     throw new Error(`console warm render failed with HTTP ${warmResponse.status}`);
   }
