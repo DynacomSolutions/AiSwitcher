@@ -1476,3 +1476,305 @@ index c68471a..771e05f 100644
 +}
 +
 +#[test]
+
+diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/src/message_cache.rs
+--- a/crates/tokscale-core/src/message_cache.rs
++++ b/crates/tokscale-core/src/message_cache.rs
+@@ -96,0 +97,195 @@
++
++const AIS_CLAUDE_SEED_MARKER: &str = "ais-claude-cache-seed-v1.json";
++
++#[derive(Debug, serde::Serialize, serde::Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct AisClaudeSeedMarker {
++    schema_version: u32,
++    source_present: bool,
++    imported_shard_count: usize,
++    destination_already_present: bool,
++}
++
++/// Copy only the Claude retained-history namespace from the real Tokscale
++/// profile into the isolated AIS profile. The source is never written to.
++pub(crate) fn seed_ais_claude_cache(source_config_dir: &Path) -> Result<(), String> {
++    seed_ais_claude_cache_between(source_config_dir, &crate::paths::get_cache_dir())
++}
++
++fn seed_ais_claude_cache_between(
++    source_config_dir: &Path,
++    destination_cache: &Path,
++) -> Result<(), String> {
++    let source_cache = source_config_dir.join("cache");
++    let source_shards = source_cache
++        .join(CACHE_SHARD_DIRNAME)
++        .join(ClientId::Claude.as_str());
++    let source_lock = source_cache.join(CACHE_LOCK_FILENAME);
++    ensure_cache_dir(destination_cache)
++        .map_err(|e| format!("AIS Claude cache destination: {e}"))?;
++    let marker_path = destination_cache.join(AIS_CLAUDE_SEED_MARKER);
++    let destination_lock_path = destination_cache.join(CACHE_LOCK_FILENAME);
++    let destination_lock = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create(true)
++        .truncate(false)
++        .open(&destination_lock_path)
++        .map_err(|e| format!("AIS Claude cache destination lock: {e}"))?;
++    fs2::FileExt::lock_exclusive(&destination_lock)
++        .map_err(|e| format!("AIS Claude cache destination lock: {e}"))?;
++
++    match fs::symlink_metadata(&marker_path) {
++        Ok(metadata) if metadata.file_type().is_file() => {
++            let marker: AisClaudeSeedMarker = serde_json::from_reader(
++                File::open(&marker_path)
++                    .map_err(|e| format!("AIS Claude cache seed marker: {e}"))?,
++            )
++            .map_err(|e| format!("AIS Claude cache seed marker is invalid: {e}"))?;
++            if marker.schema_version != 1 {
++                return Err("AIS Claude cache seed marker has unsupported schema".into());
++            }
++            return Ok(());
++        }
++        Ok(_) => return Err("AIS Claude cache seed marker is not a regular file".into()),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++        Err(error) => return Err(format!("AIS Claude cache seed marker: {error}")),
++    }
++
++    let source_present = match fs::symlink_metadata(&source_shards) {
++        Ok(metadata) if metadata.file_type().is_dir() => true,
++        Ok(_) => return Err("AIS Claude source cache namespace is not a real directory".into()),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
++        Err(error) => return Err(format!("AIS Claude source cache namespace: {error}")),
++    };
++    let destination_shards = destination_cache.join(CACHE_SHARD_DIRNAME);
++    let destination_claude = destination_shards.join(ClientId::Claude.as_str());
++    let destination_already_present = match fs::symlink_metadata(&destination_claude) {
++        Ok(metadata) if metadata.file_type().is_dir() => true,
++        Ok(_) => {
++            return Err("AIS Claude cache destination namespace is not a real directory".into())
++        }
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
++        Err(error) => return Err(format!("AIS Claude cache destination namespace: {error}")),
++    };
++
++    let mut imported_shard_count = 0usize;
++    if source_present && !destination_already_present {
++        let lock_metadata = fs::symlink_metadata(&source_lock)
++            .map_err(|e| format!("AIS Claude source cache lock: {e}"))?;
++        if !lock_metadata.file_type().is_file() {
++            return Err("AIS Claude source cache lock is not a regular file".into());
++        }
++        let source_lock_file = OpenOptions::new()
++            .read(true)
++            .open(&source_lock)
++            .map_err(|e| format!("AIS Claude source cache lock: {e}"))?;
++        fs2::FileExt::lock_shared(&source_lock_file)
++            .map_err(|e| format!("AIS Claude source cache lock: {e}"))?;
++
++        let mut shards = Vec::new();
++        for entry in fs::read_dir(&source_shards)
++            .map_err(|e| format!("AIS Claude source cache namespace: {e}"))?
++        {
++            let entry = entry.map_err(|e| format!("AIS Claude source cache shard listing: {e}"))?;
++            let name = entry.file_name();
++            let Some(index) = parse_shard_filename(&name) else {
++                continue;
++            };
++            if name != shard_filename(index) {
++                continue;
++            }
++            let metadata = fs::symlink_metadata(entry.path())
++                .map_err(|e| format!("AIS Claude source shard metadata: {e}"))?;
++            if !metadata.file_type().is_file() {
++                return Err("AIS Claude source shard is not a regular file".into());
++            }
++            match read_shard(&entry.path(), CacheIdentity::for_client(ClientId::Claude)) {
++                ShardReadStatus::Loaded(_) | ShardReadStatus::Migrated(_) => {}
++                ShardReadStatus::Missing => {
++                    return Err("AIS Claude source shard disappeared during seed".into())
++                }
++                ShardReadStatus::Stale => {
++                    return Err("AIS Claude source shard has a stale parser version".into())
++                }
++                ShardReadStatus::Invalid(error) => {
++                    return Err(format!("AIS Claude source shard is invalid: {error}"))
++                }
++            }
++            shards.push((index, entry.path()));
++        }
++        shards.sort_by_key(|(index, _)| *index);
++
++        ensure_cache_dir(&destination_shards)
++            .map_err(|e| format!("AIS Claude cache destination shard directory: {e}"))?;
++        let staged = tempfile::Builder::new()
++            .prefix(".ais-claude-seed-")
++            .tempdir_in(&destination_shards)
++            .map_err(|e| format!("AIS Claude cache seed staging: {e}"))?;
++        for (index, source) in &shards {
++            let mut input =
++                File::open(source).map_err(|e| format!("AIS Claude source shard read: {e}"))?;
++            let target = staged.path().join(shard_filename(*index));
++            let mut output_options = OpenOptions::new();
++            output_options.write(true).create_new(true);
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::OpenOptionsExt;
++                output_options.mode(0o600);
++            }
++            let mut output = output_options
++                .open(&target)
++                .map_err(|e| format!("AIS Claude staged shard create: {e}"))?;
++            std::io::copy(&mut input, &mut output)
++                .and_then(|_| output.sync_all())
++                .map_err(|e| format!("AIS Claude staged shard copy: {e}"))?;
++            imported_shard_count += 1;
++        }
++        if destination_claude.exists() {
++            return Err("AIS Claude cache destination appeared during seed".into());
++        }
++        fs::rename(staged.path(), &destination_claude)
++            .map_err(|e| format!("AIS Claude cache seed publish: {e}"))?;
++        File::open(&destination_shards)
++            .and_then(|dir| dir.sync_all())
++            .map_err(|e| format!("AIS Claude cache seed directory sync: {e}"))?;
++    }
++
++    let marker = AisClaudeSeedMarker {
++        schema_version: 1,
++        source_present,
++        imported_shard_count,
++        destination_already_present,
++    };
++    let marker_temp = destination_cache.join(format!(
++        ".{AIS_CLAUDE_SEED_MARKER}.{}.tmp",
++        std::process::id()
++    ));
++    let mut marker_options = OpenOptions::new();
++    marker_options.write(true).create_new(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        marker_options.mode(0o600);
++    }
++    let mut marker_file = marker_options
++        .open(&marker_temp)
++        .map_err(|e| format!("AIS Claude cache seed marker temp: {e}"))?;
++    let write_result = serde_json::to_writer(&mut marker_file, &marker)
++        .map_err(std::io::Error::other)
++        .and_then(|_| marker_file.sync_all());
++    if let Err(error) = write_result {
++        drop(marker_file);
++        let _ = fs::remove_file(&marker_temp);
++        return Err(format!("AIS Claude cache seed marker write: {error}"));
++    }
++    drop(marker_file);
++    if let Err(error) = fs::rename(&marker_temp, &marker_path) {
++        let _ = fs::remove_file(&marker_temp);
++        return Err(format!("AIS Claude cache seed marker publish: {error}"));
++    }
++    File::open(destination_cache)
++        .and_then(|dir| dir.sync_all())
++        .map_err(|e| format!("AIS Claude cache seed marker directory sync: {e}"))?;
++    Ok(())
++}
+@@ -5316,0 +5512,92 @@
++    fn ais_shared_snapshot_claude_seed_preserves_history_for_only_matching_profile_and_is_idempotent(
++    ) {
++        let source_home = TempDir::new().unwrap();
++        let destination_home = TempDir::new().unwrap();
++        let profile_a = source_home.path().join("profile-a");
++        let profile_b = source_home.path().join("profile-b");
++        std::fs::create_dir_all(&profile_a).unwrap();
++        std::fs::create_dir_all(&profile_b).unwrap();
++        let source_a = profile_a.join("session-a.jsonl");
++        let source_b = profile_b.join("session-b.jsonl");
++        std::fs::write(&source_a, b"retained profile a").unwrap();
++        std::fs::write(&source_b, b"retained profile b").unwrap();
++        let identity = CacheIdentity::for_client(ClientId::Claude);
++        let mut entry_a = test_entry(identity, &source_a, "retained-a");
++        let mut entry_b = test_entry(identity, &source_b, "retained-b");
++        entry_a.fallback_timestamp_indices = vec![0];
++        entry_b.fallback_timestamp_indices = vec![0];
++        std::fs::remove_file(&source_a).unwrap();
++        std::fs::remove_file(&source_b).unwrap();
++
++        let source_config = source_home.path().join("original-config");
++        let source_cache = source_config.join("cache");
++        let source_namespace = source_cache
++            .join(CACHE_SHARD_DIRNAME)
++            .join(ClientId::Claude.as_str());
++        ensure_cache_dir(&source_namespace).unwrap();
++        std::fs::write(source_cache.join(CACHE_LOCK_FILENAME), b"").unwrap();
++        write_shard_with_limit(
++            &source_namespace.join(shard_filename(0)),
++            identity,
++            &[entry_a, entry_b],
++            MAX_CACHE_SHARD_BYTES,
++        )
++        .unwrap();
++
++        let _env = sandbox_cache_env(destination_home.path());
++        let destination_cache = cache_dir().unwrap();
++        seed_ais_claude_cache_between(&source_config, &destination_cache).unwrap();
++        let destination_shard = destination_cache
++            .join(CACHE_SHARD_DIRNAME)
++            .join(ClientId::Claude.as_str())
++            .join(shard_filename(0));
++        let seeded_bytes = std::fs::read(&destination_shard).unwrap();
++        assert_eq!(
++            serde_json::from_reader::<_, AisClaudeSeedMarker>(
++                File::open(destination_cache.join(AIS_CLAUDE_SEED_MARKER)).unwrap()
++            )
++            .unwrap()
++            .imported_shard_count,
++            1
++        );
++
++        let cache = SourceMessageCache::load();
++        assert_eq!(cache.missing_claude_history(&[profile_a.clone()]).len(), 1);
++        assert_eq!(cache.missing_claude_history(&[profile_b.clone()]).len(), 1);
++        assert_eq!(
++            cache.missing_claude_history(&[profile_a, profile_b]).len(),
++            2
++        );
++
++        std::fs::write(
++            &source_namespace.join(shard_filename(0)),
++            b"changed after seed",
++        )
++        .unwrap();
++        seed_ais_claude_cache_between(&source_config, &destination_cache).unwrap();
++        assert_eq!(std::fs::read(&destination_shard).unwrap(), seeded_bytes);
++    }
++
++    #[test]
++    #[serial_test::serial]
++    fn ais_shared_snapshot_claude_seed_records_success_when_original_cache_is_absent() {
++        let source_home = TempDir::new().unwrap();
++        let destination_home = TempDir::new().unwrap();
++        let _env = sandbox_cache_env(destination_home.path());
++        let destination_cache = cache_dir().unwrap();
++        seed_ais_claude_cache_between(
++            &source_home.path().join("missing-original-config"),
++            &destination_cache,
++        )
++        .unwrap();
++        let marker: AisClaudeSeedMarker = serde_json::from_reader(
++            File::open(destination_cache.join(AIS_CLAUDE_SEED_MARKER)).unwrap(),
++        )
++        .unwrap();
++        assert!(!marker.source_present);
++        assert_eq!(marker.imported_shard_count, 0);
++        assert!(!marker.destination_already_present);
++    }
++
++    #[test]
++    #[serial_test::serial]
+diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -6923,0 +6924,5 @@
++    if std::env::var_os("TOKSCALE_AIS_EXPORT_PATH").is_some() {
++        let source_config = std::env::var_os("TOKSCALE_AIS_SOURCE_CONFIG_DIR")
++            .ok_or("AIS export requires TOKSCALE_AIS_SOURCE_CONFIG_DIR")?;
++        message_cache::seed_ais_claude_cache(std::path::Path::new(&source_config))?;
++    }
