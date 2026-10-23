@@ -21,8 +21,10 @@ import { canonicalUsageProvider, providerForTool } from "./providers.ts";
 import {
   ensureTokscaleCacheFresh,
   fetchTokscaleDailyUsage,
+  runAisTokscaleExportInvocation,
   runTokscaleProcess,
   tokscaleInvocationFor,
+  type AisTokscaleExportInvocation,
   type DateSpan,
   type TokscaleEntry,
   type TokscaleReport,
@@ -71,6 +73,9 @@ export interface UsageResult {
    */
   dailyCostUsd?: Record<string, number>;
   pending?: true;
+  /** Internal candidate produced alongside the same Tokscale report process.
+   * Snapshot code validates and promotes it before publishing the partition. */
+  nativeBatchCandidate?: { path: string; partitionId: string };
 }
 
 /** Every (tool, identity) pair to query, filtered by --tool and/or --identity.
@@ -242,9 +247,14 @@ export interface UsageRunDeps {
   fetchAwsBedrockUsage?: typeof fetchAwsBedrockUsage;
   runTokscale?: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]>;
   fetchTokscaleDailyUsage?: typeof fetchTokscaleDailyUsage;
+  nativeExportForTarget?: (target: UsageTarget) => Promise<{
+    invocation: AisTokscaleExportInvocation;
+    path: string;
+    partitionId: string;
+  } | undefined>;
 }
 
-async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression): Promise<UsageResult[]> {
+export async function runTokscaleForUsageTarget(target: UsageTarget, suppression: UsageRowSuppression, deps: UsageRunDeps = {}): Promise<UsageResult[]> {
   const fallbackProvider = providerForTool(target.toolName);
   const invocation = await tokscaleInvocationFor(target.toolName, target.identity);
   if (!invocation) {
@@ -254,8 +264,14 @@ async function runTokscale(target: UsageTarget, suppression: UsageRowSuppression
   const { env, clientArgs } = invocation;
 
   try {
-    const stdout = await runTokscaleProcess([...clientArgs, "--json"], env);
-    return providerReportsFromTokscale(target, JSON.parse(stdout) as TokscaleReport, suppression);
+    const nativeExport = await deps.nativeExportForTarget?.(target);
+    const stdout = nativeExport
+      ? await runAisTokscaleExportInvocation(nativeExport.invocation)
+      : await runTokscaleProcess([...clientArgs, "--json"], env);
+    const results = providerReportsFromTokscale(target, JSON.parse(stdout) as TokscaleReport, suppression);
+    return nativeExport
+      ? results.map((result) => ({ ...result, nativeBatchCandidate: { path: nativeExport.path, partitionId: nativeExport.partitionId } }))
+      : results;
   } catch (err) {
     const message = err instanceof SyntaxError
       ? "Could not parse tokscale's --json output."
@@ -342,7 +358,7 @@ async function runOne(target: UsageTarget, suppression: UsageRowSuppression, dep
   if (target.toolName === "opencode") return runOpencodeUsage(target, suppression);
 
   const [results, extraCost, daily] = await Promise.all([
-    (deps.runTokscale ?? runTokscale)(target, suppression),
+    (deps.runTokscale ?? ((selected, rowSuppression) => runTokscaleForUsageTarget(selected, rowSuppression, deps)))(target, suppression),
     // Retired identities keep local usage only: the extra-cost probe is a
     // live OAuth call against an account whose credentials are gone.
     isRetired(target.identity) ? Promise.resolve(undefined) : (deps.fetchExtraCost ?? fetchExtraCost)(target.toolName, target.identity),
@@ -451,7 +467,7 @@ const USAGE_MAX_CONCURRENT = 6;
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
-  options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => void; deps?: UsageRunDeps } = {},
+  options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => unknown; deps?: UsageRunDeps } = {},
 ): Promise<UsageResult[]> {
   const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
   if (!options.deps?.runTokscale && targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
@@ -506,7 +522,9 @@ export async function defaultOpencodeProfileUsageResults(): Promise<UsageResult[
 export async function swapPoolUsageResults(
   flags: ParsedArgs["flags"],
   ledgerPath: string = aisClaudeSwapLedgerPath(),
-  tokscaleForPool: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]> = runTokscale,
+  tokscaleForPool: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]> = runTokscaleForUsageTarget,
+  onPoolDone?: (pool: Identity, results: UsageResult[], failed?: boolean, nativeBatchCandidate?: UsageResult["nativeBatchCandidate"]) => void | Promise<void>,
+  includePoolNames?: ReadonlySet<string>,
 ): Promise<UsageResult[]> {
   const toolFilter = toolConfigFromFlag(flags);
   if (toolFilter && toolFilter.toolName !== "claude") return [];
@@ -514,6 +532,9 @@ export async function swapPoolUsageResults(
   const [{ file }] = await loadAll([CLAUDE_CONFIG]);
   const results: UsageResult[] = [];
   for (const pool of poolsOf(file)) {
+    if (includePoolNames && !includePoolNames.has(pool.name)) continue;
+    const poolStart = results.length;
+    try {
     const members = pool.swapPool.accounts.map((name) => file.identities.find((i) => i.name === name)).filter((i): i is Identity => i !== undefined);
     const usages = await poolMemberModelUsage(pool, members, ledgerPath);
     // Cost: the pool's tokscale per-model cost, split by each member's token share
@@ -522,7 +543,14 @@ export async function swapPoolUsageResults(
     const poolCost = new Map<string, number>();
     const modelTokens = new Map<string, number>();
     const tokens = (e: TokscaleEntry) => e.input + e.output + e.cacheRead + e.cacheWrite;
-    for (const result of await tokscaleForPool({ toolName: "claude", identity: pool }, { explicitTool: false }).catch(() => [])) {
+    let nativeBatchCandidate: UsageResult["nativeBatchCandidate"];
+    const poolSourceResults = await tokscaleForPool({ toolName: "claude", identity: pool }, { explicitTool: false });
+    if (poolSourceResults.some((result) => result.error || result.sourceOnlyError)) {
+      await onPoolDone?.(pool, [], true);
+      continue;
+    }
+    for (const result of poolSourceResults) {
+      nativeBatchCandidate ??= result.nativeBatchCandidate;
       for (const e of result.report?.entries ?? []) poolCost.set(e.model, (poolCost.get(e.model) ?? 0) + e.cost);
     }
     for (const usage of usages) for (const e of usage.entries) modelTokens.set(e.model, (modelTokens.get(e.model) ?? 0) + tokens(e));
@@ -545,6 +573,10 @@ export async function swapPoolUsageResults(
         dateSpan: { firstMs: usage.firstMs, lastMs: usage.lastMs },
         dailyUsage: usage.dailyUsage,
       });
+    }
+    await onPoolDone?.(pool, results.slice(poolStart), undefined, nativeBatchCandidate);
+    } catch {
+      await onPoolDone?.(pool, [], true);
     }
   }
   return results;

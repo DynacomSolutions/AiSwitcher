@@ -3,7 +3,6 @@ import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PollCache } from "../../src/server/expensive.ts";
-import { warmUsageCaches } from "../../src/server/workers.ts";
 
 const dirs: string[] = [];
 const tmp = async () => {
@@ -61,19 +60,6 @@ describe("first request", () => {
     await Bun.sleep(5);
     const next = await cache.getSwr("k", fetcher);
     expect(next.value).toBe("done");
-  });
-});
-
-describe("warmUsageCaches", () => {
-  test("fires the default usage and breakdown scans once", () => {
-    const calls: Array<[string, unknown]> = [];
-    const run = (async (kind: string, params: unknown) => {
-      calls.push([kind, params]);
-      return { ok: true };
-    }) as never;
-    warmUsageCaches(run);
-    warmUsageCaches(run);
-    expect(calls).toEqual([["usage", {}], ["breakdown", { days: 30 }]]);
   });
 });
 

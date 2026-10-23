@@ -227,7 +227,7 @@ export async function runBatched<T, R>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<R>,
-  onItemDone?: (index: number, result: R) => void,
+  onItemDone?: (index: number, result: R) => unknown,
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;
@@ -236,7 +236,7 @@ export async function runBatched<T, R>(
       const i = next++;
       const result = await fn(items[i]!);
       results[i] = result;
-      onItemDone?.(i, result);
+      await onItemDone?.(i, result);
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));

@@ -2,7 +2,7 @@ import { execReal } from "../../shared/exec.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { collectTargets } from "./run.ts";
-import { buildMergedEnv, resolveTokscaleCommand, tokscaleInvocationFor } from "./tokscale.ts";
+import { buildMergedEnv, resolveAisTokscaleSharedTui, resolveTokscaleCommand, tokscaleInvocationFor } from "./tokscale.ts";
 
 /**
  * Full tokscale capability — TUI, `graph`, `monthly`, `hourly`, `pricing`,
@@ -33,6 +33,23 @@ import { buildMergedEnv, resolveTokscaleCommand, tokscaleInvocationFor } from ".
  * configured for more than one tool.
  */
 export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: string[]): Promise<never> {
+  if (tokscaleArgs[0] === "tui") {
+    if (stringFlag(flags, "identity") !== undefined) {
+      throw new CliUsageError("--identity cannot select a partition in shared Tokscale TUI mode");
+    }
+    if (stringFlag(flags, "tool") !== undefined) {
+      throw new CliUsageError("--tool cannot select one partition in shared Tokscale TUI mode");
+    }
+
+    let shared: Awaited<ReturnType<typeof resolveAisTokscaleSharedTui>>;
+    try {
+      shared = await resolveAisTokscaleSharedTui();
+    } catch (error) {
+      throw new CliUsageError(error instanceof Error ? error.message : "AIS shared Tokscale binary is unavailable");
+    }
+    return execReal(shared.command, [...shared.args, ...tokscaleArgs.slice(1)], {});
+  }
+
   const [cmd, ...prefixArgs] = resolveTokscaleCommand();
   const identityFilter = stringFlag(flags, "identity");
 

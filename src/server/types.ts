@@ -84,6 +84,12 @@ export interface LimitsEnvelope {
 export interface UsageEnvelope {
   results: unknown[];
   generatedAt: string;
+  stale?: boolean;
+  pending?: boolean;
+  nativeCoverage?: { supported: number; unsupported: number; error: number; pending: number };
+  lastSuccessAt?: string;
+  lastError?: string;
+  lastErrorAt?: string;
 }
 
 export interface SessionsEnvelope {

@@ -1,26 +1,20 @@
 import { boolFlag, parseArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
-import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
-import { spinnerChar, withLiveRender } from "../live.ts";
 import { runPassthrough } from "./passthrough.ts";
 import {
   breakdownQueryFromFlags,
   formatBreakdownReport,
-  runBreakdownQuery,
 } from "./breakdown.ts";
+import {
+  readUsageBreakdownEnvelope,
+  requestUsageBreakdownRefresh,
+} from "./breakdown-snapshot.ts";
 import { formatUsageReport } from "./report.ts";
 import {
-  aggregateUsageResults,
   collectTargets,
-  defaultOpencodeProfileUsageResults,
-  swapPoolUsageResults,
-  pendingUsageResult,
-  runUsageQuery,
-  runUsageQueryForTargets,
-  shouldIncludeDefaultOpencodeProfile,
-  usageResultsForJson,
   type UsageResult,
 } from "./run.ts";
+import { readUsageSnapshotEnvelope, startUsageSnapshotRefreshInBackground } from "./snapshot.ts";
 
 /** Our own recognized `ais usage` flags — anything else is tokscale's, not
  * ours, even if it happens to start with "--" (tokscale has plenty of its
@@ -69,11 +63,22 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
   if (rawArgs[0] === "breakdown") {
     const { flags, positionals } = parseArgs(rawArgs.slice(1));
     const query = breakdownQueryFromFlags(flags, positionals[0]);
-    const results = await runBreakdownQuery(query);
+    await collectTargets({
+      ...(query.tool ? { tool: query.tool } : {}),
+      ...(query.identity ? { identity: query.identity } : {}),
+    }); // validate registry filters without reading usage history
+    let envelope = readUsageBreakdownEnvelope(query);
+    if (!envelope || envelope.stale) {
+      requestUsageBreakdownRefresh(query);
+      envelope = readUsageBreakdownEnvelope(query);
+    }
+    const results = envelope.results;
     if (boolFlag(flags, "json")) {
-      console.log(JSON.stringify({ results }, null, 2));
+      console.log(JSON.stringify(envelope, null, 2));
       return;
     }
+    if (envelope.stale || envelope.pending) console.error("Usage breakdown snapshot is stale or still being collected.");
+    if (envelope.error) console.error(`Usage breakdown refresh failed: ${envelope.error.category} (${envelope.error.at}).`);
     console.log(formatBreakdownReport(results));
     return;
   }
@@ -87,46 +92,27 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
   const { flags } = parseArgs(rawArgs);
   const json = boolFlag(flags, "json");
 
-  // Live per-row-spinner render — same rationale/gating as
-  // limits/dispatch.ts's own live path: only with a real TTY to redraw in
-  // place, and only for the plain report (not --json, and not this
-  // function's own earlier `runPassthrough` branch above, which already
-  // hands off to tokscale's own interactive stdio-inherited process and has
-  // nothing to do with this render loop at all).
-  if (!json && process.stdout.isTTY) {
-    const targets = await collectTargets(flags);
-    // One slot per target; multi-provider clients (pi/opencode) seed no
-    // pending row — their provider is only known once their own source
-    // resolves (see pendingUsageResult).
-    const resultSlots: UsageResult[][] = targets.map((target) => {
-      const pending = pendingUsageResult(target);
-      return pending ? [pending] : [];
-    });
-    // The default opencode profile gets its own slot: it is usage outside
-    // any identity and has no target row to hang a spinner on, so it fills
-    // in whenever its (fast, local) db read lands.
-    const includeDefaultProfile = shouldIncludeDefaultOpencodeProfile(flags);
-    const defaultSlot: UsageResult[] = [];
-    await withLiveRender(
-      (tick) => formatUsageReport(aggregateUsageResults([...resultSlots.flat(), ...defaultSlot]), spinnerChar(tick)),
-      async () => {
-        await Promise.all([
-          runUsageQueryForTargets(targets, {
-            explicitTool: toolConfigFromFlag(flags) !== undefined,
-            onItemDone: (index, results) => (resultSlots[index] = results),
-          }),
-          includeDefaultProfile ? defaultOpencodeProfileUsageResults().then((rows) => defaultSlot.push(...rows)) : Promise.resolve(),
-          swapPoolUsageResults(flags).then((rows) => defaultSlot.push(...rows)),
-        ]);
-      },
-    );
-    return;
-  }
-
-  const results = await runUsageQuery(flags);
+  const tool = typeof flags.tool === "string" ? flags.tool : undefined;
+  const identity = typeof flags.identity === "string" ? flags.identity : undefined;
+  await collectTargets(flags); // validates filters without reading usage history
+  let envelope = readUsageSnapshotEnvelope(tool, identity);
+  if (!envelope || envelope.stale) startUsageSnapshotRefreshInBackground();
+  const results = (envelope?.results ?? []) as UsageResult[];
   if (json) {
-    console.log(JSON.stringify(usageResultsForJson(results), null, 2));
+    console.log(JSON.stringify(envelope?.results ?? [], null, 2));
+    console.error(`AIS_USAGE_STATUS ${JSON.stringify({
+      stale: envelope?.stale ?? true,
+      pending: envelope?.pending ?? true,
+      nativeCoverage: envelope?.nativeCoverage ?? { supported: 0, unsupported: 0, error: 0, pending: 0 },
+      ...(envelope?.generatedAt ? { generatedAt: envelope.generatedAt } : {}),
+      ...(envelope?.lastSuccessAt ? { lastSuccessAt: envelope.lastSuccessAt } : {}),
+      ...(envelope?.lastError ? { error: envelope.lastError } : {}),
+      ...(envelope?.lastErrorAt ? { lastErrorAt: envelope.lastErrorAt } : {}),
+    })}`);
     return;
   }
+  if (!envelope || envelope.stale || envelope.pending) console.error("Usage snapshot is stale or still being collected.");
+  if (envelope?.lastError) console.error(`Usage refresh failed: ${envelope.lastError}`);
   console.log(formatUsageReport(results));
+
 }
