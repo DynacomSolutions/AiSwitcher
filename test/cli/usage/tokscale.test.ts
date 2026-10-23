@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { writeZaiAuthFile } from "../../../src/identities/zai-auth.ts";
+import { defaultOpencodeProfileDbPath } from "../../../src/cli/usage/opencode-usage.ts";
 import {
   buildMergedEnv,
   dailyUsageFromHourlyEntries,
   findCachedTokscaleBinary,
+  prepareMergedPassthrough,
   shouldRefreshTokscaleCache,
   tokscaleInvocationFor,
   tokscalePlatformVariants,
@@ -227,17 +229,194 @@ describe("buildMergedEnv", () => {
     expect(env.ZAI_API_KEY).toBeUndefined();
   });
 
-  test("includes XDG_DATA_HOME when exactly one opencode target is in the set", async () => {
-    const env = await buildMergedEnv([{ toolName: "opencode", identity: identity("/Users/alice/.opencode/identities/a") }]);
-    expect(env.XDG_DATA_HOME).toBe("/Users/alice/.opencode/identities/a/data");
+  test("prepares Tokscale settings with configured OpenCode DB paths and preserves user config state by symlink", async () => {
+    const sourceConfigDir = await makeConfigDir();
+    const overlayConfigDir = await makeConfigDir();
+    await writeFile(join(sourceConfigDir, "settings.json"), JSON.stringify({
+      tuiLanguage: "en",
+      scanner: {
+        opencodeDbPaths: ["/shared/opencode.db"],
+        extraScanPaths: { opencode: ["/shared/opencode/storage/message"] },
+        bucketTimezone: "Asia/Bangkok",
+      },
+    }));
+    await mkdir(join(sourceConfigDir, "cache"));
+    await writeFile(join(sourceConfigDir, "credentials.json"), "credential fixture");
+    await writeFile(join(sourceConfigDir, "private-user-file.json"), "must not be linked");
+    await symlink("/stale/tokscale-cache", join(overlayConfigDir, "warp-cache"), "dir");
+
+    const env = await buildMergedEnv([
+      { toolName: "opencode", identity: identity("/home/user/.opencode/identities/a") },
+      { toolName: "opencode", identity: identity("/home/user/.opencode/identities/b") },
+    ], { sourceConfigDir, overlayConfigDir });
+
+    expect(env.TOKSCALE_CONFIG_DIR).toBe(overlayConfigDir);
+    expect(env.XDG_DATA_HOME).toContain("no-default-scan");
+    const overlaySettings = JSON.parse(await readFile(join(overlayConfigDir, "settings.json"), "utf8"));
+    expect(overlaySettings.tuiLanguage).toBe("en");
+    expect(overlaySettings.scanner.bucketTimezone).toBe("Asia/Bangkok");
+    expect(overlaySettings.scanner.opencodeDbPaths).toEqual([
+      "/shared/opencode.db",
+      "/home/user/.opencode/identities/a/data/opencode/opencode.db",
+      "/home/user/.opencode/identities/b/data/opencode/opencode.db",
+    ]);
+    expect(overlaySettings.scanner.extraScanPaths.opencode).toEqual([
+      "/shared/opencode/storage/message",
+      "/home/user/.opencode/identities/a/data/opencode/storage/message",
+      "/home/user/.opencode/identities/b/data/opencode/storage/message",
+    ]);
+    expect(await readFile(join(sourceConfigDir, "settings.json"), "utf8")).toContain("/shared/opencode.db");
+    expect((await Bun.file(join(overlayConfigDir, "cache")).stat()).isDirectory()).toBe(true);
+    expect(await readFile(join(overlayConfigDir, "credentials.json"), "utf8")).toBe("credential fixture");
+    expect(await readlink(join(overlayConfigDir, "credentials.json"))).toBe(join(sourceConfigDir, "credentials.json"));
+    expect(await readlink(join(overlayConfigDir, "cache"))).toBe(join(sourceConfigDir, "cache"));
+    expect(await readlink(join(overlayConfigDir, "warp-cache"))).toBe(join(sourceConfigDir, "warp-cache"));
+    expect(await Bun.file(join(overlayConfigDir, "private-user-file.json")).exists()).toBe(false);
   });
 
-  test("drops opencode from the merge when more than one opencode identity is targeted (one XDG_DATA_HOME can only point at one data root)", async () => {
+  test("uses the Tokscale config below an existing XDG_CONFIG_HOME and retains overlay settings", async () => {
+    const xdgConfigHome = await makeConfigDir();
+    const sourceConfigDir = join(xdgConfigHome, "tokscale");
+    const overlayConfigDir = await makeConfigDir();
+    await mkdir(sourceConfigDir);
+    await writeFile(join(sourceConfigDir, "settings.json"), JSON.stringify({ tuiLanguage: "en" }));
+    const oldXdg = process.env.XDG_CONFIG_HOME;
+    const oldTokscale = process.env.TOKSCALE_CONFIG_DIR;
+    process.env.XDG_CONFIG_HOME = xdgConfigHome;
+    delete process.env.TOKSCALE_CONFIG_DIR;
+    try {
+      const target = [{ toolName: "opencode", identity: identity("/identity/a") }];
+      await buildMergedEnv(target, { overlayConfigDir });
+      const settingsPath = join(overlayConfigDir, "settings.json");
+      const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+      settings.tuiLanguage = "fr";
+      await writeFile(settingsPath, JSON.stringify(settings));
+      await buildMergedEnv(target, { overlayConfigDir });
+      const retained = JSON.parse(await readFile(settingsPath, "utf8"));
+      expect(retained.tuiLanguage).toBe("fr");
+      expect(retained.scanner.opencodeDbPaths).toEqual(["/identity/a/data/opencode/opencode.db"]);
+    expect(retained.scanner.extraScanPaths.opencode).toEqual(["/identity/a/data/opencode/storage/message"]);
+    } finally {
+      if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = oldXdg;
+      if (oldTokscale === undefined) delete process.env.TOKSCALE_CONFIG_DIR;
+      else process.env.TOKSCALE_CONFIG_DIR = oldTokscale;
+    }
+  });
+
+  test("creates the overlay when Tokscale has no source config yet", async () => {
+    const missingSourceConfig = join(await makeConfigDir(), "not-created", "tokscale");
+    const overlayConfigDir = await makeConfigDir();
     const env = await buildMergedEnv([
-      { toolName: "opencode", identity: identity("/Users/alice/.opencode/identities/a") },
-      { toolName: "opencode", identity: identity("/Users/alice/.opencode/identities/b") },
+      { toolName: "opencode", identity: identity("/identity/a") },
+      { toolName: "opencode", identity: identity("/identity/b") },
+    ], { sourceConfigDir: missingSourceConfig, overlayConfigDir });
+    expect(env.TOKSCALE_CONFIG_DIR).toBe(overlayConfigDir);
+    const settings = JSON.parse(await readFile(join(overlayConfigDir, "settings.json"), "utf8"));
+    expect(settings.scanner.opencodeDbPaths).toEqual([
+      "/identity/a/data/opencode/opencode.db",
+      "/identity/b/data/opencode/opencode.db",
     ]);
-    expect(env.XDG_DATA_HOME).toBeUndefined();
+    expect(settings.scanner.extraScanPaths.opencode).toEqual([
+      "/identity/a/data/opencode/storage/message",
+      "/identity/b/data/opencode/storage/message",
+    ]);
+    expect(await readlink(join(overlayConfigDir, "cache"))).toBe(join(missingSourceConfig, "cache"));
+  });
+
+  test("deduplicates repeated OpenCode DB paths", async () => {
+    const sourceConfigDir = await makeConfigDir();
+    const overlayConfigDir = await makeConfigDir();
+    const env = await buildMergedEnv([
+      { toolName: "opencode", identity: identity("/home/user/.opencode/identities/a") },
+      { toolName: "opencode", identity: identity("/home/user/.opencode/identities/a") },
+    ], { sourceConfigDir, overlayConfigDir });
+    const overlaySettings = JSON.parse(await readFile(join(env.TOKSCALE_CONFIG_DIR!, "settings.json"), "utf8"));
+    expect(overlaySettings.scanner.opencodeDbPaths).toHaveLength(1);
+    expect(overlaySettings.scanner.extraScanPaths.opencode).toHaveLength(1);
+  });
+
+  test("deduplicates existing OpenCode DB paths that reach the same file through symlink aliases", async () => {
+    const sourceConfigDir = await makeConfigDir();
+    const overlayConfigDir = await makeConfigDir();
+    const realDb = join(await makeConfigDir(), "opencode.db");
+    const identityDir = await makeConfigDir();
+    const identityDbDir = join(identityDir, "data", "opencode");
+    const aliasDb = join(identityDbDir, "opencode.db");
+    await mkdir(identityDbDir, { recursive: true });
+    await writeFile(realDb, "fixture db");
+    await symlink(realDb, aliasDb, "file");
+    await writeFile(join(sourceConfigDir, "settings.json"), JSON.stringify({
+      scanner: { opencodeDbPaths: [realDb] },
+    }));
+
+    await buildMergedEnv([
+      { toolName: "opencode", identity: identity(identityDir) },
+    ], { sourceConfigDir, overlayConfigDir });
+
+    const overlaySettings = JSON.parse(await readFile(join(overlayConfigDir, "settings.json"), "utf8"));
+    expect(overlaySettings.scanner.opencodeDbPaths).toEqual([realDb]);
+  });
+
+  test("prepares noninteractive --json passthrough args and config without executing Tokscale", async () => {
+    const sourceConfigDir = await makeConfigDir();
+    const overlayConfigDir = await makeConfigDir();
+    const prepared = await prepareMergedPassthrough([
+      { toolName: "opencode", identity: identity("/identities/a") },
+      { toolName: "opencode", identity: identity("/identities/b") },
+    ], ["--json"], { sourceConfigDir, overlayConfigDir });
+    expect(prepared.args).toEqual(["--json"]);
+    expect(prepared.env.TOKSCALE_CONFIG_DIR).toBe(overlayConfigDir);
+    const overlaySettings = JSON.parse(await readFile(join(overlayConfigDir, "settings.json"), "utf8"));
+    expect(overlaySettings.scanner.opencodeDbPaths).toEqual([
+      "/identities/a/data/opencode/opencode.db",
+      "/identities/b/data/opencode/opencode.db",
+    ]);
+    expect(overlaySettings.scanner.extraScanPaths.opencode).toEqual([
+      "/identities/a/data/opencode/storage/message",
+      "/identities/b/data/opencode/storage/message",
+    ]);
+  });
+
+  test("includes default OpenCode DB and legacy roots when requested for unscoped passthrough", async () => {
+    const sourceConfigDir = await makeConfigDir();
+    const overlayConfigDir = await makeConfigDir();
+    const prepared = await prepareMergedPassthrough([
+      { toolName: "claude", identity: identity("/identities/claude") },
+      { toolName: "opencode", identity: identity("/identities/opencode") },
+    ], ["tui"], { sourceConfigDir, overlayConfigDir, includeDefaultOpencodeProfile: true });
+    const scanner = JSON.parse(await readFile(join(overlayConfigDir, "settings.json"), "utf8")).scanner;
+    const defaultDb = defaultOpencodeProfileDbPath();
+    expect(prepared.args).toEqual(["tui"]);
+    expect(scanner.opencodeDbPaths).toContain(defaultDb);
+    expect(scanner.opencodeDbPaths).toContain("/identities/opencode/data/opencode/opencode.db");
+    expect(scanner.extraScanPaths.opencode).toContain(join(dirname(defaultDb), "storage", "message"));
+    expect(scanner.extraScanPaths.opencode).toContain("/identities/opencode/data/opencode/storage/message");
+  });
+
+  test("does not configure the default OpenCode profile when filtered to another tool", async () => {
+    const sourceConfigDir = await makeConfigDir();
+    const overlayConfigDir = await makeConfigDir();
+    const prepared = await prepareMergedPassthrough([
+      { toolName: "claude", identity: identity("/identities/claude") },
+    ], ["tui"], { sourceConfigDir, overlayConfigDir, includeDefaultOpencodeProfile: false });
+    expect(prepared.env.TOKSCALE_CONFIG_DIR).toBeUndefined();
+    expect(await Bun.file(join(overlayConfigDir, "settings.json")).exists()).toBe(false);
+  });
+
+  test("configures the default OpenCode profile when no identities are configured", async () => {
+    const sourceConfigDir = await makeConfigDir();
+    const overlayConfigDir = await makeConfigDir();
+    const prepared = await prepareMergedPassthrough([], ["tui"], {
+      sourceConfigDir,
+      overlayConfigDir,
+      includeDefaultOpencodeProfile: true,
+    });
+    const scanner = JSON.parse(await readFile(join(overlayConfigDir, "settings.json"), "utf8")).scanner;
+    const defaultDb = defaultOpencodeProfileDbPath();
+    expect(prepared.env.TOKSCALE_CONFIG_DIR).toBe(overlayConfigDir);
+    expect(scanner.opencodeDbPaths).toContain(defaultDb);
+    expect(scanner.extraScanPaths.opencode).toContain(join(dirname(defaultDb), "storage", "message"));
   });
 });
 

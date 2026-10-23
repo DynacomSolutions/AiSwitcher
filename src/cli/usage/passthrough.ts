@@ -1,8 +1,13 @@
 import { execReal } from "../../shared/exec.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
-import { collectTargets } from "./run.ts";
-import { buildMergedEnv, resolveAisTokscaleSharedTui, resolveTokscaleCommand, tokscaleInvocationFor } from "./tokscale.ts";
+import { collectTargets, shouldIncludeDefaultOpencodeProfile } from "./run.ts";
+import {
+  prepareMergedPassthrough,
+  resolveAisTokscaleSharedTui,
+  resolveTokscaleCommand,
+  tokscaleInvocationFor,
+} from "./tokscale.ts";
 
 /**
  * Full tokscale capability — TUI, `graph`, `monthly`, `hourly`, `pricing`,
@@ -10,22 +15,20 @@ import { buildMergedEnv, resolveAisTokscaleSharedTui, resolveTokscaleCommand, to
  * `ais usage [--identity=] [--tool=] [-- ]<tokscale args...>`. Unlike the
  * default aggregate report (run.ts), this execs the real tokscale process
  * with full stdio inheritance (so the interactive TUI and raw-mode terminal
- * handling actually work), so it can only ever target zero or one
- * (tool, identity) pair — an interactive/streaming invocation can't
- * sensibly run once per identity and merge results the way the JSON report
- * can.
+ * handling actually work). Unscoped passthrough merges all configured
+ * identity roots into one Tokscale process, including the default OpenCode
+ * profile whenever the usage filters allow it.
  *
  * --identity omitted: NOT the same as no env injection at all — tokscale's
  * own bare defaults resolve to this project's top-level ~/.claude/~/.codex/
  * ~/.grok containers, which are deliberately kept empty of real session data
  * (see AGENTS.md's disk layout). An unscoped passthrough instead merges
- * every configured identity (optionally narrowed by --tool) into one
- * TOKSCALE_EXTRA_DIRS value, confirmed empirically to surface every
- * identity/provider in a single tokscale process — this is what makes
- * `ais usage -- tui` show everything rather than next to nothing. Zero
- * configured identities at all falls back to a truly bare passthrough (no
- * env injection), which is still correct for identity-agnostic commands
- * like `pricing "<model>"`.
+ * every configured identity (optionally narrowed by --tool) into Tokscale's
+ * additive scan settings. The default OpenCode profile is included unless
+ * an identity filter or unrelated tool filter excludes it. If there are no
+ * configured identities and no default profile applies, passthrough remains
+ * bare, which is correct for identity-agnostic commands like `pricing
+ * "<model>"`.
  *
  * --identity given: resolved via the same collectTargets() as the aggregate
  * report (so it throws the same "not found" error on zero matches), then
@@ -55,10 +58,10 @@ export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: s
 
   if (!identityFilter) {
     const targets = await collectTargets(flags, undefined, { includePools: true });
-    if (targets.length === 0) {
-      return execReal(cmd!, [...prefixArgs, ...tokscaleArgs], {});
-    }
-    return execReal(cmd!, [...prefixArgs, ...tokscaleArgs], await buildMergedEnv(targets));
+    const prepared = await prepareMergedPassthrough(targets, tokscaleArgs, {
+      includeDefaultOpencodeProfile: shouldIncludeDefaultOpencodeProfile(flags),
+    });
+    return execReal(cmd!, [...prefixArgs, ...prepared.args], prepared.env);
   }
 
   const targets = await collectTargets(flags, undefined, { includePools: true });
