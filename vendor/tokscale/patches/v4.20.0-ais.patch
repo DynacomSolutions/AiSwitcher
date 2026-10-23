@@ -1433,7 +1433,7 @@ index c68471a..771e05f 100644
 +    write_ais_export_if_requested(&all_messages)?;
 --- a/crates/tokscale-cli/tests/cli_tests.rs
 +++ b/crates/tokscale-cli/tests/cli_tests.rs
-@@ -2360,0 +2361,48 @@
+@@ -2360,0 +2361,52 @@
 +fn ais_native_export_from_json_model_report_uses_report_parser_vector() {
 +    let tmp = create_codex_fixture_dir();
 +    let export_path = tmp.path().join("native-batch.json");
@@ -1686,7 +1686,7 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +        .map_err(|e| format!("AIS Claude cache seed marker directory sync: {e}"))?;
 +    Ok(())
 +}
-@@ -5316,0 +5512,92 @@
+@@ -5316,0 +5512,117 @@
 +    fn ais_shared_snapshot_claude_seed_preserves_history_for_only_matching_profile_and_is_idempotent(
 +    ) {
 +        let source_home = TempDir::new().unwrap();
@@ -1696,10 +1696,23 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +        std::fs::create_dir_all(&profile_a).unwrap();
 +        std::fs::create_dir_all(&profile_b).unwrap();
 +        let source_a = profile_a.join("session-a.jsonl");
-+        let source_b = profile_b.join("session-b.jsonl");
 +        std::fs::write(&source_a, b"retained profile a").unwrap();
++        let index_a = CacheKey::new(CacheIdentity::for_client(ClientId::Claude), &source_a)
++            .shard()
++            .index;
++        let source_b = (0..CACHE_SHARD_COUNT)
++            .map(|index| profile_b.join(format!("session-b-{index}.jsonl")))
++            .find(|path| {
++                CacheKey::new(CacheIdentity::for_client(ClientId::Claude), path)
++                    .shard()
++                    .index
++                    != index_a
++            })
++            .expect("find a profile-b path in a distinct cache shard");
 +        std::fs::write(&source_b, b"retained profile b").unwrap();
 +        let identity = CacheIdentity::for_client(ClientId::Claude);
++        let index_b = CacheKey::new(identity, &source_b).shard().index;
++        assert_ne!(index_a, index_b);
 +        let mut entry_a = test_entry(identity, &source_a, "retained-a");
 +        let mut entry_b = test_entry(identity, &source_b, "retained-b");
 +        entry_a.fallback_timestamp_indices = vec![0];
@@ -1715,9 +1728,16 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +        ensure_cache_dir(&source_namespace).unwrap();
 +        std::fs::write(source_cache.join(CACHE_LOCK_FILENAME), b"").unwrap();
 +        write_shard_with_limit(
-+            &source_namespace.join(shard_filename(0)),
++            &source_namespace.join(shard_filename(index_a)),
 +            identity,
-+            &[entry_a, entry_b],
++            &[entry_a],
++            MAX_CACHE_SHARD_BYTES,
++        )
++        .unwrap();
++        write_shard_with_limit(
++            &source_namespace.join(shard_filename(index_b)),
++            identity,
++            &[entry_b],
 +            MAX_CACHE_SHARD_BYTES,
 +        )
 +        .unwrap();
@@ -1725,18 +1745,18 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +        let _env = sandbox_cache_env(destination_home.path());
 +        let destination_cache = cache_dir().unwrap();
 +        seed_ais_claude_cache_between(&source_config, &destination_cache).unwrap();
-+        let destination_shard = destination_cache
++        let destination_namespace = destination_cache
 +            .join(CACHE_SHARD_DIRNAME)
-+            .join(ClientId::Claude.as_str())
-+            .join(shard_filename(0));
-+        let seeded_bytes = std::fs::read(&destination_shard).unwrap();
++            .join(ClientId::Claude.as_str());
++        let seeded_bytes = [index_a, index_b]
++            .map(|index| std::fs::read(destination_namespace.join(shard_filename(index))).unwrap());
 +        assert_eq!(
 +            serde_json::from_reader::<_, AisClaudeSeedMarker>(
 +                File::open(destination_cache.join(AIS_CLAUDE_SEED_MARKER)).unwrap()
 +            )
 +            .unwrap()
 +            .imported_shard_count,
-+            1
++            2
 +        );
 +
 +        let cache = SourceMessageCache::load();
@@ -1748,12 +1768,17 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +        );
 +
 +        std::fs::write(
-+            &source_namespace.join(shard_filename(0)),
++            source_namespace.join(shard_filename(index_a)),
 +            b"changed after seed",
 +        )
 +        .unwrap();
 +        seed_ais_claude_cache_between(&source_config, &destination_cache).unwrap();
-+        assert_eq!(std::fs::read(&destination_shard).unwrap(), seeded_bytes);
++        assert_eq!(
++            [index_a, index_b].map(|index| {
++                std::fs::read(destination_namespace.join(shard_filename(index))).unwrap()
++            }),
++            seeded_bytes
++        );
 +    }
 +
 +    #[test]
