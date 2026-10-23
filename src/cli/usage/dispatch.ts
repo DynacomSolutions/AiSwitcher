@@ -10,6 +10,7 @@ import {
   requestUsageBreakdownRefresh,
 } from "./breakdown-snapshot.ts";
 import { formatUsageReport } from "./report.ts";
+import { installUsageCollectorService } from "./collector-service.ts";
 import {
   collectTargets,
   type UsageResult,
@@ -58,6 +59,16 @@ export function splitPassthroughArgs(
  * splitPassthroughArgs for why this can't be the already-parsed top-level
  * flags the other `ais` subcommands use. */
 export async function runUsageCommand(rawArgs: string[]): Promise<void> {
+  if (rawArgs[0] === "service") {
+    if (rawArgs.length !== 2 || rawArgs[1] !== "install") {
+      throw new CliUsageError("Usage: ais usage service install");
+    }
+    const result = await installUsageCollectorService();
+    console.log(`usage service ${result.changed ? "installed" : "already current"}: ${result.path}`);
+    console.log("The unit is enabled and active.");
+    return;
+  }
+
   // "breakdown" is our own subcommand, never a tokscale one: intercept it
   // before the passthrough splitter would hand the bare word to tokscale.
   if (rawArgs[0] === "breakdown") {

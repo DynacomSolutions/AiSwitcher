@@ -43,14 +43,17 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   usage: {
-    usage: "ais usage [breakdown] [--identity=] [--tool=] [--json]",
+    usage: "ais usage [breakdown|service install] [--identity=] [--tool=] [--json]",
     desc: "Token usage and cost, grouped by provider",
     flags: [
       ["--days=30", "breakdown window"],
       ["<tokscale args>", "anything else runs tokscale, e.g. `ais usage tui`"],
     ],
-    examples: ["ais usage --json", "ais usage breakdown --days=7"],
-    subs: { breakdown: sub("ais usage breakdown [identity] [--tool=] [--days=30] [--json]", "Per-tool-call breakdown") },
+    examples: ["ais usage --json", "ais usage breakdown --days=7", "ais usage service install"],
+    subs: {
+      breakdown: sub("ais usage breakdown [identity] [--tool=] [--days=30] [--json]", "Per-tool-call breakdown"),
+      service: sub("ais usage service install", "Install the bounded Linux user collector unit"),
+    },
   },
   limits: {
     usage: "ais limits [identity] [--tool=] [--json|--watch|--cached|--compact]",
