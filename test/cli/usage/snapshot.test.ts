@@ -6,6 +6,7 @@ import { basename, dirname, join } from "node:path";
 import {
   acquireSnapshotLock,
   externalUsageCollectorOwnsRefreshes,
+  recordUsageSnapshotRefreshFailure,
   readUsageSnapshotEnvelope,
   refreshUsageSnapshot,
   validateNativeBatchEnvelope,
@@ -270,6 +271,124 @@ describe("shared usage snapshot", () => {
     expect(pending?.stale).toBe(true);
     releaseScan();
     await refresh;
+  });
+
+  test("successful partition freshness starts at commit completion while attempts retain cycle start", async () => {
+    const path = await snapshotFile();
+    const startedAt = Date.UTC(2026, 0, 1);
+    let currentMs = startedAt;
+    const key = usageSnapshotTargetKey("claude", identity.name);
+    await refreshUsageSnapshot({
+      ...deps(path, { now: startedAt, results: [result(4)] }),
+      now: () => currentMs,
+      collectTargetResults: async (_targets, done) => {
+        // Simulate a source that takes longer than the cache TTL to finish.
+        currentMs += 75_000;
+        done(0, [result(4)]);
+        return [];
+      },
+    });
+
+    const persisted = JSON.parse(await readFile(path, "utf8")) as {
+      aggregateGeneratedAt: string;
+      partitions: Record<string, { lastAttemptAt: string; lastSuccessAt?: string }>;
+    };
+    expect(persisted.partitions[key]?.lastAttemptAt).toBe(new Date(startedAt).toISOString());
+    expect(persisted.partitions[key]?.lastSuccessAt).toBe(new Date(currentMs).toISOString());
+    expect(persisted.aggregateGeneratedAt).toBe(new Date(currentMs).toISOString());
+    expect(readUsageSnapshotEnvelope("claude", "work", path, currentMs + 1)?.stale).toBe(false);
+  });
+
+  test("swap-pool scans mark missing callbacks failed whether the collector resolves or rejects", async () => {
+    for (const rejects of [false, true]) {
+      const path = await snapshotFile();
+      const startedAt = Date.UTC(2026, 0, 1) + (rejects ? 1 : 0);
+      const pool = { ...identity, name: rejects ? "pool-reject" : "pool-resolve", swapPool: { accounts: [identity.name], active: identity.name } };
+      const poolTarget: UsageTarget = { toolName: "claude", identity: pool };
+      const key = usageSnapshotTargetKey("claude", pool.name);
+      await refreshUsageSnapshot({
+        ...deps(path, { now: startedAt, results: [] }),
+        collectTargets: async () => [],
+        collectPoolTargets: async () => [poolTarget],
+        collectSwapPools: async () => {
+          if (rejects) throw new Error("collector failed without callback");
+          return [];
+        },
+      });
+
+      const persisted = JSON.parse(await readFile(path, "utf8")) as {
+        producer?: { refreshCyclesFailedTotal?: number };
+        partitions: Record<string, { lastAttemptAt: string; lastSuccessAt?: string; lastError?: string; nativeCoverage?: string }>;
+      };
+      expect(persisted.partitions[key]?.lastAttemptAt).toBe(new Date(startedAt).toISOString());
+      expect(persisted.partitions[key]?.lastSuccessAt).toBeUndefined();
+      expect(persisted.partitions[key]?.lastError).toBe("source-error");
+      expect(persisted.partitions[key]?.nativeCoverage).toBe("error");
+      expect(persisted.producer?.refreshCyclesFailedTotal).toBe(1);
+    }
+  });
+
+  test("isolated worker failure preserves last-good data and completes an unfinished cycle once", async () => {
+    const path = await snapshotFile();
+    const startedAt = Date.UTC(2026, 0, 1);
+    await refreshUsageSnapshot(deps(path, { now: startedAt, results: [result(9)] }));
+    const key = usageSnapshotTargetKey("claude", "work");
+    const freshKey = usageSnapshotTargetKey("claude", "new-identity");
+    const persisted = JSON.parse(await readFile(path, "utf8")) as {
+      generatedAt: string;
+      aggregateGeneratedAt?: string;
+      producer: Record<string, unknown>;
+      partitions: Record<string, { results?: UsageResult[]; [key: string]: unknown }>;
+    };
+    const previousAggregateGeneration = persisted.aggregateGeneratedAt;
+    const previousRows = persisted.partitions[key]?.results;
+    const nativeBatch = {
+      path: "usage/native/fixture/last-good.json", partitionId: "a".repeat(64),
+      generatedAt: new Date(startedAt).toISOString(), sha256: "b".repeat(64),
+    };
+    persisted.partitions[key]!.nativeBatch = nativeBatch;
+    const cycleStartedAt = new Date(startedAt + 10_000).toISOString();
+    persisted.producer.lastStartedAt = cycleStartedAt;
+    persisted.producer.lastCompletedAt = new Date(startedAt + 5_000).toISOString();
+    persisted.partitions[freshKey] = {
+      tool: "claude", identity: "new-identity", nativeCoverage: "pending", results: [], lastAttemptAt: cycleStartedAt,
+    };
+    await writeFile(path, JSON.stringify(persisted));
+
+    const failed = await recordUsageSnapshotRefreshFailure("collector-timeout", {
+      path, now: () => startedAt + 20_000,
+    });
+    expect(failed?.partitions[key]?.results).toEqual(previousRows);
+    expect(failed?.partitions[key]?.nativeBatch).toEqual(nativeBatch);
+    expect(failed?.aggregateGeneratedAt).toBe(previousAggregateGeneration);
+    expect(failed?.partitions[freshKey]?.lastError).toBe("source-interrupted");
+    expect(failed?.partitions[freshKey]?.nativeCoverage).toBe("error");
+    expect(failed?.producer?.lastCycleError).toBe("collector-timeout");
+    expect(failed?.producer?.lastCompletedAt).toBe(new Date(startedAt + 20_000).toISOString());
+    expect(failed?.producer?.refreshCyclesFailedTotal).toBe(1);
+
+    const completedBytes = await readFile(path, "utf8");
+    expect(await recordUsageSnapshotRefreshFailure("collector-failed", { path, now: () => startedAt + 30_000 })).toBeUndefined();
+    expect(await readFile(path, "utf8")).toBe(completedBytes);
+  });
+
+  test("isolated worker failure does not overwrite a snapshot while its writer lock is held", async () => {
+    const path = await snapshotFile();
+    const startedAt = Date.UTC(2026, 0, 1);
+    await refreshUsageSnapshot(deps(path, { now: startedAt, results: [result(2)] }));
+    const snapshot = JSON.parse(await readFile(path, "utf8")) as { producer: Record<string, unknown> };
+    snapshot.producer.lastStartedAt = new Date(startedAt + 10_000).toISOString();
+    snapshot.producer.lastCompletedAt = new Date(startedAt + 5_000).toISOString();
+    await writeFile(path, JSON.stringify(snapshot));
+    const before = await readFile(path, "utf8");
+    const release = await acquireSnapshotLock(path);
+    expect(release).toBeDefined();
+    try {
+      expect(await recordUsageSnapshotRefreshFailure("collector-rejected", { path, now: () => startedAt + 20_000 })).toBeUndefined();
+      expect(await readFile(path, "utf8")).toBe(before);
+    } finally {
+      await release?.();
+    }
   });
 
   test("a dirty source publishes appended usage without a read-triggered scan", async () => {

@@ -11,6 +11,7 @@ import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResul
 import { usageResultsForJson } from "./run.ts";
 import { buildAisTokscaleExportInvocation, runAisTokscaleExportInvocation } from "./tokscale.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
+import { grokDuplicateBaselineIsSafe } from "./grok-history-regression.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 
@@ -129,6 +130,8 @@ export interface UsageSnapshotDeps {
   ) => Promise<UsageResult[]>;
   captureNative?: (spec: NativeSnapshotCaptureSpec) => Promise<UsageSnapshotPartition["nativeBatch"]>;
 }
+
+export type UsageSnapshotRefreshFailureCategory = "collector-timeout" | "collector-rejected" | "collector-failed";
 
 export interface NativeSnapshotCaptureSpec {
   partitionKey: string;
@@ -727,7 +730,18 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
       return;
     }
-    if (prior?.lastSuccessAt && isSuspectedHistoryRegression(prior.results, results)) {
+    const suspectedRegression = prior?.lastSuccessAt && isSuspectedHistoryRegression(prior.results, results);
+    const acceptedGrokDuplicateCorrection = suspectedRegression && tool === "grok" && prior.nativeBatch && nativeCandidate
+      ? grokDuplicateBaselineIsSafe({
+        priorRef: prior.nativeBatch,
+        candidatePath: nativeCandidate.path,
+        expectedPartitionId: nativePartitionId(key),
+        nativeBatchRoot: deps.nativeBatchRoot ?? join(aisCacheDir(), "usage", "native"),
+        previous: prior.results,
+        incoming: results,
+      })
+      : false;
+    if (suspectedRegression && !acceptedGrokDuplicateCorrection) {
       producer.sourceScanFailuresTotal++;
       if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
       // There is deliberately no force-refresh bypass. To reconcile an
@@ -793,10 +807,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       results: safeResults(results),
       ...(nativeBatch ? { nativeBatch } : {}),
       lastAttemptAt: attemptedAt,
-      lastSuccessAt: attemptedAt,
+      lastSuccessAt: new Date(now()).toISOString(),
       nativeFailure: undefined,
     };
-    aggregateGeneratedAt = attemptedAt;
+    aggregateGeneratedAt = partitions[key]!.lastSuccessAt!;
     writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
   };
 
@@ -851,8 +865,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
 
   if (dueSwapPools.length > 0) {
     const dueNames = new Set(dueSwapPools.map((target) => target.identity.name));
+    const completedPoolNames = new Set<string>();
     const onPoolDone = async (pool: UsageTarget["identity"], results: UsageResult[], failed = false, nativeCandidate?: UsageResult["nativeBatchCandidate"]) => {
       if (!dueNames.has(pool.name)) return;
+      completedPoolNames.add(pool.name);
       const key = targetKey({ toolName: "claude", identity: pool });
       if (failed) {
         producer.sourceScansTotal++;
@@ -881,14 +897,12 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
           onPoolDone, dueNames);
       }
       for (const pool of dueSwapPools) {
-        const key = targetKey(pool);
-        if (partitions[key]?.lastAttemptAt === attemptedAt) continue;
+        if (completedPoolNames.has(pool.identity.name)) continue;
         onPoolDone(pool.identity, [], true);
       }
     } catch {
       for (const pool of dueSwapPools) {
-        const key = targetKey(pool);
-        if (partitions[key]?.lastAttemptAt !== attemptedAt) onPoolDone(pool.identity, [], true);
+        if (!completedPoolNames.has(pool.identity.name)) onPoolDone(pool.identity, [], true);
       }
     }
   }
@@ -965,6 +979,58 @@ export function refreshUsageSnapshot(deps: UsageSnapshotDeps = {}): Promise<Usag
   if (activeRefresh) return activeRefresh;
   activeRefresh = refreshUsageSnapshotOnce(deps).finally(() => { activeRefresh = undefined; });
   return activeRefresh;
+}
+
+/** Record that an isolated collector ended before the snapshot cycle completed.
+ * The lock and start/completion timestamps make this safe to call after a
+ * worker timeout: an active writer or already-completed cycle is left alone. */
+export async function recordUsageSnapshotRefreshFailure(
+  category: UsageSnapshotRefreshFailureCategory,
+  deps: UsageSnapshotDeps = {},
+): Promise<UsageSnapshot | undefined> {
+  const path = deps.path ?? USAGE_SNAPSHOT_FILE;
+  const releaseLock = await acquireSnapshotLock(path);
+  if (!releaseLock) return undefined;
+  try {
+    const previous = readSnapshot(path);
+    if (!previous) return undefined;
+    const producer = previous.producer;
+    const startedMs = producer?.lastStartedAt ? Date.parse(producer.lastStartedAt) : Number.NaN;
+    const completedMs = producer?.lastCompletedAt ? Date.parse(producer.lastCompletedAt) : Number.NaN;
+    if (!Number.isFinite(startedMs) || (Number.isFinite(completedMs) && startedMs <= completedMs)) return undefined;
+
+    const failedAt = new Date((deps.now ?? Date.now)()).toISOString();
+    const partitions = { ...previous.partitions };
+    for (const [key, partition] of Object.entries(partitions)) {
+      // Only an identity first discovered by this unfinished cycle can be
+      // attributed to an interrupted source with certainty. Existing
+      // last-good partitions retain all rows, batch pointers, and attempt data.
+      if (partition.lastAttemptAt !== producer!.lastStartedAt || partition.lastSuccessAt || partition.lastError) continue;
+      partitions[key] = {
+        ...partition,
+        ...(partition.nativeCoverage === undefined || partition.nativeCoverage === "pending" ? { nativeCoverage: "error" as const } : {}),
+        lastError: "source-interrupted",
+        lastErrorAt: failedAt,
+      };
+    }
+    const snapshot: UsageSnapshot = {
+      ...previous,
+      generatedAt: failedAt,
+      aggregateGeneratedAt: previous.aggregateGeneratedAt ?? previous.generatedAt,
+      producer: {
+        ...producer,
+        lastHeartbeatAt: failedAt,
+        lastCompletedAt: failedAt,
+        lastCycleError: category,
+        refreshCyclesFailedTotal: (producer?.refreshCyclesFailedTotal ?? 0) + 1,
+      },
+      partitions,
+    };
+    writeSnapshot(snapshot, path);
+    return snapshot;
+  } finally {
+    await releaseLock();
+  }
 }
 
 /** Ask an isolated worker to refresh the canonical store without keeping a
