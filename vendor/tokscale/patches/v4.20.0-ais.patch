@@ -1106,11 +1106,12 @@ index c68471a..771e05f 100644
          let next_turn = turn("2026-10-02T00:00:01Z", "turn-3");
          let tail = token_count("2026-10-02T00:00:01.500Z", (600, 280, 50), (500, 200, 40))
              + &record("2026-10-02T00:00:05Z", "turn-3", "resp-3", (30, 0, 3))
-@@ -10262,6 +10714,302 @@ mod tests {
+@@ -10262,6 +10714,303 @@ mod tests {
          msg
      }
  
 +    #[test]
++    #[serial]
 +    fn ais_shared_snapshot_uses_complete_manifest_batches_deduplicates_and_reloads() {
 +        use super::{parse_ais_shared_snapshot, AisBatchEnvelope};
 +        use sha2::{Digest, Sha256};
@@ -1409,7 +1410,7 @@ index c68471a..771e05f 100644
      fn make_workbuddy_message(
          session_id: &str,
          timestamp: i64,
-@@ -24508,8 +25256,8 @@ mod tests {
+@@ -24508,8 +25257,8 @@ mod tests {
              std::fs::create_dir_all(path.parent().unwrap()).unwrap();
              let record = |input| {
                  format!(
