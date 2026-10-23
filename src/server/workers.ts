@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { PollCache } from "./expensive.ts";
 import { aisCacheDir } from "../shared/ais-home.ts";
@@ -7,6 +7,7 @@ import { collectTargets, pendingUsageResult } from "../cli/usage/run.ts";
 import { tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
+import { scanMetric } from "./scan-metrics.ts";
 
 /** Child-process runner for expensive scans. Every scan executes in a fresh
  * `ais __scan_worker` child (same entrypoint trick as the web daemon:
@@ -208,12 +209,14 @@ export async function runScanIsolated<T>(
  * real child processes. */
 export class ConcurrencyLimiter {
   private active = 0;
-  private readonly queue: Array<() => void> = [];
+  private stopped = false;
+  private readonly queue: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
 
   constructor(private readonly limit: number) {}
 
   async run<T>(job: () => Promise<T>): Promise<T> {
     await this.acquire();
+    scanMetric("active");
     try {
       return await job();
     } finally {
@@ -222,22 +225,36 @@ export class ConcurrencyLimiter {
   }
 
   private acquire(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error("scan worker is stopping"));
     if (this.active < this.limit) {
       this.active++;
       return Promise.resolve();
     }
-    return new Promise((resolve) => {
-      this.queue.push(() => {
+    scanMetric("queued");
+    return new Promise((resolve, reject) => {
+      this.queue.push({ resolve: () => {
+        scanMetric("queued", -1);
         this.active++;
         resolve();
-      });
+      }, reject });
     });
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    const error = new Error("scan worker is stopping");
+    for (const queued of this.queue.splice(0)) {
+      scanMetric("queued", -1);
+      queued.reject(error);
+    }
   }
 
   private release(): void {
     this.active--;
-    const next = this.queue.shift();
-    if (next) next();
+    scanMetric("active", -1);
+    const next = this.stopped ? undefined : this.queue.shift();
+    if (next) next.resolve();
   }
 }
 
@@ -251,9 +268,80 @@ export class ConcurrencyLimiter {
  * deadline unnoticed for long. */
 export function scanWorkerConcurrencyLimit(): number {
   const raw = Number.parseInt(process.env.AIS_SCAN_WORKER_CONCURRENCY ?? "", 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 4;
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
 }
 const scanWorkerLimiter = new ConcurrencyLimiter(scanWorkerConcurrencyLimit());
+const activeScanCleanup = new Map<number, () => Promise<void>>();
+
+/** Stop accepting queued/future scan work and reap active scan process groups.
+ * The daemon calls this after HTTP draining and before it exits. */
+export async function stopScanWorkers(): Promise<void> {
+  scanWorkerLimiter.stop();
+  await Promise.all([...activeScanCleanup.values()].map((cleanup) => cleanup()));
+}
+
+/** Stop an isolated worker and reap it before its limiter slot can be reused.
+ * Without setsid, signal only the direct child: negative-PID group signalling
+ * is safe only when this code created that process group itself. */
+export async function terminateScanProcess(
+  proc: Bun.Subprocess<any, any, any>,
+  isolatedGroup: boolean,
+): Promise<void> {
+  let signalFailure: unknown;
+  const signal = (value: "SIGTERM" | "SIGKILL") => {
+    try {
+      if (isolatedGroup && proc.pid) process.kill(-proc.pid, value);
+      else proc.kill(value);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH" && code !== "ENOENT") signalFailure = error;
+    }
+  };
+  const groupHasLiveMembers = () => {
+    if (!isolatedGroup || !proc.pid) return false;
+    if (process.platform === "linux") {
+      for (const entry of readdirSync("/proc")) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+          const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+          const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+          if (Number(fields[2]) === proc.pid && fields[0] !== "Z" && fields[0] !== "X") return true;
+        } catch { /* process exited while /proc was read */ }
+      }
+      return false;
+    }
+    try { process.kill(-proc.pid, 0); return true; } catch { return false; }
+  };
+  signal("SIGTERM");
+  const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(500).then(() => false)]);
+  const forcedKill = !exited || groupHasLiveMembers();
+  if (forcedKill) {
+    signal("SIGKILL");
+    const reportAfter = Date.now() + 2_000;
+    let reported = false;
+    while (groupHasLiveMembers()) {
+      if (!reported && Date.now() >= reportAfter) {
+        scanMetric("cleanupFailures");
+        reported = true;
+      }
+      // Keep the limiter slot until every owned process is gone. Re-signal
+      // at a bounded cadence in case a member was temporarily uninterruptible.
+      await Bun.sleep(250);
+      signal("SIGKILL");
+    }
+  }
+  if (forcedKill) scanMetric("forcedKills");
+  try {
+    await proc.exited;
+  } catch (error) {
+    scanMetric("cleanupFailures");
+    throw error;
+  }
+  if (signalFailure !== undefined) {
+    scanMetric("cleanupFailures");
+    throw signalFailure;
+  }
+}
 
 async function spawnScanWorker<T>(
   kind: ScanKind,
@@ -269,56 +357,54 @@ async function spawnScanWorkerNow<T>(
   timeoutMs: number,
 ): Promise<ScanResult<T>> {
   const req: ScanRequest = { kind, ...params };
-  let proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
-  let settled = false;
-  const finish = (result: ScanResult<T>) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    try {
-      proc?.kill();
-    } catch {
-      // already exited
-    }
-  };
-  let timer!: ReturnType<typeof setTimeout>;
-  const result = await new Promise<ScanResult<T>>((resolve) => {
-    timer = setTimeout(() => {
-      finish({ ok: false, error: `${kind} scan timed out after ${Math.round(timeoutMs / 1000)}s`, status: 504 });
-      resolve({ ok: false, error: `${kind} scan timed out after ${Math.round(timeoutMs / 1000)}s`, status: 504 });
-    }, timeoutMs);
-    try {
-      proc = withUsableCwd(() =>
-        Bun.spawn([...baseArgs(), "__scan_worker"], {
-          stdin: "pipe",
-          stdout: "pipe",
-          stderr: "pipe",
-        }),
-      );
-    } catch (err) {
-      resolve({ ok: false, error: err instanceof Error ? err.message : "failed to start scan worker", status: 500 });
-      return;
-    }
-    const child = proc;
-    void new Response(child.stdout).text().then((stdout) => {
-      if (settled) return;
-      try {
-        const parsed = JSON.parse(stdout) as ScanResult<T>;
-        finish(parsed);
-        resolve(parsed);
-      } catch {
-        void new Response(child.stderr).text().then((stderr) => {
-          const failure = { ok: false, error: stderr.trim() || "scan worker produced no output", status: 500 } as ScanResult<T>;
-          finish(failure);
-          resolve(failure);
-        });
-      }
+  const args = baseArgs();
+  const isolatedGroup = Bun.which("setsid") !== null;
+  let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
+  try {
+    proc = withUsableCwd(() => Bun.spawn([...args, "__scan_worker"], {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    }));
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "failed to start scan worker", status: 500 };
+  }
+
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = () => {
+    cleanupPromise ??= terminateScanProcess(proc, isolatedGroup).finally(() => {
+      activeScanCleanup.delete(proc.pid!);
     });
-    child.stdin.write(JSON.stringify(req));
-    child.stdin.end();
-  });
-  finish(result);
-  return result;
+    return cleanupPromise;
+  };
+  if (proc.pid) activeScanCleanup.set(proc.pid, cleanup);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const output = new Response(proc.stdout).text();
+    const stderr = new Response(proc.stderr).text().catch(() => "");
+    const deadline = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+    });
+    proc.stdin.write(JSON.stringify(req));
+    proc.stdin.end();
+    const stdout = await Promise.race([output, deadline]);
+    if (stdout === null) {
+      scanMetric("timeouts");
+      return { ok: false, error: `${kind} scan timed out after ${Math.round(timeoutMs / 1000)}s`, status: 504 };
+    }
+    let parsed: ScanResult<T>;
+    try {
+      parsed = JSON.parse(stdout) as ScanResult<T>;
+    } catch {
+      const errorText = await Promise.race([stderr, Bun.sleep(100).then(() => "")]);
+      parsed = { ok: false, error: errorText.trim() || "scan worker produced no output", status: 500 };
+    }
+    return parsed;
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "scan worker failed", status: 500 };
+  } finally {
+    if (timer) clearTimeout(timer);
+    await cleanup();
+  }
 }
 
 /** Entry point for `ais __scan_worker`: one scan request on stdin, one JSON

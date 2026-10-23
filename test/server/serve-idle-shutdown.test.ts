@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { idleCheckIntervalMs, isIdleTooLong } from "../../src/server/serve.ts";
+import { createConsoleWarmRequest, idleCheckIntervalMs, isIdleTooLong } from "../../src/server/serve.ts";
 
 /**
  * The idle-shutdown timer's decision logic, tested as a pure function
@@ -30,5 +30,30 @@ describe("idleCheckIntervalMs", () => {
     expect(idleCheckIntervalMs(10 * 60_000)).toBe(30_000); // clamped down
     expect(idleCheckIntervalMs(4_000)).toBe(1_000); // clamped up
     expect(idleCheckIntervalMs(20_000)).toBe(5_000); // unclamped quarter
+  });
+});
+
+describe("console pre-bind warm request", () => {
+  test("passes the live health guard with its loopback Host, port, and bearer token", async () => {
+    const previousLive = process.env.AIS_LIVE;
+    process.env.AIS_LIVE = "1";
+    try {
+      const { createApp } = await import("../../src/server/app.ts");
+      const port = 47130;
+      const token = "synthetic-warm-token-SYNTHETIC_FIXTURE";
+      const app = createApp({ token, port, startedAt: Date.now() });
+      const oldWarmRequest = new Request("http://127.0.0.1/api/health", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      expect((await app.fetch(oldWarmRequest)).status).toBe(403);
+
+      const response = await app.fetch(createConsoleWarmRequest("/api/health", port, token));
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true });
+    } finally {
+      if (previousLive === undefined) delete process.env.AIS_LIVE;
+      else process.env.AIS_LIVE = previousLive;
+    }
   });
 });

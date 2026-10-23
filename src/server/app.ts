@@ -22,6 +22,7 @@ import { HttpError } from "./types.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
+import { renderScanMetrics } from "./scan-metrics.ts";
 
 import {
   createIdentityInRegistry,
@@ -72,6 +73,8 @@ export interface ConsoleAppDeps extends GuardDeps {
 
 export function createApp(deps: ConsoleAppDeps): Hono {
   const app = new Hono();
+
+  app.get("/metrics", (c) => c.text(renderScanMetrics(), 200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" }));
 
   app.onError((err, c) => {
     if (err instanceof HttpError) return c.json({ error: err.message }, err.status as 400);

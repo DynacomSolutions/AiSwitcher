@@ -14,12 +14,79 @@ import {
   tokscaleSpawnTimeoutMs,
   tokscaleTimeoutMessage,
   DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS,
+  spawnTokscaleProcess,
+  terminateTokscaleProcess,
+  withTokscaleProcessSlot,
 } from "../../../src/cli/usage/tokscale.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
 function identity(configDir: string): Identity {
   return { name: "identity-a", label: "Identity A", configDir };
 }
+
+describe("tokscale process bounds", () => {
+  test("serializes every process slot", async () => {
+    let active = 0;
+    let peak = 0;
+    await Promise.all(Array.from({ length: 5 }, (_, i) => withTokscaleProcessSlot(async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await Bun.sleep(10);
+      active--;
+      return i;
+    })));
+    expect(peak).toBe(1);
+  });
+
+  test("does not release a slot while a descendant survives its leader", async () => {
+    if (!Bun.which("setsid") || !Bun.which("sh") || process.platform !== "linux") return;
+    const proc = Bun.spawn(["setsid", "sh", "-c", "(trap '' TERM; exec sleep 30) >/dev/null 2>&1 & echo $!; exit 0"], {
+      stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const childPid = Number.parseInt((await new Response(proc.stdout).text()).trim(), 10);
+    await proc.exited;
+    const order: string[] = [];
+    const first = withTokscaleProcessSlot(async () => {
+      await terminateTokscaleProcess(proc, true);
+      order.push("cleaned");
+    });
+    const second = withTokscaleProcessSlot(async () => {
+      const stat = await Bun.file(`/proc/${childPid}/stat`).text().catch(() => undefined);
+      const state = stat?.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+      expect(state === undefined || /^[ZX]$/.test(state)).toBe(true);
+      order.push("next");
+    });
+    await Promise.all([first, second]);
+    expect(order).toEqual(["cleaned", "next"]);
+    const stat = await Bun.file(`/proc/${childPid}/stat`).text().catch(() => undefined);
+    const state = stat?.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    expect(state === undefined || /^[ZX]$/.test(state)).toBe(true);
+  }, 5000);
+
+  test("warm-up timeout kills its child tree before rejecting", async () => {
+    if (!Bun.which("sh") || process.platform !== "linux") return;
+    const dir = await makeConfigDir();
+    const pidFile = join(dir, "child.pid");
+    const script = `trap '' TERM; (trap '' TERM; exec sleep 30) & echo $! > '${pidFile}'; wait`;
+    await expect(spawnTokscaleProcess("sh", ["-c", script], [], {}, 100)).rejects.toThrow("timed out");
+    const childPid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
+    const stat = await Bun.file(`/proc/${childPid}/stat`).text().catch(() => undefined);
+    const state = stat?.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    expect(state === undefined || /^[ZX]$/.test(state)).toBe(true);
+  }, 5000);
+
+  test("normal tokscale completion still reaps a child after its leader exits", async () => {
+    if (!Bun.which("sh") || process.platform !== "linux") return;
+    const dir = await makeConfigDir();
+    const pidFile = join(dir, "child.pid");
+    const script = `(trap '' TERM; exec sleep 30) >/dev/null 2>&1 & echo $! > '${pidFile}'; sleep 0.1; printf ok`;
+    await expect(spawnTokscaleProcess("sh", ["-c", script], [], {}, 2_000)).resolves.toBe("ok");
+    const childPid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
+    const stat = await Bun.file(`/proc/${childPid}/stat`).text().catch(() => undefined);
+    const state = stat?.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    expect(state === undefined || /^[ZX]$/.test(state)).toBe(true);
+  }, 5000);
+});
 
 const tempDirs: string[] = [];
 afterEach(async () => {
