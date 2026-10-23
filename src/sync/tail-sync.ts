@@ -18,7 +18,8 @@ import type { SyncScope } from "./types.ts";
 /** Smaller histories are cheaper to stage whole than to negotiate. */
 export const TAIL_MIN_BYTES = 1 << 20;
 export const TAIL_PLAN_FILE = "tails.json";
-/** Histories the sender could not snapshot this run; both bulk transfers leave them out until the next run. */
+/** Histories the bulk transfers leave out this run: unchanged at plan time, or changed under the sender mid-plan.
+ * A live history the receiver appends to after planning would otherwise fail rsync's quick check and go whole. */
 export const TAIL_DEFERRED_FILE = "deferred.json";
 
 export interface HistoryInfo { size: number; mtimeMs: number }
@@ -177,7 +178,7 @@ export async function planTails(
   skip: ReadonlySet<string> = new Set(),
   /** Test seam: the histories to consider instead of walking the tool trees. */
   listing?: HistoryManifest,
-  /** Receives histories that changed under the sender mid-plan; the bulk transfer must not carry them whole. */
+  /** Receives histories the bulk transfer must not carry whole: equal at plan time, or changed mid-plan. */
   deferred: string[] = [],
 ): Promise<TailPlan> {
   const plan: TailPlan = {};
@@ -191,7 +192,7 @@ export async function planTails(
     try {
       const info = await handle.stat();
       if (info.size < TAIL_MIN_BYTES) continue;
-      if (info.size === theirs.size && Math.floor(info.mtimeMs / 1000) === Math.floor(theirs.mtimeMs / 1000)) continue;
+      if (info.size === theirs.size && Math.floor(info.mtimeMs / 1000) === Math.floor(theirs.mtimeMs / 1000)) { deferred.push(rel); continue; }
       // A receiver that is already ahead needs no bytes at all: proving our whole file is its prefix is enough.
       const offset = Math.min(info.size, theirs.size);
       const prefix = await cache.prefix(handle, path, offset);

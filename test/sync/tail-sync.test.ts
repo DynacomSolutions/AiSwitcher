@@ -92,6 +92,18 @@ test("a file replaced between hashing and copying is deferred, not planned or se
   } finally { setBeforeTailCopyHook(); }
 });
 
+test("a history equal at plan time is held back from the bulk transfer", async () => {
+  const { home, tails } = await homes();
+  const body = lines(0, 1300);
+  await writeFile(join(home, REL), body);
+  await utimes(join(home, REL), 5000, 5000);
+  const listing: HistoryManifest = { [REL]: { size: body.length, mtimeMs: 5_000_000 } };
+  // The receiver may append to its live copy after this plan; rsync's quick check must not then resend it whole.
+  const deferred: string[] = [];
+  expect(await planTails(home, all, { [REL]: { size: body.length, mtimeMs: 5_000_400 } }, join(tails, "equal"), new Set(), listing, deferred)).toEqual({});
+  expect(deferred).toEqual([REL]);
+});
+
 test("restrictTo drops paths the peer was never offered", () => {
   expect(restrictTo([REL, ".ssh/id_ed25519", "../x"], [REL])).toEqual([REL]);
   expect(restrictTo(undefined, [REL])).toEqual([]);
