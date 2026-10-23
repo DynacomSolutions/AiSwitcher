@@ -62,6 +62,25 @@ describe("formatUsageReport", () => {
     expect(output).toContain("$3.00"); // summed cost
   });
 
+  test("labels the aggregate PARTIAL TOTAL when another source errored", () => {
+    const output = formatUsageReport([
+      success("claude", "identity-a", { totalMessages: 10, totalCost: 1 }),
+      success("codex", "identity-a", { totalMessages: 20, totalCost: 2 }),
+      { provider: "xai", identity: identity("identity-a"), error: "SYNTHETIC_FIXTURE_error" },
+    ]);
+    expect(output).toContain("PARTIAL TOTAL");
+    expect(output).not.toMatch(/(?<!PARTIAL )TOTAL/);
+  });
+
+  test("labels the aggregate PARTIAL TOTAL while another source is pending", () => {
+    const output = formatUsageReport([
+      success("claude", "identity-a"),
+      success("codex", "identity-a"),
+      { provider: "xai", identity: identity("identity-a"), pending: true },
+    ]);
+    expect(output).toContain("PARTIAL TOTAL");
+  });
+
   test("error rows show a placeholder in the table and detail in an Errors section", () => {
     const results: UsageResult[] = [
       success("claude", "identity-a"),

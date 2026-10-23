@@ -1,9 +1,11 @@
 import { useMemo } from "react";
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { UsageDataStatus } from "@/components/usage-data-status";
 import { Progress } from "@/components/ui/progress";
 import { useLimitsQuery, useUsageQuery } from "@/hooks/queries";
 import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
+import { isInitialUsageScanPending } from "@/lib/usage-summary";
 
 function CounterCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
@@ -67,7 +69,7 @@ export function GlobalUsageCards({ title = "Global usage" }: { title?: string })
     ].filter((b) => b.avg !== null) as { label: string; avg: number; count: number }[];
   }, [limitResults]);
 
-  const usageLoading = usage.isLoading || (results.length === 0 && usage.isPending);
+  const usageLoading = usage.isLoading || usage.isPending || isInitialUsageScanPending(usage.data);
   const limitsLoading = limits.isLoading || (limitResults.length === 0 && limits.isPending);
 
   return (
@@ -77,7 +79,10 @@ export function GlobalUsageCards({ title = "Global usage" }: { title?: string })
         <span className="text-xs text-muted-foreground">{results.length} series</span>
       </CardHeader>
       <CardContent className="space-y-4">
-        {usageLoading ? (
+        <UsageDataStatus response={usage.data} refreshFailed={usage.isError && Boolean(usage.data)} />
+        {usage.isError && !usage.data ? (
+          <p className="text-sm text-muted-foreground">Usage data is unavailable because the latest request failed.</p>
+        ) : usageLoading ? (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {Array.from({ length: 4 }).map((_, i) => (
               <div key={i} className="h-16 animate-pulse rounded-lg bg-muted" />

@@ -4,6 +4,7 @@ import type { BarTooltipProps } from "@nivo/bar";
 
 import { IdentityChip, ToolBadge } from "@/components/badges";
 import { ProviderIcon, ProviderLabel } from "@/components/provider-icon";
+import { UsageDataStatus } from "@/components/usage-data-status";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -31,6 +32,7 @@ import {
 } from "@/components/ui/table";
 import { useUsageQuery } from "@/hooks/queries";
 import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
+import { classifyUsageError, hasPartialUsageCoverage, usageErrorLabel } from "@/lib/usage-summary";
 import type { RealCostInfo, TokscaleEntry, UsageResult } from "@/types/api";
 
 type Granularity = "day" | "week" | "month";
@@ -331,8 +333,8 @@ function NotesCell({ result }: { result: UsageResult }) {
   if (result.pending) return <Badge variant="muted">Collecting</Badge>;
   if (result.error)
     return (
-      <span className="block max-w-64 truncate text-xs text-muted-foreground" title={result.error}>
-        {result.error}
+      <span className="block max-w-64 truncate text-xs text-muted-foreground">
+        {usageErrorLabel(classifyUsageError(result.error))}
       </span>
     );
   if (result.extraCost) {
@@ -387,6 +389,7 @@ export function UsagePage() {
   const totalCacheWrite = sumReport(filtered, (r) => r.totalCacheWrite);
   const totalMessages = sumReport(filtered, (r) => r.totalMessages);
   const hasAnyReport = filtered.some((r) => r.report !== undefined);
+  const hasPartialCoverage = hasPartialUsageCoverage(results, { provider, tool, identity });
   // Real AWS spend is summarised separately from the estimate total: only
   // rows whose Cost Explorer query actually answered contribute (an
   // unavailable figure must not read as a confirmed zero).
@@ -409,13 +412,17 @@ export function UsagePage() {
         updatedAt={query.dataUpdatedAt}
       />
 
+      {query.data ? (
+        <UsageDataStatus response={query.data} refreshFailed={query.isError} />
+      ) : null}
+
       {query.isLoading || (query.data?.pending && results.length === 0) ? (
         <div className="space-y-4">
           <div className="h-72 animate-pulse rounded-xl bg-muted" />
           <div className="h-64 animate-pulse rounded-xl bg-muted" />
         </div>
       ) : query.isError && !query.data ? (
-        <ErrorBanner message={query.error.message} />
+        <ErrorBanner message="Usage data could not be loaded. Try again shortly." />
       ) : results.length === 0 ? (
         <EmptyState
           title="No usage recorded"
@@ -444,7 +451,7 @@ export function UsagePage() {
             <StatCard label="Output tokens" value={formatTokens(totalOutput)} />
             <StatCard label="Cache tokens" value={formatTokens(totalCacheRead + totalCacheWrite)} sub="reads + writes" />
             <StatCard label="Messages" value={totalMessages.toLocaleString()} />
-            <StatCard label="Est. cost" value={formatMoney(totalCost)} sub="filtered set" />
+            <StatCard label="Est. cost (all time)" value={formatMoney(totalCost)} sub={since === 0 ? "for selected sources" : "period filters token series only"} />
           </div>
 
           {buckets.length > 0 ? (
@@ -489,7 +496,7 @@ export function UsagePage() {
                       <TableHead className="text-right">Input</TableHead>
                       <TableHead className="text-right">Output</TableHead>
                       <TableHead className="text-right">Messages</TableHead>
-                      <TableHead className="text-right">Est. cost</TableHead>
+                      <TableHead className="text-right">Est. cost (all time)</TableHead>
                       <TableHead className="w-40">Share</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -542,7 +549,7 @@ export function UsagePage() {
                   <TableHead className="text-right">Cache read</TableHead>
                   <TableHead className="text-right">Cache write</TableHead>
                   <TableHead className="text-right">Messages</TableHead>
-                  <TableHead className="text-right">Est. cost</TableHead>
+                  <TableHead className="text-right">Est. cost (all time)</TableHead>
                   <TableHead>Notes</TableHead>
                 </TableRow>
               </TableHeader>
@@ -605,7 +612,7 @@ export function UsagePage() {
                 ])}
                 <TableRow className="border-t-2 hover:bg-transparent">
                   <TableCell colSpan={4} className="font-semibold">
-                    TOTAL
+                    {hasPartialCoverage ? "PARTIAL TOTAL (all-time estimate)" : "TOTAL (all-time estimate)"}
                   </TableCell>
                   <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalInput)}</TableCell>
                   <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalOutput)}</TableCell>
