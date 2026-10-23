@@ -224,6 +224,24 @@ describe("shared usage snapshot", () => {
     expect(envelope?.stale).toBe(true);
   });
 
+  test("a successful result without count coverage cannot replace known positive counts", async () => {
+    const path = await snapshotFile();
+    const now = Date.UTC(2026, 0, 1);
+    const key = usageSnapshotTargetKey("claude", "work");
+    await refreshUsageSnapshot(deps(path, { now, results: [result(5)] }));
+    const missingReport = { ...result(5), report: undefined };
+    await refreshUsageSnapshot({
+      ...deps(path, { now: now + 1, results: [missingReport] }),
+      forcePartitionKeys: [key],
+    });
+
+    const persisted = JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, { results: UsageResult[] }> };
+    const envelope = readUsageSnapshotEnvelope("claude", "work", path, now + 2);
+    expect(persisted.partitions[key]?.results[0]?.report).toBeDefined();
+    expect(envelope?.lastError).toBe("suspected-history-regression");
+    expect(envelope?.stale).toBe(true);
+  });
+
   test("cost-only repricing decreases are accepted when counts are unchanged", async () => {
     const path = await snapshotFile();
     const now = Date.UTC(2026, 0, 1);

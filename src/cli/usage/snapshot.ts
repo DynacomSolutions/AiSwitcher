@@ -446,11 +446,14 @@ function reportCountTotals(results: UsageResult[]): { tokens?: number; messages?
 }
 
 function isSuspectedHistoryRegression(previous: UsageResult[], incoming: UsageResult[]): boolean {
-  // An empty successful scan is a real zero, not missing count metadata. Keep
-  // a valid non-empty source partition until an operator reconciles a reset.
+  // This catches count shrinkage and disappearing count coverage. It cannot
+  // detect every source/parser semantic error. An empty successful scan is a
+  // real zero, not missing count metadata.
   if (previous.length > 0 && incoming.length === 0) return true;
   const before = reportCountTotals(previous);
   const after = reportCountTotals(incoming);
+  if (before.tokens !== undefined && before.tokens > 0 && after.tokens === undefined) return true;
+  if (before.messages !== undefined && before.messages > 0 && after.messages === undefined) return true;
   return (before.tokens !== undefined && after.tokens !== undefined && after.tokens < before.tokens) ||
     (before.messages !== undefined && after.messages !== undefined && after.messages < before.messages);
 }
