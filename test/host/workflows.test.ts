@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { aggregatePassed, checkWorkflow, type Workflow } from "../../scripts/host/check-workflows";
+import { parseArtifacts } from "../../scripts/host/windows-tests";
 import { validateReleaseCommit } from "../../scripts/host/validate-tag";
 
 const read = (name: string) => Bun.YAML.parse(readFileSync(`.github/workflows/${name}.yml`, "utf8")) as Workflow;
@@ -33,6 +34,27 @@ describe("host workflow policy", () => {
     expect(aggregatePassed("failure", "skip", "skipped", "skipped")).toBe(false);
     expect(aggregatePassed("success", "", "skipped", "skipped")).toBe(false);
     expect(aggregatePassed("success", "skip", "failure", "skipped")).toBe(false);
+    expect(aggregatePassed("success", "host", "success", "success", "success", "success")).toBe(true);
+    expect(aggregatePassed("success", "host", "success", "success", "success", "failure")).toBe(false);
+    expect(aggregatePassed("success", "skip", "skipped", "skipped", "skipped", "success")).toBe(false);
+    expect(aggregatePassed("success", "host", "success")).toBe(false);
+  });
+  test("only the Windows test job uses a Windows runner", () => {
+    const workflow = read("host-app");
+    expect(workflow.jobs["windows-build"]!["runs-on"]).toBe("ubuntu-latest");
+    expect(workflow.jobs["windows-test"]!["runs-on"]).toBe("windows-latest");
+    workflow.jobs["windows-build"]!["runs-on"] = "windows-latest";
+    expect(checkWorkflow(workflow, false).length).toBeGreaterThan(0);
+  });
+  test("Windows test executables are located from cargo's JSON messages", () => {
+    const line = (value: object) => JSON.stringify({ reason: "compiler-artifact", ...value });
+    const found = parseArtifacts([
+      "not json",
+      line({ executable: "/t/deps/a-1", manifest_path: "/h/crates/core/Cargo.toml", target: { kind: ["test"], name: "a" }, profile: { test: true } }),
+      line({ executable: "/t/ais-host-helper.exe", manifest_path: "/h/crates/helper/Cargo.toml", target: { kind: ["bin"], name: "x" }, profile: { test: false } }),
+      line({ executable: null, manifest_path: "/h/crates/helper/Cargo.toml", target: { kind: ["lib"], name: "x" }, profile: { test: false } }),
+    ], "/h");
+    expect(found).toEqual({ tests: [{ source: "/t/deps/a-1", exe: "tests/a-1", crate: "crates/core" }], bins: ["/t/ais-host-helper.exe"] });
   });
   test("release checks and every consumer stay on the validated commit", () => {
     for (const change of [

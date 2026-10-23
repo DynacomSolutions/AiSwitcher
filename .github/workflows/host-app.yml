@@ -90,9 +90,6 @@ jobs:
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: macos-arm64
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset: windows-x64
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: linux-x64
@@ -185,9 +182,137 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Windows is compiled, linted, packaged and test-built on Linux; only the steps
+  # that need a real Windows host run on windows-latest (windows-test).
+  windows-build:
+    needs: changes
+    if: needs.changes.outputs.selection != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOST_PRODUCTION: ${{ inputs.production }}
+      HOST_WINDOWS_TARGET: x86_64-pc-windows-msvc
+      CARGO_XWIN_VERSION: 0.23.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Set isolated build directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/host-cargo" >> "$GITHUB_ENV"
+          echo "HOST_BUILD_DIR=$RUNNER_TEMP/host-build" >> "$GITHUB_ENV"
+          echo "HOST_WINDOWS_TESTS=$RUNNER_TEMP/host-windows-tests" >> "$GITHUB_ENV"
+      # NSIS, the LLVM linker and resource compiler stand in for the MSVC toolchain.
+      - name: Install Windows cross-compilation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis lld llvm clang zip
+      # The Windows SDK and CRT download is large and Microsoft-hosted, so it is cached
+      # by cargo-xwin version, also for production builds (it is not a built artefact).
+      - name: Cache the Windows SDK download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-sdk-${{ env.CARGO_XWIN_VERSION }}
+      # Skipped for production builds: release artefacts never reuse cached binaries.
+      - name: Cache Cargo registry, tools and build output
+        if: inputs.production != true
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/host
+          key: x86_64-pc-windows-msvc-xwin
+      - name: Install locked dependencies and cross toolchain
+        run: |
+          bun install --frozen-lockfile
+          bun install --cwd apps/host --frozen-lockfile
+          cd apps/host
+          rustup show
+          rustup target add "$HOST_WINDOWS_TARGET"
+          cargo install tauri-cli --version 2.12.3 --locked
+          cargo install cargo-xwin --version "$CARGO_XWIN_VERSION" --locked
+      # generate_context! needs the built frontend before any cargo step.
+      - name: Frontend build
+        working-directory: apps/host
+        run: bun run build
+      - name: Windows lint
+        working-directory: apps/host
+        run: cargo xwin clippy --locked --workspace --all-targets --target "$HOST_WINDOWS_TARGET" -- -D warnings
+      # The executables run in windows-test; their JSON build messages locate them.
+      - name: Build Windows test executables
+        working-directory: apps/host
+        run: |
+          cargo xwin test --no-run --locked --workspace --target "$HOST_WINDOWS_TARGET" \
+            --message-format=json-render-diagnostics |
+            bun run ../../scripts/host/windows-tests.ts --collect "$HOST_WINDOWS_TESTS" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-windows-tests
+          path: ${{ runner.temp }}/host-windows-tests
+          if-no-files-found: error
+          retention-days: 1
+      - name: Package the Windows app
+        run: |
+          args=(--windows)
+          if [ "$HOST_PRODUCTION" = true ]; then args+=(--production); fi
+          bun run scripts/host/build-release.ts "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-unsigned-windows-x64
+          path: ${{ runner.temp }}/host-build/assets/*
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-test:
+    needs: [changes, windows-build]
+    if: needs.changes.outputs.selection != 'skip'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOST_PRODUCTION: ${{ inputs.production }}
+    steps:
+      # The sources supply each test's working directory and the smoke scripts.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-windows-tests
+          path: ${{ runner.temp }}/host-windows-tests
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-unsigned-windows-x64
+          path: ${{ runner.temp }}/host-windows-assets
+      - name: Run the Windows test executables
+        run: bun run scripts/host/windows-tests.ts --run "$RUNNER_TEMP/host-windows-tests" apps/host
+      - name: Smoke the Windows package
+        run: |
+          args=(--smoke "--target=windows-x64"
+                "--asset=$RUNNER_TEMP/host-windows-assets/ais-host-windows-x64.zip"
+                "--destination=$RUNNER_TEMP/clean launch é")
+          if [ "$HOST_PRODUCTION" = true ]; then args+=(--production); fi
+          bun run scripts/host/release-assets.ts "${args[@]}"
+
   gate:
     if: ${{ always() }}
-    needs: [changes, checks, native]
+    needs: [changes, checks, native, windows-build, windows-test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -203,4 +328,6 @@ jobs:
           SELECTION: ${{ needs.changes.outputs.selection }}
           CHECKS_RESULT: ${{ needs.checks.result }}
           NATIVE_RESULT: ${{ needs.native.result }}
+          WINDOWS_BUILD_RESULT: ${{ needs.windows-build.result }}
+          WINDOWS_TEST_RESULT: ${{ needs.windows-test.result }}
         run: bun run scripts/host/check-workflows.ts --gate

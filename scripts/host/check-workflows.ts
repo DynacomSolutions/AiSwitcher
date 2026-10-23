@@ -7,10 +7,11 @@ type Job = {
 };
 export type Workflow = { on: Record<string, unknown>; permissions: Record<string, string>; jobs: Record<string, Job> };
 
-export function aggregatePassed(changes: string, selection: string, checks: string, native: string): boolean {
+export function aggregatePassed(changes: string, selection: string, checks: string, ...jobs: string[]): boolean {
   if (changes !== "success") return false;
-  if (selection === "skip") return checks === "skipped" && native === "skipped";
-  return ["host", "all"].includes(selection) && checks === "success" && native === "success";
+  if (jobs.length === 0) return false;
+  if (selection === "skip") return checks === "skipped" && jobs.every((job) => job === "skipped");
+  return ["host", "all"].includes(selection) && checks === "success" && jobs.every((job) => job === "success");
 }
 
 export function checkWorkflow(workflow: Workflow, release: boolean): string[] {
@@ -39,7 +40,11 @@ export function checkWorkflow(workflow: Workflow, release: boolean): string[] {
   }
   if (!release) {
     if (workflow.jobs.gate?.if !== "${{ always() }}") errors.push("The aggregate must always run.");
-    if (JSON.stringify(workflow.jobs.gate?.needs) !== '["changes","checks","native"]') errors.push("The aggregate must cover every required job.");
+    if (JSON.stringify(workflow.jobs.gate?.needs) !== '["changes","checks","native","windows-build","windows-test"]') errors.push("The aggregate must cover every required job.");
+    // Windows builds run on Linux; only the test job needs a Windows host.
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      if (name !== "windows-test" && JSON.stringify(job).includes("windows-latest")) errors.push(`${name}: only windows-test may use a Windows runner.`);
+    }
   } else {
     const calls = workflow.jobs.checks;
     if (calls?.uses !== "./.github/workflows/host-app.yml" || (calls.with as Record<string, unknown>)?.production !== true) errors.push("Release must run the full production checks.");
@@ -64,7 +69,8 @@ export function checkWorkflow(workflow: Workflow, release: boolean): string[] {
 if (import.meta.main) {
   if (Bun.argv.includes("--gate")) {
     const env = process.env;
-    if (!aggregatePassed(env.CHANGES_RESULT ?? "", env.SELECTION ?? "", env.CHECKS_RESULT ?? "", env.NATIVE_RESULT ?? "")) {
+    if (!aggregatePassed(env.CHANGES_RESULT ?? "", env.SELECTION ?? "", env.CHECKS_RESULT ?? "", env.NATIVE_RESULT ?? "",
+      env.WINDOWS_BUILD_RESULT ?? "", env.WINDOWS_TEST_RESULT ?? "")) {
       throw new Error("Required host checks failed, were cancelled or were unexpectedly skipped.");
     }
   } else {

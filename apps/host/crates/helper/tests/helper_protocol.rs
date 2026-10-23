@@ -34,6 +34,15 @@ fn update_request() -> serde_json::Value {
     value
 }
 
+/// Windows test executables are built on Linux, so the compile-time binary path is
+/// meaningless where they run; AIS_TEST_BIN_DIR points at the copied binaries instead.
+fn built_binary(name: &str, compiled: &str) -> std::path::PathBuf {
+    std::env::var_os("AIS_TEST_BIN_DIR").map_or_else(
+        || compiled.into(),
+        |dir| std::path::Path::new(&dir).join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+    )
+}
+
 #[test]
 fn parses_only_bounded_structured_operations() {
     assert_eq!(
@@ -115,13 +124,16 @@ fn helper_invoked_directly_refuses_without_reading_a_target() {
         process::Stdio,
         time::{Duration, Instant},
     };
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ais-host-helper"))
-        .args(["createLayout", "SYNTHETIC_FIXTURE_DISK"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = std::process::Command::new(built_binary(
+        "ais-host-helper",
+        env!("CARGO_BIN_EXE_ais-host-helper"),
+    ))
+    .args(["createLayout", "SYNTHETIC_FIXTURE_DISK"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
     let start = Instant::now();
     while child.try_wait().unwrap().is_none() {
         if start.elapsed() >= Duration::from_secs(5) {

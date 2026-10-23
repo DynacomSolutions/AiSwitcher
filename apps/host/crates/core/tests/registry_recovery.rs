@@ -22,6 +22,15 @@ fn directory() -> PathBuf {
     path
 }
 
+/// Windows test executables are built on Linux, so the compile-time binary path is
+/// meaningless where they run; AIS_TEST_BIN_DIR points at the copied binaries instead.
+fn built_binary(name: &str, compiled: &str) -> std::path::PathBuf {
+    std::env::var_os("AIS_TEST_BIN_DIR").map_or_else(
+        || compiled.into(),
+        |dir| std::path::Path::new(&dir).join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+    )
+}
+
 #[test]
 fn records_survive_restart_without_secret_material() {
     let directory = directory();
@@ -185,11 +194,14 @@ fn invalid_json_is_not_replaced_by_an_empty_registry() {
 #[test]
 fn cleanup_executable_runs_without_ui_or_store_for_an_empty_registry() {
     let directory = directory();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ais-host-escrow-purge"))
-        .arg("--once")
-        .arg(&directory)
-        .output()
-        .unwrap();
+    let output = std::process::Command::new(built_binary(
+        "ais-host-escrow-purge",
+        env!("CARGO_BIN_EXE_ais-host-escrow-purge"),
+    ))
+    .arg("--once")
+    .arg(&directory)
+    .output()
+    .unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     let mut registry = FileRegistry::open(&directory).unwrap();
@@ -200,11 +212,14 @@ fn cleanup_executable_runs_without_ui_or_store_for_an_empty_registry() {
 fn cleanup_executable_fails_closed_on_corrupt_registry() {
     let directory = directory();
     fs::write(directory.join("drives.json"), b"{").unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ais-host-escrow-purge"))
-        .arg("--once")
-        .arg(&directory)
-        .output()
-        .unwrap();
+    let output = std::process::Command::new(built_binary(
+        "ais-host-escrow-purge",
+        env!("CARGO_BIN_EXE_ais-host-escrow-purge"),
+    ))
+    .arg("--once")
+    .arg(&directory)
+    .output()
+    .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert_eq!(
