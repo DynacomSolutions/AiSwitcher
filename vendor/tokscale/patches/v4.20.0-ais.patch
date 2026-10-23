@@ -1423,6 +1423,12 @@ index c68471a..771e05f 100644
                  parse_all_messages_with_pricing_with_env_strategy(
 --- a/crates/tokscale-core/src/lib.rs
 +++ b/crates/tokscale-core/src/lib.rs
+@@ -5128,0 +5129,5 @@
++    if std::env::var_os("TOKSCALE_AIS_EXPORT_PATH").is_some() {
++        let source_config = std::env::var_os("TOKSCALE_AIS_SOURCE_CONFIG_DIR")
++            .ok_or("AIS export requires TOKSCALE_AIS_SOURCE_CONFIG_DIR")?;
++        message_cache::seed_ais_claude_cache(std::path::Path::new(&source_config))?;
++    }
 @@ -5136,0 +5137 @@
 +    write_ais_export_if_requested(&all_messages)?;
 --- a/crates/tokscale-cli/tests/cli_tests.rs
@@ -1435,6 +1441,10 @@ index c68471a..771e05f 100644
 +    let output = cmd_with_home(tmp.path())
 +        .env("TOKSCALE_AIS_EXPORT_PATH", &export_path)
 +        .env("TOKSCALE_AIS_PARTITION_ID", &partition_id)
++        .env(
++            "TOKSCALE_AIS_SOURCE_CONFIG_DIR",
++            tmp.path().join("original-tokscale-config"),
++        )
 +        .args(["--json", "--client", "codex", "--no-spinner"])
 +        .output()
 +        .unwrap();
@@ -1772,9 +1782,3 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
 --- a/crates/tokscale-core/src/lib.rs
 +++ b/crates/tokscale-core/src/lib.rs
-@@ -6923,0 +6924,5 @@
-+    if std::env::var_os("TOKSCALE_AIS_EXPORT_PATH").is_some() {
-+        let source_config = std::env::var_os("TOKSCALE_AIS_SOURCE_CONFIG_DIR")
-+            .ok_or("AIS export requires TOKSCALE_AIS_SOURCE_CONFIG_DIR")?;
-+        message_cache::seed_ais_claude_cache(std::path::Path::new(&source_config))?;
-+    }
