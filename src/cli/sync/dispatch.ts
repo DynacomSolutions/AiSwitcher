@@ -196,8 +196,9 @@ export async function runSyncCommand(positionals: string[], flags: ParsedArgs["f
       const scope = scopeFromFlags(flags);
       if (!scope) throw new CliUsageError("A tail plan requires both --tool and --identity, or neither.");
       const manifest = JSON.parse(await Bun.stdin.text()) as HistoryManifest;
-      const plan = await ioPhase("tail-plan", () => planTails(homedir(), scope, manifest, snapshotRoot("tail-outgoing", host)));
-      console.log(JSON.stringify({ planned: Object.keys(plan).length, io: ioSnapshot() }));
+      const deferred: string[] = [];
+      const plan = await ioPhase("tail-plan", () => planTails(homedir(), scope, manifest, snapshotRoot("tail-outgoing", host), new Set(), undefined, deferred));
+      console.log(JSON.stringify({ planned: Object.keys(plan).length + deferred.length, io: ioSnapshot() }));
       return;
     }
     case "drop-tail-plan": {

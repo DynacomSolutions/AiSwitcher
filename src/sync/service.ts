@@ -25,7 +25,7 @@ import {
   loadCrushSnapshotManifest,
   mergeCrushSnapshotTree,
 } from "./sqlite-merge.ts";
-import { listHistories, planTails, restrictTo, TAIL_MIN_BYTES, TAIL_PLAN_FILE, tailExcludeFilters, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
+import { listHistories, planTails, restrictTo, TAIL_DEFERRED_FILE, TAIL_MIN_BYTES, TAIL_PLAN_FILE, tailExcludeFilters, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
 import { mergeIncomingProfileTree, type TreeMergeResult } from "./tree-merge.ts";
 import type { SyncRunOptions, SyncRunResult, SyncScope } from "./types.ts";
 
@@ -277,7 +277,7 @@ function scopeArgs(scope: SyncScope): string[] {
 }
 
 /** Everything the local side prepared for one tail-only exchange of append-only histories. */
-interface PushTails { id: string; outDir: string; plan: TailPlan }
+interface PushTails { id?: string; outDir: string; plan: TailPlan; deferred: string[] }
 
 /** Ask the remote which histories it holds, then ship only the bytes it lacks. Undefined when there is nothing to
  * ship or the remote predates this command (the bulk transfer then carries those histories whole, as before). */
@@ -291,11 +291,15 @@ async function pushTails(host: string, scope: SyncScope, home: string, state: St
   const id = crypto.randomUUID();
   const outDir = join(aisRemoteCacheDir(home), "tail-outgoing", id);
   try {
-    const plan = await planTails(home, scope, manifest, outDir, new Set(state.ignored));
-    if (Object.keys(plan).length === 0) { await rm(outDir, { recursive: true, force: true }); return undefined; }
+    const deferred: string[] = [];
+    const plan = await planTails(home, scope, manifest, outDir, new Set(state.ignored), undefined, deferred);
+    if (Object.keys(plan).length === 0) {
+      await rm(outDir, { recursive: true, force: true });
+      return deferred.length > 0 ? { outDir, plan, deferred } : undefined;
+    }
     const pushed = await runRsync(host, "push", [], home, { localRoot: outDir, remoteRoot: `${AIS_REMOTE_CACHE_REL}/tail-incoming/${id}` });
     if (pushed.exitCode !== 0) throw syncError(host, "push", pushed.stderr, pushed.exitCode);
-    return { id, outDir, plan };
+    return { id, outDir, plan, deferred };
   } catch (error) {
     await rm(outDir, { recursive: true, force: true });
     throw error;
@@ -343,7 +347,7 @@ async function writeFileList(home: string, rels: string[]): Promise<string> {
 async function pushProfileSnapshot(host: string, filters: string[], scope: SyncScope, home: string, state: SteadyState): Promise<void> {
   const tails = await ioPhase("push-tails", () => pushTails(host, scope, home, state));
   try {
-    const needsFull = restrictTo(await pushSnapshot(host, [...tailExcludeFilters(tails?.plan ?? {}), ...filters], scope, home, state, tails?.id), Object.keys(tails?.plan ?? {}));
+    const needsFull = restrictTo(await pushSnapshot(host, [...tailExcludeFilters(tails?.plan ?? {}, tails?.deferred), ...filters], scope, home, state, tails?.id), Object.keys(tails?.plan ?? {}));
     // A tail whose prefix did not verify on the remote is staged whole and merged the ordinary way.
     if (needsFull.length > 0) {
       const list = await writeFileList(home, needsFull);
@@ -357,20 +361,30 @@ async function pushProfileSnapshot(host: string, filters: string[], scope: SyncS
 
 /** Fetch the bytes this host lacks of histories it already holds. Undefined when there are none or the remote
  * cannot plan them (an older version): the bulk transfer then stages those histories whole, as before. */
-async function pullTails(host: string, scope: SyncScope, home: string, state: SteadyState): Promise<{ dir: string; plan: TailPlan; manifest: HistoryManifest } | undefined> {
+async function pullTails(host: string, scope: SyncScope, home: string, state: SteadyState): Promise<{ dir: string; plan: TailPlan; deferred: string[]; manifest: HistoryManifest } | undefined> {
   const manifest = await listHistories(home, scope, new Set(state.ignored), TAIL_MIN_BYTES);
   if (Object.keys(manifest).length === 0) return undefined;
   const id = crypto.randomUUID();
   const dir = join(aisRemoteCacheDir(home), "tail-incoming", id);
   try {
-    const planned = await runRemoteAis(host, ["sync", "tail-plan", id, ...scopeArgs(scope)], JSON.stringify(manifest)).catch(() => undefined);
+    const planned = await runRemoteAis(host, ["sync", "tail-plan", id, ...scopeArgs(scope)], JSON.stringify(manifest)).catch((error: unknown) => {
+      console.warn(`AIS sync could not plan history tails on ${host}; differing histories transfer whole this run. ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    });
     if (!planned || !parseJson(planned)?.planned) return undefined;
     noteRemoteIo(host, planned);
     await mkdir(dir, { recursive: true });
     const pulled = await runRsync(host, "pull", [], home, { localRoot: dir, remoteRoot: `${AIS_REMOTE_CACHE_REL}/tail-outgoing/${id}` });
     if (pulled.exitCode !== 0) throw syncError(host, "pull", pulled.stderr, pulled.exitCode);
     const plan = JSON.parse(await readFile(join(dir, TAIL_PLAN_FILE), "utf8")) as TailPlan;
-    return { dir, plan: Object.fromEntries(Object.entries(plan).filter(([rel]) => rel in manifest)), manifest };
+    const deferred = JSON.parse(await readFile(join(dir, TAIL_DEFERRED_FILE), "utf8").catch(() => "[]")) as unknown;
+    return {
+      dir,
+      plan: Object.fromEntries(Object.entries(plan).filter(([rel]) => rel in manifest)),
+      // Only histories we already hold may be held back; a peer must not hide anything else from the pull.
+      deferred: Array.isArray(deferred) ? deferred.filter((rel): rel is string => typeof rel === "string" && rel in manifest) : [],
+      manifest,
+    };
   } catch (error) {
     await rm(dir, { recursive: true, force: true });
     if (error instanceof SyntaxError) return undefined;
@@ -422,7 +436,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           "profile-incoming",
           `${new Date().toISOString().replaceAll(":", "-")}-${safeHostSegment(host)}-${crypto.randomUUID()}`,
         );
-        let tails: { dir: string; plan: TailPlan; manifest: HistoryManifest } | undefined;
+        let tails: { dir: string; plan: TailPlan; deferred: string[]; manifest: HistoryManifest } | undefined;
         let fullDir: string | undefined;
         try {
           if (includeDatabases && syncsCrush(scope)) await ioPhase("pull-crush", () => pullCrushSnapshots(host, home, state));
@@ -434,7 +448,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           // Append-only histories this host already holds come as tails; the bulk pull leaves them out.
           tails = await ioPhase("pull-tails", () => pullTails(host, scope, home, state));
           await mkdir(incomingDir, { recursive: true });
-          const pulled = await ioPhase("pull-rsync", () => runRsync(host, "pull", [...tailExcludeFilters(tails?.plan ?? {}), ...filters], home, {
+          const pulled = await ioPhase("pull-rsync", () => runRsync(host, "pull", [...tailExcludeFilters(tails?.plan ?? {}, tails?.deferred), ...filters], home, {
             localRoot: incomingDir,
             compareDest: "../../../..",
           }), () => stagedSummary(incomingDir));
