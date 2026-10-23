@@ -48,6 +48,26 @@ export interface UsageSnapshotPartition {
   lastSuccessAt?: string;
   lastError?: string;
   lastErrorAt?: string;
+  nativeFailure?: NativeCaptureFailure;
+}
+
+export type NativeCaptureFailureStage =
+  | "partition-id-mismatch"
+  | "candidate-read"
+  | "candidate-json-parse"
+  | "candidate-envelope-validation"
+  | "candidate-hash"
+  | "promotion-directory"
+  | "promotion-copy"
+  | "promotion-permissions"
+  | "capture-setup"
+  | "capture-process"
+  | "unknown";
+
+export interface NativeCaptureFailure {
+  stage: NativeCaptureFailureStage;
+  errorClass: "Error" | "SyntaxError" | "TypeError" | "RangeError" | "AbortError";
+  errorCode?: "ENOENT" | "EACCES" | "EPERM" | "EIO" | "ENOSPC" | "EEXIST" | "EINVAL" | "ETIMEDOUT" | "ECONNRESET" | "UNKNOWN";
 }
 
 export interface UsageSnapshot {
@@ -135,14 +155,23 @@ async function captureNativeBatch(spec: NativeSnapshotCaptureSpec, deps: UsageSn
   mkdirSync(staging, { recursive: true, mode: 0o700 });
   const temporary = join(staging, `${spec.partitionId}.${crypto.randomUUID()}.json`);
   try {
-    const invocation = await buildAisTokscaleExportInvocation({
-      toolName: spec.toolName,
-      ...(spec.identity ? { identity: spec.identity } : {}),
-      partitionId: spec.partitionId,
-      exportPath: temporary,
-    });
+    let invocation;
+    try {
+      invocation = await buildAisTokscaleExportInvocation({
+        toolName: spec.toolName,
+        ...(spec.identity ? { identity: spec.identity } : {}),
+        partitionId: spec.partitionId,
+        exportPath: temporary,
+      });
+    } catch (error) {
+      throw nativeCaptureError("capture-setup", error);
+    }
     if (!invocation) return undefined;
-    await runAisTokscaleExportInvocation(invocation);
+    try {
+      await runAisTokscaleExportInvocation(invocation);
+    } catch (error) {
+      throw nativeCaptureError("capture-process", error);
+    }
     return promoteNativeBatchFile(temporary, spec.partitionId);
   } finally {
     try { unlinkSync(temporary); } catch { /* no export was produced */ }
@@ -174,11 +203,33 @@ function candidateFromResults(results: UsageResult[]): UsageResult["nativeBatchC
 }
 
 function validateNativeBatchFile(path: string, partitionId: string): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
-  const generatedAt = validateNativeBatchEnvelope(JSON.parse(readFileSync(path, "utf8")), partitionId);
-  const bytes = readFileSync(path);
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (error) {
+    throw nativeCaptureError("candidate-read", error);
+  }
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    throw nativeCaptureError("candidate-json-parse", error);
+  }
+  let generatedAt: string;
+  try {
+    generatedAt = validateNativeBatchEnvelope(envelope, partitionId);
+  } catch (error) {
+    throw nativeCaptureError("candidate-envelope-validation", error);
+  }
+  let sha256: string;
+  try {
+    sha256 = createHash("sha256").update(bytes).digest("hex");
+  } catch (error) {
+    throw nativeCaptureError("candidate-hash", error);
+  }
   return {
     path: "",
-    sha256: createHash("sha256").update(bytes).digest("hex"),
+    sha256,
     generatedAt,
     partitionId,
   };
@@ -197,15 +248,67 @@ export function validateNativeBatchEnvelope(value: unknown, partitionId: string)
 
 function promoteNativeBatchFile(candidatePath: string, partitionId: string): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
   const ref = validateNativeBatchFile(candidatePath, partitionId);
-  const bytes = readFileSync(candidatePath);
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(candidatePath);
+  } catch (error) {
+    throw nativeCaptureError("candidate-read", error);
+  }
   const attempt = crypto.randomUUID();
   const batchDir = join(aisCacheDir(), "usage", "native", partitionId);
-  mkdirSync(batchDir, { recursive: true, mode: 0o700 });
+  try {
+    mkdirSync(batchDir, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    throw nativeCaptureError("promotion-directory", error);
+  }
   const batchName = `${attempt}.json`;
   const promoted = join(batchDir, batchName);
-  writeFileSync(promoted, bytes, { flag: "wx", mode: 0o600 });
-  chmodSync(promoted, 0o600);
+  try {
+    writeFileSync(promoted, bytes, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    throw nativeCaptureError("promotion-copy", error);
+  }
+  try {
+    chmodSync(promoted, 0o600);
+  } catch (error) {
+    throw nativeCaptureError("promotion-permissions", error);
+  }
   return { ...ref, path: `usage/native/${partitionId}/${batchName}` };
+}
+
+class NativeCaptureStageError extends Error {
+  constructor(readonly stage: NativeCaptureFailureStage, readonly original: unknown) {
+    super("native-capture-failed");
+  }
+}
+
+function nativeCaptureError(stage: NativeCaptureFailureStage, error: unknown): NativeCaptureStageError {
+  return error instanceof NativeCaptureStageError ? error : new NativeCaptureStageError(stage, error);
+}
+
+const NATIVE_CAPTURE_ERROR_CODES = new Set<NonNullable<NativeCaptureFailure["errorCode"]>>([
+  "ENOENT", "EACCES", "EPERM", "EIO", "ENOSPC", "EEXIST", "EINVAL", "ETIMEDOUT", "ECONNRESET", "UNKNOWN",
+]);
+
+function nativeCaptureFailure(error: unknown): NativeCaptureFailure {
+  const staged = error instanceof NativeCaptureStageError ? error : new NativeCaptureStageError("unknown", error);
+  const candidate = staged.original as { name?: unknown; code?: unknown } | null;
+  const name = candidate && typeof candidate.name === "string" ? candidate.name : "Error";
+  const errorClass: NativeCaptureFailure["errorClass"] =
+    name === "SyntaxError" || name === "TypeError" || name === "RangeError" || name === "AbortError" ? name : "Error";
+  const code = candidate && typeof candidate.code === "string" && NATIVE_CAPTURE_ERROR_CODES.has(candidate.code as NonNullable<NativeCaptureFailure["errorCode"]>)
+    ? candidate.code as NonNullable<NativeCaptureFailure["errorCode"]>
+    : undefined;
+  return { stage: staged.stage, errorClass, ...(code ? { errorCode: code } : {}) };
+}
+
+function validNativeCaptureFailure(value: unknown): value is NativeCaptureFailure {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const failure = value as Record<string, unknown>;
+  const stages: NativeCaptureFailureStage[] = ["partition-id-mismatch", "candidate-read", "candidate-json-parse", "candidate-envelope-validation", "candidate-hash", "promotion-directory", "promotion-copy", "promotion-permissions", "capture-setup", "capture-process", "unknown"];
+  const classes = ["Error", "SyntaxError", "TypeError", "RangeError", "AbortError"];
+  return stages.includes(failure.stage as NativeCaptureFailureStage) && classes.includes(failure.errorClass as string) &&
+    (failure.errorCode === undefined || NATIVE_CAPTURE_ERROR_CODES.has(failure.errorCode as NonNullable<NativeCaptureFailure["errorCode"]>));
 }
 
 let activeRefresh: Promise<UsageSnapshot> | undefined;
@@ -259,7 +362,10 @@ function readSnapshot(path = USAGE_SNAPSHOT_FILE): UsageSnapshot | undefined {
             typeof ref.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(ref.sha256) || typeof ref.generatedAt !== "string" ||
             typeof ref.partitionId !== "string" || !/^[a-f0-9]{64}$/.test(ref.partitionId)) continue;
       }
-      partitions[key] = partition as UsageSnapshotPartition;
+      partitions[key] = {
+        ...(partition as UsageSnapshotPartition),
+        ...(validNativeCaptureFailure(partition.nativeFailure) ? { nativeFailure: partition.nativeFailure } : { nativeFailure: undefined }),
+      };
     }
     return {
       schemaVersion: 1,
@@ -620,7 +726,9 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     try {
       if (nativeCandidate) {
         const expectedPartitionId = nativePartitionId(key);
-        if (nativeCandidate.partitionId !== expectedPartitionId) throw new Error("native-export-partition-mismatch");
+        if (nativeCandidate.partitionId !== expectedPartitionId) {
+          throw new NativeCaptureStageError("partition-id-mismatch", new Error("native-export-partition-mismatch"));
+        }
         nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId);
         nativeCoverage = "supported";
       } else if (nativeSpec) {
@@ -630,7 +738,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
         if (!deps.collectTargetResults && !deps.collectSwapPools) throw new Error("native-export-missing");
         nativeCoverage = "unsupported";
       }
-    } catch {
+    } catch (error) {
       producer.sourceScanFailuresTotal++;
       if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
       partitions[key] = {
@@ -638,6 +746,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
         results: prior?.results ?? [], ...(prior?.nativeBatch ? { nativeBatch: prior.nativeBatch } : {}),
         lastAttemptAt: attemptedAt, ...(prior?.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
         lastError: "native-capture-failed", lastErrorAt: attemptedAt,
+        nativeFailure: nativeCaptureFailure(error),
       };
       writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
       return;
@@ -651,6 +760,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       ...(nativeBatch ? { nativeBatch } : {}),
       lastAttemptAt: attemptedAt,
       lastSuccessAt: attemptedAt,
+      nativeFailure: undefined,
     };
     aggregateGeneratedAt = attemptedAt;
     writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);

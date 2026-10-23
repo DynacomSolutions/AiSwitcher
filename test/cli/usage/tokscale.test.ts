@@ -16,6 +16,7 @@ import {
   tokscaleSpawnTimeoutMs,
   tokscaleTimeoutMessage,
   DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS,
+  runAisTokscaleExportInvocation,
   spawnTokscaleProcess,
   terminateTokscaleProcess,
   withTokscaleProcessSlot,
@@ -38,6 +39,22 @@ describe("tokscale process bounds", () => {
       return i;
     })));
     expect(peak).toBe(1);
+  });
+
+  test("native export invocations share the bounded tokscale process slot", async () => {
+    if (process.platform !== "linux") return;
+    const dir = await makeConfigDir();
+    const events = join(dir, "events.log");
+    const command = join(dir, "fake-tokscale");
+    await writeFile(command, `#!/bin/sh\nprintf 'start\\n' >> '${events}'\nsleep 0.1\nprintf 'end\\n' >> '${events}'\nprintf '{}\\n'\n`);
+    await chmod(command, 0o700);
+    const invocation = { command, args: [], env: {}, cwd: dir };
+    const output = await Promise.all([
+      runAisTokscaleExportInvocation(invocation),
+      runAisTokscaleExportInvocation(invocation),
+    ]);
+    expect(output).toEqual(["{}\n", "{}\n"]);
+    expect((await readFile(events, "utf8")).trim().split("\n")).toEqual(["start", "end", "start", "end"]);
   });
 
   test("does not release a slot while a descendant survives its leader", async () => {

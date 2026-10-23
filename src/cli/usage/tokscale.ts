@@ -194,7 +194,8 @@ export async function buildAisTokscaleExportInvocation(
  * separately written export envelope before it can become visible. */
 export async function runAisTokscaleExportInvocation(invocation: AisTokscaleExportInvocation): Promise<string> {
   if (invocation.signal?.aborted) throw new Error("native-export-aborted");
-  return spawnTokscaleProcess(invocation.command, [], [...invocation.args, "--json"], invocation.env);
+  return withTokscaleProcessSlot(() =>
+    spawnTokscaleProcess(invocation.command, [], [...invocation.args, "--json"], invocation.env));
 }
 
 /** Resolve the installed AIS-patched binary and authoritative manifest for

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -72,6 +73,51 @@ describe("shared usage snapshot", () => {
     expect(() => validateNativeBatchEnvelope({ ...valid, partitionId: "b".repeat(64) }, partitionId)).toThrow("invalid-native-batch");
     expect(() => validateNativeBatchEnvelope({ ...valid, complete: false }, partitionId)).toThrow("invalid-native-batch");
     expect(() => validateNativeBatchEnvelope({ ...valid, messages: [null] }, partitionId)).toThrow("invalid-native-batch");
+  });
+
+  test("native capture failures persist safe stage and error details for missing and invalid candidates", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    const path = await snapshotFile();
+    const key = usageSnapshotTargetKey("claude", identity.name);
+    const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
+    const candidatePath = join(dirname(path), "private-profile-secret.json");
+    const nativeBatchCandidate = { path: candidatePath, partitionId };
+    const candidateResults = [{ ...result(5), nativeBatchCandidate }];
+    const runCandidate = async () => refreshUsageSnapshot({
+      ...deps(path, { now, results: candidateResults }),
+      forcePartitionKeys: [key],
+    });
+
+    await runCandidate();
+    let snapshot = JSON.parse(await readFile(path, "utf8")) as {
+      partitions: Record<string, { nativeFailure?: { stage: string; errorClass: string; errorCode?: string } }>;
+    };
+    expect(snapshot.partitions[key]?.nativeFailure).toEqual({
+      stage: "candidate-read", errorClass: "Error", errorCode: "ENOENT",
+    });
+    expect(await readFile(path, "utf8")).not.toContain("private-profile-secret");
+
+    await writeFile(candidatePath, "{ malformed json");
+    await runCandidate();
+    snapshot = JSON.parse(await readFile(path, "utf8")) as typeof snapshot;
+    expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "candidate-json-parse", errorClass: "SyntaxError" });
+
+    const malformedEnvelope = {
+      schemaVersion: 1, partitionId, generatedAt: new Date(now).toISOString(), complete: false, messages: [],
+    };
+    await writeFile(candidatePath, JSON.stringify(malformedEnvelope));
+    await runCandidate();
+    snapshot = JSON.parse(await readFile(path, "utf8")) as typeof snapshot;
+    expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "candidate-envelope-validation", errorClass: "Error" });
+
+    await writeFile(candidatePath, JSON.stringify({ ...malformedEnvelope, complete: true }));
+    const mismatchedResults = [{ ...result(5), nativeBatchCandidate: { path: candidatePath, partitionId: "b".repeat(64) } }];
+    await refreshUsageSnapshot({
+      ...deps(path, { now, results: mismatchedResults }),
+      forcePartitionKeys: [key],
+    });
+    snapshot = JSON.parse(await readFile(path, "utf8")) as typeof snapshot;
+    expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "partition-id-mismatch", errorClass: "Error" });
   });
 
   test("restart reads persisted last-good data without another collection", async () => {
