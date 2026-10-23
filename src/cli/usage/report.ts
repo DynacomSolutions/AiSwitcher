@@ -150,10 +150,10 @@ function computeTotals(successes: UsageResult[]): Totals {
   );
 }
 
-function totalRow(totals: Totals): string[] {
+function totalRow(totals: Totals, label = "TOTAL"): string[] {
   return [
     "",
-    "TOTAL",
+    label,
     formatNumber(totals.messages),
     formatNumber(totals.input),
     formatNumber(totals.output),
@@ -260,7 +260,8 @@ export function formatUsageReport(results: UsageResult[], spinnerFrame = "⠋"):
   const successes = results.filter((r) => r.report);
   const rows = tableResults.map((r) => (r.pending ? pendingRow(r, spinnerFrame) : r.report ? successRow(r) : errorRow(r)));
   const totals = successes.length > 0 ? computeTotals(successes) : undefined;
-  const total = successes.length > 1 && totals ? totalRow(totals) : undefined;
+  const hasPartialCoverage = results.some((r) => r.error || r.pending);
+  const total = successes.length > 1 && totals ? totalRow(totals, hasPartialCoverage ? "PARTIAL TOTAL" : "TOTAL") : undefined;
   // Real (AWS-reported) spend is summarised separately from the estimate
   // totals: the TOTAL row's EST. COST stays a sum of local estimates, and
   // the real figure gets its own trailing row only from rows whose Cost
