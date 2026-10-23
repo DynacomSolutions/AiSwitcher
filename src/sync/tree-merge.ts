@@ -213,7 +213,7 @@ async function sourceWinsTie(source: string, destination: string): Promise<boole
 /** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict.
  * Credentials are in it deliberately: every host refreshes its own OAuth tokens, and an archived stale token is a
  * liability rather than a recovery aid. */
-const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|settings_cache\.json|\.last_inuse_sweep|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$|(?:^|\/)identities\/[^/]+\/(?:\.credentials\.json|credentials\.json|auth\.(?:json|toml)|credentials\/kimi-code\.json|(?:data\/)?opencode\/auth\.json)$/;
+const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|settings_cache\.json|\.last_inuse_sweep|[^/]+\.log|version\.json|bundled\/manifest\.json|known_marketplaces\.json|plugins\/synced\/.+|[^/]+\.ais-bak|subagents\/[^/]+\.meta\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$|(?:^|\/)identities\/[^/]+\/(?:\.credentials\.json|credentials\.json|auth\.(?:json|toml)|credentials\/kimi-code\.json|(?:data\/)?opencode\/auth\.json)$/;
 
 /** Content digests already archived per path, so a conflict whose losing copy was preserved before is neither
  * archived nor counted again. Without it a file both hosts keep rewriting reports itself on every run. */
@@ -247,6 +247,10 @@ class ConflictLedger {
 /** Keys Claude Code rewrites by itself on every host (counters, tips, cached flags): merged key by key, newest first. */
 const SELF_CHANGING_CLAUDE_KEYS = /^(?:numStartups|tips?[A-Z].*|tipsHistory|lastReleaseNotesSeen|promptQueueUseCount|firstStartTime|pluginUsage|changelogLastFetched|cached.*|.*Cache.*)$/;
 
+/** Keys a person sets on purpose (MCP servers, per-project tools and trust, preferences). Only these are worth a
+ * conflict copy when the hosts disagree; every other key is Claude Code's own bookkeeping and follows the newest file. */
+const USER_CONFIG_CLAUDE_KEYS = /^(?:mcpServers|projects|theme|editorMode|autoUpdates|verbose|env|permissions|preferredNotifChannel|customApiKeyResponses|primaryApiKey)$/;
+
 let claudeLockOptions: LockOptions = {};
 /** Test hook: shorten the `.claude.json` lock wait (no argument restores the default). */
 export function setClaudeLockOptions(options: LockOptions = {}): void { claudeLockOptions = options; }
@@ -261,7 +265,7 @@ function withoutSessionStats(key: string, value: unknown): unknown {
 
 /** A per-identity `.claude.json` is rewritten constantly by every running Claude Code on every host. Self-changing
  * keys merge key by key; every other key follows the newest file whole (deletions included) and, when the older
- * file held a different value, that file is preserved and counted as a conflict. */
+ * file held a different value for a user-config key, that file is preserved and counted as a conflict. */
 async function mergeClaudeJson(source: string, destination: string, rel: string, conflictRoot: string, result: TreeMergeResult, ledger: ConflictLedger): Promise<boolean> {
   const plain = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   const read = async (path: string): Promise<Record<string, unknown> | undefined> => {
@@ -279,7 +283,7 @@ async function mergeClaudeJson(source: string, destination: string, rel: string,
     const differing: string[] = [];
     for (const [key, value] of Object.entries(loser)) {
       if (SELF_CHANGING_CLAUDE_KEYS.test(key)) { if (!(key in winner)) merged[key] = value; }
-      else if (!isDeepStrictEqual(withoutSessionStats(key, value), withoutSessionStats(key, winner[key]))) differing.push(key);
+      else if (USER_CONFIG_CLAUDE_KEYS.test(key) && !isDeepStrictEqual(withoutSessionStats(key, value), withoutSessionStats(key, winner[key]))) differing.push(key);
     }
     if (differing.length > 0) {
       console.warn(`AIS sync ${rel} differs in: ${differing.join(", ")}`);

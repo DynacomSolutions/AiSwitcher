@@ -141,3 +141,28 @@ test("the plugin in-use sweep stamp is volatile state, not a conflict", async ()
   await f.put(f.incoming, rel, "2", T);
   expect((await f.merge()).preservedConflicts).toBe(0);
 });
+
+test(".claude.json bookkeeping keys never conflict; a differing MCP server still does", async () => {
+  const f = await fixture();
+  const rel = ".claude/identities/a3/.claude.json";
+  const doc = (n: number, mcp: string) => JSON.stringify({ closedIssuesLastChecked: n, oauthAccount: { id: `a${n}` }, mcpServers: { [mcp]: { command: mcp } } });
+  await f.put(f.home, rel, doc(1, "x"), T + 10);
+  await f.put(f.incoming, rel, doc(2, "x"), T);
+  expect((await f.merge()).preservedConflicts).toBe(0);
+  await f.put(f.incoming, rel, doc(3, "y"), T);
+  expect((await f.merge()).preservedConflictPaths).toEqual([rel]);
+});
+
+test("tool logs, version stamps and plugin marketplace state are volatile", async () => {
+  const f = await fixture();
+  const rels = [
+    ".codex/identities/a3/app-server-daemon/daemon-updater.stderr.log",
+    ".codex/identities/a3/version.json",
+    ".claude/identities/a3/plugins/known_marketplaces.json",
+    ".claude/identities/a3/plugins/synced/x/.last-complete-round",
+    ".claude/identities/a3/.credentials.json.ais-bak",
+    ".claude/identities/a3/projects/p/s/subagents/agent-1.meta.json",
+  ];
+  for (const rel of rels) { await f.put(f.home, rel, "1", T + 10); await f.put(f.incoming, rel, "2", T); }
+  expect((await f.merge()).preservedConflicts).toBe(0);
+});
