@@ -21,6 +21,7 @@ export const TAIL_PLAN_FILE = "tails.json";
 /** Histories the bulk transfers leave out this run: unchanged at plan time, or changed under the sender mid-plan.
  * A live history the receiver appends to after planning would otherwise fail rsync's quick check and go whole. */
 export const TAIL_DEFERRED_FILE = "deferred.json";
+const LIVE_HISTORY_MS = 24 * 60 * 60 * 1000;
 
 export interface HistoryInfo { size: number; mtimeMs: number }
 export type HistoryManifest = Record<string, HistoryInfo>;
@@ -192,7 +193,12 @@ export async function planTails(
     try {
       const info = await handle.stat();
       if (info.size < TAIL_MIN_BYTES) continue;
-      if (info.size === theirs.size && Math.floor(info.mtimeMs / 1000) === Math.floor(theirs.mtimeMs / 1000)) { deferred.push(rel); continue; }
+      if (info.size === theirs.size && Math.floor(info.mtimeMs / 1000) === Math.floor(theirs.mtimeMs / 1000)) {
+        // Only recently written histories can grow before the bulk transfer; holding back every idle one
+        // costs rsync one exclude rule per file checked against every path (thousands of rules, minutes).
+        if (Date.now() - info.mtimeMs < LIVE_HISTORY_MS) deferred.push(rel);
+        continue;
+      }
       // A receiver that is already ahead needs no bytes at all: proving our whole file is its prefix is enough.
       const offset = Math.min(info.size, theirs.size);
       const prefix = await cache.prefix(handle, path, offset);

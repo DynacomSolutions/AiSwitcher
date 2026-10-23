@@ -92,16 +92,21 @@ test("a file replaced between hashing and copying is deferred, not planned or se
   } finally { setBeforeTailCopyHook(); }
 });
 
-test("a history equal at plan time is held back from the bulk transfer", async () => {
+test("a live history equal at plan time is held back from the bulk transfer; an idle one is not", async () => {
   const { home, tails } = await homes();
   const body = lines(0, 1300);
   await writeFile(join(home, REL), body);
-  await utimes(join(home, REL), 5000, 5000);
-  const listing: HistoryManifest = { [REL]: { size: body.length, mtimeMs: 5_000_000 } };
+  const plan = async (mtimeSec: number) => {
+    await utimes(join(home, REL), mtimeSec, mtimeSec);
+    const manifest: HistoryManifest = { [REL]: { size: body.length, mtimeMs: mtimeSec * 1000 } };
+    const deferred: string[] = [];
+    expect(await planTails(home, all, manifest, join(tails, `equal-${mtimeSec}`), new Set(), manifest, deferred)).toEqual({});
+    return deferred;
+  };
   // The receiver may append to its live copy after this plan; rsync's quick check must not then resend it whole.
-  const deferred: string[] = [];
-  expect(await planTails(home, all, { [REL]: { size: body.length, mtimeMs: 5_000_400 } }, join(tails, "equal"), new Set(), listing, deferred)).toEqual({});
-  expect(deferred).toEqual([REL]);
+  expect(await plan(Math.floor(Date.now() / 1000) - 60)).toEqual([REL]);
+  // An idle history cannot grow meanwhile; excluding it would only add an rsync rule per file.
+  expect(await plan(5000)).toEqual([]);
 });
 
 test("restrictTo drops paths the peer was never offered", () => {
