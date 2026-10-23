@@ -14,7 +14,7 @@ import { ensureUsableCwd } from "../shared/exec.ts";
 import type { ConsoleAppDeps } from "./app.ts";
 import { stopScanWorkers, stopUsageSnapshotSampler, warmUsageCaches } from "./workers.ts";
 import { isAisLive, isLiveImageUser, noteLiveFeatureDisabled } from "../shared/live-mode.ts";
-import { ServerLifecycle, trackResponseBody } from "./lifecycle.ts";
+import { ServerLifecycle, stopServerAfterDrain, trackResponseBody } from "./lifecycle.ts";
 
 export interface ServeOptions {
   port?: number;
@@ -278,7 +278,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
       herdrBridge?.stop();
       claudeSwap?.stop();
       loginFlows.stop();
-      void Promise.all([server.stop(false), lifecycle.waitForDrain()]).then(finishShutdownWhenDrained);
+      void stopServerAfterDrain(server, lifecycle).then(finishShutdownWhenDrained);
     };
     process.on("SIGTERM", shutdown);
     process.on("SIGINT", shutdown);

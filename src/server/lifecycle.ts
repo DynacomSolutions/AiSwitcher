@@ -51,6 +51,15 @@ export class ServerLifecycle {
   }
 }
 
+/** Stop accepting requests and wait for both Bun's connection drain and the
+ * application-level response-body tracking to finish. */
+export function stopServerAfterDrain(
+  server: { stop(closeActiveConnections?: boolean): Promise<void> },
+  lifecycle: ServerLifecycle,
+): Promise<void> {
+  return Promise.all([server.stop(false), lifecycle.waitForDrain()]).then(() => undefined);
+}
+
 /** Keep a request in flight until its response body has been consumed or
  * abandoned. Bun's fetch promise resolves as soon as headers are available. */
 export function trackResponseBody(response: Response, finish: () => void): Response {
