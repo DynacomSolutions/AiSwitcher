@@ -70,4 +70,3 @@ export function writeBreakdownProjectionCache(path: string, fingerprint: string,
     try { unlinkSync(temporary); } catch { /* renamed or absent */ }
   }
 }
-
