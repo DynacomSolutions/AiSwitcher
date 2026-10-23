@@ -1487,6 +1487,22 @@ index c68471a..771e05f 100644
 +
 +#[test]
 
+diff --git a/crates/tokscale-core/Cargo.toml b/crates/tokscale-core/Cargo.toml
+--- a/crates/tokscale-core/Cargo.toml
++++ b/crates/tokscale-core/Cargo.toml
+@@ -30,6 +30,7 @@
+ sha2 = { workspace = true }
+ libc = { workspace = true }
+ fs2 = { workspace = true }
++tempfile = "3"
+ # Read Chromium's local conversation cache without opening or modifying its DB.
+ leveldb-core = "0.1.2"
+ snap = "1"
+@@ -50,4 +51,3 @@
+ [dev-dependencies]
+ jsonschema = { version = "0.33", default-features = false }
+-tempfile = "3"
+ serial_test = "3"
 diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/src/message_cache.rs
 --- a/crates/tokscale-core/src/message_cache.rs
 +++ b/crates/tokscale-core/src/message_cache.rs
