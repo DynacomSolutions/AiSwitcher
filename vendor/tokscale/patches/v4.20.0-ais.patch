@@ -1421,3 +1421,58 @@ index c68471a..771e05f 100644
              };
              let scan = || {
                  parse_all_messages_with_pricing_with_env_strategy(
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -5136,0 +5137 @@
++    write_ais_export_if_requested(&all_messages)?;
+--- a/crates/tokscale-cli/tests/cli_tests.rs
++++ b/crates/tokscale-cli/tests/cli_tests.rs
+@@ -2360,0 +2361,48 @@
++fn ais_native_export_from_json_model_report_uses_report_parser_vector() {
++    let tmp = create_codex_fixture_dir();
++    let export_path = tmp.path().join("native-batch.json");
++    let partition_id = "a".repeat(64);
++    let output = cmd_with_home(tmp.path())
++        .env("TOKSCALE_AIS_EXPORT_PATH", &export_path)
++        .env("TOKSCALE_AIS_PARTITION_ID", &partition_id)
++        .args(["--json", "--client", "codex", "--no-spinner"])
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "stderr: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++
++    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++    let batch: serde_json::Value = serde_json::from_slice(&fs::read(export_path).unwrap()).unwrap();
++    assert_eq!(batch["schemaVersion"], 1);
++    assert_eq!(batch["partitionId"], partition_id);
++    assert_eq!(batch["complete"], true);
++    let messages = batch["messages"].as_array().unwrap();
++    assert!(!messages.is_empty(), "native batch must contain real parsed rows");
++
++    let sum = |key: &str| -> i64 {
++        messages
++            .iter()
++            .map(|message| message["tokens"][key].as_i64().unwrap_or_default())
++            .sum()
++    };
++    let message_count: i64 = messages
++        .iter()
++        .map(|message| message["message_count"].as_i64().unwrap_or(1))
++        .sum();
++    let total_cost: f64 = messages
++        .iter()
++        .map(|message| message["cost"].as_f64().unwrap_or_default())
++        .sum();
++
++    assert_eq!(report["totalInput"].as_i64().unwrap(), sum("input"));
++    assert_eq!(report["totalOutput"].as_i64().unwrap(), sum("output"));
++    assert_eq!(report["totalCacheRead"].as_i64().unwrap(), sum("cache_read"));
++    assert_eq!(report["totalCacheWrite"].as_i64().unwrap(), sum("cache_write"));
++    assert_eq!(report["totalMessages"].as_i64().unwrap(), message_count);
++    assert!((report["totalCost"].as_f64().unwrap() - total_cost).abs() < 1e-9);
++}
++
++#[test]

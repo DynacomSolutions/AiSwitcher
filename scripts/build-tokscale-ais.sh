@@ -51,6 +51,7 @@ patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/pa
 
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_shared_snapshot)
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --bin tokscale ais_shared_overlay)
+(cd "$source_dir" && cargo test --locked --package tokscale-cli --test cli_tests ais_native_export_from_json_model_report_uses_report_parser_vector)
 (cd "$source_dir" && cargo build --locked --release --package tokscale-cli --bin tokscale)
 
 if [[ -z "$target_dir" ]]; then
