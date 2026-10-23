@@ -175,12 +175,19 @@ export async function buildAisTokscaleExportInvocation(
     clientArgs = invocation.clientArgs;
   }
 
+  // The native exporter runs with an isolated config directory. Pass the
+  // caller's pre-isolation Tokscale config root separately so its one-time
+  // Claude message-cache seed can read only the historical source cache.
+  const sourceTokscaleConfigDir = env.TOKSCALE_CONFIG_DIR ||
+    join(env.XDG_CONFIG_HOME || join(homedir(), ".config"), "tokscale");
+
   return {
     command,
     args: clientArgs,
     env: {
       ...sourceEnv,
       TOKSCALE_EXTRA_DIRS: "",
+      TOKSCALE_AIS_SOURCE_CONFIG_DIR: resolve(sourceTokscaleConfigDir),
       TOKSCALE_CONFIG_DIR: join(aisCacheDir(), "usage", "native-tokscale", "isolated-config"),
       TOKSCALE_AIS_EXPORT_PATH: target.exportPath,
       TOKSCALE_AIS_PARTITION_ID: target.partitionId,

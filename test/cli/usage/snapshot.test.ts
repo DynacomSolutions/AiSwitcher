@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   acquireSnapshotLock,
   externalUsageCollectorOwnsRefreshes,
@@ -126,22 +126,33 @@ describe("shared usage snapshot", () => {
     const key = usageSnapshotTargetKey("claude", identity.name);
     const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
     const candidate = { path: join(dirname(path), "empty-report-native.json"), partitionId };
+    const nativeBatchRoot = join(dirname(path), "native-batches");
     await refreshUsageSnapshot({
       ...deps(path, { now, results: [] }),
+      nativeBatchRoot,
       forcePartitionKeys: [key],
       prepareNativeExportCandidate: async () => candidate,
       collectTargetResults: async (targets, onItemDone, prepareNativeExport) => {
         expect(prepareNativeExport).toBeDefined();
-        await prepareNativeExport!(targets[0]!);
+        const prepared = await prepareNativeExport!(targets[0]!);
+        expect(prepared).toEqual(candidate);
+        await writeFile(candidate.path, JSON.stringify({
+          schemaVersion: 1, partitionId, generatedAt: new Date(now).toISOString(), complete: true, messages: [],
+        }));
         onItemDone(0, []);
         return [];
       },
     });
 
     const snapshot = JSON.parse(await readFile(path, "utf8")) as {
-      partitions: Record<string, { nativeFailure?: { stage: string; errorClass?: string; errorCode?: string } }>;
+      partitions: Record<string, { nativeCoverage?: string; nativeBatch?: { path: string; partitionId: string }; nativeFailure?: unknown; lastSuccessAt?: string }>;
     };
-    expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "candidate-read", errorClass: "Error", errorCode: "ENOENT" });
+    expect(snapshot.partitions[key]?.nativeCoverage).toBe("supported");
+    expect(snapshot.partitions[key]?.nativeBatch?.partitionId).toBe(partitionId);
+    expect(snapshot.partitions[key]?.nativeBatch?.path).toMatch(/^usage\/native\//);
+    expect(snapshot.partitions[key]?.nativeFailure).toBeUndefined();
+    expect(snapshot.partitions[key]?.lastSuccessAt).toBe(new Date(now).toISOString());
+    expect(await Bun.file(join(nativeBatchRoot, partitionId, basename(snapshot.partitions[key]!.nativeBatch!.path))).exists()).toBe(true);
   });
 
   test("empty swap-pool report rows retain their native export candidate", async () => {
@@ -152,12 +163,17 @@ describe("shared usage snapshot", () => {
     const key = usageSnapshotTargetKey("claude", pool.name);
     const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
     const candidate = { path: join(dirname(path), "empty-pool-native.json"), partitionId };
+    const nativeBatchRoot = join(dirname(path), "native-batches");
     await refreshUsageSnapshot({
       ...deps(path, { now, results: [] }),
+      nativeBatchRoot,
       collectTargets: async () => [],
       collectPoolTargets: async () => [poolTarget],
       collectSwapPools: async (onPoolDone, prepareNativeExport) => {
         await prepareNativeExport!(poolTarget);
+        await writeFile(candidate.path, JSON.stringify({
+          schemaVersion: 1, partitionId, generatedAt: new Date(now).toISOString(), complete: true, messages: [],
+        }));
         await onPoolDone(pool, []);
         return [];
       },
@@ -165,9 +181,12 @@ describe("shared usage snapshot", () => {
     });
 
     const snapshot = JSON.parse(await readFile(path, "utf8")) as {
-      partitions: Record<string, { nativeFailure?: { stage: string; errorClass?: string; errorCode?: string } }>;
+      partitions: Record<string, { nativeCoverage?: string; nativeBatch?: { path: string; partitionId: string }; nativeFailure?: unknown; lastSuccessAt?: string }>;
     };
-    expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "candidate-read", errorClass: "Error", errorCode: "ENOENT" });
+    expect(snapshot.partitions[key]?.nativeCoverage).toBe("supported");
+    expect(snapshot.partitions[key]?.nativeBatch?.partitionId).toBe(partitionId);
+    expect(snapshot.partitions[key]?.nativeFailure).toBeUndefined();
+    expect(snapshot.partitions[key]?.lastSuccessAt).toBe(new Date(now).toISOString());
   });
 
   test("Codex Bedrock report partitions are explicitly report-only for native coverage", async () => {

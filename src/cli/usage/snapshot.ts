@@ -108,6 +108,8 @@ export interface UsageSnapshotEnvelope {
 
 export interface UsageSnapshotDeps {
   path?: string;
+  /** Test seam for keeping successful native promotions inside the fixture tree. */
+  nativeBatchRoot?: string;
   now?: () => number;
   partitionTtlMs?: number;
   forcePartitionKeys?: string[];
@@ -256,7 +258,7 @@ export function validateNativeBatchEnvelope(value: unknown, partitionId: string)
   return envelope.generatedAt;
 }
 
-function promoteNativeBatchFile(candidatePath: string, partitionId: string): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
+function promoteNativeBatchFile(candidatePath: string, partitionId: string, nativeRoot = join(aisCacheDir(), "usage", "native")): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
   const ref = validateNativeBatchFile(candidatePath, partitionId);
   let bytes: Buffer;
   try {
@@ -265,7 +267,7 @@ function promoteNativeBatchFile(candidatePath: string, partitionId: string): Non
     throw nativeCaptureError("candidate-read", error);
   }
   const attempt = crypto.randomUUID();
-  const batchDir = join(aisCacheDir(), "usage", "native", partitionId);
+  const batchDir = join(nativeRoot, partitionId);
   try {
     mkdirSync(batchDir, { recursive: true, mode: 0o700 });
   } catch (error) {
@@ -759,7 +761,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
         if (nativeCandidate.partitionId !== expectedPartitionId) {
           throw new NativeCaptureStageError("partition-id-mismatch", new Error("native-export-partition-mismatch"));
         }
-        nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId);
+        nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot);
         nativeCoverage = "supported";
       } else if (nativeSpec) {
         nativeBatch = await captureNativeBatch(nativeSpec, deps);

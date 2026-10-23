@@ -6,6 +6,7 @@ import { writeZaiAuthFile } from "../../../src/identities/zai-auth.ts";
 import { defaultOpencodeProfileDbPath } from "../../../src/cli/usage/opencode-usage.ts";
 import {
   buildMergedEnv,
+  buildAisTokscaleExportInvocation,
   dailyUsageFromHourlyEntries,
   findCachedTokscaleBinary,
   prepareMergedPassthrough,
@@ -105,6 +106,33 @@ describe("tokscale process bounds", () => {
     const state = stat?.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
     expect(state === undefined || /^[ZX]$/.test(state)).toBe(true);
   }, 5000);
+});
+
+describe("AIS native export cache seeding", () => {
+  test("preserves the caller Tokscale config root before applying isolated config", async () => {
+    const dir = await makeConfigDir();
+    const command = join(dir, "fake-tokscale");
+    await writeFile(command, "#!/bin/sh\nexit 0\n");
+    await chmod(command, 0o700);
+    const invocation = await buildAisTokscaleExportInvocation({
+      toolName: "claude", identity: identity("/identity/claude"),
+      partitionId: "a".repeat(64), exportPath: join(dir, "candidate.json"),
+    }, { AIS_TOKSCALE_SHARED_BIN: command, TOKSCALE_CONFIG_DIR: join(dir, "original-config"), XDG_CONFIG_HOME: join(dir, "other-xdg") });
+    expect(invocation?.env.TOKSCALE_AIS_SOURCE_CONFIG_DIR).toBe(join(dir, "original-config"));
+    expect(invocation?.env.TOKSCALE_CONFIG_DIR).toContain("/usage/native-tokscale/isolated-config");
+  });
+
+  test("uses caller XDG_CONFIG_HOME when no Tokscale config override exists", async () => {
+    const dir = await makeConfigDir();
+    const command = join(dir, "fake-tokscale");
+    await writeFile(command, "#!/bin/sh\nexit 0\n");
+    await chmod(command, 0o700);
+    const invocation = await buildAisTokscaleExportInvocation({
+      toolName: "claude", identity: identity("/identity/claude"),
+      partitionId: "b".repeat(64), exportPath: join(dir, "candidate.json"),
+    }, { AIS_TOKSCALE_SHARED_BIN: command, XDG_CONFIG_HOME: join(dir, "xdg-config") });
+    expect(invocation?.env.TOKSCALE_AIS_SOURCE_CONFIG_DIR).toBe(join(dir, "xdg-config", "tokscale"));
+  });
 });
 
 const tempDirs: string[] = [];
