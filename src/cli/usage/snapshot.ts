@@ -10,6 +10,7 @@ import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnaps
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, type UsageResult, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
 import { buildAisTokscaleExportInvocation, runAisTokscaleExportInvocation } from "./tokscale.ts";
+import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 
@@ -113,9 +114,17 @@ export interface UsageSnapshotDeps {
   dirtyDirectory?: string;
   collectTargets?: () => Promise<UsageTarget[]>;
   collectPoolTargets?: () => Promise<UsageTarget[]>;
-  collectTargetResults?: (targets: UsageTarget[], onItemDone: (index: number, results: UsageResult[]) => void) => Promise<UsageResult[]>;
+  prepareNativeExportCandidate?: (target: UsageTarget) => Promise<UsageResult["nativeBatchCandidate"]>;
+  collectTargetResults?: (
+    targets: UsageTarget[],
+    onItemDone: (index: number, results: UsageResult[], nativeCandidate?: UsageResult["nativeBatchCandidate"]) => void,
+    prepareNativeExport?: (target: UsageTarget) => Promise<{ path: string; partitionId: string } | undefined>,
+  ) => Promise<UsageResult[]>;
   collectDefaultProfile?: () => Promise<UsageResult[]>;
-  collectSwapPools?: (onPoolDone: (pool: UsageTarget["identity"], results: UsageResult[], failed?: boolean, nativeBatchCandidate?: UsageResult["nativeBatchCandidate"]) => void | Promise<void>) => Promise<UsageResult[]>;
+  collectSwapPools?: (
+    onPoolDone: (pool: UsageTarget["identity"], results: UsageResult[], failed?: boolean, nativeBatchCandidate?: UsageResult["nativeBatchCandidate"]) => void | Promise<void>,
+    prepareNativeExport?: (target: UsageTarget) => Promise<{ path: string; partitionId: string } | undefined>,
+  ) => Promise<UsageResult[]>;
   captureNative?: (spec: NativeSnapshotCaptureSpec) => Promise<UsageSnapshotPartition["nativeBatch"]>;
 }
 
@@ -182,12 +191,13 @@ function nativePartitionId(partitionKey: string): string {
   return createHash("sha256").update(`ais-native-partition-v1\0${partitionKey}`).digest("hex");
 }
 
-function nativeExportSupportedInSameRun(toolName: UsageTarget["toolName"]): boolean {
-  return toolName !== "ali" && toolName !== "zai" && toolName !== "opencode" && toolName !== "pi";
+function nativeExportSupportedInSameRun(target: UsageTarget): boolean {
+  return target.toolName !== "ali" && target.toolName !== "zai" && target.toolName !== "opencode" && target.toolName !== "pi" &&
+    !(target.toolName === "codex" && isBedrockIdentity(target.identity));
 }
 
 async function nativeExportForTarget(target: UsageTarget, key = targetKey(target)) {
-  if (!nativeExportSupportedInSameRun(target.toolName)) return undefined;
+  if (!nativeExportSupportedInSameRun(target)) return undefined;
   const partitionId = nativePartitionId(key);
   const staging = join(aisCacheDir(), "usage", "native", ".staging");
   mkdirSync(staging, { recursive: true, mode: 0o700 });
@@ -667,6 +677,25 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     return !previousPartition || currentMs - lastSuccess >= ttl || forcedKeys.has(targetKey(target));
   });
   const nativeSpecs = new Map((await buildNativeSnapshotCaptureSpecs(targets)).map((spec) => [spec.partitionKey, spec]));
+  // An export can be valid and contain no messages. In that case the report
+  // reader returns no UsageResult rows to carry the candidate metadata, so
+  // keep the candidate independently until the matching callback commits.
+  const nativeCandidates = new Map<string, UsageResult["nativeBatchCandidate"]>();
+  const getNativeExportForTarget = async (target: UsageTarget) => {
+    const nativeExport = await nativeExportForTarget(target);
+    if (nativeExport) nativeCandidates.set(targetKey(target), {
+      path: nativeExport.path,
+      partitionId: nativeExport.partitionId,
+    });
+    return nativeExport;
+  };
+  const prepareNativeExportCandidate = async (target: UsageTarget) => {
+    const candidate = deps.prepareNativeExportCandidate
+      ? await deps.prepareNativeExportCandidate(target)
+      : await getNativeExportForTarget(target);
+    if (candidate) nativeCandidates.set(targetKey(target), candidate);
+    return candidate;
+  };
   const dueDefaultProfile = (() => {
     const partition = partitions[DEFAULT_OPENCODE_PARTITION];
     return !partition?.lastSuccessAt || currentMs - Date.parse(partition.lastSuccessAt) >= ttl || deps.forcePartitionKeys?.includes(DEFAULT_OPENCODE_PARTITION) === true || forcedKeys.has(DEFAULT_OPENCODE_PARTITION);
@@ -677,7 +706,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     return !partition?.lastSuccessAt || currentMs - Date.parse(partition.lastSuccessAt) >= ttl || deps.forcePartitionKeys?.includes(key) === true || forcedKeys.has(key);
   });
 
-  const savePartition = async (key: string, tool: string | undefined, identity: string | undefined, results: UsageResult[], nativeCandidate = candidateFromResults(results)) => {
+  const savePartition = async (key: string, tool: string | undefined, identity: string | undefined, results: UsageResult[], nativeCandidate = candidateFromResults(results) ?? nativeCandidates.get(key)) => {
     producer.sourceScansTotal++;
     const prior = partitions[key];
     if (hasCollectorError(results)) {
@@ -723,6 +752,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     let nativeBatch: UsageSnapshotPartition["nativeBatch"];
     let nativeCoverage: UsageSnapshotPartition["nativeCoverage"] = tool === "ali" || tool === "zai" ? "unsupported" : "pending";
     const nativeSpec = nativeSpecs.get(key);
+    const target = [...targets, ...poolTargets].find((candidate) => targetKey(candidate) === key);
     try {
       if (nativeCandidate) {
         const expectedPartitionId = nativePartitionId(key);
@@ -734,8 +764,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       } else if (nativeSpec) {
         nativeBatch = await captureNativeBatch(nativeSpec, deps);
         nativeCoverage = nativeBatch ? "supported" : "unsupported";
-      } else if (tool && nativeExportSupportedInSameRun(tool as UsageTarget["toolName"])) {
+      } else if (target && nativeExportSupportedInSameRun(target)) {
         if (!deps.collectTargetResults && !deps.collectSwapPools) throw new Error("native-export-missing");
+        nativeCoverage = "unsupported";
+      } else {
         nativeCoverage = "unsupported";
       }
     } catch (error) {
@@ -767,16 +799,16 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
   };
 
   if (dueTargets.length > 0) {
-    const collect = deps.collectTargetResults ?? ((selected: UsageTarget[], onItemDone: (index: number, results: UsageResult[]) => void) =>
-      runUsageQueryForTargets(selected, { onItemDone, deps: { nativeExportForTarget: (target) => nativeExportForTarget(target) } }));
+    const collect = deps.collectTargetResults ?? ((selected: UsageTarget[], onItemDone: (index: number, results: UsageResult[], nativeCandidate?: UsageResult["nativeBatchCandidate"]) => void) =>
+      runUsageQueryForTargets(selected, { onItemDone, deps: { nativeExportForTarget: getNativeExportForTarget } }));
     const recorded = new Set<number>();
     try {
-      await collect(dueTargets, async (index, results) => {
+      await collect(dueTargets, async (index, results, nativeCandidate) => {
         const target = dueTargets[index];
         if (!target) return;
         recorded.add(index);
-        await savePartition(targetKey(target), target.toolName, target.identity.name, results);
-      });
+        await savePartition(targetKey(target), target.toolName, target.identity.name, results, nativeCandidate ?? nativeCandidates.get(targetKey(target)));
+      }, prepareNativeExportCandidate);
     } catch {
       // Completed callbacks have already been durably saved. Remaining
       // identities keep their prior rows and receive a safe error category.
@@ -837,18 +869,12 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     };
     try {
       if (deps.collectSwapPools) {
-        await deps.collectSwapPools(onPoolDone);
+        await deps.collectSwapPools(onPoolDone, prepareNativeExportCandidate);
       } else {
         await swapPoolUsageResults({}, undefined,
           async (target, suppression) => {
-            const nativeExport = await nativeExportForTarget(target);
-            const results = await runTokscaleForUsageTarget(target, suppression, { nativeExportForTarget: async () => nativeExport });
-            if (nativeExport && !candidateFromResults(results)) {
-              return results.length
-                ? results.map((result) => ({ ...result, sourceOnlyError: true as const, error: "native-capture-failed" }))
-                : [{ provider: "anthropic", identity: target.identity, sourceOnlyError: true, error: "native-capture-failed" }];
-            }
-            return results;
+            const nativeExport = await getNativeExportForTarget(target);
+            return runTokscaleForUsageTarget(target, suppression, { nativeExportForTarget: async () => nativeExport });
           },
           onPoolDone, dueNames);
       }

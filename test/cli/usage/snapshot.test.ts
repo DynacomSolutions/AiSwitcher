@@ -120,6 +120,77 @@ describe("shared usage snapshot", () => {
     expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "partition-id-mismatch", errorClass: "Error" });
   });
 
+  test("empty report rows retain their separately supplied native export candidate", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    const path = await snapshotFile();
+    const key = usageSnapshotTargetKey("claude", identity.name);
+    const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
+    const candidate = { path: join(dirname(path), "empty-report-native.json"), partitionId };
+    await refreshUsageSnapshot({
+      ...deps(path, { now, results: [] }),
+      forcePartitionKeys: [key],
+      prepareNativeExportCandidate: async () => candidate,
+      collectTargetResults: async (targets, onItemDone, prepareNativeExport) => {
+        expect(prepareNativeExport).toBeDefined();
+        await prepareNativeExport!(targets[0]!);
+        onItemDone(0, []);
+        return [];
+      },
+    });
+
+    const snapshot = JSON.parse(await readFile(path, "utf8")) as {
+      partitions: Record<string, { nativeFailure?: { stage: string; errorClass?: string; errorCode?: string } }>;
+    };
+    expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "candidate-read", errorClass: "Error", errorCode: "ENOENT" });
+  });
+
+  test("empty swap-pool report rows retain their native export candidate", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    const path = await snapshotFile();
+    const pool = { ...identity, name: "pool", swapPool: { accounts: [identity.name], active: identity.name } };
+    const poolTarget: UsageTarget = { toolName: "claude", identity: pool };
+    const key = usageSnapshotTargetKey("claude", pool.name);
+    const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
+    const candidate = { path: join(dirname(path), "empty-pool-native.json"), partitionId };
+    await refreshUsageSnapshot({
+      ...deps(path, { now, results: [] }),
+      collectTargets: async () => [],
+      collectPoolTargets: async () => [poolTarget],
+      collectSwapPools: async (onPoolDone, prepareNativeExport) => {
+        await prepareNativeExport!(poolTarget);
+        await onPoolDone(pool, []);
+        return [];
+      },
+      prepareNativeExportCandidate: async () => candidate,
+    });
+
+    const snapshot = JSON.parse(await readFile(path, "utf8")) as {
+      partitions: Record<string, { nativeFailure?: { stage: string; errorClass?: string; errorCode?: string } }>;
+    };
+    expect(snapshot.partitions[key]?.nativeFailure).toEqual({ stage: "candidate-read", errorClass: "Error", errorCode: "ENOENT" });
+  });
+
+  test("Codex Bedrock report partitions are explicitly report-only for native coverage", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    const path = await snapshotFile();
+    const bedrockIdentity = { ...identity, name: "bedrock", env: { CLAUDE_CODE_USE_BEDROCK: "1" } };
+    const bedrockTarget: UsageTarget = { toolName: "codex", identity: bedrockIdentity };
+    const key = usageSnapshotTargetKey("codex", bedrockIdentity.name);
+    await refreshUsageSnapshot({
+      ...deps(path, { now, results: [result(1, bedrockIdentity)] }),
+      collectTargets: async () => [bedrockTarget],
+      collectTargetResults: async (_targets, onItemDone) => {
+        onItemDone(0, [result(1, bedrockIdentity)]);
+        return [];
+      },
+    });
+    const snapshot = JSON.parse(await readFile(path, "utf8")) as {
+      partitions: Record<string, { nativeCoverage?: string; results: UsageResult[] }>;
+    };
+    expect(snapshot.partitions[key]?.nativeCoverage).toBe("unsupported");
+    expect(snapshot.partitions[key]?.results).toHaveLength(1);
+  });
+
   test("restart reads persisted last-good data without another collection", async () => {
     const path = await snapshotFile();
     await refreshUsageSnapshot(deps(path, { now: Date.UTC(2026, 0, 1), results: [result(4)] }));
