@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, open, readdir, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { writeFileAtomic } from "../identities/pool/fs.ts";
+import { aisRemoteCacheDir } from "../shared/ais-home.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../shared/reproducible-paths.ts";
 import { configHomeRoot, SYNC_TOOL_CONFIGS } from "./rsync.ts";
 import type { SyncScope } from "./types.ts";
@@ -52,23 +54,95 @@ export async function listHistories(home: string, scope: SyncScope, skip: Readon
   return manifest;
 }
 
-async function hashHandlePrefix(handle: FileHandle, length: number): Promise<string | undefined> {
-  const hash = createHash("sha256");
-  const buffer = Buffer.allocUnsafe(1 << 22);
-  for (let position = 0; position < length;) {
-    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, length - position), position);
+const BLOCK = 1 << 18;
+const WINDOW = 1 << 16;
+const sha = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
+
+async function readAt(handle: FileHandle, position: number, length: number): Promise<Buffer | undefined> {
+  const buffer = Buffer.allocUnsafe(length);
+  for (let got = 0; got < length;) {
+    const { bytesRead } = await handle.read(buffer, got, length - got, position + got);
     if (bytesRead === 0) return undefined;
-    hash.update(buffer.subarray(0, bytesRead));
-    position += bytesRead;
+    got += bytesRead;
   }
-  return hash.digest("hex");
+  return buffer;
 }
 
-/** SHA-256 of the first `length` bytes, or undefined when the file is shorter. Streams; never holds the file. */
-export async function hashPrefix(path: string, length: number): Promise<string | undefined> {
+/** Digests of the leading whole blocks of one file, valid while the file only grows. `window` is the hash of the
+ * last WINDOW bytes the blocks cover; size and mtime are those of the file when the entry was written. */
+interface PrefixEntry { ino: number; size: number; mtimeMs: number; window: string; blocks: string[] }
+
+async function windowOf(handle: FileHandle, covered: number): Promise<string | undefined> {
+  const length = Math.min(covered, WINDOW);
+  const bytes = length === 0 ? Buffer.alloc(0) : await readAt(handle, covered - length, length);
+  return bytes && sha(bytes);
+}
+
+/** Persistent per-path block digests (`prefix-cache.json` beside steady-state.json). A history that only grew
+ * is re-verified by one sampled window and hashed from its last whole block on, so reads follow the appended
+ * bytes, not the file size. Without a home it is a throwaway in-memory cache.
+ * shortcut: an in-place edit before the sampled window of a grown file goes unseen here; the peer's hash of
+ * the same prefix still has to match, upgrade by sampling more windows. */
+export class PrefixCache {
+  private dirty = false;
+  private readonly touched = new Set<string>();
+  constructor(private readonly file?: string, private readonly entries: Record<string, PrefixEntry> = {}) {}
+
+  static async load(home: string): Promise<PrefixCache> {
+    const file = join(aisRemoteCacheDir(home), "prefix-cache.json");
+    try {
+      const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, PrefixEntry>;
+      return new PrefixCache(file, raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {});
+    } catch { return new PrefixCache(file); }
+  }
+
+  async save(): Promise<void> {
+    if (!this.dirty || !this.file) return;
+    for (const path of Object.keys(this.entries)) {
+      if (!this.touched.has(path) && !(await lstat(path).catch(() => undefined))) delete this.entries[path];
+    }
+    await mkdir(dirname(this.file), { recursive: true });
+    await writeFileAtomic(this.file, JSON.stringify(this.entries));
+    this.dirty = false;
+  }
+
+  /** Hash of the first `length` bytes, or undefined when the file is shorter. */
+  async prefix(handle: FileHandle, path: string, length: number): Promise<string | undefined> {
+    const info = await handle.stat();
+    if (length > info.size) return undefined;
+    const need = Math.floor(length / BLOCK);
+    const entry = this.entries[path];
+    let known: string[] = [];
+    if (entry && entry.ino === info.ino && entry.blocks.length * BLOCK <= info.size) {
+      const same = entry.size === info.size && entry.mtimeMs === info.mtimeMs;
+      if (same || (await windowOf(handle, entry.blocks.length * BLOCK)) === entry.window) known = entry.blocks;
+    }
+    let blocks = known.slice(0, need);
+    if (need > known.length) {
+      for (let i = known.length; i < need; i++) {
+        const bytes = await readAt(handle, i * BLOCK, BLOCK);
+        if (!bytes) return undefined;
+        blocks.push(sha(bytes));
+      }
+      const window = await windowOf(handle, need * BLOCK);
+      if (window === undefined) return undefined;
+      this.entries[path] = { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, window, blocks };
+    } else if (entry && known === entry.blocks) {
+      Object.assign(entry, { size: info.size, mtimeMs: info.mtimeMs });
+    }
+    this.dirty = true;
+    this.touched.add(path);
+    const rest = await readAt(handle, need * BLOCK, length - need * BLOCK);
+    if (!rest) return undefined;
+    return sha(Buffer.from(`b1:${length}:${blocks.join("")}:${sha(rest)}`));
+  }
+}
+
+/** Hash of the first `length` bytes, or undefined when the file is shorter. Reads blocks; never holds the file. */
+export async function hashPrefix(path: string, length: number, cache: PrefixCache = new PrefixCache()): Promise<string | undefined> {
   const handle = await open(path, "r").catch(() => undefined);
   if (!handle) return undefined;
-  try { return await hashHandlePrefix(handle, length); } finally { await handle.close(); }
+  try { return await cache.prefix(handle, path, length); } finally { await handle.close(); }
 }
 
 async function copyRange(from: FileHandle, destination: string, start: number, end: number): Promise<void> {
@@ -103,6 +177,7 @@ export async function planTails(
   listing?: HistoryManifest,
 ): Promise<TailPlan> {
   const plan: TailPlan = {};
+  const cache = await PrefixCache.load(home);
   const mine = listing ?? await listHistories(home, scope, skip);
   for (const [rel, theirs] of Object.entries(receiver)) {
     if (!mine[rel]) continue;
@@ -115,7 +190,7 @@ export async function planTails(
       if (info.size === theirs.size && Math.floor(info.mtimeMs / 1000) === Math.floor(theirs.mtimeMs / 1000)) continue;
       // A receiver that is already ahead needs no bytes at all: proving our whole file is its prefix is enough.
       const offset = Math.min(info.size, theirs.size);
-      const prefix = await hashHandlePrefix(handle, offset);
+      const prefix = await cache.prefix(handle, path, offset);
       if (!prefix) continue;
       await beforeTailCopy?.(rel);
       await copyRange(handle, join(outDir, rel), offset, info.size);
@@ -125,6 +200,7 @@ export async function planTails(
       plan[rel] = { offset, size: info.size, mtimeMs: info.mtimeMs, prefix };
     } finally { await handle.close(); }
   }
+  await cache.save();
   if (Object.keys(plan).length > 0) await writeFile(join(outDir, TAIL_PLAN_FILE), JSON.stringify(plan));
   return plan;
 }

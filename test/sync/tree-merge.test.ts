@@ -300,7 +300,8 @@ describe("mergeIncomingProfileTree", () => {
         const result = await mergeIncomingProfileTree(incoming, scope, {
           home, conflictRoot: join(aisRemoteCacheDir(home), "merge-conflicts", `run-${i}-${repeat}`),
         });
-        expect(result.preservedConflictPaths).toEqual([rel]);
+        // Only a copy not archived before is news; an unchanged replay converges to zero.
+        expect(result.preservedConflictPaths).toEqual(repeat === 0 ? [rel] : []);
       }
     }
     const root = join(aisRemoteCacheDir(home), "merge-conflicts");
@@ -492,9 +493,9 @@ describe("post-merge credential purge", () => {
       const files = await readdir(join(conflictRoot, side), { recursive: true }).catch(() => [] as string[]);
       for (const f of files) if (!(await stat(join(conflictRoot, side, f))).isDirectory()) preserved.push(`${side}/${f}`);
     }
-    // No retired-identity codex credential survives under the conflict dir; work's does.
+    // No codex credential is archived at all: the newest copy wins and a stale token is never kept.
     expect(preserved.filter((p) => p.includes("old-team"))).toEqual([]);
-    expect(preserved.filter((p) => p.includes("work") && p.endsWith("auth.json")).length).toBe(1);
+    expect(preserved.filter((p) => p.includes("work") && p.endsWith("auth.json"))).toEqual([]);
     // The retired zai crush.json copy is kept without its api key.
     const crushCopies = preserved.filter((p) => p.includes("old-zai"));
     expect(crushCopies.length).toBe(1);
