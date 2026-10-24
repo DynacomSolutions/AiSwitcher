@@ -1,6 +1,6 @@
 # ais Host shell
 
-The desktop shell lives in this workspace. It uses Rust 1.99.0 and Bun 1.4.4,
+The desktop shell lives in this workspace. It uses Rust 1.99.0 and Bun (version in the root `.bun-version`),
 React 19, Vite 8, Tauri 2.11.5 and tauri-build 2.6.3. Rust is pinned by
 `rust-toolchain.toml`; the tested compiler version is a build pin, not a claim
 about the minimum Rust version supported by every dependency.
