@@ -1,6 +1,11 @@
 # AIS console daemon image: one self-contained `ais` binary plus the built
 # WebUI, serving both on AIS_WEB_PORT via `ais web --serve-internal`.
-FROM oven/bun:1.4.4 AS server
+# Bun version comes from .bun-version via the BUN_VERSION build arg (no default,
+# so a missing arg fails the build). COPY --from cannot take a variable, hence the stage.
+ARG BUN_VERSION
+FROM oven/bun:${BUN_VERSION} AS bun-bin
+
+FROM oven/bun:${BUN_VERSION} AS server
 WORKDIR /build
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
@@ -45,8 +50,8 @@ COPY --from=kubectl /usr/local/bin/kubectl /usr/local/bin/kubectl
 COPY --from=server /out/ais /usr/local/bin/ais
 # bun/bunx: the usage pipeline shells out to `bunx tokscale` to refresh its
 # cache; the compiled ais binary cannot serve as a bunx entrypoint.
-COPY --from=oven/bun:1.4.4 /usr/local/bin/bun /usr/local/bin/bun
-COPY --from=oven/bun:1.4.4 /usr/local/bin/bunx /usr/local/bin/bunx
+COPY --from=bun-bin /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=bun-bin /usr/local/bin/bunx /usr/local/bin/bunx
 COPY --from=web /build/dist /web/dist
 # resolveInstalledAisBinary() probes $HOME/.local/bin/ais first (background
 # sync workers and remote-AIS callers), so give it a real file to find.
