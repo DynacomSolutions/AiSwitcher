@@ -17,6 +17,9 @@ MemoryHigh=8G
 MemoryMax=12G
 MemorySwapMax=512M
 CPUQuota=400%
+# Backstop: blk-throttle caps the disk holding the cache, so a regression cannot starve other services.
+IOReadBandwidthMax=%h 20M
+IOWriteBandwidthMax=%h 20M
 
 [Install]
 WantedBy=default.target
