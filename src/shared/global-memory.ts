@@ -8,6 +8,7 @@ import {
   readFile,
   readlink,
   rename,
+  stat,
   symlink,
   unlink,
   writeFile,
@@ -62,10 +63,18 @@ export async function ensureGlobalMemoryFile(home: string = homedir()): Promise<
     } finally {
       await handle.close();
     }
+    await chmod(path, 0o600);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Existing file: a read-only mount (Codex workspace-write sandbox) must not break reads.
+    if (((await stat(path)).mode & 0o777) !== 0o600) {
+      try {
+        await chmod(path, 0o600);
+      } catch (chmodError) {
+        if (!["EROFS", "EPERM", "EACCES"].includes((chmodError as NodeJS.ErrnoException).code ?? "")) throw chmodError;
+      }
+    }
   }
-  await chmod(path, 0o600);
   return path;
 }
 
