@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readlink, rm, writeFile, mkdir } from "node:fs/promises";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as fsPromises from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readlink, rm, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -120,5 +121,38 @@ describe("AIS global memory", () => {
     expect(config.providers.zai.api_key).toBe("test");
     expect(config.options.debug).toBe(true);
     expect(config.options.global_context_paths).toEqual([projection.memoryPath]);
+  });
+});
+
+describe("ensureGlobalMemoryFile on an existing file", () => {
+  async function existing(mode: number): Promise<{ root: string; path: string }> {
+    const root = await home();
+    const path = await ensureGlobalMemoryFile(root);
+    await chmod(path, mode);
+    return { root, path };
+  }
+
+  test("does not chmod an already-0600 file", async () => {
+    const { root } = await existing(0o600);
+    const spy = spyOn(fsPromises, "chmod");
+    try {
+      await ensureGlobalMemoryFile(root);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("tolerates EROFS from chmod on a loose-mode existing file", async () => {
+    const { root, path } = await existing(0o644);
+    const spy = spyOn(fsPromises, "chmod").mockRejectedValue(
+      Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" }),
+    );
+    try {
+      expect(await ensureGlobalMemoryFile(root)).toBe(path);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
