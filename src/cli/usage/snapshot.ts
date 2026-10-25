@@ -17,6 +17,9 @@ export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 
 export const USAGE_SNAPSHOT_REFRESH_INTERVAL_MS = 2 * 60_000;
 export const USAGE_SNAPSHOT_PARTITION_TTL_MS = 15 * 60_000;
+// A dirty marker re-exports a partition's whole native history (hundreds of MB
+// for busy identities), so live sessions may force at most one refresh per window.
+export const USAGE_SNAPSHOT_DIRTY_MIN_INTERVAL_MS = 10 * 60_000;
 export const USAGE_SNAPSHOT_FILE = join(aisCacheDir(), "usage", "snapshot.json");
 // Two latest generations protect a reader racing a manifest replacement.
 // A 10-minute grace covers ordinary reads; long-lived readers must retry once
@@ -114,6 +117,7 @@ export interface UsageSnapshotDeps {
   now?: () => number;
   partitionTtlMs?: number;
   forcePartitionKeys?: string[];
+  dirtyMinIntervalMs?: number;
   dirtyDirectory?: string;
   collectTargets?: () => Promise<UsageTarget[]>;
   collectPoolTargets?: () => Promise<UsageTarget[]>;
@@ -263,12 +267,6 @@ export function validateNativeBatchEnvelope(value: unknown, partitionId: string)
 
 function promoteNativeBatchFile(candidatePath: string, partitionId: string, nativeRoot = join(aisCacheDir(), "usage", "native")): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
   const ref = validateNativeBatchFile(candidatePath, partitionId);
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(candidatePath);
-  } catch (error) {
-    throw nativeCaptureError("candidate-read", error);
-  }
   const attempt = crypto.randomUUID();
   const batchDir = join(nativeRoot, partitionId);
   try {
@@ -279,7 +277,8 @@ function promoteNativeBatchFile(candidatePath: string, partitionId: string, nati
   const batchName = `${attempt}.json`;
   const promoted = join(batchDir, batchName);
   try {
-    writeFileSync(promoted, bytes, { flag: "wx", mode: 0o600 });
+    // Same filesystem as .staging: a rename avoids rewriting hundreds of MB per capture.
+    renameSync(candidatePath, promoted);
   } catch (error) {
     throw nativeCaptureError("promotion-copy", error);
   }
@@ -671,10 +670,16 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
   const dirtyKeyById = new Map(candidateKeys.map((key) => [usageSnapshotDirtyId(key), key]));
   dirtyKeyById.set(usageSnapshotDirtyId("special:all"), "special:all");
   const forcedKeys = new Set(deps.forcePartitionKeys ?? []);
+  const dirtyMinInterval = deps.dirtyMinIntervalMs ?? USAGE_SNAPSHOT_DIRTY_MIN_INTERVAL_MS;
+  // Throttled markers stay unacknowledged, so the change is picked up once the window passes.
+  const addDirty = (key: string) => {
+    const lastSuccess = partitions[key]?.lastSuccessAt ? Date.parse(partitions[key].lastSuccessAt!) : 0;
+    if (currentMs - lastSuccess >= dirtyMinInterval) forcedKeys.add(key);
+  };
   for (const marker of dirtyMarkers) {
     const key = dirtyKeyById.get(marker.id);
-    if (key === "special:all") for (const candidate of candidateKeys) forcedKeys.add(candidate);
-    else if (key) forcedKeys.add(key);
+    if (key === "special:all") for (const candidate of candidateKeys) addDirty(candidate);
+    else if (key) addDirty(key);
   }
   const dueTargets = targets.filter((target) => {
     const previousPartition = partitions[targetKey(target)];

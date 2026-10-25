@@ -31,6 +31,7 @@ test("renders a bounded generic user unit for the installed AIS command", () => 
   expect(USAGE_COLLECTOR_UNIT).toContain("MemoryMax=12G");
   expect(USAGE_COLLECTOR_UNIT).toContain("MemorySwapMax=512M");
   expect(USAGE_COLLECTOR_UNIT).toContain("CPUQuota=400%");
+  expect(USAGE_COLLECTOR_UNIT).toContain("IOWriteBandwidthMax=%h 20M");
   expect(USAGE_COLLECTOR_UNIT).not.toContain("systemctl");
   expect(USAGE_COLLECTOR_UNIT).not.toContain("/home/");
 });

@@ -9,6 +9,7 @@ import {
   recordUsageSnapshotRefreshFailure,
   readUsageSnapshotEnvelope,
   refreshUsageSnapshot,
+  USAGE_SNAPSHOT_DIRTY_MIN_INTERVAL_MS,
   validateNativeBatchEnvelope,
   type UsageSnapshotDeps,
 } from "../../../src/cli/usage/snapshot.ts";
@@ -408,8 +409,12 @@ describe("shared usage snapshot", () => {
     expect(calls).toBe(0);
     markUsageSnapshotDirty(usageSnapshotTargetKey("claude", "work"), join(dirname(path), "dirty"));
     await refreshUsageSnapshot(appended);
+    // Inside the dirty window the full re-export is deferred; the marker survives for later.
+    expect(calls).toBe(0);
+    const later = now + USAGE_SNAPSHOT_DIRTY_MIN_INTERVAL_MS;
+    await refreshUsageSnapshot({ ...appended, now: () => later });
     expect(calls).toBe(1);
-    expect(readUsageSnapshotEnvelope("claude", "work", path, now + 2)?.results).toHaveLength(1);
+    expect(readUsageSnapshotEnvelope("claude", "work", path, later + 1)?.results).toHaveLength(1);
   });
 
   test("failed scans preserve last-good results and persist only a safe error category", async () => {
@@ -417,16 +422,17 @@ describe("shared usage snapshot", () => {
     const now = Date.UTC(2026, 0, 1);
     await refreshUsageSnapshot(deps(path, { now, results: [result(7)] }));
     markUsageSnapshotDirty(usageSnapshotTargetKey("claude", "work"), join(dirname(path), "dirty"));
-    await refreshUsageSnapshot(deps(path, { now: now + 1, results: [], fail: true }));
+    const failedAt = now + 1;
+    await refreshUsageSnapshot({ ...deps(path, { now: failedAt, results: [], fail: true }), dirtyMinIntervalMs: 0 });
 
-    const envelope = readUsageSnapshotEnvelope(undefined, undefined, path, now + 2);
+    const envelope = readUsageSnapshotEnvelope(undefined, undefined, path, failedAt + 1);
     const persisted = JSON.parse(await readFile(path, "utf8")) as { aggregateGeneratedAt: string; generatedAt: string };
     expect(envelope?.results).toHaveLength(1);
     expect(envelope?.lastError).toBe("source-error");
     expect(envelope?.stale).toBe(true);
     expect(envelope?.generatedAt).toBe(new Date(now).toISOString());
     expect(persisted.aggregateGeneratedAt).toBe(new Date(now).toISOString());
-    expect(persisted.generatedAt).toBe(new Date(now + 1).toISOString());
+    expect(persisted.generatedAt).toBe(new Date(failedAt).toISOString());
     expect(await readFile(path, "utf8")).not.toContain("secret-like-provider-error");
   });
 
