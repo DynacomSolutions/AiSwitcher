@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import type { Identity } from "../../identities/types.ts";
 import { canonicalUsageProvider } from "../usage/providers.ts";
@@ -8,9 +9,14 @@ import type { LimitCategory, LimitWindow, ToolLimitResult } from "./types.ts";
 /** OpenCode keeps one credential per upstream provider in
  * `<configDir>/data/opencode/auth.json` (its XDG data root, redirected into
  * the identity's own `data/` subdirectory by OPENCODE_CONFIG's
- * extraEnvVarNames). Entries are static API credentials — the same key an
- * upstream-owning AIS tool would hold when the credential was provisioned
- * through it. */
+ * extraEnvVarNames). OpenCode v2 migrates those legacy credentials once,
+ * then writes new/updated credentials ONLY to
+ * `<configDir>/data/opencode/opencode.db` table `credential`; auth.json is
+ * never updated again, so its entries can be stale (the live 2026-10-25 401:
+ * a fresh Console login landed in the db while auth.json kept the dead
+ * `opencode-go` key). This adapter reads both: v2 db rows win per provider,
+ * auth.json remains the fallback for v1 or when the db/table/usable row is
+ * absent. */
 export interface OpencodeAuthEntry {
   type?: string;
   key?: string;
@@ -34,6 +40,89 @@ async function readOpencodeAuth(configDir: string): Promise<OpencodeAuthFile | u
     return parsed as OpencodeAuthFile;
   } catch {
     return undefined;
+  }
+}
+
+/** Live v2 schema: `credential(id, integration_id, label, value,
+ * connector_id, method_id, active, time_created, time_updated)`. Only the
+ * four columns this adapter needs are read; `value` is credential JSON and
+ * is parsed but never logged. */
+interface OpencodeV2CredentialRow {
+  integration_id?: unknown;
+  value?: unknown;
+  active?: unknown;
+  time_updated?: unknown;
+}
+
+/** One usable v2 credential: the object form's static `key`, or an OAuth
+ * grant's `access` token (OpenCode's Go gateway accepts the access token as
+ * the Authorization credential for the quota request). Anything else is
+ * unusable. */
+function parseOpencodeV2CredentialValue(value: unknown): OpencodeAuthEntry | undefined {
+  if (typeof value !== "string") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const record = parsed as Record<string, unknown>;
+  const key =
+    typeof record.key === "string" && record.key.length > 0
+      ? record.key
+      : typeof record.access === "string" && record.access.length > 0
+        ? record.access
+        : undefined;
+  if (!key) return undefined;
+  return { type: typeof record.type === "string" ? record.type : undefined, key };
+}
+
+/** The v2 db renamed the Go plan's integration to `opencode`; AIS keeps
+ * the `opencode-go` provider id, mapped HERE only: canonicalUsageProvider
+ * intentionally leaves `opencode` as the multi-provider wrapper label for
+ * usage attribution elsewhere. */
+function opencodeV2CredentialProvider(integrationId: string): string {
+  return integrationId === "opencode" ? "opencode-go" : canonicalUsageProvider(integrationId);
+}
+
+/** Usable OpenCode v2 credentials from the identity's opencode.db, one per
+ * fetchable provider (the newest row wins when several collapse to the same
+ * provider). Active semantics: explicit `active = 0` rows are excluded;
+ * `active = 1` and null-active imported/legacy rows are both usable. Returns
+ * undefined when the db or table is absent/unreadable (v1 installs), and []
+ * when the db WAS read but held no usable row; auth.json stays the fallback
+ * in both cases, but only the undefined case means the v2 store itself was
+ * not readable. */
+async function readOpencodeV2Credentials(
+  configDir: string,
+): Promise<Array<{ provider: string; entry: OpencodeAuthEntry }> | undefined> {
+  let db: Database;
+  try {
+    db = new Database(join(configDir, "data", "opencode", "opencode.db"), { readonly: true });
+  } catch {
+    return undefined;
+  }
+  try {
+    const rows = db.query("SELECT integration_id, value, active, time_updated FROM credential").all() as OpencodeV2CredentialRow[];
+    const newestByProvider = new Map<string, { entry: OpencodeAuthEntry; timeUpdated: number }>();
+    for (const row of rows) {
+      if (row.active === 0) continue;
+      if (typeof row.integration_id !== "string" || row.integration_id.length === 0) continue;
+      const provider = opencodeV2CredentialProvider(row.integration_id);
+      if (NATIVE_COVERED_OPENCODE_PROVIDERS.has(provider)) continue;
+      if (provider !== "zai" && provider !== "opencode-go") continue;
+      const entry = parseOpencodeV2CredentialValue(row.value);
+      if (!entry) continue;
+      const timeUpdated = typeof row.time_updated === "number" && Number.isFinite(row.time_updated) ? row.time_updated : 0;
+      const existing = newestByProvider.get(provider);
+      if (!existing || timeUpdated >= existing.timeUpdated) newestByProvider.set(provider, { entry, timeUpdated });
+    }
+    return [...newestByProvider.entries()].map(([provider, { entry }]) => ({ provider, entry }));
+  } catch {
+    return undefined;
+  } finally {
+    db.close();
   }
 }
 
@@ -119,7 +208,9 @@ export interface OpencodeGoQuotaOutcome {
   error?: string;
 }
 
-/** The live Go-plan quota read for ONE OpenCode Go API key. The user hit
+/** The live Go-plan quota read for ONE OpenCode Go credential: a legacy
+ * auth.json API key, or the OAuth access token from a v2 opencode.db
+ * credential row. The user hit
  * their weekly limit with no way to see it (2026-09-03) — this endpoint is
  * the answer, found by probing the Go gateway directly. */
 export async function fetchOpencodeGoQuotaForKey(apiKey: string): Promise<OpencodeGoQuotaOutcome> {
@@ -133,7 +224,7 @@ export async function fetchOpencodeGoQuotaForKey(apiKey: string): Promise<Openco
   }
 
   if (response.status === 401 || response.status === 403) {
-    return { error: `authentication rejected (HTTP ${response.status}) — check this identity's OpenCode Go API key` };
+    return { error: `authentication rejected (HTTP ${response.status}) - check this identity's OpenCode Go credential` };
   }
   if (!response.ok) {
     return { error: `quota fetch failed (HTTP ${response.status})` };
@@ -154,35 +245,66 @@ export async function fetchOpencodeGoQuotaForKey(apiKey: string): Promise<Openco
 }
 
 /** Canonical provider ids `fetchOpencodeLimits` will answer for, from a cheap
- * local auth.json read (no network) — what the live render seeds pending rows
- * from. Same list as the fetch: `fetchableOpencodeProviders`. */
+ * local credential read (no network); what the live render seeds pending
+ * rows from. Same list as the fetch: legacy auth.json entries plus any
+ * usable v2 opencode.db credentials. */
 export async function pendingOpencodeProviders(identity: Identity): Promise<string[]> {
+  return (await fetchableOpencodeCredentials(identity)).credentials.map((f) => f.provider);
+}
+
+/** The merged per-provider credential view for one identity: fetchable
+ * legacy auth.json entries first, then usable v2 opencode.db credentials,
+ * which OVERRIDE the legacy entry for the same provider (v2 writes never
+ * touch auth.json, so a legacy `opencode-go` key can be stale while the db
+ * holds the fresh grant). `storeReadable` reports whether AT LEAST ONE store
+ * could be read, so the caller can distinguish "nothing readable" from
+ * "read fine, nothing fetchable". */
+async function fetchableOpencodeCredentials(
+  identity: Identity,
+): Promise<{ credentials: Array<{ provider: string; entry: OpencodeAuthEntry }>; storeReadable: boolean }> {
   const auth = await readOpencodeAuth(identity.configDir);
-  return auth ? fetchableOpencodeProviders(auth).map((f) => f.provider) : [];
+  const v2 = await readOpencodeV2Credentials(identity.configDir);
+  const merged = new Map<string, OpencodeAuthEntry>();
+  if (auth) {
+    for (const { provider, entry } of fetchableOpencodeProviders(auth)) merged.set(provider, entry);
+  }
+  for (const { provider, entry } of v2 ?? []) {
+    merged.set(provider, entry);
+  }
+  return {
+    credentials: [...merged.entries()].map(([provider, entry]) => ({ provider, entry })),
+    storeReadable: auth !== undefined || v2 !== undefined,
+  };
 }
 
 /**
  * Limits for one OpenCode identity, one result per upstream provider
  * OpenCode holds a fetchable credential for (the Z.ai coding plan — the
  * same quota endpoint the zai tool's fetcher uses — and OpenCode Go, whose
- * own gateway reports the plan's dollar-window usage). Everything else is
+ * own gateway reports the plan's dollar-window usage). Credentials come from
+ * both OpenCode stores: the v2 opencode.db `credential` table wins per
+ * provider, legacy auth.json is the fallback (v2 never writes back to it, so
+ * its keys can be stale). Everything else is
  * skipped: native-covered plans (alibaba) get their branch from the tool
  * that can actually answer, and unknown provider ids are ignored rather
- * than guessed at. With no readable auth.json or no fetchable entries the
- * identity contributes nothing to an unscoped report; an explicit
+ * than guessed at. With no readable credential store or no fetchable entries
+ * the identity contributes nothing to an unscoped report; an explicit
  * `ais limits --tool=opencode` gets one honest "unavailable" row instead of
  * silence (same explicit-question rule as the usage pipeline).
  */
 export async function fetchOpencodeLimits(identity: Identity, explicitTool = false): Promise<ToolLimitResult[]> {
-  const auth = await readOpencodeAuth(identity.configDir);
-  if (!auth) {
-    return explicitTool
-      ? [unavailable(identity, "no readable OpenCode auth.json — nothing to fetch limits from")]
-      : [];
+  const { credentials, storeReadable } = await fetchableOpencodeCredentials(identity);
+  if (credentials.length === 0) {
+    if (!explicitTool) return [];
+    return [
+      storeReadable
+        ? unavailable(identity, "no fetchable OpenCode providers configured (native tools cover the rest)")
+        : unavailable(identity, "no readable OpenCode auth.json or credential db - nothing to fetch limits from"),
+    ];
   }
 
   const results: ToolLimitResult[] = [];
-  for (const { provider, entry } of fetchableOpencodeProviders(auth)) {
+  for (const { provider, entry } of credentials) {
     const outcome = provider === "opencode-go" ? await fetchOpencodeGoQuotaForKey(entry.key!) : await fetchZaiQuotaForKey(entry.key!);
     results.push(
       outcome.error || !outcome.windows
@@ -198,8 +320,5 @@ export async function fetchOpencodeLimits(identity: Identity, explicitTool = fal
     );
   }
 
-  if (results.length === 0 && explicitTool) {
-    return [unavailable(identity, "no fetchable OpenCode providers configured (native tools cover the rest)")];
-  }
   return results;
 }
