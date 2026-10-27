@@ -1,11 +1,9 @@
-import { isRetired } from "../retired.ts";
 import { loadIdentitiesFile } from "../store.ts";
 import type { PoolAdapter } from "./adapter.ts";
+import { healPool } from "./heal.ts";
 import { swapIfLimited, type LimitedOutcome, type PoolOpsDeps } from "./ops.ts";
-import { withPoolLock } from "./lock.ts";
 import { allAdapters } from "./registry.ts";
-import { poolsOf, requirePool, type PoolIdentity } from "./swap-pool.ts";
-import type { Identity } from "../types.ts";
+import { poolsOf, type PoolIdentity } from "./swap-pool.ts";
 
 /**
  * Daemon loop: for every swap pool with `auto` on, in the registry of every
@@ -74,20 +72,12 @@ export class PoolSwapScheduler {
 
   /** Heal pass for every adapter that has one: a running session can rewrite
    * the pool credentials after a swap (even a live-swap tool refreshes the
-   * account it had in flight), so repair them every tick, under the pool lock. */
+   * account it had in flight), so repair them every tick. The shared helper
+   * (pool/heal.ts) holds the pool lock and reloads the registry under it. */
   private async healPool(adapter: PoolAdapter<any>, pool: PoolIdentity): Promise<void> {
     if (!adapter.heal) return;
     try {
-      const lock = { timeoutMs: 1_500 };
-      const notes = await withPoolLock(pool.configDir, async () => {
-        // Reload under the lock: a swap that landed while we waited must not be undone.
-        const file = await this.fileOf(adapter);
-        const fresh = requirePool(file, pool.name, adapter.tool);
-        const members = fresh.swapPool.accounts
-          .map((name) => file.identities.find((i) => i.name === name))
-          .filter((i): i is Identity => i !== undefined && !isRetired(i));
-        return adapter.heal!(fresh, members, lock);
-      }, lock);
+      const notes = await healPool(adapter, pool, { registryPath: this.deps.perTool?.[adapter.tool]?.registryPath });
       for (const note of notes) this.log(adapter.tool, note);
     } catch (err) {
       this.log(adapter.tool, `pool ${pool.name}: heal failed: ${err instanceof Error ? err.message : String(err)}`);

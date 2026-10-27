@@ -1,5 +1,6 @@
 import type { Identity } from "../types.ts";
 import type { PoolAdapter, PoolUsage } from "./adapter.ts";
+import { healPool } from "./heal.ts";
 import { swapIfLimited, type PoolOpsDeps } from "./ops.ts";
 import { performPoolSwap } from "./swap.ts";
 import { allowedAccounts, isSwapPool, poolThreshold } from "./swap-pool.ts";
@@ -18,11 +19,15 @@ export const LAUNCH_SETTLE_MS = 30_000;
 
 /**
  * Pre-launch check run by a tool shim for a swap POOL identity (and only
- * for one). Bootstraps a pool that has no credentials yet, and, when auto
- * swap is on, swaps away from an active member that is over the threshold
- * (reason "launch"). Bounded by a short timeout and never throws: on any
- * error or timeout the launch simply continues with whatever is in place.
- * Returns a one-line note to print on stderr when something happened.
+ * for one). First heals the pool folder (the shared pool/heal.ts mechanic:
+ * a running session can have rewritten the pool credentials, or they may
+ * hold another member's grant, which would otherwise launch into a login
+ * prompt), then bootstraps a pool that has no credentials yet, and, when
+ * auto swap is on, swaps away from an active member that is over the
+ * threshold (reason "launch"). Bounded by a short timeout and never throws:
+ * on any error or timeout the launch simply continues with whatever is in
+ * place. Returns a one-line note to print on stderr when something happened;
+ * heal notes surface through the same line when no swap note replaces them.
  */
 export async function poolLaunchCheck<U extends PoolUsage>(
   realAdapter: PoolAdapter<U>,
@@ -41,9 +46,20 @@ export async function poolLaunchCheck<U extends PoolUsage>(
   };
   const label = `${adapter.tool}-swap`;
   const work = (async (): Promise<string | undefined> => {
+    let healNotes: string[] = [];
+    if (adapter.heal) {
+      try {
+        healNotes = await healPool(adapter, pool, {
+          ...(deps.registryPath ? { registryPath: deps.registryPath } : {}),
+        });
+      } catch (err) {
+        healNotes = [`pool ${pool.name}: heal failed: ${err instanceof Error ? err.message : String(err)}`];
+      }
+    }
+    const healNote = healNotes.length > 0 ? `${label}: ${healNotes.join("; ")}` : undefined;
     if (!pool.swapPool.active || !adapter.hasCredentials(pool.configDir)) {
       const first = allowedAccounts(pool)[0];
-      if (!first) return undefined;
+      if (!first) return healNote;
       const r = await performPoolSwap(adapter, {
         ...(deps.registryPath ? { registryPath: deps.registryPath } : {}),
         ...(deps.ledgerPath ? { ledgerPath: deps.ledgerPath } : {}),
@@ -55,9 +71,9 @@ export async function poolLaunchCheck<U extends PoolUsage>(
       const { to: target } = r;
       return `${label}: ${pool.name} activated ${target}`;
     }
-    if (pool.swapPool.auto !== true) return undefined;
+    if (pool.swapPool.auto !== true) return healNote;
     const outcome = await swapIfLimited(adapter, deps, pool.name, "launch");
-    if (outcome.action !== "swapped") return undefined;
+    if (outcome.action !== "swapped") return healNote;
     const { from: previous, to: target } = outcome.result;
     return `${label}: ${pool.name} was at/over ${poolThreshold(pool)}%, switched ${previous} -> ${target}`;
   })();

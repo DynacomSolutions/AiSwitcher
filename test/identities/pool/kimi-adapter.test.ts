@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { parse as parseToml } from "smol-toml";
 import { readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +8,8 @@ import { persistKimiCredentials } from "../../../src/cli/limits/kimi-store.ts";
 import { refreshIdentityOAuthGrant } from "../../../src/identities/oauth-refresh.ts";
 import { grantFileTuning, withToolLock, type GrantFileSpec } from "../../../src/identities/pool/grant-file-adapter.ts";
 import { kimiAdapter } from "../../../src/identities/pool/kimi-adapter.ts";
+import { seedKimiPoolModelConfig } from "../../../src/identities/kimi-pool-config.ts";
+import { poolLaunchCheck } from "../../../src/identities/pool/launch.ts";
 import { readSwapEvents } from "../../../src/identities/pool/ledger.ts";
 import { adapterFor } from "../../../src/identities/pool/registry.ts";
 import { PoolSwapScheduler } from "../../../src/identities/pool/scheduler.ts";
@@ -375,6 +378,17 @@ describe("kimi heal", () => {
     expect(await read("pool")).toBe(await read("a"));
     expect(logs.join("\n")).toContain("kimi-swap: pool pool credentials were empty or partial");
   });
+
+  test("poolLaunchCheck restores a non-empty wrong-member pool grant to the recorded active member, auto off", async () => {
+    await setup();
+    await put("pool", creds("user-b", T0 + 50, { tag: "b-at-launch" }));
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    const note = await poolLaunchCheck(kimiAdapter, pool, { registryPath: registry, ledgerPath: ledger });
+    expect(await read("pool")).toBe(await read("a"));
+    expect(note).toContain('restored "a" into pool');
+    // The wrong member's newer grant was captured into its vault, not destroyed.
+    expect(await refreshToken("b")).toBe("SYNTHETIC_FIXTURE-rt-b-at-launch");
+  });
 });
 
 describe("kimi pool refresh integration", () => {
@@ -415,5 +429,229 @@ describe("kimi pool refresh integration", () => {
     const baks = bakFiles(dir, "kimi-code.json", "heal").filter((f) => /\.\d{8}T\d{9}Z-[0-9a-f]{4}\.bak$/.test(f));
     expect(baks.length).toBe(10);
     expect((await Promise.all(baks.map((f) => readFile(f, "utf8")))).some((t) => t.includes("SYNTHETIC_FIXTURE-rt-stepback"))).toBe(true);
+  });
+});
+
+describe("kimi pool model config seeding", () => {
+  const configPath = (name: string) => join(dirOf(name), "config.toml");
+  const putConfig = async (name: string, text: string) => writeFile(configPath(name), text);
+  const readConfig = (name: string) => readFile(configPath(name), "utf8");
+  const parseConfig = async (name: string) => parseToml(await readConfig(name)) as Record<string, unknown>;
+  const seedPool = async (identity: Identity) =>
+    seedKimiPoolModelConfig(identity.configDir, { identity, configDirValue: identity.configDir, source: "flag" }, { registryPath: registry });
+  const occurrences = (text: string, section: string) => text.split(section).length - 1;
+
+  /** Member config with a default, a secondary table, two models and their providers. */
+  const memberConfigText = `# member a config
+default_model = "kimi-code/synthetic-model-a"
+
+[secondary_model]
+default_model = "kimi-code/synthetic-model-b"
+fast = "kimi-code/synthetic-model-b"
+
+[models."kimi-code/synthetic-model-a"]
+provider = "managed:kimi-code"
+model = "synthetic-model-a"
+max_context_size = 262144
+display_name = "Synthetic Model A"
+
+[models."kimi-code/synthetic-model-b"]
+provider = "provider-b"
+model = "synthetic-model-b"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://kimi-provider.example.test"
+api_key = ""
+
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code.json"
+
+[providers."provider-b"]
+type = "synthetic"
+base_url = "https://provider-b.example.test"
+api_key = ""
+`;
+
+  test("a missing pool default_model is seeded once from the current active member, preserving the file", async () => {
+    await setup();
+    await putConfig("a", "# member a config\ndefault_model = \"kimi-code/synthetic-model-a\"\n");
+    await putConfig("pool", "# pool config\n[ui]\ntheme = \"dark\"\n");
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    await seedPool(pool);
+    const text = await readConfig("pool");
+    expect(text.startsWith("default_model = \"kimi-code/synthetic-model-a\"\n\n# pool config")).toBe(true);
+    const parsed = await parseConfig("pool");
+    expect(parsed.default_model).toBe("kimi-code/synthetic-model-a");
+    expect((parsed.ui as Record<string, unknown>).theme).toBe("dark");
+    expect((await stat(configPath("pool"))).mode & 0o777).toBe(0o600);
+  });
+
+  test("missing default, secondary, models and providers are appended as valid TOML, exactly once", async () => {
+    await setup();
+    await putConfig("a", memberConfigText);
+    await putConfig("pool", "# pool config\n");
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    await seedPool(pool);
+    const text = await readConfig("pool");
+    expect(text.startsWith("default_model = \"kimi-code/synthetic-model-a\"\n\n# pool config\n")).toBe(true);
+    for (const section of ["[secondary_model]", "[models.\"kimi-code/synthetic-model-a\"]", "[models.\"kimi-code/synthetic-model-b\"]", "[providers.\"managed:kimi-code\"]", "[providers.provider-b]"]) {
+      expect(occurrences(text, section)).toBe(1);
+    }
+    const parsed = await parseConfig("pool");
+    expect(parsed.default_model).toBe("kimi-code/synthetic-model-a");
+    expect(parsed.secondary_model).toMatchObject({ default_model: "kimi-code/synthetic-model-b", fast: "kimi-code/synthetic-model-b" });
+    const models = parsed.models as Record<string, Record<string, unknown>>;
+    expect(models["kimi-code/synthetic-model-a"]).toMatchObject({ provider: "managed:kimi-code", model: "synthetic-model-a", max_context_size: 262144, display_name: "Synthetic Model A" });
+    expect(models["kimi-code/synthetic-model-b"]).toMatchObject({ provider: "provider-b", model: "synthetic-model-b" });
+    const providers = parsed.providers as Record<string, Record<string, unknown>>;
+    expect(providers["managed:kimi-code"]).toMatchObject({ type: "kimi", base_url: "https://kimi-provider.example.test", api_key: "", oauth: { storage: "file", key: "oauth/kimi-code.json" } });
+    expect(providers["provider-b"]).toMatchObject({ type: "synthetic", base_url: "https://provider-b.example.test" });
+    // A second run changes nothing (no duplicated sections, no rewrite).
+    await seedPool(pool);
+    expect(await readConfig("pool")).toBe(text);
+  });
+
+  test("existing pool root keys, secondary, model and provider entries always win; unrelated providers stay behind", async () => {
+    await setup();
+    await putConfig("a", `${memberConfigText}
+[providers."unrelated"]
+type = "synthetic"
+base_url = "https://unrelated.example.test"
+`);
+    await putConfig("pool", `# pool config
+default_model = "pool-choice"
+
+[secondary_model]
+default_model = "pool-secondary"
+
+[models."kimi-code/synthetic-model-a"]
+provider = "managed:kimi-code"
+model = "pool-override"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://pool.example.test"
+api_key = ""
+`);
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    await seedPool(pool);
+    const text = await readConfig("pool");
+    expect(text.startsWith("# pool config\ndefault_model = \"pool-choice\"")).toBe(true);
+    expect(text).not.toContain("unrelated");
+    const parsed = await parseConfig("pool");
+    expect(parsed.default_model).toBe("pool-choice");
+    expect(parsed.secondary_model).toEqual({ default_model: "pool-secondary" });
+    const models = parsed.models as Record<string, Record<string, unknown>>;
+    expect(models["kimi-code/synthetic-model-a"].model).toBe("pool-override");
+    expect(models["kimi-code/synthetic-model-b"]).toMatchObject({ provider: "provider-b", model: "synthetic-model-b" });
+    const providers = parsed.providers as Record<string, Record<string, unknown>>;
+    expect(providers["managed:kimi-code"].base_url).toBe("https://pool.example.test");
+    expect(providers["provider-b"]).toBeDefined();
+    expect(providers.unrelated).toBeUndefined();
+  });
+
+  test("credential-shaped fields never reach the pool; an empty api_key and OAuth metadata survive", async () => {
+    await setup();
+    await putConfig("a", `default_model = "kimi-code/synthetic-model-a"
+
+[models."kimi-code/synthetic-model-a"]
+provider = "managed:kimi-code"
+model = "synthetic-model-a"
+display_name = "Synthetic Model A"
+api_key = "SYNTHETIC_FIXTURE-model-api-key"
+api-key = "SYNTHETIC_FIXTURE-model-api-key-dashed"
+access_token = "SYNTHETIC_FIXTURE-model-access-token"
+
+[models."kimi-code/synthetic-model-a".overrides]
+authorization = "SYNTHETIC_FIXTURE-model-authorization"
+client_secret = "SYNTHETIC_FIXTURE-model-client-secret"
+safe_option = "keep-me"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://kimi-provider.example.test"
+api_key = "SYNTHETIC_FIXTURE-provider-api-key"
+refresh_token = "SYNTHETIC_FIXTURE-provider-refresh-token"
+
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code.json"
+
+[providers."provider-empty"]
+type = "synthetic"
+base_url = "https://provider-empty.example.test"
+api_key = ""
+
+[models."kimi-code/synthetic-model-b"]
+provider = "provider-empty"
+model = "synthetic-model-b"
+`);
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    await seedPool(pool);
+    const text = await readConfig("pool");
+    expect(text).not.toContain("SYNTHETIC_FIXTURE");
+    const parsed = await parseConfig("pool");
+    const models = parsed.models as Record<string, Record<string, unknown>>;
+    const modelA = models["kimi-code/synthetic-model-a"];
+    expect(modelA.display_name).toBe("Synthetic Model A");
+    expect(modelA.api_key).toBeUndefined();
+    expect(modelA["api-key"]).toBeUndefined();
+    expect(modelA.access_token).toBeUndefined();
+    expect(modelA.overrides).toEqual({ safe_option: "keep-me" });
+    const providers = parsed.providers as Record<string, Record<string, unknown>>;
+    const managed = providers["managed:kimi-code"];
+    expect(managed.type).toBe("kimi");
+    expect(managed.base_url).toBe("https://kimi-provider.example.test");
+    expect(managed.api_key).toBeUndefined(); // a non-empty api_key is stripped, never copied
+    expect(managed.refresh_token).toBeUndefined();
+    expect(managed.oauth).toEqual({ storage: "file", key: "oauth/kimi-code.json" });
+    expect(providers["provider-empty"].api_key).toBe(""); // an empty api_key is safe metadata
+  });
+
+  test("an existing pool default_model is never overwritten", async () => {
+    await setup();
+    await putConfig("a", "default_model = \"kimi-code/synthetic-model-a\"\n");
+    await putConfig("pool", "default_model = \"pool-choice\"\n");
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    await seedPool(pool);
+    expect(await readConfig("pool")).toBe("default_model = \"pool-choice\"\n");
+  });
+
+  test("ordinary identities are untouched", async () => {
+    await setup();
+    await putConfig("pool", "# pool config\n");
+    await seedPool(member("a"));
+    await expect(stat(configPath("a"))).rejects.toThrow();
+    expect(await readConfig("pool")).toBe("# pool config\n");
+  });
+
+  test("no usable default on the active member means no invented value and no file", async () => {
+    await setup();
+    await putConfig("a", "# member a config, no default_model\n[models.\"kimi-code/synthetic-model-a\"]\nmodel = \"synthetic-model-a\"\n");
+    await putConfig("b", "default_model = \"kimi-code/synthetic-model-b\"\n");
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    await seedPool(pool);
+    await expect(stat(configPath("pool"))).rejects.toThrow();
+  });
+
+  test("the registry is re-read fresh: a swap after resolution seeds the new active member's default", async () => {
+    await setup();
+    await putConfig("b", "default_model = \"kimi-code/synthetic-model-b\"\n");
+    const stalePool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    expect(stalePool.swapPool.active).toBe("a");
+    await swap("b"); // the pre-launch pool check may swap after resolution
+    await seedPool(stalePool);
+    expect((await parseConfig("pool")).default_model).toBe("kimi-code/synthetic-model-b");
+  });
+
+  test("an unparsable pool config is left alone", async () => {
+    await setup();
+    await putConfig("a", "default_model = \"kimi-code/synthetic-model-a\"\n");
+    await putConfig("pool", "default_model = [broken\n");
+    const pool = requirePool(await loadIdentitiesFile(registry), "pool", "kimi");
+    await seedPool(pool);
+    expect(await readConfig("pool")).toBe("default_model = [broken\n");
   });
 });

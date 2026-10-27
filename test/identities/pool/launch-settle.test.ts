@@ -77,4 +77,31 @@ describe("poolLaunchCheck vs process replacement", () => {
     expect(existsSync(before)).toBe(true);
     expect(existsSync(after)).toBe(true);
   });
+
+  test("heal runs before the usage/auto decision; a swap note replaces the heal notes", async () => {
+    const { adapter, pool, ledgerPath, registryPath } = await setup(0, 0);
+    const order: string[] = [];
+    adapter.heal = async () => {
+      order.push("heal");
+      return ["pool pool credentials were repaired"];
+    };
+    const fetch = adapter.fetchUsage;
+    adapter.fetchUsage = async (m) => {
+      order.push("usage");
+      return fetch(m);
+    };
+    const note = await poolLaunchCheck(adapter, pool, { ledgerPath, registryPath });
+    expect(order[0]).toBe("heal");
+    expect(order).toContain("usage");
+    expect(note).toContain("switched a -> b");
+    expect(note).not.toContain("repaired");
+  });
+
+  test("heal notes surface as the launch note when nothing swaps", async () => {
+    const { adapter, pool, ledgerPath, registryPath } = await setup(0, 0);
+    adapter.heal = async () => ["pool pool credentials were empty or partial", 'restored "a" into pool'];
+    adapter.fetchUsage = async () => live(10);
+    const note = await poolLaunchCheck(adapter, pool, { ledgerPath, registryPath });
+    expect(note).toBe('claude-swap: pool pool credentials were empty or partial; restored "a" into pool');
+  });
 });
