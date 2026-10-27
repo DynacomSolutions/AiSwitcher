@@ -11,7 +11,6 @@ import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResul
 import { usageResultsForJson } from "./run.ts";
 import { buildAisTokscaleExportInvocation, runAisTokscaleExportInvocation } from "./tokscale.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
-import { grokDuplicateBaselineIsSafe } from "./grok-history-regression.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 
@@ -551,33 +550,6 @@ function hasCollectorError(results: UsageResult[]): boolean {
   return results.some((result) => result.error !== undefined || result.sourceOnlyError === true || !isValidUsageResult(result));
 }
 
-function reportCountTotals(results: UsageResult[]): { tokens?: number; messages?: number } {
-  const reports = results.map((result) => result.report);
-  if (reports.some((report) => report === undefined)) return {};
-  const concrete = reports as NonNullable<UsageResult["report"]>[];
-  const tokenParts = concrete.flatMap((report) => [report.totalInput, report.totalOutput, report.totalCacheRead, report.totalCacheWrite]);
-  const tokens = tokenParts.every((value) => Number.isFinite(value) && value >= 0)
-    ? tokenParts.reduce((total, value) => total + value, 0)
-    : undefined;
-  const messages = concrete.every((report) => Number.isFinite(report.totalMessages) && report.totalMessages >= 0)
-    ? concrete.reduce((total, report) => total + report.totalMessages, 0)
-    : undefined;
-  return { ...(tokens === undefined ? {} : { tokens }), ...(messages === undefined ? {} : { messages }) };
-}
-
-function isSuspectedHistoryRegression(previous: UsageResult[], incoming: UsageResult[]): boolean {
-  // This catches count shrinkage and disappearing count coverage. It cannot
-  // detect every source/parser semantic error. An empty successful scan is a
-  // real zero, not missing count metadata.
-  if (previous.length > 0 && incoming.length === 0) return true;
-  const before = reportCountTotals(previous);
-  const after = reportCountTotals(incoming);
-  if (before.tokens !== undefined && before.tokens > 0 && after.tokens === undefined) return true;
-  if (before.messages !== undefined && before.messages > 0 && after.messages === undefined) return true;
-  return (before.tokens !== undefined && after.tokens !== undefined && after.tokens < before.tokens) ||
-    (before.messages !== undefined && after.messages !== undefined && after.messages < before.messages);
-}
-
 function isValidUsageResult(value: UsageResult): boolean {
   if (!value || typeof value !== "object" || typeof value.provider !== "string" || !value.identity || typeof value.identity.name !== "string") return false;
   if (value.report === undefined) return true;
@@ -730,37 +702,6 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
         lastAttemptAt: attemptedAt,
         ...(prior?.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
         lastError: errorCategory(results),
-        lastErrorAt: attemptedAt,
-      };
-      writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
-      return;
-    }
-    const suspectedRegression = prior?.lastSuccessAt && isSuspectedHistoryRegression(prior.results, results);
-    const acceptedGrokDuplicateCorrection = suspectedRegression && tool === "grok" && prior.nativeBatch && nativeCandidate
-      ? grokDuplicateBaselineIsSafe({
-        priorRef: prior.nativeBatch,
-        candidatePath: nativeCandidate.path,
-        expectedPartitionId: nativePartitionId(key),
-        nativeBatchRoot: deps.nativeBatchRoot ?? join(aisCacheDir(), "usage", "native"),
-        previous: prior.results,
-        incoming: results,
-      })
-      : false;
-    if (suspectedRegression && !acceptedGrokDuplicateCorrection) {
-      producer.sourceScanFailuresTotal++;
-      if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
-      // There is deliberately no force-refresh bypass. To reconcile an
-      // intentional source-history reset, back up the manifest, explicitly
-      // remove the affected partition, then enqueue a fresh scan to establish
-      // its new baseline. Ordinary TTL and dirty refreshes stay protective.
-      partitions[key] = {
-        ...(tool ? { tool } : {}), ...(identity ? { identity } : {}),
-        nativeCoverage: "error",
-        results: prior.results,
-        ...(prior.nativeBatch ? { nativeBatch: prior.nativeBatch } : {}),
-        lastAttemptAt: attemptedAt,
-        ...(prior.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
-        lastError: "suspected-history-regression",
         lastErrorAt: attemptedAt,
       };
       writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
