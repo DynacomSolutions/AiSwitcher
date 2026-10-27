@@ -50,7 +50,7 @@ export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: s
     } catch (error) {
       throw new CliUsageError(error instanceof Error ? error.message : "AIS shared Tokscale binary is unavailable");
     }
-    return execReal(shared.command, [...shared.args, ...tokscaleArgs.slice(1)], {});
+    return execReal(shared.command, [...shared.args, ...tokscaleArgs], {});
   }
 
   const [cmd, ...prefixArgs] = resolveTokscaleCommand();
