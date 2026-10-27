@@ -49,6 +49,8 @@ export interface UsageSnapshotPartition {
     partitionId: string;
   };
   lastAttemptAt: string;
+  /** Identity no longer registered: results stay in totals, freshness ignores it. */
+  retired?: true;
   lastSuccessAt?: string;
   lastError?: string;
   lastErrorAt?: string;
@@ -631,14 +633,19 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     partitions[key] ??= { tool: target.toolName, identity: target.identity.name, nativeCoverage: "pending", results: [], lastAttemptAt: attemptedAt };
   }
   partitions[DEFAULT_OPENCODE_PARTITION] ??= { tool: "opencode", nativeCoverage: "pending", results: [], lastAttemptAt: attemptedAt };
-  writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
-  const dirtyDirectory = deps.dirtyDirectory ?? usageSnapshotDirtyDirectory;
-  const dirtyMarkers = readUsageSnapshotDirtyMarkers(dirtyDirectory);
   const candidateKeys = [
     ...targets.map(targetKey),
     ...poolTargets.map((target) => usageSnapshotTargetKey(target.toolName, target.identity.name)),
     DEFAULT_OPENCODE_PARTITION,
   ];
+  const liveKeys = new Set(candidateKeys);
+  for (const [key, partition] of Object.entries(partitions)) {
+    if (liveKeys.has(key) || key.startsWith("special:")) delete partition.retired;
+    else partition.retired = true;
+  }
+  writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
+  const dirtyDirectory = deps.dirtyDirectory ?? usageSnapshotDirtyDirectory;
+  const dirtyMarkers = readUsageSnapshotDirtyMarkers(dirtyDirectory);
   const dirtyKeyById = new Map(candidateKeys.map((key) => [usageSnapshotDirtyId(key), key]));
   dirtyKeyById.set(usageSnapshotDirtyId("special:all"), "special:all");
   const forcedKeys = new Set(deps.forcePartitionKeys ?? []);
@@ -899,11 +906,12 @@ export function readUsageSnapshotEnvelope(
   const scopedRows = identity === undefined ? matching.flatMap(([, partition]) => partition.results) : matching.flatMap(([, partition]) =>
     partition.results.filter((result) => result.identity.name === identity || result.identity.aliases?.includes(identity)));
   const results = aggregateUsageResults(scopedRows);
-  const successfulTimes = matching.map(([, partition]) => partition.lastSuccessAt ? Date.parse(partition.lastSuccessAt) : undefined).filter((value): value is number => value !== undefined);
-  const errors = matching.map(([, partition]) => partition.lastError ? { error: partition.lastError, at: partition.lastErrorAt ?? partition.lastAttemptAt } : undefined).filter((value): value is { error: string; at: string } => value !== undefined);
+  const live = matching.filter(([, partition]) => !partition.retired);
+  const successfulTimes = live.map(([, partition]) => partition.lastSuccessAt ? Date.parse(partition.lastSuccessAt) : undefined).filter((value): value is number => value !== undefined);
+  const errors = live.map(([, partition]) => partition.lastError ? { error: partition.lastError, at: partition.lastErrorAt ?? partition.lastAttemptAt } : undefined).filter((value): value is { error: string; at: string } => value !== undefined);
   const lastSuccess = successfulTimes.length ? Math.min(...successfulTimes) : undefined;
-  const pending = matching.length === 0 || matching.some(([, partition]) => partition.lastSuccessAt === undefined);
-  const nativeCoverage = matching.reduce((coverage, [, partition]) => {
+  const pending = live.length === 0 || live.some(([, partition]) => partition.lastSuccessAt === undefined);
+  const nativeCoverage = live.reduce((coverage, [, partition]) => {
     coverage[partition.nativeCoverage ?? "pending"]++;
     return coverage;
   }, { supported: 0, unsupported: 0, error: 0, pending: 0 });
