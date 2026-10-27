@@ -251,6 +251,46 @@ describe("shared usage snapshot", () => {
     }
   });
 
+  const oldIdentity = { name: "old", label: "Old", configDir: "/not-persisted", env: {} } as UsageTarget["identity"];
+  const oldTarget: UsageTarget = { toolName: "claude", identity: oldIdentity };
+  const multi = (path: string, now: number, targets: UsageTarget[]): UsageSnapshotDeps => ({
+    ...deps(path, { now, results: [] }),
+    collectTargets: async () => targets,
+    collectTargetResults: async (list, done) => {
+      list.forEach((item, index) => done(index, [result(item === oldTarget ? 5 : 1, item.identity)]));
+      return [];
+    },
+  });
+
+  test("retired identity partitions keep their results but never make the envelope stale", async () => {
+    const path = await snapshotFile();
+    const t0 = Date.UTC(2026, 0, 1);
+    await refreshUsageSnapshot(multi(path, t0, [target, oldTarget]));
+    const later = t0 + 10 * 24 * 3_600_000;
+    const snapshot = await refreshUsageSnapshot(multi(path, later, [target]));
+    const retired = snapshot.partitions[usageSnapshotTargetKey("claude", "old")]!;
+    expect(retired.retired).toBe(true);
+    expect(retired.results.length).toBe(1);
+    expect(snapshot.partitions[usageSnapshotTargetKey("claude", "work")]!.retired).toBeUndefined();
+    const envelope = readUsageSnapshotEnvelope(undefined, undefined, path, later + 1000)!;
+    expect(envelope.stale).toBe(false);
+    expect(envelope.pending).toBe(false);
+    expect(envelope.lastSuccessAt).not.toBe(retired.lastSuccessAt);
+    expect((envelope.results as UsageResult[]).reduce((sum, row) => sum + row.report!.totalMessages, 0)).toBe(6);
+  });
+
+  test("a retired partition whose target returns is un-retired and refreshed", async () => {
+    const path = await snapshotFile();
+    const t0 = Date.UTC(2026, 0, 1);
+    await refreshUsageSnapshot(multi(path, t0, [target, oldTarget]));
+    await refreshUsageSnapshot(multi(path, t0 + 120_000, [target]));
+    const back = t0 + 240_000;
+    const snapshot = await refreshUsageSnapshot(multi(path, back, [target, oldTarget]));
+    const revived = snapshot.partitions[usageSnapshotTargetKey("claude", "old")]!;
+    expect(revived.retired).toBeUndefined();
+    expect(Date.parse(revived.lastSuccessAt!)).toBe(back);
+  });
+
   test("newly discovered identities are visible as pending while their first scan runs", async () => {
     const path = await snapshotFile();
     let releaseScan!: () => void;
