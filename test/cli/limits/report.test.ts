@@ -311,12 +311,12 @@ describe("sortByUrgency", () => {
 describe("swap pool row", () => {
   const pool = (): ToolLimitResult => ({
     ...withWindows("pool-x", [71]),
-    identity: { ...identity("pool-x"), swapPool: { accounts: ["identity-a"], active: "identity-a" } },
+    identity: { ...identity("pool-x"), swapPool: { accounts: ["identity-a", "identity-b", "identity-c"], active: "identity-a" } },
   });
 
-  test("renders one pointer line and stays out of the aggregates", () => {
+  test("lists every member with only the active one starred, and stays out of the aggregates", () => {
     const out = formatLimitsReport([claudeAcme(), pool()], NOW, "⠋", { width: 100, columns: false });
-    expect(out).toContain("→ active member: identity-a");
+    expect(out).toContain("→ members: *identity-a (active), identity-b, identity-c");
     expect(out).toContain("sessions          [██████░░░░░░░░░░░░░░]  25%".slice(0, 8));
     expect(out.split("\n")[0]).toContain(" 25%"); // 71 would shift the session average
     expect(out.match(/71%/g)).toBeNull();
@@ -324,15 +324,22 @@ describe("swap pool row", () => {
     expect(out.indexOf("pool-x")).toBeGreaterThan(out.indexOf("identity-a  "));
   });
 
+  test("compact mode keeps the pool to one line with the complete member list and active marker", () => {
+    const out = formatLimitsReport([claudeAcme(), pool()], NOW, "⠋", { width: 100, columns: false, compact: true });
+    const lines = out.split("\n").filter((l) => l.includes("pool-x"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("→ members: *identity-a (active), identity-b, identity-c");
+  });
+
   test("a codex pool mirrors its active codex member, not a claude one of that name", () => {
     const codexPool = { ...pool(), toolName: "codex" as const };
-    expect(formatLimitsReport([claudeAcme(), codexPool], NOW, "⠋", { width: 100, columns: false })).not.toContain("active member");
-    expect(formatLimitsReport([claudeAcme(), codexPool, { ...codexAcme(), identity: identity("identity-a") }], NOW, "⠋", { width: 100, columns: false })).toContain("→ active member: identity-a");
+    expect(formatLimitsReport([claudeAcme(), codexPool], NOW, "⠋", { width: 100, columns: false })).not.toContain("→ members:");
+    expect(formatLimitsReport([claudeAcme(), codexPool, { ...codexAcme(), identity: identity("identity-a") }], NOW, "⠋", { width: 100, columns: false })).toContain("→ members: *identity-a (active), identity-b, identity-c");
   });
 
   test("a pool whose active member is not in the report keeps its own windows", () => {
     const out = formatLimitsReport([pool()], NOW, "⠋", { width: 100, columns: false });
-    expect(out).not.toContain("active member");
+    expect(out).not.toContain("→ members:");
     expect(out).toContain("71%");
   });
 });
