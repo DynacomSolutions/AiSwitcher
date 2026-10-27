@@ -7,6 +7,8 @@ import { appendSwapEvent, ledgerPathFor, readSwapEvents } from "../../../src/ide
 import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
 import { chooseBest, swapIfLimited } from "../../../src/identities/pool/ops.ts";
 import { PoolSwapScheduler } from "../../../src/identities/pool/scheduler.ts";
+import { poolsOf, requirePool } from "../../../src/identities/pool/swap-pool.ts";
+import type { IdentitiesFile, Identity } from "../../../src/identities/types.ts";
 import { aisClaudeSwapLedgerPath, aisSwapLedgerPath } from "../../../src/shared/ais-home.ts";
 import { CLAUDE_CONFIG } from "../../../src/identities/tool-configs.ts";
 
@@ -363,5 +365,49 @@ describe("claude scheduler view", () => {
     const only = (tool: "claude" | "codex") => new PoolSwapScheduler({ adapters: () => [fakeAdapter(tool, registry, {})] });
     expect(claudeSchedulerView(await only("codex").status())).toBeNull();
     expect(claudeSchedulerView(await only("claude").status())?.pools).toHaveLength(1);
+  });
+});
+
+describe("canonical pools by configDir", () => {
+  const entry = (name: string, configDir: string, extra: Partial<Identity> = {}): Identity => ({ name, label: name, configDir, ...extra });
+  const duplicatedRegistry = (): IdentitiesFile => ({
+    version: 1,
+    identities: [
+      entry("a", join(root, "a")),
+      entry("b", join(root, "b")),
+      entry("pool", join(root, "pool"), { swapPool: { accounts: ["a", "b"], active: "a" } }),
+      // A legacy/sync duplicate: same configDir (trailing slash included) as "pool".
+      entry("pool-dup", `${join(root, "pool")}/`, { swapPool: { accounts: ["a", "b"], active: "b" } }),
+    ],
+  });
+
+  test("poolsOf keeps the first record per configDir and still drops retired pools", () => {
+    const file = duplicatedRegistry();
+    file.identities.push(
+      entry("pool-gone", join(root, "pool-gone"), { swapPool: { accounts: ["a", "b"] }, retired: true }),
+      entry("pool-two", join(root, "pool-two"), { swapPool: { accounts: ["a", "b"] } }),
+    );
+    expect(poolsOf(file).map((p) => p.name)).toEqual(["pool", "pool-two"]);
+  });
+
+  test("requirePool redirects a duplicate pool name to the canonical record", () => {
+    const pool = requirePool(duplicatedRegistry(), "pool-dup", "kimi");
+    expect(pool.name).toBe("pool");
+    expect(pool.swapPool.active).toBe("a");
+  });
+
+  test("an unqualified requirePool resolves the single canonical pool despite a duplicate record", () => {
+    expect(requirePool(duplicatedRegistry(), undefined, "kimi").name).toBe("pool");
+    const file = duplicatedRegistry();
+    file.identities.push(entry("pool-two", join(root, "pool-two"), { swapPool: { accounts: ["a", "b"] } }));
+    expect(() => requirePool(file, undefined, "kimi")).toThrow(/More than one swap pool exists \(pool, pool-two\)/);
+  });
+
+  test("unknown, non-pool and retired errors are preserved", () => {
+    const file = duplicatedRegistry();
+    file.identities.push(entry("pool-gone", join(root, "pool-gone"), { swapPool: { accounts: ["a", "b"] }, retired: true }));
+    expect(() => requirePool(file, "nope", "kimi")).toThrow(/No identity named "nope"/);
+    expect(() => requirePool(file, "a", "kimi")).toThrow(/Identity "a" is not a swap pool/);
+    expect(() => requirePool(file, "pool-gone", "kimi")).toThrow(/Swap pool "pool-gone" is retired/);
   });
 });

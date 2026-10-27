@@ -5,6 +5,7 @@ import { promptForIdentity } from "./prompt.ts";
 import { NonInteractiveResolutionError, RetiredIdentityError, UnknownIdentityError, UnknownPoolError } from "./errors.ts";
 import { findRetiredByConfigDir, isRetired } from "./retired.ts";
 import { adapterFor } from "./pool/registry.ts";
+import { findPool, poolsOf } from "./pool/swap-pool.ts";
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
 
@@ -73,15 +74,16 @@ export async function resolveIdentity(
     return { identity, configDirValue: expandPath(identity.configDir), source: "flag" };
   }
 
-  // (a2) explicit --pool=<name> launches a registered pool directly.
+  // (a2) explicit --pool=<name> launches a registered pool directly. A legacy
+  // duplicate name (same configDir as an earlier record) resolves to the
+  // canonical pool record.
   if (opts.explicitPoolFlag) {
     const file = await deps.loadIdentitiesFile(cfg.identitiesJsonPath);
-    const pools = file.identities.filter((i) => i.swapPool !== undefined && !isRetired(i));
-    const pool = findIdentityByNameOrAlias(pools, opts.explicitPoolFlag);
+    const pool = findPool(file, opts.explicitPoolFlag);
     if (!pool) {
       throw new UnknownPoolError(
         opts.explicitPoolFlag,
-        pools.map((p) => p.name),
+        poolsOf(file).map((p) => p.name),
       );
     }
     return { identity: pool, configDirValue: expandPath(pool.configDir), source: "flag" };
@@ -185,12 +187,12 @@ export async function resolveSingleInstanceIdentity(
   }
 
   // An explicit pool is a separate runtime config for pi. It must use the
-  // pool's own directory so the pool adapter's credentials are loaded.
+  // pool's own directory so the pool adapter's credentials are loaded. A
+  // legacy duplicate name resolves to the canonical record for its configDir.
   if (opts.explicitPoolFlag) {
-    const pools = file.identities.filter((i) => i.swapPool !== undefined && !isRetired(i));
-    const pool = findIdentityByNameOrAlias(pools, opts.explicitPoolFlag);
+    const pool = findPool(file, opts.explicitPoolFlag);
     if (!adapterFor(cfg.toolName) || !pool) {
-      throw new UnknownPoolError(opts.explicitPoolFlag, pools.map((p) => p.name));
+      throw new UnknownPoolError(opts.explicitPoolFlag, poolsOf(file).map((p) => p.name));
     }
     return { identity: pool, configDirValue: expandPath(pool.configDir), source: "flag" };
   }
