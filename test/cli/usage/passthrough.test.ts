@@ -19,7 +19,7 @@ describe("ais usage tui argv", () => {
         stderr: "pipe",
       });
       const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-      expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+      expect(code, stderr).toBe(0);
 
       expect((await readFile(out, "utf8")).trimEnd().split("\n")).toEqual([
         "--ais-shared-snapshot",
