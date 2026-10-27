@@ -38,7 +38,9 @@ and per-tool adapters. Core: `swap-pool.ts` (registry helpers, moved from
 `~/.ais/state/<tool>-swap.jsonl`; claude stays exactly `claude-swap.jsonl`),
 `swap.ts` (`performPoolSwap`: validate, adapter swap, persist `active`, ledger),
 `ops.ts` (`chooseBest`, `swapIfLimited`, 10 min cooldown, `poolStatus`,
-`swapToNext`), `launch.ts` (`poolLaunchCheck`), `scheduler.ts`
+`swapToNext`), `launch.ts` (`poolLaunchCheck`), `heal.ts` (`healPool`: the
+shared heal mechanic, pool lock plus registry reload plus adapter.heal),
+`scheduler.ts`
 (`PoolSwapScheduler`: daemon loop over every registered adapter's registry),
 `registry.ts` (`adapterFor(tool)`, `allAdapters()`). An adapter
 (`pool/adapter.ts` `PoolAdapter`) supplies only `tool`, `config`, `liveSwap`,
@@ -135,7 +137,8 @@ session's snapshot `pluginVersion` is missing or below `PLUGIN_VERSION` (keep it
 through `claude-swap/attribution.ts` `poolMemberUsageSplit(..., {tool})`:
 claude reads `projects/`, codex reads `sessions/**/rollout-*.jsonl`
 `token_count` events; both attribute by `activeMemberAt` on the tool's ledger.
-`ais limits` mirrors a pool row to its active member of the SAME tool.
+`ais limits` mirrors a pool row to its active member of the SAME tool (the
+pointer lists every member; see the 2026-10-25 section below).
 
 
 ### Kimi and Pi adapters, `liveSwap: true` (task 46)
@@ -217,3 +220,67 @@ status` adds an `extra` column when any member has it enabled. Rules in
   usage.
 - A rate-limited or failed Claude read keeps `extraUsage` from the member's last good read (`cache/claude-limits/<id>.json`, written by `fetchMemberUsage` and `ais limits`) when at most 6 hours old, marked `stale`.
 Kimi and Pi report no extra usage; their pools are unchanged.
+
+
+### Canonical pools, full limits membership and launch heal (2026-10-25, task kimi-pool-limits-launch)
+
+Legacy and sync-merged registries can hold two pool records sharing one
+configDir (pool create rejects new collisions, but existing records are never
+deleted locally because sync would bring them back).
+Duplicates are canonicalised behaviourally in `pool/swap-pool.ts`: `poolsOf`
+keeps the FIRST active record per expanded/resolved configDir as the
+canonical pool, and `requirePool`/`findPool` redirect a duplicate pool name
+to it (the unknown, not-pool and retired errors are unchanged). The picker
+(`identities/prompt.ts`), both `--pool=` paths (`identities/resolve.ts`), the
+limits targets (`cli/limits/collect.ts`; naming a duplicate as
+`ais limits <name>` redirects to the canonical row) and every existing
+`poolsOf` consumer (scheduler, usage) therefore see one pool per configDir.
+The registry itself is never rewritten by this.
+
+`ais limits` still mirrors a pool row to its active member of the same tool
+and keeps pool windows out of every aggregate, but the pointer now lists
+EVERY `swapPool.accounts` member with the active one starred and marked
+`(active)`; compact mode keeps the pool to one line with the complete list.
+
+The heal mechanic (pool lock, registry reload under the lock, requirePool,
+non-retired member resolution, adapter.heal) lives in `pool/heal.ts`
+(`healPool`) and is shared by the scheduler tick and `poolLaunchCheck`, which
+now heals before its bootstrap/auto decision, inside the existing
+timeout/settle budget. This closes the login-prompt-on-launch case: a pool
+file holding a non-empty stale or wrong-member grant (which the old launch
+check left alone) is restored to the recorded active member before the tool
+starts. Heal notes surface through the launch check's one-line stderr note
+when no swap note replaces them. All pool operations on a duplicate record
+(swap, heal, status) act on the canonical pool through the same requirePool
+redirection.
+
+Kimi launch configuration (same task): a pool configDir carries the swapped
+credentials but nobody ever configures models inside it, and Kimi refuses to
+run when the selected model is not configured in its config.toml, failing
+with `Model "..." is not configured in config.toml.`
+`identities/kimi-pool-config.ts`
+(`seedKimiPoolModelConfig`, wired as the kimi `runWrapper` beforeLaunch
+callback, so it runs right after the launch heal) re-reads the registry fresh
+(the launch check may have swapped the active member after resolution),
+resolves the canonical pool, and seeds the pool config.toml's NON-CREDENTIAL
+model configuration once from the current active member's own config: the
+`default_model` root key (prepended, so it stays at root level whatever the
+rest of the file declares), the `[secondary_model]` table (copied
+all-or-nothing, only while the pool has none), every missing `models` entry,
+and the missing `providers` entries referenced by those newly added models
+(unrelated providers stay behind). Missing table sections are appended via
+smol-toml stringify, which emits `[models."id"]`/`[providers."id"]` without a
+parent header, so appending never duplicates a table; the existing pool
+source (keys, entries, comments, formatting) is kept byte-identical in
+between, and the atomic 0600 write (pool/fs.ts) happens only when something
+changed. Existing pool values always win (a later in-pool /model choice
+writes the same file), an active member without a usable default invents
+nothing and no file is created, ordinary identities are a no-op, and the step
+never throws. Credential safety: copied model and provider entries are
+recursively stripped of credential-shaped fields (api keys, tokens, secrets,
+passwords, authorization/credential keys, matched on the punctuation-normalised
+lowercase name so `api-key` forms go too); a provider `api_key` survives only
+as the empty string, and OAuth storage/key metadata is kept because it is a
+pointer, not a secret. `runWrapper`'s beforeLaunch callback gained a second
+argument (the ResolvedIdentity); existing one-argument callbacks are
+unaffected.

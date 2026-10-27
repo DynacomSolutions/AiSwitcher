@@ -101,9 +101,10 @@ function buildAggregateRows(results: ToolLimitResult[]): Row[] {
 }
 
 /** A swap-pool identity whose active member is also in this report: its
- * windows are a copy of that member's, so it renders as a pointer and stays
- * out of every aggregate. A pool with no known (or unlisted) active member
- * keeps its own windows — there is nothing else to show them from. */
+ * windows are a copy of that member's, so it renders as a pointer listing
+ * every pool member (active one starred) and stays out of every aggregate.
+ * A pool with no known (or unlisted) active member keeps its own windows:
+ * there is nothing else to show them from. */
 function isMirroredPool(r: ToolLimitResult, all: ToolLimitResult[]): boolean {
   const active = r.identity.swapPool?.active;
   return active !== undefined && all.some((o) => o !== r && o.toolName === r.toolName && o.identity.name === active);
@@ -191,8 +192,11 @@ function identityHeading(result: ToolLimitResult): string {
   return label.toLowerCase() === name.toLowerCase() ? bold(name) : `${bold(name)}  ${dim(`(${label})`)}`;
 }
 
+/** Every member of the pool; the active one is starred and marked. */
 function poolPointer(result: ToolLimitResult): string {
-  return `→ active member: ${result.identity.swapPool?.active}`;
+  const pool = result.identity.swapPool!;
+  const members = pool.accounts.map((name) => (name === pool.active ? `*${name} (active)` : name));
+  return `→ members: ${members.join(", ")}`;
 }
 
 function buildIdentityBlock(result: ToolLimitResult, isLast: boolean, ctx: Ctx): { branch: string; rows: Row[] } {

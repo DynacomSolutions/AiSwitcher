@@ -70,13 +70,24 @@ src/
                              errors on no-match, always launches the one shared dir (flag >
                              env override still honored; a match only seeds the in-app default)
     prompt.ts               @clack/prompts picker + create-new-identity flow
-                             The picker lists claude pools under one "Claude Pools" entry
-                             (second select of member accounts; a member choice makes it
-                             active via the manual switch, then launches the pool) and
-                             pre-selects the last pick per tool, remembered by
+                             With pools registered, a chooser (Identity / Pool) opens first;
+                             the pool list shows the canonical pools only (one per configDir:
+                             legacy/sync duplicate records collapse to the first record, see
+                             identities/pool/swap-pool.ts). Pre-selects the last pick per
+                             tool, remembered by
                              last-identity.ts in ~/.ais/state/last-identity.json (mode 0600,
                              every read/write best-effort)
     errors.ts                typed IdentityResolutionError subclasses
+    kimi-pool-config.ts      seedKimiPoolModelConfig(): a kimi pool launch seeds its
+                             config.toml's non-credential model configuration once
+                             from the current active member (default_model root key,
+                             [secondary_model] table, missing models entries plus the
+                             providers they reference; credential-shaped fields
+                             stripped, non-empty api_key never copied; registry
+                             re-read fresh; existing pool entries win; ordinary
+                             identities untouched). Wired as src/kimi.ts's
+                             beforeLaunch callback (runWrapper's beforeLaunch takes
+                             (configDir, resolved)); see docs/agents/claude-swap-pools.md
   shared/              process/OS mechanics — no identity-resolution logic
     resolve-binary.ts    find the REAL claude/codex/grok/kimi/open/crush/pi binary,
                         self-recursion guard. Takes a `realBinaryName`, not a `toolName` —

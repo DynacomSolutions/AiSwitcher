@@ -90,7 +90,9 @@ export interface PoolAdapter<U extends PoolUsage = PoolUsage> {
    * sessions to relaunch; the returned count is surfaced on the result. */
   notifySwapped?(pool: PoolIdentity, from: string | null, to: string): Promise<{ sessions?: number } | void>;
   /** Repairs the pool folder if something outside the core damaged it (e.g. a
-   * running session rewriting its own account). Called by the scheduler each
-   * tick, under the pool lock, before the swap check. Optional. */
+   * running session rewriting its own account, or a pool file holding another
+   * member's grant). Called through the shared pool/heal.ts mechanic by the
+   * scheduler each tick and by the launch check before its bootstrap/auto
+   * decision, both under the pool lock. Optional. */
   heal?(pool: PoolIdentity, members: Identity[], lock?: LockOptions): Promise<string[]>;
 }

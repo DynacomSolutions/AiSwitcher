@@ -14,6 +14,7 @@ import { fetchOpencodeLimits, pendingOpencodeProviders } from "./opencode-limits
 import { fetchPiLimits, pendingPiProviders } from "./pi-limits.ts";
 import { fetchZaiLimits } from "./zai-limits.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
+import { canonicalPool, isSwapPool, poolsOf } from "../../identities/pool/swap-pool.ts";
 import { annotateWithSpendGuard } from "../../spend/annotate.ts";
 import { loadSpendGuardConfig } from "../../spend/config.ts";
 import { loadSpendGuardCache } from "../../spend/cache.ts";
@@ -98,12 +99,23 @@ export async function collectLimitTargets(
   const targets: LimitTarget[] = [];
   let skippedRetired: string | undefined;
   for (const { cfg, file } of loaded) {
+    // A legacy/sync duplicate pool record (same configDir as an earlier pool)
+    // is not a separate target: the canonical record answers for it.
+    const canonicalPools = new Set(poolsOf(file).map((p) => p.name));
     for (const identity of file.identities) {
       if (identityFilter && identity.name !== identityFilter && !(identity.aliases ?? []).includes(identityFilter)) {
         continue;
       }
       if (isRetired(identity)) {
         skippedRetired ??= identity.name;
+        continue;
+      }
+      if (isSwapPool(identity) && !canonicalPools.has(identity.name)) {
+        // The filter may have named the duplicate: the canonical record stands in for it.
+        const canonical = canonicalPool(file, identity);
+        if (!targets.some((t) => t.toolName === cfg.toolName && t.identity.name === canonical.name)) {
+          targets.push({ toolName: cfg.toolName, identity: canonical });
+        }
         continue;
       }
       targets.push({ toolName: cfg.toolName, identity });

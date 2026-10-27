@@ -96,6 +96,21 @@ test("no disabled rows, no Claude Pools row, no pool row on the identity screen"
   expect(h.calls[1]!.options.map((o) => o.value)).not.toContain("shared-pool");
 });
 
+test("two pool records sharing a configDir produce one picker option, the canonical first record", async () => {
+  const file = registry();
+  file.identities.push({
+    name: "legacy-pool",
+    label: "Legacy Pool",
+    configDir: "/example/shared-pool",
+    swapPool: { accounts: ["acct-a", "acct-b"], active: "acct-b" },
+  });
+  const h = harness(["pool", "shared-pool"]);
+  const result = await promptForIdentity(file, cfg, 1000, h.deps);
+  expect(labels(h.calls[1]!)).toEqual(["Shared Pool"]);
+  expect(h.calls[1]!.options[0]!.hint).toBe("3 accounts, active: Account A");
+  expect(result.identity.name).toBe("shared-pool");
+});
+
 test("pool list: one row per pool, hint has member count and active account, no member rows", async () => {
   const h = harness(["pool", "shared-pool"]);
   const result = await promptForIdentity(registry(), cfg, 1000, h.deps);

@@ -12,6 +12,7 @@ import { writeAliAuthFile } from "./ali-auth.ts";
 import { activeIdentities } from "./retired.ts";
 import { readLastIdentity, writeLastIdentity } from "./last-identity.ts";
 import { adapterFor } from "./pool/registry.ts";
+import { poolsOf } from "./pool/swap-pool.ts";
 
 // A plain string sentinel rather than a Symbol: identity names are validated
 // elsewhere to be lowercase kebab-case only, so this can never collide with a
@@ -77,7 +78,9 @@ export async function promptForIdentity(
     clack.intro(intro);
 
     const active = activeIdentities(identitiesFile.identities);
-    const pools = adapterFor(cfg.toolName) ? active.filter((i) => i.swapPool !== undefined) : [];
+    // Canonical pools only: a legacy/sync duplicate record (same configDir as
+    // an earlier pool) never becomes a second picker entry.
+    const pools = adapterFor(cfg.toolName) ? poolsOf(identitiesFile) : [];
     const plain = active.filter((i) => i.swapPool === undefined);
     const remembered = await deps.readLast(cfg.toolName).catch(() => undefined);
     const rememberedPool = remembered !== undefined ? pools.find((p) => p.name === remembered) : undefined;

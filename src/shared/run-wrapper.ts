@@ -1,4 +1,4 @@
-import type { ToolConfig } from "../identities/types.ts";
+import type { ResolvedIdentity, ToolConfig } from "../identities/types.ts";
 import { basename, join } from "node:path";
 import { resolveIdentity } from "../identities/resolve.ts";
 import { PromptCancelledError, RetiredIdentityError } from "../identities/errors.ts";
@@ -41,7 +41,7 @@ export function herdrTitleForLaunch(
 export async function runWrapper(
   cfg: ToolConfig,
   appName: "Claude" | "Codex" | "Grok" | "Kimi" | "Crush" | "Pi" | "OpenCode",
-  beforeLaunch?: (configDir: string) => Promise<unknown>,
+  beforeLaunch?: (configDir: string, resolved: ResolvedIdentity) => Promise<unknown>,
 ): Promise<void> {
   // Detached sidecar re-entry (see session-sidecar.ts): none of the launch
   // logic below applies, and the terminal is never touched.
@@ -117,7 +117,7 @@ export async function runWrapper(
       } catch {}
     }
 
-    await beforeLaunch?.(resolved.configDirValue);
+    await beforeLaunch?.(resolved.configDirValue, resolved);
 
     if (parsed.desktopFlag) {
       const launch = () => launchDesktopApp(appName, cfg.envVarName, resolved.configDirValue, cfg.extraEnvVarNames);

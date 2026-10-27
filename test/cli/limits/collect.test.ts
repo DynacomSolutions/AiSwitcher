@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { aggregateLimitResults, fetchLimitResults, isMirroredPoolTarget, pendingLimitResult, runBatched } from "../../../src/cli/limits/collect.ts";
+import { aggregateLimitResults, collectLimitTargets, fetchLimitResults, isMirroredPoolTarget, pendingLimitResult, runBatched } from "../../../src/cli/limits/collect.ts";
 import type { ToolLimitResult } from "../../../src/cli/limits/types.ts";
 import type { Identity, ToolConfig } from "../../../src/identities/types.ts";
 
@@ -182,6 +182,30 @@ describe("runBatched", () => {
     });
     expect(results).toEqual([]);
     expect(calls).toBe(0);
+  });
+});
+
+describe("collectLimitTargets with duplicate pool records", () => {
+  test("two pool records sharing a configDir produce only one limits target", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ais-limits-pool-"));
+    try {
+      const identitiesJsonPath = join(dir, "identities.json");
+      writeFileSync(identitiesJsonPath, JSON.stringify({
+        version: 1,
+        identities: [
+          { name: "a", label: "a", configDir: join(dir, "a") },
+          { name: "b", label: "b", configDir: join(dir, "b") },
+          { name: "pool", label: "pool", configDir: join(dir, "pool"), swapPool: { accounts: ["a", "b"], active: "a" } },
+          { name: "pool-dup", label: "pool-dup", configDir: join(dir, "pool"), swapPool: { accounts: ["a", "b"], active: "a" } },
+        ],
+      }));
+      const cfg = { toolName: "claude", identitiesJsonPath } as ToolConfig;
+      expect((await collectLimitTargets(undefined, {}, [cfg])).map((t) => t.identity.name)).toEqual(["a", "b", "pool"]);
+      // A filter naming the duplicate record redirects to the canonical pool.
+      expect((await collectLimitTargets("pool-dup", {}, [cfg])).map((t) => t.identity.name)).toEqual(["pool"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

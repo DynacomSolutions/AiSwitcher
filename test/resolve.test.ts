@@ -277,6 +277,41 @@ describe("single-instance resolution (pi)", () => {
     expect(selectedIdentity.configDirValue).toBe(SINGLE_CFG.singleInstanceDir!);
   });
 
+  test("a duplicate pi pool record resolves to the canonical pool; ordinary identities stay shared", async () => {
+    const pool: Identity = {
+      name: "pi-team-pool",
+      label: "Pi Team Pool",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "work" },
+    };
+    const duplicate: Identity = {
+      name: "pi-team-pool-dup",
+      label: "Pi Team Pool Dup",
+      configDir: "/tmp/does-not-exist/pi-team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "personal" },
+    };
+    const deps = fakeDeps({
+      loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool, duplicate] }),
+    });
+    const selectedPool = await resolveIdentity(
+      SINGLE_CFG,
+      { explicitPoolFlag: "pi-team-pool-dup", cwd: "/x", env: {} },
+      deps,
+    );
+    expect(selectedPool.source).toBe("flag");
+    expect(selectedPool.identity?.name).toBe("pi-team-pool");
+    expect(selectedPool.configDirValue).toBe(pool.configDir);
+    expect(selectedPool.identity?.swapPool?.active).toBe("work");
+
+    const selectedIdentity = await resolveIdentity(
+      SINGLE_CFG,
+      { explicitIdentityFlag: "work", cwd: "/x", env: {} },
+      deps,
+    );
+    expect(selectedIdentity.identity?.name).toBe("work");
+    expect(selectedIdentity.configDirValue).toBe(SINGLE_CFG.singleInstanceDir!);
+  });
+
   test("a directory match to a pi pool uses its pool config dir", async () => {
     const pool: Identity = {
       name: "pi-team-pool",
@@ -405,6 +440,26 @@ describe("pool flags", () => {
     );
     expect(result.source).toBe("flag");
     expect(result.identity?.name).toBe("team-pool");
+  });
+
+  test("--pool naming a duplicate record resolves the canonical first pool", async () => {
+    const duplicate: Identity = {
+      name: "team-pool-dup",
+      label: "Team Pool Dup",
+      configDir: "/tmp/does-not-exist/team-pool",
+      swapPool: { accounts: ["work", "personal"], active: "personal" },
+    };
+    const result = await resolveIdentity(
+      CFG,
+      { explicitPoolFlag: "team-pool-dup", cwd: "/x", env: {} },
+      withPool({
+        loadIdentitiesFile: async () => ({ version: 1, identities: [...IDENTITIES, pool, duplicate] }),
+      }),
+    );
+    expect(result.source).toBe("flag");
+    expect(result.identity?.name).toBe("team-pool");
+    expect(result.configDirValue).toBe(pool.configDir);
+    expect(result.identity?.swapPool?.active).toBe("work");
   });
 
   test("--pool=<unknown> errors and lists pool names", async () => {

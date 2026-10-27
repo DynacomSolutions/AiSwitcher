@@ -158,4 +158,16 @@ empirically on this machine, 2026-07-17:
   that the invocation shape is bare `open <url>`). Never re-verified for
   kimi; the real binary IS Bun-compiled, so the circumstantial evidence for
   assumption 1 is the same strength as claude's.
+- **Kimi pools need the model configuration seeded into the pool configDir**
+  (found by live acceptance 2026-10-25): a bare pool launch fails with
+  `Model "kimi-code/k3.1-pro-highspeed" is not configured in config.toml.`
+  even with valid swapped credentials, and `kimi doctor` only validates TOML
+  syntax so it does not catch the missing tables. The kimi wrapper seeds the
+  pool's config.toml once from the current active member: the `default_model`
+  root key, the `[secondary_model]` table, the missing `models` entries and
+  the providers those new entries reference, with credential-shaped fields
+  stripped (a non-empty `api_key` is never copied; an empty one and OAuth
+  storage/key metadata survive)
+  (`identities/kimi-pool-config.ts`; see the 2026-10-25
+  section of `docs/agents/claude-swap-pools.md`).
 
