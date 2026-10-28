@@ -78,6 +78,8 @@ const SANDBOX_KEYS = ["sandbox_mode", "default_permissions", "sandbox_workspace_
 const OPERATIONAL_RUNTIME_SCALARS = [
   "model_auto_compact_token_limit", "tool_output_token_limit",
 ];
+// Compaction keys an identity may size for its own model: a local value wins.
+const IDENTITY_OVERRIDABLE_RUNTIME_SCALARS = new Set(["model_auto_compact_token_limit"]);
 // User preferences Codex's own pickers persist into the identity's
 // config.toml (the /model picker writes "model" and
 // "model_reasoning_effort"). They are never projected as -c invocation
@@ -95,6 +97,7 @@ function sharedRuntimeProjection(shared: Table, local: Table): Table {
   const defaults: Table = {};
   const nonOpenAiProvider = Object.hasOwn(local, "model_provider") && local.model_provider !== "openai";
   for (const key of OPERATIONAL_RUNTIME_SCALARS) {
+    if (IDENTITY_OVERRIDABLE_RUNTIME_SCALARS.has(key) && Object.hasOwn(local, key)) continue;
     if (Object.hasOwn(shared, key)) defaults[key] = shared[key];
   }
   for (const key of ["agents", "features"]) {
@@ -207,7 +210,8 @@ async function seedUserPreferences(
 /**
  * Read per-user MCP and whitelisted runtime/permission defaults on every launch;
  * shared operational runtime policy is authoritative and identity values are
- * never forwarded. Shared user-preference runtime keys (model, reasoning
+ * never forwarded, except that an identity's own model_auto_compact_token_limit
+ * wins over the shared one. Shared user-preference runtime keys (model, reasoning
  * effort, service tier) are never projected as -c invocation overrides, since
  * that layer outranks config.toml and would override every picker save;
  * instead the shared value is written into an identity's config.toml once,

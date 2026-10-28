@@ -502,6 +502,16 @@ enabled = true
     expect((await readdir(join(home, ".codex"))).sort()).toEqual(["config.toml", "identities"]);
   });
 
+  test("identity compaction limit beats shared; unset inherits; other limits stay shared", async () => {
+    const { home, identity } = await fixture("model_auto_compact_token_limit = 200000\ntool_output_token_limit = 12000\n");
+    await localConfig(identity, "model_auto_compact_token_limit = 300000\ntool_output_token_limit = 2000\n");
+    expect(projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home)))
+      .toEqual({ tool_output_token_limit: 12000 });
+    await localConfig(identity, "");
+    expect(projectedConfig(await projectGlobalCodexMcpForLaunch(codex, identity, argv, home)))
+      .toEqual({ model_auto_compact_token_limit: 200000, tool_output_token_limit: 12000 });
+  });
+
   test("shared operational limits override local duplicates; user preferences keep local values", async () => {
     const { home, identity } = await fixture(runtimeConfig);
     const local = `
@@ -528,6 +538,7 @@ enabled = false
     delete expected.model;
     delete expected.model_reasoning_effort;
     delete expected.service_tier;
+    delete expected.model_auto_compact_token_limit;
     expect(projectedConfig(result)).toEqual(expected);
     expect(result.join(" ")).not.toContain("identity-");
     expect(result.join(" ")).not.toContain("bedrock");
