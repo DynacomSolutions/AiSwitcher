@@ -7,7 +7,8 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 54
   (`src/shared/codex-shared-config.ts`) splits its runtime allowlist in two.
   Operational keys (`model_auto_compact_token_limit`, `tool_output_token_limit`,
   plus the permission defaults) restamp every launch as `-c` invocation
-  overrides, even over identity duplicates. User preference keys (`model`,
+  overrides, even over identity duplicates, except that an identity's own
+  `model_auto_compact_token_limit` wins. User preference keys (`model`,
   `model_reasoning_effort`, `service_tier`) are never sent as `-c` at all: a
   `-c` invocation overlay outranks config.toml at runtime, so any `-c` for
   those keys, even a once-per-first-run seed, made Codex reject the `/model`

@@ -217,7 +217,8 @@ their first launch; edits apply to existing identities on their next launch.
 AIS does not copy shared entries into identity files. Its shared operational
 runtime allowlist is `model_auto_compact_token_limit`, `tool_output_token_limit`,
 and shared fields within `agents` and `features`. These shared values override
-identity duplicates, including settings written back by Codex, while
+identity duplicates, including settings written back by Codex, except
+`model_auto_compact_token_limit`, where an identity's own value wins, while
 identity-only fields remain. Shared user preference keys, `model`,
 `model_reasoning_effort`, and `service_tier`, are never sent as runtime
 configuration arguments: any such argument outranks `config.toml`, and Codex
