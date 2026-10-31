@@ -16,7 +16,7 @@ transparency and forced-colour preferences use opaque CSS surfaces.
 From this directory, run `bun install --frozen-lockfile`, `bun run typecheck`, and
 `bun run build`. Native Cargo commands use `--locked` to match the checked-in
 workspace lockfile.
-The browser smoke suite uses Playwright 1.58.2 from the isolated host-app
+The browser smoke suite uses Playwright 1.64.1 from the isolated host-app
 tooling cache and an installed Chromium binary without adding either as a
 project dependency:
 
