@@ -1,5 +1,5 @@
 import { describe, expect, test, afterAll } from "bun:test";
-import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -210,8 +210,18 @@ describe("SpendGuardScheduler transitions", () => {
   });
 });
 
-/** The real-kill canary: an actual child process, running a sleep binary
- * copied under an agent name, carrying the marker env. The scheduler (with
+/** Long-running canary command under an AGENT_BINARIES name. A symlink to
+ * the running Bun binary, not a copy of /bin/sleep: on Ubuntu 26.04
+ * /bin/sleep belongs to the multi-call uutils coreutils, which dispatches on
+ * argv0 and exits 1 when run as "codex". Bun ignores its own argv0. */
+function canaryCommand(dir: string, seconds: number): string[] {
+  const link = join(dir, "bin", "codex");
+  symlinkSync(process.execPath, link);
+  return [link, "-e", `setTimeout(() => {}, ${seconds * 1000})`];
+}
+
+/** The real-kill canary: an actual child process, running a long-lived
+ * binary linked under an agent name, carrying the marker env. The scheduler (with
  * the REAL /proc scanner and REAL signals) must terminate it. A twin
  * WITHOUT the marker must survive untouched. The identities involved are
  * synthetic, so no real session on this machine can ever match. */
@@ -220,13 +230,13 @@ describe("spend guard killer (real process canary)", () => {
     const dir = join(TMP, "kill-fixture");
     mkdirSync(join(dir, "bin"), { recursive: true });
     // A real, long-running binary under an AGENT_BINARIES name.
-    copyFileSync("/bin/sleep", join(dir, "bin", "codex"));
+    const canaryCmd = canaryCommand(dir, 120);
 
     const spawnCanary = (marker: boolean) => {
       const env: Record<string, string> = {};
       for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
       if (marker) env.AI_PROFILE_SWITCHER_SESSION = "canary-identity";
-      return Bun.spawn([join(dir, "bin", "codex"), "120"], {
+      return Bun.spawn(canaryCmd, {
         env,
         stdout: "ignore",
         stderr: "ignore",
@@ -285,12 +295,12 @@ describe("spend guard killer (real process canary)", () => {
   test("warn mode: the marked canary SURVIVES a breach tick untouched (no signal ever sent)", async () => {
     const dir = join(TMP, "kill-fixture-warn");
     mkdirSync(join(dir, "bin"), { recursive: true });
-    copyFileSync("/bin/sleep", join(dir, "bin", "codex"));
+    const canaryCmd = canaryCommand(dir, 60);
 
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
     env.AI_PROFILE_SWITCHER_SESSION = "canary-identity";
-    const marked = Bun.spawn([join(dir, "bin", "codex"), "60"], { env, stdout: "ignore", stderr: "ignore" });
+    const marked = Bun.spawn(canaryCmd, { env, stdout: "ignore", stderr: "ignore" });
     const cleanup = (): void => {
       try {
         marked.kill(9);
