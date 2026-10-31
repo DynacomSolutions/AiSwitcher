@@ -31,7 +31,8 @@ import { createIdentity } from "../identities/actions.ts";
 import { CliUsageError } from "../errors.ts";
 import { helpText } from "../help.ts";
 import { poolMemberUsageSplit } from "../claude-swap/attribution.ts";
-import { acquireSnapshotLock, readSwapUsageFromSnapshot } from "../usage/snapshot.ts";
+import { usageCollectorInstalled } from "../usage/collector-service.ts";
+import { acquireSnapshotLock, externalUsageCollectorOwnsRefreshes, readSwapUsageFromSnapshot } from "../usage/snapshot.ts";
 
 export interface SwapDeps extends PoolOpsDeps<any> {
   log?: (line: string) => void;
@@ -45,6 +46,8 @@ export interface SwapDeps extends PoolOpsDeps<any> {
   usageSnapshotPath?: string;
   /** Lock base path for live `usage` scans; default: ~/.ais/cache/usage/swap-usage-scan. */
   usageScanLockPath?: string;
+  /** Whether this host has the usage collector service; default: unit file or running collector marker. */
+  collectorInstalled?: () => boolean;
 }
 
 const usageText = (cmd: string): string => `Usage: ${cmd} <subcommand>; run "ais swap help" for the list`;
@@ -345,21 +348,30 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         const file = await loadIdentitiesFile(registryPath);
         const pool = requirePool(file, rest[0] ?? poolFlag, tool);
         // A full transcript scan takes minutes on a large host, so `--json` (the mod's call, once per session) reads the
-        // collector's snapshot instead. `--scan` and the table view still scan, one at a time.
+        // collector's snapshot. Only a host with no collector, or an explicit `--scan`, scans; scans are single-flight.
         if (json && tool === "claude" && !boolFlag(flags, "scan")) {
           const stored = readSwapUsageFromSnapshot(pool.name, deps.usageSnapshotPath);
-          if (!stored) throw new SwapPoolError(`no usage snapshot for pool ${pool.name}: start the collector (ais-usage-snapshot.service) or pass --scan`);
-          return log(JSON.stringify({ pool: stored.pool, days: stored.days, members: stored.members, generatedAt: stored.at, stale: stored.stale }, null, 2));
+          if (stored) return log(JSON.stringify({ pool: stored.pool, days: stored.days, members: stored.members, generatedAt: stored.at, stale: stored.stale }, null, 2));
+          const installed = (deps.collectorInstalled ?? (() => usageCollectorInstalled({ ownsRefreshes: externalUsageCollectorOwnsRefreshes })))();
+          if (installed) throw new SwapPoolError(`no usage split for pool ${pool.name} in the collector snapshot yet (is ais-usage-snapshot.service running the current ais?); not scanning`);
         }
-        const lockBase = deps.usageScanLockPath ?? join(aisCacheDir(), "usage", "swap-usage-scan");
-        await mkdir(dirname(lockBase), { recursive: true, mode: 0o700 });
-        const releaseScan = await acquireSnapshotLock(lockBase);
-        if (!releaseScan) throw new SwapPoolError("another usage scan is already running; try again when it finishes or use the collector snapshot (usage --json)");
+        // The lock needs flock(1), absent on stock macOS: scan unlocked there, as before the lock existed. Claude only.
+        let releaseScan: (() => Promise<void>) | undefined;
+        if (tool === "claude") {
+          if (Bun.which("flock", { PATH: process.env.PATH ?? "" })) {
+            const lockBase = deps.usageScanLockPath ?? join(aisCacheDir(), "usage", "swap-usage-scan");
+            await mkdir(dirname(lockBase), { recursive: true, mode: 0o700 });
+            releaseScan = await acquireSnapshotLock(lockBase);
+            if (!releaseScan) throw new SwapPoolError("another usage scan is already running; try again when it finishes");
+          } else {
+            console.error("flock not found: running the usage scan without the single-flight lock");
+          }
+        }
         let split;
         try {
           split = await poolMemberUsageSplit(pool, { days, ledgerPath: deps.ledgerPath ?? aisSwapLedgerPath(tool), tool: tool as "claude" | "codex" });
         } finally {
-          await releaseScan();
+          await releaseScan?.();
         }
         if (json) return log(JSON.stringify(split, null, 2));
         log(bold(`${pool.name}: transcript usage by active member, last ${days}d`));

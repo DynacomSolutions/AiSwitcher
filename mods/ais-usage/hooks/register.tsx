@@ -17,6 +17,7 @@ import {
   resolveCurrent,
   shares,
   shortError,
+  stamp,
   switchNotice,
   tone,
   totals,
@@ -423,7 +424,7 @@ export const register: Register = on => {
             ))}
             <Text dimColor>
               30d total: {humanise(tot.messages)} messages, {humanise(tot.output)} output tokens
-              {us?.stale && us.generatedAt ? ` (stale, as of ${clock(Date.parse(us.generatedAt))})` : ''}
+              {us?.stale && us.generatedAt ? ` (stale, as of ${stamp(Date.parse(us.generatedAt))})` : ''}
             </Text>
           </Box>
         )}
@@ -489,3 +490,4 @@ const clock = (ms: number) => {
   const d = new Date(ms)
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
 }
+

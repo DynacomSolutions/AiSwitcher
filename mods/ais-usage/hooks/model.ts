@@ -425,7 +425,7 @@ export function memberCards(blocks: MemberBlock[], cols: number): Seg[][][] {
 }
 
 /** Version of this mod's source; keep equal to .claude-plugin/plugin.json (a test enforces it). The statusline compares sessions' recorded version against it. */
-export const PLUGIN_VERSION = '0.5.3'
+export const PLUGIN_VERSION = '0.5.4'
 
 export type Snapshot = {
   /** Plugin version the session loaded; absent in snapshots from mods older than 0.5.3. */
@@ -449,3 +449,11 @@ export const snapshotName = (configDir: string | undefined, sessionId?: string):
 /** Where the mod writes the snapshot `ais statusline` reads. */
 export const snapshotPath = (home: string, configDir: string | undefined, sessionId?: string): string =>
   `${norm(home)}/.ais/cache/ais-usage/${snapshotName(configDir, sessionId)}`
+
+/** Clock time (HH:MM), with the date in front when the moment is not from today. */
+export const stamp = (ms: number, now = Date.now()): string => {
+  const d = new Date(ms)
+  const p = (n: number) => String(n).padStart(2, '0')
+  const time = `${p(d.getHours())}:${p(d.getMinutes())}`
+  return d.toDateString() === new Date(now).toDateString() ? time : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${time}`
+}

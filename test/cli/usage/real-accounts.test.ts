@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { poolMemberModelUsage } from "../../../src/cli/claude-swap/attribution.ts";
+import { poolMemberModelUsage, poolMemberUsageSplit } from "../../../src/cli/claude-swap/attribution.ts";
 import { pickProviderAccount, withoutEmptyProviders, type CredentialIndexEntry } from "../../../src/cli/usage/opencode-usage.ts";
 import { eventsForPool } from "../../../src/identities/claude-swap.ts";
 import type { PoolIdentity } from "../../../src/identities/swap-pool.ts";
@@ -87,13 +87,26 @@ describe("swap pool usage attribution cache", () => {
     return { root, pool, ledger, transcript, cachePath, msg };
   }
 
-  test("recent counts only messages inside the 30-day window", async () => {
+  test("recent split matches the live scan: window, dedup, pre-ledger label, departed members", async () => {
     const f = await fixture();
+    await writeFile(f.ledger, JSON.stringify({ ts: "2026-10-20T00:00:00.000Z", pool: "pool-x", from: null, to: "gone", reason: "manual" }));
     const at = (ts: string, id: string, output: number) => JSON.stringify({ timestamp: ts, message: { id, model: "claude-opus-4-8", usage: { input_tokens: 10, output_tokens: output } } });
-    await writeFile(f.transcript, [at("2026-09-20T00:00:00Z", "old", 5), at("2026-10-25T00:00:00Z", "new", 7)].join("\n"));
-    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath, now: Date.parse("2026-11-01T00:00:00Z") });
-    expect(usage[0]?.recent).toEqual({ messages: 1, input: 10, output: 7 });
-    expect(usage[0]?.entries[0]?.messageCount).toBe(2);
+    await writeFile(f.transcript, [
+      at("2026-09-20T00:00:00Z", "outside", 5),
+      at("2026-10-15T00:00:00Z", "early", 3), // inside the window, before the first ledger event
+      at("2026-10-25T00:00:00Z", "dup", 7),
+      at("2026-10-25T00:00:00Z", "dup", 7), // streaming copy
+    ].join("\n"));
+    const now = Date.parse("2026-11-01T00:00:00Z");
+    let recent: unknown;
+    await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath, now, onRecentSplit: (split) => { recent = split; } });
+    const scan = await poolMemberUsageSplit(f.pool, { days: 30, ledgerPath: f.ledger, now });
+    const project = (rows: Array<{ member: string; messages: number; input: number; output: number }>) => rows.map(({ member, messages, input, output }) => ({ member, messages, input, output })).sort((a, b) => a.member.localeCompare(b.member));
+    expect(project(recent as never)).toEqual([
+      { member: "(before first swap)", messages: 1, input: 10, output: 3 },
+      { member: "gone", messages: 1, input: 10, output: 7 },
+    ]);
+    expect(project(scan.members)).toEqual(project(recent as never));
   });
 
   test("reuses unchanged files after restart without reopening transcripts", async () => {

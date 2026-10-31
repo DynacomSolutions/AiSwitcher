@@ -132,12 +132,18 @@ export async function poolMemberUsageSplit(pool: PoolIdentity, options: { days: 
   const events = eventsForPool(await readSwapEvents(options.ledgerPath), pool);
   const sinceMs = (options.now ?? Date.now()) - options.days * 86_400_000;
   const rows = new Map<string, MemberSplitRow>();
+  // Transcripts repeat streaming copies of a message; count each id once, as poolMemberModelUsage does.
+  const seen = new Set<string>();
   for await (const file of jsonlFiles(join(pool.configDir, source.dir), sinceMs)) {
     const rl = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
     const read = source.reader(events, pool.name, sinceMs);
     for await (const line of rl) {
       const hit = read(line);
       if (!hit) continue;
+      if (hit.id) {
+        if (seen.has(hit.id)) continue;
+        seen.add(hit.id);
+      }
       const row = rows.get(hit.member) ?? { member: hit.member, messages: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
       row.messages += 1;
       row.input += hit.usage.input;
@@ -157,9 +163,10 @@ export interface PoolMemberUsage {
   firstMs: number;
   lastMs: number;
   dailyUsage: Record<string, number>;
-  /** Messages and tokens within the last RECENT_USAGE_DAYS, for the shared snapshot's per-member split. */
-  recent: { messages: number; input: number; output: number };
 }
+
+/** Counts per member over the last RECENT_USAGE_DAYS: what `usage --json` serves, scan or snapshot. */
+export type RecentMemberSplit = Array<{ member: string; messages: number; input: number; output: number }>;
 
 export const RECENT_USAGE_DAYS = 30;
 
@@ -180,6 +187,8 @@ interface PoolUsageCache {
 export interface PoolMemberModelUsageOptions {
   cachePath?: string;
   now?: number;
+  /** Receives the recent per-member split, built with the same counting as `poolMemberUsageSplit`. */
+  onRecentSplit?: (split: RecentMemberSplit) => void;
   onSourceFileRead?: (path: string) => void;
   /** Injectable discovery hooks for deterministic race/error tests. */
   readdir?: (path: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
@@ -326,6 +335,7 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
   const known = new Set(members.map((m) => m.name));
   const byMember = new Map<string | undefined, PoolMemberUsage>();
   const seen = new Set<string>();
+  const recentByMember = new Map<string, RecentMemberSplit[number]>();
   const recentSinceMs = (options.now ?? Date.now()) - RECENT_USAGE_DAYS * 86_400_000;
   const projectsDir = join(pool.configDir, "projects");
   const cachePath = options.cachePath ?? defaultPoolUsageCachePath(pool);
@@ -378,7 +388,7 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
       }
       const actualName = activeMemberAt(events, pool.name, at) ?? fallback;
       const member = actualName !== undefined && known.has(actualName) ? actualName : undefined;
-      const row = byMember.get(member) ?? { member, entries: [], firstMs: at, lastMs: at, dailyUsage: {}, recent: { messages: 0, input: 0, output: 0 } };
+      const row = byMember.get(member) ?? { member, entries: [], firstMs: at, lastMs: at, dailyUsage: {} };
       byMember.set(member, row);
       const model = modelName ?? "unknown";
       let entry = row.entries.find((e) => e.model === model);
@@ -393,9 +403,13 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
       entry.messageCount += 1;
       entry.cost += estimateChatModelTokenCost(model, input, output, cacheRead, cacheWrite) ?? 0;
       if (at >= recentSinceMs) {
-        row.recent.messages += 1;
-        row.recent.input += input;
-        row.recent.output += output;
+        // The label a live scan uses: the member active then, "(before first swap)" before the ledger, even for departed members.
+        const label = activeMemberAt(events, pool.name, at) ?? "(before first swap)";
+        const recent = recentByMember.get(label) ?? { member: label, messages: 0, input: 0, output: 0 };
+        recent.messages += 1;
+        recent.input += input;
+        recent.output += output;
+        recentByMember.set(label, recent);
       }
       row.firstMs = Math.min(row.firstMs, at);
       row.lastMs = Math.max(row.lastMs, at);
@@ -403,5 +417,6 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
       row.dailyUsage[day] = (row.dailyUsage[day] ?? 0) + input + output;
     }
   }
+  options.onRecentSplit?.([...recentByMember.values()].sort((a, b) => b.output - a.output));
   return [...byMember.values()];
 }

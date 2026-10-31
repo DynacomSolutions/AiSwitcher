@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { snapshotName, bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks, memberCards, resetLabel, rowText } from './model'
+import { snapshotName, bar, bandRows, poolWindowPct, twoToneBar, poolProviders, humanise, resolveCurrent, shares, switchNotice, others, entriesFor, providerBlocks, memberBlocks, memberCards, resetLabel, rowText, stamp } from './model'
 import type { LimitsEntry, SwapAccount, SwapStatus, SwapUsage } from '../types'
 
 const live = (tool: string, name: string, dir: string, pool = false): LimitsEntry => ({
@@ -230,4 +230,10 @@ test('snapshotName: per identity, plus the sanitised session id when given', () 
   expect(snapshotName('/c/swap', 'abc-123')).toBe('swap.abc-123.json')
   expect(snapshotName('/c/swap', '../x/y')).toBe('swap.__x_y.json')
   expect(snapshotName('/c/swap', '')).toBe('swap.json')
+})
+
+test('stamp shows the time today and the date otherwise', () => {
+  const now = new Date(2026, 9, 31, 15, 0).getTime()
+  expect(stamp(new Date(2026, 9, 31, 9, 5).getTime(), now)).toBe('09:05')
+  expect(stamp(new Date(2026, 9, 30, 23, 59).getTime(), now)).toBe('2026-10-30 23:59')
 })

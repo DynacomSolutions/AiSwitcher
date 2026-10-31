@@ -9,7 +9,7 @@ import { isSwapPool } from "../../identities/swap-pool.ts";
 import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotDirtyId, usageSnapshotTargetKey, usageSnapshotDirtyDirectory } from "./snapshot-dirty.ts";
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, type UsageResult, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
-import { RECENT_USAGE_DAYS, type PoolMemberUsage } from "../claude-swap/attribution.ts";
+import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
 import { buildAisTokscaleExportInvocation, runAisTokscaleExportInvocation } from "./tokscale.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
@@ -142,6 +142,7 @@ export interface UsageSnapshotDeps {
   collectSwapPools?: (
     onPoolDone: (pool: UsageTarget["identity"], results: UsageResult[], failed?: boolean, nativeBatchCandidate?: UsageResult["nativeBatchCandidate"]) => void | Promise<void>,
     prepareNativeExport?: (target: UsageTarget) => Promise<{ path: string; partitionId: string } | undefined>,
+    onPoolWindow?: (pool: UsageTarget["identity"], members: SwapMemberUsage["members"]) => void,
   ) => Promise<UsageResult[]>;
   captureNative?: (spec: NativeSnapshotCaptureSpec) => Promise<UsageSnapshotPartition["nativeBatch"]>;
 }
@@ -346,7 +347,7 @@ export async function acquireSnapshotLock(path: string): Promise<(() => Promise<
   // flock's child holds a kernel advisory lock on the shared hostPath inode
   // for the whole refresh. The kernel releases it on process exit, including
   // crashes and pod restarts, without PID/hostname/clock based reclamation.
-  const flock = Bun.which("flock");
+  const flock = Bun.which("flock", { PATH: process.env.PATH ?? "" });
   if (!flock) throw new Error("snapshot-lock-unavailable");
   const child = Bun.spawn([flock, "-n", lockPath, "/bin/sh", "-c", "printf locked; cat >/dev/null"], {
     stdin: "pipe", stdout: "pipe", stderr: "ignore",
@@ -705,9 +706,12 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     return !partition?.lastSuccessAt || currentMs - Date.parse(partition.lastSuccessAt) >= ttl || deps.forcePartitionKeys?.includes(key) === true || forcedKeys.has(key);
   });
 
-  const savePartition = async (key: string, tool: string | undefined, identity: string | undefined, results: UsageResult[], nativeCandidate = candidateFromResults(results) ?? nativeCandidates.get(key)) => {
+  const savePartition = async (key: string, tool: string | undefined, identity: string | undefined, results: UsageResult[], nativeCandidate = candidateFromResults(results) ?? nativeCandidates.get(key), splitUsage?: SwapMemberUsage) => {
     producer.sourceScansTotal++;
     const prior = partitions[key];
+    // Pool split computed this cycle, else the last good one; written in the same commit as the partition.
+    const memberUsage = splitUsage ?? prior?.memberUsage;
+    const memberUsageField = memberUsage ? { memberUsage } : {};
     if (hasCollectorError(results)) {
       producer.sourceScanFailuresTotal++;
       if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
@@ -716,6 +720,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
         nativeCoverage: "error",
         results: prior?.results ?? [],
         ...(prior?.nativeBatch ? { nativeBatch: prior.nativeBatch } : {}),
+        ...memberUsageField,
         lastAttemptAt: attemptedAt,
         ...(prior?.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
         lastError: errorCategory(results),
@@ -755,6 +760,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       partitions[key] = {
         ...(tool ? { tool } : {}), ...(identity ? { identity } : {}), nativeCoverage: "error",
         results: prior?.results ?? [], ...(prior?.nativeBatch ? { nativeBatch: prior.nativeBatch } : {}),
+        ...memberUsageField,
         lastAttemptAt: attemptedAt, ...(prior?.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
         lastError: "native-capture-failed", lastErrorAt: attemptedAt,
         nativeFailure: nativeCaptureFailure(error),
@@ -769,6 +775,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       nativeCoverage,
       results: safeResults(results),
       ...(nativeBatch ? { nativeBatch } : {}),
+      ...memberUsageField,
       lastAttemptAt: attemptedAt,
       lastSuccessAt: new Date(now()).toISOString(),
       nativeFailure: undefined,
@@ -830,18 +837,14 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     const dueNames = new Set(dueSwapPools.map((target) => target.identity.name));
     const completedPoolNames = new Set<string>();
     const poolWindows = new Map<string, SwapMemberUsage>();
-    const onPoolWindow = (pool: UsageTarget["identity"], usages: PoolMemberUsage[]) => {
-      poolWindows.set(pool.name, {
-        days: RECENT_USAGE_DAYS,
-        at: new Date(now()).toISOString(),
-        members: usages.map((usage) => ({ member: usage.member ?? "(unattributed)", ...usage.recent })),
-      });
+    const onPoolWindow = (pool: UsageTarget["identity"], members: SwapMemberUsage["members"]) => {
+      poolWindows.set(pool.name, { days: RECENT_USAGE_DAYS, at: new Date(now()).toISOString(), members });
     };
     const onPoolDone = async (pool: UsageTarget["identity"], results: UsageResult[], failed = false, nativeCandidate?: UsageResult["nativeBatchCandidate"]) => {
       if (!dueNames.has(pool.name)) return;
       completedPoolNames.add(pool.name);
       const key = targetKey({ toolName: "claude", identity: pool });
-      const priorMemberUsage = partitions[key]?.memberUsage;
+      const memberUsage = poolWindows.get(pool.name) ?? partitions[key]?.memberUsage;
       if (failed) {
         producer.sourceScansTotal++;
         producer.sourceScanFailuresTotal++;
@@ -850,22 +853,18 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
           tool: "claude", identity: pool.name, nativeCoverage: "error", results: prior?.results ?? [], lastAttemptAt: attemptedAt,
           ...(prior?.nativeBatch ? { nativeBatch: prior.nativeBatch } : {}),
           ...(prior?.lastSuccessAt ? { lastSuccessAt: prior.lastSuccessAt } : {}),
-          ...(priorMemberUsage ? { memberUsage: priorMemberUsage } : {}),
+          // The split is computed from local transcripts before tokscale runs, so a tokscale failure keeps it.
+          ...(memberUsage ? { memberUsage } : {}),
           lastError: "source-error", lastErrorAt: attemptedAt,
         };
         writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
         return;
       }
-      await savePartition(key, "claude", pool.name, results, nativeCandidate ?? candidateFromResults(results));
-      const memberUsage = poolWindows.get(pool.name) ?? priorMemberUsage;
-      if (memberUsage && partitions[key]) {
-        partitions[key]!.memberUsage = memberUsage;
-        writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
-      }
+      await savePartition(key, "claude", pool.name, results, nativeCandidate ?? candidateFromResults(results), poolWindows.get(pool.name));
     };
     try {
       if (deps.collectSwapPools) {
-        await deps.collectSwapPools(onPoolDone, prepareNativeExportCandidate);
+        await deps.collectSwapPools(onPoolDone, prepareNativeExportCandidate, onPoolWindow);
       } else {
         await swapPoolUsageResults({}, undefined,
           async (target, suppression) => {
@@ -913,13 +912,13 @@ export interface SwapUsageFromSnapshot extends SwapMemberUsage {
 }
 
 /** Per-member split the collector stored for a pool, or undefined when there is no snapshot, no such pool,
- * or the collector predates the split. Never scans. `stale` once the split is older than two partition TTLs. */
+ * or the collector predates the split. Never scans. `stale` once the split is older than two partition TTLs, or dated more than 5 minutes ahead. */
 export function readSwapUsageFromSnapshot(pool: string, path = USAGE_SNAPSHOT_FILE, now = Date.now()): SwapUsageFromSnapshot | undefined {
   const partition = Object.values(readSnapshot(path)?.partitions ?? {}).find((candidate) => candidate.tool === "claude" && candidate.identity === pool && !candidate.retired);
   const usage = partition?.memberUsage;
   if (!usage || typeof usage.at !== "string" || !Number.isFinite(Date.parse(usage.at)) || !Number.isFinite(usage.days) || !Array.isArray(usage.members) ||
       !usage.members.every((m) => m && typeof m.member === "string" && [m.messages, m.input, m.output].every(Number.isFinite))) return undefined;
-  return { pool, ...usage, stale: now - Date.parse(usage.at) >= 2 * USAGE_SNAPSHOT_PARTITION_TTL_MS };
+  return { pool, ...usage, stale: now - Date.parse(usage.at) >= 2 * USAGE_SNAPSHOT_PARTITION_TTL_MS || Date.parse(usage.at) - now > 5 * 60_000 };
 }
 
 export function readUsageSnapshotEnvelope(
