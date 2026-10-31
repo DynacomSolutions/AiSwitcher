@@ -162,7 +162,7 @@ jobs:
       - name: Browser smoke
         if: runner.os == 'Linux'
         run: |
-          npm install --prefix "$RUNNER_TEMP/host-playwright" --no-audit --no-fund @playwright/test@1.58.2
+          npm install --prefix "$RUNNER_TEMP/host-playwright" --no-audit --no-fund @playwright/test@1.64.1
           node "$RUNNER_TEMP/host-playwright/node_modules/playwright/cli.js" install --with-deps chromium
           export HOST_PLAYWRIGHT_MODULE="$RUNNER_TEMP/host-playwright/node_modules/@playwright/test"
           bun run --cwd apps/host test:smoke
