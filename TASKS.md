@@ -108,3 +108,10 @@ UK 16:00 BST on 2026-10-24; owner check after.
 | 85 | C5 Host app on macOS: list USB drives, privileged write helper with macOS authorisation, create and update drives | done | | | 2.66 | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/243 (2026-10-21) after security review fixes; CI green on macOS, Linux and Windows. Admin prompt and a real stick write are first exercised in row 86. |
 | 86 | Owner check: create a USB stick with the signed macOS app, boot it, then Refresh and Pull logs | blocked_on_owner | Thomas | | 2.88 | | Needed from Thomas: on a Mac with a spare USB stick, download `ais-host-macos-arm64.dmg` from the `host-v0.1.5` draft release (after 2.88), open it, drag ais Host to Applications, create a new drive with it, boot it on any machine that can boot from USB, then run Refresh and Pull logs in the app and report the result. Use a newly created drive; older drives lack the drive ID file. |
 | 87 | C6 Host app on Windows: list USB drives and write helper | done | | | 2.85 | | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/253 (2026-10-22): USB listing, elevated write helper, exFAT exchange create/update, per-machine installer with protected-install check; two security reviews, all findings fixed. Not yet run on real Windows hardware. Storage reset stays Linux-only. |
+
+## 3. ais-usage mod cost
+ETA: 2026-11-07 18:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 97 | ais-usage mod: usage scan per session is 60 to 120 s and always times out | todo | | | | | mods/ais-usage/hooks/register.tsx runs `ais claude-swap usage --json` per session every 600 s, 20 s timeout.<br>On a large host a scan takes 60 to 120 s, opens 24,188 transcripts, polls statm 7,421 times; 125 scans in 24 h, each ~16 GB page cache. Mod never gets a value.<br>Fix: scan once in src/cli/usage/collector-service.ts, mod reads ~/.ais/cache/usage/snapshot.json; drop statm polling. |
