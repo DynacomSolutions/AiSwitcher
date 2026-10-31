@@ -87,6 +87,15 @@ describe("swap pool usage attribution cache", () => {
     return { root, pool, ledger, transcript, cachePath, msg };
   }
 
+  test("recent counts only messages inside the 30-day window", async () => {
+    const f = await fixture();
+    const at = (ts: string, id: string, output: number) => JSON.stringify({ timestamp: ts, message: { id, model: "claude-opus-4-8", usage: { input_tokens: 10, output_tokens: output } } });
+    await writeFile(f.transcript, [at("2026-09-20T00:00:00Z", "old", 5), at("2026-10-25T00:00:00Z", "new", 7)].join("\n"));
+    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath, now: Date.parse("2026-11-01T00:00:00Z") });
+    expect(usage[0]?.recent).toEqual({ messages: 1, input: 10, output: 7 });
+    expect(usage[0]?.entries[0]?.messageCount).toBe(2);
+  });
+
   test("reuses unchanged files after restart without reopening transcripts", async () => {
     const f = await fixture();
     await writeFile(f.transcript, `${f.msg("one", 2)}\n`);

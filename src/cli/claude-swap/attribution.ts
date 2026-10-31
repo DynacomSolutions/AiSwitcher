@@ -157,7 +157,11 @@ export interface PoolMemberUsage {
   firstMs: number;
   lastMs: number;
   dailyUsage: Record<string, number>;
+  /** Messages and tokens within the last RECENT_USAGE_DAYS, for the shared snapshot's per-member split. */
+  recent: { messages: number; input: number; output: number };
 }
+
+export const RECENT_USAGE_DAYS = 30;
 
 // A tuple keeps the durable cache substantially smaller than the source JSONL
 // rows and avoids storing member attribution or derived pricing.
@@ -175,6 +179,7 @@ interface PoolUsageCache {
 /** Test hooks for proving unchanged transcript files are not reopened. */
 export interface PoolMemberModelUsageOptions {
   cachePath?: string;
+  now?: number;
   onSourceFileRead?: (path: string) => void;
   /** Injectable discovery hooks for deterministic race/error tests. */
   readdir?: (path: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
@@ -321,6 +326,7 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
   const known = new Set(members.map((m) => m.name));
   const byMember = new Map<string | undefined, PoolMemberUsage>();
   const seen = new Set<string>();
+  const recentSinceMs = (options.now ?? Date.now()) - RECENT_USAGE_DAYS * 86_400_000;
   const projectsDir = join(pool.configDir, "projects");
   const cachePath = options.cachePath ?? defaultPoolUsageCachePath(pool);
   const previous = await readPoolUsageCache(cachePath);
@@ -372,7 +378,7 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
       }
       const actualName = activeMemberAt(events, pool.name, at) ?? fallback;
       const member = actualName !== undefined && known.has(actualName) ? actualName : undefined;
-      const row = byMember.get(member) ?? { member, entries: [], firstMs: at, lastMs: at, dailyUsage: {} };
+      const row = byMember.get(member) ?? { member, entries: [], firstMs: at, lastMs: at, dailyUsage: {}, recent: { messages: 0, input: 0, output: 0 } };
       byMember.set(member, row);
       const model = modelName ?? "unknown";
       let entry = row.entries.find((e) => e.model === model);
@@ -386,6 +392,11 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
       entry.cacheWrite += cacheWrite;
       entry.messageCount += 1;
       entry.cost += estimateChatModelTokenCost(model, input, output, cacheRead, cacheWrite) ?? 0;
+      if (at >= recentSinceMs) {
+        row.recent.messages += 1;
+        row.recent.input += input;
+        row.recent.output += output;
+      }
       row.firstMs = Math.min(row.firstMs, at);
       row.lastMs = Math.max(row.lastMs, at);
       const day = localDateKey(at);

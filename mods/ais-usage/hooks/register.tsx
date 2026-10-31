@@ -213,6 +213,7 @@ export const register: Register = on => {
       }
     }
     const refreshUsage = async () => {
+      // Reads the collector's snapshot; the CLI never scans transcripts for --json, so a missing snapshot is an error line, not a slow call.
       const v = await fetchJson<SwapUsage>('usage', ['claude-swap', 'usage', '--json'], 20000)
       if (v) await update($, usage, () => v)
     }
@@ -422,6 +423,7 @@ export const register: Register = on => {
             ))}
             <Text dimColor>
               30d total: {humanise(tot.messages)} messages, {humanise(tot.output)} output tokens
+              {us?.stale && us.generatedAt ? ` (stale, as of ${clock(Date.parse(us.generatedAt))})` : ''}
             </Text>
           </Box>
         )}

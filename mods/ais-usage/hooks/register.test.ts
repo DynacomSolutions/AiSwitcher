@@ -214,3 +214,29 @@ test('ais-swap rejects more than one word', async ($, on) => {
   expect(calls).toEqual([])
   expect(res.text).toMatch(/^Usage: \/ais-swap/)
 })
+
+test('usage is read from the collector snapshot: no --scan, one call per interval', async ($, on) => {
+  mock.env(on, { CLAUDE_CONFIG_DIR: dir, HOME: '/h' })
+  const clock = mock.clock(on)
+  mock.store(on)
+  const usageCalls: { argv: string[] }[] = []
+  on('fs.write', () => ({ value: undefined }) as never)
+  on('session.start', ($$: any, e: any) => ({ cwd: e.cwd }))
+  on('command.register', () => ({ value: { command: 'ais-usage' } }))
+  on('process.run', ($$: any, e: any) => {
+    if (e.argv.includes('usage')) {
+      usageCalls.push({ argv: e.argv.slice(1) })
+      return { value: { exitCode: 1, stdout: '', stderr: 'no usage snapshot for pool team-pool' } } as never
+    }
+    const out = e.argv.includes('limits') ? limits : status
+    return { value: { exitCode: 0, stdout: JSON.stringify(out), stderr: '' } } as never
+  })
+  await $.session.start?.({ cwd: '/', surface: 'terminal', isInteractive: true } as never)
+  await clock.advance(1)
+  expect(usageCalls.map(c => c.argv)).toEqual([['claude-swap', 'usage', '--json']])
+  await clock.advance(600_000)
+  expect(usageCalls.length).toBe(2)
+  for (const c of usageCalls) {
+    expect(c.argv).toEqual(['claude-swap', 'usage', '--json'])
+  }
+})

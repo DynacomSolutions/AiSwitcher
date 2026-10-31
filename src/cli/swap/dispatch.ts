@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { MemberUsage } from "../../identities/claude-usage-api.ts";
 import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
 import { eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
@@ -24,13 +24,14 @@ import {
   validateMembers,
 } from "../../identities/pool/swap-pool.ts";
 import type { IdentitiesFile, ToolConfig } from "../../identities/types.ts";
-import { aisSwapLedgerPath } from "../../shared/ais-home.ts";
+import { aisCacheDir, aisSwapLedgerPath } from "../../shared/ais-home.ts";
 import { boolFlag, listFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { bold, dim, green, yellow } from "../colors.ts";
 import { createIdentity } from "../identities/actions.ts";
 import { CliUsageError } from "../errors.ts";
 import { helpText } from "../help.ts";
 import { poolMemberUsageSplit } from "../claude-swap/attribution.ts";
+import { acquireSnapshotLock, readSwapUsageFromSnapshot } from "../usage/snapshot.ts";
 
 export interface SwapDeps extends PoolOpsDeps<any> {
   log?: (line: string) => void;
@@ -40,6 +41,10 @@ export interface SwapDeps extends PoolOpsDeps<any> {
   spawnContinuation?: (req: ContinueRequest) => void;
   /** Environment for HERDR_PANE_ID; default process.env. */
   env?: Record<string, string | undefined>;
+  /** Collector snapshot `usage --json` reads; default: the shared ~/.ais/cache/usage/snapshot.json. */
+  usageSnapshotPath?: string;
+  /** Lock base path for live `usage` scans; default: ~/.ais/cache/usage/swap-usage-scan. */
+  usageScanLockPath?: string;
 }
 
 const usageText = (cmd: string): string => `Usage: ${cmd} <subcommand>; run "ais swap help" for the list`;
@@ -339,7 +344,23 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         const days = Number(stringFlag(flags, "days") ?? 30);
         const file = await loadIdentitiesFile(registryPath);
         const pool = requirePool(file, rest[0] ?? poolFlag, tool);
-        const split = await poolMemberUsageSplit(pool, { days, ledgerPath: deps.ledgerPath ?? aisSwapLedgerPath(tool), tool: tool as "claude" | "codex" });
+        // A full transcript scan takes minutes on a large host, so `--json` (the mod's call, once per session) reads the
+        // collector's snapshot instead. `--scan` and the table view still scan, one at a time.
+        if (json && tool === "claude" && !boolFlag(flags, "scan")) {
+          const stored = readSwapUsageFromSnapshot(pool.name, deps.usageSnapshotPath);
+          if (!stored) throw new SwapPoolError(`no usage snapshot for pool ${pool.name}: start the collector (ais-usage-snapshot.service) or pass --scan`);
+          return log(JSON.stringify({ pool: stored.pool, days: stored.days, members: stored.members, generatedAt: stored.at, stale: stored.stale }, null, 2));
+        }
+        const lockBase = deps.usageScanLockPath ?? join(aisCacheDir(), "usage", "swap-usage-scan");
+        await mkdir(dirname(lockBase), { recursive: true, mode: 0o700 });
+        const releaseScan = await acquireSnapshotLock(lockBase);
+        if (!releaseScan) throw new SwapPoolError("another usage scan is already running; try again when it finishes or use the collector snapshot (usage --json)");
+        let split;
+        try {
+          split = await poolMemberUsageSplit(pool, { days, ledgerPath: deps.ledgerPath ?? aisSwapLedgerPath(tool), tool: tool as "claude" | "codex" });
+        } finally {
+          await releaseScan();
+        }
         if (json) return log(JSON.stringify(split, null, 2));
         log(bold(`${pool.name}: transcript usage by active member, last ${days}d`));
         for (const row of split.members) {

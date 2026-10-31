@@ -31,7 +31,8 @@ export type SwapStatus = {
   accounts: SwapAccount[]
 }
 export type SwapMember = { member: string; messages: number; input: number; output: number }
-export type SwapUsage = { pool: string; days: number; members: SwapMember[] }
+/** From the collector's snapshot: generatedAt is when it computed the split, stale once that is over 30 minutes old. */
+export type SwapUsage = { pool: string; days: number; members: SwapMember[]; generatedAt?: string; stale?: boolean }
 
 declare module 'claude-code' {
   interface PluginState {
