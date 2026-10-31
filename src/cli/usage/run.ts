@@ -3,7 +3,7 @@ import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import { isRetired } from "../../identities/retired.ts";
 import { aisClaudeSwapLedgerPath } from "../../shared/ais-home.ts";
 import { isSwapPool, poolsOf } from "../../identities/swap-pool.ts";
-import { poolMemberModelUsage } from "../claude-swap/attribution.ts";
+import { poolMemberModelUsage, type RecentMemberSplit } from "../claude-swap/attribution.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { CLAUDE_CONFIG } from "../../identities/tool-configs.ts";
@@ -525,6 +525,7 @@ export async function swapPoolUsageResults(
   tokscaleForPool: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]> = runTokscaleForUsageTarget,
   onPoolDone?: (pool: Identity, results: UsageResult[], failed?: boolean, nativeBatchCandidate?: UsageResult["nativeBatchCandidate"]) => void | Promise<void>,
   includePoolNames?: ReadonlySet<string>,
+  onPoolWindow?: (pool: Identity, members: RecentMemberSplit) => void,
 ): Promise<UsageResult[]> {
   const toolFilter = toolConfigFromFlag(flags);
   if (toolFilter && toolFilter.toolName !== "claude") return [];
@@ -536,7 +537,7 @@ export async function swapPoolUsageResults(
     const poolStart = results.length;
     try {
     const members = pool.swapPool.accounts.map((name) => file.identities.find((i) => i.name === name)).filter((i): i is Identity => i !== undefined);
-    const usages = await poolMemberModelUsage(pool, members, ledgerPath);
+    const usages = await poolMemberModelUsage(pool, members, ledgerPath, onPoolWindow ? { onRecentSplit: (split) => onPoolWindow(pool, split) } : {});
     // Cost: the pool's tokscale per-model cost, split by each member's token share
     // of that model (the transcripts carry no cost). Models tokscale did not
     // report keep the list-price estimate.

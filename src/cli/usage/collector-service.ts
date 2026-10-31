@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 
 export const USAGE_COLLECTOR_SERVICE_NAME = "ais-usage-snapshot.service";
@@ -163,6 +164,15 @@ async function enableStartAndVerifyUserUnit(serviceName: string, restartIfActive
       throw new Error(`usage collector service ${property} is ${state.trim() || error.trim() || `exit ${code}`}, expected ${expected}`);
     }
   }
+}
+
+/** True when the collector service is installed on this host: its unit file exists (Linux), or a running
+ * collector has marked itself as the refresh owner. Hosts without one fall back to live scans. */
+export function usageCollectorInstalled(options: { unitDirectory?: string; platform?: NodeJS.Platform; ownsRefreshes?: () => boolean } = {}): boolean {
+  if (options.ownsRefreshes?.()) return true;
+  if ((options.platform ?? process.platform) !== "linux") return false;
+  const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  return existsSync(join(options.unitDirectory ?? join(configHome, "systemd", "user"), USAGE_COLLECTOR_SERVICE_NAME));
 }
 
 /** True when this login has a reachable user systemd manager. */

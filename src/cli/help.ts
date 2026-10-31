@@ -88,7 +88,7 @@ export const HELP: Record<string, HelpNode> = {
       auto: sub("ais swap <tool> auto on|off [--threshold=95]", "Automatic swap near the limit"),
       pool: sub("ais swap <tool> pool create <name> --accounts=a,b [--config-dir=]", "Create a pool identity"),
       hook: sub("ais swap claude hook on|off [--pool=]", "Optional StopFailure rate-limit hook (claude only)"),
-      usage: sub("ais swap <tool> usage", "Per-member usage split (claude, codex)"),
+      usage: sub("ais swap <tool> usage [--json] [--scan]", "Per-member usage split (claude, codex); claude --json reads the collector snapshot, --scan forces a live scan"),
     },
   },
   "claude-swap": { usage: "ais claude-swap [subcommand]", desc: 'Alias of "ais swap claude"; see "ais swap help"' },

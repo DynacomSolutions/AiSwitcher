@@ -8,6 +8,7 @@ import {
   externalUsageCollectorOwnsRefreshes,
   recordUsageSnapshotRefreshFailure,
   readUsageSnapshotEnvelope,
+  readSwapUsageFromSnapshot,
   refreshUsageSnapshot,
   USAGE_SNAPSHOT_DIRTY_MIN_INTERVAL_MS,
   validateNativeBatchEnvelope,
@@ -189,6 +190,59 @@ describe("shared usage snapshot", () => {
     expect(snapshot.partitions[key]?.nativeBatch?.partitionId).toBe(partitionId);
     expect(snapshot.partitions[key]?.nativeFailure).toBeUndefined();
     expect(snapshot.partitions[key]?.lastSuccessAt).toBe(new Date(now).toISOString());
+  });
+
+  test("the pool member split is stored with a good pass, kept through a source failure, and kept when the pool is not rescanned", async () => {
+    const path = await snapshotFile();
+    const pool = { ...identity, name: "pool", swapPool: { accounts: [identity.name], active: identity.name } };
+    const poolTarget: UsageTarget = { toolName: "claude", identity: pool };
+    const key = usageSnapshotTargetKey("claude", pool.name);
+    const split = [{ member: "work", messages: 3, input: 30, output: 9 }];
+    const read = async () => (JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, { memberUsage?: { days: number; at: string; members: unknown[] }; lastSuccessAt?: string; lastError?: string }> }).partitions[key]!;
+    const base = (now: number) => ({ ...deps(path, { now, results: [] }), collectTargets: async () => [], collectPoolTargets: async () => [poolTarget] });
+
+    const t0 = Date.UTC(2026, 0, 1);
+    await refreshUsageSnapshot({ ...base(t0), collectSwapPools: async (onPoolDone, _prepare, onPoolWindow) => {
+      onPoolWindow!(pool, split);
+      await onPoolDone(pool, []);
+      return [];
+    } });
+    let part = await read();
+    expect(part.memberUsage).toEqual({ days: 30, at: new Date(t0).toISOString(), members: split });
+    expect(part.lastSuccessAt).toBe(new Date(t0).toISOString());
+
+    // Tokscale fails after the local split was computed: the new split lands next to the error.
+    const t1 = t0 + 3_600_000;
+    await refreshUsageSnapshot({ ...base(t1), collectSwapPools: async (onPoolDone, _prepare, onPoolWindow) => {
+      onPoolWindow!(pool, [{ member: "work", messages: 4, input: 40, output: 12 }]);
+      await onPoolDone(pool, [], true);
+      return [];
+    } });
+    part = await read();
+    expect(part.lastError).toBe("source-error");
+    expect(part.memberUsage).toEqual({ days: 30, at: new Date(t1).toISOString(), members: [{ member: "work", messages: 4, input: 40, output: 12 }] });
+
+    // Even when no split was computed this cycle, the last good one survives a failed pass.
+    await refreshUsageSnapshot({ ...base(t1 + 3_600_000), collectSwapPools: async (onPoolDone) => { await onPoolDone(pool, [], true); return []; } });
+    expect((await read()).memberUsage?.at).toBe(new Date(t1).toISOString());
+  });
+
+  test("a split dated in the future, or older than two TTLs, reads as stale", async () => {
+    const path = await snapshotFile();
+    const key = usageSnapshotTargetKey("claude", "pool");
+    const now = Date.UTC(2026, 0, 1);
+    const write = (at: number) => writeFile(path, JSON.stringify({ schemaVersion: 1, generatedAt: new Date(now).toISOString(), partitions: { [key]: {
+      tool: "claude", identity: "pool", results: [], lastAttemptAt: new Date(now).toISOString(), memberUsage: { days: 30, at: new Date(at).toISOString(), members: [] },
+    } } }));
+    await mkdir(dirname(path), { recursive: true });
+    await write(now - 60_000);
+    expect(readSwapUsageFromSnapshot("pool", path, now)?.stale).toBe(false);
+    await write(now - 31 * 60_000);
+    expect(readSwapUsageFromSnapshot("pool", path, now)?.stale).toBe(true);
+    await write(now + 4 * 60_000);
+    expect(readSwapUsageFromSnapshot("pool", path, now)?.stale).toBe(false);
+    await write(now + 6 * 60_000);
+    expect(readSwapUsageFromSnapshot("pool", path, now)?.stale).toBe(true);
   });
 
   test("Codex Bedrock report partitions are explicitly report-only for native coverage", async () => {

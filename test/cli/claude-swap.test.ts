@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +6,7 @@ import { hookCommand } from "../../src/identities/claude-swap-hook.ts";
 import { runClaudeSwapCommand } from "../../src/cli/claude-swap/dispatch.ts";
 import { continuedSince, runContinuation, CONTINUE_TEXT } from "../../src/identities/claude-swap-continue.ts";
 import { loadIdentitiesFile } from "../../src/identities/store.ts";
+import { acquireSnapshotLock } from "../../src/cli/usage/snapshot.ts";
 import { mergeIdentity } from "../../src/sync/registry.ts";
 
 const dirs: string[] = [];
@@ -283,4 +284,119 @@ test("hook swap schedules the continuation only with a pane, a transcript and a 
   }
   expect(spawned).toHaveLength(1);
   expect(errors).toEqual(["ais live: Claude swap auto-continue disabled"]);
+});
+
+describe("usage --json serves the collector snapshot", () => {
+  const usageDeps = (snapshot: string, collectorInstalled = true) => ({ ...deps(), usageSnapshotPath: snapshot, usageScanLockPath: join(root, "scan"), collectorInstalled: () => collectorInstalled });
+  const writeSnapshot = async (path: string, at: string | undefined) => {
+    await writeFile(path, JSON.stringify({
+      schemaVersion: 1, generatedAt: at ?? "2026-10-31T00:00:00Z",
+      partitions: { "target:claude-swap-pool:shared": {
+        tool: "claude", identity: "shared", results: [], lastAttemptAt: "2026-10-31T00:00:00Z",
+        ...(at ? { memberUsage: { days: 30, at, members: [{ member: "a", messages: 5, input: 10, output: 20 }] } } : {}),
+      } },
+    }));
+  };
+  const withPool = async () => {
+    await runClaudeSwapCommand(["pool", "create", "shared"], { accounts: "a,b", "config-dir": join(root, "shared") }, deps());
+    // A transcript a live scan would count; the snapshot read must not open it.
+    await mkdir(join(root, "shared", "projects", "p"), { recursive: true });
+    await writeFile(join(root, "shared", "projects", "p", "s.jsonl"), JSON.stringify({ timestamp: new Date().toISOString(), message: { id: "x", usage: { output_tokens: 999 } } }));
+    out = [];
+  };
+
+  test("fresh snapshot is returned without scanning transcripts", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    await writeSnapshot(snapshot, new Date().toISOString());
+    await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot));
+    const shown = JSON.parse(out.join("\n"));
+    expect(shown).toMatchObject({ pool: "shared", days: 30, stale: false, members: [{ member: "a", messages: 5, input: 10, output: 20 }] });
+  });
+
+  test("old snapshot is still returned, flagged stale with its age", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    const old = new Date(Date.now() - 3 * 3_600_000).toISOString();
+    await writeSnapshot(snapshot, old);
+    await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot));
+    expect(JSON.parse(out.join("\n"))).toMatchObject({ stale: true, generatedAt: old, members: [{ output: 20 }] });
+  });
+
+  test("collector installed but no split yet is an error and never a scan", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    await expect(runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot))).rejects.toThrow(/not scanning/);
+    await writeSnapshot(snapshot, undefined);
+    await expect(runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot))).rejects.toThrow(/not scanning/);
+    expect(out).toEqual([]);
+  });
+
+  test("no collector on this host: fall back to one scan under the lock, a concurrent caller fails fast", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot, false));
+    expect(JSON.parse(out.join("\n")).members[0]).toMatchObject({ messages: 1, output: 999 });
+    const release = await acquireSnapshotLock(join(root, "scan"));
+    try {
+      await expect(runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot, false))).rejects.toThrow(/already running/);
+    } finally {
+      await release!();
+    }
+  });
+
+  test("a snapshot with a split wins even where no collector is installed", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    await writeSnapshot(snapshot, new Date().toISOString());
+    await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot, false));
+    expect(JSON.parse(out.join("\n")).members[0]).toMatchObject({ messages: 5, output: 20 });
+  });
+
+  test("no collector and a stale split: rescan, or serve the stale split while another scan holds the lock", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    const old = new Date(Date.now() - 3 * 3_600_000).toISOString();
+    await writeSnapshot(snapshot, old);
+    await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot, false));
+    expect(JSON.parse(out.join("\n")).members[0]).toMatchObject({ messages: 1, output: 999 });
+    out = [];
+    const release = await acquireSnapshotLock(join(root, "scan"));
+    try {
+      await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot, false));
+    } finally {
+      await release!();
+    }
+    expect(JSON.parse(out.join("\n"))).toMatchObject({ stale: true, generatedAt: old, members: [{ output: 20 }] });
+  });
+
+  test("without flock the scan still runs, unlocked", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    const path = process.env.PATH;
+    process.env.PATH = join(root, "empty");
+    try {
+      expect(Bun.which("flock", { PATH: process.env.PATH ?? "" })).toBeNull();
+      const release = await acquireSnapshotLock(join(root, "scan")).catch(() => "no-flock");
+      expect(release).toBe("no-flock");
+      await runClaudeSwapCommand(["usage"], { json: true, scan: true }, usageDeps(snapshot));
+    } finally {
+      process.env.PATH = path;
+    }
+    expect(JSON.parse(out.join("\n")).members[0]).toMatchObject({ messages: 1, output: 999 });
+  });
+
+  test("--scan runs the live scan, and a second scan while one runs is refused", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    await runClaudeSwapCommand(["usage"], { json: true, scan: true }, usageDeps(snapshot));
+    expect(JSON.parse(out.join("\n")).members[0]).toMatchObject({ messages: 1, output: 999 });
+    const release = await acquireSnapshotLock(join(root, "scan"));
+    expect(release).toBeDefined();
+    try {
+      await expect(runClaudeSwapCommand(["usage"], { json: true, scan: true }, usageDeps(snapshot))).rejects.toThrow(/already running/);
+    } finally {
+      await release!();
+    }
+  });
 });

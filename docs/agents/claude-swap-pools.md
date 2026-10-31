@@ -137,6 +137,13 @@ session's snapshot `pluginVersion` is missing or below `PLUGIN_VERSION` (keep it
 through `claude-swap/attribution.ts` `poolMemberUsageSplit(..., {tool})`:
 claude reads `projects/`, codex reads `sessions/**/rollout-*.jsonl`
 `token_count` events; both attribute by `activeMemberAt` on the tool's ledger.
+Claude `usage --json` (the ais-usage mod calls it once per session) reads the last-30-day split
+the usage collector stores per pool in `snapshot.json` (`memberUsage`, from `poolMemberModelUsage`'s
+`onRecentSplit`; `stale` after 30 min or when dated >5 min ahead). No split and a collector installed
+(unit file or running marker): exit 1, no scan. No collector on the host, or `--scan`, or the table
+view: live `poolMemberUsageSplit`, single-flight via flock `~/.ais/cache/usage/swap-usage-scan.lock`
+(claude only; unlocked with a stderr note where flock is missing). Both paths count a message id once and
+label pre-ledger messages "(before first swap)".
 `ais limits` mirrors a pool row to its active member of the SAME tool (the
 pointer lists every member; see the 2026-10-25 section below).
 
