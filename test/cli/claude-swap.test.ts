@@ -353,6 +353,23 @@ describe("usage --json serves the collector snapshot", () => {
     expect(JSON.parse(out.join("\n")).members[0]).toMatchObject({ messages: 5, output: 20 });
   });
 
+  test("no collector and a stale split: rescan, or serve the stale split while another scan holds the lock", async () => {
+    await withPool();
+    const snapshot = join(root, "snapshot.json");
+    const old = new Date(Date.now() - 3 * 3_600_000).toISOString();
+    await writeSnapshot(snapshot, old);
+    await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot, false));
+    expect(JSON.parse(out.join("\n")).members[0]).toMatchObject({ messages: 1, output: 999 });
+    out = [];
+    const release = await acquireSnapshotLock(join(root, "scan"));
+    try {
+      await runClaudeSwapCommand(["usage"], { json: true }, usageDeps(snapshot, false));
+    } finally {
+      await release!();
+    }
+    expect(JSON.parse(out.join("\n"))).toMatchObject({ stale: true, generatedAt: old, members: [{ output: 20 }] });
+  });
+
   test("without flock the scan still runs, unlocked", async () => {
     await withPool();
     const snapshot = join(root, "snapshot.json");

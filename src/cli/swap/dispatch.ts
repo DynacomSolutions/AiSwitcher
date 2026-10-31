@@ -349,11 +349,15 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
         const pool = requirePool(file, rest[0] ?? poolFlag, tool);
         // A full transcript scan takes minutes on a large host, so `--json` (the mod's call, once per session) reads the
         // collector's snapshot. Only a host with no collector, or an explicit `--scan`, scans; scans are single-flight.
+        let staleFallback: string | undefined;
         if (json && tool === "claude" && !boolFlag(flags, "scan")) {
           const stored = readSwapUsageFromSnapshot(pool.name, deps.usageSnapshotPath);
-          if (stored) return log(JSON.stringify({ pool: stored.pool, days: stored.days, members: stored.members, generatedAt: stored.at, stale: stored.stale }, null, 2));
+          const shown = stored && JSON.stringify({ pool: stored.pool, days: stored.days, members: stored.members, generatedAt: stored.at, stale: stored.stale }, null, 2);
           const installed = (deps.collectorInstalled ?? (() => usageCollectorInstalled({ ownsRefreshes: externalUsageCollectorOwnsRefreshes })))();
+          // A host with no collector has nobody refreshing the split, so a stale one is rescanned (the old split is the fallback if a scan is already running).
+          if (shown && (installed || !stored.stale)) return log(shown);
           if (installed) throw new SwapPoolError(`no usage split for pool ${pool.name} in the collector snapshot yet (is ais-usage-snapshot.service running the current ais?); not scanning`);
+          staleFallback = shown;
         }
         // The lock needs flock(1), absent on stock macOS: scan unlocked there, as before the lock existed. Claude only.
         let releaseScan: (() => Promise<void>) | undefined;
@@ -362,7 +366,10 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
             const lockBase = deps.usageScanLockPath ?? join(aisCacheDir(), "usage", "swap-usage-scan");
             await mkdir(dirname(lockBase), { recursive: true, mode: 0o700 });
             releaseScan = await acquireSnapshotLock(lockBase);
-            if (!releaseScan) throw new SwapPoolError("another usage scan is already running; try again when it finishes");
+            if (!releaseScan) {
+              if (staleFallback) return log(staleFallback);
+              throw new SwapPoolError("another usage scan is already running; try again when it finishes");
+            }
           } else {
             console.error("flock not found: running the usage scan without the single-flight lock");
           }
