@@ -118,15 +118,18 @@ back; meeting it is the app's job.
   to true`, so there is no non-streamed call). The SDK's `responses.stream()`
   helper throws on the backend's `response.metadata` event; iterate
   `responses.create({ stream: true })` instead. Known gap: the Codex backend sends
-  its SSE without a `content-type` header, so the gateway records no usage for
-  Codex requests yet (board row 4.110); requests themselves work.
+  its SSE without a `content-type` header, so the gateway sniffs the body
+  (`event:`, `data:` or `:` first means SSE) so usage is still recorded.
 - **kimi** (anthropic or openai): the Kimi Coding endpoint; choose the style that
   matches your SDK.
 - **grok** (openai style): Chat Completions. The endpoint answers 426 to a caller
   with no Grok CLI version; send the header `x-grok-client-version: 1.0.70` (any
   version from 1.0.13 up).
 - **zai** (anthropic or openai): choose the style that matches your SDK.
-- **ali** (anthropic style only): Alibaba Token Plan.
+- **ali** (anthropic style only): Alibaba Token Plan. UNPROVEN: the route is
+  written from the Anthropic-compatible base URL and an inferred `x-api-key`
+  header, and has never been run against the live endpoint (no ali identity on
+  the host, board row 4.111).
 - **opencode** (openai style only): OpenCode Go. Send an `x-opencode-session`
   header (any stable id per conversation); without it the endpoint answers 400
   `MissingSessionID`. `GET /models` lists the models the plan serves; `glm-5` is
