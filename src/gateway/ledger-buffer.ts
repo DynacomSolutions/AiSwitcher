@@ -34,6 +34,10 @@ export class LedgerBuffer {
   }
 
   push(row: UsageRow): void {
+    if (this.closed) {
+      this.droppedCount += 1;
+      return;
+    }
     this.rows.push(row);
     this.trim();
   }
@@ -62,13 +66,39 @@ export class LedgerBuffer {
       try {
         await this.store.appendUsage(batch);
       } catch (err) {
-        // Put the batch back in front of rows pushed meanwhile, then stop until the next tick.
-        this.rows.unshift(...batch);
-        this.trim();
-        console.warn(`gateway ledger flush failed: ${err instanceof Error ? err.message : String(err)}`);
-        return;
+        const msg = err instanceof Error ? err.message : String(err);
+        const rejected = batch.length > 1 ? await this.isolate(batch) : undefined;
+        if (rejected === undefined) {
+          // Store looks down: put the batch back in front of rows pushed meanwhile and wait for the next tick.
+          this.rows.unshift(...batch);
+          this.trim();
+          console.warn(`gateway ledger flush failed: ${msg}`);
+          return;
+        }
+        this.droppedCount += rejected;
+        console.warn(`gateway ledger discarded ${rejected} rejected row(s): ${msg}`);
       }
     }
+  }
+
+  /**
+   * Retries a failed batch row by row so one poison row cannot block good ones.
+   * Returns the number of rows the store rejected, or undefined when every row
+   * failed (an outage, not poison); in that case nothing is lost and the caller requeues.
+   */
+  private async isolate(batch: UsageRow[]): Promise<number | undefined> {
+    const failed: UsageRow[] = [];
+    let ok = 0;
+    for (const row of batch) {
+      try {
+        await this.store.appendUsage([row]);
+        ok++;
+      } catch {
+        failed.push(row);
+      }
+    }
+    if (ok === 0) return undefined;
+    return failed.length;
   }
 
   async close(): Promise<void> {
@@ -77,5 +107,11 @@ export class LedgerBuffer {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     await this.flush();
+    if (this.rows.length > 0) {
+      const lost = this.rows.length;
+      this.rows = [];
+      this.droppedCount += lost;
+      console.warn(`gateway ledger closed with ${lost} unwritten row(s), dropped`);
+    }
   }
 }

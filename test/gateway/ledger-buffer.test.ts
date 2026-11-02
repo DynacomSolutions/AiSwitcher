@@ -79,4 +79,36 @@ describe("LedgerBuffer", () => {
     await b.close();
     expect(await store.usageSince("a", new Date(0))).toBe(7);
   });
+
+  test("a poison row is discarded and good rows behind it still land", async () => {
+    class PoisonStore extends MemoryGatewayStore {
+      override async appendUsage(rows: UsageRow[]): Promise<void> {
+        if (rows.some((r) => r.inputTokens === 1.5)) throw new Error("bad row");
+        await super.appendUsage(rows);
+      }
+    }
+    const store = new PoisonStore();
+    const b = new LedgerBuffer(store, { max: 100, flushMs: 60_000 });
+    b.push(row(1.5));
+    b.push(row(10));
+    b.push(row(20));
+    b.push(row(30));
+    await b.flush();
+    expect(b.depth).toBe(0);
+    expect(b.dropped).toBe(1);
+    expect(await store.usageSince("a", new Date(0))).toBe(60);
+    await b.close();
+  });
+
+  test("close counts unwritten rows as dropped and push after close drops", async () => {
+    const b = new LedgerBuffer(new FailingStore(), { max: 10, flushMs: 60_000 });
+    b.push(row(1));
+    b.push(row(2));
+    await b.close();
+    expect(b.dropped).toBe(2);
+    expect(b.depth).toBe(0);
+    b.push(row(3));
+    expect(b.dropped).toBe(3);
+    expect(b.depth).toBe(0);
+  });
 });
