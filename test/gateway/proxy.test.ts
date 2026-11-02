@@ -761,4 +761,46 @@ describe("fix round 1", () => {
     expect(seen.length).toBe(0);
     expect((await rows()).length).toBe(3);
   });
+
+  test("a bare % in the query does not cause a false 401", async () => {
+    const t = await addApp(baseApp({}));
+    const res = await call("/pin/v1/messages?q=100%", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(200);
+    expect(seen.length).toBe(1);
+    // A token hidden next to a bare % is still caught.
+    const bad = await call(`/pin/v1/messages?q=100%&k=${t.replace("_", "%5F")}`, t, { method: "POST", body: "{}" });
+    expect(bad.status).toBe(401);
+    expect(seen.length).toBe(1);
+  });
+
+  test("a body read failure without an abort is a 400 in the app's shape with one row", async () => {
+    const t = await addApp(baseApp({}));
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        c.error(new Error("socket reset at /srv/secret"));
+      },
+    });
+    const res = await call("/pin/v1/messages", t, { method: "POST", body, duplex: "half" } as RequestInit);
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).not.toContain("srv");
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]).toMatchObject({ httpStatus: 400, status: "rejected" });
+    expect(seen.length).toBe(0);
+  });
+
+  test("%2F is allowed only in the final segment after /models/", async () => {
+    const t = await addApp(baseApp({ name: "oa", provider: "codex", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    const ok = await call("/oa/v1/models/org%2Fmodel", t, { method: "GET" });
+    expect(ok.status).toBe(200);
+    expect(new URL(seen[0]!.url).pathname.endsWith("/v1/models/org%2Fmodel")).toBe(true);
+    expect((await call("/oa/v1/models/org%2fmodel", t, { method: "GET" })).status).toBe(200);
+    for (const p of ["/oa/v1%2Fmodels/x", "/oa/v1/models%2Fx", "/oa/v1/models/a%2Fb/c", "/oa/v1/other/a%2Fb", "/oa/v1/models/%2e%2e%2Fx", "/oa/v1/models/a%2F%2e%2e", "/oa/v1/models/a%5Cb"]) {
+      const res = await call(p, t, { method: "GET" });
+      expect(res.status).toBe(400);
+    }
+    expect(seen.length).toBe(2);
+  });
+
 });

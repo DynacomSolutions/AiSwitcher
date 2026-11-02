@@ -95,9 +95,13 @@ export function queryCarriesToken(search: string): boolean {
     for (const [k, v] of new URLSearchParams(search)) {
       if (k.toLowerCase().includes(needle) || v.toLowerCase().includes(needle)) return true;
     }
+  } catch {
+    // fall through to the lenient checks below
+  }
+  try {
     if (decodeURIComponent(lower).includes(needle)) return true;
   } catch {
-    return true; // Undecodable query: refuse rather than forward something we cannot inspect.
+    // A bare % is legal in practice (`?q=100%`). The raw and URLSearchParams forms above already decode leniently, so nothing is hidden.
   }
   return false;
 }
@@ -285,13 +289,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
 
   async function run(): Promise<Response> {
-  if (/%2f|%5c|%2e/i.test(rest)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
+  if (!pathAllowed(rest)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
   let body: Body;
   try {
     body = await readBody(req);
   } catch {
-    record(identity, "client_aborted", 499, undefined, false, undefined, undefined);
-    return new Response(null, { status: 499 });
+    if (req.signal.aborted || ctrl.signal.aborted) {
+      record(identity, "client_aborted", 499, undefined, false, undefined, undefined);
+      return new Response(null, { status: 499 });
+    }
+    return reject(400, "request body could not be read");
   }
   model = requestModel(body);
   if (app.models && app.models.length > 0 && body.kind === "stream") {
@@ -459,6 +466,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   req.signal.addEventListener("abort", () => finish("client_aborted"), { once: true });
   return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
   }
+}
+
+/** Encoded slashes, backslashes and dots are refused, except `%2F` in the final segment after `/models/` (OpenAI model ids such as `org/model`). */
+function pathAllowed(rest: string): boolean {
+  const m = /^(.*\/models\/)([^/]*)$/.exec(rest);
+  if (m) return !/%2f|%5c|%2e/i.test(m[1] as string) && !/%5c|%2e/i.test(m[2] as string);
+  return !/%2f|%5c|%2e/i.test(rest);
 }
 
 function decodeSegment(s: string): string {
