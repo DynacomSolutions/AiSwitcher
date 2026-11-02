@@ -3,6 +3,8 @@ import { Database } from "bun:sqlite";
 import { cp, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CredentialCache, NotRefreshableError, RefreshCooldownError, type RefreshFn } from "../../src/gateway/credentials.ts";
+import { SwapLockError } from "../../src/identities/claude-swap-lock.ts";
+import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { refreshIdentityOAuthGrant } from "../../src/identities/oauth-refresh.ts";
 
 const FIXTURES = join(import.meta.dir, "..", "fixtures", "gateway");
@@ -10,14 +12,30 @@ const SCRATCH = join(import.meta.dir, ".tmp");
 const ANTHROPIC_TOKEN_HOST = "platform.claude.com";
 
 let work = "";
+const CONFIGS = { claude: CLAUDE_CONFIG, codex: CODEX_CONFIG, grok: GROK_CONFIG, kimi: KIMI_CONFIG, pi: PI_CONFIG } as const;
+const savedPaths: Record<string, string> = {};
+const registryOf = (tool: string) => join(work, `${tool}-registry.json`);
+// Registries are repointed at empty temp files so no test ever reads the real home directory.
 beforeEach(async () => {
   await mkdir(SCRATCH, { recursive: true });
   work = await mkdtemp(join(SCRATCH, "gw-cred-"));
   await cp(FIXTURES, work, { recursive: true });
+  for (const [tool, config] of Object.entries(CONFIGS)) {
+    savedPaths[tool] = config.identitiesJsonPath;
+    (config as { identitiesJsonPath: string }).identitiesJsonPath = registryOf(tool);
+    await writeFile(registryOf(tool), JSON.stringify({ version: 1, identities: [] }));
+  }
 });
 afterEach(async () => {
+  for (const [tool, config] of Object.entries(CONFIGS)) (config as { identitiesJsonPath: string }).identitiesJsonPath = savedPaths[tool]!;
   await rm(work, { recursive: true, force: true });
 });
+const registerPi = async (): Promise<string> => {
+  const piDir = join(work, "pi");
+  await mkdir(piDir, { recursive: true });
+  await writeFile(registryOf("pi"), JSON.stringify({ version: 1, identities: [{ name: "id1", label: "id1", configDir: piDir }] }));
+  return join(piDir, "auth.json");
+};
 
 const claudeFile = () => join(work, "claude", ".credentials.json");
 const writeClaude = async (token: string, mtimeSec: number): Promise<void> => {
@@ -134,6 +152,59 @@ describe("CredentialCache", () => {
     const err = await c.get("claude", "id1").catch((e: Error) => e);
     expect((err as Error).message).toMatch(/retired/);
     expect((err as Error).message).not.toContain("SYNTHETIC_FIXTURE");
+  });
+
+  test("claude: a newer pi copy wins, and a 401 on the stale native token refreshes nothing", async () => {
+    const piAuth = await registerPi();
+    // Native holds T1 (expiresAt 2030); the pi copy expires later, so AIS's selection picks it.
+    await writeFile(piAuth, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE-claude-pi-0002", refresh: "SYNTHETIC_FIXTURE-claude-pi-refresh", expires: 1_900_000_000_000 } }));
+    let calls = 0;
+    const c = makeCache(async () => { calls++; return refreshed(); });
+    expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-pi-0002");
+    const cred = await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001");
+    expect(cred.accessToken).toBe("SYNTHETIC_FIXTURE-claude-pi-0002");
+    expect(calls).toBe(0);
+  });
+
+  test("claude: pi copy changing is noticed through the mtime watch set", async () => {
+    const piAuth = await registerPi();
+    const c = makeCache();
+    expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0001");
+    await writeFile(piAuth, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE-claude-pi-0002", refresh: "SYNTHETIC_FIXTURE-claude-pi-refresh", expires: 1_900_000_000_000 } }));
+    expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-pi-0002");
+  });
+
+  test("kimi: the freshest store wins and the stale native token needs no refresh", async () => {
+    const piAuth = await registerPi();
+    await writeFile(piAuth, JSON.stringify({ "kimi-coding": { type: "oauth", access: "SYNTHETIC_FIXTURE-kimi-pi-0002", refresh: "SYNTHETIC_FIXTURE-kimi-pi-refresh", expires: 1_900_000_000_000 } }));
+    await writeFile(registryOf("kimi"), JSON.stringify({ version: 1, identities: [{ name: "id1", label: "id1", configDir: join(work, "kimi") }] }));
+    let calls = 0;
+    const c = makeCache(async () => { calls++; return refreshed(); });
+    expect((await c.get("kimi", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-kimi-pi-0002");
+    expect((await c.refreshAfter401("kimi", "id1", "SYNTHETIC_FIXTURE-kimi-access-0001")).accessToken).toBe("SYNTHETIC_FIXTURE-kimi-pi-0002");
+    expect(calls).toBe(0);
+  });
+
+  test("grok: with two account entries the one AIS refresh would pick is used", async () => {
+    await writeFile(join(work, "grok", "auth.json"), JSON.stringify({
+      "SYNTHETIC_FIXTURE-issuer|a": { key: "SYNTHETIC_FIXTURE-grok-a-0001", refresh_token: "SYNTHETIC_FIXTURE-grok-a-refresh", expires_at: 1_893_456_000 },
+      "SYNTHETIC_FIXTURE-issuer|b": { key: "SYNTHETIC_FIXTURE-grok-b-0002", refresh_token: "SYNTHETIC_FIXTURE-grok-b-refresh", expires_at: 1_993_456_000 },
+    }));
+    const c = makeCache();
+    expect((await c.get("grok", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-grok-b-0002");
+  });
+
+  test("refresh errors are wrapped: a lock timeout leaks no path", async () => {
+    const lockPath = join(work, "claude", ".oauth_refresh.lock");
+    const c = makeCache(async () => { throw new SwapLockError(`timed out waiting for lock ${lockPath}`, lockPath, true); });
+    const err = await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: Error) => e);
+    expect((err as Error).message).not.toContain("/");
+    expect((err as { code?: string }).code).toBe("refresh-lock-timeout");
+    expect((err as Error).cause).toBeInstanceOf(SwapLockError);
+    const plain = makeCache(async () => { throw new Error(`boom ${lockPath}`); });
+    const err2 = await plain.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: Error) => e);
+    expect((err2 as { code?: string }).code).toBe("refresh-failed");
+    expect((err2 as Error).message).not.toContain("/");
   });
 
   test("failed refresh and unchanged token raise errors without token values", async () => {

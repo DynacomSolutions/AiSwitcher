@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { join } from "node:path";
 import { CredentialCache } from "../../src/gateway/credentials.ts";
 import { adapterFor } from "../../src/gateway/providers/index.ts";
@@ -6,6 +9,22 @@ import type { GatewayProvider } from "../../src/gateway/types.ts";
 
 const FIXTURES = join(import.meta.dir, "..", "fixtures", "gateway");
 const cache = new CredentialCache({ resolveConfigDir: async (provider) => join(FIXTURES, provider) });
+
+// Registries point at empty temp files so the cache never reads the real home directory.
+const CONFIGS = [CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG];
+const saved = CONFIGS.map((c) => c.identitiesJsonPath);
+let isolation = "";
+beforeAll(async () => {
+  isolation = await mkdtemp(join(tmpdir(), "gw-providers-"));
+  for (const [i, c] of CONFIGS.entries()) {
+    (c as { identitiesJsonPath: string }).identitiesJsonPath = join(isolation, `${i}.json`);
+    await writeFile(c.identitiesJsonPath, JSON.stringify({ version: 1, identities: [] }));
+  }
+});
+afterAll(async () => {
+  CONFIGS.forEach((c, i) => { (c as { identitiesJsonPath: string }).identitiesJsonPath = saved[i]!; });
+  await rm(isolation, { recursive: true, force: true });
+});
 
 describe("provider adapters", () => {
   test("each adapter builds headers from its fixture credential", async () => {
