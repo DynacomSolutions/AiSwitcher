@@ -11,6 +11,8 @@ export interface GatewayMetrics {
   }): void;
   /** `app` is only given when the app exists (bounded); unknown apps are counted under "-". */
   authFailure(reason: "unknown-app" | "bad-token", app?: string): void;
+  /** A request refused by a policy of the gateway itself. */
+  rejection(app: string, reason: "daily_cap" | "model" | "reserve" | "no_headroom"): void;
   failover(app: string): void;
   /** A safety check could not run and the request was let through (for example the daily cap while the database is down). */
   failOpen(app: string, reason: "cap_check_failed"): void;
@@ -19,6 +21,7 @@ export interface GatewayMetrics {
 export const noopMetrics: GatewayMetrics = {
   request() {},
   authFailure() {},
+  rejection() {},
   failover() {},
   failOpen() {},
 };
@@ -55,6 +58,7 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly rejections = new Counter("ais_gateway_rejections_total", "Requests rejected before reaching a provider.");
   private readonly failovers = new Counter("ais_gateway_failovers_total", "Requests retried on another pool member.");
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
+  private readonly unreadable = new Counter("ais_gateway_credential_unreadable_total", "Credential reads that failed at warm-up, per app identity.");
   private readonly bucketCounts = BUCKETS.map(() => 0);
   private durationCount = 0;
   private durationSum = 0;
@@ -82,6 +86,10 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.rejections.inc({ app: app ?? "-", reason });
   }
 
+  rejection(app: string, reason: "daily_cap" | "model" | "reserve" | "no_headroom"): void {
+    this.rejections.inc({ app, reason });
+  }
+
   failover(app: string): void {
     this.failovers.inc({ app });
   }
@@ -90,13 +98,17 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.failOpens.inc({ app, reason });
   }
 
+  credentialUnreadable(app: string, provider: string, identity: string): void {
+    this.unreadable.inc({ app, provider, identity });
+  }
+
   refresh(provider: string, outcome: string): void {
     this.refreshes.inc({ provider, outcome });
   }
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.rejections, this.failovers, this.failOpens]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.rejections, this.failovers, this.failOpens, this.unreadable]) out.push(...c.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);

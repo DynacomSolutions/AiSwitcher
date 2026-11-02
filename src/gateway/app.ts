@@ -162,6 +162,19 @@ function guessStyle(path: string): ApiStyle {
   return /\/messages(\/|$)/.test(path) ? "anthropic" : "openai";
 }
 
+/** The error shape for a request before auth: the app's own style when the path names a known app, else a guess from the path (OpenAI by default). */
+export async function styleForPath(deps: Pick<GatewayDeps, "store">, pathname: string): Promise<ApiStyle> {
+  const slash = pathname.indexOf("/", 1);
+  const name = decodeSegment(pathname.slice(1, slash === -1 ? undefined : slash));
+  try {
+    const found = name ? await deps.store.getApp(name) : undefined;
+    if (found) return found.style;
+  } catch {
+    // fall through to the guess
+  }
+  return guessStyle(pathname);
+}
+
 function defaultLog(line: string): void {
   console.info(line);
 }
@@ -177,7 +190,8 @@ async function discard(res: Response): Promise<void> {
 export function createGatewayApp(deps: GatewayDeps): Hono {
   const hono = new Hono();
   const log = deps.log ?? defaultLog;
-  const handle = (req: Request): Promise<Response> => proxy(req, deps, log).catch(() => providerError("openai", 500, "gateway error"));
+  const handle = (req: Request): Promise<Response> =>
+    proxy(req, deps, log).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   hono.all("/:app", (c) => handle(c.req.raw));
   hono.all("/:app/*", (c) => handle(c.req.raw));
   return hono;
@@ -272,6 +286,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
   model = requestModel(body);
   if (app.models && app.models.length > 0 && body.kind === "stream") {
+    deps.metrics.rejection(app.name, "model");
     return reject(413, "request too large to verify the model allowlist", identityForRow, model);
   }
   let used = 0;
@@ -284,10 +299,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
   }
   const caps = checkCaps(app, model, used);
+  if (!("ok" in caps)) {
+    deps.metrics.rejection(app.name, caps.status === 403 ? "model" : "daily_cap");
+  }
   if (!("ok" in caps)) return reject(caps.status, caps.reason, identityForRow, model);
 
   const pick = await pickIdentity(app, deps);
   if ("reject" in pick) {
+    deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : "no_headroom");
     return reject(429, pick.reject === "reserve" ? "identity is at its usage reserve" : "no pool member has headroom below the reserve", identityForRow, model);
   }
 

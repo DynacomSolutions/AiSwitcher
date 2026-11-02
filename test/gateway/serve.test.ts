@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
-import { instrumentRefresh, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
+import { styleForPath } from "../../src/gateway/app.ts";
+import { instrumentRefresh, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { generateToken } from "../../src/gateway/tokens.ts";
 import type { GatewayApp, UsageRow } from "../../src/gateway/types.ts";
 
-const ADMIN = "adm-test-value-0001";
+const ADMIN = "adm-test-value-0001-0123456789abcdef";
 const enc = new TextEncoder();
 const UPSTREAM_CRED = ["upstream", "cred", "fixture"].join("-");
 const WRONG_TOKEN = ["aisg", "abcdefgh", "wrongwrong"].join("_");
@@ -108,6 +109,9 @@ beforeEach(() => {
     hostname: "127.0.0.1",
     port: 0,
     fetch(req) {
+      if (new URL(req.url).pathname.endsWith("/slow")) {
+        return gate.then(() => new Response("{}", { headers: { "content-type": "application/json" } }));
+      }
       if (new URL(req.url).pathname.endsWith("/stream")) {
         return new Response(
           new ReadableStream({
@@ -161,14 +165,82 @@ describe("serve lifecycle", () => {
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
   });
 
-  test("unreadable credential keeps the gateway unready", async () => {
-    await seed();
-    credFails = true;
-    const g = await boot();
-    await Bun.sleep(80);
-    expect(await status(`${base(g)}/readyz`)).toBe(503);
-    credFails = false;
+  test("an app pinned to a missing identity does not make the gateway unready", async () => {
+    const token = await seed();
+    await store.putApp({ ...app, name: "broken", target: { kind: "pin", identity: "missing" } });
+    const t2 = generateToken();
+    await store.addToken({ app: "broken", prefix: t2.prefix, hash: t2.hash, createdAt: app.createdAt });
+    const base0 = hooks().creds as { get(p: string, i: string): Promise<unknown> };
+    const g = await boot({
+      creds: {
+        get: async (p: string, i: string) => {
+          if (i === "missing") throw new Error("unknown identity");
+          return base0.get(p, i);
+        },
+        refreshAfter401: async () => ({ identity: "x", accessToken: "x" }),
+      } as unknown as GatewayHooks["creds"],
+    });
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const ok = await fetch(`${base(g)}/web/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    expect(ok.status).toBe(200);
+    const bad = await fetch(`${base(g)}/broken/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${t2.token}` }, body: "{}" });
+    expect(bad.status).toBe(502);
+    await waitFor(async () => (await (await fetch(`${base(g)}/metrics`)).text()).includes("ais_gateway_credential_unreadable_total"));
+    const text = await (await fetch(`${base(g)}/metrics`)).text();
+    expect(text).toContain('ais_gateway_credential_unreadable_total{app="broken",provider="claude",identity="missing"} 1');
+  });
+
+  test("admin token shorter than 32 characters fails startup without printing it", async () => {
+    const short = "short-token-value";
+    const err = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: short }, hooks()).then(() => undefined, (e: Error) => e);
+    expect(err?.message).toContain("32");
+    expect(err?.message).not.toContain(short);
+  });
+
+  test("warm-up finishing after stop does not start the cache refresh", async () => {
+    let release2!: () => void;
+    const hold = new Promise<void>((r) => (release2 = r));
+    let listCalls = 0;
+    const counting = new CapturingStore();
+    counting.listApps = async () => {
+      listCalls += 1;
+      return [];
+    };
+    const g = await boot({ migrate: () => hold, openStore: () => counting, refreshIntervalMs: 20 });
+    await g.stop();
+    release2();
+    await Bun.sleep(150);
+    expect(listCalls).toBeLessThanOrEqual(1);
+  });
+
+  test("responses finishing while draining ask the client to close the connection", async () => {
+    const token = await seed();
+    const g = await boot({}, true);
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    let buf = "";
+    let wake!: () => void;
+    const got = new Promise<void>((r) => (wake = r));
+    const sock = await Bun.connect({
+      hostname: "127.0.0.1",
+      port: g.port,
+      socket: {
+        data(_s, d) {
+          buf += new TextDecoder().decode(d);
+          if (buf.includes("\r\n\r\n")) wake();
+        },
+        open(s) {
+          s.write(`POST /web/v1/slow HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${token}\r\ncontent-length: 2\r\n\r\n{}`);
+        },
+      },
+    });
+    await Bun.sleep(100);
+    process.emit("SIGTERM");
+    await Bun.sleep(50);
+    release();
+    await Promise.race([got, Bun.sleep(2000)]);
+    sock.end();
+    expect(buf).toContain("HTTP/1.1 200");
+    expect(buf.toLowerCase()).toContain("connection: close");
   });
 
   test("database lost after warm keeps serving from cache", async () => {
@@ -317,5 +389,90 @@ describe("owner alerts", () => {
     check();
     expect(seen).toEqual(["ledger-drop", "ledger-drop"]);
     await ledger.close();
+  });
+});
+
+describe("rejection reasons", () => {
+  test("rejections carry cap, model, reserve and no-headroom reasons", async () => {
+    const mk = async (name: string, over: Partial<GatewayApp>): Promise<string> => {
+      await store.putApp({ ...app, name, ...over });
+      const t = generateToken();
+      await store.addToken({ app: name, prefix: t.prefix, hash: t.hash, createdAt: app.createdAt });
+      return t.token;
+    };
+    const tModel = await mk("modelled", { models: ["allowed-model"] });
+    const tCap = await mk("capped", { dailyTokens: 5 });
+    const tRes = await mk("reserved", { reservePercent: 50 });
+    const tPool = await mk("pooled", { target: { kind: "pool" }, reservePercent: 50 });
+    await store.appendUsage([{ ts: new Date().toISOString(), app: "capped", provider: "claude", identity: "id1", inputTokens: 10, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, status: "ok", httpStatus: 200, latencyMs: 1, streamed: false }]);
+    const g = await boot({ now: () => new Date(), usageFor: async (_p, i) => (i === "id1" ? { status: "live", maxUtilization: 99, capturedAt: new Date().toISOString() } : undefined) });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const post = (name: string, token: string, b: object) => fetch(`${base(g)}/${name}/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: JSON.stringify(b) });
+    expect((await post("modelled", tModel, { model: "other" })).status).toBe(403);
+    expect((await post("capped", tCap, { model: "m" })).status).toBe(429);
+    expect((await post("reserved", tRes, { model: "m" })).status).toBe(429);
+    expect((await post("pooled", tPool, { model: "m" })).status).toBe(429);
+    const text = await (await fetch(`${base(g)}/metrics`)).text();
+    expect(text).toContain('ais_gateway_rejections_total{app="modelled",reason="model"} 1');
+    expect(text).toContain('ais_gateway_rejections_total{app="capped",reason="daily_cap"} 1');
+    expect(text).toContain('ais_gateway_rejections_total{app="reserved",reason="reserve"} 1');
+    expect(text).toContain('ais_gateway_rejections_total{app="pooled",reason="no_headroom"} 1');
+  });
+});
+
+describe("error shapes", () => {
+  test("pre-auth errors use the app's provider shape when the app is known", async () => {
+    await store.putApp(app);
+    const deps = { store } as never;
+    expect(await styleForPath(deps, "/web/v1/chat")).toBe("anthropic");
+    expect(await styleForPath(deps, "/nope/v1/messages")).toBe("anthropic");
+    expect(await styleForPath(deps, "/nope/v1/chat/completions")).toBe("openai");
+  });
+
+  test("starting-up 503 is OpenAI shaped when the app is unknown", async () => {
+    migrateFails = true;
+    const g = await boot();
+    const res = await fetch(`${base(g)}/web/v1/chat/completions`, { method: "POST" });
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { error?: { type?: string } }).error?.type).toBe("server_error");
+  });
+});
+
+describe("alert recovery", () => {
+  test("a 200 for the identity clears its alert, so a later failure alerts again", () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(a.key));
+    alerter.raise("refresh-failed", "claude/id1", "x");
+    alerter.raise("refresh-failed", "claude/id1", "x");
+    const m = recoverOnSuccess(new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 }), alerter);
+    m.request({ app: "a", provider: "claude", identity: "id1", status: "upstream_error", httpStatus: 401, latencyMs: 1 });
+    alerter.raise("refresh-failed", "claude/id1", "x");
+    m.request({ app: "a", provider: "claude", identity: "id1", status: "ok", httpStatus: 200, latencyMs: 1 });
+    alerter.raise("refresh-failed", "claude/id1", "x");
+    expect(seen).toEqual(["claude/id1", "claude/id1"]);
+  });
+
+  test("no-grant and skipped-revoked outcomes alert; a different token read clears", async () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(a.key));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const failed = new Map<string, string>();
+    let outcome = "no-grant";
+    const refresh = instrumentRefresh((async (_t: string, id: { name: string }) => ({ tool: "codex", identity: id.name, outcome, written: [], writeFailures: [] })) as never, { metrics, alerter, failed });
+    const id = { name: "c1", label: "c1", configDir: "/x" } as never;
+    await refresh("codex", id, { expectedAccessToken: "old" });
+    outcome = "skipped-revoked";
+    await refresh("codex", id, { expectedAccessToken: "old" });
+    expect(seen).toEqual(["codex/c1"]);
+    expect(failed.get("codex/c1")).toBe("old");
+    const { watchCredentialReads } = await import("../../src/gateway/serve.ts");
+    const creds = watchCredentialReads({ get: async () => ({ identity: "c1", accessToken: "old" }), refreshAfter401: async () => ({ identity: "c1", accessToken: "old" }) } as never, alerter, failed);
+    await creds.get("codex", "c1");
+    await refresh("codex", id, { expectedAccessToken: "old" });
+    expect(seen).toEqual(["codex/c1"]);
+    const fresh = watchCredentialReads({ get: async () => ({ identity: "c1", accessToken: "new" }), refreshAfter401: async () => ({ identity: "c1", accessToken: "new" }) } as never, alerter, failed);
+    await fresh.get("codex", "c1");
+    await refresh("codex", id, { expectedAccessToken: "new" });
+    expect(seen).toEqual(["codex/c1", "codex/c1"]);
   });
 });

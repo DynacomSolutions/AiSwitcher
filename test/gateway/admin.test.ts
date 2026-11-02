@@ -4,7 +4,7 @@ import { CachedGatewayStore } from "../../src/gateway/cache-store.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { verifyToken } from "../../src/gateway/tokens.ts";
 
-const ADMIN = "adm-test-value-0001";
+const ADMIN = "adm-test-value-0001-0123456789abcdef";
 let now: Date;
 let inner: MemoryGatewayStore;
 let store: CachedGatewayStore;
