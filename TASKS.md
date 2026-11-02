@@ -116,3 +116,11 @@ ETA: 2026-11-07 18:00 ICT
 |---|---|---|---|---|---|---|---|
 | 97 | ais-usage mod: usage scan per session is 60 to 120 s and always times out | done | claude-20261031-ais-usage-snapshot | ais-usage-snapshot | | 2026-11-01 06:00 ICT | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/318 (24d5f49); deployed on the main host 1 Nov: ais built from main, collector restarted, mod 0.5.4 on all identities.<br>`claude-swap usage --json` reads the snapshot in 0.1 s (9 members, stale=false); no per-session scans running. |
 | 98 | Fix main CI: spend guard canary and Host app Browser smoke | done | claude-20261031-main-ci-red | main-ci-red | | 2026-10-31 23:30 ICT | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/319 (b9e97f3).<br>Canary tests now use the Bun binary as `codex`; @playwright/test 1.58.2 to 1.64.1 for ubuntu26.04.<br>All PR 319 checks green. |
+
+## 4. AIS AI Gateway for cluster apps
+ETA: 2026-11-02 18:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 99 | Design the AIS AI Gateway (per-app tokens, real SDKs, all providers) | in_progress | claude-20261102-ai-gateway | ai-gateway | | 2026-11-02 18:00 ICT | Brainstorm decisions taken with owner 2026-11-02.<br>Design doc in .data specs, then plan and build rows. |
+| 100 | Full gateway policy engine: priority, load balancing, failover, reservations, rate limits | parked | | | 4.99 | | Parked by owner 2026-11-02: future work; v1 ships tracking plus simple per-app caps only.<br>Resumes when owner un-parks it. |
