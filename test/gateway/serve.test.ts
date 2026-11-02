@@ -520,3 +520,42 @@ describe("usage prefill", () => {
     await waitFor(() => fetched.includes("m1") && fetched.includes("m2"));
   });
 });
+
+describe("canonical names in probes", () => {
+  test("the unreadable-credential metric uses the canonical name", async () => {
+    await store.putApp({ ...app, target: { kind: "pin", identity: "alias1" } });
+    const g = await boot({
+      canonical: async (_p, i) => (i === "alias1" ? "id1" : i),
+      creds: {
+        get: async (_p: string, i: string) => {
+          if (i === "alias1") throw new Error("nope");
+          return { identity: i, accessToken: "x" };
+        },
+        refreshAfter401: async () => ({ identity: "x", accessToken: "x" }),
+      } as unknown as GatewayHooks["creds"],
+    });
+    await waitFor(async () => (await (await fetch(`${base(g)}/metrics`)).text()).includes("credential_unreadable_total{"));
+    const text = await (await fetch(`${base(g)}/metrics`)).text();
+    expect(text).toContain('identity="id1"');
+    expect(text).not.toContain('identity="alias1"');
+  });
+});
+
+describe("canonical resolver", () => {
+  test("a failed registry read is cached briefly", async () => {
+    const { createCanonicalResolver } = await import("../../src/gateway/serve.ts");
+    let loads = 0;
+    let t = 0;
+    const resolve = createCanonicalResolver(async () => {
+      loads += 1;
+      throw new SyntaxError("corrupt");
+    }, () => t);
+    expect(await resolve("claude", "a")).toBe("a");
+    expect(await resolve("claude", "a")).toBe("a");
+    expect(await resolve("claude", "b")).toBe("b");
+    expect(loads).toBe(1);
+    t = 61_000;
+    await resolve("claude", "a");
+    expect(loads).toBe(2);
+  });
+});

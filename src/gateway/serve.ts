@@ -133,25 +133,37 @@ async function defaultIdentityState(provider: GatewayProvider, name: string): Pr
   return !found ? "missing" : isRetired(found) ? "retired" : "ok";
 }
 
-/** Reasons only: errors from the store or filesystem can carry connection strings or paths. */
-/** Alias to canonical identity name, with a short cache so the registry file is not read per request. */
-function canonicalResolver(): NonNullable<GatewayDeps["canonical"]> {
+/** Alias to canonical identity name, with a short cache (also for failed reads) so the registry file is not re-read per request. */
+export function createCanonicalResolver(
+  load: (provider: GatewayProvider) => Promise<Array<{ name: string; aliases?: string[] }>>,
+  nowMs: () => number = Date.now,
+): NonNullable<GatewayDeps["canonical"]> {
+  const TTL = 60_000;
   const cache = new Map<string, { name: string; at: number }>();
+  const failedAt = new Map<GatewayProvider, number>();
   return async (provider, identity) => {
     const key = `${provider}\u0000${identity}`;
     const hit = cache.get(key);
-    if (hit && Date.now() - hit.at < 60_000) return hit.name;
+    const now = nowMs();
+    if (hit && now - hit.at < TTL) return hit.name;
+    const failed = failedAt.get(provider);
+    if (failed !== undefined && now - failed < TTL) return hit?.name ?? identity;
     try {
-      const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
-      const name = findIdentityByNameOrAlias(file.identities, identity)?.name ?? identity;
-      cache.set(key, { name, at: Date.now() });
+      const file = await load(provider);
+      failedAt.delete(provider);
+      const name = findIdentityByNameOrAlias(file as never, identity)?.name ?? identity;
+      cache.set(key, { name, at: now });
       return name;
     } catch {
+      failedAt.set(provider, now);
       return hit?.name ?? identity;
     }
   };
 }
 
+const canonicalResolver = () => createCanonicalResolver(async (provider) => (await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath)).identities);
+
+/** Reasons only: errors from the store or filesystem can carry connection strings or paths. */
 const describe = (err: unknown): string => {
   const e = err as { name?: unknown; code?: unknown } | null;
   return [typeof e?.name === "string" ? e.name : "Error", typeof e?.code === "string" ? e.code : undefined].filter(Boolean).join(" ");
@@ -220,7 +232,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         try {
           await creds.get(app.provider, identity);
         } catch (err) {
-          metrics.credentialUnreadable(app.name, app.provider, identity);
+          metrics.credentialUnreadable(app.name, app.provider, await canonical(app.provider, identity));
           console.warn(`gateway: app "${app.name}" cannot read ${app.provider} identity "${identity}" (${describe(err)}); its requests will fail`);
         }
         await prefill(app.provider, identity);
