@@ -1,0 +1,93 @@
+import type { GatewayStore } from "./store.ts";
+import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
+
+/**
+ * The proxy's view of the store. Apps and tokens are held in memory so a
+ * database outage after warm-up does not stop authentication. Writes go to the
+ * store first and then into the cache, so a revoke or rotation made through
+ * this instance is seen by the next request. A timer re-reads the store to
+ * pick up changes made by other instances; a failed re-read keeps the cache.
+ */
+export class CachedGatewayStore implements GatewayStore {
+  private apps = new Map<string, GatewayApp>();
+  private tokens = new Map<string, TokenRecord[]>();
+  private version = 0;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private loaded = false;
+
+  constructor(private readonly inner: GatewayStore) {}
+
+  /** Loads every app and its tokens. Throws when the store is unreachable. */
+  async warm(): Promise<void> {
+    const seen = this.version;
+    const apps = await this.inner.listApps();
+    const tokens = new Map<string, TokenRecord[]>();
+    for (const a of apps) tokens.set(a.name, await this.inner.tokensFor(a.name));
+    // A write made while we were reading is newer than this snapshot: keep it.
+    if (this.version !== seen && this.loaded) return;
+    this.apps = new Map(apps.map((a) => [a.name, a]));
+    this.tokens = tokens;
+    this.loaded = true;
+  }
+
+  startRefresh(intervalMs: number): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => void this.warm().catch(() => undefined), intervalMs);
+    this.timer.unref?.();
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+  }
+
+  async getApp(name: string): Promise<GatewayApp | undefined> {
+    const a = this.apps.get(name);
+    return a ? { ...a } : undefined;
+  }
+
+  async listApps(): Promise<GatewayApp[]> {
+    return [...this.apps.values()].map((a) => ({ ...a }));
+  }
+
+  async tokensFor(app: string): Promise<TokenRecord[]> {
+    return (this.tokens.get(app) ?? []).map((t) => ({ ...t }));
+  }
+
+  async putApp(app: GatewayApp): Promise<void> {
+    await this.inner.putApp(app);
+    this.version++;
+    this.apps.set(app.name, { ...app });
+    if (!this.tokens.has(app.name)) this.tokens.set(app.name, []);
+  }
+
+  async addToken(rec: TokenRecord): Promise<void> {
+    await this.inner.addToken(rec);
+    this.version++;
+    this.tokens.set(rec.app, [...(this.tokens.get(rec.app) ?? []), { ...rec }]);
+  }
+
+  async expireTokens(app: string, at: string): Promise<void> {
+    await this.inner.expireTokens(app, at);
+    this.version++;
+    this.tokens.set(
+      app,
+      (this.tokens.get(app) ?? []).map((t) => (t.expiresAt === undefined ? { ...t, expiresAt: at } : t)),
+    );
+  }
+
+  async revokeApp(name: string): Promise<void> {
+    await this.inner.revokeApp(name);
+    this.version++;
+    const a = this.apps.get(name);
+    if (a) this.apps.set(name, { ...a, state: "revoked" });
+  }
+
+  appendUsage(rows: UsageRow[]): Promise<void> {
+    return this.inner.appendUsage(rows);
+  }
+
+  usageSince(app: string, since: Date): Promise<number> {
+    return this.inner.usageSince(app, since);
+  }
+}

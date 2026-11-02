@@ -76,6 +76,14 @@ export const HELP: Record<string, HelpNode> = {
       import: sub("ais auth import <pi-id> --tool=pi --claude=<id> [--codex= --grok= --kimi= --zai= --ali= --opencode-go]", "Merge provider credentials into a Pi identity"),
     },
   },
+  gateway: {
+    usage: "ais gateway serve [--port=47130] [--admin-port=47131]",
+    desc: "AI Gateway: token-authenticated proxy over AIS logins",
+    examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
+    subs: {
+      serve: sub("ais gateway serve [--port=] [--admin-port=]", "Run the proxy and admin API (env: AIS_GATEWAY_PORT, AIS_GATEWAY_ADMIN_PORT, AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_ADMIN_TOKEN)"),
+    },
+  },
   swap: {
     usage: "ais swap <claude|codex|kimi|pi> [subcommand]",
     desc: "Swap pools: switch a login between member accounts",

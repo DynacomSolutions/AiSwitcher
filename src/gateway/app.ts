@@ -201,7 +201,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   const token = queryCarriesToken(url.search) ? undefined : extractToken(req, app.name);
   if (!token || !(await verifyToken(deps.store, app.name, token, deps.now()))) {
-    deps.metrics.authFailure("bad-token");
+    deps.metrics.authFailure("bad-token", app.name);
     return providerError(style, 401, "invalid or missing gateway token");
   }
 
@@ -231,7 +231,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     };
     try {
       deps.ledger.push(row);
-      deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs });
+      deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs, ...(counts ? { tokens: c } : {}) });
       log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}) }));
     } catch {
       // Observation must never affect the response.
