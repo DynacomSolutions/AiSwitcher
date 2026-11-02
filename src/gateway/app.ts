@@ -33,8 +33,9 @@ export const REPLAY_LIMIT_BYTES = 8 * 1024 * 1024;
 /** Quota errors (403) are only inspected up to this size. */
 const ERROR_PEEK_BYTES = 64 * 1024;
 
-const HOP_BY_HOP = ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers", "transfer-encoding", "upgrade"];
-const QUOTA_RE = /quota|insufficient|credit|billing|exceeded your/i;
+const HOP_BY_HOP = ["connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers", "transfer-encoding", "upgrade"];
+/** Error types or codes that mean "this login is out of quota". A bare 403 (for example "insufficient permissions") is not one. */
+const QUOTA_CODES = /^(insufficient_quota|rate_limit_error|rate_limit_exceeded|usage_limit_reached|quota_exceeded|billing_hard_limit_reached)$/i;
 
 type Body = { kind: "none" } | { kind: "buffered"; bytes: Uint8Array } | { kind: "stream"; stream: ReadableStream<Uint8Array> };
 
@@ -61,8 +62,13 @@ async function readBody(req: Request): Promise<Body> {
     overflow = size > REPLAY_LIMIT_BYTES;
   }
   // Too big to replay: hand the buffered part and the rest on, byte for byte.
+  return { kind: "stream", stream: chainStream(chunks, reader) };
+}
+
+/** The already-read chunks followed by the rest of the reader, unmodified. */
+function chainStream(chunks: Uint8Array[], reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(reason?: unknown): Promise<void> }): ReadableStream<Uint8Array> {
   let i = 0;
-  const stream = new ReadableStream<Uint8Array>({
+  return new ReadableStream<Uint8Array>({
     async pull(c) {
       if (i < chunks.length) {
         c.enqueue(chunks[i++] as Uint8Array);
@@ -76,7 +82,69 @@ async function readBody(req: Request): Promise<Body> {
       return reader.cancel(reason);
     },
   });
-  return { kind: "stream", stream };
+}
+
+/** True when the query string carries a gateway token in any spelling (raw, percent-encoded, in a name or a value). */
+export function queryCarriesToken(search: string): boolean {
+  const needle = "aisg_";
+  const lower = search.toLowerCase();
+  if (lower.includes(needle) || lower.includes("aisg%5f")) return true;
+  try {
+    for (const [k, v] of new URLSearchParams(search)) {
+      if (k.toLowerCase().includes(needle) || v.toLowerCase().includes(needle)) return true;
+    }
+    if (decodeURIComponent(lower).includes(needle)) return true;
+  } catch {
+    return true; // Undecodable query: refuse rather than forward something we cannot inspect.
+  }
+  return false;
+}
+
+/** Removes the headers a `Connection` header names, plus the fixed hop-by-hop set. */
+function stripHopByHop(headers: Headers): void {
+  for (const name of (headers.get("connection") ?? "").split(",")) {
+    const n = name.trim().toLowerCase();
+    if (n) headers.delete(n);
+  }
+  for (const h of HOP_BY_HOP) headers.delete(h);
+}
+
+/** Reads at most `cap` bytes of a response body; the response is re-created unchanged. */
+async function peek(res: Response, cap: number): Promise<{ bytes: Uint8Array; whole: boolean; res: Response }> {
+  if (!res.body) return { bytes: new Uint8Array(0), whole: true, res };
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let whole = false;
+  while (size <= cap) {
+    const r = await reader.read();
+    if (r.done) {
+      whole = true;
+      break;
+    }
+    chunks.push(r.value);
+    size += r.value.length;
+  }
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    bytes.set(c, at);
+    at += c.length;
+  }
+  const out = whole ? new Response(bytes, { status: res.status, statusText: res.statusText, headers: res.headers }) : new Response(chainStream(chunks, reader), { status: res.status, statusText: res.statusText, headers: res.headers });
+  return { bytes, whole: whole && size <= cap, res: out };
+}
+
+function isQuotaBody(bytes: Uint8Array): boolean {
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    const obj = (v: unknown): Record<string, unknown> => (typeof v === "object" && v !== null ? (v as Record<string, unknown>) : {});
+    const top = obj(parsed);
+    const err = obj(top.error);
+    return [top.type, top.code, err.type, err.code].some((v) => typeof v === "string" && QUOTA_CODES.test(v));
+  } catch {
+    return false;
+  }
 }
 
 function requestModel(body: Body): string | undefined {
@@ -122,15 +190,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const appName = decodeSegment(url.pathname.slice(1, slash === -1 ? undefined : slash));
   const rest = slash === -1 ? "" : url.pathname.slice(slash);
 
-  const app = appName ? await deps.store.getApp(appName) : undefined;
-  if (!app) {
+  const found = appName ? await deps.store.getApp(appName) : undefined;
+  if (!found) {
     deps.metrics.authFailure("unknown-app");
     return providerError(guessStyle(url.pathname), 404, "not found");
   }
+  const app: GatewayApp = found;
   const style = app.style;
   const adapter = adapterFor(app.provider);
 
-  const token = url.search.includes("aisg_") ? undefined : extractToken(req, app.name);
+  const token = queryCarriesToken(url.search) ? undefined : extractToken(req, app.name);
   if (!token || !(await verifyToken(deps.store, app.name, token, deps.now()))) {
     deps.metrics.authFailure("bad-token");
     return providerError(style, 401, "invalid or missing gateway token");
@@ -173,8 +242,35 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return providerError(style, status, message);
   };
 
-  const body = await readBody(req);
-  const model = requestModel(body);
+  let identity = identityForRow;
+  let model: string | undefined;
+  const ctrl = new AbortController();
+  const onAbort = (): void => ctrl.abort();
+  req.signal.addEventListener("abort", onAbort, { once: true });
+  if (req.signal.aborted) ctrl.abort(); // already gone: the listener will never fire
+  try {
+    return await run();
+  } catch {
+    // Anything unexpected after auth: one ledger row and the app's own error shape, never the cause.
+    req.signal.removeEventListener("abort", onAbort);
+    if (req.signal.aborted || ctrl.signal.aborted) {
+      record(identity, "client_aborted", 499, undefined, false, undefined, model);
+      return new Response(null, { status: 499 });
+    }
+    record(identity, "error", 500, undefined, false, undefined, model);
+    return providerError(style, 500, "gateway error");
+  }
+
+  async function run(): Promise<Response> {
+  if (/%2f|%5c|%2e/i.test(rest)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
+  let body: Body;
+  try {
+    body = await readBody(req);
+  } catch {
+    record(identity, "client_aborted", 499, undefined, false, undefined, undefined);
+    return new Response(null, { status: 499 });
+  }
+  model = requestModel(body);
   if (app.models && app.models.length > 0 && body.kind === "stream") {
     return reject(413, "request too large to verify the model allowlist", identityForRow, model);
   }
@@ -183,7 +279,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     try {
       used = await deps.store.usageSince(app.name, dayStartIct(deps.now()));
     } catch {
-      used = 0; // Database lost after warm: keep serving.
+      used = 0; // Database lost after warm: keep serving, and count it.
+      deps.metrics.failOpen(app.name, "cap_check_failed");
     }
   }
   const caps = checkCaps(app, model, used);
@@ -195,14 +292,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
 
   const upstreamUrl = adapter.upstreamBase(style) + rest + url.search;
-  const ctrl = new AbortController();
-  const onAbort = (): void => ctrl.abort();
-  req.signal.addEventListener("abort", onAbort, { once: true });
   const replayable = body.kind !== "stream";
 
   const send = (cred: ProviderCredential): Promise<Response> => {
+    // A client that is already gone gets no upstream call.
+    if (req.signal.aborted || ctrl.signal.aborted) return Promise.reject(new DOMException("aborted", "AbortError"));
     const headers = new Headers(req.headers);
-    for (const h of [...HOP_BY_HOP, ...adapter.stripRequestHeaders, "host", "content-length", "accept-encoding"]) headers.delete(h);
+    stripHopByHop(headers);
+    for (const h of [...adapter.stripRequestHeaders, "host", "content-length", "accept-encoding"]) headers.delete(h);
     headers.set("accept-encoding", "identity");
     for (const [k, v] of Object.entries(adapter.authHeaders(cred, req.headers))) headers.set(k, v);
     const init: RequestInit & { duplex?: "half" } = { method: req.method, headers, signal: ctrl.signal, redirect: "manual" };
@@ -215,34 +312,35 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   };
 
   /** One attempt for `identity`, including at most one 401 refresh and retry. */
-  const attempt = async (identity: string): Promise<Response> => {
-    let cred = await deps.creds.get(app.provider, identity);
+  const attempt = async (ident: string): Promise<Response> => {
+    let cred = await deps.creds.get(app.provider, ident);
     let res = await send(cred);
-    if (res.status === 401 && replayable && adapter.refreshable) {
+    if (res.status === 401 && adapter.refreshable) {
       try {
-        cred = await deps.creds.refreshAfter401(app.provider, identity, cred.accessToken);
+        cred = await deps.creds.refreshAfter401(app.provider, ident, cred.accessToken);
       } catch (err) {
         if (err instanceof RefreshCooldownError || err instanceof NotRefreshableError) return res; // pass the upstream 401 through
+        if (!replayable) return res; // The body cannot be replayed anyway: the client sees the 401.
         await discard(res);
         throw err;
       }
+      // The credential is refreshed for the next request; a streamed body cannot be sent again.
+      if (!replayable) return res;
       await discard(res);
       res = await send(cred);
     }
     return res;
   };
 
+  /** 429 is quota or rate limit. 402 is a payment-required signal some providers use for exhausted credit. A 403 counts only when its (bounded) JSON body names a quota error type or code. */
   const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
     if (res.status === 429 || res.status === 402) return { quota: true, res };
     if (res.status !== 403) return { quota: false, res };
-    const declared = Number(res.headers.get("content-length") ?? "");
-    if (!res.body || (Number.isFinite(declared) && declared > ERROR_PEEK_BYTES)) return { quota: false, res };
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    const copy = new Response(bytes, { status: res.status, statusText: res.statusText, headers: res.headers });
-    return { quota: bytes.length <= ERROR_PEEK_BYTES && QUOTA_RE.test(new TextDecoder().decode(bytes)), res: copy };
+    const p = await peek(res, ERROR_PEEK_BYTES);
+    return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
   };
 
-  let identity = pick.identity;
+  identity = pick.identity;
   let up: Response;
   try {
     up = await attempt(identity);
@@ -252,10 +350,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       if (q.quota) {
         const next = await pickIdentity(app, deps, identity);
         if ("identity" in next) {
-          await discard(up);
-          deps.metrics.failover(app.name);
-          identity = next.identity;
-          up = await attempt(identity);
+          // If the second identity cannot even be tried, the client gets the original upstream answer.
+          try {
+            const second = await attempt(next.identity);
+            await discard(up);
+            deps.metrics.failover(app.name);
+            up = second;
+            identity = next.identity;
+          } catch {
+            if (req.signal.aborted || ctrl.signal.aborted) throw new DOMException("aborted", "AbortError");
+          }
         }
       }
     }
@@ -276,7 +380,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
 
   const headers = new Headers(up.headers);
-  for (const h of HOP_BY_HOP) headers.delete(h);
+  stripHopByHop(headers);
   if (headers.has("content-encoding")) {
     headers.delete("content-encoding");
     headers.delete("content-length");
@@ -326,6 +430,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   // A client that vanishes before pulling again: the request signal ends the upstream read.
   req.signal.addEventListener("abort", () => finish("client_aborted"), { once: true });
   return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
+  }
 }
 
 function decodeSegment(s: string): string {

@@ -571,3 +571,180 @@ describe("client abort", () => {
     expect(r[0]).toMatchObject({ status: "client_aborted", inputTokens: 9, streamed: true });
   });
 });
+
+describe("fix round 1", () => {
+  test("encoded or cased gateway token in the query is rejected and never forwarded", async () => {
+    const t = await addApp(baseApp({}));
+    const encoded = t.replace("_", "%5F");
+    for (const q of [`?key=${encoded}`, `?key=${t.toUpperCase()}`, `?${encoded}=1`, `?a=x&key=${encodeURIComponent(t)}`, `?key=${t.replace("aisg_", "AiSg%5f")}`]) {
+      const res = await call(`/pin/v1/messages${q}`, t, { method: "POST", body: "{}" });
+      expect(res.status).toBe(401);
+      expect(((await res.json()) as { type: string }).type).toBe("error");
+    }
+    expect(seen.length).toBe(0);
+    expect(logs.join("\n")).not.toContain(parseToken(t)!.secret);
+    expect((await call("/pin/v1/messages?beta=true", t, { method: "POST", body: "{}" })).status).toBe(200);
+  });
+
+  test("poolMembers throwing gives the app's error shape and exactly one row", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    deps.poolMembers = async () => {
+      throw new Error("members unavailable at /srv/secret");
+    };
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(500);
+    const text = await res.text();
+    expect(JSON.parse(text).type).toBe("error");
+    expect(text).not.toContain("srv");
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]).toMatchObject({ app: "pool", httpStatus: 500 });
+  });
+
+  test("upload abort gives one client_aborted row", async () => {
+    const t = await addApp(baseApp({}));
+    const ac = new AbortController();
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        c.enqueue(enc.encode("{"));
+        queueMicrotask(() => {
+          ac.abort();
+          c.error(new Error("client went away"));
+        });
+      },
+    });
+    await Promise.resolve(callRaw("/pin/v1/messages", t, { method: "POST", body, signal: ac.signal, duplex: "half" } as RequestInit)).catch(() => undefined);
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]!.status).toBe("client_aborted");
+    expect(seen.length).toBe(0);
+  });
+
+  test("a client that is already gone gets no upstream call", async () => {
+    const t = await addApp(baseApp({}));
+    const ac = new AbortController();
+    ac.abort();
+    await Promise.resolve(callRaw("/pin/v1/messages", t, { method: "POST", body: "{}", signal: ac.signal })).catch(() => undefined);
+    expect(seen.length).toBe(0);
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]!.status).toBe("client_aborted");
+  });
+
+  test("headers named by Connection are stripped both ways, and proxy-connection", async () => {
+    const t = await addApp(baseApp({}));
+    const real = deps.fetch;
+    let sent: Headers | undefined;
+    deps.fetch = (async (_u: string, init?: RequestInit) => {
+      sent = new Headers(init?.headers);
+      return new Response("{}", { headers: { connection: "x-resp-hop", "x-resp-hop": "1", "proxy-connection": "keep-alive", "x-keep": "yes" } });
+    }) as unknown as typeof fetch;
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}", headers: { connection: "x-req-hop", "x-req-hop": "1", "proxy-connection": "keep-alive", "x-keep": "yes" } });
+    deps.fetch = real;
+    expect(sent!.get("x-req-hop")).toBeNull();
+    expect(sent!.get("proxy-connection")).toBeNull();
+    expect(sent!.get("x-keep")).toBe("yes");
+    expect(res.headers.get("x-resp-hop")).toBeNull();
+    expect(res.headers.get("proxy-connection")).toBeNull();
+    expect(res.headers.get("x-keep")).toBe("yes");
+  });
+
+  const poolApp = async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    return t;
+  };
+  const forbidden = (error: object) => new Response(JSON.stringify({ error }), { status: 403, headers: { "content-type": "application/json" } });
+
+  test("a 403 permission error does not fail over; a 403 quota error does", async () => {
+    const t = await poolApp();
+    handler = () => forbidden({ type: "permission_error", message: "insufficient permissions for this key" });
+    expect((await call("/pool/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(403);
+    expect(seen.length).toBe(1);
+    seen.length = 0;
+    handler = (_r, s) => (s.headers.get("authorization") === "Bearer tok-a" ? forbidden({ type: "insufficient_quota" }) : new Response("{}", { headers: { "content-type": "application/json" } }));
+    expect((await call("/pool/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
+    expect(seen.length).toBe(2);
+  });
+
+  test("an oversized 403 body is only peeked at and still passes through unchanged", async () => {
+    const t = await poolApp();
+    const big = JSON.stringify({ pad: "x".repeat(200 * 1024), error: { type: "insufficient_quota" } });
+    handler = () => new Response(big, { status: 403, headers: { "content-type": "application/json" } });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe(big);
+    expect(seen.length).toBe(1);
+  });
+
+  test("a failover target that cannot be tried returns the original 429", async () => {
+    const t = await poolApp();
+    const get = deps.creds.get.bind(deps.creds);
+    deps.creds = {
+      ...deps.creds,
+      get: async (p: GatewayApp["provider"], id: string) => {
+        if (id === "b") throw new GatewayCredentialError("no-credential", p, id);
+        return get(p, id);
+      },
+      refreshAfter401: deps.creds.refreshAfter401,
+    } as GatewayDeps["creds"];
+    usage.a = live(5);
+    handler = () => new Response('{"orig":"429"}', { status: 429, headers: { "content-type": "application/json" } });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe('{"orig":"429"}');
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]).toMatchObject({ identity: "a", httpStatus: 429 });
+  });
+
+  test("an over-limit body 401 refreshes the credential but is not retried", async () => {
+    const t = await addApp(baseApp({}));
+    handler = () => new Response('{"e":"auth"}', { status: 401 });
+    const big = new Uint8Array(8 * 1024 * 1024 + 10);
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: big, headers: { "content-type": "application/octet-stream" } });
+    expect(res.status).toBe(401);
+    expect(refreshCalls).toBe(1);
+    expect(seen.length).toBe(1);
+  });
+
+  test("a chunked body over the limit streams through without failover", async () => {
+    const t = await poolApp();
+    handler = () => new Response("{}", { status: 429, headers: { "content-type": "application/json" } });
+    const chunk = new Uint8Array(1024 * 1024).fill(7);
+    let n = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (n++ < 9) c.enqueue(chunk);
+        else c.close();
+      },
+    });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body, duplex: "half", headers: { "content-type": "application/octet-stream" } } as RequestInit);
+    expect(res.status).toBe(429);
+    expect(seen.length).toBe(1);
+    expect(seen[0]!.body.length).toBe(9 * 1024 * 1024);
+  });
+
+  test("cap check failing open is counted", async () => {
+    const t = await addApp(baseApp({ dailyTokens: 10 }));
+    const failures: string[] = [];
+    deps.metrics = { ...noopMetrics, failOpen: (_a, reason) => void failures.push(reason) };
+    store.usageSince = async () => {
+      throw new Error("db down");
+    };
+    expect((await call("/pin/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
+    expect(failures).toEqual(["cap_check_failed"]);
+  });
+
+  test("encoded slashes and dot segments in the path are rejected", async () => {
+    const t = await addApp(baseApp({}));
+    for (const p of ["/pin/v1%2Fmessages", "/pin/v1/a%5Cb", "/pin/v1/a%2fb"]) {
+      const res = await call(p, t, { method: "POST", body: "{}" });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { type: string }).type).toBe("error");
+    }
+    expect(seen.length).toBe(0);
+    expect((await rows()).length).toBe(3);
+  });
+});
