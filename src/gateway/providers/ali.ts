@@ -9,7 +9,8 @@ import { BASE_STRIP_HEADERS, unsupportedStyle, type ProviderAdapter } from "./sh
  *   (readAliApiKey). A static API key, so there is nothing to refresh.
  * - header: AIS writes the provider as type "anthropic", which crush sends as
  *   the Anthropic SDK does (`x-api-key`). This is inferred from the type, not
- *   observed on the wire. TODO(task-3): confirm Alibaba accepts it live.
+ *   observed on the wire. crush is not installed on this host, so it could not
+ *   be read from the binary. TODO(task-3): Task 9 proves it live.
  */
 export const aliAdapter: ProviderAdapter = {
   provider: "ali",

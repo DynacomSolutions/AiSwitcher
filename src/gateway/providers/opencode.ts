@@ -6,9 +6,10 @@ import { bearer, BASE_STRIP_HEADERS, unsupportedStyle, type ProviderAdapter } fr
  *   (https://opencode.ai/zen/go/v1/usage) in src/cli/limits/opencode-limits.ts,
  *   called with `Authorization: Bearer <key>`. AIS knows no Anthropic-style
  *   Go upstream, so that style throws.
- * - credential: the `opencode-go` key in <configDir>/data/opencode/auth.json
- *   (credential-paths.ts, opencode-limits.ts). The v2 opencode.db rows are not
- *   read by the gateway. A static key, so there is nothing to refresh.
+ * - credential: the `opencode-go` key. v2 opencode writes only
+ *   <configDir>/data/opencode/opencode.db (credential table); auth.json can be
+ *   stale (opencode-limits.ts header). The cache prefers the db and falls back
+ *   to auth.json. A static key, so there is nothing to refresh.
  */
 export const opencodeAdapter: ProviderAdapter = {
   provider: "opencode",

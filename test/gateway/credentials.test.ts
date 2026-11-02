@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { cp, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { CredentialCache, NotRefreshableError, type RefreshFn } from "../../src/gateway/credentials.ts";
+import { CredentialCache, NotRefreshableError, RefreshCooldownError, type RefreshFn } from "../../src/gateway/credentials.ts";
+import { refreshIdentityOAuthGrant } from "../../src/identities/oauth-refresh.ts";
 
 const FIXTURES = join(import.meta.dir, "..", "fixtures", "gateway");
 const SCRATCH = join(import.meta.dir, ".tmp");
+const ANTHROPIC_TOKEN_HOST = "platform.claude.com";
 
 let work = "";
 beforeEach(async () => {
@@ -70,14 +73,78 @@ describe("CredentialCache", () => {
     expect(cred.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0009");
   });
 
+  test("file rotated between the gateway read and the lock gives zero token POSTs", async () => {
+    const posts: string[] = [];
+    const registry = join(work, "claude-registry.json");
+    await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "id1", label: "id1", configDir: join(work, "claude") }] }));
+    const fetchImpl = (async (url: string) => { posts.push(String(url)); return new Response("{}", { status: 500 }); }) as unknown as typeof fetch;
+    const refresh: RefreshFn = async (tool, identity, options) => {
+      // Another process rotates T1 to T2 after the gateway read, before the lock is taken.
+      await writeClaude("SYNTHETIC_FIXTURE-claude-access-0002", 1_800_000_400);
+      return refreshIdentityOAuthGrant(tool, identity, { ...options, fetchImpl, claudeRegistryPath: registry });
+    };
+    const c = makeCache(refresh);
+    const cred = await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001");
+    expect(posts).toEqual([]);
+    expect(cred.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0002");
+  });
+
+  test("repeated 401s within the cooldown give exactly one token POST", async () => {
+    const posts: string[] = [];
+    const registry = join(work, "claude-registry.json");
+    await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "id1", label: "id1", configDir: join(work, "claude") }] }));
+    const fetchImpl = (async (url: string) => {
+      posts.push(String(url));
+      return new Response(JSON.stringify({ access_token: "SYNTHETIC_FIXTURE-claude-access-0002", expires_in: 3600 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    let now = 1_800_000_000_000;
+    const c = new CredentialCache({
+      resolveConfigDir: async (p) => join(work, p),
+      now: () => now,
+      refresh: (tool, identity, options) => refreshIdentityOAuthGrant(tool, identity, { ...options, fetchImpl, claudeRegistryPath: registry }),
+    });
+    const first = await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001");
+    expect(first.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0002");
+    now += 30_000;
+    await expect(c.refreshAfter401("claude", "id1", first.accessToken)).rejects.toBeInstanceOf(RefreshCooldownError);
+    expect(posts.length).toBe(1);
+    expect(posts[0]).toContain(ANTHROPIC_TOKEN_HOST);
+    now += 31_000;
+    await c.refreshAfter401("claude", "id1", first.accessToken).catch(() => undefined);
+    expect(posts.length).toBe(2);
+  });
+
+  test("opencode prefers the v2 db key over a stale auth.json and watches the db mtime", async () => {
+    const dbPath = join(work, "opencode", "data", "opencode", "opencode.db");
+    const db = new Database(dbPath, { create: true });
+    db.run("CREATE TABLE credential (id TEXT, integration_id TEXT, label TEXT, value TEXT, active INTEGER, time_updated INTEGER)");
+    db.run("INSERT INTO credential VALUES ('1','opencode','x', ?, 1, 5)", [JSON.stringify({ type: "api", key: "SYNTHETIC_FIXTURE-opencode-db-0001" })]);
+    db.close();
+    const c = makeCache();
+    expect((await c.get("opencode", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-opencode-db-0001");
+    const db2 = new Database(dbPath);
+    db2.run("UPDATE credential SET value = ?", [JSON.stringify({ type: "api", key: "SYNTHETIC_FIXTURE-opencode-db-0002" })]);
+    db2.close();
+    await utimes(dbPath, 1_900_000_000, 1_900_000_000);
+    expect((await c.get("opencode", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-opencode-db-0002");
+  });
+
+  test("retired identities are rejected without leaking the token", async () => {
+    const c = new CredentialCache({ resolveIdentity: async () => ({ name: "id1", label: "id1", configDir: join(work, "claude"), retired: true }) });
+    const err = await c.get("claude", "id1").catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/retired/);
+    expect((err as Error).message).not.toContain("SYNTHETIC_FIXTURE");
+  });
+
   test("failed refresh and unchanged token raise errors without token values", async () => {
     const failing = makeCache(async () => refreshed({ outcome: "failed", detail: "endpoint said no" }));
     const err = await failing.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: Error) => e);
-    expect((err as Error).message).toContain("endpoint said no");
+    expect((err as Error).message).toContain("refresh-failed");
+    expect((err as Error).message).not.toContain("endpoint said no");
     expect((err as Error).message).not.toContain("SYNTHETIC_FIXTURE-claude-access-0001");
     const noop = makeCache(async () => refreshed());
     const err2 = await noop.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: Error) => e);
-    expect((err2 as Error).message).toMatch(/still holds/);
+    expect((err2 as Error).message).toMatch(/token-unchanged/);
     expect((err2 as Error).message).not.toContain("SYNTHETIC_FIXTURE-claude-access-0001");
   });
 
@@ -95,8 +162,8 @@ describe("CredentialCache", () => {
 
   test("missing identity or credential gives a clear error", async () => {
     const c = new CredentialCache({ resolveConfigDir: async () => undefined });
-    await expect(c.get("claude", "nope")).rejects.toThrow(/identity "nope"/);
+    await expect(c.get("claude", "nope")).rejects.toThrow(/unknown-identity/);
     const d = new CredentialCache({ resolveConfigDir: async () => join(work, "empty") });
-    await expect(d.get("claude", "id1")).rejects.toThrow(/no usable claude credential/);
+    await expect(d.get("claude", "id1")).rejects.toThrow(/no-credential/);
   });
 });

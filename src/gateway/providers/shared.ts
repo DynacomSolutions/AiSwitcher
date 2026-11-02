@@ -13,7 +13,8 @@ export interface ProviderCredential {
 export interface ProviderAdapter {
   provider: GatewayProvider;
   upstreamBase(style: ApiStyle): string;
-  authHeaders(cred: ProviderCredential): Record<string, string>;
+  /** Final credential header values for the upstream call. `incoming` is the client request's headers, so an adapter can merge rather than clobber. */
+  authHeaders(cred: ProviderCredential, incoming: Headers): Record<string, string>;
   /** Lower-case request headers removed before the upstream call (gateway auth and anything the adapter sets). */
   stripRequestHeaders: string[];
   refreshable: boolean;
@@ -21,7 +22,7 @@ export interface ProviderAdapter {
 }
 
 /** Headers that can carry the gateway token (or a caller-supplied upstream credential). */
-export const BASE_STRIP_HEADERS = ["authorization", "x-api-key", "api-key"];
+export const BASE_STRIP_HEADERS = ["authorization", "x-api-key", "api-key", "cookie", "proxy-authorization"];
 
 export function unsupportedStyle(provider: GatewayProvider, style: ApiStyle): Error {
   return new Error(`gateway: provider ${provider} has no ${style} upstream configured in AIS`);

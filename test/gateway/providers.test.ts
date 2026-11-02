@@ -20,7 +20,7 @@ describe("provider adapters", () => {
     };
     for (const provider of Object.keys(expected) as GatewayProvider[]) {
       const cred = await cache.get(provider, "id1");
-      expect(adapterFor(provider).authHeaders(cred)).toEqual(expected[provider]);
+      expect(adapterFor(provider).authHeaders(cred, new Headers())).toEqual(expected[provider]);
     }
   });
 
@@ -34,11 +34,31 @@ describe("provider adapters", () => {
     expect(adapterFor("codex").stripRequestHeaders).toContain("chatgpt-account-id");
   });
 
+  test("claude merges client betas with the oauth beta, each once", async () => {
+    const cred = await cache.get("claude", "id1");
+    const merged = adapterFor("claude").authHeaders(cred, new Headers({ "Anthropic-Beta": "interleaved-thinking-2025-05-14, oauth-2025-04-20" }));
+    const betas = (merged["anthropic-beta"] ?? "").split(",").map((b) => b.trim());
+    expect(betas.sort()).toEqual(["interleaved-thinking-2025-05-14", "oauth-2025-04-20"]);
+  });
+
+  test("strip list removes mixed-case credential headers from a real Headers object", () => {
+    const headers = new Headers({
+      Authorization: "x", "X-Api-Key": "x", "API-Key": "x", Cookie: "x", "Proxy-Authorization": "x", "Content-Type": "application/json",
+    });
+    for (const provider of ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"] as const) {
+      const copy = new Headers(headers);
+      for (const name of adapterFor(provider).stripRequestHeaders) copy.delete(name);
+      expect([...copy.keys()]).toEqual(["content-type"]);
+    }
+  });
+
   test("upstream bases come from the AIS tool configs", () => {
     expect(adapterFor("claude").upstreamBase("anthropic")).toBe("https://api.anthropic.com");
     expect(adapterFor("zai").upstreamBase("openai")).toBe("https://api.z.ai/api/coding/paas/v4");
     expect(adapterFor("zai").upstreamBase("anthropic")).toBe("https://api.z.ai/api/anthropic");
     expect(adapterFor("ali").upstreamBase("anthropic")).toBe("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic");
+    expect(adapterFor("codex").upstreamBase("openai")).toBe("https://chatgpt.com/backend-api/codex");
+    expect(adapterFor("kimi").upstreamBase("anthropic")).toBe("https://api.kimi.com/coding");
     expect(adapterFor("kimi").upstreamBase("openai")).toBe("https://api.kimi.com/coding/v1");
     expect(adapterFor("opencode").upstreamBase("openai")).toBe("https://opencode.ai/zen/go/v1");
   });
