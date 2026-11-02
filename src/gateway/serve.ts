@@ -41,6 +41,7 @@ export interface GatewayHooks {
   usageFor?: GatewayDeps["usageFor"];
   /** Replaces the AIS adapter fetch behind the default (cached) usage source. */
   fetchUsage?: FetchUsage;
+  canonical?: GatewayDeps["canonical"];
   identityState?(provider: GatewayProvider, identity: string): Promise<IdentityState>;
   poolMembers?: GatewayDeps["poolMembers"];
   notify?: Notifier;
@@ -133,6 +134,24 @@ async function defaultIdentityState(provider: GatewayProvider, name: string): Pr
 }
 
 /** Reasons only: errors from the store or filesystem can carry connection strings or paths. */
+/** Alias to canonical identity name, with a short cache so the registry file is not read per request. */
+function canonicalResolver(): NonNullable<GatewayDeps["canonical"]> {
+  const cache = new Map<string, { name: string; at: number }>();
+  return async (provider, identity) => {
+    const key = `${provider}\u0000${identity}`;
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < 60_000) return hit.name;
+    try {
+      const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
+      const name = findIdentityByNameOrAlias(file.identities, identity)?.name ?? identity;
+      cache.set(key, { name, at: Date.now() });
+      return name;
+    } catch {
+      return hit?.name ?? identity;
+    }
+  };
+}
+
 const describe = (err: unknown): string => {
   const e = err as { name?: unknown; code?: unknown } | null;
   return [typeof e?.name === "string" ? e.name : "Error", typeof e?.code === "string" ? e.code : undefined].filter(Boolean).join(" ");
@@ -152,6 +171,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const failedTokens = new Map<string, string>();
   const baseCreds = hooks.creds ?? new CredentialCache({ refresh: instrumentRefresh(refreshIdentityOAuthGrant, { metrics, alerter, failed: failedTokens }) });
   const creds = watchCredentialReads(baseCreds, alerter, failedTokens);
+  const canonical = hooks.canonical ?? canonicalResolver();
   const usage = createUsageSource({ fetchUsage: hooks.fetchUsage ?? fetchPoolUsage });
   const poolMembers = hooks.poolMembers ?? defaultPoolMembers;
 
@@ -159,7 +179,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     store,
     ledger,
     creds,
-    usageFor: hooks.usageFor ?? usage.get,
+    usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
+    canonical,
     poolMembers,
     fetch: hooks.fetch ?? fetch,
     now,
@@ -184,17 +205,29 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
    * cache. A bad identity only fails its own app's requests, so this never blocks readiness.
    */
   async function probeIdentities(): Promise<void> {
+    const prefilled = new Set<string>();
+    const prefill = async (provider: GatewayProvider, name: string): Promise<void> => {
+      const c = await canonical(provider, name);
+      const key = `${provider}\u0000${c}`;
+      if (prefilled.has(key)) return;
+      prefilled.add(key);
+      await usage.prefill(provider, c).catch(() => undefined);
+    };
     for (const app of await store.listApps()) {
       if (app.state !== "active") continue;
-      const names = app.target.kind === "pin" ? [app.target.identity] : (app.target.identities ?? []);
-      for (const identity of names) {
+      const listed = app.target.kind === "pin" ? [app.target.identity] : (app.target.identities ?? []);
+      for (const identity of listed) {
         try {
           await creds.get(app.provider, identity);
         } catch (err) {
           metrics.credentialUnreadable(app.name, app.provider, identity);
           console.warn(`gateway: app "${app.name}" cannot read ${app.provider} identity "${identity}" (${describe(err)}); its requests will fail`);
         }
-        await usage.prefill(app.provider, identity).catch(() => undefined);
+        await prefill(app.provider, identity);
+      }
+      // A pool with no list may use any current member.
+      if (app.target.kind === "pool" && listed.length === 0) {
+        for (const member of await poolMembers(app.provider).catch(() => [] as string[])) await prefill(app.provider, member);
       }
     }
   }

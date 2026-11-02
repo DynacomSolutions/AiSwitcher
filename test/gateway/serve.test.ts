@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
-import { styleForPath } from "../../src/gateway/app.ts";
+import { createGatewayApp, styleForPath } from "../../src/gateway/app.ts";
 import { instrumentRefresh, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
@@ -474,5 +474,49 @@ describe("alert recovery", () => {
     await fresh.get("codex", "c1");
     await refresh("codex", id, { expectedAccessToken: "new" });
     expect(seen).toEqual(["codex/c1", "codex/c1"]);
+  });
+});
+
+describe("canonical identity names", () => {
+  test("an alias pin is recorded under the canonical name and its alert clears on a 2xx", async () => {
+    await store.putApp({ ...app, target: { kind: "pin", identity: "alias1" } });
+    const t = generateToken();
+    await store.addToken({ app: "web", prefix: t.prefix, hash: t.hash, createdAt: app.createdAt });
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(a.key));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const ledger = new LedgerBuffer(store, { max: 100, flushMs: 3_600_000 });
+    const gw = createGatewayApp({
+      store,
+      ledger,
+      creds: { get: async () => ({ identity: "id1", accessToken: "t" }), refreshAfter401: async () => ({ identity: "id1", accessToken: "t" }) } as never,
+      usageFor: async () => undefined,
+      poolMembers: async () => [],
+      canonical: async (_p, i) => (i === "alias1" ? "id1" : i),
+      fetch: (async () => new Response("{}", { headers: { "content-type": "application/json" } })) as never,
+      now: () => new Date(),
+      metrics: recoverOnSuccess(metrics, alerter),
+    });
+    alerter.raise("refresh-failed", "claude/id1", "x");
+    const res = await gw.request("http://gw.test/web/v1/messages", { method: "POST", headers: { authorization: `Bearer ${t.token}` }, body: "{}" });
+    expect(res.status).toBe(200);
+    await res.text();
+    await ledger.flush();
+    expect(store.written[0]!.identity).toBe("id1");
+    expect(metrics.render()).toContain('identity="id1"');
+    expect(metrics.render()).not.toContain("alias1");
+    alerter.raise("refresh-failed", "claude/id1", "x");
+    expect(seen).toEqual(["claude/id1", "claude/id1"]);
+    await ledger.close();
+  });
+});
+
+describe("usage prefill", () => {
+  test("pools without an identity list prefill every current member", async () => {
+    await store.putApp({ ...app, target: { kind: "pool" } });
+    const fetched: string[] = [];
+    const g = await boot({ poolMembers: async () => ["m1", "m2"], fetchUsage: async (_p, i) => (fetched.push(i), undefined) });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    await waitFor(() => fetched.includes("m1") && fetched.includes("m2"));
   });
 });

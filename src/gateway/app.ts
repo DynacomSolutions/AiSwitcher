@@ -21,6 +21,8 @@ export interface GatewayDeps {
   creds: Pick<CredentialCache, "get" | "refreshAfter401">;
   usageFor(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   poolMembers(provider: GatewayProvider): Promise<string[]>;
+  /** Resolves an alias to the identity's canonical name. Ledger rows, metrics and alerts use the canonical name. */
+  canonical?(provider: GatewayProvider, identity: string): Promise<string>;
   fetch: typeof fetch;
   now(): Date;
   metrics: GatewayMetrics;
@@ -219,7 +221,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return providerError(style, 401, "invalid or missing gateway token");
   }
 
-  const identityForRow = app.target.kind === "pin" ? app.target.identity : "-";
+  const canon = async (name: string): Promise<string> => {
+    try {
+      return (await deps.canonical?.(app.provider, name)) ?? name;
+    } catch {
+      return name;
+    }
+  };
+  const identityForRow = app.target.kind === "pin" ? await canon(app.target.identity) : "-";
   let recorded = false;
   const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string): void => {
     if (recorded) return;
@@ -359,7 +368,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
   };
 
-  identity = pick.identity;
+  identity = await canon(pick.identity);
   let up: Response;
   try {
     up = await attempt(identity);
@@ -375,7 +384,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
             await discard(up);
             deps.metrics.failover(app.name);
             up = second;
-            identity = next.identity;
+            identity = await canon(next.identity);
           } catch {
             if (req.signal.aborted || ctrl.signal.aborted) throw new DOMException("aborted", "AbortError");
           }
