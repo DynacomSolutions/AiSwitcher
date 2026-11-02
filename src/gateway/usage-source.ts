@@ -8,14 +8,14 @@ export const USAGE_TTL_MS = 45_000;
 
 export type FetchUsage = (provider: GatewayProvider, identity: string) => Promise<PoolUsage | undefined>;
 
-/** The agent reserve's utilisation figure, from the same adapters `ais swap` uses (claude, codex, kimi). Others have none. */
+/** The agent reserve's utilisation figure, from the same adapters `ais swap` uses (claude, codex, kimi). Others have none. The poll never refreshes a token (`noRefresh`): rotating a grant is the proxy's job, where it is counted and alerted. */
 export const fetchPoolUsage: FetchUsage = async (provider, identity) => {
   if (provider !== "claude" && provider !== "codex" && provider !== "kimi") return undefined;
   const adapter = poolAdapterFor(provider);
   if (!adapter) return undefined;
   const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
   const found = findIdentityByNameOrAlias(file.identities, identity);
-  return found ? adapter.fetchUsage(found) : undefined;
+  return found ? adapter.fetchUsage(found, { noRefresh: true }) : undefined;
 };
 
 interface Entry {

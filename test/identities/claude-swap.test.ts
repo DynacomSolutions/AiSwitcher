@@ -431,6 +431,21 @@ describe("usage api", () => {
     expect(unknown && "usedPercent" in unknown).toBe(false);
   });
 
+  test("noRefresh leaves an expired token alone and reports unavailable", async () => {
+    await writeRegistry();
+    await seedMember("b", "at-b-old", "rt-b-old", NOW_S - 100);
+    const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
+    let calls = 0;
+    const impl = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ access_token: "new", refresh_token: "rt", expires_in: 3600 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const u = await fetchMemberUsage(b, { fetchImpl: impl, claudeRegistryPath: registry, cacheDir: join(root, "cache"), now: () => NOW_S * 1000, noRefresh: true });
+    expect(calls).toBe(0);
+    expect(u.status).toBe("unavailable");
+    expect((await read(join(root, "b", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-b-old");
+  });
+
   test("sends the bearer and beta header; 429 is reported", async () => {
     await writeRegistry();
     const b = (await loadIdentitiesFile(registry)).identities.find((i) => i.name === "b")!;
