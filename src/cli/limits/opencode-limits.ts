@@ -32,7 +32,7 @@ export type OpencodeAuthFile = Record<string, OpencodeAuthEntry>;
  * all. */
 const NATIVE_COVERED_OPENCODE_PROVIDERS = new Set(["alibaba"]);
 
-async function readOpencodeAuth(configDir: string): Promise<OpencodeAuthFile | undefined> {
+export async function readOpencodeAuth(configDir: string): Promise<OpencodeAuthFile | undefined> {
   try {
     const parsed = JSON.parse(await Bun.file(join(configDir, "data", "opencode", "auth.json")).text()) as unknown;
     if (typeof parsed !== "object" && parsed === null) return undefined;
@@ -94,7 +94,7 @@ function opencodeV2CredentialProvider(integrationId: string): string {
  * when the db WAS read but held no usable row; auth.json stays the fallback
  * in both cases, but only the undefined case means the v2 store itself was
  * not readable. */
-async function readOpencodeV2Credentials(
+export async function readOpencodeV2Credentials(
   configDir: string,
 ): Promise<Array<{ provider: string; entry: OpencodeAuthEntry }> | undefined> {
   let db: Database;

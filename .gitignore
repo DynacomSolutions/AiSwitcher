@@ -5,3 +5,4 @@ dist/
 .claude/
 mods/**/.claude-plugin/types/
 __pycache__/
+test/gateway/.tmp/
