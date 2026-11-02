@@ -31,6 +31,6 @@ export async function writeAppSecret(
     metadata: { name: secretName(app), namespace: ns, labels: { "app.kubernetes.io/managed-by": "ais-gateway" } },
     stringData: { AIS_GATEWAY_URL: data.url, AIS_GATEWAY_USERNAME: data.username, AIS_GATEWAY_TOKEN: data.token },
   };
-  const res = await kubectl(["apply", "-f", "-"], JSON.stringify(manifest));
-  if (res.code !== 0) throw new Error(`kubectl apply of Secret ${secretName(app)} in ${ns} failed: ${res.stderr || `exit ${res.code}`}`);
+  const res = await kubectl(["apply", "--server-side", "--field-manager=ais-gateway", "-f", "-"], JSON.stringify(manifest));
+  if (res.code !== 0) throw new Error(`kubectl apply of Secret ${secretName(app)} in ${ns} failed: ${(res.stderr || `exit ${res.code}`).split(data.token).join("[redacted]")}`);
 }

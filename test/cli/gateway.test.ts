@@ -1,12 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "../../src/cli/args.ts";
 import { runGatewayCommand, type GatewayCliDeps } from "../../src/cli/gateway/dispatch.ts";
 import { appendSecretsFile } from "../../src/cli/gateway/secrets-file.ts";
 import { writeAppSecret } from "../../src/cli/gateway/kube-secret.ts";
 
-const SCRATCH = resolve(import.meta.dir, "../../../../../../.data/DynacomSolutions/AiSwitcher/scratch/gw-t7-tests");
+// Scratch lives in AIS_TEST_SCRATCH_DIR, or in the repo-local test/gateway/.tmp (gitignored).
+const SCRATCH = process.env.AIS_TEST_SCRATCH_DIR ? join(process.env.AIS_TEST_SCRATCH_DIR, "gw-t7-cli") : join(import.meta.dir, "..", "gateway", ".tmp", "gw-t7-cli");
 const TOKEN = "aisgw_TESTTOKEN0123456789abcdef";
 let dir: string;
 let secrets: string;
@@ -72,8 +73,7 @@ describe("ais gateway app add", () => {
     await run(ADD);
     expect(out.join("\n").split(TOKEN)).toHaveLength(2);
     expect(kube[0]!.args.join(" ")).not.toContain(TOKEN);
-    expect(kube[0]!.args).toContain("-f");
-    expect(kube[0]!.args).toContain("-");
+    expect(kube[0]!.args).toEqual(["apply", "--server-side", "--field-manager=ais-gateway", "-f", "-"]);
   });
 
   test("pin and pool flags are mutually exclusive", async () => {
@@ -98,6 +98,31 @@ describe("ais gateway app add", () => {
   test("refuses to overwrite an existing app", async () => {
     respond = () => Response.json({ name: "billing" });
     await expect(run(ADD)).rejects.toThrow(/already exists/);
+  });
+
+  test("existing app message points to update and rotate", async () => {
+    respond = () => Response.json({ name: "billing" });
+    await expect(run(ADD)).rejects.toThrow(/update billing.*rotate billing/);
+  });
+
+  test("missing token in admin response writes nothing", async () => {
+    respond = (url, m) => (m === "GET" ? Response.json({}, { status: 404 }) : url.endsWith("/tokens") ? Response.json({ app: "billing" }, { status: 201 }) : Response.json({}, { status: 201 }));
+    const before = readFileSync(secrets, "utf8");
+    await expect(run(ADD)).rejects.toThrow(/no token/);
+    expect(kube).toHaveLength(0);
+    expect(readFileSync(secrets, "utf8")).toBe(before);
+  });
+
+  test("kubectl message is redacted and both failures are reported", async () => {
+    const bad = join(dir, "isdir");
+    mkdirSync(bad);
+    // Admin settings come from the environment here, since the secrets path is the broken one.
+    Object.assign(process.env, { AIS_GATEWAY_ADMIN_URL: "http://admin.test", AIS_GATEWAY_ADMIN_TOKEN: "adm-1", AIS_GATEWAY_PROXY_URL: "https://gw.test" });
+    const err = await run(ADD, { secretsPath: bad, kubectl: async () => ({ code: 1, stderr: `boom ${TOKEN}` }) }).catch((e: Error) => e);
+    for (const k of ["AIS_GATEWAY_ADMIN_URL", "AIS_GATEWAY_ADMIN_TOKEN", "AIS_GATEWAY_PROXY_URL"]) delete process.env[k];
+    expect(String(err)).not.toContain(TOKEN);
+    expect(String(err)).toContain("boom [redacted]");
+    expect(String(err)).toMatch(/secrets file/i);
   });
 
   test("a kubectl failure still saves the token locally and reports", async () => {
@@ -155,6 +180,29 @@ describe("appendSecretsFile", () => {
     expect(text.match(/^K=/gm)).toHaveLength(1);
     expect(text).toContain("K=two");
     expect(text).toContain("OTHER=keep");
+  });
+
+  test("backup of a 0644 file is 0600", async () => {
+    chmodSync(secrets, 0o644);
+    await appendSecretsFile("K", "v", secrets, 7);
+    expect(statSync(join(dir, "secrets.bak.7")).mode & 0o777).toBe(0o600);
+  });
+
+  test("an unreadable path throws and changes nothing", async () => {
+    const d = join(dir, "adir");
+    mkdirSync(d);
+    await expect(appendSecretsFile("K", "v", d, 1)).rejects.toThrow();
+    expect(readdirSync(dir).filter((f) => f.startsWith("adir."))).toEqual([]);
+    expect(statSync(d).isDirectory()).toBe(true);
+  });
+
+  test("a symlink is written through to its target", async () => {
+    const link = join(dir, "link");
+    symlinkSync(secrets, link);
+    await appendSecretsFile("K", "v", link, 3);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readFileSync(secrets, "utf8")).toContain("K=v");
+    expect(readdirSync(dir).filter((f) => f.includes(".tmp."))).toEqual([]);
   });
 
   test("creates a missing file with mode 0600", async () => {

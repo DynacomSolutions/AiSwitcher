@@ -1,4 +1,4 @@
-import { chmod, copyFile, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -36,23 +36,42 @@ export const appTokenKey = (app: string): string => `AIS_GATEWAY_APP_${app.toUpp
  * Sets KEY=value in a secrets file: backs the file up to `<path>.bak.<epoch>` first,
  * replaces an existing assignment of the key (never duplicates it) and enforces mode 0600.
  */
-export async function appendSecretsFile(key: string, value: string, path = defaultSecretsPath(), epoch = Math.floor(Date.now() / 1000)): Promise<void> {
+export async function appendSecretsFile(key: string, value: string, requested = defaultSecretsPath(), epoch = Math.floor(Date.now() / 1000)): Promise<void> {
+  // A symlinked secrets file is updated in place at its target.
+  let path = requested;
+  try {
+    path = await realpath(requested);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
   let existing: string | undefined;
   try {
     existing = await readFile(path, "utf8");
-  } catch {
-    existing = undefined;
+  } catch (e) {
+    // Only a missing file is "absent"; any other error must not lead to replacing the file.
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
   if (existing !== undefined) {
     const backup = `${path}.bak.${epoch}`;
-    await copyFile(path, backup);
+    await writeFile(backup, existing, { mode: 0o600 });
     await chmod(backup, 0o600);
   }
   const kept = (existing ?? "").split("\n").filter((line) => parseLine(line)?.key !== key);
   while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
   kept.push(`${key}=${value}`);
   const tmp = `${path}.tmp.${process.pid}`;
-  await writeFile(tmp, `${kept.join("\n")}\n`, { mode: 0o600 });
-  await chmod(tmp, 0o600);
-  await rename(tmp, path);
+  try {
+    const fh = await open(tmp, "w", 0o600);
+    try {
+      await fh.writeFile(`${kept.join("\n")}\n`);
+      await fh.chmod(0o600);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, path);
+  } catch (e) {
+    await rm(tmp, { force: true });
+    throw e;
+  }
 }

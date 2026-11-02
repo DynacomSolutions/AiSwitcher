@@ -130,18 +130,36 @@ const proxyUrl = async (deps: GatewayCliDeps, flags: Flags, app: string): Promis
 /** Delivers a freshly minted token: kube Secret, then the local secrets file, then the one printed copy. */
 async function deliverToken(deps: GatewayCliDeps, flags: Flags, app: string, namespace: string, token: string): Promise<void> {
   const url = await proxyUrl(deps, flags, app);
+  const redact = (e: unknown): string => (e instanceof Error ? e.message : String(e)).split(token).join("[redacted]");
   let kubeError: unknown;
+  let fileError: unknown;
   try {
     await writeAppSecret(namespace, app, { url, username: app, token }, deps.kubectl);
   } catch (e) {
     kubeError = e;
   }
-  await appendSecretsFile(appTokenKey(app), token, deps.secretsPath, Math.floor(deps.now() / 1000));
+  try {
+    await appendSecretsFile(appTokenKey(app), token, deps.secretsPath, Math.floor(deps.now() / 1000));
+  } catch (e) {
+    fileError = e;
+  }
   deps.out(`app: ${app}`);
   deps.out(`url: ${url}`);
   deps.out(`token (shown once): ${token}`);
-  deps.out(kubeError === undefined ? `secret: ais-gateway-${app} written in ${namespace}; token saved as ${appTokenKey(app)} in ~/.secrets` : `token saved as ${appTokenKey(app)} in ~/.secrets`);
-  if (kubeError !== undefined) throw new Error(`${kubeError instanceof Error ? kubeError.message : String(kubeError)} (the token was minted and saved locally; fix kubectl access, then run: ais gateway app rotate ${app})`);
+  if (kubeError === undefined && fileError === undefined) {
+    deps.out(`secret: ais-gateway-${app} written in ${namespace}; token saved as ${appTokenKey(app)} in ~/.secrets`);
+    return;
+  }
+  const parts: string[] = [];
+  if (kubeError !== undefined) parts.push(redact(kubeError));
+  if (fileError !== undefined) parts.push(`secrets file not updated: ${redact(fileError)}`);
+  const hint = kubeError !== undefined ? `fix kubectl access, then run: ais gateway app rotate ${app}` : "copy the token above now";
+  throw new Error(`${parts.join("; ")} (the token was minted; ${hint})`);
+}
+
+function mintedToken(json: Record<string, unknown>): string {
+  if (typeof json.token !== "string" || json.token === "") throw new Error("gateway admin returned no token; nothing was written");
+  return json.token;
 }
 
 function appName(positionals: string[]): string {
@@ -157,10 +175,10 @@ export async function runAppCommand(action: string | undefined, positionals: str
       const name = appName(positionals);
       const body = buildNew(flags);
       const existing = await admin.call("GET", `/apps/${name}`, undefined, [404]);
-      if (existing.status !== 404) throw new CliUsageError(`App "${name}" already exists; use: ais gateway app update ${name}`);
+      if (existing.status !== 404) throw new CliUsageError(`App "${name}" already exists; use: ais gateway app update ${name} to change settings, or ais gateway app rotate ${name} for a new token`);
       await admin.call("PUT", `/apps/${name}`, body);
       const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
-      await deliverToken(deps, flags, name, body.namespace, String(minted.json.token));
+      await deliverToken(deps, flags, name, body.namespace, mintedToken(minted.json));
       return;
     }
     case "list": {
@@ -196,7 +214,7 @@ export async function runAppCommand(action: string | undefined, positionals: str
       const name = appName(positionals);
       const { json: cur } = await admin.call("GET", `/apps/${name}`);
       const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
-      await deliverToken(deps, flags, name, str(cur.namespace), String(minted.json.token));
+      await deliverToken(deps, flags, name, str(cur.namespace), mintedToken(minted.json));
       deps.out("previous tokens keep working until " + str(minted.json.previousTokensExpireAt));
       return;
     }
