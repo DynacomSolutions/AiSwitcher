@@ -210,7 +210,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const appName = decodeSegment(url.pathname.slice(1, slash === -1 ? undefined : slash));
   const rest = slash === -1 ? "" : url.pathname.slice(slash);
 
-  const found = appName ? await deps.store.getApp(appName) : undefined;
+  let found: GatewayApp | undefined;
+  try {
+    found = appName ? await deps.store.getApp(appName) : undefined;
+  } catch {
+    deps.metrics.authFailure("auth-error");
+    return providerError("openai", 502, "gateway store unavailable");
+  }
   if (!found) {
     deps.metrics.authFailure("unknown-app");
     return providerError(guessStyle(url.pathname), 404, "not found");
@@ -220,7 +226,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const adapter = adapterFor(app.provider);
 
   const token = queryCarriesToken(url.search) ? undefined : extractToken(req, app.name);
-  if (!token || !(await verifyToken(deps.store, app.name, token, deps.now()))) {
+  let valid = false;
+  if (token) {
+    try {
+      valid = await verifyToken(deps.store, app.name, token, deps.now());
+    } catch {
+      deps.metrics.authFailure("auth-error", app.name);
+      return providerError(style, 502, "gateway store unavailable");
+    }
+  }
+  if (!valid) {
     deps.metrics.authFailure("bad-token", app.name);
     return providerError(style, 401, "invalid or missing gateway token");
   }
@@ -394,7 +409,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
             up = second;
             identity = await canon(next.identity);
           } catch {
-            if (req.signal.aborted || ctrl.signal.aborted) throw new DOMException("aborted", "AbortError");
+            if (req.signal.aborted || ctrl.signal.aborted) {
+              await discard(up);
+              throw new DOMException("aborted", "AbortError");
+            }
           }
         }
       }

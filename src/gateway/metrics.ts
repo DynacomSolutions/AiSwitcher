@@ -10,7 +10,7 @@ export interface GatewayMetrics {
     tokens?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
   }): void;
   /** `app` is only given when the app exists (bounded); unknown apps are counted under "-". */
-  authFailure(reason: "unknown-app" | "bad-token", app?: string): void;
+  authFailure(reason: "unknown-app" | "bad-token" | "auth-error", app?: string): void;
   /** A request refused by a policy of the gateway itself. */
   rejection(app: string, reason: "daily_cap" | "model" | "reserve" | "no_headroom" | "no_identities"): void;
   failover(app: string): void;
@@ -82,7 +82,7 @@ export class PrometheusMetrics implements GatewayMetrics {
     });
   }
 
-  authFailure(reason: "unknown-app" | "bad-token", app?: string): void {
+  authFailure(reason: "unknown-app" | "bad-token" | "auth-error", app?: string): void {
     this.rejections.inc({ app: app ?? "-", reason });
   }
 

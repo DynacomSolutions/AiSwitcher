@@ -803,4 +803,58 @@ describe("fix round 1", () => {
     expect(seen.length).toBe(2);
   });
 
+  test("an aborted failover attempt cancels the original 429 body", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(5);
+    usage.b = live(10);
+    const ac = new AbortController();
+    let cancelled = false;
+    let calls = 0;
+    deps.fetch = (async () => {
+      calls += 1;
+      if (calls === 1) {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode('{"e":"rl"}'));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        });
+        return new Response(body, { status: 429, headers: { "content-type": "application/json" } });
+      }
+      ac.abort();
+      throw new DOMException("aborted", "AbortError");
+    }) as unknown as typeof fetch;
+    await Promise.resolve(callRaw("/pool/v1/messages", t, { method: "POST", body: "{}", signal: ac.signal })).catch(() => undefined);
+    expect(calls).toBe(2);
+    expect(cancelled).toBe(true);
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]!.status).toBe("client_aborted");
+  });
+
+  test("a store failure before auth gives 502, a metric and no ledger row", async () => {
+    const t = await addApp(baseApp({}));
+    const fails: Array<[string, string | undefined]> = [];
+    deps.metrics = { ...noopMetrics, authFailure: (reason, app) => void fails.push([reason, app]) };
+    store.tokensFor = async () => {
+      throw new Error("db down");
+    };
+    const known = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(known.status).toBe(502);
+    expect(((await known.json()) as { type: string }).type).toBe("error"); // anthropic shape
+    store.getApp = async () => {
+      throw new Error("db down");
+    };
+    const unknown = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(unknown.status).toBe(502);
+    expect(((await unknown.json()) as { error: { type: string } }).error.type).toBe("server_error"); // openai shape
+    expect(fails).toEqual([
+      ["auth-error", "pin"],
+      ["auth-error", undefined],
+    ]);
+    expect((await rows()).length).toBe(0);
+    expect(seen.length).toBe(0);
+  });
 });
