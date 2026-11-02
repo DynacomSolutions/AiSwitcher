@@ -1,0 +1,1 @@
+{"providers":{"zai":{"type":"openai-compat","name":"ZAI Provider","base_url":"https://api.z.ai/api/coding/paas/v4","api_key":"SYNTHETIC_FIXTURE-zai-key-0001"}}}

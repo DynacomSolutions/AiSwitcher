@@ -45,6 +45,7 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "aliyun.com", reason: "Alibaba Cloud auth cookie domain (src/identities/auth-session.ts)" },
   { domain: "aliyuncs.com", reason: "Alibaba MaaS token-plan API (src/identities/ali-auth.ts, tool-configs.ts)" },
   { domain: "x.ai", reason: "xAI (Grok) OAuth and installer domains (src/cli/upgrade.ts, oauth-refresh.ts)" },
+  { domain: "grok.com", reason: "Grok CLI chat proxy upstream (src/gateway/providers/grok.ts)" },
   { domain: "z.ai", reason: "Zai provider API and docs (src/identities/zai-auth.ts, src/cli/limits/zai-limits.ts)" },
   { domain: "opencode.ai", reason: "OpenCode provider usage API (src/cli/limits/opencode-limits.ts)" },
   { domain: "models.dev", reason: "public model pricing/catalogue data source (src/identities/model-pricing.ts)" },

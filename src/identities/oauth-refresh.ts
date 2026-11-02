@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -5,6 +6,7 @@ import {
   jwtExpSeconds,
   readPiEntry,
   reconcileNativeProviderStores,
+  nativeStorePathFor,
   readProviderGrantCopy,
   writePiEntry,
   writeProviderGrantCopy,
@@ -19,7 +21,7 @@ import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
 import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
 import type { Identity } from "./types.ts";
-import { persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
+import { kimiCredentialStores, persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
 import { refreshKimiOAuthToken } from "../cli/limits/kimi-limits.ts";
 import type { KimiOAuthCredentials } from "../cli/limits/kimi-limits.ts";
 
@@ -534,6 +536,36 @@ async function freshestGrant(
     : { grant: piGrant!, source: "pi auth.json" };
 }
 
+/** READ-ONLY: the grant AIS's own refresh would act on for this identity (the
+ * same freshest-copy selection across native, pool, pi and kimi stores). The
+ * gateway sends exactly this token, so its expectedAccessToken compare cannot
+ * disagree with the refresh. Never writes any store. */
+export async function readEffectiveGrant(
+  tool: RefreshableTool,
+  identity: Identity,
+  options: { claudeRegistryPath?: string } = {},
+): Promise<{ grant: OAuthGrant; source: string } | undefined> {
+  const found = await freshestGrant(tool, identity, options.claudeRegistryPath);
+  return found ? { grant: found.grant, source: found.source } : undefined;
+}
+
+/** READ-ONLY: every file whose change can alter readEffectiveGrant's answer
+ * (native, pool, pi auth.json, kimi stores), for mtime watching. */
+export async function effectiveGrantPaths(
+  tool: RefreshableTool,
+  identity: Identity,
+  options: { claudeRegistryPath?: string } = {},
+): Promise<string[]> {
+  if (tool === "kimi") return (await kimiCredentialStores(identity, "kimi")).map((store) => store.path);
+  const paths = [nativeStorePathFor(tool, identity.configDir)];
+  if (await poolAdapterFor(tool)) {
+    for (const dir of await poolStoreDirsFor(identity, options.claudeRegistryPath, tool)) paths.push(nativeStorePathFor(tool, dir));
+  }
+  const piDir = (await piIdentityFor(identity.name))?.configDir;
+  if (piDir) paths.push(join(expandPath(piDir), "auth.json"));
+  return paths;
+}
+
 function grantRecencySeconds(grant: OAuthGrant, nowSeconds: number): number {
   return grant.minted_at ?? grant.expires_at ?? nowSeconds;
 }
@@ -560,6 +592,11 @@ export interface OAuthRefreshOptions {
    * call (never loop; a re-login mints a different token and resumes). */
   revokedFingerprint?: string;
   lastSuccessAt?: string | null;
+  /** Compare-and-refresh: when set, the refresh proceeds only if the freshest
+   * stored access token (re-read under the locks) still has this value;
+   * otherwise another process already rotated it and no token request is
+   * made. Compared by sha256 digest; the value is never logged. */
+  expectedAccessToken?: string;
   fetchImpl?: FetchImpl;
   now?: () => number;
   /** Test hook: claude registry that lists swap pools. */
@@ -656,6 +693,10 @@ export async function refreshIdentityOAuthGrant(
   }
 }
 
+function tokenDigest(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
 async function refreshGrantUnlocked(
   tool: RefreshableTool,
   identity: Identity,
@@ -698,6 +739,10 @@ async function refreshGrantUnlocked(
       beforeFingerprint,
       detail: `refresh token revoked (diagnosed earlier) — re-login required: ${REFRESH_HINTS[tool]}; not retrying until re-login`,
     };
+  }
+
+  if (options.expectedAccessToken !== undefined && tokenDigest(options.expectedAccessToken) !== tokenDigest(freshest.grant.access_token)) {
+    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: "stored access token already differs from the one the caller saw (rotated elsewhere) - not refreshing" };
   }
 
   const decision = shouldAttemptOAuthRefresh(freshest.grant, {
