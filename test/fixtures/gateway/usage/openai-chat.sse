@@ -1,0 +1,6 @@
+data: {"model":"gpt-5","choices":[{"delta":{"content":"hi"}}]}
+
+data: {"model":"gpt-5","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":30}}}
+
+data: [DONE]
+
