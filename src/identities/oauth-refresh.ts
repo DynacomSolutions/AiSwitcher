@@ -6,6 +6,7 @@ import {
   jwtExpSeconds,
   readPiEntry,
   reconcileNativeProviderStores,
+  nativeStorePathFor,
   readProviderGrantCopy,
   writePiEntry,
   writeProviderGrantCopy,
@@ -20,7 +21,7 @@ import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
 import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
 import type { Identity } from "./types.ts";
-import { persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
+import { kimiCredentialStores, persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
 import { refreshKimiOAuthToken } from "../cli/limits/kimi-limits.ts";
 import type { KimiOAuthCredentials } from "../cli/limits/kimi-limits.ts";
 
@@ -533,6 +534,36 @@ async function freshestGrant(
   return native
     ? { grant: native.grant, entryKey: native.entryKey, rawEntry: native.rawEntry, source: `native:${native.path}` }
     : { grant: piGrant!, source: "pi auth.json" };
+}
+
+/** READ-ONLY: the grant AIS's own refresh would act on for this identity (the
+ * same freshest-copy selection across native, pool, pi and kimi stores). The
+ * gateway sends exactly this token, so its expectedAccessToken compare cannot
+ * disagree with the refresh. Never writes any store. */
+export async function readEffectiveGrant(
+  tool: RefreshableTool,
+  identity: Identity,
+  options: { claudeRegistryPath?: string } = {},
+): Promise<{ grant: OAuthGrant; source: string } | undefined> {
+  const found = await freshestGrant(tool, identity, options.claudeRegistryPath);
+  return found ? { grant: found.grant, source: found.source } : undefined;
+}
+
+/** READ-ONLY: every file whose change can alter readEffectiveGrant's answer
+ * (native, pool, pi auth.json, kimi stores), for mtime watching. */
+export async function effectiveGrantPaths(
+  tool: RefreshableTool,
+  identity: Identity,
+  options: { claudeRegistryPath?: string } = {},
+): Promise<string[]> {
+  if (tool === "kimi") return (await kimiCredentialStores(identity, "kimi")).map((store) => store.path);
+  const paths = [nativeStorePathFor(tool, identity.configDir)];
+  if (await poolAdapterFor(tool)) {
+    for (const dir of await poolStoreDirsFor(identity, options.claudeRegistryPath, tool)) paths.push(nativeStorePathFor(tool, dir));
+  }
+  const piDir = (await piIdentityFor(identity.name))?.configDir;
+  if (piDir) paths.push(join(expandPath(piDir), "auth.json"));
+  return paths;
 }
 
 function grantRecencySeconds(grant: OAuthGrant, nowSeconds: number): number {
