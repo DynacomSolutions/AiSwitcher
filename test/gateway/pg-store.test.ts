@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
+import { isDataError } from "../../src/gateway/ledger-buffer.ts";
 import { migrate, PgGatewayStore } from "../../src/gateway/pg-store.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { storeContract } from "./store-contract.ts";
@@ -63,6 +64,51 @@ if (!url && process.env.CI && !optOut) {
       } finally {
         await sql.close();
       }
+    });
+  });
+
+  describe("isDataError against real Postgres", () => {
+    const usageRow = (inputTokens: number) => ({
+      ts: "2026-11-02T01:00:00.000Z",
+      app: "a",
+      provider: "codex" as const,
+      identity: "id1",
+      inputTokens,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      status: "ok",
+      httpStatus: 200,
+      latencyMs: 1,
+      streamed: false,
+    });
+
+    test("a rejected value is a data error", async () => {
+      await reset();
+      await migrate(url);
+      const s = new PgGatewayStore(url);
+      stores.push(s);
+      let caught: unknown;
+      try {
+        await s.appendUsage([usageRow(1e30)]);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      expect(isDataError(caught)).toBe(true);
+    });
+
+    test("a refused connection is not a data error", async () => {
+      const s = new PgGatewayStore("postgres://ais@127.0.0.1:1/x?connect_timeout=2");
+      let caught: unknown;
+      try {
+        await s.appendUsage([usageRow(1)]);
+      } catch (err) {
+        caught = err;
+      }
+      await s.close().catch(() => {});
+      expect(caught).toBeDefined();
+      expect(isDataError(caught)).toBe(false);
     });
   });
 
