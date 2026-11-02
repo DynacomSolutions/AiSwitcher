@@ -136,4 +136,4 @@ ETA: 2026-11-05 18:00 ICT
 | 110 | Gateway usage tap: Codex SSE response has no content-type, so no usage is recorded | done | claude-20261102-ai-gateway | ai-gateway-e2e | 4.109 | | Deployed 8076dfe (.cluster #2066).<br>Codex e2e ledger matches SDK usage. |
 | 111 | Gateway ali route unproven: no ali identity on the host | parked | | | 4.109 | | Owner: dropped for now 2026-11-02.<br>Route code kept, unproven (no ali identity on host). |
 | 112 | Gateway: deferred review minors | done | claude-20261102-ai-gateway | ai-gateway-cleanup | 4.110 | | Merged #339 (e2dcb3f).<br>Includes `%2F` path-escape fix (Opus approved).<br>Image deploy via .cluster pin bump. |
-| 113 | Codex CLI via gateway | in_progress | claude-20261103-codex-gw | codex-cli-gateway | 4.112 | 2026-11-03 20:00 ICT | Route Codex CLI model traffic through the gateway. |
+| 113 | Codex CLI via gateway | done | claude-20261103-codex-gw | codex-cli-gateway | 4.112 |  | Route Codex CLI model traffic through the gateway.<br>App agents-codex, reserve 100, verified with codex exec.<br>New sessions only; running ones need restart. |
