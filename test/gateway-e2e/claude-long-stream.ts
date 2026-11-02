@@ -15,10 +15,17 @@ try {
     system,
     messages: [{ role: "user", content: "Count from 1 to 150, one number per line, with no other text." }],
   });
+  // Read slowly (AIS_E2E_READ_DELAY_MS per event, default 60) so the stream stays open for
+  // ~20 s whatever the model speed; the first delta is announced on stderr so a caller can
+  // trigger a rollout while bytes are in flight.
+  const delay = Number(process.env.AIS_E2E_READ_DELAY_MS ?? 60);
   let deltas = 0;
-  stream.on("text", () => {
+  for await (const event of stream) {
+    if (event.type !== "content_block_delta") continue;
+    if (deltas === 0) console.error("stream-open");
     deltas += 1;
-  });
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
   const final = await stream.finalMessage();
   console.log(JSON.stringify({ provider: "claude", model, longStream: { deltas, ms: Date.now() - started, stopReason: final.stop_reason, usage: final.usage } }));
 } catch (e) {

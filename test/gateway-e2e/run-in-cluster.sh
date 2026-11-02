@@ -12,7 +12,7 @@
 # The app's Secret ais-gateway-<app> must exist in the namespace (ais gateway app add
 # creates it). The pod gets AIS_GATEWAY_TOKEN from it; AIS_GATEWAY_URL is replaced by
 # the in-cluster Service URL. Environment: AIS_E2E_NAMESPACE (default ais-gateway-e2e),
-# AIS_E2E_IMAGE (default oven/bun:1.3), AIS_E2E_MODEL (optional model override),
+# AIS_E2E_IMAGE (default oven/bun:1.3), AIS_E2E_MODEL (optional model override), AIS_E2E_READ_DELAY_MS (claude-long-stream: ms to wait per event, default 60),
 # AIS_E2E_GATEWAY_SERVICE (default http://ais-gateway.dev.svc.cluster.local:47130).
 set -euo pipefail
 
@@ -36,9 +36,10 @@ deps="$(bun -e '
   console.log(JSON.stringify({ name: "gw-e2e", private: true, type: "module", dependencies: Object.fromEntries([pick("@anthropic-ai/sdk"), pick("openai")]) }));
 ' "$root/package.json")"
 
-overrides="$(APP="$app" SERVICE="$service" MODEL="${AIS_E2E_MODEL:-}" bun -e '
+overrides="$(APP="$app" SERVICE="$service" MODEL="${AIS_E2E_MODEL:-}" DELAY="${AIS_E2E_READ_DELAY_MS:-}" bun -e '
   const env = [{ name: "AIS_GATEWAY_URL", value: `${process.env.SERVICE}/${process.env.APP}` }];
   if (process.env.MODEL) env.push({ name: "AIS_E2E_MODEL", value: process.env.MODEL });
+  if (process.env.DELAY) env.push({ name: "AIS_E2E_READ_DELAY_MS", value: process.env.DELAY });
   console.log(JSON.stringify({ spec: { containers: [{
     name: process.argv[1], image: process.argv[2], stdin: true, stdinOnce: true,
     envFrom: [{ secretRef: { name: `ais-gateway-${process.env.APP}` } }],
