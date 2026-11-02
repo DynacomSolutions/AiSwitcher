@@ -33,7 +33,7 @@ export function utilisationOf(usage: PoolUsage | undefined): number | undefined 
  */
 export async function pickIdentity(
   app: GatewayApp,
-  deps: Pick<GatewayDeps, "usageFor" | "poolMembers">,
+  deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
   exclude?: string,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
@@ -44,14 +44,16 @@ export async function pickIdentity(
   }
   let names = await deps.poolMembers(app.provider);
   if (app.target.identities && app.target.identities.length > 0) {
-    const allowed = new Set(app.target.identities);
+    const canon = deps.canonical;
+    const allowed = new Set(await Promise.all(app.target.identities.map((n) => (canon ? canon(app.provider, n).catch(() => n) : n))));
     names = names.filter((n) => allowed.has(n));
   }
   names = names.filter((n) => n !== exclude);
   const rows = await Promise.all(
     names.map(async (name) => {
-      const util = utilisationOf(await usageOf(deps, app, name));
-      return { name, usage: util === undefined ? undefined : ({ status: "live", maxUtilization: util, capturedAt: "" } as PoolUsage) };
+      const usage = await usageOf(deps, app, name);
+      const util = utilisationOf(usage);
+      return { name, usage: util === undefined ? undefined : ({ status: "live", maxUtilization: util, capturedAt: "", ...(usage?.extraUsage ? { extraUsage: usage.extraUsage } : {}) } as PoolUsage) };
     }),
   );
   const known = chooseBest(rows, { belowPercent: reserve, requireKnown: true });

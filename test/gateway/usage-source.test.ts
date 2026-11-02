@@ -95,3 +95,23 @@ describe("reserve uses numbers only", () => {
     expect(await pickIdentity(pool, { usageFor: usageFor as never, poolMembers: async () => ["a", "b"] })).toEqual({ identity: "a" });
   });
 });
+
+describe("pool selection details", () => {
+  const pool: GatewayApp = { ...app, target: { kind: "pool" } };
+  test("extra usage breaks a tie between equal members", async () => {
+    const usageFor = async (_p: string, i: string): Promise<PoolUsage> => ({
+      status: "live",
+      maxUtilization: 50,
+      capturedAt: "x",
+      ...(i === "b" ? { extraUsage: { available: true } } : {}),
+    }) as PoolUsage;
+    expect(await pickIdentity(pool, { usageFor: usageFor as never, poolMembers: async () => ["a", "b"] })).toEqual({ identity: "b" });
+  });
+
+  test("an alias in the identities list matches the canonical member", async () => {
+    const listed: GatewayApp = { ...app, target: { kind: "pool", identities: ["work-alias"] } };
+    const canonical = async (_p: string, i: string): Promise<string> => (i === "work-alias" ? "work" : i);
+    const r = await pickIdentity(listed, { usageFor: async () => undefined, poolMembers: async () => ["other", "work"], canonical });
+    expect(r).toEqual({ identity: "work" });
+  });
+});
