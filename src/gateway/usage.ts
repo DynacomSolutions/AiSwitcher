@@ -111,7 +111,7 @@ export class UsageTap {
     const first = all.findIndex((b) => b !== 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d);
     if (first === -1) return undefined; // Whitespace carries nothing in either mode.
     const body = all.subarray(first);
-    const head = new TextDecoder("latin1").decode(body.subarray(0, 6));
+    const head = String.fromCharCode(...body.subarray(0, 6));
     const isField = SSE_FIELDS.some((f) => head.startsWith(f));
     const couldBe = head.startsWith(":") || isField || (head.length < 6 && SSE_FIELDS.some((f) => f.startsWith(head)));
     if (!isField && !head.startsWith(":") && couldBe) {
