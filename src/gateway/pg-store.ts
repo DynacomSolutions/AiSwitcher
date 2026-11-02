@@ -158,7 +158,7 @@ export class PgGatewayStore implements GatewayStore {
 
   async usageSince(app: string, since: Date): Promise<number> {
     const rows = await this.sql`
-      SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS total
+      SELECT COALESCE(SUM(input_tokens + output_tokens + cache_write_tokens), 0) AS total
       FROM gateway_usage WHERE app = ${app} AND ts >= ${since.toISOString()}::timestamptz`;
     return Number(rows[0]?.total ?? 0);
   }

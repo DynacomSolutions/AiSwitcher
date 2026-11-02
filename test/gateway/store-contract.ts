@@ -76,7 +76,7 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect((await s.tokensFor("b"))[0]?.expiresAt).toBeUndefined();
   });
 
-  test("usageSince sums input and output for the app since the cutoff", async () => {
+  test("usageSince sums input, output and cache-write for the app since the cutoff", async () => {
     const s = await makeStore();
     await s.putApp(base);
     await s.putApp({ ...base, name: "b" });
@@ -88,6 +88,8 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.usageSince("a", new Date("2026-11-02T00:00:00.000Z"))).toBe(30);
     expect(await s.usageSince("a", new Date("2026-10-01T00:00:00.000Z"))).toBe(40);
     expect(await s.usageSince("nobody", new Date(0))).toBe(0);
+    await s.appendUsage([{ ...row("a", "2026-11-02T02:00:00.000Z", 1, 1), cacheReadTokens: 100, cacheWriteTokens: 7 }]);
+    expect(await s.usageSince("a", new Date("2026-11-02T00:00:00.000Z"))).toBe(39);
   });
 
   test("appendUsage accepts an empty batch", async () => {
