@@ -12,11 +12,11 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # Gateway store tests (test/gateway/pg-store.test.ts). Plain Postgres, so
-    # the TimescaleDB fallback path is what CI exercises.
+    # Gateway store tests (test/gateway/pg-store.test.ts), on a pinned
+    # TimescaleDB image so the hypertable path is exercised.
     services:
       postgres:
-        image: postgres:17
+        image: timescale/timescaledb:2.17.2-pg17
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: gateway_test

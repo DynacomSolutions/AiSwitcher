@@ -10,7 +10,15 @@ describe("MemoryGatewayStore contract", () => {
   storeContract(async () => new MemoryGatewayStore());
 });
 
-if (!url) {
+const optOut = process.env.AIS_GATEWAY_TEST_NO_DATABASE === "1";
+
+if (!url && process.env.CI && !optOut) {
+  test("pg store tests need AIS_GATEWAY_TEST_DATABASE_URL in CI", () => {
+    throw new Error(
+      "AIS_GATEWAY_TEST_DATABASE_URL is unset in CI; provide a Postgres service or set AIS_GATEWAY_TEST_NO_DATABASE=1",
+    );
+  });
+} else if (!url) {
   console.warn("SKIP pg-store tests: AIS_GATEWAY_TEST_DATABASE_URL is not set");
   test.skip("pg store tests need AIS_GATEWAY_TEST_DATABASE_URL", () => {});
 } else {
@@ -18,6 +26,11 @@ if (!url) {
   afterAll(async () => {
     for (const s of stores) await s.close();
   });
+
+  const dbName = new URL(url).pathname.replace(/^\//, "");
+  if (!dbName.includes("test")) {
+    throw new Error(`refusing to reset database "${dbName}": its name must contain "test"`);
+  }
 
   async function reset(): Promise<void> {
     const sql = new SQL(url as string);
@@ -40,6 +53,11 @@ if (!url) {
         expect(rows.length).toBe(1);
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
+        const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;
+        if (ext.length > 0) {
+          const h = await sql`SELECT hypertable_name FROM timescaledb_information.hypertables`;
+          expect(h.map((r: { hypertable_name: string }) => r.hypertable_name)).toContain("gateway_usage");
+        }
       } finally {
         await sql.close();
       }

@@ -36,6 +36,9 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Run tests
+        env:
+          # No Postgres service here; the gateway store tests run in ci.yml.
+          AIS_GATEWAY_TEST_NO_DATABASE: "1"
         run: bun test
 
       - name: Build binaries for ${{ matrix.target.name }}
