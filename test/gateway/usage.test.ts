@@ -88,6 +88,26 @@ describe("content-type sniffing", () => {
   test("json with no content-type is still json", () => {
     expect(tap("anthropic", "", fx("anthropic.json"))).toEqual({ model: "claude-sonnet-4-5", inputTokens: 12, outputTokens: 34, cacheReadTokens: 78, cacheWriteTokens: 56 });
   });
+  test("id: and retry: first lines mean sse", () => {
+    const body = new TextDecoder().decode(fx("codex-responses.sse"));
+    expect(tap("openai-responses", "", new TextEncoder().encode("id: 1\n" + body))).toEqual(codex);
+    expect(tap("openai-responses", "", new TextEncoder().encode("retry: 3000\n\n" + body), 3)).toEqual(codex);
+  });
+  test("a plain-text body that starts like a field name is not sse", () => {
+    for (const text of ["error: something broke", "error 500 internal", "data stream unavailable", "idle"]) {
+      const t = new UsageTap("openai-responses", "");
+      t.write(new TextEncoder().encode(text));
+      expect(t.status()).toBe("unparseable");
+      expect(t.isSse()).toBe(false);
+    }
+  });
+  test("isSse reports the resolved mode", () => {
+    const a = new UsageTap("openai-responses", "");
+    a.write(fx("codex-responses.sse"));
+    expect(a.isSse()).toBe(true);
+    expect(new UsageTap("anthropic", "text/event-stream").isSse()).toBe(true);
+    expect(new UsageTap("anthropic", "application/json").isSse()).toBe(false);
+  });
   test("status is ok for a sniffed sse body", () => {
     const t = new UsageTap("openai-responses", "");
     t.write(fx("codex-responses.sse"));

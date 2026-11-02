@@ -415,14 +415,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     headers.delete("content-length");
   }
   const contentType = up.headers.get("content-type") ?? "";
-  const streamed = contentType.toLowerCase().includes("text/event-stream");
   const tap = new UsageTap(adapter.usageStyle(style), contentType);
   const httpStatus = up.status;
   const okStatus = httpStatus >= 400 ? "upstream_error" : "ok";
   const finish = (status: string): void => {
     req.signal.removeEventListener("abort", onAbort);
     const counts = tap.result();
-    record(identity, status, httpStatus, counts, streamed, tap.status(), model);
+    record(identity, status, httpStatus, counts, tap.isSse(), tap.status(), model);
   };
 
   if (!up.body) {

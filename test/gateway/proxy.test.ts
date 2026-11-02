@@ -251,6 +251,20 @@ describe("forwarding", () => {
     expect(seen[0]!.headers.get("accept-encoding")).toBe("identity");
   });
 
+  test("sse with no content-type is sniffed, unchanged for the client, and recorded as streamed", async () => {
+    const t = await addApp(baseApp({}));
+    const sse = enc.encode(
+      'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":1}}}\n\n' +
+        'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":42}}\n\n',
+    );
+    handler = () => new Response(sse);
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.headers.get("content-type") ?? "").not.toContain("event-stream");
+    expect(Buffer.from(await res.arrayBuffer()).equals(Buffer.from(sse))).toBe(true);
+    const r = await rows();
+    expect(r[0]).toMatchObject({ inputTokens: 10, outputTokens: 42, streamed: true, status: "ok" });
+  });
+
   test("response sse bytes reach client unchanged", async () => {
     const t = await addApp(baseApp({}));
     const sse = enc.encode(

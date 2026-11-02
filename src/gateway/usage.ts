@@ -45,12 +45,15 @@ function num(v: unknown): number | undefined {
  * the bytes (callers pass the same chunk on), never throws, and holds at most
  * one partial SSE event or a capped JSON body.
  */
+const SSE_FIELDS = ["event:", "data:", "id:", "retry:"];
+
 export class UsageTap {
   private readonly counts: UsageCounts = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   // SSE or JSON. When the upstream names neither (the Codex backend sends no content-type on its
   // SSE), the mode is decided from the first non-whitespace byte: `e`(vent), `d`(ata) or `:` is SSE.
   private sse: boolean;
   private sniffing: boolean;
+  private held0: Uint8Array = new Uint8Array(0);
   private readonly decoder = new TextDecoder("utf-8");
   // JSON mode
   private readonly parts: Uint8Array[] = [];
@@ -75,18 +78,49 @@ export class UsageTap {
   write(chunk: Uint8Array): void {
     try {
       if (this.sniffing) {
-        const first = chunk.findIndex((b) => b !== 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d);
-        if (first === -1) return; // Whitespace carries nothing in either mode.
-        this.sniffing = false;
-        const b = chunk[first]!;
-        this.sse = b === 0x65 || b === 0x64 || b === 0x3a;
-        chunk = chunk.subarray(first);
+        const rest = this.sniff(chunk);
+        if (rest === undefined) return; // Still undecided: the prefix is held.
+        chunk = rest;
       }
       if (this.sse) this.writeSse(chunk);
       else this.writeJson(chunk);
     } catch {
       // Observation must never affect the response.
     }
+  }
+
+  /** True when the body is being read as SSE (named by the upstream or sniffed). */
+  isSse(): boolean {
+    return this.sse;
+  }
+
+  /**
+   * Decides SSE or JSON from the first non-whitespace bytes when the upstream named neither.
+   * SSE starts with a field name followed by a colon (event, data, id, retry) or a `:` comment;
+   * anything else is JSON. Returns the bytes to process once decided, undefined while the
+   * prefix is still too short to tell (at most 6 bytes are held).
+   */
+  private sniff(chunk: Uint8Array): Uint8Array | undefined {
+    let all = chunk;
+    if (this.held0.length > 0) {
+      all = new Uint8Array(this.held0.length + chunk.length);
+      all.set(this.held0);
+      all.set(chunk, this.held0.length);
+      this.held0 = new Uint8Array(0);
+    }
+    const first = all.findIndex((b) => b !== 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d);
+    if (first === -1) return undefined; // Whitespace carries nothing in either mode.
+    const body = all.subarray(first);
+    const head = new TextDecoder("latin1").decode(body.subarray(0, 6));
+    const isField = SSE_FIELDS.some((f) => head.startsWith(f));
+    const couldBe = head.startsWith(":") || isField || (head.length < 6 && SSE_FIELDS.some((f) => f.startsWith(head)));
+    if (!isField && !head.startsWith(":") && couldBe) {
+      this.held0 = body.slice();
+      return undefined;
+    }
+    this.sniffing = false;
+    this.sse = isField || head.startsWith(":");
+    return body;
   }
 
   /** Call after the body ends (it flushes pending input, like result()). */
