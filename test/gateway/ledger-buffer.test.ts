@@ -83,7 +83,7 @@ describe("LedgerBuffer", () => {
   test("a poison row is discarded and good rows behind it still land", async () => {
     class PoisonStore extends MemoryGatewayStore {
       override async appendUsage(rows: UsageRow[]): Promise<void> {
-        if (rows.some((r) => r.inputTokens === 1.5)) throw new Error("bad row");
+        if (rows.some((r) => r.inputTokens === 1.5)) throw Object.assign(new Error("bad row"), { code: "22003" });
         await super.appendUsage(rows);
       }
     }
@@ -110,5 +110,30 @@ describe("LedgerBuffer", () => {
     b.push(row(3));
     expect(b.dropped).toBe(3);
     expect(b.depth).toBe(0);
+  });
+
+  test("a flap on one row requeues it and the untried rows instead of dropping", async () => {
+    class FlapStore extends MemoryGatewayStore {
+      calls = 0;
+      failSingleCall = 0;
+      override async appendUsage(rows: UsageRow[]): Promise<void> {
+        this.calls++;
+        if (this.calls === 1) throw Object.assign(new Error("bad row"), { code: "22003" });
+        if (this.calls === this.failSingleCall) throw new Error("connection reset");
+        await super.appendUsage(rows);
+      }
+    }
+    const store = new FlapStore();
+    store.failSingleCall = 3; // call 1 = batch, call 2 = first single row, call 3 = second single row
+    const b = new LedgerBuffer(store, { max: 100, flushMs: 60_000 });
+    for (const n of [1, 2, 3, 4]) b.push(row(n));
+    await b.flush();
+    expect(b.dropped).toBe(0);
+    expect(b.depth).toBe(3);
+    await b.flush();
+    expect(b.depth).toBe(0);
+    expect(b.dropped).toBe(0);
+    expect(await store.usageSince("a", new Date(0))).toBe(10);
+    await b.close();
   });
 });

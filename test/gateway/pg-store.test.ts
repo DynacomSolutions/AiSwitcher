@@ -54,6 +54,8 @@ if (!url && process.env.CI && !optOut) {
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
         const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;
+        const requireTimescale = Boolean(process.env.CI) && !optOut;
+        if (requireTimescale) expect(ext.length).toBe(1);
         if (ext.length > 0) {
           const h = await sql`SELECT hypertable_name FROM timescaledb_information.hypertables`;
           expect(h.map((r: { hypertable_name: string }) => r.hypertable_name)).toContain("gateway_usage");

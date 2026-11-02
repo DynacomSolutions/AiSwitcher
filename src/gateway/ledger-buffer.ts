@@ -3,6 +3,16 @@ import type { UsageRow } from "./types.ts";
 
 const BATCH_SIZE = 500;
 
+/** True for Postgres SQLSTATE class 22 (data exception) or 23 (integrity violation). */
+export function isDataError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { errno?: unknown; code?: unknown };
+  for (const v of [e.errno, e.code]) {
+    if (typeof v === "string" && /^2[23][0-9A-Z]{3}$/.test(v)) return true;
+  }
+  return false;
+}
+
 /**
  * In-memory usage buffer that flushes to the store on a timer. A store outage
  * keeps rows for the next flush; once `max` rows are held the oldest are
@@ -67,38 +77,39 @@ export class LedgerBuffer {
         await this.store.appendUsage(batch);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        const rejected = batch.length > 1 ? await this.isolate(batch) : undefined;
-        if (rejected === undefined) {
-          // Store looks down: put the batch back in front of rows pushed meanwhile and wait for the next tick.
-          this.rows.unshift(...batch);
+        const requeue = isDataError(err) ? await this.isolate(batch) : batch;
+        if (requeue.length > 0) {
+          // Store looks down: put unwritten rows back in front of rows pushed meanwhile and wait for the next tick.
+          this.rows.unshift(...requeue);
           this.trim();
           console.warn(`gateway ledger flush failed: ${msg}`);
           return;
         }
-        this.droppedCount += rejected;
-        console.warn(`gateway ledger discarded ${rejected} rejected row(s): ${msg}`);
       }
     }
   }
 
   /**
-   * Retries a failed batch row by row so one poison row cannot block good ones.
-   * Returns the number of rows the store rejected, or undefined when every row
-   * failed (an outage, not poison); in that case nothing is lost and the caller requeues.
+   * Retries a batch the store rejected with a data error, row by row, so one
+   * poison row cannot block good ones. Only rows rejected with a data error are
+   * discarded (and counted). Any other error means the store is unwell: the
+   * failing row and all untried rows are returned for requeueing, in order.
    */
-  private async isolate(batch: UsageRow[]): Promise<number | undefined> {
-    const failed: UsageRow[] = [];
-    let ok = 0;
-    for (const row of batch) {
+  private async isolate(batch: UsageRow[]): Promise<UsageRow[]> {
+    for (let i = 0; i < batch.length; i++) {
+      const row = batch[i] as UsageRow;
       try {
         await this.store.appendUsage([row]);
-        ok++;
-      } catch {
-        failed.push(row);
+      } catch (err) {
+        if (isDataError(err)) {
+          this.droppedCount += 1;
+          console.warn(`gateway ledger discarded a rejected row: ${err instanceof Error ? err.message : String(err)}`);
+        } else {
+          return batch.slice(i);
+        }
       }
     }
-    if (ok === 0) return undefined;
-    return failed.length;
+    return [];
   }
 
   async close(): Promise<void> {
