@@ -1,4 +1,4 @@
-import { estimateChatModelTokenCost, estimateModelTokenCost } from "../identities/model-pricing.ts";
+import { estimateChatModelTokenCost, estimateDetailedModelTokenCost } from "../identities/model-pricing.ts";
 import type { UsageStyle } from "./providers/index.ts";
 import type { GatewayProvider } from "./types.ts";
 
@@ -25,6 +25,13 @@ const MAX_JSON_BYTES = 4 * 1024 * 1024;
 /** Largest single SSE event held; a bigger event is skipped. */
 const MAX_EVENT_BYTES = 1024 * 1024;
 
+/**
+ * Outcome of the tap: "ok" usage found, "none" a well-formed body without usage,
+ * "unparseable" nothing usable and some of it was not valid, "overflow" part of
+ * the body exceeded a cap so counts may be incomplete.
+ */
+export type UsageStatus = "ok" | "none" | "unparseable" | "overflow";
+
 type Obj = Record<string, unknown>;
 
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -46,6 +53,8 @@ export class UsageTap {
   private readonly parts: Uint8Array[] = [];
   private held = 0;
   private overflow = false;
+  private found = false;
+  private bad = false;
   // SSE mode
   private line = "";
   private lineTooLong = false;
@@ -67,13 +76,21 @@ export class UsageTap {
     }
   }
 
+  /** Call after the body ends (it flushes pending input, like result()). */
+  status(): UsageStatus {
+    this.result();
+    if (this.overflow) return "overflow";
+    if (this.found) return "ok";
+    return this.bad ? "unparseable" : "none";
+  }
+
   result(): UsageCounts {
     try {
       if (this.sse) {
         this.feedText(this.decoder.decode());
         this.endLine();
         this.dispatch();
-      } else if (!this.overflow && this.held > 0) {
+      } else if (!this.overflow && this.held > 0 && this.parts.length > 0) {
         const buf = new Uint8Array(this.held);
         let at = 0;
         for (const p of this.parts) {
@@ -84,7 +101,7 @@ export class UsageTap {
         this.apply(JSON.parse(new TextDecoder().decode(buf)));
       }
     } catch {
-      // Malformed body: keep whatever was parsed so far.
+      this.bad = true; // Malformed body: keep whatever was parsed so far.
     }
     return { ...this.counts };
   }
@@ -142,6 +159,7 @@ export class UsageTap {
     this.lineTooLong = false;
     if (tooLong) {
       this.eventTooBig = true;
+      this.overflow = true;
       return;
     }
     if (line === "") {
@@ -151,9 +169,10 @@ export class UsageTap {
     if (!line.startsWith("data:")) return; // comments, event:, id:, retry:
     let v = line.slice(5);
     if (v.startsWith(" ")) v = v.slice(1);
-    this.dataBytes += v.length;
+    this.dataBytes += v.length + 1; // count the newline so empty lines are bounded too
     if (this.dataBytes > MAX_EVENT_BYTES) {
       this.eventTooBig = true;
+      this.overflow = true;
       this.data = [];
       return;
     }
@@ -172,12 +191,15 @@ export class UsageTap {
     try {
       this.apply(JSON.parse(joined));
     } catch {
-      // Not JSON: ignore the event.
+      this.bad = true; // Not JSON: ignore the event.
     }
   }
 
   private apply(root: unknown): void {
-    if (!isObj(root)) return;
+    if (!isObj(root)) {
+      this.bad = true;
+      return;
+    }
     if (this.style === "anthropic") this.applyAnthropic(root);
     else if (this.style === "openai-responses") this.applyResponses(root);
     else this.applyChat(root);
@@ -192,12 +214,14 @@ export class UsageTap {
     this.setModel(msg.model);
     const u = isObj(msg.usage) ? msg.usage : isObj(root.usage) ? root.usage : undefined;
     if (!u) return;
-    // Later events carry cumulative values, so a present field replaces the earlier one.
+    // Values are cumulative, so keep the max: a compat provider sending
+    // input_tokens:0 in message_delta must not zero the earlier input count.
     const c = this.counts;
-    c.inputTokens = num(u.input_tokens) ?? c.inputTokens;
-    c.outputTokens = num(u.output_tokens) ?? c.outputTokens;
-    c.cacheReadTokens = num(u.cache_read_input_tokens) ?? c.cacheReadTokens;
-    c.cacheWriteTokens = num(u.cache_creation_input_tokens) ?? c.cacheWriteTokens;
+    this.found = true;
+    c.inputTokens = Math.max(c.inputTokens, num(u.input_tokens) ?? 0);
+    c.outputTokens = Math.max(c.outputTokens, num(u.output_tokens) ?? 0);
+    c.cacheReadTokens = Math.max(c.cacheReadTokens, num(u.cache_read_input_tokens) ?? 0);
+    c.cacheWriteTokens = Math.max(c.cacheWriteTokens, num(u.cache_creation_input_tokens) ?? 0);
   }
 
   private applyResponses(root: Obj): void {
@@ -220,6 +244,7 @@ export class UsageTap {
   }
 
   private setOpenAi(prompt: number, output: number | undefined, cached: number | undefined): void {
+    this.found = true;
     const read = Math.min(cached ?? 0, prompt);
     this.counts.inputTokens = prompt - read;
     this.counts.cacheReadTokens = read;
@@ -229,16 +254,14 @@ export class UsageTap {
 }
 
 /**
- * Estimated USD cost, or undefined for an unknown model. Z.AI and Ali only have
- * flat in/out prices, so all input-side tokens are charged at the input rate
- * (a slight over-estimate when cache reads are present). Other providers use
- * the chat list prices with the separate cache rates.
+ * Estimated USD cost, or undefined for an unknown model. Z.AI and Ali price
+ * cache reads at their cached-input rate (writes at the input rate); other
+ * providers use the chat list prices with separate cache rates.
  */
 export function estimateCost(provider: GatewayProvider, c: UsageCounts): number | undefined {
   if (!c.model) return undefined;
   if (provider === "zai" || provider === "ali") {
-    const input = c.inputTokens + c.cacheReadTokens + c.cacheWriteTokens;
-    return estimateModelTokenCost(provider === "zai" ? "zai" : "alibaba", c.model, input, c.outputTokens);
+    return estimateDetailedModelTokenCost(provider === "zai" ? "zai" : "alibaba", c.model, c.inputTokens, c.outputTokens, c.cacheReadTokens, c.cacheWriteTokens);
   }
   return estimateChatModelTokenCost(c.model, c.inputTokens, c.outputTokens, c.cacheReadTokens, c.cacheWriteTokens);
 }

@@ -72,6 +72,53 @@ describe("usage tap", () => {
   });
 });
 
+describe("usage tap edge cases", () => {
+  const enc = new TextEncoder();
+  const zero = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const sse = (style: UsageStyle, text: string) => {
+    const t = new UsageTap(style, "text/event-stream");
+    t.write(enc.encode(text));
+    return t;
+  };
+
+  test("anthropic max rule keeps input when message_delta sends zero", () => {
+    const t = sse("anthropic", 'data: {"type":"message_start","message":{"usage":{"input_tokens":9,"output_tokens":1}}}\n\ndata: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":5}}\n\n');
+    expect(t.result()).toEqual({ ...zero, inputTokens: 9, outputTokens: 5 });
+  });
+
+  test("lone CR terminators parse", () => {
+    const t = sse("anthropic", 'data: {"type":"message_delta","usage":{"output_tokens":4}}\r\r');
+    expect(t.result().outputTokens).toBe(4);
+  });
+
+  test("multi-line data event joins lines", () => {
+    const t = sse("anthropic", 'data: {"type":"message_delta",\ndata: "usage":{"output_tokens":6}}\n\n');
+    expect(t.result().outputTokens).toBe(6);
+  });
+
+  test("many empty data lines stay bounded and later events parse", () => {
+    const t = new UsageTap("anthropic", "text/event-stream");
+    const burst = enc.encode("data:\n".repeat(100_000));
+    for (let i = 0; i < 20; i++) t.write(burst);
+    t.write(enc.encode('\n' + 'data: {"type":"message_delta","usage":{"output_tokens":2}}\n\n'));
+    expect(t.result().outputTokens).toBe(2);
+    expect(t.status()).toBe("overflow");
+  });
+
+  test("status ok, none, unparseable, overflow", () => {
+    expect(new UsageTap("anthropic", "application/json").status()).toBe("none");
+    expect(sse("anthropic", 'data: {"type":"ping"}\n\n').status()).toBe("none");
+    expect(sse("anthropic", 'data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n').status()).toBe("ok");
+    const bad = new UsageTap("anthropic", "application/json");
+    bad.write(enc.encode("nope {"));
+    expect(bad.status()).toBe("unparseable");
+    expect(sse("openai-chat", "data: {oops\n\n").status()).toBe("unparseable");
+    const big = new UsageTap("anthropic", "application/json");
+    big.write(new Uint8Array(5 * 1024 * 1024));
+    expect(big.status()).toBe("overflow");
+  });
+});
+
 describe("estimateCost", () => {
   const c = { model: "glm-4.6", inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 };
   test("unknown model or missing model is undefined", () => {
@@ -81,5 +128,9 @@ describe("estimateCost", () => {
   });
   test("known zai model prices", () => {
     expect(estimateCost("zai", c)).toBeGreaterThan(0);
+  });
+  test("zai cache reads use the cached rate", () => {
+    const cost = estimateCost("zai", { ...c, inputTokens: 0, outputTokens: 0, cacheReadTokens: 1_000_000 });
+    expect(cost).toBeCloseTo(0.11, 6);
   });
 });
