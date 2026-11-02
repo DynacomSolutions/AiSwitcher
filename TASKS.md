@@ -130,6 +130,6 @@ ETA: 2026-11-05 18:00 ICT
 | 104 | Gateway usage extraction from JSON and SSE | done | claude-20261102-ai-gateway | gw-t4-usage | 4.103 | | Merged in PR #329. |
 | 105 | Gateway transparent proxy path with pool, caps and ledger | done | claude-20261102-ai-gateway | gw-t5-proxy | 4.102, 4.103, 4.104 | | Merged in PR #331. |
 | 106 | Gateway serve, lifecycle, metrics, alerts and admin API | done | claude-20261102-ai-gateway | gw-t6-serve | 4.105 | | Merged in PR #332.<br>Worker emptied scratch/20261020-live-integration deps dirs; owner said leave, rebuild on next live-image QA. |
-| 107 | ais gateway CLI for agents plus docs/agents/gateway.md | in_progress | claude-20261102-ai-gateway | gw-t7-cli | 4.106 | 2026-11-02 21:30 ICT | Reviewed (2 rounds).<br>Shipping PR. |
-| 108 | Deploy ais-gateway via .cluster (pg-shared, Tailnet, metrics) | todo | | | 4.106 | | Plan task 8 in 2026-11-02-ai-gateway-plan.md. |
+| 107 | ais gateway CLI for agents plus docs/agents/gateway.md | done | claude-20261102-ai-gateway | gw-t7-cli | 4.106 | | Merged PR #334 (044361c). |
+| 108 | Deploy ais-gateway via .cluster (pg-shared, Tailnet, metrics) | in_progress | claude-20261102-ai-gateway | ai-gateway-deploy | 4.106 | 2026-11-03 12:00 ICT | .cluster PR #2060 merged (image ais:044361c).<br>Live checks running. |
 | 109 | Real-SDK e2e for all 7 providers and console usage view | todo | | | 4.107, 4.108 | | Plan task 9 in 2026-11-02-ai-gateway-plan.md. |
