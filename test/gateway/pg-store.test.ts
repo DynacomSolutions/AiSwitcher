@@ -36,7 +36,11 @@ if (!url && process.env.CI && !optOut) {
   async function reset(): Promise<void> {
     const sql = new SQL(url as string);
     try {
-      await sql`DROP TABLE IF EXISTS gateway_usage, gateway_tokens, gateway_apps, schema_migrations CASCADE`;
+      // One statement per table: TimescaleDB refuses to drop a hypertable together with other objects.
+      await sql`DROP TABLE IF EXISTS gateway_usage CASCADE`;
+      await sql`DROP TABLE IF EXISTS gateway_tokens CASCADE`;
+      await sql`DROP TABLE IF EXISTS gateway_apps CASCADE`;
+      await sql`DROP TABLE IF EXISTS schema_migrations CASCADE`;
     } finally {
       await sql.close();
     }
