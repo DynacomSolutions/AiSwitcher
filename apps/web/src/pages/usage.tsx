@@ -30,7 +30,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useUsageQuery } from "@/hooks/queries";
+import { useGatewayUsageQuery, useUsageQuery } from "@/hooks/queries";
 import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
 import { classifyUsageError, hasPartialUsageCoverage, usageErrorLabel } from "@/lib/usage-summary";
 import type { RealCostInfo, TokscaleEntry, UsageResult } from "@/types/api";
@@ -354,6 +354,61 @@ function NotesCell({ result }: { result: UsageResult }) {
   return <span className="text-muted-foreground">-</span>;
 }
 
+/** Per-app gateway tokens from the admin API; renders nothing when this console has no gateway admin credentials. */
+function GatewayAppsCard({ days }: { days: number }) {
+  const query = useGatewayUsageQuery(days);
+  const data = query.data;
+  if (!data || !data.configured) return null;
+  const total = data.rows.reduce((sum, row) => sum + row.tokens, 0);
+  return (
+    <Card className="gap-3">
+      <CardHeader>
+        <CardTitle className="text-base">Gateway apps</CardTitle>
+        <CardDescription>
+          Tokens per gateway app over the last {days} days (input, output and cache writes).
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="px-0">
+        {data.error ? (
+          <p className="px-6 text-xs text-muted-foreground">Gateway usage unavailable: {data.error}</p>
+        ) : data.rows.length === 0 ? (
+          <p className="px-6 text-xs text-muted-foreground">No gateway apps yet.</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead>App</TableHead>
+                <TableHead>Provider</TableHead>
+                <TableHead className="text-right">Tokens</TableHead>
+                <TableHead className="w-40">Share</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.rows.map((row) => (
+                <TableRow key={row.app}>
+                  <TableCell className="font-mono text-xs">{row.app}</TableCell>
+                  <TableCell>
+                    <ProviderLabel provider={row.provider} />
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">{formatTokens(row.tokens)}</TableCell>
+                  <TableCell>
+                    <div className="h-1.5 w-full rounded-full bg-muted">
+                      <div
+                        className="h-1.5 rounded-full bg-primary"
+                        style={{ width: `${total > 0 ? Math.round((row.tokens / total) * 100) : 0}%` }}
+                      />
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function UsagePage() {
   const query = useUsageQuery();
   const results = query.data?.results ?? [];
@@ -415,6 +470,8 @@ export function UsagePage() {
       {query.data ? (
         <UsageDataStatus response={query.data} refreshFailed={query.isError} />
       ) : null}
+
+      <GatewayAppsCard days={7} />
 
       {query.isLoading || (query.data?.pending && results.length === 0) ? (
         <div className="space-y-4">

@@ -301,6 +301,19 @@ export interface UsageResult {
   pending?: true;
 }
 
+export interface GatewayAppUsage {
+  app: string;
+  provider: string;
+  days: number;
+  tokens: number;
+}
+
+export interface GatewayUsageResponse {
+  configured: boolean;
+  rows: GatewayAppUsage[];
+  error?: string;
+}
+
 export interface UsageResponse {
   results: UsageResult[];
   generatedAt: string;

@@ -24,6 +24,7 @@ import { collectTargets } from "../cli/usage/run.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
+import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
 
 import {
@@ -69,6 +70,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   loginFlows?: LoginFlowManagerLike;
   /** Test seam for GET /api/local-models; defaults to the real discovery and probe. */
   localModels?: () => Promise<LocalModelsDto>;
+  /** Test seam for GET /api/gateway/usage; defaults to the gateway admin API. */
+  gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
   /** Online-probe cache file for the default localModels; tests inject a temp path. */
   onlineCachePath?: string;
 }
@@ -215,6 +218,9 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     if (!result.ok) throw new HttpError(result.status ?? 500, result.error ?? "usage scan failed");
     return c.json(result.payload);
   });
+  // Per-app gateway tokens from the admin API; "configured: false" when this
+  // process has no admin URL and token, so the console can hide the section.
+  app.get("/api/gateway/usage", async (c) => c.json(await (deps.gatewayUsage ?? loadGatewayUsage)(numberQuery(c, "days", 7))));
   // The shared breakdown snapshot is read immediately; this API request only
   // queues a refresh marker. The host collector owns all history scans.
   app.get("/api/usage/breakdown", async (c) => {
