@@ -54,12 +54,12 @@ export class MemoryGatewayStore implements GatewayStore {
     for (const r of rows) this.usage.push({ ...r });
   }
 
-  /** Sum of input and output tokens for the app at or after `since`. */
+  /** Sum of input, output and cache-write tokens for the app at or after `since` (the daily-cap rule). */
   async usageSince(app: string, since: Date): Promise<number> {
     const cutoff = since.getTime();
     let total = 0;
     for (const r of this.usage) {
-      if (r.app === app && Date.parse(r.ts) >= cutoff) total += r.inputTokens + r.outputTokens;
+      if (r.app === app && Date.parse(r.ts) >= cutoff) total += r.inputTokens + r.outputTokens + r.cacheWriteTokens;
     }
     return total;
   }
