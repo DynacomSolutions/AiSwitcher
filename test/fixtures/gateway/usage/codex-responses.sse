@@ -1,0 +1,12 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_x","model":"gpt-5","usage":null}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"ok"}
+
+event: response.metadata
+data: {"type":"response.metadata","metadata":{"note":"scrubbed"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_x","model":"gpt-5","usage":{"input_tokens":23,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":0},"output_tokens":5,"total_tokens":28}}}
+

@@ -35,7 +35,7 @@ export async function pickIdentity(
   app: GatewayApp,
   deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
   exclude?: string,
-): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" }> {
+): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
   if (app.target.kind === "pin") {
     const util = utilisationOf(await usageOf(deps, app, app.target.identity));
@@ -48,6 +48,8 @@ export async function pickIdentity(
     const allowed = new Set(await Promise.all(app.target.identities.map((n) => (canon ? canon(app.provider, n).catch(() => n) : n))));
     names = names.filter((n) => allowed.has(n));
   }
+  // Nothing to choose from at all (as opposed to everything being full): say so.
+  if (names.length === 0) return { reject: "no-identities" };
   names = names.filter((n) => n !== exclude);
   const rows = await Promise.all(
     names.map(async (name) => {

@@ -15,6 +15,7 @@ import {
   collectTargets,
   type UsageResult,
 } from "./run.ts";
+import { formatGatewayUsageSection, loadGatewayUsage } from "../../gateway/usage-view.ts";
 import { readUsageSnapshotEnvelope, startUsageSnapshotRefreshInBackground } from "./snapshot.ts";
 
 /** Our own recognized `ais usage` flags — anything else is tokscale's, not
@@ -125,5 +126,7 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
   if (!envelope || envelope.stale || envelope.pending) console.error("Usage snapshot is stale or still being collected.");
   if (envelope?.lastError) console.error(`Usage refresh failed: ${envelope.lastError}`);
   console.log(formatUsageReport(results));
-
+  // Gateway apps: only when an admin URL and token are configured; a down gateway never fails `ais usage`.
+  const gateway = formatGatewayUsageSection(await loadGatewayUsage(7));
+  if (gateway) console.log(gateway);
 }
