@@ -87,10 +87,10 @@ function watchedFiles(provider: GatewayProvider, dir: string): string[] {
 
 const OAUTH_PROVIDERS: ReadonlySet<GatewayProvider> = new Set(["claude", "codex", "grok", "kimi"]);
 
-async function newestMtime(provider: GatewayProvider, dir: string, name: string, registry?: string): Promise<number | undefined> {
+async function newestMtime(provider: GatewayProvider, id: Identity, registry?: string): Promise<number | undefined> {
   const files = OAUTH_PROVIDERS.has(provider)
-    ? await effectiveGrantPaths(provider as RefreshableTool, { name, label: name, configDir: dir }, { claudeRegistryPath: registry }).catch(() => watchedFiles(provider, dir))
-    : watchedFiles(provider, dir);
+    ? await effectiveGrantPaths(provider as RefreshableTool, id, { claudeRegistryPath: registry }).catch(() => watchedFiles(provider, id.configDir))
+    : watchedFiles(provider, id.configDir);
   const times = await Promise.all(files.map((f) => stat(f).then((x) => x.mtimeMs, () => undefined)));
   const present = times.filter((t): t is number => t !== undefined);
   return present.length === 0 ? undefined : Math.max(...present);
@@ -124,14 +124,16 @@ async function readJsonObject(path: string): Promise<Record<string, unknown> | u
 
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 
-async function readCredential(provider: GatewayProvider, identity: string, dir: string, registry?: string): Promise<ProviderCredential | undefined> {
+async function readCredential(provider: GatewayProvider, id: Identity, registry?: string): Promise<ProviderCredential | undefined> {
+  const identity = id.name;
+  const dir = id.configDir;
   switch (provider) {
     case "claude":
     case "codex":
     case "grok":
     case "kimi": {
       // The very selection AIS's refresh uses (native vs pi vs pool vs kimi stores), read-only.
-      const found = await readEffectiveGrant(provider, { name: identity, label: identity, configDir: dir }, { claudeRegistryPath: registry });
+      const found = await readEffectiveGrant(provider, id, { claudeRegistryPath: registry });
       if (!found) return undefined;
       const { grant } = found;
       let accountId: string | undefined;
@@ -181,12 +183,14 @@ export class CredentialCache {
   }
 
   async get(provider: GatewayProvider, identity: string): Promise<ProviderCredential> {
+    // Everything below uses the RESOLVED identity (canonical name), never the raw request string:
+    // pool, pi and kimi store lookups go by name, and an alias would miss them.
     const id = await this.resolve(provider, identity);
-    const key = `${provider}\u0000${identity}`;
-    const mtimeMs = await newestMtime(provider, id.configDir, identity, this.deps.claudeRegistryPath);
+    const key = `${provider}\u0000${id.name}`;
+    const mtimeMs = await newestMtime(provider, id, this.deps.claudeRegistryPath);
     const cached = this.entries.get(key);
     if (cached && mtimeMs !== undefined && cached.mtimeMs === mtimeMs) return cached.cred;
-    return this.load(provider, identity, id.configDir, mtimeMs);
+    return this.load(provider, id, mtimeMs);
   }
 
   /**
@@ -194,21 +198,22 @@ export class CredentialCache {
    * for one identity share a single refresh. The refresh runs only if the file
    * still holds the stale token (another process may already have rotated it).
    */
-  refreshAfter401(provider: GatewayProvider, identity: string, staleToken: string): Promise<ProviderCredential> {
-    if (!adapterFor(provider).refreshable) return Promise.reject(new NotRefreshableError(provider, identity));
-    const key = `${provider}\u0000${identity}`;
+  async refreshAfter401(provider: GatewayProvider, identity: string, staleToken: string): Promise<ProviderCredential> {
+    if (!adapterFor(provider).refreshable) throw new NotRefreshableError(provider, identity);
+    const id = await this.resolve(provider, identity);
+    const key = `${provider}\u0000${id.name}`;
     const running = this.inflight.get(key);
     if (running) return running;
-    const run = this.doRefresh(provider, identity, staleToken).finally(() => {
+    const run = this.doRefresh(provider, id, staleToken).finally(() => {
       this.inflight.delete(key);
     });
     this.inflight.set(key, run);
     return run;
   }
 
-  private async doRefresh(provider: GatewayProvider, identity: string, staleToken: string): Promise<ProviderCredential> {
-    const id = await this.resolve(provider, identity);
-    const current = await this.reload(provider, identity, id.configDir);
+  private async doRefresh(provider: GatewayProvider, id: Identity, staleToken: string): Promise<ProviderCredential> {
+    const identity = id.name;
+    const current = await this.reload(provider, id);
     if (current.accessToken !== staleToken) return current;
     const key = `${provider}\u0000${identity}`;
     const now = (this.deps.now ?? Date.now)();
@@ -224,21 +229,21 @@ export class CredentialCache {
       throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : "refresh-failed", provider, identity, err);
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
-    const next = await this.reload(provider, identity, id.configDir);
+    const next = await this.reload(provider, id);
     if (next.accessToken !== staleToken) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
     throw new GatewayCredentialError(result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-revoked" ? "refresh-failed" : "token-unchanged", provider, identity);
   }
 
-  private async reload(provider: GatewayProvider, identity: string, dir: string): Promise<ProviderCredential> {
-    const mtimeMs = await newestMtime(provider, dir, identity, this.deps.claudeRegistryPath);
-    return this.load(provider, identity, dir, mtimeMs);
+  private async reload(provider: GatewayProvider, id: Identity): Promise<ProviderCredential> {
+    const mtimeMs = await newestMtime(provider, id, this.deps.claudeRegistryPath);
+    return this.load(provider, id, mtimeMs);
   }
 
-  private async load(provider: GatewayProvider, identity: string, dir: string, mtimeMs: number | undefined): Promise<ProviderCredential> {
-    const cred = await readCredential(provider, identity, dir, this.deps.claudeRegistryPath);
-    if (!cred) throw new GatewayCredentialError("no-credential", provider, identity);
-    if (mtimeMs !== undefined) this.entries.set(`${provider}\u0000${identity}`, { mtimeMs, cred });
+  private async load(provider: GatewayProvider, id: Identity, mtimeMs: number | undefined): Promise<ProviderCredential> {
+    const cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
+    if (!cred) throw new GatewayCredentialError("no-credential", provider, id.name);
+    if (mtimeMs !== undefined) this.entries.set(`${provider}\u0000${id.name}`, { mtimeMs, cred });
     return cred;
   }
 

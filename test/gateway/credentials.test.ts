@@ -166,6 +166,30 @@ describe("CredentialCache", () => {
     expect(calls).toBe(0);
   });
 
+  test("alias: the pi-newer copy is found through an alias with zero refreshes", async () => {
+    const piAuth = await registerPi();
+    await writeFile(piAuth, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE-claude-pi-0002", refresh: "SYNTHETIC_FIXTURE-claude-pi-refresh", expires: 1_900_000_000_000 } }));
+    await writeFile(registryOf("claude"), JSON.stringify({ version: 1, identities: [{ name: "id1", label: "id1", aliases: ["al"], configDir: join(work, "claude") }] }));
+    let calls = 0;
+    const c = new CredentialCache({ claudeRegistryPath: registryOf("claude"), refresh: async () => { calls++; return refreshed(); } });
+    expect((await c.get("claude", "al")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-pi-0002");
+    expect((await c.refreshAfter401("claude", "al", "SYNTHETIC_FIXTURE-claude-access-0001")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-pi-0002");
+    expect(calls).toBe(0);
+  });
+
+  test("alias and canonical name share one cooldown", async () => {
+    await writeFile(registryOf("claude"), JSON.stringify({ version: 1, identities: [{ name: "id1", label: "id1", aliases: ["al"], configDir: join(work, "claude") }] }));
+    let calls = 0;
+    const c = new CredentialCache({
+      claudeRegistryPath: registryOf("claude"),
+      now: () => 1_800_000_000_000,
+      refresh: async () => { calls++; await writeClaude("SYNTHETIC_FIXTURE-claude-access-0002", 1_800_000_500); return refreshed(); },
+    });
+    await c.refreshAfter401("claude", "al", "SYNTHETIC_FIXTURE-claude-access-0001");
+    await expect(c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0002")).rejects.toBeInstanceOf(RefreshCooldownError);
+    expect(calls).toBe(1);
+  });
+
   test("claude: pi copy changing is noticed through the mtime watch set", async () => {
     const piAuth = await registerPi();
     const c = makeCache();
