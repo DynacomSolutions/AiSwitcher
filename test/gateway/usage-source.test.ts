@@ -77,3 +77,21 @@ describe("usage source", () => {
     expect(await src.get("claude", "id1")).toBeUndefined();
   });
 });
+
+describe("reserve uses numbers only", () => {
+  const pinned = (usage: PoolUsage | undefined) => pickIdentity(app, { usageFor: async () => usage, poolMembers: async () => [] });
+  test("rate-limited without a number is no figure", async () => {
+    expect(await pinned({ status: "rate-limited", capturedAt: "x" })).toEqual({ identity: "id1" });
+    expect(await pinned({ status: "rate-limited", maxUtilization: 100, capturedAt: "x" })).toEqual({ reject: "reserve" });
+  });
+  test("codex at 100 percent is still rejected, and a worst window counts when there is no max", async () => {
+    const codexApp = { ...app, provider: "codex" as const };
+    expect(await pickIdentity(codexApp, { usageFor: async () => ({ status: "rate-limited", maxUtilization: 100, capturedAt: "x" }), poolMembers: async () => [] })).toEqual({ reject: "reserve" });
+    expect(await pinned({ status: "live", windows: [{ label: "a", utilization: 10 }, { label: "b", utilization: 90 }], capturedAt: "x" })).toEqual({ reject: "reserve" });
+  });
+  test("a pool treats a number-less rate-limited member as unknown, not full", async () => {
+    const pool: GatewayApp = { ...app, target: { kind: "pool" } };
+    const usageFor = async (_p: string, i: string): Promise<PoolUsage> => (i === "a" ? { status: "rate-limited", capturedAt: "x" } : { status: "live", maxUtilization: 95, capturedAt: "x" });
+    expect(await pickIdentity(pool, { usageFor: usageFor as never, poolMembers: async () => ["a", "b"] })).toEqual({ identity: "a" });
+  });
+});
