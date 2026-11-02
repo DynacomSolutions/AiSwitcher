@@ -96,6 +96,21 @@ describe("reserve uses numbers only", () => {
   });
 });
 
+describe("empty pool", () => {
+  const pool: GatewayApp = { ...app, target: { kind: "pool" } };
+  test("a provider with no identities is its own rejection", async () => {
+    expect(await pickIdentity(pool, { usageFor: async () => undefined, poolMembers: async () => [] })).toEqual({ reject: "no-identities" });
+  });
+  test("an allow-list that matches no member is its own rejection", async () => {
+    const limited: GatewayApp = { ...app, target: { kind: "pool", identities: ["ghost"] } };
+    expect(await pickIdentity(limited, { usageFor: async () => undefined, poolMembers: async () => ["a"] })).toEqual({ reject: "no-identities" });
+  });
+  test("members that are all over the reserve stay no-headroom", async () => {
+    const full = async (): Promise<PoolUsage> => ({ status: "live", maxUtilization: 99, capturedAt: "x" });
+    expect(await pickIdentity(pool, { usageFor: full as never, poolMembers: async () => ["a"] })).toEqual({ reject: "no-headroom" });
+  });
+});
+
 describe("pool selection details", () => {
   const pool: GatewayApp = { ...app, target: { kind: "pool" } };
   test("extra usage breaks a tie between equal members", async () => {

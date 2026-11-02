@@ -315,8 +315,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   const pick = await pickIdentity(app, deps);
   if ("reject" in pick) {
-    deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : "no_headroom");
-    return reject(429, pick.reject === "reserve" ? "identity is at its usage reserve" : "no pool member has headroom below the reserve", identityForRow, model);
+    deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
+    const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
+    return reject(429, why, identityForRow, model);
   }
 
   const upstreamUrl = adapter.upstreamBase(style) + rest + url.search;
