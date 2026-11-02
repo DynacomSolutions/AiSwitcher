@@ -803,6 +803,35 @@ describe("fix round 1", () => {
     expect(seen.length).toBe(2);
   });
 
+  test("dot segments hidden in the model id, or %2F outside the openai models route, are refused with no upstream call", async () => {
+    const t = await addApp(baseApp({ name: "oa", provider: "codex", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    for (const p of ["/oa/v1/models/..%2F..%2Fx", "/oa/v1/models/a%2F..%2Fb", "/oa/v1/models/.%2Fx", "/oa/v1/models/a%2F%2Fb", "/oa/v1/models/%2Fx", "/oa/v1/models/x%2F", "/oa/v1/foo/models/..%2Fbar", "/oa/v1/foo/models/org%2Fmodel", "/oa/v1/models/a%2F."]) {
+      expect((await call(p, t, { method: "GET" })).status).toBe(400);
+    }
+    expect(seen.length).toBe(0);
+    const an = await addApp(baseApp({ name: "an" }));
+    expect((await call("/an/v1/models/org%2Fmodel", an, { method: "GET" })).status).toBe(400);
+    expect(seen.length).toBe(0);
+    expect((await call("/oa/v1/models/org%2Fmodel", t, { method: "GET" })).status).toBe(200);
+  });
+
+  test("a body read failure followed by an abort on the next tick is client_aborted", async () => {
+    const t = await addApp(baseApp({}));
+    const ac = new AbortController();
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        c.error(new Error("socket reset"));
+        setTimeout(() => ac.abort(), 0);
+      },
+    });
+    const res = await Promise.resolve(callRaw("/pin/v1/messages", t, { method: "POST", body, signal: ac.signal, duplex: "half" } as RequestInit)).catch(() => undefined);
+    if (res) await res.arrayBuffer().catch(() => undefined);
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]).toMatchObject({ status: "client_aborted", httpStatus: 499 });
+    expect(seen.length).toBe(0);
+  });
+
   test("an aborted failover attempt cancels the original 429 body", async () => {
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
     usage.a = live(5);
@@ -849,9 +878,13 @@ describe("fix round 1", () => {
     };
     const unknown = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
     expect(unknown.status).toBe(502);
-    expect(((await unknown.json()) as { error: { type: string } }).error.type).toBe("server_error"); // openai shape
+    expect(((await unknown.json()) as { type: string }).type).toBe("error"); // guessed from the path: anthropic
+    const guessedOpenai = await call("/pin/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(guessedOpenai.status).toBe(502);
+    expect(((await guessedOpenai.json()) as { error: { type: string } }).error.type).toBe("server_error");
     expect(fails).toEqual([
       ["auth-error", "pin"],
+      ["auth-error", undefined],
       ["auth-error", undefined],
     ]);
     expect((await rows()).length).toBe(0);

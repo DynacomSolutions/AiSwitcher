@@ -215,7 +215,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     found = appName ? await deps.store.getApp(appName) : undefined;
   } catch {
     deps.metrics.authFailure("auth-error");
-    return providerError("openai", 502, "gateway store unavailable");
+    return providerError(guessStyle(url.pathname), 502, "gateway store unavailable");
   }
   if (!found) {
     deps.metrics.authFailure("unknown-app");
@@ -304,11 +304,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
 
   async function run(): Promise<Response> {
-  if (!pathAllowed(rest)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
+  if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
   let body: Body;
   try {
     body = await readBody(req);
   } catch {
+    // An abort can land a tick after the read error it caused: look again before calling it a bad body.
+    if (!req.signal.aborted && !ctrl.signal.aborted) await new Promise((r) => setTimeout(r, 0));
     if (req.signal.aborted || ctrl.signal.aborted) {
       record(identity, "client_aborted", 499, undefined, false, undefined, undefined);
       return new Response(null, { status: 499 });
@@ -486,10 +488,17 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
 }
 
-/** Encoded slashes, backslashes and dots are refused, except `%2F` in the final segment after `/models/` (OpenAI model ids such as `org/model`). */
-function pathAllowed(rest: string): boolean {
-  const m = /^(.*\/models\/)([^/]*)$/.exec(rest);
-  if (m) return !/%2f|%5c|%2e/i.test(m[1] as string) && !/%5c|%2e/i.test(m[2] as string);
+/**
+ * Encoded slashes, backslashes and dots are refused, with one exception: `%2F` in the id of an OpenAI-style
+ * `[/v1]/models/<id>` route (model ids such as `org/model`). The id is split on `%2F` and no piece may be empty, `.` or `..`.
+ */
+function pathAllowed(rest: string, style: ApiStyle): boolean {
+  const m = style === "openai" ? /^(?:\/v1)?\/models\/([^/]+)$/.exec(rest) : null;
+  if (m) {
+    const id = m[1] as string;
+    if (/%5c|%2e/i.test(id)) return false;
+    return id.split(/%2f/i).every((piece) => piece !== "" && piece !== "." && piece !== "..");
+  }
   return !/%2f|%5c|%2e/i.test(rest);
 }
 
