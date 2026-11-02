@@ -124,8 +124,8 @@ ETA: 2026-11-05 18:00 ICT
 |---|---|---|---|---|---|---|---|
 | 99 | Design the AIS AI Gateway (per-app tokens, real SDKs, all providers) | done | claude-20261102-ai-gateway | | | | Owner approved 2026-11-02.<br>Spec and plan: .data/DynacomSolutions/AiSwitcher/specs/2026-11-02-ai-gateway-{design,plan}.md |
 | 100 | Full gateway policy engine: priority, load balancing, failover, reservations, rate limits | parked | | | 4.99 | | Parked by owner 2026-11-02: future work; v1 ships tracking plus simple per-app caps only.<br>Resumes when owner un-parks it. |
-| 101 | Gateway app model, tokens and in-memory store | in_progress | claude-20261102-ai-gateway | gw-t1-app-model | 4.99 | 2026-11-02 17:00 ICT | Sonnet worker implementing plan task 1; task review next. |
-| 102 | Gateway Postgres store, migrations and ledger buffer | todo | | | 4.101 | | Plan task 2 in 2026-11-02-ai-gateway-plan.md. |
+| 101 | Gateway app model, tokens and in-memory store | done | claude-20261102-ai-gateway | | 4.99 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/324 (a4fa771).<br>Task review clean; 4 minors deferred to final review. |
+| 102 | Gateway Postgres store, migrations and ledger buffer | in_progress | claude-20261102-ai-gateway | gw-t2-pg-store | 4.101 | 2026-11-02 18:30 ICT | Sonnet worker implementing plan task 2. |
 | 103 | Gateway provider adapters and locked credential refresh | todo | | | 4.101 | | Plan task 3 in 2026-11-02-ai-gateway-plan.md. |
 | 104 | Gateway usage extraction from JSON and SSE | todo | | | 4.103 | | Plan task 4 in 2026-11-02-ai-gateway-plan.md. |
 | 105 | Gateway transparent proxy path with pool, caps and ledger | todo | | | 4.102, 4.103, 4.104 | | Plan task 5 in 2026-11-02-ai-gateway-plan.md. |
