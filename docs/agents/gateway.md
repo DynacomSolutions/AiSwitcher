@@ -106,17 +106,31 @@ Subscription endpoints can insist on the request shape of their own CLI. The gat
 is transparent, so an app that does not meet the shape gets the provider's own error
 back; meeting it is the app's job.
 
-- **claude** (anthropic style): the Claude OAuth login expects Claude Code's identity
+- **claude** (anthropic style, proven live with the Anthropic SDK): the Claude OAuth login expects Claude Code's identity
   system prompt as the first system block (`You are Claude Code, Anthropic's official
   CLI for Claude.`). Add it to the app's system prompt. The gateway adds the
   `anthropic-beta: oauth-2025-04-20` header and merges the app's own betas.
 - **codex** (openai style): a ChatGPT login reaches only the Codex backend, so the
-  OpenAI SDK works through the Responses API, not Chat Completions. Expect to send
-  `instructions`, `store: false` and `stream: true` as the Codex CLI does. These
-  expectations are unproven against the live backend until the real-SDK smoke check.
+  OpenAI SDK works through the Responses API, not Chat Completions. Proven live
+  with the OpenAI SDK, as app-side requirements: send `instructions`, a list-shaped
+  `input` (`[{role, content}]`; a bare string gets 400 `Input must be a list`),
+  `store: false` and `stream: true` (a plain request gets 400 `Stream must be set
+  to true`, so there is no non-streamed call). The SDK's `responses.stream()`
+  helper throws on the backend's `response.metadata` event; iterate
+  `responses.create({ stream: true })` instead.
 - **kimi** (anthropic or openai): the Kimi Coding endpoint; choose the style that
   matches your SDK.
-- **grok** (openai style): Chat Completions.
+- **grok** (openai style): Chat Completions. The endpoint answers 426 to a caller
+  with no Grok CLI version; send the header `x-grok-client-version: 1.0.70` (any
+  version from 1.0.13 up).
 - **zai** (anthropic or openai): choose the style that matches your SDK.
 - **ali** (anthropic style only): Alibaba Token Plan.
-- **opencode** (openai style only): OpenCode Go.
+- **opencode** (openai style only): OpenCode Go. Send an `x-opencode-session`
+  header (any stable id per conversation); without it the endpoint answers 400
+  `MissingSessionID`. `GET /models` lists the models the plan serves; `glm-5` is
+  not one of them.
+
+The live proof lives in `test/gateway-e2e/` (one script per provider using the
+unmodified official SDK, configured with `AIS_GATEWAY_URL` and `AIS_GATEWAY_TOKEN`
+only) and `test/gateway-e2e/run-in-cluster.sh <script>`, which runs one from a
+throwaway pod outside the `dev` namespace.
