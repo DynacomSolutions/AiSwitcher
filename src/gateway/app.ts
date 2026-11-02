@@ -21,6 +21,8 @@ export interface GatewayDeps {
   creds: Pick<CredentialCache, "get" | "refreshAfter401">;
   usageFor(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   poolMembers(provider: GatewayProvider): Promise<string[]>;
+  /** Resolves an alias to the identity's canonical name. Ledger rows, metrics and alerts use the canonical name. */
+  canonical?(provider: GatewayProvider, identity: string): Promise<string>;
   fetch: typeof fetch;
   now(): Date;
   metrics: GatewayMetrics;
@@ -162,6 +164,19 @@ function guessStyle(path: string): ApiStyle {
   return /\/messages(\/|$)/.test(path) ? "anthropic" : "openai";
 }
 
+/** The error shape for a request before auth: the app's own style when the path names a known app, else a guess from the path (OpenAI by default). */
+export async function styleForPath(deps: Pick<GatewayDeps, "store">, pathname: string): Promise<ApiStyle> {
+  const slash = pathname.indexOf("/", 1);
+  const name = decodeSegment(pathname.slice(1, slash === -1 ? undefined : slash));
+  try {
+    const found = name ? await deps.store.getApp(name) : undefined;
+    if (found) return found.style;
+  } catch {
+    // fall through to the guess
+  }
+  return guessStyle(pathname);
+}
+
 function defaultLog(line: string): void {
   console.info(line);
 }
@@ -177,7 +192,8 @@ async function discard(res: Response): Promise<void> {
 export function createGatewayApp(deps: GatewayDeps): Hono {
   const hono = new Hono();
   const log = deps.log ?? defaultLog;
-  const handle = (req: Request): Promise<Response> => proxy(req, deps, log).catch(() => providerError("openai", 500, "gateway error"));
+  const handle = (req: Request): Promise<Response> =>
+    proxy(req, deps, log).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   hono.all("/:app", (c) => handle(c.req.raw));
   hono.all("/:app/*", (c) => handle(c.req.raw));
   return hono;
@@ -201,11 +217,18 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   const token = queryCarriesToken(url.search) ? undefined : extractToken(req, app.name);
   if (!token || !(await verifyToken(deps.store, app.name, token, deps.now()))) {
-    deps.metrics.authFailure("bad-token");
+    deps.metrics.authFailure("bad-token", app.name);
     return providerError(style, 401, "invalid or missing gateway token");
   }
 
-  const identityForRow = app.target.kind === "pin" ? app.target.identity : "-";
+  const canon = async (name: string): Promise<string> => {
+    try {
+      return (await deps.canonical?.(app.provider, name)) ?? name;
+    } catch {
+      return name;
+    }
+  };
+  const identityForRow = app.target.kind === "pin" ? await canon(app.target.identity) : "-";
   let recorded = false;
   const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string): void => {
     if (recorded) return;
@@ -231,7 +254,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     };
     try {
       deps.ledger.push(row);
-      deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs });
+      deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs, ...(counts ? { tokens: c } : {}) });
       log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}) }));
     } catch {
       // Observation must never affect the response.
@@ -272,6 +295,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
   model = requestModel(body);
   if (app.models && app.models.length > 0 && body.kind === "stream") {
+    deps.metrics.rejection(app.name, "model");
     return reject(413, "request too large to verify the model allowlist", identityForRow, model);
   }
   let used = 0;
@@ -284,10 +308,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
   }
   const caps = checkCaps(app, model, used);
+  if (!("ok" in caps)) {
+    deps.metrics.rejection(app.name, caps.status === 403 ? "model" : "daily_cap");
+  }
   if (!("ok" in caps)) return reject(caps.status, caps.reason, identityForRow, model);
 
   const pick = await pickIdentity(app, deps);
   if ("reject" in pick) {
+    deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : "no_headroom");
     return reject(429, pick.reject === "reserve" ? "identity is at its usage reserve" : "no pool member has headroom below the reserve", identityForRow, model);
   }
 
@@ -340,7 +368,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
   };
 
-  identity = pick.identity;
+  identity = await canon(pick.identity);
   let up: Response;
   try {
     up = await attempt(identity);
@@ -356,7 +384,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
             await discard(up);
             deps.metrics.failover(app.name);
             up = second;
-            identity = next.identity;
+            identity = await canon(next.identity);
           } catch {
             if (req.signal.aborted || ctrl.signal.aborted) throw new DOMException("aborted", "AbortError");
           }

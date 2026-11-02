@@ -106,6 +106,8 @@ export interface FetchUsageDeps {
   claudeRegistryPath?: string;
   /** Test hook: where the per-member last-good read (shared with `ais limits`) lives. */
   cacheDir?: string;
+  /** Never refresh an expired token: report the account unavailable instead. For callers that must not rotate grants (the gateway). */
+  noRefresh?: boolean;
 }
 
 function backoffPath(member: Identity, cacheDir: string): string {
@@ -182,6 +184,7 @@ async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promis
   let grant = await read();
   if (!grant) return { error: "no Claude login stored for this account" };
   const expired = (g: { expires_at?: number }) => g.expires_at !== undefined && g.expires_at - EXPIRY_SKEW_SECONDS <= nowSeconds;
+  if (expired(grant) && deps.noRefresh) return { error: "token expired; refresh is disabled for this poll" };
   if (expired(grant)) {
     // Not forced first: under the lock a fresher non-expired grant (rotated by someone else) is kept, not re-rotated.
     // If that skipped (lock busy, or the freshest copy was not a native store) and the stores are still expired, force.
