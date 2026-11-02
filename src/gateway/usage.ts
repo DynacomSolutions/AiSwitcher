@@ -47,7 +47,10 @@ function num(v: unknown): number | undefined {
  */
 export class UsageTap {
   private readonly counts: UsageCounts = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-  private readonly sse: boolean;
+  // SSE or JSON. When the upstream names neither (the Codex backend sends no content-type on its
+  // SSE), the mode is decided from the first non-whitespace byte: `e`(vent), `d`(ata) or `:` is SSE.
+  private sse: boolean;
+  private sniffing: boolean;
   private readonly decoder = new TextDecoder("utf-8");
   // JSON mode
   private readonly parts: Uint8Array[] = [];
@@ -64,11 +67,21 @@ export class UsageTap {
   private eventTooBig = false;
 
   constructor(private readonly style: UsageStyle, contentType: string) {
-    this.sse = contentType.toLowerCase().includes("text/event-stream");
+    const ct = contentType.toLowerCase();
+    this.sse = ct.includes("text/event-stream");
+    this.sniffing = !this.sse && !ct.includes("json");
   }
 
   write(chunk: Uint8Array): void {
     try {
+      if (this.sniffing) {
+        const first = chunk.findIndex((b) => b !== 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d);
+        if (first === -1) return; // Whitespace carries nothing in either mode.
+        this.sniffing = false;
+        const b = chunk[first]!;
+        this.sse = b === 0x65 || b === 0x64 || b === 0x3a;
+        chunk = chunk.subarray(first);
+      }
       if (this.sse) this.writeSse(chunk);
       else this.writeJson(chunk);
     } catch {

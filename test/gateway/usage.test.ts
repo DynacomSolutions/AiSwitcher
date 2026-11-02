@@ -72,6 +72,29 @@ describe("usage tap", () => {
   });
 });
 
+describe("content-type sniffing", () => {
+  const codex = { model: "gpt-5", inputTokens: 20, outputTokens: 5, cacheReadTokens: 3, cacheWriteTokens: 0 };
+  test("sse with no content-type is read as sse, whole or in small chunks", () => {
+    expect(tap("openai-responses", "", fx("codex-responses.sse"))).toEqual(codex);
+    expect(tap("openai-responses", "", fx("codex-responses.sse"), 7)).toEqual(codex);
+  });
+  test("a content-type that is neither json nor event-stream is sniffed too", () => {
+    expect(tap("openai-responses", "application/octet-stream", fx("codex-responses.sse"))).toEqual(codex);
+  });
+  test("leading whitespace and a comment line still mean sse", () => {
+    const body = new TextEncoder().encode("\n  : keep-alive\n\n" + new TextDecoder().decode(fx("codex-responses.sse")));
+    expect(tap("openai-responses", "", body)).toEqual(codex);
+  });
+  test("json with no content-type is still json", () => {
+    expect(tap("anthropic", "", fx("anthropic.json"))).toEqual({ model: "claude-sonnet-4-5", inputTokens: 12, outputTokens: 34, cacheReadTokens: 78, cacheWriteTokens: 56 });
+  });
+  test("status is ok for a sniffed sse body", () => {
+    const t = new UsageTap("openai-responses", "");
+    t.write(fx("codex-responses.sse"));
+    expect(t.status()).toBe("ok");
+  });
+});
+
 describe("usage tap edge cases", () => {
   const enc = new TextEncoder();
   const zero = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
