@@ -118,9 +118,18 @@ ETA: 2026-11-07 18:00 ICT
 | 98 | Fix main CI: spend guard canary and Host app Browser smoke | done | claude-20261031-main-ci-red | main-ci-red | | 2026-10-31 23:30 ICT | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/319 (b9e97f3).<br>Canary tests now use the Bun binary as `codex`; @playwright/test 1.58.2 to 1.64.1 for ubuntu26.04.<br>All PR 319 checks green. |
 
 ## 4. AIS AI Gateway for cluster apps
-ETA: 2026-11-02 18:00 ICT
+ETA: 2026-11-05 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 99 | Design the AIS AI Gateway (per-app tokens, real SDKs, all providers) | in_progress | claude-20261102-ai-gateway | ai-gateway | | 2026-11-02 18:00 ICT | Brainstorm decisions taken with owner 2026-11-02.<br>Design doc in .data specs, then plan and build rows. |
+| 99 | Design the AIS AI Gateway (per-app tokens, real SDKs, all providers) | done | claude-20261102-ai-gateway | | | | Owner approved 2026-11-02.<br>Spec and plan: .data/DynacomSolutions/AiSwitcher/specs/2026-11-02-ai-gateway-{design,plan}.md |
 | 100 | Full gateway policy engine: priority, load balancing, failover, reservations, rate limits | parked | | | 4.99 | | Parked by owner 2026-11-02: future work; v1 ships tracking plus simple per-app caps only.<br>Resumes when owner un-parks it. |
+| 101 | Gateway app model, tokens and in-memory store | todo | | | 4.99 | | Plan task 1 in 2026-11-02-ai-gateway-plan.md. |
+| 102 | Gateway Postgres store, migrations and ledger buffer | todo | | | 4.101 | | Plan task 2 in 2026-11-02-ai-gateway-plan.md. |
+| 103 | Gateway provider adapters and locked credential refresh | todo | | | 4.101 | | Plan task 3 in 2026-11-02-ai-gateway-plan.md. |
+| 104 | Gateway usage extraction from JSON and SSE | todo | | | 4.103 | | Plan task 4 in 2026-11-02-ai-gateway-plan.md. |
+| 105 | Gateway transparent proxy path with pool, caps and ledger | todo | | | 4.102, 4.103, 4.104 | | Plan task 5 in 2026-11-02-ai-gateway-plan.md. |
+| 106 | Gateway serve, lifecycle, metrics, alerts and admin API | todo | | | 4.105 | | Plan task 6 in 2026-11-02-ai-gateway-plan.md. |
+| 107 | ais gateway CLI for agents plus docs/agents/gateway.md | todo | | | 4.106 | | Plan task 7 in 2026-11-02-ai-gateway-plan.md. |
+| 108 | Deploy ais-gateway via .cluster (pg-shared, Tailnet, metrics) | todo | | | 4.106 | | Plan task 8 in 2026-11-02-ai-gateway-plan.md. |
+| 109 | Real-SDK e2e for all 7 providers and console usage view | todo | | | 4.107, 4.108 | | Plan task 9 in 2026-11-02-ai-gateway-plan.md. |
