@@ -117,7 +117,9 @@ back; meeting it is the app's job.
   `store: false` and `stream: true` (a plain request gets 400 `Stream must be set
   to true`, so there is no non-streamed call). The SDK's `responses.stream()`
   helper throws on the backend's `response.metadata` event; iterate
-  `responses.create({ stream: true })` instead.
+  `responses.create({ stream: true })` instead. Known gap: the Codex backend sends
+  its SSE without a `content-type` header, so the gateway records no usage for
+  Codex requests yet (board row 4.110); requests themselves work.
 - **kimi** (anthropic or openai): the Kimi Coding endpoint; choose the style that
   matches your SDK.
 - **grok** (openai style): Chat Completions. The endpoint answers 426 to a caller
