@@ -12,6 +12,21 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Gateway store tests (test/gateway/pg-store.test.ts). Plain Postgres, so
+    # the TimescaleDB fallback path is what CI exercises.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: gateway_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,6 +101,7 @@ jobs:
       - name: Test
         env:
           AIS_REQUIRE_LIVE_TEST_TOOLS: "1"
+          AIS_GATEWAY_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/gateway_test
         run: bun test
 
   # Decides whether the macOS job is needed. Pushes to main always run it.
