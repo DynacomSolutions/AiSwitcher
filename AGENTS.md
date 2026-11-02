@@ -217,6 +217,7 @@ then run the real command once. Full recipe: `docs/agents/adding-a-tool.md`.
 - Global memory projection and git-base landing: `docs/agents/global-memory.md`
 - Wrappers, exec, shims, PATH, nested-launch policy: `docs/agents/wrappers-and-shims.md`
 - Codex defaults, backfill lease: `docs/agents/codex.md`
+- AI Gateway apps, tokens, `ais gateway app|usage`: `docs/agents/gateway.md`
 - SSH/rsync profile sync, resume cwd overrides: `docs/agents/sync.md`
 - `open` shim, Chrome profile per identity: `docs/agents/chrome-open.md`
 - `--desktop` launches and spike status: `docs/agents/desktop-apps.md`
