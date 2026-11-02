@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -560,6 +561,11 @@ export interface OAuthRefreshOptions {
    * call (never loop; a re-login mints a different token and resumes). */
   revokedFingerprint?: string;
   lastSuccessAt?: string | null;
+  /** Compare-and-refresh: when set, the refresh proceeds only if the freshest
+   * stored access token (re-read under the locks) still has this value;
+   * otherwise another process already rotated it and no token request is
+   * made. Compared by sha256 digest; the value is never logged. */
+  expectedAccessToken?: string;
   fetchImpl?: FetchImpl;
   now?: () => number;
   /** Test hook: claude registry that lists swap pools. */
@@ -656,6 +662,10 @@ export async function refreshIdentityOAuthGrant(
   }
 }
 
+function tokenDigest(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
 async function refreshGrantUnlocked(
   tool: RefreshableTool,
   identity: Identity,
@@ -698,6 +708,10 @@ async function refreshGrantUnlocked(
       beforeFingerprint,
       detail: `refresh token revoked (diagnosed earlier) — re-login required: ${REFRESH_HINTS[tool]}; not retrying until re-login`,
     };
+  }
+
+  if (options.expectedAccessToken !== undefined && tokenDigest(options.expectedAccessToken) !== tokenDigest(freshest.grant.access_token)) {
+    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: "stored access token already differs from the one the caller saw (rotated elsewhere) - not refreshing" };
   }
 
   const decision = shouldAttemptOAuthRefresh(freshest.grant, {
