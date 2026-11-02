@@ -148,4 +148,27 @@ describe("admin api", () => {
     expect((await req({ target: { kind: "pin", identity: "id1" } })).status).toBe(201);
     expect((await req({ target: { kind: "pool" } })).status).toBe(200);
   });
+
+  test("name error message matches the DNS-1123 rule", async () => {
+    const res = await put("Bad_Name");
+    const msg = ((await res.json()) as { error: string }).error;
+    expect(msg).toContain("63");
+    expect(msg).not.toContain("_");
+  });
+
+  test("an unreadable identity registry is a 500 with a clear reason", async () => {
+    const broken = createAdminApp({
+      store,
+      adminToken: ADMIN,
+      now: () => now,
+      identityState: async () => {
+        throw new SyntaxError("Unexpected token in identities.json");
+      },
+    });
+    const res = await broken.request("http://admin.test/apps/ident", { method: "PUT", headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify(body) });
+    expect(res.status).toBe(500);
+    const msg = ((await res.json()) as { error: string }).error;
+    expect(msg).toContain("identity registry unreadable");
+    expect(msg).not.toContain("identities.json");
+  });
 });

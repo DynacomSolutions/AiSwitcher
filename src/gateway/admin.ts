@@ -102,7 +102,7 @@ async function jsonBody(req: Request): Promise<unknown> {
 export function createAdminApp(deps: AdminDeps): Hono {
   const { store } = deps;
   const hono = new Hono();
-  const err = (status: 400 | 401 | 404 | 409 | 503, message: string): Response => Response.json({ error: message }, { status });
+  const err = (status: 400 | 401 | 404 | 409 | 500 | 503, message: string): Response => Response.json({ error: message }, { status });
 
   hono.use("*", async (c, next) => {
     if (!deps.adminToken || !sameSecret(bearer(c.req.raw), deps.adminToken)) return err(401, "admin token required");
@@ -122,7 +122,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
 
   hono.put("/apps/:name", async (c) => {
     const name = c.req.param("name");
-    if (!NAME.test(name) || RESERVED_NAMES.has(name)) return err(400, "name must be lowercase letters, digits, - or _ and not a reserved path");
+    if (!NAME.test(name) || RESERVED_NAMES.has(name)) return err(400, "name must be 1 to 63 lowercase letters, digits or -, start and end with a letter or digit, and not be a reserved path");
     let raw: unknown;
     try {
       raw = await jsonBody(c.req.raw);
@@ -131,9 +131,13 @@ export function createAdminApp(deps: AdminDeps): Hono {
     }
     const parsed = parseAppBody(raw);
     if (typeof parsed === "string") return err(400, parsed);
+    try {
     for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : (parsed.target.identities ?? [])) {
       const state = (await deps.identityState?.(parsed.provider, identity)) ?? "ok";
       if (state !== "ok") return err(400, `identity "${identity}" is ${state === "retired" ? "retired" : "not a known"} ${parsed.provider} identity`);
+    }
+    } catch {
+      return err(500, "identity registry unreadable");
     }
     const existing = await store.getApp(name);
     const app: GatewayApp = {
