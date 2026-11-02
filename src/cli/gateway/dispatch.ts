@@ -1,5 +1,7 @@
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
+import { runKubectl } from "./kube-secret.ts";
+import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
 import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
 
 function portOf(flag: string | undefined, env: string | undefined, fallback: number, name: string): number {
@@ -10,9 +12,16 @@ function portOf(flag: string | undefined, env: string | undefined, fallback: num
   return n;
 }
 
-export async function runGatewayCommand(positionals: string[], flags: ParsedArgs["flags"]): Promise<void> {
-  const [sub] = positionals;
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve [--port=47130] [--admin-port=47131]");
+export type { GatewayCliDeps };
+
+const defaultDeps = (): GatewayCliDeps => ({ fetch, kubectl: runKubectl, out: (line) => console.info(line), now: () => Date.now() });
+
+export async function runGatewayCommand(positionals: string[], flags: ParsedArgs["flags"], deps: Partial<GatewayCliDeps> = {}): Promise<void> {
+  const [sub, ...rest] = positionals;
+  const merged: GatewayCliDeps = { ...defaultDeps(), ...deps };
+  if (sub === "app") return runAppCommand(rest[0], rest.slice(1), flags, merged);
+  if (sub === "usage") return runUsageCommand(flags, merged);
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|app|usage ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");

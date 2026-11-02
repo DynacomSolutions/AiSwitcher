@@ -77,11 +77,16 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve [--port=47130] [--admin-port=47131]",
+    usage: "ais gateway serve|app|usage ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
       serve: sub("ais gateway serve [--port=] [--admin-port=]", "Run the proxy and admin API (env: AIS_GATEWAY_PORT, AIS_GATEWAY_ADMIN_PORT, AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_ADMIN_TOKEN)"),
+      app: sub(
+        "ais gateway app add|update <name> --namespace=<ns> --provider=<p> [--style=anthropic|openai] (--pool [--identities=a,b] | --identity=<id>) [--models=glob,glob] [--daily-tokens=N] [--reserve=80]; app list|show|rotate|revoke [<name>]",
+        "Manage gateway apps; add and rotate write Secret ais-gateway-<app> and ~/.secrets (admin: AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN, AIS_GATEWAY_PROXY_URL in ~/.secrets)",
+      ),
+      usage: sub("ais gateway usage [--app=] [--provider=] [--days=7] [--json]", "Tokens used per app"),
     },
   },
   swap: {
