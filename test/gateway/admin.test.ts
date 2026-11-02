@@ -107,4 +107,45 @@ describe("admin api", () => {
     expect(wide.usage).toEqual([{ app: "web", provider: "claude", days: 7, tokens: 116 }]);
     expect((await call("/usage?days=0")).status).toBe(400);
   });
+
+  test("names are DNS-1123 labels", async () => {
+    for (const bad of ["with_underscore", "-lead", "trail-", "UPPER", "a".repeat(64)]) expect((await put(bad)).status).toBe(400);
+    expect((await put("a")).status).toBe(201);
+    expect((await put("a-b-1")).status).toBe(201);
+    expect((await put("a".repeat(63))).status).toBe(201);
+  });
+
+  test("provider and style combinations follow what the adapter supports", async () => {
+    expect((await put("x1", { provider: "ali", style: "openai" })).status).toBe(400);
+    expect((await put("x2", { provider: "opencode", style: "anthropic" })).status).toBe(400);
+    expect((await put("x3", { provider: "claude", style: "openai" })).status).toBe(400);
+    expect((await put("x4", { provider: "codex", style: "anthropic" })).status).toBe(400);
+    expect((await put("x5", { provider: "ali", style: "anthropic" })).status).toBe(201);
+    expect((await put("x6", { provider: "opencode", style: "openai" })).status).toBe(201);
+    expect((await put("x7", { provider: "kimi", style: "openai" })).status).toBe(201);
+    expect((await put("x8", { provider: "zai", style: "anthropic" })).status).toBe(201);
+  });
+
+  test("caps and reserve are validated", async () => {
+    for (const dailyTokens of [-1, 0, 1.5, "10"]) expect((await put("c1", { dailyTokens })).status).toBe(400);
+    for (const reservePercent of [0, -5, 101, "50", Number.NaN]) expect((await put("c2", { reservePercent })).status).toBe(400);
+    expect((await put("c3", { dailyTokens: 1000, reservePercent: 1 })).status).toBe(201);
+    expect((await put("c4", { reservePercent: 100 })).status).toBe(201);
+  });
+
+  test("a pinned or listed identity must exist and not be retired", async () => {
+    const checked = createAdminApp({
+      store,
+      adminToken: ADMIN,
+      now: () => now,
+      identityState: async (_p, name) => (name === "gone" ? "missing" : name === "old" ? "retired" : "ok"),
+    });
+    const req = (b: object) =>
+      checked.request("http://admin.test/apps/ident", { method: "PUT", headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ ...body, ...b }) });
+    expect((await req({ target: { kind: "pin", identity: "gone" } })).status).toBe(400);
+    expect((await req({ target: { kind: "pin", identity: "old" } })).status).toBe(400);
+    expect((await req({ target: { kind: "pool", identities: ["id1", "gone"] } })).status).toBe(400);
+    expect((await req({ target: { kind: "pin", identity: "id1" } })).status).toBe(201);
+    expect((await req({ target: { kind: "pool" } })).status).toBe(200);
+  });
 });

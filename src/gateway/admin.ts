@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import type { GatewayStore } from "./store.ts";
+import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord } from "./types.ts";
 
@@ -12,13 +13,20 @@ const PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok"
 const STYLES: readonly ApiStyle[] = ["anthropic", "openai"];
 /** Paths the proxy port answers itself; an app of this name could never be reached. */
 const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics"]);
-const NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+/** A DNS-1123 label: the name becomes a URL path segment and may become a Kubernetes label. */
+const NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+/** Providers that speak one API style only; the others (kimi, zai) offer both. */
+const FIXED_STYLE: Partial<Record<GatewayProvider, ApiStyle>> = { claude: "anthropic", ali: "anthropic", codex: "openai", grok: "openai", opencode: "openai" };
+
+export type IdentityState = "ok" | "missing" | "retired";
 
 export interface AdminDeps {
   store: GatewayStore;
   adminToken: string;
   now(): Date;
   overlapMs?: number;
+  /** Looks an identity up in the AIS registry. When absent, identities are not checked. */
+  identityState?(provider: GatewayProvider, identity: string): Promise<IdentityState>;
 }
 
 /** Constant-time comparison: both sides are hashed first so lengths never leak. */
@@ -52,6 +60,13 @@ function parseAppBody(raw: unknown): Pick<GatewayApp, "owner" | "namespace" | "p
   if (typeof namespace !== "string" || !namespace) return "namespace is required";
   if (!PROVIDERS.includes(provider as GatewayProvider)) return `provider must be one of ${PROVIDERS.join(", ")}`;
   if (!STYLES.includes(style as ApiStyle)) return "style must be anthropic or openai";
+  const fixed = FIXED_STYLE[provider as GatewayProvider];
+  if (fixed !== undefined && style !== fixed) return `${provider as string} supports only the ${fixed} style`;
+  try {
+    adapterFor(provider as GatewayProvider).upstreamBase(style as ApiStyle);
+  } catch {
+    return `${provider as string} has no ${style as string} upstream`;
+  }
   let t: GatewayApp["target"];
   if (!isObj(target)) return "target is required";
   if (target.kind === "pin") {
@@ -65,7 +80,7 @@ function parseAppBody(raw: unknown): Pick<GatewayApp, "owner" | "namespace" | "p
   }
   if (models !== undefined && !isStrings(models)) return "models must be a list of names";
   if (dailyTokens !== undefined && !isPosInt(dailyTokens)) return "dailyTokens must be a positive integer";
-  if (reservePercent !== undefined && !(typeof reservePercent === "number" && reservePercent >= 0 && reservePercent <= 100)) return "reservePercent must be between 0 and 100";
+  if (reservePercent !== undefined && !(typeof reservePercent === "number" && reservePercent >= 1 && reservePercent <= 100)) return "reservePercent must be between 1 and 100";
   return {
     owner,
     namespace,
@@ -116,6 +131,10 @@ export function createAdminApp(deps: AdminDeps): Hono {
     }
     const parsed = parseAppBody(raw);
     if (typeof parsed === "string") return err(400, parsed);
+    for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : (parsed.target.identities ?? [])) {
+      const state = (await deps.identityState?.(parsed.provider, identity)) ?? "ok";
+      if (state !== "ok") return err(400, `identity "${identity}" is ${state === "retired" ? "retired" : "not a known"} ${parsed.provider} identity`);
+    }
     const existing = await store.getApp(name);
     const app: GatewayApp = {
       ...parsed,
