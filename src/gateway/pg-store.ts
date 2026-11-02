@@ -1,4 +1,5 @@
 import { SQL, type TransactionSQL } from "bun";
+import { errorTag } from "./ledger-buffer.ts";
 import type { GatewayStore } from "./store.ts";
 import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
@@ -41,7 +42,7 @@ async function tryHypertable(tx: TransactionSQL): Promise<void> {
     });
   } catch (err) {
     console.warn(
-      `gateway: TimescaleDB unavailable, gateway_usage stays a plain table (${err instanceof Error ? err.message : String(err)})`,
+      `gateway: TimescaleDB unavailable, gateway_usage stays a plain table (${errorTag(err)})`,
     );
   }
 }

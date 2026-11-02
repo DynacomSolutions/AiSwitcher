@@ -137,3 +137,49 @@ describe("LedgerBuffer", () => {
     await b.close();
   });
 });
+
+describe("ledger logging", () => {
+  test("a flush failure logs a class or code, never the error message", async () => {
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => void warns.push(a.join(" "));
+    try {
+      class Leaky extends MemoryGatewayStore {
+        override async appendUsage(): Promise<void> {
+          throw Object.assign(new Error("connect postgres://user:hunter2@db/x refused"), { code: "ECONNREFUSED" });
+        }
+      }
+      const b = new LedgerBuffer(new Leaky(), { max: 10, flushMs: 3_600_000 });
+      b.push(row(1));
+      await b.flush();
+      await b.close();
+    } finally {
+      console.warn = orig;
+    }
+    const all = warns.join("\n");
+    expect(all).toContain("ECONNREFUSED");
+    expect(all).not.toContain("hunter2");
+  });
+
+  test("a rejected row logs the SQLSTATE, never the message", async () => {
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => void warns.push(a.join(" "));
+    try {
+      class Poison extends MemoryGatewayStore {
+        override async appendUsage(): Promise<void> {
+          throw Object.assign(new Error("value 'hunter2' too long"), { errno: "22001" });
+        }
+      }
+      const b = new LedgerBuffer(new Poison(), { max: 10, flushMs: 3_600_000 });
+      b.push(row(1));
+      await b.flush();
+      await b.close();
+    } finally {
+      console.warn = orig;
+    }
+    const all = warns.join("\n");
+    expect(all).toContain("22001");
+    expect(all).not.toContain("hunter2");
+  });
+});

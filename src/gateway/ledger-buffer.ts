@@ -13,6 +13,14 @@ export function isDataError(err: unknown): boolean {
   return false;
 }
 
+/** Error class and code (SQLSTATE or errno) only: messages can carry connection strings or row values. */
+export function errorTag(err: unknown): string {
+  const e = err as { name?: unknown; code?: unknown; errno?: unknown } | null;
+  const parts = [typeof e?.name === "string" ? e.name : "Error"];
+  for (const v of [e?.code, e?.errno]) if (typeof v === "string" || typeof v === "number") parts.push(String(v));
+  return parts.join(" ");
+}
+
 /**
  * In-memory usage buffer that flushes to the store on a timer. A store outage
  * keeps rows for the next flush; once `max` rows are held the oldest are
@@ -76,7 +84,7 @@ export class LedgerBuffer {
       try {
         await this.store.appendUsage(batch);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorTag(err);
         const requeue = isDataError(err) ? await this.isolate(batch) : batch;
         if (requeue.length > 0) {
           // Store looks down: put unwritten rows back in front of rows pushed meanwhile and wait for the next tick.
@@ -103,7 +111,7 @@ export class LedgerBuffer {
       } catch (err) {
         if (isDataError(err)) {
           this.droppedCount += 1;
-          console.warn(`gateway ledger discarded a rejected row: ${err instanceof Error ? err.message : String(err)}`);
+          console.warn(`gateway ledger discarded a rejected row: ${errorTag(err)}`);
         } else {
           return batch.slice(i);
         }
