@@ -32,6 +32,8 @@ passed to `kubectl` on the command line (the manifest goes through stdin). The
 Secret is created out of band, not through GitOps; mount it in the app's manifests
 with `envFrom` / `secretKeyRef`.
 
+`--url=<base>` overrides `AIS_GATEWAY_PROXY_URL` for one run.
+
 Other commands:
 
 ```sh
@@ -58,6 +60,10 @@ ais gateway usage [--app=billing] [--provider=claude] [--days=7] [--json]
 - `--models=glob,glob` restricts which models the app may request.
 
 The admin API owns validation; its reason is shown when a value is refused.
+
+`update` merges your flags over the current app. It cannot clear a field (such as
+`--models` or a cap), and it does not move the Secret to another namespace. To do
+either, `revoke` the app and `add` it again.
 
 ## Rotate and revoke
 
@@ -88,9 +94,11 @@ The gateway changes credential headers only. It does not rewrite bodies.
 
 ## Usage recording
 
-Chat Completions streams report no usage unless the request sets
-`stream_options={"include_usage": true}`. Without it the stream works but its tokens
-are not recorded. Anthropic Messages and the Responses API report usage by default.
+Chat Completions streams carry no usage unless the request sets
+`stream_options={"include_usage": true}`. Without it the stream works but no usage
+is recorded for it. Anthropic Messages (the final `message_delta` usage) and
+Responses API (`response.usage` on completion) bodies are read as sent, with no
+extra option.
 
 ## Per-provider notes
 
