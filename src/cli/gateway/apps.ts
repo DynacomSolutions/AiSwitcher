@@ -128,8 +128,7 @@ const proxyUrl = async (deps: GatewayCliDeps, flags: Flags, app: string): Promis
 };
 
 /** Delivers a freshly minted token: kube Secret, then the local secrets file, then the one printed copy. */
-async function deliverToken(deps: GatewayCliDeps, flags: Flags, app: string, namespace: string, token: string): Promise<void> {
-  const url = await proxyUrl(deps, flags, app);
+async function deliverToken(deps: GatewayCliDeps, app: string, namespace: string, url: string, token: string): Promise<void> {
   const redact = (e: unknown): string => (e instanceof Error ? e.message : String(e)).split(token).join("[redacted]");
   let kubeError: unknown;
   let fileError: unknown;
@@ -174,11 +173,12 @@ export async function runAppCommand(action: string | undefined, positionals: str
     case "add": {
       const name = appName(positionals);
       const body = buildNew(flags);
+      const url = await proxyUrl(deps, flags, name);
       const existing = await admin.call("GET", `/apps/${name}`, undefined, [404]);
       if (existing.status !== 404) throw new CliUsageError(`App "${name}" already exists; use: ais gateway app update ${name} to change settings, or ais gateway app rotate ${name} for a new token`);
       await admin.call("PUT", `/apps/${name}`, body);
       const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
-      await deliverToken(deps, flags, name, body.namespace, mintedToken(minted.json));
+      await deliverToken(deps, name, body.namespace, url, mintedToken(minted.json));
       return;
     }
     case "list": {
@@ -213,8 +213,9 @@ export async function runAppCommand(action: string | undefined, positionals: str
     case "rotate": {
       const name = appName(positionals);
       const { json: cur } = await admin.call("GET", `/apps/${name}`);
+      const url = await proxyUrl(deps, flags, name);
       const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
-      await deliverToken(deps, flags, name, str(cur.namespace), mintedToken(minted.json));
+      await deliverToken(deps, name, str(cur.namespace), url, mintedToken(minted.json));
       deps.out("previous tokens keep working until " + str(minted.json.previousTokensExpireAt));
       return;
     }

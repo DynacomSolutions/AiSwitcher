@@ -73,7 +73,7 @@ describe("ais gateway app add", () => {
     await run(ADD);
     expect(out.join("\n").split(TOKEN)).toHaveLength(2);
     expect(kube[0]!.args.join(" ")).not.toContain(TOKEN);
-    expect(kube[0]!.args).toEqual(["apply", "--server-side", "--field-manager=ais-gateway", "-f", "-"]);
+    expect(kube[0]!.args).toEqual(["apply", "--server-side", "--field-manager=ais-gateway", "--force-conflicts", "-f", "-"]);
   });
 
   test("pin and pool flags are mutually exclusive", async () => {
@@ -98,6 +98,13 @@ describe("ais gateway app add", () => {
   test("refuses to overwrite an existing app", async () => {
     respond = () => Response.json({ name: "billing" });
     await expect(run(ADD)).rejects.toThrow(/already exists/);
+  });
+
+  test("no proxy url errors before any token is minted", async () => {
+    writeFileSync(secrets, "AIS_GATEWAY_ADMIN_URL=http://admin.test\nAIS_GATEWAY_ADMIN_TOKEN=adm-1\n", { mode: 0o600 });
+    delete process.env.AIS_GATEWAY_PROXY_URL;
+    await expect(run(ADD)).rejects.toThrow(/Proxy base URL/);
+    expect(calls.filter((c) => c.url.endsWith("/tokens"))).toHaveLength(0);
   });
 
   test("existing app message points to update and rotate", async () => {
@@ -203,6 +210,20 @@ describe("appendSecretsFile", () => {
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
     expect(readFileSync(secrets, "utf8")).toContain("K=v");
     expect(readdirSync(dir).filter((f) => f.includes(".tmp."))).toEqual([]);
+  });
+
+  test("a dangling symlink is refused and left alone", async () => {
+    const link = join(dir, "dangling");
+    symlinkSync(join(dir, "nowhere"), link);
+    await expect(appendSecretsFile("K", "v", link, 1)).rejects.toThrow(/dangling|symlink/i);
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  test("an existing backup name is not overwritten", async () => {
+    writeFileSync(`${secrets}.bak.5`, "old");
+    await appendSecretsFile("K", "v", secrets, 5);
+    expect(readFileSync(`${secrets}.bak.5`, "utf8")).toBe("old");
+    expect(readdirSync(dir).filter((f) => f.startsWith("secrets.bak.5")).length).toBe(2);
   });
 
   test("creates a missing file with mode 0600", async () => {

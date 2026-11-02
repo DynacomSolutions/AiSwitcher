@@ -1,4 +1,4 @@
-import { chmod, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -43,6 +43,9 @@ export async function appendSecretsFile(key: string, value: string, requested = 
     path = await realpath(requested);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    // ENOENT is either a missing file or a dangling symlink; the link must not be replaced.
+    const st = await lstat(requested).catch(() => undefined);
+    if (st?.isSymbolicLink()) throw new Error(`${requested} is a dangling symlink; refusing to replace it`);
   }
   let existing: string | undefined;
   try {
@@ -52,9 +55,16 @@ export async function appendSecretsFile(key: string, value: string, requested = 
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
   if (existing !== undefined) {
-    const backup = `${path}.bak.${epoch}`;
-    await writeFile(backup, existing, { mode: 0o600 });
-    await chmod(backup, 0o600);
+    for (let n = 0; ; n++) {
+      const backup = n === 0 ? `${path}.bak.${epoch}` : `${path}.bak.${epoch}.${n}`;
+      try {
+        await writeFile(backup, existing, { mode: 0o600, flag: "wx" });
+        await chmod(backup, 0o600);
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      }
+    }
   }
   const kept = (existing ?? "").split("\n").filter((line) => parseLine(line)?.key !== key);
   while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
