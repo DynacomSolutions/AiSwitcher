@@ -761,4 +761,133 @@ describe("fix round 1", () => {
     expect(seen.length).toBe(0);
     expect((await rows()).length).toBe(3);
   });
+
+  test("a bare % in the query does not cause a false 401", async () => {
+    const t = await addApp(baseApp({}));
+    const res = await call("/pin/v1/messages?q=100%", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(200);
+    expect(seen.length).toBe(1);
+    // A token hidden next to a bare % is still caught.
+    const bad = await call(`/pin/v1/messages?q=100%&k=${t.replace("_", "%5F")}`, t, { method: "POST", body: "{}" });
+    expect(bad.status).toBe(401);
+    expect(seen.length).toBe(1);
+  });
+
+  test("a body read failure without an abort is a 400 in the app's shape with one row", async () => {
+    const t = await addApp(baseApp({}));
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        c.error(new Error("socket reset at /srv/secret"));
+      },
+    });
+    const res = await call("/pin/v1/messages", t, { method: "POST", body, duplex: "half" } as RequestInit);
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).not.toContain("srv");
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]).toMatchObject({ httpStatus: 400, status: "rejected" });
+    expect(seen.length).toBe(0);
+  });
+
+  test("%2F is allowed only in the final segment after /models/", async () => {
+    const t = await addApp(baseApp({ name: "oa", provider: "codex", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    const ok = await call("/oa/v1/models/org%2Fmodel", t, { method: "GET" });
+    expect(ok.status).toBe(200);
+    expect(new URL(seen[0]!.url).pathname.endsWith("/v1/models/org%2Fmodel")).toBe(true);
+    expect((await call("/oa/v1/models/org%2fmodel", t, { method: "GET" })).status).toBe(200);
+    for (const p of ["/oa/v1%2Fmodels/x", "/oa/v1/models%2Fx", "/oa/v1/models/a%2Fb/c", "/oa/v1/other/a%2Fb", "/oa/v1/models/%2e%2e%2Fx", "/oa/v1/models/a%2F%2e%2e", "/oa/v1/models/a%5Cb"]) {
+      const res = await call(p, t, { method: "GET" });
+      expect(res.status).toBe(400);
+    }
+    expect(seen.length).toBe(2);
+  });
+
+  test("dot segments hidden in the model id, or %2F outside the openai models route, are refused with no upstream call", async () => {
+    const t = await addApp(baseApp({ name: "oa", provider: "codex", style: "openai", target: { kind: "pin", identity: "id1" } }));
+    for (const p of ["/oa/v1/models/..%2F..%2Fx", "/oa/v1/models/a%2F..%2Fb", "/oa/v1/models/.%2Fx", "/oa/v1/models/a%2F%2Fb", "/oa/v1/models/%2Fx", "/oa/v1/models/x%2F", "/oa/v1/foo/models/..%2Fbar", "/oa/v1/foo/models/org%2Fmodel", "/oa/v1/models/a%2F."]) {
+      expect((await call(p, t, { method: "GET" })).status).toBe(400);
+    }
+    expect(seen.length).toBe(0);
+    const an = await addApp(baseApp({ name: "an" }));
+    expect((await call("/an/v1/models/org%2Fmodel", an, { method: "GET" })).status).toBe(400);
+    expect(seen.length).toBe(0);
+    expect((await call("/oa/v1/models/org%2Fmodel", t, { method: "GET" })).status).toBe(200);
+  });
+
+  test("a body read failure followed by an abort on the next tick is client_aborted", async () => {
+    const t = await addApp(baseApp({}));
+    const ac = new AbortController();
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        c.error(new Error("socket reset"));
+        setTimeout(() => ac.abort(), 0);
+      },
+    });
+    const res = await Promise.resolve(callRaw("/pin/v1/messages", t, { method: "POST", body, signal: ac.signal, duplex: "half" } as RequestInit)).catch(() => undefined);
+    if (res) await res.arrayBuffer().catch(() => undefined);
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]).toMatchObject({ status: "client_aborted", httpStatus: 499 });
+    expect(seen.length).toBe(0);
+  });
+
+  test("an aborted failover attempt cancels the original 429 body", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(5);
+    usage.b = live(10);
+    const ac = new AbortController();
+    let cancelled = false;
+    let calls = 0;
+    deps.fetch = (async () => {
+      calls += 1;
+      if (calls === 1) {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode('{"e":"rl"}'));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        });
+        return new Response(body, { status: 429, headers: { "content-type": "application/json" } });
+      }
+      ac.abort();
+      throw new DOMException("aborted", "AbortError");
+    }) as unknown as typeof fetch;
+    await Promise.resolve(callRaw("/pool/v1/messages", t, { method: "POST", body: "{}", signal: ac.signal })).catch(() => undefined);
+    expect(calls).toBe(2);
+    expect(cancelled).toBe(true);
+    const r = await rows();
+    expect(r.length).toBe(1);
+    expect(r[0]!.status).toBe("client_aborted");
+  });
+
+  test("a store failure before auth gives 502, a metric and no ledger row", async () => {
+    const t = await addApp(baseApp({}));
+    const fails: Array<[string, string | undefined]> = [];
+    deps.metrics = { ...noopMetrics, authFailure: (reason, app) => void fails.push([reason, app]) };
+    store.tokensFor = async () => {
+      throw new Error("db down");
+    };
+    const known = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(known.status).toBe(502);
+    expect(((await known.json()) as { type: string }).type).toBe("error"); // anthropic shape
+    store.getApp = async () => {
+      throw new Error("db down");
+    };
+    const unknown = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(unknown.status).toBe(502);
+    expect(((await unknown.json()) as { type: string }).type).toBe("error"); // guessed from the path: anthropic
+    const guessedOpenai = await call("/pin/v1/chat/completions", t, { method: "POST", body: "{}" });
+    expect(guessedOpenai.status).toBe(502);
+    expect(((await guessedOpenai.json()) as { error: { type: string } }).error.type).toBe("server_error");
+    expect(fails).toEqual([
+      ["auth-error", "pin"],
+      ["auth-error", undefined],
+      ["auth-error", undefined],
+    ]);
+    expect((await rows()).length).toBe(0);
+    expect(seen.length).toBe(0);
+  });
 });

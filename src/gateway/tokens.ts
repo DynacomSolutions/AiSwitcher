@@ -3,6 +3,7 @@ import type { GatewayStore } from "./store.ts";
 
 const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
 const PREFIX_LEN = 8;
+const SECRET_LEN = 43; // base64url of 32 bytes, no padding
 const TOKEN_HEAD = "aisg_";
 
 export function hashSecret(secret: string): string {
@@ -23,7 +24,7 @@ export function parseToken(raw: string): { prefix: string; secret: string } | un
   if (sep !== PREFIX_LEN) return undefined;
   const prefix = rest.slice(0, sep);
   const secret = rest.slice(sep + 1);
-  if (!/^[a-z2-7]+$/.test(prefix) || !/^[A-Za-z0-9_-]+$/.test(secret)) return undefined;
+  if (!/^[a-z2-7]+$/.test(prefix) || secret.length !== SECRET_LEN || !/^[A-Za-z0-9_-]+$/.test(secret)) return undefined;
   return { prefix, secret };
 }
 
@@ -43,7 +44,10 @@ export async function verifyToken(
     if (t.prefix !== parsed.prefix) continue;
     const stored = Buffer.from(t.hash, "hex");
     if (stored.length !== given.length || !timingSafeEqual(stored, given)) continue;
-    if (t.expiresAt !== undefined && Date.parse(t.expiresAt) <= now.getTime()) continue;
+    if (t.expiresAt !== undefined) {
+      const exp = Date.parse(t.expiresAt);
+      if (Number.isNaN(exp) || exp <= now.getTime()) continue; // unparseable counts as expired
+    }
     ok = true;
   }
   return ok;

@@ -139,3 +139,11 @@ The live proof lives in `test/gateway-e2e/` (one script per provider using the
 unmodified official SDK, configured with `AIS_GATEWAY_URL` and `AIS_GATEWAY_TOKEN`
 only) and `test/gateway-e2e/run-in-cluster.sh <script>`, which runs one from a
 throwaway pod outside the `dev` namespace.
+
+## Operations notes
+
+- Revoking an app needs the database. While the database is down, revoke
+  returns 503 and the app stays active; retry once the database is back.
+- The usage table becomes a TimescaleDB hypertable only on the first migration.
+  If TimescaleDB is added to the database later, the table stays a plain table
+  until someone converts it by hand.

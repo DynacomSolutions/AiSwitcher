@@ -95,9 +95,13 @@ export function queryCarriesToken(search: string): boolean {
     for (const [k, v] of new URLSearchParams(search)) {
       if (k.toLowerCase().includes(needle) || v.toLowerCase().includes(needle)) return true;
     }
+  } catch {
+    // fall through to the lenient checks below
+  }
+  try {
     if (decodeURIComponent(lower).includes(needle)) return true;
   } catch {
-    return true; // Undecodable query: refuse rather than forward something we cannot inspect.
+    // A bare % is legal in practice (`?q=100%`). The raw and URLSearchParams forms above already decode leniently, so nothing is hidden.
   }
   return false;
 }
@@ -206,7 +210,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const appName = decodeSegment(url.pathname.slice(1, slash === -1 ? undefined : slash));
   const rest = slash === -1 ? "" : url.pathname.slice(slash);
 
-  const found = appName ? await deps.store.getApp(appName) : undefined;
+  let found: GatewayApp | undefined;
+  try {
+    found = appName ? await deps.store.getApp(appName) : undefined;
+  } catch {
+    deps.metrics.authFailure("auth-error");
+    return providerError(guessStyle(url.pathname), 502, "gateway store unavailable");
+  }
   if (!found) {
     deps.metrics.authFailure("unknown-app");
     return providerError(guessStyle(url.pathname), 404, "not found");
@@ -216,7 +226,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const adapter = adapterFor(app.provider);
 
   const token = queryCarriesToken(url.search) ? undefined : extractToken(req, app.name);
-  if (!token || !(await verifyToken(deps.store, app.name, token, deps.now()))) {
+  let valid = false;
+  if (token) {
+    try {
+      valid = await verifyToken(deps.store, app.name, token, deps.now());
+    } catch {
+      deps.metrics.authFailure("auth-error", app.name);
+      return providerError(style, 502, "gateway store unavailable");
+    }
+  }
+  if (!valid) {
     deps.metrics.authFailure("bad-token", app.name);
     return providerError(style, 401, "invalid or missing gateway token");
   }
@@ -285,13 +304,18 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   }
 
   async function run(): Promise<Response> {
-  if (/%2f|%5c|%2e/i.test(rest)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
+  if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
   let body: Body;
   try {
     body = await readBody(req);
   } catch {
-    record(identity, "client_aborted", 499, undefined, false, undefined, undefined);
-    return new Response(null, { status: 499 });
+    // An abort can land a tick after the read error it caused: look again before calling it a bad body.
+    if (!req.signal.aborted && !ctrl.signal.aborted) await new Promise((r) => setTimeout(r, 0));
+    if (req.signal.aborted || ctrl.signal.aborted) {
+      record(identity, "client_aborted", 499, undefined, false, undefined, undefined);
+      return new Response(null, { status: 499 });
+    }
+    return reject(400, "request body could not be read");
   }
   model = requestModel(body);
   if (app.models && app.models.length > 0 && body.kind === "stream") {
@@ -387,7 +411,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
             up = second;
             identity = await canon(next.identity);
           } catch {
-            if (req.signal.aborted || ctrl.signal.aborted) throw new DOMException("aborted", "AbortError");
+            if (req.signal.aborted || ctrl.signal.aborted) {
+              await discard(up);
+              throw new DOMException("aborted", "AbortError");
+            }
           }
         }
       }
@@ -459,6 +486,20 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   req.signal.addEventListener("abort", () => finish("client_aborted"), { once: true });
   return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
   }
+}
+
+/**
+ * Encoded slashes, backslashes and dots are refused, with one exception: `%2F` in the id of an OpenAI-style
+ * `[/v1]/models/<id>` route (model ids such as `org/model`). The id is split on `%2F` and no piece may be empty, `.` or `..`.
+ */
+function pathAllowed(rest: string, style: ApiStyle): boolean {
+  const m = style === "openai" ? /^(?:\/v1)?\/models\/([^/]+)$/.exec(rest) : null;
+  if (m) {
+    const id = m[1] as string;
+    if (/%5c|%2e/i.test(id)) return false;
+    return id.split(/%2f/i).every((piece) => piece !== "" && piece !== "." && piece !== "..");
+  }
+  return !/%2f|%5c|%2e/i.test(rest);
 }
 
 function decodeSegment(s: string): string {
