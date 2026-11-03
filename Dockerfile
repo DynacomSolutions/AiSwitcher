@@ -23,24 +23,32 @@ RUN pnpm install --frozen-lockfile
 COPY apps/web ./
 RUN pnpm build
 
-FROM debian:trixie-slim AS kubectl
+FROM --platform=$BUILDPLATFORM golang:1.26.10-trixie@sha256:a050dcceee6eb9bf110151662dfac7662f3bec40927c7dee48731e3d92083d42 AS kubectl
 # kubectl: the auth-refresh scheduler drives the chrome-auth browser pods
 # through `kubectl port-forward` (WebDriver + noVNC stay loopback-only).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
- && rm -rf /var/lib/apt/lists/* \
- && case "$(dpkg --print-architecture)" in \
-      amd64) kubectl_arch=amd64; kubectl_sha256=65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8 ;; \
-      arm64) kubectl_arch=arm64; kubectl_sha256=ff749f4b78d9c4f1ec87307df9b50119ed819e2094aa9810cb9acffc3286c8c7 ;; \
-      armhf) kubectl_arch=arm; kubectl_sha256=8af0113a5b03b13b923f530bc4177479799dee2a0c188d15bef0ebef5d0c6d75 ;; \
-      ppc64el) kubectl_arch=ppc64le; kubectl_sha256=50a33e7a7f0d1125099abbdba3c010a3cb497142f58ed8ea198949f738e79b82 ;; \
-      s390x) kubectl_arch=s390x; kubectl_sha256=222798cd808e287cccd427718f9d76f7b3bff4e8601dca96b8bf5c371d3b59f6 ;; \
-      *) echo "unsupported kubectl architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+# Built from the v1.37.2 source with golang.org/x/net and golang.org/x/text
+# bumped past the upstream pins: the release binary still carries x/net 0.57.0
+# and x/text 0.40.0, which Trivy flags as fixable HIGH/CRITICAL. Drop the
+# `go get` once upstream ships fixed pins.
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG KUBECTL_VERSION=v1.37.2
+ARG KUBECTL_COMMIT=c50e5395f1ae2d4a2c05f28fdcc38c0916cc1a32
+RUN git clone --quiet --depth 1 --branch "${KUBECTL_VERSION}" \
+      https://github.com/kubernetes/kubernetes /src/kubernetes \
+ && test "$(git -C /src/kubernetes rev-parse HEAD)" = "${KUBECTL_COMMIT}"
+WORKDIR /src/kubernetes
+RUN case "${TARGETARCH}" in \
+      amd64|arm64|ppc64le|s390x) goarm= ;; \
+      arm) goarm="${TARGETVARIANT#v}"; goarm="${goarm:-7}" ;; \
+      *) echo "unsupported kubectl architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
- && curl -fsSL "https://dl.k8s.io/release/v1.37.1/bin/linux/${kubectl_arch}/kubectl" \
-      -o /usr/local/bin/kubectl \
- && printf '%s  %s\n' "$kubectl_sha256" /usr/local/bin/kubectl | sha256sum -c - \
- && chmod +x /usr/local/bin/kubectl
+ && export GOFLAGS=-mod=mod GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" GOARM="${goarm}" \
+ && go get golang.org/x/net@v0.60.0 golang.org/x/text@v0.42.0 \
+ && v=k8s.io/component-base/version \
+ && go build -trimpath \
+      -ldflags "-s -w -X ${v}.gitVersion=${KUBECTL_VERSION} -X ${v}.gitMajor=1 -X ${v}.gitMinor=37 -X ${v}.gitTreeState=clean -X ${v}.gitCommit=${KUBECTL_COMMIT}" \
+      -o /usr/local/bin/kubectl ./cmd/kubectl
 
 FROM debian:trixie-slim
 RUN apt-get update \
