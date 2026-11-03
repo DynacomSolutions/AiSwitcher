@@ -137,3 +137,14 @@ ETA: 2026-11-05 18:00 ICT
 | 111 | Gateway ali route unproven: no ali identity on the host | parked | | | 4.109 | | Owner: dropped for now 2026-11-02.<br>Route code kept, unproven (no ali identity on host). |
 | 112 | Gateway: deferred review minors | done | claude-20261102-ai-gateway | ai-gateway-cleanup | 4.110 | | Merged #339 (e2dcb3f).<br>Includes `%2F` path-escape fix (Opus approved).<br>Image deploy via .cluster pin bump. |
 | 113 | Codex CLI via gateway | done | claude-20261103-codex-gw | codex-cli-gateway | 4.112 | | Route Codex CLI model traffic through the gateway.<br>App agents-codex, reserve 100, verified with codex exec.<br>New sessions only; running ones need restart. |
+
+## 5. Usage and limits accuracy across web, CLI and TUI
+ETA: 2026-11-03 20:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 114 | Kimi limits: show monthly windows from the `usages` block | in_progress | claude-20261103-usage-accuracy | kimi-monthly-usages | | 2026-11-03 15:00 ICT | Personal plan returns `usages.limit_month_total` and `limit_month_code` (100% used, resets 29 Nov).<br>Parser reads only `limits[]` and `usage`, so they vanish. |
+| 115 | Usage snapshot refresh failing since 31 Oct with source-error | in_progress | claude-20261103-usage-accuracy | usage-refresh-failing | | 2026-11-03 17:00 ICT | lastSuccessAt 2026-10-31 17:59Z; CLI and web both show 3-day-old data. |
+| 116 | Web Usage page: cost ignores the period filter but says all time | in_progress | claude-20261103-usage-accuracy | web-usage-cost-period | | 2026-11-03 17:00 ICT | Last 30 days hides 8 of 23 series, then sums their all-time cost: $132,710 vs CLI $161,420. |
+| 117 | `ais usage tui` starts from the AIS snapshot, not a full rescan | in_progress | claude-20261103-usage-accuracy | usage-tui-snapshot | | 2026-11-03 18:00 ICT | Tokscale TUI sits on Scanning session data for 45 s+. |
+| 118 | Redeploy ais console and auto-redeploy on every AIS release | in_progress | claude-20261103-usage-accuracy | ais-console-autodeploy | 5.116 | 2026-11-03 20:00 ICT | Pod image 2770df9 (28 Oct), 30 commits behind; `/api/gateway/usage` 404.<br>Wire gateway admin URL and token so the Gateway apps card shows. |
