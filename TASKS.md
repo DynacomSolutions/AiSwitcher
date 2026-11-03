@@ -143,8 +143,8 @@ ETA: 2026-11-03 20:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 114 | Kimi limits: show monthly windows from the `usages` block | in_progress | claude-20261103-usage-accuracy | kimi-monthly-usages | | 2026-11-03 15:00 ICT | Personal plan returns `usages.limit_month_total` and `limit_month_code` (100% used, resets 29 Nov).<br>Parser reads only `limits[]` and `usage`, so they vanish. |
+| 114 | Kimi limits: show monthly windows from the `usages` block | in_review | claude-20261103-usage-accuracy | kimi-monthly-usages | | 2026-11-03 14:30 ICT | Personal plan returns `usages.limit_month_total` and `limit_month_code` (100% used, resets 29 Nov).<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/345.<br>Parser reads only `limits[]` and `usage`, so they vanish. |
 | 115 | Usage snapshot refresh failing since 31 Oct with source-error | in_progress | claude-20261103-usage-accuracy | usage-refresh-failing | | 2026-11-03 17:00 ICT | lastSuccessAt 2026-10-31 17:59Z; CLI and web both show 3-day-old data. |
 | 116 | Web Usage page: cost ignores the period filter but says all time | in_progress | claude-20261103-usage-accuracy | web-usage-cost-period | | 2026-11-03 17:00 ICT | Last 30 days hides 8 of 23 series, then sums their all-time cost: $132,710 vs CLI $161,420. |
-| 117 | `ais usage tui` starts from the AIS snapshot, not a full rescan | in_progress | claude-20261103-usage-accuracy | usage-tui-snapshot | | 2026-11-03 18:00 ICT | Tokscale TUI sits on Scanning session data for 45 s+. |
+| 117 | `ais usage tui` starts from the AIS snapshot, not a full rescan | dropped | | | | | Dropped: owner chose to keep the current Tokscale TUI (2026-11-03).<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/346 closed. |
 | 118 | Redeploy ais console and auto-redeploy on every AIS release | in_progress | claude-20261103-usage-accuracy | ais-console-autodeploy | 5.116 | 2026-11-03 20:00 ICT | Pod image 2770df9 (28 Oct), 30 commits behind; `/api/gateway/usage` 404.<br>Wire gateway admin URL and token so the Gateway apps card shows. |
