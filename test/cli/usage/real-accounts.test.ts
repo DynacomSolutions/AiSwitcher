@@ -221,6 +221,19 @@ describe("swap pool usage attribution cache", () => {
     expect([2, 9]).toContain(usage[0]?.entries[0]?.output);
   });
 
+  test("per-day per-model totals sum to the member entry", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n${f.msg("two", 7)}\n`);
+    const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath });
+    const days = usage[0]!.dailyByModel["claude-opus-4-8"]!;
+    expect(days["2026-10-03"] ?? days[Object.keys(days)[0]!]).toBeDefined();
+    const all = [0, 0, 0, 0, 0, 0];
+    for (const v of Object.values(days)) v.forEach((n, i) => { all[i]! += n; });
+    expect(all.slice(0, 2)).toEqual([20, 9]);
+    expect(all[4]).toBe(2);
+    expect(all[5]).toBeCloseTo(usage[0]!.entries[0]!.cost, 9);
+  });
+
   test("discovery ENOENT races preserve the prior cache generation", async () => {
     const f = await fixture();
     await writeFile(f.transcript, `${f.msg("one", 2)}\n`);

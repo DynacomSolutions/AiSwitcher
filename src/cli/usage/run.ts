@@ -524,6 +524,23 @@ export async function defaultOpencodeProfileUsageResults(): Promise<UsageResult[
   }));
 }
 
+/** Per-day totals for a pool member. Cost per day is the list-price estimate of that day's
+ * messages, rescaled per model so the days sum to the cost the member's report carries. */
+function poolDailyTotals(usage: { entries: TokscaleEntry[]; dailyByModel: Record<string, DailyTotals> }): DailyTotals {
+  const totals: DailyTotals = {};
+  for (const [model, days] of Object.entries(usage.dailyByModel)) {
+    const reported = usage.entries.find((e) => e.model === model)?.cost ?? 0;
+    const estimated = Object.values(days).reduce((sum, v) => sum + v[5], 0);
+    const factor = estimated > 0 ? reported / estimated : 0;
+    for (const [day, v] of Object.entries(days)) {
+      const row = (totals[day] ??= [0, 0, 0, 0, 0, 0]);
+      for (let i = 0; i < 5; i++) row[i]! += v[i]!;
+      row[5]! += v[5]! * factor;
+    }
+  }
+  return totals;
+}
+
 /** Usage of every claude swap pool, charged to the member accounts that were
  * active (per the swap ledger) — a pool is not an account and gets no row.
  * Respects --tool / --identity (matched against the member). */
@@ -581,6 +598,7 @@ export async function swapPoolUsageResults(
         report: reportFromEntries(usage.entries),
         dateSpan: { firstMs: usage.firstMs, lastMs: usage.lastMs },
         dailyUsage: usage.dailyUsage,
+        dailyTotals: poolDailyTotals(usage),
       });
     }
     await onPoolDone?.(pool, results.slice(poolStart), undefined, nativeBatchCandidate);
