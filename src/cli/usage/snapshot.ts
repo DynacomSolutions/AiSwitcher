@@ -52,6 +52,8 @@ export interface UsageSnapshotPartition {
   lastAttemptAt: string;
   /** Identity no longer registered: results stay in totals, freshness ignores it. */
   retired?: true;
+  /** When the collector first saw the identity gone; cleared on return. */
+  retiredAt?: string;
   lastSuccessAt?: string;
   lastError?: string;
   lastErrorAt?: string;
@@ -463,7 +465,8 @@ function writeSnapshot(snapshot: UsageSnapshot, path = USAGE_SNAPSHOT_FILE): voi
     chmodSync(temporary, 0o600);
     renameSync(temporary, file);
     if (path === USAGE_SNAPSHOT_FILE) collectObsoleteNativeBatches(committed);
-    const successfulAt = Object.values(committed.partitions)
+    const activePartitions = Object.values(committed.partitions).filter((partition) => !partition.retired);
+    const successfulAt = activePartitions
       .map((partition) => partition.lastSuccessAt ? Date.parse(partition.lastSuccessAt) : undefined)
       .filter((value): value is number => value !== undefined && Number.isFinite(value));
     const status: UsageSnapshotMetricsStatus = {
@@ -480,7 +483,7 @@ function writeSnapshot(snapshot: UsageSnapshot, path = USAGE_SNAPSHOT_FILE): voi
         oldestSuccessAt: new Date(Math.min(...successfulAt)).toISOString(),
       } : {}),
       partitions: Object.keys(committed.partitions).length,
-      partitionsWithErrors: Object.values(committed.partitions).filter((partition) => partition.lastError).length,
+      partitionsWithErrors: activePartitions.filter((partition) => partition.lastError).length,
     };
     const statusFile = join(dirname(file), "status.json");
     const statusTemporary = `${statusFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -679,8 +682,8 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
   ];
   const liveKeys = new Set(candidateKeys);
   for (const [key, partition] of Object.entries(partitions)) {
-    if (liveKeys.has(key) || key.startsWith("special:")) delete partition.retired;
-    else partition.retired = true;
+    if (liveKeys.has(key) || key.startsWith("special:")) { delete partition.retired; delete partition.retiredAt; }
+    else { partition.retired = true; partition.retiredAt ??= attemptedAt; }
   }
   writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
   const dirtyDirectory = deps.dirtyDirectory ?? usageSnapshotDirtyDirectory;

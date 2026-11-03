@@ -324,6 +324,10 @@ describe("shared usage snapshot", () => {
     const snapshot = await refreshUsageSnapshot(multi(path, later, [target]));
     const retired = snapshot.partitions[usageSnapshotTargetKey("claude", "old")]!;
     expect(retired.retired).toBe(true);
+    expect(retired.retiredAt).toBe(new Date(later).toISOString());
+    const status = JSON.parse(await Bun.file(join(dirname(path), "status.json")).text());
+    expect(status.oldestSuccessAt).toBe(new Date(later).toISOString());
+    expect(status.partitions).toBe(3);
     expect(retired.results.length).toBe(1);
     expect(snapshot.partitions[usageSnapshotTargetKey("claude", "work")]!.retired).toBeUndefined();
     const envelope = readUsageSnapshotEnvelope(undefined, undefined, path, later + 1000)!;
@@ -331,6 +335,14 @@ describe("shared usage snapshot", () => {
     expect(envelope.pending).toBe(false);
     expect(envelope.lastSuccessAt).not.toBe(retired.lastSuccessAt);
     expect((envelope.results as UsageResult[]).reduce((sum, row) => sum + row.report!.totalMessages, 0)).toBe(6);
+  });
+
+  test("a current partition that is old still makes the envelope stale", async () => {
+    const path = await snapshotFile();
+    const t0 = Date.UTC(2026, 0, 1);
+    await refreshUsageSnapshot(multi(path, t0, [target, oldTarget]));
+    const envelope = readUsageSnapshotEnvelope(undefined, undefined, path, t0 + 9 * 24 * 3_600_000)!;
+    expect(envelope.stale).toBe(true);
   });
 
   test("a retired partition whose target returns is un-retired and refreshed", async () => {
@@ -342,6 +354,7 @@ describe("shared usage snapshot", () => {
     const snapshot = await refreshUsageSnapshot(multi(path, back, [target, oldTarget]));
     const revived = snapshot.partitions[usageSnapshotTargetKey("claude", "old")]!;
     expect(revived.retired).toBeUndefined();
+    expect(revived.retiredAt).toBeUndefined();
     expect(Date.parse(revived.lastSuccessAt!)).toBe(back);
   });
 
