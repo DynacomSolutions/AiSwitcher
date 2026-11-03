@@ -67,7 +67,15 @@ export interface KimiBoosterWalletWire {
   monthlyUsed?: KimiMoneyWire;
 }
 
+/** One entry of the `usages` map: a 0..1 ratio plus a reset instant without
+ * fractional seconds (confirmed live 2026-11-03). */
+export interface KimiUsagesMapEntryWire {
+  used_ratio?: number;
+  reset_time?: string;
+}
+
 export interface KimiUsagesResponseWire {
+  usages?: Record<string, KimiUsagesMapEntryWire>;
   user?: { membership?: { level?: string } };
   usage?: KimiUsageDetailWire;
   limits?: KimiUsageWindowWire[];
@@ -183,6 +191,28 @@ function resetMs(resetTime: string | undefined): { resetsAtMs?: number } {
   return Number.isNaN(ms) ? {} : { resetsAtMs: ms };
 }
 
+/** Label and category for a `usages` map key: the known keys first, then a
+ * name-based guess (`limit_<N>h`, `limit_<N>d`, "week"/"month" words); an
+ * unrecognizable key yields undefined and is skipped. */
+function labelAndCategoryForUsagesKey(key: string): { label: string; category: LimitCategory } | undefined {
+  switch (key) {
+    case "limit_5h":
+      return { label: "session", category: "session" };
+    case "limit_7d":
+      return { label: "week", category: "week" };
+    case "limit_month_total":
+      return { label: "month", category: "month" };
+    case "limit_month_code":
+      return { label: "month (code)", category: "month" };
+  }
+  const duration = /^limit_(\d+)([hd])$/.exec(key);
+  if (duration) return labelAndCategoryFor(Number(duration[1]) * (duration[2] === "d" ? 1440 : 60));
+  const lower = key.toLowerCase();
+  if (lower.includes("month")) return { label: key.replace(/^limit_/, "").replace(/_/g, " "), category: "month" };
+  if (lower.includes("week")) return { label: key.replace(/^limit_/, "").replace(/_/g, " "), category: "week" };
+  return undefined;
+}
+
 /** Pure mapping from the wire shape to display windows, exported so tests
  * can exercise it without any network. Each `limits[]` entry becomes one
  * window; the top-level weekly `usage` block becomes one more ("week"),
@@ -207,6 +237,32 @@ export function windowsFromUsagesResponse(resp: KimiUsagesResponseWire): LimitWi
       const duplicate = windows.some((w) => w.usedPercent === usedPercent && w.resetsAt === resetsAt);
       if (!duplicate) windows.push({ label: "week", category: "week", usedPercent, resetsAt, ...resetMs(usage.resetTime) });
     }
+  }
+
+  // The `usages` map repeats the session/week windows (reset_time lacks the
+  // fractional seconds, so compare within a minute) and adds the monthly
+  // ones. Dedupe only against the windows above, never among map entries:
+  // month_total and month_code legitimately share a reset instant.
+  const fromLimits = [...windows];
+  for (const [key, entry] of Object.entries(resp.usages ?? {})) {
+    const ratio = entry?.used_ratio;
+    if (typeof ratio !== "number" || !Number.isFinite(ratio)) continue;
+    const mapped = labelAndCategoryForUsagesKey(key);
+    if (!mapped) continue;
+    const reset = resetMs(entry.reset_time).resetsAtMs;
+    const duplicate = fromLimits.some(
+      (w) =>
+        w.category === mapped.category &&
+        (reset === undefined || w.resetsAtMs === undefined ? false : Math.abs(w.resetsAtMs - reset) < 60_000),
+    );
+    if (duplicate) continue;
+    windows.push({
+      label: mapped.label,
+      category: mapped.category,
+      usedPercent: Math.min(100, Math.max(0, ratio * 100)),
+      resetsAt: formatResetsAt(entry.reset_time),
+      ...resetMs(entry.reset_time),
+    });
   }
   return windows;
 }

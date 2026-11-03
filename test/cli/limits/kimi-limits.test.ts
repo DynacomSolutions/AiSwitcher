@@ -116,6 +116,69 @@ describe("windowsFromUsagesResponse", () => {
   });
 });
 
+describe("windowsFromUsagesResponse usages map", () => {
+  const limits = [
+    {
+      window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
+      detail: { limit: "100", remaining: "100", resetTime: "2026-11-03T09:24:53.795742Z" },
+    },
+  ];
+
+  test("individual-account payload: session from limits[] plus both monthly windows", () => {
+    const payload: KimiUsagesResponseWire = {
+      limits,
+      usages: {
+        limit_5h: { used_ratio: 0, reset_time: "2026-11-03T09:24:53Z" },
+        limit_month_total: { used_ratio: 1, reset_time: "2026-11-29T00:00:00Z" },
+        limit_month_code: { used_ratio: 1, reset_time: "2026-11-29T00:00:00Z" },
+      },
+    };
+    const windows = windowsFromUsagesResponse(payload);
+    expect(windows.map((w) => [w.label, w.category, w.usedPercent])).toEqual([
+      ["session", "session", 0],
+      ["month", "month", 100],
+      ["month (code)", "month", 100],
+    ]);
+    expect(windows[1]?.resetsAtMs).toBe(new Date("2026-11-29T00:00:00Z").getTime());
+  });
+
+  test("team-account payload: usages duplicates dedupe to exactly session + week", () => {
+    const payload: KimiUsagesResponseWire = {
+      usage: { limit: "100", used: "100", resetTime: "2026-11-06T03:31:45.259929Z" },
+      limits: [
+        {
+          window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" },
+          detail: { limit: "100", remaining: "100", resetTime: "2026-11-03T07:31:44.5Z" },
+        },
+      ],
+      usages: {
+        limit_5h: { used_ratio: 0, reset_time: "2026-11-03T07:31:44Z" },
+        limit_7d: { used_ratio: 1, reset_time: "2026-11-06T03:31:45Z" },
+      },
+    };
+    const windows = windowsFromUsagesResponse(payload);
+    expect(windows.map((w) => [w.label, w.usedPercent])).toEqual([
+      ["session", 0],
+      ["week", 100],
+    ]);
+  });
+
+  test("usages-only week, inferred and unknown keys", () => {
+    const windows = windowsFromUsagesResponse({
+      usages: {
+        limit_7d: { used_ratio: 0.5, reset_time: "2026-11-06T03:31:45Z" },
+        limit_30d: { used_ratio: 0.25, reset_time: "2026-11-29T00:00:00Z" },
+        limit_mystery: { used_ratio: 0.9, reset_time: "2026-11-29T00:00:00Z" },
+        limit_bad: { used_ratio: Number.NaN },
+      },
+    });
+    expect(windows.map((w) => [w.label, w.category, w.usedPercent])).toEqual([
+      ["week", "week", 50],
+      ["month", "month", 25],
+    ]);
+  });
+});
+
 describe("overageFromBoosterWallet", () => {
   test("no monthlyUsed field at all yields undefined (never used Extra Usage)", () => {
     expect(overageFromBoosterWallet(undefined)).toBeUndefined();
