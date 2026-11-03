@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { ResponsiveBar } from "@nivo/bar";
 import type { BarTooltipProps } from "@nivo/bar";
 
-import { IdentityChip, ToolBadge } from "@/components/badges";
+import { IdentityChip } from "@/components/badges";
 import { ProviderIcon, ProviderLabel } from "@/components/provider-icon";
 import { UsageDataStatus } from "@/components/usage-data-status";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
@@ -32,11 +32,11 @@ import {
 } from "@/components/ui/table";
 import { useGatewayUsageQuery, useUsageQuery } from "@/hooks/queries";
 import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
+import { applyPeriod, periodLabel, withinSince, type SinceDays } from "@/lib/usage-period";
 import { classifyUsageError, hasPartialUsageCoverage, usageErrorLabel } from "@/lib/usage-summary";
 import type { RealCostInfo, TokscaleEntry, UsageResult } from "@/types/api";
 
 type Granularity = "day" | "week" | "month";
-type SinceDays = 7 | 30 | 90 | 0;
 
 const GRANULARITIES: { value: Granularity; label: string }[] = [
   { value: "day", label: "Daily" },
@@ -56,12 +56,6 @@ const CHART_PALETTE = ["#8b5cf6", "#22d3ee", "#f59e0b", "#34d399", "#f472b6", "#
 interface Bucket {
   [key: string]: string | number;
   date: string;
-}
-
-function withinSince(dateKey: string, since: SinceDays): boolean {
-  if (since === 0) return true;
-  const cutoff = Date.now() - since * 86_400_000;
-  return dateKey >= formatDateMs(cutoff);
 }
 
 function bucketKey(dateKey: string, granularity: Granularity): string {
@@ -88,17 +82,12 @@ function sumReport(results: UsageResult[], pick: (report: NonNullable<UsageResul
 
 function filterResults(
   results: UsageResult[],
-  filters: { provider: string; tool: string; identity: string; model: string; since: SinceDays },
+  filters: { provider: string; identity: string; model: string },
 ): UsageResult[] {
   return results.filter((result) => {
     if (filters.provider !== "all" && result.provider !== filters.provider) return false;
-    if (filters.tool !== "all" && (result.sourceTool ?? "unknown") !== filters.tool) return false;
     if (filters.identity !== "all" && result.identity.name !== filters.identity) return false;
     if (filters.model !== "all" && !result.report?.entries.some((e) => e.model === filters.model)) return false;
-    if (filters.since !== 0 && result.dailyUsage) {
-      const keys = Object.keys(result.dailyUsage);
-      if (keys.length > 0 && !keys.some((k) => withinSince(k, filters.since))) return false;
-    }
     return true;
   });
 }
@@ -414,19 +403,17 @@ export function UsagePage() {
   const results = query.data?.results ?? [];
 
   const [provider, setProvider] = useState("all");
-  const [tool, setTool] = useState("all");
   const [identity, setIdentity] = useState("all");
   const [model, setModel] = useState("all");
   const [since, setSince] = useState<SinceDays>(30);
   const [granularity, setGranularity] = useState<Granularity>("day");
 
   const filtered = useMemo(
-    () => filterResults(results, { provider, tool, identity, model, since }),
-    [results, provider, tool, identity, model, since],
+    () => filterResults(results, { provider, identity, model }),
+    [results, provider, identity, model],
   );
 
   const providerOptions = useMemo(() => uniqueSorted(results.map((r) => r.provider)), [results]);
-  const toolOptions = useMemo(() => uniqueSorted(results.map((r) => r.sourceTool ?? "unknown")), [results]);
   const identityOptions = useMemo(() => uniqueSorted(results.map((r) => r.identity.name)), [results]);
   const modelOptions = useMemo(
     () => uniqueSorted(results.flatMap((r) => r.report?.entries.map((e) => e.model) ?? [])),
@@ -436,28 +423,31 @@ export function UsagePage() {
   const buckets = useMemo(() => buildBuckets(filtered, granularity, since), [filtered, granularity, since]);
   const bucketProviders = useMemo(() => perProviderIn(filtered, since).slice(0, 5), [filtered, since]);
 
-  const modelRows = useMemo(() => buildModelRows(filtered), [filtered]);
-  const totalCost = sumReport(filtered, (r) => r.totalCost);
-  const totalInput = sumReport(filtered, (r) => r.totalInput);
-  const totalOutput = sumReport(filtered, (r) => r.totalOutput);
-  const totalCacheRead = sumReport(filtered, (r) => r.totalCacheRead);
-  const totalCacheWrite = sumReport(filtered, (r) => r.totalCacheWrite);
-  const totalMessages = sumReport(filtered, (r) => r.totalMessages);
-  const hasAnyReport = filtered.some((r) => r.report !== undefined);
-  const hasPartialCoverage = hasPartialUsageCoverage(results, { provider, tool, identity });
+  // Every figure below follows the selected period. "All time" leaves the
+  // reports untouched, so it matches the CLI's TOTAL row exactly.
+  const { rows: shown, withoutHistory } = useMemo(() => applyPeriod(filtered, since), [filtered, since]);
+  const period = periodLabel(since);
+  const modelRows = useMemo(() => buildModelRows(shown), [shown]);
+  const totalCost = sumReport(shown, (r) => r.totalCost);
+  const totalInput = sumReport(shown, (r) => r.totalInput);
+  const totalOutput = sumReport(shown, (r) => r.totalOutput);
+  const totalCacheRead = sumReport(shown, (r) => r.totalCacheRead);
+  const totalCacheWrite = sumReport(shown, (r) => r.totalCacheWrite);
+  const totalMessages = sumReport(shown, (r) => r.totalMessages);
+  const hasAnyReport = shown.some((r) => r.report !== undefined);
+  const hasPartialCoverage = hasPartialUsageCoverage(results, { provider, tool: "all", identity });
   // Real AWS spend is summarised separately from the estimate total: only
   // rows whose Cost Explorer query actually answered contribute (an
   // unavailable figure must not read as a confirmed zero).
-  const realTotal = filtered.reduce((sum, r) => (typeof r.realCost?.monthToDateUsd === "number" ? sum + r.realCost.monthToDateUsd : sum), 0);
-  const hasRealTotal = filtered.some((r) => typeof r.realCost?.monthToDateUsd === "number");
+  const realTotal = shown.reduce((sum, r) => (typeof r.realCost?.monthToDateUsd === "number" ? sum + r.realCost.monthToDateUsd : sum), 0);
+  const hasRealTotal = shown.some((r) => typeof r.realCost?.monthToDateUsd === "number");
 
   const reset = () => {
     setProvider("all");
-    setTool("all");
     setIdentity("all");
     setModel("all");
   };
-  const hasActiveFilter = provider !== "all" || tool !== "all" || identity !== "all" || model !== "all";
+  const hasActiveFilter = provider !== "all" || identity !== "all" || model !== "all";
 
   return (
     <div className="space-y-5">
@@ -489,7 +479,6 @@ export function UsagePage() {
         <>
           <div className="flex flex-wrap items-center gap-2">
             <FilterSelect label="Provider" value={provider} onChange={setProvider} options={[{ value: "all", label: "All providers" }, ...providerOptions.map((p) => ({ value: p, label: p }))]} />
-            <FilterSelect label="Tool" value={tool} onChange={setTool} options={[{ value: "all", label: "All tools" }, ...toolOptions.map((t) => ({ value: t, label: t }))]} />
             <FilterSelect label="Identity" value={identity} onChange={setIdentity} options={[{ value: "all", label: "All identities" }, ...identityOptions.map((i) => ({ value: i, label: i }))]} />
             <FilterSelect label="Model" value={model} onChange={setModel} options={[{ value: "all", label: "All models" }, ...modelOptions.map((m) => ({ value: m, label: m }))]} width="w-52" />
             <FilterSelect label="Period" value={String(since)} onChange={(v) => setSince(Number(v) as SinceDays)} options={SINCE_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))} width="w-32" />
@@ -499,17 +488,27 @@ export function UsagePage() {
               </Button>
             ) : null}
             <span className="ml-auto text-xs text-muted-foreground">
-              {filtered.length} of {results.length} series
+              {shown.length} of {results.length} series
             </span>
           </div>
 
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-            <StatCard label="Input tokens" value={formatTokens(totalInput)} />
-            <StatCard label="Output tokens" value={formatTokens(totalOutput)} />
-            <StatCard label="Cache tokens" value={formatTokens(totalCacheRead + totalCacheWrite)} sub="reads + writes" />
-            <StatCard label="Messages" value={totalMessages.toLocaleString()} />
-            <StatCard label="Est. cost (all time)" value={formatMoney(totalCost)} sub={since === 0 ? "for selected sources" : "period filters token series only"} />
+            <StatCard label="Input tokens" value={formatTokens(totalInput)} sub={period} />
+            <StatCard label="Output tokens" value={formatTokens(totalOutput)} sub={period} />
+            <StatCard label="Cache tokens" value={formatTokens(totalCacheRead + totalCacheWrite)} sub={`reads + writes, ${period}`} />
+            <StatCard label="Messages" value={totalMessages.toLocaleString()} sub={period} />
+            <StatCard label={`Est. cost (${period})`} value={formatMoney(totalCost)} sub={since === 0 ? "for selected sources" : "pro-rated by daily token share"} />
           </div>
+          {since !== 0 ? (
+            <p className="text-xs text-muted-foreground">
+              Totals cover the {period}. The API holds cost and token counts for each series' whole history and only
+              input plus output tokens per day, so period figures are pro-rated by each series' share of those daily
+              tokens. Choose All time for the exact figures that <span className="font-mono">ais usage</span> shows.
+              {withoutHistory > 0
+                ? ` ${withoutHistory} ${withoutHistory === 1 ? "series has" : "series have"} no daily history and only count under All time.`
+                : ""}
+            </p>
+          ) : null}
 
           {buckets.length > 0 ? (
             <Card className="gap-3">
@@ -542,7 +541,7 @@ export function UsagePage() {
             <Card className="gap-3">
               <CardHeader>
                 <CardTitle className="text-base">By model</CardTitle>
-                <CardDescription>Per-model totals across the filtered set.</CardDescription>
+                <CardDescription>Per-model totals across the filtered set, {period}.</CardDescription>
               </CardHeader>
               <CardContent className="px-0">
                 <Table>
@@ -553,7 +552,7 @@ export function UsagePage() {
                       <TableHead className="text-right">Input</TableHead>
                       <TableHead className="text-right">Output</TableHead>
                       <TableHead className="text-right">Messages</TableHead>
-                      <TableHead className="text-right">Est. cost (all time)</TableHead>
+                      <TableHead className="text-right">Est. cost ({period})</TableHead>
                       <TableHead className="w-40">Share</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -598,7 +597,6 @@ export function UsagePage() {
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead>Provider</TableHead>
-                  <TableHead>Tool</TableHead>
                   <TableHead>Identity</TableHead>
                   <TableHead>Span</TableHead>
                   <TableHead className="text-right">Input</TableHead>
@@ -606,18 +604,15 @@ export function UsagePage() {
                   <TableHead className="text-right">Cache read</TableHead>
                   <TableHead className="text-right">Cache write</TableHead>
                   <TableHead className="text-right">Messages</TableHead>
-                  <TableHead className="text-right">Est. cost (all time)</TableHead>
+                  <TableHead className="text-right">Est. cost ({period})</TableHead>
                   <TableHead>Notes</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filtered.flatMap((r, index) => [
+                {shown.flatMap((r, index) => [
                   <TableRow key={`${r.provider}/${r.identity.name}/${index}`}>
                     <TableCell className="font-medium">
                       <ProviderLabel provider={r.provider} />
-                    </TableCell>
-                    <TableCell>
-                      <ToolBadge tool={r.sourceTool ?? "unknown"} />
                     </TableCell>
                     <TableCell>
                       <span className="flex items-center gap-1.5">
@@ -656,7 +651,7 @@ export function UsagePage() {
                   // spend never sits in the Est. cost column.
                   r.realCost ? (
                     <TableRow key={`${r.provider}/${r.identity.name}/${index}/real`} className="hover:bg-transparent">
-                      <TableCell colSpan={2} className="border-none py-1" />
+                      <TableCell className="border-none py-1" />
                       <TableCell className="border-none py-1 text-xs text-muted-foreground">└ {r.realCost.label}</TableCell>
                       <TableCell className="border-none py-1" />
                       <RealSubDashCells />
@@ -668,8 +663,8 @@ export function UsagePage() {
                   ) : null,
                 ])}
                 <TableRow className="border-t-2 hover:bg-transparent">
-                  <TableCell colSpan={4} className="font-semibold">
-                    {hasPartialCoverage ? "PARTIAL TOTAL (all-time estimate)" : "TOTAL (all-time estimate)"}
+                  <TableCell colSpan={3} className="font-semibold">
+                    {hasPartialCoverage ? `PARTIAL TOTAL (${period} estimate)` : `TOTAL (${period} estimate)`}
                   </TableCell>
                   <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalInput)}</TableCell>
                   <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalOutput)}</TableCell>
@@ -681,7 +676,7 @@ export function UsagePage() {
                 </TableRow>
                 {hasRealTotal ? (
                   <TableRow className="hover:bg-transparent">
-                    <TableCell colSpan={2} className="border-none py-1" />
+                    <TableCell className="border-none py-1" />
                     <TableCell className="border-none py-1 text-xs text-muted-foreground">└ real AWS total</TableCell>
                     <TableCell className="border-none py-1" />
                     <RealSubDashCells />
