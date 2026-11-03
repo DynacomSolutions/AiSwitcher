@@ -52,6 +52,7 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "no-color.org", reason: "NO_COLOR convention this CLI implements, cited in a comment (src/cli/colors.ts)" },
   { domain: "tokscale.ai", reason: "upstream Tokscale Pi client logo URL preserved in the pinned v4.20.0 patch (vendor/tokscale/patches/v4.20.0-ais.patch)" },
   { domain: "k8s.io", reason: "official Kubernetes release download used by the image build (Dockerfile)" },
+  { domain: "golang.org", reason: "Go module paths (golang.org/x/net, golang.org/x/text) bumped when building kubectl from source in the Dockerfile; not a network endpoint" },
   { domain: "kubernetes.io", reason: "well-known Kubernetes label-key namespace, e.g. kubernetes.io/hostname (k8s/deployment.yaml)" },
   { domain: "getambassador.io", reason: "Emissary-ingress Mapping API group used in apiVersion fields (k8s/*.yaml)" },
   { domain: "w3.org", reason: "SVG namespace URI required by the SVG spec, not a network endpoint (apps/web/index.html)" },
