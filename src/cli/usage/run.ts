@@ -541,6 +541,13 @@ function poolDailyTotals(usage: { entries: TokscaleEntry[]; dailyByModel: Record
   return totals;
 }
 
+/** The snapshot only persists a safe category ("source-error"), so the reason a source failed
+ * would otherwise be lost. Log it to stderr (the service journal) instead. */
+export function logUsageSourceFailure(source: string, reason: unknown): void {
+  const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason ?? "unknown");
+  console.warn(`Usage source failed: ${source}: ${detail}`);
+}
+
 /** Usage of every claude swap pool, charged to the member accounts that were
  * active (per the swap ledger) — a pool is not an account and gets no row.
  * Respects --tool / --identity (matched against the member). */
@@ -571,7 +578,9 @@ export async function swapPoolUsageResults(
     const tokens = (e: TokscaleEntry) => e.input + e.output + e.cacheRead + e.cacheWrite;
     let nativeBatchCandidate: UsageResult["nativeBatchCandidate"];
     const poolSourceResults = await tokscaleForPool({ toolName: "claude", identity: pool }, { explicitTool: false });
-    if (poolSourceResults.some((result) => result.error || result.sourceOnlyError)) {
+    const sourceFailure = poolSourceResults.find((result) => result.error || result.sourceOnlyError);
+    if (sourceFailure) {
+      logUsageSourceFailure(`pool ${pool.name} tokscale`, sourceFailure.error);
       await onPoolDone?.(pool, [], true);
       continue;
     }
@@ -602,7 +611,8 @@ export async function swapPoolUsageResults(
       });
     }
     await onPoolDone?.(pool, results.slice(poolStart), undefined, nativeBatchCandidate);
-    } catch {
+    } catch (error) {
+      logUsageSourceFailure(`pool ${pool.name} attribution`, error);
       await onPoolDone?.(pool, [], true);
     }
   }
