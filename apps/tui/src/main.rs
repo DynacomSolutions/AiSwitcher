@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
             if args.iter().any(|arg| arg == "--overview") {
                 runtime.block_on(overview::run(terminal, settings))
             } else {
-                runtime.block_on(app::run(terminal, settings))
+                runtime.block_on(app::run(terminal, settings, app::start_tab(&args)))
             }
         }
     };

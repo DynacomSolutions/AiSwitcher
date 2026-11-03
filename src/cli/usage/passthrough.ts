@@ -1,6 +1,7 @@
 import { execReal } from "../../shared/exec.ts";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
+import { runTuiCommand } from "../tui.ts";
 import { collectTargets, shouldIncludeDefaultOpencodeProfile } from "./run.ts";
 import {
   prepareMergedPassthrough,
@@ -35,6 +36,14 @@ import {
  * requires exactly one match — pass --tool= too when an identity name is
  * configured for more than one tool.
  */
+/** A bare `ais usage tui` (no Tokscale flags) renders from the AIS collector
+ * snapshot via aistui's Usage tab. Tokscale's own TUI loads every native
+ * batch (5 GB, about 50 s) before its first data frame, so it is kept only
+ * for invocations that pass Tokscale-specific flags such as `--since`. */
+export function isBareUsageTui(tokscaleArgs: string[]): boolean {
+  return tokscaleArgs.length === 1 && tokscaleArgs[0] === "tui";
+}
+
 export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: string[]): Promise<never> {
   if (tokscaleArgs[0] === "tui") {
     if (stringFlag(flags, "identity") !== undefined) {
@@ -42,6 +51,11 @@ export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: s
     }
     if (stringFlag(flags, "tool") !== undefined) {
       throw new CliUsageError("--tool cannot select one partition in shared Tokscale TUI mode");
+    }
+
+    if (isBareUsageTui(tokscaleArgs)) {
+      await runTuiCommand([], {}, ["--tab=usage"]);
+      process.exit(0);
     }
 
     let shared: Awaited<ReturnType<typeof resolveAisTokscaleSharedTui>>;

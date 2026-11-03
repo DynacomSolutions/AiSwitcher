@@ -12,7 +12,11 @@ export { resolveTuiBinary } from "../shared/aistui-bin.ts";
  * binary against it with the URL and bearer token in env. The TUI itself is
  * a Rust crate under apps/tui; this launcher never blocks on SSH or sync
  * work. */
-export async function runTuiCommand(_positionals: string[], _flags: Record<string, string | true>): Promise<void> {
+export async function runTuiCommand(
+  _positionals: string[],
+  _flags: Record<string, string | true>,
+  tuiArgs: string[] = [],
+): Promise<void> {
   const { ensureConsoleRunning } = await import("./web.ts");
   const port = await ensureConsoleRunning();
   const state = await readServerState();
@@ -35,7 +39,7 @@ export async function runTuiCommand(_positionals: string[], _flags: Record<strin
     );
   }
 
-  const proc = Bun.spawn([bin], {
+  const proc = Bun.spawn([bin, ...tuiArgs], {
     env: {
       ...process.env,
       AIS_CONSOLE_URL: `http://127.0.0.1:${port}`,

@@ -493,7 +493,16 @@ fn drain_input(event_rx: &mut mpsc::UnboundedReceiver<Event>) {
     }
 }
 
-pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()> {
+/// Initial tab from a `--tab=<name>` argument (case-insensitive tab name),
+/// so `ais usage tui` can open straight on the Usage tab.
+pub fn start_tab(args: &[String]) -> Option<usize> {
+    let wanted = args.iter().find_map(|arg| arg.strip_prefix("--tab="))?;
+    TAB_NAMES
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(wanted))
+}
+
+pub async fn run(mut terminal: DefaultTerminal, settings: Settings, start_tab: Option<usize>) -> Result<()> {
     let client =
         Arc::new(ConsoleClient::new(settings.clone()).context("failed to build HTTP client")?);
 
@@ -535,6 +544,9 @@ pub async fn run(mut terminal: DefaultTerminal, settings: Settings) -> Result<()
     });
 
     let mut app = App::new(&settings);
+    if let Some(tab) = start_tab {
+        app.tab = tab;
+    }
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
 
     loop {
@@ -604,6 +616,16 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         handle_key(app, key(code), &[]);
+    }
+
+    #[test]
+    fn start_tab_parses_name_and_rejects_unknown() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(start_tab(&args(&["--tab=usage"])), Some(4));
+        assert_eq!(start_tab(&args(&["--tab=Local Models"])), Some(2));
+        assert_eq!(start_tab(&args(&["--overview", "--tab=help"])), Some(8));
+        assert_eq!(start_tab(&args(&["--tab=nope"])), None);
+        assert_eq!(start_tab(&args(&[])), None);
     }
 
     #[test]

@@ -2,6 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isBareUsageTui } from "../../../src/cli/usage/passthrough.ts";
+
+describe("isBareUsageTui", () => {
+  test("only a lone tui uses the snapshot-backed aistui Usage tab", () => {
+    expect(isBareUsageTui(["tui"])).toBe(true);
+    expect(isBareUsageTui(["tui", "--since", "2026-01-01"])).toBe(false);
+    expect(isBareUsageTui(["monthly"])).toBe(false);
+  });
+});
 
 describe("ais usage tui argv", () => {
   test.skipIf(process.platform === "win32")("hands snapshot flag, tui and extras to the shared tokscale binary", async () => {
