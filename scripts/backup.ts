@@ -93,7 +93,9 @@ interface GitResult {
 // Hooks, fsmonitor, a global/root excludes file and attributes (autocrlf,
 // filters) must never act on a snapshot of $HOME: they could run arbitrary
 // code from the user's global config or silently change what is stored.
-const SAFE_GIT_CONFIG = [
+// Auto gc/maintenance is also off: a commit in the 100 GB home repo once triggered
+// `git gc --auto`, whose pack-objects ran for hours and blocked every host install.
+export const SAFE_GIT_CONFIG = [
   "core.hooksPath=/dev/null",
   "core.fsmonitor=false",
   "core.excludesFile=/dev/null",
@@ -101,6 +103,8 @@ const SAFE_GIT_CONFIG = [
   "core.autocrlf=false",
   // Never Git LFS, even if the user ran `git lfs install` globally.
   "filter.lfs.required=false",
+  "gc.auto=0",
+  "maintenance.auto=false",
 ].flatMap((kv) => ["-c", kv]);
 
 /** Thrown when the overall backup time budget runs out and the running git was killed. */

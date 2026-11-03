@@ -5,7 +5,7 @@ import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes, writeFile } from 
 import { existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addRetryingVanished, loadBackupConfig, runBackup } from "../scripts/backup.ts";
+import { addRetryingVanished, loadBackupConfig, runBackup, SAFE_GIT_CONFIG } from "../scripts/backup.ts";
 import { acquirePidLock } from "../src/shared/pid-lock.ts";
 
 const tempDirs: string[] = [];
@@ -1002,5 +1002,14 @@ describe("runBackup shallow push and vanished files", () => {
       expect(errs.some((l) => l.includes("WARNING: SQLite snapshot of") && l.includes("locked.sqlite"))).toBe(true);
       expect(existsSync(join(home, ".ais", "backups-sqlite", setsOf(home)[0]!, ".codex", "locked.sqlite"))).toBe(false);
     }, 60_000);
+  });
+});
+
+describe("backup git config", () => {
+  test("every backup git command disables auto gc and auto maintenance", () => {
+    const pairs = SAFE_GIT_CONFIG.flatMap((arg, i) => (arg === "-c" ? [SAFE_GIT_CONFIG[i + 1]] : []));
+    expect(pairs).toContain("gc.auto=0");
+    expect(pairs).toContain("maintenance.auto=false");
+    expect(pairs).toContain("core.hooksPath=/dev/null");
   });
 });
