@@ -4,7 +4,7 @@ import { PollCache } from "./expensive.ts";
 import { aisCacheDir } from "../shared/ais-home.ts";
 import { CliUsageError } from "../cli/errors.ts";
 import { collectTargets, pendingUsageResult } from "../cli/usage/run.ts";
-import { tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
+import { tokscaleExportTimeoutMs, tokscaleSpawnTimeoutMs } from "../cli/usage/tokscale.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { runScan, type ScanKind, type ScanRequest, type ScanResult } from "./scan-worker.ts";
 import { scanMetric } from "./scan-metrics.ts";
@@ -160,7 +160,8 @@ export function scanTimeoutAboveTokscale(baseMs: number): number {
 }
 
 export function usageSnapshotRefreshTimeoutMs(): number {
-  return scanTimeoutAboveTokscale(30 * 60_000);
+  // One cycle runs every source in turn and the swap pool export alone may take tokscaleExportTimeoutMs().
+  return Math.max(scanTimeoutAboveTokscale(60 * 60_000), tokscaleExportTimeoutMs() + 35 * 60_000);
 }
 
 /** Run one source cycle and turn transport failures into a safe persisted
@@ -554,7 +555,11 @@ async function spawnScanWorkerNow<T>(
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const output = new Response(proc.stdout).text();
-    const stderr = new Response(proc.stderr).text().catch(() => "");
+    const stderr = new Response(proc.stderr).text().then((text) => {
+      // The worker's diagnostics (why a usage source failed) are otherwise lost whenever it still prints valid JSON.
+      if (text.trim()) process.stderr.write(text.endsWith("\n") ? text : `${text}\n`);
+      return text;
+    }).catch(() => "");
     const deadline = new Promise<null>((resolve) => {
       timer = setTimeout(() => resolve(null), timeoutMs);
     });

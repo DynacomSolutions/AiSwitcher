@@ -202,7 +202,7 @@ export async function buildAisTokscaleExportInvocation(
 export async function runAisTokscaleExportInvocation(invocation: AisTokscaleExportInvocation): Promise<string> {
   if (invocation.signal?.aborted) throw new Error("native-export-aborted");
   return withTokscaleProcessSlot(() =>
-    spawnTokscaleProcess(invocation.command, [], [...invocation.args, "--json"], invocation.env));
+    spawnTokscaleProcess(invocation.command, [], [...invocation.args, "--json"], invocation.env, tokscaleExportTimeoutMs()));
 }
 
 /** Resolve the installed AIS-patched binary and authoritative manifest for
@@ -684,6 +684,19 @@ export function tokscaleSpawnTimeoutMs(): number {
   if (!/^\d+$/.test(raw)) return DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS;
   const parsed = Number.parseInt(raw, 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS;
+}
+
+/** A native export writes the full message envelope (hundreds of MB for the swap pool) and the
+ * collector service runs throttled (MemoryHigh, IO bandwidth caps), so it needs more headroom than a
+ * plain report before a kill turns the partition into an error. The ceiling is never below the plain
+ * tokscale one; AIS_TOKSCALE_EXPORT_TIMEOUT_MS overrides the default. */
+export const DEFAULT_TOKSCALE_EXPORT_TIMEOUT_MS = 25 * 60 * 1000;
+
+export function tokscaleExportTimeoutMs(): number {
+  const raw = process.env.AIS_TOKSCALE_EXPORT_TIMEOUT_MS?.trim() ?? "";
+  const parsed = /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0;
+  const configured = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_TOKSCALE_EXPORT_TIMEOUT_MS;
+  return Math.max(configured, tokscaleSpawnTimeoutMs());
 }
 
 /** Message for a tokscale child that outlived the ceiling. Names the env var
