@@ -4,7 +4,7 @@ import { estimateDetailedModelTokenCost } from "../../identities/model-pricing.t
 import type { Identity } from "../../identities/types.ts";
 import { localDateKey } from "./local-day.ts";
 import { canonicalUsageProvider } from "./providers.ts";
-import type { DateSpan, TokscaleEntry, TokscaleReport } from "./tokscale.ts";
+import { addDailyTotals, type DailyTotals, type DateSpan, type TokscaleEntry, type TokscaleReport } from "./tokscale.ts";
 
 export interface PiProviderUsage {
   provider: string;
@@ -15,6 +15,7 @@ export interface PiProviderUsage {
   report: TokscaleReport;
   dateSpan: DateSpan;
   dailyUsage: Record<string, number>;
+  dailyTotals: DailyTotals;
 }
 
 interface PiAttribution {
@@ -34,6 +35,7 @@ interface MutableProviderUsage {
   firstMs: number;
   lastMs: number;
   dailyUsage: Record<string, number>;
+  dailyTotals: DailyTotals;
 }
 
 function finiteNumber(value: unknown): number {
@@ -73,6 +75,7 @@ function newProviderUsage(timestampMs: number): MutableProviderUsage {
     firstMs: timestampMs,
     lastMs: timestampMs,
     dailyUsage: {},
+    dailyTotals: {},
   };
 }
 
@@ -186,6 +189,7 @@ export async function fetchPiUsage(identity: Identity): Promise<PiProviderUsage[
         aggregate.lastMs = Math.max(aggregate.lastMs, timestamp);
         const day = localDateKey(timestamp);
         aggregate.dailyUsage[day] = (aggregate.dailyUsage[day] ?? 0) + attributedInput + attributedOutput;
+        addDailyTotals(aggregate.dailyTotals, day, attributedInput, attributedOutput, attributedCacheRead, attributedCacheWrite, 1, attributedCost);
 
         const entryKey = `${provider}\u0000${model}`;
         const modelEntry = aggregate.entries.get(entryKey) ?? {
@@ -228,6 +232,7 @@ export async function fetchPiUsage(identity: Identity): Promise<PiProviderUsage[
       },
       dateSpan: { firstMs: usage.firstMs, lastMs: usage.lastMs },
       dailyUsage: usage.dailyUsage,
+      dailyTotals: usage.dailyTotals,
     };
   });
 }

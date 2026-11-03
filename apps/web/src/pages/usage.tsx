@@ -405,7 +405,7 @@ export function UsagePage() {
   const [provider, setProvider] = useState("all");
   const [identity, setIdentity] = useState("all");
   const [model, setModel] = useState("all");
-  const [since, setSince] = useState<SinceDays>(30);
+  const [since, setSince] = useState<SinceDays>(0);
   const [granularity, setGranularity] = useState<Granularity>("day");
 
   const filtered = useMemo(
@@ -427,7 +427,9 @@ export function UsagePage() {
   // reports untouched, so it matches the CLI's TOTAL row exactly.
   const { rows: shown, withoutHistory } = useMemo(() => applyPeriod(filtered, since), [filtered, since]);
   const period = periodLabel(since);
-  const modelRows = useMemo(() => buildModelRows(shown), [shown]);
+  // Per-model figures exist only for the whole history, so this card is always all time.
+  const modelRows = useMemo(() => buildModelRows(filtered), [filtered]);
+  const modelTotal = modelRows.reduce((sum, row) => sum + row.input + row.output, 0);
   const totalCost = sumReport(shown, (r) => r.totalCost);
   const totalInput = sumReport(shown, (r) => r.totalInput);
   const totalOutput = sumReport(shown, (r) => r.totalOutput);
@@ -497,15 +499,13 @@ export function UsagePage() {
             <StatCard label="Output tokens" value={formatTokens(totalOutput)} sub={period} />
             <StatCard label="Cache tokens" value={formatTokens(totalCacheRead + totalCacheWrite)} sub={`reads + writes, ${period}`} />
             <StatCard label="Messages" value={totalMessages.toLocaleString()} sub={period} />
-            <StatCard label={`Est. cost (${period})`} value={formatMoney(totalCost)} sub={since === 0 ? "for selected sources" : "pro-rated by daily token share"} />
+            <StatCard label={`Est. cost (${period})`} value={formatMoney(totalCost)} sub={since === 0 ? "for selected sources" : "sum of per-day costs"} />
           </div>
           {since !== 0 ? (
             <p className="text-xs text-muted-foreground">
-              Totals cover the {period}. The API holds cost and token counts for each series' whole history and only
-              input plus output tokens per day, so period figures are pro-rated by each series' share of those daily
-              tokens. Choose All time for the exact figures that <span className="font-mono">ais usage</span> shows.
+              Totals are exact sums of per-day figures for the {period}.
               {withoutHistory > 0
-                ? ` ${withoutHistory} ${withoutHistory === 1 ? "series has" : "series have"} no daily history and only count under All time.`
+                ? ` ${withoutHistory} ${withoutHistory === 1 ? "series has" : "series have"} no daily history and only count under All time, because their source has no per-day split.`
                 : ""}
             </p>
           ) : null}
@@ -541,7 +541,7 @@ export function UsagePage() {
             <Card className="gap-3">
               <CardHeader>
                 <CardTitle className="text-base">By model</CardTitle>
-                <CardDescription>Per-model totals across the filtered set, {period}.</CardDescription>
+                <CardDescription>Per-model totals across the filtered set, always all time (the API has no per-day model split).</CardDescription>
               </CardHeader>
               <CardContent className="px-0">
                 <Table>
@@ -552,13 +552,13 @@ export function UsagePage() {
                       <TableHead className="text-right">Input</TableHead>
                       <TableHead className="text-right">Output</TableHead>
                       <TableHead className="text-right">Messages</TableHead>
-                      <TableHead className="text-right">Est. cost ({period})</TableHead>
+                      <TableHead className="text-right">Est. cost (all time)</TableHead>
                       <TableHead className="w-40">Share</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {modelRows.map((row) => {
-                      const share = totalInput + totalOutput > 0 ? (row.input + row.output) / (totalInput + totalOutput) : 0;
+                      const share = modelTotal > 0 ? (row.input + row.output) / modelTotal : 0;
                       return (
                         <TableRow key={row.model}>
                           <TableCell className="max-w-72 truncate font-mono text-xs" title={row.model}>
