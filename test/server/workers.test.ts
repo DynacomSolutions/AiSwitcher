@@ -49,13 +49,14 @@ describe("scanWorkerConcurrencyLimit", () => {
 });
 
 describe("usage snapshot collector cycle", () => {
-  test("uses at least 30 minutes and follows a longer configured Tokscale ceiling", () => {
+  test("uses at least 60 minutes and follows a longer configured Tokscale ceiling", () => {
     const original = process.env.AIS_TOKSCALE_TIMEOUT_MS;
     try {
       delete process.env.AIS_TOKSCALE_TIMEOUT_MS;
-      expect(usageSnapshotRefreshTimeoutMs()).toBe(30 * 60_000);
-      process.env.AIS_TOKSCALE_TIMEOUT_MS = String(35 * 60_000);
-      expect(usageSnapshotRefreshTimeoutMs()).toBe(35 * 60_000 + 30_000);
+      expect(usageSnapshotRefreshTimeoutMs()).toBe(60 * 60_000);
+      // The export ceiling follows the plain one, and the cycle leaves room for the other sources.
+      process.env.AIS_TOKSCALE_TIMEOUT_MS = String(40 * 60_000);
+      expect(usageSnapshotRefreshTimeoutMs()).toBe(75 * 60_000);
     } finally {
       if (original === undefined) delete process.env.AIS_TOKSCALE_TIMEOUT_MS;
       else process.env.AIS_TOKSCALE_TIMEOUT_MS = original;

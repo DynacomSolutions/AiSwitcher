@@ -1,13 +1,13 @@
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
-import { statSync } from "node:fs";
+import { lstatSync, rmSync, statSync } from "node:fs";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import { withUsableCwd } from "../../shared/exec.ts";
 import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { isSwapPool } from "../../identities/swap-pool.ts";
 import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotDirtyId, usageSnapshotTargetKey, usageSnapshotDirtyDirectory } from "./snapshot-dirty.ts";
-import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, type UsageResult, type UsageTarget } from "./run.ts";
+import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, type UsageResult, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
 import { buildAisTokscaleExportInvocation, runAisTokscaleExportInvocation } from "./tokscale.ts";
@@ -125,6 +125,8 @@ export interface UsageSnapshotDeps {
   path?: string;
   /** Test seam for keeping successful native promotions inside the fixture tree. */
   nativeBatchRoot?: string;
+  /** Test seam: the staging directory swept for dead exports at the start of a cycle. */
+  nativeStagingRoot?: string;
   now?: () => number;
   partitionTtlMs?: number;
   forcePartitionKeys?: string[];
@@ -275,6 +277,30 @@ export function validateNativeBatchEnvelope(value: unknown, partitionId: string)
     throw new Error("invalid-native-batch");
   }
   return envelope.generatedAt;
+}
+
+/** A killed or failed export leaves its temporary file (tokscale's own `.ais-batch-*.tmp`, or a staged
+ * `<partition>.<uuid>.json` that never promoted) in .staging for good: hundreds of MB each, and nothing
+ * else removes them. The collector holds the snapshot lock while it writes there, so anything this old
+ * belongs to a dead run. Never throws: a sweep failure must not fail the cycle. */
+export const NATIVE_STAGING_MAX_AGE_MS = 2 * 60 * 60_000;
+
+export function sweepStaleNativeStaging(staging = join(aisCacheDir(), "usage", "native", ".staging"), nowMs = Date.now(), maxAgeMs = NATIVE_STAGING_MAX_AGE_MS): number {
+  let removed = 0;
+  let names: string[];
+  try { names = readdirSync(staging); } catch { return 0; }
+  for (const name of names) {
+    const file = join(staging, name);
+    try {
+      const info = lstatSync(file);
+      if (!info.isFile() || nowMs - info.mtimeMs < maxAgeMs) continue;
+      rmSync(file, { force: true });
+      removed++;
+    } catch (error) {
+      logUsageSourceFailure(`native staging sweep ${name}`, error);
+    }
+  }
+  return removed;
 }
 
 function promoteNativeBatchFile(candidatePath: string, partitionId: string, nativeRoot = join(aisCacheDir(), "usage", "native")): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
@@ -609,6 +635,8 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     sourceScanFailuresTotal: previous.producer?.sourceScanFailuresTotal ?? 0,
   };
   const partitions = { ...previous.partitions };
+  // Tests that redirect the snapshot path must not sweep the real home, so only the default location or an explicit root is swept.
+  if (deps.nativeStagingRoot || deps.path === undefined) sweepStaleNativeStaging(deps.nativeStagingRoot);
   writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
   let targets: UsageTarget[];
   try {
@@ -714,6 +742,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
     const memberUsageField = memberUsage ? { memberUsage } : {};
     if (hasCollectorError(results)) {
       producer.sourceScanFailuresTotal++;
+      for (const result of results) if (result.error || result.sourceOnlyError) logUsageSourceFailure(`${key} result`, result.error ?? "source-only error row");
       if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
       partitions[key] = {
         ...(tool ? { tool } : {}), ...(identity ? { identity } : {}),
@@ -756,6 +785,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       }
     } catch (error) {
       producer.sourceScanFailuresTotal++;
+      logUsageSourceFailure(`${key} native capture`, (error as { original?: unknown } | null)?.original ?? error);
       if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
       partitions[key] = {
         ...(tool ? { tool } : {}), ...(identity ? { identity } : {}), nativeCoverage: "error",
@@ -819,6 +849,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       const results = await job.collect();
       await savePartition(job.key, job.tool, undefined, results);
     } catch (error) {
+      logUsageSourceFailure(`${job.key} collect`, error);
       producer.sourceScansTotal++;
       producer.sourceScanFailuresTotal++;
       const prior = partitions[job.key];
@@ -846,6 +877,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       const key = targetKey({ toolName: "claude", identity: pool });
       const memberUsage = poolWindows.get(pool.name) ?? partitions[key]?.memberUsage;
       if (failed) {
+        // Failure reasons are logged where they arise; this covers a pool the collector never reported on.
+        if (results.length === 0 && !nativeCandidate && !nativeCandidates.has(key)) logUsageSourceFailure(`${key} pool`, "pool reported failure");
+        const staged = nativeCandidate ?? nativeCandidates.get(key);
+        if (staged) try { unlinkSync(staged.path); } catch { /* no staged export remains */ }
         producer.sourceScansTotal++;
         producer.sourceScanFailuresTotal++;
         const prior = partitions[key];
@@ -875,11 +910,13 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       }
       for (const pool of dueSwapPools) {
         if (completedPoolNames.has(pool.identity.name)) continue;
-        onPoolDone(pool.identity, [], true);
+        logUsageSourceFailure(`pool ${pool.identity.name}`, "collector finished without reporting this pool");
+        await onPoolDone(pool.identity, [], true);
       }
-    } catch {
+    } catch (error) {
+      logUsageSourceFailure("swap pool collection", error);
       for (const pool of dueSwapPools) {
-        if (!completedPoolNames.has(pool.identity.name)) onPoolDone(pool.identity, [], true);
+        if (!completedPoolNames.has(pool.identity.name)) await onPoolDone(pool.identity, [], true);
       }
     }
   }
