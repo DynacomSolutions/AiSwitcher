@@ -324,6 +324,10 @@ describe("shared usage snapshot", () => {
     const snapshot = await refreshUsageSnapshot(multi(path, later, [target]));
     const retired = snapshot.partitions[usageSnapshotTargetKey("claude", "old")]!;
     expect(retired.retired).toBe(true);
+    expect(retired.retiredAt).toBe(new Date(later).toISOString());
+    const status = JSON.parse(await Bun.file(join(dirname(path), "status.json")).text());
+    expect(status.oldestSuccessAt).toBe(new Date(later).toISOString());
+    expect(status.partitions).toBe(3);
     expect(retired.results.length).toBe(1);
     expect(snapshot.partitions[usageSnapshotTargetKey("claude", "work")]!.retired).toBeUndefined();
     const envelope = readUsageSnapshotEnvelope(undefined, undefined, path, later + 1000)!;
@@ -331,6 +335,61 @@ describe("shared usage snapshot", () => {
     expect(envelope.pending).toBe(false);
     expect(envelope.lastSuccessAt).not.toBe(retired.lastSuccessAt);
     expect((envelope.results as UsageResult[]).reduce((sum, row) => sum + row.report!.totalMessages, 0)).toBe(6);
+  });
+
+  test("a current partition that is old still makes the envelope stale", async () => {
+    const path = await snapshotFile();
+    const t0 = Date.UTC(2026, 0, 1);
+    await refreshUsageSnapshot(multi(path, t0, [target, oldTarget]));
+    const envelope = readUsageSnapshotEnvelope(undefined, undefined, path, t0 + 9 * 24 * 3_600_000)!;
+    expect(envelope.stale).toBe(true);
+  });
+
+  describe("staleness follows the collector keeping up, not a fixed partition age", () => {
+    const MIN = 60_000;
+    const start = Date.UTC(2026, 0, 1);
+    const iso = (ms: number) => new Date(ms).toISOString();
+    /** A 42-minute cycle: `work` refreshed early, the default profile late. */
+    async function cycleSnapshot(overrides: { workSuccess?: number; inProgress?: boolean } = {}): Promise<string> {
+      const path = await snapshotFile();
+      await refreshUsageSnapshot(multi(path, start, [target]));
+      const snapshot = JSON.parse(await readFile(path, "utf8"));
+      const done = start + 42 * MIN;
+      snapshot.partitions[usageSnapshotTargetKey("claude", "work")].lastSuccessAt = iso(overrides.workSuccess ?? start + MIN);
+      for (const [key, partition] of Object.entries<any>(snapshot.partitions)) {
+        if (key !== usageSnapshotTargetKey("claude", "work")) partition.lastSuccessAt = iso(done - MIN);
+      }
+      snapshot.producer = {
+        ...snapshot.producer,
+        lastStartedAt: iso(overrides.inProgress ? done + 10 * MIN : start),
+        lastHeartbeatAt: iso(overrides.inProgress ? done + 12 * MIN : done),
+        lastCompletedAt: iso(done),
+        lastCompletedCycleStartedAt: iso(start),
+      };
+      await writeFile(path, JSON.stringify(snapshot));
+      return path;
+    }
+    const read = (path: string, now: number) => readUsageSnapshotEnvelope(undefined, undefined, path, now)!;
+
+    test("a 42 minute cycle that refreshed everything is fresh 5 minutes after completion", async () => {
+      const path = await cycleSnapshot();
+      expect(read(path, start + 47 * MIN).stale).toBe(false);
+    });
+
+    test("a partition due but skipped by the last completed cycle is stale", async () => {
+      const path = await cycleSnapshot({ workSuccess: start - 20 * MIN });
+      expect(read(path, start + 47 * MIN).stale).toBe(true);
+    });
+
+    test("a collector whose last cycle completed 2 hours ago is stale", async () => {
+      const path = await cycleSnapshot();
+      expect(read(path, start + 42 * MIN + 120 * MIN).stale).toBe(true);
+    });
+
+    test("a cycle in progress after a good one does not flip stale", async () => {
+      const path = await cycleSnapshot({ inProgress: true });
+      expect(read(path, start + 55 * MIN).stale).toBe(false);
+    });
   });
 
   test("a retired partition whose target returns is un-retired and refreshed", async () => {
@@ -342,6 +401,7 @@ describe("shared usage snapshot", () => {
     const snapshot = await refreshUsageSnapshot(multi(path, back, [target, oldTarget]));
     const revived = snapshot.partitions[usageSnapshotTargetKey("claude", "old")]!;
     expect(revived.retired).toBeUndefined();
+    expect(revived.retiredAt).toBeUndefined();
     expect(Date.parse(revived.lastSuccessAt!)).toBe(back);
   });
 

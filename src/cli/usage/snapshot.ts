@@ -52,6 +52,8 @@ export interface UsageSnapshotPartition {
   lastAttemptAt: string;
   /** Identity no longer registered: results stay in totals, freshness ignores it. */
   retired?: true;
+  /** When the collector first saw the identity gone; cleared on return. */
+  retiredAt?: string;
   lastSuccessAt?: string;
   lastError?: string;
   lastErrorAt?: string;
@@ -101,6 +103,8 @@ export interface UsageSnapshot {
     lastStartedAt?: string;
     lastHeartbeatAt?: string;
     lastCompletedAt?: string;
+    /** Start time of the most recent cycle that ran to completion; freshness is judged against it. */
+    lastCompletedCycleStartedAt?: string;
     lastCycleError?: string;
     refreshCyclesTotal?: number;
     refreshCyclesFailedTotal?: number;
@@ -463,7 +467,8 @@ function writeSnapshot(snapshot: UsageSnapshot, path = USAGE_SNAPSHOT_FILE): voi
     chmodSync(temporary, 0o600);
     renameSync(temporary, file);
     if (path === USAGE_SNAPSHOT_FILE) collectObsoleteNativeBatches(committed);
-    const successfulAt = Object.values(committed.partitions)
+    const activePartitions = Object.values(committed.partitions).filter((partition) => !partition.retired);
+    const successfulAt = activePartitions
       .map((partition) => partition.lastSuccessAt ? Date.parse(partition.lastSuccessAt) : undefined)
       .filter((value): value is number => value !== undefined && Number.isFinite(value));
     const status: UsageSnapshotMetricsStatus = {
@@ -480,7 +485,7 @@ function writeSnapshot(snapshot: UsageSnapshot, path = USAGE_SNAPSHOT_FILE): voi
         oldestSuccessAt: new Date(Math.min(...successfulAt)).toISOString(),
       } : {}),
       partitions: Object.keys(committed.partitions).length,
-      partitionsWithErrors: Object.values(committed.partitions).filter((partition) => partition.lastError).length,
+      partitionsWithErrors: activePartitions.filter((partition) => partition.lastError).length,
     };
     const statusFile = join(dirname(file), "status.json");
     const statusTemporary = `${statusFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -679,8 +684,8 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
   ];
   const liveKeys = new Set(candidateKeys);
   for (const [key, partition] of Object.entries(partitions)) {
-    if (liveKeys.has(key) || key.startsWith("special:")) delete partition.retired;
-    else partition.retired = true;
+    if (liveKeys.has(key) || key.startsWith("special:")) { delete partition.retired; delete partition.retiredAt; }
+    else { partition.retired = true; partition.retiredAt ??= attemptedAt; }
   }
   writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
   const dirtyDirectory = deps.dirtyDirectory ?? usageSnapshotDirtyDirectory;
@@ -930,6 +935,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
       ...producer,
       lastHeartbeatAt: new Date(now()).toISOString(),
       lastCompletedAt: new Date(now()).toISOString(),
+      lastCompletedCycleStartedAt: attemptedAt,
       ...(cycleFailed ? { lastCycleError: "partition-refresh-failed", refreshCyclesFailedTotal: producer.refreshCyclesFailedTotal + 1 } : { lastCycleError: undefined }),
     },
     partitions,
@@ -956,6 +962,26 @@ export function readSwapUsageFromSnapshot(pool: string, path = USAGE_SNAPSHOT_FI
   if (!usage || typeof usage.at !== "string" || !Number.isFinite(Date.parse(usage.at)) || !Number.isFinite(usage.days) || !Array.isArray(usage.members) ||
       !usage.members.every((m) => m && typeof m.member === "string" && [m.messages, m.input, m.output].every(Number.isFinite))) return undefined;
   return { pool, ...usage, stale: now - Date.parse(usage.at) >= 2 * USAGE_SNAPSHOT_PARTITION_TTL_MS || Date.parse(usage.at) - now > 5 * 60_000 };
+}
+
+/**
+ * Whether the collector is failing to keep up. A full cycle can outlast the
+ * partition TTL, so partitions scanned early are always older than the TTL by
+ * the time it completes; judging each partition's age against the clock would
+ * report permanent staleness. Instead: a partition due at the start of the
+ * last completed cycle (older than TTL then) must have been refreshed by it,
+ * and the collector must have shown life (a heartbeat, written per partition
+ * while a cycle runs) within the TTL plus one refresh interval. Snapshots from
+ * before the cycle start was recorded fall back to the plain per-partition TTL.
+ */
+function collectorBehind(producer: UsageSnapshot["producer"], successTimes: number[], oldestSuccess: number | undefined, now: number): boolean {
+  const cycleStart = producer?.lastCompletedCycleStartedAt ? Date.parse(producer.lastCompletedCycleStartedAt) : Number.NaN;
+  const completed = producer?.lastCompletedAt ? Date.parse(producer.lastCompletedAt) : Number.NaN;
+  if (!Number.isFinite(cycleStart) || !Number.isFinite(completed)) return oldestSuccess === undefined || now - oldestSuccess >= USAGE_SNAPSHOT_PARTITION_TTL_MS;
+  const heartbeat = producer?.lastHeartbeatAt ? Date.parse(producer.lastHeartbeatAt) : Number.NaN;
+  const lastLife = Math.max(completed, Number.isFinite(heartbeat) ? heartbeat : 0);
+  if (now - lastLife >= USAGE_SNAPSHOT_PARTITION_TTL_MS + USAGE_SNAPSHOT_REFRESH_INTERVAL_MS) return true;
+  return successTimes.some((time) => time < cycleStart - USAGE_SNAPSHOT_PARTITION_TTL_MS);
 }
 
 export function readUsageSnapshotEnvelope(
@@ -994,7 +1020,7 @@ export function readUsageSnapshotEnvelope(
   return {
     results: usageResultsForJson(results),
     generatedAt: snapshot.aggregateGeneratedAt ?? snapshot.generatedAt,
-    stale: lastSuccess === undefined || now - lastSuccess >= USAGE_SNAPSHOT_PARTITION_TTL_MS || errors.length > 0 || pending,
+    stale: lastSuccess === undefined || errors.length > 0 || pending || collectorBehind(snapshot.producer, successfulTimes, lastSuccess, now),
     ...(lastSuccess !== undefined ? { lastSuccessAt: new Date(lastSuccess).toISOString() } : {}),
     pending,
     nativeCoverage,
