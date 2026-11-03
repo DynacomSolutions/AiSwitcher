@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { appendFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -219,6 +220,25 @@ describe("swap pool usage attribution cache", () => {
     const usage = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath });
     expect(usage[0]?.entries[0]?.messageCount).toBe(1);
     expect([2, 9]).toContain(usage[0]?.entries[0]?.output);
+  });
+
+  test("a transcript that keeps growing during the scan is kept as a prefix and re-read next cycle", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg("one", 2)}\n`);
+    let appended = 0;
+    const growing = {
+      cachePath: f.cachePath,
+      onSourceFileRead: () => {
+        appended += 1;
+        appendFileSync(f.transcript, `${f.msg(`grow-${appended}`, 1)}\n`);
+      },
+    };
+    const first = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, growing);
+    expect(first[0]?.entries[0]?.messageCount).toBeGreaterThanOrEqual(1);
+    const reads: string[] = [];
+    const settled = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, { cachePath: f.cachePath, onSourceFileRead: (path: string) => reads.push(path) });
+    expect(reads).toEqual([f.transcript]);
+    expect(settled[0]?.entries[0]?.messageCount).toBe(1 + appended);
   });
 
   test("discovery ENOENT races preserve the prior cache generation", async () => {
