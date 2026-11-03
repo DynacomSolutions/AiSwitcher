@@ -31,12 +31,11 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useGatewayUsageQuery, useUsageQuery } from "@/hooks/queries";
-import { formatDateMs, formatMoney, formatTokens } from "@/lib/format";
-import { applyPeriod, periodLabel, withinSince, type SinceDays } from "@/lib/usage-period";
+import { formatCount, formatDateMs, formatMoney, formatTokens } from "@/lib/format";
+import { applyPeriod, buildBuckets, periodLabel, providersByTokens, type Bucket, type Granularity, type SinceDays } from "@/lib/usage-period";
 import { classifyUsageError, hasPartialUsageCoverage, usageErrorLabel } from "@/lib/usage-summary";
 import type { RealCostInfo, TokscaleEntry, UsageResult } from "@/types/api";
 
-type Granularity = "day" | "week" | "month";
 
 const GRANULARITIES: { value: Granularity; label: string }[] = [
   { value: "day", label: "Daily" },
@@ -52,23 +51,6 @@ const SINCE_OPTIONS: { value: SinceDays; label: string }[] = [
 ];
 
 const CHART_PALETTE = ["#8b5cf6", "#22d3ee", "#f59e0b", "#34d399", "#f472b6", "#94a3b8"];
-
-interface Bucket {
-  [key: string]: string | number;
-  date: string;
-}
-
-function bucketKey(dateKey: string, granularity: Granularity): string {
-  if (granularity === "day") return dateKey;
-  const date = new Date(`${dateKey}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return dateKey;
-  if (granularity === "month") return dateKey.slice(0, 7);
-  // Monday-start week: back up from the date to its Monday.
-  const day = (date.getDay() + 6) % 7;
-  const monday = new Date(date);
-  monday.setDate(date.getDate() - day);
-  return formatDateMs(monday.getTime());
-}
 
 function uniqueSorted(values: Iterable<string>): string[] {
   return [...new Set(values)].sort((a, b) => a.localeCompare(b));
@@ -89,58 +71,6 @@ function filterResults(
     if (filters.identity !== "all" && result.identity.name !== filters.identity) return false;
     if (filters.model !== "all" && !result.report?.entries.some((e) => e.model === filters.model)) return false;
     return true;
-  });
-}
-
-/** Per-bucket token totals stacked by provider. Buckets are padded with zero
- * entries between first and last active bucket so gaps read as zero bars. */
-function buildBuckets(results: UsageResult[], granularity: Granularity, since: SinceDays): Bucket[] {
-  const perProvider = new Map<string, Map<string, number>>();
-  for (const result of results) {
-    if (!result.dailyUsage) continue;
-    for (const [date, tokens] of Object.entries(result.dailyUsage)) {
-      if (!withinSince(date, since)) continue;
-      const key = bucketKey(date, granularity);
-      let series = perProvider.get(result.provider);
-      if (!series) perProvider.set(result.provider, (series = new Map()));
-      series.set(key, (series.get(key) ?? 0) + tokens);
-    }
-  }
-  if (perProvider.size === 0) return [];
-
-  const totals = new Map<string, number>();
-  for (const series of perProvider.values())
-    for (const [key, value] of series) totals.set(key, (totals.get(key) ?? 0) + value);
-  const keys = [...totals.keys()].sort();
-
-  const topProviders = [...perProvider.entries()]
-    .sort((a, b) => b[1].size - a[1].size)
-    .slice(0, 5)
-    .map(([provider]) => provider);
-
-  // Dense bucket sequence so empty weeks/months render as zero, not gaps.
-  const dense: string[] = [];
-  let cursor = new Date(`${keys[0]}T00:00:00`);
-  const last = new Date(`${keys[keys.length - 1]}T00:00:00`);
-  const step = granularity === "day" ? 1 : granularity === "week" ? 7 : 1;
-  while (cursor <= last && dense.length < 400) {
-    dense.push(formatDateMs(cursor.getTime()));
-    if (granularity === "month") cursor.setMonth(cursor.getMonth() + 1);
-    else cursor.setDate(cursor.getDate() + step);
-  }
-
-  return dense.map((date) => {
-    const bucket: Bucket = { date };
-    let covered = 0;
-    for (const [provider, series] of perProvider) {
-      if (!topProviders.includes(provider)) continue;
-      const value = series.get(date) ?? 0;
-      bucket[provider] = value;
-      covered += value;
-    }
-    const total = totals.get(date) ?? 0;
-    bucket.other = Math.max(0, total - covered);
-    return bucket;
   });
 }
 
@@ -241,6 +171,7 @@ function UsageChart({ buckets, providers }: { buckets: Bucket[]; providers: stri
         }}
         axisLeft={{ tickSize: 4, tickPadding: 6, format: (value: number) => formatTokens(value) }}
         enableGridY
+        enableLabel={false}
         theme={{
           text: { color: "#a1a1aa", fontSize: 11 },
           grid: { line: { stroke: "rgba(148,163,184,0.14)" } },
@@ -421,7 +352,7 @@ export function UsagePage() {
   );
 
   const buckets = useMemo(() => buildBuckets(filtered, granularity, since), [filtered, granularity, since]);
-  const bucketProviders = useMemo(() => perProviderIn(filtered, since).slice(0, 5), [filtered, since]);
+  const bucketProviders = useMemo(() => providersByTokens(filtered, since).slice(0, 5), [filtered, since]);
 
   // Every figure below follows the selected period. "All time" leaves the
   // reports untouched, so it matches the CLI's TOTAL row exactly.
@@ -495,10 +426,10 @@ export function UsagePage() {
           </div>
 
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-            <StatCard label="Input tokens" value={formatTokens(totalInput)} sub={period} />
-            <StatCard label="Output tokens" value={formatTokens(totalOutput)} sub={period} />
-            <StatCard label="Cache tokens" value={formatTokens(totalCacheRead + totalCacheWrite)} sub={`reads + writes, ${period}`} />
-            <StatCard label="Messages" value={totalMessages.toLocaleString()} sub={period} />
+            <StatCard label="Input tokens" value={formatCount(totalInput)} sub={period} />
+            <StatCard label="Output tokens" value={formatCount(totalOutput)} sub={period} />
+            <StatCard label="Cache tokens" value={formatCount(totalCacheRead + totalCacheWrite)} sub={`reads + writes, ${period}`} />
+            <StatCard label="Messages" value={formatCount(totalMessages)} sub={period} />
             <StatCard label={`Est. cost (${period})`} value={formatMoney(totalCost)} sub={since === 0 ? "for selected sources" : "sum of per-day costs"} />
           </div>
           {since !== 0 ? (
@@ -571,9 +502,9 @@ export function UsagePage() {
                               ))}
                             </span>
                           </TableCell>
-                          <TableCell className="text-right tabular-nums">{formatTokens(row.input)}</TableCell>
-                          <TableCell className="text-right tabular-nums">{formatTokens(row.output)}</TableCell>
-                          <TableCell className="text-right tabular-nums">{formatTokens(row.messages)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{formatCount(row.input)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{formatCount(row.output)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{formatCount(row.messages)}</TableCell>
                           <TableCell className="text-right tabular-nums">{formatMoney(row.cost)}</TableCell>
                           <TableCell>
                             <span className="flex items-center gap-2">
@@ -624,22 +555,22 @@ export function UsagePage() {
                       {spanText(r)}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {r.report ? formatTokens(r.report.totalInput) : "-"}
+                      {r.report ? formatCount(r.report.totalInput) : "-"}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {r.report ? formatTokens(r.report.totalOutput) : "-"}
+                      {r.report ? formatCount(r.report.totalOutput) : "-"}
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-muted-foreground">
-                      {r.report ? formatTokens(r.report.totalCacheRead) : "-"}
+                      {r.report ? formatCount(r.report.totalCacheRead) : "-"}
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-muted-foreground">
-                      {r.report ? formatTokens(r.report.totalCacheWrite) : "-"}
+                      {r.report ? formatCount(r.report.totalCacheWrite) : "-"}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {r.report ? formatTokens(r.report.totalMessages) : "-"}
+                      {r.report ? formatCount(r.report.totalMessages) : "-"}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
-                      {r.report ? `$${r.report.totalCost.toFixed(2)}` : "-"}
+                      {r.report ? formatMoney(r.report.totalCost) : "-"}
                     </TableCell>
                     <TableCell>
                       <NotesCell result={r} />
@@ -666,11 +597,11 @@ export function UsagePage() {
                   <TableCell colSpan={3} className="font-semibold">
                     {hasPartialCoverage ? `PARTIAL TOTAL (${period} estimate)` : `TOTAL (${period} estimate)`}
                   </TableCell>
-                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalInput)}</TableCell>
-                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalOutput)}</TableCell>
-                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalCacheRead)}</TableCell>
-                  <TableCell className="text-right font-semibold tabular-nums">{formatTokens(totalCacheWrite)}</TableCell>
-                  <TableCell className="text-right font-semibold tabular-nums">{totalMessages.toLocaleString()}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatCount(totalInput)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatCount(totalOutput)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatCount(totalCacheRead)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatCount(totalCacheWrite)}</TableCell>
+                  <TableCell className="text-right font-semibold tabular-nums">{formatCount(totalMessages)}</TableCell>
                   <TableCell className="text-right font-semibold tabular-nums">{formatMoney(totalCost)}</TableCell>
                   <TableCell />
                 </TableRow>
@@ -698,19 +629,6 @@ export function UsagePage() {
       )}
     </div>
   );
-}
-
-/** Providers with at least one in-window daily bucket, biggest first. */
-function perProviderIn(results: UsageResult[], since: SinceDays): string[] {
-  const totals = new Map<string, number>();
-  for (const result of results) {
-    if (!result.dailyUsage) continue;
-    for (const [date, tokens] of Object.entries(result.dailyUsage)) {
-      if (!withinSince(date, since)) continue;
-      totals.set(result.provider, (totals.get(result.provider) ?? 0) + tokens);
-    }
-  }
-  return [...totals.entries()].sort((a, b) => b[1] - a[1]).map(([provider]) => provider);
 }
 
 export default UsagePage;

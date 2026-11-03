@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyPeriod, periodLabel } from "../../apps/web/src/lib/usage-period.ts";
+import { applyPeriod, buildBuckets, bucketKey, periodLabel, type Granularity } from "../../apps/web/src/lib/usage-period.ts";
 import type { Identity, TokscaleReport, UsageResult } from "../../apps/web/src/types/api.ts";
 
 const identity: Identity = { name: "SYNTHETIC_FIXTURE_identity", label: "SYNTHETIC_FIXTURE_identity", configDir: "SYNTHETIC_FIXTURE_dir" };
@@ -54,5 +54,50 @@ describe("applyPeriod", () => {
 
   test("a series with no activity in the period is hidden", () => {
     expect(applyPeriod([rows[1]!], 90, NOW).rows).toHaveLength(0);
+  });
+});
+
+describe("token buckets", () => {
+  // Spans a month boundary and a partial week at both ends.
+  const rows = [
+    row({ provider: "a", dailyUsage: { "2026-09-29": 5, "2026-10-01": 7, "2026-10-14": 11, "2026-10-31": 13, "2026-11-02": 17 } }),
+    row({ provider: "b", dailyUsage: { "2026-10-01": 1, "2026-11-03": 2 } }),
+  ];
+  const now = new Date(2026, 10, 3, 12).getTime();
+  const total = (buckets: ReturnType<typeof buildBuckets>) =>
+    buckets.reduce((sum, b) => sum + Object.entries(b).reduce((s, [k, v]) => (k === "date" ? s : s + Number(v)), 0), 0);
+
+  test("bucket keys are always full day keys", () => {
+    expect(bucketKey("2026-10-14", "month")).toBe("2026-10-01");
+    expect(bucketKey("2026-11-01", "week")).toBe("2026-10-26");
+    expect(bucketKey("2026-11-01", "day")).toBe("2026-11-01");
+  });
+
+  for (const granularity of ["day", "week", "month"] as Granularity[]) {
+    test(`${granularity} buckets sum to the daily total, all time`, () => {
+      const buckets = buildBuckets(rows, granularity, 0, now);
+      expect(total(buckets)).toBe(56);
+      expect(buckets.every((b) => /^\d{4}-\d{2}-\d{2}$/.test(b.date))).toBe(true);
+    });
+
+    test(`${granularity} buckets sum to the daily total for the last 30 days`, () => {
+      // Cutoff 2026-10-04: drops 09-29 and both 10-01 days, keeps the rest.
+      const buckets = buildBuckets(rows, granularity, 30, now);
+      expect(total(buckets)).toBe(11 + 13 + 17 + 2);
+    });
+  }
+
+  test("monthly keeps a partial first month and shows real bars", () => {
+    const buckets = buildBuckets(rows, "month", 30, now);
+    expect(buckets.map((b) => b.date)).toEqual(["2026-10-01", "2026-11-01"]);
+    expect(Number(buckets[0]!.a)).toBe(24);
+    expect(Number(buckets[1]!.a)).toBe(17);
+  });
+
+  test("weekly includes the partial first week and zero-fills gaps", () => {
+    const buckets = buildBuckets(rows, "week", 0, now);
+    expect(buckets[0]!.date).toBe("2026-09-28");
+    expect(Number(buckets[0]!.a)).toBe(12);
+    expect(buckets.length).toBeGreaterThan(5);
   });
 });

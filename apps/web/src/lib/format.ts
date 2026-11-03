@@ -78,8 +78,15 @@ export function formatBytes(bytes: number | undefined): string {
   return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} ${units[unit]}`;
 }
 
+/** Dollars the way the CLI prints them: en-US grouping, always 2 decimals ($161,422.40). */
 export function formatMoney(value: number): string {
-  return `$${value.toFixed(value < 100 ? 2 : 0)}`;
+  const safe = Number.isFinite(value) ? value : 0;
+  return `$${safe.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** Full count with en-US grouping, as the CLI's tables show token and message counts. */
+export function formatCount(value: number): string {
+  return Math.round(Number.isFinite(value) ? value : 0).toLocaleString("en-US");
 }
 
 /** Local YYYY-MM-DD from an epoch-milliseconds value. */
