@@ -9,7 +9,7 @@ import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { PoolIdentity } from "../../identities/pool/swap-pool.ts";
 import type { Identity } from "../../identities/types.ts";
 import { localDateKey } from "../usage/local-day.ts";
-import type { TokscaleEntry } from "../usage/tokscale.ts";
+import { addDailyTotals, type DailyTotals, type TokscaleEntry } from "../usage/tokscale.ts";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 
 /**
@@ -163,6 +163,8 @@ export interface PoolMemberUsage {
   firstMs: number;
   lastMs: number;
   dailyUsage: Record<string, number>;
+  /** Per model, per day, with list-price cost estimates; callers rescale cost to the figure they report. */
+  dailyByModel: Record<string, DailyTotals>;
 }
 
 /** Counts per member over the last RECENT_USAGE_DAYS: what `usage --json` serves, scan or snapshot. */
@@ -393,7 +395,7 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
       }
       const actualName = activeMemberAt(events, pool.name, at) ?? fallback;
       const member = actualName !== undefined && known.has(actualName) ? actualName : undefined;
-      const row = byMember.get(member) ?? { member, entries: [], firstMs: at, lastMs: at, dailyUsage: {} };
+      const row = byMember.get(member) ?? { member, entries: [], firstMs: at, lastMs: at, dailyUsage: {}, dailyByModel: {} };
       byMember.set(member, row);
       const model = modelName ?? "unknown";
       let entry = row.entries.find((e) => e.model === model);
@@ -420,6 +422,7 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
       row.lastMs = Math.max(row.lastMs, at);
       const day = localDateKey(at);
       row.dailyUsage[day] = (row.dailyUsage[day] ?? 0) + input + output;
+      addDailyTotals(row.dailyByModel[model] ??= {}, day, input, output, cacheRead, cacheWrite, 1, estimateChatModelTokenCost(model, input, output, cacheRead, cacheWrite) ?? 0);
     }
   }
   options.onRecentSplit?.([...recentByMember.values()].sort((a, b) => b.output - a.output));

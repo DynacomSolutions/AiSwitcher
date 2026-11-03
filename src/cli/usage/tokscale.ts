@@ -951,6 +951,26 @@ interface TokscaleHourlyEntry {
   hour: string;
   input: number;
   output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  messageCount?: number;
+  cost?: number;
+}
+
+/** Per local day: [input, output, cacheRead, cacheWrite, messages, cost]. Exact
+ * per-day figures, so a period total is a plain sum of days, never an estimate. */
+export type DailyTotals = Record<string, [number, number, number, number, number, number]>;
+
+export function addDailyTotals(into: DailyTotals, day: string, input: number, output: number, cacheRead: number, cacheWrite: number, messages: number, cost: number): void {
+  const row = into[day] ??= [0, 0, 0, 0, 0, 0];
+  row[0] += input; row[1] += output; row[2] += cacheRead; row[3] += cacheWrite; row[4] += messages; row[5] += cost;
+}
+
+export function mergeDailyTotals(a: DailyTotals | undefined, b: DailyTotals | undefined): DailyTotals | undefined {
+  if (!a && !b) return undefined;
+  const merged: DailyTotals = {};
+  for (const source of [a, b]) for (const [day, v] of Object.entries(source ?? {})) addDailyTotals(merged, day, v[0], v[1], v[2], v[3], v[4], v[5]);
+  return merged;
 }
 interface TokscaleHourlyReport {
   entries: TokscaleHourlyEntry[];
@@ -968,6 +988,7 @@ export interface DailyUsage {
    * no entry means no tracked usage, never a fabricated 0 for days outside
    * what tokscale actually returned. */
   daily: Record<string, number>;
+  totals: DailyTotals;
 }
 
 /**
@@ -1028,6 +1049,7 @@ export function dailyUsageFromHourlyEntries(entries: TokscaleHourlyEntry[]): Dai
   let firstMs: number | undefined;
   let lastMs: number | undefined;
   const daily: Record<string, number> = {};
+  const totals: DailyTotals = {};
 
   for (const e of entries) {
     if (!HOUR_BUCKET_RE.test(e.hour)) continue;
@@ -1037,8 +1059,9 @@ export function dailyUsageFromHourlyEntries(entries: TokscaleHourlyEntry[]): Dai
     lastMs = lastMs === undefined ? ms : Math.max(lastMs, ms);
     const dayKey = e.hour.slice(0, 10);
     daily[dayKey] = (daily[dayKey] ?? 0) + e.input + e.output;
+    addDailyTotals(totals, dayKey, e.input, e.output, e.cacheRead ?? 0, e.cacheWrite ?? 0, e.messageCount ?? 0, e.cost ?? 0);
   }
 
   if (firstMs === undefined || lastMs === undefined) return undefined;
-  return { dateSpan: { firstMs, lastMs }, daily };
+  return { dateSpan: { firstMs, lastMs }, daily, totals };
 }

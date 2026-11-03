@@ -6,7 +6,7 @@ import { isRetired } from "../../identities/retired.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { localDateKey } from "./local-day.ts";
 import { canonicalUsageProvider } from "./providers.ts";
-import type { DateSpan, TokscaleEntry, TokscaleReport } from "./tokscale.ts";
+import { addDailyTotals, type DailyTotals, type DateSpan, type TokscaleEntry, type TokscaleReport } from "./tokscale.ts";
 
 /**
  * Reads the DEFAULT OpenCode profile's own database — the usage that exists
@@ -163,6 +163,7 @@ export interface OpencodeProfileUsage {
   report: TokscaleReport;
   dateSpan: DateSpan;
   dailyUsage: Record<string, number>;
+  dailyTotals: DailyTotals;
 }
 
 interface MutableProfileUsage {
@@ -176,6 +177,7 @@ interface MutableProfileUsage {
   firstMs: number;
   lastMs: number;
   dailyUsage: Record<string, number>;
+  dailyTotals: DailyTotals;
 }
 
 /** The default profile's own db — ALWAYS the unredirected
@@ -216,6 +218,7 @@ function newMutable(timestampMs: number): MutableProfileUsage {
     firstMs: timestampMs,
     lastMs: timestampMs,
     dailyUsage: {},
+    dailyTotals: {},
   };
 }
 
@@ -288,6 +291,7 @@ export async function readOpencodeProfileUsage(dbPath: string): Promise<Opencode
       aggregate.lastMs = Math.max(aggregate.lastMs, created);
       const day = localDateKey(created);
       aggregate.dailyUsage[day] = (aggregate.dailyUsage[day] ?? 0) + input + output;
+      addDailyTotals(aggregate.dailyTotals, day, input, output, cacheRead, cacheWrite, 1, estimatedCost);
 
       const entryKey = `${provider}\u0000${model}`;
       const modelEntry = aggregate.entries.get(entryKey) ?? {
@@ -331,6 +335,7 @@ export async function readOpencodeProfileUsage(dbPath: string): Promise<Opencode
         },
         dateSpan: { firstMs: usage.firstMs, lastMs: usage.lastMs },
         dailyUsage: usage.dailyUsage,
+        dailyTotals: usage.dailyTotals,
       })),
     };
   } catch (err) {

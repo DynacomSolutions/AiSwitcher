@@ -298,6 +298,8 @@ export interface UsageResult {
   realCost?: RealCostInfo;
   dateSpan?: DateSpan;
   dailyUsage?: Record<string, number>;
+  /** Exact per local day: [input, output, cacheRead, cacheWrite, messages, cost]. Absent when the source cannot split by day. */
+  dailyTotals?: Record<string, [number, number, number, number, number, number]>;
   pending?: true;
 }
 

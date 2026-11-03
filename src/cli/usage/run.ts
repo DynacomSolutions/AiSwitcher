@@ -21,10 +21,12 @@ import { canonicalUsageProvider, providerForTool } from "./providers.ts";
 import {
   ensureTokscaleCacheFresh,
   fetchTokscaleDailyUsage,
+  mergeDailyTotals,
   runAisTokscaleExportInvocation,
   runTokscaleProcess,
   tokscaleInvocationFor,
   type AisTokscaleExportInvocation,
+  type DailyTotals,
   type DateSpan,
   type TokscaleEntry,
   type TokscaleReport,
@@ -66,6 +68,8 @@ export interface UsageResult {
   realCost?: RealCostInfo;
   dateSpan?: DateSpan;
   dailyUsage?: Record<string, number>;
+  /** Exact per-day input/output/cache/messages/cost; absent when the source cannot split by day. */
+  dailyTotals?: DailyTotals;
   /** AWS Bedrock only: REAL billed dollars per UTC day from Cost Explorer
    * (see usage/aws-bedrock-usage.ts). Deliberately separate from dailyUsage,
    * which is a TOKEN-typed dimension feeding the shared contribution graph —
@@ -180,8 +184,8 @@ async function runPiUsage(target: UsageTarget, suppression: UsageRowSuppression)
     }
     const index = await identityCredentialIndex();
     const shown = withoutEmptyProviders(providers, suppression.explicitTool);
-    return shown.map(({ provider, nativeCoverageTool, report, dateSpan, dailyUsage }) =>
-      providerResult(target, provider, { report, dateSpan, dailyUsage, ...(nativeCoverageTool ? { nativeCoverageTool } : {}) }, pickProviderAccount(index, "pi", target.identity, canonicalUsageProvider(provider))),
+    return shown.map(({ provider, nativeCoverageTool, report, dateSpan, dailyUsage, dailyTotals }) =>
+      providerResult(target, provider, { report, dateSpan, dailyUsage, dailyTotals, ...(nativeCoverageTool ? { nativeCoverageTool } : {}) }, pickProviderAccount(index, "pi", target.identity, canonicalUsageProvider(provider))),
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -295,8 +299,8 @@ async function runOpencodeUsage(target: UsageTarget, suppression: UsageRowSuppre
       return suppression.explicitTool ? [sourceErrorResult(target, "no local OpenCode provider usage yet for this identity")] : [];
     }
     const index = await identityCredentialIndex();
-    return withoutEmptyProviders(providers, suppression.explicitTool).map(({ provider, report, dateSpan, dailyUsage }) =>
-      providerResult(target, provider, { report, ...(dateSpan ? { dateSpan } : {}), dailyUsage }, pickProviderAccount(index, "opencode", target.identity, canonicalUsageProvider(provider))),
+    return withoutEmptyProviders(providers, suppression.explicitTool).map(({ provider, report, dateSpan, dailyUsage, dailyTotals }) =>
+      providerResult(target, provider, { report, ...(dateSpan ? { dateSpan } : {}), dailyUsage, dailyTotals }, pickProviderAccount(index, "opencode", target.identity, canonicalUsageProvider(provider))),
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -370,7 +374,7 @@ async function runOne(target: UsageTarget, suppression: UsageRowSuppression, dep
     ...(extraCost && (result.provider === primaryProvider || (index === 0 && !results.some((r) => r.provider === primaryProvider)))
       ? { extraCost }
       : {}),
-    ...(daily && results.length === 1 ? { dateSpan: daily.dateSpan, dailyUsage: daily.daily } : {}),
+    ...(daily && results.length === 1 ? { dateSpan: daily.dateSpan, dailyUsage: daily.daily, dailyTotals: daily.totals } : {}),
   }));
 }
 
@@ -433,6 +437,8 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
 
     const dailyUsage = { ...(existing.dailyUsage ?? {}) };
     for (const [day, tokens] of Object.entries(result.dailyUsage ?? {})) dailyUsage[day] = (dailyUsage[day] ?? 0) + tokens;
+    // Exact per-day figures only survive a merge when every merged part has them.
+    const dailyTotals = existing.dailyTotals && result.dailyTotals ? mergeDailyTotals(existing.dailyTotals, result.dailyTotals) : undefined;
     const firstMs = [existing.dateSpan?.firstMs, result.dateSpan?.firstMs].filter((v): v is number => v !== undefined);
     const lastMs = [existing.dateSpan?.lastMs, result.dateSpan?.lastMs].filter((v): v is number => v !== undefined);
     const errors = [...new Set([existing.error, result.error].filter((v): v is string => Boolean(v)))];
@@ -449,6 +455,7 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
       ...(realCost ? { realCost } : {}),
       ...(firstMs.length && lastMs.length ? { dateSpan: { firstMs: Math.min(...firstMs), lastMs: Math.max(...lastMs) } } : {}),
       ...(Object.keys(dailyUsage).length ? { dailyUsage } : {}),
+      ...(dailyTotals ? { dailyTotals } : {}),
       ...(existing.pending && result.pending ? { pending: true as const } : {}),
     });
   }
@@ -506,14 +513,32 @@ export async function defaultOpencodeProfileUsageResults(): Promise<UsageResult[
   if (outcome.kind === "error") {
     return [{ provider: "unattributed", identity: fallbackIdentity, sourceTool: "opencode", sourceOnlyError: true, error: `Could not read the default OpenCode profile: ${outcome.message}` }];
   }
-  return outcome.providers.map(({ provider, report, dateSpan, dailyUsage }) => ({
+  return outcome.providers.map(({ provider, report, dateSpan, dailyUsage, dailyTotals }) => ({
     provider: canonicalUsageProvider(provider),
     identity: profileIdentities.get(canonicalUsageProvider(provider)) ?? fallbackIdentity,
     sourceTool: "opencode" as const,
     report,
     dateSpan,
     dailyUsage,
+    dailyTotals,
   }));
+}
+
+/** Per-day totals for a pool member. Cost per day is the list-price estimate of that day's
+ * messages, rescaled per model so the days sum to the cost the member's report carries. */
+function poolDailyTotals(usage: { entries: TokscaleEntry[]; dailyByModel: Record<string, DailyTotals> }): DailyTotals {
+  const totals: DailyTotals = {};
+  for (const [model, days] of Object.entries(usage.dailyByModel)) {
+    const reported = usage.entries.find((e) => e.model === model)?.cost ?? 0;
+    const estimated = Object.values(days).reduce((sum, v) => sum + v[5], 0);
+    const factor = estimated > 0 ? reported / estimated : 0;
+    for (const [day, v] of Object.entries(days)) {
+      const row = (totals[day] ??= [0, 0, 0, 0, 0, 0]);
+      for (let i = 0; i < 5; i++) row[i]! += v[i]!;
+      row[5]! += v[5]! * factor;
+    }
+  }
+  return totals;
 }
 
 /** Usage of every claude swap pool, charged to the member accounts that were
@@ -573,6 +598,7 @@ export async function swapPoolUsageResults(
         report: reportFromEntries(usage.entries),
         dateSpan: { firstMs: usage.firstMs, lastMs: usage.lastMs },
         dailyUsage: usage.dailyUsage,
+        dailyTotals: poolDailyTotals(usage),
       });
     }
     await onPoolDone?.(pool, results.slice(poolStart), undefined, nativeBatchCandidate);
