@@ -359,7 +359,12 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
         throw new Error("usage source changed during attribution scan");
       }
       if (fingerprintAfterRead === fingerprint) break;
-      if (attempt === 1) throw new Error("usage source changed during attribution scan");
+      // A live session keeps appending to its transcript, so on a large pool
+      // some file is always growing mid-scan. Failing the whole pool for that
+      // stalled the shared snapshot for days. Keep what this read saw (an
+      // append-only prefix) and cache it under the fingerprint taken BEFORE
+      // the read, which no longer matches the file, so the next cycle re-reads it.
+      if (attempt === 1) break;
       fingerprint = fingerprintAfterRead;
     }
     if (!hits) throw new Error("usage source could not be read");
