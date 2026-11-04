@@ -1,7 +1,10 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { expandPath } from "../identities/match.ts";
+import { allowedAccounts, type PoolIdentity } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
-import type { Identity } from "../identities/types.ts";
+import { findIdentityByNameOrAlias } from "../identities/store.ts";
+import type { IdentitiesFile, Identity } from "../identities/types.ts";
 
 /** Longest relay call (wait: 120 s) plus margin; the MCP client must not give up first. */
 const TOOL_TIMEOUT_SEC = 135;
@@ -17,6 +20,21 @@ export interface BrowserWiring {
   /** First user argv entry, to detect subcommands. */
   firstArg?: string;
   exists?: (p: string) => boolean;
+  /**
+   * Swap pool launch: the shim resolves the pool's active member on every call, so the
+   * wiring needs a token in ANY of these (allowed, non-retired) member config dirs.
+   */
+  pool?: { name: string; memberConfigDirs: string[] };
+}
+
+/** Config dirs of the allowed, non-retired members of `pool` (retired identities are never wired). */
+export function poolMemberConfigDirs(file: IdentitiesFile, pool: PoolIdentity): string[] {
+  const dirs: string[] = [];
+  for (const name of allowedAccounts(pool)) {
+    const member = findIdentityByNameOrAlias(file.identities, name);
+    if (member && !isRetired(member)) dirs.push(expandPath(member.configDir));
+  }
+  return dirs;
 }
 
 /**
@@ -29,9 +47,15 @@ export function browserMcpArgs(tool: string, configDir: string, identity: Pick<I
   if (tool !== "claude" && tool !== "codex") return [];
   if (aisBinary === undefined) return []; // never fall back to the running executable (it may be bun, not ais)
   if (identity && isRetired(identity)) return [];
-  if (!(w.exists ?? existsSync)(join(configDir, TOKEN_FILE))) return [];
+  const exists = w.exists ?? existsSync;
+  if (w.pool) {
+    if (!w.pool.memberConfigDirs.some((d) => exists(join(d, TOKEN_FILE)))) return [];
+  } else if (!exists(join(configDir, TOKEN_FILE))) return [];
   if (tool === "claude" && w.firstArg !== undefined && CLAUDE_SUBCOMMANDS.has(w.firstArg)) return [];
-  const shimArgs = ["browser", "mcp", "--config-dir", configDir, ...(w.identityName ? ["--identity", w.identityName] : []), ...(w.gateway ? ["--gateway", w.gateway] : [])];
+  const target = w.pool
+    ? ["--pool", w.pool.name, "--tool", tool]
+    : ["--config-dir", configDir, ...(w.identityName ? ["--identity", w.identityName] : [])];
+  const shimArgs = ["browser", "mcp", ...target, ...(w.gateway ? ["--gateway", w.gateway] : [])];
   if (tool === "claude") {
     return [`--mcp-config=${JSON.stringify({ mcpServers: { "ais-browser": { command: aisBinary, args: shimArgs } } })}`];
   }

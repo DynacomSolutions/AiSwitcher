@@ -46,3 +46,27 @@ test("claude launch gets MCP_TOOL_TIMEOUT=135000 only when wired and not already
   expect(browserLaunchEnv("claude", [], {})).toEqual({});
   expect(browserLaunchEnv("codex", wired, {})).toEqual({});
 });
+
+import { poolMemberConfigDirs } from "../../src/shared/browser-wiring.ts";
+
+const poolShim = ["browser", "mcp", "--pool", "team-pool", "--tool", "claude"];
+const poolOf = (dirs: string[]) => ({ name: "team-pool", memberConfigDirs: dirs });
+
+test("pool launch wires when any member has a token, with pool shim args", () => {
+  const withB = { exists: (p: string) => p === "/m/b/ais-browser-token" };
+  const args = browserMcpArgs("claude", "/pool", { }, "/bin/ais", { ...withB, identityName: "team-pool", pool: poolOf(["/m/a", "/m/b"]) });
+  expect(JSON.parse(args[0]!.slice("--mcp-config=".length)).mcpServers["ais-browser"].args).toEqual(poolShim);
+  const codex = browserMcpArgs("codex", "/pool", {}, "/bin/ais", { ...withB, pool: poolOf(["/m/b"]) });
+  expect(codex[3]).toBe(`mcp_servers.ais-browser.args=${JSON.stringify(["browser", "mcp", "--pool", "team-pool", "--tool", "codex"])}`);
+});
+
+test("pool launch without any member token wires nothing, even if the pool dir has one", () => {
+  expect(browserMcpArgs("claude", "/pool", {}, "/bin/ais", { exists: (p) => p === "/pool/ais-browser-token", pool: poolOf(["/m/a"]) })).toEqual([]);
+});
+
+test("poolMemberConfigDirs skips disallowed and retired members", () => {
+  const id = (name: string, extra: object = {}) => ({ name, configDir: `/m/${name}`, ...extra });
+  const file: any = { identities: [id("a"), id("b", { retired: true }), id("c"), id("d")] };
+  const pool: any = { name: "p", configDir: "/p", swapPool: { accounts: ["a", "b", "c"], disallowed: ["c"] } };
+  expect(poolMemberConfigDirs(file, pool)).toEqual(["/m/a"]);
+});
