@@ -6,6 +6,7 @@ import { Executor } from "./executor.ts";
 import { clearToken, KEYS, loadSettings } from "./pairing.ts";
 import { State } from "./state.ts";
 import { colorForIdentity, TabManager } from "./tabs.ts";
+import { handleMessage } from "./messages.ts";
 import { hexForIdentity, OverlayUi } from "./ui.ts";
 import type { PanelStatus } from "../shared/panel.ts";
 
@@ -56,6 +57,7 @@ async function panelStatus(): Promise<PanelStatus> {
   return {
     status: disconnected && s.token ? "disconnected" : connection.status,
     paused: state.paused,
+    inflight: state.inflightCount,
     signedIn: Boolean(s.token),
     ...(s.binding ? { binding: s.binding } : {}),
     ...(s.target ? { target: s.target } : {}),
@@ -72,21 +74,15 @@ chrome.alarms.onAlarm.addListener(() => {
   void startup.then(async () => { if (connection.needsRestart()) await connect(); });
 });
 
-// Control messages from the side panel, options page and the in-page Stop button.
-chrome.runtime.onMessage.addListener((msg: { type?: string }, _sender, reply) => {
-  switch (msg.type) {
-    case "ais-pause": state.pause(); reply({ ok: true }); return false;
-    case "ais-resume": state.resume(); reply({ ok: true }); return false;
-    case "ais-stop": void state.stop().then(() => reply({ ok: true })); return true;
-    case "ais-disconnect":
-      disconnected = true;
-      void api.storage.set({ [DISCONNECTED_KEY]: true }).then(() => connect()).then(() => reply({ ok: true }));
-      return true;
-    case "ais-connect":
-      disconnected = false;
-      void api.storage.set({ [DISCONNECTED_KEY]: false }).then(() => connect()).then(() => reply({ ok: true }));
-      return true;
-    case "ais-status": void panelStatus().then(reply); return true;
-    default: return false;
-  }
-});
+// Control messages from the side panel, options page and the in-page Stop button (see messages.ts for who may send what).
+chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMessage(msg, sender, reply, {
+  runtimeId: chrome.runtime.id,
+  state,
+  status: panelStatus,
+  setDisconnected: async value => {
+    disconnected = value;
+    await api.storage.set({ [DISCONNECTED_KEY]: value });
+    await connect();
+  },
+  isMarked: tabId => ui.has(tabId),
+}));

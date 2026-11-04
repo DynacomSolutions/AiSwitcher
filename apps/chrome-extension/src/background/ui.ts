@@ -14,15 +14,24 @@ export interface Ui {
   unmark(tabId: number): Promise<void> | void;
   /** Clears every marked tab (Stop, Pause). */
   unmarkAll(): Promise<void> | void;
+  /** Hides the overlay so it is neither captured by a screenshot nor hit by synthetic mouse input. Best effort, capped at SUSPEND_MAX_MS. */
+  suspend(tabId: number): Promise<void> | void;
+  /** Undoes suspend. Always called, including after an abort. */
+  restore(tabId: number): Promise<void> | void;
 }
 
 export const BEFORE_ACTION_MAX_MS = 350;
+export const SUSPEND_MAX_MS = 150;
+/** No tool call for this long: the agent session is treated as over and the overlay is not redrawn. */
+export const SESSION_IDLE_MS = 90_000;
 
 export const noopUi: Ui = {
   beforeAction() {},
   markControlled() {},
   unmark() {},
   unmarkAll() {},
+  suspend() {},
+  restore() {},
 };
 
 /** Glow and cursor colours, matching the tab group colour for the identity. */
@@ -70,16 +79,19 @@ const withTimeout = <T>(p: Promise<T>, ms: number, signal?: AbortSignal): Promis
 /** In-page overlay: cursor, ripple, border glow and the controlling pill. Everything is best effort. */
 export class OverlayUi implements Ui {
   private readonly marked = new Map<number, UiSession>();
+  private readonly lastActive = new Map<number, number>();
 
-  constructor(private readonly scripting: Scripting = realScripting()) {}
+  constructor(private readonly scripting: Scripting = realScripting(), private readonly now: () => number = Date.now) {}
 
   has(tabId: number): boolean { return this.marked.has(tabId); }
 
-  private async run(tabId: number, method: string, arg: unknown, inject = true): Promise<unknown> {
+  /** `inject` allows a first-time content script injection; `wanted` is re-checked after it so a concurrent unmark wins. */
+  private async run(tabId: number, method: string, arg: unknown, inject = true, wanted: () => boolean = () => true): Promise<unknown> {
     try {
       let r = await this.scripting.call(tabId, method, arg);
       if (r === "missing" && inject) {
         await this.scripting.inject(tabId);
+        if (!wanted()) return undefined;
         r = await this.scripting.call(tabId, method, arg);
       }
       return r;
@@ -94,16 +106,29 @@ export class OverlayUi implements Ui {
 
   async markControlled(tabId: number, session: UiSession): Promise<void> {
     this.marked.set(tabId, session);
-    await this.run(tabId, "mark", this.payload(session));
+    this.lastActive.set(tabId, this.now());
+    await this.run(tabId, "mark", this.payload(session), true, () => this.marked.has(tabId));
   }
 
   async beforeAction(tabId: number, point: ActionPoint, signal?: AbortSignal): Promise<void> {
     const session = this.marked.get(tabId);
     if (!session || signal?.aborted) return;
-    await withTimeout(this.run(tabId, "action", { ...point, ...this.payload(session) }), BEFORE_ACTION_MAX_MS, signal);
+    this.lastActive.set(tabId, this.now());
+    await withTimeout(this.run(tabId, "action", { ...point, ...this.payload(session) }, true, () => this.marked.has(tabId)), BEFORE_ACTION_MAX_MS, signal);
+  }
+
+  async suspend(tabId: number): Promise<void> {
+    if (!this.marked.has(tabId)) return;
+    await withTimeout(this.run(tabId, "suspend", null, false), SUSPEND_MAX_MS);
+  }
+
+  async restore(tabId: number): Promise<void> {
+    if (!this.marked.has(tabId)) return;
+    await withTimeout(this.run(tabId, "restore", null, false), SUSPEND_MAX_MS);
   }
 
   async unmark(tabId: number): Promise<void> {
+    this.lastActive.delete(tabId);
     if (!this.marked.delete(tabId)) return;
     await this.run(tabId, "unmark", null, false);
   }
@@ -111,12 +136,19 @@ export class OverlayUi implements Ui {
   async unmarkAll(): Promise<void> {
     const ids = [...this.marked.keys()];
     this.marked.clear();
+    this.lastActive.clear();
     await Promise.all(ids.map(id => this.run(id, "unmark", null, false)));
   }
 
-  /** A controlled tab finished loading a new page: the overlay died with the old document, so draw it again. */
+  /** A controlled tab finished loading a new page: the overlay died with the old document, so draw it again, unless the session went quiet. */
   async refresh(tabId: number): Promise<void> {
     const s = this.marked.get(tabId);
-    if (s) await this.run(tabId, "mark", this.payload(s));
+    if (!s) return;
+    if (this.now() - (this.lastActive.get(tabId) ?? 0) > SESSION_IDLE_MS) {
+      this.marked.delete(tabId);
+      this.lastActive.delete(tabId);
+      return;
+    }
+    await this.run(tabId, "mark", this.payload(s), true, () => this.marked.has(tabId));
   }
 }

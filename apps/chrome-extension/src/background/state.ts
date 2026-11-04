@@ -13,6 +13,9 @@ export class State {
 
   get paused(): boolean { return this._paused; }
 
+  /** Calls currently running. */
+  get inflightCount(): number { return this.inflight.size; }
+
   /** Restore persisted pause state. Call once at start-up before connecting. */
   async load(): Promise<void> {
     if (!this.storage) return;

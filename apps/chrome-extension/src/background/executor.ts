@@ -184,7 +184,7 @@ export class Executor {
     this.throwIfAborted(sig);
     switch (tool) {
       case "navigate": return this.navigate(sig, tab, a("navigate").url);
-      case "screenshot": return this.screenshot(sig, tabId);
+      case "screenshot": return this.hidden(tabId, () => this.screenshot(sig, tabId));
       case "read_page": return text(await this.readPage(sig, tabId, a("read_page").filter ?? "interactive"));
       case "find": return text(await this.find(sig, tabId, a("find").query));
       case "click": {
@@ -193,15 +193,17 @@ export class Executor {
         const button = a("click").button ?? "left";
         const clickCount = a("click").clickCount ?? 1;
         const base = { x: p.x, y: p.y, button, buttons: button === "left" ? 1 : button === "right" ? 2 : 4 };
-        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
-        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", clickCount });
-        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", clickCount, buttons: 0 });
+        await this.hidden(tabId, async () => {
+          await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
+          await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", clickCount });
+          await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", clickCount, buttons: 0 });
+        });
         return text(`Clicked at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "hover": {
         const p = await this.target(sig, tabId, a("hover"));
         await this.input(sig, tabId, p, "hover");
-        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
+        await this.hidden(tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y }));
         return text(`Hovered at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "type": {
@@ -242,7 +244,7 @@ export class Executor {
         const delta = (s.amount ?? 3) * 100;
         const dx = s.direction === "left" ? -delta : s.direction === "right" ? delta : 0;
         const dy = s.direction === "up" ? -delta : s.direction === "down" ? delta : 0;
-        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, deltaX: dx, deltaY: dy });
+        await this.hidden(tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, deltaX: dx, deltaY: dy }));
         return text(`Scrolled ${s.direction}.`);
       }
       case "form_input": return this.formInput(sig, tabId, a("form_input").ref, a("form_input").value);
@@ -310,6 +312,16 @@ export class Executor {
   private async markControlled(tabId: number, session: UiSession): Promise<void> {
     if (this.state.paused) return;
     try { await this.ui.markControlled(tabId, session); } catch { /* visuals never fail a tool call */ }
+  }
+
+  /** Runs `fn` with the overlay hidden: agent captures and hit-testing must see the page, not our pill. Restores even when `fn` throws or the call is aborted. */
+  private async hidden<T>(tabId: number, fn: () => Promise<T>): Promise<T> {
+    try { await this.ui.suspend(tabId); } catch { /* best effort */ }
+    try {
+      return await fn();
+    } finally {
+      try { await this.ui.restore(tabId); } catch { /* best effort */ }
+    }
   }
 
   private async unmark(tabId: number): Promise<void> {

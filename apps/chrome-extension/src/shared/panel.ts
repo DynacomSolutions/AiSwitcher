@@ -6,6 +6,8 @@ export interface PanelSession { id: string; identity: string; label: string; tab
 export interface PanelStatus {
   status: "idle" | "connecting" | "connected" | "reconnecting" | "signed_out" | "replaced" | "disconnected";
   paused: boolean;
+  /** Tool calls running right now. */
+  inflight: number;
   signedIn: boolean;
   binding?: string;
   target?: BrowserTarget;

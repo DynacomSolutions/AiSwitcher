@@ -1,4 +1,6 @@
 // Minimal Chrome DevTools Protocol client over WebSocket, so the e2e needs no browser-automation package.
+const CDP_TIMEOUT_MS = 30_000;
+
 export class Cdp {
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
@@ -17,18 +19,20 @@ export class Cdp {
     };
   }
 
-  static connect(url: string): Promise<Cdp> {
+  static connect(url: string, timeoutMs = 15_000): Promise<Cdp> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url);
-      ws.onopen = () => resolve(new Cdp(ws));
-      ws.onerror = () => reject(new Error(`cannot connect to ${url}`));
+      const timer = setTimeout(() => { ws.close(); reject(new Error(`CDP connect timed out after ${timeoutMs} ms`)); }, timeoutMs);
+      ws.onopen = () => { clearTimeout(timer); resolve(new Cdp(ws)); };
+      ws.onerror = () => { clearTimeout(timer); reject(new Error("CDP connect failed")); };
     });
   }
 
   send<T = Record<string, unknown>>(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: v => resolve(v as T), reject });
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`CDP ${method} timed out after ${CDP_TIMEOUT_MS} ms`)); }, CDP_TIMEOUT_MS);
+      this.pending.set(id, { resolve: v => { clearTimeout(timer); resolve(v as T); }, reject: e => { clearTimeout(timer); reject(e); } });
       this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
     });
   }

@@ -38,7 +38,8 @@ export function createIndicator(root: ShadowRoot, onStop: () => void): Indicator
   pill.innerHTML = `<span class="dot"></span><span class="brand">AIS</span><span class="text"></span><button type="button">Stop</button>`;
   const text = pill.querySelector<HTMLElement>(".text")!;
   const button = pill.querySelector<HTMLButtonElement>("button")!;
-  button.addEventListener("click", ev => { ev.stopPropagation(); onStop(); });
+  // Only a real user click counts: page scripts can dispatch synthetic events, but never trusted ones.
+  button.addEventListener("click", ev => { ev.stopPropagation(); if (ev.isTrusted) onStop(); });
   let shown = false;
 
   return {

@@ -2,7 +2,8 @@ import { cp, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 const root = import.meta.dir;
-const dist = join(root, "dist");
+// Optional output directory (the e2e builds into its own per-run directory).
+const dist = process.argv[2] ?? join(root, "dist");
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 
@@ -24,4 +25,4 @@ await cp(join(root, "manifest.json"), join(dist, "manifest.json"));
 await cp(join(root, "src/options/options.html"), join(dist, "options.html"));
 await cp(join(root, "src/sidepanel/sidepanel.html"), join(dist, "sidepanel.html"));
 await cp(join(root, "src/sidepanel/sidepanel.css"), join(dist, "sidepanel.css"));
-console.log("Built apps/chrome-extension/dist");
+console.log(`Built ${process.argv[2] ?? "apps/chrome-extension/dist"}`);

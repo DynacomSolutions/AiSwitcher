@@ -206,6 +206,8 @@ describe("args and tools", () => {
       markControlled: (tabId, s) => { events.push(`mark:${tabId}:${s.id}`); },
       unmark() {},
       unmarkAll() {},
+      suspend() {},
+      restore() {},
     };
     const { api, tabs, executor } = setup(ui);
     const tab = await tabs.create(session, "https://example.test/");
@@ -320,6 +322,8 @@ describe("visuals and abort hygiene", () => {
       markControlled: (t) => { log.push(`mark:${t}`); },
       unmark: (t) => { log.push(`unmark:${t}`); },
       unmarkAll: () => { log.push("unmarkAll"); },
+      suspend: t => { log.push(`suspend:${t}`); },
+      restore: t => { log.push(`restore:${t}`); },
     };
     return { ui, log, signal: () => signal };
   }
@@ -428,5 +432,41 @@ describe("visuals and abort hygiene", () => {
     api.emit(tab.id, "Page.frameNavigated", { frame: { id: "main" } });
     await executor.run(call("hover", { tabId: tab.id, ref: "ref_1" }));
     expect(getDocs()).toBe(2);
+  });
+
+  test("screenshot and mouse input run between suspend and restore, in order, also when aborted", async () => {
+    const r = recordingUi();
+    const { api, state, tabs, executor } = setup(r.ui);
+    const tab = await tabs.create(session);
+    const order = r.log;
+    const send = api.debugger.send;
+    api.debugger.send = async (id, method, params) => { if (/^(Page\.captureScreenshot|Input\.dispatchMouseEvent)$/.test(method)) order.push(method); return send(id, method, params); };
+    api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    await executor.run(call("screenshot", { tabId: tab.id }));
+    const shot = order.filter(l => /suspend|restore|captureScreenshot/.test(l));
+    expect(shot).toEqual([`suspend:${tab.id}`, "Page.captureScreenshot", `restore:${tab.id}`]);
+    order.length = 0;
+    expect((await executor.run(call("click", { tabId: tab.id, coordinate: [10, 10] }))).ok).toBe(true);
+    const seq = order.filter(l => !l.startsWith("mark") && l !== "before");
+    expect(seq).toEqual([`suspend:${tab.id}`, "Input.dispatchMouseEvent", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent", `restore:${tab.id}`]);
+    // abort between suspend and the capture: restore still runs
+    order.length = 0;
+    api.cdpResults["Page.getLayoutMetrics"] = async () => { await state.stop(); return { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } }; };
+    state.resume();
+    expect(await executor.run(call("screenshot", { tabId: tab.id }))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    await new Promise(res => setTimeout(res, 10)); // run() returns on abort; the dispatch unwinds right after
+    expect(order.filter(l => /^(suspend|restore)/.test(l))).toEqual([`suspend:${tab.id}`, `restore:${tab.id}`]);
+  });
+
+  test("a ui that fails to suspend never fails the call", async () => {
+    const r = recordingUi();
+    r.ui.suspend = () => { throw new Error("gone"); };
+    r.ui.restore = () => { throw new Error("gone"); };
+    const { api, tabs, executor } = setup(r.ui);
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    expect((await executor.run(call("screenshot", { tabId: tab.id }))).ok).toBe(true);
   });
 });

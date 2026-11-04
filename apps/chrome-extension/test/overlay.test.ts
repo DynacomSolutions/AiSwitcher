@@ -18,7 +18,7 @@ function fakeScripting(opts: { missing?: boolean; slowMs?: number; fail?: boolea
     },
     async inject() { injected++; present = true; },
   };
-  return { s, calls, injected: () => injected };
+  return { s, calls, injected: () => injected, navigate: () => { present = false; } };
 }
 const session = { id: "s", identity: "dyn", label: "dyn / s" };
 
@@ -76,7 +76,7 @@ describe("OverlayUi", () => {
 });
 
 describe("side panel view", () => {
-  const base: PanelStatus = { status: "connected", paused: false, signedIn: true, sessions: [] };
+  const base: PanelStatus = { status: "connected", paused: false, inflight: 0, signedIn: true, sessions: [] };
   test("paused shows Resume as the primary action", () => {
     const v = viewFor({ ...base, paused: true });
     expect(v.title).toBe("Paused");
@@ -88,5 +88,54 @@ describe("side panel view", () => {
   });
   test("pause beats reconnecting so a stopped profile never looks usable", () => {
     expect(viewFor({ ...base, status: "reconnecting", paused: true }).chip).toBe("Paused");
+  });
+});
+
+describe("OverlayUi session end and races", () => {
+  test("refresh after the idle window neither redraws nor keeps the entry; activity extends it", async () => {
+    const f = fakeScripting();
+    let t = 0;
+    const ui = new OverlayUi(f.s, () => t);
+    await ui.markControlled(3, session);
+    t = 80_000;
+    await ui.refresh(3);
+    expect(f.calls.filter(c => c.method === "mark")).toHaveLength(2);
+    await ui.beforeAction(3, { x: 1, y: 1, kind: "click" });
+    t = 80_000 + 89_000;
+    await ui.refresh(3);
+    expect(f.calls.filter(c => c.method === "mark")).toHaveLength(3);
+    t += 91_000;
+    await ui.refresh(3);
+    expect(f.calls.filter(c => c.method === "mark")).toHaveLength(3);
+    expect(ui.has(3)).toBe(false);
+  });
+
+  test("an unmark that lands during injection wins: no second mark or action call", async () => {
+    const f = fakeScripting({ missing: true });
+    const ui = new OverlayUi(f.s);
+    const inject = f.s.inject;
+    f.s.inject = async tabId => { await inject(tabId); await ui.unmark(tabId); };
+    await ui.markControlled(5, session);
+    expect(f.calls.filter(c => c.method === "mark")).toHaveLength(0);
+    const f2 = fakeScripting({ missing: true });
+    const ui2 = new OverlayUi(f2.s);
+    await ui2.markControlled(6, session);
+    f2.navigate(); // the page navigated: overlay gone, next call must re-inject
+    f2.s.inject = async () => { await ui2.unmark(6); };
+    await ui2.beforeAction(6, { x: 1, y: 1, kind: "click" });
+    expect(f2.calls.filter(c => c.method === "action")).toHaveLength(0);
+  });
+
+  test("suspend and restore reach only marked tabs and are capped at 150 ms", async () => {
+    const f = fakeScripting({ slowMs: 2000 });
+    const ui = new OverlayUi(f.s);
+    await ui.suspend(1);
+    expect(f.calls).toHaveLength(0);
+    await ui.markControlled(1, session);
+    const t0 = Date.now();
+    await ui.suspend(1);
+    await ui.restore(1);
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(f.calls.map(c => c.method)).toEqual(["mark", "suspend", "restore"]);
   });
 });
