@@ -104,6 +104,42 @@ describe("browser pairing", () => {
     expect((await approve("NOPE", { target: { kind: "identity", identity: "id1" } })).status).toBe(404);
   });
 
+  test("revoked binding name is reusable and old tokens stay dead", async () => {
+    const p = await startPair();
+    await approve(p.code, { target: { kind: "identity", identity: "id1" }, name: "laptop" });
+    const { token: old } = (await (await post("/browser/pair/poll", { code: p.code, pollSecret: p.pollSecret })).json()) as { token: string };
+    expect(await authBrowserToken(store, old)).toBeDefined();
+    expect((await adm("/browser/bindings/laptop", { method: "DELETE" })).status).toBe(200);
+
+    const q = await startPair("Other");
+    const res = await approve(q.code, { target: { kind: "pool", pool: "main" }, name: "laptop" });
+    expect(res.status).toBe(200);
+    const b = ((await res.json()) as { binding: { state: string; profileLabel: string; target: unknown } }).binding;
+    expect(b.state).toBe("active");
+    expect(b.profileLabel).toBe("Other");
+    expect(b.target).toEqual({ kind: "pool", pool: "main" });
+    expect(await authBrowserToken(store, old)).toBeUndefined();
+
+    const { token: fresh } = (await (await post("/browser/pair/poll", { code: q.code, pollSecret: q.pollSecret })).json()) as { token: string };
+    expect((await authBrowserToken(store, fresh))?.name).toBe("laptop");
+    expect(await authBrowserToken(store, old)).toBeUndefined();
+
+    const r = await startPair();
+    expect((await approve(r.code, { target: { kind: "identity", identity: "id1" }, name: "laptop" })).status).toBe(409);
+  });
+
+  test("default name reuses a revoked slug", async () => {
+    const p = await startPair("Work");
+    await approve(p.code, { target: { kind: "identity", identity: "id1" } });
+    await adm("/browser/bindings/work", { method: "DELETE" });
+    const q = await startPair("Work");
+    const res = await approve(q.code, { target: { kind: "identity", identity: "id1" } });
+    expect(((await res.json()) as { binding: { name: string } }).binding.name).toBe("work");
+    const r = await startPair("Work");
+    const res2 = await approve(r.code, { target: { kind: "identity", identity: "id1" } });
+    expect(((await res2.json()) as { binding: { name: string } }).binding.name).toBe("work-2");
+  });
+
   test("admin routes need the admin token", async () => {
     const res = await admin.request("http://admin.test/browser/bindings");
     expect(res.status).toBe(401);

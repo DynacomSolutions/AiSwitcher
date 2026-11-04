@@ -19,6 +19,8 @@ export interface GatewayStore {
   touchBrowserBinding(name: string, at: string): Promise<void>;
   /** Stores only the hash; the binding name goes in the `app` field of the returned records. */
   addBrowserToken(binding: string, prefix: string, hash: string): Promise<void>;
+  /** Drops every browser token issued for a binding (used when a revoked name is reused). */
+  deleteBrowserTokens(binding: string): Promise<void>;
   /** The browser token with this prefix (binding name in `app`), or undefined. */
   browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined>;
   putPairing(p: BrowserPairing): Promise<void>;
@@ -116,6 +118,10 @@ export class MemoryGatewayStore implements GatewayStore {
 
   async addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
     this.browserTokens.push({ app: binding, prefix, hash, createdAt: new Date().toISOString() });
+  }
+
+  async deleteBrowserTokens(binding: string): Promise<void> {
+    this.browserTokens = this.browserTokens.filter((x) => x.app !== binding);
   }
 
   async browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {

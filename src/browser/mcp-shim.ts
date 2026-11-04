@@ -7,6 +7,7 @@ import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
+import { shortSessionId } from "./session-label.ts";
 import { BROWSER_TOOLS, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
 
@@ -55,7 +56,7 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
     const auth = await ctx.resolveAuth();
     if (auth.error !== undefined || !auth.identity) return errorResult(auth.error ?? "internal: cannot resolve the active pool member");
     token = auth.token;
-    session = { id: ctx.session.id, identity: auth.identity, label: `${auth.identity} / ${ctx.session.id.slice(0, 6)}` };
+    session = { id: ctx.session.id, identity: auth.identity, label: `${auth.identity} / ${shortSessionId(ctx.session.id)}` };
     url = await ctx.gatewayUrl();
   } else {
     [url, token] = await Promise.all([ctx.gatewayUrl(), ctx.token()]);
@@ -186,7 +187,7 @@ export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimO
     gatewayUrl: async () => opts.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
     token: () => readToken(env, opts.configDir),
     ...(opts.pool ? { resolveAuth: () => resolvePoolAuth(opts.pool!, opts.tool ?? "claude", opts.registryPath) } : {}),
-    session: { id, identity, label: `${identity} / ${id.slice(0, 6)}` },
+    session: { id, identity, label: `${identity} / ${shortSessionId(id)}` },
     fetch,
     inflight: new Map(),
   };

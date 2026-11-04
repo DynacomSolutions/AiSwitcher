@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { BROWSER_TOOLS, DEFAULT_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallResult } from "../../browser/protocol.ts";
+import { shortSessionId } from "../../browser/session-label.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import { authAgentToken } from "./auth.ts";
@@ -25,7 +26,7 @@ export async function allowedBindings(identity: string, connected: BrowserBindin
  */
 export function forwardedSession(b: BrowserBinding, identity: string, id: string, label: string): { id: string; identity: string; label: string } {
   if (b.target.kind !== "pool") return { id, identity, label };
-  return { id, identity: `pool:${b.target.pool}`, label: `${b.target.pool} / ${id.slice(0, 6)}`.slice(0, 80) };
+  return { id, identity: `pool:${b.target.pool}`, label: `${b.target.pool} / ${shortSessionId(id)}`.slice(0, 80) };
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);

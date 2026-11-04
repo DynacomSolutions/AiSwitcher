@@ -182,7 +182,7 @@ describe("POST /browser/call", () => {
     await call({ session: sess, tool: "screenshot" });
     answer(pool);
     await call({ session: { ...sess, label: "id2 / abcdef" }, tool: "screenshot" }, tokB);
-    expect(seenPool).toEqual([{ identity: "pool:main", label: "main / abcdef" }, { identity: "pool:main", label: "main / abcdef" }]);
+    expect(seenPool).toEqual([{ identity: "pool:main", label: "main / abcdef123" }, { identity: "pool:main", label: "main / abcdef123" }]);
 
     const pin = await connect(b("i", { kind: "identity", identity: "id1" }));
     const seenPin = capture(pin);
