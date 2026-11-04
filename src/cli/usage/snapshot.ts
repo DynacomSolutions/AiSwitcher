@@ -133,6 +133,8 @@ export interface UsageSnapshotDeps {
   nativeStagingRoot?: string;
   now?: () => number;
   partitionTtlMs?: number;
+  /** Interval between in-cycle heartbeat writes (default USAGE_SNAPSHOT_HEARTBEAT_INTERVAL_MS). */
+  heartbeatIntervalMs?: number;
   forcePartitionKeys?: string[];
   dirtyMinIntervalMs?: number;
   dirtyDirectory?: string;
@@ -608,18 +610,22 @@ async function defaultCollectTargets(): Promise<UsageTarget[]> {
   return collectTargets({});
 }
 
+export const USAGE_SNAPSHOT_HEARTBEAT_INTERVAL_MS = 60_000;
+
 async function refreshUsageSnapshotOnce(deps: UsageSnapshotDeps): Promise<UsageSnapshot> {
   const path = deps.path ?? USAGE_SNAPSHOT_FILE;
   const releaseLock = await acquireSnapshotLock(path);
   if (!releaseLock) return readSnapshot(path) ?? { schemaVersion: 1, generatedAt: new Date((deps.now ?? Date.now)()).toISOString(), partitions: {} };
+  const life: { timer?: ReturnType<typeof setInterval> } = {};
   try {
-    return await refreshUsageSnapshotLocked(deps, path);
+    return await refreshUsageSnapshotLocked(deps, path, life);
   } finally {
+    if (life.timer !== undefined) clearInterval(life.timer);
     await releaseLock();
   }
 }
 
-async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string): Promise<UsageSnapshot> {
+async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string, life: { timer?: ReturnType<typeof setInterval> } = {}): Promise<UsageSnapshot> {
   const now = deps.now ?? Date.now;
   const ttl = deps.partitionTtlMs ?? USAGE_SNAPSHOT_PARTITION_TTL_MS;
   const previous = readSnapshot(path) ?? { schemaVersion: 1 as const, generatedAt: new Date(now()).toISOString(), partitions: {} };
@@ -643,6 +649,18 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string)
   // Tests that redirect the snapshot path must not sweep the real home, so only the default location or an explicit root is swept.
   if (deps.nativeStagingRoot || deps.path === undefined) sweepStaleNativeStaging(deps.nativeStagingRoot);
   writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
+  // A single partition or the pool scan can run for many minutes without a
+  // partition commit. Keep writing the heartbeat meanwhile. The timer callback
+  // runs on the same event loop as the cycle, only between awaits, and every
+  // snapshot write is synchronous over the cycle's own in-memory state, so it
+  // cannot interleave with or clobber a partition commit; the cycle also holds
+  // the snapshot lock throughout. Cleared by the caller's finally.
+  life.timer = setInterval(() => {
+    try {
+      writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+    } catch { /* a missed heartbeat is retried on the next tick */ }
+  }, deps.heartbeatIntervalMs ?? USAGE_SNAPSHOT_HEARTBEAT_INTERVAL_MS);
+  life.timer.unref?.();
   let targets: UsageTarget[];
   try {
     targets = await (deps.collectTargets ?? defaultCollectTargets)();
