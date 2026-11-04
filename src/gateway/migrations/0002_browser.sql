@@ -16,12 +16,14 @@ CREATE TABLE IF NOT EXISTS browser_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS browser_tokens_binding_idx ON browser_tokens (binding);
+CREATE INDEX IF NOT EXISTS browser_tokens_prefix_idx ON browser_tokens (prefix);
 
 CREATE TABLE IF NOT EXISTS browser_pairings (
   code text PRIMARY KEY,
   profile_label text NOT NULL,
   created_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
+  poll_secret_hash text NOT NULL,
   approved_binding text,
   token_delivered boolean NOT NULL
 );

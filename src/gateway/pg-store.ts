@@ -215,14 +215,20 @@ export class PgGatewayStore implements GatewayStore {
     return rows.map((r: Row) => ({ app: r.binding, prefix: r.prefix, hash: r.hash, createdAt: iso(r.created_at) }));
   }
 
+  async browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
+    const rows = await this.sql`SELECT * FROM browser_tokens WHERE prefix = ${prefix} ORDER BY id LIMIT 1`;
+    const r = rows[0];
+    return r ? { app: r.binding, prefix: r.prefix, hash: r.hash, createdAt: iso(r.created_at) } : undefined;
+  }
+
   async putPairing(p: BrowserPairing): Promise<void> {
     await this.sql`
-      INSERT INTO browser_pairings (code, profile_label, created_at, expires_at, approved_binding, token_delivered)
+      INSERT INTO browser_pairings (code, profile_label, created_at, expires_at, poll_secret_hash, approved_binding, token_delivered)
       VALUES (${p.code}, ${p.profileLabel}, ${p.createdAt}::timestamptz, ${p.expiresAt}::timestamptz,
-              ${p.approvedBinding ?? null}, ${p.tokenDelivered})
+              ${p.pollSecretHash}, ${p.approvedBinding ?? null}, ${p.tokenDelivered})
       ON CONFLICT (code) DO UPDATE SET
         profile_label = EXCLUDED.profile_label, created_at = EXCLUDED.created_at,
-        expires_at = EXCLUDED.expires_at, approved_binding = EXCLUDED.approved_binding,
+        expires_at = EXCLUDED.expires_at, poll_secret_hash = EXCLUDED.poll_secret_hash, approved_binding = EXCLUDED.approved_binding,
         token_delivered = EXCLUDED.token_delivered`;
   }
 
@@ -235,6 +241,7 @@ export class PgGatewayStore implements GatewayStore {
       profileLabel: r.profile_label,
       createdAt: iso(r.created_at),
       expiresAt: iso(r.expires_at),
+      pollSecretHash: r.poll_secret_hash,
       tokenDelivered: r.token_delivered,
     };
     if (r.approved_binding !== null) p.approvedBinding = r.approved_binding;

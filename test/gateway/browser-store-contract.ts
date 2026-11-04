@@ -15,6 +15,7 @@ const pairing: BrowserPairing = {
   profileLabel: "Work",
   createdAt: "2026-11-04T00:00:00.000Z",
   expiresAt: "2020-01-01T00:00:00.000Z",
+  pollSecretHash: "ab".repeat(32),
   tokenDelivered: false,
 };
 
@@ -50,6 +51,14 @@ export function browserStoreContract(make: () => Promise<GatewayStore>): void {
     expect(toks).toHaveLength(1);
     expect(toks[0]).toMatchObject({ app: "work-laptop", prefix: "pre1", hash: "hash1" });
     expect(await s.browserTokensFor("other")).toEqual([]);
+  });
+
+  test("browser token is found by prefix", async () => {
+    const s = await make();
+    await s.putBrowserBinding(binding);
+    await s.addBrowserToken("work-laptop", "abcdefgh", "ff".repeat(32));
+    expect(await s.browserTokenByPrefix("abcdefgh")).toMatchObject({ app: "work-laptop", prefix: "abcdefgh", hash: "ff".repeat(32) });
+    expect(await s.browserTokenByPrefix("zzzzzzzz")).toBeUndefined();
   });
 
   test("pairing round-trips, expired is still readable, delete removes", async () => {

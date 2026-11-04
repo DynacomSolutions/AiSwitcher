@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { extractToken } from "./auth.ts";
+import { createPairRoutes } from "./browser/pair.ts";
 import { checkCaps, dayStartIct } from "./caps.ts";
 import { GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
@@ -28,6 +29,9 @@ export interface GatewayDeps {
   metrics: GatewayMetrics;
   /** One JSON line per request (app, provider, identity, status, tap status). Never carries tokens, bodies or query strings. Defaults to console.info. */
   log?: (line: string) => void;
+  /** Member accounts of a swap pool, or undefined for an unknown pool. */
+  browserPoolMembers?(pool: string): Promise<string[] | undefined>;
+  browserIdentityExists?(identity: string): Promise<boolean>;
 }
 
 /** Request bodies up to this size are buffered so they can be replayed (401 retry, failover). */
@@ -198,6 +202,8 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const log = deps.log ?? defaultLog;
   const handle = (req: Request): Promise<Response> =>
     proxy(req, deps, log).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+  // Before the catch-all proxy routes: "browser" is not an app name.
+  hono.route("/browser", createPairRoutes({ store: deps.store, now: deps.now, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) }));
   hono.all("/:app", (c) => handle(c.req.raw));
   hono.all("/:app/*", (c) => handle(c.req.raw));
   return hono;

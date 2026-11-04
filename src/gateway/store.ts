@@ -18,6 +18,8 @@ export interface GatewayStore {
   /** Stores only the hash; the binding name goes in the `app` field of the returned records. */
   addBrowserToken(binding: string, prefix: string, hash: string): Promise<void>;
   browserTokensFor(binding: string): Promise<TokenRecord[]>;
+  /** The browser token with this prefix (binding name in `app`), or undefined. */
+  browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined>;
   putPairing(p: BrowserPairing): Promise<void>;
   /** Returns expired pairings too; the caller enforces expiry. */
   getPairing(code: string): Promise<BrowserPairing | undefined>;
@@ -108,6 +110,11 @@ export class MemoryGatewayStore implements GatewayStore {
 
   async browserTokensFor(binding: string): Promise<TokenRecord[]> {
     return this.browserTokens.filter((t) => t.app === binding).map((t) => ({ ...t }));
+  }
+
+  async browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
+    const t = this.browserTokens.find((x) => x.prefix === prefix);
+    return t ? { ...t } : undefined;
   }
 
   async putPairing(p: BrowserPairing): Promise<void> {

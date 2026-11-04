@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import type { GatewayStore } from "./store.ts";
+import { registerBrowserAdmin } from "./browser/admin.ts";
 import { adapterFor } from "./providers/index.ts";
 import { generateToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, TokenRecord } from "./types.ts";
@@ -12,7 +13,7 @@ const MAX_USAGE_DAYS = 90;
 const PROVIDERS: readonly GatewayProvider[] = ["claude", "codex", "kimi", "grok", "zai", "ali", "opencode"];
 const STYLES: readonly ApiStyle[] = ["anthropic", "openai"];
 /** Paths the proxy port answers itself; an app of this name could never be reached. */
-const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics"]);
+const RESERVED_NAMES = new Set(["healthz", "readyz", "metrics", "browser"]);
 /** A DNS-1123 label: the name becomes a URL path segment and may become a Kubernetes label. */
 const NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 /** Providers that speak one API style only; the others (kimi, zai) offer both. */
@@ -27,6 +28,8 @@ export interface AdminDeps {
   overlapMs?: number;
   /** Looks an identity up in the AIS registry. When absent, identities are not checked. */
   identityState?(provider: GatewayProvider, identity: string): Promise<IdentityState>;
+  browserPoolMembers?(pool: string): Promise<string[] | undefined>;
+  browserIdentityExists?(identity: string): Promise<boolean>;
 }
 
 /** Constant-time comparison: both sides are hashed first so lengths never leak. */
@@ -109,6 +112,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     return next();
   });
   hono.onError(() => err(503, "store unavailable"));
+  registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
 
   hono.get("/apps", async (c) => {
     const apps = await store.listApps();

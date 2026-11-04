@@ -15,6 +15,8 @@ export interface BrowserPairing {
   profileLabel: string;
   createdAt: string;
   expiresAt: string;
+  /** SHA-256 hex of the secret the extension polls with. */
+  pollSecretHash: string;
   approvedBinding?: string;
   tokenDelivered: boolean;
 }
