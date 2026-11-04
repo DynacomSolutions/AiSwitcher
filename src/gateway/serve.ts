@@ -1,6 +1,7 @@
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
 import { isRetired } from "../identities/retired.ts";
+import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { createAdminApp, type IdentityState } from "./admin.ts";
@@ -130,7 +131,7 @@ async function defaultPoolMembers(provider: GatewayProvider): Promise<string[]> 
 async function defaultIdentityState(provider: GatewayProvider, name: string): Promise<IdentityState> {
   const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
   const found = findIdentityByNameOrAlias(file.identities, name);
-  return !found ? "missing" : isRetired(found) ? "retired" : "ok";
+  return !found ? "missing" : isRetired(found) ? "retired" : isSwapPool(found) ? "pool" : "ok";
 }
 
 /** Alias to canonical identity name, with a short cache (also for failed reads) so the registry file is not re-read per request. */

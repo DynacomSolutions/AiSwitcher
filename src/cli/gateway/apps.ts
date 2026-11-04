@@ -1,4 +1,7 @@
 import { userInfo } from "node:os";
+import { TOOL_CONFIGS } from "../identities/resolve-tool.ts";
+import { isSwapPool } from "../../identities/pool/swap-pool.ts";
+import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { boolFlag, listFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { writeAppSecret, type KubectlRunner } from "./kube-secret.ts";
@@ -13,6 +16,28 @@ export interface GatewayCliDeps {
   secretsPath?: string;
   out(line: string): void;
   now(): number;
+  /** True when `name` (or an alias) is a swap pool in the local registry. Defaults to reading it. */
+  isPoolName?(provider: string, name: string): Promise<boolean>;
+}
+
+async function localIsPoolName(provider: string, name: string): Promise<boolean> {
+  try {
+    const cfg = (TOOL_CONFIGS as Record<string, { identitiesJsonPath: string } | undefined>)[provider];
+    if (!cfg) return false;
+    const found = findIdentityByNameOrAlias((await loadIdentitiesFile(cfg.identitiesJsonPath)).identities, name);
+    return found !== undefined && isSwapPool(found);
+  } catch {
+    // An unreadable local registry must not block; the admin API is authoritative.
+    return false;
+  }
+}
+
+/** Friendly early rejection of a swap-pool name used as a pinned identity. */
+async function rejectPoolPin(deps: GatewayCliDeps, provider: string, target: AppTarget | undefined, flagged: boolean): Promise<void> {
+  if (!flagged || target?.kind !== "pin" || target.identity === undefined) return;
+  if (await (deps.isPoolName ?? localIsPoolName)(provider, target.identity)) {
+    throw new CliUsageError(`"${target.identity}" is a swap pool, not one account: --identity would pin to the pool's active login only. Use --pool --identities=<members> instead`);
+  }
 }
 
 interface AppTarget {
@@ -173,6 +198,7 @@ export async function runAppCommand(action: string | undefined, positionals: str
     case "add": {
       const name = appName(positionals);
       const body = buildNew(flags);
+      await rejectPoolPin(deps, body.provider, body.target, true);
       const url = await proxyUrl(deps, flags, name);
       const existing = await admin.call("GET", `/apps/${name}`, undefined, [404]);
       if (existing.status !== 404) throw new CliUsageError(`App "${name}" already exists; use: ais gateway app update ${name} to change settings, or ais gateway app rotate ${name} for a new token`);
@@ -204,6 +230,7 @@ export async function runAppCommand(action: string | undefined, positionals: str
         style: stringFlag(flags, "style") ?? str(cur.style),
         target: targetFromFlags(flags, false) ?? (cur.target as AppTarget),
       };
+      await rejectPoolPin(deps, body.provider, body.target, stringFlag(flags, "identity") !== undefined);
       for (const k of ["models", "dailyTokens", "reservePercent"] as const) if (cur[k] !== undefined) (body as unknown as Record<string, unknown>)[k] = cur[k];
       applyOptional(body, flags);
       await admin.call("PUT", `/apps/${name}`, body);

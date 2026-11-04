@@ -18,7 +18,7 @@ const NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 /** Providers that speak one API style only; the others (kimi, zai) offer both. */
 const FIXED_STYLE: Partial<Record<GatewayProvider, ApiStyle>> = { claude: "anthropic", ali: "anthropic", codex: "openai", grok: "openai", opencode: "openai" };
 
-export type IdentityState = "ok" | "missing" | "retired";
+export type IdentityState = "ok" | "missing" | "retired" | "pool";
 
 export interface AdminDeps {
   store: GatewayStore;
@@ -134,6 +134,9 @@ export function createAdminApp(deps: AdminDeps): Hono {
     try {
     for (const identity of parsed.target.kind === "pin" ? [parsed.target.identity] : (parsed.target.identities ?? [])) {
       const state = (await deps.identityState?.(parsed.provider, identity)) ?? "ok";
+      if (state === "pool") {
+        return err(400, `"${identity}" is a swap pool, not one account: a pin would only ever use the pool's active login. Use target kind "pool" with identities set to the member accounts (CLI: --pool --identities=<members>)`);
+      }
       if (state !== "ok") return err(400, `identity "${identity}" is ${state === "retired" ? "retired" : "not a known"} ${parsed.provider} identity`);
     }
     } catch {
