@@ -392,6 +392,90 @@ describe("shared usage snapshot", () => {
     });
   });
 
+  describe("heartbeat during a long scan", () => {
+    const MIN = 60_000;
+    const t0 = Date.UTC(2026, 0, 1);
+    const poolIdentity = { name: "pool", label: "Pool", configDir: "/not-persisted", env: {}, swapPool: { accounts: ["work"], active: "work" } } as UsageTarget["identity"];
+    const poolTarget: UsageTarget = { toolName: "claude", identity: poolIdentity };
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    /** One finished cycle, then a second whose pool scan runs `scan` against a mutable clock. */
+    async function longScan(scan: (clock: { now: number }, read: () => boolean | undefined) => Promise<void>): Promise<string> {
+      const path = await snapshotFile();
+      await refreshUsageSnapshot({
+        ...deps(path, { now: t0, results: [result(1)] }),
+        collectPoolTargets: async () => [poolTarget],
+        collectSwapPools: async (onPoolDone) => { await onPoolDone(poolIdentity, [result(1, poolIdentity)]); return []; },
+      });
+      const clock = { now: t0 + 20 * MIN };
+      const read = () => readUsageSnapshotEnvelope(undefined, undefined, path, clock.now)?.stale;
+      await refreshUsageSnapshot({
+        ...deps(path, { now: 0, results: [result(1)] }),
+        now: () => clock.now,
+        heartbeatIntervalMs: 5,
+        collectPoolTargets: async () => [poolTarget],
+        collectSwapPools: async (onPoolDone) => {
+          await scan(clock, read);
+          await onPoolDone(poolIdentity, [result(2, poolIdentity)]);
+          return [];
+        },
+      });
+      return path;
+    }
+
+    test("a 25 minute pool scan with heartbeats arriving reads stale false throughout", async () => {
+      const seen: Array<boolean | undefined> = [];
+      await longScan(async (clock, read) => {
+        for (let step = 0; step < 5; step++) {
+          clock.now += 5 * MIN;
+          await sleep(30);
+          seen.push(read());
+        }
+      });
+      expect(seen).toEqual([false, false, false, false, false]);
+    });
+
+    test("heartbeats stopping for 20 minutes reads stale true", async () => {
+      let stale: boolean | undefined;
+      await longScan(async (clock, read) => {
+        await sleep(30);
+        clock.now += 20 * MIN; // no await after this: no timer tick can refresh the heartbeat
+        stale = read();
+      });
+      expect(stale).toBe(true);
+    });
+
+    test("the heartbeat timer is cleared when the cycle ends or fails", async () => {
+      const realSet = globalThis.setInterval;
+      const realClear = globalThis.clearInterval;
+      const live = new Set<unknown>();
+      globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => {
+        const timer = realSet(...args);
+        live.add(timer);
+        return timer;
+      }) as typeof setInterval;
+      globalThis.clearInterval = ((timer: Parameters<typeof clearInterval>[0]) => {
+        live.delete(timer);
+        realClear(timer);
+      }) as typeof clearInterval;
+      try {
+        await longScan(async () => { await sleep(10); });
+        expect(live.size).toBe(0);
+        const path = await snapshotFile();
+        await refreshUsageSnapshot({
+          ...deps(path, { now: t0, results: [result(1)] }),
+          heartbeatIntervalMs: 5,
+          collectPoolTargets: async () => [poolTarget],
+          collectSwapPools: async () => { throw new Error("pool scan exploded"); },
+        });
+        expect(live.size).toBe(0);
+      } finally {
+        globalThis.setInterval = realSet;
+        globalThis.clearInterval = realClear;
+      }
+    });
+  });
+
   test("a retired partition whose target returns is un-retired and refreshed", async () => {
     const path = await snapshotFile();
     const t0 = Date.UTC(2026, 0, 1);
