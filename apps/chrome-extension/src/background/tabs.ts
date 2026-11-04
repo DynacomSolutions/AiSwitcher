@@ -21,8 +21,10 @@ export class TabManager {
     api.tabs.onRemoved(tabId => this.forget(tabId));
   }
 
-  owns(sessionId: string, tabId: number): boolean {
-    return this.sessions.get(sessionId)?.tabIds.has(tabId) ?? false;
+  /** True only when the session id AND the identity that created it both match. */
+  owns(sessionId: string, tabId: number, identity: string): boolean {
+    const s = this.sessions.get(sessionId);
+    return s !== undefined && s.identity === identity && s.tabIds.has(tabId);
   }
 
   ownerOf(tabId: number): string | undefined {

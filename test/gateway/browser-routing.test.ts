@@ -125,18 +125,18 @@ describe("POST /browser/call", () => {
     expect(await (await call({ session, tool: "screenshot", browser: "ghost" })).json()).toMatchObject({ error: "no_browser" });
   });
 
-  test("list_browsers and GET /browser/list show only allowed bindings", async () => {
+  test("list_browsers shows only allowed bindings; GET /browser/list is gone", async () => {
     await connect(b("w1", { kind: "identity", identity: "id1" }));
     await connect(b("other", { kind: "identity", identity: "id9" }));
     const r = (await (await call({ session, tool: "list_browsers" })).json()) as { content: Array<{ text: string }> };
     expect((JSON.parse(r.content[0]?.text ?? "[]") as Array<{ name: string }>).map((x) => x.name)).toEqual(["w1"]);
-    const l = await app.request("http://gw.test/browser/list", { headers: { authorization: `Bearer ${agent}` } });
-    expect(((await l.json()) as { browsers: Array<{ name: string }> }).browsers.map((x) => x.name)).toEqual(["w1"]);
+    expect((await app.request("http://gw.test/browser/list", { headers: { authorization: `Bearer ${agent}` } })).status).not.toBe(200);
   });
 
   test("bad bodies are 400", async () => {
     expect((await call({ session, tool: "nope" })).status).toBe(400);
     expect((await call({ tool: "navigate" })).status).toBe(400);
+    expect((await call({ session, tool: "upload_file", args: { tabId: 1, ref: "ref_1", paths: ["/etc/passwd"] } })).status).toBe(400);
   });
 
   test("session.id over 128 characters is 400", async () => {

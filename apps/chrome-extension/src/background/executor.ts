@@ -184,7 +184,7 @@ export class Executor {
         const tab = await this.api.tabs.get(tabId);
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
         const owner = this.tabs.ownerOf(tabId);
-        if (owner !== undefined && owner !== session.id) throw new ToolError("forbidden_tab", `Tab ${tabId} belongs to another session.`);
+        if (owner !== undefined && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} belongs to another session.`);
         this.throwIfAborted(sig);
         await this.tabs.addToSession(session, tabId);
         await this.markControlled(tabId, session);
@@ -288,14 +288,6 @@ export class Executor {
         if (s.clear) this.netBuf.set(tabId, []);
         return text(rows.length ? rows.join("\n") : "No network requests.");
       }
-      case "upload_file": {
-        const u = a("upload_file");
-        const id = this.refTable(tabId).byRef.get(u.ref);
-        if (id === undefined) throw new ToolError("bad_args", `Unknown ref ${u.ref}; call read_page or find first.`);
-        await this.ensureDom(sig, tabId);
-        await this.cdp(sig, tabId, "DOM.setFileInputFiles", { files: u.paths, backendNodeId: id });
-        return text(`Set ${u.paths.length} file(s).`);
-      }
       case "resize": {
         this.throwIfAborted(sig);
         await this.api.windows.resize(tab.windowId, a("resize").width, a("resize").height);
@@ -318,7 +310,7 @@ export class Executor {
   // ---- ownership ---------------------------------------------------------
 
   private async ownedTab(req: CallRequest, tabId: number): Promise<TabInfo> {
-    if (!this.tabs.owns(req.session.id, tabId)) throw new ToolError("forbidden_tab", `Tab ${tabId} is not in this session. Use tabs_create, or adopt_tab to take one of the user's tabs.`);
+    if (!this.tabs.owns(req.session.id, tabId, req.session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} is not in this session. Use tabs_create, or adopt_tab to take one of the user's tabs.`);
     const tab = await this.api.tabs.get(tabId);
     if (!tab) {
       this.tabs.forget(tabId);

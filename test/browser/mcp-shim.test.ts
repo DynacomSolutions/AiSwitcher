@@ -29,6 +29,7 @@ test("initialize and notification", async () => {
 test("tools/list returns every tool; browser prop on all but list_browsers", async () => {
   const r: any = await handleRpc({ id: 2, method: "tools/list" }, ctx());
   expect(r.result.tools.map((t: any) => t.name)).toEqual([...BROWSER_TOOLS]);
+  expect(r.result.tools.map((t: any) => t.name)).not.toContain("upload_file");
   for (const t of r.result.tools) {
     expect(t.inputSchema.properties.browser !== undefined).toBe(t.name !== "list_browsers");
   }

@@ -15,15 +15,18 @@ export interface GatewayStore {
   getBrowserBinding(name: string): Promise<BrowserBinding | undefined>;
   listBrowserBindings(): Promise<BrowserBinding[]>;
   revokeBrowserBinding(name: string): Promise<void>;
+  /** Records the last time a browser authenticated; changes nothing else (so it cannot undo a revoke). */
+  touchBrowserBinding(name: string, at: string): Promise<void>;
   /** Stores only the hash; the binding name goes in the `app` field of the returned records. */
   addBrowserToken(binding: string, prefix: string, hash: string): Promise<void>;
-  browserTokensFor(binding: string): Promise<TokenRecord[]>;
   /** The browser token with this prefix (binding name in `app`), or undefined. */
   browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined>;
   putPairing(p: BrowserPairing): Promise<void>;
   /** Returns expired pairings too; the caller enforces expiry. */
   getPairing(code: string): Promise<BrowserPairing | undefined>;
   deletePairing(code: string): Promise<void>;
+  /** Removes every pairing whose expiry is at or before `now`. */
+  deleteExpiredPairings(now: Date): Promise<void>;
   /** Atomically deletes the pairing and returns it; undefined if it was already gone (so only one caller wins). */
   claimPairing(code: string): Promise<BrowserPairing | undefined>;
   addAgentToken(r: AgentTokenRecord): Promise<void>;
@@ -101,6 +104,11 @@ export class MemoryGatewayStore implements GatewayStore {
     return [...this.bindings.values()].map((b) => ({ ...b, target: { ...b.target } }));
   }
 
+  async touchBrowserBinding(name: string, at: string): Promise<void> {
+    const b = this.bindings.get(name);
+    if (b) b.lastSeenAt = at;
+  }
+
   async revokeBrowserBinding(name: string): Promise<void> {
     const b = this.bindings.get(name);
     if (b) b.state = "revoked";
@@ -108,10 +116,6 @@ export class MemoryGatewayStore implements GatewayStore {
 
   async addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
     this.browserTokens.push({ app: binding, prefix, hash, createdAt: new Date().toISOString() });
-  }
-
-  async browserTokensFor(binding: string): Promise<TokenRecord[]> {
-    return this.browserTokens.filter((t) => t.app === binding).map((t) => ({ ...t }));
   }
 
   async browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
@@ -136,6 +140,10 @@ export class MemoryGatewayStore implements GatewayStore {
 
   async deletePairing(code: string): Promise<void> {
     this.pairings.delete(code);
+  }
+
+  async deleteExpiredPairings(now: Date): Promise<void> {
+    for (const [code, p] of this.pairings) if (Date.parse(p.expiresAt) <= now.getTime()) this.pairings.delete(code);
   }
 
   async addAgentToken(r: AgentTokenRecord): Promise<void> {

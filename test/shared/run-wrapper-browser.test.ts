@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { browserMcpArgs } from "../../src/shared/browser-wiring.ts";
+import { browserLaunchEnv, browserMcpArgs } from "../../src/shared/browser-wiring.ts";
 
 const yes = { exists: () => true };
 const no = { exists: () => false };
@@ -17,6 +17,7 @@ test("codex gets -c overrides with args and env_vars", () => {
     "-c", 'mcp_servers.ais-browser.command="/bin/ais"',
     "-c", `mcp_servers.ais-browser.args=${JSON.stringify(shim)}`,
     "-c", 'mcp_servers.ais-browser.env_vars=["CODEX_HOME","AIS_GATEWAY_PROXY_URL","AI_PROFILE_SWITCHER_SESSION"]',
+    "-c", "mcp_servers.ais-browser.tool_timeout_sec=135",
   ]);
 });
 
@@ -31,4 +32,17 @@ test("nothing without token file, retired, other tools, or claude subcommands", 
   expect(browserMcpArgs("kimi", "/c", {}, "/bin/ais", yes)).toEqual([]);
   for (const sub of ["mcp", "doctor", "update", "config", "install"]) expect(browserMcpArgs("claude", "/c", {}, "/bin/ais", { ...yes, firstArg: sub })).toEqual([]);
   expect(browserMcpArgs("claude", "/c", {}, "/bin/ais", { ...yes, firstArg: "hello" }).length).toBe(1);
+});
+
+test("no installed ais binary means no wiring at all", () => {
+  expect(browserMcpArgs("claude", "/c", {}, undefined, yes)).toEqual([]);
+  expect(browserMcpArgs("codex", "/c", {}, undefined, yes)).toEqual([]);
+});
+
+test("claude launch gets MCP_TOOL_TIMEOUT=135000 only when wired and not already set", () => {
+  const wired = ["--mcp-config={}"];
+  expect(browserLaunchEnv("claude", wired, {})).toEqual({ MCP_TOOL_TIMEOUT: "135000" });
+  expect(browserLaunchEnv("claude", wired, { MCP_TOOL_TIMEOUT: "60000" })).toEqual({});
+  expect(browserLaunchEnv("claude", [], {})).toEqual({});
+  expect(browserLaunchEnv("codex", wired, {})).toEqual({});
 });

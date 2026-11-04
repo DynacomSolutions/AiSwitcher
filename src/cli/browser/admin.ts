@@ -82,7 +82,7 @@ export async function runBrowserAdmin(sub: string | undefined, rest: string[], f
       const bindings = Array.isArray(json.bindings) ? (json.bindings as Record<string, unknown>[]) : [];
       if (boolFlag(flags, "json")) return deps.out(JSON.stringify(json, null, 2));
       if (bindings.length === 0) return deps.out("no browser bindings");
-      deps.out(table(["NAME", "TARGET", "PROFILE", "STATE"], bindings.map((b) => [str(b.name), targetText(b.target), str(b.profileLabel), str(b.state)])));
+      deps.out(table(["NAME", "TARGET", "PROFILE", "STATE", "LAST SEEN"], bindings.map((b) => [str(b.name), targetText(b.target), str(b.profileLabel), str(b.state), str(b.lastSeenAt) || "never"])));
       return;
     }
     case "revoke": {
@@ -124,6 +124,7 @@ export async function runBrowserAdmin(sub: string | undefined, rest: string[], f
         throw e;
       }
       deps.out(`agent token for ${identity} written to ${local.dirs.map((d) => join(d, BROWSER_TOKEN_FILE)).join(", ")} and ~/.secrets (${agentTokenKey(identity)})`);
+      deps.out("Mint once per identity, not per host: ais sync distributes the token file to your other hosts.");
       return;
     }
     default:

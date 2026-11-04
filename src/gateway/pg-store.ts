@@ -206,13 +206,12 @@ export class PgGatewayStore implements GatewayStore {
     await this.sql`UPDATE browser_bindings SET state = 'revoked' WHERE name = ${name}`;
   }
 
-  async addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
-    await this.sql`INSERT INTO browser_tokens (binding, prefix, hash) VALUES (${binding}, ${prefix}, ${hash})`;
+  async touchBrowserBinding(name: string, at: string): Promise<void> {
+    await this.sql`UPDATE browser_bindings SET last_seen_at = ${at}::timestamptz WHERE name = ${name}`;
   }
 
-  async browserTokensFor(binding: string): Promise<TokenRecord[]> {
-    const rows = await this.sql`SELECT * FROM browser_tokens WHERE binding = ${binding} ORDER BY id`;
-    return rows.map((r: Row) => ({ app: r.binding, prefix: r.prefix, hash: r.hash, createdAt: iso(r.created_at) }));
+  async addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
+    await this.sql`INSERT INTO browser_tokens (binding, prefix, hash) VALUES (${binding}, ${prefix}, ${hash})`;
   }
 
   async browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
@@ -263,6 +262,10 @@ export class PgGatewayStore implements GatewayStore {
 
   async deletePairing(code: string): Promise<void> {
     await this.sql`DELETE FROM browser_pairings WHERE code = ${code}`;
+  }
+
+  async deleteExpiredPairings(now: Date): Promise<void> {
+    await this.sql`DELETE FROM browser_pairings WHERE expires_at <= ${now.toISOString()}::timestamptz`;
   }
 
   async addAgentToken(r: AgentTokenRecord): Promise<void> {

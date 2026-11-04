@@ -40,13 +40,6 @@ export function createCallRoutes(deps: CallDeps): Hono {
   }
   const summary = (b: BrowserBinding) => ({ name: b.name, profileLabel: b.profileLabel, target: b.target });
 
-  hono.get("/list", async (c) => {
-    const a = await agent(c.req.raw);
-    if (!a) return c.json({ error: "unauthorised" }, 401);
-    const allowed = await allowedBindings(a.identity, deps.hub.connected(), poolMembers);
-    return c.json({ browsers: allowed.map(summary) });
-  });
-
   hono.post("/call", async (c) => {
     const a = await agent(c.req.raw);
     if (!a) return c.json({ error: "unauthorised" }, 401);

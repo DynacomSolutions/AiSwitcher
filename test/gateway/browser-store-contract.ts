@@ -42,14 +42,24 @@ export function browserStoreContract(make: () => Promise<GatewayStore>): void {
     expect((await s.getBrowserBinding("work-laptop"))?.state).toBe("revoked");
   });
 
-  test("browser tokens store prefix and hash per binding", async () => {
+  test("touchBrowserBinding sets lastSeenAt and nothing else", async () => {
     const s = await make();
     await s.putBrowserBinding(binding);
-    await s.addBrowserToken("work-laptop", "pre1", "hash1");
-    const toks = await s.browserTokensFor("work-laptop");
-    expect(toks).toHaveLength(1);
-    expect(toks[0]).toMatchObject({ app: "work-laptop", prefix: "pre1", hash: "hash1" });
-    expect(await s.browserTokensFor("other")).toEqual([]);
+    await s.revokeBrowserBinding("work-laptop");
+    await s.touchBrowserBinding("work-laptop", "2026-11-04T02:00:00.000Z");
+    expect(await s.getBrowserBinding("work-laptop")).toEqual({ ...binding, state: "revoked", lastSeenAt: "2026-11-04T02:00:00.000Z" });
+    await s.touchBrowserBinding("ghost", "2026-11-04T02:00:00.000Z");
+    expect(await s.getBrowserBinding("ghost")).toBeUndefined();
+  });
+
+  test("deleteExpiredPairings removes only expired pairings", async () => {
+    const s = await make();
+    const fresh: BrowserPairing = { ...pairing, code: "FRSH-0001", expiresAt: "2026-11-04T12:00:00.000Z" };
+    await s.putPairing(pairing);
+    await s.putPairing(fresh);
+    await s.deleteExpiredPairings(new Date("2026-11-04T10:00:00.000Z"));
+    expect(await s.getPairing(pairing.code)).toBeUndefined();
+    expect(await s.getPairing(fresh.code)).toEqual(fresh);
   });
 
   test("claimPairing returns the pairing once", async () => {

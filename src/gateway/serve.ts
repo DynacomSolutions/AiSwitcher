@@ -211,7 +211,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
   const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
 
-  const hub = new BrowserHub({ authToken: (t) => authBrowserToken(store, t), metrics });
+  const hub = new BrowserHub({ authToken: async (t) => {
+      const b = await authBrowserToken(store, t);
+      if (b) await store.touchBrowserBinding(b.name, new Date().toISOString()).catch(() => {});
+      return b;
+    },
+    metrics });
   metrics.browserGauges = { connected: () => hub.connected().length, sessions: () => hub.activeSessions() };
 
   const proxy = createGatewayApp({

@@ -108,6 +108,7 @@ export function createPairRoutes(deps: BrowserDeps): Hono {
     }
     const label = body?.profileLabel;
     if (typeof label !== "string" || label.trim() === "" || label.length > MAX_LABEL) return c.json({ error: `profileLabel is required (1 to ${MAX_LABEL} characters)` }, 400);
+    await deps.store.deleteExpiredPairings(deps.now());
     let code = generatePairingCode();
     for (let i = 0; i < 5 && (await deps.store.getPairing(code)); i++) code = generatePairingCode();
     const pollSecret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");

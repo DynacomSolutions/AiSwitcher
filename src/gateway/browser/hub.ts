@@ -187,7 +187,8 @@ export class BrowserHub {
     const p = this.pending.get(id);
     if (!p) return;
     this.send(p.ws, { t: "abort", id });
-    this.settle(id, { id, ok: false, error: "internal", message: "The caller went away." });
+    // Labelled "timeout" (the caller gave up waiting) so it does not inflate the "internal" outcome metric.
+    this.settle(id, { id, ok: false, error: "timeout", message: "The caller went away." });
   }
 
   call(binding: string, req: CallRequest, timeoutMs: number): Promise<CallResult> {
@@ -208,7 +209,9 @@ export class BrowserHub {
       }, timeoutMs);
       this.pending.set(req.id, { ws: conn.ws, tool: req.tool, started, timer, resolve: (r) => resolve(finish(r)) });
       try {
-        conn.ws.send(JSON.stringify({ t: "call", req } satisfies GatewayToExt));
+        // Bun's ServerWebSocket.send returns 0 when the message was dropped and -1 under backpressure.
+        const sent = conn.ws.send(JSON.stringify({ t: "call", req } satisfies GatewayToExt));
+        if (sent === 0 || sent === -1) this.settle(req.id, { id: req.id, ok: false, error: "browser_disconnected", message: "The browser connection failed." });
       } catch {
         this.settle(req.id, { id: req.id, ok: false, error: "browser_disconnected", message: "The browser connection failed." });
       }

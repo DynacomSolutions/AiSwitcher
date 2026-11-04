@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { isRetired } from "../identities/retired.ts";
 import type { Identity } from "../identities/types.ts";
 
+/** Longest relay call (wait: 120 s) plus margin; the MCP client must not give up first. */
+const TOOL_TIMEOUT_SEC = 135;
 const TOKEN_FILE = "ais-browser-token";
 
 /** Claude subcommands: a leading --mcp-config would precede them, so they get no wiring. */
@@ -23,8 +25,9 @@ export interface BrowserWiring {
  * server environment); the token itself stays in the 0600 file. Claude: --mcp-config=<json>
  * (single-token form; the flag is variadic). Codex: root -c overrides.
  */
-export function browserMcpArgs(tool: string, configDir: string, identity: Pick<Identity, "retired"> | undefined, aisBinary: string, w: BrowserWiring = {}): string[] {
+export function browserMcpArgs(tool: string, configDir: string, identity: Pick<Identity, "retired"> | undefined, aisBinary: string | undefined, w: BrowserWiring = {}): string[] {
   if (tool !== "claude" && tool !== "codex") return [];
+  if (aisBinary === undefined) return []; // never fall back to the running executable (it may be bun, not ais)
   if (identity && isRetired(identity)) return [];
   if (!(w.exists ?? existsSync)(join(configDir, TOKEN_FILE))) return [];
   if (tool === "claude" && w.firstArg !== undefined && CLAUDE_SUBCOMMANDS.has(w.firstArg)) return [];
@@ -36,5 +39,15 @@ export function browserMcpArgs(tool: string, configDir: string, identity: Pick<I
     "-c", `mcp_servers.ais-browser.command=${JSON.stringify(aisBinary)}`,
     "-c", `mcp_servers.ais-browser.args=${JSON.stringify(shimArgs)}`,
     "-c", `mcp_servers.ais-browser.env_vars=["CODEX_HOME","AIS_GATEWAY_PROXY_URL","AI_PROFILE_SWITCHER_SESSION"]`,
+    "-c", `mcp_servers.ais-browser.tool_timeout_sec=${TOOL_TIMEOUT_SEC}`,
   ];
+}
+
+/**
+ * Env for the claude launch when the browser server is wired. Claude Code has no per-server
+ * timeout field in its MCP config, only the MCP_TOOL_TIMEOUT env (ms); set it unless the user did.
+ */
+export function browserLaunchEnv(tool: string, browserArgs: string[], env: Record<string, string | undefined>): Record<string, string> {
+  if (tool !== "claude" || browserArgs.length === 0 || env.MCP_TOOL_TIMEOUT !== undefined) return {};
+  return { MCP_TOOL_TIMEOUT: String(TOOL_TIMEOUT_SEC * 1000) };
 }

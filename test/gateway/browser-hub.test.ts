@@ -6,9 +6,11 @@ import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 
 class FakeWs implements HubSocket {
   sent: Array<Record<string, unknown>> = [];
+  sendResult: unknown = undefined;
   closed?: { code?: number; reason?: string };
   send(d: string) {
     this.sent.push(JSON.parse(d) as Record<string, unknown>);
+    return this.sendResult;
   }
   close(code?: number, reason?: string) {
     this.closed = { code, reason };
@@ -156,6 +158,29 @@ describe("BrowserHub", () => {
     expect(a.closed?.code).toBe(1012);
     expect(b.closed?.code).toBe(1012);
     expect(hub.connected()).toEqual([]);
+  });
+
+  test("a failed send (0 or -1) settles browser_disconnected at once", async () => {
+    for (const code of [0, -1]) {
+      const hub = mk();
+      const ws = new FakeWs();
+      await hello(hub, ws);
+      ws.sendResult = code;
+      expect(await hub.call("work", req(`c${code}`), 60_000)).toMatchObject({ ok: false, error: "browser_disconnected" });
+    }
+  });
+
+  test("a caller abort settles as timeout, not internal", async () => {
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const hub = mk({ metrics });
+    const ws = new FakeWs();
+    await hello(hub, ws);
+    const p = hub.call("work", req("a1"), 60_000);
+    hub.abort("a1");
+    expect(await p).toMatchObject({ ok: false, error: "timeout" });
+    const text = metrics.render();
+    expect(text).toContain('outcome="timeout"');
+    expect(text).not.toContain('outcome="internal"');
   });
 
   test("metrics count calls by tool and outcome, never content", async () => {

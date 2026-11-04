@@ -72,6 +72,13 @@ describe("browser pairing", () => {
     expect((await post("/browser/pair/poll", { code: p.code, pollSecret: p.pollSecret })).status).toBe(410);
   });
 
+  test("POST /browser/pair prunes expired pairings", async () => {
+    const p = await startPair();
+    nowMs += 10 * 60_000 + 1;
+    await startPair();
+    expect(await store.getPairing(p.code)).toBeUndefined();
+  });
+
   test("11th pair from one IP in a minute is 429; other IPs and later minutes are fine", async () => {
     for (let i = 0; i < 10; i++) expect((await post("/browser/pair", { profileLabel: "x" })).status).toBe(200);
     expect((await post("/browser/pair", { profileLabel: "x" })).status).toBe(429);

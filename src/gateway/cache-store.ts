@@ -109,12 +109,12 @@ export class CachedGatewayStore implements GatewayStore {
     return this.inner.revokeBrowserBinding(name);
   }
 
-  addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
-    return this.inner.addBrowserToken(binding, prefix, hash);
+  touchBrowserBinding(name: string, at: string): Promise<void> {
+    return this.inner.touchBrowserBinding(name, at);
   }
 
-  browserTokensFor(binding: string): Promise<TokenRecord[]> {
-    return this.inner.browserTokensFor(binding);
+  addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
+    return this.inner.addBrowserToken(binding, prefix, hash);
   }
 
   browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
@@ -135,6 +135,10 @@ export class CachedGatewayStore implements GatewayStore {
 
   deletePairing(code: string): Promise<void> {
     return this.inner.deletePairing(code);
+  }
+
+  deleteExpiredPairings(now: Date): Promise<void> {
+    return this.inner.deleteExpiredPairings(now);
   }
 
   addAgentToken(r: AgentTokenRecord): Promise<void> {

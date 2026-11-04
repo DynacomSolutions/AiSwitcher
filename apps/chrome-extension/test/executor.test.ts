@@ -38,7 +38,7 @@ describe("tab ownership", () => {
     api.tabList.delete(id); // closed without the onRemoved event reaching us
     const r = await executor.run(call("read_page", { tabId: id }));
     expect(r).toMatchObject({ ok: false, error: "tab_closed" });
-    expect(tabs.owns("s1", id)).toBe(false);
+    expect(tabs.owns("s1", id, "dyn")).toBe(false);
   });
 
   test("tabs_create groups with session label and a stable colour per identity", async () => {
@@ -46,7 +46,7 @@ describe("tab ownership", () => {
     const r = await executor.run(call("tabs_create", { url: "example.test" }));
     expect(r.ok).toBe(true);
     const { tabId } = JSON.parse(textOf(r));
-    expect(tabs.owns("s1", tabId)).toBe(true);
+    expect(tabs.owns("s1", tabId, "dyn")).toBe(true);
     const group = api.groups.get(api.tabList.get(tabId)!.groupId)!;
     expect(group.title).toBe("dyn / s1");
     expect(group.color).toBe(colorForIdentity("dyn"));
@@ -67,6 +67,9 @@ describe("tab ownership", () => {
     expect(ctx.sessionTabs.map((t: { tabId: number }) => t.tabId).sort()).toEqual([7, ownId].sort());
     const other = { id: "s2", identity: "x", label: "x / s2" };
     expect(await executor.run(call("adopt_tab", { tabId: 7 }, other))).toMatchObject({ ok: false, error: "forbidden_tab" });
+    const sameIdOtherIdentity = { id: "s1", identity: "x", label: "x / s1" };
+    expect(await executor.run(call("adopt_tab", { tabId: 7 }, sameIdOtherIdentity))).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(await executor.run(call("screenshot", { tabId: 7 }, sameIdOtherIdentity))).toMatchObject({ ok: false, error: "forbidden_tab" });
     ctx = JSON.parse(textOf(await executor.run(call("tabs_context", {}, other))));
     expect(ctx.otherTabs.map((t: { tabId: number }) => t.tabId)).not.toContain(7);
   });
@@ -81,8 +84,8 @@ describe("tab persistence and groups", () => {
     api.tabList.delete(b.id);
     const tabs2 = new TabManager(api);
     await tabs2.load();
-    expect(tabs2.owns("s1", a.id)).toBe(true);
-    expect(tabs2.owns("s1", b.id)).toBe(false);
+    expect(tabs2.owns("s1", a.id, "dyn")).toBe(true);
+    expect(tabs2.owns("s1", b.id, "dyn")).toBe(false);
     expect(tabs2.sessions.get("s1")).toMatchObject({ groupId: gid, label: "dyn / s1", identity: "dyn" });
   });
 
@@ -93,8 +96,8 @@ describe("tab persistence and groups", () => {
     const r = await executor.run(call("tabs_create"));
     expect(r.ok).toBe(true);
     const { tabId } = JSON.parse(textOf(r));
-    expect(tabs.owns("s1", tabId)).toBe(true);
-    expect(tabs.owns("s1", first.id)).toBe(true);
+    expect(tabs.owns("s1", tabId, "dyn")).toBe(true);
+    expect(tabs.owns("s1", first.id, "dyn")).toBe(true);
     expect(api.groups.get(tabs.sessions.get("s1")!.groupId)?.title).toBe("dyn / s1");
   });
 });
@@ -194,7 +197,8 @@ describe("args and tools", () => {
   });
 
   test("every tool except list_browsers has a schema", () => {
-    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(20);
+    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(19);
+    expect(Object.keys(TOOL_SCHEMAS)).not.toContain("upload_file");
     expect(validateToolArgs("click", { tabId: 1, coordinate: [1, 2] })).toBeUndefined();
     expect(validateToolArgs("click", { tabId: 1, coordinate: [1] })).toBeDefined();
     expect(validateToolArgs("click", { tabId: 1, junk: 1 })).toBeDefined();

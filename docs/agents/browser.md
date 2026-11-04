@@ -15,15 +15,17 @@ Lets Claude and Codex sessions drive a real Chrome profile through the gateway. 
 1. Open the extension options page. Set Gateway URL to the `wss://` form of the host in `AIS_GATEWAY_PROXY_URL` (same host, `wss://` instead of `https://`). `ws://` is accepted only for localhost.
 2. Press Sign in. The page shows a pairing code.
 3. On a machine with the gateway admin settings in `~/.secrets`: `ais browser approve <CODE> --identity=<id>` or `--pool=<pool>` (exactly one; `--name=<n>` names the binding). An identity binding serves that identity; a pool binding serves every identity in the swap pool.
-4. `ais browser list [--json]` shows bindings.
+4. `ais browser list [--json]` shows bindings and when each browser last connected.
 
 ## Agent tokens
 
-On each agent host run `ais browser agent-token <identity>`. It mints a token (replacing any earlier one), writes it 0600 to `<configDir>/ais-browser-token` for the identity's claude and codex config dirs and to `~/.secrets` as `AIS_BROWSER_AGENT_<IDENTITY>_TOKEN`, and never prints it. Then relaunch the sessions: launches that find a token wire the `ais-browser` MCP server. `--revoke` removes the token everywhere.
+Run `ais browser agent-token <identity>` once per identity, not per host; `ais sync` distributes the token file to your other hosts. It mints a token (replacing any earlier one), writes it 0600 to `<configDir>/ais-browser-token` for the identity's claude and codex config dirs and to `~/.secrets` as `AIS_BROWSER_AGENT_<IDENTITY>_TOKEN`, and never prints it. Then relaunch the sessions: launches that find a token wire the `ais-browser` MCP server. `--revoke` removes the token everywhere.
 
 ## Tools
 
-`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `javascript`, `get_console`, `get_network`, `wait`, `upload_file`, `resize`, `close_tab`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`.
+`list_browsers`, `tabs_context`, `tabs_create`, `adopt_tab`, `navigate`, `screenshot`, `read_page`, `find`, `click`, `type`, `key`, `scroll`, `hover`, `form_input`, `javascript`, `get_console`, `get_network`, `wait`, `resize`, `close_tab`. Every tool except `list_browsers` takes an optional `browser` argument, required only when several browsers are connected. Tabs must be created by the agent or adopted with `adopt_tab`; other tabs fail with `forbidden_tab`. Ownership needs both the session id and the identity that created it to match.
+
+File upload is deliberately unsupported: it would let an agent read arbitrary local files on the Mac running Chrome (other identities' tokens, `~/.secrets`), which breaks identity isolation.
 
 ## Pause, Stop, revoke
 
@@ -31,6 +33,15 @@ On each agent host run `ais browser agent-token <identity>`. It mints a token (r
 - Stop: ends the agent's calls with `stopped_by_user`.
 - `ais browser revoke <name>` revokes the binding and drops its connection; the profile must pair again.
 - Error codes: `paused_by_user`, `stopped_by_user`, `no_browser`, `ambiguous_browser`, `forbidden_tab`, `tab_closed`, `tab_hidden`, `timeout`, `browser_disconnected`, `bad_args`, `internal`.
+
+## Deploy requirements
+
+- The Emissary Mapping for the gateway needs `allow_upgrade: [websocket]` and `timeout_ms` of 0 or at least 130000, or long calls and the socket are cut.
+- The gateway runs as a single replica.
+
+## Tool timeout
+
+The relay allows up to 125 s per call (`wait`). Codex is wired with `mcp_servers.ais-browser.tool_timeout_sec=135`. Claude Code's MCP config has no per-server timeout field; its `MCP_TOOL_TIMEOUT` env (ms) must be at least 135000. AIS sets `MCP_TOOL_TIMEOUT=135000` for the claude launch only when it is not already set.
 
 ## Limits
 

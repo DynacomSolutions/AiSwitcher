@@ -23,7 +23,7 @@ import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { browserMcpArgs } from "./browser-wiring.ts";
+import { browserLaunchEnv, browserMcpArgs } from "./browser-wiring.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
@@ -161,7 +161,7 @@ export async function runWrapper(
       sharedConfigArgs,
     );
     const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
-    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary() ?? process.execPath, {
+    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary(), {
       ...(activeIdentity !== undefined ? { identityName: activeIdentity } : {}),
       ...(gatewayUrl ? { gateway: gatewayUrl } : {}),
       ...(parsed.cleanedArgv[0] !== undefined ? { firstArg: parsed.cleanedArgv[0] } : {}),
@@ -211,6 +211,7 @@ export async function runWrapper(
             }
           })(),
           ...extraEnv,
+          ...browserLaunchEnv(cfg.toolName, browserArgs, process.env),
           ...memoryProjection.env,
           ...(titleOwnerPid !== undefined ? { AIS_HERDR_TITLE_OWNER_PID: titleOwnerPid } : {}),
           ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),

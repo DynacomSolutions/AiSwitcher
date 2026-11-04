@@ -28,7 +28,6 @@ export interface ToolArgs {
   get_console: TabArgs & { onlyErrors?: boolean; pattern?: string; clear?: boolean };
   get_network: TabArgs & { urlPattern?: string; clear?: boolean };
   wait: { seconds: number };
-  upload_file: TabArgs & { ref: string; paths: string[] };
   resize: TabArgs & { width: number; height: number };
   close_tab: TabArgs;
 }
@@ -62,7 +61,7 @@ export const TOOL_SCHEMAS: Record<ExtensionTool, { description: string; inputSch
   adopt_tab: { description: "Move one of the user's tabs into this session's tab group so it can be controlled.", inputSchema: obj({ tabId }, ["tabId"]) },
   navigate: { description: "Navigate a tab to a URL, or go \"back\" or \"forward\" in its history.", inputSchema: obj({ tabId, url: { type: "string", description: "http(s) URL, or the literal \"back\" or \"forward\"." } }, ["tabId", "url"]) },
   screenshot: { description: "Capture a JPEG screenshot of the tab viewport, scaled to at most 1568 px on the long edge. Coordinates passed to click, hover and scroll are in this image's pixel space.", inputSchema: obj({ tabId }, ["tabId"]) },
-  read_page: { description: "Return the accessibility tree of the page as text with element refs (ref_N) usable by click, type, form_input, scroll and upload_file.", inputSchema: obj({ tabId, filter: { type: "string", enum: ["interactive", "all"], description: "interactive (default) lists only actionable elements." } }, ["tabId"]) },
+  read_page: { description: "Return the accessibility tree of the page as text with element refs (ref_N) usable by click, type, form_input and scroll.", inputSchema: obj({ tabId, filter: { type: "string", enum: ["interactive", "all"], description: "interactive (default) lists only actionable elements." } }, ["tabId"]) },
   find: { description: "Find elements whose role, name or value contains the query text. Returns matching refs.", inputSchema: obj({ tabId, query: { type: "string" } }, ["tabId", "query"]) },
   click: { description: "Click an element by ref, or a point by coordinate.", inputSchema: obj({ tabId, ref, coordinate, button: { type: "string", enum: ["left", "right", "middle"] }, clickCount: { type: "number", minimum: 1, maximum: 3, description: "2 for double click." } }, ["tabId"]) },
   type: { description: "Type text into the focused element, or into the element given by ref.", inputSchema: obj({ tabId, text: { type: "string" }, ref }, ["tabId", "text"]) },
@@ -74,7 +73,6 @@ export const TOOL_SCHEMAS: Record<ExtensionTool, { description: string; inputSch
   get_console: { description: "Return console messages and log entries collected since the extension attached to the tab.", inputSchema: obj({ tabId, onlyErrors: { type: "boolean" }, pattern: { type: "string", description: "Case-insensitive substring filter." }, clear: { type: "boolean" } }, ["tabId"]) },
   get_network: { description: "Return network requests collected since the extension attached to the tab.", inputSchema: obj({ tabId, urlPattern: { type: "string", description: "Case-insensitive substring filter." }, clear: { type: "boolean" } }, ["tabId"]) },
   wait: { description: "Wait for a number of seconds (at most 120).", inputSchema: obj({ seconds: { type: "number", minimum: 0, maximum: 120 } }, ["seconds"]) },
-  upload_file: { description: "Set files on a file input by ref. Paths are on the machine running the browser.", inputSchema: obj({ tabId, ref, paths: { type: "array", items: { type: "string" }, minItems: 1 } }, ["tabId", "ref", "paths"]) },
   resize: { description: "Resize the browser window containing the tab.", inputSchema: obj({ tabId, width: { type: "number", minimum: 200, maximum: 10000 }, height: { type: "number", minimum: 200, maximum: 10000 } }, ["tabId", "width", "height"]) },
   close_tab: { description: "Close a tab owned by this session.", inputSchema: obj({ tabId }, ["tabId"]) },
 };
