@@ -156,3 +156,4 @@ ETA: 2026-11-06 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 120 | AIS Browser: Chrome extension agents drive via the gateway | in_progress | claude-20261104-browser | ais-browser | | 2026-11-06 18:00 ICT | Spec and plan: .data/DynacomSolutions/AiSwitcher/specs/2026-11-04-ais-chrome-extension-*.md<br>Branch ais-browser |
+| 121 | Release v0.5.24 with extension zip | blocked_on_owner | Thomas | | | | PR 362 merged, main at 0.5.24<br>Agent dispatch refused (public release)<br>Run: gh workflow run release.yml --repo DynacomSolutions/AiSwitcher -f tag=v0.5.24 |
