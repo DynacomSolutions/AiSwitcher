@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { expandPath } from "../identities/match.ts";
-import { findPool } from "../identities/pool/swap-pool.ts";
+import { allowedAccounts, findPool } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
@@ -171,7 +171,10 @@ export async function resolvePoolAuth(poolName: string, tool: string, registryPa
   if (!active) return { error: `internal: swap pool ${poolName} has no active member` };
   const member = findIdentityByNameOrAlias(file.identities, active);
   const name = member?.name ?? active;
-  const token = member && !isRetired(member) ? await readTokenFile(expandPath(member.configDir)) : undefined;
+  if (!member) return { identity: name, error: `active pool member ${name} of pool ${pool.name} is not a known identity` };
+  if (isRetired(member)) return { identity: name, error: `active pool member ${name} of pool ${pool.name} is retired` };
+  if (!allowedAccounts(pool).includes(member.name)) return { identity: name, error: `active pool member ${name} is not allowed in pool ${pool.name}` };
+  const token = await readTokenFile(expandPath(member.configDir));
   if (!token) return { identity: name, error: `no AIS Browser agent token for identity ${name}; run ais browser agent-token ${name}` };
   return { identity: name, token };
 }

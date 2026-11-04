@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { expandPath } from "../identities/match.ts";
-import { allowedAccounts, type PoolIdentity } from "../identities/pool/swap-pool.ts";
+import { allowedAccounts, isSwapPool, type PoolIdentity } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
@@ -35,6 +35,19 @@ export function poolMemberConfigDirs(file: IdentitiesFile, pool: PoolIdentity): 
     if (member && !isRetired(member)) dirs.push(expandPath(member.configDir));
   }
   return dirs;
+}
+
+/**
+ * Pool wiring input for a launch: set only for a claude/codex swap pool identity whose registry
+ * loads. This is the exact step run-wrapper performs before `browserMcpArgs`.
+ */
+export async function browserPoolWiring(toolName: string, identity: Identity | undefined, loadFile: () => Promise<IdentitiesFile>): Promise<BrowserWiring["pool"]> {
+  if (!identity || !isSwapPool(identity) || (toolName !== "claude" && toolName !== "codex")) return undefined;
+  try {
+    return { name: identity.name, memberConfigDirs: poolMemberConfigDirs(await loadFile(), identity) };
+  } catch {
+    return undefined;
+  }
 }
 
 /**

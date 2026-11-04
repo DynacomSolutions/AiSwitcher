@@ -154,4 +154,46 @@ describe("POST /browser/call", () => {
     expect(ws.sent.some((m) => m.t === "abort")).toBe(true);
     await res.catch(() => undefined);
   });
+
+  async function tokenFor(identity: string): Promise<string> {
+    const t = generateToken();
+    await store.addAgentToken({ identity, prefix: t.prefix, hash: t.hash, createdAt: "2026-11-04T00:00:00.000Z" });
+    return t.token;
+  }
+  /** Identity and label the extension is sent for the next call. */
+  function capture(ws: Ws): Array<{ identity: string; label: string }> {
+    const seen: Array<{ identity: string; label: string }> = [];
+    const orig = ws.send.bind(ws);
+    ws.send = (d: string) => {
+      const s = (JSON.parse(d) as { req?: { session: { identity: string; label: string } } }).req?.session;
+      if (s) seen.push({ identity: s.identity, label: s.label });
+      orig(d);
+    };
+    return seen;
+  }
+
+  test("pool binding: members a then b forward the same pool identity and label; identity binding keeps the real one", async () => {
+    const tokB = await tokenFor("id2");
+    const pool = await connect(b("p", { kind: "pool", pool: "main" }));
+    const seenPool = capture(pool);
+    const sess = { id: "abcdef123", label: "id1 / abcdef" };
+    answer(pool);
+    await call({ session: sess, tool: "screenshot" });
+    answer(pool);
+    await call({ session: { ...sess, label: "id2 / abcdef" }, tool: "screenshot" }, tokB);
+    expect(seenPool).toEqual([{ identity: "pool:main", label: "main / abcdef" }, { identity: "pool:main", label: "main / abcdef" }]);
+
+    const pin = await connect(b("i", { kind: "identity", identity: "id1" }));
+    const seenPin = capture(pin);
+    answer(pin);
+    await call({ session: sess, tool: "screenshot", browser: "i" });
+    expect(seenPin).toEqual([{ identity: "id1", label: "id1 / abcdef" }]);
+  });
+
+  test("a non-member is refused a pool binding", async () => {
+    const tokZ = await tokenFor("zzz");
+    await connect(b("p", { kind: "pool", pool: "main" }));
+    expect((await call({ session, tool: "screenshot", browser: "p" }, tokZ)).status).toBe(403);
+    expect(await (await call({ session, tool: "screenshot" }, tokZ)).json()).toMatchObject({ ok: false, error: "no_browser" });
+  });
 });

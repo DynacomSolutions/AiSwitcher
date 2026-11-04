@@ -151,6 +151,19 @@ test("pool mode resolves the active member per call, stable session id, clear mi
   expect(r.result.isError).toBe(true);
   expect(r.result.content[0].text).toBe("no AIS Browser agent token for identity c; run ais browser agent-token c");
   expect(seen.length).toBe(2);
+  mkdirSync(join(root, "d"));
+  writeFileSync(join(root, "d", "ais-browser-token"), "tok-d\n");
+  writeFileSync(registry, JSON.stringify({ version: 1, identities: [
+    ...["a", "d"].map((n) => ({ name: n, label: n, configDir: join(root, n) })),
+    { name: "pool", label: "pool", configDir: join(root, "pool"), swapPool: { accounts: ["a", "d"], disallowed: ["d"], active: "d" } },
+  ] }));
+  expect((await go()).result.content[0].text).toBe("active pool member d is not allowed in pool pool");
+  writeFileSync(registry, JSON.stringify({ version: 1, identities: [
+    { name: "a", label: "a", configDir: join(root, "a") },
+    { name: "pool", label: "pool", configDir: join(root, "pool"), swapPool: { accounts: ["a", "ghost"], active: "ghost" } },
+  ] }));
+  expect((await go()).result.content[0].text).toContain("is not a known identity");
+  expect(seen.length).toBe(2);
   rmSync(root, { recursive: true });
 });
 

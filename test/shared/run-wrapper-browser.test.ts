@@ -70,3 +70,19 @@ test("poolMemberConfigDirs skips disallowed and retired members", () => {
   const pool: any = { name: "p", configDir: "/p", swapPool: { accounts: ["a", "b", "c"], disallowed: ["c"] } };
   expect(poolMemberConfigDirs(file, pool)).toEqual(["/m/a"]);
 });
+
+import { browserPoolWiring } from "../../src/shared/browser-wiring.ts";
+
+test("launch path: swap pool identity -> member dirs -> --pool args; plain identity gets none", async () => {
+  const id = (name: string) => ({ name, label: name, configDir: `/m/${name}` });
+  const file: any = { version: 1, identities: [id("a"), id("b")] };
+  const pool: any = { name: "team-pool", label: "p", configDir: "/pool", swapPool: { accounts: ["a", "b"], active: "a" } };
+  const exists = (p: string) => p === "/m/b/ais-browser-token";
+  const wiring = await browserPoolWiring("claude", pool, async () => file);
+  expect(wiring).toEqual({ name: "team-pool", memberConfigDirs: ["/m/a", "/m/b"] });
+  const argv = browserMcpArgs("claude", "/pool", pool, "/bin/ais", { exists, ...(wiring ? { pool: wiring } : {}) });
+  expect(JSON.parse(argv[0]!.slice("--mcp-config=".length)).mcpServers["ais-browser"].args).toEqual(["browser", "mcp", "--pool", "team-pool", "--tool", "claude"]);
+  expect(await browserPoolWiring("claude", id("a") as any, async () => file)).toBeUndefined();
+  expect(await browserPoolWiring("kimi", pool, async () => file)).toBeUndefined();
+  expect(await browserPoolWiring("claude", pool, async () => { throw new Error("x"); })).toBeUndefined();
+});

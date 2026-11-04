@@ -16,7 +16,6 @@ import { codexSubcommandConfigArgs } from "./codex-config-args.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 import { gatePluginArgs } from "./plugin-gating.ts";
 import { poolLaunchCheck } from "../identities/pool/launch.ts";
-import { isSwapPool, type PoolIdentity } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { adapterFor } from "../identities/pool/registry.ts";
 import { runLaunchGate } from "../spend/gate.ts";
@@ -25,7 +24,7 @@ import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { browserLaunchEnv, browserMcpArgs, poolMemberConfigDirs } from "./browser-wiring.ts";
+import { browserLaunchEnv, browserMcpArgs, browserPoolWiring } from "./browser-wiring.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
@@ -163,9 +162,7 @@ export async function runWrapper(
       sharedConfigArgs,
     );
     const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
-    const browserPool = resolved.identity && isSwapPool(resolved.identity) && (cfg.toolName === "claude" || cfg.toolName === "codex")
-      ? await loadIdentitiesFile(cfg.identitiesJsonPath).then((file) => ({ name: resolved.identity!.name, memberConfigDirs: poolMemberConfigDirs(file, resolved.identity as PoolIdentity) }), () => undefined)
-      : undefined;
+    const browserPool = await browserPoolWiring(cfg.toolName, resolved.identity, () => loadIdentitiesFile(cfg.identitiesJsonPath));
     const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary(), {
       ...(activeIdentity !== undefined ? { identityName: activeIdentity } : {}),
       ...(gatewayUrl ? { gateway: gatewayUrl } : {}),
