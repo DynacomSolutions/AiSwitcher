@@ -1,8 +1,10 @@
+import type { GatewayMetrics } from "../metrics.ts";
 import type { GatewayStore } from "../store.ts";
 
 export interface BrowserDeps {
   store: GatewayStore;
   now(): Date;
+  metrics?: GatewayMetrics;
   /** Member accounts of a swap pool; undefined when no such pool exists. */
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
   /** Whether an identity exists. When absent, identity targets are not checked. */

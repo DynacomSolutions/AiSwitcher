@@ -7,6 +7,8 @@ import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { createAdminApp, type IdentityState } from "./admin.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
 import { createGatewayApp, styleForPath, type GatewayDeps } from "./app.ts";
+import { authBrowserToken } from "./browser/auth.ts";
+import { BrowserHub } from "./browser/hub.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
 import { CredentialCache, type RefreshFn } from "./credentials.ts";
 import { providerError } from "./errors.ts";
@@ -209,6 +211,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
   const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
 
+  const hub = new BrowserHub({ authToken: (t) => authBrowserToken(store, t), metrics });
+  metrics.browserGauges = { connected: () => hub.connected().length, sessions: () => hub.activeSessions() };
+
   const proxy = createGatewayApp({
     store,
     ledger,
@@ -218,6 +223,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     poolMembers,
     browserPoolMembers,
     browserIdentityExists,
+    browserHub: hub,
     fetch: hooks.fetch ?? fetch,
     now,
     metrics: recoverOnSuccess(metrics, alerter),
@@ -296,7 +302,21 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     port: opts.port,
     // The longest allowed idle gap; SSE streams carry their own keepalives.
     idleTimeout: 255,
+    websocket: {
+      // Screenshots arrive base64 inside one frame.
+      maxPayloadLength: 32 * 1024 * 1024,
+      open: (ws) => hub.open(ws),
+      message: (ws, data) => {
+        void hub.message(ws, typeof data === "string" ? data : data.toString("utf8"));
+      },
+      close: (ws) => hub.detach(ws),
+    },
     async fetch(req, srv) {
+      if (!draining && warmed && req.method === "GET" && new URL(req.url).pathname === "/browser/connect") {
+        // Authentication is the first `hello` message; the token is never in the URL.
+        if (srv.upgrade(req)) return undefined as unknown as Response;
+        return new Response("websocket upgrade required\n", { status: 426 });
+      }
       const res = await route(req, srv);
       if (draining) {
         // Keep-alive clients reconnect (to another replica) instead of reusing this connection.
@@ -339,6 +359,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       draining = true;
+      hub.closeAll(1012);
       wake?.();
       clearInterval(alertTimer);
       store.stop();

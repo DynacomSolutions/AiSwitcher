@@ -119,6 +119,7 @@ export function createPairRoutes(deps: BrowserDeps): Hono {
       const t = generateToken();
       await deps.store.addBrowserToken(binding.name, t.prefix, t.hash);
       await deps.store.deletePairing(code);
+      deps.metrics?.browserPairing();
       // The only time the token is ever returned.
       return c.json({ binding: binding.name, token: t.token, target: binding.target });
     } finally {
