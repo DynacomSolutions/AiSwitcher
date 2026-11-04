@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { BrowserTool, CallRequest } from "../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../src/browser/tool-args.ts";
 import { capText, Executor, jpegSize } from "../src/background/executor.ts";
+import type { ExecutorDeps } from "../src/background/executor.ts";
 import { State } from "../src/background/state.ts";
 import { colorForIdentity, TabManager } from "../src/background/tabs.ts";
 import type { Ui } from "../src/background/ui.ts";
@@ -11,11 +12,11 @@ const session = { id: "s1", identity: "dyn", label: "dyn / s1" };
 let n = 0;
 const call = (tool: BrowserTool, args: Record<string, unknown> = {}, s = session): CallRequest => ({ id: `c${n++}`, session: s, tool, args });
 
-function setup(ui?: Ui) {
+function setup(ui?: Ui, extra: Partial<ExecutorDeps> = {}) {
   const api = new FakeChrome();
   const state = new State(api.storage);
   const tabs = new TabManager(api);
-  const executor = new Executor({ api, tabs, state, ...(ui ? { ui } : {}), defaultTimeoutMs: 200 });
+  const executor = new Executor({ api, tabs, state, ...(ui ? { ui } : {}), defaultTimeoutMs: 200, ...extra });
   return { api, state, tabs, executor };
 }
 
@@ -468,5 +469,102 @@ describe("visuals and abort hygiene", () => {
     api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
     api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
     expect((await executor.run(call("screenshot", { tabId: tab.id }))).ok).toBe(true);
+  });
+
+  const VIEWPORT = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
+
+  test("a capture Chrome never answers returns tab_hidden within the cap and restores the overlay", async () => {
+    const r = recordingUi();
+    const { api, tabs, executor } = setup(r.ui, { captureTimeoutMs: 40, defaultTimeoutMs: 5000 });
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = VIEWPORT;
+    api.cdpResults["Page.captureScreenshot"] = () => new Promise(() => {});
+    const t0 = Date.now();
+    const res = await executor.run(call("screenshot", { tabId: tab.id }));
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(res).toMatchObject({ ok: false, error: "tab_hidden" });
+    expect((res as { message: string }).message).toBe(`Chrome did not render tab ${tab.id} (minimised or hidden window). Ask the user to bring the window forward, then retry.`);
+    expect(r.log.at(-1)).toBe(`restore:${tab.id}`);
+  });
+
+  test("a hung capture hit by the call timeout restores the overlay straight away (abort path)", async () => {
+    const r = recordingUi();
+    const { api, tabs, executor } = setup(r.ui, { defaultTimeoutMs: 50 });
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = VIEWPORT;
+    api.cdpResults["Page.captureScreenshot"] = () => new Promise(() => {});
+    const t0 = Date.now();
+    expect(await executor.run(call("screenshot", { tabId: tab.id }))).toMatchObject({ ok: false, error: "timeout" });
+    await new Promise(res => setTimeout(res, 10));
+    expect(Date.now() - t0).toBeLessThan(200);
+    expect(r.log.filter(l => l.startsWith("restore"))).toEqual([`restore:${tab.id}`]);
+  });
+
+  test("a tab that is not active is activated before the capture, and the wait is bounded when it never turns visible", async () => {
+    const { api, tabs, executor } = setup(undefined, { visibleWaitMs: 80 });
+    const tab = await tabs.create(session);
+    api.tabList.get(tab.id)!.active = false;
+    api.cdpResults["Page.getLayoutMetrics"] = VIEWPORT;
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    const order: string[] = [];
+    const activate = api.tabs.activate;
+    api.tabs.activate = async id => { order.push("activate"); await activate(id); };
+    const send = api.debugger.send;
+    api.debugger.send = async (id, m, p) => { if (m === "Page.captureScreenshot") order.push("capture"); return send(id, m, p); };
+    expect((await executor.run(call("screenshot", { tabId: tab.id }))).ok).toBe(true);
+    expect(order).toEqual(["activate", "capture"]);
+    expect(api.tabList.get(tab.id)!.active).toBe(true);
+  });
+
+  test("an already active tab is not activated; input tools activate a background tab too", async () => {
+    const { api, tabs, executor } = setup(undefined, { visibleWaitMs: 30 });
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = VIEWPORT;
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    await executor.run(call("screenshot", { tabId: tab.id }));
+    expect(api.activateCalls).toEqual([]);
+    api.tabList.get(tab.id)!.active = false;
+    api.cdpResults["Runtime.evaluate"] = { result: { value: "visible" } };
+    expect((await executor.run(call("key", { tabId: tab.id, key: "a" }))).ok).toBe(true);
+    expect(api.activateCalls).toEqual([tab.id]);
+    api.tabList.get(tab.id)!.active = false;
+    await executor.run(call("javascript", { tabId: tab.id, code: "1" }));
+    expect(api.activateCalls).toEqual([tab.id]); // javascript does not need the front
+  });
+
+  test("tabs_create opens the tab active, in its group", async () => {
+    const { api, executor } = setup();
+    const id = JSON.parse(textOf(await executor.run(call("tabs_create", { url: "example.test" })))).tabId;
+    expect(api.tabList.get(id)!.active).toBe(true);
+    expect(api.tabList.get(id)!.groupId).toBeGreaterThan(0);
+  });
+
+  test("after a hover the overlay stays hidden until the hold ends, the next non-hover call, or stop", async () => {
+    const r = recordingUi();
+    const { api, state, tabs, executor } = setup(r.ui, { hoverHoldMs: 60 });
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = VIEWPORT;
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    await executor.run(call("screenshot", { tabId: tab.id }));
+    const restores = () => r.log.filter(l => l.startsWith("restore")).length;
+    const base = restores();
+    expect((await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }))).ok).toBe(true);
+    expect(restores()).toBe(base); // still hidden right after the hover
+    await new Promise(res => setTimeout(res, 100));
+    expect(restores()).toBe(base + 1); // timer restored
+    // next non-hover call releases early
+    await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }));
+    expect(restores()).toBe(base + 1);
+    await executor.run(call("tabs_context"));
+    expect(restores()).toBe(base + 1); // tabs_context is not tab scoped
+    await executor.run(call("get_console", { tabId: tab.id }));
+    expect(restores()).toBe(base + 2);
+    // stop releases a pending hold
+    state.resume();
+    await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }));
+    await state.stop();
+    expect(restores()).toBe(base + 3);
+    await new Promise(res => setTimeout(res, 100));
+    expect(restores()).toBe(base + 3); // and the timer does not fire again
   });
 });

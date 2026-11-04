@@ -15,7 +15,7 @@ const entries = [
   ["src/content/index.ts", "content", "iife"],
 ] as const;
 for (const [entry, name, format] of entries) {
-  const result = await Bun.build({ entrypoints: [join(root, entry)], outdir: dist, target: "browser", format, naming: `${name}.js` });
+  const result = await Bun.build({ entrypoints: [join(root, entry)], outdir: dist, target: "browser", format, naming: `${name}.js`, define: { AIS_E2E: process.env.AIS_E2E === "1" ? "true" : "false" } });
   if (!result.success) {
     for (const log of result.logs) console.error(log);
     process.exit(1);

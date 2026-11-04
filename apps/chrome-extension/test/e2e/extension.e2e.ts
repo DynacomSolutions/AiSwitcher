@@ -190,7 +190,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
       await mkdir(join(runDir, "logs"), { recursive: true });
       await mkdir(join(runDir, "ext"));
       const extDir = realpathSync(join(runDir, "ext"));
-      const built = Bun.spawnSync(["bun", "run", "build.ts", extDir], { cwd: extRoot, stdout: "pipe", stderr: "pipe" });
+      const built = Bun.spawnSync(["bun", "run", "build.ts", extDir], { cwd: extRoot, stdout: "pipe", stderr: "pipe", env: { ...process.env, AIS_E2E: "1" } }); // AIS_E2E keeps the overlay inspection hooks in this build only
       if (built.exitCode !== 0) throw new Error(`extension build failed: ${built.stderr.toString()}`);
 
       site = Bun.serve({
@@ -200,7 +200,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
           const u = new URL(req.url);
           const body = u.pathname === "/second"
             ? `<h1>Second page</h1><p id="p">Landed.</p>`
-            : `<h1>Fixture</h1><p id="out">idle</p><button id="go" onclick="out.textContent='go clicked'">Go</button><button id="save" onclick="out.textContent='save clicked'">Save</button><button id="bottom" onclick="out.textContent='bottom clicked'">Bottom</button>`;
+            : `<h1>Fixture</h1><p id="out">idle</p><button id="go" onclick="out.textContent='go clicked'">Go</button><button id="save" onclick="out.textContent='save clicked'">Save</button><button id="bottom" onclick="out.textContent='bottom clicked'" onmouseenter="window.enters=(window.enters||0)+1" onmouseleave="window.leaves=(window.leaves||0)+1">Bottom</button>`;
           return new Response(page(u.pathname === "/second" ? "Second" : "Fixture", body), { headers: { "content-type": "text/html" } });
         },
       });
@@ -262,6 +262,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
 
   it("pairs through the options page, then connects", async () => {
     const opts = await extensionPage("options.html");
+    await until("options page loaded", () => opts.eval<boolean>(`document.getElementById("signin") !== null`));
     // The options page messages the worker, which starts it; only then does its target exist.
     const swTarget = await until("extension service worker", async () => (await targets()).find(t => t.type === "service_worker" && t.url.startsWith(`chrome-extension://${extId}/`)));
     sw = await cdp.attach(swTarget.targetId);
@@ -296,14 +297,30 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(info.groups.find(g => g.id === info.gb)?.title).toBe("id2 / sess-b");
   });
 
+  it("new tabs are active in their group; a deliberately backgrounded tab is re-activated for a capture", async () => {
+    const tabInfo = (id: number) => sw.eval<{ active: boolean; groupId: number }>(`chrome.tabs.get(${id}).then(t => ({ active: t.active, groupId: t.groupId }))`);
+    // B was created last, so it is the active tab and A sits behind it in the same window.
+    expect(await tabInfo(tabB)).toMatchObject({ active: true });
+    expect((await tabInfo(tabB)).groupId).toBeGreaterThan(0);
+    expect((await tabInfo(tabA)).active).toBe(false);
+    // Background A explicitly through the extension API (not CDP), then capture it.
+    await sw.eval(`chrome.tabs.update(${tabB}, { active: true })`);
+    expect((await tabInfo(tabA)).active).toBe(false);
+    const res = await call(agents.a!, "screenshot", { tabId: tabA });
+    expect(res.ok ? "ok" : JSON.stringify(res)).toBe("ok");
+    expect((await tabInfo(tabA)).active).toBe(true);
+    // The whole browser still answers: nothing was left wedged.
+    const t0 = Date.now();
+    await step("Browser.getVersion", 2000, cdp.send("Browser.getVersion"));
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
   it("navigate and screenshot (JPEG, long edge <= 1568)", async () => {
     const nav = await call(agents.a!, "navigate", { tabId: tabA, url: `http://127.0.0.1:${site.port}/second` });
     expect(textOf(nav)).toContain("/second");
     expect(await pageA.eval<string>(`document.getElementById("p").textContent`)).toBe("Landed.");
     await call(agents.a!, "navigate", { tabId: tabA, url: `http://127.0.0.1:${site.port}/?s=a` });
 
-    // Chromium may not produce frames for a hidden tab right after a window resize, so capture from the foreground tab.
-    await cdp.send("Target.activateTarget", { targetId: pageA.targetId });
     await call(agents.a!, "resize", { tabId: tabA, width: 2400, height: 1400 });
     await sleep(500); // let the window settle (the headless screen may clamp the size)
     const shotRes = await call(agents.a!, "screenshot", { tabId: tabA });
@@ -355,9 +372,6 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
       return c && Math.abs(c.x - target.x) < 3 && Math.abs(c.y - target.y) < 3 ? c : undefined;
     }, 5000);
 
-    // Agent tabs open in the background; a hidden page does not run timers or animations, so bring this one forward like a user watching it.
-    await cdp.send("Target.activateTarget", { targetId: pageA.targetId });
-    await until("tab visible", () => pageA.eval<boolean>(`document.visibilityState === "visible"`));
     const mid = ov<boolean>(tabA, "pauseCursorAt", 110);
     mid.catch(() => {});
     const first = call(agents.a!, "click", { tabId: tabA, ref: ref("Go") });
@@ -391,6 +405,20 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     await until("overlay restored", async () => (await snapshot(tabA))?.hostVisibility === "visible");
   });
 
+  it("hover keeps the overlay out of the way: the pointer is not stolen by the pill until the hold ends", async () => {
+    const tree = textOf(await call(agents.a!, "read_page", { tabId: tabA }));
+    const bottom = /button "Bottom" \[(ref_\d+)\]/.exec(tree)?.[1];
+    expect(bottom).toBeDefined();
+    await sleep(700); // pointer events caused by the previous test's overlay restore settle first
+    await pageA.eval(`window.enters = 0; window.leaves = 0`);
+    expect((await call(agents.a!, "hover", { tabId: tabA, ref: bottom })).ok).toBe(true);
+    await sleep(600);
+    expect(await pageA.eval<number>(`window.enters`)).toBe(1);
+    expect(await pageA.eval<number>(`window.leaves`)).toBe(0); // the pill did not take the pointer from the page element
+    expect((await snapshot(tabA))?.hostVisibility).toBe("hidden");
+    await until("overlay back after the hold", async () => (await snapshot(tabA))?.hostVisibility === "visible", 4000);
+  });
+
   it("a session cannot touch another session's tab", async () => {
     expect(await call(agents.b!, "screenshot", { tabId: tabA })).toMatchObject({ ok: false, error: "forbidden_tab" });
     expect(await call(agents.a!, "navigate", { tabId: tabB, url: "https://example.test/" })).toMatchObject({ ok: false, error: "forbidden_tab" });
@@ -415,9 +443,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
   });
 
   it("page scripts cannot press Stop; a trusted click on the pill does, then Resume works", async () => {
-    await cdp.send("Target.activateTarget", { targetId: pageA.targetId });
-    await until("tab visible", () => pageA.eval<boolean>(`document.visibilityState === "visible"`));
-    await call(agents.a!, "screenshot", { tabId: tabA }); // makes sure the pill is up
+    await call(agents.a!, "screenshot", { tabId: tabA }); // brings the tab forward and makes sure the pill is up
     await until("pill", async () => (await snapshot(tabA))?.pillOn);
 
     const waiting = call(agents.a!, "wait", { seconds: 30 });

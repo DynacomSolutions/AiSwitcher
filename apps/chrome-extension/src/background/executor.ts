@@ -14,6 +14,14 @@ export const MAX_SCREENSHOT_EDGE = 1568;
 export const JPEG_QUALITY = 80;
 const NAVIGATE_LOAD_WAIT_MS = 15_000;
 const BUFFER_LIMIT = 500;
+/** A capture that takes longer than this means Chrome is not rendering the tab. */
+export const CAPTURE_TIMEOUT_MS = 8000;
+/** How long to wait for a freshly activated tab to report visible. */
+export const VISIBLE_WAIT_MS = 2000;
+/** After a hover the overlay stays hidden this long (or until the next non-hover call) so it cannot steal the pointer. */
+export const HOVER_HOLD_MS = 1500;
+/** Tools that act on what the user would see: the tab must be at the front of its window first. */
+const NEEDS_FRONT = new Set<ExtensionTool>(["screenshot", "click", "type", "hover", "scroll", "key", "form_input"]);
 
 type Content = Extract<CallResult, { ok: true }>["content"];
 
@@ -64,6 +72,9 @@ export interface ExecutorDeps {
   ui?: Ui;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   defaultTimeoutMs?: number;
+  captureTimeoutMs?: number;
+  visibleWaitMs?: number;
+  hoverHoldMs?: number;
 }
 
 export class Executor {
@@ -90,19 +101,26 @@ export class Executor {
       signal.addEventListener("abort", () => { clearTimeout(t); reject(new Error("aborted")); }, { once: true });
     }));
     this.defaultTimeout = deps.defaultTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
+    this.captureTimeout = deps.captureTimeoutMs ?? CAPTURE_TIMEOUT_MS;
+    this.visibleWait = deps.visibleWaitMs ?? VISIBLE_WAIT_MS;
+    this.hoverHold = deps.hoverHoldMs ?? HOVER_HOLD_MS;
     this.api.debugger.onEvent((tabId, method, params) => this.onEvent(tabId, method, params));
     this.api.debugger.onDetach((tabId, reason) => {
       this.dropTab(tabId);
       // The user dismissed Chrome's debugging bar: treat as Stop for everything.
       if (reason === "canceled_by_user") void this.state.stop();
     });
-    this.api.tabs.onRemoved(tabId => { this.dropTab(tabId); void this.unmark(tabId); });
-    this.state.onStop(async () => { await Promise.all([this.detachAll(), this.ui.unmarkAll()]); });
+    this.api.tabs.onRemoved(tabId => { this.dropTab(tabId); this.cancelHold(tabId); void this.unmark(tabId); });
+    this.state.onStop(async () => { await Promise.all([this.detachAll(), this.ui.unmarkAll(), this.releaseAllHolds()]); });
     this.state.onChange(paused => { if (paused) void this.ui.unmarkAll(); });
   }
 
   private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly defaultTimeout: number;
+  private readonly captureTimeout: number;
+  private readonly visibleWait: number;
+  private readonly hoverHold: number;
+  private readonly held = new Map<number, ReturnType<typeof setTimeout>>();
 
   async run(req: CallRequest): Promise<CallResult> {
     const { id } = req;
@@ -182,9 +200,11 @@ export class Executor {
     const { tabId } = a("screenshot");
     const tab = await this.ownedTab(req, tabId);
     this.throwIfAborted(sig);
+    if (tool !== "hover") await this.releaseHold(tabId);
+    if (NEEDS_FRONT.has(tool)) await this.bringToFront(sig, tab);
     switch (tool) {
       case "navigate": return this.navigate(sig, tab, a("navigate").url);
-      case "screenshot": return this.hidden(tabId, () => this.screenshot(sig, tabId));
+      case "screenshot": return this.hidden(sig, tabId, () => this.screenshot(sig, tabId));
       case "read_page": return text(await this.readPage(sig, tabId, a("read_page").filter ?? "interactive"));
       case "find": return text(await this.find(sig, tabId, a("find").query));
       case "click": {
@@ -193,7 +213,7 @@ export class Executor {
         const button = a("click").button ?? "left";
         const clickCount = a("click").clickCount ?? 1;
         const base = { x: p.x, y: p.y, button, buttons: button === "left" ? 1 : button === "right" ? 2 : 4 };
-        await this.hidden(tabId, async () => {
+        await this.hidden(sig, tabId, async () => {
           await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
           await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", clickCount });
           await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", clickCount, buttons: 0 });
@@ -203,7 +223,7 @@ export class Executor {
       case "hover": {
         const p = await this.target(sig, tabId, a("hover"));
         await this.input(sig, tabId, p, "hover");
-        await this.hidden(tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y }));
+        await this.hidden(sig, tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y }), true);
         return text(`Hovered at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "type": {
@@ -244,7 +264,7 @@ export class Executor {
         const delta = (s.amount ?? 3) * 100;
         const dx = s.direction === "left" ? -delta : s.direction === "right" ? delta : 0;
         const dy = s.direction === "up" ? -delta : s.direction === "down" ? delta : 0;
-        await this.hidden(tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, deltaX: dx, deltaY: dy }));
+        await this.hidden(sig, tabId, () => this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, deltaX: dx, deltaY: dy }));
         return text(`Scrolled ${s.direction}.`);
       }
       case "form_input": return this.formInput(sig, tabId, a("form_input").ref, a("form_input").value);
@@ -315,13 +335,68 @@ export class Executor {
   }
 
   /** Runs `fn` with the overlay hidden: agent captures and hit-testing must see the page, not our pill. Restores even when `fn` throws or the call is aborted. */
-  private async hidden<T>(tabId: number, fn: () => Promise<T>): Promise<T> {
+  private async hidden<T>(sig: AbortSignal, tabId: number, fn: () => Promise<T>, holdAfter = false): Promise<T> {
+    this.cancelHold(tabId);
     try { await this.ui.suspend(tabId); } catch { /* best effort */ }
+    // Single-use: an abort mid-call restores at once (the call result may arrive long after), and so does the normal exit.
+    let restored = false;
+    const restore = async (): Promise<void> => {
+      if (restored) return;
+      restored = true;
+      try { await this.ui.restore(tabId); } catch { /* best effort */ }
+    };
+    const onAbort = (): void => { void restore(); };
+    if (sig.aborted) onAbort(); else sig.addEventListener("abort", onAbort, { once: true });
     try {
       return await fn();
     } finally {
-      try { await this.ui.restore(tabId); } catch { /* best effort */ }
+      sig.removeEventListener("abort", onAbort);
+      if (holdAfter && !sig.aborted) {
+        restored = true; // the hold timer restores instead
+        this.held.set(tabId, setTimeout(() => { this.held.delete(tabId); void this.restoreQuietly(tabId); }, this.hoverHold));
+      } else {
+        await restore();
+      }
     }
+  }
+
+  private async restoreQuietly(tabId: number): Promise<void> {
+    try { await this.ui.restore(tabId); } catch { /* best effort */ }
+  }
+
+  private cancelHold(tabId: number): boolean {
+    const t = this.held.get(tabId);
+    if (t === undefined) return false;
+    clearTimeout(t);
+    this.held.delete(tabId);
+    return true;
+  }
+
+  /** Ends the post-hover hold early: the next non-hover call, Stop or the tab going away. */
+  private async releaseHold(tabId: number): Promise<void> {
+    if (this.cancelHold(tabId)) await this.restoreQuietly(tabId);
+  }
+
+  private async releaseAllHolds(): Promise<void> {
+    await Promise.all([...this.held.keys()].map(id => this.releaseHold(id)));
+  }
+
+  /** Brings a non-active tab to the front of its window (never the window itself) and waits until Chrome reports it visible. */
+  private async bringToFront(sig: AbortSignal, tab: TabInfo): Promise<void> {
+    if (tab.active) return;
+    await this.api.tabs.activate(tab.id);
+    const end = Date.now() + this.visibleWait;
+    while (Date.now() < end) {
+      this.throwIfAborted(sig);
+      try {
+        const r = (await this.cdp(sig, tab.id, "Runtime.evaluate", { expression: "document.visibilityState", returnByValue: true })) as { result?: { value?: unknown } };
+        if (r.result?.value === "visible") return;
+      } catch (e) {
+        if (e instanceof ToolError) throw e;
+      }
+      await new Promise<void>(res => { const t = setTimeout(res, 40); sig.addEventListener("abort", () => { clearTimeout(t); res(); }, { once: true }); });
+    }
+    this.throwIfAborted(sig); // still not visible: carry on, the capture timeout reports tab_hidden
   }
 
   private async unmark(tabId: number): Promise<void> {
@@ -484,8 +559,17 @@ export class Executor {
   }
 
   private async shoot(sig: AbortSignal, tabId: number, v: { w: number; h: number; x: number; y: number }, scale: number): Promise<string> {
-    const r = (await this.cdp(sig, tabId, "Page.captureScreenshot", { format: "jpeg", quality: JPEG_QUALITY, clip: { x: v.x, y: v.y, width: v.w, height: v.h, scale } })) as { data: string };
-    return r.data;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const hung = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new ToolError("tab_hidden", `Chrome did not render tab ${tabId} (minimised or hidden window). Ask the user to bring the window forward, then retry.`)), this.captureTimeout);
+    });
+    hung.catch(() => {});
+    try {
+      const r = (await Promise.race([this.cdp(sig, tabId, "Page.captureScreenshot", { format: "jpeg", quality: JPEG_QUALITY, clip: { x: v.x, y: v.y, width: v.w, height: v.h, scale } }), hung])) as { data: string };
+      return r.data;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async screenshot(sig: AbortSignal, tabId: number): Promise<Content> {

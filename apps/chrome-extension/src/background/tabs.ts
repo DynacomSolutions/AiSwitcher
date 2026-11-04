@@ -84,7 +84,8 @@ export class TabManager {
   }
 
   async create(ref: SessionRef, url?: string): Promise<TabInfo> {
-    const tab = await this.api.tabs.create(url);
+    // Active, so the user sees the agent working in the session's group; the window itself is never raised.
+    const tab = await this.api.tabs.create(url, true);
     await this.addToSession(ref, tab.id);
     return tab;
   }

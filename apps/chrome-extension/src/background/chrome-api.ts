@@ -18,7 +18,10 @@ export interface ChromeApi {
   tabs: {
     get(tabId: number): Promise<TabInfo | undefined>;
     query(): Promise<TabInfo[]>;
-    create(url?: string): Promise<TabInfo>;
+    /** Opens a tab in the current window; `active` brings it to the front of that window (never raises the window). */
+    create(url?: string, active?: boolean): Promise<TabInfo>;
+    /** Makes the tab the active one in its window. */
+    activate(tabId: number): Promise<void>;
     remove(tabId: number): Promise<void>;
     group(tabIds: number[], groupId?: number): Promise<number>;
     onRemoved(listener: (tabId: number) => void): void;
@@ -54,7 +57,8 @@ export function realChromeApi(): ChromeApi {
         try { return toTab(await chrome.tabs.get(tabId)); } catch { return undefined; }
       },
       query: async () => (await chrome.tabs.query({})).map(toTab),
-      create: async url => toTab(await chrome.tabs.create(url ? { url, active: false } : { active: false })),
+      create: async (url, active = false) => toTab(await chrome.tabs.create(url ? { url, active } : { active })),
+      activate: async tabId => { await chrome.tabs.update(tabId, { active: true }); },
       remove: async tabId => { await chrome.tabs.remove(tabId); },
       group: (tabIds, groupId) => { const ids = tabIds as [number, ...number[]]; return chrome.tabs.group(groupId === undefined ? { tabIds: ids } : { tabIds: ids, groupId }); },
       onRemoved: listener => chrome.tabs.onRemoved.addListener(listener),

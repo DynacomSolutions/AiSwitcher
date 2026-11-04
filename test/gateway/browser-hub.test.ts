@@ -201,6 +201,17 @@ describe("BrowserHub", () => {
     expect(metrics.render()).not.toContain("free text");
   });
 
+  test("tab_hidden passes the sanitiser and is a metrics outcome", async () => {
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const hub = mk({ metrics });
+    const ws = new FakeWs();
+    await hello(hub, ws);
+    const p = hub.call("work", req("c1", "screenshot"), 1000);
+    await hub.message(ws, JSON.stringify({ t: "result", result: { id: "c1", ok: false, error: "tab_hidden", message: "Chrome did not render tab 5" } }));
+    expect(await p).toMatchObject({ ok: false, error: "tab_hidden" });
+    expect(metrics.render()).toContain('ais_gateway_browser_calls_total{tool="screenshot",outcome="tab_hidden"} 1');
+  });
+
   test("messages during auth are ignored and a second hello cannot double-attach", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));

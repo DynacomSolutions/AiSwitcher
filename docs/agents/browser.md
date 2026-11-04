@@ -30,11 +30,15 @@ On each agent host run `ais browser agent-token <identity>`. It mints a token (r
 - Pause (extension popup): calls fail with `paused_by_user` until resumed.
 - Stop: ends the agent's calls with `stopped_by_user`.
 - `ais browser revoke <name>` revokes the binding and drops its connection; the profile must pair again.
-- Error codes: `paused_by_user`, `stopped_by_user`, `no_browser`, `ambiguous_browser`, `forbidden_tab`, `tab_closed`, `timeout`, `browser_disconnected`, `bad_args`, `internal`.
+- Error codes: `paused_by_user`, `stopped_by_user`, `no_browser`, `ambiguous_browser`, `forbidden_tab`, `tab_closed`, `tab_hidden`, `timeout`, `browser_disconnected`, `bad_args`, `internal`.
 
 ## Limits
 
 The relay keeps sockets, pairing rate limits and in-flight calls in memory, so the gateway must run as a single replica. Scaling it out needs a shared relay first.
+
+Agent tabs live in the user's window, inside the session's tab group. Before a screenshot or input the extension brings the target tab to the front of its window (never the window itself). If Chrome still does not render it (minimised window), the call fails with `tab_hidden` after 8 s.
+
+Known limit: the headless Chromium used in CI cannot reproduce headful background-tab and minimised-window behaviour on this host, so that behaviour is verified only on a real Mac with a headful Chrome.
 
 ## Metrics
 

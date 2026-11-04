@@ -10,6 +10,9 @@ const SESSION_IDLE_MS = 90_000;
 interface MarkArg { identity: string; label: string; color: string }
 interface ActionArg extends MarkArg { x: number; y: number; kind: CursorKind }
 
+/** Injected by build.ts: true only in the e2e build. */
+declare const AIS_E2E: boolean;
+
 const g = globalThis as unknown as { __aisOverlay?: unknown };
 
 function init(): void {
@@ -98,34 +101,38 @@ function init(): void {
       suspended = false;
       return "ok";
     },
-    // ---- inspection for the end-to-end test; reachable only from the extension's isolated world ----
-    snapshot(): unknown {
-      if (!root) return null;
-      stopButton = root.querySelector("button") ?? undefined;
-      return {
-        suspended,
-        hostVisibility: host?.style.visibility ?? "",
-        pill: root.querySelector(".pill")?.textContent ?? "",
-        pillOn: root.querySelector(".pill.on") !== null,
-        glowOn: root.querySelector(".glow.on") !== null,
-        cursor: rect(root.querySelector(".cursor")),
-        stop: rect(stopButton),
-      };
-    },
-    /** Pauses the cursor glide once it is at least `ms` in, so a test can capture it mid-move. */
-    pauseCursorAt(ms: number): Promise<boolean> {
-      return new Promise(resolve => {
-        const t0 = Date.now();
-        const tick = setInterval(() => {
-          const a = root?.getAnimations().find(x => x.playState === "running" && Number(x.currentTime) >= ms);
-          if (a) { a.pause(); clearInterval(tick); resolve(true); } else if (Date.now() - t0 > 5000) { clearInterval(tick); resolve(false); }
-        }, 4);
-      });
-    },
-    resumeAnimations(): string { root?.getAnimations().forEach(a => { if (a.playState === "paused") a.play(); }); return "ok"; },
-    /** A synthetic (untrusted) click on Stop, to prove the guard ignores it. */
-    untrustedStopClick(): string { root?.querySelector("button")?.click(); return "ok"; },
   };
+  // Inspection hooks for the end-to-end test only: compiled out of release builds (build.ts defines AIS_E2E as false).
+  if (AIS_E2E) {
+    Object.assign(api, {
+      snapshot(): unknown {
+        if (!root) return null;
+        stopButton = root.querySelector("button") ?? undefined;
+        return {
+          suspended,
+          hostVisibility: host?.style.visibility ?? "",
+          pill: root.querySelector(".pill")?.textContent ?? "",
+          pillOn: root.querySelector(".pill.on") !== null,
+          glowOn: root.querySelector(".glow.on") !== null,
+          cursor: rect(root.querySelector(".cursor")),
+          stop: rect(stopButton),
+        };
+      },
+      /** Pauses the cursor glide once it is at least `ms` in, so a test can capture it mid-move. */
+      pauseCursorAt(ms: number): Promise<boolean> {
+        return new Promise(resolve => {
+          const t0 = Date.now();
+          const tick = setInterval(() => {
+            const a = root?.getAnimations().find(x => x.playState === "running" && Number(x.currentTime) >= ms);
+            if (a) { a.pause(); clearInterval(tick); resolve(true); } else if (Date.now() - t0 > 5000) { clearInterval(tick); resolve(false); }
+          }, 4);
+        });
+      },
+      resumeAnimations(): string { root?.getAnimations().forEach(a => { if (a.playState === "paused") a.play(); }); return "ok"; },
+      /** A synthetic (untrusted) click on Stop, to prove the guard ignores it. */
+      untrustedStopClick(): string { root?.querySelector("button")?.click(); return "ok"; }
+    });
+  }
   g.__aisOverlay = api;
 }
 
