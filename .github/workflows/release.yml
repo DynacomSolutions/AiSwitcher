@@ -141,8 +141,41 @@ jobs:
           path: aistui-${{ matrix.target.name }}
           retention-days: 1
 
+  build-extension:
+    # AIS Browser Chrome extension (apps/chrome-extension): one platform-independent
+    # zip with manifest.json at the zip root, fetched by `ais browser extension update`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install extension dependencies
+        working-directory: apps/chrome-extension
+        run: bun install --frozen-lockfile
+
+      - name: Test and build the extension
+        working-directory: apps/chrome-extension
+        run: |
+          bun test test
+          bun run build
+
+      - name: Zip dist (manifest.json at the zip root)
+        run: |
+          (cd apps/chrome-extension/dist && zip -r -q ../../../ais-browser-extension.zip .)
+          unzip -l ais-browser-extension.zip | grep -E ' manifest\.json$'
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ais-browser-extension
+          path: ais-browser-extension.zip
+          retention-days: 1
+
   release:
-    needs: [build, build-tui]
+    needs: [build, build-tui, build-extension]
     runs-on: ubuntu-latest
     permissions:
       contents: write
