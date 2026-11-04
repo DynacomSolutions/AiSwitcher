@@ -54,3 +54,66 @@ test("HTTP failure and missing token are tool errors", async () => {
   expect(r.result.isError).toBe(true);
   expect(seen).toEqual([]);
 });
+
+import { parseShimArgs, runMcpShim } from "../../src/browser/mcp-shim.ts";
+import { Readable } from "node:stream";
+
+async function stdio(lines: string[], c: ShimContext = ctx()): Promise<any[]> {
+  const out: string[] = [];
+  await runMcpShim(c, Readable.from(lines.map((l) => `${l}\n`)), (l) => out.push(l));
+  return out.map((l) => JSON.parse(l));
+}
+
+test("stdio: malformed, non-object, unknown tool, responses ignored", async () => {
+  const r = await stdio([
+    "{nope",
+    "[1]",
+    "42",
+    JSON.stringify({ jsonrpc: "2.0", id: 9, result: {} }),
+    JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "nope", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 6, method: "bogus" }),
+  ]);
+  expect(r.map((x) => x.error?.code ?? null)).toEqual([-32700, -32600, -32600, null, -32601]);
+  expect(r[3].result.isError).toBe(true);
+  expect(r[3].result.content[0].text).toContain("unknown tool");
+});
+
+test("stdio: gateway non-200 is an isError result", async () => {
+  const c = ctx();
+  c.fetch = (async () => new Response(JSON.stringify({ error: "unauthorised" }), { status: 401 })) as unknown as typeof fetch;
+  const r = await stdio([JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tabs_context", arguments: {} } })], c);
+  expect(r[0].result.isError).toBe(true);
+  expect(r[0].result.content[0].text).toContain("401");
+});
+
+test("initialize echoes known protocol versions, else latest", async () => {
+  const v = async (p?: string): Promise<string> => ((await handleRpc({ id: 1, method: "initialize", params: p ? { protocolVersion: p } : {} }, ctx())) as any).result.protocolVersion;
+  expect(await v("2025-03-26")).toBe("2025-03-26");
+  expect(await v("2024-11-05")).toBe("2024-11-05");
+  expect(await v("1999-01-01")).toBe("2025-06-18");
+  expect(await v()).toBe("2025-06-18");
+});
+
+test("notifications/cancelled aborts the in-flight fetch", async () => {
+  const c = ctx();
+  c.inflight = new Map();
+  c.fetch = ((_u: string, init: RequestInit) => new Promise((_res, rej) => init.signal!.addEventListener("abort", () => rej(new Error("aborted"))))) as unknown as typeof fetch;
+  const p = handleRpc({ id: 7, method: "tools/call", params: { name: "wait", arguments: { seconds: 5 } } }, c) as Promise<any>;
+  await new Promise((r) => setTimeout(r, 20));
+  await handleRpc({ method: "notifications/cancelled", params: { requestId: 7 } }, c);
+  expect((await p).result.isError).toBe(true);
+});
+
+test("token read from --config-dir without env", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { contextFromEnv } = await import("../../src/browser/mcp-shim.ts");
+  const d = mkdtempSync(join(tmpdir(), "ais-shim-"));
+  writeFileSync(join(d, "ais-browser-token"), "tok-from-file\n");
+  const c = contextFromEnv({}, parseShimArgs(["browser", "mcp", "--config-dir", d, "--identity", "work", "--gateway", "http://gw"]));
+  expect(await c.token()).toBe("tok-from-file");
+  expect(await c.gatewayUrl()).toBe("http://gw");
+  expect(c.session.label.startsWith("work / ")).toBe(true);
+  rmSync(d, { recursive: true });
+});

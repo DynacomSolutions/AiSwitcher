@@ -22,6 +22,7 @@ import type { HerdrChatTool } from "./herdr-chat-source.ts";
 import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
+import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { browserMcpArgs } from "./browser-wiring.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
@@ -159,7 +160,12 @@ export async function runWrapper(
       resolved.configDirValue,
       sharedConfigArgs,
     );
-    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary() ?? process.execPath);
+    const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
+    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary() ?? process.execPath, {
+      ...(activeIdentity !== undefined ? { identityName: activeIdentity } : {}),
+      ...(gatewayUrl ? { gateway: gatewayUrl } : {}),
+      ...(parsed.cleanedArgv[0] !== undefined ? { firstArg: parsed.cleanedArgv[0] } : {}),
+    });
     const launchArgs = cfg.toolName === "codex"
       ? codexSubcommandConfigArgs([...browserArgs, ...memoryProjection.argv])
       : [...browserArgs, ...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
