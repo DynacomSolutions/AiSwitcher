@@ -55,6 +55,27 @@ afterAll(() => rmSync(SCRATCH, { recursive: true, force: true }));
 
 const ADD = "gateway app add billing --namespace=shop --provider=claude --pool";
 
+describe("pool name as pinned identity", () => {
+  const isPoolName = async (_p: string, n: string) => n === "shared-pool";
+  const PIN = "gateway app add billing --namespace=shop --provider=claude";
+
+  test("add rejects a pool name before any write", async () => {
+    await expect(run(`${PIN} --identity=shared-pool`, { isPoolName })).rejects.toThrow(/--pool --identities=<members>/);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  test("update rejects a pool name", async () => {
+    respond = (url, method) => (method === "GET" ? Response.json({ owner: "o", namespace: "shop", provider: "claude", style: "anthropic", target: { kind: "pool" } }) : Response.json({}));
+    await expect(run("gateway app update billing --identity=shared-pool", { isPoolName })).rejects.toThrow(/swap pool/);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  test("a real identity or alias is accepted", async () => {
+    await run(`${PIN} --identity=real-account`, { isPoolName });
+    expect(calls.find((c) => c.method === "PUT")!.body).toMatchObject({ target: { kind: "pin", identity: "real-account" } });
+  });
+});
+
 describe("ais gateway app add", () => {
   test("add calls admin then writes secret then secrets file", async () => {
     await run(ADD);

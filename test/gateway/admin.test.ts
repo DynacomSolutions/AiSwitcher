@@ -149,6 +149,22 @@ describe("admin api", () => {
     expect((await req({ target: { kind: "pool" } })).status).toBe(200);
   });
 
+  test("a swap pool name is rejected as a pin; a real identity and an alias are accepted", async () => {
+    const checked = createAdminApp({
+      store,
+      adminToken: ADMIN,
+      now: () => now,
+      identityState: async (_p, name) => (name === "shared-pool" ? "pool" : "ok"),
+    });
+    const req = (b: object) =>
+      checked.request("http://admin.test/apps/poolpin", { method: "PUT", headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ ...body, ...b }) });
+    const bad = await req({ target: { kind: "pin", identity: "shared-pool" } });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toContain("identities");
+    expect((await req({ target: { kind: "pin", identity: "real-account" } })).status).toBe(201);
+    expect((await req({ target: { kind: "pin", identity: "alias-of-real" } })).status).toBe(200);
+  });
+
   test("name error message matches the DNS-1123 rule", async () => {
     const res = await put("Bad_Name");
     const msg = ((await res.json()) as { error: string }).error;
