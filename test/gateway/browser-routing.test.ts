@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { BrowserBinding } from "../../src/browser/types.ts";
 import { createGatewayApp } from "../../src/gateway/app.ts";
 import { BrowserHub, type HubSocket } from "../../src/gateway/browser/hub.ts";
+import { browserPoolMemberNames } from "../../src/gateway/serve.ts";
 import { allowedBindings } from "../../src/gateway/browser/routing.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken, hashSecret, parseToken } from "../../src/gateway/tokens.ts";
@@ -195,5 +196,20 @@ describe("POST /browser/call", () => {
     await connect(b("p", { kind: "pool", pool: "main" }));
     expect((await call({ session, tool: "screenshot", browser: "p" }, tokZ)).status).toBe(403);
     expect(await (await call({ session, tool: "screenshot" }, tokZ)).json()).toMatchObject({ ok: false, error: "no_browser" });
+  });
+
+  test("a retired pool member is excluded: 403 when naming the pool browser, no_browser otherwise", async () => {
+    const file: any = { version: 1, identities: [
+      { name: "id1", label: "id1", configDir: "/x/id1" },
+      { name: "id2", label: "id2", configDir: "/x/id2", retired: true },
+      { name: "main", label: "main", configDir: "/x/main", swapPool: { accounts: ["id1", "id2"], active: "id1" } },
+    ] };
+    expect(browserPoolMemberNames(file, "main")).toEqual(["id1"]);
+    expect(browserPoolMemberNames(file, "nope")).toBeUndefined();
+    members = { main: browserPoolMemberNames(file, "main")! };
+    const tokB = await tokenFor("id2");
+    await connect(b("p", { kind: "pool", pool: "main" }));
+    expect((await call({ session, tool: "screenshot", browser: "p" }, tokB)).status).toBe(403);
+    expect(await (await call({ session, tool: "screenshot" }, tokB)).json()).toMatchObject({ ok: false, error: "no_browser" });
   });
 });

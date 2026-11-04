@@ -18,6 +18,7 @@ import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
 import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-source.ts";
 import type { GatewayProvider } from "./types.ts";
+import type { IdentitiesFile } from "../identities/types.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
 export const DEFAULT_GATEWAY_ADMIN_PORT = 47131;
@@ -132,11 +133,21 @@ async function defaultPoolMembers(provider: GatewayProvider): Promise<string[]> 
   return file.identities.filter((i) => !isRetired(i)).map((i) => i.name);
 }
 
+/** Allowed, non-retired members of pool `pool` in `file`, or undefined when the file has no such pool. */
+export function browserPoolMemberNames(file: IdentitiesFile, pool: string): string[] | undefined {
+  const found = findPool(file, pool);
+  if (!found) return undefined;
+  return allowedAccounts(found).filter((name) => {
+    const m = findIdentityByNameOrAlias(file.identities, name);
+    return !(m && isRetired(m));
+  });
+}
+
 /** Members of the named swap pool in any tool registry, or undefined when no tool has such a pool. */
 async function defaultBrowserPoolMembers(pool: string): Promise<string[] | undefined> {
   for (const cfg of Object.values(TOOL_CONFIGS)) {
-    const found = findPool(await loadIdentitiesFile(cfg.identitiesJsonPath), pool);
-    if (found) return allowedAccounts(found);
+    const names = browserPoolMemberNames(await loadIdentitiesFile(cfg.identitiesJsonPath), pool);
+    if (names) return names;
   }
   return undefined;
 }
