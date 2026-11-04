@@ -78,11 +78,6 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # The root typecheck also checks apps/chrome-extension, which has its own lockfile.
-      - name: Install Chrome extension dependencies
-        working-directory: apps/chrome-extension
-        run: bun install --frozen-lockfile
-
       # Claude Code refuses to load a mod that fails this check (e.g. #184), and
       # the unit tests import the module directly so they never notice.
       - name: Validate Claude Code mods
@@ -173,7 +168,7 @@ jobs:
       - name: Test execve, session sidecar and shim end to end
         run: bun test test/shim-execve.test.ts test/shared/execve.test.ts test/shared/session-sidecar.test.ts
 
-  # GitHub-hosted runner only: this repository is public, never self-hosted.
+  # GitHub-hosted runner only. Unit tests run in the root `bun test` (test job), so this job only builds.
   extension:
     needs: changes
     if: needs.changes.outputs.extension == 'true'
@@ -188,13 +183,6 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
-
-      - name: Install Chrome extension dependencies
-        working-directory: apps/chrome-extension
-        run: bun install --frozen-lockfile
-
-      - name: Unit tests
-        run: bun test apps/chrome-extension/test
 
       - name: Build
         working-directory: apps/chrome-extension
