@@ -149,3 +149,10 @@ ETA: 2026-11-03 20:00 ICT
 | 116 | Web Usage page: cost ignores the period filter but says all time | done | | | | | PR https://github.com/DynacomSolutions/AiSwitcher/pull/349: All time default, exact per-day costs, CLI money format, Monthly chart fix. |
 | 117 | `ais usage tui` starts from the AIS snapshot, not a full rescan | dropped | | | | | Dropped: owner chose to keep the current Tokscale TUI (2026-11-03).<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/346 closed. |
 | 118 | Redeploy ais console and auto-redeploy on every AIS release | done | | | | | .cluster PRs #2074, #2076, #2078; DynacomDevWatcher #49; AiSwitcher https://github.com/DynacomSolutions/AiSwitcher/pull/350 (kubectl built from source for CVEs).<br>Verified: AiSwitcher main merge auto-built and rolled ais pod to ais-console:main@sha256:d3040120. |
+
+## 6. Browser control extension
+ETA: 2026-11-06 18:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 120 | AIS Browser: Chrome extension agents drive via the gateway | in_progress | claude-20261104-browser | ais-browser | | 2026-11-06 18:00 ICT | Spec and plan: .data/DynacomSolutions/AiSwitcher/specs/2026-11-04-ais-chrome-extension-*.md<br>Branch ais-browser |
