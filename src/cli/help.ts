@@ -90,7 +90,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   browser: {
-    usage: "ais browser approve|list|revoke|agent-token ...",
+    usage: "ais browser approve|list|revoke|agent-token|mcp ...",
     desc: "AIS Browser: bind Chrome extensions to an identity or swap pool; agent tokens",
     examples: ["ais browser approve ABCD2345 --identity=work --name=work-chrome"],
     subs: {
@@ -101,6 +101,7 @@ export const HELP: Record<string, HelpNode> = {
         "ais browser agent-token <identity> [--revoke]",
         "Mint an agent token (replacing any earlier one); written to <configDir>/ais-browser-token (0600) for claude and codex and to ~/.secrets as AIS_BROWSER_AGENT_<IDENTITY>_TOKEN, never printed. --revoke removes it",
       ),
+      mcp: sub("ais browser mcp", "Stdio MCP server exposing the browser tools; started by Claude and Codex launches that have an agent token (not for manual use)"),
     },
   },
   swap: {

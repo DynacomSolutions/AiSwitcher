@@ -22,6 +22,8 @@ import type { HerdrChatTool } from "./herdr-chat-source.ts";
 import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
+import { browserMcpArgs } from "./browser-wiring.ts";
+import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
 export function herdrTitleForLaunch(
@@ -157,9 +159,10 @@ export async function runWrapper(
       resolved.configDirValue,
       sharedConfigArgs,
     );
+    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary() ?? process.execPath);
     const launchArgs = cfg.toolName === "codex"
-      ? codexSubcommandConfigArgs(memoryProjection.argv)
-      : gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd());
+      ? codexSubcommandConfigArgs([...browserArgs, ...memoryProjection.argv])
+      : [...browserArgs, ...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
     const inheritedTitleOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
     const liveImage = isAisLive();
     const chatTitleTool = herdrTitleForLaunch(cfg.toolName, Boolean(parentSession), inheritedTitleOwner, liveImage);

@@ -71,7 +71,22 @@ test("list and revoke", async () => {
   expect(seen[1]).toMatchObject({ method: "DELETE", path: "/browser/bindings/my-chrome" });
 });
 
+test("approve trims and uppercases the pairing code", async () => {
+  await run("browser approve  abcd2345 --identity=work");
+  expect(seen[0]?.path).toBe("/browser/pairings/ABCD2345/approve");
+});
+
 describe("agent-token", () => {
+  test("unwritable target fails before the server token is rotated", async () => {
+    writeFileSync(join(dir, "blocker"), "x");
+    await expect(run("browser agent-token work", async () => ({ name: "work", dirs: [dirs[0]!, join(dir, "blocker", "sub")] }))).rejects.toThrow();
+    expect(seen).toEqual([]);
+  });
+  test("a later write failure tells the user to re-run", async () => {
+    mkdirSync(join(dirs[1]!, "ais-browser-token", "x"), { recursive: true });
+    await expect(run("browser agent-token work")).rejects.toThrow();
+    expect(out.join("\n")).toContain("re-run ais browser agent-token work to mint again");
+  });
   test("writes 0600 files and secrets key, never prints token", async () => {
     await run("browser agent-token work");
     for (const d of dirs) {

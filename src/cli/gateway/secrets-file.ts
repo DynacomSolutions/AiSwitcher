@@ -65,7 +65,7 @@ async function rewriteSecrets(requested: string, epoch: number, edit: (kept: str
     // Only a missing file is "absent"; any other error must not lead to replacing the file.
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
-  if (existing === undefined && !createIfMissing) return;
+  if (!createIfMissing && (existing === undefined || !existing.split("\n").some((line) => parseLine(line)?.key === key))) return;
   if (existing !== undefined) {
     for (let n = 0; ; n++) {
       const backup = n === 0 ? `${path}.bak.${epoch}` : `${path}.bak.${epoch}.${n}`;

@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, rename, rm } from "node:fs/promises";
+import { access, chmod, constants, mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { CLAUDE_CONFIG, CODEX_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
@@ -62,7 +62,7 @@ function targetText(t: unknown): string {
 export async function runBrowserAdmin(sub: string | undefined, rest: string[], flags: ParsedArgs["flags"], deps: BrowserCliDeps): Promise<void> {
   switch (sub) {
     case "approve": {
-      const code = rest[0];
+      const code = rest[0]?.trim().toUpperCase();
       if (!code) throw new CliUsageError("Usage: ais browser approve <code> (--identity=<id> | --pool=<pool>) [--name=<n>]");
       const identity = stringFlag(flags, "identity");
       const pool = stringFlag(flags, "pool");
@@ -107,12 +107,22 @@ export async function runBrowserAdmin(sub: string | undefined, rest: string[], f
         return;
       }
       if (local.dirs.length === 0) throw new CliUsageError(`identity "${given}" not found in the claude or codex registry`);
+      // Fail before the POST rotates the server token if any target is unwritable.
+      for (const dir of local.dirs) {
+        await mkdir(dir, { recursive: true });
+        await access(dir, constants.W_OK);
+      }
       const { json } = await admin.call("POST", `/browser/agents/${encodeURIComponent(given)}/tokens`);
       const token = json.token;
       if (typeof token !== "string" || !token) throw new Error("gateway admin returned no token");
       const identity = typeof json.identity === "string" ? json.identity : local.name;
-      for (const dir of local.dirs) await writeTokenFile(dir, token);
-      await appendSecretsFile(agentTokenKey(identity), token, secretsPath);
+      try {
+        for (const dir of local.dirs) await writeTokenFile(dir, token);
+        await appendSecretsFile(agentTokenKey(identity), token, secretsPath);
+      } catch (e) {
+        deps.out(`token write failed after the server token was rotated; re-run ais browser agent-token ${given} to mint again`);
+        throw e;
+      }
       deps.out(`agent token for ${identity} written to ${local.dirs.map((d) => join(d, BROWSER_TOKEN_FILE)).join(", ")} and ~/.secrets (${agentTokenKey(identity)})`);
       return;
     }
