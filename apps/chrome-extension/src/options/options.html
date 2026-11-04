@@ -7,6 +7,10 @@
 <body>
   <h1>AIS Browser</h1>
   <p id="status">Not signed in.</p>
+  <section id="control" hidden>
+    <p id="paused-note" role="status"></p>
+    <p><button id="resume" hidden>Resume</button> <button id="pause" hidden>Pause all</button></p>
+  </section>
   <p><label>Gateway URL <input id="gateway" size="48" placeholder="wss://..."></label></p>
   <p><label>Profile label <input id="label" size="32" value="Chrome profile"></label></p>
   <p><button id="signin">Sign in</button> <button id="signout" hidden>Sign out</button></p>

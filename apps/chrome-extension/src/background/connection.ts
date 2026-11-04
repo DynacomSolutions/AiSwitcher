@@ -162,6 +162,7 @@ export class Connection {
         if (this.deps.isPaused()) this.send({ t: "state", paused: true });
         return;
       case "call": {
+        if (typeof msg.req !== "object" || msg.req === null || typeof msg.req.id !== "string") return; // malformed frame
         if (!this.welcomed) return; // commands are rejected until a token-authenticated hello succeeded
         const gen = this.generation;
         void this.deps.onCall(msg.req).then(result => {

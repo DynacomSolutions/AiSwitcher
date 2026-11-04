@@ -69,6 +69,19 @@ describe("connection", () => {
     expect(s.sent.at(-1)).toEqual({ t: "result", result: { id: "ok", ok: true, content: [] } });
   });
 
+  test("call frames without a usable req are ignored without throwing", async () => {
+    const t = setup();
+    t.conn.start("wss://gw.example.test", "tok");
+    const s = t.sockets[0]!;
+    s.onopen!();
+    s.serve({ t: "welcome", binding: "b", target: { kind: "identity", identity: "i" } });
+    for (const frame of [{ t: "call" }, { t: "call", req: null }, { t: "call", req: "x" }, { t: "call", req: {} }]) {
+      expect(() => s.serve(frame)).not.toThrow();
+    }
+    await flush();
+    expect(t.calls).toHaveLength(0);
+  });
+
   test("pings every 20 s after welcome", () => {
     const t = setup();
     t.conn.start("wss://gw.example.test", "tok");

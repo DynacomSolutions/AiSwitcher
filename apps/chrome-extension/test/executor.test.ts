@@ -204,6 +204,8 @@ describe("args and tools", () => {
     const ui: Ui = {
       beforeAction: (tabId, p) => { events.push(`before:${tabId}:${p.kind}:${p.x},${p.y}`); },
       markControlled: (tabId, s) => { events.push(`mark:${tabId}:${s.id}`); },
+      unmark() {},
+      unmarkAll() {},
     };
     const { api, tabs, executor } = setup(ui);
     const tab = await tabs.create(session, "https://example.test/");
@@ -306,5 +308,125 @@ describe("args and tools", () => {
     api.emit(tab.id, "Network.responseReceived", { requestId: "1", response: { status: 200 } });
     expect(textOf(await executor.run(call("get_console", { tabId: tab.id, onlyErrors: true })))).toBe("[error] bad");
     expect(textOf(await executor.run(call("get_network", { tabId: tab.id })))).toBe("GET https://a.test/x 200");
+  });
+});
+
+describe("visuals and abort hygiene", () => {
+  function recordingUi() {
+    const log: string[] = [];
+    let signal: AbortSignal | undefined;
+    const ui: Ui = {
+      beforeAction: (_t, _p, s) => { signal = s; log.push("before"); },
+      markControlled: (t) => { log.push(`mark:${t}`); },
+      unmark: (t) => { log.push(`unmark:${t}`); },
+      unmarkAll: () => { log.push("unmarkAll"); },
+    };
+    return { ui, log, signal: () => signal };
+  }
+
+  test("beforeAction receives the call's abort signal; a throwing ui never fails the call", async () => {
+    const r = recordingUi();
+    r.ui.beforeAction = () => { throw new Error("overlay gone"); };
+    const { api, tabs, executor } = setup(r.ui);
+    const tab = await tabs.create(session);
+    api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    await executor.run(call("screenshot", { tabId: tab.id }));
+    expect((await executor.run(call("hover", { tabId: tab.id, coordinate: [10, 10] }))).ok).toBe(true);
+  });
+
+  test("unmark on close_tab, tab removal, stop and pause", async () => {
+    const r = recordingUi();
+    const { api, state, tabs, executor } = setup(r.ui);
+    const t1 = await tabs.create(session);
+    expect((await executor.run(call("close_tab", { tabId: t1.id }))).ok).toBe(true);
+    expect(r.log).toContain(`unmark:${t1.id}`);
+    const t2 = await tabs.create(session);
+    api.closeTab(t2.id);
+    await new Promise(res => setTimeout(res, 2));
+    expect(r.log).toContain(`unmark:${t2.id}`);
+    r.log.length = 0;
+    state.pause();
+    expect(r.log).toContain("unmarkAll");
+    r.log.length = 0;
+    state.resume();
+    await state.stop();
+    expect(r.log).toContain("unmarkAll");
+  });
+
+  test("no overlay is drawn while paused", async () => {
+    const r = recordingUi();
+    const { state, tabs, executor } = setup(r.ui);
+    const tab = await tabs.create(session);
+    r.log.length = 0;
+    state.pause();
+    r.log.length = 0;
+    expect(await executor.run(call("read_page", { tabId: tab.id }))).toMatchObject({ error: "paused_by_user" });
+    expect(r.log).toEqual([]);
+  });
+
+  test("timeout during attach keeps the debugger attached for a concurrent call", async () => {
+    const { api, state, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const attach = api.debugger.attach;
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    api.debugger.attach = async id => { await gate; await attach(id); };
+    const first = executor.run(call("read_page", { tabId: tab.id }));
+    await new Promise(r => setTimeout(r, 5));
+    const id = [...(state as unknown as { inflight: Map<string, AbortController> }).inflight.keys()][0]!;
+    state.abort(id);
+    release();
+    expect(await first).toMatchObject({ ok: false, error: "timeout" });
+    expect(api.attachedTabs.has(tab.id)).toBe(true);
+    api.debugger.attach = attach;
+    api.cdpResults["Accessibility.getFullAXTree"] = { nodes: [] };
+    expect((await executor.run(call("read_page", { tabId: tab.id }))).ok).toBe(true);
+    expect(api.detachCalls).toEqual([]);
+  });
+
+  test("stop during attach drops recorded tab state so the next attach is real", async () => {
+    const { api, state, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const attach = api.debugger.attach;
+    api.debugger.attach = async id => { await state.stop(); await attach(id); };
+    await executor.run(call("read_page", { tabId: tab.id }));
+    await new Promise(r => setTimeout(r, 5)); // the aborted dispatch finishes its detach after run() returned
+    state.resume();
+    api.debugger.attach = attach;
+    api.cdpResults["Accessibility.getFullAXTree"] = { nodes: [] };
+    expect((await executor.run(call("read_page", { tabId: tab.id }))).ok).toBe(true);
+    expect(api.attachedTabs.has(tab.id)).toBe(true);
+  });
+
+  test("aborted calls do not run side-effecting non-CDP steps", async () => {
+    const { api, state, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    // abort lands while the ownership lookup is in flight
+    const get = api.tabs.get;
+    api.tabs.get = async id => { const r = await get(id); await state.stop(); return r; };
+    expect(await executor.run(call("close_tab", { tabId: tab.id }))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(api.tabList.has(tab.id)).toBe(true);
+    state.resume();
+    expect(await executor.run(call("resize", { tabId: tab.id, width: 800, height: 600 }))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(api.resizes).toEqual([]);
+    api.tabs.get = get;
+  });
+
+  test("main-frame navigation from a click clears domReady; subframes do not", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    api.cdpResults["Accessibility.getFullAXTree"] = { nodes: [{ nodeId: "1", role: { value: "button" }, name: { value: "Go" }, backendDOMNodeId: 9 }] };
+    api.cdpResults["DOM.getContentQuads"] = { quads: [[0, 0, 2, 0, 2, 2, 0, 2]] };
+    await executor.run(call("read_page", { tabId: tab.id }));
+    await executor.run(call("hover", { tabId: tab.id, ref: "ref_1" }));
+    const getDocs = () => api.cdpLog.filter(l => l.method === "DOM.getDocument").length;
+    expect(getDocs()).toBe(1);
+    api.emit(tab.id, "Page.frameNavigated", { frame: { id: "f", parentId: "main" } });
+    await executor.run(call("hover", { tabId: tab.id, ref: "ref_1" }));
+    expect(getDocs()).toBe(1);
+    api.emit(tab.id, "Page.frameNavigated", { frame: { id: "main" } });
+    await executor.run(call("hover", { tabId: tab.id, ref: "ref_1" }));
+    expect(getDocs()).toBe(2);
   });
 });

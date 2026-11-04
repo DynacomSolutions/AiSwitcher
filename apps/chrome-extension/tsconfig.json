@@ -13,5 +13,6 @@
     "skipLibCheck": true,
     "types": ["chrome", "bun-types"]
   },
-  "include": ["src", "test", "build.ts", "../../src/browser"]
+  "include": ["src", "test", "build.ts", "../../src/browser"],
+  "exclude": ["test/e2e"]
 }

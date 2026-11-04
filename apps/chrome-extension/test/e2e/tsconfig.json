@@ -1,0 +1,5 @@
+{
+  "extends": "../../../../tsconfig.json",
+  "compilerOptions": { "types": ["chrome", "bun-types"] },
+  "include": [".", "../../../../src/gateway/sql-text.d.ts", "../../../../src/browser"]
+}

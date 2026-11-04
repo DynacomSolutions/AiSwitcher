@@ -7,7 +7,7 @@ import { parseKeys } from "./keys.ts";
 import type { State } from "./state.ts";
 import type { TabManager } from "./tabs.ts";
 import { noopUi } from "./ui.ts";
-import type { ActionKind, Ui } from "./ui.ts";
+import type { ActionKind, Ui, UiSession } from "./ui.ts";
 
 export const MAX_TEXT_CHARS = 100_000;
 export const MAX_SCREENSHOT_EDGE = 1568;
@@ -96,8 +96,9 @@ export class Executor {
       // The user dismissed Chrome's debugging bar: treat as Stop for everything.
       if (reason === "canceled_by_user") void this.state.stop();
     });
-    this.api.tabs.onRemoved(tabId => this.dropTab(tabId));
-    this.state.onStop(() => this.detachAll());
+    this.api.tabs.onRemoved(tabId => { this.dropTab(tabId); void this.unmark(tabId); });
+    this.state.onStop(async () => { await Promise.all([this.detachAll(), this.ui.unmarkAll()]); });
+    this.state.onChange(paused => { if (paused) void this.ui.unmarkAll(); });
   }
 
   private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -155,8 +156,9 @@ export class Executor {
         return text(JSON.stringify({ sessionTabs: own.map(view), otherTabs: other.map(view), note: "otherTabs are read-only; use adopt_tab to control one." }));
       }
       case "tabs_create": {
+        this.throwIfAborted(sig);
         const tab = await this.tabs.create(session, a("tabs_create").url ? this.normaliseUrl(a("tabs_create").url!) : undefined);
-        await this.ui.markControlled(tab.id, session);
+        await this.markControlled(tab.id, session);
         return text(JSON.stringify({ tabId: tab.id, url: tab.url }));
       }
       case "adopt_tab": {
@@ -165,8 +167,9 @@ export class Executor {
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
         const owner = this.tabs.ownerOf(tabId);
         if (owner !== undefined && owner !== session.id) throw new ToolError("forbidden_tab", `Tab ${tabId} belongs to another session.`);
+        this.throwIfAborted(sig);
         await this.tabs.addToSession(session, tabId);
-        await this.ui.markControlled(tabId, session);
+        await this.markControlled(tabId, session);
         return text(`Adopted tab ${tabId}: ${tab.title}`);
       }
       case "wait": {
@@ -178,6 +181,7 @@ export class Executor {
     }
     const { tabId } = a("screenshot");
     const tab = await this.ownedTab(req, tabId);
+    this.throwIfAborted(sig);
     switch (tool) {
       case "navigate": return this.navigate(sig, tab, a("navigate").url);
       case "screenshot": return this.screenshot(sig, tabId);
@@ -185,7 +189,7 @@ export class Executor {
       case "find": return text(await this.find(sig, tabId, a("find").query));
       case "click": {
         const p = await this.target(sig, tabId, a("click"));
-        await this.input(tabId, p, "click");
+        await this.input(sig, tabId, p, "click");
         const button = a("click").button ?? "left";
         const clickCount = a("click").clickCount ?? 1;
         const base = { x: p.x, y: p.y, button, buttons: button === "left" ? 1 : button === "right" ? 2 : 4 };
@@ -196,7 +200,7 @@ export class Executor {
       }
       case "hover": {
         const p = await this.target(sig, tabId, a("hover"));
-        await this.input(tabId, p, "hover");
+        await this.input(sig, tabId, p, "hover");
         await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
         return text(`Hovered at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
@@ -208,14 +212,14 @@ export class Executor {
           p = { x: r.x, y: r.y };
           await this.cdp(sig, tabId, "DOM.focus", { backendNodeId: r.backendNodeId });
         }
-        await this.input(tabId, p, "type");
+        await this.input(sig, tabId, p, "type");
         await this.cdp(sig, tabId, "Input.insertText", { text: value });
         return text(`Typed ${value.length} characters.`);
       }
       case "key": {
         let specs;
         try { specs = parseKeys(a("key").key); } catch (e) { throw new ToolError("bad_args", (e as Error).message); }
-        await this.input(tabId, this.lastPoint.get(tabId) ?? { x: 0, y: 0 }, "key");
+        await this.input(sig, tabId, this.lastPoint.get(tabId) ?? { x: 0, y: 0 }, "key");
         for (let n = 0; n < (a("key").repeat ?? 1); n++) {
           for (const k of specs) {
             const common = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
@@ -230,11 +234,11 @@ export class Executor {
         if (!s.direction) {
           if (!s.ref) throw new ToolError("bad_args", "scroll needs a direction or a ref");
           const p = await this.refPoint(sig, tabId, s.ref);
-          await this.input(tabId, p, "scroll");
+          await this.input(sig, tabId, p, "scroll");
           return text("Scrolled element into view.");
         }
         const p = s.ref || s.coordinate ? await this.target(sig, tabId, s) : await this.viewportCentre(sig, tabId);
-        await this.input(tabId, p, "scroll");
+        await this.input(sig, tabId, p, "scroll");
         const delta = (s.amount ?? 3) * 100;
         const dx = s.direction === "left" ? -delta : s.direction === "right" ? delta : 0;
         const dy = s.direction === "up" ? -delta : s.direction === "down" ? delta : 0;
@@ -271,14 +275,17 @@ export class Executor {
         return text(`Set ${u.paths.length} file(s).`);
       }
       case "resize": {
+        this.throwIfAborted(sig);
         await this.api.windows.resize(tab.windowId, a("resize").width, a("resize").height);
         this.scales.delete(tabId);
         return text(`Resized window to ${a("resize").width}x${a("resize").height}.`);
       }
       case "close_tab": {
+        this.throwIfAborted(sig);
         await this.api.tabs.remove(tabId);
         this.tabs.forget(tabId);
         await this.detach(tabId);
+        await this.unmark(tabId);
         return text(`Closed tab ${tabId}.`);
       }
       default:
@@ -296,8 +303,17 @@ export class Executor {
       this.dropTab(tabId);
       throw new ToolError("tab_closed", `Tab ${tabId} was closed.`);
     }
-    await this.ui.markControlled(tabId, req.session);
+    await this.markControlled(tabId, req.session);
     return tab;
+  }
+
+  private async markControlled(tabId: number, session: UiSession): Promise<void> {
+    if (this.state.paused) return;
+    try { await this.ui.markControlled(tabId, session); } catch { /* visuals never fail a tool call */ }
+  }
+
+  private async unmark(tabId: number): Promise<void> {
+    try { await this.ui.unmark(tabId); } catch { /* best effort */ }
   }
 
   // ---- CDP ---------------------------------------------------------------
@@ -314,11 +330,13 @@ export class Executor {
     } catch (e) {
       if (!/already attached/i.test((e as Error).message ?? "")) throw new ToolError("internal", `Cannot attach debugger: ${(e as Error).message}`);
     }
-    if (sig.aborted) {
-      // Stop landed while attaching: never leave the debugger attached.
+    if (sig.aborted && sig.reason === "stopped") {
+      // Stop landed while attaching: never leave the debugger attached, and forget any state a concurrent call recorded.
       try { await this.api.debugger.detach(tabId); } catch { /* already gone */ }
+      this.dropTab(tabId);
       this.throwIfAborted(sig);
     }
+    // A timeout or gateway abort keeps the attachment: a concurrent call may already rely on it.
     this.attached.add(tabId);
     for (const d of ["Page", "Runtime", "Log", "Network"]) await this.api.debugger.send(tabId, `${d}.enable`);
   }
@@ -370,6 +388,7 @@ export class Executor {
   private onEvent(tabId: number, method: string, p: Record<string, unknown>): void {
     const ws = this.waiters.get(tabId);
     if (ws) for (const w of [...ws]) if (w.methods.includes(method)) { ws.delete(w); w.resolve(); }
+    if (method === "Page.frameNavigated" && !(p.frame as { parentId?: string } | undefined)?.parentId) this.domReady.delete(tabId);
     if (method === "Runtime.consoleAPICalled") {
       const args = (p.args as Array<{ value?: unknown; description?: string }> | undefined) ?? [];
       this.push(this.consoleBuf, tabId, `[${String(p.type)}] ${args.map(x => (x.value !== undefined ? String(x.value) : (x.description ?? ""))).join(" ")}`);
@@ -560,9 +579,10 @@ export class Executor {
     throw new ToolError("bad_args", "Give either ref or coordinate.");
   }
 
-  private async input(tabId: number, p: { x: number; y: number }, kind: ActionKind): Promise<void> {
+  private async input(sig: AbortSignal, tabId: number, p: { x: number; y: number }, kind: ActionKind): Promise<void> {
     this.lastPoint.set(tabId, { x: p.x, y: p.y });
-    await this.ui.beforeAction(tabId, { x: p.x, y: p.y, kind });
+    try { await this.ui.beforeAction(tabId, { x: p.x, y: p.y, kind }, sig); } catch { /* visuals never fail a tool call */ }
+    this.throwIfAborted(sig);
   }
 
   private async formInput(sig: AbortSignal, tabId: number, ref: string, value: string | number | boolean): Promise<Content> {
