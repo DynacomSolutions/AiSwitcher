@@ -1,6 +1,6 @@
 import { DEFAULT_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
-import { validateToolArgs } from "../../../../src/browser/tool-args.ts";
+import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
 import type { ExtensionTool, ToolArgs } from "../../../../src/browser/tool-args.ts";
 import type { ChromeApi, TabInfo } from "./chrome-api.ts";
 import { parseKeys } from "./keys.ts";
@@ -72,12 +72,13 @@ export class Executor {
   private readonly state: State;
   private readonly ui: Ui;
   private readonly attached = new Set<number>();
+  private readonly domReady = new Set<number>();
   private readonly scales = new Map<number, number>();
   private readonly refTables = new Map<number, RefTable>();
   private readonly consoleBuf = new Map<number, string[]>();
   private readonly netBuf = new Map<number, NetEntry[]>();
   private readonly lastPoint = new Map<number, { x: number; y: number }>();
-  private readonly waiters = new Map<number, Set<{ method: string; resolve: () => void }>>();
+  private readonly waiters = new Map<number, Set<{ methods: string[]; resolve: () => void }>>();
 
   constructor(deps: ExecutorDeps) {
     this.api = deps.api;
@@ -90,7 +91,11 @@ export class Executor {
     }));
     this.defaultTimeout = deps.defaultTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this.api.debugger.onEvent((tabId, method, params) => this.onEvent(tabId, method, params));
-    this.api.debugger.onDetach(tabId => this.dropTab(tabId));
+    this.api.debugger.onDetach((tabId, reason) => {
+      this.dropTab(tabId);
+      // The user dismissed Chrome's debugging bar: treat as Stop for everything.
+      if (reason === "canceled_by_user") void this.state.stop();
+    });
     this.api.tabs.onRemoved(tabId => this.dropTab(tabId));
     this.state.onStop(() => this.detachAll());
   }
@@ -103,6 +108,7 @@ export class Executor {
     const fail = (error: BrowserErrorCode, message: string): CallResult => ({ id, ok: false, error, message });
     if (this.state.paused) return fail("paused_by_user", "The user paused this browser. Do not retry until they resume it.");
     if (req.tool === "list_browsers") return fail("bad_args", "list_browsers is answered by the gateway");
+    if (!Object.hasOwn(TOOL_SCHEMAS, req.tool)) return fail("bad_args", `Unknown tool ${String(req.tool)}`);
     const tool: ExtensionTool = req.tool;
     const invalid = validateToolArgs(tool, req.args);
     if (invalid) return fail("bad_args", invalid);
@@ -138,6 +144,7 @@ export class Executor {
   // ---- dispatch ----------------------------------------------------------
 
   private async dispatch(tool: ExtensionTool, req: CallRequest, signal: AbortSignal): Promise<Content> {
+    const sig = signal;
     const session = req.session;
     const args = req.args as unknown;
     const a = <T extends ExtensionTool>(_t: T): ToolArgs[T] => args as ToolArgs[T];
@@ -172,37 +179,37 @@ export class Executor {
     const { tabId } = a("screenshot");
     const tab = await this.ownedTab(req, tabId);
     switch (tool) {
-      case "navigate": return this.navigate(tab, a("navigate").url);
-      case "screenshot": return this.screenshot(tabId);
-      case "read_page": return text(await this.readPage(tabId, a("read_page").filter ?? "interactive"));
-      case "find": return text(await this.find(tabId, a("find").query));
+      case "navigate": return this.navigate(sig, tab, a("navigate").url);
+      case "screenshot": return this.screenshot(sig, tabId);
+      case "read_page": return text(await this.readPage(sig, tabId, a("read_page").filter ?? "interactive"));
+      case "find": return text(await this.find(sig, tabId, a("find").query));
       case "click": {
-        const p = await this.target(tabId, a("click"));
+        const p = await this.target(sig, tabId, a("click"));
         await this.input(tabId, p, "click");
         const button = a("click").button ?? "left";
         const clickCount = a("click").clickCount ?? 1;
         const base = { x: p.x, y: p.y, button, buttons: button === "left" ? 1 : button === "right" ? 2 : 4 };
-        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
-        await this.cdp(tabId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", clickCount });
-        await this.cdp(tabId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", clickCount, buttons: 0 });
+        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
+        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", clickCount });
+        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", clickCount, buttons: 0 });
         return text(`Clicked at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "hover": {
-        const p = await this.target(tabId, a("hover"));
+        const p = await this.target(sig, tabId, a("hover"));
         await this.input(tabId, p, "hover");
-        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
+        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
         return text(`Hovered at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "type": {
         const { ref, text: value } = a("type");
         let p = this.lastPoint.get(tabId) ?? { x: 0, y: 0 };
         if (ref) {
-          const r = await this.refPoint(tabId, ref);
+          const r = await this.refPoint(sig, tabId, ref);
           p = { x: r.x, y: r.y };
-          await this.cdp(tabId, "DOM.focus", { backendNodeId: r.backendNodeId });
+          await this.cdp(sig, tabId, "DOM.focus", { backendNodeId: r.backendNodeId });
         }
         await this.input(tabId, p, "type");
-        await this.cdp(tabId, "Input.insertText", { text: value });
+        await this.cdp(sig, tabId, "Input.insertText", { text: value });
         return text(`Typed ${value.length} characters.`);
       }
       case "key": {
@@ -212,8 +219,8 @@ export class Executor {
         for (let n = 0; n < (a("key").repeat ?? 1); n++) {
           for (const k of specs) {
             const common = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
-            await this.cdp(tabId, "Input.dispatchKeyEvent", { ...common, type: k.text !== undefined ? "keyDown" : "rawKeyDown", ...(k.text !== undefined ? { text: k.text } : {}), ...(k.commands ? { commands: k.commands } : {}) });
-            await this.cdp(tabId, "Input.dispatchKeyEvent", { ...common, type: "keyUp" });
+            await this.cdp(sig, tabId, "Input.dispatchKeyEvent", { ...common, type: k.text !== undefined ? "keyDown" : "rawKeyDown", ...(k.text !== undefined ? { text: k.text } : {}), ...(k.commands ? { commands: k.commands } : {}) });
+            await this.cdp(sig, tabId, "Input.dispatchKeyEvent", { ...common, type: "keyUp" });
           }
         }
         return text(`Pressed ${a("key").key}.`);
@@ -222,21 +229,21 @@ export class Executor {
         const s = a("scroll");
         if (!s.direction) {
           if (!s.ref) throw new ToolError("bad_args", "scroll needs a direction or a ref");
-          const p = await this.refPoint(tabId, s.ref);
+          const p = await this.refPoint(sig, tabId, s.ref);
           await this.input(tabId, p, "scroll");
           return text("Scrolled element into view.");
         }
-        const p = s.ref || s.coordinate ? await this.target(tabId, s) : await this.viewportCentre(tabId);
+        const p = s.ref || s.coordinate ? await this.target(sig, tabId, s) : await this.viewportCentre(sig, tabId);
         await this.input(tabId, p, "scroll");
         const delta = (s.amount ?? 3) * 100;
         const dx = s.direction === "left" ? -delta : s.direction === "right" ? delta : 0;
         const dy = s.direction === "up" ? -delta : s.direction === "down" ? delta : 0;
-        await this.cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, deltaX: dx, deltaY: dy });
+        await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: p.x, y: p.y, deltaX: dx, deltaY: dy });
         return text(`Scrolled ${s.direction}.`);
       }
-      case "form_input": return this.formInput(tabId, a("form_input").ref, a("form_input").value);
+      case "form_input": return this.formInput(sig, tabId, a("form_input").ref, a("form_input").value);
       case "javascript": {
-        const r = (await this.cdp(tabId, "Runtime.evaluate", { expression: a("javascript").code, awaitPromise: true, returnByValue: true, userGesture: true })) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string; exception?: { description?: string } } };
+        const r = (await this.cdp(sig, tabId, "Runtime.evaluate", { expression: a("javascript").code, awaitPromise: true, returnByValue: true, userGesture: true })) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string; exception?: { description?: string } } };
         if (r.exceptionDetails) throw new ToolError("internal", `JavaScript error: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "unknown"}`);
         const v = r.result?.value;
         return text(v === undefined ? (r.result?.description ?? "undefined") : JSON.stringify(v));
@@ -259,7 +266,8 @@ export class Executor {
         const u = a("upload_file");
         const id = this.refTable(tabId).byRef.get(u.ref);
         if (id === undefined) throw new ToolError("bad_args", `Unknown ref ${u.ref}; call read_page or find first.`);
-        await this.cdp(tabId, "DOM.setFileInputFiles", { files: u.paths, backendNodeId: id });
+        await this.ensureDom(sig, tabId);
+        await this.cdp(sig, tabId, "DOM.setFileInputFiles", { files: u.paths, backendNodeId: id });
         return text(`Set ${u.paths.length} file(s).`);
       }
       case "resize": {
@@ -294,20 +302,41 @@ export class Executor {
 
   // ---- CDP ---------------------------------------------------------------
 
-  private async ensureAttached(tabId: number): Promise<void> {
+  private throwIfAborted(sig: AbortSignal): void {
+    if (sig.aborted) throw new ToolError(this.abortCode(sig.reason), this.abortMessage(sig.reason));
+  }
+
+  private async ensureAttached(sig: AbortSignal, tabId: number): Promise<void> {
+    this.throwIfAborted(sig);
     if (this.attached.has(tabId)) return;
     try {
       await this.api.debugger.attach(tabId);
     } catch (e) {
       if (!/already attached/i.test((e as Error).message ?? "")) throw new ToolError("internal", `Cannot attach debugger: ${(e as Error).message}`);
     }
+    if (sig.aborted) {
+      // Stop landed while attaching: never leave the debugger attached.
+      try { await this.api.debugger.detach(tabId); } catch { /* already gone */ }
+      this.throwIfAborted(sig);
+    }
     this.attached.add(tabId);
     for (const d of ["Page", "Runtime", "Log", "Network"]) await this.api.debugger.send(tabId, `${d}.enable`);
   }
 
-  private async cdp(tabId: number, method: string, params?: Record<string, unknown>): Promise<unknown> {
-    await this.ensureAttached(tabId);
-    return this.api.debugger.send(tabId, method, params);
+  private async cdp(sig: AbortSignal, tabId: number, method: string, params?: Record<string, unknown>): Promise<unknown> {
+    await this.ensureAttached(sig, tabId);
+    this.throwIfAborted(sig);
+    const result = await this.api.debugger.send(tabId, method, params);
+    this.throwIfAborted(sig);
+    return result;
+  }
+
+  /** DOM calls on backend node ids need the DOM agent to know the document. */
+  private async ensureDom(sig: AbortSignal, tabId: number): Promise<void> {
+    if (this.domReady.has(tabId)) return;
+    await this.cdp(sig, tabId, "DOM.enable");
+    await this.cdp(sig, tabId, "DOM.getDocument", { depth: 0 });
+    this.domReady.add(tabId);
   }
 
   private async detach(tabId: number): Promise<void> {
@@ -323,6 +352,7 @@ export class Executor {
 
   private dropTab(tabId: number): void {
     this.attached.delete(tabId);
+    this.domReady.delete(tabId);
     this.scales.delete(tabId);
     this.refTables.delete(tabId);
     this.consoleBuf.delete(tabId);
@@ -339,7 +369,7 @@ export class Executor {
 
   private onEvent(tabId: number, method: string, p: Record<string, unknown>): void {
     const ws = this.waiters.get(tabId);
-    if (ws) for (const w of [...ws]) if (w.method === method) { ws.delete(w); w.resolve(); }
+    if (ws) for (const w of [...ws]) if (w.methods.includes(method)) { ws.delete(w); w.resolve(); }
     if (method === "Runtime.consoleAPICalled") {
       const args = (p.args as Array<{ value?: unknown; description?: string }> | undefined) ?? [];
       this.push(this.consoleBuf, tabId, `[${String(p.type)}] ${args.map(x => (x.value !== undefined ? String(x.value) : (x.description ?? ""))).join(" ")}`);
@@ -361,9 +391,9 @@ export class Executor {
     }
   }
 
-  private waitForEvent(tabId: number, method: string, ms: number): { promise: Promise<void>; cancel: () => void } {
+  private waitForEvent(tabId: number, methods: string[], ms: number): { promise: Promise<void>; cancel: () => void } {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const w = { method, resolve: () => {} };
+    const w = { methods, resolve: () => {} };
     const promise = new Promise<void>(resolve => {
       w.resolve = () => { if (timer) clearTimeout(timer); resolve(); };
       timer = setTimeout(resolve, ms);
@@ -384,56 +414,58 @@ export class Executor {
     return u.protocol === "about:" ? "about:blank" : u.toString();
   }
 
-  private async navigate(tab: TabInfo, target: string): Promise<Content> {
+  private async navigate(sig: AbortSignal, tab: TabInfo, target: string): Promise<Content> {
     const tabId = tab.id;
-    await this.ensureAttached(tabId);
-    const loaded = this.waitForEvent(tabId, "Page.loadEventFired", NAVIGATE_LOAD_WAIT_MS);
+    await this.ensureAttached(sig, tabId);
+    const loaded = this.waitForEvent(tabId, ["Page.loadEventFired", "Page.navigatedWithinDocument"], NAVIGATE_LOAD_WAIT_MS);
     try {
       if (target === "back" || target === "forward") {
-        const h = (await this.cdp(tabId, "Page.getNavigationHistory")) as { currentIndex: number; entries: Array<{ id: number }> };
+        const h = (await this.cdp(sig, tabId, "Page.getNavigationHistory")) as { currentIndex: number; entries: Array<{ id: number }> };
         const entry = h.entries[h.currentIndex + (target === "back" ? -1 : 1)];
         if (!entry) throw new ToolError("bad_args", `No ${target} history entry.`);
-        await this.cdp(tabId, "Page.navigateToHistoryEntry", { entryId: entry.id });
+        await this.cdp(sig, tabId, "Page.navigateToHistoryEntry", { entryId: entry.id });
       } else {
-        const r = (await this.cdp(tabId, "Page.navigate", { url: this.normaliseUrl(target) })) as { errorText?: string };
+        const r = (await this.cdp(sig, tabId, "Page.navigate", { url: this.normaliseUrl(target) })) as { errorText?: string };
         if (r.errorText) throw new ToolError("internal", `Navigation failed: ${r.errorText}`);
       }
-      await loaded.promise;
+      await Promise.race([loaded.promise, new Promise<void>(r => sig.addEventListener("abort", () => r(), { once: true }))]);
+      this.throwIfAborted(sig);
     } finally {
       loaded.cancel();
     }
     this.refTables.delete(tabId);
+    this.domReady.delete(tabId);
     this.scales.delete(tabId);
     const now = await this.api.tabs.get(tabId);
     return text(`Navigated. Now at ${now?.url ?? target}`);
   }
 
-  private async viewport(tabId: number): Promise<{ w: number; h: number; x: number; y: number }> {
-    const m = (await this.cdp(tabId, "Page.getLayoutMetrics")) as { cssVisualViewport?: { clientWidth: number; clientHeight: number; pageX: number; pageY: number }; cssLayoutViewport?: { clientWidth: number; clientHeight: number } };
+  private async viewport(sig: AbortSignal, tabId: number): Promise<{ w: number; h: number; x: number; y: number }> {
+    const m = (await this.cdp(sig, tabId, "Page.getLayoutMetrics")) as { cssVisualViewport?: { clientWidth: number; clientHeight: number; pageX: number; pageY: number }; cssLayoutViewport?: { clientWidth: number; clientHeight: number } };
     const v = m.cssVisualViewport;
     const l = m.cssLayoutViewport;
     return { w: v?.clientWidth ?? l?.clientWidth ?? 800, h: v?.clientHeight ?? l?.clientHeight ?? 600, x: v?.pageX ?? 0, y: v?.pageY ?? 0 };
   }
 
-  private async viewportCentre(tabId: number): Promise<{ x: number; y: number }> {
-    const v = await this.viewport(tabId);
+  private async viewportCentre(sig: AbortSignal, tabId: number): Promise<{ x: number; y: number }> {
+    const v = await this.viewport(sig, tabId);
     return { x: v.w / 2, y: v.h / 2 };
   }
 
-  private async shoot(tabId: number, v: { w: number; h: number; x: number; y: number }, scale: number): Promise<string> {
-    const r = (await this.cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: JPEG_QUALITY, clip: { x: v.x, y: v.y, width: v.w, height: v.h, scale } })) as { data: string };
+  private async shoot(sig: AbortSignal, tabId: number, v: { w: number; h: number; x: number; y: number }, scale: number): Promise<string> {
+    const r = (await this.cdp(sig, tabId, "Page.captureScreenshot", { format: "jpeg", quality: JPEG_QUALITY, clip: { x: v.x, y: v.y, width: v.w, height: v.h, scale } })) as { data: string };
     return r.data;
   }
 
-  private async screenshot(tabId: number): Promise<Content> {
-    const v = await this.viewport(tabId);
+  private async screenshot(sig: AbortSignal, tabId: number): Promise<Content> {
+    const v = await this.viewport(sig, tabId);
     let scale = Math.min(1, MAX_SCREENSHOT_EDGE / Math.max(v.w, v.h));
-    let data = await this.shoot(tabId, v, scale);
+    let data = await this.shoot(sig, tabId, v, scale);
     let size = jpegSize(data);
     if (size && Math.max(size.width, size.height) > MAX_SCREENSHOT_EDGE) {
       // High-DPI output is larger than requested: scale down once more.
       scale *= MAX_SCREENSHOT_EDGE / Math.max(size.width, size.height);
-      data = await this.shoot(tabId, v, scale);
+      data = await this.shoot(sig, tabId, v, scale);
       size = jpegSize(data);
     }
     this.scales.set(tabId, size ? size.width / v.w : scale);
@@ -457,8 +489,8 @@ export class Executor {
     return ref;
   }
 
-  private async axNodes(tabId: number): Promise<AxNode[]> {
-    const r = (await this.cdp(tabId, "Accessibility.getFullAXTree")) as { nodes?: AxNode[] };
+  private async axNodes(sig: AbortSignal, tabId: number): Promise<AxNode[]> {
+    const r = (await this.cdp(sig, tabId, "Accessibility.getFullAXTree")) as { nodes?: AxNode[] };
     return r.nodes ?? [];
   }
 
@@ -470,8 +502,8 @@ export class Executor {
     return `${indent}${role}${name}${value}${ref}`;
   }
 
-  private async readPage(tabId: number, filter: "interactive" | "all"): Promise<string> {
-    const nodes = await this.axNodes(tabId);
+  private async readPage(sig: AbortSignal, tabId: number, filter: "interactive" | "all"): Promise<string> {
+    const nodes = await this.axNodes(sig, tabId);
     const byId = new Map(nodes.map(n => [n.nodeId, n]));
     const lines: string[] = [];
     const walk = (n: AxNode, depth: number): void => {
@@ -488,9 +520,9 @@ export class Executor {
     return lines.length ? lines.join("\n") : "No matching elements.";
   }
 
-  private async find(tabId: number, query: string): Promise<string> {
+  private async find(sig: AbortSignal, tabId: number, query: string): Promise<string> {
     const q = query.toLowerCase();
-    const hits = (await this.axNodes(tabId)).filter(n => {
+    const hits = (await this.axNodes(sig, tabId)).filter(n => {
       if (n.ignored || n.backendDOMNodeId === undefined) return false;
       const hay = `${n.role?.value ?? ""} ${n.name?.value ?? ""} ${String(n.value?.value ?? "")}`.toLowerCase();
       return hay.includes(q) && !NOISE.has(n.role?.value ?? "");
@@ -498,12 +530,13 @@ export class Executor {
     return hits.length ? hits.map(n => this.describe(tabId, n, "")).join("\n") : "No matching elements.";
   }
 
-  private async refPoint(tabId: number, ref: string): Promise<{ x: number; y: number; backendNodeId: number }> {
+  private async refPoint(sig: AbortSignal, tabId: number, ref: string): Promise<{ x: number; y: number; backendNodeId: number }> {
     const backendNodeId = this.refTable(tabId).byRef.get(ref);
     if (backendNodeId === undefined) throw new ToolError("bad_args", `Unknown ref ${ref}; call read_page or find first.`);
     try {
-      await this.cdp(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
-      const q = (await this.cdp(tabId, "DOM.getContentQuads", { backendNodeId })) as { quads?: number[][] };
+      await this.ensureDom(sig, tabId);
+      await this.cdp(sig, tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
+      const q = (await this.cdp(sig, tabId, "DOM.getContentQuads", { backendNodeId })) as { quads?: number[][] };
       const quad = q.quads?.[0];
       if (!quad || quad.length < 8) throw new Error("not visible");
       const x = (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4;
@@ -511,15 +544,17 @@ export class Executor {
       return { x, y, backendNodeId };
     } catch (e) {
       if (e instanceof ToolError) throw e;
+      this.throwIfAborted(sig);
       throw new ToolError("bad_args", `Element ${ref} is stale or not visible; call read_page again.`);
     }
   }
 
   /** Resolve ref or screenshot-space coordinate to page CSS pixels. */
-  private async target(tabId: number, t: { ref?: string; coordinate?: [number, number] }): Promise<{ x: number; y: number }> {
-    if (t.ref) return this.refPoint(tabId, t.ref);
+  private async target(sig: AbortSignal, tabId: number, t: { ref?: string; coordinate?: [number, number] }): Promise<{ x: number; y: number }> {
+    if (t.ref) return this.refPoint(sig, tabId, t.ref);
     if (t.coordinate) {
-      const scale = this.scales.get(tabId) ?? 1;
+      const scale = this.scales.get(tabId);
+      if (scale === undefined) throw new ToolError("bad_args", "Take a screenshot first: coordinates are in screenshot pixels.");
       return { x: t.coordinate[0] / scale, y: t.coordinate[1] / scale };
     }
     throw new ToolError("bad_args", "Give either ref or coordinate.");
@@ -530,13 +565,14 @@ export class Executor {
     await this.ui.beforeAction(tabId, { x: p.x, y: p.y, kind });
   }
 
-  private async formInput(tabId: number, ref: string, value: string | number | boolean): Promise<Content> {
+  private async formInput(sig: AbortSignal, tabId: number, ref: string, value: string | number | boolean): Promise<Content> {
     const backendNodeId = this.refTable(tabId).byRef.get(ref);
     if (backendNodeId === undefined) throw new ToolError("bad_args", `Unknown ref ${ref}; call read_page or find first.`);
-    const node = (await this.cdp(tabId, "DOM.resolveNode", { backendNodeId })) as { object?: { objectId?: string } };
+    await this.ensureDom(sig, tabId);
+    const node = (await this.cdp(sig, tabId, "DOM.resolveNode", { backendNodeId })) as { object?: { objectId?: string } };
     const objectId = node.object?.objectId;
     if (!objectId) throw new ToolError("bad_args", `Element ${ref} is stale; call read_page again.`);
-    const r = (await this.cdp(tabId, "Runtime.callFunctionOn", { objectId, returnByValue: true, arguments: [{ value }], functionDeclaration: FORM_INPUT_FN })) as { exceptionDetails?: { exception?: { description?: string }; text?: string } };
+    const r = (await this.cdp(sig, tabId, "Runtime.callFunctionOn", { objectId, returnByValue: true, arguments: [{ value }], functionDeclaration: FORM_INPUT_FN })) as { exceptionDetails?: { exception?: { description?: string }; text?: string } };
     if (r.exceptionDetails) throw new ToolError("bad_args", r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "Cannot set value");
     return text(`Set ${ref}.`);
   }

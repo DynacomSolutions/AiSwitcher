@@ -4,6 +4,7 @@ import type { ChromeApi, GroupColor, TabInfo } from "./chrome-api.ts";
 export interface SessionTabs { groupId: number; tabIds: Set<number>; identity: string; label: string }
 export interface SessionRef { id: string; identity: string; label: string }
 
+const SESSIONS_KEY = "sessions";
 const COLORS: GroupColor[] = ["blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
 
 /** Stable colour per identity: FNV-1a hash into the palette. */
@@ -32,6 +33,24 @@ export class TabManager {
   /** Drop a tab from every session (tab closed, by the user or by us). */
   forget(tabId: number): void {
     for (const s of this.sessions.values()) s.tabIds.delete(tabId);
+    this.persist();
+  }
+
+  private persist(): void {
+    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds] }));
+    void this.api.sessionStorage.set({ [SESSIONS_KEY]: data }).catch(() => {});
+  }
+
+  /** Rebuild ownership after a service-worker restart; tabs that no longer exist are dropped. */
+  async load(): Promise<void> {
+    const raw = (await this.api.sessionStorage.get([SESSIONS_KEY]))[SESSIONS_KEY];
+    if (!Array.isArray(raw)) return;
+    const live = new Set((await this.api.tabs.query()).map(t => t.id));
+    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[] }>) {
+      const tabIds = new Set(e.tabIds.filter(id => live.has(id)));
+      if (tabIds.size > 0) this.sessions.set(e.id, { groupId: e.groupId, tabIds, identity: e.identity, label: e.label });
+    }
+    this.persist();
   }
 
   private session(ref: SessionRef): SessionTabs {
@@ -44,17 +63,24 @@ export class TabManager {
     return s;
   }
 
+  private async newGroup(ref: SessionRef, s: SessionTabs, tabId: number): Promise<void> {
+    s.groupId = await this.api.tabs.group([tabId]);
+    await this.api.tabGroups.update(s.groupId, { title: ref.label, color: colorForIdentity(ref.identity) });
+  }
+
   /** Put a tab into the session's group, creating the group on first use (or after the user dissolved it). */
   async addToSession(ref: SessionRef, tabId: number): Promise<void> {
     const s = this.session(ref);
     if (s.tabIds.size === 0) s.groupId = -1;
-    if (s.groupId === -1) {
-      s.groupId = await this.api.tabs.group([tabId]);
-      await this.api.tabGroups.update(s.groupId, { title: ref.label, color: colorForIdentity(ref.identity) });
-    } else {
-      await this.api.tabs.group([tabId], s.groupId);
+    s.tabIds.add(tabId); // owned even if grouping fails
+    try {
+      if (s.groupId === -1) await this.newGroup(ref, s, tabId);
+      else {
+        try { await this.api.tabs.group([tabId], s.groupId); } catch { await this.newGroup(ref, s, tabId); }
+      }
+    } finally {
+      this.persist();
     }
-    s.tabIds.add(tabId);
   }
 
   async create(ref: SessionRef, url?: string): Promise<TabInfo> {

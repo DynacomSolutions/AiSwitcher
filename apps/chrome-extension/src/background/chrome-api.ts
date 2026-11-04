@@ -10,6 +10,11 @@ export interface ChromeApi {
     set(values: Record<string, unknown>): Promise<void>;
     remove(keys: string[]): Promise<void>;
   };
+  /** chrome.storage.session: survives service-worker restarts, not browser restarts. */
+  sessionStorage: {
+    get(keys: string[]): Promise<Record<string, unknown>>;
+    set(values: Record<string, unknown>): Promise<void>;
+  };
   tabs: {
     get(tabId: number): Promise<TabInfo | undefined>;
     query(): Promise<TabInfo[]>;
@@ -25,7 +30,7 @@ export interface ChromeApi {
     detach(tabId: number): Promise<void>;
     send(tabId: number, method: string, params?: Record<string, unknown>): Promise<unknown>;
     onEvent(listener: (tabId: number, method: string, params: Record<string, unknown>) => void): void;
-    onDetach(listener: (tabId: number) => void): void;
+    onDetach(listener: (tabId: number, reason: string) => void): void;
   };
 }
 
@@ -39,6 +44,10 @@ export function realChromeApi(): ChromeApi {
       get: keys => chrome.storage.local.get(keys),
       set: values => chrome.storage.local.set(values),
       remove: keys => chrome.storage.local.remove(keys),
+    },
+    sessionStorage: {
+      get: keys => chrome.storage.session.get(keys),
+      set: values => chrome.storage.session.set(values),
     },
     tabs: {
       get: async tabId => {
@@ -59,7 +68,7 @@ export function realChromeApi(): ChromeApi {
       onEvent: listener => chrome.debugger.onEvent.addListener((source, method, params) => {
         if (source.tabId !== undefined) listener(source.tabId, method, (params ?? {}) as Record<string, unknown>);
       }),
-      onDetach: listener => chrome.debugger.onDetach.addListener(source => { if (source.tabId !== undefined) listener(source.tabId); }),
+      onDetach: listener => chrome.debugger.onDetach.addListener((source, reason) => { if (source.tabId !== undefined) listener(source.tabId, reason); }),
     },
   };
 }

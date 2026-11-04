@@ -39,9 +39,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 // Keeps the worker (and thus the socket) honest after Chrome suspends it.
-chrome.alarms.create("ais-keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.create("ais-keepalive", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(() => {
-  if (connection.status === "idle" || connection.status === "reconnecting") void connect();
+  if (connection.needsRestart()) void connect();
 });
 
 // Control messages for the popup / overlay (visuals task).
@@ -53,4 +53,4 @@ chrome.runtime.onMessage.addListener((msg: { type?: string }, _sender, reply) =>
   return false;
 });
 
-void state.load().then(connect);
+void Promise.all([state.load(), tabs.load()]).then(connect);

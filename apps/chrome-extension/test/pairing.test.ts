@@ -48,6 +48,15 @@ describe("pairing", () => {
     expect(chrome.store[KEYS.token]).toBe("secret");
   });
 
+  test("429 on poll backs off and keeps polling", async () => {
+    const chrome = new FakeChrome();
+    const responses = [json(429), json(200, { binding: "b", token: "t", target: { kind: "pool", pool: "p" } })];
+    const sleeps: number[] = [];
+    await pollPairing({ fetch: async () => responses.shift()!, storage: chrome.storage, sleep: async ms => { sleeps.push(ms); } }, "wss://gw.example.test", { code: "X", pollSecret: "p", expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    expect(sleeps).toEqual([4000]);
+    expect(chrome.store[KEYS.token]).toBe("t");
+  });
+
   test("expiry stores nothing", async () => {
     const chrome = new FakeChrome();
     const fetchFn = async () => json(410);

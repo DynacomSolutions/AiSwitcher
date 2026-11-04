@@ -44,10 +44,11 @@ export class State {
   /** Gateway asked to abort one call. */
   abort(id: string): void { this.inflight.get(id)?.abort("aborted"); }
 
-  /** Abort every in-flight call with stopped_by_user and detach the debugger from all tabs. */
+  /** Abort every in-flight call with stopped_by_user, detach the debugger from all tabs and pause (user resumes from the UI). */
   async stop(): Promise<void> {
     for (const c of this.inflight.values()) c.abort("stopped");
     this.inflight.clear();
+    this.pause();
     await Promise.all([...this.stopListeners].map(async l => { try { await l(); } catch { /* best effort */ } }));
   }
 }

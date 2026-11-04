@@ -62,16 +62,24 @@ export class Connection {
 
   /** Throws if the URL is not wss:// (or ws:// on localhost). */
   start(url: string, token: string): void {
-    this.url = validateGatewayUrl(url);
+    const normalised = validateGatewayUrl(url);
+    const same = normalised === this.url && token === this.token;
+    this.url = normalised;
     this.token = token;
     this.teardown();
-    this.backoff = BACKOFF_START_MS;
+    if (!same) this.backoff = BACKOFF_START_MS; // a keepalive restart must not reset backoff
     this.open();
   }
 
   stop(): void {
     this.teardown();
-    this.setStatus("idle");
+    if (this.status !== "signed_out") this.setStatus("idle");
+  }
+
+  /** True when the keepalive alarm may call start(): nothing is connecting, waiting or connected. */
+  needsRestart(): boolean {
+    if (this.status === "idle") return true;
+    return this.status === "reconnecting" && this.socket === null && this.retryTimer === undefined;
   }
 
   sendState(paused: boolean): void {
@@ -151,6 +159,7 @@ export class Connection {
         this.backoff = BACKOFF_START_MS;
         this.pingTimer = this.sched.setInterval(() => this.send({ t: "ping" }), PING_INTERVAL_MS);
         this.setStatus("connected");
+        if (this.deps.isPaused()) this.send({ t: "state", paused: true });
         return;
       case "call": {
         if (!this.welcomed) return; // commands are rejected until a token-authenticated hello succeeded

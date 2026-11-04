@@ -82,6 +82,11 @@ export async function pollPairing(deps: PollDeps, gatewayUrl: string, start: Pai
       await deps.storage.set({ [KEYS.token]: body.token, [KEYS.binding]: body.binding, [KEYS.target]: body.target });
       return { binding: body.binding, target: body.target };
     }
+    if (res.status === 429) {
+      if (Date.parse(start.expiresAt) < Date.now()) throw new PairingError("Pairing code expired, start again");
+      await sleep(POLL_INTERVAL_MS * 2);
+      continue;
+    }
     if (res.status === 404 || res.status === 410) throw new PairingError("Pairing code expired or unknown, start again");
     if (res.status !== 202) throw new PairingError(`Unexpected poll status ${res.status}`);
     if (Date.parse(start.expiresAt) < Date.now()) throw new PairingError("Pairing code expired, start again");

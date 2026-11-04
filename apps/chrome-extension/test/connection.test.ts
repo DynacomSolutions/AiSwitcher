@@ -93,6 +93,29 @@ describe("connection", () => {
     expect(delays).toEqual([1000, 2000, 4000, 8000, 16000, 30000, 30000]);
   });
 
+  test("alarm mid-backoff does not restart or reset backoff; start with same args keeps backoff", () => {
+    const t = setup();
+    t.conn.start("wss://gw.example.test", "tok");
+    t.sockets[0]!.onclose!({ code: 1012 });
+    t.timers.filter(x => !x.interval).at(-1)!.fn(); // 1 s retry, now connecting again
+    expect(t.conn.needsRestart()).toBe(false);
+    t.sockets[1]!.onclose!({ code: 1012 }); // waiting 2 s
+    expect(t.conn.needsRestart()).toBe(false);
+    t.conn.start("wss://gw.example.test", "tok");
+    t.sockets.at(-1)!.onclose!({ code: 1012 });
+    expect(t.timers.filter(x => !x.interval).at(-1)!.ms).toBe(4000);
+  });
+
+  test("signed_out survives stop(); paused state is sent on welcome", () => {
+    const t = setup(true);
+    t.conn.start("wss://gw.example.test", "tok");
+    t.sockets[0]!.serve({ t: "welcome", binding: "b", target: { kind: "identity", identity: "i" } });
+    expect(t.sockets[0]!.sent.at(-1)).toEqual({ t: "state", paused: true });
+    t.sockets[0]!.onclose!({ code: 4401 });
+    t.conn.stop();
+    expect(t.conn.status).toBe("signed_out");
+  });
+
   test("4401 signs out and does not reconnect; 4409 shows replaced and does not reconnect", () => {
     const a = setup();
     a.conn.start("wss://gw.example.test", "tok");

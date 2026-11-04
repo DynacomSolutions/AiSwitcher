@@ -49,7 +49,8 @@ export function parseKeys(input: string): KeySpec[] {
       const upper = main.toUpperCase();
       const isLetter = /[a-z]/i.test(main);
       const isDigit = /[0-9]/.test(main);
-      spec = { key: main, code: isLetter ? `Key${upper}` : isDigit ? `Digit${main}` : "", vk: upper.charCodeAt(0), text: main, modifiers };
+      const shifted = (modifiers & 8) !== 0 && isLetter ? upper : main;
+      spec = { key: shifted, code: isLetter ? `Key${upper}` : isDigit ? `Digit${main}` : "", vk: upper.charCodeAt(0), text: shifted, modifiers };
     } else {
       throw new Error(`Unknown key "${main}"`);
     }

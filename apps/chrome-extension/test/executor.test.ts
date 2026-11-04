@@ -71,6 +71,33 @@ describe("tab ownership", () => {
   });
 });
 
+describe("tab persistence and groups", () => {
+  test("ownership survives a worker restart; vanished tabs are dropped", async () => {
+    const { api, tabs } = setup();
+    const a = await tabs.create(session, "https://a.test/");
+    const b = await tabs.create(session, "https://b.test/");
+    const gid = tabs.sessions.get("s1")!.groupId;
+    api.tabList.delete(b.id);
+    const tabs2 = new TabManager(api);
+    await tabs2.load();
+    expect(tabs2.owns("s1", a.id)).toBe(true);
+    expect(tabs2.owns("s1", b.id)).toBe(false);
+    expect(tabs2.sessions.get("s1")).toMatchObject({ groupId: gid, label: "dyn / s1", identity: "dyn" });
+  });
+
+  test("stale groupId gets a fresh group and the tab stays owned", async () => {
+    const { api, tabs, executor } = setup();
+    const first = await tabs.create(session);
+    api.groupFailures.add(tabs.sessions.get("s1")!.groupId);
+    const r = await executor.run(call("tabs_create"));
+    expect(r.ok).toBe(true);
+    const { tabId } = JSON.parse(textOf(r));
+    expect(tabs.owns("s1", tabId)).toBe(true);
+    expect(tabs.owns("s1", first.id)).toBe(true);
+    expect(api.groups.get(tabs.sessions.get("s1")!.groupId)?.title).toBe("dyn / s1");
+  });
+});
+
 describe("pause and stop", () => {
   test("paused replies paused_by_user without touching the browser", async () => {
     const { api, state, executor } = setup();
@@ -105,6 +132,43 @@ describe("pause and stop", () => {
     await state.stop();
     expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
     expect(api.attachedTabs.size).toBe(0);
+    expect(state.paused).toBe(true);
+    expect(api.store.paused).toBe(true);
+  });
+
+  test("stop during a multi-step click dispatches no input and leaves nothing attached", async () => {
+    const { api, state, tabs, executor } = setup();
+    const tab = await tabs.create(session, "https://example.test/");
+    api.cdpResults["Accessibility.getFullAXTree"] = { nodes: [{ nodeId: "1", role: { value: "button" }, name: { value: "Go" }, backendDOMNodeId: 9 }] };
+    await executor.run(call("read_page", { tabId: tab.id }));
+    api.cdpResults["DOM.getContentQuads"] = async () => { await state.stop(); return { quads: [[0, 0, 2, 0, 2, 2, 0, 2]] }; };
+    const r = await executor.run(call("click", { tabId: tab.id, ref: "ref_1" }));
+    expect(r).toMatchObject({ ok: false, error: "stopped_by_user" });
+    await new Promise(res => setTimeout(res, 10));
+    expect(api.cdpLog.some(l => l.method === "Input.dispatchMouseEvent")).toBe(false);
+    expect(api.attachedTabs.size).toBe(0);
+    // paused now, further calls refused
+    expect(await executor.run(call("tabs_context"))).toMatchObject({ ok: false, error: "paused_by_user" });
+  });
+
+  test("stop while the debugger is attaching detaches again and never enables domains", async () => {
+    const { api, state, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const attach = api.debugger.attach;
+    api.debugger.attach = async id => { await state.stop(); await attach(id); };
+    expect(await executor.run(call("read_page", { tabId: tab.id }))).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(api.attachedTabs.size).toBe(0);
+    expect(api.cdpLog).toHaveLength(0);
+  });
+
+  test("user cancelling the debugger bar acts as Stop", async () => {
+    const { api, state, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const pending = executor.run(call("wait", { seconds: 100 }));
+    await new Promise(r => setTimeout(r, 5));
+    for (const l of api.detachListeners) l(tab.id, "canceled_by_user");
+    expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(state.paused).toBe(true);
   });
 
   test("gateway abort and call timeout yield timeout", async () => {
@@ -178,6 +242,45 @@ describe("args and tools", () => {
     const move = api.cdpLog.filter(l => l.method === "Input.dispatchMouseEvent").at(-1)!.params!;
     expect(move.x).toBeCloseTo(200, 3);
     expect(move.y).toBeCloseTo(100, 3);
+  });
+
+  test("coordinate without a screenshot is bad_args", async () => {
+    const { tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    const r = await executor.run(call("click", { tabId: tab.id, coordinate: [1, 2] }));
+    expect(r).toMatchObject({ ok: false, error: "bad_args" });
+    expect(r.ok ? "" : r.message).toMatch(/screenshot first/);
+  });
+
+  test("unknown tool replies bad_args instead of throwing", async () => {
+    const { executor } = setup();
+    expect(await executor.run({ ...call("tabs_context"), tool: "nope" as BrowserTool })).toMatchObject({ ok: false, error: "bad_args" });
+  });
+
+  test("navigate resolves on same-document navigation without waiting for load", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session, "https://example.test/");
+    api.cdpResults["Page.navigate"] = () => { queueMicrotask(() => api.emit(tab.id, "Page.navigatedWithinDocument", {})); return {}; };
+    const t0 = Date.now();
+    expect((await executor.run(call("navigate", { tabId: tab.id, url: "https://example.test/#x" }))).ok).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(150);
+  });
+
+  test("shift+letter types the upper case letter", async () => {
+    const { parseKeys } = await import("../src/background/keys.ts");
+    expect(parseKeys("shift+a")[0]).toMatchObject({ key: "A", text: "A", modifiers: 8 });
+  });
+
+  test("DOM agent is enabled before ref based DOM calls", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    api.cdpResults["Accessibility.getFullAXTree"] = { nodes: [{ nodeId: "1", role: { value: "button" }, name: { value: "Go" }, backendDOMNodeId: 9 }] };
+    api.cdpResults["DOM.getContentQuads"] = { quads: [[0, 0, 2, 0, 2, 2, 0, 2]] };
+    await executor.run(call("read_page", { tabId: tab.id }));
+    await executor.run(call("hover", { tabId: tab.id, ref: "ref_1" }));
+    const methods = api.cdpLog.map(l => l.method);
+    expect(methods.indexOf("DOM.getDocument")).toBeGreaterThan(-1);
+    expect(methods.indexOf("DOM.getDocument")).toBeLessThan(methods.indexOf("DOM.getContentQuads"));
   });
 
   test("text results are truncated at 100000 chars", () => {
