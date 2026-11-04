@@ -1,3 +1,4 @@
+import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
 
 export interface GatewayStore {
@@ -10,12 +11,31 @@ export interface GatewayStore {
   revokeApp(name: string): Promise<void>;
   appendUsage(rows: UsageRow[]): Promise<void>;
   usageSince(app: string, since: Date): Promise<number>;
+  putBrowserBinding(b: BrowserBinding): Promise<void>;
+  getBrowserBinding(name: string): Promise<BrowserBinding | undefined>;
+  listBrowserBindings(): Promise<BrowserBinding[]>;
+  revokeBrowserBinding(name: string): Promise<void>;
+  /** Stores only the hash; the binding name goes in the `app` field of the returned records. */
+  addBrowserToken(binding: string, prefix: string, hash: string): Promise<void>;
+  browserTokensFor(binding: string): Promise<TokenRecord[]>;
+  putPairing(p: BrowserPairing): Promise<void>;
+  /** Returns expired pairings too; the caller enforces expiry. */
+  getPairing(code: string): Promise<BrowserPairing | undefined>;
+  deletePairing(code: string): Promise<void>;
+  addAgentToken(r: AgentTokenRecord): Promise<void>;
+  /** Returns undefined once the identity's agent tokens are revoked. */
+  agentTokenByPrefix(prefix: string): Promise<AgentTokenRecord | undefined>;
+  revokeAgentTokens(identity: string): Promise<void>;
 }
 
 export class MemoryGatewayStore implements GatewayStore {
   private apps = new Map<string, GatewayApp>();
   private tokens: TokenRecord[] = [];
   private usage: UsageRow[] = [];
+  private bindings = new Map<string, BrowserBinding>();
+  private browserTokens: TokenRecord[] = [];
+  private pairings = new Map<string, BrowserPairing>();
+  private agentTokens: AgentTokenRecord[] = [];
 
   async getApp(name: string): Promise<GatewayApp | undefined> {
     const app = this.apps.get(name);
@@ -62,5 +82,60 @@ export class MemoryGatewayStore implements GatewayStore {
       if (r.app === app && Date.parse(r.ts) >= cutoff) total += r.inputTokens + r.outputTokens + r.cacheWriteTokens;
     }
     return total;
+  }
+
+  async putBrowserBinding(b: BrowserBinding): Promise<void> {
+    this.bindings.set(b.name, { ...b, target: { ...b.target } });
+  }
+
+  async getBrowserBinding(name: string): Promise<BrowserBinding | undefined> {
+    const b = this.bindings.get(name);
+    return b ? { ...b, target: { ...b.target } } : undefined;
+  }
+
+  async listBrowserBindings(): Promise<BrowserBinding[]> {
+    return [...this.bindings.values()].map((b) => ({ ...b, target: { ...b.target } }));
+  }
+
+  async revokeBrowserBinding(name: string): Promise<void> {
+    const b = this.bindings.get(name);
+    if (b) b.state = "revoked";
+  }
+
+  async addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
+    this.browserTokens.push({ app: binding, prefix, hash, createdAt: new Date().toISOString() });
+  }
+
+  async browserTokensFor(binding: string): Promise<TokenRecord[]> {
+    return this.browserTokens.filter((t) => t.app === binding).map((t) => ({ ...t }));
+  }
+
+  async putPairing(p: BrowserPairing): Promise<void> {
+    this.pairings.set(p.code, { ...p });
+  }
+
+  async getPairing(code: string): Promise<BrowserPairing | undefined> {
+    const p = this.pairings.get(code);
+    return p ? { ...p } : undefined;
+  }
+
+  async deletePairing(code: string): Promise<void> {
+    this.pairings.delete(code);
+  }
+
+  async addAgentToken(r: AgentTokenRecord): Promise<void> {
+    this.agentTokens.push({ ...r });
+  }
+
+  async agentTokenByPrefix(prefix: string): Promise<AgentTokenRecord | undefined> {
+    const r = this.agentTokens.find((t) => t.prefix === prefix && t.revokedAt === undefined);
+    return r ? { ...r } : undefined;
+  }
+
+  async revokeAgentTokens(identity: string): Promise<void> {
+    const at = new Date().toISOString();
+    for (const t of this.agentTokens) {
+      if (t.identity === identity && t.revokedAt === undefined) t.revokedAt = at;
+    }
   }
 }

@@ -1,3 +1,4 @@
+import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import type { GatewayStore } from "./store.ts";
 import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
 
@@ -89,5 +90,54 @@ export class CachedGatewayStore implements GatewayStore {
 
   usageSince(app: string, since: Date): Promise<number> {
     return this.inner.usageSince(app, since);
+  }
+
+  // Browser records are not on the proxy's hot path: pass straight through to the store.
+  putBrowserBinding(b: BrowserBinding): Promise<void> {
+    return this.inner.putBrowserBinding(b);
+  }
+
+  getBrowserBinding(name: string): Promise<BrowserBinding | undefined> {
+    return this.inner.getBrowserBinding(name);
+  }
+
+  listBrowserBindings(): Promise<BrowserBinding[]> {
+    return this.inner.listBrowserBindings();
+  }
+
+  revokeBrowserBinding(name: string): Promise<void> {
+    return this.inner.revokeBrowserBinding(name);
+  }
+
+  addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
+    return this.inner.addBrowserToken(binding, prefix, hash);
+  }
+
+  browserTokensFor(binding: string): Promise<TokenRecord[]> {
+    return this.inner.browserTokensFor(binding);
+  }
+
+  putPairing(p: BrowserPairing): Promise<void> {
+    return this.inner.putPairing(p);
+  }
+
+  getPairing(code: string): Promise<BrowserPairing | undefined> {
+    return this.inner.getPairing(code);
+  }
+
+  deletePairing(code: string): Promise<void> {
+    return this.inner.deletePairing(code);
+  }
+
+  addAgentToken(r: AgentTokenRecord): Promise<void> {
+    return this.inner.addAgentToken(r);
+  }
+
+  agentTokenByPrefix(prefix: string): Promise<AgentTokenRecord | undefined> {
+    return this.inner.agentTokenByPrefix(prefix);
+  }
+
+  revokeAgentTokens(identity: string): Promise<void> {
+    return this.inner.revokeAgentTokens(identity);
   }
 }
