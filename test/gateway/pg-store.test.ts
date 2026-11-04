@@ -29,6 +29,17 @@ if (!url && process.env.CI && !optOut) {
     for (const s of stores) await s.close();
   });
 
+  // Close every earlier store before making the next, so pools never pile up past max_connections.
+  async function fresh(): Promise<PgGatewayStore> {
+    const old = stores.splice(0);
+    for (const s of old) await s.close();
+    await reset();
+    await migrate(url as string);
+    const s = new PgGatewayStore(url as string);
+    stores.push(s);
+    return s;
+  }
+
   const dbName = new URL(url).pathname.replace(/^\//, "");
   if (!dbName.includes("test")) {
     throw new Error(`refusing to reset database "${dbName}": its name must contain "test"`);
@@ -122,21 +133,13 @@ if (!url && process.env.CI && !optOut) {
 
   describe("PgGatewayStore contract", () => {
     storeContract(async () => {
-      await reset();
-      await migrate(url);
-      const s = new PgGatewayStore(url);
-      stores.push(s);
-      return s;
+      return fresh();
     });
   });
 
   describe("PgGatewayStore browser contract", () => {
     browserStoreContract(async () => {
-      await reset();
-      await migrate(url);
-      const s = new PgGatewayStore(url);
-      stores.push(s);
-      return s;
+      return fresh();
     });
   });
 }
