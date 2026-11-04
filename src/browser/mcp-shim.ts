@@ -1,7 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { expandPath } from "../identities/match.ts";
+import { allowedAccounts, findPool } from "../identities/pool/swap-pool.ts";
+import { isRetired } from "../identities/retired.ts";
+import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
+import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
+import { shortSessionId } from "./session-label.ts";
 import { BROWSER_TOOLS, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
 
@@ -17,6 +23,11 @@ export interface ShimContext {
   /** Agent token, resolved on each call. */
   token(): Promise<string | undefined>;
   session: { id: string; identity: string; label: string };
+  /**
+   * Pool mode: resolves the pool's current active member and that member's token on each call.
+   * `error` is a ready tool error text. Overrides `token` and `session.identity`/`label`.
+   */
+  resolveAuth?(): Promise<{ identity?: string; token?: string; error?: string }>;
   fetch: typeof fetch;
   /** In-flight tools/call requests by JSON-RPC id, aborted by notifications/cancelled. */
   inflight?: Map<string | number, AbortController>;
@@ -38,7 +49,18 @@ export function mapCallResult(result: CallResult): { isError?: true; content: Mc
 async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal?: AbortSignal): Promise<{ isError?: true; content: McpContent[] }> {
   if (!(BROWSER_TOOLS as readonly string[]).includes(name)) return errorResult(`bad_args: unknown tool ${name}`);
   const { browser, ...args } = (typeof rawArgs === "object" && rawArgs !== null ? rawArgs : {}) as Record<string, unknown>;
-  const [url, token] = await Promise.all([ctx.gatewayUrl(), ctx.token()]);
+  let session = ctx.session;
+  let token: string | undefined;
+  let url: string | undefined;
+  if (ctx.resolveAuth) {
+    const auth = await ctx.resolveAuth();
+    if (auth.error !== undefined || !auth.identity) return errorResult(auth.error ?? "internal: cannot resolve the active pool member");
+    token = auth.token;
+    session = { id: ctx.session.id, identity: auth.identity, label: `${auth.identity} / ${shortSessionId(ctx.session.id)}` };
+    url = await ctx.gatewayUrl();
+  } else {
+    [url, token] = await Promise.all([ctx.gatewayUrl(), ctx.token()]);
+  }
   if (!url) return errorResult("internal: AIS_GATEWAY_PROXY_URL is not set (env or ~/.secrets)");
   if (!token) return errorResult("internal: no ais-browser-token found; run `ais browser agent-token <identity>`");
   let res: Response;
@@ -47,7 +69,7 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
       signal: AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), ...(signal ? [signal] : [])]),
-      body: JSON.stringify({ ...(typeof browser === "string" ? { browser } : {}), session: ctx.session, tool: name, args }),
+      body: JSON.stringify({ ...(typeof browser === "string" ? { browser } : {}), session, tool: name, args }),
     });
   } catch (e) {
     if (signal?.aborted) return errorResult("internal: cancelled");
@@ -98,12 +120,12 @@ export async function handleRpc(msg: RpcMessage, ctx: ShimContext): Promise<obje
   }
 }
 
-export interface ShimOptions { configDir?: string; identity?: string; gateway?: string }
+export interface ShimOptions { configDir?: string; identity?: string; gateway?: string; pool?: string; tool?: string; registryPath?: string }
 
-/** Parses `--config-dir <d> --identity <n> --gateway <u>` (also `--flag=value`). Unknown args are ignored. */
+/** Parses `--config-dir <d> --identity <n> --gateway <u> --pool <p> --tool <t>` (also `--flag=value`). Unknown args are ignored. */
 export function parseShimArgs(argv: string[]): ShimOptions {
   const out: ShimOptions = {};
-  const keys = { "--config-dir": "configDir", "--identity": "identity", "--gateway": "gateway" } as const;
+  const keys = { "--config-dir": "configDir", "--identity": "identity", "--gateway": "gateway", "--pool": "pool", "--tool": "tool" } as const;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     const eq = a.indexOf("=");
@@ -127,9 +149,35 @@ async function readToken(env: NodeJS.ProcessEnv, configDir?: string): Promise<st
   return undefined;
 }
 
-/** Random UUIDs keep 6 chars; human-chosen ids show up to 12. */
-function shortId(id: string): string {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) ? id.slice(0, 6) : id.slice(0, 12);
+async function readTokenFile(dir: string): Promise<string | undefined> {
+  try {
+    return (await readFile(join(dir, BROWSER_TOKEN_FILE), "utf8")).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Active member of swap pool `poolName` (read fresh from the registry) and its token. */
+export async function resolvePoolAuth(poolName: string, tool: string, registryPath?: string): Promise<{ identity?: string; token?: string; error?: string }> {
+  const cfg = tool === "codex" ? CODEX_CONFIG : CLAUDE_CONFIG;
+  let file;
+  try {
+    file = await loadIdentitiesFile(registryPath ?? cfg.identitiesJsonPath);
+  } catch (e) {
+    return { error: `internal: cannot read ${tool} identities: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  const pool = findPool(file, poolName);
+  if (!pool) return { error: `internal: swap pool ${poolName} not found` };
+  const active = pool.swapPool.active;
+  if (!active) return { error: `internal: swap pool ${poolName} has no active member` };
+  const member = findIdentityByNameOrAlias(file.identities, active);
+  const name = member?.name ?? active;
+  if (!member) return { identity: name, error: `active pool member ${name} of pool ${pool.name} is not a known identity` };
+  if (isRetired(member)) return { identity: name, error: `active pool member ${name} of pool ${pool.name} is retired` };
+  if (!allowedAccounts(pool).includes(member.name)) return { identity: name, error: `active pool member ${name} is not allowed in pool ${pool.name}` };
+  const token = await readTokenFile(expandPath(member.configDir));
+  if (!token) return { identity: name, error: `no AIS Browser agent token for identity ${name}; run ais browser agent-token ${name}` };
+  return { identity: name, token };
 }
 
 export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimOptions = {}): ShimContext {
@@ -138,7 +186,8 @@ export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimO
   return {
     gatewayUrl: async () => opts.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
     token: () => readToken(env, opts.configDir),
-    session: { id, identity, label: `${identity} / ${shortId(id)}` },
+    ...(opts.pool ? { resolveAuth: () => resolvePoolAuth(opts.pool!, opts.tool ?? "claude", opts.registryPath) } : {}),
+    session: { id, identity, label: `${identity} / ${shortSessionId(id)}` },
     fetch,
     inflight: new Map(),
   };

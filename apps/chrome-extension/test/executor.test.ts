@@ -89,6 +89,19 @@ describe("tab persistence and groups", () => {
     expect(tabs2.sessions.get("s1")).toMatchObject({ groupId: gid, label: "dyn / s1", identity: "dyn" });
   });
 
+  test("a pool session keeps ownership across calls; an identity session cannot claim it", async () => {
+    const { tabs, executor } = setup();
+    const poolSession = { id: "sp", identity: "pool:main", label: "main / sp" };
+    const first = await tabs.create(poolSession);
+    const r = await executor.run(call("tabs_create", {}, poolSession));
+    expect(r.ok).toBe(true);
+    const { tabId } = JSON.parse(textOf(r));
+    expect(tabs.owns("sp", first.id, "pool:main")).toBe(true);
+    expect(tabs.owns("sp", tabId, "pool:main")).toBe(true);
+    expect(tabs.owns("sp", first.id, "id1")).toBe(false);
+    expect(tabs.owns("sp", first.id, "dyn")).toBe(false);
+  });
+
   test("stale groupId gets a fresh group and the tab stays owned", async () => {
     const { api, tabs, executor } = setup();
     const first = await tabs.create(session);

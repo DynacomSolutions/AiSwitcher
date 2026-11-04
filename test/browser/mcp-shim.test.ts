@@ -119,6 +119,58 @@ test("token read from --config-dir without env", async () => {
   rmSync(d, { recursive: true });
 });
 
+test("pool mode resolves the active member per call, stable session id, clear missing-token error", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { contextFromEnv } = await import("../../src/browser/mcp-shim.ts");
+  const root = mkdtempSync(join(tmpdir(), "ais-shim-pool-"));
+  for (const n of ["a", "b", "c"]) mkdirSync(join(root, n));
+  writeFileSync(join(root, "a", "ais-browser-token"), "tok-a\n");
+  writeFileSync(join(root, "b", "ais-browser-token"), "tok-b\n");
+  const registry = join(root, "identities.json");
+  const write = (active: string) => writeFileSync(registry, JSON.stringify({ version: 1, identities: [
+    ...["a", "b", "c"].map((n) => ({ name: n, label: n, configDir: join(root, n) })),
+    { name: "pool", label: "pool", configDir: join(root, "pool"), swapPool: { accounts: ["a", "b", "c"], active } },
+  ] }));
+  write("a");
+  reply = { id: "x", ok: true, content: [{ type: "text", text: "ok" }] };
+  const base = contextFromEnv({ CLAUDE_SESSION_ID: "sess-123456" }, { pool: "pool", tool: "claude", registryPath: registry });
+  const c: ShimContext = { ...base, gatewayUrl: async () => "http://gw.test/", fetch: ((u: string, init: RequestInit) => app.request(u, init)) as unknown as typeof fetch };
+  const go = () => handleRpc({ id: 1, method: "tools/call", params: { name: "tabs_context" } }, c) as Promise<any>;
+  await go();
+  write("b");
+  await go();
+  expect(seen.map((s) => s.auth)).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+  expect(seen.map((s) => s.body.session)).toEqual([
+    { id: "sess-123456", identity: "a", label: "a / sess-123456" },
+    { id: "sess-123456", identity: "b", label: "b / sess-123456" },
+  ]);
+  write("c");
+  const r = await go();
+  expect(r.result.isError).toBe(true);
+  expect(r.result.content[0].text).toBe("no AIS Browser agent token for identity c; run ais browser agent-token c");
+  expect(seen.length).toBe(2);
+  mkdirSync(join(root, "d"));
+  writeFileSync(join(root, "d", "ais-browser-token"), "tok-d\n");
+  writeFileSync(registry, JSON.stringify({ version: 1, identities: [
+    ...["a", "d"].map((n) => ({ name: n, label: n, configDir: join(root, n) })),
+    { name: "pool", label: "pool", configDir: join(root, "pool"), swapPool: { accounts: ["a", "d"], disallowed: ["d"], active: "d" } },
+  ] }));
+  expect((await go()).result.content[0].text).toBe("active pool member d is not allowed in pool pool");
+  writeFileSync(registry, JSON.stringify({ version: 1, identities: [
+    { name: "a", label: "a", configDir: join(root, "a") },
+    { name: "pool", label: "pool", configDir: join(root, "pool"), swapPool: { accounts: ["a", "ghost"], active: "ghost" } },
+  ] }));
+  expect((await go()).result.content[0].text).toContain("is not a known identity");
+  expect(seen.length).toBe(2);
+  rmSync(root, { recursive: true });
+});
+
+test("parseShimArgs reads --pool and --tool", () => {
+  expect(parseShimArgs(["browser", "mcp", "--pool", "p", "--tool=codex"])).toEqual({ pool: "p", tool: "codex" });
+});
+
 test("session label keeps 6 chars for UUIDs and up to 12 for named sessions", async () => {
   const { contextFromEnv } = await import("../../src/browser/mcp-shim.ts");
   const uuid = "3f2a9c1e-1111-4222-8333-444455556666";

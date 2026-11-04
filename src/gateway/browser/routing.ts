@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { BROWSER_TOOLS, DEFAULT_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallResult } from "../../browser/protocol.ts";
+import { shortSessionId } from "../../browser/session-label.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import { authAgentToken } from "./auth.ts";
@@ -15,6 +16,17 @@ export async function allowedBindings(identity: string, connected: BrowserBindin
     } else if ((await poolMembers(b.target.pool)).includes(identity)) out.push(b);
   }
   return out;
+}
+
+/**
+ * Session sent to the extension. Identity bindings keep the caller's real identity. A pool
+ * binding owns tabs per pool, not per member (the active member changes on every swap), so the
+ * identity is `pool:<P>` and the tab group title `<P> / <id>`; the caller was already checked
+ * to be a live member of P.
+ */
+export function forwardedSession(b: BrowserBinding, identity: string, id: string, label: string): { id: string; identity: string; label: string } {
+  if (b.target.kind !== "pool") return { id, identity, label };
+  return { id, identity: `pool:${b.target.pool}`, label: `${b.target.pool} / ${shortSessionId(id)}`.slice(0, 80) };
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -82,7 +94,7 @@ export function createCallRoutes(deps: CallDeps): Hono {
     c.req.raw.signal.addEventListener("abort", onAbort, { once: true });
     const result = await deps.hub.call(
       chosen.name,
-      { id, session: { id: body.session.id, identity: a.identity, label }, tool: tool as BrowserTool, args },
+      { id, session: forwardedSession(chosen, a.identity, body.session.id, label), tool: tool as BrowserTool, args },
       tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : DEFAULT_CALL_TIMEOUT_MS,
     );
     c.req.raw.signal.removeEventListener("abort", onAbort);

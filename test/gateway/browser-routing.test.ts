@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { BrowserBinding } from "../../src/browser/types.ts";
 import { createGatewayApp } from "../../src/gateway/app.ts";
 import { BrowserHub, type HubSocket } from "../../src/gateway/browser/hub.ts";
+import { browserPoolMemberNames } from "../../src/gateway/serve.ts";
 import { allowedBindings } from "../../src/gateway/browser/routing.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken, hashSecret, parseToken } from "../../src/gateway/tokens.ts";
@@ -153,5 +154,62 @@ describe("POST /browser/call", () => {
     await Bun.sleep(30);
     expect(ws.sent.some((m) => m.t === "abort")).toBe(true);
     await res.catch(() => undefined);
+  });
+
+  async function tokenFor(identity: string): Promise<string> {
+    const t = generateToken();
+    await store.addAgentToken({ identity, prefix: t.prefix, hash: t.hash, createdAt: "2026-11-04T00:00:00.000Z" });
+    return t.token;
+  }
+  /** Identity and label the extension is sent for the next call. */
+  function capture(ws: Ws): Array<{ identity: string; label: string }> {
+    const seen: Array<{ identity: string; label: string }> = [];
+    const orig = ws.send.bind(ws);
+    ws.send = (d: string) => {
+      const s = (JSON.parse(d) as { req?: { session: { identity: string; label: string } } }).req?.session;
+      if (s) seen.push({ identity: s.identity, label: s.label });
+      orig(d);
+    };
+    return seen;
+  }
+
+  test("pool binding: members a then b forward the same pool identity and label; identity binding keeps the real one", async () => {
+    const tokB = await tokenFor("id2");
+    const pool = await connect(b("p", { kind: "pool", pool: "main" }));
+    const seenPool = capture(pool);
+    const sess = { id: "abcdef123", label: "id1 / abcdef" };
+    answer(pool);
+    await call({ session: sess, tool: "screenshot" });
+    answer(pool);
+    await call({ session: { ...sess, label: "id2 / abcdef" }, tool: "screenshot" }, tokB);
+    expect(seenPool).toEqual([{ identity: "pool:main", label: "main / abcdef123" }, { identity: "pool:main", label: "main / abcdef123" }]);
+
+    const pin = await connect(b("i", { kind: "identity", identity: "id1" }));
+    const seenPin = capture(pin);
+    answer(pin);
+    await call({ session: sess, tool: "screenshot", browser: "i" });
+    expect(seenPin).toEqual([{ identity: "id1", label: "id1 / abcdef" }]);
+  });
+
+  test("a non-member is refused a pool binding", async () => {
+    const tokZ = await tokenFor("zzz");
+    await connect(b("p", { kind: "pool", pool: "main" }));
+    expect((await call({ session, tool: "screenshot", browser: "p" }, tokZ)).status).toBe(403);
+    expect(await (await call({ session, tool: "screenshot" }, tokZ)).json()).toMatchObject({ ok: false, error: "no_browser" });
+  });
+
+  test("a retired pool member is excluded: 403 when naming the pool browser, no_browser otherwise", async () => {
+    const file: any = { version: 1, identities: [
+      { name: "id1", label: "id1", configDir: "/x/id1" },
+      { name: "id2", label: "id2", configDir: "/x/id2", retired: true },
+      { name: "main", label: "main", configDir: "/x/main", swapPool: { accounts: ["id1", "id2"], active: "id1" } },
+    ] };
+    expect(browserPoolMemberNames(file, "main")).toEqual(["id1"]);
+    expect(browserPoolMemberNames(file, "nope")).toBeUndefined();
+    members = { main: browserPoolMemberNames(file, "main")! };
+    const tokB = await tokenFor("id2");
+    await connect(b("p", { kind: "pool", pool: "main" }));
+    expect((await call({ session, tool: "screenshot", browser: "p" }, tokB)).status).toBe(403);
+    expect(await (await call({ session, tool: "screenshot" }, tokB)).json()).toMatchObject({ ok: false, error: "no_browser" });
   });
 });

@@ -29,6 +29,11 @@ export interface Indicator {
   destroy(): void;
 }
 
+/** Pool sessions carry `pool:<name>`; the pill shows just the pool name. */
+export function displayIdentity(identity: string): string {
+  return identity.startsWith("pool:") ? identity.slice(5) : identity;
+}
+
 export function createIndicator(root: ShadowRoot, onStop: () => void): Indicator {
   const glow = document.createElement("div");
   glow.className = "glow";
@@ -43,7 +48,8 @@ export function createIndicator(root: ShadowRoot, onStop: () => void): Indicator
   let shown = false;
 
   return {
-    show(identity, label, color) {
+    show(rawIdentity, label, color) {
+      const identity = displayIdentity(rawIdentity);
       if (!glow.isConnected) root.append(glow, pill);
       for (const n of [glow, pill]) n.style.setProperty("--c", color);
       text.replaceChildren();
