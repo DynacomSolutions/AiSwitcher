@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AIS Browser</title>
+</head>
+<body>
+  <h1>AIS Browser</h1>
+  <p id="status">Not signed in.</p>
+  <p><label>Gateway URL <input id="gateway" size="48" placeholder="wss://..."></label></p>
+  <p><label>Profile label <input id="label" size="32" value="Chrome profile"></label></p>
+  <p><button id="signin">Sign in</button> <button id="signout" hidden>Sign out</button></p>
+  <div id="pairing" hidden>
+    <p>Pairing code: <strong id="code"></strong></p>
+    <p>Approve it on a host with gateway admin access:</p>
+    <pre id="cmd-identity"></pre>
+    <pre id="cmd-pool"></pre>
+    <p id="wait">Waiting for approval...</p>
+  </div>
+  <p id="error" role="alert"></p>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

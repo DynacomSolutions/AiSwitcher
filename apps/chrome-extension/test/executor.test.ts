@@ -1,0 +1,207 @@
+import { describe, expect, test } from "bun:test";
+import type { BrowserTool, CallRequest } from "../../../src/browser/protocol.ts";
+import { TOOL_SCHEMAS, validateToolArgs } from "../../../src/browser/tool-args.ts";
+import { capText, Executor, jpegSize } from "../src/background/executor.ts";
+import { State } from "../src/background/state.ts";
+import { colorForIdentity, TabManager } from "../src/background/tabs.ts";
+import type { Ui } from "../src/background/ui.ts";
+import { FakeChrome } from "./fakes.ts";
+
+const session = { id: "s1", identity: "dyn", label: "dyn / s1" };
+let n = 0;
+const call = (tool: BrowserTool, args: Record<string, unknown> = {}, s = session): CallRequest => ({ id: `c${n++}`, session: s, tool, args });
+
+function setup(ui?: Ui) {
+  const api = new FakeChrome();
+  const state = new State(api.storage);
+  const tabs = new TabManager(api);
+  const executor = new Executor({ api, tabs, state, ...(ui ? { ui } : {}), defaultTimeoutMs: 200 });
+  return { api, state, tabs, executor };
+}
+
+const textOf = (r: Awaited<ReturnType<Executor["run"]>>) => (r.ok && r.content[0]?.type === "text" ? r.content[0].text : "");
+
+describe("tab ownership", () => {
+  test("tab not in session is forbidden_tab", async () => {
+    const { api, executor } = setup();
+    api.addTab(5);
+    const r = await executor.run(call("screenshot", { tabId: 5 }));
+    expect(r).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(api.cdpLog).toHaveLength(0);
+  });
+
+  test("tab closed by the user is tab_closed and removed from the map", async () => {
+    const { api, tabs, executor } = setup();
+    await tabs.create(session, "https://example.test/");
+    const id = [...tabs.sessions.get("s1")!.tabIds][0]!;
+    api.tabList.delete(id); // closed without the onRemoved event reaching us
+    const r = await executor.run(call("read_page", { tabId: id }));
+    expect(r).toMatchObject({ ok: false, error: "tab_closed" });
+    expect(tabs.owns("s1", id)).toBe(false);
+  });
+
+  test("tabs_create groups with session label and a stable colour per identity", async () => {
+    const { api, tabs, executor } = setup();
+    const r = await executor.run(call("tabs_create", { url: "example.test" }));
+    expect(r.ok).toBe(true);
+    const { tabId } = JSON.parse(textOf(r));
+    expect(tabs.owns("s1", tabId)).toBe(true);
+    const group = api.groups.get(api.tabList.get(tabId)!.groupId)!;
+    expect(group.title).toBe("dyn / s1");
+    expect(group.color).toBe(colorForIdentity("dyn"));
+    expect(colorForIdentity("dyn")).toBe(colorForIdentity("dyn"));
+    expect(api.tabList.get(tabId)!.url).toBe("https://example.test/");
+  });
+
+  test("tabs_context lists own tabs and other tabs; adopt_tab moves one; another session's tab is forbidden", async () => {
+    const { api, executor } = setup();
+    api.addTab(7, "https://mine.test/");
+    const mine = await executor.run(call("tabs_create"));
+    const ownId = JSON.parse(textOf(mine)).tabId;
+    let ctx = JSON.parse(textOf(await executor.run(call("tabs_context"))));
+    expect(ctx.sessionTabs.map((t: { tabId: number }) => t.tabId)).toEqual([ownId]);
+    expect(ctx.otherTabs.map((t: { tabId: number }) => t.tabId)).toEqual([7]);
+    expect((await executor.run(call("adopt_tab", { tabId: 7 }))).ok).toBe(true);
+    ctx = JSON.parse(textOf(await executor.run(call("tabs_context"))));
+    expect(ctx.sessionTabs.map((t: { tabId: number }) => t.tabId).sort()).toEqual([7, ownId].sort());
+    const other = { id: "s2", identity: "x", label: "x / s2" };
+    expect(await executor.run(call("adopt_tab", { tabId: 7 }, other))).toMatchObject({ ok: false, error: "forbidden_tab" });
+    ctx = JSON.parse(textOf(await executor.run(call("tabs_context", {}, other))));
+    expect(ctx.otherTabs.map((t: { tabId: number }) => t.tabId)).not.toContain(7);
+  });
+});
+
+describe("pause and stop", () => {
+  test("paused replies paused_by_user without touching the browser", async () => {
+    const { api, state, executor } = setup();
+    state.pause();
+    const r = await executor.run(call("tabs_context"));
+    expect(r).toMatchObject({ ok: false, error: "paused_by_user" });
+    expect(api.store.paused).toBe(true);
+    state.resume();
+    expect((await executor.run(call("tabs_context"))).ok).toBe(true);
+  });
+
+  test("pause state loads from storage and is reported via onChange", async () => {
+    const api = new FakeChrome();
+    api.store.paused = true;
+    const state = new State(api.storage);
+    await state.load();
+    expect(state.paused).toBe(true);
+    const seen: boolean[] = [];
+    state.onChange(p => seen.push(p));
+    state.resume();
+    state.resume();
+    expect(seen).toEqual([false]);
+  });
+
+  test("stop aborts in-flight calls with stopped_by_user and detaches the debugger", async () => {
+    const { api, state, tabs, executor } = setup();
+    const tab = await tabs.create(session, "https://example.test/");
+    await executor.run(call("read_page", { tabId: tab.id })); // attaches
+    expect(api.attachedTabs.has(tab.id)).toBe(true);
+    const pending = executor.run(call("wait", { seconds: 100 }));
+    await new Promise(r => setTimeout(r, 5));
+    await state.stop();
+    expect(await pending).toMatchObject({ ok: false, error: "stopped_by_user" });
+    expect(api.attachedTabs.size).toBe(0);
+  });
+
+  test("gateway abort and call timeout yield timeout", async () => {
+    const { api, state, tabs, executor } = setup();
+    const req = call("wait", { seconds: 100 });
+    const pending = executor.run(req);
+    await new Promise(r => setTimeout(r, 5));
+    state.abort(req.id);
+    expect(await pending).toMatchObject({ ok: false, error: "timeout" });
+    const tab = await tabs.create(session);
+    api.cdpResults["Runtime.evaluate"] = () => new Promise(() => {});
+    expect(await executor.run(call("javascript", { tabId: tab.id, code: "x" }))).toMatchObject({ ok: false, error: "timeout" });
+  });
+});
+
+describe("args and tools", () => {
+  test("bad args are rejected before any action", async () => {
+    const { executor } = setup();
+    expect(await executor.run(call("navigate", { tabId: "x" }))).toMatchObject({ ok: false, error: "bad_args" });
+    expect(await executor.run(call("wait", { seconds: 500 }))).toMatchObject({ ok: false, error: "bad_args" });
+    expect(await executor.run(call("list_browsers"))).toMatchObject({ ok: false, error: "bad_args" });
+  });
+
+  test("every tool except list_browsers has a schema", () => {
+    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(20);
+    expect(validateToolArgs("click", { tabId: 1, coordinate: [1, 2] })).toBeUndefined();
+    expect(validateToolArgs("click", { tabId: 1, coordinate: [1] })).toBeDefined();
+    expect(validateToolArgs("click", { tabId: 1, junk: 1 })).toBeDefined();
+  });
+
+  test("read_page yields refs; click on a ref calls the ui hooks and dispatches trusted mouse events", async () => {
+    const events: string[] = [];
+    const ui: Ui = {
+      beforeAction: (tabId, p) => { events.push(`before:${tabId}:${p.kind}:${p.x},${p.y}`); },
+      markControlled: (tabId, s) => { events.push(`mark:${tabId}:${s.id}`); },
+    };
+    const { api, tabs, executor } = setup(ui);
+    const tab = await tabs.create(session, "https://example.test/");
+    api.cdpResults["Accessibility.getFullAXTree"] = { nodes: [
+      { nodeId: "1", role: { value: "RootWebArea" }, childIds: ["2", "3"] },
+      { nodeId: "2", role: { value: "button" }, name: { value: "Save" }, backendDOMNodeId: 40 },
+      { nodeId: "3", role: { value: "paragraph" }, name: { value: "x" }, backendDOMNodeId: 41 },
+    ] };
+    api.cdpResults["DOM.getContentQuads"] = { quads: [[10, 10, 30, 10, 30, 30, 10, 30]] };
+    const page = textOf(await executor.run(call("read_page", { tabId: tab.id })));
+    expect(page).toBe('button "Save" [ref_1]');
+    const r = await executor.run(call("click", { tabId: tab.id, ref: "ref_1" }));
+    expect(r.ok).toBe(true);
+    expect(events).toContain(`before:${tab.id}:click:20,20`);
+    expect(events).toContain(`mark:${tab.id}:s1`);
+    const types = api.cdpLog.filter(l => l.method === "Input.dispatchMouseEvent").map(l => l.params!.type);
+    expect(types).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+    expect(await executor.run(call("click", { tabId: tab.id, ref: "ref_99" }))).toMatchObject({ ok: false, error: "bad_args" });
+  });
+
+  test("screenshot is scaled to the cap and its scale maps coordinates back", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session, "https://example.test/");
+    api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 3136, clientHeight: 1000, pageX: 0, pageY: 0 } };
+    // minimal JPEG header: SOI, SOF0 with 1568x500
+    const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 0x01, 0xf4, 0x06, 0x20, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    const b64 = btoa(String.fromCharCode(...bytes));
+    expect(jpegSize(b64)).toEqual({ width: 1568, height: 500 });
+    api.cdpResults["Page.captureScreenshot"] = { data: b64 };
+    const shot = await executor.run(call("screenshot", { tabId: tab.id }));
+    expect(shot).toMatchObject({ ok: true, content: [{ type: "image", mimeType: "image/jpeg" }] });
+    const cap = api.cdpLog.find(l => l.method === "Page.captureScreenshot")!.params as { quality: number; clip: { scale: number } };
+    expect(cap.quality).toBe(80);
+    expect(cap.clip.scale).toBeCloseTo(0.5, 3);
+    await executor.run(call("hover", { tabId: tab.id, coordinate: [100, 50] }));
+    const move = api.cdpLog.filter(l => l.method === "Input.dispatchMouseEvent").at(-1)!.params!;
+    expect(move.x).toBeCloseTo(200, 3);
+    expect(move.y).toBeCloseTo(100, 3);
+  });
+
+  test("text results are truncated at 100000 chars", () => {
+    expect(capText("a".repeat(100_001))).toBe(`${"a".repeat(100_000)}\n[truncated]`);
+    expect(capText("short")).toBe("short");
+  });
+
+  test("javascript returns JSON and surfaces exceptions", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    api.cdpResults["Runtime.evaluate"] = { result: { value: { a: 1 } } };
+    expect(textOf(await executor.run(call("javascript", { tabId: tab.id, code: "x" })))).toBe('{"a":1}');
+    api.cdpResults["Runtime.evaluate"] = { exceptionDetails: { exception: { description: "boom" } } };
+    expect(await executor.run(call("javascript", { tabId: tab.id, code: "x" }))).toMatchObject({ ok: false, error: "internal" });
+  });
+
+  test("console and network buffers fill from debugger events", async () => {
+    const { api, tabs, executor } = setup();
+    const tab = await tabs.create(session);
+    await executor.run(call("get_console", { tabId: tab.id })); // attach
+    api.emit(tab.id, "Runtime.consoleAPICalled", { type: "error", args: [{ value: "bad" }] });
+    api.emit(tab.id, "Network.requestWillBeSent", { requestId: "1", request: { url: "https://a.test/x", method: "GET" } });
+    api.emit(tab.id, "Network.responseReceived", { requestId: "1", response: { status: 200 } });
+    expect(textOf(await executor.run(call("get_console", { tabId: tab.id, onlyErrors: true })))).toBe("[error] bad");
+    expect(textOf(await executor.run(call("get_network", { tabId: tab.id })))).toBe("GET https://a.test/x 200");
+  });
+});

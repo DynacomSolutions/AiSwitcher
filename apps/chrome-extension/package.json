@@ -1,0 +1,14 @@
+{
+  "name": "@ais/chrome-extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "bun run build.ts",
+    "test": "bun test test",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.3.7"
+  }
+}
