@@ -214,6 +214,10 @@ export class PgGatewayStore implements GatewayStore {
     await this.sql`INSERT INTO browser_tokens (binding, prefix, hash) VALUES (${binding}, ${prefix}, ${hash})`;
   }
 
+  async deleteBrowserTokens(binding: string): Promise<void> {
+    await this.sql`DELETE FROM browser_tokens WHERE binding = ${binding}`;
+  }
+
   async browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
     const rows = await this.sql`SELECT * FROM browser_tokens WHERE prefix = ${prefix} ORDER BY id LIMIT 1`;
     const r = rows[0];

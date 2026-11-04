@@ -118,3 +118,11 @@ test("token read from --config-dir without env", async () => {
   expect(c.session.label.startsWith("work / ")).toBe(true);
   rmSync(d, { recursive: true });
 });
+
+test("session label keeps 6 chars for UUIDs and up to 12 for named sessions", async () => {
+  const { contextFromEnv } = await import("../../src/browser/mcp-shim.ts");
+  const uuid = "3f2a9c1e-1111-4222-8333-444455556666";
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: uuid }, { identity: "work" }).session.label).toBe("work / 3f2a9c");
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "live-proof" }, { identity: "work" }).session.label).toBe("work / live-proof");
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "a-very-long-session-id" }, { identity: "work" }).session.label).toBe("work / a-very-long-");
+});
