@@ -26,6 +26,7 @@ import { runStatuslineCommand } from "./statusline.ts";
 import { runLiveCommand } from "./live/dispatch.ts";
 import { runHostCommand } from "./host/dispatch.ts";
 import { runGatewayCommand } from "./gateway/dispatch.ts";
+import { runBrowserCommand } from "./browser/dispatch.ts";
 
 /** Commands that kick off the detached background sync. `identities retire`
  * and `unretire` are excluded: a sync merging the remote registry while the
@@ -141,6 +142,9 @@ export async function runCli(argv: string[]): Promise<void> {
         break;
       case "gateway":
         await runGatewayCommand(rest, flags);
+        break;
+      case "browser":
+        await runBrowserCommand(rest, flags);
         break;
       case "claude-swap":
         await runClaudeSwapCommand(rest, flags);

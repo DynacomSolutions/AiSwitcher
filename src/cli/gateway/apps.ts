@@ -61,7 +61,7 @@ interface AppBody {
 const FIXED_STYLE: Record<string, string> = { claude: "anthropic", ali: "anthropic", codex: "openai", grok: "openai", opencode: "openai" };
 const CHOOSE_STYLE = new Set(["kimi", "zai"]);
 
-class Admin {
+export class Admin {
   constructor(
     private readonly base: string,
     private readonly token: string,
@@ -87,7 +87,7 @@ class Admin {
   }
 }
 
-async function connect(deps: GatewayCliDeps): Promise<{ admin: Admin; secretsPath: string | undefined }> {
+export async function connect(deps: GatewayCliDeps): Promise<{ admin: Admin; secretsPath: string | undefined }> {
   const url = (await readSecretsKey("AIS_GATEWAY_ADMIN_URL", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_URL;
   const token = (await readSecretsKey("AIS_GATEWAY_ADMIN_TOKEN", deps.secretsPath)) ?? process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!url || !token) throw new CliUsageError("AIS_GATEWAY_ADMIN_URL and AIS_GATEWAY_ADMIN_TOKEN must be set in ~/.secrets");
@@ -281,7 +281,7 @@ function targetText(t: unknown): string {
   return target.identities ? `pool:${target.identities.join(",")}` : "pool";
 }
 
-function table(head: string[], rows: string[][]): string {
+export function table(head: string[], rows: string[][]): string {
   const all = [head, ...rows];
   const widths = head.map((_, i) => Math.max(...all.map((r) => (r[i] ?? "").length)));
   return all.map((r) => r.map((c, i) => c.padEnd(widths[i]!)).join("  ").trimEnd()).join("\n");

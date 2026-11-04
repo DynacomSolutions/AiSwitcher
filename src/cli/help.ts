@@ -89,6 +89,20 @@ export const HELP: Record<string, HelpNode> = {
       usage: sub("ais gateway usage [--app=] [--provider=] [--days=7] [--json]", "Tokens used per app"),
     },
   },
+  browser: {
+    usage: "ais browser approve|list|revoke|agent-token ...",
+    desc: "AIS Browser: bind Chrome extensions to an identity or swap pool; agent tokens",
+    examples: ["ais browser approve ABCD2345 --identity=work --name=work-chrome"],
+    subs: {
+      approve: sub("ais browser approve <code> (--identity=<id> | --pool=<pool>) [--name=<n>]", "Approve a pairing code shown by the extension and bind that profile to the target"),
+      list: sub("ais browser list [--json]", "List browser bindings"),
+      revoke: sub("ais browser revoke <name>", "Revoke a browser binding and drop its connection"),
+      "agent-token": sub(
+        "ais browser agent-token <identity> [--revoke]",
+        "Mint an agent token (replacing any earlier one); written to <configDir>/ais-browser-token (0600) for claude and codex and to ~/.secrets as AIS_BROWSER_AGENT_<IDENTITY>_TOKEN, never printed. --revoke removes it",
+      ),
+    },
+  },
   swap: {
     usage: "ais swap <claude|codex|kimi|pi> [subcommand]",
     desc: "Swap pools: switch a login between member accounts",
