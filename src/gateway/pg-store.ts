@@ -223,13 +223,12 @@ export class PgGatewayStore implements GatewayStore {
 
   async putPairing(p: BrowserPairing): Promise<void> {
     await this.sql`
-      INSERT INTO browser_pairings (code, profile_label, created_at, expires_at, poll_secret_hash, approved_binding, token_delivered)
+      INSERT INTO browser_pairings (code, profile_label, created_at, expires_at, poll_secret_hash, approved_binding)
       VALUES (${p.code}, ${p.profileLabel}, ${p.createdAt}::timestamptz, ${p.expiresAt}::timestamptz,
-              ${p.pollSecretHash}, ${p.approvedBinding ?? null}, ${p.tokenDelivered})
+              ${p.pollSecretHash}, ${p.approvedBinding ?? null})
       ON CONFLICT (code) DO UPDATE SET
         profile_label = EXCLUDED.profile_label, created_at = EXCLUDED.created_at,
-        expires_at = EXCLUDED.expires_at, poll_secret_hash = EXCLUDED.poll_secret_hash, approved_binding = EXCLUDED.approved_binding,
-        token_delivered = EXCLUDED.token_delivered`;
+        expires_at = EXCLUDED.expires_at, poll_secret_hash = EXCLUDED.poll_secret_hash, approved_binding = EXCLUDED.approved_binding`;
   }
 
   async getPairing(code: string): Promise<BrowserPairing | undefined> {
@@ -242,7 +241,21 @@ export class PgGatewayStore implements GatewayStore {
       createdAt: iso(r.created_at),
       expiresAt: iso(r.expires_at),
       pollSecretHash: r.poll_secret_hash,
-      tokenDelivered: r.token_delivered,
+    };
+    if (r.approved_binding !== null) p.approvedBinding = r.approved_binding;
+    return p;
+  }
+
+  async claimPairing(code: string): Promise<BrowserPairing | undefined> {
+    const rows = await this.sql`DELETE FROM browser_pairings WHERE code = ${code} RETURNING *`;
+    const r = rows[0];
+    if (!r) return undefined;
+    const p: BrowserPairing = {
+      code: r.code,
+      profileLabel: r.profile_label,
+      createdAt: iso(r.created_at),
+      expiresAt: iso(r.expires_at),
+      pollSecretHash: r.poll_secret_hash,
     };
     if (r.approved_binding !== null) p.approvedBinding = r.approved_binding;
     return p;

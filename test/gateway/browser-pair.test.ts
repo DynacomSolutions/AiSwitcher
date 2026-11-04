@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { createAdminApp } from "../../src/gateway/admin.ts";
 import { createGatewayApp } from "../../src/gateway/app.ts";
 import { authAgentToken, authBrowserToken } from "../../src/gateway/browser/auth.ts";
+import { BrowserHub } from "../../src/gateway/browser/hub.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 
 const ADMIN = "adm-test-value-0001-0123456789abcdef";
@@ -9,6 +10,7 @@ let nowMs: number;
 let store: MemoryGatewayStore;
 let proxy: ReturnType<typeof createGatewayApp>;
 let admin: ReturnType<typeof createAdminApp>;
+let hub: BrowserHub;
 
 const now = () => new Date(nowMs);
 const pools = async (pool: string) => (pool === "main" ? ["a", "b"] : undefined);
@@ -28,9 +30,10 @@ async function startPair(label = "Work") {
 beforeEach(() => {
   nowMs = Date.parse("2026-11-04T10:00:00.000Z");
   store = new MemoryGatewayStore();
-  const common = { store, now, browserPoolMembers: pools, browserIdentityExists: async (n: string) => n === "id1" };
+  const common = { store, now, browserPoolMembers: pools, browserIdentityExists: async (n: string) => (n === "id1" || n === "alias1" ? "id1" : undefined) };
   proxy = createGatewayApp({ ...common } as never);
-  admin = createAdminApp({ ...common, adminToken: ADMIN });
+  hub = new BrowserHub({ authToken: (t) => authBrowserToken(store, t) });
+  admin = createAdminApp({ ...common, adminToken: ADMIN, browserHub: hub });
 });
 
 describe("browser pairing", () => {
@@ -131,5 +134,58 @@ describe("browser pairing", () => {
     expect((await adm("/browser/agents/id1/tokens", { method: "DELETE" })).status).toBe(200);
     expect(await authAgentToken(store, second)).toBeUndefined();
     expect((await adm("/browser/agents/ghost/tokens", { method: "POST" })).status).toBe(404);
+  });
+
+  test("rate limit keys on the rightmost x-forwarded-for entry", async () => {
+    const send = (i: number) =>
+      proxy.request("http://gw.test/browser/pair", { method: "POST", headers: { "x-forwarded-for": `spoof-${i}, real-peer` }, body: JSON.stringify({ profileLabel: "x" }) });
+    for (let i = 0; i < 10; i++) expect((await send(i)).status).toBe(200);
+    expect((await send(10)).status).toBe(429);
+  });
+
+  test("poll is rate limited too (60 per minute)", async () => {
+    const send = () => post("/browser/pair/poll", { code: "NOPE", pollSecret: "x" }, "poller");
+    for (let i = 0; i < 60; i++) expect((await send()).status).toBe(404);
+    expect((await send()).status).toBe(429);
+  });
+
+  test("public bodies over 4 KiB are 413", async () => {
+    expect((await post("/browser/pair", { profileLabel: "x", pad: "y".repeat(5000) })).status).toBe(413);
+    expect((await post("/browser/pair/poll", { code: "x", pollSecret: "y".repeat(5000) })).status).toBe(413);
+  });
+
+  test("concurrent polls after approval: exactly one 200", async () => {
+    const p = await startPair();
+    await approve(p.code, { target: { kind: "identity", identity: "id1" } });
+    const results = await Promise.all(Array.from({ length: 5 }, () => post("/browser/pair/poll", { code: p.code, pollSecret: p.pollSecret })));
+    expect(results.map((r) => r.status).sort()).toEqual([200, 404, 404, 404, 404]);
+  });
+
+  test("alias and canonical identity share one agent token slot; binding stores canonical", async () => {
+    const mint = async (id: string) => ((await (await adm(`/browser/agents/${id}/tokens`, { method: "POST" })).json()) as { token: string }).token;
+    const viaAlias = await mint("alias1");
+    expect(await authAgentToken(store, viaAlias)).toEqual({ identity: "id1" });
+    const viaCanonical = await mint("id1");
+    expect(await authAgentToken(store, viaAlias)).toBeUndefined();
+    expect(await authAgentToken(store, viaCanonical)).toEqual({ identity: "id1" });
+    expect((await adm("/browser/agents/alias1/tokens", { method: "DELETE" })).status).toBe(200);
+    expect(await authAgentToken(store, viaCanonical)).toBeUndefined();
+
+    const p = await startPair();
+    const res = await approve(p.code, { target: { kind: "identity", identity: "alias1" } });
+    expect(((await res.json()) as { binding: { target: unknown } }).binding.target).toEqual({ kind: "identity", identity: "id1" });
+  });
+
+  test("revoking a binding closes its live socket with 4401", async () => {
+    const p = await startPair();
+    await approve(p.code, { target: { kind: "identity", identity: "id1" }, name: "laptop" });
+    const { token } = (await (await post("/browser/pair/poll", { code: p.code, pollSecret: p.pollSecret })).json()) as { token: string };
+    const ws = { sent: [] as string[], closed: undefined as number | undefined, send(d: string) { this.sent.push(d); }, close(c?: number) { this.closed = c; } };
+    hub.open(ws);
+    await hub.message(ws, JSON.stringify({ t: "hello", token, version: "1" }));
+    expect(hub.connected().map((b) => b.name)).toEqual(["laptop"]);
+    await adm("/browser/bindings/laptop", { method: "DELETE" });
+    expect(ws.closed).toBe(4401);
+    expect(hub.connected()).toEqual([]);
   });
 });

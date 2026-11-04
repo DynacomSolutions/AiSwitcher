@@ -141,12 +141,12 @@ async function defaultBrowserPoolMembers(pool: string): Promise<string[] | undef
   return undefined;
 }
 
-async function defaultBrowserIdentityExists(name: string): Promise<boolean> {
+async function defaultBrowserIdentityExists(name: string): Promise<string | undefined> {
   for (const cfg of Object.values(TOOL_CONFIGS)) {
     const found = findIdentityByNameOrAlias((await loadIdentitiesFile(cfg.identitiesJsonPath)).identities, name);
-    if (found && !isRetired(found) && !isSwapPool(found)) return true;
+    if (found && !isRetired(found) && !isSwapPool(found)) return found.name;
   }
-  return false;
+  return undefined;
 }
 
 async function defaultIdentityState(provider: GatewayProvider, name: string): Promise<IdentityState> {
@@ -228,7 +228,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     now,
     metrics: recoverOnSuccess(metrics, alerter),
   });
-  const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
+  const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: hub, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
 
   let warmed = false;
   let draining = false;

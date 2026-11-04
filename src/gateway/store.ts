@@ -24,6 +24,8 @@ export interface GatewayStore {
   /** Returns expired pairings too; the caller enforces expiry. */
   getPairing(code: string): Promise<BrowserPairing | undefined>;
   deletePairing(code: string): Promise<void>;
+  /** Atomically deletes the pairing and returns it; undefined if it was already gone (so only one caller wins). */
+  claimPairing(code: string): Promise<BrowserPairing | undefined>;
   addAgentToken(r: AgentTokenRecord): Promise<void>;
   /** Returns undefined once the identity's agent tokens are revoked. */
   agentTokenByPrefix(prefix: string): Promise<AgentTokenRecord | undefined>;
@@ -123,6 +125,12 @@ export class MemoryGatewayStore implements GatewayStore {
 
   async getPairing(code: string): Promise<BrowserPairing | undefined> {
     const p = this.pairings.get(code);
+    return p ? { ...p } : undefined;
+  }
+
+  async claimPairing(code: string): Promise<BrowserPairing | undefined> {
+    const p = this.pairings.get(code);
+    this.pairings.delete(code);
     return p ? { ...p } : undefined;
   }
 

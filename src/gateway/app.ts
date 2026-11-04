@@ -33,7 +33,7 @@ export interface GatewayDeps {
   log?: (line: string) => void;
   /** Member accounts of a swap pool, or undefined for an unknown pool. */
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
-  browserIdentityExists?(identity: string): Promise<boolean>;
+  browserIdentityExists?(identity: string): Promise<string | undefined>;
   /** Browser relay; the agent call routes are only mounted when present. */
   browserHub?: BrowserHub;
 }

@@ -129,6 +129,10 @@ export class CachedGatewayStore implements GatewayStore {
     return this.inner.getPairing(code);
   }
 
+  claimPairing(code: string): Promise<BrowserPairing | undefined> {
+    return this.inner.claimPairing(code);
+  }
+
   deletePairing(code: string): Promise<void> {
     return this.inner.deletePairing(code);
   }

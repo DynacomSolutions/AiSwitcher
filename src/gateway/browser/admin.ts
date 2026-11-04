@@ -21,8 +21,9 @@ async function parseTarget(deps: BrowserDeps, raw: unknown): Promise<BrowserTarg
   if (!isObj(raw)) return "target is required";
   if (raw.kind === "identity") {
     if (typeof raw.identity !== "string" || !raw.identity || raw.identity.length > MAX_IDENTITY) return "target.identity is required";
-    if (deps.browserIdentityExists && !(await deps.browserIdentityExists(raw.identity))) return `identity "${raw.identity}" is not a known identity`;
-    return { kind: "identity", identity: raw.identity };
+    const canonical = deps.browserIdentityExists ? await deps.browserIdentityExists(raw.identity) : raw.identity;
+    if (canonical === undefined) return `identity "${raw.identity}" is not a known identity`;
+    return { kind: "identity", identity: canonical };
   }
   if (raw.kind === "pool") {
     if (typeof raw.pool !== "string" || !raw.pool || raw.pool.length > MAX_IDENTITY) return "target.pool is required";
@@ -75,22 +76,27 @@ export function registerBrowserAdmin(hono: Hono, deps: BrowserDeps): void {
     const name = c.req.param("name");
     if (!(await store.getBrowserBinding(name))) return err(404, "no such binding");
     await store.revokeBrowserBinding(name);
+    deps.hub?.revoke(name);
     return c.json({ binding: name, state: "revoked" });
   });
 
   hono.post("/browser/agents/:identity/tokens", async (c) => {
     const identity = c.req.param("identity");
     if (!identity || identity.length > MAX_IDENTITY) return err(400, "identity is required");
-    if (deps.browserIdentityExists && !(await deps.browserIdentityExists(identity))) return err(404, "no such identity");
-    await store.revokeAgentTokens(identity);
+    const canonical = deps.browserIdentityExists ? await deps.browserIdentityExists(identity) : identity;
+    if (canonical === undefined) return err(404, "no such identity");
+    await store.revokeAgentTokens(canonical);
     const t = generateToken();
-    await store.addAgentToken({ identity, prefix: t.prefix, hash: t.hash, createdAt: deps.now().toISOString() });
+    await store.addAgentToken({ identity: canonical, prefix: t.prefix, hash: t.hash, createdAt: deps.now().toISOString() });
     // The only time the token is ever returned.
     return c.json({ token: t.token });
   });
 
   hono.delete("/browser/agents/:identity/tokens", async (c) => {
-    await store.revokeAgentTokens(c.req.param("identity"));
-    return c.json({ identity: c.req.param("identity"), revoked: true });
+    const given = c.req.param("identity");
+    const canonical = (await deps.browserIdentityExists?.(given)) ?? given;
+    await store.revokeAgentTokens(canonical);
+    if (canonical !== given) await store.revokeAgentTokens(given);
+    return c.json({ identity: canonical, revoked: true });
   });
 }

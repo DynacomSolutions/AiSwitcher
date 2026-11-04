@@ -29,7 +29,8 @@ export interface AdminDeps {
   /** Looks an identity up in the AIS registry. When absent, identities are not checked. */
   identityState?(provider: GatewayProvider, identity: string): Promise<IdentityState>;
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
-  browserIdentityExists?(identity: string): Promise<boolean>;
+  browserIdentityExists?(identity: string): Promise<string | undefined>;
+  browserHub?: { revoke(binding: string): void };
 }
 
 /** Constant-time comparison: both sides are hashed first so lengths never leak. */
@@ -112,7 +113,7 @@ export function createAdminApp(deps: AdminDeps): Hono {
     return next();
   });
   hono.onError(() => err(503, "store unavailable"));
-  registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
+  registerBrowserAdmin(hono, { store, now: deps.now, ...(deps.browserHub ? { hub: deps.browserHub } : {}), ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) });
 
   hono.get("/apps", async (c) => {
     const apps = await store.listApps();

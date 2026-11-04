@@ -16,7 +16,6 @@ const pairing: BrowserPairing = {
   createdAt: "2026-11-04T00:00:00.000Z",
   expiresAt: "2020-01-01T00:00:00.000Z",
   pollSecretHash: "ab".repeat(32),
-  tokenDelivered: false,
 };
 
 export function browserStoreContract(make: () => Promise<GatewayStore>): void {
@@ -53,6 +52,14 @@ export function browserStoreContract(make: () => Promise<GatewayStore>): void {
     expect(await s.browserTokensFor("other")).toEqual([]);
   });
 
+  test("claimPairing returns the pairing once", async () => {
+    const s = await make();
+    await s.putPairing(pairing);
+    expect(await s.claimPairing(pairing.code)).toEqual(pairing);
+    expect(await s.claimPairing(pairing.code)).toBeUndefined();
+    expect(await s.getPairing(pairing.code)).toBeUndefined();
+  });
+
   test("browser token is found by prefix", async () => {
     const s = await make();
     await s.putBrowserBinding(binding);
@@ -65,7 +72,7 @@ export function browserStoreContract(make: () => Promise<GatewayStore>): void {
     const s = await make();
     await s.putPairing(pairing);
     expect(await s.getPairing("ABCD-1234")).toEqual(pairing);
-    const approved: BrowserPairing = { ...pairing, approvedBinding: "work-laptop", tokenDelivered: true };
+    const approved: BrowserPairing = { ...pairing, approvedBinding: "work-laptop" };
     await s.putPairing(approved);
     expect(await s.getPairing("ABCD-1234")).toEqual(approved);
     await s.deletePairing("ABCD-1234");

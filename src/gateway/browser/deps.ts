@@ -7,8 +7,10 @@ export interface BrowserDeps {
   metrics?: GatewayMetrics;
   /** Member accounts of a swap pool; undefined when no such pool exists. */
   browserPoolMembers?(pool: string): Promise<string[] | undefined>;
-  /** Whether an identity exists. When absent, identity targets are not checked. */
-  browserIdentityExists?(identity: string): Promise<boolean>;
+  /** The canonical name of an identity (alias resolved), or undefined when it does not exist. When absent, names are used as given. */
+  browserIdentityExists?(identity: string): Promise<string | undefined>;
+  /** Closes the live extension socket of a revoked binding. */
+  hub?: { revoke(binding: string): void };
 }
 
 /** A DNS-1123 label, as for app names. */

@@ -1,13 +1,6 @@
-import { timingSafeEqual } from "node:crypto";
 import type { BrowserBinding } from "../../browser/types.ts";
 import type { GatewayStore } from "../store.ts";
-import { hashSecret, parseToken } from "../tokens.ts";
-
-function sameHash(storedHex: string, secret: string): boolean {
-  const stored = Buffer.from(storedHex, "hex");
-  const given = Buffer.from(hashSecret(secret), "hex");
-  return stored.length === given.length && timingSafeEqual(stored, given);
-}
+import { parseToken, sameHash } from "../tokens.ts";
 
 /** The active binding a browser token belongs to, or undefined (unknown, wrong secret, revoked binding). */
 export async function authBrowserToken(store: GatewayStore, token: string): Promise<BrowserBinding | undefined> {

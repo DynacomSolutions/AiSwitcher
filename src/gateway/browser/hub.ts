@@ -179,6 +179,12 @@ export class BrowserHub {
     });
   }
 
+  /** Closes the live socket of a revoked binding (code 4401). */
+  revoke(binding: string): void {
+    const conn = this.byBinding.get(binding);
+    if (conn) this.drop(conn, 4401, "binding revoked");
+  }
+
   closeAll(code: number): void {
     for (const conn of [...this.conns.values()]) this.drop(conn, code, "service restart");
   }

@@ -18,7 +18,6 @@ export interface BrowserPairing {
   /** SHA-256 hex of the secret the extension polls with. */
   pollSecretHash: string;
   approvedBinding?: string;
-  tokenDelivered: boolean;
 }
 
 export interface AgentTokenRecord {

@@ -24,8 +24,7 @@ CREATE TABLE IF NOT EXISTS browser_pairings (
   created_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
   poll_secret_hash text NOT NULL,
-  approved_binding text,
-  token_delivered boolean NOT NULL
+  approved_binding text
 );
 
 CREATE TABLE IF NOT EXISTS browser_agent_tokens (
