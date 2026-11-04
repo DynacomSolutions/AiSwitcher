@@ -37,6 +37,17 @@ export const appTokenKey = (app: string): string => `AIS_GATEWAY_APP_${app.toUpp
  * replaces an existing assignment of the key (never duplicates it) and enforces mode 0600.
  */
 export async function appendSecretsFile(key: string, value: string, requested = defaultSecretsPath(), epoch = Math.floor(Date.now() / 1000)): Promise<void> {
+  await rewriteSecrets(requested, epoch, (kept) => {
+    kept.push(`${key}=${value}`);
+  }, key, true);
+}
+
+/** Removes KEY from a secrets file (backup first, mode 0600); a missing file or key is a no-op. */
+export async function removeSecretsKey(key: string, requested = defaultSecretsPath(), epoch = Math.floor(Date.now() / 1000)): Promise<void> {
+  await rewriteSecrets(requested, epoch, () => {}, key, false);
+}
+
+async function rewriteSecrets(requested: string, epoch: number, edit: (kept: string[]) => void, key: string, createIfMissing: boolean): Promise<void> {
   // A symlinked secrets file is updated in place at its target.
   let path = requested;
   try {
@@ -54,6 +65,7 @@ export async function appendSecretsFile(key: string, value: string, requested = 
     // Only a missing file is "absent"; any other error must not lead to replacing the file.
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
+  if (!createIfMissing && (existing === undefined || !existing.split("\n").some((line) => parseLine(line)?.key === key))) return;
   if (existing !== undefined) {
     for (let n = 0; ; n++) {
       const backup = n === 0 ? `${path}.bak.${epoch}` : `${path}.bak.${epoch}.${n}`;
@@ -68,7 +80,7 @@ export async function appendSecretsFile(key: string, value: string, requested = 
   }
   const kept = (existing ?? "").split("\n").filter((line) => parseLine(line)?.key !== key);
   while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
-  kept.push(`${key}=${value}`);
+  edit(kept);
   const tmp = `${path}.tmp.${process.pid}`;
   try {
     const fh = await open(tmp, "w", 0o600);

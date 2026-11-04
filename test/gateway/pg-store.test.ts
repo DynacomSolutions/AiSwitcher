@@ -3,6 +3,7 @@ import { SQL } from "bun";
 import { isDataError } from "../../src/gateway/ledger-buffer.ts";
 import { migrate, PgGatewayStore } from "../../src/gateway/pg-store.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
+import { browserStoreContract } from "./browser-store-contract.ts";
 import { storeContract } from "./store-contract.ts";
 
 const url = process.env.AIS_GATEWAY_TEST_DATABASE_URL;
@@ -28,6 +29,17 @@ if (!url && process.env.CI && !optOut) {
     for (const s of stores) await s.close();
   });
 
+  // Close every earlier store before making the next, so pools never pile up past max_connections.
+  async function fresh(): Promise<PgGatewayStore> {
+    const old = stores.splice(0);
+    for (const s of old) await s.close();
+    await reset();
+    await migrate(url as string);
+    const s = new PgGatewayStore(url as string);
+    stores.push(s);
+    return s;
+  }
+
   const dbName = new URL(url).pathname.replace(/^\//, "");
   if (!dbName.includes("test")) {
     throw new Error(`refusing to reset database "${dbName}": its name must contain "test"`);
@@ -37,6 +49,9 @@ if (!url && process.env.CI && !optOut) {
     const sql = new SQL(url as string);
     try {
       // One statement per table: TimescaleDB refuses to drop a hypertable together with other objects.
+      for (const t of ["browser_tokens", "browser_pairings", "browser_agent_tokens", "browser_bindings"]) {
+        await sql.unsafe(`DROP TABLE IF EXISTS ${t} CASCADE`);
+      }
       await sql`DROP TABLE IF EXISTS gateway_usage CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_tokens CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_apps CASCADE`;
@@ -55,7 +70,7 @@ if (!url && process.env.CI && !optOut) {
       const sql = new SQL(url);
       try {
         const rows = await sql`SELECT version FROM schema_migrations`;
-        expect(rows.length).toBe(1);
+        expect(rows.length).toBe(2);
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
         const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;
@@ -118,11 +133,13 @@ if (!url && process.env.CI && !optOut) {
 
   describe("PgGatewayStore contract", () => {
     storeContract(async () => {
-      await reset();
-      await migrate(url);
-      const s = new PgGatewayStore(url);
-      stores.push(s);
-      return s;
+      return fresh();
+    });
+  });
+
+  describe("PgGatewayStore browser contract", () => {
+    browserStoreContract(async () => {
+      return fresh();
     });
   });
 }

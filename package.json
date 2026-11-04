@@ -4,6 +4,7 @@
   "version": "0.5.23",
   "scripts": {
     "test": "bun test",
+    "test:e2e": "bun test ./apps/chrome-extension/test/e2e/extension.e2e.ts",
     "privacy:check": "bun run scripts/privacy-check.ts",
     "privacy:install": "bun run scripts/install-privacy-hooks.ts",
     "identifiers:check": "bun run scripts/identifier-scan.ts",
@@ -11,7 +12,7 @@
     "host:check-contract": "bun run scripts/host/check-contract.ts",
     "host:test-ssh": "bun run scripts/host/test-ssh.ts",
     "lint": "bun run scripts/identifier-scan.ts --tree && bun run scripts/secret-scan.ts --tree",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p apps/chrome-extension/tsconfig.json",
     "build": "bun run scripts/build.ts",
     "backup": "bun run scripts/backup.ts",
     "migrate": "bun run scripts/migrate.ts",
@@ -22,6 +23,7 @@
     "@earendil-works/pi-ai": "^0.85.1",
     "@earendil-works/pi-tui": "^0.85.1",
     "@types/bun": "^1.3.14",
+    "@types/chrome": "0.3.7",
     "openai": "7.47.0",
     "typescript": "^7.0.2"
   },

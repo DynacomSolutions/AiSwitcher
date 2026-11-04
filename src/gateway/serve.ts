@@ -1,12 +1,14 @@
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
 import { isRetired } from "../identities/retired.ts";
-import { isSwapPool } from "../identities/pool/swap-pool.ts";
+import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { createAdminApp, type IdentityState } from "./admin.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
 import { createGatewayApp, styleForPath, type GatewayDeps } from "./app.ts";
+import { authBrowserToken } from "./browser/auth.ts";
+import { BrowserHub } from "./browser/hub.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
 import { CredentialCache, type RefreshFn } from "./credentials.ts";
 import { providerError } from "./errors.ts";
@@ -45,6 +47,8 @@ export interface GatewayHooks {
   canonical?: GatewayDeps["canonical"];
   identityState?(provider: GatewayProvider, identity: string): Promise<IdentityState>;
   poolMembers?: GatewayDeps["poolMembers"];
+  browserPoolMembers?: NonNullable<GatewayDeps["browserPoolMembers"]>;
+  browserIdentityExists?: NonNullable<GatewayDeps["browserIdentityExists"]>;
   notify?: Notifier;
   warmBackoff?: { initialMs: number; maxMs: number };
   ledger?: { max: number; flushMs: number };
@@ -128,6 +132,23 @@ async function defaultPoolMembers(provider: GatewayProvider): Promise<string[]> 
   return file.identities.filter((i) => !isRetired(i)).map((i) => i.name);
 }
 
+/** Members of the named swap pool in any tool registry, or undefined when no tool has such a pool. */
+async function defaultBrowserPoolMembers(pool: string): Promise<string[] | undefined> {
+  for (const cfg of Object.values(TOOL_CONFIGS)) {
+    const found = findPool(await loadIdentitiesFile(cfg.identitiesJsonPath), pool);
+    if (found) return allowedAccounts(found);
+  }
+  return undefined;
+}
+
+async function defaultBrowserIdentityExists(name: string): Promise<string | undefined> {
+  for (const cfg of Object.values(TOOL_CONFIGS)) {
+    const found = findIdentityByNameOrAlias((await loadIdentitiesFile(cfg.identitiesJsonPath)).identities, name);
+    if (found && !isRetired(found) && !isSwapPool(found)) return found.name;
+  }
+  return undefined;
+}
+
 async function defaultIdentityState(provider: GatewayProvider, name: string): Promise<IdentityState> {
   const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
   const found = findIdentityByNameOrAlias(file.identities, name);
@@ -187,6 +208,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const canonical = hooks.canonical ?? canonicalResolver();
   const usage = createUsageSource({ fetchUsage: hooks.fetchUsage ?? fetchPoolUsage });
   const poolMembers = hooks.poolMembers ?? defaultPoolMembers;
+  const browserPoolMembers = hooks.browserPoolMembers ?? defaultBrowserPoolMembers;
+  const browserIdentityExists = hooks.browserIdentityExists ?? defaultBrowserIdentityExists;
+
+  const hub = new BrowserHub({ authToken: async (t) => {
+      const b = await authBrowserToken(store, t);
+      if (b) await store.touchBrowserBinding(b.name, new Date().toISOString()).catch(() => {});
+      return b;
+    },
+    metrics });
+  metrics.browserGauges = { connected: () => hub.connected().length, sessions: () => hub.activeSessions() };
 
   const proxy = createGatewayApp({
     store,
@@ -195,11 +226,14 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
     canonical,
     poolMembers,
+    browserPoolMembers,
+    browserIdentityExists,
+    browserHub: hub,
     fetch: hooks.fetch ?? fetch,
     now,
     metrics: recoverOnSuccess(metrics, alerter),
   });
-  const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
+  const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: hub, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
 
   let warmed = false;
   let draining = false;
@@ -273,7 +307,21 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     port: opts.port,
     // The longest allowed idle gap; SSE streams carry their own keepalives.
     idleTimeout: 255,
+    websocket: {
+      // Screenshots arrive base64 inside one frame.
+      maxPayloadLength: 32 * 1024 * 1024,
+      open: (ws) => hub.open(ws),
+      message: (ws, data) => {
+        void hub.message(ws, typeof data === "string" ? data : data.toString("utf8"));
+      },
+      close: (ws) => hub.detach(ws),
+    },
     async fetch(req, srv) {
+      if (!draining && warmed && req.method === "GET" && new URL(req.url).pathname === "/browser/connect") {
+        // Authentication is the first `hello` message; the token is never in the URL.
+        if (srv.upgrade(req)) return undefined as unknown as Response;
+        return new Response("websocket upgrade required\n", { status: 426 });
+      }
       const res = await route(req, srv);
       if (draining) {
         // Keep-alive clients reconnect (to another replica) instead of reusing this connection.
@@ -286,14 +334,14 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       return res;
     },
   });
-  async function route(req: Request, srv: { timeout(r: Request, s: number): void }): Promise<Response> {
+  async function route(req: Request, srv: { timeout(r: Request, s: number): void; requestIP(r: Request): { address: string } | null }): Promise<Response> {
     const path = new URL(req.url).pathname;
     if (path === "/healthz") return new Response("ok\n");
     if (path === "/readyz") return warmed && !draining ? new Response("ready\n") : new Response(draining ? "draining\n" : "warming\n", { status: 503 });
     if (path === "/metrics") return new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } });
     if (!warmed) return providerError(await styleForPath({ store }, path), 503, "gateway is starting");
     srv.timeout(req, 0); // A long generation is not idle.
-    return proxy.fetch(req);
+    return proxy.fetch(req, { ip: srv.requestIP(req)?.address });
   }
   const adminServer = Bun.serve({
     hostname: hooks.host ?? "0.0.0.0",
@@ -316,6 +364,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       draining = true;
+      hub.closeAll(1012);
       wake?.();
       clearInterval(alertTimer);
       store.stop();

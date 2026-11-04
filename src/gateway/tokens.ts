@@ -10,6 +10,13 @@ export function hashSecret(secret: string): string {
   return createHash("sha256").update(secret).digest("hex");
 }
 
+/** Constant-time check of a presented secret against a stored SHA-256 hex hash. */
+export function sameHash(storedHex: string, secret: string): boolean {
+  const stored = Buffer.from(storedHex, "hex");
+  const given = Buffer.from(hashSecret(secret), "hex");
+  return stored.length === given.length && timingSafeEqual(stored, given);
+}
+
 export function generateToken(): { token: string; prefix: string; hash: string } {
   const p = crypto.getRandomValues(new Uint8Array(PREFIX_LEN));
   const prefix = Array.from(p, (b) => BASE32[b % 32]).join("");

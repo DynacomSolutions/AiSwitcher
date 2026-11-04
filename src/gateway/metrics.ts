@@ -1,3 +1,4 @@
+import { BROWSER_ERROR_CODES, BROWSER_TOOLS } from "../browser/protocol.ts";
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {
@@ -16,6 +17,10 @@ export interface GatewayMetrics {
   failover(app: string): void;
   /** A safety check could not run and the request was let through (for example the daily cap while the database is down). */
   failOpen(app: string, reason: "cap_check_failed"): void;
+  /** One browser tool call: `outcome` is "ok" or a browser error code. Tool is from a fixed set. */
+  browserCall(tool: string, outcome: string, seconds: number): void;
+  /** A browser pairing completed (token delivered). */
+  browserPairing(): void;
 }
 
 export const noopMetrics: GatewayMetrics = {
@@ -24,6 +29,8 @@ export const noopMetrics: GatewayMetrics = {
   rejection() {},
   failover() {},
   failOpen() {},
+  browserCall() {},
+  browserPairing() {},
 };
 
 const BUCKETS = [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300];
@@ -59,6 +66,13 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly failovers = new Counter("ais_gateway_failovers_total", "Requests retried on another pool member.");
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
   private readonly unreadable = new Counter("ais_gateway_credential_unreadable_total", "Credential reads that failed at warm-up, per app identity.");
+  private readonly browserCalls = new Counter("ais_gateway_browser_calls_total", "Browser tool calls by tool and outcome.");
+  private readonly browserPairings = new Counter("ais_gateway_browser_pairings_total", "Browser pairings completed.");
+  private readonly callBucketCounts = BUCKETS.map(() => 0);
+  private callCount = 0;
+  private callSum = 0;
+  /** Set once the relay hub exists. */
+  browserGauges: { connected(): number; sessions(): number } = { connected: () => 0, sessions: () => 0 };
   private readonly bucketCounts = BUCKETS.map(() => 0);
   private durationCount = 0;
   private durationSum = 0;
@@ -98,6 +112,22 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.failOpens.inc({ app, reason });
   }
 
+  browserCall(tool: string, outcome: string, seconds: number): void {
+    // Labels come from fixed sets only, whatever the caller passed.
+    const t = (BROWSER_TOOLS as readonly string[]).includes(tool) ? tool : "unknown";
+    const o = outcome === "ok" || (BROWSER_ERROR_CODES as readonly string[]).includes(outcome) ? outcome : "internal";
+    this.browserCalls.inc({ tool: t, outcome: o });
+    this.callCount += 1;
+    this.callSum += seconds;
+    BUCKETS.forEach((b, i) => {
+      if (seconds <= b) this.callBucketCounts[i] = (this.callBucketCounts[i] ?? 0) + 1;
+    });
+  }
+
+  browserPairing(): void {
+    this.browserPairings.inc({});
+  }
+
   credentialUnreadable(app: string, provider: string, identity: string): void {
     this.unreadable.inc({ app, provider, identity });
   }
@@ -108,10 +138,15 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.rejections, this.failovers, this.failOpens, this.unreadable]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);
+    out.push("# HELP ais_gateway_browser_call_seconds Browser tool call duration.", "# TYPE ais_gateway_browser_call_seconds histogram");
+    BUCKETS.forEach((b, i) => out.push(`ais_gateway_browser_call_seconds_bucket{le="${b}"} ${this.callBucketCounts[i]}`));
+    out.push(`ais_gateway_browser_call_seconds_bucket{le="+Inf"} ${this.callCount}`, `ais_gateway_browser_call_seconds_sum ${this.callSum}`, `ais_gateway_browser_call_seconds_count ${this.callCount}`);
+    out.push("# HELP ais_gateway_browsers_connected Browser extensions connected.", "# TYPE ais_gateway_browsers_connected gauge", `ais_gateway_browsers_connected ${this.browserGauges.connected()}`);
+    out.push("# HELP ais_gateway_browser_sessions_active Agent browser sessions active in the last ten minutes.", "# TYPE ais_gateway_browser_sessions_active gauge", `ais_gateway_browser_sessions_active ${this.browserGauges.sessions()}`);
     out.push("# HELP ais_gateway_ledger_buffer_depth Usage rows waiting to be written.", "# TYPE ais_gateway_ledger_buffer_depth gauge", `ais_gateway_ledger_buffer_depth ${this.gauges.ledgerDepth()}`);
     out.push("# HELP ais_gateway_ledger_dropped_total Usage rows lost.", "# TYPE ais_gateway_ledger_dropped_total counter", `ais_gateway_ledger_dropped_total ${this.gauges.ledgerDropped()}`);
     return `${out.join("\n")}\n`;

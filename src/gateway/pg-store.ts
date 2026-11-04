@@ -1,10 +1,15 @@
 import { SQL, type TransactionSQL } from "bun";
+import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import type { GatewayStore } from "./store.ts";
 import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
+import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
 
-const MIGRATIONS: { version: string; sql: string }[] = [{ version: "0001_init", sql: init0001 }];
+const MIGRATIONS: { version: string; sql: string }[] = [
+  { version: "0001_init", sql: init0001 },
+  { version: "0002_browser", sql: browser0002 },
+];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
 const MIGRATION_LOCK_KEY = 7_410_102;
@@ -71,6 +76,19 @@ function toApp(r: Row): GatewayApp {
   const last = isoOpt(r.last_used_at);
   if (last !== undefined) app.lastUsedAt = last;
   return app;
+}
+
+function toBinding(r: Row): BrowserBinding {
+  const b: BrowserBinding = {
+    name: r.name,
+    target: json(r.target) as BrowserBinding["target"],
+    profileLabel: r.profile_label,
+    state: r.state,
+    createdAt: iso(r.created_at),
+  };
+  const seen = isoOpt(r.last_seen_at);
+  if (seen !== undefined) b.lastSeenAt = seen;
+  return b;
 }
 
 export class PgGatewayStore implements GatewayStore {
@@ -162,5 +180,110 @@ export class PgGatewayStore implements GatewayStore {
       SELECT COALESCE(SUM(input_tokens + output_tokens + cache_write_tokens), 0) AS total
       FROM gateway_usage WHERE app = ${app} AND ts >= ${since.toISOString()}::timestamptz`;
     return Number(rows[0]?.total ?? 0);
+  }
+
+  async putBrowserBinding(b: BrowserBinding): Promise<void> {
+    await this.sql`
+      INSERT INTO browser_bindings (name, target, profile_label, state, created_at, last_seen_at)
+      VALUES (${b.name}, ${JSON.stringify(b.target)}::jsonb, ${b.profileLabel}, ${b.state},
+              ${b.createdAt}::timestamptz, ${b.lastSeenAt ?? null}::timestamptz)
+      ON CONFLICT (name) DO UPDATE SET
+        target = EXCLUDED.target, profile_label = EXCLUDED.profile_label, state = EXCLUDED.state,
+        created_at = EXCLUDED.created_at, last_seen_at = EXCLUDED.last_seen_at`;
+  }
+
+  async getBrowserBinding(name: string): Promise<BrowserBinding | undefined> {
+    const rows = await this.sql`SELECT * FROM browser_bindings WHERE name = ${name}`;
+    return rows[0] ? toBinding(rows[0]) : undefined;
+  }
+
+  async listBrowserBindings(): Promise<BrowserBinding[]> {
+    const rows = await this.sql`SELECT * FROM browser_bindings ORDER BY name`;
+    return rows.map(toBinding);
+  }
+
+  async revokeBrowserBinding(name: string): Promise<void> {
+    await this.sql`UPDATE browser_bindings SET state = 'revoked' WHERE name = ${name}`;
+  }
+
+  async touchBrowserBinding(name: string, at: string): Promise<void> {
+    await this.sql`UPDATE browser_bindings SET last_seen_at = ${at}::timestamptz WHERE name = ${name}`;
+  }
+
+  async addBrowserToken(binding: string, prefix: string, hash: string): Promise<void> {
+    await this.sql`INSERT INTO browser_tokens (binding, prefix, hash) VALUES (${binding}, ${prefix}, ${hash})`;
+  }
+
+  async browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
+    const rows = await this.sql`SELECT * FROM browser_tokens WHERE prefix = ${prefix} ORDER BY id LIMIT 1`;
+    const r = rows[0];
+    return r ? { app: r.binding, prefix: r.prefix, hash: r.hash, createdAt: iso(r.created_at) } : undefined;
+  }
+
+  async putPairing(p: BrowserPairing): Promise<void> {
+    await this.sql`
+      INSERT INTO browser_pairings (code, profile_label, created_at, expires_at, poll_secret_hash, approved_binding)
+      VALUES (${p.code}, ${p.profileLabel}, ${p.createdAt}::timestamptz, ${p.expiresAt}::timestamptz,
+              ${p.pollSecretHash}, ${p.approvedBinding ?? null})
+      ON CONFLICT (code) DO UPDATE SET
+        profile_label = EXCLUDED.profile_label, created_at = EXCLUDED.created_at,
+        expires_at = EXCLUDED.expires_at, poll_secret_hash = EXCLUDED.poll_secret_hash, approved_binding = EXCLUDED.approved_binding`;
+  }
+
+  async getPairing(code: string): Promise<BrowserPairing | undefined> {
+    const rows = await this.sql`SELECT * FROM browser_pairings WHERE code = ${code}`;
+    const r = rows[0];
+    if (!r) return undefined;
+    const p: BrowserPairing = {
+      code: r.code,
+      profileLabel: r.profile_label,
+      createdAt: iso(r.created_at),
+      expiresAt: iso(r.expires_at),
+      pollSecretHash: r.poll_secret_hash,
+    };
+    if (r.approved_binding !== null) p.approvedBinding = r.approved_binding;
+    return p;
+  }
+
+  async claimPairing(code: string): Promise<BrowserPairing | undefined> {
+    const rows = await this.sql`DELETE FROM browser_pairings WHERE code = ${code} RETURNING *`;
+    const r = rows[0];
+    if (!r) return undefined;
+    const p: BrowserPairing = {
+      code: r.code,
+      profileLabel: r.profile_label,
+      createdAt: iso(r.created_at),
+      expiresAt: iso(r.expires_at),
+      pollSecretHash: r.poll_secret_hash,
+    };
+    if (r.approved_binding !== null) p.approvedBinding = r.approved_binding;
+    return p;
+  }
+
+  async deletePairing(code: string): Promise<void> {
+    await this.sql`DELETE FROM browser_pairings WHERE code = ${code}`;
+  }
+
+  async deleteExpiredPairings(now: Date): Promise<void> {
+    await this.sql`DELETE FROM browser_pairings WHERE expires_at <= ${now.toISOString()}::timestamptz`;
+  }
+
+  async addAgentToken(r: AgentTokenRecord): Promise<void> {
+    await this.sql`
+      INSERT INTO browser_agent_tokens (identity, prefix, hash, created_at, revoked_at)
+      VALUES (${r.identity}, ${r.prefix}, ${r.hash}, ${r.createdAt}::timestamptz, ${r.revokedAt ?? null}::timestamptz)`;
+  }
+
+  async agentTokenByPrefix(prefix: string): Promise<AgentTokenRecord | undefined> {
+    const rows = await this.sql`
+      SELECT * FROM browser_agent_tokens WHERE prefix = ${prefix} AND revoked_at IS NULL ORDER BY id LIMIT 1`;
+    const r = rows[0];
+    if (!r) return undefined;
+    return { identity: r.identity, prefix: r.prefix, hash: r.hash, createdAt: iso(r.created_at) };
+  }
+
+  async revokeAgentTokens(identity: string): Promise<void> {
+    await this.sql`
+      UPDATE browser_agent_tokens SET revoked_at = now() WHERE identity = ${identity} AND revoked_at IS NULL`;
   }
 }

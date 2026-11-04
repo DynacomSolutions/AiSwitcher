@@ -202,6 +202,10 @@ src/
                              then promptForIdentity and exec through ~/.local/bin/<tool> shim
                              with --identity/--pool; or start a local model (no identity)
     local/dispatch.ts          `ais local list|start`: local llama.cpp model (shared/local-models.ts)
+    browser/                  `ais browser ...`: admin.ts (approve/list/revoke/agent-token), extension.ts
+                             (`extension path|update [--from=<zip>]`: atomic install of the release asset
+                             ais-browser-extension.zip into ~/.ais/browser-extension), dispatch.ts.
+                             Feature guide: docs/agents/browser.md
     version.ts               `ais version` (reads package.json)
     help.ts                   `ais help` / bare `ais` / `--help`/`-h`
     update.ts                 `ais update`: re-downloads whichever of claude/codex/grok/kimi/

@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "AIS Browser",
+  "version": "0.1.0",
+  "description": "Lets AIS agents drive this Chrome profile through the AIS gateway.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "storage",
+    "sidePanel",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "AIS Browser"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}

@@ -22,6 +22,9 @@ import type { HerdrChatTool } from "./herdr-chat-source.ts";
 import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
+import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
+import { browserLaunchEnv, browserMcpArgs } from "./browser-wiring.ts";
+import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
 export function herdrTitleForLaunch(
@@ -157,9 +160,15 @@ export async function runWrapper(
       resolved.configDirValue,
       sharedConfigArgs,
     );
+    const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
+    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary(), {
+      ...(activeIdentity !== undefined ? { identityName: activeIdentity } : {}),
+      ...(gatewayUrl ? { gateway: gatewayUrl } : {}),
+      ...(parsed.cleanedArgv[0] !== undefined ? { firstArg: parsed.cleanedArgv[0] } : {}),
+    });
     const launchArgs = cfg.toolName === "codex"
-      ? codexSubcommandConfigArgs(memoryProjection.argv)
-      : gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd());
+      ? codexSubcommandConfigArgs([...browserArgs, ...memoryProjection.argv])
+      : [...browserArgs, ...gatePluginArgs(cfg.toolName, memoryProjection.argv, process.cwd())];
     const inheritedTitleOwner = process.env.AIS_HERDR_TITLE_OWNER_PID;
     const liveImage = isAisLive();
     const chatTitleTool = herdrTitleForLaunch(cfg.toolName, Boolean(parentSession), inheritedTitleOwner, liveImage);
@@ -202,6 +211,7 @@ export async function runWrapper(
             }
           })(),
           ...extraEnv,
+          ...browserLaunchEnv(cfg.toolName, browserArgs, process.env),
           ...memoryProjection.env,
           ...(titleOwnerPid !== undefined ? { AIS_HERDR_TITLE_OWNER_PID: titleOwnerPid } : {}),
           ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),

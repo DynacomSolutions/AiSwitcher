@@ -559,3 +559,37 @@ describe("canonical resolver", () => {
     expect(loads).toBe(2);
   });
 });
+
+describe("browser relay socket", () => {
+  const wsOpen = (url: string): Promise<WebSocket> =>
+    new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      ws.onopen = () => resolve(ws);
+      ws.onerror = () => reject(new Error("ws error"));
+    });
+  const closed = (ws: WebSocket): Promise<number> => new Promise((r) => (ws.onclose = (e) => r(e.code)));
+
+  test("hello authenticates, a bad token closes 4401, and drain closes with 1012", async () => {
+    await store.putBrowserBinding({ name: "work", target: { kind: "identity", identity: "id1" }, profileLabel: "w", state: "active", createdAt: app.createdAt });
+    const t = generateToken();
+    await store.addBrowserToken("work", t.prefix, t.hash);
+    const g = await boot();
+    await waitFor(() => g.ready());
+    const url = `ws://127.0.0.1:${g.port}/browser/connect`;
+
+    const bad = await wsOpen(url);
+    const badClosed = closed(bad);
+    bad.send(JSON.stringify({ t: "hello", token: WRONG_TOKEN, version: "1", paused: false }));
+    expect(await badClosed).toBe(4401);
+
+    const ws = await wsOpen(url);
+    const welcome = new Promise<{ t: string }>((r) => (ws.onmessage = (e) => r(JSON.parse(String(e.data)) as { t: string })));
+    ws.send(JSON.stringify({ t: "hello", token: t.token, version: "1", paused: false }));
+    expect((await welcome).t).toBe("welcome");
+    await waitFor(async () => (await (await fetch(`${base(g)}/metrics`)).text()).includes("ais_gateway_browsers_connected 1"));
+
+    const drained = closed(ws);
+    void g.stop();
+    expect(await drained).toBe(1012);
+  });
+});
