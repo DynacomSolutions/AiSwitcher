@@ -180,7 +180,7 @@ jobs:
           name: host-unsigned-${{ matrix.asset }}
           path: ${{ runner.temp }}/host-build/assets/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
 
   # Windows is compiled, linted, packaged and test-built on Linux; only the steps
   # that need a real Windows host run on windows-latest (windows-test).
@@ -259,7 +259,7 @@ jobs:
           name: host-windows-tests
           path: ${{ runner.temp }}/host-windows-tests
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
       - name: Package the Windows app
         run: |
           args=(--windows)
@@ -270,7 +270,7 @@ jobs:
           name: host-unsigned-windows-x64
           path: ${{ runner.temp }}/host-build/assets/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
 
   windows-test:
     needs: [changes, windows-build]

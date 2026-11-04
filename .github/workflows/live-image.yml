@@ -274,7 +274,7 @@ jobs:
             out/scenario-*/qemu-*/qmp.log
             out/scenario-*/http.log
             out/build-info.json
-          retention-days: 3
+          retention-days: 1
           if-no-files-found: warn
 
       # Tag releases only: the signed release job is a separate, write-scoped
