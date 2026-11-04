@@ -1,3 +1,4 @@
+import { BROWSER_ERROR_CODES, BROWSER_TOOLS } from "../browser/protocol.ts";
 /** Counters the proxy reports. `PrometheusMetrics` is the production implementation. */
 export interface GatewayMetrics {
   request(e: {
@@ -112,7 +113,10 @@ export class PrometheusMetrics implements GatewayMetrics {
   }
 
   browserCall(tool: string, outcome: string, seconds: number): void {
-    this.browserCalls.inc({ tool, outcome });
+    // Labels come from fixed sets only, whatever the caller passed.
+    const t = (BROWSER_TOOLS as readonly string[]).includes(tool) ? tool : "unknown";
+    const o = outcome === "ok" || (BROWSER_ERROR_CODES as readonly string[]).includes(outcome) ? outcome : "internal";
+    this.browserCalls.inc({ tool: t, outcome: o });
     this.callCount += 1;
     this.callSum += seconds;
     BUCKETS.forEach((b, i) => {

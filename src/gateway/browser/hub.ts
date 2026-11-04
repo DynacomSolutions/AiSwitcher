@@ -1,4 +1,4 @@
-import type { BrowserTool, CallRequest, CallResult, ExtToGateway, GatewayToExt } from "../../browser/protocol.ts";
+import { BROWSER_ERROR_CODES, MAX_ERROR_MESSAGE, type BrowserErrorCode, type BrowserTool, type CallRequest, type CallResult, type ExtToGateway, type GatewayToExt } from "../../browser/protocol.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import { noopMetrics, type GatewayMetrics } from "../metrics.ts";
 
@@ -12,10 +12,33 @@ export const HELLO_TIMEOUT_MS = 10_000;
 export const SILENCE_TIMEOUT_MS = 60_000;
 const SESSION_TTL_MS = 10 * 60_000;
 
+/** A well-formed result from untrusted input, or undefined. Unknown error codes become "internal"; messages are capped. */
+export function sanitiseResult(v: unknown): CallResult | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r.id !== "string" || typeof r.ok !== "boolean") return undefined;
+  if (r.ok) {
+    if (!Array.isArray(r.content)) return undefined;
+    const content: Extract<CallResult, { ok: true }>["content"] = [];
+    for (const c of r.content as unknown[]) {
+      if (typeof c !== "object" || c === null) return undefined;
+      const x = c as Record<string, unknown>;
+      if (x.type === "text" && typeof x.text === "string") content.push({ type: "text", text: x.text });
+      else if (x.type === "image" && (x.mimeType === "image/jpeg" || x.mimeType === "image/png") && typeof x.data === "string") content.push({ type: "image", mimeType: x.mimeType, data: x.data });
+      else return undefined;
+    }
+    return { id: r.id, ok: true, content };
+  }
+  const error: BrowserErrorCode = (BROWSER_ERROR_CODES as readonly unknown[]).includes(r.error) ? (r.error as BrowserErrorCode) : "internal";
+  const message = typeof r.message === "string" ? r.message.slice(0, MAX_ERROR_MESSAGE) : "";
+  return { id: r.id, ok: false, error, message };
+}
+
 interface Conn {
   ws: HubSocket;
   binding?: BrowserBinding;
   paused: boolean;
+  authenticating?: boolean;
   helloTimer?: ReturnType<typeof setTimeout>;
   silenceTimer?: ReturnType<typeof setTimeout>;
 }
@@ -75,12 +98,13 @@ export class BrowserHub {
       return;
     }
     if (!conn.binding) {
+      // While the token is being checked nothing else is processed; the hello timer keeps running.
+      if (conn.authenticating) return;
       if (msg.t !== "hello" || typeof msg.token !== "string") {
         this.drop(conn, 4401, "hello required");
         return;
       }
-      if (conn.helloTimer) clearTimeout(conn.helloTimer);
-      conn.helloTimer = undefined;
+      conn.authenticating = true;
       let binding: BrowserBinding | undefined;
       try {
         binding = await this.opts.authToken(msg.token);
@@ -93,6 +117,8 @@ export class BrowserHub {
         return;
       }
       if (!this.conns.has(ws)) return; // closed while authenticating
+      conn.paused = msg.paused === true;
+      conn.authenticating = false;
       this.attach(ws, binding);
       this.send(ws, { t: "welcome", binding: binding.name, target: binding.target });
       return;
@@ -106,9 +132,10 @@ export class BrowserHub {
         conn.paused = msg.paused === true;
         return;
       case "result": {
-        const id = msg.result?.id;
-        const p = typeof id === "string" ? this.pending.get(id) : undefined;
-        if (p && p.ws === ws) this.settle(id as string, msg.result);
+        const result = sanitiseResult(msg.result);
+        if (!result) return;
+        const p = this.pending.get(result.id);
+        if (p && p.ws === ws) this.settle(result.id, result);
         return;
       }
       default:
@@ -155,8 +182,17 @@ export class BrowserHub {
     return this.sessions.size;
   }
 
+  /** Gives up on a call the agent no longer waits for: tells the extension and settles it. */
+  abort(id: string): void {
+    const p = this.pending.get(id);
+    if (!p) return;
+    this.send(p.ws, { t: "abort", id });
+    this.settle(id, { id, ok: false, error: "internal", message: "The caller went away." });
+  }
+
   call(binding: string, req: CallRequest, timeoutMs: number): Promise<CallResult> {
     const started = this.now();
+    this.activeSessions();
     this.sessions.set(req.session.id, started);
     const finish = (r: CallResult): CallResult => {
       this.metrics.browserCall(req.tool, r.ok ? "ok" : r.error, (this.now() - started) / 1000);

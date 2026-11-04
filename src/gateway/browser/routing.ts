@@ -56,7 +56,7 @@ export function createCallRoutes(deps: CallDeps): Hono {
     } catch {
       return c.json({ error: "invalid JSON" }, 400);
     }
-    if (!isObj(body) || !isObj(body.session) || typeof body.session.id !== "string" || body.session.id === "") return c.json({ error: "session.id is required" }, 400);
+    if (!isObj(body) || !isObj(body.session) || typeof body.session.id !== "string" || body.session.id === "" || body.session.id.length > 128) return c.json({ error: "session.id is required" }, 400);
     const tool = body.tool;
     if (typeof tool !== "string" || !(BROWSER_TOOLS as readonly string[]).includes(tool)) return c.json({ error: "unknown tool" }, 400);
     if (body.args !== undefined && !isObj(body.args)) return c.json({ error: "args must be an object" }, 400);
@@ -68,6 +68,7 @@ export function createCallRoutes(deps: CallDeps): Hono {
     const connected = deps.hub.connected();
     const allowed = await allowedBindings(a.identity, connected, poolMembers);
     if (tool === "list_browsers") {
+      deps.metrics?.browserCall(tool, "ok", 0);
       return c.json({ id, ok: true, content: [{ type: "text", text: JSON.stringify(allowed.map(summary)) }] } satisfies CallResult);
     }
     let chosen: BrowserBinding | undefined;
@@ -84,11 +85,14 @@ export function createCallRoutes(deps: CallDeps): Hono {
     } else chosen = allowed[0];
     if (!chosen) return c.json(fail(id, tool, "no_browser", "No browser is bound to this identity and connected."));
 
+    const onAbort = (): void => deps.hub.abort(id);
+    c.req.raw.signal.addEventListener("abort", onAbort, { once: true });
     const result = await deps.hub.call(
       chosen.name,
       { id, session: { id: body.session.id, identity: a.identity, label }, tool: tool as BrowserTool, args },
       tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : DEFAULT_CALL_TIMEOUT_MS,
     );
+    c.req.raw.signal.removeEventListener("abort", onAbort);
     return c.json(result);
   });
 

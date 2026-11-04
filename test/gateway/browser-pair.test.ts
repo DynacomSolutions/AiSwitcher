@@ -182,7 +182,7 @@ describe("browser pairing", () => {
     const { token } = (await (await post("/browser/pair/poll", { code: p.code, pollSecret: p.pollSecret })).json()) as { token: string };
     const ws = { sent: [] as string[], closed: undefined as number | undefined, send(d: string) { this.sent.push(d); }, close(c?: number) { this.closed = c; } };
     hub.open(ws);
-    await hub.message(ws, JSON.stringify({ t: "hello", token, version: "1" }));
+    await hub.message(ws, JSON.stringify({ t: "hello", token, version: "1", paused: false }));
     expect(hub.connected().map((b) => b.name)).toEqual(["laptop"]);
     await adm("/browser/bindings/laptop", { method: "DELETE" });
     expect(ws.closed).toBe(4401);

@@ -138,4 +138,20 @@ describe("POST /browser/call", () => {
     expect((await call({ session, tool: "nope" })).status).toBe(400);
     expect((await call({ tool: "navigate" })).status).toBe(400);
   });
+
+  test("session.id over 128 characters is 400", async () => {
+    expect((await call({ session: { id: "x".repeat(129) }, tool: "navigate" })).status).toBe(400);
+  });
+
+  test("agent disconnect aborts the call on the extension", async () => {
+    const ws = await connect(b("w", { kind: "identity", identity: "id1" }));
+    const ac = new AbortController();
+    const res = Promise.resolve(app.request(new Request("http://gw.test/browser/call", { method: "POST", signal: ac.signal, headers: { authorization: `Bearer ${agent}`, "content-type": "application/json" }, body: JSON.stringify({ session, tool: "navigate" }) })));
+    await Bun.sleep(30);
+    expect(ws.sent.some((m) => m.t === "call")).toBe(true);
+    ac.abort();
+    await Bun.sleep(30);
+    expect(ws.sent.some((m) => m.t === "abort")).toBe(true);
+    await res.catch(() => undefined);
+  });
 });

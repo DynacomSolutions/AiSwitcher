@@ -19,9 +19,9 @@ const binding = (name: string): BrowserBinding => ({ name, target: { kind: "iden
 const req = (id = "c1", tool: CallRequest["tool"] = "navigate"): CallRequest => ({ id, session: { id: "s1", identity: "id1", label: "" }, tool, args: { url: "https://example.test" } });
 const tokens: Record<string, BrowserBinding> = { good: binding("work") };
 const mk = (over = {}) => new BrowserHub({ authToken: async (t) => tokens[t], ...over });
-async function hello(hub: BrowserHub, ws: FakeWs, token = "good") {
+async function hello(hub: BrowserHub, ws: FakeWs, token = "good", paused = false) {
   hub.open(ws);
-  await hub.message(ws, JSON.stringify({ t: "hello", token, version: "1" }));
+  await hub.message(ws, JSON.stringify({ t: "hello", token, version: "1", paused }));
 }
 
 describe("BrowserHub", () => {
@@ -177,5 +177,72 @@ describe("BrowserHub", () => {
     expect(text).toContain("ais_gateway_browser_sessions_active 1");
     expect(text).toContain("ais_gateway_browser_pairings_total 1");
     expect(text).not.toContain("SECRET-PAGE-TEXT");
+  });
+
+  test("malformed results are ignored; odd error codes become internal and metrics still render", async () => {
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const hub = mk({ metrics });
+    const ws = new FakeWs();
+    await hello(hub, ws);
+    const p = hub.call("work", req("c1"), 1000);
+    await hub.message(ws, JSON.stringify({ t: "result", result: { id: "c1", ok: true, content: [{ type: "text" }] } }));
+    await hub.message(ws, JSON.stringify({ t: "result", result: { id: "c1", ok: "yes" } }));
+    await hub.message(ws, JSON.stringify({ t: "result", result: { id: "c1", ok: false, error: 123, message: "x".repeat(5000) } }));
+    const r = await p;
+    expect(r).toMatchObject({ ok: false, error: "internal" });
+    expect((r as { message: string }).message.length).toBe(1000);
+    const p2 = hub.call("work", req("c2"), 1000);
+    await hub.message(ws, JSON.stringify({ t: "result", result: { id: "c2", ok: false, error: "leaked page text", message: "m" } }));
+    expect(await p2).toMatchObject({ error: "internal" });
+    const text = metrics.render();
+    expect(text).toContain('outcome="internal"');
+    expect(text).not.toContain("leaked page text");
+    metrics.browserCall("not-a-tool", "free text", 0);
+    expect(metrics.render()).not.toContain("free text");
+  });
+
+  test("messages during auth are ignored and a second hello cannot double-attach", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const hub = new BrowserHub({ authToken: async () => (await gate, binding("work")) });
+    const ws = new FakeWs();
+    hub.open(ws);
+    const h1 = hub.message(ws, JSON.stringify({ t: "hello", token: "a", version: "1", paused: false }));
+    await hub.message(ws, JSON.stringify({ t: "hello", token: "b", version: "1", paused: false }));
+    await hub.message(ws, JSON.stringify({ t: "ping" }));
+    expect(ws.closed).toBeUndefined();
+    expect(ws.sent).toEqual([]);
+    release();
+    await h1;
+    expect(ws.sent).toHaveLength(1);
+    expect(hub.connected()).toHaveLength(1);
+    hub.detach(ws);
+    expect(hub.connected()).toEqual([]);
+  });
+
+  test("hello timer keeps running while auth hangs", async () => {
+    const hub = new BrowserHub({ authToken: () => new Promise(() => {}), helloTimeoutMs: 20 });
+    const ws = new FakeWs();
+    hub.open(ws);
+    void hub.message(ws, JSON.stringify({ t: "hello", token: "a", version: "1", paused: false }));
+    await Bun.sleep(60);
+    expect(ws.closed?.code).toBe(4408);
+  });
+
+  test("hello with paused true starts the connection paused", async () => {
+    const hub = mk();
+    const ws = new FakeWs();
+    await hello(hub, ws, "good", true);
+    expect(await hub.call("work", req(), 100)).toMatchObject({ error: "paused_by_user" });
+  });
+
+  test("abort sends abort to the extension and settles the call", async () => {
+    const hub = mk();
+    const ws = new FakeWs();
+    await hello(hub, ws);
+    const p = hub.call("work", req(), 30_000);
+    hub.abort("c1");
+    expect(ws.sent.at(-1)).toEqual({ t: "abort", id: "c1" });
+    expect(await p).toMatchObject({ ok: false });
   });
 });

@@ -579,12 +579,12 @@ describe("browser relay socket", () => {
 
     const bad = await wsOpen(url);
     const badClosed = closed(bad);
-    bad.send(JSON.stringify({ t: "hello", token: WRONG_TOKEN, version: "1" }));
+    bad.send(JSON.stringify({ t: "hello", token: WRONG_TOKEN, version: "1", paused: false }));
     expect(await badClosed).toBe(4401);
 
     const ws = await wsOpen(url);
     const welcome = new Promise<{ t: string }>((r) => (ws.onmessage = (e) => r(JSON.parse(String(e.data)) as { t: string })));
-    ws.send(JSON.stringify({ t: "hello", token: t.token, version: "1" }));
+    ws.send(JSON.stringify({ t: "hello", token: t.token, version: "1", paused: false }));
     expect((await welcome).t).toBe("welcome");
     await waitFor(async () => (await (await fetch(`${base(g)}/metrics`)).text()).includes("ais_gateway_browsers_connected 1"));
 
