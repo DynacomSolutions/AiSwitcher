@@ -117,6 +117,10 @@ export class CachedGatewayStore implements GatewayStore {
     return this.inner.addBrowserToken(binding, prefix, hash);
   }
 
+  deleteBrowserTokens(binding: string): Promise<void> {
+    return this.inner.deleteBrowserTokens(binding);
+  }
+
   browserTokenByPrefix(prefix: string): Promise<TokenRecord | undefined> {
     return this.inner.browserTokenByPrefix(prefix);
   }

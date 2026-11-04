@@ -39,6 +39,9 @@ export function registerBrowserAdmin(hono: Hono, deps: BrowserDeps): void {
   const { store } = deps;
   const err = (status: 400 | 404 | 409 | 410, message: string): Response => Response.json({ error: message }, { status });
 
+  /** A name is taken only by an active binding; a revoked one can be reused. */
+  const nameTaken = async (n: string): Promise<boolean> => (await store.getBrowserBinding(n))?.state === "active";
+
   hono.post("/browser/pairings/:code/approve", async (c) => {
     const code = c.req.param("code");
     let raw: unknown;
@@ -57,14 +60,16 @@ export function registerBrowserAdmin(hono: Hono, deps: BrowserDeps): void {
     let name: string;
     if (raw.name !== undefined) {
       if (typeof raw.name !== "string" || !BINDING_NAME.test(raw.name)) return err(400, "name must be 1 to 63 lowercase letters, digits or -, start and end with a letter or digit");
-      if (await store.getBrowserBinding(raw.name)) return err(409, "a binding with that name exists");
+      if (await nameTaken(raw.name)) return err(409, "a binding with that name exists");
       name = raw.name;
     } else {
       const base = slug(pairing.profileLabel);
       name = base;
-      for (let i = 2; await store.getBrowserBinding(name); i++) name = `${base}-${i}`;
+      for (let i = 2; await nameTaken(name); i++) name = `${base}-${i}`;
     }
     const binding: BrowserBinding = { name, target, profileLabel: pairing.profileLabel, state: "active", createdAt: deps.now().toISOString() };
+    // Reusing a revoked name: its old tokens must not authenticate the new binding.
+    await store.deleteBrowserTokens(name);
     await store.putBrowserBinding(binding);
     await store.putPairing({ ...pairing, approvedBinding: name });
     return c.json({ binding });

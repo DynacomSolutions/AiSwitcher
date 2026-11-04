@@ -127,13 +127,18 @@ async function readToken(env: NodeJS.ProcessEnv, configDir?: string): Promise<st
   return undefined;
 }
 
+/** Random UUIDs keep 6 chars; human-chosen ids show up to 12. */
+function shortId(id: string): string {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) ? id.slice(0, 6) : id.slice(0, 12);
+}
+
 export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimOptions = {}): ShimContext {
   const id = env.CLAUDE_SESSION_ID || env.CODEX_SESSION_ID || crypto.randomUUID();
   const identity = opts.identity || env.AI_PROFILE_SWITCHER_SESSION || "agent";
   return {
     gatewayUrl: async () => opts.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
     token: () => readToken(env, opts.configDir),
-    session: { id, identity, label: `${identity} / ${id.slice(0, 6)}` },
+    session: { id, identity, label: `${identity} / ${shortId(id)}` },
     fetch,
     inflight: new Map(),
   };
