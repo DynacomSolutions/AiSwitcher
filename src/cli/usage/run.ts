@@ -372,7 +372,8 @@ async function runOne(target: UsageTarget, suppression: UsageRowSuppression, dep
   if (target.toolName === "pi") return runPiUsage(target, suppression);
   if (target.toolName === "opencode") return runOpencodeUsage(target, suppression);
 
-  // Daily usage is derived from the native export in snapshot.ts.
+  // claude, codex, grok and kimi report through the AIS-patched native
+  // export. Their daily usage is derived from that export in snapshot.ts.
   const [results, extraCost] = await Promise.all([
     (deps.runTokscale ?? ((selected, rowSuppression) => runTokscaleForUsageTarget(selected, rowSuppression, deps)))(target, suppression),
     // Retired identities keep local usage only: the extra-cost probe is a
