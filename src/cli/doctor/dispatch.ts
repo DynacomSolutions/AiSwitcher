@@ -1,6 +1,7 @@
 import { boolFlag, type ParsedArgs } from "../args.ts";
 import { runDoctorQuery } from "./collect.ts";
 import { formatDoctorReport } from "./report.ts";
+import { fetchLocalStatus } from "../gateway/local-service.ts";
 import { collectSpendGuardDoctor } from "../../spend/doctor.ts";
 
 /** `ais doctor [--identity=] [--tool=] [--json]` — takes the top-level
@@ -19,4 +20,10 @@ export async function runDoctorCommand(flags: ParsedArgs["flags"]): Promise<void
     return;
   }
   console.log(formatDoctorReport(all));
+  const local = await fetchLocalStatus();
+  console.log(
+    local
+      ? `\nGateway local proxy: running, ${local.mode === "direct" ? "DIRECT mode (cluster gateway unreachable)" : "remote mode"} since ${new Date(local.sinceMs).toISOString()}`
+      : "\nGateway local proxy: not running (ais gateway local install)",
+  );
 }

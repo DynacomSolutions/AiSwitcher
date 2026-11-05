@@ -75,7 +75,7 @@ export async function installedUsageCollectorSupported(
   return checkInstalledEntrypoint(aisPath);
 }
 
-async function reloadAndVerifyUserUnit(serviceName: string): Promise<void> {
+export async function reloadAndVerifyUserUnit(serviceName: string): Promise<void> {
   const reload = Bun.spawn(["systemctl", "--user", "daemon-reload"], {
     stdin: "ignore",
     stdout: "ignore",
@@ -104,7 +104,7 @@ async function reloadAndVerifyUserUnit(serviceName: string): Promise<void> {
   }
 }
 
-async function enableStartAndVerifyUserUnit(serviceName: string, restartIfActive: boolean): Promise<void> {
+export async function enableStartAndVerifyUserUnit(serviceName: string, restartIfActive: boolean): Promise<void> {
   const enable = Bun.spawn(["systemctl", "--user", "enable", serviceName], {
     stdin: "ignore",
     stdout: "ignore",
@@ -161,7 +161,7 @@ async function enableStartAndVerifyUserUnit(serviceName: string, restartIfActive
       new Response(check.stderr).text(),
     ]);
     if (code !== 0 || state.trim() !== expected) {
-      throw new Error(`usage collector service ${property} is ${state.trim() || error.trim() || `exit ${code}`}, expected ${expected}`);
+      throw new Error(`service ${serviceName} ${property} is ${state.trim() || error.trim() || `exit ${code}`}, expected ${expected}`);
     }
   }
 }
