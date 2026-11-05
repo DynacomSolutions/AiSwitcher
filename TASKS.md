@@ -155,6 +155,6 @@ ETA: 2026-11-06 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 120 | AIS Browser: Chrome extension agents drive via the gateway | in_progress | claude-20261104-browser | ais-browser | | 2026-11-06 18:00 ICT | Spec and plan: .data/DynacomSolutions/AiSwitcher/specs/2026-11-04-ais-chrome-extension-*.md<br>Branch ais-browser |
+| 120 | AIS Browser: Chrome extension agents drive via the gateway | done | claude-20261104-browser | ais-browser | | | Shipped in v0.5.24 + v0.5.25<br>PRs #360 #364 #365 #367<br>Gateway live (.cluster #2131) |
 | 121 | Release v0.5.24 with extension zip | done | Thomas | | | | Released v0.5.24 with ais-browser-extension.zip |
 | 122 | Install on Mac and pair profiles | blocked_on_owner | Thomas | | 6.121 | | ais update (needs 0.5.24)<br>ais browser extension update<br>chrome://extensions: Developer mode, Load unpacked ~/.ais/browser-extension, each profile<br>Options: wss:// gateway URL, Sign in<br>Approve code on the gateway host: ais browser approve CODE --pool=NAME or --identity=ID |
