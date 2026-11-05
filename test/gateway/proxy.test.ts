@@ -544,6 +544,21 @@ describe("failover and refresh", () => {
   });
 });
 
+describe("dead login", () => {
+  test("the cluster gateway tells the client which login is out and how to log back in", async () => {
+    const t = await addApp(baseApp({}));
+    handler = () => new Response("{}", { status: 401 });
+    refreshImpl = async () => {
+      throw new GatewayCredentialError("login-dead", "claude", "id1");
+    };
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    const body = (await res.json()) as { type: string; error: { type: string; message: string } };
+    expect(body.type).toBe("error");
+    expect(body.error.message).toContain('claude identity "id1" is logged out');
+    expect(body.error.message).toContain("claude --identity=id1");
+  });
+});
+
 describe("client abort", () => {
   test("client abort mid-stream aborts upstream and records client_aborted", async () => {
     const t = await addApp(baseApp({}));

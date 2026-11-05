@@ -147,6 +147,15 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     };
     const attempt = async (identity: string): Promise<Response> => {
       let cred = await deps.creds.get(provider, identity);
+      // An access token already past its expiry is refreshed (AIS's locked refresh) before the first send.
+      if (cred.expiresAtMs !== undefined && cred.expiresAtMs <= deps.now() + 30_000 && adapter.refreshable) {
+        try {
+          cred = await deps.creds.refreshAfter401(provider, identity, cred.accessToken);
+        } catch (err) {
+          if (err instanceof GatewayCredentialError && err.loggedOut) throw err;
+          // Anything else: the old token may still work, and a 401 refresh below gets another go.
+        }
+      }
       let res = await send(cred);
       if (res.status === 401 && adapter.refreshable && replayable) {
         try {
@@ -178,7 +187,15 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     }
     if (names.length === 0) return providerError(style, 502, "no local login available for direct mode");
     try {
-      let up = await attempt(names[0] as string);
+      let up: Response;
+      try {
+        up = await attempt(names[0] as string);
+      } catch (err) {
+        // A logged-out first member: the next one gets the request (its own error stands if it fails too).
+        if (!(err instanceof GatewayCredentialError && err.loggedOut) || names.length < 2) throw err;
+        up = await attempt(names[1] as string);
+        return clean(up);
+      }
       if (replayable && names.length > 1) {
         const q = await isQuota(up);
         up = q.res;
@@ -196,7 +213,10 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
       return clean(up);
     } catch (err) {
       if (signal.aborted) return new Response(null, { status: 499 });
-      if (err instanceof GatewayCredentialError) return providerError(style, 502, `local credential unavailable (${err.code})`);
+      if (err instanceof GatewayCredentialError) {
+        deps.log(`gateway-local: direct ${tool} credential problem (${err.code})`);
+        return providerError(style, err.loggedOut ? 401 : 502, err.clientMessage);
+      }
       return providerError(style, 502, "direct upstream request failed");
     }
   }

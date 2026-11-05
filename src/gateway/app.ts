@@ -445,7 +445,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     if (err instanceof GatewayCredentialError) {
       record(identity, "credential_error", 502, undefined, false, undefined, model);
-      return providerError(style, 502, `upstream credential unavailable (${err.code})`);
+      return providerError(style, 502, err.clientMessage);
     }
     // Never echo the error: it may carry paths or provider text.
     const credential = err instanceof RefreshCooldownError || err instanceof NotRefreshableError || (err as { name?: string } | null)?.name === "SwapLockError";

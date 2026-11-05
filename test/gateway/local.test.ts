@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { createLocalGateway, startLocalGateway, type LocalGateway } from "../../src/gateway/local.ts";
+import { GatewayCredentialError } from "../../src/gateway/credentials.ts";
+import { createLocalGateway, type LocalGatewayDeps, startLocalGateway, type LocalGateway } from "../../src/gateway/local.ts";
 
 const enc = new TextEncoder();
 const CLIENT_KEY = String(Math.random());
@@ -12,7 +13,7 @@ interface Call {
 }
 
 /** Fake network: `remote` answers REMOTE urls, `upstream` answers provider urls; every call is recorded. */
-function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream?: (c: Call, identity: string) => Response | Promise<Response>; members?: string[]; breakerMs?: number; firstByteMs?: number }) {
+function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream?: (c: Call, identity: string) => Response | Promise<Response>; creds?: Partial<LocalGatewayDeps["creds"]>; now?: number; members?: string[]; breakerMs?: number; firstByteMs?: number }) {
   const calls: Call[] = [];
   const logs: string[] = [];
   const tokenOf: Record<string, string> = { a: "tok-a", b: "tok-b" };
@@ -38,6 +39,7 @@ function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream
     creds: {
       get: async (_p, identity) => ({ identity, accessToken: tokenOf[identity] as string }),
       refreshAfter401: async (_p, identity) => ({ identity, accessToken: tokenOf[identity] as string }),
+      ...opts.creds,
     },
     members: async () => opts.members ?? ["a", "b"],
     log: (l) => logs.push(l),
@@ -225,6 +227,57 @@ describe("local gateway failover", () => {
     const r2 = rig({ remote: refused, upstream: () => new Response('{"error":{"code":"invalid_request"}}', { status: 400 }) });
     expect((await r2.post()).status).toBe(400);
     expect(r2.calls.filter((c) => !c.url.startsWith(REMOTE))).toHaveLength(1);
+  });
+
+  test("a 401 from the provider refreshes the login once and retries with the new token", async () => {
+    let refreshed = 0;
+    const r = rig({
+      remote: refused,
+      creds: { refreshAfter401: async (_p, identity) => (refreshed++, { identity, accessToken: "tok-b" }) },
+      upstream: (c) => (c.headers.get("authorization") === "Bearer tok-b" ? new Response("fresh") : new Response("expired", { status: 401 })),
+    });
+    expect(await (await r.post()).text()).toBe("fresh");
+    expect(refreshed).toBe(1);
+  });
+
+  test("an expired access token is refreshed before the first send", async () => {
+    let refreshed = 0;
+    const r = rig({
+      remote: refused,
+      creds: {
+        get: async (_p, identity) => ({ identity, accessToken: "old", expiresAtMs: 1 }),
+        refreshAfter401: async (_p, identity) => (refreshed++, { identity, accessToken: "tok-a" }),
+      },
+      upstream: (c) => new Response(c.headers.get("authorization") ?? ""),
+    });
+    expect(await (await r.post()).text()).toBe("Bearer tok-a");
+    expect(refreshed).toBe(1);
+  });
+
+  test("a dead login answers in the client's error shape with the tool, identity and login command", async () => {
+    const dead = (_p: string, identity: string): never => {
+      throw new GatewayCredentialError("login-dead", "claude", identity);
+    };
+    const r = rig({ remote: refused, members: ["only"], creds: { get: async (p, i) => dead(p, i) } });
+    const res = await r.post();
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { type: string; error: { message: string } };
+    expect(body.type).toBe("error");
+    expect(body.error.message).toContain('claude identity "only" is logged out');
+    expect(body.error.message).toContain("claude --identity=only");
+    const codex = rig({ remote: refused, members: ["m"], creds: { get: async () => { throw new GatewayCredentialError("login-dead", "codex", "m"); } } });
+    const cres = await codex.post("/codex/responses");
+    const cbody = (await cres.json()) as { error: { message: string } };
+    expect(cbody.error.message).toContain("codex --identity=m login");
+  });
+
+  test("a logged-out first member hands the request to the next member", async () => {
+    const r = rig({
+      remote: refused,
+      creds: { get: async (_p, identity) => { if (identity === "a") throw new GatewayCredentialError("login-dead", "claude", "a"); return { identity, accessToken: "tok-b" }; } },
+      upstream: () => new Response("from-b"),
+    });
+    expect(await (await r.post()).text()).toBe("from-b");
   });
 
   test("body over 8 MiB gets no fallback and the remote error passes through", async () => {

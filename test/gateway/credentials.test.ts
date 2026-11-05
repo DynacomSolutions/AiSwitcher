@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { cp, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { CredentialCache, NotRefreshableError, RefreshCooldownError, type RefreshFn } from "../../src/gateway/credentials.ts";
+import { CredentialCache, GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type RefreshFn } from "../../src/gateway/credentials.ts";
 import { SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../src/identities/tool-configs.ts";
-import { refreshIdentityOAuthGrant } from "../../src/identities/oauth-refresh.ts";
+import { OAuthRefreshError, refreshIdentityOAuthGrant } from "../../src/identities/oauth-refresh.ts";
 
 const FIXTURES = join(import.meta.dir, "..", "fixtures", "gateway");
 const SCRATCH = join(import.meta.dir, ".tmp");
@@ -80,6 +80,21 @@ describe("CredentialCache", () => {
     expect(calls).toBe(1);
     expect(a.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0002");
     expect(b.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0002");
+  });
+
+  test("a revoked refresh token is a dead login with a plain message and the login command", async () => {
+    const c = makeCache(async () => {
+      throw new OAuthRefreshError("invalid_grant", true);
+    });
+    const err = (await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(err).toBeInstanceOf(GatewayCredentialError);
+    expect(err.code).toBe("login-dead");
+    expect(err.loggedOut).toBe(true);
+    expect(err.clientMessage).toContain('claude identity "id1" is logged out');
+    expect(err.clientMessage).toContain("claude --identity=id1");
+    expect(err.clientMessage).not.toContain("SYNTHETIC_FIXTURE");
+    expect(new GatewayCredentialError("login-dead", "codex", "x").clientMessage).toContain("codex --identity=x login");
+    expect(new GatewayCredentialError("refresh-lock-timeout", "codex", "x").loggedOut).toBe(false);
   });
 
   test("refresh skipped when file already holds a newer token", async () => {

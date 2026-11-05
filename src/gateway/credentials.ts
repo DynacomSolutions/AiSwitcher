@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { codexAccountOf, jwtAccountId, parseCodexAuth, readCodexAuthText } from "../identities/codex-auth.ts";
 import { readAliApiKey } from "../identities/ali-auth.ts";
 import { nativeStorePathFor } from "../identities/oauth-reconcile.ts";
-import { effectiveGrantPaths, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { isRetired } from "../identities/retired.ts";
 import { readOpencodeAuth, readOpencodeV2Credentials } from "../cli/limits/opencode-limits.ts";
@@ -58,11 +58,29 @@ export class RefreshCooldownError extends Error {
   }
 }
 
+/** The normal AIS way to log an identity back in (identity selection by `--identity=`, as for every launcher). */
+export function loginCommand(provider: GatewayProvider, identity: string): string {
+  if (provider === "claude") return `claude --identity=${identity}  (then run /login inside it)`;
+  if (provider === "codex") return `codex --identity=${identity} login`;
+  return `${provider} --identity=${identity} auth login`;
+}
+
 /** Generic credential failure; `code` is a stable reason, the message never carries paths or token values. */
 export class GatewayCredentialError extends Error {
-  constructor(readonly code: "refresh-failed" | "refresh-lock-timeout" | "token-unchanged" | "no-credential" | "unknown-identity" | "retired", provider: GatewayProvider, identity: string, cause?: unknown) {
+  constructor(readonly code: "refresh-failed" | "refresh-lock-timeout" | "token-unchanged" | "no-credential" | "unknown-identity" | "retired" | "login-dead", readonly provider: GatewayProvider, readonly identity: string, cause?: unknown) {
     super(`gateway: ${provider} identity "${identity}" credential unavailable (${code})`, cause === undefined ? undefined : { cause });
     this.name = "GatewayCredentialError";
+  }
+
+  /** True when only a person can fix it: the login is gone or revoked. */
+  get loggedOut(): boolean {
+    return this.code === "login-dead" || this.code === "no-credential";
+  }
+
+  /** Text for the client: plain about a dead login, a bare reason code otherwise. */
+  get clientMessage(): string {
+    if (this.loggedOut) return `${this.provider} identity "${this.identity}" is logged out (its saved login cannot be refreshed). Log back in with: ${loginCommand(this.provider, this.identity)}`;
+    return `upstream credential unavailable (${this.code})`;
   }
 }
 
@@ -226,13 +244,14 @@ export class CredentialCache {
       result = await this.refresh(provider as RefreshableTool, id, { force: true, expectedAccessToken: staleToken });
     } catch (err) {
       // Raw errors can carry lock paths or provider text: keep them as `cause` only.
-      throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : "refresh-failed", provider, identity, err);
+      const revoked = err instanceof OAuthRefreshError && err.revoked;
+      throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
     if (next.accessToken !== staleToken) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
-    throw new GatewayCredentialError(result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-revoked" ? "refresh-failed" : "token-unchanged", provider, identity);
+    throw new GatewayCredentialError(result.outcome === "no-grant" || result.outcome === "skipped-revoked" ? "login-dead" : result.outcome === "failed" ? "refresh-failed" : "token-unchanged", provider, identity);
   }
 
   private async reload(provider: GatewayProvider, id: Identity): Promise<ProviderCredential> {
