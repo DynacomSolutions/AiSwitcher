@@ -66,6 +66,16 @@ async function verifyDownload(name: string, tmp: string): Promise<void> {
   } finally { await handle.close(); }
 }
 
+async function fileHash(path: string): Promise<string | undefined> {
+  try {
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update(await Bun.file(path).arrayBuffer());
+    return hasher.digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
 export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
   const prefix = dim("ais update:");
   if (options.skipBackup) {
@@ -93,7 +103,7 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
 
   const before = await installedVersion(join(shimDir, "ais"));
   let updated = 0;
-  let aisUpdated = false;
+  const aisHashBefore = await fileHash(join(shimDir, "ais"));
   for (const name of MANAGED_BINARIES) {
     const dest = join(shimDir, name);
     if (!(await Bun.file(dest).exists())) {
@@ -105,13 +115,16 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     // Verified before it replaces the installed file, so a bad download leaves the working binary in place.
     await downloadAssetAtomic(assetName, dest, { fetchImpl: options.fetchImpl, mode: 0o755, verify: (tmp) => verifyDownload(name, tmp) });
     updated++;
-    if (name === "ais") aisUpdated = true;
   }
 
   if (updated > 0 && (await Bun.file(join(shimDir, "ais")).exists())) {
     const after = await installedVersion(join(shimDir, "ais"));
     console.log(`${prefix} ais ${before && after && before !== after ? `${before} -> ${after}` : `${after ?? "?"} (already the latest release)`}`);
   }
+
+  // A same-version download still replaces the file; restart the daemon only
+  // when the installed ais bytes really changed.
+  const aisUpdated = aisHashBefore !== (await fileHash(join(shimDir, "ais")));
 
   // The unit runs %h/.local/bin/ais, so only the default shim dir with an
   // installed ais gets it. Never fails the update: problems are warnings.

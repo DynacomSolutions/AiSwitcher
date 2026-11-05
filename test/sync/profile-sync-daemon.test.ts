@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLAUDE_CONFIG, ZAI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { startSessionWork, type SessionSpec } from "../../src/shared/session-sidecar.ts";
-import { acquireDaemonLock, createProfileSyncDaemon, ownsDaemonLock, watchTargets } from "../../src/sync/profile-sync-daemon.ts";
+import { acquireDaemonLock, createProfileSyncDaemon, daemonLockState, ownsDaemonLock, runProfileSyncDaemon, watchTargets } from "../../src/sync/profile-sync-daemon.ts";
 import { listLiveSessions, registerSession, unregisterSession, type RegisteredSession } from "../../src/sync/session-registry.ts";
 import type { SyncRunOptions } from "../../src/sync/types.ts";
 import { scanTree } from "../../src/sync/watch.ts";
@@ -313,6 +313,40 @@ describe("daemon single instance", () => {
     expect(readFileSync(lock, "utf8").startsWith(`${process.pid} `)).toBe(true);
     expect(readdirSync(dir)).toEqual(["daemon.pid"]);
     expect(acquireDaemonLock(lock, () => true)).toBe(true);
+  });
+
+  test("a running daemon recreates a removed lock and exits non-zero when another owner holds it", async () => {
+    const dir = tempDir();
+    const lock = join(dir, "daemon.pid");
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const run = runProfileSyncDaemon({ pollMs: 10, lockPath: lock, deps: { registryDir: join(dir, "sessions") } });
+      await Bun.sleep(30);
+      expect(daemonLockState(lock)).toBe("mine");
+      unlinkSync(lock);
+      await Bun.sleep(60);
+      expect(daemonLockState(lock)).toBe("mine");
+      // Unreadable or garbled content is not a reason to stop.
+      writeFileSync(lock, "garbage");
+      await Bun.sleep(60);
+      expect(daemonLockState(lock)).toBe("unknown");
+      writeFileSync(lock, "424242 777\n");
+      expect(await run).toBe(1);
+      expect(readFileSync(lock, "utf8")).toBe("424242 777\n");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test("a stopped daemon exits 0 and removes its own lock", async () => {
+    const dir = tempDir();
+    const lock = join(dir, "daemon.pid");
+    const controller = new AbortController();
+    const run = runProfileSyncDaemon({ pollMs: 10, lockPath: lock, signal: controller.signal, deps: { registryDir: join(dir, "sessions") } });
+    await Bun.sleep(30);
+    controller.abort();
+    expect(await run).toBe(0);
+    expect(existsSync(lock)).toBe(false);
   });
 
   test("a reused PID with a different start time does not hold the lock", () => {

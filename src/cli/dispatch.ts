@@ -123,7 +123,8 @@ export async function runCli(argv: string[]): Promise<void> {
         {
           if (boolFlag(flags, "check")) break;
           const { runProfileSyncDaemon } = await import("../sync/profile-sync-daemon.ts");
-          await runProfileSyncDaemon();
+          const code = await runProfileSyncDaemon();
+          if (code !== 0) process.exitCode = code;
           break;
         }
       case "__spend_refresh":

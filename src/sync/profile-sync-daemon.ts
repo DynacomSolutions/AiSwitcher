@@ -209,8 +209,9 @@ export function ownsDaemonLock(path = profileSyncDaemonLockPath()): boolean {
  * older than a short grace period. A lock whose owner is gone (PID plus start
  * time) is replaced by rename only if it still holds exactly the stale content
  * that was judged, and the result is re-read to confirm. The running daemon
- * also re-checks ownership every poll (ownsDaemonLock) and exits if it lost
- * the lock, so even a lost race cannot leave two daemons for long.
+ * also re-checks ownership every poll (daemonLockState) and exits non-zero if
+ * another process holds the lock, so even a lost race cannot leave two
+ * daemons for long.
  */
 export function acquireDaemonLock(path = profileSyncDaemonLockPath(), isRunning: IsRunning = isPidRunning): boolean {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -245,15 +246,44 @@ export function acquireDaemonLock(path = profileSyncDaemonLockPath(), isRunning:
   }
 }
 
-/** Body of `ais __profile_sync_daemon`. Runs until SIGTERM/SIGINT. */
-export async function runProfileSyncDaemon(options: { pollMs?: number } = {}): Promise<void> {
-  const lockPath = profileSyncDaemonLockPath();
+export type LockState = "mine" | "other" | "missing" | "unknown";
+
+/** Who holds the lock, judged by PID only. Read errors and unparseable
+ * content are "unknown": never a reason to stop. */
+export function daemonLockState(path: string, pid = process.pid): LockState {
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unknown";
+  }
+  const owner = lockOwner(content);
+  if (!owner) return "unknown";
+  return owner.pid === pid ? "mine" : "other";
+}
+
+export interface RunDaemonOptions {
+  pollMs?: number;
+  lockPath?: string;
+  /** Stops the loop (tests); SIGTERM/SIGINT do the same in production. */
+  signal?: AbortSignal;
+  deps?: DaemonDeps;
+}
+
+/**
+ * Body of `ais __profile_sync_daemon`. Runs until SIGTERM/SIGINT and returns
+ * the process exit code. Non-zero when another daemon holds the lock, so the
+ * user unit (Restart=on-failure) retries instead of staying dead. A lock that
+ * vanished is recreated; a transient read error is ignored.
+ */
+export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Promise<number> {
+  const lockPath = options.lockPath ?? profileSyncDaemonLockPath();
   if (!acquireDaemonLock(lockPath)) {
     console.error("ais: a profile sync daemon is already running");
-    return;
+    return 1;
   }
   const pollMs = options.pollMs ?? POLL_MS;
-  const daemon = createProfileSyncDaemon();
+  const daemon = createProfileSyncDaemon(options.deps);
   let stopped = false;
   let wake: (() => void) | undefined;
   const onSignal = () => {
@@ -262,11 +292,22 @@ export async function runProfileSyncDaemon(options: { pollMs?: number } = {}): P
   };
   process.once("SIGTERM", onSignal);
   process.once("SIGINT", onSignal);
+  options.signal?.addEventListener("abort", onSignal, { once: true });
+  if (options.signal?.aborted) stopped = true;
   try {
     while (!stopped) {
-      if (!ownsDaemonLock(lockPath)) {
+      const state = daemonLockState(lockPath);
+      if (state === "other") {
         console.error("ais: profile sync daemon lock taken by another process; exiting");
-        return;
+        return 1;
+      }
+      if (state === "missing") {
+        try {
+          if (!acquireDaemonLock(lockPath)) {
+            console.error("ais: profile sync daemon lock taken by another process; exiting");
+            return 1;
+          }
+        } catch { /* state dir unavailable right now: keep running, retry next poll */ }
       }
       try { await daemon.tick(); } catch { /* keep polling */ }
       if (stopped) break;
@@ -276,11 +317,13 @@ export async function runProfileSyncDaemon(options: { pollMs?: number } = {}): P
       });
       wake = undefined;
     }
+    return 0;
   } finally {
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
+    options.signal?.removeEventListener("abort", onSignal);
     try {
-      if (ownsDaemonLock(lockPath)) unlinkSync(lockPath);
+      if (daemonLockState(lockPath) === "mine") unlinkSync(lockPath);
     } catch { /* already gone */ }
   }
 }

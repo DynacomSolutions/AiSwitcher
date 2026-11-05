@@ -92,3 +92,18 @@ test("an unavailable systemd user manager only warns; the update still succeeds"
     expect(lines).toContain("done, updated");
   } finally { log.mockRestore(); }
 });
+
+test("re-downloading the same ais does not restart the profile sync service", async () => {
+  const shimDir = await shims("0.0.1");
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const calls: boolean[] = [];
+  try {
+    await runUpdate({
+      shimDir,
+      skipBackup: true,
+      fetchImpl: (async () => new Response("#!/bin/sh\necho 0.0.1\n")) as unknown as typeof fetch,
+      installProfileSyncService: async (restart) => (calls.push(restart), { status: "verified", path: "/u/ais-profile-sync.service", changed: false, action: "running" }),
+    });
+    expect(calls).toEqual([false]);
+  } finally { log.mockRestore(); }
+});
