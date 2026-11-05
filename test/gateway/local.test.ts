@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { GatewayCredentialError } from "../../src/gateway/credentials.ts";
-import { createLocalGateway, type LocalGatewayDeps, startLocalGateway, type LocalGateway } from "../../src/gateway/local.ts";
+import { remoteRefusal, createLocalGateway, type LocalGatewayDeps, startLocalGateway, type LocalGateway } from "../../src/gateway/local.ts";
 
 const enc = new TextEncoder();
 const CLIENT_KEY = String(Math.random());
@@ -106,11 +106,24 @@ describe("local gateway failover", () => {
     expect(calls[1]).toBe("https://chatgpt.com/backend-api/codex/responses");
   });
 
-  test("an edge 502, 503 or 504 (no gateway mark) falls back", async () => {
-    for (const status of [502, 503, 504]) {
-      const r = rig({ remote: () => new Response("no healthy upstream", { status }) });
+  test("an unmarked 502, or a 503 with an edge 'not served' body, falls back", async () => {
+    const cases: Array<[number, string]> = [[502, "bad gateway"], [503, "no healthy upstream"], [503, "upstream connect error or disconnect/reset before headers. reset reason: connection failure"], [503, "upstream_reset_before_response_started{overflow}"]];
+    for (const [status, text] of cases) {
+      const r = rig({ remote: () => new Response(text, { status }) });
       expect(await (await r.post()).text()).toBe("direct");
       expect(r.gw.status().mode).toBe("direct");
+    }
+  });
+
+  test("an unmarked 504, or a 503 with any other body (for example connection termination), passes through with no replay", async () => {
+    const cases: Array<[number, string]> = [[504, "no healthy upstream"], [503, "upstream connect error or disconnect/reset before headers. reset reason: connection termination"], [503, "service unavailable"]];
+    for (const [status, text] of cases) {
+      const r = rig({ remote: () => new Response(text, { status }) });
+      const res = await r.post();
+      expect(res.status).toBe(status);
+      expect(await res.text()).toBe(text);
+      expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
+      expect(r.gw.status().mode).toBe("remote");
     }
   });
 
@@ -126,10 +139,18 @@ describe("local gateway failover", () => {
   });
 
   test("pre-send errors fail over: refused, DNS, TLS handshake, connect timeout", async () => {
-    for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EPROTO", "CERT_HAS_EXPIRED", "ETIMEDOUT"]) {
+    for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EPROTO", "CERT_HAS_EXPIRED"]) {
       const r = rig({ remote: () => { throw coded(code); } });
       expect(await (await r.post()).text()).toBe("direct");
     }
+  });
+
+  test("ETIMEDOUT is pre-send only when the message shows a connect failure", async () => {
+    const connect = rig({ remote: () => { throw Object.assign(new TypeError("ETIMEDOUT: Unable to connect"), { code: "ETIMEDOUT" }); } });
+    expect(await (await connect.post()).text()).toBe("direct");
+    const established = rig({ remote: () => { throw Object.assign(new TypeError("ETIMEDOUT: socket timed out"), { code: "ETIMEDOUT" }); } });
+    expect((await established.post()).status).toBe(502);
+    expect(established.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
   });
 
   test("ECONNRESET after send is a 502 to the client with no direct call and no breaker", async () => {
@@ -372,6 +393,28 @@ describe("local gateway failover", () => {
     expect(r.calls).toHaveLength(1);
   });
 
+  test("a failing or dead member never aborts the loop; dead wins in the message only when every member is exhausted", async () => {
+    const r = rig({
+      members: ["a", "b", "c"],
+      remote: refused,
+      creds: { get: async (_p, identity) => { if (identity === "a") throw new GatewayCredentialError("refresh-failed", "codex", "a"); if (identity === "b") throw new GatewayCredentialError("login-dead", "codex", "b"); return { identity, accessToken: "tok-c" }; } },
+      upstream: () => new Response("from-c"),
+    });
+    expect(await (await r.post("/codex/responses")).text()).toBe("from-c");
+    const none = rig({
+      members: ["a", "b"],
+      remote: refused,
+      creds: { get: async (_p, identity) => { throw new GatewayCredentialError(identity === "a" ? "refresh-failed" : "login-dead", "codex", identity); } },
+    });
+    const res = await none.post("/codex/responses");
+    expect(res.status).toBe(401);
+    expect(JSON.stringify(await res.json())).toContain("codex --identity=b login");
+    const transient = rig({ members: ["a", "b"], remote: refused, creds: { get: async (_p, identity) => { throw new GatewayCredentialError("refresh-failed", "codex", identity); } } });
+    const tres = await transient.post("/codex/responses");
+    expect(tres.status).toBe(502);
+    expect(await tres.text()).not.toContain("logged out");
+  });
+
   test("every pool member is tried, in order, and a logged-out one is logged once", async () => {
     const seen: string[] = [];
     const r = rig({
@@ -414,5 +457,53 @@ describe("local gateway without a cluster URL", () => {
     const res = await gw.handle(new Request("http://127.0.0.1:47140/claude/v1/messages", { method: "POST", body: "{}", headers: { "x-api-key": CLIENT_KEY } }));
     expect(await res.text()).toBe("direct");
     expect(gw.status().mode).toBe("direct");
+  });
+});
+
+describe("remote URL guard and drain", () => {
+  test("loopback and own-address remotes are refused", () => {
+    for (const u of ["http://127.0.0.1:47140", "http://localhost:9", "http://[::1]:47140", "http://127.5.5.5", "http://0.0.0.0:1", "not a url"]) expect(remoteRefusal(u, 47140)).toBeDefined();
+    expect(remoteRefusal("https://gw.example.com", 47140)).toBeUndefined();
+  });
+
+  test("startLocalGateway with a loopback remote logs one warning and runs direct-only", async () => {
+    const logs: string[] = [];
+    const running = await startLocalGateway({ port: 0, remoteBase: "http://127.0.0.1:9", members: async () => [], log: (l) => logs.push(l), clientToken: async () => CLIENT_KEY });
+    try {
+      expect(logs.filter((l) => l.includes("remote refused"))).toHaveLength(1);
+      expect(running.gateway.status().mode).toBe("direct");
+    } finally {
+      running.stop();
+    }
+  });
+
+  test("drain lets an in-flight stream finish after stop is requested", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const upstream = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response(new ReadableStream({ async start(c) { c.enqueue(enc.encode("first;")); await gate; c.enqueue(enc.encode("last")); c.close(); } })) });
+    const running = await startLocalGateway({ port: 0, remoteBase: `http://remote.test`, fetch: ((u: string | URL | Request, i?: RequestInit) => fetch(String(u).replace("http://remote.test", `http://127.0.0.1:${upstream.port}`), i)) as typeof fetch, members: async () => [], log: () => {}, clientToken: async () => CLIENT_KEY });
+    try {
+      const res = await fetch(`http://127.0.0.1:${running.port}/claude/v1/messages`, { method: "POST", body: "{}", headers: { "x-api-key": CLIENT_KEY } });
+      const reader = res.body!.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe("first;");
+      let drained = false;
+      const draining = running.drain().then(() => (drained = true));
+      await Bun.sleep(50);
+      expect(drained).toBe(false); // still waiting on the in-flight stream
+      await expect(fetch(`http://127.0.0.1:${running.port}/__ais/status`)).rejects.toBeDefined(); // no new connections
+      release();
+      let rest = "";
+      for (;;) {
+        const r = await reader.read();
+        if (r.done) break;
+        rest += new TextDecoder().decode(r.value);
+      }
+      expect(rest).toBe("last");
+      await draining;
+      expect(drained).toBe(true);
+    } finally {
+      running.stop();
+      upstream.stop(true);
+    }
   });
 });

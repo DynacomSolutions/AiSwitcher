@@ -17,6 +17,8 @@ ExecStart=%h/.local/bin/ais gateway local
 # Ready only once the port listens, so units ordered After= this one (Herdr) never race the proxy. $$ is systemd's escape for a literal $.
 ExecStartPost=/usr/bin/env bash -c 'p=\$\${AIS_GATEWAY_LOCAL_PORT:-47140}; for i in $$(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$$p) 2>/dev/null && exit 0; sleep 0.1; done; exit 1'
 TimeoutStartSec=15s
+# The proxy drains on SIGTERM (in-flight streams finish) with no timer of its own; this is only the kill ceiling.
+TimeoutStopSec=15min
 Restart=always
 RestartSec=2s
 
@@ -31,7 +33,22 @@ export interface InstallLocalOptions {
   enableStartAndVerify?: (serviceName: string, restartIfActive: boolean) => Promise<void>;
   /** Restart an active proxy even when the unit text is unchanged (the ais binary was replaced). */
   restartIfActive?: boolean;
+  /** Release/host-update mode: enable and start only on first install; afterwards never re-enable, restart only an active unit. */
+  respectDisabled?: boolean;
+  isActive?: (serviceName: string) => Promise<boolean>;
+  restart?: (serviceName: string) => Promise<void>;
 }
+
+async function systemctlUser(args: string[]): Promise<{ code: number; out: string }> {
+  const child = Bun.spawn(["systemctl", "--user", ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+  return { code, out: out.trim() };
+}
+const unitActive = async (name: string): Promise<boolean> => (await systemctlUser(["is-active", name])).out === "active";
+const unitRestart = async (name: string): Promise<void> => {
+  const r = await systemctlUser(["restart", name]);
+  if (r.code !== 0) throw new Error(`systemctl --user restart ${name} failed`);
+};
 
 /** Atomically writes, enables and starts the per-user unit (same flow as the usage collector unit). */
 export async function installLocalGatewayService(options: InstallLocalOptions = {}): Promise<{ path: string; changed: boolean }> {
@@ -41,6 +58,7 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
   await mkdir(dir, { recursive: true });
   const path = join(dir, LOCAL_GATEWAY_SERVICE_NAME);
   const current = await readFile(path, "utf8").catch(() => undefined);
+  const existed = current !== undefined;
   const mode = await stat(path).then((s) => s.mode & 0o777, () => undefined);
   const changed = current !== LOCAL_GATEWAY_UNIT || mode !== 0o644;
   if (changed) {
@@ -55,6 +73,11 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
     }
   }
   await (options.reloadAndVerify ?? reloadAndVerifyUserUnit)(LOCAL_GATEWAY_SERVICE_NAME);
+  if (options.respectDisabled && existed) {
+    // A unit the user disabled or stopped stays that way; an active one picks up a new binary or unit text.
+    if ((changed || (options.restartIfActive ?? false)) && (await (options.isActive ?? unitActive)(LOCAL_GATEWAY_SERVICE_NAME))) await (options.restart ?? unitRestart)(LOCAL_GATEWAY_SERVICE_NAME);
+    return { path, changed };
+  }
   await (options.enableStartAndVerify ?? enableStartAndVerifyUserUnit)(LOCAL_GATEWAY_SERVICE_NAME, changed || (options.restartIfActive ?? false));
   return { path, changed };
 }

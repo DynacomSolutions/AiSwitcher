@@ -16,6 +16,8 @@ export const LOCAL_IDLE_MS = 10 * 60_000;
 export const LOCAL_BREAKER_MS = 30_000;
 export const LOCAL_STATUS_PATH = "/__ais/status";
 
+/** Edge (Envoy/Emissary) 503 bodies that mean the upstream pod could not be reached at all. */
+const EDGE_NOT_SERVED = /no healthy upstream|reset reason: connection failure|overflow/i;
 const MODEL_NOT_FOUND = /"code"\s*:\s*"model_not_found"/;
 
 type Tool = "claude" | "codex";
@@ -65,13 +67,16 @@ class RemoteOther extends Error {}
 
 /** Error codes that can only happen before any request byte reaches the gateway: connect refused or unreachable, DNS, TLS handshake and certificate failures, connect timeout. */
 const PRE_SEND_CODES = new Set([
-  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EAI_FAIL", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT", "ConnectionRefused", "ConnectionTimedOut",
+  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EAI_FAIL", "EHOSTUNREACH", "ENETUNREACH", "ConnectionRefused", "ConnectionTimedOut",
   "EPROTO", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_UNTRUSTED", "ERR_SSL_WRONG_VERSION_NUMBER",
 ]);
 
 export function isPreSendError(err: unknown): boolean {
   const code = (err as { code?: unknown } | null)?.code;
-  return typeof code === "string" && PRE_SEND_CODES.has(code);
+  if (typeof code !== "string") return false;
+  // A timeout can also hit an established connection: it counts only when the message shows the connect itself failed.
+  if (code === "ETIMEDOUT") return /unable to connect|connect/i.test(String((err as { message?: unknown }).message ?? ""));
+  return PRE_SEND_CODES.has(code);
 }
 
 class RemoteFailure extends Error {
@@ -158,8 +163,17 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
     }
-    // A 502/503/504 the gateway app did not mark came from an edge in front of it ("no healthy upstream"): it never served the request.
-    if ((res.status === 502 || res.status === 503 || res.status === 504) && res.headers.get(GATEWAY_MARK_HEADER) !== "1") throw new RemoteFailure(`http-${res.status}`, res);
+    // An unmarked answer came from an edge in front of the gateway, not from the gateway app.
+    if (res.headers.get(GATEWAY_MARK_HEADER) !== "1") {
+      if (res.status === 502) throw new RemoteFailure("http-502", res);
+      if (res.status === 503) {
+        // Only the edge's own "pod is gone" bodies prove the request was not served. Anything else (for example "connection termination") may have reached the app.
+        const p = await peek(res, 4096);
+        if (EDGE_NOT_SERVED.test(new TextDecoder().decode(p.bytes))) throw new RemoteFailure("http-503", p.res);
+        return p.res;
+      }
+      // A 504 is never replayed: the gateway may be mid-answer.
+    }
     return res;
   }
 
@@ -220,6 +234,7 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     if (names.length === 0) return providerError(style, 502, "no local login available for direct mode");
     let lastQuota: Response | undefined;
     let lastDead: GatewayCredentialError | undefined;
+    let lastTransient: GatewayCredentialError | undefined;
     try {
       for (const name of names) {
         let up: Response;
@@ -228,12 +243,15 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
           reportedLoggedOut.delete(name);
         } catch (err) {
           if (signal.aborted) throw err;
-          if (!(err instanceof GatewayCredentialError && err.loggedOut)) throw err;
-          lastDead = err;
-          if (!reportedLoggedOut.has(name)) {
-            reportedLoggedOut.add(name);
-            deps.log(`gateway-local: ${tool} member "${name}" is logged out, skipped (ais: ${loginCommand(tool, name)})`);
-          }
+          if (!(err instanceof GatewayCredentialError)) throw err;
+          // A dead or failing login never aborts the loop: the next member gets the request.
+          if (err.loggedOut) {
+            lastDead = err;
+            if (!reportedLoggedOut.has(name)) {
+              reportedLoggedOut.add(name);
+              deps.log(`gateway-local: ${tool} member "${name}" is logged out, skipped (ais: ${loginCommand(tool, name)})`);
+            }
+          } else lastTransient = err;
           continue;
         }
         if (!replayable) return clean(up);
@@ -247,7 +265,9 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
         lastQuota = q.res;
       }
       if (lastQuota) return clean(lastQuota);
+      // Every member is exhausted: a dead login wins over a transient failure in the message.
       if (lastDead) throw lastDead;
+      if (lastTransient) throw lastTransient;
       return providerError(style, 502, "direct upstream request failed");
     } catch (err) {
       if (lastQuota) await discard(lastQuota);
@@ -353,6 +373,20 @@ export async function defaultLocalMembers(tool: Tool): Promise<string[]> {
   return active && live.includes(active) ? [active, ...live.filter((n) => n !== active)] : live;
 }
 
+/** Why a remote must not be used (it would loop back into this proxy or another local listener), or undefined when it is fine. */
+export function remoteRefusal(remoteBase: string, ownPort: number): string | undefined {
+  let u: URL;
+  try {
+    u = new URL(remoteBase);
+  } catch {
+    return "not a valid URL";
+  }
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "0.0.0.0" || host === "::" || /^127\./.test(host);
+  if (loopback) return `loopback host (${u.host}); ${u.port === String(ownPort) ? "that is this proxy" : "a local listener is not the cluster gateway"}`;
+  return undefined;
+}
+
 export interface StartLocalOptions {
   port?: number;
   remoteBase?: string;
@@ -368,7 +402,7 @@ export interface StartLocalOptions {
 }
 
 /** Starts the loopback-only listener. It never binds anything but 127.0.0.1. */
-export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{ host: string; port: number; gateway: LocalGateway; stop(): void }> {
+export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{ host: string; port: number; gateway: LocalGateway; stop(): void; drain(): Promise<void> }> {
   const { CredentialCache } = await import("./credentials.ts");
   const { appTokenKey, readSecretsKey } = await import("../cli/gateway/secrets-file.ts");
   const now = opts.now ?? Date.now;
@@ -382,15 +416,23 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     return value;
   });
   let boundPort = 0;
+  const log = opts.log ?? ((line: string) => console.info(line));
+  let remoteBase = opts.remoteBase ?? "";
+  const bindPort = opts.port ?? LOCAL_GATEWAY_DEFAULT_PORT;
+  const refusal = remoteBase ? remoteRefusal(remoteBase, bindPort) : undefined;
+  if (refusal) {
+    log(`gateway-local: warning: remote refused (${refusal}); running direct-only`);
+    remoteBase = "";
+  }
   const gateway = createLocalGateway({
-    remoteBase: opts.remoteBase ?? "",
+    remoteBase,
     clientToken,
     allowedHosts: () => [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`],
     fetch: opts.fetch ?? fetch,
     now,
     creds: opts.creds ?? new CredentialCache(),
     members: opts.members ?? defaultLocalMembers,
-    log: opts.log ?? ((line) => console.info(line)),
+    log,
     ...(opts.idleMs !== undefined ? { idleMs: opts.idleMs } : {}),
     ...(opts.breakerMs !== undefined ? { breakerMs: opts.breakerMs } : {}),
   });
@@ -401,5 +443,12 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     fetch: (req) => gateway.handle(req).catch(() => providerError("openai", 500, "gateway error")),
   });
   boundPort = server.port as number;
-  return { host: server.hostname as string, port: server.port as number, gateway, stop: () => void server.stop(true) };
+  return {
+    host: server.hostname as string,
+    port: server.port as number,
+    gateway,
+    stop: () => void server.stop(true),
+    // Graceful: no new connections, in-flight requests (streams) run to completion; resolves when the last one ends.
+    drain: () => server.stop(false),
+  };
 }

@@ -118,7 +118,17 @@ interface TokenResponseWire {
   access_token?: string;
   refresh_token?: string;
   expires_in?: number;
-  error?: string;
+  /** RFC 6749 string code, or the object shape `{ code, message }` some endpoints (Codex) send. */
+  error?: string | { code?: string; message?: string };
+}
+
+/** Refresh-token codes that mean only a new login helps. invalid_grant is the RFC code; the refresh_token_* codes are what the OpenAI/Codex endpoint sends. */
+export const DEAD_REFRESH_CODES: ReadonlySet<string> = new Set(["invalid_grant", "refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"]);
+
+function oauthErrorCode(parsed: TokenResponseWire): string | undefined {
+  const e = parsed.error;
+  if (typeof e === "string") return e;
+  return e && typeof e.code === "string" ? e.code : undefined;
 }
 
 /** One RFC 6749 refresh_token grant POST. Injectable fetch for tests — no
@@ -150,7 +160,7 @@ export async function postRefreshTokenGrant(
     // A non-JSON error body is fine; the status check below reports it.
   }
   if (!response.ok) {
-    const code = typeof parsed.error === "string" ? parsed.error : undefined;
+    const code = oauthErrorCode(parsed);
     const revoked = response.status === 400 || response.status === 401 || code === "invalid_grant" || code === "invalid_client";
     throw new OAuthRefreshError(
       `token refresh rejected (HTTP ${response.status}${code ? ` ${code}` : ""})`,
@@ -580,6 +590,8 @@ export interface IdentityGrantRefresh {
   identity: string;
   outcome: "refreshed" | "skipped-fresh" | "skipped-revoked" | "no-grant" | "failed";
   detail: string;
+  /** Set on a "no-grant" that came from a store read error: transient, never a logged-out identity. */
+  readError?: boolean;
   beforeFingerprint?: string;
   afterFingerprint?: string;
   /** New access-token expiry (unix seconds) on success. */
@@ -663,10 +675,14 @@ export async function refreshIdentityOAuthGrant(
   const poolDirs = await poolStoreDirsFor(identity, registryPath, tool);
   if (!options.force) {
     // Cheap pre-check without locks: don't contend with Claude Code when there is nothing to do.
-    const peek = await freshestGrant(tool, identity, registryPath, poolDirs).catch(() => undefined);
+    let peekFailed = false;
+    const peek = await freshestGrant(tool, identity, registryPath, poolDirs).catch(() => {
+      peekFailed = true;
+      return undefined;
+    });
     if (!peek?.grant.refresh_token) {
       return {
-        tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [],
+        tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], ...(peekFailed ? { readError: true } : {}),
         detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
       };
     }
@@ -728,11 +744,16 @@ async function refreshGrantUnlocked(
   }
   if (pooled) await convergeClaudePoolStores(identity, registryPath, options.locksHeld, options.lockedPoolDirs, tool).catch(() => undefined);
 
-  const freshest = await freshestGrant(tool, identity, registryPath, options.lockedPoolDirs).catch(() => undefined);
+  let readFailed = false;
+  const freshest = await freshestGrant(tool, identity, registryPath, options.lockedPoolDirs).catch(() => {
+    readFailed = true;
+    return undefined;
+  });
   if (!freshest || !freshest.grant.refresh_token) {
     return {
       ...base,
       outcome: "no-grant",
+      ...(readFailed ? { readError: true } : {}),
       detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
     };
   }

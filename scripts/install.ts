@@ -70,7 +70,7 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
   // The local gateway failover proxy rides the same binary: restart it when the binary changed, install it when missing.
   if (result.status === "installed" || result.status === "verified") {
     try {
-      const unit = await installLocalGatewayService({ restartIfActive: aisBinaryChanged });
+      const unit = await installLocalGatewayService({ restartIfActive: aisBinaryChanged, respectDisabled: true });
       console.error(`install: gateway local service ${unit.changed ? "installed" : "verified"}: ${unit.path}`);
     } catch (err) {
       console.error(`install: gateway local service skipped: ${err instanceof Error ? err.message : String(err)}`);

@@ -1,9 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
-import { readSecretsKey } from "./secrets-file.ts";
+import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
 import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
 import { LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
@@ -55,18 +52,15 @@ async function runLocal(args: string[], deps: GatewayCliDeps): Promise<void> {
     return;
   }
   if (args.length > 0) throw new CliUsageError("Usage: ais gateway local [install|status]");
-  // The cluster gateway base comes from the same place `ais gateway app` reads it (AIS_GATEWAY_PROXY_URL in ~/.secrets); only the override is local.
-  // The last URL found is remembered, so a unit started without ~/.secrets still knows it. With none at all the proxy runs direct-only.
-  const rememberPath = join(homedir(), ".ais", "gateway-local-remote");
-  const found = process.env.AIS_GATEWAY_REMOTE_URL || process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
-  if (found && !process.env.AIS_GATEWAY_REMOTE_URL) await mkdir(dirname(rememberPath), { recursive: true }).then(() => writeFile(rememberPath, `${found}\n`, { mode: 0o600 })).catch(() => undefined);
-  const remoteBase = found || (await readFile(rememberPath, "utf8").then((t) => t.trim(), () => ""));
-  if (!remoteBase) console.warn("gateway local: no cluster gateway URL known (AIS_GATEWAY_PROXY_URL); running direct-only");
+  const remoteBase = await resolveRemoteBase();
   const running = await startLocalGateway({ port, remoteBase });
   console.info(`gateway local: listening on 127.0.0.1:${running.port}`);
+  // Drain: stop accepting, let in-flight streams finish, then exit. No drain timer; systemd's TimeoutStopSec is the kill ceiling.
+  let stopping = false;
   const stop = (): void => {
-    running.stop();
-    process.exit(0);
+    if (stopping) return;
+    stopping = true;
+    void running.drain().then(() => process.exit(0));
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);

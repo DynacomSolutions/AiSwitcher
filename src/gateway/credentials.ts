@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { codexAccountOf, jwtAccountId, parseCodexAuth, readCodexAuthText } from "../identities/codex-auth.ts";
 import { readAliApiKey } from "../identities/ali-auth.ts";
 import { nativeStorePathFor } from "../identities/oauth-reconcile.ts";
-import { effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
@@ -264,8 +264,8 @@ export class CredentialCache {
       result = await this.refresh(provider as RefreshableTool, id, { force: true, expectedAccessToken: staleToken });
     } catch (err) {
       // Raw errors can carry lock paths or provider text: keep them as `cause` only.
-      // Only a real OAuth invalid_grant in the token endpoint's body proves the login is gone; any other 400/401 is not enough.
-      const revoked = err instanceof OAuthRefreshError && err.revoked && err.oauthCode === "invalid_grant";
+      // Only a dead-grant OAuth code (invalid_grant, refresh_token_expired/reused/invalidated) in the token endpoint's body proves the login is gone; any other 400/401 is not enough.
+      const revoked = err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode);
       throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
@@ -273,7 +273,7 @@ export class CredentialCache {
     if (next.accessToken !== staleToken) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
     // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
-    const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id)) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" ? "refresh-failed" : "token-unchanged";
+    const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" ? "refresh-failed" : "token-unchanged";
     throw new GatewayCredentialError(code, provider, identity);
   }
 

@@ -309,6 +309,14 @@ describe("postRefreshTokenGrant", () => {
     }
   });
 
+  test("the object error shape { error: { code } } yields the OAuth code, string shape too", async () => {
+    for (const [wire, expected] of [[{ error: { code: "refresh_token_expired", message: "x" } }, "refresh_token_expired"], [{ error: "invalid_grant" }, "invalid_grant"], [{ error: { message: "no code" } }, undefined]] as const) {
+      const { fetchImpl } = stubFetch([wire], [400]);
+      const err = (await postRefreshTokenGrant(OPENAI_CODEX_TOKEN_URL, { refresh_token: "rt-dead-1" }, { fetchImpl }).catch((e: unknown) => e)) as OAuthRefreshError;
+      expect(err.oauthCode).toBe(expected);
+    }
+  });
+
   test("a 5xx is transient, not revoked", async () => {
     const { fetchImpl } = stubFetch([{ error: "server_error" }], [503]);
     try {

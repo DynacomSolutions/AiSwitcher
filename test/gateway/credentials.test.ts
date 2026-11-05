@@ -108,6 +108,22 @@ describe("CredentialCache", () => {
     }
   });
 
+  test("the Codex dead-grant codes count as a dead login; unknown codes do not", async () => {
+    for (const code of ["refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated", "invalid_grant"]) {
+      const c = makeCache(async () => { throw new OAuthRefreshError("rejected", true, undefined, code); });
+      expect(((await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError).code).toBe("login-dead");
+    }
+    const other = makeCache(async () => { throw new OAuthRefreshError("rejected", true, undefined, "invalid_client"); });
+    expect(((await other.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError).code).toBe("refresh-failed");
+  });
+
+  test("a no-grant caused by a store read error is transient, not a dead login", async () => {
+    const c = makeCache(async () => refreshed({ outcome: "no-grant", readError: true }));
+    const err = (await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(err.code).toBe("refresh-failed");
+    expect(err.loggedOut).toBe(false);
+  });
+
   test("no-grant is a dead login for a plain identity but only transient for a swap pool identity", async () => {
     const noGrant = async () => refreshed({ outcome: "no-grant" });
     const plain = makeCache(noGrant);
