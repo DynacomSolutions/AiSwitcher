@@ -15,12 +15,14 @@ import { collectSpendGuardDoctor } from "../../spend/doctor.ts";
 export async function runDoctorCommand(flags: ParsedArgs["flags"]): Promise<void> {
   const [results, spendRows] = await Promise.all([runDoctorQuery(flags), collectSpendGuardDoctor().catch(() => [])]);
   const all = [...results, ...spendRows];
+  const local = await fetchLocalStatus();
   if (boolFlag(flags, "json")) {
-    console.log(JSON.stringify(all, null, 2));
+    // The proxy state rides along as a last row, so existing consumers of the array keep working.
+    const proxy = local ? { gatewayLocal: { running: true, mode: local.mode, sinceMs: local.sinceMs, ...(local.probeAtMs !== undefined ? { probeAtMs: local.probeAtMs } : {}) } } : { gatewayLocal: { running: false } };
+    console.log(JSON.stringify([...all, proxy], null, 2));
     return;
   }
   console.log(formatDoctorReport(all));
-  const local = await fetchLocalStatus();
   console.log(
     local
       ? `\nGateway local proxy: running, ${local.mode === "direct" ? "DIRECT mode (cluster gateway unreachable)" : "remote mode"} since ${new Date(local.sinceMs).toISOString()}`

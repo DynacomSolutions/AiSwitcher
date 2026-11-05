@@ -10,7 +10,10 @@ import { adapterFor } from "./providers/index.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 
 export const LOCAL_GATEWAY_DEFAULT_PORT = 47140;
-export const LOCAL_FIRST_BYTE_MS = 5_000;
+/** Fail over only when the request provably never reached the cluster gateway: a connect failure or a connect that takes this long. */
+export const LOCAL_CONNECT_MS = 5_000;
+/** Once connected, wait for the answer this long before giving up. Slowness never triggers a replay. */
+export const LOCAL_IDLE_MS = 10 * 60_000;
 export const LOCAL_BREAKER_MS = 30_000;
 export const LOCAL_STATUS_PATH = "/__ais/status";
 
@@ -34,7 +37,10 @@ export interface LocalGatewayDeps {
   members(tool: Tool): Promise<string[]>;
   /** One line per state change; never carries tokens or bodies. */
   log(line: string): void;
-  firstByteMs?: number;
+  connectMs?: number;
+  idleMs?: number;
+  /** True when a TCP connection to the remote can be made (used only after connectMs without an answer). Defaults to a real TCP connect. */
+  reachable?: (remoteBase: string, timeoutMs: number) => Promise<boolean>;
   breakerMs?: number;
 }
 
@@ -51,6 +57,9 @@ export interface LocalGateway {
   status(): LocalGatewayStatus;
 }
 
+/** The cluster gateway took longer than the idle ceiling: reported to the client, never replayed. */
+class RemoteIdle extends Error {}
+
 class RemoteFailure extends Error {
   constructor(readonly reason: string, readonly response?: Response) {
     super(reason);
@@ -66,7 +75,9 @@ async function discard(res: Response): Promise<void> {
 }
 
 export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
-  const firstByteMs = deps.firstByteMs ?? LOCAL_FIRST_BYTE_MS;
+  const connectMs = deps.connectMs ?? LOCAL_CONNECT_MS;
+  const idleMs = deps.idleMs ?? LOCAL_IDLE_MS;
+  const reachable = deps.reachable ?? tcpReachable;
   const breakerMs = deps.breakerMs ?? LOCAL_BREAKER_MS;
   const remoteBase = deps.remoteBase.replace(/\/+$/, "");
   let mode: "remote" | "direct" = "remote";
@@ -108,11 +119,29 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
       init.duplex = "half";
     }
     const ctrl = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      ctrl.abort();
-    }, firstByteMs);
+    let settled = false;
+    let verdict: "unreachable" | "idle" | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (ms: number, onFire: () => void): void => {
+      timer = setTimeout(onFire, ms);
+    };
+    // Phase 1: connect window. If no answer came in connectMs, check the TCP connection separately.
+    // Reachable means the request is with the gateway: keep waiting. Not reachable means it never got there.
+    arm(connectMs, () => {
+      void reachable(remoteBase, connectMs).then((ok) => {
+        if (settled) return;
+        if (!ok) {
+          verdict = "unreachable";
+          ctrl.abort();
+          return;
+        }
+        // Phase 2: sent, so never replay on slowness; only a long idle ceiling.
+        arm(idleMs, () => {
+          verdict = "idle";
+          ctrl.abort();
+        });
+      });
+    });
     const onAbort = (): void => ctrl.abort();
     signal.addEventListener("abort", onAbort, { once: true });
     init.signal = ctrl.signal;
@@ -121,8 +150,10 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
       res = await deps.fetch(`${remoteBase}/${app}${rest}${url.search}`, init);
     } catch (err) {
       if (signal.aborted) throw err;
-      throw new RemoteFailure(timedOut ? "timeout" : "unreachable");
+      if (verdict === "idle") throw new RemoteIdle();
+      throw new RemoteFailure("unreachable");
     } finally {
+      settled = true;
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
     }
@@ -266,6 +297,10 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
         remoteOk(isProbe || (!replayable && mode === "direct"));
         return clean(res);
       } catch (err) {
+        if (err instanceof RemoteIdle) {
+          if (isProbe) probing = false;
+          return providerError(style, 504, "cluster gateway did not answer in time");
+        }
         if (!(err instanceof RemoteFailure)) {
           if (isProbe) probing = false;
           return new Response(null, { status: 499 });
@@ -307,7 +342,9 @@ export interface StartLocalOptions {
   now?: () => number;
   creds?: LocalGatewayDeps["creds"];
   members?: LocalGatewayDeps["members"];
-  firstByteMs?: number;
+  connectMs?: number;
+  idleMs?: number;
+  reachable?: LocalGatewayDeps["reachable"];
   breakerMs?: number;
 }
 
@@ -321,7 +358,9 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     creds: opts.creds ?? new CredentialCache(),
     members: opts.members ?? defaultLocalMembers,
     log: opts.log ?? ((line) => console.info(line)),
-    ...(opts.firstByteMs !== undefined ? { firstByteMs: opts.firstByteMs } : {}),
+    ...(opts.connectMs !== undefined ? { connectMs: opts.connectMs } : {}),
+    ...(opts.idleMs !== undefined ? { idleMs: opts.idleMs } : {}),
+    ...(opts.reachable ? { reachable: opts.reachable } : {}),
     ...(opts.breakerMs !== undefined ? { breakerMs: opts.breakerMs } : {}),
   });
   const server = Bun.serve({
@@ -331,4 +370,25 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     fetch: (req) => gateway.handle(req).catch(() => providerError("openai", 500, "gateway error")),
   });
   return { host: server.hostname as string, port: server.port as number, gateway, stop: () => void server.stop(true) };
+}
+
+async function tcpReachable(remoteBase: string, timeoutMs: number): Promise<boolean> {
+  const { connect } = await import("node:net");
+  let u: URL;
+  try {
+    u = new URL(remoteBase);
+  } catch {
+    return false;
+  }
+  const port = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+  return new Promise<boolean>((resolve) => {
+    const sock = connect({ host: u.hostname, port, timeout: timeoutMs });
+    const done = (ok: boolean): void => {
+      sock.destroy();
+      resolve(ok);
+    };
+    sock.once("connect", () => done(true));
+    sock.once("timeout", () => done(false));
+    sock.once("error", () => done(false));
+  });
 }

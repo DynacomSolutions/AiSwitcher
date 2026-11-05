@@ -58,11 +58,30 @@ export class RefreshCooldownError extends Error {
   }
 }
 
-/** The normal AIS way to log an identity back in (identity selection by `--identity=`, as for every launcher). */
+/**
+ * The normal AIS way to log an identity back in. Verified against the code:
+ * - `<tool> --identity=<name>` launches the tool under that identity (src/shared/cli-args.ts IDENTITY_PREFIXES,
+ *   src/cli/launch.ts shimLaunchArgs); the login step inside it comes from REFRESH_HINTS in
+ *   src/identities/oauth-refresh.ts (claude: `/login`; codex and grok: `<tool> login`; kimi: just run it).
+ * - ali is the only tool with `ais auth login` (src/cli/auth/dispatch.ts, src/cli/identities/retire.ts).
+ * - zai: docs/agents/history.md (`zai --identity=<name> auth login`).
+ */
 export function loginCommand(provider: GatewayProvider, identity: string): string {
-  if (provider === "claude") return `claude --identity=${identity}  (then run /login inside it)`;
-  if (provider === "codex") return `codex --identity=${identity} login`;
-  return `${provider} --identity=${identity} auth login`;
+  switch (provider) {
+    case "claude":
+      return `claude --identity=${identity}, then run /login inside it`;
+    case "codex":
+    case "grok":
+      return `${provider} --identity=${identity} login`;
+    case "kimi":
+      return `kimi --identity=${identity}, then sign in when it asks`;
+    case "ali":
+      return `ais auth login ${identity} --tool=ali`;
+    case "zai":
+      return `zai --identity=${identity} auth login`;
+    case "opencode":
+      return `opencode --identity=${identity}, then sign in when it asks`;
+  }
 }
 
 /** Generic credential failure; `code` is a stable reason, the message never carries paths or token values. */

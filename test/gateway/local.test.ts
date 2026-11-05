@@ -13,7 +13,7 @@ interface Call {
 }
 
 /** Fake network: `remote` answers REMOTE urls, `upstream` answers provider urls; every call is recorded. */
-function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream?: (c: Call, identity: string) => Response | Promise<Response>; creds?: Partial<LocalGatewayDeps["creds"]>; now?: number; members?: string[]; breakerMs?: number; firstByteMs?: number }) {
+function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream?: (c: Call, identity: string) => Response | Promise<Response>; creds?: Partial<LocalGatewayDeps["creds"]>; now?: number; members?: string[]; breakerMs?: number; connectMs?: number; idleMs?: number; reachable?: boolean }) {
   const calls: Call[] = [];
   const logs: string[] = [];
   const tokenOf: Record<string, string> = { a: "tok-a", b: "tok-b" };
@@ -44,7 +44,9 @@ function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream
     members: async () => opts.members ?? ["a", "b"],
     log: (l) => logs.push(l),
     ...(opts.breakerMs !== undefined ? { breakerMs: opts.breakerMs } : {}),
-    ...(opts.firstByteMs !== undefined ? { firstByteMs: opts.firstByteMs } : {}),
+    ...(opts.connectMs !== undefined ? { connectMs: opts.connectMs } : {}),
+    ...(opts.idleMs !== undefined ? { idleMs: opts.idleMs } : {}),
+    reachable: async () => opts.reachable ?? true,
   });
   const post = (path = "/claude/v1/messages", body = '{"model":"m"}') =>
     gw.handle(new Request(`http://127.0.0.1:47140${path}`, { method: "POST", body, headers: { "x-api-key": CLIENT_KEY } }));
@@ -109,11 +111,27 @@ describe("local gateway failover", () => {
     }
   });
 
-  test("remote timeout to first byte falls back", async () => {
-    const r = rig({ firstByteMs: 20, remote: () => new Promise<Response>(() => {}) });
+  test("a slow first byte is never replayed and does not open the breaker", async () => {
+    const r = rig({ connectMs: 15, remote: () => new Promise<Response>((resolve) => setTimeout(() => resolve(new Response("slow-remote")), 120)) });
     const res = await r.post();
-    expect(await res.text()).toBe("direct");
-    expect(r.logs[0]).toContain("timeout");
+    expect(await res.text()).toBe("slow-remote");
+    expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
+    expect(r.gw.status().mode).toBe("remote");
+    expect(r.logs).toHaveLength(0);
+  });
+
+  test("a connect that never completes (not reachable after the connect window) fails over", async () => {
+    const r = rig({ connectMs: 15, reachable: false, remote: () => new Promise<Response>(() => {}) });
+    expect(await (await r.post()).text()).toBe("direct");
+    expect(r.logs[0]).toContain("unreachable");
+  });
+
+  test("past the idle ceiling the client gets a 504 and nothing is replayed", async () => {
+    const r = rig({ connectMs: 10, idleMs: 30, remote: () => new Promise<Response>(() => {}) });
+    const res = await r.post();
+    expect(res.status).toBe(504);
+    expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
+    expect(r.gw.status().mode).toBe("remote");
   });
 
   test("remote 401 and 400 do not fall back", async () => {
