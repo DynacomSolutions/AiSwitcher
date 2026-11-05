@@ -152,7 +152,7 @@ ETA: 2026-11-06 18:00 ICT
 | 118 | Redeploy ais console and auto-redeploy on every AIS release | done | | | | | .cluster PRs #2074, #2076, #2078; DynacomDevWatcher #49; AiSwitcher https://github.com/DynacomSolutions/AiSwitcher/pull/350 (kubectl built from source for CVEs).<br>Verified: AiSwitcher main merge auto-built and rolled ais pod to ais-console:main@sha256:d3040120. |
 | 124 | Usage collector: stop re-reading unchanged Claude transcripts each cycle | done | claude-20261105-usage-incremental | ais-usage-incremental | | | PR https://github.com/DynacomSolutions/AiSwitcher/pull/371 merged as a8b1871.<br>Warm scans stay incremental (subagent sidecar dependency plus stat-only cache).<br>Was 123. |
 | 125 | Usage collector: derive daily usage from the native export, no second hourly scan | done | claude-20261105-usage-hourly | ais-usage-hourly-patched | | | PR https://github.com/DynacomSolutions/AiSwitcher/pull/377 merged as e1b5b93.<br>Collector no longer runs `bunx tokscale@latest hourly`; daily figures come from the native export. |
-| 126 | Native daily usage: exporter zone, chrono-tz names, patched-binary fixture, dead bunx code | in_progress | claude-20261106-usage-daily-zone | ais-usage-daily-zone | | 2026-11-06 18:00 ICT | Review follow-up to 5.125: L1 zone source, L2 zone names, L3 fixture; removes the bunx report path. |
+| 126 | Native daily usage: exporter zone, chrono-tz names, patched-binary fixture, dead bunx code | in_review | claude-20261106-usage-daily-zone | ais-usage-daily-zone | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/378.<br>Review follow-up to 5.125: L1 zone source, L2 zone names, L3 fixture; removes the bunx report path. |
 
 ## 6. Browser control extension
 ETA: 2026-11-06 18:00 ICT
