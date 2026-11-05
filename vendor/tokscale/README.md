@@ -34,8 +34,9 @@ The patch adds three AIS-only surfaces:
   names its `agentType` never reads its parent session, so the parent is no
   longer a cache dependency of that subagent: a long-running parent session no
   longer forces every one of its subagents to be re-parsed on each scan. The
-  sidecar stays watched, and a subagent without a named type still follows
-  its parent. With `TOKSCALE_AIS_STAT_ONLY_CACHE=1`, an exact size and
+  sidecar stays watched: when it changes or is removed, the parent is probed
+  and recorded again, and a subagent without a named type still follows its
+  parent. With `TOKSCALE_AIS_STAT_ONLY_CACHE=1`, an exact size and
   nanosecond mtime match is a cache hit without reading the bounded content
   samples, so an unchanged transcript is only stat'ed. Appended transcripts
   still resume from their checkpoint (the cached prefix is re-hashed, then only

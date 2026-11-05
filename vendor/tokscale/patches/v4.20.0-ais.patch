@@ -2243,7 +2243,7 @@ diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
 +                        .push(path.to_path_buf());
                      let parsed = sessions::claudecode::parse_claude_file_with_checkpoint(
                          path,
-@@ -14419,4 +14440,154 @@ mod tests {
+@@ -14419,4 +14440,324 @@ mod tests {
      }
  
 +    fn ais_incremental_claude_row(session: &str, sidechain: bool, id: &str, input: i64) -> String {
@@ -2396,6 +2396,176 @@ diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
 +        assert_eq!(after_meta_removed, cold(home.path()));
 +    }
 +
++    /// Removing the sidecar while the subagent transcript is unchanged must
++    /// record the parent again, so a later spawn link in the parent still
++    /// names the agent exactly as a cold scan does.
++    #[test]
++    #[serial_test::serial]
++    fn ais_incremental_removed_sidecar_restores_parent_dependency() {
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let project = home.path().join(".claude/projects/ais-incremental");
++        let parent = project.join("parent-session.jsonl");
++        let subagents = project.join("parent-session/subagents");
++        let child = subagents.join("agent-abc123.jsonl");
++        let meta = subagents.join("agent-abc123.meta.json");
++        std::fs::create_dir_all(&subagents).unwrap();
++        let row = |sidechain: bool, id: &str| {
++            format!(
++                "{}\n",
++                serde_json::json!({
++                    "type": "assistant", "isSidechain": sidechain,
++                    "sessionId": "parent-session", "agentId": "abc123",
++                    "timestamp": "2026-01-01T00:00:00Z", "requestId": format!("req-{id}"),
++                    "message": {"id": format!("msg-{id}"), "model": "claude-sonnet-4",
++                        "usage": {"input_tokens": 10, "output_tokens": 1}}
++                })
++            )
++        };
++        std::fs::write(&parent, row(false, "p1")).unwrap();
++        std::fs::write(&child, row(true, "c1")).unwrap();
++        std::fs::write(&meta, r#"{"agentType":"explore"}"#).unwrap();
++
++        let scan = |home: &std::path::Path| {
++            ais_incremental_totals(&parse_all_messages_with_pricing(
++                home.to_str().unwrap(),
++                &["claude".to_string()],
++                None,
++            ))
++        };
++        let cold = |home: &std::path::Path| {
++            let fresh_cache = tempfile::TempDir::new().unwrap();
++            let _env = redirect_cache_home(fresh_cache.path());
++            scan(home)
++        };
++
++        {
++            let _env = redirect_cache_home(cache_home.path());
++            scan(home.path());
++            std::fs::remove_file(&meta).unwrap();
++            scan(home.path());
++        }
++        let spawn = serde_json::json!({"type": "assistant", "sessionId": "parent-session",
++            "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "Agent",
++            "input": {"subagent_type": "planner"}}]}});
++        let result = serde_json::json!({"type": "user", "sessionId": "parent-session",
++            "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1",
++            "content": [{"type": "text", "text": "done agentId: abc123"}]}]}});
++        ais_incremental_append(&parent, &format!("{spawn}\n{result}\n"));
++
++        let warm = {
++            let _env = redirect_cache_home(cache_home.path());
++            scan(home.path())
++        };
++        let expected = cold(home.path());
++        assert!(
++            expected.3.iter().any(|agent| agent.contains("lanner")),
++            "{expected:?}"
++        );
++        assert_eq!(warm, expected, "warm attribution must equal a cold scan");
++    }
++
++    /// An entry cached before this change still lists the parent session. A
++    /// named subagent that later grows resumes from its checkpoint instead of
++    /// being parsed again from byte 0.
++    #[test]
++    #[serial_test::serial]
++    fn ais_incremental_legacy_entry_with_parent_resumes_named_subagent() {
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let project = home.path().join(".claude/projects/ais-incremental");
++        let parent = project.join("parent-session.jsonl");
++        let subagents = project.join("parent-session/subagents");
++        let named = subagents.join("agent-named.jsonl");
++        std::fs::create_dir_all(&subagents).unwrap();
++        std::fs::write(
++            &parent,
++            ais_incremental_claude_row("parent-session", false, "p1", 10),
++        )
++        .unwrap();
++        std::fs::write(
++            &named,
++            ais_incremental_claude_row("parent-session", true, "n1", 20),
++        )
++        .unwrap();
++        std::fs::write(
++            subagents.join("agent-named.meta.json"),
++            r#"{"agentType":"explore"}"#,
++        )
++        .unwrap();
++        let scan = |home: &std::path::Path| {
++            ais_incremental_totals(&parse_all_messages_with_pricing(
++                home.to_str().unwrap(),
++                &["claude".to_string()],
++                None,
++            ))
++        };
++
++        {
++            let _env = redirect_cache_home(cache_home.path());
++            scan(home.path());
++            // Rewrite the entry the way the previous release stored it: with
++            // the parent session among its related files.
++            let mut cache = message_cache::SourceMessageCache::load();
++            let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
++            let mut entry = cache
++                .get(identity, &named)
++                .expect("named subagent is cached");
++            assert!(entry.claude_checkpoint.is_some());
++            let legacy =
++                message_cache::SourceFingerprint::from_claude_code_path_with_home(&named, None)
++                    .unwrap();
++            assert!(legacy
++                .related_files
++                .iter()
++                .any(|related| related.suffix.starts_with("parent-session-")));
++            entry.fingerprint.related_files.extend(
++                legacy
++                    .related_files
++                    .into_iter()
++                    .filter(|related| related.suffix.starts_with("parent-session-")),
++            );
++            entry
++                .fingerprint
++                .related_files
++                .sort_by(|left, right| left.suffix.cmp(&right.suffix));
++            cache.insert(entry);
++            cache.save_if_dirty();
++            let reloaded = message_cache::SourceMessageCache::load()
++                .get(identity, &named)
++                .unwrap();
++            assert!(reloaded
++                .fingerprint
++                .related_files
++                .iter()
++                .any(|related| related.suffix.starts_with("parent-session-")));
++        }
++
++        ais_incremental_append(
++            &parent,
++            &ais_incremental_claude_row("parent-session", false, "p2", 30),
++        );
++        ais_incremental_append(
++            &named,
++            &ais_incremental_claude_row("parent-session", true, "n2", 40),
++        );
++        crate::CLAUDE_FULL_PARSED_PATHS.lock().unwrap().clear();
++        crate::CLAUDE_RESUMED_PATHS.lock().unwrap().clear();
++        let warm = {
++            let _env = redirect_cache_home(cache_home.path());
++            scan(home.path())
++        };
++        assert!(crate::CLAUDE_RESUMED_PATHS.lock().unwrap().contains(&named));
++        assert!(!crate::CLAUDE_FULL_PARSED_PATHS
++            .lock()
++            .unwrap()
++            .iter()
++            .any(|path| path == &named));
++        let fresh_cache = tempfile::TempDir::new().unwrap();
++        let _env = redirect_cache_home(fresh_cache.path());
++        assert_eq!(warm, scan(home.path()));
++    }
++
      #[test]
      #[serial_test::serial]
 diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/src/message_cache.rs
@@ -2414,7 +2584,7 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +            related.push((".meta.json".to_string(), path));
          }
  
-@@ -841,16 +844,38 @@ impl SourceFingerprint {
+@@ -841,16 +844,49 @@ impl SourceFingerprint {
          let primary_matches =
              cached.and_then(|fingerprint| primary_fingerprint_matches(path, fingerprint));
 -        let parent_paths = cached
@@ -2428,17 +2598,27 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 -                        (format!("parent-session-{index}.jsonl"), parent_path)
 -                    })
 -                    .collect()
--            });
 +        let cached_parents = cached.map(cached_claude_parent_paths).unwrap_or_default();
 +
 +        // AIS: a subagent whose `.meta.json` names its type never reads the
 +        // parent session (Tier 1 of `resolve_subagent_name`), so the parent is
 +        // not a parser input. A long-running parent then must not invalidate
 +        // every one of its subagents on each scan. The sidecar stays watched,
-+        // so a changed or removed sidecar restores the parent dependency. When
-+        // the source is unchanged and its entry already has no parent, the
-+        // result is the same either way and the sidecar is not read.
-+        let parents_known_absent = primary_matches == Some(true) && cached_parents.is_empty();
++        // so a changed or removed sidecar restores the parent dependency.
++        //
++        // The cached parent list is only trusted while both the transcript and
++        // its sidecar are unchanged: an entry cached while the sidecar named
++        // the agent has no parent, and once the sidecar changes the parent has
++        // to be probed again or it would never be recorded. With both
++        // unchanged the result is the same either way, so the sidecar is not
++        // read.
++        let cached_parents_trusted = primary_matches == Some(true)
++            && cached.is_some_and(|fingerprint| {
++                meta_path.as_deref().map_or(true, |meta_path| {
++                    cached_related_file_matches(fingerprint, ".meta.json", meta_path)
++                })
+             });
++        let parents_known_absent = cached_parents_trusted && cached_parents.is_empty();
 +        if !parents_known_absent
 +            && meta_path
 +                .as_deref()
@@ -2454,7 +2634,7 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +            );
 +        }
 +
-+        let parent_paths = if primary_matches == Some(true) {
++        let parent_paths = if cached_parents_trusted {
 +            cached_parents
 +        } else {
 +            crate::sessions::claudecode::parent_session_paths_for_cache(path)
@@ -2465,7 +2645,7 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +        };
          related.extend(parent_paths);
  
-@@ -858,4 +883,13 @@ impl SourceFingerprint {
+@@ -858,4 +894,13 @@ impl SourceFingerprint {
      }
  
 +    /// This fingerprint without its Claude parent-session related files.
@@ -2479,7 +2659,30 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +
      pub(crate) fn check_grok_path_samples_only(
          path: &Path,
-@@ -1112,11 +1146,30 @@ fn cached_claude_parent_paths(cached: &SourceFingerprint) -> Vec<(String, PathBu
+@@ -1102,4 +1147,22 @@ fn fx_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
+ }
+ 
++/// Whether `cached` records the related file `suffix` at `path` and that file
++/// still matches it, with the same rules as the full related-file check.
++fn cached_related_file_matches(cached: &SourceFingerprint, suffix: &str, path: &Path) -> bool {
++    let Some(related) = cached
++        .related_files
++        .iter()
++        .find(|related| related.suffix == suffix)
++    else {
++        return false;
++    };
++    let single = SourceFingerprint {
++        related_files: vec![related.clone()],
++        ..cached.clone()
++    };
++    related_fingerprint_metadata_matches(&[(suffix.to_string(), path.to_path_buf())], &single)
++        .unwrap_or(false)
++}
++
+ fn cached_claude_parent_paths(cached: &SourceFingerprint) -> Vec<(String, PathBuf)> {
+     cached
+@@ -1112,11 +1175,30 @@ fn cached_claude_parent_paths(cached: &SourceFingerprint) -> Vec<(String, PathBu
  
  fn primary_fingerprint_matches(path: &Path, cached: &SourceFingerprint) -> Option<bool> {
 +    primary_fingerprint_matches_mode(path, cached, stat_only_fingerprints())
@@ -2510,7 +2713,7 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +
  fn metadata_signature(path: &Path) -> std::io::Result<(u64, u64)> {
      let metadata = path.metadata()?;
-@@ -1132,4 +1185,12 @@ fn related_fingerprint_metadata_matches(
+@@ -1132,4 +1214,12 @@ fn related_fingerprint_metadata_matches(
      related_paths: &[(String, PathBuf)],
      cached: &SourceFingerprint,
 +) -> Option<bool> {
@@ -2523,7 +2726,7 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +    stat_only: bool,
  ) -> Option<bool> {
      if cached.related_files.len() != related_paths.len() {
-@@ -1153,5 +1214,6 @@ fn related_fingerprint_metadata_matches(
+@@ -1153,5 +1243,6 @@ fn related_fingerprint_metadata_matches(
                      return Some(false);
                  }
 -                if compute_sample_hashes(related_path, size)? != related.sample_hashes {
@@ -2531,7 +2734,7 @@ diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/sr
 +                {
                      return Some(false);
                  }
-@@ -9785,4 +9847,161 @@ mod tests {
+@@ -9785,4 +9876,161 @@ mod tests {
      }
  
 +    #[test]
