@@ -55,9 +55,18 @@ reconciliation.
   owns authentication and always runs with `BatchMode=yes` plus
   `StrictHostKeyChecking=yes`. A top-level wrapper resolves locally and spawns
   the real agent first, then starts full reconciliation in a detached AIS
-  worker. Ordinary profile/session mutations use detached workers with a
-  three-second debounce, and the final post-exit reconciliation is detached
-  too. No
+  worker. Ordinary profile/session mutations are picked up by one host-level
+  watcher, `ais __profile_sync_daemon` (`sync/profile-sync-daemon.ts`, user
+  unit `scripts/systemd/ais-profile-sync.service`, installed by hand): every
+  30 s it reads the live-session registry (`~/.ais/state/profile-sync/sessions/`,
+  one file per session, written and removed by the sidecar, dead PIDs pruned
+  by PID plus start time), stat-walks each distinct identity configDir once
+  however many sessions share it, plus each crush session's own `<cwd>/.crush`,
+  and on a change starts one detached identity-scoped sync and marks the usage
+  snapshot dirty. A configDir change syncs without `cwd` (only crush-backed
+  tools read it); a `.crush` change syncs with that cwd. Sidecars never scan:
+  without the daemon only the post-exit sync runs, by design. The final
+  post-exit reconciliation is detached too. No
   automatic SSH, rsync, dedupe, or lock wait may block agent startup or keep
   the wrapper open after the child exits. `ais resume` follows the same rule.
   Nested wrappers do not start another full reconciliation. No delete

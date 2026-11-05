@@ -1,15 +1,11 @@
 import { lstat, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
-import { expandPath } from "../identities/match.ts";
-import type { ToolConfig } from "../identities/types.ts";
-import { startBackgroundProfileSync } from "./background.ts";
-import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
 
-const DEBOUNCE_MS = 3_000;
-// How often the identity tree is re-scanned for sync-relevant changes.
-const POLL_MS = 5_000;
+// How often the host-level profile-sync daemon (profile-sync-daemon.ts)
+// re-scans each watched identity tree for sync-relevant changes.
+export const POLL_MS = 30_000;
 // Safety ceiling on entries visited per scan, so a pathological tree cannot
-// make a launcher spin.
+// make the daemon spin.
 const MAX_SCAN_ENTRIES = 200_000;
 // High-churn per-session scratch (tens of thousands of directories in a large
 // identity) that the final post-exit sync already covers.
@@ -25,7 +21,7 @@ export function shouldScanDirectory(relativePath: string): boolean {
   return !REPRODUCIBLE_DIR_PATTERN.test(rel) && !UNSCANNED_DIR_PATTERN.test(rel);
 }
 
-type Snapshot = Map<string, string>;
+export type Snapshot = Map<string, string>;
 
 /**
  * Stat-walk a tree, never descending into excluded directories, and return
@@ -79,96 +75,4 @@ export function shouldTriggerProfileSync(filename: string): boolean {
     !TRANSIENT_PATTERN.test(filename) &&
     !REPRODUCIBLE_DIR_PATTERN.test(filename)
   );
-}
-
-export interface ProfileSyncWatcher {
-  stop(): Promise<void>;
-}
-
-export function startProfileSyncWatcher(
-  cfg: ToolConfig,
-  identityName: string,
-  configDir: string,
-  cwd: string,
-  options: { pollMs?: number; debounceMs?: number } = {},
-): ProfileSyncWatcher {
-  const pollMs = options.pollMs ?? POLL_MS;
-  const debounceMs = options.debounceMs ?? DEBOUNCE_MS;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let stopped = false;
-
-  const flush = () => {
-    startBackgroundProfileSync({
-      direction: "both",
-      scope: { kind: "identity", cfg, identityName, cwd },
-      includeDatabases: false,
-    });
-  };
-
-  const schedule = () => {
-    if (stopped || timer) return;
-    timer = setTimeout(() => {
-      timer = undefined;
-      flush();
-    }, debounceMs);
-  };
-
-  // Poll each root. A missing root (normal for a brand-new profile or
-  // `.crush` directory) scans as empty and is picked up once it appears.
-  // Watcher failures must never take down the real AI CLI; the final
-  // post-exit push remains the fallback.
-  let pollTimer: ReturnType<typeof setTimeout> | undefined;
-  const roots = [expandPath(configDir)];
-  // Every crush-backed tool (zai, ali; see identities/tool-configs.ts) also
-  // has a project-local `.crush` dotdir alongside the identity's own
-  // configDir, since that's where Crush's actual session data lives (see
-  // resume/crush-resume.ts).
-  if (cfg.realBinaryName === "crush") roots.push(join(cwd, ".crush"));
-
-  const snapshots = new Map<string, Snapshot>();
-  const poll = async () => {
-    for (const root of roots) {
-      if (stopped) return;
-      try {
-        const next = await scanTree(root);
-        const previous = snapshots.get(root);
-        snapshots.set(root, next);
-        if (previous && snapshotsDiffer(previous, next)) {
-          schedule();
-          try {
-            markUsageSnapshotDirty(usageSnapshotTargetKey(cfg.toolName, identityName));
-          } catch { /* source freshness must never interfere with the agent */ }
-        }
-      } catch {}
-    }
-    if (!stopped) {
-      pollTimer = setTimeout(poll, pollMs);
-      pollTimer.unref?.();
-    }
-  };
-  void poll();
-
-  return {
-    async stop() {
-      stopped = true;
-      if (pollTimer) {
-        clearTimeout(pollTimer);
-        pollTimer = undefined;
-      }
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
-      // Always perform one final pull/merge/push: SQLite databases are
-      // intentionally quiet during the session, then reconciled by a detached
-      // worker after the child has closed. Waiting for the lock happens in
-      // that worker and can never hold the caller's terminal open.
-      startBackgroundProfileSync({
-        direction: "both",
-        scope: { kind: "identity", cfg, identityName, cwd },
-        waitForLock: true,
-        includeDatabases: true,
-      });
-    },
-  };
 }

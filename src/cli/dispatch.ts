@@ -117,6 +117,15 @@ export async function runCli(argv: string[]): Promise<void> {
           await runUsageSnapshotDaemon();
           break;
         }
+      case "__profile_sync_daemon":
+        // Host-level watcher for live sessions' identity trees (see
+        // sync/profile-sync-daemon.ts); supervised by a user service.
+        {
+          if (boolFlag(flags, "check")) break;
+          const { runProfileSyncDaemon } = await import("../sync/profile-sync-daemon.ts");
+          await runProfileSyncDaemon();
+          break;
+        }
       case "__spend_refresh":
         // Same dynamic-import discipline as __scan_worker: the spend
         // refresh drags the AWS SDK clients in, which must never load in

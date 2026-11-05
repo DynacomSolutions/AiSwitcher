@@ -115,8 +115,9 @@ src/
                           (macOS): argv/envp block, signal and fd hygiene; every
                           failure returns a reason string
     darwin-proc.ts        macOS sysctl/proc_pidpath reads for the sidecar's PID watch
-    session-sidecar.ts    detached `__session-sidecar` (sync watcher, Herdr titles,
-                          PID-exit watch, post-exit sync) and launchWithSession()
+    session-sidecar.ts    detached `__session-sidecar` (registers the session with the
+                          profile-sync daemon, Herdr titles, PID-exit watch,
+                          post-exit sync) and launchWithSession()
     cli-args.ts            strip --identity=/--desktop, detect non-interactive intent
                           (per-tool: claude's -p/--print, codex's `exec` subcommand,
                           grok's -p/--single or `agent` subcommand, kimi's -p/--prompt
@@ -134,7 +135,11 @@ src/
                           second writable store
   sync/                SSH/rsync profile and usage-data synchronisation — machine-local
                           remote config, portable ~/ registries, staged additive exchange,
-                          inter-process lock, and debounced/final reconciliation
+                          inter-process lock, and in-session/final reconciliation;
+                          session-registry.ts (live sessions, one file each) and
+                          profile-sync-daemon.ts (`ais __profile_sync_daemon`: one
+                          30 s scan per identity root for all sessions; watch.ts
+                          holds the stat-walk)
    server/              the local console API behind `ais web` — thin HTTP wrappers around
                            the EXISTING engines (store/actions, limits fetchers, usage
                            aggregation, resume readers, zai/ali auth writers), no new

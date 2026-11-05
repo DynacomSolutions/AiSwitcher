@@ -1,0 +1,24 @@
+# Host-level profile-sync watcher: one process scans the identity trees of all
+# live sessions every 30 s, instead of one stat-walk per session sidecar.
+# Not installed automatically. To install by hand:
+#   cp scripts/systemd/ais-profile-sync.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ais-profile-sync.service
+[Unit]
+Description=AiProfileSwitcher profile sync watcher
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ais __profile_sync_daemon
+Restart=on-failure
+RestartSec=10s
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=200%
+MemoryHigh=1G
+MemoryMax=2G
+# The background syncs it starts are detached workers; a restart of the
+# watcher must not kill a sync that is mid-transfer.
+KillMode=process
+
+[Install]
+WantedBy=default.target
