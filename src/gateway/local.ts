@@ -4,6 +4,7 @@ import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, requirePool, findPool } from "../identities/pool/swap-pool.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { hostname, networkInterfaces } from "node:os";
 import { ERROR_PEEK_BYTES, GATEWAY_MARK_HEADER, isQuotaBody, peek, readBody, stripHopByHop, upstreamHeaders, type Body } from "./app.ts";
 import { GatewayCredentialError, loginCommand, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
@@ -42,11 +43,14 @@ export interface LocalGatewayDeps {
   breakerMs?: number;
   /** The local agent token for an app (the one the key helpers print). A client key that differs is refused. */
   clientToken(app: string): Promise<string | undefined>;
+  instance?: string;
   /** Host header values accepted (host:port); anything else is refused with 403. */
   allowedHosts(): string[];
 }
 
 export interface LocalGatewayStatus {
+  /** Which service slot answered (set by the template unit); with a handoff in progress either instance may answer. */
+  instance?: string;
   mode: "remote" | "direct";
   sinceMs: number;
   /** Epoch ms when the next remote probe is allowed; only set in direct mode. */
@@ -75,7 +79,7 @@ export function isPreSendError(err: unknown): boolean {
   const code = (err as { code?: unknown } | null)?.code;
   if (typeof code !== "string") return false;
   // A timeout can also hit an established connection: it counts only when the message shows the connect itself failed.
-  if (code === "ETIMEDOUT") return /unable to connect|connect/i.test(String((err as { message?: unknown }).message ?? ""));
+  if (code === "ETIMEDOUT") return /unable to connect/i.test(String((err as { message?: unknown }).message ?? ""));
   return PRE_SEND_CODES.has(code);
 }
 
@@ -124,7 +128,7 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     setMode("remote", "remote answered");
   };
 
-  const status = (): LocalGatewayStatus => ({ mode, sinceMs: since, ...(mode === "direct" ? { probeAtMs: probeAt } : {}), remote: remoteBase });
+  const status = (): LocalGatewayStatus => ({ ...(deps.instance ? { instance: deps.instance } : {}), mode, sinceMs: since, ...(mode === "direct" ? { probeAtMs: probeAt } : {}), remote: remoteBase });
 
   /** The remote answer, or a RemoteFailure for a pre-byte failure (the response rides along for pass-through). */
   async function tryRemote(req: Request, url: URL, app: string, rest: string, body: Body, signal: AbortSignal): Promise<Response> {
@@ -373,17 +377,38 @@ export async function defaultLocalMembers(tool: Tool): Promise<string[]> {
   return active && live.includes(active) ? [active, ...live.filter((n) => n !== active)] : live;
 }
 
+/** Addresses and names of this host (every interface, plus the hostname). */
+export function ownHostAddresses(): string[] {
+  const out = [hostname().toLowerCase()];
+  for (const list of Object.values(networkInterfaces())) for (const a of list ?? []) out.push(a.address.toLowerCase().replace(/%.*$/, ""));
+  return out;
+}
+
+/** The IPv4 inside an IPv4-mapped IPv6 literal (::ffff:127.0.0.1 or ::ffff:7f00:1), else the host unchanged. */
+function unmapV4(host: string): string {
+  const m = /^::ffff:(.+)$/i.exec(host);
+  if (!m) return host;
+  const inner = m[1] as string;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(inner)) return inner;
+  const hex = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(inner);
+  if (!hex) return host;
+  const hi = parseInt(hex[1] as string, 16);
+  const lo = parseInt(hex[2] as string, 16);
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
 /** Why a remote must not be used (it would loop back into this proxy or another local listener), or undefined when it is fine. */
-export function remoteRefusal(remoteBase: string, ownPort: number): string | undefined {
+export function remoteRefusal(remoteBase: string, ownPort: number, own: string[] = ownHostAddresses()): string | undefined {
   let u: URL;
   try {
     u = new URL(remoteBase);
   } catch {
     return "not a valid URL";
   }
-  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = unmapV4(u.hostname.toLowerCase().replace(/^\[|\]$/g, ""));
   const loopback = host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "0.0.0.0" || host === "::" || /^127\./.test(host);
   if (loopback) return `loopback host (${u.host}); ${u.port === String(ownPort) ? "that is this proxy" : "a local listener is not the cluster gateway"}`;
+  if (own.some((a) => a === host || unmapV4(a) === host)) return `an address of this host (${u.host}); that would loop back into a local listener`;
   return undefined;
 }
 
@@ -399,6 +424,11 @@ export interface StartLocalOptions {
   idleMs?: number;
   breakerMs?: number;
   clientToken?: LocalGatewayDeps["clientToken"];
+  instance?: string;
+  /** Keep retrying a busy port this long (a previous process that does not share the port is draining). */
+  bindRetryMs?: number;
+  /** Test hook: accept a loopback remote (the real proxy refuses one). */
+  allowLoopbackRemote?: boolean;
 }
 
 /** Starts the loopback-only listener. It never binds anything but 127.0.0.1. */
@@ -419,7 +449,7 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
   const log = opts.log ?? ((line: string) => console.info(line));
   let remoteBase = opts.remoteBase ?? "";
   const bindPort = opts.port ?? LOCAL_GATEWAY_DEFAULT_PORT;
-  const refusal = remoteBase ? remoteRefusal(remoteBase, bindPort) : undefined;
+  const refusal = remoteBase && !opts.allowLoopbackRemote ? remoteRefusal(remoteBase, bindPort) : undefined;
   if (refusal) {
     log(`gateway-local: warning: remote refused (${refusal}); running direct-only`);
     remoteBase = "";
@@ -427,6 +457,7 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
   const gateway = createLocalGateway({
     remoteBase,
     clientToken,
+    ...((opts.instance ?? process.env.AIS_GATEWAY_LOCAL_INSTANCE) ? { instance: (opts.instance ?? process.env.AIS_GATEWAY_LOCAL_INSTANCE) as string } : {}),
     allowedHosts: () => [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`],
     fetch: opts.fetch ?? fetch,
     now,
@@ -436,12 +467,26 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     ...(opts.idleMs !== undefined ? { idleMs: opts.idleMs } : {}),
     ...(opts.breakerMs !== undefined ? { breakerMs: opts.breakerMs } : {}),
   });
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: opts.port ?? LOCAL_GATEWAY_DEFAULT_PORT,
-    idleTimeout: 0,
-    fetch: (req) => gateway.handle(req).catch(() => providerError("openai", 500, "gateway error")),
-  });
+  const serve = (): ReturnType<typeof Bun.serve> =>
+    Bun.serve({
+      hostname: "127.0.0.1",
+      port: bindPort,
+      // Two instances (old draining, new serving) share the port during a restart, so it is never refused.
+      reusePort: true,
+      idleTimeout: 0,
+      fetch: (req) => gateway.handle(req).catch(() => providerError("openai", 500, "gateway error")),
+    });
+  let server: ReturnType<typeof Bun.serve>;
+  const deadline = Date.now() + (opts.bindRetryMs ?? 0);
+  for (;;) {
+    try {
+      server = serve();
+      break;
+    } catch (err) {
+      if ((err as { code?: unknown }).code !== "EADDRINUSE" || Date.now() >= deadline) throw err;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
   boundPort = server.port as number;
   return {
     host: server.hostname as string,
@@ -451,4 +496,23 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     // Graceful: no new connections, in-flight requests (streams) run to completion; resolves when the last one ends.
     drain: () => server.stop(false),
   };
+}
+
+/**
+ * SIGTERM/SIGINT: stop accepting, let in-flight streams finish, exit. No drain timer; the service manager's stop timeout is the only ceiling.
+ * Bun's stop(false) closes the listener at once and does not wait on idle keep-alive sockets (measured), so nothing else needs closing.
+ * A second signal forces the exit.
+ */
+export function installDrainHandlers(running: { drain(): Promise<void> }, exit: (code: number) => void = (code) => process.exit(code)): void {
+  let stopping = false;
+  const stop = (): void => {
+    if (stopping) {
+      exit(1);
+      return;
+    }
+    stopping = true;
+    void running.drain().then(() => exit(0));
+  };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
 }

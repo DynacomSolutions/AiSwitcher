@@ -71,7 +71,7 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
   if (result.status === "installed" || result.status === "verified") {
     try {
       const unit = await installLocalGatewayService({ restartIfActive: aisBinaryChanged, respectDisabled: true });
-      console.error(`install: gateway local service ${unit.changed ? "installed" : "verified"}: ${unit.path}`);
+      console.error(`install: gateway local service ${unit.action}: ${unit.path}`);
     } catch (err) {
       console.error(`install: gateway local service skipped: ${err instanceof Error ? err.message : String(err)}`);
     }

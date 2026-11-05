@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -314,6 +314,47 @@ describe("postRefreshTokenGrant", () => {
       const { fetchImpl } = stubFetch([wire], [400]);
       const err = (await postRefreshTokenGrant(OPENAI_CODEX_TOKEN_URL, { refresh_token: "rt-dead-1" }, { fetchImpl }).catch((e: unknown) => e)) as OAuthRefreshError;
       expect(err.oauthCode).toBe(expected);
+    }
+  });
+
+  test("revoked stays true for invalid_client in the string shape, but the object shape marks only the dead codes", async () => {
+    const cases: Array<[unknown, boolean]> = [
+      [{ error: "invalid_client" }, true], // AIS's own refresher keeps its old behaviour
+      [{ error: { code: "invalid_client" } }, false],
+      [{ error: { code: "refresh_token_reused" } }, true],
+      [{ error: { code: "invalid_grant" } }, true],
+    ];
+    for (const [wire, revoked] of cases) {
+      const { fetchImpl } = stubFetch([wire], [403]);
+      const err = (await postRefreshTokenGrant(OPENAI_CODEX_TOKEN_URL, { refresh_token: "rt-x-1" }, { fetchImpl }).catch((e: unknown) => e)) as OAuthRefreshError;
+      expect(err.revoked).toBe(revoked);
+    }
+  });
+
+  test("an unreadable or torn store is a read error, not a logged-out identity (real refreshIdentityOAuthGrant)", async () => {
+    await json(CODEX_FILE(), { tokens: { access_token: "at-old-1", refresh_token: "rt-old-1" } });
+    const { fetchImpl } = stubFetch([tokenResponse({})]);
+    // Absent store: plainly logged out, no read error.
+    await rm(CODEX_FILE());
+    const absent = await refreshIdentityOAuthGrant("codex", identityIn(dirs.codex), { force: true, fetchImpl, now: () => NOW * 1000 });
+    expect(absent.outcome).toBe("no-grant");
+    expect(absent.readError).toBeUndefined();
+    // Torn JSON.
+    await writeFile(CODEX_FILE(), '{"tokens": {"access_tok');
+    const torn = await refreshIdentityOAuthGrant("codex", identityIn(dirs.codex), { force: true, fetchImpl, now: () => NOW * 1000 });
+    expect(torn.outcome).toBe("no-grant");
+    expect(torn.readError).toBe(true);
+    // chmod 000 (skipped when running as root, which ignores modes).
+    if (process.getuid?.() !== 0) {
+      await json(CODEX_FILE(), { tokens: { access_token: "at-old-1", refresh_token: "rt-old-1" } });
+      await chmod(CODEX_FILE(), 0o000);
+      try {
+        const denied = await refreshIdentityOAuthGrant("codex", identityIn(dirs.codex), { force: true, fetchImpl, now: () => NOW * 1000 });
+        expect(denied.outcome).toBe("no-grant");
+        expect(denied.readError).toBe(true);
+      } finally {
+        await chmod(CODEX_FILE(), 0o600);
+      }
     }
   });
 

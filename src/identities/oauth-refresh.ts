@@ -8,6 +8,7 @@ import {
   reconcileNativeProviderStores,
   nativeStorePathFor,
   readProviderGrantCopy,
+  withReadErrorProbe,
   writePiEntry,
   writeProviderGrantCopy,
   type NativeReconcilableTool,
@@ -161,7 +162,9 @@ export async function postRefreshTokenGrant(
   }
   if (!response.ok) {
     const code = oauthErrorCode(parsed);
-    const revoked = response.status === 400 || response.status === 401 || code === "invalid_grant" || code === "invalid_client";
+    // Unchanged for the RFC string shape. The object shape ({ error: { code } }) marks revoked only for the dead codes, so AIS's own refresher keeps its old behaviour for invalid_client.
+    const legacyCode = typeof parsed.error === "string" ? parsed.error : undefined;
+    const revoked = response.status === 400 || response.status === 401 || legacyCode === "invalid_grant" || legacyCode === "invalid_client" || (code !== undefined && DEAD_REFRESH_CODES.has(code));
     throw new OAuthRefreshError(
       `token refresh rejected (HTTP ${response.status}${code ? ` ${code}` : ""})`,
       revoked,
@@ -676,10 +679,14 @@ export async function refreshIdentityOAuthGrant(
   if (!options.force) {
     // Cheap pre-check without locks: don't contend with Claude Code when there is nothing to do.
     let peekFailed = false;
-    const peek = await freshestGrant(tool, identity, registryPath, poolDirs).catch(() => {
-      peekFailed = true;
-      return undefined;
-    });
+    const peeked = await withReadErrorProbe(() =>
+      freshestGrant(tool, identity, registryPath, poolDirs).catch(() => {
+        peekFailed = true;
+        return undefined;
+      }),
+    );
+    peekFailed = peekFailed || peeked.readFailed;
+    const peek = peeked.value;
     if (!peek?.grant.refresh_token) {
       return {
         tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], ...(peekFailed ? { readError: true } : {}),
@@ -745,10 +752,14 @@ async function refreshGrantUnlocked(
   if (pooled) await convergeClaudePoolStores(identity, registryPath, options.locksHeld, options.lockedPoolDirs, tool).catch(() => undefined);
 
   let readFailed = false;
-  const freshest = await freshestGrant(tool, identity, registryPath, options.lockedPoolDirs).catch(() => {
-    readFailed = true;
-    return undefined;
-  });
+  const probed = await withReadErrorProbe(() =>
+    freshestGrant(tool, identity, registryPath, options.lockedPoolDirs).catch(() => {
+      readFailed = true;
+      return undefined;
+    }),
+  );
+  readFailed = readFailed || probed.readFailed;
+  const freshest = probed.value;
   if (!freshest || !freshest.grant.refresh_token) {
     return {
       ...base,

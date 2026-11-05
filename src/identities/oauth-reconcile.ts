@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { withOauthRefreshLock } from "./claude-swap-lock.ts";
@@ -115,15 +116,36 @@ function secondsFromMs(value: number): number {
   return value < 10_000_000_000 ? value : Math.floor(value / 1000);
 }
 
+/** Out-parameter for store reads: set when a store existed but could not be read (EACCES, EIO, torn JSON). */
+interface ReadProbe {
+  failed: boolean;
+}
+const readProbe = new AsyncLocalStorage<ReadProbe>();
+
+/**
+ * Runs `fn` and reports whether any native-store read inside it failed for a reason other than "file absent".
+ * Behaviour of the readers themselves is unchanged (they still answer "no copy"); callers that must tell
+ * "logged out" from "could not read" use this.
+ */
+export async function withReadErrorProbe<T>(fn: () => Promise<T>): Promise<{ value: T; readFailed: boolean }> {
+  const probe: ReadProbe = { failed: false };
+  const value = await readProbe.run(probe, fn);
+  return { value, readFailed: probe.failed };
+}
+
 async function readJson(path: string): Promise<Record<string, unknown> | undefined> {
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
     if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
       return parsed as Record<string, unknown>;
     }
-  } catch {
+  } catch (err) {
     // Unreadable or absent store: the reconcile sees "no copy", same as the
-    // kimi-store readers.
+    // kimi-store readers. A store that exists but fails to read is recorded for probing callers.
+    if ((err as { code?: unknown } | null)?.code !== "ENOENT") {
+      const probe = readProbe.getStore();
+      if (probe) probe.failed = true;
+    }
   }
   return undefined;
 }

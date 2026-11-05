@@ -3,7 +3,7 @@ import { CliUsageError } from "../errors.ts";
 import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
 import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
-import { LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
+import { installDrainHandlers, LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
 import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
 
 function portOf(flag: string | undefined, env: string | undefined, fallback: number, name: string): number {
@@ -42,7 +42,7 @@ async function runLocal(args: string[], deps: GatewayCliDeps): Promise<void> {
   if (args[0] === "install") {
     const { installLocalGatewayService } = await import("./local-service.ts");
     const r = await installLocalGatewayService();
-    deps.out(`gateway local: unit ${r.changed ? "installed" : "verified"} at ${r.path}`);
+    deps.out(`gateway local: ${r.action}${r.slot ? ` (slot ${r.slot})` : ""}; unit at ${r.path}`);
     return;
   }
   if (args[0] === "status") {
@@ -53,16 +53,8 @@ async function runLocal(args: string[], deps: GatewayCliDeps): Promise<void> {
   }
   if (args.length > 0) throw new CliUsageError("Usage: ais gateway local [install|status]");
   const remoteBase = await resolveRemoteBase();
-  const running = await startLocalGateway({ port, remoteBase });
+  const running = await startLocalGateway({ port, remoteBase, bindRetryMs: 30_000 });
   console.info(`gateway local: listening on 127.0.0.1:${running.port}`);
-  // Drain: stop accepting, let in-flight streams finish, then exit. No drain timer; systemd's TimeoutStopSec is the kill ceiling.
-  let stopping = false;
-  const stop = (): void => {
-    if (stopping) return;
-    stopping = true;
-    void running.drain().then(() => process.exit(0));
-  };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  installDrainHandlers(running);
   await new Promise<void>(() => {});
 }

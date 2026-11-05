@@ -148,6 +148,9 @@ describe("local gateway failover", () => {
   test("ETIMEDOUT is pre-send only when the message shows a connect failure", async () => {
     const connect = rig({ remote: () => { throw Object.assign(new TypeError("ETIMEDOUT: Unable to connect"), { code: "ETIMEDOUT" }); } });
     expect(await (await connect.post()).text()).toBe("direct");
+    const plainTimeout = rig({ remote: () => { throw Object.assign(new TypeError("Connection timed out"), { code: "ETIMEDOUT" }); } });
+    expect((await plainTimeout.post()).status).toBe(502);
+    expect(plainTimeout.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
     const established = rig({ remote: () => { throw Object.assign(new TypeError("ETIMEDOUT: socket timed out"), { code: "ETIMEDOUT" }); } });
     expect((await established.post()).status).toBe(502);
     expect(established.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
@@ -463,7 +466,14 @@ describe("local gateway without a cluster URL", () => {
 describe("remote URL guard and drain", () => {
   test("loopback and own-address remotes are refused", () => {
     for (const u of ["http://127.0.0.1:47140", "http://localhost:9", "http://[::1]:47140", "http://127.5.5.5", "http://0.0.0.0:1", "not a url"]) expect(remoteRefusal(u, 47140)).toBeDefined();
-    expect(remoteRefusal("https://gw.example.com", 47140)).toBeUndefined();
+    expect(remoteRefusal("https://gw.example.com", 47140, [])).toBeUndefined();
+    // IPv4-mapped IPv6 loopback, dotted and hex forms.
+    for (const u of ["http://[::ffff:127.0.0.1]:47140", "http://[::ffff:7f00:1]:47140", "http://[::ffff:7f00:1]"]) expect(remoteRefusal(u, 47140, [])).toBeDefined();
+    // Any address of this host, plain and IPv4-mapped.
+    expect(remoteRefusal("http://192.0.2.7:8080", 47140, ["192.0.2.7"])).toContain("this host");
+    expect(remoteRefusal("http://[::ffff:c000:207]:8080", 47140, ["192.0.2.7"])).toContain("this host");
+    expect(remoteRefusal("http://myhost.lan", 47140, ["myhost.lan"])).toContain("this host");
+    expect(remoteRefusal("http://192.0.2.8", 47140, ["192.0.2.7"])).toBeUndefined();
   });
 
   test("startLocalGateway with a loopback remote logs one warning and runs direct-only", async () => {
