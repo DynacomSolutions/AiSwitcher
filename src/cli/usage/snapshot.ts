@@ -129,8 +129,6 @@ export interface UsageSnapshotDeps {
   path?: string;
   /** Test seam for keeping successful native promotions inside the fixture tree. */
   nativeBatchRoot?: string;
-  /** Test seam: the isolated Tokscale config whose bucket timezone keys native daily usage. */
-  nativeTokscaleConfigDir?: string;
   /** Test seam: the staging directory swept for dead exports at the start of a cycle. */
   nativeStagingRoot?: string;
   now?: () => number;
@@ -744,6 +742,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     if (nativeExport) nativeCandidates.set(targetKey(target), {
       path: nativeExport.path,
       partitionId: nativeExport.partitionId,
+      ...(nativeExport.invocation.env.TOKSCALE_CONFIG_DIR ? { tokscaleConfigDir: nativeExport.invocation.env.TOKSCALE_CONFIG_DIR } : {}),
     });
     return nativeExport;
   };
@@ -807,7 +806,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot, nativeDaily
           ? (messages) => {
             try {
-              results = withDailyUsage(results, dailyUsageFromNativeMessages(messages, readTokscaleBucketTimezone(deps.nativeTokscaleConfigDir)));
+              results = withDailyUsage(results, dailyUsageFromNativeMessages(messages, nativeCandidate.tokscaleConfigDir ? readTokscaleBucketTimezone(nativeCandidate.tokscaleConfigDir) : undefined));
             } catch (error) {
               // Daily figures are a display detail; the report still commits.
               logUsageSourceFailure(`${key} native daily usage`, error);

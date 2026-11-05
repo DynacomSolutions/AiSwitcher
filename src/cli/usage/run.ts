@@ -19,11 +19,8 @@ import { OPENCODE_DEFAULT_PROFILE_IDENTITY, defaultOpencodeProfileDbPath, fetchO
 import { fetchPiUsage } from "./pi-usage.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
 import {
-  ensureTokscaleCacheFresh,
-  fetchTokscaleDailyUsage,
   mergeDailyTotals,
   runAisTokscaleExportInvocation,
-  runTokscaleProcess,
   tokscaleInvocationFor,
   type AisTokscaleExportInvocation,
   type DailyTotals,
@@ -80,7 +77,17 @@ export interface UsageResult {
   pending?: true;
   /** Internal candidate produced alongside the same Tokscale report process.
    * Snapshot code validates and promotes it before publishing the partition. */
-  nativeBatchCandidate?: { path: string; partitionId: string };
+  nativeBatchCandidate?: NativeBatchCandidate;
+}
+
+/** A staged native export batch. tokscaleConfigDir is the TOKSCALE_CONFIG_DIR
+ * the exporting process ran with: its settings.json holds the bucket timezone
+ * Tokscale keyed the batch's dates in, so daily figures derived from the
+ * batch must use the same file. */
+export interface NativeBatchCandidate {
+  path: string;
+  partitionId: string;
+  tokscaleConfigDir?: string;
 }
 
 /** Every (tool, identity) pair to query, filtered by --tool and/or --identity.
@@ -251,7 +258,6 @@ export interface UsageRunDeps {
   fetchExtraCost?: typeof fetchExtraCost;
   fetchAwsBedrockUsage?: typeof fetchAwsBedrockUsage;
   runTokscale?: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]>;
-  fetchTokscaleDailyUsage?: typeof fetchTokscaleDailyUsage;
   nativeExportForTarget?: (target: UsageTarget) => Promise<{
     invocation: AisTokscaleExportInvocation;
     path: string;
@@ -266,20 +272,21 @@ export async function runTokscaleForUsageTarget(target: UsageTarget, suppression
     const error = "usage tracking is not supported for this source";
     return isMultiProviderSource(target.toolName) ? [sourceErrorResult(target, error)] : [providerResult(target, fallbackProvider, { error })];
   }
-  const { env, clientArgs } = invocation;
 
   try {
+    // Reports come only from the AIS-patched native export. There is no
+    // PATH/bunx Tokscale fallback: it would rescan every transcript without
+    // the AIS cache.
     const nativeExport = await deps.nativeExportForTarget?.(target);
-    // A collector run must never fall back to PATH/bunx Tokscale, which scans
-    // every transcript again without the AIS cache.
-    if (deps.nativeExportForTarget && !nativeExport) throw new Error("native-export-unavailable");
-    const stdout = nativeExport
-      ? await runAisTokscaleExportInvocation(nativeExport.invocation)
-      : await runTokscaleProcess([...clientArgs, "--json"], env);
+    if (!nativeExport) throw new Error("native-export-unavailable");
+    const stdout = await runAisTokscaleExportInvocation(nativeExport.invocation);
     const results = providerReportsFromTokscale(target, JSON.parse(stdout) as TokscaleReport, suppression);
-    return nativeExport
-      ? results.map((result) => ({ ...result, nativeBatchCandidate: { path: nativeExport.path, partitionId: nativeExport.partitionId } }))
-      : results;
+    const nativeBatchCandidate: NativeBatchCandidate = {
+      path: nativeExport.path,
+      partitionId: nativeExport.partitionId,
+      ...(nativeExport.invocation.env.TOKSCALE_CONFIG_DIR ? { tokscaleConfigDir: nativeExport.invocation.env.TOKSCALE_CONFIG_DIR } : {}),
+    };
+    return results.map((result) => ({ ...result, nativeBatchCandidate }));
   } catch (err) {
     const message = err instanceof SyntaxError
       ? "Could not parse tokscale's --json output."
@@ -365,24 +372,20 @@ async function runOne(target: UsageTarget, suppression: UsageRowSuppression, dep
   if (target.toolName === "pi") return runPiUsage(target, suppression);
   if (target.toolName === "opencode") return runOpencodeUsage(target, suppression);
 
-  const [results, extraCost, daily] = await Promise.all([
+  // Daily usage is derived from the native export in snapshot.ts.
+  const [results, extraCost] = await Promise.all([
     (deps.runTokscale ?? ((selected, rowSuppression) => runTokscaleForUsageTarget(selected, rowSuppression, deps)))(target, suppression),
     // Retired identities keep local usage only: the extra-cost probe is a
     // live OAuth call against an account whose credentials are gone.
     isRetired(target.identity) ? Promise.resolve(undefined) : (deps.fetchExtraCost ?? fetchExtraCost)(target.toolName, target.identity),
-    // With a native export the collector derives daily usage from the export
-    // it already reads (snapshot.ts), so no second `hourly` scan runs.
-    deps.nativeExportForTarget
-      ? Promise.resolve(undefined)
-      : (deps.fetchTokscaleDailyUsage ?? fetchTokscaleDailyUsage)(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
   ]);
   const primaryProvider = providerForTool(target.toolName);
-  return withDailyUsage(results.map((result, index) => ({
+  return results.map((result, index) => ({
     ...result,
     ...(extraCost && (result.provider === primaryProvider || (index === 0 && !results.some((r) => r.provider === primaryProvider)))
       ? { extraCost }
       : {}),
-  })), daily);
+  }));
 }
 
 /** Attaches one source's daily usage to its report row. Only a single-row
@@ -492,9 +495,6 @@ export async function runUsageQueryForTargets(
   options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => unknown; deps?: UsageRunDeps } = {},
 ): Promise<UsageResult[]> {
   const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
-  // The collector (nativeExportForTarget) only runs the AIS-patched binary,
-  // so it skips the `bunx tokscale@latest --version` warm-up.
-  if (!options.deps?.runTokscale && !options.deps?.nativeExportForTarget && targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
   return runBatched(
     targets,
     USAGE_MAX_CONCURRENT,
@@ -571,7 +571,7 @@ export function logUsageSourceFailure(source: string, reason: unknown): void {
 export async function swapPoolUsageResults(
   flags: ParsedArgs["flags"],
   ledgerPath: string = aisClaudeSwapLedgerPath(),
-  tokscaleForPool: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]> = runTokscaleForUsageTarget,
+  tokscaleForPool: (target: UsageTarget, suppression: UsageRowSuppression) => Promise<UsageResult[]>,
   onPoolDone?: (pool: Identity, results: UsageResult[], failed?: boolean, nativeBatchCandidate?: UsageResult["nativeBatchCandidate"]) => void | Promise<void>,
   includePoolNames?: ReadonlySet<string>,
   onPoolWindow?: (pool: Identity, members: RecentMemberSplit) => void,
@@ -634,17 +634,6 @@ export async function swapPoolUsageResults(
     }
   }
   return results;
-}
-
-export async function runUsageQuery(flags: ParsedArgs["flags"]): Promise<UsageResult[]> {
-  const targets = await collectTargets(flags);
-  const includeDefaultProfile = shouldIncludeDefaultOpencodeProfile(flags);
-  const [results, defaultProfileResults, poolResults] = await Promise.all([
-    runUsageQueryForTargets(targets, { explicitTool: toolConfigFromFlag(flags) !== undefined }),
-    includeDefaultProfile ? defaultOpencodeProfileUsageResults() : Promise.resolve([] as UsageResult[]),
-    swapPoolUsageResults(flags),
-  ]);
-  return aggregateUsageResults([...results, ...defaultProfileResults, ...poolResults]);
 }
 
 /** JSON follows the same provider-first contract as the table. Client/tool

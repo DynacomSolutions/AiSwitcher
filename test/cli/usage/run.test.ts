@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CliUsageError } from "../../../src/cli/errors.ts";
@@ -299,7 +299,6 @@ describe("retired identities", () => {
             extraCostCalls.push(id.name);
             return { active: false, label: "none" } as never;
           },
-          fetchTokscaleDailyUsage: async () => undefined,
         },
       },
     );
@@ -337,30 +336,26 @@ describe("retired identities", () => {
 
 describe("collector runs (native export)", () => {
   const identity = { name: "work", label: "Work", configDir: "/tmp/does-not-exist/work", retired: true };
-  const report: TokscaleReport = { entries: [], totalInput: 1, totalOutput: 1, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 1, totalCost: 0 };
 
-  test("never run the separate hourly scan; daily usage comes from the export", async () => {
-    let hourlyScans = 0;
-    const results = await runUsageQueryForTargets([{ toolName: "claude", identity }], {
-      deps: {
-        nativeExportForTarget: async () => undefined,
-        runTokscale: async (target) => providerReportsFromTokscale(target, report, { explicitTool: true }),
-        fetchTokscaleDailyUsage: async () => {
-          hourlyScans++;
-          return { dateSpan: { firstMs: 1, lastMs: 2 }, daily: { "2026-11-01": 2 }, totals: { "2026-11-01": [1, 1, 0, 0, 1, 0] } };
-        },
-      },
-    });
-    expect(hourlyScans).toBe(0);
-    expect(results).toHaveLength(1);
-    expect(results[0]?.dailyUsage).toBeUndefined();
-  });
-
-  test("a missing native export is an error, never a PATH/bunx Tokscale fallback", async () => {
-    const results = await runTokscaleForUsageTarget({ toolName: "claude", identity }, { explicitTool: true }, {
-      nativeExportForTarget: async () => undefined,
-    });
-    expect(results).toHaveLength(1);
-    expect(results[0]?.error).toBe("Could not run tokscale: native-export-unavailable");
+  test("the staged batch names the Tokscale config dir its exporter ran with", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ais-usage-export-"));
+    try {
+      const command = join(dir, "fake-tokscale");
+      await writeFile(command, `#!/bin/sh\nprintf '{"entries":[],"totalInput":0,"totalOutput":0,"totalCacheRead":0,"totalCacheWrite":0,"totalMessages":0,"totalCost":0}'\n`);
+      await chmod(command, 0o700);
+      const isolated = join(dir, "isolated-config");
+      const results = await runTokscaleForUsageTarget({ toolName: "claude", identity }, { explicitTool: true }, {
+        nativeExportForTarget: async () => ({
+          invocation: { command, args: ["--client", "claude"], env: { TOKSCALE_CONFIG_DIR: isolated }, cwd: dir },
+          path: join(dir, "batch.json"),
+          partitionId: "a".repeat(64),
+        }),
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0]?.error).toBeUndefined();
+      expect(results[0]?.nativeBatchCandidate).toEqual({ path: join(dir, "batch.json"), partitionId: "a".repeat(64), tokscaleConfigDir: isolated });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -6,6 +6,7 @@ import {
   dailyUsageFromHourlyEntries,
   dailyUsageFromNativeMessages,
   hourlyEntriesFromNativeMessages,
+  tokscalePinnedZone,
   mergeDailyTotals,
   readTokscaleBucketTimezone,
 } from "../../../src/cli/usage/tokscale.ts";
@@ -37,14 +38,15 @@ describe("daily usage from an AIS native export", () => {
     cost: 0.25, message_count: 1, ...overrides,
   });
 
-  // Fixture: synthetic Claude transcripts with scanner.bucketTimezone
-  // Asia/Bangkok. export.json is the AIS-patched Tokscale 4.20.0 native
-  // export; hourly.json is upstream Tokscale 4.21.0 `hourly --client claude
-  // --json` over the same tree, i.e. what the collector used to run.
+  // Fixture (generate.ts): synthetic Claude transcripts with duplicate
+  // messages, the local recovery overlay (untimestamped request rows and
+  // daily floors) and the America/New_York DST change, bucketed in that zone.
+  // export.json and hourly.json both come from the AIS-patched Tokscale
+  // 4.20.0 binary, with one config dir.
   test("equals the rollup of Tokscale's hourly report for the same transcripts", () => {
-    const derived = dailyUsageFromNativeMessages(nativeExport.messages, "Asia/Bangkok");
+    const derived = dailyUsageFromNativeMessages(nativeExport.messages, "America/New_York");
     expect(derived).toEqual(dailyUsageFromHourlyEntries(hourlyReport.entries)!);
-    expect(hourlyEntriesFromNativeMessages(nativeExport.messages, "Asia/Bangkok").map(({ hour, input, output, cacheRead, cacheWrite, messageCount, cost }) => ({ hour, input, output, cacheRead, cacheWrite, messageCount, cost })))
+    expect(hourlyEntriesFromNativeMessages(nativeExport.messages, "America/New_York").map(({ hour, input, output, cacheRead, cacheWrite, messageCount, cost }) => ({ hour, input, output, cacheRead, cacheWrite, messageCount, cost })))
       .toEqual(hourlyReport.entries.map(({ hour, input, output, cacheRead, cacheWrite, messageCount, cost }) => ({ hour, input, output, cacheRead, cacheWrite, messageCount, cost })));
   });
 
@@ -55,9 +57,28 @@ describe("daily usage from an AIS native export", () => {
     expect(hourlyEntriesFromNativeMessages([message({ timestamp: at })], "UTC")[0]?.hour).toBe("2026-11-01 18:00");
   });
 
-  test("an unknown zone falls back to local time, as Tokscale does", () => {
+  test("the fixture really covers recovery rows, untimestamped rows and the DST hour", () => {
+    const keys = nativeExport.messages.map((m) => m.dedup_key ?? "");
+    expect(keys.some((k) => k.startsWith("local-recovery:daily:"))).toBe(true);
+    expect(nativeExport.messages.some((m) => m.timestamp === 0 && !String(m.dedup_key).startsWith("local-recovery:daily:"))).toBe(true);
+    // 01:00 EDT and 01:00 EST share one New York hour key.
+    const repeated = nativeExport.messages.filter((m) => m.timestamp >= Date.UTC(2026, 10, 1, 5) && m.timestamp < Date.UTC(2026, 10, 1, 7));
+    expect(new Set(repeated.map((m) => m.timestamp >= Date.UTC(2026, 10, 1, 6)))).toEqual(new Set([false, true]));
+    expect(hourlyEntriesFromNativeMessages(repeated, "America/New_York").map((e) => e.hour)).toEqual(["2026-11-01 01:00"]);
+  });
+
+  test("zone names follow chrono-tz: exact IANA names and links, anything else is local time", () => {
     const at = Date.UTC(2026, 10, 1, 18, 20);
-    expect(hourlyEntriesFromNativeMessages([message({ timestamp: at })], "Not/AZone")).toEqual(hourlyEntriesFromNativeMessages([message({ timestamp: at })]));
+    const local = hourlyEntriesFromNativeMessages([message({ timestamp: at })]);
+    for (const rejected of ["Not/AZone", "asia/bangkok", "ASIA/BANGKOK", "+07:00", "UTC+7", "GMT+7", "Etc/GMT+07", ""]) {
+      expect(tokscalePinnedZone(rejected)).toBeUndefined();
+      expect(hourlyEntriesFromNativeMessages([message({ timestamp: at })], rejected)).toEqual(local);
+    }
+    expect(tokscalePinnedZone(" Asia/Bangkok ")).toBe("Asia/Bangkok");
+    expect(tokscalePinnedZone("US/Eastern")).toBe("US/Eastern");
+    expect(tokscalePinnedZone("Etc/GMT-7")).toBe("Etc/GMT-7");
+    expect(tokscalePinnedZone("UTC")).toBe("UTC");
+    expect(hourlyEntriesFromNativeMessages([message({ timestamp: at })], "US/Eastern")[0]?.hour).toBe("2026-11-01 13:00");
   });
 
   test("skips recovery daily rows and undated balances, and keys timestamp-less rows by date", () => {
