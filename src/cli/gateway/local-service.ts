@@ -162,6 +162,24 @@ async function carryLegacyDropins(dir: string, names: UnitNames, log: (line: str
   return port === undefined ? {} : { port };
 }
 
+/** The AIS_GATEWAY_LOCAL_PORT the template's drop-ins set (last wins, a bare Environment= resets), or undefined. Read on every install: it is the one source of truth. */
+async function templateDropinPort(dir: string, names: UnitNames): Promise<number | undefined> {
+  const target = join(dir, `${names.template}.d`);
+  let port: number | undefined;
+  for (const f of (await readdir(target).catch(() => [] as string[])).filter((n) => n.endsWith(".conf")).sort()) {
+    const text = (await readFile(join(target, f), "utf8").catch(() => "")).replace(/\s*\\\r?\n\s*/g, " ");
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (/^Environment=\s*$/.test(line)) port = undefined;
+      else if (/^Environment=/.test(line)) {
+        const m = /AIS_GATEWAY_LOCAL_PORT=(\d+)/.exec(line);
+        if (m) port = Number(m[1]);
+      }
+    }
+  }
+  return port;
+}
+
 /**
  * Installs the template unit and starts or hands over the proxy without closing the port:
  * - first install: enable and start slot a;
@@ -207,28 +225,38 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
   const activeSlots = LOCAL_GATEWAY_SLOTS.filter((s) => states[s] === "active");
   const freeSlots = LOCAL_GATEWAY_SLOTS.filter((s) => states[s] === "idle");
 
+  let unitPort: number | undefined; // set when a legacy drop-in is carried in this run
+  const stoppedThisRun = new Set<LocalSlot>();
   /**
    * Leaves exactly one slot enabled, the active one. With respectDisabled a slot the user disabled is never re-enabled.
    * With both slots active, the one that answers on the port is kept and the other drains and is disabled; if neither answers, nothing is touched.
    */
-  const converge = async (): Promise<void> => {
-    const active: LocalSlot[] = [];
-    for (const slot of LOCAL_GATEWAY_SLOTS) if ((await stateOf(names.slot(slot))) === "active") active.push(slot);
-    let keep: LocalSlot | undefined = active.length === 1 ? active[0] : undefined;
-    if (active.length === 2) {
-      const answering = await (options.answeringInstance ?? (async () => (await fetchLocalStatus(undefined, fetch, true))?.instance))().catch(() => undefined);
-      keep = active.find((s) => s === answering);
-      if (!keep) {
-        log("gateway local: both slots are active and neither answers on the port; nothing was changed");
-        return;
+  const converge = async (startedThisRun?: LocalSlot): Promise<void> => {
+    let keep: LocalSlot | undefined;
+    if (startedThisRun) {
+      // This run started (and proved) this slot, and may have queued a stop of the other one that still reads "active": keep the new slot, no probe.
+      keep = startedThisRun;
+    } else {
+      const active: LocalSlot[] = [];
+      for (const slot of LOCAL_GATEWAY_SLOTS) if ((await stateOf(names.slot(slot))) === "active") active.push(slot);
+      keep = active.length === 1 ? active[0] : undefined;
+      if (active.length === 2) {
+        const port = unitPort ?? (await templateDropinPort(dir, names));
+        const answering = await (options.answeringInstance ?? (async () => (await fetchLocalStatus(port, fetch, true))?.instance))().catch(() => undefined);
+        keep = active.find((s) => s === answering);
+        if (!keep) {
+          log("gateway local: both slots are active and neither answers on the port; nothing was changed");
+          return;
+        }
+        const other = active.find((s) => s !== keep) as LocalSlot;
+        await soft(["stop", "--no-block", names.slot(other)]);
+        stoppedThisRun.add(other);
       }
-      const other = active.find((s) => s !== keep) as LocalSlot;
-      await soft(["stop", "--no-block", names.slot(other)]);
     }
     if (!keep) return;
     for (const slot of LOCAL_GATEWAY_SLOTS) {
       const enabled = await isEnabled(names.slot(slot));
-      if (slot === keep && !enabled && !options.respectDisabled) await soft(["enable", names.slot(slot)]);
+      if (slot === keep && !enabled && !options.respectDisabled && !stoppedThisRun.has(slot)) await soft(["enable", names.slot(slot)]);
       if (slot !== keep && enabled) await soft(["disable", names.slot(slot)]);
     }
   };
@@ -238,9 +266,9 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
     await ctl(["stop", names.slot(slot)]).catch(() => undefined);
     await ctl(["disable", names.slot(slot)]).catch(() => undefined);
   };
-  const startAndWait = async (slot: LocalSlot, port?: number): Promise<void> => {
+  const startAndWait = async (slot: LocalSlot): Promise<void> => {
     await must(["start", names.slot(slot)]);
-    await wait(slot, port);
+    await wait(slot, unitPort ?? (await templateDropinPort(dir, names)));
   };
 
   const legacyPath = join(dir, names.legacy);
@@ -249,7 +277,6 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
     const legacyActive = (await stateOf(names.legacy)) === "active";
     const legacyEnabled = await isEnabled(names.legacy);
     let carried = false;
-    let unitPort: number | undefined;
     const carry = async (): Promise<void> => {
       if (carried) return;
       carried = true;
@@ -278,8 +305,10 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
     let legacyStopped = false;
     const restoreLegacy = async (): Promise<void> => {
       await abandon(slot);
-      if (legacyActive && legacyStopped) await ctl(["start", names.legacy]);
-      else if (legacyActive && (await stateOf(names.legacy)) !== "active") await ctl(["start", names.legacy]);
+      if (legacyActive && (legacyStopped || (await stateOf(names.legacy)) !== "active")) {
+        const r = await ctl(["start", names.legacy]);
+        if (r.code !== 0) log(`gateway local: ERROR: could not start ${names.legacy} again after a failed migration (exit ${r.code}); no proxy may be running, start it by hand`);
+      }
     };
     try {
       // (b) Start the slot on the shared port. (c) The legacy unit stays up until the slot answers.
@@ -301,7 +330,7 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
     }
     if (legacyActive && !legacyStopped) await soft(["stop", "--no-block", names.legacy]);
     await retireLegacy();
-    await converge();
+    await converge(slot);
     return { path, changed, slot, action: "migrated" };
   }
 
@@ -316,7 +345,7 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
       await abandon(slot);
       throw err;
     }
-    await converge();
+    await converge(slot);
     return { path, changed, slot, action: "started" };
   }
 
@@ -343,8 +372,9 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
     throw err;
   }
   await soft(["stop", "--no-block", names.slot(current)]);
+  stoppedThisRun.add(current);
   await soft(["disable", names.slot(current)]);
-  await converge();
+  await converge(next);
   return { path, changed, slot: next, action: "handed-over" };
 }
 

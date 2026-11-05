@@ -346,6 +346,50 @@ describe("ais-gateway-local@.service", () => {
     });
   });
 
+  test("after a handoff whose stop is only queued, the new slot is kept even if the old one still reads active and answers", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      const sd = fakeSystemd({ active: [localSlotUnit("a")], enabled: [localSlotUnit("a")] });
+      const calls: string[] = [];
+      const r = await installLocalGatewayService({
+        unitDirectory: dir,
+        platform: "linux",
+        // A queued `stop --no-block` has not taken effect yet: slot a keeps reading "active".
+        ctl: async (args) => (calls.push(args.join(" ")), args[0] === "stop" && args[1] === "--no-block" ? { code: 0, out: "" } : sd.ctl(args)),
+        waitListening: async () => {},
+        answeringInstance: async () => "a",
+        restartIfActive: true,
+      });
+      expect(r).toMatchObject({ slot: "b", action: "handed-over" });
+      expect(sd.active.has(localSlotUnit("b"))).toBe(true);
+      expect(sd.enabled.has(localSlotUnit("b"))).toBe(true);
+      expect(calls.some((c) => c.startsWith("stop") && c.includes(localSlotUnit("b")))).toBe(false);
+      expect(calls).toContain(`stop --no-block ${localSlotUnit("a")}`);
+      expect(calls.filter((c) => c === `enable ${localSlotUnit("a")}`)).toHaveLength(0);
+    });
+  });
+
+  test("a port set in the template drop-ins is used by every later handoff wait", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      await mkdir(join(dir, `${LOCAL_GATEWAY_TEMPLATE_NAME}.d`));
+      await writeFile(join(dir, `${LOCAL_GATEWAY_TEMPLATE_NAME}.d`, "legacy-migrated.conf"), "[Service]\nEnvironment=AIS_GATEWAY_LOCAL_PORT=47999\n");
+      const sd = fakeSystemd({ active: [localSlotUnit("a")], enabled: [localSlotUnit("a")] });
+      const ports: Array<number | undefined> = [];
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, waitListening: async (_s, port) => void ports.push(port), restartIfActive: true });
+      expect(ports).toEqual([47999]);
+    });
+  });
+
+  test("a failed restart of the legacy unit after a failed migration is logged as an error", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir, { fail: (a) => a[0] === "start" && a[1] === LOCAL_GATEWAY_LEGACY_NAME });
+      const logs: string[] = [];
+      await expect(installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => true, waitListening: async () => { throw new Error("timeout"); }, log: (l) => logs.push(l) })).rejects.toThrow("timeout");
+      expect(logs.some((l) => l.includes("ERROR") && l.includes(LOCAL_GATEWAY_LEGACY_NAME))).toBe(true);
+    });
+  });
+
   test("doctor status reads the proxy mode and instance, undefined when down", async () => {
     const running = await startLocalGateway({ port: 0, members: async () => [], remoteBase: "http://remote.test", log: () => {}, clientToken: async () => undefined, instance: "b" });
     try {
