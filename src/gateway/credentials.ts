@@ -114,7 +114,7 @@ const TOOL_CONFIGS: Record<GatewayProvider, ToolConfig> = {
   opencode: OPENCODE_CONFIG,
 };
 
-/** Files whose newest mtime decides a reload. */
+/** Files whose mtimes decide a reload. */
 function watchedFiles(provider: GatewayProvider, dir: string): string[] {
   if (provider === "opencode") {
     const base = join(dir, "data", "opencode");
@@ -125,13 +125,17 @@ function watchedFiles(provider: GatewayProvider, dir: string): string[] {
 
 const OAUTH_PROVIDERS: ReadonlySet<GatewayProvider> = new Set(["claude", "codex", "grok", "kimi"]);
 
-async function newestMtime(provider: GatewayProvider, id: Identity, registry?: string): Promise<number | undefined> {
+/**
+ * One signature of every watched file's mtime, kept per file. A single newest mtime masked a rewrite of a
+ * file whose mtime stays below another watched file's (a pinned or future-dated native store beside a pi copy).
+ */
+async function mtimeSignature(provider: GatewayProvider, id: Identity, registry?: string): Promise<string | undefined> {
   const files = OAUTH_PROVIDERS.has(provider)
     ? await effectiveGrantPaths(provider as RefreshableTool, id, { claudeRegistryPath: registry }).catch(() => watchedFiles(provider, id.configDir))
     : watchedFiles(provider, id.configDir);
-  const times = await Promise.all(files.map((f) => stat(f).then((x) => x.mtimeMs, () => undefined)));
-  const present = times.filter((t): t is number => t !== undefined);
-  return present.length === 0 ? undefined : Math.max(...present);
+  const times = await Promise.all(files.map((f) => stat(f).then((x) => `${f}:${x.mtimeMs}`, () => undefined)));
+  const present = times.filter((t): t is string => t !== undefined);
+  return present.length === 0 ? undefined : present.join("\n");
 }
 
 /** The main credential file (paths from credential-paths.ts and the readers below). */
@@ -201,7 +205,7 @@ async function readCredential(provider: GatewayProvider, id: Identity, registry?
 }
 
 interface Entry {
-  mtimeMs: number;
+  signature: string;
   cred: ProviderCredential;
 }
 
@@ -225,10 +229,10 @@ export class CredentialCache {
     // pool, pi and kimi store lookups go by name, and an alias would miss them.
     const id = await this.resolve(provider, identity);
     const key = `${provider}\u0000${id.name}`;
-    const mtimeMs = await newestMtime(provider, id, this.deps.claudeRegistryPath);
+    const signature = await mtimeSignature(provider, id, this.deps.claudeRegistryPath);
     const cached = this.entries.get(key);
-    if (cached && mtimeMs !== undefined && cached.mtimeMs === mtimeMs) return cached.cred;
-    return this.load(provider, id, mtimeMs);
+    if (cached && signature !== undefined && cached.signature === signature) return cached.cred;
+    return this.load(provider, id, signature);
   }
 
   /**
@@ -278,11 +282,11 @@ export class CredentialCache {
   }
 
   private async reload(provider: GatewayProvider, id: Identity): Promise<ProviderCredential> {
-    const mtimeMs = await newestMtime(provider, id, this.deps.claudeRegistryPath);
-    return this.load(provider, id, mtimeMs);
+    const signature = await mtimeSignature(provider, id, this.deps.claudeRegistryPath);
+    return this.load(provider, id, signature);
   }
 
-  private async load(provider: GatewayProvider, id: Identity, mtimeMs: number | undefined): Promise<ProviderCredential> {
+  private async load(provider: GatewayProvider, id: Identity, signature: string | undefined): Promise<ProviderCredential> {
     let cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
     // Absent once could be a store mid-rewrite: only a second clean read that is also empty confirms a logged-out identity.
     if (!cred) {
@@ -290,7 +294,7 @@ export class CredentialCache {
       cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
     }
     if (!cred) throw new GatewayCredentialError(isSwapPool(id) ? "no-credential" : "login-dead", provider, id.name);
-    if (mtimeMs !== undefined) this.entries.set(`${provider}\u0000${id.name}`, { mtimeMs, cred });
+    if (signature !== undefined) this.entries.set(`${provider}\u0000${id.name}`, { signature, cred });
     return cred;
   }
 

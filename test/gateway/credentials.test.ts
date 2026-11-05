@@ -265,9 +265,22 @@ describe("CredentialCache", () => {
 
   test("claude: pi copy changing is noticed through the mtime watch set", async () => {
     const piAuth = await registerPi();
+    await utimes(claudeFile(), 1_700_000_000, 1_700_000_000);
     const c = makeCache();
     expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0001");
     await writeFile(piAuth, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE-claude-pi-0002", refresh: "SYNTHETIC_FIXTURE-claude-pi-refresh", expires: 1_900_000_000_000 } }));
+    await utimes(piAuth, 1_750_000_000, 1_750_000_000);
+    expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-pi-0002");
+  });
+
+  test("claude: a pi copy rewrite is noticed even when its mtime is older than the native store's", async () => {
+    const piAuth = await registerPi();
+    // Native pinned far in the future and the pi copy given an explicit older mtime: a single newest-mtime key would never move.
+    await utimes(claudeFile(), 2_000_000_000, 2_000_000_000);
+    const c = makeCache();
+    expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0001");
+    await writeFile(piAuth, JSON.stringify({ anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE-claude-pi-0002", refresh: "SYNTHETIC_FIXTURE-claude-pi-refresh", expires: 1_900_000_000_000 } }));
+    await utimes(piAuth, 1_700_000_000, 1_700_000_000);
     expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-pi-0002");
   });
 
