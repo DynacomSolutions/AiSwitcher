@@ -191,6 +191,9 @@ export async function buildAisTokscaleExportInvocation(
       TOKSCALE_CONFIG_DIR: join(aisCacheDir(), "usage", "native-tokscale", "isolated-config"),
       TOKSCALE_AIS_EXPORT_PATH: target.exportPath,
       TOKSCALE_AIS_PARTITION_ID: target.partitionId,
+      // A warm scan trusts an exact size and mtime match, so an unchanged
+      // transcript is only stat'ed, never read (vendor/tokscale README).
+      TOKSCALE_AIS_STAT_ONLY_CACHE: "1",
     },
     cwd: process.cwd(),
     ...(target.signal ? { signal: target.signal } : {}),

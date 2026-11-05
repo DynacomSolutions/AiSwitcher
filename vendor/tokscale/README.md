@@ -5,7 +5,7 @@ This patch targets the unmodified `junhoyeo/tokscale` v4.20.0 release archive
 `73376cdde65268d18de5d319d8cad416d3370101201284f50d573430058dc533`). The
 upstream licence is preserved in `LICENSE`.
 
-The patch adds two AIS-only surfaces:
+The patch adds three AIS-only surfaces:
 
 - A successful local native parse writes a complete JSON batch atomically when
   both `TOKSCALE_AIS_EXPORT_PATH` and `TOKSCALE_AIS_PARTITION_ID` are set. The
@@ -30,10 +30,24 @@ The patch adds two AIS-only surfaces:
   The Pi client also honours AIS's existing `PI_CODING_AGENT_DIR` identity
   boundary.
 
+- Warm scans stay incremental. A Claude subagent whose sibling `.meta.json`
+  names its `agentType` never reads its parent session, so the parent is no
+  longer a cache dependency of that subagent: a long-running parent session no
+  longer forces every one of its subagents to be re-parsed on each scan. The
+  sidecar stays watched: when it changes or is removed, the parent is probed
+  and recorded again, and a subagent without a named type still follows its
+  parent. With `TOKSCALE_AIS_STAT_ONLY_CACHE=1`, an exact size and
+  nanosecond mtime match is a cache hit without reading the bounded content
+  samples, so an unchanged transcript is only stat'ed. Appended transcripts
+  still resume from their checkpoint (the cached prefix is re-hashed, then only
+  the new bytes are parsed), and changed files are re-parsed. Claude's
+  retained history for deleted transcripts is unchanged upstream behaviour.
+
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
-sets the attempt-unique export path and opaque partition key. For default
+sets the attempt-unique export path and opaque partition key, and enables
+the stat-only warm cache. For default
 OpenCode it points `XDG_DATA_HOME` at the exact default profile's data root.
 Z.ai and Alibaba are unsupported for native batch capture and remain
 explicitly outside this coverage.

@@ -122,6 +122,19 @@ describe("AIS native export cache seeding", () => {
     expect(invocation?.env.TOKSCALE_CONFIG_DIR).toContain("/usage/native-tokscale/isolated-config");
   });
 
+  test("asks the patched exporter for the stat-only warm cache", async () => {
+    const dir = await makeConfigDir();
+    const command = join(dir, "fake-tokscale");
+    await writeFile(command, "#!/bin/sh\nexit 0\n");
+    await chmod(command, 0o700);
+    const invocation = await buildAisTokscaleExportInvocation({
+      toolName: "claude", identity: identity("/identity/claude"),
+      partitionId: "c".repeat(64), exportPath: join(dir, "candidate.json"),
+    }, { AIS_TOKSCALE_SHARED_BIN: command });
+    expect(invocation?.env.TOKSCALE_AIS_STAT_ONLY_CACHE).toBe("1");
+    expect(invocation?.env.TOKSCALE_CONFIG_DIR).toContain("/usage/native-tokscale/isolated-config");
+  });
+
   test("uses caller XDG_CONFIG_HOME when no Tokscale config override exists", async () => {
     const dir = await makeConfigDir();
     const command = join(dir, "fake-tokscale");
