@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CLAUDE_CONFIG, ZAI_CONFIG } from "../../src/identities/tool-configs.ts";
 import { startSessionWork, type SessionSpec } from "../../src/shared/session-sidecar.ts";
-import { acquireDaemonLock, createProfileSyncDaemon, watchTargets } from "../../src/sync/profile-sync-daemon.ts";
+import { acquireDaemonLock, createProfileSyncDaemon, ownsDaemonLock, watchTargets } from "../../src/sync/profile-sync-daemon.ts";
 import { listLiveSessions, registerSession, unregisterSession, type RegisteredSession } from "../../src/sync/session-registry.ts";
 import type { SyncRunOptions } from "../../src/sync/types.ts";
 import { scanTree } from "../../src/sync/watch.ts";
@@ -65,6 +65,17 @@ describe("session registry", () => {
     const live = listLiveSessions((pid, startTime) => pid === 11 || (pid === 12 && startTime === "999"), dir);
     expect(live.map((s) => s.pid)).toEqual([11]);
     expect(readdirSync(dir)).toEqual(["11-100.json"]);
+  });
+
+  test("leftover temporary files are removed once they are a few minutes old", () => {
+    const dir = tempDir();
+    const old = join(dir, "11-100.json.4242.tmp");
+    const recent = join(dir, "12-100.json.4243.tmp");
+    writeFileSync(old, "{");
+    writeFileSync(recent, "{");
+    utimesSync(old, new Date(Date.now() - 10 * 60_000), new Date(Date.now() - 10 * 60_000));
+    expect(listLiveSessions(() => true, dir)).toEqual([]);
+    expect(readdirSync(dir)).toEqual(["12-100.json.4243.tmp"]);
   });
 
   test("a missing registry is no sessions", () => {
@@ -145,7 +156,7 @@ describe("profile sync daemon", () => {
     h.exit(1);
     await h.daemon.tick();
     writeFileSync(join(root, "x.json"), "x");
-    h.start(session({ pid: 2, configDir: root }));
+    h.start(session({ pid: 2, configDir: root, registeredAt: Date.now() + 60_000 }));
     expect((await h.daemon.tick()).syncs).toBe(0);
   });
 
@@ -173,6 +184,52 @@ describe("profile sync daemon", () => {
     writeFileSync(join(config, "crush.json"), "{}");
     await h.daemon.tick();
     expect(h.syncs.map((s) => (s.scope as { cwd?: string }).cwd)).toEqual([undefined]);
+  });
+
+  test("a write between registration and the first scan is a change (one sync)", async () => {
+    const h = harness();
+    const root = join(h.base, "cfg");
+    mkdirSync(root);
+    writeFileSync(join(root, "old.json"), "x");
+    utimesSync(join(root, "old.json"), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+    await h.daemon.tick();
+    h.start(session({ pid: 1, configDir: root }));
+    writeFileSync(join(root, "history.jsonl"), "first prompt\n");
+    await h.daemon.tick();
+    await h.daemon.tick();
+    expect(h.syncs.length).toBe(1);
+  });
+
+  test("after a daemon restart, writes since the session registered are synced once; older files are baseline", async () => {
+    const base = tempDir();
+    const registryDir = join(base, "sessions");
+    const root = join(base, "cfg");
+    mkdirSync(root);
+    const registeredAt = Date.now() - 120_000;
+    writeFileSync(join(root, "before.json"), "x");
+    utimesSync(join(root, "before.json"), new Date(registeredAt - 60_000), new Date(registeredAt - 60_000));
+    registerSession(session({ pid: 1, configDir: root, registeredAt }), registryDir);
+    const syncs: SyncRunOptions[] = [];
+    const fresh = () => createProfileSyncDaemon({ registryDir, isRunning: () => true, sync: (o) => void syncs.push(o), markDirty: () => {} });
+    expect((await fresh().tick()).syncs).toBe(0);
+    // Written while the daemon was down, after the session registered.
+    writeFileSync(join(root, "during-downtime.json"), "x");
+    utimesSync(join(root, "during-downtime.json"), new Date(registeredAt + 30_000), new Date(registeredAt + 30_000));
+    const restarted = fresh();
+    expect((await restarted.tick()).syncs).toBe(1);
+    expect((await restarted.tick()).syncs).toBe(0);
+  });
+
+  test("a session file without registeredAt falls back to the daemon start time", async () => {
+    const h = harness();
+    const root = join(h.base, "cfg");
+    mkdirSync(root);
+    writeFileSync(join(root, "old.json"), "x");
+    utimesSync(join(root, "old.json"), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+    h.running.add(1);
+    mkdirSync(h.registryDir, { recursive: true });
+    writeFileSync(join(h.registryDir, "1-na.json"), JSON.stringify({ v: 1, ...session({ pid: 1, configDir: root }) }));
+    expect((await h.daemon.tick()).syncs).toBe(0);
   });
 
   test("watchTargets ignores unknown tools", () => {
@@ -217,6 +274,45 @@ describe("daemon single instance", () => {
     ownerAlive = false;
     expect(acquireDaemonLock(lock, isRunning)).toBe(true);
     expect(readFileSync(lock, "utf8").startsWith(`${process.pid} `)).toBe(true);
+  });
+
+  test("two starters racing over one stale lock: only one wins", () => {
+    const lock = join(tempDir(), "daemon.pid");
+    writeFileSync(lock, "999999 1\n");
+    let bAcquired = false;
+    // While C judges the stale owner, starter B takes the lock over first.
+    const cResult = acquireDaemonLock(lock, (pid) => {
+      if (pid === 999999 && !bAcquired) {
+        unlinkSync(lock);
+        writeFileSync(lock, "555 77\n", { flag: "wx" });
+        bAcquired = true;
+        return false;
+      }
+      return pid === 555;
+    });
+    expect(cResult).toBe(false);
+    expect(readFileSync(lock, "utf8")).toBe("555 77\n");
+  });
+
+  test("an empty or unparseable lock is busy during the grace period, then stale", () => {
+    const lock = join(tempDir(), "daemon.pid");
+    writeFileSync(lock, "");
+    expect(acquireDaemonLock(lock, () => true)).toBe(false);
+    expect(readFileSync(lock, "utf8")).toBe("");
+    writeFileSync(lock, "garbage");
+    expect(acquireDaemonLock(lock, () => true)).toBe(false);
+    utimesSync(lock, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+    expect(acquireDaemonLock(lock, () => true)).toBe(true);
+    expect(ownsDaemonLock(lock)).toBe(true);
+  });
+
+  test("the lock is created with its content and leaves no temporary files", () => {
+    const dir = tempDir();
+    const lock = join(dir, "daemon.pid");
+    expect(acquireDaemonLock(lock, () => false)).toBe(true);
+    expect(readFileSync(lock, "utf8").startsWith(`${process.pid} `)).toBe(true);
+    expect(readdirSync(dir)).toEqual(["daemon.pid"]);
+    expect(acquireDaemonLock(lock, () => true)).toBe(true);
   });
 
   test("a reused PID with a different start time does not hold the lock", () => {

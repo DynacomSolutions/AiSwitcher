@@ -15,8 +15,9 @@ RestartSec=10s
 Nice=10
 IOSchedulingClass=idle
 CPUQuota=200%
-MemoryHigh=1G
-MemoryMax=2G
+# No MemoryMax: the detached syncs share this cgroup and an OOM kill could
+# hit one mid-merge. MemoryHigh only throttles.
+MemoryHigh=4G
 # The background syncs it starts are detached workers; a restart of the
 # watcher must not kill a sync that is mid-transfer.
 KillMode=process

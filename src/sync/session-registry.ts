@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { aisStateDir } from "../shared/ais-home.ts";
 
@@ -24,11 +24,16 @@ export interface RegisteredSession {
   /** The real tool's PID (the wrapper's PID, which the tool takes over via execve). */
   pid: number;
   startTime?: string;
+  /** When the session registered (epoch ms): the daemon's first scan of a root counts writes since then. */
+  registeredAt?: number;
 }
 
 export type IsRunning = (pid: number, startTime?: string) => boolean;
 
 const EXT = ".json";
+/** A temporary file left by a registration that died between write and rename. */
+const TEMP_PATTERN = /\.json\.\d+\.tmp$/;
+const TEMP_MAX_AGE_MS = 5 * 60_000;
 
 export function sessionRegistryDir(): string {
   return join(aisStateDir(), "profile-sync", "sessions");
@@ -45,7 +50,7 @@ export function registerSession(session: Omit<RegisteredSession, "v">, dir = ses
   const file = join(dir, entryName(session.pid, session.startTime));
   const temporary = `${file}.${process.pid}.tmp`;
   try {
-    writeFileSync(temporary, JSON.stringify({ v: 1, ...session }), { mode: 0o600 });
+    writeFileSync(temporary, JSON.stringify({ v: 1, registeredAt: Date.now(), ...session }), { mode: 0o600 });
     renameSync(temporary, file);
   } catch (error) {
     try { unlinkSync(temporary); } catch { /* nothing left behind */ }
@@ -78,7 +83,9 @@ function parse(raw: string): RegisteredSession | undefined {
 }
 
 /** Live registered sessions; removes entries whose process is gone or which
- * cannot be parsed. A missing directory means no sessions. */
+ * cannot be parsed, and temporary files from a registration that died
+ * mid-write once they are a few minutes old. A missing directory means no
+ * sessions. */
 export function listLiveSessions(isRunning: IsRunning, dir = sessionRegistryDir()): RegisteredSession[] {
   let names: string[];
   try {
@@ -88,6 +95,12 @@ export function listLiveSessions(isRunning: IsRunning, dir = sessionRegistryDir(
   }
   const live: RegisteredSession[] = [];
   for (const name of names) {
+    if (TEMP_PATTERN.test(name)) {
+      try {
+        if (Date.now() - statSync(join(dir, name)).mtimeMs > TEMP_MAX_AGE_MS) unlinkSync(join(dir, name));
+      } catch { /* gone already */ }
+      continue;
+    }
     if (!name.endsWith(EXT)) continue;
     const file = join(dir, name);
     let raw: string;
