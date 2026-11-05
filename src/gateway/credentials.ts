@@ -5,6 +5,7 @@ import { readAliApiKey } from "../identities/ali-auth.ts";
 import { nativeStorePathFor } from "../identities/oauth-reconcile.ts";
 import { effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
+import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
 import { readOpencodeAuth, readOpencodeV2Credentials } from "../cli/limits/opencode-limits.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
@@ -93,7 +94,7 @@ export class GatewayCredentialError extends Error {
 
   /** True when only a person can fix it: the login is gone or revoked. */
   get loggedOut(): boolean {
-    return this.code === "login-dead" || this.code === "no-credential";
+    return this.code === "login-dead";
   }
 
   /** Text for the client: plain about a dead login, a bare reason code otherwise. */
@@ -263,14 +264,17 @@ export class CredentialCache {
       result = await this.refresh(provider as RefreshableTool, id, { force: true, expectedAccessToken: staleToken });
     } catch (err) {
       // Raw errors can carry lock paths or provider text: keep them as `cause` only.
-      const revoked = err instanceof OAuthRefreshError && err.revoked;
+      // Only a real OAuth invalid_grant in the token endpoint's body proves the login is gone; any other 400/401 is not enough.
+      const revoked = err instanceof OAuthRefreshError && err.revoked && err.oauthCode === "invalid_grant";
       throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
     if (next.accessToken !== staleToken) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
-    throw new GatewayCredentialError(result.outcome === "no-grant" || result.outcome === "skipped-revoked" ? "login-dead" : result.outcome === "failed" ? "refresh-failed" : "token-unchanged", provider, identity);
+    // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
+    const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id)) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" ? "refresh-failed" : "token-unchanged";
+    throw new GatewayCredentialError(code, provider, identity);
   }
 
   private async reload(provider: GatewayProvider, id: Identity): Promise<ProviderCredential> {
@@ -279,8 +283,13 @@ export class CredentialCache {
   }
 
   private async load(provider: GatewayProvider, id: Identity, mtimeMs: number | undefined): Promise<ProviderCredential> {
-    const cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
-    if (!cred) throw new GatewayCredentialError("no-credential", provider, id.name);
+    let cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
+    // Absent once could be a store mid-rewrite: only a second clean read that is also empty confirms a logged-out identity.
+    if (!cred) {
+      await new Promise((r) => setTimeout(r, 50));
+      cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
+    }
+    if (!cred) throw new GatewayCredentialError(isSwapPool(id) ? "no-credential" : "login-dead", provider, id.name);
     if (mtimeMs !== undefined) this.entries.set(`${provider}\u0000${id.name}`, { mtimeMs, cred });
     return cred;
   }

@@ -9,6 +9,7 @@ describe("ais gateway local service", () => {
   test("unit restarts always, starts before Herdr and installs idempotently", async () => {
     expect(LOCAL_GATEWAY_UNIT).toContain("Restart=always");
     expect(LOCAL_GATEWAY_UNIT).toContain("ExecStart=%h/.local/bin/ais gateway local");
+    expect(LOCAL_GATEWAY_UNIT).toContain("ExecStartPost=");
     expect(LOCAL_GATEWAY_UNIT).toMatch(/Before=.*herdr-host\.service/);
     const dir = await mkdtemp(join(tmpdir(), "ais-gw-local-"));
     try {
@@ -25,7 +26,7 @@ describe("ais gateway local service", () => {
   });
 
   test("doctor status reads the proxy mode, undefined when down", async () => {
-    const running = await startLocalGateway({ port: 0, members: async () => [], remoteBase: "http://127.0.0.1:9", log: () => {} });
+    const running = await startLocalGateway({ port: 0, members: async () => [], remoteBase: "http://127.0.0.1:9", log: () => {}, clientToken: async () => undefined });
     try {
       expect((await fetchLocalStatus(running.port))?.mode).toBe("remote");
     } finally {

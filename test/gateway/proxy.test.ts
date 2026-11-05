@@ -556,6 +556,19 @@ describe("dead login", () => {
     expect(body.type).toBe("error");
     expect(body.error.message).toContain('claude identity "id1" is logged out');
     expect(body.error.message).toContain("claude --identity=id1");
+    expect(res.status).toBe(502);
+  });
+
+  test("every gateway-made response carries x-ais-gateway: 1 (errors, unknown app, success)", async () => {
+    const t = await addApp(baseApp({}));
+    const bad = await call("/pin/v1/messages", "wrong", { method: "POST", body: "{}" });
+    expect(bad.status).toBe(401);
+    expect(bad.headers.get("x-ais-gateway")).toBe("1");
+    const unknown = await call("/nope/v1/messages", t, { method: "POST", body: "{}" });
+    expect(unknown.headers.get("x-ais-gateway")).toBe("1");
+    handler = () => new Response("{}", { status: 200 });
+    const ok = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(ok.headers.get("x-ais-gateway")).toBe("1");
   });
 });
 

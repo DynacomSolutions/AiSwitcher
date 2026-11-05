@@ -77,8 +77,11 @@ import type { KimiOAuthCredentials } from "../cli/limits/kimi-limits.ts";
 export class OAuthRefreshError extends Error {
   readonly revoked: boolean;
   readonly refreshFingerprint?: string;
-  constructor(message: string, revoked: boolean, refreshFingerprint?: string) {
+  /** The OAuth `error` code from the token endpoint's JSON body, when it sent one (for example "invalid_grant"). */
+  readonly oauthCode?: string;
+  constructor(message: string, revoked: boolean, refreshFingerprint?: string, oauthCode?: string) {
     super(message);
+    this.oauthCode = oauthCode;
     this.name = "OAuthRefreshError";
     this.revoked = revoked;
     this.refreshFingerprint = refreshFingerprint;
@@ -152,6 +155,8 @@ export async function postRefreshTokenGrant(
     throw new OAuthRefreshError(
       `token refresh rejected (HTTP ${response.status}${code ? ` ${code}` : ""})`,
       revoked,
+      undefined,
+      code,
     );
   }
   return parsed;
@@ -809,6 +814,7 @@ async function refreshGrantUnlocked(
         `${err.message} — re-login required: ${REFRESH_HINTS[tool]}`,
         true,
         beforeFingerprint,
+        err.oauthCode,
       );
     }
     throw err;

@@ -14,6 +14,9 @@ Before=herdr-host.service herdr-session-restore.service
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/ais gateway local
+# Ready only once the port listens, so units ordered After= this one (Herdr) never race the proxy. $$ is systemd's escape for a literal $.
+ExecStartPost=/usr/bin/env bash -c 'p=\$\${AIS_GATEWAY_LOCAL_PORT:-47140}; for i in $$(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$$p) 2>/dev/null && exit 0; sleep 0.1; done; exit 1'
+TimeoutStartSec=15s
 Restart=always
 RestartSec=2s
 
@@ -26,6 +29,8 @@ export interface InstallLocalOptions {
   platform?: NodeJS.Platform;
   reloadAndVerify?: (serviceName: string) => Promise<void>;
   enableStartAndVerify?: (serviceName: string, restartIfActive: boolean) => Promise<void>;
+  /** Restart an active proxy even when the unit text is unchanged (the ais binary was replaced). */
+  restartIfActive?: boolean;
 }
 
 /** Atomically writes, enables and starts the per-user unit (same flow as the usage collector unit). */
@@ -50,7 +55,7 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
     }
   }
   await (options.reloadAndVerify ?? reloadAndVerifyUserUnit)(LOCAL_GATEWAY_SERVICE_NAME);
-  await (options.enableStartAndVerify ?? enableStartAndVerifyUserUnit)(LOCAL_GATEWAY_SERVICE_NAME, changed);
+  await (options.enableStartAndVerify ?? enableStartAndVerifyUserUnit)(LOCAL_GATEWAY_SERVICE_NAME, changed || (options.restartIfActive ?? false));
   return { path, changed };
 }
 

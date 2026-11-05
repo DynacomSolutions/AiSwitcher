@@ -5,6 +5,8 @@ import { createLocalGateway, type LocalGatewayDeps, startLocalGateway, type Loca
 const enc = new TextEncoder();
 const CLIENT_KEY = String(Math.random());
 const REMOTE = "http://remote.invalid";
+const HOSTS = ["127.0.0.1:47140", "localhost:47140"];
+const coded = (code: string): Error => Object.assign(new TypeError(code), { code });
 
 interface Call {
   url: string;
@@ -13,10 +15,10 @@ interface Call {
 }
 
 /** Fake network: `remote` answers REMOTE urls, `upstream` answers provider urls; every call is recorded. */
-function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream?: (c: Call, identity: string) => Response | Promise<Response>; creds?: Partial<LocalGatewayDeps["creds"]>; now?: number; members?: string[]; breakerMs?: number; connectMs?: number; idleMs?: number; reachable?: boolean }) {
+function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream?: (c: Call, identity: string) => Response | Promise<Response>; creds?: Partial<LocalGatewayDeps["creds"]>; now?: number; members?: string[]; breakerMs?: number; idleMs?: number }) {
   const calls: Call[] = [];
   const logs: string[] = [];
-  const tokenOf: Record<string, string> = { a: "tok-a", b: "tok-b" };
+  const tokenOf: Record<string, string> = { a: "tok-a", b: "tok-b", c: "tok-c" };
   let clock = 1_000_000;
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
@@ -44,9 +46,9 @@ function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream
     members: async () => opts.members ?? ["a", "b"],
     log: (l) => logs.push(l),
     ...(opts.breakerMs !== undefined ? { breakerMs: opts.breakerMs } : {}),
-    ...(opts.connectMs !== undefined ? { connectMs: opts.connectMs } : {}),
     ...(opts.idleMs !== undefined ? { idleMs: opts.idleMs } : {}),
-    reachable: async () => opts.reachable ?? true,
+    clientToken: async () => CLIENT_KEY,
+    allowedHosts: () => HOSTS,
   });
   const post = (path = "/claude/v1/messages", body = '{"model":"m"}') =>
     gw.handle(new Request(`http://127.0.0.1:47140${path}`, { method: "POST", body, headers: { "x-api-key": CLIENT_KEY } }));
@@ -54,7 +56,7 @@ function rig(opts: { remote: (c: Call) => Response | Promise<Response>; upstream
 }
 
 const refused = (): Response => {
-  throw new TypeError("connect ECONNREFUSED");
+  throw coded("ECONNREFUSED");
 };
 
 function sse(chunks: string[]): Response {
@@ -96,23 +98,55 @@ describe("local gateway failover", () => {
       creds: { get: async (_p, identity) => ({ identity, accessToken: "t" }), refreshAfter401: async (_p, identity) => ({ identity, accessToken: "t" }) },
       members: async () => ["a"],
       log: () => {},
+      clientToken: async () => CLIENT_KEY,
+      allowedHosts: () => HOSTS,
     });
-    const res = await gw.handle(new Request("http://127.0.0.1:47140/codex/responses", { method: "POST", body: "{}" }));
+    const res = await gw.handle(new Request("http://127.0.0.1:47140/codex/responses", { method: "POST", body: "{}", headers: { authorization: `Bearer ${CLIENT_KEY}` } }));
     expect(await res.text()).toBe("direct-ok");
     expect(calls[1]).toBe("https://chatgpt.com/backend-api/codex/responses");
   });
 
-  test("remote 503 falls back; 502 and 504 too", async () => {
+  test("an edge 502, 503 or 504 (no gateway mark) falls back", async () => {
     for (const status of [502, 503, 504]) {
-      const r = rig({ remote: () => new Response("down", { status }) });
-      const res = await r.post();
-      expect(await res.text()).toBe("direct");
+      const r = rig({ remote: () => new Response("no healthy upstream", { status }) });
+      expect(await (await r.post()).text()).toBe("direct");
       expect(r.gw.status().mode).toBe("direct");
     }
   });
 
+  test("a 5xx the gateway itself made (marked) passes through untouched and never opens the breaker", async () => {
+    for (const status of [502, 503, 504]) {
+      const r = rig({ remote: () => new Response('{"error":"login is out"}', { status, headers: { "x-ais-gateway": "1" } }) });
+      const res = await r.post();
+      expect(res.status).toBe(status);
+      expect(await res.text()).toBe('{"error":"login is out"}');
+      expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
+      expect(r.gw.status().mode).toBe("remote");
+    }
+  });
+
+  test("pre-send errors fail over: refused, DNS, TLS handshake, connect timeout", async () => {
+    for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EPROTO", "CERT_HAS_EXPIRED", "ETIMEDOUT"]) {
+      const r = rig({ remote: () => { throw coded(code); } });
+      expect(await (await r.post()).text()).toBe("direct");
+    }
+  });
+
+  test("ECONNRESET after send is a 502 to the client with no direct call and no breaker", async () => {
+    for (const code of ["ECONNRESET", "UND_ERR_SOCKET", "SOMETHING_ELSE"]) {
+      const r = rig({ remote: () => { throw coded(code); } });
+      const res = await r.post();
+      expect(res.status).toBe(502);
+      expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
+      expect(r.gw.status().mode).toBe("remote");
+    }
+    const plain = rig({ remote: () => { throw new Error("no code at all"); } });
+    expect((await plain.post()).status).toBe(502);
+    expect(plain.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
+  });
+
   test("a slow first byte is never replayed and does not open the breaker", async () => {
-    const r = rig({ connectMs: 15, remote: () => new Promise<Response>((resolve) => setTimeout(() => resolve(new Response("slow-remote")), 120)) });
+    const r = rig({ remote: () => new Promise<Response>((resolve) => setTimeout(() => resolve(new Response("slow-remote")), 150)) });
     const res = await r.post();
     expect(await res.text()).toBe("slow-remote");
     expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
@@ -120,14 +154,8 @@ describe("local gateway failover", () => {
     expect(r.logs).toHaveLength(0);
   });
 
-  test("a connect that never completes (not reachable after the connect window) fails over", async () => {
-    const r = rig({ connectMs: 15, reachable: false, remote: () => new Promise<Response>(() => {}) });
-    expect(await (await r.post()).text()).toBe("direct");
-    expect(r.logs[0]).toContain("unreachable");
-  });
-
   test("past the idle ceiling the client gets a 504 and nothing is replayed", async () => {
-    const r = rig({ connectMs: 10, idleMs: 30, remote: () => new Promise<Response>(() => {}) });
+    const r = rig({ idleMs: 30, remote: () => new Promise<Response>(() => {}) });
     const res = await r.post();
     expect(res.status).toBe(504);
     expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
@@ -209,7 +237,7 @@ describe("local gateway failover", () => {
     expect(r.logs).toHaveLength(1);
   });
 
-  test("429 on the active member tries the next member once", async () => {
+  test("429 on the active member tries the next members, each once", async () => {
     const seen: string[] = [];
     const r = rig({
       members: ["a", "b", "c"],
@@ -225,7 +253,7 @@ describe("local gateway failover", () => {
     const r2 = rig({ members: ["a", "b", "c"], remote: refused, upstream: (_c, id) => (seen.push(id), new Response("limit", { status: 429 })) });
     const res = await r2.post();
     expect(res.status).toBe(429);
-    expect(seen).toEqual(["a", "b"]); // never a third
+    expect(seen).toEqual(["a", "b", "c"]); // every member once, then the last answer
   });
 
   test("quota error body on 403 also moves to the next member", async () => {
@@ -318,8 +346,49 @@ describe("local gateway failover", () => {
     expect((await r.gw.handle(new Request("http://127.0.0.1:47140/other/x"))).status).toBe(404);
   });
 
+  test("a missing or wrong local key is refused in both modes", async () => {
+    for (const remote of [() => new Response("remote"), refused]) {
+      const r = rig({ remote });
+      const none = await r.gw.handle(new Request("http://127.0.0.1:47140/claude/v1/messages", { method: "POST", body: "{}" }));
+      expect(none.status).toBe(401);
+      const wrong = await r.gw.handle(new Request("http://127.0.0.1:47140/claude/v1/messages", { method: "POST", body: "{}", headers: { "x-api-key": `${CLIENT_KEY}x` } }));
+      expect(wrong.status).toBe(401);
+      expect(r.calls).toHaveLength(0);
+      const bearer = await r.gw.handle(new Request("http://127.0.0.1:47140/claude/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${CLIENT_KEY}` } }));
+      expect(bearer.status).toBe(200);
+    }
+  });
+
+  test("a Host other than 127.0.0.1:<port> or localhost:<port> is refused with 403", async () => {
+    const r = rig({ remote: () => new Response("remote") });
+    for (const host of ["evil.example:47140", "127.0.0.1:1", "127.0.0.1", "gw.test:47140"]) {
+      const res = await r.gw.handle(new Request("http://127.0.0.1:47140/claude/v1/messages", { method: "POST", body: "{}", headers: { host, "x-api-key": CLIENT_KEY } }));
+      expect(res.status).toBe(403);
+    }
+    const ok = await r.gw.handle(new Request("http://127.0.0.1:47140/claude/v1/messages", { method: "POST", body: "{}", headers: { host: "localhost:47140", "x-api-key": CLIENT_KEY } }));
+    expect(ok.status).toBe(200);
+    const st = await r.gw.handle(new Request("http://127.0.0.1:47140/__ais/status", { headers: { host: "evil.example:47140" } }));
+    expect(st.status).toBe(403);
+    expect(r.calls).toHaveLength(1);
+  });
+
+  test("every pool member is tried, in order, and a logged-out one is logged once", async () => {
+    const seen: string[] = [];
+    const r = rig({
+      members: ["a", "b", "c", "d"],
+      remote: refused,
+      creds: { get: async (_p, identity) => { if (identity === "a") throw new GatewayCredentialError("login-dead", "claude", "a"); return { identity, accessToken: identity === "d" ? "tok-x" : `tok-${identity}` }; } },
+      upstream: (c) => { seen.push(c.headers.get("authorization") ?? ""); return c.headers.get("authorization") === "Bearer tok-x" ? new Response("from-d") : new Response("limit", { status: 429 }); },
+    });
+    const res = await r.post();
+    expect(await res.text()).toBe("from-d");
+    expect(seen).toEqual(["Bearer tok-b", "Bearer tok-c", "Bearer tok-x"]);
+    await r.post();
+    expect(r.logs.filter((l) => l.includes('member "a" is logged out'))).toHaveLength(1);
+  });
+
   test("binds to 127.0.0.1 only", async () => {
-    const running = await startLocalGateway({ port: 0, members: async () => [], remoteBase: REMOTE, log: () => {} });
+    const running = await startLocalGateway({ port: 0, members: async () => [], remoteBase: REMOTE, log: () => {}, clientToken: async () => CLIENT_KEY });
     try {
       const probe = await fetch(`http://127.0.0.1:${running.port}/__ais/status`);
       expect(probe.status).toBe(200);
@@ -327,5 +396,23 @@ describe("local gateway failover", () => {
     } finally {
       running.stop();
     }
+  });
+});
+
+describe("local gateway without a cluster URL", () => {
+  test("runs direct-only instead of failing", async () => {
+    const gw = createLocalGateway({
+      remoteBase: "",
+      fetch: (async () => new Response("direct")) as unknown as typeof fetch,
+      now: Date.now,
+      creds: { get: async (_p, identity) => ({ identity, accessToken: "t" }), refreshAfter401: async (_p, identity) => ({ identity, accessToken: "t" }) },
+      members: async () => ["a"],
+      log: () => {},
+      clientToken: async () => CLIENT_KEY,
+      allowedHosts: () => HOSTS,
+    });
+    const res = await gw.handle(new Request("http://127.0.0.1:47140/claude/v1/messages", { method: "POST", body: "{}", headers: { "x-api-key": CLIENT_KEY } }));
+    expect(await res.text()).toBe("direct");
+    expect(gw.status().mode).toBe("direct");
   });
 });

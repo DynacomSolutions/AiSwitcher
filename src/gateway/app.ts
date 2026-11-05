@@ -211,8 +211,27 @@ async function discard(res: Response): Promise<void> {
   }
 }
 
+/** Set on every response the gateway app itself produces. A 5xx without it came from an edge in front (for example "no healthy upstream" during a restart). */
+export const GATEWAY_MARK_HEADER = "x-ais-gateway";
+
+/** Marks `res` as gateway-made; returns a copy when the headers are immutable. */
+export function markGatewayResponse(res: Response): Response {
+  try {
+    res.headers.set(GATEWAY_MARK_HEADER, "1");
+    return res;
+  } catch {
+    const headers = new Headers(res.headers);
+    headers.set(GATEWAY_MARK_HEADER, "1");
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  }
+}
+
 export function createGatewayApp(deps: GatewayDeps): Hono {
   const hono = new Hono();
+  hono.use("*", async (c, next) => {
+    await next();
+    c.res = markGatewayResponse(c.res);
+  });
   const log = deps.log ?? defaultLog;
   const handle = (req: Request): Promise<Response> =>
     proxy(req, deps, log).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
