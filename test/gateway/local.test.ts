@@ -216,6 +216,17 @@ describe("local gateway failover", () => {
     expect(await (await r.post()).text()).toBe("from-b");
   });
 
+  test("a 400 model_not_found on the active member tries the next member, other 400s do not", async () => {
+    const r = rig({
+      remote: refused,
+      upstream: (_c, id) => (id === "a" ? new Response('{"error":{"code":"model_not_found"}}', { status: 400 }) : new Response("from-b")),
+    });
+    expect(await (await r.post()).text()).toBe("from-b");
+    const r2 = rig({ remote: refused, upstream: () => new Response('{"error":{"code":"invalid_request"}}', { status: 400 }) });
+    expect((await r2.post()).status).toBe(400);
+    expect(r2.calls.filter((c) => !c.url.startsWith(REMOTE))).toHaveLength(1);
+  });
+
   test("body over 8 MiB gets no fallback and the remote error passes through", async () => {
     const big = "x".repeat(8 * 1024 * 1024 + 10);
     const r = rig({ remote: () => new Response("busy", { status: 503 }) });

@@ -14,6 +14,8 @@ export const LOCAL_FIRST_BYTE_MS = 5_000;
 export const LOCAL_BREAKER_MS = 30_000;
 export const LOCAL_STATUS_PATH = "/__ais/status";
 
+const MODEL_NOT_FOUND = /"code"\s*:\s*"model_not_found"/;
+
 type Tool = "claude" | "codex";
 
 const ROUTES: Record<string, { tool: Tool; app: string; style: ApiStyle }> = {
@@ -161,9 +163,11 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     };
     const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
       if (res.status === 429 || res.status === 402) return { quota: true, res };
-      if (res.status !== 403) return { quota: false, res };
+      if (res.status !== 403 && res.status !== 400 && res.status !== 404) return { quota: false, res };
       const p = await peek(res, ERROR_PEEK_BYTES);
-      return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
+      // A login whose plan lacks the model ("model_not_found") cannot serve the request either: the next member may.
+      const unusable = res.status === 403 ? isQuotaBody(p.bytes) : MODEL_NOT_FOUND.test(new TextDecoder().decode(p.bytes));
+      return { quota: p.whole && unusable, res: p.res };
     };
 
     let names: string[];
