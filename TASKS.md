@@ -151,6 +151,7 @@ ETA: 2026-11-06 12:00 ICT
 | 117 | `ais usage tui` starts from the AIS snapshot, not a full rescan | dropped | | | | | Dropped: owner chose to keep the current Tokscale TUI (2026-11-03).<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/346 closed. |
 | 118 | Redeploy ais console and auto-redeploy on every AIS release | done | | | | | .cluster PRs #2074, #2076, #2078; DynacomDevWatcher #49; AiSwitcher https://github.com/DynacomSolutions/AiSwitcher/pull/350 (kubectl built from source for CVEs).<br>Verified: AiSwitcher main merge auto-built and rolled ais pod to ais-console:main@sha256:d3040120. |
 | 124 | Usage collector: stop re-reading unchanged Claude transcripts each cycle | in_review | claude-20261105-usage-incremental | ais-usage-incremental | | 2026-11-06 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/371.<br>Growing parent session invalidated all its subagent cache entries each scan; fixed in vendored Tokscale patch plus stat-only cache.<br>Needs binary rebuild after merge.<br>Was 123. |
+| 125 | Usage collector: derive daily usage from the native export, no second hourly scan | in_progress | claude-20261105-usage-hourly | ais-usage-hourly-patched | | 2026-11-06 12:00 ICT | Collector ran unpatched `bunx tokscale@latest hourly` per identity (310 MB, 140 s live).<br>Daily figures now come from the export the report already reads. |
 
 ## 6. Browser control extension
 ETA: 2026-11-06 18:00 ICT

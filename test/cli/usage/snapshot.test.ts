@@ -17,6 +17,9 @@ import {
 import { acknowledgeUsageSnapshotDirty, markUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotTargetKey } from "../../../src/cli/usage/snapshot-dirty.ts";
 import { readUsageSnapshotMetricsStatus } from "../../../src/cli/usage/snapshot-status.ts";
 import type { UsageResult, UsageTarget } from "../../../src/cli/usage/run.ts";
+import { dailyUsageFromHourlyEntries } from "../../../src/cli/usage/tokscale.ts";
+import nativeExport from "../../fixtures/tokscale-native-daily/export.json";
+import hourlyReport from "../../fixtures/tokscale-native-daily/hourly.json";
 
 const dirs: string[] = [];
 async function snapshotFile(): Promise<string> {
@@ -158,6 +161,37 @@ describe("shared usage snapshot", () => {
     expect(await Bun.file(join(nativeBatchRoot, partitionId, basename(snapshot.partitions[key]!.nativeBatch!.path))).exists()).toBe(true);
   });
 
+  test("daily usage comes from the native export the report used, with no hourly scan", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    const path = await snapshotFile();
+    const key = usageSnapshotTargetKey("claude", identity.name);
+    const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
+    const candidate = { path: join(dirname(path), "daily-native.json"), partitionId };
+    const configDir = join(dirname(path), "isolated-config");
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(configDir, "settings.json"), JSON.stringify({ scanner: { bucketTimezone: "Asia/Bangkok" } }));
+    await refreshUsageSnapshot({
+      ...deps(path, { now, results: [] }),
+      nativeBatchRoot: join(dirname(path), "native-batches"),
+      nativeTokscaleConfigDir: configDir,
+      forcePartitionKeys: [key],
+      prepareNativeExportCandidate: async () => candidate,
+      collectTargetResults: async (targets, onItemDone, prepareNativeExport) => {
+        await prepareNativeExport!(targets[0]!);
+        await writeFile(candidate.path, JSON.stringify({ ...nativeExport, partitionId, generatedAt: new Date(now).toISOString() }));
+        onItemDone(0, [result(48)]);
+        return [];
+      },
+    });
+
+    const snapshot = JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, { results: UsageResult[] }> };
+    const [row] = snapshot.partitions[key]!.results;
+    const expected = dailyUsageFromHourlyEntries(hourlyReport.entries)!;
+    expect(row?.dailyUsage).toEqual(expected.daily);
+    expect(row?.dailyTotals).toEqual(expected.totals);
+    expect(row?.dateSpan).toEqual(expected.dateSpan);
+  });
+
   test("empty swap-pool report rows retain their native export candidate", async () => {
     const now = Date.UTC(2026, 0, 1);
     const path = await snapshotFile();
@@ -190,6 +224,34 @@ describe("shared usage snapshot", () => {
     expect(snapshot.partitions[key]?.nativeBatch?.partitionId).toBe(partitionId);
     expect(snapshot.partitions[key]?.nativeFailure).toBeUndefined();
     expect(snapshot.partitions[key]?.lastSuccessAt).toBe(new Date(now).toISOString());
+  });
+
+  test("a swap-pool member row keeps its own daily usage, not the pool export's", async () => {
+    const now = Date.UTC(2026, 0, 1);
+    const path = await snapshotFile();
+    const pool = { ...identity, name: "pool", swapPool: { accounts: [identity.name], active: identity.name } };
+    const poolTarget: UsageTarget = { toolName: "claude", identity: pool };
+    const key = usageSnapshotTargetKey("claude", pool.name);
+    const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
+    const candidate = { path: join(dirname(path), "pool-native.json"), partitionId };
+    const memberDaily = { "2025-12-31": 7 };
+    await refreshUsageSnapshot({
+      ...deps(path, { now, results: [] }),
+      nativeBatchRoot: join(dirname(path), "native-batches"),
+      collectTargets: async () => [],
+      collectPoolTargets: async () => [poolTarget],
+      collectSwapPools: async (onPoolDone, prepareNativeExport) => {
+        await prepareNativeExport!(poolTarget);
+        await writeFile(candidate.path, JSON.stringify({ ...nativeExport, partitionId, generatedAt: new Date(now).toISOString() }));
+        await onPoolDone(pool, [{ ...result(3), dailyUsage: memberDaily }]);
+        return [];
+      },
+      prepareNativeExportCandidate: async () => candidate,
+    });
+
+    const snapshot = JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, { results: UsageResult[] }> };
+    expect(snapshot.partitions[key]!.results[0]?.dailyUsage).toEqual(memberDaily);
+    expect(snapshot.partitions[key]!.results[0]?.dailyTotals).toBeUndefined();
   });
 
   test("the pool member split is stored with a good pass, kept through a source failure, and kept when the pool is not rescanned", async () => {

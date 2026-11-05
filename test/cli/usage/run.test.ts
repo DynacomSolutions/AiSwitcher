@@ -7,6 +7,7 @@ import {
   aggregateUsageResults,
   collectTargets,
   providerReportsFromTokscale,
+  runTokscaleForUsageTarget,
   runUsageQueryForTargets,
   shouldIncludeDefaultOpencodeProfile,
   usageResultsForJson,
@@ -331,5 +332,35 @@ describe("retired identities", () => {
       { provider: "anthropic", identity: { name: "gone", label: "Gone", configDir: "/x", retired: true }, report: emptyReport },
     ]) as Array<{ identity: { retired?: boolean } }>;
     expect(rows[0]?.identity.retired).toBe(true);
+  });
+});
+
+describe("collector runs (native export)", () => {
+  const identity = { name: "work", label: "Work", configDir: "/tmp/does-not-exist/work", retired: true };
+  const report: TokscaleReport = { entries: [], totalInput: 1, totalOutput: 1, totalCacheRead: 0, totalCacheWrite: 0, totalMessages: 1, totalCost: 0 };
+
+  test("never run the separate hourly scan; daily usage comes from the export", async () => {
+    let hourlyScans = 0;
+    const results = await runUsageQueryForTargets([{ toolName: "claude", identity }], {
+      deps: {
+        nativeExportForTarget: async () => undefined,
+        runTokscale: async (target) => providerReportsFromTokscale(target, report, { explicitTool: true }),
+        fetchTokscaleDailyUsage: async () => {
+          hourlyScans++;
+          return { dateSpan: { firstMs: 1, lastMs: 2 }, daily: { "2026-11-01": 2 }, totals: { "2026-11-01": [1, 1, 0, 0, 1, 0] } };
+        },
+      },
+    });
+    expect(hourlyScans).toBe(0);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.dailyUsage).toBeUndefined();
+  });
+
+  test("a missing native export is an error, never a PATH/bunx Tokscale fallback", async () => {
+    const results = await runTokscaleForUsageTarget({ toolName: "claude", identity }, { explicitTool: true }, {
+      nativeExportForTarget: async () => undefined,
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]?.error).toBe("Could not run tokscale: native-export-unavailable");
   });
 });

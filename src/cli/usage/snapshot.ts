@@ -7,10 +7,10 @@ import { withUsableCwd } from "../../shared/exec.ts";
 import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { isSwapPool } from "../../identities/swap-pool.ts";
 import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotDirtyId, usageSnapshotTargetKey, usageSnapshotDirtyDirectory } from "./snapshot-dirty.ts";
-import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, type UsageResult, type UsageTarget } from "./run.ts";
+import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
-import { buildAisTokscaleExportInvocation, runAisTokscaleExportInvocation } from "./tokscale.ts";
+import { buildAisTokscaleExportInvocation, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation } from "./tokscale.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
@@ -129,6 +129,8 @@ export interface UsageSnapshotDeps {
   path?: string;
   /** Test seam for keeping successful native promotions inside the fixture tree. */
   nativeBatchRoot?: string;
+  /** Test seam: the isolated Tokscale config whose bucket timezone keys native daily usage. */
+  nativeTokscaleConfigDir?: string;
   /** Test seam: the staging directory swept for dead exports at the start of a cycle. */
   nativeStagingRoot?: string;
   now?: () => number;
@@ -241,7 +243,11 @@ function candidateFromResults(results: UsageResult[]): UsageResult["nativeBatchC
   return results.find((result) => result.nativeBatchCandidate)?.nativeBatchCandidate;
 }
 
-function validateNativeBatchFile(path: string, partitionId: string): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
+/** Receives a validated batch's messages while they are in memory, so a
+ * caller can derive figures from the one read and parse of the batch. */
+type NativeBatchMessagesReader = (messages: readonly unknown[]) => void;
+
+function validateNativeBatchFile(path: string, partitionId: string, readMessages?: NativeBatchMessagesReader): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
@@ -266,6 +272,7 @@ function validateNativeBatchFile(path: string, partitionId: string): NonNullable
   } catch (error) {
     throw nativeCaptureError("candidate-hash", error);
   }
+  readMessages?.((envelope as { messages: unknown[] }).messages);
   return {
     path: "",
     sha256,
@@ -309,8 +316,8 @@ export function sweepStaleNativeStaging(staging = join(aisCacheDir(), "usage", "
   return removed;
 }
 
-function promoteNativeBatchFile(candidatePath: string, partitionId: string, nativeRoot = join(aisCacheDir(), "usage", "native")): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
-  const ref = validateNativeBatchFile(candidatePath, partitionId);
+function promoteNativeBatchFile(candidatePath: string, partitionId: string, nativeRoot = join(aisCacheDir(), "usage", "native"), readMessages?: NativeBatchMessagesReader): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
+  const ref = validateNativeBatchFile(candidatePath, partitionId, readMessages);
   const attempt = crypto.randomUUID();
   const batchDir = join(nativeRoot, partitionId);
   try {
@@ -757,7 +764,9 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     return !partition?.lastSuccessAt || currentMs - Date.parse(partition.lastSuccessAt) >= ttl || deps.forcePartitionKeys?.includes(key) === true || forcedKeys.has(key);
   });
 
-  const savePartition = async (key: string, tool: string | undefined, identity: string | undefined, results: UsageResult[], nativeCandidate = candidateFromResults(results) ?? nativeCandidates.get(key), splitUsage?: SwapMemberUsage) => {
+  // nativeDaily: the source's daily usage comes from its native export (the
+  // same messages its report came from), never from a second Tokscale scan.
+  const savePartition = async (key: string, tool: string | undefined, identity: string | undefined, results: UsageResult[], nativeCandidate = candidateFromResults(results) ?? nativeCandidates.get(key), splitUsage?: SwapMemberUsage, nativeDaily = false) => {
     producer.sourceScansTotal++;
     const prior = partitions[key];
     // Pool split computed this cycle, else the last good one; written in the same commit as the partition.
@@ -795,7 +804,16 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         if (nativeCandidate.partitionId !== expectedPartitionId) {
           throw new NativeCaptureStageError("partition-id-mismatch", new Error("native-export-partition-mismatch"));
         }
-        nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot);
+        nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot, nativeDaily
+          ? (messages) => {
+            try {
+              results = withDailyUsage(results, dailyUsageFromNativeMessages(messages, readTokscaleBucketTimezone(deps.nativeTokscaleConfigDir)));
+            } catch (error) {
+              // Daily figures are a display detail; the report still commits.
+              logUsageSourceFailure(`${key} native daily usage`, error);
+            }
+          }
+          : undefined);
         nativeCoverage = "supported";
       } else if (nativeSpec) {
         nativeBatch = await captureNativeBatch(nativeSpec, deps);
@@ -846,7 +864,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         const target = dueTargets[index];
         if (!target) return;
         recorded.add(index);
-        await savePartition(targetKey(target), target.toolName, target.identity.name, results, nativeCandidate ?? nativeCandidates.get(targetKey(target)));
+        await savePartition(targetKey(target), target.toolName, target.identity.name, results, nativeCandidate ?? nativeCandidates.get(targetKey(target)), undefined, true);
       }, prepareNativeExportCandidate);
     } catch {
       // Completed callbacks have already been durably saved. Remaining
