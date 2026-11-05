@@ -6,7 +6,7 @@ import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
 import { createAdminApp, type IdentityState } from "./admin.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
-import { createGatewayApp, styleForPath, type GatewayDeps } from "./app.ts";
+import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps } from "./app.ts";
 import { authBrowserToken } from "./browser/auth.ts";
 import { BrowserHub } from "./browser/hub.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
@@ -331,9 +331,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       if (!draining && warmed && req.method === "GET" && new URL(req.url).pathname === "/browser/connect") {
         // Authentication is the first `hello` message; the token is never in the URL.
         if (srv.upgrade(req)) return undefined as unknown as Response;
-        return new Response("websocket upgrade required\n", { status: 426 });
+        return markGatewayResponse(new Response("websocket upgrade required\n", { status: 426 }));
       }
-      const res = await route(req, srv);
+      const res = markGatewayResponse(await route(req, srv));
       if (draining) {
         // Keep-alive clients reconnect (to another replica) instead of reusing this connection.
         try {

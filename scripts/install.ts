@@ -6,6 +6,7 @@ import { aisManifestPath } from "../src/shared/ais-home.ts";
 import {
   configureUsageCollectorServiceForFullInstall,
 } from "../src/cli/usage/collector-service.ts";
+import { installLocalGatewayService } from "../src/cli/gateway/local-service.ts";
 
 // "open" (shadows macOS's /usr/bin/open) is a macOS-only concept — see
 // scripts/build.ts's matching platform gate. "ais" (the management CLI)
@@ -65,6 +66,15 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
   } else if (result.status === "installed" || result.status === "verified") {
     console.error(`install: usage collector service ${result.status}: ${result.path}`);
     console.error("install: usage collector service is enabled and active.");
+  }
+  // The local gateway failover proxy rides the same binary: restart it when the binary changed, install it when missing.
+  if (result.status === "installed" || result.status === "verified") {
+    try {
+      const unit = await installLocalGatewayService({ restartIfActive: aisBinaryChanged, respectDisabled: true });
+      console.error(`install: gateway local service ${unit.action}: ${unit.path}`);
+    } catch (err) {
+      console.error(`install: gateway local service skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 

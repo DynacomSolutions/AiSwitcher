@@ -3,8 +3,9 @@ import { join } from "node:path";
 import { codexAccountOf, jwtAccountId, parseCodexAuth, readCodexAuthText } from "../identities/codex-auth.ts";
 import { readAliApiKey } from "../identities/ali-auth.ts";
 import { nativeStorePathFor } from "../identities/oauth-reconcile.ts";
-import { effectiveGrantPaths, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
+import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
 import { readOpencodeAuth, readOpencodeV2Credentials } from "../cli/limits/opencode-limits.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
@@ -58,11 +59,48 @@ export class RefreshCooldownError extends Error {
   }
 }
 
+/**
+ * The normal AIS way to log an identity back in. Verified against the code:
+ * - `<tool> --identity=<name>` launches the tool under that identity (src/shared/cli-args.ts IDENTITY_PREFIXES,
+ *   src/cli/launch.ts shimLaunchArgs); the login step inside it comes from REFRESH_HINTS in
+ *   src/identities/oauth-refresh.ts (claude: `/login`; codex and grok: `<tool> login`; kimi: just run it).
+ * - ali is the only tool with `ais auth login` (src/cli/auth/dispatch.ts, src/cli/identities/retire.ts).
+ * - zai: docs/agents/history.md (`zai --identity=<name> auth login`).
+ */
+export function loginCommand(provider: GatewayProvider, identity: string): string {
+  switch (provider) {
+    case "claude":
+      return `claude --identity=${identity}, then run /login inside it`;
+    case "codex":
+    case "grok":
+      return `${provider} --identity=${identity} login`;
+    case "kimi":
+      return `kimi --identity=${identity}, then sign in when it asks`;
+    case "ali":
+      return `ais auth login ${identity} --tool=ali`;
+    case "zai":
+      return `zai --identity=${identity} auth login`;
+    case "opencode":
+      return `opencode --identity=${identity}, then sign in when it asks`;
+  }
+}
+
 /** Generic credential failure; `code` is a stable reason, the message never carries paths or token values. */
 export class GatewayCredentialError extends Error {
-  constructor(readonly code: "refresh-failed" | "refresh-lock-timeout" | "token-unchanged" | "no-credential" | "unknown-identity" | "retired", provider: GatewayProvider, identity: string, cause?: unknown) {
+  constructor(readonly code: "refresh-failed" | "refresh-lock-timeout" | "token-unchanged" | "no-credential" | "unknown-identity" | "retired" | "login-dead", readonly provider: GatewayProvider, readonly identity: string, cause?: unknown) {
     super(`gateway: ${provider} identity "${identity}" credential unavailable (${code})`, cause === undefined ? undefined : { cause });
     this.name = "GatewayCredentialError";
+  }
+
+  /** True when only a person can fix it: the login is gone or revoked. */
+  get loggedOut(): boolean {
+    return this.code === "login-dead";
+  }
+
+  /** Text for the client: plain about a dead login, a bare reason code otherwise. */
+  get clientMessage(): string {
+    if (this.loggedOut) return `${this.provider} identity "${this.identity}" is logged out (its saved login cannot be refreshed). Log back in with: ${loginCommand(this.provider, this.identity)}`;
+    return `upstream credential unavailable (${this.code})`;
   }
 }
 
@@ -226,13 +264,17 @@ export class CredentialCache {
       result = await this.refresh(provider as RefreshableTool, id, { force: true, expectedAccessToken: staleToken });
     } catch (err) {
       // Raw errors can carry lock paths or provider text: keep them as `cause` only.
-      throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : "refresh-failed", provider, identity, err);
+      // Only a dead-grant OAuth code (invalid_grant, refresh_token_expired/reused/invalidated) in the token endpoint's body proves the login is gone; any other 400/401 is not enough.
+      const revoked = err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode);
+      throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
     if (next.accessToken !== staleToken) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
-    throw new GatewayCredentialError(result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-revoked" ? "refresh-failed" : "token-unchanged", provider, identity);
+    // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
+    const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" ? "refresh-failed" : "token-unchanged";
+    throw new GatewayCredentialError(code, provider, identity);
   }
 
   private async reload(provider: GatewayProvider, id: Identity): Promise<ProviderCredential> {
@@ -241,8 +283,13 @@ export class CredentialCache {
   }
 
   private async load(provider: GatewayProvider, id: Identity, mtimeMs: number | undefined): Promise<ProviderCredential> {
-    const cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
-    if (!cred) throw new GatewayCredentialError("no-credential", provider, id.name);
+    let cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
+    // Absent once could be a store mid-rewrite: only a second clean read that is also empty confirms a logged-out identity.
+    if (!cred) {
+      await new Promise((r) => setTimeout(r, 50));
+      cred = await readCredential(provider, id, this.deps.claudeRegistryPath);
+    }
+    if (!cred) throw new GatewayCredentialError(isSwapPool(id) ? "no-credential" : "login-dead", provider, id.name);
     if (mtimeMs !== undefined) this.entries.set(`${provider}\u0000${id.name}`, { mtimeMs, cred });
     return cred;
   }

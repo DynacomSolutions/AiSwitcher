@@ -10,7 +10,7 @@ import { providerError } from "./errors.ts";
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
-import type { ProviderCredential } from "./providers/index.ts";
+import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
@@ -41,15 +41,15 @@ export interface GatewayDeps {
 /** Request bodies up to this size are buffered so they can be replayed (401 retry, failover). */
 export const REPLAY_LIMIT_BYTES = 8 * 1024 * 1024;
 /** Quota errors (403) are only inspected up to this size. */
-const ERROR_PEEK_BYTES = 64 * 1024;
+export const ERROR_PEEK_BYTES = 64 * 1024;
 
 const HOP_BY_HOP = ["connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers", "transfer-encoding", "upgrade"];
 /** Error types or codes that mean "this login is out of quota". A bare 403 (for example "insufficient permissions") is not one. */
 const QUOTA_CODES = /^(insufficient_quota|rate_limit_error|rate_limit_exceeded|usage_limit_reached|quota_exceeded|billing_hard_limit_reached)$/i;
 
-type Body = { kind: "none" } | { kind: "buffered"; bytes: Uint8Array } | { kind: "stream"; stream: ReadableStream<Uint8Array> };
+export type Body = { kind: "none" } | { kind: "buffered"; bytes: Uint8Array } | { kind: "stream"; stream: ReadableStream<Uint8Array> };
 
-async function readBody(req: Request): Promise<Body> {
+export async function readBody(req: Request): Promise<Body> {
   if (!req.body) return { kind: "none" };
   const declared = Number(req.headers.get("content-length") ?? "");
   const reader = req.body.getReader();
@@ -76,7 +76,7 @@ async function readBody(req: Request): Promise<Body> {
 }
 
 /** The already-read chunks followed by the rest of the reader, unmodified. */
-function chainStream(chunks: Uint8Array[], reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(reason?: unknown): Promise<void> }): ReadableStream<Uint8Array> {
+export function chainStream(chunks: Uint8Array[], reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(reason?: unknown): Promise<void> }): ReadableStream<Uint8Array> {
   let i = 0;
   return new ReadableStream<Uint8Array>({
     async pull(c) {
@@ -115,7 +115,7 @@ export function queryCarriesToken(search: string): boolean {
 }
 
 /** Removes the headers a `Connection` header names, plus the fixed hop-by-hop set. */
-function stripHopByHop(headers: Headers): void {
+export function stripHopByHop(headers: Headers): void {
   for (const name of (headers.get("connection") ?? "").split(",")) {
     const n = name.trim().toLowerCase();
     if (n) headers.delete(n);
@@ -123,8 +123,18 @@ function stripHopByHop(headers: Headers): void {
   for (const h of HOP_BY_HOP) headers.delete(h);
 }
 
+/** The request headers for the provider: hop-by-hop and gateway-auth headers removed, the adapter's credential headers set. */
+export function upstreamHeaders(adapter: ProviderAdapter, cred: ProviderCredential, incoming: Headers): Headers {
+  const headers = new Headers(incoming);
+  stripHopByHop(headers);
+  for (const h of [...adapter.stripRequestHeaders, "host", "content-length", "accept-encoding"]) headers.delete(h);
+  headers.set("accept-encoding", "identity");
+  for (const [k, v] of Object.entries(adapter.authHeaders(cred, incoming))) headers.set(k, v);
+  return headers;
+}
+
 /** Reads at most `cap` bytes of a response body; the response is re-created unchanged. */
-async function peek(res: Response, cap: number): Promise<{ bytes: Uint8Array; whole: boolean; res: Response }> {
+export async function peek(res: Response, cap: number): Promise<{ bytes: Uint8Array; whole: boolean; res: Response }> {
   if (!res.body) return { bytes: new Uint8Array(0), whole: true, res };
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -149,7 +159,7 @@ async function peek(res: Response, cap: number): Promise<{ bytes: Uint8Array; wh
   return { bytes, whole: whole && size <= cap, res: out };
 }
 
-function isQuotaBody(bytes: Uint8Array): boolean {
+export function isQuotaBody(bytes: Uint8Array): boolean {
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
     const obj = (v: unknown): Record<string, unknown> => (typeof v === "object" && v !== null ? (v as Record<string, unknown>) : {});
@@ -201,8 +211,27 @@ async function discard(res: Response): Promise<void> {
   }
 }
 
+/** Set on every response the gateway app itself produces. A 5xx without it came from an edge in front (for example "no healthy upstream" during a restart). */
+export const GATEWAY_MARK_HEADER = "x-ais-gateway";
+
+/** Marks `res` as gateway-made; returns a copy when the headers are immutable. */
+export function markGatewayResponse(res: Response): Response {
+  try {
+    res.headers.set(GATEWAY_MARK_HEADER, "1");
+    return res;
+  } catch {
+    const headers = new Headers(res.headers);
+    headers.set(GATEWAY_MARK_HEADER, "1");
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  }
+}
+
 export function createGatewayApp(deps: GatewayDeps): Hono {
   const hono = new Hono();
+  hono.use("*", async (c, next) => {
+    await next();
+    c.res = markGatewayResponse(c.res);
+  });
   const log = deps.log ?? defaultLog;
   const handle = (req: Request): Promise<Response> =>
     proxy(req, deps, log).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
@@ -362,11 +391,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const send = (cred: ProviderCredential): Promise<Response> => {
     // A client that is already gone gets no upstream call.
     if (req.signal.aborted || ctrl.signal.aborted) return Promise.reject(new DOMException("aborted", "AbortError"));
-    const headers = new Headers(req.headers);
-    stripHopByHop(headers);
-    for (const h of [...adapter.stripRequestHeaders, "host", "content-length", "accept-encoding"]) headers.delete(h);
-    headers.set("accept-encoding", "identity");
-    for (const [k, v] of Object.entries(adapter.authHeaders(cred, req.headers))) headers.set(k, v);
+    const headers = upstreamHeaders(adapter, cred, req.headers);
     const init: RequestInit & { duplex?: "half" } = { method: req.method, headers, signal: ctrl.signal, redirect: "manual" };
     if (body.kind === "buffered" && body.bytes.length > 0) init.body = body.bytes;
     else if (body.kind === "stream") {
@@ -439,7 +464,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     if (err instanceof GatewayCredentialError) {
       record(identity, "credential_error", 502, undefined, false, undefined, model);
-      return providerError(style, 502, `upstream credential unavailable (${err.code})`);
+      return providerError(style, 502, err.clientMessage);
     }
     // Never echo the error: it may carry paths or provider text.
     const credential = err instanceof RefreshCooldownError || err instanceof NotRefreshableError || (err as { name?: string } | null)?.name === "SwapLockError";

@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { cp, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { CredentialCache, NotRefreshableError, RefreshCooldownError, type RefreshFn } from "../../src/gateway/credentials.ts";
+import { CredentialCache, GatewayCredentialError, NotRefreshableError, RefreshCooldownError, type RefreshFn } from "../../src/gateway/credentials.ts";
 import { SwapLockError } from "../../src/identities/claude-swap-lock.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../src/identities/tool-configs.ts";
-import { refreshIdentityOAuthGrant } from "../../src/identities/oauth-refresh.ts";
+import { OAuthRefreshError, refreshIdentityOAuthGrant } from "../../src/identities/oauth-refresh.ts";
 
 const FIXTURES = join(import.meta.dir, "..", "fixtures", "gateway");
 const SCRATCH = join(import.meta.dir, ".tmp");
@@ -80,6 +80,79 @@ describe("CredentialCache", () => {
     expect(calls).toBe(1);
     expect(a.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0002");
     expect(b.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0002");
+  });
+
+  test("a revoked refresh token is a dead login with a plain message and the login command", async () => {
+    const c = makeCache(async () => {
+      throw new OAuthRefreshError("token refresh rejected (HTTP 400 invalid_grant)", true, undefined, "invalid_grant");
+    });
+    const err = (await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(err).toBeInstanceOf(GatewayCredentialError);
+    expect(err.code).toBe("login-dead");
+    expect(err.loggedOut).toBe(true);
+    expect(err.clientMessage).toContain('claude identity "id1" is logged out');
+    expect(err.clientMessage).toContain("claude --identity=id1");
+    expect(err.clientMessage).not.toContain("SYNTHETIC_FIXTURE");
+    expect(new GatewayCredentialError("login-dead", "codex", "x").clientMessage).toContain("codex --identity=x login");
+    expect(new GatewayCredentialError("refresh-lock-timeout", "codex", "x").loggedOut).toBe(false);
+  });
+
+  test("a 400/401 without an OAuth invalid_grant code is not a dead login", async () => {
+    for (const code of [undefined, "invalid_request", "temporarily_unavailable"]) {
+      const c = makeCache(async () => {
+        throw new OAuthRefreshError("token refresh rejected (HTTP 400)", true, undefined, code);
+      });
+      const err = (await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
+      expect(err.code).toBe("refresh-failed");
+      expect(err.loggedOut).toBe(false);
+    }
+  });
+
+  test("the Codex dead-grant codes count as a dead login; unknown codes do not", async () => {
+    for (const code of ["refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated", "invalid_grant"]) {
+      const c = makeCache(async () => { throw new OAuthRefreshError("rejected", true, undefined, code); });
+      expect(((await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError).code).toBe("login-dead");
+    }
+    const other = makeCache(async () => { throw new OAuthRefreshError("rejected", true, undefined, "invalid_client"); });
+    expect(((await other.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError).code).toBe("refresh-failed");
+  });
+
+  test("a no-grant caused by a store read error is transient, not a dead login", async () => {
+    const c = makeCache(async () => refreshed({ outcome: "no-grant", readError: true }));
+    const err = (await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(err.code).toBe("refresh-failed");
+    expect(err.loggedOut).toBe(false);
+  });
+
+  test("no-grant is a dead login for a plain identity but only transient for a swap pool identity", async () => {
+    const noGrant = async () => refreshed({ outcome: "no-grant" });
+    const plain = makeCache(noGrant);
+    expect(((await plain.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError).code).toBe("login-dead");
+    const pool = new CredentialCache({
+      resolveIdentity: async (_p, name) => ({ name, label: name, configDir: join(work, "claude"), swapPool: { accounts: ["m1"], active: "m1" } }),
+      refresh: noGrant,
+    });
+    const err = (await pool.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(err.code).toBe("refresh-failed");
+    expect(err.loggedOut).toBe(false);
+  });
+
+  test("a credential confirmed absent by a second read is a dead login; a swap pool identity's is transient", async () => {
+    await rm(claudeFile(), { force: true });
+    const plain = makeCache();
+    const dead = (await plain.get("claude", "id1").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(dead.code).toBe("login-dead");
+    const pool = new CredentialCache({ resolveIdentity: async (_p, name) => ({ name, label: name, configDir: join(work, "claude"), swapPool: { accounts: ["m1"], active: "m1" } }) });
+    const transient = (await pool.get("claude", "id1").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(transient.code).toBe("no-credential");
+    expect(transient.loggedOut).toBe(false);
+  });
+
+  test("a file that reappears on the second read is not a dead login", async () => {
+    await rm(claudeFile(), { force: true });
+    setTimeout(() => void writeClaude("SYNTHETIC_FIXTURE-claude-access-0005", 1_800_000_900), 10);
+    const cred = await makeCache().get("claude", "id1");
+    expect(cred.accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-0005");
   });
 
   test("refresh skipped when file already holds a newer token", async () => {
@@ -259,6 +332,6 @@ describe("CredentialCache", () => {
     const c = new CredentialCache({ resolveConfigDir: async () => undefined });
     await expect(c.get("claude", "nope")).rejects.toThrow(/unknown-identity/);
     const d = new CredentialCache({ resolveConfigDir: async () => join(work, "empty") });
-    await expect(d.get("claude", "id1")).rejects.toThrow(/no-credential/);
+    await expect(d.get("claude", "id1")).rejects.toThrow(/login-dead/);
   });
 });
