@@ -4,6 +4,7 @@ import { open } from "node:fs/promises";
 import { runBackup } from "../../scripts/backup.ts";
 import { downloadAssetAtomic, platformKey } from "../shared/release-assets.ts";
 import { cyan, dim, green, yellow } from "./colors.ts";
+import { describeProfileSyncServiceResult, installProfileSyncService, type ProfileSyncServiceResult } from "../sync/profile-sync-service.ts";
 
 // Everything `ais update` knows how to refresh - "open" is darwin-only (see
 // AGENTS.md's "Chrome profile per identity" section), the rest ship
@@ -36,6 +37,8 @@ export interface UpdateOptions {
   shimDir?: string;
   /** Test seam for the release download. */
   fetchImpl?: typeof fetch;
+  /** Test seam for the profile-sync user service step (Linux only). */
+  installProfileSyncService?: (restartIfActive: boolean) => Promise<ProfileSyncServiceResult>;
 }
 
 async function installedVersion(binary: string): Promise<string | undefined> {
@@ -61,6 +64,16 @@ async function verifyDownload(name: string, tmp: string): Promise<void> {
       throw new Error(`the downloaded ${name} is not an executable; the installed ${name} was left unchanged`);
     }
   } finally { await handle.close(); }
+}
+
+async function fileHash(path: string): Promise<string | undefined> {
+  try {
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update(await Bun.file(path).arrayBuffer());
+    return hasher.digest("hex");
+  } catch {
+    return undefined;
+  }
 }
 
 export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
@@ -90,6 +103,7 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
 
   const before = await installedVersion(join(shimDir, "ais"));
   let updated = 0;
+  const aisHashBefore = await fileHash(join(shimDir, "ais"));
   for (const name of MANAGED_BINARIES) {
     const dest = join(shimDir, name);
     if (!(await Bun.file(dest).exists())) {
@@ -106,6 +120,26 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
   if (updated > 0 && (await Bun.file(join(shimDir, "ais")).exists())) {
     const after = await installedVersion(join(shimDir, "ais"));
     console.log(`${prefix} ais ${before && after && before !== after ? `${before} -> ${after}` : `${after ?? "?"} (already the latest release)`}`);
+  }
+
+  // A same-version download still replaces the file; restart the daemon only
+  // when the installed ais bytes really changed.
+  const aisUpdated = aisHashBefore !== (await fileHash(join(shimDir, "ais")));
+
+  // The unit runs %h/.local/bin/ais, so only the default shim dir with an
+  // installed ais gets it. Never fails the update: problems are warnings.
+  const defaultShimDir = shimDir === join(homedir(), ".local", "bin");
+  if (options.installProfileSyncService || (defaultShimDir && (await Bun.file(join(shimDir, "ais")).exists()))) {
+    let result: ProfileSyncServiceResult;
+    try {
+      result = await (options.installProfileSyncService ?? ((restart) => installProfileSyncService({ restartIfActive: restart })))(
+        aisUpdated,
+      );
+    } catch (error) {
+      result = { status: "failed", reason: error instanceof Error ? error.message : String(error) };
+    }
+    const described = describeProfileSyncServiceResult(result);
+    if (described) console.log(`${prefix} ${described.warn ? yellow(`warning: ${described.line}`) : described.line}`);
   }
 
   console.log(

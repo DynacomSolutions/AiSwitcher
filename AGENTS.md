@@ -96,7 +96,8 @@ Identity and launch:
   subcommands (`install`/`remove`/`uninstall`/`update`/`list`/`config`/`auth`) must
   bypass the projection.
 - The wrapper never stays alive as the TUI's parent: after setup it spawns the
-  detached `__session-sidecar` (sync watcher, Herdr titles, post-exit sync; never
+  detached `__session-sidecar` (session registration for the host profile-sync
+  daemon, Herdr titles, post-exit sync; never scans the profile itself; never
   touches the terminal), then replaces itself with the real binary via libc
   `execve` (`src/shared/execve.ts`, `session-sidecar.ts`; Linux, and macOS via
   `posix_spawn` SETEXEC). Without

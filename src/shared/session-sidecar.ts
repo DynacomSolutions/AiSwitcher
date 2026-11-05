@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readlinkSync, stat
 import { dirname, join } from "node:path";
 import type { ToolConfig } from "../identities/types.ts";
 import { launchThenStartBackgroundSync, startBackgroundProfileSync } from "../sync/background.ts";
-import { startProfileSyncWatcher } from "../sync/watch.ts";
+import { registerSession, unregisterSession } from "../sync/session-registry.ts";
 import { markUsageSnapshotDirty, usageSnapshotTargetKey } from "../cli/usage/snapshot-dirty.ts";
 import { aisHerdrTabLabelsPath, aisStateDir } from "./ais-home.ts";
 import { isOnline } from "./connectivity.ts";
@@ -18,7 +18,7 @@ import { readHerdrChatTitle, type HerdrChatTool } from "./herdr-chat-source.ts";
 import { HerdrTabTitleWatcher } from "./herdr-tab-title.ts";
 
 /**
- * In-session work (profile-sync watcher, Herdr tab titles, post-exit sync)
+ * In-session work (profile-sync registration, Herdr tab titles, post-exit sync)
  * used to run inside the wrapper, which therefore had to stay alive as the
  * real tool's parent for the whole session. When a wrapper died (a JSC GC
  * crash on 2026-10-14) the tool was orphaned with the terminal in an
@@ -124,18 +124,48 @@ export interface SessionWork {
   stop(): Promise<void>;
 }
 
-/** The in-session watchers, shared by the sidecar and the in-process fallback. */
-export async function startSessionWork(cfg: ToolConfig, spec: SessionSpec): Promise<SessionWork> {
+export interface SessionWorkDeps {
+  /** Session registry directory override for isolated tests. */
+  registryDir?: string;
+  startSync?: typeof startBackgroundProfileSync;
+  markDirty?: (toolName: string, identityName: string) => void;
+}
+
+/**
+ * The in-session work, shared by the sidecar and the in-process fallback.
+ * The session never scans its identity tree itself: it registers with the
+ * host-level profile-sync daemon (sync/profile-sync-daemon.ts), which scans
+ * each identity root once for all its sessions. Without that daemon only the
+ * post-exit sync runs; there is deliberately no per-session scanning fallback.
+ */
+export async function startSessionWork(cfg: ToolConfig, spec: SessionSpec, deps: SessionWorkDeps = {}): Promise<SessionWork> {
+  const startSync = deps.startSync ?? startBackgroundProfileSync;
   const markDirty = () => {
     if (!spec.identity) return;
     try {
-      markUsageSnapshotDirty(usageSnapshotTargetKey(cfg.toolName, spec.identity.name));
+      if (deps.markDirty) deps.markDirty(cfg.toolName, spec.identity.name);
+      else markUsageSnapshotDirty(usageSnapshotTargetKey(cfg.toolName, spec.identity.name));
     } catch { /* freshness markers are best-effort */ }
   };
   markDirty();
-  const watcher = spec.identity
-    ? startProfileSyncWatcher(cfg, spec.identity.name, spec.identity.configDir, spec.cwd)
-    : undefined;
+  let registered = false;
+  if (spec.identity) {
+    try {
+      registerSession(
+        {
+          toolName: cfg.toolName,
+          identityName: spec.identity.name,
+          configDir: spec.identity.configDir,
+          cwd: spec.cwd,
+          ...(cfg.realBinaryName === "crush" ? { crushRoot: join(spec.cwd, ".crush") } : {}),
+          pid: spec.pid,
+          ...(spec.startTime !== undefined ? { startTime: spec.startTime } : {}),
+        },
+        ...(deps.registryDir ? [deps.registryDir] : []),
+      );
+      registered = true;
+    } catch { /* registration is best-effort; the post-exit sync still runs */ }
+  }
   const titleWatcher = spec.title
     ? new HerdrTabTitleWatcher({
         agent: cfg.realBinaryName,
@@ -153,13 +183,23 @@ export async function startSessionWork(cfg: ToolConfig, spec: SessionSpec): Prom
     async stop() {
       markDirty();
       titleWatcher?.stop();
-      if (watcher) {
-        await watcher.stop();
+      if (registered) unregisterSession(spec.pid, spec.startTime, ...(deps.registryDir ? [deps.registryDir] : []));
+      if (spec.identity) {
+        // Always perform one final pull/merge/push: SQLite databases are
+        // intentionally quiet during the session, then reconciled by a
+        // detached worker after the child has closed. Waiting for the lock
+        // happens in that worker and can never hold the caller's terminal open.
+        startSync({
+          direction: "both",
+          scope: { kind: "identity", cfg, identityName: spec.identity.name, cwd: spec.cwd },
+          waitForLock: true,
+          includeDatabases: true,
+        });
       } else {
         // An explicit environment override may not reverse-map to a registry
         // identity, so there is no safe remote destination for a scoped push.
         // The next full sync still catches standard registered profiles.
-        startBackgroundProfileSync({ direction: "both", scope: { kind: "all" }, waitForLock: true });
+        startSync({ direction: "both", scope: { kind: "all" }, waitForLock: true });
       }
     },
   };

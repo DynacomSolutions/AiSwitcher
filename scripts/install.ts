@@ -7,6 +7,7 @@ import {
   configureUsageCollectorServiceForFullInstall,
 } from "../src/cli/usage/collector-service.ts";
 import { installLocalGatewayService } from "../src/cli/gateway/local-service.ts";
+import { describeProfileSyncServiceResult, installProfileSyncService } from "../src/sync/profile-sync-service.ts";
 
 // "open" (shadows macOS's /usr/bin/open) is a macOS-only concept — see
 // scripts/build.ts's matching platform gate. "ais" (the management CLI)
@@ -52,6 +53,10 @@ async function migrateLegacyManifest(): Promise<void> {
 
 async function configureUsageCollectorService(aisBinaryChanged: boolean): Promise<void> {
   if (process.platform !== "linux") return;
+
+  // Host-level profile-sync watcher (sync/profile-sync-daemon.ts). Never fails the install.
+  const profileSync = describeProfileSyncServiceResult(await installProfileSyncService({ restartIfActive: aisBinaryChanged }));
+  if (profileSync) console.error(`install: ${profileSync.warn ? "warning: " : ""}${profileSync.line}`);
 
   const aisPath = join(homedir(), ".local", "bin", "ais");
   const result = await configureUsageCollectorServiceForFullInstall({ aisPath, aisBinaryChanged });

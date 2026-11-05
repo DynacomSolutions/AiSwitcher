@@ -353,7 +353,7 @@ src/
 │   │                      (zai's realBinaryName is "crush", not "zai")
 │   ├── exec.ts             Bun.spawn passthrough, signal relay, exit-code parity
 │   ├── execve.ts           libc execve via bun:ffi (Linux), falls back to exec.ts
-│   ├── session-sidecar.ts  detached sidecar: sync watcher, Herdr titles, post-exit sync
+│   ├── session-sidecar.ts  detached sidecar: sync registration, Herdr titles, post-exit sync
 │   ├── cli-args.ts         strip --identity=/--desktop, detect non-interactive intent
 │   ├── codex-backfill.ts   recover orphaned Codex state-DB backfill leases
 │   ├── launch-desktop.ts   best-effort --desktop launch

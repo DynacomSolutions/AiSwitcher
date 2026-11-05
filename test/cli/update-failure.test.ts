@@ -60,3 +60,50 @@ test("a downloaded binary that does not run is an error, not a silent success", 
     expect(await Bun.file(`${join(shimDir, "ais")}.download-tmp`).exists()).toBe(false);
   } finally { log.mockRestore(); }
 });
+
+test("update installs the profile sync service and restarts it when ais changed", async () => {
+  const shimDir = await shims("0.0.1");
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const calls: boolean[] = [];
+  try {
+    await runUpdate({
+      shimDir,
+      skipBackup: true,
+      fetchImpl: (async () => new Response("#!/bin/sh\necho 9.9.9\n")) as unknown as typeof fetch,
+      installProfileSyncService: async (restart) => (calls.push(restart), { status: "installed", path: "/u/ais-profile-sync.service", changed: true, action: "started" }),
+    });
+    expect(calls).toEqual([true]);
+    expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("profile sync service installed (started)");
+  } finally { log.mockRestore(); }
+});
+
+test("an unavailable systemd user manager only warns; the update still succeeds", async () => {
+  const shimDir = await shims("0.0.1");
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await runUpdate({
+      shimDir,
+      skipBackup: true,
+      fetchImpl: (async () => new Response("#!/bin/sh\necho 9.9.9\n")) as unknown as typeof fetch,
+      installProfileSyncService: async () => { throw new Error("systemctl: not found"); },
+    });
+    const lines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(lines).toContain("warning: profile sync service not set up: systemctl: not found");
+    expect(lines).toContain("done, updated");
+  } finally { log.mockRestore(); }
+});
+
+test("re-downloading the same ais does not restart the profile sync service", async () => {
+  const shimDir = await shims("0.0.1");
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const calls: boolean[] = [];
+  try {
+    await runUpdate({
+      shimDir,
+      skipBackup: true,
+      fetchImpl: (async () => new Response("#!/bin/sh\necho 0.0.1\n")) as unknown as typeof fetch,
+      installProfileSyncService: async (restart) => (calls.push(restart), { status: "verified", path: "/u/ais-profile-sync.service", changed: false, action: "running" }),
+    });
+    expect(calls).toEqual([false]);
+  } finally { log.mockRestore(); }
+});

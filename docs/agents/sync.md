@@ -55,9 +55,28 @@ reconciliation.
   owns authentication and always runs with `BatchMode=yes` plus
   `StrictHostKeyChecking=yes`. A top-level wrapper resolves locally and spawns
   the real agent first, then starts full reconciliation in a detached AIS
-  worker. Ordinary profile/session mutations use detached workers with a
-  three-second debounce, and the final post-exit reconciliation is detached
-  too. No
+  worker. Ordinary profile/session mutations are picked up by one host-level
+  watcher, `ais __profile_sync_daemon` (`sync/profile-sync-daemon.ts`, user
+  unit `scripts/systemd/ais-profile-sync.service`, embedded in `ais` and
+  installed, enabled and started or restarted by `ais update` and
+  `bun run install:shims` via `sync/profile-sync-service.ts`; idempotent,
+  Linux only, and a missing user manager is a warning, never a failed
+  update): every
+  30 s it reads the live-session registry (`~/.ais/state/profile-sync/sessions/`,
+  one file per session, written and removed by the sidecar, dead PIDs pruned
+  by PID plus start time), stat-walks each distinct identity configDir once
+  however many sessions share it, plus each crush session's own `<cwd>/.crush`,
+  and on a change starts one detached identity-scoped sync and marks the usage
+  snapshot dirty. A configDir change syncs without `cwd` (only crush-backed
+  tools read it); a `.crush` change syncs with that cwd. Sidecars never scan:
+  without the daemon only the post-exit sync runs, by design. A root's first
+  scan counts files modified since its earliest live session registered
+  (`registeredAt`), so writes before the first poll or during a daemon
+  restart still sync. Known limitations: the daemon's syncs run in the
+  service's environment, not the session's, so a shell-only override such as
+  `AIS_SYNC_CONFIG` is not seen; and macOS and Windows have no daemon, so
+  sessions there get only the post-exit sync, with no in-session push. The
+  final post-exit reconciliation is detached too. No
   automatic SSH, rsync, dedupe, or lock wait may block agent startup or keep
   the wrapper open after the child exits. `ais resume` follows the same rule.
   Nested wrappers do not start another full reconciliation. No delete
