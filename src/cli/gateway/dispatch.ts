@@ -1,4 +1,4 @@
-import { stringFlag, type ParsedArgs } from "../args.ts";
+import { boolFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
@@ -23,7 +23,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   const merged: GatewayCliDeps = { ...defaultDeps(), ...deps };
   if (sub === "app") return runAppCommand(rest[0], rest.slice(1), flags, merged);
   if (sub === "usage") return runUsageCommand(flags, merged);
-  if (sub === "local") return runLocal(rest, merged);
+  if (sub === "local") return runLocal(rest, merged, boolFlag(flags, "check"));
   if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
@@ -37,7 +37,7 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   await new Promise<void>(() => {});
 }
 
-async function runLocal(args: string[], deps: GatewayCliDeps): Promise<void> {
+async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): Promise<void> {
   const port = portOf(undefined, process.env.AIS_GATEWAY_LOCAL_PORT, LOCAL_GATEWAY_DEFAULT_PORT, "AIS_GATEWAY_LOCAL_PORT");
   if (args[0] === "install") {
     const { installLocalGatewayService } = await import("./local-service.ts");
@@ -53,6 +53,11 @@ async function runLocal(args: string[], deps: GatewayCliDeps): Promise<void> {
   }
   if (args.length > 0) throw new CliUsageError("Usage: ais gateway local [install|status]");
   const remoteBase = await resolveRemoteBase();
+  if (check) {
+    // Preflight for the installer: the subcommand exists and its config loads. Binds nothing.
+    deps.out("gateway local: ok");
+    return;
+  }
   const running = await startLocalGateway({ port, remoteBase, bindRetryMs: 30_000 });
   console.info(`gateway local: listening on 127.0.0.1:${running.port}`);
   installDrainHandlers(running);

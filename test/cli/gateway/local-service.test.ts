@@ -6,17 +6,19 @@ import { fetchLocalStatus, installLocalGatewayService, LOCAL_GATEWAY_LEGACY_NAME
 import { startLocalGateway } from "../../../src/gateway/local.ts";
 
 /** A tiny fake of systemctl --user: state in memory, every call recorded in order. */
-function fakeSystemd(initial: { active?: string[]; enabled?: string[] } = {}) {
+function fakeSystemd(initial: { active?: string[]; enabled?: string[]; deactivating?: string[]; fail?: (args: string[]) => boolean } = {}) {
   const active = new Set(initial.active ?? []);
+  const deactivating = new Set(initial.deactivating ?? []);
   const enabled = new Set(initial.enabled ?? []);
   const calls: string[] = [];
   const ctl: Ctl = async (args) => {
     calls.push(args.join(" "));
     const [verb, ...rest] = args;
     const unit = rest.filter((a) => !a.startsWith("--")).at(-1) ?? "";
+    if (initial.fail?.(args)) return { code: 1, out: "" };
     switch (verb) {
       case "is-active":
-        return { code: active.has(unit) ? 0 : 3, out: active.has(unit) ? "active" : "inactive" };
+        return { code: active.has(unit) ? 0 : 3, out: active.has(unit) ? "active" : deactivating.has(unit) ? "deactivating" : "inactive" };
       case "is-enabled":
         return { code: enabled.has(unit) ? 0 : 1, out: enabled.has(unit) ? "enabled" : "disabled" };
       case "start":
@@ -34,7 +36,7 @@ function fakeSystemd(initial: { active?: string[]; enabled?: string[] } = {}) {
     }
     return { code: 0, out: "" };
   };
-  return { ctl, calls, active, enabled };
+  return { ctl, calls, active, enabled, deactivating };
 }
 
 async function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -127,6 +129,7 @@ describe("ais-gateway-local@.service", () => {
         unitDirectory: dir,
         platform: "linux",
         ctl: sd.ctl,
+        preflight: async () => true,
         waitListening: async () => {
           legacyPresentWhenListening = await exists(join(dir, LOCAL_GATEWAY_LEGACY_NAME));
           dropinPresentWhenListening = await exists(join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`));
@@ -138,8 +141,125 @@ describe("ais-gateway-local@.service", () => {
       expect(await exists(join(dir, LOCAL_GATEWAY_LEGACY_NAME))).toBe(false);
       expect(await exists(join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`))).toBe(false);
       expect(sd.calls).toContain(`stop --no-block ${LOCAL_GATEWAY_LEGACY_NAME}`);
+      // The legacy unit is stopped only after the slot answered.
+      expect(sd.calls.indexOf(`stop --no-block ${LOCAL_GATEWAY_LEGACY_NAME}`)).toBeGreaterThan(sd.calls.indexOf(`start ${localSlotUnit("a")}`));
       expect(sd.calls).toContain(`disable ${LOCAL_GATEWAY_LEGACY_NAME}`);
       expect(sd.enabled.has(localSlotUnit("a"))).toBe(true);
+    });
+  });
+
+  async function legacyRig(dir: string, over: { fail?: (a: string[]) => boolean; legacyOn?: boolean } = {}) {
+    await writeFile(join(dir, LOCAL_GATEWAY_LEGACY_NAME), "[Service]\nExecStart=old\n");
+    const on = over.legacyOn ?? true;
+    return fakeSystemd({ active: on ? [LOCAL_GATEWAY_LEGACY_NAME] : [], enabled: on ? [LOCAL_GATEWAY_LEGACY_NAME] : [], ...(over.fail ? { fail: over.fail } : {}) });
+  }
+
+  test("migration: a failing start leaves the legacy unit running and never stopped", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir, { fail: (a) => a[0] === "start" && a[1] === localSlotUnit("a") });
+      await expect(installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => true, waitListening: async () => {} })).rejects.toThrow();
+      expect(sd.active.has(LOCAL_GATEWAY_LEGACY_NAME)).toBe(true);
+      expect(sd.calls.some((c) => c.startsWith("stop") && c.includes(LOCAL_GATEWAY_LEGACY_NAME))).toBe(false);
+      expect(sd.calls).toContain(`stop ${localSlotUnit("a")}`);
+      expect(sd.calls).toContain(`disable ${localSlotUnit("a")}`);
+      expect(await exists(join(dir, LOCAL_GATEWAY_LEGACY_NAME))).toBe(true);
+    });
+  });
+
+  test("migration: a slot that never answers gets the legacy unit started again and the slot stopped and disabled", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir);
+      let waits = 0;
+      await expect(
+        installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => true, waitListening: async () => { waits++; throw new Error("timeout"); } }),
+      ).rejects.toThrow("timeout");
+      expect(waits).toBe(2); // once beside the legacy unit, once after it released the port
+      expect(sd.active.has(LOCAL_GATEWAY_LEGACY_NAME)).toBe(true); // restarted
+      expect(sd.calls.filter((c) => c === `start ${LOCAL_GATEWAY_LEGACY_NAME}`)).toHaveLength(1);
+      expect(sd.active.has(localSlotUnit("a"))).toBe(false);
+      expect(sd.enabled.has(localSlotUnit("a"))).toBe(false);
+      expect(await exists(join(dir, LOCAL_GATEWAY_LEGACY_NAME))).toBe(true);
+    });
+  });
+
+  test("migration: a failed preflight never touches the legacy unit", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir);
+      await expect(installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => false, waitListening: async () => {} })).rejects.toThrow(/preflight/);
+      expect(sd.calls.some((c) => /^(start|stop|enable|disable)/.test(c))).toBe(false);
+      expect(sd.active.has(LOCAL_GATEWAY_LEGACY_NAME)).toBe(true);
+      expect(await exists(join(dir, LOCAL_GATEWAY_LEGACY_NAME))).toBe(true);
+    });
+  });
+
+  test("migration carries Environment= from the legacy drop-ins into a template drop-in and drops ExecStart", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir);
+      await mkdir(join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`));
+      await writeFile(join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`, "override.conf"), "[Service]\nEnvironment=AIS_GATEWAY_LOCAL_PORT=47999\nExecStart=\nExecStart=/somewhere/bun run x\n");
+      const logs: string[] = [];
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => true, waitListening: async () => {}, log: (l) => logs.push(l) });
+      const carried = await readFile(join(dir, `${LOCAL_GATEWAY_TEMPLATE_NAME}.d`, "legacy-migrated.conf"), "utf8");
+      expect(carried).toContain("Environment=AIS_GATEWAY_LOCAL_PORT=47999");
+      expect(carried).not.toContain("ExecStart");
+      expect(logs.filter((l) => l.includes("ExecStart override"))).toHaveLength(1);
+    });
+  });
+
+  test("migration respects a disabled or stopped legacy unit: retired without starting a slot", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir, { legacyOn: false });
+      const r = await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => true, waitListening: async () => {}, respectDisabled: true });
+      expect(r.action).toBe("retired-legacy");
+      expect(sd.calls.some((c) => c.startsWith("start"))).toBe(false);
+      expect(await exists(join(dir, LOCAL_GATEWAY_LEGACY_NAME))).toBe(false);
+    });
+  });
+
+  test("a slot that is still draining is never the handoff target", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      const sd = fakeSystemd({ active: [localSlotUnit("a")], enabled: [localSlotUnit("a")], deactivating: [localSlotUnit("b")] });
+      const logs: string[] = [];
+      const r = await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, waitListening: async () => {}, restartIfActive: true, log: (l) => logs.push(l) });
+      expect(r.action).toBe("handoff-deferred");
+      expect(sd.calls.some((c) => c.startsWith("start") || c.startsWith("stop"))).toBe(false);
+      expect(sd.active.has(localSlotUnit("a"))).toBe(true);
+      expect(logs.some((l) => l.includes("still draining"))).toBe(true);
+    });
+  });
+
+  test("a failed enable of the new slot rolls back: new slot stopped, old one kept running and enabled", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      const sd = fakeSystemd({ active: [localSlotUnit("a")], enabled: [localSlotUnit("a")], fail: (a) => a[0] === "enable" && a[1] === localSlotUnit("b") });
+      await expect(installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, waitListening: async () => {}, restartIfActive: true })).rejects.toThrow();
+      expect(sd.active.has(localSlotUnit("b"))).toBe(false);
+      expect(sd.active.has(localSlotUnit("a"))).toBe(true);
+      expect(sd.enabled.has(localSlotUnit("a"))).toBe(true);
+    });
+  });
+
+  test("a handoff whose new slot never answers stops and disables it and keeps the old one", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      const sd = fakeSystemd({ active: [localSlotUnit("a")], enabled: [localSlotUnit("a")] });
+      await expect(installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, waitListening: async () => { throw new Error("timeout"); }, restartIfActive: true })).rejects.toThrow("timeout");
+      expect(sd.active.has(localSlotUnit("b"))).toBe(false);
+      expect(sd.enabled.has(localSlotUnit("b"))).toBe(false);
+      expect(sd.active.has(localSlotUnit("a"))).toBe(true);
+      expect(sd.enabled.has(localSlotUnit("a"))).toBe(true);
+    });
+  });
+
+  test("every install converges to exactly one enabled slot, the active one", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      const sd = fakeSystemd({ active: [localSlotUnit("b")], enabled: [localSlotUnit("a"), localSlotUnit("b")] });
+      const r = await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, waitListening: async () => {} });
+      expect(r.action).toBe("unchanged");
+      expect(sd.enabled.has(localSlotUnit("a"))).toBe(false);
+      expect(sd.enabled.has(localSlotUnit("b"))).toBe(true);
     });
   });
 

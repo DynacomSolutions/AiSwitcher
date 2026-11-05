@@ -408,7 +408,9 @@ export function remoteRefusal(remoteBase: string, ownPort: number, own: string[]
   const host = unmapV4(u.hostname.toLowerCase().replace(/^\[|\]$/g, ""));
   const loopback = host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "0.0.0.0" || host === "::" || /^127\./.test(host);
   if (loopback) return `loopback host (${u.host}); ${u.port === String(ownPort) ? "that is this proxy" : "a local listener is not the cluster gateway"}`;
-  if (own.some((a) => a === host || unmapV4(a) === host)) return `an address of this host (${u.host}); that would loop back into a local listener`;
+  // Another port on this host (a tunnel, a different service) can be a legitimate gateway; only this proxy's own port loops back.
+  const port = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+  if (port === ownPort && own.some((a) => a === host || unmapV4(a) === host)) return `an address of this host (${u.host}); that would loop back into a local listener`;
   return undefined;
 }
 

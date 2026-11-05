@@ -45,15 +45,36 @@ export interface InstallLocalOptions {
   unitDirectory?: string;
   platform?: NodeJS.Platform;
   ctl?: Ctl;
-  /** Resolves once `slot` answers on the port (default: polls the status endpoint for its instance). */
+  /** Resolves once `slot` answers on the port (default: polls the status endpoint for its instance); rejects on timeout. */
   waitListening?: (slot: LocalSlot) => Promise<void>;
+  /** Proves the installed binary can serve (default: `<ais> gateway local --check`). Rejects or returns false when it cannot. */
+  preflight?: () => Promise<boolean>;
   /** The unit text or the ais binary changed: hand the running instance over to the other slot. */
   restartIfActive?: boolean;
   /** Release/host-update mode: enable and start only on a first install; never re-enable what the user disabled. */
   respectDisabled?: boolean;
+  log?: (line: string) => void;
+  /** Unit name base (default ais-gateway-local); for proofs on throwaway names. */
+  unitBase?: string;
+  /** Unit text override (default LOCAL_GATEWAY_UNIT); for proofs. */
+  unitText?: string;
 }
 
 const MIGRATE_WAIT_MS = 30_000;
+
+/** Runs `<ais> gateway local --check` (port 0, bounded): exit 0 means the subcommand exists and its config loads. An older binary without --check would start serving, so the bound kills it and counts as a failure. */
+async function defaultPreflight(): Promise<boolean> {
+  const aisPath = join(homedir(), ".local", "bin", "ais");
+  try {
+    const child = Bun.spawn([aisPath, "gateway", "local", "--check"], { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: { ...process.env, AIS_GATEWAY_LOCAL_PORT: "0" } });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+    const code = await child.exited;
+    clearTimeout(timer);
+    return code === 0;
+  } catch {
+    return false;
+  }
+}
 
 async function defaultWaitListening(slot: LocalSlot): Promise<void> {
   const port = Number(process.env.AIS_GATEWAY_LOCAL_PORT) || LOCAL_GATEWAY_DEFAULT_PORT;
@@ -86,14 +107,47 @@ async function atomicWrite(dir: string, name: string, text: string): Promise<boo
   return true;
 }
 
+export interface UnitNames {
+  template: string;
+  legacy: string;
+  slot(slot: LocalSlot): string;
+}
+
+/** Unit names for a base ("ais-gateway-local" in production; a throwaway base lets a proof run beside the real unit). */
+export function unitNames(base = "ais-gateway-local"): UnitNames {
+  return { template: `${base}@.service`, legacy: `${base}.service`, slot: (slot) => `${base}@${slot}.service` };
+}
+
+/** Environment= lines of the legacy unit's drop-ins (ExecStart overrides are not carried: the template owns the command). */
+async function carryLegacyDropins(dir: string, names: UnitNames, log: (line: string) => void): Promise<void> {
+  const dropins = join(dir, `${names.legacy}.d`);
+  const env: string[] = [];
+  let droppedExec = false;
+  for (const f of (await readdir(dropins).catch(() => [] as string[])).sort()) {
+    const text = await readFile(join(dropins, f), "utf8").catch(() => "");
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (/^Environment=/.test(line)) env.push(line);
+      else if (/^ExecStart=\s*\S/.test(line)) droppedExec = true;
+    }
+  }
+  if (droppedExec) log("gateway local: an ExecStart override in the old unit's drop-ins was dropped (the template owns the command)");
+  if (env.length === 0) return;
+  const target = join(dir, `${names.template}.d`);
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "legacy-migrated.conf"), `[Service]\n${[...new Set(env)].join("\n")}\n`, { mode: 0o644 });
+}
+
 /**
- * Installs the template unit and starts or hands over the proxy without ever closing the port:
+ * Installs the template unit and starts or hands over the proxy without closing the port:
  * - first install: enable and start slot a;
- * - upgrade with the proxy running: start the other slot, wait until it listens, enable it, then stop the old slot
- *   (non-blocking; it drains its in-flight streams) and disable it;
- * - migration from the single ais-gateway-local.service: only after the new slot listens, the old unit is disabled and
- *   removed together with its drop-ins (the old process is told to stop first because it does not share the port, so
- *   this one hop has a gap of the old process's exit; the new slot keeps retrying the bind meanwhile).
+ * - upgrade with the proxy running: start the other slot, wait until it answers, enable it, then stop the old slot
+ *   (non-blocking; it drains its in-flight streams) and disable it. A slot still draining is never the target: the
+ *   handoff is skipped and the next install converges;
+ * - every install ends by converging: exactly one slot enabled, and it is the active one;
+ * - migration from the single ais-gateway-local.service: preflight the binary, start the new slot, stop the legacy unit
+ *   only once the slot answers, and on any failure start the legacy unit again and stop and disable the slot. The legacy
+ *   unit and its drop-ins are removed last (Environment= lines move to a template drop-in).
  */
 export async function installLocalGatewayService(options: InstallLocalOptions = {}): Promise<{ path: string; changed: boolean; slot?: LocalSlot; action: string }> {
   if ((options.platform ?? process.platform) !== "linux") throw new Error("local gateway service installation is available on Linux only");
@@ -101,67 +155,155 @@ export async function installLocalGatewayService(options: InstallLocalOptions = 
   const dir = options.unitDirectory ?? join(configHome, "systemd", "user");
   const ctl = options.ctl ?? systemctlUser;
   const wait = options.waitListening ?? defaultWaitListening;
+  const names = unitNames(options.unitBase);
+  const unitText = options.unitText ?? LOCAL_GATEWAY_UNIT;
+  const log = options.log ?? ((line: string) => console.error(line));
   await mkdir(dir, { recursive: true });
-  const path = join(dir, LOCAL_GATEWAY_TEMPLATE_NAME);
+  const path = join(dir, names.template);
   const existedBefore = await stat(path).then(() => true, () => false);
-  const changed = await atomicWrite(dir, LOCAL_GATEWAY_TEMPLATE_NAME, LOCAL_GATEWAY_UNIT);
-  const reload = await ctl(["daemon-reload"]);
-  if (reload.code !== 0) throw new Error("systemctl --user daemon-reload failed");
+  const changed = await atomicWrite(dir, names.template, unitText);
+  const must = async (args: string[]): Promise<void> => {
+    const r = await ctl(args);
+    if (r.code !== 0) throw new Error(`systemctl --user ${args.join(" ")} failed`);
+  };
+  const soft = async (args: string[]): Promise<void> => {
+    const r = await ctl(args);
+    if (r.code !== 0) log(`gateway local: systemctl --user ${args.join(" ")} failed (exit ${r.code})`);
+  };
+  await must(["daemon-reload"]);
 
-  const active = async (unit: string): Promise<boolean> => (await ctl(["is-active", unit])).out === "active";
-  const enabled = async (unit: string): Promise<boolean> => (await ctl(["is-enabled", unit])).out === "enabled";
-  const activeSlots: LocalSlot[] = [];
-  const enabledSlots: LocalSlot[] = [];
-  for (const slot of LOCAL_GATEWAY_SLOTS) {
-    if (await active(localSlotUnit(slot))) activeSlots.push(slot);
-    if (await enabled(localSlotUnit(slot))) enabledSlots.push(slot);
-  }
-  const legacyPath = join(dir, LOCAL_GATEWAY_LEGACY_NAME);
-  const legacyExists = await stat(legacyPath).then(() => true, () => false);
-  const legacyActive = legacyExists && (await active(LOCAL_GATEWAY_LEGACY_NAME));
+  type State = "active" | "deactivating" | "idle";
+  const stateOf = async (unit: string): Promise<State> => {
+    const out = (await ctl(["is-active", unit])).out;
+    return out === "active" ? "active" : out === "deactivating" ? "deactivating" : "idle";
+  };
+  const isEnabled = async (unit: string): Promise<boolean> => (await ctl(["is-enabled", unit])).out === "enabled";
+  const states = {} as Record<LocalSlot, State>;
+  for (const slot of LOCAL_GATEWAY_SLOTS) states[slot] = await stateOf(names.slot(slot));
+  const activeSlots = LOCAL_GATEWAY_SLOTS.filter((s) => states[s] === "active");
+  const freeSlots = LOCAL_GATEWAY_SLOTS.filter((s) => states[s] === "idle");
 
-  const start = async (slot: LocalSlot): Promise<void> => {
-    const r = await ctl(["start", localSlotUnit(slot)]);
-    if (r.code !== 0) throw new Error(`systemctl --user start ${localSlotUnit(slot)} failed`);
+  /** Leaves exactly one slot enabled when exactly one is active: the active one. */
+  const converge = async (): Promise<void> => {
+    const now = LOCAL_GATEWAY_SLOTS;
+    const active: LocalSlot[] = [];
+    for (const slot of now) if ((await stateOf(names.slot(slot))) === "active") active.push(slot);
+    if (active.length !== 1) return;
+    for (const slot of now) {
+      const enabled = await isEnabled(names.slot(slot));
+      if (slot === active[0] && !enabled) await soft(["enable", names.slot(slot)]);
+      if (slot !== active[0] && enabled) await soft(["disable", names.slot(slot)]);
+    }
+  };
+  /** Stops and disables a slot that did not come up; best effort, never throws. */
+  const abandon = async (slot: LocalSlot): Promise<void> => {
+    await ctl(["stop", names.slot(slot)]).catch(() => undefined);
+    await ctl(["disable", names.slot(slot)]).catch(() => undefined);
+  };
+  const startAndWait = async (slot: LocalSlot): Promise<void> => {
+    await must(["start", names.slot(slot)]);
     await wait(slot);
   };
-  const enable = async (slot: LocalSlot): Promise<void> => void (await ctl(["enable", localSlotUnit(slot)]));
-  const retireLegacy = async (): Promise<void> => {
-    await ctl(["disable", LOCAL_GATEWAY_LEGACY_NAME]);
-    await rm(legacyPath, { force: true });
-    const dropins = join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`);
-    for (const f of await readdir(dropins).catch(() => [] as string[])) await rm(join(dropins, f), { force: true });
-    await rmdir(dropins).catch(() => undefined);
-    await ctl(["daemon-reload"]);
-  };
 
-  // Migration from the single unit.
+  const legacyPath = join(dir, names.legacy);
+  const legacyExists = await stat(legacyPath).then(() => true, () => false);
   if (legacyExists) {
-    const slot: LocalSlot = activeSlots[0] ?? "a";
-    if (legacyActive) await ctl(["stop", "--no-block", LOCAL_GATEWAY_LEGACY_NAME]);
-    if (!activeSlots.includes(slot)) await start(slot);
-    await enable(slot);
+    const legacyActive = (await stateOf(names.legacy)) === "active";
+    const legacyEnabled = await isEnabled(names.legacy);
+    let carried = false;
+    const carry = async (): Promise<void> => {
+      if (carried) return;
+      carried = true;
+      await carryLegacyDropins(dir, names, log);
+    };
+    const retireLegacy = async (): Promise<void> => {
+      await carry();
+      await ctl(["disable", names.legacy]);
+      await rm(legacyPath, { force: true });
+      const dropins = join(dir, `${names.legacy}.d`);
+      for (const f of await readdir(dropins).catch(() => [] as string[])) await rm(join(dropins, f), { force: true });
+      await rmdir(dropins).catch(() => undefined);
+      await must(["daemon-reload"]);
+    };
+    // A legacy unit the user disabled or stopped is retired without starting anything.
+    if (options.respectDisabled && (!legacyActive || !legacyEnabled)) {
+      await retireLegacy();
+      return { path, changed, action: "retired-legacy" };
+    }
+    // (a) The installed binary must be able to serve before the legacy unit is touched.
+    const ok = await (options.preflight ?? defaultPreflight)().catch(() => false);
+    if (!ok) throw new Error("the installed ais cannot serve the local gateway (preflight `gateway local --check` failed); the existing unit was left running");
+    const slot: LocalSlot = activeSlots[0] ?? freeSlots[0] ?? "a";
+    await carry();
+    let legacyStopped = false;
+    const restoreLegacy = async (): Promise<void> => {
+      await abandon(slot);
+      if (legacyActive && legacyStopped) await ctl(["start", names.legacy]);
+      else if (legacyActive && (await stateOf(names.legacy)) !== "active") await ctl(["start", names.legacy]);
+    };
+    try {
+      // (b) Start the slot on the shared port. (c) The legacy unit stays up until the slot answers.
+      if (!activeSlots.includes(slot)) await must(["start", names.slot(slot)]);
+      try {
+        await wait(slot);
+      } catch (err) {
+        if (!legacyActive) throw err;
+        // An old legacy process does not share the port (no reusePort): the slot is alive but retrying its bind. Stopping the legacy
+        // unit is then the one unavoidable hop; the slot must answer within the wait, or the legacy unit is started again.
+        legacyStopped = true;
+        await must(["stop", names.legacy]);
+        await wait(slot);
+      }
+      await must(["enable", names.slot(slot)]);
+    } catch (err) {
+      await restoreLegacy();
+      throw err;
+    }
+    if (legacyActive && !legacyStopped) await soft(["stop", "--no-block", names.legacy]);
     await retireLegacy();
+    await converge();
     return { path, changed, slot, action: "migrated" };
   }
 
   if (activeSlots.length === 0) {
-    // Nothing running. A release respects a unit the user disabled; an explicit install or a first install enables it.
+    // Nothing running. A release respects a unit the user disabled or stopped; a first or explicit install enables it.
     if (options.respectDisabled && existedBefore) return { path, changed, action: "left-alone" };
-    const slot: LocalSlot = enabledSlots[0] ?? "a";
-    await enable(slot);
-    await start(slot);
+    const slot: LocalSlot = freeSlots[0] ?? "a";
+    try {
+      await must(["enable", names.slot(slot)]);
+      await startAndWait(slot);
+    } catch (err) {
+      await abandon(slot);
+      throw err;
+    }
+    await converge();
     return { path, changed, slot, action: "started" };
   }
 
   const current = activeSlots[0] as LocalSlot;
-  if (!(changed || (options.restartIfActive ?? false))) return { path, changed, slot: current, action: "unchanged" };
-  // Handoff: the new instance listens (sharing the port) before the old one is told to drain.
+  if (!(changed || (options.restartIfActive ?? false))) {
+    await converge();
+    return { path, changed, slot: current, action: "unchanged" };
+  }
   const next: LocalSlot = current === "a" ? "b" : "a";
-  await start(next);
-  await enable(next);
-  await ctl(["stop", "--no-block", localSlotUnit(current)]);
-  await ctl(["disable", localSlotUnit(current)]);
+  if (states[next] !== "idle") {
+    // The other slot is still draining an earlier instance: leave the running one alone, the next install converges.
+    log(`gateway local: handoff skipped, ${names.slot(next)} is still draining; the running instance stays`);
+    await converge();
+    return { path, changed, slot: current, action: "handoff-deferred" };
+  }
+  // Handoff: the new instance answers (sharing the port) before the old one is told to drain.
+  try {
+    await startAndWait(next);
+    await must(["enable", names.slot(next)]);
+  } catch (err) {
+    await abandon(next);
+    await soft(["enable", names.slot(current)]);
+    throw err;
+  }
+  await soft(["stop", "--no-block", names.slot(current)]);
+  await soft(["disable", names.slot(current)]);
+  await converge();
   return { path, changed, slot: next, action: "handed-over" };
 }
 

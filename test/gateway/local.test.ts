@@ -470,9 +470,12 @@ describe("remote URL guard and drain", () => {
     // IPv4-mapped IPv6 loopback, dotted and hex forms.
     for (const u of ["http://[::ffff:127.0.0.1]:47140", "http://[::ffff:7f00:1]:47140", "http://[::ffff:7f00:1]"]) expect(remoteRefusal(u, 47140, [])).toBeDefined();
     // Any address of this host, plain and IPv4-mapped.
-    expect(remoteRefusal("http://192.0.2.7:8080", 47140, ["192.0.2.7"])).toContain("this host");
-    expect(remoteRefusal("http://[::ffff:c000:207]:8080", 47140, ["192.0.2.7"])).toContain("this host");
-    expect(remoteRefusal("http://myhost.lan", 47140, ["myhost.lan"])).toContain("this host");
+    expect(remoteRefusal("http://192.0.2.7:47140", 47140, ["192.0.2.7"])).toContain("this host");
+    expect(remoteRefusal("http://[::ffff:c000:207]:47140", 47140, ["192.0.2.7"])).toContain("this host");
+    expect(remoteRefusal("http://myhost.lan:47140", 47140, ["myhost.lan"])).toContain("this host");
+    // Another port on this host is allowed.
+    expect(remoteRefusal("http://192.0.2.7:8080", 47140, ["192.0.2.7"])).toBeUndefined();
+    expect(remoteRefusal("https://myhost.lan", 47140, ["myhost.lan"])).toBeUndefined();
     expect(remoteRefusal("http://192.0.2.8", 47140, ["192.0.2.7"])).toBeUndefined();
   });
 
