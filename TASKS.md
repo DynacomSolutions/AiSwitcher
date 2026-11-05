@@ -140,7 +140,7 @@ ETA: 2026-11-05 18:00 ICT
 | 119 | Gateway: reject pool pin, stable admin URL | done | claude-20261104-gw-followups | | 4.113 | | PRs https://github.com/DynacomSolutions/AiSwitcher/pull/357, https://github.com/DynacomSolutions/.cluster/pull/2122, roll https://github.com/DynacomSolutions/.cluster/pull/2125.<br>Pool name as pinned identity is rejected (admin API and CLI); admin Service ClusterIP pinned.<br>Live on ais:60d231b. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-03 20:00 ICT
+ETA: 2026-11-06 01:30 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -149,6 +149,7 @@ ETA: 2026-11-03 20:00 ICT
 | 116 | Web Usage page: cost ignores the period filter but says all time | done | | | | | PR https://github.com/DynacomSolutions/AiSwitcher/pull/349: All time default, exact per-day costs, CLI money format, Monthly chart fix. |
 | 117 | `ais usage tui` starts from the AIS snapshot, not a full rescan | dropped | | | | | Dropped: owner chose to keep the current Tokscale TUI (2026-11-03).<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/346 closed. |
 | 118 | Redeploy ais console and auto-redeploy on every AIS release | done | | | | | .cluster PRs #2074, #2076, #2078; DynacomDevWatcher #49; AiSwitcher https://github.com/DynacomSolutions/AiSwitcher/pull/350 (kubectl built from source for CVEs).<br>Verified: AiSwitcher main merge auto-built and rolled ais pod to ais-console:main@sha256:d3040120. |
+| 123 | Usage collector: stop re-reading unchanged Claude transcripts each cycle | in_progress | claude-20261105-usage-incremental | ais-usage-incremental | | 2026-11-06 01:30 ICT | Growing parent session invalidated all 463 subagent cache entries (7.1 GB) every scan.<br>Fix in vendored Tokscale patch plus stat-only cache mode. |
 
 ## 6. Browser control extension
 ETA: 2026-11-06 18:00 ICT
