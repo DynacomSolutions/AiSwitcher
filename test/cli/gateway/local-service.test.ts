@@ -263,6 +263,89 @@ describe("ais-gateway-local@.service", () => {
     });
   });
 
+  test("the carried drop-in is loaded (daemon-reload) before the slot starts, and the wait polls the unit's own port", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir);
+      await mkdir(join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`));
+      await writeFile(join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`, "port.conf"), "[Service]\nEnvironment=AIS_GATEWAY_LOCAL_PORT=47999\n");
+      const order: string[] = [];
+      const ports: Array<number | undefined> = [];
+      const carriedFile = join(dir, `${LOCAL_GATEWAY_TEMPLATE_NAME}.d`, "legacy-migrated.conf");
+      let carriedSeenByLastReload = false;
+      await installLocalGatewayService({
+        unitDirectory: dir,
+        platform: "linux",
+        ctl: async (args) => {
+          order.push(args.join(" "));
+          if (args[0] === "daemon-reload") carriedSeenByLastReload = await exists(carriedFile);
+          if (args[0] === "start" && args[1] === localSlotUnit("a")) expect(carriedSeenByLastReload).toBe(true); // reloaded after the file was written
+          return sd.ctl(args);
+        },
+        preflight: async () => true,
+        waitListening: async (_s, port) => void ports.push(port),
+      });
+      expect(order.indexOf("daemon-reload")).toBeLessThan(order.indexOf(`start ${localSlotUnit("a")}`));
+      expect(ports).toEqual([47999]);
+    });
+  });
+
+  test("carrying: EnvironmentFile and UnsetEnvironment kept, continuations joined, a bare Environment= reset kept in order, others named in the log", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir);
+      await mkdir(join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`));
+      await writeFile(
+        join(dir, `${LOCAL_GATEWAY_LEGACY_NAME}.d`, "a.conf"),
+        "[Service]\nEnvironment=ONE=1\nEnvironment=\nEnvironment=TWO=2 \\\n  THREE=3\nEnvironmentFile=-/etc/x.env\nUnsetEnvironment=GONE\nEnvironment=TWO=2 THREE=3\nMemoryMax=1G\nRestart=on-failure\nExecStart=/bin/x\n",
+      );
+      const logs: string[] = [];
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => true, waitListening: async () => {}, log: (l) => logs.push(l) });
+      const carried = (await readFile(join(dir, `${LOCAL_GATEWAY_TEMPLATE_NAME}.d`, "legacy-migrated.conf"), "utf8")).trim().split("\n");
+      expect(carried).toEqual(["[Service]", "Environment=ONE=1", "Environment=", "Environment=TWO=2 THREE=3", "EnvironmentFile=-/etc/x.env", "UnsetEnvironment=GONE", "Environment=TWO=2 THREE=3"]);
+      expect(logs.filter((l) => l.includes("MemoryMax="))).toHaveLength(1);
+      expect(logs.filter((l) => l.includes("Restart="))).toHaveLength(1);
+      expect(logs.filter((l) => l.includes("ExecStart override"))).toHaveLength(1);
+    });
+  });
+
+  test("respectDisabled never re-enables a running slot the user disabled", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      const sd = fakeSystemd({ active: [localSlotUnit("a")] }); // running, but disabled by the user
+      const r = await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, waitListening: async () => {}, respectDisabled: true });
+      expect(r.action).toBe("unchanged");
+      expect(sd.calls.some((c) => c.startsWith("enable"))).toBe(false);
+      expect(sd.enabled.size).toBe(0);
+    });
+  });
+
+  test("both slots active: the one that answers is kept, the other drains and is disabled; none answering changes nothing", async () => {
+    await withDir(async (dir) => {
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: fakeSystemd().ctl, waitListening: async () => {} });
+      const both = [localSlotUnit("a"), localSlotUnit("b")];
+      const sd = fakeSystemd({ active: both, enabled: both });
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, waitListening: async () => {}, answeringInstance: async () => "b" });
+      expect(sd.calls).toContain(`stop --no-block ${localSlotUnit("a")}`);
+      expect(sd.enabled.has(localSlotUnit("a"))).toBe(false);
+      expect(sd.enabled.has(localSlotUnit("b"))).toBe(true);
+      expect(sd.active.has(localSlotUnit("b"))).toBe(true);
+      const none = fakeSystemd({ active: both, enabled: both });
+      const logs: string[] = [];
+      await installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: none.ctl, waitListening: async () => {}, answeringInstance: async () => undefined, log: (l) => logs.push(l) });
+      expect(none.calls.some((c) => c.startsWith("stop") || c.startsWith("disable") || c.startsWith("enable"))).toBe(false);
+      expect(logs.some((l) => l.includes("neither answers"))).toBe(true);
+    });
+  });
+
+  test("a slot that was already running before the install is never stopped by a failed migration", async () => {
+    await withDir(async (dir) => {
+      const sd = await legacyRig(dir, { legacyOn: false });
+      sd.active.add(localSlotUnit("a")); // slot a already running
+      await expect(installLocalGatewayService({ unitDirectory: dir, platform: "linux", ctl: sd.ctl, preflight: async () => true, waitListening: async () => { throw new Error("timeout"); } })).rejects.toThrow("timeout");
+      expect(sd.active.has(localSlotUnit("a"))).toBe(true);
+      expect(sd.calls.some((c) => c === `stop ${localSlotUnit("a")}`)).toBe(false);
+    });
+  });
+
   test("doctor status reads the proxy mode and instance, undefined when down", async () => {
     const running = await startLocalGateway({ port: 0, members: async () => [], remoteBase: "http://remote.test", log: () => {}, clientToken: async () => undefined, instance: "b" });
     try {
