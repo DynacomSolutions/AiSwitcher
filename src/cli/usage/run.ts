@@ -27,6 +27,7 @@ import {
   tokscaleInvocationFor,
   type AisTokscaleExportInvocation,
   type DailyTotals,
+  type DailyUsage,
   type DateSpan,
   type TokscaleEntry,
   type TokscaleReport,
@@ -269,6 +270,9 @@ export async function runTokscaleForUsageTarget(target: UsageTarget, suppression
 
   try {
     const nativeExport = await deps.nativeExportForTarget?.(target);
+    // A collector run must never fall back to PATH/bunx Tokscale, which scans
+    // every transcript again without the AIS cache.
+    if (deps.nativeExportForTarget && !nativeExport) throw new Error("native-export-unavailable");
     const stdout = nativeExport
       ? await runAisTokscaleExportInvocation(nativeExport.invocation)
       : await runTokscaleProcess([...clientArgs, "--json"], env);
@@ -366,16 +370,27 @@ async function runOne(target: UsageTarget, suppression: UsageRowSuppression, dep
     // Retired identities keep local usage only: the extra-cost probe is a
     // live OAuth call against an account whose credentials are gone.
     isRetired(target.identity) ? Promise.resolve(undefined) : (deps.fetchExtraCost ?? fetchExtraCost)(target.toolName, target.identity),
-    (deps.fetchTokscaleDailyUsage ?? fetchTokscaleDailyUsage)(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
+    // With a native export the collector derives daily usage from the export
+    // it already reads (snapshot.ts), so no second `hourly` scan runs.
+    deps.nativeExportForTarget
+      ? Promise.resolve(undefined)
+      : (deps.fetchTokscaleDailyUsage ?? fetchTokscaleDailyUsage)(target.toolName as "claude" | "codex" | "grok" | "kimi", target.identity),
   ]);
   const primaryProvider = providerForTool(target.toolName);
-  return results.map((result, index) => ({
+  return withDailyUsage(results.map((result, index) => ({
     ...result,
     ...(extraCost && (result.provider === primaryProvider || (index === 0 && !results.some((r) => r.provider === primaryProvider)))
       ? { extraCost }
       : {}),
-    ...(daily && results.length === 1 ? { dateSpan: daily.dateSpan, dailyUsage: daily.daily, dailyTotals: daily.totals } : {}),
-  }));
+  })), daily);
+}
+
+/** Attaches one source's daily usage to its report row. Only a single-row
+ * source gets it: daily figures carry no provider, so they cannot be split
+ * across several provider rows. */
+export function withDailyUsage(results: UsageResult[], daily: DailyUsage | undefined): UsageResult[] {
+  if (!daily || results.length !== 1) return results;
+  return [{ ...results[0]!, dateSpan: daily.dateSpan, dailyUsage: daily.daily, dailyTotals: daily.totals }];
 }
 
 function mergeExtraCost(a: OverageInfo | undefined, b: OverageInfo | undefined): OverageInfo | undefined {
@@ -477,7 +492,9 @@ export async function runUsageQueryForTargets(
   options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => unknown; deps?: UsageRunDeps } = {},
 ): Promise<UsageResult[]> {
   const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
-  if (!options.deps?.runTokscale && targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
+  // The collector (nativeExportForTarget) only runs the AIS-patched binary,
+  // so it skips the `bunx tokscale@latest --version` warm-up.
+  if (!options.deps?.runTokscale && !options.deps?.nativeExportForTarget && targets.some((target) => !["zai", "ali", "pi"].includes(target.toolName))) await ensureTokscaleCacheFresh();
   return runBatched(
     targets,
     USAGE_MAX_CONCURRENT,

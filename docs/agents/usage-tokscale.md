@@ -140,6 +140,25 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     would seem natural, and easy to get wrong again if this ever gets
     refactored without re-reading why.
 
+- **The usage snapshot collector runs Tokscale exactly once per source: the
+  AIS-patched native export (2026-11-05).** Its daily figures (date span,
+  per-day tokens and totals) used to come from a second process,
+  `fetchTokscaleDailyUsage`'s `hourly --client <tool> --json` via
+  PATH/`bunx tokscale@latest`: unpatched upstream Tokscale with no AIS cache,
+  no stat-only mode and none of the warm-scan fixes, re-reading every
+  transcript once per identity. The collector now derives them from the
+  export it already reads and validates (`dailyUsageFromNativeMessages`,
+  applied in `snapshot.ts`'s `savePartition`), mirroring Tokscale 4.20's
+  hourly aggregation: recovery daily rows and undated balances skipped, hours
+  keyed in the `scanner.bucketTimezone` pinned in the isolated config's
+  `settings.json` (local time when unpinned), costs summed per hour in message
+  order. A committed fixture (`test/fixtures/tokscale-native-daily`) pins
+  equality with upstream `hourly`. A collector run never falls back to
+  PATH/bunx Tokscale (a missing export is an error row) and skips the
+  `bunx tokscale@latest --version` warm-up. Swap-pool member rows keep their
+  own transcript-derived daily figures. PATH/bunx Tokscale remains only for
+  `ais usage <tokscale args>` passthrough (other than `tui`).
+
 - **`ais usage breakdown` answers WHAT consumed the tokens, per tool call
   (2026-09-10).** tokscale aggregates per model; breakdown.ts
   (`src/cli/usage/breakdown.ts`) re-reads the same local logs one level

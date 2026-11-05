@@ -188,7 +188,7 @@ export async function buildAisTokscaleExportInvocation(
       ...sourceEnv,
       TOKSCALE_EXTRA_DIRS: "",
       TOKSCALE_AIS_SOURCE_CONFIG_DIR: resolve(sourceTokscaleConfigDir),
-      TOKSCALE_CONFIG_DIR: join(aisCacheDir(), "usage", "native-tokscale", "isolated-config"),
+      TOKSCALE_CONFIG_DIR: aisNativeTokscaleConfigDir(),
       TOKSCALE_AIS_EXPORT_PATH: target.exportPath,
       TOKSCALE_AIS_PARTITION_ID: target.partitionId,
       // A warm scan trusts an exact size and mtime match, so an unchanged
@@ -198,6 +198,13 @@ export async function buildAisTokscaleExportInvocation(
     cwd: process.cwd(),
     ...(target.signal ? { signal: target.signal } : {}),
   };
+}
+
+/** The isolated Tokscale config directory every native export runs with. Its
+ * settings.json holds the scanner's bucket timezone (Tokscale pins it on its
+ * first run), which the daily rollup of an export must reuse. */
+export function aisNativeTokscaleConfigDir(): string {
+  return join(aisCacheDir(), "usage", "native-tokscale", "isolated-config");
 }
 
 /** The snapshot worker owns this bounded process call and validates the
@@ -1029,6 +1036,11 @@ export interface DailyUsage {
  * PATH they genuinely overlap. Returns undefined rather than throwing on any
  * failure (unsupported client, tokscale error, zero history) — this is a
  * display nicety, never something worth sinking the whole report over.
+ *
+ * The usage snapshot collector never calls this: it runs PATH/bunx Tokscale,
+ * a full second scan of every transcript with no AIS cache. The collector
+ * derives the same figures from its native export instead
+ * (dailyUsageFromNativeMessages, applied in snapshot.ts).
  */
 export async function fetchTokscaleDailyUsage(
   toolName: "claude" | "codex" | "grok" | "kimi" | "opencode",
@@ -1080,4 +1092,117 @@ export function dailyUsageFromHourlyEntries(entries: TokscaleHourlyEntry[]): Dai
 
   if (firstMs === undefined || lastMs === undefined) return undefined;
   return { dateSpan: { firstMs, lastMs }, daily, totals };
+}
+
+/** One message of an AIS native export batch: Tokscale's `UnifiedMessage`,
+ * serialized with its snake_case field names. Only the fields the hourly
+ * rollup reads are typed. */
+interface NativeExportMessage {
+  session_id?: unknown;
+  dedup_key?: unknown;
+  timestamp?: unknown;
+  date?: unknown;
+  tokens?: { input?: unknown; output?: unknown; cache_read?: unknown; cache_write?: unknown } | null;
+  message_count?: unknown;
+  cost?: unknown;
+}
+
+const LOCAL_RECOVERY_DAILY_PREFIX = "local-recovery:daily:";
+const TOKSCALE_UNKNOWN_DATE = "unknown";
+
+function finiteNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+/** Formats an instant as Tokscale's "YYYY-MM-DD HH:00" hour key in its
+ * bucket timezone: a pinned IANA zone, or the machine's local zone when none
+ * is pinned or the pinned name is not a zone (Tokscale's own fallback).
+ * Memoized per minute, since every real zone offset is whole minutes. */
+function tokscaleHourKeyFormatter(bucketTimezone: string | undefined): (timestampMs: number) => string {
+  let zoned: Intl.DateTimeFormat | undefined;
+  const zone = bucketTimezone?.trim();
+  if (zone) {
+    try {
+      zoned = new Intl.DateTimeFormat("en-US", {
+        timeZone: zone, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit",
+      });
+    } catch {
+      zoned = undefined;
+    }
+  }
+  const memo = new Map<number, string>();
+  return (timestampMs) => {
+    const minute = Math.floor(timestampMs / 60_000);
+    const cached = memo.get(minute);
+    if (cached !== undefined) return cached;
+    let key: string;
+    if (zoned) {
+      const parts: Record<string, string> = {};
+      for (const part of zoned.formatToParts(new Date(timestampMs))) parts[part.type] = part.value;
+      key = `${(parts.year ?? "").padStart(4, "0")}-${parts.month}-${parts.day} ${parts.hour}:00`;
+    } else {
+      const d = new Date(timestampMs);
+      key = `${String(d.getFullYear()).padStart(4, "0")}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:00`;
+    }
+    memo.set(minute, key);
+    return key;
+  };
+}
+
+/** Tokscale's `hourly` report computed from the messages an AIS native export
+ * already holds, so the collector needs no second transcript scan. Mirrors
+ * Tokscale 4.20's aggregate_hourly_usage_entries exactly: recovery daily rows
+ * and undated balances are skipped, a timestamped message is keyed by its
+ * hour in the bucket timezone, a timestamp-less one by `<date> 00:00`, and
+ * costs add in message order within an hour, hours sorted by key. The export
+ * holds the same parsed, unfiltered message set the hourly report filters
+ * with no date range, which removes nothing. */
+export function hourlyEntriesFromNativeMessages(messages: readonly unknown[], bucketTimezone?: string): TokscaleHourlyEntry[] {
+  const hourKey = tokscaleHourKeyFormatter(bucketTimezone);
+  const hours = new Map<string, TokscaleHourlyEntry>();
+  for (const value of messages) {
+    if (!value || typeof value !== "object") continue;
+    const message = value as NativeExportMessage;
+    const timestamp = finiteNumber(message.timestamp);
+    const date = typeof message.date === "string" ? message.date : "";
+    const dedupKey = typeof message.dedup_key === "string" ? message.dedup_key : undefined;
+    if (dedupKey !== undefined && message.session_id === dedupKey && dedupKey.startsWith(LOCAL_RECOVERY_DAILY_PREFIX)) continue;
+    if (timestamp === 0 && date === TOKSCALE_UNKNOWN_DATE) continue;
+    const key = timestamp > 0 ? hourKey(timestamp) : `${date} 00:00`;
+    let entry = hours.get(key);
+    if (!entry) {
+      entry = { hour: key, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, messageCount: 0, cost: 0 };
+      hours.set(key, entry);
+    }
+    const tokens = message.tokens ?? {};
+    entry.input += finiteNumber(tokens.input);
+    entry.output += finiteNumber(tokens.output);
+    entry.cacheRead! += finiteNumber(tokens.cache_read);
+    entry.cacheWrite! += finiteNumber(tokens.cache_write);
+    entry.messageCount! += Math.max(0, finiteNumber(message.message_count, 1));
+    entry.cost! += finiteNumber(message.cost);
+  }
+  return [...hours.values()].sort((a, b) => (a.hour < b.hour ? -1 : a.hour > b.hour ? 1 : 0));
+}
+
+/** The daily usage `fetchTokscaleDailyUsage` would report, derived from an
+ * AIS native export's messages instead of a separate `hourly` scan. */
+export function dailyUsageFromNativeMessages(messages: readonly unknown[], bucketTimezone?: string): DailyUsage | undefined {
+  return dailyUsageFromHourlyEntries(hourlyEntriesFromNativeMessages(messages, bucketTimezone));
+}
+
+/** The scanner bucket timezone Tokscale recorded in a config directory's
+ * settings.json, or undefined (local time) when it is absent or unreadable. */
+export function readTokscaleBucketTimezone(configDir = aisNativeTokscaleConfigDir()): string | undefined {
+  try {
+    const settings = JSON.parse(readFileSync(join(configDir, "settings.json"), "utf8")) as { scanner?: { bucketTimezone?: unknown } };
+    const zone = settings?.scanner?.bucketTimezone;
+    return typeof zone === "string" && zone.trim() ? zone : undefined;
+  } catch {
+    return undefined;
+  }
 }
