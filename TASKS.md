@@ -165,4 +165,4 @@ ETA: 2026-11-06 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 124 | One host-level profile-sync watcher instead of a scan per session sidecar | in_review | claude-20261105-sync-daemon | perf/host-profile-sync-daemon | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/375<br>`ais __profile_sync_daemon`, 30 s poll; sidecars only register.<br>Unit file included, not installed. |
+| 124 | One host-level profile-sync watcher instead of a scan per session sidecar | in_review | claude-20261105-sync-daemon | perf/host-profile-sync-daemon | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/375<br>`ais __profile_sync_daemon`, 30 s poll; sidecars only register.<br>`ais update` and install:shims install and start the unit; not installed on any host yet. |

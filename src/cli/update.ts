@@ -4,6 +4,7 @@ import { open } from "node:fs/promises";
 import { runBackup } from "../../scripts/backup.ts";
 import { downloadAssetAtomic, platformKey } from "../shared/release-assets.ts";
 import { cyan, dim, green, yellow } from "./colors.ts";
+import { describeProfileSyncServiceResult, installProfileSyncService, type ProfileSyncServiceResult } from "../sync/profile-sync-service.ts";
 
 // Everything `ais update` knows how to refresh - "open" is darwin-only (see
 // AGENTS.md's "Chrome profile per identity" section), the rest ship
@@ -36,6 +37,8 @@ export interface UpdateOptions {
   shimDir?: string;
   /** Test seam for the release download. */
   fetchImpl?: typeof fetch;
+  /** Test seam for the profile-sync user service step (Linux only). */
+  installProfileSyncService?: (restartIfActive: boolean) => Promise<ProfileSyncServiceResult>;
 }
 
 async function installedVersion(binary: string): Promise<string | undefined> {
@@ -90,6 +93,7 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
 
   const before = await installedVersion(join(shimDir, "ais"));
   let updated = 0;
+  let aisUpdated = false;
   for (const name of MANAGED_BINARIES) {
     const dest = join(shimDir, name);
     if (!(await Bun.file(dest).exists())) {
@@ -101,11 +105,28 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     // Verified before it replaces the installed file, so a bad download leaves the working binary in place.
     await downloadAssetAtomic(assetName, dest, { fetchImpl: options.fetchImpl, mode: 0o755, verify: (tmp) => verifyDownload(name, tmp) });
     updated++;
+    if (name === "ais") aisUpdated = true;
   }
 
   if (updated > 0 && (await Bun.file(join(shimDir, "ais")).exists())) {
     const after = await installedVersion(join(shimDir, "ais"));
     console.log(`${prefix} ais ${before && after && before !== after ? `${before} -> ${after}` : `${after ?? "?"} (already the latest release)`}`);
+  }
+
+  // The unit runs %h/.local/bin/ais, so only the default shim dir with an
+  // installed ais gets it. Never fails the update: problems are warnings.
+  const defaultShimDir = shimDir === join(homedir(), ".local", "bin");
+  if (options.installProfileSyncService || (defaultShimDir && (await Bun.file(join(shimDir, "ais")).exists()))) {
+    let result: ProfileSyncServiceResult;
+    try {
+      result = await (options.installProfileSyncService ?? ((restart) => installProfileSyncService({ restartIfActive: restart })))(
+        aisUpdated,
+      );
+    } catch (error) {
+      result = { status: "failed", reason: error instanceof Error ? error.message : String(error) };
+    }
+    const described = describeProfileSyncServiceResult(result);
+    if (described) console.log(`${prefix} ${described.warn ? yellow(`warning: ${described.line}`) : described.line}`);
   }
 
   console.log(

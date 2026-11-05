@@ -1,6 +1,7 @@
 # Host-level profile-sync watcher: one process scans the identity trees of all
 # live sessions every 30 s, instead of one stat-walk per session sidecar.
-# Not installed automatically. To install by hand:
+# Installed, enabled and started by `ais update` and the source install
+# (src/sync/profile-sync-service.ts). By hand:
 #   cp scripts/systemd/ais-profile-sync.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now ais-profile-sync.service
 [Unit]

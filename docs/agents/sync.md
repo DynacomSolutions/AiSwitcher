@@ -57,7 +57,11 @@ reconciliation.
   the real agent first, then starts full reconciliation in a detached AIS
   worker. Ordinary profile/session mutations are picked up by one host-level
   watcher, `ais __profile_sync_daemon` (`sync/profile-sync-daemon.ts`, user
-  unit `scripts/systemd/ais-profile-sync.service`, installed by hand): every
+  unit `scripts/systemd/ais-profile-sync.service`, embedded in `ais` and
+  installed, enabled and started or restarted by `ais update` and
+  `bun run install:shims` via `sync/profile-sync-service.ts`; idempotent,
+  Linux only, and a missing user manager is a warning, never a failed
+  update): every
   30 s it reads the live-session registry (`~/.ais/state/profile-sync/sessions/`,
   one file per session, written and removed by the sidecar, dead PIDs pruned
   by PID plus start time), stat-walks each distinct identity configDir once

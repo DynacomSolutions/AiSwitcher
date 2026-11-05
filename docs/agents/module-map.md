@@ -139,7 +139,8 @@ src/
                           session-registry.ts (live sessions, one file each) and
                           profile-sync-daemon.ts (`ais __profile_sync_daemon`: one
                           30 s scan per identity root for all sessions; watch.ts
-                          holds the stat-walk)
+                          holds the stat-walk); profile-sync-service.ts installs
+                          its user unit from `ais update` and install:shims
    server/              the local console API behind `ais web` — thin HTTP wrappers around
                            the EXISTING engines (store/actions, limits fetchers, usage
                            aggregation, resume readers, zai/ali auth writers), no new

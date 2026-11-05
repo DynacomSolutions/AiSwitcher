@@ -24,7 +24,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 92
   satisfied with narrow per-tool allowlists (Claude's own package; Kimi plus
   `node-pty`; Crush's own package), never
   `--dangerously-allow-all-scripts`. This is distinct from `ais update`, which
-  only refreshes this project's shim binaries. For the public npm registry,
+  only refreshes this project's shim binaries and, on Linux with a user
+  systemd manager, (re)installs and starts `ais-profile-sync.service`
+  (restarted when `ais` itself changed; a missing manager is only a warning). For the public npm registry,
   `upgrade.ts` resolves the small `/latest` manifest, pins npm to that exact
   version with `--prefer-online` (sent on every managed install, including the
   `@latest` fallback, so npm's cached packument can never pick yesterday's
