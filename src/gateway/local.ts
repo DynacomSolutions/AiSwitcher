@@ -83,7 +83,9 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     probeAt = deps.now() + breakerMs;
     setMode("direct", reason);
   };
-  const remoteOk = (): void => {
+  /** Only the probe may close the breaker: a slow request that began before it opened and answers late proves nothing. */
+  const remoteOk = (wasProbe: boolean): void => {
+    if (!wasProbe) return;
     probing = false;
     setMode("remote", "remote answered");
   };
@@ -225,8 +227,10 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     const replayable = body.kind !== "stream";
 
     let useRemote = mode === "remote";
+    let isProbe = false;
     if (!useRemote && replayable && deps.now() >= probeAt && !probing) {
       probing = true;
+      isProbe = true;
       useRemote = true;
     } else if (!useRemote && !replayable) {
       useRemote = true; // Too big to replay: remote only, its answer passes through.
@@ -235,14 +239,16 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     if (useRemote) {
       try {
         const res = await tryRemote(req, url, app, rest, body, req.signal);
-        remoteOk();
+        remoteOk(isProbe || (!replayable && mode === "direct"));
         return clean(res);
       } catch (err) {
         if (!(err instanceof RemoteFailure)) {
-          probing = false;
+          if (isProbe) probing = false;
           return new Response(null, { status: 499 });
         }
-        remoteFailed(err.reason);
+        if (mode === "direct" && !isProbe && replayable) {
+          // Began before the breaker opened: it is already open, nothing to change.
+        } else remoteFailed(err.reason);
         if (!replayable) return err.response ? clean(err.response) : providerError(style, 502, "cluster gateway unreachable");
         if (err.response) await discard(err.response);
       }

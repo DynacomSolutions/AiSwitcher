@@ -170,6 +170,25 @@ describe("local gateway failover", () => {
     expect(r.logs.join("\n")).not.toMatch(new RegExp(`tok-|${CLIENT_KEY}`));
   });
 
+  test("a slow request that began before the breaker opened does not close it when it answers late", async () => {
+    let release: () => void = () => {};
+    let n = 0;
+    const r = rig({
+      remote: () => {
+        n += 1;
+        return n === 1 ? new Promise<Response>((resolve) => (release = () => resolve(new Response("late")))) : refused();
+      },
+    });
+    const slow = r.post();
+    await Bun.sleep(5);
+    expect(await (await r.post()).text()).toBe("direct");
+    expect(r.gw.status().mode).toBe("direct");
+    release();
+    expect(await (await slow).text()).toBe("late");
+    expect(r.gw.status().mode).toBe("direct");
+    expect(r.logs).toHaveLength(1);
+  });
+
   test("429 on the active member tries the next member once", async () => {
     const seen: string[] = [];
     const r = rig({
