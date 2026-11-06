@@ -5,10 +5,11 @@ const USAGE_PROVIDER: Record<string, string> = { claude: "anthropic", codex: "op
 /** The provider name the gateway ledger uses for the same tool. */
 const GATEWAY_PROVIDER: Record<string, string> = { claude: "claude", codex: "codex", kimi: "kimi" };
 
-/** Gateway apps whose clients (the agent CLIs) write local transcripts into the pool folder. The native scan already
- * attributes those transcripts to the pool members, so counting their ledger rows again would double the figure. */
-export function isNativeCoveredApp(app: string): boolean {
-  return app.startsWith("agents-");
+/** Claude agent traffic: the CLI writes transcripts into the pool folder and the native scan attributes them to the
+ * members, so counting the ledger rows again would double the figure. Codex pool sessions are not attributed natively
+ * (live check: native codex 0 against billions of ledger tokens), so codex ledger rows must be counted. */
+export function isNativeCoveredApp(app: string, provider: string): boolean {
+  return provider === "claude" && app.startsWith("agents-");
 }
 
 export type PeriodName = "today" | "week";
@@ -97,7 +98,7 @@ function gatewayFigure(period: GatewayPeriod, provider: string, member: string):
   let coveredByNative = 0;
   for (const r of period.rows) {
     if (r.identity !== member || r.provider !== provider) continue;
-    if (isNativeCoveredApp(r.app)) {
+    if (isNativeCoveredApp(r.app, r.provider)) {
       coveredByNative += r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens;
       continue;
     }

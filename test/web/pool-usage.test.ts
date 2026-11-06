@@ -81,6 +81,15 @@ describe("summarisePools", () => {
     expect(s!.week.gatewayTokens).toBe(0);
   });
 
+  test("codex agent-app rows are counted because codex pool transcripts are not in native usage", () => {
+    const cx: PoolRef = { tool: "codex", name: "cp", members: [{ name: "m1", allowed: true }] };
+    const row = { ...gw("m1", 700, 2, { app: "agents-codex" }), provider: "codex" };
+    const u = [{ ...native("m1", {}), provider: "openai", dailyTotals: {} }];
+    const [s] = summarisePools([cx], u, [], resp(ok([row]), ok([row])));
+    expect(s!.today.gatewayTokens).toBe(700);
+    expect(s!.today.gatewayCoveredByNative).toBe(0);
+  });
+
   test("gateway usage counts every token kind, flags unpriced requests, and ignores other providers", () => {
     const row = gw("m1", 1, 0.1, { outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, unpricedRequests: 2 });
     const other = { ...gw("m1", 5000, 5), provider: "codex" };
