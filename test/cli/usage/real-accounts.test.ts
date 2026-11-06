@@ -407,6 +407,29 @@ describe("swap pool attribution cache: appended transcripts", () => {
     expect(warm).toEqual(await f.cold());
   });
 
+  test("a same-size edit between the sampled windows forces a full re-parse", async () => {
+    const f = await fixture();
+    // ~200 KiB: the edited message sits far outside the first 4 KiB and the last 64 KiB.
+    const filler = Array.from({ length: 100 }, (_, i) => JSON.stringify({ type: "user", n: i, text: "x".repeat(1000) })).join("\n");
+    await writeFile(f.transcript, `${filler}\n${f.msg(10, 5)}\n${filler}\n`);
+    const reads: number[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (_path: string, offset: number) => reads.push(offset) };
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    const before = await stat(f.transcript);
+    const text = await readFile(f.transcript, "utf8");
+    const at = text.indexOf('"output_tokens":5');
+    expect(at).toBeGreaterThan(4096);
+    expect(before.size - at).toBeGreaterThan(65_536);
+    const handle = await open(f.transcript, "r+");
+    await handle.write("9", at + '"output_tokens":'.length);
+    await handle.close();
+    const after = await stat(f.transcript);
+    expect([after.ino, after.size]).toEqual([before.ino, before.size]);
+    const warm = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    expect(reads).toEqual([0, 0]);
+    expect(warm).toEqual(await f.cold());
+  });
+
   test("a truncated and regrown transcript is re-parsed from byte 0", async () => {
     const f = await fixture();
     await writeFile(f.transcript, `${f.msg(1)}\n${f.msg(2)}\n`);

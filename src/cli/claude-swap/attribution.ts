@@ -187,12 +187,13 @@ type CachedUsageHit = [at: number, model: string | null, id: string | null, inpu
  * produces exactly the same hits in the same order.
  *
  * Resume safety is a sampled check, not a full prefix hash: the same device
- * and inode, a size no smaller than last time, and SHA-256 digests of the
- * first 4 KiB and of the 64 KiB before `offset`. Re-hashing the whole prefix
- * would re-read multi-GB live transcripts every cycle, which is what this
- * cache exists to avoid. The trade-off: an in-place rewrite that keeps the
- * inode, does not shrink the file, and leaves both sampled windows intact
- * while changing bytes between them is not detected. Claude Code only ever
+ * and inode, a size larger than the stored stat and no smaller than `offset`
+ * (which can lie past that stat when the file grew during the last read), and
+ * SHA-256 digests of the first 4 KiB and of the 64 KiB before `offset`.
+ * Re-hashing the whole prefix would re-read multi-GB live transcripts every
+ * cycle, which is what this cache exists to avoid. The trade-off: an in-place
+ * rewrite that keeps the inode, also grows the file, and leaves both sampled
+ * windows intact while changing bytes between them is not detected. Claude Code only ever
  * appends to a session transcript (a rewrite replaces the file or changes its
  * tail), and any other change (a new inode, a truncation, a same-size
  * rewrite, a sample mismatch) falls back to a full re-parse.
@@ -590,12 +591,13 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
     let entry: CachedUsageFile | undefined;
     let hits: CachedUsageHit[] | undefined;
 
-    // Append: same file, not shorter than where the last read stopped, and
-    // both sampled windows still match. `offset` may exceed the size in the
-    // stored fingerprint: that stat is taken before the read, and a live
-    // transcript keeps growing while it is read.
+    // Append: same file, grown since the stored stat, not shorter than where
+    // the last read stopped, and both sampled windows still match. `offset`
+    // may exceed the size in the stored fingerprint: that stat is taken before
+    // the read, and a live transcript keeps growing while it is read. A
+    // same-size change is never resumed: it is a rewrite, not an append.
     const was = cached ? fingerprintParts(cached.fingerprint) : undefined;
-    if (cached && was && now && was.file === now.file && now.size >= cached.offset) {
+    if (cached && was && now && was.file === now.file && now.size > was.size && now.size >= cached.offset) {
       const samples = await sampleDigests(source.path, cached.offset);
       const committed = samples.head === cached.head && samples.tail === cached.tail
         ? await readHitsLog(join(hitsDirectory, cached.hitsFile), cached.hitsBytes)
