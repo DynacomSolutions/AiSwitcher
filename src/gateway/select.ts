@@ -34,7 +34,7 @@ export function utilisationOf(usage: PoolUsage | undefined): number | undefined 
 export async function pickIdentity(
   app: GatewayApp,
   deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
-  exclude?: string,
+  exclude?: string | ReadonlySet<string>,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
   if (app.target.kind === "pin") {
@@ -50,7 +50,8 @@ export async function pickIdentity(
   }
   // Nothing to choose from at all (as opposed to everything being full): say so.
   if (names.length === 0) return { reject: "no-identities" };
-  names = names.filter((n) => n !== exclude);
+  const skip = typeof exclude === "string" ? new Set([exclude]) : exclude;
+  if (skip && skip.size > 0) names = names.filter((n) => !skip.has(n));
   const rows = await Promise.all(
     names.map(async (name) => {
       const usage = await usageOf(deps, app, name);
@@ -58,7 +59,8 @@ export async function pickIdentity(
       return { name, usage: util === undefined ? undefined : ({ status: "live", maxUtilization: util, capturedAt: "", ...(usage?.extraUsage ? { extraUsage: usage.extraUsage } : {}) } as PoolUsage) };
     }),
   );
-  const known = chooseBest(rows, { belowPercent: reserve, requireKnown: true });
+  // A window at 100% is full whatever the reserve says (reserve 100 must not let a full account through).
+  const known = chooseBest(rows, { belowPercent: Math.min(reserve, 99.999), requireKnown: true });
   if (known) return { identity: known };
   const unknown = rows.find((r) => r.usage === undefined);
   return unknown ? { identity: unknown.name } : { reject: "no-headroom" };
