@@ -27,10 +27,11 @@ export interface TokenRecord {
   expiresAt?: string;
 }
 
-/** Ledger totals for one provider and identity over a window (the admin `GET /usage/identities` row). */
+/** Ledger totals for one provider, identity and app over a window (the admin `GET /usage/identities` row). */
 export interface IdentityUsageRow {
   provider: string;
   identity: string;
+  app: string;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;

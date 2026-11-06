@@ -26,7 +26,7 @@ function TotalBlock({ title, total }: { title: string; total: PeriodTotal }) {
         {formatMoney(total.costUsd)}
       </div>
       <div className="text-xs text-muted-foreground">
-        native {formatTokens(total.nativeTokens)}, gateway {formatTokens(total.gatewayTokens)}
+        native {formatTokens(total.nativeTokens)} (includes {formatTokens(total.gatewayCoveredByNative)} via agent gateway), other gateway apps {formatTokens(total.gatewayTokens)}
       </div>
       {partial ? (
         <div className="space-y-0.5">

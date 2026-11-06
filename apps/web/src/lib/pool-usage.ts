@@ -5,6 +5,12 @@ const USAGE_PROVIDER: Record<string, string> = { claude: "anthropic", codex: "op
 /** The provider name the gateway ledger uses for the same tool. */
 const GATEWAY_PROVIDER: Record<string, string> = { claude: "claude", codex: "codex", kimi: "kimi" };
 
+/** Gateway apps whose clients (the agent CLIs) write local transcripts into the pool folder. The native scan already
+ * attributes those transcripts to the pool members, so counting their ledger rows again would double the figure. */
+export function isNativeCoveredApp(app: string): boolean {
+  return app.startsWith("agents-");
+}
+
 export type PeriodName = "today" | "week";
 
 export interface Figure {
@@ -16,7 +22,7 @@ export interface MemberPeriod {
   /** Known native figure, or the reason it is missing. */
   native: Figure | { missing: string };
   /** Known gateway ledger figure (a member absent from a reachable ledger is a real zero), or the reason it is missing. */
-  gateway: (Figure & { unpricedRequests: number }) | { missing: string };
+  gateway: (Figure & { unpricedRequests: number; coveredByNative: number }) | { missing: string };
 }
 
 export interface MemberUsage {
@@ -35,6 +41,8 @@ export interface PeriodTotal {
   costUsd: number;
   nativeTokens: number;
   gatewayTokens: number;
+  /** Ledger tokens of agent apps, already inside the native figure and so not added again. */
+  gatewayCoveredByNative: number;
   /** Gateway requests whose model has no price: the cost is a floor when above zero. */
   unpricedRequests: number;
   /** Members whose every source is known. */
@@ -86,17 +94,22 @@ function gatewayFigure(period: GatewayPeriod, provider: string, member: string):
   let tokens = 0;
   let costUsd = 0;
   let unpricedRequests = 0;
+  let coveredByNative = 0;
   for (const r of period.rows) {
     if (r.identity !== member || r.provider !== provider) continue;
+    if (isNativeCoveredApp(r.app)) {
+      coveredByNative += r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens;
+      continue;
+    }
     tokens += r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens;
     costUsd += r.estCostUsd;
     unpricedRequests += r.unpricedRequests;
   }
-  return { tokens, costUsd, unpricedRequests };
+  return { tokens, costUsd, unpricedRequests, coveredByNative };
 }
 
 function total(members: MemberUsage[], period: PeriodName): PeriodTotal {
-  const t: PeriodTotal = { tokens: 0, costUsd: 0, nativeTokens: 0, gatewayTokens: 0, unpricedRequests: 0, covered: 0, total: members.length, missing: [] };
+  const t: PeriodTotal = { tokens: 0, costUsd: 0, nativeTokens: 0, gatewayTokens: 0, gatewayCoveredByNative: 0, unpricedRequests: 0, covered: 0, total: members.length, missing: [] };
   for (const m of members) {
     const p = m[period];
     const reasons: string[] = [];
@@ -109,6 +122,7 @@ function total(members: MemberUsage[], period: PeriodName): PeriodTotal {
     if (isMissing(p.gateway)) reasons.push(p.gateway.missing);
     else {
       t.gatewayTokens += p.gateway.tokens;
+      t.gatewayCoveredByNative += p.gateway.coveredByNative;
       t.tokens += p.gateway.tokens;
       t.costUsd += p.gateway.costUsd;
       t.unpricedRequests += p.gateway.unpricedRequests;

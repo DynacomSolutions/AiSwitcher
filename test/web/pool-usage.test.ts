@@ -16,7 +16,7 @@ function native(name: string, days: Record<string, [number, number, number, numb
 }
 
 const gw = (identity: string, tokens: number, cost: number, extra: Partial<GatewayIdentityUsage> = {}): GatewayIdentityUsage => ({
-  provider: "claude", identity, inputTokens: tokens, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: cost, unpricedRequests: 0, requests: 1, ...extra,
+  provider: "claude", identity, app: "other-app", inputTokens: tokens, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: cost, unpricedRequests: 0, requests: 1, ...extra,
 });
 const ok = (rows: GatewayIdentityUsage[]): GatewayPeriod => ({ configured: true, rows });
 const resp = (today: GatewayPeriod, week: GatewayPeriod) => ({ todayKey: "2026-11-06", weekStartKey: "2026-10-31", gateway: { today, week } });
@@ -69,6 +69,16 @@ describe("summarisePools", () => {
     const [s] = summarisePools([pool], usage, [], resp(ok([]), ok([])));
     expect(s!.today.gatewayTokens).toBe(0);
     expect(s!.today.covered).toBe(3);
+  });
+
+  test("agent-app ledger rows are inside the native figure and are not added twice", () => {
+    const agent = gw("m1", 1000, 9, { app: "agents-claude" });
+    const [s] = summarisePools([pool], usage, [], resp(ok([agent, gw("m1", 100, 0.25)]), ok([agent])));
+    expect(s!.today.gatewayTokens).toBe(100);
+    expect(s!.today.gatewayCoveredByNative).toBe(1000);
+    expect(s!.today.tokens).toBe(15 + 100);
+    expect(s!.today.costUsd).toBeCloseTo(1.5 + 0.5 + 0.25);
+    expect(s!.week.gatewayTokens).toBe(0);
   });
 
   test("gateway usage counts every token kind, flags unpriced requests, and ignores other providers", () => {

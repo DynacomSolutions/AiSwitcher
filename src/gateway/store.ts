@@ -102,10 +102,10 @@ export class MemoryGatewayStore implements GatewayStore {
     for (const r of this.usage) {
       const t = Date.parse(r.ts);
       if (t < from || t >= to) continue;
-      const key = `${r.provider}\u0000${r.identity}`;
+      const key = `${r.provider}\u0000${r.identity}\u0000${r.app}`;
       let a = by.get(key);
       if (!a) {
-        a = { provider: r.provider, identity: r.identity, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 };
+        a = { provider: r.provider, identity: r.identity, app: r.app, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 };
         by.set(key, a);
       }
       a.inputTokens += r.inputTokens;
