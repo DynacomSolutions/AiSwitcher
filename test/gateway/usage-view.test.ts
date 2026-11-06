@@ -90,8 +90,8 @@ describe("gateway identity usage", () => {
   };
   const creds = "AIS_GATEWAY_ADMIN_URL=http://gw.invalid/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n";
   test("maps rows and drops malformed ones", () => {
-    expect(mapGatewayIdentityUsage({ identities: [{ provider: "claude", identity: "m1", inputTokens: 5, estCostUsd: -1 }, { provider: "claude" }] })).toEqual([
-      { provider: "claude", identity: "m1", inputTokens: 5, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 },
+    expect(mapGatewayIdentityUsage({ identities: [{ provider: "claude", identity: "m1", app: "x", inputTokens: 5, estCostUsd: -1 }, { provider: "claude" }] })).toEqual([
+      { provider: "claude", identity: "m1", app: "x", inputTokens: 5, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 },
     ]);
     expect(mapGatewayIdentityUsage(null)).toEqual([]);
   });

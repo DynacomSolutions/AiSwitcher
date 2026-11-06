@@ -101,10 +101,11 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
       { ...row("a", "2026-10-01T00:00:00.000Z", 999, 0), identity: "m1" },
     ]);
     const got = await s.usageByIdentity(new Date("2026-11-02T00:00:00.000Z"));
-    const sorted = [...got].sort((x, y) => x.identity.localeCompare(y.identity));
+    const sorted = [...got].sort((x, y) => `${x.identity}/${x.app}`.localeCompare(`${y.identity}/${y.app}`));
     expect(sorted).toEqual([
-      { provider: "codex", identity: "m1", inputTokens: 11, outputTokens: 21, cacheReadTokens: 5, cacheWriteTokens: 0, estCostUsd: 0.5, unpricedRequests: 1, requests: 2 },
-      { provider: "codex", identity: "m2", inputTokens: 3, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.1, unpricedRequests: 0, requests: 1 },
+      { provider: "codex", identity: "m1", app: "a", inputTokens: 10, outputTokens: 20, cacheReadTokens: 5, cacheWriteTokens: 0, estCostUsd: 0.5, unpricedRequests: 0, requests: 1 },
+      { provider: "codex", identity: "m1", app: "b", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 1, requests: 1 },
+      { provider: "codex", identity: "m2", app: "a", inputTokens: 3, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.1, unpricedRequests: 0, requests: 1 },
     ]);
     expect(await s.usageByIdentity(new Date("2026-11-02T00:00:00.000Z"), new Date("2026-11-02T02:00:00.000Z"))).toHaveLength(1);
     expect(await s.usageByIdentity(new Date("2027-01-01T00:00:00.000Z"))).toEqual([]);

@@ -185,7 +185,7 @@ export class PgGatewayStore implements GatewayStore {
   async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
     const to = until ? until.toISOString() : null;
     const rows = await this.sql`
-      SELECT provider, identity,
+      SELECT provider, identity, app,
         COALESCE(SUM(input_tokens), 0) AS input_tokens,
         COALESCE(SUM(output_tokens), 0) AS output_tokens,
         COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
@@ -194,10 +194,11 @@ export class PgGatewayStore implements GatewayStore {
         COUNT(*) FILTER (WHERE est_cost_usd IS NULL AND input_tokens + output_tokens + cache_read_tokens + cache_write_tokens > 0) AS unpriced,
         COUNT(*) AS requests
       FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
-      GROUP BY provider, identity ORDER BY provider, identity`;
+      GROUP BY provider, identity, app ORDER BY provider, identity, app`;
     return rows.map((r: Record<string, unknown>) => ({
       provider: String(r.provider),
       identity: String(r.identity),
+      app: String(r.app),
       inputTokens: Number(r.input_tokens),
       outputTokens: Number(r.output_tokens),
       cacheReadTokens: Number(r.cache_read_tokens),

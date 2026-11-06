@@ -328,6 +328,7 @@ export interface PoolRef {
 export interface GatewayIdentityUsage {
   provider: string;
   identity: string;
+  app: string;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;

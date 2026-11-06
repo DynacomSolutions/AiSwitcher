@@ -105,6 +105,7 @@ export function mapGatewayIdentityUsage(json: unknown): IdentityUsageRow[] {
     rows.push({
       provider: r.provider,
       identity: r.identity,
+      app: typeof r.app === "string" ? r.app : "",
       inputTokens: n(r.inputTokens),
       outputTokens: n(r.outputTokens),
       cacheReadTokens: n(r.cacheReadTokens),

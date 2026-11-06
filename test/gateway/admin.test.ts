@@ -120,8 +120,8 @@ describe("admin api", () => {
     ]);
     const day = (await (await call("/usage/identities?days=1&provider=claude")).json()) as any;
     expect(day.identities).toEqual([
-      { provider: "claude", identity: "m1", inputTokens: 11, outputTokens: 6, cacheReadTokens: 100, cacheWriteTokens: 0, estCostUsd: 0.5, unpricedRequests: 1, requests: 2 },
-      { provider: "claude", identity: "m2", inputTokens: 7, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.25, unpricedRequests: 0, requests: 1 },
+      { provider: "claude", identity: "m1", app: "web", inputTokens: 11, outputTokens: 6, cacheReadTokens: 100, cacheWriteTokens: 0, estCostUsd: 0.5, unpricedRequests: 1, requests: 2 },
+      { provider: "claude", identity: "m2", app: "web", inputTokens: 7, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.25, unpricedRequests: 0, requests: 1 },
     ]);
     const wide = (await (await call("/usage/identities?days=7&provider=claude")).json()) as any;
     expect(wide.identities.find((r: any) => r.identity === "m2").inputTokens).toBe(1007);
