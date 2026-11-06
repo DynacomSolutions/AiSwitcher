@@ -65,6 +65,22 @@ The admin API owns validation; its reason is shown when a value is refused.
 `--models` or a cap), and it does not move the Secret to another namespace. To do
 either, `revoke` the app and `add` it again.
 
+## Out of capacity
+
+When every allowed pool member is over its limit or reserve (or a pinned member is), claude and codex apps answer
+in the provider's own limit shape, so the CLI shows its built-in limit message and resets:
+
+- claude: `429` with a `rate_limit_error` body and the `anthropic-ratelimit-unified-*` headers (status `rejected`,
+  reset in epoch seconds, representative claim, 5h and 7d families) plus `retry-after`.
+- codex: `429` with `error.type` `usage_limit_reached`, `resets_at` and `resets_in_seconds`, plus `x-codex-primary-*`
+  and `x-codex-secondary-*` headers.
+
+The reset is the earliest member recovery time from AIS usage data (300 s when no member reports one). A real
+upstream 429 from a member is passed through unchanged. Other providers keep the generic gateway error.
+
+Claude Code in API-key mode (the gateway token via `apiKeyHelper`) retries a 429 only when `retry-after` is
+60 s or less; a longer wait ends the request with `Request rejected (429)`.
+
 ## Rotate and revoke
 
 `rotate` mints a new token and rewrites the Secret and `~/.secrets`. Earlier tokens

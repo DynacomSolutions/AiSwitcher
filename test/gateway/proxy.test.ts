@@ -391,7 +391,8 @@ describe("caps and selection", () => {
     usage.id1 = live(75);
     const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
     expect(res.status).toBe(429);
-    expect(JSON.stringify(await res.json())).toContain("reserve");
+    expect(res.headers.get("anthropic-ratelimit-unified-status")).toBe("rejected");
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe("rate_limit_error");
     expect(seen.length).toBe(0);
     usage.id1 = live(60);
     expect((await call("/pin/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
@@ -1009,5 +1010,83 @@ describe("fix round 1", () => {
     ]);
     expect((await rows()).length).toBe(0);
     expect(seen.length).toBe(0);
+  });
+});
+
+describe("native limit answers", () => {
+  const win = (five: number, fiveReset: string, seven = 10): PoolUsage => ({
+    status: "live",
+    maxUtilization: Math.max(five, seven),
+    capturedAt: NOW.toISOString(),
+    windows: [
+      { label: "five-hour", utilization: five, resetsAt: fiveReset },
+      { label: "seven-day", utilization: seven, resetsAt: "2026-11-05T09:00:00.000Z" },
+    ],
+  });
+
+  test("pool with every member over the reserve answers with the Anthropic limit shape and the earliest reset", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = win(100, "2026-11-02T14:00:00.000Z");
+    usage.b = win(90, "2026-11-02T12:30:00.000Z");
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("x-ais-gateway")).toBe("1");
+    expect(res.headers.get("anthropic-ratelimit-unified-status")).toBe("rejected");
+    expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe("1793622600");
+    expect(res.headers.get("anthropic-ratelimit-unified-representative-claim")).toBe("five_hour");
+    expect(res.headers.get("retry-after")).toBe("9000");
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe("rate_limit_error");
+    expect(seen.length).toBe(0);
+    expect((await rows())[0]).toMatchObject({ status: "rejected", httpStatus: 429 });
+  });
+
+  test("a pinned member over the reserve answers natively too", async () => {
+    const t = await addApp(baseApp({ reservePercent: 70 }));
+    usage.id1 = win(75, "2026-11-02T12:30:00.000Z");
+    const res = await call("/pin/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe("1793622600");
+    expect(seen.length).toBe(0);
+  });
+
+  test("codex apps answer with usage_limit_reached and resets_at", async () => {
+    const t = await addApp(baseApp({ name: "cx", provider: "codex", style: "openai", target: { kind: "pool" }, reservePercent: 100 }));
+    const full = (reset: string): PoolUsage => ({ status: "rate-limited", maxUtilization: 100, capturedAt: NOW.toISOString(), windows: [{ label: "session", utilization: 100, resetsAt: reset }] });
+    usage.a = full("2026-11-02T14:00:00.000Z");
+    usage.b = full("2026-11-02T12:30:00.000Z");
+    const res = await call("/cx/v1/responses", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(await res.json()).toEqual({ error: { type: "usage_limit_reached", message: "The usage limit has been reached", resets_at: 1793622600, resets_in_seconds: 9000 } });
+    expect(res.headers.get("x-codex-primary-reset-at")).toBe("1793622600");
+  });
+
+  test("a provider without a native shape keeps the generic reason", async () => {
+    const t = await addApp(baseApp({ name: "k", provider: "kimi", target: { kind: "pool" }, reservePercent: 50 }));
+    usage.a = live(90);
+    usage.b = live(90);
+    const res = await call("/k/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(JSON.stringify(await res.json())).toContain("no pool member has headroom");
+  });
+
+  test("a real upstream 429 from the last member passes through byte for byte", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    const realBody = '{"type":"error","error":{"type":"rate_limit_error","message":"Number 3 SYNTHETIC_FIXTURE"},"request_id":"req_SYNTHETIC_FIXTURE"}';
+    const realHeaders = {
+      "content-type": "application/json",
+      "retry-after": "1234",
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-reset": "1793622600",
+      "anthropic-ratelimit-unified-representative-claim": "five_hour",
+      "anthropic-ratelimit-unified-5h-utilization": "1.0",
+    };
+    handler = () => new Response(realBody, { status: 429, headers: realHeaders });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(429);
+    expect(seen.length).toBe(2); // both members tried
+    expect(await res.text()).toBe(realBody);
+    for (const [k, v] of Object.entries(realHeaders)) expect(res.headers.get(k)).toBe(v);
   });
 });

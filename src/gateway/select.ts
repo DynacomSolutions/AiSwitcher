@@ -26,6 +26,29 @@ export function utilisationOf(usage: PoolUsage | undefined): number | undefined 
   return nums.length === 0 ? undefined : Math.max(...nums);
 }
 
+/** The members an app may use: the pin, or the pool members narrowed by the app's identity list. */
+export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "poolMembers" | "canonical">): Promise<string[]> {
+  if (app.target.kind === "pin") return [app.target.identity];
+  let names = await deps.poolMembers(app.provider);
+  if (app.target.identities && app.target.identities.length > 0) {
+    const canon = deps.canonical;
+    const allowed = new Set(await Promise.all(app.target.identities.map((n) => (canon ? canon(app.provider, n).catch(() => n) : n))));
+    names = names.filter((n) => allowed.has(n));
+  }
+  return names;
+}
+
+/** The usage readings of the members an app may use, for the native limit answer (reset times). */
+export async function memberUsages(app: GatewayApp, deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">): Promise<Array<PoolUsage | undefined>> {
+  let names: string[];
+  try {
+    names = await allowedMembers(app, deps);
+  } catch {
+    return [];
+  }
+  return Promise.all(names.map((n) => usageOf(deps, app, n)));
+}
+
 /**
  * Pinned: the identity, unless its worst window is at or over the reserve.
  * Pool: the member with the lowest utilisation below the reserve; members with
@@ -42,12 +65,7 @@ export async function pickIdentity(
     if (util !== undefined && util >= reserve) return { reject: "reserve" };
     return { identity: app.target.identity };
   }
-  let names = await deps.poolMembers(app.provider);
-  if (app.target.identities && app.target.identities.length > 0) {
-    const canon = deps.canonical;
-    const allowed = new Set(await Promise.all(app.target.identities.map((n) => (canon ? canon(app.provider, n).catch(() => n) : n))));
-    names = names.filter((n) => allowed.has(n));
-  }
+  let names = await allowedMembers(app, deps);
   // Nothing to choose from at all (as opposed to everything being full): say so.
   if (names.length === 0) return { reject: "no-identities" };
   const skip = typeof exclude === "string" ? new Set([exclude]) : exclude;

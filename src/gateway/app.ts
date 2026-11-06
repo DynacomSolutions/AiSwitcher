@@ -12,7 +12,8 @@ import type { LedgerBuffer } from "./ledger-buffer.ts";
 import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
-import { pickIdentity } from "./select.ts";
+import { nativeLimitResponse } from "./native-limit.ts";
+import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
@@ -544,7 +545,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   if ("reject" in pick) {
     deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
     const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
-    return reject(429, why, identityForRow, model, pick.reject === "no-headroom" && app.target.kind === "pool" && exhaustedNames().size > 0 ? "no-headroom:exhausted" : pick.reject);
+    const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && exhaustedNames().size > 0 ? "no-headroom:exhausted" : pick.reject;
+    // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
+    if (pick.reject !== "no-identities") {
+      const native = nativeLimitResponse(app.provider, await memberUsages(app, deps), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now());
+      if (native) {
+        record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
+        return native;
+      }
+    }
+    return reject(429, why, identityForRow, model, reason);
   }
 
   const upstreamUrl = adapter.upstreamBase(style) + rest + url.search;
