@@ -23,7 +23,7 @@ export const LOCAL_STATUS_PATH = "/__ais/status";
  * failure", "connection refused"). Other reset reasons ("connection termination", "remote reset") may come after the
  * app took the request, so they are not here.
  */
-const EDGE_NOT_SERVED = /no healthy upstream|upstream connect error or disconnect\/reset before headers\.\s*reset reason: connection (?:timeout|failure|refused)\b|upstream_reset_before_response_started\{(?:connection_failure|connection_timeout|connection_refused)\}|overflow/i;
+const EDGE_NOT_SERVED = /no healthy upstream|upstream connect error or disconnect\/reset before headers\.\s*(?:retried and the latest )?reset reason: connection (?:timeout|failure|refused)\b|upstream_reset_before_response_started\{(?:connection_failure|connection_timeout|connection_refused)\}|overflow/i;
 const MODEL_NOT_FOUND = /"code"\s*:\s*"model_not_found"/;
 
 type Tool = "claude" | "codex";

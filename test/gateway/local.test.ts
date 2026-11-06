@@ -129,6 +129,17 @@ describe("local gateway failover", () => {
     }
   });
 
+  test("Envoy's retried form of the connect failure also fails over", async () => {
+    for (const reason of ["connection failure", "connection timeout", "connection refused"]) {
+      const r = rig({ remote: () => new Response(`upstream connect error or disconnect/reset before headers. retried and the latest reset reason: ${reason}`, { status: 503 }) });
+      expect(await (await r.post()).text()).toBe("direct");
+      expect(r.gw.status().mode).toBe("direct");
+    }
+    const t = rig({ remote: () => new Response("upstream connect error or disconnect/reset before headers. retried and the latest reset reason: connection termination", { status: 503 }) });
+    expect((await t.post()).status).toBe(503);
+    expect(t.gw.status().mode).toBe("remote");
+  });
+
   test("a connection termination or remote reset 503 does not fail over", async () => {
     for (const reason of ["connection termination", "remote reset"]) {
       const text = `upstream connect error or disconnect/reset before headers. reset reason: ${reason}`;

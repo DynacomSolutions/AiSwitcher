@@ -21,6 +21,18 @@ describe("scanModel", () => {
     expect(scanModel(enc.encode('{"model":5}'))).toEqual({ ok: true });
     expect(scanModel(enc.encode("{}"))).toEqual({ ok: true });
   });
+  test("an escaped key, anywhere, is left to JSON.parse (duplicate-key allowlist bypass)", () => {
+    expect(scanModel(enc.encode('{"model":"a","m\\u006fdel":"b"}')).ok).toBe(false);
+    expect(scanModel(enc.encode('{"model":"a","\\u006dodel":"b"}')).ok).toBe(false);
+    expect(scanModel(enc.encode('{"x":1,"mod\\u0065l":"b","model":"a"}')).ok).toBe(false);
+    expect(model('{"model":"a","model":"b"}')).toBe("b");
+  });
+  test("invalid JSON falls back to JSON.parse instead of yielding a model", () => {
+    for (const bad of ['{"x":tru,"model":"ok"}', '{"x":[1,2},"model":"ok"}', '{"x":{"a":1],"model":"ok"}', '{"x":01,"model":"ok"}', '{"model":"ok"} junk', '{"x":nul,"model":"ok"}']) {
+      expect(scanModel(enc.encode(bad)).ok).toBe(false);
+    }
+    expect(model('{"x":[1,{"a":null}],"y":-1.5e3,"z":true,"model":"ok"}')).toBe("ok");
+  });
   test("malformed or escaped-key input is left to JSON.parse", () => {
     expect(scanModel(enc.encode('{"model":"a"')).ok).toBe(false);
     expect(scanModel(enc.encode('{"\\u006dodel":"hidden"}')).ok).toBe(false);
@@ -120,7 +132,9 @@ async function rig(opts: { budget: number; holdMs: number }) {
   const app = createGatewayApp(deps);
   const post = async (payload: string, signal?: AbortSignal): Promise<Response> =>
     app.fetch(new Request("http://gw/a/v1/messages", { method: "POST", headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" }, body: payload, ...(signal ? { signal } : {}) }));
-  return { post, peak: () => peakLive, waits, waiting, rows, stop: () => upstream.stop(true) };
+  const postRaw = async (payload: ReadableStream | undefined, method = "POST"): Promise<Response> =>
+    app.fetch(new Request("http://gw/a/v1/messages", { method, headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" }, ...(payload ? { body: payload, duplex: "half" } : {}) } as RequestInit));
+  return { post, postRaw, peak: () => peakLive, waits, waiting, rows, stop: () => upstream.stop(true) };
 }
 
 const MIB = 1024 * 1024;
@@ -152,6 +166,44 @@ describe("gateway memory", () => {
     expect(Math.max(...r.waits)).toBeGreaterThan(0.03);
     expect(Math.max(...r.waiting)).toBeGreaterThan(0);
     expect(r.waiting[r.waiting.length - 1]).toBe(0);
+  });
+
+  test("chunked bodies with no Content-Length reserve the replay cap, so held bytes stay within the budget", async () => {
+    const r = await rig({ budget: 16 * MIB, holdMs: 40 });
+    const chunk = new TextEncoder().encode(big(MIB));
+    const chunked = (): Promise<Response> =>
+      r.postRaw(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(chunk);
+            c.close();
+          },
+        }),
+      );
+    const statuses = await Promise.all(
+      Array.from({ length: 12 }, async () => {
+        const res = await chunked();
+        await res.arrayBuffer();
+        return res.status;
+      }),
+    );
+    r.stop();
+    expect(statuses.every((s) => s === 200)).toBe(true);
+    // 16 MiB budget / 8 MiB reserved per unknown-length request = 2 at a time.
+    expect(r.peak()).toBeLessThanOrEqual(2);
+  });
+
+  test("requests with nothing to buffer never queue behind a full budget", async () => {
+    const r = await rig({ budget: MIB, holdMs: 300 });
+    const first = r.post(big(MIB)).then((x) => x.arrayBuffer());
+    await Bun.sleep(50);
+    const res = await r.postRaw(undefined, "GET");
+    await res.arrayBuffer();
+    expect(res.status).toBe(200);
+    expect(r.waiting).toEqual([]); // never entered the queue
+    expect(r.waits).toHaveLength(1); // only the holder reserved budget
+    await first;
+    r.stop();
   });
 
   test("abort while queued releases nothing and records client_aborted", async () => {

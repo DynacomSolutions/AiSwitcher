@@ -227,7 +227,7 @@ export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
       return true;
     }
     if (c === 0x7b || c === 0x5b) {
-      let depth = 0;
+      const stack: number[] = [];
       while (i < n) {
         const d = b[i];
         if (d === 0x22) {
@@ -236,10 +236,11 @@ export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
           i = e + 1;
           continue;
         }
-        if (d === 0x7b || d === 0x5b) depth++;
+        if (d === 0x7b) stack.push(0x7d);
+        else if (d === 0x5b) stack.push(0x5d);
         else if (d === 0x7d || d === 0x5d) {
-          depth--;
-          if (depth === 0) {
+          if (stack.pop() !== d) return false; // bracket mismatch: not JSON
+          if (stack.length === 0) {
             i++;
             return true;
           }
@@ -248,22 +249,29 @@ export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
       }
       return false;
     }
+    // Only the JSON literals and numbers are accepted; anything else is left to JSON.parse (which will reject it).
     const start = i;
     while (i < n && b[i] !== 0x2c && b[i] !== 0x7d && b[i] !== 0x20 && b[i] !== 0x0a && b[i] !== 0x0d && b[i] !== 0x09) i++;
-    return i > start;
+    const lit = new TextDecoder().decode(b.subarray(start, i));
+    return lit === "true" || lit === "false" || lit === "null" || /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(lit);
   };
   ws();
   if (b[i] !== 0x7b) return { ok: false };
   i++;
   let model: string | undefined;
   ws();
-  if (b[i] === 0x7d) return { ok: true };
+  if (b[i] === 0x7d) {
+    i++;
+    ws();
+    return i === n ? { ok: true } : { ok: false };
+  }
   for (;;) {
     ws();
     if (b[i] !== 0x22) return { ok: false };
     const ke = str(i);
     if (ke < 0) return { ok: false };
     const keyStart = i;
+    for (let k = keyStart + 1; k < ke; k++) if (b[k] === 0x5c) return { ok: false }; // An escaped key can spell "model" in a way no byte compare sees: leave it to JSON.parse.
     i = ke + 1;
     ws();
     if (b[i] !== 0x3a) return { ok: false };
@@ -281,15 +289,18 @@ export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
           return { ok: false };
         }
       } else model = undefined;
-    } else if (!isModel && b[keyStart + 1] === 0x5c) {
-      return { ok: false }; // An escaped key could spell "model": leave it to JSON.parse.
     }
     ws();
     if (b[i] === 0x2c) {
       i++;
       continue;
     }
-    if (b[i] === 0x7d) return model === undefined ? { ok: true } : { ok: true, model };
+    if (b[i] === 0x7d) {
+      i++;
+      ws();
+      if (i !== n) return { ok: false };
+      return model === undefined ? { ok: true } : { ok: true, model };
+    }
     return { ok: false };
   }
 }
@@ -479,11 +490,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   try {
     // Reserve the declared size first; a request that does not fit waits without reading its body.
     const declared = declaredLength(req);
-    const reserve = !req.body ? 0 : Number.isFinite(declared) ? (declared > REPLAY_LIMIT_BYTES ? 0 : declared) : 1024 * 1024;
+    const reserve = !req.body ? 0 : Number.isFinite(declared) ? (declared > REPLAY_LIMIT_BYTES ? 0 : declared) : REPLAY_LIMIT_BYTES; // unknown length (chunked): up to the replay cap may be buffered
     // A queued request waits until it fits or its client leaves (the abort rejects here and is recorded below). The gateway never answers 503 for capacity.
-    const queuedAt = performance.now();
-    releaseBody = await budget.reserve(reserve, ctrl.signal);
-    deps.metrics.bodyBudgetWait?.((performance.now() - queuedAt) / 1000);
+    // Nothing buffered (no body, empty, or streamed past the replay cap) means nothing to reserve: it never queues behind others.
+    if (reserve > 0) {
+      const queuedAt = performance.now();
+      releaseBody = await budget.reserve(reserve, ctrl.signal);
+      deps.metrics.bodyBudgetWait?.((performance.now() - queuedAt) / 1000);
+    }
     body = await readBody(req);
   } catch {
     // An abort can land a tick after the read error it caused: look again before calling it a bad body.
