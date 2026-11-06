@@ -726,7 +726,7 @@ interface RecordCache {
 
 async function fileFingerprint(path: string): Promise<string> {
   const info = await statAsync(path, { bigint: true });
-  return [info.dev, info.ino, info.size, info.mtimeNs].map(String).join(":");
+  return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String).join(":");
 }
 
 function validUsageRecord(value: unknown): value is UsageRecord {

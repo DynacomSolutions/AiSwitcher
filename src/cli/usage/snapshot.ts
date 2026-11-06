@@ -52,6 +52,10 @@ export interface UsageSnapshotPartition {
     messagesSha256?: string;
     /** Bucket timezone of the export, which its daily figures depend on. */
     bucketTimezone?: string;
+    /** Size and mtime (ns) of the batch file when it was promoted. Reuse
+     * ("unchanged") is offered only while the file still matches both. */
+    batchSize?: number;
+    batchMtimeNs?: string;
   };
   lastAttemptAt: string;
   /** Identity no longer registered: results stay in totals, freshness ignores it. */
@@ -244,8 +248,9 @@ async function nativeExportForTarget(target: UsageTarget, key = targetKey(target
 }
 
 /** The committed batch's message digest, when Tokscale may answer "unchanged"
- * for it: the batch file is still there, and the daily figures derived from it
- * used the bucket timezone the export will use now. */
+ * for it: the batch file is still the one promoted (same size and mtime), and
+ * the daily figures derived from it used the bucket timezone the export will
+ * use now. */
 export function reusableNativeBatchDigest(
   previous: UsageSnapshotPartition["nativeBatch"],
   partitionId: string,
@@ -254,13 +259,20 @@ export function reusableNativeBatchDigest(
 ): string | undefined {
   if (!previous?.messagesSha256 || previous.partitionId !== partitionId) return undefined;
   if (previous.bucketTimezone !== currentBucketTimezone) return undefined;
-  const relative = previous.path.slice("usage/native/".length);
+  return committedNativeBatchIntact(previous, nativeRoot) ? previous.messagesSha256 : undefined;
+}
+
+/** The committed batch file is still the one promoted: a replaced, rewritten
+ * or truncated file changes its size or mtime. A batch recorded before these
+ * were kept is never reused. */
+function committedNativeBatchIntact(ref: NonNullable<UsageSnapshotPartition["nativeBatch"]>, nativeRoot: string): boolean {
+  if (ref.batchSize === undefined || ref.batchMtimeNs === undefined) return false;
   try {
-    if (!statSync(join(nativeRoot, relative)).isFile()) return undefined;
+    const info = statSync(join(nativeRoot, ref.path.slice("usage/native/".length)), { bigint: true });
+    return info.isFile() && info.size === BigInt(ref.batchSize) && String(info.mtimeNs) === ref.batchMtimeNs;
   } catch {
-    return undefined;
+    return false;
   }
-  return previous.messagesSha256;
 }
 
 function priorDailyUsage(prior: UsageSnapshotPartition | undefined): DailyUsage | undefined {
@@ -279,7 +291,7 @@ type NativeBatchMessagesReader = (messages: readonly unknown[]) => void;
 
 /** Tokscale's answer when the messages equal the batch AIS already holds
  * (`TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256`): no batch, only the digest. */
-function unchangedNativeBatch(path: string, partitionId: string, previous: UsageSnapshotPartition["nativeBatch"]): NonNullable<UsageSnapshotPartition["nativeBatch"]> | undefined {
+function unchangedNativeBatch(path: string, partitionId: string, previous: UsageSnapshotPartition["nativeBatch"], nativeRoot: string): NonNullable<UsageSnapshotPartition["nativeBatch"]> | undefined {
   if (!previous?.messagesSha256) return undefined;
   let size: number;
   try {
@@ -298,6 +310,11 @@ function unchangedNativeBatch(path: string, partitionId: string, previous: Usage
   if (!envelope || envelope.schemaVersion !== 1 || envelope.unchanged !== true) return undefined;
   if (envelope.partitionId !== partitionId || envelope.messagesSha256 !== previous.messagesSha256 || previous.partitionId !== partitionId) {
     throw nativeCaptureError("candidate-envelope-validation", new Error("invalid-unchanged-native-batch"));
+  }
+  // Tokscale only answers "unchanged" for a digest AIS offered, but the batch
+  // may have changed since: never keep pointing at a file that is not the one promoted.
+  if (!committedNativeBatchIntact(previous, nativeRoot)) {
+    throw nativeCaptureError("candidate-envelope-validation", new Error("unchanged-native-batch-not-intact"));
   }
   return previous;
 }
@@ -395,7 +412,17 @@ function promoteNativeBatchFile(candidatePath: string, partitionId: string, nati
   } catch (error) {
     throw nativeCaptureError("promotion-permissions", error);
   }
-  return { ...ref, path: `usage/native/${partitionId}/${batchName}` };
+  let promotedInfo: { size: bigint; mtimeNs: bigint } | undefined;
+  try {
+    promotedInfo = statSync(promoted, { bigint: true });
+  } catch {
+    // Without the stat the batch is still valid; it is just never reused.
+  }
+  return {
+    ...ref,
+    path: `usage/native/${partitionId}/${batchName}`,
+    ...(promotedInfo ? { batchSize: Number(promotedInfo.size), batchMtimeNs: String(promotedInfo.mtimeNs) } : {}),
+  };
 }
 
 class NativeCaptureStageError extends Error {
@@ -863,7 +890,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
           throw new NativeCaptureStageError("partition-id-mismatch", new Error("native-export-partition-mismatch"));
         }
         const bucketTimezone = nativeCandidate.tokscaleConfigDir ? readTokscaleBucketTimezone(nativeCandidate.tokscaleConfigDir) : undefined;
-        const unchanged = unchangedNativeBatch(nativeCandidate.path, expectedPartitionId, prior?.nativeBatch);
+        const unchanged = unchangedNativeBatch(nativeCandidate.path, expectedPartitionId, prior?.nativeBatch, deps.nativeBatchRoot ?? join(aisCacheDir(), "usage", "native"));
         if (unchanged) {
           // Same messages as the batch already committed: keep pointing at it,
           // and the daily figures derived from those messages stay valid.

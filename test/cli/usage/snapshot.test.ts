@@ -14,6 +14,7 @@ import {
   USAGE_SNAPSHOT_DIRTY_MIN_INTERVAL_MS,
   validateNativeBatchEnvelope,
   type UsageSnapshotDeps,
+  type UsageSnapshotPartition,
 } from "../../../src/cli/usage/snapshot.ts";
 import { acknowledgeUsageSnapshotDirty, markUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotTargetKey } from "../../../src/cli/usage/snapshot-dirty.ts";
 import { readUsageSnapshotMetricsStatus } from "../../../src/cli/usage/snapshot-status.ts";
@@ -248,18 +249,73 @@ describe("shared usage snapshot", () => {
     expect(third.partitions[key]!.nativeBatch).toEqual(committed.nativeBatch);
   });
 
+  test("a corrupted or replaced committed batch is not reused, and the next export promotes a new one", async () => {
+    const path = await snapshotFile();
+    const key = usageSnapshotTargetKey("claude", identity.name);
+    const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
+    const nativeBatchRoot = join(dirname(path), "native-batches");
+    const isolated = join(dirname(path), "isolated-config");
+    await mkdir(isolated, { recursive: true });
+    await writeFile(join(isolated, "settings.json"), JSON.stringify({ scanner: { bucketTimezone: "America/New_York" } }));
+    const digest = "d".repeat(64);
+    const cycle = async (now: number, envelope: (generatedAt: string) => unknown) => {
+      const candidate = { path: join(dirname(path), `candidate-${now}.json`), partitionId, tokscaleConfigDir: isolated };
+      await refreshUsageSnapshot({
+        ...deps(path, { now, results: [] }),
+        nativeBatchRoot,
+        forcePartitionKeys: [key],
+        prepareNativeExportCandidate: async () => candidate,
+        collectTargetResults: async (targets, onItemDone, prepareNativeExport) => {
+          await prepareNativeExport!(targets[0]!);
+          await writeFile(candidate.path, JSON.stringify(envelope(new Date(now).toISOString())));
+          onItemDone(0, [result(48)]);
+          return [];
+        },
+      });
+      return (JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, { nativeBatch?: UsageSnapshotPartition["nativeBatch"]; nativeCoverage?: string }> }).partitions[key]!;
+    };
+    const committed = await cycle(Date.UTC(2026, 0, 1), (generatedAt) => ({ ...nativeExport, partitionId, generatedAt, messagesSha256: digest }));
+    const ref = committed.nativeBatch!;
+    const batchPath = join(nativeBatchRoot, ref.path.slice("usage/native/".length));
+    expect(ref.batchSize).toBe((await stat(batchPath)).size);
+    expect(ref.batchMtimeNs).toBe(String((await stat(batchPath, { bigint: true })).mtimeNs));
+    expect(reusableNativeBatchDigest(ref, partitionId, nativeBatchRoot, "America/New_York")).toBe(digest);
+
+    // Corrupted in place: no digest is offered, and an "unchanged" answer is refused.
+    await writeFile(batchPath, "{corrupt");
+    expect(reusableNativeBatchDigest(ref, partitionId, nativeBatchRoot, "America/New_York")).toBeUndefined();
+    const refused = await cycle(Date.UTC(2026, 0, 2), (generatedAt) => ({ schemaVersion: 1, partitionId, generatedAt, unchanged: true, messagesSha256: digest }));
+    expect(refused.nativeCoverage).toBe("error");
+
+    // Without the digest Tokscale writes the full batch, which is promoted anew.
+    const next = await cycle(Date.UTC(2026, 0, 3), (generatedAt) => ({ ...nativeExport, partitionId, generatedAt, messagesSha256: digest }));
+    expect(next.nativeCoverage).toBe("supported");
+    expect(next.nativeBatch!.path).not.toBe(ref.path);
+    const nextPath = join(nativeBatchRoot, next.nativeBatch!.path.slice("usage/native/".length));
+    expect(next.nativeBatch!.batchSize).toBe((await stat(nextPath)).size);
+    expect(reusableNativeBatchDigest(next.nativeBatch, partitionId, nativeBatchRoot, "America/New_York")).toBe(digest);
+
+    // Replaced by a same-size file: the mtime differs, so it is not reused either.
+    const original = await readFile(nextPath);
+    await writeFile(nextPath, Buffer.alloc(original.length, 0x20));
+    expect(reusableNativeBatchDigest(next.nativeBatch, partitionId, nativeBatchRoot, "America/New_York")).toBeUndefined();
+  });
+
   test("the previous digest is offered only for a batch that still exists, in the same bucket zone", async () => {
     const root = await mkdtemp(join(tmpdir(), "ais-native-reuse-"));
     dirs.push(root);
     const partitionId = "a".repeat(64);
     await mkdir(join(root, partitionId), { recursive: true });
     await writeFile(join(root, partitionId, "batch.json"), "{}");
-    const ref = { path: `usage/native/${partitionId}/batch.json`, sha256: "b".repeat(64), generatedAt: "2026-01-01T00:00:00.000Z", partitionId, messagesSha256: "c".repeat(64), bucketTimezone: "Asia/Bangkok" };
+    const info = await stat(join(root, partitionId, "batch.json"), { bigint: true });
+    const ref = { path: `usage/native/${partitionId}/batch.json`, sha256: "b".repeat(64), generatedAt: "2026-01-01T00:00:00.000Z", partitionId, messagesSha256: "c".repeat(64), bucketTimezone: "Asia/Bangkok", batchSize: Number(info.size), batchMtimeNs: String(info.mtimeNs) };
     expect(reusableNativeBatchDigest(ref, partitionId, root, "Asia/Bangkok")).toBe("c".repeat(64));
     expect(reusableNativeBatchDigest(ref, partitionId, root, "Europe/London")).toBeUndefined();
     expect(reusableNativeBatchDigest(ref, "f".repeat(64), root, "Asia/Bangkok")).toBeUndefined();
     expect(reusableNativeBatchDigest({ ...ref, messagesSha256: undefined }, partitionId, root, "Asia/Bangkok")).toBeUndefined();
     expect(reusableNativeBatchDigest({ ...ref, path: `usage/native/${partitionId}/gone.json` }, partitionId, root, "Asia/Bangkok")).toBeUndefined();
+    // Recorded before size and mtime were kept: never reused.
+    expect(reusableNativeBatchDigest({ ...ref, batchSize: undefined, batchMtimeNs: undefined }, partitionId, root, "Asia/Bangkok")).toBeUndefined();
   });
 
   test("empty swap-pool report rows retain their native export candidate", async () => {

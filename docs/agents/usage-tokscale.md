@@ -160,7 +160,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     cache: a small index (`<key>.v2.json`) plus one append-only hits log per
     transcript (`<key>.v2.json.d/`). An unchanged transcript is not opened, a
     grown one is read from its last newline, and only new hits are appended.
-    Resume safety is a sampled check (same inode, no shrink, SHA-256 of the
+    Resume safety is a sampled check (same inode, not shorter than the
+    offset, which may lie past the pre-read stat size of a file that grew
+    mid-read, SHA-256 of the
     first 4 KiB and the 64 KiB before the offset); see `CachedUsageFile` for
     the trade-off. Schema-1 hits of unchanged files are adopted once.
   - Claude checkpoint resumes in the patched Tokscale verify a sampled prefix
@@ -169,9 +171,11 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
   - Each committed batch records `messagesSha256` and its `bucketTimezone`.
     The next export passes the digest; identical messages come back as a
     small `unchanged` envelope, the partition keeps its batch pointer and
-    daily figures, and nothing is promoted or read back.
+    daily figures, and nothing is promoted or read back. The digest is offered
+    (and an `unchanged` answer accepted) only while the batch file keeps the
+    size and mtime recorded at promotion.
   - Codex Bedrock partitions read their all-time rollouts through a per-file
-    record cache (`usage/local-spend/`), keyed on dev, inode, size and mtime.
+    record cache (`usage/local-spend/`), keyed on dev, inode, size, mtime and ctime.
   - Totals stay those of a cold scan: every shortcut is either exact (an
     unchanged file, an append of whole lines, byte-identical messages) or
     falls back to the full read.

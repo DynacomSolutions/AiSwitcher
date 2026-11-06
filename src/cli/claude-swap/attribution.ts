@@ -590,9 +590,12 @@ export async function poolMemberModelUsage(pool: PoolIdentity, members: Identity
     let entry: CachedUsageFile | undefined;
     let hits: CachedUsageHit[] | undefined;
 
-    // Append: same file, grown, and both sampled windows still match.
+    // Append: same file, not shorter than where the last read stopped, and
+    // both sampled windows still match. `offset` may exceed the size in the
+    // stored fingerprint: that stat is taken before the read, and a live
+    // transcript keeps growing while it is read.
     const was = cached ? fingerprintParts(cached.fingerprint) : undefined;
-    if (cached && was && now && was.file === now.file && now.size > was.size && cached.offset <= was.size) {
+    if (cached && was && now && was.file === now.file && now.size >= cached.offset) {
       const samples = await sampleDigests(source.path, cached.offset);
       const committed = samples.head === cached.head && samples.tail === cached.tail
         ? await readHitsLog(join(hitsDirectory, cached.hitsFile), cached.hitsBytes)

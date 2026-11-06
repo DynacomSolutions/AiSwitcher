@@ -327,6 +327,29 @@ describe("swap pool attribution cache: appended transcripts", () => {
     expect(warm).toEqual(await f.cold());
   });
 
+  test("a transcript that grows during every read still resumes from its offset and matches a cold scan", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1)}\n${f.msg(2)}\n`);
+    const offsets: number[] = [];
+    let n = 100;
+    // The append lands after the pre-read stat and before the read: the offset
+    // reached is then past the size in the stored fingerprint.
+    const growing = {
+      cachePath: f.cachePath,
+      onSourceFileRead: (_path: string, offset: number) => {
+        offsets.push(offset);
+        appendFileSync(f.transcript, `${f.msg(n++)}\n`);
+      },
+    };
+    for (let cycle = 0; cycle < 5; cycle++) {
+      const warm = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, growing);
+      expect(warm).toEqual(await f.cold());
+    }
+    expect(offsets[0]).toBe(0);
+    for (const offset of offsets.slice(1)) expect(offset).toBeGreaterThan(0);
+    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+  });
+
   test("an unchanged cycle opens no transcript and rewrites neither the index nor any hits log", async () => {
     const f = await fixture();
     await writeFile(f.transcript, `${f.msg(1)}\n${f.msg(2)}\n`);
