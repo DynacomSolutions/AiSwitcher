@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 import { extractToken } from "./auth.ts";
+import { BodyBudget } from "./body-budget.ts";
 import type { BrowserHub } from "./browser/hub.ts";
 import { createPairRoutes } from "./browser/pair.ts";
 import { createCallRoutes } from "./browser/routing.ts";
@@ -36,7 +37,14 @@ export interface GatewayDeps {
   browserIdentityExists?(identity: string): Promise<string | undefined>;
   /** Browser relay; the agent call routes are only mounted when present. */
   browserHub?: BrowserHub;
+  /** Most request-body bytes held for replay at once across all requests. Defaults to BODY_BUDGET_BYTES. */
+  bodyBudgetBytes?: number;
 }
+
+/** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
+export const BODY_BUDGET_BYTES = 32 * 1024 * 1024;
+/** A request waits at most this long for body budget before it gets a 503. */
+export const BODY_BUDGET_WAIT_MS = 60_000;
 
 /** Request bodies up to this size are buffered so they can be replayed (401 retry, failover). */
 export const REPLAY_LIMIT_BYTES = 8 * 1024 * 1024;
@@ -49,9 +57,21 @@ const QUOTA_CODES = /^(insufficient_quota|rate_limit_error|rate_limit_exceeded|u
 
 export type Body = { kind: "none" } | { kind: "buffered"; bytes: Uint8Array } | { kind: "stream"; stream: ReadableStream<Uint8Array> };
 
+/** The declared Content-Length, or NaN when absent or malformed (`Number("")` would be a misleading 0). */
+export function declaredLength(req: Request): number {
+  const h = req.headers.get("content-length");
+  return h !== null && /^\d+$/.test(h.trim()) ? Number(h) : Number.NaN;
+}
+
 export async function readBody(req: Request): Promise<Body> {
   if (!req.body) return { kind: "none" };
-  const declared = Number(req.headers.get("content-length") ?? "");
+  const declared = declaredLength(req);
+  // A declared length within the limit: let the runtime read the body natively into one buffer. Reading it chunk by
+  // chunk in JS made 64 KiB garbage chunks plus a large copy per request, and under 50 concurrent 2 MB bodies the
+  // collector fell behind (RSS above 1 GiB). The runtime refuses a body longer than its declared length.
+  if (Number.isFinite(declared) && declared >= 0 && declared <= REPLAY_LIMIT_BYTES) {
+    return { kind: "buffered", bytes: new Uint8Array(await req.arrayBuffer()) };
+  }
   const reader = req.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -171,8 +191,109 @@ export function isQuotaBody(bytes: Uint8Array): boolean {
   }
 }
 
+/**
+ * Allocation-free scan for the top-level `model` string of a JSON object. The last duplicate wins, as in
+ * JSON.parse, so an allowlist cannot be dodged with `{"model":"ok","model":"other"}`. Returns `ok: false` when the
+ * bytes are not a well-formed object (the caller then falls back to JSON.parse).
+ */
+export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
+  const n = b.length;
+  let i = 0;
+  const ws = (): void => {
+    while (i < n && (b[i] === 0x20 || b[i] === 0x0a || b[i] === 0x0d || b[i] === 0x09)) i++;
+  };
+  /** Skips a string starting at the opening quote; returns the index of the closing quote or -1. */
+  const str = (from: number): number => {
+    let j = from + 1;
+    while (j < n) {
+      const c = b[j];
+      if (c === 0x5c) j += 2;
+      else if (c === 0x22) return j;
+      else j++;
+    }
+    return -1;
+  };
+  const value = (): boolean => {
+    ws();
+    const c = b[i];
+    if (c === 0x22) {
+      const e = str(i);
+      if (e < 0) return false;
+      i = e + 1;
+      return true;
+    }
+    if (c === 0x7b || c === 0x5b) {
+      let depth = 0;
+      while (i < n) {
+        const d = b[i];
+        if (d === 0x22) {
+          const e = str(i);
+          if (e < 0) return false;
+          i = e + 1;
+          continue;
+        }
+        if (d === 0x7b || d === 0x5b) depth++;
+        else if (d === 0x7d || d === 0x5d) {
+          depth--;
+          if (depth === 0) {
+            i++;
+            return true;
+          }
+        }
+        i++;
+      }
+      return false;
+    }
+    const start = i;
+    while (i < n && b[i] !== 0x2c && b[i] !== 0x7d && b[i] !== 0x20 && b[i] !== 0x0a && b[i] !== 0x0d && b[i] !== 0x09) i++;
+    return i > start;
+  };
+  ws();
+  if (b[i] !== 0x7b) return { ok: false };
+  i++;
+  let model: string | undefined;
+  ws();
+  if (b[i] === 0x7d) return { ok: true };
+  for (;;) {
+    ws();
+    if (b[i] !== 0x22) return { ok: false };
+    const ke = str(i);
+    if (ke < 0) return { ok: false };
+    const keyStart = i;
+    i = ke + 1;
+    ws();
+    if (b[i] !== 0x3a) return { ok: false };
+    i++;
+    ws();
+    const isModel = ke - keyStart === 6 && b[keyStart + 1] === 0x6d && b[keyStart + 2] === 0x6f && b[keyStart + 3] === 0x64 && b[keyStart + 4] === 0x65 && b[keyStart + 5] === 0x6c;
+    const vStart = i;
+    if (!value()) return { ok: false };
+    if (isModel) {
+      if (b[vStart] === 0x22) {
+        try {
+          const m: unknown = JSON.parse(new TextDecoder().decode(b.subarray(vStart, i)));
+          model = typeof m === "string" ? m : undefined;
+        } catch {
+          return { ok: false };
+        }
+      } else model = undefined;
+    } else if (!isModel && b[keyStart + 1] === 0x5c) {
+      return { ok: false }; // An escaped key could spell "model": leave it to JSON.parse.
+    }
+    ws();
+    if (b[i] === 0x2c) {
+      i++;
+      continue;
+    }
+    if (b[i] === 0x7d) return model === undefined ? { ok: true } : { ok: true, model };
+    return { ok: false };
+  }
+}
+
 function requestModel(body: Body): string | undefined {
   if (body.kind !== "buffered" || body.bytes.length === 0 || body.bytes[0] !== 0x7b) return undefined; // only a JSON object has a model
+  const scanned = scanModel(body.bytes);
+  if (scanned.ok) return scanned.model;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(body.bytes));
     const m = typeof parsed === "object" && parsed !== null ? (parsed as { model?: unknown }).model : undefined;
@@ -233,8 +354,9 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
     c.res = markGatewayResponse(c.res);
   });
   const log = deps.log ?? defaultLog;
+  const budget = new BodyBudget(deps.bodyBudgetBytes ?? BODY_BUDGET_BYTES);
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -244,7 +366,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -331,6 +453,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const onAbort = (): void => ctrl.abort();
   req.signal.addEventListener("abort", onAbort, { once: true });
   if (req.signal.aborted) ctrl.abort(); // already gone: the listener will never fire
+  let releaseBody: (() => void) | undefined;
   try {
     return await run();
   } catch {
@@ -342,12 +465,23 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     record(identity, "error", 500, undefined, false, undefined, model);
     return providerError(style, 500, "gateway error");
+  } finally {
+    releaseBody?.();
   }
 
   async function run(): Promise<Response> {
   if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
   let body: Body;
   try {
+    // Reserve the declared size first; a request that does not fit waits without reading its body.
+    const declared = declaredLength(req);
+    const reserve = !req.body ? 0 : Number.isFinite(declared) ? (declared > REPLAY_LIMIT_BYTES ? 0 : declared) : 1024 * 1024;
+    try {
+      releaseBody = await budget.reserve(reserve, AbortSignal.any([ctrl.signal, AbortSignal.timeout(BODY_BUDGET_WAIT_MS)]));
+    } catch (err) {
+      if (req.signal.aborted || ctrl.signal.aborted) throw err; // caught below as a client abort
+      return reject(503, "gateway busy, retry shortly");
+    }
     body = await readBody(req);
   } catch {
     // An abort can land a tick after the read error it caused: look again before calling it a bad body.
@@ -472,6 +606,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return providerError(style, 502, credential ? "upstream credential unavailable" : "upstream request failed");
   }
 
+  // The upstream has answered: no replay is possible or needed any more, so the request bytes can go.
+  body = { kind: "none" };
+  releaseBody?.();
   const headers = new Headers(up.headers);
   stripHopByHop(headers);
   if (headers.has("content-encoding")) {

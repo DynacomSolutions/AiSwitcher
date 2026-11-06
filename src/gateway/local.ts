@@ -17,8 +17,13 @@ export const LOCAL_IDLE_MS = 10 * 60_000;
 export const LOCAL_BREAKER_MS = 30_000;
 export const LOCAL_STATUS_PATH = "/__ais/status";
 
-/** Edge (Envoy/Emissary) 503 bodies that mean the upstream pod could not be reached at all. */
-const EDGE_NOT_SERVED = /no healthy upstream|reset reason: connection failure|overflow/i;
+/**
+ * Edge (Envoy/Emissary) 503 bodies that mean the request never reached the gateway pod: no pod to pick, an
+ * overflowing circuit, or a connect that failed before any header went out ("connection timeout", "connection
+ * failure", "connection refused"). Other reset reasons ("connection termination", "remote reset") may come after the
+ * app took the request, so they are not here.
+ */
+const EDGE_NOT_SERVED = /no healthy upstream|upstream connect error or disconnect\/reset before headers\.\s*reset reason: connection (?:timeout|failure|refused)\b|upstream_reset_before_response_started\{(?:connection_failure|connection_timeout|connection_refused)\}|overflow/i;
 const MODEL_NOT_FOUND = /"code"\s*:\s*"model_not_found"/;
 
 type Tool = "claude" | "codex";

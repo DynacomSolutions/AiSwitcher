@@ -139,6 +139,7 @@ ETA: 2026-11-05 18:00 ICT
 | 113 | Codex CLI via gateway | done | claude-20261103-codex-gw | codex-cli-gateway | 4.112 | | Route Codex CLI model traffic through the gateway.<br>App agents-codex, reserve 100, verified with codex exec.<br>New sessions only; running ones need restart. |
 | 119 | Gateway: reject pool pin, stable admin URL | done | claude-20261104-gw-followups | | 4.113 | | PRs https://github.com/DynacomSolutions/AiSwitcher/pull/357, https://github.com/DynacomSolutions/.cluster/pull/2122, roll https://github.com/DynacomSolutions/.cluster/pull/2125.<br>Pool name as pinned identity is rejected (admin API and CLI); admin Service ClusterIP pinned.<br>Live on ais:60d231b. |
 | 123 | Gateway: local failover when cluster gateway is down | done | claude-20261105-gw-local-failover | gateway-local-failover | 4.113 | | Shipped in v0.5.26<br>PRs #370 #373 (credential cache mtime fix) #372<br>Gateway header live (.cluster #2151)<br>Host unit ais-gateway-local@ slots on 47140; owner configs repointed to 127.0.0.1:47140 |
+| 128 | Gateway: OOM under agent load | in_progress | claude-20261106-gw-memory | gateway-memory | 4.123 | | Bound buffered request bodies (native read plus 32 MiB replay budget), allocation-free model scan.<br>Local proxy: fail over on Envoy connect-timeout/refused 503s. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
 ETA: 2026-11-06 18:00 ICT
