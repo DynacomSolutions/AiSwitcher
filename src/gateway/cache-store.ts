@@ -1,6 +1,6 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import type { GatewayStore } from "./store.ts";
-import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
 
 /**
  * The proxy's view of the store. Apps and tokens are held in memory so a
@@ -90,6 +90,10 @@ export class CachedGatewayStore implements GatewayStore {
 
   usageSince(app: string, since: Date): Promise<number> {
     return this.inner.usageSince(app, since);
+  }
+
+  usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
+    return this.inner.usageByIdentity(since, until);
   }
 
   // Browser records are not on the proxy's hot path: pass straight through to the store.

@@ -108,6 +108,30 @@ describe("admin api", () => {
     expect((await call("/usage?days=0")).status).toBe(400);
   });
 
+  test("usage/identities groups the ledger by provider and identity", async () => {
+    const at = (ms: number) => new Date(now.getTime() - ms).toISOString();
+    const base = { app: "web", provider: "claude" as const, cacheReadTokens: 0, cacheWriteTokens: 0, status: "ok", httpStatus: 200, latencyMs: 1, streamed: false };
+    await inner.appendUsage([
+      { ...base, ts: at(3600_000), identity: "m1", inputTokens: 10, outputTokens: 5, cacheReadTokens: 100, estCostUsd: 0.5 },
+      { ...base, ts: at(3 * 3600_000), identity: "m1", inputTokens: 1, outputTokens: 1 },
+      { ...base, ts: at(3600_000), identity: "m2", inputTokens: 7, outputTokens: 0, estCostUsd: 0.25 },
+      { ...base, ts: at(5 * 86400_000), identity: "m2", inputTokens: 1000, outputTokens: 0 },
+      { ...base, ts: at(3600_000), provider: "codex", identity: "m1", inputTokens: 2, outputTokens: 2, estCostUsd: 1 },
+    ]);
+    const day = (await (await call("/usage/identities?days=1&provider=claude")).json()) as any;
+    expect(day.identities).toEqual([
+      { provider: "claude", identity: "m1", inputTokens: 11, outputTokens: 6, cacheReadTokens: 100, cacheWriteTokens: 0, estCostUsd: 0.5, unpricedRequests: 1, requests: 2 },
+      { provider: "claude", identity: "m2", inputTokens: 7, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.25, unpricedRequests: 0, requests: 1 },
+    ]);
+    const wide = (await (await call("/usage/identities?days=7&provider=claude")).json()) as any;
+    expect(wide.identities.find((r: any) => r.identity === "m2").inputTokens).toBe(1007);
+    const win = (await (await call(`/usage/identities?since=${encodeURIComponent(at(2 * 3600_000))}&until=${encodeURIComponent(at(1800_000))}`)).json()) as any;
+    expect(win.identities.map((r: any) => `${r.provider}/${r.identity}`)).toEqual(["claude/m1", "claude/m2", "codex/m1"]);
+    expect((await call("/usage/identities?days=0")).status).toBe(400);
+    expect((await call("/usage/identities?since=nope")).status).toBe(400);
+    expect((await call("/usage/identities?provider=bogus")).status).toBe(400);
+  });
+
   test("names are DNS-1123 labels", async () => {
     for (const bad of ["with_underscore", "-lead", "trail-", "UPPER", "a".repeat(64)]) expect((await put(bad)).status).toBe(400);
     expect((await put("a")).status).toBe(201);

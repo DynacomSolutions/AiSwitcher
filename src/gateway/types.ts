@@ -27,6 +27,21 @@ export interface TokenRecord {
   expiresAt?: string;
 }
 
+/** Ledger totals for one provider and identity over a window (the admin `GET /usage/identities` row). */
+export interface IdentityUsageRow {
+  provider: string;
+  identity: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** Sum of the rows that carry an estimate. */
+  estCostUsd: number;
+  /** Rows with tokens but no estimate (unpriced model); the cost figure is a floor when above zero. */
+  unpricedRequests: number;
+  requests: number;
+}
+
 export interface UsageRow {
   ts: string;
   app: string;

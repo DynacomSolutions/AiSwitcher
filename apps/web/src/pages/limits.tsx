@@ -3,6 +3,7 @@ import { useMemo } from "react";
 
 import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
+import { PoolUsageCards } from "@/components/pool-usage-cards";
 import { GlobalUsageCards } from "@/components/usage-counter";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -14,7 +15,7 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import { useLimitsQuery } from "@/hooks/queries";
+import { useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
 import type { LimitFetchStatus, LimitWindow, ManualResetInfo, OverageInfo, ToolLimitResult } from "@/types/api";
 
@@ -147,7 +148,12 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
 
 export function LimitsPage() {
   const query = useLimitsQuery();
-  const results = query.data?.results ?? [];
+  const poolsQuery = usePoolsUsageQuery();
+  // A pool mirrors its active member's token, so its own limits row only ever
+  // says "not fetched"; the pool cards above carry the real figures instead.
+  const poolKeys = useMemo(() => new Set((poolsQuery.data?.pools ?? []).map((p) => `${p.tool}/${p.name}`)), [poolsQuery.data]);
+  const allResults = query.data?.results ?? [];
+  const results = useMemo(() => allResults.filter((r) => !poolKeys.has(`${r.toolName}/${r.identity.name}`)), [allResults, poolKeys]);
 
   // Provider-first grouping, mirroring the CLI report: provider is the
   // grouping key, the wrapper tool is secondary info on each identity row.
@@ -172,6 +178,8 @@ export function LimitsPage() {
       />
 
       <GlobalUsageCards title="Global usage" />
+
+      <PoolUsageCards />
 
       {query.isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">

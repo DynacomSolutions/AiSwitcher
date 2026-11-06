@@ -205,5 +205,32 @@ export function createAdminApp(deps: AdminDeps): Hono {
     return c.json({ usage });
   });
 
+  // Ledger totals per provider and identity, so the console can sum a pool's members.
+  // `since` (ISO instant, optional `until`) wins over `days`; both are bounded by MAX_USAGE_DAYS.
+  hono.get("/usage/identities", async (c) => {
+    const now = deps.now();
+    const sinceRaw = c.req.query("since");
+    const untilRaw = c.req.query("until");
+    let since: Date;
+    if (sinceRaw !== undefined) {
+      since = new Date(sinceRaw);
+      if (Number.isNaN(since.getTime())) return err(400, "since must be an ISO date-time");
+    } else {
+      const days = c.req.query("days") === undefined ? 1 : Number(c.req.query("days"));
+      if (!Number.isInteger(days) || days < 1 || days > MAX_USAGE_DAYS) return err(400, `days must be a whole number from 1 to ${MAX_USAGE_DAYS}`);
+      since = new Date(now.getTime() - days * 86400_000);
+    }
+    if (now.getTime() - since.getTime() > MAX_USAGE_DAYS * 86400_000) return err(400, `since must be within ${MAX_USAGE_DAYS} days`);
+    let until: Date | undefined;
+    if (untilRaw !== undefined) {
+      until = new Date(untilRaw);
+      if (Number.isNaN(until.getTime())) return err(400, "until must be an ISO date-time");
+    }
+    const provider = c.req.query("provider");
+    if (provider !== undefined && !PROVIDERS.includes(provider as GatewayProvider)) return err(400, "unknown provider");
+    const rows = (await store.usageByIdentity(since, until)).filter((r) => provider === undefined || r.provider === provider);
+    return c.json({ since: since.toISOString(), ...(until ? { until: until.toISOString() } : {}), identities: rows });
+  });
+
   return hono;
 }
