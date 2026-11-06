@@ -183,8 +183,12 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     an export loads and rewrites only its own entries. Keying by directory,
     not identity name, keeps the cache across a rename; cache entries are
     keyed by absolute path, so a new directory could not reuse them anyway.
-    Each cycle removes scopes no live source uses, but only when target and
-    pool discovery both succeeded. Measured live on 7 Nov
+    Every scoped export stamps its scope directory's mtime; a cycle removes a
+    scope only when no live source uses it and it has been idle for 30 days,
+    and skips the sweep when target or pool discovery failed or a native
+    tool's identities registry file is missing (a missing file loads as an
+    empty list). The age floor also protects a second collector that sees
+    the same caches under translated paths. Measured live on 7 Nov
     2026 before this change, every Claude export read the whole 611 MB Claude
     namespace and every Codex export the 337 MB Codex one, even for an
     unchanged identity: about 8 GB of the roughly 10 GB a full round read.

@@ -1,7 +1,7 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { lstat, mkdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
 import { access, constants as fsConstants, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -227,20 +227,49 @@ export function aisTokscaleCacheScope(toolName: string, sourceEnv: Record<string
   return createHash("sha256").update(`ais-tokscale-cache-scope-v1\0${toolName}\0${roots}`).digest("hex");
 }
 
+const TOKSCALE_CACHE_SCOPE_DIRNAME = "source-message-cache-v2-ais-scope";
+
 /** Where the patched Tokscale keeps scoped message caches. */
 export function aisTokscaleCacheScopeRoot(): string {
-  return join(aisNativeTokscaleConfigDir(), "cache", "source-message-cache-v2-ais-scope");
+  return join(aisNativeTokscaleConfigDir(), "cache", TOKSCALE_CACHE_SCOPE_DIRNAME);
 }
 
-/** Delete scoped caches no live source uses any more (a removed identity or
- * a moved directory). Never throws; returns the number removed. */
-export function sweepUnusedTokscaleCacheScopes(liveScopes: ReadonlySet<string>, root = aisTokscaleCacheScopeRoot()): number {
+/** A scope unused for this long, and absent from the live set, is removed. */
+export const TOKSCALE_CACHE_SCOPE_MAX_IDLE_MS = 30 * 24 * 60 * 60_000;
+
+/** Stamp a scope as used: its directory mtime is the sweep's last-use time.
+ * Tokscale writes only inside the namespace subdirectories, so without this
+ * an unchanged source's scope would look idle. Never throws. */
+export function markTokscaleCacheScopeUsed(env: Record<string, string>): void {
+  const scope = env.TOKSCALE_AIS_CACHE_SCOPE;
+  const configDir = env.TOKSCALE_CONFIG_DIR;
+  if (!scope || !/^[a-f0-9]{64}$/.test(scope) || !configDir || !isAbsolute(configDir)) return;
+  try {
+    const dir = join(configDir, "cache", TOKSCALE_CACHE_SCOPE_DIRNAME, scope);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const now = new Date();
+    utimesSync(dir, now, now);
+  } catch { /* a missed stamp only delays nothing: the scope stays live or young */ }
+}
+
+/** Delete scoped caches that no live source uses and that no export has used
+ * for `maxIdleMs` (a removed identity or a moved directory). The age floor
+ * protects a source that is only briefly missing from discovery, and a second
+ * collector that sees the same caches under different paths. Never throws;
+ * returns the number removed. */
+export function sweepUnusedTokscaleCacheScopes(
+  liveScopes: ReadonlySet<string>,
+  root = aisTokscaleCacheScopeRoot(),
+  nowMs = Date.now(),
+  maxIdleMs = TOKSCALE_CACHE_SCOPE_MAX_IDLE_MS,
+): number {
   let names: string[];
   try { names = readdirSync(root); } catch { return 0; }
   let removed = 0;
   for (const name of names) {
     if (!/^[a-f0-9]{64}$/.test(name) || liveScopes.has(name)) continue;
     try {
+      if (nowMs - statSync(join(root, name)).mtimeMs < maxIdleMs) continue;
       rmSync(join(root, name), { recursive: true, force: true });
       removed++;
     } catch { /* retried next cycle */ }
@@ -259,6 +288,7 @@ export function aisNativeTokscaleConfigDir(): string {
  * separately written export envelope before it can become visible. */
 export async function runAisTokscaleExportInvocation(invocation: AisTokscaleExportInvocation): Promise<string> {
   if (invocation.signal?.aborted) throw new Error("native-export-aborted");
+  markTokscaleCacheScopeUsed(invocation.env);
   return withTokscaleProcessSlot(() =>
     spawnTokscaleProcess(invocation.command, [], [...invocation.args, "--json"], invocation.env, tokscaleExportTimeoutMs()));
 }

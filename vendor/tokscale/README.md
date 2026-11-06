@@ -96,8 +96,8 @@ identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
 sets the attempt-unique export path and opaque partition key, sets the
 message-cache scope to a hash of the tool and the scanned source directory
-(so a renamed identity keeps its cache; unused scopes are swept each
-collector cycle), and enables the stat-only warm cache. For default
+(so a renamed identity keeps its cache; a scope no live source uses and no
+export has used for 30 days is swept), and enables the stat-only warm cache. For default
 OpenCode it points `XDG_DATA_HOME` at the exact default profile's data root.
 Z.ai and Alibaba are unsupported for native batch capture and remain
 explicitly outside this coverage.

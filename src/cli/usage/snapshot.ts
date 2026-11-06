@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, rmSync, statSync } from "node:fs";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import { withUsableCwd } from "../../shared/exec.ts";
-import { toolConfigFromFlag } from "../identities/resolve-tool.ts";
+import { TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { isSwapPool } from "../../identities/swap-pool.ts";
 import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotDirtyId, usageSnapshotTargetKey, usageSnapshotDirtyDirectory } from "./snapshot-dirty.ts";
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageTarget } from "./run.ts";
@@ -141,6 +141,8 @@ export interface UsageSnapshotDeps {
   nativeStagingRoot?: string;
   /** Test seam: scoped Tokscale cache root swept of unused scopes (production sweeps the default root). */
   tokscaleCacheScopeRoot?: string;
+  /** Test seam: whether every native tool's identities registry file exists. */
+  identityRegistriesPresent?: () => boolean;
   now?: () => number;
   partitionTtlMs?: number;
   /** Interval between in-cycle heartbeat writes (default USAGE_SNAPSHOT_HEARTBEAT_INTERVAL_MS). */
@@ -658,6 +660,12 @@ function collectObsoleteNativeBatches(snapshot: UsageSnapshot): void {
   }
 }
 
+/** Whether the identities registry of every tool with native capture exists. */
+function nativeIdentityRegistriesPresent(): boolean {
+  const tools = ["claude", "codex", "grok", "kimi", "opencode", "pi"] as const;
+  return tools.every((tool) => existsSync(TOOL_CONFIGS[tool].identitiesJsonPath));
+}
+
 function targetKey(target: UsageTarget): string {
   return usageSnapshotTargetKey(target.toolName, target.identity.name);
 }
@@ -783,7 +791,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   targets = targets.filter((target) => !isSwapPool(target.identity));
   // Scoped Tokscale caches of sources that no longer exist would stay on disk
   // for good. Only sweep with a complete picture of the live sources.
-  if ((deps.tokscaleCacheScopeRoot || deps.path === undefined) && poolDiscoveryOk && targets.length > 0) {
+  // A missing registry file loads as an empty identity list, which would look
+  // like every identity of that tool was removed.
+  const registriesPresent = deps.identityRegistriesPresent ?? nativeIdentityRegistriesPresent;
+  if ((deps.tokscaleCacheScopeRoot || deps.path === undefined) && poolDiscoveryOk && targets.length > 0 && registriesPresent()) {
     const live = new Set<string>();
     for (const target of [...targets, ...poolTargets]) {
       const sourceEnv = aisNativeSourceEnv(target.toolName, target.identity);
