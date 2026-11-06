@@ -26,6 +26,7 @@ import type {
   ToolName,
   TranscriptResponse,
   GatewayUsageResponse,
+  PoolsUsageResponse,
   UsageResponse,
 } from "@/types/api";
 
@@ -151,6 +152,8 @@ export const api = {
   getLimits: () => request<LimitsResponse>("/api/limits?maxAge=45"),
 
   getUsage: () => request<UsageResponse>("/api/usage"),
+
+  getPoolsUsage: () => request<PoolsUsageResponse>("/api/pools/usage"),
 
   getGatewayUsage: (days: number) => request<GatewayUsageResponse>(`/api/gateway/usage?days=${days}`),
 

@@ -316,6 +316,40 @@ export interface GatewayUsageResponse {
   error?: string;
 }
 
+/* Pools */
+
+export interface PoolRef {
+  tool: string;
+  name: string;
+  active?: string;
+  members: Array<{ name: string; allowed: boolean }>;
+}
+
+export interface GatewayIdentityUsage {
+  provider: string;
+  identity: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  estCostUsd: number;
+  unpricedRequests: number;
+  requests: number;
+}
+
+export interface GatewayPeriod {
+  configured: boolean;
+  error?: string;
+  rows: GatewayIdentityUsage[];
+}
+
+export interface PoolsUsageResponse {
+  todayKey: string;
+  weekStartKey: string;
+  pools: PoolRef[];
+  gateway: { today: GatewayPeriod; week: GatewayPeriod };
+}
+
 export interface UsageResponse {
   results: UsageResult[];
   generatedAt: string;

@@ -2,7 +2,7 @@ import { SQL, type TransactionSQL } from "bun";
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import type { GatewayStore } from "./store.ts";
-import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
 
@@ -180,6 +180,32 @@ export class PgGatewayStore implements GatewayStore {
       SELECT COALESCE(SUM(input_tokens + output_tokens + cache_write_tokens), 0) AS total
       FROM gateway_usage WHERE app = ${app} AND ts >= ${since.toISOString()}::timestamptz`;
     return Number(rows[0]?.total ?? 0);
+  }
+
+  async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
+    const to = until ? until.toISOString() : null;
+    const rows = await this.sql`
+      SELECT provider, identity,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
+        COUNT(*) FILTER (WHERE est_cost_usd IS NULL AND input_tokens + output_tokens + cache_read_tokens + cache_write_tokens > 0) AS unpriced,
+        COUNT(*) AS requests
+      FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+      GROUP BY provider, identity ORDER BY provider, identity`;
+    return rows.map((r: Record<string, unknown>) => ({
+      provider: String(r.provider),
+      identity: String(r.identity),
+      inputTokens: Number(r.input_tokens),
+      outputTokens: Number(r.output_tokens),
+      cacheReadTokens: Number(r.cache_read_tokens),
+      cacheWriteTokens: Number(r.cache_write_tokens),
+      estCostUsd: Number(r.est_cost_usd),
+      unpricedRequests: Number(r.unpriced),
+      requests: Number(r.requests),
+    }));
   }
 
   async putBrowserBinding(b: BrowserBinding): Promise<void> {

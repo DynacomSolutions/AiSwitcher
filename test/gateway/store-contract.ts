@@ -92,6 +92,24 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.usageSince("a", new Date("2026-11-02T00:00:00.000Z"))).toBe(39);
   });
 
+  test("usageByIdentity totals per provider and identity inside the window", async () => {
+    const s = await makeStore();
+    await s.appendUsage([
+      { ...row("a", "2026-11-02T01:00:00.000Z", 10, 20), identity: "m1", cacheReadTokens: 5, estCostUsd: 0.5 },
+      { ...row("b", "2026-11-02T02:00:00.000Z", 1, 1), identity: "m1" },
+      { ...row("a", "2026-11-02T03:00:00.000Z", 3, 0), identity: "m2", estCostUsd: 0.1 },
+      { ...row("a", "2026-10-01T00:00:00.000Z", 999, 0), identity: "m1" },
+    ]);
+    const got = await s.usageByIdentity(new Date("2026-11-02T00:00:00.000Z"));
+    const sorted = [...got].sort((x, y) => x.identity.localeCompare(y.identity));
+    expect(sorted).toEqual([
+      { provider: "codex", identity: "m1", inputTokens: 11, outputTokens: 21, cacheReadTokens: 5, cacheWriteTokens: 0, estCostUsd: 0.5, unpricedRequests: 1, requests: 2 },
+      { provider: "codex", identity: "m2", inputTokens: 3, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0.1, unpricedRequests: 0, requests: 1 },
+    ]);
+    expect(await s.usageByIdentity(new Date("2026-11-02T00:00:00.000Z"), new Date("2026-11-02T02:00:00.000Z"))).toHaveLength(1);
+    expect(await s.usageByIdentity(new Date("2027-01-01T00:00:00.000Z"))).toEqual([]);
+  });
+
   test("appendUsage accepts an empty batch", async () => {
     const s = await makeStore();
     await s.appendUsage([]);

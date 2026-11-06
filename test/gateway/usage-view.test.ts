@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatGatewayUsageSection, loadGatewayUsage, mapGatewayUsage } from "../../src/gateway/usage-view.ts";
+import { formatGatewayUsageSection, loadGatewayIdentityUsage, loadGatewayUsage, mapGatewayIdentityUsage, mapGatewayUsage } from "../../src/gateway/usage-view.ts";
 
 describe("mapGatewayUsage", () => {
   test("sorts by tokens, drops malformed rows, clamps bad numbers", () => {
@@ -78,5 +78,35 @@ describe("loadGatewayUsage", () => {
     expect(a.error).toBe("admin unreachable");
     expect(b.error).toBe("admin answered 401");
     expect(JSON.stringify([a, b])).not.toContain("sekrit");
+  });
+});
+
+describe("gateway identity usage", () => {
+  const secretsFile = (body: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "gwiu-"));
+    const p = join(dir, "secrets");
+    writeFileSync(p, body);
+    return p;
+  };
+  const creds = "AIS_GATEWAY_ADMIN_URL=http://gw.invalid/\nAIS_GATEWAY_ADMIN_TOKEN=SYNTHETIC_FIXTURE_token\n";
+  test("maps rows and drops malformed ones", () => {
+    expect(mapGatewayIdentityUsage({ identities: [{ provider: "claude", identity: "m1", inputTokens: 5, estCostUsd: -1 }, { provider: "claude" }] })).toEqual([
+      { provider: "claude", identity: "m1", inputTokens: 5, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 },
+    ]);
+    expect(mapGatewayIdentityUsage(null)).toEqual([]);
+  });
+  test("requests /usage/identities with since and reports failures as short errors", async () => {
+    let url = "";
+    const since = new Date("2026-11-06T00:00:00.000Z");
+    const okView = await loadGatewayIdentityUsage(since, {
+      secretsPath: secretsFile(creds),
+      fetch: (async (u: string) => ((url = u), Response.json({ identities: [] }))) as unknown as typeof fetch,
+    });
+    expect(okView).toEqual({ configured: true, rows: [] });
+    expect(url).toBe("http://gw.invalid/usage/identities?since=2026-11-06T00%3A00%3A00.000Z");
+    const old = await loadGatewayIdentityUsage(since, { secretsPath: secretsFile(creds), fetch: (async () => new Response("", { status: 404 })) as unknown as typeof fetch });
+    expect(old.error).toContain("older version");
+    const down = await loadGatewayIdentityUsage(since, { secretsPath: secretsFile(creds), fetch: (async () => { throw new Error("x"); }) as unknown as typeof fetch });
+    expect(down.error).toBe("admin unreachable");
   });
 });

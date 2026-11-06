@@ -25,6 +25,7 @@ import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
+import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
 
 import {
@@ -72,6 +73,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   localModels?: () => Promise<LocalModelsDto>;
   /** Test seam for GET /api/gateway/usage; defaults to the gateway admin API. */
   gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
+  /** Test seam for GET /api/pools/usage. */
+  poolsUsage?: () => Promise<PoolsUsageResponse>;
   /** Online-probe cache file for the default localModels; tests inject a temp path. */
   onlineCachePath?: string;
 }
@@ -221,6 +224,8 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   // Per-app gateway tokens from the admin API; "configured: false" when this
   // process has no admin URL and token, so the console can hide the section.
   app.get("/api/gateway/usage", async (c) => c.json(await (deps.gatewayUsage ?? loadGatewayUsage)(numberQuery(c, "days", 7))));
+  // Pool membership and the gateway ledger by identity; the console page sums these with native usage and limits.
+  app.get("/api/pools/usage", async (c) => c.json(await (deps.poolsUsage ?? (() => poolsUsage()))()));
   // The shared breakdown snapshot is read immediately; this API request only
   // queues a refresh marker. The host collector owns all history scans.
   app.get("/api/usage/breakdown", async (c) => {

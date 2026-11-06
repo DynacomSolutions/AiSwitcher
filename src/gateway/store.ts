@@ -1,5 +1,5 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
-import type { GatewayApp, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
 
 export interface GatewayStore {
   getApp(name: string): Promise<GatewayApp | undefined>;
@@ -11,6 +11,8 @@ export interface GatewayStore {
   revokeApp(name: string): Promise<void>;
   appendUsage(rows: UsageRow[]): Promise<void>;
   usageSince(app: string, since: Date): Promise<number>;
+  /** Ledger totals per provider and identity for rows at or after `since` (before `until` when given). */
+  usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]>;
   putBrowserBinding(b: BrowserBinding): Promise<void>;
   getBrowserBinding(name: string): Promise<BrowserBinding | undefined>;
   listBrowserBindings(): Promise<BrowserBinding[]>;
@@ -91,6 +93,30 @@ export class MemoryGatewayStore implements GatewayStore {
       if (r.app === app && Date.parse(r.ts) >= cutoff) total += r.inputTokens + r.outputTokens + r.cacheWriteTokens;
     }
     return total;
+  }
+
+  async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
+    const from = since.getTime();
+    const to = until?.getTime() ?? Infinity;
+    const by = new Map<string, IdentityUsageRow>();
+    for (const r of this.usage) {
+      const t = Date.parse(r.ts);
+      if (t < from || t >= to) continue;
+      const key = `${r.provider}\u0000${r.identity}`;
+      let a = by.get(key);
+      if (!a) {
+        a = { provider: r.provider, identity: r.identity, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, unpricedRequests: 0, requests: 0 };
+        by.set(key, a);
+      }
+      a.inputTokens += r.inputTokens;
+      a.outputTokens += r.outputTokens;
+      a.cacheReadTokens += r.cacheReadTokens;
+      a.cacheWriteTokens += r.cacheWriteTokens;
+      a.requests += 1;
+      if (r.estCostUsd !== undefined) a.estCostUsd += r.estCostUsd;
+      else if (r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens > 0) a.unpricedRequests += 1;
+    }
+    return [...by.values()];
   }
 
   async putBrowserBinding(b: BrowserBinding): Promise<void> {

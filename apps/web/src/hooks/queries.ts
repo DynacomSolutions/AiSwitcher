@@ -24,6 +24,7 @@ export const qk = {
   limits: ["limits"] as const,
   localModels: ["local-models"] as const,
   usage: ["usage"] as const,
+  poolsUsage: ["pools-usage"] as const,
   gatewayUsage: (days: number) => ["gateway-usage", days] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
@@ -117,6 +118,10 @@ export function useUsageQuery() {
     queryFn: api.getUsage,
     refetchInterval: (q) => (q.state.data?.pending ? 3000 : POLL.slow),
   });
+}
+
+export function usePoolsUsageQuery() {
+  return useQuery({ queryKey: qk.poolsUsage, queryFn: () => api.getPoolsUsage(), refetchInterval: POLL.slow });
 }
 
 export function useGatewayUsageQuery(days: number) {
