@@ -21,6 +21,10 @@ export interface GatewayMetrics {
   browserCall(tool: string, outcome: string, seconds: number): void;
   /** A browser pairing completed (token delivered). */
   browserPairing(): void;
+  /** Requests currently queued for request-body budget. */
+  bodyBudgetWaiting?(n: number): void;
+  /** Seconds a request waited for body budget (0 when it did not have to wait). */
+  bodyBudgetWait?(seconds: number): void;
 }
 
 export const noopMetrics: GatewayMetrics = {
@@ -73,6 +77,10 @@ export class PrometheusMetrics implements GatewayMetrics {
   private callSum = 0;
   /** Set once the relay hub exists. */
   browserGauges: { connected(): number; sessions(): number } = { connected: () => 0, sessions: () => 0 };
+  private budgetWaiting = 0;
+  private readonly budgetBucketCounts = BUCKETS.map(() => 0);
+  private budgetCount = 0;
+  private budgetSum = 0;
   private readonly bucketCounts = BUCKETS.map(() => 0);
   private durationCount = 0;
   private durationSum = 0;
@@ -124,6 +132,18 @@ export class PrometheusMetrics implements GatewayMetrics {
     });
   }
 
+  bodyBudgetWaiting(n: number): void {
+    this.budgetWaiting = n;
+  }
+
+  bodyBudgetWait(seconds: number): void {
+    this.budgetCount += 1;
+    this.budgetSum += seconds;
+    BUCKETS.forEach((b, i) => {
+      if (seconds <= b) this.budgetBucketCounts[i] = (this.budgetBucketCounts[i] ?? 0) + 1;
+    });
+  }
+
   browserPairing(): void {
     this.browserPairings.inc({});
   }
@@ -145,6 +165,10 @@ export class PrometheusMetrics implements GatewayMetrics {
     out.push("# HELP ais_gateway_browser_call_seconds Browser tool call duration.", "# TYPE ais_gateway_browser_call_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_browser_call_seconds_bucket{le="${b}"} ${this.callBucketCounts[i]}`));
     out.push(`ais_gateway_browser_call_seconds_bucket{le="+Inf"} ${this.callCount}`, `ais_gateway_browser_call_seconds_sum ${this.callSum}`, `ais_gateway_browser_call_seconds_count ${this.callCount}`);
+    out.push("# HELP ais_gateway_body_budget_waiting Requests queued for request-body memory budget.", "# TYPE ais_gateway_body_budget_waiting gauge", `ais_gateway_body_budget_waiting ${this.budgetWaiting}`);
+    out.push("# HELP ais_gateway_body_budget_wait_seconds Time requests waited for request-body memory budget.", "# TYPE ais_gateway_body_budget_wait_seconds histogram");
+    BUCKETS.forEach((b, i) => out.push(`ais_gateway_body_budget_wait_seconds_bucket{le="${b}"} ${this.budgetBucketCounts[i]}`));
+    out.push(`ais_gateway_body_budget_wait_seconds_bucket{le="+Inf"} ${this.budgetCount}`, `ais_gateway_body_budget_wait_seconds_sum ${this.budgetSum}`, `ais_gateway_body_budget_wait_seconds_count ${this.budgetCount}`);
     out.push("# HELP ais_gateway_browsers_connected Browser extensions connected.", "# TYPE ais_gateway_browsers_connected gauge", `ais_gateway_browsers_connected ${this.browserGauges.connected()}`);
     out.push("# HELP ais_gateway_browser_sessions_active Agent browser sessions active in the last ten minutes.", "# TYPE ais_gateway_browser_sessions_active gauge", `ais_gateway_browser_sessions_active ${this.browserGauges.sessions()}`);
     out.push("# HELP ais_gateway_ledger_buffer_depth Usage rows waiting to be written.", "# TYPE ais_gateway_ledger_buffer_depth gauge", `ais_gateway_ledger_buffer_depth ${this.gauges.ledgerDepth()}`);

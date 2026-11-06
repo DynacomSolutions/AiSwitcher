@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createGatewayApp, readBody, scanModel, type GatewayDeps } from "../../src/gateway/app.ts";
+import { bodyBudgetFromEnv, BODY_BUDGET_BYTES, createGatewayApp, readBody, scanModel, type GatewayDeps } from "../../src/gateway/app.ts";
 import { BodyBudget } from "../../src/gateway/body-budget.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { noopMetrics } from "../../src/gateway/metrics.ts";
@@ -82,54 +82,98 @@ describe("BodyBudget", () => {
   });
 });
 
+async function rig(opts: { budget: number; holdMs: number }) {
+  let live = 0;
+  let peakLive = 0;
+  const upstream = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(req) {
+      live += 1;
+      peakLive = Math.max(peakLive, live);
+      await req.arrayBuffer();
+      await Bun.sleep(opts.holdMs); // time to first byte: the request is held until headers
+      live -= 1;
+      return new Response('{"model":"claude-x","usage":{"input_tokens":1,"output_tokens":1}}', { headers: { "content-type": "application/json" } });
+    },
+  });
+  const store = new MemoryGatewayStore();
+  const rows: string[] = [];
+  const ledger = new LedgerBuffer(store, { max: 1000, flushMs: 3_600_000 });
+  const t = generateToken();
+  await store.putApp({ name: "a", owner: "o", namespace: "ns", provider: "claude", style: "anthropic", target: { kind: "pin", identity: "id1" }, state: "active", createdAt: "2026-11-01T00:00:00.000Z" });
+  await store.addToken({ app: "a", prefix: t.prefix, hash: t.hash, createdAt: new Date().toISOString() });
+  const waits: number[] = [];
+  const waiting: number[] = [];
+  const deps: GatewayDeps = {
+    store,
+    ledger,
+    creds: { get: async (_p: string, identity: string) => ({ identity, accessToken: "x" }), refreshAfter401: async () => ({ identity: "id1", accessToken: "y" }) } as unknown as GatewayDeps["creds"],
+    usageFor: async () => undefined,
+    poolMembers: async () => ["id1"],
+    fetch: ((input: string | URL | Request, init?: RequestInit) => fetch(`http://127.0.0.1:${upstream.port}${new URL(String(input)).pathname}`, init)) as typeof fetch,
+    now: () => new Date(),
+    metrics: { ...noopMetrics, bodyBudgetWait: (s) => waits.push(s), bodyBudgetWaiting: (n) => waiting.push(n), request: (e) => rows.push(e.status) },
+    log: () => {},
+    bodyBudgetBytes: opts.budget,
+  };
+  const app = createGatewayApp(deps);
+  const post = async (payload: string, signal?: AbortSignal): Promise<Response> =>
+    app.fetch(new Request("http://gw/a/v1/messages", { method: "POST", headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" }, body: payload, ...(signal ? { signal } : {}) }));
+  return { post, peak: () => peakLive, waits, waiting, rows, stop: () => upstream.stop(true) };
+}
+
+const MIB = 1024 * 1024;
+const big = (n: number): string => JSON.stringify({ model: "claude-x", pad: "y".repeat(n - 100) });
+
 describe("gateway memory", () => {
-  test("bodies held for replay stay within the budget while many large requests arrive", async () => {
-    const BODY = 1024 * 1024;
-    const BUDGET = 4 * BODY;
-    let live = 0;
-    let peakLive = 0;
-    const upstream = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      async fetch(req) {
-        live += 1;
-        peakLive = Math.max(peakLive, live);
-        await req.arrayBuffer();
-        await Bun.sleep(40); // time to first byte: the request is held until headers
-        live -= 1;
-        return new Response('{"model":"claude-x","usage":{"input_tokens":1,"output_tokens":1}}', { headers: { "content-type": "application/json" } });
-      },
-    });
-    const store = new MemoryGatewayStore();
-    const ledger = new LedgerBuffer(store, { max: 1000, flushMs: 3_600_000 });
-    const t = generateToken();
-    await store.putApp({ name: "a", owner: "o", namespace: "ns", provider: "claude", style: "anthropic", target: { kind: "pin", identity: "id1" }, state: "active", createdAt: "2026-11-01T00:00:00.000Z" });
-    await store.addToken({ app: "a", prefix: t.prefix, hash: t.hash, createdAt: new Date().toISOString() });
-    const deps: GatewayDeps = {
-      store,
-      ledger,
-      creds: { get: async (_p: string, identity: string) => ({ identity, accessToken: "x" }), refreshAfter401: async () => ({ identity: "id1", accessToken: "y" }) } as unknown as GatewayDeps["creds"],
-      usageFor: async () => undefined,
-      poolMembers: async () => ["id1"],
-      fetch: ((input: string | URL | Request, init?: RequestInit) => fetch(`http://127.0.0.1:${upstream.port}${new URL(String(input)).pathname}`, init)) as typeof fetch,
-      now: () => new Date(),
-      metrics: noopMetrics,
-      log: () => {},
-      bodyBudgetBytes: BUDGET,
-    };
-    const app = createGatewayApp(deps);
-    const payload = JSON.stringify({ model: "claude-x", pad: "y".repeat(BODY - 100) });
+  test("defaults to 512 MiB and reads AIS_GATEWAY_BODY_BUDGET_MB", () => {
+    expect(BODY_BUDGET_BYTES).toBe(512 * MIB);
+    expect(bodyBudgetFromEnv({})).toBe(512 * MIB);
+    expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "64" })).toBe(64 * MIB);
+    expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "junk" })).toBe(512 * MIB);
+    expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "0" })).toBe(512 * MIB);
+  });
+
+  test("waits and completes when budget frees: bodies held stay within the budget and nobody gets a 503", async () => {
+    const r = await rig({ budget: 4 * MIB, holdMs: 40 });
+    const payload = big(MIB);
     const statuses = await Promise.all(
       Array.from({ length: 24 }, async () => {
-        const res = await app.fetch(new Request("http://gw/a/v1/messages", { method: "POST", headers: { authorization: `Bearer ${t.token}`, "content-type": "application/json" }, body: payload }));
+        const res = await r.post(payload);
         await res.arrayBuffer();
         return res.status;
       }),
     );
-    upstream.stop(true);
-    ledger.close?.();
+    r.stop();
     expect(statuses.every((s) => s === 200)).toBe(true);
-    // Each request holds about 1 MiB: at most BUDGET / BODY of them can be past the gate at once.
-    expect(peakLive).toBeLessThanOrEqual(BUDGET / BODY);
+    expect(r.peak()).toBeLessThanOrEqual(4);
+    expect(r.waits).toHaveLength(24);
+    expect(Math.max(...r.waits)).toBeGreaterThan(0.03);
+    expect(Math.max(...r.waiting)).toBeGreaterThan(0);
+    expect(r.waiting[r.waiting.length - 1]).toBe(0);
+  });
+
+  test("abort while queued releases nothing and records client_aborted", async () => {
+    const r = await rig({ budget: MIB, holdMs: 300 });
+    const payload = big(MIB);
+    const first = r.post(payload).then((x) => x.arrayBuffer());
+    await Bun.sleep(50); // the first holds the whole budget
+    const ac = new AbortController();
+    const queued = r.post(payload, ac.signal);
+    await Bun.sleep(50);
+    expect(r.waiting[r.waiting.length - 1]).toBe(1);
+    ac.abort();
+    const res = await queued.catch(() => undefined);
+    if (res) expect(res.status).toBe(499);
+    await first;
+    // The aborted request never reached the upstream, and the budget is whole again.
+    const after = await r.post(payload);
+    expect(after.status).toBe(200);
+    await after.arrayBuffer();
+    r.stop();
+    expect(r.peak()).toBe(1);
+    expect(r.rows).toContain("client_aborted");
+    expect(r.waiting[r.waiting.length - 1]).toBe(0);
   });
 });

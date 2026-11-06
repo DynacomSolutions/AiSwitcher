@@ -37,14 +37,18 @@ export interface GatewayDeps {
   browserIdentityExists?(identity: string): Promise<string | undefined>;
   /** Browser relay; the agent call routes are only mounted when present. */
   browserHub?: BrowserHub;
-  /** Most request-body bytes held for replay at once across all requests. Defaults to BODY_BUDGET_BYTES. */
+  /** Most request-body bytes held for replay at once across all requests. Defaults to AIS_GATEWAY_BODY_BUDGET_MB, else BODY_BUDGET_BYTES. */
   bodyBudgetBytes?: number;
 }
 
 /** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
-export const BODY_BUDGET_BYTES = 32 * 1024 * 1024;
-/** A request waits at most this long for body budget before it gets a 503. */
-export const BODY_BUDGET_WAIT_MS = 60_000;
+export const BODY_BUDGET_BYTES = 512 * 1024 * 1024;
+
+/** The budget in bytes: `AIS_GATEWAY_BODY_BUDGET_MB` when it is a positive number, else the default. */
+export function bodyBudgetFromEnv(env: Record<string, string | undefined> = process.env): number {
+  const mb = Number(env.AIS_GATEWAY_BODY_BUDGET_MB ?? "");
+  return Number.isFinite(mb) && mb > 0 ? Math.floor(mb * 1024 * 1024) : BODY_BUDGET_BYTES;
+}
 
 /** Request bodies up to this size are buffered so they can be replayed (401 retry, failover). */
 export const REPLAY_LIMIT_BYTES = 8 * 1024 * 1024;
@@ -354,7 +358,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
     c.res = markGatewayResponse(c.res);
   });
   const log = deps.log ?? defaultLog;
-  const budget = new BodyBudget(deps.bodyBudgetBytes ?? BODY_BUDGET_BYTES);
+  const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const handle = (req: Request): Promise<Response> =>
     proxy(req, deps, log, budget).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
@@ -476,12 +480,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     // Reserve the declared size first; a request that does not fit waits without reading its body.
     const declared = declaredLength(req);
     const reserve = !req.body ? 0 : Number.isFinite(declared) ? (declared > REPLAY_LIMIT_BYTES ? 0 : declared) : 1024 * 1024;
-    try {
-      releaseBody = await budget.reserve(reserve, AbortSignal.any([ctrl.signal, AbortSignal.timeout(BODY_BUDGET_WAIT_MS)]));
-    } catch (err) {
-      if (req.signal.aborted || ctrl.signal.aborted) throw err; // caught below as a client abort
-      return reject(503, "gateway busy, retry shortly");
-    }
+    // A queued request waits until it fits or its client leaves (the abort rejects here and is recorded below). The gateway never answers 503 for capacity.
+    const queuedAt = performance.now();
+    releaseBody = await budget.reserve(reserve, ctrl.signal);
+    deps.metrics.bodyBudgetWait?.((performance.now() - queuedAt) / 1000);
     body = await readBody(req);
   } catch {
     // An abort can land a tick after the read error it caused: look again before calling it a bad body.
