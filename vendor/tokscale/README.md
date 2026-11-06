@@ -69,13 +69,19 @@ The patch adds three AIS-only surfaces:
   the whole namespace (all identities' Claude or Codex entries) and rewrote
   every shared shard one of its changed entries hashed into. A scoped
   namespace is seeded once: the first scoped scan reads the shared shards,
-  records the entries it looks up (including retained Claude history of
-  deleted transcripts, through the missing-history lookup), writes those and
-  its own changes to the scoped shards and only then publishes
-  `.ais-scope-seeded`. Before the marker the shared shards stay
-  authoritative; a scoped shard left by an interrupted seed wins over its
-  shared copy. The shared shards are never written by a scoped scan. Invalid
-  values are ignored (the scan stays unscoped).
+  records the entries it looks up plus, for Claude, every entry under its
+  scan roots (so retained history of deleted transcripts and transcripts the
+  directory walk missed are kept), writes those and its own changes to the
+  scoped shards and only then publishes `.ais-scope-seeded`. Codex and the
+  other namespaces carry only looked-up entries: they retain no history, so
+  a missed entry is just re-parsed from the live file later. If the shared
+  directory or any shared shard cannot be read, the marker is not published
+  and the next scan seeds again. Before the marker the shared shards stay
+  authoritative. When an interrupted seed left a scoped copy, the copy with
+  the newer source fingerprint wins and absorbs the other's retained
+  history; for a deleted source the copy that retains history wins. The
+  shared shards are never written by a scoped scan. Invalid values are
+  ignored (the scan stays unscoped).
 
 - The export envelope carries `messagesSha256`, the SHA-256 of its `messages`
   array as written. When AIS passes the digest of the batch it already holds
@@ -88,8 +94,10 @@ The patch adds three AIS-only surfaces:
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
-sets the attempt-unique export path and opaque partition key, uses that key
-as the message-cache scope, and enables the stat-only warm cache. For default
+sets the attempt-unique export path and opaque partition key, sets the
+message-cache scope to a hash of the tool and the scanned source directory
+(so a renamed identity keeps its cache; unused scopes are swept each
+collector cycle), and enables the stat-only warm cache. For default
 OpenCode it points `XDG_DATA_HOME` at the exact default profile's data root.
 Z.ai and Alibaba are unsupported for native batch capture and remain
 explicitly outside this coverage.

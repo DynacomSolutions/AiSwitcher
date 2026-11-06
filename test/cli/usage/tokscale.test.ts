@@ -10,6 +10,7 @@ import {
   dailyUsageFromHourlyEntries,
   prepareMergedPassthrough,
   tokscaleInvocationFor,
+  aisTokscaleCacheScope,
   tokscaleSpawnTimeoutMs,
   tokscaleTimeoutMessage,
   DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS,
@@ -141,7 +142,8 @@ describe("AIS native export cache seeding", () => {
       toolName: "codex", identity: identity("/identity/codex"),
       partitionId, exportPath: join(dir, "candidate.json"),
     }, { AIS_TOKSCALE_SHARED_BIN: command });
-    expect(invocation?.env.TOKSCALE_AIS_CACHE_SCOPE).toBe(partitionId);
+    expect(invocation?.env.TOKSCALE_AIS_CACHE_SCOPE).toBe(aisTokscaleCacheScope("codex", { CODEX_HOME: "/identity/codex" }));
+    expect(invocation?.env.TOKSCALE_AIS_CACHE_SCOPE).not.toBe(partitionId);
   });
 
   test("passes the committed batch digest so identical messages are not written again", async () => {

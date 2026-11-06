@@ -1,8 +1,8 @@
 diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/src/message_cache.rs
-index 71be3b7..9b40621 100644
+index 71be3b7..f30710a 100644
 --- a/crates/tokscale-core/src/message_cache.rs
 +++ b/crates/tokscale-core/src/message_cache.rs
-@@ -352,6 +352,52 @@ fn cache_lock_path() -> Option<PathBuf> {
+@@ -352,6 +352,77 @@ fn cache_lock_path() -> Option<PathBuf> {
      Some(cache_dir()?.join(CACHE_LOCK_FILENAME))
  }
  
@@ -38,6 +38,31 @@ index 71be3b7..9b40621 100644
 +    Some(cache_dir()?.join(AIS_SCOPED_CACHE_DIRNAME).join(scope))
 +}
 +
++/// AIS: reconcile a scoped entry (left by an interrupted seed) with the
++/// shared entry for the same source. The copy with the newer source
++/// fingerprint wins, and it absorbs the other's retained history, as the save
++/// merge does for a concurrent writer.
++/// For a deleted source only a copy that retains history still counts, so
++/// that copy wins regardless of fingerprints.
++fn prefer_seed_entry(scoped: CachedSourceEntry, shared: CachedSourceEntry) -> CachedSourceEntry {
++    let source_gone = !scoped.path.to_path_buf().exists();
++    let shared_is_newer = if source_gone
++        && scoped.holds_retained_history() != shared.holds_retained_history()
++    {
++        shared.holds_retained_history()
++    } else {
++        (shared.fingerprint.modified_ns, shared.fingerprint.size)
++            > (scoped.fingerprint.modified_ns, scoped.fingerprint.size)
++    };
++    let (mut keep, other) = if shared_is_newer {
++        (shared, scoped)
++    } else {
++        (scoped, shared)
++    };
++    keep.absorb_retained_history(&other);
++    keep
++}
++
 +fn write_scope_seeded_marker(namespace_dir: &Path) -> std::io::Result<()> {
 +    ensure_cache_dir(namespace_dir)?;
 +    let marker = namespace_dir.join(AIS_SCOPE_SEEDED_MARKER);
@@ -55,7 +80,7 @@ index 71be3b7..9b40621 100644
  /// Deletes the pre-v2 monolithic cache file, once per process.
  ///
  /// V2 deliberately never reads it (see the note on `CACHE_SHARD_DIRNAME`), so
-@@ -522,12 +568,18 @@ impl SourceFingerprint {
+@@ -522,12 +593,18 @@ impl SourceFingerprint {
      /// the existing cache wire layout, so retained-history cache formats do not
      /// need a lossy global migration for this Codex-only parser input.
      pub(crate) fn from_codex_path(path: &Path) -> Option<Self> {
@@ -79,7 +104,7 @@ index 71be3b7..9b40621 100644
          Some(fingerprint)
      }
  
-@@ -667,7 +719,12 @@ impl SourceFingerprint {
+@@ -667,7 +744,12 @@ impl SourceFingerprint {
          cached: Option<&Self>,
      ) -> Option<FingerprintStatus> {
          if !crate::sessions::utils::is_zst_path(path) {
@@ -93,7 +118,7 @@ index 71be3b7..9b40621 100644
          }
  
          if let Some(cached) = cached {
-@@ -3532,6 +3589,10 @@ struct CacheState {
+@@ -3532,6 +3614,15 @@ struct CacheState {
      dirty_keys: HashSet<CacheKey>,
      deleted_keys: HashMap<CacheKey, DeletionReason>,
      rewrite_shards: HashSet<CacheShardKey>,
@@ -101,10 +126,15 @@ index 71be3b7..9b40621 100644
 +    /// `AIS_SCOPED_CACHE_DIRNAME`), and the keys this scan looked up in them.
 +    seeding_namespaces: HashSet<&'static str>,
 +    accessed_keys: HashSet<CacheKey>,
++    /// AIS: seeding namespaces whose shared directory or a shared shard could
++    /// not be read. Their marker is never published: entries that only the
++    /// unread bytes hold (retained Claude history of a deleted transcript)
++    /// must stay reachable through the shared shards for a later seed.
++    seed_failed_namespaces: HashSet<&'static str>,
  }
  
  /// The persisted parse cache, read lazily and drained as it is consumed.
-@@ -3579,6 +3640,8 @@ pub(crate) struct SourceMessageCache {
+@@ -3579,6 +3670,8 @@ pub(crate) struct SourceMessageCache {
      /// `false` for [`SourceCachePolicy::InMemory`] callers, who must never
      /// touch the on-disk shards.
      persistent: bool,
@@ -113,7 +143,7 @@ index 71be3b7..9b40621 100644
  }
  
  // A shard can be as large as `MAX_CACHE_SHARD_BYTES`, and one transaction
-@@ -3634,6 +3697,7 @@ impl SourceMessageCache {
+@@ -3634,6 +3727,7 @@ impl SourceMessageCache {
          Self {
              state: Mutex::new(CacheState::default()),
              persistent: true,
@@ -121,7 +151,7 @@ index 71be3b7..9b40621 100644
          }
      }
  
-@@ -3694,17 +3758,37 @@ impl SourceMessageCache {
+@@ -3694,17 +3788,46 @@ impl SourceMessageCache {
              return;
          }
  
@@ -146,7 +176,13 @@ index 71be3b7..9b40621 100644
 +            None => parser_dirs.push(shard_root.join(namespace)),
 +        }
 +
-+        for parser_dir in parser_dirs {
++        // Keys the scoped pass of a seeding namespace loaded or dropped as
++        // missing, so the shared pass can reconcile them (`prefer_seed_entry`).
++        let seeding = state.seeding_namespaces.contains(namespace);
++        let mut scoped_loaded: HashSet<CacheKey> = HashSet::new();
++        let mut scoped_missing: HashSet<CacheKey> = HashSet::new();
++        for (pass, parser_dir) in parser_dirs.into_iter().enumerate() {
++        let shared_seed_pass = seeding && pass == 1;
          let read_dir = match fs::read_dir(&parser_dir) {
              Ok(read_dir) => read_dir,
 -            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -158,11 +194,60 @@ index 71be3b7..9b40621 100644
                      &error,
                  );
 -                return;
++                if shared_seed_pass {
++                    state.seed_failed_namespaces.insert(namespace);
++                }
 +                continue;
              }
          };
  
-@@ -3772,6 +3856,7 @@ impl SourceMessageCache {
+@@ -3728,6 +3851,9 @@ impl SourceMessageCache {
+                 }
+                 ShardReadStatus::Invalid(error) => {
+                     warn_cache_failure_once("source message cache shard is invalid", &path, &error);
++                    if shared_seed_pass {
++                        state.seed_failed_namespaces.insert(namespace);
++                    }
+                     state.rewrite_shards.insert(shard_key);
+                     state.dirty = true;
+                     continue;
+@@ -3748,10 +3874,29 @@ impl SourceMessageCache {
+                 // Only retained Claude history can outlive a missing source;
+                 // an ordinary deleted session must stop contributing usage.
+                 if !key.path.to_path_buf().exists() && !entry.holds_retained_history() {
++                    if seeding && pass == 0 {
++                        scoped_missing.insert(key.clone());
++                    }
+                     state.deleted_keys.insert(key, DeletionReason::Missing);
+                     state.dirty = true;
+                     continue;
+                 }
++                if shared_seed_pass && !state.dirty_keys.contains(&key) {
++                    // A scoped copy from an interrupted seed may be older than
++                    // the shared one, or may have lost history the shared one
++                    // still retains.
++                    if scoped_loaded.contains(&key) {
++                        if let Some(scoped) = state.entries.remove(&key) {
++                            state.entries.insert(key, prefer_seed_entry(scoped, entry));
++                        }
++                        continue;
++                    }
++                    if scoped_missing.contains(&key) {
++                        state.deleted_keys.remove(&key);
++                        state.entries.insert(key, entry);
++                        continue;
++                    }
++                }
+                 // This scan already produced (or deleted) something for this
+                 // source, and that is newer than the bytes on disk.
+                 if state.entries.contains_key(&key)
+@@ -3769,9 +3914,13 @@ impl SourceMessageCache {
+                     state.dirty_keys.insert(key.clone());
+                     state.dirty = true;
+                 }
++                if seeding && pass == 0 {
++                    scoped_loaded.insert(key.clone());
++                }
                  state.entries.insert(key, entry);
              }
          }
@@ -170,7 +255,7 @@ index 71be3b7..9b40621 100644
      }
  
      #[cfg(test)]
-@@ -3807,6 +3892,14 @@ impl SourceMessageCache {
+@@ -3807,6 +3956,24 @@ impl SourceMessageCache {
              })
              .cloned()
              .collect();
@@ -178,14 +263,24 @@ index 71be3b7..9b40621 100644
 +            .seeding_namespaces
 +            .contains(ClientId::Claude.as_str())
 +        {
-+            for entry in &entries {
-+                state.accessed_keys.insert(CacheKey::from_entry(entry));
-+            }
++            // Seed every entry under this scan's roots, not only the ones a
++            // lookup reached: a transcript the directory walk missed this
++            // time must not lose its cached (possibly retained) history.
++            let under_roots: Vec<CacheKey> = state
++                .entries
++                .iter()
++                .filter(|(_, entry)| {
++                    let path = entry.path.to_path_buf();
++                    roots.iter().any(|root| path.starts_with(root))
++                })
++                .map(|(key, _)| key.clone())
++                .collect();
++            state.accessed_keys.extend(under_roots);
 +        }
          entries.sort_by_key(|entry| entry.path.to_path_buf());
          entries
      }
-@@ -3820,6 +3913,7 @@ impl SourceMessageCache {
+@@ -3820,6 +3987,7 @@ impl SourceMessageCache {
          let key = CacheKey::new(identity, path);
          let mut state = self.state();
          self.ensure_namespace_loaded(&mut state, identity.namespace);
@@ -193,7 +288,7 @@ index 71be3b7..9b40621 100644
          state
              .entries
              .get(&key)
-@@ -3853,6 +3947,7 @@ impl SourceMessageCache {
+@@ -3853,6 +4021,7 @@ impl SourceMessageCache {
          let key = CacheKey::new(identity, path);
          let mut state = self.state();
          self.ensure_namespace_loaded(&mut state, identity.namespace);
@@ -201,7 +296,7 @@ index 71be3b7..9b40621 100644
          let retains_history = retained_history_key_filter(identity.namespace).is_some();
          let dirty = state.dirty_keys.contains(&key);
          let entry = state.entries.get_mut(&key)?;
-@@ -3865,6 +3960,12 @@ impl SourceMessageCache {
+@@ -3865,6 +4034,12 @@ impl SourceMessageCache {
          Some(entry.take_payload())
      }
  
@@ -214,7 +309,7 @@ index 71be3b7..9b40621 100644
      pub(crate) fn remove(&mut self, identity: CacheIdentity, path: &Path) {
          self.invalidate(identity, path);
      }
-@@ -3981,9 +4082,16 @@ impl SourceMessageCache {
+@@ -3981,9 +4156,16 @@ impl SourceMessageCache {
              observer();
          }
  
@@ -232,7 +327,7 @@ index 71be3b7..9b40621 100644
          if let Err(error) = ensure_cache_dir(&shard_root) {
              warn_cache_failure_once(
                  "source message cache directory is unavailable",
-@@ -4039,9 +4147,25 @@ impl SourceMessageCache {
+@@ -4039,9 +4221,25 @@ impl SourceMessageCache {
                  .push((key.clone(), reason.clone()));
          }
  
@@ -258,7 +353,7 @@ index 71be3b7..9b40621 100644
  
          // Prepare namespace directories before entering the parallel batch. Each
          // worker then owns one distinct final path while the cross-process lock
-@@ -4097,6 +4221,26 @@ impl SourceMessageCache {
+@@ -4097,6 +4295,30 @@ impl SourceMessageCache {
                          }
                      };
  
@@ -269,7 +364,11 @@ index 71be3b7..9b40621 100644
 +                            for entry in entries {
 +                                let key = CacheKey::from_entry(&entry);
 +                                if entry.identity_is_current() && seed.contains(&key) {
-+                                    merged_entries.entry(key).or_insert(entry);
++                                    let preferred = match merged_entries.remove(&key) {
++                                        Some(scoped) => prefer_seed_entry(scoped, entry),
++                                        None => entry,
++                                    };
++                                    merged_entries.insert(key, preferred);
 +                                }
 +                            }
 +                        }
@@ -285,7 +384,7 @@ index 71be3b7..9b40621 100644
                  if let Some(deleted) = deleted_by_shard.get(&shard_key) {
                      for (key, reason) in deleted {
                          let should_remove = match reason {
-@@ -4139,12 +4283,14 @@ impl SourceMessageCache {
+@@ -4139,12 +4361,14 @@ impl SourceMessageCache {
              });
  
          let mut successful_shards = HashSet::new();
@@ -300,7 +399,7 @@ index 71be3b7..9b40621 100644
                      warn_cache_failure_once(
                          "source message cache shard could not be saved; future scans may remain cold",
                          &final_path,
-@@ -4163,9 +4309,38 @@ impl SourceMessageCache {
+@@ -4163,9 +4387,39 @@ impl SourceMessageCache {
          state
              .rewrite_shards
              .retain(|shard| !successful_shards.contains(shard));
@@ -313,6 +412,7 @@ index 71be3b7..9b40621 100644
 +            .filter(|namespace| {
 +                !failed_namespaces.contains(*namespace)
 +                    && !unavailable_namespaces.contains(namespace)
++                    && !state.seed_failed_namespaces.contains(*namespace)
 +            })
 +            .collect();
 +        for namespace in seeded {
@@ -340,7 +440,7 @@ index 71be3b7..9b40621 100644
      }
  }
  
-@@ -4840,6 +5015,10 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
+@@ -4840,6 +5094,10 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
  enum ContentHashMode {
      Full,
      SamplesOnly,
@@ -351,7 +451,7 @@ index 71be3b7..9b40621 100644
  }
  
  fn file_fingerprint_parts(
-@@ -4861,6 +5040,7 @@ fn file_fingerprint_parts(
+@@ -4861,6 +5119,7 @@ fn file_fingerprint_parts(
          match mode {
              ContentHashMode::Full => hash_prefix(path, size)?,
              ContentHashMode::SamplesOnly => [0_u8; 32],
@@ -359,7 +459,7 @@ index 71be3b7..9b40621 100644
          }
      };
      Some((size, modified_ns, sample_hashes, content_hash))
-@@ -4872,6 +5052,27 @@ fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+@@ -4872,6 +5131,27 @@ fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
      PathBuf::from(os)
  }
  
@@ -387,7 +487,7 @@ index 71be3b7..9b40621 100644
  fn hash_prefix(path: &Path, len: u64) -> Option<[u8; 32]> {
      #[cfg(test)]
      FULL_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
-@@ -4914,7 +5115,7 @@ pub(crate) fn build_codex_incremental_cache(
+@@ -4914,7 +5194,7 @@ pub(crate) fn build_codex_incremental_cache(
          state,
          consumed_offset,
          ends_with_newline,
@@ -396,7 +496,7 @@ index 71be3b7..9b40621 100644
      })
  }
  
-@@ -4963,7 +5164,7 @@ pub(crate) fn codex_prefix_matches(path: &Path, cached: &CodexIncrementalCache)
+@@ -4963,7 +5243,7 @@ pub(crate) fn codex_prefix_matches(path: &Path, cached: &CodexIncrementalCache)
          return false;
      }
  
@@ -405,7 +505,7 @@ index 71be3b7..9b40621 100644
          Some(prefix_hash) => prefix_hash == cached.prefix_hash,
          None => false,
      }
-@@ -5075,7 +5276,9 @@ mod tests {
+@@ -5075,7 +5355,9 @@ mod tests {
          assert_eq!(cached.state.usage_event_ordinal, 1);
          assert!(cached.state.pending_usage_record.is_some());
          assert_eq!(cached.state.settled_usage_records.len(), 1);
@@ -416,7 +516,7 @@ index 71be3b7..9b40621 100644
  
          write_shard_with_limit(&shard, identity, &entries, MAX_CACHE_SHARD_BYTES).unwrap();
          let ShardReadStatus::Loaded(mut warm) = read_shard(&shard, identity) else {
-@@ -5573,6 +5776,7 @@ mod tests {
+@@ -5573,6 +5855,7 @@ mod tests {
              SOURCE_CACHE_ABORT_PATHS_ENV,
              SOURCE_CACHE_ABORT_MARKER_ENV,
              "TOKSCALE_CODEX_MAX_DECODED_BYTES",
@@ -424,7 +524,7 @@ index 71be3b7..9b40621 100644
          ]);
          env.set("HOME", temp_home);
          env.set("XDG_CONFIG_HOME", temp_home.join(".config"));
-@@ -5595,9 +5799,154 @@ mod tests {
+@@ -5595,9 +5878,309 @@ mod tests {
          env.remove(SOURCE_CACHE_ABORT_PATHS_ENV);
          env.remove(SOURCE_CACHE_ABORT_MARKER_ENV);
          env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
@@ -562,6 +662,161 @@ index 71be3b7..9b40621 100644
 +        ais_scope_set(None);
 +    }
 +
++    /// Shared Claude shards with a retained entry for a deleted transcript,
++    /// a live transcript and one more live transcript the scan never looks up.
++    fn ais_scope_claude_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
++        let identity = CacheIdentity::for_client(ClientId::Claude);
++        let root = dir.join("identity-a").join("projects");
++        std::fs::create_dir_all(&root).unwrap();
++        let live = root.join("live.jsonl");
++        let gone = root.join("gone.jsonl");
++        let unwalked = root.join("unwalked.jsonl");
++        for path in [&live, &gone, &unwalked] {
++            std::fs::write(path, b"{}\n").unwrap();
++        }
++        let mut retained = test_entry(identity, &gone, "gone");
++        retained.fallback_timestamp_indices = vec![0];
++        let mut shared = SourceMessageCache::load();
++        shared.insert(test_entry(identity, &live, "live"));
++        shared.insert(retained);
++        shared.insert(test_entry(identity, &unwalked, "unwalked"));
++        shared.save_if_dirty();
++        std::fs::remove_file(&gone).unwrap();
++        (root, live, gone, unwalked)
++    }
++
++    fn ais_scope_seed_once(root: &Path, live: &Path) -> usize {
++        let identity = CacheIdentity::for_client(ClientId::Claude);
++        let mut scoped = SourceMessageCache::load();
++        let _ = scoped.take(identity, live);
++        let history = scoped.missing_claude_history(&[root.to_path_buf()]).len();
++        scoped.save_if_dirty();
++        history
++    }
++
++    #[cfg(unix)]
++    #[test]
++    #[serial_test::serial]
++    fn ais_cache_scope_never_publishes_a_seed_when_the_shared_namespace_is_unreadable() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = TempDir::new().unwrap();
++        let _env = sandbox_cache_env(dir.path());
++        let (root, live, gone, unwalked) = ais_scope_claude_fixture(dir.path());
++        let shared_dir = cache_shard_dir().unwrap().join(ClientId::Claude.as_str());
++        ais_scope_set(Some("0c"));
++        let scoped_dir = scoped_shard_dir("0c").unwrap().join(ClientId::Claude.as_str());
++
++        std::fs::set_permissions(&shared_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
++        let readable = std::fs::read_dir(&shared_dir).is_ok(); // root ignores modes
++        let during = ais_scope_seed_once(&root, &live);
++        std::fs::set_permissions(&shared_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
++        if !readable {
++            assert_eq!(during, 0);
++            assert!(!scoped_dir.join(AIS_SCOPE_SEEDED_MARKER).exists());
++        }
++
++        // Readable again: the next scan seeds, keeping the retained history
++        // and the transcript no lookup reached.
++        assert_eq!(ais_scope_seed_once(&root, &live), 1);
++        assert!(scoped_dir.join(AIS_SCOPE_SEEDED_MARKER).is_file());
++        let mut expected = vec![gone, live, unwalked];
++        expected.sort();
++        assert_eq!(ais_scope_entries("0c", ClientId::Claude.as_str()), expected);
++        ais_scope_set(None);
++    }
++
++    #[test]
++    #[serial_test::serial]
++    fn ais_cache_scope_never_publishes_a_seed_over_an_invalid_shared_shard() {
++        let dir = TempDir::new().unwrap();
++        let _env = sandbox_cache_env(dir.path());
++        let (root, live, gone, _) = ais_scope_claude_fixture(dir.path());
++        let identity = CacheIdentity::for_client(ClientId::Claude);
++        let gone_shard = shard_path(
++            &cache_shard_dir().unwrap(),
++            &CacheKey::new(identity, &gone).shard(),
++        );
++        let original = std::fs::read(&gone_shard).unwrap();
++        std::fs::write(&gone_shard, b"not a shard").unwrap();
++        ais_scope_set(Some("0d"));
++        let scoped_dir = scoped_shard_dir("0d").unwrap().join(identity.namespace);
++        assert_eq!(ais_scope_seed_once(&root, &live), 0);
++        assert!(!scoped_dir.join(AIS_SCOPE_SEEDED_MARKER).exists());
++
++        std::fs::write(&gone_shard, original).unwrap();
++        assert_eq!(ais_scope_seed_once(&root, &live), 1);
++        assert!(scoped_dir.join(AIS_SCOPE_SEEDED_MARKER).is_file());
++        let warm = SourceMessageCache::load();
++        assert_eq!(warm.missing_claude_history(&[root]).len(), 1);
++        ais_scope_set(None);
++    }
++
++    #[test]
++    #[serial_test::serial]
++    fn ais_cache_scope_interrupted_seed_prefers_newer_shared_entries_and_retained_history() {
++        let dir = TempDir::new().unwrap();
++        let _env = sandbox_cache_env(dir.path());
++        let identity = CacheIdentity::for_client(ClientId::Claude);
++        let root = dir.path().join("identity-a").join("projects");
++        std::fs::create_dir_all(&root).unwrap();
++        let live = root.join("live.jsonl");
++        let gone = root.join("gone.jsonl");
++        std::fs::write(&live, b"{}\n").unwrap();
++        std::fs::write(&gone, b"{}\n").unwrap();
++
++        // The interrupted seed wrote an older copy of `live` and a copy of
++        // `gone` without retained history.
++        let stale_live = test_entry(identity, &live, "live-stale");
++        let mut plain_gone = test_entry(identity, &gone, "gone-plain");
++        // Provenance says this copy retains nothing, so once `gone` is
++        // deleted the scoped pass drops it as missing.
++        plain_gone.fallback_timestamp_indices = vec![CLAUDE_RETENTION_PROVENANCE_MARKER];
++        ais_scope_set(Some("0e"));
++        let scoped_root = scoped_shard_dir("0e").unwrap();
++        ensure_cache_dir(&scoped_root.join(identity.namespace)).unwrap();
++        for entry in [stale_live, plain_gone] {
++            let shard = CacheKey::from_entry(&entry).shard();
++            write_shard_with_limit(
++                &shard_path(&scoped_root, &shard),
++                identity,
++                &[entry],
++                MAX_CACHE_SHARD_BYTES,
++            )
++            .unwrap();
++        }
++
++        // Later the shared cache saw `live` grow and kept `gone`'s history.
++        std::thread::sleep(std::time::Duration::from_millis(20));
++        std::fs::write(&live, b"{}\n{}\n").unwrap();
++        let mut retained = test_entry(identity, &gone, "gone-retained");
++        retained.fallback_timestamp_indices = vec![0];
++        ais_scope_set(None);
++        let mut shared = SourceMessageCache::load();
++        shared.insert(test_entry(identity, &live, "live-newer"));
++        shared.insert(retained);
++        shared.save_if_dirty();
++        std::fs::remove_file(&gone).unwrap();
++
++        ais_scope_set(Some("0e"));
++        let mut scoped = SourceMessageCache::load();
++        assert_eq!(
++            scoped.take(identity, &live).unwrap().messages[0].session_id,
++            "live-newer"
++        );
++        let history = scoped.missing_claude_history(&[root.clone()]);
++        assert_eq!(history.len(), 1);
++        assert_eq!(history[0].messages[0].session_id, "gone-retained");
++        scoped.save_if_dirty();
++
++        let warm = SourceMessageCache::load();
++        assert_eq!(
++            warm.get(identity, &live).unwrap().messages[0].session_id,
++            "live-newer"
++        );
++        assert_eq!(warm.missing_claude_history(&[root]).len(), 1);
++        ais_scope_set(None);
++    }
++
 +    #[test]
 +    #[serial_test::serial]
 +    fn ais_cache_scope_rejects_values_that_are_not_lowercase_hex() {
@@ -579,7 +834,7 @@ index 71be3b7..9b40621 100644
      #[test]
      #[serial_test::serial]
      fn ais_shared_snapshot_claude_seed_preserves_history_for_only_matching_profile_and_is_idempotent(
-@@ -7531,7 +7880,7 @@ mod tests {
+@@ -7531,7 +8114,7 @@ mod tests {
              parser_version: 17,
              ..identity
          };
@@ -588,7 +843,7 @@ index 71be3b7..9b40621 100644
          // What v17 cached: the token_count row of turn 1 only. Its incremental
          // metadata is valid for the unchanged file, so generation v17 would
          // reuse this undercounted row instead of reparsing.
-@@ -7577,7 +7926,7 @@ mod tests {
+@@ -7577,7 +8160,7 @@ mod tests {
          )
          .unwrap();
  
@@ -597,7 +852,7 @@ index 71be3b7..9b40621 100644
          let options = crate::LocalParseOptions {
              home_dir: Some(temp_home.path().to_string_lossy().into_owned()),
              use_env_roots: false,
-@@ -7655,7 +8004,7 @@ mod tests {
+@@ -7655,7 +8238,7 @@ mod tests {
              parser_version: 18,
              ..identity
          };
@@ -606,7 +861,7 @@ index 71be3b7..9b40621 100644
          // What v18 cached: an intentionally wrong single-token row. Its incremental
          // metadata is valid for the unchanged file, so generation v18 would
          // reuse this undercounted row instead of reparsing.
-@@ -7697,7 +8046,7 @@ mod tests {
+@@ -7697,7 +8280,7 @@ mod tests {
          )
          .unwrap();
  
@@ -615,7 +870,7 @@ index 71be3b7..9b40621 100644
          let options = crate::LocalParseOptions {
              home_dir: Some(temp_home.path().to_string_lossy().into_owned()),
              use_env_roots: false,
-@@ -10185,6 +10534,49 @@ mod tests {
+@@ -10185,6 +10768,49 @@ mod tests {
          assert!(!codex_prefix_matches(file.path(), &incremental_cache));
      }
  

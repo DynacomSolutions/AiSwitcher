@@ -10,7 +10,7 @@ import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnaps
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
-import { aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage } from "./tokscale.ts";
+import { aisNativeSourceEnv, aisTokscaleCacheScope, sweepUnusedTokscaleCacheScopes, aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage } from "./tokscale.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
@@ -139,6 +139,8 @@ export interface UsageSnapshotDeps {
   nativeBatchRoot?: string;
   /** Test seam: the staging directory swept for dead exports at the start of a cycle. */
   nativeStagingRoot?: string;
+  /** Test seam: scoped Tokscale cache root swept of unused scopes (production sweeps the default root). */
+  tokscaleCacheScopeRoot?: string;
   now?: () => number;
   partitionTtlMs?: number;
   /** Interval between in-cycle heartbeat writes (default USAGE_SNAPSHOT_HEARTBEAT_INTERVAL_MS). */
@@ -765,10 +767,12 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   }
   delete partitions["special:discovery"];
   let poolTargets: UsageTarget[] = [];
+  let poolDiscoveryOk = false;
   try {
     poolTargets = (await (deps.collectPoolTargets ?? (() => collectTargets({}, undefined, { includePools: true })))())
       .filter((target) => target.toolName === "claude" && isSwapPool(target.identity));
     delete partitions["special:pool-discovery"];
+    poolDiscoveryOk = true;
   } catch {
     // Keep last-good pool partitions and make discovery failure visible.
     partitions["special:pool-discovery"] = {
@@ -777,6 +781,17 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     };
   }
   targets = targets.filter((target) => !isSwapPool(target.identity));
+  // Scoped Tokscale caches of sources that no longer exist would stay on disk
+  // for good. Only sweep with a complete picture of the live sources.
+  if ((deps.tokscaleCacheScopeRoot || deps.path === undefined) && poolDiscoveryOk && targets.length > 0) {
+    const live = new Set<string>();
+    for (const target of [...targets, ...poolTargets]) {
+      const sourceEnv = aisNativeSourceEnv(target.toolName, target.identity);
+      if (sourceEnv) live.add(aisTokscaleCacheScope(target.toolName, sourceEnv));
+    }
+    live.add(aisTokscaleCacheScope("opencode", aisNativeSourceEnv("opencode", undefined)!));
+    sweepUnusedTokscaleCacheScopes(live, deps.tokscaleCacheScopeRoot);
+  }
   for (const target of targets) {
     const key = targetKey(target);
     partitions[key] ??= { tool: target.toolName, identity: target.identity.name, nativeCoverage: "pending", results: [], lastAttemptAt: attemptedAt };
