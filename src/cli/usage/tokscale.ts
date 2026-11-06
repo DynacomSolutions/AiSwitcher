@@ -130,6 +130,10 @@ export interface AisTokscaleExportTarget {
   partitionId: string;
   exportPath: string;
   signal?: AbortSignal;
+  /** Digest of the messages in the batch AIS already holds for this
+   * partition. Identical messages are then reported as unchanged instead of
+   * written out again (vendor/tokscale README). */
+  previousMessagesSha256?: string;
 }
 
 export interface AisTokscaleExportInvocation {
@@ -195,6 +199,9 @@ export async function buildAisTokscaleExportInvocation(
       // A warm scan trusts an exact size and mtime match, so an unchanged
       // transcript is only stat'ed, never read (vendor/tokscale README).
       TOKSCALE_AIS_STAT_ONLY_CACHE: "1",
+      ...(target.previousMessagesSha256 && /^[a-f0-9]{64}$/.test(target.previousMessagesSha256)
+        ? { TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256: target.previousMessagesSha256 }
+        : {}),
     },
     cwd: process.cwd(),
     ...(target.signal ? { signal: target.signal } : {}),

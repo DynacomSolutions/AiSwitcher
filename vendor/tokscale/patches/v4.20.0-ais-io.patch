@@ -1,0 +1,473 @@
+diff --git a/crates/tokscale-cli/tests/cli_tests.rs b/crates/tokscale-cli/tests/cli_tests.rs
+index 845591c..4c114fa 100644
+--- a/crates/tokscale-cli/tests/cli_tests.rs
++++ b/crates/tokscale-cli/tests/cli_tests.rs
+@@ -2409,6 +2409,68 @@ fn ais_native_export_from_json_model_report_uses_report_parser_vector() {
+     assert!((report["totalCost"].as_f64().unwrap() - total_cost).abs() < 1e-9);
+ }
+ 
++#[test]
++fn ais_native_export_reports_unchanged_messages_instead_of_rewriting_the_batch() {
++    let tmp = create_codex_fixture_dir();
++    let partition_id = "b".repeat(64);
++    let run = |export_path: &std::path::Path, previous: Option<&str>| {
++        let mut command = cmd_with_home(tmp.path());
++        command
++            .env("TOKSCALE_AIS_EXPORT_PATH", export_path)
++            .env("TOKSCALE_AIS_PARTITION_ID", &partition_id)
++            .env(
++                "TOKSCALE_AIS_SOURCE_CONFIG_DIR",
++                tmp.path().join("original-tokscale-config"),
++            )
++            .args(["--json", "--client", "codex", "--no-spinner"]);
++        if let Some(previous) = previous {
++            command.env("TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256", previous);
++        }
++        let output = command.output().unwrap();
++        assert!(
++            output.status.success(),
++            "stderr: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++        let batch: serde_json::Value =
++            serde_json::from_slice(&fs::read(export_path).unwrap()).unwrap();
++        (report, batch)
++    };
++
++    let (first_report, first) = run(&tmp.path().join("first.json"), None);
++    let digest = first["messagesSha256"].as_str().unwrap().to_string();
++    assert_eq!(digest.len(), 64);
++    use sha2::Digest;
++    // The digest covers the `messages` array exactly as written: the last field.
++    let raw = fs::read(tmp.path().join("first.json")).unwrap();
++    let key = b"\"messages\":";
++    let start = raw.windows(key.len()).rposition(|window| window == key).unwrap() + key.len();
++    let messages = &raw[start..raw.len() - 1];
++    assert_eq!(
++        digest,
++        sha2::Sha256::digest(messages)
++            .iter()
++            .map(|byte| format!("{byte:02x}"))
++            .collect::<String>()
++    );
++
++    let (mut second_report, second) = run(&tmp.path().join("second.json"), Some(&digest));
++    let mut first_report = first_report;
++    for report in [&mut first_report, &mut second_report] {
++        report.as_object_mut().unwrap().remove("processingTimeMs");
++    }
++    assert_eq!(second["unchanged"], true);
++    assert_eq!(second["messagesSha256"], digest.as_str());
++    assert_eq!(second["partitionId"], partition_id);
++    assert!(second.get("messages").is_none() && second.get("complete").is_none());
++    assert_eq!(second_report, first_report, "the report is still printed in full");
++
++    let (_, third) = run(&tmp.path().join("third.json"), Some(&"0".repeat(64)));
++    assert_eq!(third["complete"], true);
++    assert_eq!(third["messages"], first["messages"]);
++}
++
+ #[test]
+ fn test_global_theme_flag() {
+     let mut cmd = cargo_bin_cmd!("tokscale");
+diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
+index afa34ef..f6f336c 100644
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -6537,6 +6537,52 @@ struct AisBatchEnvelope {
+     messages: Vec<UnifiedMessage>,
+ }
+ 
++/// What the exporter writes: the envelope above plus the digest of its
++/// `messages` array, borrowed rather than cloned.
++#[derive(serde::Serialize)]
++#[serde(rename_all = "camelCase")]
++struct AisBatchEnvelopeOut<'a> {
++    schema_version: u32,
++    partition_id: &'a str,
++    generated_at: &'a str,
++    complete: bool,
++    messages_sha256: &'a str,
++    messages: &'a [UnifiedMessage],
++}
++
++/// Written instead of a batch when the messages are byte-identical to the
++/// previous batch. It has no `complete` or `messages`, so a reader that
++/// expects a batch rejects it.
++#[derive(serde::Serialize)]
++#[serde(rename_all = "camelCase")]
++struct AisUnchangedEnvelope<'a> {
++    schema_version: u32,
++    partition_id: &'a str,
++    generated_at: &'a str,
++    unchanged: bool,
++    messages_sha256: &'a str,
++}
++
++struct Sha256Writer(sha2::Sha256);
++
++impl std::io::Write for Sha256Writer {
++    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++        sha2::Digest::update(&mut self.0, bytes);
++        Ok(bytes.len())
++    }
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++/// SHA-256 of the `messages` array exactly as the batch serializes it.
++fn ais_messages_sha256(messages: &[UnifiedMessage]) -> Result<String, String> {
++    let mut writer = Sha256Writer(sha2::Sha256::default());
++    serde_json::to_writer(&mut writer, messages).map_err(|e| format!("AIS batch digest: {e}"))?;
++    let digest = sha2::Digest::finalize(writer.0);
++    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
++}
++
+ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), String> {
+     let path = std::env::var_os("TOKSCALE_AIS_EXPORT_PATH");
+     let partition_id = std::env::var("TOKSCALE_AIS_PARTITION_ID").ok();
+@@ -6552,31 +6598,62 @@ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), Stri
+     let parent = path.parent().ok_or("AIS export path has no parent")?;
+     std::fs::create_dir_all(parent).map_err(|e| format!("AIS export directory: {e}"))?;
+     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+-    let envelope = AisBatchEnvelope {
+-        schema_version: 1,
+-        partition_id,
+-        generated_at,
+-        complete: true,
+-        messages: messages.to_vec(),
+-    };
+-    let bytes = serde_json::to_vec(&envelope).map_err(|e| format!("AIS batch encode: {e}"))?;
++    // AIS passes the digest of the batch it already holds. Identical messages
++    // need no second copy: a few hundred bytes replace a batch of up to
++    // hundreds of MB, and AIS keeps pointing at the batch it has.
++    let messages_sha256 = ais_messages_sha256(messages)?;
++    let unchanged = std::env::var("TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256")
++        .is_ok_and(|previous| previous == messages_sha256);
+     let temp = parent.join(format!(
+         ".ais-batch-{}-{}.tmp",
+         std::process::id(),
+         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+     ));
+     use std::io::Write;
+-    let mut file = std::fs::OpenOptions::new()
++    let file = std::fs::OpenOptions::new()
+         .write(true)
+         .create_new(true)
+         .open(&temp)
+         .map_err(|e| format!("AIS batch temp: {e}"))?;
+-    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+-        drop(file);
++    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
++    let encoded = if unchanged {
++        serde_json::to_writer(
++            &mut writer,
++            &AisUnchangedEnvelope {
++                schema_version: 1,
++                partition_id: &partition_id,
++                generated_at: &generated_at,
++                unchanged: true,
++                messages_sha256: &messages_sha256,
++            },
++        )
++    } else {
++        serde_json::to_writer(
++            &mut writer,
++            &AisBatchEnvelopeOut {
++                schema_version: 1,
++                partition_id: &partition_id,
++                generated_at: &generated_at,
++                complete: true,
++                messages_sha256: &messages_sha256,
++                messages,
++            },
++        )
++    };
++    let written = encoded
++        .map_err(|e| format!("AIS batch encode: {e}"))
++        .and_then(|_| writer.flush().map_err(|e| format!("AIS batch write: {e}")))
++        .and_then(|_| {
++            writer
++                .get_ref()
++                .sync_all()
++                .map_err(|e| format!("AIS batch write: {e}"))
++        });
++    drop(writer);
++    if let Err(error) = written {
+         let _ = std::fs::remove_file(&temp);
+-        return Err(format!("AIS batch write: {error}"));
++        return Err(error);
+     }
+-    drop(file);
+     std::fs::rename(&temp, &path).map_err(|e| {
+         let _ = std::fs::remove_file(&temp);
+         format!("AIS batch publish: {e}")
+diff --git a/crates/tokscale-core/src/sessions/claudecode.rs b/crates/tokscale-core/src/sessions/claudecode.rs
+index 4bcd7cb..2e1287b 100644
+--- a/crates/tokscale-core/src/sessions/claudecode.rs
++++ b/crates/tokscale-core/src/sessions/claudecode.rs
+@@ -456,6 +456,10 @@ pub(crate) struct ClaudeParse {
+ /// this parse read (`prefix_sha256`) and the messages handed back with the
+ /// checkpoint are the messages it produced (`message_digest`). Everything else
+ /// the parse loop carries from one line to the next is in `state`.
++///
++/// AIS: `prefix_sha256` is a sampled digest of the prefix (see
++/// `sampled_prefix_digest`), not a hash of every byte, so a resume reads a few
++/// hundred KiB instead of re-reading a multi-GB live transcript.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub(crate) struct ClaudeCheckpoint {
+     client_id: String,
+@@ -600,8 +604,8 @@ impl ClaudeFileContext {
+ /// Where `parse_claude_lines` starts: byte 0 with nothing parsed, or a
+ /// verified checkpoint with the messages produced before it.
+ struct ClaudeParseStart {
+-    /// `None` keeps the ordinary non-resumable parser off checkpoint work.
+-    prefix_hasher: Option<Sha256>,
++    /// `false` keeps the ordinary non-resumable parser off checkpoint work.
++    capture_checkpoint: bool,
+     consumed_offset: u64,
+     messages: Vec<UnifiedMessage>,
+     state: ClaudeParseState,
+@@ -609,6 +613,76 @@ struct ClaudeParseStart {
+ 
+ const CLAUDE_READ_BUFFER_BYTES: usize = 64 * 1024;
+ 
++const SAMPLED_PREFIX_DOMAIN: &[u8] = b"tokscale-ais-claude-sampled-prefix-v1\0";
++const SAMPLED_PREFIX_EDGE_BYTES: u64 = 64 * 1024;
++const SAMPLED_PREFIX_WINDOW_BYTES: u64 = 4 * 1024;
++const SAMPLED_PREFIX_WINDOWS: u64 = 32;
++
++/// AIS: the digest a checkpoint stores for the bytes before `len`.
++///
++/// It covers the first and the last 64 KiB before `len` and 32 evenly spaced
++/// 4 KiB windows between them (every byte when `len` is at most 256 KiB),
++/// plus `len` itself: at most 256 KiB read, however large the transcript.
++/// Upstream hashed the whole prefix, so each resume of a live multi-GB
++/// session re-read all of it.
++///
++/// Trade-off: a rewrite that changes only bytes outside every window, keeps
++/// the file at least `len` long and keeps its cache fingerprint moving is
++/// resumed instead of re-parsed. Claude Code appends to a session transcript
++/// and never edits earlier lines in place; a rewrite through a new file, a
++/// truncation, or any edit touching a window still forces the full parse.
++/// The domain prefix keeps an upstream full-prefix digest from ever matching,
++/// so a checkpoint from before this change is re-parsed once.
++fn sampled_prefix_digest(file: &std::fs::File, len: u64) -> Option<[u8; 32]> {
++    let mut hasher = Sha256::new();
++    hasher.update(SAMPLED_PREFIX_DOMAIN);
++    hasher.update(len.to_le_bytes());
++    let mut windows: Vec<(u64, u64)> = Vec::new();
++    if len <= 2 * SAMPLED_PREFIX_EDGE_BYTES + SAMPLED_PREFIX_WINDOWS * SAMPLED_PREFIX_WINDOW_BYTES {
++        windows.push((0, len));
++    } else {
++        windows.push((0, SAMPLED_PREFIX_EDGE_BYTES));
++        let middle_start = SAMPLED_PREFIX_EDGE_BYTES;
++        let middle_len = len - 2 * SAMPLED_PREFIX_EDGE_BYTES;
++        let stride = middle_len / SAMPLED_PREFIX_WINDOWS;
++        for index in 0..SAMPLED_PREFIX_WINDOWS {
++            windows.push((middle_start + index * stride, SAMPLED_PREFIX_WINDOW_BYTES.min(stride)));
++        }
++        windows.push((len - SAMPLED_PREFIX_EDGE_BYTES, SAMPLED_PREFIX_EDGE_BYTES));
++    }
++    let mut buffer = vec![0_u8; CLAUDE_READ_BUFFER_BYTES];
++    for (start, length) in windows {
++        hasher.update(start.to_le_bytes());
++        hasher.update(length.to_le_bytes());
++        let mut done = 0_u64;
++        while done < length {
++            let take = (length - done).min(buffer.len() as u64) as usize;
++            read_exact_at(file, &mut buffer[..take], start + done)?;
++            hasher.update(&buffer[..take]);
++            done += take as u64;
++        }
++    }
++    Some(hasher.finalize().into())
++}
++
++#[cfg(unix)]
++fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> Option<()> {
++    std::os::unix::fs::FileExt::read_exact_at(file, buffer, offset).ok()
++}
++
++#[cfg(windows)]
++fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> Option<()> {
++    let mut done = 0;
++    while done < buffer.len() {
++        let read = std::os::windows::fs::FileExt::seek_read(file, &mut buffer[done..], offset + done as u64).ok()?;
++        if read == 0 {
++            return None;
++        }
++        done += read;
++    }
++    Some(())
++}
++
+ /// Parse a transcript from its first byte, ending in a checkpoint when one is
+ /// safe to take.
+ pub(crate) fn parse_claude_file_with_checkpoint(
+@@ -659,24 +733,12 @@ pub(crate) fn resume_claude_file(
+         messages.get_mut(index)?.tokens.cache_write_1h = cache_write_1h;
+     }
+ 
+-    let mut reader = BufReader::with_capacity(CLAUDE_READ_BUFFER_BYTES, file);
+-    let mut prefix_hasher = Sha256::new();
+-    let mut remaining = checkpoint.consumed_offset;
+-    while remaining > 0 {
+-        let chunk = reader.fill_buf().ok()?;
+-        if chunk.is_empty() {
+-            return None;
+-        }
+-        let take = chunk
+-            .len()
+-            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+-        prefix_hasher.update(&chunk[..take]);
+-        reader.consume(take);
+-        remaining -= take as u64;
+-    }
+-    if prefix_hasher.clone().finalize()[..] != checkpoint.prefix_sha256[..] {
++    if sampled_prefix_digest(&file, checkpoint.consumed_offset)?[..] != checkpoint.prefix_sha256[..] {
+         return None;
+     }
++    let mut file = file;
++    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(checkpoint.consumed_offset)).ok()?;
++    let reader = BufReader::with_capacity(CLAUDE_READ_BUFFER_BYTES, file);
+ 
+     let mut parent_cache = ParentSubagentTypeCache::new();
+     Some(parse_claude_lines(
+@@ -684,7 +746,7 @@ pub(crate) fn resume_claude_file(
+         &context,
+         reader,
+         ClaudeParseStart {
+-            prefix_hasher: Some(prefix_hasher),
++            capture_checkpoint: true,
+             consumed_offset: checkpoint.consumed_offset,
+             messages,
+             state: checkpoint.state.clone(),
+@@ -742,7 +804,7 @@ fn parse_claude_file_internal(
+         &context,
+         BufReader::with_capacity(CLAUDE_READ_BUFFER_BYTES, file),
+         ClaudeParseStart {
+-            prefix_hasher: capture_checkpoint.then(Sha256::new),
++            capture_checkpoint,
+             consumed_offset: 0,
+             messages: Vec::with_capacity(64),
+             state: ClaudeParseState {
+@@ -793,7 +855,7 @@ fn parse_claude_lines(
+     let fallback_timestamp = context.fallback_timestamp;
+ 
+     let ClaudeParseStart {
+-        mut prefix_hasher,
++        capture_checkpoint,
+         mut consumed_offset,
+         mut messages,
+         state,
+@@ -849,9 +911,6 @@ fn parse_claude_lines(
+         match reader.read_until(b'\n', &mut raw_line) {
+             Ok(0) => break,
+             Ok(read) => {
+-                if let Some(prefix_hasher) = prefix_hasher.as_mut() {
+-                    prefix_hasher.update(&raw_line);
+-                }
+                 consumed_offset += read as u64;
+                 ends_with_newline = raw_line.last() == Some(&b'\n');
+             }
+@@ -1246,16 +1305,18 @@ fn parse_claude_lines(
+ 
+     // A last line without its newline may still be being written, so only a
+     // parse that ended on a complete line can be continued.
+-    let checkpoint = if checkpoint_blocked || !ends_with_newline {
++    let checkpoint = if checkpoint_blocked || !ends_with_newline || !capture_checkpoint {
+         None
+     } else {
+-        prefix_hasher.and_then(|prefix_hasher| {
++        // Sampled from the handle the parse read, so a file replaced at the
++        // same path since cannot lend this checkpoint its bytes.
++        sampled_prefix_digest(reader.get_ref(), consumed_offset).and_then(|prefix_sha256| {
+             let message_digest = claude_message_digest(&messages)?;
+             let mut checkpoint = ClaudeCheckpoint {
+                 client_id: client_id.clone(),
+                 metadata_provider_hint: context.metadata_provider_hint.clone(),
+                 consumed_offset,
+-                prefix_sha256: prefix_hasher.finalize().into(),
++                prefix_sha256,
+                 message_count: messages.len(),
+                 message_digest,
+                 integrity_digest: [0; 32],
+@@ -4946,6 +5007,75 @@ mod resume_tests {
+         assert_eq!(parsed.checkpoint, full.checkpoint);
+     }
+ 
++    /// AIS: a transcript well past the sampled-digest threshold, padded with
++    /// user lines that carry no usage.
++    fn large_prefix(dir: &TempDir) -> (std::path::PathBuf, usize) {
++        let path = transcript_path(dir);
++        let lines = fixture_lines();
++        append(&path, &lines[..3]);
++        let padding: Vec<Vec<u8>> = (0..400)
++            .map(|index| {
++                format!(
++                    "{{\"type\":\"user\",\"timestamp\":\"2026-10-01T10:00:02.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"pad-{index:04}-{}\"}}}}\n",
++                    "p".repeat(2000)
++                )
++                .into_bytes()
++            })
++            .collect();
++        append(&path, &padding);
++        append(&path, &lines[3..6]);
++        (path, std::fs::metadata(dir.path().join(".claude/projects/-tmp-demo/session.jsonl")).unwrap().len() as usize)
++    }
++
++    #[test]
++    fn ais_sampled_prefix_resume_of_a_large_transcript_matches_a_full_parse() {
++        let lines = fixture_lines();
++        let dir = TempDir::new().unwrap();
++        let (path, size) = large_prefix(&dir);
++        assert!(size > 512 * 1024, "the prefix is past the sampled threshold");
++        let first = parse_claude_file_with_checkpoint(&path, None);
++        let checkpoint = first.checkpoint.clone().expect("a complete prefix checkpoints");
++        append(&path, &lines[6..]);
++        let resumed = resume_claude_file(&path, None, &checkpoint, &first.messages)
++            .expect("an appended transcript resumes");
++        let full = parse_claude_file_with_checkpoint(&path, None);
++        assert_eq!(resumed.messages, full.messages);
++        assert_eq!(resumed.checkpoint, full.checkpoint);
++    }
++
++    #[test]
++    fn ais_sampled_prefix_refuses_an_edit_inside_a_sampled_window() {
++        let lines = fixture_lines();
++        // The first bytes, the last 64 KiB before the checkpoint, and a middle window.
++        for edit_at in [10_usize, usize::MAX, 64 * 1024] {
++            let dir = TempDir::new().unwrap();
++            let (path, size) = large_prefix(&dir);
++            let first = parse_claude_file_with_checkpoint(&path, None);
++            let checkpoint = first.checkpoint.clone().unwrap();
++            let mut bytes = std::fs::read(&path).unwrap();
++            let at = if edit_at == usize::MAX { size - 100 } else { edit_at };
++            // Swap one letter for another of the same width.
++            bytes[at] = if bytes[at] == b'q' { b'r' } else { b'q' };
++            std::fs::write(&path, &bytes).unwrap();
++            append(&path, &lines[6..]);
++            assert!(
++                resume_claude_file(&path, None, &checkpoint, &first.messages).is_none(),
++                "an edit at byte {at} forces the full parse"
++            );
++        }
++    }
++
++    #[test]
++    fn ais_sampled_prefix_digest_never_matches_a_full_prefix_hash() {
++        let dir = TempDir::new().unwrap();
++        let path = transcript_path(&dir);
++        append(&path, &fixture_lines()[..5]);
++        let file = std::fs::File::open(&path).unwrap();
++        let len = file.metadata().unwrap().len();
++        let full: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
++        assert_ne!(sampled_prefix_digest(&file, len).unwrap(), full);
++    }
++
+     #[test]
+     fn test_resume_refuses_a_rewritten_prefix_a_truncation_and_an_unchanged_file() {
+         let lines = fixture_lines();

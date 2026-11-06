@@ -38,10 +38,31 @@ The patch adds three AIS-only surfaces:
   and recorded again, and a subagent without a named type still follows its
   parent. With `TOKSCALE_AIS_STAT_ONLY_CACHE=1`, an exact size and
   nanosecond mtime match is a cache hit without reading the bounded content
-  samples, so an unchanged transcript is only stat'ed. Appended transcripts
-  still resume from their checkpoint (the cached prefix is re-hashed, then only
-  the new bytes are parsed), and changed files are re-parsed. Claude's
-  retained history for deleted transcripts is unchanged upstream behaviour.
+  samples, so an unchanged transcript is only stat'ed. Appended Claude
+  transcripts resume from their checkpoint and only the new bytes are parsed;
+  changed files are re-parsed. Claude's retained history for deleted
+  transcripts is unchanged upstream behaviour.
+
+- Resuming an appended Claude transcript reads at most 256 KiB of its prefix
+  (`patches/v4.20.0-ais-io.patch`). Upstream re-hashed the whole cached prefix
+  on every resume, which re-read multi-GB live sessions on every scan. The
+  checkpoint now stores a sampled digest: the prefix length, its first and
+  last 64 KiB, and 32 evenly spaced 4 KiB windows between them (every byte
+  of a prefix up to 256 KiB). Trade-off: an in-place edit that touches no
+  sampled window, keeps the file at least as long and changes its size or
+  mtime is resumed instead of re-parsed. Claude Code only appends to a session
+  transcript; a rewrite through a new file, a truncation or an edit inside a
+  window still forces the full parse. Checkpoints written before this change
+  never match the new digest, so each growing transcript is re-parsed once.
+  Codex resumes still hash their whole prefix.
+
+- The export envelope carries `messagesSha256`, the SHA-256 of its `messages`
+  array as written. When AIS passes the digest of the batch it already holds
+  in `TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256` and the messages are identical,
+  the exporter writes a small `{"unchanged": true, "messagesSha256": ...}`
+  envelope (no `complete`, no `messages`, so no batch reader accepts it)
+  instead of a second copy of the batch. The `--json` report is printed as
+  usual.
 
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
@@ -59,7 +80,7 @@ bash scripts/build-tokscale-ais.sh
 ```
 
 The helper downloads only the pinned release archive, verifies its checksum and
-licence, applies `patches/v4.20.0-ais.patch`, and installs to
+licence, applies `patches/v4.20.0-ais.patch` and then `patches/v4.20.0-ais-io.patch`, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -345,6 +346,59 @@ function asyncFixtureDeps(fixture: FsFixture, chunkSize?: number, chunkDelayMs =
 }
 
 describe("readIdentityLocalSpendAsync", () => {
+  test("the record cache skips unchanged rollouts, re-reads changed ones and matches an uncached read", async () => {
+    const { configDir, periodStart } = await makeCodexTree(3);
+    const recordCachePath = join(configDir, "cache", "records.json");
+    const reads: string[] = [];
+    const counting = { recordCachePath, readTextChunks: (path: string) => { reads.push(path); return fileTextChunks(path); } };
+    const cold = await readIdentityLocalSpendAsync("codex", configDir, periodStart);
+    expect(JSON.stringify(await readIdentityLocalSpendAsync("codex", configDir, periodStart, counting))).toBe(JSON.stringify(cold));
+    expect(reads).toHaveLength(3);
+    const written = (await stat(recordCachePath, { bigint: true })).mtimeNs;
+
+    reads.length = 0;
+    expect(JSON.stringify(await readIdentityLocalSpendAsync("codex", configDir, periodStart, counting))).toBe(JSON.stringify(cold));
+    expect(reads).toEqual([]);
+    expect((await stat(recordCachePath, { bigint: true })).mtimeNs).toBe(written);
+
+    const changed = (await readdir(join(configDir, "sessions"), { recursive: true })).find((name) => name.endsWith("rollout-1.jsonl"))!;
+    await appendFile(join(configDir, "sessions", changed), `${JSON.stringify({ timestamp: new Date(Date.now() - 5_000).toISOString(), type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 3, output_tokens: 2 } } } })}\n`);
+    const fresh = await readIdentityLocalSpendAsync("codex", configDir, periodStart);
+    expect(JSON.stringify(await readIdentityLocalSpendAsync("codex", configDir, periodStart, counting))).toBe(JSON.stringify(fresh));
+    expect(reads).toEqual([join(configDir, "sessions", changed)]);
+    expect(fresh.messages).toBe(cold.messages + 1);
+  });
+
+  test("a same-size rewrite with its mtime restored is still re-read", async () => {
+    const { configDir, periodStart } = await makeCodexTree(2);
+    const recordCachePath = join(configDir, "cache", "records.json");
+    await readIdentityLocalSpendAsync("codex", configDir, periodStart, { recordCachePath });
+    const name = (await readdir(join(configDir, "sessions"), { recursive: true })).find((entry) => entry.endsWith("rollout-1.jsonl"))!;
+    const path = join(configDir, "sessions", name);
+    const reference = join(configDir, "mtime-reference");
+    execFileSync("cp", ["-p", path, reference]);
+    const before = await readFile(path, "utf8");
+    const after = before.replace('"output_tokens":50', '"output_tokens":90');
+    expect(after).not.toBe(before);
+    expect(after.length).toBe(before.length);
+    await writeFile(path, after);
+    execFileSync("touch", ["-r", reference, path]);
+    const was = await stat(reference, { bigint: true });
+    const now = await stat(path, { bigint: true });
+    expect([now.size, now.mtimeNs]).toEqual([was.size, was.mtimeNs]);
+    const cold = await readIdentityLocalSpendAsync("codex", configDir, periodStart);
+    expect(JSON.stringify(await readIdentityLocalSpendAsync("codex", configDir, periodStart, { recordCachePath }))).toBe(JSON.stringify(cold));
+  });
+
+  test("a corrupt record cache is ignored and replaced", async () => {
+    const { configDir, periodStart } = await makeCodexTree(2);
+    const recordCachePath = join(configDir, "records.json");
+    await writeFile(recordCachePath, "{not json");
+    const cold = await readIdentityLocalSpendAsync("codex", configDir, periodStart);
+    expect(JSON.stringify(await readIdentityLocalSpendAsync("codex", configDir, periodStart, { recordCachePath }))).toBe(JSON.stringify(cold));
+    expect(JSON.parse(await readFile(recordCachePath, "utf8")).schemaVersion).toBe(1);
+  });
+
   test("matches the sync reader exactly on the same on-disk month-to-date tree (default chunked reader)", async () => {
     const { configDir, periodStart } = await makeCodexTree(3);
     const sync = readIdentityLocalSpend("codex", configDir, periodStart);

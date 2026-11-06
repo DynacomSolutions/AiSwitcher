@@ -152,6 +152,34 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
   row). PATH/bunx Tokscale remains only for `ais usage <tokscale args>`
   passthrough (other than `tui`).
 
+- **Collector disk I/O: a cycle reads and writes what changed, not the
+  history (2026-11-06).** Measured live before this change, a pool cycle read
+  about 19 GB (mostly page cache, 1.8 GB from disk) and wrote 0.8 GB, because
+  appended multi-GB Claude transcripts were read whole three times. The rules:
+  - Swap-pool attribution (`claude-swap/attribution.ts`) keeps a schema-2
+    cache: a small index (`<key>.v2.json`) plus one append-only hits log per
+    transcript (`<key>.v2.json.d/`). An unchanged transcript is not opened, a
+    grown one is read from its last newline, and only new hits are appended.
+    Resume safety is a sampled check (same inode, not shorter than the
+    offset, which may lie past the pre-read stat size of a file that grew
+    mid-read, SHA-256 of the
+    first 4 KiB and the 64 KiB before the offset); see `CachedUsageFile` for
+    the trade-off. Schema-1 hits of unchanged files are adopted once.
+  - Claude checkpoint resumes in the patched Tokscale verify a sampled prefix
+    digest (at most 256 KiB read), not a full-prefix hash
+    (`vendor/tokscale/README.md`).
+  - Each committed batch records `messagesSha256` and its `bucketTimezone`.
+    The next export passes the digest; identical messages come back as a
+    small `unchanged` envelope, the partition keeps its batch pointer and
+    daily figures, and nothing is promoted or read back. The digest is offered
+    (and an `unchanged` answer accepted) only while the batch file keeps the
+    size and mtime recorded at promotion.
+  - Codex Bedrock partitions read their all-time rollouts through a per-file
+    record cache (`usage/local-spend/`), keyed on dev, inode, size, mtime and ctime.
+  - Totals stay those of a cold scan: every shortcut is either exact (an
+    unchanged file, an append of whole lines, byte-identical messages) or
+    falls back to the full read.
+
 - **`ais usage breakdown` answers WHAT consumed the tokens, per tool call
   (2026-09-10).** tokscale aggregates per model; breakdown.ts
   (`src/cli/usage/breakdown.ts`) re-reads the same local logs one level
