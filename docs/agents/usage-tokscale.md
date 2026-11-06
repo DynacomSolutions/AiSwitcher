@@ -176,6 +176,21 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     size and mtime recorded at promotion.
   - Codex Bedrock partitions read their all-time rollouts through a per-file
     record cache (`usage/local-spend/`), keyed on dev, inode, size, mtime and ctime.
+  - Each native export passes its partition id as `TOKSCALE_AIS_CACHE_SCOPE`,
+    so Tokscale keeps one message cache per partition
+    (`isolated-config/cache/source-message-cache-v2-ais-scope/<id>/`) and an
+    export loads and rewrites only its own entries. Measured live on 7 Nov
+    2026 before this change, every Claude export read the whole 611 MB Claude
+    namespace and every Codex export the 337 MB Codex one, even for an
+    unchanged identity: about 8 GB of the roughly 10 GB a full round read.
+    Each scope seeds itself once from the shared shards (see
+    `vendor/tokscale/README.md`).
+  - Codex resumes and Codex fingerprints use the sampled digest, as Claude
+    checkpoints do, instead of hashing the whole rollout.
+  - Still open: a changed batch (the swap pool, about 480 MB) is written whole
+    and read back each cycle, which is most of the collector's disk writes,
+    and the Grok reader re-reads its whole session tree (about 0.9 GB per
+    round) while a session is active.
   - Totals stay those of a cold scan: every shortcut is either exact (an
     unchanged file, an append of whole lines, byte-identical messages) or
     falls back to the full read.

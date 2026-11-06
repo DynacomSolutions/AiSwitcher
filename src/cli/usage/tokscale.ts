@@ -196,6 +196,10 @@ export async function buildAisTokscaleExportInvocation(
       TOKSCALE_CONFIG_DIR: aisNativeTokscaleConfigDir(),
       TOKSCALE_AIS_EXPORT_PATH: target.exportPath,
       TOKSCALE_AIS_PARTITION_ID: target.partitionId,
+      // One message-cache scope per partition: an export reads and rewrites
+      // only its own identity's cache entries, not the whole namespace
+      // (vendor/tokscale README).
+      TOKSCALE_AIS_CACHE_SCOPE: target.partitionId,
       // A warm scan trusts an exact size and mtime match, so an unchanged
       // transcript is only stat'ed, never read (vendor/tokscale README).
       TOKSCALE_AIS_STAT_ONLY_CACHE: "1",
