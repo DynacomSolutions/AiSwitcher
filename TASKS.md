@@ -84,7 +84,7 @@ ETA: 2026-10-28 02:30 ICT
 | 96 | Ignore retired identity partitions in usage snapshot freshness | done | | | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/313 (`2770df9`); released v0.5.23, installed on host.<br>Web pod rolled to `2770df9` via .cluster #1884; `/api/usage` stale false, retired identities still in totals. |
 
 ## 2. Live USB
-ETA: 2026-10-23 18:00 ICT
+ETA: 2026-11-14 18:00 ICT
 
 UK 16:00 BST on 2026-10-24; owner check after.
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -118,7 +118,7 @@ ETA: 2026-11-07 18:00 ICT
 | 98 | Fix main CI: spend guard canary and Host app Browser smoke | done | claude-20261031-main-ci-red | main-ci-red | | 2026-10-31 23:30 ICT | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/319 (b9e97f3).<br>Canary tests now use the Bun binary as `codex`; @playwright/test 1.58.2 to 1.64.1 for ubuntu26.04.<br>All PR 319 checks green. |
 
 ## 4. AIS AI Gateway for cluster apps
-ETA: 2026-11-05 18:00 ICT
+ETA: 2026-11-14 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -145,7 +145,7 @@ ETA: 2026-11-05 18:00 ICT
 | 131 | Gateway: native rate-limit responses for auto-resume | done | claude-20261106-gw-native-limits | gateway-native-limits | 4.128 | | Was 129 (clash with #382 and #383).<br>Pool exhausted or pinned over reserve: claude apps get the Anthropic 429 rate_limit_error plus unified headers (earliest member reset), codex apps get usage_limit_reached with resets_at; a real upstream 429 passes through unchanged. Merged PR #384 (eeec197); cluster pod runs ais-console@sha256:750aa970e634 (created after the merge). No release needed (local.ts unchanged).<br>Finding: an API-key session (apiKeyHelper) shows the retry countdown only when retry-after is 60 s or less; the wait menu needs a subscriber-mode session (OAuth credentials). |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-06 18:00 ICT
+ETA: 2026-11-14 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -159,7 +159,7 @@ ETA: 2026-11-06 18:00 ICT
 | 126 | Native daily usage: exporter zone, chrono-tz names, patched-binary fixture, dead bunx code | in_review | claude-20261106-usage-daily-zone | ais-usage-daily-zone | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/378.<br>Review follow-up to 5.125: L1 zone source, L2 zone names, L3 fixture; removes the bunx report path. |
 
 ## 6. Browser control extension
-ETA: 2026-11-06 18:00 ICT
+ETA: 2026-11-14 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -168,7 +168,7 @@ ETA: 2026-11-06 18:00 ICT
 | 122 | Install on Mac and pair profiles | blocked_on_owner | Thomas | | 6.121 | | ais update (needs 0.5.24)<br>ais browser extension update<br>chrome://extensions: Developer mode, Load unpacked ~/.ais/browser-extension, each profile<br>Options: wss:// gateway URL, Sign in<br>Approve code on the gateway host: ais browser approve CODE --pool=NAME or --identity=ID |
 
 ## 7. Profile-sync watcher CPU on shared hosts
-ETA: 2026-11-06 18:00 ICT
+ETA: 2026-11-14 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
