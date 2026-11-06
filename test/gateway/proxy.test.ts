@@ -437,7 +437,86 @@ describe("failover and refresh", () => {
     expect(r[0]).toMatchObject({ identity: "b", httpStatus: 200 });
   });
 
-  test("failover happens at most once", async () => {
+  test("fails over through every member until one succeeds", async () => {
+    deps.poolMembers = async () => ["a", "b", "c", "d"];
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    usage.c = live(30);
+    usage.d = live(40);
+    handler = (_req, s) =>
+      s.headers.get("authorization") === "Bearer tok-d"
+        ? new Response(anthropicJson, { headers: { "content-type": "application/json" } })
+        : new Response("{}", { status: 429, headers: { "content-type": "application/json" } });
+    const body = JSON.stringify({ model: "claude-sonnet-4-5", n: 2 });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body });
+    expect(res.status).toBe(200);
+    expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b", "Bearer tok-c", "Bearer tok-d"]);
+    for (const x of seen) expect(Buffer.from(x.body).toString()).toBe(body);
+    expect((await rows())[0]).toMatchObject({ identity: "d", httpStatus: 200 });
+  });
+
+  test("first 429 then second serves: the client sees 200", async () => {
+    deps.poolMembers = async () => ["first", "second"];
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.first = live(10);
+    usage.second = live(20);
+    handler = (_req, s) =>
+      s.headers.get("authorization")?.endsWith("-first")
+        ? new Response("{}", { status: 429, headers: { "content-type": "application/json" } })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(res.status).toBe(200);
+    expect((await rows())[0]).toMatchObject({ identity: "second", httpStatus: 200 });
+  });
+
+  test("an exhausted member is skipped until its reset, then tried again", async () => {
+    let clock = NOW.getTime();
+    deps.now = () => new Date(clock);
+    const gw = createGatewayApp(deps);
+    const call = (path: string, token: string, init: RequestInit) => (async () => { const r = await gw.request(`http://gw.test${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); })();
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    const resetAt = Math.floor((clock + 120_000) / 1000);
+    handler = (_req, s) =>
+      s.headers.get("authorization") === "Bearer tok-a"
+        ? new Response("{}", { status: 429, headers: { "content-type": "application/json", "anthropic-ratelimit-unified-reset": String(resetAt) } })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    expect((await call("/pool/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
+    expect(seen.length).toBe(2);
+    seen.length = 0;
+    expect((await call("/pool/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
+    expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock += 121_000;
+    expect((await call("/pool/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
+    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+  });
+
+  test("exhaustion without reset headers lasts five minutes", async () => {
+    let clock = NOW.getTime();
+    deps.now = () => new Date(clock);
+    const gw = createGatewayApp(deps);
+    const call = (path: string, token: string, init: RequestInit) => (async () => { const r = await gw.request(`http://gw.test${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); })();
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    usage.a = live(10);
+    usage.b = live(20);
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    seen.length = 0;
+    clock += 4 * 60_000;
+    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock += 61_000;
+    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+  });
+
+  test("all members exhausted gives one 429 with a reason in the log", async () => {
+    const gw = createGatewayApp(deps);
+    const call = (path: string, token: string, init: RequestInit) => (async () => { const r = await gw.request(`http://gw.test${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); })();
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
     usage.a = live(10);
     usage.b = live(20);
@@ -446,6 +525,19 @@ describe("failover and refresh", () => {
     expect(res.status).toBe(429);
     expect(seen.length).toBe(2);
     expect((await rows()).length).toBe(1);
+    seen.length = 0;
+    const again = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(again.status).toBe(429);
+    expect(seen.length).toBe(0);
+    expect(logs.some((l) => l.includes('"reason":"no-headroom:exhausted"'))).toBe(true);
+  });
+
+  test("a member at 100% is skipped even with reserve 100", async () => {
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" }, reservePercent: 100 }));
+    usage.a = { ...live(10), windows: [{ label: "seven-day", utilization: 100 }] };
+    usage.b = live(99.5);
+    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-b");
   });
 
   test("429 on a pinned app passes through without failover", async () => {

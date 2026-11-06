@@ -370,8 +370,9 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   });
   const log = deps.log ?? defaultLog;
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
+  const exhausted = new Map<string, number>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -381,7 +382,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -427,7 +428,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   };
   const identityForRow = app.target.kind === "pin" ? await canon(app.target.identity) : "-";
   let recorded = false;
-  const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string): void => {
+  const record = (identity: string, status: string, httpStatus: number, counts: UsageCounts | undefined, streamed: boolean, tap?: string, model?: string, reason?: string): void => {
     if (recorded) return;
     recorded = true;
     const latencyMs = Math.round(performance.now() - started);
@@ -452,13 +453,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     try {
       deps.ledger.push(row);
       deps.metrics.request({ app: app.name, provider: app.provider, identity, status, httpStatus, latencyMs, ...(counts ? { tokens: c } : {}) });
-      log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}) }));
+      log(JSON.stringify({ event: "request", app: app.name, provider: app.provider, identity, status, http: httpStatus, ...(tap ? { tap } : {}), ...(reason ? { reason } : {}) }));
     } catch {
       // Observation must never affect the response.
     }
   };
-  const reject = (status: number, message: string, identity = identityForRow, model?: string): Response => {
-    record(identity, "rejected", status, undefined, false, undefined, model);
+  const reject = (status: number, message: string, identity = identityForRow, model?: string, reason?: string): Response => {
+    record(identity, "rejected", status, undefined, false, undefined, model, reason);
     return providerError(style, status, message);
   };
 
@@ -526,13 +527,24 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   if (!("ok" in caps)) {
     deps.metrics.rejection(app.name, caps.status === 403 ? "model" : "daily_cap");
   }
-  if (!("ok" in caps)) return reject(caps.status, caps.reason, identityForRow, model);
+  if (!("ok" in caps)) return reject(caps.status, caps.reason, identityForRow, model, caps.status === 403 ? "model" : "daily_cap");
 
-  const pick = await pickIdentity(app, deps);
+  const nowMs = deps.now().getTime();
+  const exKey = (name: string): string => `${app.provider}\u0000${name}`;
+  /** Pool members still marked exhausted (their reset has not passed). */
+  const exhaustedNames = (): Set<string> => {
+    const out = new Set<string>();
+    for (const [k, until] of exhausted) {
+      if (until <= deps.now().getTime()) exhausted.delete(k);
+      else if (k.startsWith(`${app.provider}\u0000`)) out.add(k.slice(app.provider.length + 1));
+    }
+    return out;
+  };
+  const pick = await pickIdentity(app, deps, app.target.kind === "pool" ? exhaustedNames() : undefined);
   if ("reject" in pick) {
     deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
     const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
-    return reject(429, why, identityForRow, model);
+    return reject(429, why, identityForRow, model, pick.reject === "no-headroom" && app.target.kind === "pool" && exhaustedNames().size > 0 ? "no-headroom:exhausted" : pick.reject);
   }
 
   const upstreamUrl = adapter.upstreamBase(style) + rest + url.search;
@@ -587,23 +599,35 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (app.target.kind === "pool" && replayable) {
       const q = await isQuota(up);
       up = q.res;
-      if (q.quota) {
-        const next = await pickIdentity(app, deps, identity);
-        if ("identity" in next) {
-          // If the second identity cannot even be tried, the client gets the original upstream answer.
-          try {
-            const second = await attempt(next.identity);
+      // Every quota answer before the first byte marks that member exhausted until its reset, then the next
+      // eligible member gets the replayed body, until one answers or none is left (the last answer then stands).
+      const tried = new Set<string>();
+      let name = pick.identity;
+      let quota = q.quota;
+      while (quota) {
+        tried.add(name);
+        if (up.status === 429 || up.status === 402 || up.status === 403) exhausted.set(exKey(name), exhaustedUntil(up.headers, deps.now().getTime()));
+        const next = await pickIdentity(app, deps, new Set([...exhaustedNames(), ...tried]));
+        if (!("identity" in next)) break;
+        name = next.identity;
+        // If the next identity cannot even be tried, it is skipped; the client keeps the last upstream answer.
+        let second: Response;
+        try {
+          second = await attempt(next.identity);
+        } catch {
+          if (req.signal.aborted || ctrl.signal.aborted) {
             await discard(up);
-            deps.metrics.failover(app.name);
-            up = second;
-            identity = await canon(next.identity);
-          } catch {
-            if (req.signal.aborted || ctrl.signal.aborted) {
-              await discard(up);
-              throw new DOMException("aborted", "AbortError");
-            }
+            throw new DOMException("aborted", "AbortError");
           }
+          tried.add(name);
+          continue;
         }
+        const sq = await isQuota(second);
+        await discard(up);
+        deps.metrics.failover(app.name);
+        up = sq.res;
+        identity = await canon(next.identity);
+        quota = sq.quota;
       }
     }
   } catch (err) {
@@ -676,6 +700,26 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   req.signal.addEventListener("abort", () => finish("client_aborted"), { once: true });
   return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
   }
+}
+
+const EXHAUSTED_DEFAULT_MS = 5 * 60_000;
+const EXHAUSTED_MAX_MS = 7 * 24 * 3_600_000;
+
+/** Epoch ms until which a member that answered a quota error counts as exhausted: its reset header, else five minutes. */
+export function exhaustedUntil(headers: Headers, nowMs: number): number {
+  const candidates: number[] = [];
+  const unified = Number(headers.get("anthropic-ratelimit-unified-reset") ?? "");
+  const iso = Date.parse(headers.get("anthropic-ratelimit-unified-reset") ?? "");
+  if (Number.isFinite(unified) && unified > 0) candidates.push(unified < 1e11 ? unified * 1000 : unified);
+  else if (Number.isFinite(iso)) candidates.push(iso);
+  const retry = headers.get("retry-after");
+  if (retry !== null) {
+    const secs = Number(retry);
+    if (retry.trim() !== "" && Number.isFinite(secs) && secs >= 0) candidates.push(nowMs + secs * 1000);
+    else if (Number.isFinite(Date.parse(retry))) candidates.push(Date.parse(retry));
+  }
+  const valid = candidates.filter((t) => t > nowMs && t <= nowMs + EXHAUSTED_MAX_MS);
+  return valid.length > 0 ? Math.max(...valid) : nowMs + EXHAUSTED_DEFAULT_MS;
 }
 
 /**
