@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { readdir as readdirAsync, stat as statAsync } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir as mkdirAsync, readdir as readdirAsync, readFile as readFileAsync, rename as renameAsync, stat as statAsync, unlink as unlinkAsync, writeFile as writeFileAsync } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { ToolConfig } from "../identities/types.ts";
 import { estimateBedrockTokenCost, unknownBedrockModelFallbackPrice } from "../identities/model-pricing.ts";
 import { localDateKey } from "../cli/usage/local-day.ts";
@@ -529,6 +529,10 @@ export interface AsyncLocalEstimateDeps {
   /** Also report `usdSince`: the estimate over records on/after this epoch-ms
    * cut-off, without narrowing the read itself. */
   usdSinceMs?: number;
+  /** Persistent per-file record cache. A file whose device, inode, size and
+   * mtime are unchanged is not read again; its parsed records come from here.
+   * Only rewritten when an entry changed. */
+  recordCachePath?: string;
 }
 
 function defaultReaddirAsync(path: string): Promise<string[]> {
@@ -686,15 +690,77 @@ export async function readIdentityLocalSpendAsync(
   const readTextChunks = deps.readTextChunks ?? fileTextChunks;
   const periodStartMs = periodStart.getTime();
   const records: UsageRecord[] = [];
+  const cache = deps.recordCachePath ? await readRecordCache(deps.recordCachePath, toolName) : undefined;
+  const nextCache: RecordCache = { schemaVersion: 1, tool: toolName, files: {} };
+  let cacheChanged = cache === undefined;
   for (const file of files) {
     try {
-      records.push(...filterPeriod(await collectRecordsFromChunks(file, scanner, readTextChunks), periodStartMs));
+      const fingerprint = cache ? await fileFingerprint(file).catch(() => undefined) : undefined;
+      const cached = fingerprint !== undefined ? cache?.files[file] : undefined;
+      let fileRecords: UsageRecord[];
+      if (cached && cached.fingerprint === fingerprint) {
+        fileRecords = cached.records;
+      } else {
+        fileRecords = await collectRecordsFromChunks(file, scanner, readTextChunks);
+        cacheChanged = true;
+      }
+      // Cached under the stat taken before the read: a file still being
+      // written no longer matches it next time and is read again.
+      if (fingerprint !== undefined) nextCache.files[file] = { fingerprint, records: fileRecords };
+      records.push(...filterPeriod(fileRecords, periodStartMs));
     } catch {
       // A file that vanished or became unreadable mid-read still leaves the
       // rest of the estimate intact.
     }
   }
+  if (cache && Object.keys(cache.files).length !== Object.keys(nextCache.files).length) cacheChanged = true;
+  if (deps.recordCachePath && cacheChanged) await writeRecordCache(deps.recordCachePath, nextCache);
   return reduceLocalSpendRead(records, files.length, deps.usdSinceMs);
+}
+
+interface RecordCache {
+  schemaVersion: 1;
+  tool: string;
+  files: Record<string, { fingerprint: string; records: UsageRecord[] }>;
+}
+
+async function fileFingerprint(path: string): Promise<string> {
+  const info = await statAsync(path, { bigint: true });
+  return [info.dev, info.ino, info.size, info.mtimeNs].map(String).join(":");
+}
+
+function validUsageRecord(value: unknown): value is UsageRecord {
+  const record = value as Partial<UsageRecord> | null;
+  return !!record && typeof record === "object" && typeof record.model === "string" &&
+    [record.input, record.output, record.cacheRead, record.cacheWrite].every((n) => typeof n === "number" && Number.isFinite(n)) &&
+    (record.atMs === undefined || (typeof record.atMs === "number" && Number.isFinite(record.atMs)));
+}
+
+/** An unreadable or foreign cache is an empty one: the files are read again. */
+async function readRecordCache(path: string, tool: string): Promise<RecordCache> {
+  const empty: RecordCache = { schemaVersion: 1, tool, files: {} };
+  try {
+    const value = JSON.parse(await readFileAsync(path, "utf8")) as Partial<RecordCache>;
+    if (value.schemaVersion !== 1 || value.tool !== tool || !value.files || typeof value.files !== "object") return empty;
+    for (const entry of Object.values(value.files)) {
+      if (!entry || typeof entry.fingerprint !== "string" || !Array.isArray(entry.records) || !entry.records.every(validUsageRecord)) return empty;
+    }
+    return value as RecordCache;
+  } catch {
+    return empty;
+  }
+}
+
+/** Advisory: a failed write only means the next read parses the files again. */
+async function writeRecordCache(path: string, cache: RecordCache): Promise<void> {
+  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await mkdirAsync(dirname(path), { recursive: true, mode: 0o700 });
+    await writeFileAsync(temporary, JSON.stringify(cache), { mode: 0o600 });
+    await renameAsync(temporary, path);
+  } catch {
+    await unlinkAsync(temporary).catch(() => undefined);
+  }
 }
 
 /** The guard's estimate: the same read, reduced to the four fields the

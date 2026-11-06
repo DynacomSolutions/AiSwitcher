@@ -1,6 +1,9 @@
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
 import { fromIni } from "@aws-sdk/credential-providers";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
+import { aisCacheDir } from "../../shared/ais-home.ts";
 import { resolveAwsProfileForIdentity, type AwsProfileDeps } from "../../identities/aws-profile.ts";
 import { fetchAccountBudgetWires, isSsoAuthError, withAwsTransientRetry, type BudgetsApi } from "../limits/aws-bedrock-limits.ts";
 import { readIdentityLocalSpendAsync, type AsyncLocalEstimateDeps, type LocalSpendRead } from "../../shared/local-spend.ts";
@@ -331,6 +334,11 @@ async function fetchRealCost(
  * the result so one billing-plane failure cannot blank the local tracking
  * again (the 2026-09 display regression).
  */
+function localSpendRecordCachePath(configDir: string, tool: string): string {
+  const key = createHash("sha256").update(`ais-local-spend-records-v1\0${tool}\0${configDir}`).digest("hex");
+  return join(aisCacheDir(), "usage", "local-spend", `${key}.json`);
+}
+
 export async function fetchAwsBedrockUsage(identity: Identity, deps: AwsBedrockUsageDeps = {}): Promise<AwsBedrockUsageResult> {
   const target = deps.localOnly ? undefined : resolveAwsProfileForIdentity(identity, deps.awsProfileDeps);
   if (!target && !deps.localOnly) {
@@ -347,6 +355,9 @@ export async function fetchAwsBedrockUsage(identity: Identity, deps: AwsBedrockU
   // sub-row's "reported lag" note compares like with like.
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const read = await (deps.localSpend ?? readIdentityLocalSpendAsync)(deps.localTool ?? "codex", identity.configDir, new Date(0), {
+    // The all-time read covers every rollout the identity ever wrote; only
+    // files changed since the last collector cycle are parsed again.
+    ...(deps.localSpendDeps ? {} : { recordCachePath: localSpendRecordCachePath(identity.configDir, deps.localTool ?? "codex") }),
     ...deps.localSpendDeps,
     usdSinceMs: monthStart.getTime(),
   });

@@ -131,6 +131,20 @@ describe("AIS native export cache seeding", () => {
     expect(invocation?.env.TOKSCALE_CONFIG_DIR).toContain("/usage/native-tokscale/isolated-config");
   });
 
+  test("passes the committed batch digest so identical messages are not written again", async () => {
+    const dir = await makeConfigDir();
+    const command = join(dir, "fake-tokscale");
+    await writeFile(command, "#!/bin/sh\nexit 0\n");
+    await chmod(command, 0o700);
+    const base = { toolName: "claude" as const, identity: identity("/identity/claude"), partitionId: "c".repeat(64), exportPath: join(dir, "candidate.json") };
+    const withDigest = await buildAisTokscaleExportInvocation({ ...base, previousMessagesSha256: "d".repeat(64) }, { AIS_TOKSCALE_SHARED_BIN: command });
+    expect(withDigest?.env.TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256).toBe("d".repeat(64));
+    const malformed = await buildAisTokscaleExportInvocation({ ...base, previousMessagesSha256: "not-a-digest" }, { AIS_TOKSCALE_SHARED_BIN: command });
+    expect(malformed?.env.TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256).toBeUndefined();
+    const none = await buildAisTokscaleExportInvocation(base, { AIS_TOKSCALE_SHARED_BIN: command });
+    expect(none?.env.TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256).toBeUndefined();
+  });
+
   test("uses caller XDG_CONFIG_HOME when no Tokscale config override exists", async () => {
     const dir = await makeConfigDir();
     const command = join(dir, "fake-tokscale");

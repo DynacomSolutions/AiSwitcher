@@ -10,7 +10,7 @@ import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnaps
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
-import { buildAisTokscaleExportInvocation, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation } from "./tokscale.ts";
+import { aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage } from "./tokscale.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
@@ -48,6 +48,10 @@ export interface UsageSnapshotPartition {
     /** Opaque Tokscale export key. The manifest partition key is an AIS
      * report/source identifier and is deliberately not the export identity. */
     partitionId: string;
+    /** SHA-256 of the batch's `messages` array as Tokscale serialized it. */
+    messagesSha256?: string;
+    /** Bucket timezone of the export, which its daily figures depend on. */
+    bucketTimezone?: string;
   };
   lastAttemptAt: string;
   /** Identity no longer registered: results stay in totals, freshness ignores it. */
@@ -225,16 +229,44 @@ function nativeExportSupportedInSameRun(target: UsageTarget): boolean {
     !(target.toolName === "codex" && isBedrockIdentity(target.identity));
 }
 
-async function nativeExportForTarget(target: UsageTarget, key = targetKey(target)) {
+async function nativeExportForTarget(target: UsageTarget, key = targetKey(target), previous?: UsageSnapshotPartition["nativeBatch"], nativeRoot = join(aisCacheDir(), "usage", "native")) {
   if (!nativeExportSupportedInSameRun(target)) return undefined;
   const partitionId = nativePartitionId(key);
-  const staging = join(aisCacheDir(), "usage", "native", ".staging");
+  const staging = join(nativeRoot, ".staging");
   mkdirSync(staging, { recursive: true, mode: 0o700 });
   const path = join(staging, `${partitionId}.${crypto.randomUUID()}.json`);
+  const previousMessagesSha256 = reusableNativeBatchDigest(previous, partitionId, nativeRoot);
   const invocation = await buildAisTokscaleExportInvocation({
     toolName: target.toolName, identity: target.identity, partitionId, exportPath: path,
+    ...(previousMessagesSha256 ? { previousMessagesSha256 } : {}),
   });
   return invocation ? { invocation, path, partitionId } : undefined;
+}
+
+/** The committed batch's message digest, when Tokscale may answer "unchanged"
+ * for it: the batch file is still there, and the daily figures derived from it
+ * used the bucket timezone the export will use now. */
+export function reusableNativeBatchDigest(
+  previous: UsageSnapshotPartition["nativeBatch"],
+  partitionId: string,
+  nativeRoot: string,
+  currentBucketTimezone = readTokscaleBucketTimezone(aisNativeTokscaleConfigDir()),
+): string | undefined {
+  if (!previous?.messagesSha256 || previous.partitionId !== partitionId) return undefined;
+  if (previous.bucketTimezone !== currentBucketTimezone) return undefined;
+  const relative = previous.path.slice("usage/native/".length);
+  try {
+    if (!statSync(join(nativeRoot, relative)).isFile()) return undefined;
+  } catch {
+    return undefined;
+  }
+  return previous.messagesSha256;
+}
+
+function priorDailyUsage(prior: UsageSnapshotPartition | undefined): DailyUsage | undefined {
+  const row = prior?.results.length === 1 ? prior.results[0] : undefined;
+  if (!row?.dateSpan || !row.dailyUsage || !row.dailyTotals) return undefined;
+  return { dateSpan: row.dateSpan, daily: row.dailyUsage, totals: row.dailyTotals };
 }
 
 function candidateFromResults(results: UsageResult[]): UsageResult["nativeBatchCandidate"] | undefined {
@@ -244,6 +276,31 @@ function candidateFromResults(results: UsageResult[]): UsageResult["nativeBatchC
 /** Receives a validated batch's messages while they are in memory, so a
  * caller can derive figures from the one read and parse of the batch. */
 type NativeBatchMessagesReader = (messages: readonly unknown[]) => void;
+
+/** Tokscale's answer when the messages equal the batch AIS already holds
+ * (`TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256`): no batch, only the digest. */
+function unchangedNativeBatch(path: string, partitionId: string, previous: UsageSnapshotPartition["nativeBatch"]): NonNullable<UsageSnapshotPartition["nativeBatch"]> | undefined {
+  if (!previous?.messagesSha256) return undefined;
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return undefined;
+  }
+  // A real batch is never this small with messages; only peek at small files.
+  if (size > 4096) return undefined;
+  let envelope: Record<string, unknown>;
+  try {
+    envelope = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  if (!envelope || envelope.schemaVersion !== 1 || envelope.unchanged !== true) return undefined;
+  if (envelope.partitionId !== partitionId || envelope.messagesSha256 !== previous.messagesSha256 || previous.partitionId !== partitionId) {
+    throw nativeCaptureError("candidate-envelope-validation", new Error("invalid-unchanged-native-batch"));
+  }
+  return previous;
+}
 
 function validateNativeBatchFile(path: string, partitionId: string, readMessages?: NativeBatchMessagesReader): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
   let bytes: Buffer;
@@ -271,11 +328,13 @@ function validateNativeBatchFile(path: string, partitionId: string, readMessages
     throw nativeCaptureError("candidate-hash", error);
   }
   readMessages?.((envelope as { messages: unknown[] }).messages);
+  const messagesSha256 = (envelope as { messagesSha256?: unknown }).messagesSha256;
   return {
     path: "",
     sha256,
     generatedAt,
     partitionId,
+    ...(typeof messagesSha256 === "string" && /^[a-f0-9]{64}$/.test(messagesSha256) ? { messagesSha256 } : {}),
   };
 }
 
@@ -738,7 +797,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   // keep the candidate independently until the matching callback commits.
   const nativeCandidates = new Map<string, UsageResult["nativeBatchCandidate"]>();
   const getNativeExportForTarget = async (target: UsageTarget) => {
-    const nativeExport = await nativeExportForTarget(target);
+    const nativeExport = await nativeExportForTarget(target, targetKey(target), partitions[targetKey(target)]?.nativeBatch, deps.nativeBatchRoot);
     if (nativeExport) nativeCandidates.set(targetKey(target), {
       path: nativeExport.path,
       partitionId: nativeExport.partitionId,
@@ -803,16 +862,26 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         if (nativeCandidate.partitionId !== expectedPartitionId) {
           throw new NativeCaptureStageError("partition-id-mismatch", new Error("native-export-partition-mismatch"));
         }
-        nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot, nativeDaily
-          ? (messages) => {
-            try {
-              results = withDailyUsage(results, dailyUsageFromNativeMessages(messages, nativeCandidate.tokscaleConfigDir ? readTokscaleBucketTimezone(nativeCandidate.tokscaleConfigDir) : undefined));
-            } catch (error) {
-              // Daily figures are a display detail; the report still commits.
-              logUsageSourceFailure(`${key} native daily usage`, error);
+        const bucketTimezone = nativeCandidate.tokscaleConfigDir ? readTokscaleBucketTimezone(nativeCandidate.tokscaleConfigDir) : undefined;
+        const unchanged = unchangedNativeBatch(nativeCandidate.path, expectedPartitionId, prior?.nativeBatch);
+        if (unchanged) {
+          // Same messages as the batch already committed: keep pointing at it,
+          // and the daily figures derived from those messages stay valid.
+          nativeBatch = unchanged;
+          if (nativeDaily) results = withDailyUsage(results, priorDailyUsage(prior));
+        } else {
+          nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot, nativeDaily
+            ? (messages) => {
+              try {
+                results = withDailyUsage(results, dailyUsageFromNativeMessages(messages, bucketTimezone));
+              } catch (error) {
+                // Daily figures are a display detail; the report still commits.
+                logUsageSourceFailure(`${key} native daily usage`, error);
+              }
             }
-          }
-          : undefined);
+            : undefined);
+          if (bucketTimezone) nativeBatch = { ...nativeBatch, bucketTimezone };
+        }
         nativeCoverage = "supported";
       } else if (nativeSpec) {
         nativeBatch = await captureNativeBatch(nativeSpec, deps);

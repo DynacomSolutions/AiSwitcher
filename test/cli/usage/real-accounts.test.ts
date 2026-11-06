@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { appendFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, unlink, utimes, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { poolMemberModelUsage, poolMemberUsageSplit } from "../../../src/cli/claude-swap/attribution.ts";
@@ -288,11 +289,170 @@ describe("swap pool usage attribution cache", () => {
     const first = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
     expect(first[0]?.entries[0]?.messageCount).toBe(1);
     const repaired = await readFile(f.cachePath, "utf8");
-    expect(JSON.parse(repaired).schemaVersion).toBe(1);
+    expect(JSON.parse(repaired).schemaVersion).toBe(2);
     await unlink(f.transcript);
     const afterRemoval = await poolMemberModelUsage(f.pool, [id("alice")], f.ledger, options);
     expect(afterRemoval).toEqual([]);
     expect(reads).toEqual([f.transcript]);
+  });
+});
+
+describe("swap pool attribution cache: appended transcripts", () => {
+  async function fixture() {
+    const root = await mkdtemp(join(tmpdir(), "ais-pool-append-"));
+    dirs.push(root);
+    const configDir = join(root, "swap");
+    const projects = join(configDir, "projects", "p");
+    await mkdir(projects, { recursive: true });
+    const ledger = join(root, "ledger.jsonl");
+    await writeFile(ledger, `${JSON.stringify({ ts: "2026-10-02T00:00:00Z", pool: "pool-x", from: null, to: "alice", reason: "manual" })}\n${JSON.stringify({ ts: "2026-10-03T12:00:00Z", pool: "pool-x", from: "alice", to: "bob", reason: "auto" })}\n`);
+    const pool: PoolIdentity = { name: "pool-x", label: "Pool", configDir, swapPool: { accounts: ["alice", "bob"], active: "bob" } };
+    const transcript = join(projects, "s.jsonl");
+    const cachePath = join(root, "cache", "pool.v2.json");
+    const msg = (n: number, output = n % 7 + 1) => JSON.stringify({ timestamp: new Date(Date.parse("2026-10-03T00:00:00Z") + n * 3_600_000).toISOString(), message: { id: `m${n % 50}`, model: n % 3 ? "claude-opus-4-8" : "claude-sonnet-4-6", usage: { input_tokens: 10 + n, output_tokens: output, cache_read_input_tokens: n, cache_creation_input_tokens: 1 } } });
+    const cold = async () => poolMemberModelUsage(pool, [id("alice"), id("bob")], ledger, { cachePath: join(root, `cold-${Math.random().toString(36).slice(2)}`, "pool.json") });
+    return { root, pool, ledger, transcript, cachePath, msg, cold };
+  }
+
+  test("a grown transcript is read only from where the last scan stopped and matches a cold scan", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1)}\n${f.msg(2)}\n`);
+    const reads: Array<[string, number]> = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (path: string, offset: number) => reads.push([path, offset]) };
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    const firstSize = (await stat(f.transcript)).size;
+    appendFileSync(f.transcript, `${f.msg(3)}\n${f.msg(40)}\n`);
+    const warm = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    expect(reads).toEqual([[f.transcript, 0], [f.transcript, firstSize]]);
+    expect(warm).toEqual(await f.cold());
+  });
+
+  test("an unchanged cycle opens no transcript and rewrites neither the index nor any hits log", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1)}\n${f.msg(2)}\n`);
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath });
+    const stamp = async () => {
+      const names = (await readdir(`${f.cachePath}.d`)).sort();
+      return [String((await stat(f.cachePath, { bigint: true })).mtimeNs), ...await Promise.all(names.map(async (name) => `${name}:${(await stat(join(`${f.cachePath}.d`, name), { bigint: true })).mtimeNs}`))];
+    };
+    const before = await stamp();
+    const reads: string[] = [];
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath, onSourceFileRead: (path) => reads.push(path) });
+    expect(reads).toEqual([]);
+    expect(await stamp()).toEqual(before);
+  });
+
+  test("random appends, partial lines and CRLF stay equal to a cold scan after every cycle", async () => {
+    const f = await fixture();
+    let seed = 7;
+    const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    let text = "";
+    await writeFile(f.transcript, "");
+    for (let cycle = 0; cycle < 25; cycle++) {
+      let chunk = "";
+      const lines = Math.floor(random() * 4);
+      for (let i = 0; i < lines; i++) chunk += `${f.msg(cycle * 5 + i)}${random() < 0.3 ? "\r\n" : "\n"}`;
+      // Cut mid-line sometimes: the rest arrives with a later append.
+      const cut = random() < 0.4 ? Math.floor(random() * chunk.length) : chunk.length;
+      text += chunk.slice(0, cut);
+      appendFileSync(f.transcript, chunk.slice(0, cut));
+      if (cut < chunk.length) {
+        const warmPartial = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath });
+        expect(warmPartial).toEqual(await f.cold());
+        text += chunk.slice(cut);
+        appendFileSync(f.transcript, chunk.slice(cut));
+      }
+      const warm = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath });
+      expect(warm).toEqual(await f.cold());
+    }
+    expect((await readFile(f.transcript, "utf8"))).toBe(text);
+  });
+
+  test("a changed byte inside the sampled prefix forces a full re-parse", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1, 2)}\n${f.msg(2, 3)}\n`);
+    const reads: number[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (_path: string, offset: number) => reads.push(offset) };
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    // Same inode, grown, but an earlier message now says something else.
+    const handle = await open(f.transcript, "r+");
+    await handle.write(f.msg(1, 9), 0);
+    await handle.close();
+    appendFileSync(f.transcript, `${f.msg(3)}\n`);
+    const warm = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    expect(reads).toEqual([0, 0]);
+    expect(warm).toEqual(await f.cold());
+  });
+
+  test("a truncated and regrown transcript is re-parsed from byte 0", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1)}\n${f.msg(2)}\n`);
+    const reads: number[] = [];
+    const options = { cachePath: f.cachePath, onSourceFileRead: (_path: string, offset: number) => reads.push(offset) };
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    await writeFile(f.transcript, `${f.msg(5)}\n`);
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    appendFileSync(f.transcript, `${f.msg(6)}\n${f.msg(7)}\n${f.msg(8)}\n`);
+    const warm = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, options);
+    expect(reads[0]).toBe(0);
+    expect(reads[1]).toBe(0);
+    expect(warm).toEqual(await f.cold());
+  });
+
+  test("an append whose index commit failed is not counted twice", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1)}\n`);
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath });
+    appendFileSync(f.transcript, `${f.msg(2)}\n`);
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath, writeCache: async () => { throw new Error("crash before commit"); } });
+    appendFileSync(f.transcript, `${f.msg(3)}\n`);
+    const warm = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath });
+    expect(warm).toEqual(await f.cold());
+    // Message ids dedupe the totals, so check the log itself holds each hit once.
+    const [log] = await readdir(`${f.cachePath}.d`);
+    expect((await readFile(join(`${f.cachePath}.d`, log!), "utf8")).trim().split("\n")).toHaveLength(3);
+  });
+
+  test("schema-1 hits of unchanged transcripts are adopted without reading them", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1)}\n${f.msg(2)}\n`);
+    const changed = join(f.pool.configDir, "projects", "p", "changed.jsonl");
+    await writeFile(changed, `${f.msg(3)}\n`);
+    const legacyCachePath = join(f.root, "cache", "pool.json");
+    const expected = await f.cold();
+    const fingerprint = async (path: string) => {
+      const info = await stat(path, { bigint: true });
+      return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String).join(":");
+    };
+    const key = (name: string) => createHash("sha256").update(`p/${name}`).digest("hex");
+    const opaque = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 32);
+    const hit = (n: number) => {
+      const row = JSON.parse(f.msg(n));
+      const usage = row.message.usage;
+      return [Date.parse(row.timestamp), row.message.model, opaque(row.message.id), usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens];
+    };
+    await mkdir(join(f.root, "cache"), { recursive: true });
+    await writeFile(legacyCachePath, JSON.stringify({ schemaVersion: 1, files: [
+      { key: key("s.jsonl"), fingerprint: await fingerprint(f.transcript), hits: [hit(1), hit(2)] },
+      { key: key("changed.jsonl"), fingerprint: ["0", "0", "0", "0", "0"].join(":"), hits: [hit(3)] },
+    ] }));
+    const reads: string[] = [];
+    const usage = await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath, legacyCachePath, onSourceFileRead: (path) => reads.push(path) });
+    expect(reads).toEqual([changed]);
+    expect(usage).toEqual(expected);
+    await expect(stat(legacyCachePath)).rejects.toMatchObject({ code: "ENOENT" });
+    appendFileSync(f.transcript, `${f.msg(4)}\n`);
+    expect(await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath })).toEqual(await f.cold());
+  });
+
+  test("a removed transcript drops its hits log", async () => {
+    const f = await fixture();
+    await writeFile(f.transcript, `${f.msg(1)}\n`);
+    await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath });
+    expect(await readdir(`${f.cachePath}.d`)).toHaveLength(1);
+    await unlink(f.transcript);
+    expect(await poolMemberModelUsage(f.pool, [id("alice"), id("bob")], f.ledger, { cachePath: f.cachePath })).toEqual([]);
+    expect(await readdir(`${f.cachePath}.d`)).toEqual([]);
   });
 });
 

@@ -48,12 +48,16 @@ mkdir "$source_dir"
 tar -xzf "$archive" --strip-components=1 -C "$source_dir"
 cmp -- "$repo_root/vendor/tokscale/LICENSE" "$source_dir/LICENSE"
 patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais.patch"
+patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-io.patch"
 
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_shared_snapshot)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib selector_)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_incremental)
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --bin tokscale ais_shared_overlay)
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --test cli_tests ais_native_export_from_json_model_report_uses_report_parser_vector)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_sampled_prefix)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib test_resume_)
+(cd "$source_dir" && cargo test --locked --package tokscale-cli --test cli_tests ais_native_export_reports_unchanged_messages_instead_of_rewriting_the_batch)
 (cd "$source_dir" && cargo build --locked --release --package tokscale-cli --bin tokscale)
 
 if [[ -z "$target_dir" ]]; then
