@@ -1,58 +1,55 @@
 {
  "entries": [
   {
-   "hour": "2026-10-20 12:00",
+   "hour": "2026-10-28 00:00",
    "clients": [
     "claude"
    ],
    "models": [
-    "claude-haiku-4-5"
+    "claude-sonnet-4-5"
    ],
-   "input": 4695,
-   "output": 1286,
-   "cacheRead": 44580,
-   "cacheWrite": 5737,
+   "input": 700,
+   "output": 70,
+   "cacheRead": 0,
+   "cacheWrite": 0,
    "messageCount": 1,
-   "turnCount": 1,
-   "cost": 0.02275425
+   "turnCount": 0,
+   "cost": 0.5
   },
   {
-   "hour": "2026-10-20 13:00",
+   "hour": "2026-10-28 11:00",
    "clients": [
     "claude"
    ],
    "models": [
-    "claude-haiku-4-5",
-    "claude-opus-4-1",
     "claude-sonnet-4-5"
    ],
-   "input": 18921,
-   "output": 3607,
-   "cacheRead": 224987,
-   "cacheWrite": 30628,
-   "messageCount": 6,
-   "turnCount": 6,
-   "cost": 0.6888445999999999
+   "input": 800,
+   "output": 80,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "messageCount": 1,
+   "turnCount": 0,
+   "cost": 0.5
   },
   {
-   "hour": "2026-10-20 14:00",
+   "hour": "2026-10-29 19:00",
    "clients": [
     "claude"
    ],
    "models": [
-    "claude-haiku-4-5",
-    "claude-sonnet-4-5"
+    "claude-opus-4-1"
    ],
-   "input": 9809,
-   "output": 7536,
-   "cacheRead": 320276,
-   "cacheWrite": 21770,
-   "messageCount": 5,
-   "turnCount": 5,
-   "cost": 0.1314527
+   "input": 5523,
+   "output": 5507,
+   "cacheRead": 125584,
+   "cacheWrite": 14048,
+   "messageCount": 3,
+   "turnCount": 3,
+   "cost": 0.947646
   },
   {
-   "hour": "2026-10-22 17:00",
+   "hour": "2026-10-29 20:00",
    "clients": [
     "claude"
    ],
@@ -60,170 +57,299 @@
     "claude-haiku-4-5",
     "claude-opus-4-1"
    ],
-   "input": 5154,
-   "output": 5516,
-   "cacheRead": 106298,
-   "cacheWrite": 5711,
+   "input": 6603,
+   "output": 2819,
+   "cacheRead": 150432,
+   "cacheWrite": 21888,
    "messageCount": 3,
    "turnCount": 3,
-   "cost": 0.48369545
+   "cost": 0.3929804
   },
   {
-   "hour": "2026-10-22 18:00",
+   "hour": "2026-10-29 21:00",
    "clients": [
     "claude"
    ],
    "models": [
     "claude-haiku-4-5",
-    "claude-sonnet-4-5"
+    "claude-opus-4-1"
    ],
-   "input": 5917,
-   "output": 3970,
-   "cacheRead": 95820,
-   "cacheWrite": 16124,
-   "messageCount": 3,
-   "turnCount": 3,
-   "cost": 0.1212037
-  },
-  {
-   "hour": "2026-10-22 19:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-haiku-4-5",
-    "claude-opus-4-1",
-    "claude-sonnet-4-5"
-   ],
-   "input": 14690,
-   "output": 4065,
-   "cacheRead": 238912,
-   "cacheWrite": 20729,
-   "messageCount": 5,
-   "turnCount": 5,
-   "cost": 0.66297555
-  },
-  {
-   "hour": "2026-10-22 20:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-haiku-4-5",
-    "claude-sonnet-4-5"
-   ],
-   "input": 4429,
-   "output": 3331,
-   "cacheRead": 74922,
-   "cacheWrite": 13850,
-   "messageCount": 3,
-   "turnCount": 3,
-   "cost": 0.0737508
-  },
-  {
-   "hour": "2026-10-22 21:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-haiku-4-5",
-    "claude-opus-4-1",
-    "claude-sonnet-4-5"
-   ],
-   "input": 16450,
-   "output": 9925,
-   "cacheRead": 232280,
-   "cacheWrite": 34863,
-   "messageCount": 6,
-   "turnCount": 6,
-   "cost": 1.17195645
-  },
-  {
-   "hour": "2026-10-22 22:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-opus-4-1",
-    "claude-sonnet-4-5"
-   ],
-   "input": 6380,
-   "output": 5546,
-   "cacheRead": 159974,
-   "cacheWrite": 18620,
-   "messageCount": 3,
-   "turnCount": 3,
-   "cost": 0.48232679999999994
-  },
-  {
-   "hour": "2026-10-22 23:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-sonnet-4-5"
-   ],
-   "input": 2289,
-   "output": 1935,
-   "cacheRead": 33970,
-   "cacheWrite": 3172,
-   "messageCount": 1,
-   "turnCount": 1,
-   "cost": 0.057978
-  },
-  {
-   "hour": "2026-10-23 18:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-haiku-4-5",
-    "claude-sonnet-4-5"
-   ],
-   "input": 12618,
-   "output": 9918,
-   "cacheRead": 351612,
-   "cacheWrite": 27300,
-   "messageCount": 7,
-   "turnCount": 7,
-   "cost": 0.2034212
-  },
-  {
-   "hour": "2026-10-23 19:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-haiku-4-5",
-    "claude-opus-4-1",
-    "claude-sonnet-4-5"
-   ],
-   "input": 4536,
-   "output": 7308,
-   "cacheRead": 135739,
-   "cacheWrite": 16898,
-   "messageCount": 3,
-   "turnCount": 3,
-   "cost": 0.5240756999999999
-  },
-  {
-   "hour": "2026-10-23 20:00",
-   "clients": [
-    "claude"
-   ],
-   "models": [
-    "claude-haiku-4-5",
-    "claude-sonnet-4-5"
-   ],
-   "input": 8250,
-   "output": 3120,
-   "cacheRead": 80450,
-   "cacheWrite": 10321,
+   "input": 6978,
+   "output": 2074,
+   "cacheRead": 89360,
+   "cacheWrite": 10672,
    "messageCount": 2,
    "turnCount": 2,
-   "cost": 0.08864844999999999
+   "cost": 0.4151544
+  },
+  {
+   "hour": "2026-10-29 22:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5"
+   ],
+   "input": 4537,
+   "output": 2465,
+   "cacheRead": 72464,
+   "cacheWrite": 6576,
+   "messageCount": 1,
+   "turnCount": 1,
+   "cost": 0.0323284
+  },
+  {
+   "hour": "2026-10-29 23:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-sonnet-4-5"
+   ],
+   "input": 1929,
+   "output": 993,
+   "cacheRead": 39136,
+   "cacheWrite": 4024,
+   "messageCount": 1,
+   "turnCount": 1,
+   "cost": 0.0475128
+  },
+  {
+   "hour": "2026-10-30 00:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5"
+   ],
+   "input": 5218,
+   "output": 4834,
+   "cacheRead": 83168,
+   "cacheWrite": 3016,
+   "messageCount": 2,
+   "turnCount": 2,
+   "cost": 0.0820052
+  },
+  {
+   "hour": "2026-10-30 21:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-opus-4-1",
+    "claude-sonnet-4-5"
+   ],
+   "input": 10716,
+   "output": 7300,
+   "cacheRead": 120985,
+   "cacheWrite": 17552,
+   "messageCount": 4,
+   "turnCount": 4,
+   "cost": 0.46174109999999996
+  },
+  {
+   "hour": "2026-10-30 22:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5"
+   ],
+   "input": 5027,
+   "output": 7907,
+   "cacheRead": 50288,
+   "cacheWrite": 3008,
+   "messageCount": 3,
+   "turnCount": 3,
+   "cost": 0.12221480000000001
+  },
+  {
+   "hour": "2026-10-30 23:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5",
+    "claude-opus-4-1",
+    "claude-sonnet-4-5"
+   ],
+   "input": 11317,
+   "output": 5894,
+   "cacheRead": 279536,
+   "cacheWrite": 30464,
+   "messageCount": 5,
+   "turnCount": 5,
+   "cost": 0.6486034
+  },
+  {
+   "hour": "2026-10-31 00:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5",
+    "claude-opus-4-1"
+   ],
+   "input": 7675,
+   "output": 4995,
+   "cacheRead": 167056,
+   "cacheWrite": 17440,
+   "messageCount": 3,
+   "turnCount": 3,
+   "cost": 0.7892324
+  },
+  {
+   "hour": "2026-10-31 01:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5"
+   ],
+   "input": 13542,
+   "output": 8582,
+   "cacheRead": 275504,
+   "cacheWrite": 19096,
+   "messageCount": 6,
+   "turnCount": 6,
+   "cost": 0.2596076
+  },
+  {
+   "hour": "2026-10-31 02:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5"
+   ],
+   "input": 6226,
+   "output": 5154,
+   "cacheRead": 60928,
+   "cacheWrite": 3800,
+   "messageCount": 2,
+   "turnCount": 2,
+   "cost": 0.0428388
+  },
+  {
+   "hour": "2026-10-31 03:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5"
+   ],
+   "input": 2377,
+   "output": 753,
+   "cacheRead": 36544,
+   "cacheWrite": 3976,
+   "messageCount": 1,
+   "turnCount": 1,
+   "cost": 0.0147664
+  },
+  {
+   "hour": "2026-10-31 23:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-sonnet-4-5"
+   ],
+   "input": 3201,
+   "output": 2713,
+   "cacheRead": 87200,
+   "cacheWrite": 6656,
+   "messageCount": 1,
+   "turnCount": 1,
+   "cost": 0.101418
+  },
+  {
+   "hour": "2026-11-01 00:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5",
+    "claude-opus-4-1"
+   ],
+   "input": 3635,
+   "output": 3987,
+   "cacheRead": 159816,
+   "cacheWrite": 7752,
+   "messageCount": 3,
+   "turnCount": 3,
+   "cost": 0.5829496
+  },
+  {
+   "hour": "2026-11-01 01:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5"
+   ],
+   "input": 5971,
+   "output": 4411,
+   "cacheRead": 152976,
+   "cacheWrite": 9360,
+   "messageCount": 3,
+   "turnCount": 3,
+   "cost": 0.1034844
+  },
+  {
+   "hour": "2026-11-01 02:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-opus-4-1",
+    "claude-sonnet-4-5"
+   ],
+   "input": 6962,
+   "output": 5138,
+   "cacheRead": 96256,
+   "cacheWrite": 11760,
+   "messageCount": 2,
+   "turnCount": 2,
+   "cost": 0.5504064
+  },
+  {
+   "hour": "2026-11-01 03:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-opus-4-1",
+    "claude-sonnet-4-5"
+   ],
+   "input": 5522,
+   "output": 3506,
+   "cacheRead": 131504,
+   "cacheWrite": 13672,
+   "messageCount": 2,
+   "turnCount": 2,
+   "cost": 0.5306435999999999
+  },
+  {
+   "hour": "2026-11-01 04:00",
+   "clients": [
+    "claude"
+   ],
+   "models": [
+    "claude-haiku-4-5"
+   ],
+   "input": 2409,
+   "output": 2393,
+   "cacheRead": 77696,
+   "cacheWrite": 6264,
+   "messageCount": 1,
+   "turnCount": 1,
+   "cost": 0.0299736
   }
  ],
- "totalCost": 4.71308365,
+ "totalCost": 7.1555073,
  "processingTimeMs": 0
 }

@@ -75,8 +75,7 @@ The recipe:
      error; plus `PROVIDER_ALIASES`/`PROVIDER_LABELS` entries if the tool
      reports provider names of its own),
      `src/cli/usage/tokscale.ts` (`tokscaleInvocationFor` — again exhaustive),
-     and `src/cli/usage/run.ts` (the `runOne` dispatch and the
-     `fetchTokscaleDailyUsage` client union).
+     and `src/cli/usage/run.ts` (the `runOne` dispatch).
    - `limits`: a fetcher in `src/cli/limits/` wired into collect.ts's
      `FETCHERS` map (1:1 tools wrap their single-result fetcher via
      `singleToolFetcher`; multi-provider clients return one result per

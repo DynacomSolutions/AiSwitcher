@@ -45,7 +45,7 @@ const FILES: Array<{ path: string; why: string }> = [
   { path: "src/installer.ts", why: "the interactive install menu" },
   { path: "src/cli/usage/providers.ts", why: "providerForTool and the provider alias/label tables" },
   { path: "src/cli/usage/tokscale.ts", why: "tokscaleInvocationFor and the merged-env rules" },
-  { path: "src/cli/usage/run.ts", why: "the runOne dispatch and daily-usage client unions" },
+  { path: "src/cli/usage/run.ts", why: "the runOne dispatch and its native-export tools" },
   { path: "scripts/build.ts", why: "ENTRYPOINTS release binaries" },
   { path: "scripts/install.ts", why: "shim BINARIES and backupGroups" },
   { path: "scripts/backup.ts", why: "the backup groups" },

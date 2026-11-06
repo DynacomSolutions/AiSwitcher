@@ -17,7 +17,7 @@ import {
 import { acknowledgeUsageSnapshotDirty, markUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotTargetKey } from "../../../src/cli/usage/snapshot-dirty.ts";
 import { readUsageSnapshotMetricsStatus } from "../../../src/cli/usage/snapshot-status.ts";
 import type { UsageResult, UsageTarget } from "../../../src/cli/usage/run.ts";
-import { dailyUsageFromHourlyEntries } from "../../../src/cli/usage/tokscale.ts";
+import { dailyUsageFromHourlyEntries, dailyUsageFromNativeMessages } from "../../../src/cli/usage/tokscale.ts";
 import nativeExport from "../../fixtures/tokscale-native-daily/export.json";
 import hourlyReport from "../../fixtures/tokscale-native-daily/hourly.json";
 
@@ -161,28 +161,40 @@ describe("shared usage snapshot", () => {
     expect(await Bun.file(join(nativeBatchRoot, partitionId, basename(snapshot.partitions[key]!.nativeBatch!.path))).exists()).toBe(true);
   });
 
-  test("daily usage comes from the native export the report used, with no hourly scan", async () => {
+  test("daily usage comes from the native export, keyed in the zone of the config the exporter used", async () => {
     const now = Date.UTC(2026, 0, 1);
     const path = await snapshotFile();
     const key = usageSnapshotTargetKey("claude", identity.name);
     const partitionId = createHash("sha256").update(`ais-native-partition-v1\0${key}`).digest("hex");
-    const candidate = { path: join(dirname(path), "daily-native.json"), partitionId };
-    const configDir = join(dirname(path), "isolated-config");
-    await mkdir(configDir, { recursive: true });
-    await writeFile(join(configDir, "settings.json"), JSON.stringify({ scanner: { bucketTimezone: "Asia/Bangkok" } }));
-    await refreshUsageSnapshot({
-      ...deps(path, { now, results: [] }),
-      nativeBatchRoot: join(dirname(path), "native-batches"),
-      nativeTokscaleConfigDir: configDir,
-      forcePartitionKeys: [key],
-      prepareNativeExportCandidate: async () => candidate,
-      collectTargetResults: async (targets, onItemDone, prepareNativeExport) => {
-        await prepareNativeExport!(targets[0]!);
-        await writeFile(candidate.path, JSON.stringify({ ...nativeExport, partitionId, generatedAt: new Date(now).toISOString() }));
-        onItemDone(0, [result(48)]);
-        return [];
-      },
-    });
+    // The two settings files disagree. The exporter ran with the isolated
+    // config (the candidate's tokscaleConfigDir), so its zone wins; the
+    // user's default Tokscale config is never read for a native batch.
+    const isolated = join(dirname(path), "isolated-config");
+    const userConfig = join(dirname(path), "user-config");
+    await mkdir(isolated, { recursive: true });
+    await mkdir(userConfig, { recursive: true });
+    await writeFile(join(isolated, "settings.json"), JSON.stringify({ scanner: { bucketTimezone: "America/New_York" } }));
+    await writeFile(join(userConfig, "settings.json"), JSON.stringify({ scanner: { bucketTimezone: "Asia/Bangkok" } }));
+    const candidate = { path: join(dirname(path), "daily-native.json"), partitionId, tokscaleConfigDir: isolated };
+    const previous = process.env.TOKSCALE_CONFIG_DIR;
+    process.env.TOKSCALE_CONFIG_DIR = userConfig;
+    try {
+      await refreshUsageSnapshot({
+        ...deps(path, { now, results: [] }),
+        nativeBatchRoot: join(dirname(path), "native-batches"),
+        forcePartitionKeys: [key],
+        prepareNativeExportCandidate: async () => candidate,
+        collectTargetResults: async (targets, onItemDone, prepareNativeExport) => {
+          await prepareNativeExport!(targets[0]!);
+          await writeFile(candidate.path, JSON.stringify({ ...nativeExport, partitionId, generatedAt: new Date(now).toISOString() }));
+          onItemDone(0, [result(48)]);
+          return [];
+        },
+      });
+    } finally {
+      if (previous === undefined) delete process.env.TOKSCALE_CONFIG_DIR;
+      else process.env.TOKSCALE_CONFIG_DIR = previous;
+    }
 
     const snapshot = JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, { results: UsageResult[] }> };
     const [row] = snapshot.partitions[key]!.results;
@@ -190,6 +202,7 @@ describe("shared usage snapshot", () => {
     expect(row?.dailyUsage).toEqual(expected.daily);
     expect(row?.dailyTotals).toEqual(expected.totals);
     expect(row?.dateSpan).toEqual(expected.dateSpan);
+    expect(row?.dailyUsage).not.toEqual(dailyUsageFromNativeMessages(nativeExport.messages, "Asia/Bangkok")!.daily);
   });
 
   test("empty swap-pool report rows retain their native export candidate", async () => {

@@ -24,38 +24,18 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     additive extra scan root tokscale supports without symlinks. Its default
     scan root remains active, so the top-level `~/.claude/projects` must be
     empty to avoid including unrelated sessions.
-  - **bunx concurrency race, also found empirically, not in any doc:** when
-    tokscale isn't already on `PATH` and runs via `bunx tokscale@latest`,
-    firing several of those processes at once — the natural way to query N
-    identities concurrently — can fail with `error: Failed to link
-    @tokscale/cli: EEXIST`. A one-shot "warm the cache first, then
-    parallelize" attempt did NOT fix it (reproduced the same failure on an
-    already-warm cache); the race is in bunx's global `.bin` link step
-    itself, not just the first-ever download — re-confirmed still
-    reproducible on bun 1.3.11 (8 parallel warm invocations, 2/8 failed)
-    right before the cached-binary redesign, so it is NOT something a bun upgrade
-    quietly fixed. The earlier design worked around it by fully serializing
-    every tokscale invocation whenever `resolveTokscaleCommand()` resolved
-    to `bunx` (parallelizing only when tokscale was on `PATH`). That was
-    correct but made the aggregate report crawl. The cached-binary design
-    (`resolveTokscaleCachedBinary()` in `src/cli/usage/tokscale.ts`)
-    avoids that race: bunx's own install
-    already materializes tokscale's real per-platform native binary at
-    `~/.bun/install/cache/@tokscale/cli-<os>-<arch>-<libc>@<ver>/bin/tokscale`,
-    so after a one-time `bunx tokscale@latest --version` warm-up per CLI
-    run (`ensureTokscaleCacheFresh()`, itself serialized through a tiny
-    bunx promise-queue since it IS a bunx call), every actual scan spawn
-    goes DIRECTLY at that cached binary (`runTokscaleProcess`) — no bunx,
-    no `.bin` link step, and no bunx link race. Independently, every
-    tokscale invocation is serialized through a process-wide slot so native
-    scans and bunx fallback cannot fan out memory use across targets.
-    Candidates are probed for actual executability
-    (`spawnSync --version`) not just file existence, so a wrong-libc or
-    corrupt cache entry falls through to the next variant or ultimately to
-    the old serialized-bunx fallback; the resolution result is memoized
-    per process. If tokscale's own bunx/npm packaging changes its cache
-    layout later, re-verify `findCachedTokscaleBinary` still finds the
-    real binary before trusting the cached-binary path.
+  - **bunx concurrency race (history):** several concurrent
+    `bunx tokscale@latest` processes can fail with `error: Failed to link
+    @tokscale/cli: EEXIST` in bunx's global `.bin` link step, even on a warm
+    cache (reproduced on bun 1.3.11). Report scans worked around it first by
+    serializing bunx, then by spawning the native binary bunx had cached in
+    `~/.bun/install/cache/@tokscale/` after a daily `--version` warm-up.
+    That machinery was removed on 2026-11-06: every report and daily figure
+    now comes from the AIS-patched shared binary's native export (below), so
+    no collector path runs PATH/bunx Tokscale. Passthrough execs one process,
+    so the race does not arise there. Every remaining Tokscale spawn still
+    goes through one process-wide slot (`withTokscaleProcessSlot`) to bound
+    memory.
   - tokscale is deliberately not a `package.json` dependency of this project
     (see `resolveTokscaleCommand()`) — it ships heavy platform-specific
     native optional-deps that don't belong bundled into a thin-wrapper
@@ -142,22 +122,35 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
 
 - **The usage snapshot collector runs Tokscale exactly once per source: the
   AIS-patched native export (2026-11-05).** Its daily figures (date span,
-  per-day tokens and totals) used to come from a second process,
-  `fetchTokscaleDailyUsage`'s `hourly --client <tool> --json` via
-  PATH/`bunx tokscale@latest`: unpatched upstream Tokscale with no AIS cache,
-  no stat-only mode and none of the warm-scan fixes, re-reading every
-  transcript once per identity. The collector now derives them from the
-  export it already reads and validates (`dailyUsageFromNativeMessages`,
-  applied in `snapshot.ts`'s `savePartition`), mirroring Tokscale 4.20's
-  hourly aggregation: recovery daily rows and undated balances skipped, hours
-  keyed in the `scanner.bucketTimezone` pinned in the isolated config's
-  `settings.json` (local time when unpinned), costs summed per hour in message
-  order. A committed fixture (`test/fixtures/tokscale-native-daily`) pins
-  equality with upstream `hourly`. A collector run never falls back to
-  PATH/bunx Tokscale (a missing export is an error row) and skips the
-  `bunx tokscale@latest --version` warm-up. Swap-pool member rows keep their
-  own transcript-derived daily figures. PATH/bunx Tokscale remains only for
-  `ais usage <tokscale args>` passthrough (other than `tui`).
+  per-day tokens and totals) used to come from a second process, an
+  `hourly --client <tool> --json` via PATH/`bunx tokscale@latest`: unpatched
+  upstream Tokscale with no AIS cache, no stat-only mode and none of the
+  warm-scan fixes, re-reading every transcript once per identity. The
+  collector now derives them from the export it already reads and validates
+  (`dailyUsageFromNativeMessages`, applied in `snapshot.ts`'s
+  `savePartition`), mirroring Tokscale 4.20's hourly aggregation: recovery
+  daily rows and undated balances skipped, timestamp-less rows keyed by date,
+  costs summed per hour in message order.
+  - **Bucket timezone: the exporter's config wins.** Hours are keyed in the
+    `scanner.bucketTimezone` of the `settings.json` in the TOKSCALE_CONFIG_DIR
+    the exporting process ran with (carried as the batch candidate's
+    `tokscaleConfigDir`, read after the run so Tokscale's own first-run pin
+    is seen). That is the isolated config, not the user's default
+    `~/.config/tokscale`: the exporter never reads the default, and the
+    batch's own `date` fields and recovery rows were bucketed in the
+    isolated zone, so any other file would contradict the batch.
+  - **Zone names match chrono-tz, not Intl.** Tokscale parses the name with
+    chrono-tz 0.10.4 (case-sensitive IANA names and links); anything else
+    (`asia/bangkok`, `+07:00`) means local time. `tokscale-zones.ts` holds
+    that crate's name list; regenerate it when the vendored Tokscale moves.
+  - `test/fixtures/tokscale-native-daily` (regenerate with its
+    `generate.ts` and the patched binary) pins equality with the patched
+    binary's own `hourly` over duplicates, the recovery overlay and a DST
+    change.
+
+  Report scans have no PATH/bunx fallback (a missing export is an error
+  row). PATH/bunx Tokscale remains only for `ais usage <tokscale args>`
+  passthrough (other than `tui`).
 
 - **`ais usage breakdown` answers WHAT consumed the tokens, per tool call
   (2026-09-10).** tokscale aggregates per model; breakdown.ts

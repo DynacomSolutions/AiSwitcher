@@ -16,8 +16,9 @@ export function startOfLocalDay(ms: number): Date {
 }
 
 /** "YYYY-MM-DD" in local time — matches the date portion of tokscale's own
- * `hour` bucket keys (see tokscale.ts's fetchTokscaleDailyUsage doc) so the
- * two can be joined/merged by plain string equality. */
+ * `hour` bucket keys when no zone is pinned (see tokscale.ts's
+ * hourlyEntriesFromNativeMessages) so the two can be joined/merged by plain
+ * string equality. */
 export function localDateKey(ms: number): string {
   const d = new Date(ms);
   const y = d.getFullYear();
