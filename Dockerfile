@@ -44,7 +44,7 @@ RUN case "${TARGETARCH}" in \
       *) echo "unsupported kubectl architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
  && export GOFLAGS=-mod=mod GOWORK=off CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" GOARM="${goarm}" \
- && go get golang.org/x/net@v0.60.0 golang.org/x/text@v0.42.0 \
+ && go get golang.org/x/net@v0.62.0 golang.org/x/text@v0.43.0 \
  && v=k8s.io/component-base/version \
  && go build -trimpath \
       -ldflags "-s -w -X ${v}.gitVersion=${KUBECTL_VERSION} -X ${v}.gitMajor=1 -X ${v}.gitMinor=37 -X ${v}.gitTreeState=clean -X ${v}.gitCommit=${KUBECTL_COMMIT}" \
