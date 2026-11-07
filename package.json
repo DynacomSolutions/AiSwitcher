@@ -1,7 +1,7 @@
 {
   "name": "ai-profile-switcher",
   "type": "module",
-  "version": "0.5.28",
+  "version": "0.5.29",
   "scripts": {
     "test": "bun test",
     "test:e2e": "bun test ./apps/chrome-extension/test/e2e/extension.e2e.ts",
