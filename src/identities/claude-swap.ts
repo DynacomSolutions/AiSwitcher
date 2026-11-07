@@ -7,6 +7,7 @@ import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuth
 import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, readSwapEvents as readPoolSwapEvents } from "./pool/ledger.ts";
 import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
 import { claudeAdapter } from "./pool/claude-adapter.ts";
+import { dropApiKeyHelper, isGatewayAccessToken, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
 import { performPoolSwap, type PerformSwapOptions } from "./pool/swap.ts";
 import { allowedAccounts, SwapPoolError, type PoolIdentity } from "./pool/swap-pool.ts";
 import type { Identity } from "./types.ts";
@@ -118,11 +119,120 @@ export interface SwapFsInput {
   lock?: LockOptions;
 }
 
+/** Writes the pool's live grant back to the member that owns it (refresh tokens rotate, so an unsynchronised copy would die).
+ * A grant that cannot be attributed is never destroyed: a 0600 copy is kept next to the pool credentials. Caller holds the claude locks. */
+async function writeBackPoolGrant(input: {
+  pool: PoolIdentity;
+  members: Identity[];
+  poolCredPath: string;
+  poolCredText: string | undefined;
+  poolGrant: OAuthGrant | undefined;
+  poolUuid: string | undefined;
+  lock?: LockOptions;
+  /** A login of a different known member than the active one is credited to that member (a /login inside a gateway pool). */
+  attributeByLogin?: boolean;
+}): Promise<{ writeBack: WriteBackOutcome; notes: string[] }> {
+  const { pool, members, poolCredPath, poolCredText, poolUuid } = input;
+  const notes: string[] = [];
+  // The gateway entry is not a member login: it is never written back anywhere.
+  const poolGrant = input.poolGrant && !isGatewayAccessToken(input.poolGrant.access_token) ? input.poolGrant : undefined;
+  const activeName = pool.swapPool.active ?? null;
+  let owner: Identity | undefined = activeName ? members.find((m) => m.name === activeName) : undefined;
+  const ownerMismatch = input.attributeByLogin && owner && poolGrant && poolUuid ? (accountUuid(parseObject(await readText(claudeJsonPath(owner.configDir)))) ?? poolUuid) !== poolUuid : false;
+  if ((!owner || ownerMismatch) && poolGrant) {
+    const inferred = await inferOwner(pool, members, poolGrant, poolUuid);
+    const found = members.find((m) => m.name === inferred);
+    if (found && !owner) notes.push(`pool had no recorded active account; live credentials matched "${inferred}"`);
+    if (found && ownerMismatch) notes.push(`pool login belongs to "${inferred}", not the active "${owner?.name}"`);
+    if (found || !ownerMismatch) owner = found;
+  }
+  let writeBack: WriteBackOutcome;
+  if (!owner) {
+    writeBack = poolGrant ? "none-unknown-owner" : "none-no-live-credentials";
+  } else {
+    const ownerGrant = (await readProviderGrantCopy("claude", owner.configDir))?.grant;
+    const ownerUuid = accountUuid(parseObject(await readText(claudeJsonPath(owner.configDir))));
+    writeBack = decideWriteBack({ pool: poolGrant, member: ownerGrant, poolAccountUuid: poolUuid, memberAccountUuid: ownerUuid });
+    if (writeBack === "written" && poolCredText !== undefined) {
+      const ownerCredPath = nativeStorePathFor("claude", owner.configDir);
+      await withOauthRefreshLock(owner.configDir, () => writeFileAtomic(ownerCredPath, poolCredText), input.lock);
+    }
+  }
+  // A live grant we cannot attribute is never silently destroyed.
+  if ((writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && poolCredText !== undefined && poolGrant) {
+    const backup = `${poolCredPath}.pre-swap.bak`;
+    await writeFileAtomic(backup, poolCredText);
+    notes.push(`live pool credentials could not be attributed to a member; kept a 0600 backup copy at ${backup}`);
+  }
+  return { writeBack, notes };
+}
+
+/** The gateway token when `pool` routes through the AIS gateway (settings at the local proxy or cluster gateway, or the
+ * gateway entry already in place); undefined for an ordinary pool. A routed pool without a token is an error, never a
+ * silent fall back to a real login. */
+async function gatewayTokenFor(pool: PoolIdentity): Promise<string | undefined> {
+  let remoteBase = "";
+  try {
+    const { resolveRemoteBase } = await import("../cli/gateway/local-remote.ts");
+    remoteBase = await resolveRemoteBase();
+  } catch {
+    // no remote known: the local proxy and the stored entry still identify a gateway pool
+  }
+  if (!(await isGatewayRoutedDir(pool.configDir, remoteBase ? { remoteBase } : {}))) return undefined;
+  const token = await readGatewayClaudeToken();
+  if (!token) {
+    throw new SwapPoolError(`Pool "${pool.name}" routes through the AIS gateway, but the secrets file has no AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN; run "ais gateway app add agents-claude" or restore it.`);
+  }
+  return token;
+}
+
+/** Puts the gateway entry in a gateway-routed pool folder, first saving any real login found there (to its member, else
+ * a 0600 backup). Caller holds the claude locks. Returns the notes and whether anything changed. */
+async function installGatewayEntry(input: { pool: PoolIdentity; members: Identity[]; token: string; lock?: LockOptions }): Promise<{ changed: boolean; entryReplaced: boolean; writeBack: WriteBackOutcome; notes: string[] }> {
+  const { pool, members, token } = input;
+  const poolCredPath = nativeStorePathFor("claude", pool.configDir);
+  const current = await storedAccessToken(pool.configDir);
+  if (current === token) {
+    const dropped = await dropApiKeyHelper(pool.configDir);
+    return { changed: dropped, entryReplaced: false, writeBack: "none-identical", notes: dropped ? ["removed apiKeyHelper from the gateway identity's settings"] : [] };
+  }
+  const poolCredText = await readText(poolCredPath);
+  const poolGrant = (await readProviderGrantCopy("claude", pool.configDir))?.grant;
+  const poolUuid = accountUuid(parseObject(await readText(claudeJsonPath(pool.configDir))));
+  const { writeBack, notes } = await writeBackPoolGrant({ pool, members, poolCredPath, poolCredText, poolGrant, poolUuid, attributeByLogin: true, ...(input.lock ? { lock: input.lock } : {}) });
+  await mkdir(pool.configDir, { recursive: true });
+  await writeGatewayEntry(pool.configDir, token);
+  if (await dropApiKeyHelper(pool.configDir)) notes.push("removed apiKeyHelper from the gateway identity's settings");
+  return { changed: true, entryReplaced: true, writeBack, notes };
+}
+
+/** Pool heal for a gateway-routed claude pool: a `/login` (or anything else) that left a real login in the folder is saved
+ * and the gateway entry restored. Quiet when the entry is already in place or the pool is not gateway-routed. */
+export async function healGatewayPool(pool: PoolIdentity, members: Identity[], lock?: LockOptions): Promise<string[]> {
+  const token = await gatewayTokenFor(pool).catch(() => undefined);
+  if (!token) return [];
+  return withClaudeLocks(pool.configDir, async () => {
+    const r = await installGatewayEntry({ pool, members, token, ...(lock ? { lock } : {}) });
+    if (!r.changed) return [];
+    if (!r.entryReplaced) return r.notes.map((n) => `pool ${pool.name}: ${n}`);
+    return [`pool ${pool.name}: a real login was found in the gateway identity; restored the gateway entry`, ...r.notes];
+  }, lock);
+}
+
 /** The filesystem half: write-back, credential copy, oauthAccount replace.
  * Does not touch the registry or ledger. */
 export async function swapCredentialFiles(input: SwapFsInput): Promise<Omit<SwapResult, "reason">> {
   const { pool, members, target } = input;
   const poolDir = pool.configDir;
+  const gatewayToken = await gatewayTokenFor(pool);
+  if (gatewayToken) {
+    // A gateway-routed pool never holds a member login: the swap only records which member is active.
+    return withClaudeLocks(poolDir, async () => {
+      const activeName = pool.swapPool.active ?? null;
+      const r = await installGatewayEntry({ pool, members, token: gatewayToken, ...(input.lock ? { lock: input.lock } : {}) });
+      return { pool: pool.name, from: activeName, to: target.name, noop: !r.changed && activeName === target.name, writeBack: r.writeBack, notes: r.notes };
+    }, input.lock);
+  }
   const poolCredPath = nativeStorePathFor("claude", poolDir);
   const targetCredPath = nativeStorePathFor("claude", target.configDir);
   const notes: string[] = [];
@@ -152,30 +262,8 @@ export async function swapCredentialFiles(input: SwapFsInput): Promise<Omit<Swap
     }
 
     // (b) write-back first
-    let owner: Identity | undefined = activeName ? members.find((m) => m.name === activeName) : undefined;
-    if (!owner && poolGrant) {
-      const inferred = await inferOwner(pool, members, poolGrant, poolUuid);
-      owner = members.find((m) => m.name === inferred);
-      if (inferred) notes.push(`pool had no recorded active account; live credentials matched "${inferred}"`);
-    }
-    let writeBack: WriteBackOutcome;
-    if (!owner) {
-      writeBack = poolGrant ? "none-unknown-owner" : "none-no-live-credentials";
-    } else {
-      const ownerGrant = (await readProviderGrantCopy("claude", owner.configDir))?.grant;
-      const ownerUuid = accountUuid(parseObject(await readText(claudeJsonPath(owner.configDir))));
-      writeBack = decideWriteBack({ pool: poolGrant, member: ownerGrant, poolAccountUuid: poolUuid, memberAccountUuid: ownerUuid });
-      if (writeBack === "written" && poolCredText !== undefined) {
-        const ownerCredPath = nativeStorePathFor("claude", owner.configDir);
-        await withOauthRefreshLock(owner.configDir, () => writeFileAtomic(ownerCredPath, poolCredText), input.lock);
-      }
-    }
-    // A live grant we cannot attribute is never silently destroyed.
-    if ((writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && poolCredText !== undefined) {
-      const backup = `${poolCredPath}.pre-swap.bak`;
-      await writeFileAtomic(backup, poolCredText);
-      notes.push(`live pool credentials could not be attributed to a member; kept a 0600 copy at ${backup}`);
-    }
+    const { writeBack, notes: wbNotes } = await writeBackPoolGrant({ pool, members, poolCredPath, poolCredText, poolGrant, poolUuid, lock: input.lock });
+    notes.push(...wbNotes);
 
     // (c) credentials, (d) oauthAccount; roll (c) back if (d) fails
     await mkdir(poolDir, { recursive: true });
