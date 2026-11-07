@@ -3,7 +3,9 @@
 export interface BackupProgress {
   /** Bytes the backup is expected to copy; undefined while still being measured. */
   totalBytes?: number;
-  doneBytes: number;
+  doneBytes?: number;
+  /** Label of a later phase (e.g. "snapshotting databases") shown once the copy itself is done. */
+  phase?: string;
 }
 
 /** Samples needed, and the minimum time they must span, before an ETA is trusted. */
@@ -52,10 +54,11 @@ export function formatProgressLine(progress: BackupProgress | undefined, samples
   if (!progress || progress.totalBytes === undefined) return `still backing up (measuring, elapsed ${elapsed})`;
   const total = progress.totalBytes;
   if (total <= 0) return `still backing up (nothing new to copy, finishing, elapsed ${elapsed})`;
-  const done = Math.min(progress.doneBytes, total);
+  const done = Math.min(progress.doneBytes ?? 0, total);
   const pct = Math.floor((done / total) * 100);
   const eta = etaSeconds(samples, total);
   const etaText = eta === undefined ? "ETA estimating..." : `ETA ${formatDuration(eta)}`;
+  if (progress.phase) return `backing up ${pct}% (${formatBytesPair(done, total)}), ${progress.phase} (elapsed ${elapsed})`;
   return `backing up ${pct}% (${formatBytesPair(done, total)}), ${etaText} (elapsed ${elapsed})`;
 }
 
@@ -69,9 +72,9 @@ export function createProgressTracker(now: () => number = Date.now): {
   let samples: ProgressSample[] = [];
   return {
     report(p) {
-      if (current && p.doneBytes < current.doneBytes) samples = []; // the copy restarted
-      current = { ...p };
-      samples.push({ at: now(), done: p.doneBytes });
+      if (current && p.doneBytes !== undefined && p.doneBytes < (current.doneBytes ?? 0)) samples = []; // the copy restarted
+      current = { ...current, ...p };
+      if (p.doneBytes !== undefined) samples.push({ at: now(), done: p.doneBytes });
       if (samples.length > 60) samples.splice(0, samples.length - 60);
     },
     line: () => formatProgressLine(current, samples, now() - started),

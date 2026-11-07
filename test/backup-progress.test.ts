@@ -36,6 +36,15 @@ test("progress line matches the owner's format and says estimating early", () =>
   console.log(`ais update: ${line}`);
 });
 
+test("a later phase replaces the ETA so 100% does not look stuck", () => {
+  let now = 0;
+  const t = createProgressTracker(() => now);
+  t.report({ totalBytes: 100, doneBytes: 100 });
+  now = 7000;
+  t.report({ phase: "snapshotting databases" });
+  expect(t.line()).toBe("backing up 100% (100.0 / 100.0 B), snapshotting databases (elapsed 7s)".replace("100.0 / 100.0 B", "100 / 100 B"));
+});
+
 test("zero total and restart", () => {
   expect(formatProgressLine({ totalBytes: 0, doneBytes: 0 }, [], 5000)).toContain("nothing new to copy");
   let now = 0;

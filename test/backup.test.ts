@@ -516,7 +516,7 @@ describe("runBackup lock and progress", () => {
     await mkdir(join(home, ".ais"), { recursive: true });
     await Bun.write(join(home, ".ais", "backups.lock"), JSON.stringify({ pid: dead.pid, token: "stale", startedAt: "2026-11-07T00:00:00Z" }) + "\n");
 
-    const seen: { totalBytes?: number; doneBytes: number }[] = [];
+    const seen: { totalBytes?: number; doneBytes?: number }[] = [];
     await runBackup(["codex"], home, join(home, "none.json"), (p) => seen.push({ ...p }));
 
     const last = seen[seen.length - 1]!;
@@ -525,12 +525,25 @@ describe("runBackup lock and progress", () => {
     expect(existsSync(join(home, ".ais", "backups.lock"))).toBe(false);
   });
 
+  test("without exitOnSignal no SIGINT/SIGTERM listeners are registered", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "x");
+    const base = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+    let during: number[] = [];
+    await runBackup(["codex"], home, join(home, "none.json"), () => { during = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")]; });
+    expect(during).toEqual(base);
+    let withOpt: number[] = [];
+    await runBackup(["codex"], home, join(home, "none.json"), () => { withOpt = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")]; }, { exitOnSignal: true });
+    expect(withOpt).toEqual([base[0]! + 1, base[1]! + 1]);
+    expect([process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")]).toEqual(base);
+  });
+
   test("SIGTERM releases the lock", async () => {
     const home = await makeHome();
     await write(join(home, ".codex", "a.txt"), "x");
     const script = join(home, "run.ts");
     const mod = join(import.meta.dir, "..", "scripts", "backup.ts");
-    await Bun.write(script, `import { runBackup } from ${JSON.stringify(mod)};\nawait runBackup(["codex"], ${JSON.stringify(home)}, ${JSON.stringify(join(home, "none.json"))}, () => { process.kill(process.pid, "SIGTERM"); });\nawait Bun.sleep(5000);\n`);
+    await Bun.write(script, `import { runBackup } from ${JSON.stringify(mod)};\nawait runBackup(["codex"], ${JSON.stringify(home)}, ${JSON.stringify(join(home, "none.json"))}, () => { process.kill(process.pid, "SIGTERM"); }, { exitOnSignal: true });\nawait Bun.sleep(5000);\n`);
     const proc = Bun.spawn([process.execPath, script], { stdout: "ignore", stderr: "ignore" });
     await proc.exited;
     expect(existsSync(join(home, ".ais", "backups.lock"))).toBe(false);

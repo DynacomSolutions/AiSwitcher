@@ -466,6 +466,7 @@ async function backupAndCommitInner(groups: readonly BackupGroup[], home: string
   try {
     return await commitMirrored(home, repoDir, mirrored, polluted, sqlite.all, onProgress);
   } finally {
+    if (sqlite.dbs.length > 0) onProgress?.({ phase: "snapshotting databases" });
     await snapshotSqlite(home, sqlite.dbs);
   }
 }
@@ -934,6 +935,8 @@ export async function runBackup(
   home: string = homedir(),
   configPath: string = aisBackupConfigPath(process.env, home),
   onProgress?: (p: BackupProgress) => void,
+  /** CLI entry points set `exitOnSignal`; a daemon must not, so its own graceful shutdown keeps working. */
+  options: { exitOnSignal?: boolean } = {},
 ): Promise<string> {
   // The lock covers everything, including legacy-mirror deletion and the trim.
   // Try once, so a held lock is reported instead of waiting up to 10 minutes in silence.
@@ -952,16 +955,20 @@ export async function runBackup(
   };
   const onInt = (): void => onSignal("SIGINT");
   const onTerm = (): void => onSignal("SIGTERM");
-  process.on("SIGINT", onInt);
-  process.on("SIGTERM", onTerm);
+  if (options.exitOnSignal) {
+    process.on("SIGINT", onInt);
+    process.on("SIGTERM", onTerm);
+  }
   try {
     const repoDir = await backupAndCommit(groups, home, onProgress);
     const config = await loadBackupConfig(configPath);
     if (config.remote) await pushAndTrim(repoDir, home, config.remote, config.localRetentionDays);
     return repoDir;
   } finally {
-    process.off("SIGINT", onInt);
-    process.off("SIGTERM", onTerm);
+    if (options.exitOnSignal) {
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+    }
     await release();
   }
 }
@@ -971,7 +978,7 @@ export async function runBackupWithProgress(intervalMs = 15_000): Promise<string
   const tracker = createProgressTracker();
   const timer = setInterval(() => console.error(`backup: ${tracker.line()}`), intervalMs);
   try {
-    return await runBackup(undefined, undefined, undefined, tracker.report);
+    return await runBackup(undefined, undefined, undefined, tracker.report, { exitOnSignal: true });
   } finally {
     clearInterval(timer);
   }

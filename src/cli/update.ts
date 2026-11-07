@@ -90,7 +90,7 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
       options.heartbeatMs ?? HEARTBEAT_MS,
     );
     try {
-      console.log(`${prefix} backup complete: ${await (options.backup ?? ((onProgress) => runBackup(undefined, undefined, undefined, onProgress)))(tracker.report)}`);
+      console.log(`${prefix} backup complete: ${await (options.backup ?? ((onProgress) => runBackup(undefined, undefined, undefined, onProgress, { exitOnSignal: true })))(tracker.report)}`);
     } catch (error) {
       // Nothing was downloaded yet: say so, so a failed backup is never mistaken for an update.
       throw new Error(`backup failed, so NOTHING was updated: ${error instanceof Error ? error.message : String(error)}. Fix that, or run "ais update --no-backup" to update without a snapshot.`);
