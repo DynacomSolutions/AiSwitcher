@@ -176,6 +176,30 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     size and mtime recorded at promotion.
   - Codex Bedrock partitions read their all-time rollouts through a per-file
     record cache (`usage/local-spend/`), keyed on dev, inode, size, mtime and ctime.
+  - Each native export passes `TOKSCALE_AIS_CACHE_SCOPE`, a hash of the tool
+    and the scanned source directory (`aisTokscaleCacheScope`), so Tokscale
+    keeps one message cache per source
+    (`isolated-config/cache/source-message-cache-v2-ais-scope/<scope>/`) and
+    an export loads and rewrites only its own entries. Keying by directory,
+    not identity name, keeps the cache across a rename; cache entries are
+    keyed by absolute path, so a new directory could not reuse them anyway.
+    Every scoped export stamps its scope directory's mtime; a cycle removes a
+    scope only when no live source uses it and it has been idle for 30 days,
+    and skips the sweep when target or pool discovery failed or a native
+    tool's identities registry file is missing (a missing file loads as an
+    empty list). The age floor also protects a second collector that sees
+    the same caches under translated paths. Measured live on 7 Nov
+    2026 before this change, every Claude export read the whole 611 MB Claude
+    namespace and every Codex export the 337 MB Codex one, even for an
+    unchanged identity: about 8 GB of the roughly 10 GB a full round read.
+    Each scope seeds itself once from the shared shards (see
+    `vendor/tokscale/README.md`).
+  - Codex resumes and Codex fingerprints use the sampled digest, as Claude
+    checkpoints do, instead of hashing the whole rollout.
+  - Still open: a changed batch (the swap pool, about 480 MB) is written whole
+    and read back each cycle, which is most of the collector's disk writes,
+    and the Grok reader re-reads its whole session tree (about 0.9 GB per
+    round) while a session is active.
   - Totals stay those of a cold scan: every shortcut is either exact (an
     unchanged file, an append of whole lines, byte-identical messages) or
     falls back to the full read.

@@ -49,6 +49,7 @@ tar -xzf "$archive" --strip-components=1 -C "$source_dir"
 cmp -- "$repo_root/vendor/tokscale/LICENSE" "$source_dir/LICENSE"
 patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais.patch"
 patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-io.patch"
+patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-scope.patch"
 
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_shared_snapshot)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib selector_)
@@ -58,6 +59,9 @@ patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/pa
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_sampled_prefix)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib test_resume_)
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --test cli_tests ais_native_export_reports_unchanged_messages_instead_of_rewriting_the_batch)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_cache_scope)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_codex_resume)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib codex_prefix)
 (cd "$source_dir" && cargo build --locked --release --package tokscale-cli --bin tokscale)
 
 if [[ -z "$target_dir" ]]; then

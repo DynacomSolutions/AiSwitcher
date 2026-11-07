@@ -1,7 +1,7 @@
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { lstat, mkdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
 import { access, constants as fsConstants, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -164,21 +164,11 @@ export async function buildAisTokscaleExportInvocation(
     throw new Error("native-export-binary-unavailable");
   }
 
-  let sourceEnv: Record<string, string>;
-  let clientArgs: string[];
-  if (target.toolName === "opencode" && !target.identity) {
-    sourceEnv = { XDG_DATA_HOME: join(homedir(), ".local", "share") };
-    clientArgs = ["--client", "opencode"];
-  } else if (target.toolName === "pi" && target.identity) {
-    sourceEnv = { PI_CODING_AGENT_DIR: target.identity.configDir };
-    clientArgs = ["--client", "pi"];
-  } else {
-    if (!target.identity) throw new Error("native-export-identity-required");
-    const invocation = await tokscaleInvocationFor(target.toolName, target.identity);
-    if (!invocation || target.toolName === "ali" || target.toolName === "zai") return undefined;
-    sourceEnv = invocation.env;
-    clientArgs = invocation.clientArgs;
-  }
+  const defaultOpencode = target.toolName === "opencode" && !target.identity;
+  if (!target.identity && !defaultOpencode) throw new Error("native-export-identity-required");
+  const sourceEnv = aisNativeSourceEnv(target.toolName, target.identity);
+  if (!sourceEnv) return undefined;
+  const clientArgs = ["--client", target.toolName];
 
   // The native exporter runs with an isolated config directory. Pass the
   // caller's pre-isolation Tokscale config root separately so its one-time
@@ -196,6 +186,10 @@ export async function buildAisTokscaleExportInvocation(
       TOKSCALE_CONFIG_DIR: aisNativeTokscaleConfigDir(),
       TOKSCALE_AIS_EXPORT_PATH: target.exportPath,
       TOKSCALE_AIS_PARTITION_ID: target.partitionId,
+      // One message-cache scope per scanned source root: an export reads and
+      // rewrites only its own identity's cache entries, not the whole
+      // namespace (vendor/tokscale README).
+      TOKSCALE_AIS_CACHE_SCOPE: aisTokscaleCacheScope(target.toolName, sourceEnv),
       // A warm scan trusts an exact size and mtime match, so an unchanged
       // transcript is only stat'ed, never read (vendor/tokscale README).
       TOKSCALE_AIS_STAT_ONLY_CACHE: "1",
@@ -206,6 +200,81 @@ export async function buildAisTokscaleExportInvocation(
     cwd: process.cwd(),
     ...(target.signal ? { signal: target.signal } : {}),
   };
+}
+
+/** The env that points the native exporter at one source's data: the same
+ * roots `tokscaleInvocationFor` uses, plus the default OpenCode profile and
+ * Pi. Undefined for tools without native capture (Z.ai, Alibaba). */
+export function aisNativeSourceEnv(toolName: ToolConfig["toolName"], identity: Identity | undefined): Record<string, string> | undefined {
+  if (!identity) return toolName === "opencode" ? { XDG_DATA_HOME: join(homedir(), ".local", "share") } : undefined;
+  switch (toolName) {
+    case "codex": return { CODEX_HOME: identity.configDir };
+    case "grok": return { GROK_HOME: identity.configDir };
+    case "kimi": return { KIMI_CODE_HOME: identity.configDir };
+    case "claude": return { CLAUDE_CONFIG_DIR: identity.configDir };
+    case "opencode": return { XDG_DATA_HOME: join(identity.configDir, "data") };
+    case "pi": return { PI_CODING_AGENT_DIR: identity.configDir };
+    default: return undefined;
+  }
+}
+
+/** Tokscale's message-cache scope for one source. It is keyed by the tool
+ * and the scanned root, not the identity name: cache entries are keyed by
+ * absolute path, so a renamed or re-added identity with the same directory
+ * keeps its cache, and a new directory could not reuse old entries anyway. */
+export function aisTokscaleCacheScope(toolName: string, sourceEnv: Record<string, string>): string {
+  const roots = Object.keys(sourceEnv).sort().map((key) => `${key}=${resolve(sourceEnv[key]!)}`).join("\0");
+  return createHash("sha256").update(`ais-tokscale-cache-scope-v1\0${toolName}\0${roots}`).digest("hex");
+}
+
+const TOKSCALE_CACHE_SCOPE_DIRNAME = "source-message-cache-v2-ais-scope";
+
+/** Where the patched Tokscale keeps scoped message caches. */
+export function aisTokscaleCacheScopeRoot(): string {
+  return join(aisNativeTokscaleConfigDir(), "cache", TOKSCALE_CACHE_SCOPE_DIRNAME);
+}
+
+/** A scope unused for this long, and absent from the live set, is removed. */
+export const TOKSCALE_CACHE_SCOPE_MAX_IDLE_MS = 30 * 24 * 60 * 60_000;
+
+/** Stamp a scope as used: its directory mtime is the sweep's last-use time.
+ * Tokscale writes only inside the namespace subdirectories, so without this
+ * an unchanged source's scope would look idle. Never throws. */
+export function markTokscaleCacheScopeUsed(env: Record<string, string>): void {
+  const scope = env.TOKSCALE_AIS_CACHE_SCOPE;
+  const configDir = env.TOKSCALE_CONFIG_DIR;
+  if (!scope || !/^[a-f0-9]{64}$/.test(scope) || !configDir || !isAbsolute(configDir)) return;
+  try {
+    const dir = join(configDir, "cache", TOKSCALE_CACHE_SCOPE_DIRNAME, scope);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const now = new Date();
+    utimesSync(dir, now, now);
+  } catch { /* a missed stamp only delays nothing: the scope stays live or young */ }
+}
+
+/** Delete scoped caches that no live source uses and that no export has used
+ * for `maxIdleMs` (a removed identity or a moved directory). The age floor
+ * protects a source that is only briefly missing from discovery, and a second
+ * collector that sees the same caches under different paths. Never throws;
+ * returns the number removed. */
+export function sweepUnusedTokscaleCacheScopes(
+  liveScopes: ReadonlySet<string>,
+  root = aisTokscaleCacheScopeRoot(),
+  nowMs = Date.now(),
+  maxIdleMs = TOKSCALE_CACHE_SCOPE_MAX_IDLE_MS,
+): number {
+  let names: string[];
+  try { names = readdirSync(root); } catch { return 0; }
+  let removed = 0;
+  for (const name of names) {
+    if (!/^[a-f0-9]{64}$/.test(name) || liveScopes.has(name)) continue;
+    try {
+      if (nowMs - statSync(join(root, name)).mtimeMs < maxIdleMs) continue;
+      rmSync(join(root, name), { recursive: true, force: true });
+      removed++;
+    } catch { /* retried next cycle */ }
+  }
+  return removed;
 }
 
 /** The isolated Tokscale config directory every native export runs with. Its
@@ -219,6 +288,7 @@ export function aisNativeTokscaleConfigDir(): string {
  * separately written export envelope before it can become visible. */
 export async function runAisTokscaleExportInvocation(invocation: AisTokscaleExportInvocation): Promise<string> {
   if (invocation.signal?.aborted) throw new Error("native-export-aborted");
+  markTokscaleCacheScopeUsed(invocation.env);
   return withTokscaleProcessSlot(() =>
     spawnTokscaleProcess(invocation.command, [], [...invocation.args, "--json"], invocation.env, tokscaleExportTimeoutMs()));
 }

@@ -10,6 +10,7 @@ import {
   dailyUsageFromHourlyEntries,
   prepareMergedPassthrough,
   tokscaleInvocationFor,
+  aisTokscaleCacheScope,
   tokscaleSpawnTimeoutMs,
   tokscaleTimeoutMessage,
   DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS,
@@ -129,6 +130,20 @@ describe("AIS native export cache seeding", () => {
     }, { AIS_TOKSCALE_SHARED_BIN: command });
     expect(invocation?.env.TOKSCALE_AIS_STAT_ONLY_CACHE).toBe("1");
     expect(invocation?.env.TOKSCALE_CONFIG_DIR).toContain("/usage/native-tokscale/isolated-config");
+  });
+
+  test("scopes the message cache to the partition so an export loads only its own entries", async () => {
+    const dir = await makeConfigDir();
+    const command = join(dir, "fake-tokscale");
+    await writeFile(command, "#!/bin/sh\nexit 0\n");
+    await chmod(command, 0o700);
+    const partitionId = "e".repeat(64);
+    const invocation = await buildAisTokscaleExportInvocation({
+      toolName: "codex", identity: identity("/identity/codex"),
+      partitionId, exportPath: join(dir, "candidate.json"),
+    }, { AIS_TOKSCALE_SHARED_BIN: command });
+    expect(invocation?.env.TOKSCALE_AIS_CACHE_SCOPE).toBe(aisTokscaleCacheScope("codex", { CODEX_HOME: "/identity/codex" }));
+    expect(invocation?.env.TOKSCALE_AIS_CACHE_SCOPE).not.toBe(partitionId);
   });
 
   test("passes the committed batch digest so identical messages are not written again", async () => {

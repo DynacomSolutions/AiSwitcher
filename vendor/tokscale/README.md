@@ -54,7 +54,34 @@ The patch adds three AIS-only surfaces:
   transcript; a rewrite through a new file, a truncation or an edit inside a
   window still forces the full parse. Checkpoints written before this change
   never match the new digest, so each growing transcript is re-parsed once.
-  Codex resumes still hash their whole prefix.
+
+- Codex resumes use the same sampled digest under their own domain
+  (`patches/v4.20.0-ais-scope.patch`). A plain rollout's fingerprint
+  `content_hash` is that digest of the whole file, so it still equals the
+  incremental `prefix_hash` when everything was consumed. Upstream read a
+  grown rollout whole up to three times per scan (fingerprint, prefix check,
+  new fingerprint). Zstd archives keep the full hash. The trade-off is the
+  Claude one above; entries written before this change are re-parsed once.
+
+- `TOKSCALE_AIS_CACHE_SCOPE=<lowercase hex>` gives a scan its own message
+  cache under `cache/source-message-cache-v2-ais-scope/<scope>/`, with the
+  same 256-shard layout. Without it every per-identity export deserialized
+  the whole namespace (all identities' Claude or Codex entries) and rewrote
+  every shared shard one of its changed entries hashed into. A scoped
+  namespace is seeded once: the first scoped scan reads the shared shards,
+  records the entries it looks up plus, for Claude, every entry under its
+  scan roots (so retained history of deleted transcripts and transcripts the
+  directory walk missed are kept), writes those and its own changes to the
+  scoped shards and only then publishes `.ais-scope-seeded`. Codex and the
+  other namespaces carry only looked-up entries: they retain no history, so
+  a missed entry is just re-parsed from the live file later. If the shared
+  directory or any shared shard cannot be read, the marker is not published
+  and the next scan seeds again. Before the marker the shared shards stay
+  authoritative. When an interrupted seed left a scoped copy, the copy with
+  the newer source fingerprint wins and absorbs the other's retained
+  history; for a deleted source the copy that retains history wins. The
+  shared shards are never written by a scoped scan. Invalid values are
+  ignored (the scan stays unscoped).
 
 - The export envelope carries `messagesSha256`, the SHA-256 of its `messages`
   array as written. When AIS passes the digest of the batch it already holds
@@ -67,8 +94,10 @@ The patch adds three AIS-only surfaces:
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
-sets the attempt-unique export path and opaque partition key, and enables
-the stat-only warm cache. For default
+sets the attempt-unique export path and opaque partition key, sets the
+message-cache scope to a hash of the tool and the scanned source directory
+(so a renamed identity keeps its cache; a scope no live source uses and no
+export has used for 30 days is swept), and enables the stat-only warm cache. For default
 OpenCode it points `XDG_DATA_HOME` at the exact default profile's data root.
 Z.ai and Alibaba are unsupported for native batch capture and remain
 explicitly outside this coverage.
@@ -80,7 +109,7 @@ bash scripts/build-tokscale-ais.sh
 ```
 
 The helper downloads only the pinned release archive, verifies its checksum and
-licence, applies `patches/v4.20.0-ais.patch` and then `patches/v4.20.0-ais-io.patch`, and installs to
+licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch` and then `patches/v4.20.0-ais-scope.patch`, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.
