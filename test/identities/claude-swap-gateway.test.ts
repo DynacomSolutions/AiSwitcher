@@ -186,6 +186,18 @@ describe("heal restores the gateway entry after a /login", () => {
     expect(await heal()).toEqual([]);
   });
 
+  test("apiKeyHelper is removed from a gateway pool's settings by swap and by heal; other settings stay", async () => {
+    const f = join(poolDir(), "settings.json");
+    const withHelper = () => writeFile(f, JSON.stringify({ apiKeyHelper: "/x/ais-gateway-key", env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:47140/claude" }, model: "opus" }));
+    await withHelper();
+    await performSwap({ registryPath: registry, ledgerPath: ledger, pool: "pool", target: "b", reason: "manual" });
+    expect(await read(f)).toEqual({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:47140/claude" }, model: "opus" });
+    await withHelper();
+    expect((await heal()).length).toBe(1);
+    expect((await read(f)).apiKeyHelper).toBeUndefined();
+    expect(await heal()).toEqual([]);
+  });
+
   test("a pool that is not gateway-routed is not touched by the gateway heal", async () => {
     expect(await heal()).toEqual([]);
     expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.accessToken).toBe("at-a1");

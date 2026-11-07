@@ -7,7 +7,7 @@ import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuth
 import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, readSwapEvents as readPoolSwapEvents } from "./pool/ledger.ts";
 import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
 import { claudeAdapter } from "./pool/claude-adapter.ts";
-import { isGatewayAccessToken, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
+import { dropApiKeyHelper, isGatewayAccessToken, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
 import { performPoolSwap, type PerformSwapOptions } from "./pool/swap.ts";
 import { allowedAccounts, SwapPoolError, type PoolIdentity } from "./pool/swap-pool.ts";
 import type { Identity } from "./types.ts";
@@ -188,18 +188,22 @@ async function gatewayTokenFor(pool: PoolIdentity): Promise<string | undefined> 
 
 /** Puts the gateway entry in a gateway-routed pool folder, first saving any real login found there (to its member, else
  * a 0600 backup). Caller holds the claude locks. Returns the notes and whether anything changed. */
-async function installGatewayEntry(input: { pool: PoolIdentity; members: Identity[]; token: string; lock?: LockOptions }): Promise<{ changed: boolean; writeBack: WriteBackOutcome; notes: string[] }> {
+async function installGatewayEntry(input: { pool: PoolIdentity; members: Identity[]; token: string; lock?: LockOptions }): Promise<{ changed: boolean; entryReplaced: boolean; writeBack: WriteBackOutcome; notes: string[] }> {
   const { pool, members, token } = input;
   const poolCredPath = nativeStorePathFor("claude", pool.configDir);
   const current = await storedAccessToken(pool.configDir);
-  if (current === token) return { changed: false, writeBack: "none-identical", notes: [] };
+  if (current === token) {
+    const dropped = await dropApiKeyHelper(pool.configDir);
+    return { changed: dropped, entryReplaced: false, writeBack: "none-identical", notes: dropped ? ["removed apiKeyHelper from the gateway identity's settings"] : [] };
+  }
   const poolCredText = await readText(poolCredPath);
   const poolGrant = (await readProviderGrantCopy("claude", pool.configDir))?.grant;
   const poolUuid = accountUuid(parseObject(await readText(claudeJsonPath(pool.configDir))));
   const { writeBack, notes } = await writeBackPoolGrant({ pool, members, poolCredPath, poolCredText, poolGrant, poolUuid, attributeByLogin: true, ...(input.lock ? { lock: input.lock } : {}) });
   await mkdir(pool.configDir, { recursive: true });
   await writeGatewayEntry(pool.configDir, token);
-  return { changed: true, writeBack, notes };
+  if (await dropApiKeyHelper(pool.configDir)) notes.push("removed apiKeyHelper from the gateway identity's settings");
+  return { changed: true, entryReplaced: true, writeBack, notes };
 }
 
 /** Pool heal for a gateway-routed claude pool: a `/login` (or anything else) that left a real login in the folder is saved
@@ -210,6 +214,7 @@ export async function healGatewayPool(pool: PoolIdentity, members: Identity[], l
   return withClaudeLocks(pool.configDir, async () => {
     const r = await installGatewayEntry({ pool, members, token, ...(lock ? { lock } : {}) });
     if (!r.changed) return [];
+    if (!r.entryReplaced) return r.notes.map((n) => `pool ${pool.name}: ${n}`);
     return [`pool ${pool.name}: a real login was found in the gateway identity; restored the gateway entry`, ...r.notes];
   }, lock);
 }

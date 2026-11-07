@@ -89,3 +89,14 @@ export async function isGatewayRoutedDir(configDir: string, opts: { localPort?: 
 export async function writeGatewayEntry(configDir: string, token: string): Promise<void> {
   await writeFileAtomic(join(configDir, ".credentials.json"), gatewayEntryText(token));
 }
+
+/** Removes `apiKeyHelper` from the folder's settings.json (it would switch Claude Code out of subscriber mode). Other keys
+ * are kept; returns whether anything was removed. */
+export async function dropApiKeyHelper(configDir: string): Promise<boolean> {
+  const path = join(configDir, "settings.json");
+  const settings = await readJson(path);
+  if (!settings || !("apiKeyHelper" in settings)) return false;
+  delete settings.apiKeyHelper;
+  await writeFileAtomic(path, `${JSON.stringify(settings, null, 2)}\n`);
+  return true;
+}
