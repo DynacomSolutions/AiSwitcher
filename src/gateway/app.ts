@@ -581,8 +581,17 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (pick.reject === "no-headroom" && app.target.kind === "pool") {
       // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
       const quotaOut = new Set([...(await exhaustedNames())].filter((n) => !holds.has(exKey(n))));
-      const free = await pickIdentity(app, deps, quotaOut);
-      const h = "identity" in free ? holds.get(exKey(free.identity)) : undefined;
+      let free = await pickIdentity(app, deps, quotaOut);
+      let h = "identity" in free ? holds.get(exKey(free.identity)) : undefined;
+      if (h?.kind === "cred") {
+        // A burst-held member frees sooner than a credential-held one, so it decides the answer.
+        const noCred = new Set([...quotaOut, ...[...holds].filter(([k, v]) => v.kind === "cred" && k.startsWith(exKey(""))).map(([k]) => k.slice(exKey("").length))]);
+        const alt = await pickIdentity(app, deps, noCred);
+        if ("identity" in alt && holds.get(exKey(alt.identity))?.kind === "burst") {
+          free = alt;
+          h = holds.get(exKey(alt.identity));
+        }
+      }
       if (h?.kind === "burst" && "identity" in free) {
         const secs = Math.min(60, Math.max(1, Math.ceil(((exhausted.get(exKey(free.identity)) ?? 0) - deps.now().getTime()) / 1000)));
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
