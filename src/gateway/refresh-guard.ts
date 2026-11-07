@@ -197,8 +197,20 @@ export interface GuardDeps {
 const defaultReadGrant = async (tool: RefreshableTool, identity: Identity, claudeRegistryPath?: string): Promise<OAuthGrant | undefined> =>
   (await readEffectiveGrant(tool, identity, claudeRegistryPath ? { claudeRegistryPath } : {}))?.grant;
 
-/** Reasons only: store and driver errors can carry connection strings. */
-const reason = (err: unknown): string => (err instanceof Error ? err.name : "Error");
+/**
+ * Name, code and a short message so an alert says WHY the guard is unavailable. Connection URLs and anything that looks like
+ * credentials in a driver message are masked, and the text is cut short.
+ */
+const reason = (err: unknown): string => {
+  if (!(err instanceof Error)) return "Error";
+  const code = (err as { code?: unknown }).code;
+  const message = err.message
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
+    .replace(/(password|passwd|pwd|token|secret)\s*[=:]\s*\S+/gi, "$1=<hidden>")
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
+  return [err.name, typeof code === "string" ? code : undefined, message ? `- ${message}` : undefined].filter(Boolean).join(" ");
+};
 
 /** Rejects when `p` takes longer than `ms`; the call itself may still finish later. */
 export function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -312,6 +324,9 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       }
 
       // The claim is written by the refresher itself, under its file locks, immediately before the token request.
+      const refuseIfRotatedOut = (fingerprint: string): void => {
+        if (rotatedOut.has(`${tool}\u0000${identity.name}\u0000${fingerprint}`)) throw new RefreshRefused(ROTATED_OUT_MESSAGE, false);
+      };
       const beforePost = async ({ fingerprint }: { fingerprint: string }): Promise<void> => {
         let rows: JournalEntry[];
         try {
@@ -319,6 +334,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
           rows = await bounded(lock.findByOldFp(fingerprint), callMs, "refresh journal");
         } catch (err) {
           degrade(err);
+          refuseIfRotatedOut(fingerprint);
           return;
         }
         for (const e of rows) if (e.outcome === "refreshed" && e.newFp !== undefined && e.newFp !== e.oldFp) markRotatedOut(`${tool}\u0000${identity.name}\u0000${e.oldFp}`);
@@ -333,6 +349,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
           }
         } catch (err) {
           degrade(err);
+          refuseIfRotatedOut(fingerprint);
           return;
         }
         deps.onInterrupted?.(account, interrupted);
