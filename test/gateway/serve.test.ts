@@ -593,3 +593,12 @@ describe("browser relay socket", () => {
     expect(await drained).toBe(1012);
   });
 });
+
+describe("watchCredentialReads", () => {
+  test("keeps the credential signature method", async () => {
+    const { CredentialCache } = await import("../../src/gateway/credentials.ts");
+    const { watchCredentialReads } = await import("../../src/gateway/serve.ts");
+    const w = watchCredentialReads(new CredentialCache({ resolveConfigDir: async () => "/nonexistent" }), { recover() {}, fire() {} } as never, new Map());
+    expect(typeof w.signature).toBe("function");
+  });
+});

@@ -23,7 +23,7 @@ import type { UsageCounts } from "./usage.ts";
 export interface GatewayDeps {
   store: GatewayStore;
   ledger: LedgerBuffer;
-  creds: Pick<CredentialCache, "get" | "refreshAfter401">;
+  creds: Pick<CredentialCache, "get" | "refreshAfter401"> & Partial<Pick<CredentialCache, "signature">>;
   usageFor(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
   poolMembers(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name. Ledger rows, metrics and alerts use the canonical name. */
@@ -372,8 +372,10 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const log = deps.log ?? defaultLog;
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
+  /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
+  const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -383,7 +385,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -533,20 +535,66 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const nowMs = deps.now().getTime();
   const exKey = (name: string): string => `${app.provider}\u0000${name}`;
   /** Pool members still marked exhausted (their reset has not passed). */
-  const exhaustedNames = (): Set<string> => {
+  const exhaustedNames = async (): Promise<Set<string>> => {
     const out = new Set<string>();
-    for (const [k, until] of exhausted) {
-      if (until <= deps.now().getTime()) exhausted.delete(k);
-      else if (k.startsWith(`${app.provider}\u0000`)) out.add(k.slice(app.provider.length + 1));
+    for (const [k, until] of [...exhausted]) {
+      if (until <= deps.now().getTime()) {
+        exhausted.delete(k);
+        holds.delete(k);
+      } else if (k.startsWith(`${app.provider}\u0000`)) {
+        const name = k.slice(app.provider.length + 1);
+        // A member held for a credential failure is released as soon as its credential file changes.
+        const h = holds.get(k);
+        if (h?.long && (await credentialSignature(deps, app.provider, name)) !== h.sig) {
+          exhausted.delete(k);
+          holds.delete(k);
+        } else out.add(name);
+      }
     }
     return out;
   };
-  const pick = await pickIdentity(app, deps, app.target.kind === "pool" ? exhaustedNames() : undefined);
+  /** Hold a member whose credential failed: ten minutes (or until its credential file changes) when only a person can fix it, else briefly. */
+  const holdCredentialFailure = async (name: string, err: unknown): Promise<void> => {
+    const long = err instanceof GatewayCredentialError && (err.loggedOut || err.code === "retired" || err.code === "unknown-identity");
+    const message = err instanceof GatewayCredentialError ? err.clientMessage : "upstream credential unavailable";
+    exhausted.set(exKey(name), deps.now().getTime() + (long ? CREDENTIAL_HOLD_MS : BURST_HOLD_DEFAULT_MS));
+    holds.set(exKey(name), { kind: "cred", long, message, sig: long ? await credentialSignature(deps, app.provider, name) : undefined });
+  };
+  /** Hold a member after a quota-type answer: until reset when exhaustion is proven (or 402/403), else briefly. */
+  const holdQuota = (name: string, res: Response): void => {
+    const nowMs = deps.now().getTime();
+    if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
+      exhausted.set(exKey(name), exhaustedUntil(res.headers, nowMs));
+      holds.delete(exKey(name));
+    } else if (res.status === 429) {
+      exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
+      holds.set(exKey(name), { kind: "burst", long: false });
+    }
+  };
+  const pick = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined);
   if ("reject" in pick) {
     deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
     const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
-    const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && exhaustedNames().size > 0 ? "no-headroom:exhausted" : pick.reject;
+    const reason = pick.reject === "no-headroom" && app.target.kind === "pool" && (await exhaustedNames()).size > 0 ? "no-headroom:exhausted" : pick.reject;
     // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
+    // When a member would be free without the short holds, the answer is about the hold, not about usage.
+    if (pick.reject === "no-headroom" && app.target.kind === "pool") {
+      // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
+      const quotaOut = new Set([...(await exhaustedNames())].filter((n) => !holds.has(exKey(n))));
+      const free = await pickIdentity(app, deps, quotaOut);
+      const h = "identity" in free ? holds.get(exKey(free.identity)) : undefined;
+      if (h?.kind === "burst" && "identity" in free) {
+        const secs = Math.min(60, Math.max(1, Math.ceil(((exhausted.get(exKey(free.identity)) ?? 0) - deps.now().getTime()) / 1000)));
+        record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
+        const res = providerError(style, 429, "upstream rate limit: retry shortly");
+        res.headers.set("retry-after", String(secs));
+        return res;
+      }
+      if (h?.kind === "cred") {
+        record(identityForRow, "credential_error", 502, undefined, false, undefined, model, reason);
+        return providerError(style, 502, h.message ?? "upstream credential unavailable");
+      }
+    }
     if (pick.reject !== "no-identities") {
       const native = nativeLimitResponse(app.provider, await memberUsages(app, deps), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now());
       if (native) {
@@ -581,7 +629,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       try {
         cred = await deps.creds.refreshAfter401(app.provider, ident, cred.accessToken);
       } catch (err) {
-        if (err instanceof RefreshCooldownError || err instanceof NotRefreshableError) return res; // pass the upstream 401 through
+        if (err instanceof RefreshCooldownError || err instanceof NotRefreshableError) {
+          if (app.target.kind === "pool" && replayable) {
+            // A pool member whose refresh cannot run is held back and the next member tries the request.
+            await discard(res);
+            throw err;
+          }
+          return res; // pass the upstream 401 through
+        }
         if (!replayable) return res; // The body cannot be replayed anyway: the client sees the 401.
         await discard(res);
         throw err;
@@ -596,7 +651,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   /** 429 is quota or rate limit. 402 is a payment-required signal some providers use for exhausted credit. A 403 counts only when its (bounded) JSON body names a quota error type or code. */
   const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
-    if (res.status === 429 || res.status === 402) return { quota: true, res };
+    if (res.status === 402) return { quota: true, res };
+    if (res.status === 429) {
+      // Only Codex states exhaustion in the body (the (bounded) peek); elsewhere the headers decide and the body is not read.
+      if (app.provider !== "codex") return { quota: true, res };
+      const p = await peek(res, ERROR_PEEK_BYTES);
+      if (!(p.whole && /usage_limit_reached/.test(new TextDecoder().decode(p.bytes)))) return { quota: true, res: p.res };
+      const h = new Headers(p.res.headers);
+      h.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
+      return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers: h }) };
+    }
     if (res.status !== 403) return { quota: false, res };
     const p = await peek(res, ERROR_PEEK_BYTES);
     return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
@@ -605,41 +669,63 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   identity = await canon(pick.identity);
   let up: Response;
   try {
-    up = await attempt(identity);
-    if (app.target.kind === "pool" && replayable) {
-      const q = await isQuota(up);
-      up = q.res;
-      // Every quota answer before the first byte marks that member exhausted until its reset, then the next
-      // eligible member gets the replayed body, until one answers or none is left (the last answer then stands).
+    const poolReplay = app.target.kind === "pool" && replayable;
+    let first: Response | undefined;
+    let credErr: unknown;
+    try {
+      first = await attempt(identity);
+    } catch (err) {
+      if (!poolReplay || ctrl.signal.aborted || req.signal.aborted || !isCredentialFailure(err)) throw err;
+      credErr = err;
+      await holdCredentialFailure(pick.identity, err);
+    }
+    let cur: Response | undefined = first;
+    if (poolReplay) {
+      let quota = false;
+      if (cur) {
+        const q = await isQuota(cur);
+        cur = q.res;
+        quota = q.quota;
+        if (quota) holdQuota(pick.identity, cur);
+      }
+      // Every quota answer before the first byte marks that member exhausted until its reset (or briefly for a burst
+      // 429), and a credential failure holds the member back; then the next eligible member gets the replayed body,
+      // until one answers or none is left (the last answer then stands, or the credential error if there was none).
       const tried = new Set<string>();
       let name = pick.identity;
-      let quota = q.quota;
-      while (quota) {
+      while (quota || !cur) {
         tried.add(name);
-        if (up.status === 429 || up.status === 402 || up.status === 403) exhausted.set(exKey(name), exhaustedUntil(up.headers, deps.now().getTime()));
-        const next = await pickIdentity(app, deps, new Set([...exhaustedNames(), ...tried]));
+        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]));
         if (!("identity" in next)) break;
         name = next.identity;
         // If the next identity cannot even be tried, it is skipped; the client keeps the last upstream answer.
         let second: Response;
         try {
           second = await attempt(next.identity);
-        } catch {
+        } catch (err) {
           if (req.signal.aborted || ctrl.signal.aborted) {
-            await discard(up);
+            if (cur) await discard(cur);
             throw new DOMException("aborted", "AbortError");
+          }
+          if (isCredentialFailure(err)) {
+            credErr = err;
+            await holdCredentialFailure(name, err);
           }
           tried.add(name);
           continue;
         }
         const sq = await isQuota(second);
-        await discard(up);
+        if (cur) await discard(cur);
         deps.metrics.failover(app.name);
-        up = sq.res;
+        cur = sq.res;
         identity = await canon(next.identity);
         quota = sq.quota;
+        if (quota) holdQuota(name, cur);
       }
+      if (!cur) throw credErr;
     }
+    if (!cur) throw credErr;
+    up = cur;
   } catch (err) {
     req.signal.removeEventListener("abort", onAbort);
     if (ctrl.signal.aborted) {
@@ -660,6 +746,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   body = { kind: "none" };
   releaseBody?.();
   const headers = new Headers(up.headers);
+  headers.delete(SUBSCRIPTION_EXHAUSTED_HEADER);
   stripHopByHop(headers);
   if (headers.has("content-encoding")) {
     headers.delete("content-encoding");
@@ -710,6 +797,53 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   req.signal.addEventListener("abort", () => finish("client_aborted"), { once: true });
   return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
   }
+}
+
+interface Hold {
+  kind: "burst" | "cred";
+  /** Held for the long credential period and released early when the credential signature changes. */
+  long: boolean;
+  sig?: string | undefined;
+  /** Client message for a credential hold. */
+  message?: string;
+}
+
+const CREDENTIAL_HOLD_MS = 10 * 60_000;
+
+function isCredentialFailure(err: unknown): boolean {
+  return err instanceof GatewayCredentialError || err instanceof RefreshCooldownError || err instanceof NotRefreshableError || (err as { name?: string } | null)?.name === "SwapLockError";
+}
+
+async function credentialSignature(deps: GatewayDeps, provider: GatewayProvider, name: string): Promise<string | undefined> {
+  try {
+    return await deps.creds.signature?.(provider, name);
+  } catch {
+    return undefined;
+  }
+}
+
+const BURST_HOLD_DEFAULT_MS = 15_000;
+const BURST_HOLD_MAX_MS = 60_000;
+/** Internal marker set on a 429 whose body proved Codex subscription exhaustion; stripped before the client sees it. */
+const SUBSCRIPTION_EXHAUSTED_HEADER = "x-ais-subscription-exhausted";
+
+/** True when a 429 proves subscription exhaustion (unified status or a 5h/7d window `rejected`, or Codex `usage_limit_reached`), not a transient rate limit. */
+export function provesSubscriptionExhaustion(headers: Headers): boolean {
+  if (headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1") return true;
+  for (const k of ["status", "5h-status", "7d-status"]) if (headers.get(`anthropic-ratelimit-unified-${k}`)?.trim().toLowerCase() === "rejected") return true;
+  return false;
+}
+
+/** Epoch ms until which a member that answered a burst 429 is held back: its retry-after (seconds or HTTP date), capped at 60 s, default 15 s. */
+export function burstHoldUntil(headers: Headers, nowMs: number): number {
+  const retry = headers.get("retry-after");
+  let ms = BURST_HOLD_DEFAULT_MS;
+  if (retry !== null && retry.trim() !== "") {
+    const secs = Number(retry);
+    if (Number.isFinite(secs) && secs >= 0) ms = secs * 1000;
+    else if (Number.isFinite(Date.parse(retry))) ms = Math.max(0, Date.parse(retry) - nowMs);
+  }
+  return nowMs + Math.min(ms, BURST_HOLD_MAX_MS);
 }
 
 const EXHAUSTED_DEFAULT_MS = 5 * 60_000;

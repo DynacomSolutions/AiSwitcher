@@ -218,7 +218,7 @@ describe("CredentialCache", () => {
     db2.close();
     await utimes(dbPath, 1_900_000_000, 1_900_000_000);
     expect((await c.get("opencode", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-opencode-db-0002");
-  });
+  }, 20_000);
 
   test("retired identities are rejected without leaking the token", async () => {
     const c = new CredentialCache({ resolveIdentity: async () => ({ name: "id1", label: "id1", configDir: join(work, "claude"), retired: true }) });

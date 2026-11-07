@@ -495,24 +495,272 @@ describe("failover and refresh", () => {
     expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
   });
 
-  test("exhaustion without reset headers lasts five minutes", async () => {
-    let clock = NOW.getTime();
-    deps.now = () => new Date(clock);
+  const burstSetup = async (members: "pair" | "single") => {
+    const clock = { ms: NOW.getTime() };
+    deps.now = () => new Date(clock.ms);
     const gw = createGatewayApp(deps);
-    const call = (path: string, token: string, init: RequestInit) => (async () => { const r = await gw.request(`http://gw.test${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); })();
+    const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); };
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
     usage.a = live(10);
-    usage.b = live(20);
+    usage.b = members === "pair" ? live(20) : undefined;
+    return { clock, call, who: () => seen.map((x) => x.headers.get("authorization")) };
+  };
+
+  test("burst 429 without unified headers holds the member back at most 60 s", async () => {
+    const { clock, call, who } = await burstSetup("pair");
     handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
-    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect((await call()).status).toBe(200);
     seen.length = 0;
-    clock += 4 * 60_000;
-    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    clock.ms += 10_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 6_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("burst 429 honours retry-after seconds and HTTP dates, capped at 60 s", async () => {
+    const { clock, call, who } = await burstSetup("pair");
+    let retry = "30";
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429, headers: { "retry-after": retry } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    await call();
+    seen.length = 0;
+    clock.ms += 29_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 2_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+    // Date form
+    clock.ms += 61_000;
+    retry = new Date(clock.ms + 20_000).toUTCString();
+    seen.length = 0;
+    await call();
+    seen.length = 0;
+    clock.ms += 25_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+    // Cap
+    clock.ms += 61_000;
+    retry = "3600";
+    seen.length = 0;
+    await call();
+    seen.length = 0;
+    clock.ms += 61_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("unified rejected 429 still marks the member exhausted until its reset", async () => {
+    const { clock, call, who } = await burstSetup("pair");
+    const resetAt = Math.floor((clock.ms + 600_000) / 1000);
+    handler = (_req, s) =>
+      s.headers.get("authorization") === "Bearer tok-a"
+        ? new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt) } })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    await call();
+    seen.length = 0;
+    clock.ms += 300_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 301_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("Codex usage_limit_reached 429 without headers counts as exhausted for five minutes", async () => {
+    const clock = { ms: NOW.getTime() };
+    deps.now = () => new Date(clock.ms);
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "cx", provider: "codex", style: "openai", target: { kind: "pool" } }));
+    const call = async () => { const r = await gw.request("http://gw.test/cx/v1/responses", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); };
+    usage.a = live(10);
+    usage.b = live(20);
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response('{"error":{"type":"usage_limit_reached"}}', { status: 429 }) : new Response("{}", { headers: { "content-type": "application/json" } }));
+    await call();
+    seen.length = 0;
+    clock.ms += 4 * 60_000;
+    await call();
     expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-b"]);
+  });
+
+  test("single-member pool: burst 429 reaches the client once and recovers within the hold window", async () => {
+    const { clock, call } = await burstSetup("single");
+    usage.b = live(100);
+    let limited = true;
+    handler = () => (limited ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    expect((await call()).status).toBe(429);
+    limited = false;
+    clock.ms += 16_000;
+    expect((await call()).status).toBe(200);
+  });
+
+  /** Pool app whose `get` throws `fail(id)` while it returns an error (until `sig[id]` changes for login-dead). */
+  const credSetup = async (members: string[], fail: (id: string, sig: string) => Error | undefined, handlerFor?: (who: string) => Response) => {
+    const clock = { ms: NOW.getTime() };
+    deps.now = () => new Date(clock.ms);
+    const sig: Record<string, string> = Object.fromEntries(members.map((m) => [m, "s1"]));
+    const gets: string[] = [];
+    const get = deps.creds.get.bind(deps.creds);
+    deps.creds = {
+      get: async (p: GatewayApp["provider"], id: string) => {
+        gets.push(id);
+        const e = fail(id, sig[id]!);
+        if (e) throw e;
+        return get(p, id);
+      },
+      refreshAfter401: deps.creds.refreshAfter401,
+      signature: async (_p: string, id: string) => sig[id],
+    } as unknown as GatewayDeps["creds"];
+    deps.poolMembers = async () => members;
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status, headers: r.headers }); };
+    members.forEach((m, i) => (usage[m] = live(10 * (i + 1))));
+    handler = (_req, s) => (handlerFor ? handlerFor(s.headers.get("authorization")!.slice("Bearer tok-".length)) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    return { clock, sig, gets, call, who: () => seen.map((x) => x.headers.get("authorization")) };
+  };
+  const deadLogin = (dead: string[]) => (id: string, sig: string) => (dead.includes(id) && sig === "s1" ? new GatewayCredentialError("login-dead", "claude", id) : undefined);
+
+  test("a dead-login pool member is skipped and the request succeeds on the next member", async () => {
+    const { call, who } = await credSetup(["a", "b"], deadLogin(["a"]));
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
     seen.length = 0;
-    clock += 61_000;
-    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
-    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+  });
+
+  test("a held dead-login member is retried once its credential changes", async () => {
+    const { clock, sig, call, who } = await credSetup(["a", "b"], deadLogin(["a"]));
+    await call();
+    seen.length = 0;
+    clock.ms += 5 * 60_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    sig.a = "s2";
+    await call();
+    expect(who()).toEqual(["Bearer tok-a"]);
+  });
+
+  test("a dead-login member is not read for ten minutes, then once more", async () => {
+    const { clock, gets, call } = await credSetup(["a", "b"], deadLogin(["a"]));
+    await call();
+    expect(gets.filter((g) => g === "a").length).toBe(1);
+    clock.ms += 10 * 60_000 - 1000;
+    await call();
+    await call();
+    expect(gets.filter((g) => g === "a").length).toBe(1);
+    clock.ms += 2000;
+    await call();
+    expect(gets.filter((g) => g === "a").length).toBe(2);
+  });
+
+  test("an all-dead pool returns 502 with the safe message after trying both members", async () => {
+    const { call, gets } = await credSetup(["a", "b"], deadLogin(["a", "b"]));
+    const res = await call();
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("is logged out");
+    expect(gets.sort()).toEqual(["a", "b"]);
+    expect(seen.length).toBe(0);
+  });
+
+  test("a dead login on a pinned app keeps returning 502 without failover", async () => {
+    const t = await addApp(baseApp({ name: "pinned", target: { kind: "pin", identity: "a" } }));
+    const get = deps.creds.get.bind(deps.creds);
+    deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "a") throw new GatewayCredentialError("login-dead", p, id); return get(p, id); } } as GatewayDeps["creds"];
+    const gw = createGatewayApp(deps);
+    const r = await gw.request("http://gw.test/pinned/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } });
+    expect(r.status).toBe(502);
+    expect(seen.length).toBe(0);
+  });
+
+  test("a transient credential error holds the member only for the short default", async () => {
+    let failOnce = true;
+    const { clock, call, who } = await credSetup(["a", "b"], (id) => {
+      if (id === "a" && failOnce) {
+        failOnce = false;
+        return new GatewayCredentialError("refresh-failed", "claude", id);
+      }
+      return undefined;
+    });
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 20_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-a"]);
+  });
+
+  test("a credential hold is not overwritten by an earlier member's burst hold", async () => {
+    const { clock, call, who } = await credSetup(["a", "b", "c"], deadLogin(["b"]), (w) => (w === "a" ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } })));
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-c"]);
+    seen.length = 0;
+    clock.ms += 20_000;
+    await call();
+    // a's 15 s burst hold is over; b (dead login) must still be held, so the order is a then c.
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-c"]);
+  });
+
+  test("a pool 401 whose refresh is in cooldown holds the member and fails over", async () => {
+    refreshImpl = async () => {
+      throw new RefreshCooldownError("claude", "a");
+    };
+    const { clock, call, who } = await credSetup(["a", "b"], () => undefined, (w) => (w === "a" ? new Response("{}", { status: 401 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } })));
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    seen.length = 0;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 20_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("while only a burst hold remains, the client gets a plain short 429 without unified headers", async () => {
+    const { clock, call } = await credSetup(["a"], () => undefined, () => new Response("{}", { status: 429 }));
+    expect((await call()).status).toBe(429);
+    clock.ms += 1000;
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(15);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(res.headers.get("anthropic-ratelimit-unified-status")).toBeNull();
+    expect(await res.text()).toContain("rate_limit_error");
+  });
+
+  test("while only credential holds remain, the client gets the stored 502 message", async () => {
+    const { call } = await credSetup(["a"], deadLogin(["a"]));
+    expect((await call()).status).toBe(502);
+    const res = await call();
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("is logged out");
+  });
+
+  test("a hold on a member outside the app's pool does not change its quota rejection", async () => {
+    const week = Math.floor(NOW.getTime() / 1000) + 3 * 86400;
+    usage.a = { ...live(100), windows: [{ label: "seven_day", utilization: 100, resetsAt: new Date(week * 1000).toISOString() }] };
+    usage.b = live(10);
+    usage.c = live(10);
+    deps.poolMembers = async () => ["a", "b", "c"];
+    const get = deps.creds.get.bind(deps.creds);
+    deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "c") throw new GatewayCredentialError("login-dead", p, id); return get(p, id); } } as GatewayDeps["creds"];
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-b" ? new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(week) } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    const tx = await addApp(baseApp({ name: "x", target: { kind: "pool", identities: ["a", "b"] } }));
+    const ty = await addApp(baseApp({ name: "y", target: { kind: "pool", identities: ["c"] } }));
+    const gw = createGatewayApp(deps);
+    const go = (path: string, token: string) => gw.request(`http://gw.test${path}`, { method: "POST", body: "{}", headers: { authorization: `Bearer ${token}` } });
+    expect((await go("/x/v1/messages", tx)).status).toBe(429);
+    expect((await go("/y/v1/messages", ty)).status).toBe(502);
+    const res = await go("/x/v1/messages", tx);
+    expect(res.status).toBe(429);
+    expect(await res.text()).not.toContain("logged out");
   });
 
   test("all members exhausted gives one 429 with a reason in the log", async () => {
