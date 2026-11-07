@@ -7,10 +7,11 @@ import { withUsableCwd } from "../../shared/exec.ts";
 import { TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { isSwapPool } from "../../identities/swap-pool.ts";
 import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotDirtyId, usageSnapshotTargetKey, usageSnapshotDirtyDirectory } from "./snapshot-dirty.ts";
-import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageTarget } from "./run.ts";
+import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, reuseNativeReportRows, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageRunDeps, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
-import { aisNativeSourceEnv, aisTokscaleCacheScope, sweepUnusedTokscaleCacheScopes, aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromHourlyEntries, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage, type TokscaleHourlyEntry } from "./tokscale.ts";
+import { nativeSourceFingerprint, sharedNativeExportInputs } from "./source-fingerprint.ts";
+import { aisNativeSourceEnv, aisTokscaleCacheScope, markTokscaleCacheScopeUsed, sweepUnusedTokscaleCacheScopes, aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromHourlyEntries, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage, type TokscaleHourlyEntry } from "./tokscale.ts";
 import { collectObsoleteNativeSegments, isSegmentedNativeEnvelope, nativeSegmentDir, nativeSegmentsIntact, parseSegmentedNativeManifest, verifyNativeSegments, writeReusableSegmentList, type NativeSegmentRecord } from "./native-segments.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
@@ -21,6 +22,10 @@ export const USAGE_SNAPSHOT_PARTITION_TTL_MS = 15 * 60_000;
 // A dirty marker re-exports a partition's whole native history (hundreds of MB
 // for busy identities), so live sessions may force at most one refresh per window.
 export const USAGE_SNAPSHOT_DIRTY_MIN_INTERVAL_MS = 10 * 60_000;
+// A source whose stat fingerprint is unchanged is not exported again, but at
+// least this often it is, so an input the fingerprint does not cover can
+// leave a partition stale for this long at most.
+export const USAGE_SNAPSHOT_SOURCE_REUSE_MAX_AGE_MS = 6 * 60 * 60_000;
 export const USAGE_SNAPSHOT_FILE = join(aisCacheDir(), "usage", "snapshot.json");
 // Two latest generations protect a reader racing a manifest replacement.
 // A 10-minute grace covers ordinary reads; long-lived readers must retry once
@@ -73,6 +78,11 @@ export interface UsageSnapshotPartition {
   nativeFailure?: NativeCaptureFailure;
   /** Swap pools only: last-30-day messages and tokens per member, what `ais claude-swap usage --json` serves to sessions. */
   memberUsage?: SwapMemberUsage;
+  /** Claude and Codex: stat fingerprint of the sources when `nativeBatch` was
+   * exported (source-fingerprint.ts). An equal fingerprint skips the export. */
+  sourceFingerprint?: string;
+  /** When Tokscale last exported this partition's batch (not a reuse). */
+  nativeExportedAt?: string;
 }
 
 export interface SwapMemberUsage {
@@ -170,6 +180,14 @@ export interface UsageSnapshotDeps {
     onPoolWindow?: (pool: UsageTarget["identity"], members: SwapMemberUsage["members"]) => void,
   ) => Promise<UsageResult[]>;
   captureNative?: (spec: NativeSnapshotCaptureSpec) => Promise<UsageSnapshotPartition["nativeBatch"]>;
+  /** Stat fingerprint of a source's inputs (undefined: always export).
+   * Production uses source-fingerprint.ts; tests that redirect the snapshot
+   * path get no fingerprints unless they pass one. */
+  nativeSourceFingerprint?: (target: UsageTarget) => string | undefined;
+  /** Seams of the report run, e.g. the extra-cost probe of a reused source. */
+  usageRunDeps?: UsageRunDeps;
+  /** Max age of a reused export (default USAGE_SNAPSHOT_SOURCE_REUSE_MAX_AGE_MS). */
+  sourceReuseMaxAgeMs?: number;
 }
 
 export type UsageSnapshotRefreshFailureCategory = "collector-timeout" | "collector-rejected" | "collector-failed";
@@ -961,6 +979,32 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     return !previousPartition || currentMs - lastSuccess >= ttl || forcedKeys.has(targetKey(target));
   });
   const nativeSpecs = new Map((await buildNativeSnapshotCaptureSpecs(targets)).map((spec) => [spec.partitionKey, spec]));
+  const nativeRoot = deps.nativeBatchRoot ?? join(aisCacheDir(), "usage", "native");
+  // Fingerprint due sources before anything reads them: a change while the
+  // export runs then shows up as a mismatch next cycle, never as a match.
+  const fingerprintOf = deps.nativeSourceFingerprint ?? (deps.path === undefined ? defaultNativeSourceFingerprinter() : undefined);
+  const sourceFingerprints = new Map<string, string>();
+  if (fingerprintOf) {
+    for (const target of dueTargets) {
+      if (!nativeExportSupportedInSameRun(target)) continue;
+      let fingerprint: string | undefined;
+      try { fingerprint = fingerprintOf(target); } catch { fingerprint = undefined; }
+      if (fingerprint) sourceFingerprints.set(targetKey(target), fingerprint);
+    }
+  }
+  const reuseMaxAge = deps.sourceReuseMaxAgeMs ?? USAGE_SNAPSHOT_SOURCE_REUSE_MAX_AGE_MS;
+  const reusable = (target: UsageTarget): boolean => {
+    const key = targetKey(target);
+    const prior = partitions[key];
+    const fingerprint = sourceFingerprints.get(key);
+    if (!fingerprint || forcedKeys.has(key) || !prior || prior.sourceFingerprint !== fingerprint) return false;
+    if (prior.lastError || !prior.lastSuccessAt || prior.nativeCoverage !== "supported" || prior.results.length === 0) return false;
+    const exportedAt = prior.nativeExportedAt ? Date.parse(prior.nativeExportedAt) : Number.NaN;
+    if (!Number.isFinite(exportedAt) || currentMs - exportedAt >= reuseMaxAge || exportedAt - currentMs > 5 * 60_000) return false;
+    return !!prior.nativeBatch && prior.nativeBatch.partitionId === nativePartitionId(key) && committedNativeBatchIntact(prior.nativeBatch, nativeRoot);
+  };
+  const reusedTargets = dueTargets.filter(reusable);
+  const exportTargets = dueTargets.filter((target) => !reusedTargets.includes(target));
   // An export can be valid and contain no messages. In that case the report
   // reader returns no UsageResult rows to carry the candidate metadata, so
   // keep the candidate independently until the matching callback commits.
@@ -1022,6 +1066,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     // the prior report and pointer together; this success path commits the
     // coverage state and batch pointer as one generation.
     let nativeBatch: UsageSnapshotPartition["nativeBatch"];
+    let exported = false;
     let nativeCoverage: UsageSnapshotPartition["nativeCoverage"] = tool === "ali" || tool === "zai" ? "unsupported" : "pending";
     const nativeSpec = nativeSpecs.get(key);
     const target = [...targets, ...poolTargets].find((candidate) => targetKey(candidate) === key);
@@ -1056,6 +1101,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
           if (bucketTimezone) nativeBatch = { ...nativeBatch, bucketTimezone };
         }
         nativeCoverage = "supported";
+        exported = true;
       } else if (nativeSpec) {
         nativeBatch = await captureNativeBatch(nativeSpec, deps);
         nativeCoverage = nativeBatch ? "supported" : "unsupported";
@@ -1082,6 +1128,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     } finally {
       if (nativeCandidate) discardNativeCandidate(nativeCandidate.path);
     }
+    const sourceFingerprint = exported ? sourceFingerprints.get(key) : undefined;
     partitions[key] = {
       ...(tool ? { tool } : {}), ...(identity ? { identity } : {}),
       nativeCoverage,
@@ -1091,14 +1138,49 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
       lastAttemptAt: attemptedAt,
       lastSuccessAt: new Date(now()).toISOString(),
       nativeFailure: undefined,
+      ...(sourceFingerprint ? { sourceFingerprint, nativeExportedAt: attemptedAt } : {}),
     };
     aggregateGeneratedAt = partitions[key]!.lastSuccessAt!;
     writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
   };
 
-  if (dueTargets.length > 0) {
+  // Unchanged sources: the committed batch and report rows stand; only the
+  // live extra-cost probe runs. Tokscale, and with it the source's whole
+  // message cache, is not touched.
+  for (const target of reusedTargets) {
+    const key = targetKey(target);
+    const prior = partitions[key]!;
+    producer.sourceScansTotal++;
+    let rows: UsageResult[];
+    try {
+      rows = await reuseNativeReportRows(target, prior.results, deps.usageRunDeps);
+    } catch (error) {
+      // Keep the rows; the source is rechecked next cycle.
+      logUsageSourceFailure(`${key} reuse`, error);
+      rows = prior.results;
+    }
+    if (deps.path === undefined) {
+      const sourceEnv = aisNativeSourceEnv(target.toolName, target.identity);
+      // The scope sweep reads the scope's mtime as its last use.
+      if (sourceEnv) markTokscaleCacheScopeUsed({ TOKSCALE_AIS_CACHE_SCOPE: aisTokscaleCacheScope(target.toolName, sourceEnv), TOKSCALE_CONFIG_DIR: aisNativeTokscaleConfigDir() });
+    }
+    partitions[key] = {
+      ...prior,
+      tool: target.toolName,
+      identity: target.identity.name,
+      results: safeResults(rows),
+      lastAttemptAt: attemptedAt,
+      lastSuccessAt: new Date(now()).toISOString(),
+      nativeFailure: undefined,
+    };
+    aggregateGeneratedAt = partitions[key]!.lastSuccessAt!;
+    writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+  }
+
+  if (exportTargets.length > 0) {
+    const dueTargets = exportTargets;
     const collect = deps.collectTargetResults ?? ((selected: UsageTarget[], onItemDone: (index: number, results: UsageResult[], nativeCandidate?: UsageResult["nativeBatchCandidate"]) => void) =>
-      runUsageQueryForTargets(selected, { onItemDone, deps: { nativeExportForTarget: getNativeExportForTarget } }));
+      runUsageQueryForTargets(selected, { onItemDone, deps: { ...deps.usageRunDeps, nativeExportForTarget: getNativeExportForTarget } }));
     const recorded = new Set<number>();
     try {
       await collect(dueTargets, async (index, results, nativeCandidate) => {
@@ -1224,6 +1306,22 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     return key !== undefined && partitions[key]?.lastAttemptAt === attemptedAt && partitions[key]?.lastError === undefined;
   }), dirtyDirectory);
   return snapshot;
+}
+
+/** Fingerprints sources against this cycle's exporter binary, settings and
+ * pricing (read once per cycle, on first use). */
+function defaultNativeSourceFingerprinter(): (target: UsageTarget) => string | undefined {
+  const env = {
+    binaryPath: process.env.AIS_TOKSCALE_SHARED_BIN || join(aisCacheDir(), "usage", "native-tokscale", "tokscale"),
+    configDir: aisNativeTokscaleConfigDir(),
+    digestMemoPath: join(aisCacheDir(), "usage", "native-tokscale", "source-fingerprint-digests.json"),
+    ...(process.env.TOKSCALE_HEADLESS_DIR ? { headlessDir: process.env.TOKSCALE_HEADLESS_DIR } : {}),
+  };
+  let shared: string | undefined | null = null;
+  return (target) => {
+    if (shared === null) shared = sharedNativeExportInputs(env);
+    return nativeSourceFingerprint(target, shared, env);
+  };
 }
 
 export interface SwapUsageFromSnapshot extends SwapMemberUsage {

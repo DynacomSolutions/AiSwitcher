@@ -197,6 +197,28 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     `vendor/tokscale/README.md`).
   - Codex resumes and Codex fingerprints use the sampled digest, as Claude
     checkpoints do, instead of hashing the whole rollout.
+  - An unchanged Claude or Codex source is not exported again
+    (`source-fingerprint.ts`). Before a due source is read, the cycle takes a
+    stat fingerprint of every file under the roots Tokscale v4.20.0 scans for
+    it (Claude: `<config>/projects`, `<config>/transcripts`, the Claude
+    desktop session stores; Codex: `sessions`, `archived_sessions`, the
+    headless `codex` roots), plus the exporter binary's SHA-256, the isolated
+    `settings.json` and the pricing caches' data (their hourly refresh stamp
+    excluded). Digests of the binary and pricing files are remembered with
+    their stat in `native-tokscale/source-fingerprint-digests.json`. When the
+    fingerprint equals the one recorded at the partition's last export, the
+    committed batch is intact, the last attempt succeeded and that export is
+    under 6 hours old, the partition keeps its batch and rows (only the live
+    extra-cost probe runs) and Tokscale is not started. A symlink in a source
+    tree, a `~/.cc-mirror` directory or configured extra scan paths make a
+    source undecidable: it is always exported. Dirty markers still force an
+    export. Why: every export loads the source's whole Tokscale message cache
+    even to answer `unchanged`. That is cheap only from the page cache; on
+    7 Nov 2026 kernel reclaim during each host update emptied the collector's
+    page cache (about 3.9 GB stolen in 20 minutes, restart or not), and the
+    next rounds re-read 2.5-3.5 GB from disk although almost no source had
+    changed. On a 200,000-message Claude fixture with a cold page cache, a due
+    unchanged source cost 50.8 MB of disk reads before and 0.1 MB after.
   - Native batches are segmented (`native-segments.ts`, vendor README). A
     collector export passes `TOKSCALE_AIS_SEGMENT_DIR`
     (`usage/native/<partitionId>/segments/`), so the staged export is a small
