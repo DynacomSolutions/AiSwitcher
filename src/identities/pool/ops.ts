@@ -72,7 +72,8 @@ export async function poolStatus<U extends PoolUsage>(adapter: PoolAdapter<U>, d
 /** Switch to the allowed member (other than the active one) with the most headroom. */
 export async function swapToNext<U extends PoolUsage>(adapter: PoolAdapter<U>, deps: PoolOpsDeps<U>, poolKey: string | undefined, reason: SwapReason, options: { requireBelowThreshold?: boolean } = {}): Promise<SwapResult | undefined> {
   const status = await poolStatus(adapter, deps, poolKey);
-  const candidates = status.rows.filter((r) => r.allowed && !r.active);
+  // Members at 100% on any window are never picked; unknown usage ranks after known headroom.
+  const candidates = status.rows.filter((r) => r.allowed && !r.active && !(r.usage?.status === "live" && (r.usage.maxUtilization ?? 0) >= 100));
   const target = chooseBest(candidates, {
     ...(options.requireBelowThreshold ? { belowPercent: status.thresholdPercent, requireKnown: true } : {}),
   });

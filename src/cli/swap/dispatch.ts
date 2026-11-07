@@ -241,7 +241,7 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
           return outcome.action === "swapped" ? runningWarning(outcome.result) : undefined;
         }
         const r = await swapToNext(adapter, opsDeps, scopedPool, reason);
-        if (!r) throw new SwapPoolError("No other allowed account to switch to.");
+        if (!r) throw new SwapPoolError("No other allowed account with headroom to switch to (every candidate is at 100% on a window).");
         if (json) return log(JSON.stringify(r, null, 2));
         log(`${green("✔")} ${describeSwap(r)}`);
         return runningWarning(r);

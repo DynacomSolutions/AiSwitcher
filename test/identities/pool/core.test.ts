@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { PoolAdapter, PoolUsage } from "../../../src/identities/pool/adapter.ts";
 import { appendSwapEvent, ledgerPathFor, readSwapEvents } from "../../../src/identities/pool/ledger.ts";
 import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
-import { chooseBest, swapIfLimited } from "../../../src/identities/pool/ops.ts";
+import { chooseBest, swapIfLimited, swapToNext } from "../../../src/identities/pool/ops.ts";
 import { PoolSwapScheduler } from "../../../src/identities/pool/scheduler.ts";
 import { poolsOf, requirePool } from "../../../src/identities/pool/swap-pool.ts";
 import type { IdentitiesFile, Identity } from "../../../src/identities/types.ts";
@@ -48,6 +48,29 @@ describe("generic pool core", () => {
     expect(chooseBest([{ name: "a", usage: live(100) }, { name: "b", usage: extra(100) }], {})).toBe("b");
     expect(chooseBest([{ name: "a", usage: live(50) }, { name: "b", usage: extra(60) }], {})).toBe("a");
     expect(chooseBest([{ name: "a", usage: live(100) }, { name: "b", usage: extra(100, false) }], {})).toBe("a");
+  });
+
+  describe("manual swapToNext", () => {
+    const run = async (usage: Record<string, PoolUsage>, order = ["x", "y", "z"]) => {
+      const registry = join(root, "claude.json");
+      const member = (name: string) => ({ name, label: name, configDir: join(root, name) });
+      await writeFile(registry, JSON.stringify({ version: 1, identities: [...["act", ...order].map(member), { ...member("pool"), swapPool: { accounts: ["act", ...order], active: "act", auto: false } }] }));
+      const adapter: PoolAdapter = { ...fakeAdapter("claude", registry, {}), fetchUsage: async (m) => usage[m.name] ?? live(100) };
+      return swapToNext(adapter, { ledgerPath: join(root, "l.jsonl") }, "pool", "manual");
+    };
+    const unknown: PoolUsage = { status: "rate-limited", capturedAt: "x" };
+
+    test("skips a full member listed first and picks the most headroom", async () => {
+      const r = await run({ act: live(50), x: live(100), y: live(60), z: live(20) });
+      expect(r?.to).toBe("z");
+    });
+    test("unknown usage ranks after known headroom", async () => {
+      expect((await run({ x: unknown, y: live(90), z: live(100) }))?.to).toBe("y");
+      expect((await run({ x: live(100), y: unknown, z: live(100) }))?.to).toBe("y");
+    });
+    test("does nothing when every candidate is full", async () => {
+      expect(await run({ x: live(100), y: live(100), z: live(100) })).toBeUndefined();
+    });
   });
 
   describe("extra usage fallback", () => {
