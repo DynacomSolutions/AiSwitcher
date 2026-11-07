@@ -31,7 +31,9 @@ test("renders a bounded generic user unit for the installed AIS command", () => 
   expect(USAGE_COLLECTOR_UNIT).toContain("MemoryMax=12G");
   expect(USAGE_COLLECTOR_UNIT).toContain("MemorySwapMax=512M");
   expect(USAGE_COLLECTOR_UNIT).toContain("CPUQuota=400%");
-  expect(USAGE_COLLECTOR_UNIT).toContain("IOWriteBandwidthMax=%h 20M");
+  expect(USAGE_COLLECTOR_UNIT).toContain("IOReadBandwidthMax=%h 5M");
+  expect(USAGE_COLLECTOR_UNIT).toContain("IOWriteBandwidthMax=%h 5M");
+  expect(USAGE_COLLECTOR_UNIT).not.toContain("20M");
   expect(USAGE_COLLECTOR_UNIT).not.toContain("systemctl");
   expect(USAGE_COLLECTOR_UNIT).not.toContain("/home/");
 });
@@ -157,4 +159,26 @@ test("replaces a stale unit atomically with the canonical bounded unit", async (
   });
   expect(result.changed).toBe(true);
   expect(await readFile(path, "utf8")).toBe(USAGE_COLLECTOR_UNIT);
+});
+
+test("an installed unit with the old 20M disk cap is rewritten and the service restarted", async () => {
+  const root = await temporaryDirectory();
+  const unitDirectory = join(root, "systemd", "user");
+  const path = join(unitDirectory, USAGE_COLLECTOR_SERVICE_NAME);
+  await mkdir(unitDirectory, { recursive: true });
+  await writeFile(path, USAGE_COLLECTOR_UNIT.replaceAll("%h 5M", "%h 20M"), { mode: 0o644 });
+
+  const restarts: boolean[] = [];
+  const result = await installUsageCollectorService({
+    unitDirectory,
+    platform: "linux",
+    checkEntrypoint: async () => true,
+    reloadAndVerify: async () => {},
+    enableStartAndVerify: async (_serviceName, restartIfActive) => { restarts.push(restartIfActive); },
+  });
+  expect(result.changed).toBe(true);
+  expect(restarts).toEqual([true]);
+  const installed = await readFile(path, "utf8");
+  expect(installed).toContain("IOReadBandwidthMax=%h 5M");
+  expect(installed).toContain("IOWriteBandwidthMax=%h 5M");
 });

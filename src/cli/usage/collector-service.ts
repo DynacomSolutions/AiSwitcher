@@ -19,8 +19,9 @@ MemoryMax=12G
 MemorySwapMax=512M
 CPUQuota=400%
 # Backstop: blk-throttle caps the disk holding the cache, so a regression cannot starve other services.
-IOReadBandwidthMax=%h 20M
-IOWriteBandwidthMax=%h 20M
+# Steady state is well under 1 MB/s; a cold export checkpoints its cache, so it finishes across cycles.
+IOReadBandwidthMax=%h 5M
+IOWriteBandwidthMax=%h 5M
 
 [Install]
 WantedBy=default.target

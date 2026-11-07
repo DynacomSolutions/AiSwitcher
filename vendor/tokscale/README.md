@@ -5,7 +5,7 @@ This patch targets the unmodified `junhoyeo/tokscale` v4.20.0 release archive
 `73376cdde65268d18de5d319d8cad416d3370101201284f50d573430058dc533`). The
 upstream licence is preserved in `LICENSE`.
 
-The patch adds three AIS-only surfaces:
+The patches add these AIS-only surfaces:
 
 - A successful local native parse writes a complete JSON batch atomically when
   both `TOKSCALE_AIS_EXPORT_PATH` and `TOKSCALE_AIS_PARTITION_ID` are set. The
@@ -139,13 +139,31 @@ The patch adds three AIS-only surfaces:
   unreferenced session is never looked up. An entry written before this
   change is rebuilt once.
 
+- `TOKSCALE_AIS_CHECKPOINT_SECS=<n>` commits the message cache during a long
+  scan (`patches/v4.20.0-ais-checkpoint.patch`). Upstream wrote the cache
+  once, after every source was parsed, so a cold scan killed by AIS's export
+  timeout (a new host or identity, or a deleted cache, under the collector's
+  5 MB/s disk cap) lost everything and every later cycle repeated the same
+  failing scan. The Claude and Codex lanes now parse their sources in chunks
+  of 64 and, once at least `n` seconds and four times the previous
+  checkpoint's own duration have passed, write the entries parsed so far with
+  the normal locked, atomic per-shard save. A killed scan keeps what it
+  committed; the next one reads those sources as cache hits and continues.
+  The messages, and the order they are merged in, are unchanged, so totals
+  equal one uninterrupted cold scan. A checkpoint never publishes
+  `.ais-scope-seeded`: only the final save has looked up every entry a seed
+  must carry. The export batch is still written only when the scan completes,
+  so a killed scan never publishes partial data. One source is never split,
+  so a single transcript must still parse within the timeout.
+
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
 sets the attempt-unique export path and opaque partition key, sets the
 message-cache scope to a hash of the tool and the scanned source directory
 (so a renamed identity keeps its cache; a scope no live source uses and no
-export has used for 30 days is swept), and enables the stat-only warm cache. For default
+export has used for 30 days is swept), enables the stat-only warm cache and
+asks for a cache checkpoint at most every 120 seconds. For default
 OpenCode it points `XDG_DATA_HOME` at the exact default profile's data root.
 Z.ai and Alibaba are unsupported for native batch capture and remain
 explicitly outside this coverage.
@@ -157,7 +175,7 @@ bash scripts/build-tokscale-ais.sh
 ```
 
 The helper downloads only the pinned release archive, verifies its checksum and
-licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch`, `patches/v4.20.0-ais-scope.patch`, `patches/v4.20.0-ais-segments.patch` and then `patches/v4.20.0-ais-grok.patch`, and installs to
+licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch`, `patches/v4.20.0-ais-scope.patch`, `patches/v4.20.0-ais-segments.patch`, `patches/v4.20.0-ais-grok.patch` and then `patches/v4.20.0-ais-checkpoint.patch`, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.

@@ -52,6 +52,7 @@ patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/pa
 patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-scope.patch"
 patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-segments.patch"
 patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-grok.patch"
+patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-checkpoint.patch"
 
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_shared_snapshot)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib selector_)
@@ -68,6 +69,7 @@ patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/pa
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --test cli_tests ais_native_export_writes_segments_and_rewrites_only_unlisted_ones)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_grok)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib rev412)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_checkpoint)
 (cd "$source_dir" && cargo build --locked --release --package tokscale-cli --bin tokscale)
 
 if [[ -z "$target_dir" ]]; then

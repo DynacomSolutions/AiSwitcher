@@ -199,6 +199,10 @@ export async function buildAisTokscaleExportInvocation(
       // A warm scan trusts an exact size and mtime match, so an unchanged
       // transcript is only stat'ed, never read (vendor/tokscale README).
       TOKSCALE_AIS_STAT_ONLY_CACHE: "1",
+      // A long cold scan commits its message cache as it goes, so an export
+      // killed by the timeout below keeps what it parsed and the next cycle
+      // continues from there (vendor/tokscale README).
+      TOKSCALE_AIS_CHECKPOINT_SECS: String(TOKSCALE_EXPORT_CHECKPOINT_SECS),
       ...(target.previousMessagesSha256 && /^[a-f0-9]{64}$/.test(target.previousMessagesSha256)
         ? { TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256: target.previousMessagesSha256 }
         : {}),
@@ -658,8 +662,19 @@ export function tokscaleSpawnTimeoutMs(): number {
 /** A native export writes the full message envelope (hundreds of MB for the swap pool) and the
  * collector service runs throttled (MemoryHigh, IO bandwidth caps), so it needs more headroom than a
  * plain report before a kill turns the partition into an error. The ceiling is never below the plain
- * tokscale one; AIS_TOKSCALE_EXPORT_TIMEOUT_MS overrides the default. */
+ * tokscale one; AIS_TOKSCALE_EXPORT_TIMEOUT_MS overrides the default.
+ *
+ * A cold export of a large identity (an empty or deleted message cache) can need longer than this
+ * under the service's 5 MB/s disk cap. It is still killed here, and its partition stays in error or
+ * stale, since it never wrote a batch; but it checkpointed its message cache every
+ * TOKSCALE_EXPORT_CHECKPOINT_SECS, so each cycle continues where the last one stopped until one
+ * finishes and publishes the complete batch. */
 export const DEFAULT_TOKSCALE_EXPORT_TIMEOUT_MS = 25 * 60 * 1000;
+
+/** Minimum seconds between two message-cache checkpoints of one native export. The patched
+ * Tokscale also waits at least four times the previous checkpoint's duration, which bounds the
+ * extra writes as the cache grows. */
+export const TOKSCALE_EXPORT_CHECKPOINT_SECS = 120;
 
 export function tokscaleExportTimeoutMs(): number {
   const raw = process.env.AIS_TOKSCALE_EXPORT_TIMEOUT_MS?.trim() ?? "";
