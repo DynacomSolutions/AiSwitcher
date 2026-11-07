@@ -52,6 +52,7 @@ RUN case "${TARGETARCH}" in \
 
 FROM debian:trixie-slim
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends util-linux ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=kubectl /usr/local/bin/kubectl /usr/local/bin/kubectl
