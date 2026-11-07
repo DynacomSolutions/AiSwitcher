@@ -204,7 +204,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     desktop session stores and its IndexedDB store and blob directory, in
     all three app locations; Codex: `sessions`, `archived_sessions`, the
     headless `codex` roots), plus the AIS release and the running compiled
-    AIS binary's SHA-256 (a merge without a version bump is a new build), the exporter binary's
+    AIS image's SHA-256 (`/proc/self/exe` on Linux, so a build renamed over
+    the path mid-cycle is not mistaken for the running one; a merge without a
+    version bump is a new build; an unreadable image leaves the version only), the exporter binary's
     SHA-256, the isolated `settings.json`, `custom-pricing.json` and
     `recovered-usage-v1.json` (a missing file counts as its own value) and
     the pricing caches' data (their hourly refresh stamp excluded). Digests of the binary and pricing files are remembered with
@@ -218,7 +220,8 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     tree, a `~/.cc-mirror` directory or configured extra scan paths make a
     source undecidable: it is always exported. Dirty markers still force an
     export. A source whose snapshot write throws is recorded as an error
-    and the others still commit; neither batch rejects, so no write of the
+    with its last committed rows, batch and success time and no fingerprint,
+    so the next cycle exports it again; the others still commit; neither batch rejects, so no write of the
     cycle happens after it returns and releases the snapshot lock. Why: every export loads the source's whole Tokscale message cache
     even to answer `unchanged`. That is cheap only from the page cache; on
     7 Nov 2026 kernel reclaim during each host update emptied the collector's

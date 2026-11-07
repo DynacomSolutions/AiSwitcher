@@ -1157,28 +1157,35 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   // A source whose commit throws (a failed snapshot write) is recorded as an
   // error in memory, which the cycle's final write persists; it never
   // rejects, so no worker of a batch is still running, and writing, when the
-  // cycle returns and releases the snapshot lock.
-  const recordCommitFailure = (key: string, target: UsageTarget, error: unknown) => {
+  // cycle returns and releases the snapshot lock. `before` is the partition
+  // as it was before the failed commit, whose new state is already in
+  // `partitions`: the error keeps the last committed rows, batch and success
+  // time, and no fingerprint, so the next cycle exports the source again.
+  const recordCommitFailure = (key: string, target: UsageTarget, before: UsageSnapshotPartition | undefined, error: unknown) => {
     logUsageSourceFailure(`${key} commit`, error);
     producer.sourceScanFailuresTotal++;
-    const prior = partitions[key];
     partitions[key] = {
-      ...prior,
       tool: target.toolName, identity: target.identity.name,
       nativeCoverage: "error",
-      results: prior?.results ?? [],
+      results: before?.results ?? [],
+      ...(before?.nativeBatch ? { nativeBatch: before.nativeBatch } : {}),
+      ...(before?.memberUsage ? { memberUsage: before.memberUsage } : {}),
       lastAttemptAt: attemptedAt,
+      ...(before?.lastSuccessAt ? { lastSuccessAt: before.lastSuccessAt } : {}),
       lastError: "source-error",
       lastErrorAt: attemptedAt,
     };
   };
-  const reuse = async (target: UsageTarget) => {
+  /** Commits one source; a failed commit is recorded, never thrown. */
+  const commitSource = async (target: UsageTarget, commit: () => Promise<void>) => {
+    const before = partitions[targetKey(target)];
     try {
-      await reuseUnchangedSource(target);
+      await commit();
     } catch (error) {
-      recordCommitFailure(targetKey(target), target, error);
+      recordCommitFailure(targetKey(target), target, before, error);
     }
   };
+  const reuse = (target: UsageTarget) => commitSource(target, () => reuseUnchangedSource(target));
   const reuseUnchangedSource = async (target: UsageTarget) => {
     const key = targetKey(target);
     const prior = partitions[key]!;
@@ -1220,11 +1227,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         const target = dueTargets[index];
         if (!target) return;
         recorded.add(index);
-        try {
-          await savePartition(targetKey(target), target.toolName, target.identity.name, results, nativeCandidate ?? nativeCandidates.get(targetKey(target)), undefined, true);
-        } catch (error) {
-          recordCommitFailure(targetKey(target), target, error);
-        }
+        await commitSource(target, () => savePartition(targetKey(target), target.toolName, target.identity.name, results, nativeCandidate ?? nativeCandidates.get(targetKey(target)), undefined, true));
       }, prepareNativeExportCandidate);
     } catch {
       // Completed callbacks have already been durably saved. Remaining
@@ -1235,13 +1238,9 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     for (let index = 0; index < dueTargets.length; index++) {
       if (recorded.has(index)) continue;
       const target = dueTargets[index]!;
-      try {
-        await savePartition(targetKey(target), target.toolName, target.identity.name, [{
-          provider: "unattributed", identity: safeIdentity(target.identity), sourceOnlyError: true, error: "source-error",
-        }]);
-      } catch (error) {
-        recordCommitFailure(targetKey(target), target, error);
-      }
+      await commitSource(target, () => savePartition(targetKey(target), target.toolName, target.identity.name, [{
+        provider: "unattributed", identity: safeIdentity(target.identity), sourceOnlyError: true, error: "source-error",
+      }]));
     }
   };
 
@@ -1353,15 +1352,16 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   return snapshot;
 }
 
-/** The compiled AIS binary this process runs (`process.execPath`). A
- * development run (`bun src/ais.ts`) has no single build to digest; its
- * fingerprint then follows the package version only. */
-function runningAisExecutable(): string | undefined {
-  const main = Bun.main;
+/** The compiled AIS image this process runs. On Linux `/proc/self/exe`
+ * opens the running image even after an update renames a new build over
+ * `process.execPath`, so the digest always matches the code that produced
+ * the rows. A development run (`bun src/ais.ts`) has no single build to
+ * digest; its fingerprint then follows the package version only. */
+export function runningAisExecutable(platform: NodeJS.Platform = process.platform, main: string = Bun.main, execPath: string = process.execPath): string | undefined {
   try {
     if (/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(main) && statSync(main).isFile()) return undefined;
   } catch { /* a virtual /$bunfs entry: compiled */ }
-  return process.execPath;
+  return platform === "linux" ? "/proc/self/exe" : execPath;
 }
 
 /** Fingerprints sources against this cycle's exporter binary, settings and
@@ -1371,7 +1371,7 @@ function defaultNativeSourceFingerprinter(): (target: UsageTarget) => string | u
     binaryPath: process.env.AIS_TOKSCALE_SHARED_BIN || join(aisCacheDir(), "usage", "native-tokscale", "tokscale"),
     configDir: aisNativeTokscaleConfigDir(),
     aisVersion: pkg.version,
-    ...(runningAisExecutable() ? { aisExecutablePath: runningAisExecutable() } : {}),
+    ...((executable) => executable ? { aisExecutablePath: executable } : {})(runningAisExecutable()),
     digestMemoPath: join(aisCacheDir(), "usage", "native-tokscale", "source-fingerprint-digests.json"),
     ...(process.env.TOKSCALE_HEADLESS_DIR ? { headlessDir: process.env.TOKSCALE_HEADLESS_DIR } : {}),
   };

@@ -1,5 +1,5 @@
 import { createHash, type Hash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { UsageTarget } from "./run.ts";
@@ -58,9 +58,15 @@ export function sharedNativeExportInputs(env: NativeSourceFingerprintEnv): strin
     const hash = createHash("sha256").update(`${FINGERPRINT_SCHEME}\0`);
     // A host update installs a rebuilt binary (a new inode) each time;
     // hashing its bytes keeps the fingerprint when the build is the same.
-    hash.update(`binary\0${memo.digest(env.binaryPath, (bytes) => bytes)}\0`);
+    hash.update(`binary\0${memo.digest(env.binaryPath)}\0`);
     hash.update(`ais\0${env.aisVersion ?? "unknown"}\0`);
-    if (env.aisExecutablePath) hash.update(`ais-build\0${memo.digest(env.aisExecutablePath, (bytes) => bytes)}\0`);
+    if (env.aisExecutablePath) {
+      // An unreadable executable leaves the version alone to tell builds
+      // apart, rather than turning reuse off for every source.
+      let build: string | undefined;
+      try { build = memo.digest(env.aisExecutablePath); } catch { /* version only */ }
+      if (build) hash.update(`ais-build\0${build}\0`);
+    }
     // Every config-dir input of a local parse: settings, custom prices and
     // recovered usage (a missing file is its own value).
     for (const name of ["settings.json", "custom-pricing.json", "recovered-usage-v1.json"]) {
@@ -189,6 +195,20 @@ function walk(hash: Hash, path: string, relative: string): boolean {
   return true;
 }
 
+function streamSha256(path: string): string {
+  const hash = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(1 << 20);
+  const fd = openSync(path, "r");
+  try {
+    for (let read = readSync(fd, chunk, 0, chunk.length, null); read > 0; read = readSync(fd, chunk, 0, chunk.length, null)) {
+      hash.update(chunk.subarray(0, read));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
 function statKey(path: string): string {
   const { dev: device, ino, size, mtimeNs, ctimeNs } = statSync(path, { bigint: true });
   return `${device}\0${ino}\0${size}\0${mtimeNs}\0${ctimeNs}`;
@@ -215,12 +235,15 @@ export class DigestMemo {
     } catch { /* nothing remembered yet */ }
   }
 
-  digest(file: string, select: (bytes: Buffer) => Buffer): string {
+  /** SHA-256 of the file, or of `select(bytes)`. Without `select` the file
+   * is streamed, so a large binary is never held in memory whole. A symlink
+   * such as `/proc/self/exe` is followed for the stat and the read alike. */
+  digest(file: string, select?: (bytes: Buffer) => Buffer): string {
     const absolute = resolve(file);
     const key = statKey(absolute);
     const known = this.entries[absolute];
     if (known?.key === key) return known.sha256;
-    const sha256 = createHash("sha256").update(select(readFileSync(absolute))).digest("hex");
+    const sha256 = select ? createHash("sha256").update(select(readFileSync(absolute))).digest("hex") : streamSha256(absolute);
     if (statKey(absolute) === key) {
       this.entries[absolute] = { key, sha256 };
       this.changed = true;
