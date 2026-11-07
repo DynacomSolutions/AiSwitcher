@@ -41,6 +41,9 @@ export interface NativeSourceFingerprintEnv {
   /** The running AIS release: a new release always exports once, so a
    * change in how AIS reads an export is never hidden by reuse. */
   aisVersion?: string;
+  /** The running AIS executable. Merges without a version bump install a
+   * different build under the same version; its bytes tell them apart. */
+  aisExecutablePath?: string;
   /** Where digests of the binary and the pricing files are remembered with
    * the stat they were taken at, so a collector cycle (a fresh process) does
    * not re-read 30 MB of binary and 14 MB of pricing each time. */
@@ -57,6 +60,7 @@ export function sharedNativeExportInputs(env: NativeSourceFingerprintEnv): strin
     // hashing its bytes keeps the fingerprint when the build is the same.
     hash.update(`binary\0${memo.digest(env.binaryPath, (bytes) => bytes)}\0`);
     hash.update(`ais\0${env.aisVersion ?? "unknown"}\0`);
+    if (env.aisExecutablePath) hash.update(`ais-build\0${memo.digest(env.aisExecutablePath, (bytes) => bytes)}\0`);
     // Every config-dir input of a local parse: settings, custom prices and
     // recovered usage (a missing file is its own value).
     for (const name of ["settings.json", "custom-pricing.json", "recovered-usage-v1.json"]) {

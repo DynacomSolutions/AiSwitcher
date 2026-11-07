@@ -188,6 +188,8 @@ export interface UsageSnapshotDeps {
   nativeSourceFingerprint?: (target: UsageTarget) => string | undefined;
   /** Seams of the report run, e.g. the extra-cost probe of a reused source. */
   usageRunDeps?: UsageRunDeps;
+  /** Test seam: every snapshot write of a cycle (default writeSnapshot). */
+  writeSnapshot?: (snapshot: UsageSnapshot, path: string) => void;
   /** Max age of a reused export (default USAGE_SNAPSHOT_SOURCE_REUSE_MAX_AGE_MS). */
   sourceReuseMaxAgeMs?: number;
 }
@@ -645,7 +647,7 @@ function validSegmentRecords(value: unknown): value is NativeSegmentRecord[] {
   });
 }
 
-function writeSnapshot(snapshot: UsageSnapshot, path = USAGE_SNAPSHOT_FILE): void {
+export function writeSnapshot(snapshot: UsageSnapshot, path = USAGE_SNAPSHOT_FILE): void {
   const aggregateSourceRows = Object.values(snapshot.partitions).flatMap((partition) => partition.results.map((result) => {
     if (!result.report) return result;
     const client = result.nativeCoverageTool ?? result.sourceTool ?? "unknown";
@@ -863,6 +865,7 @@ async function refreshUsageSnapshotOnce(deps: UsageSnapshotDeps): Promise<UsageS
 }
 
 async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string, life: { timer?: ReturnType<typeof setInterval> } = {}): Promise<UsageSnapshot> {
+  const write = deps.writeSnapshot ?? writeSnapshot;
   const now = deps.now ?? Date.now;
   const ttl = deps.partitionTtlMs ?? USAGE_SNAPSHOT_PARTITION_TTL_MS;
   const previous = readSnapshot(path) ?? { schemaVersion: 1 as const, generatedAt: new Date(now()).toISOString(), partitions: {} };
@@ -885,7 +888,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   const partitions = { ...previous.partitions };
   // Tests that redirect the snapshot path must not sweep the real home, so only the default location or an explicit root is swept.
   if (deps.nativeStagingRoot || deps.path === undefined) sweepStaleNativeStaging(deps.nativeStagingRoot);
-  writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
+  write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
   // A single partition or the pool scan can run for many minutes without a
   // partition commit. Keep writing the heartbeat meanwhile. The timer callback
   // runs on the same event loop as the cycle, only between awaits, and every
@@ -894,7 +897,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   // the snapshot lock throughout. Cleared by the caller's finally.
   life.timer = setInterval(() => {
     try {
-      writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+      write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
     } catch { /* a missed heartbeat is retried on the next tick */ }
   }, deps.heartbeatIntervalMs ?? USAGE_SNAPSHOT_HEARTBEAT_INTERVAL_MS);
   life.timer.unref?.();
@@ -906,7 +909,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
       results: [], lastAttemptAt: attemptedAt, lastError: "target-discovery-failed", lastErrorAt: attemptedAt,
     };
     const snapshot: UsageSnapshot = { schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastCompletedAt: attemptedAt, lastCycleError: "target-discovery-failed", refreshCyclesFailedTotal: producer.refreshCyclesFailedTotal + 1 }, partitions };
-    writeSnapshot(snapshot, path);
+    write(snapshot, path);
     return snapshot;
   }
   delete partitions["special:discovery"];
@@ -958,7 +961,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     if (liveKeys.has(key) || key.startsWith("special:")) { delete partition.retired; delete partition.retiredAt; }
     else { partition.retired = true; partition.retiredAt ??= attemptedAt; }
   }
-  writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
+  write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer, partitions }, path);
   const dirtyDirectory = deps.dirtyDirectory ?? usageSnapshotDirtyDirectory;
   const dirtyMarkers = readUsageSnapshotDirtyMarkers(dirtyDirectory);
   const dirtyKeyById = new Map(candidateKeys.map((key) => [usageSnapshotDirtyId(key), key]));
@@ -1060,7 +1063,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         lastError: errorCategory(results),
         lastErrorAt: attemptedAt,
       };
-      writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+      write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
       return;
     }
     // A completed report refresh without a native export must not retain a
@@ -1125,7 +1128,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         lastError: "native-capture-failed", lastErrorAt: attemptedAt,
         nativeFailure: nativeCaptureFailure(error),
       };
-      writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+      write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
       return;
     } finally {
       if (nativeCandidate) discardNativeCandidate(nativeCandidate.path);
@@ -1143,7 +1146,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
       ...(sourceFingerprint ? { sourceFingerprint, nativeExportedAt: attemptedAt } : {}),
     };
     aggregateGeneratedAt = partitions[key]!.lastSuccessAt!;
-    writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+    write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
   };
 
   // Unchanged sources: the committed batch and report rows stand; only the
@@ -1151,7 +1154,32 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
   // message cache, is not touched. The probes run alongside the exports, as
   // many at once as a report run allows, so a slow probe never holds up a
   // changed or dirty source.
+  // A source whose commit throws (a failed snapshot write) is recorded as an
+  // error in memory, which the cycle's final write persists; it never
+  // rejects, so no worker of a batch is still running, and writing, when the
+  // cycle returns and releases the snapshot lock.
+  const recordCommitFailure = (key: string, target: UsageTarget, error: unknown) => {
+    logUsageSourceFailure(`${key} commit`, error);
+    producer.sourceScanFailuresTotal++;
+    const prior = partitions[key];
+    partitions[key] = {
+      ...prior,
+      tool: target.toolName, identity: target.identity.name,
+      nativeCoverage: "error",
+      results: prior?.results ?? [],
+      lastAttemptAt: attemptedAt,
+      lastError: "source-error",
+      lastErrorAt: attemptedAt,
+    };
+  };
   const reuse = async (target: UsageTarget) => {
+    try {
+      await reuseUnchangedSource(target);
+    } catch (error) {
+      recordCommitFailure(targetKey(target), target, error);
+    }
+  };
+  const reuseUnchangedSource = async (target: UsageTarget) => {
     const key = targetKey(target);
     const prior = partitions[key]!;
     producer.sourceScansTotal++;
@@ -1178,21 +1206,25 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
       nativeFailure: undefined,
     };
     aggregateGeneratedAt = partitions[key]!.lastSuccessAt!;
-    writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+    write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
   };
 
   const exportSources = async () => {
     if (exportTargets.length === 0) return;
     const dueTargets = exportTargets;
     const collect = deps.collectTargetResults ?? ((selected: UsageTarget[], onItemDone: (index: number, results: UsageResult[], nativeCandidate?: UsageResult["nativeBatchCandidate"]) => void) =>
-      runUsageQueryForTargets(selected, { onItemDone, deps: { ...deps.usageRunDeps, nativeExportForTarget: getNativeExportForTarget } }));
+      runUsageQueryForTargets(selected, { onItemDone, settleEachTarget: true, deps: { ...deps.usageRunDeps, nativeExportForTarget: getNativeExportForTarget } }));
     const recorded = new Set<number>();
     try {
       await collect(dueTargets, async (index, results, nativeCandidate) => {
         const target = dueTargets[index];
         if (!target) return;
         recorded.add(index);
-        await savePartition(targetKey(target), target.toolName, target.identity.name, results, nativeCandidate ?? nativeCandidates.get(targetKey(target)), undefined, true);
+        try {
+          await savePartition(targetKey(target), target.toolName, target.identity.name, results, nativeCandidate ?? nativeCandidates.get(targetKey(target)), undefined, true);
+        } catch (error) {
+          recordCommitFailure(targetKey(target), target, error);
+        }
       }, prepareNativeExportCandidate);
     } catch {
       // Completed callbacks have already been durably saved. Remaining
@@ -1203,15 +1235,19 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     for (let index = 0; index < dueTargets.length; index++) {
       if (recorded.has(index)) continue;
       const target = dueTargets[index]!;
-      await savePartition(targetKey(target), target.toolName, target.identity.name, [{
-        provider: "unattributed", identity: safeIdentity(target.identity), sourceOnlyError: true, error: "source-error",
-      }]);
+      try {
+        await savePartition(targetKey(target), target.toolName, target.identity.name, [{
+          provider: "unattributed", identity: safeIdentity(target.identity), sourceOnlyError: true, error: "source-error",
+        }]);
+      } catch (error) {
+        recordCommitFailure(targetKey(target), target, error);
+      }
     }
   };
 
-  // Both settle before the cycle goes on, even when one fails.
-  const settled = await Promise.allSettled([runBatched(reusedTargets, USAGE_MAX_CONCURRENT, reuse), exportSources()]);
-  for (const outcome of settled) if (outcome.status === "rejected") throw outcome.reason;
+  // Neither rejects: every commit failure is recorded per source above, so
+  // both have finished all their work, and every write, when this returns.
+  await Promise.all([runBatched(reusedTargets, USAGE_MAX_CONCURRENT, reuse), exportSources()]);
 
   const specialJobs: Array<{ due: boolean; key: string; tool: string; collect: () => Promise<UsageResult[]> }> = [
     { due: dueDefaultProfile, key: DEFAULT_OPENCODE_PARTITION, tool: "opencode", collect: deps.collectDefaultProfile ?? defaultOpencodeProfileUsageResults },
@@ -1234,7 +1270,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         lastErrorAt: attemptedAt,
       };
     }
-    writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+    write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
   }
 
   if (dueSwapPools.length > 0) {
@@ -1265,7 +1301,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
           ...(memberUsage ? { memberUsage } : {}),
           lastError: "source-error", lastErrorAt: attemptedAt,
         };
-        writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
+        write({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
         return;
       }
       await savePartition(key, "claude", pool.name, results, nativeCandidate ?? candidateFromResults(results), poolWindows.get(pool.name));
@@ -1308,13 +1344,24 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     },
     partitions,
   };
-  writeSnapshot(snapshot, path);
+  write(snapshot, path);
   acknowledgeUsageSnapshotDirty(dirtyMarkers.filter((marker) => {
     const key = dirtyKeyById.get(marker.id);
     if (key === "special:all") return candidateKeys.every((candidate) => partitions[candidate]?.lastAttemptAt === attemptedAt && partitions[candidate]?.lastError === undefined);
     return key !== undefined && partitions[key]?.lastAttemptAt === attemptedAt && partitions[key]?.lastError === undefined;
   }), dirtyDirectory);
   return snapshot;
+}
+
+/** The compiled AIS binary this process runs (`process.execPath`). A
+ * development run (`bun src/ais.ts`) has no single build to digest; its
+ * fingerprint then follows the package version only. */
+function runningAisExecutable(): string | undefined {
+  const main = Bun.main;
+  try {
+    if (/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(main) && statSync(main).isFile()) return undefined;
+  } catch { /* a virtual /$bunfs entry: compiled */ }
+  return process.execPath;
 }
 
 /** Fingerprints sources against this cycle's exporter binary, settings and
@@ -1324,6 +1371,7 @@ function defaultNativeSourceFingerprinter(): (target: UsageTarget) => string | u
     binaryPath: process.env.AIS_TOKSCALE_SHARED_BIN || join(aisCacheDir(), "usage", "native-tokscale", "tokscale"),
     configDir: aisNativeTokscaleConfigDir(),
     aisVersion: pkg.version,
+    ...(runningAisExecutable() ? { aisExecutablePath: runningAisExecutable() } : {}),
     digestMemoPath: join(aisCacheDir(), "usage", "native-tokscale", "source-fingerprint-digests.json"),
     ...(process.env.TOKSCALE_HEADLESS_DIR ? { headlessDir: process.env.TOKSCALE_HEADLESS_DIR } : {}),
   };
