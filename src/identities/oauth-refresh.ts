@@ -21,6 +21,7 @@ import { CLAUDE_CONFIG, PI_CONFIG } from "./tool-configs.ts";
 import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
 import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
+import { isGatewayManagedHere } from "./gateway-managed.ts";
 import { isGatewayAccessToken, isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import type { Identity } from "./types.ts";
 import { kimiCredentialStores, persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
@@ -476,6 +477,7 @@ export async function convergeClaudePoolStores(
 ): Promise<{ written: string[]; failed: Array<{ path: string; error: string }> }> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
+  if (await isGatewayManagedHere(tool, identity.name, registryPath)) return { written, failed };
   const poolDirs = lockedPoolDirs ?? (await poolStoreDirsFor(identity, registryPath, tool));
   if (poolDirs.length === 0) return { written, failed };
   const dirs = [identity.configDir, ...poolDirs];
@@ -484,8 +486,6 @@ export async function convergeClaudePoolStores(
   let best: { grant: OAuthGrant } | undefined;
   for (const copy of copies) if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
   if (!best) return { written, failed };
-  // A damaged copy (gateway token beside a refresh token) may hold a newer refresh token than the "best" one: leave all copies for a refresh to repair.
-  if (copies.some((c) => c && isGatewayAccessToken(c.grant.access_token) && c.grant.refresh_token !== best!.grant.refresh_token)) return { written, failed };
   const fp = grantFingerprint(best.grant);
   const same = (copy: (typeof copies)[number]) =>
     copy !== undefined && grantFingerprint(copy.grant) === fp && copy.grant.access_token === best!.grant.access_token;
@@ -549,10 +549,6 @@ async function freshestGrant(
   const piFingerprint = piGrant ? grantFingerprint(piGrant) : undefined;
   const native = await readProviderGrantCopy(tool, identity.configDir, piFingerprint);
   if (!native && !piGrant) return undefined;
-  // A damaged native store (gateway token beside a refresh token) holds the newest refresh token whatever its expiry says: it wins.
-  if (native && piGrant && isGatewayAccessToken(native.grant.access_token) && native.grant.refresh_token !== piGrant.refresh_token) {
-    return { grant: native.grant, entryKey: native.entryKey, rawEntry: native.rawEntry, source: `native:${native.path}` };
-  }
   if (native && piGrant) {
     const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
     return recency(native.grant) >= recency(piGrant)
@@ -653,6 +649,9 @@ export async function refreshIdentityOAuthGrant(
 ): Promise<IdentityGrantRefresh> {
   const pooled = (await poolAdapterFor(tool)) !== undefined;
   const registryPath = registryOf(tool, options);
+  if (await isGatewayManagedHere(tool, identity.name, registryPath)) {
+    return { tool, identity: identity.name, outcome: "skipped-fresh", written: [], writeFailures: [], detail: "login is owned by the cluster gateway - not refreshed here" };
+  }
   if (tool === "kimi" && isSwapPool(identity)) {
     return { tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], detail: "kimi swap pool: its credentials are a copy of the active member's grant and are refreshed through that member" };
   }

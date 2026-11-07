@@ -4,6 +4,7 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { withOauthRefreshLock } from "./claude-swap-lock.ts";
 import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
+import { isGatewayManagedHere } from "./gateway-managed.ts";
 import {
   CLAUDE_CONFIG,
   CODEX_CONFIG,
@@ -469,7 +470,8 @@ async function providerPairings(piIdentity: Identity, paths: ReconcileRegistryPa
     configDirFor(paths.kimi ?? KIMI_CONFIG.identitiesJsonPath, piIdentity.name),
   ]);
   const pairings: ProviderPairing[] = [];
-  if (claudeDir) {
+  // The cluster gateway owns gateway-managed logins: no local copy is reconciled with them.
+  if (claudeDir && !(await isGatewayManagedHere("claude", piIdentity.name, paths.claude))) {
     const nativePath = join(claudeDir, ".credentials.json");
     pairings.push({
       provider: "anthropic",
@@ -570,9 +572,6 @@ function driftLabel(minutes: number): string {
   return `${Math.round((minutes / 1440) * 10) / 10}d`;
 }
 
-/** True for the damaged store shape readNativeAnthropic reports: a gateway app token as the access token. */
-export const hasGatewayToken = (grant: OAuthGrant): boolean => isGatewayAccessToken(grant.access_token);
-
 /** One (native, pi) copy pair's compare-and-heal, shared by the pi-identity
  * sweep (reconcilePiOAuthStores) and the native-side single-provider
  * reconcile (reconcileNativeProviderStores). Never throws: a failing store
@@ -602,12 +601,6 @@ async function reconcilePair(
     } else {
       entry.status = "forked";
       entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
-      // A damaged store (gateway token beside a refresh token) carries the newest refresh token whatever its expiry says:
-      // never overwrite it from, or copy it over, the other store; the next refresh decides.
-      if (hasGatewayToken(native.grant) || hasGatewayToken(pi.grant)) {
-        entry.detail = "one copy holds a gateway token beside its refresh token; left untouched until a refresh repairs it";
-        return entry;
-      }
       const nativeFresher = recency(native.grant) >= recency(pi.grant);
       entry.adoptedFrom = nativeFresher ? "native" : "pi";
       if (write) {
@@ -788,6 +781,9 @@ export async function reconcileNativeProviderStores(
   const nativePath = nativeStorePathFor(tool, identity.configDir);
   if (isRetired(identity)) {
     return { provider, status: "single-copy", nativePath, detail: "identity is retired; nothing to reconcile" };
+  }
+  if (await isGatewayManagedHere(tool, identity.name, options.registryPaths?.claude)) {
+    return { provider, status: "single-copy", nativePath, detail: "login is owned by the cluster gateway; nothing is reconciled locally" };
   }
   const piDir = await configDirFor(options.registryPaths?.pi ?? PI_CONFIG.identitiesJsonPath, identity.name);
   if (!piDir) {

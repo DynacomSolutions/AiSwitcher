@@ -104,13 +104,14 @@ describe("swap into a gateway-routed pool", () => {
     expect((await read(registry)).identities.find((i: { name: string }) => i.name === "pool").swapPool.active).toBe("b");
   });
 
-  test("the pool's last live member grant is written back before the real login is replaced", async () => {
+  test("a login found in the gateway folder is backed up, never written back to a member", async () => {
     await routeThroughProxy();
     await writeFile(join(poolDir(), ".credentials.json"), cred("at-a2", "rt-a2", NOW_S + 5000)); // refreshed inside the pool
     const r = await performSwap({ registryPath: registry, ledgerPath: ledger, pool: "pool", target: "b", reason: "manual" });
-    expect(r.writeBack).toBe("written");
-    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-a2");
+    expect(r.writeBack).not.toBe("written");
+    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-a1");
     expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.accessToken).toBe(GW);
+    expect((await readdir(poolDir())).includes(".credentials.json.pre-swap.bak")).toBe(true);
   });
 
   test("a pool that is not gateway-routed still gets the member's real login", async () => {
@@ -150,7 +151,7 @@ describe("heal restores the gateway entry after a /login", () => {
     return claudeAdapter.heal!(pool as never, members);
   };
 
-  test("a real login of a known member is saved to that member, then the entry is restored", async () => {
+  test("a real login of a known member is kept in a backup, not written to the member, then the entry is restored", async () => {
     await routeThroughProxy();
     await performSwap({ registryPath: registry, ledgerPath: ledger, pool: "pool", target: "a", reason: "manual" });
     // the user runs /login inside the identity and signs in as member b
@@ -160,7 +161,8 @@ describe("heal restores the gateway entry after a /login", () => {
     const notes = await heal();
     expect(notes.join(" ")).toContain("restored");
     expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.accessToken).toBe(GW);
-    expect((await read(join(root, "b", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-b9");
+    expect((await read(join(root, "b", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-b1");
+    expect((await readdir(poolDir())).includes(".credentials.json.pre-swap.bak")).toBe(true);
     expect(JSON.stringify(notes)).not.toContain(GW);
   });
 
@@ -261,47 +263,72 @@ describe("a gateway token that leaked into a member store (older build converged
   });
 });
 
-describe("a damaged store's live refresh token is never lost", () => {
-  test("pi reconcile does not overwrite a hybrid native store with a stale pi copy", async () => {
-    const { reconcileNativeProviderStores } = await import("../../src/identities/oauth-reconcile.ts");
+describe("the cluster gateway owns gateway-managed logins; nothing local touches them", () => {
+  const withRole = async (role: string | undefined, fn: () => Promise<void>) => {
+    const saved = process.env.AIS_GATEWAY_OWNER;
+    if (role === undefined) delete process.env.AIS_GATEWAY_OWNER;
+    else process.env.AIS_GATEWAY_OWNER = role;
+    try { await fn(); } finally { if (saved === undefined) delete process.env.AIS_GATEWAY_OWNER; else process.env.AIS_GATEWAY_OWNER = saved; }
+  };
+  const piSetup = async () => {
     const pi = join(root, "pi-a");
     await mkdir(pi, { recursive: true });
-    await writeFile(join(root, "a", ".credentials.json"), cred(GW, "rt-new", 4_102_444_800));
+    await writeFile(join(root, "a", ".credentials.json"), cred(GW, "rt-new", 4_102_444_800)); // damaged member store
     await writeFile(join(pi, "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "at-old", refresh: "rt-old", expires: 1_700_000_000_000 } }));
     await writeFile(join(root, "pi.json"), JSON.stringify({ version: 1, identities: [{ name: "a", label: "a", configDir: pi }] }));
-    await reconcileNativeProviderStores("claude", { name: "a", label: "a", configDir: join(root, "a") }, { write: true, registryPaths: { pi: join(root, "pi.json"), claude: registry } });
+    await routeThroughProxy();
+    return pi;
+  };
+  const member = () => ({ name: "a", label: "a", configDir: join(root, "a") });
+
+  test("pi reconcile does not touch either copy of a gateway-managed member", async () => {
+    const { reconcileNativeProviderStores } = await import("../../src/identities/oauth-reconcile.ts");
+    const pi = await piSetup();
+    await withRole("0", async () => {
+      await reconcileNativeProviderStores("claude", member(), { write: true, registryPaths: { pi: join(root, "pi.json"), claude: registry } });
+    });
     expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-new");
     expect((await read(join(pi, "auth.json"))).anthropic.refresh).toBe("rt-old");
   });
 
-  test("the refresh picks the hybrid's refresh token over a stale pi copy", async () => {
-    await routeThroughProxy();
-    const pi = join(root, "pi-a");
-    await mkdir(pi, { recursive: true });
-    await writeFile(join(root, "a", ".credentials.json"), cred(GW, "rt-new", 4_102_444_800));
-    await writeFile(join(pi, "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "at-old", refresh: "rt-old", expires: 1_700_000_000_000 } }));
-    const { PI_CONFIG } = await import("../../src/identities/tool-configs.ts");
-    const saved = PI_CONFIG.identitiesJsonPath;
-    (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = join(root, "pi.json");
-    await writeFile(join(root, "pi.json"), JSON.stringify({ version: 1, identities: [{ name: "a", label: "a", configDir: pi }] }));
-    try {
-      const found = await readEffectiveGrant("claude", { name: "a", label: "a", configDir: join(root, "a") }, { claudeRegistryPath: registry });
-      expect(found?.grant.refresh_token).toBe("rt-new");
-    } finally {
-      (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
-    }
+  test("refresh and convergence are skipped locally, but run in the gateway's own process", async () => {
+    await piSetup();
+    let posts = 0;
+    const fetchImpl = (async () => { posts++; return new Response(JSON.stringify({ access_token: "at-fresh", refresh_token: "rt-fresh", expires_in: 3600 }), { status: 200 }); }) as unknown as typeof fetch;
+    const { refreshIdentityOAuthGrant } = await import("../../src/identities/oauth-refresh.ts");
+    await withRole("0", async () => {
+      const r = await refreshIdentityOAuthGrant("claude", member(), { force: true, claudeRegistryPath: registry, fetchImpl });
+      expect(r.outcome).toBe("skipped-fresh");
+      expect((await convergeClaudePoolStores(member(), registry)).written).toEqual([]);
+    });
+    expect(posts).toBe(0);
+    await withRole("1", async () => {
+      const r = await refreshIdentityOAuthGrant("claude", member(), { force: true, claudeRegistryPath: registry, fetchImpl });
+      expect(r.outcome).not.toBe("skipped-fresh");
+    });
+    expect(posts).toBe(1);
   });
 
-  test("heal of a hybrid pool credits its newer refresh token to the member and keeps a .pre-swap.bak", async () => {
+  test("a member of no gateway-routed pool is still refreshed locally", async () => {
+    const { isGatewayManagedHere } = await import("../../src/identities/gateway-managed.ts");
+    await withRole("0", async () => {
+      expect(await isGatewayManagedHere("claude", "a", registry)).toBe(false); // pool folder not routed
+      await routeThroughProxy();
+      expect(await isGatewayManagedHere("claude", "a", registry)).toBe(true);
+      expect(await isGatewayManagedHere("claude", "unknown", registry)).toBe(false);
+    });
+  });
+
+  test("heal of a hybrid pool backs it up, writes nothing to the member, and leaves the pure entry", async () => {
     await routeThroughProxy();
     await writeFile(join(poolDir(), ".credentials.json"), cred(GW, "rt-a2", 4_102_444_800));
     const file = (await read(registry)) as IdentitiesFile;
     const pool = file.identities.find((i) => i.name === "pool")!;
     await claudeAdapter.heal!(pool as never, file.identities.filter((i) => i.name === "a" || i.name === "b"));
-    const member = (await read(join(root, "a", ".credentials.json"))).claudeAiOauth;
-    expect(member.refreshToken).toBe("rt-a2");
-    expect(member.accessToken).toBe("at-a1");
-    expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.refreshToken).toBeNull();
+    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-a1");
+    const o = (await read(join(poolDir(), ".credentials.json"))).claudeAiOauth;
+    expect(o.accessToken).toBe(GW);
+    expect(o.refreshToken).toBeNull();
     expect((await readdir(poolDir())).includes(".credentials.json.pre-swap.bak")).toBe(true);
   });
 });

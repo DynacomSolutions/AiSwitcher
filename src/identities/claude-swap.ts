@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { aisClaudeSwapLedgerPath } from "../shared/ais-home.ts";
 import { withClaudeLocks, withOauthRefreshLock, type LockOptions } from "./claude-swap-lock.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
-import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, writeProviderGrantCopy, type OAuthGrant } from "./oauth-reconcile.ts";
+import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuthGrant } from "./oauth-reconcile.ts";
 import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, readSwapEvents as readPoolSwapEvents } from "./pool/ledger.ts";
 import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
 import { claudeAdapter } from "./pool/claude-adapter.ts";
@@ -135,33 +135,19 @@ async function writeBackPoolGrant(input: {
   const { pool, members, poolCredPath, poolCredText, poolUuid } = input;
   const notes: string[] = [];
   // The gateway entry is not a member login: it is never written back anywhere.
-  // A damaged entry (gateway token beside a refresh token) still carries a login's newest refresh token: it is written back with
-  // a real access token slot of the member's own, so the rotation is not lost.
-  const hybrid = input.poolGrant !== undefined && isGatewayAccessToken(input.poolGrant.access_token) && input.poolGrant.refresh_token !== undefined;
   const poolGrant = input.poolGrant && !isGatewayAccessToken(input.poolGrant.access_token) ? input.poolGrant : undefined;
   const activeName = pool.swapPool.active ?? null;
   let owner: Identity | undefined = activeName ? members.find((m) => m.name === activeName) : undefined;
   const ownerMismatch = input.attributeByLogin && owner && poolGrant && poolUuid ? (accountUuid(parseObject(await readText(claudeJsonPath(owner.configDir)))) ?? poolUuid) !== poolUuid : false;
-  if ((!owner || ownerMismatch) && (poolGrant || hybrid)) {
-    const inferred = await inferOwner(pool, members, (poolGrant ?? input.poolGrant)!, poolUuid);
+  if ((!owner || ownerMismatch) && poolGrant) {
+    const inferred = await inferOwner(pool, members, poolGrant, poolUuid);
     const found = members.find((m) => m.name === inferred);
     if (found && !owner) notes.push(`pool had no recorded active account; live credentials matched "${inferred}"`);
     if (found && ownerMismatch) notes.push(`pool login belongs to "${inferred}", not the active "${owner?.name}"`);
     if (found || !ownerMismatch) owner = found;
   }
   let writeBack: WriteBackOutcome;
-  if (hybrid && owner && !poolGrant) {
-    // Damaged entry: only its refresh token is live. Credit it to the member when it differs (the member keeps its own access token).
-    const ownerCopy = (await readProviderGrantCopy("claude", owner.configDir))?.grant;
-    const ownerUuid = accountUuid(parseObject(await readText(claudeJsonPath(owner.configDir))));
-    const sameAccount = !poolUuid || !ownerUuid || poolUuid === ownerUuid;
-    const rt = input.poolGrant!.refresh_token!;
-    if (ownerCopy && sameAccount && ownerCopy.refresh_token !== rt) {
-      await withOauthRefreshLock(owner.configDir, () => writeProviderGrantCopy("claude", owner!.configDir, { ...ownerCopy, refresh_token: rt }), input.lock);
-      notes.push(`gateway entry carried a newer refresh token; credited it to "${owner.name}"`);
-      writeBack = "written";
-    } else writeBack = "none-identical";
-  } else if (!owner) {
+  if (!owner) {
     writeBack = poolGrant ? "none-unknown-owner" : "none-no-live-credentials";
   } else {
     const ownerGrant = (await readProviderGrantCopy("claude", owner.configDir))?.grant;
@@ -172,8 +158,8 @@ async function writeBackPoolGrant(input: {
       await withOauthRefreshLock(owner.configDir, () => writeFileAtomic(ownerCredPath, poolCredText), input.lock);
     }
   }
-  // A live grant we cannot attribute is never silently destroyed (a damaged entry is always kept: its refresh token may be the only copy).
-  if (((writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && poolCredText !== undefined && poolGrant) || (hybrid && poolCredText !== undefined)) {
+  // A live grant we cannot attribute is never silently destroyed.
+  if ((writeBack === "none-unknown-owner" || writeBack === "none-account-mismatch") && poolCredText !== undefined && poolGrant) {
     const backup = `${poolCredPath}.pre-swap.bak`;
     await writeFileAtomic(backup, poolCredText);
     notes.push(`live pool credentials could not be attributed to a member; kept a 0600 backup copy at ${backup}`);
@@ -210,10 +196,16 @@ async function installGatewayEntry(input: { pool: PoolIdentity; members: Identit
     const dropped = await dropApiKeyHelper(pool.configDir);
     return { changed: dropped, entryReplaced: false, writeBack: "none-identical", notes: dropped ? ["removed apiKeyHelper from the gateway identity's settings"] : [] };
   }
+  // The cluster gateway owns every account login: nothing found in a gateway folder is written back to a member. A real or
+  // damaged login (a /login, an older build's leftover) is kept in a 0600 backup for the owner to inspect, then replaced.
   const poolCredText = await readText(poolCredPath);
-  const poolGrant = (await readProviderGrantCopy("claude", pool.configDir))?.grant;
-  const poolUuid = accountUuid(parseObject(await readText(claudeJsonPath(pool.configDir))));
-  const { writeBack, notes } = await writeBackPoolGrant({ pool, members, poolCredPath, poolCredText, poolGrant, poolUuid, attributeByLogin: true, ...(input.lock ? { lock: input.lock } : {}) });
+  const notes: string[] = [];
+  if (poolCredText !== undefined) {
+    const backup = `${poolCredPath}.pre-swap.bak`;
+    await writeFileAtomic(backup, poolCredText);
+    notes.push(`a login found in the gateway identity was not used; kept a 0600 backup copy at ${backup}`);
+  }
+  const writeBack: WriteBackOutcome = "none-identical";
   await mkdir(pool.configDir, { recursive: true });
   await writeGatewayEntry(pool.configDir, token);
   if (await dropApiKeyHelper(pool.configDir)) notes.push("removed apiKeyHelper from the gateway identity's settings");
