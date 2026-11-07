@@ -320,6 +320,33 @@ describe("the cluster gateway owns gateway-managed logins; nothing local touches
     expect(bodies[0]).not.toContain(GW);
   });
 
+  test("owner: pi that rotated after the damaged store was written wins; the member store is healed and no dead rt is POSTed", async () => {
+    const pi = await piSetup();
+    // pi holds a later, still valid rotation; the damaged file is older than that mint (expiry far in the future)
+    await writeFile(join(pi, "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "at-2", refresh: "rt-2", expires: 4_000_000_000_000 } }));
+    const { refreshIdentityOAuthGrant } = await import("../../src/identities/oauth-refresh.ts");
+    const { PI_CONFIG } = await import("../../src/identities/tool-configs.ts");
+    const saved = PI_CONFIG.identitiesJsonPath;
+    (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = join(root, "pi.json");
+    const bodies: string[] = [];
+    const fetchImpl = (async (_u: unknown, init: { body?: unknown }) => { bodies.push(String(init?.body)); return new Response(JSON.stringify({ access_token: "at-3", refresh_token: "rt-3", expires_in: 3600 }), { status: 200 }); }) as unknown as typeof fetch;
+    try {
+      await withRole("1", async () => {
+        await refreshIdentityOAuthGrant("claude", member(), { claudeRegistryPath: registry, fetchImpl });
+        const healed = (await read(join(root, "a", ".credentials.json"))).claudeAiOauth;
+        expect(healed.accessToken).toBe("at-2");
+        expect(healed.refreshToken).toBe("rt-2");
+        expect(bodies.length).toBe(0); // at-2 is valid: no POST
+        await refreshIdentityOAuthGrant("claude", member(), { force: true, claudeRegistryPath: registry, fetchImpl });
+      });
+    } finally {
+      (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
+    }
+    expect(bodies.length).toBe(1);
+    expect(bodies[0]).toContain("rt-2");
+    expect(bodies[0]).not.toContain("rt-new");
+  });
+
   test("owner: pi reconcile leaves a hybrid member store and a stale pi copy alone", async () => {
     const { reconcileNativeProviderStores } = await import("../../src/identities/oauth-reconcile.ts");
     const pi = await piSetup();

@@ -620,4 +620,24 @@ describe("idle keep-alive", () => {
     expect(seen).toEqual(["a", "bad", "b"]);
     expect(counted).toEqual(["claude:refreshed", "claude:failed", "claude:refreshed"]);
   });
+
+  test("a revoked grant is remembered by fingerprint and not refreshed again until it changes", async () => {
+    const seen: Array<string | undefined> = [];
+    let fp = "fp-1";
+    const refresh = (async (_t: string, id: { name: string }, opts?: { revokedFingerprint?: string }) => {
+      seen.push(opts?.revokedFingerprint);
+      return { tool: "claude", identity: id.name, outcome: opts?.revokedFingerprint === fp ? "skipped-revoked" : "failed", beforeFingerprint: fp, detail: "", written: [], writeFailures: [] };
+    }) as never;
+    const revoked = new Map<string, string>();
+    const accounts = async () => [{ name: "a", label: "a", configDir: "/x/a" }];
+    const metrics = { keepAlive: () => {} };
+    await keepAliveOnce({ refresh, accounts, metrics, revoked }); // first POST fails, nothing remembered
+    revoked.set("a", "fp-1");
+    await keepAliveOnce({ refresh, accounts, metrics, revoked });
+    expect(seen).toEqual([undefined, "fp-1"]);
+    expect(revoked.get("a")).toBe("fp-1");
+    fp = "fp-2"; // re-login minted a different grant: the stale mark no longer matches, so the refresh runs
+    await keepAliveOnce({ refresh, accounts, metrics, revoked });
+    expect(revoked.has("a")).toBe(false);
+  });
 });

@@ -443,6 +443,8 @@ export const SHORT_TOKEN_EXPIRY_WINDOW_HOURS: Partial<Record<RefreshableTool, nu
   grok: 1,
 };
 export const DEFAULT_EXPIRY_WINDOW_HOURS = 24;
+/** Claude access tokens live about eight hours: a mint time is estimated as expiry minus this when the token carries none. */
+const CLAUDE_ACCESS_TOKEN_LIFETIME_S = 8 * 3600;
 
 /** claude member that is active in a swap pool: the freshest of its own
  * store and the pool store(s). Undefined when no pool holds it (the normal
@@ -549,10 +551,15 @@ async function freshestGrant(
   const piFingerprint = piGrant ? grantFingerprint(piGrant) : undefined;
   const native = await readProviderGrantCopy(tool, identity.configDir, piFingerprint);
   if (!native && !piGrant) return undefined;
-  // A damaged native store (gateway token beside a refresh token) holds the newest refresh token whatever its expiry says: it wins,
-  // and only its refresh token is ever used (its access token is never sent anywhere).
+  // A damaged native store (gateway token beside a refresh token) usually holds the newest refresh token whatever its expiry says,
+  // so it wins, unless pi rotated after the damaged file was last written (pi's mint time is later than the file's mtime).
   if (native && piGrant && isGatewayAccessToken(native.grant.access_token) && native.grant.refresh_token !== piGrant.refresh_token) {
-    return { grant: native.grant, entryKey: native.entryKey, rawEntry: native.rawEntry, source: `native:${native.path}` };
+    const damagedAt = await stat(native.path).then((x) => Math.floor(x.mtimeMs / 1000), () => undefined);
+    const piMinted = piGrant.minted_at ?? (piGrant.expires_at !== undefined ? piGrant.expires_at - CLAUDE_ACCESS_TOKEN_LIFETIME_S : undefined);
+    if (!(damagedAt !== undefined && piMinted !== undefined && piMinted > damagedAt)) {
+      return { grant: native.grant, entryKey: native.entryKey, rawEntry: native.rawEntry, source: `native:${native.path}` };
+    }
+    return { grant: piGrant, entryKey: native.entryKey, rawEntry: native.rawEntry, source: "pi auth.json" };
   }
   if (native && piGrant) {
     const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
@@ -701,6 +708,7 @@ export async function refreshIdentityOAuthGrant(
     );
     peekFailed = peekFailed || peeked.readFailed;
     const peek = peeked.value;
+    if (peek) await healDamagedNativeFromPi(tool, identity, peek, false);
     if (!peek?.grant.refresh_token) {
       return {
         tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], ...(peekFailed ? { readError: true } : {}),
@@ -733,6 +741,15 @@ export async function refreshIdentityOAuthGrant(
     }
     throw err;
   }
+}
+
+/** Pi rotated after a damaged native store (gateway token) was written: put pi's real grant there, never the gateway token. */
+async function healDamagedNativeFromPi(tool: RefreshableTool, identity: Identity, freshest: { grant: OAuthGrant; source: string }, locksHeld: boolean): Promise<void> {
+  if (tool !== "claude" || freshest.source !== "pi auth.json" || isGatewayAccessToken(freshest.grant.access_token)) return;
+  const native = await readProviderGrantCopy("claude", identity.configDir);
+  if (!native || !isGatewayAccessToken(native.grant.access_token)) return;
+  const write = () => writeProviderGrantCopy("claude", identity.configDir, freshest.grant);
+  await (locksHeld ? write() : withOauthRefreshLock(identity.configDir, write)).catch(() => undefined);
 }
 
 function tokenDigest(token: string): string {
@@ -782,6 +799,7 @@ async function refreshGrantUnlocked(
       detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
     };
   }
+  await healDamagedNativeFromPi(tool, identity, freshest, options.locksHeld === true);
   const beforeFingerprint = grantFingerprint(freshest.grant);
   if (options.revokedFingerprint && options.revokedFingerprint === beforeFingerprint) {
     return {

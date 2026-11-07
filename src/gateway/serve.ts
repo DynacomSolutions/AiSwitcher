@@ -1,6 +1,6 @@
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
+import { OAuthRefreshError, refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
 import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
@@ -212,12 +212,18 @@ const describe = (err: unknown): string => {
  * Idle keep-alive: the gateway is the only refresher of managed logins, so it refreshes each one before expiry even with no
  * traffic (AIS's normal expiry window decides; a fresh login is left alone). Counted per outcome; a failure raises the usual alert.
  */
-export async function keepAliveOnce(deps: { refresh: RefreshFn; accounts: () => Promise<Identity[]>; metrics: { keepAlive(provider: string, outcome: string): void } }): Promise<void> {
+export async function keepAliveOnce(deps: { refresh: RefreshFn; accounts: () => Promise<Identity[]>; metrics: { keepAlive(provider: string, outcome: string): void }; revoked?: Map<string, string> }): Promise<void> {
+  // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
+  const revoked = deps.revoked ?? new Map<string, string>();
   for (const account of await deps.accounts().catch(() => [] as Identity[])) {
     try {
-      const r = await deps.refresh("claude", account, {});
+      const known = revoked.get(account.name);
+      const r = await deps.refresh("claude", account, { ...(known ? { revokedFingerprint: known } : {}) });
+      if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(account.name, r.beforeFingerprint);
+      else revoked.delete(account.name);
       deps.metrics.keepAlive("claude", r.outcome);
-    } catch {
+    } catch (err) {
+      if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint) revoked.set(account.name, err.refreshFingerprint);
       deps.metrics.keepAlive("claude", "failed");
     }
   }
@@ -387,11 +393,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const checkLedger = watchLedger(ledger, alerter);
   const alertTimer = setInterval(checkLedger, hooks.alertCheckMs ?? 5_000);
   alertTimer.unref?.();
+  const revokedGrants = new Map<string, string>();
   let keepAliveRunning = false;
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     keepAliveRunning = true;
-    void keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? (() => listGatewayManagedAccounts()), metrics }).finally(() => {
+    void keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? (() => listGatewayManagedAccounts()), metrics, revoked: revokedGrants }).finally(() => {
       keepAliveRunning = false;
     });
   }, hooks.keepAliveMs ?? 600_000);

@@ -244,7 +244,9 @@ export async function healGatewayPool(pool: PoolIdentity, members: Identity[], l
     const r = await installGatewayEntry({ pool, members, token, ...(lock ? { lock } : {}) });
     if (!r.changed) return [];
     if (!r.entryReplaced) return r.notes.map((n) => `pool ${pool.name}: ${n}`);
-    return [`pool ${pool.name}: a real login was found in the gateway identity; restored the gateway entry`, ...r.notes];
+    // The entry is replaced for a new app token as well as after a stray login: only claim a login when a backup note says so.
+    const foundLogin = r.notes.some((n) => n.includes("backup"));
+    return [`pool ${pool.name}: ${foundLogin ? "a real login was found in the gateway identity; " : ""}restored the gateway entry`, ...r.notes];
   }, lock);
 }
 
