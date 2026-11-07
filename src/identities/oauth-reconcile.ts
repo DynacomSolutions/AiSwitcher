@@ -191,8 +191,15 @@ interface NativeAnthropicFile {
 async function readNativeAnthropic(path: string): Promise<StoreCopy | undefined> {
   const raw = (await readJson(path)) as NativeAnthropicFile | undefined;
   const auth = raw?.claudeAiOauth;
+  if (!auth || !usableToken(auth.accessToken)) return undefined;
   // The gateway entry of a gateway-routed identity is an app token, not a login: it is never a grant to reconcile or refresh.
-  if (!auth || !usableToken(auth.accessToken) || isGatewayAccessToken(auth.accessToken)) return undefined;
+  if (isGatewayAccessToken(auth.accessToken)) {
+    // A pure entry has no refresh token. One that still carries a refresh token is a damaged member store: an older build
+    // converged the gateway entry over a real login. The refresh token is the only live part, so keep it and report the
+    // access token as long expired: it loses every freshest-copy comparison and is never sent upstream or written elsewhere.
+    if (!usableToken(auth.refreshToken)) return undefined;
+    return { side: "native", path, grant: { access_token: auth.accessToken, refresh_token: auth.refreshToken, expires_at: 0 } };
+  }
   return {
     side: "native",
     path,
@@ -205,6 +212,9 @@ async function readNativeAnthropic(path: string): Promise<StoreCopy | undefined>
 }
 
 async function writeNativeAnthropic(path: string, grant: OAuthGrant, backups: Set<string>): Promise<void> {
+  // The gateway app token belongs to the gateway entry alone (written by writeGatewayEntry); merging it into a login store
+  // would log that identity out of every direct session that reads the file.
+  if (isGatewayAccessToken(grant.access_token)) throw new Error("refusing to write a gateway app token into a login store");
   const raw = ((await readJson(path)) as NativeAnthropicFile | undefined) ?? {};
   const auth = (raw.claudeAiOauth && typeof raw.claudeAiOauth === "object" ? raw.claudeAiOauth : {}) as Record<string, unknown>;
   await backupOnce(path, backups);

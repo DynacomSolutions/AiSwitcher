@@ -229,3 +229,34 @@ describe("member credential convergence ignores a gateway pool folder", () => {
     expect(paths.some((p) => p.startsWith(poolDir()))).toBe(false);
   });
 });
+
+describe("a gateway token that leaked into a member store (older build converged it)", () => {
+  test("the member's refresh token survives as an expired grant that loses every freshest comparison, and is never written onward", async () => {
+    // Damaged member store: gateway token + far-future expiry beside the member's real refresh token.
+    await writeFile(join(root, "a", ".credentials.json"), cred(GW, "rt-a1", 4_102_444_800));
+    const copy = await readProviderGrantCopy("claude", join(root, "a"));
+    expect(copy?.grant.refresh_token).toBe("rt-a1");
+    expect(copy?.grant.expires_at).toBe(0);
+    // A pure entry (no refresh token) is still not a grant.
+    await writeFile(join(root, "b", ".credentials.json"), gatewayEntryText(GW));
+    expect(await readProviderGrantCopy("claude", join(root, "b"))).toBeUndefined();
+    // Converging a real grant over the damaged store heals it; the gateway token is never copied out.
+    await routeThroughProxy();
+    const a = ((await read(registry)) as IdentitiesFile).identities.find((i) => i.name === "a")!;
+    await writeFile(join(poolDir(), ".credentials.json"), cred("at-a2", "rt-a1", NOW_S + 3000));
+    await rm(join(poolDir(), "settings.json"));
+    await convergeClaudePoolStores(a, registry);
+    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.accessToken).toBe("at-a2");
+  });
+
+  test("a hybrid pool folder (gateway token plus a refresh token) is rewritten to the pure entry by heal", async () => {
+    await routeThroughProxy();
+    await writeFile(join(poolDir(), ".credentials.json"), cred(GW, "rt-a1", 4_102_444_800));
+    const file = (await read(registry)) as IdentitiesFile;
+    const pool = file.identities.find((i) => i.name === "pool")!;
+    await claudeAdapter.heal!(pool as never, file.identities.filter((i) => i.name === "a" || i.name === "b"));
+    const o = (await read(join(poolDir(), ".credentials.json"))).claudeAiOauth;
+    expect(o.accessToken).toBe(GW);
+    expect(o.refreshToken).toBeNull();
+  });
+});

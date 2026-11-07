@@ -7,7 +7,7 @@ import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuth
 import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, readSwapEvents as readPoolSwapEvents } from "./pool/ledger.ts";
 import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
 import { claudeAdapter } from "./pool/claude-adapter.ts";
-import { dropApiKeyHelper, isGatewayAccessToken, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
+import { dropApiKeyHelper, isGatewayAccessToken, isIntactGatewayEntry, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
 import { performPoolSwap, type PerformSwapOptions } from "./pool/swap.ts";
 import { allowedAccounts, SwapPoolError, type PoolIdentity } from "./pool/swap-pool.ts";
 import type { Identity } from "./types.ts";
@@ -192,7 +192,7 @@ async function installGatewayEntry(input: { pool: PoolIdentity; members: Identit
   const { pool, members, token } = input;
   const poolCredPath = nativeStorePathFor("claude", pool.configDir);
   const current = await storedAccessToken(pool.configDir);
-  if (current === token) {
+  if (current === token && (await isIntactGatewayEntry(pool.configDir, token))) {
     const dropped = await dropApiKeyHelper(pool.configDir);
     return { changed: dropped, entryReplaced: false, writeBack: "none-identical", notes: dropped ? ["removed apiKeyHelper from the gateway identity's settings"] : [] };
   }
