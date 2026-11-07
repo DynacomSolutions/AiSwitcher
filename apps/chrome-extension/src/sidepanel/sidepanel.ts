@@ -1,6 +1,8 @@
 // Side panel: connection status, binding, agent sessions and the Pause / Resume / Stop controls. Plain DOM.
 import type { PanelMessage, PanelSession, PanelStatus } from "../shared/panel.ts";
 import { targetText } from "../shared/panel.ts";
+import { KEYS, PairingError, parseConsoleUrl, signIn, UNREACHABLE_MESSAGE } from "../background/pairing.ts";
+import { realChromeApi } from "../background/chrome-api.ts";
 
 type Tone = "ok" | "warn" | "bad" | "idle";
 interface View { tone: Tone; chip: string; busy?: boolean; title: string; text: string; actions: Array<{ label: string; send?: PanelMessage; kind?: "primary" | "danger" | "quiet"; open?: boolean; signOut?: boolean }> }
@@ -8,7 +10,7 @@ interface View { tone: Tone; chip: string; busy?: boolean; title: string; text: 
 /** Pure mapping from status to what the panel shows; exported for tests. */
 export function viewFor(s: PanelStatus): View {
   if (!s.signedIn || s.status === "signed_out") {
-    return { tone: "idle", chip: "Signed out", title: "Not signed in", text: "Pair this Chrome profile with an AIS identity or pool. Agents cannot reach it until then.", actions: [{ label: "Sign in", open: true, kind: "primary" }] };
+    return { tone: "idle", chip: "Not connected", title: "Connect this browser", text: "Enter the address of your AIS and approve the connection. Agents cannot reach this browser until then.", actions: [] };
   }
   if (s.status === "disconnected") {
     return { tone: "idle", chip: "Disconnected", title: "Disconnected", text: "This profile is paired but not connected. Agents cannot reach it.", actions: [{ label: "Connect", send: "ais-connect", kind: "primary" }] };
@@ -42,16 +44,77 @@ function sessionRow(s: PanelSession): HTMLElement {
   return h("li", {}, bar, h("div", {}, h("div", { class: "title" }, s.label), h("div", { class: "sub" }, s.identity)), h("span", { class: "count" }, `${s.tabs} ${s.tabs === 1 ? "tab" : "tabs"}`));
 }
 
+/** Sign-in form state. The panel re-renders on a timer, so the form is built once and only patched afterwards. */
+const form: { draft: string; error: string; busy: boolean; loaded: boolean } = { draft: "", error: "", busy: false, loaded: false };
+
+function chromeEmail(): Promise<string | undefined> {
+  return new Promise(resolve => {
+    try { chrome.identity.getProfileUserInfo({ accountStatus: "ANY" as chrome.identity.AccountStatus }, info => resolve(info?.email || undefined)); } catch { resolve(undefined); }
+  });
+}
+
+async function connectClicked(): Promise<void> {
+  form.error = "";
+  form.busy = true;
+  patchForm();
+  try {
+    const api = realChromeApi();
+    await signIn({
+      storage: api.storage,
+      launch: url => chrome.identity.launchWebAuthFlow({ url, interactive: true }),
+      redirectUri: chrome.identity.getRedirectURL("cb"),
+      getEmail: chromeEmail,
+      platform: (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ?? navigator.platform ?? "",
+    }, form.draft);
+  } catch (e) {
+    form.error = e instanceof PairingError ? e.message : UNREACHABLE_MESSAGE;
+  }
+  form.busy = false;
+  patchForm();
+  await refresh();
+}
+
+/** Applies the form state to the existing form elements without rebuilding them (keeps focus and caret). */
+function patchForm(): void {
+  const input = document.getElementById("ais-url") as HTMLInputElement | null;
+  const button = document.getElementById("ais-connect") as HTMLButtonElement | null;
+  const err = document.getElementById("ais-error");
+  if (!input || !button || !err) return;
+  input.disabled = form.busy;
+  button.disabled = form.busy || !parseConsoleUrl(form.draft);
+  button.textContent = form.busy ? "Waiting for approval..." : "Connect";
+  err.textContent = form.error;
+  err.hidden = form.error === "";
+  const hint = document.getElementById("ais-hint");
+  if (hint) hint.hidden = form.draft === "" || Boolean(parseConsoleUrl(form.draft)) || form.error !== "";
+}
+
+function signInCard(v: View): HTMLElement {
+  const input = h("input", { id: "ais-url", type: "text", inputmode: "url", spellcheck: "false", autocomplete: "off", placeholder: "https://ais.example.com", "aria-label": "AIS address" });
+  input.value = form.draft;
+  input.addEventListener("input", () => { form.draft = input.value; form.error = ""; patchForm(); });
+  input.addEventListener("keydown", e => { if (e.key === "Enter" && !form.busy && parseConsoleUrl(form.draft)) void connectClicked(); });
+  const button = h("button", { id: "ais-connect", type: "button", class: "primary" }, "Connect");
+  button.addEventListener("click", () => void connectClicked());
+  const error = h("p", { id: "ais-error", class: "banner bad", role: "alert", hidden: "" });
+  const hint = h("p", { id: "ais-hint", class: "hint", hidden: "" }, "Use the full https address, for example https://ais.example.com");
+  return h("section", { id: "signin-card", class: "card hero idle" }, h("h1", {}, v.title), h("p", {}, v.text), h("label", { class: "field" }, h("span", {}, "AIS address"), input), hint, error, h("div", { class: "actions" }, button));
+}
+
 export function render(s: PanelStatus, root: HTMLElement, chip: HTMLElement): void {
   const v = viewFor(s);
   chip.textContent = v.chip;
   chip.className = `chip ${v.tone === "idle" ? "" : v.tone}${v.busy ? " busy" : ""}`.trim();
+  if (!s.signedIn || s.status === "signed_out") {
+    if (!root.querySelector("#signin-card")) { root.replaceChildren(signInCard(v)); }
+    patchForm();
+    return;
+  }
 
   const actions = h("div", { class: "actions" }, ...v.actions.map(a => {
     const b = h("button", { type: "button", class: a.kind ?? "" }, a.label);
     b.addEventListener("click", () => {
-      if (a.open) void chrome.runtime.openOptionsPage();
-      else if (a.send) void send(a.send).then(refresh);
+      if (a.send) void send(a.send).then(refresh);
     });
     return b;
   }));
@@ -82,6 +145,11 @@ export function render(s: PanelStatus, root: HTMLElement, chip: HTMLElement): vo
 }
 
 async function refresh(): Promise<void> {
+  if (!form.loaded) {
+    form.loaded = true;
+    const saved = (await chrome.storage.local.get([KEYS.consoleUrl]))[KEYS.consoleUrl];
+    if (typeof saved === "string" && !form.draft) form.draft = saved;
+  }
   const s = (await chrome.runtime.sendMessage({ type: "ais-status" })) as PanelStatus | undefined;
   if (s) render(s, document.getElementById("root")!, document.getElementById("chip")!);
 }

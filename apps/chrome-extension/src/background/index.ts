@@ -74,7 +74,7 @@ chrome.alarms.onAlarm.addListener(() => {
   void startup.then(async () => { if (connection.needsRestart()) await connect(); });
 });
 
-// Control messages from the side panel, options page and the in-page Stop button (see messages.ts for who may send what).
+// Control messages from the side panel and the in-page Stop button (see messages.ts for who may send what).
 chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMessage(msg, sender, reply, {
   runtimeId: chrome.runtime.id,
   state,

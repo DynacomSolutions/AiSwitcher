@@ -84,7 +84,7 @@ describe("side panel view", () => {
   });
   test("connected offers Pause all and Stop; signed out offers sign in", () => {
     expect(viewFor(base).actions.map(a => a.label)).toEqual(["Pause all", "Stop"]);
-    expect(viewFor({ ...base, signedIn: false, status: "idle" }).actions[0]).toMatchObject({ label: "Sign in", open: true });
+    expect(viewFor({ ...base, signedIn: false, status: "idle" })).toMatchObject({ chip: "Not connected", title: "Connect this browser", actions: [] });
   });
   test("pause beats reconnecting so a stopped profile never looks usable", () => {
     expect(viewFor({ ...base, status: "reconnecting", paused: true }).chip).toBe("Paused");

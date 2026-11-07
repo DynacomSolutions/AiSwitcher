@@ -4,18 +4,22 @@ Lets Claude and Codex sessions drive a real Chrome profile through the gateway. 
 
 ## Install on the Mac
 
-1. Tailscale must be running: the gateway hostname is Tailnet-only, so the extension cannot connect without it.
+1. If your AIS and gateway are on a private network (for example Tailscale), it must be running, or the extension cannot reach them.
 2. `ais browser extension update` downloads the latest `ais-browser-extension.zip` release asset (via `gh`, else the GitHub REST API with `GITHUB_TOKEN` or `GH_TOKEN`) and swaps it into `~/.ais/browser-extension/` atomically (old folder renamed aside, new one renamed in, old removed; on any failure the old folder stays). `--from=<zip>` installs a local zip instead.
 3. `ais browser extension path` prints the folder.
-4. In Chrome: `chrome://extensions`, enable Developer mode, Load unpacked, pick that folder. Repeat in every Chrome profile that should be drivable (each profile pairs separately).
+4. In Chrome: `chrome://extensions`, enable Developer mode, Load unpacked, pick that folder. Repeat in every Chrome profile that should be drivable (each profile connects separately).
 5. After a later `update`, reload the extension in each Chrome profile.
 
-## Pair and bind
+## Connect and bind
 
-1. Open the extension options page. Set Gateway URL to the `wss://` form of the host in `AIS_GATEWAY_PROXY_URL` (same host, `wss://` instead of `https://`). `ws://` is accepted only for localhost.
-2. Press Sign in. The page shows a pairing code.
-3. On a machine with the gateway admin settings in `~/.secrets`: `ais browser approve <CODE> --identity=<id>` or `--pool=<pool>` (exactly one; `--name=<n>` names the binding). An identity binding serves that identity; a pool binding serves every identity in the swap pool.
-4. `ais browser list [--json]` shows bindings and when each browser last connected.
+1. Open the AIS Browser side panel (toolbar button). Type the address of your AIS Console (for example `https://ais.example.com`) and press Connect. The panel names the Chrome account email as the profile label, or "Chrome on <platform> <id>" when no account is signed in.
+2. Chrome opens the console page `/browser/authorize`: "Connect <label> to AIS". Pick a pool (the first is preselected) or an identity and press Approve. An identity binding serves that identity; a pool binding serves every identity in the swap pool.
+3. The page returns to the extension, which stores the token and the gateway relay address the console handed out, and shows Connected. Nothing needs the CLI.
+4. `ais browser list [--json]` shows bindings and when each browser last connected. `ais browser approve <CODE>` remains an admin command for the older pairing-code flow.
+
+The console does the approval server-side: it starts a pairing on the gateway, approves it with the gateway admin bearer, and claims the token. The bearer never reaches the browser. The page has no login: the console is meant to sit on a private network. It is guarded by a CSRF cookie and a strict `redirect_uri` check (`https://<32 letters a-p>.chromiumapp.org/...`, optionally limited to the extension ids in `AIS_CONSOLE_EXTENSION_IDS`). Gateway and console URLs may carry a path prefix such as `/gateway`.
+
+Console configuration: `AIS_GATEWAY_PROXY_URL` (gateway proxy, reachable from the console, with any prefix), `AIS_GATEWAY_ADMIN_URL` and `AIS_GATEWAY_ADMIN_TOKEN` (env or `~/.secrets`), `AIS_CONSOLE_GATEWAY_WSS_URL` (the public `wss://` address handed to the extension; defaults to the proxy URL with `ws`), `AIS_CONSOLE_EXTENSION_IDS` (optional comma-separated allowlist). Without the first three the page answers 503.
 
 ## Agent tokens
 

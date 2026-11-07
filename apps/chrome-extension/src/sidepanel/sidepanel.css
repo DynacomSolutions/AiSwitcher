@@ -56,3 +56,14 @@ ul.sessions { list-style: none; margin: 0; padding: 0; display: flex; flex-direc
 .sessions .count { font-size: 12px; font-weight: 600; color: var(--muted); background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; }
 .empty { color: var(--muted); margin: 0; font-size: 13px; }
 .foot { display: flex; justify-content: space-between; gap: 8px; }
+[hidden] { display: none !important; }
+.field { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.field span { font-size: 11.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+input[type="text"] { font: inherit; font-size: 14px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; width: 100%; transition: border-color .12s, box-shadow .12s; }
+input[type="text"]::placeholder { color: color-mix(in srgb, var(--muted) 70%, transparent); }
+input[type="text"]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+input[type="text"]:disabled { opacity: .6; }
+button:disabled { opacity: .55; cursor: default; transform: none; }
+.hint { margin: 6px 0 0; color: var(--muted); font-size: 12.5px; }
+.banner { margin: 10px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 13px; font-weight: 550; line-height: 1.45; }
+.banner.bad { background: var(--bad-bg); color: var(--bad); border: 1px solid color-mix(in srgb, var(--bad) 30%, transparent); }

@@ -28,6 +28,7 @@ export const RESERVED_DOMAINS: readonly AllowlistEntry[] = [
 // needs, to function. Enumerated from the actual source: every entry below
 // has at least one call site or normative reference in this repository.
 export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
+  { domain: "chromiumapp.org", reason: "Chrome-defined redirect host of chrome.identity.launchWebAuthFlow, validated by the console sign-in page (src/server/browser-authorize.ts)" },
   { domain: "github.com", reason: "release asset URLs and repo links (src/shared/release-assets.ts) and the connectivity probe (src/shared/connectivity.ts)" },
   { domain: "huggingface.co", reason: "pinned local model download host (apps/host/crates/core/src/model.rs)" },
   { domain: "hf.co", reason: "download redirect hosts used by huggingface.co for pinned model files (apps/host/crates/core/src/model.rs)" },

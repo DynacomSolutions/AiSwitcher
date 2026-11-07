@@ -10,7 +10,6 @@ await mkdir(dist, { recursive: true });
 // The content script is injected as a classic script, so it is bundled as an IIFE.
 const entries = [
   ["src/background/index.ts", "background", "esm"],
-  ["src/options/options.ts", "options", "esm"],
   ["src/sidepanel/sidepanel.ts", "sidepanel", "esm"],
   ["src/content/index.ts", "content", "iife"],
 ] as const;
@@ -22,7 +21,6 @@ for (const [entry, name, format] of entries) {
   }
 }
 await cp(join(root, "manifest.json"), join(dist, "manifest.json"));
-await cp(join(root, "src/options/options.html"), join(dist, "options.html"));
 await cp(join(root, "src/sidepanel/sidepanel.html"), join(dist, "sidepanel.html"));
 await cp(join(root, "src/sidepanel/sidepanel.css"), join(dist, "sidepanel.css"));
 console.log(`Built ${process.argv[2] ?? "apps/chrome-extension/dist"}`);

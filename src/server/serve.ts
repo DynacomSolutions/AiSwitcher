@@ -2,6 +2,7 @@ import { isIP } from "node:net";
 import { join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync } from "node:fs";
+import { browserAuthFromEnv } from "./browser-authorize.ts";
 import { createApp } from "./app.ts";
 import { AuthRefreshScheduler, parseRefreshIntervalMs } from "./auth-refresh.ts";
 import { loadSpendGuardConfig, SpendGuardScheduler } from "./spend-guard.ts";
@@ -181,6 +182,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     claudeSwap.start();
   }
 
+  const browserAuth = await browserAuthFromEnv();
   const token = newConsoleToken();
   const deps: ConsoleAppDeps = {
     token,
@@ -193,6 +195,7 @@ export async function startConsoleServer(options: ServeOptions = {}): Promise<{ 
     ...(herdrBridge ? { herdrBridge } : {}),
     ...(claudeSwap ? { claudeSwap } : {}),
     loginFlows,
+    ...(browserAuth ? { browserAuth } : {}),
     ...(options.distDir ? { distDir: options.distDir } : {}),
   };
   const app = createApp(deps);

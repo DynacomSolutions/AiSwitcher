@@ -1,4 +1,4 @@
-// Message shapes shared by the service worker, side panel and options page.
+// Message shapes shared by the service worker and side panel.
 import type { BrowserTarget } from "../../../../src/browser/types.ts";
 
 export interface PanelSession { id: string; identity: string; label: string; tabs: number; color: string; group: string }
