@@ -3,7 +3,7 @@
 Track product work, bugs and acceptance evidence. Routine Git operations are not tasks.
 
 ## 1. Product work
-ETA: 2026-10-28 02:30 ICT
+ETA: 2026-11-07 22:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 1 | Preserve Grok's explicit memory control through the identity launcher | done | grok_memory_fix | | | | Exact-key forwarding and four real-subprocess regressions are source-reviewed. Focused QA completed successfully; full CI on `97ae2de` passed typecheck and 609 tests across 76 files with zero failures. Compiled launcher inspected live: both launcher and real Grok child receive `GROK_MEMORY=0`. Installed binary matches the tested candidate byte-for-byte, with a rollback copy; other launchers and shared memory settings are unchanged. Other session markers and explicit child overrides remain intact. |
@@ -82,6 +82,7 @@ ETA: 2026-10-28 02:30 ICT
 | 94 | Fix `ais usage tui` dropping the `tui` subcommand before shared tokscale | done | | | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/310 (`5143125`); released v0.5.22.<br>Regression test https://github.com/DynacomSolutions/AiSwitcher/pull/312 (`f239100`) fails on the old `slice(1)` bug. |
 | 95 | Usage collector commits every successful scan; drop history regression guard | done | | | | | Guard froze a grok partition ~6 h on a source history rewrite.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/311 (`4cea523`); released v0.5.22, installed, clean cycle with no partition errors.<br>Superseded #304, closed. |
 | 96 | Ignore retired identity partitions in usage snapshot freshness | done | | | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/313 (`2770df9`); released v0.5.23, installed on host.<br>Web pod rolled to `2770df9` via .cluster #1884; `/api/usage` stale false, retired identities still in totals. |
+| 141 | ais update backup progress % + ETA | in_progress | claude-20261107-update-backup-progress | update-backup-progress | | 2026-11-07 22:00 ICT | Heartbeat shows percent, bytes and ETA from observed rate; also `bun run backup` and the installer.<br>Reclaim of dead-pid backups.lock already worked; added release on SIGINT/SIGTERM. |
 
 ## 2. Live USB
 ETA: 2026-11-14 18:00 ICT

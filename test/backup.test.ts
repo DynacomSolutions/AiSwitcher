@@ -506,6 +506,37 @@ describe("pid lock", () => {
   });
 });
 
+describe("runBackup lock and progress", () => {
+  test("reports byte progress and reclaims a lock left by a dead pid", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "x".repeat(1000));
+    await write(join(home, ".codex", "b.txt"), "y".repeat(500));
+    const dead = Bun.spawn(["true"]);
+    await dead.exited;
+    await mkdir(join(home, ".ais"), { recursive: true });
+    await Bun.write(join(home, ".ais", "backups.lock"), JSON.stringify({ pid: dead.pid, token: "stale", startedAt: "2026-11-07T00:00:00Z" }) + "\n");
+
+    const seen: { totalBytes?: number; doneBytes: number }[] = [];
+    await runBackup(["codex"], home, join(home, "none.json"), (p) => seen.push({ ...p }));
+
+    const last = seen[seen.length - 1]!;
+    expect(last.totalBytes).toBeGreaterThanOrEqual(1500);
+    expect(last.doneBytes).toBe(last.totalBytes!);
+    expect(existsSync(join(home, ".ais", "backups.lock"))).toBe(false);
+  });
+
+  test("SIGTERM releases the lock", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "x");
+    const script = join(home, "run.ts");
+    const mod = join(import.meta.dir, "..", "scripts", "backup.ts");
+    await Bun.write(script, `import { runBackup } from ${JSON.stringify(mod)};\nawait runBackup(["codex"], ${JSON.stringify(home)}, ${JSON.stringify(join(home, "none.json"))}, () => { process.kill(process.pid, "SIGTERM"); });\nawait Bun.sleep(5000);\n`);
+    const proc = Bun.spawn([process.execPath, script], { stdout: "ignore", stderr: "ignore" });
+    await proc.exited;
+    expect(existsSync(join(home, ".ais", "backups.lock"))).toBe(false);
+  });
+});
+
 describe("runBackup off-host push", () => {
   test("no backup.json: no remote, no shallow file, no lock left behind", async () => {
     const home = await makeHome();
