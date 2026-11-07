@@ -579,23 +579,20 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     // Out of capacity (or at the reserve): answer in the provider's own limit shape so its CLI shows its built-in limit handling.
     // When a member would be free without the short holds, the answer is about the hold, not about usage.
     if (pick.reject === "no-headroom" && app.target.kind === "pool") {
-      const free = await pickIdentity(app, deps, undefined);
-      if ("identity" in free) {
-        const live = [...holds].filter(([k]) => k.startsWith(`${app.provider}\u0000`) && (exhausted.get(k) ?? 0) > deps.now().getTime());
-        const burst = live.filter(([, h]) => h.kind === "burst");
-        if (burst.length > 0) {
-          const until = Math.min(...burst.map(([k]) => exhausted.get(k)!));
-          const secs = Math.min(60, Math.max(1, Math.ceil((until - deps.now().getTime()) / 1000)));
-          record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
-          const res = providerError(style, 429, "upstream rate limit: retry shortly");
-          res.headers.set("retry-after", String(secs));
-          return res;
-        }
-        const cred = live.find(([, h]) => h.kind === "cred");
-        if (cred) {
-          record(identityForRow, "credential_error", 502, undefined, false, undefined, model, reason);
-          return providerError(style, 502, cred[1].message ?? "upstream credential unavailable");
-        }
+      // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
+      const quotaOut = new Set([...(await exhaustedNames())].filter((n) => !holds.has(exKey(n))));
+      const free = await pickIdentity(app, deps, quotaOut);
+      const h = "identity" in free ? holds.get(exKey(free.identity)) : undefined;
+      if (h?.kind === "burst" && "identity" in free) {
+        const secs = Math.min(60, Math.max(1, Math.ceil(((exhausted.get(exKey(free.identity)) ?? 0) - deps.now().getTime()) / 1000)));
+        record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
+        const res = providerError(style, 429, "upstream rate limit: retry shortly");
+        res.headers.set("retry-after", String(secs));
+        return res;
+      }
+      if (h?.kind === "cred") {
+        record(identityForRow, "credential_error", 502, undefined, false, undefined, model, reason);
+        return providerError(style, 502, h.message ?? "upstream credential unavailable");
       }
     }
     if (pick.reject !== "no-identities") {
