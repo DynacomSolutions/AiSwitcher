@@ -196,3 +196,10 @@ ETA: 2026-11-14 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 148 | Prove gateway clients keep a base path such as /gateway | in_progress | claude | gateway-url-path | | 2026-11-07 22:00 ICT | No built-in gateway host exists; URL comes from AIS_GATEWAY_PROXY_URL only<br>Tests for local proxy and browser shim; docs use example.com<br>Was 142. |
+
+## 9. Console image security
+ETA: 2026-11-08 12:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 149 | Console image pulls Debian security updates so Trivy passes | in_progress | claude | console-zlib-cve | | 2026-11-08 12:00 ICT | .cluster "AIS console image" Trivy fails on zlib1g CVE-2026-76844 and CVE-2026-85091 (fixed in deb13u1) since 2026-11-07.<br>Prod console missed PR #409 because of it.<br>Fix: apt-get upgrade in the final stage. |
