@@ -1,5 +1,6 @@
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import { priceNullCostGroup } from "./usage.ts";
 
 export interface GatewayStore {
   getApp(name: string): Promise<GatewayApp | undefined>;
@@ -114,7 +115,12 @@ export class MemoryGatewayStore implements GatewayStore {
       a.cacheWriteTokens += r.cacheWriteTokens;
       a.requests += 1;
       if (r.estCostUsd !== undefined) a.estCostUsd += r.estCostUsd;
-      else if (r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens > 0) a.unpricedRequests += 1;
+      else {
+        // Stored without a cost: price from tokens and model now (the ledger is not rewritten).
+        const priced = priceNullCostGroup({ provider: r.provider, identity: r.identity, app: r.app, model: r.model ?? null, inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadTokens: r.cacheReadTokens, cacheWriteTokens: r.cacheWriteTokens, requests: 1 });
+        a.estCostUsd += priced.cost;
+        a.unpricedRequests += priced.unpriced;
+      }
     }
     return [...by.values()];
   }

@@ -1,3 +1,4 @@
+import "../identities/model-price-source.ts";
 import { estimateChatModelTokenCost, estimateDetailedModelTokenCost } from "../identities/model-pricing.ts";
 import type { UsageStyle } from "./providers/index.ts";
 import type { GatewayProvider } from "./types.ts";
@@ -311,4 +312,41 @@ export function estimateCost(provider: GatewayProvider, c: UsageCounts): number 
     return estimateDetailedModelTokenCost(provider === "zai" ? "zai" : "alibaba", c.model, c.inputTokens, c.outputTokens, c.cacheReadTokens, c.cacheWriteTokens);
   }
   return estimateChatModelTokenCost(c.model, c.inputTokens, c.outputTokens, c.cacheReadTokens, c.cacheWriteTokens);
+}
+
+const warnedModels = new Set<string>();
+
+/** Logs one JSON warning per model per process when a model has no price anywhere. */
+export function warnUnpricedModelOnce(provider: string, model: string, sink: (line: string) => void = (l) => console.warn(l)): void {
+  const key = `${provider}\u0000${model}`;
+  if (warnedModels.has(key)) return;
+  warnedModels.add(key);
+  sink(JSON.stringify({ event: "unpriced_model", provider, model }));
+}
+
+/** estimateCost plus a once-per-model warning when the model is unknown but carried tokens. */
+export function estimateCostWarn(provider: GatewayProvider, c: UsageCounts, sink?: (line: string) => void): number | undefined {
+  const cost = estimateCost(provider, c);
+  if (cost === undefined && c.model && c.inputTokens + c.outputTokens + c.cacheReadTokens + c.cacheWriteTokens > 0) warnUnpricedModelOnce(provider, c.model, sink);
+  return cost;
+}
+
+export interface NullCostGroup {
+  provider: GatewayProvider;
+  identity: string;
+  app: string;
+  model: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  requests: number;
+}
+
+/** Prices stored NULL-cost rows from their tokens and model at read time. Returns the cost to add and the rows that stay unpriced. */
+export function priceNullCostGroup(g: NullCostGroup): { cost: number; unpriced: number } {
+  const tokens = g.inputTokens + g.outputTokens + g.cacheReadTokens + g.cacheWriteTokens;
+  if (tokens <= 0) return { cost: 0, unpriced: 0 };
+  const cost = g.model ? estimateCostWarn(g.provider, { ...g, model: g.model }) : undefined;
+  return cost === undefined ? { cost: 0, unpriced: g.requests } : { cost, unpriced: 0 };
 }

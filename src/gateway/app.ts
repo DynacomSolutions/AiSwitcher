@@ -17,7 +17,7 @@ import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
-import { estimateCost, UsageTap } from "./usage.ts";
+import { estimateCostWarn, UsageTap } from "./usage.ts";
 import type { UsageCounts } from "./usage.ts";
 
 export interface GatewayDeps {
@@ -438,7 +438,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     recorded = true;
     const latencyMs = Math.round(performance.now() - started);
     const c = counts ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-    const cost = counts ? estimateCost(app.provider, counts) : undefined;
+    const cost = counts ? estimateCostWarn(app.provider, { ...counts, model: counts.model ?? model }, log) : undefined;
     const row: UsageRow = {
       ts: deps.now().toISOString(),
       app: app.name,
