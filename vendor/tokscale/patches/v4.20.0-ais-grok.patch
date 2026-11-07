@@ -1,0 +1,537 @@
+diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
+index 529b828..5102f21 100644
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -14911,6 +14911,269 @@ mod tests {
+         }
+     }
+ 
++    type AisGrokRow = (
++        String,
++        String,
++        String,
++        Option<String>,
++        i64,
++        i64,
++        i64,
++        i64,
++        i64,
++        String,
++    );
++
++    fn ais_grok_rows(messages: &[UnifiedMessage]) -> Vec<AisGrokRow> {
++        let mut rows: Vec<AisGrokRow> = messages
++            .iter()
++            .map(|m| {
++                (
++                    m.dedup_key.clone().unwrap_or_default(),
++                    m.model_id.clone(),
++                    m.session_id.clone(),
++                    m.workspace_key.clone(),
++                    m.timestamp,
++                    m.tokens.input,
++                    m.tokens.output,
++                    m.tokens.cache_read,
++                    m.tokens.reasoning,
++                    format!("{:.9}", m.cost),
++                )
++            })
++            .collect();
++        rows.sort();
++        rows
++    }
++
++    fn ais_grok_inference(sid: &str, pid: u32, second: u32, prompt: u32) -> String {
++        format!(
++            "{{\"ts\":\"2026-11-01T00:00:{second:02}Z\",\"pid\":{pid},\"sid\":\"{sid}\",\"msg\":\"shell.turn.inference_done\",\"ctx\":{{\"loop_index\":1,\"prompt_tokens\":{prompt},\"cached_prompt_tokens\":10,\"completion_tokens\":7,\"reasoning_tokens\":2}}}}\n"
++        )
++    }
++
++    fn ais_grok_session(dir: &std::path::Path, model: &str, legacy_total: Option<u32>) {
++        std::fs::create_dir_all(dir).unwrap();
++        std::fs::write(
++            dir.join("summary.json"),
++            format!("{{\"current_model_id\":\"{model}\",\"updated_at\":\"2026-11-01T00:00:00Z\"}}"),
++        )
++        .unwrap();
++        std::fs::write(
++            dir.join("signals.json"),
++            format!("{{\"primaryModelId\":\"{model}\"}}"),
++        )
++        .unwrap();
++        std::fs::write(
++            dir.join("events.jsonl"),
++            format!("{{\"ts\":\"2026-11-01T00:00:00Z\",\"model_id\":\"{model}\"}}\n"),
++        )
++        .unwrap();
++        if let Some(total) = legacy_total {
++            let session = dir.file_name().unwrap().to_str().unwrap();
++            std::fs::write(
++                dir.join("updates.jsonl"),
++                format!(
++                    "{{\"method\":\"session/update\",\"params\":{{\"sessionId\":\"{session}\",\"_meta\":{{\"totalTokens\":{total},\"agentTimestampMs\":1761955200000}}}}}}\n"
++                ),
++            )
++            .unwrap();
++        }
++    }
++
++    /// A unified log only takes metadata from the sessions it names. A warm
++    /// scan of an unchanged Grok home reads nothing, a changed log reads only
++    /// the sessions it references, never the rest of the tree, and every warm
++    /// result equals a cold scan.
++    #[test]
++    #[serial_test::serial]
++    fn ais_grok_unified_warm_scan_reads_only_referenced_sessions_and_matches_cold() {
++        for stat_only in [true, false] {
++            let cache_home = tempfile::TempDir::new().unwrap();
++            let home = tempfile::TempDir::new().unwrap();
++            let mut stat_env =
++                crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_AIS_STAT_ONLY_CACHE"]);
++            if stat_only {
++                stat_env.set("TOKSCALE_AIS_STAT_ONLY_CACHE", "1");
++            } else {
++                stat_env.remove("TOKSCALE_AIS_STAT_ONLY_CACHE");
++            }
++            let sessions = home.path().join(".grok/sessions");
++            let ws_a = sessions.join("%2Ftmp%2Fa");
++            let ws_b = sessions.join("%2Ftmp%2Fb");
++            // Referenced: s1 (legacy updates too) and s3 (no updates.jsonl).
++            ais_grok_session(&ws_a.join("s1"), "grok-code", Some(500));
++            ais_grok_session(&ws_b.join("s3"), "grok-4", None);
++            // Unreferenced: s2 until the log names it, s4 never.
++            ais_grok_session(&ws_a.join("s2"), "grok-3", Some(900));
++            ais_grok_session(&ws_b.join("s4"), "grok-3", Some(700));
++            let logs = home.path().join(".grok/logs");
++            std::fs::create_dir_all(&logs).unwrap();
++            let unified = logs.join("unified.jsonl");
++            std::fs::write(
++                &unified,
++                format!(
++                    "{}{}{}",
++                    ais_grok_inference("s1", 11, 1, 100),
++                    ais_grok_inference("s3", 12, 2, 200),
++                    ais_grok_inference("s-new", 13, 3, 300)
++                ),
++            )
++            .unwrap();
++
++            let mut litellm = HashMap::new();
++            for model in ["grok-code", "grok-4", "grok-3", "grok-5"] {
++                litellm.insert(
++                    model.to_string(),
++                    pricing::ModelPricing {
++                        input_cost_per_token: Some(0.001),
++                        output_cost_per_token: Some(0.002),
++                        ..Default::default()
++                    },
++                );
++            }
++            let pricing = pricing::PricingService::new(litellm, HashMap::new());
++            let scan = |home: &std::path::Path| {
++                ais_grok_rows(&parse_all_messages_with_pricing_with_env_strategy(
++                    home.to_str().unwrap(),
++                    &["grok".to_string()],
++                    Some(&pricing),
++                    false,
++                    &scanner::ScannerSettings::default(),
++                ))
++            };
++            let cold = |home: &std::path::Path| {
++                let fresh_cache = tempfile::TempDir::new().unwrap();
++                let _env = redirect_cache_home(fresh_cache.path());
++                scan(home)
++            };
++            let reset = || {
++                sessions::grok::GROK_UNIFIED_PARSED_PATHS
++                    .lock()
++                    .unwrap()
++                    .clear();
++                sessions::grok::GROK_UNIFIED_METADATA_READS
++                    .lock()
++                    .unwrap()
++                    .clear();
++            };
++            let parsed = || {
++                !sessions::grok::GROK_UNIFIED_PARSED_PATHS
++                    .lock()
++                    .unwrap()
++                    .is_empty()
++            };
++            let metadata_reads = || {
++                let mut names: Vec<String> = sessions::grok::GROK_UNIFIED_METADATA_READS
++                    .lock()
++                    .unwrap()
++                    .iter()
++                    .map(|dir| dir.file_name().unwrap().to_string_lossy().into_owned())
++                    .collect();
++                names.sort();
++                names.dedup();
++                names
++            };
++            // Directory and file mtimes must move between steps.
++            let tick = || std::thread::sleep(std::time::Duration::from_millis(30));
++            let label = if stat_only { "stat-only" } else { "sampled" };
++
++            let expected = cold(home.path());
++            assert!(!expected.is_empty());
++            let env = redirect_cache_home(cache_home.path());
++            reset();
++            assert_eq!(scan(home.path()), expected, "{label}: first warm scan");
++            assert_eq!(
++                metadata_reads(),
++                vec!["s1", "s3"],
++                "{label}: first scan reads"
++            );
++
++            // Unchanged home: the unified log is neither parsed nor are any
++            // session metadata files read.
++            reset();
++            assert_eq!(scan(home.path()), expected, "{label}: unchanged");
++            assert!(!parsed(), "{label}: unchanged log must stay cached");
++            assert!(metadata_reads().is_empty(), "{label}: unchanged reads");
++
++            // An unreferenced session changes and gains a file: the unified
++            // log stays cached and the totals still equal a cold scan.
++            tick();
++            std::fs::write(
++                ws_a.join("s2/summary.json"),
++                r#"{"current_model_id":"grok-5","updated_at":"2026-11-02T00:00:00Z"}"#,
++            )
++            .unwrap();
++            std::fs::write(ws_b.join("s4/rewind_points.jsonl"), "{}\n").unwrap();
++            reset();
++            let after_unrelated = scan(home.path());
++            assert!(!parsed(), "{label}: unreferenced change must not re-parse");
++            drop(env);
++            assert_eq!(after_unrelated, cold(home.path()), "{label}: unrelated");
++            let env = redirect_cache_home(cache_home.path());
++
++            // The log grows and now names s2: only the referenced sessions are
++            // read, never s4.
++            tick();
++            ais_incremental_append(&unified, &ais_grok_inference("s2", 14, 4, 400));
++            reset();
++            let after_append = scan(home.path());
++            assert!(parsed(), "{label}: grown log must re-parse");
++            assert_eq!(
++                metadata_reads(),
++                vec!["s1", "s2", "s3"],
++                "{label}: append reads"
++            );
++            drop(env);
++            assert_eq!(after_append, cold(home.path()), "{label}: append");
++            assert!(after_append
++                .iter()
++                .any(|row| row.2 == "s2" && row.1 == "grok-5"));
++            let env = redirect_cache_home(cache_home.path());
++
++            // A referenced session's metadata changes under an unchanged log.
++            tick();
++            std::fs::write(
++                ws_b.join("s3/summary.json"),
++                r#"{"current_model_id":"grok-code","updated_at":"2026-11-03T00:00:00Z"}"#,
++            )
++            .unwrap();
++            reset();
++            let after_referenced = scan(home.path());
++            assert!(
++                parsed(),
++                "{label}: referenced metadata change must re-parse"
++            );
++            drop(env);
++            assert_eq!(after_referenced, cold(home.path()), "{label}: referenced");
++            assert!(after_referenced
++                .iter()
++                .any(|row| row.2 == "s3" && row.1 == "grok-code"));
++            let env = redirect_cache_home(cache_home.path());
++
++            // A session the log already names appears on disk later.
++            tick();
++            ais_grok_session(&ws_b.join("s-new"), "grok-4", None);
++            reset();
++            let after_new_dir = scan(home.path());
++            assert!(parsed(), "{label}: a new referenced session must re-parse");
++            drop(env);
++            assert_eq!(after_new_dir, cold(home.path()), "{label}: new session dir");
++            assert!(after_new_dir
++                .iter()
++                .any(|row| row.2 == "s-new" && row.1 == "grok-4"));
++            assert!(
++                !sessions::grok::GROK_UNIFIED_METADATA_READS
++                    .lock()
++                    .unwrap()
++                    .iter()
++                    .any(|dir| dir.ends_with("s4")),
++                "{label}: an unreferenced session is never read"
++            );
++            drop(stat_env);
++        }
++    }
++
+     #[test]
+     #[serial_test::serial]
+     fn test_parse_all_messages_with_pricing_kimi_deduplicates_repeated_status_updates() {
+diff --git a/crates/tokscale-core/src/message_cache.rs b/crates/tokscale-core/src/message_cache.rs
+index f30710a..553ab1b 100644
+--- a/crates/tokscale-core/src/message_cache.rs
++++ b/crates/tokscale-core/src/message_cache.rs
+@@ -996,6 +996,34 @@ impl SourceFingerprint {
+         cached: Option<&Self>,
+         mode: ContentHashMode,
+     ) -> Option<FingerprintStatus> {
++        // AIS: building a unified log's related set reads the whole log (to
++        // find the sessions it references) and lists every workspace. While
++        // the log itself is unchanged its cached set is still the right one:
++        // the set only depends on the log and on directories that are in the
++        // set (see `grok_related_paths`). So an unchanged log and an unchanged
++        // cached set cost a stat per entry and nothing is read.
++        if path.file_name().and_then(|name| name.to_str()) == Some("unified.jsonl") {
++            // A set without the sessions root predates the tree-wide
++            // dependency and cannot vouch for the referenced sessions.
++            let cached = cached.filter(|cached| {
++                cached
++                    .related_files
++                    .iter()
++                    .any(|related| related.suffix == "sessions-directory")
++            });
++            if let Some(cached) = cached {
++                if primary_fingerprint_matches(path, cached) == Some(true) {
++                    let cached_related: Vec<(String, PathBuf)> = cached
++                        .related_files
++                        .iter()
++                        .map(|related| (related.suffix.clone(), related.path.to_path_buf()))
++                        .collect();
++                    if related_fingerprint_metadata_matches(&cached_related, cached) == Some(true) {
++                        return Some(FingerprintStatus::Unchanged);
++                    }
++                }
++            }
++        }
+         let related_paths = crate::sessions::grok::grok_related_paths(path);
+         Self::check_path_with_related_mode(path, related_paths, cached, mode)
+     }
+@@ -9689,6 +9717,58 @@ mod tests {
+         assert_ne!(changed_summary, changed_tree);
+     }
+ 
++    #[test]
++    fn ais_grok_unified_fingerprint_watches_only_referenced_sessions() {
++        let dir = TempDir::new().unwrap();
++        let logs_dir = dir.path().join(".grok/logs");
++        let workspace = dir.path().join(".grok/sessions/%2Ftmp%2Fproject");
++        let referenced = workspace.join("session-1");
++        let unrelated = workspace.join("session-2");
++        std::fs::create_dir_all(&logs_dir).unwrap();
++        std::fs::create_dir_all(&referenced).unwrap();
++        std::fs::create_dir_all(&unrelated).unwrap();
++        std::fs::write(unrelated.join("summary.json"), br#"{"model_id":"a"}"#).unwrap();
++        let unified_path = logs_dir.join("unified.jsonl");
++        std::fs::write(
++            &unified_path,
++            br#"{"sid":"session-1","msg":"shell.turn.inference_done","ctx":{"prompt_tokens":1,"completion_tokens":1}}"#,
++        )
++        .unwrap();
++
++        let base = SourceFingerprint::from_grok_path(&unified_path).unwrap();
++        let suffixes: Vec<&str> = base
++            .related_files
++            .iter()
++            .map(|related| related.suffix.as_str())
++            .collect();
++        assert!(suffixes.iter().any(|suffix| suffix.contains("session-1")));
++        assert!(!suffixes.iter().any(|suffix| suffix.contains("session-2")));
++        assert!(matches!(
++            SourceFingerprint::check_grok_path_samples_only(&unified_path, Some(&base)),
++            Some(FingerprintStatus::Unchanged)
++        ));
++
++        // An unreferenced session's metadata is not a parser input.
++        std::thread::sleep(std::time::Duration::from_millis(20));
++        std::fs::write(unrelated.join("summary.json"), br#"{"model_id":"bb"}"#).unwrap();
++        std::fs::write(unrelated.join("events.jsonl"), b"{}\n").unwrap();
++        assert!(matches!(
++            SourceFingerprint::check_grok_path_samples_only(&unified_path, Some(&base)),
++            Some(FingerprintStatus::Unchanged)
++        ));
++
++        // A referenced session's sidecar appearing is.
++        std::fs::write(
++            referenced.join("signals.json"),
++            br#"{"primaryModelId":"c"}"#,
++        )
++        .unwrap();
++        assert!(matches!(
++            SourceFingerprint::check_grok_path_samples_only(&unified_path, Some(&base)),
++            Some(FingerprintStatus::Changed(_))
++        ));
++    }
++
+     #[test]
+     fn test_kiro_ide_fingerprint_tracks_messages_sidecar_changes() {
+         let dir = TempDir::new().unwrap();
+diff --git a/crates/tokscale-core/src/sessions/grok.rs b/crates/tokscale-core/src/sessions/grok.rs
+index 74c3c92..6a2f382 100644
+--- a/crates/tokscale-core/src/sessions/grok.rs
++++ b/crates/tokscale-core/src/sessions/grok.rs
+@@ -27,6 +27,17 @@ const UNKNOWN_MODEL: &str = "grok-unknown";
+ const UNIFIED_LOG_DEDUP_PREFIX: &str = "grok-unified:";
+ const LEGACY_UNIFIED_TIMESTAMP_TOLERANCE_MS: u64 = 250;
+ 
++/// AIS: every unified log a scan parsed (test instrumentation).
++#[cfg(test)]
++pub(crate) static GROK_UNIFIED_PARSED_PATHS: std::sync::Mutex<Vec<PathBuf>> =
++    std::sync::Mutex::new(Vec::new());
++
++/// AIS: every session directory whose metadata a unified-log parse read (test
++/// instrumentation).
++#[cfg(test)]
++pub(crate) static GROK_UNIFIED_METADATA_READS: std::sync::Mutex<Vec<PathBuf>> =
++    std::sync::Mutex::new(Vec::new());
++
+ type UnifiedGeneration = u64;
+ type UnifiedProcessKey = (i64, UnifiedGeneration);
+ type UnifiedProcessSessionKey = (i64, UnifiedGeneration, String);
+@@ -52,6 +63,8 @@ struct UnifiedChildEvidence {
+     terminal_scopes: HashSet<UnifiedChildScope>,
+     terminal_models: HashMap<UnifiedChildScope, UnifiedModelEvidence>,
+     child_session_ids: HashSet<String>,
++    /// AIS: every session id an inference row can look metadata up for.
++    referenced_session_ids: HashSet<String>,
+ }
+ 
+ fn authoritative_model(value: Option<&Value>) -> Option<String> {
+@@ -717,13 +730,18 @@ fn parse_grok_unified_log_snapshot(
+     file: &mut std::fs::File,
+     prefix_len: u64,
+ ) -> Vec<UnifiedMessage> {
++    #[cfg(test)]
++    GROK_UNIFIED_PARSED_PATHS
++        .lock()
++        .unwrap()
++        .push(path.to_path_buf());
+     let fallback_timestamp = file_modified_timestamp_ms(path);
+     let evidence = collect_unified_child_evidence(file, prefix_len);
+     if file.seek(SeekFrom::Start(0)).is_err() {
+         return Vec::new();
+     }
+ 
+-    let metadata_by_session = read_unified_session_metadata(path);
++    let metadata_by_session = read_unified_session_metadata(path, &evidence.referenced_session_ids);
+     let mut generations = HashMap::new();
+     let mut fallback_model_by_pid: HashMap<UnifiedProcessKey, String> = HashMap::new();
+     let mut model_by_pid_and_session: HashMap<UnifiedProcessSessionKey, String> = HashMap::new();
+@@ -956,6 +974,16 @@ fn collect_unified_child_evidence(
+         }
+ 
+         let message_name = value.get("msg").and_then(Value::as_str);
++        if message_name == Some("shell.turn.inference_done") {
++            // The same `sid` filter the inference parse applies before its
++            // metadata lookup, so this set covers every id it looks up.
++            if let Some(session_id) =
++                extract_string(value.get("sid")).filter(|session_id| !session_id.trim().is_empty())
++            {
++                evidence.referenced_session_ids.insert(session_id);
++            }
++            continue;
++        }
+         let is_spawn = message_name == Some("subagent spawn credentials");
+         let is_terminal = matches!(message_name, Some("subagent completed" | "subagent failed"));
+         if !is_spawn && !is_terminal {
+@@ -1001,10 +1029,18 @@ pub fn parse_grok_file(path: &Path) -> Vec<UnifiedMessage> {
+ }
+ 
+ /// Return the files and directories that can affect metadata attached to a
+-/// unified-log message. The unified parser reads every session under the Grok
+-/// home, so the root, workspace/session directories, and metadata siblings all
+-/// participate in its source fingerprint. Legacy update files only need their
+-/// own sibling metadata.
++/// unified-log message. Legacy update files only need their own sibling
++/// metadata.
++///
++/// AIS: a unified-log message only takes metadata from the session its `sid`
++/// names, so only the sessions the log references participate, plus the
++/// sessions root and every workspace directory. Creating, removing or
++/// renaming a session directory changes its workspace directory's mtime and a
++/// workspace change changes the root's, so a session the log starts to
++/// resolve (or stops resolving) is still seen without listing, stat'ing and
++/// sampling the metadata of every unrelated session. The set therefore only
++/// changes with the log itself or that directory structure, which is what
++/// lets `check_grok_path_with_mode` re-check a cached set by stat alone.
+ pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
+     if path.file_name().and_then(|name| name.to_str()) != Some("unified.jsonl") {
+         let parent = path.parent().unwrap_or_else(|| Path::new("."));
+@@ -1020,7 +1056,8 @@ pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
+     let sessions_root = grok_home.join("sessions");
+     let mut related = vec![("sessions-directory".to_string(), sessions_root.clone())];
+ 
+-    let Some((_, workspaces)) = unified_session_tree(path) else {
++    let referenced = grok_unified_referenced_session_ids(path);
++    let Some((_, workspaces)) = unified_session_tree(path, &referenced) else {
+         return related;
+     };
+     for (workspace_dir, session_dirs) in workspaces {
+@@ -1512,8 +1549,23 @@ fn fallback_unified_metadata(session_id: &str, timestamp: i64) -> GrokMetadata {
+     }
+ }
+ 
+-fn read_unified_session_metadata(path: &Path) -> HashMap<String, GrokMetadata> {
+-    let Some((_, workspaces)) = unified_session_tree(path) else {
++/// The session ids a unified log's inference rows reference (see
++/// [`UnifiedChildEvidence::referenced_session_ids`]).
++fn grok_unified_referenced_session_ids(path: &Path) -> HashSet<String> {
++    let Ok(mut file) = std::fs::File::open(path) else {
++        return HashSet::new();
++    };
++    let prefix_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
++    collect_unified_child_evidence(&mut file, prefix_len).referenced_session_ids
++}
++
++/// Metadata of the referenced sessions only: a session no inference row names
++/// is never looked up, so reading it cannot change the parse.
++fn read_unified_session_metadata(
++    path: &Path,
++    referenced: &HashSet<String>,
++) -> HashMap<String, GrokMetadata> {
++    let Some((_, workspaces)) = unified_session_tree(path, referenced) else {
+         return HashMap::new();
+     };
+ 
+@@ -1535,6 +1587,11 @@ fn read_unified_session_metadata(path: &Path) -> HashMap<String, GrokMetadata> {
+                 continue;
+             };
+ 
++            #[cfg(test)]
++            GROK_UNIFIED_METADATA_READS
++                .lock()
++                .unwrap()
++                .push(session_dir.clone());
+             let updates_path = session_dir.join("updates.jsonl");
+             let metadata = if updates_path.is_file() {
+                 read_metadata(&updates_path)
+@@ -1555,7 +1612,13 @@ fn read_unified_session_metadata(path: &Path) -> HashMap<String, GrokMetadata> {
+     metadata_by_session
+ }
+ 
+-fn unified_session_tree(path: &Path) -> Option<(PathBuf, UnifiedSessionTree)> {
++/// Every workspace directory under the sessions root, each with its session
++/// directories named in `referenced` (in the order the full tree used, so a
++/// session id present in two workspaces still resolves to the same one).
++fn unified_session_tree(
++    path: &Path,
++    referenced: &HashSet<String>,
++) -> Option<(PathBuf, UnifiedSessionTree)> {
+     let grok_home = path.parent().and_then(Path::parent)?;
+     let sessions_root = grok_home.join("sessions");
+     let mut workspaces = Vec::new();
+@@ -1571,6 +1634,10 @@ fn unified_session_tree(path: &Path) -> Option<(PathBuf, UnifiedSessionTree)> {
+         let mut session_dirs = Vec::new();
+         if let Ok(entries) = std::fs::read_dir(&workspace_dir) {
+             for entry in entries.flatten() {
++                let name = entry.file_name();
++                if !name.to_str().is_some_and(|name| referenced.contains(name)) {
++                    continue;
++                }
+                 let session_dir = entry.path();
+                 if session_dir.is_dir() {
+                     session_dirs.push(session_dir);

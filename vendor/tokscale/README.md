@@ -116,6 +116,23 @@ The patch adds three AIS-only surfaces:
   partition's native detail unavailable, never partial; a missing one first
   retries against a newer manifest, as a missing batch does.
 
+- A Grok unified log (`logs/unified.jsonl`) only takes metadata from the
+  sessions its inference rows name (`patches/v4.20.0-ais-grok.patch`).
+  Upstream read `summary.json`, `events.jsonl` and `signals.json` of every
+  session under the Grok home on each parse of the log, and its fingerprint
+  listed and sampled those files plus `updates.jsonl` for every session.
+  Grok appends to the log all the time, so each scan re-read about 0.75 GB
+  for a home of 13k sessions. The fingerprint now holds the sessions root,
+  every workspace directory and only the referenced sessions (directory and
+  four files); creating or removing a session directory changes its
+  workspace directory's mtime, so a session the log names that appears
+  later is still seen. While the log is unchanged the cached set is
+  re-checked by stat alone, without reading the log or listing the tree.
+  The parse result is identical to reading every session, since an
+  unreferenced session is never looked up. An entry written before this
+  change (a superset of the new set) stays valid and is replaced by the
+  smaller set the next time the log or a watched directory changes.
+
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
@@ -134,7 +151,7 @@ bash scripts/build-tokscale-ais.sh
 ```
 
 The helper downloads only the pinned release archive, verifies its checksum and
-licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch`, `patches/v4.20.0-ais-scope.patch` and then `patches/v4.20.0-ais-segments.patch`, and installs to
+licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch`, `patches/v4.20.0-ais-scope.patch`, `patches/v4.20.0-ais-segments.patch` and then `patches/v4.20.0-ais-grok.patch`, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.
