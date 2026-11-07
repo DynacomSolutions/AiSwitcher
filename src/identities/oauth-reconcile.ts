@@ -601,6 +601,12 @@ async function reconcilePair(
     } else {
       entry.status = "forked";
       entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
+      // A damaged store (gateway token beside a refresh token) carries the newest refresh token whatever its expiry says: it is
+      // never overwritten from, or copied over, the other store; the owner's refresh repairs it.
+      if (isGatewayAccessToken(native.grant.access_token) || isGatewayAccessToken(pi.grant.access_token)) {
+        entry.detail = "one copy holds a gateway token beside its refresh token; left untouched until a refresh repairs it";
+        return entry;
+      }
       const nativeFresher = recency(native.grant) >= recency(pi.grant);
       entry.adoptedFrom = nativeFresher ? "native" : "pi";
       if (write) {

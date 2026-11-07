@@ -66,6 +66,7 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly requests = new Counter("ais_gateway_requests_total", "Proxied requests by outcome.");
   private readonly tokens = new Counter("ais_gateway_tokens_total", "Tokens used by proxied requests.");
   private readonly refreshes = new Counter("ais_gateway_refresh_total", "Login refresh attempts by outcome.");
+  private readonly keepAlives = new Counter("ais_gateway_keepalive_total", "Idle keep-alive refresh passes over managed logins, by outcome.");
   private readonly rejections = new Counter("ais_gateway_rejections_total", "Requests rejected before reaching a provider.");
   private readonly failovers = new Counter("ais_gateway_failovers_total", "Requests retried on another pool member.");
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
@@ -152,13 +153,17 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.unreadable.inc({ app, provider, identity });
   }
 
+  keepAlive(provider: string, outcome: string): void {
+    this.keepAlives.inc({ provider, outcome });
+  }
+
   refresh(provider: string, outcome: string): void {
     this.refreshes.inc({ provider, outcome });
   }
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);

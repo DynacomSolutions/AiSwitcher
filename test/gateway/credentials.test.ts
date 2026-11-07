@@ -376,4 +376,12 @@ describe("CredentialCache never serves a gateway app token upstream", () => {
     const c = makeCache(async () => refreshed({ outcome: "failed" }));
     expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-OLD");
   });
+
+  test("the 401 retry path never returns a gateway token either", async () => {
+    await writeHybrid();
+    const expected: Array<string | undefined> = [];
+    const c = makeCache(async (_t, _i, opts) => { expected.push(opts?.expectedAccessToken); return refreshed(); }); // leaves the hybrid in place
+    await expect(c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-some-other-stale-token")).rejects.toBeInstanceOf(GatewayCredentialError);
+    expect(expected).toEqual([GW]);
+  });
 });

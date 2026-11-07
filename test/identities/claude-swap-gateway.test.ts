@@ -111,7 +111,7 @@ describe("swap into a gateway-routed pool", () => {
     expect(r.writeBack).not.toBe("written");
     expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-a1");
     expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.accessToken).toBe(GW);
-    expect((await readdir(poolDir())).includes(".credentials.json.pre-swap.bak")).toBe(true);
+    expect((await readdir(poolDir())).some((n) => /^\.credentials\.json\.pre-swap\..+\.bak$/.test(n))).toBe(true);
   });
 
   test("a pool that is not gateway-routed still gets the member's real login", async () => {
@@ -162,7 +162,7 @@ describe("heal restores the gateway entry after a /login", () => {
     expect(notes.join(" ")).toContain("restored");
     expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.accessToken).toBe(GW);
     expect((await read(join(root, "b", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-b1");
-    expect((await readdir(poolDir())).includes(".credentials.json.pre-swap.bak")).toBe(true);
+    expect((await readdir(poolDir())).some((n) => /^\.credentials\.json\.pre-swap\..+\.bak$/.test(n))).toBe(true);
     expect(JSON.stringify(notes)).not.toContain(GW);
   });
 
@@ -173,7 +173,9 @@ describe("heal restores the gateway entry after a /login", () => {
     await writeFile(join(poolDir(), ".claude.json"), claudeJson("uuid-stranger"));
     const notes = await heal();
     expect(notes.join(" ")).toContain("backup");
-    const backups = (await readdir(poolDir())).filter((n) => n.endsWith(".bak"));
+    const all = (await readdir(poolDir())).filter((n) => n.endsWith(".bak"));
+    const backups: string[] = [];
+    for (const n of all) if (JSON.stringify(await read(join(poolDir(), n))).includes("rt-x1")) backups.push(n);
     expect(backups.length).toBe(1);
     expect((await stat(join(poolDir(), backups[0] as string))).mode & 0o777).toBe(0o600);
     expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.accessToken).toBe(GW);
@@ -264,6 +266,11 @@ describe("a gateway token that leaked into a member store (older build converged
 });
 
 describe("the cluster gateway owns gateway-managed logins; nothing local touches them", () => {
+  const heal = async () => {
+    const file = (await read(registry)) as IdentitiesFile;
+    const pool = file.identities.find((i) => i.name === "pool")!;
+    return claudeAdapter.heal!(pool as never, file.identities.filter((i) => i.name === "a" || i.name === "b"));
+  };
   const withRole = async (role: string | undefined, fn: () => Promise<void>) => {
     const saved = process.env.AIS_GATEWAY_OWNER;
     if (role === undefined) delete process.env.AIS_GATEWAY_OWNER;
@@ -289,6 +296,66 @@ describe("the cluster gateway owns gateway-managed logins; nothing local touches
     });
     expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-new");
     expect((await read(join(pi, "auth.json"))).anthropic.refresh).toBe("rt-old");
+  });
+
+  test("owner: a hybrid member store wins over a stale pi copy and its refresh token (not rt-old) is what is POSTed", async () => {
+    await piSetup();
+    const { refreshIdentityOAuthGrant, readEffectiveGrant: eff } = await import("../../src/identities/oauth-refresh.ts");
+    const { PI_CONFIG } = await import("../../src/identities/tool-configs.ts");
+    const saved = PI_CONFIG.identitiesJsonPath;
+    (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = join(root, "pi.json");
+    const bodies: string[] = [];
+    const fetchImpl = (async (_u: unknown, init: { body?: unknown }) => { bodies.push(String(init?.body)); return new Response(JSON.stringify({ access_token: "at-fresh", refresh_token: "rt-fresh", expires_in: 3600 }), { status: 200 }); }) as unknown as typeof fetch;
+    try {
+      await withRole("1", async () => {
+        expect((await eff("claude", member(), { claudeRegistryPath: registry }))?.grant.refresh_token).toBe("rt-new");
+        await refreshIdentityOAuthGrant("claude", member(), { force: true, claudeRegistryPath: registry, fetchImpl });
+      });
+    } finally {
+      (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
+    }
+    expect(bodies.length).toBe(1);
+    expect(bodies[0]).toContain("rt-new");
+    expect(bodies[0]).not.toContain("rt-old");
+    expect(bodies[0]).not.toContain(GW);
+  });
+
+  test("owner: pi reconcile leaves a hybrid member store and a stale pi copy alone", async () => {
+    const { reconcileNativeProviderStores } = await import("../../src/identities/oauth-reconcile.ts");
+    const pi = await piSetup();
+    await withRole("1", async () => {
+      await reconcileNativeProviderStores("claude", member(), { write: true, registryPaths: { pi: join(root, "pi.json"), claude: registry } });
+    });
+    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-new");
+    expect((await read(join(pi, "auth.json"))).anthropic.refresh).toBe("rt-old");
+  });
+
+  test("the role is set in code by the gateway server, not by the environment of the pod", async () => {
+    const m = await import("../../src/identities/gateway-managed.ts");
+    delete process.env.AIS_GATEWAY_OWNER;
+    process.env.KUBERNETES_SERVICE_HOST = "kubernetes.default.svc";
+    try {
+      expect(m.isGatewayOwnerProcess()).toBe(false); // the console pod is not an owner
+      m.markGatewayOwnerProcess();
+      expect(m.isGatewayOwnerProcess()).toBe(true);
+    } finally {
+      delete process.env.KUBERNETES_SERVICE_HOST;
+    }
+  });
+
+  test("heal twice keeps the first backup: a rotated gateway token never overwrites a live login's backup", async () => {
+    await routeThroughProxy();
+    await writeFile(join(poolDir(), ".credentials.json"), cred("at-a2", "rt-a2-LIVE", NOW_S + 5000));
+    await heal();
+    await writeFile(join(root, "secrets"), "AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN=aisg_SYNTHETIC_FIXTURE_gateway_token_0002\n", { mode: 0o600 });
+    await heal();
+    const baks = (await readdir(poolDir())).filter((n) => n.endsWith(".bak"));
+    expect(baks.length).toBe(1);
+    expect((await read(join(poolDir(), baks[0] as string))).claudeAiOauth.refreshToken).toBe("rt-a2-LIVE");
+    // a second real login gets its own backup
+    await writeFile(join(poolDir(), ".credentials.json"), cred("at-a3", "rt-a3-LIVE", NOW_S + 6000));
+    await heal();
+    expect((await readdir(poolDir())).filter((n) => n.endsWith(".bak")).length).toBe(2);
   });
 
   test("refresh and convergence are skipped locally, but run in the gateway's own process", async () => {
@@ -329,6 +396,6 @@ describe("the cluster gateway owns gateway-managed logins; nothing local touches
     const o = (await read(join(poolDir(), ".credentials.json"))).claudeAiOauth;
     expect(o.accessToken).toBe(GW);
     expect(o.refreshToken).toBeNull();
-    expect((await readdir(poolDir())).includes(".credentials.json.pre-swap.bak")).toBe(true);
+    expect((await readdir(poolDir())).some((n) => /^\.credentials\.json\.pre-swap\..+\.bak$/.test(n))).toBe(true);
   });
 });

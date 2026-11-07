@@ -549,6 +549,11 @@ async function freshestGrant(
   const piFingerprint = piGrant ? grantFingerprint(piGrant) : undefined;
   const native = await readProviderGrantCopy(tool, identity.configDir, piFingerprint);
   if (!native && !piGrant) return undefined;
+  // A damaged native store (gateway token beside a refresh token) holds the newest refresh token whatever its expiry says: it wins,
+  // and only its refresh token is ever used (its access token is never sent anywhere).
+  if (native && piGrant && isGatewayAccessToken(native.grant.access_token) && native.grant.refresh_token !== piGrant.refresh_token) {
+    return { grant: native.grant, entryKey: native.entryKey, rawEntry: native.rawEntry, source: `native:${native.path}` };
+  }
   if (native && piGrant) {
     const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
     return recency(native.grant) >= recency(piGrant)

@@ -19,7 +19,8 @@ import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
 import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-source.ts";
 import type { GatewayProvider } from "./types.ts";
-import type { IdentitiesFile } from "../identities/types.ts";
+import type { IdentitiesFile, Identity } from "../identities/types.ts";
+import { listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
 export const DEFAULT_GATEWAY_ADMIN_PORT = 47131;
@@ -57,6 +58,9 @@ export interface GatewayHooks {
   /** How often the app and token cache is re-read for changes made by other instances. */
   refreshIntervalMs?: number;
   alertCheckMs?: number;
+  /** How often every managed login is refreshed ahead of expiry with no traffic (default 10 minutes). */
+  keepAliveMs?: number;
+  keepAliveAccounts?(): Promise<Identity[]>;
   overlapMs?: number;
   exit?(code: number): void;
 }
@@ -204,9 +208,25 @@ const describe = (err: unknown): string => {
   return [typeof e?.name === "string" ? e.name : "Error", typeof e?.code === "string" ? e.code : undefined].filter(Boolean).join(" ");
 };
 
+/**
+ * Idle keep-alive: the gateway is the only refresher of managed logins, so it refreshes each one before expiry even with no
+ * traffic (AIS's normal expiry window decides; a fresh login is left alone). Counted per outcome; a failure raises the usual alert.
+ */
+export async function keepAliveOnce(deps: { refresh: RefreshFn; accounts: () => Promise<Identity[]>; metrics: { keepAlive(provider: string, outcome: string): void } }): Promise<void> {
+  for (const account of await deps.accounts().catch(() => [] as Identity[])) {
+    try {
+      const r = await deps.refresh("claude", account, {});
+      deps.metrics.keepAlive("claude", r.outcome);
+    } catch {
+      deps.metrics.keepAlive("claude", "failed");
+    }
+  }
+}
+
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
   if (opts.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the admin token (AIS_GATEWAY_ADMIN_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
   startModelPriceRefresh();
+  markGatewayOwnerProcess(); // this process alone refreshes gateway-managed logins
   const now = hooks.now ?? (() => new Date());
   const backoff = hooks.warmBackoff ?? { initialMs: 1_000, maxMs: 30_000 };
   const exit = hooks.exit ?? ((code: number) => process.exit(code));
@@ -217,7 +237,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const metrics = new PrometheusMetrics({ ledgerDepth: () => ledger.depth, ledgerDropped: () => ledger.dropped });
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
   const failedTokens = new Map<string, string>();
-  const baseCreds = hooks.creds ?? new CredentialCache({ refresh: instrumentRefresh(refreshIdentityOAuthGrant, { metrics, alerter, failed: failedTokens }) });
+  const refreshLogin = instrumentRefresh(refreshIdentityOAuthGrant, { metrics, alerter, failed: failedTokens });
+  const baseCreds = hooks.creds ?? new CredentialCache({ refresh: refreshLogin });
   const creds = watchCredentialReads(baseCreds, alerter, failedTokens);
   const canonical = hooks.canonical ?? canonicalResolver();
   const usage = createUsageSource({ fetchUsage: hooks.fetchUsage ?? fetchPoolUsage });
@@ -366,6 +387,15 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const checkLedger = watchLedger(ledger, alerter);
   const alertTimer = setInterval(checkLedger, hooks.alertCheckMs ?? 5_000);
   alertTimer.unref?.();
+  let keepAliveRunning = false;
+  const keepAliveTimer = setInterval(() => {
+    if (keepAliveRunning || draining || !warmed) return;
+    keepAliveRunning = true;
+    void keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? (() => listGatewayManagedAccounts()), metrics }).finally(() => {
+      keepAliveRunning = false;
+    });
+  }, hooks.keepAliveMs ?? 600_000);
+  keepAliveTimer.unref?.();
 
   void warmUp();
 
@@ -381,6 +411,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       hub.closeAll(1012);
       wake?.();
       clearInterval(alertTimer);
+      clearInterval(keepAliveTimer);
       store.stop();
       // Bun's stop(false) refuses new connections and resolves once active requests are done.
       await Promise.all([server.stop(false), adminServer.stop(false)]);

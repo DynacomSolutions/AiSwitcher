@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisClaudeSwapLedgerPath } from "../shared/ais-home.ts";
 import { withClaudeLocks, withOauthRefreshLock, type LockOptions } from "./claude-swap-lock.ts";
@@ -186,6 +186,29 @@ async function gatewayTokenFor(pool: PoolIdentity): Promise<string | undefined> 
   return token;
 }
 
+function hasUsableRefreshToken(text: string): boolean {
+  try {
+    const rt = (JSON.parse(text) as { claudeAiOauth?: { refreshToken?: unknown } })?.claudeAiOauth?.refreshToken;
+    return typeof rt === "string" && rt.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** `<cred>.pre-swap.<timestamp>[-n].bak`, created exclusively (0600): an existing backup is never overwritten. */
+async function writeUniqueBackup(credPath: string, text: string): Promise<string> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (let n = 0; ; n++) {
+    const path = `${credPath}.pre-swap.${stamp}${n === 0 ? "" : `-${n}`}.bak`;
+    try {
+      await writeFile(path, text, { flag: "wx", mode: 0o600 });
+      return path;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || n > 1000) throw err;
+    }
+  }
+}
+
 /** Puts the gateway entry in a gateway-routed pool folder, first saving any real login found there (to its member, else
  * a 0600 backup). Caller holds the claude locks. Returns the notes and whether anything changed. */
 async function installGatewayEntry(input: { pool: PoolIdentity; members: Identity[]; token: string; lock?: LockOptions }): Promise<{ changed: boolean; entryReplaced: boolean; writeBack: WriteBackOutcome; notes: string[] }> {
@@ -200,9 +223,9 @@ async function installGatewayEntry(input: { pool: PoolIdentity; members: Identit
   // damaged login (a /login, an older build's leftover) is kept in a 0600 backup for the owner to inspect, then replaced.
   const poolCredText = await readText(poolCredPath);
   const notes: string[] = [];
-  if (poolCredText !== undefined) {
-    const backup = `${poolCredPath}.pre-swap.bak`;
-    await writeFileAtomic(backup, poolCredText);
+  // Only a file that still holds a usable refresh token is worth keeping; each backup gets a unique name and none is overwritten.
+  if (poolCredText !== undefined && hasUsableRefreshToken(poolCredText)) {
+    const backup = await writeUniqueBackup(poolCredPath, poolCredText);
     notes.push(`a login found in the gateway identity was not used; kept a 0600 backup copy at ${backup}`);
   }
   const writeBack: WriteBackOutcome = "none-identical";

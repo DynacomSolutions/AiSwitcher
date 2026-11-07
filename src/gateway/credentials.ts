@@ -280,7 +280,9 @@ export class CredentialCache {
   private async doRefresh(provider: GatewayProvider, id: Identity, staleToken: string): Promise<ProviderCredential> {
     const identity = id.name;
     const current = await this.reload(provider, id);
-    if (current.accessToken !== staleToken) return current;
+    // A gateway app token is never a result: when the store holds one, the refresh below spends its refresh token instead.
+    if (current.accessToken !== staleToken && !isGatewayAccessToken(current.accessToken)) return current;
+    staleToken = current.accessToken;
     const key = `${provider}\u0000${identity}`;
     const now = (this.deps.now ?? Date.now)();
     const last = this.lastRefreshAt.get(key);
@@ -298,7 +300,7 @@ export class CredentialCache {
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
-    if (next.accessToken !== staleToken) return next;
+    if (next.accessToken !== staleToken && !isGatewayAccessToken(next.accessToken)) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
     // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
     const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" ? "refresh-failed" : "token-unchanged";
