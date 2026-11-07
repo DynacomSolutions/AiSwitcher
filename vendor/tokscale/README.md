@@ -132,8 +132,9 @@ The patch adds three AIS-only surfaces:
   log is stat'ed first and the referenced sessions come from the prefix
   that stat bounds, the stored log signature is that first stat (a log that
   grew meanwhile is never fresh), and each directory stores the signature it
-  had before it was listed. The parse reads the log's prefix once for both
-  of its passes.
+  had before it was listed; a workspace that cannot be stat'ed (an mtime
+  before 1970) leaves the log uncached but still feeds the parse. The parse
+  streams the log's bounded prefix twice and never holds it in memory.
   The parse result is identical to reading every session, since an
   unreferenced session is never looked up. An entry written before this
   change is rebuilt once.
