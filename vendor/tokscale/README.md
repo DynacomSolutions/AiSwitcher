@@ -128,10 +128,15 @@ The patch adds three AIS-only surfaces:
   workspace directory's mtime, so a session the log names that appears
   later is still seen. While the log is unchanged the cached set is
   re-checked by stat alone, without reading the log or listing the tree.
+  To keep that set from describing an older tree than its signatures, the
+  log is stat'ed first and the referenced sessions come from the prefix
+  that stat bounds, the stored log signature is that first stat (a log that
+  grew meanwhile is never fresh), and each directory stores the signature it
+  had before it was listed. The parse reads the log's prefix once for both
+  of its passes.
   The parse result is identical to reading every session, since an
   unreferenced session is never looked up. An entry written before this
-  change (a superset of the new set) stays valid and is replaced by the
-  smaller set the next time the log or a watched directory changes.
+  change is rebuilt once.
 
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates

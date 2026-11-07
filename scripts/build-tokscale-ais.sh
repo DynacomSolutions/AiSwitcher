@@ -67,6 +67,7 @@ patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/pa
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_segmented)
 (cd "$source_dir" && cargo test --locked --package tokscale-cli --test cli_tests ais_native_export_writes_segments_and_rewrites_only_unlisted_ones)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_grok)
+(cd "$source_dir" && cargo test --locked --package tokscale-core --lib rev412_)
 (cd "$source_dir" && cargo build --locked --release --package tokscale-cli --bin tokscale)
 
 if [[ -z "$target_dir" ]]; then
