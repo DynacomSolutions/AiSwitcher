@@ -89,6 +89,8 @@ beforeEach(async () => {
   store = new CapturingStore();
   ledger = new LedgerBuffer(store, { max: 1000, flushMs: 3_600_000 });
   deps = {
+    // No real waiting in tests: with a fixed clock, short holds never end, so the wait gives up after its cap.
+    sleep: async () => {},
     store,
     ledger,
     creds: {
@@ -498,6 +500,7 @@ describe("failover and refresh", () => {
   const burstSetup = async (members: "pair" | "single") => {
     const clock = { ms: NOW.getTime() };
     deps.now = () => new Date(clock.ms);
+    deps.sleep = async (ms) => { clock.ms += ms; };
     const gw = createGatewayApp(deps);
     const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); };
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
@@ -587,6 +590,37 @@ describe("failover and refresh", () => {
     expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-b"]);
   });
 
+  test("every member burst-held: the gateway waits for the first hold and serves 200, no 429 reaches the client", async () => {
+    const { clock, call, who } = await burstSetup("pair");
+    const start = clock.ms;
+    let left = 2;
+    handler = () => (left-- > 0 ? new Response("{}", { status: 429, headers: { "retry-after": "5" } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    const res = await call();
+    expect(res.status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-b", "Bearer tok-a"]);
+    expect(clock.ms - start).toBeGreaterThanOrEqual(5_000);
+    expect(clock.ms - start).toBeLessThan(10_000);
+  });
+
+  test("a new request while every member is burst-held waits instead of being rejected", async () => {
+    const { clock, call } = await burstSetup("pair");
+    let limited = true;
+    handler = () => (limited ? new Response("{}", { status: 429, headers: { "retry-after": "60" } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    expect((await call()).status).toBe(429); // upstream keeps refusing past the wait budget
+    limited = false;
+    clock.ms += 1_000;
+    expect((await call()).status).toBe(200);
+  });
+
+  test("a quota-exhausted pool still answers 429 at once, without waiting", async () => {
+    const { clock, call } = await burstSetup("pair");
+    const start = clock.ms;
+    const resetAt = Math.floor((clock.ms + 600_000) / 1000);
+    handler = () => new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt) } });
+    expect((await call()).status).toBe(429);
+    expect(clock.ms).toBe(start);
+  });
+
   test("single-member pool: burst 429 reaches the client once and recovers within the hold window", async () => {
     const { clock, call } = await burstSetup("single");
     usage.b = live(100);
@@ -602,6 +636,7 @@ describe("failover and refresh", () => {
   const credSetup = async (members: string[], fail: (id: string, sig: string) => Error | undefined, handlerFor?: (who: string) => Response) => {
     const clock = { ms: NOW.getTime() };
     deps.now = () => new Date(clock.ms);
+    deps.sleep = async (ms) => { clock.ms += ms; };
     const sig: Record<string, string> = Object.fromEntries(members.map((m) => [m, "s1"]));
     const gets: string[] = [];
     const get = deps.creds.get.bind(deps.creds);
@@ -725,6 +760,7 @@ describe("failover and refresh", () => {
 
   test("while only a burst hold remains, the client gets a plain short 429 without unified headers", async () => {
     const { clock, call } = await credSetup(["a"], () => undefined, () => new Response("{}", { status: 429 }));
+    deps.sleep = async () => {}; // the wait budget is spent: the rejection shape is what is under test
     expect((await call()).status).toBe(429);
     clock.ms += 1000;
     const res = await call();
@@ -745,6 +781,7 @@ describe("failover and refresh", () => {
 
   test("a burst hold is preferred over a credential hold in the rejection, even when the dead member has lower usage", async () => {
     const { clock, call } = await credSetup(["a", "b"], deadLogin(["a"]), () => new Response("{}", { status: 429 }));
+    deps.sleep = async () => {}; // the wait budget is spent: the rejection shape is what is under test
     await call();
     clock.ms += 1000;
     const res = await call();
