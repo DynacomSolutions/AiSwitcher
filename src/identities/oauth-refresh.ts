@@ -21,6 +21,7 @@ import { CLAUDE_CONFIG, PI_CONFIG } from "./tool-configs.ts";
 import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
 import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
+import { isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import type { Identity } from "./types.ts";
 import { kimiCredentialStores, persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
 import { refreshKimiOAuthToken } from "../cli/limits/kimi-limits.ts";
@@ -250,7 +251,10 @@ export interface WriteThroughReport {
 export async function poolStoreDirsFor(identity: Identity, registryPath?: string, tool: RefreshableTool = "claude"): Promise<string[]> {
   try {
     const file = await loadIdentitiesFile(registryPath ?? (await poolAdapterFor(tool))?.config.identitiesJsonPath ?? CLAUDE_CONFIG.identitiesJsonPath);
-    return sameAccountDirs(identity, poolsHoldingMember(file, identity.name).map((pool) => pool.configDir), tool);
+    // A gateway-routed pool folder holds the gateway entry, never a member login: it is not a store of the member's grant.
+    const candidates = poolsHoldingMember(file, identity.name).map((pool) => pool.configDir);
+    const plain = tool === "claude" ? (await Promise.all(candidates.map(async (dir) => ((await isGatewayRoutedDir(expandPath(dir))) ? undefined : dir)))).filter((d): d is string => d !== undefined) : candidates;
+    return sameAccountDirs(identity, plain, tool);
   } catch {
     return [];
   }

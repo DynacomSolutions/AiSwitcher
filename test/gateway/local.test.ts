@@ -175,6 +175,18 @@ describe("local gateway failover", () => {
     }
   });
 
+  test("the gateway's native limit answer (429, unified headers) relays untouched, with no direct fallback", async () => {
+    const headers = { "x-ais-gateway": "1", "content-type": "application/json", "retry-after": "9000", "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": "1793622600", "anthropic-ratelimit-unified-representative-claim": "five_hour" };
+    const body = '{"type":"error","error":{"type":"rate_limit_error","message":"synthetic"}}';
+    const r = rig({ remote: () => new Response(body, { status: 429, headers }) });
+    const res = await r.post();
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe(body);
+    for (const [k, v] of Object.entries(headers)) expect(res.headers.get(k)).toBe(v);
+    expect(r.calls.every((c) => c.url.startsWith(REMOTE))).toBe(true);
+    expect(r.gw.status().mode).toBe("remote");
+  });
+
   test("pre-send errors fail over: refused, DNS, TLS handshake, connect timeout", async () => {
     for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EPROTO", "CERT_HAS_EXPIRED"]) {
       const r = rig({ remote: () => { throw coded(code); } });
