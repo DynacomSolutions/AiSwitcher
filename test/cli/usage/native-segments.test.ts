@@ -197,6 +197,49 @@ describe("segmented native batches", () => {
     expect(promoteNativeBatchFile(second, partitionId, nativeRoot, {}, committed).segments!.length).toBe(committed.segments!.length);
   });
 
+  test("damage whose size and mtime were put back is still not trusted", async () => {
+    const root = await tempRoot();
+    const nativeRoot = join(root, "native");
+    const segmentDir = nativeSegmentDir(nativeRoot, partitionId);
+    await mkdir(join(nativeRoot, ".staging"), { recursive: true });
+    const first = join(nativeRoot, ".staging", "first.json");
+    await writeSegmentedExport(first, segmentDir, messages);
+    const committed = { ...promoteNativeBatchFile(first, partitionId, nativeRoot), bucketTimezone: "UTC" };
+    const victim = join(segmentDir, `${committed.segments![0]!.sha256}.json`);
+    // `touch -r` restores the mtime to the nanosecond, as `cp -p` or `rsync -t` would.
+    const reference = join(root, "reference");
+    expect(Bun.spawnSync(["cp", "-p", victim, reference]).exitCode).toBe(0);
+    const damaged = Buffer.from(await readFile(victim));
+    damaged[Math.floor(damaged.length / 2)] ^= 1;
+    await writeFile(victim, damaged);
+    expect(Bun.spawnSync(["touch", "-m", "-r", reference, victim]).exitCode).toBe(0);
+    expect((await stat(victim, { bigint: true })).mtimeNs).toBe(BigInt(committed.segments![0]!.mtimeNs));
+    expect(reusableNativeBatchDigest(committed, partitionId, nativeRoot, "UTC")).toBeUndefined();
+    const second = join(nativeRoot, ".staging", "second.json");
+    await writeSegmentedExport(second, join(root, "elsewhere"), messages);
+    expect(() => promoteNativeBatchFile(second, partitionId, nativeRoot, {}, committed)).toThrow("native-capture-failed");
+  });
+
+  test("collection keeps segments of an export still in flight", async () => {
+    const root = await tempRoot();
+    const path = join(root, "usage", "snapshot.json");
+    const nativeBatchRoot = join(root, "native");
+    const segmentDir = nativeSegmentDir(nativeBatchRoot, partitionId);
+    await cycle(path, nativeBatchRoot, Date.UTC(2026, 0, 1), (candidatePath) => writeSegmentedExport(candidatePath, segmentDir, messages));
+    const snapshot = JSON.parse(await readFile(path, "utf8")) as UsageSnapshot;
+    const committedNames = new Set(snapshot.partitions[key]!.nativeBatch!.segments!.map((s) => `${s.sha256}.json`));
+    // A slow full rebuild: its first segments are 11 minutes old, its manifest not yet promoted.
+    const staged = join(nativeBatchRoot, ".staging", "slow.json");
+    await mkdir(dirname(staged), { recursive: true });
+    await writeSegmentedExport(staged, segmentDir, [...messages, { ...(messages[0] as object), dedup_key: "slow" }], { perSegment: 7 });
+    const inFlight = (await readdir(segmentDir)).filter((name) => !committedNames.has(name));
+    expect(inFlight.length).toBeGreaterThan(0);
+    const elevenMinutesAgo = new Date(Date.now() - 11 * 60_000);
+    for (const name of inFlight) await utimes(join(segmentDir, name), elevenMinutesAgo, elevenMinutesAgo);
+    collectObsoleteNativeBatches(snapshot, nativeBatchRoot, Date.now());
+    for (const name of [...inFlight, ...committedNames]) expect(existsSync(join(segmentDir, name))).toBe(true);
+  });
+
   test("migration: a single-file batch is never a source of reusable segments; the next segmented batch is", async () => {
     const root = await tempRoot();
     const path = join(root, "usage", "snapshot.json");

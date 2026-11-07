@@ -208,8 +208,10 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     (3 of 42 segments plus a 0.4 MB manifest). The rules:
     - Promotion reads the manifest and only segments it has not verified: a
       segment recorded for the previous batch is trusted while its file keeps
-      the size and mtime recorded then; any other is read and must match its
-      size, SHA-256, message count and parse as message objects.
+      the size, mtime, ctime and inode recorded then (ctime cannot be set
+      back, so damage with a restored mtime is still caught); any other is
+      read and must match its size, SHA-256, message count and parse as
+      message objects. Segment files are 0600 in a 0700 directory.
     - The exporter may skip writing only segments AIS lists as reusable, and
       AIS lists them only when the committed manifest and every one of its
       segments are intact. One damaged or missing segment means no list and
@@ -223,8 +225,10 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
       leaves the committed manifest and all its segments valid.
     - Collection keeps every segment named by a retained batch (listed, the
       two latest generations, anything inside the 10-minute reader grace) and
-      any segment younger than that grace; if a retained manifest cannot be
-      read, nothing is removed. Exporter temporaries older than 2 hours go.
+      any unnamed segment younger than 2 hours, the staging lifetime, since an
+      export in flight names its new segments only in a staged manifest; if a
+      retained manifest cannot be read, nothing is removed. Exporter
+      temporaries older than 2 hours go too.
     - Migration: a single-file batch stays valid and is kept while its
       messages are unchanged (the digest is the same in both formats). The
       first changed export writes a full segment set, and the single-file
@@ -232,8 +236,10 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
       Pi captures (`captureNativeBatch`) still write single-file batches.
     - Still open: the Grok reader re-reads its whole session tree (about
       0.9 GB per round) while a session is active, and a segment damaged in
-      place without a size or mtime change is caught by the TUI reader's
-      checksum, not by the collector.
+      place with its size, mtime and ctime unchanged (not possible through
+      ordinary writes) would be caught by the TUI reader's checksum, not by
+      the collector; and the registry check cannot see identities whose
+      config directory lies outside the tool's identities root.
   - Totals stay those of a cold scan: every shortcut is either exact (an
     unchanged file, an append of whole lines, byte-identical messages) or
     falls back to the full read.

@@ -252,18 +252,24 @@ export async function nativeExportForTarget(target: UsageTarget, key = targetKey
   // Segments of the committed batch may stay as they are only while every one
   // of them is still the file verified at promotion; otherwise the export
   // rewrites them all.
+  const segmentDir = nativeSegmentDir(nativeRoot, partitionId);
+  // Owner-only before the exporter could create it with the process umask.
+  mkdirSync(segmentDir, { recursive: true, mode: 0o700 });
   let reusableSegmentsFile: string | undefined;
   if (previous?.segments && previous.partitionId === partitionId && committedNativeBatchIntact(previous, nativeRoot)) {
     reusableSegmentsFile = reusableSegmentsPath(path);
     writeReusableSegmentList(reusableSegmentsFile, previous.segments);
   }
-  const invocation = await buildAisTokscaleExportInvocation({
-    toolName: target.toolName, identity: target.identity, partitionId, exportPath: path,
-    segmentDir: nativeSegmentDir(nativeRoot, partitionId),
-    ...(reusableSegmentsFile ? { reusableSegmentsFile } : {}),
-    ...(previousMessagesSha256 ? { previousMessagesSha256 } : {}),
-  });
-  if (!invocation && reusableSegmentsFile) try { unlinkSync(reusableSegmentsFile); } catch { /* swept with staging */ }
+  let invocation;
+  try {
+    invocation = await buildAisTokscaleExportInvocation({
+      toolName: target.toolName, identity: target.identity, partitionId, exportPath: path, segmentDir,
+      ...(reusableSegmentsFile ? { reusableSegmentsFile } : {}),
+      ...(previousMessagesSha256 ? { previousMessagesSha256 } : {}),
+    });
+  } finally {
+    if (!invocation && reusableSegmentsFile) try { unlinkSync(reusableSegmentsFile); } catch { /* swept with staging */ }
+  }
   return invocation ? { invocation, path, partitionId } : undefined;
 }
 
@@ -615,7 +621,7 @@ function validSegmentRecords(value: unknown): value is NativeSegmentRecord[] {
     const segment = record as Record<string, unknown> | null;
     return !!segment && typeof segment === "object" && typeof segment.sha256 === "string" && /^[a-f0-9]{64}$/.test(segment.sha256) &&
       Number.isSafeInteger(segment.bytes) && Number.isSafeInteger(segment.messages) &&
-      typeof segment.mtimeNs === "string" && /^\d+$/.test(segment.mtimeNs);
+      [segment.mtimeNs, segment.ctimeNs, segment.ino].every((field) => typeof field === "string" && /^\d+$/.test(field));
   });
 }
 
@@ -749,7 +755,9 @@ export function collectObsoleteNativeBatches(snapshot: UsageSnapshot, nativeRoot
       }
       try { unlinkSync(generation.path); } catch { kept.push(generation.path); }
     }
-    collectObsoleteNativeSegments(directory, kept, now, NATIVE_BATCH_READER_AGE_FLOOR_MS);
+    // An export in flight names its new segments only in a staged manifest, so
+    // an unnamed segment is kept as long as a staged export may still be live.
+    collectObsoleteNativeSegments(directory, kept, now, NATIVE_STAGING_MAX_AGE_MS);
   }
 }
 

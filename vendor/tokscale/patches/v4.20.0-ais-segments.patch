@@ -1,8 +1,8 @@
 diff --git a/crates/tokscale-cli/tests/cli_tests.rs b/crates/tokscale-cli/tests/cli_tests.rs
-index 4c114fa..7376a75 100644
+index 4c114fa..3b28425 100644
 --- a/crates/tokscale-cli/tests/cli_tests.rs
 +++ b/crates/tokscale-cli/tests/cli_tests.rs
-@@ -2471,6 +2471,86 @@ fn ais_native_export_reports_unchanged_messages_instead_of_rewriting_the_batch()
+@@ -2471,6 +2471,107 @@ fn ais_native_export_reports_unchanged_messages_instead_of_rewriting_the_batch()
      assert_eq!(third["messages"], first["messages"]);
  }
  
@@ -68,6 +68,27 @@ index 4c114fa..7376a75 100644
 +        joined.extend(serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap());
 +    }
 +    assert_eq!(serde_json::Value::Array(joined), single["messages"]);
++    #[cfg(unix)]
++    for segment in segments {
++        use std::os::unix::fs::PermissionsExt;
++        let path = segments_dir.join(format!("{}.json", segment["sha256"].as_str().unwrap()));
++        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
++    }
++    // The manifest's hourly rollup is Tokscale's own `hourly` report.
++    let output = cmd_with_home(tmp.path())
++        .args(["hourly", "--client", "codex", "--json", "--no-spinner"])
++        .output()
++        .unwrap();
++    assert!(output.status.success());
++    let hourly: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++    let report_hours = hourly["entries"].as_array().unwrap();
++    let manifest_hours = manifest["hourly"].as_array().unwrap();
++    assert_eq!(report_hours.len(), manifest_hours.len());
++    for (report, exported) in report_hours.iter().zip(manifest_hours) {
++        for field in ["hour", "input", "output", "cacheRead", "cacheWrite", "messageCount", "cost"] {
++            assert_eq!(report[field], exported[field], "{field}");
++        }
++    }
 +    let first = segments[0]["sha256"].as_str().unwrap();
 +    let first_path = segments_dir.join(format!("{first}.json"));
 +
@@ -90,7 +111,7 @@ index 4c114fa..7376a75 100644
  fn test_global_theme_flag() {
      let mut cmd = cargo_bin_cmd!("tokscale");
 diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
-index f6f336c..f0a311e 100644
+index f6f336c..529b828 100644
 --- a/crates/tokscale-core/src/lib.rs
 +++ b/crates/tokscale-core/src/lib.rs
 @@ -50,6 +50,11 @@ static AIS_SHARED_PARSED_MANIFEST: OnceLock<Mutex<Option<(PathBuf, serde_json::V
@@ -114,7 +135,7 @@ index f6f336c..f0a311e 100644
  
      let filtered = filter_messages_for_report(all_messages, &options);
      let mut undated_tokens = TokenBreakdown::default();
-@@ -6583,7 +6588,223 @@ fn ais_messages_sha256(messages: &[UnifiedMessage]) -> Result<String, String> {
+@@ -6583,7 +6588,238 @@ fn ais_messages_sha256(messages: &[UnifiedMessage]) -> Result<String, String> {
      Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
  }
  
@@ -248,9 +269,15 @@ index f6f336c..f0a311e 100644
 +        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 +    ));
 +    let result = (|| -> Result<(), String> {
-+        let mut file = std::fs::OpenOptions::new()
-+            .write(true)
-+            .create_new(true)
++        let mut options = std::fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            // Message history: owner-only, like AIS's own batches.
++            options.mode(0o600);
++        }
++        let mut file = options
 +            .open(&temp)
 +            .map_err(|e| format!("AIS {tag} temp: {e}"))?;
 +        file.write_all(bytes)
@@ -287,7 +314,16 @@ index f6f336c..f0a311e 100644
 +    segment_dir: &std::path::Path,
 +) -> Result<Vec<AisSegmentRef>, String> {
 +    use sha2::Digest;
-+    std::fs::create_dir_all(segment_dir).map_err(|e| format!("AIS segment directory: {e}"))?;
++    let mut builder = std::fs::DirBuilder::new();
++    builder.recursive(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::DirBuilderExt;
++        builder.mode(0o700);
++    }
++    builder
++        .create(segment_dir)
++        .map_err(|e| format!("AIS segment directory: {e}"))?;
 +    let reusable = ais_reusable_segments()?;
 +    let mut written = HashSet::new();
 +    let mut segments = Vec::new();
@@ -339,7 +375,7 @@ index f6f336c..f0a311e 100644
      let path = std::env::var_os("TOKSCALE_AIS_EXPORT_PATH");
      let partition_id = std::env::var("TOKSCALE_AIS_PARTITION_ID").ok();
      let (path, partition_id) = match (path, partition_id) {
-@@ -6594,6 +6815,10 @@ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), Stri
+@@ -6594,6 +6830,10 @@ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), Stri
      if partition_id.is_empty() {
          return Err("AIS partition id is empty".into());
      }
@@ -350,7 +386,7 @@ index f6f336c..f0a311e 100644
      let path = std::path::PathBuf::from(path);
      let parent = path.parent().ok_or("AIS export path has no parent")?;
      std::fs::create_dir_all(parent).map_err(|e| format!("AIS export directory: {e}"))?;
-@@ -6604,6 +6829,26 @@ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), Stri
+@@ -6604,6 +6844,26 @@ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), Stri
      let messages_sha256 = ais_messages_sha256(messages)?;
      let unchanged = std::env::var("TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256")
          .is_ok_and(|previous| previous == messages_sha256);
@@ -377,7 +413,7 @@ index f6f336c..f0a311e 100644
      let temp = parent.join(format!(
          ".ais-batch-{}-{}.tmp",
          std::process::id(),
-@@ -6797,6 +7042,45 @@ fn ais_shared_snapshot_report_impl(
+@@ -6797,6 +7057,45 @@ fn ais_shared_snapshot_report_impl(
      )
  }
  
@@ -423,7 +459,7 @@ index f6f336c..f0a311e 100644
  pub fn parse_ais_shared_snapshot(
      path: &str,
      options: &LocalParseOptions,
-@@ -6856,6 +7140,7 @@ fn parse_ais_shared_snapshot_inner(
+@@ -6856,6 +7155,7 @@ fn parse_ais_shared_snapshot_inner(
      let mut combined = Vec::new();
      let mut unavailable_tools = unsupported_tools;
      let mut manifest_cache_keys = HashSet::new();
@@ -431,7 +467,7 @@ index f6f336c..f0a311e 100644
      let mut saw_missing_batch = false;
      for (_partition_key, partition) in partitions {
          let Some(batch) = partition.get("nativeBatch").filter(|v| !v.is_null()) else {
-@@ -6922,7 +7207,8 @@ fn parse_ais_shared_snapshot_inner(
+@@ -6922,7 +7222,8 @@ fn parse_ais_shared_snapshot_inner(
              combined.extend(messages);
              continue;
          }
@@ -441,7 +477,7 @@ index f6f336c..f0a311e 100644
              let bytes = std::fs::read(&batch_path).map_err(|e| {
                  if e.kind() == std::io::ErrorKind::NotFound {
                      saw_missing_batch = true;
-@@ -6933,6 +7219,40 @@ fn parse_ais_shared_snapshot_inner(
+@@ -6933,6 +7234,40 @@ fn parse_ais_shared_snapshot_inner(
              if expected_digest != digest {
                  return Err("native batch checksum mismatch".into());
              }
@@ -482,7 +518,7 @@ index f6f336c..f0a311e 100644
              let envelope: AisBatchEnvelope =
                  serde_json::from_slice(&bytes).map_err(|e| format!("native batch JSON: {e}"))?;
              if expected_partition_id.len() != 64
-@@ -6954,16 +7274,20 @@ fn parse_ais_shared_snapshot_inner(
+@@ -6954,16 +7289,20 @@ fn parse_ais_shared_snapshot_inner(
              if expected_generated_at != envelope.generated_at {
                  return Err("native batch generation mismatch".into());
              }
@@ -511,7 +547,7 @@ index f6f336c..f0a311e 100644
              }
              Err(_) => *unavailable_tools.entry(tool).or_default() += 1,
          }
-@@ -6980,6 +7304,11 @@ fn parse_ais_shared_snapshot_inner(
+@@ -6980,6 +7319,11 @@ fn parse_ais_shared_snapshot_inner(
          .lock()
          .unwrap()
          .retain(|key, _| manifest_cache_keys.contains(key));
@@ -523,7 +559,7 @@ index f6f336c..f0a311e 100644
      let aggregate_generated_at = manifest
          .get("aggregateGeneratedAt")
          .and_then(serde_json::Value::as_str)
-@@ -7041,7 +7370,7 @@ fn parse_local_unified_messages_resolved(
+@@ -7041,7 +7385,7 @@ fn parse_local_unified_messages_resolved(
          cache_policy,
      );
      let messages = filter_unified_messages(messages, &options);
@@ -532,7 +568,7 @@ index f6f336c..f0a311e 100644
      Ok(messages)
  }
  
-@@ -10818,6 +11147,198 @@ mod tests {
+@@ -10818,6 +11162,198 @@ mod tests {
          msg
      }
  

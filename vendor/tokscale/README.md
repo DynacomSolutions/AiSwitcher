@@ -106,7 +106,7 @@ The patch adds three AIS-only surfaces:
   proportional to its size, once the segment holds 512 KiB; at most 16 MiB,
   about 2 MiB on average), so messages added to one transcript change only
   the segment around them. Segments are written atomically (temporary file,
-  fsync, rename) before the manifest. Only segments listed in
+  fsync, rename; mode 0600 in a 0700 directory) before the manifest. Only segments listed in
   `TOKSCALE_AIS_REUSABLE_SEGMENTS_FILE` (one SHA-256 per line, the ones AIS
   verified on disk) are left unwritten; every other segment is written even
   if a file of that name exists, so a damaged file is never adopted. The

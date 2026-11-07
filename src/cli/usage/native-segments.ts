@@ -16,8 +16,12 @@ export interface NativeSegmentRecord {
   sha256: string;
   bytes: number;
   messages: number;
-  /** mtime (ns) of the file when AIS verified it. */
+  /** mtime (ns), ctime (ns) and inode of the file when AIS verified it.
+   * ctime cannot be set back, and the exporter's rename gives a new inode, so
+   * damage whose size and mtime were restored still breaks the match. */
   mtimeNs: string;
+  ctimeNs: string;
+  ino: string;
 }
 
 export interface SegmentedNativeManifest {
@@ -89,7 +93,8 @@ function segmentPath(segmentDir: string, sha256: string): string {
 function segmentRecordIntact(segmentDir: string, record: NativeSegmentRecord): boolean {
   try {
     const info = statSync(segmentPath(segmentDir, record.sha256), { bigint: true });
-    return info.isFile() && info.size === BigInt(record.bytes) && String(info.mtimeNs) === record.mtimeNs;
+    return info.isFile() && info.size === BigInt(record.bytes) && String(info.mtimeNs) === record.mtimeNs &&
+      String(info.ctimeNs) === record.ctimeNs && String(info.ino) === record.ino;
   } catch {
     return false;
   }
@@ -130,11 +135,11 @@ export function verifyNativeSegments(
     }
     const fd = openSync(segmentPath(segmentDir, segment.sha256), "r");
     let bytes: Buffer;
-    let mtimeNs: string;
+    let stamp: Pick<NativeSegmentRecord, "mtimeNs" | "ctimeNs" | "ino">;
     try {
       const info = fstatSync(fd, { bigint: true });
       if (!info.isFile() || info.size !== BigInt(segment.bytes)) throw new Error("native-segment-mismatch");
-      mtimeNs = String(info.mtimeNs);
+      stamp = { mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs), ino: String(info.ino) };
       bytes = readFileSync(fd);
     } finally {
       closeSync(fd);
@@ -148,7 +153,7 @@ export function verifyNativeSegments(
         !messages.every((message) => message !== null && typeof message === "object" && !Array.isArray(message))) {
       throw new Error("native-segment-mismatch");
     }
-    const record = { ...segment, mtimeNs };
+    const record = { ...segment, ...stamp };
     verified.set(segment.sha256, record);
     return record;
   });
