@@ -743,6 +743,18 @@ describe("failover and refresh", () => {
     expect(await res.text()).toContain("is logged out");
   });
 
+  test("a burst hold is preferred over a credential hold in the rejection, even when the dead member has lower usage", async () => {
+    const { clock, call } = await credSetup(["a", "b"], deadLogin(["a"]), () => new Response("{}", { status: 429 }));
+    await call();
+    clock.ms += 1000;
+    const res = await call();
+    expect(res.status).toBe(429);
+    const retry = Number(res.headers.get("retry-after"));
+    expect(retry).toBeGreaterThan(0);
+    expect(retry).toBeLessThanOrEqual(15);
+    expect(await res.text()).not.toContain("logged out");
+  });
+
   test("a hold on a member outside the app's pool does not change its quota rejection", async () => {
     const week = Math.floor(NOW.getTime() / 1000) + 3 * 86400;
     usage.a = { ...live(100), windows: [{ label: "seven_day", utilization: 100, resetsAt: new Date(week * 1000).toISOString() }] };
