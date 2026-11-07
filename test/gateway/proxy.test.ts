@@ -598,6 +598,75 @@ describe("failover and refresh", () => {
     expect((await call()).status).toBe(200);
   });
 
+  const deadLoginSetup = async (dead: string[]) => {
+    const clock = { ms: NOW.getTime() };
+    deps.now = () => new Date(clock.ms);
+    const sig: Record<string, string> = { a: "s1", b: "s1" };
+    const get = deps.creds.get.bind(deps.creds);
+    deps.creds = {
+      get: async (p: GatewayApp["provider"], id: string) => {
+        if (dead.includes(id) && sig[id] === "s1") throw new GatewayCredentialError("login-dead", p, id);
+        return get(p, id);
+      },
+      refreshAfter401: deps.creds.refreshAfter401,
+      signature: async (_p: string, id: string) => sig[id],
+    } as unknown as GatewayDeps["creds"];
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); };
+    usage.a = live(10);
+    usage.b = live(20);
+    handler = () => new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    return { clock, sig, call, who: () => seen.map((x) => x.headers.get("authorization")) };
+  };
+
+  test("a dead-login pool member is skipped and the request succeeds on the next member", async () => {
+    const { call, who } = await deadLoginSetup(["a"]);
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+  });
+
+  test("a held dead-login member is retried after its credential changes, or after ten minutes", async () => {
+    const { clock, sig, call, who } = await deadLoginSetup(["a"]);
+    await call();
+    seen.length = 0;
+    clock.ms += 5 * 60_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    sig.a = "s2";
+    await call();
+    expect(who()).toEqual(["Bearer tok-a"]);
+    // Time-based release when the file never changes
+    const again = await deadLoginSetup(["a"]);
+    await again.call();
+    seen.length = 0;
+    again.clock.ms += 10 * 60_000 + 1000;
+    again.sig.a = "s1";
+    await again.call();
+    expect(again.who()).toEqual(["Bearer tok-b"]);
+  });
+
+  test("an all-dead pool still returns 502 with the safe message", async () => {
+    const { call } = await deadLoginSetup(["a", "b"]);
+    const res = await call();
+    expect(res.status).toBe(502);
+  });
+
+  test("a dead login on a pinned app keeps returning 502 without failover", async () => {
+    const { clock: _c } = await deadLoginSetup(["id1"]);
+    const t = await addApp(baseApp({ name: "pinned", target: { kind: "pin", identity: "a" } }));
+    const get = deps.creds.get.bind(deps.creds);
+    deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "a") throw new GatewayCredentialError("login-dead", p, id); return get(p, id); } } as GatewayDeps["creds"];
+    const gw = createGatewayApp(deps);
+    const r = await gw.request("http://gw.test/pinned/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } });
+    expect(r.status).toBe(502);
+    expect(seen.length).toBe(0);
+  });
+
   test("all members exhausted gives one 429 with a reason in the log", async () => {
     const gw = createGatewayApp(deps);
     const call = (path: string, token: string, init: RequestInit) => (async () => { const r = await gw.request(`http://gw.test${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); })();

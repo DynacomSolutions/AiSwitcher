@@ -224,6 +224,12 @@ export class CredentialCache {
     this.refresh = deps.refresh ?? refreshIdentityOAuthGrant;
   }
 
+  /** Signature of the identity's credential files (their mtimes); changes when the login is rewritten. */
+  async signature(provider: GatewayProvider, identity: string): Promise<string | undefined> {
+    const id = await this.resolve(provider, identity);
+    return mtimeSignature(provider, id, this.deps.claudeRegistryPath);
+  }
+
   async get(provider: GatewayProvider, identity: string): Promise<ProviderCredential> {
     // Everything below uses the RESOLVED identity (canonical name), never the raw request string:
     // pool, pi and kimi store lookups go by name, and an alias would miss them.
