@@ -40,6 +40,8 @@ export interface GatewayDeps {
   browserHub?: BrowserHub;
   /** Most request-body bytes held for replay at once across all requests. Defaults to AIS_GATEWAY_BODY_BUDGET_MB, else BODY_BUDGET_BYTES. */
   bodyBudgetBytes?: number;
+  /** Waits `ms` or until `signal` aborts; tests inject a fake clock. */
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 /** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
@@ -571,7 +573,29 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       holds.set(exKey(name), { kind: "burst", long: false });
     }
   };
-  const pick = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined);
+  // While the pool still has headroom and only short holds (burst 429s, brief credential retries) stand in the way,
+  // the gateway waits for the first hold to end instead of answering 429: a client CLI treats a 429 as a hard limit.
+  const waitStart = deps.now().getTime();
+  let waits = 0;
+  const waitForShortHold = async (): Promise<boolean> => {
+    if (app.target.kind !== "pool" || waits >= SHORT_HOLD_MAX_WAITS || req.signal.aborted) return false;
+    const now = deps.now().getTime();
+    const left = waitStart + SHORT_HOLD_WAIT_BUDGET_MS - now;
+    if (left <= 0) return false;
+    const held = await exhaustedNames();
+    const shortHeld = [...held].filter((n) => { const h = holds.get(exKey(n)); return h !== undefined && !h.long; });
+    if (shortHeld.length === 0) return false;
+    // Only worth waiting when some member would be picked once the short holds are gone.
+    const quotaOut = new Set([...held].filter((n) => !shortHeld.includes(n)));
+    if (!("identity" in (await pickIdentity(app, deps, quotaOut)))) return false;
+    const soonest = Math.min(...shortHeld.map((n) => exhausted.get(exKey(n)) ?? now));
+    waits++;
+    await (deps.sleep ?? defaultSleep)(Math.min(Math.max(soonest - now, SHORT_HOLD_MIN_SLEEP_MS), left), req.signal);
+    return !req.signal.aborted;
+  };
+  let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined);
+  while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames());
+  const pick = picked;
   if ("reject" in pick) {
     deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
     const why = pick.reject === "reserve" ? "identity is at its usage reserve" : pick.reject === "no-identities" ? `no identities configured for ${app.provider}` : "no pool member has headroom below the reserve";
@@ -705,7 +729,15 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       while (quota || !cur) {
         tried.add(name);
         const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]));
-        if (!("identity" in next)) break;
+        if (!("identity" in next)) {
+          // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
+          if (quota && cur && !provesSubscriptionExhaustion(cur.headers) && (await waitForShortHold())) {
+            tried.clear();
+            name = "";
+            continue;
+          }
+          break;
+        }
         name = next.identity;
         // If the next identity cannot even be tried, it is skipped; the client keeps the last upstream answer.
         let second: Response;
@@ -832,6 +864,21 @@ async function credentialSignature(deps: GatewayDeps, provider: GatewayProvider,
 }
 
 const BURST_HOLD_DEFAULT_MS = 15_000;
+/** Longest a request waits in total for short member holds to end before the client gets the 429. */
+const SHORT_HOLD_WAIT_BUDGET_MS = 90_000;
+const SHORT_HOLD_MAX_WAITS = 8;
+const SHORT_HOLD_MIN_SLEEP_MS = 250;
+const defaultSleep = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const t = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(t);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
 const BURST_HOLD_MAX_MS = 60_000;
 /** Internal marker set on a 429 whose body proved Codex subscription exhaustion; stripped before the client sees it. */
 const SUBSCRIPTION_EXHAUSTED_HEADER = "x-ais-subscription-exhausted";

@@ -147,6 +147,7 @@ ETA: 2026-11-14 18:00 ICT
 | 135 | Gateway: fail over to the next pool member on a credential failure | done | claude-20261107-gw-burst-429 | gateway-burst-429 | 4.134 | | Merged in PRs #394, #396 and #397 (CVE image bump).<br>Live 09:43 ICT 7 Nov on the new gateway pod. |
 | 136 | Re-login the dead Claude pool identity | done | Thomas | | 4.135 | | Re-logged 07:29 ICT 7 Nov; the login is valid.<br>The account is at its weekly limit until about 22:00 ICT 8 Nov. |
 | 137 | Gateway: prefer a burst hold over a credential hold in rejections | done | claude-20261107-gw-hold-pref | gateway-hold-preference | 4.134, 4.135 | | Merged in PRs #394, #396 and #397 (CVE image bump).<br>Live 09:43 ICT 7 Nov on the new gateway pod. |
+| 139 | Gateway: wait out short member holds instead of answering 429 while the pool has weekly headroom | in progress | claude-20261107-gw-burst-wait | gw-burst-wait | 4.134, 4.137 | 2026-11-07 16:30 ICT | Seen 15:20 ICT 7 Nov: burst holds on both members with headroom made the gateway send the native account-limit 429, killing agents. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
 ETA: 2026-11-14 18:00 ICT
