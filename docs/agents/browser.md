@@ -12,7 +12,7 @@ Lets Claude and Codex sessions drive a real Chrome profile through the gateway. 
 
 ## Pair and bind
 
-1. Open the extension options page. Set Gateway URL to the `wss://` form of the host in `AIS_GATEWAY_PROXY_URL` (same host, `wss://` instead of `https://`). `ws://` is accepted only for localhost.
+1. Open the extension options page. Set Gateway URL to the `wss://` form of the host in `AIS_GATEWAY_PROXY_URL` (same host and path prefix, `wss://` instead of `https://`; for example `https://gw.example.com/gateway` becomes `wss://gw.example.com/gateway`). `ws://` is accepted only for localhost.
 2. Press Sign in. The page shows a pairing code.
 3. On a machine with the gateway admin settings in `~/.secrets`: `ais browser approve <CODE> --identity=<id>` or `--pool=<pool>` (exactly one; `--name=<n>` names the binding). An identity binding serves that identity; a pool binding serves every identity in the swap pool.
 4. `ais browser list [--json]` shows bindings and when each browser last connected.
