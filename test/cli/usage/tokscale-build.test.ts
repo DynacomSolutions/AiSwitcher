@@ -1,14 +1,17 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installUsageCollectorService, USAGE_COLLECTOR_SERVICE_NAME } from "../../../src/cli/usage/collector-service.ts";
 import {
   ensureNativeTokscale,
   expectedTokscaleBuildManifest,
+  installedTokscaleBuild,
   nativeTokscaleSupportsCheckpoints,
   TOKSCALE_CHECKPOINT_PATCH,
   tokscaleBuildStampPath,
+  tokscaleFailedBuildPath,
   writeTokscaleBuildStamp,
 } from "../../../src/cli/usage/tokscale-build.ts";
 
@@ -130,7 +133,7 @@ test("a failed build keeps the previous binary and the 20M cap", async () => {
   expect(await collectorCap(root, binaryPath)).toBe("20M");
 
   // A helper that cannot even start is reported the same way.
-  const thrown = await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: async () => { throw new Error("cargo is required"); } });
+  const thrown = await ensureNativeTokscale({ repoRoot, binaryPath, force: true, runBuild: async () => { throw new Error("cargo is required"); } });
   expect(thrown).toEqual({ status: "failed", reason: "outdated", error: "cargo is required" });
   expect(await collectorCap(root, binaryPath)).toBe("20M");
 });
@@ -151,6 +154,160 @@ test("this checkout's build stamp lists every series patch, including the checkp
   expect(series).toContain(TOKSCALE_CHECKPOINT_PATCH);
   expect(manifest[1]).toMatch(/^source v4\.20\.0 [0-9a-f]{64}$/);
   const helper = await readFile(join(repoRoot, "scripts", "build-tokscale-ais.sh"), "utf8");
-  expect(helper).toContain('done 3< "$repo_root/vendor/tokscale/patches/series"');
-  expect(helper).toContain('bun "$repo_root/scripts/tokscale-stamp.ts" "$repo_root" "$output"');
+  expect(helper).toContain('done 3< "$inputs/vendor/tokscale/patches/series"');
+  expect(helper).toContain('apply_snapshot_patches "$inputs" "$source_dir"');
+  expect(helper).toContain('install_built_binary "$target_dir/release/tokscale" "$output" "$inputs"');
+});
+
+// ---- Review follow-ups: R1 (stale manifest), R2 (concurrent builds), R3 (failed builds retried) ----
+
+const REAL_HELPER = join(import.meta.dir, "..", "..", "..", "scripts", "build-tokscale-ais.sh");
+const BUN_DIR = join(process.execPath, "..");
+
+/** A checkout carrying the real build helper, so its functions run against this fixture. */
+async function helperFixture(series: string[]) {
+  const f = await fixture(series);
+  await copyFile(REAL_HELPER, join(f.repoRoot, "scripts", "build-tokscale-ais.sh"));
+  return f;
+}
+
+/** Source the real helper (defines its functions, builds nothing) and run `body`. */
+async function helperShell(body: string, env: Record<string, string> = {}): Promise<{ code: number; stderr: string }> {
+  const child = Bun.spawn(["bash", "-c", `set -euo pipefail; source "$HELPER"; ${body}`], {
+    env: { ...process.env, PATH: `${BUN_DIR}:${process.env.PATH ?? ""}`, HELPER: REAL_HELPER, ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+  return { code, stderr };
+}
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+test("R1: a commit that lands during a build is never recorded against the binary it did not build", async () => {
+  const { root, repoRoot, binaryPath } = await helperFixture(OLD_SERIES);
+  await writeFile(binaryPath, "tokscale from before stamps", { mode: 0o755 });
+  const built = join(root, "built-from-old-series");
+  await writeFile(built, "tokscale built without checkpoints");
+
+  // The build snapshots its inputs, the checkpoint patch is merged while cargo
+  // runs, then the build installs what it compiled from the old series.
+  const midBuildCommit = async (checkout: string, output: string) => {
+    const inputs = join(root, `inputs-${Math.random().toString(16).slice(2)}`);
+    const run = await helperShell(
+      `snapshot_build_inputs "$CHECKOUT" "$INPUTS"; "$COMMIT"; install_built_binary "$BUILT" "$OUTPUT" "$INPUTS"`,
+      { CHECKOUT: checkout, INPUTS: inputs, BUILT: built, OUTPUT: output, COMMIT: join(root, "commit.sh") },
+    );
+    expect(run.stderr).toBe("");
+    return run.code;
+  };
+  // The "commit": the series gains the checkpoint patch.
+  await writeFile(join(root, "commit.sh"), `#!/bin/sh\nprintf 'patch body of ${TOKSCALE_CHECKPOINT_PATCH}\\n' > "${repoRoot}/vendor/tokscale/patches/${TOKSCALE_CHECKPOINT_PATCH}"\nprintf '%s\\n' ${NEW_SERIES.join(" ")} > "${repoRoot}/vendor/tokscale/patches/series"\n`, { mode: 0o755 });
+
+  // This install read the old series before building, and that is what got built.
+  const result = await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: midBuildCommit });
+  expect(result).toEqual({ status: "rebuilt", reason: "missing" });
+  expect(await readFile(binaryPath, "utf8")).toBe("tokscale built without checkpoints");
+  // The stamp tells the truth: built from the old series, so no checkpoints and no 5M.
+  expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(false);
+  const stamp = await readFile(tokscaleBuildStampPath(binaryPath), "utf8");
+  expect(stamp).not.toContain(TOKSCALE_CHECKPOINT_PATCH);
+  expect(await collectorCap(root, binaryPath)).toBe("20M");
+  // And the next install does not take it for current: it rebuilds for the new series.
+  const calls: string[] = [];
+  expect(await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: fakeHelper(calls) })).toEqual({ status: "rebuilt", reason: "outdated" });
+  expect(calls).toHaveLength(1);
+  expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(true);
+});
+
+test("R2: a stamp records the hash of the binary its build staged, not whatever is installed later", async () => {
+  const { root, repoRoot, binaryPath } = await fixture(NEW_SERIES);
+  // Build B (with checkpoints) staged these bytes, but a concurrent build A
+  // without checkpoints replaced the output before B wrote its stamp.
+  await writeFile(binaryPath, "binary from build A, no checkpoints");
+  await writeTokscaleBuildStamp(repoRoot, binaryPath, sha256Hex("binary from build B, with checkpoints"));
+  expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(false);
+  expect(await collectorCap(root, binaryPath)).toBe("20M");
+});
+
+test("R2: the helper stamps the staged hash and holds the output lock across replace and stamp", async () => {
+  const { root, repoRoot, binaryPath } = await helperFixture(NEW_SERIES);
+  const inputs = join(root, "inputs");
+  const built = join(root, "built");
+  await writeFile(binaryPath, "previous tokscale", { mode: 0o755 });
+  await writeFile(built, "new tokscale with checkpoints");
+  expect((await helperShell(`snapshot_build_inputs "$CHECKOUT" "$INPUTS"`, { CHECKOUT: repoRoot, INPUTS: inputs })).code).toBe(0);
+
+  // Another build holds the lock: this one must not replace the binary until it is released.
+  const holder = Bun.spawn(["flock", `${binaryPath}.lock`, "sleep", "1.5"], { stdout: "ignore", stderr: "ignore" });
+  await Bun.sleep(200);
+  const install = helperShell(`install_built_binary "$BUILT" "$OUTPUT" "$INPUTS"`, { BUILT: built, OUTPUT: binaryPath, INPUTS: inputs });
+  await Bun.sleep(700);
+  expect(await readFile(binaryPath, "utf8")).toBe("previous tokscale");
+  await holder.exited;
+  expect((await install).code).toBe(0);
+  expect(await readFile(binaryPath, "utf8")).toBe("new tokscale with checkpoints");
+  expect(await readFile(tokscaleBuildStampPath(binaryPath), "utf8")).toContain(`binary ${sha256Hex("new tokscale with checkpoints")}`);
+  expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(true);
+});
+
+test("R2: concurrent builds of different patch sets never leave a stamp that claims the other's checkpoints", async () => {
+  const { root, repoRoot, binaryPath } = await helperFixture(OLD_SERIES);
+  const oldInputs = join(root, "inputs-old");
+  const newInputs = join(root, "inputs-new");
+  expect((await helperShell(`snapshot_build_inputs "$CHECKOUT" "$INPUTS"`, { CHECKOUT: repoRoot, INPUTS: oldInputs })).code).toBe(0);
+  await setSeries(repoRoot, NEW_SERIES);
+  expect((await helperShell(`snapshot_build_inputs "$CHECKOUT" "$INPUTS"`, { CHECKOUT: repoRoot, INPUTS: newInputs })).code).toBe(0);
+  await writeFile(join(root, "built-old"), "tokscale without checkpoints");
+  await writeFile(join(root, "built-new"), "tokscale with checkpoints");
+
+  for (let round = 0; round < 6; round++) {
+    const runs = await Promise.all([
+      helperShell(`install_built_binary "$BUILT" "$OUTPUT" "$INPUTS"`, { BUILT: join(root, "built-old"), OUTPUT: binaryPath, INPUTS: oldInputs }),
+      helperShell(`install_built_binary "$BUILT" "$OUTPUT" "$INPUTS"`, { BUILT: join(root, "built-new"), OUTPUT: binaryPath, INPUTS: newInputs }),
+    ]);
+    expect(runs.map((run) => run.code)).toEqual([0, 0]);
+    const installed = await readFile(binaryPath, "utf8");
+    // Serialised: the stamp always describes the binary that won, whichever it was.
+    expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(installed === "tokscale with checkpoints");
+    expect(await installedTokscaleBuild(binaryPath)).toBeDefined();
+  }
+});
+
+test("R3: a patch set whose build failed is not rebuilt on every install, until it changes or is forced", async () => {
+  const { repoRoot, binaryPath } = await fixture(OLD_SERIES);
+  await fakeHelper([], "tokscale without checkpoints")(repoRoot, binaryPath);
+  await setSeries(repoRoot, NEW_SERIES);
+
+  let builds = 0;
+  const failing = async () => { builds++; return 1; };
+  expect((await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: failing })).status).toBe("failed");
+  expect(builds).toBe(1);
+  expect(await readFile(tokscaleFailedBuildPath(binaryPath), "utf8")).toContain(TOKSCALE_CHECKPOINT_PATCH);
+
+  // Same patch set: skipped, the build is not started again.
+  expect(await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: failing })).toEqual({ status: "skipped", reason: "outdated" });
+  expect(builds).toBe(1);
+
+  // Forced (or AIS_TOKSCALE_FORCE_REBUILD=1): retried.
+  expect((await ensureNativeTokscale({ repoRoot, binaryPath, force: true, runBuild: failing })).status).toBe("failed");
+  expect(builds).toBe(2);
+  const previous = process.env.AIS_TOKSCALE_FORCE_REBUILD;
+  process.env.AIS_TOKSCALE_FORCE_REBUILD = "1";
+  try {
+    expect((await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: failing })).status).toBe("failed");
+  } finally {
+    if (previous === undefined) delete process.env.AIS_TOKSCALE_FORCE_REBUILD;
+    else process.env.AIS_TOKSCALE_FORCE_REBUILD = previous;
+  }
+  expect(builds).toBe(3);
+
+  // A changed patch set is a new attempt; a success clears the failure record.
+  await writeFile(join(repoRoot, "vendor", "tokscale", "patches", TOKSCALE_CHECKPOINT_PATCH), "fixed patch body\n");
+  const calls: string[] = [];
+  expect((await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: fakeHelper(calls) })).status).toBe("rebuilt");
+  expect(calls).toHaveLength(1);
+  expect(await Bun.file(tokscaleFailedBuildPath(binaryPath)).exists()).toBe(false);
 });

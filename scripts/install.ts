@@ -7,7 +7,7 @@ import {
   configureUsageCollectorServiceForFullInstall,
   USAGE_COLLECTOR_IO_CAP,
 } from "../src/cli/usage/collector-service.ts";
-import { ensureNativeTokscale, type NativeTokscaleResult } from "../src/cli/usage/tokscale-build.ts";
+import { ensureNativeTokscale, TOKSCALE_FORCE_REBUILD_ENV, type NativeTokscaleResult } from "../src/cli/usage/tokscale-build.ts";
 import { installLocalGatewayService } from "../src/cli/gateway/local-service.ts";
 import { describeProfileSyncServiceResult, installProfileSyncService } from "../src/sync/profile-sync-service.ts";
 
@@ -109,6 +109,8 @@ export function describeNativeTokscaleResult(result: NativeTokscaleResult): stri
       return `install: AIS-patched Tokscale rebuilt (${result.reason === "missing" ? "no build stamp" : "patch set changed"}).`;
     case "failed":
       return `install: warning: AIS-patched Tokscale rebuild failed, previous binary kept: ${result.error}`;
+    case "skipped":
+      return `install: warning: AIS-patched Tokscale is not current and its last build of this patch set failed; not retrying (set ${TOKSCALE_FORCE_REBUILD_ENV}=1 to retry).`;
   }
 }
 

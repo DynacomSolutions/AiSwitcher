@@ -89,12 +89,14 @@ export async function nativeTokscaleSupportsCheckpoints(binaryPath = defaultNati
   return build?.some((line) => line.startsWith(`patch ${TOKSCALE_CHECKPOINT_PATCH} `)) ?? false;
 }
 
-/** Write the stamp for a binary the build helper just installed. The helper
- * removes the old stamp before replacing the binary, so a stamp never
- * outlives the binary it describes. */
-export async function writeTokscaleBuildStamp(repoRoot: string, binaryPath: string): Promise<void> {
-  const lines = await expectedTokscaleBuildManifest(repoRoot);
-  lines.push(`binary ${await sha256File(binaryPath)}`);
+/** Write the stamp for a binary the build helper just installed. `inputsRoot`
+ * is the helper's snapshot of itself and the patch series, taken before the
+ * build; `binarySha256` is the hash of the file it staged. Neither is read from
+ * the live checkout or output, so neither can describe something else. The
+ * helper removes the old stamp before replacing the binary. */
+export async function writeTokscaleBuildStamp(inputsRoot: string, binaryPath: string, binarySha256?: string): Promise<void> {
+  const lines = await expectedTokscaleBuildManifest(inputsRoot);
+  lines.push(`binary ${binarySha256 ?? await sha256File(binaryPath)}`);
   const directory = await mkdtemp(join(dirname(binaryPath), ".ais-build-stamp-"));
   try {
     const staged = join(directory, "stamp");
@@ -108,11 +110,23 @@ export async function writeTokscaleBuildStamp(repoRoot: string, binaryPath: stri
 export type NativeTokscaleResult =
   | { status: "current" }
   | { status: "rebuilt"; reason: "missing" | "outdated" }
-  | { status: "failed"; reason: "missing" | "outdated"; error: string };
+  | { status: "failed"; reason: "missing" | "outdated"; error: string }
+  /** This exact patch set already failed to build; not retried until it changes or is forced. */
+  | { status: "skipped"; reason: "missing" | "outdated" };
+
+/** Set to 1 to retry a build of a patch set that already failed. */
+export const TOKSCALE_FORCE_REBUILD_ENV = "AIS_TOKSCALE_FORCE_REBUILD";
+
+/** The manifest of the last failed build attempt for this binary. */
+export function tokscaleFailedBuildPath(binaryPath: string): string {
+  return `${binaryPath}.ais-build-failed`;
+}
 
 export interface EnsureNativeTokscaleOptions {
   repoRoot: string;
   binaryPath?: string;
+  /** Retry even when this patch set already failed (default: AIS_TOKSCALE_FORCE_REBUILD=1). */
+  force?: boolean;
   /** Runs the build helper; resolves to its exit code. Test seam. */
   runBuild?: (repoRoot: string, binaryPath: string) => Promise<number>;
 }
@@ -142,16 +156,28 @@ export async function ensureNativeTokscale(options: EnsureNativeTokscaleOptions)
   const installed = await installedTokscaleBuild(binaryPath);
   if (installed?.join("\n") === expected) return { status: "current" };
   const reason = installed ? "outdated" : "missing";
+  const failedPath = tokscaleFailedBuildPath(binaryPath);
+  const force = options.force ?? process.env[TOKSCALE_FORCE_REBUILD_ENV] === "1";
+  // A cold build compiles Tokscale and runs its tests; one that failed for this
+  // exact patch set (no toolchain, a broken patch) would fail again on every install.
+  if (!force && (await readFile(failedPath, "utf8").catch(() => undefined)) === expected) {
+    return { status: "skipped", reason };
+  }
+  const fail = async (error: string): Promise<NativeTokscaleResult> => {
+    await writeFile(failedPath, expected, { mode: 0o644 }).catch(() => {});
+    return { status: "failed", reason, error };
+  };
   let code: number;
   try {
     code = await (options.runBuild ?? runTokscaleBuildHelper)(options.repoRoot, binaryPath);
   } catch (error) {
-    return { status: "failed", reason, error: error instanceof Error ? error.message : String(error) };
+    return fail(error instanceof Error ? error.message : String(error));
   }
-  if (code !== 0) return { status: "failed", reason, error: `build-tokscale-ais.sh exited with ${code}` };
+  if (code !== 0) return fail(`build-tokscale-ais.sh exited with ${code}`);
   const rebuilt = await installedTokscaleBuild(binaryPath);
   if (rebuilt?.join("\n") !== expected) {
-    return { status: "failed", reason, error: "the rebuilt Tokscale has no matching build stamp" };
+    return fail("the rebuilt Tokscale is not stamped with this checkout's patch set (did the checkout change during the build?)");
   }
+  await rm(failedPath, { force: true });
   return { status: "rebuilt", reason };
 }

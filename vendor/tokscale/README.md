@@ -185,12 +185,16 @@ licence, applies the patches in the order `patches/series` lists them
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.
 
-Next to the binary it writes `<binary>.ais-build`: the pinned release, the
-SHA-256 of every patch in series order, the helper's own SHA-256 and the
-installed binary's SHA-256 (`src/cli/usage/tokscale-build.ts`). The old stamp is
-removed before the binary is replaced and the new one written after, so a
-stamp never describes an older binary; a failed build leaves the previous
-binary and stamp alone.
+Before it builds, the helper copies itself and `patches/` into its scratch
+tree; it applies the patches from that copy and stamps from it, so a commit
+that lands during a long build is never recorded against this binary. Next to
+the binary it writes `<binary>.ais-build`: the pinned release, the SHA-256 of
+every patch in series order, the helper's own SHA-256 and the SHA-256 of the
+file it staged (`src/cli/usage/tokscale-build.ts`). Replacing the binary and
+writing the stamp happen under `flock <binary>.lock`, the old stamp removed
+first and the new one written last, so a stamp never describes an older
+binary, and a binary another build swapped in fails the hash check. A failed
+build leaves the previous binary and stamp alone.
 
 A full install (`bun run install:shims`) compares the stamp with the checkout
 and runs this helper under `nice -n 19` and `ionice -c 3` when the stamp is
@@ -199,4 +203,6 @@ unit gets its 5 MB/s disk cap only when the stamp verifies and lists
 `v4.20.0-ais-checkpoint.patch`; otherwise it keeps 20 MB/s, because without
 checkpoints a cold export of a large identity cannot finish under 5 MB/s.
 `ais usage service install` applies the same check. A failed rebuild is
-reported as a warning and the host keeps its previous binary and 20 MB/s.
+reported as a warning and the host keeps its previous binary and 20 MB/s. The
+failed patch set is recorded in `<binary>.ais-build-failed` and not retried
+until the patch set changes or `AIS_TOKSCALE_FORCE_REBUILD=1` is set.
