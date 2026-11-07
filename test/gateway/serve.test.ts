@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
 import { createGatewayApp, styleForPath } from "../../src/gateway/app.ts";
-import { instrumentRefresh, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
+import { instrumentRefresh, keepAliveOnce, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
@@ -600,5 +600,44 @@ describe("watchCredentialReads", () => {
     const { watchCredentialReads } = await import("../../src/gateway/serve.ts");
     const w = watchCredentialReads(new CredentialCache({ resolveConfigDir: async () => "/nonexistent" }), { recover() {}, fire() {} } as never, new Map());
     expect(typeof w.signature).toBe("function");
+  });
+});
+
+describe("idle keep-alive", () => {
+  test("refreshes every managed login without traffic and counts outcomes, a throw counts as failed", async () => {
+    const counted: string[] = [];
+    const seen: string[] = [];
+    const refresh = (async (_t: string, id: { name: string }) => {
+      seen.push(id.name);
+      if (id.name === "bad") throw new Error("boom");
+      return { tool: "claude", identity: id.name, outcome: "refreshed", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    await keepAliveOnce({
+      refresh,
+      accounts: async () => [{ name: "a", label: "a", configDir: "/x/a" }, { name: "bad", label: "bad", configDir: "/x/bad" }, { name: "b", label: "b", configDir: "/x/b" }],
+      metrics: { keepAlive: (p: string, o: string) => { counted.push(`${p}:${o}`); } },
+    });
+    expect(seen).toEqual(["a", "bad", "b"]);
+    expect(counted).toEqual(["claude:refreshed", "claude:failed", "claude:refreshed"]);
+  });
+
+  test("a revoked grant is remembered by fingerprint and not refreshed again until it changes", async () => {
+    const seen: Array<string | undefined> = [];
+    let fp = "fp-1";
+    const refresh = (async (_t: string, id: { name: string }, opts?: { revokedFingerprint?: string }) => {
+      seen.push(opts?.revokedFingerprint);
+      return { tool: "claude", identity: id.name, outcome: opts?.revokedFingerprint === fp ? "skipped-revoked" : "failed", beforeFingerprint: fp, detail: "", written: [], writeFailures: [] };
+    }) as never;
+    const revoked = new Map<string, string>();
+    const accounts = async () => [{ name: "a", label: "a", configDir: "/x/a" }];
+    const metrics = { keepAlive: () => {} };
+    await keepAliveOnce({ refresh, accounts, metrics, revoked }); // first POST fails, nothing remembered
+    revoked.set("a", "fp-1");
+    await keepAliveOnce({ refresh, accounts, metrics, revoked });
+    expect(seen).toEqual([undefined, "fp-1"]);
+    expect(revoked.get("a")).toBe("fp-1");
+    fp = "fp-2"; // re-login minted a different grant: the stale mark no longer matches, so the refresh runs
+    await keepAliveOnce({ refresh, accounts, metrics, revoked });
+    expect(revoked.has("a")).toBe(false);
   });
 });

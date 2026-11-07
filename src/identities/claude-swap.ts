@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisClaudeSwapLedgerPath } from "../shared/ais-home.ts";
 import { withClaudeLocks, withOauthRefreshLock, type LockOptions } from "./claude-swap-lock.ts";
@@ -7,7 +7,7 @@ import { grantFingerprint, nativeStorePathFor, readProviderGrantCopy, type OAuth
 import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, readSwapEvents as readPoolSwapEvents } from "./pool/ledger.ts";
 import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
 import { claudeAdapter } from "./pool/claude-adapter.ts";
-import { dropApiKeyHelper, isGatewayAccessToken, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
+import { dropApiKeyHelper, isGatewayAccessToken, isIntactGatewayEntry, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
 import { performPoolSwap, type PerformSwapOptions } from "./pool/swap.ts";
 import { allowedAccounts, SwapPoolError, type PoolIdentity } from "./pool/swap-pool.ts";
 import type { Identity } from "./types.ts";
@@ -186,20 +186,49 @@ async function gatewayTokenFor(pool: PoolIdentity): Promise<string | undefined> 
   return token;
 }
 
+function hasUsableRefreshToken(text: string): boolean {
+  try {
+    const rt = (JSON.parse(text) as { claudeAiOauth?: { refreshToken?: unknown } })?.claudeAiOauth?.refreshToken;
+    return typeof rt === "string" && rt.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** `<cred>.pre-swap.<timestamp>[-n].bak`, created exclusively (0600): an existing backup is never overwritten. */
+async function writeUniqueBackup(credPath: string, text: string): Promise<string> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (let n = 0; ; n++) {
+    const path = `${credPath}.pre-swap.${stamp}${n === 0 ? "" : `-${n}`}.bak`;
+    try {
+      await writeFile(path, text, { flag: "wx", mode: 0o600 });
+      return path;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || n > 1000) throw err;
+    }
+  }
+}
+
 /** Puts the gateway entry in a gateway-routed pool folder, first saving any real login found there (to its member, else
  * a 0600 backup). Caller holds the claude locks. Returns the notes and whether anything changed. */
 async function installGatewayEntry(input: { pool: PoolIdentity; members: Identity[]; token: string; lock?: LockOptions }): Promise<{ changed: boolean; entryReplaced: boolean; writeBack: WriteBackOutcome; notes: string[] }> {
   const { pool, members, token } = input;
   const poolCredPath = nativeStorePathFor("claude", pool.configDir);
   const current = await storedAccessToken(pool.configDir);
-  if (current === token) {
+  if (current === token && (await isIntactGatewayEntry(pool.configDir, token))) {
     const dropped = await dropApiKeyHelper(pool.configDir);
     return { changed: dropped, entryReplaced: false, writeBack: "none-identical", notes: dropped ? ["removed apiKeyHelper from the gateway identity's settings"] : [] };
   }
+  // The cluster gateway owns every account login: nothing found in a gateway folder is written back to a member. A real or
+  // damaged login (a /login, an older build's leftover) is kept in a 0600 backup for the owner to inspect, then replaced.
   const poolCredText = await readText(poolCredPath);
-  const poolGrant = (await readProviderGrantCopy("claude", pool.configDir))?.grant;
-  const poolUuid = accountUuid(parseObject(await readText(claudeJsonPath(pool.configDir))));
-  const { writeBack, notes } = await writeBackPoolGrant({ pool, members, poolCredPath, poolCredText, poolGrant, poolUuid, attributeByLogin: true, ...(input.lock ? { lock: input.lock } : {}) });
+  const notes: string[] = [];
+  // Only a file that still holds a usable refresh token is worth keeping; each backup gets a unique name and none is overwritten.
+  if (poolCredText !== undefined && hasUsableRefreshToken(poolCredText)) {
+    const backup = await writeUniqueBackup(poolCredPath, poolCredText);
+    notes.push(`a login found in the gateway identity was not used; kept a 0600 backup copy at ${backup}`);
+  }
+  const writeBack: WriteBackOutcome = "none-identical";
   await mkdir(pool.configDir, { recursive: true });
   await writeGatewayEntry(pool.configDir, token);
   if (await dropApiKeyHelper(pool.configDir)) notes.push("removed apiKeyHelper from the gateway identity's settings");
@@ -215,7 +244,9 @@ export async function healGatewayPool(pool: PoolIdentity, members: Identity[], l
     const r = await installGatewayEntry({ pool, members, token, ...(lock ? { lock } : {}) });
     if (!r.changed) return [];
     if (!r.entryReplaced) return r.notes.map((n) => `pool ${pool.name}: ${n}`);
-    return [`pool ${pool.name}: a real login was found in the gateway identity; restored the gateway entry`, ...r.notes];
+    // The entry is replaced for a new app token as well as after a stray login: only claim a login when a backup note says so.
+    const foundLogin = r.notes.some((n) => n.includes("backup"));
+    return [`pool ${pool.name}: ${foundLogin ? "a real login was found in the gateway identity; " : ""}restored the gateway entry`, ...r.notes];
   }, lock);
 }
 

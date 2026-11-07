@@ -2,6 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { codexAccountOf, jwtAccountId, parseCodexAuth, readCodexAuthText } from "../identities/codex-auth.ts";
 import { readAliApiKey } from "../identities/ali-auth.ts";
+import { isGatewayAccessToken } from "../identities/claude-gateway-entry.ts";
 import { nativeStorePathFor } from "../identities/oauth-reconcile.ts";
 import { DEAD_REFRESH_CODES, effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
@@ -237,8 +238,25 @@ export class CredentialCache {
     const key = `${provider}\u0000${id.name}`;
     const signature = await mtimeSignature(provider, id, this.deps.claudeRegistryPath);
     const cached = this.entries.get(key);
-    if (cached && signature !== undefined && cached.signature === signature) return cached.cred;
-    return this.load(provider, id, signature);
+    const cred = cached && signature !== undefined && cached.signature === signature ? cached.cred : await this.load(provider, id, signature);
+    return this.ensureUsable(provider, id, cred);
+  }
+
+  /**
+   * A gateway app token (damaged member store) is never sent upstream, and an access token past its expiry is refreshed first.
+   * The refresh is AIS's locked compare-and-swap, shared with concurrent callers. A merely expired token that cannot be refreshed
+   * is still returned (a 401 refresh follows); a gateway token that cannot be refreshed is an error.
+   */
+  private async ensureUsable(provider: GatewayProvider, id: Identity, cred: ProviderCredential): Promise<ProviderCredential> {
+    const leaked = isGatewayAccessToken(cred.accessToken);
+    const expired = cred.expiresAtMs !== undefined && cred.expiresAtMs <= (this.deps.now ?? Date.now)() + 30_000;
+    if ((!leaked && !expired) || !adapterFor(provider).refreshable) return cred;
+    try {
+      return await this.refreshAfter401(provider, id.name, cred.accessToken);
+    } catch (err) {
+      if (leaked) throw err;
+      return cred;
+    }
   }
 
   /**
@@ -262,7 +280,9 @@ export class CredentialCache {
   private async doRefresh(provider: GatewayProvider, id: Identity, staleToken: string): Promise<ProviderCredential> {
     const identity = id.name;
     const current = await this.reload(provider, id);
-    if (current.accessToken !== staleToken) return current;
+    // A gateway app token is never a result: when the store holds one, the refresh below spends its refresh token instead.
+    if (current.accessToken !== staleToken && !isGatewayAccessToken(current.accessToken)) return current;
+    staleToken = current.accessToken;
     const key = `${provider}\u0000${identity}`;
     const now = (this.deps.now ?? Date.now)();
     const last = this.lastRefreshAt.get(key);
@@ -280,7 +300,7 @@ export class CredentialCache {
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
-    if (next.accessToken !== staleToken) return next;
+    if (next.accessToken !== staleToken && !isGatewayAccessToken(next.accessToken)) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
     // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
     const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" ? "refresh-failed" : "token-unchanged";
