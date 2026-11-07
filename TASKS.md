@@ -3,7 +3,7 @@
 Track product work, bugs and acceptance evidence. Routine Git operations are not tasks.
 
 ## 1. Product work
-ETA: 2026-11-07 22:00 ICT
+ETA: 2026-11-14 18:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 1 | Preserve Grok's explicit memory control through the identity launcher | done | grok_memory_fix | | | | Exact-key forwarding and four real-subprocess regressions are source-reviewed. Focused QA completed successfully; full CI on `97ae2de` passed typecheck and 609 tests across 76 files with zero failures. Compiled launcher inspected live: both launcher and real Grok child receive `GROK_MEMORY=0`. Installed binary matches the tested candidate byte-for-byte, with a rollback copy; other launchers and shared memory settings are unchanged. Other session markers and explicit child overrides remain intact. |
@@ -150,7 +150,7 @@ ETA: 2026-11-14 18:00 ICT
 | 137 | Gateway: prefer a burst hold over a credential hold in rejections | done | claude-20261107-gw-hold-pref | gateway-hold-preference | 4.134, 4.135 | | Merged in PRs #394, #396 and #397 (CVE image bump).<br>Live 09:43 ICT 7 Nov on the new gateway pod. |
 | 139 | Gateway: wait out short member holds instead of answering 429 while the pool has weekly headroom | done | claude-20261107-gw-burst-wait | gw-burst-wait | 4.134, 4.137 | | Merged in PR #400; gateway pod rolled 7 Nov.<br>Seen 15:20 ICT 7 Nov: burst holds on both members with headroom made the gateway send the native account-limit 429, killing agents. |
 | 140 | Manual pool swap with no account named picks a member at 100% weekly usage (`swapToNext` took the lowest utilisation without excluding full members) | done | claude-20261107-swap-skip-full | swap-skip-full | | | `swapToNext` now excludes members at 100% on any window; unknown usage ranks after known headroom; nothing eligible means no swap and a clear message. `swap to <name>` unchanged. Tests in `test/identities/pool/core.test.ts`. |
-| 142 | Gateway-routed swap identity: subscriber-mode gateway entry instead of real OAuth | in_progress | claude-20261107-gw-oauth-identity | gateway-oauth-identity | 4.131 | | Was 132 (id clash). Owner decision: Claude Code in OAuth (subscriber) mode shows the native wait/continue menu; API-key mode does not.<br>For a pool whose settings route ANTHROPIC_BASE_URL at the local proxy or gateway, swap and heal write a claudeAiOauth entry holding the agents-claude gateway token (refreshToken null, far-future expiry, scope user:inference, subscriptionType max, 0600) and never a member login. A /login inside the identity is rescued to its member or backed up, then the entry is restored. apiKeyHelper is removed from the identity settings. Gateway pool dirs are excluded from member credential convergence. |
+| 142 | Gateway-routed swap identity: subscriber-mode gateway entry instead of real OAuth | in_progress | claude-20261107-gw-oauth-identity | gateway-oauth-identity | 4.131 | | Was 132 (id clash).<br>Owner decision: Claude Code in OAuth (subscriber) mode shows the native wait/continue menu; API-key mode does not.<br>Gateway pools: swap and heal write a claudeAiOauth entry holding the gateway token (never a member login), restore it after /login, and drop apiKeyHelper. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
 ETA: 2026-11-14 18:00 ICT
@@ -168,8 +168,9 @@ ETA: 2026-11-14 18:00 ICT
 | 132 | Usage collector: cut per-cycle disk reads and writes (pool cache, unchanged exports) | done | claude-20261106-usage-io-diet | usage-io-diet | | | Was 129 (clash with the console row).<br>Merged PR #385 (df330fe), deployed 7 Nov 02:42 ICT.<br>Follow-up in 5.133. |
 | 133 | Usage collector: per-partition Tokscale cache and sampled Codex resumes | in_review | claude-20261107-usage-io-2 | ais-usage-io-2 | 5.132 | 2026-11-07 18:00 ICT | Live: each Claude export read the whole 611 MB namespace, each Codex export 337 MB (~8 of ~10 GB per round).<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/392.<br>Open: swap-pool batch rewrite (~530 MB written per cycle), Grok re-reads ~0.9 GB. |
 | 138 | Usage collector: segmented native batch so a changed cycle writes only changed segments | in_review | claude-20261107-usage-segmented-batch | ais-usage-segmented-batch | 5.133 | 2026-11-07 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/395.<br>Fixture: changed cycle writes and reads 14 MB instead of 119 MB.<br>Also: scope sweep needs only registries of used tools (5.133 review low).<br>Was 134. |
-| 141 | Gateway cost: fetch a public model price list so new models are priced with no code edit | done | claude-20261107-auto-model-prices | auto-model-prices | | | Source: LiteLLM price list, cached daily under the AIS home, hand table as fallback.<br>Rows stored with NULL cost are priced from tokens and model at read time (ledger not rewritten).<br>Unknown models warn once per process. |
-| 143 | Usage collector: unchanged Grok sources cost only a stat; unified log reads referenced sessions only | in_review | claude-20261107-grok-stat-only | ais-usage-grok-stat-only | 5.138 | 2026-11-08 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/412.<br>Live: 763 MB read per cycle (all 13k sessions sampled and parsed).<br>Fixture, log appended: 107.2 MB to 4.4 MB.<br>Review race fixed (pre-read and pre-listing signatures).<br>Needs rebuild of the live binary after merge. |
+| 145 | Gateway cost: fetch a public model price list so new models are priced with no code edit | done | claude-20261107-auto-model-prices | auto-model-prices | | | Source: LiteLLM price list, cached daily under the AIS home, hand table as fallback.<br>Rows stored with NULL cost are priced from tokens and model at read time (ledger not rewritten).<br>Unknown models warn once per process.<br>Was 141. |
+| 143 | Usage collector: unchanged Grok sources cost only a stat; unified log reads referenced sessions only | done | claude-20261107-grok-stat-only | ais-usage-grok-stat-only | 5.138 | | PR https://github.com/DynacomSolutions/AiSwitcher/pull/412 merged as 51a7e13.<br>Fixture, log appended: 107.2 MB to 4.4 MB.<br>Live binary needs a rebuild.<br>Follow-up in 5.144. |
+| 144 | Grok unified log: stream the log twice; keep pre-1970 workspaces in the parse | in_review | claude-20261107-grok-followup | ais-usage-grok-followup | 5.143 | 2026-11-08 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/413.<br>Re-review lows of 5.143: whole log held in memory; pre-1970 workspace lost session metadata. |
 
 ## 6. Browser control extension
 ETA: 2026-11-14 18:00 ICT
@@ -179,8 +180,8 @@ ETA: 2026-11-14 18:00 ICT
 | 120 | AIS Browser: Chrome extension agents drive via the gateway | done | claude-20261104-browser | ais-browser | | | Shipped in v0.5.24 + v0.5.25<br>PRs #360 #364 #365 #367<br>Gateway live (.cluster #2131) |
 | 121 | Release v0.5.24 with extension zip | done | Thomas | | | | Released v0.5.24 with ais-browser-extension.zip |
 | 122 | Install on Mac and pair profiles | blocked_on_owner | Thomas | | 6.121 | | ais update (needs 0.5.24)<br>ais browser extension update<br>chrome://extensions: Developer mode, Load unpacked ~/.ais/browser-extension, each profile<br>Options: wss:// gateway URL, Sign in<br>Approve code on the gateway host: ais browser approve CODE --pool=NAME or --identity=ID |
-| 141 | Extension update: public download | in_progress | Claude | ext-public-download | | 2026-11-07 14:00 ICT | `ais browser extension update` failed with HTTP 401 on stale gh/GitHub credentials.<br>Use the shared anonymous release-asset download instead. |
-| 142 | Extension one-click sign-in + redesign | in_progress | Claude | ext-signin-redesign | | 2026-11-07 22:00 ICT | Side panel: AIS address + Connect, approve on console page /browser/authorize, no options page.<br>Console approves via gateway admin server-side. |
+| 146 | Extension update: public download | in_progress | Claude | ext-public-download | | 2026-11-07 14:00 ICT | `ais browser extension update` failed with HTTP 401 on stale gh/GitHub credentials.<br>Use the shared anonymous release-asset download instead.<br>Was 141. |
+| 147 | Extension one-click sign-in + redesign | in_progress | Claude | ext-signin-redesign | | 2026-11-07 22:00 ICT | Side panel: AIS address + Connect, approve on console page /browser/authorize, no options page.<br>Console approves via gateway admin server-side.<br>Was 142. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-14 18:00 ICT
@@ -190,15 +191,15 @@ ETA: 2026-11-14 18:00 ICT
 | 127 | One host-level profile-sync watcher instead of a scan per session sidecar | in_review | claude-20261105-sync-daemon | perf/host-profile-sync-daemon | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/375<br>`ais __profile_sync_daemon`, 30 s poll; sidecars only register.<br>`ais update` and install:shims install and start the unit; not installed on any host yet.<br>Was 124. |
 
 ## 8. Gateway client under a base path
-ETA: 2026-11-07 22:00 ICT
+ETA: 2026-11-14 18:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 142 | Prove gateway clients keep a base path such as /gateway | in_progress | claude | gateway-url-path | | 2026-11-07 22:00 ICT | No built-in gateway host exists; URL comes from AIS_GATEWAY_PROXY_URL only<br>Tests for local proxy and browser shim; docs use example.com |
+| 148 | Prove gateway clients keep a base path such as /gateway | in_progress | claude | gateway-url-path | | 2026-11-07 22:00 ICT | No built-in gateway host exists; URL comes from AIS_GATEWAY_PROXY_URL only<br>Tests for local proxy and browser shim; docs use example.com<br>Was 142. |
 
 ## 9. Console image security
 ETA: 2026-11-08 12:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 144 | Console image pulls Debian security updates so Trivy passes | in_progress | claude | console-zlib-cve | | 2026-11-08 12:00 ICT | .cluster "AIS console image" Trivy fails on zlib1g CVE-2026-76844 and CVE-2026-85091 (fixed in deb13u1) since 2026-11-07.<br>Prod console missed PR #409 because of it.<br>Fix: apt-get upgrade in the final stage. |
+| 149 | Console image pulls Debian security updates so Trivy passes | in_progress | claude | console-zlib-cve | | 2026-11-08 12:00 ICT | .cluster "AIS console image" Trivy fails on zlib1g CVE-2026-76844 and CVE-2026-85091 (fixed in deb13u1) since 2026-11-07.<br>Prod console missed PR #409 because of it.<br>Fix: apt-get upgrade in the final stage. |

@@ -1,8 +1,8 @@
 diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
-index 529b828..5102f21 100644
+index 529b828..efd2b3a 100644
 --- a/crates/tokscale-core/src/lib.rs
 +++ b/crates/tokscale-core/src/lib.rs
-@@ -14911,6 +14911,269 @@ mod tests {
+@@ -14911,6 +14911,307 @@ mod tests {
          }
      }
  
@@ -73,6 +73,44 @@ index 529b828..5102f21 100644
 +                ),
 +            )
 +            .unwrap();
++        }
++    }
++
++    /// Re-review of #412: a workspace whose mtime predates 1970 has no stat
++    /// signature. Its sessions must still give their metadata to the parse
++    /// (the fingerprint, not the parse, gives up), cold and warm.
++    #[test]
++    #[serial_test::serial]
++    fn rev412b_pre_epoch_workspace_mtime_drops_metadata() {
++        let cache_home = tempfile::TempDir::new().unwrap();
++        let home = tempfile::TempDir::new().unwrap();
++        let _env = redirect_cache_home(cache_home.path());
++        let workspace = home.path().join(".grok/sessions/%2Ftmp%2Fold");
++        ais_grok_session(&workspace.join("s1"), "grok-a", None);
++        let logs = home.path().join(".grok/logs");
++        std::fs::create_dir_all(&logs).unwrap();
++        std::fs::write(
++            logs.join("unified.jsonl"),
++            ais_grok_inference("s1", 11, 1, 100),
++        )
++        .unwrap();
++        let pre_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(24 * 60 * 60);
++        std::fs::File::open(&workspace)
++            .unwrap()
++            .set_modified(pre_epoch)
++            .unwrap();
++        assert!(crate::message_cache::metadata_signature(&workspace).is_err());
++
++        for scan in ["cold", "warm"] {
++            let rows = ais_grok_rows(&parse_all_messages_with_pricing_with_env_strategy(
++                home.path().to_str().unwrap(),
++                &["grok".to_string()],
++                None,
++                false,
++                &scanner::ScannerSettings::default(),
++            ));
++            assert_eq!(rows.len(), 1, "{scan} scan");
++            assert_eq!(rows[0].1, "grok-a", "{scan} scan");
 +        }
 +    }
 +
@@ -559,7 +597,7 @@ index f30710a..d814920 100644
      fn test_kiro_ide_fingerprint_tracks_messages_sidecar_changes() {
          let dir = TempDir::new().unwrap();
 diff --git a/crates/tokscale-core/src/sessions/grok.rs b/crates/tokscale-core/src/sessions/grok.rs
-index 74c3c92..a05792c 100644
+index 74c3c92..3c06980 100644
 --- a/crates/tokscale-core/src/sessions/grok.rs
 +++ b/crates/tokscale-core/src/sessions/grok.rs
 @@ -18,7 +18,7 @@ use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
@@ -567,11 +605,11 @@ index 74c3c92..a05792c 100644
  use serde_json::Value;
  use std::collections::{HashMap, HashSet};
 -use std::io::{BufReader, Read, Seek, SeekFrom};
-+use std::io::{BufRead, BufReader, Read};
++use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
  use std::path::{Path, PathBuf};
  
  const CLIENT_ID: &str = "grok";
-@@ -27,10 +27,39 @@ const UNKNOWN_MODEL: &str = "grok-unknown";
+@@ -27,10 +27,41 @@ const UNKNOWN_MODEL: &str = "grok-unknown";
  const UNIFIED_LOG_DEDUP_PREFIX: &str = "grok-unified:";
  const LEGACY_UNIFIED_TIMESTAMP_TOLERANCE_MS: u64 = 250;
  
@@ -598,7 +636,9 @@ index 74c3c92..a05792c 100644
 +/// listed, and its session directories named by the log.
 +struct UnifiedWorkspace {
 +    dir: PathBuf,
-+    listed_signature: (u64, u64),
++    /// `Err` when it could not be stat'ed (for example an mtime before
++    /// 1970); the parse still uses the workspace, the fingerprint cannot.
++    listed_signature: Result<(u64, u64), ()>,
 +    sessions: Vec<PathBuf>,
 +}
 +
@@ -612,7 +652,7 @@ index 74c3c92..a05792c 100644
  
  #[derive(Debug, Clone, PartialEq, Eq, Hash)]
  struct UnifiedChildScope {
-@@ -52,6 +81,8 @@ struct UnifiedChildEvidence {
+@@ -52,6 +83,8 @@ struct UnifiedChildEvidence {
      terminal_scopes: HashSet<UnifiedChildScope>,
      terminal_models: HashMap<UnifiedChildScope, UnifiedModelEvidence>,
      child_session_ids: HashSet<String>,
@@ -621,7 +661,7 @@ index 74c3c92..a05792c 100644
  }
  
  fn authoritative_model(value: Option<&Value>) -> Option<String> {
-@@ -717,13 +748,21 @@ fn parse_grok_unified_log_snapshot(
+@@ -717,13 +750,20 @@ fn parse_grok_unified_log_snapshot(
      file: &mut std::fs::File,
      prefix_len: u64,
  ) -> Vec<UnifiedMessage> {
@@ -632,33 +672,19 @@ index 74c3c92..a05792c 100644
 +        .push(path.to_path_buf());
      let fallback_timestamp = file_modified_timestamp_ms(path);
 -    let evidence = collect_unified_child_evidence(file, prefix_len);
--    if file.seek(SeekFrom::Start(0)).is_err() {
--        return Vec::new();
--    }
--
++    // Two streamed passes over the same bounded prefix; the log is never
++    // held in memory whole.
++    let evidence = collect_unified_child_evidence(BufReader::new(&mut *file).take(prefix_len));
+     if file.seek(SeekFrom::Start(0)).is_err() {
+         return Vec::new();
+     }
+ 
 -    let metadata_by_session = read_unified_session_metadata(path);
-+    // AIS: read the bounded prefix once; both passes walk the same bytes.
-+    // A read error keeps what was read, as the line reader stopped there.
-+    let mut bytes = Vec::new();
-+    let _ = BufReader::new(file)
-+        .take(prefix_len)
-+        .read_to_end(&mut bytes);
-+    let evidence = collect_unified_child_evidence(bytes.as_slice());
-+
 +    let metadata_by_session = read_unified_session_metadata(path, &evidence.referenced_session_ids);
      let mut generations = HashMap::new();
      let mut fallback_model_by_pid: HashMap<UnifiedProcessKey, String> = HashMap::new();
      let mut model_by_pid_and_session: HashMap<UnifiedProcessSessionKey, String> = HashMap::new();
-@@ -731,7 +770,7 @@ fn parse_grok_unified_log_snapshot(
-     let mut seen = HashSet::new();
-     let mut messages = Vec::new();
- 
--    for line in lossy_lines(BufReader::new(file).take(prefix_len)) {
-+    for line in lossy_lines(bytes.as_slice()) {
-         if line.trim().is_empty() {
-             continue;
-         }
-@@ -936,14 +975,11 @@ fn parse_grok_unified_log_snapshot(
+@@ -936,14 +976,11 @@ fn parse_grok_unified_log_snapshot(
      messages
  }
  
@@ -675,7 +701,7 @@ index 74c3c92..a05792c 100644
          if line.trim().is_empty() {
              continue;
          }
-@@ -956,6 +992,16 @@ fn collect_unified_child_evidence(
+@@ -956,6 +993,16 @@ fn collect_unified_child_evidence(
          }
  
          let message_name = value.get("msg").and_then(Value::as_str);
@@ -692,7 +718,7 @@ index 74c3c92..a05792c 100644
          let is_spawn = message_name == Some("subagent spawn credentials");
          let is_terminal = matches!(message_name, Some("subagent completed" | "subagent failed"));
          if !is_spawn && !is_terminal {
-@@ -1001,10 +1047,18 @@ pub fn parse_grok_file(path: &Path) -> Vec<UnifiedMessage> {
+@@ -1001,10 +1048,18 @@ pub fn parse_grok_file(path: &Path) -> Vec<UnifiedMessage> {
  }
  
  /// Return the files and directories that can affect metadata attached to a
@@ -715,7 +741,7 @@ index 74c3c92..a05792c 100644
  pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
      if path.file_name().and_then(|name| name.to_str()) != Some("unified.jsonl") {
          let parent = path.parent().unwrap_or_else(|| Path::new("."));
-@@ -1013,27 +1067,53 @@ pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
+@@ -1013,27 +1068,56 @@ pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
              .map(|name| (name.to_string(), parent.join(name)))
              .collect();
      }
@@ -767,11 +793,14 @@ index 74c3c92..a05792c 100644
 +    )];
 +    for workspace in tree.workspaces {
 +        let workspace_suffix = cache_path_suffix(grok_home, &workspace.dir);
++        // A workspace without a signature leaves the log uncached, as an
++        // unreadable related file did upstream.
++        let listed_signature = workspace.listed_signature.ok()?;
          related.push((
              format!("sessions-workspace:{workspace_suffix}"),
 -            workspace_dir.clone(),
 +            workspace.dir.clone(),
-+            Some(Some(workspace.listed_signature)),
++            Some(Some(listed_signature)),
          ));
 -        for session_dir in session_dirs {
 +        for session_dir in workspace.sessions {
@@ -783,7 +812,7 @@ index 74c3c92..a05792c 100644
              ));
              for file_name in [
                  "updates.jsonl",
-@@ -1044,12 +1124,13 @@ pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
+@@ -1044,12 +1128,13 @@ pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
                  related.push((
                      format!("sessions-file:{session_suffix}/{file_name}"),
                      session_dir.join(file_name),
@@ -798,7 +827,7 @@ index 74c3c92..a05792c 100644
  }
  
  #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-@@ -1512,13 +1593,32 @@ fn fallback_unified_metadata(session_id: &str, timestamp: i64) -> GrokMetadata {
+@@ -1512,13 +1597,32 @@ fn fallback_unified_metadata(session_id: &str, timestamp: i64) -> GrokMetadata {
      }
  }
  
@@ -834,7 +863,7 @@ index 74c3c92..a05792c 100644
          let workspace_key = workspace_dir
              .file_name()
              .and_then(|name| name.to_str())
-@@ -1535,6 +1635,11 @@ fn read_unified_session_metadata(path: &Path) -> HashMap<String, GrokMetadata> {
+@@ -1535,6 +1639,11 @@ fn read_unified_session_metadata(path: &Path) -> HashMap<String, GrokMetadata> {
                  continue;
              };
  
@@ -846,7 +875,7 @@ index 74c3c92..a05792c 100644
              let updates_path = session_dir.join("updates.jsonl");
              let metadata = if updates_path.is_file() {
                  read_metadata(&updates_path)
-@@ -1555,12 +1660,25 @@ fn read_unified_session_metadata(path: &Path) -> HashMap<String, GrokMetadata> {
+@@ -1555,12 +1664,25 @@ fn read_unified_session_metadata(path: &Path) -> HashMap<String, GrokMetadata> {
      metadata_by_session
  }
  
@@ -876,15 +905,12 @@ index 74c3c92..a05792c 100644
      };
  
      for entry in entries.flatten() {
-@@ -1568,9 +1686,18 @@ fn unified_session_tree(path: &Path) -> Option<(PathBuf, UnifiedSessionTree)> {
+@@ -1568,9 +1690,15 @@ fn unified_session_tree(path: &Path) -> Option<(PathBuf, UnifiedSessionTree)> {
          if !workspace_dir.is_dir() {
              continue;
          }
-+        // A workspace that vanished since the root listing is skipped; the
-+        // root's pre-listing signature no longer matches, so it is seen.
-+        let Ok(listed_signature) = crate::message_cache::metadata_signature(&workspace_dir) else {
-+            continue;
-+        };
++        let listed_signature =
++            crate::message_cache::metadata_signature(&workspace_dir).map_err(|_| ());
          let mut session_dirs = Vec::new();
          if let Ok(entries) = std::fs::read_dir(&workspace_dir) {
              for entry in entries.flatten() {
@@ -895,7 +921,7 @@ index 74c3c92..a05792c 100644
                  let session_dir = entry.path();
                  if session_dir.is_dir() {
                      session_dirs.push(session_dir);
-@@ -1578,11 +1705,19 @@ fn unified_session_tree(path: &Path) -> Option<(PathBuf, UnifiedSessionTree)> {
+@@ -1578,11 +1706,19 @@ fn unified_session_tree(path: &Path) -> Option<(PathBuf, UnifiedSessionTree)> {
              }
          }
          session_dirs.sort_unstable();
