@@ -754,9 +754,11 @@ describe("failover and refresh", () => {
     handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-b" ? new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(week) } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
     const tx = await addApp(baseApp({ name: "x", target: { kind: "pool", identities: ["a", "b"] } }));
     const ty = await addApp(baseApp({ name: "y", target: { kind: "pool", identities: ["c"] } }));
-    expect((await call("/x/v1/messages", tx, { method: "POST", body: "{}" })).status).toBe(429);
-    expect((await call("/y/v1/messages", ty, { method: "POST", body: "{}" })).status).toBe(502);
-    const res = await call("/x/v1/messages", tx, { method: "POST", body: "{}" });
+    const gw = createGatewayApp(deps);
+    const go = (path: string, token: string) => gw.request(`http://gw.test${path}`, { method: "POST", body: "{}", headers: { authorization: `Bearer ${token}` } });
+    expect((await go("/x/v1/messages", tx)).status).toBe(429);
+    expect((await go("/y/v1/messages", ty)).status).toBe(502);
+    const res = await go("/x/v1/messages", tx);
     expect(res.status).toBe(429);
     expect(await res.text()).not.toContain("logged out");
   });
