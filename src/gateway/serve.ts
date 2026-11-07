@@ -262,6 +262,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     backend: refreshBackend,
     metrics,
     onDegraded: (account, why) => alerter.raise("refresh-guard-degraded", `${account.provider}/${account.identity}`, `the refresh guard is unavailable (${why}); refreshing under the file lock and compare-and-swap only`),
+    onInterrupted: (account, count) => {
+      const key = `${account.provider}/${account.identity}`;
+      if (count >= 2) alerter.raise("refresh-interrupted", key, `refreshes of the ${account.provider} login "${account.identity}" keep ending with an unknown outcome (${count} times); the token is retried, check the gateway and the provider`);
+      else alerter.recover("refresh-interrupted", key);
+    },
     onHealthy: (account) => alerter.recover("refresh-guard-degraded", `${account.provider}/${account.identity}`),
   });
   const instrumented = instrumentRefresh(guarded, { metrics, alerter, failed: failedTokens });

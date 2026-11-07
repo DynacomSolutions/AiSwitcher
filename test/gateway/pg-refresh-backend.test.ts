@@ -133,21 +133,52 @@ if (!url && process.env.CI && !optOut) {
       expect(rows).toBe(1);
     });
 
-    test("retention removes old resolved rows but keeps open claims and rotated-out evidence", async () => {
+    test("acquires that time out never leak a connection or the lock", async () => {
+      await prepare();
+      const holder = open();
+      const waiter = open();
+      const held = await holder.acquire(account, 1000);
+      // More timed-out acquires than the pool has connections: a leak would exhaust it.
+      for (let i = 0; i < 14; i += 1) await expect(waiter.acquire(account, 120)).rejects.toMatchObject({ timedOut: true });
+      await held.release();
+      const got = await waiter.acquire(account, 2000);
+      await got.release();
+      // A deadline that has already passed never reserves or locks anything.
+      await expect(waiter.acquire(account, 0)).rejects.toMatchObject({ timedOut: true });
+      const again = await waiter.acquire(account, 2000);
+      await again.release();
+    });
+
+    test("resolveFresh writes through the pool, not the lock's connection", async () => {
+      await prepare();
+      const lock = await open().acquire(account, 1000);
+      const id = await lock.claim("fresh001", "pod-1");
+      await lock.resolveFresh?.(id, "failed");
+      expect((await lock.findByOldFp("fresh001"))[0]).toMatchObject({ outcome: "failed" });
+      await lock.release();
+    });
+
+    test("retention removes old resolved rows but keeps open claims and rotated-out evidence for longer", async () => {
       await prepare();
       const backend = open();
       const admin = new SQL(url as string);
+      const old = async (fp: string, outcome: string | null, days: number): Promise<void> => {
+        await admin`INSERT INTO gateway_refresh_journal (provider, identity, holder, old_fp, new_fp, outcome, ts, resolved_at)
+          VALUES ('claude', 'ret', 'h', ${fp}, ${outcome === "refreshed" ? "n" : null}, ${outcome}, now() - make_interval(days => ${days}), ${outcome === null ? null : new Date()})`;
+      };
       try {
-        for (let i = 0; i < 60; i += 1) {
-          await admin`INSERT INTO gateway_refresh_journal (provider, identity, holder, old_fp, outcome, ts, resolved_at) VALUES ('claude', 'ret', 'h', ${`f${i}`}, 'failed', now() - interval '90 days', now() - interval '90 days')`;
-        }
-        await admin`INSERT INTO gateway_refresh_journal (provider, identity, holder, old_fp, outcome, ts) VALUES ('claude', 'ret', 'h', 'lostfp', 'lost', now() - interval '90 days')`;
-        await admin`INSERT INTO gateway_refresh_journal (provider, identity, holder, old_fp, ts) VALUES ('claude', 'ret', 'h', 'openfp', now() - interval '90 days')`;
+        await old("evid90", "refreshed", 90);
+        await old("evid400", "refreshed", 400);
+        await old("lostfp", "lost", 90);
+        await old("openfp", null, 90);
+        for (let i = 0; i < 60; i += 1) await old(`plain${i}`, "failed", 90);
+        for (let i = 0; i < 50; i += 1) await old(`new${i}`, "failed", 0);
         const removed = await backend.prune(30 * 86_400_000);
-        expect(removed).toBe(12); // 62 oldest rows beyond the newest 50 are candidates; the 'lost' one is kept
-        const left = await admin`SELECT old_fp FROM gateway_refresh_journal WHERE identity = 'ret'`;
-        expect(left.some((r: { old_fp: string }) => r.old_fp === "lostfp")).toBe(true);
-        expect(left.some((r: { old_fp: string }) => r.old_fp === "openfp")).toBe(true);
+        expect(removed).toBe(61); // 60 plain rows and evid400; evid90, lost and open stay
+        const left = (await admin`SELECT old_fp FROM gateway_refresh_journal WHERE identity = 'ret'`).map((r: { old_fp: string }) => r.old_fp);
+        for (const keep of ["evid90", "lostfp", "openfp", "new0"]) expect(left).toContain(keep);
+        expect(left).not.toContain("evid400");
+        expect(left).not.toContain("plain3");
       } finally {
         await admin.close();
       }

@@ -135,15 +135,49 @@ describe("refresh guard", () => {
     expect(backend.entries.map((e) => e.outcome)).toEqual(["interrupted", "refreshed"]);
   });
 
-  test("a token whose attempts were interrupted twice is refused, not retried forever", async () => {
+  test("A2: repeated unknown outcomes keep retrying and alert from the second; the token is never refused for it", async () => {
     const w = world();
     const backend = new MemoryRefreshBackend();
     const fp = grantFingerprint(w.grant);
     await seedOpenClaim(backend, fp);
     await seedOpenClaim(backend, fp);
-    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read });
-    await expect(guard("claude", ID, { force: true })).rejects.toThrow(/never finished twice/);
-    expect(w.posts).toBe(0);
+    const counts: number[] = [];
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, onInterrupted: (_a, n) => void counts.push(n) });
+    const res = await guard("claude", ID, { force: true });
+    expect(res.outcome).toBe("refreshed");
+    expect(w.posts).toBe(1);
+    expect(counts[0]).toBe(2); // alert level reached, request still sent
+    expect(counts.at(-1)).toBe(0); // cleared on success
+  });
+
+  test("A2 (network blips): two blips between claim and resolve do not strand a token the provider never received", async () => {
+    const state = { down: false };
+    const w = world();
+    const inner = new MemoryRefreshBackend();
+    let blips = 2;
+    const refresh = (async (tool: string, id: { name: string }, o?: { force?: boolean; beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
+      await o?.beforePost?.({ fingerprint: grantFingerprint(w.grant) });
+      if (blips-- > 0) {
+        state.down = true;
+        throw new Error("ECONNREFUSED (request never left the pod)");
+      }
+      return (w.refresh as unknown as (...a: unknown[]) => Promise<unknown>)(tool, id, { ...o, beforePost: undefined });
+    }) as never;
+    const backend: RefreshGuardBackend = {
+      acquire: async (a, t) => {
+        const h = await inner.acquire(a, t);
+        // The lock's own connection is broken while the blip lasts; fresh-connection retries still work.
+        return { ...h, resolve: async (...x) => { if (state.down) throw new Error("conn reset"); return h.resolve(...x); } };
+      },
+    };
+    const guard = guardRefresh(refresh, { backend, metrics: metricsOf(), readGrant: w.read, warn: () => {}, callTimeoutMs: 50 });
+    await expect(guard("claude", ID, { force: true })).rejects.toThrow(/ECONNREFUSED/);
+    state.down = false;
+    await expect(guard("claude", ID, { force: true })).rejects.toThrow(/ECONNREFUSED/);
+    state.down = false;
+    const third = await guard("claude", ID, { force: true });
+    expect(third.outcome).toBe("refreshed");
+    expect(w.posts).toBe(1);
   });
 
   test("crash recovery: when the newer grant reached the stores the stale claim is recovered and the newest token is used", async () => {
@@ -170,11 +204,56 @@ describe("refresh guard", () => {
     expect(w.reusedTokenPosts).toBe(0);
   });
 
-  test("a refresh whose write-through failed blocks reuse of the spent token", async () => {
+  test("a refresh whose write-through failed is journalled lost, and the next attempt is sent once for the provider to judge", async () => {
     const w = world({ failWrite: true });
-    const guard = guardRefresh(w.refresh, { backend: new MemoryRefreshBackend(), metrics: metricsOf(), readGrant: w.read });
+    const backend = new MemoryRefreshBackend();
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read });
     const res = await guard("claude", ID, { force: true });
     expect(res.outcome).toBe("failed");
+    expect(backend.entries[0]?.outcome).toBe("lost");
+    const again = await guard("claude", ID, { force: true });
+    expect(again.outcome).toBe("failed");
+    expect(w.posts).toBe(2);
+  });
+
+  test("C: an acquire that completes after the outer bound releases its late handle instead of leaking the account lock", async () => {
+    const w = world();
+    const inner = new MemoryRefreshBackend();
+    let slow = true;
+    const backend: RefreshGuardBackend = {
+      acquire: async (a, t) => {
+        const h = await inner.acquire(a, t);
+        if (slow) {
+          slow = false;
+          await sleep(120);
+        }
+        return h;
+      },
+    };
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, warn: () => {}, lockTimeoutMs: 50, callTimeoutMs: 20 });
+    const first = await guard("claude", ID, { force: true }); // the outer bound fires: degraded refresh
+    expect(first.outcome).toBe("refreshed");
+    await sleep(100); // the late handle arrives and is released
+    const second = await guard("claude", ID, { force: true });
+    expect(second.outcome).not.toBeUndefined();
+    expect(inner.entries.some((e) => e.outcome === "refreshed")).toBe(true);
+  });
+
+  test("degraded mode still refuses a token this process saw rotated out", async () => {
+    const w = world();
+    let down = false;
+    const inner = new MemoryRefreshBackend();
+    const backend: RefreshGuardBackend = {
+      acquire: async (a, t) => {
+        if (down) throw new Error("connect refused");
+        return inner.acquire(a, t);
+      },
+    };
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read });
+    const old = w.grant;
+    await guard("claude", ID, { force: true });
+    w.grant = old;
+    down = true;
     await expect(guard("claude", ID, { force: true })).rejects.toThrow(/rotated out/);
     expect(w.posts).toBe(1);
   });
@@ -264,6 +343,19 @@ describe("refresh guard", () => {
     expect(backend.entries.map((e) => e.outcome)).toEqual(["refreshed"]);
   });
 
+  test("resolve retries go through a fresh connection when the lock's own one is broken", async () => {
+    const w = world();
+    const backend = new MemoryRefreshBackend();
+    const orig = backend.acquire.bind(backend);
+    backend.acquire = async (...a) => {
+      const h = await orig(...a);
+      return { ...h, resolve: async () => { throw new Error("conn reset"); }, resolveFresh: (...r) => h.resolve(...r) };
+    };
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, warn: () => {} });
+    await guard("claude", ID, { force: true });
+    expect(backend.entries.map((e) => e.outcome)).toEqual(["refreshed"]);
+  });
+
   test("lock wait beyond the timeout is a timed-out lock error", async () => {
     const w = world();
     const backend = new MemoryRefreshBackend();
@@ -290,6 +382,12 @@ describe("refresh guard", () => {
     const removed = await backend.prune(30 * 86_400_000);
     expect(removed).toBe(80 - 48);
     expect(backend.entries.some((e) => e.oldFp === "lostfp")).toBe(true);
+    backend.entries.push({ id: 102, ts: new Date(Date.now() - 400 * 86_400_000).toISOString(), ...ACCOUNT, holder: "h", oldFp: "ancient", newFp: "z", outcome: "refreshed" });
+    backend.entries.push({ id: 103, ts: new Date(Date.now() - 90 * 86_400_000).toISOString(), ...ACCOUNT, holder: "h", oldFp: "evidence", newFp: "y", outcome: "refreshed" });
+    for (let i = 0; i < 60; i += 1) backend.entries.push({ id: 200 + i, ts: new Date().toISOString(), ...ACCOUNT, holder: "h", oldFp: `n${i}`, outcome: "failed" });
+    await backend.prune(30 * 86_400_000);
+    expect(backend.entries.some((e) => e.oldFp === "evidence")).toBe(true); // rotated-out evidence outlives ordinary rows
+    expect(backend.entries.some((e) => e.oldFp === "ancient")).toBe(false);
     expect(backend.entries.some((e) => e.oldFp === "openfp")).toBe(true);
   });
 });

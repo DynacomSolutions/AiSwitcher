@@ -48,6 +48,8 @@ export interface RefreshJournalOps {
   closeStale(currentFp: string): Promise<number>;
   claim(oldFp: string, holder: string): Promise<number>;
   resolve(id: number, outcome: JournalOutcome, newFp?: string): Promise<void>;
+  /** Same write on a fresh connection, for retries after the lock's own connection failed. Defaults to `resolve`. */
+  resolveFresh?(id: number, outcome: JournalOutcome, newFp?: string): Promise<void>;
 }
 
 export interface RefreshLockHandle extends RefreshJournalOps {
@@ -62,7 +64,10 @@ export interface RefreshLockHandle extends RefreshJournalOps {
 export interface RefreshGuardBackend {
   /** Resolves once this caller is the only holder for the account; rejects with a timed-out SwapLockError. */
   acquire(account: RefreshAccount, timeoutMs: number): Promise<RefreshLockHandle>;
-  /** Deletes resolved journal rows older than `retentionMs`, always keeping the newest rows per account and any rotated-out evidence. */
+  /**
+   * Deletes resolved journal rows older than `retentionMs`, always keeping the newest rows per account. Rows that are
+   * rotated-out evidence (`refreshed`, `lost`, `interrupted`) are kept EVIDENCE_RETENTION_FACTOR times as long.
+   */
   prune?(retentionMs: number): Promise<number>;
   close?(): Promise<void>;
 }
@@ -84,6 +89,8 @@ export class RefreshGuardRetryable extends Error {
 class RefreshRefused extends OAuthRefreshError {}
 
 export const JOURNAL_RETENTION_MS = 30 * 24 * 3_600_000;
+/** Rotated-out evidence outlives other rows by this factor (30 days x 12 = a year). */
+export const EVIDENCE_RETENTION_FACTOR = 12;
 export const DEFAULT_LOCK_TIMEOUT_MS = 60_000;
 export const BACKEND_CALL_TIMEOUT_MS = 5_000;
 /** Resolved rows kept per account whatever their age. */
@@ -159,7 +166,9 @@ export class MemoryRefreshBackend implements RefreshGuardBackend {
     for (const e of this.entries) perAccount.set(`${e.provider}\u0000${e.identity}`, [...(perAccount.get(`${e.provider}\u0000${e.identity}`) ?? []), e]);
     for (const rows of perAccount.values()) for (const e of rows.sort((a, b) => b.id - a.id).slice(0, JOURNAL_KEEP_PER_ACCOUNT)) keep.add(e.id);
     const before = this.entries.length;
-    const kept = this.entries.filter((e) => keep.has(e.id) || e.outcome === undefined || e.outcome === "lost" || e.outcome === "interrupted" || Date.parse(e.ts) >= cutoff);
+    const evidenceCutoff = Date.now() - retentionMs * EVIDENCE_RETENTION_FACTOR;
+    const evidence = (e: JournalEntry): boolean => e.outcome === "refreshed" || e.outcome === "lost" || e.outcome === "interrupted";
+    const kept = this.entries.filter((e) => keep.has(e.id) || e.outcome === undefined || Date.parse(e.ts) >= (evidence(e) ? evidenceCutoff : cutoff));
     this.entries.length = 0;
     this.entries.push(...kept);
     return before - kept.length;
@@ -178,6 +187,8 @@ export interface GuardDeps {
   callTimeoutMs?: number;
   /** The guard could not run for this account and the refresh went ahead on the file lock alone. */
   onDegraded?(account: RefreshAccount, reason: string): void;
+  /** Consecutive interrupted attempts with the current refresh token (0 once it is cleared). Alert from 2 up. */
+  onInterrupted?(account: RefreshAccount, count: number): void;
   /** The guard worked again for this account. */
   onHealthy?(account: RefreshAccount): void;
   warn?(message: string): void;
@@ -211,6 +222,13 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
   const callMs = deps.callTimeoutMs ?? BACKEND_CALL_TIMEOUT_MS;
   const read = deps.readGrant ?? defaultReadGrant;
   const warn = deps.warn ?? ((m: string) => console.warn(`gateway: ${m}`));
+  /** Refresh tokens this process saw rotated out (bounded), for the stretches when the journal cannot be read. */
+  const rotatedOut = new Set<string>();
+  const markRotatedOut = (key: string): void => {
+    rotatedOut.add(key);
+    if (rotatedOut.size > 2000) rotatedOut.delete(rotatedOut.values().next().value as string);
+  };
+  const ROTATED_OUT_MESSAGE = "refresh refused: this refresh token was already rotated out (journal) and is not sent again; the newer grant is missing from the stores";
 
   return (async (tool, identity, opts) => {
     const account: RefreshAccount = { provider: tool, identity: identity.name };
@@ -225,9 +243,12 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
     const before = await read(tool, identity, opts?.claudeRegistryPath).catch(() => undefined);
 
     let lock: RefreshLockHandle;
+    const acquiring = deps.backend.acquire(account, lockTimeoutMs);
     try {
-      lock = await bounded(deps.backend.acquire(account, lockTimeoutMs), lockTimeoutMs + callMs, "refresh lock");
+      lock = await bounded(acquiring, lockTimeoutMs + callMs, "refresh lock");
     } catch (err) {
+      // A handle that arrives after the outer bound is nobody's: release it, or the account stays locked for good.
+      acquiring.then((late) => late.release().catch(() => undefined), () => undefined);
       if (err instanceof SwapLockError) {
         count("failure");
         throw err;
@@ -235,7 +256,11 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       // The guard cannot run. Refreshing still goes ahead under AIS's file lock and the expectedAccessToken compare-and-swap.
       count("degraded");
       deps.onDegraded?.(account, reason(err));
-      return settle(await refresh(tool, identity, opts));
+      // No journal here, but a token this process itself saw rotated out is still never sent again.
+      const guardLocal = async ({ fingerprint }: { fingerprint: string }): Promise<void> => {
+        if (rotatedOut.has(`${tool}\u0000${identity.name}\u0000${fingerprint}`)) throw new RefreshRefused(ROTATED_OUT_MESSAGE, false);
+      };
+      return settle(await refresh(tool, identity, { ...opts, beforePost: guardLocal }));
     }
     deps.onHealthy?.(account);
     if (lock.contended) count("lock_wait", lock.waitedMs / 1000);
@@ -246,6 +271,14 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       degraded = true;
       count("degraded");
       deps.onDegraded?.(account, reason(err));
+    };
+    /** Resolve writes: the first on the lock's connection, the retries on a fresh pool connection (the lock's may be the broken one). */
+    const resolveClaim = async (id: number, outcome: JournalOutcome, newFp?: string): Promise<void> => {
+      let attempt = 0;
+      await journal(() => {
+        const fresh = attempt++ > 0 && lock.resolveFresh;
+        return fresh ? lock.resolveFresh!(id, outcome, newFp) : lock.resolve(id, outcome, newFp);
+      });
     };
     const journal = async (fn: () => Promise<void>): Promise<void> => {
       for (let attempt = 0; ; attempt += 1) {
@@ -288,23 +321,21 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
           degrade(err);
           return;
         }
-        if (rows.some((e) => e.outcome === "lost" || (e.outcome === "refreshed" && e.newFp !== undefined && e.newFp !== e.oldFp))) {
-          throw new RefreshRefused("refresh refused: this refresh token was already rotated out (journal) and is not sent again; the newer grant is missing from the stores", false);
-        }
+        for (const e of rows) if (e.outcome === "refreshed" && e.newFp !== undefined && e.newFp !== e.oldFp) markRotatedOut(`${tool}\u0000${identity.name}\u0000${e.oldFp}`);
+        if (rotatedOut.has(`${tool}\u0000${identity.name}\u0000${fingerprint}`)) throw new RefreshRefused(ROTATED_OUT_MESSAGE, false);
         let interrupted = rows.filter((e) => e.outcome === "interrupted").length;
         try {
-          // An unresolved claim for this very token is a request whose outcome is unknown, like a failed transport attempt: one retry.
+          // An unresolved claim for this very token is a request whose outcome is unknown, like a failed transport attempt:
+          // it is retried (the provider's own dead-grant answer decides), and the owner is alerted from the second one.
           for (const e of rows.filter((x) => x.outcome === undefined)) {
-            await journal(() => lock.resolve(e.id, "interrupted"));
+            await resolveClaim(e.id, "interrupted");
             interrupted += 1;
           }
         } catch (err) {
           degrade(err);
           return;
         }
-        if (interrupted >= 2) {
-          throw new RefreshRefused("refresh refused: the earlier attempts with this refresh token never finished twice (outcome unknown) and it is not sent again; log in again", false);
-        }
+        deps.onInterrupted?.(account, interrupted);
         try {
           claim = await bounded(lock.claim(fingerprint, holder), callMs, "refresh journal");
         } catch (err) {
@@ -316,15 +347,19 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       try {
         res = await refresh(tool, identity, { ...opts, beforePost });
       } catch (err) {
-        if (claim !== undefined) await journal(() => lock.resolve(claim as number, "failed")).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        if (claim !== undefined) await resolveClaim(claim, "failed").catch((e) => warn(`refresh journal write failed (${reason(e)})`));
         count("failure");
         throw err;
+      }
+      if (res.outcome === "refreshed" && res.beforeFingerprint && res.afterFingerprint && res.beforeFingerprint !== res.afterFingerprint) {
+        markRotatedOut(`${tool}\u0000${identity.name}\u0000${res.beforeFingerprint}`);
+        deps.onInterrupted?.(account, 0);
       }
       if (claim !== undefined) {
         const lost = res.outcome === "failed" && res.afterFingerprint !== undefined;
         const outcome: JournalOutcome = res.outcome === "refreshed" ? "refreshed" : lost ? "lost" : res.outcome === "failed" ? "failed" : "recovered";
         const id = claim;
-        await journal(() => lock.resolve(id, outcome, outcome === "refreshed" || lost ? res.afterFingerprint : undefined)).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        await resolveClaim(id, outcome, outcome === "refreshed" || lost ? res.afterFingerprint : undefined).catch((e) => warn(`refresh journal write failed (${reason(e)})`));
       }
       if (!degraded) deps.onHealthy?.(account);
       return settle(res);

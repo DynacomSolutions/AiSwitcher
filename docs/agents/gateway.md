@@ -193,14 +193,20 @@ CLIProxyAPI's refresh journal):
   fingerprints only, never a token. Outcomes: `refreshed`, `failed`, `lost`
   (provider rotated but no store was written), `interrupted`, `recovered`.
 - Never reuse a rotated-out token: a stored token the journal shows as
-  `refreshed` to a different token, or `lost`, is refused. An unresolved claim
-  for the stored token (a crash) is closed as `interrupted` and treated like a
-  failed transport attempt: one journalled retry; after two interrupted
-  attempts it is refused. A claim whose token the stores have moved past is
-  closed as `recovered`. Only a provider `invalid_grant` class answer makes a
-  login dead.
+  `refreshed` to a different token is refused (a restored backup or lagging
+  store), and this process also remembers such tokens in memory for the times
+  the journal cannot be read. An unresolved claim for the stored token (a
+  crash, a network blip between claim and resolve) is closed as `interrupted`
+  and the token is sent again: the provider's own dead-grant answer decides, so
+  a token that never reached the provider is never stranded. From the second
+  interruption in a row an owner alert (`refresh-interrupted`) is raised. A
+  `lost` write (provider rotated, no store written) is sent once more too. Resolve
+  retries run on a fresh pool connection, not the lock's. A claim whose token
+  the stores have moved past is closed as `recovered`.
 - Retention: every 6 hours resolved rows older than 30 days are deleted,
-  keeping the newest 50 per account and all `lost`/`interrupted` rows.
+  keeping the newest 50 per account and all open claims; rotated-out evidence
+  (`refreshed`, `lost`, `interrupted`) is kept for a year.
+- A lock handle that arrives after the guard gave up is released, never leaked.
 - Database or guard unavailable: the refresh still runs, under AIS's
   `.oauth_refresh.lock` file lock and the `expectedAccessToken`
   compare-and-swap, with a `refresh-guard-degraded` alert and
