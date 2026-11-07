@@ -2,7 +2,8 @@ import { chmod, lstat, open, readFile, realpath, rename, rm, writeFile } from "n
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const defaultSecretsPath = (): string => join(homedir(), ".secrets");
+/** `AIS_SECRETS_FILE` overrides the default `~/.secrets` (tests, unusual layouts). */
+export const defaultSecretsPath = (): string => process.env.AIS_SECRETS_FILE || join(homedir(), ".secrets");
 
 /** Strips an optional `export ` prefix and surrounding quotes from one KEY=value line. */
 function parseLine(line: string): { key: string; value: string } | undefined {

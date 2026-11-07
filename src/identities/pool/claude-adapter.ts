@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { swapCredentialFiles } from "../claude-swap.ts";
+import { healGatewayPool, swapCredentialFiles } from "../claude-swap.ts";
 import { fetchMemberUsage, type FetchUsageDeps, type MemberUsage } from "../claude-usage-api.ts";
 import { nativeStorePathFor } from "../oauth-reconcile.ts";
 import { CLAUDE_CONFIG } from "../tool-configs.ts";
@@ -13,6 +13,7 @@ export const claudeAdapter: PoolAdapter<MemberUsage> = {
   liveSwap: true,
   hasCredentials: (configDir) => existsSync(nativeStorePathFor("claude", configDir)),
   swapCredentials: (input) => swapCredentialFiles(input),
+  heal: (pool, members, lock) => healGatewayPool(pool, members, lock),
   fetchUsage: (member, deps) => {
     const d = (deps ?? {}) as FetchUsageDeps & { registryPath?: string };
     return fetchMemberUsage(member, { ...d, claudeRegistryPath: d.claudeRegistryPath ?? d.registryPath }).then((usage) => ({
