@@ -38,6 +38,9 @@ export interface NativeSourceFingerprintEnv {
   binaryPath: string;
   /** The exporter's isolated config directory (settings.json, pricing cache). */
   configDir: string;
+  /** The running AIS release: a new release always exports once, so a
+   * change in how AIS reads an export is never hidden by reuse. */
+  aisVersion?: string;
   /** Where digests of the binary and the pricing files are remembered with
    * the stat they were taken at, so a collector cycle (a fresh process) does
    * not re-read 30 MB of binary and 14 MB of pricing each time. */
@@ -53,7 +56,12 @@ export function sharedNativeExportInputs(env: NativeSourceFingerprintEnv): strin
     // A host update installs a rebuilt binary (a new inode) each time;
     // hashing its bytes keeps the fingerprint when the build is the same.
     hash.update(`binary\0${memo.digest(env.binaryPath, (bytes) => bytes)}\0`);
-    hash.update(`settings\0${optionalFileSha256(join(env.configDir, "settings.json"))}\0`);
+    hash.update(`ais\0${env.aisVersion ?? "unknown"}\0`);
+    // Every config-dir input of a local parse: settings, custom prices and
+    // recovered usage (a missing file is its own value).
+    for (const name of ["settings.json", "custom-pricing.json", "recovered-usage-v1.json"]) {
+      hash.update(`config\0${name}\0${optionalFileSha256(join(env.configDir, name))}\0`);
+    }
     // Tokscale refreshes its pricing caches hourly and stamps each refresh,
     // so only the data after the leading timestamp counts: unchanged prices
     // keep the fingerprint, changed prices change every source's.
@@ -109,8 +117,13 @@ function nativeSourceRoots(target: Pick<UsageTarget, "toolName" | "identity">, e
     return [
       join(configDir, "projects"),
       join(configDir, "transcripts"),
-      ...["Library/Application Support/Claude", "AppData/Roaming/Claude", ".config/Claude"].flatMap((app) =>
-        ["local-agent-mode-sessions", "claude-code-sessions"].map((name) => join(home, app, name))),
+      // The Claude desktop app: its session stores (scanned as roots) and the
+      // IndexedDB store plus its external blobs, which every Claude export
+      // reads for desktop usage (`claude_desktop::read`).
+      ...["Library/Application Support/Claude", "AppData/Roaming/Claude", ".config/Claude"].flatMap((app) => [
+        ...["local-agent-mode-sessions", "claude-code-sessions"].map((name) => join(home, app, name)),
+        ...["leveldb", "blob"].map((kind) => join(home, app, "IndexedDB", `https_claude.ai_0.indexeddb.${kind}`)),
+      ]),
     ];
   }
   if (target.toolName === "codex") {

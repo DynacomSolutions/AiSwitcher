@@ -8,12 +8,14 @@ import { TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts"
 import { isSwapPool } from "../../identities/swap-pool.ts";
 import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotDirtyId, usageSnapshotTargetKey, usageSnapshotDirtyDirectory } from "./snapshot-dirty.ts";
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, reuseNativeReportRows, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageRunDeps, type UsageTarget } from "./run.ts";
-import { usageResultsForJson } from "./run.ts";
+import { USAGE_MAX_CONCURRENT, usageResultsForJson } from "./run.ts";
+import { runBatched } from "../limits/collect.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
 import { nativeSourceFingerprint, sharedNativeExportInputs } from "./source-fingerprint.ts";
 import { aisNativeSourceEnv, aisTokscaleCacheScope, markTokscaleCacheScopeUsed, sweepUnusedTokscaleCacheScopes, aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromHourlyEntries, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage, type TokscaleHourlyEntry } from "./tokscale.ts";
 import { collectObsoleteNativeSegments, isSegmentedNativeEnvelope, nativeSegmentDir, nativeSegmentsIntact, parseSegmentedNativeManifest, verifyNativeSegments, writeReusableSegmentList, type NativeSegmentRecord } from "./native-segments.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
+import pkg from "../../../package.json" with { type: "json" };
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 
@@ -1146,8 +1148,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
 
   // Unchanged sources: the committed batch and report rows stand; only the
   // live extra-cost probe runs. Tokscale, and with it the source's whole
-  // message cache, is not touched.
-  for (const target of reusedTargets) {
+  // message cache, is not touched. The probes run alongside the exports, as
+  // many at once as a report run allows, so a slow probe never holds up a
+  // changed or dirty source.
+  const reuse = async (target: UsageTarget) => {
     const key = targetKey(target);
     const prior = partitions[key]!;
     producer.sourceScansTotal++;
@@ -1165,7 +1169,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
       if (sourceEnv) markTokscaleCacheScopeUsed({ TOKSCALE_AIS_CACHE_SCOPE: aisTokscaleCacheScope(target.toolName, sourceEnv), TOKSCALE_CONFIG_DIR: aisNativeTokscaleConfigDir() });
     }
     partitions[key] = {
-      ...prior,
+      ...partitions[key]!,
       tool: target.toolName,
       identity: target.identity.name,
       results: safeResults(rows),
@@ -1175,9 +1179,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     };
     aggregateGeneratedAt = partitions[key]!.lastSuccessAt!;
     writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
-  }
+  };
 
-  if (exportTargets.length > 0) {
+  const exportSources = async () => {
+    if (exportTargets.length === 0) return;
     const dueTargets = exportTargets;
     const collect = deps.collectTargetResults ?? ((selected: UsageTarget[], onItemDone: (index: number, results: UsageResult[], nativeCandidate?: UsageResult["nativeBatchCandidate"]) => void) =>
       runUsageQueryForTargets(selected, { onItemDone, deps: { ...deps.usageRunDeps, nativeExportForTarget: getNativeExportForTarget } }));
@@ -1202,7 +1207,11 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         provider: "unattributed", identity: safeIdentity(target.identity), sourceOnlyError: true, error: "source-error",
       }]);
     }
-  }
+  };
+
+  // Both settle before the cycle goes on, even when one fails.
+  const settled = await Promise.allSettled([runBatched(reusedTargets, USAGE_MAX_CONCURRENT, reuse), exportSources()]);
+  for (const outcome of settled) if (outcome.status === "rejected") throw outcome.reason;
 
   const specialJobs: Array<{ due: boolean; key: string; tool: string; collect: () => Promise<UsageResult[]> }> = [
     { due: dueDefaultProfile, key: DEFAULT_OPENCODE_PARTITION, tool: "opencode", collect: deps.collectDefaultProfile ?? defaultOpencodeProfileUsageResults },
@@ -1314,6 +1323,7 @@ function defaultNativeSourceFingerprinter(): (target: UsageTarget) => string | u
   const env = {
     binaryPath: process.env.AIS_TOKSCALE_SHARED_BIN || join(aisCacheDir(), "usage", "native-tokscale", "tokscale"),
     configDir: aisNativeTokscaleConfigDir(),
+    aisVersion: pkg.version,
     digestMemoPath: join(aisCacheDir(), "usage", "native-tokscale", "source-fingerprint-digests.json"),
     ...(process.env.TOKSCALE_HEADLESS_DIR ? { headlessDir: process.env.TOKSCALE_HEADLESS_DIR } : {}),
   };

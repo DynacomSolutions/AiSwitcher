@@ -128,6 +128,52 @@ describe("native source fingerprint", () => {
     expect(new DigestMemo(memoPath).digest(f.binaryPath, whole)).toBe(createHash("sha256").update("binary-v3").digest("hex"));
   });
 
+  test("covers the Claude desktop IndexedDB store and its blobs in every app location", async () => {
+    const f = await fixture();
+    let previous = f.fingerprint(f.claude)!;
+    for (const app of ["Library/Application Support/Claude", "AppData/Roaming/Claude", ".config/Claude"]) {
+      for (const kind of ["leveldb", "blob"]) {
+        const dir = join(f.home, app, "IndexedDB", `https_claude.ai_0.indexeddb.${kind}`);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, "000003.log"), "record");
+        const added = f.fingerprint(f.claude)!;
+        expect(added).not.toBe(previous);
+        await appendFile(join(dir, "000003.log"), "more");
+        const grown = f.fingerprint(f.claude)!;
+        expect(grown).not.toBe(added);
+        previous = grown;
+      }
+    }
+    // Codex does not read the desktop store.
+    const codex = f.fingerprint(f.codex);
+    await appendFile(join(f.home, ".config/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/000003.log"), "x");
+    expect(f.fingerprint(f.codex)).toBe(codex);
+  });
+
+  test("custom prices and recovered usage count, a missing file being its own value", async () => {
+    const f = await fixture();
+    for (const name of ["custom-pricing.json", "recovered-usage-v1.json"]) {
+      const base = f.fingerprint(f.claude)!;
+      await writeFile(join(f.configDir, name), "{}");
+      const present = f.fingerprint(f.claude)!;
+      expect(present).not.toBe(base);
+      await writeFile(join(f.configDir, name), "{\"changed\":true}");
+      expect(f.fingerprint(f.claude)).not.toBe(present);
+      await rm(join(f.configDir, name));
+      expect(f.fingerprint(f.claude)).toBe(base);
+    }
+  });
+
+  test("a new AIS release changes every fingerprint", async () => {
+    const f = await fixture();
+    const at = (aisVersion: string) => {
+      const env = { ...f.env, aisVersion };
+      return nativeSourceFingerprint(f.claude, sharedNativeExportInputs(env), env);
+    };
+    expect(at("0.5.30")).toBe(at("0.5.30")!);
+    expect(at("0.5.31")).not.toBe(at("0.5.30")!);
+  });
+
   test("undecidable sources are always exported", async () => {
     const f = await fixture();
     // Other tools are not covered.
@@ -164,7 +210,8 @@ const HOUR = 60 * 60_000;
 /** One collector cycle for one Claude source. `fingerprint` is its source
  * fingerprint this cycle; the fake exporter writes a full batch with
  * `messages` rows. Returns the committed partition and whether Tokscale ran. */
-async function cycle(root: string, now: number, fingerprint: string | undefined, options: { messages?: number; force?: boolean; extraCost?: number } = {}) {
+async function cycle(root: string, now: number, fingerprint: string | undefined, options: { messages?: number; force?: boolean; extraCost?: number; identity?: UsageTarget["identity"] } = {}) {
+  const target: UsageTarget = { toolName: "claude", identity: options.identity ?? identity };
   const path = join(root, "usage", "snapshot.json");
   const nativeBatchRoot = join(root, "native");
   const tokscaleConfigDir = join(root, "isolated-config");
@@ -242,6 +289,67 @@ describe("collector reuse of unchanged sources", () => {
     const batch = join(root, "native", unknown.partition.nativeBatch!.path.slice("usage/native/".length));
     await appendFile(batch, " ");
     expect((await cycle(root, t0 + 10 * HOUR, "a".repeat(64))).exported).toBe(true);
+  });
+
+  test("reused rows show the identity as it is now", async () => {
+    const root = await tempRoot();
+    const t0 = Date.UTC(2026, 10, 7, 12);
+    await cycle(root, t0, "a".repeat(64));
+    const renamed = { ...identity, label: "Work (renamed)", aliases: ["w"] } as UsageTarget["identity"];
+    const reused = await cycle(root, t0 + HOUR, "a".repeat(64), { identity: renamed });
+    expect(reused.exported).toBe(false);
+    expect(reused.partition.results[0]?.identity).toEqual({ name: "work", label: "Work (renamed)", aliases: ["w"] } as never);
+  });
+
+  test("extra-cost probes of reused sources run together and never hold up an export", async () => {
+    const root = await tempRoot();
+    const path = join(root, "usage", "snapshot.json");
+    const nativeBatchRoot = join(root, "native");
+    const tokscaleConfigDir = join(root, "isolated-config");
+    await mkdir(tokscaleConfigDir, { recursive: true });
+    await writeFile(join(tokscaleConfigDir, "settings.json"), JSON.stringify({ scanner: { bucketTimezone: "America/New_York" } }));
+    const targets: UsageTarget[] = ["a", "b", "c"].map((name) => ({ toolName: "claude", identity: { ...identity, name, label: name } as UsageTarget["identity"] }));
+    const idOf = (t: UsageTarget) => createHash("sha256").update(`ais-native-partition-v1\0${usageSnapshotTargetKey("claude", t.identity.name)}`).digest("hex");
+    const run = async (now: number, fingerprints: Record<string, string>, probeMs: number) => {
+      const events: string[] = [];
+      let active = 0;
+      let maxActive = 0;
+      const deps: UsageSnapshotDeps = {
+        path, nativeBatchRoot, dirtyDirectory: join(root, "dirty"), now: () => now, partitionTtlMs: 15 * 60_000,
+        collectTargets: async () => targets, collectPoolTargets: async () => [],
+        collectDefaultProfile: async () => [], collectSwapPools: async () => [],
+        captureNative: async () => undefined,
+        nativeSourceFingerprint: (t) => fingerprints[t.identity.name],
+        usageRunDeps: {
+          fetchExtraCost: async (_tool, who) => {
+            active++; maxActive = Math.max(maxActive, active);
+            await Bun.sleep(probeMs);
+            active--; events.push(`probe-done:${who.name}`);
+            return undefined;
+          },
+        },
+        prepareNativeExportCandidate: async (t) => ({ path: join(root, `candidate-${t.identity.name}-${now}.json`), partitionId: idOf(t), tokscaleConfigDir }),
+        collectTargetResults: async (selected, onItemDone, prepareNativeExport) => {
+          for (const [index, t] of selected.entries()) {
+            events.push(`export:${t.identity.name}`);
+            const candidate = await prepareNativeExport!(t);
+            await writeFile(candidate!.path, JSON.stringify({ ...nativeExport, messages: (nativeExport.messages as unknown[]).slice(0, 5), partitionId: idOf(t), generatedAt: new Date(now).toISOString() }));
+            await onItemDone(index, [{ ...row(5), identity: t.identity }]);
+          }
+          return [];
+        },
+      };
+      await refreshUsageSnapshot(deps);
+      return { events, maxActive };
+    };
+    const t0 = Date.UTC(2026, 10, 7, 12);
+    await run(t0, { a: "a".repeat(64), b: "b".repeat(64), c: "c".repeat(64) }, 0);
+    // a and b unchanged, c changed: c's export must not wait for a's and b's probes.
+    const { events, maxActive } = await run(t0 + HOUR, { a: "a".repeat(64), b: "b".repeat(64), c: "d".repeat(64) }, 300);
+    expect(events.indexOf("export:c")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("export:c")).toBeLessThan(events.indexOf("probe-done:a"));
+    expect(events.indexOf("export:c")).toBeLessThan(events.indexOf("probe-done:b"));
+    expect(maxActive).toBeGreaterThanOrEqual(2);
   });
 
   test("a source that failed last time exports, never reuses", async () => {

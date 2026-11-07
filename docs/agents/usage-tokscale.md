@@ -201,15 +201,19 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     (`source-fingerprint.ts`). Before a due source is read, the cycle takes a
     stat fingerprint of every file under the roots Tokscale v4.20.0 scans for
     it (Claude: `<config>/projects`, `<config>/transcripts`, the Claude
-    desktop session stores; Codex: `sessions`, `archived_sessions`, the
-    headless `codex` roots), plus the exporter binary's SHA-256, the isolated
-    `settings.json` and the pricing caches' data (their hourly refresh stamp
-    excluded). Digests of the binary and pricing files are remembered with
+    desktop session stores and its IndexedDB store and blob directory, in
+    all three app locations; Codex: `sessions`, `archived_sessions`, the
+    headless `codex` roots), plus the AIS release, the exporter binary's
+    SHA-256, the isolated `settings.json`, `custom-pricing.json` and
+    `recovered-usage-v1.json` (a missing file counts as its own value) and
+    the pricing caches' data (their hourly refresh stamp excluded). Digests of the binary and pricing files are remembered with
     their stat in `native-tokscale/source-fingerprint-digests.json`. When the
     fingerprint equals the one recorded at the partition's last export, the
     committed batch is intact, the last attempt succeeded and that export is
-    under 6 hours old, the partition keeps its batch and rows (only the live
-    extra-cost probe runs) and Tokscale is not started. A symlink in a source
+    under 6 hours old, the partition keeps its batch and rows, relabelled with
+    the identity as it is now, and Tokscale is not started. Only the live
+    extra-cost probe runs, six at a time, alongside the exports, so a slow
+    probe never delays a changed or dirty source. A symlink in a source
     tree, a `~/.cc-mirror` directory or configured extra scan paths make a
     source undecidable: it is always exported. Dirty markers still force an
     export. Why: every export loads the source's whole Tokscale message cache

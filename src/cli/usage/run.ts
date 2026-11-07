@@ -402,7 +402,9 @@ function attachExtraCost(target: UsageTarget, results: UsageResult[], extraCost:
  * the rows of its last export (its sources are unchanged) and a fresh
  * extra-cost probe, without running Tokscale. */
 export async function reuseNativeReportRows(target: UsageTarget, rows: UsageResult[], deps: UsageRunDeps = {}): Promise<UsageResult[]> {
-  return attachExtraCost(target, rows, await targetExtraCost(target, deps));
+  // The stored rows carry the identity as it was then; a renamed label or
+  // new aliases must show as an export would show them.
+  return attachExtraCost(target, rows.map((row) => ({ ...row, identity: target.identity })), await targetExtraCost(target, deps));
 }
 
 /** Attaches one source's daily usage to its report row. Only a single-row
@@ -505,7 +507,7 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
  * tokscale child scanning that identity's whole history. A bounded pool
  * reduces disk contention, matches limits's own fan-out cap, and lets the
  * live render fill in as results arrive. */
-const USAGE_MAX_CONCURRENT = 6;
+export const USAGE_MAX_CONCURRENT = 6;
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
