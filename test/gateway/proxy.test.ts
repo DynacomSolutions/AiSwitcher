@@ -495,24 +495,107 @@ describe("failover and refresh", () => {
     expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
   });
 
-  test("exhaustion without reset headers lasts five minutes", async () => {
-    let clock = NOW.getTime();
-    deps.now = () => new Date(clock);
+  const burstSetup = async (members: "pair" | "single") => {
+    const clock = { ms: NOW.getTime() };
+    deps.now = () => new Date(clock.ms);
     const gw = createGatewayApp(deps);
-    const call = (path: string, token: string, init: RequestInit) => (async () => { const r = await gw.request(`http://gw.test${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); })();
+    const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); };
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
     usage.a = live(10);
-    usage.b = live(20);
+    usage.b = members === "pair" ? live(20) : undefined;
+    return { clock, call, who: () => seen.map((x) => x.headers.get("authorization")) };
+  };
+
+  test("burst 429 without unified headers holds the member back at most 60 s", async () => {
+    const { clock, call, who } = await burstSetup("pair");
     handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
-    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    expect((await call()).status).toBe(200);
     seen.length = 0;
-    clock += 4 * 60_000;
-    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
+    clock.ms += 10_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 6_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("burst 429 honours retry-after seconds and HTTP dates, capped at 60 s", async () => {
+    const { clock, call, who } = await burstSetup("pair");
+    let retry = "30";
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429, headers: { "retry-after": retry } }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    await call();
+    seen.length = 0;
+    clock.ms += 29_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 2_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+    // Date form
+    clock.ms += 61_000;
+    retry = new Date(clock.ms + 20_000).toUTCString();
+    seen.length = 0;
+    await call();
+    seen.length = 0;
+    clock.ms += 25_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+    // Cap
+    clock.ms += 61_000;
+    retry = "3600";
+    seen.length = 0;
+    await call();
+    seen.length = 0;
+    clock.ms += 61_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("unified rejected 429 still marks the member exhausted until its reset", async () => {
+    const { clock, call, who } = await burstSetup("pair");
+    const resetAt = Math.floor((clock.ms + 600_000) / 1000);
+    handler = (_req, s) =>
+      s.headers.get("authorization") === "Bearer tok-a"
+        ? new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt) } })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    await call();
+    seen.length = 0;
+    clock.ms += 300_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 301_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("Codex usage_limit_reached 429 without headers counts as exhausted for five minutes", async () => {
+    const clock = { ms: NOW.getTime() };
+    deps.now = () => new Date(clock.ms);
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "cx", provider: "codex", style: "openai", target: { kind: "pool" } }));
+    const call = async () => { const r = await gw.request("http://gw.test/cx/v1/responses", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); };
+    usage.a = live(10);
+    usage.b = live(20);
+    handler = (_req, s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response('{"error":{"type":"usage_limit_reached"}}', { status: 429 }) : new Response("{}", { headers: { "content-type": "application/json" } }));
+    await call();
+    seen.length = 0;
+    clock.ms += 4 * 60_000;
+    await call();
     expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-b"]);
-    seen.length = 0;
-    clock += 61_000;
-    await call("/pool/v1/messages", t, { method: "POST", body: "{}" });
-    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+  });
+
+  test("single-member pool: burst 429 reaches the client once and recovers within the hold window", async () => {
+    const { clock, call } = await burstSetup("single");
+    usage.b = live(100);
+    let limited = true;
+    handler = () => (limited ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    expect((await call()).status).toBe(429);
+    limited = false;
+    clock.ms += 16_000;
+    expect((await call()).status).toBe(200);
   });
 
   test("all members exhausted gives one 429 with a reason in the log", async () => {

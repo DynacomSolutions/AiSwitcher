@@ -596,7 +596,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   /** 429 is quota or rate limit. 402 is a payment-required signal some providers use for exhausted credit. A 403 counts only when its (bounded) JSON body names a quota error type or code. */
   const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
-    if (res.status === 429 || res.status === 402) return { quota: true, res };
+    if (res.status === 402) return { quota: true, res };
+    if (res.status === 429) {
+      // Only Codex states exhaustion in the body (the (bounded) peek); elsewhere the headers decide and the body is not read.
+      if (app.provider !== "codex") return { quota: true, res };
+      const p = await peek(res, ERROR_PEEK_BYTES);
+      if (!(p.whole && /usage_limit_reached/.test(new TextDecoder().decode(p.bytes)))) return { quota: true, res: p.res };
+      const h = new Headers(p.res.headers);
+      h.set(SUBSCRIPTION_EXHAUSTED_HEADER, "1");
+      return { quota: true, res: new Response(p.res.body, { status: p.res.status, statusText: p.res.statusText, headers: h }) };
+    }
     if (res.status !== 403) return { quota: false, res };
     const p = await peek(res, ERROR_PEEK_BYTES);
     return { quota: p.whole && isQuotaBody(p.bytes), res: p.res };
@@ -616,7 +625,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       let quota = q.quota;
       while (quota) {
         tried.add(name);
-        if (up.status === 429 || up.status === 402 || up.status === 403) exhausted.set(exKey(name), exhaustedUntil(up.headers, deps.now().getTime()));
+        const nowMs = deps.now().getTime();
+        if (up.status === 402 || up.status === 403 || (up.status === 429 && provesSubscriptionExhaustion(up.headers))) exhausted.set(exKey(name), exhaustedUntil(up.headers, nowMs));
+        else if (up.status === 429) exhausted.set(exKey(name), burstHoldUntil(up.headers, nowMs));
         const next = await pickIdentity(app, deps, new Set([...exhaustedNames(), ...tried]));
         if (!("identity" in next)) break;
         name = next.identity;
@@ -660,6 +671,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   body = { kind: "none" };
   releaseBody?.();
   const headers = new Headers(up.headers);
+  headers.delete(SUBSCRIPTION_EXHAUSTED_HEADER);
   stripHopByHop(headers);
   if (headers.has("content-encoding")) {
     headers.delete("content-encoding");
@@ -710,6 +722,30 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   req.signal.addEventListener("abort", () => finish("client_aborted"), { once: true });
   return new Response(out, { status: httpStatus, statusText: up.statusText, headers });
   }
+}
+
+const BURST_HOLD_DEFAULT_MS = 15_000;
+const BURST_HOLD_MAX_MS = 60_000;
+/** Internal marker set on a 429 whose body proved Codex subscription exhaustion; stripped before the client sees it. */
+const SUBSCRIPTION_EXHAUSTED_HEADER = "x-ais-subscription-exhausted";
+
+/** True when a 429 proves subscription exhaustion (unified status or a 5h/7d window `rejected`, or Codex `usage_limit_reached`), not a transient rate limit. */
+export function provesSubscriptionExhaustion(headers: Headers): boolean {
+  if (headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1") return true;
+  for (const k of ["status", "5h-status", "7d-status"]) if (headers.get(`anthropic-ratelimit-unified-${k}`)?.trim().toLowerCase() === "rejected") return true;
+  return false;
+}
+
+/** Epoch ms until which a member that answered a burst 429 is held back: its retry-after (seconds or HTTP date), capped at 60 s, default 15 s. */
+export function burstHoldUntil(headers: Headers, nowMs: number): number {
+  const retry = headers.get("retry-after");
+  let ms = BURST_HOLD_DEFAULT_MS;
+  if (retry !== null && retry.trim() !== "") {
+    const secs = Number(retry);
+    if (Number.isFinite(secs) && secs >= 0) ms = secs * 1000;
+    else if (Number.isFinite(Date.parse(retry))) ms = Math.max(0, Date.parse(retry) - nowMs);
+  }
+  return nowMs + Math.min(ms, BURST_HOLD_MAX_MS);
 }
 
 const EXHAUSTED_DEFAULT_MS = 5 * 60_000;
