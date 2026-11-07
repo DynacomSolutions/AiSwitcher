@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } fr
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { stringFlag, type ParsedArgs } from "../args.ts";
+import { downloadAsset } from "../../shared/release-assets.ts";
 import { CliUsageError } from "../errors.ts";
 
 export const EXTENSION_REPO = "DynacomSolutions/AiSwitcher";
@@ -46,39 +47,9 @@ const defaults = (): ExtensionDeps => ({
   run: defaultRun,
 });
 
-async function ghDownload(deps: ExtensionDeps, dest: string): Promise<CommandResult> {
-  return deps.run(["gh", "release", "download", "--repo", EXTENSION_REPO, "--pattern", EXTENSION_ASSET, "--dir", dest, "--clobber"]);
-}
-
-async function downloadWithApi(deps: ExtensionDeps, dest: string, bearer: string): Promise<void> {
-  const headers = { Authorization: `Bearer ${bearer}`, "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "ais-cli" };
-  const rel = await deps.fetch(`https://api.github.com/repos/${EXTENSION_REPO}/releases/latest`, { headers: { ...headers, Accept: "application/vnd.github+json" } });
-  if (!rel.ok) throw new Error(`GitHub latest release lookup failed: HTTP ${rel.status}`);
-  const assets = ((await rel.json()) as { assets?: { name?: string; url?: string }[] }).assets ?? [];
-  const asset = assets.find((a) => a.name === EXTENSION_ASSET);
-  if (!asset?.url) throw new Error(`latest release has no ${EXTENSION_ASSET} asset`);
-  const res = await deps.fetch(asset.url, { headers: { ...headers, Accept: "application/octet-stream" }, redirect: "follow" });
-  if (!res.ok) throw new Error(`asset download failed: HTTP ${res.status}`);
-  await writeFile(join(dest, EXTENSION_ASSET), new Uint8Array(await res.arrayBuffer()));
-}
-
-/** gh first; on any gh failure fall back to the REST API when credentials exist (env, else gh's own login). */
+/** Public download through the shared release-asset helper, never sending credentials. */
 async function download(deps: ExtensionDeps, dest: string): Promise<void> {
-  const gh = await ghDownload(deps, dest);
-  if (gh.code === 0) return;
-  const ghMissing = gh.code === 127;
-  let bearer = deps.env.GITHUB_TOKEN || deps.env.GH_TOKEN;
-  if (!bearer && !ghMissing) {
-    const t = await deps.run(["gh", "auth", "token"]);
-    if (t.code === 0 && t.stdout?.trim()) bearer = t.stdout.trim();
-  }
-  const ghErr = ghMissing ? "gh is not installed" : `gh release download failed: ${gh.stderr.trim() || `exit ${gh.code}`}`;
-  if (!bearer) throw new Error(`${ghErr}; no GITHUB_TOKEN or GH_TOKEN for the REST fallback`);
-  try {
-    await downloadWithApi(deps, dest, bearer);
-  } catch (e) {
-    throw new Error(`${ghErr}; REST fallback failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
+  await downloadAsset(EXTENSION_ASSET, join(dest, EXTENSION_ASSET), { fetchImpl: deps.fetch, anonymous: true });
 }
 
 /** True for absolute, drive-letter or `..` entry names. */

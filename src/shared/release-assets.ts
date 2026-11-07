@@ -40,6 +40,8 @@ export interface DownloadAssetOptions {
   mode?: number;
   /** downloadAssetAtomic only: runs on the executable temp file before it replaces dest; a throw keeps dest as it was. */
   verify?: (tmpPath: string) => Promise<void>;
+  /** Ignore GH_TOKEN/GITHUB_TOKEN and always use the public redirect, so stale credentials cannot break a public download. */
+  anonymous?: boolean;
 }
 
 /**
@@ -62,8 +64,8 @@ export interface DownloadAssetOptions {
  * environment. Without a token, behavior is byte-for-byte what it was
  * before: the same plain public redirect fetch.
  */
-async function fetchAssetResponse(assetName: string, tag?: string, fetchImpl: typeof fetch = fetch): Promise<Response> {
-  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+async function fetchAssetResponse(assetName: string, tag?: string, fetchImpl: typeof fetch = fetch, anonymous = false): Promise<Response> {
+  const token = anonymous ? undefined : process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
   if (!token) {
     const url = tag
       ? `https://github.com/${REPO}/releases/download/${tag}/${assetName}`
@@ -100,7 +102,7 @@ async function fetchAssetResponse(assetName: string, tag?: string, fetchImpl: ty
 }
 
 export async function downloadAsset(assetName: string, dest: string, options: DownloadAssetOptions = {}): Promise<void> {
-  const response = await fetchAssetResponse(assetName, options.tag, options.fetchImpl);
+  const response = await fetchAssetResponse(assetName, options.tag, options.fetchImpl, options.anonymous);
   // Unlink first: Bun.write follows a destination symlink and overwrites
   // whatever it points at, rather than replacing the symlink itself. This
   // matters when the REAL tool's own installer already left a symlink at
