@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { open } from "node:fs/promises";
 import { runBackup } from "../../scripts/backup.ts";
+import { createProgressTracker, type BackupProgress } from "../shared/backup-progress.ts";
 import { downloadAssetAtomic, platformKey } from "../shared/release-assets.ts";
 import { cyan, dim, green, yellow } from "./colors.ts";
 import { describeProfileSyncServiceResult, installProfileSyncService, type ProfileSyncServiceResult } from "../sync/profile-sync-service.ts";
@@ -32,7 +33,7 @@ const HEARTBEAT_MS = 15_000;
 export interface UpdateOptions {
   /** `--no-backup`: skip the safety-net snapshot of every tool config directory. */
   skipBackup?: boolean;
-  backup?: () => Promise<string>;
+  backup?: (onProgress: (p: BackupProgress) => void) => Promise<string>;
   heartbeatMs?: number;
   shimDir?: string;
   /** Test seam for the release download. */
@@ -83,13 +84,13 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
   } else {
     // A snapshot of tens of GB of tool state can take minutes; never go silent while it runs.
     console.log(`${prefix} backing up tool config directories first (can take minutes on large profiles; --no-backup skips it)`);
-    const started = Date.now();
+    const tracker = createProgressTracker();
     const timer = setInterval(
-      () => console.log(`${prefix} still backing up (${Math.round((Date.now() - started) / 1000)}s)`),
+      () => console.log(`${prefix} ${tracker.line()}`),
       options.heartbeatMs ?? HEARTBEAT_MS,
     );
     try {
-      console.log(`${prefix} backup complete: ${await (options.backup ?? runBackup)()}`);
+      console.log(`${prefix} backup complete: ${await (options.backup ?? ((onProgress) => runBackup(undefined, undefined, undefined, onProgress, { exitOnSignal: true })))(tracker.report)}`);
     } catch (error) {
       // Nothing was downloaded yet: say so, so a failed backup is never mistaken for an update.
       throw new Error(`backup failed, so NOTHING was updated: ${error instanceof Error ? error.message : String(error)}. Fix that, or run "ais update --no-backup" to update without a snapshot.`);

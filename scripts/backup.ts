@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import { access, appendFile, chmod, constants, link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { aisBackupConfigPath, aisBackupLockPath, aisBackupsDir, aisBackupsSqliteDir } from "../src/shared/ais-home.ts";
 import { acquirePidLock } from "../src/shared/pid-lock.ts";
+import { createProgressTracker, type BackupProgress } from "../src/shared/backup-progress.ts";
 import { REPRODUCIBLE_JUNK_DIR_NAMES } from "../src/shared/reproducible-paths.ts";
 
 // Grouped by which wrapped-tool proxy actually reads/writes each directory —
@@ -113,7 +114,16 @@ class BackupTimeoutError extends Error {}
 // Epoch ms after which every backup git command is killed; set by runBackup around the local backup only.
 let deadlineAt: number | undefined;
 
-async function runGit(repoDir: string, home: string, args: string[], stdin?: string, env?: Record<string, string>): Promise<GitResult> {
+/** Reads a stream to text; with `onChunk` the text is streamed to it and not kept. */
+async function readStream(stream: ReadableStream<Uint8Array>, onChunk?: (text: string) => void): Promise<string> {
+  if (!onChunk) return new Response(stream).text();
+  const decoder = new TextDecoder();
+  for await (const chunk of stream) onChunk(decoder.decode(chunk, { stream: true }));
+  onChunk(decoder.decode());
+  return "";
+}
+
+async function runGit(repoDir: string, home: string, args: string[], stdin?: string, env?: Record<string, string>, onStdout?: (text: string) => void): Promise<GitResult> {
   const git = Bun.which("git", { PATH: process.env.PATH ?? "" });
   if (!git) throw new Error("backup: git is required for the git-managed backup repo but was not found on PATH");
   const left = deadlineAt === undefined ? undefined : deadlineAt - Date.now();
@@ -134,7 +144,7 @@ async function runGit(repoDir: string, home: string, args: string[], stdin?: str
     hardKill = setTimeout(() => proc.kill("SIGKILL"), 5000);
   }, left);
   const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
+    readStream(proc.stdout, onStdout),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
@@ -142,6 +152,33 @@ async function runGit(repoDir: string, home: string, args: string[], stdin?: str
   clearTimeout(hardKill);
   if (timedOut) throw new BackupTimeoutError();
   return { exitCode, stdout, stderr };
+}
+
+/** Splits streamed `git add --verbose` text into the paths of its `add '<path>'` lines. */
+function lineSplitter(onPath: (path: string) => void): { push: (text: string) => void; end: () => void } {
+  let buffer = "";
+  const emit = (line: string): void => {
+    const m = /^add '(.*)'$/.exec(line);
+    if (m) onPath(m[1]!);
+  };
+  return {
+    push(text) {
+      buffer += text;
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        emit(buffer.slice(0, nl));
+        buffer = buffer.slice(nl + 1);
+      }
+    },
+    end() {
+      if (buffer) emit(buffer);
+      buffer = "";
+    },
+  };
+}
+
+async function fileSize(home: string, relPath: string): Promise<number> {
+  return stat(join(home, relPath)).then((s) => (s.isFile() ? s.size : 0), () => 0);
 }
 
 const VANISHED_RE = /unable to stat '[^']*': No such file or directory/;
@@ -377,7 +414,7 @@ const DEFAULT_BACKUP_TIMEOUT_MS = 20 * 60_000;
 
 /** Runs the local backup under a time budget (AIS_BACKUP_TIMEOUT_MS, default 20 min). On expiry the
  * running git is killed and the backup fails cleanly; an index.lock is removed only if this run's git created it. */
-async function backupAndCommit(groups: readonly BackupGroup[], home: string): Promise<string> {
+async function backupAndCommit(groups: readonly BackupGroup[], home: string, onProgress?: (p: BackupProgress) => void): Promise<string> {
   const repoDir = aisBackupsDir(home);
   await removeStaleIndexLock(repoDir);
   const lock = join(repoDir, ".git", "index.lock");
@@ -386,7 +423,7 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
   const budgetMs = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BACKUP_TIMEOUT_MS;
   deadlineAt = Date.now() + budgetMs;
   try {
-    return await backupAndCommitInner(groups, home, repoDir);
+    return await backupAndCommitInner(groups, home, repoDir, onProgress);
   } catch (err) {
     if (!(err instanceof BackupTimeoutError)) throw err;
     if (!lockBefore) await rm(lock, { force: true });
@@ -398,7 +435,7 @@ async function backupAndCommit(groups: readonly BackupGroup[], home: string): Pr
   }
 }
 
-async function backupAndCommitInner(groups: readonly BackupGroup[], home: string, repoDir: string): Promise<string> {
+async function backupAndCommitInner(groups: readonly BackupGroup[], home: string, repoDir: string, onProgress?: (p: BackupProgress) => void): Promise<string> {
   const polluted = await ensureRepo(repoDir, home);
   await removeLegacyMirrors(repoDir, home);
 
@@ -427,13 +464,14 @@ async function backupAndCommitInner(groups: readonly BackupGroup[], home: string
   const sqlite = await findSqliteFiles(home, mirrored);
   await appendFile(join(repoDir, ".git", "info", "exclude"), sqlite.excludes.map((p) => `${gitignoreEscape(p)}\n`).join(""));
   try {
-    return await commitMirrored(home, repoDir, mirrored, polluted, sqlite.all);
+    return await commitMirrored(home, repoDir, mirrored, polluted, sqlite.all, onProgress);
   } finally {
+    if (sqlite.dbs.length > 0) onProgress?.({ phase: "snapshotting databases" });
     await snapshotSqlite(home, sqlite.dbs);
   }
 }
 
-async function commitMirrored(home: string, repoDir: string, mirrored: string[], polluted: readonly string[], sqliteAll: ReadonlySet<string>): Promise<string> {
+async function commitMirrored(home: string, repoDir: string, mirrored: string[], polluted: readonly string[], sqliteAll: ReadonlySet<string>, onProgress?: (p: BackupProgress) => void): Promise<string> {
   // A group dir (or anything above it) matched by a .gitignore outside our
   // control, e.g. `*` in ~/.gitignore, would make `git add` store nothing and
   // still look successful. That file cannot be disabled by config, so fail loudly.
@@ -476,13 +514,45 @@ async function commitMirrored(home: string, repoDir: string, mirrored: string[],
   // Exit 1 is --ignore-errors reporting files it skipped (permission-denied,
   // vanished mid-scan); anything else (e.g. 128, a stale index.lock) is fatal.
   // Pathspecs go over stdin (NUL-separated): no ARG_MAX limit however long `skip` is.
-  const add = await addRetryingVanished(repoDir, (skip) =>
-    runGit(
+  // Progress: a dry run measures the bytes git will stage, then the real add (--verbose) lists each
+  // file as it goes. Both are skipped when nobody listens, so plain backups pay nothing for it.
+  let totalBytes: number | undefined;
+  if (onProgress) {
+    onProgress({ doneBytes: 0 });
+    let sum = 0;
+    let chain: Promise<void> = Promise.resolve();
+    const lines = lineSplitter((path) => { chain = chain.then(async () => { sum += await fileSize(home, path); }); });
+    try {
+      const dry = await runGit(repoDir, home, ["-c", "core.quotePath=false", "add", "-A", "-n", "--ignore-errors", "--pathspec-from-file=-", "--pathspec-file-nul"], mirrored.join("\0") + "\0", undefined, lines.push);
+      lines.end();
+      await chain;
+      if (dry.exitCode === 0 || dry.exitCode === 1) totalBytes = sum;
+    } catch (err) {
+      if (err instanceof BackupTimeoutError) throw err;
+    }
+    if (totalBytes !== undefined) onProgress({ totalBytes, doneBytes: 0 });
+  }
+  const add = await addRetryingVanished(repoDir, async (skip) => {
+    let done = 0;
+    let chain: Promise<void> = Promise.resolve();
+    const lines = lineSplitter((path) => {
+      chain = chain.then(async () => {
+        done += await fileSize(home, path);
+        onProgress?.({ totalBytes, doneBytes: done });
+      });
+    });
+    const result = await runGit(
       repoDir,
       home,
-      ["add", "-A", "--ignore-errors", "--pathspec-from-file=-", "--pathspec-file-nul"],
+      ["-c", "core.quotePath=false", "add", "-A", "--ignore-errors", ...(onProgress ? ["--verbose"] : []), "--pathspec-from-file=-", "--pathspec-file-nul"],
       [...mirrored, ...skip.map((p) => `:(exclude,literal)${p}`)].join("\0") + "\0",
-    ),
+      undefined,
+      onProgress ? lines.push : undefined,
+    );
+    lines.end();
+    await chain;
+    return result;
+  },
     (sinceMs) => filesChangedSince(home, mirrored, sinceMs),
   );
   if (add.exitCode === 1) {
@@ -864,6 +934,9 @@ export async function runBackup(
   groups: readonly BackupGroup[] = Object.keys(BACKUP_GROUPS) as BackupGroup[],
   home: string = homedir(),
   configPath: string = aisBackupConfigPath(process.env, home),
+  onProgress?: (p: BackupProgress) => void,
+  /** CLI entry points set `exitOnSignal`; a daemon must not, so its own graceful shutdown keeps working. */
+  options: { exitOnSignal?: boolean } = {},
 ): Promise<string> {
   // The lock covers everything, including legacy-mirror deletion and the trim.
   // Try once, so a held lock is reported instead of waiting up to 10 minutes in silence.
@@ -876,16 +949,41 @@ export async function runBackup(
       return acquirePidLock(lockPath, { waitMs: LOCK_WAIT_MS, retryMs: LOCK_RETRY_MS });
     })());
   if (!release) throw new Error(`backup: another backup still holds ${aisBackupLockPath(home)} after 10 minutes`);
+  // Ctrl+C or a service stop must not strand the lock: release it, then exit like the default handler.
+  const onSignal = (signal: NodeJS.Signals): void => {
+    void release().finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
+  };
+  const onInt = (): void => onSignal("SIGINT");
+  const onTerm = (): void => onSignal("SIGTERM");
+  if (options.exitOnSignal) {
+    process.on("SIGINT", onInt);
+    process.on("SIGTERM", onTerm);
+  }
   try {
-    const repoDir = await backupAndCommit(groups, home);
+    const repoDir = await backupAndCommit(groups, home, onProgress);
     const config = await loadBackupConfig(configPath);
     if (config.remote) await pushAndTrim(repoDir, home, config.remote, config.localRetentionDays);
     return repoDir;
   } finally {
+    if (options.exitOnSignal) {
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+    }
     await release();
   }
 }
 
+/** Runs the backup printing a progress line to stderr every `intervalMs` (for `bun run backup` and the installer). */
+export async function runBackupWithProgress(intervalMs = 15_000): Promise<string> {
+  const tracker = createProgressTracker();
+  const timer = setInterval(() => console.error(`backup: ${tracker.line()}`), intervalMs);
+  try {
+    return await runBackup(undefined, undefined, undefined, tracker.report, { exitOnSignal: true });
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 if (import.meta.main) {
-  await runBackup();
+  await runBackupWithProgress();
 }

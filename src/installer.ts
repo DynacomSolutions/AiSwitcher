@@ -2,7 +2,7 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { chmod, mkdir } from "node:fs/promises";
 import * as clack from "@clack/prompts";
-import { runBackup } from "../scripts/backup.ts";
+import { runBackupWithProgress } from "../scripts/backup.ts";
 import { downloadAsset, platformKey, REPO } from "./shared/release-assets.ts";
 
 // The actual download mechanics (fetchAssetResponse/downloadAsset and the
@@ -46,7 +46,7 @@ async function runInstaller(): Promise<void> {
 
   const platformSuffix = platformKey();
 
-  const backupDir = await runBackup();
+  const backupDir = await runBackupWithProgress();
   clack.log.info(`Backup complete: ${backupDir}`);
 
   const shimDir = join(homedir(), ".local", "bin");
