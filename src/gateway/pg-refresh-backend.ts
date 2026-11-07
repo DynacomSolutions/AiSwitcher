@@ -115,8 +115,10 @@ export class PgRefreshBackend implements RefreshGuardBackend {
         released = true;
         try {
           await bounded(c`SELECT pg_advisory_unlock(hashtextextended(${name}, 0))`, this.callMs, "guard unlock");
-          await bounded(c.unsafe("RESET statement_timeout"), this.callMs, "guard reset").catch(() => undefined);
-          c.release();
+          // A connection whose RESET failed or timed out may still carry the bound: end it rather than return it to the pool.
+          const reset = await bounded(c.unsafe("RESET statement_timeout"), this.callMs, "guard reset").then(() => true, () => false);
+          if (reset) c.release();
+          else await Promise.race([c.close().catch(() => undefined), new Promise((r) => setTimeout(r, this.callMs))]);
         } catch (err) {
           // An unlock that failed would leave the lock on a pooled connection: end the session, which frees it.
           await Promise.race([c.close().catch(() => undefined), new Promise((r) => setTimeout(r, this.callMs))]);

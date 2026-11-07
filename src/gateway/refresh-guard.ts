@@ -198,18 +198,27 @@ const defaultReadGrant = async (tool: RefreshableTool, identity: Identity, claud
   (await readEffectiveGrant(tool, identity, claudeRegistryPath ? { claudeRegistryPath } : {}))?.grant;
 
 /**
- * Name, code and a short message so an alert says WHY the guard is unavailable. Connection URLs and anything that looks like
- * credentials in a driver message are masked, and the text is cut short.
+ * Why the guard is unavailable, for an alert. A PostgresError yields only its name, code, SQLSTATE and the server's own message.
+ * Any other error is masked first: URLs, `user:pw@host`, secret-looking keys (also JSON-quoted) and every quoted value. Short.
  */
 const reason = (err: unknown): string => {
   if (!(err instanceof Error)) return "Error";
   const code = (err as { code?: unknown }).code;
+  const codeText = typeof code === "string" ? code : undefined;
+  if (err.name === "PostgresError") {
+    const sqlstate = (err as { errno?: unknown }).errno;
+    const message = err.message.replace(/\s+/g, " ").slice(0, 160);
+    return [err.name, codeText, typeof sqlstate === "string" ? sqlstate : undefined, message ? `- ${message}` : undefined].filter(Boolean).join(" ");
+  }
   const message = err.message
     .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
+    .replace(/[^\s:@/'"]+:[^\s@/'"]+@\S*/g, "<credentials>@")
+    .replace(/"(password|passwd|pwd|token|secret|authorization|api[_-]?key)"\s*:\s*"[^"]*"/gi, '"$1":"<hidden>"')
     .replace(/(password|passwd|pwd|token|secret)\s*[=:]\s*\S+/gi, "$1=<hidden>")
+    .replace(/"[^"]*"|'[^']*'/g, "<value>")
     .replace(/\s+/g, " ")
     .slice(0, 160);
-  return [err.name, typeof code === "string" ? code : undefined, message ? `- ${message}` : undefined].filter(Boolean).join(" ");
+  return [err.name, codeText, message ? `- ${message}` : undefined].filter(Boolean).join(" ");
 };
 
 /** Rejects when `p` takes longer than `ms`; the call itself may still finish later. */
