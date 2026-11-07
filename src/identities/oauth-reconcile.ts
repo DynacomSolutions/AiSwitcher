@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { withOauthRefreshLock } from "./claude-swap-lock.ts";
+import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
 import {
   CLAUDE_CONFIG,
   CODEX_CONFIG,
@@ -190,7 +191,8 @@ interface NativeAnthropicFile {
 async function readNativeAnthropic(path: string): Promise<StoreCopy | undefined> {
   const raw = (await readJson(path)) as NativeAnthropicFile | undefined;
   const auth = raw?.claudeAiOauth;
-  if (!auth || !usableToken(auth.accessToken)) return undefined;
+  // The gateway entry of a gateway-routed identity is an app token, not a login: it is never a grant to reconcile or refresh.
+  if (!auth || !usableToken(auth.accessToken) || isGatewayAccessToken(auth.accessToken)) return undefined;
   return {
     side: "native",
     path,
