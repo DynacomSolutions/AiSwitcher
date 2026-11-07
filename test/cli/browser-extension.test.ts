@@ -83,84 +83,55 @@ describe("ais browser extension", () => {
     expect(readFileSync(join(target, "manifest.json"), "utf8")).toContain('"0"');
   });
 
-  test("update downloads with gh and installs", async () => {
-    const zip = await makeZip("gh", { "manifest.json": '{"version":"3"}' });
-    const calls: string[][] = [];
-    const runCmd = async (cmd: string[]): Promise<CommandResult> => {
-      calls.push(cmd);
-      if (cmd[0] === "gh") {
-        await Bun.write(join(cmd[cmd.indexOf("--dir") + 1]!, "ais-browser-extension.zip"), Bun.file(zip));
-        return { code: 0, stderr: "" };
-      }
-      return real(cmd);
-    };
-    await run("browser extension update", { run: runCmd, platform: "linux" });
-    expect(calls[0]!.slice(0, 6)).toEqual(["gh", "release", "download", "--repo", "DynacomSolutions/AiSwitcher", "--pattern"]);
-    expect(calls[0]![6]).toBe("ais-browser-extension.zip");
+  test("update downloads the public asset without credentials and installs", async () => {
+    const zip = await makeZip("pub", { "manifest.json": '{"version":"3"}' });
+    const seen: { url: string; auth: string | null }[] = [];
+    const fakeFetch = (async (url: string, init?: RequestInit) => {
+      seen.push({ url, auth: new Headers(init?.headers).get("authorization") });
+      return new Response(Bun.file(zip));
+    }) as unknown as typeof fetch;
+    await run("browser extension update", { fetch: fakeFetch, platform: "linux" });
+    expect(seen).toEqual([{ url: "https://github.com/DynacomSolutions/AiSwitcher/releases/latest/download/ais-browser-extension.zip", auth: null }]);
     expect(readFileSync(join(target, "manifest.json"), "utf8")).toContain('"3"');
   });
 
-  test("without gh falls back to the REST API with the token", async () => {
-    const zip = await makeZip("api", { "manifest.json": '{"version":"4"}' });
-    const seen: { url: string; accept: string | null; auth: string | null }[] = [];
-    const fakeFetch = (async (url: string, init: RequestInit) => {
-      const h = new Headers(init.headers);
-      seen.push({ url, accept: h.get("accept"), auth: h.get("authorization") });
-      if (url.endsWith("/releases/latest")) return Response.json({ assets: [{ name: "other.zip", url: "https://x/other" }, { name: "ais-browser-extension.zip", url: "https://api.test/asset/1" }] });
-      return new Response(Bun.file(zip));
+  test("a bad GITHUB_TOKEN and a gh that exits 401 do not block the public download", async () => {
+    const zip = await makeZip("bad-tok", { "manifest.json": '{"version":"4"}' });
+    const seen: string[] = [];
+    const fakeFetch = (async (url: string) => {
+      seen.push(url);
+      return url.startsWith("https://api.github.com") ? new Response("Bad credentials", { status: 401 }) : new Response(Bun.file(zip));
     }) as unknown as typeof fetch;
+    const calls: string[][] = [];
     const runCmd = async (cmd: string[]): Promise<CommandResult> => {
-      if (cmd[0] === "gh") return { code: 127, stderr: "not found" };
-      return real(cmd);
+      calls.push(cmd);
+      return cmd[0] === "gh" ? { code: 1, stderr: "HTTP 401: Bad credentials" } : real(cmd);
     };
-    await run("browser extension update", { run: runCmd, fetch: fakeFetch, env: { GH_TOKEN: "tok" }, platform: "linux" });
-    expect(seen[1]).toEqual({ url: "https://api.test/asset/1", accept: "application/octet-stream", auth: "Bearer tok" });
+    const saved = { g: process.env.GITHUB_TOKEN, h: process.env.GH_TOKEN };
+    process.env.GITHUB_TOKEN = "bad";
+    process.env.GH_TOKEN = "bad";
+    try {
+      await run("browser extension update", { run: runCmd, fetch: fakeFetch, platform: "linux" });
+    } finally {
+      if (saved.g === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = saved.g;
+      if (saved.h === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved.h;
+    }
+    expect(seen.every((u) => u.startsWith("https://github.com/"))).toBe(true);
+    expect(calls.some((c) => c[0] === "gh")).toBe(false);
     expect(readFileSync(join(target, "manifest.json"), "utf8")).toContain('"4"');
   });
 
-  test("without gh or a token fails and keeps the old folder", async () => {
+  test("a failed download reports the HTTP status and keeps the old folder", async () => {
     mkdirSync(target, { recursive: true });
     writeFileSync(join(target, "manifest.json"), '{"version":"0"}');
-    const runCmd = async (): Promise<CommandResult> => ({ code: 127, stderr: "" });
-    await expect(run("browser extension update", { run: runCmd, env: {} })).rejects.toThrow(/GITHUB_TOKEN/);
+    const fakeFetch = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
+    await expect(run("browser extension update", { fetch: fakeFetch, platform: "linux" })).rejects.toThrow(/HTTP 500/);
     expect(readFileSync(join(target, "manifest.json"), "utf8")).toContain('"0"');
     expect(readdirSync(join(dir, "home"))).toEqual(["browser-extension"]);
   });
 
   test("unknown subcommand is a usage error", async () => {
     await expect(run("browser extension nope")).rejects.toThrow(/Usage/);
-  });
-
-  test("any gh failure falls back to REST with an env token", async () => {
-    const zip = await makeZip("fb", { "manifest.json": '{"version":"5"}' });
-    const fakeFetch = (async (url: string) => (url.endsWith("/releases/latest") ? Response.json({ assets: [{ name: "ais-browser-extension.zip", url: "https://api.test/a" }] }) : new Response(Bun.file(zip)))) as unknown as typeof fetch;
-    const runCmd = async (cmd: string[]): Promise<CommandResult> => (cmd[0] === "gh" ? { code: 1, stderr: "HTTP 404" } : real(cmd));
-    await run("browser extension update", { run: runCmd, fetch: fakeFetch, env: { GITHUB_TOKEN: "t" }, platform: "linux" });
-    expect(readFileSync(join(target, "manifest.json"), "utf8")).toContain('"5"');
-  });
-
-  test("gh failure uses the gh login token for REST", async () => {
-    const zip = await makeZip("fb2", { "manifest.json": '{"version":"6"}' });
-    let auth = "";
-    const fakeFetch = (async (url: string, init: RequestInit) => {
-      auth = new Headers(init.headers).get("authorization") ?? "";
-      return url.endsWith("/releases/latest") ? Response.json({ assets: [{ name: "ais-browser-extension.zip", url: "https://api.test/a" }] }) : new Response(Bun.file(zip));
-    }) as unknown as typeof fetch;
-    const runCmd = async (cmd: string[]): Promise<CommandResult> => {
-      if (cmd[0] === "gh" && cmd[1] !== "release") return { code: 0, stderr: "", stdout: "ghtok\n" };
-      return cmd[0] === "gh" ? { code: 1, stderr: "boom" } : real(cmd);
-    };
-    await run("browser extension update", { run: runCmd, fetch: fakeFetch, env: {}, platform: "linux" });
-    expect(auth).toBe("Bearer ghtok");
-  });
-
-  test("both gh and REST failing reports both errors and keeps the old folder", async () => {
-    mkdirSync(target, { recursive: true });
-    writeFileSync(join(target, "manifest.json"), '{"version":"0"}');
-    const fakeFetch = (async () => new Response("no", { status: 500 })) as unknown as typeof fetch;
-    const runCmd = async (cmd: string[]): Promise<CommandResult> => (cmd[0] === "gh" ? { code: 1, stderr: "gh broke" } : real(cmd));
-    await expect(run("browser extension update", { run: runCmd, fetch: fakeFetch, env: { GH_TOKEN: "t" }, platform: "linux" })).rejects.toThrow(/gh broke.*REST fallback failed.*500/);
-    expect(readFileSync(join(target, "manifest.json"), "utf8")).toContain('"0"');
   });
 
   test("a zip with a traversal entry is rejected before extraction", async () => {

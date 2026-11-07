@@ -176,6 +176,7 @@ ETA: 2026-11-14 18:00 ICT
 | 120 | AIS Browser: Chrome extension agents drive via the gateway | done | claude-20261104-browser | ais-browser | | | Shipped in v0.5.24 + v0.5.25<br>PRs #360 #364 #365 #367<br>Gateway live (.cluster #2131) |
 | 121 | Release v0.5.24 with extension zip | done | Thomas | | | | Released v0.5.24 with ais-browser-extension.zip |
 | 122 | Install on Mac and pair profiles | blocked_on_owner | Thomas | | 6.121 | | ais update (needs 0.5.24)<br>ais browser extension update<br>chrome://extensions: Developer mode, Load unpacked ~/.ais/browser-extension, each profile<br>Options: wss:// gateway URL, Sign in<br>Approve code on the gateway host: ais browser approve CODE --pool=NAME or --identity=ID |
+| 141 | Extension update: public download | in_progress | Claude | ext-public-download | | 2026-11-07 14:00 ICT | `ais browser extension update` failed with HTTP 401 on stale gh/GitHub credentials.<br>Use the shared anonymous release-asset download instead. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-14 18:00 ICT
