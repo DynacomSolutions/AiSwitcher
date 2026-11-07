@@ -27,7 +27,9 @@ const toEntry = (r: any): JournalEntry => ({
  * Refresh lock and journal in the gateway's PostgreSQL. The lock is a session-level advisory lock on a reserved
  * connection: it is exclusive across every replica and process, and the database drops it if the holder dies.
  * The journal queries run on that same reserved connection, so a holder never needs a second pool connection (no
- * pool deadlock), and at most MAX_HOLDERS locks are held at once. Every call is bounded in time.
+ * pool deadlock), and at most MAX_HOLDERS locks are held at once. Every call is bounded in time on the client; no startup
+ * parameter is sent (a connection pooler such as PgBouncer rejects unknown ones, which left every refresh unguarded), and the
+ * server-side statement_timeout is only set best-effort with SET on the reserved connection.
  */
 export class PgRefreshBackend implements RefreshGuardBackend {
   private readonly sql: SQL;
@@ -35,7 +37,7 @@ export class PgRefreshBackend implements RefreshGuardBackend {
   private readonly waiters: Array<() => void> = [];
 
   constructor(url: string, private readonly callMs = BACKEND_CALL_TIMEOUT_MS) {
-    this.sql = new SQL(url, { max: POOL_MAX, connection: { statement_timeout: callMs } });
+    this.sql = new SQL(url, { max: POOL_MAX });
   }
 
   async close(): Promise<void> {
@@ -87,6 +89,8 @@ export class PgRefreshBackend implements RefreshGuardBackend {
         throw err;
       }
       const c = conn;
+      // Server-side bound too, where the server allows a SET (never a startup parameter); the client timeout is what is relied on.
+      await bounded(c.unsafe(`SET statement_timeout = ${Math.trunc(this.callMs)}`), this.callMs, "guard setup").catch(() => undefined);
       for (;;) {
         if (Date.now() >= deadline) throw timedOut();
         const rows = await bounded(c`SELECT pg_try_advisory_lock(hashtextextended(${name}, 0)) AS got`, this.callMs, "guard lock");
@@ -111,6 +115,7 @@ export class PgRefreshBackend implements RefreshGuardBackend {
         released = true;
         try {
           await bounded(c`SELECT pg_advisory_unlock(hashtextextended(${name}, 0))`, this.callMs, "guard unlock");
+          await bounded(c.unsafe("RESET statement_timeout"), this.callMs, "guard reset").catch(() => undefined);
           c.release();
         } catch (err) {
           // An unlock that failed would leave the lock on a pooled connection: end the session, which frees it.

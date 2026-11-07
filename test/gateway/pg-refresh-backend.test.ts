@@ -91,16 +91,68 @@ if (!url && process.env.CI && !optOut) {
       await lock.release();
     });
 
-    test("every call is bounded by statement_timeout", async () => {
+    test("works through a pooler that rejects startup parameters (PgBouncer): no statement_timeout is sent at startup", async () => {
       await prepare();
-      const lock = await open().acquire(account, 1000);
-      // pg_sleep on the lock connection must be cut short by the 5 s statement timeout, not run for 30 s.
-      const sql = new SQL(url as string, { connection: { statement_timeout: 300 } });
-      const t0 = Date.now();
-      await expect(sql`SELECT pg_sleep(5)`).rejects.toBeDefined();
-      expect(Date.now() - t0).toBeLessThan(3000);
-      await sql.close();
-      await lock.release();
+      const target = new URL(url as string);
+      // A stand-in pooler: refuses a startup packet carrying any statement_timeout parameter, as PgBouncer does, else forwards.
+      const proxy = Bun.listen<{ up?: Awaited<ReturnType<typeof Bun.connect>>; first: boolean }>({
+        hostname: "127.0.0.1",
+        port: 0,
+        socket: {
+          open(sock) {
+            sock.data = { first: true };
+          },
+          async data(sock, chunk) {
+            if (sock.data.first) {
+              sock.data.first = false;
+              if (Buffer.from(chunk).includes("statement_timeout")) {
+                const msg = Buffer.from("unsupported startup parameter: statement_timeout\0");
+                const fields = Buffer.concat([Buffer.from("SFATAL\0C08P01\0M"), msg, Buffer.from("\0")]);
+                const head = Buffer.alloc(5);
+                head.write("E");
+                head.writeInt32BE(4 + fields.length, 1);
+                sock.write(Buffer.concat([head, fields]));
+                sock.end();
+                return;
+              }
+              sock.data.up = await Bun.connect({
+                hostname: target.hostname,
+                port: Number(target.port),
+                socket: {
+                  data(_up, d) {
+                    sock.write(d);
+                  },
+                  close() {
+                    sock.end();
+                  },
+                },
+              });
+            }
+            sock.data.up?.write(chunk);
+          },
+          close(sock) {
+            sock.data.up?.end();
+          },
+        },
+      });
+      try {
+        const via = new URL(url as string);
+        via.hostname = "127.0.0.1";
+        via.port = String(proxy.port);
+        const backend = new PgRefreshBackend(via.toString());
+        opened.push(backend);
+        const lock = await backend.acquire(account, 3000);
+        const id = await lock.claim("pool0001", "pod-1");
+        await lock.resolve(id, "failed");
+        expect((await lock.findByOldFp("pool0001"))[0]).toMatchObject({ outcome: "failed" });
+        await lock.release();
+        // And the pooler really does refuse what the old code sent, so this test would have caught it.
+        const old = new SQL(via.toString(), { connection: { statement_timeout: 5000 } });
+        await expect(old`SELECT 1`).rejects.toThrow(/unsupported startup parameter/);
+        await old.close().catch(() => undefined);
+      } finally {
+        proxy.stop(true);
+      }
     });
 
     test("ten accounts refreshing at once do not deadlock the pool", async () => {

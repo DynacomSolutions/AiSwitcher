@@ -239,6 +239,36 @@ describe("refresh guard", () => {
     expect(inner.entries.some((e) => e.outcome === "refreshed")).toBe(true);
   });
 
+  test("the degraded alert says why: error name, code and a masked, short message", async () => {
+    const w = world();
+    const reasons: string[] = [];
+    const err = Object.assign(new Error("unsupported startup parameter: statement_timeout (postgres://user:pw@host/db)"), { name: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR" });
+    const backend: RefreshGuardBackend = { acquire: async () => { throw err; } };
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, onDegraded: (_a, why) => void reasons.push(why) });
+    await guard("claude", ID, { force: true });
+    expect(reasons[0]).toBe("PostgresError ERR_POSTGRES_SERVER_ERROR - unsupported startup parameter: statement_timeout (<url>");
+    expect(reasons[0]).not.toContain("pw");
+  });
+
+  test("a journal read error still refuses a token this process saw rotated out", async () => {
+    const w = world();
+    const inner = new MemoryRefreshBackend();
+    let breakJournal = false;
+    const backend: RefreshGuardBackend = {
+      acquire: async (a, t) => {
+        const h = await inner.acquire(a, t);
+        return { ...h, findByOldFp: async (fp) => { if (breakJournal) throw new Error("conn reset"); return h.findByOldFp(fp); } };
+      },
+    };
+    const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, warn: () => {} });
+    const old = w.grant;
+    await guard("claude", ID, { force: true });
+    w.grant = old;
+    breakJournal = true;
+    await expect(guard("claude", ID, { force: true })).rejects.toThrow(/rotated out/);
+    expect(w.posts).toBe(1);
+  });
+
   test("degraded mode still refuses a token this process saw rotated out", async () => {
     const w = world();
     let down = false;
@@ -306,7 +336,7 @@ describe("refresh guard", () => {
     const res = await guard("claude", ID, { force: true });
     expect(res.outcome).toBe("refreshed");
     expect(w.posts).toBe(1);
-    expect(raised).toEqual(["claude/acct1:Error"]);
+    expect(raised).toEqual(["claude/acct1:Error - connect refused"]);
     expect(metrics.render()).toContain('ais_gateway_refresh_guard_degraded_total{provider="claude",identity="acct1"} 1');
   });
 

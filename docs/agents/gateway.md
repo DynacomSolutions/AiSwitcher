@@ -181,7 +181,7 @@ CLIProxyAPI's refresh journal):
   so the database frees the lock. The journal queries run on that same
   connection, and at most 8 locks are held at once (pool of 10), so the pool
   cannot deadlock. Every backend call is bounded to about 5 s
-  (`statement_timeout` plus a client timeout).
+  (a client timeout, plus a best-effort `SET statement_timeout` on the reserved connection; never a startup parameter, which a connection pooler rejects).
 - Adopt first: the latest stored grant is re-read under the lock. A newer
   refresh token or expiry (or an access token that no longer matches the one
   the caller saw) is used as it is; no token request and no journal row. A grant
