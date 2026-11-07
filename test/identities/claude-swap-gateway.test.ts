@@ -336,6 +336,11 @@ describe("the cluster gateway owns gateway-managed logins; nothing local touches
         const healed = (await read(join(root, "a", ".credentials.json"))).claudeAiOauth;
         expect(healed.accessToken).toBe("at-2");
         expect(healed.refreshToken).toBe("rt-2");
+        // The repair overwrote the store's refresh token: the old file is kept in a unique timestamped 0600 backup.
+        const backups = (await readdir(join(root, "a"))).filter((f) => f.startsWith(".credentials.json.pre-heal.") && f.endsWith(".bak"));
+        expect(backups).toHaveLength(1);
+        expect((await stat(join(root, "a", backups[0] as string))).mode & 0o777).toBe(0o600);
+        expect(await readFile(join(root, "a", backups[0] as string), "utf8")).toContain("rt-new");
         expect(bodies.length).toBe(0); // at-2 is valid: no POST
         await refreshIdentityOAuthGrant("claude", member(), { force: true, claudeRegistryPath: registry, fetchImpl });
       });

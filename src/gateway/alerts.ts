@@ -1,6 +1,6 @@
 import type { LedgerBuffer } from "./ledger-buffer.ts";
 
-export type AlertKind = "refresh-failed" | "ledger-drop";
+export type AlertKind = "refresh-failed" | "ledger-drop" | "refresh-guard-degraded";
 
 export interface OwnerAlert {
   kind: AlertKind;

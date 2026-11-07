@@ -6,10 +6,12 @@ import type { GatewayApp, GatewayProvider, IdentityUsageRow, TokenRecord, UsageR
 import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
+import refreshJournal0003 from "./migrations/0003_refresh_journal.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
   { version: "0002_browser", sql: browser0002 },
+  { version: "0003_refresh_journal", sql: refreshJournal0003 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */

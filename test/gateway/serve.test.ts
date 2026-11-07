@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
 import { createGatewayApp, styleForPath } from "../../src/gateway/app.ts";
 import { instrumentRefresh, keepAliveOnce, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
+import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
+import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
@@ -55,6 +57,7 @@ async function seed(): Promise<string> {
 function hooks(over: Partial<GatewayHooks> = {}): GatewayHooks {
   return {
     host: "127.0.0.1",
+    refreshBackend: new MemoryRefreshBackend(),
     migrate: async () => {
       if (migrateFails) throw new Error("connect ECONNREFUSED");
     },
@@ -639,5 +642,72 @@ describe("idle keep-alive", () => {
     fp = "fp-2"; // re-login minted a different grant: the stale mark no longer matches, so the refresh runs
     await keepAliveOnce({ refresh, accounts, metrics, revoked });
     expect(revoked.has("a")).toBe(false);
+  });
+});
+
+describe("idle keep-alive and the refresh guard", () => {
+  const acct = { name: "ka1", label: "ka1", configDir: "/x/ka1" };
+
+  test("the keep-alive refreshes through the guard: lock taken, claim journalled before the request, and stop() waits for it", async () => {
+    const backend = new MemoryRefreshBackend();
+    let posts = 0;
+    let finish!: () => void;
+    const hold = new Promise<void>((r) => (finish = r));
+    const g = await boot({
+      refreshBackend: backend,
+      keepAliveMs: 20,
+      keepAliveAccounts: async () => [acct],
+      refreshImpl: (async (tool: string, id: { name: string }, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
+        await o?.beforePost?.({ fingerprint: "aaaa1111" });
+        posts += 1;
+        await hold;
+        return { tool, identity: id.name, outcome: "refreshed", detail: "", afterFingerprint: "bbbb2222", written: [], writeFailures: [] };
+      }) as never,
+      // The guard reads the stored grant; the fake store has none for this fixture identity.
+    });
+    await waitFor(() => posts > 0);
+    expect(backend.acquires).toBeGreaterThan(0);
+    expect(backend.entries[0]).toMatchObject({ provider: "claude", identity: "ka1", oldFp: "aaaa1111" });
+    expect(backend.entries[0]?.outcome).toBeUndefined();
+    let stopped = false;
+    const stopping = g.stop().then(() => (stopped = true));
+    await Bun.sleep(60);
+    expect(stopped).toBe(false); // the refresh in flight keeps the backend open
+    finish();
+    await stopping;
+    expect(backend.entries[0]).toMatchObject({ outcome: "refreshed", newFp: "bbbb2222" });
+  });
+
+  test("a bare 400/401 (no dead-grant OAuth code) is not remembered as revoked; invalid_grant is", async () => {
+    const accounts = async () => [acct];
+    const metrics = { keepAlive: () => {} };
+    const revoked = new Map<string, string>();
+    const bare = (async () => {
+      throw new OAuthRefreshError("token refresh rejected (HTTP 400)", true, "fp-9", undefined);
+    }) as never;
+    await keepAliveOnce({ refresh: bare, accounts, metrics, revoked });
+    expect(revoked.size).toBe(0);
+    const dead = (async () => {
+      throw new OAuthRefreshError("token refresh rejected (HTTP 400 invalid_grant)", true, "fp-9", "invalid_grant");
+    }) as never;
+    await keepAliveOnce({ refresh: dead, accounts, metrics, revoked });
+    expect(revoked.get("ka1")).toBe("fp-9");
+  });
+
+  test("lock timeouts and guard-retryable errors do not raise the log-in-again alert", async () => {
+    const { SwapLockError } = await import("../../src/identities/claude-swap-lock.ts");
+    const { RefreshGuardRetryable } = await import("../../src/gateway/refresh-guard.ts");
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(a.key));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    for (const err of [new SwapLockError("busy", "/l", true), new RefreshGuardRetryable("retry")]) {
+      const refresh = instrumentRefresh((async () => {
+        throw err;
+      }) as never, { metrics, alerter });
+      await refresh("claude", acct as never, {}).catch(() => undefined);
+    }
+    expect(seen).toEqual([]);
+    expect(metrics.render()).toContain('outcome="lock-timeout"');
+    expect(metrics.render()).toContain('outcome="retryable"');
   });
 });

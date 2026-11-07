@@ -67,6 +67,12 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly tokens = new Counter("ais_gateway_tokens_total", "Tokens used by proxied requests.");
   private readonly refreshes = new Counter("ais_gateway_refresh_total", "Login refresh attempts by outcome.");
   private readonly keepAlives = new Counter("ais_gateway_keepalive_total", "Idle keep-alive refresh passes over managed logins, by outcome.");
+  private readonly refreshAttempts = new Counter("ais_gateway_refresh_attempts_total", "Login refresh attempts reaching the refresh guard, per account.");
+  private readonly refreshSuccesses = new Counter("ais_gateway_refresh_successes_total", "Login refreshes that renewed or adopted a fresh grant, per account.");
+  private readonly refreshFailures = new Counter("ais_gateway_refresh_failures_total", "Login refreshes that failed or were refused, per account.");
+  private readonly refreshDegraded = new Counter("ais_gateway_refresh_guard_degraded_total", "Refreshes run without the guard (database unavailable), under the file lock and compare-and-swap only, per account.");
+  private readonly refreshLockWaits = new Counter("ais_gateway_refresh_lock_waits_total", "Refreshes that had to wait for another holder's account lock, per account.");
+  private readonly refreshLockWaitSeconds = new Counter("ais_gateway_refresh_lock_wait_seconds_total", "Seconds spent waiting for account refresh locks, per account.");
   private readonly rejections = new Counter("ais_gateway_rejections_total", "Requests rejected before reaching a provider.");
   private readonly failovers = new Counter("ais_gateway_failovers_total", "Requests retried on another pool member.");
   private readonly failOpens = new Counter("ais_gateway_fail_open_total", "Safety checks skipped so the request could proceed.");
@@ -161,9 +167,21 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.refreshes.inc({ provider, outcome });
   }
 
+  refreshGuard(event: "attempt" | "success" | "failure" | "lock_wait" | "degraded", provider: string, identity: string, seconds = 0): void {
+    const l = { provider, identity };
+    if (event === "attempt") this.refreshAttempts.inc(l);
+    else if (event === "success") this.refreshSuccesses.inc(l);
+    else if (event === "failure") this.refreshFailures.inc(l);
+    else if (event === "degraded") this.refreshDegraded.inc(l);
+    else {
+      this.refreshLockWaits.inc(l);
+      this.refreshLockWaitSeconds.inc(l, seconds);
+    }
+  }
+
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);
