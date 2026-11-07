@@ -15,7 +15,10 @@ credentials into an app.
 
 Run it from a host that has `kubectl` access to the app's namespace. The admin
 endpoint and token are read from `~/.secrets` (`AIS_GATEWAY_ADMIN_URL`,
-`AIS_GATEWAY_ADMIN_TOKEN`, plus `AIS_GATEWAY_PROXY_URL`, the public proxy base).
+`AIS_GATEWAY_ADMIN_TOKEN`, plus `AIS_GATEWAY_PROXY_URL`, the public proxy base). The base may carry a path prefix
+(for example `https://gw.example.com/gateway`); clients append `/<app>/...` and
+`/browser/...` to it unchanged. There is no built-in default: when it is unset
+the CLI asks for it.
 
 ```sh
 ais gateway app add billing --namespace=shop --provider=claude --pool

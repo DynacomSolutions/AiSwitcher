@@ -527,6 +527,20 @@ describe("remote URL guard and drain", () => {
     }
   });
 
+  test("a remote base with a path prefix keeps the prefix on proxied requests", async () => {
+    const seenPaths: string[] = [];
+    const upstream = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => { seenPaths.push(new URL(req.url).pathname); return new Response("ok"); } });
+    const running = await startLocalGateway({ port: 0, remoteBase: "https://gw.example.com/gateway/", fetch: ((u: string | URL | Request, i?: RequestInit) => fetch(String(u).replace("https://gw.example.com", `http://127.0.0.1:${upstream.port}`), i)) as typeof fetch, members: async () => [], log: () => {}, clientToken: async () => CLIENT_KEY });
+    try {
+      const res = await fetch(`http://127.0.0.1:${running.port}/claude/v1/messages`, { method: "POST", body: "{}", headers: { "x-api-key": CLIENT_KEY } });
+      expect(await res.text()).toBe("ok");
+      expect(seenPaths).toEqual(["/gateway/agents-claude/v1/messages"]);
+    } finally {
+      running.stop();
+      upstream.stop(true);
+    }
+  });
+
   test("drain lets an in-flight stream finish after stop is requested", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));

@@ -43,6 +43,15 @@ test("tools/call posts to the gateway and maps image content", async () => {
   expect(seen[0]).toEqual({ auth: "Bearer tok", body: { browser: "b1", session: { id: "abcdef123", identity: "work", label: "work / abcdef" }, tool: "screenshot", args: { tabId: 3 } } });
 });
 
+test("a gateway base with a path prefix keeps the prefix on /browser/call", async () => {
+  reply = { id: "x", ok: true, content: [{ type: "text", text: "hi" }] };
+  const urls: string[] = [];
+  const base = ctx("https://gw.example.com/gateway/");
+  const spy = { ...base, fetch: ((u: string, init: RequestInit) => { urls.push(u); return app.request(u, init); }) as unknown as typeof fetch };
+  await handleRpc({ id: 1, method: "tools/call", params: { name: "tabs_context", arguments: {} } }, spy);
+  expect(urls).toEqual(["https://gw.example.com/gateway/browser/call"]);
+});
+
 test("error codes become isError text; stopped_by_user adds the sentence", async () => {
   reply = { id: "x", ok: false, error: "no_browser", message: "none" };
   expect((await call("tabs_context")).result).toEqual({ isError: true, content: [{ type: "text", text: "no_browser: none" }] });
