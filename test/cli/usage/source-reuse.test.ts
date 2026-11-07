@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { appendFile, link, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { refreshUsageSnapshot, type UsageSnapshotDeps, type UsageSnapshotPartition } from "../../../src/cli/usage/snapshot.ts";
+import { refreshUsageSnapshot, runningAisExecutable, writeSnapshot, type UsageSnapshot, type UsageSnapshotDeps, type UsageSnapshotPartition } from "../../../src/cli/usage/snapshot.ts";
 import { DigestMemo, nativeSourceFingerprint, sharedNativeExportInputs, type NativeSourceFingerprintEnv } from "../../../src/cli/usage/source-fingerprint.ts";
 import { usageSnapshotTargetKey } from "../../../src/cli/usage/snapshot-dirty.ts";
 import type { UsageResult, UsageTarget } from "../../../src/cli/usage/run.ts";
@@ -172,6 +173,62 @@ describe("native source fingerprint", () => {
     };
     expect(at("0.5.30")).toBe(at("0.5.30")!);
     expect(at("0.5.31")).not.toBe(at("0.5.30")!);
+  });
+
+  test("a different AIS build under the same version exports again", async () => {
+    const f = await fixture();
+    const aisExecutablePath = join(f.root, "ais");
+    await writeFile(aisExecutablePath, "ais-build-1", { mode: 0o755 });
+    const env = { ...f.env, aisVersion: "0.5.30", aisExecutablePath };
+    const fingerprint = () => nativeSourceFingerprint(f.claude, sharedNativeExportInputs(env), env);
+    const root = await tempRoot();
+    const t0 = Date.UTC(2026, 10, 7, 12);
+    expect((await cycle(root, t0, fingerprint())).exported).toBe(true);
+    expect((await cycle(root, t0 + HOUR, fingerprint())).exported).toBe(false);
+    // A merge without a version bump: new bytes, same version string.
+    await rm(aisExecutablePath);
+    await writeFile(aisExecutablePath, "ais-build-2", { mode: 0o755 });
+    expect((await cycle(root, t0 + 2 * HOUR, fingerprint())).exported).toBe(true);
+    expect((await cycle(root, t0 + 3 * HOUR, fingerprint())).exported).toBe(false);
+  });
+
+  test("the running build is read through /proc/self/exe on Linux, else its path", () => {
+    const compiled = "/$bunfs/root/ais";
+    expect(runningAisExecutable("linux", compiled, "/usr/local/bin/ais")).toBe("/proc/self/exe");
+    expect(runningAisExecutable("darwin", compiled, "/usr/local/bin/ais")).toBe("/usr/local/bin/ais");
+    // A development run has no single build.
+    expect(runningAisExecutable("linux", import.meta.path, "/usr/bin/bun")).toBeUndefined();
+  });
+
+  test("the build digest follows the running image when a new build is renamed over its path", async () => {
+    const f = await fixture();
+    const installed = join(f.root, "ais");
+    const running = join(f.root, "running-image");
+    await writeFile(installed, "ais-build-1", { mode: 0o755 });
+    // Stands in for /proc/self/exe: a name for the inode this process runs,
+    // which a rename over the installed path does not change.
+    await link(installed, running);
+    const env = (aisExecutablePath: string) => ({ ...f.env, aisVersion: "0.5.30", aisExecutablePath });
+    const before = sharedNativeExportInputs(env(running));
+    // An update renames a new build over the installed path mid-cycle.
+    await writeFile(join(f.root, "ais.new"), "ais-build-2", { mode: 0o755 });
+    await rename(join(f.root, "ais.new"), installed);
+    expect(sharedNativeExportInputs(env(running))).toBe(before);
+    expect(sharedNativeExportInputs(env(installed))).not.toBe(before);
+  });
+
+  test("an unreadable AIS executable falls back to the version, keeping reuse", async () => {
+    const f = await fixture();
+    const versionOnly = sharedNativeExportInputs({ ...f.env, aisVersion: "0.5.30" });
+    const missing = sharedNativeExportInputs({ ...f.env, aisVersion: "0.5.30", aisExecutablePath: join(f.root, "no-such-ais") });
+    expect(missing).toBeDefined();
+    expect(missing).toBe(versionOnly);
+  });
+
+  test("on Linux the real running image digests to the bytes this process runs", () => {
+    if (process.platform !== "linux") return;
+    const memo = new DigestMemo();
+    expect(memo.digest("/proc/self/exe")).toBe(createHash("sha256").update(readFileSync(process.execPath)).digest("hex"));
   });
 
   test("undecidable sources are always exported", async () => {
@@ -362,5 +419,111 @@ describe("collector reuse of unchanged sources", () => {
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, JSON.stringify(snapshot));
     expect((await cycle(root, t0 + HOUR, "a".repeat(64))).exported).toBe(true);
+  });
+});
+
+describe("a failed commit of one source", () => {
+  const names = ["a", "b", "c"];
+  const targets: UsageTarget[] = names.map((name) => ({ toolName: "claude", identity: { ...identity, name, label: name } as UsageTarget["identity"] }));
+  const keyOf = (name: string) => usageSnapshotTargetKey("claude", name);
+  const idOf = (name: string) => createHash("sha256").update(`ais-native-partition-v1\0${keyOf(name)}`).digest("hex");
+
+  /** One cycle over a, b and c. Each source's commit takes `delayMs` (a's
+   * none), and the snapshot write that commits `failing` throws. */
+  async function run(root: string, now: number, fingerprints: Record<string, string>, options: { failing?: string; delayMs?: number } = {}) {
+    const path = join(root, "usage", "snapshot.json");
+    const tokscaleConfigDir = join(root, "isolated-config");
+    await mkdir(tokscaleConfigDir, { recursive: true });
+    await writeFile(join(tokscaleConfigDir, "settings.json"), JSON.stringify({ scanner: { bucketTimezone: "America/New_York" } }));
+    let returned = false;
+    let lateWrites = 0;
+    let failed = false;
+    const exported: string[] = [];
+    const delay = (name: string) => Bun.sleep(name === "a" ? 0 : options.delayMs ?? 0);
+    const deps: UsageSnapshotDeps = {
+      path, nativeBatchRoot: join(root, "native"), dirtyDirectory: join(root, "dirty"), now: () => now, partitionTtlMs: 15 * 60_000,
+      collectTargets: async () => targets, collectPoolTargets: async () => [],
+      collectDefaultProfile: async () => [], collectSwapPools: async () => [],
+      captureNative: async () => undefined,
+      nativeSourceFingerprint: (t) => fingerprints[t.identity.name],
+      usageRunDeps: { fetchExtraCost: async (_tool, who) => { await delay(who.name); return undefined; } },
+      writeSnapshot: (snapshot: UsageSnapshot, file: string) => {
+        if (returned) lateWrites++;
+        const committing = options.failing && snapshot.partitions[keyOf(options.failing)]?.lastSuccessAt === new Date(now).toISOString();
+        if (committing && !failed) {
+          failed = true;
+          throw new Error("disk full");
+        }
+        writeSnapshot(snapshot, file);
+      },
+      prepareNativeExportCandidate: async (t) => ({ path: join(root, `candidate-${t.identity.name}-${now}.json`), partitionId: idOf(t.identity.name), tokscaleConfigDir }),
+      // Exports run concurrently, as the report run does.
+      collectTargetResults: async (selected, onItemDone, prepareNativeExport) => {
+        exported.push(...selected.map((t) => t.identity.name));
+        await Promise.all(selected.map(async (t, index) => {
+          const candidate = await prepareNativeExport!(t);
+          await writeFile(candidate!.path, JSON.stringify({ ...nativeExport, messages: (nativeExport.messages as unknown[]).slice(0, 5), partitionId: idOf(t.identity.name), generatedAt: new Date(now).toISOString() }));
+          await delay(t.identity.name);
+          await onItemDone(index, [{ ...row(5), identity: t.identity }]);
+        }));
+        return [];
+      },
+    };
+    await refreshUsageSnapshot(deps);
+    returned = true;
+    await Bun.sleep((options.delayMs ?? 0) + 200);
+    const partitions = (JSON.parse(await readFile(path, "utf8")) as { partitions: Record<string, UsageSnapshotPartition> }).partitions;
+    return { partitions, lateWrites, exported };
+  }
+
+  test("while reusing: the others still commit and nothing is written after the cycle returns", async () => {
+    const root = await tempRoot();
+    const t0 = Date.UTC(2026, 10, 7, 12);
+    const same = { a: "a".repeat(64), b: "b".repeat(64), c: "c".repeat(64) };
+    await run(root, t0, same);
+    const { partitions, lateWrites, exported } = await run(root, t0 + HOUR, same, { failing: "a", delayMs: 150 });
+    expect(exported).toEqual([]);
+    expect(lateWrites).toBe(0);
+    expect(partitions[keyOf("a")]?.lastError).toBe("source-error");
+    // The failed commit keeps the last committed success and no fingerprint.
+    expect(partitions[keyOf("a")]?.lastSuccessAt).toBe(new Date(t0).toISOString());
+    expect(partitions[keyOf("a")]?.sourceFingerprint).toBeUndefined();
+    expect(partitions[keyOf("a")]?.nativeExportedAt).toBeUndefined();
+    expect(partitions[keyOf("a")]?.results.length).toBeGreaterThan(0);
+    for (const name of ["b", "c"]) {
+      expect(partitions[keyOf(name)]?.lastError).toBeUndefined();
+      expect(partitions[keyOf(name)]?.lastSuccessAt).toBe(new Date(t0 + HOUR).toISOString());
+    }
+    // The next cycle, well inside the 15-minute TTL, exports a again.
+    const next = await run(root, t0 + HOUR + 2 * 60_000, same);
+    expect(next.exported).toEqual(["a"]);
+    expect(next.partitions[keyOf("a")]?.lastError).toBeUndefined();
+  });
+
+  test("while exporting: the others still commit and nothing is written after the cycle returns", async () => {
+    const root = await tempRoot();
+    const t0 = Date.UTC(2026, 10, 7, 12);
+    await run(root, t0, { a: "a".repeat(64), b: "b".repeat(64), c: "c".repeat(64) });
+    // Every source changed: all three export, and a's commit fails.
+    const changed = { a: "d".repeat(64), b: "e".repeat(64), c: "f".repeat(64) };
+    const { partitions, lateWrites, exported } = await run(root, t0 + HOUR, changed, { failing: "a", delayMs: 150 });
+    expect(exported.sort()).toEqual(["a", "b", "c"]);
+    expect(lateWrites).toBe(0);
+    expect(partitions[keyOf("a")]?.lastError).toBe("source-error");
+    // The failed commit keeps the last committed success and no fingerprint.
+    expect(partitions[keyOf("a")]?.lastSuccessAt).toBe(new Date(t0).toISOString());
+    expect(partitions[keyOf("a")]?.sourceFingerprint).toBeUndefined();
+    expect(partitions[keyOf("a")]?.nativeExportedAt).toBeUndefined();
+    for (const name of ["b", "c"]) {
+      expect(partitions[keyOf(name)]?.lastError).toBeUndefined();
+      expect(partitions[keyOf(name)]?.nativeCoverage).toBe("supported");
+      expect(partitions[keyOf(name)]?.lastSuccessAt).toBe(new Date(t0 + HOUR).toISOString());
+      expect(partitions[keyOf(name)]?.sourceFingerprint).toBe(changed[name as keyof typeof changed]);
+    }
+    // The next cycle, well inside the 15-minute TTL, exports a again.
+    const next = await run(root, t0 + HOUR + 2 * 60_000, changed);
+    expect(next.exported).toEqual(["a"]);
+    expect(next.partitions[keyOf("a")]?.lastError).toBeUndefined();
+    expect(next.partitions[keyOf("a")]?.sourceFingerprint).toBe(changed.a);
   });
 });

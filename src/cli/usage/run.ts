@@ -511,15 +511,29 @@ export const USAGE_MAX_CONCURRENT = 6;
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
-  options: { explicitTool?: boolean; onItemDone?: (index: number, results: UsageResult[]) => unknown; deps?: UsageRunDeps } = {},
+  options: {
+    explicitTool?: boolean;
+    onItemDone?: (index: number, results: UsageResult[]) => unknown;
+    deps?: UsageRunDeps;
+    /** A target that throws becomes a source-error row instead of rejecting
+     * the run while other targets are still in flight (the snapshot
+     * collector must not have work running after its cycle returns). */
+    settleEachTarget?: boolean;
+  } = {},
 ): Promise<UsageResult[]> {
   const suppression: UsageRowSuppression = { explicitTool: options.explicitTool ?? false };
-  return runBatched(
-    targets,
-    USAGE_MAX_CONCURRENT,
-    async (target) => runOne(target, suppression, options.deps),
-    options.onItemDone,
-  ).then((batches) => aggregateUsageResults(batches.flat()));
+  const one = options.settleEachTarget
+    ? async (target: UsageTarget): Promise<UsageResult[]> => {
+      try {
+        return await runOne(target, suppression, options.deps);
+      } catch (error) {
+        logUsageSourceFailure(`${target.toolName}:${target.identity.name} run`, error);
+        return [{ provider: "unattributed", identity: target.identity, sourceOnlyError: true, error: "source-error" }];
+      }
+    }
+    : (target: UsageTarget) => runOne(target, suppression, options.deps);
+  return runBatched(targets, USAGE_MAX_CONCURRENT, one, options.onItemDone)
+    .then((batches) => aggregateUsageResults(batches.flat()));
 }
 
 /** When the default opencode profile contributes to a report: it is the
