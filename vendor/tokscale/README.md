@@ -204,5 +204,10 @@ unit gets its 5 MB/s disk cap only when the stamp verifies and lists
 checkpoints a cold export of a large identity cannot finish under 5 MB/s.
 `ais usage service install` applies the same check. A failed rebuild is
 reported as a warning and the host keeps its previous binary and 20 MB/s. The
-failed patch set is recorded in `<binary>.ais-build-failed` and not retried
-until the patch set changes or `AIS_TOKSCALE_FORCE_REBUILD=1` is set.
+failure is recorded in `<binary>.ais-build-failed` with the patch set, the
+toolchain (`cargo --version`, `rustc -V`) and the time; the same patch set and
+toolchain are retried after 24 h, a changed patch set or toolchain at once, and
+`AIS_TOKSCALE_FORCE_REBUILD=1` forces a retry. A missing tool (exit 2) is not
+recorded. The download gives up after 30 s to connect or 600 s in all, the
+whole build is killed (with its process group) after 90 min, and the wait for
+`<binary>.lock` is limited to 600 s.

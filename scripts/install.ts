@@ -110,7 +110,7 @@ export function describeNativeTokscaleResult(result: NativeTokscaleResult): stri
     case "failed":
       return `install: warning: AIS-patched Tokscale rebuild failed, previous binary kept: ${result.error}`;
     case "skipped":
-      return `install: warning: AIS-patched Tokscale is not current and its last build of this patch set failed; not retrying (set ${TOKSCALE_FORCE_REBUILD_ENV}=1 to retry).`;
+      return `install: warning: AIS-patched Tokscale is not current and its build of this patch set failed within the last day with this toolchain; retried after 24 h (set ${TOKSCALE_FORCE_REBUILD_ENV}=1 to retry now).`;
   }
 }
 

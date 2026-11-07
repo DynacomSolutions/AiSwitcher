@@ -19,6 +19,16 @@ snapshot_build_inputs() {
   cp -- "$checkout/vendor/tokscale/patches/"* "$inputs/vendor/tokscale/patches/"
 }
 
+# Fetch the pinned release archive. A stalled connection or transfer fails
+# instead of hanging an install.
+download_source() {
+  local archive=$1
+  curl --fail --location --silent --show-error \
+    --connect-timeout "${AIS_TOKSCALE_CONNECT_TIMEOUT_SECS:-30}" \
+    --max-time "${AIS_TOKSCALE_DOWNLOAD_MAX_SECS:-600}" \
+    "$source_url" --output "$archive"
+}
+
 # Apply the snapshot's patches in the order its series lists them.
 apply_snapshot_patches() {
   local inputs=$1 source_dir=$2 patch_name
@@ -41,7 +51,12 @@ install_built_binary() {
   chmod 0755 "$staged"
   staged_sha=$(sha256sum < "$staged" | cut -d' ' -f1)
   (
-    flock 9
+    # A frozen holder must not wedge an install: give up after the wait limit.
+    flock -w "${AIS_TOKSCALE_LOCK_WAIT_SECS:-600}" 9 || {
+      printf 'timed out waiting for %s.lock\n' "$output" >&2
+      rm -f -- "$staged"
+      exit 1
+    }
     rm -f -- "$output.ais-build"
     mv -f -- "$staged" "$output"
     bun "$repo_root/scripts/tokscale-stamp.ts" "$inputs" "$output" "$staged_sha"
@@ -91,7 +106,7 @@ main() {
 
   archive="$build_root/tokscale-v4.20.0.tar.gz"
   source_dir="$build_root/source"
-  curl --fail --location --silent --show-error "$source_url" --output "$archive"
+  download_source "$archive"
   printf '%s  %s\n' "$source_sha256" "$archive" | sha256sum --check --status || {
     printf 'Tokscale v4.20.0 source checksum mismatch\n' >&2
     exit 1

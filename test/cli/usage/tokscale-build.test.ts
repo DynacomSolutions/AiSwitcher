@@ -8,6 +8,8 @@ import {
   ensureNativeTokscale,
   expectedTokscaleBuildManifest,
   installedTokscaleBuild,
+  runTokscaleBuildHelper,
+  TOKSCALE_FAILED_BUILD_BACKOFF_MS,
   nativeTokscaleSupportsCheckpoints,
   TOKSCALE_CHECKPOINT_PATCH,
   tokscaleBuildStampPath,
@@ -311,3 +313,118 @@ test("R3: a patch set whose build failed is not rebuilt on every install, until 
   expect(calls).toHaveLength(1);
   expect(await Bun.file(tokscaleFailedBuildPath(binaryPath)).exists()).toBe(false);
 });
+
+// ---- Third review: transient failures back off; stalled builds, downloads and locks give up ----
+
+test("a failed build is retried after the 24 h backoff, or at once when the toolchain changes", async () => {
+  const { repoRoot, binaryPath } = await fixture(OLD_SERIES);
+  await fakeHelper([], "tokscale without checkpoints")(repoRoot, binaryPath);
+  await setSeries(repoRoot, NEW_SERIES);
+  let clock = Date.parse("2026-11-08T00:00:00Z");
+  let toolchain = "cargo 1.99.0; rustc 1.99.0";
+  const base = { repoRoot, binaryPath, now: () => clock, toolchainId: async () => toolchain };
+
+  // A transient failure (a download error, an OOM kill, a full disk).
+  expect((await ensureNativeTokscale({ ...base, runBuild: async () => 6 })).status).toBe("failed");
+  const record = JSON.parse(await readFile(tokscaleFailedBuildPath(binaryPath), "utf8"));
+  expect(record).toMatchObject({ toolchain, failedAt: clock });
+
+  let attempts = 0;
+  const working = async (root: string, path: string) => { attempts++; return fakeHelper([])(root, path); };
+  clock += TOKSCALE_FAILED_BUILD_BACKOFF_MS - 60_000;
+  expect((await ensureNativeTokscale({ ...base, runBuild: working })).status).toBe("skipped");
+  expect(attempts).toBe(0);
+
+  // Past the backoff the same patch set and toolchain are tried again, and the build now works.
+  clock += 2 * 60_000;
+  expect(await ensureNativeTokscale({ ...base, runBuild: working })).toEqual({ status: "rebuilt", reason: "outdated" });
+  expect(attempts).toBe(1);
+  expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(true);
+
+  // A new toolchain retries at once, inside the backoff.
+  await setSeries(repoRoot, [...NEW_SERIES, "v4.20.0-ais-later.patch"]);
+  expect((await ensureNativeTokscale({ ...base, runBuild: async () => 6 })).status).toBe("failed");
+  expect((await ensureNativeTokscale({ ...base, runBuild: working })).status).toBe("skipped");
+  toolchain = "cargo 1.100.0; rustc 1.100.0";
+  expect((await ensureNativeTokscale({ ...base, runBuild: working })).status).toBe("rebuilt");
+  expect(attempts).toBe(2);
+});
+
+test("a missing tool (exit 2) is not recorded, so the next install tries again", async () => {
+  const { repoRoot, binaryPath } = await fixture();
+  await writeFile(binaryPath, "old", { mode: 0o755 });
+  const base = { repoRoot, binaryPath, toolchainId: async () => "cargo: unavailable; rustc: unavailable" };
+  expect((await ensureNativeTokscale({ ...base, runBuild: async () => 2 })).status).toBe("failed");
+  expect(await Bun.file(tokscaleFailedBuildPath(binaryPath)).exists()).toBe(false);
+  const calls: string[] = [];
+  expect((await ensureNativeTokscale({ ...base, runBuild: fakeHelper(calls) })).status).toBe("rebuilt");
+  expect(calls).toHaveLength(1);
+});
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+test("a build that outlives its timeout is killed with its whole process group", async () => {
+  const { root, repoRoot, binaryPath } = await fixture();
+  const pidFile = join(root, "grandchild.pid");
+  const wedgedRepo = join(root, "wedged");
+  await mkdir(join(wedgedRepo, "scripts"), { recursive: true });
+  // Stands in for a wedged cargo or curl: a child of the helper that never ends.
+  await writeFile(join(wedgedRepo, "scripts", "build-tokscale-ais.sh"),
+    `sleep 300 & echo $! > "${pidFile}"\nwait\n`);
+  const started = Date.now();
+  const code = await runTokscaleBuildHelper(wedgedRepo, binaryPath, { timeoutMs: 500, killGraceMs: 500 });
+  expect(code).toBe(124);
+  expect(Date.now() - started).toBeLessThan(10_000);
+  const grandchild = Number(await readFile(pidFile, "utf8"));
+  await Bun.sleep(200);
+  expect(alive(grandchild)).toBe(false);
+
+  // ensureNativeTokscale counts it as a failed (recorded) build.
+  const result = await ensureNativeTokscale({ repoRoot, binaryPath, toolchainId: async () => "t", runBuild: async () => 124 });
+  expect(result).toMatchObject({ status: "failed" });
+  expect(result.status === "failed" && result.error).toContain("timed out");
+}, 20_000);
+
+test("a stalled download fails after the transfer limit instead of hanging the install", async () => {
+  // Accepts the connection and never answers.
+  const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  try {
+    const { root } = await fixture();
+    const started = Date.now();
+    const run = await helperShell(
+      `source_url="http://127.0.0.1:${server.port}/tokscale.tar.gz"; download_source "$ARCHIVE"`,
+      { ARCHIVE: join(root, "archive.tgz"), AIS_TOKSCALE_DOWNLOAD_MAX_SECS: "2" },
+    );
+    expect(run.code).not.toBe(0);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  } finally {
+    server.stop(true);
+  }
+}, 20_000);
+
+test("an install gives up on a lock a frozen build never releases", async () => {
+  const { root, repoRoot, binaryPath } = await helperFixture(NEW_SERIES);
+  const inputs = join(root, "inputs");
+  const built = join(root, "built");
+  await writeFile(binaryPath, "previous tokscale", { mode: 0o755 });
+  await writeFile(built, "new tokscale");
+  expect((await helperShell(`snapshot_build_inputs "$CHECKOUT" "$INPUTS"`, { CHECKOUT: repoRoot, INPUTS: inputs })).code).toBe(0);
+  const holder = Bun.spawn(["flock", `${binaryPath}.lock`, "sleep", "8"], { stdout: "ignore", stderr: "ignore" });
+  try {
+    await Bun.sleep(200);
+    const started = Date.now();
+    const run = await helperShell(`install_built_binary "$BUILT" "$OUTPUT" "$INPUTS"`,
+      { BUILT: built, OUTPUT: binaryPath, INPUTS: inputs, AIS_TOKSCALE_LOCK_WAIT_SECS: "1" });
+    expect(run.code).not.toBe(0);
+    expect(run.stderr).toContain("timed out waiting for");
+    expect(Date.now() - started).toBeLessThan(6_000);
+    expect(await readFile(binaryPath, "utf8")).toBe("previous tokscale");
+    const leftovers = (await Array.fromAsync(new Bun.Glob("tokscale.ais-new-*").scan(join(binaryPath, "..")))).length;
+    expect(leftovers).toBe(0);
+  } finally {
+    holder.kill();
+    await holder.exited;
+  }
+}, 20_000);

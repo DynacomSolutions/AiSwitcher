@@ -117,9 +117,50 @@ export type NativeTokscaleResult =
 /** Set to 1 to retry a build of a patch set that already failed. */
 export const TOKSCALE_FORCE_REBUILD_ENV = "AIS_TOKSCALE_FORCE_REBUILD";
 
-/** The manifest of the last failed build attempt for this binary. */
+/** The record of the last failed build attempt for this binary. */
 export function tokscaleFailedBuildPath(binaryPath: string): string {
   return `${binaryPath}.ais-build-failed`;
+}
+
+/** A failed patch set is retried after this long, or at once when the toolchain changes. */
+export const TOKSCALE_FAILED_BUILD_BACKOFF_MS = 24 * 60 * 60_000;
+/** A build that runs longer than this is killed (with its whole process group) and counts as failed. */
+export const TOKSCALE_BUILD_TIMEOUT_MS = 90 * 60_000;
+/** Exit code the helper runner reports for a build it killed on timeout. */
+export const TOKSCALE_BUILD_TIMEOUT_EXIT = 124;
+
+interface FailedBuildRecord {
+  manifest: string;
+  toolchain: string;
+  failedAt: number;
+}
+
+async function readFailedBuild(path: string): Promise<FailedBuildRecord | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8")) as Partial<FailedBuildRecord>;
+    if (typeof value.manifest !== "string" || typeof value.toolchain !== "string" || typeof value.failedAt !== "number") {
+      return undefined;
+    }
+    return { manifest: value.manifest, toolchain: value.toolchain, failedAt: value.failedAt };
+  } catch {
+    return undefined;
+  }
+}
+
+async function commandLine(command: string[]): Promise<string> {
+  try {
+    const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    return code === 0 ? out.trim() : `${command[0]}: exit ${code}`;
+  } catch {
+    return `${command[0]}: unavailable`;
+  }
+}
+
+/** What the build depends on outside the checkout: a new Rust toolchain may
+ * fix a build that failed with the old one. */
+export async function tokscaleToolchainId(): Promise<string> {
+  return `${await commandLine(["cargo", "--version"])}; ${await commandLine(["rustc", "-V"])}`;
 }
 
 export interface EnsureNativeTokscaleOptions {
@@ -129,21 +170,60 @@ export interface EnsureNativeTokscaleOptions {
   force?: boolean;
   /** Runs the build helper; resolves to its exit code. Test seam. */
   runBuild?: (repoRoot: string, binaryPath: string) => Promise<number>;
+  /** Toolchain identity recorded with a failure. Test seam. */
+  toolchainId?: () => Promise<string>;
+  /** Clock for the failure backoff. Test seam. */
+  now?: () => number;
 }
 
 /** Low CPU and IO priority: a cold build compiles Tokscale and runs its tests
- * on a host that is serving other work. */
-export async function runTokscaleBuildHelper(repoRoot: string, binaryPath: string): Promise<number> {
+ * on a host that is serving other work. The helper runs in its own process
+ * group; past `timeoutMs` the whole group (cargo, rustc, curl) is killed and
+ * the build reports TOKSCALE_BUILD_TIMEOUT_EXIT. */
+export async function runTokscaleBuildHelper(
+  repoRoot: string,
+  binaryPath: string,
+  options: { timeoutMs?: number; killGraceMs?: number } = {},
+): Promise<number> {
   const command = ["bash", join(repoRoot, "scripts", "build-tokscale-ais.sh"), binaryPath];
+  const setsid = Bun.which("setsid");
   const ionice = Bun.which("ionice");
   const nice = Bun.which("nice");
-  const child = Bun.spawn([...(nice ? [nice, "-n", "19"] : []), ...(ionice ? [ionice, "-c", "3"] : []), ...command], {
+  const child = Bun.spawn([
+    ...(setsid ? [setsid] : []),
+    ...(nice ? [nice, "-n", "19"] : []),
+    ...(ionice ? [ionice, "-c", "3"] : []),
+    ...command,
+  ], {
     cwd: repoRoot,
     stdin: "ignore",
     stdout: "inherit",
     stderr: "inherit",
   });
-  return child.exited;
+  const signalGroup = (signal: NodeJS.Signals) => {
+    try {
+      process.kill(setsid ? -child.pid : child.pid, signal);
+    } catch { /* already gone */ }
+  };
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    signalGroup("SIGTERM");
+    killTimer = setTimeout(() => signalGroup("SIGKILL"), options.killGraceMs ?? 10_000);
+  }, options.timeoutMs ?? TOKSCALE_BUILD_TIMEOUT_MS);
+  try {
+    const code = await child.exited;
+    if (timedOut) {
+      // The leader may exit on SIGTERM while a child ignores it.
+      signalGroup("SIGKILL");
+      return TOKSCALE_BUILD_TIMEOUT_EXIT;
+    }
+    return code;
+  } finally {
+    clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
+  }
 }
 
 /** Rebuild the installed AIS-patched Tokscale when its stamp is missing or
@@ -158,13 +238,21 @@ export async function ensureNativeTokscale(options: EnsureNativeTokscaleOptions)
   const reason = installed ? "outdated" : "missing";
   const failedPath = tokscaleFailedBuildPath(binaryPath);
   const force = options.force ?? process.env[TOKSCALE_FORCE_REBUILD_ENV] === "1";
-  // A cold build compiles Tokscale and runs its tests; one that failed for this
-  // exact patch set (no toolchain, a broken patch) would fail again on every install.
-  if (!force && (await readFile(failedPath, "utf8").catch(() => undefined)) === expected) {
+  const now = options.now ?? Date.now;
+  const toolchain = await (options.toolchainId ?? tokscaleToolchainId)();
+  // A cold build compiles Tokscale and runs its tests. One that failed for this
+  // patch set and toolchain is not repeated on every install, only once a day:
+  // a broken patch fails again, a full disk or a network outage may not.
+  const previous = await readFailedBuild(failedPath);
+  if (!force && previous && previous.manifest === expected && previous.toolchain === toolchain &&
+    now() - previous.failedAt < TOKSCALE_FAILED_BUILD_BACKOFF_MS) {
     return { status: "skipped", reason };
   }
-  const fail = async (error: string): Promise<NativeTokscaleResult> => {
-    await writeFile(failedPath, expected, { mode: 0o644 }).catch(() => {});
+  const fail = async (error: string, record = true): Promise<NativeTokscaleResult> => {
+    if (record) {
+      const entry: FailedBuildRecord = { manifest: expected, toolchain, failedAt: now() };
+      await writeFile(failedPath, `${JSON.stringify(entry)}\n`, { mode: 0o644 }).catch(() => {});
+    }
     return { status: "failed", reason, error };
   };
   let code: number;
@@ -172,6 +260,12 @@ export async function ensureNativeTokscale(options: EnsureNativeTokscaleOptions)
     code = await (options.runBuild ?? runTokscaleBuildHelper)(options.repoRoot, binaryPath);
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
+  }
+  // Exit 2 is a missing tool or a bad argument, found before any build work:
+  // retrying costs nothing, so it is not recorded.
+  if (code === 2) return fail("build-tokscale-ais.sh exited with 2 (a required tool is missing)", false);
+  if (code === TOKSCALE_BUILD_TIMEOUT_EXIT) {
+    return fail(`build-tokscale-ais.sh timed out after ${TOKSCALE_BUILD_TIMEOUT_MS / 60_000} min and was killed`);
   }
   if (code !== 0) return fail(`build-tokscale-ais.sh exited with ${code}`);
   const rebuilt = await installedTokscaleBuild(binaryPath);
