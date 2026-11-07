@@ -186,8 +186,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     Every scoped export stamps its scope directory's mtime; a cycle removes a
     scope only when no live source uses it and it has been idle for 30 days,
     and skips the sweep when target or pool discovery failed or a native
-    tool's identities registry file is missing (a missing file loads as an
-    empty list). The age floor also protects a second collector that sees
+    tool that has identity directories has no identities registry file (a
+    missing file loads as an empty list). A tool never used on the host (no
+    identity directories) needs no registry. The age floor also protects a second collector that sees
     the same caches under translated paths. Measured live on 7 Nov
     2026 before this change, every Claude export read the whole 611 MB Claude
     namespace and every Codex export the 337 MB Codex one, even for an
@@ -196,10 +197,49 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
     `vendor/tokscale/README.md`).
   - Codex resumes and Codex fingerprints use the sampled digest, as Claude
     checkpoints do, instead of hashing the whole rollout.
-  - Still open: a changed batch (the swap pool, about 480 MB) is written whole
-    and read back each cycle, which is most of the collector's disk writes,
-    and the Grok reader re-reads its whole session tree (about 0.9 GB per
-    round) while a session is active.
+  - Native batches are segmented (`native-segments.ts`, vendor README). A
+    collector export passes `TOKSCALE_AIS_SEGMENT_DIR`
+    (`usage/native/<partitionId>/segments/`), so the staged export is a small
+    manifest and the messages are content-addressed segments. Measured live
+    before this change, the swap-pool batch (about 478 MB) was rewritten and
+    read back on every changed cycle: nearly all of the collector's writes,
+    about 0.66 MB/s in ~550 MB bursts. On a 119 MB fixture with three growing
+    transcripts a changed cycle now writes and reads about 14 MB
+    (3 of 42 segments plus a 0.4 MB manifest). The rules:
+    - Promotion reads the manifest and only segments it has not verified: a
+      segment recorded for the previous batch is trusted while its file keeps
+      the size, mtime, ctime and inode recorded then (ctime cannot be set
+      back, so damage with a restored mtime is still caught); any other is
+      read and must match its size, SHA-256, message count and parse as
+      message objects. Segment files are 0600 in a 0700 directory.
+    - The exporter may skip writing only segments AIS lists as reusable, and
+      AIS lists them only when the committed manifest and every one of its
+      segments are intact. One damaged or missing segment means no list and
+      no `unchanged` digest, so the next export rewrites every segment (a
+      full rebuild); a manifest naming a damaged segment fails promotion and
+      the prior batch stays.
+    - Daily figures come from the manifest's `hourly` (Tokscale's own
+      rollup), not from the messages.
+    - Crash safety: segments are published before their manifest and are
+      only removed by the collector's collection pass, so a cycle that dies
+      leaves the committed manifest and all its segments valid.
+    - Collection keeps every segment named by a retained batch (listed, the
+      two latest generations, anything inside the 10-minute reader grace) and
+      any unnamed segment younger than 2 hours, the staging lifetime, since an
+      export in flight names its new segments only in a staged manifest; if a
+      retained manifest cannot be read, nothing is removed. Exporter
+      temporaries older than 2 hours go too.
+    - Migration: a single-file batch stays valid and is kept while its
+      messages are unchanged (the digest is the same in both formats). The
+      first changed export writes a full segment set, and the single-file
+      generation ages out under the usual two-generation rule. Opencode and
+      Pi captures (`captureNativeBatch`) still write single-file batches.
+    - Still open: the Grok reader re-reads its whole session tree (about
+      0.9 GB per round) while a session is active, and a segment damaged in
+      place with its size, mtime and ctime unchanged (not possible through
+      ordinary writes) would be caught by the TUI reader's checksum, not by
+      the collector; and the registry check cannot see identities whose
+      config directory lies outside the tool's identities root.
   - Totals stay those of a cold scan: every shortcut is either exact (an
     unchanged file, an append of whole lines, byte-identical messages) or
     falls back to the full read.

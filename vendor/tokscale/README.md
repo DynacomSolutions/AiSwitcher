@@ -91,6 +91,31 @@ The patch adds three AIS-only surfaces:
   instead of a second copy of the batch. The `--json` report is printed as
   usual.
 
+- `TOKSCALE_AIS_SEGMENT_DIR=<absolute dir>` makes a changed export segmented
+  (`patches/v4.20.0-ais-segments.patch`). The `messages` array is cut into
+  contiguous segments, each a JSON array of whole messages stored as
+  `<sha256>.json` in that directory, and the export path receives a small
+  manifest instead of the batch: `schemaVersion: 2`, `format:
+  "ais-segmented-v1"`, `messagesSha256`, `messageCount`, the ordered
+  `segments` (`sha256`, `bytes`, `messages`) and `hourly`, Tokscale's own
+  hourly rollup of the messages in the export's bucket timezone (so AIS gets
+  daily figures without reading the segments). Joining the segments' elements
+  in order gives the single-file `messages` bytes exactly, so `messagesSha256`
+  and the `unchanged` answer work across both formats. A segment ends at a
+  content-defined point (a message whose FNV-1a hash falls in a window
+  proportional to its size, once the segment holds 512 KiB; at most 16 MiB,
+  about 2 MiB on average), so messages added to one transcript change only
+  the segment around them. Segments are written atomically (temporary file,
+  fsync, rename; mode 0600 in a 0700 directory) before the manifest. Only segments listed in
+  `TOKSCALE_AIS_REUSABLE_SEGMENTS_FILE` (one SHA-256 per line, the ones AIS
+  verified on disk) are left unwritten; every other segment is written even
+  if a file of that name exists, so a damaged file is never adopted. The
+  `--ais-shared-snapshot` reader recognises a segmented manifest, checks every
+  segment's size, SHA-256 and message count and caches verified segments, so
+  a reload reads only new ones. A damaged or missing segment makes that whole
+  partition's native detail unavailable, never partial; a missing one first
+  retries against a newer manifest, as a missing batch does.
+
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
@@ -109,7 +134,7 @@ bash scripts/build-tokscale-ais.sh
 ```
 
 The helper downloads only the pinned release archive, verifies its checksum and
-licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch` and then `patches/v4.20.0-ais-scope.patch`, and installs to
+licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch`, `patches/v4.20.0-ais-scope.patch` and then `patches/v4.20.0-ais-segments.patch`, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.
