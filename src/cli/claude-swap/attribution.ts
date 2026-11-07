@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { SwapEvent } from "../../identities/pool/adapter.ts";
 import { activeMemberAt, eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
+import "../../identities/model-price-source.ts";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { PoolIdentity } from "../../identities/pool/swap-pool.ts";
 import type { Identity } from "../../identities/types.ts";

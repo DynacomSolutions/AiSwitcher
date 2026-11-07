@@ -97,6 +97,24 @@ describe("ModelPriceSource", () => {
   });
 });
 
+describe("background flag", () => {
+  test("preload reads the cache with no fetch; refresh starts only once enabled", async () => {
+    const path = join(dir(), "p.json");
+    const seed = new ModelPriceSource({ fetch: okFetch(FIXTURE), cachePath: path, now: () => 1_700_000_000_000 });
+    seed.lookup("x");
+    await seed.idle();
+    const calls = { n: 0 };
+    const cli = new ModelPriceSource({ fetch: okFetch(FIXTURE, calls), cachePath: path, now: () => 1_700_000_000_000 + 3 * REFRESH_INTERVAL_MS, background: false });
+    cli.preload();
+    expect(cli.lookup("claude-opus-5-5")?.usdPer1mOutput).toBe(20);
+    await cli.idle();
+    expect(calls.n).toBe(0);
+    cli.enableBackgroundRefresh();
+    await cli.idle();
+    expect(calls.n).toBe(1);
+  });
+});
+
 describe("read-time pricing and warnings", () => {
   test("NULL-cost rows are priced from tokens and model at read time", async () => {
     setFetchedChatPriceLookup((id) => (id === "claude-opus-5-5" ? { usdPer1mInput: 4, usdPer1mOutput: 20, usdPer1mCacheRead: 0.2, usdPer1mCacheWrite: 5 } : undefined));

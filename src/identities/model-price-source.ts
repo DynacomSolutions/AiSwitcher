@@ -51,6 +51,8 @@ export interface PriceSourceDeps {
   now?: () => number;
   /** Receives JSON log lines for refresh failures. */
   log?: (line: string) => void;
+  /** Whether lookups may start a background refresh (default true). Short CLI commands turn it off. */
+  background?: boolean;
 }
 
 export class ModelPriceSource {
@@ -59,6 +61,7 @@ export class ModelPriceSource {
   private lastAttempt = 0;
   private inflight: Promise<void> | undefined;
   private loaded = false;
+  private background: boolean;
   private readonly doFetch: typeof fetch;
   private readonly cachePath: string;
   private readonly url: string;
@@ -66,11 +69,23 @@ export class ModelPriceSource {
   private readonly log: (line: string) => void;
 
   constructor(deps: PriceSourceDeps = {}) {
+    this.background = deps.background ?? true;
     this.doFetch = deps.fetch ?? fetch;
     this.cachePath = deps.cachePath ?? process.env.AIS_MODEL_PRICES_CACHE ?? join(aisHome(), "cache", "model-prices.json");
     this.url = deps.url ?? process.env.AIS_MODEL_PRICES_URL ?? MODEL_PRICES_URL;
     this.now = deps.now ?? Date.now;
     this.log = deps.log ?? ((l) => console.warn(l));
+  }
+
+  /** Reads the cache file synchronously; idempotent. */
+  preload(): void {
+    this.load();
+  }
+
+  /** Lets lookups start the daily background refresh; for long-running processes only. */
+  enableBackgroundRefresh(): void {
+    this.background = true;
+    this.refreshIfStale();
   }
 
   private load(): void {
@@ -90,7 +105,7 @@ export class ModelPriceSource {
   /** Synchronous, network-free lookup by normalised id. Schedules a background refresh when the list is stale. */
   lookup(normalisedId: string): ListModelPrice | undefined {
     this.load();
-    this.refreshIfStale();
+    if (this.background) this.refreshIfStale();
     const p = this.prices[normalisedId];
     return p ? { usdPer1mInput: p[0], usdPer1mOutput: p[1], usdPer1mCacheRead: p[2], usdPer1mCacheWrite: p[3] } : undefined;
   }
@@ -138,11 +153,18 @@ export class ModelPriceSource {
   }
 }
 
-/** Process-wide source. Off under `bun test` and when AIS_MODEL_PRICES=off. */
+/** Process-wide source. Off under `bun test` and when AIS_MODEL_PRICES=off.
+ * Importing this module loads the cache synchronously but never fetches;
+ * long-running processes call startModelPriceRefresh(). */
 export const modelPriceSource: ModelPriceSource | undefined =
-  process.env.NODE_ENV === "test" || process.env.AIS_MODEL_PRICES === "off" ? undefined : new ModelPriceSource();
+  process.env.NODE_ENV === "test" || process.env.AIS_MODEL_PRICES === "off" ? undefined : new ModelPriceSource({ background: false });
 
 if (modelPriceSource) {
   setFetchedChatPriceLookup((id) => modelPriceSource.lookup(id));
-  modelPriceSource.refreshIfStale();
+  modelPriceSource.preload();
+}
+
+/** Enables the once-a-day background refresh (gateway, usage collector). */
+export function startModelPriceRefresh(): void {
+  modelPriceSource?.enableBackgroundRefresh();
 }
