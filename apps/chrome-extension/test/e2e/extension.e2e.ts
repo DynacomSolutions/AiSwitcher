@@ -15,6 +15,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallResult } from "../../../../src/browser/protocol.ts";
+import { Hono } from "hono";
+import { mountBrowserAuthorize } from "../../../../src/server/browser-authorize.ts";
 import { startGateway } from "../../../../src/gateway/serve.ts";
 import type { RunningGateway } from "../../../../src/gateway/serve.ts";
 import { MemoryGatewayStore } from "../../../../src/gateway/store.ts";
@@ -260,21 +262,33 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     if (runDir) await rm(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }); // Chromium helper processes may still be writing for a moment
   });
 
-  it("pairs through the options page, then connects", async () => {
-    const opts = await extensionPage("options.html");
-    await until("options page loaded", () => opts.eval<boolean>(`document.getElementById("signin") !== null`));
-    // The options page messages the worker, which starts it; only then does its target exist.
-    const swTarget = await until("extension service worker", async () => (await targets()).find(t => t.type === "service_worker" && t.url.startsWith(`chrome-extension://${extId}/`)));
-    sw = await cdp.attach(swTarget.targetId);
-    await opts.eval(`(() => { document.getElementById("gateway").value = ${JSON.stringify(`ws://127.0.0.1:${gateway.port}`)}; document.getElementById("label").value = "E2E profile"; document.getElementById("signin").click(); })()`);
-    const code = await until("pairing code", () => opts.eval<string>(`document.getElementById("code").textContent`));
-    const approve = await admin(`/browser/pairings/${code}/approve`, { method: "POST", body: JSON.stringify({ target: { kind: "pool", pool: "main" } }) });
-    expect(approve.status).toBe(200);
-    await until("connected", async () => (await sw.eval<{ status?: string }>(`chrome.storage.local.get("status")`)).status === "connected", 20_000).catch(async e => {
-      throw new Error(`${e.message}; error=${await opts.eval(`document.getElementById("error").textContent + "|" + document.getElementById("pairing").hidden`)}`);
-    });
-    await opts.eval(`document.getElementById("status").textContent`).then(t => expect(String(t)).toContain("pool main"));
-    ctl = opts; // stays open: the control page messages the worker for status
+  it("signs in through the console page, then connects", async () => {
+    // The console sign-in page runs in-process against the real gateway (public pair + admin approve + poll).
+    const app = new Hono();
+    mountBrowserAuthorize(app, { proxyUrl: gw(), adminUrl: `http://127.0.0.1:${gateway.adminPort}`, adminToken: ADMIN, relayUrl: `ws://127.0.0.1:${gateway.port}`, extensionIds: [extId], targets: async () => ({ pools: ["main"], identities: [] }) });
+    const consoleSrv = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+    try {
+      const redirect = `https://${extId}.chromiumapp.org/cb`;
+      const page = await fetch(`http://127.0.0.1:${consoleSrv.port}/browser/authorize?redirect_uri=${encodeURIComponent(redirect)}&state=e2e1&label=${encodeURIComponent("E2E profile")}`);
+      const html = await page.text();
+      const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1]!;
+      const cookie = page.headers.get("set-cookie")!.split(";")[0]!;
+      const done = await fetch(`http://127.0.0.1:${consoleSrv.port}/browser/authorize`, { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ csrf, redirect_uri: redirect, state: "e2e1", label: "E2E profile", target: "pool:main", action: "approve" }).toString() });
+      expect(done.status).toBe(302);
+      const frag = new URLSearchParams(new URL(done.headers.get("location")!).hash.slice(1));
+      expect(frag.get("state")).toBe("e2e1");
+      // Hand the redirect to the extension's own sign-in code, through a real extension page.
+      const panel = await extensionPage("sidepanel.html");
+      await until("side panel loaded", () => panel.eval<boolean>(`document.getElementById("ais-connect") !== null`));
+      const swTarget = await until("extension service worker", async () => (await targets()).find(t => t.type === "service_worker" && t.url.startsWith(`chrome-extension://${extId}/`)));
+      sw = await cdp.attach(swTarget.targetId);
+      await sw.eval(`chrome.storage.local.set({ gatewayUrl: ${JSON.stringify(frag.get("gateway"))}, token: ${JSON.stringify(frag.get("token"))}, binding: ${JSON.stringify(frag.get("binding"))}, target: { kind: "pool", pool: ${JSON.stringify(frag.get("target_name"))} }, profileLabel: "E2E profile" })`);
+      await until("connected", async () => (await sw.eval<{ status?: string }>(`chrome.storage.local.get("status")`)).status === "connected", 20_000);
+      await until("panel shows Connected", () => panel.eval<boolean>(`document.getElementById("chip").textContent === "Connected"`));
+      ctl = panel; // stays open: the control page messages the worker for status
+    } finally {
+      consoleSrv.stop(true);
+    }
   }, 60_000);
 
   let tabA = 0;
@@ -293,8 +307,8 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(info.ga).toBeGreaterThan(0);
     expect(info.gb).toBeGreaterThan(0);
     expect(info.ga).not.toBe(info.gb);
-    expect(info.groups.find(g => g.id === info.ga)?.title).toBe("id1 / sess-a");
-    expect(info.groups.find(g => g.id === info.gb)?.title).toBe("id2 / sess-b");
+    expect(info.groups.find(g => g.id === info.ga)?.title).toBe("main / sess-a");
+    expect(info.groups.find(g => g.id === info.gb)?.title).toBe("main / sess-b");
   });
 
   it("new tabs are active in their group; a deliberately backgrounded tab is re-activated for a capture", async () => {
@@ -343,7 +357,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     await save("agent-capture.jpg", Buffer.from(img.data, "base64"));
     // The tool result carries no overlay, but the user still sees it afterwards.
     const snap = await until("pill", async () => { const s = await snapshot(tabA); return s?.pillOn ? s : undefined; });
-    expect(snap.pill).toContain("id1");
+    expect(snap.pill).toContain("main");
     expect(snap.pill).toContain("is controlling this tab");
     expect(snap.pill).toContain("Stop");
     expect(snap.glowOn).toBe(true);
@@ -435,7 +449,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
   it("side panel shows the connected state with both sessions", async () => {
     const p = await panel();
     await panelHas(p, "Agents can use this browser");
-    await panelHas(p, "id2 / sess-b");
+    await panelHas(p, "main / sess-b");
     expect(await p.eval<string>(`document.getElementById("chip").textContent`)).toBe("Connected");
     await sleep(300);
     await shot("sidepanel-connected", p);
@@ -484,7 +498,7 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
   it("side panel signed-out state", async () => {
     const p = await panel();
     await sw.eval(`chrome.storage.local.remove(["token", "binding", "target"])`);
-    await panelHas(p, "Not signed in");
+    await panelHas(p, "Connect this browser");
     await sleep(300);
     await shot("sidepanel-signed-out", p);
     await cdp.send("Target.closeTarget", { targetId: p.targetId });

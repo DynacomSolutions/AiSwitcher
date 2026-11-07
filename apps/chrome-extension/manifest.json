@@ -11,7 +11,9 @@
     "scripting",
     "storage",
     "sidePanel",
-    "alarms"
+    "alarms",
+    "identity",
+    "identity.email"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -19,10 +21,6 @@
   "background": {
     "service_worker": "background.js",
     "type": "module"
-  },
-  "options_ui": {
-    "page": "options.html",
-    "open_in_tab": true
   },
   "action": {
     "default_title": "AIS Browser"

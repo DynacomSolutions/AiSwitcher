@@ -27,6 +27,7 @@ import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
+import { mountBrowserAuthorize, type BrowserAuthConfig } from "./browser-authorize.ts";
 
 import {
   createIdentityInRegistry,
@@ -75,6 +76,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
   /** Test seam for GET /api/pools/usage. */
   poolsUsage?: () => Promise<PoolsUsageResponse>;
+  /** Extension sign-in page config (gateway URLs and admin token); absent answers /browser/authorize with 503. */
+  browserAuth?: BrowserAuthConfig;
   /** Online-probe cache file for the default localModels; tests inject a temp path. */
   onlineCachePath?: string;
 }
@@ -99,6 +102,9 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   );
 
   app.use("/api/*", (c, next) => consoleGuard(deps, c, next));
+
+  // Extension sign-in page (outside /api: opened by launchWebAuthFlow, guarded by its own CSRF cookie).
+  mountBrowserAuthorize(app, deps.browserAuth);
 
   /* --------------------------------- status -------------------------------- */
 

@@ -14,7 +14,7 @@ export interface MessageDeps {
 /**
  * Returns true when `reply` will be called asynchronously.
  *
- * Only this extension may talk to the worker. Everything needs an extension-page origin (side panel, options), with one exception:
+ * Only this extension may talk to the worker. Everything needs an extension-page origin (side panel), with one exception:
  * the in-page Stop button, which comes from our content script in the top frame of a tab we are currently controlling.
  */
 export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: unknown) => void, deps: MessageDeps): boolean {
