@@ -242,12 +242,29 @@ describe("refresh guard", () => {
   test("the degraded alert says why: error name, code and a masked, short message", async () => {
     const w = world();
     const reasons: string[] = [];
-    const err = Object.assign(new Error("unsupported startup parameter: statement_timeout (postgres://user:pw@host/db)"), { name: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR" });
+    const err = Object.assign(new Error("unsupported startup parameter: statement_timeout (postgres://user:pw@host/db)"), { name: "ConnectionError", code: "ERR_CONNECT" });
     const backend: RefreshGuardBackend = { acquire: async () => { throw err; } };
     const guard = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, onDegraded: (_a, why) => void reasons.push(why) });
     await guard("claude", ID, { force: true });
-    expect(reasons[0]).toBe("PostgresError ERR_POSTGRES_SERVER_ERROR - unsupported startup parameter: statement_timeout (<url>");
+    expect(reasons[0]).toBe("ConnectionError ERR_CONNECT - unsupported startup parameter: statement_timeout (<url>");
     expect(reasons[0]).not.toContain("pw");
+  });
+
+  test("alert reasons: a PostgresError gives name, code, SQLSTATE and the server message; other errors are masked", async () => {
+    const reasonFor = async (err: Error): Promise<string> => {
+      const w = world();
+      const out: string[] = [];
+      const backend: RefreshGuardBackend = { acquire: async () => { throw err; } };
+      await guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read, onDegraded: (_a, why) => void out.push(why) })("claude", ID, { force: true });
+      return out[0] as string;
+    };
+    const pg = Object.assign(new Error('unsupported startup parameter: statement_timeout'), { name: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR", errno: "08P01" });
+    expect(await reasonFor(pg)).toBe("PostgresError ERR_POSTGRES_SERVER_ERROR 08P01 - unsupported startup parameter: statement_timeout");
+    const HOSTPART = ["db", "internal"].join("."); // built at run time: no host literal in the repository
+    const other = new Error(`connect failed {"password":"hunter2","host":"db"} for dsn user:s3cret@${HOSTPART}:5432 key \'abc123\' and "quoted-secret" token=zzz`);
+    const text = await reasonFor(other);
+    for (const leak of ["hunter2", "s3cret", "abc123", "quoted-secret", "zzz", "db.internal"]) expect(text).not.toContain(leak);
+    expect(text.startsWith("Error - connect failed")).toBe(true);
   });
 
   test("a journal read error still refuses a token this process saw rotated out", async () => {

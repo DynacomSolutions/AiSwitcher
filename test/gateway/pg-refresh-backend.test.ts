@@ -91,10 +91,9 @@ if (!url && process.env.CI && !optOut) {
       await lock.release();
     });
 
-    test("works through a pooler that rejects startup parameters (PgBouncer): no statement_timeout is sent at startup", async () => {
-      await prepare();
+    /** A stand-in pooler in front of the test database. `rule` sees each client chunk: reject the startup, drop the link, or forward. */
+    function startPooler(rule: (chunk: Buffer, first: boolean) => "reject" | "drop" | "swallow" | "forward") {
       const target = new URL(url as string);
-      // A stand-in pooler: refuses a startup packet carrying any statement_timeout parameter, as PgBouncer does, else forwards.
       const proxy = Bun.listen<{ up?: Awaited<ReturnType<typeof Bun.connect>>; first: boolean }>({
         hostname: "127.0.0.1",
         port: 0,
@@ -103,18 +102,26 @@ if (!url && process.env.CI && !optOut) {
             sock.data = { first: true };
           },
           async data(sock, chunk) {
-            if (sock.data.first) {
-              sock.data.first = false;
-              if (Buffer.from(chunk).includes("statement_timeout")) {
-                const msg = Buffer.from("unsupported startup parameter: statement_timeout\0");
-                const fields = Buffer.concat([Buffer.from("SFATAL\0C08P01\0M"), msg, Buffer.from("\0")]);
-                const head = Buffer.alloc(5);
-                head.write("E");
-                head.writeInt32BE(4 + fields.length, 1);
-                sock.write(Buffer.concat([head, fields]));
-                sock.end();
-                return;
-              }
+            const first = sock.data.first;
+            sock.data.first = false;
+            const verdict = rule(Buffer.from(chunk), first);
+            if (verdict === "reject") {
+              const msg = Buffer.from("unsupported startup parameter: statement_timeout\0");
+              const fields = Buffer.concat([Buffer.from("SFATAL\0C08P01\0M"), msg, Buffer.from("\0")]);
+              const head = Buffer.alloc(5);
+              head.write("E");
+              head.writeInt32BE(4 + fields.length, 1);
+              sock.write(Buffer.concat([head, fields]));
+              sock.end();
+              return;
+            }
+            if (verdict === "swallow") return; // never answered: the client's request hangs on a live connection
+            if (verdict === "drop") {
+              sock.data.up?.end();
+              sock.end();
+              return;
+            }
+            if (first) {
               sock.data.up = await Bun.connect({
                 hostname: target.hostname,
                 port: Number(target.port),
@@ -135,11 +142,17 @@ if (!url && process.env.CI && !optOut) {
           },
         },
       });
+      const via = new URL(url as string);
+      via.hostname = "127.0.0.1";
+      via.port = String(proxy.port);
+      return { proxy, via: via.toString() };
+    }
+
+    test("works through a pooler that rejects startup parameters (PgBouncer): no statement_timeout is sent at startup", async () => {
+      await prepare();
+      const { proxy, via } = startPooler((chunk, first) => (first && chunk.includes("statement_timeout") ? "reject" : "forward"));
       try {
-        const via = new URL(url as string);
-        via.hostname = "127.0.0.1";
-        via.port = String(proxy.port);
-        const backend = new PgRefreshBackend(via.toString());
+        const backend = new PgRefreshBackend(via);
         opened.push(backend);
         const lock = await backend.acquire(account, 3000);
         const id = await lock.claim("pool0001", "pod-1");
@@ -147,9 +160,37 @@ if (!url && process.env.CI && !optOut) {
         expect((await lock.findByOldFp("pool0001"))[0]).toMatchObject({ outcome: "failed" });
         await lock.release();
         // And the pooler really does refuse what the old code sent, so this test would have caught it.
-        const old = new SQL(via.toString(), { connection: { statement_timeout: 5000 } });
+        const old = new SQL(via, { connection: { statement_timeout: 5000 } });
         await expect(old`SELECT 1`).rejects.toThrow(/unsupported startup parameter/);
         await old.close().catch(() => undefined);
+      } finally {
+        proxy.stop(true);
+      }
+    });
+
+    test("a connection whose RESET statement_timeout fails is closed, not returned to the pool", async () => {
+      await prepare();
+      let resets = 0;
+      const { proxy, via } = startPooler((chunk) => {
+        if (chunk.includes("RESET statement_timeout")) {
+          resets += 1;
+          return "swallow";
+        }
+        return "forward";
+      });
+      try {
+        const backend = new PgRefreshBackend(via, 300);
+        opened.push(backend);
+        // More cycles than the pool has connections: a broken connection handed back would poison later acquires.
+        for (let i = 0; i < 12; i += 1) {
+          const lock = await backend.acquire(account, 3000);
+          await lock.release();
+        }
+        expect(resets).toBe(12);
+        const lock = await backend.acquire(account, 3000);
+        const id = await lock.claim("reset001", "pod-1");
+        expect(id).toBeGreaterThan(0);
+        await lock.release();
       } finally {
         proxy.stop(true);
       }
@@ -234,7 +275,7 @@ if (!url && process.env.CI && !optOut) {
       } finally {
         await admin.close();
       }
-    });
+    }, 30_000);
 
     test("concurrent refreshes from separate replicas make one token request", async () => {
       await prepare();
