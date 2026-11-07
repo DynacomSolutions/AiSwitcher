@@ -2,7 +2,8 @@ import { SQL, type TransactionSQL } from "bun";
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import type { GatewayStore } from "./store.ts";
-import type { GatewayApp, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import type { GatewayApp, GatewayProvider, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
+import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
 
@@ -191,10 +192,39 @@ export class PgGatewayStore implements GatewayStore {
         COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
         COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
         COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
-        COUNT(*) FILTER (WHERE est_cost_usd IS NULL AND input_tokens + output_tokens + cache_read_tokens + cache_write_tokens > 0) AS unpriced,
+        0 AS unpriced,
         COUNT(*) AS requests
       FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
       GROUP BY provider, identity, app ORDER BY provider, identity, app`;
+    // Rows stored without a cost are priced from tokens and model at read time.
+    const nulls = await this.sql`
+      SELECT provider, identity, app, model,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COUNT(*) AS requests
+      FROM gateway_usage WHERE est_cost_usd IS NULL AND ts >= ${since.toISOString()}::timestamptz AND (${to}::timestamptz IS NULL OR ts < ${to}::timestamptz)
+      GROUP BY provider, identity, app, model`;
+    const extra = new Map<string, { cost: number; unpriced: number }>();
+    for (const n of nulls as Record<string, unknown>[]) {
+      const priced = priceNullCostGroup({
+        provider: String(n.provider) as GatewayProvider,
+        identity: String(n.identity),
+        app: String(n.app),
+        model: n.model === null || n.model === undefined ? null : String(n.model),
+        inputTokens: Number(n.input_tokens),
+        outputTokens: Number(n.output_tokens),
+        cacheReadTokens: Number(n.cache_read_tokens),
+        cacheWriteTokens: Number(n.cache_write_tokens),
+        requests: Number(n.requests),
+      });
+      const k = `${String(n.provider)}\u0000${String(n.identity)}\u0000${String(n.app)}`;
+      const e = extra.get(k) ?? { cost: 0, unpriced: 0 };
+      e.cost += priced.cost;
+      e.unpriced += priced.unpriced;
+      extra.set(k, e);
+    }
     return rows.map((r: Record<string, unknown>) => ({
       provider: String(r.provider),
       identity: String(r.identity),
@@ -203,8 +233,8 @@ export class PgGatewayStore implements GatewayStore {
       outputTokens: Number(r.output_tokens),
       cacheReadTokens: Number(r.cache_read_tokens),
       cacheWriteTokens: Number(r.cache_write_tokens),
-      estCostUsd: Number(r.est_cost_usd),
-      unpricedRequests: Number(r.unpriced),
+      estCostUsd: Number(r.est_cost_usd) + (extra.get(`${String(r.provider)}\u0000${String(r.identity)}\u0000${String(r.app)}`)?.cost ?? 0),
+      unpricedRequests: extra.get(`${String(r.provider)}\u0000${String(r.identity)}\u0000${String(r.app)}`)?.unpriced ?? 0,
       requests: Number(r.requests),
     }));
   }

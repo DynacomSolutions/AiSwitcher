@@ -1,3 +1,4 @@
+import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
 import { isRetired } from "../identities/retired.ts";
@@ -205,6 +206,7 @@ const describe = (err: unknown): string => {
 
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
   if (opts.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the admin token (AIS_GATEWAY_ADMIN_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
+  startModelPriceRefresh();
   const now = hooks.now ?? (() => new Date());
   const backoff = hooks.warmBackoff ?? { initialMs: 1_000, maxMs: 30_000 };
   const exit = hooks.exit ?? ((code: number) => process.exit(code));

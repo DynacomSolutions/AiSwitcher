@@ -1,6 +1,7 @@
 import { isRetired } from "../../identities/retired.ts";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import "../../identities/model-price-source.ts";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { listRecentFiles, type LocalEstimateDeps } from "../../shared/local-spend.ts";

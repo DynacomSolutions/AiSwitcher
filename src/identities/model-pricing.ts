@@ -275,6 +275,14 @@ export function normaliseChatModelId(model: string): string {
   return normaliseModelId(model).replace(/-\d{8}$/, "");
 }
 
+let fetchedChatPriceLookup: ((normalisedId: string) => ListModelPrice | undefined) | undefined;
+
+/** Installs the fetched price list (see model-price-source.ts) as the first
+ * lookup for chat models; CHAT_MODEL_PRICES stays the fallback. */
+export function setFetchedChatPriceLookup(fn: ((normalisedId: string) => ListModelPrice | undefined) | undefined): void {
+  fetchedChatPriceLookup = fn;
+}
+
 /** Values one token tally at chat list rates (see CHAT_MODEL_PRICES).
  * Returns undefined for models with no entry: reporting callers surface
  * that honestly rather than inventing a price. */
@@ -285,7 +293,8 @@ export function estimateChatModelTokenCost(
   cacheReadTokens: number,
   cacheWriteTokens: number,
 ): number | undefined {
-  const price = CHAT_MODEL_PRICES[normaliseChatModelId(model)];
+  const id = normaliseChatModelId(model);
+  const price = fetchedChatPriceLookup?.(id) ?? CHAT_MODEL_PRICES[id];
   if (!price) return undefined;
   return (
     inputTokens * price.usdPer1mInput +

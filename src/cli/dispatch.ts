@@ -113,6 +113,7 @@ export async function runCli(argv: string[]): Promise<void> {
           // Service installation can probe the exact entrypoint without
           // starting a long-running process.
           if (boolFlag(flags, "check")) break;
+          (await import("../identities/model-price-source.ts")).startModelPriceRefresh();
           const { runUsageSnapshotDaemon } = await import("../server/workers.ts");
           await runUsageSnapshotDaemon();
           break;
