@@ -14,6 +14,7 @@ fi
 command -v curl >/dev/null || { printf 'curl is required\n' >&2; exit 2; }
 command -v sha256sum >/dev/null || { printf 'sha256sum is required\n' >&2; exit 2; }
 command -v cargo >/dev/null || { printf 'cargo is required\n' >&2; exit 2; }
+command -v bun >/dev/null || { printf 'bun is required (it writes the build stamp)\n' >&2; exit 2; }
 
 if [[ "$build_base" != /* ]]; then
   printf 'build directory must be absolute: %s\n' "$build_base" >&2
@@ -47,12 +48,12 @@ printf '%s  %s\n' "$source_sha256" "$archive" | sha256sum --check --status || {
 mkdir "$source_dir"
 tar -xzf "$archive" --strip-components=1 -C "$source_dir"
 cmp -- "$repo_root/vendor/tokscale/LICENSE" "$source_dir/LICENSE"
-patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais.patch"
-patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-io.patch"
-patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-scope.patch"
-patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-segments.patch"
-patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-grok.patch"
-patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/v4.20.0-ais-checkpoint.patch"
+# Patches apply in the order vendor/tokscale/patches/series lists them; the
+# build stamp records the same list.
+while IFS= read -r -u 3 patch_name; do
+  [[ -n "$patch_name" ]] || continue
+  patch --directory="$source_dir" --strip=1 --input="$repo_root/vendor/tokscale/patches/$patch_name" </dev/null
+done 3< "$repo_root/vendor/tokscale/patches/series"
 
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_shared_snapshot)
 (cd "$source_dir" && cargo test --locked --package tokscale-core --lib selector_)
@@ -79,5 +80,8 @@ mkdir -p "$(dirname "$output")"
 staged="$output.ais-new-$$"
 cp "$target_dir/release/tokscale" "$staged"
 chmod 0755 "$staged"
+# The stamp goes first and comes back last, so it never describes an older binary.
+rm -f -- "$output.ais-build"
 mv -f -- "$staged" "$output"
+bun "$repo_root/scripts/tokscale-stamp.ts" "$repo_root" "$output"
 printf 'Installed AIS-patched Tokscale v4.20.0 at %s\n' "$output"

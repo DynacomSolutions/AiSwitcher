@@ -7,6 +7,7 @@ import {
   installUsageCollectorService,
   USAGE_COLLECTOR_SERVICE_NAME,
   USAGE_COLLECTOR_UNIT,
+  usageCollectorUnit,
 } from "../../../src/cli/usage/collector-service.ts";
 import { finalizeInstall } from "../../../scripts/install.ts";
 
@@ -49,6 +50,7 @@ test("atomically installs, verifies, and leaves an identical unit untouched on r
     unitDirectory,
     aisPath,
     platform: "linux" as NodeJS.Platform,
+    checkpointSupport: async () => true,
     checkEntrypoint: async (path: string) => {
       probes.push(path);
       return true;
@@ -60,7 +62,7 @@ test("atomically installs, verifies, and leaves an identical unit untouched on r
   };
 
   const first = await installUsageCollectorService(options);
-  expect(first).toEqual({ path: join(unitDirectory, USAGE_COLLECTOR_SERVICE_NAME), changed: true });
+  expect(first).toEqual({ path: join(unitDirectory, USAGE_COLLECTOR_SERVICE_NAME), changed: true, ioCap: "5M" });
   expect(await readFile(first.path, "utf8")).toBe(USAGE_COLLECTOR_UNIT);
   expect((await stat(first.path)).mode & 0o777).toBe(0o644);
 
@@ -92,19 +94,19 @@ test("full install skips unsupported hosts and starts the service only when supp
     platform: "darwin",
     checkEntrypoint: async () => { calls.push("probe"); return true; },
     hasManager: async () => { calls.push("manager"); return true; },
-    install: async () => { calls.push("install"); return { path: "/unit", changed: true }; },
+    install: async () => { calls.push("install"); return { path: "/unit", changed: true, ioCap: "5M" }; },
   })).toEqual({ status: "not-linux" });
   expect(await configureUsageCollectorServiceForFullInstall({
     platform: "linux",
     checkEntrypoint: async () => false,
     hasManager: async () => { calls.push("unexpected-manager"); return true; },
-    install: async () => { calls.push("unexpected-install"); return { path: "/unit", changed: true }; },
+    install: async () => { calls.push("unexpected-install"); return { path: "/unit", changed: true, ioCap: "5M" }; },
   })).toEqual({ status: "unsupported-entrypoint" });
   expect(await configureUsageCollectorServiceForFullInstall({
     platform: "linux",
     checkEntrypoint: async () => true,
     hasManager: async () => false,
-    install: async () => { calls.push("unexpected-install"); return { path: "/unit", changed: true }; },
+    install: async () => { calls.push("unexpected-install"); return { path: "/unit", changed: true, ioCap: "5M" }; },
   })).toEqual({ status: "no-user-manager" });
   const restartRequests: boolean[] = [];
   expect(await configureUsageCollectorServiceForFullInstall({
@@ -115,9 +117,9 @@ test("full install skips unsupported hosts and starts the service only when supp
     install: async (_aisPath, aisBinaryChanged) => {
       calls.push("install");
       restartRequests.push(aisBinaryChanged);
-      return { path: "/unit", changed: false };
+      return { path: "/unit", changed: false, ioCap: "5M" };
     },
-  })).toEqual({ status: "verified", path: "/unit", changed: false });
+  })).toEqual({ status: "verified", path: "/unit", changed: false, ioCap: "5M" });
   expect(calls).toEqual(["install"]);
   expect(restartRequests).toEqual([true]);
 });
@@ -148,6 +150,7 @@ test("replaces a stale unit atomically with the canonical bounded unit", async (
   const result = await installUsageCollectorService({
     unitDirectory,
     platform: "linux",
+    checkpointSupport: async () => true,
     checkEntrypoint: async () => true,
     reloadAndVerify: async (serviceName) => {
       expect(serviceName).toBe(USAGE_COLLECTOR_SERVICE_NAME);
@@ -172,6 +175,7 @@ test("an installed unit with the old 20M disk cap is rewritten and the service r
   const result = await installUsageCollectorService({
     unitDirectory,
     platform: "linux",
+    checkpointSupport: async () => true,
     checkEntrypoint: async () => true,
     reloadAndVerify: async () => {},
     enableStartAndVerify: async (_serviceName, restartIfActive) => { restarts.push(restartIfActive); },
@@ -181,4 +185,45 @@ test("an installed unit with the old 20M disk cap is rewritten and the service r
   const installed = await readFile(path, "utf8");
   expect(installed).toContain("IOReadBandwidthMax=%h 5M");
   expect(installed).toContain("IOWriteBandwidthMax=%h 5M");
+});
+
+test("keeps the 20M cap, and moves to 5M only once the installed Tokscale checkpoints", async () => {
+  const root = await temporaryDirectory();
+  const unitDirectory = join(root, "systemd", "user");
+  const path = join(unitDirectory, USAGE_COLLECTOR_SERVICE_NAME);
+  const restarts: boolean[] = [];
+  let checkpoints = false;
+  const options = {
+    unitDirectory,
+    platform: "linux" as NodeJS.Platform,
+    checkpointSupport: async () => checkpoints,
+    checkEntrypoint: async () => true,
+    reloadAndVerify: async () => {},
+    enableStartAndVerify: async (_serviceName: string, restartIfActive: boolean) => { restarts.push(restartIfActive); },
+  };
+
+  expect(await installUsageCollectorService(options)).toMatchObject({ changed: true, ioCap: "20M" });
+  expect(await readFile(path, "utf8")).toBe(usageCollectorUnit("20M"));
+  expect(await readFile(path, "utf8")).toContain("IOReadBandwidthMax=%h 20M");
+
+  expect(await installUsageCollectorService(options)).toMatchObject({ changed: false, ioCap: "20M" });
+
+  checkpoints = true;
+  expect(await installUsageCollectorService(options)).toMatchObject({ changed: true, ioCap: "5M" });
+  expect(await readFile(path, "utf8")).toBe(USAGE_COLLECTOR_UNIT);
+  expect(restarts).toEqual([true, false, true]);
+});
+
+test("a failing checkpoint probe keeps the 20M cap", async () => {
+  const root = await temporaryDirectory();
+  const unitDirectory = join(root, "systemd", "user");
+  const result = await installUsageCollectorService({
+    unitDirectory,
+    platform: "linux",
+    checkpointSupport: async () => { throw new Error("stamp unreadable"); },
+    checkEntrypoint: async () => true,
+    reloadAndVerify: async () => {},
+    enableStartAndVerify: async () => {},
+  });
+  expect(result.ioCap).toBe("20M");
 });

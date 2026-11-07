@@ -154,7 +154,10 @@ The patches add these AIS-only surfaces:
   `.ais-scope-seeded`: only the final save has looked up every entry a seed
   must carry. The export batch is still written only when the scan completes,
   so a killed scan never publishes partial data. One source is never split,
-  so a single transcript must still parse within the timeout.
+  so a single transcript must still parse within the timeout. A scan killed
+  in the middle of a shard write leaves a `.<shard>.<pid>.<nanos>.tmp` file;
+  the next save of that scoped namespace removes such files (and stale seed
+  marker temp files) once they are an hour old, under the cache lock.
 
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
@@ -175,7 +178,25 @@ bash scripts/build-tokscale-ais.sh
 ```
 
 The helper downloads only the pinned release archive, verifies its checksum and
-licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch`, `patches/v4.20.0-ais-scope.patch`, `patches/v4.20.0-ais-segments.patch`, `patches/v4.20.0-ais-grok.patch` and then `patches/v4.20.0-ais-checkpoint.patch`, and installs to
+licence, applies the patches in the order `patches/series` lists them
+(`v4.20.0-ais.patch`, `-ais-io`, `-ais-scope`, `-ais-segments`, `-ais-grok`, then
+`-ais-checkpoint`), runs the patch tests, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.
+
+Next to the binary it writes `<binary>.ais-build`: the pinned release, the
+SHA-256 of every patch in series order, the helper's own SHA-256 and the
+installed binary's SHA-256 (`src/cli/usage/tokscale-build.ts`). The old stamp is
+removed before the binary is replaced and the new one written after, so a
+stamp never describes an older binary; a failed build leaves the previous
+binary and stamp alone.
+
+A full install (`bun run install:shims`) compares the stamp with the checkout
+and runs this helper under `nice -n 19` and `ionice -c 3` when the stamp is
+missing, differs, or no longer matches the binary's bytes. The usage collector
+unit gets its 5 MB/s disk cap only when the stamp verifies and lists
+`v4.20.0-ais-checkpoint.patch`; otherwise it keeps 20 MB/s, because without
+checkpoints a cold export of a large identity cannot finish under 5 MB/s.
+`ais usage service install` applies the same check. A failed rebuild is
+reported as a warning and the host keeps its previous binary and 20 MB/s.
