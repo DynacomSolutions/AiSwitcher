@@ -1,0 +1,733 @@
+diff --git a/crates/tokscale-cli/tests/cli_tests.rs b/crates/tokscale-cli/tests/cli_tests.rs
+index 4c114fa..7376a75 100644
+--- a/crates/tokscale-cli/tests/cli_tests.rs
++++ b/crates/tokscale-cli/tests/cli_tests.rs
+@@ -2471,6 +2471,86 @@ fn ais_native_export_reports_unchanged_messages_instead_of_rewriting_the_batch()
+     assert_eq!(third["messages"], first["messages"]);
+ }
+ 
++/// With `TOKSCALE_AIS_SEGMENT_DIR`, the export path gets a small manifest and
++/// the messages go to content-addressed segments. Only segments AIS lists as
++/// verified are left alone; all others are (re)written, so a damaged file is
++/// never adopted. The messages and their digest equal the single-file batch.
++#[test]
++fn ais_native_export_writes_segments_and_rewrites_only_unlisted_ones() {
++    use sha2::Digest;
++    let tmp = create_codex_fixture_dir();
++    let partition_id = "d".repeat(64);
++    let segments_dir = tmp.path().join("segments");
++    let run = |export_path: &std::path::Path, segmented: bool, reusable: Option<&str>| {
++        let mut command = cmd_with_home(tmp.path());
++        command
++            .env("TOKSCALE_AIS_EXPORT_PATH", export_path)
++            .env("TOKSCALE_AIS_PARTITION_ID", &partition_id)
++            .env(
++                "TOKSCALE_AIS_SOURCE_CONFIG_DIR",
++                tmp.path().join("original-tokscale-config"),
++            )
++            .args(["--json", "--client", "codex", "--no-spinner"]);
++        if segmented {
++            command.env("TOKSCALE_AIS_SEGMENT_DIR", &segments_dir);
++        }
++        if let Some(list) = reusable {
++            let file = tmp.path().join("reusable.txt");
++            fs::write(&file, list).unwrap();
++            command.env("TOKSCALE_AIS_REUSABLE_SEGMENTS_FILE", file);
++        }
++        let output = command.output().unwrap();
++        assert!(
++            output.status.success(),
++            "stderr: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        serde_json::from_slice::<serde_json::Value>(&fs::read(export_path).unwrap()).unwrap()
++    };
++
++    let single = run(&tmp.path().join("single.json"), false, None);
++    let manifest = run(&tmp.path().join("segmented.json"), true, None);
++    assert_eq!(manifest["schemaVersion"], 2);
++    assert_eq!(manifest["format"], "ais-segmented-v1");
++    assert_eq!(manifest["complete"], true);
++    assert!(manifest.get("messages").is_none());
++    assert_eq!(manifest["messagesSha256"], single["messagesSha256"]);
++    assert!(manifest["hourly"]
++        .as_array()
++        .is_some_and(|hours| !hours.is_empty()));
++    let segments = manifest["segments"].as_array().unwrap();
++    assert!(!segments.is_empty());
++    let mut joined = Vec::new();
++    for segment in segments {
++        let sha = segment["sha256"].as_str().unwrap();
++        let bytes = fs::read(segments_dir.join(format!("{sha}.json"))).unwrap();
++        assert_eq!(bytes.len() as u64, segment["bytes"].as_u64().unwrap());
++        let digest: String = sha2::Sha256::digest(&bytes)
++            .iter()
++            .map(|byte| format!("{byte:02x}"))
++            .collect();
++        assert_eq!(digest, sha);
++        joined.extend(serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap());
++    }
++    assert_eq!(serde_json::Value::Array(joined), single["messages"]);
++    let first = segments[0]["sha256"].as_str().unwrap();
++    let first_path = segments_dir.join(format!("{first}.json"));
++
++    // Listed as verified: left alone, even when damaged on disk.
++    fs::write(&first_path, b"damaged").unwrap();
++    run(
++        &tmp.path().join("again.json"),
++        true,
++        Some(&format!("{first}\n")),
++    );
++    assert_eq!(fs::read(&first_path).unwrap(), b"damaged");
++    // Not listed: rewritten from the scan.
++    let again = run(&tmp.path().join("rebuilt.json"), true, Some(""));
++    assert_eq!(again["segments"], manifest["segments"]);
++    let bytes = fs::read(&first_path).unwrap();
++    assert_eq!(bytes.len() as u64, segments[0]["bytes"].as_u64().unwrap());
++}
++
+ #[test]
+ fn test_global_theme_flag() {
+     let mut cmd = cargo_bin_cmd!("tokscale");
+diff --git a/crates/tokscale-core/src/lib.rs b/crates/tokscale-core/src/lib.rs
+index f6f336c..f0a311e 100644
+--- a/crates/tokscale-core/src/lib.rs
++++ b/crates/tokscale-core/src/lib.rs
+@@ -50,6 +50,11 @@ static AIS_SHARED_PARSED_MANIFEST: OnceLock<Mutex<Option<(PathBuf, serde_json::V
+ static AIS_SHARED_NATIVE_BATCH_CACHE: OnceLock<
+     Mutex<std::collections::HashMap<(PathBuf, String, String, String), Vec<UnifiedMessage>>>,
+ > = OnceLock::new();
++/// Verified segments of segmented native batches, keyed by path and SHA-256.
++/// A reload reads only segments it has not verified yet.
++static AIS_SHARED_SEGMENT_CACHE: OnceLock<
++    Mutex<std::collections::HashMap<(PathBuf, String), Arc<Vec<UnifiedMessage>>>>,
++> = OnceLock::new();
+ 
+ /// Counts Claude cache entries rebuilt because they predate retention
+ /// provenance. Tests assert the rebuild is a one-time upgrade cost: the count
+@@ -5160,7 +5165,7 @@ pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2
+         &options.scanner_settings,
+         SourceCachePolicy::Persistent,
+     );
+-    write_ais_export_if_requested(&all_messages)?;
++    write_ais_export_if_requested(&all_messages, &options.scanner_settings)?;
+ 
+     let filtered = filter_messages_for_report(all_messages, &options);
+     let mut undated_tokens = TokenBreakdown::default();
+@@ -6583,7 +6588,223 @@ fn ais_messages_sha256(messages: &[UnifiedMessage]) -> Result<String, String> {
+     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+ }
+ 
+-fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), String> {
++/// Segmented batches (`TOKSCALE_AIS_SEGMENT_DIR`): the `messages` array is
++/// cut into contiguous, content-defined segments stored by their SHA-256, and
++/// the export path receives a small manifest listing them in order. Joining
++/// the segments' elements in order gives the exact bytes of the single-file
++/// `messages` array, so `messagesSha256` is unchanged. A segment's boundaries
++/// depend only on the messages themselves, so a scan that adds messages to one
++/// transcript changes only the segments around them.
++pub const AIS_SEGMENT_FORMAT: &str = "ais-segmented-v1";
++const AIS_SEGMENT_MIN_BYTES: usize = 512 << 10;
++const AIS_SEGMENT_TARGET_BYTES: u64 = 2 << 20;
++const AIS_SEGMENT_MAX_BYTES: usize = 16 << 20;
++
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct AisSegmentRef {
++    pub sha256: String,
++    pub bytes: u64,
++    pub messages: u64,
++}
++
++/// Tokscale's own hourly rollup of the exported messages, in the shape AIS
++/// reads, so AIS derives daily figures without reading the segments.
++#[derive(serde::Serialize)]
++#[serde(rename_all = "camelCase")]
++struct AisHourlyOut {
++    hour: String,
++    input: i64,
++    output: i64,
++    cache_read: i64,
++    cache_write: i64,
++    message_count: i32,
++    cost: f64,
++}
++
++#[derive(serde::Serialize)]
++#[serde(rename_all = "camelCase")]
++struct AisSegmentedEnvelopeOut<'a> {
++    schema_version: u32,
++    format: &'a str,
++    partition_id: &'a str,
++    generated_at: &'a str,
++    complete: bool,
++    messages_sha256: &'a str,
++    message_count: u64,
++    segments: &'a [AisSegmentRef],
++    hourly: Vec<AisHourlyOut>,
++}
++
++#[derive(serde::Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct AisSegmentedEnvelope {
++    schema_version: u32,
++    format: String,
++    partition_id: String,
++    generated_at: String,
++    complete: bool,
++    messages_sha256: String,
++    segments: Vec<AisSegmentRef>,
++}
++
++fn ais_hex(digest: &[u8]) -> String {
++    digest.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++fn ais_is_sha256_hex(value: &str) -> bool {
++    value.len() == 64
++        && value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++/// FNV-1a: a fixed, dependency-free hash, so segment boundaries never move
++/// between builds.
++fn ais_fnv1a(bytes: &[u8]) -> u64 {
++    let mut hash = 0xcbf2_9ce4_8422_2325u64;
++    for byte in bytes {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    hash
++}
++
++/// Split the serialized messages into segments. Each segment is a JSON array
++/// of whole messages. A segment ends once it holds at least the minimum size
++/// and a message's hash falls in a window proportional to that message's
++/// size (so segments average the target size whatever the message sizes), or
++/// when it reaches the maximum size.
++fn ais_segment_messages(
++    messages: &[UnifiedMessage],
++    mut emit: impl FnMut(&[u8], u64) -> Result<(), String>,
++) -> Result<(), String> {
++    let mut buffer = Vec::with_capacity(AIS_SEGMENT_MIN_BYTES * 2);
++    let mut count = 0u64;
++    for message in messages {
++        let encoded =
++            serde_json::to_vec(message).map_err(|e| format!("AIS segment encode: {e}"))?;
++        buffer.push(if count == 0 { b'[' } else { b',' });
++        buffer.extend_from_slice(&encoded);
++        count += 1;
++        let cut = buffer.len() + 1 >= AIS_SEGMENT_MAX_BYTES
++            || (buffer.len() >= AIS_SEGMENT_MIN_BYTES
++                && ais_fnv1a(&encoded) % AIS_SEGMENT_TARGET_BYTES < encoded.len() as u64);
++        if cut {
++            buffer.push(b']');
++            emit(&buffer, count)?;
++            buffer.clear();
++            count = 0;
++        }
++    }
++    if count > 0 {
++        buffer.push(b']');
++        emit(&buffer, count)?;
++    }
++    Ok(())
++}
++
++/// Atomically write `bytes` to `path`: a temporary file in the same
++/// directory, synced, then renamed over the target.
++fn ais_write_atomic(path: &std::path::Path, bytes: &[u8], tag: &str) -> Result<(), String> {
++    use std::io::Write;
++    let parent = path.parent().ok_or("AIS write path has no parent")?;
++    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let temp = parent.join(format!(
++        ".ais-{tag}-{}-{}-{}.tmp",
++        std::process::id(),
++        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
++        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
++    ));
++    let result = (|| -> Result<(), String> {
++        let mut file = std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&temp)
++            .map_err(|e| format!("AIS {tag} temp: {e}"))?;
++        file.write_all(bytes)
++            .and_then(|_| file.sync_all())
++            .map_err(|e| format!("AIS {tag} write: {e}"))?;
++        std::fs::rename(&temp, path).map_err(|e| format!("AIS {tag} publish: {e}"))
++    })();
++    if result.is_err() {
++        let _ = std::fs::remove_file(&temp);
++    }
++    result
++}
++
++/// Segments AIS has verified on disk since it last committed them (one
++/// SHA-256 per line). Only these may be left as they are; every other
++/// segment is written, even when a file of that name exists, so a damaged
++/// or foreign file is never adopted.
++fn ais_reusable_segments() -> Result<HashSet<String>, String> {
++    let Some(path) = std::env::var_os("TOKSCALE_AIS_REUSABLE_SEGMENTS_FILE") else {
++        return Ok(HashSet::new());
++    };
++    let text =
++        std::fs::read_to_string(&path).map_err(|e| format!("AIS reusable segment list: {e}"))?;
++    Ok(text
++        .lines()
++        .map(str::trim)
++        .filter(|line| ais_is_sha256_hex(line))
++        .map(str::to_string)
++        .collect())
++}
++
++fn write_ais_segments(
++    messages: &[UnifiedMessage],
++    segment_dir: &std::path::Path,
++) -> Result<Vec<AisSegmentRef>, String> {
++    use sha2::Digest;
++    std::fs::create_dir_all(segment_dir).map_err(|e| format!("AIS segment directory: {e}"))?;
++    let reusable = ais_reusable_segments()?;
++    let mut written = HashSet::new();
++    let mut segments = Vec::new();
++    ais_segment_messages(messages, |bytes, count| {
++        let sha256 = ais_hex(&sha2::Sha256::digest(bytes));
++        if !reusable.contains(&sha256) && !written.contains(&sha256) {
++            ais_write_atomic(
++                &segment_dir.join(format!("{sha256}.json")),
++                bytes,
++                "segment",
++            )?;
++            written.insert(sha256.clone());
++        }
++        segments.push(AisSegmentRef {
++            sha256,
++            bytes: bytes.len() as u64,
++            messages: count,
++        });
++        Ok(())
++    })?;
++    Ok(segments)
++}
++
++fn ais_hourly_out(
++    messages: &[UnifiedMessage],
++    scanner_settings: &scanner::ScannerSettings,
++) -> Vec<AisHourlyOut> {
++    aggregate_hourly_usage_entries(
++        messages.iter().cloned(),
++        bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings),
++    )
++    .into_iter()
++    .map(|entry| AisHourlyOut {
++        hour: entry.hour,
++        input: entry.input,
++        output: entry.output,
++        cache_read: entry.cache_read,
++        cache_write: entry.cache_write,
++        message_count: entry.message_count,
++        cost: entry.cost,
++    })
++    .collect()
++}
++
++fn write_ais_export_if_requested(
++    messages: &[UnifiedMessage],
++    scanner_settings: &scanner::ScannerSettings,
++) -> Result<(), String> {
+     let path = std::env::var_os("TOKSCALE_AIS_EXPORT_PATH");
+     let partition_id = std::env::var("TOKSCALE_AIS_PARTITION_ID").ok();
+     let (path, partition_id) = match (path, partition_id) {
+@@ -6594,6 +6815,10 @@ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), Stri
+     if partition_id.is_empty() {
+         return Err("AIS partition id is empty".into());
+     }
++    let segment_dir = std::env::var_os("TOKSCALE_AIS_SEGMENT_DIR").map(std::path::PathBuf::from);
++    if segment_dir.as_ref().is_some_and(|dir| !dir.is_absolute()) {
++        return Err("AIS segment directory must be absolute".into());
++    }
+     let path = std::path::PathBuf::from(path);
+     let parent = path.parent().ok_or("AIS export path has no parent")?;
+     std::fs::create_dir_all(parent).map_err(|e| format!("AIS export directory: {e}"))?;
+@@ -6604,6 +6829,26 @@ fn write_ais_export_if_requested(messages: &[UnifiedMessage]) -> Result<(), Stri
+     let messages_sha256 = ais_messages_sha256(messages)?;
+     let unchanged = std::env::var("TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256")
+         .is_ok_and(|previous| previous == messages_sha256);
++    if !unchanged {
++        if let Some(segment_dir) = segment_dir {
++            // Segments are published before the manifest that names them, so
++            // a manifest never lists a segment that is not on disk.
++            let segments = write_ais_segments(messages, &segment_dir)?;
++            let encoded = serde_json::to_vec(&AisSegmentedEnvelopeOut {
++                schema_version: 2,
++                format: AIS_SEGMENT_FORMAT,
++                partition_id: &partition_id,
++                generated_at: &generated_at,
++                complete: true,
++                messages_sha256: &messages_sha256,
++                message_count: messages.len() as u64,
++                segments: &segments,
++                hourly: ais_hourly_out(messages, scanner_settings),
++            })
++            .map_err(|e| format!("AIS batch encode: {e}"))?;
++            return ais_write_atomic(&path, &encoded, "batch");
++        }
++    }
+     let temp = parent.join(format!(
+         ".ais-batch-{}-{}.tmp",
+         std::process::id(),
+@@ -6797,6 +7042,45 @@ fn ais_shared_snapshot_report_impl(
+     )
+ }
+ 
++/// One verified segment of a segmented native batch: its file must have the
++/// listed size, SHA-256 and message count. The error says whether the file
++/// was missing, so the caller can retry against a newer manifest.
++fn load_ais_segment(
++    segment_dir: &std::path::Path,
++    segment: &AisSegmentRef,
++    keys: &mut HashSet<(PathBuf, String)>,
++) -> Result<Arc<Vec<UnifiedMessage>>, (bool, String)> {
++    use sha2::{Digest, Sha256};
++    if !ais_is_sha256_hex(&segment.sha256) {
++        return Err((false, "native segment name invalid".into()));
++    }
++    let path = segment_dir.join(format!("{}.json", segment.sha256));
++    let key = (path.clone(), segment.sha256.clone());
++    keys.insert(key.clone());
++    let cache =
++        AIS_SHARED_SEGMENT_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
++    if let Some(messages) = cache.lock().unwrap().get(&key).cloned() {
++        return Ok(messages);
++    }
++    let bytes = std::fs::read(&path).map_err(|e| {
++        (
++            e.kind() == std::io::ErrorKind::NotFound,
++            format!("native segment read: {e}"),
++        )
++    })?;
++    if bytes.len() as u64 != segment.bytes || ais_hex(&Sha256::digest(&bytes)) != segment.sha256 {
++        return Err((false, "native segment checksum mismatch".into()));
++    }
++    let messages: Vec<UnifiedMessage> =
++        serde_json::from_slice(&bytes).map_err(|e| (false, format!("native segment JSON: {e}")))?;
++    if messages.len() as u64 != segment.messages {
++        return Err((false, "native segment message count mismatch".into()));
++    }
++    let messages = Arc::new(messages);
++    cache.lock().unwrap().insert(key, messages.clone());
++    Ok(messages)
++}
++
+ pub fn parse_ais_shared_snapshot(
+     path: &str,
+     options: &LocalParseOptions,
+@@ -6856,6 +7140,7 @@ fn parse_ais_shared_snapshot_inner(
+     let mut combined = Vec::new();
+     let mut unavailable_tools = unsupported_tools;
+     let mut manifest_cache_keys = HashSet::new();
++    let mut manifest_segment_keys = HashSet::new();
+     let mut saw_missing_batch = false;
+     for (_partition_key, partition) in partitions {
+         let Some(batch) = partition.get("nativeBatch").filter(|v| !v.is_null()) else {
+@@ -6922,7 +7207,8 @@ fn parse_ais_shared_snapshot_inner(
+             combined.extend(messages);
+             continue;
+         }
+-        let loaded = (|| -> Result<AisBatchEnvelope, String> {
++        let mut segmented = false;
++        let loaded = (|| -> Result<Vec<UnifiedMessage>, String> {
+             let bytes = std::fs::read(&batch_path).map_err(|e| {
+                 if e.kind() == std::io::ErrorKind::NotFound {
+                     saw_missing_batch = true;
+@@ -6933,6 +7219,40 @@ fn parse_ais_shared_snapshot_inner(
+             if expected_digest != digest {
+                 return Err("native batch checksum mismatch".into());
+             }
++            if bytes.starts_with(b"{\"schemaVersion\":2,") {
++                segmented = true;
++                let envelope: AisSegmentedEnvelope = serde_json::from_slice(&bytes)
++                    .map_err(|e| format!("native batch JSON: {e}"))?;
++                if envelope.schema_version != 2
++                    || envelope.format != AIS_SEGMENT_FORMAT
++                    || !envelope.complete
++                    || envelope.partition_id != expected_partition_id
++                    || !ais_is_sha256_hex(&envelope.messages_sha256)
++                {
++                    return Err("native batch envelope mismatch".into());
++                }
++                if chrono::DateTime::parse_from_rfc3339(&envelope.generated_at).is_err() {
++                    return Err("native batch timestamp invalid".into());
++                }
++                if expected_generated_at != envelope.generated_at {
++                    return Err("native batch generation mismatch".into());
++                }
++                let segment_dir = batch_path
++                    .parent()
++                    .ok_or("native batch has no directory")?
++                    .join("segments");
++                let mut messages = Vec::new();
++                for segment in &envelope.segments {
++                    let loaded =
++                        load_ais_segment(&segment_dir, segment, &mut manifest_segment_keys)
++                            .map_err(|(missing, error)| {
++                                saw_missing_batch |= missing;
++                                error
++                            })?;
++                    messages.extend(loaded.iter().cloned());
++                }
++                return Ok(messages);
++            }
+             let envelope: AisBatchEnvelope =
+                 serde_json::from_slice(&bytes).map_err(|e| format!("native batch JSON: {e}"))?;
+             if expected_partition_id.len() != 64
+@@ -6954,16 +7274,20 @@ fn parse_ais_shared_snapshot_inner(
+             if expected_generated_at != envelope.generated_at {
+                 return Err("native batch generation mismatch".into());
+             }
+-            Ok(envelope)
++            Ok(envelope.messages)
+         })();
+         match loaded {
+-            Ok(envelope) => {
+-                AIS_SHARED_NATIVE_BATCH_CACHE
+-                    .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+-                    .lock()
+-                    .unwrap()
+-                    .insert(cache_key, envelope.messages.clone());
+-                combined.extend(envelope.messages)
++            Ok(messages) => {
++                // Segmented batches are cached per segment instead, so a
++                // partition's messages are held once.
++                if !segmented {
++                    AIS_SHARED_NATIVE_BATCH_CACHE
++                        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
++                        .lock()
++                        .unwrap()
++                        .insert(cache_key, messages.clone());
++                }
++                combined.extend(messages)
+             }
+             Err(_) => *unavailable_tools.entry(tool).or_default() += 1,
+         }
+@@ -6980,6 +7304,11 @@ fn parse_ais_shared_snapshot_inner(
+         .lock()
+         .unwrap()
+         .retain(|key, _| manifest_cache_keys.contains(key));
++    AIS_SHARED_SEGMENT_CACHE
++        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
++        .lock()
++        .unwrap()
++        .retain(|key, _| manifest_segment_keys.contains(key));
+     let aggregate_generated_at = manifest
+         .get("aggregateGeneratedAt")
+         .and_then(serde_json::Value::as_str)
+@@ -7041,7 +7370,7 @@ fn parse_local_unified_messages_resolved(
+         cache_policy,
+     );
+     let messages = filter_unified_messages(messages, &options);
+-    write_ais_export_if_requested(&messages)?;
++    write_ais_export_if_requested(&messages, &options.scanner_settings)?;
+     Ok(messages)
+ }
+ 
+@@ -10818,6 +11147,198 @@ mod tests {
+         msg
+     }
+ 
++    fn ais_segmented_test_messages(count: usize, tag: &str) -> Vec<UnifiedMessage> {
++        (0..count)
++            .map(|index| {
++                let mut message = make_workspace_message(
++                    "claude",
++                    "claude-sonnet-4",
++                    "anthropic",
++                    &format!("{tag}-session-{:06}-{}", index / 40, "x".repeat(120)),
++                    0.000_1 * (index % 97) as f64 + 0.1,
++                    None,
++                    None,
++                );
++                message.timestamp = 1_733_011_200_000 + (index as i64) * 61_000;
++                message.dedup_key = Some(format!("{tag}-{index}"));
++                message
++            })
++            .collect()
++    }
++
++    fn ais_segment_list(messages: &[UnifiedMessage]) -> Vec<(String, Vec<u8>)> {
++        use sha2::Digest;
++        let mut out = Vec::new();
++        super::ais_segment_messages(messages, |bytes, _| {
++            out.push((super::ais_hex(&sha2::Sha256::digest(bytes)), bytes.to_vec()));
++            Ok(())
++        })
++        .unwrap();
++        out
++    }
++
++    /// Joining the segments' elements gives the single-file `messages` bytes,
++    /// so `messagesSha256` is the same for both formats; and messages added in
++    /// the middle (one transcript grew) change only the segments around them.
++    #[test]
++    fn ais_segmented_batch_matches_single_file_digest_and_localizes_changes() {
++        use sha2::Digest;
++        let messages = ais_segmented_test_messages(60_000, "m");
++        let segments = ais_segment_list(&messages);
++        assert!(segments.len() >= 3, "{} segments", segments.len());
++        let mut joined = vec![b'['];
++        for (index, (_, bytes)) in segments.iter().enumerate() {
++            if index > 0 {
++                joined.push(b',');
++            }
++            joined.extend_from_slice(&bytes[1..bytes.len() - 1]);
++        }
++        joined.push(b']');
++        assert_eq!(joined, serde_json::to_vec(&messages).unwrap());
++        assert_eq!(
++            super::ais_hex(&sha2::Sha256::digest(&joined)),
++            super::ais_messages_sha256(&messages).unwrap()
++        );
++        assert_eq!(segments, ais_segment_list(&messages), "deterministic");
++
++        let mut grown = messages.clone();
++        let middle = grown.len() / 2;
++        grown.splice(middle..middle, ais_segmented_test_messages(200, "new"));
++        let before: HashSet<String> = segments.iter().map(|(sha, _)| sha.clone()).collect();
++        let changed: Vec<_> = ais_segment_list(&grown)
++            .into_iter()
++            .filter(|(sha, _)| !before.contains(sha))
++            .collect();
++        assert!(
++            !changed.is_empty() && changed.len() <= 2,
++            "{} of {} segments changed",
++            changed.len(),
++            segments.len()
++        );
++    }
++
++    fn ais_write_segmented_batch(
++        partition_dir: &std::path::Path,
++        file_name: &str,
++        partition_id: &str,
++        generation: &str,
++        messages: &[UnifiedMessage],
++    ) -> (Vec<super::AisSegmentRef>, String) {
++        use sha2::{Digest, Sha256};
++        let segments =
++            super::write_ais_segments(messages, &partition_dir.join("segments")).unwrap();
++        let bytes = serde_json::to_vec(&super::AisSegmentedEnvelopeOut {
++            schema_version: 2,
++            format: super::AIS_SEGMENT_FORMAT,
++            partition_id,
++            generated_at: generation,
++            complete: true,
++            messages_sha256: &super::ais_messages_sha256(messages).unwrap(),
++            message_count: messages.len() as u64,
++            segments: &segments,
++            hourly: super::ais_hourly_out(messages, &crate::scanner::ScannerSettings::default()),
++        })
++        .unwrap();
++        std::fs::write(partition_dir.join(file_name), &bytes).unwrap();
++        (segments, format!("{:x}", Sha256::digest(&bytes)))
++    }
++
++    /// The TUI reader returns exactly the single-file batch's messages from a
++    /// segmented batch, and treats a damaged or missing segment as the whole
++    /// partition's native detail being unavailable, never a partial load.
++    #[test]
++    #[serial]
++    fn ais_segmented_batch_tui_reader_equals_single_file_and_fails_closed() {
++        use super::{parse_ais_shared_snapshot, AisBatchEnvelope, AIS_SHARED_SEGMENT_CACHE};
++        use sha2::{Digest, Sha256};
++        let (_temp, root) = crate::sessions::canonical_tempdir();
++        let usage = root.join("usage");
++        let partition_id = "c".repeat(64);
++        let partition_dir = usage.join("native").join(&partition_id);
++        std::fs::create_dir_all(&partition_dir).unwrap();
++        let manifest_path = usage.join("snapshot.json");
++        let generation = "2026-11-07T08:00:00.000Z";
++        let messages = ais_segmented_test_messages(20_000, "t");
++
++        let legacy = serde_json::to_vec(&AisBatchEnvelope {
++            schema_version: 1,
++            partition_id: partition_id.clone(),
++            generated_at: generation.into(),
++            complete: true,
++            messages: messages.clone(),
++        })
++        .unwrap();
++        std::fs::write(partition_dir.join("legacy.json"), &legacy).unwrap();
++        let legacy_digest = format!("{:x}", Sha256::digest(&legacy));
++        let (segments, segmented_digest) = ais_write_segmented_batch(
++            &partition_dir,
++            "segmented.json",
++            &partition_id,
++            generation,
++            &messages,
++        );
++        assert!(segments.len() >= 2);
++
++        let write_manifest = |file: &str, digest: &str| {
++            let manifest = serde_json::json!({
++                "schemaVersion": 1, "aggregateGeneratedAt": generation, "aggregateResults": [],
++                "partitions": { "target:claude:pool": { "tool": "claude", "results": [], "nativeBatch": {
++                    "path": format!("usage/native/{partition_id}/{file}"), "sha256": digest,
++                    "generatedAt": generation, "partitionId": partition_id,
++                }}}
++            });
++            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
++        };
++        let load = || {
++            parse_ais_shared_snapshot(
++                &manifest_path.to_string_lossy(),
++                &LocalParseOptions::default(),
++            )
++            .unwrap()
++        };
++        let as_json = |messages: &[UnifiedMessage]| serde_json::to_value(messages).unwrap();
++
++        write_manifest("legacy.json", &legacy_digest);
++        let from_legacy = load();
++        assert_eq!(from_legacy.len(), messages.len());
++        write_manifest("segmented.json", &segmented_digest);
++        AIS_SHARED_SEGMENT_CACHE
++            .get_or_init(Default::default)
++            .lock()
++            .unwrap()
++            .clear();
++        let from_segments = load();
++        assert_eq!(as_json(&from_segments), as_json(&from_legacy));
++        assert!(super::ais_shared_snapshot_coverage_status()
++            .is_some_and(|status| !status.contains("unavailable")));
++
++        // A damaged segment of the same size: unavailable, not partial.
++        let victim = partition_dir
++            .join("segments")
++            .join(format!("{}.json", segments[1].sha256));
++        let original = std::fs::read(&victim).unwrap();
++        let mut damaged = original.clone();
++        let at = damaged.len() / 2;
++        damaged[at] = if damaged[at] == b'1' { b'2' } else { b'1' };
++        std::fs::write(&victim, &damaged).unwrap();
++        AIS_SHARED_SEGMENT_CACHE
++            .get_or_init(Default::default)
++            .lock()
++            .unwrap()
++            .clear();
++        assert!(load().is_empty());
++        assert!(super::ais_shared_snapshot_coverage_status()
++            .is_some_and(|status| status.contains("Native detail unavailable: claude: 1")));
++
++        // A missing segment: unavailable too.
++        std::fs::remove_file(&victim).unwrap();
++        assert!(load().is_empty());
++
++        // Restored: whole again, reading only the segment not yet verified.
++        std::fs::write(&victim, &original).unwrap();
++        assert_eq!(as_json(&load()), as_json(&from_legacy));
++    }
++
+     #[test]
+     #[serial]
+     fn ais_shared_snapshot_uses_complete_manifest_batches_deduplicates_and_reloads() {

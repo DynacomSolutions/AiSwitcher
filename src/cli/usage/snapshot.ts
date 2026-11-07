@@ -10,7 +10,8 @@ import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnaps
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageTarget } from "./run.ts";
 import { usageResultsForJson } from "./run.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
-import { aisNativeSourceEnv, aisTokscaleCacheScope, sweepUnusedTokscaleCacheScopes, aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage } from "./tokscale.ts";
+import { aisNativeSourceEnv, aisTokscaleCacheScope, sweepUnusedTokscaleCacheScopes, aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromHourlyEntries, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage, type TokscaleHourlyEntry } from "./tokscale.ts";
+import { collectObsoleteNativeSegments, isSegmentedNativeEnvelope, nativeSegmentDir, nativeSegmentsIntact, parseSegmentedNativeManifest, verifyNativeSegments, writeReusableSegmentList, type NativeSegmentRecord } from "./native-segments.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
 export { readUsageSnapshotMetricsStatus } from "./snapshot-status.ts";
@@ -56,6 +57,10 @@ export interface UsageSnapshotPartition {
      * ("unchanged") is offered only while the file still matches both. */
     batchSize?: number;
     batchMtimeNs?: string;
+    /** Segmented batch: `path` is its manifest, and these are its segments
+     * (under `<partitionId>/segments/`) as verified when promoted. */
+    format?: "segmented-v1";
+    segments?: NativeSegmentRecord[];
   };
   lastAttemptAt: string;
   /** Identity no longer registered: results stay in totals, freshness ignores it. */
@@ -237,18 +242,39 @@ function nativeExportSupportedInSameRun(target: UsageTarget): boolean {
     !(target.toolName === "codex" && isBedrockIdentity(target.identity));
 }
 
-async function nativeExportForTarget(target: UsageTarget, key = targetKey(target), previous?: UsageSnapshotPartition["nativeBatch"], nativeRoot = join(aisCacheDir(), "usage", "native")) {
+export async function nativeExportForTarget(target: UsageTarget, key = targetKey(target), previous?: UsageSnapshotPartition["nativeBatch"], nativeRoot = join(aisCacheDir(), "usage", "native")) {
   if (!nativeExportSupportedInSameRun(target)) return undefined;
   const partitionId = nativePartitionId(key);
   const staging = join(nativeRoot, ".staging");
   mkdirSync(staging, { recursive: true, mode: 0o700 });
   const path = join(staging, `${partitionId}.${crypto.randomUUID()}.json`);
   const previousMessagesSha256 = reusableNativeBatchDigest(previous, partitionId, nativeRoot);
+  // Segments of the committed batch may stay as they are only while every one
+  // of them is still the file verified at promotion; otherwise the export
+  // rewrites them all.
+  let reusableSegmentsFile: string | undefined;
+  if (previous?.segments && previous.partitionId === partitionId && committedNativeBatchIntact(previous, nativeRoot)) {
+    reusableSegmentsFile = reusableSegmentsPath(path);
+    writeReusableSegmentList(reusableSegmentsFile, previous.segments);
+  }
   const invocation = await buildAisTokscaleExportInvocation({
     toolName: target.toolName, identity: target.identity, partitionId, exportPath: path,
+    segmentDir: nativeSegmentDir(nativeRoot, partitionId),
+    ...(reusableSegmentsFile ? { reusableSegmentsFile } : {}),
     ...(previousMessagesSha256 ? { previousMessagesSha256 } : {}),
   });
+  if (!invocation && reusableSegmentsFile) try { unlinkSync(reusableSegmentsFile); } catch { /* swept with staging */ }
   return invocation ? { invocation, path, partitionId } : undefined;
+}
+
+function reusableSegmentsPath(exportPath: string): string {
+  return `${exportPath}.reusable`;
+}
+
+/** Remove a staged export and its reusable-segment list. */
+function discardNativeCandidate(path: string): void {
+  try { unlinkSync(path); } catch { /* no staged export remains */ }
+  try { unlinkSync(reusableSegmentsPath(path)); } catch { /* none was written */ }
 }
 
 /** The committed batch's message digest, when Tokscale may answer "unchanged"
@@ -273,10 +299,11 @@ function committedNativeBatchIntact(ref: NonNullable<UsageSnapshotPartition["nat
   if (ref.batchSize === undefined || ref.batchMtimeNs === undefined) return false;
   try {
     const info = statSync(join(nativeRoot, ref.path.slice("usage/native/".length)), { bigint: true });
-    return info.isFile() && info.size === BigInt(ref.batchSize) && String(info.mtimeNs) === ref.batchMtimeNs;
+    if (!info.isFile() || info.size !== BigInt(ref.batchSize) || String(info.mtimeNs) !== ref.batchMtimeNs) return false;
   } catch {
     return false;
   }
+  return !ref.segments || nativeSegmentsIntact(nativeSegmentDir(nativeRoot, ref.partitionId), ref.segments);
 }
 
 function priorDailyUsage(prior: UsageSnapshotPartition | undefined): DailyUsage | undefined {
@@ -292,6 +319,15 @@ function candidateFromResults(results: UsageResult[]): UsageResult["nativeBatchC
 /** Receives a validated batch's messages while they are in memory, so a
  * caller can derive figures from the one read and parse of the batch. */
 type NativeBatchMessagesReader = (messages: readonly unknown[]) => void;
+/** Receives a segmented batch's hourly rollup, which replaces reading its messages. */
+type NativeBatchHourlyReader = (hourly: TokscaleHourlyEntry[]) => void;
+
+interface NativeBatchReaders {
+  messages?: NativeBatchMessagesReader;
+  hourly?: NativeBatchHourlyReader;
+  /** Segment bytes read this promotion, for tests and measurement. */
+  bytesRead?: (bytes: number) => void;
+}
 
 /** Tokscale's answer when the messages equal the batch AIS already holds
  * (`TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256`): no batch, only the digest. */
@@ -323,7 +359,13 @@ function unchangedNativeBatch(path: string, partitionId: string, previous: Usage
   return previous;
 }
 
-function validateNativeBatchFile(path: string, partitionId: string, readMessages?: NativeBatchMessagesReader): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
+function validateNativeBatchFile(
+  path: string,
+  partitionId: string,
+  readers: NativeBatchReaders = {},
+  nativeRoot = join(aisCacheDir(), "usage", "native"),
+  priorSegments?: readonly NativeSegmentRecord[],
+): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
@@ -335,6 +377,33 @@ function validateNativeBatchFile(path: string, partitionId: string, readMessages
     envelope = JSON.parse(bytes.toString("utf8"));
   } catch (error) {
     throw nativeCaptureError("candidate-json-parse", error);
+  }
+  readers.bytesRead?.(bytes.length);
+  if (isSegmentedNativeEnvelope(envelope)) {
+    let manifest;
+    try {
+      manifest = parseSegmentedNativeManifest(envelope, partitionId);
+    } catch (error) {
+      throw nativeCaptureError("candidate-envelope-validation", error);
+    }
+    let segments: NativeSegmentRecord[];
+    try {
+      const verified = verifyNativeSegments(manifest, nativeSegmentDir(nativeRoot, partitionId), priorSegments);
+      segments = verified.records;
+      readers.bytesRead?.(verified.bytesRead);
+    } catch (error) {
+      throw nativeCaptureError("candidate-hash", error);
+    }
+    readers.hourly?.(manifest.hourly);
+    return {
+      path: "",
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      generatedAt: manifest.generatedAt,
+      partitionId,
+      messagesSha256: manifest.messagesSha256,
+      format: "segmented-v1",
+      segments,
+    };
   }
   let generatedAt: string;
   try {
@@ -348,7 +417,7 @@ function validateNativeBatchFile(path: string, partitionId: string, readMessages
   } catch (error) {
     throw nativeCaptureError("candidate-hash", error);
   }
-  readMessages?.((envelope as { messages: unknown[] }).messages);
+  readers.messages?.((envelope as { messages: unknown[] }).messages);
   const messagesSha256 = (envelope as { messagesSha256?: unknown }).messagesSha256;
   return {
     path: "",
@@ -394,8 +463,14 @@ export function sweepStaleNativeStaging(staging = join(aisCacheDir(), "usage", "
   return removed;
 }
 
-function promoteNativeBatchFile(candidatePath: string, partitionId: string, nativeRoot = join(aisCacheDir(), "usage", "native"), readMessages?: NativeBatchMessagesReader): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
-  const ref = validateNativeBatchFile(candidatePath, partitionId, readMessages);
+export function promoteNativeBatchFile(
+  candidatePath: string,
+  partitionId: string,
+  nativeRoot = join(aisCacheDir(), "usage", "native"),
+  readers: NativeBatchReaders = {},
+  prior?: UsageSnapshotPartition["nativeBatch"],
+): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
+  const ref = validateNativeBatchFile(candidatePath, partitionId, readers, nativeRoot, prior?.partitionId === partitionId ? prior.segments : undefined);
   const attempt = crypto.randomUUID();
   const batchDir = join(nativeRoot, partitionId);
   try {
@@ -514,6 +589,7 @@ function readSnapshot(path = USAGE_SNAPSHOT_FILE): UsageSnapshot | undefined {
         if (!ref || typeof ref !== "object" || typeof ref.path !== "string" || !ref.path.startsWith("usage/native/") || ref.path.includes("..") ||
             typeof ref.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(ref.sha256) || typeof ref.generatedAt !== "string" ||
             typeof ref.partitionId !== "string" || !/^[a-f0-9]{64}$/.test(ref.partitionId)) continue;
+        if (ref.segments !== undefined && !validSegmentRecords(ref.segments)) continue;
       }
       partitions[key] = {
         ...(partition as UsageSnapshotPartition),
@@ -532,6 +608,15 @@ function readSnapshot(path = USAGE_SNAPSHOT_FILE): UsageSnapshot | undefined {
   } catch {
     return undefined;
   }
+}
+
+function validSegmentRecords(value: unknown): value is NativeSegmentRecord[] {
+  return Array.isArray(value) && value.every((record) => {
+    const segment = record as Record<string, unknown> | null;
+    return !!segment && typeof segment === "object" && typeof segment.sha256 === "string" && /^[a-f0-9]{64}$/.test(segment.sha256) &&
+      Number.isSafeInteger(segment.bytes) && Number.isSafeInteger(segment.messages) &&
+      typeof segment.mtimeNs === "string" && /^\d+$/.test(segment.mtimeNs);
+  });
 }
 
 function writeSnapshot(snapshot: UsageSnapshot, path = USAGE_SNAPSHOT_FILE): void {
@@ -621,9 +706,11 @@ function snapshotResultsForJson(results: UsageResult[]): unknown[] {
 /** Retain manifest-listed batches, two recent generations per partition, and
  * a short reader grace period. Readers of older manifests retry against the
  * current manifest if their batch has been swept. Only generations created
- * by this writer (UUID JSON names) are eligible for deletion. */
-function collectObsoleteNativeBatches(snapshot: UsageSnapshot): void {
-  const nativeRoot = join(aisCacheDir(), "usage", "native");
+ * by this writer (UUID JSON names) are eligible for deletion. Segments of a
+ * segmented batch are kept while any retained batch names them (and for the
+ * same grace period), so a reader never loses a segment of a batch it may
+ * still be reading. */
+export function collectObsoleteNativeBatches(snapshot: UsageSnapshot, nativeRoot = join(aisCacheDir(), "usage", "native"), now = Date.now()): void {
   const listed = new Set(Object.values(snapshot.partitions)
     .map((partition) => partition.nativeBatch?.path)
     .filter((path): path is string => path !== undefined));
@@ -633,7 +720,6 @@ function collectObsoleteNativeBatches(snapshot: UsageSnapshot): void {
   } catch {
     return;
   }
-  const now = Date.now();
   for (const entry of partitionDirectories) {
     if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name)) continue;
     const relativeDirectory = `usage/native/${entry.name}`;
@@ -652,18 +738,40 @@ function collectObsoleteNativeBatches(snapshot: UsageSnapshot): void {
     } catch {
       continue;
     }
+    const kept = [...listed]
+      .filter((path) => path.startsWith(`${relativeDirectory}/`))
+      .map((path) => join(nativeRoot, path.slice("usage/native/".length)));
     for (const [index, generation] of generations.entries()) {
       const relativePath = `${relativeDirectory}/${generation.item}`;
-      if (listed.has(relativePath) || index < 2 || now - generation.mtimeMs < NATIVE_BATCH_READER_AGE_FLOOR_MS) continue;
-      try { unlinkSync(generation.path); } catch { /* another safe cleanup may have won */ }
+      if (listed.has(relativePath) || index < 2 || now - generation.mtimeMs < NATIVE_BATCH_READER_AGE_FLOOR_MS) {
+        kept.push(generation.path);
+        continue;
+      }
+      try { unlinkSync(generation.path); } catch { kept.push(generation.path); }
     }
+    collectObsoleteNativeSegments(directory, kept, now, NATIVE_BATCH_READER_AGE_FLOOR_MS);
   }
 }
 
-/** Whether the identities registry of every tool with native capture exists. */
-function nativeIdentityRegistriesPresent(): boolean {
-  const tools = ["claude", "codex", "grok", "kimi", "opencode", "pi"] as const;
-  return tools.every((tool) => existsSync(TOOL_CONFIGS[tool].identitiesJsonPath));
+/** Whether discovery saw every native tool's identities: each tool's
+ * registry file exists, or the tool has no identity directories at all (it
+ * was never used here, so no live source of it can be missing). A missing
+ * registry beside existing identity directories loads as an empty list and
+ * would make those identities look removed. */
+export function nativeIdentityRegistriesPresent(
+  configs: ReadonlyArray<{ identitiesJsonPath: string; identitiesRootDir: string }> =
+    (["claude", "codex", "grok", "kimi", "opencode", "pi"] as const).map((tool) => TOOL_CONFIGS[tool]),
+): boolean {
+  return configs.every((config) => existsSync(config.identitiesJsonPath) || !hasEntries(config.identitiesRootDir));
+}
+
+function hasEntries(directory: string): boolean {
+  try {
+    return readdirSync(directory).length > 0;
+  } catch (error) {
+    // Only a directory that is known to be absent counts as empty.
+    return (error as { code?: string }).code !== "ENOENT";
+  }
 }
 
 function targetKey(target: UsageTarget): string {
@@ -886,7 +994,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     if (hasCollectorError(results)) {
       producer.sourceScanFailuresTotal++;
       for (const result of results) if (result.error || result.sourceOnlyError) logUsageSourceFailure(`${key} result`, result.error ?? "source-only error row");
-      if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
+      if (nativeCandidate) discardNativeCandidate(nativeCandidate.path);
       partitions[key] = {
         ...(tool ? { tool } : {}), ...(identity ? { identity } : {}),
         nativeCoverage: "error",
@@ -923,16 +1031,20 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
           nativeBatch = unchanged;
           if (nativeDaily) results = withDailyUsage(results, priorDailyUsage(prior));
         } else {
-          nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot, nativeDaily
-            ? (messages) => {
-              try {
-                results = withDailyUsage(results, dailyUsageFromNativeMessages(messages, bucketTimezone));
-              } catch (error) {
-                // Daily figures are a display detail; the report still commits.
-                logUsageSourceFailure(`${key} native daily usage`, error);
-              }
+          // Daily figures are a display detail; a failure to derive them still commits the report.
+          const deriveDaily = (derive: () => DailyUsage | undefined) => {
+            try {
+              results = withDailyUsage(results, derive());
+            } catch (error) {
+              logUsageSourceFailure(`${key} native daily usage`, error);
             }
-            : undefined);
+          };
+          nativeBatch = promoteNativeBatchFile(nativeCandidate.path, expectedPartitionId, deps.nativeBatchRoot, nativeDaily
+            ? {
+              messages: (messages) => deriveDaily(() => dailyUsageFromNativeMessages(messages, bucketTimezone)),
+              hourly: (hourly) => deriveDaily(() => dailyUsageFromHourlyEntries(hourly)),
+            }
+            : {}, prior?.nativeBatch);
           if (bucketTimezone) nativeBatch = { ...nativeBatch, bucketTimezone };
         }
         nativeCoverage = "supported";
@@ -948,7 +1060,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     } catch (error) {
       producer.sourceScanFailuresTotal++;
       logUsageSourceFailure(`${key} native capture`, (error as { original?: unknown } | null)?.original ?? error);
-      if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* no staged export remains */ }
+      if (nativeCandidate) discardNativeCandidate(nativeCandidate.path);
       partitions[key] = {
         ...(tool ? { tool } : {}), ...(identity ? { identity } : {}), nativeCoverage: "error",
         results: prior?.results ?? [], ...(prior?.nativeBatch ? { nativeBatch: prior.nativeBatch } : {}),
@@ -960,7 +1072,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
       writeSnapshot({ schemaVersion: 1, generatedAt: attemptedAt, aggregateGeneratedAt, producer: { ...producer, lastHeartbeatAt: new Date(now()).toISOString() }, partitions }, path);
       return;
     } finally {
-      if (nativeCandidate) try { unlinkSync(nativeCandidate.path); } catch { /* promotion removes staged data below */ }
+      if (nativeCandidate) discardNativeCandidate(nativeCandidate.path);
     }
     partitions[key] = {
       ...(tool ? { tool } : {}), ...(identity ? { identity } : {}),
@@ -1042,7 +1154,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
         // Failure reasons are logged where they arise; this covers a pool the collector never reported on.
         if (results.length === 0 && !nativeCandidate && !nativeCandidates.has(key)) logUsageSourceFailure(`${key} pool`, "pool reported failure");
         const staged = nativeCandidate ?? nativeCandidates.get(key);
-        if (staged) try { unlinkSync(staged.path); } catch { /* no staged export remains */ }
+        if (staged) discardNativeCandidate(staged.path);
         producer.sourceScansTotal++;
         producer.sourceScanFailuresTotal++;
         const prior = partitions[key];

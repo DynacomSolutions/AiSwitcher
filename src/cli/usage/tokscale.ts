@@ -134,6 +134,12 @@ export interface AisTokscaleExportTarget {
    * partition. Identical messages are then reported as unchanged instead of
    * written out again (vendor/tokscale README). */
   previousMessagesSha256?: string;
+  /** Write a segmented batch: content-addressed segments in this directory and
+   * a small manifest at exportPath (vendor/tokscale README). */
+  segmentDir?: string;
+  /** File listing the segments AIS has verified on disk (one SHA-256 per
+   * line). Only these may be left unwritten; every other segment is written. */
+  reusableSegmentsFile?: string;
 }
 
 export interface AisTokscaleExportInvocation {
@@ -195,6 +201,10 @@ export async function buildAisTokscaleExportInvocation(
       TOKSCALE_AIS_STAT_ONLY_CACHE: "1",
       ...(target.previousMessagesSha256 && /^[a-f0-9]{64}$/.test(target.previousMessagesSha256)
         ? { TOKSCALE_AIS_PREVIOUS_MESSAGES_SHA256: target.previousMessagesSha256 }
+        : {}),
+      ...(target.segmentDir && isAbsolute(target.segmentDir) ? { TOKSCALE_AIS_SEGMENT_DIR: target.segmentDir } : {}),
+      ...(target.segmentDir && target.reusableSegmentsFile && isAbsolute(target.reusableSegmentsFile)
+        ? { TOKSCALE_AIS_REUSABLE_SEGMENTS_FILE: target.reusableSegmentsFile }
         : {}),
     },
     cwd: process.cwd(),
@@ -829,7 +839,7 @@ export async function terminateTokscaleProcess(
  * module reads (`hour`/`input`/`output`) are typed; the real payload also
  * carries per-hour cache/reasoning/model/cost breakdowns this module has no
  * use for. */
-interface TokscaleHourlyEntry {
+export interface TokscaleHourlyEntry {
   hour: string;
   input: number;
   output: number;

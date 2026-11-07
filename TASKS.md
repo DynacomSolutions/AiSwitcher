@@ -159,6 +159,7 @@ ETA: 2026-11-14 18:00 ICT
 | 126 | Native daily usage: exporter zone, chrono-tz names, patched-binary fixture, dead bunx code | in_review | claude-20261106-usage-daily-zone | ais-usage-daily-zone | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/378.<br>Review follow-up to 5.125: L1 zone source, L2 zone names, L3 fixture; removes the bunx report path. |
 | 132 | Usage collector: cut per-cycle disk reads and writes (pool cache, unchanged exports) | done | claude-20261106-usage-io-diet | usage-io-diet | | | Was 129 (clash with the console row).<br>Merged PR #385 (df330fe), deployed 7 Nov 02:42 ICT.<br>Follow-up in 5.133. |
 | 133 | Usage collector: per-partition Tokscale cache and sampled Codex resumes | in_review | claude-20261107-usage-io-2 | ais-usage-io-2 | 5.132 | 2026-11-07 18:00 ICT | Live: each Claude export read the whole 611 MB namespace, each Codex export 337 MB (~8 of ~10 GB per round).<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/392.<br>Open: swap-pool batch rewrite (~530 MB written per cycle), Grok re-reads ~0.9 GB. |
+| 134 | Usage collector: segmented native batch so a changed cycle writes only changed segments | in_progress | claude-20261107-usage-segmented-batch | ais-usage-segmented-batch | 5.133 | 2026-11-07 19:00 ICT | Swap-pool batch (~478 MB) rewritten and read back each changed cycle (~0.66 MB/s on the collector host, disk shared with etcd).<br>Also: scope sweep needs only present registries (5.133 review low). |
 
 ## 6. Browser control extension
 ETA: 2026-11-14 18:00 ICT
