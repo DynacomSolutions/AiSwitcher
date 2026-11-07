@@ -1,6 +1,9 @@
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { OAuthRefreshError, refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, OAuthRefreshError, refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
+import { SwapLockError } from "../identities/claude-swap-lock.ts";
+import { PgRefreshBackend } from "./pg-refresh-backend.ts";
+import { guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, type RefreshGuardBackend } from "./refresh-guard.ts";
 import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
@@ -42,6 +45,10 @@ export interface GatewayHooks {
   migrate?(url: string): Promise<void>;
   openStore?(url: string): GatewayStore & { close?(): Promise<void> };
   creds?: GatewayDeps["creds"];
+  /** Test hook: the refresh the guard wraps (default AIS's locked refresh). */
+  refreshImpl?: RefreshFn;
+  /** Lock and journal that guard login refreshes across replicas. Default: the gateway's PostgreSQL. */
+  refreshBackend?: RefreshGuardBackend & { close?(): Promise<void> };
   fetch?: typeof fetch;
   now?(): Date;
   usageFor?: GatewayDeps["usageFor"];
@@ -94,6 +101,11 @@ export function instrumentRefresh(
       else if (result.outcome === "refreshed") ok();
       return result;
     } catch (err) {
+      // A busy lock or a transient guard/read error is retried by the next caller or tick: it never means the login needs a person.
+      if ((err instanceof SwapLockError && err.timedOut) || err instanceof RefreshGuardRetryable) {
+        deps.metrics.refresh(tool, err instanceof RefreshGuardRetryable ? "retryable" : "lock-timeout");
+        throw err;
+      }
       deps.metrics.refresh(tool, "failed");
       fail();
       throw err;
@@ -223,7 +235,8 @@ export async function keepAliveOnce(deps: { refresh: RefreshFn; accounts: () => 
       else revoked.delete(account.name);
       deps.metrics.keepAlive("claude", r.outcome);
     } catch (err) {
-      if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint) revoked.set(account.name, err.refreshFingerprint);
+      // Only a dead-grant OAuth code proves the login is gone; any other 400/401 is not enough (as in credentials.ts).
+      if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) revoked.set(account.name, err.refreshFingerprint);
       deps.metrics.keepAlive("claude", "failed");
     }
   }
@@ -243,7 +256,28 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const metrics = new PrometheusMetrics({ ledgerDepth: () => ledger.depth, ledgerDropped: () => ledger.dropped });
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
   const failedTokens = new Map<string, string>();
-  const refreshLogin = instrumentRefresh(refreshIdentityOAuthGrant, { metrics, alerter, failed: failedTokens });
+  const refreshBackend = hooks.refreshBackend ?? new PgRefreshBackend(opts.databaseUrl);
+  const inflightRefreshes = new Set<Promise<unknown>>();
+  const guarded = guardRefresh(hooks.refreshImpl ?? refreshIdentityOAuthGrant, {
+    backend: refreshBackend,
+    metrics,
+    onDegraded: (account, why) => alerter.raise("refresh-guard-degraded", `${account.provider}/${account.identity}`, `the refresh guard is unavailable (${why}); refreshing under the file lock and compare-and-swap only`),
+    onInterrupted: (account, count) => {
+      const key = `${account.provider}/${account.identity}`;
+      if (count >= 2) alerter.raise("refresh-interrupted", key, `refreshes of the ${account.provider} login "${account.identity}" keep ending with an unknown outcome (${count} times); the token is retried, check the gateway and the provider`);
+      else alerter.recover("refresh-interrupted", key);
+    },
+    onHealthy: (account) => alerter.recover("refresh-guard-degraded", `${account.provider}/${account.identity}`),
+  });
+  const instrumented = instrumentRefresh(guarded, { metrics, alerter, failed: failedTokens });
+  /** The one guarded refresh: the credential cache and the keep-alive both go through it, and stop() waits for it. */
+  const refreshLogin = ((...a: Parameters<RefreshFn>) => {
+    const p = instrumented(...a);
+    inflightRefreshes.add(p);
+    const done = (): void => void inflightRefreshes.delete(p);
+    p.then(done, done);
+    return p;
+  }) as RefreshFn;
   const baseCreds = hooks.creds ?? new CredentialCache({ refresh: refreshLogin });
   const creds = watchCredentialReads(baseCreds, alerter, failedTokens);
   const canonical = hooks.canonical ?? canonicalResolver();
@@ -331,6 +365,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         await store.warm();
         if (draining) return;
         warmed = true;
+        pruneJournal();
         store.startRefresh(hooks.refreshIntervalMs ?? 15_000);
         console.info("gateway: warm, ready for traffic");
         void probeIdentities().catch(() => undefined);
@@ -395,14 +430,21 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   alertTimer.unref?.();
   const revokedGrants = new Map<string, string>();
   let keepAliveRunning = false;
+  let keepAliveRun: Promise<void> | undefined;
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     keepAliveRunning = true;
-    void keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? (() => listGatewayManagedAccounts()), metrics, revoked: revokedGrants }).finally(() => {
+    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? (() => listGatewayManagedAccounts()), metrics, revoked: revokedGrants }).finally(() => {
       keepAliveRunning = false;
     });
   }, hooks.keepAliveMs ?? 600_000);
   keepAliveTimer.unref?.();
+  // Refresh-journal retention: old resolved rows go, the newest per account and any rotated-out evidence stay.
+  const pruneJournal = (): void => void Promise.resolve(refreshBackend.prune?.(JOURNAL_RETENTION_MS)).catch(() => undefined);
+  const pruneTimer = setInterval(() => {
+    if (warmed && !draining) pruneJournal();
+  }, 6 * 3_600_000);
+  pruneTimer.unref?.();
 
   void warmUp();
 
@@ -419,11 +461,15 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       wake?.();
       clearInterval(alertTimer);
       clearInterval(keepAliveTimer);
+      clearInterval(pruneTimer);
       store.stop();
       // Bun's stop(false) refuses new connections and resolves once active requests are done.
       await Promise.all([server.stop(false), adminServer.stop(false)]);
+      // Refreshes and the keep-alive in flight finish (or fail) before the backend that guards them goes away.
+      await Promise.allSettled([...inflightRefreshes, keepAliveRun]);
       await ledger.close();
       await inner.close?.();
+      await refreshBackend.close?.();
     })();
     return stopping;
   };

@@ -166,3 +166,57 @@ throwaway pod outside the `dev` namespace.
 - The usage table becomes a TimescaleDB hypertable only on the first migration.
   If TimescaleDB is added to the database later, the table stays a plain table
   until someone converts it by hand.
+
+## Refresh guard
+
+The gateway alone refreshes account logins, and a provider rotates the refresh
+token on every refresh, so two refreshes racing (or one replayed with a spent
+token) kill the login. `src/gateway/refresh-guard.ts` wraps the one refresh
+that the credential cache and the idle keep-alive both use (design after
+CLIProxyAPI's refresh journal):
+
+- One refresh per account at a time across all replicas: a PostgreSQL
+  session-level advisory lock on a reserved connection
+  (`src/gateway/pg-refresh-backend.ts`). A holder that dies loses its session,
+  so the database frees the lock. The journal queries run on that same
+  connection, and at most 8 locks are held at once (pool of 10), so the pool
+  cannot deadlock. Every backend call is bounded to about 5 s
+  (`statement_timeout` plus a client timeout).
+- Adopt first: the latest stored grant is re-read under the lock. A newer
+  refresh token or expiry (or an access token that no longer matches the one
+  the caller saw) is used as it is; no token request and no journal row. A grant
+  read error fails retryably (no alert, nothing sent).
+- Journal (`gateway_refresh_journal`, indexed by account and old fingerprint):
+  the claim is written by the refresher (`beforePost`) immediately before the
+  token request, under its file locks, and resolved after it (retried on
+  error). A pass that sends nothing journals nothing. Rows hold refresh-token
+  fingerprints only, never a token. Outcomes: `refreshed`, `failed`, `lost`
+  (provider rotated but no store was written), `interrupted`, `recovered`.
+- Never reuse a rotated-out token: a stored token the journal shows as
+  `refreshed` to a different token is refused (a restored backup or lagging
+  store), and this process also remembers such tokens in memory for the times
+  the journal cannot be read. An unresolved claim for the stored token (a
+  crash, a network blip between claim and resolve) is closed as `interrupted`
+  and the token is sent again: the provider's own dead-grant answer decides, so
+  a token that never reached the provider is never stranded. From the second
+  interruption in a row an owner alert (`refresh-interrupted`) is raised. A
+  `lost` write (provider rotated, no store written) is sent once more too. Resolve
+  retries run on a fresh pool connection, not the lock's. A claim whose token
+  the stores have moved past is closed as `recovered`.
+- Retention: every 6 hours resolved rows older than 30 days are deleted,
+  keeping the newest 50 per account and all open claims; rotated-out evidence
+  (`refreshed`, `lost`, `interrupted`) is kept for a year.
+- A lock handle that arrives after the guard gave up is released, never leaked.
+- Database or guard unavailable: the refresh still runs, under AIS's
+  `.oauth_refresh.lock` file lock and the `expectedAccessToken`
+  compare-and-swap, with a `refresh-guard-degraded` alert and
+  `ais_gateway_refresh_guard_degraded_total`. A lock timeout is not alerted as a
+  dead login.
+- `stop()` waits for refreshes and the keep-alive in flight before closing the
+  backend.
+- Metrics, per `provider` and `identity`:
+  `ais_gateway_refresh_attempts_total`, `ais_gateway_refresh_successes_total`
+  (renewed or adopted), `ais_gateway_refresh_failures_total`,
+  `ais_gateway_refresh_lock_waits_total`,
+  `ais_gateway_refresh_lock_wait_seconds_total` and
+  `ais_gateway_refresh_guard_degraded_total`.

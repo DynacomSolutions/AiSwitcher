@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   grantFingerprint,
@@ -647,6 +647,11 @@ export interface OAuthRefreshOptions {
   lockedPoolDirs?: string[];
   /** Set by the lock holder: true once a held refresh lock was broken under us. */
   isLockLost?: () => boolean;
+  /**
+   * Called under the refresh locks immediately before the token request is sent, with the fingerprint of the refresh token
+   * about to be spent. Throwing aborts the refresh with nothing sent. The gateway's refresh guard journals its claim here.
+   */
+  beforePost?: (info: { fingerprint: string }) => Promise<void>;
 }
 
 /** Refreshes one identity's OAuth grant for one tool: picks the freshest
@@ -748,8 +753,33 @@ async function healDamagedNativeFromPi(tool: RefreshableTool, identity: Identity
   if (tool !== "claude" || freshest.source !== "pi auth.json" || isGatewayAccessToken(freshest.grant.access_token)) return;
   const native = await readProviderGrantCopy("claude", identity.configDir);
   if (!native || !isGatewayAccessToken(native.grant.access_token)) return;
-  const write = () => writeProviderGrantCopy("claude", identity.configDir, freshest.grant);
+  const write = async () => {
+    // The repair overwrites the store's refresh token: keep what was there in a unique timestamped 0600 backup first, never overwritten.
+    await backupBeforeHeal(nativeStorePathFor("claude", identity.configDir));
+    await writeProviderGrantCopy("claude", identity.configDir, freshest.grant);
+  };
   await (locksHeld ? write() : withOauthRefreshLock(identity.configDir, write)).catch(() => undefined);
+}
+
+/** `<store>.pre-heal.<timestamp>[-n].bak`, created exclusively (0600). Returns undefined when the store is unreadable (nothing to keep). */
+export async function backupBeforeHeal(storePath: string): Promise<string | undefined> {
+  let text: Buffer;
+  try {
+    text = await readFile(storePath);
+  } catch {
+    return undefined;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (let n = 0; n <= 1000; n++) {
+    const path = `${storePath}.pre-heal.${stamp}${n === 0 ? "" : `-${n}`}.bak`;
+    try {
+      await writeFile(path, text, { flag: "wx", mode: 0o600 });
+      return path;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
+  return undefined;
 }
 
 function tokenDigest(token: string): string {
@@ -829,6 +859,7 @@ async function refreshGrantUnlocked(
   if (options.isLockLost?.()) {
     return { ...base, outcome: "failed", beforeFingerprint, detail: "refresh lock was lost to another process before the token request; not refreshing (retry next tick)" };
   }
+  await options.beforePost?.({ fingerprint: beforeFingerprint });
   let grant: OAuthGrant;
   try {
     if (tool === "kimi") {
