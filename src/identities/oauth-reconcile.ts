@@ -4,6 +4,7 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { withOauthRefreshLock } from "./claude-swap-lock.ts";
 import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
+import { isGatewayManagedHere } from "./gateway-managed.ts";
 import {
   CLAUDE_CONFIG,
   CODEX_CONFIG,
@@ -191,8 +192,15 @@ interface NativeAnthropicFile {
 async function readNativeAnthropic(path: string): Promise<StoreCopy | undefined> {
   const raw = (await readJson(path)) as NativeAnthropicFile | undefined;
   const auth = raw?.claudeAiOauth;
+  if (!auth || !usableToken(auth.accessToken)) return undefined;
   // The gateway entry of a gateway-routed identity is an app token, not a login: it is never a grant to reconcile or refresh.
-  if (!auth || !usableToken(auth.accessToken) || isGatewayAccessToken(auth.accessToken)) return undefined;
+  if (isGatewayAccessToken(auth.accessToken)) {
+    // A pure entry has no refresh token. One that still carries a refresh token is a damaged member store: an older build
+    // converged the gateway entry over a real login. The refresh token is the only live part, so keep it and report the
+    // access token as long expired: it loses every freshest-copy comparison and is never sent upstream or written elsewhere.
+    if (!usableToken(auth.refreshToken)) return undefined;
+    return { side: "native", path, grant: { access_token: auth.accessToken, refresh_token: auth.refreshToken, expires_at: 0 } };
+  }
   return {
     side: "native",
     path,
@@ -205,6 +213,9 @@ async function readNativeAnthropic(path: string): Promise<StoreCopy | undefined>
 }
 
 async function writeNativeAnthropic(path: string, grant: OAuthGrant, backups: Set<string>): Promise<void> {
+  // The gateway app token belongs to the gateway entry alone (written by writeGatewayEntry); merging it into a login store
+  // would log that identity out of every direct session that reads the file.
+  if (isGatewayAccessToken(grant.access_token)) throw new Error("refusing to write a gateway app token into a login store");
   const raw = ((await readJson(path)) as NativeAnthropicFile | undefined) ?? {};
   const auth = (raw.claudeAiOauth && typeof raw.claudeAiOauth === "object" ? raw.claudeAiOauth : {}) as Record<string, unknown>;
   await backupOnce(path, backups);
@@ -459,7 +470,8 @@ async function providerPairings(piIdentity: Identity, paths: ReconcileRegistryPa
     configDirFor(paths.kimi ?? KIMI_CONFIG.identitiesJsonPath, piIdentity.name),
   ]);
   const pairings: ProviderPairing[] = [];
-  if (claudeDir) {
+  // The cluster gateway owns gateway-managed logins: no local copy is reconciled with them.
+  if (claudeDir && !(await isGatewayManagedHere("claude", piIdentity.name, paths.claude))) {
     const nativePath = join(claudeDir, ".credentials.json");
     pairings.push({
       provider: "anthropic",
@@ -589,6 +601,12 @@ async function reconcilePair(
     } else {
       entry.status = "forked";
       entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
+      // A damaged store (gateway token beside a refresh token) carries the newest refresh token whatever its expiry says: it is
+      // never overwritten from, or copied over, the other store; the owner's refresh repairs it.
+      if (isGatewayAccessToken(native.grant.access_token) || isGatewayAccessToken(pi.grant.access_token)) {
+        entry.detail = "one copy holds a gateway token beside its refresh token; left untouched until a refresh repairs it";
+        return entry;
+      }
       const nativeFresher = recency(native.grant) >= recency(pi.grant);
       entry.adoptedFrom = nativeFresher ? "native" : "pi";
       if (write) {
@@ -769,6 +787,9 @@ export async function reconcileNativeProviderStores(
   const nativePath = nativeStorePathFor(tool, identity.configDir);
   if (isRetired(identity)) {
     return { provider, status: "single-copy", nativePath, detail: "identity is retired; nothing to reconcile" };
+  }
+  if (await isGatewayManagedHere(tool, identity.name, options.registryPaths?.claude)) {
+    return { provider, status: "single-copy", nativePath, detail: "login is owned by the cluster gateway; nothing is reconciled locally" };
   }
   const piDir = await configDirFor(options.registryPaths?.pi ?? PI_CONFIG.identitiesJsonPath, identity.name);
   if (!piDir) {

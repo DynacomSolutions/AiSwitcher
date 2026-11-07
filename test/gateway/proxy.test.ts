@@ -660,6 +660,19 @@ describe("failover and refresh", () => {
   };
   const deadLogin = (dead: string[]) => (id: string, sig: string) => (dead.includes(id) && sig === "s1" ? new GatewayCredentialError("login-dead", "claude", id) : undefined);
 
+  test("a refresh-failed (short) hold is released the moment the credential changes, not after the hold", async () => {
+    const failing = (id: string, sig: string) => (id === "a" && sig === "s1" ? new GatewayCredentialError("refresh-failed", "claude", id) : undefined);
+    const { sig, call, who } = await credSetup(["a", "b"], failing);
+    await call();
+    seen.length = 0;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    sig.a = "s2"; // portal re-login rewrote the credential file; no clock advance
+    await call();
+    expect(who()).toEqual(["Bearer tok-a"]);
+  });
+
   test("a dead-login pool member is skipped and the request succeeds on the next member", async () => {
     const { call, who } = await credSetup(["a", "b"], deadLogin(["a"]));
     expect((await call()).status).toBe(200);

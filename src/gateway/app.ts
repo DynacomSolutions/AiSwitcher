@@ -545,9 +545,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         holds.delete(k);
       } else if (k.startsWith(`${app.provider}\u0000`)) {
         const name = k.slice(app.provider.length + 1);
-        // A member held for a credential failure is released as soon as its credential file changes.
+        // A member held for a credential failure (short or long) is released as soon as its credential file changes:
+        // a fresh login must not wait out the hold.
         const h = holds.get(k);
-        if (h?.long && (await credentialSignature(deps, app.provider, name)) !== h.sig) {
+        if (h?.kind === "cred" && (await credentialSignature(deps, app.provider, name)) !== h.sig) {
           exhausted.delete(k);
           holds.delete(k);
         } else out.add(name);
@@ -560,7 +561,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     const long = err instanceof GatewayCredentialError && (err.loggedOut || err.code === "retired" || err.code === "unknown-identity");
     const message = err instanceof GatewayCredentialError ? err.clientMessage : "upstream credential unavailable";
     exhausted.set(exKey(name), deps.now().getTime() + (long ? CREDENTIAL_HOLD_MS : BURST_HOLD_DEFAULT_MS));
-    holds.set(exKey(name), { kind: "cred", long, message, sig: long ? await credentialSignature(deps, app.provider, name) : undefined });
+    holds.set(exKey(name), { kind: "cred", long, message, sig: await credentialSignature(deps, app.provider, name) });
   };
   /** Hold a member after a quota-type answer: until reset when exhaustion is proven (or 402/403), else briefly. */
   const holdQuota = (name: string, res: Response): void => {

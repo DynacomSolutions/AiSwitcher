@@ -69,6 +69,12 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
   }
 }
 
+/** True when the folder's `.credentials.json` is exactly the gateway entry: this token and no refresh token (a refresh token beside it is a leaked member login). */
+export async function isIntactGatewayEntry(configDir: string, token: string): Promise<boolean> {
+  const oauth = (await readJson(join(configDir, ".credentials.json")))?.claudeAiOauth as { accessToken?: unknown; refreshToken?: unknown } | undefined;
+  return oauth?.accessToken === token && (oauth.refreshToken === null || oauth.refreshToken === undefined || oauth.refreshToken === "");
+}
+
 /** The access token in the identity's `.credentials.json`, if any. */
 export async function storedAccessToken(configDir: string): Promise<string | undefined> {
   const oauth = (await readJson(join(configDir, ".credentials.json")))?.claudeAiOauth as { accessToken?: unknown } | undefined;
