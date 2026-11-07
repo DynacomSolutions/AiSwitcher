@@ -570,6 +570,9 @@ function driftLabel(minutes: number): string {
   return `${Math.round((minutes / 1440) * 10) / 10}d`;
 }
 
+/** True for the damaged store shape readNativeAnthropic reports: a gateway app token as the access token. */
+export const hasGatewayToken = (grant: OAuthGrant): boolean => isGatewayAccessToken(grant.access_token);
+
 /** One (native, pi) copy pair's compare-and-heal, shared by the pi-identity
  * sweep (reconcilePiOAuthStores) and the native-side single-provider
  * reconcile (reconcileNativeProviderStores). Never throws: a failing store
@@ -599,6 +602,12 @@ async function reconcilePair(
     } else {
       entry.status = "forked";
       entry.divergenceMinutes = minutesBetween(native.grant, pi.grant);
+      // A damaged store (gateway token beside a refresh token) carries the newest refresh token whatever its expiry says:
+      // never overwrite it from, or copy it over, the other store; the next refresh decides.
+      if (hasGatewayToken(native.grant) || hasGatewayToken(pi.grant)) {
+        entry.detail = "one copy holds a gateway token beside its refresh token; left untouched until a refresh repairs it";
+        return entry;
+      }
       const nativeFresher = recency(native.grant) >= recency(pi.grant);
       entry.adoptedFrom = nativeFresher ? "native" : "pi";
       if (write) {

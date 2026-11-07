@@ -260,3 +260,48 @@ describe("a gateway token that leaked into a member store (older build converged
     expect(o.refreshToken).toBeNull();
   });
 });
+
+describe("a damaged store's live refresh token is never lost", () => {
+  test("pi reconcile does not overwrite a hybrid native store with a stale pi copy", async () => {
+    const { reconcileNativeProviderStores } = await import("../../src/identities/oauth-reconcile.ts");
+    const pi = join(root, "pi-a");
+    await mkdir(pi, { recursive: true });
+    await writeFile(join(root, "a", ".credentials.json"), cred(GW, "rt-new", 4_102_444_800));
+    await writeFile(join(pi, "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "at-old", refresh: "rt-old", expires: 1_700_000_000_000 } }));
+    await writeFile(join(root, "pi.json"), JSON.stringify({ version: 1, identities: [{ name: "a", label: "a", configDir: pi }] }));
+    await reconcileNativeProviderStores("claude", { name: "a", label: "a", configDir: join(root, "a") }, { write: true, registryPaths: { pi: join(root, "pi.json"), claude: registry } });
+    expect((await read(join(root, "a", ".credentials.json"))).claudeAiOauth.refreshToken).toBe("rt-new");
+    expect((await read(join(pi, "auth.json"))).anthropic.refresh).toBe("rt-old");
+  });
+
+  test("the refresh picks the hybrid's refresh token over a stale pi copy", async () => {
+    await routeThroughProxy();
+    const pi = join(root, "pi-a");
+    await mkdir(pi, { recursive: true });
+    await writeFile(join(root, "a", ".credentials.json"), cred(GW, "rt-new", 4_102_444_800));
+    await writeFile(join(pi, "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "at-old", refresh: "rt-old", expires: 1_700_000_000_000 } }));
+    const { PI_CONFIG } = await import("../../src/identities/tool-configs.ts");
+    const saved = PI_CONFIG.identitiesJsonPath;
+    (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = join(root, "pi.json");
+    await writeFile(join(root, "pi.json"), JSON.stringify({ version: 1, identities: [{ name: "a", label: "a", configDir: pi }] }));
+    try {
+      const found = await readEffectiveGrant("claude", { name: "a", label: "a", configDir: join(root, "a") }, { claudeRegistryPath: registry });
+      expect(found?.grant.refresh_token).toBe("rt-new");
+    } finally {
+      (PI_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = saved;
+    }
+  });
+
+  test("heal of a hybrid pool credits its newer refresh token to the member and keeps a .pre-swap.bak", async () => {
+    await routeThroughProxy();
+    await writeFile(join(poolDir(), ".credentials.json"), cred(GW, "rt-a2", 4_102_444_800));
+    const file = (await read(registry)) as IdentitiesFile;
+    const pool = file.identities.find((i) => i.name === "pool")!;
+    await claudeAdapter.heal!(pool as never, file.identities.filter((i) => i.name === "a" || i.name === "b"));
+    const member = (await read(join(root, "a", ".credentials.json"))).claudeAiOauth;
+    expect(member.refreshToken).toBe("rt-a2");
+    expect(member.accessToken).toBe("at-a1");
+    expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.refreshToken).toBeNull();
+    expect((await readdir(poolDir())).includes(".credentials.json.pre-swap.bak")).toBe(true);
+  });
+});

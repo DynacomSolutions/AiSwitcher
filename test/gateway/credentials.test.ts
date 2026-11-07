@@ -348,3 +348,32 @@ describe("CredentialCache", () => {
     await expect(d.get("claude", "id1")).rejects.toThrow(/login-dead/);
   });
 });
+
+describe("CredentialCache never serves a gateway app token upstream", () => {
+  const GW = "aisg_SYNTHETIC_FIXTURE_gateway_token_0001";
+  const writeHybrid = () => writeFile(claudeFile(), JSON.stringify({ claudeAiOauth: { accessToken: GW, refreshToken: "SYNTHETIC_FIXTURE-claude-refresh-0001", expiresAt: 4_102_444_800_000 } }));
+
+  test("a hybrid member store is refreshed before the first send", async () => {
+    await writeHybrid();
+    const seen: string[] = [];
+    const c = makeCache(async (_t, _i, opts) => {
+      seen.push(opts?.expectedAccessToken ?? "");
+      await writeClaude("SYNTHETIC_FIXTURE-claude-access-NEW", 1_800_000_100);
+      return refreshed();
+    });
+    expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-NEW");
+    expect(seen).toEqual([GW]);
+  });
+
+  test("a hybrid store whose refresh fails is an error, never the gateway token", async () => {
+    await writeHybrid();
+    const c = makeCache(async () => refreshed({ outcome: "failed" }));
+    await expect(c.get("claude", "id1")).rejects.toBeInstanceOf(GatewayCredentialError);
+  });
+
+  test("an expired access token is refreshed first; if that fails the old token is still returned", async () => {
+    await writeFile(claudeFile(), JSON.stringify({ claudeAiOauth: { accessToken: "SYNTHETIC_FIXTURE-claude-access-OLD", refreshToken: "SYNTHETIC_FIXTURE-claude-refresh-0001", expiresAt: 1000 } }));
+    const c = makeCache(async () => refreshed({ outcome: "failed" }));
+    expect((await c.get("claude", "id1")).accessToken).toBe("SYNTHETIC_FIXTURE-claude-access-OLD");
+  });
+});

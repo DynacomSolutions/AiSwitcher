@@ -21,7 +21,7 @@ import { CLAUDE_CONFIG, PI_CONFIG } from "./tool-configs.ts";
 import { isSwapPool, poolsHoldingMember } from "./pool/swap-pool.ts";
 import { codexAccountIdOfDir } from "./codex-auth.ts";
 import { SwapLockError, withOauthRefreshLock, withOauthRefreshLocks } from "./claude-swap-lock.ts";
-import { isGatewayRoutedDir } from "./claude-gateway-entry.ts";
+import { isGatewayAccessToken, isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import type { Identity } from "./types.ts";
 import { kimiCredentialStores, persistKimiCredentials, readFreshestKimiCredentials } from "../cli/limits/kimi-store.ts";
 import { refreshKimiOAuthToken } from "../cli/limits/kimi-limits.ts";
@@ -484,6 +484,8 @@ export async function convergeClaudePoolStores(
   let best: { grant: OAuthGrant } | undefined;
   for (const copy of copies) if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
   if (!best) return { written, failed };
+  // A damaged copy (gateway token beside a refresh token) may hold a newer refresh token than the "best" one: leave all copies for a refresh to repair.
+  if (copies.some((c) => c && isGatewayAccessToken(c.grant.access_token) && c.grant.refresh_token !== best!.grant.refresh_token)) return { written, failed };
   const fp = grantFingerprint(best.grant);
   const same = (copy: (typeof copies)[number]) =>
     copy !== undefined && grantFingerprint(copy.grant) === fp && copy.grant.access_token === best!.grant.access_token;
@@ -547,6 +549,10 @@ async function freshestGrant(
   const piFingerprint = piGrant ? grantFingerprint(piGrant) : undefined;
   const native = await readProviderGrantCopy(tool, identity.configDir, piFingerprint);
   if (!native && !piGrant) return undefined;
+  // A damaged native store (gateway token beside a refresh token) holds the newest refresh token whatever its expiry says: it wins.
+  if (native && piGrant && isGatewayAccessToken(native.grant.access_token) && native.grant.refresh_token !== piGrant.refresh_token) {
+    return { grant: native.grant, entryKey: native.entryKey, rawEntry: native.rawEntry, source: `native:${native.path}` };
+  }
   if (native && piGrant) {
     const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
     return recency(native.grant) >= recency(piGrant)
