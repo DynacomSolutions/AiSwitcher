@@ -598,30 +598,35 @@ describe("failover and refresh", () => {
     expect((await call()).status).toBe(200);
   });
 
-  const deadLoginSetup = async (dead: string[]) => {
+  /** Pool app whose `get` throws `fail(id)` while it returns an error (until `sig[id]` changes for login-dead). */
+  const credSetup = async (members: string[], fail: (id: string, sig: string) => Error | undefined, handlerFor?: (who: string) => Response) => {
     const clock = { ms: NOW.getTime() };
     deps.now = () => new Date(clock.ms);
-    const sig: Record<string, string> = { a: "s1", b: "s1" };
+    const sig: Record<string, string> = Object.fromEntries(members.map((m) => [m, "s1"]));
+    const gets: string[] = [];
     const get = deps.creds.get.bind(deps.creds);
     deps.creds = {
       get: async (p: GatewayApp["provider"], id: string) => {
-        if (dead.includes(id) && sig[id] === "s1") throw new GatewayCredentialError("login-dead", p, id);
+        gets.push(id);
+        const e = fail(id, sig[id]!);
+        if (e) throw e;
         return get(p, id);
       },
       refreshAfter401: deps.creds.refreshAfter401,
       signature: async (_p: string, id: string) => sig[id],
     } as unknown as GatewayDeps["creds"];
+    deps.poolMembers = async () => members;
     const gw = createGatewayApp(deps);
     const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
-    const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status }); };
-    usage.a = live(10);
-    usage.b = live(20);
-    handler = () => new Response(anthropicJson, { headers: { "content-type": "application/json" } });
-    return { clock, sig, call, who: () => seen.map((x) => x.headers.get("authorization")) };
+    const call = async () => { const r = await gw.request("http://gw.test/pool/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } }); return new Response(await r.arrayBuffer(), { status: r.status, headers: r.headers }); };
+    members.forEach((m, i) => (usage[m] = live(10 * (i + 1))));
+    handler = (_req, s) => (handlerFor ? handlerFor(s.headers.get("authorization")!.slice("Bearer tok-".length)) : new Response(anthropicJson, { headers: { "content-type": "application/json" } }));
+    return { clock, sig, gets, call, who: () => seen.map((x) => x.headers.get("authorization")) };
   };
+  const deadLogin = (dead: string[]) => (id: string, sig: string) => (dead.includes(id) && sig === "s1" ? new GatewayCredentialError("login-dead", "claude", id) : undefined);
 
   test("a dead-login pool member is skipped and the request succeeds on the next member", async () => {
-    const { call, who } = await deadLoginSetup(["a"]);
+    const { call, who } = await credSetup(["a", "b"], deadLogin(["a"]));
     expect((await call()).status).toBe(200);
     expect(who()).toEqual(["Bearer tok-b"]);
     seen.length = 0;
@@ -629,8 +634,8 @@ describe("failover and refresh", () => {
     expect(who()).toEqual(["Bearer tok-b"]);
   });
 
-  test("a held dead-login member is retried after its credential changes, or after ten minutes", async () => {
-    const { clock, sig, call, who } = await deadLoginSetup(["a"]);
+  test("a held dead-login member is retried once its credential changes", async () => {
+    const { clock, sig, call, who } = await credSetup(["a", "b"], deadLogin(["a"]));
     await call();
     seen.length = 0;
     clock.ms += 5 * 60_000;
@@ -640,24 +645,31 @@ describe("failover and refresh", () => {
     sig.a = "s2";
     await call();
     expect(who()).toEqual(["Bearer tok-a"]);
-    // Time-based release when the file never changes
-    const again = await deadLoginSetup(["a"]);
-    await again.call();
-    seen.length = 0;
-    again.clock.ms += 10 * 60_000 + 1000;
-    again.sig.a = "s1";
-    await again.call();
-    expect(again.who()).toEqual(["Bearer tok-b"]);
   });
 
-  test("an all-dead pool still returns 502 with the safe message", async () => {
-    const { call } = await deadLoginSetup(["a", "b"]);
+  test("a dead-login member is not read for ten minutes, then once more", async () => {
+    const { clock, gets, call } = await credSetup(["a", "b"], deadLogin(["a"]));
+    await call();
+    expect(gets.filter((g) => g === "a").length).toBe(1);
+    clock.ms += 10 * 60_000 - 1000;
+    await call();
+    await call();
+    expect(gets.filter((g) => g === "a").length).toBe(1);
+    clock.ms += 2000;
+    await call();
+    expect(gets.filter((g) => g === "a").length).toBe(2);
+  });
+
+  test("an all-dead pool returns 502 with the safe message after trying both members", async () => {
+    const { call, gets } = await credSetup(["a", "b"], deadLogin(["a", "b"]));
     const res = await call();
     expect(res.status).toBe(502);
+    expect(await res.text()).toContain("is logged out");
+    expect(gets.sort()).toEqual(["a", "b"]);
+    expect(seen.length).toBe(0);
   });
 
   test("a dead login on a pinned app keeps returning 502 without failover", async () => {
-    const { clock: _c } = await deadLoginSetup(["id1"]);
     const t = await addApp(baseApp({ name: "pinned", target: { kind: "pin", identity: "a" } }));
     const get = deps.creds.get.bind(deps.creds);
     deps.creds = { ...deps.creds, get: async (p: GatewayApp["provider"], id: string) => { if (id === "a") throw new GatewayCredentialError("login-dead", p, id); return get(p, id); } } as GatewayDeps["creds"];
@@ -665,6 +677,70 @@ describe("failover and refresh", () => {
     const r = await gw.request("http://gw.test/pinned/v1/messages", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t}` } });
     expect(r.status).toBe(502);
     expect(seen.length).toBe(0);
+  });
+
+  test("a transient credential error holds the member only for the short default", async () => {
+    let failOnce = true;
+    const { clock, call, who } = await credSetup(["a", "b"], (id) => {
+      if (id === "a" && failOnce) {
+        failOnce = false;
+        return new GatewayCredentialError("refresh-failed", "claude", id);
+      }
+      return undefined;
+    });
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 20_000;
+    await call();
+    expect(who()).toEqual(["Bearer tok-a"]);
+  });
+
+  test("a credential hold is not overwritten by an earlier member's burst hold", async () => {
+    const { clock, call, who } = await credSetup(["a", "b", "c"], deadLogin(["b"]), (w) => (w === "a" ? new Response("{}", { status: 429 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } })));
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-c"]);
+    seen.length = 0;
+    clock.ms += 20_000;
+    await call();
+    // a's 15 s burst hold is over; b (dead login) must still be held, so the order is a then c.
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-c"]);
+  });
+
+  test("a pool 401 whose refresh is in cooldown holds the member and fails over", async () => {
+    refreshImpl = async () => {
+      throw new RefreshCooldownError("claude", "a");
+    };
+    const { clock, call, who } = await credSetup(["a", "b"], () => undefined, (w) => (w === "a" ? new Response("{}", { status: 401 }) : new Response(anthropicJson, { headers: { "content-type": "application/json" } })));
+    expect((await call()).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    seen.length = 0;
+    await call();
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms += 20_000;
+    await call();
+    expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  test("while only a burst hold remains, the client gets a plain short 429 without unified headers", async () => {
+    const { clock, call } = await credSetup(["a"], () => undefined, () => new Response("{}", { status: 429 }));
+    expect((await call()).status).toBe(429);
+    clock.ms += 1000;
+    const res = await call();
+    expect(res.status).toBe(429);
+    expect(Number(res.headers.get("retry-after"))).toBeLessThanOrEqual(15);
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(res.headers.get("anthropic-ratelimit-unified-status")).toBeNull();
+    expect(await res.text()).toContain("rate_limit_error");
+  });
+
+  test("while only credential holds remain, the client gets the stored 502 message", async () => {
+    const { call } = await credSetup(["a"], deadLogin(["a"]));
+    expect((await call()).status).toBe(502);
+    const res = await call();
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("is logged out");
   });
 
   test("all members exhausted gives one 429 with a reason in the log", async () => {
