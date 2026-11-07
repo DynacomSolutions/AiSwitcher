@@ -376,17 +376,35 @@ async function runOne(target: UsageTarget, suppression: UsageRowSuppression, dep
   // export. Their daily usage is derived from that export in snapshot.ts.
   const [results, extraCost] = await Promise.all([
     (deps.runTokscale ?? ((selected, rowSuppression) => runTokscaleForUsageTarget(selected, rowSuppression, deps)))(target, suppression),
-    // Retired identities keep local usage only: the extra-cost probe is a
-    // live OAuth call against an account whose credentials are gone.
-    isRetired(target.identity) ? Promise.resolve(undefined) : (deps.fetchExtraCost ?? fetchExtraCost)(target.toolName, target.identity),
+    targetExtraCost(target, deps),
   ]);
+  return attachExtraCost(target, results, extraCost);
+}
+
+/** The live extra-cost (overage) figure of a native-report target. Retired
+ * identities keep local usage only: the probe is a live OAuth call against an
+ * account whose credentials are gone. */
+function targetExtraCost(target: UsageTarget, deps: UsageRunDeps): Promise<OverageInfo | undefined> {
+  return isRetired(target.identity) ? Promise.resolve(undefined) : (deps.fetchExtraCost ?? fetchExtraCost)(target.toolName, target.identity);
+}
+
+function attachExtraCost(target: UsageTarget, results: UsageResult[], extraCost: OverageInfo | undefined): UsageResult[] {
   const primaryProvider = providerForTool(target.toolName);
-  return results.map((result, index) => ({
+  return results.map(({ extraCost: _stale, ...result }, index) => ({
     ...result,
     ...(extraCost && (result.provider === primaryProvider || (index === 0 && !results.some((r) => r.provider === primaryProvider)))
       ? { extraCost }
       : {}),
   }));
+}
+
+/** A native-report target's rows as `runOne` would return them, built from
+ * the rows of its last export (its sources are unchanged) and a fresh
+ * extra-cost probe, without running Tokscale. */
+export async function reuseNativeReportRows(target: UsageTarget, rows: UsageResult[], deps: UsageRunDeps = {}): Promise<UsageResult[]> {
+  // The stored rows carry the identity as it was then; a renamed label or
+  // new aliases must show as an export would show them.
+  return attachExtraCost(target, rows.map((row) => ({ ...row, identity: target.identity })), await targetExtraCost(target, deps));
 }
 
 /** Attaches one source's daily usage to its report row. Only a single-row
@@ -489,7 +507,7 @@ export function aggregateUsageResults(results: UsageResult[]): UsageResult[] {
  * tokscale child scanning that identity's whole history. A bounded pool
  * reduces disk contention, matches limits's own fan-out cap, and lets the
  * live render fill in as results arrive. */
-const USAGE_MAX_CONCURRENT = 6;
+export const USAGE_MAX_CONCURRENT = 6;
 
 export async function runUsageQueryForTargets(
   targets: UsageTarget[],
