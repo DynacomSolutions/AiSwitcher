@@ -693,6 +693,8 @@ export interface IdentityGrantRefresh {
   readError?: boolean;
   /** Store classes ("native", "pi", "pool") that could not be read and were left untouched; no paths or secrets. */
   unreadableStores?: string[];
+  /** True when this result came from a full probe of every store (so an empty `unreadableStores` means all stores read cleanly). Absent on adopted, lock-busy and rotated-elsewhere results. */
+  storesProbed?: boolean;
   beforeFingerprint?: string;
   afterFingerprint?: string;
   /** New access-token expiry (unix seconds) on success. */
@@ -803,7 +805,7 @@ export async function refreshIdentityOAuthGrant(
     if (!decision.attempt) {
       return {
         tool, identity: identity.name, outcome: "skipped-fresh", detail: decision.reason,
-        beforeFingerprint: grantFingerprint(peek.grant), written: [], writeFailures: [],
+        beforeFingerprint: grantFingerprint(peek.grant), written: [], writeFailures: [], storesProbed: true,
         ...(peeked.failed ? { unreadableStores: peeked.unreadable } : {}),
       };
     }
@@ -926,7 +928,7 @@ async function refreshGrantUnlocked(
     tool,
   });
   if (!decision.attempt) {
-    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason, ...(readFailed ? { unreadableStores: probed.unreadable } : {}) };
+    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason, storesProbed: true, ...(readFailed ? { unreadableStores: probed.unreadable } : {}) };
   }
   // Only a refresh that is actually due is blocked by an unreadable authoritative store.
   if (probed.blocking) {
@@ -1014,6 +1016,7 @@ async function refreshGrantUnlocked(
     expiresAt: grant.expires_at,
     written: writeThrough.written,
     writeFailures: writeThrough.failed,
+    storesProbed: true,
     ...(probed.failed ? { unreadableStores: probed.unreadable } : {}),
   };
 }

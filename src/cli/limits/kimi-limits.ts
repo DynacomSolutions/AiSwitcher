@@ -339,6 +339,8 @@ export async function refreshKimiOAuthToken(
 
 export interface KimiRefreshContext {
   lockDir: string;
+  /** The cluster gateway owns this login: never refresh it here, use the stored token as it is. */
+  gatewayManaged?: boolean;
   reread: () => Promise<KimiOAuthCredentials | undefined>;
 }
 
@@ -352,6 +354,7 @@ async function refreshCredentials(
     await persist(next);
     return next;
   };
+  if (ctx?.gatewayManaged) throw new Error("login is owned by the cluster gateway - not refreshed here");
   if (!ctx) return run(credentials);
   // The refresh token rotates: hold the identity lock (shared with the daemon refresher) and
   // re-read, so a grant rotated meanwhile is used as-is instead of POSTing the spent token.

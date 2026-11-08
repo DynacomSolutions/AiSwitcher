@@ -1,6 +1,6 @@
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { DEAD_REFRESH_CODES, OAuthRefreshError, refreshIdentityOAuthGrant } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, OAuthRefreshError, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { PgRefreshBackend } from "./pg-refresh-backend.ts";
 import { guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, type RefreshGuardBackend } from "./refresh-guard.ts";
@@ -23,7 +23,7 @@ import type { GatewayStore } from "./store.ts";
 import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-source.ts";
 import type { GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
-import { listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
+import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
 export const DEFAULT_GATEWAY_ADMIN_PORT = 47131;
@@ -67,7 +67,7 @@ export interface GatewayHooks {
   alertCheckMs?: number;
   /** How often every managed login is refreshed ahead of expiry with no traffic (default 10 minutes). */
   keepAliveMs?: number;
-  keepAliveAccounts?(): Promise<Identity[]>;
+  keepAliveAccounts?(tool: string): Promise<Identity[]>;
   overlapMs?: number;
   exit?(code: number): void;
 }
@@ -93,7 +93,9 @@ export function instrumentRefresh(
     /** A store could not be read: the login itself may be fine, but a person must look. Names the store class only. */
     const readError = (stores: string[] | undefined): void => {
       const which = stores && stores.length > 0 ? ` (${stores.join(", ")} store)` : "";
-      deps.alerter.raise("store-unreadable", key, `a credential store of the ${tool} login "${identity.name}" could not be read${which}; check the file's permissions and contents (the existing token stays in use)`);
+      // A forced refresh (after a 401) was asked for because the token in use was rejected: it does not stay in use.
+      const effect = opts?.expectedAccessToken !== undefined || opts?.force ? "the rejected token could not be replaced" : "the existing token stays in use";
+      deps.alerter.raise("store-unreadable", key, `a credential store of the ${tool} login "${identity.name}" could not be read${which}; check the file's permissions and contents (${effect})`);
     };
     const ok = (): void => {
       deps.failed?.delete(key);
@@ -103,12 +105,12 @@ export function instrumentRefresh(
       const result = await refresh(tool, identity, opts);
       deps.metrics.refresh(tool, result.outcome);
       if (result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-revoked") fail();
+      else if (result.outcome === "refreshed") ok();
+      // Any result that names unreadable stores warns early (the alerter dedupes); only a result whose store probe ran and
+      // found none closes the alert. Adopted, lock-busy and rotated-elsewhere results never probed, so they leave it open.
+      if (result.unreadableStores && result.unreadableStores.length > 0) readError(result.unreadableStores);
       else if (result.outcome === "skipped-read-error") readError(result.unreadableStores);
-      else if (result.outcome === "refreshed") {
-        ok();
-        if (result.unreadableStores && result.unreadableStores.length > 0) readError(result.unreadableStores);
-        else deps.alerter.recover("store-unreadable", key);
-      } else if (result.outcome === "skipped-fresh" && !result.unreadableStores) deps.alerter.recover("store-unreadable", key);
+      else if (result.outcome === "refreshed" || (result.outcome === "skipped-fresh" && result.storesProbed)) deps.alerter.recover("store-unreadable", key);
       return result;
     } catch (err) {
       // A busy lock or a transient guard/read error is retried by the next caller or tick: it never means the login needs a person.
@@ -234,20 +236,30 @@ const describe = (err: unknown): string => {
  * Idle keep-alive: the gateway is the only refresher of managed logins, so it refreshes each one before expiry even with no
  * traffic (AIS's normal expiry window decides; a fresh login is left alone). Counted per outcome; a failure raises the usual alert.
  */
-export async function keepAliveOnce(deps: { refresh: RefreshFn; accounts: () => Promise<Identity[]>; metrics: { keepAlive(provider: string, outcome: string): void }; revoked?: Map<string, string> }): Promise<void> {
+export async function keepAliveOnce(deps: {
+  refresh: RefreshFn;
+  accounts: (tool: string) => Promise<Identity[]>;
+  metrics: { keepAlive(provider: string, outcome: string): void };
+  revoked?: Map<string, string>;
+  /** Tools to keep alive, in order, one sequential pass over all of them (default: claude only). */
+  tools?: readonly string[];
+}): Promise<void> {
   // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
   const revoked = deps.revoked ?? new Map<string, string>();
-  for (const account of await deps.accounts().catch(() => [] as Identity[])) {
-    try {
-      const known = revoked.get(account.name);
-      const r = await deps.refresh("claude", account, { ...(known ? { revokedFingerprint: known } : {}) });
-      if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(account.name, r.beforeFingerprint);
-      else revoked.delete(account.name);
-      deps.metrics.keepAlive("claude", r.outcome);
-    } catch (err) {
-      // Only a dead-grant OAuth code proves the login is gone; any other 400/401 is not enough (as in credentials.ts).
-      if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) revoked.set(account.name, err.refreshFingerprint);
-      deps.metrics.keepAlive("claude", "failed");
+  for (const tool of deps.tools ?? ["claude"]) {
+    for (const account of await deps.accounts(tool).catch(() => [] as Identity[])) {
+      const key = `${tool}/${account.name}`;
+      try {
+        const known = revoked.get(key);
+        const r = await deps.refresh(tool as RefreshableTool, account, { ...(known ? { revokedFingerprint: known } : {}) });
+        if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(key, r.beforeFingerprint);
+        else revoked.delete(key);
+        deps.metrics.keepAlive(tool, r.outcome);
+      } catch (err) {
+        // Only a dead-grant OAuth code proves the login is gone; any other 400/401 is not enough (as in credentials.ts).
+        if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) revoked.set(key, err.refreshFingerprint);
+        deps.metrics.keepAlive(tool, "failed");
+      }
     }
   }
 }
@@ -444,7 +456,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     keepAliveRunning = true;
-    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? (() => listGatewayManagedAccounts()), metrics, revoked: revokedGrants }).finally(() => {
+    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, metrics, revoked: revokedGrants }).finally(() => {
       keepAliveRunning = false;
     });
   }, hooks.keepAliveMs ?? 600_000);
