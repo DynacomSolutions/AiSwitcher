@@ -85,7 +85,7 @@ function hooks(over: Partial<GatewayHooks> = {}): GatewayHooks {
 }
 
 async function boot(over: Partial<GatewayHooks> = {}, handleSignals = false) {
-  const g = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: ADMIN, handleSignals }, hooks(over));
+  const g = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: ADMIN, handleSignals }, hooks({ noHeartbeat: true, ...over }));
   started.push(g);
   return g;
 }
@@ -724,6 +724,33 @@ describe("keep-alive across every refreshable tool", () => {
     });
     expect(calls).toEqual(["claude/c1", "codex/x1", "codex/x2", "grok/g1", "kimi/k1"]);
     expect(counted).toEqual(["claude:refreshed", "codex:refreshed", "codex:refreshed", "grok:failed", "kimi:refreshed"]);
+  });
+
+  test("an API-key or logged-out entry found by the keep-alive is skipped quietly, a real failure still alerts", async () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(`${a.kind} ${a.key}`));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const counted: string[] = [];
+    let outcome = "no-grant";
+    const refresh = instrumentRefresh((async (_t: string, id: { name: string }) => ({ tool: "codex", identity: id.name, outcome, written: [], writeFailures: [], detail: "x" })) as never, { metrics, alerter });
+    const deps = { refresh, accounts: async () => [member("api1")], tools: ["codex"], metrics: { keepAlive: (p: string, o: string) => void counted.push(`${p}:${o}`) } };
+    await keepAliveOnce(deps);
+    expect(seen).toEqual([]);
+    expect(counted).toEqual(["codex:no-grant"]);
+    // The request path (no keepAlive flag) still reports a logged-out login.
+    await refresh("codex", member("api1"), {});
+    expect(seen).toEqual(["refresh-failed codex/api1"]);
+  });
+
+  test("a pass records the heartbeat with what it holds and when each login last refreshed", async () => {
+    const passes: Array<Record<string, { lastSuccessAt?: string }>> = [];
+    const refresh = (async (tool: string, id: { name: string }) => ({ tool, identity: id.name, outcome: id.name === "ok" ? "refreshed" : "skipped-fresh", detail: "", written: [], writeFailures: [] })) as never;
+    await keepAliveOnce({
+      refresh, accounts: async () => [member("ok"), member("idle")], tools: ["kimi"], metrics: { keepAlive: () => {} },
+      now: () => new Date("2026-01-01T00:00:00Z"),
+      onPass: async (held) => void passes.push(held),
+    });
+    expect(passes).toEqual([{ "kimi/ok": { lastSuccessAt: "2026-01-01T00:00:00.000Z" }, "kimi/idle": {} }]);
   });
 
   test("a same-named account in two tools keeps separate revoked marks", async () => {

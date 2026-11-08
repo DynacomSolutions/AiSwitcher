@@ -423,7 +423,21 @@ export async function fetchKimiUsageForCredentials(
     return { error: `usage fetch failed: ${errorMessage(err)}` };
   }
 
-  if ((response.status === 401 || response.status === 403) && credentials.refresh_token && !refreshAttempted) {
+  const gatewayOwned = refreshCtx?.gatewayManaged === true;
+  if ((response.status === 401 || response.status === 403) && gatewayOwned) {
+    // The gateway renews this login: re-read the store once (it may have just rotated) and retry; never refresh here.
+    const current = await refreshCtx!.reread().catch(() => undefined);
+    if (current && current.access_token !== accessToken) {
+      try {
+        response = await fetchUsages(current.access_token);
+      } catch (err) {
+        return { error: `usage fetch failed after re-reading the gateway-renewed token: ${errorMessage(err)}` };
+      }
+    }
+    if (response.status === 401 || response.status === 403) {
+      return { error: `authentication rejected (HTTP ${response.status}); the cluster gateway owns and renews this login, so there is nothing to run here` };
+    }
+  } else if ((response.status === 401 || response.status === 403) && credentials.refresh_token && !refreshAttempted) {
     refreshAttempted = true;
     try {
       accessToken = (await refreshCredentials(credentials, persist, refreshCtx)).access_token;

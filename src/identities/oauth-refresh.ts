@@ -712,6 +712,8 @@ export interface OAuthRefreshOptions {
    * call (never loop; a re-login mints a different token and resumes). */
   revokedFingerprint?: string;
   lastSuccessAt?: string | null;
+  /** The gateway's idle keep-alive pass: an identity with no OAuth grant (API key or logged out) is skipped quietly, not alerted. */
+  keepAlive?: boolean;
   /** Compare-and-refresh: when set, the refresh proceeds only if the freshest
    * stored access token (re-read under the locks) still has this value;
    * otherwise another process already rotated it and no token request is

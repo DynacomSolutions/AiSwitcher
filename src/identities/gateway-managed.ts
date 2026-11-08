@@ -1,6 +1,7 @@
 import { isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import { expandPath } from "./match.ts";
 import { poolsOf } from "./pool/swap-pool.ts";
+import { heartbeatHolds } from "./gateway-heartbeat.ts";
 import { adapterFor } from "../gateway/providers/index.ts";
 import { isRetired } from "./retired.ts";
 import { loadIdentitiesFile } from "./store.ts";
@@ -60,9 +61,11 @@ export async function listGatewayManagedAccounts(registryPath?: string, tool: st
 
 /**
  * True when this process must not refresh, converge, reconcile or write the account's login: the gateway owns it (see
- * listGatewayManagedAccounts) and this process is not the gateway server. Unreadable registry or unserved tool: not managed.
+ * listGatewayManagedAccounts) and this process is not the gateway server. claude is decided by the pool routing marker;
+ * codex, grok and kimi also need a fresh gateway heartbeat naming the login (see gateway-heartbeat.ts). Unreadable registry or unserved tool: not managed.
  */
 export async function isGatewayManagedHere(tool: string, identityName: string, registryPath?: string): Promise<boolean> {
   if (!isGatewayServedTool(tool) || isGatewayOwnerProcess()) return false;
+  if (tool !== "claude" && !(await heartbeatHolds(tool, identityName))) return false; // no live gateway has said it holds this login: refresh as before
   return (await listGatewayManagedAccounts(registryPath, tool)).some((i) => i.name === identityName);
 }

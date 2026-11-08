@@ -892,3 +892,45 @@ describe("registry wiring", () => {
     }
   });
 });
+
+describe("gateway keep-alive cadence with the real refresh", () => {
+  const withOwner = async (fn: () => Promise<void>): Promise<void> => {
+    const saved = process.env.AIS_GATEWAY_OWNER;
+    process.env.AIS_GATEWAY_OWNER = "1";
+    try { await fn(); } finally { if (saved === undefined) delete process.env.AIS_GATEWAY_OWNER; else process.env.AIS_GATEWAY_OWNER = saved; }
+  };
+  const nowS = (): number => Math.floor(Date.now() / 1000);
+
+  test("two passes on a fresh codex grant POST at most once", async () => {
+    await json(CODEX_FILE(), {
+      OPENAI_API_KEY: null,
+      tokens: { access_token: fakeJwt({ iat: nowS() - 3600, exp: nowS() + 9 * 86_400 }), refresh_token: "rt-old-1" },
+      last_refresh: new Date((nowS() - 3600) * 1000).toISOString(),
+    });
+    const { calls, fetchImpl } = stubFetch([{ access_token: fakeJwt({ iat: nowS(), exp: nowS() + 10 * 86_400 }), refresh_token: "rt-new-1", expires_in: 864_000 }]);
+    const { keepAliveOnce } = await import("../../src/gateway/serve.ts");
+    const lastSuccess = new Map<string, string>();
+    await withOwner(async () => {
+      const deps = { refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async () => [identityIn(dirs.codex)], tools: ["codex"], metrics: { keepAlive: () => {} }, lastSuccess, onPass: undefined };
+      await keepAliveOnce(deps);
+      await keepAliveOnce(deps);
+      await keepAliveOnce(deps);
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("two passes on a kimi grant POST at most once", async () => {
+    await mkdir(join(dirs.kimi, "credentials"), { recursive: true });
+    await json(KIMI_FILE(), { access_token: "at-syn-kim", refresh_token: "rt-old-1", expires_at: nowS() - 60 });
+    const { calls, fetchImpl } = stubFetch([{ access_token: "at-syn-new", refresh_token: "rt-new-1", expires_in: 900 }]);
+    const { keepAliveOnce } = await import("../../src/gateway/serve.ts");
+    const lastSuccess = new Map<string, string>();
+    await withOwner(async () => {
+      const deps = { refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async () => [identityIn(dirs.kimi)], tools: ["kimi"], metrics: { keepAlive: () => {} }, lastSuccess };
+      await keepAliveOnce(deps);
+      await keepAliveOnce(deps);
+    });
+    expect(calls).toHaveLength(1);
+    expect(lastSuccess.get(`kimi/${ACME}`)).toBeDefined();
+  });
+});

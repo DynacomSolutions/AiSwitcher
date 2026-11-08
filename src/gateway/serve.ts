@@ -23,6 +23,7 @@ import type { GatewayStore } from "./store.ts";
 import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-source.ts";
 import type { GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
+import { readHeartbeat, writeHeartbeat } from "../identities/gateway-heartbeat.ts";
 import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -68,6 +69,8 @@ export interface GatewayHooks {
   /** How often every managed login is refreshed ahead of expiry with no traffic (default 10 minutes). */
   keepAliveMs?: number;
   keepAliveAccounts?(tool: string): Promise<Identity[]>;
+  /** Tests: do not read or write the shared gateway heartbeat file. */
+  noHeartbeat?: boolean;
   overlapMs?: number;
   exit?(code: number): void;
 }
@@ -104,7 +107,8 @@ export function instrumentRefresh(
     try {
       const result = await refresh(tool, identity, opts);
       deps.metrics.refresh(tool, result.outcome);
-      if (result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-revoked") fail();
+      const idleNoGrant = result.outcome === "no-grant" && opts?.keepAlive === true && !result.readError;
+      if (result.outcome === "failed" || (result.outcome === "no-grant" && !idleNoGrant) || result.outcome === "skipped-revoked") fail();
       else if (result.outcome === "refreshed") ok();
       // Any result that names unreadable stores warns early (the alerter dedupes); only a result whose store probe ran and
       // found none closes the alert. Adopted, lock-busy and rotated-elsewhere results never probed, so they leave it open.
@@ -243,25 +247,38 @@ export async function keepAliveOnce(deps: {
   revoked?: Map<string, string>;
   /** Tools to keep alive, in order, one sequential pass over all of them (default: claude only). */
   tools?: readonly string[];
+  /** "tool/name" to the ISO time of its last successful refresh; survives passes so codex and kimi rotate about daily, not per pass. */
+  lastSuccess?: Map<string, string>;
+  now?: () => Date;
+  /** Called after the pass with every login held and its last success: the gateway's heartbeat. */
+  onPass?: (held: Record<string, { lastSuccessAt?: string }>, at: Date) => Promise<void>;
 }): Promise<void> {
   // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
   const revoked = deps.revoked ?? new Map<string, string>();
+  const lastSuccess = deps.lastSuccess ?? new Map<string, string>();
+  const now = deps.now ?? (() => new Date());
+  const held: Record<string, { lastSuccessAt?: string }> = {};
   for (const tool of deps.tools ?? ["claude"]) {
     for (const account of await deps.accounts(tool).catch(() => [] as Identity[])) {
       const key = `${tool}/${account.name}`;
+      held[key] = {};
       try {
         const known = revoked.get(key);
-        const r = await deps.refresh(tool as RefreshableTool, account, { ...(known ? { revokedFingerprint: known } : {}) });
+        const r = await deps.refresh(tool as RefreshableTool, account, { keepAlive: true, lastSuccessAt: lastSuccess.get(key) ?? null, ...(known ? { revokedFingerprint: known } : {}) });
         if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(key, r.beforeFingerprint);
         else revoked.delete(key);
+        if (r.outcome === "refreshed") lastSuccess.set(key, now().toISOString());
         deps.metrics.keepAlive(tool, r.outcome);
       } catch (err) {
         // Only a dead-grant OAuth code proves the login is gone; any other 400/401 is not enough (as in credentials.ts).
         if (err instanceof OAuthRefreshError && err.revoked && err.refreshFingerprint && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) revoked.set(key, err.refreshFingerprint);
         deps.metrics.keepAlive(tool, "failed");
       }
+      const last = lastSuccess.get(key);
+      if (last) held[key] = { lastSuccessAt: last };
     }
   }
+  await deps.onPass?.(held, now()).catch(() => undefined);
 }
 
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
@@ -451,12 +468,18 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const alertTimer = setInterval(checkLedger, hooks.alertCheckMs ?? 5_000);
   alertTimer.unref?.();
   const revokedGrants = new Map<string, string>();
+  // Seeded from the previous heartbeat so a restart does not rotate every codex and kimi login again at once.
+  const lastSuccessAt = new Map<string, string>();
+  if (!hooks.noHeartbeat) {
+    const prior = await readHeartbeat();
+    for (const [k, v] of Object.entries(prior?.held ?? {})) if (v.lastSuccessAt) lastSuccessAt.set(k, v.lastSuccessAt);
+  }
   let keepAliveRunning = false;
   let keepAliveRun: Promise<void> | undefined;
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     keepAliveRunning = true;
-    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, metrics, revoked: revokedGrants }).finally(() => {
+    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, lastSuccess: lastSuccessAt, now, onPass: hooks.noHeartbeat ? undefined : (held, at) => writeHeartbeat({ version: 1, passAt: at.toISOString(), held }), metrics, revoked: revokedGrants }).finally(() => {
       keepAliveRunning = false;
     });
   }, hooks.keepAliveMs ?? 600_000);
