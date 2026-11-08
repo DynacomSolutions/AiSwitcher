@@ -16,11 +16,8 @@ export class FakeChrome implements ChromeApi {
   removedListeners: Array<(id: number) => void> = [];
   eventListeners: Array<(tabId: number, method: string, params: Record<string, unknown>) => void> = [];
   resizes: Array<[number, number, number]> = [];
-  activateCalls: number[] = [];
-
-  private activate(id: number): void {
-    for (const t of this.tabList.values()) t.active = t.id === id;
-  }
+  /** Every tab created, with the `active` flag it was created with (always false: agents never foreground a tab). */
+  createdActive: boolean[] = [];
 
   addTab(id: number, url = "https://example.test/", title = "T"): TabInfo {
     const t: TabInfo = { id, windowId: 1, groupId: -1, url, title, active: false };
@@ -47,12 +44,10 @@ export class FakeChrome implements ChromeApi {
   tabs = {
     get: async (id: number) => this.tabList.get(id),
     query: async () => [...this.tabList.values()],
-    create: async (url?: string, active = false) => {
-      const t = this.addTab(this.nextTab++, url ?? "chrome://newtab/");
-      if (active) this.activate(t.id);
-      return t;
+    create: async (url?: string) => {
+      this.createdActive.push(false);
+      return this.addTab(this.nextTab++, url ?? "chrome://newtab/");
     },
-    activate: async (id: number) => { this.activateCalls.push(id); this.activate(id); },
     remove: async (id: number) => { this.closeTab(id); },
     group: async (ids: number[], groupId?: number) => {
       if (groupId !== undefined && this.groupFailures.has(groupId)) throw new Error("No group with id");
@@ -62,7 +57,13 @@ export class FakeChrome implements ChromeApi {
     },
     onRemoved: (l: (id: number) => void) => { this.removedListeners.push(l); },
   };
-  tabGroups = { update: async (id: number, p: { title: string; color: string }) => { this.groups.set(id, p); } };
+  /** Chrome drops a group when its last tab leaves, so a group exists only while a tab is in it. */
+  private groupLive(id: number): boolean { return [...this.tabList.values()].some(t => t.groupId === id); }
+  tabGroups = {
+    update: async (id: number, p: { title: string; color: string }) => { this.groups.set(id, p); },
+    get: async (id: number) => (this.groupLive(id) ? { id, title: this.groups.get(id)?.title ?? "" } : undefined),
+    queryByTitle: async (title: string) => [...this.groups].filter(([id, g]) => g.title === title && this.groupLive(id)).map(([id, g]) => ({ id, title: g.title })),
+  };
   windows = { resize: async (w: number, width: number, height: number) => { this.resizes.push([w, width, height]); } };
   debugger = {
     attach: async (id: number) => { this.attachedTabs.add(id); },

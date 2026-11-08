@@ -1,6 +1,8 @@
-// Side panel: connection status, binding, agent sessions and the Pause / Resume / Stop controls. Plain DOM.
-import type { PanelMessage, PanelSession, PanelStatus } from "../shared/panel.ts";
+// Side panel: connection status, binding and the agent sessions using the active tab, with Pause / Resume / Stop. Plain DOM.
+import type { PanelMessage, PanelStatus } from "../shared/panel.ts";
 import { targetText } from "../shared/panel.ts";
+import { groupState, sessionsForTab } from "../shared/current-tab.ts";
+import type { ActiveTab, TabSession } from "../shared/current-tab.ts";
 import { KEYS, PairingError, parseConsoleUrl, signIn, UNREACHABLE_MESSAGE } from "../background/pairing.ts";
 import { realChromeApi } from "../background/chrome-api.ts";
 
@@ -36,12 +38,66 @@ function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Record<string, 
   return el;
 }
 
-function send(type: PanelMessage): Promise<unknown> { return chrome.runtime.sendMessage({ type }); }
+function send(type: PanelMessage, extra: Record<string, unknown> = {}): Promise<unknown> { return chrome.runtime.sendMessage({ type, ...extra }); }
 
-function sessionRow(s: PanelSession): HTMLElement {
+/** Active tab of the window this panel lives in; undefined until known. */
+let activeTab: ActiveTab | undefined;
+
+function tabSessionRow(t: TabSession, paused: boolean, tab: ActiveTab | undefined): HTMLElement {
+  const { session: s } = t;
   const bar = h("span", { class: "bar" });
   bar.style.background = s.color;
-  return h("li", {}, bar, h("div", {}, h("div", { class: "title" }, s.label), h("div", { class: "sub" }, s.identity)), h("span", { class: "count" }, `${s.tabs} ${s.tabs === 1 ? "tab" : "tabs"}`));
+  const state = h("span", { class: `use ${t.use}` }, t.use === "controlling" ? "Controlling this tab" : "Idle");
+  const btn = (label: string, msg: PanelMessage, kind = "") => {
+    const b = h("button", { type: "button", class: `small ${kind}`.trim(), title: "Applies to every agent in this browser" }, label);
+    b.addEventListener("click", () => void send(msg).then(refresh));
+    return b;
+  };
+  const controls = h("div", { class: "row-actions" }, paused ? btn("Resume", "ais-resume") : btn("Pause", "ais-pause"), btn("Stop", "ais-stop", "danger"));
+  return h("li", { class: "tab-row" }, bar, h("div", {}, h("div", { class: "title" }, s.label), h("div", { class: "sub" }, state, tab && s.grantedGroupIds.includes(tab.groupId) ? " \u00b7 granted group" : "")), controls);
+}
+
+/** Session picked in the grant form; kept across the timed re-renders. */
+let pickedSession = "";
+let grantError = "";
+
+const GRANT_ERRORS: Record<string, string> = {
+  no_session: "That session has ended.",
+  no_group: "That tab group no longer exists.",
+  in_use: "An agent is already using this group.",
+};
+
+function groupControls(s: PanelStatus, tab: ActiveTab | undefined): HTMLElement | undefined {
+  const g = groupState(s.sessions, tab);
+  if (g.kind === "ungrouped" || g.kind === "agent" || !tab) return undefined;
+  if (g.kind === "granted") {
+    const revoke = h("button", { type: "button", class: "small" }, "Revoke access");
+    revoke.addEventListener("click", () => void send("ais-revoke", { groupId: tab.groupId }).then(refresh));
+    return h("div", { class: "grant" }, h("div", { class: "sub" }, "This tab group is granted to ", h("strong", {}, g.session.label), "."), h("div", { class: "row-actions" }, revoke));
+  }
+  const title = h("div", { class: "grant-title" }, "Let an agent use this group");
+  if (g.candidates.length === 0) return h("div", { class: "grant" }, title, h("p", { class: "empty" }, "No active agent sessions to grant it to."));
+  if (!g.candidates.some(c => c.id === pickedSession)) pickedSession = g.candidates[0]!.id;
+  const select = h("select", { "aria-label": "Agent session" }, ...g.candidates.map(c => h("option", { value: c.id }, c.label)));
+  select.value = pickedSession;
+  select.addEventListener("change", () => { pickedSession = select.value; });
+  const grant = h("button", { type: "button", class: "small primary-small" }, "Grant");
+  grant.addEventListener("click", () => {
+    grantError = "";
+    void send("ais-grant", { groupId: tab.groupId, sessionId: pickedSession }).then(r => { const e = (r as { error?: string } | undefined)?.error; if (e) grantError = GRANT_ERRORS[e] ?? "Could not grant access."; }).then(refresh);
+  });
+  const err = h("p", { class: "banner bad", role: "alert" }, grantError);
+  err.hidden = grantError === "";
+  return h("div", { class: "grant" }, title, h("p", { class: "hint" }, "The agent can use and open tabs in it. It cannot rename or close the group."), h("div", { class: "grant-form" }, select, grant), err);
+}
+
+function thisTabCard(s: PanelStatus, tab: ActiveTab | undefined): HTMLElement {
+  const using = sessionsForTab(s.sessions, tab, s.paused);
+  const body = using.length
+    ? h("ul", { class: "sessions" }, ...using.map(t => tabSessionRow(t, s.paused, tab)))
+    : h("p", { class: "empty" }, "No agent is using this tab.");
+  const controls = groupControls(s, tab);
+  return h("section", { class: "card", id: "this-tab" }, h("h2", {}, using.length ? `This tab (${using.length})` : "This tab"), body, ...(controls ? [controls] : []));
 }
 
 /** Sign-in form state. The panel re-renders on a timer, so the form is built once and only patched afterwards. */
@@ -101,7 +157,7 @@ function signInCard(v: View): HTMLElement {
   return h("section", { id: "signin-card", class: "card hero idle" }, h("h1", {}, v.title), h("p", {}, v.text), h("label", { class: "field" }, h("span", {}, "AIS address"), input), hint, error, h("div", { class: "actions" }, button));
 }
 
-export function render(s: PanelStatus, root: HTMLElement, chip: HTMLElement): void {
+export function render(s: PanelStatus, root: HTMLElement, chip: HTMLElement, tab: ActiveTab | undefined = activeTab): void {
   const v = viewFor(s);
   chip.textContent = v.chip;
   chip.className = `chip ${v.tone === "idle" ? "" : v.tone}${v.busy ? " busy" : ""}`.trim();
@@ -120,16 +176,13 @@ export function render(s: PanelStatus, root: HTMLElement, chip: HTMLElement): vo
   }));
   const hero = h("section", { class: `card hero ${v.tone}` }, h("h1", {}, v.title), h("p", {}, v.text), actions);
 
-  const out: HTMLElement[] = [hero];
+  const out: HTMLElement[] = [];
   if (s.signedIn) {
+    out.push(thisTabCard(s, tab), hero);
     out.push(h("section", { class: "card" }, h("h2", {}, "Binding"), h("dl", { class: "kv" },
       h("dt", {}, "Name"), h("dd", {}, s.binding ?? "unknown"),
       h("dt", {}, "Bound to"), h("dd", {}, targetText(s.target)),
       h("dt", {}, "Profile"), h("dd", {}, s.profileLabel ?? "Chrome profile"))));
-    const list = s.sessions.length
-      ? h("ul", { class: "sessions" }, ...s.sessions.map(sessionRow))
-      : h("p", { class: "empty" }, "No agent sessions yet. They appear here when an agent opens a tab.");
-    out.push(h("section", { class: "card" }, h("h2", {}, `Agent sessions (${s.sessions.length})`), list));
     const foot = h("div", { class: "foot" });
     if (s.status !== "disconnected") {
       const d = h("button", { type: "button", class: "quiet" }, "Disconnect");
@@ -144,7 +197,15 @@ export function render(s: PanelStatus, root: HTMLElement, chip: HTMLElement): vo
   root.replaceChildren(...out);
 }
 
+async function readActiveTab(): Promise<void> {
+  try {
+    const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+    activeTab = t?.id === undefined ? undefined : { id: t.id, groupId: t.groupId ?? -1 };
+  } catch { activeTab = undefined; }
+}
+
 async function refresh(): Promise<void> {
+  await readActiveTab();
   if (!form.loaded) {
     form.loaded = true;
     const saved = (await chrome.storage.local.get([KEYS.consoleUrl]))[KEYS.consoleUrl];
@@ -157,5 +218,14 @@ async function refresh(): Promise<void> {
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   void refresh();
   chrome.storage.onChanged.addListener(() => void refresh());
+  // The tab under the panel changes without any storage write: follow tabs, groups and window focus.
+  chrome.tabs.onActivated.addListener(() => void refresh());
+  chrome.tabs.onUpdated.addListener((_id, info) => { if (info.status !== undefined || info.groupId !== undefined || info.url !== undefined) void refresh(); });
+  chrome.tabs.onAttached.addListener(() => void refresh());
+  chrome.tabs.onRemoved.addListener(() => void refresh());
+  chrome.tabGroups?.onUpdated.addListener(() => void refresh());
+  chrome.tabGroups?.onRemoved.addListener(() => void refresh());
+  chrome.windows.onFocusChanged.addListener(() => void refresh());
+  // The worker pushes nothing, so session state (controlling now, pause) comes from the poll below.
   setInterval(() => { if (!document.hidden) void refresh(); }, 1500); // sessions live in the worker, not in storage
 }

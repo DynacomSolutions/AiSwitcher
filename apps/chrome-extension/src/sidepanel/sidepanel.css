@@ -67,3 +67,15 @@ button:disabled { opacity: .55; cursor: default; transform: none; }
 .hint { margin: 6px 0 0; color: var(--muted); font-size: 12.5px; }
 .banner { margin: 10px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 13px; font-weight: 550; line-height: 1.45; }
 .banner.bad { background: var(--bad-bg); color: var(--bad); border: 1px solid color-mix(in srgb, var(--bad) 30%, transparent); }
+.sessions li.tab-row { grid-template-columns: 4px 1fr auto; padding-right: 10px; }
+.use { font-weight: 600; }
+.use.controlling { color: var(--ok); }
+.row-actions { display: flex; gap: 6px; }
+button.small { font-size: 12px; padding: 4px 10px; border-radius: 8px; }
+.grant { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+.grant-title { font-weight: 600; }
+.grant-form { display: flex; gap: 8px; }
+select { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 7px 10px; flex: 1; min-width: 0; }
+select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary-small { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.grant .hint { margin: 0; } .grant .banner { margin: 0; }

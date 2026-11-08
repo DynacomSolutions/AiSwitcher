@@ -124,7 +124,8 @@ test("token read from --config-dir without env", async () => {
   const c = contextFromEnv({}, parseShimArgs(["browser", "mcp", "--config-dir", d, "--identity", "work", "--gateway", "http://gw"]));
   expect(await c.token()).toBe("tok-from-file");
   expect(await c.gatewayUrl()).toBe("http://gw");
-  expect(c.session.label.startsWith("work / ")).toBe(true);
+  expect(c.session.label).not.toContain("work"); // no identity in the label
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "sess-123456", AIS_SESSION_NAME: "  Fix   login  " }, parseShimArgs(["browser", "mcp", "--identity", "work"])).session.label).toBe("Fix login");
   rmSync(d, { recursive: true });
 });
 
@@ -152,8 +153,8 @@ test("pool mode resolves the active member per call, stable session id, clear mi
   await go();
   expect(seen.map((s) => s.auth)).toEqual(["Bearer tok-a", "Bearer tok-b"]);
   expect(seen.map((s) => s.body.session)).toEqual([
-    { id: "sess-123456", identity: "a", label: "a / sess-123456" },
-    { id: "sess-123456", identity: "b", label: "b / sess-123456" },
+    { id: "sess-123456", identity: "a", label: "sess-123456" },
+    { id: "sess-123456", identity: "b", label: "sess-123456" },
   ]);
   write("c");
   const r = await go();
@@ -183,7 +184,14 @@ test("parseShimArgs reads --pool and --tool", () => {
 test("session label keeps 6 chars for UUIDs and up to 12 for named sessions", async () => {
   const { contextFromEnv } = await import("../../src/browser/mcp-shim.ts");
   const uuid = "3f2a9c1e-1111-4222-8333-444455556666";
-  expect(contextFromEnv({ CLAUDE_SESSION_ID: uuid }, { identity: "work" }).session.label).toBe("work / 3f2a9c");
-  expect(contextFromEnv({ CLAUDE_SESSION_ID: "live-proof" }, { identity: "work" }).session.label).toBe("work / live-proof");
-  expect(contextFromEnv({ CLAUDE_SESSION_ID: "a-very-long-session-id" }, { identity: "work" }).session.label).toBe("work / a-very-long-");
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: uuid }, { identity: "work" }).session.label).toBe("3f2a9c");
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "live-proof" }, { identity: "work" }).session.label).toBe("live-proof");
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "a-very-long-session-id" }, { identity: "work" }).session.label).toBe("a-very-long-");
+});
+
+test("without an agent session id the session id is stable across shim respawns", async () => {
+  const { contextFromEnv } = await import("../../src/browser/mcp-shim.ts");
+  const a = contextFromEnv({}, { identity: "work" }).session.id;
+  expect(contextFromEnv({}, { identity: "work" }).session.id).toBe(a);
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "abc" }, { identity: "work" }).session.id).toBe("abc");
 });

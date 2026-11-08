@@ -207,3 +207,10 @@ ETA: 2026-11-08 12:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 149 | Console image pulls Debian security updates so Trivy passes | in_progress | claude | console-zlib-cve | | 2026-11-08 12:00 ICT | .cluster "AIS console image" Trivy fails on zlib1g CVE-2026-76844 and CVE-2026-85091 (fixed in deb13u1) since 2026-11-07.<br>Prod console missed PR #409 because of it.<br>Fix: apt-get upgrade in the final stage. |
+
+## 10. Side panel: sessions on the current tab
+ETA: 2026-11-08 18:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 154 | Side panel shows only the agent sessions using the current tab, with Pause/Stop/Resume; tab group title is the session name | done | claude | sidepanel-current-tab | | 2026-11-08 18:00 ICT | Empty state "No agent is using this tab."<br>Session name from AIS_SESSION_NAME, else the short session id; never the identity.<br>Same PR: agents never foreground a tab (tabs.create was active:true, bringToFront used tabs.update active); one tab group per session (concurrent first calls raced, shim random session id per spawn).<br>Also: owner can grant one of their own tab groups to a session (side panel Grant/Revoke; no rename/close).<br>Tests: tab to session mapping, grants, groups, background sequence, shim and gateway labels. |

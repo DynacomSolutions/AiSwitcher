@@ -39,6 +39,10 @@ async function connect(): Promise<void> {
 }
 
 state.onChange(paused => connection.sendState(paused));
+// Stop ends every grant: the user takes the groups back.
+state.onStop(() => tabs.revokeAll());
+// A granted group the user closed or dissolved is no longer granted.
+chrome.tabGroups.onRemoved.addListener(() => { void tabs.pruneGrants(); });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (KEYS.token in changes || KEYS.gatewayUrl in changes)) void connect();
@@ -53,6 +57,9 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
 async function panelStatus(): Promise<PanelStatus> {
+  tabs.expireIdle();
+  await tabs.pruneGrants();
+  const attached = new Set(executor.attachedTabIds());
   const s = await loadSettings(api.storage);
   return {
     status: disconnected && s.token ? "disconnected" : connection.status,
@@ -62,7 +69,10 @@ async function panelStatus(): Promise<PanelStatus> {
     ...(s.binding ? { binding: s.binding } : {}),
     ...(s.target ? { target: s.target } : {}),
     ...(s.profileLabel ? { profileLabel: s.profileLabel } : {}),
-    sessions: [...tabs.sessions].map(([id, t]) => ({ id, identity: t.identity, label: t.label, tabs: t.tabIds.size, color: hexForIdentity(t.identity), group: colorForIdentity(t.identity) })),
+    sessions: [...tabs.sessions].map(([id, t]) => ({
+      id, identity: t.identity, label: t.label, tabs: t.tabIds.size, color: hexForIdentity(t.identity), group: colorForIdentity(t.identity),
+      groupId: t.groupId, tabIds: [...t.tabIds], controlledTabIds: ui.markedTabs(id), attachedTabIds: [...t.tabIds].filter(x => attached.has(x)), grantedGroupIds: tabs.grantedGroups(id),
+    })),
   };
 }
 
@@ -71,7 +81,7 @@ const startup = Promise.all([state.load(), api.storage.get([DISCONNECTED_KEY]).t
 // Keeps the worker (and thus the socket) honest after Chrome suspends it. Waits for the startup load so it never races it.
 chrome.alarms.create("ais-keepalive", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(() => {
-  void startup.then(async () => { if (connection.needsRestart()) await connect(); });
+  void startup.then(async () => { tabs.expireIdle(); if (connection.needsRestart()) await connect(); });
 });
 
 // Control messages from the side panel and the in-page Stop button (see messages.ts for who may send what).
@@ -85,4 +95,6 @@ chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMess
     await connect();
   },
   isMarked: tabId => ui.has(tabId),
+  grant: (groupId, sessionId) => tabs.grant(groupId, sessionId),
+  revoke: async groupId => { tabs.revoke(groupId); },
 }));

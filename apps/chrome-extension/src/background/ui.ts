@@ -85,6 +85,11 @@ export class OverlayUi implements Ui {
 
   has(tabId: number): boolean { return this.marked.has(tabId); }
 
+  /** Tabs currently marked as controlled by the given session. */
+  markedTabs(sessionId: string): number[] {
+    return [...this.marked].filter(([, s]) => s.id === sessionId).map(([id]) => id);
+  }
+
   /** `inject` allows a first-time content script injection; `wanted` is re-checked after it so a concurrent unmark wins. */
   private async run(tabId: number, method: string, arg: unknown, inject = true, wanted: () => boolean = () => true): Promise<unknown> {
     try {

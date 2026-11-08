@@ -12,7 +12,7 @@ export interface ElementTarget extends TabArgs { ref?: string; coordinate?: Coor
 
 export interface ToolArgs {
   tabs_context: Record<string, never>;
-  tabs_create: { url?: string };
+  tabs_create: { url?: string; groupId?: number };
   adopt_tab: TabArgs;
   navigate: TabArgs & { url: string };
   screenshot: TabArgs;
@@ -56,8 +56,8 @@ function obj(properties: Record<string, JsonSchema>, required: string[] = []): J
 }
 
 export const TOOL_SCHEMAS: Record<ExtensionTool, { description: string; inputSchema: JsonSchema }> = {
-  tabs_context: { description: "List the tabs this session owns (actionable) and the user's other tabs (read-only, adopt with adopt_tab).", inputSchema: obj({}) },
-  tabs_create: { description: "Open a new tab in this session's tab group and return its tabId.", inputSchema: obj({ url: { type: "string", description: "Optional URL to open." } }) },
+  tabs_context: { description: "List the tabs this session owns or was granted (actionable; scope own or granted) and the user's other tabs (read-only, adopt with adopt_tab).", inputSchema: obj({}) },
+  tabs_create: { description: "Open a new tab in this session's tab group and return its tabId. Pass groupId to open it inside a tab group the user granted to this session instead.", inputSchema: obj({ url: { type: "string", description: "Optional URL to open." }, groupId: { type: "number", description: "Optional id of a granted group (see grantedGroups in tabs_context)." } }) },
   adopt_tab: { description: "Move one of the user's tabs into this session's tab group so it can be controlled.", inputSchema: obj({ tabId }, ["tabId"]) },
   navigate: { description: "Navigate a tab to a URL, or go \"back\" or \"forward\" in its history.", inputSchema: obj({ tabId, url: { type: "string", description: "http(s) URL, or the literal \"back\" or \"forward\"." } }, ["tabId", "url"]) },
   screenshot: { description: "Capture a JPEG screenshot of the tab viewport, scaled to at most 1568 px on the long edge. Coordinates passed to click, hover and scroll are in this image's pixel space.", inputSchema: obj({ tabId }, ["tabId"]) },
