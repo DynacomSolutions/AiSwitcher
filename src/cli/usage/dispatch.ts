@@ -65,7 +65,7 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
       throw new CliUsageError("Usage: ais usage service install");
     }
     const result = await installUsageCollectorService();
-    console.log(`usage service ${result.changed ? "installed" : "already current"}: ${result.path}`);
+    console.log(`usage service ${result.changed ? "installed" : "already current"}: ${result.path} (disk cap ${result.ioCap}/s)`);
     console.log("The unit is enabled and active.");
     return;
   }

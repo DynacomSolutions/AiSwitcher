@@ -2,10 +2,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { nativeTokscaleSupportsCheckpoints } from "./tokscale-build.ts";
 
 export const USAGE_COLLECTOR_SERVICE_NAME = "ais-usage-snapshot.service";
 
-export const USAGE_COLLECTOR_UNIT = `[Unit]
+/** Disk cap when the installed Tokscale checkpoints its message cache: a cold export that the
+ * timeout kills keeps its progress, so it finishes across cycles even this slowly. */
+export const USAGE_COLLECTOR_IO_CAP = "5M";
+/** Disk cap while the installed Tokscale is an older or unstamped build: without checkpoints a
+ * cold export of a large identity could never finish within the timeout at 5M. */
+export const USAGE_COLLECTOR_FALLBACK_IO_CAP = "20M";
+
+export function usageCollectorUnit(ioCap: string = USAGE_COLLECTOR_IO_CAP): string {
+  return `[Unit]
 Description=AiProfileSwitcher usage snapshot collector
 
 [Service]
@@ -19,12 +28,16 @@ MemoryMax=12G
 MemorySwapMax=512M
 CPUQuota=400%
 # Backstop: blk-throttle caps the disk holding the cache, so a regression cannot starve other services.
-IOReadBandwidthMax=%h 20M
-IOWriteBandwidthMax=%h 20M
+# 5 MB/s needs a Tokscale that checkpoints its cache (a cold export then finishes across cycles); else 20 MB/s.
+IOReadBandwidthMax=%h ${ioCap}
+IOWriteBandwidthMax=%h ${ioCap}
 
 [Install]
 WantedBy=default.target
 `;
+}
+
+export const USAGE_COLLECTOR_UNIT = usageCollectorUnit();
 
 export interface UsageCollectorServiceOptions {
   /** Unit directory override for isolated tests. */
@@ -41,6 +54,8 @@ export interface UsageCollectorServiceOptions {
   restartIfActive?: boolean;
   /** Platform override for isolated tests. */
   platform?: NodeJS.Platform;
+  /** Whether the installed Tokscale checkpoints its message cache (picks the disk cap). */
+  checkpointSupport?: () => Promise<boolean>;
 }
 
 export interface FullInstallServiceOptions {
@@ -49,12 +64,12 @@ export interface FullInstallServiceOptions {
   aisBinaryChanged?: boolean;
   checkEntrypoint?: (aisPath: string) => Promise<boolean>;
   hasManager?: () => Promise<boolean>;
-  install?: (aisPath: string, aisBinaryChanged: boolean) => Promise<{ path: string; changed: boolean }>;
+  install?: (aisPath: string, aisBinaryChanged: boolean) => Promise<{ path: string; changed: boolean; ioCap: string }>;
 }
 
 export type FullInstallServiceResult =
   | { status: "not-linux" | "unsupported-entrypoint" | "no-user-manager" }
-  | { status: "installed" | "verified"; path: string; changed: boolean };
+  | { status: "installed" | "verified"; path: string; changed: boolean; ioCap: string };
 
 async function checkInstalledEntrypoint(aisPath: string): Promise<boolean> {
   try {
@@ -212,7 +227,7 @@ export async function configureUsageCollectorServiceForFullInstall(
 /** Atomically installs, verifies, enables, and starts the per-user service. */
 export async function installUsageCollectorService(
   options: UsageCollectorServiceOptions = {},
-): Promise<{ path: string; changed: boolean }> {
+): Promise<{ path: string; changed: boolean; ioCap: string }> {
   if ((options.platform ?? process.platform) !== "linux") {
     throw new Error("usage collector service installation is available on Linux only");
   }
@@ -225,17 +240,21 @@ export async function installUsageCollectorService(
     throw new Error(`installed AIS at ${aisPath} does not support the usage snapshot daemon`);
   }
 
+  const checkpoints = await (options.checkpointSupport ?? nativeTokscaleSupportsCheckpoints)().catch(() => false);
+  const ioCap = checkpoints ? USAGE_COLLECTOR_IO_CAP : USAGE_COLLECTOR_FALLBACK_IO_CAP;
+  const unit = usageCollectorUnit(ioCap);
+
   await mkdir(unitDirectory, { recursive: true });
   const path = join(unitDirectory, USAGE_COLLECTOR_SERVICE_NAME);
   const current = await readFile(path, "utf8").catch(() => undefined);
   const currentMode = await stat(path).then((info) => info.mode & 0o777, () => undefined);
-  const changed = current !== USAGE_COLLECTOR_UNIT || currentMode !== 0o644;
+  const changed = current !== unit || currentMode !== 0o644;
 
   if (changed) {
     const temporaryDirectory = await mkdtemp(join(unitDirectory, ".ais-usage-service-"));
     const temporaryPath = join(temporaryDirectory, USAGE_COLLECTOR_SERVICE_NAME);
     try {
-      await writeFile(temporaryPath, USAGE_COLLECTOR_UNIT, { encoding: "utf8", mode: 0o644 });
+      await writeFile(temporaryPath, unit, { encoding: "utf8", mode: 0o644 });
       await chmod(temporaryPath, 0o644);
       await rename(temporaryPath, path);
     } finally {
@@ -244,7 +263,7 @@ export async function installUsageCollectorService(
   }
 
   const verified = await readFile(path, "utf8");
-  if (verified !== USAGE_COLLECTOR_UNIT) {
+  if (verified !== unit) {
     throw new Error(`installed usage collector unit did not verify at ${path}`);
   }
   await (options.reloadAndVerify ?? reloadAndVerifyUserUnit)(USAGE_COLLECTOR_SERVICE_NAME);
@@ -252,5 +271,5 @@ export async function installUsageCollectorService(
     USAGE_COLLECTOR_SERVICE_NAME,
     changed || (options.restartIfActive ?? false),
   );
-  return { path, changed };
+  return { path, changed, ioCap };
 }

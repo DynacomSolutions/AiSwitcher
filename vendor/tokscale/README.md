@@ -5,7 +5,7 @@ This patch targets the unmodified `junhoyeo/tokscale` v4.20.0 release archive
 `73376cdde65268d18de5d319d8cad416d3370101201284f50d573430058dc533`). The
 upstream licence is preserved in `LICENSE`.
 
-The patch adds three AIS-only surfaces:
+The patches add these AIS-only surfaces:
 
 - A successful local native parse writes a complete JSON batch atomically when
   both `TOKSCALE_AIS_EXPORT_PATH` and `TOKSCALE_AIS_PARTITION_ID` are set. The
@@ -139,13 +139,34 @@ The patch adds three AIS-only surfaces:
   unreferenced session is never looked up. An entry written before this
   change is rebuilt once.
 
+- `TOKSCALE_AIS_CHECKPOINT_SECS=<n>` commits the message cache during a long
+  scan (`patches/v4.20.0-ais-checkpoint.patch`). Upstream wrote the cache
+  once, after every source was parsed, so a cold scan killed by AIS's export
+  timeout (a new host or identity, or a deleted cache, under the collector's
+  5 MB/s disk cap) lost everything and every later cycle repeated the same
+  failing scan. The Claude and Codex lanes now parse their sources in chunks
+  of 64 and, once at least `n` seconds and four times the previous
+  checkpoint's own duration have passed, write the entries parsed so far with
+  the normal locked, atomic per-shard save. A killed scan keeps what it
+  committed; the next one reads those sources as cache hits and continues.
+  The messages, and the order they are merged in, are unchanged, so totals
+  equal one uninterrupted cold scan. A checkpoint never publishes
+  `.ais-scope-seeded`: only the final save has looked up every entry a seed
+  must carry. The export batch is still written only when the scan completes,
+  so a killed scan never publishes partial data. One source is never split,
+  so a single transcript must still parse within the timeout. A scan killed
+  in the middle of a shard write leaves a `.<shard>.<pid>.<nanos>.tmp` file;
+  the next save of that scoped namespace removes such files (and stale seed
+  marker temp files) once they are an hour old, under the cache lock.
+
 The AIS adapter's per-partition capture uses `--client <tool>` plus that
 identity's native parser root, clears additive extra roots and isolates
 Tokscale settings. It appends `--json` to the returned client arguments and
 sets the attempt-unique export path and opaque partition key, sets the
 message-cache scope to a hash of the tool and the scanned source directory
 (so a renamed identity keeps its cache; a scope no live source uses and no
-export has used for 30 days is swept), and enables the stat-only warm cache. For default
+export has used for 30 days is swept), enables the stat-only warm cache and
+asks for a cache checkpoint at most every 120 seconds. For default
 OpenCode it points `XDG_DATA_HOME` at the exact default profile's data root.
 Z.ai and Alibaba are unsupported for native batch capture and remain
 explicitly outside this coverage.
@@ -157,7 +178,47 @@ bash scripts/build-tokscale-ais.sh
 ```
 
 The helper downloads only the pinned release archive, verifies its checksum and
-licence, applies `patches/v4.20.0-ais.patch`, `patches/v4.20.0-ais-io.patch`, `patches/v4.20.0-ais-scope.patch`, `patches/v4.20.0-ais-segments.patch` and then `patches/v4.20.0-ais-grok.patch`, and installs to
+licence, applies the patches in the order `patches/series` lists them
+(`v4.20.0-ais.patch`, `-ais-io`, `-ais-scope`, `-ais-segments`, `-ais-grok`, then
+`-ais-checkpoint`), runs the patch tests, and installs to
 `$AIS_TOKSCALE_SHARED_BIN` or `~/.ais/cache/usage/native-tokscale/tokscale`.
 Pass an absolute output path as its first argument to build elsewhere. It
 removes its temporary source and build tree after completion.
+
+Before it builds, the helper copies itself and `patches/` into its scratch
+tree; it applies the patches from that copy and stamps from it, so a commit
+that lands during a long build is never recorded against this binary. Next to
+the binary it writes `<binary>.ais-build`: the pinned release, the SHA-256 of
+every patch in series order, the helper's own SHA-256 and the SHA-256 of the
+file it staged (`src/cli/usage/tokscale-build.ts`). Replacing the binary and
+writing the stamp happen under `flock <binary>.lock`, the old stamp removed
+first and the new one written last, so a stamp never describes an older
+binary, and a binary another build swapped in fails the hash check. A failed
+build leaves the previous binary and stamp alone.
+
+A full install (`bun run install:shims`) compares the stamp with the checkout
+and runs this helper under `nice -n 19` and `ionice -c 3` when the stamp is
+missing, differs, or no longer matches the binary's bytes. The usage collector
+unit gets its 5 MB/s disk cap only when the stamp verifies and lists
+`v4.20.0-ais-checkpoint.patch`; otherwise it keeps 20 MB/s, because without
+checkpoints a cold export of a large identity cannot finish under 5 MB/s.
+`ais usage service install` applies the same check. A failed rebuild is
+reported as a warning and the host keeps its previous binary and 20 MB/s. The
+failure is recorded in `<binary>.ais-build-failed` with the patch set, the
+toolchain (`cargo --version`, `rustc -V`) and the time; the same patch set and
+toolchain are retried after 24 h, a changed patch set or toolchain at once, and
+`AIS_TOKSCALE_FORCE_REBUILD=1` forces a retry. A missing tool (exit 2) is not
+recorded. The download gives up after 30 s to connect or 600 s in all, the
+whole build is killed (with its process group) after 90 min, and the wait for
+`<binary>.lock` is limited to 600 s. A Ctrl-C, TERM or hangup of the installer
+stops the build's process group the same way (TERM, then KILL after the grace
+period) before the installer exits. Each build holds an flock on its scratch
+tree's `.lock` for its whole life, and first removes trees of earlier builds
+whose lock is free (trees without a lock, from older helpers, by pid). A tree
+is claimed by renaming it before deletion, so concurrent sweeps never fail a
+build. The toolchain probe runs with `RUSTUP_AUTO_INSTALL=0` and a 30 s limit.
+
+`rust-toolchain.toml` here is a copy of the release's own pin (the helper
+`cmp`s it against the archive). The failure record's toolchain identity probes
+`cargo` and `rustc` with `RUSTUP_TOOLCHAIN` set to that channel, the toolchain
+the build really uses.

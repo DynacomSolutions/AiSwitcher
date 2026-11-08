@@ -14,6 +14,8 @@ import {
   tokscaleSpawnTimeoutMs,
   tokscaleTimeoutMessage,
   DEFAULT_TOKSCALE_SPAWN_TIMEOUT_MS,
+  DEFAULT_TOKSCALE_EXPORT_TIMEOUT_MS,
+  TOKSCALE_EXPORT_CHECKPOINT_SECS,
   runAisTokscaleExportInvocation,
   spawnTokscaleProcess,
   terminateTokscaleProcess,
@@ -130,6 +132,20 @@ describe("AIS native export cache seeding", () => {
     }, { AIS_TOKSCALE_SHARED_BIN: command });
     expect(invocation?.env.TOKSCALE_AIS_STAT_ONLY_CACHE).toBe("1");
     expect(invocation?.env.TOKSCALE_CONFIG_DIR).toContain("/usage/native-tokscale/isolated-config");
+  });
+
+  test("asks the patched exporter to checkpoint its message cache well inside the export timeout", async () => {
+    const dir = await makeConfigDir();
+    const command = join(dir, "fake-tokscale");
+    await writeFile(command, "#!/bin/sh\nexit 0\n");
+    await chmod(command, 0o700);
+    const invocation = await buildAisTokscaleExportInvocation({
+      toolName: "codex", identity: identity("/identity/codex"),
+      partitionId: "d".repeat(64), exportPath: join(dir, "candidate.json"),
+    }, { AIS_TOKSCALE_SHARED_BIN: command });
+    const seconds = Number(invocation?.env.TOKSCALE_AIS_CHECKPOINT_SECS);
+    expect(seconds).toBe(TOKSCALE_EXPORT_CHECKPOINT_SECS);
+    expect(seconds * 1000 * 5).toBeLessThan(DEFAULT_TOKSCALE_EXPORT_TIMEOUT_MS);
   });
 
   test("scopes the message cache to the partition so an export loads only its own entries", async () => {

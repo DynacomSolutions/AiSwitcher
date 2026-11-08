@@ -5,7 +5,9 @@ import { runBackup } from "./backup.ts";
 import { aisManifestPath } from "../src/shared/ais-home.ts";
 import {
   configureUsageCollectorServiceForFullInstall,
+  USAGE_COLLECTOR_IO_CAP,
 } from "../src/cli/usage/collector-service.ts";
+import { ensureNativeTokscale, TOKSCALE_FORCE_REBUILD_ENV, type NativeTokscaleResult } from "../src/cli/usage/tokscale-build.ts";
 import { installLocalGatewayService } from "../src/cli/gateway/local-service.ts";
 import { describeProfileSyncServiceResult, installProfileSyncService } from "../src/sync/profile-sync-service.ts";
 
@@ -58,6 +60,15 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
   const profileSync = describeProfileSyncServiceResult(await installProfileSyncService({ restartIfActive: aisBinaryChanged }));
   if (profileSync) console.error(`install: ${profileSync.warn ? "warning: " : ""}${profileSync.line}`);
 
+  // The collector's 5 MB/s disk cap needs a Tokscale that checkpoints its cache; rebuild it first
+  // when this checkout's patch set differs from the installed build. A failure keeps the old binary.
+  const native = await ensureNativeTokscale({ repoRoot: REPO_ROOT }).catch((error): NativeTokscaleResult => ({
+    status: "failed",
+    reason: "missing",
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  console.error(describeNativeTokscaleResult(native));
+
   const aisPath = join(homedir(), ".local", "bin", "ais");
   const result = await configureUsageCollectorServiceForFullInstall({ aisPath, aisBinaryChanged });
   if (result.status === "unsupported-entrypoint") {
@@ -70,6 +81,11 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
     );
   } else if (result.status === "installed" || result.status === "verified") {
     console.error(`install: usage collector service ${result.status}: ${result.path}`);
+    console.error(
+      result.ioCap === USAGE_COLLECTOR_IO_CAP
+        ? `install: usage collector disk cap ${result.ioCap}/s (Tokscale checkpoints its cache).`
+        : `install: warning: usage collector disk cap kept at ${result.ioCap}/s: the installed Tokscale does not checkpoint its cache.`,
+    );
     console.error("install: usage collector service is enabled and active.");
   }
   // The local gateway failover proxy rides the same binary: restart it when the binary changed, install it when missing.
@@ -80,6 +96,21 @@ async function configureUsageCollectorService(aisBinaryChanged: boolean): Promis
     } catch (err) {
       console.error(`install: gateway local service skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+}
+
+const REPO_ROOT = join(import.meta.dir, "..");
+
+export function describeNativeTokscaleResult(result: NativeTokscaleResult): string {
+  switch (result.status) {
+    case "current":
+      return "install: AIS-patched Tokscale is current.";
+    case "rebuilt":
+      return `install: AIS-patched Tokscale rebuilt (${result.reason === "missing" ? "no build stamp" : "patch set changed"}).`;
+    case "failed":
+      return `install: warning: AIS-patched Tokscale rebuild failed, previous binary kept: ${result.error}`;
+    case "skipped":
+      return `install: warning: AIS-patched Tokscale is not current and its build of this patch set failed within the last day with this toolchain; retried after 24 h (set ${TOKSCALE_FORCE_REBUILD_ENV}=1 to retry now).`;
   }
 }
 
