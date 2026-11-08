@@ -326,6 +326,56 @@ describe("OAuth refresher outcomes", () => {
     expect(status.lastDetail).toBe("refreshed after re-login");
   });
 
+  describe("stale revoked pin after a re-login", () => {
+    const revoke = async (fp: () => string | undefined, refresher: Parameters<typeof makeScheduler>[0]) => {
+      const stateHome = await tempStateHome();
+      const identities: Identity[] = [{ name: "personal", label: "personal", configDir: "/tmp/ali-personal" }];
+      const scheduler = new AuthRefreshScheduler(0, { ali: refresher }, async () => identities, stateHome, 24, async () => fp());
+      return scheduler;
+    };
+
+    test("a skip tick clears the pin when the grant fingerprint changed", async () => {
+      let current: string | undefined = "fp-old";
+      let revoking = true;
+      const scheduler = await revoke(() => current, async () => {
+        if (revoking) throw new OAuthRefreshError("refresh token revoked", true, "fp-old");
+        return { skipped: true, detail: "login is owned by the cluster gateway - not refreshed here" };
+      });
+      await scheduler.refreshNow("ali", "personal");
+      expect(scheduler.status()[0]!.revoked).toBe(true);
+      revoking = false;
+      current = "fp-new";
+      await scheduler.tick();
+      const status = scheduler.status()[0]!;
+      expect(status.revoked).toBe(false);
+      expect(status.lastError).toBeNull();
+      expect(status.consecutiveFailures).toBe(0);
+    });
+
+    test("the same fingerprint stays revoked, also through reconcileStale", async () => {
+      const scheduler = await revoke(() => "fp-old", async () => {
+        throw new OAuthRefreshError("refresh token revoked", true, "fp-old");
+      });
+      await scheduler.refreshNow("ali", "personal");
+      await scheduler.reconcileStale();
+      expect(scheduler.status()[0]!.revoked).toBe(true);
+      expect(scheduler.status()[0]!.consecutiveFailures).toBe(1);
+    });
+
+    test("reconcileStale clears a stale pin without a tick", async () => {
+      let current = "fp-old";
+      const scheduler = await revoke(() => current, async () => {
+        throw new OAuthRefreshError("refresh token revoked", true, "fp-old");
+      });
+      await scheduler.refreshNow("ali", "personal");
+      current = "fp-new";
+      await scheduler.reconcileStale();
+      const status = scheduler.status()[0]!;
+      expect(status.revoked).toBe(false);
+      expect(status.lastError).toBeNull();
+    });
+  });
+
   test("undefined is still a failure, string a success with detail", async () => {
     const { scheduler } = await makeScheduler(async () => undefined);
     expect(await scheduler.refreshNow("ali", "personal")).toBe(false);
