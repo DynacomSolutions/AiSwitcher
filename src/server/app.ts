@@ -370,7 +370,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
 
   /* ----------------------- credential refresh scheduler -------------------- */
 
-  app.get("/api/auth/refresh", (c) => c.json({ results: deps.authRefresh?.status() ?? [] }));
+  app.get("/api/auth/refresh", async (c) => c.json({ results: await freshRefreshStatus(deps.authRefresh) }));
 
   app.post("/api/auth/refresh", async (c) => {
     if (!deps.authRefresh) return c.json({ error: "refresh scheduler not running" }, 503);
