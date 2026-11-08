@@ -260,7 +260,7 @@ async function probePi(configDir: string): Promise<ProbeResult> {
   if (expiry === undefined) {
     return { kind: "oauth", state: "ok", detail: "auth.json present (no parsable expiry)", fixable: ["login"] };
   }
-  const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
+  const derived = stateFromExpiry(expiry);
   return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry), ...(derived.selfRefreshing ? { selfRefreshing: true } : {}) };
 }
 
@@ -275,7 +275,7 @@ async function probeOpencode(configDir: string): Promise<ProbeResult> {
     if (expiry === undefined) {
       return { kind: "oauth", state: "ok", detail: "auth.json present (no parsable expiry)", fixable: ["login"] };
     }
-    const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
+    const derived = stateFromExpiry(expiry);
     return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry), ...(derived.selfRefreshing ? { selfRefreshing: true } : {}) };
   }
   return { kind: "oauth", state: "missing", detail: "no auth.json under this identity's opencode data dir", fixable: ["login"] };
@@ -350,14 +350,21 @@ export async function authStatus(
         result = { kind: "none", state: "unknown", detail: err instanceof Error ? err.message : "probe failed", fixable: [] };
       }
       const refresh = refreshStatus.find((entry) => entry.tool === cfg.toolName && entry.identity === identity.name);
-      // A failing refresher means the short-lived token is not self-healing.
-      const state = result.selfRefreshing && refresh?.lastError ? "expiring" : result.state;
+      // A revoked or failing refresher means the short-lived token is not self-healing.
+      const refresherUnhealthy = !!refresh && (refresh.revoked || !!refresh.lastError || refresh.consecutiveFailures > 0);
+      const state = result.selfRefreshing && refresherUnhealthy ? "expiring" : result.state;
+      const detail =
+        result.selfRefreshing && refresh?.revoked
+          ? "refresh token revoked: re-login required"
+          : result.selfRefreshing && refresherUnhealthy
+            ? `${result.detail?.replace(" (auto-refreshed)", "") ?? "token expiring"} (refresh failing)`
+            : result.detail;
       entries.push({
         toolName: cfg.toolName,
         identity: identity.name,
         kind: result.kind,
         state,
-        ...(result.detail ? { detail: result.detail } : {}),
+        ...(detail ? { detail } : {}),
         fixable: result.fixable,
         ...(result.expiresAt ? { expiresAt: result.expiresAt } : {}),
         ...(refresh?.lastSuccessAt ? { lastRefreshAt: refresh.lastSuccessAt } : {}),
