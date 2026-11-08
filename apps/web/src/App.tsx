@@ -3,6 +3,7 @@ import { Route, Routes } from "react-router-dom";
 import { AppShell } from "@/components/layout/app-shell";
 import { AuthPage } from "@/pages/auth";
 import { BreakdownPage } from "@/pages/breakdown";
+import { BrowsersPage } from "@/pages/browsers";
 import { DashboardPage } from "@/pages/dashboard";
 import { FilesPage } from "@/pages/files";
 import { IdentitiesPage } from "@/pages/identities";
@@ -26,6 +27,7 @@ export function AppRoutes() {
         <Route path="breakdown" element={<BreakdownPage />} />
         <Route path="sessions" element={<SessionsPage />} />
         <Route path="auth" element={<AuthPage />} />
+        <Route path="browsers" element={<BrowsersPage />} />
         <Route path="permissions" element={<PermissionsPage />} />
         <Route path="files" element={<FilesPage />} />
         <Route path="*" element={<NotFoundPage />} />

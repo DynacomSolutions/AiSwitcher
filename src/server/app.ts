@@ -28,6 +28,7 @@ import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.t
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
 import { mountBrowserAuthorize, type BrowserAuthConfig } from "./browser-authorize.ts";
+import { loadBrowserBindings, revokeBrowserBinding, type BrowserBindingsView } from "./browser-bindings.ts";
 
 import {
   createIdentityInRegistry,
@@ -78,6 +79,10 @@ export interface ConsoleAppDeps extends GuardDeps {
   poolsUsage?: () => Promise<PoolsUsageResponse>;
   /** Extension sign-in page config (gateway URLs and admin token); absent answers /browser/authorize with 503. */
   browserAuth?: BrowserAuthConfig;
+  /** Test seam for GET /api/browsers; defaults to the gateway admin API. */
+  browserBindings?: () => Promise<BrowserBindingsView>;
+  /** Test seam for POST /api/browsers/:name/revoke; defaults to the gateway admin API. */
+  browserRevoke?: (name: string) => Promise<{ ok: true }>;
   /** Online-probe cache file for the default localModels; tests inject a temp path. */
   onlineCachePath?: string;
 }
@@ -146,6 +151,16 @@ export function createApp(deps: ConsoleAppDeps): Hono {
     if (!deps.herdrBridge) throw new HttpError(503, "herdr bridge scheduler not running");
     return c.json(deps.herdrBridge.status());
   });
+
+  /* ------------------------------ AIS Browser ------------------------------ */
+
+  // Connected extensions, read from the gateway admin API server-side so the admin token never reaches the page.
+  // "configured: false" when this process has no admin URL and token.
+  app.get("/api/browsers", async (c) => c.json(await (deps.browserBindings ?? loadBrowserBindings)()));
+  // Mutating, so consoleGuard already demands X-AIS-Console and a loopback or allowed Host.
+  app.post("/api/browsers/:name/revoke", async (c) =>
+    c.json(await (deps.browserRevoke ?? ((name) => revokeBrowserBinding(name)))(decodeSegment(c.req.param("name")))),
+  );
 
   /* ----------------------------- claude swap pools -------------------------- */
 
