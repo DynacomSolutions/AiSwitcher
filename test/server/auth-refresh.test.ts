@@ -390,3 +390,41 @@ describe("OAuth refresher outcomes", () => {
     expect(parseRefreshExpiryWindowHours("12")).toBe(12);
   });
 });
+
+describe("stale revoked pin: races and partial reads", () => {
+  test("a pin made while the fingerprint read is in flight survives", async () => {
+    const stateHome = await tempStateHome();
+    const identities: Identity[] = [{ name: "personal", label: "personal", configDir: "/tmp/ali-personal" }];
+    let revokeWith = "fp-old";
+    let release!: () => void;
+    let blocking = false;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const scheduler = new AuthRefreshScheduler(
+      0,
+      {
+        ali: async () => {
+          throw new OAuthRefreshError("refresh token revoked", true, revokeWith);
+        },
+      },
+      async () => identities,
+      stateHome,
+      24,
+      async () => {
+        if (blocking) await gate;
+        return "fp-new";
+      },
+    );
+    await scheduler.refreshNow("ali", "personal"); // pins fp-old
+    blocking = true;
+    const stale = scheduler.reconcileStale(); // reads "fp-new" after the gate
+    await Bun.sleep(5);
+    blocking = false;
+    revokeWith = "fp-newer";
+    await scheduler.refreshNow("ali", "personal"); // pins fp-newer meanwhile
+    release();
+    await stale;
+    const status = scheduler.status()[0]!;
+    expect(status.revoked).toBe(true);
+    expect(status.lastError).toContain("revoked");
+  });
+});

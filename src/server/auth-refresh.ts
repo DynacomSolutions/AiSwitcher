@@ -11,7 +11,7 @@ import {
   refreshIdentityOAuthGrant,
   type RefreshableTool,
 } from "../identities/oauth-refresh.ts";
-import { grantFingerprint } from "../identities/oauth-reconcile.ts";
+import { grantFingerprint, withReadErrorProbe } from "../identities/oauth-reconcile.ts";
 import { isRetired } from "../identities/retired.ts";
 import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
@@ -100,7 +100,11 @@ const OAUTH_TOOLS: ReadonlySet<string> = new Set(["codex", "claude", "grok", "ki
 async function currentGrantFingerprint(tool: string, identity: Identity): Promise<string | undefined> {
   if (!OAUTH_TOOLS.has(tool)) return undefined;
   try {
-    const found = await readEffectiveGrant(tool as RefreshableTool, identity);
+    // A store that exists but cannot be read may hide the newer grant, so a
+    // partial read must never be taken as "the grant changed".
+    const probed = await withReadErrorProbe(() => readEffectiveGrant(tool as RefreshableTool, identity));
+    if (probed.readFailed) return undefined;
+    const found = probed.value;
     return found?.grant.refresh_token ? grantFingerprint(found.grant) : undefined;
   } catch {
     return undefined;
@@ -308,9 +312,12 @@ export class AuthRefreshScheduler {
    * diagnosis and the failure state that came with it. Runs on every path,
    * including skips (gateway-managed members always skip locally). */
   private async clearIfSuperseded(entry: RefreshEntry, identity: Identity): Promise<boolean> {
-    if (entry.revokedFingerprint === null) return false;
+    const pinned = entry.revokedFingerprint;
+    if (pinned === null) return false;
     const current = await this.fingerprintOf(entry.tool, identity);
-    if (current === undefined || current === entry.revokedFingerprint) return false;
+    // The read is async: a failure pinned meanwhile (a new fingerprint) is
+    // newer than what we compared against and must survive.
+    if (current === undefined || current === pinned || entry.revokedFingerprint !== pinned) return false;
     entry.revokedFingerprint = null;
     entry.lastError = null;
     entry.consecutiveFailures = 0;
