@@ -147,13 +147,27 @@ async function readFailedBuild(path: string): Promise<FailedBuildRecord | undefi
   }
 }
 
-async function commandLine(command: string[], env: Record<string, string> = {}): Promise<string> {
+/** Probes run with a short limit: a wedged rustup must not hang an install. */
+export const TOKSCALE_TOOLCHAIN_PROBE_TIMEOUT_MS = 30_000;
+
+async function commandLine(command: string[], env: Record<string, string> = {}, timeoutMs = TOKSCALE_TOOLCHAIN_PROBE_TIMEOUT_MS): Promise<string> {
+  let child;
   try {
-    const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: { ...process.env, ...env } });
-    const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-    return code === 0 ? out.trim() : `${command[0]}: exit ${code}`;
+    child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: { ...process.env, ...env } });
   } catch {
     return `${command[0]}: unavailable`;
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, timeoutMs);
+  try {
+    const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    if (timedOut) return `${command[0]}: timed out`;
+    return code === 0 ? out.trim() : `${command[0]}: exit ${code}`;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -172,10 +186,12 @@ export async function pinnedTokscaleToolchain(repoRoot: string): Promise<string 
 /** What the build depends on outside the checkout: a new Rust toolchain may
  * fix a build that failed with the old one. Probes the toolchain the build
  * really uses (rustup honours the archive's pin), not the default one. */
-export async function tokscaleToolchainId(repoRoot?: string): Promise<string> {
+export async function tokscaleToolchainId(repoRoot?: string, options: { timeoutMs?: number } = {}): Promise<string> {
   const channel = repoRoot ? await pinnedTokscaleToolchain(repoRoot) : undefined;
-  const env: Record<string, string> = channel ? { RUSTUP_TOOLCHAIN: channel } : {};
-  return `${channel ? `pin ${channel}; ` : ""}${await commandLine(["cargo", "--version"], env)}; ${await commandLine(["rustc", "-V"], env)}`;
+  // Only ask: a pinned channel that is not installed must not be downloaded here.
+  const env: Record<string, string> = { RUSTUP_AUTO_INSTALL: "0", ...(channel ? { RUSTUP_TOOLCHAIN: channel } : {}) };
+  const probe = (command: string[]) => commandLine(command, env, options.timeoutMs);
+  return `${channel ? `pin ${channel}; ` : ""}${await probe(["cargo", "--version"])}; ${await probe(["rustc", "-V"])}`;
 }
 
 export interface EnsureNativeTokscaleOptions {

@@ -10,6 +10,7 @@ import {
   installedTokscaleBuild,
   runTokscaleBuildHelper,
   tokscaleToolchainId,
+  TOKSCALE_TOOLCHAIN_PROBE_TIMEOUT_MS,
   TOKSCALE_FAILED_BUILD_BACKOFF_MS,
   nativeTokscaleSupportsCheckpoints,
   TOKSCALE_CHECKPOINT_PATCH,
@@ -510,4 +511,124 @@ test("the toolchain id probes the Rust channel the pinned release builds with", 
   expect((await helperShell(`check_toolchain_pin "$CHECKOUT" "$SRC"`, { CHECKOUT: repoRoot, SRC: archiveDir })).code).toBe(0);
   await writeFile(join(archiveDir, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.99.0"\n');
   expect((await helperShell(`check_toolchain_pin "$CHECKOUT" "$SRC" >/dev/null`, { CHECKOUT: repoRoot, SRC: archiveDir })).code).not.toBe(0);
+});
+
+// ---- Final re-check: concurrent sweeps, cross-namespace builds, bounded toolchain probe ----
+
+async function deadPid(): Promise<number> {
+  const finished = Bun.spawn(["true"]);
+  await finished.exited;
+  return finished.pid;
+}
+
+async function listing(dir: string): Promise<string[]> {
+  return (await Array.fromAsync(new Bun.Glob("*").scan({ cwd: dir, onlyFiles: false, dot: true }))).sort();
+}
+
+test("two builds sweeping the same dead tree both carry on", async () => {
+  const { root } = await fixture();
+  const base = join(root, "build-base");
+  for (let round = 0; round < 5; round++) {
+    const tree = join(base, `tokscale-v4.20.0-${await deadPid()}`);
+    for (let i = 0; i < 50; i++) await mkdir(join(tree, "source", `d${i}`), { recursive: true });
+    const runs = await Promise.all([1, 2, 3].map(() => helperShell(`sweep_stale_build_dirs "$BASE"`, { BASE: base })));
+    expect(runs.map((run) => run.code)).toEqual([0, 0, 0]);
+    expect(await listing(base)).toEqual([]);
+  }
+}, 30_000);
+
+test("a tree whose build holds its lock is kept even when its pid is not visible here", async () => {
+  const { root } = await fixture();
+  const base = join(root, "build-base");
+  // A build in another pid namespace: its pid means nothing here, its lock does.
+  const foreign = join(base, `tokscale-v4.20.0-${await deadPid()}`);
+  await mkdir(join(foreign, "source"), { recursive: true });
+  await writeFile(join(foreign, ".lock"), "");
+  // A finished build whose pid happens to be a live process here: its lock is free.
+  const finished = join(base, `tokscale-v4.20.0-${process.pid}`);
+  await mkdir(join(finished, "source"), { recursive: true });
+  await writeFile(join(finished, ".lock"), "");
+
+  // (flock's child keeps the lock until it exits, so let it finish rather than kill flock.)
+  const holder = Bun.spawn(["flock", join(foreign, ".lock"), "sleep", "1.5"], { stdout: "ignore", stderr: "ignore" });
+  await Bun.sleep(200);
+  expect((await helperShell(`sweep_stale_build_dirs "$BASE"`, { BASE: base })).code).toBe(0);
+  expect(await listing(base)).toEqual([foreign.split("/").pop()!]);
+  await holder.exited;
+  expect((await helperShell(`sweep_stale_build_dirs "$BASE"`, { BASE: base })).code).toBe(0);
+  expect(await listing(base)).toEqual([]);
+}, 30_000);
+
+test("a dead tree named after this build's own pid is swept, and the build's tree is created locked", async () => {
+  const { root } = await fixture();
+  const base = join(root, "build-base");
+  await mkdir(base, { recursive: true });
+  const run = await helperShell(`
+    mkdir -p "$BASE/tokscale-v4.20.0-$$/source"
+    sweep_stale_build_dirs "$BASE"
+    create_build_root "$BASE"
+    [[ "$build_root" == "$BASE/tokscale-v4.20.0-$$" && -d "$build_root" && ! -e "$build_root/source" ]]
+    if flock -n "$build_root/.lock" true; then echo unlocked; else echo locked; fi
+    ls -A "$BASE"
+  `, { BASE: base });
+  expect(run.stderr).toBe("");
+  expect(run.code).toBe(0);
+});
+
+test("create_build_root leaves its tree locked for the build's life and no pending tree behind", async () => {
+  const { root } = await fixture();
+  const base = join(root, "build-base");
+  await mkdir(base, { recursive: true });
+  const child = Bun.spawn(["bash", "-c", `set -euo pipefail; source "$HELPER"; create_build_root "$BASE"; echo "$build_root"; sleep 3`], {
+    env: { ...process.env, PATH: `${BUN_DIR}:${process.env.PATH ?? ""}`, HELPER: REAL_HELPER, BASE: base },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    const reader = child.stdout.getReader();
+    const { value } = await reader.read();
+    const tree = new TextDecoder().decode(value).trim();
+    expect(await listing(base)).toEqual([tree.split("/").pop()!]);
+    // While the build lives, a sweep (even one that cannot see its pid) leaves it alone.
+    const probe = Bun.spawn(["flock", "-n", join(tree, ".lock"), "true"]);
+    expect(await probe.exited).not.toBe(0);
+    expect((await helperShell(`sweep_stale_build_dirs "$BASE"`, { BASE: base })).code).toBe(0);
+    expect(await listing(base)).toEqual([tree.split("/").pop()!]);
+  } finally {
+    child.kill("SIGKILL");
+    await child.exited;
+  }
+}, 30_000);
+
+test("the toolchain probe never auto-installs and gives up on a wedged rustup", async () => {
+  expect(TOKSCALE_TOOLCHAIN_PROBE_TIMEOUT_MS).toBe(30_000);
+  const { root } = await fixture();
+  const bin = join(root, "fake-bin");
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, "cargo"), `#!/bin/sh\necho "cargo auto-install=\${RUSTUP_AUTO_INSTALL:-unset}"\n`, { mode: 0o755 });
+  // A rustup proxy stuck downloading the pinned toolchain.
+  await writeFile(join(bin, "rustc"), "#!/bin/sh\nexec sleep 60\n", { mode: 0o755 });
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  try {
+    const started = Date.now();
+    const id = await tokscaleToolchainId(repoRoot, { timeoutMs: 500 });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(id).toContain("cargo auto-install=0");
+    expect(id).toContain("rustc: timed out");
+  } finally {
+    process.env.PATH = previous;
+  }
+}, 30_000);
+
+test("a pin mismatch explains why the pins must match", async () => {
+  const { root } = await fixture();
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+  const archiveDir = join(root, "archive");
+  await mkdir(archiveDir, { recursive: true });
+  await writeFile(join(archiveDir, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.99.0"\n');
+  const run = await helperShell(`check_toolchain_pin "$CHECKOUT" "$SRC" >/dev/null`, { CHECKOUT: repoRoot, SRC: archiveDir });
+  expect(run.code).not.toBe(0);
+  expect(run.stderr).toContain("must name the toolchain the build uses");
 });

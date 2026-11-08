@@ -29,20 +29,50 @@ download_source() {
     "$source_url" --output "$archive"
 }
 
+# Create this build's scratch tree and hold an flock on <tree>/.lock for the
+# whole build (the fd stays open until the script exits, and cargo inherits
+# it). The tree is set up under a dot name and renamed into place with the lock
+# already held, so a sweep never sees it unlocked. Sets build_root.
+create_build_root() {
+  local build_base=$1 pending
+  build_root="$build_base/tokscale-v4.20.0-$$"
+  pending="$build_base/.tokscale-v4.20.0-$$.new"
+  if [[ -e "$build_root" || -L "$build_root" ]]; then
+    printf 'build scratch path already exists: %s\n' "$build_root" >&2
+    exit 1
+  fi
+  rm -rf -- "$pending"
+  mkdir -- "$pending"
+  exec {build_lock_fd}>"$pending/.lock"
+  flock -n "$build_lock_fd" || { printf 'could not lock %s\n' "$pending/.lock" >&2; exit 1; }
+  mv -T -- "$pending" "$build_root"
+}
+
 # Remove scratch trees of builds that were killed before their EXIT trap
-# finished (for example by the installer's timeout). A tree is named after its
-# build's pid; it is removed only when that pid is no longer running.
+# finished (for example by the installer's timeout). A live build holds
+# <tree>/.lock, which works across pid namespaces (a shared or bind-mounted
+# cache); a tree is removed only when that lock is free. Trees from builds that
+# predate the lock fall back to their pid, which is only meaningful in this
+# namespace. A tree is claimed by renaming it first, so two sweeps of the same
+# tree never both try to delete it, and nothing here can fail the build.
 sweep_stale_build_dirs() {
-  local build_base=$1 dir name pid
+  local build_base=$1 dir name pid claimed
   for dir in "$build_base"/tokscale-v*-*; do
     [[ -d "$dir" && ! -L "$dir" ]] || continue
     name=${dir##*/}
     [[ "$name" =~ ^tokscale-v[0-9.]+-([0-9]+)$ ]] || continue
     pid=${BASH_REMATCH[1]}
-    [[ "$pid" != "$$" ]] || continue
-    kill -0 "$pid" 2>/dev/null && continue
-    [[ -d "/proc/$pid" ]] && continue
-    rm -r -- "$dir"
+    if [[ -e "$dir/.lock" ]]; then
+      flock -n "$dir/.lock" true 2>/dev/null || continue
+    elif [[ "$pid" != "$$" ]]; then
+      # (A tree named after this shell's own pid is a dead build whose pid was
+      # reused: this build has not created its tree yet.)
+      kill -0 "$pid" 2>/dev/null && continue
+      [[ -d "/proc/$pid" ]] && continue
+    fi
+    claimed="$build_base/.$name.sweep.$$"
+    mv -T -- "$dir" "$claimed" 2>/dev/null || continue
+    rm -rf -- "$claimed" 2>/dev/null || true
   done
 }
 
@@ -50,7 +80,10 @@ sweep_stale_build_dirs() {
 # vendored copy is what the installer probes, so it must match.
 check_toolchain_pin() {
   local checkout=$1 source_dir=$2
-  cmp -- "$checkout/vendor/tokscale/rust-toolchain.toml" "$source_dir/rust-toolchain.toml"
+  cmp -- "$checkout/vendor/tokscale/rust-toolchain.toml" "$source_dir/rust-toolchain.toml" || {
+    printf 'vendor/tokscale/rust-toolchain.toml differs from the release archive pin: copy the archive file there. The installer probes the vendored pin to tell when a new toolchain may fix a failed build, so it must name the toolchain the build uses.\n' >&2
+    return 1
+  }
 }
 
 # Apply the snapshot's patches in the order its series lists them.
@@ -114,12 +147,7 @@ main() {
   fi
   mkdir -p "$build_base"
   sweep_stale_build_dirs "$build_base"
-  build_root="$build_base/tokscale-v4.20.0-$$"
-  if [[ -e "$build_root" || -L "$build_root" ]]; then
-    printf 'build scratch path already exists: %s\n' "$build_root" >&2
-    exit 1
-  fi
-  mkdir "$build_root"
+  create_build_root "$build_base"
   cleanup_build_root() {
     [[ -d "$build_root" && ! -L "$build_root" ]] || return 0
     rm -r -- "${build_base:?}/tokscale-v4.20.0-$$"

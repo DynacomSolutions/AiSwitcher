@@ -212,8 +212,11 @@ recorded. The download gives up after 30 s to connect or 600 s in all, the
 whole build is killed (with its process group) after 90 min, and the wait for
 `<binary>.lock` is limited to 600 s. A Ctrl-C, TERM or hangup of the installer
 stops the build's process group the same way (TERM, then KILL after the grace
-period) before the installer exits. Each build first removes scratch trees of
-earlier builds whose pid is no longer running.
+period) before the installer exits. Each build holds an flock on its scratch
+tree's `.lock` for its whole life, and first removes trees of earlier builds
+whose lock is free (trees without a lock, from older helpers, by pid). A tree
+is claimed by renaming it before deletion, so concurrent sweeps never fail a
+build. The toolchain probe runs with `RUSTUP_AUTO_INSTALL=0` and a 30 s limit.
 
 `rust-toolchain.toml` here is a copy of the release's own pin (the helper
 `cmp`s it against the archive). The failure record's toolchain identity probes
