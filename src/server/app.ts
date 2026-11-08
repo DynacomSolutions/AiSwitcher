@@ -12,7 +12,7 @@ import { discoverLocalModels, resolveLlamaRunner } from "../shared/local-models.
 import type { ToolConfig } from "../identities/types.ts";
 import { consoleGuard, type GuardDeps } from "./guard.ts";
 import { isAisLive } from "../shared/live-mode.ts";
-import { type AuthRefreshScheduler } from "./auth-refresh.ts";
+import { type AuthRefreshScheduler, type RefreshStatusDto } from "./auth-refresh.ts";
 import { type SpendGuardScheduler } from "./spend-guard.ts";
 import { type HerdrBridgeScheduler } from "./herdr-bridge.ts";
 import { claudeSchedulerView, type ClaudeSwapStatusDto } from "./claude-swap-auto.ts";
@@ -85,6 +85,13 @@ export interface ConsoleAppDeps extends GuardDeps {
   browserRevoke?: (name: string) => Promise<{ ok: true }>;
   /** Online-probe cache file for the default localModels; tests inject a temp path. */
   onlineCachePath?: string;
+}
+
+/** Refresh status with stale revoked pins dropped, so a re-login shows at once. */
+async function freshRefreshStatus(scheduler: AuthRefreshScheduler | undefined): Promise<RefreshStatusDto[]> {
+  if (!scheduler) return [];
+  await scheduler.reconcileStale().catch(() => undefined);
+  return scheduler.status();
 }
 
 export function createApp(deps: ConsoleAppDeps): Hono {
@@ -311,7 +318,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   /* ---------------------------------- auth --------------------------------- */
 
   app.get("/api/auth", async (c) =>
-    c.json(await authApi.authStatus(Object.values(TOOL_CONFIGS), deps.authRefresh?.status() ?? [])),
+    c.json(await authApi.authStatus(Object.values(TOOL_CONFIGS), await freshRefreshStatus(deps.authRefresh))),
   );
 
   app.post("/api/auth/zai-key", async (c) => {

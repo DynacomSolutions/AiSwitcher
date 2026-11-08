@@ -7,9 +7,11 @@ import { refreshAliAuthSession } from "../identities/auth-session.ts";
 import {
   DEFAULT_EXPIRY_WINDOW_HOURS,
   OAuthRefreshError,
+  readEffectiveGrant,
   refreshIdentityOAuthGrant,
   type RefreshableTool,
 } from "../identities/oauth-refresh.ts";
+import { grantFingerprint } from "../identities/oauth-reconcile.ts";
 import { isRetired } from "../identities/retired.ts";
 import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
@@ -90,6 +92,20 @@ const REFRESHERS: Record<string, Refresher> = {
   grok: oauthRefresherFor("grok"),
   kimi: oauthRefresherFor("kimi"),
 };
+
+const OAUTH_TOOLS: ReadonlySet<string> = new Set(["codex", "claude", "grok", "kimi"]);
+
+/** Fingerprint of the grant currently on disk for an identity (never a
+ * token), or undefined when the tool has no OAuth grant or none is stored. */
+async function currentGrantFingerprint(tool: string, identity: Identity): Promise<string | undefined> {
+  if (!OAUTH_TOOLS.has(tool)) return undefined;
+  try {
+    const found = await readEffectiveGrant(tool as RefreshableTool, identity);
+    return found?.grant.refresh_token ? grantFingerprint(found.grant) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export const DEFAULT_REFRESH_INTERVAL_MS = 10 * 60_000;
 
@@ -224,6 +240,8 @@ export class AuthRefreshScheduler {
     /** Proactive-refresh window for the OAuth refreshers (hours before
      * access-token expiry at which a refresh runs). */
     private readonly expiryWindowHours: number = parseRefreshExpiryWindowHours(process.env.AIS_AUTH_REFRESH_EXPIRY_HOURS),
+    /** Injectable so tests never read real credential stores. */
+    private readonly fingerprintOf: (tool: string, identity: Identity) => Promise<string | undefined> = currentGrantFingerprint,
   ) {
     if (this.intervalMs > 0 && this.intervalMs < 60_000) this.intervalMs = 60_000;
   }
@@ -285,6 +303,32 @@ export class AuthRefreshScheduler {
     return targets;
   }
 
+  /** A new login supersedes an old failure: when the grant on disk no longer
+   * matches the fingerprint a revoked diagnosis was pinned to, drop the
+   * diagnosis and the failure state that came with it. Runs on every path,
+   * including skips (gateway-managed members always skip locally). */
+  private async clearIfSuperseded(entry: RefreshEntry, identity: Identity): Promise<boolean> {
+    if (entry.revokedFingerprint === null) return false;
+    const current = await this.fingerprintOf(entry.tool, identity);
+    if (current === undefined || current === entry.revokedFingerprint) return false;
+    entry.revokedFingerprint = null;
+    entry.lastError = null;
+    entry.consecutiveFailures = 0;
+    return true;
+  }
+
+  /** Drops stale revoked pins for every known entry so status reflects the
+   * grant currently on disk (the portal calls this before reading status). */
+  async reconcileStale(): Promise<void> {
+    let changed = false;
+    for (const entry of this.entries.values()) {
+      if (entry.revokedFingerprint === null || this.inFlight.has(`${entry.tool}/${entry.identity}`)) continue;
+      const identity = (await this.listIdentities(entry.tool).catch(() => [])).find((candidate) => candidate.name === entry.identity);
+      if (identity && (await this.clearIfSuperseded(entry, identity))) changed = true;
+    }
+    if (changed) await this.persist();
+  }
+
   private async runOne(tool: string, identity: Identity, refresher: Refresher, context: RefresherContext): Promise<boolean> {
     const key = `${tool}/${identity.name}`;
     const existing = this.entries.get(key);
@@ -303,6 +347,7 @@ export class AuthRefreshScheduler {
     this.inFlight.add(key);
     let failed = false;
     try {
+      await this.clearIfSuperseded(entry, identity);
       const outcome = await refresher(identity, { ...context, lastSuccessAt: entry.lastSuccessAt, revokedFingerprint: entry.revokedFingerprint ?? undefined });
       if (outcome === undefined) {
         failed = true;
