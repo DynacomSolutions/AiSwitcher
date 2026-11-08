@@ -394,6 +394,9 @@ export async function writeGrantThroughStores(
   return { written, failed };
 }
 
+/** An expired kimi grant is renewed when the last successful refresh is older than this. */
+const KIMI_EXPIRED_RETRY_S = 2 * 3600;
+
 /** The refresh decision for the scheduler's cadence: refresh when the
  * access token is within `expiryWindowHours` of expiry, and at least once
  * a day even for long-lived tokens (so a healthy grant is still exercised
@@ -428,6 +431,12 @@ export function shouldAttemptOAuthRefresh(
     return { attempt: false, reason: `access token expires in ${(secondsLeft / 3600).toFixed(1)}h (window ${windowHours}h) — nothing to do` };
   }
   const last = options.lastSuccessAt !== null && options.lastSuccessAt !== undefined ? Date.parse(options.lastSuccessAt) : NaN;
+  // Safety net: kimi has no expiry window, so a recorded success must not hide an expired token for a whole day. An expired
+  // grant is renewed once the last success is older than KIMI_EXPIRED_RETRY_S (a ~15 minute token is expired most of the
+  // time while idle, so retrying every pass would rotate it 144 times a day).
+  if (options.tool === "kimi" && secondsLeft <= 0 && Number.isFinite(last) && now - last / 1000 > KIMI_EXPIRED_RETRY_S) {
+    return { attempt: true, reason: `access token expired ${Math.abs(secondsLeft / 3600).toFixed(1)}h ago and no successful refresh for over ${KIMI_EXPIRED_RETRY_S / 3600}h` };
+  }
   if (!Number.isFinite(last) || now - last / 1000 >= 86_400) {
     return { attempt: true, reason: "daily keep-alive (no successful refresh in 24h)" };
   }

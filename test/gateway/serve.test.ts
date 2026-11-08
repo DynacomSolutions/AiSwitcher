@@ -785,6 +785,18 @@ describe("keep-alive across every refreshable tool", () => {
     }
   });
 
+  test("a lastSuccessAt in the future, from the map or a minted estimate, is clamped to now", async () => {
+    const seenLast: Array<string | null | undefined> = [];
+    const refresh = (async (tool: string, id: { name: string }, o?: { lastSuccessAt?: string | null }) => {
+      seenLast.push(o?.lastSuccessAt);
+      return { tool, identity: id.name, outcome: "skipped-fresh", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    const at = new Date("2026-01-01T00:00:00Z");
+    const lastSuccess = new Map([["kimi/a", "2030-01-01T00:00:00.000Z"]]);
+    await keepAliveOnce({ refresh, accounts: async () => [member("a"), member("b")], tools: ["kimi"], lastSuccess, now: () => at, mintedAt: async (_t, acct) => (acct.name === "b" ? Math.floor(at.getTime() / 1000) + 5 * 86_400 : undefined), metrics: { keepAlive: () => {} } });
+    expect(seenLast).toEqual([at.toISOString(), at.toISOString()]);
+  });
+
   test("a same-named account in two tools keeps separate revoked marks", async () => {
     const seen: Array<string | undefined> = [];
     const refresh = (async (tool: string, id: { name: string }, opts?: { revokedFingerprint?: string }) => {

@@ -268,6 +268,14 @@ describe("shouldAttemptOAuthRefresh (scheduler cadence)", () => {
       expect(kimi(-600, recent).attempt).toBe(false);
       expect(kimi(60, old).attempt).toBe(true);
       expect(kimi(60, old).reason).toContain("daily keep-alive");
+      // An expiry-based safety net, bounded: expired with a success 3h ago refreshes; with one 1h ago it does not.
+      const threeHours = new Date((NOW - 3 * 3600) * 1000).toISOString();
+      expect(kimi(-600, threeHours).attempt).toBe(true);
+      expect(kimi(-600, threeHours).reason).toContain("expired");
+      expect(kimi(60, threeHours).attempt).toBe(false); // not expired: only the daily keep-alive applies
+      // A grant 5 days from expiry refreshes once 24h have passed.
+      expect(kimi(5 * 86_400, old).attempt).toBe(true);
+      expect(kimi(5 * 86_400, recent).attempt).toBe(false);
       expect(shouldAttemptOAuthRefresh({ access_token: "x", expires_at: NOW + 60 }, { tool: "kimi", force: true, lastSuccessAt: recent, nowSeconds: NOW }).attempt).toBe(true);
     });
 

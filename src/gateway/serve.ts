@@ -257,9 +257,10 @@ export async function grantMintedAt(tool: string, account: Identity): Promise<nu
   const found = await readEffectiveGrant(tool as RefreshableTool, account).catch(() => undefined);
   const g = found?.grant;
   if (!g) return undefined;
-  if (g.minted_at !== undefined) return g.minted_at;
+  const nowS = Math.floor(Date.now() / 1000);
+  if (g.minted_at !== undefined) return Math.min(g.minted_at, nowS);
   const life = ACCESS_TOKEN_LIFETIME_S[tool];
-  return g.expires_at !== undefined && life !== undefined ? g.expires_at - life : undefined;
+  return g.expires_at !== undefined && life !== undefined ? Math.min(g.expires_at - life, nowS) : undefined;
 }
 
 /** Writes the ownership heartbeat; a failure raises one alert (cleared by the next good write) and is counted. */
@@ -301,8 +302,12 @@ export async function keepAliveOnce(deps: {
       try {
         const known = revoked.get(key);
         const minted = await deps.mintedAt?.(tool, account).catch(() => undefined);
+        // A success can never lie in the future (clock skew, odd expiry maths): clamp every source to now.
+        const nowIso = now().toISOString();
+        const haveRaw = lastSuccess.get(key);
+        if (haveRaw && haveRaw > nowIso) lastSuccess.set(key, nowIso);
         if (minted !== undefined) {
-          const iso = new Date(minted * 1000).toISOString();
+          const iso = new Date(Math.min(minted * 1000, now().getTime())).toISOString();
           const have = lastSuccess.get(key);
           if (!have || have < iso) lastSuccess.set(key, iso);
         }
@@ -516,7 +521,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   // Seeded from the previous heartbeat so a restart does not rotate every codex and kimi login again at once.
   if (!hooks.noHeartbeat) {
     const prior = await readHeartbeat();
-    for (const [k, v] of Object.entries(prior?.held ?? {})) if (v.lastSuccessAt && !(lastSuccessAt.get(k) && lastSuccessAt.get(k)! >= v.lastSuccessAt)) lastSuccessAt.set(k, v.lastSuccessAt);
+    for (const [k, v] of Object.entries(prior?.held ?? {})) {
+      const seeded = v.lastSuccessAt && v.lastSuccessAt > now().toISOString() ? now().toISOString() : v.lastSuccessAt;
+      if (seeded && !(lastSuccessAt.get(k) && lastSuccessAt.get(k)! >= seeded)) lastSuccessAt.set(k, seeded);
+    }
   }
   let keepAliveRunning = false;
   let keepAliveRun: Promise<void> | undefined;
