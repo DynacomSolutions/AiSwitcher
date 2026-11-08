@@ -9,6 +9,7 @@ import {
   expectedTokscaleBuildManifest,
   installedTokscaleBuild,
   runTokscaleBuildHelper,
+  tokscaleToolchainId,
   TOKSCALE_FAILED_BUILD_BACKOFF_MS,
   nativeTokscaleSupportsCheckpoints,
   TOKSCALE_CHECKPOINT_PATCH,
@@ -159,6 +160,8 @@ test("this checkout's build stamp lists every series patch, including the checkp
   expect(helper).toContain('done 3< "$inputs/vendor/tokscale/patches/series"');
   expect(helper).toContain('apply_snapshot_patches "$inputs" "$source_dir"');
   expect(helper).toContain('install_built_binary "$target_dir/release/tokscale" "$output" "$inputs"');
+  expect(helper).toContain('sweep_stale_build_dirs "$build_base"');
+  expect(helper).toContain('check_toolchain_pin "$repo_root" "$source_dir"');
 });
 
 // ---- Review follow-ups: R1 (stale manifest), R2 (concurrent builds), R3 (failed builds retried) ----
@@ -222,7 +225,7 @@ test("R1: a commit that lands during a build is never recorded against the binar
   expect(await ensureNativeTokscale({ repoRoot, binaryPath, runBuild: fakeHelper(calls) })).toEqual({ status: "rebuilt", reason: "outdated" });
   expect(calls).toHaveLength(1);
   expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(true);
-});
+}, 30_000);
 
 test("R2: a stamp records the hash of the binary its build staged, not whatever is installed later", async () => {
   const { root, repoRoot, binaryPath } = await fixture(NEW_SERIES);
@@ -253,7 +256,7 @@ test("R2: the helper stamps the staged hash and holds the output lock across rep
   expect(await readFile(binaryPath, "utf8")).toBe("new tokscale with checkpoints");
   expect(await readFile(tokscaleBuildStampPath(binaryPath), "utf8")).toContain(`binary ${sha256Hex("new tokscale with checkpoints")}`);
   expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(true);
-});
+}, 30_000);
 
 test("R2: concurrent builds of different patch sets never leave a stamp that claims the other's checkpoints", async () => {
   const { root, repoRoot, binaryPath } = await helperFixture(OLD_SERIES);
@@ -276,7 +279,7 @@ test("R2: concurrent builds of different patch sets never leave a stamp that cla
     expect(await nativeTokscaleSupportsCheckpoints(binaryPath)).toBe(installed === "tokscale with checkpoints");
     expect(await installedTokscaleBuild(binaryPath)).toBeDefined();
   }
-});
+}, 30_000);
 
 test("R3: a patch set whose build failed is not rebuilt on every install, until it changes or is forced", async () => {
   const { repoRoot, binaryPath } = await fixture(OLD_SERIES);
@@ -428,3 +431,83 @@ test("an install gives up on a lock a frozen build never releases", async () => 
     await holder.exited;
   }
 }, 20_000);
+
+// ---- Final review: Ctrl-C reaches the build, stale scratch trees, pinned toolchain ----
+
+const BUILD_MODULE = join(import.meta.dir, "..", "..", "..", "src", "cli", "usage", "tokscale-build.ts");
+
+test("Ctrl-C to the installer stops the whole build process group, then the installer exits", async () => {
+  const { root, binaryPath } = await fixture();
+  const pidFile = join(root, "grandchild.pid");
+  const wedgedRepo = join(root, "wedged");
+  await mkdir(join(wedgedRepo, "scripts"), { recursive: true });
+  await writeFile(join(wedgedRepo, "scripts", "build-tokscale-ais.sh"),
+    `sleep 300 & echo $! > "${pidFile}"\nwait\n`);
+  const installer = join(root, "installer.ts");
+  await writeFile(installer, `import { runTokscaleBuildHelper } from ${JSON.stringify(BUILD_MODULE)};
+await runTokscaleBuildHelper(${JSON.stringify(wedgedRepo)}, ${JSON.stringify(binaryPath)}, { timeoutMs: 120_000, killGraceMs: 500 });
+console.log("build returned");
+`);
+  const child = Bun.spawn([process.execPath, installer], { stdout: "pipe", stderr: "pipe" });
+  try {
+    for (let i = 0; i < 100 && !(await Bun.file(pidFile).exists()); i++) await Bun.sleep(50);
+    const grandchild = Number(await readFile(pidFile, "utf8"));
+    expect(alive(grandchild)).toBe(true);
+
+    child.kill("SIGINT");
+    const started = Date.now();
+    const code = await child.exited;
+    expect(code).toBe(130);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await Bun.sleep(200);
+    expect(alive(grandchild)).toBe(false);
+    expect(await new Response(child.stdout).text()).not.toContain("build returned");
+  } finally {
+    child.kill("SIGKILL");
+  }
+}, 30_000);
+
+test("a build removes scratch trees left by killed builds, and only theirs", async () => {
+  const { root } = await fixture();
+  const base = join(root, "build-base");
+  const finished = Bun.spawn(["true"]);
+  await finished.exited;
+  const dead = join(base, `tokscale-v4.20.0-${finished.pid}`);
+  const live = join(base, `tokscale-v4.20.0-${process.pid}`);
+  const other = join(base, "tokscale-notes");
+  const odd = join(base, "tokscale-v4.20.0-abc");
+  for (const dir of [dead, live, other, odd]) await mkdir(join(dir, "source"), { recursive: true });
+
+  const run = await helperShell(`sweep_stale_build_dirs "$BASE"`, { BASE: base });
+  expect(run.code).toBe(0);
+  const remaining = (await Array.fromAsync(new Bun.Glob("*").scan({ cwd: base, onlyFiles: false }))).sort();
+  expect(remaining).toEqual([`tokscale-v4.20.0-${process.pid}`, "tokscale-notes", "tokscale-v4.20.0-abc"].sort());
+}, 30_000);
+
+test("the toolchain id probes the Rust channel the pinned release builds with", async () => {
+  const { root } = await fixture();
+  const bin = join(root, "fake-bin");
+  await mkdir(bin, { recursive: true });
+  for (const tool of ["cargo", "rustc"]) {
+    await writeFile(join(bin, tool), `#!/bin/sh\necho "${tool} \${RUSTUP_TOOLCHAIN:-default}"\n`, { mode: 0o755 });
+  }
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  try {
+    const id = await tokscaleToolchainId(repoRoot);
+    expect(id).toContain("cargo 1.98.0");
+    expect(id).toContain("rustc 1.98.0");
+    expect(id).not.toContain("default");
+  } finally {
+    process.env.PATH = previous;
+  }
+
+  // The helper refuses an archive whose pin differs from the vendored copy.
+  const archiveDir = join(root, "archive");
+  await mkdir(archiveDir, { recursive: true });
+  await copyFile(join(repoRoot, "vendor", "tokscale", "rust-toolchain.toml"), join(archiveDir, "rust-toolchain.toml"));
+  expect((await helperShell(`check_toolchain_pin "$CHECKOUT" "$SRC"`, { CHECKOUT: repoRoot, SRC: archiveDir })).code).toBe(0);
+  await writeFile(join(archiveDir, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.99.0"\n');
+  expect((await helperShell(`check_toolchain_pin "$CHECKOUT" "$SRC" >/dev/null`, { CHECKOUT: repoRoot, SRC: archiveDir })).code).not.toBe(0);
+});

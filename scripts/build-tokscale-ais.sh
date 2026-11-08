@@ -29,6 +29,30 @@ download_source() {
     "$source_url" --output "$archive"
 }
 
+# Remove scratch trees of builds that were killed before their EXIT trap
+# finished (for example by the installer's timeout). A tree is named after its
+# build's pid; it is removed only when that pid is no longer running.
+sweep_stale_build_dirs() {
+  local build_base=$1 dir name pid
+  for dir in "$build_base"/tokscale-v*-*; do
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    name=${dir##*/}
+    [[ "$name" =~ ^tokscale-v[0-9.]+-([0-9]+)$ ]] || continue
+    pid=${BASH_REMATCH[1]}
+    [[ "$pid" != "$$" ]] || continue
+    kill -0 "$pid" 2>/dev/null && continue
+    [[ -d "/proc/$pid" ]] && continue
+    rm -r -- "$dir"
+  done
+}
+
+# The archive builds with the Rust channel its rust-toolchain.toml pins; the
+# vendored copy is what the installer probes, so it must match.
+check_toolchain_pin() {
+  local checkout=$1 source_dir=$2
+  cmp -- "$checkout/vendor/tokscale/rust-toolchain.toml" "$source_dir/rust-toolchain.toml"
+}
+
 # Apply the snapshot's patches in the order its series lists them.
 apply_snapshot_patches() {
   local inputs=$1 source_dir=$2 patch_name
@@ -89,6 +113,7 @@ main() {
     exit 2
   fi
   mkdir -p "$build_base"
+  sweep_stale_build_dirs "$build_base"
   build_root="$build_base/tokscale-v4.20.0-$$"
   if [[ -e "$build_root" || -L "$build_root" ]]; then
     printf 'build scratch path already exists: %s\n' "$build_root" >&2
@@ -114,6 +139,7 @@ main() {
   mkdir "$source_dir"
   tar -xzf "$archive" --strip-components=1 -C "$source_dir"
   cmp -- "$repo_root/vendor/tokscale/LICENSE" "$source_dir/LICENSE"
+  check_toolchain_pin "$repo_root" "$source_dir"
   apply_snapshot_patches "$inputs" "$source_dir"
 
   (cd "$source_dir" && cargo test --locked --package tokscale-core --lib ais_shared_snapshot)

@@ -147,9 +147,9 @@ async function readFailedBuild(path: string): Promise<FailedBuildRecord | undefi
   }
 }
 
-async function commandLine(command: string[]): Promise<string> {
+async function commandLine(command: string[], env: Record<string, string> = {}): Promise<string> {
   try {
-    const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: { ...process.env, ...env } });
     const [code, out] = await Promise.all([child.exited, new Response(child.stdout).text()]);
     return code === 0 ? out.trim() : `${command[0]}: exit ${code}`;
   } catch {
@@ -157,10 +157,25 @@ async function commandLine(command: string[]): Promise<string> {
   }
 }
 
+/** The Rust channel the pinned Tokscale release builds with: its
+ * rust-toolchain.toml, vendored as `vendor/tokscale/rust-toolchain.toml`
+ * (the build helper checks the copy against the archive). */
+export async function pinnedTokscaleToolchain(repoRoot: string): Promise<string | undefined> {
+  try {
+    const text = await readFile(join(repoRoot, "vendor", "tokscale", "rust-toolchain.toml"), "utf8");
+    return /^\s*channel\s*=\s*"([^"]+)"/m.exec(text)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
 /** What the build depends on outside the checkout: a new Rust toolchain may
- * fix a build that failed with the old one. */
-export async function tokscaleToolchainId(): Promise<string> {
-  return `${await commandLine(["cargo", "--version"])}; ${await commandLine(["rustc", "-V"])}`;
+ * fix a build that failed with the old one. Probes the toolchain the build
+ * really uses (rustup honours the archive's pin), not the default one. */
+export async function tokscaleToolchainId(repoRoot?: string): Promise<string> {
+  const channel = repoRoot ? await pinnedTokscaleToolchain(repoRoot) : undefined;
+  const env: Record<string, string> = channel ? { RUSTUP_TOOLCHAIN: channel } : {};
+  return `${channel ? `pin ${channel}; ` : ""}${await commandLine(["cargo", "--version"], env)}; ${await commandLine(["rustc", "-V"], env)}`;
 }
 
 export interface EnsureNativeTokscaleOptions {
@@ -205,15 +220,36 @@ export async function runTokscaleBuildHelper(
       process.kill(setsid ? -child.pid : child.pid, signal);
     } catch { /* already gone */ }
   };
-  let timedOut = false;
+  const killGraceMs = options.killGraceMs ?? 10_000;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  /** TERM the whole build group, then KILL it after the grace period. */
+  const terminate = () => {
+    signalGroup("SIGTERM");
+    killTimer ??= setTimeout(() => signalGroup("SIGKILL"), killGraceMs);
+  };
+  let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    signalGroup("SIGTERM");
-    killTimer = setTimeout(() => signalGroup("SIGKILL"), options.killGraceMs ?? 10_000);
+    terminate();
   }, options.timeoutMs ?? TOKSCALE_BUILD_TIMEOUT_MS);
+  // The build has its own process group, so a Ctrl-C or hangup of the installer
+  // no longer reaches it. Forward it: stop the build the same way, then exit.
+  const exitCodes: Record<string, number> = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+  let interrupted: NodeJS.Signals | undefined;
+  const onSignal = (signal: NodeJS.Signals) => {
+    interrupted ??= signal;
+    terminate();
+  };
+  const forwarded = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  for (const signal of forwarded) process.on(signal, onSignal);
   try {
     const code = await child.exited;
+    if (interrupted) {
+      // The group got TERM (and KILL after the grace period, which is what
+      // ended a leader that ignored TERM); make sure nothing survives, then exit.
+      signalGroup("SIGKILL");
+      process.exit(exitCodes[interrupted] ?? 1);
+    }
     if (timedOut) {
       // The leader may exit on SIGTERM while a child ignores it.
       signalGroup("SIGKILL");
@@ -221,6 +257,7 @@ export async function runTokscaleBuildHelper(
     }
     return code;
   } finally {
+    for (const signal of forwarded) process.off(signal, onSignal);
     clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
   }
@@ -239,7 +276,7 @@ export async function ensureNativeTokscale(options: EnsureNativeTokscaleOptions)
   const failedPath = tokscaleFailedBuildPath(binaryPath);
   const force = options.force ?? process.env[TOKSCALE_FORCE_REBUILD_ENV] === "1";
   const now = options.now ?? Date.now;
-  const toolchain = await (options.toolchainId ?? tokscaleToolchainId)();
+  const toolchain = await (options.toolchainId ?? (() => tokscaleToolchainId(options.repoRoot)))();
   // A cold build compiles Tokscale and runs its tests. One that failed for this
   // patch set and toolchain is not repeated on every install, only once a day:
   // a broken patch fails again, a full disk or a network outage may not.

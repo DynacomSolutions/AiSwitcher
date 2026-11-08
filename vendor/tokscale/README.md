@@ -210,4 +210,12 @@ toolchain are retried after 24 h, a changed patch set or toolchain at once, and
 `AIS_TOKSCALE_FORCE_REBUILD=1` forces a retry. A missing tool (exit 2) is not
 recorded. The download gives up after 30 s to connect or 600 s in all, the
 whole build is killed (with its process group) after 90 min, and the wait for
-`<binary>.lock` is limited to 600 s.
+`<binary>.lock` is limited to 600 s. A Ctrl-C, TERM or hangup of the installer
+stops the build's process group the same way (TERM, then KILL after the grace
+period) before the installer exits. Each build first removes scratch trees of
+earlier builds whose pid is no longer running.
+
+`rust-toolchain.toml` here is a copy of the release's own pin (the helper
+`cmp`s it against the archive). The failure record's toolchain identity probes
+`cargo` and `rustc` with `RUSTUP_TOOLCHAIN` set to that channel, the toolchain
+the build really uses.
