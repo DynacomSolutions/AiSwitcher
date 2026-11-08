@@ -54,6 +54,25 @@ export function run(command: string[], cwd = process.cwd(), timeout = 120_000, e
   return result.stdout.toString();
 }
 
+/** True when a failed build step died on a transient download error (for example a GitHub 5xx). */
+export function isTransientDownloadError(message: string): boolean {
+  return /http status: 5\d\d|error returned status 5\d\d|timed out|connection (?:reset|refused|closed)/i.test(message);
+}
+
+/** Runs a packaging step, retrying only when the bundler's own tool download failed transiently. */
+export function runWithRetry(command: string[], cwd: string, timeout: number, attempts = 4, delayMs = 15_000, execute: typeof run = run): string {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return execute(command, cwd, timeout);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt >= attempts || !isTransientDownloadError(message)) throw error;
+      console.warn(`Transient download failure (attempt ${attempt}/${attempts}); retrying in ${delayMs / 1000}s.`);
+      Bun.sleepSync(delayMs * attempt);
+    }
+  }
+}
+
 export function payloadFiles(root: string): string[] {
   const result: string[] = [];
   const walk = (directory: string) => {

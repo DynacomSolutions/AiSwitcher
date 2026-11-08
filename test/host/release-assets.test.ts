@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { binaryTarget, checksums, components, digest, releaseFiles, validateTrustKey, validatePayloadNames, verifyChecksums, verifyPayload } from "../../scripts/host/release-assets";
+import { binaryTarget, checksums, components, digest, isTransientDownloadError, releaseFiles, runWithRetry, validateTrustKey, validatePayloadNames, verifyChecksums, verifyPayload } from "../../scripts/host/release-assets";
 
 describe("portable release contents", () => {
   test("identifies the architecture from bytes rather than filenames", () => {
@@ -88,5 +88,23 @@ describe("portable release contents", () => {
       writeFileSync(join(directory, "ais-host-helper.exe"), "SYNTHETIC_FIXTURE wrong architecture");
       expect(verify).toThrow();
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+});
+
+describe("transient download retry", () => {
+  test("recognises GitHub 5xx download failures only", () => {
+    expect(isTransientDownloadError("Error failed to bundle project: `http status: 504`")).toBe(true);
+    expect(isTransientDownloadError("error: could not compile `x`")).toBe(false);
+  });
+
+  test("retries a transient failure and rethrows permanent ones", () => {
+    let calls = 0;
+    const flaky = (() => { if (++calls < 3) throw new Error("http status: 504"); return "ok"; }) as unknown as typeof import("../../scripts/host/release-assets").run;
+    expect(runWithRetry(["x"], ".", 1, 4, 0, flaky)).toBe("ok");
+    expect(calls).toBe(3);
+    calls = 0;
+    const broken = (() => { calls++; throw new Error("compile error"); }) as unknown as typeof flaky;
+    expect(() => runWithRetry(["x"], ".", 1, 4, 0, broken)).toThrow("compile error");
+    expect(calls).toBe(1);
   });
 });
