@@ -303,7 +303,7 @@ export class CredentialCache {
     if (next.accessToken !== staleToken && !isGatewayAccessToken(next.accessToken)) return next;
     // Detail from the refresher may carry local paths: surface only a reason code.
     // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
-    const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" ? "refresh-failed" : "token-unchanged";
+    const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-read-error" ? "refresh-failed" : "token-unchanged";
     throw new GatewayCredentialError(code, provider, identity);
   }
 

@@ -121,6 +121,8 @@ function secondsFromMs(value: number): number {
 /** Out-parameter for store reads: set when a store existed but could not be read (EACCES, EIO, torn JSON). */
 interface ReadProbe {
   failed: boolean;
+  /** Files whose read failed (when the reader knew the path). */
+  paths: Set<string>;
 }
 const readProbe = new AsyncLocalStorage<ReadProbe>();
 
@@ -129,10 +131,10 @@ const readProbe = new AsyncLocalStorage<ReadProbe>();
  * Behaviour of the readers themselves is unchanged (they still answer "no copy"); callers that must tell
  * "logged out" from "could not read" use this.
  */
-export async function withReadErrorProbe<T>(fn: () => Promise<T>): Promise<{ value: T; readFailed: boolean }> {
-  const probe: ReadProbe = { failed: false };
+export async function withReadErrorProbe<T>(fn: () => Promise<T>): Promise<{ value: T; readFailed: boolean; failedPaths: string[] }> {
+  const probe: ReadProbe = { failed: false, paths: new Set() };
   const value = await readProbe.run(probe, fn);
-  return { value, readFailed: probe.failed };
+  return { value, readFailed: probe.failed, failedPaths: [...probe.paths] };
 }
 
 async function readJson(path: string): Promise<Record<string, unknown> | undefined> {
@@ -144,7 +146,7 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
   } catch (err) {
     // Unreadable or absent store: the reconcile sees "no copy", same as the
     // kimi-store readers. A store that exists but fails to read is recorded for probing callers.
-    recordReadFailure(err);
+    recordReadFailure(err, path);
   }
   return undefined;
 }
@@ -152,10 +154,12 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
 /** Marks the active read probe (if any) failed unless the error is plain
  * "file absent". Shared with the kimi store readers so every store layer
  * reports a torn or unreadable credentials file the same way. */
-export function recordReadFailure(err: unknown): void {
+export function recordReadFailure(err: unknown, path?: string): void {
   if ((err as { code?: unknown } | null)?.code === "ENOENT") return;
   const probe = readProbe.getStore();
-  if (probe) probe.failed = true;
+  if (!probe) return;
+  probe.failed = true;
+  if (path !== undefined) probe.paths.add(path);
 }
 
 /** Atomic rewrite, mode 0600, temp file + rename in the destination

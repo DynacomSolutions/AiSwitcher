@@ -90,6 +90,12 @@ export function instrumentRefresh(
       if (opts?.expectedAccessToken !== undefined) deps.failed?.set(key, opts.expectedAccessToken);
       deps.alerter.raise("refresh-failed", key, `refresh of the ${tool} login "${identity.name}" failed; it needs attention (ais auth login or ais auth refresh)`);
     };
+    /** A store could not be read: the login itself may be fine, but a person must look. Names the store class only. */
+    const readError = (stores: string[] | undefined, track = true): void => {
+      const which = stores && stores.length > 0 ? ` (${stores.join(", ")} store)` : "";
+      if (track && opts?.expectedAccessToken !== undefined) deps.failed?.set(key, opts.expectedAccessToken);
+      deps.alerter.raise("refresh-failed", key, `a credential store of the ${tool} login "${identity.name}" could not be read${which}; check the file's permissions and contents (the existing token stays in use)`);
+    };
     const ok = (): void => {
       deps.failed?.delete(key);
       deps.alerter.recover("refresh-failed", key);
@@ -98,6 +104,8 @@ export function instrumentRefresh(
       const result = await refresh(tool, identity, opts);
       deps.metrics.refresh(tool, result.outcome);
       if (result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-revoked") fail();
+      else if (result.outcome === "skipped-read-error") readError(result.unreadableStores);
+      else if (result.outcome === "refreshed" && result.unreadableStores && result.unreadableStores.length > 0) readError(result.unreadableStores, false);
       else if (result.outcome === "refreshed") ok();
       return result;
     } catch (err) {

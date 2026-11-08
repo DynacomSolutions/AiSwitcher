@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   grantFingerprint,
   jwtExpSeconds,
@@ -338,7 +338,7 @@ export async function writeGrantThroughStores(
   tool: RefreshableTool,
   identity: Identity,
   grant: OAuthGrant,
-  options: { entryKey?: string; piDir?: string; claudeRegistryPath?: string; poolRegistryPath?: string; locksHeld?: boolean; poolDirs?: string[] } = {},
+  options: { entryKey?: string; piDir?: string; claudeRegistryPath?: string; poolRegistryPath?: string; locksHeld?: boolean; poolDirs?: string[]; skipPaths?: ReadonlySet<string> } = {},
 ): Promise<WriteThroughReport> {
   const written: string[] = [];
   const failed: Array<{ path: string; error: string }> = [];
@@ -351,7 +351,7 @@ export async function writeGrantThroughStores(
       ...(grant.expires_at !== undefined ? { expires_at: grant.expires_at } : {}),
     };
     try {
-      await persistKimiCredentials(identity, "kimi", credentials);
+      await persistKimiCredentials(identity, "kimi", credentials, options.skipPaths);
       written.push("(kimi native + pi stores)");
     } catch (err) {
       failed.push({ path: "kimi stores", error: err instanceof Error ? err.message : String(err) });
@@ -360,14 +360,19 @@ export async function writeGrantThroughStores(
   }
 
   const backups = new Set<string>();
+  // A store whose read failed is never written over: a torn file would lose its other entries.
+  const skip = (path: string): boolean => options.skipPaths?.has(path) === true;
   try {
-    await writeProviderGrantCopy(tool, identity.configDir, grant, { entryKey: options.entryKey, backups });
-    written.push(`native:${identity.configDir}`);
+    if (!skip(nativeStorePathFor(tool, identity.configDir))) {
+      await writeProviderGrantCopy(tool, identity.configDir, grant, { entryKey: options.entryKey, backups });
+      written.push(`native:${identity.configDir}`);
+    }
   } catch (err) {
     failed.push({ path: `native:${identity.configDir}`, error: err instanceof Error ? err.message : String(err) });
   }
   if (await poolAdapterFor(tool)) {
     for (const poolDir of options.poolDirs ?? (await poolStoreDirsFor(identity, registryOf(tool, options), tool))) {
+      if (skip(nativeStorePathFor(tool, poolDir))) continue;
       try {
         const write = () => writeProviderGrantCopy(tool as NativeReconcilableTool, poolDir, grant, { backups });
         await (options.locksHeld ? write() : withOauthRefreshLock(poolDir, write));
@@ -378,7 +383,7 @@ export async function writeGrantThroughStores(
     }
   }
   const piDir = options.piDir ?? (await piIdentityFor(identity.name))?.configDir;
-  if (piDir) {
+  if (piDir && !skip(join(expandPath(piDir), "auth.json"))) {
     const provider = tool === "claude" ? "anthropic" : tool === "codex" ? "openai-codex" : "xai";
     try {
       written.push(`pi:${await writePiGrant(provider, piDir, grant, backups)}`);
@@ -483,7 +488,12 @@ export async function convergeClaudePoolStores(
   const poolDirs = lockedPoolDirs ?? (await poolStoreDirsFor(identity, registryPath, tool));
   if (poolDirs.length === 0) return { written, failed };
   const dirs = [identity.configDir, ...poolDirs];
-  const copies = await Promise.all(dirs.map((dir) => readProviderGrantCopy(tool as NativeReconcilableTool, dir)));
+  const reads = await Promise.all(dirs.map((dir) => withReadErrorProbe(() => readProviderGrantCopy(tool as NativeReconcilableTool, dir))));
+  const copies = reads.map((read) => read.value);
+  // A store whose read failed is never written over (a torn file may hold a newer grant or other entries), and
+  // when the member's own store is the unreadable one nothing is converged at all.
+  const unreadable = reads.map((read) => read.readFailed);
+  if (unreadable[0]) return { written, failed };
   const recency = (grant: OAuthGrant): number => grant.minted_at ?? grant.expires_at ?? -1;
   let best: { grant: OAuthGrant } | undefined;
   for (const copy of copies) if (copy && (!best || recency(copy.grant) > recency(best.grant))) best = copy;
@@ -508,7 +518,7 @@ export async function convergeClaudePoolStores(
     }
   }
   for (let i = 0; i < dirs.length; i++) {
-    if (same(copies[i])) continue;
+    if (same(copies[i]) || unreadable[i]) continue;
     try {
       await writeProviderGrantCopy(tool as NativeReconcilableTool, dirs[i]!, best.grant);
       written.push(dirs[i]!);
@@ -521,6 +531,63 @@ export async function convergeClaudePoolStores(
 
 const READ_ERROR_SKIP_DETAIL =
   "a credential store could not be read (torn or unreadable file): not refreshing with another store's grant, which could rotate a forked copy and kill the real login; the existing token stays in use and the next tick retries";
+
+const READ_RETRY_DELAY_MS = 50;
+
+/** The member's own native store file: the authoritative copy of its login. */
+async function ownNativePath(tool: RefreshableTool, identity: Identity): Promise<string> {
+  if (tool === "kimi") return (await kimiCredentialStores(identity, "kimi")).find((store) => store.kind === "native")?.path ?? join(identity.configDir, "credentials", "kimi-code.json");
+  return nativeStorePathFor(tool, identity.configDir);
+}
+
+/** Names a failed store without its path: the member's own native store, the pi projection, or a pool copy. */
+function storeClass(path: string, ownPath: string): string {
+  return path === ownPath ? "native" : basename(path) === "auth.json" ? "pi" : "pool";
+}
+
+interface FreshestProbe {
+  value: Awaited<ReturnType<typeof freshestGrant>>;
+  /** Some store read failed even after one re-read. */
+  failed: boolean;
+  /** The failure involves the member's own native store (or could not be attributed): it blocks a refresh. */
+  blocking: boolean;
+  failedPaths: string[];
+  unreadable: string[];
+}
+
+/** Reads the freshest grant, re-reading once after a short delay when a store read failed (a store mid-rewrite
+ * clears by itself). Only a failure that persists counts. A persistent failure of the member's own native store
+ * blocks a refresh; one in a secondary copy (pi, pool) does not: the readable authoritative grant is used. */
+async function probeFreshest(
+  tool: RefreshableTool,
+  identity: Identity,
+  registryPath: string | undefined,
+  lockedPoolDirs: string[] | undefined,
+): Promise<FreshestProbe> {
+  const once = async () => {
+    let threw = false;
+    const probed = await withReadErrorProbe(() =>
+      freshestGrant(tool, identity, registryPath, lockedPoolDirs).catch(() => {
+        threw = true;
+        return undefined;
+      }),
+    );
+    return { value: probed.value, failed: probed.readFailed || threw, failedPaths: probed.failedPaths, unattributed: threw || (probed.readFailed && probed.failedPaths.length === 0) };
+  };
+  let result = await once();
+  if (result.failed) {
+    await new Promise((resolve) => setTimeout(resolve, READ_RETRY_DELAY_MS));
+    result = await once();
+  }
+  const own = result.failed ? await ownNativePath(tool, identity) : "";
+  return {
+    value: result.value,
+    failed: result.failed,
+    blocking: result.failed && (result.unattributed || result.failedPaths.includes(own)),
+    failedPaths: result.failedPaths,
+    unreadable: [...new Set(result.failedPaths.map((path) => storeClass(path, own)))],
+  };
+}
 
 /** Where the freshest refreshable copy of an identity's grant lives. */
 async function freshestGrant(
@@ -616,6 +683,8 @@ export interface IdentityGrantRefresh {
   detail: string;
   /** Set on a "no-grant" or "skipped-read-error" that came from a store read error: transient, never a logged-out identity. */
   readError?: boolean;
+  /** Store classes ("native", "pi", "pool") that could not be read and were left untouched; no paths or secrets. */
+  unreadableStores?: string[];
   beforeFingerprint?: string;
   afterFingerprint?: string;
   /** New access-token expiry (unix seconds) on success. */
@@ -707,22 +776,15 @@ export async function refreshIdentityOAuthGrant(
   const poolDirs = await poolStoreDirsFor(identity, registryPath, tool);
   if (!options.force) {
     // Cheap pre-check without locks: don't contend with Claude Code when there is nothing to do.
-    let peekFailed = false;
-    const peeked = await withReadErrorProbe(() =>
-      freshestGrant(tool, identity, registryPath, poolDirs).catch(() => {
-        peekFailed = true;
-        return undefined;
-      }),
-    );
-    peekFailed = peekFailed || peeked.readFailed;
+    const peeked = await probeFreshest(tool, identity, registryPath, poolDirs);
     const peek = peeked.value;
-    if (peek?.grant.refresh_token && peekFailed) {
-      return { tool, identity: identity.name, outcome: "skipped-read-error", written: [], writeFailures: [], readError: true, detail: READ_ERROR_SKIP_DETAIL };
+    if (peeked.blocking && peek?.grant.refresh_token) {
+      return { tool, identity: identity.name, outcome: "skipped-read-error", written: [], writeFailures: [], readError: true, unreadableStores: peeked.unreadable, detail: READ_ERROR_SKIP_DETAIL };
     }
     if (peek) await healDamagedNativeFromPi(tool, identity, peek, false);
     if (!peek?.grant.refresh_token) {
       return {
-        tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], ...(peekFailed ? { readError: true } : {}),
+        tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], ...(peeked.failed ? { readError: true, unreadableStores: peeked.unreadable } : {}),
         detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
       };
     }
@@ -818,25 +880,19 @@ async function refreshGrantUnlocked(
   }
   if (pooled) await convergeClaudePoolStores(identity, registryPath, options.locksHeld, options.lockedPoolDirs, tool).catch(() => undefined);
 
-  let readFailed = false;
-  const probed = await withReadErrorProbe(() =>
-    freshestGrant(tool, identity, registryPath, options.lockedPoolDirs).catch(() => {
-      readFailed = true;
-      return undefined;
-    }),
-  );
-  readFailed = readFailed || probed.readFailed;
+  const probed = await probeFreshest(tool, identity, registryPath, options.lockedPoolDirs);
+  const readFailed = probed.failed;
   const freshest = probed.value;
   if (!freshest || !freshest.grant.refresh_token) {
     return {
       ...base,
       outcome: "no-grant",
-      ...(readFailed ? { readError: true } : {}),
+      ...(readFailed ? { readError: true, unreadableStores: probed.unreadable } : {}),
       detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
     };
   }
-  if (readFailed) {
-    return { ...base, outcome: "skipped-read-error", readError: true, detail: READ_ERROR_SKIP_DETAIL };
+  if (probed.blocking) {
+    return { ...base, outcome: "skipped-read-error", readError: true, unreadableStores: probed.unreadable, detail: READ_ERROR_SKIP_DETAIL };
   }
   await healDamagedNativeFromPi(tool, identity, freshest, options.locksHeld === true);
   const beforeFingerprint = grantFingerprint(freshest.grant);
@@ -931,6 +987,7 @@ async function refreshGrantUnlocked(
     ...(options.poolRegistryPath ? { poolRegistryPath: options.poolRegistryPath } : {}),
     locksHeld: options.locksHeld,
     poolDirs: options.lockedPoolDirs,
+    skipPaths: new Set(probed.failedPaths),
   });
   const wrote = writeThrough.written.length > 0;
   return {
@@ -944,6 +1001,7 @@ async function refreshGrantUnlocked(
     expiresAt: grant.expires_at,
     written: writeThrough.written,
     writeFailures: writeThrough.failed,
+    ...(probed.failed ? { unreadableStores: probed.unreadable } : {}),
   };
 }
 

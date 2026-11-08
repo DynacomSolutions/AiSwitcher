@@ -455,6 +455,27 @@ describe("alert recovery", () => {
     expect(seen).toEqual(["claude/id1", "claude/id1"]);
   });
 
+  test("a store read error alerts with a read-error message and no path; a degraded refresh alerts too", async () => {
+    const seen: Array<{ kind: string; key: string; message: string }> = [];
+    const alerter = createAlerter((a) => void seen.push({ kind: a.kind, key: a.key, message: a.message }));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    let result: Record<string, unknown> = { outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] };
+    const refresh = instrumentRefresh((async (_t: string, id: { name: string }) => ({ tool: "claude", identity: id.name, written: [], writeFailures: [], detail: "/secret/path", ...result })) as never, { metrics, alerter });
+    const id = { name: "r1", label: "r1", configDir: "/x" } as never;
+    await refresh("claude", id, {});
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ kind: "refresh-failed", key: "claude/r1" });
+    expect(seen[0]!.message).toContain("could not be read");
+    expect(seen[0]!.message).toContain("native store");
+    expect(seen[0]!.message).not.toContain("/secret/path");
+    // A refresh that succeeded while a secondary store was unreadable still alerts, and does not recover.
+    const other = { name: "r2", label: "r2", configDir: "/y" } as never;
+    result = { outcome: "refreshed", unreadableStores: ["pi"] };
+    await refresh("claude", other, {});
+    expect(seen.map((a) => a.key)).toEqual(["claude/r1", "claude/r2"]);
+    expect(seen[1]!.message).toContain("pi store");
+  });
+
   test("no-grant and skipped-revoked outcomes alert; a different token read clears", async () => {
     const seen: string[] = [];
     const alerter = createAlerter((a) => void seen.push(a.key));
@@ -607,6 +628,18 @@ describe("watchCredentialReads", () => {
 });
 
 describe("idle keep-alive", () => {
+  test("a store read error found by the keep-alive raises the refresh-failed alert", async () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(`${a.kind} ${a.key}`));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const refresh = instrumentRefresh(
+      (async (_t: string, id: { name: string }) => ({ tool: "claude", identity: id.name, outcome: "skipped-read-error", readError: true, written: [], writeFailures: [], detail: "x" })) as never,
+      { metrics, alerter },
+    );
+    await keepAliveOnce({ refresh, accounts: async () => [{ name: "k1", label: "k1", configDir: "/x" } as never], metrics });
+    expect(seen).toEqual(["refresh-failed claude/k1"]);
+  });
+
   test("refreshes every managed login without traffic and counts outcomes, a throw counts as failed", async () => {
     const counted: string[] = [];
     const seen: string[] = [];

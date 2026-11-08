@@ -117,6 +117,13 @@ describe("CredentialCache", () => {
     expect(((await other.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError).code).toBe("refresh-failed");
   });
 
+  test("a skipped-read-error is a refresh failure, not token-unchanged and not a dead login", async () => {
+    const c = makeCache(async () => refreshed({ outcome: "skipped-read-error", readError: true }));
+    const err = (await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
+    expect(err.code).toBe("refresh-failed");
+    expect(err.loggedOut).toBe(false);
+  });
+
   test("a no-grant caused by a store read error is transient, not a dead login", async () => {
     const c = makeCache(async () => refreshed({ outcome: "no-grant", readError: true }));
     const err = (await c.refreshAfter401("claude", "id1", "SYNTHETIC_FIXTURE-claude-access-0001").catch((e: unknown) => e)) as GatewayCredentialError;
