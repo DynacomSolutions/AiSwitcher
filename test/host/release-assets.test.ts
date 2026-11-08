@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { binaryTarget, checksums, components, digest, isTransientDownloadError, releaseFiles, runWithRetry, validateTrustKey, validatePayloadNames, verifyChecksums, verifyPayload } from "../../scripts/host/release-assets";
+import { binaryTarget, checksums, components, digest, isTransientDownloadError, releaseFiles, run, runWithRetry, validateTrustKey, validatePayloadNames, verifyChecksums, verifyPayload } from "../../scripts/host/release-assets";
 
 describe("portable release contents", () => {
   test("identifies the architecture from bytes rather than filenames", () => {
@@ -106,5 +106,15 @@ describe("transient download retry", () => {
     const broken = (() => { calls++; throw new Error("compile error"); }) as unknown as typeof flaky;
     expect(() => runWithRetry(["x"], ".", 1, 4, 0, broken)).toThrow("compile error");
     expect(calls).toBe(1);
+  });
+});
+
+describe("run failure reporting", () => {
+  test("reports the exit code and stderr for a failing command", () => {
+    expect(() => run(["sh", "-c", "echo boom >&2; exit 3"])).toThrow(/sh failed with exit code 3\.\nboom/);
+  });
+
+  test("reports a timeout as a timeout", () => {
+    expect(() => run(["sleep", "5"], process.cwd(), 100)).toThrow(/sleep timed out after 0.1 seconds/);
   });
 });

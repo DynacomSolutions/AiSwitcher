@@ -50,7 +50,13 @@ export function checksums(files: Array<{ name: string; bytes: Uint8Array }>): st
 
 export function run(command: string[], cwd = process.cwd(), timeout = 120_000, env = process.env): string {
   const result = Bun.spawnSync(command, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout, maxBuffer: 16 * 1024 * 1024 });
-  if (result.exitCode !== 0) throw new Error(`${basename(command[0]!)} failed or exceeded its time limit.\n${result.stderr.toString().slice(-4000)}`);
+  if (result.exitCode !== 0) {
+    const name = basename(command[0]!);
+    const tail = result.stderr.toString().slice(-4000);
+    const timedOut = result.exitedDueToTimeout === true;
+    const cause = timedOut ? `timed out after ${timeout >= 60_000 ? `${Math.round(timeout / 60_000)} minutes` : `${timeout / 1000} seconds`}` : `failed with exit code ${result.exitCode ?? `signal ${result.signalCode}`}`;
+    throw new Error(`${name} ${cause}.\n${tail}`);
+  }
   return result.stdout.toString();
 }
 
