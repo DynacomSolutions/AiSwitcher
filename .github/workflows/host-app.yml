@@ -124,6 +124,14 @@ jobs:
           # The package installs into an sbin directory the test process may not have on PATH.
           mkfs=$(dpkg -L exfatprogs | grep -m1 '/mkfs\.exfat$')
           echo "AIS_HOST_TEST_EXFAT_TOOLS=$(dirname "$mkfs")" >> "$GITHUB_ENV"
+      # The AppImage bundler downloads AppRun and linuxdeploy from GitHub; caching them
+      # keeps a GitHub 5xx from failing a build, and also for production builds (they
+      # are pinned tools, not built artefacts).
+      - name: Cache the Tauri bundler tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tauri
+          key: tauri-bundler-tools-${{ matrix.target }}-2.12.3
       # Skipped for production builds: release artefacts never reuse cached binaries.
       - name: Cache Cargo registry, tauri-cli and build output
         if: inputs.production != true
@@ -138,6 +146,13 @@ jobs:
           cd apps/host
           rustup show
           cargo install tauri-cli --version 2.12.3 --locked
+      # GitHub's browser download URLs have been returning 504 while the API serves the
+      # same assets, so put the bundler's downloads in its cache through the API.
+      - name: Prefetch the bundler tools
+        if: runner.os == 'Linux'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/host/prefetch-bundler-tools.ts --appimage
       # generate_context! needs the built frontend before any cargo step.
       - name: Frontend typecheck and build
         working-directory: apps/host
@@ -242,6 +257,12 @@ jobs:
           rustup target add "$HOST_WINDOWS_TARGET"
           cargo install tauri-cli --version 2.12.3 --locked
           cargo install cargo-xwin --version "$CARGO_XWIN_VERSION" --locked
+      # GitHub's browser download URLs have been returning 504 while the API serves the
+      # same assets, so put the bundler's downloads in its cache through the API.
+      - name: Prefetch the bundler tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/host/prefetch-bundler-tools.ts --nsis
       # generate_context! needs the built frontend before any cargo step.
       - name: Frontend build
         working-directory: apps/host

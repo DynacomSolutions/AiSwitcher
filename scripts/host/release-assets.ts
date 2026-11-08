@@ -50,8 +50,33 @@ export function checksums(files: Array<{ name: string; bytes: Uint8Array }>): st
 
 export function run(command: string[], cwd = process.cwd(), timeout = 120_000, env = process.env): string {
   const result = Bun.spawnSync(command, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout, maxBuffer: 16 * 1024 * 1024 });
-  if (result.exitCode !== 0) throw new Error(`${basename(command[0]!)} failed or exceeded its time limit.\n${result.stderr.toString().slice(-4000)}`);
+  if (result.exitCode !== 0) {
+    const name = basename(command[0]!);
+    const tail = result.stderr.toString().slice(-4000);
+    const timedOut = result.exitedDueToTimeout === true;
+    const cause = timedOut ? `timed out after ${timeout >= 60_000 ? `${Math.round(timeout / 60_000)} minutes` : `${timeout / 1000} seconds`}` : `failed with exit code ${result.exitCode ?? `signal ${result.signalCode}`}`;
+    throw new Error(`${name} ${cause}.\n${tail}`);
+  }
   return result.stdout.toString();
+}
+
+/** True when a failed build step died on a transient download error (for example a GitHub 5xx). */
+export function isTransientDownloadError(message: string): boolean {
+  return /http status: 5\d\d|error returned status 5\d\d|timed out|connection (?:reset|refused|closed)/i.test(message);
+}
+
+/** Runs a packaging step, retrying only when the bundler's own tool download failed transiently. */
+export function runWithRetry(command: string[], cwd: string, timeout: number, attempts = 4, delayMs = 15_000, execute: typeof run = run): string {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return execute(command, cwd, timeout);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt >= attempts || !isTransientDownloadError(message)) throw error;
+      console.warn(`Transient download failure (attempt ${attempt}/${attempts}); retrying in ${delayMs / 1000}s.`);
+      Bun.sleepSync(delayMs * attempt);
+    }
+  }
 }
 
 export function payloadFiles(root: string): string[] {

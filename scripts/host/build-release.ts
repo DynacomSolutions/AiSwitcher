@@ -1,7 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { requireSearchSystem32 } from "./pe-load-flags";
-import { components, digest, run, smokeArchive, validateTrustKey, verifyPayload, type Target } from "./release-assets";
+import { components, digest, run, runWithRetry, smokeArchive, validateTrustKey, verifyPayload, type Target } from "./release-assets";
 
 const repository = resolve(import.meta.dir, "../..");
 const host = join(repository, "apps/host");
@@ -98,11 +98,12 @@ if (import.meta.main) {
       macOS: { hardenedRuntime: true, minimumSystemVersion: "11.0" },
     },
   }));
-  const args = ["cargo", "tauri", "build", ...runner, "--target", triple, "--config", overlay];
+  // --verbose makes the bundler print linuxdeploy output, which it otherwise swallows on failure.
+  const args = ["cargo", "tauri", "build", "--verbose", ...runner, "--target", triple, "--config", overlay];
   if (target === "windows-x64") args.push("--no-bundle");
   else args.push("--bundles", target === "macos-arm64" ? "app" : "appimage");
   args.push("--", "--locked");
-  run(args, host, 2_400_000);
+  runWithRetry(args, host, 2_400_000);
   let asset: string;
   if (target === "macos-arm64") {
     const app = join(binaryDir, "bundle/macos/ais Host.app");
@@ -121,7 +122,7 @@ if (import.meta.main) {
     // drives. The portable archive lists drives and refuses to elevate.
     const installer = join(root, "tauri-installer.json");
     writeFileSync(installer, JSON.stringify({ mainBinaryName: "ais-host-app", bundle: { windows: { nsis: { installMode: "perMachine" } } } }));
-    run(["cargo", "tauri", "build", ...runner, "--target", triple, "--config", overlay, "--config", installer, "--bundles", "nsis", "--", "--locked"], host, 2_400_000);
+    runWithRetry(["cargo", "tauri", "build", ...runner, "--target", triple, "--config", overlay, "--config", installer, "--bundles", "nsis", "--", "--locked"], host, 2_400_000);
     const setupDir = join(binaryDir, "bundle/nsis");
     const setups = readdirSync(setupDir).filter((name) => name.endsWith("-setup.exe"));
     if (setups.length !== 1) throw new Error("Expected one NSIS installer.");
