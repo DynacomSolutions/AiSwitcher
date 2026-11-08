@@ -1,7 +1,9 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
 import { createGatewayApp, styleForPath } from "../../src/gateway/app.ts";
-import { instrumentRefresh, keepAliveOnce, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
+import { instrumentRefresh, keepAliveOnce, trackedHeartbeatWrite, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
@@ -85,7 +87,7 @@ function hooks(over: Partial<GatewayHooks> = {}): GatewayHooks {
 }
 
 async function boot(over: Partial<GatewayHooks> = {}, handleSignals = false) {
-  const g = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: ADMIN, handleSignals }, hooks(over));
+  const g = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: ADMIN, handleSignals }, hooks({ noHeartbeat: true, ...over }));
   started.push(g);
   return g;
 }
@@ -651,6 +653,182 @@ describe("watchCredentialReads", () => {
   });
 });
 
+describe("store-unreadable raise and recover rules", () => {
+  const setup = () => {
+    const seen: Array<{ kind: string; key: string; message: string }> = [];
+    const alerter = createAlerter((a) => void seen.push({ kind: a.kind, key: a.key, message: a.message }));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    let result: Record<string, unknown> = {};
+    const refresh = instrumentRefresh((async (_t: string, id: { name: string }) => ({ tool: "claude", identity: id.name, written: [], writeFailures: [], detail: "x", ...result })) as never, { metrics, alerter });
+    const id = { name: "u1", label: "u1", configDir: "/x" } as never;
+    return { seen, refresh, id, set: (r: Record<string, unknown>) => void (result = r) };
+  };
+  const kinds = (seen: Array<{ kind: string }>) => seen.filter((a) => a.kind === "store-unreadable").length;
+
+  test("a skipped-fresh not-due result carrying unreadableStores raises once", async () => {
+    const t = setup();
+    t.set({ outcome: "skipped-fresh", storesProbed: true, unreadableStores: ["pi"] });
+    await t.refresh("claude", t.id, {});
+    await t.refresh("claude", t.id, {});
+    expect(t.seen.map((a) => a.kind)).toEqual(["store-unreadable"]);
+    expect(t.seen[0]!.message).toContain("pi store");
+  });
+
+  test("an adopted-style skipped-fresh (no store probe) keeps the alert open; a probed clean one closes it", async () => {
+    const t = setup();
+    t.set({ outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] });
+    await t.refresh("claude", t.id, {});
+    // adopted(), lock-busy and rotated-elsewhere results carry neither unreadableStores nor the probe marker
+    t.set({ outcome: "skipped-fresh", detail: "adopted the grant another holder already refreshed - no token request made" });
+    await t.refresh("claude", t.id, {});
+    t.set({ outcome: "skipped-fresh", detail: "lock busy" });
+    await t.refresh("claude", t.id, {});
+    t.set({ outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] });
+    await t.refresh("claude", t.id, {});
+    expect(kinds(t.seen)).toBe(1); // still open: the repeat did not notify again
+    t.set({ outcome: "skipped-fresh", storesProbed: true });
+    await t.refresh("claude", t.id, {});
+    t.set({ outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] });
+    await t.refresh("claude", t.id, {});
+    expect(kinds(t.seen)).toBe(2); // the probed clean result closed it, so the next one notifies again
+  });
+
+  test("the forced 401 path does not claim the existing token stays in use", async () => {
+    const t = setup();
+    t.set({ outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] });
+    await t.refresh("claude", t.id, { force: true, expectedAccessToken: "stale" });
+    expect(t.seen[0]!.message).toContain("could not be read");
+    expect(t.seen[0]!.message).not.toContain("stays in use");
+    const idle = setup();
+    idle.set({ outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] });
+    await idle.refresh("claude", idle.id, {});
+    expect(idle.seen[0]!.message).toContain("stays in use");
+  });
+});
+
+describe("keep-alive across every refreshable tool", () => {
+  const member = (name: string) => ({ name, label: name, configDir: `/x/${name}` }) as never;
+
+  test("codex, grok and kimi members are kept alive after claude, counted per tool", async () => {
+    const calls: string[] = [];
+    const counted: string[] = [];
+    const refresh = (async (tool: string, id: { name: string }) => {
+      calls.push(`${tool}/${id.name}`);
+      if (tool === "grok") throw new Error("boom");
+      return { tool, identity: id.name, outcome: "refreshed", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    const byTool: Record<string, never[]> = { claude: [member("c1")], codex: [member("x1"), member("x2")], grok: [member("g1")], kimi: [member("k1")] };
+    await keepAliveOnce({
+      refresh,
+      accounts: async (tool) => byTool[tool] ?? [],
+      tools: ["claude", "codex", "grok", "kimi"],
+      metrics: { keepAlive: (p: string, o: string) => void counted.push(`${p}:${o}`) },
+    });
+    expect(calls).toEqual(["claude/c1", "codex/x1", "codex/x2", "grok/g1", "kimi/k1"]);
+    expect(counted).toEqual(["claude:refreshed", "codex:refreshed", "codex:refreshed", "grok:failed", "kimi:refreshed"]);
+  });
+
+  test("an API-key or logged-out entry found by the keep-alive is skipped quietly, a real failure still alerts", async () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(`${a.kind} ${a.key}`));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const counted: string[] = [];
+    let outcome = "no-grant";
+    const refresh = instrumentRefresh((async (_t: string, id: { name: string }) => ({ tool: "codex", identity: id.name, outcome, written: [], writeFailures: [], detail: "x" })) as never, { metrics, alerter });
+    const deps = { refresh, accounts: async () => [member("api1")], tools: ["codex"], metrics: { keepAlive: (p: string, o: string) => void counted.push(`${p}:${o}`) } };
+    await keepAliveOnce(deps);
+    expect(seen).toEqual([]);
+    expect(counted).toEqual(["codex:no-grant"]);
+    // The request path (no keepAlive flag) still reports a logged-out login.
+    await refresh("codex", member("api1"), {});
+    expect(seen).toEqual(["refresh-failed codex/api1"]);
+  });
+
+  test("a pass records the heartbeat with what it holds and when each login last refreshed", async () => {
+    const passes: Array<Record<string, { lastSuccessAt?: string }>> = [];
+    const refresh = (async (tool: string, id: { name: string }) => ({ tool, identity: id.name, outcome: id.name === "ok" ? "refreshed" : "skipped-fresh", detail: "", written: [], writeFailures: [] })) as never;
+    await keepAliveOnce({
+      refresh, accounts: async () => [member("ok"), member("idle")], tools: ["kimi"], metrics: { keepAlive: () => {} },
+      now: () => new Date("2026-01-01T00:00:00Z"),
+      onPass: async (held) => void passes.push(held),
+    });
+    expect(passes).toEqual([{ "kimi/ok": { lastSuccessAt: "2026-01-01T00:00:00.000Z" }, "kimi/idle": {} }]);
+  });
+
+  test("a failed heartbeat write raises one alert and counts, and the next good write clears it", async () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(`${a.kind} ${a.key}`));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const hb = { version: 1 as const, passAt: new Date().toISOString(), held: {} };
+    const bad = async () => { throw new Error("EACCES /secret/path"); };
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, bad);
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, bad);
+    expect(seen).toEqual(["heartbeat-write-failed gateway"]);
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, async () => {});
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, bad);
+    expect(seen).toHaveLength(2);
+    const text = metrics.render();
+    expect(text).toContain('ais_gateway_heartbeat_writes_total{outcome="failed"} 3');
+    expect(text).toContain('ais_gateway_heartbeat_writes_total{outcome="ok"} 1');
+  });
+
+  test("the gateway keep-alive raises heartbeat-write-failed when the file cannot be written", async () => {
+    const saved = process.env.AIS_GATEWAY_HEARTBEAT;
+    const dir = await (await import("node:fs/promises")).mkdtemp(join(tmpdir(), "ais-hb-"));
+    await Bun.write(join(dir, "afile"), "x");
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "afile", "hb.json"); // parent is a regular file: the write fails
+    try {
+      await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [] });
+      await waitFor(() => alerts.some((a) => a.kind === "heartbeat-write-failed"));
+    } finally {
+      if (saved === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT; else process.env.AIS_GATEWAY_HEARTBEAT = saved;
+    }
+  });
+
+  test("a lastSuccessAt in the future, from the map or a minted estimate, is clamped to now", async () => {
+    const seenLast: Array<string | null | undefined> = [];
+    const refresh = (async (tool: string, id: { name: string }, o?: { lastSuccessAt?: string | null }) => {
+      seenLast.push(o?.lastSuccessAt);
+      return { tool, identity: id.name, outcome: "skipped-fresh", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    const at = new Date("2026-01-01T00:00:00Z");
+    const lastSuccess = new Map([["kimi/a", "2030-01-01T00:00:00.000Z"]]);
+    await keepAliveOnce({ refresh, accounts: async () => [member("a"), member("b")], tools: ["kimi"], lastSuccess, now: () => at, mintedAt: async (_t, acct) => (acct.name === "b" ? Math.floor(at.getTime() / 1000) + 5 * 86_400 : undefined), metrics: { keepAlive: () => {} } });
+    expect(seenLast).toEqual([at.toISOString(), at.toISOString()]);
+  });
+
+  test("a same-named account in two tools keeps separate revoked marks", async () => {
+    const seen: Array<string | undefined> = [];
+    const refresh = (async (tool: string, id: { name: string }, opts?: { revokedFingerprint?: string }) => {
+      seen.push(`${tool}:${opts?.revokedFingerprint ?? "-"}`);
+      return { tool, identity: id.name, outcome: tool === "codex" ? "skipped-revoked" : "refreshed", beforeFingerprint: "fp-c", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    const revoked = new Map<string, string>();
+    const deps = { refresh, accounts: async () => [member("same")], tools: ["codex", "kimi"], metrics: { keepAlive: () => {} }, revoked };
+    await keepAliveOnce(deps);
+    await keepAliveOnce(deps);
+    expect(seen).toEqual(["codex:-", "kimi:-", "codex:fp-c", "kimi:-"]);
+  });
+
+  test("the gateway timer keeps codex and kimi members alive through the guard", async () => {
+    const backend = new MemoryRefreshBackend();
+    const seen = new Set<string>();
+    const g = await boot({
+      refreshBackend: backend,
+      keepAliveMs: 20,
+      keepAliveAccounts: async (tool: string) => (tool === "codex" ? [member("cx")] : tool === "kimi" ? [member("km")] : []),
+      refreshImpl: (async (tool: string, id: { name: string }, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
+        await o?.beforePost?.({ fingerprint: "aaaa1111" });
+        seen.add(`${tool}/${id.name}`);
+        return { tool, identity: id.name, outcome: "refreshed", detail: "", afterFingerprint: "bbbb2222", written: [], writeFailures: [] };
+      }) as never,
+    });
+    await waitFor(() => seen.has("codex/cx") && seen.has("kimi/km"));
+    expect(backend.entries.map((e) => `${e.provider}/${e.identity}`)).toEqual(expect.arrayContaining(["codex/cx", "kimi/km"]));
+    await g.stop();
+  });
+});
+
 describe("idle keep-alive", () => {
   test("a store read error found by the keep-alive raises the refresh-failed alert", async () => {
     const seen: string[] = [];
@@ -692,13 +870,13 @@ describe("idle keep-alive", () => {
     const accounts = async () => [{ name: "a", label: "a", configDir: "/x/a" }];
     const metrics = { keepAlive: () => {} };
     await keepAliveOnce({ refresh, accounts, metrics, revoked }); // first POST fails, nothing remembered
-    revoked.set("a", "fp-1");
+    revoked.set("claude/a", "fp-1");
     await keepAliveOnce({ refresh, accounts, metrics, revoked });
     expect(seen).toEqual([undefined, "fp-1"]);
-    expect(revoked.get("a")).toBe("fp-1");
+    expect(revoked.get("claude/a")).toBe("fp-1");
     fp = "fp-2"; // re-login minted a different grant: the stale mark no longer matches, so the refresh runs
     await keepAliveOnce({ refresh, accounts, metrics, revoked });
-    expect(revoked.has("a")).toBe(false);
+    expect(revoked.has("claude/a")).toBe(false);
   });
 });
 
@@ -713,7 +891,7 @@ describe("idle keep-alive and the refresh guard", () => {
     const g = await boot({
       refreshBackend: backend,
       keepAliveMs: 20,
-      keepAliveAccounts: async () => [acct],
+      keepAliveAccounts: async (tool: string) => (tool === "claude" ? [acct] : []),
       refreshImpl: (async (tool: string, id: { name: string }, o?: { beforePost?: (i: { fingerprint: string }) => Promise<void> }) => {
         await o?.beforePost?.({ fingerprint: "aaaa1111" });
         posts += 1;
@@ -748,7 +926,7 @@ describe("idle keep-alive and the refresh guard", () => {
       throw new OAuthRefreshError("token refresh rejected (HTTP 400 invalid_grant)", true, "fp-9", "invalid_grant");
     }) as never;
     await keepAliveOnce({ refresh: dead, accounts, metrics, revoked });
-    expect(revoked.get("ka1")).toBe("fp-9");
+    expect(revoked.get("claude/ka1")).toBe("fp-9");
   });
 
   test("lock timeouts and guard-retryable errors do not raise the log-in-again alert", async () => {

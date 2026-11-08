@@ -268,6 +268,14 @@ describe("shouldAttemptOAuthRefresh (scheduler cadence)", () => {
       expect(kimi(-600, recent).attempt).toBe(false);
       expect(kimi(60, old).attempt).toBe(true);
       expect(kimi(60, old).reason).toContain("daily keep-alive");
+      // An expiry-based safety net, bounded: expired with a success 3h ago refreshes; with one 1h ago it does not.
+      const threeHours = new Date((NOW - 3 * 3600) * 1000).toISOString();
+      expect(kimi(-600, threeHours).attempt).toBe(true);
+      expect(kimi(-600, threeHours).reason).toContain("expired");
+      expect(kimi(60, threeHours).attempt).toBe(false); // not expired: only the daily keep-alive applies
+      // A grant 5 days from expiry refreshes once 24h have passed.
+      expect(kimi(5 * 86_400, old).attempt).toBe(true);
+      expect(kimi(5 * 86_400, recent).attempt).toBe(false);
       expect(shouldAttemptOAuthRefresh({ access_token: "x", expires_at: NOW + 60 }, { tool: "kimi", force: true, lastSuccessAt: recent, nowSeconds: NOW }).attempt).toBe(true);
     });
 
@@ -890,5 +898,80 @@ describe("registry wiring", () => {
       const file = JSON.parse(await readFile(config.identitiesJsonPath, "utf8")) as { identities: Identity[] };
       expect(file.identities.map((identity) => identity.name)).toContain(ACME);
     }
+  });
+});
+
+describe("gateway keep-alive cadence with the real refresh", () => {
+  const withOwner = async (fn: () => Promise<void>): Promise<void> => {
+    const saved = process.env.AIS_GATEWAY_OWNER;
+    process.env.AIS_GATEWAY_OWNER = "1";
+    try { await fn(); } finally { if (saved === undefined) delete process.env.AIS_GATEWAY_OWNER; else process.env.AIS_GATEWAY_OWNER = saved; }
+  };
+  const nowS = (): number => Math.floor(Date.now() / 1000);
+
+  test("two passes on a fresh codex grant POST at most once", async () => {
+    await json(CODEX_FILE(), {
+      OPENAI_API_KEY: null,
+      tokens: { access_token: fakeJwt({ iat: nowS() - 3600, exp: nowS() + 9 * 86_400 }), refresh_token: "rt-old-1" },
+      last_refresh: new Date((nowS() - 3600) * 1000).toISOString(),
+    });
+    const { calls, fetchImpl } = stubFetch([{ access_token: fakeJwt({ iat: nowS(), exp: nowS() + 10 * 86_400 }), refresh_token: "rt-new-1", expires_in: 864_000 }]);
+    const { keepAliveOnce } = await import("../../src/gateway/serve.ts");
+    const lastSuccess = new Map<string, string>();
+    await withOwner(async () => {
+      const deps = { refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async () => [identityIn(dirs.codex)], tools: ["codex"], metrics: { keepAlive: () => {} }, lastSuccess, onPass: undefined };
+      await keepAliveOnce(deps);
+      await keepAliveOnce(deps);
+      await keepAliveOnce(deps);
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("two passes on a kimi grant POST at most once", async () => {
+    await mkdir(join(dirs.kimi, "credentials"), { recursive: true });
+    await json(KIMI_FILE(), { access_token: "at-syn-kim", refresh_token: "rt-old-1", expires_at: nowS() - 60 });
+    const { calls, fetchImpl } = stubFetch([{ access_token: "at-syn-new", refresh_token: "rt-new-1", expires_in: 900 }]);
+    const { keepAliveOnce } = await import("../../src/gateway/serve.ts");
+    const lastSuccess = new Map<string, string>();
+    await withOwner(async () => {
+      const deps = { refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async () => [identityIn(dirs.kimi)], tools: ["kimi"], metrics: { keepAlive: () => {} }, lastSuccess };
+      await keepAliveOnce(deps);
+      await keepAliveOnce(deps);
+    });
+    expect(calls).toHaveLength(1);
+    expect(lastSuccess.get(`kimi/${ACME}`)).toBeDefined();
+  });
+
+  test("a grant minted an hour ago is not refreshed on a cold first pass, codex or kimi", async () => {
+    await json(CODEX_FILE(), {
+      OPENAI_API_KEY: null,
+      tokens: { access_token: fakeJwt({ iat: nowS() - 3600, exp: nowS() + 9 * 86_400 }), refresh_token: "rt-old-1" },
+      last_refresh: new Date((nowS() - 3600) * 1000).toISOString(),
+    });
+    await mkdir(join(dirs.kimi, "credentials"), { recursive: true });
+    await json(KIMI_FILE(), { access_token: "at-syn-kim", refresh_token: "rt-old-1", expires_at: nowS() - 2700 }); // 15 min token, minted an hour ago
+    const { calls, fetchImpl } = stubFetch([{ access_token: fakeJwt({ iat: nowS(), exp: nowS() + 864_000 }), refresh_token: "rt-new-1", expires_in: 900 }]);
+    const { keepAliveOnce, grantMintedAt } = await import("../../src/gateway/serve.ts");
+    await withOwner(async () => {
+      await keepAliveOnce({ refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async (t) => [identityIn(t === "codex" ? dirs.codex : dirs.kimi)], tools: ["codex", "kimi"], mintedAt: grantMintedAt, metrics: { keepAlive: () => {} } });
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a 401-driven refresh stamps the login so the next keep-alive pass makes no second POST", async () => {
+    const old = fakeJwt({ iat: nowS() - 86_400, exp: nowS() - 3600 });
+    await json(CODEX_FILE(), { OPENAI_API_KEY: null, tokens: { access_token: old, refresh_token: "rt-old-1" }, last_refresh: new Date((nowS() - 86_400) * 1000).toISOString() });
+    const { calls, fetchImpl } = stubFetch([{ access_token: fakeJwt({ iat: nowS(), exp: nowS() + 10 * 86_400 }), refresh_token: "rt-new-1", expires_in: 864_000 }]);
+    const { keepAliveOnce, stampRefreshSuccess } = await import("../../src/gateway/serve.ts");
+    const lastSuccess = new Map<string, string>();
+    const real = ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never;
+    const stamped = stampRefreshSuccess(real, lastSuccess, () => new Date());
+    await withOwner(async () => {
+      const first = await stamped("codex", identityIn(dirs.codex), { force: true, expectedAccessToken: old });
+      expect(first.outcome).toBe("refreshed");
+      expect(lastSuccess.has(`codex/${ACME}`)).toBe(true);
+      await keepAliveOnce({ refresh: real, accounts: async () => [identityIn(dirs.codex)], tools: ["codex"], lastSuccess, metrics: { keepAlive: () => {} } });
+    });
+    expect(calls).toHaveLength(1);
   });
 });

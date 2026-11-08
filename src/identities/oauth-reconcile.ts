@@ -491,7 +491,7 @@ async function providerPairings(piIdentity: Identity, paths: ReconcileRegistryPa
       writePi: (grant, backups) => writePiEntry(piAuthPath, "anthropic", grant, backups),
     });
   }
-  if (codexDir) {
+  if (codexDir && !(await isGatewayManagedHere("codex", piIdentity.name, paths.codex))) {
     const nativePath = join(codexDir, "auth.json");
     pairings.push({
       provider: "openai-codex",
@@ -501,7 +501,7 @@ async function providerPairings(piIdentity: Identity, paths: ReconcileRegistryPa
       writePi: (grant, backups) => writePiEntry(piAuthPath, "openai-codex", grant, backups),
     });
   }
-  if (grokDir) {
+  if (grokDir && !(await isGatewayManagedHere("grok", piIdentity.name, paths.grok))) {
     const nativePath = join(grokDir, "auth.json");
     // grok's store holds one entry per account: scan time picks the entry
     // whose refresh token matches pi's copy (same account), falling back to
@@ -521,7 +521,7 @@ async function providerPairings(piIdentity: Identity, paths: ReconcileRegistryPa
       writePi: (grant, backups) => writePiEntry(piAuthPath, "xai", grant, backups),
     });
   }
-  if (kimiDir) {
+  if (kimiDir && !(await isGatewayManagedHere("kimi", piIdentity.name, paths.kimi))) {
     const nativePath = join(kimiDir, "credentials", "kimi-code.json");
     pairings.push({
       provider: "kimi-coding",
@@ -798,7 +798,7 @@ export async function reconcileNativeProviderStores(
   if (isRetired(identity)) {
     return { provider, status: "single-copy", nativePath, detail: "identity is retired; nothing to reconcile" };
   }
-  if (await isGatewayManagedHere(tool, identity.name, options.registryPaths?.claude)) {
+  if (await isGatewayManagedHere(tool, identity.name, options.registryPaths?.[tool])) {
     return { provider, status: "single-copy", nativePath, detail: "login is owned by the cluster gateway; nothing is reconciled locally" };
   }
   const piDir = await configDirFor(options.registryPaths?.pi ?? PI_CONFIG.identitiesJsonPath, identity.name);

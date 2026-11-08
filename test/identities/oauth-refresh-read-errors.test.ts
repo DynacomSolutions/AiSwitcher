@@ -142,6 +142,7 @@ describe("a block only applies when a refresh is due", () => {
       const idle = await refreshIdentityOAuthGrant("claude", identityIn(claudeDir), opts());
       expect(idle.outcome).toBe("skipped-fresh");
       expect(idle.readError).toBeUndefined();
+      expect(idle.storesProbed).toBe(true); // the probe ran and found the torn native store
       await writeFile(join(piDir, "auth.json"), piFor(farMs()));
       const due = await refreshIdentityOAuthGrant("claude", identityIn(claudeDir), opts());
       expect(due.outcome).toBe("skipped-read-error");

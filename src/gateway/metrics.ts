@@ -66,6 +66,7 @@ export class PrometheusMetrics implements GatewayMetrics {
   private readonly requests = new Counter("ais_gateway_requests_total", "Proxied requests by outcome.");
   private readonly tokens = new Counter("ais_gateway_tokens_total", "Tokens used by proxied requests.");
   private readonly refreshes = new Counter("ais_gateway_refresh_total", "Login refresh attempts by outcome.");
+  private readonly heartbeatWrites = new Counter("ais_gateway_heartbeat_writes_total", "Gateway ownership heartbeat writes, by outcome.");
   private readonly keepAlives = new Counter("ais_gateway_keepalive_total", "Idle keep-alive refresh passes over managed logins, by outcome.");
   private readonly refreshAttempts = new Counter("ais_gateway_refresh_attempts_total", "Login refresh attempts reaching the refresh guard, per account.");
   private readonly refreshSuccesses = new Counter("ais_gateway_refresh_successes_total", "Login refreshes that renewed or adopted a fresh grant, per account.");
@@ -159,6 +160,10 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.unreadable.inc({ app, provider, identity });
   }
 
+  heartbeatWrite(outcome: string): void {
+    this.heartbeatWrites.inc({ outcome });
+  }
+
   keepAlive(provider: string, outcome: string): void {
     this.keepAlives.inc({ provider, outcome });
   }
@@ -181,7 +186,7 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   render(): string {
     const out: string[] = [];
-    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
+    for (const c of [this.requests, this.tokens, this.refreshes, this.keepAlives, this.heartbeatWrites, this.refreshAttempts, this.refreshSuccesses, this.refreshFailures, this.refreshDegraded, this.refreshLockWaits, this.refreshLockWaitSeconds, this.rejections, this.failovers, this.failOpens, this.unreadable, this.browserCalls, this.browserPairings]) out.push(...c.render());
     out.push("# HELP ais_gateway_upstream_seconds Time from request to completion of the response.", "# TYPE ais_gateway_upstream_seconds histogram");
     BUCKETS.forEach((b, i) => out.push(`ais_gateway_upstream_seconds_bucket{le="${b}"} ${this.bucketCounts[i]}`));
     out.push(`ais_gateway_upstream_seconds_bucket{le="+Inf"} ${this.durationCount}`, `ais_gateway_upstream_seconds_sum ${this.durationSum}`, `ais_gateway_upstream_seconds_count ${this.durationCount}`);

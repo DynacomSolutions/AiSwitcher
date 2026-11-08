@@ -394,6 +394,9 @@ export async function writeGrantThroughStores(
   return { written, failed };
 }
 
+/** An expired kimi grant is renewed when the last successful refresh is older than this. */
+const KIMI_EXPIRED_RETRY_S = 2 * 3600;
+
 /** The refresh decision for the scheduler's cadence: refresh when the
  * access token is within `expiryWindowHours` of expiry, and at least once
  * a day even for long-lived tokens (so a healthy grant is still exercised
@@ -428,6 +431,12 @@ export function shouldAttemptOAuthRefresh(
     return { attempt: false, reason: `access token expires in ${(secondsLeft / 3600).toFixed(1)}h (window ${windowHours}h) — nothing to do` };
   }
   const last = options.lastSuccessAt !== null && options.lastSuccessAt !== undefined ? Date.parse(options.lastSuccessAt) : NaN;
+  // Safety net: kimi has no expiry window, so a recorded success must not hide an expired token for a whole day. An expired
+  // grant is renewed once the last success is older than KIMI_EXPIRED_RETRY_S (a ~15 minute token is expired most of the
+  // time while idle, so retrying every pass would rotate it 144 times a day).
+  if (options.tool === "kimi" && secondsLeft <= 0 && Number.isFinite(last) && now - last / 1000 > KIMI_EXPIRED_RETRY_S) {
+    return { attempt: true, reason: `access token expired ${Math.abs(secondsLeft / 3600).toFixed(1)}h ago and no successful refresh for over ${KIMI_EXPIRED_RETRY_S / 3600}h` };
+  }
   if (!Number.isFinite(last) || now - last / 1000 >= 86_400) {
     return { attempt: true, reason: "daily keep-alive (no successful refresh in 24h)" };
   }
@@ -693,6 +702,8 @@ export interface IdentityGrantRefresh {
   readError?: boolean;
   /** Store classes ("native", "pi", "pool") that could not be read and were left untouched; no paths or secrets. */
   unreadableStores?: string[];
+  /** True when this result came from a full probe of every store (so an empty `unreadableStores` means all stores read cleanly). Absent on adopted, lock-busy and rotated-elsewhere results. */
+  storesProbed?: boolean;
   beforeFingerprint?: string;
   afterFingerprint?: string;
   /** New access-token expiry (unix seconds) on success. */
@@ -710,6 +721,8 @@ export interface OAuthRefreshOptions {
    * call (never loop; a re-login mints a different token and resumes). */
   revokedFingerprint?: string;
   lastSuccessAt?: string | null;
+  /** The gateway's idle keep-alive pass: an identity with no OAuth grant (API key or logged out) is skipped quietly, not alerted. */
+  keepAlive?: boolean;
   /** Compare-and-refresh: when set, the refresh proceeds only if the freshest
    * stored access token (re-read under the locks) still has this value;
    * otherwise another process already rotated it and no token request is
@@ -803,7 +816,7 @@ export async function refreshIdentityOAuthGrant(
     if (!decision.attempt) {
       return {
         tool, identity: identity.name, outcome: "skipped-fresh", detail: decision.reason,
-        beforeFingerprint: grantFingerprint(peek.grant), written: [], writeFailures: [],
+        beforeFingerprint: grantFingerprint(peek.grant), written: [], writeFailures: [], storesProbed: true,
         ...(peeked.failed ? { unreadableStores: peeked.unreadable } : {}),
       };
     }
@@ -926,7 +939,7 @@ async function refreshGrantUnlocked(
     tool,
   });
   if (!decision.attempt) {
-    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason, ...(readFailed ? { unreadableStores: probed.unreadable } : {}) };
+    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason, storesProbed: true, ...(readFailed ? { unreadableStores: probed.unreadable } : {}) };
   }
   // Only a refresh that is actually due is blocked by an unreadable authoritative store.
   if (probed.blocking) {
@@ -1014,6 +1027,7 @@ async function refreshGrantUnlocked(
     expiresAt: grant.expires_at,
     written: writeThrough.written,
     writeFailures: writeThrough.failed,
+    storesProbed: true,
     ...(probed.failed ? { unreadableStores: probed.unreadable } : {}),
   };
 }

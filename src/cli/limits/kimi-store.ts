@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { recordReadFailure } from "../../identities/oauth-reconcile.ts";
 import { withOauthRefreshLock } from "../../identities/claude-swap-lock.ts";
+import { isGatewayManagedHere } from "../../identities/gateway-managed.ts";
 import { KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { isRetired } from "../../identities/retired.ts";
@@ -263,7 +264,9 @@ async function writeThroughPools(identity: Identity, next: KimiOAuthCredentials)
 export async function kimiRefreshContext(
   identity: Identity,
   self: "kimi" | "pi",
-): Promise<{ lockDir: string; reread: () => Promise<KimiOAuthCredentials | undefined> } | undefined> {
+): Promise<{ lockDir: string; gatewayManaged?: boolean; reread: () => Promise<KimiOAuthCredentials | undefined> } | undefined> {
   const lockDir = self === "kimi" ? identity.configDir : await configDirFor("kimi", identity.name);
-  return lockDir ? { lockDir, reread: () => readFreshestKimiCredentials(identity, self) } : undefined;
+  if (!lockDir) return undefined;
+  const gatewayManaged = await isGatewayManagedHere("kimi", identity.name);
+  return { lockDir, ...(gatewayManaged ? { gatewayManaged } : {}), reread: () => readFreshestKimiCredentials(identity, self) };
 }
