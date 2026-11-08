@@ -1,7 +1,9 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createAlerter } from "../../src/gateway/alerts.ts";
 import { createGatewayApp, styleForPath } from "../../src/gateway/app.ts";
-import { instrumentRefresh, keepAliveOnce, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
+import { instrumentRefresh, keepAliveOnce, trackedHeartbeatWrite, recoverOnSuccess, startGateway, type GatewayHooks } from "../../src/gateway/serve.ts";
 import { MemoryRefreshBackend } from "../../src/gateway/refresh-guard.ts";
 import { OAuthRefreshError } from "../../src/identities/oauth-refresh.ts";
 import { PrometheusMetrics } from "../../src/gateway/metrics.ts";
@@ -751,6 +753,36 @@ describe("keep-alive across every refreshable tool", () => {
       onPass: async (held) => void passes.push(held),
     });
     expect(passes).toEqual([{ "kimi/ok": { lastSuccessAt: "2026-01-01T00:00:00.000Z" }, "kimi/idle": {} }]);
+  });
+
+  test("a failed heartbeat write raises one alert and counts, and the next good write clears it", async () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(`${a.kind} ${a.key}`));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    const hb = { version: 1 as const, passAt: new Date().toISOString(), held: {} };
+    const bad = async () => { throw new Error("EACCES /secret/path"); };
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, bad);
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, bad);
+    expect(seen).toEqual(["heartbeat-write-failed gateway"]);
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, async () => {});
+    await trackedHeartbeatWrite({ metrics, alerter }, hb, bad);
+    expect(seen).toHaveLength(2);
+    const text = metrics.render();
+    expect(text).toContain('ais_gateway_heartbeat_writes_total{outcome="failed"} 3');
+    expect(text).toContain('ais_gateway_heartbeat_writes_total{outcome="ok"} 1');
+  });
+
+  test("the gateway keep-alive raises heartbeat-write-failed when the file cannot be written", async () => {
+    const saved = process.env.AIS_GATEWAY_HEARTBEAT;
+    const dir = await (await import("node:fs/promises")).mkdtemp(join(tmpdir(), "ais-hb-"));
+    await Bun.write(join(dir, "afile"), "x");
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "afile", "hb.json"); // parent is a regular file: the write fails
+    try {
+      await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [] });
+      await waitFor(() => alerts.some((a) => a.kind === "heartbeat-write-failed"));
+    } finally {
+      if (saved === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT; else process.env.AIS_GATEWAY_HEARTBEAT = saved;
+    }
   });
 
   test("a same-named account in two tools keeps separate revoked marks", async () => {

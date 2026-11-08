@@ -933,4 +933,37 @@ describe("gateway keep-alive cadence with the real refresh", () => {
     expect(calls).toHaveLength(1);
     expect(lastSuccess.get(`kimi/${ACME}`)).toBeDefined();
   });
+
+  test("a grant minted an hour ago is not refreshed on a cold first pass, codex or kimi", async () => {
+    await json(CODEX_FILE(), {
+      OPENAI_API_KEY: null,
+      tokens: { access_token: fakeJwt({ iat: nowS() - 3600, exp: nowS() + 9 * 86_400 }), refresh_token: "rt-old-1" },
+      last_refresh: new Date((nowS() - 3600) * 1000).toISOString(),
+    });
+    await mkdir(join(dirs.kimi, "credentials"), { recursive: true });
+    await json(KIMI_FILE(), { access_token: "at-syn-kim", refresh_token: "rt-old-1", expires_at: nowS() - 2700 }); // 15 min token, minted an hour ago
+    const { calls, fetchImpl } = stubFetch([{ access_token: fakeJwt({ iat: nowS(), exp: nowS() + 864_000 }), refresh_token: "rt-new-1", expires_in: 900 }]);
+    const { keepAliveOnce, grantMintedAt } = await import("../../src/gateway/serve.ts");
+    await withOwner(async () => {
+      await keepAliveOnce({ refresh: ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never, accounts: async (t) => [identityIn(t === "codex" ? dirs.codex : dirs.kimi)], tools: ["codex", "kimi"], mintedAt: grantMintedAt, metrics: { keepAlive: () => {} } });
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a 401-driven refresh stamps the login so the next keep-alive pass makes no second POST", async () => {
+    const old = fakeJwt({ iat: nowS() - 86_400, exp: nowS() - 3600 });
+    await json(CODEX_FILE(), { OPENAI_API_KEY: null, tokens: { access_token: old, refresh_token: "rt-old-1" }, last_refresh: new Date((nowS() - 86_400) * 1000).toISOString() });
+    const { calls, fetchImpl } = stubFetch([{ access_token: fakeJwt({ iat: nowS(), exp: nowS() + 10 * 86_400 }), refresh_token: "rt-new-1", expires_in: 864_000 }]);
+    const { keepAliveOnce, stampRefreshSuccess } = await import("../../src/gateway/serve.ts");
+    const lastSuccess = new Map<string, string>();
+    const real = ((t: never, i: never, o: never) => refreshIdentityOAuthGrant(t, i, { ...(o as object), fetchImpl })) as never;
+    const stamped = stampRefreshSuccess(real, lastSuccess, () => new Date());
+    await withOwner(async () => {
+      const first = await stamped("codex", identityIn(dirs.codex), { force: true, expectedAccessToken: old });
+      expect(first.outcome).toBe("refreshed");
+      expect(lastSuccess.has(`codex/${ACME}`)).toBe(true);
+      await keepAliveOnce({ refresh: real, accounts: async () => [identityIn(dirs.codex)], tools: ["codex"], lastSuccess, metrics: { keepAlive: () => {} } });
+    });
+    expect(calls).toHaveLength(1);
+  });
 });

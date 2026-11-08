@@ -1,6 +1,6 @@
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { DEAD_REFRESH_CODES, OAuthRefreshError, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { PgRefreshBackend } from "./pg-refresh-backend.ts";
 import { guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, type RefreshGuardBackend } from "./refresh-guard.ts";
@@ -23,7 +23,7 @@ import type { GatewayStore } from "./store.ts";
 import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-source.ts";
 import type { GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
-import { readHeartbeat, writeHeartbeat } from "../identities/gateway-heartbeat.ts";
+import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
 import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -240,6 +240,40 @@ const describe = (err: unknown): string => {
  * Idle keep-alive: the gateway is the only refresher of managed logins, so it refreshes each one before expiry even with no
  * traffic (AIS's normal expiry window decides; a fresh login is left alone). Counted per outcome; a failure raises the usual alert.
  */
+/** Records the time of every successful refresh per "tool/name", whoever asked (keep-alive, 401 path, ensureUsable). */
+export function stampRefreshSuccess(refresh: RefreshFn, lastSuccess: Map<string, string>, now: () => Date): RefreshFn {
+  return (async (tool, identity, opts) => {
+    const r = await refresh(tool, identity, opts);
+    if (r.outcome === "refreshed") lastSuccess.set(`${tool}/${identity.name}`, now().toISOString());
+    return r;
+  }) as RefreshFn;
+}
+
+/** Typical access-token lifetimes, used to date a grant that records only its expiry. */
+const ACCESS_TOKEN_LIFETIME_S: Record<string, number> = { kimi: 900, codex: 10 * 86_400 };
+
+/** When the stored grant was minted: its own minted_at, else expiry minus the tool's token lifetime. Undefined when unknown. */
+export async function grantMintedAt(tool: string, account: Identity): Promise<number | undefined> {
+  const found = await readEffectiveGrant(tool as RefreshableTool, account).catch(() => undefined);
+  const g = found?.grant;
+  if (!g) return undefined;
+  if (g.minted_at !== undefined) return g.minted_at;
+  const life = ACCESS_TOKEN_LIFETIME_S[tool];
+  return g.expires_at !== undefined && life !== undefined ? g.expires_at - life : undefined;
+}
+
+/** Writes the ownership heartbeat; a failure raises one alert (cleared by the next good write) and is counted. */
+export async function trackedHeartbeatWrite(deps: { metrics: Pick<PrometheusMetrics, "heartbeatWrite">; alerter: Alerter }, hb: GatewayHeartbeat, write: (hb: GatewayHeartbeat) => Promise<void> = writeHeartbeat): Promise<void> {
+  try {
+    await write(hb);
+    deps.metrics.heartbeatWrite("ok");
+    deps.alerter.recover("heartbeat-write-failed", "gateway");
+  } catch {
+    deps.metrics.heartbeatWrite("failed");
+    deps.alerter.raise("heartbeat-write-failed", "gateway", "the gateway could not write its ownership heartbeat; other hosts will refresh its logins themselves until it can (check the ~/.ais directory)");
+  }
+}
+
 export async function keepAliveOnce(deps: {
   refresh: RefreshFn;
   accounts: (tool: string) => Promise<Identity[]>;
@@ -250,6 +284,8 @@ export async function keepAliveOnce(deps: {
   /** "tool/name" to the ISO time of its last successful refresh; survives passes so codex and kimi rotate about daily, not per pass. */
   lastSuccess?: Map<string, string>;
   now?: () => Date;
+  /** Seconds when the login's stored grant was last minted, if known: a grant minted recently counts as just refreshed (cold start, host handoff). */
+  mintedAt?: (tool: string, account: Identity) => Promise<number | undefined>;
   /** Called after the pass with every login held and its last success: the gateway's heartbeat. */
   onPass?: (held: Record<string, { lastSuccessAt?: string }>, at: Date) => Promise<void>;
 }): Promise<void> {
@@ -264,6 +300,12 @@ export async function keepAliveOnce(deps: {
       held[key] = {};
       try {
         const known = revoked.get(key);
+        const minted = await deps.mintedAt?.(tool, account).catch(() => undefined);
+        if (minted !== undefined) {
+          const iso = new Date(minted * 1000).toISOString();
+          const have = lastSuccess.get(key);
+          if (!have || have < iso) lastSuccess.set(key, iso);
+        }
         const r = await deps.refresh(tool as RefreshableTool, account, { keepAlive: true, lastSuccessAt: lastSuccess.get(key) ?? null, ...(known ? { revokedFingerprint: known } : {}) });
         if (r.outcome === "skipped-revoked" && r.beforeFingerprint) revoked.set(key, r.beforeFingerprint);
         else revoked.delete(key);
@@ -310,8 +352,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   });
   const instrumented = instrumentRefresh(guarded, { metrics, alerter, failed: failedTokens });
   /** The one guarded refresh: the credential cache and the keep-alive both go through it, and stop() waits for it. */
+  /** Last successful refresh per "tool/name", stamped for every gateway refresh (keep-alive, 401 path, ensureUsable). */
+  const lastSuccessAt = new Map<string, string>();
+  const stamped = stampRefreshSuccess(instrumented, lastSuccessAt, now);
   const refreshLogin = ((...a: Parameters<RefreshFn>) => {
-    const p = instrumented(...a);
+    const p = stamped(...a);
     inflightRefreshes.add(p);
     const done = (): void => void inflightRefreshes.delete(p);
     p.then(done, done);
@@ -469,17 +514,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   alertTimer.unref?.();
   const revokedGrants = new Map<string, string>();
   // Seeded from the previous heartbeat so a restart does not rotate every codex and kimi login again at once.
-  const lastSuccessAt = new Map<string, string>();
   if (!hooks.noHeartbeat) {
     const prior = await readHeartbeat();
-    for (const [k, v] of Object.entries(prior?.held ?? {})) if (v.lastSuccessAt) lastSuccessAt.set(k, v.lastSuccessAt);
+    for (const [k, v] of Object.entries(prior?.held ?? {})) if (v.lastSuccessAt && !(lastSuccessAt.get(k) && lastSuccessAt.get(k)! >= v.lastSuccessAt)) lastSuccessAt.set(k, v.lastSuccessAt);
   }
   let keepAliveRunning = false;
   let keepAliveRun: Promise<void> | undefined;
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     keepAliveRunning = true;
-    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, lastSuccess: lastSuccessAt, now, onPass: hooks.noHeartbeat ? undefined : (held, at) => writeHeartbeat({ version: 1, passAt: at.toISOString(), held }), metrics, revoked: revokedGrants }).finally(() => {
+    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, lastSuccess: lastSuccessAt, now, mintedAt: grantMintedAt, onPass: hooks.noHeartbeat ? undefined : (held, at) => trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held }), metrics, revoked: revokedGrants }).finally(() => {
       keepAliveRunning = false;
     });
   }, hooks.keepAliveMs ?? 600_000);
