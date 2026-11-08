@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { authStatus, credentialPathsForTool } from "../../src/server/auth.ts";
+import { dirname, join } from "node:path";
+import { authStatus, credentialPathsForTool, refusePool } from "../../src/server/auth.ts";
 import type { RefreshStatusDto } from "../../src/server/auth-refresh.ts";
 import type { ToolConfig } from "../../src/identities/types.ts";
 import type { AuthKind, AuthState } from "../../src/server/types.ts";
@@ -107,7 +107,7 @@ describe("claude probe", () => {
   test("expired, expiring and fresh tokens report expiresAt", async () => {
     for (const [hours, expected] of [
       [-5, "expired"],
-      [2, "expiring"],
+      [2, "ok"],
       [48, "ok"],
     ] as const) {
       const { entry, configDir } = await statusFor("claude");
@@ -120,6 +120,108 @@ describe("claude probe", () => {
       expect(refreshed.state).toBe(expected);
       expect(refreshed.expiresAt).toBeDefined();
     }
+  });
+});
+
+describe("claude probe expiring label", () => {
+  test("no refresh token with 2h left is expiring", async () => {
+    const { configDir } = await statusFor("claude");
+    await Bun.write(
+      join(configDir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "a", expiresAt: hoursFromNow(2) } }),
+    );
+    const dto = await authStatus([configFor("claude", join(configDir, ".."))]);
+    expect(singleEntry(dto).state).toBe("expiring");
+  });
+
+  test("refresh token with 2h left is ok and still shows the time left", async () => {
+    const { configDir } = await statusFor("claude");
+    await Bun.write(
+      join(configDir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "b", expiresAt: hoursFromNow(2) } }),
+    );
+    const dto = await authStatus([configFor("claude", join(configDir, ".."))]);
+    expect(singleEntry(dto).state).toBe("ok");
+    expect(singleEntry(dto).detail).toContain("expires in");
+  });
+});
+
+describe("refresher health on short-lived tokens", () => {
+  const status = (over: Partial<RefreshStatusDto>): RefreshStatusDto => ({
+    tool: "claude",
+    identity: "work",
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    lastError: null,
+    lastDetail: null,
+    revoked: false,
+    consecutiveFailures: 0,
+    running: false,
+    ...over,
+  });
+
+  async function claudeWith2h(refresh: RefreshStatusDto[]) {
+    const { configDir } = await statusFor("claude");
+    await Bun.write(
+      join(configDir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "b", expiresAt: hoursFromNow(2) } }),
+    );
+    return singleEntry(await authStatus([configFor("claude", join(configDir, ".."))], refresh));
+  }
+
+  test("a revoked refresher (lastError cleared) is never ok", async () => {
+    const entry = await claudeWith2h([status({ lastError: null, revoked: true })]);
+    expect(entry.state).not.toBe("ok");
+    expect(entry.detail).toContain("re-login required");
+  });
+
+  test("consecutive failures are never ok", async () => {
+    const entry = await claudeWith2h([status({ consecutiveFailures: 2 })]);
+    expect(entry.state).toBe("expiring");
+  });
+
+  test("pi and opencode have no refresher, so a refresh token does not make them ok", async () => {
+    for (const tool of ["pi", "opencode"] as const) {
+      const { configDir } = await statusFor(tool);
+      const authPath = credentialPathsForTool(tool, configDir)[0] as string;
+      await mkdir(dirname(authPath), { recursive: true });
+      await Bun.write(
+        authPath,
+        JSON.stringify({ anthropic: { access: "a", refresh: "b", refreshToken: "b", expires: hoursFromNow(2) } }),
+      );
+      const entry = singleEntry(await authStatus([configFor(tool, join(configDir, ".."))]));
+      expect(entry.state).toBe("expiring");
+    }
+  });
+});
+
+describe("gateway pools", () => {
+  test("a pool shows via gateway with no expiry and no login actions", async () => {
+    const root = await tempHome();
+    const configDir = join(root, "identity-swap");
+    await mkdir(configDir, { recursive: true });
+    await writeFile(
+      join(root, "identities.json"),
+      JSON.stringify({
+        version: 1,
+        identities: [{ name: "swap", label: "Swap", configDir, swapPool: { accounts: ["work"] } }],
+      }),
+    );
+    await writeFile(
+      join(configDir, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "aisg_x", refreshToken: "b", expiresAt: hoursFromNow(2) } }),
+    );
+    const entry = singleEntry(await authStatus([configFor("claude", root)]));
+    expect(entry.state).toBe("gateway");
+    expect(entry.expiresAt).toBeUndefined();
+    expect(entry.fixable).toEqual([]);
+  });
+
+  test("login is refused for a pool identity but not for an account", () => {
+    expect(() => refusePool({ name: "swap", label: "Swap", configDir: "/x", swapPool: { accounts: [] } } as never)).toThrow(
+      "gateway pool",
+    );
+    expect(() => refusePool({ name: "work", label: "Work", configDir: "/x" } as never)).not.toThrow();
   });
 });
 

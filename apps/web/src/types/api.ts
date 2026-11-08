@@ -507,7 +507,7 @@ export interface TranscriptResponse {
 /* Auth */
 
 export type AuthKind = "oauth" | "apikey" | "cookie" | "none";
-export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown" | "retired";
+export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown" | "retired" | "gateway";
 
 export interface AuthEntry {
   toolName: ToolName;

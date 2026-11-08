@@ -255,7 +255,8 @@ describe("oauthRefreshHealth (doctor classifier)", () => {
       tokens: { access_token: fakeJwt({ iat: NOW, exp: NOW + 3600 }), refresh_token: "rt-alive-1" },
     });
     const health = await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW });
-    expect(health.state).toBe("expiring");
+    expect(health.state).toBe("fresh");
+    expect(health.detail).toContain("expires in");
     await json(CODEX_FILE(), {
       tokens: { access_token: fakeJwt({ iat: NOW, exp: NOW + 30 * 86_400 }), refresh_token: "rt-alive-1" },
     });
@@ -282,7 +283,23 @@ describe("oauthRefreshHealth (doctor classifier)", () => {
     const health = await oauthRefreshHealth("claude", { name: ACME, label: "Acme", configDir: dirs.claude }, undefined, {
       nowSeconds: NOW,
     });
+    expect(health.state).toBe("fresh");
+  });
+
+  test("no refresh token with 2h left is expiring", async () => {
+    await json(CODEX_FILE(), {
+      tokens: { access_token: fakeJwt({ iat: NOW, exp: NOW + 7200 }) },
+    });
+    const health = await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW });
     expect(health.state).toBe("expiring");
+  });
+
+  test("refresh token with 2h left is fresh", async () => {
+    await json(CODEX_FILE(), {
+      tokens: { access_token: fakeJwt({ iat: NOW, exp: NOW + 7200 }), refresh_token: "rt-alive-1" },
+    });
+    const health = await oauthRefreshHealth("codex", codexIdentity(), undefined, { nowSeconds: NOW });
+    expect(health.state).toBe("fresh");
   });
 
   test("expired with no refresh token is not refreshable", async () => {

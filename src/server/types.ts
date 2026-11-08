@@ -99,7 +99,7 @@ export interface SessionsEnvelope {
 export type AuthKind = "oauth" | "apikey" | "cookie" | "none";
 /** "retired" is reported without probing: the identity's credentials were
  * deleted on purpose and nothing may touch it until it is unretired. */
-export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown" | "retired";
+export type AuthState = "ok" | "expiring" | "expired" | "missing" | "unknown" | "retired" | "gateway";
 
 export interface AuthEntryDto {
   toolName: ToolConfig["toolName"];
