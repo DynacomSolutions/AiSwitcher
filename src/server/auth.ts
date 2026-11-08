@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { loadAll, TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { requireTool } from "./registries.ts";
 import { isRetired } from "../identities/retired.ts";
+import { isSwapPool } from "../identities/pool/swap-pool.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { credentialPathsForTool } from "../identities/credential-paths.ts";
 import { readAliApiKey, writeAliAuthFile } from "../identities/ali-auth.ts";
@@ -12,7 +13,7 @@ import { withUsableCwd } from "../shared/exec.ts";
 import { resolveRealBinary } from "../shared/resolve-binary.ts";
 import { LOGIN_FLOW_SPECS, type LoginFlowSpec } from "./login-specs.ts";
 import type { RefreshStatusDto } from "./auth-refresh.ts";
-import type { ToolConfig } from "../identities/types.ts";
+import type { Identity, ToolConfig } from "../identities/types.ts";
 import {
   HttpError,
   type AuthDto,
@@ -34,6 +35,8 @@ interface ProbeResult {
   detail?: string;
   fixable: string[];
   expiresAt?: string;
+  /** Short access-token life but a refresh token is held: healthy unless the refresher is failing. */
+  selfRefreshing?: boolean;
 }
 
 function exists(path: string): Promise<boolean> {
@@ -47,15 +50,30 @@ function exists(path: string): Promise<boolean> {
 export { credentialPathsForTool };
 
 /** Expires-in state mapping shared by every probe with a known expiry. */
-function stateFromExpiry(expiresAtMs: number): { state: AuthEntryDto["state"]; detail: string } {
+function stateFromExpiry(
+  expiresAtMs: number,
+  hasRefreshToken = false,
+): { state: AuthEntryDto["state"]; detail: string; selfRefreshing?: boolean } {
   const hoursLeft = (expiresAtMs - Date.now()) / 3_600_000;
   if (hoursLeft <= 0) {
     return { state: "expired", detail: `token expired ${Math.abs(hoursLeft).toFixed(1)}h ago` };
   }
   if (hoursLeft < 24) {
+    // The gateway refreshes short-lived access tokens, so a refresh token makes this healthy.
+    if (hasRefreshToken) return { state: "ok", detail: `token expires in ${hoursLeft.toFixed(1)}h (auto-refreshed)`, selfRefreshing: true };
     return { state: "expiring", detail: `token expires in ${hoursLeft.toFixed(1)}h` };
   }
   return { state: "ok", detail: `token expires in ${(hoursLeft / 24).toFixed(1)}d` };
+}
+
+/** True when the credential JSON holds a non-empty refresh token under any key. */
+function hasRefreshToken(value: unknown, depth = 0): boolean {
+  if (depth > 4 || typeof value !== "object" || value === null) return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (/^refresh[_-]?token$/i.test(key) && typeof child === "string" && child.length > 0) return true;
+    if (hasRefreshToken(child, depth + 1)) return true;
+  }
+  return false;
 }
 
 function toIso(ms: number): string {
@@ -130,13 +148,14 @@ async function probeClaude(configDir: string): Promise<ProbeResult> {
   if (expiry === undefined) {
     return { kind: "oauth", state: "ok", detail: ".credentials.json present (no parsable expiry)", fixable: ["login"] };
   }
-  const derived = stateFromExpiry(expiry);
+  const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
   return {
     kind: "oauth",
     state: derived.state,
     detail: derived.detail,
     fixable: ["login"],
     expiresAt: toIso(expiry),
+    ...(derived.selfRefreshing ? { selfRefreshing: true } : {}),
   };
 }
 
@@ -155,8 +174,8 @@ async function probeCodex(configDir: string): Promise<ProbeResult> {
   if (expiry === undefined) {
     return { kind: "oauth", state: "ok", detail: "auth.json present (API key or unparsable expiry)", fixable: ["login"] };
   }
-  const derived = stateFromExpiry(expiry);
-  return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry) };
+  const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
+  return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry), ...(derived.selfRefreshing ? { selfRefreshing: true } : {}) };
 }
 
 async function probeGrok(configDir: string): Promise<ProbeResult> {
@@ -169,8 +188,8 @@ async function probeGrok(configDir: string): Promise<ProbeResult> {
     if (expiry === undefined) {
       return { kind: "oauth", state: "unknown", detail: `${name} present (freshness not verifiable)`, fixable: ["login"] };
     }
-    const derived = stateFromExpiry(expiry);
-    return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry) };
+    const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
+    return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry), ...(derived.selfRefreshing ? { selfRefreshing: true } : {}) };
   }
   return { kind: "oauth", state: "missing", detail: "no known credential file in configDir", fixable: ["login"] };
 }
@@ -188,13 +207,14 @@ async function probeKimi(configDir: string): Promise<ProbeResult> {
   if (expiry === undefined) {
     return { kind: "oauth", state: "unknown", detail: "token present but no parsable expiry field", fixable: ["refresh", "login"] };
   }
-  const derived = stateFromExpiry(expiry);
+  const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
   return {
     kind: "oauth",
     state: derived.state,
     detail: `${derived.detail} (refresh happens on next live fetch)`,
     fixable: ["refresh", "login"],
     expiresAt: toIso(expiry),
+    ...(derived.selfRefreshing ? { selfRefreshing: true } : {}),
   };
 }
 
@@ -240,8 +260,8 @@ async function probePi(configDir: string): Promise<ProbeResult> {
   if (expiry === undefined) {
     return { kind: "oauth", state: "ok", detail: "auth.json present (no parsable expiry)", fixable: ["login"] };
   }
-  const derived = stateFromExpiry(expiry);
-  return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry) };
+  const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
+  return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry), ...(derived.selfRefreshing ? { selfRefreshing: true } : {}) };
 }
 
 async function probeOpencode(configDir: string): Promise<ProbeResult> {
@@ -255,8 +275,8 @@ async function probeOpencode(configDir: string): Promise<ProbeResult> {
     if (expiry === undefined) {
       return { kind: "oauth", state: "ok", detail: "auth.json present (no parsable expiry)", fixable: ["login"] };
     }
-    const derived = stateFromExpiry(expiry);
-    return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry) };
+    const derived = stateFromExpiry(expiry, hasRefreshToken(raw));
+    return { kind: "oauth", state: derived.state, detail: derived.detail, fixable: ["login"], expiresAt: toIso(expiry), ...(derived.selfRefreshing ? { selfRefreshing: true } : {}) };
   }
   return { kind: "oauth", state: "missing", detail: "no auth.json under this identity's opencode data dir", fixable: ["login"] };
 }
@@ -278,6 +298,19 @@ export async function authStatus(
           kind: "none",
           state: "retired",
           detail: "retired: credentials removed; unretire and log in again to use it",
+          fixable: [],
+        });
+        continue;
+      }
+      // Pools hold only the gateway entry and never an account login: no
+      // probe, no expiry, no login or fix actions.
+      if (isSwapPool(identity)) {
+        entries.push({
+          toolName: cfg.toolName,
+          identity: identity.name,
+          kind: "none",
+          state: "gateway",
+          detail: "via gateway: pools hold no account login",
           fixable: [],
         });
         continue;
@@ -317,11 +350,13 @@ export async function authStatus(
         result = { kind: "none", state: "unknown", detail: err instanceof Error ? err.message : "probe failed", fixable: [] };
       }
       const refresh = refreshStatus.find((entry) => entry.tool === cfg.toolName && entry.identity === identity.name);
+      // A failing refresher means the short-lived token is not self-healing.
+      const state = result.selfRefreshing && refresh?.lastError ? "expiring" : result.state;
       entries.push({
         toolName: cfg.toolName,
         identity: identity.name,
         kind: result.kind,
-        state: result.state,
+        state,
         ...(result.detail ? { detail: result.detail } : {}),
         fixable: result.fixable,
         ...(result.expiresAt ? { expiresAt: result.expiresAt } : {}),
@@ -335,12 +370,20 @@ export async function authStatus(
 
 /* ------------------------------- fix actions ------------------------------ */
 
+/** Logging a pool in would write an account login into it and break the gateway. */
+export function refusePool(identity: Identity): void {
+  if (isSwapPool(identity)) {
+    throw new HttpError(409, `"${identity.name}" is a gateway pool and has no account login; log in to a member account instead`);
+  }
+}
+
 async function registryIdentity(toolName: ToolConfig["toolName"], identityName: string): Promise<{ cfg: ToolConfig; configDir: string }> {
   const cfg = requireTool(toolName);
   const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
   const identity = findIdentityByNameOrAlias(file.identities, identityName);
   if (!identity) throw new HttpError(404, `identity "${identityName}" not found in ${toolName}'s registry`);
   if (isRetired(identity)) throw new HttpError(409, `identity "${identityName}" is retired; unretire it first`);
+  refusePool(identity);
   return { cfg, configDir: identity.configDir };
 }
 

@@ -983,7 +983,8 @@ export async function oauthRefreshHealth(
   if (secondsLeft !== undefined && secondsLeft > 0) {
     const hours = secondsLeft / 3600;
     return {
-      state: hours <= 24 ? "expiring" : "fresh",
+      // The gateway refreshes short-lived access tokens, so only a grant with no refresh token is "expiring".
+      state: hours <= 24 && !grant.refresh_token ? "expiring" : "fresh",
       detail: `access token expires in ${hours < 48 ? `${hours.toFixed(1)}h` : `${Math.round(hours / 24)}d`}`,
       ...(expiresAt !== undefined ? { expiresAt } : {}),
       ...(fingerprint ? { refreshFingerprint: fingerprint } : {}),

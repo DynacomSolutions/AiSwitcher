@@ -93,6 +93,12 @@ export function AuthStateBadge({ state, className }: { state: AuthState; classNa
           Not logged in
         </Badge>
       );
+    case "gateway":
+      return (
+        <Badge variant="muted" className={className}>
+          Via gateway
+        </Badge>
+      );
     case "retired":
       return (
         <Badge variant="muted" className={className}>
