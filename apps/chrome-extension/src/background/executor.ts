@@ -16,12 +16,8 @@ const NAVIGATE_LOAD_WAIT_MS = 15_000;
 const BUFFER_LIMIT = 500;
 /** A capture that takes longer than this means Chrome is not rendering the tab. */
 export const CAPTURE_TIMEOUT_MS = 8000;
-/** How long to wait for a freshly activated tab to report visible. */
-export const VISIBLE_WAIT_MS = 2000;
 /** After a hover the overlay stays hidden this long (or until the next non-hover call) so it cannot steal the pointer. */
 export const HOVER_HOLD_MS = 1500;
-/** Tools that act on what the user would see: the tab must be at the front of its window first. */
-const NEEDS_FRONT = new Set<ExtensionTool>(["screenshot", "click", "type", "hover", "scroll", "key", "form_input"]);
 
 type Content = Extract<CallResult, { ok: true }>["content"];
 
@@ -73,7 +69,6 @@ export interface ExecutorDeps {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   defaultTimeoutMs?: number;
   captureTimeoutMs?: number;
-  visibleWaitMs?: number;
   hoverHoldMs?: number;
 }
 
@@ -83,6 +78,10 @@ export class Executor {
   private readonly state: State;
   private readonly ui: Ui;
   private readonly attached = new Set<number>();
+
+  /** Tabs the debugger is attached to right now. */
+  attachedTabIds(): number[] { return [...this.attached]; }
+
   private readonly domReady = new Set<number>();
   private readonly scales = new Map<number, number>();
   private readonly refTables = new Map<number, RefTable>();
@@ -102,7 +101,6 @@ export class Executor {
     }));
     this.defaultTimeout = deps.defaultTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this.captureTimeout = deps.captureTimeoutMs ?? CAPTURE_TIMEOUT_MS;
-    this.visibleWait = deps.visibleWaitMs ?? VISIBLE_WAIT_MS;
     this.hoverHold = deps.hoverHoldMs ?? HOVER_HOLD_MS;
     this.api.debugger.onEvent((tabId, method, params) => this.onEvent(tabId, method, params));
     this.api.debugger.onDetach((tabId, reason) => {
@@ -118,7 +116,6 @@ export class Executor {
   private readonly sleepFn: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly defaultTimeout: number;
   private readonly captureTimeout: number;
-  private readonly visibleWait: number;
   private readonly hoverHold: number;
   private readonly held = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -132,6 +129,7 @@ export class Executor {
     const invalid = validateToolArgs(tool, req.args);
     if (invalid) return fail("bad_args", invalid);
 
+    this.tabs.touch(req.session);
     const controller = this.state.track(id);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -169,13 +167,25 @@ export class Executor {
     const a = <T extends ExtensionTool>(_t: T): ToolArgs[T] => args as ToolArgs[T];
     switch (tool) {
       case "tabs_context": {
-        const { own, other } = await this.tabs.list(session.id);
+        const { own, granted, other } = await this.tabs.list(session.id);
         const view = (t: TabInfo) => ({ tabId: t.id, url: t.url, title: t.title, active: t.active });
-        return text(JSON.stringify({ sessionTabs: own.map(view), otherTabs: other.map(view), note: "otherTabs are read-only; use adopt_tab to control one." }));
+        const grantedView = (t: TabInfo) => ({ ...view(t), scope: "granted", groupId: t.groupId });
+        const mineGroup = this.tabs.sessions.get(session.id)?.groupId;
+        // `scope` and `grantedGroups` are additive: "own" tabs are in this session's own group, "granted" tabs sit in a group the user granted.
+        const ownView = (t: TabInfo) => (t.groupId !== -1 && t.groupId !== mineGroup && this.tabs.grantee(t.groupId) === session.id ? grantedView(t) : { ...view(t), scope: "own" });
+        return text(JSON.stringify({ sessionTabs: [...own.map(ownView), ...granted.map(grantedView)], otherTabs: other.map(view), grantedGroups: this.tabs.grantedGroups(session.id), note: "otherTabs are read-only; use adopt_tab to control one. scope \"granted\" tabs belong to a group the user granted: use and open tabs in them (tabs_create with groupId), but you cannot rename or close that group." }));
       }
       case "tabs_create": {
         this.throwIfAborted(sig);
-        const tab = await this.tabs.create(session, a("tabs_create").url ? this.normaliseUrl(a("tabs_create").url!) : undefined);
+        const { url, groupId } = a("tabs_create");
+        const target = url ? this.normaliseUrl(url) : undefined;
+        if (groupId !== undefined) {
+          const made = await this.tabs.createInGranted(session, groupId, target);
+          if (!made) throw new ToolError("forbidden_tab", `Group ${groupId} is not granted to this session.`);
+          await this.markControlled(made.id, session);
+          return text(JSON.stringify({ tabId: made.id, url: made.url, groupId }));
+        }
+        const tab = await this.tabs.create(session, target);
         await this.markControlled(tab.id, session);
         return text(JSON.stringify({ tabId: tab.id, url: tab.url }));
       }
@@ -183,6 +193,8 @@ export class Executor {
         const { tabId } = a("adopt_tab");
         const tab = await this.api.tabs.get(tabId);
         if (!tab) throw new ToolError("tab_closed", `Tab ${tabId} no longer exists.`);
+        if (this.tabs.inGrantedGroup(session.id, session.identity, tab)) return text(`Tab ${tabId} is in a group granted to this session and is already usable.`);
+        if (this.tabs.grantee(tab.groupId) !== undefined) throw new ToolError("forbidden_tab", `Tab ${tabId} is in a group the user granted to another session.`);
         const owner = this.tabs.ownerOf(tabId);
         if (owner !== undefined && !this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} belongs to another session.`);
         this.throwIfAborted(sig);
@@ -201,7 +213,6 @@ export class Executor {
     const tab = await this.ownedTab(req, tabId);
     this.throwIfAborted(sig);
     if (tool !== "hover") await this.releaseHold(tabId);
-    if (NEEDS_FRONT.has(tool)) await this.bringToFront(sig, tab);
     switch (tool) {
       case "navigate": return this.navigate(sig, tab, a("navigate").url);
       case "screenshot": return this.hidden(sig, tabId, () => this.screenshot(sig, tabId));
@@ -295,6 +306,8 @@ export class Executor {
         return text(`Resized window to ${a("resize").width}x${a("resize").height}.`);
       }
       case "close_tab": {
+        // Only tabs this session opened or adopted: tabs that merely sit in a granted group are the user's.
+        if (!this.tabs.owns(session.id, tabId, session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} was not opened by this session, so it cannot be closed.`);
         this.throwIfAborted(sig);
         await this.api.tabs.remove(tabId);
         this.tabs.forget(tabId);
@@ -310,8 +323,11 @@ export class Executor {
   // ---- ownership ---------------------------------------------------------
 
   private async ownedTab(req: CallRequest, tabId: number): Promise<TabInfo> {
-    if (!this.tabs.owns(req.session.id, tabId, req.session.identity)) throw new ToolError("forbidden_tab", `Tab ${tabId} is not in this session. Use tabs_create, or adopt_tab to take one of the user's tabs.`);
+    const own = this.tabs.owns(req.session.id, tabId, req.session.identity);
+    const forbidden = (): ToolError => new ToolError("forbidden_tab", `Tab ${tabId} is not in this session. Use tabs_create, or adopt_tab to take one of the user's tabs.`);
+    if (!own && this.tabs.grantedGroups(req.session.id).length === 0) throw forbidden();
     const tab = await this.api.tabs.get(tabId);
+    if (!own && (!tab || !this.tabs.inGrantedGroup(req.session.id, req.session.identity, tab))) throw forbidden();
     if (!tab) {
       this.tabs.forget(tabId);
       this.dropTab(tabId);
@@ -373,24 +389,6 @@ export class Executor {
     await Promise.all([...this.held.keys()].map(id => this.releaseHold(id)));
   }
 
-  /** Brings a non-active tab to the front of its window (never the window itself) and waits until Chrome reports it visible. */
-  private async bringToFront(sig: AbortSignal, tab: TabInfo): Promise<void> {
-    if (tab.active) return;
-    await this.api.tabs.activate(tab.id);
-    const end = Date.now() + this.visibleWait;
-    while (Date.now() < end) {
-      this.throwIfAborted(sig);
-      try {
-        const r = (await this.cdp(sig, tab.id, "Runtime.evaluate", { expression: "document.visibilityState", returnByValue: true })) as { result?: { value?: unknown } };
-        if (r.result?.value === "visible") return;
-      } catch (e) {
-        if (e instanceof ToolError) throw e;
-      }
-      await new Promise<void>(res => { const t = setTimeout(res, 40); sig.addEventListener("abort", () => { clearTimeout(t); res(); }, { once: true }); });
-    }
-    this.throwIfAborted(sig); // still not visible: carry on, the capture timeout reports tab_hidden
-  }
-
   private async unmark(tabId: number): Promise<void> {
     try { await this.ui.unmark(tabId); } catch { /* best effort */ }
   }
@@ -418,6 +416,8 @@ export class Executor {
     // A timeout or gateway abort keeps the attachment: a concurrent call may already rely on it.
     this.attached.add(tabId);
     for (const d of ["Page", "Runtime", "Log", "Network"]) await this.api.debugger.send(tabId, `${d}.enable`);
+    // Agents work in the background and never activate a tab: focus emulation keeps a background tab rendering for CDP captures and input.
+    try { await this.api.debugger.send(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }); } catch { /* best effort */ }
   }
 
   private async cdp(sig: AbortSignal, tabId: number, method: string, params?: Record<string, unknown>): Promise<unknown> {

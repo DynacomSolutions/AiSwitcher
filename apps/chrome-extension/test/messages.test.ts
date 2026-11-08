@@ -11,6 +11,8 @@ function setup() {
     status: async () => { calls.push("status"); return { status: "idle", paused: false, inflight: 0, signedIn: false, sessions: [] }; },
     setDisconnected: async v => { calls.push(`disconnected:${v}`); },
     isMarked: id => id === 7,
+    grant: async (g, sid) => { calls.push(`grant:${g}:${sid}`); return "ok"; },
+    revoke: async g => { calls.push(`revoke:${g}`); },
   };
   const replies: unknown[] = [];
   const send = (type: string, sender: MessageSender) => { const r = handleMessage({ type }, sender, v => replies.push(v), deps); return r; };
@@ -46,5 +48,20 @@ describe("runtime message sender checks", () => {
     expect(t.send("ais-stop", content(7, 3))).toBe(false); // subframe
     for (const m of ["ais-resume", "ais-pause", "ais-status", "ais-disconnect", "ais-connect"]) expect(t.send(m, content(7))).toBe(false);
     expect(t.calls).toEqual([]);
+  });
+});
+
+describe("grant and revoke messages", () => {
+  test("only the side panel may grant or revoke, with valid arguments", async () => {
+    const t = setup();
+    const send = (msg: object, sender: MessageSender) => handleMessage(msg, sender, v => t.replies.push(v), { ...({} as MessageDeps), runtimeId: ID, grant: async (g, s) => { t.calls.push(`grant:${g}:${s}`); return "ok"; }, revoke: async g => { t.calls.push(`revoke:${g}`); } });
+    expect(send({ type: "ais-grant", groupId: 3, sessionId: "s1" }, page)).toBe(true);
+    expect(send({ type: "ais-revoke", groupId: 3 }, page)).toBe(true);
+    expect(send({ type: "ais-grant", groupId: "3", sessionId: "s1" }, page)).toBe(false);
+    expect(send({ type: "ais-grant", groupId: 3, sessionId: "s1" }, { id: ID, origin: "https://site.test", frameId: 0, tab: { id: 7 } })).toBe(false);
+    await Bun.sleep(5);
+    expect(t.calls).toEqual(["grant:3:s1", "revoke:3"]);
+    expect(t.replies).toContainEqual({ ok: false, error: "bad_args" });
+    expect(t.replies.filter(r => (r as { ok: boolean }).ok)).toHaveLength(2);
   });
 });

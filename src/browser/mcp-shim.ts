@@ -7,7 +7,7 @@ import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { shortSessionId } from "./session-label.ts";
+import { sessionName } from "./session-label.ts";
 import { BROWSER_TOOLS, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
 
@@ -56,7 +56,7 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
     const auth = await ctx.resolveAuth();
     if (auth.error !== undefined || !auth.identity) return errorResult(auth.error ?? "internal: cannot resolve the active pool member");
     token = auth.token;
-    session = { id: ctx.session.id, identity: auth.identity, label: `${auth.identity} / ${shortSessionId(ctx.session.id)}` };
+    session = { id: ctx.session.id, identity: auth.identity, label: ctx.session.label };
     url = await ctx.gatewayUrl();
   } else {
     [url, token] = await Promise.all([ctx.gatewayUrl(), ctx.token()]);
@@ -181,13 +181,14 @@ export async function resolvePoolAuth(poolName: string, tool: string, registryPa
 }
 
 export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimOptions = {}): ShimContext {
-  const id = env.CLAUDE_SESSION_ID || env.CODEX_SESSION_ID || crypto.randomUUID();
+  // Without a session id from the agent, key the session on the parent agent process: a respawned shim keeps the same session (and tab group) instead of starting a new one.
+  const id = env.CLAUDE_SESSION_ID || env.CODEX_SESSION_ID || `agent-${process.ppid}`;
   const identity = opts.identity || env.AI_PROFILE_SWITCHER_SESSION || "agent";
   return {
     gatewayUrl: async () => opts.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
     token: () => readToken(env, opts.configDir),
     ...(opts.pool ? { resolveAuth: () => resolvePoolAuth(opts.pool!, opts.tool ?? "claude", opts.registryPath) } : {}),
-    session: { id, identity, label: `${identity} / ${shortSessionId(id)}` },
+    session: { id, identity, label: sessionName(id, env) },
     fetch,
     inflight: new Map(),
   };

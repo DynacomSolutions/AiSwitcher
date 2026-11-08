@@ -1,5 +1,6 @@
 // runtime.onMessage handling, kept free of chrome.* so it can be unit tested with fake senders.
 import type { PanelStatus } from "../shared/panel.ts";
+import type { GrantResult } from "./tabs.ts";
 
 export interface MessageSender { id?: string; origin?: string; frameId?: number; tab?: { id?: number } }
 
@@ -9,6 +10,9 @@ export interface MessageDeps {
   status(): Promise<PanelStatus>;
   setDisconnected(value: boolean): Promise<void>;
   isMarked(tabId: number): boolean;
+  /** Grants a user's tab group to a live session. */
+  grant(groupId: number, sessionId: string): Promise<GrantResult>;
+  revoke(groupId: number): Promise<void>;
 }
 
 /**
@@ -32,6 +36,18 @@ export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: un
     case "ais-stop": void deps.state.stop().then(() => reply({ ok: true })); return true;
     case "ais-disconnect": void deps.setDisconnected(true).then(() => reply({ ok: true })); return true;
     case "ais-connect": void deps.setDisconnected(false).then(() => reply({ ok: true })); return true;
+    case "ais-grant": {
+      const { groupId, sessionId } = msg as { groupId?: unknown; sessionId?: unknown };
+      if (typeof groupId !== "number" || !Number.isInteger(groupId) || typeof sessionId !== "string") { reply({ ok: false, error: "bad_args" }); return false; }
+      void deps.grant(groupId, sessionId).then(r => reply(r === "ok" ? { ok: true } : { ok: false, error: r }));
+      return true;
+    }
+    case "ais-revoke": {
+      const { groupId } = msg as { groupId?: unknown };
+      if (typeof groupId !== "number" || !Number.isInteger(groupId)) { reply({ ok: false, error: "bad_args" }); return false; }
+      void deps.revoke(groupId).then(() => reply({ ok: true }));
+      return true;
+    }
     case "ais-status": void deps.status().then(reply); return true;
     default: return false;
   }

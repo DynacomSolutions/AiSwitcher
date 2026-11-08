@@ -311,18 +311,16 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(info.groups.find(g => g.id === info.gb)?.title).toBe("main / sess-b");
   });
 
-  it("new tabs are active in their group; a deliberately backgrounded tab is re-activated for a capture", async () => {
+  it("agents work in the background: a capture of a background tab never changes the active tab", async () => {
     const tabInfo = (id: number) => sw.eval<{ active: boolean; groupId: number }>(`chrome.tabs.get(${id}).then(t => ({ active: t.active, groupId: t.groupId }))`);
-    // B was created last, so it is the active tab and A sits behind it in the same window.
-    expect(await tabInfo(tabB)).toMatchObject({ active: true });
     expect((await tabInfo(tabB)).groupId).toBeGreaterThan(0);
-    expect((await tabInfo(tabA)).active).toBe(false);
-    // Background A explicitly through the extension API (not CDP), then capture it.
+    // Make B the owner's tab (a user action, not an agent action), leave A in the background and capture A.
     await sw.eval(`chrome.tabs.update(${tabB}, { active: true })`);
     expect((await tabInfo(tabA)).active).toBe(false);
     const res = await call(agents.a!, "screenshot", { tabId: tabA });
     expect(res.ok ? "ok" : JSON.stringify(res)).toBe("ok");
-    expect((await tabInfo(tabA)).active).toBe(true);
+    expect((await tabInfo(tabA)).active).toBe(false);
+    expect((await tabInfo(tabB)).active).toBe(true);
     // The whole browser still answers: nothing was left wedged.
     const t0 = Date.now();
     await step("Browser.getVersion", 2000, cdp.send("Browser.getVersion"));
@@ -446,10 +444,10 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
   }
   const panelHas = (s: Session, text: string) => until(`panel text "${text}"`, () => s.eval<boolean>(`document.body.innerText.includes(${JSON.stringify(text)})`));
 
-  it("side panel shows the connected state with both sessions", async () => {
+  it("side panel shows the connected state and the This tab section", async () => {
     const p = await panel();
     await panelHas(p, "Agents can use this browser");
-    await panelHas(p, "main / sess-b");
+    await panelHas(p, "This tab");
     expect(await p.eval<string>(`document.getElementById("chip").textContent`)).toBe("Connected");
     await sleep(300);
     await shot("sidepanel-connected", p);

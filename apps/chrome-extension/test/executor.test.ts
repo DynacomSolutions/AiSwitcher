@@ -517,42 +517,40 @@ describe("visuals and abort hygiene", () => {
     expect(r.log.filter(l => l.startsWith("restore"))).toEqual([`restore:${tab.id}`]);
   });
 
-  test("a tab that is not active is activated before the capture, and the wait is bounded when it never turns visible", async () => {
-    const { api, tabs, executor } = setup(undefined, { visibleWaitMs: 80 });
-    const tab = await tabs.create(session);
-    api.tabList.get(tab.id)!.active = false;
+  test("a full tool sequence works in the background: no tab is ever activated and the owner's tab stays active", async () => {
+    const { api, executor } = setup();
+    const owner = api.addTab(1, "https://owner.example.com/");
+    owner.active = true;
     api.cdpResults["Page.getLayoutMetrics"] = VIEWPORT;
     api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
-    const order: string[] = [];
-    const activate = api.tabs.activate;
-    api.tabs.activate = async id => { order.push("activate"); await activate(id); };
-    const send = api.debugger.send;
-    api.debugger.send = async (id, m, p) => { if (m === "Page.captureScreenshot") order.push("capture"); return send(id, m, p); };
-    expect((await executor.run(call("screenshot", { tabId: tab.id }))).ok).toBe(true);
-    expect(order).toEqual(["activate", "capture"]);
-    expect(api.tabList.get(tab.id)!.active).toBe(true);
+    api.cdpResults["Runtime.evaluate"] = { result: { value: "hidden" } };
+    const id = JSON.parse(textOf(await executor.run(call("tabs_create", { url: "example.com" })))).tabId;
+    api.cdpResults["Page.navigate"] = () => { queueMicrotask(() => api.emit(id, "Page.loadEventFired", {})); return {}; };
+    for (const [tool, args] of [["navigate", { url: "https://example.com/next" }], ["screenshot", {}], ["click", { coordinate: [5, 5] }], ["type", { text: "hi" }], ["key", { key: "a" }], ["scroll", { coordinate: [5, 5], direction: "down" }]] as const) {
+      const res = await executor.run(call(tool, { tabId: id, ...args }));
+      expect(res).toMatchObject({ ok: true });
+      expect(api.tabList.get(1)!.active).toBe(true);
+      expect(api.tabList.get(id)!.active).toBe(false);
+    }
+    expect(api.createdActive.every(a => !a)).toBe(true);
+    expect("activate" in api.tabs).toBe(false);
+    expect(api.cdpLog.some(c => c.method === "Page.captureScreenshot")).toBe(true);
+    expect(api.cdpLog.some(c => c.method === "Emulation.setFocusEmulationEnabled" && c.params?.enabled === true)).toBe(true);
   });
 
-  test("an already active tab is not activated; input tools activate a background tab too", async () => {
-    const { api, tabs, executor } = setup(undefined, { visibleWaitMs: 30 });
-    const tab = await tabs.create(session);
-    api.cdpResults["Page.getLayoutMetrics"] = VIEWPORT;
-    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
-    await executor.run(call("screenshot", { tabId: tab.id }));
-    expect(api.activateCalls).toEqual([]);
-    api.tabList.get(tab.id)!.active = false;
-    api.cdpResults["Runtime.evaluate"] = { result: { value: "visible" } };
-    expect((await executor.run(call("key", { tabId: tab.id, key: "a" }))).ok).toBe(true);
-    expect(api.activateCalls).toEqual([tab.id]);
-    api.tabList.get(tab.id)!.active = false;
-    await executor.run(call("javascript", { tabId: tab.id, code: "1" }));
-    expect(api.activateCalls).toEqual([tab.id]); // javascript does not need the front
+  test("no source file can foreground a tab or a window", async () => {
+    const { readdirSync, readFileSync } = await import("node:fs");
+    const dir = new URL("../src/background/", import.meta.url).pathname;
+    for (const f of readdirSync(dir)) {
+      const src = readFileSync(dir + f, "utf8");
+      expect(src).not.toMatch(/active:\s*true|chrome\.tabs\.highlight|focused:\s*true|captureVisibleTab|bringToFront/);
+    }
   });
 
-  test("tabs_create opens the tab active, in its group", async () => {
+  test("tabs_create opens the tab inactive, in its group", async () => {
     const { api, executor } = setup();
     const id = JSON.parse(textOf(await executor.run(call("tabs_create", { url: "example.test" })))).tabId;
-    expect(api.tabList.get(id)!.active).toBe(true);
+    expect(api.tabList.get(id)!.active).toBe(false);
     expect(api.tabList.get(id)!.groupId).toBeGreaterThan(0);
   });
 

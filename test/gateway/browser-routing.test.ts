@@ -177,18 +177,18 @@ describe("POST /browser/call", () => {
     const tokB = await tokenFor("id2");
     const pool = await connect(b("p", { kind: "pool", pool: "main" }));
     const seenPool = capture(pool);
-    const sess = { id: "abcdef123", label: "id1 / abcdef" };
+    const sess = { id: "abcdef123", label: "refactor" };
     answer(pool);
     await call({ session: sess, tool: "screenshot" });
     answer(pool);
-    await call({ session: { ...sess, label: "id2 / abcdef" }, tool: "screenshot" }, tokB);
-    expect(seenPool).toEqual([{ identity: "pool:main", label: "main / abcdef123" }, { identity: "pool:main", label: "main / abcdef123" }]);
+    await call({ session: { ...sess, label: "refactor" }, tool: "screenshot" }, tokB);
+    expect(seenPool).toEqual([{ identity: "pool:main", label: "refactor" }, { identity: "pool:main", label: "refactor" }]);
 
     const pin = await connect(b("i", { kind: "identity", identity: "id1" }));
     const seenPin = capture(pin);
     answer(pin);
     await call({ session: sess, tool: "screenshot", browser: "i" });
-    expect(seenPin).toEqual([{ identity: "id1", label: "id1 / abcdef" }]);
+    expect(seenPin).toEqual([{ identity: "id1", label: "refactor" }]);
   });
 
   test("a non-member is refused a pool binding", async () => {
