@@ -54,10 +54,12 @@ export function createIndicator(root: ShadowRoot, onStop: () => void): Indicator
       for (const n of [glow, pill]) n.style.setProperty("--c", color);
       text.replaceChildren();
       const b = document.createElement("b");
-      b.textContent = identity;
+      // The session's chat name, never the identity; the identity is only the fallback for an older shim with no label.
+      const name = label.trim() || identity;
+      b.textContent = name;
       text.append(b, " is controlling this tab");
       pill.title = label;
-      button.setAttribute("aria-label", `Stop ${identity} controlling this tab`);
+      button.setAttribute("aria-label", `Stop ${name} controlling this tab`);
       if (!shown) {
         shown = true;
         // Next frame so the entry transition runs.

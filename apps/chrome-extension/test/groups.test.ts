@@ -82,6 +82,21 @@ describe("user-granted tab groups", () => {
   }
   const json = (r: { ok: boolean; content?: Array<{ text?: string }> }) => JSON.parse((r as { content: Array<{ text: string }> }).content[0]!.text);
 
+  test("a rename retitles the session's own group but never a granted group", async () => {
+    const t = await setup();
+    const made = json(await t.call("tabs_create", { url: "https://a.example.com/" }) as never);
+    const own = t.api.tabList.get(made.tabId ?? made.id)?.groupId ?? [...t.api.groups.keys()].find(g => g !== t.userGroup)!;
+    expect(t.api.groups.get(own)?.title).toBe("refactor login");
+    expect(await t.tabs.grant(t.userGroup, "s1")).toBe("ok");
+    const renamed = { id: "s1", identity: "alice", label: "login rewrite" };
+    expect(t.tabs.touch(renamed)).toBe(true);
+    expect(t.tabs.touch(renamed)).toBe(false); // same name again
+    await new Promise(r => setTimeout(r, 10));
+    expect(t.api.groups.get(own)?.title).toBe("login rewrite");
+    expect(t.api.groups.get(t.userGroup)?.title).toBe("Holiday plans");
+    expect(t.api.groups.get(t.userGroup)?.color).toBe("orange");
+  });
+
   test("without a grant the session cannot touch the user's group", async () => {
     const t = await setup();
     await t.call("tabs_context", {});

@@ -73,9 +73,24 @@ export class TabManager {
   }
 
   /** Records that the session just made a call, registering it when it has no tabs yet (so it can be granted a group). */
-  touch(ref: SessionRef): void {
+  /** Records a call from the session. Returns true when the session's name changed (e.g. after /rename). */
+  touch(ref: SessionRef): boolean {
     this.lastSeen.set(ref.id, this.now());
+    const before = this.sessions.get(ref.id)?.label;
     this.session(ref);
+    const renamed = before !== undefined && before !== ref.label;
+    if (renamed) void this.retitle(ref).catch(() => {});
+    return renamed;
+  }
+
+  /** Retitles the session's OWN group. A group the user granted keeps the user's title. */
+  private retitle(ref: SessionRef): Promise<void> {
+    return this.serial(ref.id, async () => {
+      const s = this.sessions.get(ref.id);
+      if (!s || s.groupId === -1 || this.grants.has(s.groupId)) return;
+      if (!(await this.api.tabGroups.get(s.groupId))) return;
+      await this.api.tabGroups.update(s.groupId, { title: ref.label, color: colorForIdentity(ref.identity) });
+    });
   }
 
   /** Ends sessions that made no call for SESSION_END_MS. */
