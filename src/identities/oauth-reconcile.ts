@@ -144,12 +144,18 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
   } catch (err) {
     // Unreadable or absent store: the reconcile sees "no copy", same as the
     // kimi-store readers. A store that exists but fails to read is recorded for probing callers.
-    if ((err as { code?: unknown } | null)?.code !== "ENOENT") {
-      const probe = readProbe.getStore();
-      if (probe) probe.failed = true;
-    }
+    recordReadFailure(err);
   }
   return undefined;
+}
+
+/** Marks the active read probe (if any) failed unless the error is plain
+ * "file absent". Shared with the kimi store readers so every store layer
+ * reports a torn or unreadable credentials file the same way. */
+export function recordReadFailure(err: unknown): void {
+  if ((err as { code?: unknown } | null)?.code === "ENOENT") return;
+  const probe = readProbe.getStore();
+  if (probe) probe.failed = true;
 }
 
 /** Atomic rewrite, mode 0600, temp file + rename in the destination

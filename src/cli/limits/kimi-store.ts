@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { recordReadFailure } from "../../identities/oauth-reconcile.ts";
 import { withOauthRefreshLock } from "../../identities/claude-swap-lock.ts";
 import { KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
@@ -87,7 +88,10 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
     if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
     return undefined;
-  } catch {
+  } catch (err) {
+    // Absent is "no copy"; anything else (EACCES, EIO, torn JSON) is recorded
+    // for probing callers so a partial read is never mistaken for logged out.
+    recordReadFailure(err);
     return undefined;
   }
 }
@@ -178,7 +182,10 @@ export async function kimiCredentialStores(identity: Identity, self: "kimi" | "p
 export async function readFreshestKimiCredentials(identity: Identity, self: "kimi" | "pi"): Promise<KimiOAuthCredentials | undefined> {
   let freshest: KimiOAuthCredentials | undefined;
   for (const store of await kimiCredentialStores(identity, self)) {
-    const credentials = await store.read().catch(() => undefined);
+    const credentials = await store.read().catch((err) => {
+      recordReadFailure(err);
+      return undefined;
+    });
     if (!credentials) continue;
     if (
       freshest === undefined ||
