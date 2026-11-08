@@ -149,6 +149,7 @@ jobs:
       # GitHub's browser download URLs have been returning 504 while the API serves the
       # same assets, so put the bundler's downloads in its cache through the API.
       - name: Prefetch the bundler tools
+        if: runner.os == 'Linux'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/host/prefetch-bundler-tools.ts --appimage

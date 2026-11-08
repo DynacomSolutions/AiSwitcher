@@ -98,7 +98,8 @@ if (import.meta.main) {
       macOS: { hardenedRuntime: true, minimumSystemVersion: "11.0" },
     },
   }));
-  const args = ["cargo", "tauri", "build", ...runner, "--target", triple, "--config", overlay];
+  // --verbose makes the bundler print linuxdeploy output, which it otherwise swallows on failure.
+  const args = ["cargo", "tauri", "build", "--verbose", ...runner, "--target", triple, "--config", overlay];
   if (target === "windows-x64") args.push("--no-bundle");
   else args.push("--bundles", target === "macos-arm64" ? "app" : "appimage");
   args.push("--", "--locked");
