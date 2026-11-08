@@ -129,7 +129,9 @@ export class Executor {
     const invalid = validateToolArgs(tool, req.args);
     if (invalid) return fail("bad_args", invalid);
 
-    this.tabs.touch(req.session);
+    if (this.tabs.touch(req.session)) {
+      for (const tabId of this.ui.markedTabs?.(req.session.id) ?? []) void this.markControlled(tabId, req.session);
+    }
     const controller = this.state.track(id);
     const timeoutMs = tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 1000 : this.defaultTimeout;
     const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);

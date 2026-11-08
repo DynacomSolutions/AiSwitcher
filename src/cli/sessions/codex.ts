@@ -101,6 +101,30 @@ async function firstUserMessage(filePath: string): Promise<string | undefined> {
   return line === undefined ? undefined : userTextFromLine(line);
 }
 
+/** The chat name of one Codex session, as the Sessions page shows it: the thread name set with /rename (session_index.jsonl), else the first prompt. */
+export async function codexSessionTitle(configDir: string, id: string): Promise<string | undefined> {
+  const named = await codexThreadName(configDir, id);
+  if (named) return truncateLabel(named);
+  const path = await locateCodexTranscript(configDir, id);
+  const first = path ? await firstUserMessage(path) : undefined;
+  return first ? truncateLabel(first) : undefined;
+}
+
+async function codexThreadName(configDir: string, id: string): Promise<string | undefined> {
+  let text: string;
+  try {
+    text = await Bun.file(join(configDir, "session_index.jsonl")).text();
+  } catch {
+    return undefined;
+  }
+  let name: string | undefined;
+  for (const line of text.split("\n")) {
+    const entry = safeJsonParse(line);
+    if (entry?.id === id && typeof entry.thread_name === "string" && entry.thread_name.trim()) name = entry.thread_name;
+  }
+  return name;
+}
+
 export async function readCodexTree(identity: Identity, opts: WindowOpts = {}): Promise<TreeNodeDto[]> {
   const cutoffMs = windowCutoffMs(opts);
   const sessionsRoot = join(identity.configDir, "sessions");
@@ -192,7 +216,7 @@ function toolOutputText(output: unknown): string {
   return "";
 }
 
-async function locateCodexTranscript(configDir: string, id: string): Promise<string | undefined> {
+export async function locateCodexTranscript(configDir: string, id: string): Promise<string | undefined> {
   // Generous fixed window (transcripts are reachable from a tree that only
   // shows the recent window, but a slightly stale UI should still resolve).
   const { files } = await listRecentFilesAsync(join(configDir, "sessions"), new Date(Date.now() - 365 * 86_400_000), {}, true);

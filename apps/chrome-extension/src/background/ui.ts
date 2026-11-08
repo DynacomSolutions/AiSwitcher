@@ -18,6 +18,8 @@ export interface Ui {
   suspend(tabId: number): Promise<void> | void;
   /** Undoes suspend. Always called, including after an abort. */
   restore(tabId: number): Promise<void> | void;
+  /** Tabs of this session that currently show the overlay; used to refresh the pill after a rename. */
+  markedTabs?(sessionId: string): number[];
 }
 
 export const BEFORE_ACTION_MAX_MS = 350;

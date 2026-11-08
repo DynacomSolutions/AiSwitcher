@@ -7,6 +7,7 @@ import { isRetired } from "../identities/retired.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
+import { chatNameResolver, type ChatTool } from "./chat-name.ts";
 import { sessionName } from "./session-label.ts";
 import { BROWSER_TOOLS, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
@@ -23,6 +24,8 @@ export interface ShimContext {
   /** Agent token, resolved on each call. */
   token(): Promise<string | undefined>;
   session: { id: string; identity: string; label: string };
+  /** The session's current chat name, looked up on each call (cached briefly). Absent: `session.label` is used as is. */
+  chatName?(): Promise<string>;
   /**
    * Pool mode: resolves the pool's current active member and that member's token on each call.
    * `error` is a ready tool error text. Overrides `token` and `session.identity`/`label`.
@@ -50,13 +53,17 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
   if (!(BROWSER_TOOLS as readonly string[]).includes(name)) return errorResult(`bad_args: unknown tool ${name}`);
   const { browser, ...args } = (typeof rawArgs === "object" && rawArgs !== null ? rawArgs : {}) as Record<string, unknown>;
   let session = ctx.session;
+  if (ctx.chatName) {
+    const label = await ctx.chatName().catch(() => "");
+    if (label) session = { ...session, label };
+  }
   let token: string | undefined;
   let url: string | undefined;
   if (ctx.resolveAuth) {
     const auth = await ctx.resolveAuth();
     if (auth.error !== undefined || !auth.identity) return errorResult(auth.error ?? "internal: cannot resolve the active pool member");
     token = auth.token;
-    session = { id: ctx.session.id, identity: auth.identity, label: ctx.session.label };
+    session = { id: ctx.session.id, identity: auth.identity, label: session.label };
     url = await ctx.gatewayUrl();
   } else {
     [url, token] = await Promise.all([ctx.gatewayUrl(), ctx.token()]);
@@ -184,7 +191,11 @@ export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimO
   // Without a session id from the agent, key the session on the parent agent process: a respawned shim keeps the same session (and tab group) instead of starting a new one.
   const id = env.CLAUDE_SESSION_ID || env.CODEX_SESSION_ID || `agent-${process.ppid}`;
   const identity = opts.identity || env.AI_PROFILE_SWITCHER_SESSION || "agent";
+  const tool: ChatTool | undefined = env.CLAUDE_SESSION_ID ? "claude" : env.CODEX_SESSION_ID ? "codex" : opts.tool === "codex" ? "codex" : opts.tool === "claude" ? "claude" : undefined;
+  const configDirs = [...new Set([opts.configDir, tool === "codex" ? env.CODEX_HOME : env.CLAUDE_CONFIG_DIR].filter((d): d is string => !!d))];
+  const sessionKnown = !!(env.CLAUDE_SESSION_ID || env.CODEX_SESSION_ID);
   return {
+    ...(tool && sessionKnown ? { chatName: chatNameResolver({ tool, configDirs, id }, env) } : {}),
     gatewayUrl: async () => opts.gateway || env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL")),
     token: () => readToken(env, opts.configDir),
     ...(opts.pool ? { resolveAuth: () => resolvePoolAuth(opts.pool!, opts.tool ?? "claude", opts.registryPath) } : {}),

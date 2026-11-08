@@ -50,6 +50,8 @@ interface ClaudeScan {
   firstTs?: number;
   lastTs?: number;
   aiTitle?: string;
+  /** A name the user chose with /rename; wins over the auto title. */
+  customTitle?: string;
   firstUser?: string;
   messageCount: number;
 }
@@ -68,6 +70,7 @@ async function scanSessionFile(filePath: string): Promise<ClaudeScan> {
       if (text && scan.firstUser === undefined && text.trim()) scan.firstUser = text;
     }
     if (type === "ai-title" && typeof entry.aiTitle === "string") scan.aiTitle = entry.aiTitle;
+    if (type === "custom-title" && typeof entry.customTitle === "string" && entry.customTitle.trim()) scan.customTitle = entry.customTitle;
     if (scan.cwd === undefined && typeof entry.cwd === "string") scan.cwd = entry.cwd;
     if (type === "user" || type === "assistant") scan.messageCount += 1;
     const ts = parseTimestampMs(entry.timestamp);
@@ -115,6 +118,15 @@ function titleFor(aiTitle: string | undefined, firstUser: string | undefined): s
   return "(no user message)";
 }
 
+/** The chat name of one Claude session, as the Sessions page shows it: /rename title, else the auto title, else the first prompt. Undefined until a transcript with any of those exists. */
+export async function claudeSessionTitle(configDir: string, id: string): Promise<string | undefined> {
+  const path = await locateClaudeTranscript(configDir, id);
+  if (!path) return undefined;
+  const scan = await scanSessionFile(path);
+  const title = titleFor(scan.customTitle ?? scan.aiTitle, scan.firstUser);
+  return scan.customTitle ?? scan.aiTitle ?? scan.firstUser ? title : undefined;
+}
+
 export async function readClaudeTree(identity: Identity, opts: WindowOpts = {}): Promise<TreeNodeDto[]> {
   const cutoffMs = windowCutoffMs(opts);
   const projectsDir = join(identity.configDir, "projects");
@@ -152,7 +164,7 @@ export async function readClaudeTree(identity: Identity, opts: WindowOpts = {}):
             id: entry.name.slice(0, -".jsonl".length),
             tool: "claude",
             identity: identity.name,
-            title: titleFor(scan.aiTitle, scan.firstUser),
+            title: titleFor(scan.customTitle ?? scan.aiTitle, scan.firstUser),
             cwd: scan.cwd ?? null,
             startedAt: isoOrEpoch(scan.firstTs),
             updatedAt: isoOrEpoch(scan.lastTs ?? mtimeMs),
