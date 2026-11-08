@@ -146,6 +146,12 @@ jobs:
           cd apps/host
           rustup show
           cargo install tauri-cli --version 2.12.3 --locked
+      # GitHub's browser download URLs have been returning 504 while the API serves the
+      # same assets, so put the bundler's downloads in its cache through the API.
+      - name: Prefetch the bundler tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/host/prefetch-bundler-tools.ts --appimage
       # generate_context! needs the built frontend before any cargo step.
       - name: Frontend typecheck and build
         working-directory: apps/host
@@ -250,6 +256,12 @@ jobs:
           rustup target add "$HOST_WINDOWS_TARGET"
           cargo install tauri-cli --version 2.12.3 --locked
           cargo install cargo-xwin --version "$CARGO_XWIN_VERSION" --locked
+      # GitHub's browser download URLs have been returning 504 while the API serves the
+      # same assets, so put the bundler's downloads in its cache through the API.
+      - name: Prefetch the bundler tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/host/prefetch-bundler-tools.ts --nsis
       # generate_context! needs the built frontend before any cargo step.
       - name: Frontend build
         working-directory: apps/host

@@ -123,14 +123,13 @@ jobs:
           cp -r dist "$stage/dist"
           # shellcheck source=image/pins.env
           . image/pins.env
-          # GitHub release downloads return transient 5xx from some runners: retry, then
-          # fall back to the API for the same pinned tag. The checksum below still gates it.
-          if ! curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
-            --connect-timeout 20 --max-time 300 "$HERDR_URL" --output "$stage/herdr"; then
-            echo "curl failed; falling back to gh release download for $HERDR_VERSION" >&2
+          # The browser download URL can return 5xx while the REST API still serves the asset,
+          # so fetch through the API by tag and name (checksum-pinned), then fall back to the URL.
+          if ! bun scripts/host/github-release-asset.ts herdrdev/herdr "$HERDR_VERSION" "${HERDR_URL##*/}" "$stage/herdr" "$HERDR_SHA256"; then
+            echo "API download failed; falling back to the release URL for $HERDR_VERSION" >&2
             rm -f "$stage/herdr"
-            GH_TOKEN="$GITHUB_TOKEN" gh release download "$HERDR_VERSION" --repo herdrdev/herdr \
-              --pattern "${HERDR_URL##*/}" --output "$stage/herdr"
+            curl --fail --silent --show-error --location --retry 5 --retry-all-errors --retry-delay 5 \
+              --connect-timeout 20 --max-time 300 "$HERDR_URL" --output "$stage/herdr"
           fi
           echo "$HERDR_SHA256  $stage/herdr" | sha256sum --check
           echo "AIS_STAGE_DIR=$stage" >> "$GITHUB_ENV"
