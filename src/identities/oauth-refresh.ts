@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import {
   grantFingerprint,
   jwtExpSeconds,
@@ -540,9 +540,16 @@ async function ownNativePath(tool: RefreshableTool, identity: Identity): Promise
   return nativeStorePathFor(tool, identity.configDir);
 }
 
-/** Names a failed store without its path: the member's own native store, the pi projection, or a pool copy. */
-function storeClass(path: string, ownPath: string): string {
-  return path === ownPath ? "native" : basename(path) === "auth.json" ? "pi" : "pool";
+/** The member's pi projection file (a codex pool copy is also called auth.json, so the name cannot tell them apart). */
+async function piStorePath(tool: RefreshableTool, identity: Identity): Promise<string | undefined> {
+  if (tool === "kimi") return (await kimiCredentialStores(identity, "kimi")).find((store) => store.kind === "pi")?.path;
+  const piDir = (await piIdentityFor(identity.name))?.configDir;
+  return piDir ? join(expandPath(piDir), "auth.json") : undefined;
+}
+
+/** Names a failed store without its path, by location: the member's own native store, its pi projection, or else a pool copy. */
+export function storeClass(path: string, ownPath: string, piPath: string | undefined): string {
+  return path === ownPath ? "native" : path === piPath ? "pi" : "pool";
 }
 
 interface FreshestProbe {
@@ -580,12 +587,13 @@ async function probeFreshest(
     result = await once();
   }
   const own = result.failed ? await ownNativePath(tool, identity) : "";
+  const piPath = result.failed ? await piStorePath(tool, identity) : undefined;
   return {
     value: result.value,
     failed: result.failed,
     blocking: result.failed && (result.unattributed || result.failedPaths.includes(own)),
     failedPaths: result.failedPaths,
-    unreadable: [...new Set(result.failedPaths.map((path) => storeClass(path, own)))],
+    unreadable: [...new Set(result.failedPaths.map((path) => storeClass(path, own, piPath)))],
   };
 }
 
@@ -778,10 +786,8 @@ export async function refreshIdentityOAuthGrant(
     // Cheap pre-check without locks: don't contend with Claude Code when there is nothing to do.
     const peeked = await probeFreshest(tool, identity, registryPath, poolDirs);
     const peek = peeked.value;
-    if (peeked.blocking && peek?.grant.refresh_token) {
-      return { tool, identity: identity.name, outcome: "skipped-read-error", written: [], writeFailures: [], readError: true, unreadableStores: peeked.unreadable, detail: READ_ERROR_SKIP_DETAIL };
-    }
-    if (peek) await healDamagedNativeFromPi(tool, identity, peek, false);
+    // Never heal over a native store that could not be read.
+    if (peek && !peeked.blocking) await healDamagedNativeFromPi(tool, identity, peek, false);
     if (!peek?.grant.refresh_token) {
       return {
         tool, identity: identity.name, outcome: "no-grant", written: [], writeFailures: [], ...(peeked.failed ? { readError: true, unreadableStores: peeked.unreadable } : {}),
@@ -798,7 +804,12 @@ export async function refreshIdentityOAuthGrant(
       return {
         tool, identity: identity.name, outcome: "skipped-fresh", detail: decision.reason,
         beforeFingerprint: grantFingerprint(peek.grant), written: [], writeFailures: [],
+        ...(peeked.failed ? { unreadableStores: peeked.unreadable } : {}),
       };
+    }
+    // Only a refresh that is actually due is blocked by an unreadable authoritative store.
+    if (peeked.blocking) {
+      return { tool, identity: identity.name, outcome: "skipped-read-error", written: [], writeFailures: [], readError: true, unreadableStores: peeked.unreadable, detail: READ_ERROR_SKIP_DETAIL };
     }
   }
   // Same order as `ais claude-swap` (pool dirs first, owner member last), so the two never invert.
@@ -891,10 +902,8 @@ async function refreshGrantUnlocked(
       detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
     };
   }
-  if (probed.blocking) {
-    return { ...base, outcome: "skipped-read-error", readError: true, unreadableStores: probed.unreadable, detail: READ_ERROR_SKIP_DETAIL };
-  }
-  await healDamagedNativeFromPi(tool, identity, freshest, options.locksHeld === true);
+  // Never heal over a native store that could not be read.
+  if (!probed.blocking) await healDamagedNativeFromPi(tool, identity, freshest, options.locksHeld === true);
   const beforeFingerprint = grantFingerprint(freshest.grant);
   if (options.revokedFingerprint && options.revokedFingerprint === beforeFingerprint) {
     return {
@@ -917,7 +926,11 @@ async function refreshGrantUnlocked(
     tool,
   });
   if (!decision.attempt) {
-    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason };
+    return { ...base, outcome: "skipped-fresh", beforeFingerprint, detail: decision.reason, ...(readFailed ? { unreadableStores: probed.unreadable } : {}) };
+  }
+  // Only a refresh that is actually due is blocked by an unreadable authoritative store.
+  if (probed.blocking) {
+    return { ...base, outcome: "skipped-read-error", beforeFingerprint, readError: true, unreadableStores: probed.unreadable, detail: READ_ERROR_SKIP_DETAIL };
   }
 
   // Before the POST, while the refresh token is still unspent: if Claude Code broke our lock, it may be refreshing the same token.

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { convergeClaudePoolStores, refreshIdentityOAuthGrant } from "../../src/identities/oauth-refresh.ts";
+import { convergeClaudePoolStores, refreshIdentityOAuthGrant, storeClass } from "../../src/identities/oauth-refresh.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, PI_CONFIG } from "../../src/identities/tool-configs.ts";
 import type { Identity } from "../../src/identities/types.ts";
 
@@ -127,6 +127,38 @@ describe("refresh with an unreadable store", () => {
     expect(posts()).toBe(0);
     expect(await readFile(join(codexDir, "auth.json"), "utf8")).toBe("{ torn");
     expect(await readFile(join(piDir, "auth.json"), "utf8")).toBe(piAuth);
+  });
+});
+
+describe("a block only applies when a refresh is due", () => {
+  const piFor = (expiresMs: number) => JSON.stringify({ anthropic: { type: "oauth", access: "at-pi", refresh: "rt-other", expires: expiresMs } });
+
+  for (const [label, registry] of [["pooled", () => poolRegistry], ["unpooled", () => undefined]] as const) {
+    test(`${label}: a torn native store does not raise a read error while the token is not due, and does when it is`, async () => {
+      await writeFile(claudeFile(claudeDir), "{ torn");
+      const { posts, fetchImpl } = postCounter();
+      const opts = () => ({ fetchImpl, now: () => NOW * 1000, ...(registry() ? { claudeRegistryPath: registry()! } : {}) });
+      await writeFile(join(piDir, "auth.json"), piFor((NOW + 7 * 86_400) * 1000));
+      const idle = await refreshIdentityOAuthGrant("claude", identityIn(claudeDir), opts());
+      expect(idle.outcome).toBe("skipped-fresh");
+      expect(idle.readError).toBeUndefined();
+      await writeFile(join(piDir, "auth.json"), piFor(farMs()));
+      const due = await refreshIdentityOAuthGrant("claude", identityIn(claudeDir), opts());
+      expect(due.outcome).toBe("skipped-read-error");
+      expect(posts()).toBe(0);
+      expect(await readFile(claudeFile(claudeDir), "utf8")).toBe("{ torn");
+    });
+  }
+});
+
+describe("store classes are by location, not file name", () => {
+  test("a codex pool copy named auth.json is a pool, the pi projection is pi, the member's own file is native", () => {
+    const own = "/m/acme/auth.json";
+    const pi = "/p/acme/auth.json";
+    expect(storeClass("/m/pool/auth.json", own, pi)).toBe("pool");
+    expect(storeClass(pi, own, pi)).toBe("pi");
+    expect(storeClass(own, own, pi)).toBe("native");
+    expect(storeClass("/m/pool/auth.json", own, undefined)).toBe("pool");
   });
 });
 

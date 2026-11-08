@@ -464,7 +464,7 @@ describe("alert recovery", () => {
     const id = { name: "r1", label: "r1", configDir: "/x" } as never;
     await refresh("claude", id, {});
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatchObject({ kind: "refresh-failed", key: "claude/r1" });
+    expect(seen[0]).toMatchObject({ kind: "store-unreadable", key: "claude/r1" });
     expect(seen[0]!.message).toContain("could not be read");
     expect(seen[0]!.message).toContain("native store");
     expect(seen[0]!.message).not.toContain("/secret/path");
@@ -474,6 +474,30 @@ describe("alert recovery", () => {
     await refresh("claude", other, {});
     expect(seen.map((a) => a.key)).toEqual(["claude/r1", "claude/r2"]);
     expect(seen[1]!.message).toContain("pi store");
+  });
+
+  test("a store-unreadable alert notifies once across keep-alive ticks and a 2xx, and a real refresh failure still notifies", async () => {
+    const seen: string[] = [];
+    const alerter = createAlerter((a) => void seen.push(`${a.kind} ${a.key}`));
+    const metrics = new PrometheusMetrics({ ledgerDepth: () => 0, ledgerDropped: () => 0 });
+    let result: Record<string, unknown> = { outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] };
+    const refresh = instrumentRefresh((async (_t: string, id: { name: string }) => ({ tool: "claude", identity: id.name, written: [], writeFailures: [], detail: "x", ...result })) as never, { metrics, alerter });
+    const accounts = async () => [{ name: "s1", label: "s1", configDir: "/x" } as never];
+    const traffic = recoverOnSuccess(metrics, alerter);
+    await keepAliveOnce({ refresh, accounts, metrics });
+    traffic.request({ provider: "claude", identity: "s1", httpStatus: 200 } as never);
+    await keepAliveOnce({ refresh, accounts, metrics });
+    expect(seen).toEqual(["store-unreadable claude/s1"]);
+    // A genuine refresh failure on the same key is not swallowed by the open read-error alert.
+    result = { outcome: "failed" };
+    await keepAliveOnce({ refresh, accounts, metrics });
+    expect(seen).toEqual(["store-unreadable claude/s1", "refresh-failed claude/s1"]);
+    // A clean refresh closes the read-error alert; the next read error notifies again.
+    result = { outcome: "refreshed" };
+    await keepAliveOnce({ refresh, accounts, metrics });
+    result = { outcome: "skipped-read-error", readError: true, unreadableStores: ["native"] };
+    await keepAliveOnce({ refresh, accounts, metrics });
+    expect(seen.filter((s) => s.startsWith("store-unreadable"))).toHaveLength(2);
   });
 
   test("no-grant and skipped-revoked outcomes alert; a different token read clears", async () => {
@@ -637,7 +661,7 @@ describe("idle keep-alive", () => {
       { metrics, alerter },
     );
     await keepAliveOnce({ refresh, accounts: async () => [{ name: "k1", label: "k1", configDir: "/x" } as never], metrics });
-    expect(seen).toEqual(["refresh-failed claude/k1"]);
+    expect(seen).toEqual(["store-unreadable claude/k1"]);
   });
 
   test("refreshes every managed login without traffic and counts outcomes, a throw counts as failed", async () => {
