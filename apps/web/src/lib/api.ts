@@ -26,6 +26,7 @@ import type {
   ToolName,
   TranscriptResponse,
   GatewayUsageResponse,
+  BrowsersResponse,
   PoolsUsageResponse,
   UsageResponse,
 } from "@/types/api";
@@ -156,6 +157,11 @@ export const api = {
   getPoolsUsage: () => request<PoolsUsageResponse>("/api/pools/usage"),
 
   getGatewayUsage: (days: number) => request<GatewayUsageResponse>(`/api/gateway/usage?days=${days}`),
+
+  getBrowsers: () => request<BrowsersResponse>("/api/browsers"),
+
+  revokeBrowser: (name: string) =>
+    request<{ ok: true }>(`/api/browsers/${encodeURIComponent(name)}/revoke`, { method: "POST" }),
 
   getBreakdown: (identity?: string, tool?: string, days?: number) =>
     request<BreakdownResponse>(withParams("/api/usage/breakdown", {

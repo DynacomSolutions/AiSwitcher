@@ -185,6 +185,7 @@ ETA: 2026-11-14 18:00 ICT
 | 122 | Install on Mac and pair profiles | blocked_on_owner | Thomas | | 6.121 | | ais update (needs 0.5.24)<br>ais browser extension update<br>chrome://extensions: Developer mode, Load unpacked ~/.ais/browser-extension, each profile<br>Options: wss:// gateway URL, Sign in<br>Approve code on the gateway host: ais browser approve CODE --pool=NAME or --identity=ID |
 | 146 | Extension update: public download | in_progress | Claude | ext-public-download | | 2026-11-07 14:00 ICT | `ais browser extension update` failed with HTTP 401 on stale gh/GitHub credentials.<br>Use the shared anonymous release-asset download instead.<br>Was 141. |
 | 147 | Extension one-click sign-in + redesign | in_progress | Claude | ext-signin-redesign | | 2026-11-07 22:00 ICT | Side panel: AIS address + Connect, approve on console page /browser/authorize, no options page.<br>Console approves via gateway admin server-side.<br>Was 142. |
+| 153 | Console Browsers page: list and revoke connected AIS Browser extensions | done | claude | console-browsers-page | | | `GET /api/browsers` and `POST /api/browsers/:name/revoke` read the gateway admin API server-side (admin token never reaches the page); not configured answers 200 `configured:false`.<br>Web page Browsers: name, profile, target, Connected/Offline (active and seen within 2 min), last seen, revoked hidden by default, confirm to revoke.<br>Tests: `test/server/browser-bindings-api.test.ts`. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
 ETA: 2026-11-14 18:00 ICT

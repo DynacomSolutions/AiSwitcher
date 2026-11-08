@@ -316,6 +316,27 @@ export interface GatewayUsageResponse {
   error?: string;
 }
 
+/* AIS Browser */
+
+export type BrowserTargetDto = { kind: "pool"; pool: string } | { kind: "identity"; identity: string };
+
+export interface BrowserBindingDto {
+  name: string;
+  target: BrowserTargetDto;
+  profileLabel: string;
+  state: "active" | "revoked";
+  createdAt?: string;
+  lastSeenAt?: string;
+  /** Active and seen within about two minutes. */
+  connected: boolean;
+}
+
+export interface BrowsersResponse {
+  configured: boolean;
+  bindings: BrowserBindingDto[];
+  error?: string;
+}
+
 /* Pools */
 
 export interface PoolRef {
