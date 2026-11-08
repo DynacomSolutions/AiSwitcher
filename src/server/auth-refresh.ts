@@ -80,6 +80,10 @@ function oauthRefresherFor(tool: RefreshableTool): Refresher {
       revokedFingerprint: context.revokedFingerprint,
     });
     if (result.outcome === "failed") return undefined;
+    // A store read error is a loud, transient failure (lastError, failure
+    // count, journal line) but never a revoked diagnosis: a plain Error
+    // carries no refresh fingerprint, so nothing is pinned.
+    if (result.readError) throw new Error(result.detail);
     if (result.outcome === "refreshed") return result.detail;
     return { skipped: true, detail: result.detail };
   };

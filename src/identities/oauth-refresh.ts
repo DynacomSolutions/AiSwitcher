@@ -519,6 +519,9 @@ export async function convergeClaudePoolStores(
   return { written, failed };
 }
 
+const READ_ERROR_SKIP_DETAIL =
+  "a credential store could not be read (torn or unreadable file): not refreshing with another store's grant, which could rotate a forked copy and kill the real login; the existing token stays in use and the next tick retries";
+
 /** Where the freshest refreshable copy of an identity's grant lives. */
 async function freshestGrant(
   tool: RefreshableTool,
@@ -609,9 +612,9 @@ function grantRecencySeconds(grant: OAuthGrant, nowSeconds: number): number {
 export interface IdentityGrantRefresh {
   tool: RefreshableTool;
   identity: string;
-  outcome: "refreshed" | "skipped-fresh" | "skipped-revoked" | "no-grant" | "failed";
+  outcome: "refreshed" | "skipped-fresh" | "skipped-revoked" | "skipped-read-error" | "no-grant" | "failed";
   detail: string;
-  /** Set on a "no-grant" that came from a store read error: transient, never a logged-out identity. */
+  /** Set on a "no-grant" or "skipped-read-error" that came from a store read error: transient, never a logged-out identity. */
   readError?: boolean;
   beforeFingerprint?: string;
   afterFingerprint?: string;
@@ -713,6 +716,9 @@ export async function refreshIdentityOAuthGrant(
     );
     peekFailed = peekFailed || peeked.readFailed;
     const peek = peeked.value;
+    if (peek?.grant.refresh_token && peekFailed) {
+      return { tool, identity: identity.name, outcome: "skipped-read-error", written: [], writeFailures: [], readError: true, detail: READ_ERROR_SKIP_DETAIL };
+    }
     if (peek) await healDamagedNativeFromPi(tool, identity, peek, false);
     if (!peek?.grant.refresh_token) {
       return {
@@ -828,6 +834,9 @@ async function refreshGrantUnlocked(
       ...(readFailed ? { readError: true } : {}),
       detail: "no refreshable OAuth grant in any store (API-key or logged-out identity) — nothing to refresh",
     };
+  }
+  if (readFailed) {
+    return { ...base, outcome: "skipped-read-error", readError: true, detail: READ_ERROR_SKIP_DETAIL };
   }
   await healDamagedNativeFromPi(tool, identity, freshest, options.locksHeld === true);
   const beforeFingerprint = grantFingerprint(freshest.grant);

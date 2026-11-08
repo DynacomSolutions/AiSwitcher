@@ -126,7 +126,7 @@ async function runAuthRefresh(rest: string[], flags: ParsedArgs["flags"]): Promi
     if (result.outcome === "skipped-revoked") {
       console.error(`${tool}/${result.identity}: ${result.detail}`);
       process.exitCode = 1;
-    } else if (result.outcome === "failed" || result.writeFailures.length > 0) {
+    } else if (result.outcome === "failed" || result.outcome === "skipped-read-error" || result.writeFailures.length > 0) {
       process.exitCode = 1;
     }
   } catch (err) {

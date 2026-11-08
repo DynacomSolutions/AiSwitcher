@@ -100,4 +100,38 @@ describe("stale revoked pin on the real kimi path", () => {
     expect(result.outcome).toBe("no-grant");
     expect(result.readError).toBe(true);
   });
+
+  test("a torn native store beside a pi grant skips the refresh: readError, no POST", async () => {
+    await mkdir(join(kimiDir, "credentials"), { recursive: true });
+    await writeFile(KIMI_FILE(), "{ torn");
+    await writeFile(
+      join(piDir, "auth.json"),
+      JSON.stringify({ "kimi-coding": { type: "oauth", access: "at-pi", refresh: "rt-other", expires: Date.now() - 3600_000 } }),
+    );
+    let posts = 0;
+    const fetchImpl = (async () => {
+      posts += 1;
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    const result = await refreshIdentityOAuthGrant("kimi", identity, { force: true, fetchImpl });
+    expect(result.outcome).toBe("skipped-read-error");
+    expect(result.readError).toBe(true);
+    expect(posts).toBe(0);
+  });
+
+  test("the scheduler surfaces the skip as lastError without pinning a revoked diagnosis", async () => {
+    await mkdir(join(kimiDir, "credentials"), { recursive: true });
+    await writeFile(KIMI_FILE(), "{ torn");
+    await writeFile(
+      join(piDir, "auth.json"),
+      JSON.stringify({ "kimi-coding": { type: "oauth", access: "at-pi", refresh: "rt-other", expires: Date.now() - 3600_000 } }),
+    );
+    const stateHome = await mkdtemp(join(root, "state-"));
+    const scheduler = new AuthRefreshScheduler(0, undefined, async () => [identity], stateHome);
+    await scheduler.refreshNow("kimi", NAME);
+    const status = scheduler.status().find((entry) => entry.tool === "kimi")!;
+    expect(status.lastError).toContain("could not be read");
+    expect(status.revoked).toBe(false);
+    expect(status.consecutiveFailures).toBe(1);
+  });
 });
