@@ -56,7 +56,7 @@ interface CodexMeta {
   startedAt?: number;
 }
 
-function parseMetaLine(line: string | undefined): CodexMeta | undefined {
+export function parseMetaLine(line: string | undefined): CodexMeta | undefined {
   if (!line) return undefined;
   const entry = safeJsonParse(line);
   if (!entry || entry.type !== "session_meta") return undefined;

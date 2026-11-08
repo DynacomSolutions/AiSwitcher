@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile, appendFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, appendFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chatNameResolver } from "../../src/browser/chat-name.ts";
@@ -71,4 +71,50 @@ test("shim sends the current chat name as session.label; an older shim without c
   await call(base);
   expect(bodies.map((b) => b.session.label)).toEqual(["abcdef", "refactor login", "abcdef"]);
   expect(bodies[1].session.identity).toBe("work");
+});
+
+import { findCodexThreadId } from "../../src/browser/codex-thread.ts";
+import { contextFromEnv } from "../../src/browser/mcp-shim.ts";
+
+test("claude: CLAUDE_CODE_SESSION_ID is the session key and drives the name; CLAUDE_SESSION_ID is the fallback", async () => {
+  await claudeFile(userRow, { type: "ai-title", aiTitle: "Login refactor", sessionId: ID });
+  const env = { CLAUDE_CODE_SESSION_ID: ID, CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
+  const ctx = contextFromEnv(env, {});
+  expect(ctx.session.id).toBe(ID);
+  expect(await ctx.chatName!()).toBe("Login refactor");
+  expect(contextFromEnv({ CLAUDE_SESSION_ID: "legacy-1", CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, {}).session.id).toBe("legacy-1");
+});
+
+async function rollout(cwd: string, id = ID, extra: object = {}) {
+  const day = join(dir, "sessions", "2026", "11", "08");
+  await mkdir(day, { recursive: true });
+  const f = join(day, `rollout-2026-11-08T10-00-00-${id}.jsonl`);
+  await writeFile(f, jl({ type: "session_meta", payload: { id, cwd, timestamp: new Date().toISOString(), ...extra } }));
+  return f;
+}
+
+test("codex thread id: from the parent's open rollout file", async () => {
+  const f = await rollout("/work/example");
+  expect(await findCodexThreadId(dir, 1234, "/elsewhere", { openRollouts: () => [f] })).toBe(ID);
+});
+
+test("codex thread id: newest rollout with the same cwd created after the parent started", async () => {
+  const other = "99999999-aaaa-bbbb-cccc-000000000000";
+  await rollout("/work/example", other, { thread_source: "user" });
+  await rollout("/work/other", "11111111-aaaa-bbbb-cccc-000000000000");
+  const deps = { openRollouts: () => [], parentAgeSec: () => 3600 };
+  expect(await findCodexThreadId(dir, 1234, "/work/example", deps)).toBe(other);
+  expect(await findCodexThreadId(dir, 1234, "/work/none", deps)).toBeUndefined();
+  // A rollout older than the parent is not its thread.
+  const old = await rollout("/work/old", "22222222-aaaa-bbbb-cccc-000000000000", { timestamp: "2026-11-08T00:00:01Z" });
+  await utimes(old, new Date("2026-11-08T00:00:01Z"), new Date("2026-11-08T00:00:01Z"));
+  expect(await findCodexThreadId(dir, 1234, "/work/old", deps)).toBeUndefined();
+});
+
+test("codex shim with no id in env: key stays agent-<ppid>, name comes from the derived thread", async () => {
+  await rollout(process.cwd());
+  await writeFile(join(dir, "session_index.jsonl"), jl({ id: ID, thread_name: "checkout fix" }));
+  const ctx = contextFromEnv({ CODEX_HOME: dir, AI_PROFILE_SWITCHER_SESSION: "x" } as NodeJS.ProcessEnv, { tool: "codex" });
+  expect(ctx.session.id).toBe(`agent-${process.ppid}`);
+  expect(ctx.chatName).toBeDefined();
 });
