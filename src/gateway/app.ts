@@ -13,6 +13,7 @@ import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
+import { routeFor, serveRoute } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
@@ -492,6 +493,16 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   async function run(): Promise<Response> {
   if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
+  const route = routeFor(app.provider, style, req.method, rest);
+  if (route?.kind === "serve") {
+    // Answered from the gateway's own pool state: no upstream call, no body, no account detail.
+    const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal });
+    req.signal.removeEventListener("abort", onAbort);
+    record(identityForRow, served.status >= 400 ? "rejected" : "ok", served.status, undefined, false);
+    return served;
+  }
+  /** A list, search or speech call is not a model call: the app's model allowlist does not apply to it. */
+  const notModelCall = route?.kind === "upstream" && route.anyModel;
   let body: Body;
   try {
     // Reserve the declared size first; a request that does not fit waits without reading its body.
@@ -515,7 +526,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return reject(400, "request body could not be read");
   }
   model = requestModel(body);
-  if (app.models && app.models.length > 0 && body.kind === "stream") {
+  if (!notModelCall && app.models && app.models.length > 0 && body.kind === "stream") {
     deps.metrics.rejection(app.name, "model");
     return reject(413, "request too large to verify the model allowlist", identityForRow, model);
   }
@@ -528,7 +539,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       deps.metrics.failOpen(app.name, "cap_check_failed");
     }
   }
-  const caps = checkCaps(app, model, used);
+  const caps = checkCaps(notModelCall ? { ...app, models: undefined } : app, model, used);
   if (!("ok" in caps)) {
     deps.metrics.rejection(app.name, caps.status === 403 ? "model" : "daily_cap");
   }
@@ -639,7 +650,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return reject(429, why, identityForRow, model, reason);
   }
 
-  const upstreamUrl = adapter.upstreamBase(style) + rest + url.search;
+  const upstreamUrl = (route?.kind === "upstream" ? route.url : adapter.upstreamBase(style) + rest) + url.search;
   const replayable = body.kind !== "stream";
 
   const send = (cred: ProviderCredential): Promise<Response> => {

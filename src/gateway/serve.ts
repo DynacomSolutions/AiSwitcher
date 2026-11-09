@@ -8,6 +8,7 @@ import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
+import { aliSessionOnce } from "./ali-session.ts";
 import { createAdminApp, type IdentityState } from "./admin.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
 import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps } from "./app.ts";
@@ -69,6 +70,9 @@ export interface GatewayHooks {
   /** How often every managed login is refreshed ahead of expiry with no traffic (default 10 minutes). */
   keepAliveMs?: number;
   keepAliveAccounts?(tool: string): Promise<Identity[]>;
+  /** The ali logins whose console session the gateway renews, and how (tests replace both). */
+  aliAccounts?(): Promise<Identity[]>;
+  aliRefresh?(identity: Identity): Promise<string>;
   /** Tests: do not read or write the shared gateway heartbeat file. */
   noHeartbeat?: boolean;
   overlapMs?: number;
@@ -531,9 +535,12 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     keepAliveRunning = true;
-    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, lastSuccess: lastSuccessAt, now, mintedAt: grantMintedAt, onPass: hooks.noHeartbeat ? undefined : (held, at) => trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held }), metrics, revoked: revokedGrants }).finally(() => {
-      keepAliveRunning = false;
-    });
+    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, lastSuccess: lastSuccessAt, now, mintedAt: grantMintedAt, onPass: hooks.noHeartbeat ? undefined : (held, at) => trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held }), metrics, revoked: revokedGrants })
+      // Tests (noHeartbeat) never touch the real registry or auth browser unless they inject an ali source.
+      .then(() => (hooks.noHeartbeat && !hooks.aliAccounts ? undefined : aliSessionOnce({ ...(hooks.aliAccounts ? { accounts: hooks.aliAccounts } : {}), ...(hooks.aliRefresh ? { refresh: hooks.aliRefresh } : {}), metrics, alerter, lastSuccess: lastSuccessAt, now })))
+      .finally(() => {
+        keepAliveRunning = false;
+      });
   }, hooks.keepAliveMs ?? 600_000);
   keepAliveTimer.unref?.();
   // Refresh-journal retention: old resolved rows go, the newest per account and any rotated-out evidence stay.

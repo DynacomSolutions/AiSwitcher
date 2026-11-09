@@ -154,6 +154,29 @@ back; meeting it is the app's job.
   `MissingSessionID`. `GET /models` lists the models the plan serves; `glm-5` is
   not one of them.
 
+### Extra routes (`src/gateway/routes.ts`)
+
+These sit beside the plain pass-through. They use the same app key, pool, failover,
+ledger and metrics. The model allowlist does not apply to them (a list, search or
+speech call is not a model call); the daily token cap does.
+
+- **Model lists**, `GET /models` or `/v1/models` (and `/models/<id>` where the
+  provider has it), for every provider. ali has no upstream list, so the gateway
+  lists the models AIS knows.
+- **kimi** `POST /search` and `POST /fetch` (also under `/v1`), sent to the Kimi
+  Coding `search` and `fetch` services. UNPROVEN live.
+- **codex** `POST /v1/audio/transcriptions` (or `/transcribe`), sent to ChatGPT's
+  `backend-api/transcribe` with the multipart body untouched. UNPROVEN live.
+- **Served by the gateway itself**, so no account detail leaves it: claude
+  `GET /api/oauth/usage` (the windows of the member the pool would pick) and
+  `GET /api/oauth/profile` (the app name only); codex
+  `GET /rate-limit-reset-credits` (also under `/api/codex` and `/wham`), which is
+  the total over the pool's members, and `POST .../consume`, which is refused.
+- **ali login**: the gateway renews the Alibaba console session of every live ali
+  identity on its keep-alive timer (`src/gateway/ali-session.ts`, counted as
+  `ais_gateway_keepalive_total{provider="ali"}`, failures alert). The host timer
+  `ais-ali-auth-refresh-<identity>` is no longer needed once a gateway runs.
+
 The live proof lives in `test/gateway-e2e/` (one script per provider using the
 unmodified official SDK, configured with `AIS_GATEWAY_URL` and `AIS_GATEWAY_TOKEN`
 only) and `test/gateway-e2e/run-in-cluster.sh <script>`, which runs one from a

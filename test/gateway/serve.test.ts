@@ -829,6 +829,21 @@ describe("keep-alive across every refreshable tool", () => {
   });
 });
 
+describe("ali session ownership", () => {
+  test("the gateway timer renews the ali console session of each live ali login", async () => {
+    const member = (name: string) => ({ name, label: name, configDir: `/x/${name}` }) as never;
+    const renewed = new Set<string>();
+    const g = await boot({
+      keepAliveMs: 20,
+      keepAliveAccounts: async () => [],
+      aliAccounts: async () => [member("personal")],
+      aliRefresh: async (i) => (renewed.add(i.name), "/x/console-cookie.txt"),
+    });
+    await waitFor(() => renewed.has("personal"));
+    await g.stop();
+  });
+});
+
 describe("idle keep-alive", () => {
   test("a store read error found by the keep-alive raises the refresh-failed alert", async () => {
     const seen: string[] = [];

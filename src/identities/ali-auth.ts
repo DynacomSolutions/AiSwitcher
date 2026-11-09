@@ -24,7 +24,7 @@ const ALI_BASE_URL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/a
  * including plan-included tokens; context windows/max-tokens are reasonable
  * fallback metadata, not independently verified per-model figures.
  */
-const ALI_MODELS = [
+export const ALI_MODELS = [
   {
     // The GA id, distinct from the -preview one below. Both confirmed live
     // (2026-08-07) with real /v1/messages requests against a Token plan key;
