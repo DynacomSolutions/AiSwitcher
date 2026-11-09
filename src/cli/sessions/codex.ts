@@ -121,7 +121,7 @@ async function codexThreadName(configDir: string, id: string): Promise<string | 
   let name: string | undefined;
   for (const line of text.split("\n")) {
     const entry = safeJsonParse(line);
-    if (entry?.id === id && typeof entry.thread_name === "string" && entry.thread_name.trim()) name = entry.thread_name;
+    if (entry && entry.id === id && typeof entry.thread_name === "string" && entry.thread_name.trim()) name = entry.thread_name;
   }
   return name;
 }
@@ -221,6 +221,10 @@ export async function locateCodexTranscript(configDir: string, id: string): Prom
   // Generous fixed window (transcripts are reachable from a tree that only
   // shows the recent window, but a slightly stale UI should still resolve).
   const { files } = await listRecentFilesAsync(join(configDir, "sessions"), new Date(Date.now() - 365 * 86_400_000), {}, true);
+  // Rollout file names end with the thread id: check those few files first instead of reading the first line of every rollout.
+  for (const filePath of files.filter((f) => f.endsWith(`-${id}.jsonl`))) {
+    if (parseMetaLine(await readFirstLine(filePath))?.id === id) return filePath;
+  }
   const found = await mapPool(files, 16, async (filePath) => {
     const meta = parseMetaLine(await readFirstLine(filePath));
     return meta?.id === id ? filePath : undefined;

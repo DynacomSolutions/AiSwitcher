@@ -25,6 +25,10 @@ export const SESSION_END_TIMEOUT_MS = 2_000;
 /** Shims that made at least one browser call (only those announce their end) and those that already did. */
 const usedContexts = new WeakSet<ShimContext>();
 const endedContexts = new WeakSet<ShimContext>();
+/** The last chat-name label seen per shim: reused by the end notice and when a lookup is slow. */
+const lastLabels = new WeakMap<ShimContext, string>();
+/** A chat-name lookup that takes longer than this is left running in the background; the call goes ahead with the last known label. */
+export const CHAT_NAME_WAIT_MS = 1_000;
 
 export interface ShimContext {
   /** Gateway root URL, resolved on each call. */
@@ -62,9 +66,17 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
   if (!internal) usedContexts.add(ctx);
   const { browser, ...args } = (typeof rawArgs === "object" && rawArgs !== null ? rawArgs : {}) as Record<string, unknown>;
   let session = ctx.session;
-  if (ctx.chatName) {
-    const label = await ctx.chatName().catch(() => "");
-    if (label) session = { ...session, label };
+  // The end notice never waits for a chat-name lookup (it can rescan large transcripts): it reuses the last label.
+  if (internal) {
+    const last = lastLabels.get(ctx);
+    if (last) session = { ...session, label: last };
+  } else if (ctx.chatName) {
+    const slow = new Promise<string>((resolve) => setTimeout(() => resolve(lastLabels.get(ctx) ?? ""), CHAT_NAME_WAIT_MS).unref?.());
+    const label = await Promise.race([ctx.chatName().catch(() => ""), slow]);
+    if (label) {
+      lastLabels.set(ctx, label);
+      session = { ...session, label };
+    }
   }
   let token: string | undefined;
   let url: string | undefined;

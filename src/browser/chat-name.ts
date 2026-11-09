@@ -30,8 +30,14 @@ export function chatNameResolver(src: ChatNameSource, env: NodeJS.ProcessEnv = p
   let threadId: string | undefined;
   let cached: { at: number; name: string } | undefined;
   const fallback = () => clean(env.AIS_SESSION_NAME) || shortSessionId(src.fallbackId ?? (typeof src.id === "string" ? src.id : ""));
-  return async () => {
-    if (cached && now() - cached.at < ttl) return cached.name;
+  let inflight: Promise<string> | undefined;
+  return () => {
+    if (cached && now() - cached.at < ttl) return Promise.resolve(cached.name);
+    // One lookup at a time: callers that give up waiting do not pile up scans.
+    inflight ??= lookup().finally(() => { inflight = undefined; });
+    return inflight;
+  };
+  async function lookup(): Promise<string> {
     let found = "";
     let id = typeof src.id === "string" ? src.id : undefined;
     if (!id) {
@@ -46,5 +52,5 @@ export function chatNameResolver(src: ChatNameSource, env: NodeJS.ProcessEnv = p
     const name = found || fallback();
     cached = { at: now(), name };
     return name;
-  };
+  }
 }
