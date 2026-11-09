@@ -34,22 +34,28 @@ export class Gate {
 
   constructor(private readonly max: number) {}
 
-  /** A release function once a slot is free, or undefined if none freed within `ms`. */
-  acquire(ms: number): Promise<(() => void) | undefined> {
+  /** A release function once a slot is free, or undefined if none freed within `ms` or `signal` aborted (a waiter that aborts takes no slot). */
+  acquire(ms: number, signal?: AbortSignal): Promise<(() => void) | undefined> {
+    if (signal?.aborted) return Promise.resolve(undefined);
     if (this.held < this.max) {
       this.held += 1;
       return Promise.resolve(this.releaser());
     }
     return new Promise((resolve) => {
-      const grant = (): void => {
+      const leave = (): void => {
         clearTimeout(timer);
-        resolve(this.releaser()); // the releasing holder handed its slot over: held is unchanged
-      };
-      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", leave);
         const i = this.waiters.indexOf(grant);
         if (i >= 0) this.waiters.splice(i, 1);
         resolve(undefined);
-      }, Math.max(0, ms));
+      };
+      const grant = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", leave);
+        resolve(this.releaser()); // the releasing holder handed its slot over: held is unchanged
+      };
+      const timer = setTimeout(leave, Math.max(0, ms));
+      signal?.addEventListener("abort", leave, { once: true });
       this.waiters.push(grant);
     });
   }

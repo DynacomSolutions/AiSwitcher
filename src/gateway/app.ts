@@ -53,7 +53,7 @@ export interface GatewayDeps {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
-/** Side-count database calls in flight at once, per gateway app; the rest queue for a slot. */
+/** Side-count database calls in flight at once for the whole gateway process (all apps share one gate); the rest queue for a slot. */
 const SIDE_COUNT_MAX_INFLIGHT = 4;
 
 /** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
@@ -531,7 +531,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     // waiting for the gate is normal load, not a failure. Only a database error or running out of time falls back to memory (and alerts).
     const limitMs = deps.sideCountTimeoutMs ?? 5_000;
     const deadline = Date.now() + limitMs;
-    const release = await sideGate.acquire(limitMs);
+    const release = await sideGate.acquire(limitMs, ctrl.signal);
+    // A client that left while waiting is neither counted nor given a slot.
+    if (ctrl.signal.aborted || req.signal.aborted) {
+      release?.(); // the abort may have landed after a slot was granted: hand it on, never leak it
+      throw new DOMException("aborted", "AbortError");
+    }
     if (release) {
       const abort = new AbortController();
       const query = deps.store.bumpSideCount(app.name, day, abort.signal);
