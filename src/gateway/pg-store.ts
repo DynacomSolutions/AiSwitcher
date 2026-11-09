@@ -1,5 +1,6 @@
 import { SQL, type TransactionSQL } from "bun";
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
+import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import type { GatewayStore } from "./store.ts";
 import type { GatewayApp, GatewayProvider, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
@@ -7,11 +8,13 @@ import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
 import refreshJournal0003 from "./migrations/0003_refresh_journal.sql" with { type: "text" };
+import sideCounts0004 from "./migrations/0004_side_counts.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
   { version: "0002_browser", sql: browser0002 },
   { version: "0003_refresh_journal", sql: refreshJournal0003 },
+  { version: "0004_side_counts", sql: sideCounts0004 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
@@ -183,6 +186,10 @@ export class PgGatewayStore implements GatewayStore {
       SELECT COALESCE(SUM(input_tokens + output_tokens + cache_write_tokens), 0) AS total
       FROM gateway_usage WHERE app = ${app} AND ts >= ${since.toISOString()}::timestamptz`;
     return Number(rows[0]?.total ?? 0);
+  }
+
+  bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number> {
+    return bumpSideCountOn(this.sql as unknown as SqlTag, app, day, signal);
   }
 
   async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {

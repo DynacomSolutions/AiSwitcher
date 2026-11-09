@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
-import { refreshAliAuthSession } from "../identities/auth-session.ts";
+import { refreshAliAuthSession, standDownToGateway } from "../identities/auth-session.ts";
 import {
   DEFAULT_EXPIRY_WINDOW_HOURS,
   OAuthRefreshError,
@@ -90,7 +90,11 @@ function oauthRefresherFor(tool: RefreshableTool): Refresher {
 }
 
 const REFRESHERS: Record<string, Refresher> = {
-  ali: (identity) => refreshAliAuthSession(identity),
+  ali: async (identity, context) => {
+    // The gateway owns the login while its heartbeat names it (a manual run, `force`, still renews).
+    if (!context.force && (await standDownToGateway(identity.name))) return { skipped: true, detail: "renewed by the gateway" };
+    return refreshAliAuthSession(identity);
+  },
   codex: oauthRefresherFor("codex"),
   claude: oauthRefresherFor("claude"),
   grok: oauthRefresherFor("grok"),

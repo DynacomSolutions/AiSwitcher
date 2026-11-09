@@ -1,3 +1,4 @@
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -829,6 +830,115 @@ describe("keep-alive across every refreshable tool", () => {
   });
 });
 
+describe("ali session ownership", () => {
+  test("the gateway timer renews the ali console session of each live ali login", async () => {
+    const member = (name: string) => ({ name, label: name, configDir: `/x/${name}` }) as never;
+    const renewed = new Set<string>();
+    const g = await boot({
+      keepAliveMs: 20,
+      keepAliveAccounts: async () => [],
+      aliAccounts: async () => [member("personal")],
+      aliRefresh: async (i) => (renewed.add(i.name), "/x/console-cookie.txt"),
+      aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true },
+    });
+    await waitFor(() => renewed.has("personal"));
+    await g.stop();
+  });
+});
+
+describe("ali ownership and shutdown", () => {
+  const member = (name: string) => ({ name, label: name, configDir: `/x/${name}` }) as never;
+
+  test("the heartbeat names the ali logins the gateway renews", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hb-"));
+    const prev = process.env.AIS_GATEWAY_HEARTBEAT;
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "hb.json");
+    try {
+      const g = await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => "p", aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true } });
+      await waitFor(async () => (await Bun.file(join(dir, "hb.json")).exists()) && Object.hasOwn(((await Bun.file(join(dir, "hb.json")).json()) as { held: object }).held, "ali/personal"));
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
+      else process.env.AIS_GATEWAY_HEARTBEAT = prev;
+    }
+  });
+
+  test("without injected setup checks a test gateway never runs kubectl", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fake-kubectl-"));
+    const marker = join(dir, "called");
+    await Bun.write(join(dir, "kubectl"), `#!/bin/sh\necho called > ${marker}\necho yes\n`);
+    await Bun.$`chmod +x ${join(dir, "kubectl")}`;
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${dir}:${prevPath}`;
+    try {
+      const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => "p" });
+      await Bun.sleep(250);
+      await g.stop();
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  test("a failed startup self-test keeps ali/<id> out of the heartbeat, even after renewals succeed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hb-"));
+    const prev = process.env.AIS_GATEWAY_HEARTBEAT;
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "hb.json");
+    let renewed = 0;
+    try {
+      const g = await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => (renewed++, "p"), aliSetup: { which: () => null, writable: async () => true } });
+      await waitFor(async () => renewed >= 1 && (await Bun.file(join(dir, "hb.json")).exists()));
+      await Bun.sleep(80);
+      const hb = (await Bun.file(join(dir, "hb.json")).json()) as { held: Record<string, unknown> };
+      expect(Object.keys(hb.held).filter((k) => k.startsWith("ali/"))).toEqual([]);
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
+      else process.env.AIS_GATEWAY_HEARTBEAT = prev;
+    }
+  });
+
+  test("a login is claimed only after its first successful renewal", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hb-"));
+    const prev = process.env.AIS_GATEWAY_HEARTBEAT;
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "hb.json");
+    try {
+      const g = await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => Promise.reject(new Error("down")), aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true } });
+      await waitFor(async () => await Bun.file(join(dir, "hb.json")).exists());
+      await Bun.sleep(100);
+      const hb = (await Bun.file(join(dir, "hb.json")).json()) as { held: Record<string, unknown> };
+      expect(Object.keys(hb.held).filter((k) => k.startsWith("ali/"))).toEqual([]);
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
+      else process.env.AIS_GATEWAY_HEARTBEAT = prev;
+    }
+  });
+
+  test("stop() is not held up by a startup check that never answers", async () => {
+    const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async () => [], stopCeilingMs: 300, aliAccounts: async () => [member("personal")], aliRefresh: async () => "p", aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: () => new Promise<boolean>(() => {}) } });
+    await Bun.sleep(150);
+    const t0 = Date.now();
+    await g.stop();
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
+  test("a missing kubectl is alerted once at startup", async () => {
+    const g = await boot({ aliAccounts: async () => [member("personal")], aliSetup: { which: () => null, writable: async () => true } });
+    await waitFor(() => alerts.some((a) => a.kind === "ali-setup-missing"));
+    await g.stop();
+  });
+
+  test("stop() does not wait for a browser renewal that never finishes", async () => {
+    let started = false;
+    const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async () => [], stopCeilingMs: 500, aliAccounts: async () => [member("personal")], aliRefresh: () => ((started = true), new Promise<string>(() => {})), aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true } });
+    await waitFor(() => started);
+    const t0 = Date.now();
+    await g.stop();
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+});
+
 describe("idle keep-alive", () => {
   test("a store read error found by the keep-alive raises the refresh-failed alert", async () => {
     const seen: string[] = [];
@@ -944,5 +1054,76 @@ describe("idle keep-alive and the refresh guard", () => {
     expect(seen).toEqual([]);
     expect(metrics.render()).toContain('outcome="lock-timeout"');
     expect(metrics.render()).toContain('outcome="retryable"');
+  });
+});
+
+describe("public host", () => {
+  const PUBLIC = "gw.public.example";
+  const get = (g: { port: number }, path: string, host: string) => fetch(`http://127.0.0.1:${g.port}${path}`, { headers: { host } }).then((r) => r.status);
+
+  test("metrics, health, readiness and pairing are 404 on the public host, and work on the pod address", async () => {
+    const g = await boot({ publicHosts: [PUBLIC] });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    for (const path of ["/metrics", "/healthz", "/readyz", "/browser/pair", "/browser/pair/abc"]) {
+      expect(await get(g, path, PUBLIC)).toBe(404);
+      expect(await get(g, path, `${PUBLIC.toUpperCase()}:443`)).toBe(404);
+    }
+    expect(await get(g, "/metrics", "pod-1:47130")).toBe(200);
+    expect(await get(g, "/healthz", "pod-1:47130")).toBe(200);
+    expect(await get(g, "/readyz", "pod-1:47130")).toBe(200);
+    expect(await status(`${base(g)}/metrics`)).toBe(200);
+    await g.stop();
+  });
+
+  test("encoded and doubled spellings of the operational paths are 404 too, for POST as well as GET", async () => {
+    const g = await boot({ publicHosts: [PUBLIC] });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const call = (method: string, path: string, host: string) => fetch(`http://127.0.0.1:${g.port}${path}`, { method, headers: { host }, ...(method === "POST" ? { body: "{}" } : {}) }).then((r) => r.status);
+    for (const path of ["/browser/%70air", "/%62rowser/pair", "/browser/pair/x", "//browser/pair", "/browser//pair", "/%2562rowser/pair", "/BROWSER/PAIR", "/%6detrics", "/%68ealthz", "/readyz/", "/browser/pair%2Fx"]) {
+      for (const method of ["GET", "POST"]) expect([method, path, await call(method, path, PUBLIC)]).toEqual([method, path, 404]);
+    }
+    // on the pod address the pairing route is the real one (not the 404 of the gate)
+    expect(await call("POST", "/browser/pair", "pod-1:47130")).not.toBe(404);
+    expect(await call("POST", "/browser/%70air", "pod-1:47130")).not.toBe(404);
+    await g.stop();
+  });
+
+  test("every X-Forwarded-Host value and a Forwarded host= count", async () => {
+    const g = await boot({ publicHosts: [PUBLIC] });
+    const call = (headers: Record<string, string>) => fetch(`http://127.0.0.1:${g.port}/metrics`, { headers: { host: "pod-1:47130", ...headers } }).then((r) => r.status);
+    expect(await call({ "x-forwarded-host": `other.example, ${PUBLIC}` })).toBe(404);
+    expect(await call({ "x-forwarded-host": `${PUBLIC}, other.example` })).toBe(404);
+    expect(await call({ forwarded: `for=client-a;host="${PUBLIC}";proto=https` })).toBe(404);
+    expect(await call({ "x-forwarded-host": "other.example" })).toBe(200);
+    await g.stop();
+  });
+
+  test("an empty public host list is reported at startup and in the metrics", async () => {
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    let g: Awaited<ReturnType<typeof boot>>;
+    try {
+      g = await boot({ publicHosts: [] });
+    } finally {
+      console.warn = orig;
+    }
+    expect(warnings.some((w) => w.includes("AIS_GATEWAY_PUBLIC_HOSTS is empty"))).toBe(true);
+    expect(await (await fetch(`${base(g)}/metrics`)).text()).toContain("ais_gateway_public_hosts_configured 0");
+    await g.stop();
+  });
+
+  test("the public host list comes from AIS_GATEWAY_PUBLIC_HOSTS", async () => {
+    const prev = process.env.AIS_GATEWAY_PUBLIC_HOSTS;
+    process.env.AIS_GATEWAY_PUBLIC_HOSTS = "gw.one.example, gw.two.example";
+    try {
+      const g = await boot();
+      expect(await get(g, "/metrics", "gw.two.example")).toBe(404);
+      expect(await get(g, "/metrics", PUBLIC)).toBe(200);
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_PUBLIC_HOSTS;
+      else process.env.AIS_GATEWAY_PUBLIC_HOSTS = prev;
+    }
   });
 });

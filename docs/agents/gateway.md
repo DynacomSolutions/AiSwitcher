@@ -154,6 +154,60 @@ back; meeting it is the app's job.
   `MissingSessionID`. `GET /models` lists the models the plan serves; `glm-5` is
   not one of them.
 
+### Extra routes (`src/gateway/routes.ts`)
+
+These sit beside the plain pass-through. They use the same app key, pool, failover,
+ledger and metrics. The model allowlist does not apply to them (a list, search or
+speech call is not a model call); the daily token cap does.
+
+- **Model lists**, `GET /models` or `/v1/models` (and `/models/<id>` where the
+  provider has it), for every provider. ali has no upstream list, so the gateway
+  lists the models AIS knows.
+- **kimi** `POST /search` and `POST /fetch` (also under `/v1`), sent to the Kimi
+  Coding `search` and `fetch` services. UNPROVEN live.
+- **codex** `POST /v1/audio/transcriptions` (or `/transcribe`), sent to ChatGPT's
+  `backend-api/transcribe` with the multipart body untouched. UNPROVEN live.
+- **Served by the gateway itself**, so no account detail leaves it: claude
+  `GET /api/oauth/usage` (the windows of the member the pool would pick) and
+  `GET /api/oauth/profile` (the app name only); codex
+  `GET /rate-limit-reset-credits` (also under `/api/codex` and `/wham`), which is
+  the total over the pool's members, and `POST .../consume`, which is refused.
+- **Side routes** (lists, search, fetch, speech) pass the provider's 401/402/403/429 straight to the app: no login
+  refresh, no pool hold, no failover. Side and served calls are counted per app and day apart from tokens (default 5000 a
+  day, `AIS_GATEWAY_SIDE_DAILY_LIMIT`; over it the answer is 429); no token rows are written for them. Codex reset credits
+  are cached 60 s per app.
+- **Refused claude paths** (403, after collapsing `//`, decoding, lower-casing and dropping `;params`), below `/api/`:
+  `oauth/{profile,account,userinfo,organization(s),roles}`, `oauth/claude_cli/{roles,profile,account,organization(s)}`,
+  `claude_cli_profile`, `organization(s)`, `account`, `bootstrap`, `me`. The gateway serves `oauth/usage` and
+  `oauth/profile` itself. Every other `/api/*` path passes through. Repeated slashes in any app path are collapsed before
+  matching and before the path is sent upstream.
+
+### Public host
+
+`/metrics`, `/healthz`, `/readyz` and `/browser/pair*` answer 404 when the request names a public host (Host or
+X-Forwarded-Host is in `AIS_GATEWAY_PUBLIC_HOSTS`, comma-separated; no default is compiled in, so the deployment must set it); the pod address still works for probes and
+vmagent. Every `cf-*`, `x-forwarded-*` and `x-envoy-*` header, `cdn-loop`, `forwarded`, `x-real-ip`, `x-request-id`, `x-client-ip` and `true-client-ip` (Cloudflare Access JWTs and client credentials included) is removed before a
+request goes to a provider. The side-route daily count lives in the gateway database (table `gateway_side_counts`); if the
+database cannot answer, each replica counts in memory and an owner alert (`side-count-unavailable`) is raised.
+
+The path is matched after repeated percent-decoding, slash collapsing and lower-casing. A path that cannot be decoded (a stray
+`%` escape) cannot be shown to be harmless, so on a public host it is treated as one of the operational paths and answers 404.
+Side-count database calls are limited to four at once; the rest queue for a slot within the same time limit, and only a
+database error or running out of time falls back to memory and raises the alert.
+
+### ali login ownership
+
+The gateway renews the Alibaba console session of every live ali identity on its keep-alive timer
+(`src/gateway/ali-session.ts`, `ais_gateway_keepalive_total{provider="ali"}`; failures raise an owner alert). The heartbeat
+names them as `ali/<identity>`; while it is fresh, the console daemon, the host timer `ais-ali-auth-refresh-<identity>` and
+`ais auth refresh --tool=ali` skip their run (the host timer stays installed, so the host resumes at once when the heartbeat stops naming the login; `--force` renews anyway). The gateway claims `ali/<identity>` only when the startup check found nothing missing and that login has been renewed successfully at least once. Renewals take a
+lock on the shared Chrome tab and never navigate away from a sign-in page a person is using. On shutdown a renewal in
+flight is abandoned and `stop()` waits at most 10 s for the pass.
+
+What the gateway pod needs for this, checked once at startup (alert `ali-setup-missing` lists what is absent):
+`kubectl` on the PATH; `AIS_K8S_API_SERVER` set to the in-cluster API address (no systemd in a pod); the permission
+`create pods/portforward` in the chrome-auth namespace; writable `~/.ais/auth-browser` and each ali identity directory.
+
 The live proof lives in `test/gateway-e2e/` (one script per provider using the
 unmodified official SDK, configured with `AIS_GATEWAY_URL` and `AIS_GATEWAY_TOKEN`
 only) and `test/gateway-e2e/run-in-cluster.sh <script>`, which runs one from a

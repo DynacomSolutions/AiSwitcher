@@ -13,6 +13,9 @@ import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
+import { bounded } from "./refresh-guard.ts";
+import { fallbackCount, Gate } from "./side-count.ts";
+import { collapseSlashes, isClaudeAccountPath, routeFor, serveRoute, sideDailyLimitFromEnv, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
@@ -40,9 +43,18 @@ export interface GatewayDeps {
   browserHub?: BrowserHub;
   /** Most request-body bytes held for replay at once across all requests. Defaults to AIS_GATEWAY_BODY_BUDGET_MB, else BODY_BUDGET_BYTES. */
   bodyBudgetBytes?: number;
+  /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else 5000. */
+  sideDailyLimit?: number;
+  /** Longest a side-count database call may take before the replica counts from memory (default 5 s). */
+  sideCountTimeoutMs?: number;
+  /** Told after each side-count store call whether it worked (the server turns a failure into an owner alert). */
+  sideCountHealth?(ok: boolean): void;
   /** Waits `ms` or until `signal` aborts; tests inject a fake clock. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
+
+/** Side-count database calls in flight at once, per gateway app; the rest queue for a slot. */
+const SIDE_COUNT_MAX_INFLIGHT = 4;
 
 /** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
 export const BODY_BUDGET_BYTES = 512 * 1024 * 1024;
@@ -57,6 +69,9 @@ export function bodyBudgetFromEnv(env: Record<string, string | undefined> = proc
 export const REPLAY_LIMIT_BYTES = 8 * 1024 * 1024;
 /** Quota errors (403) are only inspected up to this size. */
 export const ERROR_PEEK_BYTES = 64 * 1024;
+
+/** Headers a front proxy adds that identify the client or the path to it. */
+const PROXY_METADATA = new Set(["cdn-loop", "forwarded", "x-real-ip", "x-request-id", "x-client-ip", "true-client-ip"]);
 
 const HOP_BY_HOP = ["connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers", "transfer-encoding", "upgrade"];
 /** Error types or codes that mean "this login is out of quota". A bare 403 (for example "insufficient permissions") is not one. */
@@ -155,6 +170,9 @@ export function upstreamHeaders(adapter: ProviderAdapter, cred: ProviderCredenti
   const headers = new Headers(incoming);
   stripHopByHop(headers);
   for (const h of [...adapter.stripRequestHeaders, "host", "content-length", "accept-encoding"]) headers.delete(h);
+  // Cloudflare (tunnel, Access) adds its own headers, including Access JWTs and client ids/secrets: none of them goes to a provider.
+  // Proxy metadata (client and pod addresses, request ids, envoy/forwarding headers) stays inside too.
+  for (const name of [...headers.keys()]) if (name.startsWith("cf-") || name.startsWith("x-envoy-") || name.startsWith("x-forwarded-") || PROXY_METADATA.has(name)) headers.delete(name);
   headers.set("accept-encoding", "identity");
   for (const [k, v] of Object.entries(adapter.authHeaders(cred, incoming))) headers.set(k, v);
   return headers;
@@ -374,10 +392,13 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const log = deps.log ?? defaultLog;
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
+  const resetCredits: ResetCreditsCache = {};
+  const sideGate = new Gate(SIDE_COUNT_MAX_INFLIGHT);
+  const sideCounts = new Map<string, number>(); // fallback only, while the store is down
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts, sideGate).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -387,12 +408,13 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
   const appName = decodeSegment(url.pathname.slice(1, slash === -1 ? undefined : slash));
-  const rest = slash === -1 ? "" : url.pathname.slice(slash);
+  // Repeated slashes are collapsed once, here: every rule below and the path sent upstream see the same path.
+  const rest = slash === -1 ? "" : collapseSlashes(url.pathname.slice(slash));
 
   let found: GatewayApp | undefined;
   try {
@@ -492,6 +514,66 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   async function run(): Promise<Response> {
   if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
+  const route = routeFor(app.provider, style, req.method, rest);
+  // Claude's account, profile and organisation paths are never forwarded (the gateway serves usage and profile itself).
+  if (app.provider === "claude" && route?.kind !== "serve" && isClaudeAccountPath(rest)) return reject(403, "this path is not available through the gateway");
+  /** A list, search or speech call is not a model call: no model allowlist, and its upstream errors never touch logins or the pool. */
+  const side = route?.kind === "upstream" && route.side;
+  /**
+   * Side and served calls are counted per app and day, apart from tokens, in the gateway's shared store (so the limit holds across
+   * replicas and restarts). If the store cannot answer in time the count falls back to this replica's memory, the failure is
+   * counted and raised as an owner alert, and the request goes on.
+   */
+  if (side || route?.kind === "serve") {
+    const day = new Date(dayStartIct(deps.now()).getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
+    let n: number | undefined;
+    // At most SIDE_COUNT_MAX_INFLIGHT store calls run at once. The others queue for a slot inside the same time limit as the call itself:
+    // waiting for the gate is normal load, not a failure. Only a database error or running out of time falls back to memory (and alerts).
+    const limitMs = deps.sideCountTimeoutMs ?? 5_000;
+    const deadline = Date.now() + limitMs;
+    const release = await sideGate.acquire(limitMs);
+    if (release) {
+      const abort = new AbortController();
+      const query = deps.store.bumpSideCount(app.name, day, abort.signal);
+      // The slot is freed when the call ends, however late; a write that lands after the timeout is not used for the limit.
+      query.then(release, release);
+      try {
+        n = await bounded(query, Math.max(1, deadline - Date.now()), "side count");
+        deps.sideCountHealth?.(true);
+      } catch {
+        abort.abort();
+        n = undefined;
+      }
+    }
+    if (n === undefined) {
+      deps.metrics.failOpen(app.name, "side_count_failed");
+      deps.sideCountHealth?.(false);
+      n = fallbackCount(sideCounts, app.name, day);
+    }
+    if (n > (deps.sideDailyLimit ?? sideDailyLimitFromEnv())) {
+      deps.metrics.rejection(app.name, "daily_cap");
+      return reject(429, "daily limit for list, search and speech calls reached", identityForRow, undefined, "side_daily_cap");
+    }
+  }
+  if (route?.kind === "serve") {
+    // Answered from the gateway's own pool state: no upstream call, no body, no account detail. The daily cap still applies.
+    if (app.dailyTokens !== undefined) {
+      let usedNow = 0;
+      try {
+        usedNow = await deps.store.usageSince(app.name, dayStartIct(deps.now()));
+      } catch {
+        deps.metrics.failOpen(app.name, "cap_check_failed");
+      }
+      if (usedNow >= app.dailyTokens) {
+        deps.metrics.rejection(app.name, "daily_cap");
+        return reject(429, "daily token cap reached", identityForRow, undefined, "daily_cap");
+      }
+    }
+    const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal, cache: resetCredits });
+    req.signal.removeEventListener("abort", onAbort);
+    record(identityForRow, served.status >= 400 ? "rejected" : "ok", served.status, undefined, false);
+    return served;
+  }
   let body: Body;
   try {
     // Reserve the declared size first; a request that does not fit waits without reading its body.
@@ -515,7 +597,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return reject(400, "request body could not be read");
   }
   model = requestModel(body);
-  if (app.models && app.models.length > 0 && body.kind === "stream") {
+  if (!side && app.models && app.models.length > 0 && body.kind === "stream") {
     deps.metrics.rejection(app.name, "model");
     return reject(413, "request too large to verify the model allowlist", identityForRow, model);
   }
@@ -528,7 +610,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       deps.metrics.failOpen(app.name, "cap_check_failed");
     }
   }
-  const caps = checkCaps(app, model, used);
+  const caps = checkCaps(side ? { ...app, models: undefined } : app, model, used);
   if (!("ok" in caps)) {
     deps.metrics.rejection(app.name, caps.status === 403 ? "model" : "daily_cap");
   }
@@ -639,7 +721,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return reject(429, why, identityForRow, model, reason);
   }
 
-  const upstreamUrl = adapter.upstreamBase(style) + rest + url.search;
+  const upstreamUrl = (route?.kind === "upstream" ? route.url : adapter.upstreamBase(style) + rest) + url.search;
   const replayable = body.kind !== "stream";
 
   const send = (cred: ProviderCredential): Promise<Response> => {
@@ -659,7 +741,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const attempt = async (ident: string): Promise<Response> => {
     let cred = await deps.creds.get(app.provider, ident);
     let res = await send(cred);
-    if (res.status === 401 && adapter.refreshable) {
+    if (res.status === 401 && adapter.refreshable && !side) {
       try {
         cred = await deps.creds.refreshAfter401(app.provider, ident, cred.accessToken);
       } catch (err) {
@@ -685,6 +767,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   /** 429 is quota or rate limit. 402 is a payment-required signal some providers use for exhausted credit. A 403 counts only when its (bounded) JSON body names a quota error type or code. */
   const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
+    if (side) return { quota: false, res }; // a side route's 402/403/429 is its own, not a sign this login is out of quota
     if (res.status === 402) return { quota: true, res };
     if (res.status === 429) {
       // Only Codex states exhaustion in the body (the (bounded) peek); elsewhere the headers decide and the body is not read.

@@ -76,6 +76,14 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect((await s.tokensFor("b"))[0]?.expiresAt).toBeUndefined();
   });
 
+  test("bumpSideCount counts per app and day and returns the running total", async () => {
+    const s = await makeStore();
+    expect(await s.bumpSideCount("a", "2026-11-02")).toBe(1);
+    expect(await s.bumpSideCount("a", "2026-11-02")).toBe(2);
+    expect(await s.bumpSideCount("b", "2026-11-02")).toBe(1);
+    expect(await s.bumpSideCount("a", "2026-11-03")).toBe(1);
+  });
+
   test("usageSince sums input, output and cache-write for the app since the cutoff", async () => {
     const s = await makeStore();
     await s.putApp(base);

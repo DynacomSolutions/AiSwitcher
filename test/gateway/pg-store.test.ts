@@ -52,6 +52,7 @@ if (!url && process.env.CI && !optOut) {
       for (const t of ["browser_tokens", "browser_pairings", "browser_agent_tokens", "browser_bindings"]) {
         await sql.unsafe(`DROP TABLE IF EXISTS ${t} CASCADE`);
       }
+      await sql`DROP TABLE IF EXISTS gateway_side_counts CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_refresh_journal CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_usage CASCADE`;
       await sql`DROP TABLE IF EXISTS gateway_tokens CASCADE`;
@@ -71,7 +72,7 @@ if (!url && process.env.CI && !optOut) {
       const sql = new SQL(url);
       try {
         const rows = await sql`SELECT version FROM schema_migrations`;
-        expect(rows.length).toBe(3);
+        expect(rows.length).toBe(4);
         const t = await sql`SELECT to_regclass('gateway_usage') AS r`;
         expect(t[0].r).toBe("gateway_usage");
         const ext = await sql`SELECT 1 AS x FROM pg_extension WHERE extname = 'timescaledb'`;

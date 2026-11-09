@@ -16,7 +16,7 @@ export interface GatewayMetrics {
   rejection(app: string, reason: "daily_cap" | "model" | "reserve" | "no_headroom" | "no_identities"): void;
   failover(app: string): void;
   /** A safety check could not run and the request was let through (for example the daily cap while the database is down). */
-  failOpen(app: string, reason: "cap_check_failed"): void;
+  failOpen(app: string, reason: "cap_check_failed" | "side_count_failed"): void;
   /** One browser tool call: `outcome` is "ok" or a browser error code. Tool is from a fixed set. */
   browserCall(tool: string, outcome: string, seconds: number): void;
   /** A browser pairing completed (token delivered). */
@@ -85,6 +85,7 @@ export class PrometheusMetrics implements GatewayMetrics {
   private callSum = 0;
   /** Set once the relay hub exists. */
   browserGauges: { connected(): number; sessions(): number } = { connected: () => 0, sessions: () => 0 };
+  private publicHostCount = 0;
   private budgetWaiting = 0;
   private readonly budgetBucketCounts = BUCKETS.map(() => 0);
   private budgetCount = 0;
@@ -124,7 +125,7 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.failovers.inc({ app });
   }
 
-  failOpen(app: string, reason: "cap_check_failed"): void {
+  failOpen(app: string, reason: "cap_check_failed" | "side_count_failed"): void {
     this.failOpens.inc({ app, reason });
   }
 
@@ -158,6 +159,10 @@ export class PrometheusMetrics implements GatewayMetrics {
 
   credentialUnreadable(app: string, provider: string, identity: string): void {
     this.unreadable.inc({ app, provider, identity });
+  }
+
+  publicHostsConfigured(n: number): void {
+    this.publicHostCount = n;
   }
 
   heartbeatWrite(outcome: string): void {
@@ -199,6 +204,7 @@ export class PrometheusMetrics implements GatewayMetrics {
     out.push(`ais_gateway_body_budget_wait_seconds_bucket{le="+Inf"} ${this.budgetCount}`, `ais_gateway_body_budget_wait_seconds_sum ${this.budgetSum}`, `ais_gateway_body_budget_wait_seconds_count ${this.budgetCount}`);
     out.push("# HELP ais_gateway_browsers_connected Browser extensions connected.", "# TYPE ais_gateway_browsers_connected gauge", `ais_gateway_browsers_connected ${this.browserGauges.connected()}`);
     out.push("# HELP ais_gateway_browser_sessions_active Agent browser sessions active in the last ten minutes.", "# TYPE ais_gateway_browser_sessions_active gauge", `ais_gateway_browser_sessions_active ${this.browserGauges.sessions()}`);
+    out.push("# HELP ais_gateway_public_hosts_configured Public host names configured (AIS_GATEWAY_PUBLIC_HOSTS); 0 means operational endpoints answer on every host.", "# TYPE ais_gateway_public_hosts_configured gauge", `ais_gateway_public_hosts_configured ${this.publicHostCount}`);
     out.push("# HELP ais_gateway_ledger_buffer_depth Usage rows waiting to be written.", "# TYPE ais_gateway_ledger_buffer_depth gauge", `ais_gateway_ledger_buffer_depth ${this.gauges.ledgerDepth()}`);
     out.push("# HELP ais_gateway_ledger_dropped_total Usage rows lost.", "# TYPE ais_gateway_ledger_dropped_total counter", `ais_gateway_ledger_dropped_total ${this.gauges.ledgerDropped()}`);
     return `${out.join("\n")}\n`;
