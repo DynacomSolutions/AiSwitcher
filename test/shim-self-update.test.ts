@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { isSelfUpdateCommand } from "../src/shared/self-update.ts";
+import { dirname, join } from "node:path";
+import { isSelfUpdateCommand, selfUpdateEnv } from "../src/shared/self-update.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -35,7 +35,7 @@ function setup(): { home: string; binDir: string; env: Record<string, string> } 
   const binDir = join(home, "real-bin");
   mkdirSync(binDir);
   const fake = join(binDir, "claude");
-  writeFileSync(fake, `#!/bin/sh\necho "REAL ARGS: $*"\necho "CFG: \${CLAUDE_CONFIG_DIR:-unset}"\n`);
+  writeFileSync(fake, `#!/bin/sh\necho "REAL ARGS: $*"\necho "CFG: \${CLAUDE_CONFIG_DIR:-unset}"\necho "PREFIX: \${npm_config_prefix:-unset}"\n`);
   chmodSync(fake, 0o755);
   return {
     home,
@@ -62,6 +62,22 @@ test("claude update runs the real binary with no identity in a non-interactive c
   expect(stdout).toContain("REAL ARGS: update");
   expect(stdout).toContain("CFG: unset");
   expect(proc.exitCode).toBe(0);
+});
+
+// claude's updater runs `npm install -g`; without the managed prefix it
+// updated an unused copy under the user's own npm prefix instead.
+test("claude update installs into the managed npm prefix", () => {
+  const { home, binDir, env } = setup();
+  const proc = runShim(["update"], home, { ...env, npm_config_prefix: join(home, "user-npm") });
+  expect(proc.stdout.toString()).toContain(`PREFIX: ${dirname(binDir)}`);
+  expect(proc.exitCode).toBe(0);
+});
+
+test("selfUpdateEnv sets the prefix only for a binary in the managed bin dir", () => {
+  expect(selfUpdateEnv("/m/npm/bin/claude", "/m/npm/bin")).toEqual({ npm_config_prefix: "/m/npm" });
+  expect(selfUpdateEnv("/m/npm/bin/claude", "/m/npm/bin/")).toEqual({ npm_config_prefix: "/m/npm" });
+  expect(selfUpdateEnv("/usr/bin/claude", "/m/npm/bin")).toEqual({});
+  expect(selfUpdateEnv("/m/npm/bin-other/claude", "/m/npm/bin")).toEqual({});
 });
 
 test("claude update keeps a preset config dir", () => {
