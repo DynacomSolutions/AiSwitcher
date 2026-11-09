@@ -1,3 +1,5 @@
+import { startUsageProxy, type RunningUsageProxy } from "./usage-proxy.ts";
+import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
 import { DEAD_REFRESH_CODES, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
@@ -30,6 +32,8 @@ import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProc
 
 export const DEFAULT_GATEWAY_PORT = 47130;
 export const DEFAULT_GATEWAY_ADMIN_PORT = 47131;
+/** The CONNECT proxy for gateway-routed Claude Code (usage-proxy.ts). */
+export const DEFAULT_GATEWAY_CONNECT_PORT = 47132;
 export const MIN_ADMIN_TOKEN_LENGTH = 32;
 
 export interface GatewayOptions {
@@ -39,6 +43,8 @@ export interface GatewayOptions {
   adminToken: string;
   /** Install SIGTERM and SIGINT handlers that drain and exit. The CLI sets this. */
   handleSignals?: boolean;
+  /** The CONNECT proxy for gateway-routed Claude Code (usage-proxy.ts). Off when absent. */
+  connect?: { port: number; tlsDir: string; publishCaTo?: string };
 }
 
 /** Everything a test (or another host) may replace. Production uses the defaults. */
@@ -90,6 +96,8 @@ export interface RunningGateway {
   stop(): Promise<void>;
   readonly port: number;
   readonly adminPort: number;
+  /** The CONNECT proxy port, when it runs. */
+  readonly connectPort?: number;
   ready(): boolean;
 }
 
@@ -420,6 +428,14 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     now,
     metrics: recoverOnSuccess(metrics, alerter),
   });
+  /** The active claude app a gateway token belongs to, for the CONNECT proxy. */
+  const appForToken = async (token: string): Promise<string | undefined> => {
+    if (!warmed || !parseToken(token)) return undefined;
+    for (const app of await store.listApps()) {
+      if (app.state === "active" && app.provider === "claude" && (await verifyToken(store, app.name, token, now()))) return app.name;
+    }
+    return undefined;
+  };
   const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: hub, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
 
   let warmed = false;
@@ -621,7 +637,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       clearInterval(pruneTimer);
       store.stop();
       // Bun's stop(false) refuses new connections and resolves once active requests are done.
-      await Promise.all([server.stop(false), adminServer.stop(false)]);
+      await Promise.all([server.stop(false), adminServer.stop(false), connectProxy?.stop(false)]);
       // Refreshes and the keep-alive in flight finish (or fail) before the backend that guards them goes away.
       // A browser renewal is abandoned at once and the pass given a short ceiling, so the ledger below is always flushed inside the grace period.
       aliAbort.abort();
@@ -633,6 +649,26 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     })();
     return stopping;
   };
+
+  let connectProxy: RunningUsageProxy | undefined;
+  if (opts.connect) {
+    try {
+      connectProxy = await startUsageProxy({
+        port: opts.connect.port,
+        ...(hooks.host ? { host: hooks.host } : {}),
+        tlsDir: opts.connect.tlsDir,
+        ...(opts.connect.publishCaTo ? { publishCaTo: opts.connect.publishCaTo } : {}),
+        appForToken,
+        // The gateway's own served route for the app, with the client's headers (same token).
+        serve: async (app, path, req) => proxy.fetch(new Request(`http://gateway.internal/${encodeURIComponent(app)}${path}${new URL(req.url).search}`, { headers: req.headers }), { ip: "127.0.0.1" }),
+        ...(hooks.fetch ? { fetch: hooks.fetch } : {}),
+      });
+      console.info(`gateway: connect proxy on :${connectProxy.port}`);
+    } catch (err) {
+      // A missing certificate never takes the gateway down; only the proxy is off.
+      console.warn(`gateway: connect proxy not started (${describe(err)})`);
+    }
+  }
 
   const onSignal = (): void => {
     void stop().then(
@@ -653,6 +689,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     },
     port: server.port as number,
     adminPort: adminServer.port as number,
+    ...(connectProxy ? { connectPort: connectProxy.port } : {}),
     ready: () => warmed && !draining,
   };
 }

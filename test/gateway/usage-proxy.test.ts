@@ -1,21 +1,36 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { createPrivateKey, X509Certificate } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import tls from "node:tls";
-import { caCertPath, ensureLocalCa, issueLeaf, type LocalCa } from "../../src/gateway/local-ca.ts";
-import { secretsTokenResolver, startUsageProxy, type RunningUsageProxy } from "../../src/gateway/usage-proxy.ts";
+import { startUsageProxy, type RunningUsageProxy } from "../../src/gateway/usage-proxy.ts";
 
 const APP_TOKEN = "aisg_abcdefgh_" + "x".repeat(43);
 const OTHER_BEARER = ["Bearer", "not-an-app-token"].join(" ");
 
 let dir: string;
-let ca: LocalCa;
+let tlsDir: string;
+const ca = { certPem: "" };
+
+/** A CA and an api.anthropic.com leaf, as the cluster's cert-manager secret would hold them (tls.crt, tls.key, ca.crt). */
+function makeTls(out: string): void {
+  const run = (...args: string[]): void => {
+    const r = Bun.spawnSync(["openssl", ...args], { cwd: out, stderr: "pipe" });
+    if (r.exitCode !== 0) throw new Error(`openssl ${args[0]}: ${r.stderr.toString()}`);
+  };
+  run("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key", "-out", "ca.crt", "-days", "2", "-subj", "/CN=test ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign");
+  run("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "tls.key", "-out", "leaf.csr", "-subj", "/CN=api.anthropic.com");
+  Bun.spawnSync(["sh", "-c", "printf 'subjectAltName=DNS:api.anthropic.com\\n' > ext"], { cwd: out });
+  run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial", "-days", "2", "-extfile", "ext", "-out", "tls.crt");
+}
+
 beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), "ais-usage-proxy-"));
-  ca = await ensureLocalCa(join(dir, "ca"));
+  tlsDir = join(dir, "tls");
+  await mkdir(tlsDir);
+  makeTls(tlsDir);
+  ca.certPem = await readFile(join(tlsDir, "ca.crt"), "utf8");
 });
 
 const running: Array<{ stop(): void }> = [];
@@ -42,10 +57,14 @@ function fakeFetch(calls: Call[], answer: (url: string) => Response = () => Resp
 async function proxy(calls: Call[], extra: Partial<Parameters<typeof startUsageProxy>[0]> = {}): Promise<RunningUsageProxy> {
   const p = await startUsageProxy({
     port: 0,
-    remoteBase: "https://gw.test/gateway",
+    host: "127.0.0.1",
+    tlsDir,
     appForToken: async (t) => (t === APP_TOKEN ? "t3-claude-x" : undefined),
-    ca,
-    fetch: fakeFetch(calls, (url) => (url.startsWith("https://gw.test/") ? Response.json({ seven_day: { utilization: 62 } }) : new Response("upstream", { status: 401 }))),
+    serve: async (app, path, req) => {
+      calls.push({ url: `gateway:${app}${path}${new URL(req.url).search}`, method: req.method, headers: req.headers, body: "" });
+      return Response.json({ seven_day: { utilization: 62 } });
+    },
+    fetch: fakeFetch(calls, () => new Response("upstream", { status: 401 })),
     passthroughOrigin: "https://upstream.test",
     log: () => {},
     ...extra,
@@ -95,75 +114,6 @@ async function viaProxy(port: number, req: { method?: string; path: string; head
   return { status, body: chunked ? text.split("\r\n").filter((_, i) => i % 2 === 1).join("") : text };
 }
 
-describe("local CA", () => {
-  test("creates a 0600 key and reuses the same CA on the next start", async () => {
-    const d = join(dir, "ca2");
-    const first = await ensureLocalCa(d);
-    expect((await stat(join(d, "ca-key.pem"))).mode & 0o777).toBe(0o600);
-    expect((await stat(d)).mode & 0o777).toBe(0o700);
-    expect(first.certPath).toBe(caCertPath(d));
-    const again = await ensureLocalCa(d);
-    expect(again.certPem).toBe(first.certPem);
-    expect(await readFile(first.certPath, "utf8")).toBe(first.certPem);
-  });
-
-  test("is a name-constrained CA and its leaf verifies for the intercepted host only", () => {
-    const caCert = new X509Certificate(ca.certPem);
-    expect(caCert.ca).toBe(true);
-    const leaf = new X509Certificate(issueLeaf(ca, "api.anthropic.com").certPem);
-    expect(leaf.verify(caCert.publicKey)).toBe(true);
-    expect(leaf.checkIssued(caCert)).toBe(true);
-    expect(leaf.checkHost("api.anthropic.com")).toBe("api.anthropic.com");
-    expect(leaf.checkHost("example.com")).toBeUndefined();
-    expect(leaf.ca).toBe(false);
-  });
-
-  test("two concurrent starts end with one matching key and certificate", async () => {
-    const d = join(dir, "ca5");
-    const [a, b] = await Promise.all([ensureLocalCa(d), ensureLocalCa(d)]);
-    expect(a.certPem).toBe(b.certPem);
-    const onDisk = new X509Certificate(await readFile(join(d, "ca.pem"), "utf8"));
-    expect(onDisk.checkPrivateKey(createPrivateKey(await readFile(join(d, "ca-key.pem"), "utf8")))).toBe(true);
-  });
-
-  test("replaces a CA whose key does not match", async () => {
-    const d = join(dir, "ca3");
-    const first = await ensureLocalCa(d);
-    const other = await ensureLocalCa(join(dir, "ca4"));
-    await Bun.write(join(d, "ca-key.pem"), other.key.export({ type: "pkcs8", format: "pem" }) as string);
-    const next = await ensureLocalCa(d);
-    expect(next.certPem).not.toBe(first.certPem);
-  });
-});
-
-describe("secretsTokenResolver", () => {
-  test("maps a token to its app and re-reads after 5 s", async () => {
-    let entries = new Map([["AIS_GATEWAY_APP_T3_CLAUDE_TEAM_TOKEN", APP_TOKEN], ["OTHER", "x"]]);
-    let t = 0;
-    const resolve = secretsTokenResolver(async () => entries, () => t);
-    expect(await resolve(APP_TOKEN)).toBe("t3-claude-team");
-    expect(await resolve("x")).toBeUndefined();
-    entries = new Map();
-    expect(await resolve(APP_TOKEN)).toBe("t3-claude-team");
-    t = 5_000;
-    expect(await resolve(APP_TOKEN)).toBeUndefined();
-  });
-
-  test("a miss re-reads once the copy is 1 s old, so a rotated token is found", async () => {
-    let entries = new Map<string, string>();
-    let t = 0;
-    let reads = 0;
-    const resolve = secretsTokenResolver(async () => (reads++, entries), () => t);
-    expect(await resolve(APP_TOKEN)).toBeUndefined();
-    entries = new Map([["AIS_GATEWAY_APP_T3_CLAUDE_TEAM_TOKEN", APP_TOKEN]]);
-    expect(await resolve(APP_TOKEN)).toBeUndefined();
-    expect(reads).toBe(1);
-    t = 1_000;
-    expect(await resolve(APP_TOKEN)).toBe("t3-claude-team");
-    expect(reads).toBe(2);
-  });
-});
-
 describe("usage proxy", () => {
   test("answers /api/oauth/usage for an app token from the gateway route of that app", async () => {
     const calls: Call[] = [];
@@ -172,7 +122,7 @@ describe("usage proxy", () => {
     expect(res.status).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ seven_day: { utilization: 62 } });
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe("https://gw.test/gateway/t3-claude-x/api/oauth/usage");
+    expect(calls[0]!.url).toBe("gateway:t3-claude-x/api/oauth/usage");
     expect(calls[0]!.headers.get("authorization")).toBe(`Bearer ${APP_TOKEN}`);
     expect(calls[0]!.headers.get("anthropic-beta")).toBe("oauth-2025-04-20");
   });
@@ -182,7 +132,7 @@ describe("usage proxy", () => {
     const p = await proxy(calls);
     const res = await viaProxy(p.port, { path: "/api/oauth/profile", headers: { authorization: `Bearer ${APP_TOKEN}` } });
     expect(res.status).toBe(200);
-    expect(calls[0]!.url).toBe("https://gw.test/gateway/t3-claude-x/api/oauth/profile");
+    expect(calls[0]!.url).toBe("gateway:t3-claude-x/api/oauth/profile");
   });
 
   test("passes a usage request with any other bearer to the real host unchanged", async () => {
@@ -212,14 +162,6 @@ describe("usage proxy", () => {
     const p = await proxy(calls, { appForToken: async () => undefined });
     const res = await viaProxy(p.port, { path: "/api/oauth/usage", headers: { authorization: `Bearer ${APP_TOKEN}` } });
     expect(res.status).toBe(401);
-    expect(calls).toHaveLength(0);
-  });
-
-  test("with no gateway URL an app usage request is refused, never sent upstream", async () => {
-    const calls: Call[] = [];
-    const p = await proxy(calls, { remoteBase: "" });
-    const res = await viaProxy(p.port, { path: "/api/oauth/usage", headers: { authorization: `Bearer ${APP_TOKEN}` } });
-    expect(res.status).toBe(503);
     expect(calls).toHaveLength(0);
   });
 
@@ -253,6 +195,12 @@ describe("usage proxy", () => {
     const { status } = await connect(p.port, "api.anthropic.com:8443");
     expect(status).toBe("HTTP/1.1 502 Bad Gateway");
     expect(targets).toEqual(["api.anthropic.com:8443"]);
+  });
+
+  test("publishes ca.crt for clients", async () => {
+    const to = join(dir, "published-ca.pem");
+    await proxy([], { publishCaTo: to });
+    expect(await readFile(to, "utf8")).toBe(ca.certPem);
   });
 
   test("refuses anything but CONNECT", async () => {
