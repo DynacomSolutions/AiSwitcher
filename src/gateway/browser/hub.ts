@@ -38,6 +38,7 @@ interface Conn {
   ws: HubSocket;
   binding?: BrowserBinding;
   paused: boolean;
+  extensionVersion?: string;
   authenticating?: boolean;
   helloTimer?: ReturnType<typeof setTimeout>;
   silenceTimer?: ReturnType<typeof setTimeout>;
@@ -118,6 +119,8 @@ export class BrowserHub {
       }
       if (!this.conns.has(ws)) return; // closed while authenticating
       conn.paused = msg.paused === true;
+      const v = (msg as { version?: unknown }).version;
+      if (typeof v === "string" && /^[0-9A-Za-z.+_-]{1,40}$/.test(v)) conn.extensionVersion = v;
       conn.authenticating = false;
       this.attach(ws, binding);
       this.send(ws, { t: "welcome", binding: binding.name, target: binding.target });
@@ -169,6 +172,11 @@ export class BrowserHub {
     for (const [id, p] of [...this.pending]) {
       if (p.ws === ws) this.settle(id, { id, ok: false, error: "browser_disconnected", message: "The browser disconnected during the call." });
     }
+  }
+
+  /** Extension version reported in `hello` by the live connection of `binding`, if any. */
+  extensionVersion(binding: string): string | undefined {
+    return this.byBinding.get(binding)?.extensionVersion;
   }
 
   connected(): BrowserBinding[] {

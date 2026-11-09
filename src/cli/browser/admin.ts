@@ -82,7 +82,7 @@ export async function runBrowserAdmin(sub: string | undefined, rest: string[], f
       const bindings = Array.isArray(json.bindings) ? (json.bindings as Record<string, unknown>[]) : [];
       if (boolFlag(flags, "json")) return deps.out(JSON.stringify(json, null, 2));
       if (bindings.length === 0) return deps.out("no browser bindings");
-      deps.out(table(["NAME", "TARGET", "PROFILE", "STATE", "LAST SEEN"], bindings.map((b) => [str(b.name), targetText(b.target), str(b.profileLabel), str(b.state), str(b.lastSeenAt) || "never"])));
+      deps.out(table(["NAME", "TARGET", "PROFILE", "STATE", "VERSION", "LAST SEEN"], bindings.map((b) => [str(b.name), targetText(b.target), str(b.profileLabel), str(b.state), str(b.extensionVersion) || "unknown", str(b.lastSeenAt) || "never"])));
       return;
     }
     case "revoke": {

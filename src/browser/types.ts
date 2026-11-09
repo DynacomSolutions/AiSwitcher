@@ -8,6 +8,8 @@ export interface BrowserBinding {
   state: "active" | "revoked";
   createdAt: string;
   lastSeenAt?: string;
+  /** Version of the connected extension; live only (set by the gateway on listing, never stored). */
+  extensionVersion?: string;
 }
 
 export interface BrowserPairing {

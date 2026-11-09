@@ -231,4 +231,21 @@ describe("browser pairing", () => {
     expect(ws.closed).toBe(4401);
     expect(hub.connected()).toEqual([]);
   });
+
+  test("bindings list carries the live extension version; older extensions show none", async () => {
+    const p = await startPair();
+    await approve(p.code, { target: { kind: "identity", identity: "id1" }, name: "laptop" });
+    const { token } = (await (await post("/browser/pair/poll", { code: p.code, pollSecret: p.pollSecret })).json()) as { token: string };
+    const list = async () => ((await (await adm("/browser/bindings")).json()) as { bindings: Array<Record<string, unknown>> }).bindings[0]!;
+    expect(await list()).not.toHaveProperty("extensionVersion");
+    const ws = { send() {}, close() {} };
+    hub.open(ws);
+    await hub.message(ws, JSON.stringify({ t: "hello", token, version: "0.5.33", paused: false }));
+    expect(await list()).toMatchObject({ name: "laptop", extensionVersion: "0.5.33" });
+    hub.detach(ws);
+    const old = { send() {}, close() {} };
+    hub.open(old);
+    await hub.message(old, JSON.stringify({ t: "hello", token, paused: false }));
+    expect(await list()).not.toHaveProperty("extensionVersion");
+  });
 });

@@ -12,6 +12,8 @@ export interface BrowserBindingDto {
   state: BrowserBinding["state"];
   createdAt?: string;
   lastSeenAt?: string;
+  /** Version reported by the connected extension; absent for older extensions or when offline. */
+  extensionVersion?: string;
   /** Active and last seen within CONNECTED_WINDOW_MS. */
   connected: boolean;
 }
@@ -64,6 +66,7 @@ export function mapBrowserBindings(json: unknown, now: number): BrowserBindingDt
       state,
       ...(typeof r.createdAt === "string" ? { createdAt: r.createdAt } : {}),
       ...(lastSeenAt ? { lastSeenAt } : {}),
+      ...(typeof r.extensionVersion === "string" && r.extensionVersion !== "" ? { extensionVersion: r.extensionVersion } : {}),
       connected: state === "active" && Number.isFinite(seen) && now - seen <= CONNECTED_WINDOW_MS,
     });
   }

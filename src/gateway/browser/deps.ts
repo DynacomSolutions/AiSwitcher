@@ -10,7 +10,7 @@ export interface BrowserDeps {
   /** The canonical name of an identity (alias resolved), or undefined when it does not exist. When absent, names are used as given. */
   browserIdentityExists?(identity: string): Promise<string | undefined>;
   /** Closes the live extension socket of a revoked binding. */
-  hub?: { revoke(binding: string): void };
+  hub?: { revoke(binding: string): void; extensionVersion?(binding: string): string | undefined };
 }
 
 /** A DNS-1123 label, as for app names. */

@@ -1,5 +1,6 @@
 import { cp, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { stampManifest } from "./stamp.ts";
 
 const root = import.meta.dir;
 // Optional output directory (the e2e builds into its own per-run directory).
@@ -20,7 +21,9 @@ for (const [entry, name, format] of entries) {
     process.exit(1);
   }
 }
-await cp(join(root, "manifest.json"), join(dist, "manifest.json"));
+const aisVersion = (await Bun.file(join(root, "../../package.json")).json() as { version: string }).version;
+const manifest = stampManifest(await Bun.file(join(root, "manifest.json")).json() as Record<string, unknown>, aisVersion);
+await Bun.write(join(dist, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 await cp(join(root, "src/sidepanel/sidepanel.html"), join(dist, "sidepanel.html"));
 await cp(join(root, "src/sidepanel/sidepanel.css"), join(dist, "sidepanel.css"));
 console.log(`Built ${process.argv[2] ?? "apps/chrome-extension/dist"}`);

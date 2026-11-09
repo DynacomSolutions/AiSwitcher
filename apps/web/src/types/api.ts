@@ -327,6 +327,7 @@ export interface BrowserBindingDto {
   state: "active" | "revoked";
   createdAt?: string;
   lastSeenAt?: string;
+  extensionVersion?: string;
   /** Active and seen within about two minutes. */
   connected: boolean;
 }

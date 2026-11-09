@@ -75,7 +75,13 @@ export function registerBrowserAdmin(hono: Hono, deps: BrowserDeps): void {
     return c.json({ binding });
   });
 
-  hono.get("/browser/bindings", async (c) => c.json({ bindings: await store.listBrowserBindings() }));
+  hono.get("/browser/bindings", async (c) => {
+    const list = await store.listBrowserBindings();
+    return c.json({ bindings: list.map((b) => {
+      const v = deps.hub?.extensionVersion?.(b.name);
+      return v ? { ...b, extensionVersion: v } : b;
+    }) });
+  });
 
   hono.delete("/browser/bindings/:name", async (c) => {
     const name = c.req.param("name");
