@@ -190,6 +190,11 @@ vmagent. Every `cf-*`, `x-forwarded-*` and `x-envoy-*` header, `cdn-loop`, `forw
 request goes to a provider. The side-route daily count lives in the gateway database (table `gateway_side_counts`); if the
 database cannot answer, each replica counts in memory and an owner alert (`side-count-unavailable`) is raised.
 
+The path is matched after repeated percent-decoding, slash collapsing and lower-casing. A path that cannot be decoded (a stray
+`%` escape) cannot be shown to be harmless, so on a public host it is treated as one of the operational paths and answers 404.
+Side-count database calls are limited to four at once; the rest queue for a slot within the same time limit, and only a
+database error or running out of time falls back to memory and raises the alert.
+
 ### ali login ownership
 
 The gateway renews the Alibaba console session of every live ali identity on its keep-alive timer

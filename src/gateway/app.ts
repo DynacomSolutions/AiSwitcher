@@ -14,7 +14,7 @@ import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
-import { fallbackCount } from "./side-count.ts";
+import { fallbackCount, Gate } from "./side-count.ts";
 import { collapseSlashes, isClaudeAccountPath, routeFor, serveRoute, sideDailyLimitFromEnv, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
@@ -53,7 +53,7 @@ export interface GatewayDeps {
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
-/** Side-count database calls in flight at once, per gateway app; the rest are counted in memory. */
+/** Side-count database calls in flight at once, per gateway app; the rest queue for a slot. */
 const SIDE_COUNT_MAX_INFLIGHT = 4;
 
 /** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
@@ -393,12 +393,12 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
   const resetCredits: ResetCreditsCache = {};
-  const sideInflight = { n: 0 };
+  const sideGate = new Gate(SIDE_COUNT_MAX_INFLIGHT);
   const sideCounts = new Map<string, number>(); // fallback only, while the store is down
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts, sideInflight).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts, sideGate).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -408,7 +408,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideInflight: { n: number }): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -527,15 +527,18 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   if (side || route?.kind === "serve") {
     const day = new Date(dayStartIct(deps.now()).getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
     let n: number | undefined;
-    // At most SIDE_COUNT_MAX_INFLIGHT store calls at once: when the database is slow the rest go straight to memory instead of queueing behind it.
-    if (sideInflight.n < SIDE_COUNT_MAX_INFLIGHT) {
-      sideInflight.n += 1;
+    // At most SIDE_COUNT_MAX_INFLIGHT store calls run at once. The others queue for a slot inside the same time limit as the call itself:
+    // waiting for the gate is normal load, not a failure. Only a database error or running out of time falls back to memory (and alerts).
+    const limitMs = deps.sideCountTimeoutMs ?? 5_000;
+    const deadline = Date.now() + limitMs;
+    const release = await sideGate.acquire(limitMs);
+    if (release) {
       const abort = new AbortController();
       const query = deps.store.bumpSideCount(app.name, day, abort.signal);
-      // A write that lands after the timeout is not used: the request was already counted from memory.
-      query.then(() => void (sideInflight.n -= 1), () => void (sideInflight.n -= 1));
+      // The slot is freed when the call ends, however late; a write that lands after the timeout is not used for the limit.
+      query.then(release, release);
       try {
-        n = await bounded(query, deps.sideCountTimeoutMs ?? 5_000, "side count");
+        n = await bounded(query, Math.max(1, deadline - Date.now()), "side count");
         deps.sideCountHealth?.(true);
       } catch {
         abort.abort();

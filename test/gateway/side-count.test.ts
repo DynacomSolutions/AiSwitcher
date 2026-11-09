@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
 import { LedgerBuffer } from "../../src/gateway/ledger-buffer.ts";
 import { noopMetrics } from "../../src/gateway/metrics.ts";
-import { bumpSideCountOn, fallbackCount, type SqlTag } from "../../src/gateway/side-count.ts";
+import { bumpSideCountOn, fallbackCount, Gate, type SqlTag } from "../../src/gateway/side-count.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken } from "../../src/gateway/tokens.ts";
 
@@ -83,5 +83,29 @@ describe("the gateway prunes its fallback across days", () => {
     now += 24 * 3_600_000;
     expect([await hit(), await hit(), await hit()]).toEqual([200, 200, 429]);
     await ledger.close();
+  });
+});
+
+describe("Gate", () => {
+  test("holders beyond the maximum queue in order and are served as slots free", async () => {
+    const g = new Gate(1);
+    const first = (await g.acquire(100))!;
+    const order: number[] = [];
+    const a = g.acquire(1000).then((r) => (order.push(1), r));
+    const b = g.acquire(1000).then((r) => (order.push(2), r));
+    first();
+    (await a)!();
+    (await b)!();
+    expect(order).toEqual([1, 2]);
+  });
+  test("a waiter gives up after its own deadline and a double release frees only one slot", async () => {
+    const g = new Gate(1);
+    const held = (await g.acquire(10))!;
+    expect(await g.acquire(30)).toBeUndefined();
+    held();
+    held();
+    const x = await g.acquire(10);
+    expect(x).toBeDefined();
+    expect(await g.acquire(20)).toBeUndefined(); // only one slot exists
   });
 });

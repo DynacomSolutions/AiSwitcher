@@ -412,6 +412,27 @@ describe("daily limits", () => {
     expect(signals.every((s) => s.aborted)).toBe(true);
   });
 
+  test("a healthy but slow database: a burst queues for slots, the shared limit holds, and nothing is reported as a failure", async () => {
+    await addApp("k", "kimi", "openai");
+    deps.sideDailyLimit = 5;
+    let n = 0;
+    store.bumpSideCount = async () => {
+      await Bun.sleep(30);
+      return ++n;
+    };
+    const health: boolean[] = [];
+    let failOpens = 0;
+    deps.sideCountHealth = (ok) => void health.push(ok);
+    deps.metrics = { ...noopMetrics, failOpen: () => void (failOpens += 1) };
+    const app = createGatewayApp(deps);
+    const hit = async () => (await app.request("http://gw.test/k/search", { method: "POST", body: "{}", headers: { authorization: `Bearer ${tokens.k}` } })).status;
+    const codes = await Promise.all(Array.from({ length: 20 }, hit));
+    expect(codes.filter((c) => c === 200)).toHaveLength(5);
+    expect(codes.filter((c) => c === 429)).toHaveLength(15);
+    expect(health.filter((h) => !h)).toHaveLength(0);
+    expect(failOpens).toBe(0);
+  });
+
   test("chat calls are not counted against the side limit", async () => {
     await addApp("cl", "claude", "anthropic");
     deps.sideDailyLimit = 1;
