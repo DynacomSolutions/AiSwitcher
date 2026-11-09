@@ -212,6 +212,8 @@ async function refresh(): Promise<void> {
     if (typeof saved === "string" && !form.draft) form.draft = saved;
   }
   const s = (await chrome.runtime.sendMessage({ type: "ais-status" })) as PanelStatus | undefined;
+  const ver = document.getElementById("ver");
+  if (ver) ver.textContent = `v${chrome.runtime.getManifest().version}`;
   if (s) render(s, document.getElementById("root")!, document.getElementById("chip")!);
 }
 

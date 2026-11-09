@@ -12,7 +12,7 @@ const admin = { url: "http://admin.example.com", token: "adm-value" };
 const body = {
   bindings: [
     { name: "old", target: { kind: "pool", pool: "p1" }, profileLabel: "a@example.com", state: "revoked", createdAt: "2026-11-01T00:00:00Z" },
-    { name: "live", target: { kind: "identity", identity: "solo" }, profileLabel: "b@example.com", state: "active", lastSeenAt: "2026-11-08T11:59:30Z" },
+    { name: "live", target: { kind: "identity", identity: "solo" }, profileLabel: "b@example.com", state: "active", lastSeenAt: "2026-11-08T11:59:30Z", extensionVersion: "0.5.33" },
     { name: "idle", target: { kind: "pool", pool: "p1" }, profileLabel: "c@example.com", state: "active", lastSeenAt: "2026-11-08T11:50:00Z" },
     { name: "bad", target: { kind: "nope" }, state: "active" },
   ],
@@ -25,6 +25,8 @@ describe("loadBrowserBindings", () => {
     const view = await loadBrowserBindings({ admin, fetch: f, now: () => NOW });
     expect(calls).toEqual([{ url: "http://admin.example.com/browser/bindings", auth: `Bearer ${admin.token}` }]);
     expect(view.configured).toBe(true);
+    expect(view.bindings.find((b) => b.name === "live")?.extensionVersion).toBe("0.5.33");
+    expect(view.bindings.find((b) => b.name === "idle")).not.toHaveProperty("extensionVersion");
     expect(view.bindings.map((b) => [b.name, b.connected])).toEqual([["idle", false], ["live", true], ["old", false]]);
     expect(JSON.stringify(view)).not.toContain("adm-value");
   });

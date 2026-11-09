@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { BrowserBinding } from "../../src/browser/types.ts";
 import { createGatewayApp } from "../../src/gateway/app.ts";
 import { BrowserHub, type HubSocket } from "../../src/gateway/browser/hub.ts";
-import { browserPoolMemberNames } from "../../src/gateway/serve.ts";
+import { browserPoolMembersAcross, browserPoolMemberNames } from "../../src/gateway/serve.ts";
 import { allowedBindings } from "../../src/gateway/browser/routing.ts";
 import { MemoryGatewayStore } from "../../src/gateway/store.ts";
 import { generateToken, hashSecret, parseToken } from "../../src/gateway/tokens.ts";
@@ -212,6 +212,18 @@ describe("POST /browser/call", () => {
     await connect(b("p", { kind: "pool", pool: "main" }));
     expect((await call({ session, tool: "screenshot", browser: "p" }, tokZ)).status).toBe(403);
     expect(await (await call({ session, tool: "screenshot" }, tokZ)).json()).toMatchObject({ ok: false, error: "no_browser" });
+  });
+
+  test("a pool name in two tool registries yields the deduped union of members", () => {
+    const reg = (accounts: string[]): any => ({ version: 1, identities: [
+      ...accounts.map((n) => ({ name: n, label: n, configDir: `/x/${n}` })),
+      { name: "team-pool", label: "team-pool", configDir: "/x/p", swapPool: { accounts, active: accounts[0] } },
+    ] });
+    const claude = reg(["a", "shared"]);
+    const codex = reg(["shared", "c"]);
+    expect(browserPoolMembersAcross([claude, codex], "team-pool")).toEqual(["a", "shared", "c"]);
+    expect(browserPoolMembersAcross([{ version: 1, identities: [] } as any, codex], "team-pool")).toEqual(["shared", "c"]);
+    expect(browserPoolMembersAcross([claude, codex], "nope")).toBeUndefined();
   });
 
   test("a retired pool member is excluded: 403 when naming the pool browser, no_browser otherwise", async () => {

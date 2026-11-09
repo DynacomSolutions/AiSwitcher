@@ -177,13 +177,21 @@ export function browserPoolMemberNames(file: IdentitiesFile, pool: string): stri
   });
 }
 
-/** Members of the named swap pool in any tool registry, or undefined when no tool has such a pool. */
+/** Members of the named swap pool across all tool registries (Claude and Codex may define the same pool name), or undefined when no tool has such a pool. */
 async function defaultBrowserPoolMembers(pool: string): Promise<string[] | undefined> {
-  for (const cfg of Object.values(TOOL_CONFIGS)) {
-    const names = browserPoolMemberNames(await loadIdentitiesFile(cfg.identitiesJsonPath), pool);
-    if (names) return names;
+  const files: IdentitiesFile[] = [];
+  for (const cfg of Object.values(TOOL_CONFIGS)) files.push(await loadIdentitiesFile(cfg.identitiesJsonPath));
+  return browserPoolMembersAcross(files, pool);
+}
+
+/** Union (deduped, first-seen order) of the pool's members across all registries; undefined when none has the pool. */
+export function browserPoolMembersAcross(files: IdentitiesFile[], pool: string): string[] | undefined {
+  let all: string[] | undefined;
+  for (const file of files) {
+    const names = browserPoolMemberNames(file, pool);
+    if (names) all = [...new Set([...(all ?? []), ...names])];
   }
-  return undefined;
+  return all;
 }
 
 async function defaultBrowserIdentityExists(name: string): Promise<string | undefined> {

@@ -127,6 +127,7 @@ export function BrowsersPage() {
                   <TableHead>Profile</TableHead>
                   <TableHead>Target</TableHead>
                   <TableHead>State</TableHead>
+                  <TableHead>Version</TableHead>
                   <TableHead>Last seen</TableHead>
                   <TableHead className="w-24" />
                 </TableRow>
@@ -140,6 +141,7 @@ export function BrowsersPage() {
                     <TableCell>
                       <StateBadge binding={b} />
                     </TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">{b.extensionVersion ?? "unknown"}</TableCell>
                     <TableCell className="text-sm text-muted-foreground">
                       {b.lastSeenAt ? <RelativeTime iso={b.lastSeenAt} /> : "never"}
                     </TableCell>
