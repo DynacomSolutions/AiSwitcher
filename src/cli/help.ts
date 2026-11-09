@@ -82,7 +82,7 @@ export const HELP: Record<string, HelpNode> = {
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
       serve: sub("ais gateway serve [--port=] [--admin-port=]", "Run the proxy and admin API (env: AIS_GATEWAY_PORT, AIS_GATEWAY_ADMIN_PORT, AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_ADMIN_TOKEN)"),
-      local: sub("ais gateway local [install|status]", "Host-local failover proxy on 127.0.0.1 (env: AIS_GATEWAY_LOCAL_PORT, AIS_GATEWAY_REMOTE_URL); install sets up the ais-gateway-local.service user unit"),
+      local: sub("ais gateway local [install|status]", "Host-local failover proxy on 127.0.0.1 (env: AIS_GATEWAY_LOCAL_PORT, AIS_GATEWAY_REMOTE_URL); also a usage proxy on 127.0.0.1:47141 (AIS_GATEWAY_LOCAL_PROXY_PORT, off disables) so gateway-routed Claude Code shows its limits; install sets up the ais-gateway-local.service user unit"),
       app: sub(
         "ais gateway app add|update <name> --namespace=<ns> --provider=<p> [--style=anthropic|openai] (--pool [--identities=a,b] | --identity=<id>) [--models=glob,glob] [--daily-tokens=N] [--reserve=80]; app list|show|rotate|revoke [<name>]",
         "Manage gateway apps; add and rotate write Secret ais-gateway-<app> and ~/.secrets (admin: AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN, AIS_GATEWAY_PROXY_URL in ~/.secrets)",
