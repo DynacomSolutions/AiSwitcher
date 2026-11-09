@@ -254,7 +254,7 @@ export function humanLoginInProgress(url: unknown, selfNav: boolean | undefined)
 }
 
 /** The shared Chrome tab is one resource: renewals (gateway, daemon, CLI) take turns. */
-export async function withAliBrowserLock<T>(fn: () => Promise<T>, lockPath: string = join(AUTH_STATE_DIR, "browser.lock")): Promise<T> {
+export async function withAliBrowserLock<T>(fn: () => Promise<T>, lockPath: string = join(AUTH_STATE_DIR, "browser.lock"), signal?: AbortSignal): Promise<T> {
   await mkdir(AUTH_STATE_DIR, { recursive: true, mode: 0o700 }).catch(() => undefined);
   let held: HeldLock;
   try {
@@ -263,7 +263,16 @@ export async function withAliBrowserLock<T>(fn: () => Promise<T>, lockPath: stri
     throw new AliAuthRefreshError(`another renewal holds the shared auth browser (${errorText(err).replace(/ \S*\.lock /, " ")})`, "retry shortly", "busy");
   }
   try {
-    return await fn();
+    if (!signal) return await fn();
+    // On abort the lock is freed at once, whatever the renewal in flight is still doing (it stops at its next step).
+    const aborted = new Promise<never>((_, reject) => {
+      const stop = (): void => reject(new AliAuthRefreshError("renewal abandoned (the gateway is shutting down)", undefined, "other"));
+      if (signal.aborted) stop();
+      else signal.addEventListener("abort", stop, { once: true });
+    });
+    const run = fn();
+    run.catch(() => undefined);
+    return await Promise.race([run, aborted]);
   } finally {
     await held.release();
   }
@@ -275,17 +284,20 @@ async function clearSelfNav(identityName: string): Promise<void> {
   if (st?.selfNav) await writeState({ ...st, selfNav: false });
 }
 
-export function refreshAliAuthSession(identity: Identity): Promise<string> {
+export function refreshAliAuthSession(identity: Identity, signal?: AbortSignal): Promise<string> {
   return withAliBrowserLock(async () => {
     try {
-      return await refreshAliAuthSessionLocked(identity);
+      return await refreshAliAuthSessionLocked(identity, signal);
     } finally {
       await clearSelfNav(identity.name).catch(() => undefined);
     }
-  });
+  }, undefined, signal);
 }
 
-async function refreshAliAuthSessionLocked(identity: Identity): Promise<string> {
+async function refreshAliAuthSessionLocked(identity: Identity, signal?: AbortSignal): Promise<string> {
+  const stopIfAborted = (): void => {
+    if (signal?.aborted) throw new AliAuthRefreshError("renewal abandoned (the gateway is shutting down)");
+  };
   let state: AuthSessionState | undefined;
   try {
     // Opened without navigating: a person may be signing in on this tab right now. The dashboard visit below is the self-heal: a pod restart (observed live
@@ -322,6 +334,7 @@ async function refreshAliAuthSessionLocked(identity: Identity): Promise<string> 
       "login-in-progress",
     );
   }
+  stopIfAborted();
   try {
     await navigateDashboard(state);
   } catch (err) {
@@ -333,6 +346,7 @@ async function refreshAliAuthSessionLocked(identity: Identity): Promise<string> 
   // both domains and return to the console afterwards.
   for (const page of [ALI_CONSOLE_URL, "https://account.alibabacloud.com/login/login.htm"]) {
     try {
+      stopIfAborted();
       if (page !== ALI_CONSOLE_URL) {
         // AIS itself stands on the sign-in page for a moment: say so, so a crash here is not mistaken for a person.
         state.selfNav = true;
@@ -439,13 +453,11 @@ export async function removeAliAuthRefreshTimer(
 
 /**
  * The gateway renews ali sessions itself while a fresh heartbeat names the login. In that case the host timer, the console daemon
- * and `ais auth refresh` have nothing to do: this removes the host's systemd timer (it would only keep waking up) and says so.
- * Returns true when the caller must not renew.
+ * and `ais auth refresh` skip their run. The host timer is left installed: when the heartbeat stops naming the login (gateway
+ * down, setup broken, login not yet renewed) the host resumes at once. Returns true when the caller must not renew.
  */
-export async function standDownToGateway(identityName: string, deps: { managed?: (name: string) => Promise<boolean>; removeTimer?: (name: string) => Promise<boolean> } = {}): Promise<boolean> {
-  if (!(await (deps.managed ?? ((n) => isGatewayManagedHere("ali", n)))(identityName))) return false;
-  await (deps.removeTimer ?? ((n) => removeAliAuthRefreshTimer(n)))(identityName).catch(() => false);
-  return true;
+export async function standDownToGateway(identityName: string, deps: { managed?: (name: string) => Promise<boolean> } = {}): Promise<boolean> {
+  return (deps.managed ?? ((n) => isGatewayManagedHere("ali", n)))(identityName);
 }
 
 export function authDashboardUrl(): string {

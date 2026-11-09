@@ -173,16 +173,21 @@ speech call is not a model call); the daily token cap does.
   `GET /rate-limit-reset-credits` (also under `/api/codex` and `/wham`), which is
   the total over the pool's members, and `POST .../consume`, which is refused.
 - **Side routes** (lists, search, fetch, speech) pass the provider's 401/402/403/429 straight to the app: no login
-  refresh, no pool hold, no failover. Each counts 1,000 tokens toward the app's daily cap when the answer reports no usage;
-  so do the served routes. Codex reset credits are cached 60 s per app. Claude `/api/*` paths other than the two served ones
-  are refused (403), however spelled; `//` in any app path is refused (400).
+  refresh, no pool hold, no failover. Side and served calls are counted per app and day apart from tokens (default 5000 a
+  day, `AIS_GATEWAY_SIDE_DAILY_LIMIT`; over it the answer is 429); no token rows are written for them. Codex reset credits
+  are cached 60 s per app.
+- **Refused claude paths** (403, after collapsing `//`, decoding, lower-casing and dropping `;params`), below `/api/`:
+  `oauth/{profile,account,userinfo,organization(s),roles}`, `oauth/claude_cli/{roles,profile,account,organization(s)}`,
+  `claude_cli_profile`, `organization(s)`, `account`, `bootstrap`, `me`. The gateway serves `oauth/usage` and
+  `oauth/profile` itself. Every other `/api/*` path passes through. Repeated slashes in any app path are collapsed before
+  matching and before the path is sent upstream.
 
 ### ali login ownership
 
 The gateway renews the Alibaba console session of every live ali identity on its keep-alive timer
 (`src/gateway/ali-session.ts`, `ais_gateway_keepalive_total{provider="ali"}`; failures raise an owner alert). The heartbeat
 names them as `ali/<identity>`; while it is fresh, the console daemon, the host timer `ais-ali-auth-refresh-<identity>` and
-`ais auth refresh --tool=ali` stand down (the CLI and daemon remove the host timer; `--force` renews anyway). Renewals take a
+`ais auth refresh --tool=ali` skip their run (the host timer stays installed, so the host resumes at once when the heartbeat stops naming the login; `--force` renews anyway). The gateway claims `ali/<identity>` only when the startup check found nothing missing and that login has been renewed successfully at least once. Renewals take a
 lock on the shared Chrome tab and never navigate away from a sign-in page a person is using. On shutdown a renewal in
 flight is abandoned and `stop()` waits at most 10 s for the pass.
 

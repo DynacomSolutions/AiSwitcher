@@ -42,16 +42,26 @@ describe("the shared browser lock", () => {
   });
 });
 
-describe("the host stands down while the gateway owns ali", () => {
-  test("stand-down removes the host timer and tells the caller not to renew", async () => {
-    const removed: string[] = [];
-    expect(await standDownToGateway("personal", { managed: async () => true, removeTimer: async (n) => (removed.push(n), true) })).toBe(true);
-    expect(removed).toEqual(["personal"]);
+describe("the lock on an abandoned renewal", () => {
+  test("is freed at once when the renewal is aborted, even though it never finishes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ali-lock-"));
+    const lock = join(dir, "browser.lock");
+    const ctrl = new AbortController();
+    const stuck = withAliBrowserLock(() => new Promise<string>(() => {}), lock, ctrl.signal);
+    stuck.catch(() => undefined);
+    await Bun.sleep(30);
+    ctrl.abort();
+    await expect(stuck).rejects.toThrow();
+    const t0 = Date.now();
+    expect(await withAliBrowserLock(async () => "next", lock)).toBe("next");
+    expect(Date.now() - t0).toBeLessThan(500);
   });
-  test("without gateway ownership nothing is removed", async () => {
-    const removed: string[] = [];
-    expect(await standDownToGateway("personal", { managed: async () => false, removeTimer: async (n) => (removed.push(n), true) })).toBe(false);
-    expect(removed).toEqual([]);
+});
+
+describe("the host stands down while the gateway owns ali", () => {
+  test("stand-down only skips the run: the host timer is left installed", async () => {
+    expect(await standDownToGateway("personal", { managed: async () => true })).toBe(true);
+    expect(await standDownToGateway("personal", { managed: async () => false })).toBe(false);
   });
 
   test("a fresh heartbeat naming ali/<id> makes it gateway-managed; a stale or missing one hands it back", async () => {

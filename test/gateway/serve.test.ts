@@ -862,6 +862,41 @@ describe("ali ownership and shutdown", () => {
     }
   });
 
+  test("a failed startup self-test keeps ali/<id> out of the heartbeat, even after renewals succeed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hb-"));
+    const prev = process.env.AIS_GATEWAY_HEARTBEAT;
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "hb.json");
+    let renewed = 0;
+    try {
+      const g = await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => (renewed++, "p"), aliSetup: { which: () => null, writable: async () => true } });
+      await waitFor(async () => renewed >= 1 && (await Bun.file(join(dir, "hb.json")).exists()));
+      await Bun.sleep(80);
+      const hb = (await Bun.file(join(dir, "hb.json")).json()) as { held: Record<string, unknown> };
+      expect(Object.keys(hb.held).filter((k) => k.startsWith("ali/"))).toEqual([]);
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
+      else process.env.AIS_GATEWAY_HEARTBEAT = prev;
+    }
+  });
+
+  test("a login is claimed only after its first successful renewal", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hb-"));
+    const prev = process.env.AIS_GATEWAY_HEARTBEAT;
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "hb.json");
+    try {
+      const g = await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => Promise.reject(new Error("down")), aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true } });
+      await waitFor(async () => await Bun.file(join(dir, "hb.json")).exists());
+      await Bun.sleep(100);
+      const hb = (await Bun.file(join(dir, "hb.json")).json()) as { held: Record<string, unknown> };
+      expect(Object.keys(hb.held).filter((k) => k.startsWith("ali/"))).toEqual([]);
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
+      else process.env.AIS_GATEWAY_HEARTBEAT = prev;
+    }
+  });
+
   test("a missing kubectl is alerted once at startup", async () => {
     const g = await boot({ aliAccounts: async () => [member("personal")], aliSetup: { which: () => null, writable: async () => true } });
     await waitFor(() => alerts.some((a) => a.kind === "ali-setup-missing"));

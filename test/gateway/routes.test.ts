@@ -271,28 +271,43 @@ describe("served from pool state", () => {
   });
 });
 
-describe("claude /api paths", () => {
-  const blocked = ["/api/oauth//profile", "/api//oauth/profile", "//api/oauth/profile", "/api/oauth/account", "/API/oauth/account", "/%61pi/oauth/account", "/%2561pi/oauth/account", "/api", "/api/hello"];
+describe("claude account paths", () => {
+  const blocked = ["/api/oauth/account", "/API/oauth/account", "/api/oauth//account", "/api//oauth/account", "//api/oauth/account", "/%61pi/oauth/account", "/%2561pi/oauth/account", "/api/oauth/account;x=1", "/api/oauth/userinfo", "/api/oauth/organizations/x", "/api/oauth/claude_cli/roles", "/api/claude_cli_profile", "/api/organizations", "/api/bootstrap"];
   for (const path of blocked) {
     test(`${path} never reaches the provider`, async () => {
       await addApp("cl", "claude", "anthropic");
       const res = await call("cl", path, { method: "GET" });
-      expect([400, 403, 404]).toContain(res.status);
+      expect(res.status).toBe(403);
       expect(seen).toHaveLength(0);
     });
   }
+  for (const path of ["/api/oauth//profile", "/api//oauth/profile", "//api/oauth/profile", "/API/oauth/PROFILE", "/%61pi/oauth/profile"]) {
+    test(`${path} is the served profile, never the provider's`, async () => {
+      await addApp("cl", "claude", "anthropic");
+      const res = await call("cl", path, { method: "GET" });
+      expect(seen).toHaveLength(0);
+      expect(res.status === 200 || res.status === 403).toBe(true);
+      expect(await res.text()).not.toContain("tok-");
+    });
+  }
+  test("other /api paths Claude Code uses still pass through", async () => {
+    await addApp("cl", "claude", "anthropic");
+    for (const path of ["/api/hello", "/api/oauth/claude_cli/create_api_key", "/api/claude_code/settings", "/api/event_logging/batch"]) {
+      seen.length = 0;
+      expect((await call("cl", path, { method: "GET" })).status).toBe(200);
+      expect(seen).toHaveLength(1);
+    }
+  });
+  test("repeated slashes are collapsed before they are sent on", async () => {
+    await addApp("cl", "claude", "anthropic");
+    await call("cl", "/v1//messages", { method: "POST", body: "{}" });
+    expect(new URL(seen[0]!.url).pathname).toBe("/v1/messages");
+  });
   test("the served paths still work, and /v1 paths are unaffected", async () => {
     await addApp("cl", "claude", "anthropic");
     expect((await call("cl", "/api/oauth/profile", { method: "GET" })).status).toBe(200);
     expect((await call("cl", "/api/oauth/usage/", { method: "GET" })).status).toBe(200);
     expect(seen).toHaveLength(0);
-    await call("cl", "/v1/messages", { method: "POST", body: "{}" });
-    expect(seen).toHaveLength(1);
-  });
-  test("other providers keep their own /api paths", async () => {
-    await addApp("c", "codex", "openai");
-    await call("c", "/api/x", { method: "GET" });
-    expect(seen).toHaveLength(1);
   });
 });
 
@@ -330,26 +345,33 @@ describe("side routes do not disturb logins or the pool", () => {
   });
 });
 
-describe("daily cap", () => {
-  test("side and served calls cost a fixed amount each and stop at the cap", async () => {
-    await addApp("k", "kimi", "openai", { dailyTokens: 2500 });
+describe("daily limits", () => {
+  test("side calls are counted as requests, not tokens, and stop at the side limit", async () => {
+    await addApp("k", "kimi", "openai", { dailyTokens: 10 });
+    deps.sideDailyLimit = 3;
+    const app = createGatewayApp(deps);
     const codes: number[] = [];
-    for (let i = 0; i < 4; i++) {
-      codes.push((await call("k", "/search", { method: "POST", body: "{}" })).status);
-      await ledger.flush();
-    }
+    for (let i = 0; i < 4; i++) codes.push((await app.request("http://gw.test/k/search", { method: "POST", body: "{}", headers: { authorization: `Bearer ${tokens.k}` } })).status);
+    await ledger.flush();
     expect(codes).toEqual([200, 200, 200, 429]);
     expect(seen).toHaveLength(3);
-    expect(await store.usageSince("k", new Date(0))).toBe(3000);
+    expect(await store.usageSince("k", new Date(0))).toBe(0); // no invented token rows
   });
-  test("served routes are counted and capped too", async () => {
-    await addApp("cl", "claude", "anthropic", { dailyTokens: 1500 });
-    const codes: number[] = [];
-    for (let i = 0; i < 3; i++) {
-      codes.push((await call("cl", "/api/oauth/usage", { method: "GET" })).status);
-      await ledger.flush();
-    }
-    expect(codes).toEqual([200, 200, 429]);
+  test("served routes count against the same limit, and the count restarts the next day", async () => {
+    await addApp("cl", "claude", "anthropic");
+    deps.sideDailyLimit = 2;
+    let t = NOW.getTime();
+    deps.now = () => new Date(t);
+    const app = createGatewayApp(deps);
+    const get = async () => (await app.request("http://gw.test/cl/api/oauth/usage", { headers: { authorization: `Bearer ${tokens["cl"]}` } })).status;
+    expect([await get(), await get(), await get()]).toEqual([200, 200, 429]);
+    t += 24 * 3_600_000;
+    expect(await get()).toBe(200);
+  });
+  test("chat calls are not counted against the side limit", async () => {
+    await addApp("cl", "claude", "anthropic");
+    deps.sideDailyLimit = 1;
+    for (let i = 0; i < 3; i++) expect((await call("cl", "/v1/messages", { method: "POST", body: "{}" })).status).toBe(200);
   });
   test("a chat call that reports tokens is counted by those tokens, not the fixed cost", async () => {
     await addApp("cl", "claude", "anthropic", { dailyTokens: 100000 });

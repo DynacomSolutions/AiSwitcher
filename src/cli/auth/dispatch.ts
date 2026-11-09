@@ -94,7 +94,7 @@ async function runAuthRefresh(rest: string[], flags: ParsedArgs["flags"]): Promi
     const identity = await resolveAliIdentity(rest, flags);
     // The gateway renews this login while its heartbeat names it; --force renews anyway.
     if (!boolFlag(flags, "force") && (await standDownToGateway(identity.name))) {
-      if (!boolFlag(flags, "quiet")) console.log(`Alibaba session for ${identity.name} is renewed by the gateway; the host timer was removed (use --force to renew here anyway).`);
+      if (!boolFlag(flags, "quiet")) console.log(`Alibaba session for ${identity.name} is renewed by the gateway; skipped (use --force to renew here anyway).`);
       return;
     }
     try {

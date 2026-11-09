@@ -72,7 +72,7 @@ export interface GatewayHooks {
   keepAliveAccounts?(tool: string): Promise<Identity[]>;
   /** The ali logins whose console session the gateway renews, and how (tests replace both). */
   aliAccounts?(): Promise<Identity[]>;
-  aliRefresh?(identity: Identity): Promise<string>;
+  aliRefresh?(identity: Identity, signal?: AbortSignal): Promise<string>;
   /** Replaces the startup check that the pod can renew ali sessions (kubectl, port-forward, directories). */
   aliSetup?: AliSetupDeps;
   /** Longest stop() waits for the keep-alive pass (ali renewals are abandoned at once on drain). Default 10 s, well inside the 30 s grace. */
@@ -466,7 +466,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         store.startRefresh(hooks.refreshIntervalMs ?? 15_000);
         console.info("gateway: warm, ready for traffic");
         void probeIdentities().catch(() => undefined);
-        if (aliList) void aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).catch(() => undefined);
+        if (aliList) void aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).then((p) => void (aliSetupOk = p.length === 0), () => undefined);
         return;
       } catch (err) {
         console.warn(`gateway: warm-up failed at ${stage} (${describe(err)}); retrying in ${delay} ms`);
@@ -539,6 +539,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   let keepAliveRun: Promise<void> | undefined;
   const aliAbort = new AbortController();
   const aliSkips = new Map<string, number>();
+  /** True once the startup self-test (re-run every pass until it passes) found nothing missing. The heartbeat claims no ali login before. */
+  let aliSetupOk = false;
   // Tests (noHeartbeat) never touch the real registry or auth browser unless they inject an ali source.
   const aliList = hooks.aliAccounts ?? (hooks.noHeartbeat ? undefined : listAliAccounts);
   const keepAliveTimer = setInterval(() => {
@@ -555,12 +557,19 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       onPass: hooks.noHeartbeat
         ? undefined
         : async (held, at) => {
-            for (const a of (await aliList?.().catch(() => [] as Identity[])) ?? []) held[`ali/${a.name}`] = lastSuccessAt.get(`ali/${a.name}`) ? { lastSuccessAt: lastSuccessAt.get(`ali/${a.name}`) as string } : {};
+            // Claimed only with a working setup and a renewal that has succeeded: until then the host keeps renewing.
+            if (aliSetupOk) for (const a of (await aliList?.().catch(() => [] as Identity[])) ?? []) {
+              const last = lastSuccessAt.get(`ali/${a.name}`);
+              if (last) held[`ali/${a.name}`] = { lastSuccessAt: last };
+            }
             await trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held });
           },
       metrics,
       revoked: revokedGrants,
     })
+      .then(async () => {
+        if (aliList && !aliSetupOk && !aliAbort.signal.aborted) aliSetupOk = (await aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).catch(() => ["error"])).length === 0;
+      })
       .then(() => (aliList ? aliSessionOnce({ accounts: aliList, ...(hooks.aliRefresh ? { refresh: hooks.aliRefresh } : {}), metrics, alerter, lastSuccess: lastSuccessAt, now, signal: aliAbort.signal, loginPageSkips: aliSkips }) : undefined))
       .finally(() => {
         keepAliveRunning = false;

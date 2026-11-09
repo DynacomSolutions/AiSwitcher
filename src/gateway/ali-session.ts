@@ -41,7 +41,7 @@ function gatewayHint(code: AliAuthRefreshError["code"], identity: string): strin
  */
 export async function aliSessionOnce(deps: {
   accounts?: () => Promise<Identity[]>;
-  refresh?: (identity: Identity) => Promise<string>;
+  refresh?: (identity: Identity, signal?: AbortSignal) => Promise<string>;
   metrics: { keepAlive(provider: string, outcome: string): void };
   alerter: Alerter;
   /** "ali/<name>" to the ISO time the last successful renewal STARTED; a login renewed within the interval is left alone. */
@@ -72,7 +72,7 @@ export async function aliSessionOnce(deps: {
     // Stamped from when the attempt began: the renewal itself takes seconds, and counting from its end drifts a 10-minute cadence to 20.
     const startedAt = now().toISOString();
     try {
-      const done = await Promise.race([refresh(account), aborted]);
+      const done = await Promise.race([refresh(account, deps.signal), aborted]);
       if (done === "aborted") {
         deps.metrics.keepAlive("ali", "aborted");
         return;

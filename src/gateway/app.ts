@@ -13,7 +13,7 @@ import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
-import { isClaudeApiPath, routeFor, serveRoute, SIDE_ROUTE_COST_TOKENS, type ResetCreditsCache } from "./routes.ts";
+import { collapseSlashes, isClaudeAccountPath, routeFor, serveRoute, sideDailyLimitFromEnv, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
@@ -41,6 +41,8 @@ export interface GatewayDeps {
   browserHub?: BrowserHub;
   /** Most request-body bytes held for replay at once across all requests. Defaults to AIS_GATEWAY_BODY_BUDGET_MB, else BODY_BUDGET_BYTES. */
   bodyBudgetBytes?: number;
+  /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else 5000. */
+  sideDailyLimit?: number;
   /** Waits `ms` or until `signal` aborts; tests inject a fake clock. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
@@ -376,10 +378,11 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
   const resetCredits: ResetCreditsCache = {};
+  const sideCounts = new Map<string, { day: number; n: number }>();
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, resetCredits).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -389,12 +392,13 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, { day: number; n: number }>): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
   const appName = decodeSegment(url.pathname.slice(1, slash === -1 ? undefined : slash));
-  const rest = slash === -1 ? "" : url.pathname.slice(slash);
+  // Repeated slashes are collapsed once, here: every rule below and the path sent upstream see the same path.
+  const rest = slash === -1 ? "" : collapseSlashes(url.pathname.slice(slash));
 
   let found: GatewayApp | undefined;
   try {
@@ -495,16 +499,22 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   async function run(): Promise<Response> {
   if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
   const route = routeFor(app.provider, style, req.method, rest);
-  // Claude's /api/* paths carry account data: only the ones the gateway serves itself are reachable, however the path is spelled.
-  if (app.provider === "claude" && route?.kind !== "serve" && isClaudeApiPath(rest)) return reject(403, "this path is not available through the gateway");
+  // Claude's account, profile and organisation paths are never forwarded (the gateway serves usage and profile itself).
+  if (app.provider === "claude" && route?.kind !== "serve" && isClaudeAccountPath(rest)) return reject(403, "this path is not available through the gateway");
   /** A list, search or speech call is not a model call: no model allowlist, and its upstream errors never touch logins or the pool. */
   const side = route?.kind === "upstream" && route.side;
-  /** A call with no token usage still counts a fixed cost toward the daily cap. */
-  const withSideCost = (c: UsageCounts | undefined): UsageCounts | undefined => {
-    if (!side && route?.kind !== "serve") return c;
-    const total = c ? c.inputTokens + c.outputTokens + c.cacheReadTokens + c.cacheWriteTokens : 0;
-    return total > 0 ? c : { ...(c ?? { outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }), inputTokens: SIDE_ROUTE_COST_TOKENS };
-  };
+  /** Side and served calls are counted per app and day, apart from tokens; no token rows are invented for them. */
+  if (side || route?.kind === "serve") {
+    const day = dayStartIct(deps.now()).getTime();
+    const mine = sideCounts.get(app.name);
+    const counter = mine && mine.day === day ? mine : { day, n: 0 };
+    sideCounts.set(app.name, counter);
+    counter.n += 1;
+    if (counter.n > (deps.sideDailyLimit ?? sideDailyLimitFromEnv())) {
+      deps.metrics.rejection(app.name, "daily_cap");
+      return reject(429, "daily limit for list, search and speech calls reached", identityForRow, undefined, "side_daily_cap");
+    }
+  }
   if (route?.kind === "serve") {
     // Answered from the gateway's own pool state: no upstream call, no body, no account detail. The daily cap still applies.
     if (app.dailyTokens !== undefined) {
@@ -521,7 +531,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     }
     const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal, cache: resetCredits });
     req.signal.removeEventListener("abort", onAbort);
-    record(identityForRow, served.status >= 400 ? "rejected" : "ok", served.status, withSideCost(undefined), false);
+    record(identityForRow, served.status >= 400 ? "rejected" : "ok", served.status, undefined, false);
     return served;
   }
   let body: Body;
@@ -834,7 +844,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const finish = (status: string): void => {
     req.signal.removeEventListener("abort", onAbort);
     const counts = tap.result();
-    record(identity, status, httpStatus, withSideCost(counts), tap.isSse(), tap.status(), model);
+    record(identity, status, httpStatus, counts, tap.isSse(), tap.status(), model);
   };
 
   if (!up.body) {
@@ -961,7 +971,6 @@ export function exhaustedUntil(headers: Headers, nowMs: number): number {
  * `[/v1]/models/<id>` route (model ids such as `org/model`). The id is split on `%2F` and no piece may be empty, `.` or `..`.
  */
 function pathAllowed(rest: string, style: ApiStyle): boolean {
-  if (rest.includes("//")) return false; // an empty segment: some upstreams collapse it, which would dodge exact-path rules
   const m = style === "openai" ? /^(?:\/v1)?\/models\/([^/]+)$/.exec(rest) : null;
   if (m) {
     const id = m[1] as string;

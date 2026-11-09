@@ -15,7 +15,8 @@ import type { ApiStyle, GatewayApp, GatewayProvider } from "./types.ts";
  *   different provider URL than the pass-through would build. `side` marks a call that is not a model call: an
  *   app's model allowlist does not apply to it, and its 401/429/402/403 answers are passed through untouched (no forced login
  *   refresh, no pool hold or failover), so an unverified side route can never disable a login chat calls depend on. The
- *   daily cap still applies and a request with no token usage costs SIDE_ROUTE_COST_TOKENS.
+ *   daily token cap still applies, and these calls
+ *   are also counted per app against SIDE_DAILY_LIMIT_DEFAULT requests a day (no token rows are invented for them).
  * - `serve`: the gateway answers itself from its own pool state. No account token and no account identity leaves the gateway.
  *
  * Sources for the provider paths:
@@ -36,32 +37,48 @@ export type Route =
 
 export type ServedName = "claude-usage" | "claude-profile" | "codex-reset-credits" | "codex-reset-consume" | "ali-models";
 
-/** What a side or served request with no token usage counts toward an app's daily cap. */
-export const SIDE_ROUTE_COST_TOKENS = 1_000;
+/** Side and served requests an app may make per day, counted apart from tokens. AIS_GATEWAY_SIDE_DAILY_LIMIT overrides. */
+export const SIDE_DAILY_LIMIT_DEFAULT = 5_000;
+
+export function sideDailyLimitFromEnv(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.AIS_GATEWAY_SIDE_DAILY_LIMIT ?? "");
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : SIDE_DAILY_LIMIT_DEFAULT;
+}
+
+/** Repeated slashes collapsed, so a rule and the path sent upstream agree ("/api//oauth" is "/api/oauth"). */
+export function collapseSlashes(path: string): string {
+  return path.replace(/\/{2,}/g, "/");
+}
 
 /** How long a codex reset-credit total is reused for one app. */
 export const RESET_CREDITS_TTL_MS = 60_000;
 const RESET_CREDITS_FAILURE_TTL_MS = 15_000;
 
 /**
- * True for a claude path under `/api` however it is spelled (case, percent-encoding, repeated decoding). Claude's `/api/*`
- * paths carry account data (`/api/oauth/profile`, `/api/oauth/account`, ...): the gateway serves the ones it chooses itself
- * and refuses the rest, so no pool member's account detail can be read through an app key.
+ * Claude account detail the gateway never lets an app read with a pool member's login. Only these are refused; every other
+ * `/api/*` path (hello, settings, telemetry, other oauth/claude_cli calls) passes through as before. The gateway serves
+ * `/api/oauth/usage` and `/api/oauth/profile` itself. Refused, below `/api/`:
+ *   oauth/{profile,account,userinfo,organization(s),roles}, oauth/claude_cli/{roles,profile,account,organization(s)},
+ *   claude_cli_profile, organization(s), account, bootstrap, me.
+ * The path is matched after slash collapsing, repeated percent-decoding, lower-casing and dropping `;params`.
  */
-export function isClaudeApiPath(rest: string): boolean {
+const CLAUDE_ACCOUNT_PATH = /^\/api\/(?:oauth\/(?:(?:profile|account|userinfo|organizations?|roles)|claude_cli\/(?:roles|profile|account|organizations?))|claude_cli_profile|organizations?|account|bootstrap|me)(?:\/|$)/;
+
+export function isClaudeAccountPath(rest: string): boolean {
   let p = rest;
   for (let i = 0; i < 4; i++) {
-    if (/^\/api(?:[/;?#]|$)/i.test(p)) return true;
+    const norm = collapseSlashes(p).replace(/;[^/]*/g, "").toLowerCase();
+    if (CLAUDE_ACCOUNT_PATH.test(norm)) return true;
     let next: string;
     try {
       next = decodeURIComponent(p);
     } catch {
       return true; // undecodable: cannot be shown safe
     }
-    if (next === p) break;
+    if (next === p) return false;
     p = next;
   }
-  return /^\/api(?:[/;?#]|$)/i.test(p);
+  return CLAUDE_ACCOUNT_PATH.test(collapseSlashes(p).replace(/;[^/]*/g, "").toLowerCase());
 }
 
 const CODEX_BACKEND = "https://chatgpt.com/backend-api";
