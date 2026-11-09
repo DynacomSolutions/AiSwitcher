@@ -6,7 +6,8 @@ import { isRetired } from "../identities/retired.ts";
 import { parseCliArgs, resolveParentLaunchContext } from "./cli-args.ts";
 import { realpathSync } from "node:fs";
 import { resolveRealBinary, shimExecEnvVar } from "./resolve-binary.ts";
-import { IDENTITY_SESSION_MARKER } from "./exec.ts";
+import { IDENTITY_SESSION_MARKER, execReal } from "./exec.ts";
+import { isSelfUpdateCommand } from "./self-update.ts";
 import { launchDesktopApp } from "./launch-desktop.ts";
 import { launchThenStartBackgroundSync } from "../sync/background.ts";
 import { migrateLegacyAisHome } from "./migrate-ais-home.ts";
@@ -61,6 +62,24 @@ export async function runWrapper(
     // see migrate-ais-home.ts. Never throws.
     await migrateLegacyAisHome();
     const parsed = parseCliArgs(cfg.toolName, process.argv.slice(2));
+
+    // `claude update` and friends update the binary, not an identity: run
+    // the real binary as-is, with no identity, spend gate or session work.
+    if (isSelfUpdateCommand(cfg.toolName, parsed.cleanedArgv)) {
+      const realBinary = resolveRealBinary(cfg.realBinaryName);
+      const presetConfigDir = process.env[cfg.envVarName];
+      await execReal(realBinary, parsed.cleanedArgv, {
+        ...(presetConfigDir ? { [cfg.envVarName]: presetConfigDir } : {}),
+        [shimExecEnvVar(cfg.realBinaryName)]: (() => {
+          try {
+            return realpathSync(realBinary);
+          } catch {
+            return realBinary;
+          }
+        })(),
+      });
+    }
+
     const { parentSession, identityFlag } = resolveParentLaunchContext(
       cfg.toolName,
       process.env,

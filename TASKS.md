@@ -83,6 +83,7 @@ ETA: 2026-11-14 18:00 ICT
 | 95 | Usage collector commits every successful scan; drop history regression guard | done | | | | | Guard froze a grok partition ~6 h on a source history rewrite.<br>Merged https://github.com/DynacomSolutions/AiSwitcher/pull/311 (`4cea523`); released v0.5.22, installed, clean cycle with no partition errors.<br>Superseded #304, closed. |
 | 96 | Ignore retired identity partitions in usage snapshot freshness | done | | | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/313 (`2770df9`); released v0.5.23, installed on host.<br>Web pod rolled to `2770df9` via .cluster #1884; `/api/usage` stale false, retired identities still in totals. |
 | 141 | ais update backup progress % + ETA | in_progress | claude-20261107-update-backup-progress | update-backup-progress | | 2026-11-07 22:00 ICT | Heartbeat shows percent, bytes and ETA from observed rate; also `bun run backup` and the installer.<br>Reclaim of dead-pid backups.lock already worked; added release on SIGINT/SIGTERM. |
+| 160 | Shims: the tool's own self-update command (`claude update`, `codex update`, ...) runs the real binary without resolving an identity | in_progress | claude | shim-update-passthrough | | 2026-11-10 12:00 ICT | T3 Code's provider update ran `claude update` from the home directory and failed: "no --identity given, no CLAUDE_CONFIG_DIR set, and no unique directory match". Updating the CLI binary needs no identity. |
 
 ## 2. Live USB
 ETA: 2026-11-14 18:00 ICT
