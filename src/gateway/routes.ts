@@ -228,39 +228,47 @@ async function claudeUsageBody(ctx: ServeContext): Promise<Record<string, unknow
   return { five_hour: win("five-hour"), seven_day: win("seven-day"), seven_day_opus: null, seven_day_sonnet: null, extra_usage: null };
 }
 
-const CODEX_WINDOW_SECONDS = { short: 5 * 3_600, long: 7 * 86_400 } as const;
+/**
+ * The length of a codex limit window from its AIS label (src/cli/limits/codex-limits.ts names a window by its length:
+ * "session" up to 6 h, "week" up to 14 d, "month" up to 42 d, otherwise "~Nh" or "~Nd"). Undefined: no length known.
+ */
+export function codexWindowSeconds(label: string): number | undefined {
+  const l = label.toLowerCase().trim();
+  const approx = /^~(\d+)([hd])$/.exec(l);
+  if (approx) return Number(approx[1]) * (approx[2] === "h" ? 3_600 : 86_400);
+  if (/session|five|5h|hour/.test(l)) return 5 * 3_600;
+  if (/week|seven|7d/.test(l)) return 7 * 86_400;
+  if (/month/.test(l)) return 30 * 86_400;
+  return undefined;
+}
 
 /**
  * The windows of the member the pool would route to, in the shape of ChatGPT's `wham/usage` (what codex decodes for
- * `account/rateLimits/read`; `allowed` and `limit_reached` are required). The plan is not known to the gateway, so it is
- * always "pro". No reading at all: 502, so the client shows "unavailable" rather than an invented 0%.
+ * `account/rateLimits/read`; `allowed` and `limit_reached` are required). The shortest window is primary, the next one
+ * secondary, each with its own length (a monthly-only account shows one 30-day primary window, never a 5 h one). The
+ * plan is not known to the gateway, so it is always "pro". No reading at all: 502, so the client shows "unavailable"
+ * rather than an invented 0%.
  */
 async function codexUsage(ctx: ServeContext): Promise<Response> {
   const best = await leastUsed(ctx);
   const nowSec = Math.floor(ctx.deps.now().getTime() / 1000);
-  const slots: Partial<Record<"short" | "long", Record<string, number>>> = {};
-  for (const w of best?.windows ?? []) {
-    const slot = codexSlot(w.label) ?? (slots.short ? "long" : "short");
-    if (slots[slot]) continue;
-    const parsed = w.resetsAt ? Date.parse(w.resetsAt) : Number.NaN;
-    const windowSec = CODEX_WINDOW_SECONDS[slot];
-    // A window always resets within its own length; no known reset is shown as a full window away.
-    const resetAt = Number.isFinite(parsed) ? Math.floor(parsed / 1000) : nowSec + windowSec;
-    slots[slot] = { used_percent: Math.max(0, Math.round(w.utilization)), limit_window_seconds: windowSec, reset_after_seconds: Math.max(0, resetAt - nowSec), reset_at: resetAt };
-  }
-  if (!slots.short && !slots.long) return providerError(ctx.style, 502, "usage unavailable");
-  const full = Object.values(slots).some((w) => (w?.used_percent ?? 0) >= 100);
+  const windows = (best?.windows ?? [])
+    .map((w) => ({ w, seconds: codexWindowSeconds(w.label) }))
+    .filter((x): x is { w: (typeof x)["w"]; seconds: number } => x.seconds !== undefined && Number.isFinite(x.w.utilization))
+    .sort((a, b) => a.seconds - b.seconds)
+    .slice(0, 2)
+    .map(({ w, seconds }) => {
+      const parsed = w.resetsAt ? Date.parse(w.resetsAt) : Number.NaN;
+      // A window always resets within its own length; no known reset is shown as a full window away.
+      const resetAt = Number.isFinite(parsed) ? Math.floor(parsed / 1000) : nowSec + seconds;
+      return { used_percent: Math.max(0, Math.round(w.utilization)), limit_window_seconds: seconds, reset_after_seconds: Math.max(0, resetAt - nowSec), reset_at: resetAt };
+    });
+  if (windows.length === 0) return providerError(ctx.style, 502, "usage unavailable");
+  const full = windows.some((w) => w.used_percent >= 100);
   return json({
     plan_type: "pro",
-    rate_limit: { allowed: !full, limit_reached: full, primary_window: slots.short ?? null, secondary_window: slots.long ?? null },
+    rate_limit: { allowed: !full, limit_reached: full, primary_window: windows[0] ?? null, secondary_window: windows[1] ?? null },
   });
-}
-
-function codexSlot(label: string): "short" | "long" | undefined {
-  const l = label.toLowerCase();
-  if (/(five|5h|session|~[1-6]h|hour)/.test(l)) return "short";
-  if (/(seven|7d|week|day|~\d+d)/.test(l)) return "long";
-  return undefined;
 }
 
 const CODEX_RESET_URL = `${CODEX_BACKEND}/wham/rate-limit-reset-credits`;
