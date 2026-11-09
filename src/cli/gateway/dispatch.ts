@@ -4,6 +4,8 @@ import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
 import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
 import { installDrainHandlers, LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
+import { secretsTokenResolver, startUsageProxy, USAGE_PROXY_DEFAULT_PORT } from "../../gateway/usage-proxy.ts";
+import { readSecretsEntries } from "./secrets-file.ts";
 import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
 
 function portOf(flag: string | undefined, env: string | undefined, fallback: number, name: string): number {
@@ -37,6 +39,25 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   await new Promise<void>(() => {});
 }
 
+/**
+ * The usage proxy next to the local gateway (HTTPS_PROXY for gateway-routed Claude Code, see usage-proxy.ts).
+ * AIS_GATEWAY_LOCAL_PROXY_PORT picks the port ("off" disables it). A proxy that cannot start never stops the gateway.
+ */
+async function startLocalUsageProxy(remoteBase: string): Promise<{ stop(force?: boolean): void } | undefined> {
+  const raw = process.env.AIS_GATEWAY_LOCAL_PROXY_PORT;
+  if (raw === "off") return undefined;
+  const port = portOf(undefined, raw, USAGE_PROXY_DEFAULT_PORT, "AIS_GATEWAY_LOCAL_PROXY_PORT");
+  try {
+    const resolver = secretsTokenResolver(() => readSecretsEntries());
+    const proxy = await startUsageProxy({ port, remoteBase, appForToken: resolver });
+    console.info(`gateway local: usage proxy on 127.0.0.1:${proxy.port} (CA ${proxy.caCertPath})`);
+    return proxy;
+  } catch (err) {
+    console.info(`gateway local: warning: usage proxy not started (${(err as Error).message})`);
+    return undefined;
+  }
+}
+
 async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): Promise<void> {
   const port = portOf(undefined, process.env.AIS_GATEWAY_LOCAL_PORT, LOCAL_GATEWAY_DEFAULT_PORT, "AIS_GATEWAY_LOCAL_PORT");
   if (args[0] === "install") {
@@ -60,6 +81,12 @@ async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): P
   }
   const running = await startLocalGateway({ port, remoteBase, bindRetryMs: 30_000 });
   console.info(`gateway local: listening on 127.0.0.1:${running.port}`);
-  installDrainHandlers(running);
+  const proxy = await startLocalUsageProxy(remoteBase);
+  installDrainHandlers({
+    drain: () => {
+      proxy?.stop(false);
+      return running.drain();
+    },
+  });
   await new Promise<void>(() => {});
 }

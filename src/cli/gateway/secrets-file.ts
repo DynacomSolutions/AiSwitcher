@@ -30,6 +30,22 @@ export async function readSecretsKey(key: string, path = defaultSecretsPath()): 
   return found;
 }
 
+/** Every KEY=value of a shell-style secrets file, last assignment winning; empty when the file is absent. */
+export async function readSecretsEntries(path = defaultSecretsPath()): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    return out;
+  }
+  for (const line of text.split("\n")) {
+    const kv = parseLine(line);
+    if (kv) out.set(kv.key, kv.value);
+  }
+  return out;
+}
+
 /** The env key holding an app's token: hyphens become underscores. */
 export const appTokenKey = (app: string): string => `AIS_GATEWAY_APP_${app.toUpperCase().replace(/-/g, "_")}_TOKEN`;
 
