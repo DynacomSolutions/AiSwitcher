@@ -14,6 +14,7 @@ import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
+import { fallbackCount } from "./side-count.ts";
 import { collapseSlashes, isClaudeAccountPath, routeFor, serveRoute, sideDailyLimitFromEnv, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
@@ -544,10 +545,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (n === undefined) {
       deps.metrics.failOpen(app.name, "side_count_failed");
       deps.sideCountHealth?.(false);
-      for (const k of [...sideCounts.keys()]) if (!k.endsWith(`\u0000${day}`)) sideCounts.delete(k); // past days
-      const key = `${app.name}\u0000${day}`;
-      n = (sideCounts.get(key) ?? 0) + 1;
-      sideCounts.set(key, n);
+      n = fallbackCount(sideCounts, app.name, day);
     }
     if (n > (deps.sideDailyLimit ?? sideDailyLimitFromEnv())) {
       deps.metrics.rejection(app.name, "daily_cap");

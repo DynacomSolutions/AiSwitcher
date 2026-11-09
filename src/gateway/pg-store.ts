@@ -1,5 +1,6 @@
 import { SQL, type TransactionSQL } from "bun";
 import type { AgentTokenRecord, BrowserBinding, BrowserPairing } from "../browser/types.ts";
+import { bumpSideCountOn, type SqlTag } from "./side-count.ts";
 import { errorTag } from "./ledger-buffer.ts";
 import type { GatewayStore } from "./store.ts";
 import type { GatewayApp, GatewayProvider, IdentityUsageRow, TokenRecord, UsageRow } from "./types.ts";
@@ -187,15 +188,8 @@ export class PgGatewayStore implements GatewayStore {
     return Number(rows[0]?.total ?? 0);
   }
 
-  async bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number> {
-    const query = this.sql`
-      INSERT INTO gateway_side_counts (app, day, n) VALUES (${app}, ${day}::date, 1)
-      ON CONFLICT (app, day) DO UPDATE SET n = gateway_side_counts.n + 1
-      RETURNING n`;
-    // A caller that gave up cancels the query, so a slow database does not pile up work behind it.
-    signal?.addEventListener("abort", () => void (query as unknown as { cancel?: () => unknown }).cancel?.(), { once: true });
-    const rows = await query;
-    return Number(rows[0]?.n ?? 0);
+  bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number> {
+    return bumpSideCountOn(this.sql as unknown as SqlTag, app, day, signal);
   }
 
   async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {
