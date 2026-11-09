@@ -25,6 +25,7 @@ let ledger: LedgerBuffer;
 let usage: Record<string, PoolUsage | undefined>;
 let requests: Array<{ app: string; provider: string; status: string; httpStatus: number }>;
 let deps: GatewayDeps;
+let refreshCalls: number;
 const tokens: Record<string, string> = {};
 
 const metrics: GatewayMetrics = { ...noopMetrics, request: (e) => void requests.push({ app: e.app, provider: e.provider, status: e.status, httpStatus: e.httpStatus }) };
@@ -38,6 +39,7 @@ async function addApp(name: string, provider: GatewayProvider, style: ApiStyle, 
 
 beforeEach(async () => {
   seen = [];
+  refreshCalls = 0;
   requests = [];
   usage = {};
   reply = () => new Response("{}", { headers: { "content-type": "application/json" } });
@@ -56,7 +58,7 @@ beforeEach(async () => {
     sleep: async () => {},
     store,
     ledger,
-    creds: { get: async (_p: string, identity: string) => ({ identity, accessToken: `tok-${identity}`, accountId: "acct" }), refreshAfter401: async () => ({ identity: "a", accessToken: "x" }) } as unknown as GatewayDeps["creds"],
+    creds: { get: async (_p: string, identity: string) => ({ identity, accessToken: `tok-${identity}`, accountId: "acct" }), refreshAfter401: async () => (refreshCalls++, { identity: "a", accessToken: "x" }) } as unknown as GatewayDeps["creds"],
     usageFor: async (_p, identity) => usage[identity],
     poolMembers: async () => ["a", "b"],
     fetch: ((input: string | URL | Request, init?: RequestInit) => {
@@ -266,5 +268,110 @@ describe("served from pool state", () => {
     const res = await call("c", "/api/codex/rate-limit-reset-credits/consume", { method: "POST", body: "{}" });
     expect(res.status).toBe(403);
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe("claude /api paths", () => {
+  const blocked = ["/api/oauth//profile", "/api//oauth/profile", "//api/oauth/profile", "/api/oauth/account", "/API/oauth/account", "/%61pi/oauth/account", "/%2561pi/oauth/account", "/api", "/api/hello"];
+  for (const path of blocked) {
+    test(`${path} never reaches the provider`, async () => {
+      await addApp("cl", "claude", "anthropic");
+      const res = await call("cl", path, { method: "GET" });
+      expect([400, 403, 404]).toContain(res.status);
+      expect(seen).toHaveLength(0);
+    });
+  }
+  test("the served paths still work, and /v1 paths are unaffected", async () => {
+    await addApp("cl", "claude", "anthropic");
+    expect((await call("cl", "/api/oauth/profile", { method: "GET" })).status).toBe(200);
+    expect((await call("cl", "/api/oauth/usage/", { method: "GET" })).status).toBe(200);
+    expect(seen).toHaveLength(0);
+    await call("cl", "/v1/messages", { method: "POST", body: "{}" });
+    expect(seen).toHaveLength(1);
+  });
+  test("other providers keep their own /api paths", async () => {
+    await addApp("c", "codex", "openai");
+    await call("c", "/api/x", { method: "GET" });
+    expect(seen).toHaveLength(1);
+  });
+});
+
+describe("side routes do not disturb logins or the pool", () => {
+  for (const status of [401, 402, 403, 429]) {
+    test(`transcribe answering ${status} is passed through with no refresh and no hold`, async () => {
+      await addApp("c", "codex", "openai");
+      reply = (s) => (new URL(s.url).pathname.endsWith("/transcribe") ? new Response('{"detail":"nope"}', { status, headers: { "content-type": "application/json", "retry-after": "30" } }) : new Response("{}"));
+      const res = await call("c", "/v1/audio/transcriptions", { method: "POST", body: "x" });
+      expect(res.status).toBe(status);
+      expect(refreshCalls).toBe(0);
+      expect(seen).toHaveLength(1); // no failover to another member
+      // a chat call straight after still goes out on the first member
+      seen.length = 0;
+      const chat = await call("c", "/responses", { method: "POST", body: "{}" });
+      expect(chat.status).toBe(200);
+      expect(seen).toHaveLength(1);
+    });
+  }
+  test("kimi search 403 with a quota-looking body does not mark the member exhausted", async () => {
+    await addApp("k", "kimi", "openai");
+    reply = (s) => (s.url.includes("/search") ? new Response('{"error":{"type":"insufficient_quota"}}', { status: 403 }) : new Response("{}"));
+    expect((await call("k", "/search", { method: "POST", body: "{}" })).status).toBe(403);
+    expect(seen).toHaveLength(1);
+    await call("k", "/chat/completions", { method: "POST", body: "{}" });
+    expect(new URL(seen[1]!.url).pathname).toBe("/coding/v1/chat/completions");
+    expect(seen[1]!.headers.get("authorization")).toBe("Bearer tok-a");
+  });
+  test("chat 401 still refreshes", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    let n = 0;
+    reply = () => (++n === 1 ? new Response("{}", { status: 401 }) : new Response("{}"));
+    await call("c", "/responses", { method: "POST", body: "{}" });
+    expect(refreshCalls).toBe(1);
+  });
+});
+
+describe("daily cap", () => {
+  test("side and served calls cost a fixed amount each and stop at the cap", async () => {
+    await addApp("k", "kimi", "openai", { dailyTokens: 2500 });
+    const codes: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      codes.push((await call("k", "/search", { method: "POST", body: "{}" })).status);
+      await ledger.flush();
+    }
+    expect(codes).toEqual([200, 200, 200, 429]);
+    expect(seen).toHaveLength(3);
+    expect(await store.usageSince("k", new Date(0))).toBe(3000);
+  });
+  test("served routes are counted and capped too", async () => {
+    await addApp("cl", "claude", "anthropic", { dailyTokens: 1500 });
+    const codes: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      codes.push((await call("cl", "/api/oauth/usage", { method: "GET" })).status);
+      await ledger.flush();
+    }
+    expect(codes).toEqual([200, 200, 429]);
+  });
+  test("a chat call that reports tokens is counted by those tokens, not the fixed cost", async () => {
+    await addApp("cl", "claude", "anthropic", { dailyTokens: 100000 });
+    reply = () => new Response(JSON.stringify({ type: "message", model: "m", usage: { input_tokens: 5, output_tokens: 7 } }), { headers: { "content-type": "application/json" } });
+    await call("cl", "/v1/messages", { method: "POST", body: "{}" });
+    await ledger.flush();
+    expect(await store.usageSince("cl", new Date(0))).toBe(12);
+  });
+  test("codex reset credits are cached for a minute per app", async () => {
+    await addApp("c", "codex", "openai");
+    reply = () => new Response(JSON.stringify({ available_count: 1 }));
+    let t = NOW.getTime();
+    deps.now = () => new Date(t);
+    const app = createGatewayApp(deps);
+    const get = async () => (await app.request("http://gw.test/c/wham/rate-limit-reset-credits", { headers: { authorization: `Bearer ${tokens.c}` } })).text();
+    await get();
+    const before = seen.length;
+    expect(before).toBe(2); // one read per member
+    await get();
+    expect(seen.length).toBe(before);
+    t += 61_000;
+    await get();
+    expect(seen.length).toBe(before + 2);
   });
 });

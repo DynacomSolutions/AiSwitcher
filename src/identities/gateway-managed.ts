@@ -5,7 +5,7 @@ import { heartbeatHolds } from "./gateway-heartbeat.ts";
 import { adapterFor } from "../gateway/providers/index.ts";
 import { isRetired } from "./retired.ts";
 import { loadIdentitiesFile } from "./store.ts";
-import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG } from "./tool-configs.ts";
+import { ALI_CONFIG, CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG } from "./tool-configs.ts";
 import type { Identity } from "./types.ts";
 
 let ownerProcess = false;
@@ -33,6 +33,21 @@ const REGISTRY_OF: Record<GatewayRefreshTool, string> = {
   grok: GROK_CONFIG.identitiesJsonPath,
   kimi: KIMI_CONFIG.identitiesJsonPath,
 };
+
+/**
+ * Tools whose login is a browser session the gateway renews itself (not an OAuth grant, so they are not in
+ * GATEWAY_REFRESH_TOOLS, which drives the OAuth keep-alive). The heartbeat names them as "ali/<identity>".
+ */
+export const GATEWAY_SESSION_TOOLS = ["ali"] as const;
+
+/** Live (not retired) ali logins in the registry. An unreadable registry is no logins. */
+export async function listAliAccounts(registryPath: string = ALI_CONFIG.identitiesJsonPath): Promise<Identity[]> {
+  try {
+    return (await loadIdentitiesFile(registryPath)).identities.filter((i) => !isRetired(i));
+  } catch {
+    return [];
+  }
+}
 
 /** True for a tool whose logins the gateway owns: one the gateway serves and can refresh. Anything else is never claimed. */
 export function isGatewayServedTool(tool: string): tool is GatewayRefreshTool {
@@ -65,6 +80,11 @@ export async function listGatewayManagedAccounts(registryPath?: string, tool: st
  * codex, grok and kimi also need a fresh gateway heartbeat naming the login (see gateway-heartbeat.ts). Unreadable registry or unserved tool: not managed.
  */
 export async function isGatewayManagedHere(tool: string, identityName: string, registryPath?: string): Promise<boolean> {
+  if ((GATEWAY_SESSION_TOOLS as readonly string[]).includes(tool)) {
+    // A session tool is the gateway's only while a fresh heartbeat names it, so a stopped gateway hands it back at once.
+    if (isGatewayOwnerProcess() || !(await heartbeatHolds(tool, identityName))) return false;
+    return (await listAliAccounts(registryPath)).some((i) => i.name === identityName);
+  }
   if (!isGatewayServedTool(tool) || isGatewayOwnerProcess()) return false;
   if (tool !== "claude" && !(await heartbeatHolds(tool, identityName))) return false; // no live gateway has said it holds this login: refresh as before
   return (await listGatewayManagedAccounts(registryPath, tool)).some((i) => i.name === identityName);

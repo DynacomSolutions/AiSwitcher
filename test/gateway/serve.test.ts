@@ -1,3 +1,4 @@
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -841,6 +842,39 @@ describe("ali session ownership", () => {
     });
     await waitFor(() => renewed.has("personal"));
     await g.stop();
+  });
+});
+
+describe("ali ownership and shutdown", () => {
+  const member = (name: string) => ({ name, label: name, configDir: `/x/${name}` }) as never;
+
+  test("the heartbeat names the ali logins the gateway renews", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hb-"));
+    const prev = process.env.AIS_GATEWAY_HEARTBEAT;
+    process.env.AIS_GATEWAY_HEARTBEAT = join(dir, "hb.json");
+    try {
+      const g = await boot({ noHeartbeat: false, keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => "p", aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true } });
+      await waitFor(async () => (await Bun.file(join(dir, "hb.json")).exists()) && Object.hasOwn(((await Bun.file(join(dir, "hb.json")).json()) as { held: object }).held, "ali/personal"));
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
+      else process.env.AIS_GATEWAY_HEARTBEAT = prev;
+    }
+  });
+
+  test("a missing kubectl is alerted once at startup", async () => {
+    const g = await boot({ aliAccounts: async () => [member("personal")], aliSetup: { which: () => null, writable: async () => true } });
+    await waitFor(() => alerts.some((a) => a.kind === "ali-setup-missing"));
+    await g.stop();
+  });
+
+  test("stop() does not wait for a browser renewal that never finishes", async () => {
+    let started = false;
+    const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async () => [], stopCeilingMs: 500, aliAccounts: async () => [member("personal")], aliRefresh: () => ((started = true), new Promise<string>(() => {})), aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true } });
+    await waitFor(() => started);
+    const t0 = Date.now();
+    await g.stop();
+    expect(Date.now() - t0).toBeLessThan(2000);
   });
 });
 

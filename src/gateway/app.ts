@@ -13,7 +13,7 @@ import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
-import { routeFor, serveRoute } from "./routes.ts";
+import { isClaudeApiPath, routeFor, serveRoute, SIDE_ROUTE_COST_TOKENS, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
@@ -375,10 +375,11 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const log = deps.log ?? defaultLog;
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
+  const resetCredits: ResetCreditsCache = {};
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, resetCredits).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -388,7 +389,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -494,15 +495,35 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   async function run(): Promise<Response> {
   if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
   const route = routeFor(app.provider, style, req.method, rest);
+  // Claude's /api/* paths carry account data: only the ones the gateway serves itself are reachable, however the path is spelled.
+  if (app.provider === "claude" && route?.kind !== "serve" && isClaudeApiPath(rest)) return reject(403, "this path is not available through the gateway");
+  /** A list, search or speech call is not a model call: no model allowlist, and its upstream errors never touch logins or the pool. */
+  const side = route?.kind === "upstream" && route.side;
+  /** A call with no token usage still counts a fixed cost toward the daily cap. */
+  const withSideCost = (c: UsageCounts | undefined): UsageCounts | undefined => {
+    if (!side && route?.kind !== "serve") return c;
+    const total = c ? c.inputTokens + c.outputTokens + c.cacheReadTokens + c.cacheWriteTokens : 0;
+    return total > 0 ? c : { ...(c ?? { outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }), inputTokens: SIDE_ROUTE_COST_TOKENS };
+  };
   if (route?.kind === "serve") {
-    // Answered from the gateway's own pool state: no upstream call, no body, no account detail.
-    const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal });
+    // Answered from the gateway's own pool state: no upstream call, no body, no account detail. The daily cap still applies.
+    if (app.dailyTokens !== undefined) {
+      let usedNow = 0;
+      try {
+        usedNow = await deps.store.usageSince(app.name, dayStartIct(deps.now()));
+      } catch {
+        deps.metrics.failOpen(app.name, "cap_check_failed");
+      }
+      if (usedNow >= app.dailyTokens) {
+        deps.metrics.rejection(app.name, "daily_cap");
+        return reject(429, "daily token cap reached", identityForRow, undefined, "daily_cap");
+      }
+    }
+    const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal, cache: resetCredits });
     req.signal.removeEventListener("abort", onAbort);
-    record(identityForRow, served.status >= 400 ? "rejected" : "ok", served.status, undefined, false);
+    record(identityForRow, served.status >= 400 ? "rejected" : "ok", served.status, withSideCost(undefined), false);
     return served;
   }
-  /** A list, search or speech call is not a model call: the app's model allowlist does not apply to it. */
-  const notModelCall = route?.kind === "upstream" && route.anyModel;
   let body: Body;
   try {
     // Reserve the declared size first; a request that does not fit waits without reading its body.
@@ -526,7 +547,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     return reject(400, "request body could not be read");
   }
   model = requestModel(body);
-  if (!notModelCall && app.models && app.models.length > 0 && body.kind === "stream") {
+  if (!side && app.models && app.models.length > 0 && body.kind === "stream") {
     deps.metrics.rejection(app.name, "model");
     return reject(413, "request too large to verify the model allowlist", identityForRow, model);
   }
@@ -539,7 +560,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       deps.metrics.failOpen(app.name, "cap_check_failed");
     }
   }
-  const caps = checkCaps(notModelCall ? { ...app, models: undefined } : app, model, used);
+  const caps = checkCaps(side ? { ...app, models: undefined } : app, model, used);
   if (!("ok" in caps)) {
     deps.metrics.rejection(app.name, caps.status === 403 ? "model" : "daily_cap");
   }
@@ -670,7 +691,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const attempt = async (ident: string): Promise<Response> => {
     let cred = await deps.creds.get(app.provider, ident);
     let res = await send(cred);
-    if (res.status === 401 && adapter.refreshable) {
+    if (res.status === 401 && adapter.refreshable && !side) {
       try {
         cred = await deps.creds.refreshAfter401(app.provider, ident, cred.accessToken);
       } catch (err) {
@@ -696,6 +717,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   /** 429 is quota or rate limit. 402 is a payment-required signal some providers use for exhausted credit. A 403 counts only when its (bounded) JSON body names a quota error type or code. */
   const isQuota = async (res: Response): Promise<{ quota: boolean; res: Response }> => {
+    if (side) return { quota: false, res }; // a side route's 402/403/429 is its own, not a sign this login is out of quota
     if (res.status === 402) return { quota: true, res };
     if (res.status === 429) {
       // Only Codex states exhaustion in the body (the (bounded) peek); elsewhere the headers decide and the body is not read.
@@ -812,7 +834,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   const finish = (status: string): void => {
     req.signal.removeEventListener("abort", onAbort);
     const counts = tap.result();
-    record(identity, status, httpStatus, counts, tap.isSse(), tap.status(), model);
+    record(identity, status, httpStatus, withSideCost(counts), tap.isSse(), tap.status(), model);
   };
 
   if (!up.body) {
@@ -939,6 +961,7 @@ export function exhaustedUntil(headers: Headers, nowMs: number): number {
  * `[/v1]/models/<id>` route (model ids such as `org/model`). The id is split on `%2F` and no piece may be empty, `.` or `..`.
  */
 function pathAllowed(rest: string, style: ApiStyle): boolean {
+  if (rest.includes("//")) return false; // an empty segment: some upstreams collapse it, which would dodge exact-path rules
   const m = style === "openai" ? /^(?:\/v1)?\/models\/([^/]+)$/.exec(rest) : null;
   if (m) {
     const id = m[1] as string;

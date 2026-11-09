@@ -8,7 +8,7 @@ import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
-import { aliSessionOnce } from "./ali-session.ts";
+import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
 import { createAdminApp, type IdentityState } from "./admin.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
 import { createGatewayApp, markGatewayResponse, styleForPath, type GatewayDeps } from "./app.ts";
@@ -73,6 +73,10 @@ export interface GatewayHooks {
   /** The ali logins whose console session the gateway renews, and how (tests replace both). */
   aliAccounts?(): Promise<Identity[]>;
   aliRefresh?(identity: Identity): Promise<string>;
+  /** Replaces the startup check that the pod can renew ali sessions (kubectl, port-forward, directories). */
+  aliSetup?: AliSetupDeps;
+  /** Longest stop() waits for the keep-alive pass (ali renewals are abandoned at once on drain). Default 10 s, well inside the 30 s grace. */
+  stopCeilingMs?: number;
   /** Tests: do not read or write the shared gateway heartbeat file. */
   noHeartbeat?: boolean;
   overlapMs?: number;
@@ -462,6 +466,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         store.startRefresh(hooks.refreshIntervalMs ?? 15_000);
         console.info("gateway: warm, ready for traffic");
         void probeIdentities().catch(() => undefined);
+        if (aliList) void aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).catch(() => undefined);
         return;
       } catch (err) {
         console.warn(`gateway: warm-up failed at ${stage} (${describe(err)}); retrying in ${delay} ms`);
@@ -532,12 +537,31 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   }
   let keepAliveRunning = false;
   let keepAliveRun: Promise<void> | undefined;
+  const aliAbort = new AbortController();
+  const aliSkips = new Map<string, number>();
+  // Tests (noHeartbeat) never touch the real registry or auth browser unless they inject an ali source.
+  const aliList = hooks.aliAccounts ?? (hooks.noHeartbeat ? undefined : listAliAccounts);
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
     keepAliveRunning = true;
-    keepAliveRun = keepAliveOnce({ refresh: refreshLogin, accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)), tools: GATEWAY_REFRESH_TOOLS, lastSuccess: lastSuccessAt, now, mintedAt: grantMintedAt, onPass: hooks.noHeartbeat ? undefined : (held, at) => trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held }), metrics, revoked: revokedGrants })
-      // Tests (noHeartbeat) never touch the real registry or auth browser unless they inject an ali source.
-      .then(() => (hooks.noHeartbeat && !hooks.aliAccounts ? undefined : aliSessionOnce({ ...(hooks.aliAccounts ? { accounts: hooks.aliAccounts } : {}), ...(hooks.aliRefresh ? { refresh: hooks.aliRefresh } : {}), metrics, alerter, lastSuccess: lastSuccessAt, now })))
+    keepAliveRun = keepAliveOnce({
+      refresh: refreshLogin,
+      accounts: hooks.keepAliveAccounts ?? ((tool) => listGatewayManagedAccounts(undefined, tool)),
+      tools: GATEWAY_REFRESH_TOOLS,
+      lastSuccess: lastSuccessAt,
+      now,
+      mintedAt: grantMintedAt,
+      // The heartbeat also names the ali logins this gateway renews, so the host timer, the daemon and the CLI stand down.
+      onPass: hooks.noHeartbeat
+        ? undefined
+        : async (held, at) => {
+            for (const a of (await aliList?.().catch(() => [] as Identity[])) ?? []) held[`ali/${a.name}`] = lastSuccessAt.get(`ali/${a.name}`) ? { lastSuccessAt: lastSuccessAt.get(`ali/${a.name}`) as string } : {};
+            await trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held });
+          },
+      metrics,
+      revoked: revokedGrants,
+    })
+      .then(() => (aliList ? aliSessionOnce({ accounts: aliList, ...(hooks.aliRefresh ? { refresh: hooks.aliRefresh } : {}), metrics, alerter, lastSuccess: lastSuccessAt, now, signal: aliAbort.signal, loginPageSkips: aliSkips }) : undefined))
       .finally(() => {
         keepAliveRunning = false;
       });
@@ -570,7 +594,10 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       // Bun's stop(false) refuses new connections and resolves once active requests are done.
       await Promise.all([server.stop(false), adminServer.stop(false)]);
       // Refreshes and the keep-alive in flight finish (or fail) before the backend that guards them goes away.
-      await Promise.allSettled([...inflightRefreshes, keepAliveRun]);
+      // A browser renewal is abandoned at once and the pass given a short ceiling, so the ledger below is always flushed inside the grace period.
+      aliAbort.abort();
+      await Promise.allSettled([...inflightRefreshes]);
+      await Promise.race([Promise.allSettled([keepAliveRun]), new Promise<void>((r) => setTimeout(r, hooks.stopCeilingMs ?? 10_000).unref?.())]);
       await ledger.close();
       await inner.close?.();
       await refreshBackend.close?.();

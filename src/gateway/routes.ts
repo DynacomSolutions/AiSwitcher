@@ -12,8 +12,10 @@ import type { ApiStyle, GatewayApp, GatewayProvider } from "./types.ts";
  * Routes that are not a plain "app prefix, then the same path on the provider" pass-through.
  *
  * - `upstream`: the request is forwarded (same credential, pool, failover, ledger and metrics as a chat call) but to a
- *   different provider URL than the pass-through would build. `anyModel` marks a call that is not a model call, so an
- *   app's model allowlist does not apply to it (the daily token cap still does).
+ *   different provider URL than the pass-through would build. `side` marks a call that is not a model call: an
+ *   app's model allowlist does not apply to it, and its 401/429/402/403 answers are passed through untouched (no forced login
+ *   refresh, no pool hold or failover), so an unverified side route can never disable a login chat calls depend on. The
+ *   daily cap still applies and a request with no token usage costs SIDE_ROUTE_COST_TOKENS.
  * - `serve`: the gateway answers itself from its own pool state. No account token and no account identity leaves the gateway.
  *
  * Sources for the provider paths:
@@ -29,10 +31,38 @@ import type { ApiStyle, GatewayApp, GatewayProvider } from "./types.ts";
  *   codex binary; its summary carries `available_count`.
  */
 export type Route =
-  | { kind: "upstream"; url: string; anyModel: boolean }
+  | { kind: "upstream"; url: string; side: boolean }
   | { kind: "serve"; name: ServedName };
 
 export type ServedName = "claude-usage" | "claude-profile" | "codex-reset-credits" | "codex-reset-consume" | "ali-models";
+
+/** What a side or served request with no token usage counts toward an app's daily cap. */
+export const SIDE_ROUTE_COST_TOKENS = 1_000;
+
+/** How long a codex reset-credit total is reused for one app. */
+export const RESET_CREDITS_TTL_MS = 60_000;
+const RESET_CREDITS_FAILURE_TTL_MS = 15_000;
+
+/**
+ * True for a claude path under `/api` however it is spelled (case, percent-encoding, repeated decoding). Claude's `/api/*`
+ * paths carry account data (`/api/oauth/profile`, `/api/oauth/account`, ...): the gateway serves the ones it chooses itself
+ * and refuses the rest, so no pool member's account detail can be read through an app key.
+ */
+export function isClaudeApiPath(rest: string): boolean {
+  let p = rest;
+  for (let i = 0; i < 4; i++) {
+    if (/^\/api(?:[/;?#]|$)/i.test(p)) return true;
+    let next: string;
+    try {
+      next = decodeURIComponent(p);
+    } catch {
+      return true; // undecodable: cannot be shown safe
+    }
+    if (next === p) break;
+    p = next;
+  }
+  return /^\/api(?:[/;?#]|$)/i.test(p);
+}
 
 const CODEX_BACKEND = "https://chatgpt.com/backend-api";
 const KIMI_V1 = `${KIMI_ANTHROPIC_BASE}/v1`;
@@ -41,12 +71,12 @@ const KIMI_V1 = `${KIMI_ANTHROPIC_BASE}/v1`;
 function modelsRoute(provider: GatewayProvider, style: ApiStyle, id: string): Route | undefined {
   switch (provider) {
     case "claude":
-      return { kind: "upstream", url: `${adapterFor("claude").upstreamBase(style)}/v1/models${id}`, anyModel: true };
+      return { kind: "upstream", url: `${adapterFor("claude").upstreamBase(style)}/v1/models${id}`, side: true };
     case "codex":
       // The Codex backend lists models only as a collection.
-      return id === "" ? { kind: "upstream", url: `${CODEX_UPSTREAM_BASE}/models`, anyModel: true } : undefined;
+      return id === "" ? { kind: "upstream", url: `${CODEX_UPSTREAM_BASE}/models`, side: true } : undefined;
     case "kimi":
-      return { kind: "upstream", url: `${KIMI_V1}/models${id}`, anyModel: true };
+      return { kind: "upstream", url: `${KIMI_V1}/models${id}`, side: true };
     case "ali":
       return id === "" ? { kind: "serve", name: "ali-models" } : undefined;
     case "zai":
@@ -54,7 +84,7 @@ function modelsRoute(provider: GatewayProvider, style: ApiStyle, id: string): Ro
     case "opencode": {
       const base = adapterFor(provider).upstreamBase(style);
       // An Anthropic-style base has no /v1 of its own; an OpenAI-style one does (or is versioned, as zai's /v4).
-      return { kind: "upstream", url: `${base}${style === "anthropic" ? "/v1" : ""}/models${id}`, anyModel: true };
+      return { kind: "upstream", url: `${base}${style === "anthropic" ? "/v1" : ""}/models${id}`, side: true };
     }
   }
 }
@@ -73,10 +103,10 @@ export function routeFor(provider: GatewayProvider, style: ApiStyle, method: str
   if (m === "POST") {
     if (provider === "kimi") {
       const k = /^(?:\/v1)?\/(search|fetch)$/.exec(path);
-      if (k) return { kind: "upstream", url: `${KIMI_V1}/${k[1]}`, anyModel: true };
+      if (k) return { kind: "upstream", url: `${KIMI_V1}/${k[1]}`, side: true };
     }
     if (provider === "codex") {
-      if (/^(?:\/v1)?\/audio\/transcriptions$|^\/transcribe$/.test(path)) return { kind: "upstream", url: `${CODEX_BACKEND}/transcribe`, anyModel: true };
+      if (/^(?:\/v1)?\/audio\/transcriptions$|^\/transcribe$/.test(path)) return { kind: "upstream", url: `${CODEX_BACKEND}/transcribe`, side: true };
       if (/^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits\/consume$/.test(path)) return { kind: "serve", name: "codex-reset-consume" };
     }
   }
@@ -85,8 +115,14 @@ export function routeFor(provider: GatewayProvider, style: ApiStyle, method: str
 
 const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+export interface ResetCreditsCache {
+  [app: string]: { until: number; status: number; body: string } | undefined;
+}
+
 export interface ServeContext {
   app: GatewayApp;
+  /** Per-app memory of the last reset-credit answer (owned by the gateway app). */
+  cache: ResetCreditsCache;
   style: ApiStyle;
   deps: GatewayDeps;
   signal: AbortSignal;
@@ -135,8 +171,19 @@ function availableCount(body: unknown): number | undefined {
   return typeof n === "number" && Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
 }
 
-/** Sums the unspent reset credits over the members the app may use. Each is read by the gateway with its own login; only the total is returned. */
+/** Reset credits, remembered per app for RESET_CREDITS_TTL_MS so an app polling it cannot drive one upstream call per member per poll. */
 async function codexResetCredits(ctx: ServeContext): Promise<Response> {
+  const nowMs = ctx.deps.now().getTime();
+  const hit = ctx.cache[ctx.app.name];
+  if (hit && hit.until > nowMs) return new Response(hit.body, { status: hit.status, headers: { "content-type": "application/json" } });
+  const res = await readResetCredits(ctx);
+  const body = await res.clone().text();
+  ctx.cache[ctx.app.name] = { until: nowMs + (res.ok ? RESET_CREDITS_TTL_MS : RESET_CREDITS_FAILURE_TTL_MS), status: res.status, body };
+  return res;
+}
+
+/** Sums the unspent reset credits over the members the app may use. Each is read by the gateway with its own login; only the total is returned. */
+async function readResetCredits(ctx: ServeContext): Promise<Response> {
   const adapter = adapterFor("codex");
   let names: string[];
   try {

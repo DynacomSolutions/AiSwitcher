@@ -16,6 +16,7 @@ import {
   authBrowserPorts,
   installAliAuthRefreshTimer,
   refreshAliAuthSession,
+  standDownToGateway,
   startAliAuthSession,
 } from "../../identities/auth-session.ts";
 import { runPiAuthImport } from "./pi-import.ts";
@@ -91,6 +92,11 @@ async function runAuthRefresh(rest: string[], flags: ParsedArgs["flags"]): Promi
   const tool = stringFlag(flags, "tool") ?? "ali";
   if (tool === "ali") {
     const identity = await resolveAliIdentity(rest, flags);
+    // The gateway renews this login while its heartbeat names it; --force renews anyway.
+    if (!boolFlag(flags, "force") && (await standDownToGateway(identity.name))) {
+      if (!boolFlag(flags, "quiet")) console.log(`Alibaba session for ${identity.name} is renewed by the gateway; the host timer was removed (use --force to renew here anyway).`);
+      return;
+    }
     try {
       const path = await refreshAliAuthSession(identity);
       if (!boolFlag(flags, "quiet")) {

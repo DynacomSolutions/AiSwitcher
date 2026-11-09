@@ -3,6 +3,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Identity } from "./types.ts";
 import { expandPath } from "./match.ts";
+import { isGatewayManagedHere } from "./gateway-managed.ts";
+import { acquire, type HeldLock } from "./claude-swap-lock.ts";
 import { authBrowserConfigFor, ensureAuthBrowserPorts, readAuthVncPassword, getAuthBrowserNamespace } from "./auth-browser.ts";
 
 const AUTH_STATE_DIR = join(homedir(), ".ais", "auth-browser");
@@ -15,6 +17,8 @@ interface AuthSessionState {
   novncPort: number;
   sessionId: string;
   updatedAt: string;
+  /** True while AIS itself has the shared tab on the Alibaba account login page (to harvest cookies); cleared on its way back. */
+  selfNav?: boolean;
 }
 
 interface WebDriverResponse {
@@ -176,6 +180,7 @@ export interface AuthLoginInfo {
 export async function startAliAuthSession(identity: Identity): Promise<AuthLoginInfo | undefined> {
   const state = await ensureSession(identity.name, true);
   if (!state) return undefined;
+  await clearSelfNav(identity.name).catch(() => undefined); // a person is about to sign in on this tab
   return {
     state,
     vncPassword: await readAuthVncPassword(identity.name),
@@ -198,12 +203,16 @@ async function serverHostname(): Promise<string> {
  * (never returned as `undefined`) so every caller (the daemon scheduler, the
  * systemd timer's `ais auth refresh`, POST /api/auth/refresh) records and
  * shows the same precise message instead of a vague "not authenticated". */
+export type AliAuthRefreshCode = "browser-unreachable" | "harvest-failed" | "not-signed-in" | "login-in-progress" | "busy" | "other";
+
 export class AliAuthRefreshError extends Error {
   constructor(
     message: string,
     /** One concrete command/URL the user can act on; surfaced alongside the
      * message by the CLI, the scheduler's lastError, and `ais doctor`. */
     readonly hint?: string,
+    /** Stable reason, so a caller (the gateway) can word its own fix. */
+    readonly code: AliAuthRefreshCode = "other",
   ) {
     super(message);
     this.name = "AliAuthRefreshError";
@@ -228,26 +237,95 @@ export function hasAliLoginCookie(cookies: Iterable<{ name?: string } | string>)
   return false;
 }
 
-export async function refreshAliAuthSession(identity: Identity): Promise<string> {
+/** Alibaba sign-in pages (account, passport, sso, signin). The console itself is not one. */
+export function isAliLoginUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (!/(^|\.)(alibabacloud|aliyun)\.com$/i.test(u.hostname)) return false;
+    return /login|signin|passport|sso/i.test(u.hostname.split(".")[0] ?? "") || /\/(login|signin|passport|sso)/i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** True when a person is on a sign-in page of the shared tab: AIS only stands on one itself while it harvests (`selfNav`). */
+export function humanLoginInProgress(url: unknown, selfNav: boolean | undefined): boolean {
+  return typeof url === "string" && isAliLoginUrl(url) && selfNav !== true;
+}
+
+/** The shared Chrome tab is one resource: renewals (gateway, daemon, CLI) take turns. */
+export async function withAliBrowserLock<T>(fn: () => Promise<T>, lockPath: string = join(AUTH_STATE_DIR, "browser.lock")): Promise<T> {
+  await mkdir(AUTH_STATE_DIR, { recursive: true, mode: 0o700 }).catch(() => undefined);
+  let held: HeldLock;
+  try {
+    held = await acquire(lockPath, { timeoutMs: 60_000, staleMs: 180_000, updateMs: 10_000 });
+  } catch (err) {
+    throw new AliAuthRefreshError(`another renewal holds the shared auth browser (${errorText(err).replace(/ \S*\.lock /, " ")})`, "retry shortly", "busy");
+  }
+  try {
+    return await fn();
+  } finally {
+    await held.release();
+  }
+}
+
+/** AIS no longer stands on the sign-in page itself: from here a sign-in page on the tab is a person's. */
+async function clearSelfNav(identityName: string): Promise<void> {
+  const st = await readState(identityName);
+  if (st?.selfNav) await writeState({ ...st, selfNav: false });
+}
+
+export function refreshAliAuthSession(identity: Identity): Promise<string> {
+  return withAliBrowserLock(async () => {
+    try {
+      return await refreshAliAuthSessionLocked(identity);
+    } finally {
+      await clearSelfNav(identity.name).catch(() => undefined);
+    }
+  });
+}
+
+async function refreshAliAuthSessionLocked(identity: Identity): Promise<string> {
   let state: AuthSessionState | undefined;
   try {
-    // openDashboard=true is the self-heal: a pod restart (observed live
+    // Opened without navigating: a person may be signing in on this tab right now. The dashboard visit below is the self-heal: a pod restart (observed live
     // 2026-09-03/07) or a closed tab leaves the auth browser on about:blank,
     // and the old starting-URL precondition then failed EVERY future refresh
     // until a human happened to look. Navigating to the console first
     // recovers the harvest with no human action.
-    state = await ensureSession(identity.name, true);
+    state = await ensureSession(identity.name, false);
   } catch (err) {
     throw new AliAuthRefreshError(
       `could not reach the auth browser for "${identity.name}": ${errorText(err)}`,
       "check the chrome-auth deployment and its kubectl port-forward (ais auth ports --tool=ali --identity=" + identity.name + ")",
+      "browser-unreachable",
     );
   }
   if (!state) {
     throw new AliAuthRefreshError(
       `auth browser for "${identity.name}" is unreachable (chrome-auth deployment or its port-forward is down)`,
       "start it with 'ais auth login " + identity.name + " --tool=ali' (prints the noVNC URL), or inspect 'kubectl -n " + getAuthBrowserNamespace() + " get pods'",
+      "browser-unreachable",
     );
+  }
+  // Never navigate away from a sign-in page a person is using (the tab is shared with `ais auth login`).
+  let here: unknown;
+  try {
+    here = (await webdriverRequest(state.webdriverPort, `/session/${encodeURIComponent(state.sessionId)}/url`)).payload?.value;
+  } catch {
+    here = undefined;
+  }
+  if (humanLoginInProgress(here, state.selfNav)) {
+    throw new AliAuthRefreshError(
+      `someone is signing in to Alibaba in the auth browser for "${identity.name}"; renewal skipped so it does not interrupt the login`,
+      "finish the sign-in; the next renewal continues by itself",
+      "login-in-progress",
+    );
+  }
+  try {
+    await navigateDashboard(state);
+  } catch (err) {
+    throw new AliAuthRefreshError(`could not open the Alibaba console in the auth browser: ${errorText(err)}`, undefined, "browser-unreachable");
   }
   const cookieByName = new Map<string, string>();
   // WebDriver exposes cookies applicable to the current document domain. The
@@ -255,6 +333,11 @@ export async function refreshAliAuthSession(identity: Identity): Promise<string>
   // both domains and return to the console afterwards.
   for (const page of [ALI_CONSOLE_URL, "https://account.alibabacloud.com/login/login.htm"]) {
     try {
+      if (page !== ALI_CONSOLE_URL) {
+        // AIS itself stands on the sign-in page for a moment: say so, so a crash here is not mistaken for a person.
+        state.selfNav = true;
+        await writeState(state);
+      }
       await navigate(state, page);
       const cookies = await webdriverRequest(state.webdriverPort, `/session/${encodeURIComponent(state.sessionId)}/cookie`);
       for (const cookie of (cookies.payload?.value as { name?: string; value?: string; domain?: string }[] | undefined) ?? []) {
@@ -266,6 +349,7 @@ export async function refreshAliAuthSession(identity: Identity): Promise<string>
       throw new AliAuthRefreshError(
         `cookie harvest from the auth browser failed: ${errorText(err)}`,
         "retry once; if it persists, restart the chrome-auth browser and re-login over noVNC",
+        "harvest-failed",
       );
     }
   }
@@ -277,8 +361,11 @@ export async function refreshAliAuthSession(identity: Identity): Promise<string>
     throw new AliAuthRefreshError(
       `the auth browser for "${identity.name}" is not signed in to the Alibaba console (no login-ticket cookie after opening the console page)`,
       `re-login once: run 'ais auth login ${identity.name} --tool=ali' and complete Alibaba sign-in/MFA over the printed noVNC URL; the scheduled refresh keeps that session alive afterwards`,
+      "not-signed-in",
     );
   }
+  state.selfNav = false;
+  await writeState(state).catch(() => undefined);
   try {
     await navigateDashboard(state);
   } catch (err) {
@@ -348,6 +435,17 @@ export async function removeAliAuthRefreshTimer(
   } catch {
     return false;
   }
+}
+
+/**
+ * The gateway renews ali sessions itself while a fresh heartbeat names the login. In that case the host timer, the console daemon
+ * and `ais auth refresh` have nothing to do: this removes the host's systemd timer (it would only keep waking up) and says so.
+ * Returns true when the caller must not renew.
+ */
+export async function standDownToGateway(identityName: string, deps: { managed?: (name: string) => Promise<boolean>; removeTimer?: (name: string) => Promise<boolean> } = {}): Promise<boolean> {
+  if (!(await (deps.managed ?? ((n) => isGatewayManagedHere("ali", n)))(identityName))) return false;
+  await (deps.removeTimer ?? ((n) => removeAliAuthRefreshTimer(n)))(identityName).catch(() => false);
+  return true;
 }
 
 export function authDashboardUrl(): string {

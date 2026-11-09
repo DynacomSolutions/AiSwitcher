@@ -172,10 +172,23 @@ speech call is not a model call); the daily token cap does.
   `GET /api/oauth/profile` (the app name only); codex
   `GET /rate-limit-reset-credits` (also under `/api/codex` and `/wham`), which is
   the total over the pool's members, and `POST .../consume`, which is refused.
-- **ali login**: the gateway renews the Alibaba console session of every live ali
-  identity on its keep-alive timer (`src/gateway/ali-session.ts`, counted as
-  `ais_gateway_keepalive_total{provider="ali"}`, failures alert). The host timer
-  `ais-ali-auth-refresh-<identity>` is no longer needed once a gateway runs.
+- **Side routes** (lists, search, fetch, speech) pass the provider's 401/402/403/429 straight to the app: no login
+  refresh, no pool hold, no failover. Each counts 1,000 tokens toward the app's daily cap when the answer reports no usage;
+  so do the served routes. Codex reset credits are cached 60 s per app. Claude `/api/*` paths other than the two served ones
+  are refused (403), however spelled; `//` in any app path is refused (400).
+
+### ali login ownership
+
+The gateway renews the Alibaba console session of every live ali identity on its keep-alive timer
+(`src/gateway/ali-session.ts`, `ais_gateway_keepalive_total{provider="ali"}`; failures raise an owner alert). The heartbeat
+names them as `ali/<identity>`; while it is fresh, the console daemon, the host timer `ais-ali-auth-refresh-<identity>` and
+`ais auth refresh --tool=ali` stand down (the CLI and daemon remove the host timer; `--force` renews anyway). Renewals take a
+lock on the shared Chrome tab and never navigate away from a sign-in page a person is using. On shutdown a renewal in
+flight is abandoned and `stop()` waits at most 10 s for the pass.
+
+What the gateway pod needs for this, checked once at startup (alert `ali-setup-missing` lists what is absent):
+`kubectl` on the PATH; `AIS_K8S_API_SERVER` set to the in-cluster API address (no systemd in a pod); the permission
+`create pods/portforward` in the chrome-auth namespace; writable `~/.ais/auth-browser` and each ali identity directory.
 
 The live proof lives in `test/gateway-e2e/` (one script per provider using the
 unmodified official SDK, configured with `AIS_GATEWAY_URL` and `AIS_GATEWAY_TOKEN`
