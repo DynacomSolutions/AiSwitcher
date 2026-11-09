@@ -44,11 +44,16 @@ export interface GatewayDeps {
   bodyBudgetBytes?: number;
   /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else 5000. */
   sideDailyLimit?: number;
+  /** Longest a side-count database call may take before the replica counts from memory (default 5 s). */
+  sideCountTimeoutMs?: number;
   /** Told after each side-count store call whether it worked (the server turns a failure into an owner alert). */
   sideCountHealth?(ok: boolean): void;
   /** Waits `ms` or until `signal` aborts; tests inject a fake clock. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
+
+/** Side-count database calls in flight at once, per gateway app; the rest are counted in memory. */
+const SIDE_COUNT_MAX_INFLIGHT = 4;
 
 /** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
 export const BODY_BUDGET_BYTES = 512 * 1024 * 1024;
@@ -387,11 +392,12 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
   const resetCredits: ResetCreditsCache = {};
+  const sideInflight = { n: 0 };
   const sideCounts = new Map<string, number>(); // fallback only, while the store is down
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts, sideInflight).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -401,7 +407,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideInflight: { n: number }): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -519,13 +525,26 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    */
   if (side || route?.kind === "serve") {
     const day = new Date(dayStartIct(deps.now()).getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
-    let n: number;
-    try {
-      n = await bounded(deps.store.bumpSideCount(app.name, day), 5_000, "side count");
-      deps.sideCountHealth?.(true);
-    } catch {
+    let n: number | undefined;
+    // At most SIDE_COUNT_MAX_INFLIGHT store calls at once: when the database is slow the rest go straight to memory instead of queueing behind it.
+    if (sideInflight.n < SIDE_COUNT_MAX_INFLIGHT) {
+      sideInflight.n += 1;
+      const abort = new AbortController();
+      const query = deps.store.bumpSideCount(app.name, day, abort.signal);
+      // A write that lands after the timeout is not used: the request was already counted from memory.
+      query.then(() => void (sideInflight.n -= 1), () => void (sideInflight.n -= 1));
+      try {
+        n = await bounded(query, deps.sideCountTimeoutMs ?? 5_000, "side count");
+        deps.sideCountHealth?.(true);
+      } catch {
+        abort.abort();
+        n = undefined;
+      }
+    }
+    if (n === undefined) {
       deps.metrics.failOpen(app.name, "side_count_failed");
       deps.sideCountHealth?.(false);
+      for (const k of [...sideCounts.keys()]) if (!k.endsWith(`\u0000${day}`)) sideCounts.delete(k); // past days
       const key = `${app.name}\u0000${day}`;
       n = (sideCounts.get(key) ?? 0) + 1;
       sideCounts.set(key, n);

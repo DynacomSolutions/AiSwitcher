@@ -10,18 +10,49 @@ export function publicHostsFromEnv(env: Record<string, string | undefined> = pro
   return list.length > 0 ? list : DEFAULT_PUBLIC_HOSTS;
 }
 
-const hostOnly = (value: string | null): string => {
-  const first = (value ?? "").split(",")[0]?.trim().toLowerCase() ?? "";
-  return first.replace(/:\d+$/, "").replace(/\.$/, "");
-};
+const hostOnly = (value: string): string => value.trim().toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
 
-/** Metrics, health, readiness and browser pairing are for the cluster, never for a public host. */
-export function isOperationalPath(path: string): boolean {
-  return path === "/metrics" || path === "/healthz" || path === "/readyz" || path === "/browser/pair" || path.startsWith("/browser/pair/");
+/** Every comma-separated value of a header, as bare host names. */
+const hostsIn = (value: string | null): string[] => (value ?? "").split(",").map(hostOnly).filter(Boolean);
+
+/** `host=` parameters of a Forwarded header (RFC 7239). */
+const forwardedHosts = (value: string | null): string[] => [...(value ?? "").matchAll(/host="?([^;,"\s]+)/gi)].map((m) => hostOnly(m[1] ?? "")).filter(Boolean);
+
+/**
+ * The path as the router will see it: repeated slashes collapsed, percent-encoding decoded (repeatedly), lower-cased, trailing slash
+ * dropped. An undecodable path comes back as undefined (it cannot be shown to be harmless).
+ */
+export function normalisePath(path: string): string | undefined {
+  let p = path;
+  for (let i = 0; i < 4; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(p);
+    } catch {
+      return undefined;
+    }
+    if (next === p) break;
+    p = next;
+  }
+  p = p.replace(/\/{2,}/g, "/").toLowerCase();
+  return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
 }
 
-/** True when the request arrived under one of the public host names (Host, or X-Forwarded-Host set by a proxy). */
+/** Metrics, health, readiness and browser pairing are for the cluster, never for a public host. Spelling tricks do not hide them. */
+export function isOperationalPath(path: string): boolean {
+  const p = normalisePath(path);
+  if (p === undefined) return true;
+  return p === "/metrics" || p === "/healthz" || p === "/readyz" || p === "/browser/pair" || p.startsWith("/browser/pair/");
+}
+
+/** True when the request arrived under one of the public host names (Host, any X-Forwarded-Host value, or a Forwarded host=). */
 export function viaPublicHost(headers: Headers, url: string, publicHosts: string[]): boolean {
-  const names = [hostOnly(headers.get("host")), hostOnly(headers.get("x-forwarded-host")), (() => { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } })()];
+  let fromUrl = "";
+  try {
+    fromUrl = new URL(url).hostname.toLowerCase();
+  } catch {
+    // no usable URL host
+  }
+  const names = [...hostsIn(headers.get("host")), ...hostsIn(headers.get("x-forwarded-host")), ...forwardedHosts(headers.get("forwarded")), fromUrl];
   return names.some((n) => n !== "" && publicHosts.includes(n));
 }

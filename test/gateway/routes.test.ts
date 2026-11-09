@@ -394,6 +394,24 @@ describe("daily limits", () => {
     expect(failures).toContain("side_count_failed");
   });
 
+  test("a slow database is cancelled on timeout and never has more than four calls in flight", async () => {
+    await addApp("k", "kimi", "openai");
+    deps.sideCountTimeoutMs = 150;
+    let calls = 0;
+    const signals: AbortSignal[] = [];
+    store.bumpSideCount = (_a, _d, signal) => {
+      calls += 1;
+      if (signal) signals.push(signal);
+      return new Promise<number>(() => {});
+    };
+    const app = createGatewayApp(deps);
+    const hit = async () => (await app.request("http://gw.test/k/search", { method: "POST", body: "{}", headers: { authorization: `Bearer ${tokens.k}` } })).status;
+    const codes = await Promise.all(Array.from({ length: 8 }, hit));
+    expect(codes.every((c) => c === 200)).toBe(true);
+    expect(calls).toBe(4);
+    expect(signals.every((s) => s.aborted)).toBe(true);
+  });
+
   test("chat calls are not counted against the side limit", async () => {
     await addApp("cl", "claude", "anthropic");
     deps.sideDailyLimit = 1;

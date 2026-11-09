@@ -839,6 +839,7 @@ describe("ali session ownership", () => {
       keepAliveAccounts: async () => [],
       aliAccounts: async () => [member("personal")],
       aliRefresh: async (i) => (renewed.add(i.name), "/x/console-cookie.txt"),
+      aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: async () => true },
     });
     await waitFor(() => renewed.has("personal"));
     await g.stop();
@@ -859,6 +860,23 @@ describe("ali ownership and shutdown", () => {
     } finally {
       if (prev === undefined) delete process.env.AIS_GATEWAY_HEARTBEAT;
       else process.env.AIS_GATEWAY_HEARTBEAT = prev;
+    }
+  });
+
+  test("without injected setup checks a test gateway never runs kubectl", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fake-kubectl-"));
+    const marker = join(dir, "called");
+    await Bun.write(join(dir, "kubectl"), `#!/bin/sh\necho called > ${marker}\necho yes\n`);
+    await Bun.$`chmod +x ${join(dir, "kubectl")}`;
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${dir}:${prevPath}`;
+    try {
+      const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async () => [], aliAccounts: async () => [member("personal")], aliRefresh: async () => "p" });
+      await Bun.sleep(250);
+      await g.stop();
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally {
+      process.env.PATH = prevPath;
     }
   });
 
@@ -1054,6 +1072,44 @@ describe("public host", () => {
     expect(await get(g, "/healthz", "pod-1:47130")).toBe(200);
     expect(await get(g, "/readyz", "pod-1:47130")).toBe(200);
     expect(await status(`${base(g)}/metrics`)).toBe(200);
+    await g.stop();
+  });
+
+  test("encoded and doubled spellings of the operational paths are 404 too, for POST as well as GET", async () => {
+    const g = await boot({ publicHosts: [PUBLIC] });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    const call = (method: string, path: string, host: string) => fetch(`http://127.0.0.1:${g.port}${path}`, { method, headers: { host }, ...(method === "POST" ? { body: "{}" } : {}) }).then((r) => r.status);
+    for (const path of ["/browser/%70air", "/%62rowser/pair", "/browser/pair/x", "//browser/pair", "/browser//pair", "/%2562rowser/pair", "/BROWSER/PAIR", "/%6detrics", "/%68ealthz", "/readyz/", "/browser/pair%2Fx"]) {
+      for (const method of ["GET", "POST"]) expect([method, path, await call(method, path, PUBLIC)]).toEqual([method, path, 404]);
+    }
+    // on the pod address the pairing route is the real one (not the 404 of the gate)
+    expect(await call("POST", "/browser/pair", "pod-1:47130")).not.toBe(404);
+    expect(await call("POST", "/browser/%70air", "pod-1:47130")).not.toBe(404);
+    await g.stop();
+  });
+
+  test("every X-Forwarded-Host value and a Forwarded host= count", async () => {
+    const g = await boot({ publicHosts: [PUBLIC] });
+    const call = (headers: Record<string, string>) => fetch(`http://127.0.0.1:${g.port}/metrics`, { headers: { host: "pod-1:47130", ...headers } }).then((r) => r.status);
+    expect(await call({ "x-forwarded-host": `other.example, ${PUBLIC}` })).toBe(404);
+    expect(await call({ "x-forwarded-host": `${PUBLIC}, other.example` })).toBe(404);
+    expect(await call({ forwarded: `for=client-a;host="${PUBLIC}";proto=https` })).toBe(404);
+    expect(await call({ "x-forwarded-host": "other.example" })).toBe(200);
+    await g.stop();
+  });
+
+  test("an empty public host list is reported at startup and in the metrics", async () => {
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    let g: Awaited<ReturnType<typeof boot>>;
+    try {
+      g = await boot({ publicHosts: [] });
+    } finally {
+      console.warn = orig;
+    }
+    expect(warnings.some((w) => w.includes("AIS_GATEWAY_PUBLIC_HOSTS is empty"))).toBe(true);
+    expect(await (await fetch(`${base(g)}/metrics`)).text()).toContain("ais_gateway_public_hosts_configured 0");
     await g.stop();
   });
 

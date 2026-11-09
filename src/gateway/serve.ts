@@ -352,6 +352,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const publicHosts = hooks.publicHosts ?? publicHostsFromEnv();
   const ledger = new LedgerBuffer(store, hooks.ledger ?? { max: 50_000, flushMs: 2_000 });
   const metrics = new PrometheusMetrics({ ledgerDepth: () => ledger.depth, ledgerDropped: () => ledger.dropped });
+  metrics.publicHostsConfigured(publicHosts.length);
+  if (publicHosts.length === 0) console.warn("gateway: AIS_GATEWAY_PUBLIC_HOSTS is empty, so /metrics, /healthz, /readyz and /browser/pair answer on every host, including a public tunnel; set it to the public host names");
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
   const failedTokens = new Map<string, string>();
   const refreshBackend = hooks.refreshBackend ?? new PgRefreshBackend(opts.databaseUrl);
@@ -471,7 +473,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         store.startRefresh(hooks.refreshIntervalMs ?? 15_000);
         console.info("gateway: warm, ready for traffic");
         void probeIdentities().catch(() => undefined);
-        if (aliList) void aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).then((p) => void (aliSetupOk = p.length === 0), () => undefined);
+        if (aliList && selfTestEnabled) void aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).then((p) => void (aliSetupOk = p.length === 0), () => undefined);
         return;
       } catch (err) {
         console.warn(`gateway: warm-up failed at ${stage} (${describe(err)}); retrying in ${delay} ms`);
@@ -548,6 +550,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const aliSkips = new Map<string, number>();
   /** True once the startup self-test (re-run every pass until it passes) found nothing missing. The heartbeat claims no ali login before. */
   let aliSetupOk = false;
+  // Tests (noHeartbeat) never shell out to kubectl or touch the real home unless they inject the checks.
+  const selfTestEnabled = !hooks.noHeartbeat || hooks.aliSetup !== undefined;
+  if (!selfTestEnabled) aliSetupOk = true;
   // Tests (noHeartbeat) never touch the real registry or auth browser unless they inject an ali source.
   const aliList = hooks.aliAccounts ?? (hooks.noHeartbeat ? undefined : listAliAccounts);
   const keepAliveTimer = setInterval(() => {
@@ -575,7 +580,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       revoked: revokedGrants,
     })
       .then(async () => {
-        if (aliList && !aliSetupOk && !aliAbort.signal.aborted) aliSetupOk = (await aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).catch(() => ["error"])).length === 0;
+        if (aliList && selfTestEnabled && !aliSetupOk && !aliAbort.signal.aborted) aliSetupOk = (await aliSetupSelfTest(alerter, { ...(hooks.aliSetup ?? {}), accounts: aliList }).catch(() => ["error"])).length === 0;
       })
       .then(() => (aliList ? aliSessionOnce({ accounts: aliList, ...(hooks.aliRefresh ? { refresh: hooks.aliRefresh } : {}), metrics, alerter, lastSuccess: lastSuccessAt, now, signal: aliAbort.signal, loginPageSkips: aliSkips }) : undefined))
       .finally(() => {

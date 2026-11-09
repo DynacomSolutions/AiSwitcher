@@ -13,7 +13,7 @@ export interface GatewayStore {
   appendUsage(rows: UsageRow[]): Promise<void>;
   usageSince(app: string, since: Date): Promise<number>;
   /** Counts one side or served request for the app on `day` (YYYY-MM-DD, Bangkok day) and returns the day's count so far. Shared by every replica. */
-  bumpSideCount(app: string, day: string): Promise<number>;
+  bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number>;
   /** Ledger totals per provider and identity for rows at or after `since` (before `until` when given). */
   usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]>;
   putBrowserBinding(b: BrowserBinding): Promise<void>;
@@ -90,7 +90,7 @@ export class MemoryGatewayStore implements GatewayStore {
 
   private sideCounts = new Map<string, number>();
 
-  async bumpSideCount(app: string, day: string): Promise<number> {
+  async bumpSideCount(app: string, day: string, _signal?: AbortSignal): Promise<number> {
     const key = `${app}\u0000${day}`;
     const n = (this.sideCounts.get(key) ?? 0) + 1;
     this.sideCounts.set(key, n);
