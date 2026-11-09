@@ -274,3 +274,43 @@ CLIProxyAPI's refresh journal):
   `ais_gateway_refresh_lock_waits_total`,
   `ais_gateway_refresh_lock_wait_seconds_total` and
   `ais_gateway_refresh_guard_degraded_total`.
+
+## Member store and routing every identity through the gateway
+
+The gateway used to read each account's login from the same identity folders the local tools use (the registry's
+`configDir`, mounted into the pod). Replacing those files with a gateway entry would therefore have destroyed the
+gateway's logins. The gateway now has its own member store, `~/.ais/gateway-members/<tool>/<identity>/`
+(`AIS_GATEWAY_MEMBERS_DIR` overrides; claude: `.credentials.json` plus the `oauthAccount` record of `.claude.json`;
+codex: `auth.json`). It lives under `~/.ais`, which the gateway pod already mounts read-write, so no new mount is needed,
+and the host snapshot export skips it.
+
+- `ais gateway serve` and `ais gateway local` (`enableMemberStore()` in `src/identities/gateway-members.ts`) resolve any
+  identity whose store holds its login file to the store folder, at the one I/O boundary (`loadIdentitiesFile`). Identities
+  without a store copy behave as before, so grok, kimi and pi (no local route yet) are unchanged. `saveIdentitiesFile`
+  refuses to write store paths into a registry. The heartbeat carries `memberStore: true` so the host can tell which build
+  is running.
+- Every other process (host timers, CLI, console pod) treats an account with a store copy as the gateway's
+  (`isGatewayManagedHere`), heartbeat or not: it never refreshes, heals or reconciles that login. For claude, such an account
+  is gateway-managed even when it is not a member of a gateway-routed pool. Usage readers skip a folder that holds the
+  gateway app token, so it never reaches Anthropic.
+
+`ais identities route-all-via-gateway [--dry-run]` (host CLI only, never inside a gateway process) does the switch. Per
+identity, under the account's refresh locks (the ones the gateway takes before it renews the login):
+
+1. it refuses unless a fresh heartbeat from a gateway built with the member store names the account with a successful
+   renewal;
+2. it moves the login into the member store (kept when the store copy is newer; a newer local sign-in replaces it after a
+   unique backup). The login file is written last: its presence is what switches the gateway to the store;
+3. it backs up each local file it changes to `<file>.pre-gateway.<timestamp>.bak` (exclusive, 0600, never overwritten or
+   deleted) and writes the entry: claude `.credentials.json` gateway entry, `ANTHROPIC_BASE_URL=http://127.0.0.1:47140/claude`
+   in `settings.json`, `apiKeyHelper` removed; codex `auth.json` as an API-key file holding the app key, `model_provider =
+   "ais-gateway"` and its tables in `config.toml`, with the key printed by `~/.local/bin/ais-codex-gateway-key` (created if
+   absent, an existing one is kept).
+
+Keys are `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN` and `AIS_GATEWAY_APP_AGENTS_CODEX_TOKEN` (apps `agents-claude`,
+`agents-codex`). Reported and left alone, exit code 1: a tool with no local route (`src/gateway/local-routes.ts`: today
+grok, kimi, pi) or no key, an account the gateway does not hold, a folder without a refreshable login, a swap pool folder
+that is not routed yet (it holds a copy of a member's login; the command never writes pool folders) and a symlinked file.
+Re-running changes nothing for an identity already routed. To undo one identity: copy the member store's login file back
+(the gateway has kept it current; the `.pre-gateway` login backup may hold a refresh token already rotated away), restore
+the settings or config backup, then move the store folder aside so the gateway reads the identity folder again.

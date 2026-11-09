@@ -28,12 +28,12 @@ import { runHostCommand } from "./host/dispatch.ts";
 import { runGatewayCommand } from "./gateway/dispatch.ts";
 import { runBrowserCommand } from "./browser/dispatch.ts";
 
-/** Commands that kick off the detached background sync. `identities retire`
- * and `unretire` are excluded: a sync merging the remote registry while the
- * command saves its own change could race the write and undo the retirement. */
+/** Commands that kick off the detached background sync. `identities retire`,
+ * `unretire` and `route-all-via-gateway` are excluded: a sync running while the
+ * command saves its own change could race the write and undo it. */
 export function wantsAutoBackgroundSync(command: string | undefined, rest: string[]): boolean {
   if (command === undefined || !["identities", "usage", "limits", "doctor"].includes(command)) return false;
-  return !(command === "identities" && (rest[0] === "retire" || rest[0] === "unretire"));
+  return !(command === "identities" && (rest[0] === "retire" || rest[0] === "unretire" || rest[0] === "route-all-via-gateway"));
 }
 
 export async function runCli(argv: string[]): Promise<void> {

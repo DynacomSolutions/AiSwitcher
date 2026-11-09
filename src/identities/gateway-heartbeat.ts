@@ -14,6 +14,8 @@ export interface GatewayHeartbeat {
   passAt: string;
   /** "tool/identity" to the ISO time the gateway last refreshed it successfully (absent when it has not yet). */
   held: Record<string, { lastSuccessAt?: string }>;
+  /** True when the writing gateway reads logins from its own member store (gateway-members.ts), not the local identity folders. */
+  memberStore?: boolean;
 }
 
 export const HEARTBEAT_FRESH_MS = 30 * 60_000;

@@ -2,6 +2,7 @@ import { isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import { expandPath } from "./match.ts";
 import { poolsOf } from "./pool/swap-pool.ts";
 import { heartbeatHolds } from "./gateway-heartbeat.ts";
+import { hasMemberCopy } from "./gateway-members.ts";
 import { adapterFor } from "../gateway/providers/index.ts";
 import { isRetired } from "./retired.ts";
 import { loadIdentitiesFile } from "./store.ts";
@@ -55,7 +56,8 @@ export function isGatewayServedTool(tool: string): tool is GatewayRefreshTool {
 }
 
 /**
- * Accounts the gateway owns for `tool`, whoever asks. claude: members of gateway-routed pools. codex, grok, kimi: every
+ * Accounts the gateway owns for `tool`, whoever asks. claude: members of gateway-routed pools, plus every account moved
+ * into the gateway member store (gateway-members.ts). codex, grok, kimi: every
  * live (not retired, not a swap pool) identity in the tool's registry, which is exactly what the gateway serves.
  * Unreadable registry or a tool the gateway does not serve: none.
  */
@@ -68,7 +70,7 @@ export async function listGatewayManagedAccounts(registryPath?: string, tool: st
     for (const pool of poolsOf(file)) {
       if (await isGatewayRoutedDir(expandPath(pool.configDir))) for (const a of pool.swapPool.accounts) names.add(a);
     }
-    return file.identities.filter((i) => names.has(i.name) && !i.swapPool);
+    return file.identities.filter((i) => !i.swapPool && (names.has(i.name) || (!isRetired(i) && hasMemberCopy(tool, i.name))));
   } catch {
     return [];
   }
@@ -77,9 +79,13 @@ export async function listGatewayManagedAccounts(registryPath?: string, tool: st
 /**
  * True when this process must not refresh, converge, reconcile or write the account's login: the gateway owns it (see
  * listGatewayManagedAccounts) and this process is not the gateway server. claude is decided by the pool routing marker;
- * codex, grok and kimi also need a fresh gateway heartbeat naming the login (see gateway-heartbeat.ts). Unreadable registry or unserved tool: not managed.
+ * codex, grok and kimi also need a fresh gateway heartbeat naming the login (see gateway-heartbeat.ts). An account whose login
+ * was moved into the gateway member store is the gateway's whatever the heartbeat says: its local folder holds only the
+ * gateway entry, and a refresh here would fork the gateway's rotating refresh token. Unreadable registry or unserved tool:
+ * not managed.
  */
 export async function isGatewayManagedHere(tool: string, identityName: string, registryPath?: string): Promise<boolean> {
+  if (!isGatewayOwnerProcess() && hasMemberCopy(tool, identityName)) return true;
   if ((GATEWAY_SESSION_TOOLS as readonly string[]).includes(tool)) {
     // A session tool is the gateway's only while a fresh heartbeat names it, so a stopped gateway hands it back at once.
     if (isGatewayOwnerProcess() || !(await heartbeatHolds(tool, identityName))) return false;

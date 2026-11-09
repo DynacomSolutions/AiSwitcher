@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "./types.ts";
 import { InvalidIdentitiesFileError } from "./errors.ts";
 import { isValidIdentityColour } from "./colour.ts";
+import { applyMemberStore, isUnderMemberStore, memberStoreEnabled } from "./gateway-members.ts";
 import { expandPath, parseDirectoryPattern, translateHostPath, untranslateHostPath } from "./match.ts";
 
 /** Structural validation only. Whether members exist, are claude identities,
@@ -201,17 +202,25 @@ export async function loadIdentitiesFile(path: string): Promise<IdentitiesFile> 
   // passing a literal "~" directory to a child process or node:path.join().
   return {
     ...parsed,
-    identities: parsed.identities.map((identity) => ({
-      ...identity,
-      // In a container the host-absolute dir is mapped to its mount; saves reverse it.
-      configDir: translateHostPath(expandPath(identity.configDir)),
-    })),
+    // A gateway process reads its own copy of each member login (gateway-members.ts); every other process gets the folders as written.
+    identities: applyMemberStore(
+      path,
+      parsed.identities.map((identity) => ({
+        ...identity,
+        // In a container the host-absolute dir is mapped to its mount; saves reverse it.
+        configDir: translateHostPath(expandPath(identity.configDir)),
+      })),
+    ),
   };
 }
 
 /** Atomic write: write to a temp file in the same dir, then rename over the target. */
 export async function saveIdentitiesFile(path: string, data: IdentitiesFile): Promise<void> {
   const dir = dirname(path);
+  // A registry loaded by a gateway process carries member-store folders; writing those back would point the local tools at the store.
+  if (memberStoreEnabled() && data.identities.some((i) => isUnderMemberStore(i.configDir))) {
+    throw new Error("refusing to save an identities file whose folders point into the gateway member store");
+  }
   const tmpPath = `${dir}/.identities.${randomUUID()}.tmp`;
   const hostData = {
     ...data,

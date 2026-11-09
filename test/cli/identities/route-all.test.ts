@@ -1,0 +1,365 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { backupUnique, classifyLogin, codexConfigRouted, codexKeyHelperPath, heldProblem, routeAllViaGateway, routeCodexConfigText, runRouteAllViaGateway, type RouteAllOptions } from "../../../src/cli/identities/route-all.ts";
+import { writeHeartbeat } from "../../../src/identities/gateway-heartbeat.ts";
+import { hasMemberCopy, memberDir } from "../../../src/identities/gateway-members.ts";
+import { loadIdentitiesFile, saveIdentitiesFile } from "../../../src/identities/store.ts";
+
+const CLAUDE_KEY = "aisg_SYNTHETIC_FIXTURE_claude_key";
+const CODEX_KEY = "aisg_SYNTHETIC_FIXTURE_codex_key";
+const NOW = Date.parse("2030-01-01T12:00:00Z");
+
+const claudeLogin = (n: string) => JSON.stringify({ claudeAiOauth: { accessToken: `sk-ant-SYNTHETIC_FIXTURE-${n}`, refreshToken: `rt-SYNTHETIC_FIXTURE-${n}`, expiresAt: 1, scopes: ["user:inference"] } });
+const codexLogin = (n: string) => JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: { id_token: "x", access_token: `at-SYNTHETIC_FIXTURE-${n}`, refresh_token: `rt-SYNTHETIC_FIXTURE-${n}`, account_id: `acct-${n}` } });
+
+let home: string;
+let opts: RouteAllOptions;
+let hbPath: string;
+
+async function registry(tool: string, dirName: string, names: string[], extra: Record<string, unknown> = {}): Promise<void> {
+  const base = join(home, dirName);
+  await mkdir(base, { recursive: true });
+  await writeFile(join(base, "identities.json"), JSON.stringify({ version: 1, identities: names.map((name) => ({ name, label: name, configDir: join(base, "identities", name), ...(extra[name] as object | undefined) })) }));
+  for (const name of names) await mkdir(join(base, "identities", name), { recursive: true });
+}
+
+const dirOf = (dirName: string, name: string) => join(home, dirName, "identities", name);
+
+const ALL = ["claude/alpha", "claude/beta", "codex/alpha"];
+
+async function heartbeat(keys: readonly string[] = ALL, opt: { ageMs?: number; memberStore?: boolean; unrenewed?: readonly string[]; keys?: readonly string[] } = {}) {
+  const held = Object.fromEntries(keys.map((k) => [k, opt.unrenewed?.includes(k) ? {} : { lastSuccessAt: new Date(NOW - 60_000).toISOString() }]));
+  await writeHeartbeat({ version: 1, passAt: new Date(NOW - (opt.ageMs ?? 1000)).toISOString(), held, ...(opt.memberStore === false ? {} : { memberStore: true }) }, hbPath);
+}
+
+const claudeLine = (r: Awaited<ReturnType<typeof routeAllViaGateway>>, id: string) => r.lines.find((l) => l.tool === "claude" && l.identity === id);
+const storeOf = (tool: string, id: string) => memberDir(tool, id, opts.memberRoot);
+
+beforeEach(async () => {
+  home = await mkdtemp(join(tmpdir(), "ais-route-all-"));
+  hbPath = join(home, "heartbeat.json");
+  await writeFile(join(home, "secrets"), `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN=${CLAUDE_KEY}\nAIS_GATEWAY_APP_AGENTS_CODEX_TOKEN=${CODEX_KEY}\n`);
+  await registry("claude", ".claude", ["alpha", "beta"]);
+  await registry("codex", ".codex", ["alpha"]);
+  await registry("grok", ".grok", ["alpha"]);
+  await registry("kimi", ".kimi-code", ["alpha"]);
+  await registry("pi", ".pi", ["alpha"]);
+  for (const n of ["alpha", "beta"]) {
+    await writeFile(join(dirOf(".claude", n), ".credentials.json"), claudeLogin(n));
+    await writeFile(join(dirOf(".claude", n), ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: `u-${n}` }, projects: { big: "x" } }));
+    await writeFile(join(dirOf(".claude", n), "settings.json"), JSON.stringify({ env: { KEEP: "1" }, apiKeyHelper: "x" }));
+  }
+  await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
+  await writeFile(join(dirOf(".codex", "alpha"), "config.toml"), '# my config\nmodel = "m"\n\n[projects."/x"]\ntrust_level = "trusted"\n');
+  await writeFile(join(dirOf(".grok", "alpha"), "auth.json"), "GROK-LOGIN");
+  opts = {
+    registries: { claude: join(home, ".claude", "identities.json"), codex: join(home, ".codex", "identities.json"), grok: join(home, ".grok", "identities.json"), kimi: join(home, ".kimi-code", "identities.json"), pi: join(home, ".pi", "identities.json") },
+    secretsPath: join(home, "secrets"),
+    memberRoot: join(home, "members"),
+    heartbeatPath: hbPath,
+    home,
+    port: 47140,
+    now: () => NOW,
+    out: () => {},
+  };
+});
+afterEach(() => rm(home, { recursive: true, force: true }));
+
+const statusOf = (r: Awaited<ReturnType<typeof routeAllViaGateway>>, id: string) => r.lines.find((l) => l.identity === id)?.status;
+const files = async (dir: string) => (await readdir(dir)).sort();
+
+describe("route-all-via-gateway: refuses what the gateway does not hold", () => {
+  for (const [label, hb, expected] of [
+    ["no heartbeat", undefined, "no gateway heartbeat"],
+    ["stale heartbeat", { keys: ALL, ageMs: 3 * 3_600_000 }, "stale"],
+    ["gateway built before the member store", { keys: ALL, memberStore: false }, "predates the member store"],
+    ["account not a gateway member", { keys: ["claude/beta", "codex/alpha"] }, "does not hold this account"],
+    ["account never renewed by the gateway", { keys: ALL, unrenewed: ["claude/alpha"] }, "not yet renewed"],
+  ] as const) {
+    test(label, async () => {
+      if (hb) await heartbeat(hb.keys, hb);
+      const r = await routeAllViaGateway(opts);
+      expect(claudeLine(r, "alpha")?.status).toBe("refused");
+      expect(claudeLine(r, "alpha")?.detail).toContain(expected);
+      expect(r.incomplete).toBe(true);
+      // nothing written: no store copy, no backup, the login is where it was
+      expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+      expect(await readFile(join(dirOf(".claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+      expect((await files(dirOf(".claude", "alpha"))).some((f) => f.includes(".pre-gateway."))).toBe(false);
+    });
+  }
+
+  test("the report and exit code name every refused identity", async () => {
+    await heartbeat(["claude/beta", "codex/alpha"]);
+    const out: string[] = [];
+    const saved = process.exitCode;
+    await runRouteAllViaGateway({}, { ...opts, out: (l) => out.push(l) });
+    expect(process.exitCode).toBe(1);
+    process.exitCode = saved;
+    expect(out.some((l) => l.startsWith("  claude/alpha: refused"))).toBe(true);
+    expect(out.some((l) => l.includes("grok: NOT ROUTED"))).toBe(true);
+    // never a secret value in the output
+    expect(out.join("\n")).not.toContain("SYNTHETIC_FIXTURE");
+  });
+
+  test("heldProblem accepts a fresh heartbeat naming a renewed account", () => {
+    const hb = { version: 1 as const, passAt: new Date(NOW).toISOString(), held: { "codex/x": { lastSuccessAt: "2030-01-01T00:00:00Z" } }, memberStore: true };
+    expect(heldProblem("codex", "x", hb, NOW)).toBeUndefined();
+    expect(heldProblem("codex", "y", hb, NOW)).toContain("does not hold");
+  });
+});
+
+describe("route-all-via-gateway: routing", () => {
+  test("dry run reports and writes nothing", async () => {
+    await heartbeat();
+    const r = await routeAllViaGateway({ ...opts, dryRun: true });
+    expect(r.lines.filter((l) => l.status === "would-route").length).toBe(3);
+    expect(await readFile(join(dirOf(".claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+    expect(await files(dirOf(".claude", "alpha"))).toEqual([".claude.json", ".credentials.json", "settings.json"]);
+    await expect(stat(opts.memberRoot!)).rejects.toThrow();
+    await expect(stat(codexKeyHelperPath(home))).rejects.toThrow();
+  });
+
+  test("moves the login to the member store, backs up, writes the gateway entry; a second run changes nothing", async () => {
+    await heartbeat();
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.filter((l) => l.status === "routed").length).toBe(3);
+
+    // the store gets the fixture login (0600, folder 0700); of .claude.json only the oauthAccount record goes along
+    const store = storeOf("claude", "alpha");
+    expect(await readFile(join(store, ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+    expect((await stat(join(store, ".credentials.json"))).mode & 0o777).toBe(0o600);
+    expect((await stat(store)).mode & 0o777).toBe(0o700);
+    expect((await stat(opts.memberRoot!)).mode & 0o777).toBe(0o700);
+    expect(JSON.parse(await readFile(join(store, ".claude.json"), "utf8"))).toEqual({ oauthAccount: { accountUuid: "u-alpha" } });
+    expect(await readFile(join(storeOf("codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+
+    const dir = dirOf(".claude", "alpha");
+    const backups = (await files(dir)).filter((f) => f.startsWith(".credentials.json.pre-gateway."));
+    expect(backups.length).toBe(1);
+    expect(await readFile(join(dir, backups[0]!), "utf8")).toBe(claudeLogin("alpha"));
+    expect((await stat(join(dir, backups[0]!))).mode & 0o777).toBe(0o600);
+    expect((await files(dir)).filter((f) => f.startsWith("settings.json.pre-gateway.")).length).toBe(1);
+    const entry = JSON.parse(await readFile(join(dir, ".credentials.json"), "utf8")).claudeAiOauth;
+    expect(entry.accessToken).toBe(CLAUDE_KEY);
+    expect(entry.refreshToken).toBeNull();
+    const settings = JSON.parse(await readFile(join(dir, "settings.json"), "utf8"));
+    expect(settings.env).toEqual({ KEEP: "1", ANTHROPIC_BASE_URL: "http://127.0.0.1:47140/claude" });
+    expect(settings.apiKeyHelper).toBeUndefined();
+
+    const cdir = dirOf(".codex", "alpha");
+    expect(JSON.parse(await readFile(join(cdir, "auth.json"), "utf8"))).toEqual({ auth_mode: "apikey", OPENAI_API_KEY: CODEX_KEY });
+    const toml = await readFile(join(cdir, "config.toml"), "utf8");
+    expect(toml).toContain("# my config");
+    expect(toml).toContain('[projects."/x"]');
+    expect(codexConfigRouted(toml, "http://127.0.0.1:47140/codex", codexKeyHelperPath(home))).toBe(true);
+    expect((await stat(codexKeyHelperPath(home))).mode & 0o777).toBe(0o755);
+    expect(await readFile(codexKeyHelperPath(home), "utf8")).not.toContain(CODEX_KEY);
+
+    const snapshot = [await files(dir), await files(cdir), await files(store)];
+    const again = await routeAllViaGateway(opts);
+    expect(again.lines.every((l) => l.status === "already-routed" && l.detail === undefined)).toBe(true);
+    expect([await files(dir), await files(cdir), await files(store)]).toEqual(snapshot);
+  });
+
+  test("an existing key helper is kept", async () => {
+    await mkdir(join(home, ".local", "bin"), { recursive: true });
+    await writeFile(codexKeyHelperPath(home), "#!/bin/sh\necho mine\n", { mode: 0o700 });
+    await heartbeat();
+    await routeAllViaGateway(opts);
+    expect(await readFile(codexKeyHelperPath(home), "utf8")).toBe("#!/bin/sh\necho mine\n");
+  });
+
+  test("a store copy the gateway renewed since is kept; a newer local sign-in replaces it after a backup", async () => {
+    await heartbeat();
+    // the gateway already holds a newer copy (it renewed it after an earlier, interrupted run)
+    await mkdir(storeOf("claude", "alpha"), { recursive: true });
+    await writeFile(join(storeOf("claude", "alpha"), ".credentials.json"), claudeLogin("alpha-renewed"));
+    await utimes(join(dirOf(".claude", "alpha"), ".credentials.json"), 1, 1);
+    // beta signed in again locally after its store copy was written
+    await mkdir(storeOf("claude", "beta"), { recursive: true });
+    await writeFile(join(storeOf("claude", "beta"), ".credentials.json"), claudeLogin("beta-old"));
+    await utimes(join(storeOf("claude", "beta"), ".credentials.json"), 1, 1);
+
+    const r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    expect(await readFile(join(storeOf("claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha-renewed"));
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(await readFile(join(storeOf("claude", "beta"), ".credentials.json"), "utf8")).toBe(claudeLogin("beta"));
+    const kept = (await files(storeOf("claude", "beta"))).filter((f) => f.startsWith(".credentials.json.pre-gateway."));
+    expect(kept.length).toBe(1);
+    expect(await readFile(join(storeOf("claude", "beta"), kept[0]!), "utf8")).toBe(claudeLogin("beta-old"));
+  });
+
+  test("a half-finished folder (entry written, settings not) is completed without a heartbeat", async () => {
+    await heartbeat();
+    await routeAllViaGateway(opts);
+    await writeFile(join(dirOf(".claude", "alpha"), "settings.json"), JSON.stringify({ env: {} }));
+    await rm(hbPath);
+    const r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    expect(JSON.parse(await readFile(join(dirOf(".claude", "alpha"), "settings.json"), "utf8")).env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:47140/claude");
+  });
+
+  test("a folder with the gateway entry but no store copy is refused (the login would be lost)", async () => {
+    await writeFile(join(dirOf(".claude", "alpha"), ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "aisg_other", refreshToken: null } }));
+    await heartbeat();
+    const r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("refused");
+    expect(claudeLine(r, "alpha")?.detail).toContain("member store has no login");
+  });
+
+  test("grok, kimi and pi have no route: reported with their identities, left alone", async () => {
+    await heartbeat();
+    const r = await routeAllViaGateway(opts);
+    expect(r.unroutedTools.map((t) => t.tool)).toEqual(["grok", "kimi", "pi"]);
+    expect(r.unroutedTools[0]?.reason).toContain("alpha");
+    expect(r.incomplete).toBe(true);
+    expect(await readFile(join(dirOf(".grok", "alpha"), "auth.json"), "utf8")).toBe("GROK-LOGIN");
+  });
+
+  test("a tool without its key is reported and untouched", async () => {
+    await heartbeat();
+    await writeFile(join(home, "secrets"), `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN=${CLAUDE_KEY}\n`);
+    const r = await routeAllViaGateway(opts);
+    expect(r.unroutedTools.find((t) => t.tool === "codex")?.reason).toContain("AIS_GATEWAY_APP_AGENTS_CODEX_TOKEN");
+    expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+    expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(false);
+  });
+
+  test("a logged-out or API-key identity is refused, never given an entry", async () => {
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-SYNTHETIC_FIXTURE" }));
+    await heartbeat();
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("refused");
+    expect(JSON.parse(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).OPENAI_API_KEY).toBe("sk-SYNTHETIC_FIXTURE");
+  });
+
+  test("a symlinked settings file is refused, not written through", async () => {
+    const shared = join(home, "shared-settings.json");
+    await writeFile(shared, "{}");
+    await rm(join(dirOf(".claude", "alpha"), "settings.json"));
+    await symlink(shared, join(dirOf(".claude", "alpha"), "settings.json"));
+    await heartbeat();
+    const r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("refused");
+    expect(await readFile(shared, "utf8")).toBe("{}");
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+  });
+
+  test("a swap pool folder is never written: reported when not routed, already-routed when it is", async () => {
+    await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));
+    await heartbeat();
+    let r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "pool")?.status).toBe("refused");
+    expect(claudeLine(r, "pool")?.detail).toContain("swap pool");
+    expect(await readFile(join(dirOf(".claude", "pool"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+    expect(hasMemberCopy("claude", "pool", opts.memberRoot)).toBe(false);
+
+    await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: CLAUDE_KEY, refreshToken: null } }));
+    await writeFile(join(dirOf(".claude", "pool"), "settings.json"), JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:47140/claude" } }));
+    r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "pool")?.status).toBe("already-routed");
+  });
+
+  test("retired identities are skipped", async () => {
+    await registry("codex", ".codex", ["alpha"], { alpha: { retired: true } });
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
+    await heartbeat();
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.some((l) => l.tool === "codex")).toBe(false);
+    expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+  });
+});
+
+describe("helpers", () => {
+  test("the command does not start the background sync (it could race the rewrite)", async () => {
+    const { wantsAutoBackgroundSync } = await import("../../../src/cli/dispatch.ts");
+    expect(wantsAutoBackgroundSync("identities", ["route-all-via-gateway"])).toBe(false);
+  });
+
+  test("backups never overwrite", async () => {
+    const f = join(home, "x.json");
+    await writeFile(f, "one");
+    const a = await backupUnique(f, () => NOW);
+    await writeFile(f, "two");
+    const b = await backupUnique(f, () => NOW);
+    expect(a).not.toBe(b);
+    expect(await readFile(a!, "utf8")).toBe("one");
+    expect(await readFile(b!, "utf8")).toBe("two");
+    expect(await backupUnique(join(home, "missing"), () => NOW)).toBeUndefined();
+  });
+
+  test("classifyLogin", () => {
+    expect(classifyLogin("claude", claudeLogin("a"))).toBe("login");
+    expect(classifyLogin("claude", JSON.stringify({ claudeAiOauth: { accessToken: CLAUDE_KEY, refreshToken: null } }))).toBe("gateway");
+    expect(classifyLogin("codex", JSON.stringify({ OPENAI_API_KEY: CODEX_KEY }))).toBe("gateway");
+    expect(classifyLogin("codex", "garbage")).toBe("none");
+  });
+
+  test("codex config text: replaces an existing provider, keeps the rest, is stable", () => {
+    const base = "http://127.0.0.1:47140/codex";
+    const old = `model_provider = "openai"\nmodel = "m"\n\n# keep me\n[model_providers.ais-gateway]\nbase_url = "http://old"\n\n[model_providers.ais-gateway.auth]\ncommand = "/old"\n\n[projects."/x"]\ntrust_level = "trusted"\n`;
+    const out = routeCodexConfigText(old, base, "/bin/key");
+    expect(out).toContain("# keep me");
+    expect(out).toContain('[projects."/x"]');
+    expect(out).not.toContain("http://old");
+    expect(out.match(/model_provider\s*=/g)?.length).toBe(1);
+    expect(codexConfigRouted(out, base, "/bin/key")).toBe(true);
+    expect(routeCodexConfigText(out, base, "/bin/key")).toBe(out);
+  });
+});
+
+describe("member store in the gateway process", () => {
+  let savedFlag: string | undefined;
+  let savedDir: string | undefined;
+  beforeEach(() => {
+    savedFlag = process.env.AIS_GATEWAY_MEMBER_STORE;
+    savedDir = process.env.AIS_GATEWAY_MEMBERS_DIR;
+  });
+  afterEach(() => {
+    if (savedFlag === undefined) process.env.AIS_GATEWAY_MEMBER_STORE = "0";
+    else process.env.AIS_GATEWAY_MEMBER_STORE = savedFlag;
+    if (savedDir === undefined) delete process.env.AIS_GATEWAY_MEMBERS_DIR;
+    else process.env.AIS_GATEWAY_MEMBERS_DIR = savedDir;
+  });
+
+  test("a gateway process reads the store copy; everyone else and the save path keep the identity folder", async () => {
+    const reg = opts.registries!.claude!;
+    process.env.AIS_GATEWAY_MEMBERS_DIR = opts.memberRoot!;
+    process.env.AIS_GATEWAY_MEMBER_STORE = "1";
+    // before any move there is no store copy: the gateway reads the identity folder as it always did
+    expect((await loadIdentitiesFile(reg)).identities.find((i) => i.name === "alpha")?.configDir).toBe(dirOf(".claude", "alpha"));
+    await heartbeat();
+    await expect(routeAllViaGateway(opts)).rejects.toThrow("host CLI");
+
+    process.env.AIS_GATEWAY_MEMBER_STORE = "0";
+    await routeAllViaGateway(opts);
+    expect((await loadIdentitiesFile(reg)).identities.find((i) => i.name === "alpha")?.configDir).toBe(dirOf(".claude", "alpha"));
+
+    process.env.AIS_GATEWAY_MEMBER_STORE = "1";
+    const loaded = await loadIdentitiesFile(reg);
+    const dir = loaded.identities.find((i) => i.name === "alpha")!.configDir;
+    expect(dir).toBe(memberDir("claude", "alpha", opts.memberRoot));
+    // the gateway still sees the real login while the identity folder holds the gateway entry
+    expect(classifyLogin("claude", await readFile(join(dir, ".credentials.json"), "utf8"))).toBe("login");
+    expect(classifyLogin("claude", await readFile(join(dirOf(".claude", "alpha"), ".credentials.json"), "utf8"))).toBe("gateway");
+    // a registry that is not a tool's own identities.json is never remapped
+    const other = join(home, "other", "list.json");
+    await mkdir(join(home, "other"), { recursive: true });
+    await writeFile(other, JSON.stringify({ version: 1, identities: [{ name: "alpha", label: "a", configDir: dirOf(".claude", "alpha") }] }));
+    expect((await loadIdentitiesFile(other)).identities[0]?.configDir).toBe(dirOf(".claude", "alpha"));
+    await expect(saveIdentitiesFile(reg, loaded)).rejects.toThrow("member store");
+  });
+
+  test("a store folder without its login file is not used", async () => {
+    process.env.AIS_GATEWAY_MEMBERS_DIR = opts.memberRoot!;
+    process.env.AIS_GATEWAY_MEMBER_STORE = "1";
+    await mkdir(storeOf("claude", "alpha"), { recursive: true });
+    await writeFile(join(storeOf("claude", "alpha"), ".claude.json"), "{}");
+    expect((await loadIdentitiesFile(opts.registries!.claude!)).identities.find((i) => i.name === "alpha")?.configDir).toBe(dirOf(".claude", "alpha"));
+  });
+});

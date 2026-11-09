@@ -8,6 +8,8 @@ import { hostname, networkInterfaces } from "node:os";
 import { ERROR_PEEK_BYTES, GATEWAY_MARK_HEADER, isQuotaBody, peek, readBody, stripHopByHop, upstreamHeaders, type Body } from "./app.ts";
 import { GatewayCredentialError, loginCommand, NotRefreshableError, RefreshCooldownError, type CredentialCache } from "./credentials.ts";
 import { providerError } from "./errors.ts";
+import { enableMemberStore } from "../identities/gateway-members.ts";
+import { LOCAL_GATEWAY_ROUTES } from "./local-routes.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 
@@ -28,10 +30,7 @@ const MODEL_NOT_FOUND = /"code"\s*:\s*"model_not_found"/;
 
 type Tool = "claude" | "codex";
 
-const ROUTES: Record<string, { tool: Tool; app: string; style: ApiStyle }> = {
-  claude: { tool: "claude", app: "agents-claude", style: "anthropic" },
-  codex: { tool: "codex", app: "agents-codex", style: "openai" },
-};
+const ROUTES = LOCAL_GATEWAY_ROUTES;
 
 export interface LocalGatewayDeps {
   /** Cluster gateway origin, no trailing path. */
@@ -440,6 +439,7 @@ export interface StartLocalOptions {
 
 /** Starts the loopback-only listener. It never binds anything but 127.0.0.1. */
 export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{ host: string; port: number; gateway: LocalGateway; stop(): void; drain(): Promise<void> }> {
+  enableMemberStore();
   const { CredentialCache } = await import("./credentials.ts");
   const { appTokenKey, readSecretsKey } = await import("../cli/gateway/secrets-file.ts");
   const now = opts.now ?? Date.now;

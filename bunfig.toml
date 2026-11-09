@@ -1,4 +1,5 @@
 [test]
+preload = ["./test/setup-env.ts"]
 # mods/ tests need the Claude Code engine (`claude plugin test`), not bun.
 # apps/host e2e specs and the *.test.* harness entries are Playwright fixtures (`bun run test:smoke`), not bun tests.
 pathIgnorePatterns = ["mods/**", "apps/host/e2e/**", "apps/host/src/**"]

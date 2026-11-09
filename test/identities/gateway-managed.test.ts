@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HEARTBEAT_FRESH_MS, writeHeartbeat } from "../../src/identities/gateway-heartbeat.ts";
@@ -113,5 +113,65 @@ describe("nothing local refreshes a gateway-owned login", () => {
       else process.env.AIS_GATEWAY_HEARTBEAT = savedBeat;
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("an account moved into the gateway member store is the gateway's", () => {
+  let root: string;
+  let registry: string;
+  const env: Record<string, string | undefined> = {};
+  const keys = ["AIS_GATEWAY_OWNER", "AIS_GATEWAY_HEARTBEAT", "AIS_GATEWAY_MEMBERS_DIR"];
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "ais-gw-managed-store-"));
+    registry = join(root, "identities.json");
+    await writeFile(registry, JSON.stringify({
+      version: 1,
+      identities: [
+        { name: "moved", label: "moved", configDir: join(root, "moved") },
+        { name: "plain", label: "plain", configDir: join(root, "plain") },
+        { name: "old", label: "old", configDir: join(root, "old"), retired: true },
+      ],
+    }));
+    for (const k of keys) env[k] = process.env[k];
+    process.env.AIS_GATEWAY_HEARTBEAT = join(root, "no-heartbeat.json"); // no heartbeat at all
+    process.env.AIS_GATEWAY_MEMBERS_DIR = join(root, "members");
+    for (const [tool, file] of [["claude", ".credentials.json"], ["codex", "auth.json"]] as const) {
+      for (const name of ["moved", "old"]) {
+        await mkdir(join(root, "members", tool, name), { recursive: true });
+        await writeFile(join(root, "members", tool, name, file), "{}");
+      }
+    }
+  });
+  afterEach(async () => {
+    for (const k of keys) {
+      if (env[k] === undefined) delete process.env[k];
+      else process.env[k] = env[k];
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+
+  test("claimed by every non-owner process without a heartbeat; never by the gateway itself", async () => {
+    process.env.AIS_GATEWAY_OWNER = "0";
+    for (const tool of ["claude", "codex"]) {
+      expect(await isGatewayManagedHere(tool, "moved", registry)).toBe(true);
+      expect(await isGatewayManagedHere(tool, "plain", registry)).toBe(false);
+    }
+    process.env.AIS_GATEWAY_OWNER = "1";
+    expect(await isGatewayManagedHere("claude", "moved", registry)).toBe(false);
+  });
+
+  test("claude lists a moved account even outside a gateway-routed pool (retired ones excluded)", async () => {
+    expect((await listGatewayManagedAccounts(registry, "claude")).map((i) => i.name)).toEqual(["moved"]);
+  });
+
+  test("a non-owner refresh of a moved claude account is skipped with no request", async () => {
+    const { refreshIdentityOAuthGrant } = await import("../../src/identities/oauth-refresh.ts");
+    process.env.AIS_GATEWAY_OWNER = "0";
+    let posts = 0;
+    const fetchImpl = (async () => { posts++; return new Response("{}", { status: 500 }); }) as unknown as typeof fetch;
+    const r = await refreshIdentityOAuthGrant("claude", { name: "moved", label: "moved", configDir: join(root, "moved") }, { force: true, claudeRegistryPath: registry, fetchImpl });
+    expect(r.outcome).toBe("skipped-fresh");
+    expect(posts).toBe(0);
   });
 });
