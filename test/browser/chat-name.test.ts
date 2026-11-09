@@ -118,3 +118,63 @@ test("codex shim with no id in env: key stays agent-<ppid>, name comes from the 
   expect(ctx.session.id).toBe(`agent-${process.ppid}`);
   expect(ctx.chatName).toBeDefined();
 });
+
+test("session_end never waits for chat-name lookups and reuses the last label", async () => {
+  const bodies: any[] = [];
+  let hang = false;
+  const c: ShimContext = {
+    gatewayUrl: async () => "http://gw.test",
+    token: async () => "tok",
+    session: { id: "s1", identity: "work", label: "fallback" },
+    chatName: () => (hang ? new Promise<string>(() => {}) : Promise.resolve("my chat")),
+    fetch: (async (_u: string, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return Response.json({ id: "x", ok: true, content: [{ type: "text", text: "ok" }] }); }) as unknown as typeof fetch,
+  };
+  await handleRpc({ id: 1, method: "tools/call", params: { name: "list_browsers", arguments: {} } }, c);
+  hang = true;
+  const { sendSessionEnd } = await import("../../src/browser/mcp-shim.ts");
+  const t = performance.now();
+  await sendSessionEnd(c);
+  expect(performance.now() - t).toBeLessThan(500);
+  expect(bodies.map((b) => b.tool)).toEqual(["list_browsers", "session_end"]);
+  expect(bodies[1].session.label).toBe("my chat");
+});
+
+test("a slow chat-name lookup does not hold a normal call up for long", async () => {
+  const bodies: any[] = [];
+  const c: ShimContext = {
+    gatewayUrl: async () => "http://gw.test",
+    token: async () => "tok",
+    session: { id: "s2", identity: "work", label: "fallback" },
+    chatName: () => new Promise<string>(() => {}),
+    fetch: (async (_u: string, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return Response.json({ id: "x", ok: true, content: [{ type: "text", text: "ok" }] }); }) as unknown as typeof fetch,
+  };
+  const t = performance.now();
+  await handleRpc({ id: 1, method: "tools/call", params: { name: "list_browsers", arguments: {} } }, c);
+  expect(performance.now() - t).toBeLessThan(3000);
+  expect(bodies[0].session.label).toBe("fallback");
+});
+
+test("codex: title from a large rollout among many others is found by file name without a full scan", async () => {
+  const day = join(dir, "sessions", "2026", "11", "09");
+  await mkdir(day, { recursive: true });
+  const meta = (id: string) => ({ type: "session_meta", payload: { id, cwd: "/work/example", timestamp: "2026-11-09T10:00:00Z" } });
+  for (let i = 0; i < 100; i++) {
+    const other = `00000000-0000-0000-0000-${String(i).padStart(12, "0")}`;
+    await writeFile(join(day, `rollout-2026-11-09T10-00-00-${other}.jsonl`), jl(meta(other)));
+  }
+  const filler = JSON.stringify({ type: "response_item", payload: { type: "function_call_output", output: "x".repeat(1_000_000) } }) + "\n";
+  await writeFile(join(day, `rollout-2026-11-09T10-00-00-${ID}.jsonl`), jl(meta(ID), { type: "event_msg", payload: { type: "user_message", message: "fix the example.com login" } }) + filler.repeat(20));
+  const get = chatNameResolver({ tool: "codex", configDirs: [dir], id: ID, now: () => 0 });
+  const t = performance.now();
+  expect(await get()).toBe("fix the example.com login");
+  expect(performance.now() - t).toBeLessThan(1000);
+});
+
+test("codex: non-object JSON lines in session_index.jsonl do not throw", async () => {
+  await writeFile(join(dir, "session_index.jsonl"), `null\n42\n"str"\n[1]\n${JSON.stringify({ id: ID, thread_name: "renamed chat" })}\n`);
+  const get = chatNameResolver({ tool: "codex", configDirs: [dir], id: ID, now: () => 0 });
+  expect(await get()).toBe("renamed chat");
+  // An empty id used to match the missing id of an unparsable line and throw on `entry.thread_name`.
+  const { codexSessionTitle } = await import("../../src/cli/sessions/codex.ts");
+  expect(await codexSessionTitle(dir, "")).toBeUndefined();
+});
