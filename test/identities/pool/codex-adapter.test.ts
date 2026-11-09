@@ -227,6 +227,15 @@ describe("codex helpers", () => {
     expect(await usage([], "unavailable")).toMatchObject({ status: "unavailable", error: "nope" });
   });
 
+  test("fetchUsage gives reset times as ISO from the epoch, not the yearless display string", async () => {
+    const member: Identity = { name: "a", label: "a", configDir: dirOf("a") };
+    const resetsAtMs = Date.parse("2026-11-02T13:00:00.000Z");
+    const result = await codexAdapter.fetchUsage(member, {
+      fetchCodexLimits: async () => ({ toolName: "codex" as const, identity: member, status: "live" as const, windows: [{ label: "session", category: "session" as const, usedPercent: 5, resetsAt: "Nov 2, 1:00 PM", resetsAtMs }, { label: "week", category: "week" as const, usedPercent: 7, resetsAt: "Nov 9, 1:00 PM" }] }),
+    });
+    expect(result.windows).toEqual([{ label: "session", utilization: 5, resetsAt: "2026-11-02T13:00:00.000Z" }, { label: "week", utilization: 7 }]);
+  });
+
   test("countCodexSessions matches codex processes by CODEX_HOME from /proc", async () => {
     const proc = join(root, "proc");
     const fake = async (pid: string, argv: string[], home: string | undefined) => {

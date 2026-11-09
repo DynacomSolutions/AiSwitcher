@@ -171,7 +171,13 @@ speech call is not a model call); the daily token cap does.
   `GET /api/oauth/usage` (the windows of the member the pool would pick) and
   `GET /api/oauth/profile` (the app name only); codex
   `GET /rate-limit-reset-credits` (also under `/api/codex` and `/wham`), which is
-  the total over the pool's members, and `POST .../consume`, which is refused.
+  the total over the pool's members, and `POST .../consume`, which is refused;
+  codex `GET /wham/usage` (also `/api/codex/usage`): the pinned identity's or least-used member's windows in ChatGPT's
+  `wham/usage` shape (`plan_type` always `pro`; 502 when no member has figures).
+- **Codex `/backend-api` prefix**: codex 0.166 reads `account/rateLimits/read` from `<chatgpt_base_url>/wham/usage`
+  when its config sets `chatgpt_base_url` and `auth.json` holds a placeholder ChatGPT login whose `access_token` is the
+  app token (how T3 Code shows limits for gateway Codex instances). Every served codex path is also accepted under
+  `/backend-api`; any other `/backend-api/*` path (plugins, `ps/plugins/*`, any method) is 404 with no upstream call.
 - **Side routes** (lists, search, fetch, speech) pass the provider's 401/402/403/429 straight to the app: no login
   refresh, no pool hold, no failover. Side and served calls are counted per app and day apart from tokens (default 5000 a
   day, `AIS_GATEWAY_SIDE_DAILY_LIMIT`; over it the answer is 429); no token rows are written for them. Codex reset credits

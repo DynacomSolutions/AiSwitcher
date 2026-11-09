@@ -515,6 +515,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   async function run(): Promise<Response> {
   if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
   const route = routeFor(app.provider, style, req.method, rest);
+  // ChatGPT account paths a codex client asks for under /backend-api (plugins and the like): never forwarded with a login.
+  if (route?.kind === "deny") return reject(route.status, "this path is not available through the gateway");
   // Claude's account, profile and organisation paths are never forwarded (the gateway serves usage and profile itself).
   if (app.provider === "claude" && route?.kind !== "serve" && isClaudeAccountPath(rest)) return reject(403, "this path is not available through the gateway");
   /** A list, search or speech call is not a model call: no model allowlist, and its upstream errors never touch logins or the pool. */

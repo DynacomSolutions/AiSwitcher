@@ -314,7 +314,8 @@ export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
       return {
         status: maxUtilization >= 100 ? "rate-limited" : "live",
         maxUtilization,
-        windows: result.windows.map((w) => ({ label: w.label, utilization: w.usedPercent, ...(w.resetsAt ? { resetsAt: w.resetsAt } : {}) })),
+        // resetsAt on a limit window is a display string with no year; every PoolUsage reader parses ISO, so use the epoch.
+        windows: result.windows.map((w) => ({ label: w.label, utilization: w.usedPercent, ...(w.resetsAtMs !== undefined && Number.isFinite(w.resetsAtMs) ? { resetsAt: new Date(w.resetsAtMs).toISOString() } : {}) })),
         ...(result.extraUsage ? { extraUsage: result.extraUsage } : {}),
         capturedAt,
       };
