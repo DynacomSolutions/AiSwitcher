@@ -8,12 +8,8 @@ import { writeFileAtomic } from "./pool/fs.ts";
  * Claude Code shows its native "continue automatically / stop and wait" limit handling only in OAuth (subscriber)
  * mode, never with an `apiKeyHelper`. Such an identity therefore holds a `claudeAiOauth` entry whose access token is the
  * gateway app token (never a member login). Findings from live runs of Claude Code 2.1.316:
- *   - `refreshToken: null` and a far-future expiry keep it off the refresh call to the real Anthropic host (a gateway
- *     token is rejected there, and a failed refresh ends the session with "Login expired");
- *   - `user:profile` is what makes Claude Code ask for its limits at all (`GET api.anthropic.com/api/oauth/usage`, plus
- *     the profile). The scope list is only read by the client: the token is still the gateway token, which Anthropic
- *     refuses, so the scope grants nothing upstream. With the gateway's local usage proxy (gateway/usage-proxy.ts) as
- *     HTTPS_PROXY those two calls are answered from the gateway; without it they fail and the session runs as before;
+ *   - `refreshToken: null` and the single scope `user:inference` keep it off the profile and refresh calls that go to the
+ *     real Anthropic hosts (a gateway token is rejected there, and a failed refresh ends the session with "Login expired");
  *   - `subscriptionType: "max"` gives the "Claude Max" banner and the limit menu.
  */
 
@@ -23,7 +19,7 @@ export const GATEWAY_CLAUDE_APP = "agents-claude";
 export const GATEWAY_TOKEN_PREFIX = "aisg_";
 /** 2100-01-01T00:00:00Z in ms: Claude Code never tries to refresh the entry. */
 export const GATEWAY_ENTRY_EXPIRES_AT_MS = 4_102_444_800_000;
-export const GATEWAY_ENTRY_SCOPES = ["user:inference", "user:profile"];
+export const GATEWAY_ENTRY_SCOPES = ["user:inference"];
 
 export const isGatewayAccessToken = (token: unknown): boolean => typeof token === "string" && token.startsWith(GATEWAY_TOKEN_PREFIX);
 

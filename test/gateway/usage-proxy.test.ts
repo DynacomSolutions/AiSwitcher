@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { X509Certificate } from "node:crypto";
+import { createPrivateKey, X509Certificate } from "node:crypto";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -7,7 +7,6 @@ import { join } from "node:path";
 import tls from "node:tls";
 import { caCertPath, ensureLocalCa, issueLeaf, type LocalCa } from "../../src/gateway/local-ca.ts";
 import { secretsTokenResolver, startUsageProxy, type RunningUsageProxy } from "../../src/gateway/usage-proxy.ts";
-import { gatewayEntryText } from "../../src/identities/claude-gateway-entry.ts";
 
 const APP_TOKEN = "aisg_abcdefgh_" + "x".repeat(43);
 const OTHER_BEARER = ["Bearer", "not-an-app-token"].join(" ");
@@ -119,6 +118,14 @@ describe("local CA", () => {
     expect(leaf.ca).toBe(false);
   });
 
+  test("two concurrent starts end with one matching key and certificate", async () => {
+    const d = join(dir, "ca5");
+    const [a, b] = await Promise.all([ensureLocalCa(d), ensureLocalCa(d)]);
+    expect(a.certPem).toBe(b.certPem);
+    const onDisk = new X509Certificate(await readFile(join(d, "ca.pem"), "utf8"));
+    expect(onDisk.checkPrivateKey(createPrivateKey(await readFile(join(d, "ca-key.pem"), "utf8")))).toBe(true);
+  });
+
   test("replaces a CA whose key does not match", async () => {
     const d = join(dir, "ca3");
     const first = await ensureLocalCa(d);
@@ -140,6 +147,20 @@ describe("secretsTokenResolver", () => {
     expect(await resolve(APP_TOKEN)).toBe("t3-claude-team");
     t = 5_000;
     expect(await resolve(APP_TOKEN)).toBeUndefined();
+  });
+
+  test("a miss re-reads once the copy is 1 s old, so a rotated token is found", async () => {
+    let entries = new Map<string, string>();
+    let t = 0;
+    let reads = 0;
+    const resolve = secretsTokenResolver(async () => (reads++, entries), () => t);
+    expect(await resolve(APP_TOKEN)).toBeUndefined();
+    entries = new Map([["AIS_GATEWAY_APP_T3_CLAUDE_TEAM_TOKEN", APP_TOKEN]]);
+    expect(await resolve(APP_TOKEN)).toBeUndefined();
+    expect(reads).toBe(1);
+    t = 1_000;
+    expect(await resolve(APP_TOKEN)).toBe("t3-claude-team");
+    expect(reads).toBe(2);
   });
 });
 
@@ -184,6 +205,14 @@ describe("usage proxy", () => {
     expect(calls[0]!.method).toBe("POST");
     expect(calls[0]!.body).toBe('{"a":1}');
     expect(calls[0]!.headers.has("host")).toBe(false);
+  });
+
+  test("a gateway token the lookup does not know is refused, never sent to the real host", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls, { appForToken: async () => undefined });
+    const res = await viaProxy(p.port, { path: "/api/oauth/usage", headers: { authorization: `Bearer ${APP_TOKEN}` } });
+    expect(res.status).toBe(401);
+    expect(calls).toHaveLength(0);
   });
 
   test("with no gateway URL an app usage request is refused, never sent upstream", async () => {
@@ -231,13 +260,10 @@ describe("usage proxy", () => {
     const socket = net.connect(p.port, "127.0.0.1");
     socket.write("GET http://example.com/ HTTP/1.1\r\nhost: example.com\r\n\r\n");
     const first = await new Promise<string>((r) => socket.once("data", (d: Buffer) => r(d.toString())));
-    socket.destroy();
     expect(first.startsWith("HTTP/1.1 405")).toBe(true);
+    // The proxy closes its side even when the client keeps the connection open.
+    await new Promise<void>((r) => socket.once("close", () => r()));
   });
-});
-
-test("the gateway entry carries user:profile so Claude Code asks for its limits", () => {
-  expect(JSON.parse(gatewayEntryText(APP_TOKEN)).claudeAiOauth.scopes).toEqual(["user:inference", "user:profile"]);
 });
 
 afterAll(() => rm(dir, { recursive: true, force: true }));

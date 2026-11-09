@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import net from "node:net";
 import { stripHopByHop } from "./app.ts";
 import { collapseSlashes } from "./routes.ts";
+import { GATEWAY_TOKEN_PREFIX } from "../identities/claude-gateway-entry.ts";
 import { ensureLocalCa, issueLeaf, type LocalCa } from "./local-ca.ts";
 
 /**
@@ -21,6 +22,7 @@ export const INTERCEPTED_HOST = "api.anthropic.com";
 const SERVED_PATHS = new Set(["/api/oauth/usage", "/api/oauth/profile"]);
 const MAX_HEAD = 16 * 1024;
 const REMOTE_TIMEOUT_MS = 15_000;
+const HEAD_TIMEOUT_MS = 30_000;
 
 export interface UsageProxyOptions {
   port?: number;
@@ -54,18 +56,24 @@ export function secretsTokenResolver(read: () => Promise<Map<string, string>>, n
   let cache: { at: number; entries: Array<{ app: string; digest: Buffer }> } | undefined;
   const digest = (s: string): Buffer => createHash("sha256").update(s).digest();
   return async (token) => {
-    if (!cache || now() - cache.at >= 5_000) {
-      const entries: Array<{ app: string; digest: Buffer }> = [];
-      for (const [key, value] of await read().catch(() => new Map<string, string>())) {
-        const m = /^AIS_GATEWAY_APP_([A-Z0-9_]+)_TOKEN$/.exec(key);
-        if (m && value) entries.push({ app: m[1]!.toLowerCase().replace(/_/g, "-"), digest: digest(value) });
-      }
-      cache = { at: now(), entries };
-    }
     const given = digest(token);
-    let found: string | undefined;
-    for (const e of cache.entries) if (timingSafeEqual(e.digest, given)) found ??= e.app;
-    return found;
+    const hit = (): string | undefined => {
+      let found: string | undefined;
+      for (const e of cache?.entries ?? []) if (timingSafeEqual(e.digest, given)) found ??= e.app;
+      return found;
+    };
+    // Re-read every 5 s, and on a miss once the copy is 1 s old (a token rotated a moment ago).
+    if (cache && now() - cache.at < 5_000) {
+      const found = hit();
+      if (found || now() - cache.at < 1_000) return found;
+    }
+    const entries: Array<{ app: string; digest: Buffer }> = [];
+    for (const [key, value] of await read().catch(() => new Map<string, string>())) {
+      const m = /^AIS_GATEWAY_APP_([A-Z0-9_]+)_TOKEN$/.exec(key);
+      if (m && value) entries.push({ app: m[1]!.toLowerCase().replace(/_/g, "-"), digest: digest(value) });
+    }
+    cache = { at: now(), entries };
+    return hit();
   };
 }
 
@@ -133,6 +141,8 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       if (req.method === "GET" && SERVED_PATHS.has(path) && token) {
         const answer = await served(req, url, path, token);
         if (answer) return answer;
+        // A gateway token the lookup does not know (rotated, ~/.secrets missing) is never handed to the real host.
+        if (token.startsWith(GATEWAY_TOKEN_PREFIX)) return Response.json({ type: "error", error: { type: "authentication_error", message: "unknown AIS gateway token" } }, { status: 401 });
       }
       return passthrough(req, url);
     },
@@ -141,8 +151,10 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
 
   const server = net.createServer((client) => {
     let head = Buffer.alloc(0);
+    // The CONNECT head must arrive promptly; an open tunnel has no timeout.
+    client.setTimeout(HEAD_TIMEOUT_MS, () => client.destroy());
     const fail = (status: string): void => {
-      client.end(`HTTP/1.1 ${status}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
+      client.end(`HTTP/1.1 ${status}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`, () => client.destroy());
     };
     const onData = (chunk: Buffer): void => {
       head = Buffer.concat([head, chunk]);
@@ -155,6 +167,7 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
         return;
       }
       client.off("data", onData);
+      client.setTimeout(0);
       client.pause();
       const rest = head.subarray(end + 4);
       const line = head.subarray(0, head.indexOf("\r\n")).toString("latin1");
