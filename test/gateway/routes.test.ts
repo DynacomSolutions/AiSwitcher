@@ -306,6 +306,21 @@ describe("served from pool state", () => {
     expect(body.rate_limit).toMatchObject({ allowed: false, limit_reached: true, primary_window: { used_percent: 100, reset_at: nowSec + 18_000 }, secondary_window: { used_percent: 20 } });
   });
 
+  test("codex usage keeps each window's own length: a monthly-only account is one 30-day primary window", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    usage.a = { status: "live", maxUtilization: 99, capturedAt: "", windows: [{ label: "month", utilization: 99, resetsAt: "2026-11-20T10:00:00.000Z" }] };
+    const body = (await (await call("c", "/backend-api/wham/usage", { method: "GET" })).json()) as { rate_limit: Record<string, unknown> };
+    expect(body.rate_limit).toEqual({ allowed: true, limit_reached: false, primary_window: { used_percent: 99, limit_window_seconds: 30 * 86_400, reset_after_seconds: 18 * 86_400, reset_at: nowSec + 18 * 86_400 }, secondary_window: null });
+  });
+
+  test("codex usage orders windows by length whatever their order, and reads ~Nh/~Nd labels", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    usage.a = { status: "live", maxUtilization: 40, capturedAt: "", windows: [{ label: "~3d", utilization: 40 }, { label: "~2h", utilization: 10 }, { label: "mystery", utilization: 90 }] };
+    const body = (await (await call("c", "/backend-api/wham/usage", { method: "GET" })).json()) as { rate_limit: { primary_window: Record<string, number>; secondary_window: Record<string, number> } };
+    expect(body.rate_limit.primary_window).toMatchObject({ used_percent: 10, limit_window_seconds: 7_200 });
+    expect(body.rate_limit.secondary_window).toMatchObject({ used_percent: 40, limit_window_seconds: 3 * 86_400 });
+  });
+
   test("codex usage with no figures is 502, not an invented 0%", async () => {
     await addApp("c", "codex", "openai");
     expect((await call("c", "/backend-api/wham/usage", { method: "GET" })).status).toBe(502);
