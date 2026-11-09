@@ -188,29 +188,25 @@ speech call is not a model call); the daily token cap does.
   `oauth/profile` itself. Every other `/api/*` path passes through. Repeated slashes in any app path are collapsed before
   matching and before the path is sent upstream.
 
-### Claude limits for gateway-routed Claude Code (usage proxy)
+### Claude limits for gateway-routed Claude Code (CONNECT proxy)
 
 Claude Code reads its limits from a fixed host (`https://api.anthropic.com/api/oauth/usage`), never from
-`ANTHROPIC_BASE_URL`, and only when its login has the `user:profile` scope. `ais gateway local` also runs a CONNECT
-proxy on `127.0.0.1:47141` (`AIS_GATEWAY_LOCAL_PROXY_PORT`, `off` disables it) for those clients. A client that wants
-its limits sets both lines below and adds `user:profile` to the `scopes` of its gateway-token `.credentials.json` (the
-token is still the gateway app token, so the scope grants nothing upstream). AIS's own gateway entry keeps only
-`user:inference`: without the proxy, that scope would send the gateway token to the real host.
+`ANTHROPIC_BASE_URL`, and only when its login has the `user:profile` scope. `ais gateway serve` runs a CONNECT proxy
+for those clients when the deployment mounts a certificate for `api.anthropic.com` (`AIS_GATEWAY_CONNECT_TLS_DIR`,
+a cert-manager secret with `tls.crt`, `tls.key`, `ca.crt`; port `AIS_GATEWAY_CONNECT_PORT`, default 47132). The
+certificate and its CA are cluster-managed (.cluster); the gateway makes none. `AIS_GATEWAY_CONNECT_CA_PUBLISH` copies
+`ca.crt` to a host path for clients. Without the TLS dir the proxy is off; a proxy that cannot start never stops the gateway.
 
-```sh
-HTTPS_PROXY=http://127.0.0.1:47141
-NODE_EXTRA_CA_CERTS=$HOME/.ais/gateway-local-ca/ca.pem
-```
+A client sets `HTTPS_PROXY` to the proxy and `NODE_EXTRA_CA_CERTS` to the published CA, and adds `user:profile` to the
+`scopes` of its gateway-token `.credentials.json` (the token is still the gateway app token, so the scope grants nothing
+upstream). AIS's own gateway entry keeps only `user:inference`: without the proxy, that scope would send the gateway
+token to the real host.
 
-- Every CONNECT is a plain tunnel except `api.anthropic.com:443`, whose TLS the proxy terminates with a certificate from
-  the AIS local CA (`~/.ais/gateway-local-ca/`, key 0600, created on first start; `AIS_GATEWAY_LOCAL_CA_DIR` overrides).
-  The CA has a critical name constraint: `api.anthropic.com` only, no IP addresses. The system trust store is never
-  touched; clients trust it only through `NODE_EXTRA_CA_CERTS`.
-- On that host, `GET /api/oauth/usage` and `GET /api/oauth/profile` whose bearer is one of the `AIS_GATEWAY_APP_*_TOKEN`
-  values in `~/.secrets` are answered by the cluster gateway's served route for that app (`<remote>/<app>/api/oauth/...`,
-  same token). A gateway token (`aisg_`) the lookup does not know is answered 401 there, never sent on. Anything else on that host (other paths, other methods, any other bearer) is forwarded unchanged.
-- No pool member login is read or sent by the proxy. A running client reads `NODE_EXTRA_CA_CERTS` at start, so a new CA
-  (deleted or expiring) needs a client restart.
+- Every CONNECT is a plain TCP tunnel except `api.anthropic.com:443`, whose TLS the proxy terminates.
+- On that host, `GET /api/oauth/usage` and `GET /api/oauth/profile` with an `aisg_` bearer are answered by the gateway's
+  served route for the active claude app the token belongs to. An `aisg_` token the gateway does not accept gets 401
+  there and is never sent on. Anything else on that host is forwarded unchanged.
+- No pool member login is read or sent by the proxy. A renewed certificate is picked up within 5 minutes.
 
 ### Public host
 

@@ -1,118 +1,101 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { readFile, stat, writeFile, rename } from "node:fs/promises";
 import net from "node:net";
-import { stripHopByHop } from "./app.ts";
+import { join } from "node:path";
 import { collapseSlashes } from "./routes.ts";
 import { GATEWAY_TOKEN_PREFIX } from "../identities/claude-gateway-entry.ts";
-import { ensureLocalCa, issueLeaf, type LocalCa } from "./local-ca.ts";
 
 /**
- * The usage proxy: an HTTP CONNECT proxy for gateway-routed Claude Code (HTTPS_PROXY plus NODE_EXTRA_CA_CERTS).
+ * The gateway's CONNECT proxy, for gateway-routed Claude Code (clients set HTTPS_PROXY and NODE_EXTRA_CA_CERTS).
  *
  * Claude Code asks for its limits at a fixed host (`https://api.anthropic.com/api/oauth/usage`), never at
  * ANTHROPIC_BASE_URL, so with a gateway login it gets a refusal and shows no limits. This proxy:
  * - tunnels every CONNECT untouched (plain TCP pipe, no TLS termination), except
- * - CONNECT to api.anthropic.com:443, whose TLS it terminates with a certificate from the AIS local CA. On that
- *   connection `GET /api/oauth/usage` and `GET /api/oauth/profile` carrying a gateway app token (one of the
- *   AIS_GATEWAY_APP_*_TOKEN values in ~/.secrets) are answered by the cluster gateway's served route for that app,
- *   with that same token. Every other request (other paths, other methods, any other bearer) is forwarded to the real
- *   host byte for byte (headers, body, compressed answer). No pool member's login is ever read or sent here.
+ * - CONNECT to api.anthropic.com:443, whose TLS it terminates with the certificate the cluster issues for that name
+ *   (cert-manager, mounted as `tls.crt`/`tls.key`/`ca.crt`; the proxy makes no certificates). On that connection
+ *   `GET /api/oauth/usage` and `GET /api/oauth/profile` with a gateway app token are answered by the gateway itself
+ *   (the app's served route). A gateway token the gateway does not accept is answered 401 and never sent on. Every
+ *   other request is forwarded to the real host unchanged (headers, body, compressed answer).
+ * No pool member login is ever read or sent here.
  */
-export const USAGE_PROXY_DEFAULT_PORT = 47141;
 export const INTERCEPTED_HOST = "api.anthropic.com";
 const SERVED_PATHS = new Set(["/api/oauth/usage", "/api/oauth/profile"]);
 const MAX_HEAD = 16 * 1024;
-const REMOTE_TIMEOUT_MS = 15_000;
 const HEAD_TIMEOUT_MS = 30_000;
+/** How often the mounted certificate is checked for a renewal. */
+const TLS_RECHECK_MS = 5 * 60_000;
 
 export interface UsageProxyOptions {
-  port?: number;
-  /** Cluster gateway base (`https://host/gateway`); empty: usage requests with an app token answer 503. */
-  remoteBase: string;
-  /** The gateway app a bearer token belongs to, or undefined when it is not an app token. */
+  port: number;
+  host?: string;
+  /** Directory holding `tls.crt`, `tls.key` and (optionally) `ca.crt`: a cert-manager secret mount. */
+  tlsDir: string;
+  /** Where to copy `ca.crt` for clients (NODE_EXTRA_CA_CERTS), if anywhere. */
+  publishCaTo?: string;
+  /** The app a gateway token belongs to (an active app whose token verifies), else undefined. */
   appForToken(token: string): Promise<string | undefined>;
-  ca?: LocalCa;
-  caDir?: string;
+  /** Answers a served path for an app (the gateway's own handler; the request carries the same token). */
+  serve(app: string, path: string, req: Request): Promise<Response>;
   fetch?: typeof fetch;
   /** Where intercepted requests that are not served go (tests point it elsewhere). */
   passthroughOrigin?: string;
   /** Test hook: where a plain CONNECT goes instead of the requested host:port. */
   connectTarget?(host: string, port: number): { host: string; port: number };
   log?(line: string): void;
+  tlsRecheckMs?: number;
 }
 
 export interface RunningUsageProxy {
   port: number;
-  caCertPath: string;
   /** Stops listening; `force` also ends open intercepted connections (plain tunnels end with their sockets). */
-  stop(force?: boolean): void;
+  stop(force?: boolean): Promise<void>;
+}
+
+const HOP_BY_HOP = ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"];
+
+function hopClean(headers: Headers): Headers {
+  const out = new Headers(headers);
+  for (const name of (out.get("connection") ?? "").split(",")) if (name.trim()) out.delete(name.trim());
+  for (const h of HOP_BY_HOP) out.delete(h);
+  return out;
 }
 
 function bearerOf(headers: Headers): string | undefined {
   return /^bearer\s+(\S+)$/i.exec(headers.get("authorization")?.trim() ?? "")?.[1];
 }
 
-/** `appForToken` backed by the ~/.secrets app tokens (re-read at most every 5 s, so a rotation is picked up). */
-export function secretsTokenResolver(read: () => Promise<Map<string, string>>, now: () => number = Date.now): (token: string) => Promise<string | undefined> {
-  let cache: { at: number; entries: Array<{ app: string; digest: Buffer }> } | undefined;
-  const digest = (s: string): Buffer => createHash("sha256").update(s).digest();
-  return async (token) => {
-    const given = digest(token);
-    const hit = (): string | undefined => {
-      let found: string | undefined;
-      for (const e of cache?.entries ?? []) if (timingSafeEqual(e.digest, given)) found ??= e.app;
-      return found;
-    };
-    // Re-read every 5 s, and on a miss once the copy is 1 s old (a token rotated a moment ago).
-    if (cache && now() - cache.at < 5_000) {
-      const found = hit();
-      if (found || now() - cache.at < 1_000) return found;
-    }
-    const entries: Array<{ app: string; digest: Buffer }> = [];
-    for (const [key, value] of await read().catch(() => new Map<string, string>())) {
-      const m = /^AIS_GATEWAY_APP_([A-Z0-9_]+)_TOKEN$/.exec(key);
-      if (m && value) entries.push({ app: m[1]!.toLowerCase().replace(/_/g, "-"), digest: digest(value) });
-    }
-    cache = { at: now(), entries };
-    return hit();
-  };
+async function readTls(dir: string): Promise<{ cert: string; key: string; ca?: string; mtime: number }> {
+  const [cert, key, st] = await Promise.all([readFile(join(dir, "tls.crt"), "utf8"), readFile(join(dir, "tls.key"), "utf8"), stat(join(dir, "tls.crt"))]);
+  const ca = await readFile(join(dir, "ca.crt"), "utf8").catch(() => undefined);
+  return { cert, key, ...(ca ? { ca } : {}), mtime: st.mtimeMs };
 }
 
-function hopClean(headers: Headers): Headers {
-  const out = new Headers(headers);
-  stripHopByHop(out);
-  return out;
+async function publish(ca: string | undefined, to: string | undefined): Promise<void> {
+  if (!ca || !to) return;
+  const current = await readFile(to, "utf8").catch(() => undefined);
+  if (current === ca) return;
+  const tmp = `${to}.${process.pid}.tmp`;
+  await writeFile(tmp, ca, { mode: 0o644 });
+  await rename(tmp, to);
 }
 
-/** Starts the proxy on 127.0.0.1 (shared port, so two service slots can overlap during a restart). */
+/** Starts the proxy. Throws when the certificate cannot be read (the caller decides whether that is fatal). */
 export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningUsageProxy> {
   const log = opts.log ?? ((line: string) => console.info(line));
   const doFetch = opts.fetch ?? fetch;
-  const ca = opts.ca ?? (await ensureLocalCa(opts.caDir));
-  const leaf = issueLeaf(ca, INTERCEPTED_HOST);
-  const remoteBase = opts.remoteBase.replace(/\/+$/, "");
   const origin = (opts.passthroughOrigin ?? `https://${INTERCEPTED_HOST}`).replace(/\/+$/, "");
 
-  async function served(req: Request, url: URL, path: string, token: string): Promise<Response | undefined> {
-    const app = await opts.appForToken(token);
-    if (!app) return undefined;
-    if (!remoteBase) return Response.json({ type: "error", error: { type: "api_error", message: "AIS gateway URL not configured" } }, { status: 503 });
-    const headers = new Headers({ authorization: `Bearer ${token}`, accept: "application/json" });
-    for (const h of ["anthropic-beta", "anthropic-version", "user-agent"]) {
-      const v = req.headers.get(h);
-      if (v) headers.set(h, v);
+  async function handle(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const path = collapseSlashes(url.pathname);
+    const token = bearerOf(req.headers);
+    if (req.method === "GET" && SERVED_PATHS.has(path) && token?.startsWith(GATEWAY_TOKEN_PREFIX)) {
+      const app = await opts.appForToken(token).catch(() => undefined);
+      // A gateway token is never handed to the real host, known or not.
+      if (!app) return Response.json({ type: "error", error: { type: "authentication_error", message: "invalid AIS gateway token" } }, { status: 401 });
+      const res = await opts.serve(app, path, req).catch(() => Response.json({ type: "error", error: { type: "api_error", message: "gateway error" } }, { status: 502 }));
+      log(`gateway: connect-proxy ${path} for app ${app}: ${res.status}`);
+      return res;
     }
-    try {
-      const res = await doFetch(`${remoteBase}/${encodeURIComponent(app)}${path}${url.search}`, { headers, redirect: "manual", signal: AbortSignal.timeout(REMOTE_TIMEOUT_MS) });
-      const body = await res.arrayBuffer();
-      log(`gateway-local: usage-proxy ${path} for app ${app}: ${res.status}`);
-      return new Response(body, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
-    } catch {
-      log(`gateway-local: usage-proxy ${path} for app ${app}: gateway unreachable`);
-      return Response.json({ type: "error", error: { type: "api_error", message: "AIS gateway unreachable" } }, { status: 502 });
-    }
-  }
-
-  async function passthrough(req: Request, url: URL): Promise<Response> {
     const headers = hopClean(req.headers);
     headers.delete("host");
     const init: RequestInit & { duplex?: "half"; decompress?: boolean } = { method: req.method, headers, redirect: "manual", decompress: false };
@@ -128,26 +111,26 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     }
   }
 
-  // The TLS end of intercepted tunnels: loopback only, on a port of its own choosing.
-  const tlsServer = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    idleTimeout: 0,
-    tls: { cert: leaf.certPem, key: leaf.keyPem },
-    fetch: async (req) => {
-      const url = new URL(req.url);
-      const path = collapseSlashes(url.pathname);
-      const token = bearerOf(req.headers);
-      if (req.method === "GET" && SERVED_PATHS.has(path) && token) {
-        const answer = await served(req, url, path, token);
-        if (answer) return answer;
-        // A gateway token the lookup does not know (rotated, ~/.secrets missing) is never handed to the real host.
-        if (token.startsWith(GATEWAY_TOKEN_PREFIX)) return Response.json({ type: "error", error: { type: "authentication_error", message: "unknown AIS gateway token" } }, { status: 401 });
-      }
-      return passthrough(req, url);
-    },
-  });
-  const tlsPort = tlsServer.port as number;
+  // The TLS end of intercepted tunnels: loopback only. A renewed certificate starts a new one; the old one drains.
+  const startTls = (t: { cert: string; key: string }): ReturnType<typeof Bun.serve> =>
+    Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, tls: { cert: t.cert, key: t.key }, fetch: handle });
+  let tls = await readTls(opts.tlsDir);
+  await publish(tls.ca, opts.publishCaTo).catch((err: Error) => log(`gateway: connect-proxy could not publish ca.crt (${err.message})`));
+  let tlsServer = startTls(tls);
+  const recheck = setInterval(() => {
+    void (async () => {
+      const st = await stat(join(opts.tlsDir, "tls.crt")).catch(() => undefined);
+      if (!st || st.mtimeMs === tls.mtime) return;
+      const next = await readTls(opts.tlsDir);
+      const old = tlsServer;
+      tlsServer = startTls(next);
+      tls = next;
+      void old.stop(false);
+      await publish(next.ca, opts.publishCaTo).catch(() => undefined);
+      log("gateway: connect-proxy loaded a renewed certificate");
+    })().catch((err: Error) => log(`gateway: connect-proxy certificate reload failed (${err.message})`));
+  }, opts.tlsRecheckMs ?? TLS_RECHECK_MS);
+  recheck.unref?.();
 
   const server = net.createServer((client) => {
     let head = Buffer.alloc(0);
@@ -177,7 +160,7 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       const port = Number(m[2]);
       if (port < 1 || port > 65535) return fail("400 Bad Request");
       const intercept = host === INTERCEPTED_HOST && port === 443;
-      const target = intercept ? { host: "127.0.0.1", port: tlsPort } : (opts.connectTarget?.(host, port) ?? { host, port });
+      const target = intercept ? { host: "127.0.0.1", port: tlsServer.port as number } : (opts.connectTarget?.(host, port) ?? { host, port });
       const upstream = net.connect(target.port, target.host);
       let open = false;
       upstream.once("connect", () => {
@@ -202,18 +185,17 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen({ host: "127.0.0.1", port: opts.port ?? USAGE_PROXY_DEFAULT_PORT, reusePort: true }, () => {
+    server.listen({ host: opts.host ?? "0.0.0.0", port: opts.port }, () => {
       server.off("error", reject);
       resolve();
     });
   });
-  const addr = server.address() as net.AddressInfo;
   return {
-    port: addr.port,
-    caCertPath: ca.certPath,
-    stop: (force = true) => {
+    port: (server.address() as net.AddressInfo).port,
+    stop: async (force = true) => {
+      clearInterval(recheck);
       server.close();
-      void tlsServer.stop(force);
+      await tlsServer.stop(force);
     },
   };
 }

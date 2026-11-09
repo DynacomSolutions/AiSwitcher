@@ -4,9 +4,7 @@ import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
 import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
 import { installDrainHandlers, LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
-import { secretsTokenResolver, startUsageProxy, USAGE_PROXY_DEFAULT_PORT } from "../../gateway/usage-proxy.ts";
-import { readSecretsEntries } from "./secrets-file.ts";
-import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
+import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_CONNECT_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
 
 function portOf(flag: string | undefined, env: string | undefined, fallback: number, name: string): number {
   const raw = flag ?? env;
@@ -33,29 +31,15 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   if (!adminToken) throw new CliUsageError("AIS_GATEWAY_ADMIN_TOKEN is required");
   const port = portOf(stringFlag(flags, "port"), process.env.AIS_GATEWAY_PORT, DEFAULT_GATEWAY_PORT, "AIS_GATEWAY_PORT");
   const adminPort = portOf(stringFlag(flags, "admin-port"), process.env.AIS_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_ADMIN_PORT, "AIS_GATEWAY_ADMIN_PORT");
-  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true });
+  // The CONNECT proxy runs when the deployment mounts its certificate (AIS_GATEWAY_CONNECT_TLS_DIR).
+  const tlsDir = process.env.AIS_GATEWAY_CONNECT_TLS_DIR;
+  const connect = tlsDir
+    ? { port: portOf(undefined, process.env.AIS_GATEWAY_CONNECT_PORT, DEFAULT_GATEWAY_CONNECT_PORT, "AIS_GATEWAY_CONNECT_PORT"), tlsDir, ...(process.env.AIS_GATEWAY_CONNECT_CA_PUBLISH ? { publishCaTo: process.env.AIS_GATEWAY_CONNECT_CA_PUBLISH } : {}) }
+    : undefined;
+  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true, ...(connect ? { connect } : {}) });
   console.info(`gateway: proxy on :${gateway.port}, admin on :${gateway.adminPort}; warming up`);
   // Runs until SIGTERM or SIGINT, whose handler drains and exits the process.
   await new Promise<void>(() => {});
-}
-
-/**
- * The usage proxy next to the local gateway (HTTPS_PROXY for gateway-routed Claude Code, see usage-proxy.ts).
- * AIS_GATEWAY_LOCAL_PROXY_PORT picks the port ("off" disables it). A proxy that cannot start never stops the gateway.
- */
-async function startLocalUsageProxy(remoteBase: string): Promise<{ stop(force?: boolean): void } | undefined> {
-  const raw = process.env.AIS_GATEWAY_LOCAL_PROXY_PORT;
-  if (raw === "off") return undefined;
-  const port = portOf(undefined, raw, USAGE_PROXY_DEFAULT_PORT, "AIS_GATEWAY_LOCAL_PROXY_PORT");
-  try {
-    const resolver = secretsTokenResolver(() => readSecretsEntries());
-    const proxy = await startUsageProxy({ port, remoteBase, appForToken: resolver });
-    console.info(`gateway local: usage proxy on 127.0.0.1:${proxy.port} (CA ${proxy.caCertPath})`);
-    return proxy;
-  } catch (err) {
-    console.info(`gateway local: warning: usage proxy not started (${(err as Error).message})`);
-    return undefined;
-  }
 }
 
 async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): Promise<void> {
@@ -81,12 +65,6 @@ async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): P
   }
   const running = await startLocalGateway({ port, remoteBase, bindRetryMs: 30_000 });
   console.info(`gateway local: listening on 127.0.0.1:${running.port}`);
-  const proxy = await startLocalUsageProxy(remoteBase);
-  installDrainHandlers({
-    drain: () => {
-      proxy?.stop(false);
-      return running.drain();
-    },
-  });
+  installDrainHandlers(running);
   await new Promise<void>(() => {});
 }
