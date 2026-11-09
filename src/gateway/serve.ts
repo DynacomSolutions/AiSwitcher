@@ -8,6 +8,7 @@ import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import { findIdentityByNameOrAlias } from "../identities/store.ts";
+import { isOperationalPath, publicHostsFromEnv, viaPublicHost } from "./public-host.ts";
 import { aliSessionOnce, aliSetupSelfTest, listAliAccounts, type AliSetupDeps } from "./ali-session.ts";
 import { createAdminApp, type IdentityState } from "./admin.ts";
 import { createAlerter, stderrNotifier, watchLedger, type Alerter, type Notifier } from "./alerts.ts";
@@ -75,6 +76,8 @@ export interface GatewayHooks {
   aliRefresh?(identity: Identity, signal?: AbortSignal): Promise<string>;
   /** Replaces the startup check that the pod can renew ali sessions (kubectl, port-forward, directories). */
   aliSetup?: AliSetupDeps;
+  /** Host names the gateway is public under; metrics, health and pairing are 404 there. Defaults to AIS_GATEWAY_PUBLIC_HOSTS. */
+  publicHosts?: string[];
   /** Longest stop() waits for the keep-alive pass (ali renewals are abandoned at once on drain). Default 10 s, well inside the 30 s grace. */
   stopCeilingMs?: number;
   /** Tests: do not read or write the shared gateway heartbeat file. */
@@ -346,6 +349,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
 
   const inner = (hooks.openStore ?? ((url: string) => new PgGatewayStore(url)))(opts.databaseUrl);
   const store = new CachedGatewayStore(inner);
+  const publicHosts = hooks.publicHosts ?? publicHostsFromEnv();
   const ledger = new LedgerBuffer(store, hooks.ledger ?? { max: 50_000, flushMs: 2_000 });
   const metrics = new PrometheusMetrics({ ledgerDepth: () => ledger.depth, ledgerDropped: () => ledger.dropped });
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
@@ -397,6 +401,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     creds,
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
     canonical,
+    sideCountHealth: (ok) => (ok ? alerter.recover("side-count-unavailable", "gateway") : alerter.raise("side-count-unavailable", "gateway", "the gateway database could not count list, search and speech requests; the limit is enforced per replica from memory until it can")),
     poolMembers,
     browserPoolMembers,
     browserIdentityExists,
@@ -510,6 +515,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   });
   async function route(req: Request, srv: { timeout(r: Request, s: number): void; requestIP(r: Request): { address: string } | null }): Promise<Response> {
     const path = new URL(req.url).pathname;
+    // Operational endpoints answer only inside the cluster (vmagent and probes use the pod address): on a public host they do not exist.
+    if (isOperationalPath(path) && viaPublicHost(req.headers, req.url, publicHosts)) return markGatewayResponse(new Response("not found\n", { status: 404 }));
     if (path === "/healthz") return new Response("ok\n");
     if (path === "/readyz") return warmed && !draining ? new Response("ready\n") : new Response(draining ? "draining\n" : "warming\n", { status: 503 });
     if (path === "/metrics") return new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } });

@@ -368,6 +368,32 @@ describe("daily limits", () => {
     t += 24 * 3_600_000;
     expect(await get()).toBe(200);
   });
+  test("two gateway instances sharing one store share the count", async () => {
+    await addApp("k", "kimi", "openai");
+    deps.sideDailyLimit = 3;
+    const a = createGatewayApp(deps);
+    const b = createGatewayApp(deps); // another replica, same database
+    const hit = async (g: ReturnType<typeof createGatewayApp>) => (await g.request("http://gw.test/k/search", { method: "POST", body: "{}", headers: { authorization: `Bearer ${tokens.k}` } })).status;
+    expect([await hit(a), await hit(b), await hit(a), await hit(b)]).toEqual([200, 200, 200, 429]);
+  });
+
+  test("when the store cannot count, the replica's own memory limits, the failure is counted and reported, and requests go on", async () => {
+    await addApp("k", "kimi", "openai");
+    deps.sideDailyLimit = 2;
+    store.bumpSideCount = async () => {
+      throw new Error("db down");
+    };
+    const health: boolean[] = [];
+    const failures: string[] = [];
+    deps.sideCountHealth = (ok) => void health.push(ok);
+    deps.metrics = { ...noopMetrics, failOpen: (_a, r) => void failures.push(r) };
+    const app = createGatewayApp(deps);
+    const hit = async () => (await app.request("http://gw.test/k/search", { method: "POST", body: "{}", headers: { authorization: `Bearer ${tokens.k}` } })).status;
+    expect([await hit(), await hit(), await hit()]).toEqual([200, 200, 429]);
+    expect(health.every((h) => h === false)).toBe(true);
+    expect(failures).toContain("side_count_failed");
+  });
+
   test("chat calls are not counted against the side limit", async () => {
     await addApp("cl", "claude", "anthropic");
     deps.sideDailyLimit = 1;
@@ -395,5 +421,39 @@ describe("daily limits", () => {
     t += 61_000;
     await get();
     expect(seen.length).toBe(before + 2);
+  });
+});
+
+describe("Cloudflare headers", () => {
+  test("no cf-* header, cdn-loop or Access credential reaches a provider; ordinary headers do", async () => {
+    await addApp("cl", "claude", "anthropic");
+    await call("cl", "/v1/messages", {
+      method: "POST",
+      body: "{}",
+      headers: {
+        "cf-access-jwt-assertion": "jwt-value",
+        "cf-access-client-id": "id-value",
+        "cf-access-client-secret": ["client", "value"].join("-"),
+        "cf-connecting-ip": "client-a",
+        "cf-ray": "abc",
+        "cdn-loop": "cloudflare",
+        "anthropic-version": "2023-06-01",
+      },
+    });
+    const names = [...seen[0]!.headers.keys()];
+    expect(names.filter((n) => n.startsWith("cf-") || n === "cdn-loop")).toEqual([]);
+    expect(seen[0]!.headers.get("anthropic-version")).toBe("2023-06-01");
+  });
+  test("client and pod addresses and proxy metadata are stripped too", async () => {
+    await addApp("cl", "claude", "anthropic");
+    const meta = { "x-forwarded-for": "client-a, pod-a", "x-forwarded-proto": "https", "x-forwarded-host": "gw.public.example", "x-real-ip": "client-a", "x-request-id": "r-1", "x-envoy-external-address": "pod-a", "x-envoy-attempt-count": "1", "cf-worker": "w", forwarded: "for=client-a", "true-client-ip": "client-a" };
+    await call("cl", "/v1/messages", { method: "POST", body: "{}", headers: { ...meta, "anthropic-version": "2023-06-01" } });
+    for (const name of Object.keys(meta)) expect(seen[0]!.headers.get(name)).toBeNull();
+    expect(seen[0]!.headers.get("anthropic-version")).toBe("2023-06-01");
+  });
+  test("side routes strip them too", async () => {
+    await addApp("k", "kimi", "openai");
+    await call("k", "/search", { method: "POST", body: "{}", headers: { "cf-access-jwt-assertion": "jwt-value" } });
+    expect(seen[0]!.headers.get("cf-access-jwt-assertion")).toBeNull();
   });
 });

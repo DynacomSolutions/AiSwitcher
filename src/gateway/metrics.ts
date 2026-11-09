@@ -16,7 +16,7 @@ export interface GatewayMetrics {
   rejection(app: string, reason: "daily_cap" | "model" | "reserve" | "no_headroom" | "no_identities"): void;
   failover(app: string): void;
   /** A safety check could not run and the request was let through (for example the daily cap while the database is down). */
-  failOpen(app: string, reason: "cap_check_failed"): void;
+  failOpen(app: string, reason: "cap_check_failed" | "side_count_failed"): void;
   /** One browser tool call: `outcome` is "ok" or a browser error code. Tool is from a fixed set. */
   browserCall(tool: string, outcome: string, seconds: number): void;
   /** A browser pairing completed (token delivered). */
@@ -124,7 +124,7 @@ export class PrometheusMetrics implements GatewayMetrics {
     this.failovers.inc({ app });
   }
 
-  failOpen(app: string, reason: "cap_check_failed"): void {
+  failOpen(app: string, reason: "cap_check_failed" | "side_count_failed"): void {
     this.failOpens.inc({ app, reason });
   }
 

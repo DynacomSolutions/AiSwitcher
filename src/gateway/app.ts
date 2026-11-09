@@ -13,6 +13,7 @@ import type { GatewayMetrics } from "./metrics.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
+import { bounded } from "./refresh-guard.ts";
 import { collapseSlashes, isClaudeAccountPath, routeFor, serveRoute, sideDailyLimitFromEnv, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
@@ -43,6 +44,8 @@ export interface GatewayDeps {
   bodyBudgetBytes?: number;
   /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else 5000. */
   sideDailyLimit?: number;
+  /** Told after each side-count store call whether it worked (the server turns a failure into an owner alert). */
+  sideCountHealth?(ok: boolean): void;
   /** Waits `ms` or until `signal` aborts; tests inject a fake clock. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
@@ -60,6 +63,9 @@ export function bodyBudgetFromEnv(env: Record<string, string | undefined> = proc
 export const REPLAY_LIMIT_BYTES = 8 * 1024 * 1024;
 /** Quota errors (403) are only inspected up to this size. */
 export const ERROR_PEEK_BYTES = 64 * 1024;
+
+/** Headers a front proxy adds that identify the client or the path to it. */
+const PROXY_METADATA = new Set(["cdn-loop", "forwarded", "x-real-ip", "x-request-id", "x-client-ip", "true-client-ip"]);
 
 const HOP_BY_HOP = ["connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers", "transfer-encoding", "upgrade"];
 /** Error types or codes that mean "this login is out of quota". A bare 403 (for example "insufficient permissions") is not one. */
@@ -158,6 +164,9 @@ export function upstreamHeaders(adapter: ProviderAdapter, cred: ProviderCredenti
   const headers = new Headers(incoming);
   stripHopByHop(headers);
   for (const h of [...adapter.stripRequestHeaders, "host", "content-length", "accept-encoding"]) headers.delete(h);
+  // Cloudflare (tunnel, Access) adds its own headers, including Access JWTs and client ids/secrets: none of them goes to a provider.
+  // Proxy metadata (client and pod addresses, request ids, envoy/forwarding headers) stays inside too.
+  for (const name of [...headers.keys()]) if (name.startsWith("cf-") || name.startsWith("x-envoy-") || name.startsWith("x-forwarded-") || PROXY_METADATA.has(name)) headers.delete(name);
   headers.set("accept-encoding", "identity");
   for (const [k, v] of Object.entries(adapter.authHeaders(cred, incoming))) headers.set(k, v);
   return headers;
@@ -378,7 +387,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
   const resetCredits: ResetCreditsCache = {};
-  const sideCounts = new Map<string, { day: number; n: number }>();
+  const sideCounts = new Map<string, number>(); // fallback only, while the store is down
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
@@ -392,7 +401,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, { day: number; n: number }>): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -503,14 +512,25 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   if (app.provider === "claude" && route?.kind !== "serve" && isClaudeAccountPath(rest)) return reject(403, "this path is not available through the gateway");
   /** A list, search or speech call is not a model call: no model allowlist, and its upstream errors never touch logins or the pool. */
   const side = route?.kind === "upstream" && route.side;
-  /** Side and served calls are counted per app and day, apart from tokens; no token rows are invented for them. */
+  /**
+   * Side and served calls are counted per app and day, apart from tokens, in the gateway's shared store (so the limit holds across
+   * replicas and restarts). If the store cannot answer in time the count falls back to this replica's memory, the failure is
+   * counted and raised as an owner alert, and the request goes on.
+   */
   if (side || route?.kind === "serve") {
-    const day = dayStartIct(deps.now()).getTime();
-    const mine = sideCounts.get(app.name);
-    const counter = mine && mine.day === day ? mine : { day, n: 0 };
-    sideCounts.set(app.name, counter);
-    counter.n += 1;
-    if (counter.n > (deps.sideDailyLimit ?? sideDailyLimitFromEnv())) {
+    const day = new Date(dayStartIct(deps.now()).getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
+    let n: number;
+    try {
+      n = await bounded(deps.store.bumpSideCount(app.name, day), 5_000, "side count");
+      deps.sideCountHealth?.(true);
+    } catch {
+      deps.metrics.failOpen(app.name, "side_count_failed");
+      deps.sideCountHealth?.(false);
+      const key = `${app.name}\u0000${day}`;
+      n = (sideCounts.get(key) ?? 0) + 1;
+      sideCounts.set(key, n);
+    }
+    if (n > (deps.sideDailyLimit ?? sideDailyLimitFromEnv())) {
       deps.metrics.rejection(app.name, "daily_cap");
       return reject(429, "daily limit for list, search and speech calls reached", identityForRow, undefined, "side_daily_cap");
     }

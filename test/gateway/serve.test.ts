@@ -897,6 +897,14 @@ describe("ali ownership and shutdown", () => {
     }
   });
 
+  test("stop() is not held up by a startup check that never answers", async () => {
+    const g = await boot({ keepAliveMs: 20, keepAliveAccounts: async () => [], stopCeilingMs: 300, aliAccounts: async () => [member("personal")], aliRefresh: async () => "p", aliSetup: { which: () => "/bin/x", env: { AIS_K8S_API_SERVER: "x" }, writable: async () => true, canPortForward: () => new Promise<boolean>(() => {}) } });
+    await Bun.sleep(150);
+    const t0 = Date.now();
+    await g.stop();
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
   test("a missing kubectl is alerted once at startup", async () => {
     const g = await boot({ aliAccounts: async () => [member("personal")], aliSetup: { which: () => null, writable: async () => true } });
     await waitFor(() => alerts.some((a) => a.kind === "ali-setup-missing"));
@@ -1028,5 +1036,38 @@ describe("idle keep-alive and the refresh guard", () => {
     expect(seen).toEqual([]);
     expect(metrics.render()).toContain('outcome="lock-timeout"');
     expect(metrics.render()).toContain('outcome="retryable"');
+  });
+});
+
+describe("public host", () => {
+  const PUBLIC = "gw.public.example";
+  const get = (g: { port: number }, path: string, host: string) => fetch(`http://127.0.0.1:${g.port}${path}`, { headers: { host } }).then((r) => r.status);
+
+  test("metrics, health, readiness and pairing are 404 on the public host, and work on the pod address", async () => {
+    const g = await boot({ publicHosts: [PUBLIC] });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    for (const path of ["/metrics", "/healthz", "/readyz", "/browser/pair", "/browser/pair/abc"]) {
+      expect(await get(g, path, PUBLIC)).toBe(404);
+      expect(await get(g, path, `${PUBLIC.toUpperCase()}:443`)).toBe(404);
+    }
+    expect(await get(g, "/metrics", "pod-1:47130")).toBe(200);
+    expect(await get(g, "/healthz", "pod-1:47130")).toBe(200);
+    expect(await get(g, "/readyz", "pod-1:47130")).toBe(200);
+    expect(await status(`${base(g)}/metrics`)).toBe(200);
+    await g.stop();
+  });
+
+  test("the public host list comes from AIS_GATEWAY_PUBLIC_HOSTS", async () => {
+    const prev = process.env.AIS_GATEWAY_PUBLIC_HOSTS;
+    process.env.AIS_GATEWAY_PUBLIC_HOSTS = "gw.one.example, gw.two.example";
+    try {
+      const g = await boot();
+      expect(await get(g, "/metrics", "gw.two.example")).toBe(404);
+      expect(await get(g, "/metrics", PUBLIC)).toBe(200);
+      await g.stop();
+    } finally {
+      if (prev === undefined) delete process.env.AIS_GATEWAY_PUBLIC_HOSTS;
+      else process.env.AIS_GATEWAY_PUBLIC_HOSTS = prev;
+    }
   });
 });

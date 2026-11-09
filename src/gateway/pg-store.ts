@@ -7,11 +7,13 @@ import { priceNullCostGroup } from "./usage.ts";
 import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
 import refreshJournal0003 from "./migrations/0003_refresh_journal.sql" with { type: "text" };
+import sideCounts0004 from "./migrations/0004_side_counts.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
   { version: "0002_browser", sql: browser0002 },
   { version: "0003_refresh_journal", sql: refreshJournal0003 },
+  { version: "0004_side_counts", sql: sideCounts0004 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */
@@ -183,6 +185,14 @@ export class PgGatewayStore implements GatewayStore {
       SELECT COALESCE(SUM(input_tokens + output_tokens + cache_write_tokens), 0) AS total
       FROM gateway_usage WHERE app = ${app} AND ts >= ${since.toISOString()}::timestamptz`;
     return Number(rows[0]?.total ?? 0);
+  }
+
+  async bumpSideCount(app: string, day: string): Promise<number> {
+    const rows = await this.sql`
+      INSERT INTO gateway_side_counts (app, day, n) VALUES (${app}, ${day}::date, 1)
+      ON CONFLICT (app, day) DO UPDATE SET n = gateway_side_counts.n + 1
+      RETURNING n`;
+    return Number(rows[0]?.n ?? 0);
   }
 
   async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {

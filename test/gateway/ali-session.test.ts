@@ -113,6 +113,20 @@ describe("cadence", () => {
   });
 });
 
+describe("cadence with a long renewal", () => {
+  test("a renewal that takes two minutes is still renewed on every tick (timestamp taken at the start)", async () => {
+    const { alerter, metrics } = setup();
+    let t = 0;
+    const lastSuccess = new Map<string, string>();
+    let runs = 0;
+    for (let pass = 0; pass < 4; pass++) {
+      t = pass * 600_000 + 2_000;
+      await aliSessionOnce({ accounts: async () => [id("a")], refresh: async () => ((t += 120_000), runs++, "ok"), metrics, alerter, lastSuccess, now: () => new Date(t) });
+    }
+    expect(runs).toBe(4);
+  });
+});
+
 describe("shutdown", () => {
   test("an abort ends a renewal that never finishes, and stops the pass", async () => {
     const { alerter, metrics } = setup();

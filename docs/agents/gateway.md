@@ -182,6 +182,14 @@ speech call is not a model call); the daily token cap does.
   `oauth/profile` itself. Every other `/api/*` path passes through. Repeated slashes in any app path are collapsed before
   matching and before the path is sent upstream.
 
+### Public host
+
+`/metrics`, `/healthz`, `/readyz` and `/browser/pair*` answer 404 when the request names a public host (Host or
+X-Forwarded-Host is in `AIS_GATEWAY_PUBLIC_HOSTS`, comma-separated; no default is compiled in, so the deployment must set it); the pod address still works for probes and
+vmagent. Every `cf-*`, `x-forwarded-*` and `x-envoy-*` header, `cdn-loop`, `forwarded`, `x-real-ip`, `x-request-id`, `x-client-ip` and `true-client-ip` (Cloudflare Access JWTs and client credentials included) is removed before a
+request goes to a provider. The side-route daily count lives in the gateway database (table `gateway_side_counts`); if the
+database cannot answer, each replica counts in memory and an owner alert (`side-count-unavailable`) is raised.
+
 ### ali login ownership
 
 The gateway renews the Alibaba console session of every live ali identity on its keep-alive timer
