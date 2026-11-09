@@ -1,3 +1,5 @@
+import { dirname } from "node:path";
+
 /**
  * Each vendor CLI's own self-update subcommand, as listed in its `--help`.
  * Updating the CLI binary touches no identity, so the shim runs these on the
@@ -19,4 +21,16 @@ export function isSelfUpdateCommand(toolName: string, cleanedArgv: readonly stri
   const first = cleanedArgv[0];
   if (first === undefined) return false;
   return SELF_UPDATE_COMMANDS[toolName]?.includes(first) ?? false;
+}
+
+/**
+ * npm-based self-updaters (`claude update` runs `npm install -g`) install into
+ * npm's configured global prefix, which is usually not the AIS-managed one.
+ * The managed binary then stays old while an unused copy is updated. When the
+ * resolved binary lives in the managed bin dir, point npm at the managed prefix.
+ */
+export function selfUpdateEnv(realBinary: string, managedBinDir: string): Record<string, string> {
+  const dir = managedBinDir.replace(/\/+$/, "");
+  if (!realBinary.startsWith(`${dir}/`)) return {};
+  return { npm_config_prefix: dirname(dir) };
 }

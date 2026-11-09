@@ -5,9 +5,9 @@ import { PromptCancelledError, RetiredIdentityError } from "../identities/errors
 import { isRetired } from "../identities/retired.ts";
 import { parseCliArgs, resolveParentLaunchContext } from "./cli-args.ts";
 import { realpathSync } from "node:fs";
-import { resolveRealBinary, shimExecEnvVar } from "./resolve-binary.ts";
+import { MANAGED_REAL_BIN_DIR, resolveRealBinary, shimExecEnvVar } from "./resolve-binary.ts";
 import { IDENTITY_SESSION_MARKER, execReal } from "./exec.ts";
-import { isSelfUpdateCommand } from "./self-update.ts";
+import { isSelfUpdateCommand, selfUpdateEnv } from "./self-update.ts";
 import { launchDesktopApp } from "./launch-desktop.ts";
 import { launchThenStartBackgroundSync } from "../sync/background.ts";
 import { migrateLegacyAisHome } from "./migrate-ais-home.ts";
@@ -70,6 +70,7 @@ export async function runWrapper(
       const presetConfigDir = process.env[cfg.envVarName];
       await execReal(realBinary, parsed.cleanedArgv, {
         ...(presetConfigDir ? { [cfg.envVarName]: presetConfigDir } : {}),
+        ...selfUpdateEnv(realBinary, MANAGED_REAL_BIN_DIR),
         [shimExecEnvVar(cfg.realBinaryName)]: (() => {
           try {
             return realpathSync(realBinary);
