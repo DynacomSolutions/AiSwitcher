@@ -165,4 +165,58 @@ describe("a client that disconnects while waiting for a count slot", () => {
     expect(bumps).toBe(4); // the waiter never reached the store
     await ledger.close();
   });
+
+  test("an abort that lands right after a slot is handed to a waiter does not leak the slot", async () => {
+    const store = new MemoryGatewayStore();
+    const ledger = new LedgerBuffer(store, { max: 100, flushMs: 3_600_000 });
+    const t = generateToken();
+    await store.putApp({ name: "k", owner: "o", namespace: "ns", provider: "kimi", style: "openai", target: { kind: "pool" }, state: "active", createdAt: "2026-11-01T00:00:00.000Z" });
+    await store.addToken({ app: "k", prefix: t.prefix, hash: t.hash, createdAt: "2026-11-01T00:00:00.000Z" });
+    const ctrlW = new AbortController();
+    const resolvers: Array<(n: number) => void> = [];
+    let bumps = 0;
+    let hang = false;
+    store.bumpSideCount = (_a, _d, _s) => {
+      bumps += 1;
+      if (hang) return new Promise<number>(() => {});
+      const first = resolvers.length === 0;
+      const p = new Promise<number>((resolve) => resolvers.push(resolve));
+      // Attached before the app attaches its own release callback, so it runs first: the waiter's abort is queued right behind the hand-over.
+      if (first) void p.then(() => queueMicrotask(() => ctrlW.abort()));
+      return p;
+    };
+    const deps = {
+      sleep: async () => {},
+      store,
+      ledger,
+      creds: { get: async (_p: string, identity: string) => ({ identity, accessToken: `tok-${identity}` }), refreshAfter401: async () => ({ identity: "a", accessToken: "x" }) } as unknown as GatewayDeps["creds"],
+      usageFor: async () => undefined,
+      poolMembers: async () => ["a"],
+      fetch: (async () => new Response("{}")) as unknown as typeof fetch,
+      now: () => new Date("2026-11-02T10:00:00.000Z"),
+      metrics: noopMetrics,
+      log: () => {},
+      sideCountTimeoutMs: 100,
+    } satisfies GatewayDeps;
+    const app = createGatewayApp(deps);
+    const send = (signal?: AbortSignal): Promise<Response> => Promise.resolve(app.request("http://gw.test/k/search", { method: "POST", body: "{}", headers: { authorization: `Bearer ${t.token}` }, ...(signal ? { signal } : {}) }));
+    const holders = Array.from({ length: 4 }, () => send());
+    await Bun.sleep(30);
+    expect(bumps).toBe(4);
+    const waiter = send(ctrlW.signal).then((r) => r.status);
+    await Bun.sleep(30);
+    resolvers[0]!(1); // holder 1 finishes: its slot goes to the waiter, whose client leaves at that moment
+    await Bun.sleep(30);
+    expect(await waiter).toBe(499);
+    for (const r of resolvers.slice(1)) r(2);
+    await Promise.all(holders);
+    // all four slots must be usable again
+    hang = true;
+    bumps = 0;
+    const next = Array.from({ length: 4 }, () => send());
+    await Bun.sleep(50);
+    expect(bumps).toBe(4);
+    await Promise.all(next);
+    await ledger.close();
+  });
 });

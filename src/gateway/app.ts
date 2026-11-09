@@ -533,7 +533,10 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     const deadline = Date.now() + limitMs;
     const release = await sideGate.acquire(limitMs, ctrl.signal);
     // A client that left while waiting is neither counted nor given a slot.
-    if (ctrl.signal.aborted || req.signal.aborted) throw new DOMException("aborted", "AbortError");
+    if (ctrl.signal.aborted || req.signal.aborted) {
+      release?.(); // the abort may have landed after a slot was granted: hand it on, never leak it
+      throw new DOMException("aborted", "AbortError");
+    }
     if (release) {
       const abort = new AbortController();
       const query = deps.store.bumpSideCount(app.name, day, abort.signal);

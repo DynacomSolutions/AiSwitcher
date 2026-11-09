@@ -44,6 +44,7 @@ export class Gate {
     return new Promise((resolve) => {
       const leave = (): void => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", leave);
         const i = this.waiters.indexOf(grant);
         if (i >= 0) this.waiters.splice(i, 1);
         resolve(undefined);
