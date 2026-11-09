@@ -24,6 +24,7 @@ export interface ChromeApi {
     create(url?: string): Promise<TabInfo>;
     remove(tabId: number): Promise<void>;
     group(tabIds: number[], groupId?: number): Promise<number>;
+    ungroup(tabIds: number[]): Promise<void>;
     onRemoved(listener: (tabId: number) => void): void;
   };
   tabGroups: {
@@ -66,6 +67,7 @@ export function realChromeApi(): ChromeApi {
       create: async url => toTab(await chrome.tabs.create(url ? { url, active: false } : { active: false })),
       remove: async tabId => { await chrome.tabs.remove(tabId); },
       group: (tabIds, groupId) => { const ids = tabIds as [number, ...number[]]; return chrome.tabs.group(groupId === undefined ? { tabIds: ids } : { tabIds: ids, groupId }); },
+      ungroup: async tabIds => { await chrome.tabs.ungroup(tabIds as [number, ...number[]]); },
       onRemoved: listener => chrome.tabs.onRemoved.addListener(listener),
     },
     tabGroups: {

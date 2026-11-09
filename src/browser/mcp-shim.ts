@@ -11,7 +11,7 @@ import { CLAUDE_CONFIG, CODEX_CONFIG } from "../identities/tool-configs.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
 import { chatNameResolver, type ChatTool } from "./chat-name.ts";
 import { sessionName } from "./session-label.ts";
-import { BROWSER_TOOLS, type CallResult } from "./protocol.ts";
+import { BROWSER_TOOLS, SESSION_END_TOOL, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
 
 export const BROWSER_TOKEN_FILE = "ais-browser-token";
@@ -19,6 +19,12 @@ export const STOPPED_BY_USER_NOTE = "The user stopped browser control. Do not re
 const SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_VERSION = "2025-06-18";
 const FETCH_TIMEOUT_MS = 130_000;
+/** The end notice must never hold the agent's exit up for long. */
+export const SESSION_END_TIMEOUT_MS = 2_000;
+
+/** Shims that made at least one browser call (only those announce their end) and those that already did. */
+const usedContexts = new WeakSet<ShimContext>();
+const endedContexts = new WeakSet<ShimContext>();
 
 export interface ShimContext {
   /** Gateway root URL, resolved on each call. */
@@ -51,8 +57,9 @@ export function mapCallResult(result: CallResult): { isError?: true; content: Mc
   return errorResult(`${result.error}: ${result.message}${note}`);
 }
 
-async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal?: AbortSignal): Promise<{ isError?: true; content: McpContent[] }> {
-  if (!(BROWSER_TOOLS as readonly string[]).includes(name)) return errorResult(`bad_args: unknown tool ${name}`);
+async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal?: AbortSignal, timeoutMs = FETCH_TIMEOUT_MS, internal = false): Promise<{ isError?: true; content: McpContent[] }> {
+  if (!internal && !(BROWSER_TOOLS as readonly string[]).includes(name)) return errorResult(`bad_args: unknown tool ${name}`);
+  if (!internal) usedContexts.add(ctx);
   const { browser, ...args } = (typeof rawArgs === "object" && rawArgs !== null ? rawArgs : {}) as Record<string, unknown>;
   let session = ctx.session;
   if (ctx.chatName) {
@@ -77,7 +84,7 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
     res = await ctx.fetch(`${url.replace(/\/+$/, "")}/browser/call`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      signal: AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), ...(signal ? [signal] : [])]),
+      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]),
       body: JSON.stringify({ ...(typeof browser === "string" ? { browser } : {}), session, tool: name, args }),
     });
   } catch (e) {
@@ -95,6 +102,17 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
     return errorResult("internal: gateway returned invalid JSON");
   }
   return mapCallResult(result);
+}
+
+/**
+ * Best-effort notice that this agent session ended, so the extension can close the tabs the session created. Sent at most once, and only when the
+ * session made a browser call. Never throws and never waits longer than SESSION_END_TIMEOUT_MS. An older gateway or extension just rejects it.
+ */
+export async function sendSessionEnd(ctx: ShimContext): Promise<void> {
+  if (!usedContexts.has(ctx) || endedContexts.has(ctx)) return;
+  endedContexts.add(ctx);
+  const deadline = new Promise<void>((resolve) => setTimeout(resolve, SESSION_END_TIMEOUT_MS).unref?.());
+  await Promise.race([callTool(ctx, SESSION_END_TOOL, {}, undefined, SESSION_END_TIMEOUT_MS, true).then(() => {}, () => {}), deadline]);
 }
 
 /** Handles one JSON-RPC message; undefined for notifications. */
@@ -212,6 +230,18 @@ export function contextFromEnv(env: NodeJS.ProcessEnv = process.env, opts: ShimO
 
 /** Stdio MCP server: newline-delimited JSON-RPC on stdin/stdout; resolves when stdin closes. */
 export async function runMcpShim(ctx: ShimContext = contextFromEnv(process.env, parseShimArgs(process.argv)), input: NodeJS.ReadableStream = process.stdin, write: (line: string) => void = (l) => process.stdout.write(l)): Promise<void> {
+  const onSignal = (): void => { void sendSessionEnd(ctx).finally(() => process.exit(0)); };
+  const signals = input === process.stdin ? (["SIGTERM", "SIGINT", "SIGHUP"] as const) : [];
+  for (const sig of signals) process.on(sig, onSignal);
+  try {
+    await serve(ctx, input, write);
+  } finally {
+    for (const sig of signals) process.off(sig, onSignal);
+  }
+  await sendSessionEnd(ctx);
+}
+
+async function serve(ctx: ShimContext, input: NodeJS.ReadableStream, write: (line: string) => void): Promise<void> {
   const pending = new Set<Promise<void>>();
   for await (const line of createInterface({ input })) {
     if (!line.trim()) continue;

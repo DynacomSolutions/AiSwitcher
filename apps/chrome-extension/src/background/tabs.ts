@@ -1,7 +1,8 @@
 // Tab ownership: Map<sessionId, {groupId, tabIds}>, one Chrome tab group per agent session.
 import type { ChromeApi, GroupColor, TabInfo } from "./chrome-api.ts";
 
-export interface SessionTabs { groupId: number; tabIds: Set<number>; identity: string; label: string }
+/** `adopted` is the subset of `tabIds` the session did not create itself (adopt_tab, or tabs opened inside a user-granted group): they outlive it. */
+export interface SessionTabs { groupId: number; tabIds: Set<number>; adopted: Set<number>; identity: string; label: string }
 export interface SessionRef { id: string; identity: string; label: string }
 
 const SESSIONS_KEY = "sessions";
@@ -72,6 +73,32 @@ export class TabManager {
     this.persist();
   }
 
+  /**
+   * The session ended for good: closes the tabs it created, releases the ones it adopted (ungrouped only when they sit in its own group),
+   * revokes its grants and drops it. Tabs in a user-granted group are never touched.
+   */
+  closeSession(id: string): Promise<void> {
+    return this.serial(id, async () => {
+      const s = this.sessions.get(id);
+      if (s) {
+        const granted = new Set(this.grantedGroups(id));
+        const adopted = [...s.tabIds].filter(t => s.adopted.has(t));
+        const created = [...s.tabIds].filter(t => !s.adopted.has(t));
+        if (s.groupId !== -1 && !granted.has(s.groupId)) {
+          const release: number[] = [];
+          for (const tabId of adopted) {
+            const tab = await this.api.tabs.get(tabId).catch(() => undefined);
+            if (tab && tab.groupId === s.groupId) release.push(tabId);
+          }
+          if (release.length > 0) await this.api.tabs.ungroup(release).catch(() => {});
+        }
+        for (const tabId of created) await this.api.tabs.remove(tabId).catch(() => {}); // already closed by the user: fine
+      }
+      this.sessions.delete(id);
+      this.endSession(id);
+    });
+  }
+
   /** Records that the session just made a call, registering it when it has no tabs yet (so it can be granted a group). */
   /** Records a call from the session. Returns true when the session's name changed (e.g. after /rename). */
   touch(ref: SessionRef): boolean {
@@ -115,6 +142,7 @@ export class TabManager {
       const tab = await this.api.tabs.create(url);
       const s = this.session(ref);
       s.tabIds.add(tab.id);
+      s.adopted.add(tab.id); // sits in the user's group: stays open when the session ends
       try { await this.api.tabs.group([tab.id], groupId); } finally { this.persist(); }
       return tab;
     });
@@ -135,13 +163,14 @@ export class TabManager {
   forget(tabId: number): void {
     for (const [id, s] of this.sessions) {
       s.tabIds.delete(tabId);
+      s.adopted.delete(tabId);
       if (s.tabIds.size === 0 && !this.queues.has(id) && this.grantedGroups(id).length === 0) this.sessions.delete(id); // session over: Chrome drops the empty group itself
     }
     this.persist();
   }
 
   private persist(): void {
-    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds] }));
+    const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted] }));
     const grants = [...this.grants].map(([groupId, sessionId]) => ({ groupId, sessionId }));
     void this.api.sessionStorage.set({ [SESSIONS_KEY]: data, [GRANTS_KEY]: grants }).catch(() => {});
   }
@@ -153,9 +182,10 @@ export class TabManager {
     if (!Array.isArray(raw)) return;
     const live = new Set((await this.api.tabs.query()).map(t => t.id));
     const grants = Array.isArray(stored[GRANTS_KEY]) ? stored[GRANTS_KEY] as Array<{ groupId: number; sessionId: string }> : [];
-    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[] }>) {
+    for (const e of raw as Array<{ id: string; groupId: number; identity: string; label: string; tabIds: number[]; adoptedTabIds?: number[] }>) {
       const tabIds = new Set(e.tabIds.filter(id => live.has(id)));
-      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, identity: e.identity, label: e.label });
+      const adopted = new Set((e.adoptedTabIds ?? []).filter(id => tabIds.has(id))); // older data has no split: every tab counts as created
+      if (tabIds.size > 0 || grants.some(g => g.sessionId === e.id)) this.sessions.set(e.id, { groupId: e.groupId, tabIds, adopted, identity: e.identity, label: e.label });
     }
     for (const g of grants) if (this.sessions.has(g.sessionId)) this.grants.set(g.groupId, g.sessionId);
     await this.pruneGrants();
@@ -164,7 +194,7 @@ export class TabManager {
   private session(ref: SessionRef): SessionTabs {
     let s = this.sessions.get(ref.id);
     if (!s) {
-      s = { groupId: -1, tabIds: new Set(), identity: ref.identity, label: ref.label };
+      s = { groupId: -1, tabIds: new Set(), adopted: new Set(), identity: ref.identity, label: ref.label };
       this.sessions.set(ref.id, s);
     }
     s.label = ref.label;
@@ -215,10 +245,11 @@ export class TabManager {
   }
 
   /** Put a tab into the session's group, creating the group on first use (or after the user dissolved it). */
-  addToSession(ref: SessionRef, tabId: number): Promise<void> {
+  addToSession(ref: SessionRef, tabId: number, adopted = true): Promise<void> {
     return this.serial(ref.id, async () => {
       const s = this.session(ref);
       s.tabIds.add(tabId); // owned even if grouping fails
+      if (adopted) s.adopted.add(tabId); else s.adopted.delete(tabId);
       try {
         await this.placeInGroup(ref, s, tabId);
       } finally {
@@ -230,7 +261,7 @@ export class TabManager {
   async create(ref: SessionRef, url?: string): Promise<TabInfo> {
     // Inactive: an agent must never pull the owner away from the tab they are using.
     const tab = await this.api.tabs.create(url);
-    await this.addToSession(ref, tab.id);
+    await this.addToSession(ref, tab.id, false);
     return tab;
   }
 
@@ -240,7 +271,7 @@ export class TabManager {
     const all = await this.api.tabs.query();
     const live = new Set(all.map(t => t.id));
     const s = this.sessions.get(sessionId);
-    if (s) for (const id of [...s.tabIds]) if (!live.has(id)) s.tabIds.delete(id);
+    if (s) for (const id of [...s.tabIds]) if (!live.has(id)) { s.tabIds.delete(id); s.adopted.delete(id); }
     const mine = new Set(this.grantedGroups(sessionId));
     const own = all.filter(t => s?.tabIds.has(t.id));
     const granted = all.filter(t => mine.has(t.groupId) && !s?.tabIds.has(t.id));
