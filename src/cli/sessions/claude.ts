@@ -9,6 +9,7 @@ import {
   findFirstLine,
   forEachLine,
   isoOrEpoch,
+  isClaudeInjectedUserText,
   isInProgress,
   listSubdirs,
   parseTimestampMs,
@@ -67,7 +68,7 @@ async function scanSessionFile(filePath: string): Promise<ClaudeScan> {
     if (type === "user" && entry.isMeta !== true) {
       const message = entry.message as Record<string, unknown> | undefined;
       const text = typeof message?.content === "string" ? message.content : textFromBlocks(message?.content);
-      if (text && scan.firstUser === undefined && text.trim()) scan.firstUser = text;
+      if (text && scan.firstUser === undefined && text.trim() && !isClaudeInjectedUserText(text)) scan.firstUser = text;
     }
     if (type === "ai-title" && typeof entry.aiTitle === "string") scan.aiTitle = entry.aiTitle;
     if (type === "custom-title" && typeof entry.customTitle === "string" && entry.customTitle.trim()) scan.customTitle = entry.customTitle;
@@ -94,7 +95,7 @@ async function scanAgentFile(filePath: string): Promise<{ agentId?: string; cwd?
       if (!entry || entry.type !== "user" || entry.isMeta === true) return false;
       const message = entry.message as Record<string, unknown> | undefined;
       const text = typeof message?.content === "string" ? message.content : textFromBlocks(message?.content);
-      return text !== undefined && text.trim() !== "";
+      return text !== undefined && text.trim() !== "" && !isClaudeInjectedUserText(text);
     })) ?? "",
   );
   const result: { agentId?: string; cwd?: string; firstTs?: number; firstUser?: string } = {};
@@ -369,7 +370,7 @@ export async function readClaudeTranscript(
         (typeof (entry.message as Record<string, unknown> | undefined)?.content === "string"
           ? ((entry.message as Record<string, unknown>).content as string)
           : undefined);
-      if (text && meta.firstUser === undefined && text.trim()) meta.firstUser = text;
+      if (text && meta.firstUser === undefined && text.trim() && !isClaudeInjectedUserText(text)) meta.firstUser = text;
     }
     if (entry.type === "ai-title" && typeof entry.aiTitle === "string") meta.aiTitle = entry.aiTitle;
     if (meta.cwd === undefined && typeof entry.cwd === "string") meta.cwd = entry.cwd;

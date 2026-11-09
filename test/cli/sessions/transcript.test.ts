@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { CliUsageError } from "../../../src/cli/errors.ts";
+import { claudeSessionTitle } from "../../../src/cli/sessions/claude.ts";
+import { codexSessionTitle } from "../../../src/cli/sessions/codex.ts";
 import { readTranscript } from "../../../src/cli/sessions/transcript.ts";
 import type { TranscriptTurnDto } from "../../../src/cli/sessions/types.ts";
 import {
@@ -155,6 +157,48 @@ describe("codex transcript", () => {
     expect(dto!.turns.map((t) => t.role)).toEqual(["user", "tool", "assistant"]);
     expect(dto!.turns[1]!.text).toBe("file-a");
     expect(dto!.inProgress).toBe(true);
+  });
+});
+
+describe("injected user messages never become titles or turns", () => {
+  test("codex: a leading AGENTS.md block is skipped for the title and the turns", async () => {
+    const configDir = await freshDir("codex-agents");
+    const agentsBlock = "# AGENTS.md instructions for /home/user/projects/example\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>";
+    const user = (text: string) => ({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } });
+    await writeJsonl(join(configDir, "sessions", CODEX_DAY_DIR, "rollout-1-ta.jsonl"), [
+      codexSessionMeta({ id: "ta", threadSource: "user", cwd: "/tmp/proj-a", ts: "2026-01-12T08:00:00.000Z" }),
+      user(agentsBlock),
+      user("<permissions instructions>sandbox</permissions instructions>"),
+      user("  <user_instructions>x</user_instructions>"),
+      user("<environment_context>cwd</environment_context>"),
+      user("SYNTHETIC_FIXTURE fix the login redirect"),
+    ], FRESH);
+    expect(await codexSessionTitle(configDir, "ta")).toBe("SYNTHETIC_FIXTURE fix the login redirect");
+    const dto = await readTranscript("codex", identity(configDir), "ta", OPTS);
+    expect(dto!.session.title).toContain("fix the login redirect");
+    expect(dto!.turns.map((t) => t.text)).toEqual(["SYNTHETIC_FIXTURE fix the login redirect"]);
+  });
+
+  test("codex: the event_msg shape is filtered too", async () => {
+    const configDir = await freshDir("codex-agents-ev");
+    await writeJsonl(join(configDir, "sessions", CODEX_DAY_DIR, "rollout-1-tb.jsonl"), [
+      codexSessionMeta({ id: "tb", threadSource: "user", cwd: "/tmp/proj-a", ts: "2026-01-12T08:00:00.000Z" }),
+      { type: "event_msg", payload: { type: "user_message", message: "# AGENTS.md instructions for /x" } },
+      { type: "event_msg", payload: { type: "user_message", message: "SYNTHETIC_FIXTURE real prompt" } },
+    ], FRESH);
+    expect(await codexSessionTitle(configDir, "tb")).toBe("SYNTHETIC_FIXTURE real prompt");
+  });
+
+  test("claude: slash-command plumbing is not the first-prompt title", async () => {
+    const configDir = await freshDir("claude-inject");
+    const line = (content: string) => ({ type: "user", message: { role: "user", content }, sessionId: "ci1", cwd: "/tmp/proj-a", timestamp: "2026-01-12T08:00:00.000Z" });
+    await writeJsonl(join(configDir, "projects", CLAUDE_ENC, "ci1.jsonl"), [
+      line("<local-command-caveat>Caveat: generated locally</local-command-caveat>"),
+      line("<command-name>/model</command-name>"),
+      line("<local-command-stdout>set model</local-command-stdout>"),
+      line("SYNTHETIC_FIXTURE refactor the parser"),
+    ], FRESH);
+    expect(await claudeSessionTitle(configDir, "ci1")).toBe("SYNTHETIC_FIXTURE refactor the parser");
   });
 });
 

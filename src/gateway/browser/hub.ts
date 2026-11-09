@@ -1,4 +1,4 @@
-import { BROWSER_ERROR_CODES, MAX_ERROR_MESSAGE, type BrowserErrorCode, type BrowserTool, type CallRequest, type CallResult, type ExtToGateway, type GatewayToExt } from "../../browser/protocol.ts";
+import { BROWSER_ERROR_CODES, MAX_ERROR_MESSAGE, SESSION_END_TOOL, type BrowserErrorCode, type BrowserTool, type CallRequest, type CallResult, type ExtToGateway, type GatewayToExt } from "../../browser/protocol.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import { noopMetrics, type GatewayMetrics } from "../metrics.ts";
 
@@ -45,7 +45,7 @@ interface Conn {
 
 interface Pending {
   ws: HubSocket;
-  tool: BrowserTool;
+  tool: BrowserTool | typeof SESSION_END_TOOL;
   started: number;
   timer: ReturnType<typeof setTimeout>;
   resolve(r: CallResult): void;

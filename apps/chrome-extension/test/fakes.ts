@@ -55,6 +55,7 @@ export class FakeChrome implements ChromeApi {
       for (const id of ids) { const t = this.tabList.get(id); if (t) t.groupId = g; }
       return g;
     },
+    ungroup: async (ids: number[]) => { for (const id of ids) { const t = this.tabList.get(id); if (t) t.groupId = -1; } },
     onRemoved: (l: (id: number) => void) => { this.removedListeners.push(l); },
   };
   /** Chrome drops a group when its last tab leaves, so a group exists only while a tab is in it. */

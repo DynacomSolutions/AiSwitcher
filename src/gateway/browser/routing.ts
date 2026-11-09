@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { BROWSER_TOOLS, DEFAULT_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallResult } from "../../browser/protocol.ts";
+import { BROWSER_TOOLS, SESSION_END_TOOL, DEFAULT_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallResult } from "../../browser/protocol.ts";
 import { shortSessionId } from "../../browser/session-label.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import type { GatewayMetrics } from "../metrics.ts";
@@ -63,7 +63,7 @@ export function createCallRoutes(deps: CallDeps): Hono {
     }
     if (!isObj(body) || !isObj(body.session) || typeof body.session.id !== "string" || body.session.id === "" || body.session.id.length > 128) return c.json({ error: "session.id is required" }, 400);
     const tool = body.tool;
-    if (typeof tool !== "string" || !(BROWSER_TOOLS as readonly string[]).includes(tool)) return c.json({ error: "unknown tool" }, 400);
+    if (typeof tool !== "string" || (tool !== SESSION_END_TOOL && !(BROWSER_TOOLS as readonly string[]).includes(tool))) return c.json({ error: "unknown tool" }, 400);
     if (body.args !== undefined && !isObj(body.args)) return c.json({ error: "args must be an object" }, 400);
     if (body.browser !== undefined && typeof body.browser !== "string") return c.json({ error: "browser must be a string" }, 400);
     const id = crypto.randomUUID();
@@ -75,6 +75,14 @@ export function createCallRoutes(deps: CallDeps): Hono {
     if (tool === "list_browsers") {
       deps.metrics?.browserCall(tool, "ok", 0);
       return c.json({ id, ok: true, content: [{ type: "text", text: JSON.stringify(allowed.map(summary)) }] } satisfies CallResult);
+    }
+    if (tool === SESSION_END_TOOL) {
+      const sessionId = body.session.id;
+      // Best-effort notice: tell the named browser, else every browser this identity may drive (the shim cannot know which one holds the session's tabs).
+      const targets = typeof body.browser === "string" ? allowed.filter((b) => b.name === body.browser) : allowed;
+      await Promise.all(targets.map((b) => deps.hub.call(b.name, { id: crypto.randomUUID(), session: forwardedSession(b, a.identity, sessionId, label), tool: SESSION_END_TOOL, args }, 5_000).catch(() => undefined)));
+      deps.metrics?.browserCall(tool, "ok", 0);
+      return c.json({ id, ok: true, content: [{ type: "text", text: "ok" }] } satisfies CallResult);
     }
     let chosen: BrowserBinding | undefined;
     if (typeof body.browser === "string") {

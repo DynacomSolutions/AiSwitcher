@@ -97,6 +97,22 @@ describe("POST /browser/call", () => {
     expect(seen).toEqual(["id1"]);
   });
 
+  test("session_end is relayed to the allowed browser, answered ok", async () => {
+    const ws = await connect(b("w", { kind: "identity", identity: "id1" }));
+    const tools: string[] = [];
+    const orig = ws.send.bind(ws);
+    ws.send = (d: string) => { tools.push((JSON.parse(d) as { req: { tool: string } }).req.tool); orig(d); };
+    answer(ws);
+    const res = await call({ session, tool: "session_end" });
+    expect(await res.json()).toMatchObject({ ok: true });
+    expect(tools).toEqual(["session_end"]);
+  });
+
+  test("session_end with no browser connected is still ok", async () => {
+    const res = await call({ session, tool: "session_end" });
+    expect(await res.json()).toMatchObject({ ok: true });
+  });
+
   test("routes through a pool binding", async () => {
     const ws = await connect(b("w", { kind: "pool", pool: "main" }));
     answer(ws);

@@ -191,3 +191,90 @@ describe("user-granted tab groups", () => {
     expect(await t.tabs.grant(999, "s1")).toBe("no_group");
   });
 });
+
+describe("ending a session closes what it created", () => {
+  async function setup() {
+    const { Executor } = await import("../src/background/executor.ts");
+    const { State } = await import("../src/background/state.ts");
+    const api = new FakeChrome();
+    const tabs = new TabManager(api);
+    const executor = new Executor({ api, tabs, state: new State() });
+    let n = 0;
+    const call = (tool: string, args: Record<string, unknown> = {}, sid = "s1") => executor.run({ id: `c${++n}`, session: { id: sid, identity: "alice", label: "refactor login" }, tool, args } as never);
+    return { api, tabs, call };
+  }
+  const tabId = (r: unknown) => JSON.parse((r as { content: Array<{ text: string }> }).content[0]!.text).tabId as number;
+
+  test("created tabs close, adopted tabs stay and leave the group", async () => {
+    const t = await setup();
+    const made = tabId(await t.call("tabs_create", { url: "https://a.example.com/" }));
+    const user = t.api.addTab(1, "https://user.example.com/");
+    await t.call("adopt_tab", { tabId: user.id });
+    const group = t.api.tabList.get(made)!.groupId;
+    expect(t.api.tabList.get(user.id)!.groupId).toBe(group);
+    expect(await t.call("session_end")).toMatchObject({ ok: true });
+    expect(t.api.tabList.has(made)).toBe(false);
+    expect(t.api.tabList.get(user.id)!.groupId).toBe(-1);
+    expect(t.tabs.sessions.has("s1")).toBe(false);
+  });
+
+  test("adopted tab in some other group is left alone; granted group and its tabs survive and the grant is revoked", async () => {
+    const t = await setup();
+    await t.call("tabs_context");
+    const other = t.api.addTab(1, "https://other.example.com/");
+    const otherGroup = await t.api.tabs.group([other.id]);
+    const grantedTab = t.api.addTab(2, "https://granted.example.com/");
+    const granted = await t.api.tabs.group([grantedTab.id]);
+    await t.tabs.grant(granted, "s1");
+    const inGranted = tabId(await t.call("tabs_create", { groupId: granted }));
+    await t.tabs.addToSession({ id: "s1", identity: "alice", label: "refactor login" }, other.id);
+    await t.call("tabs_create");
+    t.api.tabList.get(other.id)!.groupId = otherGroup; // the user moved the adopted tab to a group of their own
+    await t.call("session_end");
+    expect(t.api.tabList.get(other.id)!.groupId).toBe(otherGroup);
+    expect(t.api.tabList.has(inGranted)).toBe(true);
+    expect(t.api.tabList.get(grantedTab.id)!.groupId).toBe(granted);
+    expect(t.tabs.grantee(granted)).toBeUndefined();
+    expect(t.tabs.sessions.has("s1")).toBe(false);
+  });
+
+  test("session_end for an unknown session is a harmless ok, and other sessions are untouched", async () => {
+    const t = await setup();
+    const keep = tabId(await t.call("tabs_create", {}, "s2"));
+    expect(await t.call("session_end", {}, "nobody")).toMatchObject({ ok: true });
+    expect(t.api.tabList.has(keep)).toBe(true);
+  });
+
+  test("the created/adopted split survives a restart; older data counts as created", async () => {
+    const t = await setup();
+    const made = tabId(await t.call("tabs_create"));
+    const user = t.api.addTab(1);
+    await t.call("adopt_tab", { tabId: user.id });
+    await new Promise(r => setTimeout(r, 5));
+    const restarted = new TabManager(t.api);
+    await restarted.load();
+    expect([...restarted.sessions.get("s1")!.adopted]).toEqual([user.id]);
+    await restarted.closeSession("s1");
+    expect(t.api.tabList.has(made)).toBe(false);
+    expect(t.api.tabList.has(user.id)).toBe(true);
+
+    const legacy = new FakeChrome();
+    const tab = legacy.addTab(5);
+    legacy.session = { sessions: [{ id: "old", groupId: -1, identity: "alice", label: "x", tabIds: [tab.id] }] };
+    const m = new TabManager(legacy);
+    await m.load();
+    await m.closeSession("old");
+    expect(legacy.tabList.has(5)).toBe(false);
+  });
+
+  test("idle expiry does not close tabs", async () => {
+    const api = new FakeChrome();
+    let now = 0;
+    const tabs = new TabManager(api, () => now);
+    const tab = await tabs.create({ id: "s1", identity: "alice", label: "x" }, "https://a.example.com/");
+    tabs.touch({ id: "s1", identity: "alice", label: "x" });
+    now += 31 * 60_000;
+    tabs.expireIdle();
+    expect(api.tabList.has(tab.id)).toBe(true);
+  });
+});

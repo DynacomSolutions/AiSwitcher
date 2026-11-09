@@ -195,3 +195,20 @@ test("without an agent session id the session id is stable across shim respawns"
   expect(contextFromEnv({}, { identity: "work" }).session.id).toBe(a);
   expect(contextFromEnv({ CLAUDE_SESSION_ID: "abc" }, { identity: "work" }).session.id).toBe("abc");
 });
+
+test("stdin close sends one session_end with the session id, only after a browser call", async () => {
+  await stdio([JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })]);
+  expect(seen).toEqual([]); // a shim that never made a browser call stays silent
+  reply = { id: "x", ok: true, content: [{ type: "text", text: "[]" }] };
+  await stdio([JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tabs_context", arguments: {} } })]);
+  expect(seen.map((s) => s.body.tool)).toEqual(["tabs_context", "session_end"]);
+  expect(seen[1]!.body.session.id).toBe("abcdef123");
+  expect(seen[1]!.auth).toBe("Bearer tok");
+});
+
+test("session_end is not exposed as an MCP tool and cannot be called through tools/call", async () => {
+  const list: any = await handleRpc({ id: 1, method: "tools/list" }, ctx());
+  expect(list.result.tools.map((t: any) => t.name)).not.toContain("session_end");
+  const r: any = await handleRpc({ id: 2, method: "tools/call", params: { name: "session_end" } }, ctx());
+  expect(r.result.isError).toBe(true);
+});

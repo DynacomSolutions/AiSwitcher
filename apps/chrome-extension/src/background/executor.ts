@@ -1,4 +1,4 @@
-import { DEFAULT_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
+import { DEFAULT_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
 import type { ExtensionTool, ToolArgs } from "../../../../src/browser/tool-args.ts";
@@ -122,6 +122,7 @@ export class Executor {
   async run(req: CallRequest): Promise<CallResult> {
     const { id } = req;
     const fail = (error: BrowserErrorCode, message: string): CallResult => ({ id, ok: false, error, message });
+    if (req.tool === SESSION_END_TOOL) return this.endSession(req);
     if (this.state.paused) return fail("paused_by_user", "The user paused this browser. Do not retry until they resume it.");
     if (req.tool === "list_browsers") return fail("bad_args", "list_browsers is answered by the gateway");
     if (!Object.hasOwn(TOOL_SCHEMAS, req.tool)) return fail("bad_args", `Unknown tool ${String(req.tool)}`);
@@ -151,6 +152,16 @@ export class Executor {
       clearTimeout(timer);
       this.state.untrack(id);
     }
+  }
+
+  /** The agent session ended: closes the tabs it created, releases the rest. Works while paused, so a pause never leaves a dead session's tabs behind. */
+  private async endSession(req: CallRequest): Promise<CallResult> {
+    const s = this.tabs.sessions.get(req.session.id);
+    if (s && s.identity !== req.session.identity) return { id: req.id, ok: true, content: [{ type: "text", text: "no such session" }] };
+    const tabIds = s ? [...s.tabIds] : [];
+    await this.tabs.closeSession(req.session.id);
+    await Promise.all(tabIds.map(async tabId => { await this.detach(tabId); await this.unmark(tabId); }));
+    return { id: req.id, ok: true, content: [{ type: "text", text: "session ended" }] };
   }
 
   private abortCode(reason: unknown): BrowserErrorCode { return reason === "stopped" ? "stopped_by_user" : "timeout"; }

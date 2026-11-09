@@ -9,6 +9,7 @@ import {
   clampText,
   findFirstLine,
   forEachLine,
+  isCodexInjectedUserText,
   isoOrEpoch,
   isInProgress,
   mapPool,
@@ -75,7 +76,7 @@ export function parseMetaLine(line: string | undefined): CodexMeta | undefined {
 
 /** The user-text source for titles: codex writes the real user prompt both
  * as an `event_msg` user_message and as a `response_item` user message, but
- * ALSO injects synthetic user messages (`<environment_context>` XML) that
+ * ALSO injects synthetic user messages (`# AGENTS.md instructions` and `<environment_context>` blocks, see isCodexInjectedUserText) that
  * must never become a title or a turn. Returns the first real user text in
  * the file. */
 function userTextFromLine(line: string): string | undefined {
@@ -84,11 +85,11 @@ function userTextFromLine(line: string): string | undefined {
   const payload = entry.payload as Record<string, unknown> | undefined;
   if (!payload) return undefined;
   if (entry.type === "event_msg" && payload.type === "user_message" && typeof payload.message === "string") {
-    return payload.message.trim() ? payload.message : undefined;
+    return payload.message.trim() && !isCodexInjectedUserText(payload.message) ? payload.message : undefined;
   }
   if (entry.type === "response_item" && payload.type === "message" && payload.role === "user") {
     const text = textFromBlocks(payload.content);
-    if (text?.trim() && !text.startsWith("<environment_context")) return text;
+    if (text?.trim() && !isCodexInjectedUserText(text)) return text;
   }
   return undefined;
 }
@@ -181,7 +182,7 @@ function pushCodexPayload(collector: TurnCollector, payload: Record<string, unkn
     const role = payload.role;
     if (role !== "user" && role !== "assistant") return; // developer/instructions noise
     const text = textFromBlocks(payload.content);
-    if (text?.trim() && !(role === "user" && text.startsWith("<environment_context"))) {
+    if (text?.trim() && !(role === "user" && isCodexInjectedUserText(text))) {
       collector.push({ role, text: clampText(text), ...(atMs !== undefined ? { atMs } : {}) });
     }
     return;
