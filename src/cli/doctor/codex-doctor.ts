@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { expandPath } from "../../identities/match.ts";
 import type { Identity } from "../../identities/types.ts";
 import { oauthRefreshHealth } from "../../identities/oauth-refresh.ts";
 import { lastRefreshState } from "../../server/auth-refresh.ts";
@@ -56,6 +59,15 @@ export async function probeCodexDoctor(identity: Identity): Promise<DoctorResult
         statusWord: "token expired (no refresh token)",
         detail: health.detail,
       };
+    }
+  }
+  // A gateway-routed folder with the API-key entry answers -32600 to the usage read: Codex reads usage only with a ChatGPT-style
+  // login and chatgpt_base_url, which `ais gateway codex-home` sets up for the folder.
+  if (/-32600/.test(error)) {
+    const dir = identity.configDir ? expandPath(identity.configDir) : undefined;
+    const apiKeyEntry = dir ? await readFile(join(dir, "auth.json"), "utf8").then((t) => /"auth_mode"\s*:\s*"apikey"/.test(t), () => false) : false;
+    if (dir && apiKeyEntry) {
+      return { ...base, status: "responsive", elapsedMs, detail: `${error}; this folder holds the gateway API-key login, which cannot read usage. Run: ais gateway codex-home ${dir}` };
     }
   }
   // Any other "unavailable" (auth gate, no rate-limit windows, ...) still

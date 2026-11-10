@@ -10,11 +10,12 @@ import { performSwap as performClaudeSwap } from "../../../src/identities/claude
 import { fetchMemberUsage } from "../../../src/identities/claude-usage-api.ts";
 import { classifyLogin } from "../../../src/identities/gateway-routed.ts";
 import { codexAdapter, codexMemberProblem, codexTuning } from "../../../src/identities/pool/codex-adapter.ts";
-import { isCodexGatewayPoolDir, isGatewayRoutedPool } from "../../../src/identities/pool/gateway-pool.ts";
+import { codexPoolEntryText, isCodexGatewayPoolDir, isGatewayRoutedPool } from "../../../src/identities/pool/gateway-pool.ts";
 import { poolLaunchCheck } from "../../../src/identities/pool/launch.ts";
 import { readSwapEvents } from "../../../src/identities/pool/ledger.ts";
 import { performPoolSwap } from "../../../src/identities/pool/swap.ts";
 import { requirePool } from "../../../src/identities/pool/swap-pool.ts";
+import { configureCodexGatewayHome, codexGatewayHomeProblem } from "../../../src/identities/codex-gateway-home.ts";
 import { loadIdentitiesFile } from "../../../src/identities/store.ts";
 
 // Every token below is a synthetic string built for this test.
@@ -293,5 +294,44 @@ describe("claude: gateway-routed pools and members", () => {
     expect(expired.status).toBe("unavailable");
     expect(expired.error).toContain("the AIS gateway renews it");
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe("codex pool entry for a local-route folder", () => {
+  let scratch: string;
+  beforeEach(async () => {
+    scratch = await mkdtemp(join(tmpdir(), "ais-cpe-"));
+  });
+  afterEach(() => rm(scratch, { recursive: true, force: true }));
+  const secretsWith = async (lines: string) => {
+    const path = join(scratch, "secrets");
+    await writeFile(path, lines);
+    return path;
+  };
+
+  test("chatgpt_base_url on the local route gives the placeholder login of agents-codex", async () => {
+    const secrets = await secretsWith(`AIS_GATEWAY_APP_AGENTS_CODEX_TOKEN=${CODEX_KEY}\n`);
+    const dir = join(scratch, "pool");
+    await mkdir(dir);
+    await writeFile(join(dir, "config.toml"), `chatgpt_base_url = "http://127.0.0.1:47140/codex/backend-api"\n${routedConfig}`);
+    const entry = JSON.parse((await codexPoolEntryText(dir, secrets))!);
+    expect(entry.tokens).toMatchObject({ access_token: CODEX_KEY, account_id: "ais-agents-codex" });
+    expect(entry.OPENAI_API_KEY).toBeNull();
+  });
+
+  test("the cluster form keeps its own app", async () => {
+    const secrets = await secretsWith(`AIS_GATEWAY_APP_BILLING_TOKEN=${CODEX_KEY}\n`);
+    const dir = join(scratch, "pool");
+    await mkdir(dir);
+    await writeFile(join(dir, "config.toml"), 'chatgpt_base_url = "https://gw.test/billing/backend-api"\n\n[model_providers.ais-gateway]\nbase_url = "https://gw.test/billing"\n');
+    expect(JSON.parse((await codexPoolEntryText(dir, secrets))!).tokens.account_id).toBe("ais-billing");
+  });
+
+  test("a codex-home folder on the local route checks clean", async () => {
+    const dir = join(scratch, "pool");
+    await mkdir(dir);
+    await writeFile(join(dir, "config.toml"), routedConfig);
+    await configureCodexGatewayHome(dir, CODEX_KEY);
+    expect(await codexGatewayHomeProblem(dir)).toBeUndefined();
   });
 });
