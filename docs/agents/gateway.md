@@ -558,3 +558,17 @@ second holder of one token):
    gateway renewed it since the routing). If it is not (un-routed before the gateway's first renewal), sync keeps the
    entry there: on that host move the identity's gateway entry file aside (`.credentials.json` / `auth.json`; it holds no
    login) and sync again, or sign in again there.
+
+### Portal login status and sign-in for a routed identity
+
+The Identities tab (`src/server/auth.ts`, `probeViaGateway`) probes the member-store login of an identity whose folder holds
+the gateway entry, not the folder (which has no expiry): the detail reads "via gateway member store: ...". A routed folder with
+no store copy on this host is "unknown" with a detail, never "ok". When the gateway's refresh gets a dead-grant answer
+(`invalid_grant`, `refresh_token_*`, `token_revoked`) it writes `login-revoked.json` next to the store copy
+(`src/identities/gateway-revoked.ts`: code, time, refresh-token fingerprint, no secret); the tab then shows "refresh token
+revoked: re-login required". The marker names the refresh token it was written for, so a new login in the store ends it at once.
+
+A portal sign-in writes the new login over the gateway entry in the folder. When the gateway holds the account (a store copy
+exists), `LoginFlowManager` then runs route-all for that one identity (`adoptLoginIntoGateway`): same account, provably fresher
+than the store copy, no running session, no other holder. The new login moves to the store, the folder gets the gateway entry
+back, the marker is cleared. Whatever route-all refuses is returned as the flow's `note`.

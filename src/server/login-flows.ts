@@ -7,6 +7,9 @@ import { isRetired } from "../identities/retired.ts";
 import { refusePool } from "./auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
+import { routeAllViaGateway, type RouteAllOptions } from "../cli/identities/route-all.ts";
+import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreRoot } from "../identities/gateway-members.ts";
+import { classifyLogin, refreshOf } from "../identities/gateway-routed.ts";
 import { HttpError, type LoginFlowDto, type LoginFlowStatus } from "./types.ts";
 
 /**
@@ -151,7 +154,36 @@ export interface FingerprintFn {
   (paths: string[]): Promise<string | undefined>;
 }
 
+/**
+ * After a sign-in on a gateway-routed identity: the gateway reads the account's login from its member store, not from the
+ * folder the tool just wrote the new login into (over the gateway entry). Hands the new login to the store and puts the gateway
+ * entry back, by the route-all-via-gateway rules (same account, provably fresher than the store copy, no running session, no
+ * other holder). Returns a note for the owner, or undefined when nothing was routed (an identity the gateway does not hold).
+ */
+export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}): Promise<string | undefined> {
+  if (!isMemberStoreTool(toolName)) return undefined;
+  const root = opts.memberRoot ?? memberStoreRoot();
+  if (!hasMemberCopy(toolName, identityName, root)) return undefined;
+  const folder = await Bun.file(`${configDir}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
+  if (classifyLogin(toolName, folder) !== "login") return undefined;
+  const refused = (why: string): string => `signed in, but the gateway still uses its older login for this identity: ${why}`;
+  try {
+    const report = await routeAllViaGateway({ ...opts, memberRoot: root, only: { tool: toolName, identity: identityName }, afterLogin: true });
+    const line = report.lines[0];
+    if (!line) return refused(report.unroutedTools[0]?.reason ?? "the identity could not be routed");
+    if (line.status !== "routed") return refused(line.detail ?? line.status);
+  } catch (err) {
+    return refused(`routing failed (${err instanceof Error ? err.name : "error"})`);
+  }
+  // A routed run can keep the store copy (not provably fresher): then the new login was only backed up.
+  const store = await Bun.file(`${memberDir(toolName, identityName, root)}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
+  if (refreshOf(toolName, store) !== refreshOf(toolName, folder)) return refused("the new login is not provably fresher than the gateway's copy, so the gateway kept its own (the new login is in the folder's .pre-gateway backup)");
+  return "signed in; the new login now serves the gateway";
+}
+
 export interface LoginFlowManagerDeps {
+  /** Hands a finished sign-in on a routed identity to the gateway (injectable; default adoptLoginIntoGateway). */
+  adoptLogin?: (toolName: ToolConfig["toolName"], identityName: string, configDir: string) => Promise<string | undefined>;
   spawn?: SpawnFn;
   /** util-linux script binary for PTY mode; discovery is injectable so
    * tests never depend on the host. */
@@ -197,6 +229,7 @@ async function defaultResolveIdentity(
 
 interface FlowRecord {
   dto: LoginFlowDto;
+  configDir: string;
   child?: SpawnedChild;
   credentialPaths: string[];
   /** True for a codex browser sign-in (holds the host's one callback port). */
@@ -241,6 +274,7 @@ export class LoginFlowManager {
   private readonly credentialPaths: (toolName: ToolConfig["toolName"], configDir: string) => string[];
   private readonly resolveIdentity: typeof defaultResolveIdentity;
   private readonly resolveBin: (name: string) => string | undefined;
+  private readonly adoptLogin: NonNullable<LoginFlowManagerDeps["adoptLogin"]>;
   private readonly httpFetch: NonNullable<LoginFlowManagerDeps["fetch"]>;
   private readonly flowTimeoutMs: number;
   private readonly pollIntervalMs: number;
@@ -278,6 +312,7 @@ export class LoginFlowManager {
           return undefined;
         }
       });
+    this.adoptLogin = deps.adoptLogin ?? ((tool, name, dir) => adoptLoginIntoGateway(tool, name, dir));
     this.httpFetch = deps.fetch ?? ((url, init) => fetch(url, init));
     this.flowTimeoutMs = deps.flowTimeoutMs ?? DEFAULT_FLOW_TIMEOUT_MS;
     this.pollIntervalMs = deps.pollIntervalMs ?? 1_500;
@@ -364,6 +399,7 @@ export class LoginFlowManager {
     };
     const record: FlowRecord = {
       dto,
+      configDir,
       credentialPaths: this.credentialPaths(toolName, configDir),
       ...(spec.localCallback ? { localCallback: true } : {}),
       outputTail: "",
@@ -547,13 +583,13 @@ export class LoginFlowManager {
   private onExit(record: FlowRecord, code: number | null | undefined): void {
     if (record.done) return;
     if (code === 0) {
-      this.finish(record, "completed");
+      void this.complete(record);
       return;
     }
     // A credential write already observed means the login itself worked;
     // a non-zero exit after that is cleanup noise, not a failed login.
     if (record.dto.status === "callback" && record.fingerprint !== record.initialFingerprint) {
-      this.finish(record, "completed");
+      void this.complete(record);
       return;
     }
     const tail = record.outputTail
@@ -567,6 +603,19 @@ export class LoginFlowManager {
       "failed",
       tail ? tail : `login process exited with code ${code ?? "unknown"}`,
     );
+  }
+
+  /** A sign-in finished: on a gateway-routed identity the new login is handed to the gateway before the flow reads completed. */
+  private async complete(record: FlowRecord): Promise<void> {
+    let note: string | undefined;
+    try {
+      note = await this.adoptLogin(record.dto.toolName, record.dto.identity, record.configDir);
+    } catch {
+      note = "signed in, but handing the new login to the gateway failed";
+    }
+    if (record.done) return;
+    if (note) record.dto.note = note;
+    this.finish(record, "completed");
   }
 
   private bumpStatus(record: FlowRecord, status: LoginFlowStatus): void {

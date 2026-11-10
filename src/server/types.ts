@@ -159,6 +159,8 @@ export interface LoginFlowDto {
   /** Whether POST /flows/:id/submit can inject a pasted code/URL. */
   acceptsPaste: boolean;
   error?: string;
+  /** A completed sign-in that needs the owner to know something (for example it could not be handed to the gateway). */
+  note?: string;
   startedAt: string;
   updatedAt: string;
   endedAt?: string;

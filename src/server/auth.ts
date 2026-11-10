@@ -11,6 +11,9 @@ import { readAliApiKey, writeAliAuthFile } from "../identities/ali-auth.ts";
 import { readZaiApiKey, writeZaiAuthFile } from "../identities/zai-auth.ts";
 import { withUsableCwd } from "../shared/exec.ts";
 import { resolveRealBinary } from "../shared/resolve-binary.ts";
+import { hasMemberCopy, memberDir, memberStoreRoot, type MemberStoreTool } from "../identities/gateway-members.ts";
+import { folderHoldsGatewayEntry } from "../identities/gateway-routed.ts";
+import { readLoginRevoked } from "../identities/gateway-revoked.ts";
 import { LOGIN_FLOW_SPECS, type LoginFlowSpec } from "./login-specs.ts";
 import type { RefreshStatusDto } from "./auth-refresh.ts";
 import type { Identity, ToolConfig } from "../identities/types.ts";
@@ -293,6 +296,32 @@ async function probeOpencode(configDir: string): Promise<ProbeResult> {
   return { kind: "oauth", state: "missing", detail: "no auth.json under this identity's opencode data dir", fixable: ["login"] };
 }
 
+/**
+ * A claude or codex identity routed through the gateway holds only the gateway entry in its folder (an app key, no expiry);
+ * the account's real login is the gateway's member-store copy. Probes that copy instead, so the Identities tab shows what the
+ * gateway actually uses: its expiry, and whether the gateway found it revoked (gateway-revoked.ts). Undefined when the
+ * folder holds a real login (probed as before). A routed folder with no store copy on this host cannot be verified: "unknown".
+ */
+async function probeViaGateway(tool: MemberStoreTool, identity: Identity): Promise<ProbeResult | undefined> {
+  if (!folderHoldsGatewayEntry(tool, identity)) return undefined;
+  const root = memberStoreRoot();
+  if (!hasMemberCopy(tool, identity.name, root)) {
+    return {
+      kind: "oauth",
+      state: "unknown",
+      detail: "via gateway: the folder holds the gateway entry, but this host has no member-store login for it (the real login cannot be checked here)",
+      fixable: ["login"],
+    };
+  }
+  const revoked = readLoginRevoked(tool, identity.name, root);
+  if (revoked) {
+    return { kind: "oauth", state: "expired", detail: `refresh token revoked: re-login required (via gateway member store; ${revoked.code}, ${revoked.at})`, fixable: ["login"] };
+  }
+  const dir = memberDir(tool, identity.name, root);
+  const inner = tool === "claude" ? await probeClaude(dir) : await probeCodex(dir);
+  return { ...inner, detail: `via gateway member store: ${inner.detail ?? inner.state}` };
+}
+
 export async function authStatus(
   configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
   refreshStatus: RefreshStatusDto[] = [],
@@ -331,10 +360,10 @@ export async function authStatus(
       try {
         switch (cfg.toolName) {
           case "claude":
-            result = await probeClaude(identity.configDir);
+            result = (await probeViaGateway("claude", identity)) ?? (await probeClaude(identity.configDir));
             break;
           case "codex":
-            result = await probeCodex(identity.configDir);
+            result = (await probeViaGateway("codex", identity)) ?? (await probeCodex(identity.configDir));
             break;
           case "grok":
             result = await probeGrok(identity.configDir);

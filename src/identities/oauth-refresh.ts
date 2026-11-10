@@ -125,8 +125,8 @@ interface TokenResponseWire {
   error?: string | { code?: string; message?: string };
 }
 
-/** Refresh-token codes that mean only a new login helps. invalid_grant is the RFC code; the refresh_token_* codes are what the OpenAI/Codex endpoint sends. */
-export const DEAD_REFRESH_CODES: ReadonlySet<string> = new Set(["invalid_grant", "refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"]);
+/** Refresh-token codes that mean only a new login helps. invalid_grant is the RFC code; the refresh_token_* codes and token_revoked are what the OpenAI/Codex endpoint sends. */
+export const DEAD_REFRESH_CODES: ReadonlySet<string> = new Set(["invalid_grant", "refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated", "token_revoked"]);
 
 function oauthErrorCode(parsed: TokenResponseWire): string | undefined {
   const e = parsed.error;
