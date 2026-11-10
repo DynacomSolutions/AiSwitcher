@@ -4,7 +4,7 @@ import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
 import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
 import { installDrainHandlers, LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
-import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
+import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_CONNECT_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
 
 function portOf(flag: string | undefined, env: string | undefined, fallback: number, name: string): number {
   const raw = flag ?? env;
@@ -24,14 +24,27 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   if (sub === "app") return runAppCommand(rest[0], rest.slice(1), flags, merged);
   if (sub === "usage") return runUsageCommand(flags, merged);
   if (sub === "local") return runLocal(rest, merged, boolFlag(flags, "check"));
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage ...  (ais gateway --help)");
+  if (sub === "claude-proxy") {
+    const { runClaudeProxyCommand } = await import("./claude-proxy.ts");
+    return runClaudeProxyCommand(rest, flags, merged);
+  }
+  if (sub === "codex-home") {
+    const { runCodexHomeCommand } = await import("./codex-home.ts");
+    return runCodexHomeCommand(rest, flags, merged);
+  }
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|claude-proxy|codex-home ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");
   if (!adminToken) throw new CliUsageError("AIS_GATEWAY_ADMIN_TOKEN is required");
   const port = portOf(stringFlag(flags, "port"), process.env.AIS_GATEWAY_PORT, DEFAULT_GATEWAY_PORT, "AIS_GATEWAY_PORT");
   const adminPort = portOf(stringFlag(flags, "admin-port"), process.env.AIS_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_ADMIN_PORT, "AIS_GATEWAY_ADMIN_PORT");
-  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true });
+  // The CONNECT proxy runs when the deployment mounts its certificate (AIS_GATEWAY_CONNECT_TLS_DIR).
+  const tlsDir = process.env.AIS_GATEWAY_CONNECT_TLS_DIR;
+  const connect = tlsDir
+    ? { port: portOf(undefined, process.env.AIS_GATEWAY_CONNECT_PORT, DEFAULT_GATEWAY_CONNECT_PORT, "AIS_GATEWAY_CONNECT_PORT"), tlsDir, ...(process.env.AIS_GATEWAY_CONNECT_CA_PUBLISH ? { publishCaTo: process.env.AIS_GATEWAY_CONNECT_CA_PUBLISH } : {}) }
+    : undefined;
+  const gateway = await startGateway({ port, adminPort, databaseUrl, adminToken, handleSignals: true, ...(connect ? { connect } : {}) });
   console.info(`gateway: proxy on :${gateway.port}, admin on :${gateway.adminPort}; warming up`);
   // Runs until SIGTERM or SIGINT, whose handler drains and exits the process.
   await new Promise<void>(() => {});

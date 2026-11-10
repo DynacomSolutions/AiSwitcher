@@ -360,7 +360,7 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   app.post("/api/auth/flows/:id/submit", async (c) => {
     if (!deps.loginFlows) throw new HttpError(503, "login flows are not running");
     const body = await c.req.json();
-    return c.json(deps.loginFlows.submit(c.req.param("id"), requireString(body.code, "code")));
+    return c.json(await deps.loginFlows.submit(c.req.param("id"), requireString(body.code, "code")));
   });
 
   app.post("/api/auth/flows/:id/cancel", (c) => {

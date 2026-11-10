@@ -263,10 +263,103 @@ describe("served from pool state", () => {
     expect((await call("c", "/api/codex/rate-limit-reset-credits", { method: "GET" })).status).toBe(502);
   });
 
+  for (const path of ["/backend-api/wham/rate-limit-reset-credits", "/backend-api/api/codex/rate-limit-reset-credits"]) {
+    test(`codex reset credits are served under the ChatGPT ${path}`, async () => {
+      await addApp("c", "codex", "openai");
+      reply = () => new Response(JSON.stringify({ available_count: 1 }));
+      expect(await (await call("c", path, { method: "GET" })).json()).toEqual({ available_count: 2 });
+    });
+  }
+
+  const codexUsageA = (): PoolUsage => ({ status: "live", maxUtilization: 60, capturedAt: "", windows: [{ label: "session", utilization: 60, resetsAt: "2026-11-02T11:00:00.000Z" }, { label: "week", utilization: 20, resetsAt: "2026-11-07T10:00:00.000Z" }] });
+  const codexUsageB = (): PoolUsage => ({ status: "live", maxUtilization: 30, capturedAt: "", windows: [{ label: "session", utilization: 12.6, resetsAt: "2026-11-02T12:00:00.000Z" }, { label: "week", utilization: 30, resetsAt: "2026-11-08T10:00:00.000Z" }] });
+  const nowSec = NOW.getTime() / 1000;
+
+  for (const path of ["/wham/usage", "/api/codex/usage", "/backend-api/wham/usage", "/backend-api/api/codex/usage", "/backend-api//wham/usage/"]) {
+    test(`codex ${path} shows the least-used member's windows in the ChatGPT shape, with no upstream call`, async () => {
+      await addApp("c", "codex", "openai");
+      usage.a = codexUsageA();
+      usage.b = codexUsageB();
+      const res = await call("c", path, { method: "GET" });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(JSON.parse(text)).toEqual({
+        plan_type: "pro",
+        rate_limit: {
+          allowed: true,
+          limit_reached: false,
+          primary_window: { used_percent: 13, limit_window_seconds: 18_000, reset_after_seconds: 7_200, reset_at: nowSec + 7_200 },
+          secondary_window: { used_percent: 30, limit_window_seconds: 604_800, reset_after_seconds: 6 * 86_400, reset_at: nowSec + 6 * 86_400 },
+        },
+      });
+      expect(text).not.toContain("tok-");
+      expect(seen).toHaveLength(0);
+      expect(requests.at(-1)).toMatchObject({ provider: "codex", status: "ok", httpStatus: 200 });
+    });
+  }
+
+  test("codex usage of a pinned app is the pinned identity's, and a full window is limit_reached", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    usage.a = { ...codexUsageA(), windows: [{ label: "session", utilization: 100 }, { label: "week", utilization: 20, resetsAt: "2026-11-07T10:00:00.000Z" }] };
+    usage.b = codexUsageB();
+    const body = (await (await call("c", "/backend-api/wham/usage", { method: "GET" })).json()) as { rate_limit: Record<string, unknown> };
+    expect(body.rate_limit).toMatchObject({ allowed: false, limit_reached: true, primary_window: { used_percent: 100, reset_at: nowSec + 18_000 }, secondary_window: { used_percent: 20 } });
+  });
+
+  test("codex usage keeps each window's own length: a monthly-only account is one 30-day primary window", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    usage.a = { status: "live", maxUtilization: 99, capturedAt: "", windows: [{ label: "month", utilization: 99, resetsAt: "2026-11-20T10:00:00.000Z" }] };
+    const body = (await (await call("c", "/backend-api/wham/usage", { method: "GET" })).json()) as { rate_limit: Record<string, unknown> };
+    expect(body.rate_limit).toEqual({ allowed: true, limit_reached: false, primary_window: { used_percent: 99, limit_window_seconds: 30 * 86_400, reset_after_seconds: 18 * 86_400, reset_at: nowSec + 18 * 86_400 }, secondary_window: null });
+  });
+
+  test("codex usage orders windows by length whatever their order, and reads ~Nh/~Nd labels", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    usage.a = { status: "live", maxUtilization: 40, capturedAt: "", windows: [{ label: "~3d", utilization: 40 }, { label: "~2h", utilization: 10 }, { label: "mystery", utilization: 90 }] };
+    const body = (await (await call("c", "/backend-api/wham/usage", { method: "GET" })).json()) as { rate_limit: { primary_window: Record<string, number>; secondary_window: Record<string, number> } };
+    expect(body.rate_limit.primary_window).toMatchObject({ used_percent: 10, limit_window_seconds: 7_200 });
+    expect(body.rate_limit.secondary_window).toMatchObject({ used_percent: 40, limit_window_seconds: 3 * 86_400 });
+  });
+
+  test("codex usage with no figures is 502, not an invented 0%", async () => {
+    await addApp("c", "codex", "openai");
+    expect((await call("c", "/backend-api/wham/usage", { method: "GET" })).status).toBe(502);
+    expect(seen).toHaveLength(0);
+  });
+
+  for (const [method, path] of [
+    ["GET", "/backend-api/plugins/featured"],
+    ["GET", "/backend-api/ps/plugins/installed"],
+    ["GET", "/backend-api/ps/plugins/list"],
+    ["GET", "/backend-api/ps/plugins/suggested/codex"],
+    ["GET", "/backend-api/accounts/check"],
+    ["GET", "/BACKEND-API/plugins/featured"],
+    ["GET", "/%62ackend-api/plugins/featured"],
+    ["GET", "//backend-api/plugins/featured"],
+    ["GET", "/backend-api"],
+    ["POST", "/backend-api/wham/usage"],
+    ["POST", "/backend-api/codex/responses"],
+  ] as const) {
+    test(`codex ${method} ${path} is 404 and never reaches the provider`, async () => {
+      await addApp("c", "codex", "openai");
+      const res = await call("c", path, { method, ...(method === "POST" ? { body: "{}" } : {}) });
+      expect(res.status).toBe(404);
+      expect(seen).toHaveLength(0);
+    });
+  }
+
+  test("codex usage paths are not served for another provider", async () => {
+    await addApp("k", "kimi", "openai");
+    await call("k", "/backend-api/wham/usage", { method: "GET" });
+    expect(seen).toHaveLength(1); // plain pass-through
+  });
+
   test("spending a reset credit through the gateway is refused with no upstream call", async () => {
     await addApp("c", "codex", "openai");
-    const res = await call("c", "/api/codex/rate-limit-reset-credits/consume", { method: "POST", body: "{}" });
-    expect(res.status).toBe(403);
+    for (const path of ["/api/codex/rate-limit-reset-credits/consume", "/backend-api/wham/rate-limit-reset-credits/consume"]) {
+      const res = await call("c", path, { method: "POST", body: "{}" });
+      expect(res.status).toBe(403);
+    }
     expect(seen).toHaveLength(0);
   });
 });

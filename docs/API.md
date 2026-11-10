@@ -283,7 +283,7 @@ Mutations (all return the updated registry entry; body is JSON):
 | Route | Body |
 |---|---|
 | `POST /api/identities/:tool` | `{ name, label, description?, configDir, directories?, aliases?, apiKey? }` |
-| `PATCH /api/identities/:tool/:name` | `{ label?, description?, configDir?, colour? }` |
+| `PATCH /api/identities/:tool/:name` | `{ label?, description?, configDir?, colour?, codexLoginMethod? }` |
 | `DELETE /api/identities/:tool/:name` | – |
 | `POST /api/identities/:tool/:name/directories` | `{ pattern }` |
 | `DELETE /api/identities/:tool/:name/directories` | `{ pattern }` |
@@ -313,6 +313,27 @@ the WebUI's launch/login actions: `GET /api/auth` reports it with
 for it answer `409`, and limits, sessions and resume skip it. Usage keeps it
 (see Usage). Its configDir stays a readable and editable Files root, labelled
 "(retired)", so its history remains browsable.
+
+#### Codex sign-in method
+
+Codex identities carry `codexLoginMethod`: `"device"` (default, always present
+in the identity DTO for codex) or `"browser"`, for accounts that have device
+codes disabled. `PATCH ... { "codexLoginMethod": "browser" }` sets it
+(`"device"` clears it back to the default); any other value, or the field on a
+non-codex tool, is a 400. CLI equivalent:
+`ais identities update <name> --tool=codex --codex-login=browser`.
+
+A browser identity's `POST /api/auth/login` runs plain `codex login` with no
+browser launch. The flow's `authUrl` is codex's sign-in URL, `acceptsPaste` is
+true and `instruction` explains the paste step. After signing in, the user's
+browser lands on an unreachable `http://localhost:<port>/auth/callback?...`
+page; they paste that full address to `POST /api/auth/flows/:id/submit`
+(`{ code }`). The server checks the host (localhost or 127.0.0.1), the path,
+that `code` and `state` are present, that `state` and the port match the auth
+URL, then replays it as a GET to `http://127.0.0.1:<port>/auth/callback` on the
+server host. Completion is detected as for any flow. The callback port is fixed
+per host, so a second browser flow while one is active is a 409 naming the
+identity already signing in.
 
 #### Identity colours
 

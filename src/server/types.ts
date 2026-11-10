@@ -58,6 +58,9 @@ export interface IdentityDto {
   effectiveColour: string;
   directories?: string[];
   aliases?: string[];
+  /** Codex only: how the console signs this identity in. Always present for
+   * codex identities ("device" when unset); absent for other tools. */
+  codexLoginMethod?: "device" | "browser";
   /** Present (true) only for a retired identity. */
   retired?: true;
   /** ISO timestamp of the retirement, when recorded. */
@@ -175,7 +178,7 @@ export interface LoginFlowManagerLike {
   start(toolName: ToolConfig["toolName"], identityName: string): Promise<LoginFlowDto>;
   list(): LoginFlowDto[];
   get(flowId: string): LoginFlowDto;
-  submit(flowId: string, code: string): LoginFlowDto;
+  submit(flowId: string, code: string): LoginFlowDto | Promise<LoginFlowDto>;
   cancel(flowId: string): LoginFlowDto;
 }
 

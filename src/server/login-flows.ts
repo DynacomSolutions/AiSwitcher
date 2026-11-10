@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { credentialPathsForTool } from "./auth.ts";
 import { requireTool } from "./registries.ts";
-import { LOGIN_FLOW_SPECS } from "./login-specs.ts";
+import { CODEX_BROWSER_SPEC, LOGIN_FLOW_SPECS, type LoginFlowSpec } from "./login-specs.ts";
 import { resolveRealBinary } from "../shared/resolve-binary.ts";
 import { isRetired } from "../identities/retired.ts";
 import { refusePool } from "./auth.ts";
@@ -88,6 +88,56 @@ export function extractPasteValue(raw: string): string {
   }
 }
 
+export interface CodexCallbackTarget {
+  port: number;
+  state: string;
+}
+
+/** Reads the callback port and state out of codex's auth URL. */
+export function codexCallbackTarget(authUrl: string): CodexCallbackTarget | undefined {
+  try {
+    const url = new URL(authUrl);
+    const state = url.searchParams.get("state");
+    const redirect = new URL(url.searchParams.get("redirect_uri") ?? "");
+    if (!state || !isLocalHost(redirect.hostname) || !redirect.port) return undefined;
+    return { port: Number(redirect.port), state };
+  } catch {
+    return undefined;
+  }
+}
+
+function isLocalHost(host: string): boolean {
+  return host === "localhost" || host === "127.0.0.1";
+}
+
+/** Validates a pasted codex callback URL against the running flow and
+ * returns the query string to replay. Error messages never echo the pasted
+ * value (it carries a one-time authorisation code). */
+export function validateCodexCallback(raw: string, target: CodexCallbackTarget): string {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new HttpError(400, "paste the full address from the browser's address bar (it starts with http://localhost)");
+  }
+  if (url.protocol !== "http:" || !isLocalHost(url.hostname)) {
+    throw new HttpError(400, "the pasted address must start with http://localhost or http://127.0.0.1");
+  }
+  if (url.pathname !== "/auth/callback") {
+    throw new HttpError(400, "the pasted address must have the path /auth/callback");
+  }
+  if (!url.searchParams.get("code") || !url.searchParams.get("state")) {
+    throw new HttpError(400, "the pasted address is missing its code or state; copy the whole address");
+  }
+  if (url.searchParams.get("state") !== target.state) {
+    throw new HttpError(400, "the pasted address belongs to a different sign-in attempt; start again from this flow's URL");
+  }
+  if (Number(url.port || 80) !== target.port) {
+    throw new HttpError(400, `the pasted address must use port ${target.port}`);
+  }
+  return url.search;
+}
+
 function redact(text: string): string {
   return text.replace(TOKENISH_PATTERN, "<redacted>").slice(-400).trim();
 }
@@ -118,6 +168,8 @@ export interface LoginFlowManagerDeps {
    * daemon adds an unneeded layer with its own resolution — the exec.ts
    * convention is "resolve via resolveRealBinary, spawn the real binary". */
   resolveBin?: (name: string) => string | undefined;
+  /** HTTP client for the codex callback replay (injectable). */
+  fetch?: (url: string, init: { redirect: "manual"; signal: AbortSignal }) => Promise<{ status: number }>;
   flowTimeoutMs?: number;
   pollIntervalMs?: number;
   keepEndedMs?: number;
@@ -128,20 +180,27 @@ export interface LoginFlowManagerDeps {
 async function defaultResolveIdentity(
   toolName: ToolConfig["toolName"],
   identityName: string,
-): Promise<{ cfg: ToolConfig; configDir: string; identityName: string }> {
+): Promise<{ cfg: ToolConfig; configDir: string; identityName: string; codexLoginMethod?: "device" | "browser" }> {
   const cfg = requireTool(toolName);
   const file = await loadIdentitiesFile(cfg.identitiesJsonPath);
   const identity = findIdentityByNameOrAlias(file.identities, identityName);
   if (!identity) throw new HttpError(404, `identity "${identityName}" not found in ${toolName}'s registry`);
   if (isRetired(identity)) throw new HttpError(409, `identity "${identityName}" is retired; unretire it first`);
   refusePool(identity);
-  return { cfg, configDir: identity.configDir, identityName: identity.name };
+  return {
+    cfg,
+    configDir: identity.configDir,
+    identityName: identity.name,
+    ...(identity.codexLoginMethod ? { codexLoginMethod: identity.codexLoginMethod } : {}),
+  };
 }
 
 interface FlowRecord {
   dto: LoginFlowDto;
   child?: SpawnedChild;
   credentialPaths: string[];
+  /** True for a codex browser sign-in (holds the host's one callback port). */
+  localCallback?: boolean;
   initialFingerprint?: string;
   fingerprint?: string;
   /** Rolling tail of the child's output, for failure messages only; it is
@@ -182,6 +241,7 @@ export class LoginFlowManager {
   private readonly credentialPaths: (toolName: ToolConfig["toolName"], configDir: string) => string[];
   private readonly resolveIdentity: typeof defaultResolveIdentity;
   private readonly resolveBin: (name: string) => string | undefined;
+  private readonly httpFetch: NonNullable<LoginFlowManagerDeps["fetch"]>;
   private readonly flowTimeoutMs: number;
   private readonly pollIntervalMs: number;
   private readonly keepEndedMs: number;
@@ -218,6 +278,7 @@ export class LoginFlowManager {
           return undefined;
         }
       });
+    this.httpFetch = deps.fetch ?? ((url, init) => fetch(url, init));
     this.flowTimeoutMs = deps.flowTimeoutMs ?? DEFAULT_FLOW_TIMEOUT_MS;
     this.pollIntervalMs = deps.pollIntervalMs ?? 1_500;
     this.keepEndedMs = deps.keepEndedMs ?? 30 * 60_000;
@@ -242,13 +303,28 @@ export class LoginFlowManager {
   /** Starts the managed login for (tool, identity). Throws 409 if a flow
    * for the same pair is already active. */
   async start(toolName: ToolConfig["toolName"], identityName: string): Promise<LoginFlowDto> {
-    const spec = LOGIN_FLOW_SPECS[toolName];
-    if (!spec) throw new HttpError(400, `tool "${toolName}" has no managed login flow`);
-    const { cfg, configDir, identityName: canonicalName } = await this.resolveIdentity(toolName, identityName);
+    const baseSpec = LOGIN_FLOW_SPECS[toolName];
+    if (!baseSpec) throw new HttpError(400, `tool "${toolName}" has no managed login flow`);
+    const { cfg, configDir, identityName: canonicalName, codexLoginMethod } = await this.resolveIdentity(
+      toolName,
+      identityName,
+    );
+    const spec: LoginFlowSpec = toolName === "codex" && codexLoginMethod === "browser" ? CODEX_BROWSER_SPEC : baseSpec;
 
     for (const record of this.flows.values()) {
       if (!record.done && record.dto.toolName === toolName && record.dto.identity === canonicalName) {
         throw new HttpError(409, `a login flow for ${toolName}/${canonicalName} is already running`);
+      }
+    }
+
+    if (spec.localCallback) {
+      for (const record of this.flows.values()) {
+        if (!record.done && record.localCallback) {
+          throw new HttpError(
+            409,
+            `codex identity "${record.dto.identity}" is already signing in with the browser flow; the callback port is fixed per host, so finish or cancel it first`,
+          );
+        }
       }
     }
 
@@ -259,6 +335,13 @@ export class LoginFlowManager {
       throw new HttpError(503, `could not locate the real ${cfg.realBinaryName} binary for a managed login`);
     }
     const childEnv = this.childEnv(cfg, configDir);
+    if (spec.localCallback) {
+      // No browser may open on the server host: the user signs in elsewhere.
+      // `true` is a no-op launcher for the webbrowser crate and xdg-open alike.
+      childEnv.BROWSER = "true";
+      delete childEnv.DISPLAY;
+      delete childEnv.WAYLAND_DISPLAY;
+    }
     const commandLine =
       spec.mode === "pty"
         ? this.ptyCommandLine(realBin, spec.args)
@@ -282,6 +365,7 @@ export class LoginFlowManager {
     const record: FlowRecord = {
       dto,
       credentialPaths: this.credentialPaths(toolName, configDir),
+      ...(spec.localCallback ? { localCallback: true } : {}),
       outputTail: "",
       done: false,
     };
@@ -322,11 +406,12 @@ export class LoginFlowManager {
 
   /** Injects a pasted code (or full redirect URL; the code parameter is
    * extracted) into the flow's stdin. */
-  submit(flowId: string, code: string): LoginFlowDto {
+  submit(flowId: string, code: string): LoginFlowDto | Promise<LoginFlowDto> {
     const record = this.requireActive(flowId);
     if (!record.dto.acceptsPaste) {
       throw new HttpError(400, `${record.dto.toolName}'s login flow does not accept a pasted code`);
     }
+    if (record.localCallback) return this.replayCodexCallback(record, code);
     const child = record.child;
     if (!child) throw new HttpError(409, "login process is gone");
     const value = extractPasteValue(code);
@@ -335,6 +420,33 @@ export class LoginFlowManager {
       void child.stdin.write(`${value}\n`);
     } catch (err) {
       throw new HttpError(409, err instanceof Error ? `login process is gone: ${err.message}` : "login process is gone");
+    }
+    this.touch(record);
+    return { ...record.dto };
+  }
+
+  /** Validates the pasted localhost callback URL and replays it against
+   * codex's listener on this host. Completion is then detected the usual way
+   * (credential fingerprint change, process exit). */
+  private async replayCodexCallback(record: FlowRecord, pasted: string): Promise<LoginFlowDto> {
+    const target = record.dto.authUrl ? codexCallbackTarget(record.dto.authUrl) : undefined;
+    if (!target) throw new HttpError(409, "codex has not printed its sign-in URL yet; wait for it to appear");
+    const query = validateCodexCallback(pasted, target);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const res = await this.httpFetch(`http://127.0.0.1:${target.port}/auth/callback${query}`, {
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      if (res.status >= 400) {
+        throw new HttpError(502, `codex's callback listener rejected the address (HTTP ${res.status}); start the sign-in again`);
+      }
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(409, "could not reach codex's callback listener on this host; the login process may have ended");
+    } finally {
+      clearTimeout(timer);
     }
     this.touch(record);
     return { ...record.dto };
@@ -395,7 +507,11 @@ export class LoginFlowManager {
   private onOutput(record: FlowRecord, text: string): void {
     if (record.done) return;
     record.outputTail = `${record.outputTail}${text}`.slice(-2_000);
-    const { url, deviceCode } = extractFlowSignals(record.outputTail);
+    const signals = extractFlowSignals(record.outputTail);
+    const { url } = signals;
+    // The browser flow's URL carries a long state value that can look like a
+    // device code; that flow has none.
+    const deviceCode = record.localCallback ? undefined : signals.deviceCode;
     let changed = false;
     if (url && url !== record.dto.authUrl) {
       record.dto.authUrl = url;

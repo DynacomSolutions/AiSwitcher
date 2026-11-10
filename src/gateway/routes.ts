@@ -7,6 +7,7 @@ import { CODEX_UPSTREAM_BASE } from "./providers/codex.ts";
 import { KIMI_ANTHROPIC_BASE } from "./providers/kimi.ts";
 import { allowedMembers, memberUsages, utilisationOf } from "./select.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider } from "./types.ts";
+import type { PoolUsage } from "../identities/pool/adapter.ts";
 
 /**
  * Routes that are not a plain "app prefix, then the same path on the provider" pass-through.
@@ -30,12 +31,17 @@ import type { ApiStyle, GatewayApp, GatewayProvider } from "./types.ts";
  *   0.145 binary, and not proven live.
  * - Codex reset credits: `/wham/rate-limit-reset-credits` (also `/api/codex/...`), taken from the strings of the installed
  *   codex binary; its summary carries `available_count`.
+ * - Codex usage: `/wham/usage` (and `/api/codex/usage`), what codex 0.166 calls for `account/rateLimits/read` when its
+ *   config sets `chatgpt_base_url` (T3 Code reads usage this way). Codex adds `/backend-api` to that base, so every codex
+ *   served path is also accepted under `/backend-api`. Any other `/backend-api/*` path (plugins, `ps/plugins/*`) is
+ *   ChatGPT account detail: `deny`, answered 404 with no upstream call and no login.
  */
 export type Route =
   | { kind: "upstream"; url: string; side: boolean }
-  | { kind: "serve"; name: ServedName };
+  | { kind: "serve"; name: ServedName }
+  | { kind: "deny"; status: 404 };
 
-export type ServedName = "claude-usage" | "claude-profile" | "codex-reset-credits" | "codex-reset-consume" | "ali-models";
+export type ServedName = "claude-usage" | "claude-profile" | "codex-usage" | "codex-reset-credits" | "codex-reset-consume" | "ali-models";
 
 /** Side and served requests an app may make per day, counted apart from tokens. AIS_GATEWAY_SIDE_DAILY_LIMIT overrides. */
 export const SIDE_DAILY_LIMIT_DEFAULT = 5_000;
@@ -106,16 +112,51 @@ function modelsRoute(provider: GatewayProvider, style: ApiStyle, id: string): Ro
   }
 }
 
+/**
+ * A codex path with its ChatGPT `/backend-api` prefix taken off. `backend` is true when the prefix was there, matched after
+ * slash collapsing, percent-decoding and lower-casing (so no spelling of the prefix slips through to the provider).
+ */
+function codexPath(path: string): { path: string; backend: boolean } {
+  let p = path;
+  for (let i = 0; i < 4; i++) {
+    const norm = collapseSlashes(p).toLowerCase();
+    const m = /^\/backend-api(\/.*)?$/.exec(norm);
+    if (m) {
+      const tail = m[1] ?? "";
+      return { path: tail.length > 1 && tail.endsWith("/") ? tail.slice(0, -1) : tail, backend: true };
+    }
+    let next: string;
+    try {
+      next = decodeURIComponent(p);
+    } catch {
+      return { path, backend: false };
+    }
+    if (next === p) break;
+    p = next;
+  }
+  return { path, backend: false };
+}
+
 /** Decides whether `rest` (the path after the app name) is one of the special routes. Undefined: plain pass-through. */
 export function routeFor(provider: GatewayProvider, style: ApiStyle, method: string, rest: string): Route | undefined {
   const m = method.toUpperCase();
-  const path = rest.length > 1 && rest.endsWith("/") ? rest.slice(0, -1) : rest;
+  let path = rest.length > 1 && rest.endsWith("/") ? rest.slice(0, -1) : rest;
+  let backend = false;
+  if (provider === "codex") ({ path, backend } = codexPath(path));
+  const route = specialRoute(provider, style, m, path);
+  // Under /backend-api only the served codex routes exist; nothing there is passed on with a member login.
+  if (backend && route?.kind !== "serve") return { kind: "deny", status: 404 };
+  return route;
+}
+
+function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, path: string): Route | undefined {
   if (m === "GET") {
     const models = /^(?:\/v1)?\/models(\/[^/]+)?$/.exec(path);
     if (models) return modelsRoute(provider, style, models[1] ?? "");
     if (provider === "claude" && path === "/api/oauth/usage") return { kind: "serve", name: "claude-usage" };
     if (provider === "claude" && path === "/api/oauth/profile") return { kind: "serve", name: "claude-profile" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits$/.test(path)) return { kind: "serve", name: "codex-reset-credits" };
+    if (provider === "codex" && /^(?:\/api\/codex|\/wham)\/usage$/.test(path)) return { kind: "serve", name: "codex-usage" };
   }
   if (m === "POST") {
     if (provider === "kimi") {
@@ -160,6 +201,8 @@ export async function serveRoute(name: ServedName, ctx: ServeContext): Promise<R
       return json({ account: { uuid: null, full_name: ctx.app.name, display_name: ctx.app.name, email: null }, organization: { uuid: null, name: ctx.app.name } });
     case "claude-usage":
       return json(await claudeUsageBody(ctx));
+    case "codex-usage":
+      return codexUsage(ctx);
     case "codex-reset-credits":
       return codexResetCredits(ctx);
     case "codex-reset-consume":
@@ -167,16 +210,65 @@ export async function serveRoute(name: ServedName, ctx: ServeContext): Promise<R
   }
 }
 
-/** The two windows of the member the pool would route to (lowest utilisation), in the shape of Anthropic's usage endpoint. */
-async function claudeUsageBody(ctx: ServeContext): Promise<Record<string, unknown>> {
+/** The reading of the member the pool would route to: the pin, or the pool member with the lowest utilisation. */
+async function leastUsed(ctx: ServeContext): Promise<PoolUsage | undefined> {
   const readings = (await memberUsages(ctx.app, ctx.deps)).filter((u) => u !== undefined && utilisationOf(u) !== undefined);
   let best = readings[0];
   for (const u of readings) if ((utilisationOf(u) ?? 0) < (utilisationOf(best) ?? 0)) best = u;
+  return best;
+}
+
+/** The two windows of the member the pool would route to (lowest utilisation), in the shape of Anthropic's usage endpoint. */
+async function claudeUsageBody(ctx: ServeContext): Promise<Record<string, unknown>> {
+  const best = await leastUsed(ctx);
   const win = (label: string): { utilization: number; resets_at: string | null } | null => {
     const w = best?.windows?.find((x) => x.label === label);
     return w ? { utilization: w.utilization, resets_at: w.resetsAt ?? null } : null;
   };
   return { five_hour: win("five-hour"), seven_day: win("seven-day"), seven_day_opus: null, seven_day_sonnet: null, extra_usage: null };
+}
+
+/**
+ * The length of a codex limit window from its AIS label (src/cli/limits/codex-limits.ts names a window by its length:
+ * "session" up to 6 h, "week" up to 14 d, "month" up to 42 d, otherwise "~Nh" or "~Nd"). Undefined: no length known.
+ */
+export function codexWindowSeconds(label: string): number | undefined {
+  const l = label.toLowerCase().trim();
+  const approx = /^~(\d+)([hd])$/.exec(l);
+  if (approx) return Number(approx[1]) * (approx[2] === "h" ? 3_600 : 86_400);
+  if (/session|five|5h|hour/.test(l)) return 5 * 3_600;
+  if (/week|seven|7d/.test(l)) return 7 * 86_400;
+  if (/month/.test(l)) return 30 * 86_400;
+  return undefined;
+}
+
+/**
+ * The windows of the member the pool would route to, in the shape of ChatGPT's `wham/usage` (what codex decodes for
+ * `account/rateLimits/read`; `allowed` and `limit_reached` are required). The shortest window is primary, the next one
+ * secondary, each with its own length (a monthly-only account shows one 30-day primary window, never a 5 h one). The
+ * plan is not known to the gateway, so it is always "pro". No reading at all: 502, so the client shows "unavailable"
+ * rather than an invented 0%.
+ */
+async function codexUsage(ctx: ServeContext): Promise<Response> {
+  const best = await leastUsed(ctx);
+  const nowSec = Math.floor(ctx.deps.now().getTime() / 1000);
+  const windows = (best?.windows ?? [])
+    .map((w) => ({ w, seconds: codexWindowSeconds(w.label) }))
+    .filter((x): x is { w: (typeof x)["w"]; seconds: number } => x.seconds !== undefined && Number.isFinite(x.w.utilization))
+    .sort((a, b) => a.seconds - b.seconds)
+    .slice(0, 2)
+    .map(({ w, seconds }) => {
+      const parsed = w.resetsAt ? Date.parse(w.resetsAt) : Number.NaN;
+      // A window always resets within its own length; no known reset is shown as a full window away.
+      const resetAt = Number.isFinite(parsed) ? Math.floor(parsed / 1000) : nowSec + seconds;
+      return { used_percent: Math.max(0, Math.round(w.utilization)), limit_window_seconds: seconds, reset_after_seconds: Math.max(0, resetAt - nowSec), reset_at: resetAt };
+    });
+  if (windows.length === 0) return providerError(ctx.style, 502, "usage unavailable");
+  const full = windows.some((w) => w.used_percent >= 100);
+  return json({
+    plan_type: "pro",
+    rate_limit: { allowed: !full, limit_reached: full, primary_window: windows[0] ?? null, secondary_window: windows[1] ?? null },
+  });
 }
 
 const CODEX_RESET_URL = `${CODEX_BACKEND}/wham/rate-limit-reset-credits`;

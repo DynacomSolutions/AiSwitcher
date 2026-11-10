@@ -74,6 +74,7 @@ function EditIdentityDialog({
   const [label, setLabel] = useState(identity.label);
   const [description, setDescription] = useState(identity.description ?? "");
   const [configDir, setConfigDir] = useState(identity.configDir);
+  const [codexLogin, setCodexLogin] = useState<"device" | "browser">(identity.codexLoginMethod ?? "device");
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -81,6 +82,7 @@ function EditIdentityDialog({
         label: label.trim(),
         description: description.trim() || undefined,
         configDir: configDir.trim(),
+        ...(tool === "codex" ? { codexLoginMethod: codexLogin } : {}),
       }),
     onSuccess: () => {
       invalidate();
@@ -124,6 +126,24 @@ function EditIdentityDialog({
               onChange={(e) => setConfigDir(e.target.value)}
             />
           </div>
+          {tool === "codex" ? (
+            <div className="space-y-2">
+              <Label htmlFor="edit-codex-login">Codex sign-in method</Label>
+              <select
+                id="edit-codex-login"
+                className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                value={codexLogin}
+                onChange={(e) => setCodexLogin(e.target.value === "browser" ? "browser" : "device")}
+              >
+                <option value="device">Device code (default)</option>
+                <option value="browser">Browser (for accounts without device codes)</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Browser sign-in shows a link, then asks you to paste the http://localhost address your
+                browser lands on. Only one browser sign-in can run at a time on a host.
+              </p>
+            </div>
+          ) : null}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>

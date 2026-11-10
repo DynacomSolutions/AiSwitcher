@@ -138,6 +138,8 @@ export interface IdentityDto extends Identity {
   /** Always present: `colour` when set, otherwise the stable auto palette
    * colour for (tool, name). */
   effectiveColour: string;
+  /** Codex only: "device" (default) or "browser" sign-in. */
+  codexLoginMethod?: "device" | "browser";
 }
 
 export interface ChromeProfileOverrideDto {
@@ -183,6 +185,8 @@ export interface PatchIdentityBody {
   configDir?: string;
   /** #rgb or #rrggbb; "" clears an explicit colour (back to auto). */
   colour?: string;
+  /** Codex only. */
+  codexLoginMethod?: "device" | "browser";
 }
 
 /* Limits */

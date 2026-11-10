@@ -1,4 +1,5 @@
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "../../identities/types.ts";
+import { isCodexLoginMethod } from "../../identities/types.ts";
 import { normaliseIdentityColour } from "../../identities/colour.ts";
 import { isValidIdentityKey, parseDirectoryPattern } from "../../identities/match.ts";
 import { isRetired, retireIdentityFields, unretireIdentityFields } from "../../identities/retired.ts";
@@ -83,6 +84,9 @@ export interface UpdateIdentityInput {
    * empty string to clear an existing one (the field is then removed from
    * the persisted identity, falling back to the auto palette colour). */
   colour?: string;
+  /** Codex only (callers check the tool): "device" clears the field (the
+   * default), "browser" stores it. */
+  codexLoginMethod?: string;
 }
 
 export function updateIdentity(file: IdentitiesFile, name: string, input: UpdateIdentityInput): Identity {
@@ -106,6 +110,13 @@ export function updateIdentity(file: IdentitiesFile, name: string, input: Update
       }
       identity.colour = normalised;
     }
+  }
+  if (input.codexLoginMethod !== undefined) {
+    if (!isCodexLoginMethod(input.codexLoginMethod)) {
+      throw new CliUsageError(`Invalid codex login method "${input.codexLoginMethod}" — use "device" or "browser"`);
+    }
+    if (input.codexLoginMethod === "device") delete identity.codexLoginMethod;
+    else identity.codexLoginMethod = input.codexLoginMethod;
   }
   return identity;
 }

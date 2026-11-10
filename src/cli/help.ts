@@ -78,7 +78,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage ...",
+    usage: "ais gateway serve|local|app|usage|claude-proxy|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -89,6 +89,14 @@ export const HELP: Record<string, HelpNode> = {
         "Manage gateway apps; add and rotate write Secret ais-gateway-<app> and ~/.secrets (admin: AIS_GATEWAY_ADMIN_URL, AIS_GATEWAY_ADMIN_TOKEN, AIS_GATEWAY_PROXY_URL in ~/.secrets)",
       ),
       usage: sub("ais gateway usage [--app=] [--provider=] [--days=7] [--json]", "Tokens used per app"),
+      "claude-proxy": sub(
+        "ais gateway claude-proxy <claude config dir>... [--proxy=<url>] [--ca=<path>] [--check]",
+        "Point Claude folders at the gateway usage proxy (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, always with a loopback NO_PROXY); --check only reports folders whose proxy would break a loopback base URL (proxy: AIS_GATEWAY_CONNECT_PROXY_URL in ~/.secrets or env; CA default ~/.ais/gateway-connect-ca.pem)",
+      ),
+      "codex-home": sub(
+        "ais gateway codex-home <codex home dir>... [--check]",
+        "Set up Codex folders on the gateway so Codex and T3 Code show real usage limits: placeholder ChatGPT login (auth.json 0600, token from AIS_GATEWAY_APP_<APP>_TOKEN in ~/.secrets), chatgpt_base_url, requires_openai_auth; registers the folder in ~/.ais/gateway-codex-homes.json so app add/rotate refresh its token; --check only reports",
+      ),
     },
   },
   browser: {

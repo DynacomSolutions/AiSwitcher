@@ -36,6 +36,19 @@ export interface Identity {
    * normal identity and nothing credential-related ever happens to it. See
    * identities/claude-swap.ts. */
   swapPool?: SwapPool;
+  /** Codex only. How the console signs this identity in: "device" (default,
+   * `codex login --device-auth`) or "browser" (`codex login` with a pasted
+   * localhost callback) for accounts that have device codes disabled. Absent
+   * means "device". */
+  codexLoginMethod?: CodexLoginMethod;
+}
+
+export type CodexLoginMethod = "device" | "browser";
+
+export const CODEX_LOGIN_METHODS: readonly CodexLoginMethod[] = ["device", "browser"];
+
+export function isCodexLoginMethod(value: unknown): value is CodexLoginMethod {
+  return value === "device" || value === "browser";
 }
 
 /** Credential-swap pool configuration, stored on the pool identity itself. */

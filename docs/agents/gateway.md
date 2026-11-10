@@ -171,7 +171,13 @@ speech call is not a model call); the daily token cap does.
   `GET /api/oauth/usage` (the windows of the member the pool would pick) and
   `GET /api/oauth/profile` (the app name only); codex
   `GET /rate-limit-reset-credits` (also under `/api/codex` and `/wham`), which is
-  the total over the pool's members, and `POST .../consume`, which is refused.
+  the total over the pool's members, and `POST .../consume`, which is refused;
+  codex `GET /wham/usage` (also `/api/codex/usage`): the pinned identity's or least-used member's windows in ChatGPT's
+  `wham/usage` shape (`plan_type` always `pro`; 502 when no member has figures).
+- **Codex `/backend-api` prefix**: codex 0.166 reads `account/rateLimits/read` from `<chatgpt_base_url>/wham/usage`
+  when its config sets `chatgpt_base_url` and `auth.json` holds a placeholder ChatGPT login whose `access_token` is the
+  app token (how T3 Code shows limits for gateway Codex instances). Every served codex path is also accepted under
+  `/backend-api`; any other `/backend-api/*` path (plugins, `ps/plugins/*`, any method) is 404 with no upstream call.
 - **Side routes** (lists, search, fetch, speech) pass the provider's 401/402/403/429 straight to the app: no login
   refresh, no pool hold, no failover. Side and served calls are counted per app and day apart from tokens (default 5000 a
   day, `AIS_GATEWAY_SIDE_DAILY_LIMIT`; over it the answer is 429); no token rows are written for them. Codex reset credits
@@ -181,6 +187,53 @@ speech call is not a model call); the daily token cap does.
   `claude_cli_profile`, `organization(s)`, `account`, `bootstrap`, `me`. The gateway serves `oauth/usage` and
   `oauth/profile` itself. Every other `/api/*` path passes through. Repeated slashes in any app path are collapsed before
   matching and before the path is sent upstream.
+
+### Claude limits for gateway-routed Claude Code (CONNECT proxy)
+
+Claude Code reads its limits from a fixed host (`https://api.anthropic.com/api/oauth/usage`), never from
+`ANTHROPIC_BASE_URL`, and only when its login has the `user:profile` scope. `ais gateway serve` runs a CONNECT proxy
+for those clients when the deployment mounts a certificate for `api.anthropic.com` (`AIS_GATEWAY_CONNECT_TLS_DIR`,
+a cert-manager secret with `tls.crt`, `tls.key`, `ca.crt`; port `AIS_GATEWAY_CONNECT_PORT`, default 47132). The
+certificate and its CA are cluster-managed (.cluster); the gateway makes none. `AIS_GATEWAY_CONNECT_CA_PUBLISH` copies
+`ca.crt` to a host path for clients. Without the TLS dir the proxy is off; a proxy that cannot start never stops the gateway.
+
+A client sets `HTTPS_PROXY` to the proxy and `NODE_EXTRA_CA_CERTS` to the published CA, and adds `user:profile` to the
+`scopes` of its gateway-token `.credentials.json` (the token is still the gateway app token, so the scope grants nothing
+upstream). AIS's own gateway entry keeps only `user:inference`: without the proxy, that scope would send the gateway
+token to the real host.
+
+- Every CONNECT is a plain TCP tunnel except `api.anthropic.com:443`, whose TLS the proxy terminates.
+- On that host, `GET /api/oauth/usage` and `GET /api/oauth/profile` with an `aisg_` bearer are answered by the gateway's
+  served route for the active claude app the token belongs to. An `aisg_` token the gateway does not accept gets 401
+  there and is never sent on. Anything else on that host is forwarded unchanged.
+- No pool member login is read or sent by the proxy. A renewed certificate is picked up within 5 minutes.
+
+### Claude usage proxy on a folder
+
+`ais gateway claude-proxy <dir>...` sets `HTTPS_PROXY` (the CONNECT proxy) and `NODE_EXTRA_CA_CERTS` in a Claude folder's
+settings.json, and always adds `NO_PROXY=127.0.0.1,localhost,::1`. Never set `HTTPS_PROXY` on a Claude folder by
+hand: Claude Code sends every request through it, including a plain-HTTP loopback `ANTHROPIC_BASE_URL` (the
+`ais gateway local` proxy), and the CONNECT proxy answers those with 405, so every model call fails (incident
+10 Nov 2026, row 4.162). `--check` and `ais doctor` report a folder in that state. Run a real `claude -p` turn on each
+folder after a change: running sessions read settings.json at once.
+
+### Codex usage limits on a folder
+
+`ais gateway codex-home <dir>...` sets up Codex folders (CODEX_HOME, for example T3 Code's) that run through the gateway
+so Codex and `codex app-server` show real limits. It reads the app from the folder's
+`[model_providers.ais-gateway] base_url = "<base>/<app>"`, takes the token from `AIS_GATEWAY_APP_<APP>_TOKEN` in
+`~/.secrets`, then:
+
+- writes `auth.json` (0600): a placeholder ChatGPT login whose `access_token` is the app token (the `id_token` needs a
+  non-empty signature segment: codex 0.145 rejects an empty one);
+- sets top-level `chatgpt_base_url = "<base>/<app>/backend-api"` in config.toml and `requires_openai_auth = true` on the
+  provider, and removes `[model_providers.ais-gateway.auth]` (codex refuses provider auth combined with
+  `requires_openai_auth`); every other key survives; reruns change nothing;
+- registers the folder in `~/.ais/gateway-codex-homes.json`.
+
+`app add` and `app rotate` then rewrite `auth.json` in every registered folder of that app and report the count (never the
+token); a failure there is reported and never hides the minted-token message. `--check` writes nothing and reports each
+folder (`ok` or the problem).
 
 ### Public host
 

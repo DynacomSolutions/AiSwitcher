@@ -165,6 +165,40 @@ describe("serve lifecycle", () => {
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
   });
 
+  test("the CONNECT proxy answers claude usage for the app a token belongs to, and refuses an unknown gateway token", async () => {
+    const token = await seed();
+    const tlsDir = await mkdtemp(join(tmpdir(), "gw-connect-tls-"));
+    const sh = (cmd: string): void => void Bun.spawnSync(["sh", "-c", cmd], { cwd: tlsDir });
+    sh("openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.crt -days 2 -subj /CN=ca -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign 2>/dev/null");
+    sh("openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out leaf.csr -subj /CN=api.anthropic.com 2>/dev/null");
+    sh("printf 'subjectAltName=DNS:api.anthropic.com\\n' > ext && openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -extfile ext -out tls.crt 2>/dev/null");
+    const g = await startGateway({ port: 0, adminPort: 0, databaseUrl: "postgres://unused", adminToken: ADMIN, connect: { port: 0, tlsDir } }, hooks({ noHeartbeat: true }));
+    started.push(g);
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    expect(g.connectPort).toBeGreaterThan(0);
+    const ask = async (bearer: string): Promise<{ status: number; body: string }> => {
+      const net = await import("node:net");
+      const tls = await import("node:tls");
+      const sock = net.connect(g.connectPort!, "127.0.0.1");
+      await new Promise<void>((r) => sock.once("connect", () => r()));
+      sock.write("CONNECT api.anthropic.com:443 HTTP/1.1\r\nhost: api.anthropic.com:443\r\n\r\n");
+      await new Promise<void>((r) => sock.once("data", () => r()));
+      const secure = tls.connect({ socket: sock, servername: "api.anthropic.com", ca: await Bun.file(join(tlsDir, "ca.crt")).text() });
+      await new Promise<void>((r, j) => (secure.once("secureConnect", () => r()), secure.once("error", j)));
+      secure.write(`GET /api/oauth/usage HTTP/1.1\r\nhost: api.anthropic.com\r\nauthorization: Bearer ${bearer}\r\nconnection: close\r\n\r\n`);
+      const raw = await new Promise<string>((r) => {
+        let out = "";
+        secure.on("data", (d: Buffer) => (out += d.toString()));
+        secure.on("close", () => r(out));
+      });
+      return { status: Number(/^HTTP\/1\.1 (\d+)/.exec(raw)?.[1]), body: raw.slice(raw.indexOf("\r\n\r\n") + 4) };
+    };
+    const ok = await ask(token);
+    expect(ok.status).toBe(200);
+    expect(ok.body).toContain("seven_day");
+    expect((await ask(WRONG_TOKEN.padEnd(57, "x"))).status).toBe(401);
+  });
+
   test("ready after warm-up", async () => {
     await seed();
     const g = await boot();

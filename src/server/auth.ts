@@ -56,6 +56,9 @@ function stateFromExpiry(
 ): { state: AuthEntryDto["state"]; detail: string; selfRefreshing?: boolean } {
   const hoursLeft = (expiresAtMs - Date.now()) / 3_600_000;
   if (hoursLeft <= 0) {
+    // A lapsed access token with a refresh token is renewed on next use (kimi's last only 15 min): not a reason to log in again.
+    // A refresh token that no longer works shows up as a refresh error, not here.
+    if (hasRefreshToken) return { state: "ok", detail: `access token lapsed ${formatAgo(-hoursLeft)} ago; renewed with the refresh token on next use`, selfRefreshing: true };
     return { state: "expired", detail: `token expired ${Math.abs(hoursLeft).toFixed(1)}h ago` };
   }
   if (hoursLeft < 24) {
@@ -76,6 +79,10 @@ function hasRefreshToken(value: unknown, depth = 0): boolean {
   return false;
 }
 
+function formatAgo(hours: number): string {
+  return hours < 1 ? `${Math.max(1, Math.round(hours * 60))}m` : `${hours.toFixed(1)}h`;
+}
+
 function toIso(ms: number): string {
   return new Date(ms).toISOString();
 }
@@ -85,6 +92,11 @@ function findExpiry(value: unknown, depth = 0): number | undefined {
   if (typeof value === "object" && value !== null) {
     for (const [key, child] of Object.entries(value)) {
       if (/expire|expiresat|expir/i.test(key)) {
+        // A date string (grok writes "2026-11-10T13:12:18.48Z") is parsed as a date: parseFloat would read only the year.
+        if (typeof child === "string" && !/^\s*\d+(?:\.\d+)?\s*$/.test(child)) {
+          const ms = Date.parse(child);
+          if (Number.isFinite(ms)) return ms;
+        }
         const n = typeof child === "number" ? child : typeof child === "string" ? Number.parseFloat(child) : NaN;
         if (Number.isFinite(n)) {
           // Epoch seconds vs milliseconds: a value under 10^11 must be seconds.
