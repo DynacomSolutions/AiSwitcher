@@ -246,3 +246,47 @@ describe("sync merge of gateway-routed logins", () => {
     expect(backups.length).toBe(1);
   });
 });
+
+describe("sync merge of gateway-routed swap pool folders", () => {
+  const POOL_CODEX = ".codex/identities/pool/auth.json";
+  const POOL_CLAUDE = ".claude/identities/pool/.credentials.json";
+  async function withPools(f: Awaited<ReturnType<typeof fixture>>) {
+    for (const base of [".claude", ".codex"]) {
+      const id = (name: string) => ({ name, label: name, configDir: join(f.home, base, "identities", name) });
+      await writeFile(join(f.home, base, "identities.json"), JSON.stringify({ version: 1, identities: [id("alpha"), { ...id("pool"), swapPool: { accounts: ["alpha"], active: "alpha" } }] }));
+    }
+  }
+
+  test("planCredentialMerge keeps a pool's gateway entry against an arriving login; other pool files merge as before", () => {
+    expect(planCredentialMerge("codex", codexEntry, codexLogin("remote"), { memberHere: false, pool: true })).toEqual({ action: "keep-local", reason: "kept-pool-entry" });
+    expect(planCredentialMerge("codex", codexLogin("local"), codexLogin("remote"), { memberHere: false, pool: true }).action).toBe("merge");
+    expect(planCredentialMerge("codex", codexLogin("local"), codexEntry, { memberHere: false, pool: true }).action).toBe("merge");
+  });
+
+  test("a newer member login from another host never lands over a routed pool's entry (codex and claude), logged", async () => {
+    const f = await fixture();
+    await withPools(f);
+    const warnings = captureWarnings();
+    try {
+      await f.put(f.home, POOL_CODEX, codexEntry, T);
+      await f.put(f.incoming, POOL_CODEX, codexLogin("remote"), T + 100);
+      await f.put(f.home, POOL_CLAUDE, gatewayEntryText(KEY), T);
+      await f.put(f.incoming, POOL_CLAUDE, claudeLogin("remote"), T + 100);
+      await f.merge();
+    } finally {
+      warnings.restore();
+    }
+    expect(await f.read(POOL_CODEX)).toBe(codexEntry);
+    expect(await f.read(POOL_CLAUDE)).toBe(gatewayEntryText(KEY));
+    expect(warnings.lines.some((l) => l.includes("codex swap pool pool: kept its gateway entry"))).toBe(true);
+  });
+
+  test("an unrouted pool's login still merges by time", async () => {
+    const f = await fixture();
+    await withPools(f);
+    await f.put(f.home, POOL_CODEX, codexLogin("local"), T);
+    await f.put(f.incoming, POOL_CODEX, codexLogin("remote"), T + 100);
+    await f.merge();
+    expect(await f.read(POOL_CODEX)).toBe(codexLogin("remote"));
+  });
+});

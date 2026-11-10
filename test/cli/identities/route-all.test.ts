@@ -336,20 +336,71 @@ describe("route-all-via-gateway: routing", () => {
     expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
   });
 
-  test("a swap pool folder is never written: reported when not routed, already-routed when it is", async () => {
+  test("a swap pool folder is routed before its members: the gateway entry, never a store copy, and its active member is routed too", async () => {
     await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
     await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));
+    await writeFile(join(dirOf(".claude", "pool"), ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "u-alpha" } }));
     await heartbeat();
-    let r = await routeAllViaGateway(opts);
-    expect(claudeLine(r, "pool")?.status).toBe("refused");
-    expect(claudeLine(r, "pool")?.detail).toContain("swap pool");
+    const dry = await routeAllViaGateway({ ...opts, dryRun: true });
+    expect(claudeLine(dry, "pool")?.status).toBe("would-route");
+    // the dry run knows the pool goes first: alpha is not reported as held by it
+    expect(claudeLine(dry, "alpha")?.status).toBe("would-route");
     expect(await readFile(join(dirOf(".claude", "pool"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
-    expect(hasMemberCopy("claude", "pool", opts.memberRoot)).toBe(false);
 
-    await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: CLAUDE_KEY, refreshToken: null } }));
-    await writeFile(join(dirOf(".claude", "pool"), "settings.json"), JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:47140/claude" } }));
+    let r = await routeAllViaGateway(opts);
+    expect(r.lines[0]?.identity).toBe("pool");
+    expect(claudeLine(r, "pool")?.status).toBe("routed");
+    expect(claudeLine(r, "pool")?.detail).toContain("the gateway now picks this pool's member");
+    const entry = JSON.parse(await readFile(join(dirOf(".claude", "pool"), ".credentials.json"), "utf8"));
+    expect(entry.claudeAiOauth.accessToken).toBe(CLAUDE_KEY);
+    expect(entry.claudeAiOauth.refreshToken).toBeNull();
+    expect(JSON.parse(await readFile(join(dirOf(".claude", "pool"), "settings.json"), "utf8")).env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:47140/claude");
+    // the pool's copy was the same login as alpha's: nothing written back, the old pool file kept in a backup
+    expect((await files(dirOf(".claude", "pool"))).some((f) => f.startsWith(".credentials.json.pre-gateway."))).toBe(true);
+    expect(hasMemberCopy("claude", "pool", opts.memberRoot)).toBe(false);
+    // alpha (the active member) is routed in the same run, with no pool warning
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    expect(claudeLine(r, "alpha")?.detail ?? "").not.toContain("swap pool");
+    expect(await readFile(join(storeOf("claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+
     r = await routeAllViaGateway(opts);
     expect(claudeLine(r, "pool")?.status).toBe("already-routed");
+    expect(claudeLine(r, "alpha")?.status).toBe("already-routed");
+    expect(r.lines.some((l) => l.status === "refused" || l.attention)).toBe(false);
+  });
+
+  test("a pool login fresher than its owner's copy goes back to the owner (folder, or member store) before the entry replaces it", async () => {
+    await registry("codex", ".codex", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".codex", "beta"), "auth.json"), codexLogin("beta"));
+    // a session in the pool refreshed alpha's login: same account, newer refresh token
+    const fresher = codexLogin("alpha2", { account: "acct-alpha", lastRefresh: "2029-12-31T00:00:00Z" });
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha", { lastRefresh: "2029-12-01T00:00:00Z" }));
+    await writeFile(join(dirOf(".codex", "pool"), "auth.json"), fresher);
+    await heartbeat([...ALL, "codex/beta"]);
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex" && l.identity === "pool")?.detail).toContain("went back to its folder");
+    // alpha then moved the fresher login into the store
+    expect(await readFile(join(storeOf("codex", "alpha"), "auth.json"), "utf8")).toBe(fresher);
+    expect(JSON.parse(await readFile(join(dirOf(".codex", "pool"), "auth.json"), "utf8"))).toMatchObject({ auth_mode: "apikey", OPENAI_API_KEY: CODEX_KEY });
+    expect(codexConfigRouted(await readFile(join(dirOf(".codex", "pool"), "config.toml"), "utf8"), "http://127.0.0.1:47140/codex", codexKeyHelperPath(home))).toBe(true);
+
+    // the members are routed now; a pool that holds a fresher login again sends it to the member store copy
+    const newest = codexLogin("alpha3", { account: "acct-alpha", lastRefresh: "2030-01-01T00:00:00Z" });
+    await writeFile(join(dirOf(".codex", "pool"), "auth.json"), newest);
+    const again = await routeAllViaGateway(opts);
+    expect(again.lines.find((l) => l.tool === "codex" && l.identity === "pool")?.detail).toContain("went back to the member store");
+    expect(await readFile(join(storeOf("codex", "alpha"), "auth.json"), "utf8")).toBe(newest);
+    expect(classifyLogin("codex", await readFile(join(dirOf(".codex", "pool"), "auth.json"), "utf8"))).toBe("gateway");
+  });
+
+  test("a pool whose members the gateway does not hold is refused and left as it was", async () => {
+    await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));
+    await heartbeat(["codex/alpha"]);
+    const r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "pool")?.status).toBe("refused");
+    expect(claudeLine(r, "pool")?.detail).toContain("the gateway holds none of its members");
+    expect(await readFile(join(dirOf(".claude", "pool"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
   });
 
   test("retired identities are skipped", async () => {
@@ -416,12 +467,13 @@ describe("route-all-via-gateway: running sessions", () => {
     expect(r.lines.find((l) => l.tool === "codex" && l.identity === "main")?.detail).toContain("pid 4201");
   });
 
-  test("a member whose login a swap pool holds is refused; routed members of a pool carry the warning that its swaps break", async () => {
+  test("a pool with a running session is refused; then its active member is refused and routed members carry the warning", async () => {
     await registry("codex", ".codex", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
     await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
     await writeFile(join(dirOf(".codex", "beta"), "auth.json"), codexLogin("beta"));
     await writeFile(join(dirOf(".codex", "pool"), "auth.json"), codexLogin("alpha"));
     await heartbeat([...ALL, "codex/beta"]);
+    await fakeProc(4301, ["codex"], { CODEX_HOME: dirOf(".codex", "pool") });
     const run = async () => {
       const out: string[] = [];
       const saved = process.exitCode;
@@ -435,10 +487,10 @@ describe("route-all-via-gateway: running sessions", () => {
     expect(out.find((l) => l.startsWith("  codex/alpha: refused"))).toContain("ais swap codex to beta --pool=pool");
     expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
     expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(false);
-    expect(out.find((l) => l.startsWith("  codex/pool: refused"))).toContain("no usable Codex login");
-    // beta is not what the pool holds: routed, with the warning
-    expect(out.find((l) => l.startsWith("  codex/beta: routed"))).toContain("member of swap pool pool");
-    expect(out.find((l) => l.startsWith("  codex/beta: routed"))).toContain("no usable Codex login");
+    expect(out.find((l) => l.startsWith("  codex/pool: refused"))).toContain("1 running Codex session uses this folder (pid 4301)");
+    expect(await readFile(join(dirOf(".codex", "pool"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+    // beta is not what the pool holds: routed, with the warning that the unrouted pool cannot swap to it
+    expect(out.find((l) => l.startsWith("  codex/beta: routed"))).toContain("member of swap pool pool, which is not routed");
 
     // the registry says another member is active, but the pool file still holds alpha's refresh token
     await registry("codex", ".codex", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "beta" } } });
@@ -450,7 +502,13 @@ describe("route-all-via-gateway: running sessions", () => {
     // swapped away: alpha goes through
     await writeFile(join(dirOf(".codex", "pool"), "auth.json"), codexLogin("other", { account: "acct-other" }));
     out = await run();
-    expect(out.find((l) => l.startsWith("  codex/alpha: routed"))).toContain("member of swap pool pool");
+    expect(out.find((l) => l.startsWith("  codex/alpha: routed"))).toContain("member of swap pool pool, which is not routed");
+
+    // the session ended: the pool is routed and its members lose the warning
+    await rm(join(opts.procRoot!, "4301"), { recursive: true, force: true });
+    out = await run();
+    expect(out.find((l) => l.startsWith("  codex/pool: routed"))).toContain("matches none of its members");
+    expect(out.find((l) => l.startsWith("  codex/alpha: already-routed"))).not.toContain("swap pool");
   });
 
   test("a scan that cannot run (no /proc) refuses and writes nothing", async () => {
@@ -580,7 +638,13 @@ describe("route-all-via-gateway: already routed identities are checked again", (
 
     await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
     await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));
+    // a session in the pool keeps it from being routed, so it still holds alpha's login
+    const proc = join(opts.procRoot!, "4401");
+    await mkdir(proc, { recursive: true });
+    await writeFile(join(proc, "cmdline"), "claude\0");
+    await writeFile(join(proc, "environ"), `CLAUDE_CONFIG_DIR=${dirOf(".claude", "pool")}`);
     r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "pool")?.status).toBe("refused");
     expect(claudeLine(r, "alpha")?.status).toBe("already-routed");
     expect(claudeLine(r, "alpha")?.attention).toBe(true);
     expect(claudeLine(r, "alpha")?.detail).toContain("swap pool pool holds a copy of this login");

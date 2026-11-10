@@ -413,9 +413,10 @@ identity, under the account's refresh locks (the ones the gateway takes before i
 
    It also refuses while another copy of the login would keep refreshing it:
    - a swap pool folder of the same tool that is not gateway-routed and whose active member is this identity, or whose
-     login has the same refresh token or account. Every session started with the pool uses that copy, and this command
-     never writes pool folders: swap the pool to another member first (`ais swap <tool> to <member> --pool=<pool>`), or
-     route the pool itself, then run again;
+     login has the same refresh token or account. Every session started with the pool uses that copy. Pools are routed
+     first in the same run (see "Swap pools" below), so this only refuses when the pool itself was refused (a running
+     session in it, a symlink, the gateway holding none of its members): fix that, or swap the pool to another member
+     (`ais swap <tool> to <member> --pool=<pool>`), then run again. A routed pool folder holds no login and never counts;
    - pi keeps its own copy of each identity's claude (`anthropic`) and codex (`openai-codex`) login in the same-named pi
      identity's `auth.json` (`oauth-reconcile.ts`), and once the store copy exists the reconcile no longer converges them.
      pi has no local gateway route, so that entry is removed (under pi's `auth.json.lock`, after a unique
@@ -444,18 +445,57 @@ identity, under the account's refresh locks (the ones the gateway takes before i
 Keys are `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN` and `AIS_GATEWAY_APP_AGENTS_CODEX_TOKEN` (apps `agents-claude`,
 `agents-codex`). Reported and left alone, exit code 1: a tool with no local route (`src/gateway/local-routes.ts`: today
 grok, kimi, pi) or no key, an account the gateway does not hold, a folder with running sessions, a folder whose login is
-a different account than its store copy, a folder without a refreshable login, a swap pool folder that is not routed yet
-(it holds a copy of a member's login; the command never writes pool folders) and a symlinked file.
+a different account than its store copy, a folder without a refreshable login, a swap pool folder the gateway holds none
+of the members of, and a symlinked file.
 
-Swap pools break for routed members: a pool swaps by copying the member's login out of the member's identity folder, and a
-routed member's folder holds only the gateway entry, so a swap to it no longer gets a working login (codex fails with "no
-usable Codex login") until the pool itself is routed with its own setup (a gateway-routed claude pool never copies member
-logins) or the member is taken out of the pool. The
-report adds this warning to every routed member of a swap pool and to every refused pool folder.
 Re-running changes nothing in an identity already routed, but checks its other holders again: a swap pool holding the
 login or a pi copy that may be fresher is reported (status `already-routed`, exit code 1), and pi's same-named copy is
 removed as on a first run. An entry written before the routing record existed (see below) gets the record on a re-run.
 To undo one identity, see "Undoing the routing" below.
+
+### Swap pools with routed members
+
+A gateway-routed pool folder holds the gateway entry, never a member's login (claude: `.credentials.json` entry and
+`ANTHROPIC_BASE_URL` at the gateway; codex: the API-key `auth.json` with the app key, or the `ais gateway codex-home`
+placeholder login, plus `model_provider = "ais-gateway"`). Detection: `src/identities/pool/gateway-pool.ts`
+(`isGatewayRoutedPool`; codex: the entry in `auth.json` or the gateway provider in `config.toml`).
+
+How the gateway picks a member: per request, `src/gateway/select.ts` `pickIdentity` takes the member with the lowest
+utilisation below the app's reserve (unknown usage after known headroom); the local proxy's direct fallback path
+(`defaultLocalMembers` in `src/gateway/local.ts`) tries the pool's `swapPool.active` first. There is no pinned member for
+pool apps (a pin is rejected, task 4.119). So for a routed pool:
+
+- `ais swap <tool> to|next` (manual, auto, launch, hook) records the active member (registry and ledger) and copies no
+  login: the note says the gateway picks the member. The pool's gateway entry stays; a real login found there (a `/login`
+  or `codex login` inside the pool, an older build's copy) is backed up (0600 `.pre-swap` / `.pre-heal`) and replaced, and
+  is never written back to a member (the gateway holds the members' logins). No app token in the secrets file is an error,
+  never a fall back to a member login. Codex sessions of a routed pool need no relaunch after a swap.
+- Pool heal (scheduler tick and launch check) keeps the entry in place and never restores the active member's login over
+  it. Before this, the codex heal treated the entry as a damaged pool file and restored the active member's vault into it,
+  and the launch check, not counting the entry as credentials, bootstrapped a member copy in: that is how a member login
+  reappeared in a routed codex pool about a second after the entry was written.
+- A plain (unrouted) pool refuses to swap to a routed member (one with a member store copy, or whose folder holds the
+  entry) with the way out (route the pool), instead of copying the entry or the store login.
+- Codex pool creation accepts members whose login the gateway holds.
+- The pool keeps the refresh write-through away: a member's refresh never writes into a routed pool folder (claude and
+  codex, `poolStoreDirsFor`).
+- AIS sync and the live inbox never put an arriving login over a routed pool's entry (`kept-pool-entry`, logged); other
+  pool files merge as before (`src/sync/gateway-guard.ts`).
+- Usage: `ais swap status`, `ais limits`, the console and the gateway's own pool choice read a routed member's usage from
+  its member store copy: claude with the store's access token (never refreshed here; an expired copy is reported), codex
+  with one GET of `chatgpt.com/backend-api/wham/usage` with the store's access token (no `codex app-server` against the
+  store, which could refresh and spend the gateway's refresh token). `ais swap status` marks the pool as routed
+  (`gatewayRouted: true` in `--json`); `*` is the recorded active member.
+
+`ais identities route-all-via-gateway` routes pool folders before their members, with the same checks as a member: no
+running session in the pool folder, no symlinked file, and the gateway must hold at least one of the pool's members. A
+login found in the pool folder is a copy of a member's login (sessions in the pool refresh it): under the pool lock and the
+refresh locks (pool folder first, then the owner's folder and store copy, the order swap and refresh use), it goes back to
+the member it belongs to (same refresh token, else same account; the active member first) when it is provably fresher
+than that member's copy (the member store copy when the gateway holds the member, else its folder), after a unique backup.
+Then the pool's files are backed up (`.pre-gateway`) and get the entry, as a member's do. A pool login that matches no
+member is only kept in that backup. Members routed in the same run are no longer held by the pool; a member whose pool
+stayed unrouted is reported with a warning that the pool cannot swap to it.
 
 ### Hosts that AIS sync connects
 
