@@ -78,7 +78,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|claude-proxy|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|claude-proxy|t3-proxy|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -92,6 +92,10 @@ export const HELP: Record<string, HelpNode> = {
       "claude-proxy": sub(
         "ais gateway claude-proxy <claude config dir>... [--proxy=<url>] [--ca=<path>] [--check]",
         "Point Claude folders at the gateway usage proxy (HTTPS_PROXY, NODE_EXTRA_CA_CERTS, always with a loopback NO_PROXY); --check only reports folders whose proxy would break a loopback base URL (proxy: AIS_GATEWAY_CONNECT_PROXY_URL in ~/.secrets or env; CA default ~/.ais/gateway-connect-ca.pem)",
+      ),
+      "t3-proxy": sub(
+        "ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]",
+        "Route api.anthropic.com for the T3 Code server only (not its children) through the gateway CONNECT proxy so T3's account usage and reset credits come from the gateway: installs ~/.ais/t3/anthropic-proxy.cjs and sets NODE_OPTIONS (--require), AIS_T3_ANTHROPIC_PROXY and NODE_EXTRA_CA_CERTS in ~/.t3/service.env (T3CODE_HOME honoured; never HTTPS_PROXY); --check only reports, --remove undoes it; restart T3 to apply (never done here)",
       ),
       "codex-home": sub(
         "ais gateway codex-home <codex home dir>... [--check]",

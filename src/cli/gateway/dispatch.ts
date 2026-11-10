@@ -28,11 +28,15 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
     const { runClaudeProxyCommand } = await import("./claude-proxy.ts");
     return runClaudeProxyCommand(rest, flags, merged);
   }
+  if (sub === "t3-proxy") {
+    const { runT3ProxyCommand } = await import("./t3-proxy.ts");
+    return runT3ProxyCommand(rest, flags, merged);
+  }
   if (sub === "codex-home") {
     const { runCodexHomeCommand } = await import("./codex-home.ts");
     return runCodexHomeCommand(rest, flags, merged);
   }
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|claude-proxy|codex-home ...  (ais gateway --help)");
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|claude-proxy|t3-proxy|codex-home ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");

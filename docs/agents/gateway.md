@@ -246,6 +246,20 @@ hand: Claude Code sends every request through it, including a plain-HTTP loopbac
 10 Nov 2026, row 4.162). `--check` and `ais doctor` report a folder in that state. Run a real `claude -p` turn on each
 folder after a change: running sessions read settings.json at once.
 
+### T3 Code account API (resets)
+
+`ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]` makes T3 Code's own Anthropic account reads
+(usage, reset credits and redeem) go through the gateway. It installs a preload at `~/.ais/t3/anthropic-proxy.cjs` and
+upserts `NODE_OPTIONS=--require <preload>` (other flags kept), `AIS_T3_ANTHROPIC_PROXY` and `NODE_EXTRA_CA_CERTS` in
+`~/.t3/service.env` (`T3CODE_HOME` honoured; the old file is saved to `~/.t3/backups/service.env.pre-anthropic-proxy.<epoch>`).
+The preload acts only when the process is the T3 server binary and only for `api.anthropic.com`; every other host and
+every other process stays direct. Never put `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` in `service.env`: T3 hands its
+env to every child and the CONNECT proxy refuses all hosts but `api.anthropic.com`, so git, gh, npm and codex would
+break in every thread. The command refuses to write them and fails when the file already has one; `--check` and
+`ais doctor` report that and an out-of-date preload. The proxy URL comes from `--proxy`, `AIS_GATEWAY_CONNECT_PROXY_URL`
+in `~/.secrets`, the environment, or the `HTTPS_PROXY` of a `~/.t3/gateway/t3-claude-*` folder. T3 must be restarted to
+apply a change; the command never restarts it.
+
 ### Codex usage limits on a folder
 
 `ais gateway codex-home <dir>...` sets up Codex folders (CODEX_HOME, for example T3 Code's) that run through the gateway
