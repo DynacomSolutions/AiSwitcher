@@ -392,18 +392,117 @@ describe("route-all-via-gateway: running sessions", () => {
     expect(r.lines.find((l) => l.tool === "codex" && l.identity === "main")?.detail).toContain("pid 4201");
   });
 
-  test("routed members of a swap pool carry the warning that the pool's swaps break", async () => {
-    await registry("codex", ".codex", ["alpha", "pool"], { pool: { swapPool: { accounts: ["alpha"], active: "alpha" } } });
+  test("a member whose login a swap pool holds is refused; routed members of a pool carry the warning that its swaps break", async () => {
+    await registry("codex", ".codex", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
     await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
+    await writeFile(join(dirOf(".codex", "beta"), "auth.json"), codexLogin("beta"));
     await writeFile(join(dirOf(".codex", "pool"), "auth.json"), codexLogin("alpha"));
-    await heartbeat();
-    const out: string[] = [];
-    const saved = process.exitCode;
-    await runRouteAllViaGateway({}, { ...opts, out: (l) => out.push(l) });
-    process.exitCode = saved;
-    expect(out.find((l) => l.startsWith("  codex/alpha: routed"))).toContain('member of swap pool pool');
-    expect(out.find((l) => l.startsWith("  codex/alpha: routed"))).toContain("no usable Codex login");
+    await heartbeat([...ALL, "codex/beta"]);
+    const run = async () => {
+      const out: string[] = [];
+      const saved = process.exitCode;
+      await runRouteAllViaGateway({}, { ...opts, out: (l) => out.push(l) });
+      process.exitCode = saved;
+      return out;
+    };
+    // the pool's active member: every session of the pool holds that login
+    let out = await run();
+    expect(out.find((l) => l.startsWith("  codex/alpha: refused"))).toContain("swap pool pool holds a copy of this login (this identity is its active member)");
+    expect(out.find((l) => l.startsWith("  codex/alpha: refused"))).toContain("ais swap codex to beta --pool=pool");
+    expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+    expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(false);
     expect(out.find((l) => l.startsWith("  codex/pool: refused"))).toContain("no usable Codex login");
+    // beta is not what the pool holds: routed, with the warning
+    expect(out.find((l) => l.startsWith("  codex/beta: routed"))).toContain("member of swap pool pool");
+    expect(out.find((l) => l.startsWith("  codex/beta: routed"))).toContain("no usable Codex login");
+
+    // the registry says another member is active, but the pool file still holds alpha's refresh token
+    await registry("codex", ".codex", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "beta" } } });
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha", { account: "acct-x" }));
+    await writeFile(join(dirOf(".codex", "pool"), "auth.json"), codexLogin("alpha"));
+    out = await run();
+    expect(out.find((l) => l.startsWith("  codex/alpha: refused"))).toContain("it holds the same refresh token");
+
+    // swapped away: alpha goes through
+    await writeFile(join(dirOf(".codex", "pool"), "auth.json"), codexLogin("other", { account: "acct-other" }));
+    out = await run();
+    expect(out.find((l) => l.startsWith("  codex/alpha: routed"))).toContain("member of swap pool pool");
+  });
+
+  test("a scan that cannot run (no /proc) refuses and writes nothing", async () => {
+    await heartbeat();
+    const r = await routeAllViaGateway({ ...opts, procRoot: join(home, "no-proc") });
+    expect(claudeLine(r, "alpha")?.status).toBe("refused");
+    expect(claudeLine(r, "alpha")?.detail).toContain("cannot check for running sessions");
+    expect(r.lines.every((l) => l.status === "refused")).toBe(true);
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+    expect(await readFile(join(dirOf(".claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+  });
+});
+
+describe("route-all-via-gateway: pi's copy of the login", () => {
+  const piAuth = (dirName: string) => join(dirOf(".pi", dirName), "auth.json");
+  const piEntry = (refresh: string, expires: number) => ({ type: "oauth", access: `pi-at-SYNTHETIC_FIXTURE-${refresh}`, refresh, expires });
+  const fakeProc = async (pid: number, argv: string[], env: Record<string, string>) => {
+    const dir = join(opts.procRoot!, String(pid));
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "cmdline"), `${argv.join("\0")}\0`);
+    await writeFile(join(dir, "environ"), Object.entries(env).map(([k, v]) => `${k}=${v}`).join("\0"));
+  };
+
+  test("the same-named pi identity's entry for the same login is removed after a backup; its other providers stay", async () => {
+    await writeFile(piAuth("alpha"), JSON.stringify({ anthropic: piEntry("rt-SYNTHETIC_FIXTURE-alpha", 1), "kimi-coding": { type: "oauth", access: "k", refresh: "kr" } }));
+    await heartbeat();
+    const dry = await routeAllViaGateway({ ...opts, dryRun: true });
+    expect(claudeLine(dry, "alpha")?.detail).toContain("pi identity alpha's anthropic entry would be removed");
+    expect(JSON.parse(await readFile(piAuth("alpha"), "utf8")).anthropic).toBeDefined();
+
+    const r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    expect(claudeLine(r, "alpha")?.detail).toContain("removed its anthropic entry (the same login");
+    const after = JSON.parse(await readFile(piAuth("alpha"), "utf8"));
+    expect(after.anthropic).toBeUndefined();
+    expect(after["kimi-coding"]).toEqual({ type: "oauth", access: "k", refresh: "kr" });
+    const backups = (await files(dirOf(".pi", "alpha"))).filter((f) => f.startsWith("auth.json.pre-gateway."));
+    expect(backups.length).toBe(1);
+    expect(JSON.parse(await readFile(join(dirOf(".pi", "alpha"), backups[0]!), "utf8")).anthropic.refresh).toBe("rt-SYNTHETIC_FIXTURE-alpha");
+  });
+
+  test("an older pi copy is removed; a pi copy that may be fresher is refused", async () => {
+    await writeFile(join(dirOf(".claude", "alpha"), ".credentials.json"), claudeLogin("alpha", NOW + 3_600_000));
+    await writeFile(piAuth("alpha"), JSON.stringify({ anthropic: piEntry("rt-pi-old", NOW - 86_400_000), "openai-codex": piEntry("rt-pi-codex", 1) }));
+    await heartbeat();
+    const r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.detail).toContain("an older copy");
+    expect(claudeLine(r, "alpha")?.status).toBe("routed");
+    // the codex fixture login carries no timestamp: pi's different copy cannot be proven older
+    const codex = r.lines.find((l) => l.tool === "codex");
+    expect(codex?.status).toBe("refused");
+    expect(codex?.detail).toContain("ais auth sync --tool=pi");
+    expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(false);
+    expect(JSON.parse(await readFile(piAuth("alpha"), "utf8"))["openai-codex"].refresh).toBe("rt-pi-codex");
+  });
+
+  test("a running pi session, a pi pool on this identity or another pi identity holding the token is refused", async () => {
+    await writeFile(piAuth("alpha"), JSON.stringify({ anthropic: piEntry("rt-SYNTHETIC_FIXTURE-alpha", 1) }));
+    await heartbeat();
+    await fakeProc(4301, ["node", "/usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"], { PI_CODING_AGENT_DIR: join(home, "somewhere-else") });
+    let r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("refused");
+    expect(claudeLine(r, "alpha")?.detail).toContain("1 running pi session (pid 4301)");
+    expect(JSON.parse(await readFile(piAuth("alpha"), "utf8")).anthropic).toBeDefined();
+    await rm(join(opts.procRoot!, "4301"), { recursive: true });
+
+    await registry("pi", ".pi", ["alpha", "pipool"], { pipool: { swapPool: { accounts: ["alpha"], active: "alpha" } } });
+    await writeFile(piAuth("pipool"), JSON.stringify({ anthropic: piEntry("rt-SYNTHETIC_FIXTURE-alpha", 1) }));
+    r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.detail).toContain("pi swap pool pipool holds a copy");
+
+    await registry("pi", ".pi", ["alpha", "other"]);
+    await writeFile(piAuth("other"), JSON.stringify({ anthropic: piEntry("rt-SYNTHETIC_FIXTURE-alpha", 1) }));
+    r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.detail).toContain("pi identity other holds this login's refresh token");
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
   });
 });
 

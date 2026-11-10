@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { liveSessionPids } from "../../src/identities/live-sessions.ts";
+import { liveSessionPids, scanLiveSessions } from "../../src/identities/live-sessions.ts";
 
 let root = "";
 beforeEach(async () => {
@@ -37,4 +37,29 @@ test("a process without the variable counts for the default folder in home only;
   expect(await liveSessionPids("claude", join(root, ".claude"), opts)).toEqual([21]);
   expect(await liveSessionPids("claude", join(root, "id"), opts)).toEqual([]);
   expect(await liveSessionPids("claude", join(root, ".claude"), { procRoot: join(root, "missing") })).toEqual([]);
+});
+
+test("node cli.js launches, symlinked folders, console-pod paths and pi sessions", async () => {
+  const want = join(root, "id");
+  await mkdir(want, { recursive: true });
+  await symlink(want, join(root, "link"));
+  await fake(31, ["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], { CLAUDE_CONFIG_DIR: want });
+  await fake(32, ["claude"], { CLAUDE_CONFIG_DIR: join(root, "link") });
+  // a console-pod session: its home is /home/ais, mounted from the host home `root`
+  await fake(33, ["claude"], { HOME: "/home/ais", AIS_HOST_HOME: root, CLAUDE_CONFIG_DIR: "/home/ais/id" });
+  await fake(34, ["claude"], { HOME: "/home/ais", AIS_HOST_HOME: root });
+  await fake(35, ["node", "/x/pi-coding-agent/dist/cli.js"], { PI_CODING_AGENT_DIR: want });
+  await fake(36, ["pi"], { HOME: root });
+  const opts = { procRoot: join(root, "proc"), home: root };
+  expect(await liveSessionPids("claude", want, opts)).toEqual([31, 32, 33]);
+  expect(await liveSessionPids("claude", join(root, ".claude"), opts)).toEqual([34]);
+  expect(await liveSessionPids("pi", want, opts)).toEqual([35]);
+  expect(await liveSessionPids("pi", join(root, ".pi", "agent"), opts)).toEqual([36]);
+  expect((await scanLiveSessions("pi", null, opts)).pids).toEqual([35, 36]);
+});
+
+test("a scan that cannot run says why", async () => {
+  const scan = await scanLiveSessions("claude", join(root, ".claude"), { procRoot: join(root, "missing") });
+  expect(scan.pids).toEqual([]);
+  expect(scan.unavailable).toContain("cannot check for running sessions");
 });

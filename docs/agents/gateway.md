@@ -306,7 +306,27 @@ identity, under the account's refresh locks (the ones the gateway takes before i
    started before the switch keeps the old login in memory and later refreshes it with the single-use refresh token the
    gateway now renews; the gateway's copy then fails `refresh_token_reused` and the account is lost. Codex also writes that
    login back over the gateway entry. The report lists the pids; end those sessions, then run the command again. There is
-   no override. Checked again under the locks, right before anything is written;
+   no override. Checked again under the locks, right before anything is written, and once more after the switch (pids
+   found then are reported as a warning and the exit code is 1). Detection: argv[0], the executable or a node launcher's
+   argv[1] named after the tool or its package entry (`node …/@anthropic-ai/claude-code/cli.js`); folders compared after
+   resolving symlinks; a process without the variable uses the default folder in its own `HOME`. A console-pod session
+   carrying `AIS_HOST_HOME` has its container paths (under its `HOME`, e.g. `/home/ais`) mapped back to the host home; a
+   pod session without `AIS_HOST_HOME`, or running as another uid, is not seen. When the scan cannot run (no `/proc`, as on
+   macOS, an unreadable `/proc`, or one that hides this very process, as with `hidepid`) the identity is refused.
+
+   It also refuses while another copy of the login would keep refreshing it:
+   - a swap pool folder of the same tool that is not gateway-routed and whose active member is this identity, or whose
+     login has the same refresh token or account. Every session started with the pool uses that copy, and this command
+     never writes pool folders: swap the pool to another member first (`ais swap <tool> to <member> --pool=<pool>`), or
+     route the pool itself, then run again;
+   - pi keeps its own copy of each identity's claude (`anthropic`) and codex (`openai-codex`) login in the same-named pi
+     identity's `auth.json` (`oauth-reconcile.ts`), and once the store copy exists the reconcile no longer converges them.
+     pi has no local gateway route, so that entry is removed (under pi's `auth.json.lock`, after a unique
+     `auth.json.pre-gateway.<timestamp>.bak`; every other provider is kept) when it is the same refresh token or provably
+     older (claude: `expires`; codex: the token's `iat` against `last_refresh`). pi then has no login for that provider for
+     the identity until pi gets a gateway route. Refused instead: a pi copy that may be fresher (run
+     `ais auth sync --tool=pi` first), a pi swap pool or a differently named pi identity holding the same refresh token,
+     and any running pi session (one pi instance reads every pi identity's `auth.json`);
 3. it moves the login into the member store. A store copy already there is the gateway's live login: it is replaced only
    by a login of the same account (claude: the `.claude.json` account uuid; codex: the token's account id) that is
    provably fresher (claude: later `expiresAt`; codex: later `last_refresh`), after a unique backup. A folder holding a

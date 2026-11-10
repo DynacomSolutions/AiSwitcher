@@ -4,11 +4,13 @@ import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { LOCAL_GATEWAY_ROUTES } from "../../gateway/local-routes.ts";
 import { GATEWAY_TOKEN_PREFIX, isGatewayAccessToken, writeGatewayEntry } from "../../identities/claude-gateway-entry.ts";
-import { withOauthRefreshLocks } from "../../identities/claude-swap-lock.ts";
+import { withOauthRefreshLock, withOauthRefreshLocks } from "../../identities/claude-swap-lock.ts";
 import { HEARTBEAT_FRESH_MS, readHeartbeat, type GatewayHeartbeat } from "../../identities/gateway-heartbeat.ts";
 import { codexAccountOf, codexRecency, parseCodexAuth } from "../../identities/codex-auth.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, memberStoreRoot, type MemberStoreTool } from "../../identities/gateway-members.ts";
-import { liveSessionPids } from "../../identities/live-sessions.ts";
+import { scanLiveSessions, type SessionTool } from "../../identities/live-sessions.ts";
+import { readPiEntry } from "../../identities/oauth-reconcile.ts";
+import { withLockDir } from "../../identities/pool/grant-file-adapter.ts";
 import { createFileDurable, writeFileAtomic, writeFileDurable } from "../../identities/pool/fs.ts";
 import { isRetired } from "../../identities/retired.ts";
 import { loadIdentitiesFile } from "../../identities/store.ts";
@@ -24,8 +26,11 @@ import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secr
  *      it with a successful renewal;
  *   2. no running session may use the folder: a Claude Code or Codex session started before the switch keeps the old login
  *      in memory and later refreshes it with the single-use refresh token the gateway now renews, which kills the gateway's
- *      copy (`refresh_token_reused`); Codex also writes that login back over the gateway entry. Checked before and again
- *      under the locks;
+ *      copy (`refresh_token_reused`); Codex also writes that login back over the gateway entry. A session scan that cannot
+ *      run (no readable /proc) refuses. No other holder may keep the login (holdersProblem): a swap pool folder holding it
+ *      (active member, same refresh token or account) refuses; pi's copy in the same-named pi identity is removed after a
+ *      backup (refused while any pi session runs, or when pi's copy may be the fresher one). Checked before and again
+ *      under the locks, and sessions are scanned once more after the switch (reported as a warning, exit code 1);
  *   3. the login moves into the gateway's own member store (gateway-members.ts), so the gateway keeps the account after
  *      the local file changes. The store copy is written durably (flushed, renamed, folder flushed) and read back before
  *      anything local changes. A store copy already there is replaced only by a fresher login of the same account;
@@ -34,7 +39,8 @@ import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secr
  *      and the app's `aisg_` key.
  *
  * Refused and reported, nothing written: a tool with no local gateway route (grok, kimi, pi today) or no key, an account the
- * gateway does not hold, a folder with running sessions, a folder whose login is a different account than its store copy,
+ * gateway does not hold, a folder with running sessions (or no way to check), a login a swap pool or another pi identity
+ * still holds, a pi copy that may be fresher, a folder whose login is a different account than its store copy,
  * a folder with no refreshable login, a swap pool folder that is not routed yet (a pool folder holds a copy of a member's
  * login, and this command never writes one), and any file that is a symlink. A swap pool swaps by copying a member's login
  * out of the member's folder, so once its members are routed the pool's swaps no longer get a working login (codex: "no
@@ -79,6 +85,8 @@ export interface RouteLine {
   identity: string;
   status: RouteStatus;
   detail?: string;
+  /** Routed, but something needs the user now (a session started during the switch): the exit code is non-zero. */
+  attention?: boolean;
 }
 
 export interface RouteReport {
@@ -240,13 +248,145 @@ async function writeAccountRecord(tool: MemberStoreTool, identity: Identity, dir
 
 /* ------------------------------------------------------------------ running sessions */
 
-/** Why running sessions block the switch, or undefined when none use the folder. */
+const scanOpts = (opts: RouteAllOptions) => ({ ...(opts.procRoot ? { procRoot: opts.procRoot } : {}), ...(opts.home ? { home: opts.home } : {}) });
+const LABEL_OF: Record<SessionTool, string> = { claude: "Claude Code", codex: "Codex", pi: "pi" };
+const sessionsText = (tool: SessionTool, pids: number[]): string => `${pids.length} running ${LABEL_OF[tool]} session${pids.length === 1 ? "" : "s"} (pid ${pids.join(", ")})`;
+
+/** Running sessions of `tool` in `dir` (null: any folder), or the refusal when the scan cannot run (no /proc, hidepid). */
+async function sessionsIn(tool: SessionTool, dir: string | null, opts: RouteAllOptions): Promise<{ pids: number[]; unavailable?: string }> {
+  return scanLiveSessions(tool, dir, scanOpts(opts));
+}
+
+/** Why running sessions block the switch, or undefined when none use the folder. A scan that cannot run refuses too. */
 async function sessionsProblem(tool: MemberStoreTool, dir: string, opts: RouteAllOptions): Promise<string | undefined> {
-  const pids = await liveSessionPids(tool, dir, { ...(opts.procRoot ? { procRoot: opts.procRoot } : {}), ...(opts.home ? { home: opts.home } : {}) });
+  const scan = await sessionsIn(tool, dir, opts);
+  if (scan.unavailable) return `${scan.unavailable}; a running session would later refresh the refresh token the gateway takes over, so nothing changed (run this on Linux with a readable /proc)`;
+  const pids = scan.pids;
   if (pids.length === 0) return undefined;
-  const label = tool === "claude" ? "Claude Code" : "Codex";
   const writeBack = tool === "codex" ? " and write that login back over the gateway entry" : "";
-  return `${pids.length} running ${label} session${pids.length === 1 ? "" : "s"} use${pids.length === 1 ? "s" : ""} this folder (pid ${pids.join(", ")}): a session started before the switch keeps the old login in memory and would later refresh it with the refresh token the gateway now owns, killing the gateway's copy${writeBack}; end ${pids.length === 1 ? "it" : "them"}, then run this again`;
+  return `${pids.length} running ${LABEL_OF[tool]} session${pids.length === 1 ? "" : "s"} use${pids.length === 1 ? "s" : ""} this folder (pid ${pids.join(", ")}): a session started before the switch keeps the old login in memory and would later refresh it with the refresh token the gateway now owns, killing the gateway's copy${writeBack}; end ${pids.length === 1 ? "it" : "them"}, then run this again`;
+}
+
+/* ------------------------------------------------------------------ other holders of the login */
+
+/** The refresh token of a claude or codex login file text, or undefined. */
+function refreshOf(tool: MemberStoreTool, text: string | undefined): string | undefined {
+  const json = parseJson(text);
+  const rt = tool === "claude" ? (json?.claudeAiOauth as { refreshToken?: unknown } | undefined)?.refreshToken : (json?.tokens as { refresh_token?: unknown } | undefined)?.refresh_token;
+  return nonEmpty(rt) ? rt : undefined;
+}
+
+/** pi's auth.json provider that holds its copy of each tool's login (oauth-reconcile.ts pairs them by identity name). */
+const PI_PROVIDER_OF: Record<MemberStoreTool, string> = { claude: "anthropic", codex: "openai-codex" };
+
+/** A pi auth.json entry this run removes: pi's own copy of the identity's login. */
+interface PiRemoval {
+  name: string;
+  dir: string;
+  path: string;
+  provider: string;
+  /** The entry's refresh token when analysed: removal is skipped (refused) if it changed since. */
+  refresh: string | undefined;
+  why: string;
+}
+
+interface HoldersOutcome {
+  refused?: string;
+  piRemovals: PiRemoval[];
+}
+
+/**
+ * Every other place that holds a copy of this login, which would refresh the single-use refresh token the gateway takes
+ * over (and so kill the gateway's copy, `refresh_token_reused`):
+ *  - a swap pool folder of the same tool that is not gateway-routed and whose active member is this identity, or whose
+ *    login is the same refresh token or account: refused (this command never writes pool folders; every session started
+ *    with the pool uses that copy). Swap the pool to another member first, or route the pool;
+ *  - pi: the same-named pi identity's `anthropic` / `openai-codex` entry is pi's copy of this login (oauth-reconcile.ts).
+ *    pi has no local gateway route, so the entry is removed (after a unique backup) when it is the same refresh token or
+ *    provably older than the login the gateway gets; a pi copy that may be fresher (pi refreshed it, so the folder's
+ *    token may be spent) is refused: run `ais auth sync --tool=pi` first. A pi swap pool or a differently named pi
+ *    identity holding the same refresh token is refused. Removing needs no running pi session at all: one pi instance
+ *    reads every pi identity's auth.json.
+ */
+async function holdersProblem(identity: Identity, ctx: ToolContext, localText: string | undefined): Promise<HoldersOutcome> {
+  const { tool, root } = ctx;
+  const storeText = hasMemberCopy(tool, identity.name, root) ? await readText(join(memberDir(tool, identity.name, root), memberLoginFile(tool))) : undefined;
+  const tokens = new Set([refreshOf(tool, localText), refreshOf(tool, storeText)].filter(nonEmpty));
+  const localKind = classifyLogin(tool, localText);
+  const account = localKind === "login" ? await accountOf(tool, identity.configDir, localText!) : storeText ? await accountOf(tool, memberDir(tool, identity.name, root), storeText) : undefined;
+
+  for (const pool of ctx.pools) {
+    const poolText = await readText(join(pool.configDir, memberLoginFile(tool)));
+    if (classifyLogin(tool, poolText) !== "login") continue; // gateway-routed or empty: holds no login
+    const poolRt = refreshOf(tool, poolText);
+    const reason =
+      pool.swapPool?.active === identity.name ? "this identity is its active member"
+      : poolRt !== undefined && tokens.has(poolRt) ? "it holds the same refresh token"
+      : account !== undefined && (await accountOf(tool, pool.configDir, poolText!)) === account ? "it holds the same account"
+      : undefined;
+    if (!reason) continue;
+    const other = pool.swapPool?.accounts.find((a) => a !== identity.name);
+    const how = other ? `swap the pool to another member first (ais swap ${tool} to ${other} --pool=${pool.name}), or route the pool itself` : "take this identity out of the pool, or route the pool itself";
+    return { refused: `swap pool ${pool.name} holds a copy of this login (${reason}): every session started with that pool would refresh the refresh token the gateway takes over and kill the gateway's copy; nothing changed. ${how[0]!.toUpperCase()}${how.slice(1)}, then run this again`, piRemovals: [] };
+  }
+
+  const provider = PI_PROVIDER_OF[tool];
+  const fresh = Math.max(...[localKind === "login" ? localText : undefined, storeText].map((t) => (t === undefined ? -1 : (loginFreshness(tool, t) ?? -1))));
+  const piRemovals: PiRemoval[] = [];
+  for (const pi of ctx.piIdentities) {
+    const path = join(pi.configDir, "auth.json");
+    let entry;
+    try {
+      entry = await readPiEntry(path, provider);
+    } catch {
+      return { refused: `pi identity ${pi.name}: its auth.json could not be read; nothing changed`, piRemovals: [] };
+    }
+    if (!entry) continue;
+    const rt = entry.grant.refresh_token;
+    const same = rt !== undefined && tokens.has(rt);
+    if (pi.swapPool) {
+      if (same || pi.swapPool.active === identity.name) return { refused: `pi swap pool ${pi.name} holds a copy of this login (${same ? "the same refresh token" : "this identity is its active member"}): its sessions would refresh the refresh token the gateway takes over; nothing changed. Swap the pi pool to another member first (ais swap pi to <member> --pool=${pi.name}), then run this again`, piRemovals: [] };
+      continue;
+    }
+    if (pi.name !== identity.name) {
+      if (same) return { refused: `pi identity ${pi.name} holds this login's refresh token in its ${provider} entry: pi would refresh the token the gateway takes over; nothing changed. Remove that entry or sign ${pi.name} in to its own account, then run this again`, piRemovals: [] };
+      continue;
+    }
+    // pi's copy: claude compares access-token expiry (ms), codex the last refresh (pi: the token's iat, seconds).
+    const piFresh = tool === "claude" ? (entry.grant.expires_at !== undefined ? entry.grant.expires_at * 1000 : undefined) : entry.grant.minted_at;
+    const older = piFresh !== undefined && fresh > 0 && piFresh < fresh;
+    if (!same && !older) return { refused: `pi identity ${pi.name} holds a different copy of this login (${provider}) that is not provably older than the one the gateway gets: pi may have refreshed it, so that refresh token may already be spent; nothing changed. Run ais auth sync --tool=pi to converge the copies, then run this again`, piRemovals: [] };
+    piRemovals.push({ name: pi.name, dir: pi.configDir, path, provider, refresh: rt, why: same ? "the same login" : "an older copy" });
+  }
+  if (piRemovals.length > 0) {
+    const scan = await sessionsIn("pi", null, ctx.opts);
+    if (scan.unavailable) return { refused: `${scan.unavailable}; pi's copy of this login must be removed while no pi session runs, so nothing changed`, piRemovals: [] };
+    if (scan.pids.length > 0) return { refused: `${sessionsText("pi", scan.pids)} would keep refreshing pi's copy of this login (one pi instance reads every pi identity's auth.json); nothing changed. End ${scan.pids.length === 1 ? "it" : "them"}, then run this again`, piRemovals: [] };
+  }
+  return { piRemovals };
+}
+
+/** Removes pi's copy under pi's own refresh lock (`auth.json.lock`) and AIS's: unique backup first, the rest of auth.json kept. */
+async function removePiCopy(r: PiRemoval, now: () => number): Promise<string> {
+  return withOauthRefreshLock(r.dir, () =>
+    withLockDir(join(r.dir, "auth.json.lock"), 30_000, `pi is refreshing its credentials in ${r.dir}`, async () => {
+      const text = await readText(r.path);
+      const json = parseJson(text);
+      const entry = json?.[r.provider] as { refresh?: unknown } | undefined;
+      if (!json || entry === undefined) return `pi identity ${r.name} no longer had a ${r.provider} entry`;
+      if ((nonEmpty(entry.refresh) ? entry.refresh : undefined) !== r.refresh) throw new PiChanged(r.name);
+      const b = await backupUnique(r.path, now);
+      delete json[r.provider];
+      await writeFileDurable(r.path, `${JSON.stringify(json, null, 2)}\n`);
+      return `pi identity ${r.name}: removed its ${r.provider} entry (${r.why}; backed up to ${b}); pi has no gateway route yet, so pi sessions of ${r.name} have no ${r.provider} login until it does`;
+    }),
+  );
+}
+
+class PiChanged extends Error {
+  constructor(name: string) {
+    super(`pi identity ${name}'s copy of this login changed while this run waited; run this again`);
+  }
 }
 
 /* ------------------------------------------------------------------ gateway entries */
@@ -390,10 +530,20 @@ interface ToolContext {
   now: () => number;
   /** Swap pools each identity is a member of (by name). */
   poolsOf: Map<string, string[]>;
+  /** The tool's swap pool identities. */
+  pools: Identity[];
+  /** Live pi identities (pools included): pi keeps its own copy of each identity's claude and codex login. */
+  piIdentities: Identity[];
 }
 
 async function routeOne(identity: Identity, ctx: ToolContext): Promise<RouteLine> {
-  const line = await routeOneRaw(identity, ctx);
+  let line: RouteLine;
+  try {
+    line = await routeOneRaw(identity, ctx);
+  } catch (err) {
+    if (!(err instanceof PiChanged)) throw err;
+    line = { tool: ctx.tool, identity: identity.name, status: "refused", detail: err.message };
+  }
   const pools = ctx.poolsOf.get(identity.name);
   if (!pools || (line.status !== "routed" && line.status !== "would-route" && line.status !== "already-routed")) return line;
   const warn = `member of swap pool ${pools.join(", ")}: the pool swaps by copying this folder's login, which is now the gateway entry, so swaps to it no longer get a working login (codex: "no usable Codex login") until the pool is routed with its own setup`;
@@ -424,9 +574,15 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   }
   const busy = await sessionsProblem(tool, dir, opts);
   if (busy) return { ...line, status: "refused", detail: busy };
-  if (opts.dryRun) return { ...line, status: "would-route", detail: kind === "login" ? "login would move to the member store, local files backed up, then replaced" : "gateway entry would be completed" };
+  const holders = await holdersProblem(identity, ctx, await readText(join(dir, memberLoginFile(tool))));
+  if (holders.refused) return { ...line, status: "refused", detail: holders.refused };
+  if (opts.dryRun) {
+    const pi = holders.piRemovals.map((r) => `; pi identity ${r.name}'s ${r.provider} entry would be removed (backed up)`).join("");
+    return { ...line, status: "would-route", detail: `${kind === "login" ? "login would move to the member store, local files backed up, then replaced" : "gateway entry would be completed"}${pi}` };
+  }
 
   const notes: string[] = [];
+  let removedPi = false;
   if (kind === "login") {
     await mkdir(root, { recursive: true, mode: 0o700 });
     await chmod(root, 0o700);
@@ -437,6 +593,8 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     const busyNow = await sessionsProblem(tool, dir, opts);
     if (busyNow) return busyNow;
     const localText = await readText(join(dir, memberLoginFile(tool)));
+    const holdersNow = await holdersProblem(identity, ctx, localText);
+    if (holdersNow.refused) return holdersNow.refused;
     const nowKind = classifyLogin(tool, localText);
     if (nowKind === "login") {
       const moved = await moveLoginToStore(tool, identity, localText!, root, now);
@@ -447,12 +605,31 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     if (!hasMemberCopy(tool, identity.name, root)) {
       return nowKind === "login" ? "the member store copy could not be confirmed after writing it; nothing local changed" : "the login disappeared while waiting for the lock; nothing changed";
     }
+    // pi's copy goes before the folder changes: a failure here leaves the folder as it was.
+    for (const r of holdersNow.piRemovals) notes.push(await removePiCopy(r, now));
     if (tool === "codex") await ensureCodexHelper(helper);
     notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, now) : await applyCodex(dir, token, base, helper, now)));
+    removedPi = holdersNow.piRemovals.length > 0;
     return undefined;
   });
   if (outcome) return { ...line, status: "refused", detail: outcome };
-  return { ...line, status: "routed", ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) };
+  // A session that started during the switch (after the check under the locks) holds the old login: report it.
+  const late = await lateSessions(tool, dir, removedPi, opts);
+  if (late) notes.push(late);
+  return { ...line, status: "routed", ...(late ? { attention: true } : {}), ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) };
+}
+
+/** Sessions found right after the switch (folder, and any pi session when pi's copy was removed), as a warning. */
+async function lateSessions(tool: MemberStoreTool, dir: string, pi: boolean, opts: RouteAllOptions): Promise<string | undefined> {
+  const found: string[] = [];
+  const own = await sessionsIn(tool, dir, opts);
+  if (own.pids.length > 0) found.push(sessionsText(tool, own.pids));
+  if (pi) {
+    const p = await sessionsIn("pi", null, opts);
+    if (p.pids.length > 0) found.push(sessionsText("pi", p.pids));
+  }
+  if (found.length === 0) return undefined;
+  return `WARNING: ${found.join(" and ")} found right after the switch: one started during it may hold the old login; end them now and start them again, before one refreshes the token the gateway took over`;
 }
 
 export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<RouteReport> {
@@ -481,7 +658,8 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
     for (const pool of accounts) {
       for (const member of pool.swapPool?.accounts ?? []) poolsOf.set(member, [...(poolsOf.get(member) ?? []), pool.name]);
     }
-    const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf };
+    const pools = accounts.filter((a) => a.swapPool);
+    const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts) };
     for (const identity of accounts) {
       try {
         lines.push(await routeOne(identity, ctx));
@@ -490,7 +668,7 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
       }
     }
   }
-  return { lines, unroutedTools, incomplete: unroutedTools.length > 0 || lines.some((l) => l.status === "refused") };
+  return { lines, unroutedTools, incomplete: unroutedTools.length > 0 || lines.some((l) => l.status === "refused" || l.attention === true) };
 }
 
 /* ------------------------------------------------------------------ output */
