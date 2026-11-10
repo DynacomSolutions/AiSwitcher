@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { backupUnique, classifyLogin, codexConfigRouted, codexKeyHelperPath, heldProblem, routeAllViaGateway, routeCodexConfigText, runRouteAllViaGateway, type RouteAllOptions } from "../../../src/cli/identities/route-all.ts";
 import { writeHeartbeat } from "../../../src/identities/gateway-heartbeat.ts";
 import { hasMemberCopy, memberDir } from "../../../src/identities/gateway-members.ts";
+import { refreshFingerprint, routingOf } from "../../../src/identities/gateway-routed.ts";
 import { loadIdentitiesFile, saveIdentitiesFile } from "../../../src/identities/store.ts";
 
 const CLAUDE_KEY = "aisg_SYNTHETIC_FIXTURE_claude_key";
@@ -65,6 +66,7 @@ beforeEach(async () => {
     procRoot: join(home, "proc"),
     port: 47140,
     now: () => NOW,
+    hostname: "routing-host-SYNTHETIC",
     out: () => {},
   };
 });
@@ -148,12 +150,19 @@ describe("route-all-via-gateway: routing", () => {
     const entry = JSON.parse(await readFile(join(dir, ".credentials.json"), "utf8")).claudeAiOauth;
     expect(entry.accessToken).toBe(CLAUDE_KEY);
     expect(entry.refreshToken).toBeNull();
+    // the routing record lets other hosts tell their copy of this login from a later sign-in there; nothing secret in it
+    expect(routingOf(await readFile(join(dir, ".credentials.json"), "utf8"))).toEqual({ host: "routing-host-SYNTHETIC", at: NOW, fingerprints: [refreshFingerprint("rt-SYNTHETIC_FIXTURE-alpha")], freshness: 1, account: "u-alpha" });
+    expect(await readFile(join(dir, ".credentials.json"), "utf8")).not.toContain("rt-SYNTHETIC_FIXTURE");
     const settings = JSON.parse(await readFile(join(dir, "settings.json"), "utf8"));
     expect(settings.env).toEqual({ KEEP: "1", ANTHROPIC_BASE_URL: "http://127.0.0.1:47140/claude" });
     expect(settings.apiKeyHelper).toBeUndefined();
 
     const cdir = dirOf(".codex", "alpha");
-    expect(JSON.parse(await readFile(join(cdir, "auth.json"), "utf8"))).toEqual({ auth_mode: "apikey", OPENAI_API_KEY: CODEX_KEY });
+    expect(JSON.parse(await readFile(join(cdir, "auth.json"), "utf8"))).toEqual({
+      auth_mode: "apikey",
+      OPENAI_API_KEY: CODEX_KEY,
+      aisGatewayRouting: { host: "routing-host-SYNTHETIC", at: NOW, fingerprints: [refreshFingerprint("rt-SYNTHETIC_FIXTURE-alpha")], account: "acct-alpha" },
+    });
     const toml = await readFile(join(cdir, "config.toml"), "utf8");
     expect(toml).toContain("# my config");
     expect(toml).toContain('[projects."/x"]');
@@ -165,6 +174,21 @@ describe("route-all-via-gateway: routing", () => {
     const again = await routeAllViaGateway(opts);
     expect(again.lines.every((l) => l.status === "already-routed" && l.detail === undefined)).toBe(true);
     expect([await files(dir), await files(cdir), await files(store)]).toEqual(snapshot);
+  });
+
+  test("a re-run adds the routing record to an entry written without one, and changes nothing else", async () => {
+    await heartbeat();
+    await routeAllViaGateway(opts);
+    const path = join(dirOf(".claude", "alpha"), ".credentials.json");
+    const legacy = JSON.parse(await readFile(path, "utf8"));
+    delete legacy.aisGatewayRouting;
+    await writeFile(path, JSON.stringify(legacy));
+    const again = await routeAllViaGateway({ ...opts, now: () => NOW + 1000 });
+    expect(claudeLine(again, "alpha")?.detail).toContain("added the routing record");
+    const text = await readFile(path, "utf8");
+    expect(JSON.parse(text).claudeAiOauth).toEqual(legacy.claudeAiOauth);
+    expect(routingOf(text)).toEqual({ host: "routing-host-SYNTHETIC", at: NOW + 1000, fingerprints: [refreshFingerprint("rt-SYNTHETIC_FIXTURE-alpha")], freshness: 1, account: "u-alpha" });
+    expect(claudeLine(await routeAllViaGateway(opts), "alpha")?.detail).toBeUndefined();
   });
 
   test("an existing key helper is kept", async () => {
@@ -580,6 +604,8 @@ describe("route-all-via-gateway: AIS sync remotes", () => {
     const text = await report();
     expect(text).toContain("WARNING: AIS sync copies the folders of claude/alpha, claude/beta, codex/alpha to hq1");
     expect(text).toContain("stop every Claude Code, Codex and pi session");
+    expect(text).toContain("These identities then STOP WORKING on that host");
+    expect(text).toContain("sync keeps that new sign-in");
     await writeFile(syncConfig, "{ not json");
     expect(await report()).toContain("the AIS sync config could not be read");
   });

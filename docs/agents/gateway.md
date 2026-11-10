@@ -411,9 +411,8 @@ logins) or the member is taken out of the pool. The
 report adds this warning to every routed member of a swap pool and to every refused pool folder.
 Re-running changes nothing in an identity already routed, but checks its other holders again: a swap pool holding the
 login or a pi copy that may be fresher is reported (status `already-routed`, exit code 1), and pi's same-named copy is
-removed as on a first run. To undo one identity: copy the member store's login file back
-(the gateway has kept it current; the `.pre-gateway` login backup may hold a refresh token already rotated away), restore
-the settings or config backup, then move the store folder aside so the gateway reads the identity folder again.
+removed as on a first run. An entry written before the routing record existed (see below) gets the record on a re-run.
+To undo one identity, see "Undoing the routing" below.
 
 ### Hosts that AIS sync connects
 
@@ -421,15 +420,36 @@ AIS sync copies every identity folder between hosts, logins included (newest win
 on the other host (say hq1) the identity is not in a member store, and its own copy of the login kept refreshing: the
 gateway's copy then failed `refresh_token_reused`, and hq1's newer file synced back over the gateway entry. The receiving
 side of every sync merge and of the live inbox now applies these rules (`src/sync/gateway-guard.ts`) to the claude
-`.credentials.json` and codex `auth.json` of every plain identity, under the identity's refresh lock:
+`.credentials.json` and codex `auth.json` of every plain identity, under the identity's refresh lock.
+
+The gateway entry carries a routing record (key `aisGatewayRouting`, nothing secret in it): the routing host's name, the
+time, the first 16 hex digits of the sha256 of each routed refresh token (the folder's and the member store's), the
+freshness of the routed login (claude `expiresAt`, codex `last_refresh`) and its account. With it the receiving host tells
+its own copy of the routed login from a sign-in made there after the routing (a new refresh token family the gateway never
+held, harmless to it):
 
 - a host that holds a member store copy of the identity never replaces its folder file, whatever arrives;
-- a gateway entry is never replaced by a real login, whatever the file times say;
-- an arriving gateway entry replaces a real login, whatever the file times say. So the routed state spreads: after the next
-  sync hq1's folder holds the gateway entry too (pointing at `127.0.0.1:47140` on hq1: sessions there need hq1's own local
-  gateway route to work, otherwise they fail without refreshing anything). On hq1 `isGatewayManagedHere` treats an
-  identity whose folder holds the pure gateway entry as the gateway's, so `ais serve` auth-refresh, `ais auth refresh` and
-  the pi reconcile never refresh or reconcile it there;
+- an arriving gateway entry replaces a real login only when that login is the routed one: a routed refresh token, or not
+  fresher than the routed login and not a different account. The replaced file is backed up first to
+  `~/.ais/gateway-replaced/<tool>-<identity>-<file>.<timestamp>.bak` (exclusive, 0600; `~/.ais` is not synced, so the
+  login does not travel on), and the sync (or inbox) log names the identity;
+- an arriving entry never replaces a sign-in made after the routing (fresher than the routed login, or another account):
+  the log says it was kept, at each sync. A login that cannot be told apart (an entry without the routing record, written
+  by an earlier build of this command, or an undatable login) is kept too and logged; re-run the command on the routing
+  host to add the record;
+- the routing host keeps its own login whatever entry arrives once it has no member store copy (it was un-routed);
+- a gateway entry is replaced by a real login only when that login is provably a separate one (fresher than the routed
+  login, or another account): a host that has not seen the routing yet cannot undo it with its old copy, but a fresh
+  sign-in, or the login restored on the routing host when un-routing, spreads like any login (newest wins after that).
+
+**Routed identities stop working on the other synced hosts.** After the next sync hq1's folder holds the gateway entry,
+pointing at `127.0.0.1:47140`, and hq1's gateway has no copy of the login (the member store is per host), so sessions there
+fail, without refreshing anything. On hq1 `isGatewayManagedHere` treats an identity whose folder holds the pure gateway
+entry as the gateway's, so `ais serve` auth-refresh, `ais auth refresh` and the pi reconcile never refresh or reconcile it
+there. To use the identity on hq1 again, sign in again there (`/login`, `codex login`): that is a new login, the next sync
+keeps it, hq1 refreshes it as usual (its folder holds a real login, so it is not gateway-managed), and the routing host
+keeps its gateway entry (it holds the member store copy). The command's report says this for every routed identity when the
+sync config names remotes.
 - pi's same-named copy (`anthropic` / `openai-codex`) of a routed login is dropped from an arriving pi `auth.json`, and after
   each merge removed from the live file (unique `.pre-gateway` backup first, under pi's `auth.json.lock`).
 
@@ -438,5 +458,20 @@ Every synced host must run a build with these rules: a remote with an older buil
 What sync cannot do is stop a session on hq1 that is already running: it keeps the old login in memory and refreshes it at
 its next refresh, which kills the gateway's copy. The command cannot see those sessions, so it does not refuse, but its
 report (dry run too) warns and names the sync remotes: stop every Claude Code, Codex and pi session of the identities being
-routed on those hosts before running it. To undo routing on a synced host, restore the login on every host (a gateway
-entry anywhere wins the next sync).
+routed on those hosts before running it.
+
+### Undoing the routing
+
+Restore on the routing host only, and let sync carry the login; never put a `.pre-gateway` or `gateway-replaced` login
+backup back on any host (its refresh token may be rotated away already, and a restored copy beside the live one is a
+second holder of one token):
+
+1. on every other synced host, stop the identity's sessions (they hold only the gateway entry);
+2. on the routing host, stop the identity's sessions, copy (`cp`, so the file gets a new time and wins the sync) the member store's login file
+   (`~/.ais/gateway-members/<tool>/<identity>/`) back into the identity folder (the gateway has kept it current), restore the
+   `settings.json` or `config.toml` backup the same way, then move the store folder aside so the gateway reads the identity folder again.
+   From then on this host keeps that login whatever gateway entry arrives;
+3. let sync run. The restored login replaces the other hosts' gateway entry when it is fresher than the routed login (the
+   gateway renewed it since the routing). If it is not (un-routed before the gateway's first renewal), sync keeps the
+   entry there: on that host move the identity's gateway entry file aside (`.credentials.json` / `auth.json`; it holds no
+   login) and sync again, or sign in again there.

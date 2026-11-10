@@ -29,7 +29,7 @@ import { listHistories, PrefixCache, hashPrefix, TAIL_MIN_BYTES, TAIL_PLAN_FILE,
 import { mergeRegistryConflict } from "./registry.ts";
 import { isDeepStrictEqual } from "node:util";
 import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
-import { decideCredentialMerge, loadGatewayGuard, memberHere, routedNow, routedProviders, stripRoutedPiCopies, withoutProviders, type GatewayGuard, type GuardedLogin } from "./gateway-guard.ts";
+import { backupReplacedLogin, credentialContext, credentialPlanLine, loadGatewayGuard, planCredentialMerge, routedNow, routedProviders, stripRoutedPiCopies, withoutProviders, type GatewayGuard, type GuardedLogin } from "./gateway-guard.ts";
 import type { SyncScope } from "./types.ts";
 
 export interface TreeMergeResult {
@@ -311,15 +311,26 @@ async function mergeClaudeJson(source: string, destination: string, rel: string,
 }
 
 /** The claude `.credentials.json` / codex `auth.json` of a plain identity, under its refresh lock (the lock
- * route-all-via-gateway and the gateway take): a member store copy here keeps the local file, a gateway entry is never
- * replaced by a login and replaces one whatever the times say (gateway-guard.ts); otherwise the newest copy wins, as for
- * every credential file. A busy lock leaves the file for the next sync. */
+ * route-all-via-gateway and the gateway take): a member store copy here keeps the local file; a gateway entry replaces
+ * this host's copy of the routed login (backed up first) but not a separate sign-in, and is replaced only by a separate
+ * login (gateway-guard.ts); otherwise the newest copy wins, as for every credential file. A busy lock leaves the file
+ * for the next sync. */
 async function mergeGuardedLogin(login: GuardedLogin, source: string, destination: string, rel: string, guard: GatewayGuard, result: TreeMergeResult): Promise<void> {
   try {
     await withOauthRefreshLock(dirname(destination), async () => {
       const [localText, incomingText] = await Promise.all([readFile(destination, "utf8").catch(() => undefined), readFile(source, "utf8").catch(() => undefined)]);
-      const decision = decideCredentialMerge(login.tool, localText, incomingText, memberHere(guard, login));
-      if (decision === "keep-local") return;
+      const plan = planCredentialMerge(login.tool, localText, incomingText, await credentialContext(guard, login));
+      const decision = plan.action;
+      if (decision === "keep-local") {
+        const line = credentialPlanLine(login, plan);
+        if (line) console.warn(`AIS sync: ${line}`);
+        return;
+      }
+      let replacedLine: string | undefined;
+      if (decision === "take-incoming" && localText !== undefined && localText !== incomingText) {
+        const backup = plan.reason.startsWith("entry-replaces") ? await backupReplacedLogin(guard, login, localText) : undefined;
+        replacedLine = credentialPlanLine(login, plan, backup);
+      }
       if (!(await exists(destination))) {
         if (await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths)) result.copiedFiles++;
         return;
@@ -330,7 +341,7 @@ async function mergeGuardedLogin(login: GuardedLogin, source: string, destinatio
       }
       const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
       const sourceWins = decision === "take-incoming" || (sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination));
-      if (sourceWins) await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths);
+      if (sourceWins && (await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths)) && replacedLine) console.warn(`AIS sync: ${replacedLine}`);
     });
   } catch (error) {
     if (!(error instanceof SwapLockError && error.timedOut)) throw error;

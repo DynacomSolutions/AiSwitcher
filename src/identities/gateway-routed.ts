@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
+import { codexAccountOf, codexRecency, parseCodexAuth } from "./codex-auth.ts";
 import { memberLoginFile, type MemberStoreTool } from "./gateway-members.ts";
 import { expandPath } from "./match.ts";
 import { createFileDurable } from "./pool/fs.ts";
@@ -62,6 +64,95 @@ export function folderHoldsGatewayEntry(tool: MemberStoreTool, identity: Identit
     return false;
   }
   return isPureGatewayEntry(tool, text);
+}
+
+/** The refresh token of a claude or codex login file text, or undefined. */
+export function refreshOf(tool: MemberStoreTool, text: string | undefined): string | undefined {
+  const json = parseObject(text);
+  const rt = tool === "claude" ? (json?.claudeAiOauth as { refreshToken?: unknown } | undefined)?.refreshToken : (json?.tokens as { refresh_token?: unknown } | undefined)?.refresh_token;
+  return nonEmpty(rt) ? rt : undefined;
+}
+
+/** How fresh a login is (larger is fresher), or undefined: claude its access token expiry, codex its last refresh. */
+export function loginFreshness(tool: MemberStoreTool, text: string): number | undefined {
+  if (tool === "codex") {
+    const at = codexRecency(parseCodexAuth(text));
+    return at > 0 ? at : undefined;
+  }
+  const expiresAt = (parseObject(text)?.claudeAiOauth as { expiresAt?: unknown } | undefined)?.expiresAt;
+  return typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined;
+}
+
+/** The account of a login: codex the token's account id; claude the `.claude.json` account uuid in `claudeJsonText`. */
+export function loginAccount(tool: MemberStoreTool, loginText: string | undefined, claudeJsonText?: string): string | undefined {
+  if (tool === "codex") return codexAccountOf(parseCodexAuth(loginText)).id;
+  const account = parseObject(claudeJsonText)?.oauthAccount as { accountUuid?: unknown } | undefined;
+  return nonEmpty(account?.accountUuid) ? account.accountUuid : undefined;
+}
+
+/** A non-secret fingerprint of a refresh token: the first 16 hex digits of its sha256. */
+export const refreshFingerprint = (refreshToken: string): string => createHash("sha256").update(refreshToken).digest("hex").slice(0, 16);
+
+/**
+ * What the gateway entry records about the login it replaced (the `aisGatewayRouting` key of the entry file; nothing in it is
+ * secret). Another host uses it to tell its own copy of that login (the same refresh token, or an older login of the same
+ * account), which the entry replaces, from a fresh sign-in made there after the routing, which it keeps (sync/gateway-guard.ts).
+ */
+export interface GatewayRouting {
+  /** os.hostname() of the host that routed the identity. */
+  host: string;
+  /** When it was routed (ms). */
+  at: number;
+  /** Fingerprints of the refresh tokens the routed login had (the folder's and the member store's). */
+  fingerprints: string[];
+  /** loginFreshness of the freshest routed copy. */
+  freshness?: number;
+  /** Account of the routed login. */
+  account?: string;
+}
+
+export const ROUTING_KEY = "aisGatewayRouting";
+
+/** The routing record of a gateway entry text, or undefined (not an entry, or one written before the record existed). */
+export function routingOf(text: string | undefined): GatewayRouting | undefined {
+  const r = parseObject(text)?.[ROUTING_KEY] as Partial<GatewayRouting> | undefined;
+  if (typeof r !== "object" || r === null || typeof r.host !== "string" || typeof r.at !== "number" || !Array.isArray(r.fingerprints)) return undefined;
+  return {
+    host: r.host,
+    at: r.at,
+    fingerprints: r.fingerprints.filter((f): f is string => typeof f === "string"),
+    ...(typeof r.freshness === "number" ? { freshness: r.freshness } : {}),
+    ...(nonEmpty(r.account) ? { account: r.account } : {}),
+  };
+}
+
+/** The entry text with the routing record added (the entry's own keys unchanged). */
+export function withRouting(entryText: string, routing: GatewayRouting): string {
+  const json = parseObject(entryText);
+  if (!json) throw new Error("gateway entry is not a JSON object");
+  return `${JSON.stringify({ ...json, [ROUTING_KEY]: routing })}\n`;
+}
+
+/** The routing record for login copies `texts` (folder and member store), routed now by this host. */
+export function routingFor(tool: MemberStoreTool, texts: Array<string | undefined>, account: string | undefined, host: string, at: number): GatewayRouting {
+  const fingerprints = [...new Set(texts.map((t) => refreshOf(tool, t)).filter((t): t is string => t !== undefined).map(refreshFingerprint))];
+  const fresh = texts.map((t) => (t === undefined ? undefined : loginFreshness(tool, t))).filter((f): f is number => f !== undefined);
+  return { host, at, fingerprints, ...(fresh.length > 0 ? { freshness: Math.max(...fresh) } : {}), ...(account ? { account } : {}) };
+}
+
+/**
+ * How a real login relates to a routing: `routed` when it is that login (a routed refresh token) or provably an older login
+ * of the same account (not fresher than the routed copy, and not a different account); `separate` when it is a different
+ * account or provably fresher (a sign-in made after the routing: a new refresh token family the gateway never held);
+ * `unknown` when neither can be shown.
+ */
+export function relateToRouting(tool: MemberStoreTool, loginText: string | undefined, account: string | undefined, routing: GatewayRouting): "routed" | "separate" | "unknown" {
+  const rt = refreshOf(tool, loginText);
+  if (rt !== undefined && routing.fingerprints.includes(refreshFingerprint(rt))) return "routed";
+  if (account !== undefined && routing.account !== undefined && account !== routing.account) return "separate";
+  const fresh = loginText === undefined ? undefined : loginFreshness(tool, loginText);
+  if (fresh === undefined || routing.freshness === undefined) return "unknown";
+  return fresh <= routing.freshness ? "routed" : "separate";
 }
 
 /**

@@ -9,7 +9,7 @@ import { decodeJwtPayload, readPiEntry } from "../identities/oauth-reconcile.ts"
 import { canonicalConfig } from "./portable.ts";
 import { hasOpenOwner } from "../sync/tree-merge.ts";
 import { withOauthRefreshLock } from "../identities/claude-swap-lock.ts";
-import { decideCredentialMerge, loadGatewayGuard, memberHere, routedNow, routedProviders, withoutProviders } from "../sync/gateway-guard.ts";
+import { backupReplacedLogin, credentialContext, credentialPlanLine, loadGatewayGuard, planCredentialMerge, routedNow, routedProviders, stripRoutedPiCopies, withoutProviders } from "../sync/gateway-guard.ts";
 
 interface InboxState {
   version: 1;
@@ -293,6 +293,7 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
           const incoming = bundle.files.get(item.path)!;
           let completed = false;
           let kept = false;
+          let replacedLine: string | undefined;
           await withOauthRefreshLock(`/proc/self/fd/${parent.dir.fd}`, async (lock) => {
             for (let attempt = 0; attempt < 3; attempt++) {
               const owner = deps.hasOpenOwner ? await deps.hasOpenOwner(ownerPath) : await hasOpenOwner(ownerPath, { lookups: 0 });
@@ -301,14 +302,23 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
               const expectedHash = existing === undefined ? undefined : hash(existing);
               let bytes = incoming;
               const login = guard?.native.get(item.path);
-              const decision = login ? decideCredentialMerge(login.tool, existing && new TextDecoder().decode(existing), new TextDecoder().decode(incoming), memberHere(guard!, login)) : "merge";
+              const existingText = existing && new TextDecoder().decode(existing);
+              const incomingText = new TextDecoder().decode(incoming);
+              const plan = login ? planCredentialMerge(login.tool, existingText, incomingText, await credentialContext(guard!, login)) : undefined;
+              const decision = plan?.action ?? "merge";
               if (decision === "keep-local") {
                 deps.log?.(`AIS-LIVE: stage=inbox status=kept reason=gateway-routed path=${item.path}`);
+                const line = credentialPlanLine(login!, plan!);
+                if (line) deps.log?.(`AIS-LIVE: stage=inbox ${line}`);
                 completed = kept = true;
                 break;
               }
               if (decision === "take-incoming") {
                 bytes = incoming;
+                if (existingText !== undefined && existingText !== incomingText) {
+                  const backup = plan!.reason.startsWith("entry-replaces") ? await backupReplacedLogin(guard!, login!, existingText) : undefined;
+                  replacedLine = credentialPlanLine(login!, plan!, backup);
+                }
               } else if (existing && item.path.endsWith(".json")) {
                 const oldAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(existing)) as Record<string, unknown>;
                 const newAuth = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(incoming)) as Record<string, unknown>;
@@ -339,12 +349,16 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
             deps.log?.(`AIS-LIVE: stage=inbox status=deferred reason=credential-changed path=${item.path}`);
             return { applied, skipped: bundle.manifest.entries.length - applied, conflicts, deferred: "credential changed during restore; retry the inbox", lastInboxSeq };
           }
+          if (replacedLine) deps.log?.(`AIS-LIVE: stage=inbox ${replacedLine}`);
           if (kept) continue;
         } finally { if (parent.dir !== root) await parent.dir.close(); }
       } else await writeHomeFileAtomic(root, item.path, item.bytes, item.mode);
       nextHashes[item.path] = item.hash;
       if (entry.class !== "logs") applied++;
     }
+    // A routing that arrived in this bundle (or a pi copy that won by time) leaves pi holding a routed login: strip it, as
+    // the sync merge does (gateway-guard.ts).
+    if (guard) for (const line of await stripRoutedPiCopies(guard)) deps.log?.(`AIS-LIVE: stage=inbox ${line}`);
     // A deferred auth merge must be retried, so its seq cannot be acknowledged yet.
     if (authReady) {
       const next: InboxState = { version: 1, lastInboxSeq: Math.max(lastInboxSeq, bundle.manifest.seq), hashes: nextHashes };

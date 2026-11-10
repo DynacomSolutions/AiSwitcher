@@ -1,14 +1,13 @@
 import { chmod, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { LOCAL_GATEWAY_ROUTES } from "../../gateway/local-routes.ts";
-import { GATEWAY_TOKEN_PREFIX, isGatewayAccessToken, writeGatewayEntry } from "../../identities/claude-gateway-entry.ts";
+import { GATEWAY_TOKEN_PREFIX, gatewayEntryScopesFor, gatewayEntryText, isGatewayAccessToken } from "../../identities/claude-gateway-entry.ts";
 import { withOauthRefreshLock, withOauthRefreshLocks } from "../../identities/claude-swap-lock.ts";
 import { HEARTBEAT_FRESH_MS, readHeartbeat, type GatewayHeartbeat } from "../../identities/gateway-heartbeat.ts";
-import { codexAccountOf, codexRecency, parseCodexAuth } from "../../identities/codex-auth.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, memberStoreRoot, type MemberStoreTool } from "../../identities/gateway-members.ts";
-import { backupUnique, classifyLogin } from "../../identities/gateway-routed.ts";
+import { backupUnique, classifyLogin, loginAccount, loginFreshness, refreshOf, routingFor, routingOf, withRouting, type GatewayRouting } from "../../identities/gateway-routed.ts";
 import { scanLiveSessions, type SessionTool } from "../../identities/live-sessions.ts";
 import { readPiEntry } from "../../identities/oauth-reconcile.ts";
 import { withLockDir } from "../../identities/pool/grant-file-adapter.ts";
@@ -20,7 +19,7 @@ import type { Identity } from "../../identities/types.ts";
 import { loadSyncConfig, syncConfigPath } from "../../sync/config.ts";
 import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secrets-file.ts";
 
-export { backupUnique, classifyLogin };
+export { backupUnique, classifyLogin, loginFreshness };
 
 /**
  * `ais identities route-all-via-gateway [--dry-run]`: points every local agent identity at the AIS gateway.
@@ -87,6 +86,8 @@ export interface RouteAllOptions {
   /** AIS sync config (default the user's): its remotes get the routed folders too (see sync/gateway-guard.ts). */
   syncConfigPath?: string;
   now?: () => number;
+  /** This host's name in the routing record of the entries written (default os.hostname()). */
+  hostname?: string;
   out?: (line: string) => void;
 }
 
@@ -165,19 +166,7 @@ export function heldProblem(tool: string, name: string, hb: GatewayHeartbeat | u
 
 /** The account a login belongs to: claude the `.claude.json` account uuid next to it, codex the token's account id. */
 async function accountOf(tool: MemberStoreTool, dir: string, loginText: string): Promise<string | undefined> {
-  if (tool === "codex") return codexAccountOf(parseCodexAuth(loginText)).id;
-  const account = parseJson(await readText(join(dir, ".claude.json")))?.oauthAccount as { accountUuid?: unknown } | undefined;
-  return nonEmpty(account?.accountUuid) ? account.accountUuid : undefined;
-}
-
-/** How fresh a login is (larger is fresher), or undefined: claude its access token expiry, codex its last refresh. */
-export function loginFreshness(tool: MemberStoreTool, text: string): number | undefined {
-  if (tool === "codex") {
-    const at = codexRecency(parseCodexAuth(text));
-    return at > 0 ? at : undefined;
-  }
-  const expiresAt = (parseJson(text)?.claudeAiOauth as { expiresAt?: unknown } | undefined)?.expiresAt;
-  return typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined;
+  return loginAccount(tool, loginText, tool === "claude" ? await readText(join(dir, ".claude.json")) : undefined);
 }
 
 interface StorePlan {
@@ -283,12 +272,6 @@ async function sessionsProblem(tool: MemberStoreTool, dir: string, opts: RouteAl
 
 /* ------------------------------------------------------------------ other holders of the login */
 
-/** The refresh token of a claude or codex login file text, or undefined. */
-function refreshOf(tool: MemberStoreTool, text: string | undefined): string | undefined {
-  const json = parseJson(text);
-  const rt = tool === "claude" ? (json?.claudeAiOauth as { refreshToken?: unknown } | undefined)?.refreshToken : (json?.tokens as { refresh_token?: unknown } | undefined)?.refresh_token;
-  return nonEmpty(rt) ? rt : undefined;
-}
 
 /** pi's auth.json provider that holds its copy of each tool's login (oauth-reconcile.ts pairs them by identity name). */
 const PI_PROVIDER_OF: Record<MemberStoreTool, string> = { claude: "anthropic", codex: "openai-codex" };
@@ -425,13 +408,16 @@ async function claudeRouted(dir: string, token: string, base: string): Promise<{
   };
 }
 
-async function applyClaude(dir: string, token: string, base: string, now: () => number): Promise<string[]> {
+/** The claude gateway entry text with the routing record (see gateway-routed.ts). */
+const claudeEntryText = async (dir: string, token: string, routing: GatewayRouting): Promise<string> => withRouting(gatewayEntryText(token, await gatewayEntryScopesFor(dir)), routing);
+
+async function applyClaude(dir: string, token: string, base: string, routing: GatewayRouting, now: () => number): Promise<string[]> {
   const notes: string[] = [];
   const state = await claudeRouted(dir, token, base);
   if (!state.entry) {
     const b = await backupUnique(join(dir, ".credentials.json"), now);
     if (b) notes.push(`login backed up to ${b}`);
-    await writeGatewayEntry(dir, token);
+    await writeFileAtomic(join(dir, ".credentials.json"), await claudeEntryText(dir, token, routing));
   }
   if (!state.settings || !state.helper) {
     const path = join(dir, "settings.json");
@@ -489,16 +475,16 @@ export function routeCodexConfigText(text: string, base: string, helper: string)
   return result;
 }
 
-const codexEntryText = (token: string): string => `${JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: token })}\n`;
+const codexEntryText = (token: string, routing: GatewayRouting): string => withRouting(`${JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: token })}\n`, routing);
 
-async function applyCodex(dir: string, token: string, base: string, helper: string, now: () => number): Promise<string[]> {
+async function applyCodex(dir: string, token: string, base: string, helper: string, routing: GatewayRouting, now: () => number): Promise<string[]> {
   const notes: string[] = [];
   const authPath = join(dir, "auth.json");
   const auth = parseJson(await readText(authPath));
   if (!(auth?.OPENAI_API_KEY === token && auth.tokens === undefined)) {
     const b = await backupUnique(authPath, now);
     if (b) notes.push(`login backed up to ${b}`);
-    await writeFileAtomic(authPath, codexEntryText(token));
+    await writeFileAtomic(authPath, codexEntryText(token, routing));
   }
   const cfgPath = join(dir, "config.toml");
   const cfg = await readText(cfgPath);
@@ -548,6 +534,21 @@ interface ToolContext {
   pools: Identity[];
   /** Live pi identities (pools included): pi keeps its own copy of each identity's claude and codex login. */
   piIdentities: Identity[];
+  /** This host's name, for the routing record. */
+  host: string;
+}
+
+/**
+ * The routing record written into the gateway entry: fingerprints and freshness of the folder's login (when it holds one)
+ * and of the member store copy, so another host can tell its copy of this login from a later sign-in there.
+ */
+async function routingNow(identity: Identity, ctx: ToolContext, localText: string | undefined): Promise<GatewayRouting> {
+  const { tool, root } = ctx;
+  const storeDir = memberDir(tool, identity.name, root);
+  const storeText = await readText(join(storeDir, memberLoginFile(tool)));
+  const folderLogin = classifyLogin(tool, localText) === "login" ? localText : undefined;
+  const account = (folderLogin && (await accountOf(tool, identity.configDir, folderLogin))) || (storeText && (await accountOf(tool, storeDir, storeText))) || undefined;
+  return routingFor(tool, [folderLogin, storeText], account, ctx.host, ctx.now());
 }
 
 async function routeOne(identity: Identity, ctx: ToolContext): Promise<RouteLine> {
@@ -628,7 +629,8 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
       // Nothing local changes unless the store demonstrably holds a usable login now.
       if (!hasMemberCopy(tool, identity.name, root)) throw Object.assign(new Error("the member store copy could not be confirmed after writing it"), { code: "EVERIFY" });
       if (tool === "codex") await ensureCodexHelper(helper);
-      notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, now) : await applyCodex(dir, token, base, helper, now)));
+      const routing = await routingNow(identity, ctx, localText);
+      notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, routing, now) : await applyCodex(dir, token, base, helper, routing, now)));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.name : "error");
       if (nowKind !== "login") return `failed while completing the gateway entry (${code}); the member store still holds the login`;
@@ -658,15 +660,23 @@ async function alreadyRouted(identity: Identity, ctx: ToolContext): Promise<Rout
     notes.push(`but ${holders.refused}`);
     return done(true);
   }
-  if (holders.piRemovals.length === 0) return done(false);
+  // An entry written before the routing record existed gets one, so other hosts can tell a fresh sign-in from this login.
+  const needsRecord = hasMemberCopy(tool, identity.name, root) && routingOf(await readText(loginPath)) === undefined;
+  if (holders.piRemovals.length === 0 && !needsRecord) return done(false);
   if (opts.dryRun) {
+    if (needsRecord) notes.push("the gateway entry would get its routing record");
     notes.push(...holders.piRemovals.map((r) => `pi identity ${r.name}'s ${r.provider} entry would be removed (backed up)`));
     return done(false);
   }
   const problem = await withOauthRefreshLocks([identity.configDir, memberDir(tool, identity.name, root)], async () => {
-    const again = await holdersProblem(identity, ctx, await readText(loginPath));
+    const entryText = await readText(loginPath);
+    const again = await holdersProblem(identity, ctx, entryText);
     if (again.refused) return again.refused;
     for (const r of again.piRemovals) notes.push(await removePiCopy(r, now));
+    if (needsRecord && entryText !== undefined && routingOf(entryText) === undefined && classifyLogin(tool, entryText) === "gateway") {
+      await writeFileAtomic(loginPath, withRouting(entryText, await routingNow(identity, ctx, undefined)));
+      notes.push("added the routing record to the gateway entry");
+    }
     return undefined;
   });
   if (problem) notes.push(`but ${problem}`);
@@ -713,7 +723,7 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
       for (const member of pool.swapPool?.accounts ?? []) poolsOf.set(member, [...(poolsOf.get(member) ?? []), pool.name]);
     }
     const pools = accounts.filter((a) => a.swapPool);
-    const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts) };
+    const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname() };
     for (const identity of accounts) {
       try {
         lines.push(await routeOne(identity, ctx));
@@ -744,7 +754,8 @@ export function syncWarning(report: RouteReport): string[] {
   return [
     `WARNING: AIS sync copies the folders of ${touched.join(", ")} to ${report.syncRemotes.join(", ")}.`,
     `  Before routing, stop every Claude Code, Codex and pi session of these identities on ${report.syncRemotes.length === 1 ? "that host" : "those hosts"}: this run cannot see them, and one that keeps the old login in memory spends the gateway's refresh token at its next refresh (refresh_token_reused).`,
-    "  The next sync gives their folders the gateway entry, strips pi's copy there, and never copies their login back here; every synced host must run an AIS build with this sync guard.",
+    "  The next sync gives their folders the gateway entry (their copy of the login is backed up under ~/.ais/gateway-replaced), strips pi's copy there, and never copies their login back here; every synced host must run an AIS build with this sync guard.",
+    `  These identities then STOP WORKING on ${report.syncRemotes.length === 1 ? "that host" : "those hosts"}: the gateway there has no copy of the login. To use one there again, sign in again on that host (/login, codex login); sync keeps that new sign-in.`,
   ];
 }
 
