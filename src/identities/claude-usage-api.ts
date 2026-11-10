@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
+import { hasMemberCopy, memberDir, memberStoreEnabled } from "./gateway-members.ts";
 import { readProviderGrantCopy } from "./oauth-reconcile.ts";
 import { poolStoreDirsFor, refreshIdentityOAuthGrant, type FetchImpl } from "./oauth-refresh.ts";
 import type { ExtraUsageInfo, ManualResetInfo } from "../cli/limits/types.ts";
@@ -173,7 +174,11 @@ export async function freshLastGood(member: Identity, cacheDir: string, nowMs: n
  * active, the pool store), refreshed first when expired. */
 async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promise<{ token?: string; error?: string }> {
   const nowSeconds = Math.floor((deps.now?.() ?? Date.now()) / 1000);
-  const dirs = [member.configDir, ...(await poolStoreDirsFor(member, deps.claudeRegistryPath))];
+  // Routed through the gateway (its login moved into the gateway member store): read the store copy, never refresh it here
+  // (the gateway renews it; a refresh here would spend its single-use refresh token). The gateway process itself already
+  // reads the store through the registry (memberStoreEnabled).
+  const viaStore = !memberStoreEnabled() && hasMemberCopy("claude", member.name);
+  const dirs = [member.configDir, ...(viaStore ? [memberDir("claude", member.name)] : []), ...(await poolStoreDirsFor(member, deps.claudeRegistryPath))];
   const read = async () => {
     let best: { access_token: string; expires_at?: number } | undefined;
     for (const dir of dirs) {
@@ -188,6 +193,7 @@ async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promis
   if (!grant) return { error: "no Claude login stored for this account (a folder routed through the AIS gateway holds none)" };
   const expired = (g: { expires_at?: number }) => g.expires_at !== undefined && g.expires_at - EXPIRY_SKEW_SECONDS <= nowSeconds;
   if (expired(grant) && deps.noRefresh) return { error: "token expired; refresh is disabled for this poll" };
+  if (expired(grant) && viaStore) return { error: "the gateway member store copy of this login is expired; the AIS gateway renews it (is the gateway running?)" };
   if (expired(grant)) {
     // Not forced first: under the lock a fresher non-expired grant (rotated by someone else) is kept, not re-rotated.
     // If that skipped (lock busy, or the freshest copy was not a native store) and the stores are still expired, force.

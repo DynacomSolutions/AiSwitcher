@@ -43,6 +43,8 @@ export function classifyLogin(tool: MemberStoreTool, text: string | undefined): 
   }
   if (isGatewayAccessToken(json.OPENAI_API_KEY)) return "gateway";
   const tokens = json.tokens as { access_token?: unknown; refresh_token?: unknown } | undefined;
+  // `ais gateway codex-home` writes a placeholder ChatGPT login whose access token is the app token (codex-gateway-home.ts).
+  if (isGatewayAccessToken(tokens?.access_token)) return "gateway";
   return nonEmpty(tokens?.access_token) && nonEmpty(tokens?.refresh_token) ? "login" : "none";
 }
 
@@ -51,7 +53,8 @@ export function isPureGatewayEntry(tool: MemberStoreTool, text: string | undefin
   if (classifyLogin(tool, text) !== "gateway") return false;
   const json = parseObject(text)!;
   const refresh = tool === "claude" ? (json.claudeAiOauth as { refreshToken?: unknown } | undefined)?.refreshToken : (json.tokens as { refresh_token?: unknown } | undefined)?.refresh_token;
-  return !nonEmpty(refresh);
+  // The codex placeholder login carries the literal refresh token "none" (codex-gateway-home.ts): no login.
+  return !nonEmpty(refresh) || (tool === "codex" && refresh === "none");
 }
 
 /** True when a plain identity's own folder holds the pure gateway entry (see the module comment). Swap pools never count. */

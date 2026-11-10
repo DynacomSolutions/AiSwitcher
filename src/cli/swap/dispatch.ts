@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { MemberUsage } from "../../identities/claude-usage-api.ts";
 import type { SwapReason, SwapResult } from "../../identities/pool/adapter.ts";
+import { isGatewayRoutedPool } from "../../identities/pool/gateway-pool.ts";
 import { eventsForPool, readSwapEvents } from "../../identities/pool/ledger.ts";
 import { poolStatus, swapIfLimited, swapToNext, type MemberRow, type PoolOpsDeps } from "../../identities/pool/ops.ts";
 import { adapterFor } from "../../identities/pool/registry.ts";
@@ -205,12 +206,14 @@ export async function runSwapCommand(tool: string, positionals: string[], flags:
 
       case "status": {
         const status = await poolStatus(adapter, opsDeps, rest[0] ?? scopedPool, { usage: !boolFlag(flags, "no-usage") });
+        const routed = await isGatewayRoutedPool(tool, status.pool.configDir);
         if (json) {
           const events = eventsForPool(await readSwapEvents(deps.ledgerPath ?? aisSwapLedgerPath(tool)), status.pool);
           const lastSwapAt = events.at(-1)?.ts;
-          return log(JSON.stringify({ pool: status.pool.name, active: status.pool.swapPool.active ?? null, ...(lastSwapAt ? { lastSwapAt } : {}), auto: status.pool.swapPool.auto === true, thresholdPercent: status.thresholdPercent, accounts: status.rows }, null, 2));
+          return log(JSON.stringify({ pool: status.pool.name, active: status.pool.swapPool.active ?? null, ...(lastSwapAt ? { lastSwapAt } : {}), auto: status.pool.swapPool.auto === true, thresholdPercent: status.thresholdPercent, ...(routed ? { gatewayRouted: true } : {}), accounts: status.rows }, null, 2));
         }
         for (const line of (tool === "claude" ? renderStatus : renderWindowStatus)(status.pool.name, status.pool.swapPool.auto === true, status.thresholdPercent, status.rows as MemberRow<MemberUsage>[])) log(line);
+        if (routed) log(dim("  routed through the AIS gateway: the gateway picks the member per request (* is the recorded active member; usage is read from the gateway's member logins)"));
         return;
       }
 

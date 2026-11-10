@@ -10,6 +10,7 @@ import { CODEX_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
 import type { PoolAdapter, PoolUsage, SwapResult, WriteBackOutcome } from "./adapter.ts";
 import { writeFileAtomic } from "./fs.ts";
+import { ensureCodexPoolEntry, gatewayMemberRefusal, gatewaySelectsNote, isCodexGatewayAuth, isCodexGatewayPoolDir, isGatewayMember } from "./gateway-pool.ts";
 import { writeBackup } from "./grant-file-adapter.ts";
 import type { LockOptions } from "./lock.ts";
 import { SwapPoolError, type PoolIdentity } from "./swap-pool.ts";
@@ -38,9 +39,11 @@ export type CodexMemberUsage = PoolUsage;
 const sleep = (ms: number) => new Promise<void>((resolveSleep) => setTimeout(resolveSleep, ms));
 const json = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 
-/** Why an identity cannot be a Codex pool member, or undefined (ChatGPT login only). */
+/** Why an identity cannot be a Codex pool member, or undefined (ChatGPT login only, or one the AIS gateway holds). */
 export function codexMemberProblem(member: Identity): string | undefined {
   if (isBedrockIdentity(member)) return `"${member.name}" is a Bedrock identity (pools need ChatGPT logins)`;
+  // Routed through the gateway: its ChatGPT login lives in the gateway member store; a routed pool uses it from there.
+  if (isGatewayMember("codex", member)) return undefined;
   const auth = parseCodexAuth(readSyncOrUndefined(codexAuthPath(member.configDir)));
   if (!hasCodexTokens(auth)) return `"${member.name}" has no ChatGPT login (API-key or logged-out; run "codex login" under that identity)`;
   // Same rule as heal: a member must carry tokens.account_id (agreeing with its JWT), never a JWT-only id.
@@ -89,9 +92,30 @@ async function writeBackToOwner(owner: Identity, poolAuth: CodexAuthFile, lock?:
 /** The member tier of a held set: everything except the pool dir, which is locked first on its own. */
 const memberDirs = (held: Set<string>, poolDir: string): string[] => [...held].filter((d) => d !== resolve(poolDir));
 
+/**
+ * Swap for a gateway-routed pool: the pool folder keeps the gateway entry (restored when something replaced it) and the
+ * swap only records the active member; the gateway picks the member per request (see gateway-pool.ts).
+ */
+async function swapRouted(input: Parameters<PoolAdapter["swapCredentials"]>[0]): Promise<Omit<SwapResult, "reason">> {
+  const { pool, target, lock } = input;
+  return withOauthRefreshLock(pool.configDir, async () => {
+    const activeName = pool.swapPool.active ?? null;
+    let r;
+    try {
+      r = await ensureCodexPoolEntry(pool, "swap", { backup: writeBackup });
+    } catch (err) {
+      throw new SwapPoolError(err instanceof Error ? err.message : String(err));
+    }
+    return { pool: pool.name, from: activeName, to: target.name, noop: !r.changed && activeName === target.name, writeBack: "none-identical" as const, notes: [...r.notes, gatewaySelectsNote(pool.name)] };
+  }, lock);
+}
+
 async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>[0]): Promise<Omit<SwapResult, "reason">> {
   const { pool, members, target, lock } = input;
   const poolDir = pool.configDir;
+  if (isCodexGatewayPoolDir(poolDir)) return swapRouted(input);
+  // A plain pool never takes a routed member: its login is the gateway's, and the folder holds only the gateway entry.
+  if (isGatewayMember("codex", target)) throw new SwapPoolError(gatewayMemberRefusal("codex", target.name, pool.name));
   const poolPath = codexAuthPath(poolDir);
   const notes: string[] = [];
 
@@ -181,6 +205,8 @@ async function swapCredentials(input: Parameters<PoolAdapter["swapCredentials"]>
  * Caller holds the pool lock. Returns human notes for what it did.
  */
 async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions): Promise<string[]> {
+  // A routed pool holds the gateway entry: never restore a member's login over it, only put the entry back.
+  if (isCodexGatewayPoolDir(pool.configDir)) return healRouted(pool, lock);
   const activeName = pool.swapPool.active;
   const active = members.find((m) => m.name === activeName);
   if (!activeName || !active) return [];
@@ -263,6 +289,18 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
   }
 }
 
+/** Heal for a gateway-routed pool: the gateway entry back in place when something replaced it (see ensureCodexPoolEntry). */
+async function healRouted(pool: PoolIdentity, lock?: LockOptions): Promise<string[]> {
+  // A writer may be mid-truncate: decide on a second read.
+  if (isCodexGatewayAuth(await readCodexAuthText(pool.configDir))) return [];
+  await sleep(codexTuning.healRetryMs);
+  try {
+    return await withOauthRefreshLock(pool.configDir, async () => (await ensureCodexPoolEntry(pool, "heal", { backup: writeBackup })).notes, lock);
+  } catch (err) {
+    return [`cannot heal ${pool.name}: ${err instanceof Error ? err.message : String(err)}`];
+  }
+}
+
 /** Running codex processes (owned by this user) whose CODEX_HOME is `configDir`. Linux /proc only; best effort. */
 export async function countCodexSessions(configDir: string, procRoot = "/proc"): Promise<number> {
   return (await liveSessionPids("codex", configDir, { procRoot })).length;
@@ -273,7 +311,11 @@ export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
   config: CODEX_CONFIG,
   liveSwap: false,
   memberProblem: codexMemberProblem,
-  hasCredentials: (configDir) => hasCodexTokens(parseCodexAuth(readSyncOrUndefined(codexAuthPath(configDir)))),
+  // The gateway entry of a routed pool counts: the launch check must not bootstrap a member login over it.
+  hasCredentials: (configDir) => {
+    const text = readSyncOrUndefined(codexAuthPath(configDir));
+    return hasCodexTokens(parseCodexAuth(text)) || isCodexGatewayAuth(text);
+  },
   swapCredentials,
   heal,
   fetchUsage: async (member, deps) => {
@@ -298,6 +340,8 @@ export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
     }
   },
   notifySwapped: async (pool, from, to) => {
+    // Sessions of a routed pool go through the gateway, which picks the member per request: nothing to relaunch.
+    if (isCodexGatewayPoolDir(pool.configDir)) return {};
     const sessions = await countCodexSessions(pool.configDir);
     if (sessions > 0) console.error(`codex-swap: account swapped to ${to}${from ? ` (from ${from})` : ""}; relaunch or "codex resume" in ${sessions} running session${sessions === 1 ? "" : "s"}`);
     return { sessions };

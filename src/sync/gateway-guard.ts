@@ -50,6 +50,8 @@ export interface GuardedLogin {
   tool: MemberStoreTool;
   name: string;
   dir: string;
+  /** A swap pool folder: it never holds a login of its own, and once routed only the gateway entry belongs there. */
+  pool?: boolean;
 }
 
 export interface GuardedPiFile {
@@ -62,7 +64,7 @@ export interface GatewayGuard {
   memberRoot: string;
   /** This host's name, compared with the routing record's host. */
   host: string;
-  /** Home-relative login file of every plain claude/codex identity. */
+  /** Home-relative login file of every claude/codex identity (swap pool folders marked `pool`). */
   native: Map<string, GuardedLogin>;
   /** Home-relative auth.json of every plain pi identity. */
   pi: Map<string, GuardedPiFile>;
@@ -89,8 +91,14 @@ export async function loadGatewayGuard(home: string = homedir(), registries: Par
       continue;
     }
     for (const identity of identities) {
-      if (identity.swapPool) continue;
+      if (identity.swapPool && tool === "pi") continue;
       const dir = rerooted(expandPath(identity.configDir), home);
+      if (identity.swapPool) {
+        // A routed pool folder keeps its gateway entry (planCredentialMerge); other pool files merge as before.
+        const rel = relativeTo(home, join(dir, memberLoginFile(tool as MemberStoreTool)));
+        if (rel) guard.native.set(rel, { tool: tool as MemberStoreTool, name: identity.name, dir, pool: true });
+        continue;
+      }
       if (tool === "pi") {
         const path = join(dir, "auth.json");
         const rel = relativeTo(home, path);
@@ -112,13 +120,14 @@ const readSync = (path: string): string | undefined => {
   }
 };
 
-/** True when this host holds the gateway member store copy of the identity's login. */
-export const memberHere = (guard: GatewayGuard, login: GuardedLogin): boolean => hasMemberCopy(login.tool, login.name, guard.memberRoot);
+/** True when this host holds the gateway member store copy of the identity's login (never for a pool folder). */
+export const memberHere = (guard: GatewayGuard, login: GuardedLogin): boolean => !login.pool && hasMemberCopy(login.tool, login.name, guard.memberRoot);
 
 /** Names of the identities routed on this host right now (a member store copy, or the folder holds the gateway entry). */
 export function routedNow(guard: GatewayGuard): Record<MemberStoreTool, Set<string>> {
   const routed: Record<MemberStoreTool, Set<string>> = { claude: new Set(), codex: new Set() };
   for (const login of guard.native.values()) {
+    if (login.pool) continue;
     if (memberHere(guard, login) || isPureGatewayEntry(login.tool, readSync(join(login.dir, memberLoginFile(login.tool))))) routed[login.tool].add(login.name);
   }
   return routed;
@@ -140,6 +149,7 @@ export type CredentialReason =
   | "kept-unknown-login" // this host's login cannot be told apart from the routed one: kept
   | "kept-routing-host" // this host routed the identity and un-routed it since: its login stays
   | "kept-entry" // a real login never replaces the entry unless provably separate
+  | "kept-pool-entry" // a routed swap pool folder keeps its gateway entry: no member login goes there (log)
   | "login-replaces-entry"; // a separate login (fresh sign-in, or the un-routed login) replaces the entry (log)
 
 export interface CredentialPlan {
@@ -151,6 +161,8 @@ export interface CredentialPlan {
 
 export interface CredentialContext {
   memberHere: boolean;
+  /** The file is a swap pool folder's login file. */
+  pool?: boolean;
   /** This host's name (default os.hostname()). */
   host?: string;
   /** claude: the identity folder's `.claude.json` text (its account uuid); codex reads the account from the token. */
@@ -162,6 +174,11 @@ export function planCredentialMerge(tool: MemberStoreTool, localText: string | u
   if (ctx.memberHere) return { action: "keep-local", reason: "member-here" };
   const local = classifyLogin(tool, localText);
   const incoming = classifyLogin(tool, incomingText);
+  if (ctx.pool) {
+    // The gateway picks a routed pool's member; a member login arriving over the entry would be refreshed by the pool's
+    // sessions. Anything else about a pool file (both logins, both entries, an entry arriving) merges as before.
+    return local === "gateway" && incoming !== "gateway" ? { action: "keep-local", reason: "kept-pool-entry" } : { action: "merge", reason: "plain" };
+  }
   if (local === "gateway" && incoming !== "gateway") {
     const routing = routingOf(localText);
     if (incoming === "login" && routing && relateToRouting(tool, incomingText, loginAccount(tool, incomingText, ctx.claudeJsonText), routing) === "separate") {
@@ -189,6 +206,7 @@ export const decideCredentialMerge = (tool: MemberStoreTool, localText: string |
 export async function credentialContext(guard: GatewayGuard, login: GuardedLogin): Promise<CredentialContext> {
   return {
     memberHere: memberHere(guard, login),
+    ...(login.pool ? { pool: true } : {}),
     host: guard.host,
     ...(login.tool === "claude" ? { claudeJsonText: await readFile(join(login.dir, ".claude.json"), "utf8").catch(() => undefined) } : {}),
   };
@@ -227,6 +245,8 @@ export function credentialPlanLine(login: GuardedLogin, plan: CredentialPlan, ba
       return `${who}: kept this host's login: it cannot be told apart from the login routed${by} (the entry has no routing record, or the login is undatable); re-run ais identities route-all-via-gateway on the routing host to add the record`;
     case "kept-routing-host":
       return `${who}: kept this host's login: this host routed the identity and holds no gateway member copy any more (un-routed); the arriving gateway entry was not applied`;
+    case "kept-pool-entry":
+      return `${login.tool} swap pool ${login.name}: kept its gateway entry; the arriving login was not applied (the gateway picks the pool's member)`;
     case "login-replaces-entry":
       return `${who}: a login made after the routing${by} (a fresh sign-in, or the login restored on the routing host) replaced the gateway entry`;
     default:

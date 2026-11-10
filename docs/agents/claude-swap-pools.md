@@ -291,3 +291,10 @@ as the empty string, and OAuth storage/key metadata is kept because it is a
 pointer, not a secret. `runWrapper`'s beforeLaunch callback gained a second
 argument (the ResolvedIdentity); existing one-argument callbacks are
 unaffected.
+
+### Gateway-routed pools (task 4.168)
+
+A pool whose folder routes through the AIS gateway (claude and codex) never holds a member login: swap records the active
+member only, heal keeps the gateway entry, a plain pool refuses a gateway-routed member, and member usage comes from the
+gateway member store. Rules and reasons: docs/agents/gateway.md, "Swap pools with routed members"
+(`src/identities/pool/gateway-pool.ts`).

@@ -349,6 +349,16 @@ async function mergeGuardedLogin(login: GuardedLogin, source: string, destinatio
   }
 }
 
+/** True (and logged) when a routed swap pool folder keeps its gateway entry over the arriving file (gateway-guard.ts). */
+async function keepsPoolEntry(login: GuardedLogin, source: string, destination: string, guard: GatewayGuard): Promise<boolean> {
+  const [localText, incomingText] = await Promise.all([readFile(destination, "utf8").catch(() => undefined), readFile(source, "utf8").catch(() => undefined)]);
+  const plan = planCredentialMerge(login.tool, localText, incomingText, await credentialContext(guard, login));
+  if (plan.action !== "keep-local") return false;
+  const line = credentialPlanLine(login, plan);
+  if (line) console.warn(`AIS sync: ${line}`);
+  return true;
+}
+
 /** Drops pi's copy of routed logins from a staged pi auth.json (the staged copy is ours), keeping its mtime for the merge. */
 async function stripStagedPiCopy(source: string, providers: string[]): Promise<void> {
   const stripped = withoutProviders(await readFile(source, "utf8").catch(() => undefined), providers);
@@ -838,10 +848,12 @@ export async function mergeIncomingProfileTree(
     const destination = join(home, rel);
 
     const login = guard.native.get(rel);
-    if (login) {
+    if (login && !login.pool) {
       await mergeGuardedLogin(login, source, destination, rel, guard, result);
       continue;
     }
+    // A routed swap pool keeps its gateway entry; any other pool file merges like an ordinary file below.
+    if (login?.pool && (await keepsPoolEntry(login, source, destination, guard))) continue;
     const piFile = guard.pi.get(rel);
     if (piFile) await stripStagedPiCopy(source, routedProviders(routedAtStart, piFile.name));
 

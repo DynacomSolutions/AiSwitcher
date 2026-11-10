@@ -5,6 +5,7 @@ import { parse as parseToml } from "smol-toml";
 import { LOCAL_GATEWAY_ROUTES } from "../../gateway/local-routes.ts";
 import { GATEWAY_TOKEN_PREFIX, gatewayEntryScopesFor, gatewayEntryText, isGatewayAccessToken } from "../../identities/claude-gateway-entry.ts";
 import { withOauthRefreshLock, withOauthRefreshLocks } from "../../identities/claude-swap-lock.ts";
+import { withPoolLock } from "../../identities/pool/lock.ts";
 import { HEARTBEAT_FRESH_MS, readHeartbeat, type GatewayHeartbeat } from "../../identities/gateway-heartbeat.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, memberStoreRoot, type MemberStoreTool } from "../../identities/gateway-members.ts";
 import { backupUnique, classifyLogin, loginAccount, loginFreshness, refreshOf, routingFor, routingOf, withRouting, type GatewayRouting } from "../../identities/gateway-routed.ts";
@@ -31,7 +32,8 @@ export { backupUnique, classifyLogin, loginFreshness };
  *      in memory and later refreshes it with the single-use refresh token the gateway now renews, which kills the gateway's
  *      copy (`refresh_token_reused`); Codex also writes that login back over the gateway entry. A session scan that cannot
  *      run (no readable /proc) refuses. No other holder may keep the login (holdersProblem): a swap pool folder holding it
- *      (active member, same refresh token or account) refuses; pi's copy in the same-named pi identity is removed after a
+ *      (active member, same refresh token or account) refuses unless the pool is routed (or is routed by this run, see
+ *      below); pi's copy in the same-named pi identity is removed after a
  *      backup (refused while any pi session runs, or when pi's copy may be the fresher one). Checked before and again
  *      under the locks, and sessions are scanned once more after the switch (reported as a warning, exit code 1);
  *   3. pi's copy is removed first; then the login moves into the gateway's own member store (gateway-members.ts), so the
@@ -46,10 +48,16 @@ export { backupUnique, classifyLogin, loginFreshness };
  * Refused and reported, nothing written: a tool with no local gateway route (grok, kimi, pi today) or no key, an account the
  * gateway does not hold, a folder with running sessions (or no way to check), a login a swap pool or another pi identity
  * still holds, a pi copy that may be fresher, a folder whose login is a different account than its store copy,
- * a folder with no refreshable login, a swap pool folder that is not routed yet (a pool folder holds a copy of a member's
- * login, and this command never writes one), and any file that is a symlink. A swap pool swaps by copying a member's login
- * out of the member's folder, so once its members are routed the pool's swaps no longer get a working login (codex: "no
- * usable Codex login") until the pool is routed with its own setup; the report says so for each routed pool member.
+ * a folder with no refreshable login, and any file that is a symlink.
+ *
+ * Swap pool folders are routed first (routePool), so their members are no longer held by them: a routed pool folder holds
+ * the gateway entry, the gateway picks its member per request, and `ais swap` only records the active member
+ * (pool/gateway-pool.ts). Same checks as a member: the gateway must hold at least one of the pool's members, no running
+ * session may use the pool folder, no symlinked file. A login in the pool folder is a copy of a member's login (sessions in
+ * the pool may have refreshed it): under the pool lock and the refresh locks of the pool folder and its owner, it is
+ * written back to the owning member (its member store copy when the gateway holds it, else its folder) when it is provably
+ * fresher, then the folder file is backed up and replaced by the gateway entry. A pool login that matches no member is
+ * only backed up. A member whose pool is still not routed is reported with a warning (that pool's swaps cannot use it).
  * Re-running changes nothing in an identity already routed, but its other holders are checked again: a swap pool or pi copy
  * is reported (exit code 1), and pi's same-named copy is removed as on a first run.
  *
@@ -313,6 +321,7 @@ async function holdersProblem(identity: Identity, ctx: ToolContext, localText: s
   const account = localKind === "login" ? await accountOf(tool, identity.configDir, localText!) : storeText ? await accountOf(tool, memberDir(tool, identity.name, root), storeText) : undefined;
 
   for (const pool of ctx.pools) {
+    if (ctx.routedPools.has(pool.name) && ctx.opts.dryRun) continue; // this dry run routes the pool first
     const poolText = await readText(join(pool.configDir, memberLoginFile(tool)));
     if (classifyLogin(tool, poolText) !== "login") continue; // gateway-routed or empty: holds no login
     const poolRt = refreshOf(tool, poolText);
@@ -536,6 +545,10 @@ interface ToolContext {
   piIdentities: Identity[];
   /** This host's name, for the routing record. */
   host: string;
+  /** Pools routed, already routed or (dry run) about to be routed by this run: they hold no member login. */
+  routedPools: Set<string>;
+  /** Live members of each pool, by pool name. */
+  membersOf: Map<string, Identity[]>;
 }
 
 /**
@@ -559,9 +572,11 @@ async function routeOne(identity: Identity, ctx: ToolContext): Promise<RouteLine
     if (!(err instanceof PiChanged)) throw err;
     line = { tool: ctx.tool, identity: identity.name, status: "refused", detail: err.message };
   }
-  const pools = ctx.poolsOf.get(identity.name);
-  if (!pools || (line.status !== "routed" && line.status !== "would-route" && line.status !== "already-routed")) return line;
-  const warn = `member of swap pool ${pools.join(", ")}: the pool swaps by copying this folder's login, which is now the gateway entry, so swaps to it no longer get a working login (codex: "no usable Codex login") until the pool is routed with its own setup`;
+  if (identity.swapPool) return line;
+  // A routed pool holds no login (the gateway picks its member): only a pool left unrouted is worth a word.
+  const unrouted = (ctx.poolsOf.get(identity.name) ?? []).filter((p) => !ctx.routedPools.has(p));
+  if (unrouted.length === 0 || (line.status !== "routed" && line.status !== "would-route" && line.status !== "already-routed")) return line;
+  const warn = `member of swap pool ${unrouted.join(", ")}, which is not routed: that pool cannot swap to it (its login is the gateway's now) until the pool is routed too (fix what this report says about the pool, then run this again)`;
   return { ...line, detail: line.detail ? `${line.detail}; ${warn}` : warn };
 }
 
@@ -569,13 +584,8 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   const { tool, token, base, helper, root, opts, now } = ctx;
   const line = { tool, identity: identity.name };
   const dir = identity.configDir;
-  if (await isRoutedAlready(tool, dir, token, base, helper)) {
-    if (identity.swapPool) return { ...line, status: "already-routed" };
-    return alreadyRouted(identity, ctx);
-  }
-  if (identity.swapPool) {
-    return { ...line, status: "refused", detail: "swap pool folder: it holds a copy of a member's login and this command never writes one; once its members are routed, swaps to them no longer get a working login (codex: \"no usable Codex login\") until the pool is routed with its own setup" };
-  }
+  if (identity.swapPool) return routePool(identity, ctx);
+  if (await isRoutedAlready(tool, dir, token, base, helper)) return alreadyRouted(identity, ctx);
   for (const f of FILES_OF[tool]) {
     if (await isSymlink(join(dir, f))) return { ...line, status: "refused", detail: `${f} is a symlink (shared with other folders?); not written through` };
   }
@@ -643,6 +653,148 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   const late = await lateSessions(tool, dir, removedPi, opts);
   if (late) notes.push(late);
   return { ...line, status: "routed", ...(late ? { attention: true } : {}), ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) };
+}
+
+/* ------------------------------------------------------------------ swap pool folders */
+
+/** What happens to the login found in a pool folder (see routePool). */
+interface PoolLoginPlan {
+  refused?: string;
+  /** The member whose login it is. */
+  owner?: Identity;
+  /** Write the pool's login back over the owner's copy (it is provably fresher): the store copy, or the owner's folder. */
+  writeBack?: { path: string; where: "store" | "folder" };
+  note?: string;
+}
+
+/** The owner's copy a pool login is compared with: the member store copy when the gateway holds the member, else its folder's login. */
+async function ownerCopy(tool: MemberStoreTool, member: Identity, root: string): Promise<{ path: string; text: string | undefined; dir: string; where: "store" | "folder" } | undefined> {
+  if (hasMemberCopy(tool, member.name, root)) {
+    const dir = memberDir(tool, member.name, root);
+    const path = join(dir, memberLoginFile(tool));
+    return { path, text: await readText(path), dir, where: "store" };
+  }
+  const path = join(member.configDir, memberLoginFile(tool));
+  const text = await readText(path);
+  return classifyLogin(tool, text) === "login" ? { path, text, dir: member.configDir, where: "folder" } : undefined;
+}
+
+/**
+ * Finds the member a pool folder's login belongs to (the same refresh token, else the same account; the active member is
+ * tried first) and whether the pool's copy must be written back first: it is when it is provably fresher than the owner's
+ * copy (a session in the pool refreshed it), since the owner's own refresh token is then spent.
+ */
+async function planPoolLogin(pool: Identity, ctx: ToolContext, poolText: string): Promise<PoolLoginPlan> {
+  const { tool, root } = ctx;
+  const members = [...(ctx.membersOf.get(pool.name) ?? [])].sort((a, b) => Number(b.name === pool.swapPool?.active) - Number(a.name === pool.swapPool?.active));
+  const poolRt = refreshOf(tool, poolText);
+  const poolAccount = await accountOf(tool, pool.configDir, poolText);
+  let owner: { member: Identity; copy: NonNullable<Awaited<ReturnType<typeof ownerCopy>>> } | undefined;
+  for (const pass of ["token", "account"] as const) {
+    for (const member of members) {
+      const copy = await ownerCopy(tool, member, root);
+      if (!copy || copy.text === undefined) continue;
+      const match = pass === "token" ? poolRt !== undefined && refreshOf(tool, copy.text) === poolRt : poolAccount !== undefined && (await accountOf(tool, copy.dir, copy.text)) === poolAccount;
+      if (match) {
+        owner = { member, copy };
+        break;
+      }
+    }
+    if (owner) break;
+  }
+  if (!owner) return { note: "the pool's login matches none of its members; kept only in its backup" };
+  const { member, copy } = owner;
+  if (poolRt !== undefined && refreshOf(tool, copy.text) === poolRt) return { owner: member };
+  const [poolFresh, ownerFresh] = [loginFreshness(tool, poolText), loginFreshness(tool, copy.text!)];
+  if (poolFresh === undefined || ownerFresh === undefined || poolFresh <= ownerFresh) return { owner: member, note: `the pool's copy of ${member.name}'s login is not fresher than ${copy.where === "store" ? "the member store copy" : "the member's own"}; kept that one` };
+  return { owner: member, writeBack: { path: copy.path, where: copy.where } };
+}
+
+/**
+ * Routes a swap pool folder (see the module comment): the gateway must hold one of its members, no session may run in it,
+ * then, under the pool lock and the refresh locks (pool folder first, then the owner's folder and store copy, as refresh
+ * and swap take them), a fresher pool login goes back to its owner and the folder gets the gateway entry.
+ */
+async function routePool(pool: Identity, ctx: ToolContext): Promise<RouteLine> {
+  const { tool, token, base, helper, root, opts, now } = ctx;
+  const line = { tool, identity: pool.name };
+  const dir = pool.configDir;
+  // A pool whose login file already holds a gateway entry is routed, in whichever form it was set up (this command's, or
+  // `ais gateway codex-home`'s placeholder login with chatgpt_base_url): never rewrite it into this command's form.
+  const loginFile = join(dir, memberLoginFile(tool));
+  if (await isRoutedAlready(tool, dir, token, base, helper) || classifyLogin(tool, await readText(loginFile)) === "gateway") {
+    ctx.routedPools.add(pool.name);
+    return { ...line, status: "already-routed" };
+  }
+  for (const f of FILES_OF[tool]) {
+    if (await isSymlink(join(dir, f))) return { ...line, status: "refused", detail: `${f} is a symlink (shared with other folders?); not written through` };
+  }
+  const members = ctx.membersOf.get(pool.name) ?? [];
+  const problems = members.map((m) => heldProblem(tool, m.name, ctx.hb, now()));
+  if (!problems.some((p) => p === undefined)) {
+    return { ...line, status: "refused", detail: `swap pool folder: the gateway holds none of its members (${members.length === 0 ? "the pool has no members" : `${members[0]!.name}: ${problems[0]}`}), so its sessions would get no account; nothing changed` };
+  }
+  const busy = await sessionsProblem(tool, dir, opts);
+  if (busy) return { ...line, status: "refused", detail: busy };
+  const loginPath = join(dir, memberLoginFile(tool));
+  const firstText = await readText(loginPath);
+  const firstPlan = classifyLogin(tool, firstText) === "login" ? await planPoolLogin(pool, ctx, firstText!) : {};
+  if (firstPlan.refused) return { ...line, status: "refused", detail: firstPlan.refused };
+  if (opts.dryRun) {
+    ctx.routedPools.add(pool.name);
+    const wb = firstPlan.writeBack ? `; its fresher login would go back to ${firstPlan.owner!.name} (${firstPlan.writeBack.where === "store" ? "member store copy" : "its folder"})` : "";
+    return { ...line, status: "would-route", detail: `swap pool folder would get the gateway entry (local files backed up); the gateway then picks its member${wb}${firstPlan.note ? `; ${firstPlan.note}` : ""}` };
+  }
+
+  const notes: string[] = [];
+  const ownerDirs = firstPlan.owner ? [firstPlan.owner.configDir, memberDir(tool, firstPlan.owner.name, root)] : [];
+  const outcome = await withPoolLock(dir, () =>
+    withOauthRefreshLock(dir, () =>
+      withOauthRefreshLocks(ownerDirs, async () => {
+        const busyNow = await sessionsProblem(tool, dir, opts);
+        if (busyNow) return busyNow;
+        const poolText = await readText(loginPath);
+        const kind = classifyLogin(tool, poolText);
+        const plan = kind === "login" ? await planPoolLogin(pool, ctx, poolText!) : {};
+        if (plan.refused) return plan.refused;
+        if (plan.owner && plan.owner.name !== firstPlan.owner?.name) return "the pool's login changed owner while this run waited for the locks; nothing changed, run this again";
+        // Restores the owner's old copy if the entry never made it into the pool folder: the pool then keeps the only copy
+        // of its fresher login, as before this run, instead of the pool and the owner both holding it.
+        let undoWriteBack: (() => Promise<void>) | undefined;
+        try {
+          if (plan.writeBack) {
+            const target = plan.writeBack.path;
+            const previous = await readText(target);
+            const b = await backupUnique(target, now);
+            await writeFileDurable(target, poolText!);
+            undoWriteBack = async () => {
+              if (previous !== undefined) await writeFileDurable(target, previous);
+            };
+            notes.push(`the pool's fresher copy of ${plan.owner!.name}'s login went back to ${plan.writeBack.where === "store" ? "the member store" : "its folder"} (old copy backed up to ${b})`);
+          }
+          if (plan.note) notes.push(plan.note);
+          if (tool === "codex") await ensureCodexHelper(helper);
+          const account = kind === "login" ? await accountOf(tool, dir, poolText!) : undefined;
+          const routing = routingFor(tool, [kind === "login" ? poolText : undefined], account, ctx.host, now());
+          notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, routing, now) : await applyCodex(dir, token, base, helper, routing, now)));
+        } catch (err) {
+          const entryIn = classifyLogin(tool, await readText(loginPath)) === "gateway";
+          if (undoWriteBack && !entryIn) {
+            await undoWriteBack().catch(() => undefined);
+            notes.push("the pool's login stayed in the pool; the owner's old copy was put back");
+          }
+          return `failed while routing the pool folder (${(err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.name : "error")}); ${notes.length > 0 ? `done so far: ${notes.join("; ")}` : "nothing changed"}`;
+        }
+        return undefined;
+      }),
+    ),
+  );
+  if (outcome) return { ...line, status: "refused", detail: outcome };
+  ctx.routedPools.add(pool.name);
+  notes.push("the gateway now picks this pool's member per request; ais swap records the active member only");
+  const late = await lateSessions(tool, dir, false, opts);
+  if (late) notes.push(late);
+  return { ...line, status: "routed", ...(late ? { attention: true } : {}), detail: notes.join("; ") };
 }
 
 /**
@@ -723,8 +875,10 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
       for (const member of pool.swapPool?.accounts ?? []) poolsOf.set(member, [...(poolsOf.get(member) ?? []), pool.name]);
     }
     const pools = accounts.filter((a) => a.swapPool);
-    const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname() };
-    for (const identity of accounts) {
+    const membersOf = new Map(pools.map((p) => [p.name, (p.swapPool?.accounts ?? []).map((n) => accounts.find((a) => a.name === n && !a.swapPool)).filter((a): a is Identity => a !== undefined)]));
+    const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname(), routedPools: new Set(), membersOf };
+    // Pools first: a routed pool no longer holds its members' logins, so they can be routed in the same run.
+    for (const identity of [...pools, ...accounts.filter((a) => !a.swapPool)]) {
       try {
         lines.push(await routeOne(identity, ctx));
       } catch (err) {
