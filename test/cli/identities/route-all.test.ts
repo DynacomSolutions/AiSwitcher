@@ -410,6 +410,26 @@ describe("route-all-via-gateway: routing", () => {
     expect(r.lines.find((l) => l.tool === "codex" && l.identity === "alpha")?.status).toBe("routed");
   });
 
+  test("a local-route pool folder made usage-capable by codex-home is already routed and not rewritten", async () => {
+    await registry("codex", ".codex", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
+    await writeFile(join(dirOf(".codex", "beta"), "auth.json"), codexLogin("beta"));
+    const pool = dirOf(".codex", "pool");
+    await writeFile(join(pool, "config.toml"), 'model_provider = "ais-gateway"\n\n[model_providers.ais-gateway]\nbase_url = "http://127.0.0.1:47140/codex"\nwire_api = "responses"\n');
+    await writeFile(join(pool, "auth.json"), `${JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: CODEX_KEY })}\n`);
+    const { configureCodexGatewayHome, codexGatewayHomeProblem } = await import("../../../src/identities/codex-gateway-home.ts");
+    expect(await configureCodexGatewayHome(pool, CODEX_KEY)).toEqual({ app: "agents-codex" });
+    expect(await codexGatewayHomeProblem(pool)).toBeUndefined();
+    const auth = await readFile(join(pool, "auth.json"), "utf8");
+    const config = await readFile(join(pool, "config.toml"), "utf8");
+    await heartbeat([...ALL, "codex/beta"]);
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex" && l.identity === "pool")?.status).toBe("already-routed");
+    expect(await readFile(join(pool, "auth.json"), "utf8")).toBe(auth);
+    expect(await readFile(join(pool, "config.toml"), "utf8")).toBe(config);
+    expect(JSON.parse(auth).tokens.account_id).toBe("ais-agents-codex");
+  });
+
   test("a pool whose members the gateway does not hold is refused and left as it was", async () => {
     await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
     await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));

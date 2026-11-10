@@ -116,3 +116,26 @@ describe("registry", () => {
     expect(await loadCodexGatewayHomes(join(dir, "none.json"))).toEqual([]);
   });
 });
+
+describe("local gateway route", () => {
+  const localConfig = (url: string) => `model_provider = "ais-gateway"\n\n[model_providers.ais-gateway]\nbase_url = "${url}"\n`;
+  test("a loopback base_url ending in a local route key maps to that route's app", () => {
+    expect(parseGatewayProvider(localConfig("http://127.0.0.1:47140/codex"))).toEqual({ base: "http://127.0.0.1:47140", app: "agents-codex", route: "codex" });
+    expect(parseGatewayProvider(localConfig("http://localhost:47140/codex/"))).toMatchObject({ app: "agents-codex", route: "codex" });
+  });
+  test("the cluster form keeps the last segment as the app, also for a route-like name on a non-loopback host", () => {
+    expect(parseGatewayProvider(localConfig("https://gw.example.com/gateway/codex"))).toEqual({ base: "https://gw.example.com/gateway", app: "codex" });
+    expect(parseGatewayProvider(localConfig("http://127.0.0.1:47140/codex/agents-codex"))).toEqual({ base: "http://127.0.0.1:47140/codex", app: "agents-codex" });
+  });
+  test("chatgpt_base_url stays under the route the local gateway serves", () => {
+    const out = transformCodexGatewayConfig(localConfig("http://127.0.0.1:47140/codex"), "http://127.0.0.1:47140", "agents-codex", "codex");
+    expect((parseToml(out) as Record<string, unknown>).chatgpt_base_url).toBe("http://127.0.0.1:47140/codex/backend-api");
+  });
+  test("configure and --check on a local-route folder use the agents-codex placeholder", async () => {
+    writeFileSync(join(dir, "config.toml"), localConfig("http://127.0.0.1:47140/codex"));
+    expect(await configureCodexGatewayHome(dir, TOKEN)).toEqual({ app: "agents-codex" });
+    expect(JSON.parse(readFileSync(join(dir, "auth.json"), "utf8")).tokens.account_id).toBe("ais-agents-codex");
+    expect(readFileSync(join(dir, "config.toml"), "utf8")).toContain('chatgpt_base_url = "http://127.0.0.1:47140/codex/backend-api"');
+    expect(await codexGatewayHomeProblem(dir)).toBeUndefined();
+  });
+});

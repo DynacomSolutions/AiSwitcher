@@ -294,6 +294,22 @@ describe("codex homes", () => {
     await run(`gateway codex-home ${home} --check`);
   });
 
+  test("codex-home on a local-route pool folder uses the agents-codex key and the local route", async () => {
+    writeFileSync(join(home, "config.toml"), 'model_provider = "ais-gateway"\n\n[model_providers.ais-gateway]\nbase_url = "http://127.0.0.1:47140/codex"\nwire_api = "responses"\n');
+    writeFileSync(join(home, "auth.json"), `${JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "aisg_SYNTHETIC_FIXTURE_old" })}\n`);
+    writeFileSync(secrets, `${readFileSync(secrets, "utf8")}AIS_GATEWAY_APP_AGENTS_CODEX_TOKEN=aisgw_AGENTS_SYNTHETIC_FIXTURE\n`);
+    await run(`gateway codex-home ${home} --check`).then(() => {
+      throw new Error("expected --check to fail before configuring");
+    }, () => undefined);
+    await run(`gateway codex-home ${home}`);
+    const auth = JSON.parse(readFileSync(join(home, "auth.json"), "utf8"));
+    expect(auth.tokens).toMatchObject({ access_token: "aisgw_AGENTS_SYNTHETIC_FIXTURE", account_id: "ais-agents-codex" });
+    expect(readFileSync(join(home, "config.toml"), "utf8")).toContain('chatgpt_base_url = "http://127.0.0.1:47140/codex/backend-api"');
+    expect(JSON.parse(readFileSync(join(dir, "codex-homes.json"), "utf8"))).toEqual([{ dir: home, app: "agents-codex" }]);
+    await run(`gateway codex-home ${home} --check`);
+    expect(out.join("\n")).not.toContain("AGENTS_SYNTHETIC");
+  });
+
   test("codex-home without a token in secrets is skipped and fails", async () => {
     writeFileSync(secrets, "OTHER=1\n");
     await expect(run(`gateway codex-home ${home}`)).rejects.toThrow(/not configured/);

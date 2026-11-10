@@ -2,6 +2,7 @@ import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { aisHome } from "../shared/ais-home.ts";
+import { LOCAL_GATEWAY_ROUTES } from "../gateway/local-routes.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
 
 /**
@@ -18,17 +19,35 @@ const PROVIDER_TABLE = `model_providers.${PROVIDER}`;
 
 const b64url = (text: string): string => Buffer.from(text, "utf8").toString("base64url");
 
-/** The gateway base and app name from the folder's `[model_providers.ais-gateway] base_url = "<base>/<app>"`. */
-export function parseGatewayProvider(configText: string): { base: string; app: string } {
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * The gateway base and app name from the folder's `[model_providers.ais-gateway] base_url = "<base>/<app>"`.
+ * A local-route base_url (loopback host, last segment a LOCAL_GATEWAY_ROUTES key, e.g. `http://127.0.0.1:47140/codex`)
+ * maps to that route's app (`agents-codex`) and reports the route segment, which stays the URL path the gateway serves.
+ * The cluster form `<gateway base>/<app>` has no `route`.
+ */
+export function parseGatewayProvider(configText: string): { base: string; app: string; route?: string } {
   const parsed = parseToml(configText) as { model_providers?: Record<string, { base_url?: unknown }> };
   const baseUrl = parsed.model_providers?.[PROVIDER]?.base_url;
   if (typeof baseUrl !== "string" || baseUrl === "") throw new Error(`config.toml has no [${PROVIDER_TABLE}] base_url`);
   const trimmed = baseUrl.replace(/\/+$/, "");
   const cut = trimmed.lastIndexOf("/");
-  const app = trimmed.slice(cut + 1);
+  const segment = trimmed.slice(cut + 1);
   const base = trimmed.slice(0, cut);
-  if (cut < 0 || app === "" || /^[a-z][a-z0-9+.-]*:$/i.test(base) || base.endsWith("/")) throw new Error(`base_url of [${PROVIDER_TABLE}] is not <gateway base>/<app>`);
-  return { base, app };
+  if (cut < 0 || segment === "" || /^[a-z][a-z0-9+.-]*:$/i.test(base) || base.endsWith("/")) throw new Error(`base_url of [${PROVIDER_TABLE}] is not <gateway base>/<app>`);
+  const local = Object.hasOwn(LOCAL_GATEWAY_ROUTES, segment) ? LOCAL_GATEWAY_ROUTES[segment] : undefined;
+  if (local && isLoopbackOrigin(base)) return { base, app: local.app, route: segment };
+  return { base, app: segment };
+}
+
+function isLoopbackOrigin(base: string): boolean {
+  try {
+    const u = new URL(base);
+    return (u.protocol === "http:" || u.protocol === "https:") && (u.pathname === "/" || u.pathname === "") && LOOPBACK_HOSTS.has(u.hostname);
+  } catch {
+    return false;
+  }
 }
 
 /** The placeholder ChatGPT login (auth.json text). The id_token carries a non-empty signature: codex 0.145 rejects an empty one. */
@@ -52,7 +71,7 @@ const tableName = (line: string): string | undefined => {
 };
 
 /** Edits config.toml text line by line (comments and every other key survive). Idempotent. */
-export function transformCodexGatewayConfig(configText: string, base: string, app: string): string {
+export function transformCodexGatewayConfig(configText: string, base: string, app: string, route: string = app): string {
   const out: string[] = [];
   let section: string | undefined; // undefined = top level
   let sawRequires = false;
@@ -77,7 +96,7 @@ export function transformCodexGatewayConfig(configText: string, base: string, ap
   }
   if (!sawRequires && providerHeaderAt >= 0) out.splice(providerHeaderAt + 1, 0, "requires_openai_auth = true");
   const text = out.join("\n").replace(/\n{3,}/g, "\n\n");
-  return `chatgpt_base_url = ${JSON.stringify(`${base}/${app}/backend-api`)}\n${text}`;
+  return `chatgpt_base_url = ${JSON.stringify(`${base}/${route}/backend-api`)}\n${text}`;
 }
 
 export interface ConfiguredHome {
@@ -93,13 +112,13 @@ export async function codexGatewayHomeProblem(dir: string): Promise<string | und
   } catch {
     return "no config.toml";
   }
-  let target: { base: string; app: string };
+  let target: { base: string; app: string; route?: string };
   try {
     target = parseGatewayProvider(text);
   } catch (e) {
     return e instanceof Error ? e.message : String(e);
   }
-  if (transformCodexGatewayConfig(text, target.base, target.app) !== text) return "config.toml needs chatgpt_base_url / requires_openai_auth";
+  if (transformCodexGatewayConfig(text, target.base, target.app, target.route) !== text) return "config.toml needs chatgpt_base_url / requires_openai_auth";
   try {
     const auth = JSON.parse(await readFile(join(dir, "auth.json"), "utf8")) as { tokens?: { account_id?: unknown; access_token?: unknown; id_token?: unknown } };
     if (auth.tokens?.account_id !== `ais-${target.app}` || typeof auth.tokens.access_token !== "string" || auth.tokens.access_token === "") return "auth.json is not the gateway placeholder login";
@@ -111,17 +130,17 @@ export async function codexGatewayHomeProblem(dir: string): Promise<string | und
 }
 
 /** Reads the folder's app from config.toml. */
-export async function readCodexGatewayHomeApp(dir: string): Promise<{ base: string; app: string; text: string }> {
+export async function readCodexGatewayHomeApp(dir: string): Promise<{ base: string; app: string; route?: string; text: string }> {
   const text = await readFile(join(dir, "config.toml"), "utf8");
   return { ...parseGatewayProvider(text), text };
 }
 
 /** Writes auth.json (0600) and rewrites config.toml (mode kept). Returns the app. Never logs the token. */
 export async function configureCodexGatewayHome(dir: string, token: string): Promise<{ app: string }> {
-  const { base, app, text } = await readCodexGatewayHomeApp(dir);
+  const { base, app, route, text } = await readCodexGatewayHomeApp(dir);
   await mkdir(dir, { recursive: true });
   await writeFileAtomic(join(dir, "auth.json"), buildCodexGatewayAuth(app, token));
-  const next = transformCodexGatewayConfig(text, base, app);
+  const next = transformCodexGatewayConfig(text, base, app, route);
   if (next !== text) {
     const path = join(dir, "config.toml");
     const mode = (await stat(path)).mode & 0o777;
