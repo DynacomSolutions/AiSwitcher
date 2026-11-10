@@ -105,6 +105,11 @@ export interface RouteAllOptions {
    * account, provably fresher than the store copy, no running session, no other holder.
    */
   afterLogin?: boolean;
+  /**
+   * The app key (aisg_) the identity's folder held as its gateway entry before a sign-in overwrote it, used only when the
+   * secrets file has none (a host without ~/.secrets, e.g. the console pod). The secrets file stays the first source.
+   */
+  fallbackToken?: string;
   out?: (line: string) => void;
 }
 
@@ -411,7 +416,8 @@ class PiChanged extends Error {
 
 async function readKey(app: string, opts: RouteAllOptions): Promise<string | undefined> {
   const token = await readSecretsKey(appTokenKey(app), opts.secretsPath ?? defaultSecretsPath());
-  return token && token.startsWith(GATEWAY_TOKEN_PREFIX) ? token : undefined;
+  if (token && token.startsWith(GATEWAY_TOKEN_PREFIX)) return token;
+  return opts.fallbackToken && opts.fallbackToken.startsWith(GATEWAY_TOKEN_PREFIX) ? opts.fallbackToken : undefined;
 }
 
 const gatewayBase = (tool: string, opts: RouteAllOptions): string => `http://127.0.0.1:${opts.port ?? (Number(process.env.AIS_GATEWAY_LOCAL_PORT) || LOCAL_PORT_DEFAULT)}/${tool}`;
