@@ -12,10 +12,12 @@ import { GATEWAY_TOKEN_PREFIX } from "../identities/claude-gateway-entry.ts";
  * - tunnels every CONNECT untouched (plain TCP pipe, no TLS termination), except
  * - CONNECT to api.anthropic.com:443, whose TLS it terminates with the certificate the cluster issues for that name
  *   (cert-manager, mounted as `tls.crt`/`tls.key`/`ca.crt`; the proxy makes no certificates). On that connection
- *   `GET /api/oauth/usage` and `GET /api/oauth/profile` with a gateway app token are answered by the gateway itself
- *   (the app's served route). A gateway token the gateway does not accept is answered 401 and never sent on. Every
- *   other request is forwarded to the real host unchanged (headers, body, compressed answer).
- * No pool member login is ever read or sent here.
+ *   every request that carries a gateway app token (`aisg_...`), whatever its method or path, is handed to the gateway's own
+ *   route for that app (`/<app>/<path>`): the usage and profile answers, reset-credit view and redeem and the rest of Anthropic's
+ *   account API are forwarded there with the login of the member the app maps to. A gateway token the gateway does not accept is
+ *   answered 401 and never sent on. A request with any other bearer is forwarded to the real host unchanged (headers, body,
+ *   compressed answer).
+ * No pool member login is read or sent by this file; the gateway route adds it.
  */
 export const INTERCEPTED_HOST = "api.anthropic.com";
 /** Why a plain HTTP request was refused: almost always a client with HTTPS_PROXY set and no NO_PROXY for its own (loopback) base URL. */
@@ -24,7 +26,6 @@ export const NOT_CONNECT_BODY =
   "A client with HTTPS_PROXY set is sending a request through the proxy that should go direct: add its host to NO_PROXY " +
   "(for a loopback ANTHROPIC_BASE_URL such as the ais gateway local proxy: NO_PROXY=127.0.0.1,localhost,::1).\n";
 
-const SERVED_PATHS = new Set(["/api/oauth/usage", "/api/oauth/profile"]);
 const MAX_HEAD = 16 * 1024;
 const HEAD_TIMEOUT_MS = 30_000;
 /** How often the mounted certificate is checked for a renewal. */
@@ -39,7 +40,7 @@ export interface UsageProxyOptions {
   publishCaTo?: string;
   /** The app a gateway token belongs to (an active app whose token verifies), else undefined. */
   appForToken(token: string): Promise<string | undefined>;
-  /** Answers a served path for an app (the gateway's own handler; the request carries the same token). */
+  /** Answers a request for an app (the gateway's own handler; the request carries the same token, method and body). */
   serve(app: string, path: string, req: Request): Promise<Response>;
   fetch?: typeof fetch;
   /** Where intercepted requests that are not served go (tests point it elsewhere). */
@@ -94,12 +95,12 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     const url = new URL(req.url);
     const path = collapseSlashes(url.pathname);
     const token = bearerOf(req.headers);
-    if (req.method === "GET" && SERVED_PATHS.has(path) && token?.startsWith(GATEWAY_TOKEN_PREFIX)) {
+    if (token?.startsWith(GATEWAY_TOKEN_PREFIX)) {
       const app = await opts.appForToken(token).catch(() => undefined);
       // A gateway token is never handed to the real host, known or not.
       if (!app) return Response.json({ type: "error", error: { type: "authentication_error", message: "invalid AIS gateway token" } }, { status: 401 });
       const res = await opts.serve(app, path, req).catch(() => Response.json({ type: "error", error: { type: "api_error", message: "gateway error" } }, { status: 502 }));
-      log(`gateway: connect-proxy ${path} for app ${app}: ${res.status}`);
+      log(`gateway: connect-proxy ${req.method} ${path.split("/").slice(0, 3).join("/")} for app ${app}: ${res.status}`);
       return res;
     }
     const headers = hopClean(req.headers);

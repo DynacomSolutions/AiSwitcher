@@ -167,26 +167,38 @@ speech call is not a model call); the daily token cap does.
   Coding `search` and `fetch` services. UNPROVEN live.
 - **codex** `POST /v1/audio/transcriptions` (or `/transcribe`), sent to ChatGPT's
   `backend-api/transcribe` with the multipart body untouched. UNPROVEN live.
-- **Served by the gateway itself**, so no account detail leaves it: claude
-  `GET /api/oauth/usage` (the windows of the member the pool would pick) and
-  `GET /api/oauth/profile` (the app name only); codex
-  `GET /rate-limit-reset-credits` (also under `/api/codex` and `/wham`), which is
-  the total over the pool's members, and `POST .../consume`, which is refused;
-  codex `GET /wham/usage` (also `/api/codex/usage`): the pinned identity's or least-used member's windows in ChatGPT's
-  `wham/usage` shape (`plan_type` always `pro`; 502 when no member has figures).
-- **Codex `/backend-api` prefix**: codex 0.166 reads `account/rateLimits/read` from `<chatgpt_base_url>/wham/usage`
-  when its config sets `chatgpt_base_url` and `auth.json` holds a placeholder ChatGPT login whose `access_token` is the
-  app token (how T3 Code shows limits for gateway Codex instances). Every served codex path is also accepted under
-  `/backend-api`; any other `/backend-api/*` path (plugins, `ps/plugins/*`, any method) is 404 with no upstream call.
+- **Account API, forwarded with the member's login** (`kind: "account"`, `src/gateway/account.ts`). One rule for every
+  provider: a request for an account feature (usage and limits, reset credits view and spend, profile, plugins) is sent to
+  the provider with the REAL login of the member the app maps to. A pinned app uses its identity; a pool app uses the member
+  that owns the resource (below), else the member the pool would route to now (lowest utilisation). The member's token is
+  added by the gateway and never returned; the app token is never sent on. Decision of 10 Nov 2026 (replaces the earlier
+  "never let an app read account detail" design). These calls count as side calls (no token rows, the daily side limit and
+  token cap apply, the reserve does not), are logged as app, class and status only, and one 401 gets one locked refresh.
+  - **claude**: everything under `/api/oauth/*`, `/api/claude_cli*`, `/api/organizations/*`, `/api/account`, `/api/bootstrap`
+    and `/api/me` goes to `api.anthropic.com` (profile answers keep the real account and organisation uuids). A
+    pinned app forwards `/api/oauth/usage` whole. A pool app keeps the served windows of the least-used member and, when the
+    query has `cedar_ember=1`, merges that member's real `cedar_ember` block in. `POST /api/organizations/<org>/reset_rate_limits`
+    reads a fresh `cedar_ember` view of each member to find the one owning `grant_id`, and is sent with that member's login
+    and organisation; when the org in the path differs from the member's (from its `/api/oauth/profile`, kept 10 minutes) the
+    path is rewritten to the member's, so a stale local uuid still works.
+  - **codex**: `POST .../rate-limit-reset-credits/consume` goes to the member with an unspent credit (the pin for a pinned
+    app). Every `/backend-api/*` path except model traffic (`/codex/*`, 404) and `wham/*` / `api/codex/*` go to
+    `chatgpt.com/backend-api/*` with the login and `chatgpt-account-id`. Pool apps still get the served `wham/usage` (windows
+    of the least-used member) and the summed `rate-limit-reset-credits`; pinned apps get the provider's real bodies.
+    Codex 0.166 reads `account/rateLimits/read` from `<chatgpt_base_url>/wham/usage` when its config sets `chatgpt_base_url`
+    and `auth.json` holds a placeholder ChatGPT login whose `access_token` is the app token (how T3 Code shows limits).
+  - **kimi** `GET /usages` (`api.kimi.com/coding/v1/usages`), **zai** `GET /api/monitor/*` (`api.z.ai`), **opencode**
+    `GET /usage` (`opencode.ai/zen/go/v1/usage`): forwarded with the member's key. **grok** and **ali** have no account
+    endpoint AIS calls with the model key (ali usage needs a console cookie, not the API key): nothing is forwarded for them.
+  - All of this is UNPROVEN live.
+- **CONNECT proxy**: every request with an `aisg_` bearer (any method and path, body included) is handed to that app's route;
+  an `aisg_` token the gateway does not accept is 401 and never sent on. Other bearers are forwarded unchanged.
 - **Side routes** (lists, search, fetch, speech) pass the provider's 401/402/403/429 straight to the app: no login
   refresh, no pool hold, no failover. Side and served calls are counted per app and day apart from tokens (default 5000 a
   day, `AIS_GATEWAY_SIDE_DAILY_LIMIT`; over it the answer is 429); no token rows are written for them. Codex reset credits
   are cached 60 s per app.
-- **Refused claude paths** (403, after collapsing `//`, decoding, lower-casing and dropping `;params`), below `/api/`:
-  `oauth/{profile,account,userinfo,organization(s),roles}`, `oauth/claude_cli/{roles,profile,account,organization(s)}`,
-  `claude_cli_profile`, `organization(s)`, `account`, `bootstrap`, `me`. The gateway serves `oauth/usage` and
-  `oauth/profile` itself. Every other `/api/*` path passes through. Repeated slashes in any app path are collapsed before
-  matching and before the path is sent upstream.
+- Repeated slashes in any app path are collapsed before matching and before the path is sent upstream. Claude paths are
+  matched after decoding, lower-casing and dropping `;params`.
 
 ### Claude limits for gateway-routed Claude Code (CONNECT proxy)
 
@@ -203,10 +215,10 @@ upstream). AIS's own gateway entry keeps only `user:inference`: without the prox
 token to the real host.
 
 - Every CONNECT is a plain TCP tunnel except `api.anthropic.com:443`, whose TLS the proxy terminates.
-- On that host, `GET /api/oauth/usage` and `GET /api/oauth/profile` with an `aisg_` bearer are answered by the gateway's
-  served route for the active claude app the token belongs to. An `aisg_` token the gateway does not accept gets 401
-  there and is never sent on. Anything else on that host is forwarded unchanged.
-- No pool member login is read or sent by the proxy. A renewed certificate is picked up within 5 minutes.
+- On that host, any request with an `aisg_` bearer is handed to the route of the claude app the token belongs to, which
+  forwards account requests with the member's login (see "Account API" above). An `aisg_` token the gateway does not accept
+  gets 401 there and is never sent on. Requests with any other bearer are forwarded unchanged.
+- The proxy itself reads and sends no member login. A renewed certificate is picked up within 5 minutes.
 
 ### Claude usage proxy on a folder
 

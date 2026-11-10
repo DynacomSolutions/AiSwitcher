@@ -18,7 +18,8 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
  *   refresh, no pool hold or failover), so an unverified side route can never disable a login chat calls depend on. The
  *   daily token cap still applies, and these calls
  *   are also counted per app against SIDE_DAILY_LIMIT_DEFAULT requests a day (no token rows are invented for them).
- * - `serve`: the gateway answers itself from its own pool state. No account token and no account identity leaves the gateway.
+ * - `serve`: the gateway answers itself from its own pool state (a pinned app gets PIN_FORWARD's provider answer instead).
+ * - `account`: see AccountOp.
  *
  * Sources for the provider paths:
  * - models: Anthropic `/v1/models`; Codex `<backend-api/codex>/models` (what the codex CLI calls); the OpenAI-style bases
@@ -39,9 +40,27 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 export type Route =
   | { kind: "upstream"; url: string; side: boolean }
   | { kind: "serve"; name: ServedName }
+  | { kind: "account"; op: AccountOp; url: string }
   | { kind: "deny"; status: 404 };
 
-export type ServedName = "claude-usage" | "claude-profile" | "codex-usage" | "codex-reset-credits" | "codex-reset-consume" | "ali-models";
+/**
+ * `account`: an account-feature request (usage, limits, reset credits, profile, plugins and the like). The gateway forwards it
+ * to the provider with the REAL login of the member the app maps to (pin: that identity; pool: the member owning the resource,
+ * else the one the pool would route to now), see account.ts. The member's token never reaches the client. Counted as a side call.
+ * - `forward`: as is, to `url` (plus the query string).
+ * - `claude-usage`: pin forwards; pool serves the windows and merges the chosen member's `cedar_ember` when asked for.
+ * - `claude-org`: `/api/organizations/<org>/...`; the org is rewritten to the member's, and a reset redeem goes to the member owning the grant.
+ * - `codex-consume`: spending a codex reset credit, sent to a member that has one.
+ */
+export type AccountOp = "forward" | "claude-usage" | "claude-org" | "codex-consume";
+
+export type ServedName = "codex-usage" | "codex-reset-credits" | "ali-models";
+
+/** Served names a pinned app gets forwarded to the provider instead (the real body of its one identity). */
+export const PIN_FORWARD: Partial<Record<ServedName, string>> = {
+  "codex-usage": "https://chatgpt.com/backend-api/wham/usage",
+  "codex-reset-credits": "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+};
 
 /** Side and served requests an app may make per day, counted apart from tokens. AIS_GATEWAY_SIDE_DAILY_LIMIT overrides. */
 export const SIDE_DAILY_LIMIT_DEFAULT = 5_000;
@@ -61,14 +80,12 @@ export const RESET_CREDITS_TTL_MS = 60_000;
 const RESET_CREDITS_FAILURE_TTL_MS = 15_000;
 
 /**
- * Claude account detail the gateway never lets an app read with a pool member's login. Only these are refused; every other
- * `/api/*` path (hello, settings, telemetry, other oauth/claude_cli calls) passes through as before. The gateway serves
- * `/api/oauth/usage` and `/api/oauth/profile` itself. Refused, below `/api/`:
- *   oauth/{profile,account,userinfo,organization(s),roles}, oauth/claude_cli/{roles,profile,account,organization(s)},
- *   claude_cli_profile, organization(s), account, bootstrap, me.
- * The path is matched after slash collapsing, repeated percent-decoding, lower-casing and dropping `;params`.
+ * Claude's account API, below `/api/`: oauth/*, claude_cli*, organization(s), account, bootstrap, me. The gateway forwards these
+ * to Anthropic with the login of the member the app maps to (see AccountOp); every other `/api/*` path (hello, settings,
+ * telemetry) is the plain pass-through. The path is matched after slash collapsing, repeated percent-decoding, lower-casing and
+ * dropping `;params`.
  */
-const CLAUDE_ACCOUNT_PATH = /^\/api\/(?:oauth\/(?:(?:profile|account|userinfo|organizations?|roles)|claude_cli\/(?:roles|profile|account|organizations?))|claude_cli_profile|organizations?|account|bootstrap|me)(?:\/|$)/;
+const CLAUDE_ACCOUNT_PATH = /^\/api\/(?:oauth|claude_cli[^/]*|organizations?|account|bootstrap|me)(?:\/|$)/;
 
 export function isClaudeAccountPath(rest: string): boolean {
   let p = rest;
@@ -144,8 +161,12 @@ export function routeFor(provider: GatewayProvider, style: ApiStyle, method: str
   let backend = false;
   if (provider === "codex") ({ path, backend } = codexPath(path));
   const route = specialRoute(provider, style, m, path);
-  // Under /backend-api only the served codex routes exist; nothing there is passed on with a member login.
-  if (backend && route?.kind !== "serve") return { kind: "deny", status: 404 };
+  if (backend && route?.kind !== "serve" && route?.kind !== "account") {
+    // ChatGPT's account API (plugins, accounts, wham, ...) is forwarded with the member's login. Model traffic (`/codex/*`)
+    // has its own pass-through, ledger and caps, so it is not reachable this way, and the bare prefix names nothing.
+    if (path === "" || path === "/" || /^\/codex(?:\/|$)/i.test(path)) return { kind: "deny", status: 404 };
+    return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${path}` };
+  }
   return route;
 }
 
@@ -153,10 +174,15 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
   if (m === "GET") {
     const models = /^(?:\/v1)?\/models(\/[^/]+)?$/.exec(path);
     if (models) return modelsRoute(provider, style, models[1] ?? "");
-    if (provider === "claude" && path === "/api/oauth/usage") return { kind: "serve", name: "claude-usage" };
-    if (provider === "claude" && path === "/api/oauth/profile") return { kind: "serve", name: "claude-profile" };
+    if (provider === "kimi" && /^(?:\/v1)?\/usages$/.test(path)) return { kind: "account", op: "forward", url: `${KIMI_V1}/usages` };
+    if (provider === "zai" && /^\/api\/monitor\/.+/.test(path)) return { kind: "account", op: "forward", url: `https://api.z.ai${path}` };
+    if (provider === "opencode" && /^(?:\/v1)?\/usage$/.test(path)) return { kind: "account", op: "forward", url: "https://opencode.ai/zen/go/v1/usage" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits$/.test(path)) return { kind: "serve", name: "codex-reset-credits" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)\/usage$/.test(path)) return { kind: "serve", name: "codex-usage" };
+  }
+  if (provider === "claude") {
+    if (m === "GET" && path === "/api/oauth/usage") return { kind: "account", op: "claude-usage", url: "https://api.anthropic.com/api/oauth/usage" };
+    if (isClaudeAccountPath(path)) return { kind: "account", op: /^\/api\/organizations\/[^/]+\//i.test(path) ? "claude-org" : "forward", url: `https://api.anthropic.com${path}` };
   }
   if (m === "POST") {
     if (provider === "kimi") {
@@ -165,9 +191,11 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
     }
     if (provider === "codex") {
       if (/^(?:\/v1)?\/audio\/transcriptions$|^\/transcribe$/.test(path)) return { kind: "upstream", url: `${CODEX_BACKEND}/transcribe`, side: true };
-      if (/^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits\/consume$/.test(path)) return { kind: "serve", name: "codex-reset-consume" };
+      if (/^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits\/consume$/.test(path)) return { kind: "account", op: "codex-consume", url: `${CODEX_BACKEND}/wham/rate-limit-reset-credits/consume` };
     }
   }
+  // The rest of codex's ChatGPT account API (wham/*, api/codex/*) sits on the backend-api host, not under the model base.
+  if (provider === "codex" && /^\/(?:wham|api\/codex)(?:\/|$)/.test(path)) return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${path}` };
   return undefined;
 }
 
@@ -196,22 +224,15 @@ export async function serveRoute(name: ServedName, ctx: ServeContext): Promise<R
         first_id: ALI_MODELS[0]?.id ?? null,
         last_id: ALI_MODELS[ALI_MODELS.length - 1]?.id ?? null,
       });
-    case "claude-profile":
-      // Only the app's own name: the pool's account details are never shown to an app.
-      return json({ account: { uuid: null, full_name: ctx.app.name, display_name: ctx.app.name, email: null }, organization: { uuid: null, name: ctx.app.name } });
-    case "claude-usage":
-      return json(await claudeUsageBody(ctx));
     case "codex-usage":
       return codexUsage(ctx);
     case "codex-reset-credits":
       return codexResetCredits(ctx);
-    case "codex-reset-consume":
-      return providerError(ctx.style, 403, "reset credits cannot be spent through the gateway");
   }
 }
 
 /** The reading of the member the pool would route to: the pin, or the pool member with the lowest utilisation. */
-async function leastUsed(ctx: ServeContext): Promise<PoolUsage | undefined> {
+export async function leastUsed(ctx: ServeContext): Promise<PoolUsage | undefined> {
   const readings = (await memberUsages(ctx.app, ctx.deps)).filter((u) => u !== undefined && utilisationOf(u) !== undefined);
   let best = readings[0];
   for (const u of readings) if ((utilisationOf(u) ?? 0) < (utilisationOf(best) ?? 0)) best = u;
@@ -219,7 +240,7 @@ async function leastUsed(ctx: ServeContext): Promise<PoolUsage | undefined> {
 }
 
 /** The two windows of the member the pool would route to (lowest utilisation), in the shape of Anthropic's usage endpoint. */
-async function claudeUsageBody(ctx: ServeContext): Promise<Record<string, unknown>> {
+export async function claudeUsageBody(ctx: ServeContext): Promise<Record<string, unknown>> {
   const best = await leastUsed(ctx);
   const win = (label: string): { utilization: number; resets_at: string | null } | null => {
     const w = best?.windows?.find((x) => x.label === label);
@@ -273,7 +294,7 @@ async function codexUsage(ctx: ServeContext): Promise<Response> {
 
 const CODEX_RESET_URL = `${CODEX_BACKEND}/wham/rate-limit-reset-credits`;
 
-function availableCount(body: unknown): number | undefined {
+export function availableCount(body: unknown): number | undefined {
   const obj = (v: unknown): Record<string, unknown> | undefined => (typeof v === "object" && v !== null ? (v as Record<string, unknown>) : undefined);
   const top = obj(body);
   const n = top?.available_count ?? obj(top?.rate_limit_reset_credits)?.available_count;

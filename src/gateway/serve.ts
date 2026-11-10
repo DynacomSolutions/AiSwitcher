@@ -659,8 +659,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
         tlsDir: opts.connect.tlsDir,
         ...(opts.connect.publishCaTo ? { publishCaTo: opts.connect.publishCaTo } : {}),
         appForToken,
-        // The gateway's own served route for the app, with the client's headers (same token).
-        serve: async (app, path, req) => proxy.fetch(new Request(`http://gateway.internal/${encodeURIComponent(app)}${path}${new URL(req.url).search}`, { headers: req.headers }), { ip: "127.0.0.1" }),
+        // The gateway's own route for the app, with the client's method, headers (same token) and body.
+        serve: async (app, path, req) => {
+          const hasBody = req.body !== null && req.method !== "GET" && req.method !== "HEAD";
+          return proxy.fetch(new Request(`http://gateway.internal/${encodeURIComponent(app)}${path}${new URL(req.url).search}`, { method: req.method, headers: req.headers, ...(hasBody ? { body: req.body, duplex: "half" } : {}) } as RequestInit), { ip: "127.0.0.1" });
+        },
         ...(hooks.fetch ? { fetch: hooks.fetch } : {}),
       });
       console.info(`gateway: connect proxy on :${connectProxy.port}`);

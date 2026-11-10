@@ -127,6 +127,16 @@ describe("usage proxy", () => {
     expect(calls[0]!.headers.get("anthropic-beta")).toBe("oauth-2025-04-20");
   });
 
+  test("hands any method, path and body for an app token to the gateway route of that app", async () => {
+    const calls: Call[] = [];
+    const p = await proxy(calls);
+    const res = await viaProxy(p.port, { method: "POST", path: "/api/organizations/org-1/reset_rate_limits", headers: { authorization: `Bearer ${APP_TOKEN}`, "content-type": "application/json" }, body: '{"grant_id":"g"}' });
+    expect(res.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("gateway:t3-claude-x/api/organizations/org-1/reset_rate_limits");
+    expect(calls[0]!.method).toBe("POST");
+  });
+
   test("answers /api/oauth/profile the same way", async () => {
     const calls: Call[] = [];
     const p = await proxy(calls);
@@ -144,10 +154,10 @@ describe("usage proxy", () => {
     expect(calls[0]!.headers.get("authorization")).toBe(OTHER_BEARER);
   });
 
-  test("passes other paths and methods (with their body) to the real host", async () => {
+  test("passes other paths and methods (with their body) to the real host when the bearer is not an app token", async () => {
     const calls: Call[] = [];
     const p = await proxy(calls);
-    const res = await viaProxy(p.port, { method: "POST", path: "/api/event_logging/batch", headers: { authorization: `Bearer ${APP_TOKEN}`, "content-type": "application/json" }, body: '{"a":1}' });
+    const res = await viaProxy(p.port, { method: "POST", path: "/api/event_logging/batch", headers: { authorization: OTHER_BEARER, "content-type": "application/json" }, body: '{"a":1}' });
     expect(res.status).toBe(401);
     expect(res.body).toBe("upstream");
     expect(calls).toHaveLength(1);
@@ -160,8 +170,10 @@ describe("usage proxy", () => {
   test("a gateway token the lookup does not know is refused, never sent to the real host", async () => {
     const calls: Call[] = [];
     const p = await proxy(calls, { appForToken: async () => undefined });
-    const res = await viaProxy(p.port, { path: "/api/oauth/usage", headers: { authorization: `Bearer ${APP_TOKEN}` } });
-    expect(res.status).toBe(401);
+    for (const [method, path] of [["GET", "/api/oauth/usage"], ["POST", "/api/organizations/o/reset_rate_limits"], ["GET", "/api/event_logging/batch"]] as const) {
+      const res = await viaProxy(p.port, { method, path, headers: { authorization: `Bearer ${APP_TOKEN}` } });
+      expect(res.status).toBe(401);
+    }
     expect(calls).toHaveLength(0);
   });
 
