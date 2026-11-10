@@ -78,6 +78,20 @@ describe("usage source", () => {
   });
 });
 
+test("a reading with no figure (usage API 429 or unavailable) keeps the last figure", async () => {
+  let next: PoolUsage = { status: "rate-limited", maxUtilization: 100, windows: [{ label: "seven-day", utilization: 100 }], capturedAt: "a" };
+  let t = 0;
+  const src = createUsageSource({ fetchUsage: async () => next, ttlMs: 1000, now: () => t });
+  await src.prefill("claude", "id1");
+  for (const empty of [{ status: "rate-limited", error: "HTTP 429", capturedAt: "b" }, { status: "unavailable", capturedAt: "c" }] as PoolUsage[]) {
+    next = empty;
+    t += 5000;
+    await src.get("claude", "id1");
+    await src.idle();
+    expect((await src.get("claude", "id1"))?.maxUtilization).toBe(100);
+  }
+});
+
 describe("reserve uses numbers only", () => {
   const pinned = (usage: PoolUsage | undefined) => pickIdentity(app, { usageFor: async () => usage, poolMembers: async () => [] });
   test("rate-limited without a number is no figure", async () => {

@@ -27,7 +27,7 @@ interface Entry {
  * Usage figures cached per provider and identity. A request never waits on the
  * usage API: a cold miss answers "no figure" and fills in the background, a
  * stale entry is served while one refresh (single-flight) runs. "unavailable"
- * counts as no figure; a failed fetch keeps the previous value.
+ * counts as no figure; a failed fetch or a reading with no figure keeps the previous value.
  */
 export function createUsageSource(opts: { fetchUsage: FetchUsage; ttlMs?: number; now?: () => number }) {
   const ttl = opts.ttlMs ?? USAGE_TTL_MS;
@@ -43,7 +43,11 @@ export function createUsageSource(opts: { fetchUsage: FetchUsage; ttlMs?: number
     const run = (async () => {
       try {
         const u = await opts.fetchUsage(provider, identity);
-        entries.set(key, { value: u && u.status !== "unavailable" ? u : undefined, at: now() });
+        // A reading with no figure (the usage API answered 429, as Anthropic's does for an account at its limit, or was
+        // unavailable) keeps the last figure: answering "no limits" for a full account is wrong (T3 showed "No limits reported").
+        const prev = entries.get(key)?.value;
+        const hasFigure = (v: PoolUsage | undefined): boolean => !!v && v.status !== "unavailable" && ((v.windows?.length ?? 0) > 0 || typeof v.maxUtilization === "number");
+        entries.set(key, { value: hasFigure(u) ? u : prev, at: now() });
       } catch {
         // Keep the old figure; retry after the next ttl.
         entries.set(key, { value: entries.get(key)?.value, at: now() });
