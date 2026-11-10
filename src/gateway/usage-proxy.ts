@@ -70,6 +70,22 @@ function bearerOf(headers: Headers): string | undefined {
   return /^bearer\s+(\S+)$/i.exec(headers.get("authorization")?.trim() ?? "")?.[1];
 }
 
+/** The gateway token the request carries in any header the gateway accepts it in (Bearer, Basic password, x-api-key, api-key), else the bearer. */
+function tokenOf(headers: Headers): string | undefined {
+  const basic = /^basic\s+(\S+)$/i.exec(headers.get("authorization")?.trim() ?? "")?.[1];
+  let basicPassword: string | undefined;
+  if (basic) {
+    try {
+      const decoded = Buffer.from(basic, "base64").toString("utf8");
+      basicPassword = decoded.slice(decoded.indexOf(":") + 1);
+    } catch {
+      basicPassword = undefined;
+    }
+  }
+  const candidates = [bearerOf(headers), basicPassword, headers.get("x-api-key")?.trim(), headers.get("api-key")?.trim()];
+  return candidates.find((c): c is string => c !== undefined && c.startsWith(GATEWAY_TOKEN_PREFIX)) ?? bearerOf(headers);
+}
+
 async function readTls(dir: string): Promise<{ cert: string; key: string; ca?: string; mtime: number }> {
   const [cert, key, st] = await Promise.all([readFile(join(dir, "tls.crt"), "utf8"), readFile(join(dir, "tls.key"), "utf8"), stat(join(dir, "tls.crt"))]);
   const ca = await readFile(join(dir, "ca.crt"), "utf8").catch(() => undefined);
@@ -94,7 +110,7 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
   async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = collapseSlashes(url.pathname);
-    const token = bearerOf(req.headers);
+    const token = tokenOf(req.headers);
     if (token?.startsWith(GATEWAY_TOKEN_PREFIX)) {
       const app = await opts.appForToken(token).catch(() => undefined);
       // A gateway token is never handed to the real host, known or not.

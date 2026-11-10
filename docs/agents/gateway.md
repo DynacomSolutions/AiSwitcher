@@ -174,8 +174,10 @@ speech call is not a model call); the daily token cap does.
   added by the gateway and never returned; the app token is never sent on. Decision of 10 Nov 2026 (replaces the earlier
   "never let an app read account detail" design). These calls count as side calls (no token rows, the daily side limit and
   token cap apply, the reserve does not), are logged as app, class and status only, and one 401 gets one locked refresh.
-  - **claude**: everything under `/api/oauth/*`, `/api/claude_cli*`, `/api/organizations/*`, `/api/account`, `/api/bootstrap`
-    and `/api/me` goes to `api.anthropic.com` (profile answers keep the real account and organisation uuids). A
+  - **claude**: every path that is not model traffic (`/v1/messages*`, `/v1/complete`) goes to `api.anthropic.com` as an
+    account call: `/api/oauth/*`, `/api/claude_cli*`, `/api/organizations/*`, telemetry, settings, hello. None of them
+    holds a member, fails over or forces a refresh beyond the locked account one (profile answers keep the real account and
+    organisation uuids). A
     pinned app forwards `/api/oauth/usage` whole. A pool app keeps the served windows of the least-used member and, when the
     query has `cedar_ember=1`, merges that member's real `cedar_ember` block in. `POST /api/organizations/<org>/reset_rate_limits`
     reads a fresh `cedar_ember` view of each member to find the one owning `grant_id`, and is sent with that member's login
@@ -190,6 +192,15 @@ speech call is not a model call); the daily token cap does.
   - **kimi** `GET /usages` (`api.kimi.com/coding/v1/usages`), **zai** `GET /api/monitor/*` (`api.z.ai`), **opencode**
     `GET /usage` (`opencode.ai/zen/go/v1/usage`): forwarded with the member's key. **grok** and **ali** have no account
     endpoint AIS calls with the model key (ali usage needs a console cookie, not the API key): nothing is forwarded for them.
+  - **Never forwarded (403)**: paths that mint a durable credential of the member, which would bypass the gateway:
+    `create_api_key`, `api_keys`, `oauth_tokens`, `setup_token`, `access_token`, `oauth/token`, `oauth/authorize`
+    (Claude and ChatGPT). The owner should know the app can still see account detail, but never obtains a key.
+  - Classification reads the normal form of the path (repeated percent-decoding, `;params` dropped, lower-case, `//`
+    collapsed); what is sent upstream is the client's spelling. A path that cannot be normalised is refused (404).
+  - Organisation ids are fail-closed: for `/api/(oauth/)organizations/<org>[/...]` the org sent upstream is always the
+    member's own (from its profile); if that cannot be read the answer is 502 and the client's org is never sent.
+  - Account request bodies are capped at 1 MiB, read in chunks inside the body budget (413 over it).
+  - An `aisg_` token in `x-api-key`, `api-key` or a Basic password is treated like the bearer by the CONNECT proxy.
   - All of this is UNPROVEN live.
 - **CONNECT proxy**: every request with an `aisg_` bearer (any method and path, body included) is handed to that app's route;
   an `aisg_` token the gateway does not accept is 401 and never sent on. Other bearers are forwarded unchanged.

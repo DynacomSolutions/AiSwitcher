@@ -177,6 +177,24 @@ describe("usage proxy", () => {
     expect(calls).toHaveLength(0);
   });
 
+  for (const header of ["x-api-key", "api-key"]) {
+    test(`an app token in ${header} is routed to the app like a bearer, never sent to the real host`, async () => {
+      const calls: Call[] = [];
+      const p = await proxy(calls);
+      const res = await viaProxy(p.port, { path: "/api/oauth/usage", headers: { [header]: APP_TOKEN } });
+      expect(res.status).toBe(200);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe("gateway:t3-claude-x/api/oauth/usage");
+    });
+    test(`an unknown gateway token in ${header} is 401 and never sent to the real host`, async () => {
+      const calls: Call[] = [];
+      const p = await proxy(calls, { appForToken: async () => undefined });
+      const res = await viaProxy(p.port, { method: "POST", path: "/api/event_logging/batch", headers: { [header]: APP_TOKEN } });
+      expect(res.status).toBe(401);
+      expect(calls).toHaveLength(0);
+    });
+  }
+
   test("tunnels any other host untouched, with no TLS termination", async () => {
     const echo = net.createServer((s) => s.pipe(s));
     await new Promise<void>((r) => echo.listen(0, "127.0.0.1", r));

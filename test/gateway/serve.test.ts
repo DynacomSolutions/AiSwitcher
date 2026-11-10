@@ -290,7 +290,7 @@ describe("serve lifecycle", () => {
           if (buf.includes("\r\n\r\n")) wake();
         },
         open(s) {
-          s.write(`POST /web/v1/slow HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${token}\r\ncontent-length: 2\r\n\r\n{}`);
+          s.write(`POST /web/v1/messages/slow HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${token}\r\ncontent-length: 2\r\n\r\n{}`);
         },
       },
     });
@@ -324,7 +324,7 @@ describe("serve lifecycle", () => {
     const token = await seed();
     const g = await boot({}, true);
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
-    const res = await fetch(`${base(g)}/web/v1/stream`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    const res = await fetch(`${base(g)}/web/v1/messages/stream`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
     expect(res.status).toBe(200);
     const reader = res.body!.getReader();
     const first = await reader.read();

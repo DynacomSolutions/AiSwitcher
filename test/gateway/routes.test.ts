@@ -330,6 +330,27 @@ describe("served from pool state", () => {
     });
   }
 
+  for (const path of ["/backend-api/%63odex/responses", "/backend-api/codex;x/responses", "/backend-api/%2563odex/responses", "/%62ackend-api/CODEX/responses", "/backend-api/co%64ex"]) {
+    test(`codex ${path} is model traffic however it is spelled: 404, never reaches the provider`, async () => {
+      await addApp("c", "codex", "openai");
+      const res = await call("c", path, { method: "POST", body: "{}" });
+      expect(res.status).toBe(404);
+      expect(seen).toHaveLength(0);
+    });
+  }
+  test("a codex account path is forwarded as the client wrote it (case kept), classified in normal form", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    await call("c", "/BACKEND-api/files/file-AbC123", { method: "GET" });
+    expect(new URL(seen[0]!.url).pathname).toBe("/backend-api/files/file-AbC123");
+  });
+  for (const path of ["/backend-api/api_keys", "/backend-api/oauth/token", "/backend-api/accounts/x/API_KEYS"]) {
+    test(`codex ${path} mints a credential: 403, nothing sent`, async () => {
+      await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+      expect((await call("c", path, { method: "POST", body: "{}" })).status).toBe(403);
+      expect(seen).toHaveLength(0);
+    });
+  }
+
   test("codex usage paths are not served for another provider", async () => {
     await addApp("k", "kimi", "openai");
     await call("k", "/backend-api/wham/usage", { method: "GET" });
@@ -338,7 +359,7 @@ describe("served from pool state", () => {
 });
 
 describe("claude account paths", () => {
-  const forwarded = ["/api/oauth/account", "/API/oauth/account", "/api/oauth//account", "/api//oauth/account", "//api/oauth/account", "/%61pi/oauth/account", "/api/oauth/account;x=1", "/api/oauth/userinfo", "/api/oauth/organizations/x", "/api/oauth/claude_cli/roles", "/api/claude_cli_profile", "/api/organizations", "/api/bootstrap", "/api/oauth/profile", "/api/oauth//profile", "//api/oauth/profile"];
+  const forwarded = ["/api/oauth/account", "/API/oauth/account", "/api/oauth//account", "/api//oauth/account", "//api/oauth/account", "/%61pi/oauth/account", "/api/oauth/account;x=1", "/api/oauth/userinfo", "/api/oauth/claude_cli/roles", "/api/claude_cli_profile", "/api/organizations", "/api/bootstrap", "/api/oauth/profile", "/api/oauth//profile", "//api/oauth/profile"];
   for (const path of forwarded) {
     test(`${path} is forwarded with the member's login, never the app token`, async () => {
       await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
@@ -413,6 +434,87 @@ describe("claude account paths", () => {
     expect(post.headers.get("authorization")).toBe("Bearer tok-b");
     expect(new URL(post.url).pathname).toBe("/api/organizations/org-of-b/reset_rate_limits");
   });
+  for (const status of [401, 429]) {
+    test(`a ${status} on a telemetry call through the app route leaves the pool alone: the next chat uses the same member`, async () => {
+      await addApp("cl", "claude", "anthropic");
+      usage.a = { status: "live", maxUtilization: 10, capturedAt: "" };
+      usage.b = { status: "live", maxUtilization: 50, capturedAt: "" };
+      reply = (s) => (new URL(s.url).pathname === "/api/event_logging/batch" ? new Response("{}", { status, headers: { "retry-after": "60" } }) : Response.json({ id: "m", usage: { input_tokens: 1, output_tokens: 1 } }));
+      const res = await call("cl", "/api/event_logging/batch", { method: "POST", body: "{}" });
+      expect(res.status).toBe(status);
+      expect(seen.every((x) => x.headers.get("authorization") !== "Bearer tok-b")).toBe(true); // no failover to another member
+      if (status === 429) expect(seen).toHaveLength(1);
+      seen.length = 0;
+      expect((await call("cl", "/v1/messages", { method: "POST", body: '{"model":"m","messages":[]}', headers: { "content-type": "application/json" } })).status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
+    });
+  }
+  test("the account relay keeps only content headers: no set-cookie, no upstream auth challenge, no hop-by-hop", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+    reply = () => new Response("{}", { headers: { "content-type": "application/json", "set-cookie": "sid=1", "www-authenticate": "Bearer realm=x", "x-api-key": "k", authorization: "Bearer leak", connection: "keep-alive", "keep-alive": "timeout=5", "retry-after": "3" } });
+    const res = await call("cl", "/api/oauth/profile", { method: "GET" });
+    for (const h of ["set-cookie", "www-authenticate", "x-api-key", "authorization", "keep-alive"]) expect(res.headers.get(h)).toBeNull();
+    expect(res.headers.get("content-type")).toBe("application/json");
+  });
+  test("an account route respects the pool's identity narrowing: owner probe and least-used pick stay inside the set", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pool", identities: ["b"] } });
+    usage.a = { status: "live", maxUtilization: 1, capturedAt: "" };
+    usage.b = { status: "live", maxUtilization: 90, capturedAt: "" };
+    reply = (s) => {
+      const path = new URL(s.url).pathname;
+      if (path === "/api/oauth/usage") return Response.json({ cedar_ember: { grants: [{ id: "grant-of-a" }] } }); // everyone "owns" it; only b may be asked
+      if (path === "/api/oauth/profile") return Response.json({ organization: { uuid: "org-of-b" } });
+      return Response.json({ result: "reset" });
+    };
+    await call("cl", "/api/organizations/org-x/reset_rate_limits", { method: "POST", body: '{"grant_id":"grant-of-a"}' });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((x) => x.headers.get("authorization") === "Bearer tok-b")).toBe(true);
+    await call("cl", "/api/oauth/profile", { method: "GET" });
+    expect(seen.every((x) => x.headers.get("authorization") === "Bearer tok-b")).toBe(true);
+  });
+  test("an org that cannot be read is fail-closed: 502 and the client's org is never sent", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+    reply = () => Response.json({});
+    const res = await call("cl", "/api/organizations/org-stale/reset_rate_limits", { method: "POST", body: '{"grant_id":"g"}' });
+    expect(res.status).toBe(502);
+    expect(seen.some((x) => x.method === "POST")).toBe(false);
+    expect(seen.every((x) => !x.url.includes("org-stale"))).toBe(true);
+  });
+  for (const path of ["/api/organizations/org-stale/reset_rate_limits", "/api/%6frganizations/org-stale/reset_rate_limits", "/api/organizations;x=1/org-stale/reset_rate_limits", "/API/Organizations/org-stale/reset_rate_limits", "/api/organizations/org-stale", "/api/oauth/organizations/org-stale/x", "/api/%256frganizations/org-stale/x"]) {
+    test(`${path}: the organisation sent upstream is the member's`, async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      reply = (s) => (new URL(s.url).pathname === "/api/oauth/profile" ? Response.json({ organization: { uuid: "org-of-a" } }) : Response.json({ ok: true }));
+      const res = await call("cl", path, { method: "POST", body: '{"grant_id":"g"}' });
+      expect(res.status).toBe(200);
+      const post = seen.find((x) => x.method === "POST")!;
+      expect(post.url).toContain("org-of-a");
+      expect(post.url).not.toContain("org-stale");
+    });
+  }
+  for (const [method, path] of [
+    ["POST", "/api/oauth/claude_cli/create_api_key"],
+    ["POST", "/api/oauth/claude_cli/create%5Fapi%5Fkey"],
+    ["POST", "/api/organizations/o/api_keys"],
+    ["GET", "/api/organizations/o/API_KEYS/x"],
+    ["POST", "/api/oauth/token"],
+  ] as const) {
+    test(`claude ${method} ${path} mints a credential: 403, nothing sent`, async () => {
+      await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+      expect((await call("cl", path, { method, body: "{}" })).status).toBe(403);
+      expect(seen).toHaveLength(0);
+    });
+  }
+  test("account bodies are bounded: declared and undeclared (streamed) bodies over the limit are 413 and not forwarded", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+    expect((await call("cl", "/api/event_logging/batch", { method: "POST", body: "x".repeat(2 * 1024 * 1024) })).status).toBe(413);
+    const chunk = new Uint8Array(256 * 1024);
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({ pull(c) { if (sent++ < 8) c.enqueue(chunk); else c.close(); } });
+    const res = await call("cl", "/api/event_logging/batch", { method: "POST", body: stream, duplex: "half" } as RequestInit);
+    expect(res.status).toBe(413);
+    expect(seen).toHaveLength(0);
+  });
   test("an account call is counted as a side call (no token rows) and not refused at the reserve", async () => {
     await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
     usage.a = { status: "live", maxUtilization: 100, capturedAt: "" };
@@ -428,7 +530,7 @@ describe("claude account paths", () => {
   });
   test("other /api paths Claude Code uses still pass through", async () => {
     await addApp("cl", "claude", "anthropic");
-    for (const path of ["/api/hello", "/api/oauth/claude_cli/create_api_key", "/api/claude_code/settings", "/api/event_logging/batch"]) {
+    for (const path of ["/api/hello", "/api/claude_code/settings", "/api/event_logging/batch"]) {
       seen.length = 0;
       expect((await call("cl", path, { method: "GET" })).status).toBe(200);
       expect(seen).toHaveLength(1);

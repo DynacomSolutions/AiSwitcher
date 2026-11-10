@@ -15,7 +15,7 @@ import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
-import { ACCOUNT_BODY_LIMIT, forwardAccount, newAccountState, type AccountState } from "./account.ts";
+import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
@@ -579,10 +579,15 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       }
     }
     if (route.kind === "account") {
-      const declared = declaredLength(req);
-      if (Number.isFinite(declared) && declared > ACCOUNT_BODY_LIMIT) return reject(413, "request body too large for an account call");
-      const bytes = req.body ? new Uint8Array(await req.arrayBuffer()) : undefined;
-      if (bytes && bytes.length > ACCOUNT_BODY_LIMIT) return reject(413, "request body too large for an account call");
+      let bytes: Uint8Array | undefined;
+      if (req.body) {
+        // Bounded: a declared length over the limit is refused unread; otherwise the body is read in chunks inside the body budget and cut off at the limit.
+        const declared = declaredLength(req);
+        if (Number.isFinite(declared) && declared > ACCOUNT_BODY_LIMIT) return reject(413, "request body too large for an account call");
+        releaseBody = await budget.reserve(Number.isFinite(declared) ? declared : ACCOUNT_BODY_LIMIT, ctrl.signal);
+        bytes = await readCapped(req.body, ACCOUNT_BODY_LIMIT);
+        if (!bytes) return reject(413, "request body too large for an account call");
+      }
       const out = await forwardAccount({ app, deps, state: accountState, op: route.op as AccountOp, method: req.method, url: route.url, search: url.search, headers: req.headers, body: bytes, style, signal: ctrl.signal });
       req.signal.removeEventListener("abort", onAbort);
       const who = out.identity ? await canon(out.identity) : identityForRow;

@@ -2,7 +2,7 @@ import type { GatewayDeps } from "./app.ts";
 import { upstreamHeaders } from "./app.ts";
 import { providerError } from "./errors.ts";
 import { adapterFor } from "./providers/index.ts";
-import { availableCount, claudeUsageBody, type AccountOp } from "./routes.ts";
+import { availableCount, claudeUsageBody, normalisePath, orgSegmentIndex, type AccountOp } from "./routes.ts";
 import { allowedMembers, utilisationOf } from "./select.ts";
 import type { ApiStyle, GatewayApp } from "./types.ts";
 
@@ -247,11 +247,15 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     return { res: json(served), identity: member, cls };
   }
 
-  let rewriteOrg = false;
+  let orgAt = -1;
+  let segs: string[] = [];
   if (r.op === "claude-org") {
-    const m = /^\/api\/organizations\/([^/]+)(\/.*)$/i.exec(new URL(url).pathname);
-    rewriteOrg = m !== null;
-    const grant = m?.[2] === "/reset_rate_limits" && r.method === "POST" ? jsonField(r.body, "grant_id") : undefined;
+    const u = new URL(url);
+    const n = normalisePath(u.pathname);
+    orgAt = n ? orgSegmentIndex(n.nsegs) : -1;
+    if (!n || orgAt < 0) return { res: providerError(r.style, 502, "account organisation unavailable"), cls }; // fail closed
+    segs = n.segs;
+    const grant = r.method === "POST" && n.nsegs[orgAt + 1] === "reset_rate_limits" && n.nsegs.length === orgAt + 2 ? jsonField(r.body, "grant_id") : undefined;
     if (grant) owner = (names) => firstMemberWhere(r, names, CLAUDE_RESETS_PROBE, (b) => grantIds(b).includes(grant));
   } else if (r.op === "codex-consume") {
     owner = (names) => firstMemberWhere(r, names, CODEX_CREDITS_URL, (b) => (availableCount(b) ?? 0) > 0);
@@ -260,12 +264,41 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
   const member = await chooseMember(r, owner);
   if (!member) return noMember();
 
-  if (rewriteOrg) {
+  if (orgAt >= 0) {
+    // The organisation sent upstream is always the member's own; if it cannot be read, nothing is sent.
     const org = await memberOrg(r, member);
-    const u = new URL(url);
-    const m = /^\/api\/organizations\/([^/]+)(\/.*)$/i.exec(u.pathname);
-    if (org && m && decodeURIComponent(m[1]!) !== org) url = `${u.origin}/api/organizations/${encodeURIComponent(org)}${m[2]}`;
+    if (!org) return { res: providerError(r.style, 502, "account organisation unavailable"), identity: member, cls };
+    const out = [...segs];
+    out[1] = "api";
+    if (orgAt === 4) out[2] = "oauth";
+    out[orgAt - 1] = "organizations";
+    out[orgAt] = encodeURIComponent(org);
+    url = `${new URL(url).origin}${out.join("/")}`;
   }
   const res = await callAs(r, member, { method: r.method, url: url + r.search, ...(r.body ? { body: r.body } : {}) });
   return { res: relay(res), identity: member, cls };
+}
+
+/** Reads a request body of at most `cap` bytes; undefined once the cap is passed (the rest is not read). */
+export async function readCapped(body: ReadableStream<Uint8Array>, cap: number): Promise<Uint8Array | undefined> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const r = await reader.read();
+    if (r.done) break;
+    size += r.value.length;
+    if (size > cap) {
+      await reader.cancel().catch(() => undefined);
+      return undefined;
+    }
+    chunks.push(r.value);
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
 }

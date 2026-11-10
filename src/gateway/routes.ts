@@ -41,7 +41,7 @@ export type Route =
   | { kind: "upstream"; url: string; side: boolean }
   | { kind: "serve"; name: ServedName }
   | { kind: "account"; op: AccountOp; url: string }
-  | { kind: "deny"; status: 404 };
+  | { kind: "deny"; status: 403 | 404 };
 
 /**
  * `account`: an account-feature request (usage, limits, reset credits, profile, plugins and the like). The gateway forwards it
@@ -80,28 +80,49 @@ export const RESET_CREDITS_TTL_MS = 60_000;
 const RESET_CREDITS_FAILURE_TTL_MS = 15_000;
 
 /**
- * Claude's account API, below `/api/`: oauth/*, claude_cli*, organization(s), account, bootstrap, me. The gateway forwards these
- * to Anthropic with the login of the member the app maps to (see AccountOp); every other `/api/*` path (hello, settings,
- * telemetry) is the plain pass-through. The path is matched after slash collapsing, repeated percent-decoding, lower-casing and
- * dropping `;params`.
+ * A path split into segments, each also in its normal form: repeatedly percent-decoded, `;params` dropped, lower-cased. Every
+ * classification (what is account API, what is model traffic, what mints a credential) reads the normal form; what is sent
+ * upstream is the original. Undefined: a segment cannot be decoded, decodes to a slash or backslash, or is a dot segment, so it
+ * cannot be shown safe.
  */
-const CLAUDE_ACCOUNT_PATH = /^\/api\/(?:oauth|claude_cli[^/]*|organizations?|account|bootstrap|me)(?:\/|$)/;
-
-export function isClaudeAccountPath(rest: string): boolean {
-  let p = rest;
-  for (let i = 0; i < 4; i++) {
-    const norm = collapseSlashes(p).replace(/;[^/]*/g, "").toLowerCase();
-    if (CLAUDE_ACCOUNT_PATH.test(norm)) return true;
-    let next: string;
-    try {
-      next = decodeURIComponent(p);
-    } catch {
-      return true; // undecodable: cannot be shown safe
+export function normalisePath(path: string): { segs: string[]; nsegs: string[]; norm: string } | undefined {
+  const segs = collapseSlashes(path).split("/");
+  const nsegs: string[] = [];
+  for (const seg of segs) {
+    let p = seg;
+    let settled = false;
+    for (let i = 0; i < 6; i++) {
+      let next: string;
+      try {
+        next = decodeURIComponent(p);
+      } catch {
+        return undefined;
+      }
+      if (next === p) {
+        settled = true;
+        break;
+      }
+      p = next;
     }
-    if (next === p) return false;
-    p = next;
+    if (!settled) return undefined;
+    p = p.replace(/;.*$/, "").toLowerCase();
+    if (/[/\\]/.test(p) || p === "." || p === "..") return undefined;
+    nsegs.push(p);
   }
-  return CLAUDE_ACCOUNT_PATH.test(collapseSlashes(p).replace(/;[^/]*/g, "").toLowerCase());
+  return { segs, nsegs, norm: nsegs.join("/") };
+}
+
+/** Paths that would hand the app a durable credential of the member (API keys, long-lived or OAuth tokens): never forwarded. */
+const CREDENTIAL_MINTING = /(?:^|\/)(?:create[_-]?api[_-]?key|api[_-]?keys?|oauth[_-]?tokens?|setup[_-]?tokens?|access[_-]?tokens?|create[_-]?token)(?:\/|$)|^\/api\/oauth\/(?:token|authorize)(?:\/|$)|\/oauth\/token(?:\/|$)/;
+
+/** Claude model traffic: the gateway's model path (allowlist, ledger, caps, pool failover). Everything else on the Claude host is an account call. */
+const CLAUDE_MODEL_PATH = /^\/v1\/(?:messages|complete)(?:\/|$)/;
+
+/** The index of the organisation uuid segment in `/api/organizations/<org>/...` or `/api/oauth/organizations/<org>/...` (normal form), else -1. */
+export function orgSegmentIndex(nsegs: string[]): number {
+  if (nsegs[1] !== "api") return -1;
+  const at = nsegs[2] === "oauth" ? 4 : 3;
+  return nsegs[at - 1] === "organizations" && nsegs[at] ? at : -1;
 }
 
 const CODEX_BACKEND = "https://chatgpt.com/backend-api";
@@ -129,60 +150,57 @@ function modelsRoute(provider: GatewayProvider, style: ApiStyle, id: string): Ro
   }
 }
 
-/**
- * A codex path with its ChatGPT `/backend-api` prefix taken off. `backend` is true when the prefix was there, matched after
- * slash collapsing, percent-decoding and lower-casing (so no spelling of the prefix slips through to the provider).
- */
-function codexPath(path: string): { path: string; backend: boolean } {
-  let p = path;
-  for (let i = 0; i < 4; i++) {
-    const norm = collapseSlashes(p).toLowerCase();
-    const m = /^\/backend-api(\/.*)?$/.exec(norm);
-    if (m) {
-      const tail = m[1] ?? "";
-      return { path: tail.length > 1 && tail.endsWith("/") ? tail.slice(0, -1) : tail, backend: true };
-    }
-    let next: string;
-    try {
-      next = decodeURIComponent(p);
-    } catch {
-      return { path, backend: false };
-    }
-    if (next === p) break;
-    p = next;
-  }
-  return { path, backend: false };
-}
-
 /** Decides whether `rest` (the path after the app name) is one of the special routes. Undefined: plain pass-through. */
 export function routeFor(provider: GatewayProvider, style: ApiStyle, method: string, rest: string): Route | undefined {
   const m = method.toUpperCase();
-  let path = rest.length > 1 && rest.endsWith("/") ? rest.slice(0, -1) : rest;
+  const strip = (p: string): string => (p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p);
+  const orig = strip(collapseSlashes(rest));
+  const strict = provider === "claude" || provider === "codex";
+  // A model list is a side route of its own (the id may carry an encoded slash, which pathAllowed has already vetted).
+  if (m === "GET") {
+    const models = /^(?:\/v1)?\/models(\/[^/]+)?$/.exec(orig);
+    if (models) return modelsRoute(provider, style, models[1] ?? "");
+  }
+  const n = normalisePath(orig);
+  if (!n) return strict ? { kind: "deny", status: 404 } : specialRoute(provider, style, m, orig, orig);
+  let path = strip(n.norm);
+  let origPath = orig;
   let backend = false;
-  if (provider === "codex") ({ path, backend } = codexPath(path));
-  const route = specialRoute(provider, style, m, path);
+  if (provider === "codex" && n.nsegs[1] === "backend-api") {
+    // The prefix is matched in its normal form; the tail is classified in its normal form and forwarded as the client wrote it.
+    backend = true;
+    path = strip(n.nsegs.slice(2).length > 0 ? `/${n.nsegs.slice(2).join("/")}` : "");
+    origPath = strip(n.segs.slice(2).length > 0 ? `/${n.segs.slice(2).join("/")}` : "");
+  }
+  if (provider === "claude" || provider === "codex") {
+    if (CREDENTIAL_MINTING.test(path)) return { kind: "deny", status: 403 };
+  }
+  const route = specialRoute(provider, style, m, path, origPath);
   if (backend && route?.kind !== "serve" && route?.kind !== "account") {
     // ChatGPT's account API (plugins, accounts, wham, ...) is forwarded with the member's login. Model traffic (`/codex/*`)
     // has its own pass-through, ledger and caps, so it is not reachable this way, and the bare prefix names nothing.
-    if (path === "" || path === "/" || /^\/codex(?:\/|$)/i.test(path)) return { kind: "deny", status: 404 };
-    return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${path}` };
+    if (path === "" || path === "/" || /^\/codex(?:\/|$)/.test(path)) return { kind: "deny", status: 404 };
+    return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${origPath}` };
   }
   return route;
 }
 
-function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, path: string): Route | undefined {
+/** `path` is the normal form (classification); `orig` is the client's spelling (what is sent on). */
+function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, path: string, orig: string): Route | undefined {
   if (m === "GET") {
-    const models = /^(?:\/v1)?\/models(\/[^/]+)?$/.exec(path);
+    const models = /^(?:\/v1)?\/models(\/[^/]+)?$/.exec(orig);
     if (models) return modelsRoute(provider, style, models[1] ?? "");
     if (provider === "kimi" && /^(?:\/v1)?\/usages$/.test(path)) return { kind: "account", op: "forward", url: `${KIMI_V1}/usages` };
-    if (provider === "zai" && /^\/api\/monitor\/.+/.test(path)) return { kind: "account", op: "forward", url: `https://api.z.ai${path}` };
+    if (provider === "zai" && /^\/api\/monitor\/.+/.test(path)) return { kind: "account", op: "forward", url: `https://api.z.ai${orig}` };
     if (provider === "opencode" && /^(?:\/v1)?\/usage$/.test(path)) return { kind: "account", op: "forward", url: "https://opencode.ai/zen/go/v1/usage" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits$/.test(path)) return { kind: "serve", name: "codex-reset-credits" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)\/usage$/.test(path)) return { kind: "serve", name: "codex-usage" };
   }
   if (provider === "claude") {
     if (m === "GET" && path === "/api/oauth/usage") return { kind: "account", op: "claude-usage", url: "https://api.anthropic.com/api/oauth/usage" };
-    if (isClaudeAccountPath(path)) return { kind: "account", op: /^\/api\/organizations\/[^/]+\//i.test(path) ? "claude-org" : "forward", url: `https://api.anthropic.com${path}` };
+    // Anything on the Claude host that is not a model call (account API, telemetry, settings, hello) is an account call: no
+    // allowlist, no pool hold, no failover, no forced refresh beyond the locked account one.
+    if (!CLAUDE_MODEL_PATH.test(path)) return { kind: "account", op: orgSegmentIndex(path.split("/")) >= 0 ? "claude-org" : "forward", url: `https://api.anthropic.com${orig}` };
   }
   if (m === "POST") {
     if (provider === "kimi") {
@@ -195,7 +213,7 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
     }
   }
   // The rest of codex's ChatGPT account API (wham/*, api/codex/*) sits on the backend-api host, not under the model base.
-  if (provider === "codex" && /^\/(?:wham|api\/codex)(?:\/|$)/.test(path)) return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${path}` };
+  if (provider === "codex" && /^\/(?:wham|api\/codex)(?:\/|$)/.test(path)) return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${orig}` };
   return undefined;
 }
 
