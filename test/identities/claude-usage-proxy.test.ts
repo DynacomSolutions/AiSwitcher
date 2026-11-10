@@ -71,6 +71,18 @@ describe("folders", () => {
     expect(JSON.parse(await readFile(join(dir, "settings.json"), "utf8")).env.NO_PROXY).toBe("127.0.0.1,localhost,::1");
     expect((await stat(join(dir, "settings.json"))).mode & 0o777).toBe(0o600);
   });
+  test("turning the proxy on adds user:profile to a gateway entry, and never touches a real login", async () => {
+    const gw = await mkdtemp(join(root, "gw-"));
+    await writeFile(join(gw, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE_t", refreshToken: null, scopes: ["user:inference"] } }));
+    await configureUsageProxy(gw, { proxyUrl: PROXY, caPath: "/ca.pem" });
+    expect(JSON.parse(await readFile(join(gw, ".credentials.json"), "utf8")).claudeAiOauth.scopes).toEqual(["user:inference", "user:profile"]);
+    const real = await mkdtemp(join(root, "real-"));
+    const login = JSON.stringify({ claudeAiOauth: { accessToken: "at-SYNTHETIC_FIXTURE", refreshToken: "rt-SYNTHETIC_FIXTURE", scopes: ["user:inference"] } });
+    await writeFile(join(real, ".credentials.json"), login);
+    await configureUsageProxy(real, { proxyUrl: PROXY, caPath: "/ca.pem" });
+    expect(await readFile(join(real, ".credentials.json"), "utf8")).toBe(login);
+  });
+
   test("a folder with no settings gets one; an unreadable one is not reported", async () => {
     const dir = await mkdtemp(join(root, "t3-"));
     expect(await folderUsageProxyProblem(dir)).toBeUndefined();

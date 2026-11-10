@@ -115,7 +115,28 @@ export async function configureUsageProxy(configDir: string, opts: UsageProxyOpt
   const path = join(configDir, "settings.json");
   const next = withUsageProxy(await readSettings(path), opts);
   await writeFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`);
+  await addProfileScopeToGatewayEntry(configDir);
   return next.env as Env;
+}
+
+/**
+ * With the proxy on, a gateway entry (an `aisg_` access token, no refresh token) needs `user:profile` so Claude Code asks
+ * for its limits. Only the scope list changes; a real login is never touched.
+ */
+async function addProfileScopeToGatewayEntry(configDir: string): Promise<void> {
+  const path = join(configDir, ".credentials.json");
+  let creds: Record<string, unknown>;
+  try {
+    creds = await readSettings(path);
+  } catch {
+    return;
+  }
+  const oauth = creds.claudeAiOauth as { accessToken?: unknown; refreshToken?: unknown; scopes?: unknown } | undefined;
+  if (typeof oauth?.accessToken !== "string" || !oauth.accessToken.startsWith("aisg_") || (oauth.refreshToken ?? null) !== null) return;
+  const scopes = Array.isArray(oauth.scopes) ? oauth.scopes.filter((x): x is string => typeof x === "string") : [];
+  if (scopes.includes("user:profile")) return;
+  creds.claudeAiOauth = { ...oauth, scopes: [...scopes, "user:profile"] };
+  await writeFileAtomic(path, `${JSON.stringify(creds)}\n`);
 }
 
 /** The problem with a Claude config folder's settings.json, if any (unreadable settings are not this check's concern). */
