@@ -349,3 +349,144 @@ describe("default fingerprint probe", () => {
     expect(after).not.toContain("{}");
   });
 });
+
+describe("codex browser sign-in", () => {
+  const STATE = "SYNTHETIC_FIXTURE_state";
+  const authUrl = (port: number) =>
+    `https://auth.example.com/oauth/authorize?response_type=code&redirect_uri=${encodeURIComponent(
+      `http://localhost:${port}/auth/callback`,
+    )}&state=${STATE}`;
+
+  function browserHarness(extra: Record<string, unknown> = {}, method: "browser" | "device" = "browser") {
+    const children: FakeChild[] = [];
+    const commands: string[][] = [];
+    const envs: Record<string, string>[] = [];
+    const manager = new LoginFlowManager({
+      pollIntervalMs: 5,
+      flowTimeoutMs: 60_000,
+      spawn: (cmd, opts) => {
+        commands.push(cmd);
+        envs.push(opts.env);
+        const child = new FakeChild();
+        children.push(child);
+        return child as unknown as SpawnedChild;
+      },
+      resolveBin: () => "/usr/bin/env-test-binary",
+      resolveIdentity: async (toolName: ToolConfig["toolName"], name: string) => {
+        return {
+          cfg: {
+            toolName,
+            realBinaryName: "codex",
+            envVarName: "CODEX_HOME",
+            globalMemoryProjection: "codex-developer-instructions",
+            identitiesJsonPath: "/tmp/does-not-matter.json",
+            identitiesRootDir: "/tmp/does-not-matter",
+          } as ToolConfig,
+          configDir: "/tmp/identity-config",
+          identityName: name,
+          codexLoginMethod: method,
+        };
+      },
+      fingerprint: async () => undefined,
+      ...extra,
+    });
+    return { manager, children, commands, envs };
+  }
+
+  test("runs plain codex login with no browser and surfaces the URL without a device code", async () => {
+    const h = browserHarness();
+    const flow = await h.manager.start("codex", "work");
+    expect(h.commands[0]).toEqual(["/usr/bin/env-test-binary", "login"]);
+    expect(h.envs[0]?.BROWSER).toBe("true");
+    expect(flow.acceptsPaste).toBe(true);
+    h.children[0]?.push(`Starting local login server on http://localhost:1455.\nOpen:\n${authUrl(1455)}\n`);
+    await Bun.sleep(10);
+    const got = h.manager.get(flow.flowId);
+    expect(got.authUrl).toBe(authUrl(1455));
+    expect(got.deviceCode).toBeUndefined();
+    expect(got.status).toBe("waiting");
+  });
+
+  test("rejects wrong host, path, state, port and missing code; never echoes the paste", async () => {
+    const h = browserHarness({ fetch: async () => ({ status: 200 }) });
+    const flow = await h.manager.start("codex", "work");
+    h.children[0]?.push(`${authUrl(1455)}\n`);
+    await Bun.sleep(10);
+    const bad = [
+      `http://evil.example.com:1455/auth/callback?code=SYNTHETIC_FIXTURE_c&state=${STATE}`,
+      `http://localhost:1455/other?code=SYNTHETIC_FIXTURE_c&state=${STATE}`,
+      `http://localhost:1455/auth/callback?code=SYNTHETIC_FIXTURE_c&state=wrong`,
+      `http://localhost:1456/auth/callback?code=SYNTHETIC_FIXTURE_c&state=${STATE}`,
+      `http://localhost:1455/auth/callback?state=${STATE}`,
+      "not a url",
+    ];
+    for (const value of bad) {
+      let err: unknown;
+      try {
+        await h.manager.submit(flow.flowId, value);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(HttpError);
+      expect((err as HttpError).status).toBe(400);
+      expect((err as HttpError).message).not.toContain("SYNTHETIC_FIXTURE_c");
+    }
+    expect(h.children[0]?.writes).toEqual([]);
+  });
+
+  test("replays a valid callback to the fake listener on 127.0.0.1", async () => {
+    const hits: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        hits.push(new URL(req.url).pathname + new URL(req.url).search);
+        return new Response("ok");
+      },
+    });
+    try {
+      const port = server.port as number;
+      const h = browserHarness();
+      const flow = await h.manager.start("codex", "work");
+      h.children[0]?.push(`${authUrl(port)}\n`);
+      await Bun.sleep(10);
+      await h.manager.submit(
+        flow.flowId,
+        `http://localhost:${port}/auth/callback?code=SYNTHETIC_FIXTURE_c&state=${STATE}`,
+      );
+      expect(hits).toEqual([`/auth/callback?code=SYNTHETIC_FIXTURE_c&state=${STATE}`]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("a second concurrent browser login names the identity already signing in", async () => {
+    const h = browserHarness();
+    await h.manager.start("codex", "first");
+    let err: unknown;
+    try {
+      await h.manager.start("codex", "second");
+    } catch (e) {
+      err = e;
+    }
+    expect((err as HttpError).status).toBe(409);
+    expect((err as HttpError).message).toContain('"first"');
+  });
+
+  test("cancel frees the port and kills the process", async () => {
+    const h = browserHarness();
+    const flow = await h.manager.start("codex", "first");
+    h.manager.cancel(flow.flowId);
+    expect(h.children[0]?.kills[0]).toBe("SIGTERM");
+    await h.manager.start("codex", "second");
+    expect(h.commands.length).toBe(2);
+  });
+
+  test("device identities stay on device-auth and reject paste", async () => {
+    const h = browserHarness({}, "device");
+    const flow = await h.manager.start("codex", "work");
+    expect(h.commands[0]).toEqual(["/usr/bin/env-test-binary", "login", "--device-auth"]);
+    expect(flow.acceptsPaste).toBe(false);
+    expect(h.envs[0]?.BROWSER).toBeUndefined();
+  });
+});

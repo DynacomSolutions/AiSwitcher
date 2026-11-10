@@ -54,7 +54,7 @@ export async function runIdentitiesCommand(
       const name = rest[0];
       if (!name) {
         throw new CliUsageError(
-          "Usage: ais identities update <name> --tool=<t> [--label=] [--description=] [--configDir=] [--colour=#rrggbb] [--api-key=]",
+          "Usage: ais identities update <name> --tool=<t> [--label=] [--description=] [--configDir=] [--colour=#rrggbb] [--codex-login=device|browser] [--api-key=]",
         );
       }
       const apiKey = stringFlag(flags, "api-key");
@@ -69,6 +69,13 @@ export async function runIdentitiesCommand(
           );
         }
       }
+      const codexLogin = stringFlag(flags, "codex-login");
+      if (codexLogin !== undefined) {
+        const pre = await resolveMutationTarget(flags, name, retireDeps.configs);
+        if (pre.cfg.toolName !== "codex") {
+          throw new CliUsageError(`--codex-login only applies to codex identities (got --tool=${pre.cfg.toolName}).`);
+        }
+      }
       await runNamedMutation(
         flags,
         name,
@@ -78,6 +85,7 @@ export async function runIdentitiesCommand(
             description: stringFlag(flags, "description"),
             configDir: stringFlag(flags, "configDir"),
             colour: stringFlag(flags, "colour"),
+            codexLoginMethod: codexLogin,
           });
         },
         (toolName) => `Updated "${name}" in ${toolName}'s registry.`,

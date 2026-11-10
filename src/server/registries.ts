@@ -20,7 +20,7 @@ import { findIdentityByNameOrAlias, loadIdentitiesFile, saveIdentitiesFile } fro
 import { effectiveIdentityColour, isValidIdentityColour, normaliseIdentityColour } from "../identities/colour.ts";
 import { writeAliAuthFile } from "../identities/ali-auth.ts";
 import { writeZaiAuthFile } from "../identities/zai-auth.ts";
-import type { ToolConfig } from "../identities/types.ts";
+import { isCodexLoginMethod, type ToolConfig } from "../identities/types.ts";
 import { HttpError, type RegistryDto, type RegistriesDto } from "./types.ts";
 
 async function dirExists(path: string): Promise<boolean> {
@@ -45,6 +45,7 @@ function registryDto(cfg: ToolConfig, file: Awaited<ReturnType<typeof loadIdenti
       // Always present: explicit when set, stable auto palette pick otherwise
       // (identities/colour.ts). The WebUI renders this value directly.
       effectiveColour: effectiveIdentityColour(cfg.toolName, identity.name, identity.colour),
+      ...(cfg.toolName === "codex" ? { codexLoginMethod: identity.codexLoginMethod ?? "device" } : {}),
       ...(identity.directories?.length ? { directories: identity.directories } : {}),
       ...(identity.aliases?.length ? { aliases: identity.aliases } : {}),
       ...(isRetired(identity) ? { retired: true as const } : {}),
@@ -126,12 +127,18 @@ export async function createIdentityInRegistry(toolName: string, body: CreateBod
 export async function updateIdentityInRegistry(
   toolName: string,
   name: string,
-  body: { label?: string; description?: string; configDir?: string; colour?: string },
+  body: { label?: string; description?: string; configDir?: string; colour?: string; codexLoginMethod?: string },
   configs: ToolConfig[] = Object.values(TOOL_CONFIGS),
 ): Promise<RegistryDto> {
   const cfg = requireTool(toolName, configs);
   if (body.colour !== undefined && body.colour !== "" && !isValidIdentityColour(body.colour)) {
     throw new HttpError(400, `"colour" must be #rgb or #rrggbb (e.g. #22c55e)`);
+  }
+  if (body.codexLoginMethod !== undefined) {
+    if (cfg.toolName !== "codex") throw new HttpError(400, `"codexLoginMethod" only applies to codex identities`);
+    if (!isCodexLoginMethod(body.codexLoginMethod)) {
+      throw new HttpError(400, `"codexLoginMethod" must be "device" or "browser"`);
+    }
   }
   await withRegistry(cfg, (file) =>
     updateIdentity(file, name, {
@@ -139,6 +146,7 @@ export async function updateIdentityInRegistry(
       description: body.description,
       ...(body.configDir !== undefined ? { configDir: expandPath(body.configDir) } : {}),
       ...(body.colour !== undefined ? { colour: body.colour } : {}),
+      ...(body.codexLoginMethod !== undefined ? { codexLoginMethod: body.codexLoginMethod } : {}),
     }),
   );
   return registryFor(cfg, configs);
