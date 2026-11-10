@@ -345,6 +345,15 @@ describe("grok probe", () => {
     expect(singleEntry(dto).state).toBe("unknown");
   });
 
+  test("an ISO expires_at (grok's own auth.json shape) is read as a date, not as the year in seconds", async () => {
+    const { configDir } = await statusFor("grok");
+    const expiresAt = new Date(hoursFromNow(6)).toISOString().replace("Z", "123Z"); // grok writes nanoseconds
+    await Bun.write(join(configDir, "auth.json"), JSON.stringify({ "https://auth.example.test::SYNTHETIC_FIXTURE": { key: "SYNTHETIC_FIXTURE_key", refresh_token: "SYNTHETIC_FIXTURE_refresh", expires_at: expiresAt } }));
+    const entry = singleEntry(await authStatus([configFor("grok", join(configDir, ".."))]));
+    expect(entry.state).toBe("ok");
+    expect(Date.parse(entry.expiresAt ?? "")).toBeGreaterThan(Date.now());
+  });
+
   test("missing when no known credential file exists", async () => {
     const { entry } = await statusFor("grok");
     expect(entry.state).toBe("missing");

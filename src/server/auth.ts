@@ -85,6 +85,11 @@ function findExpiry(value: unknown, depth = 0): number | undefined {
   if (typeof value === "object" && value !== null) {
     for (const [key, child] of Object.entries(value)) {
       if (/expire|expiresat|expir/i.test(key)) {
+        // A date string (grok writes "2026-11-10T13:12:18.48Z") is parsed as a date: parseFloat would read only the year.
+        if (typeof child === "string" && !/^\s*\d+(?:\.\d+)?\s*$/.test(child)) {
+          const ms = Date.parse(child);
+          if (Number.isFinite(ms)) return ms;
+        }
         const n = typeof child === "number" ? child : typeof child === "string" ? Number.parseFloat(child) : NaN;
         if (Number.isFinite(n)) {
           // Epoch seconds vs milliseconds: a value under 10^11 must be seconds.
