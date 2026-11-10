@@ -86,9 +86,12 @@ test("claude: CLAUDE_CODE_SESSION_ID is the session key and drives the name; CLA
 });
 
 async function rollout(cwd: string, id = ID, extra: object = {}) {
-  const day = join(dir, "sessions", "2026", "11", "08");
+  // Today's folder: findCodexThreadId prunes day folders older than the parent's start (minus a day), so a fixed date ages out.
+  const d = new Date();
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  const day = join(dir, "sessions", String(d.getFullYear()), p2(d.getMonth() + 1), p2(d.getDate()));
   await mkdir(day, { recursive: true });
-  const f = join(day, `rollout-2026-11-08T10-00-00-${id}.jsonl`);
+  const f = join(day, `rollout-${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T10-00-00-${id}.jsonl`);
   await writeFile(f, jl({ type: "session_meta", payload: { id, cwd, timestamp: new Date().toISOString(), ...extra } }));
   return f;
 }
