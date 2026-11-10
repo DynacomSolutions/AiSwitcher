@@ -182,7 +182,7 @@ export function LimitsPage() {
       <PoolUsageCards />
 
       {query.isLoading ? (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 6 }).map((_, i) => (
             <div key={i} className="h-52 animate-pulse rounded-xl bg-muted" />
           ))}
@@ -201,7 +201,7 @@ export function LimitsPage() {
               <ProviderLabel provider={provider} size={16} className="text-base font-semibold" />
               <Badge variant="muted">{group.length}</Badge>
             </div>
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
               {group.map((r) => (
                 <LimitCard key={`${r.provider}/${r.toolName}/${r.identity.name}`} result={r} />
               ))}

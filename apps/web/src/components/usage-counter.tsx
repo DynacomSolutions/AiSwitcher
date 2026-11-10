@@ -83,13 +83,13 @@ export function GlobalUsageCards({ title = "Global usage" }: { title?: string })
         {usage.isError && !usage.data ? (
           <p className="text-sm text-muted-foreground">Usage data is unavailable because the latest request failed.</p>
         ) : usageLoading ? (
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {Array.from({ length: 4 }).map((_, i) => (
               <div key={i} className="h-16 animate-pulse rounded-lg bg-muted" />
             ))}
           </div>
         ) : (
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <CounterCard label="Total tokens" value={formatTokens(totals.total)} sub="input + output, all providers" />
             <CounterCard label="Tokens today" value={formatTokens(totals.today)} sub="input + output since midnight" />
             <CounterCard label="Est. spend" value={formatMoney(totals.cost)} sub="all providers, all time" />

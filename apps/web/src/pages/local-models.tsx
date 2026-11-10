@@ -57,7 +57,7 @@ export function LocalModelsPage() {
                     <p className="font-mono text-xs break-all">{selected.path}</p>
                     <p className="text-muted-foreground">{mib(selected.sizeBytes)}</p>
                     <p>Start it from a terminal (the console never starts models):</p>
-                    <code className="bg-muted block rounded-md px-3 py-2 font-mono text-xs select-all">
+                    <code className="bg-muted block rounded-md px-3 py-2 font-mono text-xs break-all select-all">
                       ais local start {shellArg(selected.name)}
                     </code>
                   </>

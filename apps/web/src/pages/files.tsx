@@ -159,7 +159,7 @@ function DirectoryListing({
           <li key={`${rootKey}/${entry.name}`}>
             <button
               type="button"
-              className="grid w-full grid-cols-[auto_1fr_auto_auto] items-center gap-3 rounded-md px-2.5 py-1.5 text-left text-sm hover:bg-accent/70"
+              className="grid w-full grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-3 rounded-md px-2.5 py-1.5 text-left text-sm hover:bg-accent/70"
               onClick={() =>
                 entry.kind === "directory" ? onNavigate(fullPath) : onOpenFile(fullPath)
               }
@@ -362,7 +362,7 @@ export function FilesPage() {
         </div>
       </div>
 
-      <div className="grid items-start gap-4 lg:grid-cols-2">
+      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
         <Card className="gap-3">
           <CardHeader className="gap-3">
             <div className="flex flex-wrap items-center justify-between gap-2">

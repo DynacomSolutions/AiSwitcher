@@ -341,13 +341,13 @@ export function DashboardPage() {
       />
 
       {!data ? (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           {Array.from({ length: 4 }).map((_, i) => (
             <div key={i} className="h-28 animate-pulse rounded-xl bg-muted" />
           ))}
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <SummaryCard title="Version" value={data.version} hint={`home ${data.home}`} />
           <SummaryCard title="Uptime" value={formatUptime(data.uptimeS)} />
           <SummaryCard
@@ -376,9 +376,9 @@ export function DashboardPage() {
             Registry file and real binary resolution per wrapped tool.
           </CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        <CardContent className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {tools.map((tool) => (
-            <div key={tool.toolName} className="rounded-lg border p-3">
+            <div key={tool.toolName} className="min-w-0 rounded-lg border p-3">
               <div className="flex items-center justify-between gap-2">
                 <ToolBadge tool={tool.toolName} />
                 <Badge variant={tool.registryExists ? "success" : "destructive"}>
