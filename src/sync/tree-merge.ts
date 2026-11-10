@@ -18,7 +18,7 @@ import {
   type PurgeOptions,
   type PurgeReport,
 } from "../identities/retire-credentials.ts";
-import { SwapLockError, withClaudeLocks } from "../identities/claude-swap-lock.ts";
+import { SwapLockError, withClaudeLocks, withOauthRefreshLock } from "../identities/claude-swap-lock.ts";
 import type { LockOptions } from "../identities/pool/lock.ts";
 import { writeFileAtomic } from "../identities/pool/fs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
@@ -29,6 +29,7 @@ import { listHistories, PrefixCache, hashPrefix, TAIL_MIN_BYTES, TAIL_PLAN_FILE,
 import { mergeRegistryConflict } from "./registry.ts";
 import { isDeepStrictEqual } from "node:util";
 import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
+import { decideCredentialMerge, loadGatewayGuard, memberHere, routedNow, routedProviders, stripRoutedPiCopies, withoutProviders, type GatewayGuard, type GuardedLogin } from "./gateway-guard.ts";
 import type { SyncScope } from "./types.ts";
 
 export interface TreeMergeResult {
@@ -212,7 +213,8 @@ async function sourceWinsTie(source: string, destination: string): Promise<boole
 
 /** Machine-local, regenerated state: the newest copy wins and nothing is preserved or counted as a conflict.
  * Credentials are in it deliberately: every host refreshes its own OAuth tokens, and an archived stale token is a
- * liability rather than a recovery aid. */
+ * liability rather than a recovery aid. The claude/codex logins of plain identities are merged by mergeGuardedLogin
+ * instead, so a gateway-routed login is never synced back (gateway-guard.ts). */
 const VOLATILE_STATE = /(?:^|\/)(?:\.last-cleanup|\.last-update-result\.json|settings_cache\.json|\.last_inuse_sweep|[^/]+\.log|version\.json|bundled\/manifest\.json|known_marketplaces\.json|plugins\/synced\/.+|[^/]+\.ais-bak|subagents\/[^/]+\.meta\.json|[^/]+\.(?:signature|stamp)\.json|[^/]+\.synced-at|\.grok\/identities\/[^/]+\/sessions\/.+\/summary\.json)$|(?:^|\/)identities\/[^/]+\/(?:\.credentials\.json|credentials\.json|auth\.(?:json|toml)|credentials\/kimi-code\.json|(?:data\/)?opencode\/auth\.json)$/;
 
 /** Content digests already archived per path, so a conflict whose losing copy was preserved before is neither
@@ -306,6 +308,43 @@ async function mergeClaudeJson(source: string, destination: string, rel: string,
     console.warn(`.claude.json for ${basename(dirname(rel))} busy; will merge next sync`);
   }), result.deniedPaths);
   return true;
+}
+
+/** The claude `.credentials.json` / codex `auth.json` of a plain identity, under its refresh lock (the lock
+ * route-all-via-gateway and the gateway take): a member store copy here keeps the local file, a gateway entry is never
+ * replaced by a login and replaces one whatever the times say (gateway-guard.ts); otherwise the newest copy wins, as for
+ * every credential file. A busy lock leaves the file for the next sync. */
+async function mergeGuardedLogin(login: GuardedLogin, source: string, destination: string, rel: string, guard: GatewayGuard, result: TreeMergeResult): Promise<void> {
+  try {
+    await withOauthRefreshLock(dirname(destination), async () => {
+      const [localText, incomingText] = await Promise.all([readFile(destination, "utf8").catch(() => undefined), readFile(source, "utf8").catch(() => undefined)]);
+      const decision = decideCredentialMerge(login.tool, localText, incomingText, memberHere(guard, login));
+      if (decision === "keep-local") return;
+      if (!(await exists(destination))) {
+        if (await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths)) result.copiedFiles++;
+        return;
+      }
+      if (await filesEqual(source, destination)) {
+        await convergeMtime(source, destination, rel, result.deniedPaths);
+        return;
+      }
+      const [sourceStat, destinationStat] = await Promise.all([stat(source), stat(destination)]);
+      const sourceWins = decision === "take-incoming" || (sourceStat.mtimeMs !== destinationStat.mtimeMs ? sourceStat.mtimeMs > destinationStat.mtimeMs : await sourceWinsTie(source, destination));
+      if (sourceWins) await tolerateDenied(rel, () => copyKeepingMtime(source, destination), result.deniedPaths);
+    });
+  } catch (error) {
+    if (!(error instanceof SwapLockError && error.timedOut)) throw error;
+    console.warn(`AIS sync: ${rel} is locked by a login refresh; will merge next sync`);
+  }
+}
+
+/** Drops pi's copy of routed logins from a staged pi auth.json (the staged copy is ours), keeping its mtime for the merge. */
+async function stripStagedPiCopy(source: string, providers: string[]): Promise<void> {
+  const stripped = withoutProviders(await readFile(source, "utf8").catch(() => undefined), providers);
+  if (stripped === undefined) return;
+  const info = await stat(source);
+  await writeFile(source, stripped, { mode: 0o600 });
+  await utimes(source, info.atime, info.mtime);
 }
 
 // A hung lsof is killed; the lookup then falls back to /proc or reports unknown (callers treat unknown as open).
@@ -770,6 +809,10 @@ export async function mergeIncomingProfileTree(
     await applyTails(options.tailsDir, home, options.tailsManifest ?? await listHistories(home, scope), strict, ownerPass, result, cache);
   }
 
+  // Logins of gateway-routed identities follow their own rules (gateway-guard.ts), read after the registries merged.
+  const guard = await loadGatewayGuard(home);
+  const routedAtStart = routedNow(guard);
+
   // One lsof run per few hundred staged histories instead of a process scan (or a deferral) per file.
   const stagedHistories: string[] = [];
   for await (const source of walkFiles(incomingRoot)) {
@@ -782,6 +825,14 @@ export async function mergeIncomingProfileTree(
     const rel = pathWithin(incomingRoot, source);
     if (!rel || registries.has(rel)) continue;
     const destination = join(home, rel);
+
+    const login = guard.native.get(rel);
+    if (login) {
+      await mergeGuardedLogin(login, source, destination, rel, guard, result);
+      continue;
+    }
+    const piFile = guard.pi.get(rel);
+    if (piFile) await stripStagedPiCopy(source, routedProviders(routedAtStart, piFile.name));
 
     if (source.endsWith(".jsonl")) {
       // Identical history (even with the same unterminated tail on both hosts): nothing to merge.
@@ -852,6 +903,8 @@ export async function mergeIncomingProfileTree(
     result.preservedConflictPaths.push(rel);
   }
 
+  // A routing that arrived in this merge (or a pi copy that won by time) leaves pi holding a routed login: strip it.
+  for (const line of await stripRoutedPiCopies(guard)) console.warn(`AIS sync: ${line}`);
   await cache.save();
   await ledger.save();
   await purgeRetiredCredentialsAfterSync(configsForScope(scope), home, options.purgeRetired);

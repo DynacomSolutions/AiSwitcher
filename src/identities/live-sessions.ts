@@ -10,7 +10,7 @@ const ENV_OF: Record<SessionTool, string> = { claude: "CLAUDE_CONFIG_DIR", codex
 const DEFAULT_DIR_OF: Record<SessionTool, string> = { claude: ".claude", codex: ".codex", pi: join(".pi", "agent") };
 /** The package entry a node launcher runs when argv[1] is not named after the tool (`node …/cli.js`). */
 const PACKAGE_ENTRY_OF: Record<SessionTool, RegExp> = {
-  claude: /(^|\/)@anthropic-ai\/claude-code\/cli\.m?js$/,
+  claude: /(^|\/)@anthropic-ai\/claude-(?:code|agent-sdk)\/cli\.m?js$/,
   codex: /(^|\/)@openai\/codex\/bin\/codex(\.m?js)?$/,
   pi: /(^|\/)pi-coding-agent\/dist\/cli\.m?js$/,
 };
@@ -43,7 +43,7 @@ const envOf = (text: string): Map<string, string> => {
  * Running `tool` sessions (owned by this user) whose config folder is `configDir`: the folder variable (CLAUDE_CONFIG_DIR,
  * CODEX_HOME, PI_CODING_AGENT_DIR) when the process has it, else the tool's default folder in the process's HOME (or
  * `home`). A process is the tool when its argv[0], its executable or (a node launcher) its argv[1] is named after it or is
- * the tool's package entry (`node …/@anthropic-ai/claude-code/cli.js`); AIS helper subcommands (`claude __session-sidecar`)
+ * the tool's package entry (`node …/@anthropic-ai/claude-code/cli.js`, or the Agent SDK's bundled `…/@anthropic-ai/claude-agent-sdk/cli.js`); AIS helper subcommands (`claude __session-sidecar`)
  * are not sessions. Folders are compared after resolving symlinks. A process carrying AIS_HOST_HOME (a console-pod
  * session, whose paths are container paths under its own HOME) has its paths mapped back to the host home first. A
  * process that is the tool but whose environment cannot be read counts as a match (it may use the folder). A null

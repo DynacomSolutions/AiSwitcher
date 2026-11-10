@@ -93,6 +93,29 @@ describe("inbox apply", () => {
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
+  test("keeps the gateway entry of a routed folder and drops the pi entry of that login", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      for (const base of [".claude", ".pi"]) {
+        await mkdir(join(home, base, "identities", "alpha"), { recursive: true });
+        await writeFile(join(home, base, "identities.json"), JSON.stringify({ version: 1, identities: [{ name: "alpha", label: "alpha", configDir: join(home, base, "identities", "alpha") }] }));
+      }
+      const entry = `${JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE", refreshToken: null, expiresAt: 4_102_444_800_000 } })}\n`;
+      await writeFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), entry);
+      const login = { claudeAiOauth: { accessToken: "SYNTHETIC_FIXTURE_REMOTE_ACCESS", refreshToken: "SYNTHETIC_FIXTURE_REMOTE_REFRESH", expiresAt: 4_200_000_000_000 } };
+      const pi = { anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_A", refresh: "SYNTHETIC_FIXTURE_PI_RA", expires: 1 }, "openai-codex": { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_C", refresh: "SYNTHETIC_FIXTURE_PI_RC", expires: 1 } };
+      const tar = makeTar({}, [
+        { path: ".claude/identities/alpha/.credentials.json", class: "auth", bytes: new TextEncoder().encode(JSON.stringify(login)) },
+        { path: ".pi/identities/alpha/auth.json", class: "auth", bytes: new TextEncoder().encode(JSON.stringify(pi)) },
+      ]);
+      await applyInbox({ tar, home, clock: goodClock });
+      expect(await readFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), "utf8")).toBe(entry);
+      const piWritten = JSON.parse(await readFile(join(home, ".pi", "identities", "alpha", "auth.json"), "utf8"));
+      expect(piWritten.anthropic).toBeUndefined();
+      expect(piWritten["openai-codex"].access).toBe("SYNTHETIC_FIXTURE_PI_C");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
   test("keeps Pi and OpenCode access and refresh grants atomic", async () => {
     const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
     try {

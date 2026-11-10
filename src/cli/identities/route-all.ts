@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
@@ -8,15 +8,19 @@ import { withOauthRefreshLock, withOauthRefreshLocks } from "../../identities/cl
 import { HEARTBEAT_FRESH_MS, readHeartbeat, type GatewayHeartbeat } from "../../identities/gateway-heartbeat.ts";
 import { codexAccountOf, codexRecency, parseCodexAuth } from "../../identities/codex-auth.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, memberStoreRoot, type MemberStoreTool } from "../../identities/gateway-members.ts";
+import { backupUnique, classifyLogin } from "../../identities/gateway-routed.ts";
 import { scanLiveSessions, type SessionTool } from "../../identities/live-sessions.ts";
 import { readPiEntry } from "../../identities/oauth-reconcile.ts";
 import { withLockDir } from "../../identities/pool/grant-file-adapter.ts";
-import { createFileDurable, writeFileAtomic, writeFileDurable } from "../../identities/pool/fs.ts";
+import { writeFileAtomic, writeFileDurable } from "../../identities/pool/fs.ts";
 import { isRetired } from "../../identities/retired.ts";
 import { loadIdentitiesFile } from "../../identities/store.ts";
 import { CLAUDE_CONFIG, CODEX_CONFIG, GROK_CONFIG, KIMI_CONFIG, PI_CONFIG } from "../../identities/tool-configs.ts";
 import type { Identity } from "../../identities/types.ts";
+import { loadSyncConfig, syncConfigPath } from "../../sync/config.ts";
 import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secrets-file.ts";
+
+export { backupUnique, classifyLogin };
 
 /**
  * `ais identities route-all-via-gateway [--dry-run]`: points every local agent identity at the AIS gateway.
@@ -31,9 +35,11 @@ import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secr
  *      (active member, same refresh token or account) refuses; pi's copy in the same-named pi identity is removed after a
  *      backup (refused while any pi session runs, or when pi's copy may be the fresher one). Checked before and again
  *      under the locks, and sessions are scanned once more after the switch (reported as a warning, exit code 1);
- *   3. the login moves into the gateway's own member store (gateway-members.ts), so the gateway keeps the account after
- *      the local file changes. The store copy is written durably (flushed, renamed, folder flushed) and read back before
- *      anything local changes. A store copy already there is replaced only by a fresher login of the same account;
+ *   3. pi's copy is removed first; then the login moves into the gateway's own member store (gateway-members.ts), so the
+ *      gateway keeps the account after the local file changes. The store copy is written durably (flushed, renamed, folder
+ *      flushed) and read back before anything local changes. A store copy already there is replaced only by a fresher login
+ *      of the same account. Any failure after the store write rolls back (rollBack): the folder gets its login back and the
+ *      store copy written by this run is set aside, so the login always has exactly one holder;
  *   4. each local file about to change is copied to a unique `<file>.pre-gateway.<timestamp>.bak` (never overwritten,
  *      never deleted, flushed and read back), then the gateway entry is written: the base URL of the local gateway route
  *      and the app's `aisg_` key.
@@ -45,7 +51,11 @@ import { appTokenKey, defaultSecretsPath, readSecretsKey } from "../gateway/secr
  * login, and this command never writes one), and any file that is a symlink. A swap pool swaps by copying a member's login
  * out of the member's folder, so once its members are routed the pool's swaps no longer get a working login (codex: "no
  * usable Codex login") until the pool is routed with its own setup; the report says so for each routed pool member.
- * Re-running changes nothing for an identity already routed.
+ * Re-running changes nothing in an identity already routed, but its other holders are checked again: a swap pool or pi copy
+ * is reported (exit code 1), and pi's same-named copy is removed as on a first run.
+ *
+ * AIS sync remotes (sync/gateway-guard.ts) get the gateway entry at the next sync and never send a login back over it, but
+ * their running sessions cannot be seen from here: the report warns, naming the remotes, that those must be stopped first.
  */
 
 export const ROUTE_TOOLS = ["claude", "codex", "grok", "kimi", "pi"] as const;
@@ -74,6 +84,8 @@ export interface RouteAllOptions {
   /** /proc for the running-session check (tests pass a fake tree). */
   procRoot?: string;
   port?: number;
+  /** AIS sync config (default the user's): its remotes get the routed folders too (see sync/gateway-guard.ts). */
+  syncConfigPath?: string;
   now?: () => number;
   out?: (line: string) => void;
 }
@@ -95,11 +107,11 @@ export interface RouteReport {
   unroutedTools: Array<{ tool: string; reason: string }>;
   /** True when anything was refused or any tool is unrouted: the caller should exit non-zero. */
   incomplete: boolean;
+  /** AIS sync remotes that sync every identity folder (undefined: the sync config could not be read). */
+  syncRemotes: string[] | undefined;
 }
 
 /* ------------------------------------------------------------------ login files */
-
-type LoginKind = "login" | "gateway" | "none";
 
 function parseJson(text: string | undefined): Record<string, unknown> | undefined {
   if (text === undefined) return undefined;
@@ -112,20 +124,6 @@ function parseJson(text: string | undefined): Record<string, unknown> | undefine
 }
 
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
-
-/** What a folder's login file holds: a real refreshable login, the gateway entry, or neither (logged out, API key, Bedrock). */
-export function classifyLogin(tool: MemberStoreTool, text: string | undefined): LoginKind {
-  const json = parseJson(text);
-  if (!json) return "none";
-  if (tool === "claude") {
-    const oauth = json.claudeAiOauth as { accessToken?: unknown; refreshToken?: unknown } | undefined;
-    if (isGatewayAccessToken(oauth?.accessToken)) return "gateway";
-    return nonEmpty(oauth?.accessToken) && nonEmpty(oauth?.refreshToken) ? "login" : "none";
-  }
-  if (isGatewayAccessToken(json.OPENAI_API_KEY)) return "gateway";
-  const tokens = json.tokens as { access_token?: unknown; refresh_token?: unknown } | undefined;
-  return nonEmpty(tokens?.access_token) && nonEmpty(tokens?.refresh_token) ? "login" : "none";
-}
 
 async function readText(path: string): Promise<string | undefined> {
   try {
@@ -140,25 +138,6 @@ async function isSymlink(path: string): Promise<boolean> {
     return (await lstat(path)).isSymbolicLink();
   } catch {
     return false;
-  }
-}
-
-/**
- * `<file>.pre-gateway.<timestamp>[-n].bak`, created exclusively with mode 0600, flushed to disk and read back: an existing
- * backup is never overwritten or removed.
- */
-export async function backupUnique(path: string, now: () => number = Date.now): Promise<string | undefined> {
-  const text = await readText(path);
-  if (text === undefined) return undefined;
-  const stamp = new Date(now()).toISOString().replace(/[:.]/g, "-");
-  for (let n = 0; ; n++) {
-    const target = `${path}.pre-gateway.${stamp}${n === 0 ? "" : `-${n}`}.bak`;
-    try {
-      await createFileDurable(target, text);
-      return target;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || n > 1000) throw err;
-    }
   }
 }
 
@@ -201,42 +180,77 @@ export function loginFreshness(tool: MemberStoreTool, text: string): number | un
   return typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined;
 }
 
-interface StoreOutcome {
+interface StorePlan {
   refused?: string;
   note?: string;
+  /** Set when the folder's login goes into the store: `replacing` an older store copy of the same account, or a new one. */
+  write?: { replacing: boolean };
 }
 
 /**
- * Puts the folder's login into the member store, the copy the gateway reads from then on. Runs under the account's refresh
- * locks. A store copy already there is the gateway's live login: it is replaced only by a login of the same account that is
- * provably fresher (a fresh sign-in), after a unique backup. A different account in the folder is refused (it would move the
- * membership); an older, equally fresh or undatable local login leaves the store copy as it is (a restored or touched folder
- * may hold a refresh token the gateway already spent). The login file is written last, durably, and read back: its presence
- * is what makes the gateway switch to the store.
+ * How the folder's login gets into the member store, the copy the gateway reads from then on (nothing written yet; runs
+ * under the account's refresh locks). A store copy already there is the gateway's live login: it is replaced only by a
+ * login of the same account that is provably fresher (a fresh sign-in). A different account in the folder is refused (it
+ * would move the membership); an older, equally fresh or undatable local login leaves the store copy as it is (a restored
+ * or touched folder may hold a refresh token the gateway already spent).
  */
-async function moveLoginToStore(tool: MemberStoreTool, identity: Identity, localText: string, root: string, now: () => number): Promise<StoreOutcome> {
+async function planStoreMove(tool: MemberStoreTool, identity: Identity, localText: string, root: string): Promise<StorePlan> {
+  const dir = memberDir(tool, identity.name, root);
+  const storeText = await readText(join(dir, memberLoginFile(tool)));
+  if (!hasMemberCopy(tool, identity.name, root) || storeText === undefined) return { write: { replacing: false } };
+  if (storeText === localText) return {};
+  const [localAccount, storeAccount] = [await accountOf(tool, identity.configDir, localText), await accountOf(tool, dir, storeText)];
+  if (localAccount !== undefined && storeAccount !== undefined && localAccount !== storeAccount) {
+    return { refused: "the folder's login is a different account than the gateway's member store copy; nothing changed (sign the folder back into its own account, or give the other account its own identity)" };
+  }
+  const [localFresh, storeFresh] = [loginFreshness(tool, localText), loginFreshness(tool, storeText)];
+  if (localAccount === undefined || storeAccount === undefined) return { note: "could not confirm the folder's login is the same account as the member store copy; kept the store copy" };
+  if (localFresh === undefined || storeFresh === undefined || localFresh <= storeFresh) return { note: "the member store copy is as fresh or fresher than the folder's login (the gateway renewed it); kept it" };
+  return { write: { replacing: true } };
+}
+
+/**
+ * Writes the planned store copy: a replaced copy is backed up uniquely first. The login file is written last, durably, and
+ * read back: its presence is what makes the gateway switch to the store.
+ */
+async function writeStoreCopy(tool: MemberStoreTool, identity: Identity, localText: string, root: string, replacing: boolean, now: () => number): Promise<string | undefined> {
   const dir = memberDir(tool, identity.name, root);
   const storePath = join(dir, memberLoginFile(tool));
-  const storeText = await readText(storePath);
-  if (hasMemberCopy(tool, identity.name, root) && storeText !== undefined) {
-    if (storeText === localText) return {};
-    const [localAccount, storeAccount] = [await accountOf(tool, identity.configDir, localText), await accountOf(tool, dir, storeText)];
-    if (localAccount !== undefined && storeAccount !== undefined && localAccount !== storeAccount) {
-      return { refused: "the folder's login is a different account than the gateway's member store copy; nothing changed (sign the folder back into its own account, or give the other account its own identity)" };
-    }
-    const [localFresh, storeFresh] = [loginFreshness(tool, localText), loginFreshness(tool, storeText)];
-    if (localAccount === undefined || storeAccount === undefined) return { note: "could not confirm the folder's login is the same account as the member store copy; kept the store copy" };
-    if (localFresh === undefined || storeFresh === undefined || localFresh <= storeFresh) return { note: "the member store copy is as fresh or fresher than the folder's login (the gateway renewed it); kept it" };
+  if (replacing) {
     const b = await backupUnique(storePath, now);
     await writeAccountRecord(tool, identity, dir);
     await writeFileDurable(storePath, localText);
-    return { note: `the fresher local login of the same account replaced the member store copy (old copy backed up to ${b})` };
+    return `the fresher local login of the same account replaced the member store copy (old copy backed up to ${b})`;
   }
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await chmod(dir, 0o700);
   await writeAccountRecord(tool, identity, dir);
   await writeFileDurable(storePath, localText);
-  return {};
+  return undefined;
+}
+
+/**
+ * Undoes a switch that failed after the store copy was written, so the login has exactly one holder again: the folder gets
+ * its login back (when it changed), then the store copy this run wrote is set aside (renamed, never deleted), so the gateway
+ * reads the folder as before. When the folder cannot be restored the store copy stays active: it is then the only holder.
+ */
+async function rollBack(tool: MemberStoreTool, identity: Identity, localText: string, root: string, wroteStore: boolean, now: () => number): Promise<string> {
+  const loginPath = join(identity.configDir, memberLoginFile(tool));
+  try {
+    if ((await readText(loginPath)) !== localText) await writeFileDurable(loginPath, localText);
+  } catch (err) {
+    return `rollback could not restore the folder's login (${(err as NodeJS.ErrnoException).code ?? "error"}); the gateway keeps the login in its member store, the folder's own copy is in its .pre-gateway backup`;
+  }
+  if (!wroteStore) return "rolled back: the folder holds its login again";
+  const storePath = join(memberDir(tool, identity.name, root), memberLoginFile(tool));
+  const aside = `${storePath}.rolled-back.${new Date(now()).toISOString().replace(/[:.]/g, "-")}.bak`;
+  try {
+    await rename(storePath, aside);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "rolled back: the folder holds its login again";
+    return `rollback restored the folder's login but could not set the member store copy aside (${(err as NodeJS.ErrnoException).code ?? "error"}): both hold the login now; move ${storePath} away by hand before the gateway or a session refreshes it`;
+  }
+  return `rolled back: the folder holds its login again and the gateway reads it from there (store copy set aside as ${aside})`;
 }
 
 /** claude: only the account record of `.claude.json` (swap logic compares its uuid); the rest is large, local and changes constantly. */
@@ -555,8 +569,8 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   const line = { tool, identity: identity.name };
   const dir = identity.configDir;
   if (await isRoutedAlready(tool, dir, token, base, helper)) {
-    const lost = !identity.swapPool && !hasMemberCopy(tool, identity.name, root);
-    return { ...line, status: "already-routed", ...(lost ? { detail: "the gateway member store holds no login for it" } : {}) };
+    if (identity.swapPool) return { ...line, status: "already-routed" };
+    return alreadyRouted(identity, ctx);
   }
   if (identity.swapPool) {
     return { ...line, status: "refused", detail: "swap pool folder: it holds a copy of a member's login and this command never writes one; once its members are routed, swaps to them no longer get a working login (codex: \"no usable Codex login\") until the pool is routed with its own setup" };
@@ -596,20 +610,30 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     const holdersNow = await holdersProblem(identity, ctx, localText);
     if (holdersNow.refused) return holdersNow.refused;
     const nowKind = classifyLogin(tool, localText);
-    if (nowKind === "login") {
-      const moved = await moveLoginToStore(tool, identity, localText!, root, now);
-      if (moved.refused) return moved.refused;
-      if (moved.note) notes.push(moved.note);
-    }
-    // Nothing local changes unless the store demonstrably holds a usable login now.
-    if (!hasMemberCopy(tool, identity.name, root)) {
-      return nowKind === "login" ? "the member store copy could not be confirmed after writing it; nothing local changed" : "the login disappeared while waiting for the lock; nothing changed";
-    }
-    // pi's copy goes before the folder changes: a failure here leaves the folder as it was.
+    const plan = nowKind === "login" ? await planStoreMove(tool, identity, localText!, root) : {};
+    if (plan.refused) return plan.refused;
+    if (nowKind !== "login" && !hasMemberCopy(tool, identity.name, root)) return "the login disappeared while waiting for the lock; nothing changed";
+    // pi's copy goes first: a failure here (PiChanged, EACCES) leaves the store and the folder as they were.
     for (const r of holdersNow.piRemovals) notes.push(await removePiCopy(r, now));
-    if (tool === "codex") await ensureCodexHelper(helper);
-    notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, now) : await applyCodex(dir, token, base, helper, now)));
     removedPi = holdersNow.piRemovals.length > 0;
+    if (plan.note) notes.push(plan.note);
+    // From the store write on, a failure rolls back so the login has exactly one holder (the folder, or else the store).
+    let wroteStore = false;
+    try {
+      if (plan.write) {
+        wroteStore = true;
+        const note = await writeStoreCopy(tool, identity, localText!, root, plan.write.replacing, now);
+        if (note) notes.push(note);
+      }
+      // Nothing local changes unless the store demonstrably holds a usable login now.
+      if (!hasMemberCopy(tool, identity.name, root)) throw Object.assign(new Error("the member store copy could not be confirmed after writing it"), { code: "EVERIFY" });
+      if (tool === "codex") await ensureCodexHelper(helper);
+      notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, now) : await applyCodex(dir, token, base, helper, now)));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.name : "error");
+      if (nowKind !== "login") return `failed while completing the gateway entry (${code}); the member store still holds the login`;
+      return `failed while switching (${code}); ${await rollBack(tool, identity, localText!, root, wroteStore, now)}${removedPi ? `; ${notes.filter((n) => n.startsWith("pi identity")).join("; ")}` : ""}`;
+    }
     return undefined;
   });
   if (outcome) return { ...line, status: "refused", detail: outcome };
@@ -617,6 +641,36 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   const late = await lateSessions(tool, dir, removedPi, opts);
   if (late) notes.push(late);
   return { ...line, status: "routed", ...(late ? { attention: true } : {}), ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) };
+}
+
+/**
+ * An identity routed before still must have no other holder: a swap pool or pi copy that appeared since (or that an older
+ * build left) is reported with attention (exit code 1); pi's same-named copy is removed as on a first run.
+ */
+async function alreadyRouted(identity: Identity, ctx: ToolContext): Promise<RouteLine> {
+  const { tool, root, opts, now } = ctx;
+  const line = { tool, identity: identity.name, status: "already-routed" as const };
+  const notes: string[] = hasMemberCopy(tool, identity.name, root) ? [] : ["the gateway member store holds no login for it"];
+  const loginPath = join(identity.configDir, memberLoginFile(tool));
+  const holders = await holdersProblem(identity, ctx, await readText(loginPath));
+  const done = (attention: boolean): RouteLine => ({ ...line, ...(attention ? { attention: true } : {}), ...(notes.length > 0 ? { detail: notes.join("; ") } : {}) });
+  if (holders.refused) {
+    notes.push(`but ${holders.refused}`);
+    return done(true);
+  }
+  if (holders.piRemovals.length === 0) return done(false);
+  if (opts.dryRun) {
+    notes.push(...holders.piRemovals.map((r) => `pi identity ${r.name}'s ${r.provider} entry would be removed (backed up)`));
+    return done(false);
+  }
+  const problem = await withOauthRefreshLocks([identity.configDir, memberDir(tool, identity.name, root)], async () => {
+    const again = await holdersProblem(identity, ctx, await readText(loginPath));
+    if (again.refused) return again.refused;
+    for (const r of again.piRemovals) notes.push(await removePiCopy(r, now));
+    return undefined;
+  });
+  if (problem) notes.push(`but ${problem}`);
+  return done(problem !== undefined);
 }
 
 /** Sessions found right after the switch (folder, and any pi session when pi's copy was removed), as a warning. */
@@ -668,7 +722,30 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
       }
     }
   }
-  return { lines, unroutedTools, incomplete: unroutedTools.length > 0 || lines.some((l) => l.status === "refused" || l.attention === true) };
+  const syncRemotes = await loadSyncConfig(opts.syncConfigPath ?? syncConfigPath(process.env, opts.home ?? homedir())).then(
+    (c) => c.remotes,
+    () => undefined,
+  );
+  return { lines, unroutedTools, incomplete: unroutedTools.length > 0 || lines.some((l) => l.status === "refused" || l.attention === true), syncRemotes };
+}
+
+/**
+ * The warning for hosts this one syncs with. Their copies of a routed login cannot be checked from here: a session there
+ * that started before the gateway entry arrived keeps the old login in memory, and its next refresh spends the refresh
+ * token the gateway renews. Sync carries the gateway entry there and never copies a login back (sync/gateway-guard.ts).
+ */
+export function syncWarning(report: RouteReport): string[] {
+  const touched = report.lines.filter((l) => l.status === "routed" || l.status === "would-route").map((l) => `${l.tool}/${l.identity}`);
+  if (touched.length === 0) return [];
+  if (report.syncRemotes === undefined) {
+    return [`WARNING: the AIS sync config could not be read, so this run cannot tell which hosts sync ${touched.join(", ")}; on every host that syncs with this one, stop their Claude Code, Codex and pi sessions first (see docs/agents/gateway.md)`];
+  }
+  if (report.syncRemotes.length === 0) return [];
+  return [
+    `WARNING: AIS sync copies the folders of ${touched.join(", ")} to ${report.syncRemotes.join(", ")}.`,
+    `  Before routing, stop every Claude Code, Codex and pi session of these identities on ${report.syncRemotes.length === 1 ? "that host" : "those hosts"}: this run cannot see them, and one that keeps the old login in memory spends the gateway's refresh token at its next refresh (refresh_token_reused).`,
+    "  The next sync gives their folders the gateway entry, strips pi's copy there, and never copies their login back here; every synced host must run an AIS build with this sync guard.",
+  ];
 }
 
 /* ------------------------------------------------------------------ output */
@@ -677,6 +754,7 @@ export function formatReport(report: RouteReport, title: string): string[] {
   const out: string[] = [title];
   for (const l of report.lines) out.push(`  ${l.tool}/${l.identity}: ${l.status}${l.detail ? ` (${l.detail})` : ""}`);
   for (const t of report.unroutedTools) out.push(`  ${t.tool}: NOT ROUTED, ${t.reason}`);
+  out.push(...syncWarning(report));
   const count = (s: RouteStatus): number => report.lines.filter((l) => l.status === s).length;
   out.push(`summary: ${report.lines.length} identities; routed ${count("routed")}, would route ${count("would-route")}, already routed ${count("already-routed")}, refused ${count("refused")}; tools without a route ${report.unroutedTools.length}`);
   return out;

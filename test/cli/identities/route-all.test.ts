@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backupUnique, classifyLogin, codexConfigRouted, codexKeyHelperPath, heldProblem, routeAllViaGateway, routeCodexConfigText, runRouteAllViaGateway, type RouteAllOptions } from "../../../src/cli/identities/route-all.ts";
@@ -503,6 +503,85 @@ describe("route-all-via-gateway: pi's copy of the login", () => {
     r = await routeAllViaGateway(opts);
     expect(claudeLine(r, "alpha")?.detail).toContain("pi identity other holds this login's refresh token");
     expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+  });
+});
+
+describe("route-all-via-gateway: a failure after the store write rolls back to one holder", () => {
+  const storeFiles = async (tool: string, id: string) => (await files(storeOf(tool, id))).filter((f) => f.includes(".rolled-back."));
+  test("the entry written, then the settings write fails: the folder gets its login back, the store copy is set aside", async () => {
+    await heartbeat();
+    await rm(join(dirOf(".claude", "alpha"), "settings.json"));
+    await mkdir(join(dirOf(".claude", "alpha"), "settings.json"));
+    await rm(join(dirOf(".codex", "alpha"), "config.toml"));
+    await mkdir(join(dirOf(".codex", "alpha"), "config.toml"));
+    const r = await routeAllViaGateway(opts);
+    for (const [tool, dirName, file, login] of [["claude", ".claude", ".credentials.json", claudeLogin("alpha")], ["codex", ".codex", "auth.json", codexLogin("alpha")]] as const) {
+      const l = r.lines.find((x) => x.tool === tool && x.identity === "alpha");
+      expect(l?.status).toBe("refused");
+      expect(l?.detail).toContain("the folder holds its login again and the gateway reads it from there");
+      expect(hasMemberCopy(tool, "alpha", opts.memberRoot)).toBe(false);
+      expect((await storeFiles(tool, "alpha")).length).toBe(1);
+      expect(await readFile(join(dirOf(dirName, "alpha"), file), "utf8")).toBe(login);
+    }
+    // beta was not affected
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+  });
+
+  test("pi's copy is removed before the store write", async () => {
+    await writeFile(join(dirOf(".pi", "alpha"), "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "a", refresh: "rt-SYNTHETIC_FIXTURE-alpha", expires: 1 } }));
+    await heartbeat();
+    await chmod(dirOf(".pi", "alpha"), 0o500);
+    try {
+      const r = await routeAllViaGateway(opts);
+      expect(claudeLine(r, "alpha")?.status).toBe("refused");
+    } finally {
+      await chmod(dirOf(".pi", "alpha"), 0o700);
+    }
+    // nothing reached the store: the folder alone (and pi's untouched copy) hold the login, as before
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+    expect(await readFile(join(dirOf(".claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+  });
+});
+
+describe("route-all-via-gateway: already routed identities are checked again", () => {
+  test("a pi copy that appeared since is removed; a swap pool holding the login is reported with attention", async () => {
+    await heartbeat();
+    expect(claudeLine(await routeAllViaGateway(opts), "alpha")?.status).toBe("routed");
+    // pi got a copy of the store's login again (an older build, a restore)
+    await writeFile(join(dirOf(".pi", "alpha"), "auth.json"), JSON.stringify({ anthropic: { type: "oauth", access: "a", refresh: "rt-SYNTHETIC_FIXTURE-alpha", expires: 1 } }));
+    let r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("already-routed");
+    expect(claudeLine(r, "alpha")?.detail).toContain("removed its anthropic entry");
+    expect(JSON.parse(await readFile(join(dirOf(".pi", "alpha"), "auth.json"), "utf8")).anthropic).toBeUndefined();
+
+    await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));
+    r = await routeAllViaGateway(opts);
+    expect(claudeLine(r, "alpha")?.status).toBe("already-routed");
+    expect(claudeLine(r, "alpha")?.attention).toBe(true);
+    expect(claudeLine(r, "alpha")?.detail).toContain("swap pool pool holds a copy of this login");
+    expect(r.incomplete).toBe(true);
+  });
+});
+
+describe("route-all-via-gateway: AIS sync remotes", () => {
+  test("the report names the sync remotes and says to stop sessions there first; no remotes, no warning", async () => {
+    await heartbeat();
+    const syncConfig = join(home, "sync-v2.json");
+    const report = async () => {
+      const out: string[] = [];
+      const saved = process.exitCode;
+      await runRouteAllViaGateway({ "dry-run": true }, { ...opts, syncConfigPath: syncConfig, out: (l) => out.push(l) });
+      process.exitCode = saved;
+      return out.join("\n");
+    };
+    expect(await report()).not.toContain("WARNING: AIS sync");
+    await writeFile(syncConfig, JSON.stringify({ version: 2, remotes: ["hq1"] }));
+    const text = await report();
+    expect(text).toContain("WARNING: AIS sync copies the folders of claude/alpha, claude/beta, codex/alpha to hq1");
+    expect(text).toContain("stop every Claude Code, Codex and pi session");
+    await writeFile(syncConfig, "{ not json");
+    expect(await report()).toContain("the AIS sync config could not be read");
   });
 });
 

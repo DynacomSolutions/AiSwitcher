@@ -24,8 +24,8 @@ const TOOL_OF_REGISTRY_DIR: Record<string, MemberStoreTool> = { ".claude": "clau
 
 export const isMemberStoreTool = (tool: string): tool is MemberStoreTool => (MEMBER_STORE_TOOLS as readonly string[]).includes(tool);
 
-/** AIS_GATEWAY_MEMBERS_DIR overrides the location (tests, odd layouts). */
-export const memberStoreRoot = (): string => process.env.AIS_GATEWAY_MEMBERS_DIR || join(aisHome(), "gateway-members");
+/** AIS_GATEWAY_MEMBERS_DIR overrides the location (tests, odd layouts). `home` re-roots the default (a sync merge into another home). */
+export const memberStoreRoot = (home?: string): string => process.env.AIS_GATEWAY_MEMBERS_DIR || join(aisHome(home), "gateway-members");
 
 export const memberDir = (tool: string, name: string, root: string = memberStoreRoot()): string => join(root, tool, name);
 

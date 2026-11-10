@@ -2,7 +2,8 @@ import { isGatewayRoutedDir } from "./claude-gateway-entry.ts";
 import { expandPath } from "./match.ts";
 import { poolsOf } from "./pool/swap-pool.ts";
 import { heartbeatHolds } from "./gateway-heartbeat.ts";
-import { hasMemberCopy } from "./gateway-members.ts";
+import { hasMemberCopy, isMemberStoreTool } from "./gateway-members.ts";
+import { folderHoldsGatewayEntry } from "./gateway-routed.ts";
 import { adapterFor } from "../gateway/providers/index.ts";
 import { isRetired } from "./retired.ts";
 import { loadIdentitiesFile } from "./store.ts";
@@ -77,15 +78,33 @@ export async function listGatewayManagedAccounts(registryPath?: string, tool: st
 }
 
 /**
+ * True when the identity's own folder holds the pure gateway entry while this host has no member store copy: another host
+ * routed it (`ais identities route-all-via-gateway`) and AIS sync carried the entry here. That host's gateway renews the
+ * login, so nothing here may refresh it, nor reconcile pi's same-named copy into the folder (a refresh here would spend the
+ * single-use refresh token the gateway renews). Unreadable registry or a tool without a member store: false.
+ */
+async function routedElsewhere(tool: string, identityName: string, registryPath?: string): Promise<boolean> {
+  if (!isMemberStoreTool(tool)) return false;
+  try {
+    const identity = (await loadIdentitiesFile(registryPath ?? REGISTRY_OF[tool])).identities.find((i) => i.name === identityName);
+    return identity !== undefined && folderHoldsGatewayEntry(tool, identity);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True when this process must not refresh, converge, reconcile or write the account's login: the gateway owns it (see
  * listGatewayManagedAccounts) and this process is not the gateway server. claude is decided by the pool routing marker;
  * codex, grok and kimi also need a fresh gateway heartbeat naming the login (see gateway-heartbeat.ts). An account whose login
  * was moved into the gateway member store is the gateway's whatever the heartbeat says: its local folder holds only the
- * gateway entry, and a refresh here would fork the gateway's rotating refresh token. Unreadable registry or unserved tool:
+ * gateway entry, and a refresh here would fork the gateway's rotating refresh token. So is one whose folder holds the
+ * gateway entry synced from the host that routed it (routedElsewhere). Unreadable registry or unserved tool:
  * not managed.
  */
 export async function isGatewayManagedHere(tool: string, identityName: string, registryPath?: string): Promise<boolean> {
   if (!isGatewayOwnerProcess() && hasMemberCopy(tool, identityName)) return true;
+  if (!isGatewayOwnerProcess() && (await routedElsewhere(tool, identityName, registryPath))) return true;
   if ((GATEWAY_SESSION_TOOLS as readonly string[]).includes(tool)) {
     // A session tool is the gateway's only while a fresh heartbeat names it, so a stopped gateway hands it back at once.
     if (isGatewayOwnerProcess() || !(await heartbeatHolds(tool, identityName))) return false;

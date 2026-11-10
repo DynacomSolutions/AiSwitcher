@@ -50,8 +50,10 @@ test("node cli.js launches, symlinked folders, console-pod paths and pi sessions
   await fake(34, ["claude"], { HOME: "/home/ais", AIS_HOST_HOME: root });
   await fake(35, ["node", "/x/pi-coding-agent/dist/cli.js"], { PI_CODING_AGENT_DIR: want });
   await fake(36, ["pi"], { HOME: root });
+  // the Agent SDK's bundled Claude Code
+  await fake(37, ["node", "/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js"], { CLAUDE_CONFIG_DIR: want });
   const opts = { procRoot: join(root, "proc"), home: root };
-  expect(await liveSessionPids("claude", want, opts)).toEqual([31, 32, 33]);
+  expect(await liveSessionPids("claude", want, opts)).toEqual([31, 32, 33, 37]);
   expect(await liveSessionPids("claude", join(root, ".claude"), opts)).toEqual([34]);
   expect(await liveSessionPids("pi", want, opts)).toEqual([35]);
   expect(await liveSessionPids("pi", join(root, ".pi", "agent"), opts)).toEqual([36]);
