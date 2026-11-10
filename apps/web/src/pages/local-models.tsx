@@ -44,7 +44,7 @@ export function LocalModelsPage() {
         </div>
       ) : null}
       {data && data.runner === null ? (
-        <Badge variant="warning">Runner missing: install llama-cli or set AIS_LLAMA_BIN to start models</Badge>
+        <Badge variant="warning" className="whitespace-normal text-left">Runner missing: install llama-cli or set AIS_LLAMA_BIN to start models</Badge>
       ) : null}
       {data ? (
         <>

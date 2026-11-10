@@ -102,6 +102,12 @@ beforeAll(async () => {
     stderr: Bun.file(join(runDir, "daemon.log")),
     env: {
       ...process.env,
+      // No llama.cpp runner on any host, so /local-models always shows its long "Runner missing" badge (as on CI).
+      PATH: (process.env.PATH ?? "")
+        .split(":")
+        .filter((dir) => dir && !existsSync(join(dir, "llama-cli")))
+        .join(":"),
+      AIS_LLAMA_BIN: "",
       HOME: home,
       AIS_WEB_STATE_DIR: join(runDir, "state"),
       AIS_WEB_DIST: distDir,
