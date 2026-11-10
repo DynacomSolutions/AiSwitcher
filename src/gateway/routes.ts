@@ -40,7 +40,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 export type Route =
   | { kind: "upstream"; url: string; side: boolean }
   | { kind: "serve"; name: ServedName }
-  | { kind: "account"; op: AccountOp; url: string }
+  | { kind: "account"; op: AccountOp; url: string; /** false: not counted against the daily side limit (telemetry and the like). */ count?: false }
   | { kind: "deny"; status: 403 | 404 };
 
 /**
@@ -115,8 +115,16 @@ export function normalisePath(path: string): { segs: string[]; nsegs: string[]; 
 /** Paths that would hand the app a durable credential of the member (API keys, long-lived or OAuth tokens): never forwarded. */
 const CREDENTIAL_MINTING = /(?:^|\/)(?:create[_-]?api[_-]?key|api[_-]?keys?|oauth[_-]?tokens?|setup[_-]?tokens?|access[_-]?tokens?|create[_-]?token)(?:\/|$)|^\/api\/oauth\/(?:token|authorize)(?:\/|$)|\/oauth\/token(?:\/|$)/;
 
-/** Claude model traffic: the gateway's model path (allowlist, ledger, caps, pool failover). Everything else on the Claude host is an account call. */
-const CLAUDE_MODEL_PATH = /^\/v1\/(?:messages|complete)(?:\/|$)/;
+/**
+ * Claude model traffic: the gateway's model path (allowlist where the body names a model, ledger, caps, pool hold and failover).
+ * Every `/v1/*` path is model traffic (messages, batches, complete, sessions, ...) except `/v1/models` (a side route) and
+ * `/v1/oauth*` (account). Everything outside `/v1/` on the Claude host is an account call.
+ */
+const CLAUDE_MODEL_PATH = /^\/v1\/(?!oauth(?:\/|$))/;
+/** Telemetry-style Claude calls: forwarded and logged, but not counted against the daily side limit (a busy client must not lock itself out of usage, profile and redeem). */
+const CLAUDE_UNCOUNTED = /^\/api\/(?:event_logging|claude_code|hello|eval)(?:\/|$)/;
+/** Codex calls that run a model through the ChatGPT backend: cloud tasks and conversations (writes only; GET listings are account reads). */
+const CODEX_MODEL_WRITE = /^\/(?:wham\/tasks(?:\/.*)?|conversation|f\/conversation)$/;
 
 /** The index of the organisation uuid segment in `/api/organizations/<org>/...` or `/api/oauth/organizations/<org>/...` (normal form), else -1. */
 export function orgSegmentIndex(nsegs: string[]): number {
@@ -176,10 +184,12 @@ export function routeFor(provider: GatewayProvider, style: ApiStyle, method: str
     if (CREDENTIAL_MINTING.test(path)) return { kind: "deny", status: 403 };
   }
   const route = specialRoute(provider, style, m, path, origPath);
-  if (backend && route?.kind !== "serve" && route?.kind !== "account") {
+  if (backend && route?.kind !== "serve" && route?.kind !== "account" && route?.kind !== "upstream") {
     // ChatGPT's account API (plugins, accounts, wham, ...) is forwarded with the member's login. Model traffic (`/codex/*`)
     // has its own pass-through, ledger and caps, so it is not reachable this way, and the bare prefix names nothing.
-    if (path === "" || path === "/" || /^\/codex(?:\/|$)/.test(path)) return { kind: "deny", status: 404 };
+    if (path === "" || path === "/") return { kind: "deny", status: 404 };
+    // Model traffic (`/codex/*`) goes through the model path: ledger, caps, pool selection and failover.
+    if (/^\/codex(?:\/|$)/.test(path)) return { kind: "upstream", url: `${CODEX_BACKEND}${origPath}`, side: false };
     return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${origPath}` };
   }
   return route;
@@ -200,7 +210,9 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
     if (m === "GET" && path === "/api/oauth/usage") return { kind: "account", op: "claude-usage", url: "https://api.anthropic.com/api/oauth/usage" };
     // Anything on the Claude host that is not a model call (account API, telemetry, settings, hello) is an account call: no
     // allowlist, no pool hold, no failover, no forced refresh beyond the locked account one.
-    if (!CLAUDE_MODEL_PATH.test(path)) return { kind: "account", op: orgSegmentIndex(path.split("/")) >= 0 ? "claude-org" : "forward", url: `https://api.anthropic.com${orig}` };
+    if (!CLAUDE_MODEL_PATH.test(path)) {
+      return { kind: "account", op: orgSegmentIndex(path.split("/")) >= 0 ? "claude-org" : "forward", url: `https://api.anthropic.com${orig}`, ...(CLAUDE_UNCOUNTED.test(path) ? { count: false as const } : {}) };
+    }
   }
   if (m === "POST") {
     if (provider === "kimi") {
@@ -212,6 +224,7 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
       if (/^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits\/consume$/.test(path)) return { kind: "account", op: "codex-consume", url: `${CODEX_BACKEND}/wham/rate-limit-reset-credits/consume` };
     }
   }
+  if (provider === "codex" && m !== "GET" && m !== "HEAD" && CODEX_MODEL_WRITE.test(path)) return { kind: "upstream", url: `${CODEX_BACKEND}${orig}`, side: false };
   // The rest of codex's ChatGPT account API (wham/*, api/codex/*) sits on the backend-api host, not under the model base.
   if (provider === "codex" && /^\/(?:wham|api\/codex)(?:\/|$)/.test(path)) return { kind: "account", op: "forward", url: `${CODEX_BACKEND}${orig}` };
   return undefined;

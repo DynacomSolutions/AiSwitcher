@@ -317,27 +317,49 @@ describe("served from pool state", () => {
     expect(seen).toHaveLength(0);
   });
 
-  for (const [method, path] of [
-    ["GET", "/backend-api"],
-    ["POST", "/backend-api/codex/responses"],
-    ["GET", "/BACKEND-API/codex/models"],
-  ] as const) {
-    test(`codex ${method} ${path} is model traffic or nothing: 404, never reaches the provider`, async () => {
-      await addApp("c", "codex", "openai");
-      const res = await call("c", path, { method, ...(method === "POST" ? { body: "{}" } : {}) });
-      expect(res.status).toBe(404);
-      expect(seen).toHaveLength(0);
-    });
-  }
+  test("the bare /backend-api prefix names nothing: 404, never reaches the provider", async () => {
+    await addApp("c", "codex", "openai");
+    expect((await call("c", "/backend-api", { method: "GET" })).status).toBe(404);
+    expect(seen).toHaveLength(0);
+  });
 
-  for (const path of ["/backend-api/%63odex/responses", "/backend-api/codex;x/responses", "/backend-api/%2563odex/responses", "/%62ackend-api/CODEX/responses", "/backend-api/co%64ex"]) {
-    test(`codex ${path} is model traffic however it is spelled: 404, never reaches the provider`, async () => {
-      await addApp("c", "codex", "openai");
-      const res = await call("c", path, { method: "POST", body: "{}" });
-      expect(res.status).toBe(404);
+  const modelBody = (model: string): string => JSON.stringify({ model, input: "x" });
+  for (const [method, path, want] of [
+    ["POST", "/backend-api/codex/responses", "/backend-api/codex/responses"],
+    ["POST", "/backend-api/%63odex/responses", "/backend-api/%63odex/responses"],
+    ["POST", "/backend-api/codex;x/responses", "/backend-api/codex;x/responses"],
+    ["POST", "/backend-api/%2563odex/responses", "/backend-api/%2563odex/responses"],
+    ["POST", "/%62ackend-api/CODEX/responses", "/backend-api/CODEX/responses"],
+    ["POST", "/backend-api/conversation", "/backend-api/conversation"],
+    ["POST", "/backend-api/f/conversation", "/backend-api/f/conversation"],
+    ["POST", "/backend-api/wham/tasks", "/backend-api/wham/tasks"],
+    ["POST", "/wham/tasks/abc/retry", "/backend-api/wham/tasks/abc/retry"],
+  ] as const) {
+    test(`codex ${method} ${path} runs a model: the model path (allowlist, ledger), never an account forward`, async () => {
+      await addApp("c", "codex", "openai", { models: ["only-this-model"] });
+      const refused = await call("c", path, { method, body: modelBody("other-model") });
+      expect(refused.status).toBeGreaterThanOrEqual(400);
       expect(seen).toHaveLength(0);
+      const ok = await call("c", path, { method, body: modelBody("only-this-model") });
+      expect(ok.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(new URL(seen[0]!.url).pathname.toLowerCase()).toBe(want.toLowerCase());
+      expect(requests.filter((r) => r.status === "ok")).toHaveLength(1); // a ledger/metrics row, as for chat
     });
   }
+  test("codex cloud task listings are account reads: forwarded, no model path", async () => {
+    await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
+    await call("c", "/backend-api/wham/tasks/list", { method: "GET" });
+    expect(seen).toHaveLength(1);
+    expect(new URL(seen[0]!.url).pathname).toBe("/backend-api/wham/tasks/list");
+  });
+  test("a codex model call that hits the daily token cap is refused like chat", async () => {
+    await addApp("c", "codex", "openai", { dailyTokens: 1 });
+    await store.appendUsage([{ ts: NOW.toISOString(), app: "c", provider: "codex", identity: "a", inputTokens: 5, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, status: "ok", httpStatus: 200, latencyMs: 1, streamed: false }]);
+    expect((await call("c", "/backend-api/conversation", { method: "POST", body: modelBody("m") })).status).toBe(429);
+    expect(seen).toHaveLength(0);
+  });
+
   test("a codex account path is forwarded as the client wrote it (case kept), classified in normal form", async () => {
     await addApp("c", "codex", "openai", { target: { kind: "pin", identity: "a" } });
     await call("c", "/BACKEND-api/files/file-AbC123", { method: "GET" });
@@ -514,6 +536,33 @@ describe("claude account paths", () => {
     const res = await call("cl", "/api/event_logging/batch", { method: "POST", body: stream, duplex: "half" } as RequestInit);
     expect(res.status).toBe(413);
     expect(seen).toHaveLength(0);
+  });
+  for (const path of ["/v1/sessions", "/v1/messages/batches", "/v1/complete", "/v1/whatever"]) {
+    test(`claude POST ${path} is model traffic: allowlist, ledger row, pool failover on 429`, async () => {
+      await addApp("cl", "claude", "anthropic", { models: ["only-this-model"] });
+      const refused = await call("cl", path, { method: "POST", body: '{"model":"other-model"}' });
+      expect(refused.status).toBeGreaterThanOrEqual(400);
+      expect(seen).toHaveLength(0);
+      usage.a = { status: "live", maxUtilization: 10, capturedAt: "" };
+      usage.b = { status: "live", maxUtilization: 50, capturedAt: "" };
+      reply = (s) => (s.headers.get("authorization") === "Bearer tok-a" ? new Response("{}", { status: 429, headers: { "retry-after": "5" } }) : Response.json({ ok: true }));
+      const ok = await call("cl", path, { method: "POST", body: '{"model":"only-this-model"}' });
+      expect(ok.status).toBe(200);
+      expect(seen.map((x) => x.headers.get("authorization"))).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+      expect(requests.length).toBeGreaterThan(0);
+    });
+  }
+  test("telemetry, hello and settings calls are not counted against the daily side limit; the rest still is", async () => {
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+    deps.sideDailyLimit = 2;
+    for (let i = 0; i < 5; i++) {
+      expect((await call("cl", "/api/event_logging/batch", { method: "POST", body: "{}" })).status).toBe(200);
+      expect((await call("cl", "/api/hello", { method: "GET" })).status).toBe(200);
+      expect((await call("cl", "/api/claude_code/settings", { method: "GET" })).status).toBe(200);
+    }
+    expect((await call("cl", "/api/oauth/profile", { method: "GET" })).status).toBe(200);
+    expect((await call("cl", "/api/oauth/profile", { method: "GET" })).status).toBe(200);
+    expect((await call("cl", "/api/oauth/profile", { method: "GET" })).status).toBe(429);
   });
   test("an account call is counted as a side call (no token rows) and not refused at the reserve", async () => {
     await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });

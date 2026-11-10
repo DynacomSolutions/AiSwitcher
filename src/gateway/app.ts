@@ -528,7 +528,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    * replicas and restarts). If the store cannot answer in time the count falls back to this replica's memory, the failure is
    * counted and raised as an owner alert, and the request goes on.
    */
-  if (side || route?.kind === "serve" || route?.kind === "account") {
+  if (side || route?.kind === "serve" || (route?.kind === "account" && route.count !== false)) {
     const day = new Date(dayStartIct(deps.now()).getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
     let n: number | undefined;
     // At most SIDE_COUNT_MAX_INFLIGHT store calls run at once. The others queue for a slot inside the same time limit as the call itself:

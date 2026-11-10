@@ -174,8 +174,11 @@ speech call is not a model call); the daily token cap does.
   added by the gateway and never returned; the app token is never sent on. Decision of 10 Nov 2026 (replaces the earlier
   "never let an app read account detail" design). These calls count as side calls (no token rows, the daily side limit and
   token cap apply, the reserve does not), are logged as app, class and status only, and one 401 gets one locked refresh.
-  - **claude**: every path that is not model traffic (`/v1/messages*`, `/v1/complete`) goes to `api.anthropic.com` as an
-    account call: `/api/oauth/*`, `/api/claude_cli*`, `/api/organizations/*`, telemetry, settings, hello. None of them
+  - **claude**: every `/v1/*` path is model traffic (messages, batches, complete, sessions, ...) on the model path (allowlist where
+    the body names a model, ledger row, token cap, pool hold and failover), except `/v1/models` (side) and `/v1/oauth*`
+    (account). Every other path goes to `api.anthropic.com` as an account call: `/api/oauth/*`, `/api/claude_cli*`,
+    `/api/organizations/*`, telemetry, settings, hello. Telemetry-style calls (`/api/event_logging`, `/api/claude_code`,
+    `/api/hello`, `/api/eval`) are logged but not counted against the daily side limit. Account calls
     holds a member, fails over or forces a refresh beyond the locked account one (profile answers keep the real account and
     organisation uuids). A
     pinned app forwards `/api/oauth/usage` whole. A pool app keeps the served windows of the least-used member and, when the
@@ -184,7 +187,9 @@ speech call is not a model call); the daily token cap does.
     and organisation; when the org in the path differs from the member's (from its `/api/oauth/profile`, kept 10 minutes) the
     path is rewritten to the member's, so a stale local uuid still works.
   - **codex**: `POST .../rate-limit-reset-credits/consume` goes to the member with an unspent credit (the pin for a pinned
-    app). Every `/backend-api/*` path except model traffic (`/codex/*`, 404) and `wham/*` / `api/codex/*` go to
+    app). Model traffic goes through the model path (ledger, token cap, pool selection and failover): `/backend-api/codex/*`, and
+    writes to `/backend-api/conversation`, `/f/conversation` and `wham/tasks*`. The bare `/backend-api` is 404. Every other
+    `/backend-api/*` path and `wham/*` / `api/codex/*` (including GET task listings) go to
     `chatgpt.com/backend-api/*` with the login and `chatgpt-account-id`. Pool apps still get the served `wham/usage` (windows
     of the least-used member) and the summed `rate-limit-reset-credits`; pinned apps get the provider's real bodies.
     Codex 0.166 reads `account/rateLimits/read` from `<chatgpt_base_url>/wham/usage` when its config sets `chatgpt_base_url`
