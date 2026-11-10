@@ -209,6 +209,9 @@ describe("usage proxy", () => {
     socket.write("GET http://example.com/ HTTP/1.1\r\nhost: example.com\r\n\r\n");
     const first = await new Promise<string>((r) => socket.once("data", (d: Buffer) => r(d.toString())));
     expect(first.startsWith("HTTP/1.1 405")).toBe(true);
+    // The body says what went wrong, so a client with no loopback NO_PROXY can be fixed from the error alone.
+    expect(first.toLowerCase()).toContain("allow: connect");
+    expect(first).toContain("NO_PROXY=127.0.0.1,localhost,::1");
     // The proxy closes its side even when the client keeps the connection open.
     await new Promise<void>((r) => socket.once("close", () => r()));
   });

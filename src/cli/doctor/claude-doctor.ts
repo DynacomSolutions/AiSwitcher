@@ -1,3 +1,4 @@
+import { folderUsageProxyProblem } from "../../identities/claude-usage-proxy.ts";
 import type { Identity } from "../../identities/types.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
@@ -29,6 +30,10 @@ function errorMessage(err: unknown): string {
  */
 export async function probeClaudeDoctor(identity: Identity): Promise<DoctorResult> {
   const base = { toolName: "claude" as const, identity };
+
+  // A proxy with no loopback NO_PROXY sends every model call to the proxy (405): report it without a doomed turn.
+  const proxyProblem = await folderUsageProxyProblem(identity.configDir);
+  if (proxyProblem) return { ...base, status: "degraded", statusWord: "proxy misconfigured", detail: proxyProblem };
 
   let binaryPath: string;
   try {
