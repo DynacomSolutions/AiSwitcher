@@ -161,9 +161,11 @@ async function runInstall(): Promise<void> {
   // a config directory a broken build could actually put at risk; "ais"/
   // "open" changing doesn't warrant a multi-GB directory snapshot (see
   // AGENTS.md/backup.ts's BACKUP_GROUPS).
-  const backupGroups = (["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "opencode"] as const).filter((name) =>
+  const proxyGroups = (["claude", "codex", "grok", "kimi", "zai", "ali", "pi", "opencode"] as const).filter((name) =>
     pending.some((p) => p.name === name),
   );
+  // The gateway member store (small) holds the live logins of routed identities; "ais" runs the gateway that rewrites it.
+  const backupGroups = [...proxyGroups, ...(proxyGroups.length > 0 || aisBinaryChanged ? (["gateway"] as const) : [])];
   if (backupGroups.length > 0) {
     const backupDir = await runBackup(backupGroups);
     console.error(`install: backup complete: ${backupDir}`);

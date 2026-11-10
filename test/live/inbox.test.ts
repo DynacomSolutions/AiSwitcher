@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { appendFile, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyInbox, configHash } from "../../src/live/inbox.ts";
 import { newestPersistedMtime, openHomeDirectory } from "../../src/live/safe-fs.ts";
 import { withOauthRefreshLock } from "../../src/identities/claude-swap-lock.ts";
 import { makeTar } from "./fixtures.ts";
+import { gatewayEntryText } from "../../src/identities/claude-gateway-entry.ts";
+import { refreshFingerprint, withRouting } from "../../src/identities/gateway-routed.ts";
 
 describe("inbox apply", () => {
   const goodClock = { synchronized: true, imageBuildTimeMs: 1_000, newestPersistedMtimeMs: 0, nowMs: 2_000 };
@@ -90,6 +92,76 @@ describe("inbox apply", () => {
       const written = JSON.parse(await readFile(join(home, ".claude", ".credentials.json"), "utf8"));
       expect(written.claudeAiOauth.accessToken).toBe("SYNTHETIC_FIXTURE_CURRENT_ACCESS");
       expect(written.claudeAiOauth.refreshToken).toBe("SYNTHETIC_FIXTURE_CURRENT_REFRESH");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("keeps the gateway entry of a routed folder and drops the pi entry of that login", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      for (const base of [".claude", ".pi"]) {
+        await mkdir(join(home, base, "identities", "alpha"), { recursive: true });
+        await writeFile(join(home, base, "identities.json"), JSON.stringify({ version: 1, identities: [{ name: "alpha", label: "alpha", configDir: join(home, base, "identities", "alpha") }] }));
+      }
+      const entry = `${JSON.stringify({ claudeAiOauth: { accessToken: "aisg_SYNTHETIC_FIXTURE", refreshToken: null, expiresAt: 4_102_444_800_000 } })}\n`;
+      await writeFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), entry);
+      const login = { claudeAiOauth: { accessToken: "SYNTHETIC_FIXTURE_REMOTE_ACCESS", refreshToken: "SYNTHETIC_FIXTURE_REMOTE_REFRESH", expiresAt: 4_200_000_000_000 } };
+      const pi = { anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_A", refresh: "SYNTHETIC_FIXTURE_PI_RA", expires: 1 }, "openai-codex": { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_C", refresh: "SYNTHETIC_FIXTURE_PI_RC", expires: 1 } };
+      const tar = makeTar({}, [
+        { path: ".claude/identities/alpha/.credentials.json", class: "auth", bytes: new TextEncoder().encode(JSON.stringify(login)) },
+        { path: ".pi/identities/alpha/auth.json", class: "auth", bytes: new TextEncoder().encode(JSON.stringify(pi)) },
+      ]);
+      await applyInbox({ tar, home, clock: goodClock });
+      expect(await readFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), "utf8")).toBe(entry);
+      const piWritten = JSON.parse(await readFile(join(home, ".pi", "identities", "alpha", "auth.json"), "utf8"));
+      expect(piWritten.anthropic).toBeUndefined();
+      expect(piWritten["openai-codex"].access).toBe("SYNTHETIC_FIXTURE_PI_C");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("a bundle that routes an identity swaps out this host's routed login (backed up, logged) and strips pi's same-named entry", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      for (const base of [".claude", ".pi"]) {
+        await mkdir(join(home, base, "identities", "alpha"), { recursive: true });
+        await writeFile(join(home, base, "identities.json"), JSON.stringify({ version: 1, identities: [{ name: "alpha", label: "alpha", configDir: join(home, base, "identities", "alpha") }] }));
+      }
+      const login = JSON.stringify({ claudeAiOauth: { accessToken: "SYNTHETIC_FIXTURE_LOCAL_ACCESS", refreshToken: "SYNTHETIC_FIXTURE_LOCAL_REFRESH", expiresAt: 1000 } });
+      await writeFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), login);
+      const pi = { anthropic: { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_A", refresh: "SYNTHETIC_FIXTURE_PI_RA", expires: 1 }, "openai-codex": { type: "oauth", access: "SYNTHETIC_FIXTURE_PI_C", refresh: "SYNTHETIC_FIXTURE_PI_RC", expires: 1 } };
+      await writeFile(join(home, ".pi", "identities", "alpha", "auth.json"), JSON.stringify(pi));
+      const entry = withRouting(gatewayEntryText("aisg_SYNTHETIC_FIXTURE"), { host: "routing-host-SYNTHETIC", at: 1, fingerprints: [refreshFingerprint("SYNTHETIC_FIXTURE_LOCAL_REFRESH")], freshness: 1000 });
+      const tar = makeTar({}, [{ path: ".claude/identities/alpha/.credentials.json", class: "auth", bytes: new TextEncoder().encode(entry) }]);
+      const logs: string[] = [];
+      await applyInbox({ tar, home, clock: goodClock, log: (m) => logs.push(m) });
+      expect(await readFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), "utf8")).toBe(entry);
+      const backupDir = join(home, ".ais", "gateway-replaced");
+      const backups = await readdir(backupDir);
+      expect(backups.length).toBe(1);
+      expect(await readFile(join(backupDir, backups[0]!), "utf8")).toBe(login);
+      expect((await stat(join(backupDir, backups[0]!))).mode & 0o777).toBe(0o600);
+      expect(logs.some((l) => l.includes("claude identity alpha: the gateway entry (routed on routing-host-SYNTHETIC) replaced"))).toBe(true);
+      // pi was not in the bundle: its entry for the now routed login is removed (other providers kept)
+      const piLive = JSON.parse(await readFile(join(home, ".pi", "identities", "alpha", "auth.json"), "utf8"));
+      expect(piLive.anthropic).toBeUndefined();
+      expect(piLive["openai-codex"].access).toBe("SYNTHETIC_FIXTURE_PI_C");
+      expect(logs.some((l) => l.includes("pi identity alpha: removed its copy of the gateway-routed login"))).toBe(true);
+      expect(logs.join("\n")).not.toContain("SYNTHETIC_FIXTURE_LOCAL_REFRESH");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  test("a bundle's gateway entry never replaces a sign-in made here after the routing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      await mkdir(join(home, ".claude", "identities", "alpha"), { recursive: true });
+      await writeFile(join(home, ".claude", "identities.json"), JSON.stringify({ version: 1, identities: [{ name: "alpha", label: "alpha", configDir: join(home, ".claude", "identities", "alpha") }] }));
+      const fresh = JSON.stringify({ claudeAiOauth: { accessToken: "SYNTHETIC_FIXTURE_NEW_ACCESS", refreshToken: "SYNTHETIC_FIXTURE_NEW_REFRESH", expiresAt: 5000 } });
+      await writeFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), fresh);
+      const entry = withRouting(gatewayEntryText("aisg_SYNTHETIC_FIXTURE"), { host: "routing-host-SYNTHETIC", at: 1, fingerprints: [refreshFingerprint("SYNTHETIC_FIXTURE_ROUTED_REFRESH")], freshness: 1000 });
+      const tar = makeTar({}, [{ path: ".claude/identities/alpha/.credentials.json", class: "auth", bytes: new TextEncoder().encode(entry) }]);
+      const logs: string[] = [];
+      await applyInbox({ tar, home, clock: goodClock, log: (m) => logs.push(m) });
+      expect(await readFile(join(home, ".claude", "identities", "alpha", ".credentials.json"), "utf8")).toBe(fresh);
+      expect(logs.some((l) => l.includes("claude identity alpha: kept this host's login, a sign-in made after the identity was routed"))).toBe(true);
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 

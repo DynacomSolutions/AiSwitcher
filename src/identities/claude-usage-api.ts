@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
 import { readProviderGrantCopy } from "./oauth-reconcile.ts";
 import { poolStoreDirsFor, refreshIdentityOAuthGrant, type FetchImpl } from "./oauth-refresh.ts";
 import type { ExtraUsageInfo, ManualResetInfo } from "../cli/limits/types.ts";
@@ -177,12 +178,14 @@ async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promis
     let best: { access_token: string; expires_at?: number } | undefined;
     for (const dir of dirs) {
       const copy = await readProviderGrantCopy("claude", dir);
+      // A folder routed through the gateway holds the gateway app token: it is no login and must never reach Anthropic.
+      if (copy && isGatewayAccessToken(copy.grant.access_token)) continue;
       if (copy && (!best || (copy.grant.expires_at ?? -1) > (best.expires_at ?? -1))) best = copy.grant;
     }
     return best;
   };
   let grant = await read();
-  if (!grant) return { error: "no Claude login stored for this account" };
+  if (!grant) return { error: "no Claude login stored for this account (a folder routed through the AIS gateway holds none)" };
   const expired = (g: { expires_at?: number }) => g.expires_at !== undefined && g.expires_at - EXPIRY_SKEW_SECONDS <= nowSeconds;
   if (expired(grant) && deps.noRefresh) return { error: "token expired; refresh is disabled for this poll" };
   if (expired(grant)) {

@@ -24,6 +24,11 @@ const BACKUP_GROUPS = {
   ali: [".ali"],
   pi: [".pi"],
   opencode: [".opencode"],
+  // The AIS gateway's member store: once identities are routed through the gateway
+  // (`ais identities route-all-via-gateway`) it holds the only live Claude/Codex
+  // logins, the identity folders hold just the gateway entry. Same plain git
+  // handling as the logins in .claude/.codex.
+  gateway: [".ais/gateway-members"],
 } as const;
 
 type BackupGroup = keyof typeof BACKUP_GROUPS;

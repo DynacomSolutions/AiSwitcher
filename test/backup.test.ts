@@ -63,6 +63,17 @@ describe("runBackup integration", () => {
     expect(await Bun.file(join(repoDir, ".codex")).exists()).toBe(false);
   });
 
+  test("the gateway group commits the member store (the only live logins of routed identities)", async () => {
+    const home = await makeHome();
+    const login = '{"tokens":{"access_token":"a","refresh_token":"SYNTHETIC_FIXTURE-r"}}\n';
+    await write(join(home, ".ais", "gateway-members", "codex", "alpha", "auth.json"), login);
+
+    const repoDir = await runBackup(["gateway"], home);
+
+    expect(await gitShow(repoDir, ".ais/gateway-members/codex/alpha/auth.json")).toBe(login);
+    expect((await gitLs(repoDir)).filter((p) => !p.startsWith(".ais/gateway-members/")).length).toBe(0);
+  });
+
   test("a second run with no changes does not create an empty commit", async () => {
     const home = await makeHome();
     await write(join(home, ".codex", "identities.json"), "{}\n");

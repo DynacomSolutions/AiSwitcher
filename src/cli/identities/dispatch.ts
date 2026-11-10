@@ -200,6 +200,11 @@ export async function runIdentitiesCommand(
       );
     }
 
+    case "route-all-via-gateway": {
+      const { runRouteAllViaGateway } = await import("./route-all.ts");
+      return runRouteAllViaGateway(flags);
+    }
+
     case "chrome-overrides":
       return runChromeOverrides(rest, flags);
 

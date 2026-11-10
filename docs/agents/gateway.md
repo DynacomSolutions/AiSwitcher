@@ -327,3 +327,151 @@ CLIProxyAPI's refresh journal):
   `ais_gateway_refresh_lock_waits_total`,
   `ais_gateway_refresh_lock_wait_seconds_total` and
   `ais_gateway_refresh_guard_degraded_total`.
+
+## Member store and routing every identity through the gateway
+
+The gateway used to read each account's login from the same identity folders the local tools use (the registry's
+`configDir`, mounted into the pod). Replacing those files with a gateway entry would therefore have destroyed the
+gateway's logins. The gateway now has its own member store, `~/.ais/gateway-members/<tool>/<identity>/`
+(`AIS_GATEWAY_MEMBERS_DIR` overrides; claude: `.credentials.json` plus the `oauthAccount` record of `.claude.json`;
+codex: `auth.json`). It lives under `~/.ais`, which the gateway pod already mounts read-write, so no new mount is needed,
+and the host snapshot export skips it. `bun run backup` (and the pre-install backup) commits it as the `gateway` group,
+since once identities are routed it holds the only live logins. A store copy counts only when its login file parses and
+holds a refresh token: an empty or partial file left by a crash is ignored.
+
+- `ais gateway serve` and `ais gateway local` (`enableMemberStore()` in `src/identities/gateway-members.ts`) resolve any
+  identity whose store holds its login file to the store folder, at the one I/O boundary (`loadIdentitiesFile`). Identities
+  without a store copy behave as before, so grok, kimi and pi (no local route yet) are unchanged. `saveIdentitiesFile`
+  refuses to write store paths into a registry. The heartbeat carries `memberStore: true` so the host can tell which build
+  is running.
+- Every other process (host timers, CLI, console pod) treats an account with a store copy as the gateway's
+  (`isGatewayManagedHere`), heartbeat or not: it never refreshes, heals or reconciles that login. For claude, such an account
+  is gateway-managed even when it is not a member of a gateway-routed pool. Usage readers skip a folder that holds the
+  gateway app token, so it never reaches Anthropic.
+
+`ais identities route-all-via-gateway [--dry-run]` (host CLI only, never inside a gateway process) does the switch. Per
+identity, under the account's refresh locks (the ones the gateway takes before it renews the login):
+
+1. it refuses unless a fresh heartbeat from a gateway built with the member store names the account with a successful
+   renewal;
+2. it refuses while any session uses the folder: a running `claude` or `codex` process (this user's, found in `/proc`)
+   whose `CLAUDE_CONFIG_DIR` / `CODEX_HOME` is the folder (or, without the variable, the tool's default folder). A session
+   started before the switch keeps the old login in memory and later refreshes it with the single-use refresh token the
+   gateway now renews; the gateway's copy then fails `refresh_token_reused` and the account is lost. Codex also writes that
+   login back over the gateway entry. The report lists the pids; end those sessions, then run the command again. There is
+   no override. Checked again under the locks, right before anything is written, and once more after the switch (pids
+   found then are reported as a warning and the exit code is 1). Detection: argv[0], the executable or a node launcher's
+   argv[1] named after the tool or its package entry (`node …/@anthropic-ai/claude-code/cli.js`, or the Agent SDK's bundled
+   `node …/@anthropic-ai/claude-agent-sdk/cli.js`); folders compared after
+   resolving symlinks; a process without the variable uses the default folder in its own `HOME`. A console-pod session
+   carrying `AIS_HOST_HOME` has its container paths (under its `HOME`, e.g. `/home/ais`) mapped back to the host home; a
+   pod session without `AIS_HOST_HOME`, or running as another uid, is not seen. When the scan cannot run (no `/proc`, as on
+   macOS, an unreadable `/proc`, or one that hides this very process, as with `hidepid`) the identity is refused.
+
+   It also refuses while another copy of the login would keep refreshing it:
+   - a swap pool folder of the same tool that is not gateway-routed and whose active member is this identity, or whose
+     login has the same refresh token or account. Every session started with the pool uses that copy, and this command
+     never writes pool folders: swap the pool to another member first (`ais swap <tool> to <member> --pool=<pool>`), or
+     route the pool itself, then run again;
+   - pi keeps its own copy of each identity's claude (`anthropic`) and codex (`openai-codex`) login in the same-named pi
+     identity's `auth.json` (`oauth-reconcile.ts`), and once the store copy exists the reconcile no longer converges them.
+     pi has no local gateway route, so that entry is removed (under pi's `auth.json.lock`, after a unique
+     `auth.json.pre-gateway.<timestamp>.bak`; every other provider is kept) when it is the same refresh token or provably
+     older (claude: `expires`; codex: the token's `iat` against `last_refresh`). pi then has no login for that provider for
+     the identity until pi gets a gateway route. Refused instead: a pi copy that may be fresher (run
+     `ais auth sync --tool=pi` first), a pi swap pool or a differently named pi identity holding the same refresh token,
+     and any running pi session. Any pi session at all, whatever its folder, refuses the routing of every identity with a
+     pi copy: one pi instance reads every pi identity's `auth.json`, so stop all pi sessions first;
+3. pi's copy is removed first (a failure there leaves everything else as it was), then it moves the login into the member store. A store copy already there is the gateway's live login: it is replaced only
+   by a login of the same account (claude: the `.claude.json` account uuid; codex: the token's account id) that is
+   provably fresher (claude: later `expiresAt`; codex: later `last_refresh`), after a unique backup. A folder holding a
+   different account is refused; an older, equally fresh or undatable local login (a restored or touched folder) leaves the
+   store copy as it is. The store files are written durably (temp file flushed, renamed, folder flushed) and read back, and
+   nothing local changes unless the store then holds a usable login. The login file is written last: its presence is what
+   switches the gateway to the store. Any failure from the store write on (a read-back mismatch, `EACCES` on the folder)
+   rolls back, so the login keeps exactly one holder: the folder gets its login back and the store copy this run wrote is
+   renamed to `<file>.rolled-back.<timestamp>.bak`, so the gateway reads the folder again. If the folder cannot be
+   restored, the store copy stays active and is then the only holder (the folder's login is in its `.pre-gateway` backup);
+4. it backs up each local file it changes to `<file>.pre-gateway.<timestamp>.bak` (exclusive, 0600, flushed and read back,
+   never overwritten or deleted) and writes the entry: claude `.credentials.json` gateway entry, `ANTHROPIC_BASE_URL=http://127.0.0.1:47140/claude`
+   in `settings.json`, `apiKeyHelper` removed; codex `auth.json` as an API-key file holding the app key, `model_provider =
+   "ais-gateway"` and its tables in `config.toml`, with the key printed by `~/.local/bin/ais-codex-gateway-key` (created if
+   absent, an existing one is kept).
+
+Keys are `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN` and `AIS_GATEWAY_APP_AGENTS_CODEX_TOKEN` (apps `agents-claude`,
+`agents-codex`). Reported and left alone, exit code 1: a tool with no local route (`src/gateway/local-routes.ts`: today
+grok, kimi, pi) or no key, an account the gateway does not hold, a folder with running sessions, a folder whose login is
+a different account than its store copy, a folder without a refreshable login, a swap pool folder that is not routed yet
+(it holds a copy of a member's login; the command never writes pool folders) and a symlinked file.
+
+Swap pools break for routed members: a pool swaps by copying the member's login out of the member's identity folder, and a
+routed member's folder holds only the gateway entry, so a swap to it no longer gets a working login (codex fails with "no
+usable Codex login") until the pool itself is routed with its own setup (a gateway-routed claude pool never copies member
+logins) or the member is taken out of the pool. The
+report adds this warning to every routed member of a swap pool and to every refused pool folder.
+Re-running changes nothing in an identity already routed, but checks its other holders again: a swap pool holding the
+login or a pi copy that may be fresher is reported (status `already-routed`, exit code 1), and pi's same-named copy is
+removed as on a first run. An entry written before the routing record existed (see below) gets the record on a re-run.
+To undo one identity, see "Undoing the routing" below.
+
+### Hosts that AIS sync connects
+
+AIS sync copies every identity folder between hosts, logins included (newest wins). The member store is never synced, so
+on the other host (say hq1) the identity is not in a member store, and its own copy of the login kept refreshing: the
+gateway's copy then failed `refresh_token_reused`, and hq1's newer file synced back over the gateway entry. The receiving
+side of every sync merge and of the live inbox now applies these rules (`src/sync/gateway-guard.ts`) to the claude
+`.credentials.json` and codex `auth.json` of every plain identity, under the identity's refresh lock.
+
+The gateway entry carries a routing record (key `aisGatewayRouting`, nothing secret in it): the routing host's name, the
+time, the first 16 hex digits of the sha256 of each routed refresh token (the folder's and the member store's), the
+freshness of the routed login (claude `expiresAt`, codex `last_refresh`) and its account. With it the receiving host tells
+its own copy of the routed login from a sign-in made there after the routing (a new refresh token family the gateway never
+held, harmless to it):
+
+- a host that holds a member store copy of the identity never replaces its folder file, whatever arrives;
+- an arriving gateway entry replaces a real login only when that login is the routed one: a routed refresh token, or not
+  fresher than the routed login and not a different account. The replaced file is backed up first to
+  `~/.ais/gateway-replaced/<tool>-<identity>-<file>.<timestamp>.bak` (exclusive, 0600; `~/.ais` is not synced, so the
+  login does not travel on), and the sync (or inbox) log names the identity;
+- an arriving entry never replaces a sign-in made after the routing (fresher than the routed login, or another account):
+  the log says it was kept, at each sync. A login that cannot be told apart (an entry without the routing record, written
+  by an earlier build of this command, or an undatable login) is kept too and logged; re-run the command on the routing
+  host to add the record;
+- the routing host keeps its own login whatever entry arrives once it has no member store copy (it was un-routed);
+- a gateway entry is replaced by a real login only when that login is provably a separate one (fresher than the routed
+  login, or another account): a host that has not seen the routing yet cannot undo it with its old copy, but a fresh
+  sign-in, or the login restored on the routing host when un-routing, spreads like any login (newest wins after that).
+
+**Routed identities stop working on the other synced hosts.** After the next sync hq1's folder holds the gateway entry,
+pointing at `127.0.0.1:47140`, and hq1's gateway has no copy of the login (the member store is per host), so sessions there
+fail, without refreshing anything. On hq1 `isGatewayManagedHere` treats an identity whose folder holds the pure gateway
+entry as the gateway's, so `ais serve` auth-refresh, `ais auth refresh` and the pi reconcile never refresh or reconcile it
+there. To use the identity on hq1 again, sign in again there (`/login`, `codex login`): that is a new login, the next sync
+keeps it, hq1 refreshes it as usual (its folder holds a real login, so it is not gateway-managed), and the routing host
+keeps its gateway entry (it holds the member store copy). The command's report says this for every routed identity when the
+sync config names remotes.
+- pi's same-named copy (`anthropic` / `openai-codex`) of a routed login is dropped from an arriving pi `auth.json`, and after
+  each merge removed from the live file (unique `.pre-gateway` backup first, under pi's `auth.json.lock`).
+
+Every synced host must run a build with these rules: a remote with an older build still merges by time on its side.
+
+What sync cannot do is stop a session on hq1 that is already running: it keeps the old login in memory and refreshes it at
+its next refresh, which kills the gateway's copy. The command cannot see those sessions, so it does not refuse, but its
+report (dry run too) warns and names the sync remotes: stop every Claude Code, Codex and pi session of the identities being
+routed on those hosts before running it.
+
+### Undoing the routing
+
+Restore on the routing host only, and let sync carry the login; never put a `.pre-gateway` or `gateway-replaced` login
+backup back on any host (its refresh token may be rotated away already, and a restored copy beside the live one is a
+second holder of one token):
+
+1. on every other synced host, stop the identity's sessions (they hold only the gateway entry);
+2. on the routing host, stop the identity's sessions, copy (`cp`, so the file gets a new time and wins the sync) the member store's login file
+   (`~/.ais/gateway-members/<tool>/<identity>/`) back into the identity folder (the gateway has kept it current), restore the
+   `settings.json` or `config.toml` backup the same way, then move the store folder aside so the gateway reads the identity folder again.
+   From then on this host keeps that login whatever gateway entry arrives;
+3. let sync run. The restored login replaces the other hosts' gateway entry when it is fresher than the routed login (the
+   gateway renewed it since the routing). If it is not (un-routed before the gateway's first renewal), sync keeps the
+   entry there: on that host move the identity's gateway entry file aside (`.credentials.json` / `auth.json`; it holds no
+   login) and sync again, or sign in again there.

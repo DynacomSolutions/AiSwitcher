@@ -28,6 +28,7 @@ import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-sour
 import type { GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
+import { enableMemberStore } from "../identities/gateway-members.ts";
 import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -358,6 +359,7 @@ export async function keepAliveOnce(deps: {
 export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {}): Promise<RunningGateway> {
   if (opts.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) throw new Error(`gateway: the admin token (AIS_GATEWAY_ADMIN_TOKEN) must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters`);
   startModelPriceRefresh();
+  enableMemberStore(); // read each account's login from the gateway member store, not the local identity folders
   markGatewayOwnerProcess(); // this process alone refreshes gateway-managed logins
   const now = hooks.now ?? (() => new Date());
   const backoff = hooks.warmBackoff ?? { initialMs: 1_000, maxMs: 30_000 };
@@ -598,7 +600,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
               const last = lastSuccessAt.get(`ali/${a.name}`);
               if (last) held[`ali/${a.name}`] = { lastSuccessAt: last };
             }
-            await trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held });
+            await trackedHeartbeatWrite({ metrics, alerter }, { version: 1, passAt: at.toISOString(), held, memberStore: true });
           },
       metrics,
       revoked: revokedGrants,

@@ -1,12 +1,11 @@
 import { readFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fetchCodexLimits } from "../../cli/limits/codex-limits.ts";
 import type { FetchedLimitResult } from "../../cli/limits/types.ts";
 import { isBedrockIdentity } from "../aws-profile.ts";
 import { codexAccountOf, codexAuthPath, codexRecency, hasCodexTokens, parseCodexAuth, readCodexAuthText, type CodexAuthFile } from "../codex-auth.ts";
 import { lockOrder, withOauthRefreshLock, withOauthRefreshLocks } from "../claude-swap-lock.ts";
-import { expandPath } from "../match.ts";
+import { liveSessionPids } from "../live-sessions.ts";
 import { CODEX_CONFIG } from "../tool-configs.ts";
 import type { Identity } from "../types.ts";
 import type { PoolAdapter, PoolUsage, SwapResult, WriteBackOutcome } from "./adapter.ts";
@@ -266,32 +265,7 @@ async function heal(pool: PoolIdentity, members: Identity[], lock?: LockOptions)
 
 /** Running codex processes (owned by this user) whose CODEX_HOME is `configDir`. Linux /proc only; best effort. */
 export async function countCodexSessions(configDir: string, procRoot = "/proc"): Promise<number> {
-  const want = resolve(expandPath(configDir));
-  const uid = process.getuid?.();
-  let count = 0;
-  let entries: string[];
-  try {
-    entries = await readdir(procRoot);
-  } catch {
-    return 0;
-  }
-  // Thousands of processes on a busy host: scan in parallel chunks, a sequential scan took over half a second per swap.
-  const pids = entries.filter((entry) => /^\d+$/.test(entry) && Number(entry) !== process.pid);
-  const isMine = async (entry: string): Promise<boolean> => {
-    try {
-      if (uid !== undefined && (await stat(`${procRoot}/${entry}`)).uid !== uid) return false;
-      const argv = (await readFile(`${procRoot}/${entry}/cmdline`, "utf8")).split("\0");
-      if (basename(argv[0] ?? "") !== "codex" && basename(argv[1] ?? "") !== "codex") return false;
-      const home = (await readFile(`${procRoot}/${entry}/environ`, "utf8")).split("\0").find((kv) => kv.startsWith("CODEX_HOME="));
-      return home !== undefined && resolve(expandPath(home.slice("CODEX_HOME=".length))) === want;
-    } catch {
-      return false; // gone, or not ours to read
-    }
-  };
-  for (let i = 0; i < pids.length; i += 256) {
-    count += (await Promise.all(pids.slice(i, i + 256).map(isMine))).filter(Boolean).length;
-  }
-  return count;
+  return (await liveSessionPids("codex", configDir, { procRoot })).length;
 }
 
 export const codexAdapter: PoolAdapter<CodexMemberUsage> = {
