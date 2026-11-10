@@ -8,8 +8,9 @@ import { refusePool } from "./auth.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { routeAllViaGateway, type RouteAllOptions } from "../cli/identities/route-all.ts";
+import { isGatewayAccessToken } from "../identities/claude-gateway-entry.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreRoot } from "../identities/gateway-members.ts";
-import { classifyLogin, refreshOf } from "../identities/gateway-routed.ts";
+import { classifyLogin, isPureGatewayEntry, refreshOf } from "../identities/gateway-routed.ts";
 import { HttpError, type LoginFlowDto, type LoginFlowStatus } from "./types.ts";
 
 /**
@@ -150,6 +151,25 @@ async function readStream(stream: AsyncIterable<Uint8Array>, onChunk: (text: str
   for await (const chunk of stream) onChunk(decoder.decode(chunk, { stream: true }));
 }
 
+/**
+ * The app key (aisg_) of the gateway entry the folder holds right now, or undefined when the folder holds no pure gateway
+ * entry. Read before a sign-in overwrites the entry, so the hand-over can write it back where the host's secrets file is not
+ * mounted (the console pod). Kept in memory only: never put in the flow DTO, a note or a log.
+ */
+export async function readFolderGatewayKey(toolName: string, configDir: string): Promise<string | undefined> {
+  if (!isMemberStoreTool(toolName)) return undefined;
+  const text = await Bun.file(`${configDir}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
+  if (!isPureGatewayEntry(toolName, text)) return undefined;
+  try {
+    const json = JSON.parse(text!) as { OPENAI_API_KEY?: unknown; claudeAiOauth?: { accessToken?: unknown } };
+    // The same field route-all writes: codex OPENAI_API_KEY, claude claudeAiOauth.accessToken.
+    const key = toolName === "claude" ? json.claudeAiOauth?.accessToken : json.OPENAI_API_KEY;
+    return typeof key === "string" && isGatewayAccessToken(key) ? key : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface FingerprintFn {
   (paths: string[]): Promise<string | undefined>;
 }
@@ -161,7 +181,7 @@ export interface FingerprintFn {
  * other holder). Returns a warning for the owner when the new login did not (fully) reach the gateway, and undefined when the
  * gateway now uses it or does not hold the identity at all.
  */
-export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}): Promise<string | undefined> {
+export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}, gatewayKey?: string): Promise<string | undefined> {
   if (!isMemberStoreTool(toolName)) return undefined;
   const root = opts.memberRoot ?? memberStoreRoot();
   if (!hasMemberCopy(toolName, identityName, root)) return undefined;
@@ -169,7 +189,7 @@ export async function adoptLoginIntoGateway(toolName: string, identityName: stri
   if (classifyLogin(toolName, folder) !== "login") return undefined;
   const refused = (why: string): string => `signed in, but the gateway still uses its older login for this identity: ${why}`;
   try {
-    const report = await routeAllViaGateway({ ...opts, memberRoot: root, only: { tool: toolName, identity: identityName }, afterLogin: true });
+    const report = await routeAllViaGateway({ ...opts, memberRoot: root, only: { tool: toolName, identity: identityName }, afterLogin: true, ...(gatewayKey ? { fallbackToken: gatewayKey } : {}) });
     const line = report.lines[0];
     if (!line) return refused(report.unroutedTools[0]?.reason ?? "the identity could not be routed");
     if (line.status !== "routed") return refused(line.detail ?? line.status);
@@ -186,7 +206,7 @@ export async function adoptLoginIntoGateway(toolName: string, identityName: stri
 
 export interface LoginFlowManagerDeps {
   /** Hands a finished sign-in on a routed identity to the gateway (injectable; default adoptLoginIntoGateway). Resolves to a warning, or undefined when all is well. */
-  adoptLogin?: (toolName: ToolConfig["toolName"], identityName: string, configDir: string) => Promise<string | undefined>;
+  adoptLogin?: (toolName: ToolConfig["toolName"], identityName: string, configDir: string, gatewayKey?: string) => Promise<string | undefined>;
   spawn?: SpawnFn;
   /** util-linux script binary for PTY mode; discovery is injectable so
    * tests never depend on the host. */
@@ -233,6 +253,8 @@ async function defaultResolveIdentity(
 interface FlowRecord {
   dto: LoginFlowDto;
   configDir: string;
+  /** The folder's gateway app key from before the sign-in (memory only, see readFolderGatewayKey). */
+  gatewayKey?: string;
   /** True once the finished sign-in is being handed to the gateway: the flow can no longer time out or be cancelled. */
   adopting?: boolean;
   child?: SpawnedChild;
@@ -317,7 +339,7 @@ export class LoginFlowManager {
           return undefined;
         }
       });
-    this.adoptLogin = deps.adoptLogin ?? ((tool, name, dir) => adoptLoginIntoGateway(tool, name, dir));
+    this.adoptLogin = deps.adoptLogin ?? ((tool, name, dir, key) => adoptLoginIntoGateway(tool, name, dir, {}, key));
     this.httpFetch = deps.fetch ?? ((url, init) => fetch(url, init));
     this.flowTimeoutMs = deps.flowTimeoutMs ?? DEFAULT_FLOW_TIMEOUT_MS;
     this.pollIntervalMs = deps.pollIntervalMs ?? 1_500;
@@ -375,6 +397,8 @@ export class LoginFlowManager {
       throw new HttpError(503, `could not locate the real ${cfg.realBinaryName} binary for a managed login`);
     }
     const childEnv = this.childEnv(cfg, configDir);
+    // Before the tool overwrites the folder's gateway entry (memory only).
+    const gatewayKey = await readFolderGatewayKey(toolName, configDir);
     if (spec.localCallback) {
       // No browser may open on the server host: the user signs in elsewhere.
       // `true` is a no-op launcher for the webbrowser crate and xdg-open alike.
@@ -406,6 +430,7 @@ export class LoginFlowManager {
       dto,
       configDir,
       credentialPaths: this.credentialPaths(toolName, configDir),
+      ...(gatewayKey ? { gatewayKey } : {}),
       ...(spec.localCallback ? { localCallback: true } : {}),
       outputTail: "",
       done: false,
@@ -618,7 +643,7 @@ export class LoginFlowManager {
     this.clearTimers(record);
     let note: string | undefined;
     try {
-      note = await this.adoptLogin(record.dto.toolName, record.dto.identity, record.configDir);
+      note = await this.adoptLogin(record.dto.toolName, record.dto.identity, record.configDir, record.gatewayKey);
     } catch {
       note = "signed in, but handing the new login to the gateway failed";
     }
