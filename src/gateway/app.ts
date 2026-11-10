@@ -15,7 +15,8 @@ import type { ProviderAdapter, ProviderCredential } from "./providers/index.ts";
 import { nativeLimitResponse } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
-import { collapseSlashes, isClaudeAccountPath, routeFor, serveRoute, sideDailyLimitFromEnv, type ResetCreditsCache } from "./routes.ts";
+import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
+import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
@@ -393,12 +394,13 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   const budget = new BodyBudget(deps.bodyBudgetBytes ?? bodyBudgetFromEnv(), (n) => deps.metrics.bodyBudgetWaiting?.(n));
   const exhausted = new Map<string, number>();
   const resetCredits: ResetCreditsCache = {};
+  const accountState = newAccountState();
   const sideGate = new Gate(SIDE_COUNT_MAX_INFLIGHT);
   const sideCounts = new Map<string, number>(); // fallback only, while the store is down
   /** Short holds (burst 429, credential failures) by member key; quota exhaustion has no entry. */
   const holds = new Map<string, Hold>();
   const handle = (req: Request): Promise<Response> =>
-    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts, sideGate).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
+    proxy(req, deps, log, budget, exhausted, holds, resetCredits, sideCounts, sideGate, accountState).catch(async () => providerError(await styleForPath(deps, new URL(req.url).pathname), 500, "gateway error"));
   // Before the catch-all proxy routes: "browser" is not an app name.
   const browserDeps = { store: deps.store, now: deps.now, metrics: deps.metrics, ...(deps.browserPoolMembers ? { browserPoolMembers: deps.browserPoolMembers } : {}), ...(deps.browserIdentityExists ? { browserIdentityExists: deps.browserIdentityExists } : {}) };
   hono.route("/browser", createPairRoutes(browserDeps));
@@ -408,7 +410,7 @@ export function createGatewayApp(deps: GatewayDeps): Hono {
   return hono;
 }
 
-async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate): Promise<Response> {
+async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => void, budget: BodyBudget, exhausted: Map<string, number>, holds: Map<string, Hold>, resetCredits: ResetCreditsCache, sideCounts: Map<string, number>, sideGate: Gate, accountState: AccountState): Promise<Response> {
   const started = performance.now();
   const url = new URL(req.url);
   const slash = url.pathname.indexOf("/", 1);
@@ -514,11 +516,11 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
 
   async function run(): Promise<Response> {
   if (!pathAllowed(rest, style)) return reject(400, "encoded slashes and dot segments are not allowed in the path");
-  const route = routeFor(app.provider, style, req.method, rest);
+  let route = routeFor(app.provider, style, req.method, rest);
   // ChatGPT account paths a codex client asks for under /backend-api (plugins and the like): never forwarded with a login.
   if (route?.kind === "deny") return reject(route.status, "this path is not available through the gateway");
-  // Claude's account, profile and organisation paths are never forwarded (the gateway serves usage and profile itself).
-  if (app.provider === "claude" && route?.kind !== "serve" && isClaudeAccountPath(rest)) return reject(403, "this path is not available through the gateway");
+  // A pinned app has one identity, so a pool-served answer (usage, reset credits) is replaced by the provider's own for that identity.
+  if (route?.kind === "serve" && app.target.kind === "pin" && PIN_FORWARD[route.name]) route = { kind: "account", op: "forward", url: PIN_FORWARD[route.name] as string };
   /** A list, search or speech call is not a model call: no model allowlist, and its upstream errors never touch logins or the pool. */
   const side = route?.kind === "upstream" && route.side;
   /**
@@ -526,7 +528,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    * replicas and restarts). If the store cannot answer in time the count falls back to this replica's memory, the failure is
    * counted and raised as an owner alert, and the request goes on.
    */
-  if (side || route?.kind === "serve") {
+  if (side || route?.kind === "serve" || (route?.kind === "account" && route.count !== false)) {
     const day = new Date(dayStartIct(deps.now()).getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
     let n: number | undefined;
     // At most SIDE_COUNT_MAX_INFLIGHT store calls run at once. The others queue for a slot inside the same time limit as the call itself:
@@ -562,8 +564,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return reject(429, "daily limit for list, search and speech calls reached", identityForRow, undefined, "side_daily_cap");
     }
   }
-  if (route?.kind === "serve") {
-    // Answered from the gateway's own pool state: no upstream call, no body, no account detail. The daily cap still applies.
+  if (route?.kind === "serve" || route?.kind === "account") {
+    // Answered from the gateway's own pool state, or forwarded to the provider's account API with the member's login (no token rows). The daily cap still applies.
     if (app.dailyTokens !== undefined) {
       let usedNow = 0;
       try {
@@ -575,6 +577,22 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         deps.metrics.rejection(app.name, "daily_cap");
         return reject(429, "daily token cap reached", identityForRow, undefined, "daily_cap");
       }
+    }
+    if (route.kind === "account") {
+      let bytes: Uint8Array | undefined;
+      if (req.body) {
+        // Bounded: a declared length over the limit is refused unread; otherwise the body is read in chunks inside the body budget and cut off at the limit.
+        const declared = declaredLength(req);
+        if (Number.isFinite(declared) && declared > ACCOUNT_BODY_LIMIT) return reject(413, "request body too large for an account call");
+        releaseBody = await budget.reserve(Number.isFinite(declared) ? declared : ACCOUNT_BODY_LIMIT, ctrl.signal);
+        bytes = await readCapped(req.body, ACCOUNT_BODY_LIMIT);
+        if (!bytes) return reject(413, "request body too large for an account call");
+      }
+      const out = await forwardAccount({ app, deps, state: accountState, op: route.op as AccountOp, method: req.method, url: route.url, search: url.search, headers: req.headers, body: bytes, style, signal: ctrl.signal });
+      req.signal.removeEventListener("abort", onAbort);
+      const who = out.identity ? await canon(out.identity) : identityForRow;
+      record(who, out.res.status >= 400 ? "rejected" : "ok", out.res.status, undefined, false, undefined, undefined, out.cls);
+      return out.res;
     }
     const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal, cache: resetCredits });
     req.signal.removeEventListener("abort", onAbort);

@@ -33,6 +33,7 @@ let store: CapturingStore;
 let started: Array<{ stop(): Promise<void> }>;
 let alerts: Array<{ kind: string; key: string }>;
 let exits: number[];
+let accountSeen: Array<{ method: string; path: string; auth: string | null; body: string }>;
 let migrateFails: boolean;
 let credFails: boolean;
 let origWarn: typeof console.warn;
@@ -108,13 +109,21 @@ beforeEach(() => {
   started = [];
   alerts = [];
   exits = [];
+  accountSeen = [];
   migrateFails = false;
   credFails = false;
   gate = new Promise<void>((r) => (release = r));
   upstream = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(req) {
+    async fetch(req) {
+      const pathname = new URL(req.url).pathname;
+      if (pathname.startsWith("/api/")) {
+        accountSeen.push({ method: req.method, path: pathname + new URL(req.url).search, auth: req.headers.get("authorization"), body: await req.text() });
+        if (pathname === "/api/oauth/profile") return Response.json({ organization: { uuid: "org-member-0000" } });
+        if (pathname.endsWith("/reset_rate_limits")) return Response.json({ result: "reset" });
+        return Response.json({ five_hour: null, cedar_ember: { eligible: true, grants: [{ id: "grant-1", resets_left: 1 }], next_grant_id: null } });
+      }
       if (new URL(req.url).pathname.endsWith("/slow")) {
         return gate.then(() => new Response("{}", { headers: { "content-type": "application/json" } }));
       }
@@ -165,7 +174,7 @@ describe("serve lifecycle", () => {
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
   });
 
-  test("the CONNECT proxy answers claude usage for the app a token belongs to, and refuses an unknown gateway token", async () => {
+  test("the CONNECT proxy forwards a reset-credit view and redeem with the member's login, and refuses an unknown gateway token", async () => {
     const token = await seed();
     const tlsDir = await mkdtemp(join(tmpdir(), "gw-connect-tls-"));
     const sh = (cmd: string): void => void Bun.spawnSync(["sh", "-c", cmd], { cwd: tlsDir });
@@ -176,7 +185,7 @@ describe("serve lifecycle", () => {
     started.push(g);
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
     expect(g.connectPort).toBeGreaterThan(0);
-    const ask = async (bearer: string): Promise<{ status: number; body: string }> => {
+    const ask = async (bearer: string, req: { method?: string; path?: string; body?: string } = {}): Promise<{ status: number; body: string }> => {
       const net = await import("node:net");
       const tls = await import("node:tls");
       const sock = net.connect(g.connectPort!, "127.0.0.1");
@@ -185,7 +194,8 @@ describe("serve lifecycle", () => {
       await new Promise<void>((r) => sock.once("data", () => r()));
       const secure = tls.connect({ socket: sock, servername: "api.anthropic.com", ca: await Bun.file(join(tlsDir, "ca.crt")).text() });
       await new Promise<void>((r, j) => (secure.once("secureConnect", () => r()), secure.once("error", j)));
-      secure.write(`GET /api/oauth/usage HTTP/1.1\r\nhost: api.anthropic.com\r\nauthorization: Bearer ${bearer}\r\nconnection: close\r\n\r\n`);
+      const payload = req.body ?? "";
+      secure.write(`${req.method ?? "GET"} ${req.path ?? "/api/oauth/usage?cedar_ember=1&skip_spend=1"} HTTP/1.1\r\nhost: api.anthropic.com\r\nauthorization: Bearer ${bearer}\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(payload)}\r\nconnection: close\r\n\r\n${payload}`);
       const raw = await new Promise<string>((r) => {
         let out = "";
         secure.on("data", (d: Buffer) => (out += d.toString()));
@@ -193,10 +203,21 @@ describe("serve lifecycle", () => {
       });
       return { status: Number(/^HTTP\/1\.1 (\d+)/.exec(raw)?.[1]), body: raw.slice(raw.indexOf("\r\n\r\n") + 4) };
     };
-    const ok = await ask(token);
-    expect(ok.status).toBe(200);
-    expect(ok.body).toContain("seven_day");
+    const view = await ask(token);
+    expect(view.status).toBe(200);
+    expect(view.body).toContain("grant-1");
+    expect(accountSeen[0]).toMatchObject({ method: "GET", path: "/api/oauth/usage?cedar_ember=1&skip_spend=1", auth: `Bearer ${UPSTREAM_CRED}` });
+    const redeem = await ask(token, { method: "POST", path: "/api/organizations/org-stale-0000/reset_rate_limits", body: '{"program":"cedar_ember","grant_id":"grant-1","request_id":"r1"}' });
+    expect(redeem.status).toBe(200);
+    expect(redeem.body).toContain("reset");
+    const sent = accountSeen.find((c) => c.method === "POST")!;
+    expect(sent.path).toBe("/api/organizations/org-member-0000/reset_rate_limits"); // the stale org was replaced by the member's
+    expect(sent.auth).toBe(`Bearer ${UPSTREAM_CRED}`);
+    expect(sent.body).toContain("grant-1");
+    expect(accountSeen.every((c) => !(c.auth ?? "").includes("aisg_"))).toBe(true);
+    const before = accountSeen.length;
     expect((await ask(WRONG_TOKEN.padEnd(57, "x"))).status).toBe(401);
+    expect(accountSeen).toHaveLength(before);
   });
 
   test("ready after warm-up", async () => {
@@ -269,7 +290,7 @@ describe("serve lifecycle", () => {
           if (buf.includes("\r\n\r\n")) wake();
         },
         open(s) {
-          s.write(`POST /web/v1/slow HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${token}\r\ncontent-length: 2\r\n\r\n{}`);
+          s.write(`POST /web/v1/messages/slow HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${token}\r\ncontent-length: 2\r\n\r\n{}`);
         },
       },
     });
@@ -303,7 +324,7 @@ describe("serve lifecycle", () => {
     const token = await seed();
     const g = await boot({}, true);
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
-    const res = await fetch(`${base(g)}/web/v1/stream`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
+    const res = await fetch(`${base(g)}/web/v1/messages/stream`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: "{}" });
     expect(res.status).toBe(200);
     const reader = res.body!.getReader();
     const first = await reader.read();
