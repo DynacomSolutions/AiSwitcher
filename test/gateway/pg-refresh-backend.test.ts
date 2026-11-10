@@ -194,7 +194,8 @@ if (!url && process.env.CI && !optOut) {
       } finally {
         proxy.stop(true);
       }
-    });
+    // Each of the 12 swallowed RESETs waits out the 300 ms client bound, then the close race waits up to 300 ms more: ~5.5 s in CI.
+    }, 30_000);
 
     test("ten accounts refreshing at once do not deadlock the pool", async () => {
       await prepare();
