@@ -575,6 +575,8 @@ export interface LoginFlow {
   instruction?: string;
   acceptsPaste: boolean;
   error?: string;
+  /** Set on a completed sign-in whose new login did not (fully) reach the gateway; the owner must read it. */
+  note?: string;
   startedAt: string;
   updatedAt: string;
   endedAt?: string;

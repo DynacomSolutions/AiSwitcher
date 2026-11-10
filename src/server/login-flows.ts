@@ -158,7 +158,8 @@ export interface FingerprintFn {
  * After a sign-in on a gateway-routed identity: the gateway reads the account's login from its member store, not from the
  * folder the tool just wrote the new login into (over the gateway entry). Hands the new login to the store and puts the gateway
  * entry back, by the route-all-via-gateway rules (same account, provably fresher than the store copy, no running session, no
- * other holder). Returns a note for the owner, or undefined when nothing was routed (an identity the gateway does not hold).
+ * other holder). Returns a warning for the owner when the new login did not (fully) reach the gateway, and undefined when the
+ * gateway now uses it or does not hold the identity at all.
  */
 export async function adoptLoginIntoGateway(toolName: string, identityName: string, configDir: string, opts: RouteAllOptions = {}): Promise<string | undefined> {
   if (!isMemberStoreTool(toolName)) return undefined;
@@ -172,17 +173,19 @@ export async function adoptLoginIntoGateway(toolName: string, identityName: stri
     const line = report.lines[0];
     if (!line) return refused(report.unroutedTools[0]?.reason ?? "the identity could not be routed");
     if (line.status !== "routed") return refused(line.detail ?? line.status);
+    // Routed, but a session started during the switch may hold the old login: the owner must hear it.
+    if (line.attention) return line.detail ?? "signed in and routed, but a running session needs attention";
   } catch (err) {
     return refused(`routing failed (${err instanceof Error ? err.name : "error"})`);
   }
   // A routed run can keep the store copy (not provably fresher): then the new login was only backed up.
   const store = await Bun.file(`${memberDir(toolName, identityName, root)}/${memberLoginFile(toolName)}`).text().catch(() => undefined);
   if (refreshOf(toolName, store) !== refreshOf(toolName, folder)) return refused("the new login is not provably fresher than the gateway's copy, so the gateway kept its own (the new login is in the folder's .pre-gateway backup)");
-  return "signed in; the new login now serves the gateway";
+  return undefined;
 }
 
 export interface LoginFlowManagerDeps {
-  /** Hands a finished sign-in on a routed identity to the gateway (injectable; default adoptLoginIntoGateway). */
+  /** Hands a finished sign-in on a routed identity to the gateway (injectable; default adoptLoginIntoGateway). Resolves to a warning, or undefined when all is well. */
   adoptLogin?: (toolName: ToolConfig["toolName"], identityName: string, configDir: string) => Promise<string | undefined>;
   spawn?: SpawnFn;
   /** util-linux script binary for PTY mode; discovery is injectable so
@@ -230,6 +233,8 @@ async function defaultResolveIdentity(
 interface FlowRecord {
   dto: LoginFlowDto;
   configDir: string;
+  /** True once the finished sign-in is being handed to the gateway: the flow can no longer time out or be cancelled. */
+  adopting?: boolean;
   child?: SpawnedChild;
   credentialPaths: string[];
   /** True for a codex browser sign-in (holds the host's one callback port). */
@@ -492,6 +497,7 @@ export class LoginFlowManager {
     const record = this.flows.get(flowId);
     if (!record) throw new HttpError(404, `unknown login flow "${flowId}"`);
     if (record.done) return { ...record.dto };
+    if (record.adopting) throw new HttpError(409, "the sign-in is already finished and is being handed to the gateway; it cannot be cancelled now");
     this.killChild(record);
     this.finish(record, "cancelled");
     return { ...record.dto };
@@ -500,7 +506,7 @@ export class LoginFlowManager {
   stop(): void {
     for (const record of this.flows.values()) {
       this.clearTimers(record);
-      if (!record.done) {
+      if (!record.done && !record.adopting) {
         this.killChild(record);
         this.finish(record, "cancelled");
       }
@@ -607,13 +613,15 @@ export class LoginFlowManager {
 
   /** A sign-in finished: on a gateway-routed identity the new login is handed to the gateway before the flow reads completed. */
   private async complete(record: FlowRecord): Promise<void> {
+    // The switch runs to the end whatever the clock or the user says: the flow must not read "timed out" or "cancelled" meanwhile.
+    record.adopting = true;
+    this.clearTimers(record);
     let note: string | undefined;
     try {
       note = await this.adoptLogin(record.dto.toolName, record.dto.identity, record.configDir);
     } catch {
       note = "signed in, but handing the new login to the gateway failed";
     }
-    if (record.done) return;
     if (note) record.dto.note = note;
     this.finish(record, "completed");
   }

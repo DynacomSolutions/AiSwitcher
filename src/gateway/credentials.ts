@@ -28,8 +28,8 @@ import type { ProviderCredential } from "./providers/index.ts";
 import type { GatewayProvider } from "./types.ts";
 
 /** A dead member-store login is written next to its store copy so the portal can show it (gateway-revoked.ts); best effort, gateway processes only. */
-async function markLoginRevoked(provider: string, identity: string, code: string): Promise<void> {
-  if (memberStoreEnabled()) await recordLoginRevoked(provider, identity, code).catch(() => undefined);
+async function markLoginRevoked(provider: string, identity: string, code: string, rejected: string | undefined): Promise<void> {
+  if (memberStoreEnabled()) await recordLoginRevoked(provider, identity, code, rejected).catch(() => undefined);
 }
 
 export type RefreshFn = typeof refreshIdentityOAuthGrant;
@@ -303,13 +303,13 @@ export class CredentialCache {
       // Raw errors can carry lock paths or provider text: keep them as `cause` only.
       // Only a dead-grant OAuth code (invalid_grant, refresh_token_expired/reused/invalidated) in the token endpoint's body proves the login is gone; any other 400/401 is not enough.
       const revoked = err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode);
-      if (revoked) await markLoginRevoked(provider, identity, err.oauthCode!);
+      if (revoked) await markLoginRevoked(provider, identity, err.oauthCode!, err.refreshFingerprint);
       throw new GatewayCredentialError(err instanceof SwapLockError ? "refresh-lock-timeout" : revoked ? "login-dead" : "refresh-failed", provider, identity, err);
     }
     if (result.outcome === "refreshed") this.lastRefreshAt.set(key, now);
     const next = await this.reload(provider, id);
     if (next.accessToken !== staleToken && !isGatewayAccessToken(next.accessToken)) return next;
-    if (result.outcome === "skipped-revoked") await markLoginRevoked(provider, identity, "revoked");
+    if (result.outcome === "skipped-revoked") await markLoginRevoked(provider, identity, "revoked", result.beforeFingerprint);
     // Detail from the refresher may carry local paths: surface only a reason code.
     // A swap pool's no-grant and any failed refresh are transient here; only a revoked diagnosis or a plain identity with no grant is a dead login.
     const code = result.outcome === "skipped-revoked" || (result.outcome === "no-grant" && !isSwapPool(id) && !result.readError) ? "login-dead" : result.outcome === "failed" || result.outcome === "no-grant" || result.outcome === "skipped-read-error" ? "refresh-failed" : "token-unchanged";

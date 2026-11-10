@@ -40,6 +40,8 @@ interface ProbeResult {
   expiresAt?: string;
   /** Short access-token life but a refresh token is held: healthy unless the refresher is failing. */
   selfRefreshing?: boolean;
+  /** The result describes the gateway's member-store login: the host's own refresher never touches it (it skips gateway-managed logins), so its status says nothing about this login. */
+  viaGateway?: boolean;
 }
 
 function exists(path: string): Promise<boolean> {
@@ -309,17 +311,18 @@ async function probeViaGateway(tool: MemberStoreTool, identity: Identity): Promi
     return {
       kind: "oauth",
       state: "unknown",
+      viaGateway: true,
       detail: "via gateway: the folder holds the gateway entry, but this host has no member-store login for it (the real login cannot be checked here)",
       fixable: ["login"],
     };
   }
   const revoked = readLoginRevoked(tool, identity.name, root);
   if (revoked) {
-    return { kind: "oauth", state: "expired", detail: `refresh token revoked: re-login required (via gateway member store; ${revoked.code}, ${revoked.at})`, fixable: ["login"] };
+    return { kind: "oauth", state: "expired", viaGateway: true, detail: `refresh token revoked: re-login required (via gateway member store; ${revoked.code}, ${revoked.at})`, fixable: ["login"] };
   }
   const dir = memberDir(tool, identity.name, root);
   const inner = tool === "claude" ? await probeClaude(dir) : await probeCodex(dir);
-  return { ...inner, detail: `via gateway member store: ${inner.detail ?? inner.state}` };
+  return { ...inner, viaGateway: true, detail: `via gateway member store: ${inner.detail ?? inner.state}` };
 }
 
 export async function authStatus(
@@ -390,7 +393,8 @@ export async function authStatus(
       } catch (err) {
         result = { kind: "none", state: "unknown", detail: err instanceof Error ? err.message : "probe failed", fixable: [] };
       }
-      const refresh = refreshStatus.find((entry) => entry.tool === cfg.toolName && entry.identity === identity.name);
+      // Failures the host's refresher recorded before the identity was routed never clear (it skips gateway-managed logins): they must not override the member-store probe.
+      const refresh = result.viaGateway ? undefined : refreshStatus.find((entry) => entry.tool === cfg.toolName && entry.identity === identity.name);
       // A revoked or failing refresher means the short-lived token is not self-healing.
       const refresherUnhealthy = !!refresh && (refresh.revoked || !!refresh.lastError || refresh.consecutiveFailures > 0);
       const state = result.selfRefreshing && refresherUnhealthy ? "expiring" : result.state;

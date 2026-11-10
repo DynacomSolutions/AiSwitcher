@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import { withOauthRefreshLock } from "./claude-swap-lock.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreRoot } from "./gateway-members.ts";
 import { refreshFingerprint, refreshOf } from "./gateway-routed.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
@@ -37,15 +38,24 @@ function readStoreRefresh(tool: string, name: string, root: string): string | un
   }
 }
 
-/** Records that the store copy's current login is dead. Best effort: false when there is no store copy or the write failed. */
-export async function recordLoginRevoked(tool: string, name: string, code: string, root: string = memberStoreRoot(), now: () => Date = () => new Date()): Promise<boolean> {
-  if (!isMemberStoreTool(tool) || !hasMemberCopy(tool, name, root)) return false;
-  const refresh = readStoreRefresh(tool, name, root);
-  if (refresh === undefined) return false;
-  const marker: RevokedMarker = { at: now().toISOString(), code, fingerprint: refreshFingerprint(refresh) };
+/**
+ * Records that the login with refresh-token fingerprint `rejected` is dead (the fingerprint of the grant the token endpoint
+ * rejected: OAuthRefreshError.refreshFingerprint / RefreshResult.beforeFingerprint, the first 8 hex digits of the refresh
+ * token's sha256). Written under the member dir's refresh lock and only while the store copy still holds that very login: a
+ * newer login that landed after the rejection (a portal sign-in) is never marked. Best effort: false when nothing was written.
+ */
+export async function recordLoginRevoked(tool: string, name: string, code: string, rejected: string | undefined, root: string = memberStoreRoot(), now: () => Date = () => new Date()): Promise<boolean> {
+  if (!isMemberStoreTool(tool) || !rejected || !hasMemberCopy(tool, name, root)) return false;
   try {
-    await writeFileAtomic(revokedMarkerPath(tool, name, root), `${JSON.stringify(marker)}\n`);
-    return true;
+    return await withOauthRefreshLock(memberDir(tool, name, root), async () => {
+      const refresh = readStoreRefresh(tool, name, root);
+      if (refresh === undefined) return false;
+      const fingerprint = refreshFingerprint(refresh);
+      if (!fingerprint.startsWith(rejected)) return false;
+      const marker: RevokedMarker = { at: now().toISOString(), code, fingerprint };
+      await writeFileAtomic(revokedMarkerPath(tool, name, root), `${JSON.stringify(marker)}\n`);
+      return true;
+    });
   } catch {
     return false;
   }

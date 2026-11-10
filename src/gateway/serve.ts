@@ -122,8 +122,8 @@ export function instrumentRefresh(
       deps.alerter.raise("store-unreadable", key, `a credential store of the ${tool} login "${identity.name}" could not be read${which}; check the file's permissions and contents (${effect})`);
     };
     /** A dead login of a member-store account is written next to its store copy for the portal (gateway-revoked.ts); best effort. */
-    const markRevoked = async (t: string, name: string, code: string): Promise<void> => {
-      if (memberStoreEnabled()) await recordLoginRevoked(t, name, code).catch(() => undefined);
+    const markRevoked = async (t: string, name: string, code: string, rejected: string | undefined): Promise<void> => {
+      if (memberStoreEnabled()) await recordLoginRevoked(t, name, code, rejected).catch(() => undefined);
     };
     const ok = (): void => {
       deps.failed?.delete(key);
@@ -134,7 +134,7 @@ export function instrumentRefresh(
       deps.metrics.refresh(tool, result.outcome);
       const idleNoGrant = result.outcome === "no-grant" && opts?.keepAlive === true && !result.readError;
       if (result.outcome === "failed" || (result.outcome === "no-grant" && !idleNoGrant) || result.outcome === "skipped-revoked") fail();
-      if (result.outcome === "skipped-revoked") await markRevoked(tool, identity.name, "revoked");
+      if (result.outcome === "skipped-revoked") await markRevoked(tool, identity.name, "revoked", result.beforeFingerprint);
       else if (result.outcome === "refreshed") ok();
       // Any result that names unreadable stores warns early (the alerter dedupes); only a result whose store probe ran and
       // found none closes the alert. Adopted, lock-busy and rotated-elsewhere results never probed, so they leave it open.
@@ -151,7 +151,7 @@ export function instrumentRefresh(
       deps.metrics.refresh(tool, "failed");
       fail();
       // Only a dead-grant OAuth code proves the login is gone (as in credentials.ts): record it where the portal can read it.
-      if (err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) await markRevoked(tool, identity.name, err.oauthCode);
+      if (err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) await markRevoked(tool, identity.name, err.oauthCode, err.refreshFingerprint);
       throw err;
     }
   }) as RefreshFn;

@@ -167,6 +167,8 @@ const FILES_OF: Record<MemberStoreTool, string[]> = {
 
 /* ------------------------------------------------------------------ gateway holds the account */
 
+const NOT_RENEWED = "the gateway holds this account but has not yet renewed it successfully";
+
 /** Why the running gateway does not demonstrably hold this account, or undefined when it does. */
 export function heldProblem(tool: string, name: string, hb: GatewayHeartbeat | undefined, nowMs: number): string | undefined {
   if (!hb) return "no gateway heartbeat: the gateway has not confirmed it holds this account";
@@ -175,7 +177,7 @@ export function heldProblem(tool: string, name: string, hb: GatewayHeartbeat | u
   if (hb.memberStore !== true) return "the running gateway predates the member store; deploy a build with it, then wait for its heartbeat";
   const held = hb.held[`${tool}/${name}`];
   if (!Object.hasOwn(hb.held, `${tool}/${name}`) || held === undefined) return "the gateway does not hold this account (it is not one of its members)";
-  if (!held.lastSuccessAt) return "the gateway holds this account but has not yet renewed it successfully";
+  if (!held.lastSuccessAt) return NOT_RENEWED;
   return undefined;
 }
 
@@ -603,9 +605,10 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   const stored = hasMemberCopy(tool, identity.name, root);
   if (kind === "none" && !stored) return { ...line, status: "refused", detail: "no refreshable login in this folder (logged out, API key or Bedrock); nothing for the gateway to hold" };
   if (kind === "gateway" && !stored) return { ...line, status: "refused", detail: "the folder already holds the gateway entry but the member store has no login for it; restore the login from its .pre-gateway backup first" };
-  if (kind === "login" && !(opts.afterLogin && stored)) {
+  if (kind === "login") {
+    // After a sign-in on a routed identity the gateway only has to hold the account; that it has not yet renewed it successfully (its login is dead) is the reason for the sign-in.
     const problem = heldProblem(tool, identity.name, ctx.hb, now());
-    if (problem) return { ...line, status: "refused", detail: problem };
+    if (problem && !(opts.afterLogin && stored && problem === NOT_RENEWED)) return { ...line, status: "refused", detail: problem };
   }
   const busy = await sessionsProblem(tool, dir, opts);
   if (busy) return { ...line, status: "refused", detail: busy };
@@ -633,6 +636,8 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     const nowKind = classifyLogin(tool, localText);
     const plan = nowKind === "login" ? await planStoreMove(tool, identity, localText!, root) : {};
     if (plan.refused) return plan.refused;
+    // A sign-in just made must reach the store: when the store copy is kept, replacing the folder would bury the new login in a backup.
+    if (opts.afterLogin && nowKind === "login" && !plan.write && plan.note) return `${plan.note}; the new login stays in the folder and the gateway keeps its own copy`;
     if (nowKind !== "login" && !hasMemberCopy(tool, identity.name, root)) return "the login disappeared while waiting for the lock; nothing changed";
     // pi's copy goes first: a failure here (PiChanged, EACCES) leaves the store and the folder as they were.
     for (const r of holdersNow.piRemovals) notes.push(await removePiCopy(r, now));

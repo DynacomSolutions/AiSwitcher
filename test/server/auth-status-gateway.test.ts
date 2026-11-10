@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { authStatus } from "../../src/server/auth.ts";
 import { memberDir } from "../../src/identities/gateway-members.ts";
+import { refreshFingerprint } from "../../src/identities/gateway-routed.ts";
 import { recordLoginRevoked } from "../../src/identities/gateway-revoked.ts";
 import type { ToolConfig } from "../../src/identities/types.ts";
 
@@ -56,6 +57,7 @@ async function seed(tool: "claude" | "codex", folderFile: string, store?: string
   }
 }
 
+const fp = (n: string) => refreshFingerprint(`rt-SYNTHETIC_FIXTURE-${n}`).slice(0, 8);
 const entryOf = async (tool: "claude" | "codex") => (await authStatus([cfg(tool)])).entries[0]!;
 
 describe("auth status of a gateway-routed identity", () => {
@@ -82,7 +84,7 @@ describe("auth status of a gateway-routed identity", () => {
 
     test(`${tool}: a revoked member login needs a re-login`, async () => {
       await seed(tool, entry, login(24 * 5));
-      expect(await recordLoginRevoked(tool, "work", "token_revoked")).toBe(true);
+      expect(await recordLoginRevoked(tool, "work", "token_revoked", fp("a"))).toBe(true);
       const e = await entryOf(tool);
       expect(e.state).toBe("expired");
       expect(e.detail).toContain("refresh token revoked: re-login required");
@@ -91,7 +93,7 @@ describe("auth status of a gateway-routed identity", () => {
 
     test(`${tool}: a new login in the store makes the revoked record stale`, async () => {
       await seed(tool, entry, login(24 * 5));
-      await recordLoginRevoked(tool, "work", "token_revoked");
+      await recordLoginRevoked(tool, "work", "token_revoked", fp("a"));
       const file = tool === "codex" ? "auth.json" : ".credentials.json";
       await writeFile(join(memberDir(tool, "work"), file), tool === "codex" ? codexLogin(inHours(100), "new") : claudeLogin(Date.now() + 100 * 3_600_000, "new"));
       expect((await entryOf(tool)).state).toBe("ok");
@@ -108,7 +110,7 @@ describe("auth status of a gateway-routed identity", () => {
 
   test("a plain login in the folder is probed as before, even when a revoked record exists for the name", async () => {
     await seed("codex", codexLogin(inHours(24 * 3)), codexLogin(inHours(24 * 5), "store"));
-    await recordLoginRevoked("codex", "work", "token_revoked");
+    await recordLoginRevoked("codex", "work", "token_revoked", fp("store"));
     const e = await entryOf("codex");
     expect(e.state).toBe("ok");
     expect(e.detail).not.toContain("gateway");
@@ -120,5 +122,21 @@ describe("auth status of a gateway-routed identity", () => {
     const e = await entryOf("codex");
     expect(e.state).toBe("ok");
     expect(e.detail).toContain("API key");
+  });
+
+  test("a stale host refresh failure recorded before routing does not override the member-store probe", async () => {
+    await seed("codex", codexEntry, codexLogin(inHours(24 * 5)));
+    const stale = [{ tool: "codex", identity: "work", revoked: true, lastError: "old failure", consecutiveFailures: 9, lastSuccessAt: "2020-01-01T00:00:00Z" }] as never;
+    const e = (await authStatus([cfg("codex")], stale)).entries[0]!;
+    expect(e.state).toBe("ok");
+    expect(e.detail).toContain("via gateway member store");
+    expect(e.refreshError).toBeUndefined();
+  });
+
+  test("a host refresh status still applies to a plain login", async () => {
+    await seed("codex", codexLogin(inHours(2)));
+    const status = [{ tool: "codex", identity: "work", revoked: true, lastError: "x", consecutiveFailures: 3 }] as never;
+    const e = (await authStatus([cfg("codex")], status)).entries[0]!;
+    expect(e.state).toBe("expiring");
   });
 });
