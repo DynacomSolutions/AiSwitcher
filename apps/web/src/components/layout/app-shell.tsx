@@ -9,12 +9,16 @@ import {
   IdCard,
   LayoutDashboard,
   ListTree,
+  Menu,
   PieChart,
   ShieldCheck,
 } from "lucide-react";
-import { NavLink, Outlet } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { UpdatedAgo } from "@/components/updated-ago";
 import { useStatusQuery } from "@/hooks/queries";
@@ -34,25 +38,82 @@ const NAV_ITEMS = [
   { to: "/files", label: "Files", icon: FolderOpen, end: false },
 ] as const;
 
+function NavList({ onNavigate }: { onNavigate?: () => void }) {
+  return (
+    <nav aria-label="Main" className="flex-1 space-y-1 overflow-y-auto p-3">
+      {NAV_ITEMS.map((item) => (
+        <NavLink
+          key={item.to}
+          to={item.to}
+          end={item.end}
+          onClick={onNavigate}
+          className={({ isActive }) =>
+            cn(
+              "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors outline-none focus-visible:ring-[3px] focus-visible:ring-ring/40",
+              isActive
+                ? "bg-primary/12 text-primary font-medium"
+                : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+            )
+          }
+        >
+          <item.icon className="size-4" aria-hidden />
+          {item.label}
+        </NavLink>
+      ))}
+    </nav>
+  );
+}
+
+/** Menu button and drawer for screens narrower than the md breakpoint, where the sidebar is hidden. */
+export function MobileNav() {
+  const [open, setOpen] = useState(false);
+  const { pathname } = useLocation();
+
+  // Close on any route change, including back/forward, not only on link clicks.
+  useEffect(() => {
+    setOpen(false);
+  }, [pathname]);
+
+  return (
+    <Sheet open={open} onOpenChange={setOpen}>
+      <SheetTrigger asChild>
+        <Button variant="ghost" size="icon" className="md:hidden" aria-label="Open navigation menu">
+          <Menu className="size-5" aria-hidden />
+        </Button>
+      </SheetTrigger>
+      <SheetContent aria-describedby="mobile-nav-description">
+        <div className="flex h-14 shrink-0 items-center border-b px-4">
+          <SheetTitle className="text-sm font-semibold tracking-tight">Navigation</SheetTitle>
+          <SheetDescription id="mobile-nav-description" className="sr-only">
+            Pages of the AIS Console
+          </SheetDescription>
+        </div>
+        <NavList onNavigate={() => setOpen(false)} />
+      </SheetContent>
+    </Sheet>
+  );
+}
+
 function TopBar() {
   const status = useStatusQuery();
   const connected = !status.isError && status.data?.ok !== false;
 
   return (
     <header className="bg-background/85 sticky top-0 z-40 flex h-14 shrink-0 items-center justify-between gap-4 border-b px-4 backdrop-blur md:px-6">
-      <div className="flex items-center gap-2.5">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <MobileNav />
         <div className="flex size-7 items-center justify-center rounded-lg bg-primary text-primary-foreground">
           <ArrowLeftRight className="size-4" aria-hidden />
         </div>
-        <span className="text-sm font-semibold tracking-tight">AIS Console</span>
+        <span className="truncate text-sm font-semibold tracking-tight">AIS Console</span>
         {status.data?.version ? (
-          <Badge variant="outline" className="font-mono text-[10px]">
+          <Badge variant="outline" className="hidden font-mono text-[10px] sm:inline-flex">
             v{status.data.version}
           </Badge>
         ) : null}
       </div>
 
-      <div className="flex items-center gap-2.5">
+      <div className="flex shrink-0 items-center gap-2.5">
         <span
           aria-hidden
           className={cn(
@@ -74,26 +135,7 @@ function Sidebar() {
 
   return (
     <aside className="bg-sidebar sticky top-14 hidden h-[calc(100vh-3.5rem)] w-60 shrink-0 flex-col border-r md:flex">
-      <nav className="flex-1 space-y-1 overflow-y-auto p-3">
-        {NAV_ITEMS.map((item) => (
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end={item.end}
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors outline-none focus-visible:ring-[3px] focus-visible:ring-ring/40",
-                isActive
-                  ? "bg-primary/12 text-primary font-medium"
-                  : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-              )
-            }
-          >
-            <item.icon className="size-4" aria-hidden />
-            {item.label}
-          </NavLink>
-        ))}
-      </nav>
+      <NavList />
       <div className="space-y-1 border-t p-4 text-xs text-muted-foreground">
         <p>Loopback console for AiProfileSwitcher</p>
         {status.data?.aisHome ? (

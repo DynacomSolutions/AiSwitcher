@@ -191,10 +191,36 @@ jobs:
       - name: Check the build output
         run: test -f apps/chrome-extension/dist/manifest.json
 
+  # Builds the WebUI and loads every route in real Chromium at phone widths (apps/web/test/mobile-layout.e2e.ts).
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build the WebUI
+        working-directory: apps/web
+        run: |
+          npm install -g pnpm@10
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Mobile layout (360 and 390 px, every route)
+        env:
+          AIS_E2E_CHROMIUM: /usr/bin/google-chrome
+        run: bun run test:e2e:web
+
   # Always runs, so a required check keeps reporting when path-gated jobs are skipped.
   ci-gate:
     if: always()
-    needs: [test, changes, test-macos, extension]
+    needs: [test, changes, test-macos, extension, web]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

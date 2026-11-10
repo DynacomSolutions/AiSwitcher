@@ -20,7 +20,7 @@ function PopoverContent({
         align={align}
         sideOffset={sideOffset}
         className={cn(
-          "bg-popover text-popover-foreground animate-in fade-in-0 zoom-in-95 z-50 w-72 origin-(--radix-popover-content-transform-origin) rounded-lg border p-4 shadow-md outline-hidden",
+          "bg-popover text-popover-foreground animate-in fade-in-0 zoom-in-95 z-50 w-72 max-w-[calc(100vw-1rem)] origin-(--radix-popover-content-transform-origin) rounded-lg border p-4 shadow-md outline-hidden",
           className,
         )}
         {...props}

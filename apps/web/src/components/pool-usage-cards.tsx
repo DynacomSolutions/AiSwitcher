@@ -84,13 +84,13 @@ function PoolCard({ pool }: { pool: PoolSummary }) {
           </div>
         ) : null}
         <div className="space-y-1.5">
-          <div className="grid grid-cols-[1fr_auto_auto] gap-x-3 text-xs uppercase tracking-wide text-muted-foreground">
+          <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-x-3 text-xs uppercase tracking-wide text-muted-foreground">
             <span>Member</span>
             <span>7d tokens</span>
             <span>Worst window</span>
           </div>
           {pool.members.map((m) => (
-            <div key={m.name} className="grid grid-cols-[1fr_auto_auto] items-baseline gap-x-3 text-sm">
+            <div key={m.name} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-baseline gap-x-3 text-sm">
               <span className="truncate" title={m.name}>
                 {m.name}
                 {m.name === pool.active ? " (active)" : ""}
@@ -126,7 +126,7 @@ export function PoolUsageCards() {
         <h2 className="text-base font-semibold">Pools</h2>
         {loading ? <Badge variant="muted">loading members</Badge> : null}
       </div>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         {summaries.map((p) => (
           <PoolCard key={p.key} pool={p} />
         ))}

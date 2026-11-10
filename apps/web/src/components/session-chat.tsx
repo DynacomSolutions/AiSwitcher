@@ -123,7 +123,7 @@ function Turn({ turn }: { turn: TranscriptTurn }) {
   if (turn.role === "user") {
     return (
       <div className="flex flex-col items-end">
-        <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-primary px-3.5 py-2 text-sm text-primary-foreground">
+        <div className="max-w-[85%] break-words rounded-2xl rounded-br-sm bg-primary px-3.5 py-2 text-sm text-primary-foreground">
           <ExpandableText text={turn.text} clampLines={10} />
         </div>
         <div className="mt-0.5 flex items-center gap-2 px-1 text-[10px] text-muted-foreground">
@@ -136,7 +136,7 @@ function Turn({ turn }: { turn: TranscriptTurn }) {
   if (turn.role === "assistant") {
     return (
       <div className="flex flex-col items-start">
-        <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-muted px-3.5 py-2 text-sm">
+        <div className="max-w-[85%] break-words rounded-2xl rounded-bl-sm bg-muted px-3.5 py-2 text-sm">
           <ExpandableText text={turn.text} clampLines={12} />
         </div>
         <div className="mt-0.5 flex items-center gap-2 px-1 text-[10px] text-muted-foreground">
