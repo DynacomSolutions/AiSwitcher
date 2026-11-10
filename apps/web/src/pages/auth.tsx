@@ -95,7 +95,7 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
       qc.setQueryData(qk.loginFlow(flowId), updated);
       setPaste("");
     },
-    onError: (error) => toast.error("Could not submit code", { description: error.message }),
+    onError: (error) => toast.error("Could not submit", { description: error.message }),
   });
 
   const cancelMutation = useMutation({
@@ -173,7 +173,11 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
               >
                 <Input
                   className="font-mono text-xs"
-                  placeholder="Paste the code (or the full redirect URL) here"
+                  placeholder={
+                    flow.toolName === "codex"
+                      ? "Paste the full http://localhost address here"
+                      : "Paste the code (or the full redirect URL) here"
+                  }
                   value={paste}
                   onChange={(e) => setPaste(e.target.value)}
                   spellCheck={false}

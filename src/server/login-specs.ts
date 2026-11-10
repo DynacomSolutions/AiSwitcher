@@ -24,7 +24,23 @@ export interface LoginFlowSpec {
   acceptsPaste: boolean;
   /** Shown in the WebUI next to the paste box. */
   instruction?: string;
+  /** Codex browser sign-in: the CLI listens on a fixed localhost port and
+   * the user pastes back the callback URL their browser landed on. */
+  localCallback?: boolean;
 }
+
+/** Codex sign-in for identities whose accounts have device codes disabled
+ * (`codexLoginMethod: "browser"`). Plain `codex login` prints an auth URL
+ * whose redirect_uri is http://localhost:<port>/auth/callback and listens on
+ * that port; the manager replays the pasted callback URL against it. */
+export const CODEX_BROWSER_SPEC: LoginFlowSpec = {
+  args: ["login"],
+  mode: "pipes",
+  acceptsPaste: true,
+  localCallback: true,
+  instruction:
+    "Open the URL and sign in. Your browser will then land on a page that cannot load (an address starting with http://localhost). Copy that full address from the browser's address bar and paste it below.",
+};
 
 export const LOGIN_FLOW_SPECS: Partial<Record<ToolConfig["toolName"], LoginFlowSpec>> = {
   claude: {

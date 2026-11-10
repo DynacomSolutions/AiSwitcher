@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import type { ChromeProfileOverride, Identity, IdentitiesFile } from "./types.ts";
 import { InvalidIdentitiesFileError } from "./errors.ts";
 import { isValidIdentityColour } from "./colour.ts";
+import { isCodexLoginMethod } from "./types.ts";
 import { expandPath, parseDirectoryPattern, translateHostPath, untranslateHostPath } from "./match.ts";
 
 /** Structural validation only. Whether members exist, are claude identities,
@@ -86,6 +87,9 @@ function validateIdentity(identity: unknown, index: number): asserts identity is
     if (typeof rec.colour !== "string" || !isValidIdentityColour(rec.colour)) {
       throw new InvalidIdentitiesFileError(`identity "${rec.name}" has an invalid "colour" (use #rgb or #rrggbb)`);
     }
+  }
+  if (rec.codexLoginMethod !== undefined && !isCodexLoginMethod(rec.codexLoginMethod)) {
+    throw new InvalidIdentitiesFileError(`identity "${rec.name}" has an invalid "codexLoginMethod" (use "device" or "browser")`);
   }
   if (rec.retired !== undefined && typeof rec.retired !== "boolean") {
     throw new InvalidIdentitiesFileError(`identity "${rec.name}" has a non-boolean "retired"`);
