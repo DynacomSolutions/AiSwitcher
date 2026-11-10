@@ -254,11 +254,18 @@ export async function poolStoreDirsFor(identity: Identity, registryPath?: string
     const file = await loadIdentitiesFile(registryPath ?? (await poolAdapterFor(tool))?.config.identitiesJsonPath ?? CLAUDE_CONFIG.identitiesJsonPath);
     // A gateway-routed pool folder holds the gateway entry, never a member login: it is not a store of the member's grant.
     const candidates = poolsHoldingMember(file, identity.name).map((pool) => pool.configDir);
-    const plain = tool === "claude" ? (await Promise.all(candidates.map(async (dir) => ((await isGatewayRoutedDir(expandPath(dir))) ? undefined : dir)))).filter((d): d is string => d !== undefined) : candidates;
+    const plain = (await Promise.all(candidates.map(async (dir) => ((await isRoutedPoolDir(tool, dir)) ? undefined : dir)))).filter((d): d is string => d !== undefined);
     return sameAccountDirs(identity, plain, tool);
   } catch {
     return [];
   }
+}
+
+/** A gateway-routed pool folder (claude: base URL or entry; codex: entry or the gateway provider in config.toml). */
+async function isRoutedPoolDir(tool: RefreshableTool, dir: string): Promise<boolean> {
+  if (tool === "claude") return isGatewayRoutedDir(expandPath(dir));
+  if (tool !== "codex") return false;
+  return (await import("./pool/gateway-pool.ts")).isCodexGatewayPoolDir(dir);
 }
 
 /** The tool's pool adapter, if any. Imported lazily: the adapter registry

@@ -1,4 +1,8 @@
 import type { Identity } from "../../identities/types.ts";
+import { hasMemberCopy, memberDir, memberStoreEnabled } from "../../identities/gateway-members.ts";
+import { classifyLogin } from "../../identities/gateway-routed.ts";
+import { codexAccountOf, codexAuthPath, parseCodexAuth, readCodexAuthText } from "../../identities/codex-auth.ts";
+import { readFileSync } from "node:fs";
 import { reconcileOnceForFetch, oauthRefreshHealth } from "../../identities/oauth-refresh.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
 import { categorizeByMinutes } from "./bucket.ts";
@@ -436,7 +440,9 @@ export function isCodexAuthRejectionError(error: string | undefined): boolean {
   return /token_expired|http 401|\b401\b|unauthorized|token.*expired|expired.*token/i.test(error);
 }
 
-export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimitResult> {
+export async function fetchCodexLimits(identity: Identity, deps: CodexStoreUsageDeps = {}): Promise<FetchedLimitResult> {
+  // Routed through the AIS gateway: the folder holds the gateway entry and the login lives in the gateway member store.
+  if (readsViaMemberStore(identity, deps.memberRoot)) return fetchCodexLimitsViaStore(identity, deps);
   // ONE reconcile per fetch, BEFORE the first attempt: pi may hold a
   // fresher copy of this account's grant (its own copy is refreshed during
   // pi usage), and adopting the freshest copy here is what stops
@@ -480,4 +486,85 @@ export async function fetchCodexLimits(identity: Identity): Promise<FetchedLimit
     ...last!,
     error: last!.error !== undefined && attempts > 1 ? `${last!.error} (still failing after ${attempts} attempts)` : last!.error,
   };
+}
+
+/* ------------------------------------------------------------------ gateway-routed identities */
+
+export interface CodexStoreUsageDeps {
+  /** Test hooks. */
+  fetchImpl?: typeof fetch;
+  memberRoot?: string;
+  now?: () => number;
+}
+
+/** ChatGPT's usage endpoint (what codex reads for `account/rateLimits/read`). */
+export const CODEX_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const STORE_USAGE_TIMEOUT_MS = 15_000;
+
+/**
+ * True when this identity's usage must be read from the gateway member store: this is not a gateway process (that one
+ * reads the store through the registry already), the store holds the login, and the folder holds no login of its own.
+ */
+function readsViaMemberStore(identity: Identity, root?: string): boolean {
+  if (memberStoreEnabled() || !hasMemberCopy("codex", identity.name, root)) return false;
+  let text: string | undefined;
+  try {
+    text = readFileSync(codexAuthPath(identity.configDir), "utf8");
+  } catch {
+    text = undefined;
+  }
+  return classifyLogin("codex", text) !== "login";
+}
+
+interface WhamWindow {
+  used_percent?: unknown;
+  limit_window_seconds?: unknown;
+  reset_at?: unknown;
+  reset_after_seconds?: unknown;
+}
+
+const finite = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+
+/** The `wham/usage` body as an app-server rate-limit snapshot (windows only), or undefined when it carries none. */
+export function snapshotFromWham(body: unknown, nowMs: number): RateLimitSnapshotWire | undefined {
+  const rl = (body as { rate_limit?: { primary_window?: WhamWindow | null; secondary_window?: WhamWindow | null } } | undefined)?.rate_limit;
+  const win = (w: WhamWindow | null | undefined): RateLimitWindowWire | undefined => {
+    const used = finite(w?.used_percent);
+    if (!w || used === undefined) return undefined;
+    const seconds = finite(w.limit_window_seconds);
+    const resetAt = finite(w.reset_at) ?? (finite(w.reset_after_seconds) !== undefined ? Math.floor(nowMs / 1000) + finite(w.reset_after_seconds)! : undefined);
+    return { usedPercent: used, ...(seconds !== undefined ? { windowDurationMins: Math.round(seconds / 60) } : {}), ...(resetAt !== undefined ? { resetsAt: resetAt } : {}) };
+  };
+  const primary = win(rl?.primary_window);
+  const secondary = win(rl?.secondary_window);
+  if (!primary && !secondary) return undefined;
+  const plan = (body as { plan_type?: unknown }).plan_type;
+  return { primary: primary ?? null, secondary: secondary ?? null, ...(typeof plan === "string" ? { planType: plan } : {}) };
+}
+
+/**
+ * Usage of a gateway-routed identity, read with the gateway member store's access token: one GET, never a refresh (the
+ * gateway renews that login; a refresh here, or a codex app-server pointed at the store, would spend its single-use
+ * refresh token). An expired or rejected token is reported, not repaired.
+ */
+export async function fetchCodexLimitsViaStore(identity: Identity, deps: CodexStoreUsageDeps = {}): Promise<FetchedLimitResult> {
+  const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "codex", identity };
+  const auth = parseCodexAuth(await readCodexAuthText(memberDir("codex", identity.name, deps.memberRoot)));
+  const token = auth?.tokens?.access_token;
+  if (typeof token !== "string" || token === "") return { ...base, windows: [], status: "unavailable", error: "the gateway member store holds no Codex access token for this identity" };
+  const account = codexAccountOf(auth).id;
+  try {
+    const res = await (deps.fetchImpl ?? fetch)(CODEX_WHAM_USAGE_URL, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...(account ? { "chatgpt-account-id": account } : {}) },
+      signal: AbortSignal.timeout(STORE_USAGE_TIMEOUT_MS),
+    });
+    if (res.status === 401 || res.status === 403) return { ...base, windows: [], status: "unavailable", error: `usage endpoint answered HTTP ${res.status} for the gateway member store login; the AIS gateway renews it (is the gateway running?)` };
+    if (!res.ok) return { ...base, windows: [], status: "unavailable", error: `usage endpoint answered HTTP ${res.status}` };
+    const nowMs = deps.now?.() ?? Date.now();
+    const snapshot = snapshotFromWham(await res.json(), nowMs);
+    if (!snapshot) return { ...base, windows: [], status: "unavailable", error: "usage endpoint returned no rate-limit windows" };
+    return { ...base, windows: buildWindows(snapshot), status: "live", capturedAt: new Date(nowMs).toISOString() };
+  } catch (err) {
+    return { ...base, windows: [], status: "unavailable", error: errorMessage(err) };
+  }
 }

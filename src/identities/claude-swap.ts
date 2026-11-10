@@ -8,6 +8,7 @@ import { activeMemberAt, appendSwapEvent as appendPoolSwapEvent, eventsForPool, 
 import type { SwapEvent, SwapReason, SwapResult, WriteBackOutcome } from "./pool/adapter.ts";
 import { claudeAdapter } from "./pool/claude-adapter.ts";
 import { dropApiKeyHelper, isGatewayAccessToken, isIntactGatewayEntry, isGatewayRoutedDir, readGatewayClaudeToken, storedAccessToken, writeGatewayEntry } from "./claude-gateway-entry.ts";
+import { gatewayMemberRefusal, gatewaySelectsNote, isGatewayMember } from "./pool/gateway-pool.ts";
 import { performPoolSwap, type PerformSwapOptions } from "./pool/swap.ts";
 import { allowedAccounts, SwapPoolError, type PoolIdentity } from "./pool/swap-pool.ts";
 import type { Identity } from "./types.ts";
@@ -261,9 +262,11 @@ export async function swapCredentialFiles(input: SwapFsInput): Promise<Omit<Swap
     return withClaudeLocks(poolDir, async () => {
       const activeName = pool.swapPool.active ?? null;
       const r = await installGatewayEntry({ pool, members, token: gatewayToken, ...(input.lock ? { lock: input.lock } : {}) });
-      return { pool: pool.name, from: activeName, to: target.name, noop: !r.changed && activeName === target.name, writeBack: r.writeBack, notes: r.notes };
+      return { pool: pool.name, from: activeName, to: target.name, noop: !r.changed && activeName === target.name, writeBack: r.writeBack, notes: [...r.notes, gatewaySelectsNote(pool.name)] };
     }, input.lock);
   }
+  // A plain pool never takes a routed member: the gateway holds its login, and its folder holds only the gateway entry.
+  if (isGatewayMember("claude", target)) throw new SwapPoolError(gatewayMemberRefusal("claude", target.name, pool.name));
   const poolCredPath = nativeStorePathFor("claude", poolDir);
   const targetCredPath = nativeStorePathFor("claude", target.configDir);
   const notes: string[] = [];
