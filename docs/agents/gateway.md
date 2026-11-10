@@ -217,6 +217,24 @@ hand: Claude Code sends every request through it, including a plain-HTTP loopbac
 10 Nov 2026, row 4.162). `--check` and `ais doctor` report a folder in that state. Run a real `claude -p` turn on each
 folder after a change: running sessions read settings.json at once.
 
+### Codex usage limits on a folder
+
+`ais gateway codex-home <dir>...` sets up Codex folders (CODEX_HOME, for example T3 Code's) that run through the gateway
+so Codex and `codex app-server` show real limits. It reads the app from the folder's
+`[model_providers.ais-gateway] base_url = "<base>/<app>"`, takes the token from `AIS_GATEWAY_APP_<APP>_TOKEN` in
+`~/.secrets`, then:
+
+- writes `auth.json` (0600): a placeholder ChatGPT login whose `access_token` is the app token (the `id_token` needs a
+  non-empty signature segment: codex 0.145 rejects an empty one);
+- sets top-level `chatgpt_base_url = "<base>/<app>/backend-api"` in config.toml and `requires_openai_auth = true` on the
+  provider, and removes `[model_providers.ais-gateway.auth]` (codex refuses provider auth combined with
+  `requires_openai_auth`); every other key survives; reruns change nothing;
+- registers the folder in `~/.ais/gateway-codex-homes.json`.
+
+`app add` and `app rotate` then rewrite `auth.json` in every registered folder of that app and report the count (never the
+token); a failure there is reported and never hides the minted-token message. `--check` writes nothing and reports each
+folder (`ok` or the problem).
+
 ### Public host
 
 `/metrics`, `/healthz`, `/readyz` and `/browser/pair*` answer 404 when the request names a public host (Host or
