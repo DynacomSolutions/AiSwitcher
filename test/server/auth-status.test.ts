@@ -105,15 +105,17 @@ describe("claude probe", () => {
   });
 
   test("expired, expiring and fresh tokens report expiresAt", async () => {
-    for (const [hours, expected] of [
-      [-5, "expired"],
-      [2, "ok"],
-      [48, "ok"],
+    // A lapsed access token with a refresh token is renewed on next use, so only one with no refresh token is expired.
+    for (const [hours, refreshToken, expected] of [
+      [-5, null, "expired"],
+      [-5, "b", "ok"],
+      [2, "b", "ok"],
+      [48, "b", "ok"],
     ] as const) {
       const { entry, configDir } = await statusFor("claude");
       await Bun.write(
         join(configDir, ".credentials.json"),
-        JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "b", expiresAt: hoursFromNow(hours) } }),
+        JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken, expiresAt: hoursFromNow(hours) } }),
       );
       const dto = await authStatus([configFor("claude", join(configDir, ".."))]);
       const refreshed = singleEntry(dto);
@@ -245,7 +247,7 @@ describe("codex probe", () => {
     const expiredJwt = fakeJwt({ exp: Math.floor(hoursFromNow(-3) / 1000) });
     await Bun.write(
       join(configDir, "auth.json"),
-      JSON.stringify({ tokens: { id_token: expiredJwt, access_token: "at", refresh_token: "rt" }, last_refresh: new Date().toISOString() }),
+      JSON.stringify({ tokens: { id_token: expiredJwt, access_token: "at" }, last_refresh: new Date().toISOString() }),
     );
     const dto = await authStatus([configFor("codex", join(configDir, ".."))]);
     const refreshed = singleEntry(dto);
@@ -268,6 +270,18 @@ describe("kimi probe", () => {
     expect(refreshed.fixable).toEqual(["refresh", "login"]);
     expect(refreshed.detail).toContain("refresh");
   });
+});
+
+test("kimi: a lapsed 15-minute access token with a refresh token is ok, not expired", async () => {
+  const { configDir } = await statusFor("kimi");
+  await mkdir(join(configDir, "credentials"), { recursive: true });
+  await Bun.write(
+    join(configDir, "credentials", "kimi-code.json"),
+    JSON.stringify({ access_token: "x", refresh_token: "r", expires_at: Math.floor(Date.now() / 1000) - 360, expires_in: 900 }),
+  );
+  const entry = singleEntry(await authStatus([configFor("kimi", join(configDir, ".."))]));
+  expect(entry.state).toBe("ok");
+  expect(entry.detail).toContain("renewed");
 });
 
 describe("opencode probe", () => {

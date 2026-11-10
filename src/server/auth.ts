@@ -56,6 +56,9 @@ function stateFromExpiry(
 ): { state: AuthEntryDto["state"]; detail: string; selfRefreshing?: boolean } {
   const hoursLeft = (expiresAtMs - Date.now()) / 3_600_000;
   if (hoursLeft <= 0) {
+    // A lapsed access token with a refresh token is renewed on next use (kimi's last only 15 min): not a reason to log in again.
+    // A refresh token that no longer works shows up as a refresh error, not here.
+    if (hasRefreshToken) return { state: "ok", detail: `access token lapsed ${formatAgo(-hoursLeft)} ago; renewed with the refresh token on next use`, selfRefreshing: true };
     return { state: "expired", detail: `token expired ${Math.abs(hoursLeft).toFixed(1)}h ago` };
   }
   if (hoursLeft < 24) {
@@ -74,6 +77,10 @@ function hasRefreshToken(value: unknown, depth = 0): boolean {
     if (hasRefreshToken(child, depth + 1)) return true;
   }
   return false;
+}
+
+function formatAgo(hours: number): string {
+  return hours < 1 ? `${Math.max(1, Math.round(hours * 60))}m` : `${hours.toFixed(1)}h`;
 }
 
 function toIso(ms: number): string {
