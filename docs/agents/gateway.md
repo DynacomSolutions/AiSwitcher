@@ -208,6 +208,15 @@ token to the real host.
   there and is never sent on. Anything else on that host is forwarded unchanged.
 - No pool member login is read or sent by the proxy. A renewed certificate is picked up within 5 minutes.
 
+### Claude usage proxy on a folder
+
+`ais gateway claude-proxy <dir>...` sets `HTTPS_PROXY` (the CONNECT proxy) and `NODE_EXTRA_CA_CERTS` in a Claude folder's
+settings.json, and always adds `NO_PROXY=127.0.0.1,localhost,::1`. Never set `HTTPS_PROXY` on a Claude folder by
+hand: Claude Code sends every request through it, including a plain-HTTP loopback `ANTHROPIC_BASE_URL` (the
+`ais gateway local` proxy), and the CONNECT proxy answers those with 405, so every model call fails (incident
+10 Nov 2026, row 4.162). `--check` and `ais doctor` report a folder in that state. Run a real `claude -p` turn on each
+folder after a change: running sessions read settings.json at once.
+
 ### Public host
 
 `/metrics`, `/healthz`, `/readyz` and `/browser/pair*` answer 404 when the request names a public host (Host or

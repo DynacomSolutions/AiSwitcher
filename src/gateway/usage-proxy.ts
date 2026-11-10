@@ -18,6 +18,12 @@ import { GATEWAY_TOKEN_PREFIX } from "../identities/claude-gateway-entry.ts";
  * No pool member login is ever read or sent here.
  */
 export const INTERCEPTED_HOST = "api.anthropic.com";
+/** Why a plain HTTP request was refused: almost always a client with HTTPS_PROXY set and no NO_PROXY for its own (loopback) base URL. */
+export const NOT_CONNECT_BODY =
+  "ais gateway CONNECT proxy: only CONNECT tunnels are accepted here, and this was a plain HTTP request. " +
+  "A client with HTTPS_PROXY set is sending a request through the proxy that should go direct: add its host to NO_PROXY " +
+  "(for a loopback ANTHROPIC_BASE_URL such as the ais gateway local proxy: NO_PROXY=127.0.0.1,localhost,::1).\n";
+
 const SERVED_PATHS = new Set(["/api/oauth/usage", "/api/oauth/profile"]);
 const MAX_HEAD = 16 * 1024;
 const HEAD_TIMEOUT_MS = 30_000;
@@ -136,8 +142,9 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
     let head = Buffer.alloc(0);
     // The CONNECT head must arrive promptly; an open tunnel has no timeout.
     client.setTimeout(HEAD_TIMEOUT_MS, () => client.destroy());
-    const fail = (status: string): void => {
-      client.end(`HTTP/1.1 ${status}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`, () => client.destroy());
+    const fail = (status: string, body = ""): void => {
+      const extra = status.startsWith("405") ? "allow: CONNECT\r\ncontent-type: text/plain; charset=utf-8\r\n" : body ? "content-type: text/plain; charset=utf-8\r\n" : "";
+      client.end(`HTTP/1.1 ${status}\r\nconnection: close\r\n${extra}content-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`, () => client.destroy());
     };
     const onData = (chunk: Buffer): void => {
       head = Buffer.concat([head, chunk]);
@@ -155,7 +162,7 @@ export async function startUsageProxy(opts: UsageProxyOptions): Promise<RunningU
       const rest = head.subarray(end + 4);
       const line = head.subarray(0, head.indexOf("\r\n")).toString("latin1");
       const m = /^CONNECT\s+(\[[^\]]+\]|[^\s:]+):(\d{1,5})\s+HTTP\/1\.[01]$/i.exec(line);
-      if (!m) return fail("405 Method Not Allowed");
+      if (!m) return fail("405 Method Not Allowed", NOT_CONNECT_BODY);
       const host = m[1]!.replace(/^\[|\]$/g, "").toLowerCase();
       const port = Number(m[2]);
       if (port < 1 || port > 65535) return fail("400 Bad Request");

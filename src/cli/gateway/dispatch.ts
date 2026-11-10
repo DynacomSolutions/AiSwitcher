@@ -24,7 +24,11 @@ export async function runGatewayCommand(positionals: string[], flags: ParsedArgs
   if (sub === "app") return runAppCommand(rest[0], rest.slice(1), flags, merged);
   if (sub === "usage") return runUsageCommand(flags, merged);
   if (sub === "local") return runLocal(rest, merged, boolFlag(flags, "check"));
-  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage ...  (ais gateway --help)");
+  if (sub === "claude-proxy") {
+    const { runClaudeProxyCommand } = await import("./claude-proxy.ts");
+    return runClaudeProxyCommand(rest, flags, merged);
+  }
+  if (sub !== "serve") throw new CliUsageError("Usage: ais gateway serve|local|app|usage|claude-proxy ...  (ais gateway --help)");
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   const adminToken = process.env.AIS_GATEWAY_ADMIN_TOKEN;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");
