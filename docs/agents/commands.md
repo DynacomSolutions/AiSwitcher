@@ -11,7 +11,7 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 33
   (darwin only), `ais`, and the installer into `dist/`.
 - `bun run backup` — snapshots `~/.claude`, `~/.claude-identity-a`,
   `~/.claude-personal`, `~/.codex`, `~/.grok`, `~/.kimi-code`, `~/.zai`,
-  `~/.ali`, `~/.pi`, and `~/.opencode` into the git-only repo at `~/.ais/backups/.git` (work tree `$HOME`, no plain copy) and
+  `~/.ali`, `~/.pi`, `~/.opencode`, and the gateway member store `~/.ais/gateway-members` (the live logins of identities routed through the gateway) into the git-only repo at `~/.ais/backups/.git` (work tree `$HOME`, no plain copy) and
   commits whatever changed since the last backup (see "~/.ais: one
   consolidated root" above).
 - `bun run migrate` — **one-time, destructive.** Restructures the real

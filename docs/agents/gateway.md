@@ -282,7 +282,9 @@ The gateway used to read each account's login from the same identity folders the
 gateway's logins. The gateway now has its own member store, `~/.ais/gateway-members/<tool>/<identity>/`
 (`AIS_GATEWAY_MEMBERS_DIR` overrides; claude: `.credentials.json` plus the `oauthAccount` record of `.claude.json`;
 codex: `auth.json`). It lives under `~/.ais`, which the gateway pod already mounts read-write, so no new mount is needed,
-and the host snapshot export skips it.
+and the host snapshot export skips it. `bun run backup` (and the pre-install backup) commits it as the `gateway` group,
+since once identities are routed it holds the only live logins. A store copy counts only when its login file parses and
+holds a refresh token: an empty or partial file left by a crash is ignored.
 
 - `ais gateway serve` and `ais gateway local` (`enableMemberStore()` in `src/identities/gateway-members.ts`) resolve any
   identity whose store holds its login file to the store folder, at the one I/O boundary (`loadIdentitiesFile`). Identities
@@ -299,18 +301,36 @@ identity, under the account's refresh locks (the ones the gateway takes before i
 
 1. it refuses unless a fresh heartbeat from a gateway built with the member store names the account with a successful
    renewal;
-2. it moves the login into the member store (kept when the store copy is newer; a newer local sign-in replaces it after a
-   unique backup). The login file is written last: its presence is what switches the gateway to the store;
-3. it backs up each local file it changes to `<file>.pre-gateway.<timestamp>.bak` (exclusive, 0600, never overwritten or
-   deleted) and writes the entry: claude `.credentials.json` gateway entry, `ANTHROPIC_BASE_URL=http://127.0.0.1:47140/claude`
+2. it refuses while any session uses the folder: a running `claude` or `codex` process (this user's, found in `/proc`)
+   whose `CLAUDE_CONFIG_DIR` / `CODEX_HOME` is the folder (or, without the variable, the tool's default folder). A session
+   started before the switch keeps the old login in memory and later refreshes it with the single-use refresh token the
+   gateway now renews; the gateway's copy then fails `refresh_token_reused` and the account is lost. Codex also writes that
+   login back over the gateway entry. The report lists the pids; end those sessions, then run the command again. There is
+   no override. Checked again under the locks, right before anything is written;
+3. it moves the login into the member store. A store copy already there is the gateway's live login: it is replaced only
+   by a login of the same account (claude: the `.claude.json` account uuid; codex: the token's account id) that is
+   provably fresher (claude: later `expiresAt`; codex: later `last_refresh`), after a unique backup. A folder holding a
+   different account is refused; an older, equally fresh or undatable local login (a restored or touched folder) leaves the
+   store copy as it is. The store files are written durably (temp file flushed, renamed, folder flushed) and read back, and
+   nothing local changes unless the store then holds a usable login. The login file is written last: its presence is what
+   switches the gateway to the store;
+4. it backs up each local file it changes to `<file>.pre-gateway.<timestamp>.bak` (exclusive, 0600, flushed and read back,
+   never overwritten or deleted) and writes the entry: claude `.credentials.json` gateway entry, `ANTHROPIC_BASE_URL=http://127.0.0.1:47140/claude`
    in `settings.json`, `apiKeyHelper` removed; codex `auth.json` as an API-key file holding the app key, `model_provider =
    "ais-gateway"` and its tables in `config.toml`, with the key printed by `~/.local/bin/ais-codex-gateway-key` (created if
    absent, an existing one is kept).
 
 Keys are `AIS_GATEWAY_APP_AGENTS_CLAUDE_TOKEN` and `AIS_GATEWAY_APP_AGENTS_CODEX_TOKEN` (apps `agents-claude`,
 `agents-codex`). Reported and left alone, exit code 1: a tool with no local route (`src/gateway/local-routes.ts`: today
-grok, kimi, pi) or no key, an account the gateway does not hold, a folder without a refreshable login, a swap pool folder
-that is not routed yet (it holds a copy of a member's login; the command never writes pool folders) and a symlinked file.
+grok, kimi, pi) or no key, an account the gateway does not hold, a folder with running sessions, a folder whose login is
+a different account than its store copy, a folder without a refreshable login, a swap pool folder that is not routed yet
+(it holds a copy of a member's login; the command never writes pool folders) and a symlinked file.
+
+Swap pools break for routed members: a pool swaps by copying the member's login out of the member's identity folder, and a
+routed member's folder holds only the gateway entry, so a swap to it no longer gets a working login (codex fails with "no
+usable Codex login") until the pool itself is routed with its own setup (a gateway-routed claude pool never copies member
+logins) or the member is taken out of the pool. The
+report adds this warning to every routed member of a swap pool and to every refused pool folder.
 Re-running changes nothing for an identity already routed. To undo one identity: copy the member store's login file back
 (the gateway has kept it current; the `.pre-gateway` login backup may hold a refresh token already rotated away), restore
 the settings or config backup, then move the store folder aside so the gateway reads the identity folder again.

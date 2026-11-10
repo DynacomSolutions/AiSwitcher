@@ -139,7 +139,8 @@ describe("an account moved into the gateway member store is the gateway's", () =
     for (const [tool, file] of [["claude", ".credentials.json"], ["codex", "auth.json"]] as const) {
       for (const name of ["moved", "old"]) {
         await mkdir(join(root, "members", tool, name), { recursive: true });
-        await writeFile(join(root, "members", tool, name, file), "{}");
+        const login = tool === "claude" ? { claudeAiOauth: { accessToken: "a", refreshToken: "SYNTHETIC_FIXTURE-r" } } : { tokens: { access_token: "a", refresh_token: "SYNTHETIC_FIXTURE-r" } };
+        await writeFile(join(root, "members", tool, name, file), JSON.stringify(login));
       }
     }
   });
@@ -159,6 +160,13 @@ describe("an account moved into the gateway member store is the gateway's", () =
     }
     process.env.AIS_GATEWAY_OWNER = "1";
     expect(await isGatewayManagedHere("claude", "moved", registry)).toBe(false);
+  });
+
+  test("an empty or token-less store file left by a crash does not make the account the gateway's", async () => {
+    process.env.AIS_GATEWAY_OWNER = "0";
+    await writeFile(join(root, "members", "codex", "moved", "auth.json"), "");
+    await writeFile(join(root, "members", "claude", "moved", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "a", refreshToken: "" } }));
+    for (const tool of ["claude", "codex"]) expect(await isGatewayManagedHere(tool, "moved", registry)).toBe(false);
   });
 
   test("claude lists a moved account even outside a gateway-routed pool (retired ones excluded)", async () => {

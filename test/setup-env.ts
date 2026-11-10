@@ -30,7 +30,11 @@ if (!isolated || homedir() !== isolated) {
   const home = mkdtempSync(join(tmpdir(), "ais-test-home-"));
   const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home, [MARK]: home };
   // Point XDG dirs into the scratch home too; git must not read the real global config.
-  for (const k of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "AIS_GATEWAY_MEMBERS_DIR", "AIS_GATEWAY_HEARTBEAT", "CLAUDE_CONFIG_DIR", "CODEX_HOME"]) delete env[k];
+  // Every variable that points AIS or a tool at a real-home file goes too (secrets, pi agent dir, host home, AWS profiles, Chrome MCP).
+  for (const k of [
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "AIS_GATEWAY_MEMBERS_DIR", "AIS_GATEWAY_HEARTBEAT", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    "AIS_SECRETS_FILE", "PI_CODING_AGENT_DIR", "AIS_HOST_HOME", "AIS_AWS_PROFILES_CONFIG", "AIS_CHROME_MCP_CONFIG",
+  ]) delete env[k];
   env.GIT_CONFIG_NOSYSTEM = "1";
   // Keep bun's install cache where it was (tests never install, but bun may look it up).
   env.BUN_INSTALL_CACHE_DIR ??= join(homedir(), ".bun", "install", "cache");
@@ -41,4 +45,4 @@ if (!isolated || homedir() !== isolated) {
 
 mkdirSync(join(isolated, ".ais"), { recursive: true });
 // Even inside the scratch home: a test that starts a gateway process must not switch the whole run onto the member store.
-process.env.AIS_GATEWAY_MEMBER_STORE ??= "0";
+process.env.AIS_GATEWAY_MEMBER_STORE = "0";

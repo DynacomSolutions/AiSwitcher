@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backupUnique, classifyLogin, codexConfigRouted, codexKeyHelperPath, heldProblem, routeAllViaGateway, routeCodexConfigText, runRouteAllViaGateway, type RouteAllOptions } from "../../../src/cli/identities/route-all.ts";
@@ -11,8 +11,9 @@ const CLAUDE_KEY = "aisg_SYNTHETIC_FIXTURE_claude_key";
 const CODEX_KEY = "aisg_SYNTHETIC_FIXTURE_codex_key";
 const NOW = Date.parse("2030-01-01T12:00:00Z");
 
-const claudeLogin = (n: string) => JSON.stringify({ claudeAiOauth: { accessToken: `sk-ant-SYNTHETIC_FIXTURE-${n}`, refreshToken: `rt-SYNTHETIC_FIXTURE-${n}`, expiresAt: 1, scopes: ["user:inference"] } });
-const codexLogin = (n: string) => JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: { id_token: "x", access_token: `at-SYNTHETIC_FIXTURE-${n}`, refresh_token: `rt-SYNTHETIC_FIXTURE-${n}`, account_id: `acct-${n}` } });
+const claudeLogin = (n: string, expiresAt = 1) => JSON.stringify({ claudeAiOauth: { accessToken: `sk-ant-SYNTHETIC_FIXTURE-${n}`, refreshToken: `rt-SYNTHETIC_FIXTURE-${n}`, expiresAt, scopes: ["user:inference"] } });
+const codexLogin = (n: string, over: { account?: string; lastRefresh?: string } = {}) =>
+  JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: { id_token: "x", access_token: `at-SYNTHETIC_FIXTURE-${n}`, refresh_token: `rt-SYNTHETIC_FIXTURE-${n}`, account_id: over.account ?? `acct-${n}` }, ...(over.lastRefresh ? { last_refresh: over.lastRefresh } : {}) });
 
 let home: string;
 let opts: RouteAllOptions;
@@ -54,12 +55,14 @@ beforeEach(async () => {
   await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
   await writeFile(join(dirOf(".codex", "alpha"), "config.toml"), '# my config\nmodel = "m"\n\n[projects."/x"]\ntrust_level = "trusted"\n');
   await writeFile(join(dirOf(".grok", "alpha"), "auth.json"), "GROK-LOGIN");
+  await mkdir(join(home, "proc"), { recursive: true });
   opts = {
     registries: { claude: join(home, ".claude", "identities.json"), codex: join(home, ".codex", "identities.json"), grok: join(home, ".grok", "identities.json"), kimi: join(home, ".kimi-code", "identities.json"), pi: join(home, ".pi", "identities.json") },
     secretsPath: join(home, "secrets"),
     memberRoot: join(home, "members"),
     heartbeatPath: hbPath,
     home,
+    procRoot: join(home, "proc"),
     port: 47140,
     now: () => NOW,
     out: () => {},
@@ -172,25 +175,85 @@ describe("route-all-via-gateway: routing", () => {
     expect(await readFile(codexKeyHelperPath(home), "utf8")).toBe("#!/bin/sh\necho mine\n");
   });
 
-  test("a store copy the gateway renewed since is kept; a newer local sign-in replaces it after a backup", async () => {
+  test("a store copy the gateway renewed since is kept; a fresher sign-in of the same account replaces it after a backup", async () => {
     await heartbeat();
-    // the gateway already holds a newer copy (it renewed it after an earlier, interrupted run)
+    // the gateway already holds a fresher copy (it renewed it after an earlier, interrupted run); the folder was touched since
     await mkdir(storeOf("claude", "alpha"), { recursive: true });
-    await writeFile(join(storeOf("claude", "alpha"), ".credentials.json"), claudeLogin("alpha-renewed"));
-    await utimes(join(dirOf(".claude", "alpha"), ".credentials.json"), 1, 1);
+    await writeFile(join(storeOf("claude", "alpha"), ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "u-alpha" } }));
+    await writeFile(join(storeOf("claude", "alpha"), ".credentials.json"), claudeLogin("alpha-renewed", 2_000));
+    await writeFile(join(dirOf(".claude", "alpha"), ".credentials.json"), claudeLogin("alpha", 1_000));
     // beta signed in again locally after its store copy was written
     await mkdir(storeOf("claude", "beta"), { recursive: true });
-    await writeFile(join(storeOf("claude", "beta"), ".credentials.json"), claudeLogin("beta-old"));
-    await utimes(join(storeOf("claude", "beta"), ".credentials.json"), 1, 1);
+    await writeFile(join(storeOf("claude", "beta"), ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "u-beta" } }));
+    await writeFile(join(storeOf("claude", "beta"), ".credentials.json"), claudeLogin("beta-old", 1_000));
+    await writeFile(join(dirOf(".claude", "beta"), ".credentials.json"), claudeLogin("beta", 2_000));
 
     const r = await routeAllViaGateway(opts);
     expect(claudeLine(r, "alpha")?.status).toBe("routed");
-    expect(await readFile(join(storeOf("claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha-renewed"));
+    expect(claudeLine(r, "alpha")?.detail).toContain("kept it");
+    expect(await readFile(join(storeOf("claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha-renewed", 2_000));
     expect(claudeLine(r, "beta")?.status).toBe("routed");
-    expect(await readFile(join(storeOf("claude", "beta"), ".credentials.json"), "utf8")).toBe(claudeLogin("beta"));
+    expect(await readFile(join(storeOf("claude", "beta"), ".credentials.json"), "utf8")).toBe(claudeLogin("beta", 2_000));
     const kept = (await files(storeOf("claude", "beta"))).filter((f) => f.startsWith(".credentials.json.pre-gateway."));
     expect(kept.length).toBe(1);
-    expect(await readFile(join(storeOf("claude", "beta"), kept[0]!), "utf8")).toBe(claudeLogin("beta-old"));
+    expect(await readFile(join(storeOf("claude", "beta"), kept[0]!), "utf8")).toBe(claudeLogin("beta-old", 1_000));
+  });
+
+  test("a restored codex folder with an older login never overwrites the store copy, whatever its mtime", async () => {
+    await heartbeat();
+    await mkdir(storeOf("codex", "alpha"), { recursive: true });
+    const live = codexLogin("alpha-live", { account: "acct-alpha", lastRefresh: "2030-01-01T10:00:00Z" });
+    await writeFile(join(storeOf("codex", "alpha"), "auth.json"), live);
+    // written after the store copy (newer mtime), but its refresh token was spent long ago
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha", { lastRefresh: "2029-12-01T10:00:00Z" }));
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("routed");
+    expect(await readFile(join(storeOf("codex", "alpha"), "auth.json"), "utf8")).toBe(live);
+  });
+
+  test("a folder holding a different account than its store copy is refused and nothing changes", async () => {
+    await heartbeat();
+    await mkdir(storeOf("codex", "alpha"), { recursive: true });
+    const live = codexLogin("alpha-live", { lastRefresh: "2030-01-01T10:00:00Z" });
+    await writeFile(join(storeOf("codex", "alpha"), "auth.json"), live);
+    const other = codexLogin("other", { account: "acct-other", lastRefresh: "2030-01-01T11:00:00Z" });
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), other);
+    await mkdir(storeOf("claude", "alpha"), { recursive: true });
+    await writeFile(join(storeOf("claude", "alpha"), ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "u-someone-else" } }));
+    await writeFile(join(storeOf("claude", "alpha"), ".credentials.json"), claudeLogin("someone-else", 1));
+    await writeFile(join(dirOf(".claude", "alpha"), ".credentials.json"), claudeLogin("alpha", 5_000));
+
+    const r = await routeAllViaGateway(opts);
+    for (const tool of ["codex", "claude"]) {
+      const l = r.lines.find((x) => x.tool === tool && x.identity === "alpha");
+      expect(l?.status).toBe("refused");
+      expect(l?.detail).toContain("different account");
+    }
+    expect(await readFile(join(storeOf("codex", "alpha"), "auth.json"), "utf8")).toBe(live);
+    expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(other);
+    expect((await files(dirOf(".codex", "alpha"))).some((f) => f.includes(".pre-gateway."))).toBe(false);
+    expect(await readFile(join(dirOf(".claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha", 5_000));
+  });
+
+  test("an empty store login file left by a crash is not a store copy: the folder's login is written over it", async () => {
+    await heartbeat();
+    await mkdir(storeOf("codex", "alpha"), { recursive: true });
+    await writeFile(join(storeOf("codex", "alpha"), "auth.json"), "");
+    expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(false);
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("routed");
+    expect(await readFile(join(storeOf("codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+    expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(true);
+  });
+
+  test("an empty store file with the folder already on the gateway entry is refused (no usable login anywhere)", async () => {
+    await heartbeat();
+    await routeAllViaGateway(opts);
+    await writeFile(join(storeOf("codex", "alpha"), "auth.json"), "");
+    await writeFile(join(dirOf(".codex", "alpha"), "config.toml"), "");
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex")?.status).toBe("refused");
+    expect(r.lines.find((l) => l.tool === "codex")?.detail).toContain("member store has no login");
   });
 
   test("a half-finished folder (entry written, settings not) is completed without a heartbeat", async () => {
@@ -272,6 +335,75 @@ describe("route-all-via-gateway: routing", () => {
     const r = await routeAllViaGateway(opts);
     expect(r.lines.some((l) => l.tool === "codex")).toBe(false);
     expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+  });
+});
+
+describe("route-all-via-gateway: running sessions", () => {
+  const fakeProc = async (pid: number, argv: string[], env: Record<string, string>) => {
+    const dir = join(opts.procRoot!, String(pid));
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "cmdline"), `${argv.join("\0")}\0`);
+    await writeFile(join(dir, "environ"), Object.entries({ PATH: "/x", ...env }).map(([k, v]) => `${k}=${v}`).join("\0"));
+  };
+
+  test("a folder with a running Claude Code or Codex session is refused, listing the pids; nothing written", async () => {
+    await heartbeat();
+    await fakeProc(4101, ["/opt/bin/claude", "--model", "x"], { CLAUDE_CONFIG_DIR: dirOf(".claude", "alpha") });
+    await fakeProc(4102, ["node", "/usr/lib/node_modules/@openai/codex/bin/codex"], { CODEX_HOME: `${dirOf(".codex", "alpha")}/` });
+    await fakeProc(4103, ["/usr/bin/codex", "resume"], { CODEX_HOME: dirOf(".codex", "alpha") });
+    // not sessions of these folders: another folder, an AIS helper subcommand, a shell carrying the variable
+    await fakeProc(4104, ["claude"], { CLAUDE_CONFIG_DIR: dirOf(".claude", "beta-elsewhere") });
+    await fakeProc(4105, ["/opt/bin/claude", "__session-sidecar"], { CLAUDE_CONFIG_DIR: dirOf(".claude", "beta") });
+    await fakeProc(4106, ["/usr/bin/zsh"], { CLAUDE_CONFIG_DIR: dirOf(".claude", "beta") });
+
+    const dry = await routeAllViaGateway({ ...opts, dryRun: true });
+    expect(claudeLine(dry, "alpha")?.status).toBe("refused");
+    const r = await routeAllViaGateway(opts);
+    const alpha = claudeLine(r, "alpha");
+    expect(alpha?.status).toBe("refused");
+    expect(alpha?.detail).toContain("1 running Claude Code session uses this folder (pid 4101)");
+    const codex = r.lines.find((l) => l.tool === "codex");
+    expect(codex?.status).toBe("refused");
+    expect(codex?.detail).toContain("2 running Codex sessions use this folder (pid 4102, 4103)");
+    expect(codex?.detail).toContain("write that login back");
+    expect(claudeLine(r, "beta")?.status).toBe("routed");
+    expect(r.incomplete).toBe(true);
+    expect(hasMemberCopy("claude", "alpha", opts.memberRoot)).toBe(false);
+    expect(hasMemberCopy("codex", "alpha", opts.memberRoot)).toBe(false);
+    expect(await readFile(join(dirOf(".claude", "alpha"), ".credentials.json"), "utf8")).toBe(claudeLogin("alpha"));
+    expect(await readFile(join(dirOf(".codex", "alpha"), "auth.json"), "utf8")).toBe(codexLogin("alpha"));
+    expect((await files(dirOf(".codex", "alpha"))).some((f) => f.includes(".pre-gateway."))).toBe(false);
+
+    // once the sessions end the same run goes through
+    await rm(opts.procRoot!, { recursive: true, force: true });
+    await mkdir(opts.procRoot!, { recursive: true });
+    const after = await routeAllViaGateway(opts);
+    expect(claudeLine(after, "alpha")?.status).toBe("routed");
+    expect(after.lines.find((l) => l.tool === "codex")?.status).toBe("routed");
+  });
+
+  test("a session without the folder variable counts for the tool's default folder", async () => {
+    // an identity whose folder is the default ~/.codex of this (scratch) home
+    await writeFile(join(home, ".codex", "identities.json"), JSON.stringify({ version: 1, identities: [{ name: "main", label: "main", configDir: join(home, ".codex") }] }));
+    await writeFile(join(home, ".codex", "auth.json"), codexLogin("main"));
+    await heartbeat([...ALL, "codex/main"]);
+    await fakeProc(4201, ["codex"], {});
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex" && l.identity === "main")?.detail).toContain("pid 4201");
+  });
+
+  test("routed members of a swap pool carry the warning that the pool's swaps break", async () => {
+    await registry("codex", ".codex", ["alpha", "pool"], { pool: { swapPool: { accounts: ["alpha"], active: "alpha" } } });
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
+    await writeFile(join(dirOf(".codex", "pool"), "auth.json"), codexLogin("alpha"));
+    await heartbeat();
+    const out: string[] = [];
+    const saved = process.exitCode;
+    await runRouteAllViaGateway({}, { ...opts, out: (l) => out.push(l) });
+    process.exitCode = saved;
+    expect(out.find((l) => l.startsWith("  codex/alpha: routed"))).toContain('member of swap pool pool');
+    expect(out.find((l) => l.startsWith("  codex/alpha: routed"))).toContain("no usable Codex login");
+    expect(out.find((l) => l.startsWith("  codex/pool: refused"))).toContain("no usable Codex login");
   });
 });
 

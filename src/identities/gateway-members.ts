@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 import { aisHome } from "../shared/ais-home.ts";
 import type { Identity } from "./types.ts";
@@ -58,13 +58,43 @@ export function toolOfRegistryPath(path: string): MemberStoreTool | undefined {
 /** The store file that holds the account's login (`.credentials.json`, `auth.json`). */
 export const memberLoginFile = (tool: MemberStoreTool): string => MEMBER_FILES[tool][0]!;
 
+/** Where each tool's login file keeps its refresh token: [object, field]. */
+const REFRESH_FIELD: Record<MemberStoreTool, readonly [string, string]> = { claude: ["claudeAiOauth", "refreshToken"], codex: ["tokens", "refresh_token"] };
+
 /**
- * True when the member store holds a copy of this account's login file. `ais identities route-all-via-gateway` writes the
- * login file last, so its presence is the whole test.
+ * True when a login file's text is a login the gateway can keep renewing: parseable JSON with a refresh token
+ * (claude `claudeAiOauth.refreshToken`, codex `tokens.refresh_token`). An empty, truncated or token-less file is not.
+ */
+export function isRefreshableLoginText(tool: MemberStoreTool, text: string | undefined): boolean {
+  if (text === undefined) return false;
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (typeof json !== "object" || json === null || Array.isArray(json)) return false;
+  const [group, field] = REFRESH_FIELD[tool];
+  const nested = (json as Record<string, unknown>)[group];
+  if (typeof nested !== "object" || nested === null) return false;
+  const refresh = (nested as Record<string, unknown>)[field];
+  return typeof refresh === "string" && refresh.trim().length > 0;
+}
+
+/**
+ * True when the member store holds a usable copy of this account's login: the login file exists and holds a refreshable
+ * login (isRefreshableLoginText). An empty or partial file left by a crash does not count. `ais identities
+ * route-all-via-gateway` writes the login file last, so its presence is the whole test.
  */
 export function hasMemberCopy(tool: string, name: string, root: string = memberStoreRoot()): boolean {
   if (!isMemberStoreTool(tool)) return false;
-  return isFile(join(memberDir(tool, name, root), memberLoginFile(tool)));
+  const path = join(memberDir(tool, name, root), memberLoginFile(tool));
+  if (!isFile(path)) return false;
+  try {
+    return isRefreshableLoginText(tool, readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
 }
 
 /**
