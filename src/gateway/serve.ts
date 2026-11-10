@@ -28,7 +28,8 @@ import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-sour
 import type { GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
-import { enableMemberStore } from "../identities/gateway-members.ts";
+import { enableMemberStore, memberStoreEnabled } from "../identities/gateway-members.ts";
+import { recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
 export const DEFAULT_GATEWAY_PORT = 47130;
@@ -120,6 +121,10 @@ export function instrumentRefresh(
       const effect = opts?.expectedAccessToken !== undefined || opts?.force ? "the rejected token could not be replaced" : "the existing token stays in use";
       deps.alerter.raise("store-unreadable", key, `a credential store of the ${tool} login "${identity.name}" could not be read${which}; check the file's permissions and contents (${effect})`);
     };
+    /** A dead login of a member-store account is written next to its store copy for the portal (gateway-revoked.ts); best effort. */
+    const markRevoked = async (t: string, name: string, code: string, rejected: string | undefined): Promise<void> => {
+      if (memberStoreEnabled()) await recordLoginRevoked(t, name, code, rejected).catch(() => undefined);
+    };
     const ok = (): void => {
       deps.failed?.delete(key);
       deps.alerter.recover("refresh-failed", key);
@@ -129,6 +134,7 @@ export function instrumentRefresh(
       deps.metrics.refresh(tool, result.outcome);
       const idleNoGrant = result.outcome === "no-grant" && opts?.keepAlive === true && !result.readError;
       if (result.outcome === "failed" || (result.outcome === "no-grant" && !idleNoGrant) || result.outcome === "skipped-revoked") fail();
+      if (result.outcome === "skipped-revoked") await markRevoked(tool, identity.name, "revoked", result.beforeFingerprint);
       else if (result.outcome === "refreshed") ok();
       // Any result that names unreadable stores warns early (the alerter dedupes); only a result whose store probe ran and
       // found none closes the alert. Adopted, lock-busy and rotated-elsewhere results never probed, so they leave it open.
@@ -144,6 +150,8 @@ export function instrumentRefresh(
       }
       deps.metrics.refresh(tool, "failed");
       fail();
+      // Only a dead-grant OAuth code proves the login is gone (as in credentials.ts): record it where the portal can read it.
+      if (err instanceof OAuthRefreshError && err.revoked && err.oauthCode !== undefined && DEAD_REFRESH_CODES.has(err.oauthCode)) await markRevoked(tool, identity.name, err.oauthCode, err.refreshFingerprint);
       throw err;
     }
   }) as RefreshFn;

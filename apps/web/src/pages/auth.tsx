@@ -85,7 +85,8 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
     if (flow?.status === "completed" && !completedRef.current) {
       completedRef.current = true;
       void qc.invalidateQueries({ queryKey: qk.auth });
-      toast.success("Logged in", { description: `${flow.toolName}/${flow.identity}` });
+      if (flow.note) toast.warning("Signed in, but the gateway is not using the new login", { description: flow.note });
+      else toast.success("Logged in", { description: `${flow.toolName}/${flow.identity}` });
     }
   }, [flow, qc]);
 
@@ -128,7 +129,11 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
         ) : (
           <div className="space-y-4">
             <div className="flex items-center justify-between gap-2">
-              <FlowStatusBadge status={flow.status} />
+              {flow.status === "completed" && flow.note ? (
+                <Badge variant="warning">Signed in, gateway not updated</Badge>
+              ) : (
+                <FlowStatusBadge status={flow.status} />
+              )}
               {live ? (
                 <span className="text-xs text-muted-foreground">polling every 1.5s...</span>
               ) : null}
@@ -186,6 +191,12 @@ function LoginFlowDialog({ flowId, onClose }: { flowId: string; onClose: () => v
                   Submit
                 </Button>
               </form>
+            ) : null}
+
+            {flow.note ? (
+              <p className="break-words rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-400">
+                {flow.note}
+              </p>
             ) : null}
 
             {flow.error ? (

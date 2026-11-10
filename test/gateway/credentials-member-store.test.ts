@@ -69,3 +69,60 @@ test("the gateway credential cache writes a refreshed login into the member stor
   // the identity folder keeps the gateway entry
   expect(await readFile(join(folder, ".credentials.json"), "utf8")).toBe(entry);
 });
+
+test("a dead-grant answer while refreshing the member store login leaves a marker the portal reads; a new login clears its effect", async () => {
+  const registry = join(work, ".claude", "identities.json");
+  const folder = join(work, ".claude", "identities", "m");
+  const members = join(work, "members");
+  const store = join(members, "claude", "m");
+  await mkdir(folder, { recursive: true });
+  await mkdir(store, { recursive: true });
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "m", label: "m", configDir: folder }] }));
+  await writeFile(join(folder, ".credentials.json"), gatewayEntryText("aisg_SYNTHETIC_FIXTURE_entry"));
+  const login = (n: string) => JSON.stringify({ claudeAiOauth: { accessToken: `SYNTHETIC_FIXTURE-access-${n}`, refreshToken: `SYNTHETIC_FIXTURE-refresh-${n}`, expiresAt: 1_000, scopes: ["user:inference"] } });
+  await writeFile(join(store, ".credentials.json"), login("old"));
+  (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = registry;
+  process.env.AIS_GATEWAY_MEMBERS_DIR = members;
+  process.env.AIS_GATEWAY_MEMBER_STORE = "1";
+  process.env.AIS_GATEWAY_OWNER = "1";
+
+  const fetchImpl = (async () => new Response(JSON.stringify({ error: { code: "token_revoked" } }), { status: 401 })) as unknown as typeof fetch;
+  const cache = new CredentialCache({
+    claudeRegistryPath: registry,
+    refresh: (tool, identity, options) => refreshIdentityOAuthGrant(tool, identity, { ...options, fetchImpl, claudeRegistryPath: registry }),
+  });
+  await cache.get("claude", "m").catch(() => undefined);
+  const { readLoginRevoked } = await import("../../src/identities/gateway-revoked.ts");
+  expect(readLoginRevoked("claude", "m", members)?.code).toBe("token_revoked");
+  await writeFile(join(store, ".credentials.json"), login("new"));
+  expect(readLoginRevoked("claude", "m", members)).toBeUndefined();
+});
+
+test("a sign-in that lands between the dead-grant answer and the marker write is not marked (credential cache path)", async () => {
+  const registry = join(work, ".claude", "identities.json");
+  const folder = join(work, ".claude", "identities", "m");
+  const members = join(work, "members");
+  const store = join(members, "claude", "m");
+  await mkdir(folder, { recursive: true });
+  await mkdir(store, { recursive: true });
+  await writeFile(registry, JSON.stringify({ version: 1, identities: [{ name: "m", label: "m", configDir: folder }] }));
+  await writeFile(join(folder, ".credentials.json"), gatewayEntryText("aisg_SYNTHETIC_FIXTURE_entry"));
+  const login = (n: string) => JSON.stringify({ claudeAiOauth: { accessToken: `SYNTHETIC_FIXTURE-access-${n}`, refreshToken: `SYNTHETIC_FIXTURE-refresh-${n}`, expiresAt: 1_000, scopes: ["user:inference"] } });
+  await writeFile(join(store, ".credentials.json"), login("old"));
+  (CLAUDE_CONFIG as { identitiesJsonPath: string }).identitiesJsonPath = registry;
+  process.env.AIS_GATEWAY_MEMBERS_DIR = members;
+  process.env.AIS_GATEWAY_MEMBER_STORE = "1";
+  process.env.AIS_GATEWAY_OWNER = "1";
+  const { OAuthRefreshError } = await import("../../src/identities/oauth-refresh.ts");
+  const { refreshFingerprint } = await import("../../src/identities/gateway-routed.ts");
+  const cache = new CredentialCache({
+    claudeRegistryPath: registry,
+    refresh: async () => {
+      await writeFile(join(store, ".credentials.json"), login("new")); // the owner signs in again meanwhile
+      throw new OAuthRefreshError("rejected", true, refreshFingerprint("SYNTHETIC_FIXTURE-refresh-old").slice(0, 8), "token_revoked");
+    },
+  });
+  await cache.get("claude", "m").catch(() => undefined);
+  const { readLoginRevoked } = await import("../../src/identities/gateway-revoked.ts");
+  expect(readLoginRevoked("claude", "m", members)).toBeUndefined();
+});

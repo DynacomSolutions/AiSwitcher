@@ -9,6 +9,7 @@ import { withPoolLock } from "../../identities/pool/lock.ts";
 import { HEARTBEAT_FRESH_MS, readHeartbeat, type GatewayHeartbeat } from "../../identities/gateway-heartbeat.ts";
 import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreEnabled, memberStoreRoot, type MemberStoreTool } from "../../identities/gateway-members.ts";
 import { backupUnique, classifyLogin, loginAccount, loginFreshness, refreshOf, routingFor, routingOf, withRouting, type GatewayRouting } from "../../identities/gateway-routed.ts";
+import { clearLoginRevoked } from "../../identities/gateway-revoked.ts";
 import { scanLiveSessions, type SessionTool } from "../../identities/live-sessions.ts";
 import { readPiEntry } from "../../identities/oauth-reconcile.ts";
 import { withLockDir } from "../../identities/pool/grant-file-adapter.ts";
@@ -96,6 +97,14 @@ export interface RouteAllOptions {
   now?: () => number;
   /** This host's name in the routing record of the entries written (default os.hostname()). */
   hostname?: string;
+  /** Route only this one identity (the portal, after a sign-in on it). */
+  only?: { tool: RouteTool; identity: string };
+  /**
+   * The folder's login is a sign-in just made on a routed identity: the gateway already holds the account (it has the store
+   * copy, possibly dead), so the "gateway has renewed it" heartbeat proof is not asked for. Every other rule stands: same
+   * account, provably fresher than the store copy, no running session, no other holder.
+   */
+  afterLogin?: boolean;
   out?: (line: string) => void;
 }
 
@@ -158,6 +167,8 @@ const FILES_OF: Record<MemberStoreTool, string[]> = {
 
 /* ------------------------------------------------------------------ gateway holds the account */
 
+const NOT_RENEWED = "the gateway holds this account but has not yet renewed it successfully";
+
 /** Why the running gateway does not demonstrably hold this account, or undefined when it does. */
 export function heldProblem(tool: string, name: string, hb: GatewayHeartbeat | undefined, nowMs: number): string | undefined {
   if (!hb) return "no gateway heartbeat: the gateway has not confirmed it holds this account";
@@ -166,7 +177,7 @@ export function heldProblem(tool: string, name: string, hb: GatewayHeartbeat | u
   if (hb.memberStore !== true) return "the running gateway predates the member store; deploy a build with it, then wait for its heartbeat";
   const held = hb.held[`${tool}/${name}`];
   if (!Object.hasOwn(hb.held, `${tool}/${name}`) || held === undefined) return "the gateway does not hold this account (it is not one of its members)";
-  if (!held.lastSuccessAt) return "the gateway holds this account but has not yet renewed it successfully";
+  if (!held.lastSuccessAt) return NOT_RENEWED;
   return undefined;
 }
 
@@ -217,6 +228,7 @@ async function writeStoreCopy(tool: MemberStoreTool, identity: Identity, localTe
     const b = await backupUnique(storePath, now);
     await writeAccountRecord(tool, identity, dir);
     await writeFileDurable(storePath, localText);
+    await clearLoginRevoked(tool, identity.name, root); // the new login is not the one the gateway found dead
     return `the fresher local login of the same account replaced the member store copy (old copy backed up to ${b})`;
   }
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -594,8 +606,9 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
   if (kind === "none" && !stored) return { ...line, status: "refused", detail: "no refreshable login in this folder (logged out, API key or Bedrock); nothing for the gateway to hold" };
   if (kind === "gateway" && !stored) return { ...line, status: "refused", detail: "the folder already holds the gateway entry but the member store has no login for it; restore the login from its .pre-gateway backup first" };
   if (kind === "login") {
+    // After a sign-in on a routed identity the gateway only has to hold the account; that it has not yet renewed it successfully (its login is dead) is the reason for the sign-in.
     const problem = heldProblem(tool, identity.name, ctx.hb, now());
-    if (problem) return { ...line, status: "refused", detail: problem };
+    if (problem && !(opts.afterLogin && stored && problem === NOT_RENEWED)) return { ...line, status: "refused", detail: problem };
   }
   const busy = await sessionsProblem(tool, dir, opts);
   if (busy) return { ...line, status: "refused", detail: busy };
@@ -623,6 +636,8 @@ async function routeOneRaw(identity: Identity, ctx: ToolContext): Promise<RouteL
     const nowKind = classifyLogin(tool, localText);
     const plan = nowKind === "login" ? await planStoreMove(tool, identity, localText!, root) : {};
     if (plan.refused) return plan.refused;
+    // A sign-in just made must reach the store: when the store copy is kept, replacing the folder would bury the new login in a backup.
+    if (opts.afterLogin && nowKind === "login" && !plan.write && plan.note) return `${plan.note}; the new login stays in the folder and the gateway keeps its own copy`;
     if (nowKind !== "login" && !hasMemberCopy(tool, identity.name, root)) return "the login disappeared while waiting for the lock; nothing changed";
     // pi's copy goes first: a failure here (PiChanged, EACCES) leaves the store and the folder as they were.
     for (const r of holdersNow.piRemovals) notes.push(await removePiCopy(r, now));
@@ -858,6 +873,7 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
   const hb = await readHeartbeat(opts.heartbeatPath);
   const helper = codexKeyHelperPath(opts.home ?? homedir());
   for (const tool of ROUTE_TOOLS) {
+    if (opts.only && opts.only.tool !== tool) continue;
     const accounts = await accountsOf(tool, opts);
     const route = LOCAL_GATEWAY_ROUTES[tool];
     if (!route || !isMemberStoreTool(tool)) {
@@ -879,6 +895,7 @@ export async function routeAllViaGateway(opts: RouteAllOptions = {}): Promise<Ro
     const ctx: ToolContext = { tool, token, base: gatewayBase(tool, opts), helper, root, hb, opts, now, poolsOf, pools, piIdentities: await accountsOf("pi", opts), host: opts.hostname ?? hostname(), routedPools: new Set(), membersOf };
     // Pools first: a routed pool no longer holds its members' logins, so they can be routed in the same run.
     for (const identity of [...pools, ...accounts.filter((a) => !a.swapPool)]) {
+      if (opts.only && opts.only.identity !== identity.name) continue;
       try {
         lines.push(await routeOne(identity, ctx));
       } catch (err) {
