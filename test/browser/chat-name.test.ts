@@ -102,7 +102,8 @@ test("codex thread id: newest rollout with the same cwd created after the parent
   const other = "99999999-aaaa-bbbb-cccc-000000000000";
   await rollout("/work/example", other, { thread_source: "user" });
   await rollout("/work/other", "11111111-aaaa-bbbb-cccc-000000000000");
-  const deps = { openRollouts: () => [], parentAgeSec: () => 3600 };
+  // Pin the clock to the rollouts' day folder (2026/11/08): the lookup only scans folders from the day before the parent started.
+  const deps = { openRollouts: () => [], parentAgeSec: () => 3600, now: () => Date.parse("2026-11-08T11:00:00Z") };
   expect(await findCodexThreadId(dir, 1234, "/work/example", deps)).toBe(other);
   expect(await findCodexThreadId(dir, 1234, "/work/none", deps)).toBeUndefined();
   // A rollout older than the parent is not its thread.
