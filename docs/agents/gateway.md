@@ -60,7 +60,8 @@ ais gateway usage [--app=billing] [--provider=claude] [--days=7] [--json]
 - `--daily-tokens=N` caps the app's tokens per day.
 - `--reserve=80` (1 to 100) is the share of an identity's limit that apps may use,
   keeping the rest for people working in AIS directly.
-- `--models=glob,glob` restricts which models the app may request.
+- `--models=id,id` restricts which models the app may request. Each entry is an
+  exact model id, as the request body names it; globs and prefixes are not matched.
 
 The admin API owns validation; its reason is shown when a value is refused.
 
