@@ -20,6 +20,7 @@ const run = (line: string, over: Partial<GatewayCliDeps> = {}) => {
   const { positionals, flags } = parseArgs(line.split(" ").filter(Boolean));
   return runGatewayCommand(positionals.slice(1), flags, {
     secretsPath: secrets,
+    codexHomesPath: join(dir, "codex-homes.json"),
     fetch: (async (url: string, init: RequestInit) => {
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ url, method: init.method ?? "GET", body });
@@ -264,5 +265,61 @@ describe("writeAppSecret", () => {
     });
     expect(seen!.args.join(" ")).not.toContain(TOKEN);
     expect(seen!.stdin).toContain(TOKEN);
+  });
+});
+
+describe("codex homes", () => {
+  const CFG = `model_provider = "ais-gateway"\n\n[model_providers.ais-gateway]\nbase_url = "https://gw.test/billing"\n\n[model_providers.ais-gateway.auth]\ncommand = "printf"\n`;
+  let home: string;
+  const accessToken = () => JSON.parse(readFileSync(join(home, "auth.json"), "utf8")).tokens.access_token;
+  beforeEach(() => {
+    home = join(dir, "codex-home");
+    mkdirSync(home);
+    writeFileSync(join(home, "config.toml"), CFG);
+    writeFileSync(secrets, `${readFileSync(secrets, "utf8")}AIS_GATEWAY_APP_BILLING_TOKEN=aisgw_OLD_SYNTHETIC_FIXTURE\n`);
+  });
+
+  test("codex-home --check reports and writes nothing", async () => {
+    await expect(run(`gateway codex-home ${home} --check`)).rejects.toThrow(/1 folder/);
+    expect(out.join("\n")).toContain("config.toml needs");
+    expect(() => statSync(join(home, "auth.json"))).toThrow();
+  });
+
+  test("codex-home configures, registers; check then passes", async () => {
+    await run(`gateway codex-home ${home}`);
+    expect(accessToken()).toBe("aisgw_OLD_SYNTHETIC_FIXTURE");
+    expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(home, "config.toml"), "utf8")).toContain("chatgpt_base_url = \"https://gw.test/billing/backend-api\"");
+    expect(out.join("\n")).not.toContain("OLD_SYNTHETIC");
+    await run(`gateway codex-home ${home} --check`);
+  });
+
+  test("codex-home without a token in secrets is skipped and fails", async () => {
+    writeFileSync(secrets, "OTHER=1\n");
+    await expect(run(`gateway codex-home ${home}`)).rejects.toThrow(/not configured/);
+    expect(() => statSync(join(home, "auth.json"))).toThrow();
+  });
+
+  test("rotate rewrites registered homes and never prints the token twice", async () => {
+    await run(`gateway codex-home ${home}`);
+    out = [];
+    respond = (url, method) => {
+      if (method === "GET") return Response.json({ namespace: "shop" });
+      return Response.json({ token: TOKEN, previousTokensExpireAt: "later" }, { status: 201 });
+    };
+    await run("gateway app rotate billing");
+    expect(accessToken()).toBe(TOKEN);
+    expect(out.join("\n")).toContain("auth.json rewritten in 1 registered folder(s)");
+    expect(out.join("\n").split(TOKEN)).toHaveLength(2);
+  });
+
+  test("a failing home does not lose the token message", async () => {
+    await run(`gateway codex-home ${home}`);
+    rmSync(home, { recursive: true });
+    out = [];
+    respond = (url, method) => (method === "GET" ? Response.json({ namespace: "shop" }) : Response.json({ token: TOKEN }, { status: 201 }));
+    await run("gateway app rotate billing");
+    expect(out.join("\n")).toContain(`token (shown once): ${TOKEN}`);
+    expect(out.join("\n")).toContain("codex homes: not updated");
   });
 });

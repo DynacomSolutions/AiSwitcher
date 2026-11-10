@@ -4,6 +4,7 @@ import { isSwapPool } from "../../identities/pool/swap-pool.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../../identities/store.ts";
 import { boolFlag, listFlag, stringFlag, type ParsedArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
+import { refreshRegisteredCodexHomes } from "../../identities/codex-gateway-home.ts";
 import { writeAppSecret, type KubectlRunner } from "./kube-secret.ts";
 import { appTokenKey, appendSecretsFile, readSecretsKey } from "./secrets-file.ts";
 
@@ -17,6 +18,8 @@ export interface GatewayCliDeps {
   out(line: string): void;
   now(): number;
   /** True when `name` (or an alias) is a swap pool in the local registry. Defaults to reading it. */
+  /** Registry of configured Codex homes (default ~/.ais/gateway-codex-homes.json). */
+  codexHomesPath?: string;
   isPoolName?(provider: string, name: string): Promise<boolean>;
 }
 
@@ -170,6 +173,14 @@ async function deliverToken(deps: GatewayCliDeps, app: string, namespace: string
   deps.out(`app: ${app}`);
   deps.out(`url: ${url}`);
   deps.out(`token (shown once): ${token}`);
+  // Registered Codex homes get the new token too; a failure here must not hide the message above.
+  try {
+    const r = await refreshRegisteredCodexHomes(app, token, deps.codexHomesPath);
+    if (r.updated > 0 || r.failed.length > 0) deps.out(`codex homes: auth.json rewritten in ${r.updated} registered folder(s)`);
+    for (const f of r.failed) deps.out(`codex homes: not updated, ${f}`);
+  } catch (e) {
+    deps.out(`codex homes: not updated, ${(e instanceof Error ? e.message : String(e)).split(token).join("[redacted]")}`);
+  }
   if (kubeError === undefined && fileError === undefined) {
     deps.out(`secret: ais-gateway-${app} written in ${namespace}; token saved as ${appTokenKey(app)} in ~/.secrets`);
     return;
