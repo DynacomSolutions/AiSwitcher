@@ -126,6 +126,23 @@ describe("swap into a gateway-routed pool", () => {
     expect(again.noop).toBe(true);
   });
 
+  const routeWithUsageProxy = () =>
+    writeFile(join(poolDir(), "settings.json"), JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:47140/claude", HTTPS_PROXY: "http://proxy.example.test:47132", NO_PROXY: "127.0.0.1,localhost,::1" } }));
+
+  test("with the usage proxy, the written entry keeps user:profile (limits stay visible)", async () => {
+    await routeWithUsageProxy();
+    await performSwap({ registryPath: registry, ledgerPath: ledger, pool: "pool", target: "b", reason: "manual" });
+    expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.scopes).toEqual(["user:inference", "user:profile"]);
+  });
+
+  test("with the usage proxy, an entry that lost user:profile is repaired, not kept", async () => {
+    await routeWithUsageProxy();
+    await performSwap({ registryPath: registry, ledgerPath: ledger, pool: "pool", target: "b", reason: "manual" });
+    await writeFile(join(poolDir(), ".credentials.json"), gatewayEntryText(GW));
+    await performSwap({ registryPath: registry, ledgerPath: ledger, pool: "pool", target: "a", reason: "manual" });
+    expect((await read(join(poolDir(), ".credentials.json"))).claudeAiOauth.scopes).toEqual(["user:inference", "user:profile"]);
+  });
+
   test("no gateway token in ~/.secrets: the swap refuses and leaves the pool alone", async () => {
     await routeThroughProxy();
     await writeFile(join(root, "secrets"), "OTHER=1\n");

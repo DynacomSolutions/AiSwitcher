@@ -20,12 +20,26 @@ export const GATEWAY_TOKEN_PREFIX = "aisg_";
 /** 2100-01-01T00:00:00Z in ms: Claude Code never tries to refresh the entry. */
 export const GATEWAY_ENTRY_EXPIRES_AT_MS = 4_102_444_800_000;
 export const GATEWAY_ENTRY_SCOPES = ["user:inference"];
+/**
+ * Scopes for a folder that uses the gateway usage proxy (HTTPS_PROXY): Claude Code reads plan limits only with
+ * `user:profile`, and the proxy answers that read from the gateway. Without the proxy the read would go to Anthropic with
+ * the gateway token, so the scope is only added when the proxy is set (see claude-usage-proxy.ts).
+ */
+export const GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY = ["user:inference", "user:profile"];
+const PROXY_ENV_KEYS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 
 export const isGatewayAccessToken = (token: unknown): boolean => typeof token === "string" && token.startsWith(GATEWAY_TOKEN_PREFIX);
 
 /** The `.credentials.json` text for the gateway entry. */
-export function gatewayEntryText(token: string): string {
-  return `${JSON.stringify({ claudeAiOauth: { accessToken: token, refreshToken: null, expiresAt: GATEWAY_ENTRY_EXPIRES_AT_MS, scopes: GATEWAY_ENTRY_SCOPES, subscriptionType: "max" } })}\n`;
+export function gatewayEntryText(token: string, scopes: readonly string[] = GATEWAY_ENTRY_SCOPES): string {
+  return `${JSON.stringify({ claudeAiOauth: { accessToken: token, refreshToken: null, expiresAt: GATEWAY_ENTRY_EXPIRES_AT_MS, scopes: [...scopes], subscriptionType: "max" } })}\n`;
+}
+
+/** The scopes the gateway entry in this folder must carry: `user:profile` too when its settings use the usage proxy. */
+export async function gatewayEntryScopesFor(configDir: string): Promise<readonly string[]> {
+  const env = (await readJson(join(configDir, "settings.json")))?.env as Record<string, unknown> | undefined;
+  const proxied = PROXY_ENV_KEYS.some((k) => typeof env?.[k] === "string" && (env[k] as string).trim() !== "");
+  return proxied ? GATEWAY_ENTRY_SCOPES_WITH_USAGE_PROXY : GATEWAY_ENTRY_SCOPES;
 }
 
 /** The agents-claude gateway token from the secrets file (the one the key helpers print), or undefined. */
@@ -71,8 +85,11 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
 
 /** True when the folder's `.credentials.json` is exactly the gateway entry: this token and no refresh token (a refresh token beside it is a leaked member login). */
 export async function isIntactGatewayEntry(configDir: string, token: string): Promise<boolean> {
-  const oauth = (await readJson(join(configDir, ".credentials.json")))?.claudeAiOauth as { accessToken?: unknown; refreshToken?: unknown } | undefined;
-  return oauth?.accessToken === token && (oauth.refreshToken === null || oauth.refreshToken === undefined || oauth.refreshToken === "");
+  const oauth = (await readJson(join(configDir, ".credentials.json")))?.claudeAiOauth as { accessToken?: unknown; refreshToken?: unknown; scopes?: unknown } | undefined;
+  if (oauth?.accessToken !== token || !(oauth.refreshToken === null || oauth.refreshToken === undefined || oauth.refreshToken === "")) return false;
+  // An entry missing a scope the folder needs (user:profile with the usage proxy) is repaired, never left to lose the limits.
+  const have = new Set(Array.isArray(oauth.scopes) ? oauth.scopes : []);
+  return (await gatewayEntryScopesFor(configDir)).every((s) => have.has(s));
 }
 
 /** The access token in the identity's `.credentials.json`, if any. */
@@ -93,7 +110,7 @@ export async function isGatewayRoutedDir(configDir: string, opts: { localPort?: 
 
 /** Writes the gateway entry atomically with mode 0600. */
 export async function writeGatewayEntry(configDir: string, token: string): Promise<void> {
-  await writeFileAtomic(join(configDir, ".credentials.json"), gatewayEntryText(token));
+  await writeFileAtomic(join(configDir, ".credentials.json"), gatewayEntryText(token, await gatewayEntryScopesFor(configDir)));
 }
 
 /** Removes `apiKeyHelper` from the folder's settings.json (it would switch Claude Code out of subscriber mode). Other keys
