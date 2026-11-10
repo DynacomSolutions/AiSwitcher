@@ -393,6 +393,23 @@ describe("route-all-via-gateway: routing", () => {
     expect(classifyLogin("codex", await readFile(join(dirOf(".codex", "pool"), "auth.json"), "utf8"))).toBe("gateway");
   });
 
+  test("a pool already routed in another form (codex-home placeholder, other base) is left as it is", async () => {
+    await registry("codex", ".codex", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
+    await writeFile(join(dirOf(".codex", "alpha"), "auth.json"), codexLogin("alpha"));
+    await writeFile(join(dirOf(".codex", "beta"), "auth.json"), codexLogin("beta"));
+    const placeholder = `${JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: CODEX_KEY, id_token: "x.y.z", refresh_token: "" } })}\n`;
+    const config = 'model_provider = "ais-gateway"\nchatgpt_base_url = "http://127.0.0.1:47140/codex/agents-codex/backend-api"\n\n[model_providers.ais-gateway]\nbase_url = "http://127.0.0.1:47140/codex/agents-codex"\nrequires_openai_auth = true\n';
+    await writeFile(join(dirOf(".codex", "pool"), "auth.json"), placeholder);
+    await writeFile(join(dirOf(".codex", "pool"), "config.toml"), config);
+    await heartbeat([...ALL, "codex/beta"]);
+    const r = await routeAllViaGateway(opts);
+    expect(r.lines.find((l) => l.tool === "codex" && l.identity === "pool")?.status).toBe("already-routed");
+    expect(await readFile(join(dirOf(".codex", "pool"), "auth.json"), "utf8")).toBe(placeholder);
+    expect(await readFile(join(dirOf(".codex", "pool"), "config.toml"), "utf8")).toBe(config);
+    // a routed pool holds no login: its active member is routed, not refused
+    expect(r.lines.find((l) => l.tool === "codex" && l.identity === "alpha")?.status).toBe("routed");
+  });
+
   test("a pool whose members the gateway does not hold is refused and left as it was", async () => {
     await registry("claude", ".claude", ["alpha", "beta", "pool"], { pool: { swapPool: { accounts: ["alpha", "beta"], active: "alpha" } } });
     await writeFile(join(dirOf(".claude", "pool"), ".credentials.json"), claudeLogin("alpha"));

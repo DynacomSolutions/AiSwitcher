@@ -719,7 +719,10 @@ async function routePool(pool: Identity, ctx: ToolContext): Promise<RouteLine> {
   const { tool, token, base, helper, root, opts, now } = ctx;
   const line = { tool, identity: pool.name };
   const dir = pool.configDir;
-  if (await isRoutedAlready(tool, dir, token, base, helper)) {
+  // A pool whose login file already holds a gateway entry is routed, in whichever form it was set up (this command's, or
+  // `ais gateway codex-home`'s placeholder login with chatgpt_base_url): never rewrite it into this command's form.
+  const loginFile = join(dir, memberLoginFile(tool));
+  if (await isRoutedAlready(tool, dir, token, base, helper) || classifyLogin(tool, await readText(loginFile)) === "gateway") {
     ctx.routedPools.add(pool.name);
     return { ...line, status: "already-routed" };
   }
@@ -755,10 +758,18 @@ async function routePool(pool: Identity, ctx: ToolContext): Promise<RouteLine> {
         const plan = kind === "login" ? await planPoolLogin(pool, ctx, poolText!) : {};
         if (plan.refused) return plan.refused;
         if (plan.owner && plan.owner.name !== firstPlan.owner?.name) return "the pool's login changed owner while this run waited for the locks; nothing changed, run this again";
+        // Restores the owner's old copy if the entry never made it into the pool folder: the pool then keeps the only copy
+        // of its fresher login, as before this run, instead of the pool and the owner both holding it.
+        let undoWriteBack: (() => Promise<void>) | undefined;
         try {
           if (plan.writeBack) {
-            const b = await backupUnique(plan.writeBack.path, now);
-            await writeFileDurable(plan.writeBack.path, poolText!);
+            const target = plan.writeBack.path;
+            const previous = await readText(target);
+            const b = await backupUnique(target, now);
+            await writeFileDurable(target, poolText!);
+            undoWriteBack = async () => {
+              if (previous !== undefined) await writeFileDurable(target, previous);
+            };
             notes.push(`the pool's fresher copy of ${plan.owner!.name}'s login went back to ${plan.writeBack.where === "store" ? "the member store" : "its folder"} (old copy backed up to ${b})`);
           }
           if (plan.note) notes.push(plan.note);
@@ -767,6 +778,11 @@ async function routePool(pool: Identity, ctx: ToolContext): Promise<RouteLine> {
           const routing = routingFor(tool, [kind === "login" ? poolText : undefined], account, ctx.host, now());
           notes.push(...(tool === "claude" ? await applyClaude(dir, token, base, routing, now) : await applyCodex(dir, token, base, helper, routing, now)));
         } catch (err) {
+          const entryIn = classifyLogin(tool, await readText(loginPath)) === "gateway";
+          if (undoWriteBack && !entryIn) {
+            await undoWriteBack().catch(() => undefined);
+            notes.push("the pool's login stayed in the pool; the owner's old copy was put back");
+          }
           return `failed while routing the pool folder (${(err as NodeJS.ErrnoException).code ?? (err instanceof Error ? err.name : "error")}); ${notes.length > 0 ? `done so far: ${notes.join("; ")}` : "nothing changed"}`;
         }
         return undefined;
