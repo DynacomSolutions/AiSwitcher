@@ -44,7 +44,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   usage: {
-    usage: "ais usage [breakdown|service install] [--identity=] [--tool=] [--json]",
+    usage: "ais usage [breakdown|service install|import-batch] [--identity=] [--tool=] [--json]",
     desc: "Token usage and cost, grouped by provider",
     flags: [
       ["--days=30", "breakdown window"],
@@ -54,6 +54,7 @@ export const HELP: Record<string, HelpNode> = {
     subs: {
       breakdown: sub("ais usage breakdown [identity] [--tool=] [--days=30] [--json]", "Per-tool-call breakdown"),
       service: sub("ais usage service install", "Install the bounded Linux user collector unit"),
+      "import-batch": sub("ais usage import-batch <batch-manifest.json> [--dry-run] [--json]", "Keep sessions an older batch copy has and the current batch lost"),
     },
   },
   limits: {

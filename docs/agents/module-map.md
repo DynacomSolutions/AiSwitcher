@@ -270,6 +270,9 @@ src/
                                across registries — not an ambiguity error, unlike
                                resolve-tool.ts's resolveMutationTarget) + provider-first
                                native/Pi aggregation and CLI-bridge double-count prevention
+      retained-sessions.ts        sessions a native export lost while their transcripts are gone:
+                               kept as segments after the export's in the manifest, added to the
+                               report rows and hourly; planBatchImport() for `ais usage import-batch`
       report.ts                   formatUsageReport(): provider-labelled table + trailing Errors section
       passthrough.ts               runPassthrough(): full tokscale (tui/graph/monthly/...) via
                                `-- <args>`, execReal'd with full stdio inheritance, scoped to

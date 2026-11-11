@@ -14,7 +14,8 @@ import { runBatched } from "../limits/collect.ts";
 import { RECENT_USAGE_DAYS } from "../claude-swap/attribution.ts";
 import { nativeSourceFingerprint, sharedNativeExportInputs } from "./source-fingerprint.ts";
 import { aisNativeSourceEnv, aisTokscaleCacheScope, markTokscaleCacheScopeUsed, sweepUnusedTokscaleCacheScopes, aisNativeTokscaleConfigDir, buildAisTokscaleExportInvocation, dailyUsageFromHourlyEntries, dailyUsageFromNativeMessages, readTokscaleBucketTimezone, runAisTokscaleExportInvocation, type DailyUsage, type TokscaleHourlyEntry } from "./tokscale.ts";
-import { collectObsoleteNativeSegments, isSegmentedNativeEnvelope, nativeSegmentDir, nativeSegmentsIntact, parseSegmentedNativeManifest, verifyNativeSegments, writeReusableSegmentList, type NativeSegmentRecord } from "./native-segments.ts";
+import { collectObsoleteNativeSegments, isSegmentedNativeEnvelope, nativeSegmentDir, nativeSegmentsIntact, parseSegmentedNativeManifest, verifyNativeSegments, writeReusableSegmentList, type NativeSegmentRecord, type SegmentedNativeManifest } from "./native-segments.ts";
+import { combinedHourly, mergeRetainedSessions, nativeManifestParts, nativeTranscriptRoots, planBatchImport, retainedManifestJson, retainedSessionsForExport, withRetainedUsage, writeRetainedSegment, type NativeManifestParts, type RetainedSession } from "./retained-sessions.ts";
 import { isBedrockIdentity } from "../../identities/aws-profile.ts";
 import pkg from "../../../package.json" with { type: "json" };
 import type { UsageSnapshotMetricsStatus } from "./snapshot-status.ts";
@@ -104,6 +105,7 @@ export type NativeCaptureFailureStage =
   | "promotion-directory"
   | "promotion-copy"
   | "promotion-permissions"
+  | "retention"
   | "capture-setup"
   | "capture-process"
   | "unknown";
@@ -357,6 +359,10 @@ type NativeBatchHourlyReader = (hourly: TokscaleHourlyEntry[]) => void;
 interface NativeBatchReaders {
   messages?: NativeBatchMessagesReader;
   hourly?: NativeBatchHourlyReader;
+  /** A segmented batch's manifest, as parsed and as validated. */
+  manifest?: (envelope: unknown, manifest: SegmentedNativeManifest) => void;
+  /** The sessions the promoted batch retains (retained-sessions.ts). */
+  retained?: (sessions: RetainedSession[]) => void;
   /** Segment bytes read this promotion, for tests and measurement. */
   bytesRead?: (bytes: number) => void;
 }
@@ -426,6 +432,7 @@ function validateNativeBatchFile(
     } catch (error) {
       throw nativeCaptureError("candidate-hash", error);
     }
+    readers.manifest?.(envelope, manifest);
     readers.hourly?.(manifest.hourly);
     return {
       path: "",
@@ -495,14 +502,121 @@ export function sweepStaleNativeStaging(staging = join(aisCacheDir(), "usage", "
   return removed;
 }
 
+/** Retention of sessions the export no longer holds (retained-sessions.ts). */
+export interface NativeRetentionOptions {
+  tool: UsageTarget["toolName"];
+  /** The source's transcript roots (nativeTranscriptRoots); undefined: carry only. */
+  transcriptRoots: readonly string[] | undefined;
+  bucketTimezone?: string;
+  now: string;
+}
+
+/** The committed segmented manifest's parts, or undefined when there is none
+ * for this partition or it cannot be read (then nothing is carried). */
+function committedManifestParts(ref: UsageSnapshotPartition["nativeBatch"], partitionId: string, nativeRoot: string): NativeManifestParts | undefined {
+  if (!ref || ref.partitionId !== partitionId || ref.format !== "segmented-v1") return undefined;
+  try {
+    const envelope = JSON.parse(readFileSync(join(nativeRoot, ref.path.slice("usage/native/".length)), "utf8")) as unknown;
+    return nativeManifestParts(envelope, parseSegmentedNativeManifest(envelope, partitionId));
+  } catch (error) {
+    logUsageSourceFailure(`${partitionId} committed manifest`, error);
+    return undefined;
+  }
+}
+
+/** The sessions a committed batch retains (none for a single-file batch). */
+export function readRetainedNativeSessions(ref: UsageSnapshotPartition["nativeBatch"], nativeRoot = join(aisCacheDir(), "usage", "native")): RetainedSession[] {
+  return ref ? committedManifestParts(ref, ref.partitionId, nativeRoot)?.retained ?? [] : [];
+}
+
+/** Write a manifest over a staged or new file: temporary file, then rename. */
+function writeManifestFile(path: string, json: string): void {
+  const temporary = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, json, { mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, path);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* nothing left */ }
+    throw error;
+  }
+}
+
+/** Verify retained segments one by one; a damaged or missing one is dropped
+ * (its data is gone either way) instead of failing every later promotion. */
+function verifiedRetainedSessions(sessions: RetainedSession[], segmentDir: string, prior: readonly NativeSegmentRecord[] | undefined, generatedAt: string) {
+  const kept: RetainedSession[] = [];
+  const records: NativeSegmentRecord[] = [];
+  for (const session of sessions) {
+    try {
+      const { records: [record] } = verifyNativeSegments({ generatedAt, messagesSha256: session.sha256, hourly: [], segments: [session] }, segmentDir, prior);
+      kept.push(session);
+      records.push(record!);
+    } catch (error) {
+      logUsageSourceFailure(`retained session segment ${session.sha256}`, error);
+    }
+  }
+  return { kept, records };
+}
+
 export function promoteNativeBatchFile(
   candidatePath: string,
   partitionId: string,
   nativeRoot = join(aisCacheDir(), "usage", "native"),
   readers: NativeBatchReaders = {},
   prior?: UsageSnapshotPartition["nativeBatch"],
+  retention?: NativeRetentionOptions,
 ): NonNullable<UsageSnapshotPartition["nativeBatch"]> {
-  const ref = validateNativeBatchFile(candidatePath, partitionId, readers, nativeRoot, prior?.partitionId === partitionId ? prior.segments : undefined);
+  const priorSegments = prior?.partitionId === partitionId ? prior.segments : undefined;
+  let parsed: { envelope: unknown; manifest: SegmentedNativeManifest } | undefined;
+  let ref = validateNativeBatchFile(candidatePath, partitionId, retention ? {
+    ...readers,
+    // Daily figures wait for the retained sessions' hours.
+    hourly: undefined,
+    manifest: (envelope, manifest) => {
+      parsed = { envelope, manifest };
+      readers.manifest?.(envelope, manifest);
+    },
+  } : readers, nativeRoot, priorSegments);
+  if (retention && parsed) {
+    let hourly: TokscaleHourlyEntry[];
+    let retained: RetainedSession[];
+    try {
+      const next = nativeManifestParts(parsed.envelope, parsed.manifest);
+      const segmentDir = nativeSegmentDir(nativeRoot, partitionId);
+      const priorParts = committedManifestParts(prior, partitionId, nativeRoot);
+      const sessions = retainedSessionsForExport({
+        segmentDir,
+        tool: retention.tool,
+        prior: priorParts,
+        priorExportReadable: !!prior && committedNativeBatchIntact(prior, nativeRoot),
+        next: next.exportSegments,
+        transcriptRoots: retention.transcriptRoots,
+        ...(retention.bucketTimezone ? { bucketTimezone: retention.bucketTimezone } : {}),
+        now: retention.now,
+      });
+      const verified = verifiedRetainedSessions(sessions, segmentDir, priorSegments, parsed.manifest.generatedAt);
+      retained = verified.kept;
+      // Tokscale never writes retained sessions: the candidate is all export.
+      const parts: NativeManifestParts = { ...next, retained };
+      hourly = combinedHourly(parts);
+      if (retained.length > 0) {
+        const json = retainedManifestJson({ partitionId, generatedAt: parsed.manifest.generatedAt }, parts);
+        writeManifestFile(candidatePath, json);
+        ref = {
+          ...ref,
+          sha256: createHash("sha256").update(json).digest("hex"),
+          // Tokscale's digest: its "unchanged" answer compares the export alone.
+          messagesSha256: parts.exportMessagesSha256,
+          segments: [...ref.segments!.slice(0, next.exportSegments.length), ...verified.records],
+        };
+      }
+    } catch (error) {
+      throw nativeCaptureError("retention", error);
+    }
+    readers.retained?.(retained);
+    readers.hourly?.(hourly);
+  }
   const attempt = crypto.randomUUID();
   const batchDir = join(nativeRoot, partitionId);
   try {
@@ -565,7 +679,7 @@ function nativeCaptureFailure(error: unknown): NativeCaptureFailure {
 function validNativeCaptureFailure(value: unknown): value is NativeCaptureFailure {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const failure = value as Record<string, unknown>;
-  const stages: NativeCaptureFailureStage[] = ["partition-id-mismatch", "candidate-read", "candidate-json-parse", "candidate-envelope-validation", "candidate-hash", "promotion-directory", "promotion-copy", "promotion-permissions", "capture-setup", "capture-process", "unknown"];
+  const stages: NativeCaptureFailureStage[] = ["partition-id-mismatch", "candidate-read", "candidate-json-parse", "candidate-envelope-validation", "candidate-hash", "promotion-directory", "promotion-copy", "promotion-permissions", "retention", "capture-setup", "capture-process", "unknown"];
   const classes = ["Error", "SyntaxError", "TypeError", "RangeError", "AbortError"];
   return stages.includes(failure.stage as NativeCaptureFailureStage) && classes.includes(failure.errorClass as string) &&
     (failure.errorCode === undefined || NATIVE_CAPTURE_ERROR_CODES.has(failure.errorCode as NonNullable<NativeCaptureFailure["errorCode"]>));
@@ -1079,6 +1193,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     let nativeCoverage: UsageSnapshotPartition["nativeCoverage"] = tool === "ali" || tool === "zai" ? "unsupported" : "pending";
     const nativeSpec = nativeSpecs.get(key);
     const target = [...targets, ...poolTargets].find((candidate) => targetKey(candidate) === key);
+    // Sessions the export no longer holds are retained for single-source
+    // partitions; a swap pool's rows come from its members' transcripts.
+    const retainTarget = nativeDaily && target && !isSwapPool(target.identity) ? target : undefined;
+    let retained: RetainedSession[] = [];
     try {
       if (nativeCandidate) {
         const expectedPartitionId = nativePartitionId(key);
@@ -1086,12 +1204,14 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
           throw new NativeCaptureStageError("partition-id-mismatch", new Error("native-export-partition-mismatch"));
         }
         const bucketTimezone = nativeCandidate.tokscaleConfigDir ? readTokscaleBucketTimezone(nativeCandidate.tokscaleConfigDir) : undefined;
-        const unchanged = unchangedNativeBatch(nativeCandidate.path, expectedPartitionId, prior?.nativeBatch, deps.nativeBatchRoot ?? join(aisCacheDir(), "usage", "native"));
+        const unchanged = unchangedNativeBatch(nativeCandidate.path, expectedPartitionId, prior?.nativeBatch, nativeRoot);
         if (unchanged) {
           // Same messages as the batch already committed: keep pointing at it,
           // and the daily figures derived from those messages stay valid.
           nativeBatch = unchanged;
           if (nativeDaily) results = withDailyUsage(results, priorDailyUsage(prior));
+          // The report covers the export only; the batch's retained sessions are added.
+          if (retainTarget) retained = readRetainedNativeSessions(unchanged, nativeRoot);
         } else {
           // Daily figures are a display detail; a failure to derive them still commits the report.
           const deriveDaily = (derive: () => DailyUsage | undefined) => {
@@ -1105,10 +1225,17 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
             ? {
               messages: (messages) => deriveDaily(() => dailyUsageFromNativeMessages(messages, bucketTimezone)),
               hourly: (hourly) => deriveDaily(() => dailyUsageFromHourlyEntries(hourly)),
+              retained: (sessions) => { retained = sessions; },
             }
-            : {}, prior?.nativeBatch);
+            : {}, prior?.nativeBatch, retainTarget ? {
+            tool: retainTarget.toolName,
+            transcriptRoots: nativeTranscriptRoots(retainTarget.toolName, retainTarget.identity),
+            ...(bucketTimezone ? { bucketTimezone } : {}),
+            now: attemptedAt,
+          } : undefined);
           if (bucketTimezone) nativeBatch = { ...nativeBatch, bucketTimezone };
         }
+        if (retainTarget && retained.length > 0) results = withRetainedUsage(results, retained, retainTarget.toolName, safeIdentity(retainTarget.identity));
         nativeCoverage = "supported";
         exported = true;
       } else if (nativeSpec) {
@@ -1575,3 +1702,129 @@ export function requestUsageSnapshotRefresh(): boolean {
 }
 
 export const usageSnapshotPath = USAGE_SNAPSHOT_FILE;
+
+export interface RetainedBatchImportReport {
+  partitionKey: string;
+  partitionId: string;
+  dryRun: boolean;
+  /** Sessions added to the partition's retained sessions. */
+  sessions: number;
+  messages: number;
+  cost: number;
+  firstDate?: string;
+  lastDate?: string;
+  /** Backup sessions the current batch already holds. */
+  present: number;
+  /** Backup sessions that still have a transcript on disk (not imported). */
+  onDisk: number;
+}
+
+export interface RetainedBatchImportOptions {
+  dryRun?: boolean;
+  /** Test seams; production uses the live snapshot, native root and registry. */
+  path?: string;
+  nativeBatchRoot?: string;
+  now?: () => number;
+  /** The partition's source, for the transcript check (default: registry lookup). */
+  findTarget?: (partitionKey: string) => Promise<UsageTarget | undefined>;
+  updateProjects?: (snapshot: UsageSnapshot) => Promise<unknown>;
+}
+
+/** `ais usage import-batch`: absorb an older segmented batch of a partition
+ * (for example a copy taken before a Tokscale cache rewrite dropped
+ * sessions). Every session of the old batch that the partition's current
+ * batch does not hold, and that has no transcript on disk, becomes a retained
+ * session of the current batch, with its usage added to the partition's rows
+ * and daily figures. Running it again adds nothing. Holds the snapshot lock,
+ * so it never races a collector cycle. */
+export async function importRetainedNativeBatch(manifestPath: string, options: RetainedBatchImportOptions = {}): Promise<RetainedBatchImportReport> {
+  const path = options.path ?? USAGE_SNAPSHOT_FILE;
+  const nativeRoot = options.nativeBatchRoot ?? join(aisCacheDir(), "usage", "native");
+  const now = options.now ?? Date.now;
+  const envelope = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+  const partitionId = typeof envelope.partitionId === "string" ? envelope.partitionId : "";
+  if (!/^[a-f0-9]{64}$/.test(partitionId) || !isSegmentedNativeEnvelope(envelope)) throw new Error("not a segmented native batch manifest");
+  const backup = parseSegmentedNativeManifest(envelope, partitionId);
+  const backupSegmentDir = join(dirname(manifestPath), "segments");
+  // Every segment of the backup must be whole before anything is taken from it.
+  verifyNativeSegments(backup, backupSegmentDir, undefined);
+
+  const releaseLock = await acquireSnapshotLock(path);
+  if (!releaseLock) throw new Error("the usage collector is running a cycle; retry when it ends");
+  try {
+    const snapshot = readSnapshot(path);
+    if (!snapshot) throw new Error("no usage snapshot");
+    const found = Object.entries(snapshot.partitions).find(([, partition]) => partition.nativeBatch?.partitionId === partitionId);
+    if (!found) throw new Error(`no partition has native batch ${partitionId}`);
+    const [partitionKey, partition] = found;
+    const ref = partition.nativeBatch!;
+    if (partition.memberUsage) throw new Error("swap pool partitions do not keep retained sessions");
+    if (ref.format !== "segmented-v1" || !committedNativeBatchIntact(ref, nativeRoot)) {
+      throw new Error("the partition's current batch is not an intact segmented batch; retry after the next collector cycle");
+    }
+    const parts = committedManifestParts(ref, partitionId, nativeRoot);
+    if (!parts) throw new Error("the partition's current manifest cannot be read");
+    const target = await (options.findTarget ?? defaultFindTarget)(partitionKey);
+    const tool = (target?.toolName ?? partition.tool ?? "claude") as UsageTarget["toolName"];
+    const segmentDir = nativeSegmentDir(nativeRoot, partitionId);
+    const plan = planBatchImport({
+      backupSegmentDir,
+      backupSegments: backup.segments,
+      currentSegmentDir: segmentDir,
+      currentSegments: [...parts.exportSegments, ...parts.retained],
+      transcriptRoots: target ? nativeTranscriptRoots(target.toolName, target.identity) : undefined,
+      tool,
+      ...(ref.bucketTimezone ? { bucketTimezone: ref.bucketTimezone } : {}),
+      now: new Date(now()).toISOString(),
+    });
+    const added = plan.sessions.map((planned) => planned.session);
+    const dates = plan.sessions.flatMap((planned) => planned.session.hourly.map((hour) => hour.hour.slice(0, 10))).sort();
+    const report: RetainedBatchImportReport = {
+      partitionKey, partitionId, dryRun: options.dryRun === true,
+      sessions: added.length,
+      messages: added.reduce((sum, session) => sum + session.entries.reduce((count, entry) => count + entry.messageCount, 0), 0),
+      cost: added.reduce((sum, session) => sum + session.entries.reduce((total, entry) => total + entry.cost, 0), 0),
+      ...(dates.length ? { firstDate: dates[0], lastDate: dates.at(-1) } : {}),
+      present: plan.present,
+      onDisk: plan.onDisk,
+    };
+    if (options.dryRun || added.length === 0) return report;
+
+    for (const planned of plan.sessions) writeRetainedSegment(segmentDir, planned.session, planned.body);
+    const verified = verifiedRetainedSessions(added, segmentDir, ref.segments, ref.generatedAt);
+    if (verified.kept.length !== added.length) throw new Error("a retained segment could not be verified after it was written");
+    const next: NativeManifestParts = { ...parts, retained: mergeRetainedSessions(parts.retained, added) };
+    const json = retainedManifestJson({ partitionId, generatedAt: ref.generatedAt }, next);
+    const batchName = `${crypto.randomUUID()}.json`;
+    const manifestFile = join(nativeRoot, partitionId, batchName);
+    writeManifestFile(manifestFile, json);
+    const info = statSync(manifestFile, { bigint: true });
+    const records = new Map([...(ref.segments ?? []), ...verified.records].map((record) => [record.sha256, record]));
+    const nextRef: NonNullable<UsageSnapshotPartition["nativeBatch"]> = {
+      ...ref,
+      path: `usage/native/${partitionId}/${batchName}`,
+      sha256: createHash("sha256").update(json).digest("hex"),
+      messagesSha256: parts.exportMessagesSha256,
+      batchSize: Number(info.size),
+      batchMtimeNs: String(info.mtimeNs),
+      segments: [...next.exportSegments, ...next.retained].map((segment) => records.get(segment.sha256)!),
+    };
+    let results = withRetainedUsage(partition.results, added, tool, partition.results[0]?.identity ?? { name: partition.identity ?? partitionKey, label: partition.identity ?? partitionKey } as UsageResult["identity"]);
+    if (results.length === 1 && results[0]!.dailyTotals) results = withDailyUsage(results, dailyUsageFromHourlyEntries(combinedHourly(next)));
+    const at = new Date(now()).toISOString();
+    snapshot.partitions[partitionKey] = { ...partition, results: safeResults(results), nativeBatch: nextRef };
+    const committed: UsageSnapshot = { ...snapshot, generatedAt: at, aggregateGeneratedAt: at };
+    writeSnapshot(committed, path);
+    const updateProjects = options.updateProjects ?? (path === USAGE_SNAPSHOT_FILE ? ((value: UsageSnapshot) => updateUsageProjects(value)) : undefined);
+    if (updateProjects) {
+      try { await updateProjects(committed); } catch (error) { logUsageSourceFailure("projects aggregate", error); }
+    }
+    return report;
+  } finally {
+    await releaseLock();
+  }
+}
+
+async function defaultFindTarget(partitionKey: string): Promise<UsageTarget | undefined> {
+  return (await collectTargets({})).find((target) => targetKey(target) === partitionKey);
+}
