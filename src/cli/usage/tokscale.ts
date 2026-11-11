@@ -942,7 +942,7 @@ interface NativeExportMessage {
   cost?: unknown;
 }
 
-const LOCAL_RECOVERY_DAILY_PREFIX = "local-recovery:daily:";
+export const LOCAL_RECOVERY_DAILY_PREFIX = "local-recovery:daily:";
 const TOKSCALE_UNKNOWN_DATE = "unknown";
 
 function finiteNumber(value: unknown, fallback = 0): number {

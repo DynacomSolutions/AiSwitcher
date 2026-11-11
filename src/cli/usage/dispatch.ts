@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { boolFlag, parseArgs } from "../args.ts";
 import { CliUsageError } from "../errors.ts";
 import { runPassthrough } from "./passthrough.ts";
@@ -16,7 +17,7 @@ import {
   type UsageResult,
 } from "./run.ts";
 import { formatGatewayUsageSection, loadGatewayUsage } from "../../gateway/usage-view.ts";
-import { readUsageSnapshotEnvelope, startUsageSnapshotRefreshInBackground } from "./snapshot.ts";
+import { importRetainedNativeBatch, readUsageSnapshotEnvelope, startUsageSnapshotRefreshInBackground } from "./snapshot.ts";
 
 /** Our own recognized `ais usage` flags — anything else is tokscale's, not
  * ours, even if it happens to start with "--" (tokscale has plenty of its
@@ -67,6 +68,21 @@ export async function runUsageCommand(rawArgs: string[]): Promise<void> {
     const result = await installUsageCollectorService();
     console.log(`usage service ${result.changed ? "installed" : "already current"}: ${result.path} (disk cap ${result.ioCap}/s)`);
     console.log("The unit is enabled and active.");
+    return;
+  }
+
+  // Absorb an older batch copy's sessions the current batch lost (retained-sessions.ts).
+  if (rawArgs[0] === "import-batch") {
+    const { flags, positionals } = parseArgs(rawArgs.slice(1));
+    if (positionals.length !== 1) throw new CliUsageError("Usage: ais usage import-batch <batch-manifest.json> [--dry-run] [--json]");
+    const report = await importRetainedNativeBatch(resolve(positionals[0]!), { dryRun: boolFlag(flags, "dry-run") });
+    if (boolFlag(flags, "json")) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    const span = report.firstDate ? ` (${report.firstDate} to ${report.lastDate})` : "";
+    console.log(`${report.dryRun ? "Would retain" : "Retained"} ${report.sessions} sessions, ${report.messages} messages, $${report.cost.toFixed(2)}${span} in ${report.partitionKey}.`);
+    console.log(`Skipped: ${report.present} sessions the current batch holds, ${report.onDisk} with a transcript on disk.`);
     return;
   }
 
