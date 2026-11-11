@@ -254,7 +254,7 @@ ETA: 2026-11-12 03:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 180 | CI apt installs fall back to another Ubuntu mirror when runners cannot resolve the Ubuntu archive | done | claude | ci-pin-ubuntu-2404 | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/493 (e66915d); fallback seen in CI log.<br>Since 11 Nov ~13:47Z GitHub runners (24.04 and 26.04) cannot resolve the Ubuntu archive hosts; other hosts resolve. main CI red.<br>scripts/ci/apt-install.sh: default mirrors first, kernel.org mirror on failed fetch. |
-| 181 | Release test: shared browser lock test accepts either renewal winning the lock first | in_review | claude | fix-ali-lock-test-order | | 2026-11-12 03:00 ICT | v0.5.47 release failed on macOS: "two renewals take turns" asserted a before b; b won the lock, turns were still exclusive.<br>Test now checks no overlap in either order. |
+| 181 | Release test: shared browser lock test accepts either renewal winning the lock first | done | claude | fix-ali-lock-test-order | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/496 (130d6c5).<br>v0.5.47 release failed on macOS: "two renewals take turns" asserted a before b; b won the lock, turns were still exclusive.<br>Test now checks no overlap in either order. |
 
 ## 13. Codex clients through the gateway
 ETA: 2026-11-12 03:30 ICT
