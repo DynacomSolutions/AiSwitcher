@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -106,7 +106,7 @@ async function cycle(root: string, now: number, rows: Record<string, unknown>[],
       } else {
         await writeSegmentedExport(candidate.path, nativeSegmentDir(nativeBatchRoot, partitionId), rows);
       }
-      onItemDone(0, [reportRow(root, rows)]);
+      onItemDone(0, rows.length > 0 ? [reportRow(root, rows)] : []);
       return [];
     },
   };
@@ -276,12 +276,110 @@ describe("retained sessions", () => {
     expect(totalCost(next)).toBe(costOf([...gone, ...grownLive]) + 1);
   });
 
-  test("sessionsOnDisk finds Claude and Codex transcript names and treats a missing root as empty", async () => {
+
+  // Review findings of c439fba, one test each.
+  const asRoot = process.getuid?.() === 0;
+
+  test.skipIf(asRoot)("1. an unreadable directory under the transcript roots never blocks promotion; the session is retained", async () => {
     const root = await tempRoot();
-    await mkdir(join(root, "projects", "-work-acme", SESSION_LIVE, "subagents"), { recursive: true });
-    await mkdir(join(root, "sessions", "2026", "11"), { recursive: true });
-    await writeFile(join(root, "sessions", "2026", "11", `rollout-2026-11-10T10-00-00-${SESSION_GONE}.jsonl`), "");
-    const found = sessionsOnDisk([join(root, "projects"), join(root, "sessions"), join(root, "missing")], new Set([SESSION_LIVE, SESSION_GONE, "other"]));
-    expect([...found].sort()).toEqual([SESSION_GONE, SESSION_LIVE].sort());
+    const locked = join(configDir(root), "projects", "-work-acme-locked");
+    await mkdir(locked, { recursive: true });
+    await chmod(locked, 0o000);
+    try {
+      await cycle(root, Date.UTC(2026, 10, 11, 0), [...gone, ...live]);
+      const second = await cycle(root, Date.UTC(2026, 10, 11, 1), live);
+      expect(second.lastError).toBeUndefined();
+      expect(second.nativeCoverage).toBe("supported");
+      expect(totalCost(second)).toBe(costOf([...gone, ...live]));
+    } finally {
+      await chmod(locked, 0o700);
+    }
+  });
+
+  test("2. when the export becomes empty, the retained row still has daily figures (changed and unchanged cycles)", async () => {
+    const root = await tempRoot();
+    await cycle(root, Date.UTC(2026, 10, 11, 0), [...gone, ...live]);
+    const empty = await cycle(root, Date.UTC(2026, 10, 11, 1), []);
+    expect(empty.results).toHaveLength(1);
+    expect(totalCost(empty)).toBe(costOf([...gone, ...live]));
+    expect(empty.results[0]?.dailyTotals?.["2026-06-12"]?.[5]).toBe(costOf(gone));
+    expect(empty.results[0]?.dailyTotals?.["2026-11-10"]?.[5]).toBe(costOf(live));
+    expect(empty.results[0]?.dateSpan).toBeDefined();
+    const unchanged = await cycle(root, Date.UTC(2026, 10, 11, 2), [], { unchanged: true });
+    expect(totalCost(unchanged)).toBe(costOf([...gone, ...live]));
+    expect(unchanged.results[0]?.dailyTotals?.["2026-06-12"]?.[5]).toBe(costOf(gone));
+    expect(unchanged.results[0]?.dailyTotals?.["2026-11-10"]?.[5]).toBe(costOf(live));
+  });
+
+  test.skipIf(asRoot)("3. an unreadable committed manifest fails promotion at retention and keeps the totals", async () => {
+    const root = await tempRoot();
+    await cycle(root, Date.UTC(2026, 10, 11, 0), [...gone, ...live]);
+    const second = await cycle(root, Date.UTC(2026, 10, 11, 1), live);
+    const manifest = join(root, "usage", "native", second.nativeBatch!.path.slice("usage/native/".length));
+    await chmod(manifest, 0o000);
+    try {
+      const failed = await cycle(root, Date.UTC(2026, 10, 11, 2), grownLive);
+      expect(failed.lastError).toBe("native-capture-failed");
+      expect(failed.nativeFailure?.stage).toBe("retention");
+      expect(failed.nativeBatch?.path).toBe(second.nativeBatch?.path);
+      expect(totalCost(failed)).toBe(costOf([...gone, ...live]));
+    } finally {
+      await chmod(manifest, 0o600);
+    }
+    const recovered = await cycle(root, Date.UTC(2026, 10, 11, 3), grownLive);
+    expect(recovered.lastError).toBeUndefined();
+    expect(totalCost(recovered)).toBe(costOf([...gone, ...grownLive]));
+  });
+
+  test("4. a session on a day with a recovery balance row is not retained (the balance row grows instead)", async () => {
+    const root = await tempRoot();
+    const balance = (cost: number): Record<string, unknown> => ({
+      ...message("local-recovery:daily:2026-06-12", 0, "2026-06-12", cost, ""), dedup_key: "local-recovery:daily:2026-06-12",
+    });
+    await cycle(root, Date.UTC(2026, 10, 11, 0), [balance(1), ...gone, ...live]);
+    // The transcript is gone; Tokscale tops the floored day up with a larger balance.
+    const second = await cycle(root, Date.UTC(2026, 10, 11, 1), [balance(1 + costOf(gone)), ...live]);
+    expect((await manifestOf(root, second)).retainedSessions).toBeUndefined();
+    expect(totalCost(second)).toBe(1 + costOf(gone) + costOf(live));
+  });
+
+  test("5. a retained session exported again under another session id is not counted twice", async () => {
+    const root = await tempRoot();
+    await cycle(root, Date.UTC(2026, 10, 11, 0), [...gone, ...live]);
+    await cycle(root, Date.UTC(2026, 10, 11, 1), live);
+    const moved = gone.map((row) => ({ ...row, session_id: "0b7c1d2e-0000-4000-8000-00000000c003" }));
+    const third = await cycle(root, Date.UTC(2026, 10, 11, 2), [...moved, ...live]);
+    expect((await manifestOf(root, third)).retainedSessions).toBeUndefined();
+    expect(totalCost(third)).toBe(costOf([...moved, ...live]));
+    expect(totalMessages(third)).toBe(moved.length + live.length);
+  });
+
+  test("6. a leftover session folder without its transcript file does not count as on disk", async () => {
+    const root = await tempRoot();
+    const leftover = join(configDir(root), "projects", "-work-acme-old-app", SESSION_GONE);
+    await mkdir(join(leftover, "subagents"), { recursive: true });
+    await mkdir(join(leftover, "tool-results"), { recursive: true });
+    await writeFile(join(leftover, "tool-results", "result.txt"), "x");
+    await cycle(root, Date.UTC(2026, 10, 11, 0), [...gone, ...live]);
+    const second = await cycle(root, Date.UTC(2026, 10, 11, 1), live);
+    expect(totalCost(second)).toBe(costOf([...gone, ...live]));
+
+    // The disk check by tool naming.
+    await mkdir(join(root, "codex", "2026", "11"), { recursive: true });
+    await writeFile(join(root, "codex", "2026", "11", `rollout-2026-11-10T10-00-00-${SESSION_LIVE}.jsonl`), "");
+    await writeFile(join(configDir(root), "projects", "-work-acme-old-app", `${SESSION_LIVE}.jsonl`), "");
+    const ids = new Set([SESSION_GONE, SESSION_LIVE]);
+    expect([...sessionsOnDisk([join(configDir(root), "projects"), join(root, "missing")], ids, "claude")]).toEqual([SESSION_LIVE]);
+    expect([...sessionsOnDisk([join(root, "codex")], ids, "codex")]).toEqual([SESSION_LIVE]);
+  });
+
+  test("7. a ctime change on committed segments does not stop retention", async () => {
+    const root = await tempRoot();
+    const first = await cycle(root, Date.UTC(2026, 10, 11, 0), [...gone, ...live]);
+    const segmentDir = nativeSegmentDir(join(root, "usage", "native"), partitionId);
+    for (const segment of first.nativeBatch!.segments!) await chmod(join(segmentDir, `${segment.sha256}.json`), 0o640);
+    const second = await cycle(root, Date.UTC(2026, 10, 11, 1), live);
+    expect(totalCost(second)).toBe(costOf([...gone, ...live]));
+    expect(((await manifestOf(root, second)).retainedSessions as unknown[]).length).toBe(1);
   });
 });

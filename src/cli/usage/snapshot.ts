@@ -511,22 +511,15 @@ export interface NativeRetentionOptions {
   now: string;
 }
 
-/** The committed segmented manifest's parts, or undefined when there is none
- * for this partition or it cannot be read (then nothing is carried). */
+/** The committed segmented manifest's parts, or undefined when the partition
+ * has no segmented batch. A manifest that cannot be read or parsed throws:
+ * its retained sessions must never be dropped quietly, so the caller fails
+ * the promotion (`retention`), the partition keeps its last batch and rows,
+ * and the error shows until the manifest can be read again. */
 function committedManifestParts(ref: UsageSnapshotPartition["nativeBatch"], partitionId: string, nativeRoot: string): NativeManifestParts | undefined {
   if (!ref || ref.partitionId !== partitionId || ref.format !== "segmented-v1") return undefined;
-  try {
-    const envelope = JSON.parse(readFileSync(join(nativeRoot, ref.path.slice("usage/native/".length)), "utf8")) as unknown;
-    return nativeManifestParts(envelope, parseSegmentedNativeManifest(envelope, partitionId));
-  } catch (error) {
-    logUsageSourceFailure(`${partitionId} committed manifest`, error);
-    return undefined;
-  }
-}
-
-/** The sessions a committed batch retains (none for a single-file batch). */
-export function readRetainedNativeSessions(ref: UsageSnapshotPartition["nativeBatch"], nativeRoot = join(aisCacheDir(), "usage", "native")): RetainedSession[] {
-  return ref ? committedManifestParts(ref, ref.partitionId, nativeRoot)?.retained ?? [] : [];
+  const envelope = JSON.parse(readFileSync(join(nativeRoot, ref.path.slice("usage/native/".length)), "utf8")) as unknown;
+  return nativeManifestParts(envelope, parseSegmentedNativeManifest(envelope, partitionId));
 }
 
 /** Write a manifest over a staged or new file: temporary file, then rename. */
@@ -589,7 +582,6 @@ export function promoteNativeBatchFile(
         segmentDir,
         tool: retention.tool,
         prior: priorParts,
-        priorExportReadable: !!prior && committedNativeBatchIntact(prior, nativeRoot),
         next: next.exportSegments,
         transcriptRoots: retention.transcriptRoots,
         ...(retention.bucketTimezone ? { bucketTimezone: retention.bucketTimezone } : {}),
@@ -1197,6 +1189,7 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     // partitions; a swap pool's rows come from its members' transcripts.
     const retainTarget = nativeDaily && target && !isSwapPool(target.identity) ? target : undefined;
     let retained: RetainedSession[] = [];
+    let daily: DailyUsage | undefined;
     try {
       if (nativeCandidate) {
         const expectedPartitionId = nativePartitionId(key);
@@ -1209,14 +1202,24 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
           // Same messages as the batch already committed: keep pointing at it,
           // and the daily figures derived from those messages stay valid.
           nativeBatch = unchanged;
-          if (nativeDaily) results = withDailyUsage(results, priorDailyUsage(prior));
-          // The report covers the export only; the batch's retained sessions are added.
-          if (retainTarget) retained = readRetainedNativeSessions(unchanged, nativeRoot);
+          daily = priorDailyUsage(prior);
+          if (retainTarget) {
+            // The report covers the export only; the batch's retained sessions
+            // are added, and its hourly (which includes them) gives the days.
+            let parts: NativeManifestParts | undefined;
+            try {
+              parts = committedManifestParts(unchanged, expectedPartitionId, nativeRoot);
+            } catch (error) {
+              throw nativeCaptureError("retention", error);
+            }
+            retained = parts?.retained ?? [];
+            if (parts && retained.length > 0) daily = dailyUsageFromHourlyEntries(combinedHourly(parts)) ?? daily;
+          }
         } else {
           // Daily figures are a display detail; a failure to derive them still commits the report.
           const deriveDaily = (derive: () => DailyUsage | undefined) => {
             try {
-              results = withDailyUsage(results, derive());
+              daily = derive();
             } catch (error) {
               logUsageSourceFailure(`${key} native daily usage`, error);
             }
@@ -1235,7 +1238,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
           } : undefined);
           if (bucketTimezone) nativeBatch = { ...nativeBatch, bucketTimezone };
         }
+        // Retained rows first, so a row that only retained usage fills (every
+        // transcript gone, or a provider only retained) still gets its days.
         if (retainTarget && retained.length > 0) results = withRetainedUsage(results, retained, retainTarget.toolName, safeIdentity(retainTarget.identity));
+        if (nativeDaily) results = withDailyUsage(results, daily);
         nativeCoverage = "supported";
         exported = true;
       } else if (nativeSpec) {
@@ -1810,7 +1816,7 @@ export async function importRetainedNativeBatch(manifestPath: string, options: R
       segments: [...next.exportSegments, ...next.retained].map((segment) => records.get(segment.sha256)!),
     };
     let results = withRetainedUsage(partition.results, added, tool, partition.results[0]?.identity ?? { name: partition.identity ?? partitionKey, label: partition.identity ?? partitionKey } as UsageResult["identity"]);
-    if (results.length === 1 && results[0]!.dailyTotals) results = withDailyUsage(results, dailyUsageFromHourlyEntries(combinedHourly(next)));
+    results = withDailyUsage(results, dailyUsageFromHourlyEntries(combinedHourly(next)));
     const at = new Date(now()).toISOString();
     snapshot.partitions[partitionKey] = { ...partition, results: safeResults(results), nativeBatch: nextRef };
     const committed: UsageSnapshot = { ...snapshot, generatedAt: at, aggregateGeneratedAt: at };

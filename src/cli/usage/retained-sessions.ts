@@ -1,10 +1,10 @@
 import { chmodSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
 import { NATIVE_SEGMENT_FORMAT, type SegmentedNativeManifest } from "./native-segments.ts";
 import { canonicalUsageProvider, providerForTool } from "./providers.ts";
-import type { UsageResult } from "./run.ts";
+import { logUsageSourceFailure, type UsageResult } from "./run.ts";
 import { hourlyEntriesFromNativeMessages, LOCAL_RECOVERY_DAILY_PREFIX, type TokscaleEntry, type TokscaleHourlyEntry, type TokscaleReport } from "./tokscale.ts";
 
 /** Retained sessions (docs/agents/usage-tokscale.md, "Recorded usage is never
@@ -184,24 +184,43 @@ export function nativeTranscriptRoots(toolName: ToolConfig["toolName"], identity
   }
 }
 
-/** The sessions among `ids` that still have a file or directory whose name
- * holds the session id under one of `roots` (Claude `<id>.jsonl` and `<id>/`,
- * Codex `rollout-...-<id>.jsonl`). A missing root holds nothing; any other
- * read error throws, so the caller retries rather than guessing. Symlinks are
- * not followed. */
-export function sessionsOnDisk(roots: readonly string[], ids: ReadonlySet<string>): Set<string> {
+/** Directories the disk check could not read, logged once per process. */
+const unreadableLogged = new Set<string>();
+
+/** Whether a file is a transcript of one of `ids`, by the tool's naming:
+ * Claude `<id>.jsonl`, Codex `rollout-<time>-<id>.jsonl[.zst]`, and for other
+ * tools a file whose name holds the id or that lies in a directory named by
+ * it (Grok keeps a session's files in `<id>/`). A leftover directory of a
+ * session without such a file does not count. */
+function transcriptSession(tool: string, name: string, parent: string, ids: ReadonlySet<string>, byLower: ReadonlyMap<string, string>): string | undefined {
+  if (tool === "claude") {
+    if (!name.endsWith(".jsonl")) return undefined;
+    const id = name.slice(0, -".jsonl".length);
+    return ids.has(id) ? id : undefined;
+  }
+  if (tool === "codex") {
+    const match = /^rollout-.*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zst)?$/i.exec(name);
+    return match ? byLower.get(match[1]!.toLowerCase()) : undefined;
+  }
+  if (ids.has(parent)) return parent;
+  for (const match of name.matchAll(UUID_RE)) {
+    const id = byLower.get(match[0].toLowerCase());
+    if (id) return id;
+  }
+  for (const id of ids) if (!UUID_EXACT_RE.test(id) && name.includes(id)) return id;
+  return undefined;
+}
+
+/** The sessions among `ids` that still have a transcript file under one of
+ * `roots` (see transcriptSession). Never throws: a missing root holds
+ * nothing, and a directory that cannot be read is skipped (logged once), so
+ * a session whose transcript could only be there counts as gone, as it is
+ * for the export, which cannot read it either. Symlinked directories are not
+ * followed. */
+export function sessionsOnDisk(roots: readonly string[], ids: ReadonlySet<string>, tool = ""): Set<string> {
   const found = new Set<string>();
   if (ids.size === 0) return found;
-  const uuids = new Set([...ids].filter((id) => UUID_EXACT_RE.test(id)).map((id) => id.toLowerCase()));
-  const others = [...ids].filter((id) => !UUID_EXACT_RE.test(id));
   const byLower = new Map([...ids].map((id) => [id.toLowerCase(), id]));
-  const visit = (name: string) => {
-    for (const match of name.matchAll(UUID_RE)) {
-      const lower = match[0].toLowerCase();
-      if (uuids.has(lower)) found.add(byLower.get(lower)!);
-    }
-    for (const id of others) if (name.includes(id)) found.add(id);
-  };
   for (const root of roots) {
     const stack = [root];
     while (stack.length > 0) {
@@ -210,12 +229,21 @@ export function sessionsOnDisk(roots: readonly string[], ids: ReadonlySet<string
       try {
         entries = readdirSync(directory, { withFileTypes: true });
       } catch (error) {
-        if (directory === root && (error as { code?: string }).code === "ENOENT") break;
-        throw error;
+        if ((error as { code?: string }).code !== "ENOENT" && !unreadableLogged.has(directory)) {
+          unreadableLogged.add(directory);
+          logUsageSourceFailure(`retained-session disk check ${directory}`, error);
+        }
+        continue;
       }
+      const parent = basename(directory);
       for (const entry of entries) {
-        visit(entry.name);
-        if (entry.isDirectory()) stack.push(join(directory, entry.name));
+        if (entry.isDirectory()) {
+          stack.push(join(directory, entry.name));
+          continue;
+        }
+        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+        const id = transcriptSession(tool, entry.name, parent, ids, byLower);
+        if (id) found.add(id);
       }
     }
   }
@@ -224,12 +252,22 @@ export function sessionsOnDisk(roots: readonly string[], ids: ReadonlySet<string
 
 type Message = Record<string, unknown>;
 
+/** Tokscale's synthetic per-day balance row (`local-recovery:daily:<day>`),
+ * which tops a floored day up to its recorded floor. */
+function isRecoveryRow(message: Message): boolean {
+  return typeof message.session_id === "string" && message.session_id.startsWith(LOCAL_RECOVERY_DAILY_PREFIX);
+}
+
+function dayOf(message: Message): string {
+  return typeof message.date === "string" ? message.date : "";
+}
+
 function sessionIdOf(message: Message): string | undefined {
   const id = message.session_id;
   if (typeof id !== "string" || !id) return undefined;
   // Synthetic per-day recovery rows are Tokscale's own bookkeeping, rebuilt
   // every scan: never retained.
-  if (id.startsWith(LOCAL_RECOVERY_DAILY_PREFIX)) return undefined;
+  if (isRecoveryRow(message)) return undefined;
   return id;
 }
 
@@ -315,14 +353,27 @@ function sortedSessions(sessions: RetainedSession[]): RetainedSession[] {
   return sessions.sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
 }
 
+/** Read a segment whose data may be gone for good: a missing or damaged file
+ * is logged and gives undefined (nothing can bring it back); any other read
+ * error throws, so the promotion fails and the next cycle retries. */
+function readSegmentIfWhole(segmentDir: string, ref: SegmentRef): Message[] | undefined {
+  try {
+    return readSegmentMessages(segmentDir, ref);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === "ENOENT" || (error as Error).message === "native-segment-mismatch" || error instanceof SyntaxError) {
+      logUsageSourceFailure(`native segment ${ref.sha256}`, error);
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 export interface RetentionInput {
   segmentDir: string;
   tool: string;
-  /** The committed manifest's parts. `exportReadable` is false when its export
-   * segments are not all intact: then no new session is retained (its
-   * messages cannot be read back), but retained sessions are still carried. */
+  /** The committed manifest's parts. */
   prior: NativeManifestParts | undefined;
-  priorExportReadable: boolean;
   /** The new export's segments (already verified). */
   next: SegmentRef[];
   /** See nativeTranscriptRoots; undefined: no new session is retained. */
@@ -334,55 +385,74 @@ export interface RetentionInput {
 /** The retained sessions of the batch that replaces `prior`.
  *
  * Carried: every session `prior` retained, unless the new export holds a
- * message of that session again (it then counts from the export), with its
- * hourly part recomputed when the bucket timezone changed.
+ * message of that session again (it then counts from the export). When the
+ * export changed, its messages that the new export holds under another
+ * session (same dedup key) or that fall on a day the new export tops up with
+ * a recovery row are left out; its hourly part follows the bucket timezone.
  *
  * Added: a session whose messages were in the prior export and none of them is
  * in the new one, whose id is not a synthetic recovery row, and which has no
- * transcript under the source's scan roots. Its messages that the new export
- * holds under another session (same dedup key) are left out. Its segment is
+ * transcript file under the source's scan roots. Left out: its messages that
+ * the new export holds under another session (same dedup key), and those on
+ * a day either export has a recovery row for (Tokscale raises that row when
+ * the day loses usage, so retaining it would count it twice). Its segment is
  * written to `segmentDir`.
  *
- * Only segments that differ between the two exports are read, so an
- * unchanged batch reads nothing, and the kept segments are read only when a
- * session would be added. Throws on a read error. */
+ * Segments are verified by size and SHA-256 when read. Only segments that
+ * differ between the two exports and retained ones are read; the shared ones
+ * only when a session would be added. A missing or damaged segment is
+ * skipped (logged); any other read error throws. */
 export function retainedSessionsForExport(input: RetentionInput): RetainedSession[] {
   const prior = input.prior;
   if (!prior) return [];
   const priorShas = new Set(prior.exportSegments.map((segment) => segment.sha256));
   const nextShas = new Set(input.next.map((segment) => segment.sha256));
   const fresh = input.next.filter((segment) => !priorShas.has(segment.sha256));
-  const dropped = input.priorExportReadable ? prior.exportSegments.filter((segment) => !nextShas.has(segment.sha256)) : [];
+  const dropped = prior.exportSegments.filter((segment) => !nextShas.has(segment.sha256));
   if (prior.retained.length === 0 && dropped.length === 0) return [];
+  const zone = input.bucketTimezone ? { bucketTimezone: input.bucketTimezone } : {};
 
   const freshSessions = new Set<string>();
   const freshKeys = new Set<string>();
+  const recoveryDays = new Set<string>();
   for (const segment of fresh) {
     for (const message of readSegmentMessages(input.segmentDir, segment)) {
+      if (isRecoveryRow(message)) recoveryDays.add(dayOf(message));
       const id = sessionIdOf(message);
       if (id) freshSessions.add(id);
       freshKeys.add(messageKey(message));
     }
   }
 
-  const sameZone = (session: RetainedSession) => (session.bucketTimezone ?? "") === (input.bucketTimezone ?? "");
-  const carried = prior.retained
-    .filter((session) => !freshSessions.has(session.sessionId))
-    .map((session) => {
-      if (sameZone(session)) return session;
+  const carried: RetainedSession[] = [];
+  for (const session of prior.retained) {
+    if (freshSessions.has(session.sessionId)) continue;
+    const sameZone = (session.bucketTimezone ?? "") === (input.bucketTimezone ?? "");
+    if (fresh.length === 0 && sameZone) {
+      carried.push(session);
+      continue;
+    }
+    const messages = readSegmentIfWhole(input.segmentDir, session);
+    if (!messages) continue;
+    const kept = messages.filter((message) => !freshKeys.has(messageKey(message)) && !recoveryDays.has(dayOf(message)));
+    if (kept.length === 0) continue;
+    if (kept.length === messages.length) {
       const { bucketTimezone: _previousZone, ...rest } = session;
-      return {
-        ...rest,
-        ...(input.bucketTimezone ? { bucketTimezone: input.bucketTimezone } : {}),
-        hourly: hourlyEntriesFromNativeMessages(readSegmentMessages(input.segmentDir, session), input.bucketTimezone),
-      };
-    });
+      carried.push(sameZone ? session : { ...rest, ...zone, hourly: hourlyEntriesFromNativeMessages(messages, input.bucketTimezone) });
+      continue;
+    }
+    const { session: trimmed, body } = retainedSessionFromMessages(session.sessionId, kept, { tool: input.tool, now: session.retainedAt, ...zone });
+    writeRetainedSegment(input.segmentDir, trimmed, body);
+    carried.push(trimmed);
+  }
   const known = new Set(carried.map((session) => session.sessionId));
 
   // Messages of the prior export that the new one no longer holds, per session.
   const lost = new Map<string, Message[]>();
   for (const segment of dropped) {
-    for (const message of readSegmentMessages(input.segmentDir, segment)) {
+    const messages = readSegmentIfWhole(input.segmentDir, segment);
+    for (const message of messages ?? []) {
+      if (isRecoveryRow(message)) recoveryDays.add(dayOf(message));
       const id = sessionIdOf(message);
       if (!id || freshSessions.has(id) || known.has(id) || freshKeys.has(messageKey(message))) continue;
       const list = lost.get(id);
@@ -391,28 +461,30 @@ export function retainedSessionsForExport(input: RetentionInput): RetainedSessio
     }
   }
   if (lost.size > 0 && input.transcriptRoots) {
-    for (const id of sessionsOnDisk(input.transcriptRoots, new Set(lost.keys()))) lost.delete(id);
+    for (const id of sessionsOnDisk(input.transcriptRoots, new Set(lost.keys()), input.tool)) lost.delete(id);
   } else {
     lost.clear();
   }
   if (lost.size > 0) {
-    // A session with a message in a segment both exports share is still exported.
+    // A session with a message in a segment both exports share is still
+    // exported; recovery rows there floor their day as well.
     for (const segment of input.next) {
       if (!priorShas.has(segment.sha256)) continue;
       for (const message of readSegmentMessages(input.segmentDir, segment)) {
+        if (isRecoveryRow(message)) recoveryDays.add(dayOf(message));
         const id = sessionIdOf(message);
         if (id) lost.delete(id);
       }
-      if (lost.size === 0) break;
     }
   }
-  const added = [...lost].map(([sessionId, messages]) => {
-    const { session, body } = retainedSessionFromMessages(sessionId, messages, {
-      tool: input.tool, now: input.now, ...(input.bucketTimezone ? { bucketTimezone: input.bucketTimezone } : {}),
-    });
+  const added: RetainedSession[] = [];
+  for (const [sessionId, messages] of lost) {
+    const kept = messages.filter((message) => !recoveryDays.has(dayOf(message)));
+    if (kept.length === 0) continue;
+    const { session, body } = retainedSessionFromMessages(sessionId, kept, { tool: input.tool, now: input.now, ...zone });
     writeRetainedSegment(input.segmentDir, session, body);
-    return session;
-  });
+    added.push(session);
+  }
   return sortedSessions([...carried, ...added]);
 }
 
@@ -480,8 +552,9 @@ export interface BatchImportPlan {
 /** Which sessions of an older batch (`backup`) the current batch lacks. A
  * backup session is added when no message of the current batch (export or
  * retained) belongs to it, and it has no transcript under `transcriptRoots`
- * (when given); its messages whose dedup key the current batch holds are
- * left out. Reads every segment of both batches. */
+ * (when given); its messages whose dedup key the current batch holds, and
+ * those on a day either batch has a recovery row for, are left out. Reads
+ * every segment of both batches. */
 export function planBatchImport(input: {
   backupSegmentDir: string;
   backupSegments: readonly SegmentRef[];
@@ -494,8 +567,10 @@ export function planBatchImport(input: {
 }): BatchImportPlan {
   const sessions = new Set<string>();
   const keys = new Set<string>();
+  const recoveryDays = new Set<string>();
   for (const segment of input.currentSegments) {
     for (const message of readSegmentMessages(input.currentSegmentDir, segment)) {
+      if (isRecoveryRow(message)) recoveryDays.add(dayOf(message));
       const id = sessionIdOf(message);
       if (id) sessions.add(id);
       keys.add(messageKey(message));
@@ -505,6 +580,7 @@ export function planBatchImport(input: {
   const present = new Set<string>();
   for (const segment of input.backupSegments) {
     for (const message of readSegmentMessages(input.backupSegmentDir, segment)) {
+      if (isRecoveryRow(message)) recoveryDays.add(dayOf(message));
       const id = sessionIdOf(message);
       if (!id) continue;
       if (sessions.has(id)) { present.add(id); continue; }
@@ -516,10 +592,15 @@ export function planBatchImport(input: {
   }
   let onDisk = 0;
   if (input.transcriptRoots && missing.size > 0) {
-    for (const id of sessionsOnDisk(input.transcriptRoots, new Set(missing.keys()))) {
+    for (const id of sessionsOnDisk(input.transcriptRoots, new Set(missing.keys()), input.tool)) {
       missing.delete(id);
       onDisk++;
     }
+  }
+  for (const [id, messages] of missing) {
+    const kept = messages.filter((message) => !recoveryDays.has(dayOf(message)));
+    if (kept.length === 0) missing.delete(id);
+    else missing.set(id, kept);
   }
   const planned = [...missing].map(([sessionId, messages]) => retainedSessionFromMessages(sessionId, messages, {
     tool: input.tool, now: input.now, ...(input.bucketTimezone ? { bucketTimezone: input.bucketTimezone } : {}),
