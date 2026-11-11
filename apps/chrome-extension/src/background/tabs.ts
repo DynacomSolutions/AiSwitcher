@@ -258,6 +258,28 @@ export class TabManager {
     });
   }
 
+  /**
+   * A page in a session tab opened `tab` (target=_blank link, window.open): it belongs to the same session.
+   * In a user-granted group it stays there and outlives the session; otherwise it joins the session's own group
+   * and is closed with it. Returns the session id, or undefined when the opener is not a session tab.
+   */
+  async claimOpened(tab: TabInfo, opener: TabInfo): Promise<string | undefined> {
+    const owner = this.ownerOf(opener.id);
+    const s = owner === undefined ? undefined : this.sessions.get(owner);
+    if (owner === undefined || !s) return undefined;
+    if (opener.groupId !== -1 && this.grants.get(opener.groupId) === owner) {
+      await this.serial(owner, async () => {
+        s.tabIds.add(tab.id);
+        s.adopted.add(tab.id);
+        if (tab.groupId !== opener.groupId) await this.api.tabs.group([tab.id], opener.groupId).catch(() => {});
+        this.persist();
+      });
+      return owner;
+    }
+    await this.addToSession({ id: owner, identity: s.identity, label: s.label }, tab.id, false);
+    return owner;
+  }
+
   async create(ref: SessionRef, url?: string): Promise<TabInfo> {
     // Inactive: an agent must never pull the owner away from the tab they are using.
     const tab = await this.api.tabs.create(url);
