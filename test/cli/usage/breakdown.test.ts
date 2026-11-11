@@ -11,7 +11,7 @@ import {
   type BreakdownDeps,
   type BreakdownResult,
 } from "../../../src/cli/usage/breakdown.ts";
-import { inferMissingRepos, parseRemoteUrl, resolveProjectFromFs, type BreakdownProject } from "../../../src/cli/usage/breakdown.ts";
+import { inferMissingRepos, orgFolderOwner, parseRemoteUrl, resolveProjectFromFs, type BreakdownProject } from "../../../src/cli/usage/breakdown.ts";
 import { breakdownProjectionCachePath } from "../../../src/cli/usage/breakdown-projection-cache.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
@@ -666,6 +666,33 @@ describe("project / repo / org attribution", () => {
     writeFileSync(join(mirror, "HEAD"), "ref: refs/heads/main\n");
     writeFileSync(join(mirror, "config"), '[core]\n\tbare = true\n[remote "origin"]\n\turl = https://example.com/acme/widget.git\n');
     expect(resolveProjectFromFs(mirror)).toEqual({ path: mirror, source: "git", repo: "acme/widget", org: "acme", host: "example.com" });
+  });
+
+  test("resolver: an org folder takes its child repositories' owner", () => {
+    const root = mkdtempSync(join(tmpdir(), "ais-breakdown-org-"));
+    projectionDirs.push(root);
+    const repo = (dir: string, url: string) => {
+      mkdirSync(join(dir, ".git", "objects"), { recursive: true });
+      writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(dir, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    };
+    // A folder named after its children's owner, and a plain subfolder of it.
+    const group = join(root, "AcmeGroup");
+    repo(join(group, "widget"), "git@example.com:acme-group/widget.git");
+    repo(join(group, "fork"), "https://example.com/someone/fork");
+    mkdirSync(join(group, "notes"));
+    const want = { source: "plain", org: "acme-group", host: "example.com" };
+    expect(resolveProjectFromFs(group)).toEqual({ path: group, ...want } as never);
+    expect(resolveProjectFromFs(join(group, "notes"))).toEqual({ path: join(group, "notes"), ...want } as never);
+    // A folder that merely holds repositories, even of one owner, is not an org folder.
+    const projects = join(root, "projects");
+    repo(join(projects, "one"), "https://example.com/beta/one");
+    repo(join(projects, "two"), "https://example.com/beta/two");
+    mkdirSync(join(projects, "scratch"));
+    expect(resolveProjectFromFs(projects)).toEqual({ path: projects, source: "plain" });
+    expect(resolveProjectFromFs(join(projects, "scratch"))).toEqual({ path: join(projects, "scratch"), source: "plain" });
+    // The walk stops at the home directory.
+    expect(orgFolderOwner(join(group, "notes"), group)).toBeUndefined();
   });
 
   test("parseRemoteUrl handles https, scp-like and ssh:// remotes", () => {

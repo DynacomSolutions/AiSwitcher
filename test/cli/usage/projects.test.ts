@@ -181,4 +181,26 @@ describe("missing folders", () => {
     expect(out["-Users-alice-nothing"]).toMatchObject({ name: "nothing" });
     expect(out["-Users-alice-nothing"]!.repo).toBeUndefined();
   });
+
+  test("a gone org folder takes the owner it is named after; a repo match still wins", () => {
+    const root = temp();
+    const remotes: Record<string, { path: string; source: "git"; repo: string; org: string; host: string }> = {
+      "/work/Acme-Group/widget": { path: "/work/Acme-Group/widget", source: "git", repo: "Acme-Group/widget", org: "Acme-Group", host: "example.com" },
+    };
+    const keys = new Map([
+      ["/work/Acme-Group/widget", ""],
+      ["-Users-alice-Projects-acme-group", "acme-group"],
+      ["/old/layout/acme-group", "acme-group"],
+      ["-Users-alice-Projects-acme-group-widget", "widget"],
+      ["-Users-alice-Projects-group", "group"],
+      ["-Users-alice-Projects-AcmeGroup", "AcmeGroup"],
+    ]);
+    const out = resolveWorkspaces(keys, { cachePath: join(root, "cache.json"), resolveProject: (cwd) => remotes[cwd] ?? { path: cwd, source: "missing" } });
+    expect(out["-Users-alice-Projects-acme-group"]).toMatchObject({ org: "Acme-Group", host: "example.com", inferred: true, name: "acme-group" });
+    expect(out["-Users-alice-Projects-acme-group"]!.repo).toBeUndefined();
+    expect(out["/old/layout/acme-group"]).toMatchObject({ org: "Acme-Group", inferred: true });
+    expect(out["-Users-alice-Projects-acme-group-widget"]).toMatchObject({ repo: "Acme-Group/widget", inferred: true });
+    expect(out["-Users-alice-Projects-group"]!.org).toBeUndefined();
+    expect(out["-Users-alice-Projects-AcmeGroup"]).toMatchObject({ org: "Acme-Group", inferred: true });
+  });
 });

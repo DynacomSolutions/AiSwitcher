@@ -199,6 +199,11 @@ export function resolveWorkspaces(keys: Map<string, string>, deps: WorkspaceReso
     if (!entry.repo || entry.inferred) continue;
     known.set(entry.repo, { repo: entry.repo, ...(entry.org ? { org: entry.org } : {}), ...(entry.host ? { host: entry.host } : {}) });
   }
+  const orgs = new Map<string, { org: string; host?: string }>();
+  for (const entry of Object.values(out)) {
+    if (!entry.org || entry.inferred) continue;
+    orgs.set(entry.org.toLowerCase(), { org: entry.org, ...(entry.host ? { host: entry.host } : {}) });
+  }
   const names = [...known.values()].map((remote) => ({ remote, name: remote.repo.slice(remote.repo.lastIndexOf("/") + 1).toLowerCase() })).filter((n) => n.name !== "");
   for (const [key, entry] of Object.entries(out)) {
     const label = keys.get(key) ?? "";
@@ -216,6 +221,24 @@ export function resolveWorkspaces(keys: Map<string, string>, deps: WorkspaceReso
       if (matches.size === 1) {
         const remote = known.get([...matches][0]!)!;
         out[key] = { ...entry, ...remote, inferred: true, name: remote.repo.slice(remote.repo.lastIndexOf("/") + 1) };
+        continue;
+      }
+    }
+    // A gone org folder (`<org>` of a `<org>/<repo>` layout): its name is an owner seen this run.
+    if (entry.source === "missing" && !entry.repo && !entry.org && orgs.size > 0) {
+      const claudeKey = key.startsWith("-");
+      const subject = claudeKey ? key.toLowerCase() : entry.path.replace(/\/+$/, "").split("/").pop()!.toLowerCase();
+      let hit: { org: string; host?: string } | undefined;
+      let longest = 0;
+      for (const [lower, owner] of orgs) {
+        const compact = lower.replace(/[^a-z0-9]/g, "");
+        const match = claudeKey
+          ? subject.endsWith(`-${encodeClaudeProjectKey(lower)}`) || subject.slice(subject.lastIndexOf("-") + 1) === compact
+          : subject.replace(/[^a-z0-9]/g, "") === compact;
+        if (match && lower.length > longest) { longest = lower.length; hit = owner; }
+      }
+      if (hit) {
+        out[key] = { ...entry, org: hit.org, ...(hit.host ? { host: hit.host } : {}), inferred: true, name: label || entry.path.replace(/\/+$/, "").split("/").pop() || entry.path };
         continue;
       }
     }

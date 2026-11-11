@@ -1,6 +1,7 @@
 import { isRetired } from "../../identities/retired.ts";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import "../../identities/model-price-source.ts";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
@@ -326,7 +327,53 @@ export function resolveProjectFromFs(cwd: string): ResolvedProject {
     if (parent === dir) break;
     dir = parent;
   }
-  return { path: cwd, source: "plain" };
+  const org = orgFolderOwner(cwd);
+  return { path: cwd, source: "plain", ...(org ? { org: org.org, ...(org.host ? { host: org.host } : {}) } : {}) };
+}
+
+/** Child folders read per directory when looking for an org folder. */
+const ORG_FOLDER_SCAN_LIMIT = 500;
+/** Parents of the session cwd checked for an org folder (`<org>/<sub>/<dir>`). */
+const ORG_FOLDER_MAX_ASCENT = 2;
+
+/** The owner of an org folder: a directory (not itself in a repository)
+ * named after the owner of one of its child repositories, such as a local
+ * `<org>/<repo>` layout where sessions are started in `<org>`. Names compare
+ * without case or punctuation. A folder merely holding repositories (one
+ * owner or several) is not an org folder. The session cwd and up to two
+ * parents are checked, nearest first, never the home directory or the
+ * filesystem root. */
+export function orgFolderOwner(cwd: string, home: string = homedir()): { org: string; host?: string } | undefined {
+  for (let dir = cwd, level = 0; level <= ORG_FOLDER_MAX_ASCENT; dir = dirname(dir), level++) {
+    if (dir === home || dirname(dir) === dir) return undefined;
+    const owner = childRepoOwner(dir);
+    if (owner) return owner;
+  }
+  return undefined;
+}
+
+function childRepoOwner(dir: string): { org: string; host?: string } | undefined {
+  let children: string[];
+  try {
+    children = readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith(".")).map((e) => e.name).slice(0, ORG_FOLDER_SCAN_LIMIT);
+  } catch {
+    return undefined;
+  }
+  const owners = new Map<string, { org: string; host?: string }>();
+  for (const name of children) {
+    const child = join(dir, name);
+    const dotGit = join(child, ".git");
+    const gitDir = existsSync(dotGit) ? gitDirOf(dotGit, child) : isGitDir(child) && isFile(join(child, "config")) ? child : undefined;
+    if (!gitDir) continue;
+    const project = gitProject(child, gitDir);
+    if (project.org) owners.set(ownerKey(project.org), { org: project.org, ...(project.host ? { host: project.host } : {}) });
+  }
+  return owners.get(ownerKey(basename(dir)));
+}
+
+/** Owner names compared without case or punctuation: `AcmeGroup` = `acme-group`. */
+function ownerKey(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function memoisedProjectResolver(base: (cwd: string) => ResolvedProject): (cwd: string) => ResolvedProject {
