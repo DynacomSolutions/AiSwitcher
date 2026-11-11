@@ -185,6 +185,48 @@ describe("AuthRefreshScheduler", () => {
   });
 });
 
+describe("reconcileStale prunes records the registry no longer backs", () => {
+  async function seeded(registry: () => Promise<Identity[]>) {
+    const stateHome = await tempStateHome();
+    let list = registry;
+    const scheduler = new AuthRefreshScheduler(0, { ali: async () => undefined }, () => list(), stateHome);
+    await scheduler.refreshNow("ali", "personal").catch(() => undefined);
+    await scheduler.refreshNow("ali", "work").catch(() => undefined);
+    return { scheduler, stateHome, swap: (next: () => Promise<Identity[]>) => { list = next; } };
+  }
+  const both = async (): Promise<Identity[]> => [
+    { name: "personal", label: "personal", configDir: "/tmp/ali-personal" },
+    { name: "work", label: "work", configDir: "/tmp/ali-work" },
+  ];
+
+  test("a deleted identity drops from status and from the state file", async () => {
+    const { scheduler, stateHome, swap } = await seeded(both);
+    expect(scheduler.status().map((s) => s.identity)).toEqual(["personal", "work"]);
+    swap(async () => [{ name: "work", label: "work", configDir: "/tmp/ali-work" }]);
+    await scheduler.reconcileStale();
+    expect(scheduler.status().map((s) => s.identity)).toEqual(["work"]);
+    const raw = JSON.parse(await readFile(statePathFor(stateHome), "utf8")) as { entries: { identity: string }[] };
+    expect(raw.entries.map((e) => e.identity)).toEqual(["work"]);
+  });
+
+  test("a retired identity drops from status", async () => {
+    const { scheduler, swap } = await seeded(both);
+    swap(async () => [
+      { name: "personal", label: "personal", configDir: "/tmp/ali-personal", retired: true },
+      { name: "work", label: "work", configDir: "/tmp/ali-work" },
+    ]);
+    await scheduler.reconcileStale();
+    expect(scheduler.status().map((s) => s.identity)).toEqual(["work"]);
+  });
+
+  test("an unreadable registry prunes nothing", async () => {
+    const { scheduler, swap } = await seeded(both);
+    swap(async () => { throw new Error("EACCES"); });
+    await scheduler.reconcileStale();
+    expect(scheduler.status().map((s) => s.identity)).toEqual(["personal", "work"]);
+  });
+});
+
 describe("lastRefreshFailure", () => {
   test("returns undefined when the state file is missing", async () => {
     const dir = await tempStateHome();
