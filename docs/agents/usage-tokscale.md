@@ -272,6 +272,46 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
       ordinary writes) would be caught by the TUI reader's checksum, not by
       the collector; and the registry check cannot see identities whose
       config directory lies outside the tool's identities root.
+  - Recorded usage is never lost (`retained-sessions.ts`, 5.189). Tokscale
+    keeps a deleted transcript's usage only while its cache entry holds
+    retained history, and an entry for a whole transcript usually holds none,
+    so a removed transcript drops out of the next export. On 12 Nov 2026 the
+    copied-in transcripts of one Claude identity went missing from disk, and
+    the next export dropped 60 sessions ($3.1k) from the store. The rules:
+    - When a promoted export of a single-source partition (Claude, Codex,
+      Grok, Kimi; not swap pools, whose rows come from member transcripts)
+      lacks every message of a session the committed batch had, the session
+      id is not a synthetic `local-recovery:daily:` row, and no file or
+      directory under the source's transcript roots (Claude `projects` and
+      `transcripts`, Codex `sessions` and `archived_sessions`, Grok and Kimi
+      `sessions`) has the session id in its name, AIS stores the session's
+      messages as a segment of their own and lists it after the export's
+      segments. Messages the new export holds under another session (same
+      dedup key) are left out. Only segments that differ between the two
+      exports are read; the shared ones only when a session would be added.
+    - The manifest AIS writes then carries `retainedSessions` (per session:
+      segment, report entries, hourly part, bucket timezone),
+      `exportSegmentCount`, `exportMessagesSha256` and `exportHourly`;
+      `hourly` and `messageCount` include the retained sessions and
+      `messagesSha256` names the combination. The snapshot keeps Tokscale's
+      digest, so an `unchanged` answer still works, and that answer keeps the
+      batch with its retained sessions.
+    - The partition's report rows get the retained entries (same provider
+      row, same client and model entry, totals and message counts), the
+      daily figures come from the combined `hourly`, and the TUI reader and
+      `projects.json` read the retained segments like any other.
+    - Every later manifest carries the retained sessions, so collection never
+      removes their segments. A session the export holds again replaces its
+      retained copy; a damaged retained segment is logged and dropped. A
+      read error while retaining fails the promotion (`retention`), so the
+      prior batch stays and the next cycle tries again.
+    - `ais usage import-batch <manifest.json> [--dry-run] [--json]` absorbs
+      an older batch copy (the manifest beside its `segments/`) under the
+      snapshot lock: the sessions the current batch lacks and that have no
+      transcript on disk become retained sessions. Running it again adds
+      nothing.
+    - Not covered: a transcript moved to another identity's directory is
+      counted in both partitions while the old one retains it.
   - Totals stay those of a cold scan: every shortcut is either exact (an
     unchanged file, an append of whole lines, byte-identical messages) or
     falls back to the full read.
