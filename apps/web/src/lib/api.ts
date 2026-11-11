@@ -3,6 +3,7 @@ import type {
   AuthRefreshResponse,
   AuthResponse,
   BreakdownResponse,
+  UsageProjectsResponse,
   CreateIdentityBody,
   FileContentResponse,
   FileRoot,
@@ -169,6 +170,8 @@ export const api = {
       tool,
       days: days !== undefined ? String(days) : undefined,
     })),
+
+  getUsageProjects: () => request<UsageProjectsResponse>("/api/usage/projects"),
 
   getSessions: (cwd?: string) => request<SessionsResponse>(withParams("/api/sessions", { cwd })),
 

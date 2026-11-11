@@ -21,6 +21,7 @@ import { poolStatus } from "../identities/claude-swap-ops.ts";
 import { HttpError } from "./types.ts";
 import { readUsageBreakdownEnvelope, requestUsageBreakdownRefresh } from "../cli/usage/breakdown-snapshot.ts";
 import { collectTargets } from "../cli/usage/run.ts";
+import { readUsageProjects } from "../cli/usage/projects.ts";
 import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
@@ -75,6 +76,8 @@ export interface ConsoleAppDeps extends GuardDeps {
   localModels?: () => Promise<LocalModelsDto>;
   /** Test seam for GET /api/gateway/usage; defaults to the gateway admin API. */
   gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
+  /** Test seam for GET /api/usage/projects; defaults to reading the collector's projects.json. */
+  usageProjects?: () => ReturnType<typeof readUsageProjects>;
   /** Test seam for GET /api/pools/usage. */
   poolsUsage?: () => Promise<PoolsUsageResponse>;
   /** Extension sign-in page config (gateway URLs and admin token); absent answers /browser/authorize with 503. */
@@ -254,6 +257,12 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   app.get("/api/gateway/usage", async (c) => c.json(await (deps.gatewayUsage ?? loadGatewayUsage)(numberQuery(c, "days", 7))));
   // Pool membership and the gateway ledger by identity; the console page sums these with native usage and limits.
   app.get("/api/pools/usage", async (c) => c.json(await (deps.poolsUsage ?? (() => poolsUsage()))()));
+  // Per-project usage from the native store, written by the host collector
+  // (projects.json). Read only: this request never scans anything.
+  app.get("/api/usage/projects", (c) => {
+    const projects = (deps.usageProjects ?? (() => readUsageProjects()))();
+    return c.json(projects ?? { pending: true, rows: [] });
+  });
   // The shared breakdown snapshot is read immediately; this API request only
   // queues a refresh marker. The host collector owns all history scans.
   app.get("/api/usage/breakdown", async (c) => {

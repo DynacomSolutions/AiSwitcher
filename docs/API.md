@@ -55,6 +55,7 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 | `/api/files/*` | on demand |
 | `/api/limits`, `/api/usage`, `/api/spend-guard`, `/api/herdr-bridge` | 60s (server caches 45s) |
 | `/api/usage/breakdown` | 300s (server caches 60s; heavy local JSONL scan) |
+| `/api/usage/projects` | 120s (file read only; the host collector rewrites it each cycle) |
 
 ## Endpoints
 
@@ -472,6 +473,43 @@ example a removed task worktree): such a row takes `repo`/`org` with
 `inferred: true` only when exactly one repo resolved in the same run has
 the folder's name. `unknown` means the session recorded no cwd. Clients group `projects` by `path`, `repo` or `org`. Only claude and
 codex produce rows; other tools return `unavailable` with a reason.
+
+### Usage per project
+
+`GET /api/usage/projects`
+
+Per project, repository and org usage from the native usage store, the same
+message records the Usage page totals come from, so the figures add up to the
+Usage total (minus spend that has no session logs, such as AWS Bedrock billing).
+The host collector builds `<cache>/usage/projects.json` after each refresh cycle
+(one aggregate per partition, cached by its batch SHA-256); this endpoint only
+reads that file and never scans. Before the first cycle it answers
+`{ "pending": true, "rows": [] }`.
+
+```jsonc
+{
+  "generatedAt": "2026-11-12T03:00:00.000Z",
+  "rows": [
+    {
+      "path": "/work/acme/widget", "repo": "acme/widget", "org": "acme",
+      "host": "example.com", "source": "git",   // git | plain | missing | unknown
+      "inferred": true,                          // repo/org inferred for a folder gone from this host
+      "provider": "anthropic", "identity": "work", "tool": "claude",
+      "date": "2026-11-11",                      // local day, as the Usage period filter uses
+      "cost": 1.23, "input": 1000, "output": 200,
+      "cacheRead": 5000, "cacheWrite": 300,      // cacheWrite includes 1-hour cache writes
+      "messages": 12, "lastMs": 1762850000000
+    }
+  ]
+}
+```
+
+One row per workspace, day, provider and identity. Swap pool batches are
+attributed to the member active at each message (the claude-swap ledger), as
+the Usage page does; messages with no known member go to
+`<pool> (unattributed)`. Claude workspace keys (encoded directory names) are
+decoded by walking the host filesystem; a folder that no longer exists keeps
+`source: "missing"`. Clients filter by `provider`, `identity` and `date`.
 
 ### Sessions
 

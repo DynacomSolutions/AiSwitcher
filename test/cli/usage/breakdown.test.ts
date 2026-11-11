@@ -258,6 +258,40 @@ describe("claude breakdown", () => {
     expect(result.categories).toHaveLength(2); // conversation + Read
   });
 
+  test("counts a message once when its usage repeats per content block (5.187)", async () => {
+    const block = (extra: Record<string, unknown>, output: number, tools: string[], id?: string) => JSON.stringify({
+      type: "assistant",
+      timestamp: day(1),
+      requestId: "req_1",
+      message: {
+        ...(id ? { id } : {}),
+        model: "claude-sonnet-5",
+        content: tools.map((name) => ({ type: "tool_use", name })),
+        usage: { input_tokens: 10, output_tokens: output, cache_read_input_tokens: 5, cache_creation_input_tokens: 0 },
+      },
+      ...extra,
+    });
+    const result = await claudeResult({
+      "/synthetic/SYNTHETIC_FIXTURE/config/projects/proj/a.jsonl": {
+        mtimeMs: NOW_MS,
+        lines: [
+          block({}, 50, ["Read"], "msg_1"),
+          block({}, 80, ["Bash"], "msg_1"),
+          block({}, 100, ["Read"], "msg_1"), // last line's usage wins
+          block({}, 40, [], undefined), // no id: counted as before
+          block({}, 40, [], undefined),
+        ],
+      },
+    });
+    const conversation = category(result, "conversation");
+    // msg_1 once (input 10, output 100) plus two id-less lines.
+    expect(conversation.inputTokens).toBe(30);
+    expect(conversation.cacheReadTokens).toBe(15);
+    // Output split across the union of tool names {Read, Bash}, plus the id-less outputs on conversation.
+    expect(category(result, "Read").outputTokens + category(result, "Bash").outputTokens).toBe(100);
+    expect(conversation.outputTokens).toBe(80);
+  });
+
   test("mtime-pruned files are not read at all", async () => {
     const result = await claudeResult({
       "/synthetic/SYNTHETIC_FIXTURE/config/projects/proj/old.jsonl": {
@@ -522,7 +556,7 @@ describe("durable breakdown projections", () => {
     const reads: string[] = [];
     const cachePath = breakdownProjectionCachePath("claude", identity().name, identity().configDir, path, { cacheDir });
     await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
-    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 2, fingerprint: "stable", events: [[null, "bad", "not-a-number"]] }));
+    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 3, fingerprint: "stable", events: [[null, "bad", "not-a-number"]] }));
     const result = await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
     expect(category(result, "conversation").inputTokens).toBe(22);
     expect(reads).toEqual([path, path]);
@@ -615,7 +649,7 @@ describe("project / repo / org attribution", () => {
     const result = await collectIdentityBreakdown("claude", identity(), 30, { ...fakeDeps(files), projectionCacheDir: cacheDir, sourceFingerprint: () => "stable", onSourceFileRead: (p) => reads.push(p) });
     expect(reads).toEqual([path]);
     expect(category(result, "conversation").inputTokens).toBe(22);
-    expect(JSON.parse(readFileSync(cachePath, "utf8")).schemaVersion).toBe(2);
+    expect(JSON.parse(readFileSync(cachePath, "utf8")).schemaVersion).toBe(3);
   });
 
   test("resolver: a stray .git folder is skipped; a bare mirror resolves from its own config", () => {

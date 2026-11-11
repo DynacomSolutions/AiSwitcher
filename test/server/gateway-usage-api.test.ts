@@ -48,3 +48,22 @@ describe("poolsUsage", () => {
     expect(out.gateway.week.error).toBe("admin unreachable");
   });
 });
+
+describe("GET /api/usage/projects", () => {
+  test("serves the collector's rows without scanning and keeps the console guard", async () => {
+    const body = {
+      generatedAt: "2026-11-12T03:00:00.000Z",
+      rows: [{
+        path: "/work/acme/widget", repo: "acme/widget", org: "acme", host: "example.com", source: "git" as const,
+        workspace: "/work/acme/widget", provider: "anthropic", identity: "alice", tool: "claude", date: "2026-11-11",
+        cost: 1, input: 2, output: 3, cacheRead: 4, cacheWrite: 5, messages: 6, lastMs: 7,
+      }],
+    };
+    const app = appWith({ usageProjects: () => body });
+    const res = await app.request("/api/usage/projects", { headers });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(body);
+    expect((await appWith({ usageProjects: () => undefined }).request("/api/usage/projects", { headers })).json()).resolves.toEqual({ pending: true, rows: [] });
+    expect((await appWith({ peerAddress: "203.0.113.9" }).request("/api/usage/projects", { headers })).status).toBe(401);
+  });
+});

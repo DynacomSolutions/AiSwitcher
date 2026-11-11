@@ -681,7 +681,9 @@ function validCodexProjection(events: unknown[]): events is unknown[][] {
 interface ClaudeLine {
   timestamp?: string;
   cwd?: unknown;
+  requestId?: unknown;
   message?: {
+    id?: unknown;
     model?: string;
     content?: unknown;
     usage?: {
@@ -718,6 +720,10 @@ async function collectClaudeBreakdown(
   for (const file of files) {
     const projected = await projectedFileEvents("claude", identity, file, deps, async (path, readLines) => {
       const events: unknown[][] = [];
+      // Claude writes one line per content block of a message, each repeating
+      // the same usage under the same message.id and requestId. Count each
+      // message once: the last line's usage wins and tool names are unioned.
+      const byMessage = new Map<string, number>();
       let sourceError = false;
       try { for await (const line of readLines(path)) {
         if (!line.includes('"usage"')) continue;
@@ -725,6 +731,25 @@ async function collectClaudeBreakdown(
         try { parsed = JSON.parse(line) as ClaudeLine; } catch { continue; }
         const usage = parsed.message?.usage;
         if (!usage) continue;
+        const messageId = typeof parsed.message?.id === "string" && parsed.message.id.length > 0 ? parsed.message.id : undefined;
+        const dedupeKey = messageId === undefined ? undefined : `${messageId}:${typeof parsed.requestId === "string" ? parsed.requestId : ""}`;
+        const names = toolUseNames(parsed.message?.content);
+        const seenAt = dedupeKey === undefined ? undefined : byMessage.get(dedupeKey);
+        if (seenAt !== undefined) {
+          const earlier = events[seenAt]![6] as string[];
+          events[seenAt] = [
+            parseTimestampMs(parsed.timestamp) ?? null,
+            parsed.message?.model ?? "unknown",
+            usage.input_tokens ?? 0,
+            usage.output_tokens ?? 0,
+            usage.cache_read_input_tokens ?? 0,
+            usage.cache_creation_input_tokens ?? 0,
+            [...earlier, ...names.filter((name) => !earlier.includes(name))],
+            typeof parsed.cwd === "string" && parsed.cwd.length > 0 ? parsed.cwd : (events[seenAt]![7] as string | null),
+          ];
+          continue;
+        }
+        if (dedupeKey !== undefined) byMessage.set(dedupeKey, events.length);
         events.push([
           parseTimestampMs(parsed.timestamp) ?? null,
           parsed.message?.model ?? "unknown",
@@ -732,7 +757,7 @@ async function collectClaudeBreakdown(
           usage.output_tokens ?? 0,
           usage.cache_read_input_tokens ?? 0,
           usage.cache_creation_input_tokens ?? 0,
-          toolUseNames(parsed.message?.content),
+          names,
           typeof parsed.cwd === "string" && parsed.cwd.length > 0 ? parsed.cwd : null,
         ]);
       } } catch { sourceError = true; }

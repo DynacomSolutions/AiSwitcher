@@ -11,7 +11,7 @@ export interface BreakdownProjectionCacheDeps {
 }
 
 export interface BreakdownProjectionCache {
-  schemaVersion: 2;
+  schemaVersion: 3;
   path: string;
   fingerprint: string;
   events: BreakdownProjection[];
@@ -45,10 +45,10 @@ export function readBreakdownProjectionCache(
   try {
     const value = JSON.parse(readFileSync(path, "utf8")) as Partial<BreakdownProjectionCache>;
     if (
-      value.schemaVersion !== 2 || typeof value.fingerprint !== "string" ||
+      value.schemaVersion !== 3 || typeof value.fingerprint !== "string" ||
       !Array.isArray(value.events) || !validateEvents(value.events)
     ) return undefined;
-    return { schemaVersion: 2, path, fingerprint: value.fingerprint, events: value.events };
+    return { schemaVersion: 3, path, fingerprint: value.fingerprint, events: value.events };
   } catch {
     return undefined;
   }
@@ -60,7 +60,7 @@ export function writeBreakdownProjectionCache(path: string, fingerprint: string,
   let fd: number | undefined;
   try {
     fd = openSync(temporary, "wx", 0o600);
-    writeFileSync(fd, JSON.stringify({ schemaVersion: 2, fingerprint, events }), "utf8");
+    writeFileSync(fd, JSON.stringify({ schemaVersion: 3, fingerprint, events }), "utf8");
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
