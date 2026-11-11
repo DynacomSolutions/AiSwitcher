@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       selection: ${{ steps.paths.outputs.selection }}
@@ -46,7 +46,7 @@ jobs:
   checks:
     needs: changes
     if: needs.changes.outputs.selection != 'skip'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -73,8 +73,7 @@ jobs:
       - run: bun run scripts/host/check-workflows.ts
       - name: Prepare exchange-driver regression
         run: |
-          sudo apt-get update
-          sudo apt-get install -y expect
+          bash scripts/ci/apt-install.sh expect
           echo "HOST_TEST_SCRATCH=$RUNNER_TEMP/host-exchange" >> "$GITHUB_ENV"
       - name: Tests selected by dependencies
         # The full suite already runs in CI; this job covers the host tests only.
@@ -90,7 +89,7 @@ jobs:
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: macos-arm64
-          - runner: ubuntu-24.04
+          - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: linux-x64
     runs-on: ${{ matrix.runner }}
@@ -119,8 +118,7 @@ jobs:
       - name: Install Linux native build and smoke dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2t64 xvfb exfatprogs
+          bash scripts/ci/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2t64 xvfb exfatprogs
           # The package installs into an sbin directory the test process may not have on PATH.
           mkfs=$(dpkg -L exfatprogs | grep -m1 '/mkfs\.exfat$')
           echo "AIS_HOST_TEST_EXFAT_TOOLS=$(dirname "$mkfs")" >> "$GITHUB_ENV"
@@ -204,7 +202,7 @@ jobs:
   windows-build:
     needs: changes
     if: needs.changes.outputs.selection != 'skip'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
       run:
@@ -232,8 +230,7 @@ jobs:
       # NSIS, the LLVM linker and resource compiler stand in for the MSVC toolchain.
       - name: Install Windows cross-compilation dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y nsis lld llvm clang zip
+          bash scripts/ci/apt-install.sh nsis lld llvm clang zip
       # The Windows SDK and CRT download is large and Microsoft-hosted, so it is cached
       # by cargo-xwin version, also for production builds (it is not a built artefact).
       - name: Cache the Windows SDK download
@@ -338,7 +335,7 @@ jobs:
   gate:
     if: ${{ always() }}
     needs: [changes, checks, native, windows-build, windows-test]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

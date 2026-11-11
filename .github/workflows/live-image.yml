@@ -26,7 +26,7 @@ defaults:
 jobs:
   # Decides whether the image build is needed. Fails open: any doubt builds.
   changes:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       affected: ${{ steps.filter.outputs.affected }}
@@ -61,7 +61,7 @@ jobs:
   build:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -83,8 +83,7 @@ jobs:
       - name: Install image tools
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          bash scripts/ci/apt-install.sh --no-install-recommends \
             xorriso jq expect tcl gdisk dosfstools mtools e2fsprogs exfatprogs \
             syslinux syslinux-common grub-common grub-efi-amd64-bin \
             python3 qemu-system-x86 ovmf nodejs
@@ -301,7 +300,7 @@ jobs:
   gate:
     needs: [changes, build]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Fail when a needed job failed or was cancelled

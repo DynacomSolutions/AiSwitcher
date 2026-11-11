@@ -242,4 +242,4 @@ ETA: 2026-11-12 12:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 180 | Pin Linux CI jobs to ubuntu-24.04: ubuntu-26.04 apt cannot resolve Ubuntu mirrors | in_progress | claude | ci-pin-ubuntu-2404 | | 2026-11-12 12:00 ICT | Since 11 Nov ~13:47Z every apt step on ubuntu-latest (ubuntu-26.04) fails: apt cannot resolve the Ubuntu mirror hosts. main CI red too.<br>Fix: runs-on ubuntu-24.04 in all workflows. |
+| 180 | CI apt installs fall back to another Ubuntu mirror when runners cannot resolve the Ubuntu archive | in_review | claude | ci-pin-ubuntu-2404 | | 2026-11-12 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/493.<br>Since 11 Nov ~13:47Z GitHub runners (24.04 and 26.04) cannot resolve the Ubuntu archive hosts; other hosts resolve. main CI red.<br>scripts/ci/apt-install.sh: default mirrors first, kernel.org mirror on failed fetch. |

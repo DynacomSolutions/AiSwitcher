@@ -41,7 +41,7 @@ describe("host workflow policy", () => {
   });
   test("only the Windows test job uses a Windows runner", () => {
     const workflow = read("host-app");
-    expect(workflow.jobs["windows-build"]!["runs-on"]).toBe("ubuntu-24.04");
+    expect(workflow.jobs["windows-build"]!["runs-on"]).toBe("ubuntu-latest");
     expect(workflow.jobs["windows-test"]!["runs-on"]).toBe("windows-latest");
     workflow.jobs["windows-build"]!["runs-on"] = "windows-latest";
     expect(checkWorkflow(workflow, false).length).toBeGreaterThan(0);

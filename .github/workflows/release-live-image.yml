@@ -14,7 +14,7 @@ defaults:
 
 jobs:
   signing:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
@@ -36,7 +36,7 @@ jobs:
   publish:
     needs: [image, signing]
     if: ${{ needs.signing.outputs.enabled == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
@@ -59,8 +59,7 @@ jobs:
       - name: Install minisign
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign
+          bash scripts/ci/apt-install.sh --no-install-recommends minisign
 
       - name: Prepare checksums and optional signature
         env:

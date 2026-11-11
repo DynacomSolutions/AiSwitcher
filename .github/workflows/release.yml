@@ -17,7 +17,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         target:
@@ -110,8 +110,8 @@ jobs:
         target:
           - { name: darwin-arm64, triple: aarch64-apple-darwin, runner: macos-latest, builder: cargo }
           - { name: darwin-x64, triple: x86_64-apple-darwin, runner: macos-latest, builder: cargo }
-          - { name: linux-x64, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, builder: cargo }
-          - { name: linux-arm64, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04, builder: cross }
+          - { name: linux-x64, triple: x86_64-unknown-linux-gnu, runner: ubuntu-latest, builder: cargo }
+          - { name: linux-arm64, triple: aarch64-unknown-linux-gnu, runner: ubuntu-latest, builder: cross }
     steps:
       - uses: actions/checkout@v4
 
@@ -144,7 +144,7 @@ jobs:
   build-extension:
     # AIS Browser Chrome extension (apps/chrome-extension): one platform-independent
     # zip with manifest.json at the zip root, fetched by `ais browser extension update`.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -172,7 +172,7 @@ jobs:
 
   release:
     needs: [build, build-tui, build-extension]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
