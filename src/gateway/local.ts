@@ -10,6 +10,7 @@ import { GatewayCredentialError, loginCommand, NotRefreshableError, RefreshCoold
 import { providerError } from "./errors.ts";
 import { enableMemberStore } from "../identities/gateway-members.ts";
 import { LOCAL_GATEWAY_ROUTES } from "./local-routes.ts";
+import { ensureLocalTls } from "./local-tls.ts";
 import { adapterFor } from "./providers/index.ts";
 import type { ApiStyle, GatewayProvider } from "./types.ts";
 
@@ -50,6 +51,8 @@ export interface LocalGatewayDeps {
   instance?: string;
   /** Host header values accepted (host:port); anything else is refused with 403. */
   allowedHosts(): string[];
+  /** The HTTPS listener's port, when it runs (reported by the status endpoint). */
+  tlsPort?(): number | undefined;
 }
 
 export interface LocalGatewayStatus {
@@ -60,6 +63,8 @@ export interface LocalGatewayStatus {
   /** Epoch ms when the next remote probe is allowed; only set in direct mode. */
   probeAtMs?: number;
   remote: string;
+  /** Port of the loopback HTTPS listener (codex needs an HTTPS ChatGPT backend); absent when it is not running. */
+  tlsPort?: number;
 }
 
 export interface LocalGateway {
@@ -132,7 +137,7 @@ export function createLocalGateway(deps: LocalGatewayDeps): LocalGateway {
     setMode("remote", "remote answered");
   };
 
-  const status = (): LocalGatewayStatus => ({ ...(deps.instance ? { instance: deps.instance } : {}), mode, sinceMs: since, ...(mode === "direct" ? { probeAtMs: probeAt } : {}), remote: remoteBase });
+  const status = (): LocalGatewayStatus => ({ ...(deps.instance ? { instance: deps.instance } : {}), mode, sinceMs: since, ...(mode === "direct" ? { probeAtMs: probeAt } : {}), remote: remoteBase, ...(deps.tlsPort?.() ? { tlsPort: deps.tlsPort() as number } : {}) });
 
   /** The remote answer, or a RemoteFailure for a pre-byte failure (the response rides along for pass-through). */
   async function tryRemote(req: Request, url: URL, app: string, rest: string, body: Body, signal: AbortSignal): Promise<Response> {
@@ -435,10 +440,15 @@ export interface StartLocalOptions {
   bindRetryMs?: number;
   /** Test hook: accept a loopback remote (the real proxy refuses one). */
   allowLoopbackRemote?: boolean;
+  /**
+   * Also serve the same handler over HTTPS on 127.0.0.1:<port> (0 = ephemeral), with the leaf from the AIS local CA
+   * (generated on first start). Off when absent. Both listeners share the lifecycle: same bind retry, same drain.
+   */
+  tls?: { port: number; dir?: string };
 }
 
 /** Starts the loopback-only listener. It never binds anything but 127.0.0.1. */
-export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{ host: string; port: number; gateway: LocalGateway; stop(): void; drain(): Promise<void> }> {
+export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{ host: string; port: number; tlsPort?: number; gateway: LocalGateway; stop(): void; drain(): Promise<void> }> {
   enableMemberStore();
   const { CredentialCache } = await import("./credentials.ts");
   const { appTokenKey, readSecretsKey } = await import("../cli/gateway/secrets-file.ts");
@@ -453,6 +463,7 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     return value;
   });
   let boundPort = 0;
+  let boundTlsPort = 0;
   const log = opts.log ?? ((line: string) => console.info(line));
   let remoteBase = opts.remoteBase ?? "";
   const bindPort = opts.port ?? LOCAL_GATEWAY_DEFAULT_PORT;
@@ -465,7 +476,8 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     remoteBase,
     clientToken,
     ...((opts.instance ?? process.env.AIS_GATEWAY_LOCAL_INSTANCE) ? { instance: (opts.instance ?? process.env.AIS_GATEWAY_LOCAL_INSTANCE) as string } : {}),
-    allowedHosts: () => [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`],
+    allowedHosts: () => [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, ...(boundTlsPort ? [`127.0.0.1:${boundTlsPort}`, `localhost:${boundTlsPort}`] : [])],
+    tlsPort: () => boundTlsPort || undefined,
     fetch: opts.fetch ?? fetch,
     now,
     creds: opts.creds ?? new CredentialCache(),
@@ -474,34 +486,54 @@ export async function startLocalGateway(opts: StartLocalOptions = {}): Promise<{
     ...(opts.idleMs !== undefined ? { idleMs: opts.idleMs } : {}),
     ...(opts.breakerMs !== undefined ? { breakerMs: opts.breakerMs } : {}),
   });
-  const serve = (): ReturnType<typeof Bun.serve> =>
+  const serve = (port: number, tls?: { cert: string; key: string }): ReturnType<typeof Bun.serve> =>
     Bun.serve({
       hostname: "127.0.0.1",
-      port: bindPort,
+      port,
       // Two instances (old draining, new serving) share the port during a restart, so it is never refused.
       reusePort: true,
       idleTimeout: 0,
+      ...(tls ? { tls } : {}),
       fetch: (req) => gateway.handle(req).catch(() => providerError("openai", 500, "gateway error")),
     });
-  let server: ReturnType<typeof Bun.serve>;
   const deadline = Date.now() + (opts.bindRetryMs ?? 0);
-  for (;;) {
+  const bind = async (port: number, tls?: { cert: string; key: string }): Promise<ReturnType<typeof Bun.serve>> => {
+    for (;;) {
+      try {
+        return serve(port, tls);
+      } catch (err) {
+        if ((err as { code?: unknown }).code !== "EADDRINUSE" || Date.now() >= deadline) throw err;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+  };
+  // HTTPS first and plain HTTP last: whoever waits for the HTTP port (the unit's ExecStartPost, the slot handover) finds both up.
+  let tlsServer: ReturnType<typeof Bun.serve> | undefined;
+  if (opts.tls) {
     try {
-      server = serve();
-      break;
+      const material = await ensureLocalTls(opts.tls.dir !== undefined ? { dir: opts.tls.dir } : {});
+      tlsServer = await bind(opts.tls.port, { cert: material.cert, key: material.key });
+      boundTlsPort = tlsServer.port as number;
     } catch (err) {
-      if ((err as { code?: unknown }).code !== "EADDRINUSE" || Date.now() >= deadline) throw err;
-      await new Promise((r) => setTimeout(r, 200));
+      // Claude and the others use plain HTTP: a TLS problem (no openssl, port taken) must not take them down.
+      log(`gateway-local: warning: HTTPS listener not started (${err instanceof Error ? err.message : String(err)}); plain HTTP only`);
     }
   }
+  const server = await bind(bindPort);
   boundPort = server.port as number;
   return {
     host: server.hostname as string,
     port: server.port as number,
+    ...(tlsServer ? { tlsPort: boundTlsPort } : {}),
     gateway,
-    stop: () => void server.stop(true),
+    stop: () => {
+      void tlsServer?.stop(true);
+      void server.stop(true);
+    },
     // Graceful: no new connections, in-flight requests (streams) run to completion; resolves when the last one ends.
-    drain: () => server.stop(false),
+    drain: async () => {
+      await Promise.all([tlsServer?.stop(false), server.stop(false)]);
+    },
   };
 }
 

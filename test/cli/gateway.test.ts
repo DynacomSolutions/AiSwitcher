@@ -304,7 +304,7 @@ describe("codex homes", () => {
     await run(`gateway codex-home ${home}`);
     const auth = JSON.parse(readFileSync(join(home, "auth.json"), "utf8"));
     expect(auth.tokens).toMatchObject({ access_token: "aisgw_AGENTS_SYNTHETIC_FIXTURE", account_id: "ais-agents-codex" });
-    expect(readFileSync(join(home, "config.toml"), "utf8")).toContain('chatgpt_base_url = "http://127.0.0.1:47140/codex/backend-api"');
+    expect(readFileSync(join(home, "config.toml"), "utf8")).toContain('chatgpt_base_url = "https://localhost:47141/codex/backend-api"');
     expect(JSON.parse(readFileSync(join(dir, "codex-homes.json"), "utf8"))).toEqual([{ dir: home, app: "agents-codex" }]);
     await run(`gateway codex-home ${home} --check`);
     expect(out.join("\n")).not.toContain("AGENTS_SYNTHETIC");

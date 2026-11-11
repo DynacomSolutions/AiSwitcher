@@ -262,4 +262,5 @@ Keep new codex releases working against the AIS gateway placeholder login.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 182 | Gateway answers codex 0.167 workspace routing discovery (`wham/accounts/check`) | in_progress | claude | codex-accounts-check | | 2026-11-12 03:30 ICT | Every T3 Codex instance fails: `account/read` returns "selected workspace missing from routing discovery".<br>Gateway forwards accounts/check to ChatGPT; real workspace ids never match the placeholder id `ais-<app>`.<br>Fix: serve one synthetic workspace with id `ais-<app>`. |
+| 182 | Gateway answers codex 0.167 workspace routing discovery (`wham/accounts/check`) | done | claude | codex-accounts-check | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/498 (f1749d5); live on dev/ais-gateway.<br>codex 0.167 `account/read` now passes on all three T3 gateway Codex instances. |
+| 185 | Local gateway serves HTTPS for codex 0.167 (pool identity) | in_progress | claude | codex-local-https | 182 | 2026-11-12 04:30 ICT | codex 0.167 refuses a non-HTTPS workspace backend, even `http://localhost`.<br>Pool (Codex) uses the local gateway `http://127.0.0.1:47140`.<br>Fix: HTTPS listener with a local AIS CA; codex launcher passes the CA bundle. |

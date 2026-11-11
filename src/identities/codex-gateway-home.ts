@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { aisHome } from "../shared/ais-home.ts";
 import { LOCAL_GATEWAY_ROUTES } from "../gateway/local-routes.ts";
+import { LOCAL_GATEWAY_HTTP_PORT, localGatewayTlsPort, localTlsBundlePath } from "../gateway/local-tls.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
 
 /**
@@ -102,6 +103,101 @@ export function transformCodexGatewayConfig(configText: string, base: string, ap
   return `chatgpt_base_url = ${JSON.stringify(`${base}/${route}/backend-api`)}\n${text}`;
 }
 
+const defaultHttpPort = (): number => Number(process.env.AIS_GATEWAY_LOCAL_PORT) || LOCAL_GATEWAY_HTTP_PORT;
+
+/**
+ * Codex 0.167 refuses a non-HTTPS ChatGPT backend, so a home aimed at the LOCAL gateway (plain HTTP on loopback) goes to
+ * its HTTPS listener (`https://localhost:<tlsPort>`) instead. Rewrites the quoted `http://127.0.0.1|localhost:<httpPort>/codex`
+ * URLs (chatgpt_base_url and the provider base_url) unconditionally; remote gateways are untouched.
+ */
+export function rewriteLocalGatewayUrls(configText: string, httpPort: number = defaultHttpPort(), tlsPort: number = localGatewayTlsPort(httpPort)): string {
+  const re = new RegExp(`(["'])http://(?:127\\.0\\.0\\.1|localhost):${httpPort}(/codex(?:/backend-api)?/?)(?=\\1)`, "g");
+  return configText.replace(re, (_m, q: string, path: string) => `${q}https://localhost:${tlsPort}${path}`);
+}
+
+/**
+ * Automatic migration (launch, gateway start): only a placeholder-login home, whose top-level `chatgpt_base_url` is the local
+ * plain-HTTP gateway, moves to HTTPS (both that URL and the provider base_url). A route-all API-key home (provider base_url
+ * only) stays on plain HTTP: it never calls account/read, and a launch outside the wrapper would not trust the CA.
+ */
+export function migrateLocalGatewayConfigText(configText: string, httpPort: number = defaultHttpPort(), tlsPort: number = localGatewayTlsPort(httpPort)): string {
+  let chatgpt: unknown;
+  try {
+    chatgpt = (parseToml(configText) as { chatgpt_base_url?: unknown }).chatgpt_base_url;
+  } catch {
+    return configText;
+  }
+  if (typeof chatgpt !== "string" || !new RegExp(`^http://(?:127\\.0\\.0\\.1|localhost):${httpPort}/codex/backend-api/?$`).test(chatgpt)) return configText;
+  return rewriteLocalGatewayUrls(configText, httpPort, tlsPort);
+}
+
+/** True when the config's provider base_url or chatgpt_base_url is the local gateway's HTTPS listener (so codex needs CODEX_CA_CERTIFICATE). */
+export function usesLocalGatewayTls(configText: string, tlsPort: number = localGatewayTlsPort()): boolean {
+  let parsed: { chatgpt_base_url?: unknown; model_providers?: Record<string, { base_url?: unknown }> };
+  try {
+    parsed = parseToml(configText) as typeof parsed;
+  } catch {
+    return false;
+  }
+  const urls = [parsed.chatgpt_base_url, parsed.model_providers?.[PROVIDER]?.base_url];
+  return urls.some((u) => {
+    if (typeof u !== "string") return false;
+    try {
+      const url = new URL(u);
+      return url.protocol === "https:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1") && Number(url.port) === tlsPort;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * The environment a codex launch needs for `configDir`: CODEX_CA_CERTIFICATE (system roots + the AIS local CA) when the home
+ * points at the local HTTPS gateway, unless the caller already set one. A home still on the plain-HTTP local URL is moved
+ * to HTTPS first, but only once the gateway has produced its CA bundle (an older gateway has no HTTPS listener).
+ */
+export async function codexLocalGatewayEnv(configDir: string, inherited: NodeJS.ProcessEnv = process.env, bundlePath: string = localTlsBundlePath()): Promise<Record<string, string>> {
+  if (inherited.CODEX_CA_CERTIFICATE) return {};
+  const path = join(configDir, "config.toml");
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    return {};
+  }
+  const bundleExists = await stat(bundlePath).then(() => true, () => false);
+  if (!bundleExists) return {};
+  const migrated = migrateLocalGatewayConfigText(text);
+  if (migrated !== text) {
+    try {
+      const mode = (await stat(path)).mode & 0o777;
+      await writeFileAtomic(path, migrated);
+      await chmod(path, mode);
+      text = migrated;
+    } catch {
+      return {};
+    }
+  }
+  return usesLocalGatewayTls(text) ? { CODEX_CA_CERTIFICATE: bundlePath } : {};
+}
+
+/** Moves every registered gateway home from the local plain-HTTP URL to the HTTPS listener. Returns the migrated folders. */
+export async function migrateRegisteredLocalCodexHomes(httpPort?: number, tlsPort?: number, registryPath = codexGatewayHomesPath()): Promise<string[]> {
+  const done: string[] = [];
+  for (const h of await loadCodexGatewayHomes(registryPath)) {
+    const path = join(h.dir, "config.toml");
+    const text = await readFile(path, "utf8").catch(() => undefined);
+    if (text === undefined) continue;
+    const next = migrateLocalGatewayConfigText(text, httpPort, tlsPort);
+    if (next === text) continue;
+    const mode = (await stat(path)).mode & 0o777;
+    await writeFileAtomic(path, next);
+    await chmod(path, mode);
+    done.push(h.dir);
+  }
+  return done;
+}
+
 export interface ConfiguredHome {
   dir: string;
   app: string;
@@ -140,10 +236,15 @@ export async function readCodexGatewayHomeApp(dir: string): Promise<{ base: stri
 
 /** Writes auth.json (0600) and rewrites config.toml (mode kept). Returns the app. Never logs the token. */
 export async function configureCodexGatewayHome(dir: string, token: string): Promise<{ app: string }> {
-  const { base, app, route, text } = await readCodexGatewayHomeApp(dir);
+  const read = await readCodexGatewayHomeApp(dir);
+  const { app } = read;
+  const text = read.text;
+  // A local plain-HTTP target is written as the HTTPS listener; the placeholder-login shape stays the same.
+  const localText = rewriteLocalGatewayUrls(text);
+  const { base, route } = localText === text ? read : parseGatewayProvider(localText);
   await mkdir(dir, { recursive: true });
   await writeFileAtomic(join(dir, "auth.json"), buildCodexGatewayAuth(app, token));
-  const next = transformCodexGatewayConfig(text, base, app, route);
+  const next = transformCodexGatewayConfig(localText, base, app, route);
   if (next !== text) {
     const path = join(dir, "config.toml");
     const mode = (await stat(path)).mode & 0o777;

@@ -3,6 +3,7 @@ import { CliUsageError } from "../errors.ts";
 import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
 import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
+import { localGatewayTlsPort } from "../../gateway/local-tls.ts";
 import { installDrainHandlers, LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
 import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_CONNECT_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
 
@@ -65,7 +66,7 @@ async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): P
   if (args[0] === "status") {
     const { fetchLocalStatus } = await import("./local-service.ts");
     const st = await fetchLocalStatus(port);
-    deps.out(st ? `gateway local: ${st.mode} mode since ${new Date(st.sinceMs).toISOString()} (remote ${st.remote})` : `gateway local: not running on 127.0.0.1:${port}`);
+    deps.out(st ? `gateway local: ${st.mode} mode since ${new Date(st.sinceMs).toISOString()} (remote ${st.remote}${st.tlsPort ? `, https port ${st.tlsPort}` : ""})` : `gateway local: not running on 127.0.0.1:${port}`);
     return;
   }
   if (args.length > 0) throw new CliUsageError("Usage: ais gateway local [install|status]");
@@ -75,8 +76,13 @@ async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): P
     deps.out("gateway local: ok");
     return;
   }
-  const running = await startLocalGateway({ port, remoteBase, bindRetryMs: 30_000 });
-  console.info(`gateway local: listening on 127.0.0.1:${running.port}`);
+  const running = await startLocalGateway({ port, remoteBase, bindRetryMs: 30_000, tls: { port: localGatewayTlsPort(port) } });
+  console.info(`gateway local: listening on 127.0.0.1:${running.port}${running.tlsPort ? ` (https ${running.tlsPort})` : ""}`);
+  if (running.tlsPort) {
+    // Codex homes written for the plain-HTTP gateway move to the HTTPS one (codex refuses an http ChatGPT backend).
+    const { migrateRegisteredLocalCodexHomes } = await import("../../identities/codex-gateway-home.ts");
+    await migrateRegisteredLocalCodexHomes(port, running.tlsPort).catch((e) => console.info(`gateway local: codex home migration skipped (${e instanceof Error ? e.message : String(e)})`));
+  }
   installDrainHandlers(running);
   await new Promise<void>(() => {});
 }
