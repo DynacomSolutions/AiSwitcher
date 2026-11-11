@@ -6,6 +6,7 @@ import { Executor } from "./executor.ts";
 import { clearToken, KEYS, loadSettings } from "./pairing.ts";
 import { State } from "./state.ts";
 import { colorForIdentity, TabManager } from "./tabs.ts";
+import { PopupGuard } from "./popups.ts";
 import { handleMessage } from "./messages.ts";
 import { hexForIdentity, OverlayUi } from "./ui.ts";
 import type { PanelStatus } from "../shared/panel.ts";
@@ -15,6 +16,8 @@ const DISCONNECTED_KEY = "disconnected";
 const api = realChromeApi();
 const state = new State(api.storage);
 const tabs = new TabManager(api);
+// Registered at top level so Chrome wakes the worker for tab events.
+const popups = new PopupGuard(api, tabs);
 const ui = new OverlayUi();
 const executor = new Executor({ api, tabs, state, ui });
 let disconnected = false;
@@ -76,7 +79,7 @@ async function panelStatus(): Promise<PanelStatus> {
   };
 }
 
-const startup = Promise.all([state.load(), api.storage.get([DISCONNECTED_KEY]).then(r => { disconnected = r[DISCONNECTED_KEY] === true; }), tabs.load()]).then(connect);
+const startup = Promise.all([state.load(), api.storage.get([DISCONNECTED_KEY]).then(r => { disconnected = r[DISCONNECTED_KEY] === true; }), tabs.load(), popups.load()]).then(connect);
 
 // Keeps the worker (and thus the socket) honest after Chrome suspends it. Waits for the startup load so it never races it.
 chrome.alarms.create("ais-keepalive", { periodInMinutes: 1 });

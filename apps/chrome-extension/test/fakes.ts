@@ -16,6 +16,10 @@ export class FakeChrome implements ChromeApi {
   removedListeners: Array<(id: number) => void> = [];
   eventListeners: Array<(tabId: number, method: string, params: Record<string, unknown>) => void> = [];
   resizes: Array<[number, number, number]> = [];
+  createdListeners: Array<(tab: TabInfo) => void> = [];
+  activatedListeners: Array<(tabId: number, windowId: number) => void> = [];
+  /** Tabs the extension made active (only ever to give the owner their tab back). */
+  activations: number[] = [];
   /** Every tab created, with the `active` flag it was created with (always false: agents never foreground a tab). */
   createdActive: boolean[] = [];
 
@@ -57,7 +61,30 @@ export class FakeChrome implements ChromeApi {
     },
     ungroup: async (ids: number[]) => { for (const id of ids) { const t = this.tabList.get(id); if (t) t.groupId = -1; } },
     onRemoved: (l: (id: number) => void) => { this.removedListeners.push(l); },
+    activate: async (id: number) => { this.activations.push(id); this.setActive(id); },
+    onCreated: (l: (tab: TabInfo) => void) => { this.createdListeners.push(l); },
+    onActivated: (l: (tabId: number, windowId: number) => void) => { this.activatedListeners.push(l); },
   };
+  /** Makes the tab the active one in its window and fires onActivated. */
+  setActive(id: number): void {
+    const t = this.tabList.get(id);
+    if (!t) return;
+    for (const o of this.tabList.values()) if (o.windowId === t.windowId) o.active = o.id === id;
+    for (const l of this.activatedListeners) l(id, t.windowId);
+  }
+  /**
+   * A page in `opener` opened a tab, as Chrome does for a target=_blank click: Page.windowOpen on the opener (when attached),
+   * then a tab in the same window, foreground unless `background`. Chrome puts it next to the active tab, outside the opener's group.
+   */
+  openFromPage(opener: number, background = false, attached = true): TabInfo {
+    const o = this.tabList.get(opener)!;
+    if (attached) this.emit(opener, "Page.windowOpen", { url: "https://opened.example.com/", userGesture: true });
+    const t: TabInfo = { id: this.nextTab++, windowId: o.windowId, groupId: -1, url: "https://opened.example.com/", title: "Opened", active: !background };
+    this.tabList.set(t.id, t);
+    for (const l of this.createdListeners) l({ ...t });
+    if (!background) this.setActive(t.id);
+    return t;
+  }
   /** Chrome drops a group when its last tab leaves, so a group exists only while a tab is in it. */
   private groupLive(id: number): boolean { return [...this.tabList.values()].some(t => t.groupId === id); }
   tabGroups = {

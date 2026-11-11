@@ -533,7 +533,7 @@ describe("visuals and abort hygiene", () => {
       expect(api.tabList.get(id)!.active).toBe(false);
     }
     expect(api.createdActive.every(a => !a)).toBe(true);
-    expect("activate" in api.tabs).toBe(false);
+    expect(api.activations).toEqual([]);
     expect(api.cdpLog.some(c => c.method === "Page.captureScreenshot")).toBe(true);
     expect(api.cdpLog.some(c => c.method === "Emulation.setFocusEmulationEnabled" && c.params?.enabled === true)).toBe(true);
   });
@@ -542,8 +542,10 @@ describe("visuals and abort hygiene", () => {
     const { readdirSync, readFileSync } = await import("node:fs");
     const dir = new URL("../src/background/", import.meta.url).pathname;
     for (const f of readdirSync(dir)) {
-      const src = readFileSync(dir + f, "utf8");
+      // The one allowed activation: chrome-api.ts implements tabs.activate, which only popups.ts calls, to give the owner their tab back.
+      const src = readFileSync(dir + f, "utf8").replace("activate: async tabId => { await chrome.tabs.update(tabId, { active: true }); },", "");
       expect(src).not.toMatch(/active:\s*true|chrome\.tabs\.highlight|focused:\s*true|captureVisibleTab|bringToFront/);
+      if (f !== "popups.ts") expect(src).not.toMatch(/tabs\.activate\(/);
     }
   });
 
