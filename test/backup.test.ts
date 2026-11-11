@@ -797,6 +797,21 @@ describe("runBackup never uses Git LFS", () => {
     expect(files.some((f) => f.includes("/tmp/"))).toBe(false);
   });
 
+  test("excludes codex .tmp/ scratch clones (no commit checked out) without index errors", async () => {
+    const home = await makeHome();
+    for (const dir of [join(home, ".codex", ".tmp", "plugins-clone-a"), join(home, ".codex", "identities", "p", ".tmp", "git-b")]) {
+      await write(join(dir, "README.md"), "x\n");
+      expect(Bun.spawnSync(["git", "init", "-q", dir]).exitCode).toBe(0);
+    }
+    await write(join(home, ".codex", "identities", "p", "config.toml"), "model = \"m\"\n");
+
+    const repo = await runBackup(["codex"], home);
+
+    const files = (await git(repo, ["ls-tree", "-r", "--name-only", "HEAD"])).split("\n");
+    expect(files).toContain(".codex/identities/p/config.toml");
+    expect(files.some((f) => f.includes("/.tmp/"))).toBe(false);
+  });
+
   test("a root $HOME/.gitattributes with filter=lfs is neutralised and nothing is written to $HOME", async () => {
     const home = await makeHome();
     await useFakeLfsGlobalConfig(home);
