@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { open } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { defaultExtensionDir, installHost } from "./browser/extension.ts";
 import { runBackup } from "../../scripts/backup.ts";
 import { createProgressTracker, type BackupProgress } from "../shared/backup-progress.ts";
 import { downloadAssetAtomic, platformKey } from "../shared/release-assets.ts";
@@ -40,6 +42,8 @@ export interface UpdateOptions {
   fetchImpl?: typeof fetch;
   /** Test seam for the profile-sync user service step (Linux only). */
   installProfileSyncService?: (restartIfActive: boolean) => Promise<ProfileSyncServiceResult>;
+  /** Test seam: registers the AIS Browser self-update helper; resolves with the Chrome manifests written. */
+  installBrowserHost?: () => Promise<string[]>;
 }
 
 async function installedVersion(binary: string): Promise<string | undefined> {
@@ -143,9 +147,23 @@ export async function runUpdate(options: UpdateOptions = {}): Promise<void> {
     if (described) console.log(`${prefix} ${described.warn ? yellow(`warning: ${described.line}`) : described.line}`);
   }
 
+  // The extension updates itself (side panel or automatically) through this helper; ais update never touches its files.
+  if (options.installBrowserHost || (defaultShimDir && existsSync(defaultExtensionDir()))) {
+    try {
+      const written = await (options.installBrowserHost ?? (() => runInstallHost()))();
+      if (written.length > 0) console.log(`${prefix} AIS Browser self-update registered with Chrome`);
+    } catch (error) {
+      console.log(`${prefix} ${yellow(`warning: AIS Browser self-update not registered: ${error instanceof Error ? error.message : String(error)}`)}`);
+    }
+  }
+
   console.log(
     updated > 0
       ? `${prefix} ${green(`done, updated ${updated} binar${updated === 1 ? "y" : "ies"}.`)}`
       : `${prefix} nothing installed in ~/.local/bin to update.`,
   );
+}
+
+function runInstallHost(): Promise<string[]> {
+  return installHost({ extensionDir: defaultExtensionDir(), home: homedir(), platform: process.platform, out: () => {} });
 }

@@ -7,6 +7,9 @@ export interface SessionRef { id: string; identity: string; label: string }
 
 const SESSIONS_KEY = "sessions";
 const GRANTS_KEY = "grants";
+const HANDOVER_KEY = "handover";
+/** A handover older than this is from an earlier browser run: tab ids no longer mean anything. */
+const HANDOVER_MAX_AGE_MS = 5 * 60_000;
 /** No call for this long: the session is treated as ended, its grants are revoked and it is dropped when it holds no tabs. */
 export const SESSION_END_MS = 30 * 60_000;
 const COLORS: GroupColor[] = ["blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
@@ -169,15 +172,35 @@ export class TabManager {
     this.persist();
   }
 
-  private persist(): void {
+  private snapshot(): Record<string, unknown> {
     const data = [...this.sessions].map(([id, s]) => ({ id, groupId: s.groupId, identity: s.identity, label: s.label, tabIds: [...s.tabIds], adoptedTabIds: [...s.adopted] }));
     const grants = [...this.grants].map(([groupId, sessionId]) => ({ groupId, sessionId }));
-    void this.api.sessionStorage.set({ [SESSIONS_KEY]: data, [GRANTS_KEY]: grants }).catch(() => {});
+    return { [SESSIONS_KEY]: data, [GRANTS_KEY]: grants };
   }
 
-  /** Rebuild ownership and grants after a service-worker restart; tabs and groups that no longer exist are dropped. */
+  private persist(): void {
+    void this.api.sessionStorage.set(this.snapshot()).catch(() => {});
+  }
+
+  /**
+   * Before the extension reloads itself (self-update): chrome.storage.session is cleared by a reload, so the sessions
+   * and grants are handed to the next instance through chrome.storage.local. Tab and group ids stay valid.
+   */
+  async handover(): Promise<void> {
+    await this.api.storage.set({ [HANDOVER_KEY]: { at: this.now(), ...this.snapshot() } });
+  }
+
+  /** Rebuild ownership and grants after a service-worker restart or a self-update reload; tabs and groups that no longer exist are dropped. */
   async load(): Promise<void> {
-    const stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY]);
+    let stored = await this.api.sessionStorage.get([SESSIONS_KEY, GRANTS_KEY]);
+    const handed = (await this.api.storage.get([HANDOVER_KEY]))[HANDOVER_KEY] as ({ at?: number } & Record<string, unknown>) | undefined;
+    if (handed) {
+      await this.api.storage.remove([HANDOVER_KEY]);
+      if (!Array.isArray(stored[SESSIONS_KEY]) && typeof handed.at === "number" && this.now() - handed.at < HANDOVER_MAX_AGE_MS) {
+        stored = handed;
+        await this.api.sessionStorage.set({ [SESSIONS_KEY]: handed[SESSIONS_KEY], [GRANTS_KEY]: handed[GRANTS_KEY] });
+      }
+    }
     const raw = stored[SESSIONS_KEY];
     if (!Array.isArray(raw)) return;
     const live = new Set((await this.api.tabs.query()).map(t => t.id));

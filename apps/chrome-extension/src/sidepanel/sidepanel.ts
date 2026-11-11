@@ -1,5 +1,5 @@
 // Side panel: connection status, binding and the agent sessions using the active tab, with Pause / Resume / Stop. Plain DOM.
-import type { PanelMessage, PanelStatus } from "../shared/panel.ts";
+import type { PanelMessage, PanelStatus, UpdateInfo } from "../shared/panel.ts";
 import { targetText } from "../shared/panel.ts";
 import { groupState, sessionsForTab } from "../shared/current-tab.ts";
 import type { ActiveTab, TabSession } from "../shared/current-tab.ts";
@@ -100,6 +100,51 @@ function thisTabCard(s: PanelStatus, tab: ActiveTab | undefined): HTMLElement {
   return h("section", { class: "card", id: "this-tab" }, h("h2", {}, using.length ? `This tab (${using.length})` : "This tab"), body, ...(controls ? [controls] : []));
 }
 
+const newer = (a: string | undefined, b: string): boolean => {
+  const p = (v: string) => /^v?(\d+)\.(\d+)\.(\d+)$/.exec(v)?.slice(1).map(Number);
+  const x = a ? p(a) : undefined;
+  const y = p(b);
+  if (!x || !y) return false;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i]! > y[i]!;
+  return false;
+};
+
+/** Pure: the updates card text and which buttons show. Exported for tests. */
+export function updateView(u: UpdateInfo): { text: string; tone: "ok" | "warn" | "bad" | "idle"; canUpdate: boolean; canCheck: boolean } {
+  if (u.waitingForIdle) return { text: "New version installed. AIS Browser restarts when the running agent step ends.", tone: "warn", canUpdate: false, canCheck: false };
+  if (u.updating) return { text: "Updating...", tone: "warn", canUpdate: false, canCheck: false };
+  if (u.hostMissing) return { text: "Updates need the AIS helper on this computer. Run ais update once, then check again.", tone: "warn", canUpdate: false, canCheck: true };
+  if (u.error) return { text: `Update check failed: ${u.error}`, tone: "bad", canUpdate: newer(u.latest, u.running), canCheck: true };
+  if (newer(u.latest, u.running)) return { text: `Version ${u.latest} is available.`, tone: "warn", canUpdate: true, canCheck: true };
+  if (u.latest) return { text: "Up to date.", tone: "ok", canUpdate: false, canCheck: true };
+  return { text: "Not checked yet.", tone: "idle", canUpdate: false, canCheck: true };
+}
+
+function updatesCard(u: UpdateInfo): HTMLElement {
+  const v = updateView(u);
+  const buttons: HTMLElement[] = [];
+  if (v.canUpdate) {
+    const b = h("button", { type: "button", class: "small primary-small" }, "Update now");
+    b.addEventListener("click", () => void send("ais-update-now").then(refresh));
+    buttons.push(b);
+  }
+  if (v.canCheck) {
+    const b = h("button", { type: "button", class: "small" }, "Check for updates");
+    b.addEventListener("click", () => void send("ais-update-check").then(refresh));
+    buttons.push(b);
+  }
+  const auto = h("input", { type: "checkbox", id: "ais-auto-update" });
+  auto.checked = u.auto;
+  auto.addEventListener("change", () => void send("ais-update-auto", { enabled: auto.checked }).then(refresh));
+  const checked = u.checkedAt ? ` Checked ${new Date(u.checkedAt).toLocaleString()}.` : "";
+  return h("section", { class: "card", id: "updates" },
+    h("h2", {}, "Updates"),
+    h("p", { class: `update-text ${v.tone}` }, `Version ${u.running}. ${v.text}`),
+    h("p", { class: "hint" }, `Updates come from the AIS releases, separately from the AIS command line.${checked}`),
+    h("label", { class: "check" }, auto, h("span", {}, "Update automatically")),
+    ...(buttons.length ? [h("div", { class: "row-actions" }, ...buttons)] : []));
+}
+
 /** Sign-in form state. The panel re-renders on a timer, so the form is built once and only patched afterwards. */
 const form: { draft: string; error: string; busy: boolean; loaded: boolean } = { draft: "", error: "", busy: false, loaded: false };
 
@@ -183,6 +228,7 @@ export function render(s: PanelStatus, root: HTMLElement, chip: HTMLElement, tab
       h("dt", {}, "Name"), h("dd", {}, s.binding ?? "unknown"),
       h("dt", {}, "Bound to"), h("dd", {}, targetText(s.target)),
       h("dt", {}, "Profile"), h("dd", {}, s.profileLabel ?? "Chrome profile"))));
+    if (s.update) out.push(updatesCard(s.update));
     const foot = h("div", { class: "foot" });
     if (s.status !== "disconnected") {
       const d = h("button", { type: "button", class: "quiet" }, "Disconnect");

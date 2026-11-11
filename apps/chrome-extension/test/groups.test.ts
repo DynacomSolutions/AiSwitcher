@@ -278,3 +278,34 @@ describe("ending a session closes what it created", () => {
     expect(api.tabList.has(tab.id)).toBe(true);
   });
 });
+
+describe("self-update reload keeps sessions", () => {
+  test("handover restores tabs and grants after chrome.storage.session was cleared", async () => {
+    const api = new FakeChrome();
+    const tabs = new TabManager(api);
+    const t = await tabs.create(ref(), "https://a.example.com/");
+    const user = api.addTab(9);
+    const gid = await api.tabs.group([user.id]);
+    expect(await tabs.grant(gid, "s1")).toBe("ok");
+    await tabs.handover();
+    api.session = {}; // chrome.runtime.reload() clears session storage
+    const next = new TabManager(api);
+    await next.load();
+    expect(next.ownerOf(t.id)).toBe("s1");
+    expect(next.grantee(gid)).toBe("s1");
+    expect(api.store.handover).toBeUndefined();
+  });
+
+  test("a stale handover from an earlier browser run is ignored", async () => {
+    const api = new FakeChrome();
+    let now = 0;
+    const tabs = new TabManager(api, () => now);
+    const t = await tabs.create(ref(), "https://a.example.com/");
+    await tabs.handover();
+    api.session = {};
+    now = 10 * 60_000;
+    const next = new TabManager(api, () => now);
+    await next.load();
+    expect(next.ownerOf(t.id)).toBeUndefined();
+  });
+});

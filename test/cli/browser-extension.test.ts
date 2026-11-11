@@ -28,7 +28,7 @@ const real = async (cmd: string[]): Promise<CommandResult> => {
 
 const run = (line: string, extra: Record<string, unknown> = {}) => {
   const { positionals, flags } = parseArgs(line.split(" ").filter(Boolean));
-  return runBrowserCommand(positionals.slice(1), flags, { extensionDir: target, out: (s: string) => out.push(s), ...extra });
+  return runBrowserCommand(positionals.slice(1), flags, { extensionDir: target, home: join(dir, "user"), out: (s: string) => out.push(s), ...extra });
 };
 
 beforeEach(() => {
@@ -41,6 +41,14 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 afterAll(() => rmSync(SCRATCH, { recursive: true, force: true }));
 
 describe("ais browser extension", () => {
+  test("update registers the self-update helper under the user's home", async () => {
+    mkdirSync(join(dir, "user", ".config", "chromium"), { recursive: true });
+    const zip = await makeZip("v3", { "manifest.json": '{"version":"3"}' });
+    await run(`browser extension update --from=${zip}`, { platform: "linux", run: real });
+    expect(existsSync(join(dir, "user", ".config", "chromium", "NativeMessagingHosts", "ais_browser_extension.json"))).toBe(true);
+    expect(existsSync(join(dir, "user", ".ais", "browser-host", "ais-browser-host"))).toBe(true);
+  });
+
   test("path prints the target", async () => {
     await run("browser extension path");
     expect(out).toEqual([target]);

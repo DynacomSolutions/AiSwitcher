@@ -13,10 +13,11 @@ function setup() {
     isMarked: id => id === 7,
     grant: async (g, sid) => { calls.push(`grant:${g}:${sid}`); return "ok"; },
     revoke: async g => { calls.push(`revoke:${g}`); },
+    updater: { check: async () => { calls.push("check"); }, update: async () => { calls.push("update"); }, setAuto: async e => { calls.push(`auto:${e}`); } },
   };
   const replies: unknown[] = [];
   const send = (type: string, sender: MessageSender) => { const r = handleMessage({ type }, sender, v => replies.push(v), deps); return r; };
-  return { calls, replies, send };
+  return { calls, replies, send, deps };
 }
 const page: MessageSender = { id: ID, origin: `chrome-extension://${ID}` };
 const content = (tab: number | undefined, frameId = 0): MessageSender => ({ id: ID, origin: "https://site.test", frameId, ...(tab !== undefined ? { tab: { id: tab } } : {}) });
@@ -63,5 +64,19 @@ describe("grant and revoke messages", () => {
     expect(t.calls).toEqual(["grant:3:s1", "revoke:3"]);
     expect(t.replies).toContainEqual({ ok: false, error: "bad_args" });
     expect(t.replies.filter(r => (r as { ok: boolean }).ok)).toHaveLength(2);
+  });
+});
+
+describe("update messages", () => {
+  test("only the side panel can check, update or switch auto-update", async () => {
+    const t = setup();
+    t.send("ais-update-check", page);
+    t.send("ais-update-now", page);
+    handleMessage({ type: "ais-update-auto", enabled: false }, page, () => {}, t.deps);
+    handleMessage({ type: "ais-update-auto", enabled: "no" }, page, () => {}, t.deps);
+    t.send("ais-update-now", content(7));
+    t.send("ais-update-check", content(7));
+    await Bun.sleep(5);
+    expect(t.calls).toEqual(["check", "update", "auto:false"]);
   });
 });
