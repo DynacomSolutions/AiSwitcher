@@ -92,6 +92,59 @@ test("a reading with no figure (usage API 429 or unavailable) keeps the last fig
   }
 });
 
+// Incident 11 Nov 2026: a pinned T3 app stayed refused ("identity is at its usage reserve") after the owner reset the
+// account. Anthropic's usage API kept answering 429, so the gateway kept the pre-reset 95% and refused every model call.
+test("a kept figure is shown but never refuses: an account reset upstream gets through", async () => {
+  let next: PoolUsage = live(95);
+  let t = 0;
+  const src = createUsageSource({ fetchUsage: async () => next, ttlMs: 1000, now: () => t });
+  const deps = { usageFor: src.get, poolMembers: async () => ["id1"] };
+  await src.prefill("claude", "id1");
+  expect(await pickIdentity(app, deps)).toEqual({ reject: "reserve" }); // fresh 95%: refused
+  next = { status: "rate-limited", error: "HTTP 429", capturedAt: "b" };
+  t += 5000;
+  await src.get("claude", "id1");
+  await src.idle();
+  const kept = await src.get("claude", "id1");
+  expect(kept?.maxUtilization).toBe(95); // still shown
+  expect(kept?.stale).toBe(true);
+  expect(await pickIdentity(app, deps)).toEqual({ identity: "id1" }); // but not refused on
+  next = live(90);
+  t += 5000;
+  await src.get("claude", "id1");
+  await src.idle();
+  expect((await src.get("claude", "id1"))?.stale).toBeUndefined();
+  expect(await pickIdentity(app, deps)).toEqual({ reject: "reserve" }); // a fresh figure refuses again
+});
+
+test("a failed fetch also marks the kept figure stale", async () => {
+  let fail = false;
+  let t = 0;
+  const src = createUsageSource({
+    fetchUsage: async () => {
+      if (fail) throw new Error("x");
+      return live(97);
+    },
+    ttlMs: 1000,
+    now: () => t,
+  });
+  await src.prefill("claude", "id1");
+  fail = true;
+  t += 5000;
+  await src.get("claude", "id1");
+  await src.idle();
+  expect(await src.get("claude", "id1")).toMatchObject({ maxUtilization: 97, stale: true });
+});
+
+test("a pool prefers a fresh member under the reserve, and treats a stale one as unknown", async () => {
+  const poolApp: GatewayApp = { ...app, target: { kind: "pool" } };
+  const usages: Record<string, PoolUsage> = { a: { ...live(99), stale: true }, b: live(50) };
+  const deps = { usageFor: async (_p: string, n: string) => usages[n], poolMembers: async () => ["a", "b"] };
+  expect(await pickIdentity(poolApp, deps)).toEqual({ identity: "b" });
+  usages.b = live(95);
+  expect(await pickIdentity(poolApp, deps)).toEqual({ identity: "a" });
+});
+
 describe("reserve uses numbers only", () => {
   const pinned = (usage: PoolUsage | undefined) => pickIdentity(app, { usageFor: async () => usage, poolMembers: async () => [] });
   test("rate-limited without a number is no figure", async () => {

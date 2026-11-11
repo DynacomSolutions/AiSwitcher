@@ -57,6 +57,8 @@ export interface PoolUsage {
   error?: string;
   retryAfterSeconds?: number;
   capturedAt: string;
+  /** Gateway only: the last good figure, kept because the latest refresh failed or had no figure. Shown, never used to refuse. */
+  stale?: boolean;
 }
 
 export interface SwapCredentialsInput {

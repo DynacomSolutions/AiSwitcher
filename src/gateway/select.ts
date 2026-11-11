@@ -26,6 +26,15 @@ export function utilisationOf(usage: PoolUsage | undefined): number | undefined 
   return nums.length === 0 ? undefined : Math.max(...nums);
 }
 
+/**
+ * The figure the reserve may refuse on: a fresh reading only. A stale one (the
+ * usage API stopped answering, as Anthropic's does with 429 for a full account)
+ * may predate a reset, so it never blocks: the provider's own answer decides.
+ */
+export function reserveUtilisationOf(usage: PoolUsage | undefined): number | undefined {
+  return usage?.stale ? undefined : utilisationOf(usage);
+}
+
 /** The members an app may use: the pin, or the pool members narrowed by the app's identity list. */
 export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "poolMembers" | "canonical">): Promise<string[]> {
   if (app.target.kind === "pin") return [app.target.identity];
@@ -61,7 +70,7 @@ export async function pickIdentity(
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
   if (app.target.kind === "pin") {
-    const util = utilisationOf(await usageOf(deps, app, app.target.identity));
+    const util = reserveUtilisationOf(await usageOf(deps, app, app.target.identity));
     if (util !== undefined && util >= reserve) return { reject: "reserve" };
     return { identity: app.target.identity };
   }
@@ -73,7 +82,7 @@ export async function pickIdentity(
   const rows = await Promise.all(
     names.map(async (name) => {
       const usage = await usageOf(deps, app, name);
-      const util = utilisationOf(usage);
+      const util = reserveUtilisationOf(usage);
       return { name, usage: util === undefined ? undefined : ({ status: "live", maxUtilization: util, capturedAt: "", ...(usage?.extraUsage ? { extraUsage: usage.extraUsage } : {}) } as PoolUsage) };
     }),
   );
