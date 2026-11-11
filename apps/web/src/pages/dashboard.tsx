@@ -1,6 +1,7 @@
 import type * as React from "react";
 
 import { IdentityChip, ToolBadge } from "@/components/badges";
+import { PageTabRedirect, PageTabs, usePageTab, type PageTab } from "@/components/page-tabs";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { RelativeTime } from "@/components/updated-ago";
 import { Badge } from "@/components/ui/badge";
@@ -315,9 +316,18 @@ function HerdrBridgeCard() {
   );
 }
 
+const DASHBOARD_TABS: PageTab[] = [
+  { segment: "overview", label: "Overview" },
+  { segment: "herdr", label: "Herdr" },
+  { segment: "registries", label: "Registries" },
+  { segment: "processes", label: "Processes" },
+];
+
 export function DashboardPage() {
   const status = useStatusQuery();
   const processes = useProcessesQuery();
+  const { active, invalid } = usePageTab(DASHBOARD_TABS);
+  if (invalid) return <PageTabRedirect to="/" />;
   if (status.isError && !status.data) {
     return (
       <div className="space-y-4">
@@ -363,12 +373,19 @@ export function DashboardPage() {
         </div>
       )}
 
-      <GlobalUsageCards />
+      <PageTabs tabs={DASHBOARD_TABS} active={active} base="/" prefix="/dashboard" />
 
-      <SpendGuardCard />
+      {active === "overview" ? (
+        <>
+          <GlobalUsageCards />
 
-      <HerdrBridgeCard />
+          <SpendGuardCard />
+        </>
+      ) : null}
 
+      {active === "herdr" ? <HerdrBridgeCard /> : null}
+
+      {active === "registries" ? (
       <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">Tool registries</CardTitle>
@@ -404,7 +421,9 @@ export function DashboardPage() {
           ))}
         </CardContent>
       </Card>
+      ) : null}
 
+      {active === "processes" ? (
       <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">
@@ -427,6 +446,7 @@ export function DashboardPage() {
           <ProcessesTable />
         </CardContent>
       </Card>
+      ) : null}
     </div>
   );
 }

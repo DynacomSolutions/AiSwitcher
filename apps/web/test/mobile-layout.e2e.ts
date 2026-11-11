@@ -21,7 +21,7 @@ const chromium = process.env.AIS_E2E_CHROMIUM
 const evidence = process.env.AIS_E2E_EVIDENCE;
 
 const ROUTES = [
-  "/", "/identities", "/local-models", "/local-models/example", "/limits", "/usage", "/breakdown",
+  "/", "/identities", "/local-models", "/local-models/example", "/limits", "/usage", "/usage/models", "/usage/sources", "/usage/projects", "/usage/repos", "/usage/orgs", "/dashboard/herdr", "/dashboard/processes", "/breakdown", "/breakdown/consumers",
   "/sessions", "/auth", "/browsers", "/permissions", "/files", "/no-such-page",
 ];
 const VIEWPORTS = [{ width: 360, height: 740 }, { width: 390, height: 844 }];

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import { ToolBadge } from "@/components/badges";
+import { PageTabRedirect, PageTabs, usePageTab, type PageTab } from "@/components/page-tabs";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -186,7 +187,13 @@ function CategoryRows({
 
 const BREAKDOWN_HEADERS = ["Name", "Calls", "Input", "Output", "Cache read", "Est. cost", "Share", "Last used"];
 
+const BREAKDOWN_TABS: PageTab[] = [
+  { segment: "overview", label: "Overview" },
+  { segment: "consumers", label: "Top consumers" },
+];
+
 export function BreakdownPage() {
+  const { active, invalid } = usePageTab(BREAKDOWN_TABS);
   const registries = useIdentitiesQuery();
   const [days, setDays] = useState(30);
 
@@ -215,6 +222,7 @@ export function BreakdownPage() {
   const totalOutput = categories.reduce((sum, c) => sum + c.outputTokens, 0);
   const totalInput = categories.reduce((sum, c) => sum + c.inputTokens + c.cacheReadTokens + c.cacheWriteTokens, 0);
   const editSummary = summariseEdits(categories);
+  if (invalid) return <PageTabRedirect to="/breakdown" />;
 
   return (
     <div className="space-y-5">
@@ -283,6 +291,10 @@ export function BreakdownPage() {
         />
       ) : (
         <>
+          <PageTabs tabs={BREAKDOWN_TABS} active={active} base="/breakdown" />
+
+          {active === "overview" ? (
+          <>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             <StatCard label="Est. cost" value={formatMoney(totalCost)} sub={`${result.windowDays}-day window, list prices`} />
             <StatCard label="Tool calls" value={totalCalls.toLocaleString()} sub="attribution: output split per call" />
@@ -324,7 +336,11 @@ export function BreakdownPage() {
               </CardContent>
             </Card>
           ) : null}
+          </>
+          ) : null}
 
+          {active === "consumers" ? (
+          <>
           <Card className="gap-3">
             <CardHeader>
               <div className="space-y-1">
@@ -357,6 +373,8 @@ export function BreakdownPage() {
               Note: {note}
             </p>
           ))}
+          </>
+          ) : null}
         </>
       )}
     </div>

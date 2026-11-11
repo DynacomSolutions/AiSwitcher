@@ -5,6 +5,7 @@ import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
 import { PoolUsageCards } from "@/components/pool-usage-cards";
 import { GlobalUsageCards } from "@/components/usage-counter";
+import { PageTabRedirect, PageTabs, usePageTab, type PageTab } from "@/components/page-tabs";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -169,6 +170,18 @@ export function LimitsPage() {
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   }, [results]);
 
+  const tabs = useMemo<PageTab[]>(
+    () => [
+      { segment: "overview", label: "Overview" },
+      ...providerGroups.map(([provider]) => ({ segment: provider, label: provider })),
+    ],
+    [providerGroups],
+  );
+  const { active, invalid } = usePageTab(tabs);
+  // A provider tab is unknown until the limits have loaded: only redirect once they have.
+  if (invalid && query.data) return <PageTabRedirect to="/limits" />;
+  const activeGroup = providerGroups.find(([provider]) => provider === active);
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -177,11 +190,17 @@ export function LimitsPage() {
         updatedAt={query.dataUpdatedAt}
       />
 
-      <GlobalUsageCards title="Global usage" />
+      <PageTabs tabs={tabs} active={active} base="/limits" />
 
-      <PoolUsageCards />
+      {active === "overview" ? (
+        <>
+          <GlobalUsageCards title="Global usage" />
 
-      {query.isLoading ? (
+          <PoolUsageCards />
+        </>
+      ) : null}
+
+      {active === "overview" ? null : query.isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 6 }).map((_, i) => (
             <div key={i} className="h-52 animate-pulse rounded-xl bg-muted" />
@@ -195,7 +214,7 @@ export function LimitsPage() {
           description="Add identities with configured credentials; quotas appear once the server can fetch them."
         />
       ) : (
-        providerGroups.map(([provider, group]) => (
+        (activeGroup ? [activeGroup] : []).map(([provider, group]) => (
           <section key={provider} className="space-y-3">
             <div className="flex items-center gap-2">
               <ProviderLabel provider={provider} size={16} className="text-base font-semibold" />

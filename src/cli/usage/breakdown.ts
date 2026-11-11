@@ -1,6 +1,6 @@
 import { isRetired } from "../../identities/retired.ts";
-import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import "../../identities/model-price-source.ts";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
@@ -67,6 +67,33 @@ export interface BreakdownCategory {
   tools?: BreakdownCategory[];
 }
 
+export interface BreakdownProject {
+  /** Git working-tree root (dir holding .git) containing the session cwd; the raw cwd when no .git was found; "" when the session recorded no cwd. */
+  path: string;
+  /** "owner/name" parsed from the origin remote (any host; https, ssh scp-like git@host:owner/name(.git), ssh://). Absent when no parsable origin. */
+  repo?: string;
+  /** owner part of repo (org or user). */
+  org?: string;
+  /** remote host, e.g. example.com. */
+  host?: string;
+  /** "git" = .git found; "plain" = path exists, no .git; "missing" = path not on this host (sessions synced from another machine); "unknown" = session had no cwd. */
+  source: "git" | "plain" | "missing" | "unknown";
+  /** Set when repo/org were inferred for a missing folder from a uniquely
+   * matching repo name seen in the same collection run. */
+  inferred?: true;
+  /** Usage events (model turns) attributed. */
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** Priced per model like categories; unpriced models are excluded. */
+  estCostUsd: number;
+  lastUsedAt: string | null;
+}
+
+export type ResolvedProject = Pick<BreakdownProject, "path" | "repo" | "org" | "host" | "source">;
+
 export interface BreakdownResult {
   identity: string;
   /** True for a retired identity: history is still reported, from local logs. */
@@ -77,6 +104,10 @@ export interface BreakdownResult {
   filesRead: number;
   /** Sorted estCostUsd-desc. Empty when the identity has no in-window logs. */
   categories: BreakdownCategory[];
+  /** Per project/repo/org, estCostUsd-desc. Each usage event's FULL tokens go
+   * to the project of the session's cwd (no tool split). Present for
+   * claude/codex results, absent for unavailable tools. */
+  projects?: BreakdownProject[];
   /** Set when the tool's local logs cannot support a per-call breakdown. */
   unavailable?: string;
   /** A source failed while streaming after discovery. Partial totals are not cacheable. */
@@ -96,6 +127,9 @@ export interface BreakdownDeps extends LocalEstimateDeps {
   /** Counts actual transcript opens in cache regression tests. */
   onSourceFileRead?: (path: string) => void;
   now?: () => Date;
+  /** Test seam: maps a session cwd to its project. Defaults to a pure
+   * file-read resolver (no git subprocess), memoised per collection run. */
+  resolveProject?: (cwd: string) => ResolvedProject;
 }
 
 export const DEFAULT_BREAKDOWN_DAYS = 30;
@@ -185,6 +219,125 @@ export function classifyToolCall(rawName: string): ClassifiedCall {
   return { kind: "tool", name: rawName, detail: rawName };
 }
 
+/* ------------------------- project resolution ----------------------------- */
+
+export interface ParsedRemote {
+  host: string;
+  repo: string;
+  org: string;
+}
+
+/** Parses https://, ssh://, git:// and scp-like (user@host:owner/name) remotes. */
+export function parseRemoteUrl(raw: string): ParsedRemote | undefined {
+  const url = raw.trim();
+  let host: string | undefined;
+  let path: string | undefined;
+  const schemed = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:]+)(?::\d+)?\/(.+)$/i.exec(url);
+  if (schemed) {
+    host = schemed[1];
+    path = schemed[2];
+  } else {
+    const scp = /^(?:[^@/\s]+@)?([^/:\s]+):(?!\/\/)\/?(.+)$/.exec(url);
+    if (scp) {
+      host = scp[1];
+      path = scp[2];
+    }
+  }
+  if (!host || !path) return undefined;
+  const segments = path.replace(/\/+$/, "").replace(/\.git$/, "").split("/").filter((part) => part.length > 0);
+  if (segments.length < 2) return undefined;
+  const name = segments[segments.length - 1]!;
+  const org = segments.slice(0, -1).join("/");
+  return { host, repo: `${org}/${name}`, org };
+}
+
+/** First `[remote "origin"] url` of a git config file's text. */
+export function originUrlFromConfig(text: string): string | undefined {
+  let inOrigin = false;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("[")) {
+      inOrigin = /^\[\s*remote\s+"origin"\s*\]/.test(line);
+      continue;
+    }
+    if (!inOrigin) continue;
+    const match = /^url\s*=\s*(.+)$/.exec(line);
+    if (match) return match[1]!.trim();
+  }
+  return undefined;
+}
+
+function readTextOrUndefined(path: string): string | undefined {
+  try { return readFileSync(path, "utf8"); } catch { return undefined; }
+}
+
+function isFile(path: string): boolean {
+  try { return statSync(path).isFile(); } catch { return false; }
+}
+
+function isDirectory(path: string): boolean {
+  try { return statSync(path).isDirectory(); } catch { return false; }
+}
+
+/** A real git dir holds HEAD and objects (or a commondir pointing at them);
+ * a stray empty `.git` folder must not capture every directory below it. */
+function isGitDir(dir: string): boolean {
+  return isFile(join(dir, "HEAD")) && (isDirectory(join(dir, "objects")) || isFile(join(dir, "commondir")));
+}
+
+/** The git dir behind a working-tree root's `.git` entry: the folder itself,
+ * or the target of a worktree's `gitdir:` file. Undefined when it is not a
+ * real git dir. */
+function gitDirOf(dotGit: string, root: string): string | undefined {
+  if (isDirectory(dotGit)) return isGitDir(dotGit) ? dotGit : undefined;
+  const match = /^gitdir:\s*(.+)$/m.exec(readTextOrUndefined(dotGit) ?? "");
+  if (!match) return undefined;
+  const target = match[1]!.trim();
+  const gitDir = isAbsolute(target) ? target : resolvePath(root, target);
+  return isGitDir(gitDir) ? gitDir : undefined;
+}
+
+/** The shared config of a git dir (a linked worktree's sits behind `commondir`). */
+function gitConfigPath(gitDir: string): string {
+  const common = readTextOrUndefined(join(gitDir, "commondir"))?.trim();
+  const commonDir = common ? (isAbsolute(common) ? common : resolvePath(gitDir, common)) : gitDir;
+  return join(commonDir, "config");
+}
+
+function gitProject(root: string, gitDir: string): ResolvedProject {
+  const url = originUrlFromConfig(readTextOrUndefined(gitConfigPath(gitDir)) ?? "");
+  const remote = url ? parseRemoteUrl(url) : undefined;
+  return { path: root, source: "git", ...(remote ? { repo: remote.repo, org: remote.org, host: remote.host } : {}) };
+}
+
+/** Pure file-read cwd -> project resolution: no git subprocess. The nearest
+ * real git dir wins: a working tree's `.git`, a linked worktree's `gitdir:`
+ * file, or a bare repository (mirror) the session was started in. */
+export function resolveProjectFromFs(cwd: string): ResolvedProject {
+  if (cwd === "") return { path: "", source: "unknown" };
+  if (!existsSync(cwd)) return { path: cwd, source: "missing" };
+  let dir = cwd;
+  for (;;) {
+    const dotGit = join(dir, ".git");
+    const gitDir = existsSync(dotGit) ? gitDirOf(dotGit, dir) : undefined;
+    if (gitDir) return gitProject(dir, gitDir);
+    if (isGitDir(dir) && isFile(join(dir, "config"))) return gitProject(dir, dir);
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return { path: cwd, source: "plain" };
+}
+
+function memoisedProjectResolver(base: (cwd: string) => ResolvedProject): (cwd: string) => ResolvedProject {
+  const memo = new Map<string, ResolvedProject>();
+  return (cwd) => {
+    let hit = memo.get(cwd);
+    if (!hit) memo.set(cwd, (hit = base(cwd)));
+    return hit;
+  };
+}
+
 /* ----------------------------- accumulator -------------------------------- */
 
 interface ModelTally {
@@ -203,14 +356,72 @@ interface Bucket {
   byModel: Map<string, ModelTally>;
 }
 
-function tallyOf(bucket: Bucket, model: string): ModelTally {
+function tallyOf(bucket: { byModel: Map<string, ModelTally> }, model: string): ModelTally {
   let tally = bucket.byModel.get(model);
   if (!tally) bucket.byModel.set(model, (tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }));
   return tally;
 }
 
+interface ProjectBucket {
+  turns: number;
+  lastMs?: number;
+  byModel: Map<string, ModelTally>;
+}
+
 class BreakdownAccumulator {
   private buckets = new Map<string, Bucket>();
+  private projectBuckets = new Map<string, ProjectBucket>();
+
+  /** One usage event's whole tokens go to its session cwd ("" = no cwd). */
+  addProject(cwd: string | null, model: string, tokens: UsageLot, atMs: number | undefined): void {
+    const key = cwd ?? "";
+    let bucket = this.projectBuckets.get(key);
+    if (!bucket) this.projectBuckets.set(key, (bucket = { turns: 0, byModel: new Map() }));
+    bucket.turns += 1;
+    const tally = tallyOf(bucket, model);
+    tally.input += tokens.input;
+    tally.output += tokens.output;
+    tally.cacheRead += tokens.cacheRead;
+    tally.cacheWrite += tokens.cacheWrite;
+    if (atMs !== undefined && (bucket.lastMs === undefined || atMs > bucket.lastMs)) bucket.lastMs = atMs;
+  }
+
+  private finishProjects(resolve: (cwd: string) => ResolvedProject, unpriced: Set<string>): BreakdownProject[] {
+    const merged = new Map<string, BreakdownProject>();
+    for (const [cwd, bucket] of this.projectBuckets) {
+      let info: ResolvedProject;
+      try { info = resolve(cwd); } catch { info = cwd === "" ? { path: "", source: "unknown" } : { path: cwd, source: "missing" }; }
+      const key = `${info.source}\u0000${info.path}`;
+      let project = merged.get(key);
+      if (!project) {
+        project = {
+          path: info.path,
+          ...(info.repo ? { repo: info.repo } : {}),
+          ...(info.org ? { org: info.org } : {}),
+          ...(info.host ? { host: info.host } : {}),
+          source: info.source,
+          turns: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, lastUsedAt: null,
+        };
+        merged.set(key, project);
+      }
+      project.turns += bucket.turns;
+      for (const [model, tally] of bucket.byModel) {
+        project.inputTokens += tally.input;
+        project.outputTokens += tally.output;
+        project.cacheReadTokens += tally.cacheRead;
+        project.cacheWriteTokens += tally.cacheWrite;
+        if (tally.input + tally.output + tally.cacheRead + tally.cacheWrite === 0) continue;
+        const cost = estimateChatModelTokenCost(model, tally.input, tally.output, tally.cacheRead, tally.cacheWrite);
+        if (cost === undefined) unpriced.add(model);
+        else project.estCostUsd += cost;
+      }
+      if (bucket.lastMs !== undefined) {
+        const iso = new Date(bucket.lastMs).toISOString();
+        if (!project.lastUsedAt || iso > project.lastUsedAt) project.lastUsedAt = iso;
+      }
+    }
+    return [...merged.values()].sort((a, b) => b.estCostUsd - a.estCostUsd || a.path.localeCompare(b.path));
+  }
 
   private bucket(kind: BreakdownKind, name: string, server?: string): Bucket {
     const key = `${kind}\u0000${name}`;
@@ -248,7 +459,7 @@ class BreakdownAccumulator {
   /** Prices every bucket per model (splitting the pricing per model keeps the
    * maths linear and exact), folds MCP detail rows into their server row and
    * sorts cost-desc. */
-  finish(): { categories: BreakdownCategory[]; unpricedModels: string[] } {
+  finish(resolve: (cwd: string) => ResolvedProject): { categories: BreakdownCategory[]; projects: BreakdownProject[]; unpricedModels: string[] } {
     const unpriced = new Set<string>();
     const priced = [...this.buckets.values()].map((bucket): BreakdownCategory => {
       let estCostUsd = 0;
@@ -331,7 +542,8 @@ class BreakdownAccumulator {
       flat.push(group.rollup);
     }
     flat.sort((a, b) => b.estCostUsd - a.estCostUsd);
-    return { categories: flat, unpricedModels: [...unpriced].sort() };
+    const projects = this.finishProjects(resolve, unpriced);
+    return { categories: flat, projects, unpricedModels: [...unpriced].sort() };
   }
 }
 
@@ -446,14 +658,16 @@ function finiteNumbers(values: unknown[]): boolean {
 }
 
 function validClaudeProjection(events: unknown[]): events is unknown[][] {
-  return events.every((value) => Array.isArray(value) && value.length === 7 &&
+  return events.every((value) => Array.isArray(value) && value.length === 8 &&
     (value[0] === null || (typeof value[0] === "number" && Number.isFinite(value[0]))) &&
     typeof value[1] === "string" && finiteNumbers(value.slice(2, 6)) &&
-    Array.isArray(value[6]) && value[6].every((name) => typeof name === "string"));
+    Array.isArray(value[6]) && value[6].every((name) => typeof name === "string") &&
+    (value[7] === null || typeof value[7] === "string"));
 }
 
 function validCodexProjection(events: unknown[]): events is unknown[][] {
   return events.every((value) => Array.isArray(value) && (
+    (value[0] === "p" && value.length === 2 && typeof value[1] === "string") ||
     (value[0] === "c" && value.length === 3 && typeof value[1] === "string" && typeof value[2] === "string") ||
     (value[0] === "t" && value.length === 3 &&
       (value[1] === null || (typeof value[1] === "number" && Number.isFinite(value[1]))) && typeof value[2] === "string") ||
@@ -466,6 +680,7 @@ function validCodexProjection(events: unknown[]): events is unknown[][] {
 
 interface ClaudeLine {
   timestamp?: string;
+  cwd?: unknown;
   message?: {
     model?: string;
     content?: unknown;
@@ -494,7 +709,7 @@ async function collectClaudeBreakdown(
   identity: Identity,
   windowStartMs: number,
   deps: BreakdownDeps,
-): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
+): Promise<{ categories: BreakdownCategory[]; projects: BreakdownProject[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
   const sourceFailure = { value: false };
   const root = join(identity.configDir, "projects");
   const { files, unreadable } = listRecentFiles(root, new Date(windowStartMs), listingDeps(deps, sourceFailure, root), false);
@@ -518,17 +733,19 @@ async function collectClaudeBreakdown(
           usage.cache_read_input_tokens ?? 0,
           usage.cache_creation_input_tokens ?? 0,
           toolUseNames(parsed.message?.content),
+          typeof parsed.cwd === "string" && parsed.cwd.length > 0 ? parsed.cwd : null,
         ]);
       } } catch { sourceError = true; }
       return { events, sourceError };
     });
     sourceError ||= projected.sourceError;
     for (const event of projected.events) {
-      const [atValue, modelValue, input, output, cacheRead, cacheWrite, callNames] = event;
+      const [atValue, modelValue, input, output, cacheRead, cacheWrite, callNames, cwdValue] = event;
       const atMs = typeof atValue === "number" ? atValue : undefined;
       if (!shouldIncludeEvent(atValue === null ? null : atMs ?? null, windowStartMs)) continue;
       const model = typeof modelValue === "string" ? modelValue : "unknown";
       const names = Array.isArray(callNames) ? callNames.filter((name): name is string => typeof name === "string") : [];
+      acc.addProject(typeof cwdValue === "string" ? cwdValue : null, model, { input: input as number, output: output as number, cacheRead: cacheRead as number, cacheWrite: cacheWrite as number }, atMs);
       acc.add("conversation", "conversation", model, { input: input as number, output: 0, cacheRead: cacheRead as number, cacheWrite: cacheWrite as number }, atMs);
       acc.countCall("conversation", "conversation", atMs);
       if (names.length === 0) {
@@ -543,7 +760,7 @@ async function collectClaudeBreakdown(
       });
     }
   }
-  const finished = acc.finish();
+  const finished = acc.finish(deps.resolveProject ?? resolveProjectFromFs);
   return { ...finished, filesRead: files.length, unreadable, sourceError };
 }
 
@@ -589,7 +806,7 @@ async function collectCodexBreakdown(
   identity: Identity,
   windowStartMs: number,
   deps: BreakdownDeps,
-): Promise<{ categories: BreakdownCategory[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
+): Promise<{ categories: BreakdownCategory[]; projects: BreakdownProject[]; unpricedModels: string[]; filesRead: number; unreadable: boolean; sourceError: boolean }> {
   const sourceFailure = { value: false };
   const root = join(identity.configDir, "sessions");
   const { files, unreadable } = listRecentFiles(root, new Date(windowStartMs), listingDeps(deps, sourceFailure, root), true);
@@ -600,11 +817,18 @@ async function collectCodexBreakdown(
     const projected = await projectedFileEvents("codex", identity, file, deps, async (path, readLines) => {
       const events: unknown[][] = [];
       let model = "unknown";
+      let lastCwd: string | null = null;
       let sourceError = false;
+      const noteCwd = (value: unknown): void => {
+        if (typeof value !== "string" || value.length === 0 || value === lastCwd) return;
+        lastCwd = value;
+        events.push(["p", value]);
+      };
       try { for await (const line of readLines(path)) {
         if (
           !line.includes("token_count") &&
           !line.includes("turn_context") &&
+          !line.includes("session_meta") &&
           !line.includes("function_call") &&
           !line.includes("custom_tool_call") &&
           !line.includes("local_shell_call")
@@ -612,9 +836,14 @@ async function collectCodexBreakdown(
         let parsed: (CodexTokenCountLine | CodexCallLine) & { type?: string };
         try { parsed = JSON.parse(line) as (CodexTokenCountLine | CodexCallLine) & { type?: string }; } catch { continue; }
         const atMs = parseTimestampMs(parsed.timestamp) ?? null;
+        if (parsed.type === "session_meta") {
+          noteCwd((parsed as { payload?: { cwd?: unknown } }).payload?.cwd);
+          continue;
+        }
         if (parsed.type === "turn_context") {
-          const payload = (parsed as { payload?: { model?: unknown; turn_id?: unknown } }).payload;
+          const payload = (parsed as { payload?: { model?: unknown; turn_id?: unknown; cwd?: unknown } }).payload;
           if (!payload) continue;
+          noteCwd(payload.cwd);
           const turnKey = typeof payload.turn_id === "string" ? payload.turn_id : String(parsed.timestamp ?? "");
           if (typeof payload.model === "string") model = payload.model;
           events.push(["c", turnKey, model]);
@@ -645,6 +874,7 @@ async function collectCodexBreakdown(
     });
     sourceError ||= projected.sourceError;
     let model = "unknown";
+    let cwd: string | null = null;
     let turn: CodexTurnState | undefined;
     const flushTurn = (): void => {
       if (!turn) return;
@@ -664,6 +894,10 @@ async function collectCodexBreakdown(
     };
 
     for (const event of projected.events) {
+      if (event[0] === "p") {
+        cwd = event[1] as string;
+        continue;
+      }
       if (event[0] === "c") {
         const turnKey = event[1] as string;
         if (!turn || turn.key !== turnKey) {
@@ -688,6 +922,7 @@ async function collectCodexBreakdown(
         const cached = event[4] as number;
         const cacheWrite = event[5] as number;
         const output = event[6] as number;
+          acc.addProject(cwd, model, { input, output, cacheRead: cached, cacheWrite }, atMs);
           // Rule 1: the prompt side is conversation, exactly like Claude.
           acc.add(
             "conversation",
@@ -704,7 +939,7 @@ async function collectCodexBreakdown(
     flushTurn();
   }
 
-  const finished = acc.finish();
+  const finished = acc.finish(deps.resolveProject ?? resolveProjectFromFs);
   return { ...finished, filesRead: files.length, unreadable, sourceError };
 }
 
@@ -752,6 +987,7 @@ export async function collectIdentityBreakdown(
 
   const unavailable = UNAVAILABLE_REASONS[toolName];
   if (unavailable) return { ...meta, filesRead: 0, categories: [], unavailable };
+  deps = { ...deps, resolveProject: deps.resolveProject ?? memoisedProjectResolver(resolveProjectFromFs) };
 
   const outcome =
     toolName === "claude"
@@ -764,7 +1000,7 @@ export async function collectIdentityBreakdown(
     return { ...meta, filesRead: 0, categories: [], unavailable: `no breakdown reader for tool "${toolName}"` };
   }
   if (outcome.sourceError) {
-    return { ...meta, filesRead: outcome.filesRead, categories: outcome.categories, sourceError: "source-error" };
+    return { ...meta, filesRead: outcome.filesRead, categories: outcome.categories, projects: outcome.projects, sourceError: "source-error" };
   }
   if (outcome.unreadable) {
     return { ...meta, filesRead: 0, categories: [], unavailable: "no local session logs found for this identity" };
@@ -774,6 +1010,7 @@ export async function collectIdentityBreakdown(
     ...meta,
     filesRead: outcome.filesRead,
     categories: outcome.categories,
+    projects: outcome.projects,
     ...(outcome.sourceError ? { sourceError: "source-error" as const } : {}),
     ...(note ? { notes: [note] } : {}),
   };
@@ -788,7 +1025,40 @@ export async function collectBreakdownResults(
   onItemDone?: (index: number, result: BreakdownResult) => void,
   deps: BreakdownDeps = {},
 ): Promise<BreakdownResult[]> {
-  return runBatched(targets, 4, (target) => collectIdentityBreakdown(target.toolName, target.identity, windowDays, deps), onItemDone);
+  // One memo for the whole run so identities sharing a cwd resolve it once.
+  const shared: BreakdownDeps = { ...deps, resolveProject: deps.resolveProject ?? memoisedProjectResolver(resolveProjectFromFs) };
+  const results = await runBatched(targets, 4, (target) => collectIdentityBreakdown(target.toolName, target.identity, windowDays, shared), onItemDone);
+  inferMissingRepos(results);
+  return results;
+}
+
+/** A session whose folder is gone from this host (a removed task worktree, a
+ * folder synced from another machine) keeps its tokens on its own path. When
+ * exactly one repo resolved in this run has the folder's name, the row gets
+ * that repo and org, marked `inferred`; an ambiguous name stays unattributed. */
+export function inferMissingRepos(results: BreakdownResult[]): void {
+  const byName = new Map<string, Set<string>>();
+  const remotes = new Map<string, { org: string; host?: string }>();
+  for (const result of results) {
+    for (const project of result.projects ?? []) {
+      if (!project.repo || !project.org || project.inferred) continue;
+      const name = project.repo.slice(project.repo.lastIndexOf("/") + 1);
+      let repos = byName.get(name);
+      if (!repos) byName.set(name, (repos = new Set()));
+      repos.add(project.repo);
+      remotes.set(project.repo, { org: project.org, ...(project.host ? { host: project.host } : {}) });
+    }
+  }
+  for (const result of results) {
+    for (const project of result.projects ?? []) {
+      if (project.source !== "missing" || project.repo) continue;
+      const name = project.path.replace(/\/+$/, "").split("/").pop() ?? "";
+      const repos = byName.get(name);
+      if (!repos || repos.size !== 1) continue;
+      const repo = [...repos][0]!;
+      Object.assign(project, { repo, ...remotes.get(repo), inferred: true as const });
+    }
+  }
 }
 
 /** Shared flag handling for the CLI command and the server endpoint. */

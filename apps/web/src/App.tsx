@@ -19,12 +19,13 @@ export function AppRoutes() {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<DashboardPage />} />
+        <Route path="dashboard/:tab?" element={<DashboardPage />} />
         <Route path="identities" element={<IdentitiesPage />} />
         <Route path="local-models" element={<LocalModelsPage />} />
         <Route path="local-models/:name" element={<LocalModelsPage />} />
-        <Route path="limits" element={<LimitsPage />} />
-        <Route path="usage" element={<UsagePage />} />
-        <Route path="breakdown" element={<BreakdownPage />} />
+        <Route path="limits/:tab?" element={<LimitsPage />} />
+        <Route path="usage/:tab?" element={<UsagePage />} />
+        <Route path="breakdown/:tab?" element={<BreakdownPage />} />
         <Route path="sessions" element={<SessionsPage />} />
         <Route path="auth" element={<AuthPage />} />
         <Route path="browsers" element={<BrowsersPage />} />
