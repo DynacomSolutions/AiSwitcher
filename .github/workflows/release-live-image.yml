@@ -59,8 +59,7 @@ jobs:
       - name: Install minisign
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign
+          bash scripts/ci/apt-install.sh --no-install-recommends minisign
 
       - name: Prepare checksums and optional signature
         env:

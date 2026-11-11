@@ -95,8 +95,7 @@ jobs:
       # The live-image script tests drive expect and node.
       - name: Install test tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends expect nodejs
+          bash scripts/ci/apt-install.sh --no-install-recommends expect nodejs
 
       - name: Test
         env:
