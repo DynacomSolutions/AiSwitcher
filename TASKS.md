@@ -190,7 +190,7 @@ ETA: 2026-11-14 18:00 ICT
 | 151 | Usage reuse: fingerprint the running AIS build; one failed source commit never outlives the cycle | in_review | claude-20261108-usage-reuse-followup | usage-reuse-followup | 5.150 | 2026-11-08 03:30 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/420.<br>Was 150.<br>Re-review lows of 5.150 (was 145): the version string stays the same across merges; a throwing snapshot write could reject a batch while other workers still write. |
 | 152 | Usage collector: permanent 5 MB/s disk cap; cold exports finish across cycles | in_review | claude-20261108-usage-cold-cap | ais-usage-cold-cap | 5.150 | 2026-11-09 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/423.<br>Tokscale checkpoints its cache; fixture: 6 killed cycles then complete, sha equal.<br>Install rebuilds Tokscale when its build stamp is stale; 5M only with a checkpointing build, else 20M. |
 
-| 177 | Usage breakdown: tokens and cost per project, repo and GitHub org | in_review | claude | ais-webui-tabs-usage-breakdown | | 2026-11-12 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/489.<br>Breakdown collector records each session's cwd (Claude line cwd, Codex session_meta/turn_context) and maps it to git toplevel and origin owner/repo from .git files.<br>Shown on Usage tabs Projects, Repos, Orgs. |
+| 177 | Usage breakdown: tokens and cost per project, repo and GitHub org | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Breakdown collector records each session's cwd (Claude line cwd, Codex session_meta/turn_context) and maps it to git toplevel and origin owner/repo from .git files.<br>Shown on Usage tabs Projects, Repos, Orgs. |
 ## 6. Browser control extension
 ETA: 2026-11-14 18:00 ICT
 
@@ -241,12 +241,11 @@ ETA: 2026-11-08 18:00 ICT
 
 ## 11. Console WebUI: tabbed pages and readable usage charts
 Long console pages split into tabs with their own URL path; usage chart shows totals and readable axes in dark mode.
-ETA: 2026-11-12 12:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 178 | Split Usage, Dashboard, Limits and Breakdown into URL-path tabs | in_review | claude | ais-webui-tabs-usage-breakdown | | 2026-11-12 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/489.<br>Was 175 (clash with 6.175). Owner request 2026-11-11: pages too long.<br>Usage: overview, models, sources, projects, repos, orgs, gateway apps. |
-| 179 | Usage chart: total on hover, readable axis text in dark mode, tooltips on one line | in_review | claude | ais-webui-tabs-usage-breakdown | | 2026-11-12 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/489.<br>Was 176 (clash with 6.176). Axis ticks used theme `color`, which SVG text ignores (needs `fill`). |
+| 178 | Split Usage, Dashboard, Limits and Breakdown into URL-path tabs | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Was 175 (clash with 6.175). Owner request 2026-11-11: pages too long.<br>Usage: overview, models, sources, projects, repos, orgs, gateway apps. |
+| 179 | Usage chart: total on hover, readable axis text in dark mode, tooltips on one line | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Was 176 (clash with 6.176). Axis ticks used theme `color`, which SVG text ignores (needs `fill`). |
 
 ## 12. CI runner reliability
 Keep CI green when a GitHub-hosted runner image breaks.
