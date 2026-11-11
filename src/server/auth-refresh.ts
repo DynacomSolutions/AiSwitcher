@@ -332,14 +332,27 @@ export class AuthRefreshScheduler {
     return true;
   }
 
-  /** Drops stale revoked pins for every known entry so status reflects the
-   * grant currently on disk (the portal calls this before reading status). */
+  /** Brings status in line with the registry (the portal calls this before
+   * reading status): drops the records of identities that were deleted or
+   * retired, and drops stale revoked pins so status reflects the grant
+   * currently on disk. An unreadable registry prunes nothing. */
   async reconcileStale(): Promise<void> {
     let changed = false;
-    for (const entry of this.entries.values()) {
-      if (entry.revokedFingerprint === null || this.inFlight.has(`${entry.tool}/${entry.identity}`)) continue;
-      const identity = (await this.listIdentities(entry.tool).catch(() => [])).find((candidate) => candidate.name === entry.identity);
-      if (identity && (await this.clearIfSuperseded(entry, identity))) changed = true;
+    const registries = new Map<string, Identity[] | undefined>();
+    for (const [key, entry] of [...this.entries]) {
+      if (this.inFlight.has(key)) continue;
+      if (!registries.has(entry.tool)) {
+        registries.set(entry.tool, await this.listIdentities(entry.tool).catch(() => undefined));
+      }
+      const registry = registries.get(entry.tool);
+      if (!registry) continue;
+      const identity = registry.find((candidate) => candidate.name === entry.identity);
+      if (!identity || isRetired(identity)) {
+        this.entries.delete(key);
+        changed = true;
+        continue;
+      }
+      if (entry.revokedFingerprint !== null && (await this.clearIfSuperseded(entry, identity))) changed = true;
     }
     if (changed) await this.persist();
   }

@@ -41,7 +41,7 @@ describe("live image release contract", () => {
     expect(releaseWorkflow).toContain("MINISIGN_PASSWORD");
     expect(releaseWorkflow).toMatch(/SIGNING_KEY: \$\{\{ secrets\.MINISIGN_SECRET_KEY \}\}[\s\S]*?if \[\[ -n "\$SIGNING_KEY" \]\]; then enabled=true; else enabled=false; fi[\s\S]*?if \[\[ "\$enabled" == false \]\]; then echo '::notice::/);
     expect(releaseWorkflow).toMatch(/publish:\n[\s\S]*?if: \$\{\{ needs\.signing\.outputs\.enabled == 'true' \}\}/);
-    expect(releaseWorkflow).toContain("sudo apt-get install -y --no-install-recommends minisign");
+    expect(releaseWorkflow).toContain("bash scripts/ci/apt-install.sh --no-install-recommends minisign");
     expect(releaseWorkflow.indexOf("bash image/build/release-assets.sh")).toBeLessThan(releaseWorkflow.indexOf("gh release create"));
     expect(releaseWorkflow).toContain("needs: [image, signing]");
     expect(buildWorkflow).toContain("AIS_IMAGE_TEST_PACKAGES=${{ matrix.flavour == 'test' && '1' || '0' }}");

@@ -60,6 +60,8 @@ export const VENDOR_DOMAINS: readonly AllowlistEntry[] = [
   { domain: "bigmodel.cn", reason: "Zhipu/Z.ai China-region API endpoint, alongside the global z.ai endpoint (AGENTS.md)" },
   { domain: "archlinux.org", reason: "Arch Linux Archive and mirrors pinned by the live image build recipe (image/pins.env, image/build/bootstrap.sh)" },
   { domain: "apache.org", reason: "licence-only: the standard licence URL inside the unmodified herdr licence text shipped in the live image (image/archiso/airootfs/usr/share/licenses/herdr/LICENSE); never used as an endpoint" },
+  { domain: "ubuntu.com", reason: "CI only: scripts/ci/apt-install.sh matches the runner's Ubuntu archive and security mirror URLs to swap them for a fallback mirror; never called by the product" },
+  { domain: "kernel.org", reason: "CI only: scripts/ci/apt-install.sh falls back to the public Ubuntu mirror on mirrors.edge.kernel.org when the runner cannot resolve the Ubuntu archive hosts; never called by the product" },
   { domain: "command.run", reason: "engine event name in mods/ais-usage, not a host" },
   { domain: "process.run", reason: "engine event name in mods/ais-usage, not a host" },
 ];
