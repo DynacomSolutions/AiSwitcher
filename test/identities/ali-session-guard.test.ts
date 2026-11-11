@@ -38,7 +38,10 @@ describe("the shared browser lock", () => {
         order.push(`${name}:out`);
       }, lock);
     await Promise.all([run("a"), run("b")]);
-    expect(order).toEqual(["a:in", "a:out", "b:in", "b:out"]);
+    // Either may win the lock first; what matters is that they never overlap.
+    const first = order[0]!.split(":")[0];
+    const second = first === "a" ? "b" : "a";
+    expect(order).toEqual([`${first}:in`, `${first}:out`, `${second}:in`, `${second}:out`]);
   });
 });
 
