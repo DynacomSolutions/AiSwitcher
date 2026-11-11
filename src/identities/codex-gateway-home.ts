@@ -50,6 +50,9 @@ function isLoopbackOrigin(base: string): boolean {
   }
 }
 
+/** The account id of the placeholder ChatGPT login of a gateway app (auth.json `chatgpt_account_id`); the gateway's accounts/check answer lists the same id. */
+export const codexGatewayAccountId = (app: string): string => `ais-${app}`;
+
 /** The placeholder ChatGPT login (auth.json text). The id_token carries a non-empty signature: codex 0.145 rejects an empty one. */
 export function buildCodexGatewayAuth(app: string, token: string): string {
   const header = b64url(JSON.stringify({ alg: "none", typ: "JWT" }));
@@ -58,10 +61,10 @@ export function buildCodexGatewayAuth(app: string, token: string): string {
       email: `${app}@gateway.invalid`,
       exp: 4102444800,
       iat: 1700000000,
-      "https://api.openai.com/auth": { chatgpt_plan_type: "pro", chatgpt_account_id: `ais-${app}` },
+      "https://api.openai.com/auth": { chatgpt_plan_type: "pro", chatgpt_account_id: codexGatewayAccountId(app) },
     }),
   );
-  return `${JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: `${header}.${claims}.c2ln`, access_token: token, refresh_token: "none", account_id: `ais-${app}` }, last_refresh: "2099-01-01T00:00:00Z" }, null, 2)}\n`;
+  return `${JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: `${header}.${claims}.c2ln`, access_token: token, refresh_token: "none", account_id: codexGatewayAccountId(app) }, last_refresh: "2099-01-01T00:00:00Z" }, null, 2)}\n`;
 }
 
 const HEADER = /^\s*\[\[?\s*([^\]]*?)\s*\]\]?\s*(?:#.*)?$/;

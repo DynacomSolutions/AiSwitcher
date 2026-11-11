@@ -815,8 +815,8 @@ describe("account API of the other providers", () => {
   for (const [method, path, want] of [
     ["GET", "/backend-api/plugins/featured", "/backend-api/plugins/featured"],
     ["GET", "/backend-api/ps/plugins/installed", "/backend-api/ps/plugins/installed"],
-    ["GET", "//backend-api/accounts/check", "/backend-api/accounts/check"],
-    ["GET", "/BACKEND-API/accounts/check", "/backend-api/accounts/check"],
+    ["GET", "//backend-api/accounts/settings", "/backend-api/accounts/settings"],
+    ["GET", "/BACKEND-API/accounts/settings", "/backend-api/accounts/settings"],
     ["POST", "/backend-api/wham/tasks", "/backend-api/wham/tasks"],
     ["GET", "/wham/tasks/list", "/backend-api/wham/tasks/list"],
   ] as const) {
@@ -829,6 +829,21 @@ describe("account API of the other providers", () => {
       expect(new URL(seen[0]!.url).pathname).toBe(want);
       expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
       expect(seen[0]!.headers.get("chatgpt-account-id")).toBe("acct");
+    });
+  }
+  for (const [label, opts] of [["pool", undefined], ["pinned", { target: { kind: "pin", identity: "a" } }]] as const) {
+    test(`codex ${label}: accounts/check is served from the app, no upstream call`, async () => {
+      await addApp("c", "codex", "openai", opts as never);
+      for (const path of ["/backend-api/wham/accounts/check", "/wham/accounts/check", "//BACKEND-API/wham/accounts/check", "/backend-api/accounts/check/v4-2023-04-27"]) {
+        seen.length = 0;
+        const res = await call("c", path);
+        expect(res.status).toBe(200);
+        expect(seen).toHaveLength(0);
+        const body = (await res.json()) as { default_account_id: string; accounts: Array<{ id: string; workspace_backend_origin: string }> };
+        expect(body.default_account_id).toBe("ais-c");
+        expect(body.accounts[0]!.id).toBe("ais-c");
+        expect(body.accounts[0]!.workspace_backend_origin).toBe("NO_CONSTRAINT");
+      }
     });
   }
   const others: Array<[GatewayProvider, ApiStyle, string, string, string]> = [

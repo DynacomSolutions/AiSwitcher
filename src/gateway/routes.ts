@@ -7,6 +7,7 @@ import { CODEX_UPSTREAM_BASE } from "./providers/codex.ts";
 import { KIMI_ANTHROPIC_BASE } from "./providers/kimi.ts";
 import { allowedMembers, memberUsages, utilisationOf } from "./select.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider } from "./types.ts";
+import { codexGatewayAccountId } from "../identities/codex-gateway-home.ts";
 import type { PoolUsage } from "../identities/pool/adapter.ts";
 
 /**
@@ -32,6 +33,10 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
  *   0.145 binary, and not proven live.
  * - Codex reset credits: `/wham/rate-limit-reset-credits` (also `/api/codex/...`), taken from the strings of the installed
  *   codex binary; its summary carries `available_count`.
+ * - Codex accounts check: `/wham/accounts/check` (also `/accounts/check[/<version>]`), which codex 0.167 calls on `account/read`
+ *   ("workspace routing discovery") and requires to list the selected workspace, i.e. the placeholder login's `ais-<app>` id.
+ *   Forwarded with the member's login it would list real workspaces, so the gateway serves a one-workspace answer built from
+ *   the app alone, for pool and pinned apps alike (no upstream call, no member data).
  * - Codex usage: `/wham/usage` (and `/api/codex/usage`), what codex 0.166 calls for `account/rateLimits/read` when its
  *   config sets `chatgpt_base_url` (T3 Code reads usage this way). Codex adds `/backend-api` to that base, so every codex
  *   served path is also accepted under `/backend-api`. Any other `/backend-api/*` path (plugins, `ps/plugins/*`) is
@@ -54,7 +59,7 @@ export type Route =
  */
 export type AccountOp = "forward" | "claude-usage" | "claude-org" | "codex-consume";
 
-export type ServedName = "codex-usage" | "codex-reset-credits" | "ali-models";
+export type ServedName = "codex-usage" | "codex-reset-credits" | "codex-accounts-check" | "ali-models";
 
 /** Served names a pinned app gets forwarded to the provider instead (the real body of its one identity). */
 export const PIN_FORWARD: Partial<Record<ServedName, string>> = {
@@ -204,6 +209,7 @@ function specialRoute(provider: GatewayProvider, style: ApiStyle, m: string, pat
     if (provider === "zai" && /^\/api\/monitor\/.+/.test(path)) return { kind: "account", op: "forward", url: `https://api.z.ai${orig}` };
     if (provider === "opencode" && /^(?:\/v1)?\/usage$/.test(path)) return { kind: "account", op: "forward", url: "https://opencode.ai/zen/go/v1/usage" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/rate-limit-reset-credits$/.test(path)) return { kind: "serve", name: "codex-reset-credits" };
+    if (provider === "codex" && /^(?:\/api\/codex|\/wham)?\/accounts\/check(?:\/[^/]+)?$/.test(path)) return { kind: "serve", name: "codex-accounts-check" };
     if (provider === "codex" && /^(?:\/api\/codex|\/wham)\/usage$/.test(path)) return { kind: "serve", name: "codex-usage" };
   }
   if (provider === "claude") {
@@ -259,7 +265,40 @@ export async function serveRoute(name: ServedName, ctx: ServeContext): Promise<R
       return codexUsage(ctx);
     case "codex-reset-credits":
       return codexResetCredits(ctx);
+    case "codex-accounts-check":
+      return codexAccountsCheck(ctx.app);
   }
+}
+
+/** codex 0.167 workspace routing discovery: one workspace, the placeholder login's id. Built from the app name only. */
+function codexAccountsCheck(app: GatewayApp): Response {
+  const id = codexGatewayAccountId(app.name);
+  return json({
+    accounts: [
+      {
+        id,
+        account_user_id: `user-ais__${id}`,
+        account_user_role: "account-owner",
+        structure: "workspace",
+        plan_type: "pro",
+        is_zdr: false,
+        is_openai_internal: false,
+        tbo_config: { plan_eligible: false, tbo_available: false, waitlist_info: "NO_WAITLIST" },
+        account_residency_region: "no_constraint",
+        can_access_with_session: true,
+        enable_account_switching: false,
+        is_deactivated: false,
+        is_fedramp_compliant_workspace: false,
+        workspace_backend_origin: "NO_CONSTRAINT",
+        account_routing_override: "NO_CONSTRAINT",
+        name: `AIS ${app.name}`,
+        profile_picture_url: null,
+        sso_connection_name: null,
+      },
+    ],
+    default_account_id: id,
+    account_ordering: [id],
+  });
 }
 
 /** The reading of the member the pool would route to: the pin, or the pool member with the lowest utilisation. */

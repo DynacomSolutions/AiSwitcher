@@ -255,3 +255,10 @@ ETA: 2026-11-12 03:00 ICT
 |---|---|---|---|---|---|---|---|
 | 180 | CI apt installs fall back to another Ubuntu mirror when runners cannot resolve the Ubuntu archive | done | claude | ci-pin-ubuntu-2404 | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/493 (e66915d); fallback seen in CI log.<br>Since 11 Nov ~13:47Z GitHub runners (24.04 and 26.04) cannot resolve the Ubuntu archive hosts; other hosts resolve. main CI red.<br>scripts/ci/apt-install.sh: default mirrors first, kernel.org mirror on failed fetch. |
 | 181 | Release test: shared browser lock test accepts either renewal winning the lock first | in_review | claude | fix-ali-lock-test-order | | 2026-11-12 03:00 ICT | v0.5.47 release failed on macOS: "two renewals take turns" asserted a before b; b won the lock, turns were still exclusive.<br>Test now checks no overlap in either order. |
+
+## 13. Codex clients through the gateway
+Keep new codex releases working against the AIS gateway placeholder login.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 182 | Gateway answers codex 0.167 workspace routing discovery (`wham/accounts/check`) | in_progress | claude | codex-accounts-check | | 2026-11-12 03:30 | Every T3 Codex instance fails: `account/read` returns "selected workspace missing from routing discovery".<br>Gateway forwards accounts/check to ChatGPT; real workspace ids never match the placeholder id `ais-<app>`.<br>Fix: serve one synthetic workspace with id `ais-<app>`. |
