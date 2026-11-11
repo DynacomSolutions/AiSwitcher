@@ -434,6 +434,20 @@ entry.
           "tools": [ /* mcp only: per-tool rows inside the server */ ]
         }
       ],
+      "projects": [             // estCostUsd-desc; claude/codex only
+        {
+          "path": "/work/acme/widget", // git root of the session cwd; raw cwd if no .git; "" if no cwd
+          "repo": "acme/widget",       // from the origin remote (any host); absent without one
+          "org": "acme",
+          "host": "example.com",
+          "source": "git",             // git | plain | missing | unknown
+          "inferred": undefined,       // true when repo/org were inferred for a missing folder
+          "turns": 412,
+          "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0,
+          "estCostUsd": 12.3,
+          "lastUsedAt": "2026-09-04T..."
+        }
+      ],
       "unavailable": undefined, // set (with reason) for tools without per-call local data
       "notes": [ /* e.g. models with no list price, excluded from estCostUsd */ ]
     }
@@ -446,7 +460,17 @@ All figures are ESTIMATES under one documented attribution rule (see
 `src/cli/usage/breakdown.ts`): prompt-side tokens (input, cache read,
 cache write) always sit on the `conversation` row, and output tokens split
 evenly across the turn's tool calls. The logs record usage per model turn,
-never per call, so nothing here is real billed spend. Only claude and
+never per call, so nothing here is real billed spend. `projects` uses a
+different rule: each usage event's FULL tokens (input, output, cache read,
+cache write; no tool split) go to the project of the session's cwd, so the
+project token sums equal the category sums. A cwd resolves by walking up to the
+nearest real git dir (a `.git` directory holding `HEAD`, a worktree
+`gitdir:` file whose `commondir` holds the shared config, or a bare mirror)
+and reading the `origin` URL; a stray empty `.git` folder is skipped.
+`source` is `missing` when the path does not exist on this host (for
+example a removed task worktree): such a row takes `repo`/`org` with
+`inferred: true` only when exactly one repo resolved in the same run has
+the folder's name. `unknown` means the session recorded no cwd. Clients group `projects` by `path`, `repo` or `org`. Only claude and
 codex produce rows; other tools return `unavailable` with a reason.
 
 ### Sessions

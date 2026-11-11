@@ -28,6 +28,7 @@ export const qk = {
   browsers: ["browsers"] as const,
   gatewayUsage: (days: number) => ["gateway-usage", days] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
+  breakdownProjects: (identity: string, days: number) => ["breakdown", "projects", identity, days] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
   sessionTree: (tool: string, identity: string, days: number, active: boolean) =>
     ["sessions", "tree", tool, identity, days, active] as const,
@@ -145,6 +146,19 @@ export function useBreakdownQuery(identity: string, tool: string, days: number) 
     queryKey: qk.breakdown(identity, tool, days),
     queryFn: () => api.getBreakdown(identity, tool, days),
     enabled: identity !== "" && tool !== "",
+    refetchInterval: (q) => (q.state.data?.pending ? 3000 : POLL.breakdown),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** Breakdown across every identity (or one), for the per-project views. Only
+ * fetches while `enabled`, so the heavy scan never runs unless a project tab
+ * is open. */
+export function useProjectsBreakdownQuery(identity: string | undefined, days: number, enabled: boolean) {
+  return useQuery({
+    queryKey: qk.breakdownProjects(identity ?? "", days),
+    queryFn: () => api.getBreakdown(identity, undefined, days),
+    enabled,
     refetchInterval: (q) => (q.state.data?.pending ? 3000 : POLL.breakdown),
     placeholderData: keepPreviousData,
   });

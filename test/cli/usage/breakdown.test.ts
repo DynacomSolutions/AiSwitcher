@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
   type BreakdownDeps,
   type BreakdownResult,
 } from "../../../src/cli/usage/breakdown.ts";
+import { inferMissingRepos, parseRemoteUrl, resolveProjectFromFs, type BreakdownProject } from "../../../src/cli/usage/breakdown.ts";
 import { breakdownProjectionCachePath } from "../../../src/cli/usage/breakdown-projection-cache.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
@@ -62,9 +63,11 @@ function claudeAssistantLine(opts: {
   cacheRead?: number;
   cacheWrite?: number;
   tools?: string[];
+  cwd?: string;
 }): string {
   return JSON.stringify({
     type: "assistant",
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
     timestamp: opts.at,
     message: {
       role: "assistant",
@@ -87,11 +90,12 @@ function claudeAssistantLine(opts: {
 function codexRolloutLines(opts: {
   model: string;
   turnId: string;
+  cwd?: string;
   calls?: Array<{ name: string; at: string }>;
   deltas?: Array<{ at: string; input: number; cached: number; cacheWrite: number; output: number }>;
 }): string[] {
   const lines: string[] = [
-    JSON.stringify({ timestamp: opts.calls?.[0]?.at ?? day(1), type: "turn_context", payload: { turn_id: opts.turnId, model: opts.model } }),
+    JSON.stringify({ timestamp: opts.calls?.[0]?.at ?? day(1), type: "turn_context", payload: { turn_id: opts.turnId, model: opts.model, ...(opts.cwd ? { cwd: opts.cwd } : {}) } }),
   ];
   for (const call of opts.calls ?? []) {
     lines.push(JSON.stringify({ timestamp: call.at, type: "response_item", payload: { type: "function_call", name: call.name, call_id: "c" } }));
@@ -518,10 +522,141 @@ describe("durable breakdown projections", () => {
     const reads: string[] = [];
     const cachePath = breakdownProjectionCachePath("claude", identity().name, identity().configDir, path, { cacheDir });
     await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
-    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 1, fingerprint: "stable", events: [[null, "bad", "not-a-number"]] }));
+    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 2, fingerprint: "stable", events: [[null, "bad", "not-a-number"]] }));
     const result = await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
     expect(category(result, "conversation").inputTokens).toBe(22);
     expect(reads).toEqual([path, path]);
-    expect(JSON.parse(readFileSync(cachePath, "utf8")).events[0]).toHaveLength(7);
+    expect(JSON.parse(readFileSync(cachePath, "utf8")).events[0]).toHaveLength(8);
+  });
+});
+
+describe("project / repo / org attribution", () => {
+  function fixtureTree() {
+    const root = mkdtempSync(join(tmpdir(), "ais-breakdown-projects-"));
+    projectionDirs.push(root);
+    // Main checkout holding the shared config, plus a linked worktree.
+    const main = join(root, "widget");
+    mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
+    mkdirSync(join(main, ".git", "objects"));
+    writeFileSync(join(main, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(main, ".git", "config"), '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@example.com:acme/widget.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n');
+    writeFileSync(join(main, ".git", "worktrees", "wt", "HEAD"), "ref: refs/heads/wt\n");
+    writeFileSync(join(main, ".git", "worktrees", "wt", "commondir"), "../..\n");
+    const worktree = join(root, "widget-wt");
+    mkdirSync(join(worktree, "src"), { recursive: true });
+    writeFileSync(join(worktree, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
+    const plain = join(root, "scratch");
+    mkdirSync(plain);
+    const missing = join(root, "gone", "elsewhere");
+    return { worktree, plain, missing };
+  }
+
+  const sumTokens = (rows: Array<{ inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }>) =>
+    rows.reduce((n, r) => n + r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens, 0);
+
+  test("claude: git worktree, plain dir, missing path and no cwd; token sums match categories", async () => {
+    const { worktree, plain, missing } = fixtureTree();
+    const path = `${identity().configDir}/projects/p/a.jsonl`;
+    const files = { [path]: { mtimeMs: NOW_MS, lines: [
+      claudeAssistantLine({ at: day(0), input: 1000, output: 100, cacheRead: 50, cacheWrite: 10, tools: ["Bash", "Read"], cwd: join(worktree, "src") }),
+      claudeAssistantLine({ at: day(0), input: 200, output: 21, tools: ["Bash"], cwd: worktree }),
+      claudeAssistantLine({ at: day(0), input: 30, output: 3, cwd: plain }),
+      claudeAssistantLine({ at: day(0), input: 40, output: 4, cwd: missing }),
+      claudeAssistantLine({ at: day(0), input: 5, output: 1 }),
+      claudeAssistantLine({ at: day(40), input: 9999, output: 9999, cwd: plain }),
+    ] } };
+    const result = await claudeResult(files);
+    const projects = result.projects!;
+    expect(projects).toHaveLength(4);
+    const git = projects.find((p) => p.source === "git")!;
+    expect(git).toMatchObject({ path: worktree, repo: "acme/widget", org: "acme", host: "example.com", turns: 2, inputTokens: 1200, outputTokens: 121, cacheReadTokens: 50, cacheWriteTokens: 10 });
+    expect(git.estCostUsd).toBeGreaterThan(0);
+    expect(projects.find((p) => p.source === "plain")).toMatchObject({ path: plain, turns: 1, inputTokens: 30 });
+    expect(projects.find((p) => p.source === "plain")!.repo).toBeUndefined();
+    expect(projects.find((p) => p.source === "missing")).toMatchObject({ path: missing, inputTokens: 40 });
+    expect(projects.find((p) => p.source === "unknown")).toMatchObject({ path: "", inputTokens: 5 });
+    expect(sumTokens(projects)).toBe(sumTokens(result.categories));
+    const costs = projects.map((p) => p.estCostUsd);
+    expect(costs).toEqual([...costs].sort((a, b) => b - a));
+  });
+
+  test("codex: cwd from session_meta/turn_context applies to following usage events", async () => {
+    const { worktree, plain } = fixtureTree();
+    const path = `${identity().configDir}/sessions/a.jsonl`;
+    const files = { [path]: { mtimeMs: NOW_MS, lines: [
+      JSON.stringify({ timestamp: day(0), type: "session_meta", payload: { id: "s", cwd: worktree } }),
+      ...codexRolloutLines({ model: "gpt-5", turnId: "a", calls: [{ name: "Bash", at: day(0) }], deltas: [{ at: day(0), input: 100, cached: 20, cacheWrite: 10, output: 9 }] }),
+      ...codexRolloutLines({ model: "gpt-5", turnId: "b", cwd: plain, deltas: [{ at: day(0), input: 50, cached: 0, cacheWrite: 0, output: 4 }] }),
+    ] } };
+    const result = await codexResult(files);
+    const projects = result.projects!;
+    expect(projects.find((p) => p.source === "git")).toMatchObject({ repo: "acme/widget", org: "acme", host: "example.com", turns: 1, inputTokens: 70, cacheReadTokens: 20, cacheWriteTokens: 10, outputTokens: 9 });
+    expect(projects.find((p) => p.source === "plain")).toMatchObject({ turns: 1, inputTokens: 50, outputTokens: 4 });
+    expect(sumTokens(projects)).toBe(sumTokens(result.categories));
+  });
+
+  test("injected resolver is used and unavailable tools carry no projects", async () => {
+    const path = `${identity().configDir}/projects/p/a.jsonl`;
+    const files = { [path]: { mtimeMs: NOW_MS, lines: [claudeAssistantLine({ at: day(0), input: 7, cwd: "/work/acme/widget/sub" })] } };
+    const result = await collectIdentityBreakdown("claude", identity(), 30, { ...fakeDeps(files), resolveProject: (cwd) => ({ path: "/work/acme/widget", source: "git", repo: "acme/widget", org: "acme", host: "example.com" }) });
+    expect(result.projects).toEqual([expect.objectContaining({ path: "/work/acme/widget", repo: "acme/widget", turns: 1 })]);
+    expect((await collectIdentityBreakdown("grok", identity(), 30, {})).projects).toBeUndefined();
+  });
+
+  test("old 7-length claude cache (schema 1) is rejected and re-read", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "ais-breakdown-cache-"));
+    projectionDirs.push(cacheDir);
+    const path = `${identity().configDir}/projects/proj/a.jsonl`;
+    const files = { [path]: { mtimeMs: NOW_MS, lines: [claudeAssistantLine({ at: day(0), input: 22, cwd: "/work/acme/widget" })] } };
+    const cachePath = breakdownProjectionCachePath("claude", identity().name, identity().configDir, path, { cacheDir });
+    mkdirSync(join(cachePath, ".."), { recursive: true });
+    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 1, fingerprint: "stable", events: [[NOW_MS, "claude-sonnet-5", 99, 0, 0, 0, []]] }));
+    const reads: string[] = [];
+    const result = await collectIdentityBreakdown("claude", identity(), 30, { ...fakeDeps(files), projectionCacheDir: cacheDir, sourceFingerprint: () => "stable", onSourceFileRead: (p) => reads.push(p) });
+    expect(reads).toEqual([path]);
+    expect(category(result, "conversation").inputTokens).toBe(22);
+    expect(JSON.parse(readFileSync(cachePath, "utf8")).schemaVersion).toBe(2);
+  });
+
+  test("resolver: a stray .git folder is skipped; a bare mirror resolves from its own config", () => {
+    const root = mkdtempSync(join(tmpdir(), "ais-breakdown-resolve-"));
+    projectionDirs.push(root);
+    // An empty `.git` folder (not a repository) above a plain directory.
+    const group = join(root, "group");
+    mkdirSync(join(group, ".git", "info"), { recursive: true });
+    mkdirSync(join(group, "notes"));
+    expect(resolveProjectFromFs(join(group, "notes"))).toEqual({ path: join(group, "notes"), source: "plain" });
+    // A bare mirror: HEAD, objects and config directly in the folder.
+    const mirror = join(root, "acme", "widget");
+    mkdirSync(join(mirror, "objects"), { recursive: true });
+    writeFileSync(join(mirror, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(mirror, "config"), '[core]\n\tbare = true\n[remote "origin"]\n\turl = https://example.com/acme/widget.git\n');
+    expect(resolveProjectFromFs(mirror)).toEqual({ path: mirror, source: "git", repo: "acme/widget", org: "acme", host: "example.com" });
+  });
+
+  test("parseRemoteUrl handles https, scp-like and ssh:// remotes", () => {
+    const want = { host: "example.com", repo: "acme/widget", org: "acme" };
+    expect(parseRemoteUrl("https://example.com/acme/widget.git")).toEqual(want);
+    expect(parseRemoteUrl("https://user@example.com:8443/acme/widget")).toEqual(want);
+    expect(parseRemoteUrl("git@example.com:acme/widget.git")).toEqual(want);
+    expect(parseRemoteUrl("ssh://git@example.com:2222/acme/widget.git")).toEqual(want);
+    expect(parseRemoteUrl("/srv/local/repo.git")).toBeUndefined();
+  });
+});
+
+describe("inferMissingRepos", () => {
+  const row = (path: string, source: BreakdownProject["source"], repo?: string): BreakdownProject => ({
+    path, source, ...(repo ? { repo, org: repo.split("/")[0], host: "example.com" } : {}),
+    turns: 1, inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estCostUsd: 0, lastUsedAt: null,
+  });
+  const result = (projects: BreakdownProject[]) => ({ identity: "a", tool: "claude" as const, windowDays: 7, generatedAt: "", filesRead: 1, categories: [], projects });
+
+  test("a missing folder named like exactly one known repo takes that repo, marked inferred", () => {
+    const known = result([row("/work/acme/widget", "git", "acme/widget"), row("/work/x/gadget", "git", "acme/gadget"), row("/work/y/gadget", "git", "other/gadget")]);
+    const gone = result([row("/work/tasks/t1/widget", "missing"), row("/work/tasks/t2/gadget", "missing"), row("/work/tasks/t3/nothing", "missing")]);
+    inferMissingRepos([known, gone]);
+    expect(gone.projects[0]).toMatchObject({ repo: "acme/widget", org: "acme", host: "example.com", inferred: true, source: "missing" });
+    expect(gone.projects[1]!.repo).toBeUndefined(); // ambiguous: two repos named gadget
+    expect(gone.projects[2]!.repo).toBeUndefined();
   });
 });

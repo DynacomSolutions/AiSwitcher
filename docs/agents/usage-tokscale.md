@@ -301,4 +301,10 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 76
   isolated scan worker behind `/api/usage/breakdown` (60s server cache,
   240s child ceiling; a 12GB codex store needs minutes), and the CLI is
   `ais usage breakdown [identity] [--tool=] [--days=30] [--json]`.
+  **Per-project rows (`projects`) follow a second, simpler rule:** each
+  usage event's full tokens go to the project of its session cwd (claude:
+  top-level `cwd` on the usage line; codex: `session_meta`/`turn_context`
+  payload cwd, projected as `["p", cwd]` events), resolved by pure file
+  reads (no git subprocess) and memoised per collection run. The
+  projection cache and snapshot schema versions were bumped to 2 for this.
 

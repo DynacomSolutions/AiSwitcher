@@ -8,7 +8,7 @@ import { clampBreakdownDays, DEFAULT_BREAKDOWN_DAYS, runBreakdownQuery, type Bre
 
 export const USAGE_BREAKDOWN_TTL_MS = 15 * 60_000;
 const DEFAULT_ROOT = join(aisCacheDir(), "usage", "breakdown");
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2 as const;
 
 export interface UsageBreakdownRequest {
   tool?: string;
@@ -39,7 +39,7 @@ export interface BreakdownSnapshotDeps {
 }
 
 interface CachedBreakdown {
-  schemaVersion: 1;
+  schemaVersion: typeof SCHEMA_VERSION;
   key: string;
   /** Stored so source-dirty events can refresh known queries without history scans. */
   query: NormalizedUsageBreakdownRequest;
@@ -49,7 +49,7 @@ interface CachedBreakdown {
 }
 
 interface QueuedRequest {
-  schemaVersion: 1;
+  schemaVersion: typeof SCHEMA_VERSION;
   key: string;
   requestId: string;
   query: NormalizedUsageBreakdownRequest;
@@ -57,7 +57,7 @@ interface QueuedRequest {
 }
 
 interface RequestStatus {
-  schemaVersion: 1;
+  schemaVersion: typeof SCHEMA_VERSION;
   key: string;
   lastError?: { category: "source-error"; at: string };
 }

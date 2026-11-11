@@ -62,7 +62,7 @@ export function ErrorBanner({ message }: { message: string }) {
   return (
     <div className="flex items-start gap-2 rounded-lg border border-red-500/25 bg-red-500/8 px-3 py-2.5 text-sm text-red-600 dark:text-red-400">
       <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0" />
-      <span className="break-words">{message}</span>
+      <span className="min-w-0 [overflow-wrap:anywhere]">{message}</span>
     </div>
   );
 }

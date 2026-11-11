@@ -409,6 +409,29 @@ export interface BreakdownCategory {
   tools?: BreakdownCategory[];
 }
 
+/** One working directory's usage inside a breakdown window. */
+export interface BreakdownProject {
+  /** Git working-tree root, the raw cwd if there is no .git, "" if no cwd was recorded. */
+  path: string;
+  /** "owner/name" from the origin remote. */
+  repo?: string;
+  /** Owner part of `repo`. */
+  org?: string;
+  /** Remote host. */
+  host?: string;
+  source: "git" | "plain" | "missing" | "unknown";
+  /** Set when repo/org were inferred for a missing folder from a uniquely
+   * matching repo name seen in the same collection run. */
+  inferred?: true;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  estCostUsd: number;
+  lastUsedAt: string | null;
+}
+
 export interface BreakdownResult {
   identity: string;
   tool: ToolName;
@@ -416,6 +439,8 @@ export interface BreakdownResult {
   generatedAt: string;
   filesRead: number;
   categories: BreakdownCategory[];
+  /** Per working directory; absent on servers that predate it. */
+  projects?: BreakdownProject[];
   unavailable?: string;
   notes?: string[];
 }
