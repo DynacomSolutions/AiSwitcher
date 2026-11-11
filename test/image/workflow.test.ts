@@ -41,7 +41,7 @@ describe("live-image workflow", () => {
     expect(evaluate(false, "success", "false")).toBe(false);
     expect(evaluate(true, "success", "true")).toBe(false);
     expect(text).not.toMatch(/^\s*schedule:/m);
-    expect(text).not.toMatch(/runs-on: (?!ubuntu-latest)/);
+    expect(text).not.toMatch(/runs-on: (?!ubuntu-24.04)/);
   });
 });
 

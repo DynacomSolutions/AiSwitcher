@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.tag.outputs.sha }}
@@ -92,7 +92,7 @@ jobs:
   release:
     needs: [validate, checks, sign]
     if: ${{ needs.sign.outputs.ready == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
@@ -163,7 +163,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: windows-x64
             filename: ais-host-windows-x64.zip
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: linux-x64
             filename: ais-host-linux-x64.AppImage

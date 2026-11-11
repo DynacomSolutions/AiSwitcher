@@ -4,9 +4,9 @@ Read before touching either release pipeline.
 
 ## Portable host releases
 
-`host-app.yml` uses GitHub-hosted `macos-latest` arm64 and `ubuntu-latest`
+`host-app.yml` uses GitHub-hosted `macos-latest` arm64 and `ubuntu-24.04`
 x86_64 runners. Windows x86_64 is compiled, linted, packaged (NSIS installer
-and portable zip) and test-built on `ubuntu-latest` with a pinned `cargo-xwin`
+and portable zip) and test-built on `ubuntu-24.04` with a pinned `cargo-xwin`
 (`windows-build`); `windows-latest` only runs the resulting test executables
 and the package launch smoke (`windows-test`, via `scripts/host/windows-tests.ts`).
 Integration tests find their spawned binaries through `AIS_TEST_BIN_DIR`

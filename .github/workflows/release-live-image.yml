@@ -14,7 +14,7 @@ defaults:
 
 jobs:
   signing:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
@@ -36,7 +36,7 @@ jobs:
   publish:
     needs: [image, signing]
     if: ${{ needs.signing.outputs.enabled == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write

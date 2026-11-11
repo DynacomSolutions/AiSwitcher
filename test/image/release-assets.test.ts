@@ -23,7 +23,7 @@ describe("live image release contract", () => {
       expect(workflow).not.toMatch(/^\s*schedule:/m);
       expect(workflow.toLowerCase()).not.toContain("docker");
       expect([...workflow.matchAll(/^\s*runs-on:\s*(.+)$/gm)].length).toBeGreaterThan(0);
-      for (const [, runner] of workflow.matchAll(/^\s*runs-on:\s*(.+)$/gm)) expect(runner.trim()).toBe("ubuntu-latest");
+      for (const [, runner] of workflow.matchAll(/^\s*runs-on:\s*(.+)$/gm)) expect(runner.trim()).toBe("ubuntu-24.04");
       const externalActions = workflow.split("\n").filter((entry) => /^\s*(?:- )?uses:\s/.test(entry) && !entry.includes("./.github/workflows/"));
       expect(externalActions.length).toBeGreaterThan(0);
       for (const line of externalActions) {

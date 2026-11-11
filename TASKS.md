@@ -235,3 +235,11 @@ ETA: 2026-11-08 18:00 ICT
 |---|---|---|---|---|---|---|---|
 | 154 | Side panel shows only the agent sessions using the current tab, with Pause/Stop/Resume; tab group title is the session name | done | claude | sidepanel-current-tab | | 2026-11-08 18:00 ICT | Empty state "No agent is using this tab."<br>Session name from AIS_SESSION_NAME, else the short session id; never the identity.<br>Same PR: agents never foreground a tab (tabs.create was active:true, bringToFront used tabs.update active); one tab group per session (concurrent first calls raced, shim random session id per spawn).<br>Also: owner can grant one of their own tab groups to a session (side panel Grant/Revoke; no rename/close).<br>Tests: tab to session mapping, grants, groups, background sequence, shim and gateway labels. |
 | 172 | Codex pool/local-route folders can read usage (codex-home for local gateway routes) | done | claude-20261110-gw-codex-usage | codex-home-local-route | | | A codex folder routed to the local gateway (base_url `http://127.0.0.1:<port>/codex`) showed "could not read usage (-32600)": it holds the API-key entry, and `ais gateway codex-home` took the route name as the app, so it looked for the wrong app key.<br>codex-home, `--check`, the pool entry and rotation now map a local route to its app; the cluster form is unchanged.<br>`ais doctor` names the codex-home command for a routed folder that answers -32600.<br>Not proven live. |
+
+## 12. CI runner reliability
+Keep CI green when a GitHub-hosted runner image breaks.
+ETA: 2026-11-12 12:00 ICT
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 180 | Pin Linux CI jobs to ubuntu-24.04: ubuntu-26.04 apt cannot resolve Ubuntu mirrors | in_progress | claude | ci-pin-ubuntu-2404 | | 2026-11-12 12:00 ICT | Since 11 Nov ~13:47Z every apt step on ubuntu-latest (ubuntu-26.04) fails: apt cannot resolve the Ubuntu mirror hosts. main CI red too.<br>Fix: runs-on ubuntu-24.04 in all workflows. |

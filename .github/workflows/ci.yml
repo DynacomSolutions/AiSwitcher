@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Gateway store tests (test/gateway/pg-store.test.ts), on a pinned
     # TimescaleDB image so the hypertable path is exercised.
     services:
@@ -107,7 +107,7 @@ jobs:
   # Decides whether the macOS job is needed. Pushes to main always run it.
   # The host app is built and tested by host-app.yml.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       macos: ${{ steps.filter.outputs.macos }}
       extension: ${{ steps.filter.outputs.extension }}
@@ -172,7 +172,7 @@ jobs:
   extension:
     needs: changes
     if: needs.changes.outputs.extension == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -193,7 +193,7 @@ jobs:
 
   # Builds the WebUI and loads every route in real Chromium at phone widths (apps/web/test/mobile-layout.e2e.ts).
   web:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -221,7 +221,7 @@ jobs:
   ci-gate:
     if: always()
     needs: [test, changes, test-macos, extension, web]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Fail if any needed job failed or was cancelled

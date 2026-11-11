@@ -16,7 +16,7 @@ export function aggregatePassed(changes: string, selection: string, checks: stri
 
 export function checkWorkflow(workflow: Workflow, release: boolean): string[] {
   const errors: string[] = [];
-  const allowed = ["ubuntu-latest", "macos-latest", "windows-latest"];
+  const allowed = ["ubuntu-24.04", "macos-latest", "windows-latest"];
   if (JSON.stringify(workflow.permissions) !== '{"contents":"read"}') errors.push("Default permissions must be contents: read only.");
   if ("schedule" in workflow.on || "pull_request_target" in workflow.on) errors.push("Unsupported workflow trigger.");
   for (const [name, job] of Object.entries(workflow.jobs)) {

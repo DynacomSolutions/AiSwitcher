@@ -26,7 +26,7 @@ defaults:
 jobs:
   # Decides whether the image build is needed. Fails open: any doubt builds.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
       affected: ${{ steps.filter.outputs.affected }}
@@ -61,7 +61,7 @@ jobs:
   build:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.affected != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -301,7 +301,7 @@ jobs:
   gate:
     needs: [changes, build]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Fail when a needed job failed or was cancelled
