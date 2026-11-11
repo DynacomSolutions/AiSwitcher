@@ -242,5 +242,5 @@ ETA: 2026-11-12 12:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 175 | Split Usage, Dashboard, Limits and Breakdown into URL-path tabs | in_review | claude | ais-webui-tabs-usage-breakdown | | 2026-11-12 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/489.<br>Owner request 2026-11-11: pages too long.<br>Usage: overview, models, sources, projects, repos, orgs, gateway apps. |
+| 178 | Split Usage, Dashboard, Limits and Breakdown into URL-path tabs | in_review | claude | ais-webui-tabs-usage-breakdown | | 2026-11-12 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/489.<br>Was 175 (clash with 6.175). Owner request 2026-11-11: pages too long.<br>Usage: overview, models, sources, projects, repos, orgs, gateway apps. |
 | 176 | Usage chart: total on hover, readable axis text in dark mode, tooltips on one line | in_review | claude | ais-webui-tabs-usage-breakdown | | 2026-11-12 12:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/489.<br>Axis ticks used theme `color`, which SVG text ignores (needs `fill`). |
