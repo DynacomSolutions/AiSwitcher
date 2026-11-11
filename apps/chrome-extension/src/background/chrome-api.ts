@@ -26,6 +26,10 @@ export interface ChromeApi {
     group(tabIds: number[], groupId?: number): Promise<number>;
     ungroup(tabIds: number[]): Promise<void>;
     onRemoved(listener: (tabId: number) => void): void;
+    /** Makes the tab the active one in its window. Only used to give the owner back the tab they were on. */
+    activate(tabId: number): Promise<void>;
+    onCreated(listener: (tab: TabInfo) => void): void;
+    onActivated(listener: (tabId: number, windowId: number) => void): void;
   };
   tabGroups: {
     update(groupId: number, props: { title: string; color: GroupColor }): Promise<void>;
@@ -69,6 +73,9 @@ export function realChromeApi(): ChromeApi {
       group: (tabIds, groupId) => { const ids = tabIds as [number, ...number[]]; return chrome.tabs.group(groupId === undefined ? { tabIds: ids } : { tabIds: ids, groupId }); },
       ungroup: async tabIds => { await chrome.tabs.ungroup(tabIds as [number, ...number[]]); },
       onRemoved: listener => chrome.tabs.onRemoved.addListener(listener),
+      activate: async tabId => { await chrome.tabs.update(tabId, { active: true }); },
+      onCreated: listener => chrome.tabs.onCreated.addListener(t => listener(toTab(t))),
+      onActivated: listener => chrome.tabs.onActivated.addListener(info => listener(info.tabId, info.windowId)),
     },
     tabGroups: {
       update: async (groupId, props) => { await chrome.tabGroups.update(groupId, props); },

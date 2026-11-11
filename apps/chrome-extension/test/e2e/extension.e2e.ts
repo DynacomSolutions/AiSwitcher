@@ -202,6 +202,8 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
           const u = new URL(req.url);
           const body = u.pathname === "/second"
             ? `<h1>Second page</h1><p id="p">Landed.</p>`
+            : u.pathname === "/opener"
+            ? `<h1>Opener</h1><a id="open" href="/second" target="_blank">Open in new tab</a>`
             : `<h1>Fixture</h1><p id="out">idle</p><button id="go" onclick="out.textContent='go clicked'">Go</button><button id="save" onclick="out.textContent='save clicked'">Save</button><button id="bottom" onclick="out.textContent='bottom clicked'" onmouseenter="window.enters=(window.enters||0)+1" onmouseleave="window.leaves=(window.leaves||0)+1">Bottom</button>`;
           return new Response(page(u.pathname === "/second" ? "Second" : "Fixture", body), { headers: { "content-type": "text/html" } });
         },
@@ -435,6 +437,26 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(await call(agents.b!, "screenshot", { tabId: tabA })).toMatchObject({ ok: false, error: "forbidden_tab" });
     expect(await call(agents.a!, "navigate", { tabId: tabB, url: "https://example.test/" })).toMatchObject({ ok: false, error: "forbidden_tab" });
     expect((await call(agents.b!, "screenshot", { tabId: tabB })).ok).toBe(true);
+  });
+
+  it("a target=_blank link the agent clicks opens behind the owner's tab and joins the agent's group", async () => {
+    const tabInfo = (id: number) => sw.eval<{ active: boolean; groupId: number }>(`chrome.tabs.get(${id}).then(t => ({ active: t.active, groupId: t.groupId }))`);
+    const made = JSON.parse(textOf(await call(agents.a!, "tabs_create", { url: `http://127.0.0.1:${site.port}/opener` }))) as { tabId: number };
+    await sw.eval(`chrome.tabs.update(${tabB}, { active: true })`); // the owner's tab
+    const tree = textOf(await call(agents.a!, "read_page", { tabId: made.tabId }));
+    const link = /link "Open in new tab" \[(ref_\d+)\]/.exec(tree)?.[1];
+    expect(link).toBeDefined();
+    const before = new Set(await sw.eval<number[]>(`chrome.tabs.query({}).then(ts => ts.map(t => t.id))`));
+    expect((await call(agents.a!, "click", { tabId: made.tabId, ref: link })).ok).toBe(true);
+    const opened = await until("tab opened by the page", async () => (await sw.eval<number[]>(`chrome.tabs.query({}).then(ts => ts.filter(t => (t.url || t.pendingUrl || "").endsWith("/second")).map(t => t.id))`)).find(id => !before.has(id)));
+    await until("owner's tab active again", async () => (await tabInfo(tabB)).active);
+    await sleep(300); // nothing flips it back
+    expect((await tabInfo(tabB)).active).toBe(true);
+    expect((await tabInfo(opened)).active).toBe(false);
+    expect((await tabInfo(opened)).groupId).toBe((await tabInfo(made.tabId)).groupId);
+    const ctx = JSON.parse(textOf(await call(agents.a!, "tabs_context"))) as { sessionTabs: Array<{ tabId: number }> };
+    expect(ctx.sessionTabs.map(t => t.tabId)).toContain(opened);
+    for (const id of [opened, made.tabId]) expect((await call(agents.a!, "close_tab", { tabId: id })).ok).toBe(true);
   });
 
   async function panel(): Promise<Session> {
