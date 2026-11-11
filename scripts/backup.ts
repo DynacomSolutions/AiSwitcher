@@ -48,6 +48,8 @@ type BackupGroup = keyof typeof BACKUP_GROUPS;
 // ".claude/identities/*/sessions/": per-pid <pid>.<hash>.key runtime files that churn constantly.
 // ".codex/tmp/", ".codex/identities/*/tmp/": codex scratch (arg0 symlink farms, apply_patch shims) that
 // vanishes mid-add and makes git abort; nothing there is worth restoring (see TMP_PATH_RE).
+// ".codex/.tmp/", ".codex/identities/*/.tmp/": codex 0.16x scratch git clones (git-*, plugins-clone-*); git refuses
+// to index a clone with no commit checked out, so each one printed "unable to index file".
 const BACKUP_EXCLUDES = [
   ...REPRODUCIBLE_JUNK_DIR_NAMES,
   "*.lock",
@@ -60,9 +62,11 @@ const BACKUP_EXCLUDES = [
   ".claude/identities/*/sessions/",
   ".codex/tmp/",
   ".codex/identities/*/tmp/",
+  ".codex/.tmp/",
+  ".codex/identities/*/.tmp/",
 ];
 /** Home-relative paths under the volatile tmp trees above; mirrors BACKUP_EXCLUDES for code that bypasses the exclude file. */
-const TMP_PATH_RE = /^\.codex\/(identities\/[^/]+\/)?tmp(\/|$)/;
+const TMP_PATH_RE = /^\.codex\/(identities\/[^/]+\/)?\.?tmp(\/|$)/;
 
 function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
