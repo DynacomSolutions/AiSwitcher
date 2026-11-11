@@ -139,3 +139,17 @@ describe("OverlayUi session end and races", () => {
     expect(f.calls.map(c => c.method)).toEqual(["mark", "suspend", "restore"]);
   });
 });
+
+import { updateView } from "../src/sidepanel/sidepanel.ts";
+describe("side panel updates card", () => {
+  const u = { running: "0.5.45", auto: true };
+  test("states", () => {
+    expect(updateView({ ...u, latest: "0.5.46" })).toMatchObject({ canUpdate: true, text: "Version 0.5.46 is available." });
+    expect(updateView({ ...u, latest: "0.5.45" })).toMatchObject({ canUpdate: false, text: "Up to date." });
+    expect(updateView({ ...u, hostMissing: true }).text).toContain("Run ais update once");
+    expect(updateView({ ...u, updating: true })).toMatchObject({ canUpdate: false, canCheck: false });
+    expect(updateView({ ...u, waitingForIdle: true }).text).toContain("restarts when");
+    expect(updateView({ ...u, error: "HTTP 503" }).tone).toBe("bad");
+    expect(updateView(u).text).toBe("Not checked yet.");
+  });
+});

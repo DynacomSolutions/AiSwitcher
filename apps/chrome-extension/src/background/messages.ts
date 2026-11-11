@@ -13,6 +13,7 @@ export interface MessageDeps {
   /** Grants a user's tab group to a live session. */
   grant(groupId: number, sessionId: string): Promise<GrantResult>;
   revoke(groupId: number): Promise<void>;
+  updater?: { check(): Promise<unknown>; update(): Promise<void>; setAuto(enabled: boolean): Promise<void> };
 }
 
 /**
@@ -49,6 +50,14 @@ export function handleMessage(msg: unknown, sender: MessageSender, reply: (r: un
       return true;
     }
     case "ais-status": void deps.status().then(reply); return true;
+    case "ais-update-check": if (!deps.updater) return false; void deps.updater.check().then(() => reply({ ok: true })); return true;
+    case "ais-update-now": if (!deps.updater) return false; void deps.updater.update().then(() => reply({ ok: true })); return true;
+    case "ais-update-auto": {
+      const { enabled } = msg as { enabled?: unknown };
+      if (!deps.updater || typeof enabled !== "boolean") { reply({ ok: false, error: "bad_args" }); return false; }
+      void deps.updater.setAuto(enabled).then(() => reply({ ok: true }));
+      return true;
+    }
     default: return false;
   }
 }

@@ -19,7 +19,7 @@ export async function runBrowserCommand(positionals: string[], flags: ParsedArgs
     return;
   }
   if (sub === "extension") {
-    await runBrowserExtension(rest, flags, { ...(deps.extensionDir !== undefined ? { extensionDir: deps.extensionDir } : {}), ...(deps.fetch ? { fetch: deps.fetch } : {}), ...(deps.out ? { out: deps.out } : {}), ...(deps.env ? { env: deps.env } : {}), ...(deps.platform ? { platform: deps.platform } : {}), ...(deps.run ? { run: deps.run } : {}) });
+    await runBrowserExtension(rest, flags, { ...(deps.extensionDir !== undefined ? { extensionDir: deps.extensionDir } : {}), ...(deps.home !== undefined ? { home: deps.home } : {}), ...(deps.fetch ? { fetch: deps.fetch } : {}), ...(deps.out ? { out: deps.out } : {}), ...(deps.env ? { env: deps.env } : {}), ...(deps.platform ? { platform: deps.platform } : {}), ...(deps.run ? { run: deps.run } : {}) });
     return;
   }
   await runBrowserAdmin(sub, rest, flags, { ...defaultDeps(), ...deps });

@@ -5,6 +5,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { stringFlag, type ParsedArgs } from "../args.ts";
 import { downloadAsset } from "../../shared/release-assets.ts";
 import { CliUsageError } from "../errors.ts";
+import { aisCommand, installNativeHost, runNativeHost } from "./native-host.ts";
 
 export const EXTENSION_REPO = "DynacomSolutions/AiSwitcher";
 export const EXTENSION_ASSET = "ais-browser-extension.zip";
@@ -20,6 +21,8 @@ export interface CommandResult {
 export interface ExtensionDeps {
   /** Fixed folder the user loads unpacked in Chrome. Defaults to ~/.ais/browser-extension. */
   extensionDir: string;
+  /** Home folder for the helper launcher and Chrome's NativeMessagingHosts. */
+  home: string;
   fetch: typeof fetch;
   out: (line: string) => void;
   env: Record<string, string | undefined>;
@@ -40,6 +43,7 @@ async function defaultRun(cmd: string[]): Promise<CommandResult> {
 
 const defaults = (): ExtensionDeps => ({
   extensionDir: defaultExtensionDir(),
+  home: homedir(),
   fetch,
   out: (line) => console.info(line),
   env: process.env,
@@ -103,7 +107,12 @@ export async function swapIn(target: string, fresh: string, warn: (line: string)
   }
 }
 
-async function updateExtension(from: string | undefined, deps: ExtensionDeps): Promise<void> {
+/** Registers the self-update helper with Chrome for the extension folder. */
+export async function installHost(deps: Pick<ExtensionDeps, "extensionDir" | "home" | "platform" | "out">): Promise<string[]> {
+  return installNativeHost({ extensionDir: resolve(deps.extensionDir), home: deps.home, platform: deps.platform, command: aisCommand(), out: deps.out });
+}
+
+async function replaceExtension(from: string | undefined, deps: ExtensionDeps): Promise<void> {
   const target = resolve(deps.extensionDir);
   const parent = dirname(target);
   await mkdir(parent, { recursive: true });
@@ -132,6 +141,12 @@ async function updateExtension(from: string | undefined, deps: ExtensionDeps): P
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
+}
+
+async function updateExtension(from: string | undefined, deps: ExtensionDeps): Promise<void> {
+  const target = resolve(deps.extensionDir);
+  await replaceExtension(from, deps);
+  await installHost(deps);
   deps.out(`extension installed at ${target}`);
   deps.out("First time: chrome://extensions, enable Developer mode, Load unpacked, choose that folder (once per Chrome profile).");
   deps.out("Reload the extension in each Chrome profile (chrome://extensions, reload icon on AIS Browser).");
@@ -146,7 +161,18 @@ export async function runBrowserExtension(rest: string[], flags: ParsedArgs["fla
     case "update":
       await updateExtension(stringFlag(flags, "from"), deps);
       return;
+    case "install-host": {
+      const written = await installHost(deps);
+      for (const p of written) deps.out(`registered ${p}`);
+      return;
+    }
+    case "host": {
+      // Started by Chrome: stdout carries only native-messaging frames, so every message goes to stderr.
+      const quiet = { ...deps, out: (line: string) => console.error(line) };
+      await runNativeHost({ extensionDir: resolve(deps.extensionDir), fetch: deps.fetch, update: () => replaceExtension(undefined, quiet) });
+      return;
+    }
     default:
-      throw new CliUsageError("Usage: ais browser extension path | update [--from=<zip>]");
+      throw new CliUsageError("Usage: ais browser extension path | update [--from=<zip>] | install-host");
   }
 }

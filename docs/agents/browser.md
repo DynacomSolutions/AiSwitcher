@@ -8,7 +8,16 @@ Lets Claude and Codex sessions drive a real Chrome profile through the gateway. 
 2. `ais browser extension update` downloads the latest `ais-browser-extension.zip` release asset (via `gh`, else the GitHub REST API with `GITHUB_TOKEN` or `GH_TOKEN`) and swaps it into `~/.ais/browser-extension/` atomically (old folder renamed aside, new one renamed in, old removed; on any failure the old folder stays). `--from=<zip>` installs a local zip instead.
 3. `ais browser extension path` prints the folder.
 4. In Chrome: `chrome://extensions`, enable Developer mode, Load unpacked, pick that folder. Repeat in every Chrome profile that should be drivable (each profile connects separately).
-5. After a later `update`, reload the extension in each Chrome profile.
+5. Later versions install themselves (see Updates). After a manual `update`, the extension reloads itself on its next check, or reload it in chrome://extensions.
+
+## Updates
+
+The extension updates itself, separately from the AIS command line. Chrome does not let an extension write its own files, so a small AIS helper does it: Chrome starts `ais browser extension host` over native messaging, and the helper reads the latest release from GitHub and swaps `~/.ais/browser-extension` the same way `ais browser extension update` does (never to an older or the same version). The extension then reloads itself as soon as no agent call is running. Sessions, their tabs and granted groups are handed to the reloaded extension through `chrome.storage.local`, because a reload clears `chrome.storage.session`.
+
+- The side panel's Updates card shows the running version and the latest release, with Check for updates, Update now and an Update automatically switch (on by default; checks at most every 6 hours).
+- The helper is registered by `ais update` and `ais browser extension update` (or `ais browser extension install-host`). They write `~/.ais/browser-host/ais-browser-host` and a host manifest in each Chrome-family browser's `NativeMessagingHosts` folder, allowed only for the unpacked extension id of `~/.ais/browser-extension`. `ais update` never changes the extension's files.
+- When files on disk are already newer (for example after `ais browser extension update`), a check only reloads the extension.
+- The first version with this feature (it adds the `nativeMessaging` permission) still needs one manual reload in chrome://extensions. Developer mode must stay on: Chrome disables an unpacked extension that reloads while it is off.
 
 ## Connect and bind
 

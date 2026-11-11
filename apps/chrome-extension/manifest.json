@@ -13,7 +13,8 @@
     "sidePanel",
     "alarms",
     "identity",
-    "identity.email"
+    "identity.email",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>"

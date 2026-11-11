@@ -7,6 +7,7 @@ import { clearToken, KEYS, loadSettings } from "./pairing.ts";
 import { State } from "./state.ts";
 import { colorForIdentity, TabManager } from "./tabs.ts";
 import { PopupGuard } from "./popups.ts";
+import { HOST_NAME, Updater } from "./updater.ts";
 import { handleMessage } from "./messages.ts";
 import { hexForIdentity, OverlayUi } from "./ui.ts";
 import type { PanelStatus } from "../shared/panel.ts";
@@ -20,6 +21,13 @@ const tabs = new TabManager(api);
 const popups = new PopupGuard(api, tabs);
 const ui = new OverlayUi();
 const executor = new Executor({ api, tabs, state, ui });
+const updater = new Updater({
+  sendNative: msg => chrome.runtime.sendNativeMessage(HOST_NAME, msg),
+  reload: async () => { await tabs.handover().catch(() => {}); chrome.runtime.reload(); },
+  version: chrome.runtime.getManifest().version,
+  isIdle: () => state.inflightCount === 0,
+  storage: api.storage,
+});
 let disconnected = false;
 
 const connection = new Connection({
@@ -72,6 +80,7 @@ async function panelStatus(): Promise<PanelStatus> {
     ...(s.binding ? { binding: s.binding } : {}),
     ...(s.target ? { target: s.target } : {}),
     ...(s.profileLabel ? { profileLabel: s.profileLabel } : {}),
+    update: updater.info(),
     sessions: [...tabs.sessions].map(([id, t]) => ({
       id, identity: t.identity, label: t.label, tabs: t.tabIds.size, color: hexForIdentity(t.identity), group: colorForIdentity(t.identity),
       groupId: t.groupId, tabIds: [...t.tabIds], controlledTabIds: ui.markedTabs(id), attachedTabIds: [...t.tabIds].filter(x => attached.has(x)), grantedGroupIds: tabs.grantedGroups(id),
@@ -79,12 +88,12 @@ async function panelStatus(): Promise<PanelStatus> {
   };
 }
 
-const startup = Promise.all([state.load(), api.storage.get([DISCONNECTED_KEY]).then(r => { disconnected = r[DISCONNECTED_KEY] === true; }), tabs.load(), popups.load()]).then(connect);
+const startup = Promise.all([state.load(), api.storage.get([DISCONNECTED_KEY]).then(r => { disconnected = r[DISCONNECTED_KEY] === true; }), tabs.load(), popups.load(), updater.load()]).then(connect);
 
 // Keeps the worker (and thus the socket) honest after Chrome suspends it. Waits for the startup load so it never races it.
 chrome.alarms.create("ais-keepalive", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(() => {
-  void startup.then(async () => { tabs.expireIdle(); if (connection.needsRestart()) await connect(); });
+  void startup.then(async () => { tabs.expireIdle(); if (connection.needsRestart()) await connect(); await updater.tick().catch(() => {}); });
 });
 
 // Control messages from the side panel and the in-page Stop button (see messages.ts for who may send what).
@@ -100,4 +109,5 @@ chrome.runtime.onMessage.addListener((msg: unknown, sender, reply) => handleMess
   isMarked: tabId => ui.has(tabId),
   grant: (groupId, sessionId) => tabs.grant(groupId, sessionId),
   revoke: async groupId => { tabs.revoke(groupId); },
+  updater,
 }));
