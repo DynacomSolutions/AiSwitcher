@@ -14,6 +14,8 @@ export const POLL = {
   transcript: 3_000,
   slow: 60_000,
   breakdown: 300_000,
+  /** /api/usage/projects: a file read; the collector rewrites it each cycle. */
+  projects: 120_000,
 } as const;
 
 export const qk = {
@@ -28,7 +30,7 @@ export const qk = {
   browsers: ["browsers"] as const,
   gatewayUsage: (days: number) => ["gateway-usage", days] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
-  breakdownProjects: (identity: string, days: number) => ["breakdown", "projects", identity, days] as const,
+  usageProjects: ["usage", "projects"] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
   sessionTree: (tool: string, identity: string, days: number, active: boolean) =>
     ["sessions", "tree", tool, identity, days, active] as const,
@@ -151,15 +153,15 @@ export function useBreakdownQuery(identity: string, tool: string, days: number) 
   });
 }
 
-/** Breakdown across every identity (or one), for the per-project views. Only
- * fetches while `enabled`, so the heavy scan never runs unless a project tab
- * is open. */
-export function useProjectsBreakdownQuery(identity: string | undefined, days: number, enabled: boolean) {
+/** Per-project usage rows from the host collector's native-store aggregate.
+ * The server only reads a file, so this is a cheap poll; filtering by
+ * provider, identity and period happens in the page. */
+export function useUsageProjectsQuery(enabled: boolean) {
   return useQuery({
-    queryKey: qk.breakdownProjects(identity ?? "", days),
-    queryFn: () => api.getBreakdown(identity, undefined, days),
+    queryKey: qk.usageProjects,
+    queryFn: api.getUsageProjects,
     enabled,
-    refetchInterval: (q) => (q.state.data?.pending ? 3000 : POLL.breakdown),
+    refetchInterval: (q) => (q.state.data?.pending ? 5_000 : POLL.projects),
     placeholderData: keepPreviousData,
   });
 }

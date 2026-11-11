@@ -7,6 +7,7 @@ import { withUsableCwd } from "../../shared/exec.ts";
 import { TOOL_CONFIGS, toolConfigFromFlag } from "../identities/resolve-tool.ts";
 import { isSwapPool } from "../../identities/swap-pool.ts";
 import { acknowledgeUsageSnapshotDirty, ensureUsageSnapshotDirty, readUsageSnapshotDirtyMarkers, usageSnapshotDirtyId, usageSnapshotTargetKey, usageSnapshotDirtyDirectory } from "./snapshot-dirty.ts";
+import { updateUsageProjects } from "./projects.ts";
 import { aggregateUsageResults, collectTargets, defaultOpencodeProfileUsageResults, logUsageSourceFailure, reuseNativeReportRows, runTokscaleForUsageTarget, runUsageQueryForTargets, swapPoolUsageResults, withDailyUsage, type UsageResult, type UsageRunDeps, type UsageTarget } from "./run.ts";
 import { USAGE_MAX_CONCURRENT, usageResultsForJson } from "./run.ts";
 import { runBatched } from "../limits/collect.ts";
@@ -188,6 +189,9 @@ export interface UsageSnapshotDeps {
   nativeSourceFingerprint?: (target: UsageTarget) => string | undefined;
   /** Seams of the report run, e.g. the extra-cost probe of a reused source. */
   usageRunDeps?: UsageRunDeps;
+  /** Per-project aggregate after each completed cycle (default: only for the live
+   * snapshot path, written beside it as projects.json). Failures are logged, never fatal. */
+  updateProjects?: (snapshot: UsageSnapshot) => Promise<unknown>;
   /** Test seam: every snapshot write of a cycle (default writeSnapshot). */
   writeSnapshot?: (snapshot: UsageSnapshot, path: string) => void;
   /** Max age of a reused export (default USAGE_SNAPSHOT_SOURCE_REUSE_MAX_AGE_MS). */
@@ -1344,6 +1348,10 @@ async function refreshUsageSnapshotLocked(deps: UsageSnapshotDeps, path: string,
     partitions,
   };
   write(snapshot, path);
+  const updateProjects = deps.updateProjects ?? (path === USAGE_SNAPSHOT_FILE ? ((value: UsageSnapshot) => updateUsageProjects(value)) : undefined);
+  if (updateProjects) {
+    try { await updateProjects(snapshot); } catch (error) { logUsageSourceFailure("projects aggregate", error); }
+  }
   acknowledgeUsageSnapshotDirty(dirtyMarkers.filter((marker) => {
     const key = dirtyKeyById.get(marker.id);
     if (key === "special:all") return candidateKeys.every((candidate) => partitions[candidate]?.lastAttemptAt === attemptedAt && partitions[candidate]?.lastError === undefined);

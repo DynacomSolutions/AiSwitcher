@@ -11,7 +11,7 @@ import {
   type BreakdownDeps,
   type BreakdownResult,
 } from "../../../src/cli/usage/breakdown.ts";
-import { inferMissingRepos, parseRemoteUrl, resolveProjectFromFs, type BreakdownProject } from "../../../src/cli/usage/breakdown.ts";
+import { inferMissingRepos, orgFolderOwner, parseRemoteUrl, resolveProjectFromFs, type BreakdownProject } from "../../../src/cli/usage/breakdown.ts";
 import { breakdownProjectionCachePath } from "../../../src/cli/usage/breakdown-projection-cache.ts";
 import type { Identity } from "../../../src/identities/types.ts";
 
@@ -256,6 +256,40 @@ describe("claude breakdown", () => {
     expect(result.categories.some((c) => c.outputTokens === 999_999)).toBe(false);
     expect(category(result, "Read").outputTokens).toBe(100);
     expect(result.categories).toHaveLength(2); // conversation + Read
+  });
+
+  test("counts a message once when its usage repeats per content block (5.187)", async () => {
+    const block = (extra: Record<string, unknown>, output: number, tools: string[], id?: string) => JSON.stringify({
+      type: "assistant",
+      timestamp: day(1),
+      requestId: "req_1",
+      message: {
+        ...(id ? { id } : {}),
+        model: "claude-sonnet-5",
+        content: tools.map((name) => ({ type: "tool_use", name })),
+        usage: { input_tokens: 10, output_tokens: output, cache_read_input_tokens: 5, cache_creation_input_tokens: 0 },
+      },
+      ...extra,
+    });
+    const result = await claudeResult({
+      "/synthetic/SYNTHETIC_FIXTURE/config/projects/proj/a.jsonl": {
+        mtimeMs: NOW_MS,
+        lines: [
+          block({}, 50, ["Read"], "msg_1"),
+          block({}, 80, ["Bash"], "msg_1"),
+          block({}, 100, ["Read"], "msg_1"), // last line's usage wins
+          block({}, 40, [], undefined), // no id: counted as before
+          block({}, 40, [], undefined),
+        ],
+      },
+    });
+    const conversation = category(result, "conversation");
+    // msg_1 once (input 10, output 100) plus two id-less lines.
+    expect(conversation.inputTokens).toBe(30);
+    expect(conversation.cacheReadTokens).toBe(15);
+    // Output split across the union of tool names {Read, Bash}, plus the id-less outputs on conversation.
+    expect(category(result, "Read").outputTokens + category(result, "Bash").outputTokens).toBe(100);
+    expect(conversation.outputTokens).toBe(80);
   });
 
   test("mtime-pruned files are not read at all", async () => {
@@ -522,7 +556,7 @@ describe("durable breakdown projections", () => {
     const reads: string[] = [];
     const cachePath = breakdownProjectionCachePath("claude", identity().name, identity().configDir, path, { cacheDir });
     await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
-    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 2, fingerprint: "stable", events: [[null, "bad", "not-a-number"]] }));
+    writeFileSync(cachePath, JSON.stringify({ schemaVersion: 3, fingerprint: "stable", events: [[null, "bad", "not-a-number"]] }));
     const result = await collectIdentityBreakdown("claude", identity(), 30, cachedDeps(files, cacheDir, fingerprints, reads));
     expect(category(result, "conversation").inputTokens).toBe(22);
     expect(reads).toEqual([path, path]);
@@ -615,7 +649,7 @@ describe("project / repo / org attribution", () => {
     const result = await collectIdentityBreakdown("claude", identity(), 30, { ...fakeDeps(files), projectionCacheDir: cacheDir, sourceFingerprint: () => "stable", onSourceFileRead: (p) => reads.push(p) });
     expect(reads).toEqual([path]);
     expect(category(result, "conversation").inputTokens).toBe(22);
-    expect(JSON.parse(readFileSync(cachePath, "utf8")).schemaVersion).toBe(2);
+    expect(JSON.parse(readFileSync(cachePath, "utf8")).schemaVersion).toBe(3);
   });
 
   test("resolver: a stray .git folder is skipped; a bare mirror resolves from its own config", () => {
@@ -632,6 +666,33 @@ describe("project / repo / org attribution", () => {
     writeFileSync(join(mirror, "HEAD"), "ref: refs/heads/main\n");
     writeFileSync(join(mirror, "config"), '[core]\n\tbare = true\n[remote "origin"]\n\turl = https://example.com/acme/widget.git\n');
     expect(resolveProjectFromFs(mirror)).toEqual({ path: mirror, source: "git", repo: "acme/widget", org: "acme", host: "example.com" });
+  });
+
+  test("resolver: an org folder takes its child repositories' owner", () => {
+    const root = mkdtempSync(join(tmpdir(), "ais-breakdown-org-"));
+    projectionDirs.push(root);
+    const repo = (dir: string, url: string) => {
+      mkdirSync(join(dir, ".git", "objects"), { recursive: true });
+      writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(dir, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    };
+    // A folder named after its children's owner, and a plain subfolder of it.
+    const group = join(root, "AcmeGroup");
+    repo(join(group, "widget"), "git@example.com:acme-group/widget.git");
+    repo(join(group, "fork"), "https://example.com/someone/fork");
+    mkdirSync(join(group, "notes"));
+    const want = { source: "plain", org: "acme-group", host: "example.com" };
+    expect(resolveProjectFromFs(group)).toEqual({ path: group, ...want } as never);
+    expect(resolveProjectFromFs(join(group, "notes"))).toEqual({ path: join(group, "notes"), ...want } as never);
+    // A folder that merely holds repositories, even of one owner, is not an org folder.
+    const projects = join(root, "projects");
+    repo(join(projects, "one"), "https://example.com/beta/one");
+    repo(join(projects, "two"), "https://example.com/beta/two");
+    mkdirSync(join(projects, "scratch"));
+    expect(resolveProjectFromFs(projects)).toEqual({ path: projects, source: "plain" });
+    expect(resolveProjectFromFs(join(projects, "scratch"))).toEqual({ path: join(projects, "scratch"), source: "plain" });
+    // The walk stops at the home directory.
+    expect(orgFolderOwner(join(group, "notes"), group)).toBeUndefined();
   });
 
   test("parseRemoteUrl handles https, scp-like and ssh:// remotes", () => {

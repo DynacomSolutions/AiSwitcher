@@ -1,6 +1,7 @@
 import { isRetired } from "../../identities/retired.ts";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import "../../identities/model-price-source.ts";
 import { estimateChatModelTokenCost } from "../../identities/model-pricing.ts";
 import type { Identity, ToolConfig } from "../../identities/types.ts";
@@ -326,7 +327,53 @@ export function resolveProjectFromFs(cwd: string): ResolvedProject {
     if (parent === dir) break;
     dir = parent;
   }
-  return { path: cwd, source: "plain" };
+  const org = orgFolderOwner(cwd);
+  return { path: cwd, source: "plain", ...(org ? { org: org.org, ...(org.host ? { host: org.host } : {}) } : {}) };
+}
+
+/** Child folders read per directory when looking for an org folder. */
+const ORG_FOLDER_SCAN_LIMIT = 500;
+/** Parents of the session cwd checked for an org folder (`<org>/<sub>/<dir>`). */
+const ORG_FOLDER_MAX_ASCENT = 2;
+
+/** The owner of an org folder: a directory (not itself in a repository)
+ * named after the owner of one of its child repositories, such as a local
+ * `<org>/<repo>` layout where sessions are started in `<org>`. Names compare
+ * without case or punctuation. A folder merely holding repositories (one
+ * owner or several) is not an org folder. The session cwd and up to two
+ * parents are checked, nearest first, never the home directory or the
+ * filesystem root. */
+export function orgFolderOwner(cwd: string, home: string = homedir()): { org: string; host?: string } | undefined {
+  for (let dir = cwd, level = 0; level <= ORG_FOLDER_MAX_ASCENT; dir = dirname(dir), level++) {
+    if (dir === home || dirname(dir) === dir) return undefined;
+    const owner = childRepoOwner(dir);
+    if (owner) return owner;
+  }
+  return undefined;
+}
+
+function childRepoOwner(dir: string): { org: string; host?: string } | undefined {
+  let children: string[];
+  try {
+    children = readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith(".")).map((e) => e.name).slice(0, ORG_FOLDER_SCAN_LIMIT);
+  } catch {
+    return undefined;
+  }
+  const owners = new Map<string, { org: string; host?: string }>();
+  for (const name of children) {
+    const child = join(dir, name);
+    const dotGit = join(child, ".git");
+    const gitDir = existsSync(dotGit) ? gitDirOf(dotGit, child) : isGitDir(child) && isFile(join(child, "config")) ? child : undefined;
+    if (!gitDir) continue;
+    const project = gitProject(child, gitDir);
+    if (project.org) owners.set(ownerKey(project.org), { org: project.org, ...(project.host ? { host: project.host } : {}) });
+  }
+  return owners.get(ownerKey(basename(dir)));
+}
+
+/** Owner names compared without case or punctuation: `AcmeGroup` = `acme-group`. */
+function ownerKey(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function memoisedProjectResolver(base: (cwd: string) => ResolvedProject): (cwd: string) => ResolvedProject {
@@ -681,7 +728,9 @@ function validCodexProjection(events: unknown[]): events is unknown[][] {
 interface ClaudeLine {
   timestamp?: string;
   cwd?: unknown;
+  requestId?: unknown;
   message?: {
+    id?: unknown;
     model?: string;
     content?: unknown;
     usage?: {
@@ -718,6 +767,10 @@ async function collectClaudeBreakdown(
   for (const file of files) {
     const projected = await projectedFileEvents("claude", identity, file, deps, async (path, readLines) => {
       const events: unknown[][] = [];
+      // Claude writes one line per content block of a message, each repeating
+      // the same usage under the same message.id and requestId. Count each
+      // message once: the last line's usage wins and tool names are unioned.
+      const byMessage = new Map<string, number>();
       let sourceError = false;
       try { for await (const line of readLines(path)) {
         if (!line.includes('"usage"')) continue;
@@ -725,6 +778,25 @@ async function collectClaudeBreakdown(
         try { parsed = JSON.parse(line) as ClaudeLine; } catch { continue; }
         const usage = parsed.message?.usage;
         if (!usage) continue;
+        const messageId = typeof parsed.message?.id === "string" && parsed.message.id.length > 0 ? parsed.message.id : undefined;
+        const dedupeKey = messageId === undefined ? undefined : `${messageId}:${typeof parsed.requestId === "string" ? parsed.requestId : ""}`;
+        const names = toolUseNames(parsed.message?.content);
+        const seenAt = dedupeKey === undefined ? undefined : byMessage.get(dedupeKey);
+        if (seenAt !== undefined) {
+          const earlier = events[seenAt]![6] as string[];
+          events[seenAt] = [
+            parseTimestampMs(parsed.timestamp) ?? null,
+            parsed.message?.model ?? "unknown",
+            usage.input_tokens ?? 0,
+            usage.output_tokens ?? 0,
+            usage.cache_read_input_tokens ?? 0,
+            usage.cache_creation_input_tokens ?? 0,
+            [...earlier, ...names.filter((name) => !earlier.includes(name))],
+            typeof parsed.cwd === "string" && parsed.cwd.length > 0 ? parsed.cwd : (events[seenAt]![7] as string | null),
+          ];
+          continue;
+        }
+        if (dedupeKey !== undefined) byMessage.set(dedupeKey, events.length);
         events.push([
           parseTimestampMs(parsed.timestamp) ?? null,
           parsed.message?.model ?? "unknown",
@@ -732,7 +804,7 @@ async function collectClaudeBreakdown(
           usage.output_tokens ?? 0,
           usage.cache_read_input_tokens ?? 0,
           usage.cache_creation_input_tokens ?? 0,
-          toolUseNames(parsed.message?.content),
+          names,
           typeof parsed.cwd === "string" && parsed.cwd.length > 0 ? parsed.cwd : null,
         ]);
       } } catch { sourceError = true; }

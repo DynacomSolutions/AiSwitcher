@@ -452,6 +452,38 @@ export interface BreakdownResponse {
   pending?: boolean;
 }
 
+/** One row of GET /api/usage/projects: a workspace's usage on one local day for one provider, identity and tool. */
+export interface UsageProjectRow {
+  path: string;
+  repo?: string;
+  org?: string;
+  host?: string;
+  source: "git" | "plain" | "missing" | "unknown";
+  /** repo/org inferred for a folder that is gone from the host. */
+  inferred?: true;
+  /** Display name: the inferred repository's name, else the workspace label. */
+  name?: string;
+  provider: string;
+  identity: string;
+  tool: string;
+  /** Local calendar day, YYYY-MM-DD. */
+  date: string;
+  cost: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  messages: number;
+  lastMs: number;
+}
+
+export interface UsageProjectsResponse {
+  rows: UsageProjectRow[];
+  generatedAt?: string;
+  /** The collector has not written projects.json yet. */
+  pending?: boolean;
+}
+
 /* Sessions (resume) */
 
 export interface ResumableSession {

@@ -691,9 +691,9 @@ export function UsagePage() {
             </>
           ) : null}
 
-          {active === "projects" ? <UsageProjects grouping="project" days={since} identity={identity} /> : null}
-          {active === "repos" ? <UsageProjects grouping="repo" days={since} identity={identity} /> : null}
-          {active === "orgs" ? <UsageProjects grouping="org" days={since} identity={identity} /> : null}
+          {active === "projects" ? <UsageProjects grouping="project" since={since} provider={provider} identity={identity} usageCost={totalCost} /> : null}
+          {active === "repos" ? <UsageProjects grouping="repo" since={since} provider={provider} identity={identity} usageCost={totalCost} /> : null}
+          {active === "orgs" ? <UsageProjects grouping="org" since={since} provider={provider} identity={identity} usageCost={totalCost} /> : null}
         </>
       )}
     </div>
