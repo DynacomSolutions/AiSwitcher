@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import { Database } from "bun:sqlite";
-import { access, appendFile, chmod, constants, link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, appendFile, chmod, constants, copyFile, link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { aisBackupConfigPath, aisBackupLockPath, aisBackupsDir, aisBackupsSqliteDir } from "../src/shared/ais-home.ts";
 import { acquirePidLock } from "../src/shared/pid-lock.ts";
 import { createProgressTracker, type BackupProgress } from "../src/shared/backup-progress.ts";
@@ -685,10 +685,15 @@ async function sqliteFingerprint(path: string): Promise<string> {
   return `${await part(path)}|${await part(path + "-wal")}`;
 }
 
+function isSqliteCorruption(err: unknown): boolean {
+  const e = err as { code?: string; message?: string };
+  return e.code === "SQLITE_CORRUPT" || e.code === "SQLITE_NOTADB" || /malformed|not a database/i.test(e.message ?? "");
+}
+
 /** Snapshots each database with SQLite's online backup (VACUUM INTO) into
  * ~/.ais/backups-sqlite/<timestamp>/<same relative path>, hard-linking the previous snapshot
- * when nothing changed, then prunes old sets. A locked, failing or over-budget database is
- * skipped with a warning; this never throws. */
+ * when nothing changed, then prunes old sets. A corrupt database is kept as a raw byte copy; a locked, failing or
+ * over-budget one is skipped with a warning; this never throws. */
 async function snapshotSqlite(home: string, dbs: string[]): Promise<void> {
   if (dbs.length === 0) return;
   const root = aisBackupsSqliteDir(home);
@@ -708,6 +713,7 @@ async function snapshotSqlite(home: string, dbs: string[]): Promise<void> {
     let copied = 0;
     let linked = 0;
     let skipped = 0;
+    let raw = 0;
     for (const rel of dbs) {
       const src = join(home, rel);
       const dest = join(setDir, rel);
@@ -718,23 +724,48 @@ async function snapshotSqlite(home: string, dbs: string[]): Promise<void> {
         if (prev?.manifest[rel] === fp) {
           try {
             await link(join(prev.dir, rel), dest);
+            // A raw copy of a corrupt DB keeps its -wal next to it; link that too when the previous set has one
+            // (a VACUUM INTO snapshot has none).
+            await link(join(prev.dir, rel + "-wal"), dest + "-wal").catch(() => {});
             manifest[rel] = fp;
             linked++;
             continue;
-          } catch { /* previous file gone: take a fresh copy */ }
+          } catch {
+            /* previous file gone: take a fresh copy */
+            await rm(dest, { force: true });
+            await rm(dest + "-wal", { force: true });
+          }
         }
-        const db = new Database(src, { readonly: true });
         try {
-          db.run(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
-          db.run(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
-        } finally {
-          db.close();
+          const db = new Database(src, { readonly: true });
+          try {
+            db.run(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+            db.run(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+          } finally {
+            db.close();
+          }
+          await chmod(dest, 0o600);
+          manifest[rel] = fp;
+          copied++;
+        } catch (err) {
+          if (!isSqliteCorruption(err)) throw err;
+          // Corrupt (e.g. codex's own quarantine copies): cannot be snapshotted, keep the bytes as-is.
+          const segs = rel.split(sep === "\\" ? /[\\/]/ : "/");
+          const quarantine = segs.some((seg, i) => seg === "db-backups" && (segs[i + 1] ?? "").startsWith("sqlite-"));
+          if (!quarantine) console.error(`backup: WARNING: ${src} is corrupt (${(err as Error).message}); kept as a raw copy`);
+          await rm(dest, { force: true });
+          await copyFile(src, dest);
+          await chmod(dest, 0o600);
+          if (fp.split("|")[1] !== "-") {
+            await copyFile(src + "-wal", dest + "-wal");
+            await chmod(dest + "-wal", 0o600);
+          }
+          manifest[rel] = fp;
+          raw++;
         }
-        await chmod(dest, 0o600);
-        manifest[rel] = fp;
-        copied++;
       } catch (err) {
         await rm(dest, { force: true });
+        await rm(dest + "-wal", { force: true });
         skipped++;
         console.error(`backup: WARNING: SQLite snapshot of ${src} skipped (${(err as Error).message}); the previous snapshot, if any, is kept`);
       }
@@ -746,7 +777,7 @@ async function snapshotSqlite(home: string, dbs: string[]): Promise<void> {
     const all = (await readdir(root, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name).sort();
     for (const old of all.slice(0, Math.max(0, all.length - keep))) await rm(join(root, old), { recursive: true, force: true });
     console.error(
-      `backup: SQLite databases are kept out of git; ${copied} snapshotted, ${linked} unchanged (hard-linked), ${skipped} skipped in ${setDir}. ` +
+      `backup: SQLite databases are kept out of git; ${copied} snapshotted, ${linked} unchanged (hard-linked), ${skipped} skipped${raw > 0 ? `, ${raw} kept as raw copies (corrupt, cannot be snapshotted)` : ""} in ${setDir}. ` +
         `Restore one by copying <set>/<same path under home> back (stop the tool first, remove any stale -wal/-shm); newest set is the last directory in ${root}`,
     );
   } catch (err) {

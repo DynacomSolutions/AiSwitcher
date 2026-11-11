@@ -1,4 +1,4 @@
-import { appendFileSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, mkdir, rm, symlink, realpath, utimes, writeFile } from "node:fs/promises";
@@ -1056,6 +1056,44 @@ describe("runBackup shallow push and vanished files", () => {
       } finally { console.error = orig; db.run("ROLLBACK"); db.close(); }
       expect(errs.some((l) => l.includes("WARNING: SQLite snapshot of") && l.includes("locked.sqlite"))).toBe(true);
       expect(existsSync(join(home, ".ais", "backups-sqlite", setsOf(home)[0]!, ".codex", "locked.sqlite"))).toBe(false);
+    }, 60_000);
+
+    test("corrupt DBs are kept as raw copies without a warning and hard-linked when unchanged", async () => {
+      const home = await makeHome();
+      await write(join(home, ".codex", "config.toml"), "x = 1\n");
+      makeDb(join(home, ".codex", "good.sqlite")).close();
+      const bad = join(home, ".codex", "identities", "a", "db-backups", "sqlite-1-0", "bad.sqlite");
+      const junk = Buffer.concat([Buffer.from("SQLite format 3\0", "latin1"), Buffer.alloc(4080, 0xab)]);
+      mkdirSync(join(bad, ".."), { recursive: true });
+      writeFileSync(bad, junk);
+      writeFileSync(bad + "-wal", "wal-bytes");
+      const live = join(home, ".codex", "live.sqlite");
+      writeFileSync(live, junk);
+      const errs: string[] = [];
+      const orig = console.error;
+      console.error = (...a: unknown[]) => { errs.push(a.join(" ")); };
+      try {
+        await runBackup(["codex"], home);
+        await new Promise((r) => setTimeout(r, 1100));
+        await runBackup(["codex"], home);
+      } finally { console.error = orig; }
+      expect(errs.some((l) => l.includes("WARNING: SQLite snapshot of"))).toBe(false);
+      expect(errs.some((l) => l.includes("2 kept as raw copies"))).toBe(true);
+      // A live corrupt DB is reported (first run only); the quarantine copy stays silent.
+      expect(errs.filter((l) => l.includes(live) && l.includes("is corrupt") && l.includes("kept as a raw copy"))).toHaveLength(1);
+      expect(errs.some((l) => l.includes("bad.sqlite") && l.includes("WARNING"))).toBe(false);
+      expect(readFileSync(join(home, ".ais", "backups-sqlite", setsOf(home)[0]!, ".codex", "live.sqlite")).equals(junk)).toBe(true);
+      const [a, b] = setsOf(home);
+      const rel = join(".codex", "identities", "a", "db-backups", "sqlite-1-0", "bad.sqlite");
+      const at = (set: string, suffix = "") => join(home, ".ais", "backups-sqlite", set, rel + suffix);
+      expect(readFileSync(at(a!)).equals(junk)).toBe(true);
+      expect(readFileSync(at(a!, "-wal"), "utf8")).toBe("wal-bytes");
+      expect(statSync(at(a!)).mode & 0o777).toBe(0o600);
+      expect(statSync(at(b!)).ino).toBe(statSync(at(a!)).ino);
+      expect(statSync(at(b!, "-wal")).ino).toBe(statSync(at(a!, "-wal")).ino);
+      const good = new Database(join(home, ".ais", "backups-sqlite", a!, ".codex", "good.sqlite"), { readonly: true });
+      expect(good.query("SELECT count(*) AS n FROM t").get()).toEqual({ n: 200 });
+      good.close();
     }, 60_000);
   });
 });
