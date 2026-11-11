@@ -252,4 +252,4 @@ Keep CI green when a GitHub-hosted runner image breaks.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 180 | CI apt installs fall back to another Ubuntu mirror when runners cannot resolve the Ubuntu archive | in_review | claude | ci-pin-ubuntu-2404 | | 2026-11-12 12:00 ICT | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/493 (e66915d); fallback seen in CI log.<br>Since 11 Nov ~13:47Z GitHub runners (24.04 and 26.04) cannot resolve the Ubuntu archive hosts; other hosts resolve. main CI red.<br>scripts/ci/apt-install.sh: default mirrors first, kernel.org mirror on failed fetch. |
+| 180 | CI apt installs fall back to another Ubuntu mirror when runners cannot resolve the Ubuntu archive | done | claude | ci-pin-ubuntu-2404 | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/493 (e66915d); fallback seen in CI log.<br>Since 11 Nov ~13:47Z GitHub runners (24.04 and 26.04) cannot resolve the Ubuntu archive hosts; other hosts resolve. main CI red.<br>scripts/ci/apt-install.sh: default mirrors first, kernel.org mirror on failed fetch. |
