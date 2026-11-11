@@ -14,6 +14,7 @@ import { migrateLegacyAisHome } from "./migrate-ais-home.ts";
 import { codexPlatformArgs } from "./codex-platform-config.ts";
 import { projectSharedCodexConfigForLaunch } from "./codex-shared-config.ts";
 import { codexSubcommandConfigArgs } from "./codex-config-args.ts";
+import { codexLocalGatewayEnv } from "../identities/codex-gateway-home.ts";
 import { projectGlobalMemoryForLaunch } from "./global-memory.ts";
 import { gatePluginArgs } from "./plugin-gating.ts";
 import { poolLaunchCheck } from "../identities/pool/launch.ts";
@@ -236,6 +237,7 @@ export async function runWrapper(
           ...extraEnv,
           ...browserLaunchEnv(cfg.toolName, browserArgs, process.env),
           ...memoryProjection.env,
+          ...(cfg.toolName === "codex" ? await codexLocalGatewayEnv(resolved.configDirValue) : {}),
           ...(titleOwnerPid !== undefined ? { AIS_HERDR_TITLE_OWNER_PID: titleOwnerPid } : {}),
           ...(activeIdentity !== undefined ? { [IDENTITY_SESSION_MARKER]: activeIdentity } : {}),
         },

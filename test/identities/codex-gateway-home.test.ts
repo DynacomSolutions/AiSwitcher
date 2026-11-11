@@ -6,7 +6,11 @@ import { parse as parseToml } from "smol-toml";
 import {
   buildCodexGatewayAuth,
   codexGatewayHomeProblem,
+  codexLocalGatewayEnv,
   configureCodexGatewayHome,
+  migrateLocalGatewayConfigText,
+  migrateRegisteredLocalCodexHomes,
+  usesLocalGatewayTls,
   loadCodexGatewayHomes,
   parseGatewayProvider,
   refreshRegisteredCodexHomes,
@@ -135,7 +139,98 @@ describe("local gateway route", () => {
     writeFileSync(join(dir, "config.toml"), localConfig("http://127.0.0.1:47140/codex"));
     expect(await configureCodexGatewayHome(dir, TOKEN)).toEqual({ app: "agents-codex" });
     expect(JSON.parse(readFileSync(join(dir, "auth.json"), "utf8")).tokens.account_id).toBe("ais-agents-codex");
-    expect(readFileSync(join(dir, "config.toml"), "utf8")).toContain('chatgpt_base_url = "http://127.0.0.1:47140/codex/backend-api"');
+    expect(readFileSync(join(dir, "config.toml"), "utf8")).toContain('chatgpt_base_url = "https://localhost:47141/codex/backend-api"');
     expect(await codexGatewayHomeProblem(dir)).toBeUndefined();
+  });
+});
+
+describe("local gateway over HTTPS", () => {
+  const PROVIDER_ONLY = `model_provider = "ais-gateway"
+
+[model_providers.ais-gateway]
+name = "AIS"
+base_url = "http://127.0.0.1:47140/codex"
+`;
+  // Placeholder-login home: top-level chatgpt_base_url on the local plain-HTTP gateway.
+  const LOCAL = `chatgpt_base_url = "http://127.0.0.1:47140/codex/backend-api"\n${PROVIDER_ONLY}`;
+  // route-all API-key home: provider base_url + auth command, no chatgpt_base_url.
+  const API_KEY_HOME = `${PROVIDER_ONLY}wire_api = "responses"\n\n[model_providers.ais-gateway.auth]\ncommand = "/opt/ais/bin/ais-codex-gateway-helper"\n`;
+  const dirs: string[] = [];
+  const home = (config: string): string => {
+    const d = mkdtempSync(join(tmpdir(), "ais-codex-local-"));
+    dirs.push(d);
+    writeFileSync(join(d, "config.toml"), config);
+    return d;
+  };
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  test("migration rewrites only the local http codex URLs", () => {
+    const text = LOCAL.replace("127.0.0.1", "localhost");
+    const out = migrateLocalGatewayConfigText(text, 47140, 47141);
+    expect(out).toContain('chatgpt_base_url = "https://localhost:47141/codex/backend-api"');
+    expect(out).toContain('base_url = "https://localhost:47141/codex"');
+    expect(out).not.toContain("http://127.0.0.1");
+    const remote = `base_url = "https://gateway.example.com/gateway/t3"\n`;
+    expect(migrateLocalGatewayConfigText(remote, 47140, 47141)).toBe(remote);
+    expect(migrateLocalGatewayConfigText(out, 47140, 47141)).toBe(out);
+  });
+
+  test("configure writes https://localhost:<tlsPort> for a local target and the result validates", async () => {
+    const dir = home(PROVIDER_ONLY);
+    await configureCodexGatewayHome(dir, TOKEN);
+    const cfg = parseToml(readFileSync(join(dir, "config.toml"), "utf8")) as { chatgpt_base_url?: string; model_providers: Record<string, { base_url: string }> };
+    expect(cfg.chatgpt_base_url).toBe("https://localhost:47141/codex/backend-api");
+    expect(cfg.model_providers["ais-gateway"]?.base_url).toBe("https://localhost:47141/codex");
+    expect(await codexGatewayHomeProblem(dir)).toBeUndefined();
+    expect(parseGatewayProvider(readFileSync(join(dir, "config.toml"), "utf8"))).toEqual({ base: "https://localhost:47141", app: "agents-codex", route: "codex" });
+  });
+
+  test("a route-all API-key home stays on plain http everywhere", async () => {
+    expect(migrateLocalGatewayConfigText(API_KEY_HOME, 47140, 47141)).toBe(API_KEY_HOME);
+    const bundle = join(tmpdir(), `ais-bundle-apikey-${process.pid}.pem`);
+    writeFileSync(bundle, "x");
+    const registry = join(tmpdir(), `ais-homes-${process.pid}.json`);
+    try {
+      const dir = home(API_KEY_HOME);
+      expect(await codexLocalGatewayEnv(dir, {}, bundle)).toEqual({});
+      expect(readFileSync(join(dir, "config.toml"), "utf8")).toBe(API_KEY_HOME);
+      writeFileSync(registry, JSON.stringify([{ dir, app: "agents-codex" }]));
+      expect(await migrateRegisteredLocalCodexHomes(47140, 47141, registry)).toEqual([]);
+      expect(readFileSync(join(dir, "config.toml"), "utf8")).toBe(API_KEY_HOME);
+      // The placeholder-login home in the same registry does migrate.
+      const placeholder = home(LOCAL);
+      writeFileSync(registry, JSON.stringify([{ dir, app: "agents-codex" }, { dir: placeholder, app: "agents-codex" }]));
+      expect(await migrateRegisteredLocalCodexHomes(47140, 47141, registry)).toEqual([placeholder]);
+      expect(readFileSync(join(placeholder, "config.toml"), "utf8")).toContain('chatgpt_base_url = "https://localhost:47141/codex/backend-api"');
+    } finally {
+      rmSync(bundle, { force: true });
+      rmSync(registry, { force: true });
+    }
+  });
+
+  test("launcher env carries CODEX_CA_CERTIFICATE only for local-HTTPS homes", async () => {
+    const bundle = join(tmpdir(), `ais-bundle-${process.pid}.pem`);
+    writeFileSync(bundle, "x");
+    try {
+      const https = home(migrateLocalGatewayConfigText(LOCAL, 47140, 47141));
+      expect(await codexLocalGatewayEnv(https, {}, bundle)).toEqual({ CODEX_CA_CERTIFICATE: bundle });
+      expect(await codexLocalGatewayEnv(https, { CODEX_CA_CERTIFICATE: "/mine.pem" }, bundle)).toEqual({});
+      const remote = home(CONFIG);
+      expect(await codexLocalGatewayEnv(remote, {}, bundle)).toEqual({});
+      expect(await codexLocalGatewayEnv(join(tmpdir(), "no-such-home-xyz"), {}, bundle)).toEqual({});
+      // A home still on plain http is migrated on launch once the bundle exists.
+      const old = home(LOCAL);
+      expect(await codexLocalGatewayEnv(old, {}, bundle)).toEqual({ CODEX_CA_CERTIFICATE: bundle });
+      expect(readFileSync(join(old, "config.toml"), "utf8")).toContain("https://localhost:47141/codex");
+      expect(usesLocalGatewayTls(readFileSync(join(old, "config.toml"), "utf8"), 47141)).toBe(true);
+      // No bundle yet (older gateway without HTTPS): untouched.
+      const waiting = home(LOCAL);
+      expect(await codexLocalGatewayEnv(waiting, {}, join(tmpdir(), "missing-bundle.pem"))).toEqual({});
+      expect(readFileSync(join(waiting, "config.toml"), "utf8")).toBe(LOCAL);
+    } finally {
+      rmSync(bundle, { force: true });
+    }
   });
 });

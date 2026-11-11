@@ -20,7 +20,7 @@ export async function runDoctorCommand(flags: ParsedArgs["flags"]): Promise<void
   const t3Problems = await t3ProxyDoctorProblems().catch(() => []);
   if (boolFlag(flags, "json")) {
     // The proxy state rides along as a last row, so existing consumers of the array keep working.
-    const proxy = local ? { t3Problems, gatewayLocal: { running: true, mode: local.mode, sinceMs: local.sinceMs, ...(local.probeAtMs !== undefined ? { probeAtMs: local.probeAtMs } : {}) } } : { t3Problems, gatewayLocal: { running: false } };
+    const proxy = local ? { t3Problems, gatewayLocal: { running: true, mode: local.mode, sinceMs: local.sinceMs, ...(local.tlsPort ? { tlsPort: local.tlsPort } : {}), ...(local.probeAtMs !== undefined ? { probeAtMs: local.probeAtMs } : {}) } } : { t3Problems, gatewayLocal: { running: false } };
     console.log(JSON.stringify([...all, proxy], null, 2));
     return;
   }
@@ -28,7 +28,7 @@ export async function runDoctorCommand(flags: ParsedArgs["flags"]): Promise<void
   for (const p of t3Problems) console.log(`\nT3 Code: ${p}`);
   console.log(
     local
-      ? `\nGateway local proxy: running, ${local.mode === "direct" ? "DIRECT mode (cluster gateway unreachable)" : "remote mode"} since ${new Date(local.sinceMs).toISOString()}`
+      ? `\nGateway local proxy: running, ${local.mode === "direct" ? "DIRECT mode (cluster gateway unreachable)" : "remote mode"} since ${new Date(local.sinceMs).toISOString()}${local.tlsPort ? `, https port ${local.tlsPort}` : ""}`
       : "\nGateway local proxy: not running (ais gateway local install)",
   );
 }
