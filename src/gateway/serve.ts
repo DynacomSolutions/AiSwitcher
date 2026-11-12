@@ -190,9 +190,13 @@ export function watchCredentialReads(creds: GatewayDeps["creds"], alerter: Alert
   } as GatewayDeps["creds"];
 }
 
+/** The identities an unrestricted pool app may use: real logins only. A swap pool's folder holds no login of its own, so it is never a member. */
+export function appPoolMemberNames(file: IdentitiesFile): string[] {
+  return file.identities.filter((i) => !isRetired(i) && !isSwapPool(i)).map((i) => i.name);
+}
+
 async function defaultPoolMembers(provider: GatewayProvider): Promise<string[]> {
-  const file = await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath);
-  return file.identities.filter((i) => !isRetired(i)).map((i) => i.name);
+  return appPoolMemberNames(await loadIdentitiesFile(TOOL_CONFIGS[provider].identitiesJsonPath));
 }
 
 /** Allowed, non-retired members of pool `pool` in `file`, or undefined when the file has no such pool. */
