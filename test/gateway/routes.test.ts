@@ -543,6 +543,31 @@ describe("claude account paths", () => {
     expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-a");
     expect(requests.at(-1)).toMatchObject({ provider: "claude", status: "ok", httpStatus: 200 });
   });
+  // Incident 12 Nov 2026: T3's pinned usage reads mostly got Anthropic's 429 (the gateway's poll shares the token), so
+  // T3 showed no limits and no reset credits.
+  test("a pinned app's usage read is shared for a while and a 429 is answered with the last good body", async () => {
+    let t = NOW.getTime();
+    deps.now = () => new Date(t);
+    await addApp("cl", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
+    const gw = createGatewayApp(deps); // one gateway: the cache lives in it
+    const call = async (app: string, p: string, init: RequestInit = {}): Promise<Response> => await gw.request(`http://gw.test/${app}${p}`, { ...init, headers: { authorization: `Bearer ${tokens[app]}` } });
+    const body = { seven_day: { utilization: 70 }, cedar_ember: { eligible: true, grants: [{ id: "grant-a", resets_left: 2 }] } };
+    let limited = false;
+    reply = () => (limited ? new Response("{}", { status: 429, headers: { "retry-after": "60" } }) : Response.json(body));
+    const path = "/api/oauth/usage?cedar_ember=1";
+    expect(await (await call("cl", path, { method: "GET" })).json()).toEqual(body);
+    t += 10_000;
+    expect(await (await call("cl", path, { method: "GET" })).json()).toEqual(body);
+    expect(seen).toHaveLength(1); // shared: no second upstream read
+    limited = true;
+    t += 60_000;
+    const res = await call("cl", path, { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(body); // the 429 is covered by the last good body
+    expect(seen).toHaveLength(2);
+    // A plain read (no cedar_ember) has its own entry: with nothing good yet, the 429 passes through.
+    expect((await call("cl", "/api/oauth/usage", { method: "GET" })).status).toBe(429);
+  });
   test("a pool app's usage with cedar_ember keeps the served windows and merges the chosen member's grants", async () => {
     await addApp("cl", "claude", "anthropic");
     usage.a = { status: "live", maxUtilization: 90, capturedAt: "", windows: [{ label: "five-hour", utilization: 90 }] };
