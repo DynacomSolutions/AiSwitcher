@@ -498,7 +498,11 @@ async function commitMirrored(home: string, repoDir: string, mirrored: string[],
   // one-time migration that stops tracking SQLite files (history is not rewritten).
   const excluded = await runGit(repoDir, home, ["ls-files", "-ci", `--exclude-from=${join(repoDir, ".git", "info", "exclude")}`, "-z", "--", ...mirrored]);
   if (excluded.exitCode === 0 && excluded.stdout.length > 0) {
-    await runGit(repoDir, home, ["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"], excluded.stdout, { GIT_LITERAL_PATHSPECS: "1" });
+    // ls-files lists exact tracked paths, so drop them by path. `git rm
+    // --pathspec-from-file` matches every pathspec against every index entry:
+    // 145k excluded paths against a 687k-entry index ran for hours, holding the
+    // backup lock and failing every host update behind it.
+    await runGit(repoDir, home, ["update-index", "--force-remove", "-z", "--stdin"], excluded.stdout);
   }
 
   if (polluted.length > 0) await renormalise(repoDir, home, polluted);
