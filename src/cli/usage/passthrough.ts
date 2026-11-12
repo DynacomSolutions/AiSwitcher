@@ -40,6 +40,9 @@ export async function runPassthrough(flags: ParsedArgs["flags"], tokscaleArgs: s
     if (stringFlag(flags, "identity")) {
       throw new CliUsageError("AIS shared-snapshot TUI displays all manifest-listed identities; --identity cannot select one partition.");
     }
+    if (stringFlag(flags, "tool")) {
+      throw new CliUsageError("AIS shared-snapshot TUI displays all manifest-listed tools; --tool cannot select one partition.");
+    }
     let shared: Awaited<ReturnType<typeof resolveAisTokscaleSharedTui>>;
     try {
       shared = await resolveAisTokscaleSharedTui();

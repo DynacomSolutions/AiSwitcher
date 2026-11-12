@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeZaiAuthFile } from "../../../src/identities/zai-auth.ts";
 import { defaultOpencodeProfileDbPath } from "../../../src/cli/usage/opencode-usage.ts";
+import { runPassthrough } from "../../../src/cli/usage/passthrough.ts";
 import {
   buildMergedEnv,
   buildAisTokscaleExportInvocation,
@@ -41,6 +42,14 @@ describe("resolveAisTokscaleSharedTui", () => {
     expect((await resolveAisTokscaleSharedTui({ AIS_TOKSCALE_SHARED_BIN: process.execPath })).command).toBe(process.execPath);
     await expect(resolveAisTokscaleSharedTui({ AIS_TOKSCALE_SHARED_BIN: "tokscale" })).rejects.toThrow("must be an absolute path");
     await expect(resolveAisTokscaleSharedTui({ AIS_TOKSCALE_SHARED_BIN: "/missing/ais-tokscale" })).rejects.toThrow("missing or not executable");
+  });
+});
+
+describe("shared-snapshot TUI scope", () => {
+  test("rejects AIS tool filters instead of silently ignoring them", async () => {
+    await expect(runPassthrough({ tool: "codex" }, ["tui"])).rejects.toThrow(
+      "--tool cannot select one partition",
+    );
   });
 });
 
