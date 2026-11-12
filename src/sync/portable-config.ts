@@ -1,6 +1,7 @@
 import { chmod, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isInBaseCheckout } from "../shared/memory-land.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
 import {
   ALI_CONFIG,
@@ -198,6 +199,8 @@ export async function makeSharedHookScriptsPortable(home: string = homedir()): P
   const hooksDir = join(home, ".ais", "hooks");
   const hooksDirectory = await stat(hooksDir).catch(() => undefined);
   if (!hooksDirectory?.isDirectory()) return 0;
+  // A base checkout stays an unmodified copy of its default branch: git owns these scripts on this host.
+  if (await isInBaseCheckout(hooksDir)) return 0;
   const glob = new Bun.Glob("*");
   let changed = 0;
   for await (const path of glob.scan({ cwd: hooksDir, absolute: true, onlyFiles: true })) {

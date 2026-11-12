@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { open as openFile, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { parseBundleTar, type Bundle, type BundleManifest } from "./bundle.ts";
+import { isInBaseCheckout } from "../shared/memory-land.ts";
 import { classify } from "./path-classes.ts";
 import { appendHomeFile, openHomeDirectory, openParent, readHomeFile, writeHomeFileAtomic } from "./safe-fs.ts";
 import { decodeJwtPayload, readPiEntry } from "../identities/oauth-reconcile.ts";
@@ -230,9 +232,12 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
       return { applied: 0, skipped: bundle.manifest.entries.length, conflicts: [], deferred: "clock is not plausible for credential merge", lastInboxSeq };
     }
 
+    // Git owns the hooks when ~/.ais/hooks lives in a base checkout: those entries count as skipped, never applied.
+    const skipHooks = await isInBaseCheckout(join(home, ".ais", "hooks"));
+    const entries = bundle.manifest.entries.filter((entry) => !(skipHooks && entry.path.startsWith(".ais/hooks/")));
     const conflicts: string[] = [];
     const decisions = new Map<string, "drive" | "bundle">();
-    for (const entry of bundle.manifest.entries) {
+    for (const entry of entries) {
       if (!entry.class.startsWith("config:")) continue;
       const current = await readHomeFile(root, entry.path);
       const baseline = state.hashes[entry.path];
@@ -251,7 +256,7 @@ export async function applyInbox(deps: ApplyInboxDeps): Promise<InboxResult> {
     let applied = 0;
     const nextHashes = { ...state.hashes };
     const planned: Array<{ path: string; bytes: Uint8Array; mode?: number; hash: string; class: string }> = [];
-    for (const entry of bundle.manifest.entries) {
+    for (const entry of entries) {
       if (entry.class === "auth" && !authReady) continue;
       const content = bundle.files.get(entry.path);
       if (!content) continue;

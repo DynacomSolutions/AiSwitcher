@@ -6,6 +6,7 @@ import { loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { AIS_REMOTE_CACHE_REL, aisRemoteCacheDir } from "../shared/ais-home.ts";
 import { acquirePidLock } from "../shared/pid-lock.ts";
+import { isInBaseCheckout } from "../shared/memory-land.ts";
 import { loadSyncConfig } from "./config.ts";
 import { makeRegistryPortable } from "./registry.ts";
 import { makeProfileHookConfigsPortable, makeSharedHookScriptsPortable } from "./portable-config.ts";
@@ -427,6 +428,8 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
       ...(await collectProfileDataDirs(scope)),
       ...(await collectProjectDataDirs(scope)),
     ]);
+    // Git is the source of truth for hooks when ~/.ais/hooks lives in a base checkout: do not even stage peer copies.
+    const skipHooks = await isInBaseCheckout(join(home, ".ais", "hooks"));
     const filters = [...ignoredPathFilters(state), ...buildSyncFilterArgs(scope, extraDataDirs)];
 
     if (direction === "pull" || direction === "both") {
@@ -448,7 +451,7 @@ export async function syncConfiguredProfiles(options: SyncRunOptions = {}): Prom
           // Append-only histories this host already holds come as tails; the bulk pull leaves them out.
           tails = await ioPhase("pull-tails", () => pullTails(host, scope, home, state));
           await mkdir(incomingDir, { recursive: true });
-          const pulled = await ioPhase("pull-rsync", () => runRsync(host, "pull", [...tailExcludeFilters(tails?.plan ?? {}, tails?.deferred), ...filters], home, {
+          const pulled = await ioPhase("pull-rsync", () => runRsync(host, "pull", [...(skipHooks ? ["--exclude=/.ais/hooks"] : []), ...tailExcludeFilters(tails?.plan ?? {}, tails?.deferred), ...filters], home, {
             localRoot: incomingDir,
             compareDest: "../../../..",
           }), () => stagedSummary(incomingDir));

@@ -24,6 +24,28 @@ describe("inbox apply", () => {
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 
+  test("skips incoming shared hooks when ~/.ais/hooks lives in a base checkout", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
+    try {
+      const home = join(root, "home");
+      const hooks = join(root, "repo-root", ".worktrees", "acme", ".base", "dotfiles", "hooks");
+      await mkdir(hooks, { recursive: true });
+      await mkdir(join(home, ".ais"), { recursive: true });
+      await symlink(hooks, join(home, ".ais", "hooks"));
+      const text = (value: string) => new TextEncoder().encode(value);
+      const tar = makeTar({}, [
+        { path: ".ais/hooks/new-hook.sh", class: "config:settings", bytes: text("#!/bin/sh\necho new\n") },
+        { path: ".claude/settings.json", class: "config:settings", bytes: text('{"theme":"dark"}\n') },
+      ]);
+      const res = await applyInbox({ tar, home, clock: goodClock });
+      expect(await readdir(hooks)).toEqual([]);
+      expect(await readFile(join(home, ".claude", "settings.json"), "utf8")).toBe('{"theme":"dark"}\n');
+      expect(res.applied).toBe(1);
+      expect(res.skipped).toBe(1);
+      expect(res.deferred).toBeUndefined();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   test("does not follow a symlinked parent while applying files", async () => {
     const home = await mkdtemp(join(tmpdir(), "ais-live-inbox-"));
     const outside = await mkdtemp(join(tmpdir(), "ais-live-outside-"));
