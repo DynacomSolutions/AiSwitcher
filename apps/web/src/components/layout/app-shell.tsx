@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   ListTree,
   Menu,
+  Network,
   PieChart,
   ShieldCheck,
 } from "lucide-react";
@@ -33,6 +34,7 @@ const NAV_ITEMS = [
   { to: "/breakdown", label: "Breakdown", icon: PieChart, end: false },
   { to: "/sessions", label: "Sessions", icon: History, end: false },
   { to: "/auth", label: "Auth", icon: ShieldCheck, end: false },
+  { to: "/gateway", label: "Gateway", icon: Network, end: false },
   { to: "/browsers", label: "Browsers", icon: Globe, end: false },
   { to: "/permissions", label: "Permissions", icon: ListTree, end: false },
   { to: "/files", label: "Files", icon: FolderOpen, end: false },

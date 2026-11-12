@@ -55,6 +55,7 @@ streaming/session state. Expensive endpoints (`limits`) are cached server-side.
 | `/api/files/*` | on demand |
 | `/api/limits`, `/api/usage`, `/api/spend-guard`, `/api/herdr-bridge` | 60s (server caches 45s) |
 | `/api/usage/breakdown` | 300s (server caches 60s; heavy local JSONL scan) |
+| `/api/gateway/usage`, `/api/gateway/apps` | 60s |
 | `/api/usage/projects` | 120s (file read only; the host collector rewrites it each cycle) |
 
 ## Endpoints
@@ -372,6 +373,53 @@ upstream fetch.
   "fetchedAt": "2026-08-25T12:00:00Z"
 }
 ```
+
+Claude results carry every reset credit (`cedar_ember` grants) in
+`manualReset.grants[]`: `{ id, label?, kind: "full"|"fable"|"other",
+resetsLeft, usableNow, paused, endsAt? }`, plus `cooldownUntil?` and
+`grantsCapturedAt` (when Anthropic last listed them). `availableCount` sums
+`resetsLeft` over grants usable now and may be 0. Anthropic includes the list
+only when the account is at or near a limit, so a read without it keeps the
+last seen list with `stale: true` (ended grants dropped) instead of hiding it.
+Per-model weekly windows appear as `week (<model>)`, e.g. `week (Fable)`.
+
+`POST /api/limits/claude/:identity/resets/:grantId` spends one reset grant
+with that identity's own OAuth token (org uuid from `GET /api/oauth/profile`,
+then `POST /api/organizations/<uuid>/reset_rate_limits` with
+`{ program: "cedar_ember", grant_id, request_id }`). Answers
+`{ identity, grantId, result, resetsLeft?, cleared[], cooldownUntil? }` and
+updates the cached grant list. Swap pools and retired identities are refused
+(409); Anthropic refusals keep their status and reason. The console asks for
+confirmation first.
+
+### Gateway apps
+
+All gateway reads and writes go through the gateway admin API server-side
+(`AIS_GATEWAY_ADMIN_URL`, `AIS_GATEWAY_ADMIN_TOKEN` from `~/.secrets` or the
+environment); the admin token never reaches the page. Reads time out after 15s.
+
+`GET /api/gateway/usage?days=7` answers `{ configured, rows: [{ app, provider,
+days, tokens }], error? }`; `configured: false` means no admin URL and token.
+
+`GET /api/gateway/apps` answers `{ configured, defaultReservePercent, apps[],
+error?, usageError? }`. Each app: `name, owner, namespace, provider, style,
+target ({ kind: "pin", identity } or { kind: "pool", identities? }), models?,
+dailyTokens?, reservePercent?, effectiveReservePercent, state, createdAt?,
+lastUsedAt?, tokens[] ({ prefix, createdAt, expiresAt? }, newest first),
+usage1d, usage7d` (usage is null when the usage read failed). Full tokens are
+never listed: the gateway stores only prefixes and hashes.
+
+`PUT /api/gateway/apps/:name` body `{ reservePercent?, models?, dailyTokens? }`
+merges over the current app like `ais gateway app update`; `null` (or an empty
+`models` list) clears a field. Answers the updated app.
+
+`POST /api/gateway/apps/:name/rotate` runs the CLI's rotate path (kube Secret
+`ais-gateway-<app>`, `~/.secrets`, registered Codex homes) and answers
+`{ app, token, url, previousTokensExpireAt, messages[], deliveryError? }`. The
+token appears in this response only. A failed delivery step still returns the
+minted token with `deliveryError`.
+
+`POST /api/gateway/apps/:name/revoke` revokes the app at once (final).
 
 ### Usage
 

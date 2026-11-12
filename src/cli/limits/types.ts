@@ -82,6 +82,30 @@ export interface ManualResetInfo {
   label?: string;
   /** When the grant itself expires, human-formatted by the adapter. */
   expiresAt?: string;
+  /** Claude only: every reset grant the account holds (cedar_ember), usable or not, so Fable-only grants show too. */
+  grants?: ResetGrant[];
+  /** Claude only: the account cannot spend a reset before this instant (ISO). */
+  cooldownUntil?: string;
+  /** Claude only: when the provider last reported the grant list (ISO). Anthropic sends it only near a limit. */
+  grantsCapturedAt?: string;
+  /** True when `grants` were carried over from an earlier read because the latest one omitted them. */
+  stale?: boolean;
+}
+
+/** What one reset grant clears: every limit, only the Fable model's weekly limit, or something not recognised. */
+export type ResetGrantKind = "full" | "fable" | "other";
+
+/** One Claude reset grant from the usage body's `cedar_ember.grants` (or `exhausted`). */
+export interface ResetGrant {
+  id: string;
+  label?: string;
+  kind: ResetGrantKind;
+  resetsLeft: number;
+  /** Spendable right now (the wire's own usable_now when sent). */
+  usableNow: boolean;
+  paused: boolean;
+  /** When the grant ends (ISO). */
+  endsAt?: string;
 }
 
 /** Paid capacity past the standard windows: Claude extra usage, Codex credits. */

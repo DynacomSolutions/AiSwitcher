@@ -27,6 +27,11 @@ import type {
   ToolName,
   TranscriptResponse,
   GatewayUsageResponse,
+  GatewayAppsResponse,
+  GatewayAppDto,
+  GatewayAppPatch,
+  GatewayRotateResult,
+  UseResetResult,
   BrowsersResponse,
   PoolsUsageResponse,
   UsageResponse,
@@ -158,6 +163,20 @@ export const api = {
   getPoolsUsage: () => request<PoolsUsageResponse>("/api/pools/usage"),
 
   getGatewayUsage: (days: number) => request<GatewayUsageResponse>(`/api/gateway/usage?days=${days}`),
+
+  getGatewayApps: () => request<GatewayAppsResponse>("/api/gateway/apps"),
+
+  updateGatewayApp: (name: string, patch: GatewayAppPatch) =>
+    request<GatewayAppDto>(`/api/gateway/apps/${encodeURIComponent(name)}`, { method: "PUT", body: patch }),
+
+  rotateGatewayApp: (name: string) =>
+    request<GatewayRotateResult>(`/api/gateway/apps/${encodeURIComponent(name)}/rotate`, { method: "POST" }),
+
+  revokeGatewayApp: (name: string) =>
+    request<{ app: string; state: "revoked" }>(`/api/gateway/apps/${encodeURIComponent(name)}/revoke`, { method: "POST" }),
+
+  useClaudeReset: (identity: string, grantId: string) =>
+    request<UseResetResult>(`/api/limits/claude/${encodeURIComponent(identity)}/resets/${encodeURIComponent(grantId)}`, { method: "POST" }),
 
   getBrowsers: () => request<BrowsersResponse>("/api/browsers"),
 

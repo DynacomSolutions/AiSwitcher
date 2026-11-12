@@ -98,6 +98,9 @@ export function storeContract(makeStore: () => Promise<GatewayStore>): void {
     expect(await s.usageSince("nobody", new Date(0))).toBe(0);
     await s.appendUsage([{ ...row("a", "2026-11-02T02:00:00.000Z", 1, 1), cacheReadTokens: 100, cacheWriteTokens: 7 }]);
     expect(await s.usageSince("a", new Date("2026-11-02T00:00:00.000Z"))).toBe(39);
+    const totals = await s.usageTotalsSince(new Date("2026-11-02T00:00:00.000Z"));
+    expect(Object.fromEntries(totals)).toEqual({ a: 39, b: 198 });
+    expect((await s.usageTotalsSince(new Date("2027-01-01T00:00:00.000Z"))).size).toBe(0);
   });
 
   test("usageByIdentity totals per provider and identity inside the window", async () => {

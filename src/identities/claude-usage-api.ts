@@ -4,7 +4,7 @@ import { isGatewayAccessToken } from "./claude-gateway-entry.ts";
 import { hasMemberCopy, memberDir, memberStoreEnabled } from "./gateway-members.ts";
 import { readProviderGrantCopy } from "./oauth-reconcile.ts";
 import { poolStoreDirsFor, refreshIdentityOAuthGrant, type FetchImpl } from "./oauth-refresh.ts";
-import type { ExtraUsageInfo, ManualResetInfo } from "../cli/limits/types.ts";
+import type { ExtraUsageInfo, ManualResetInfo, ResetGrant, ResetGrantKind } from "../cli/limits/types.ts";
 import type { Identity } from "./types.ts";
 import { aisCacheDir } from "../shared/ais-home.ts";
 import { loadLastGood, saveLastGood, windowsFromUsageBody } from "../cli/limits/claude-limits.ts";
@@ -225,7 +225,7 @@ export async function freshLastGood(member: Identity, cacheDir: string, nowMs: n
 
 /** Freshest stored access token for the account (member store or, while
  * active, the pool store), refreshed first when expired. */
-async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promise<{ token?: string; error?: string }> {
+export async function usableAccessToken(member: Identity, deps: FetchUsageDeps): Promise<{ token?: string; error?: string }> {
   const nowSeconds = Math.floor((deps.now?.() ?? Date.now()) / 1000);
   // Routed through the gateway (its login moved into the gateway member store): read the store copy, never refresh it here
   // (the gateway renews it; a refresh here would spend its single-use refresh token). The gateway process itself already
@@ -357,34 +357,91 @@ async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir:
   return usage;
 }
 
+/** Full, Fable-only or other, read from the grant's id and label (e.g. `full-reset-2611`, `launch-2610-fable`). */
+export function resetGrantKind(id: string, label?: string): ResetGrantKind {
+  const text = `${id} ${label ?? ""}`;
+  if (/fable/i.test(text)) return "fable";
+  if (/full/i.test(text)) return "full";
+  return "other";
+}
+
+function isoOf(v: unknown): string | undefined {
+  const ms = typeof v === "string" ? Date.parse(v) : Number.NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
+function parseGrant(raw: unknown, now: number, exhausted: boolean): ResetGrant | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const g = raw as Record<string, unknown>;
+  const id = typeof g.id === "string" && g.id ? g.id : undefined;
+  if (!id) return undefined;
+  const label = typeof g.label === "string" && g.label ? g.label : undefined;
+  const resetsLeft = exhausted ? 0 : Math.max(0, num(g.resets_left) ?? 0);
+  const paused = g.paused === true;
+  const endsAt = isoOf(g.ends_at);
+  const ended = endsAt !== undefined && Date.parse(endsAt) <= now;
+  const usableNow = typeof g.usable_now === "boolean" ? g.usable_now && resetsLeft > 0 && !ended : resetsLeft > 0 && !paused && !ended;
+  return { id, ...(label ? { label } : {}), kind: resetGrantKind(id, label), resetsLeft, usableNow, paused, ...(endsAt ? { endsAt } : {}) };
+}
+
 /**
  * Pure mapping from the `cedar_ember` block of the usage body (what Claude
- * Code's /limit-reset reads) to a ManualResetInfo. Counts `resets_left` over
- * grants that are not paused and not past `ends_at`; zero, an ineligible
- * account or a malformed block yield undefined so nothing renders.
+ * Code's /limit-reset reads) to a ManualResetInfo carrying EVERY grant
+ * (`grants[]` plus `exhausted[]`, full and Fable-only alike). `availableCount`
+ * sums `resets_left` over grants usable now; the first usable grant names the
+ * label and expiry. A missing or malformed block yields undefined; a block
+ * with no grants yields an empty list (a real "none").
  */
 export function manualResetFromCedarEmber(block: unknown, now: number = Date.now()): ManualResetInfo | undefined {
-  if (typeof block !== "object" || block === null) return undefined;
+  if (typeof block !== "object" || block === null || Array.isArray(block)) return undefined;
   const rec = block as Record<string, unknown>;
-  if (rec.eligible !== true || !Array.isArray(rec.grants)) return undefined;
-  let count = 0;
-  let first: { label?: string; endsAt?: number } | undefined;
-  for (const raw of rec.grants) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const grant = raw as Record<string, unknown>;
-    const left = num(grant.resets_left);
-    if (left === undefined || left <= 0 || grant.paused === true) continue;
-    const endsAt = typeof grant.ends_at === "string" ? Date.parse(grant.ends_at) : Number.NaN;
-    if (Number.isFinite(endsAt) && endsAt <= now) continue;
-    count += left;
-    first ??= { ...(typeof grant.label === "string" && grant.label ? { label: grant.label } : {}), ...(Number.isFinite(endsAt) ? { endsAt } : {}) };
-  }
-  if (count <= 0) return undefined;
+  const grants: ResetGrant[] = [];
+  const seen = new Set<string>();
+  const add = (list: unknown, exhausted: boolean) => {
+    if (!Array.isArray(list)) return;
+    for (const raw of list) {
+      const g = parseGrant(raw, now, exhausted);
+      if (g && !seen.has(g.id)) {
+        seen.add(g.id);
+        grants.push(g);
+      }
+    }
+  };
+  add(rec.grants, false);
+  add(rec.exhausted, true);
+  if (!Array.isArray(rec.grants) && grants.length === 0) return undefined;
+  const ineligible = rec.eligible === false;
+  if (ineligible) for (const g of grants) g.usableNow = false;
+  const usable = grants.filter((g) => g.usableNow);
+  const count = usable.reduce((sum, g) => sum + g.resetsLeft, 0);
+  const first = usable[0];
   const expiresAt =
     first?.endsAt !== undefined
       ? new Date(first.endsAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
       : undefined;
-  return { availableCount: count, ...(first?.label ? { label: first.label } : {}), ...(expiresAt !== undefined ? { expiresAt } : {}) };
+  const cooldownUntil = isoOf(rec.cooldown_until);
+  return {
+    availableCount: count,
+    ...(first?.label ? { label: first.label } : {}),
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+    grants,
+    ...(cooldownUntil && Date.parse(cooldownUntil) > now ? { cooldownUntil } : {}),
+    grantsCapturedAt: new Date(now).toISOString(),
+  };
+}
+
+/**
+ * The grant list to keep when a read omitted `cedar_ember` (Anthropic sends it
+ * only near a limit): the last seen list, marked stale, with ended grants
+ * dropped and nothing counted as available (it cannot be confirmed).
+ */
+export function carriedManualReset(last: ManualResetInfo | undefined, now: number = Date.now()): ManualResetInfo | undefined {
+  if (!last?.grants) return undefined;
+  const grants = last.grants.filter((g) => g.endsAt === undefined || Date.parse(g.endsAt) > now);
+  if (grants.length === 0) return undefined;
+  // The label and expiry describe a usable grant of the old read; neither is confirmed now.
+  const { cooldownUntil, label: _label, expiresAt: _expires, ...rest } = last;
+  return { ...rest, availableCount: 0, grants, stale: true, ...(cooldownUntil && Date.parse(cooldownUntil) > now ? { cooldownUntil } : {}) };
 }
 
 /** Spendable usage-limit reset grants for one account; undefined on none or on ANY failure (never throws). */

@@ -6,6 +6,7 @@ import { BreakdownPage } from "@/pages/breakdown";
 import { BrowsersPage } from "@/pages/browsers";
 import { DashboardPage } from "@/pages/dashboard";
 import { FilesPage } from "@/pages/files";
+import { GatewayPage } from "@/pages/gateway";
 import { IdentitiesPage } from "@/pages/identities";
 import { LimitsPage } from "@/pages/limits";
 import { LocalModelsPage } from "@/pages/local-models";
@@ -28,6 +29,7 @@ export function AppRoutes() {
         <Route path="breakdown/:tab?" element={<BreakdownPage />} />
         <Route path="sessions" element={<SessionsPage />} />
         <Route path="auth" element={<AuthPage />} />
+        <Route path="gateway" element={<GatewayPage />} />
         <Route path="browsers" element={<BrowsersPage />} />
         <Route path="permissions" element={<PermissionsPage />} />
         <Route path="files" element={<FilesPage />} />

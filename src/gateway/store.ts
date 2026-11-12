@@ -12,6 +12,8 @@ export interface GatewayStore {
   revokeApp(name: string): Promise<void>;
   appendUsage(rows: UsageRow[]): Promise<void>;
   usageSince(app: string, since: Date): Promise<number>;
+  /** usageSince for every app at once (one ledger scan), keyed by app; apps with no rows are absent. */
+  usageTotalsSince(since: Date): Promise<Map<string, number>>;
   /** Counts one side or served request for the app on `day` (YYYY-MM-DD, Bangkok day) and returns the day's count so far. Shared by every replica. */
   bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number>;
   /** Ledger totals per provider and identity for rows at or after `since` (before `until` when given). */
@@ -105,6 +107,15 @@ export class MemoryGatewayStore implements GatewayStore {
       if (r.app === app && Date.parse(r.ts) >= cutoff) total += r.inputTokens + r.outputTokens + r.cacheWriteTokens;
     }
     return total;
+  }
+
+  async usageTotalsSince(since: Date): Promise<Map<string, number>> {
+    const cutoff = since.getTime();
+    const out = new Map<string, number>();
+    for (const r of this.usage) {
+      if (Date.parse(r.ts) >= cutoff) out.set(r.app, (out.get(r.app) ?? 0) + r.inputTokens + r.outputTokens + r.cacheWriteTokens);
+    }
+    return out;
   }
 
   async usageByIdentity(since: Date, until?: Date): Promise<IdentityUsageRow[]> {

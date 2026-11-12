@@ -29,6 +29,7 @@ export const qk = {
   poolsUsage: ["pools-usage"] as const,
   browsers: ["browsers"] as const,
   gatewayUsage: (days: number) => ["gateway-usage", days] as const,
+  gatewayApps: ["gateway-apps"] as const,
   breakdown: (identity: string, tool: string, days: number) => ["breakdown", identity, tool, days] as const,
   usageProjects: ["usage", "projects"] as const,
   sessions: (cwd: string) => ["sessions", cwd] as const,
@@ -130,6 +131,10 @@ export function usePoolsUsageQuery() {
 
 export function useBrowsersQuery() {
   return useQuery({ queryKey: qk.browsers, queryFn: api.getBrowsers, refetchInterval: POLL.registry });
+}
+
+export function useGatewayAppsQuery() {
+  return useQuery({ queryKey: qk.gatewayApps, queryFn: api.getGatewayApps, refetchInterval: POLL.slow });
 }
 
 export function useGatewayUsageQuery(days: number) {

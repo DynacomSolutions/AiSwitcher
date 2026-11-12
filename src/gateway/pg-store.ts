@@ -188,6 +188,13 @@ export class PgGatewayStore implements GatewayStore {
     return Number(rows[0]?.total ?? 0);
   }
 
+  async usageTotalsSince(since: Date): Promise<Map<string, number>> {
+    const rows = await this.sql`
+      SELECT app, COALESCE(SUM(input_tokens + output_tokens + cache_write_tokens), 0) AS total
+      FROM gateway_usage WHERE ts >= ${since.toISOString()}::timestamptz GROUP BY app`;
+    return new Map(rows.map((r: { app: unknown; total: unknown }) => [String(r.app), Number(r.total ?? 0)]));
+  }
+
   bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number> {
     return bumpSideCountOn(this.sql as unknown as SqlTag, app, day, signal);
   }

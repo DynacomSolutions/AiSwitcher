@@ -26,6 +26,8 @@ import type { LoginFlowManagerLike } from "./types.ts";
 import * as authApi from "./auth.ts";
 import { runScanIsolated, scanTimeoutAboveTokscale } from "./workers.ts";
 import { loadGatewayUsage, type GatewayUsageView } from "../gateway/usage-view.ts";
+import * as gatewayApps from "./gateway-apps.ts";
+import * as claudeResets from "./claude-resets.ts";
 import { poolsUsage, type PoolsUsageResponse } from "./pools-usage.ts";
 import { renderScanMetrics } from "./scan-metrics.ts";
 import { mountBrowserAuthorize, type BrowserAuthConfig } from "./browser-authorize.ts";
@@ -76,6 +78,15 @@ export interface ConsoleAppDeps extends GuardDeps {
   localModels?: () => Promise<LocalModelsDto>;
   /** Test seam for GET /api/gateway/usage; defaults to the gateway admin API. */
   gatewayUsage?: (days: number) => Promise<GatewayUsageView>;
+  /** Test seam for the /api/gateway/apps routes; defaults to the gateway admin API (and the CLI rotate path). */
+  gatewayApps?: Partial<{
+    list: () => Promise<gatewayApps.GatewayAppsView>;
+    update: (name: string, patch: gatewayApps.GatewayAppPatch) => Promise<gatewayApps.GatewayAppDto>;
+    rotate: (name: string) => Promise<gatewayApps.GatewayRotateResult>;
+    revoke: (name: string) => Promise<{ app: string; state: "revoked" }>;
+  }>;
+  /** Test seam for POST /api/limits/claude/:identity/resets/:grant; defaults to Anthropic's reset endpoint. */
+  claudeUseReset?: (identity: string, grantId: string) => Promise<claudeResets.UseResetResult>;
   /** Test seam for GET /api/usage/projects; defaults to reading the collector's projects.json. */
   usageProjects?: () => ReturnType<typeof readUsageProjects>;
   /** Test seam for GET /api/pools/usage. */
@@ -255,6 +266,23 @@ export function createApp(deps: ConsoleAppDeps): Hono {
   // Per-app gateway tokens from the admin API; "configured: false" when this
   // process has no admin URL and token, so the console can hide the section.
   app.get("/api/gateway/usage", async (c) => c.json(await (deps.gatewayUsage ?? loadGatewayUsage)(numberQuery(c, "days", 7))));
+  // Gateway apps (list, edit, rotate, revoke) through the admin API, server-side so the admin token never reaches the page.
+  // The list answers "configured: false" when this process has no admin URL and token; mutations answer 503 then.
+  app.get("/api/gateway/apps", async (c) => c.json(await (deps.gatewayApps?.list ?? (() => gatewayApps.loadGatewayApps()))()));
+  app.put("/api/gateway/apps/:name", async (c) => {
+    const patch = gatewayApps.parseGatewayAppPatch(await c.req.json().catch(() => undefined));
+    return c.json(await (deps.gatewayApps?.update ?? ((n, p) => gatewayApps.updateGatewayApp(n, p)))(decodeSegment(c.req.param("name")), patch));
+  });
+  app.post("/api/gateway/apps/:name/rotate", async (c) =>
+    c.json(await (deps.gatewayApps?.rotate ?? ((n) => gatewayApps.rotateGatewayApp(n)))(decodeSegment(c.req.param("name")))),
+  );
+  app.post("/api/gateway/apps/:name/revoke", async (c) =>
+    c.json(await (deps.gatewayApps?.revoke ?? ((n) => gatewayApps.revokeGatewayApp(n)))(decodeSegment(c.req.param("name")))),
+  );
+  // Spends one Claude reset grant (cedar_ember) for an identity with its own login.
+  app.post("/api/limits/claude/:identity/resets/:grant", async (c) =>
+    c.json(await (deps.claudeUseReset ?? ((i, g) => claudeResets.useClaudeReset(i, g)))(decodeSegment(c.req.param("identity")), decodeSegment(c.req.param("grant")))),
+  );
   // Pool membership and the gateway ledger by identity; the console page sums these with native usage and limits.
   app.get("/api/pools/usage", async (c) => c.json(await (deps.poolsUsage ?? (() => poolsUsage()))()));
   // Per-project usage from the native store, written by the host collector
