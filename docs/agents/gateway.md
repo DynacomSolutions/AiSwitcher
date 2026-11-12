@@ -407,14 +407,20 @@ fresh import into an emptied table.
 
 Refresh: under the account's advisory lock the guard first pulls the account's rows into HOME (adopt-first and the
 journal see the store's copy), refreshes, and pushes the changed files back (compare-and-swap on the version it pulled)
-before the lock is released. A push that fails is retried, then left to the background pass; the journal already refuses
-the spent token anywhere else. Everything for one account in one process runs under an in-process mutex, so a background
+before the lock is released. If the lock cannot be taken (database error) the refresh is refused and retried later: a file
+lock is local to one pod, so refreshing without the shared lock could send one single-use token twice. A push that fails is
+retried (also pushing every changed tracked file of the account), then raises the alert `credential-store-write-failed`
+(cleared by the next good push) and is left to the background pass; `stop()` makes a final bounded push of anything still
+unpushed, and the keep-alive stops starting refreshes once the gateway drains. The journal already refuses the spent token
+anywhere else. A row that does not decrypt is skipped with a warning naming only its path. Everything for one account in one process runs under an in-process mutex, so a background
 pull never lands between a refresh's write and its push.
 
 Sync rule per file (base = the version and hash this replica last synced): local unchanged and row moved, the row is
 written; local changed and row unchanged, the file is pushed; both changed (or no base yet), a login goes to the fresher
 grant (later expiry, ties to the store), registries and host files keep the host's copy under a file store and take the
-row otherwise. Deleted files are not propagated.
+row otherwise. The shared pi `auth.json` (account `pi/<name>`, one entry per provider) is merged per top-level key instead:
+the fresher subtree wins per key, so two replicas rotating different providers both keep their entry; a push that cannot
+settle throws. Every pass lists all row metadata (versions can commit out of order). Deleted files are not propagated.
 
 Environment (`ais gateway serve`):
 

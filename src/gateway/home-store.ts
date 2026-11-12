@@ -85,6 +85,7 @@ export class PgHomeStore {
     url: string,
     private readonly key: Buffer,
     readonly holder: string = `${process.env.HOSTNAME ?? "gateway"}:${process.pid}`,
+    private readonly warn: (message: string) => void = (m) => console.warn(`gateway store: ${m}`),
   ) {
     this.sql = new SQL(url, { max: 4 });
   }
@@ -105,14 +106,27 @@ export class PgHomeStore {
 
   /** Rows (decrypted) for an account, plus any extra paths. */
   async getAccount(account: string, extraPaths: string[] = []): Promise<HomeFileRow[]> {
-    const rows = await this.sql`SELECT path, account, kind, sha256, version, cipher FROM gateway_home_files WHERE account = ${account} OR path IN ${this.sql(extraPaths.length > 0 ? extraPaths : ["\u0000"])}`;
-    return rows.map((r: Record<string, unknown>) => this.decode(r));
+    const rows = await this.sql`SELECT path, account, kind, sha256, version, cipher FROM gateway_home_files WHERE account = ${account} OR path IN ${this.sql(extraPaths.length > 0 ? extraPaths : [""])}`;
+    return this.decodeAll(rows);
   }
 
   async get(paths: string[]): Promise<HomeFileRow[]> {
     if (paths.length === 0) return [];
     const rows = await this.sql`SELECT path, account, kind, sha256, version, cipher FROM gateway_home_files WHERE path IN ${this.sql(paths)}`;
-    return rows.map((r: Record<string, unknown>) => this.decode(r));
+    return this.decodeAll(rows);
+  }
+
+  /** Decrypts per row: one row that does not decrypt is skipped (warned by path only), so it cannot block the others. */
+  private decodeAll(rows: Array<Record<string, unknown>>): HomeFileRow[] {
+    const out: HomeFileRow[] = [];
+    for (const r of rows) {
+      try {
+        out.push(this.decode(r));
+      } catch {
+        this.warn(`skipping row ${String(r.path)}: it does not decrypt with ${STORE_KEY_ENV}`);
+      }
+    }
+    return out;
   }
 
   private decode(r: Record<string, unknown>): HomeFileRow {

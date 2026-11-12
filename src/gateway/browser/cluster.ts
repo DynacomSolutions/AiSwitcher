@@ -214,6 +214,12 @@ export class ClusterBrowserHub {
       return Response.json({ error: "bad_request" }, { status: 400 });
     }
     const id = r.id;
+    // A revocation whose NOTIFY was lost must still stop the call: the database is the authority.
+    const active = await this.bindingActive(body.binding);
+    if (active === false) {
+      this.hub.revoke(body.binding);
+      return Response.json({ id, ok: false, error: "no_browser", message: "The browser binding is not active." });
+    }
     const onAbort = (): void => this.hub.abort(id);
     req.signal.addEventListener("abort", onAbort, { once: true });
     try {
@@ -221,6 +227,18 @@ export class ClusterBrowserHub {
       return Response.json(result);
     } finally {
       req.signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  /** True/false from the bindings table; undefined when the database cannot answer (the local socket was authenticated). */
+  private async bindingActive(name: string): Promise<boolean | undefined> {
+    const sql = this.sql;
+    if (!sql) return undefined;
+    try {
+      const rows = (await sql`SELECT 1 FROM browser_bindings WHERE name = ${name} AND state = 'active'`) as unknown[];
+      return rows.length > 0;
+    } catch {
+      return undefined;
     }
   }
 
@@ -285,11 +303,12 @@ export class ClusterBrowserHub {
 
   private async refreshRemote(sql: SQL): Promise<void> {
     const rows = (await sql`
-      SELECT binding, replica_id, replica_url, binding_json, extension_version, paused,
-             (extract(epoch FROM attached_at) * 1000)::float8 AS attached_ms
-      FROM gateway_browser_presence
-      WHERE replica_id <> ${this.opts.replicaId}
-        AND updated_at > now() - make_interval(secs => ${this.staleMs / 1000}::float8)`) as Array<Record<string, unknown>>;
+      SELECT p.binding AS binding, p.replica_id, p.replica_url, p.binding_json, p.extension_version, p.paused,
+             (extract(epoch FROM p.attached_at) * 1000)::float8 AS attached_ms
+      FROM gateway_browser_presence p
+      JOIN browser_bindings b ON b.name = p.binding AND b.state = 'active'
+      WHERE p.replica_id <> ${this.opts.replicaId}
+        AND p.updated_at > now() - make_interval(secs => ${this.staleMs / 1000}::float8)`) as Array<Record<string, unknown>>;
     const next = new Map<string, Remote>();
     for (const r of rows) {
       const raw = r.binding_json;

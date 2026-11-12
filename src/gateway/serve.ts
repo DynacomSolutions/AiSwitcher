@@ -352,6 +352,8 @@ export async function keepAliveOnce(deps: {
   mintedAt?: (tool: string, account: Identity) => Promise<number | undefined>;
   /** Called after the pass with every login held and its last success: the gateway's heartbeat. */
   onPass?: (held: Record<string, { lastSuccessAt?: string }>, at: Date) => Promise<void>;
+  /** Checked before each account: true ends the pass (the gateway is stopping and its stores are about to close). */
+  shouldStop?: () => boolean;
 }): Promise<void> {
   // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
   const revoked = deps.revoked ?? new Map<string, string>();
@@ -360,6 +362,7 @@ export async function keepAliveOnce(deps: {
   const held: Record<string, { lastSuccessAt?: string }> = {};
   for (const tool of deps.tools ?? ["claude"]) {
     for (const account of await deps.accounts(tool).catch(() => [] as Identity[])) {
+      if (deps.shouldStop?.()) break;
       const key = `${tool}/${account.name}`;
       held[key] = {};
       try {
@@ -433,8 +436,22 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
           sync: {
             run: (account, fn) => mirror.withAccount(`${account.provider}/${account.identity}`, fn),
             pull: async (tool, identity) => mirror.pullAccount(`${tool}/${identity.name}`, await grantPaths(tool, identity)),
-            push: async (tool, identity, written) => mirror.push([...new Set([...(await grantPaths(tool, identity)), ...written])], `${tool}/${identity.name}`, "login"),
+            push: async (tool, identity, written) => {
+              const account = `${tool}/${identity.name}`;
+              let first: unknown;
+              try {
+                await mirror.push([...new Set([...(await grantPaths(tool, identity)), ...written])], account, "login");
+              } catch (err) {
+                first = err;
+              }
+              // Whatever the listed paths missed (or a failed push left behind) goes too: every tracked file of the account that changed.
+              await mirror.pushAccountDirty(account).catch((err) => {
+                throw first ?? err;
+              });
+              alerter.recover("credential-store-write-failed", account);
+            },
           },
+          onStoreWriteFailed: (account) => alerter.raise("credential-store-write-failed", `${account.provider}/${account.identity}`, `the gateway could not write the ${account.provider} login "${account.identity}" to the credential store after a refresh; the new token only exists on this replica until it can (check the database)`),
         }
       : {}),
   });
@@ -716,6 +733,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       lastSuccess: lastSuccessAt,
       now,
       mintedAt: grantMintedAt,
+      shouldStop: () => draining,
       // The heartbeat also names the ali logins this gateway renews, so the host timer, the daemon and the CLI stand down.
       onPass: hooks.noHeartbeat
         ? undefined
@@ -772,6 +790,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       aliAbort.abort();
       await Promise.allSettled([...inflightRefreshes]);
       await Promise.race([Promise.allSettled([keepAliveRun]), new Promise<void>((r) => setTimeout(r, hooks.stopCeilingMs ?? 10_000).unref?.())]);
+      // A keep-alive account that was already past its stop check may have started a refresh meanwhile: wait for it too.
+      await Promise.allSettled([...inflightRefreshes]);
       await ledger.close();
       await relay?.stop().catch(() => undefined);
       await mirror?.stop().catch(() => undefined);

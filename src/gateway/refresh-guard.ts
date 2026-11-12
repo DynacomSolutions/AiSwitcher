@@ -189,6 +189,8 @@ export interface GuardDeps {
   onDegraded?(account: RefreshAccount, reason: string): void;
   /** Consecutive interrupted attempts with the current refresh token (0 once it is cleared). Alert from 2 up. */
   onInterrupted?(account: RefreshAccount, count: number): void;
+  /** A refresh's result could not be written to the credential store (after retries); the local file stays ahead for the background pass. */
+  onStoreWriteFailed?(account: RefreshAccount): void;
   /** The guard worked again for this account. */
   onHealthy?(account: RefreshAccount): void;
   warn?(message: string): void;
@@ -273,6 +275,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       } catch (err) {
         if (attempt >= 2) {
           warn(`credential store write for ${tool}/${identity.name} failed (${reason(err)}); retried in the background`);
+          deps.onStoreWriteFailed?.({ provider: tool, identity: identity.name });
           return;
         }
         await sleep(200 * (attempt + 1));
@@ -302,6 +305,12 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       if (err instanceof SwapLockError) {
         count("failure");
         throw err;
+      }
+      if (deps.sync) {
+        // Each replica's file lock is local: refreshing here could send the same single-use refresh token as another replica.
+        count("failure");
+        deps.onDegraded?.(account, reason(err));
+        throw new RefreshGuardRetryable(`refresh lock unavailable (${reason(err)}); not refreshing without it on the shared credential store`);
       }
       // The guard cannot run. Refreshing still goes ahead under AIS's file lock and the expectedAccessToken compare-and-swap.
       count("degraded");

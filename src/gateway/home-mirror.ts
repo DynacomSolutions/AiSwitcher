@@ -100,6 +100,40 @@ export const isFresher = (a: string, b: string): boolean => {
   return fa !== undefined && (fb === undefined || fa > fb);
 };
 
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * Merges two JSON-object credential files per top-level key (the shared pi auth.json holds one entry per provider): keys on
+ * one side only are kept; where both differ the subtree with the greater grantFreshness wins, a tie going to `theirs`
+ * (the store). Undefined when either side is not a JSON object.
+ */
+export function mergeByKey(mine: string, theirs: string): Buffer | undefined {
+  let a: unknown;
+  let b: unknown;
+  try {
+    a = JSON.parse(mine);
+    b = JSON.parse(theirs);
+  } catch {
+    return undefined;
+  }
+  if (!isPlainObject(a) || !isPlainObject(b)) return undefined;
+  const out: Record<string, unknown> = { ...b };
+  for (const [k, v] of Object.entries(a)) {
+    if (!(k in b)) {
+      out[k] = v;
+      continue;
+    }
+    if (JSON.stringify(v) === JSON.stringify(b[k])) continue;
+    const fm = grantFreshness(JSON.stringify(v));
+    const fs = grantFreshness(JSON.stringify(b[k]));
+    if (fm !== undefined && (fs === undefined || fm > fs)) out[k] = v;
+  }
+  return Buffer.from(`${JSON.stringify(out, null, 2)}\n`);
+}
+
+const MERGE_ATTEMPTS = 5;
+const STOP_PUSH_MS = 5_000;
+
 async function writeAtomic(path: string, data: Buffer): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.ais-store-${process.pid}-${Date.now().toString(36)}.tmp`;
@@ -116,7 +150,6 @@ export class HomeMirror {
   private readonly bases = new Map<string, Base>();
   private readonly kinds = new Map<string, { kind: HomeFileKind; account: string | null }>();
   private readonly locks = new Map<string, Promise<void>>();
-  private maxVersion = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
   private unlisten: (() => Promise<void>) | undefined;
   private pending = new Set<string>();
@@ -197,6 +230,7 @@ export class HomeMirror {
     }
     // Both changed, or first sight.
     if (hostTruth) return push(row.version);
+    if (row.kind === "login" && (row.account ?? "").startsWith("pi/") && mergeByKey(local.toString("utf8"), row.content.toString("utf8"))) return this.mergeAndPush(row, local);
     if (row.kind === "login") {
       const l = local.toString("utf8");
       if (isFresher(l, row.content.toString("utf8"))) return push(row.version);
@@ -205,9 +239,42 @@ export class HomeMirror {
     return write();
   }
 
-  /** Pulls every row changed since the last pass (all rows on the first). Per-account rows run under the account mutex. */
+  /**
+   * A shared file (pi's auth.json, one entry per provider) changed on both sides: merge per key, write the merge locally and
+   * push it against the row's version, again on a further conflict. Throws when it stays unresolved.
+   */
+  private async mergeAndPush(row: HomeFileRow, local: Buffer): Promise<"wrote" | "pushed"> {
+    let cur = row;
+    let mine = local;
+    for (let attempt = 0; attempt < MERGE_ATTEMPTS; attempt += 1) {
+      const merged = mergeByKey(mine.toString("utf8"), cur.content.toString("utf8"));
+      if (!merged) throw new Error("gateway store: shared file is no longer a JSON object");
+      const sha = sha256Hex(merged);
+      if (sha === cur.sha256) {
+        await writeAtomic(this.abs(cur.path), cur.content);
+        this.bases.set(cur.path, { version: cur.version, sha: cur.sha256 });
+        return "wrote";
+      }
+      await writeAtomic(this.abs(cur.path), merged);
+      const r = await this.store.put(cur.path, merged, { account: cur.account, kind: cur.kind, expectedVersion: cur.version });
+      if (r.ok) {
+        this.bases.set(cur.path, { version: r.version, sha });
+        return "pushed";
+      }
+      mine = merged;
+      const [next] = await this.store.get([cur.path]);
+      if (!next) throw new Error("gateway store: shared file row disappeared during a merge");
+      cur = next;
+    }
+    throw new Error("gateway store: shared file merge kept conflicting");
+  }
+
+  /**
+   * Reads every row's metadata and applies the ones past their base version. Sequence versions can commit out of order, so a
+   * high-water mark could skip a row for good; the metadata is small. Per-account rows run under the account mutex.
+   */
   async pullAll(): Promise<void> {
-    const metas = await this.store.list(this.maxVersion);
+    const metas = await this.store.list(0);
     await this.applyMetas(metas);
     this.lastSyncAt = Date.now();
   }
@@ -232,7 +299,6 @@ export class HomeMirror {
       if (account) await this.withAccount(account, run);
       else await run();
     }
-    for (const m of metas) if (m.version > this.maxVersion) this.maxVersion = m.version;
   }
 
   /** Pulls one account's rows (and `extraPaths`) now. Call it holding the account's refresh lock. */
@@ -263,7 +329,19 @@ export class HomeMirror {
       }
       // Someone else wrote it: reconcile against their row (fresher grant wins).
       const [row] = await this.store.get([rel]);
-      if (row) await this.reconcile(row);
+      if (!row) throw new Error(`gateway store: write of ${rel} was refused and its row is gone`);
+      if ((await this.reconcile(row)) === "conflict") throw new Error(`gateway store: write of ${rel} lost a race that stayed unresolved`);
+    }
+  }
+
+  /** Pushes the account's tracked files whose local copy differs from their base (a push that missed them). No account lock: call it inside one. */
+  async pushAccountDirty(account: string): Promise<void> {
+    for (const [rel, base] of [...this.bases]) {
+      const k = this.kinds.get(rel);
+      if (!k || k.account !== account) continue;
+      const local = await readLocal(this.abs(rel));
+      if (!local || sha256Hex(local) === base.sha) continue;
+      await this.push([this.abs(rel)], account, k.kind);
     }
   }
 
@@ -317,6 +395,10 @@ export class HomeMirror {
     if (this.timer) clearInterval(this.timer);
     await this.unlisten?.().catch(() => undefined);
     await this.draining?.catch(() => undefined);
+    // Last chance for a rotation whose push failed: the pod is going, and so is its local copy.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([this.pushDirty().catch(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, STOP_PUSH_MS)))]);
+    clearTimeout(timer);
   }
 
   /** True when the file exists locally (tests, status). */

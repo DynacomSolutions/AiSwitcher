@@ -86,6 +86,8 @@ if (!url && process.env.CI && !optOut) {
     const sql = new SQL(url as string);
     try {
       await sql`DELETE FROM gateway_browser_presence`;
+      await sql`INSERT INTO browser_bindings (name, target, profile_label, state, created_at) VALUES ('work', '{"kind":"identity","identity":"acct-a"}'::jsonb, 'Profile', 'active', now())
+        ON CONFLICT (name) DO UPDATE SET state = 'active'`;
     } finally {
       await sql.close();
     }
@@ -179,6 +181,32 @@ if (!url && process.env.CI && !optOut) {
       expect(fresh.closed).toEqual([]);
       await until(() => a.cluster.connected().length === 1);
       expect((await a.cluster.call("work", req("call-6"), 3000)).ok).toBe(true);
+    });
+
+    test("a binding revoked in SQL without a NOTIFY disappears and is refused by the relay", async () => {
+      await prepare();
+      const a = await replica("replica-a");
+      const b = await replica("replica-b");
+      const sock = fakeSocket(a.hub);
+      a.hub.attach(sock.ws, binding("work"));
+      await until(() => b.cluster.connected().length === 1);
+      const sql = new SQL(url as string);
+      try {
+        await sql`UPDATE browser_bindings SET state = 'revoked' WHERE name = 'work'`;
+      } finally {
+        await sql.close();
+      }
+      // The next presence tick drops it from the other replica's view.
+      await until(() => b.cluster.connected().length === 0);
+      // A relay that still reaches A is refused and A drops its socket.
+      const res = await fetch(`http://127.0.0.1:${a.server.port}${RELAY_PATH}`, {
+        method: "POST",
+        body: JSON.stringify({ binding: "work", req: req("call-8"), timeoutMs: 1000 }),
+        headers: { authorization: `Bearer ${relaySecret(TOKEN)}` },
+      });
+      expect(await res.json()).toMatchObject({ ok: false, error: "no_browser" });
+      expect(sock.frames.filter((f) => f.t === "call")).toHaveLength(0);
+      expect(sock.closed).toEqual([4401]);
     });
 
     test("relay endpoint rejects a bad or missing admin token", async () => {

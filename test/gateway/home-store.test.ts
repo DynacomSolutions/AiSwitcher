@@ -172,6 +172,73 @@ if (!url && process.env.CI && !optOut) {
     });
   });
 
+  describe("shared pi auth.json, stop and bad rows", () => {
+    const PI = ".pi/agent/auth.json";
+    const entry = (name: string, expires: number) => ({ type: "oauth", refresh: `SYNTHETIC_FIXTURE-${name}`, access: `SYNTHETIC_FIXTURE-access-${name}`, expires });
+    const pi = (a: number, c: number, an = "an", cx = "cx") => JSON.stringify({ anthropic: entry(an, a), "openai-codex": entry(cx, c) });
+
+    test("two replicas rotating different provider entries both survive", async () => {
+      const { store, home } = await fresh();
+      await store.put(PI, Buffer.from(pi(1_000, 1_000)), { account: "pi/p1", kind: "login", expectedVersion: null });
+      const [ha, hb] = [await home(), await home()];
+      const a = new HomeMirror(store, { home: ha });
+      const b = new HomeMirror(store, { home: hb });
+      await a.pullAll();
+      await b.pullAll();
+      await put(ha, PI, pi(2_000, 1_000, "an2"));
+      await put(hb, PI, pi(1_000, 2_000, "an", "cx2"));
+      await a.push([join(ha, PI)], "pi/p1", "login");
+      await b.push([join(hb, PI)], "pi/p1", "login");
+      const row = JSON.parse((await store.get([PI]))[0]!.content.toString());
+      expect(row.anthropic.refresh).toBe("SYNTHETIC_FIXTURE-an2");
+      expect(row["openai-codex"].refresh).toBe("SYNTHETIC_FIXTURE-cx2");
+      expect(JSON.parse(await readFile(join(hb, PI), "utf8")).anthropic.refresh).toBe("SYNTHETIC_FIXTURE-an2");
+    });
+
+    test("push throws when the store refuses and the conflict is not resolved", async () => {
+      const { store, home } = await fresh();
+      await store.put(LOGIN, Buffer.from(grant("r0", 2_000_000_000_000)), { account: "claude/a1", kind: "login", expectedVersion: null });
+      const h = await home();
+      const m = new HomeMirror(store, { home: h });
+      await m.pullAll();
+      await put(h, LOGIN, grant("r1", 2_000_000_100_000));
+      const real = store.put.bind(store);
+      store.put = async () => ({ ok: false });
+      await expect(m.push([join(h, LOGIN)], "claude/a1", "login")).rejects.toThrow();
+      store.put = real;
+    });
+
+    test("stop pushes a rotation whose push failed earlier; pushAccountDirty pushes only the account's files", async () => {
+      const { store, home } = await fresh();
+      await store.put(LOGIN, Buffer.from(grant("r0", 2_000_000_000_000)), { account: "claude/a1", kind: "login", expectedVersion: null });
+      const h = await home();
+      const m = new HomeMirror(store, { home: h });
+      await m.pullAll();
+      await put(h, LOGIN, grant("r1", 2_000_000_100_000));
+      await m.pushAccountDirty("claude/other");
+      expect((await store.get([LOGIN]))[0]!.content.toString()).toContain("r0");
+      await m.stop();
+      expect((await store.get([LOGIN]))[0]!.content.toString()).toContain("r1");
+    });
+
+    test("a row that does not decrypt is skipped and the others are returned", async () => {
+      const { store } = await fresh();
+      const warns: string[] = [];
+      const other = new PgHomeStore(url, Buffer.alloc(32, 9), "t", (m) => void warns.push(m));
+      stores.push(other);
+      const mine = new PgHomeStore(url, KEY, "t", (m) => void warns.push(m));
+      stores.push(mine);
+      await store.put(LOGIN, Buffer.from(grant("r0", 1)), { account: "claude/a1", kind: "login", expectedVersion: null });
+      await other.put("bad/path.json", Buffer.from("x"), { account: "claude/a1", kind: "login", expectedVersion: null });
+      const got = await mine.get([LOGIN, "bad/path.json"]);
+      expect(got.map((r) => r.path)).toEqual([LOGIN]);
+      expect((await mine.getAccount("claude/a1")).map((r) => r.path)).toEqual([LOGIN]);
+      expect(warns.length).toBeGreaterThan(0);
+      expect(warns.join("\n")).toContain("bad/path.json");
+      expect(warns.join("\n")).not.toContain("SYNTHETIC_FIXTURE");
+    });
+  });
+
   describe("PgLeader", () => {
     test("one leader at a time; the next takes over when it goes", async () => {
       const a = new PgLeader(url, 60_000);

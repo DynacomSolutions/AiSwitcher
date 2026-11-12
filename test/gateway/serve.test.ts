@@ -866,6 +866,18 @@ describe("keep-alive across every refreshable tool", () => {
     expect(seen).toEqual(["codex:-", "kimi:-", "codex:fp-c", "kimi:-"]);
   });
 
+  test("keepAliveOnce stops refreshing once shouldStop turns true", async () => {
+    let stopping = false;
+    const seen: string[] = [];
+    const refresh = (async (tool: string, id: { name: string }) => {
+      seen.push(id.name);
+      stopping = true;
+      return { tool, identity: id.name, outcome: "refreshed", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    await keepAliveOnce({ refresh, accounts: async () => [member("a"), member("b"), member("c")], tools: ["kimi"], metrics: { keepAlive: () => {} }, shouldStop: () => stopping });
+    expect(seen).toEqual(["a"]);
+  });
+
   test("the gateway timer keeps codex and kimi members alive through the guard", async () => {
     const backend = new MemoryRefreshBackend();
     const seen = new Set<string>();
