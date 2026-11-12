@@ -624,6 +624,36 @@ describe("failover and refresh", () => {
     expect(who()).toEqual(["Bearer tok-b"]);
   });
 
+  // Incident 12 Nov 2026: big Fable requests (over the replay cap) got a Fable-full member's 429 and never held it, so
+  // every big Fable request landed on the same full member again.
+  test("a streamed (over the replay cap) model-scoped 429 still holds the member for that model", async () => {
+    const { clock, who } = await burstSetup("pair");
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "pool3", target: { kind: "pool" } }));
+    const big = (model: string) => JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "x".repeat(9 * 1024 * 1024) }] });
+    const callBody = async (body: string) => {
+      const r = await gw.request("http://gw.test/pool3/v1/messages", { method: "POST", body, headers: { authorization: `Bearer ${t}`, "content-length": String(body.length) } });
+      return new Response(await r.arrayBuffer(), { status: r.status });
+    };
+    const resetAt = Math.floor((clock.ms + 6 * 86_400_000) / 1000);
+    let current = "";
+    handler = (_req, s) =>
+      s.headers.get("authorization") === "Bearer tok-a" && current === "claude-fable-test"
+        ? new Response("{}", { status: 429, headers: { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String(resetAt), "anthropic-ratelimit-unified-7d-status": "allowed", "anthropic-ratelimit-unified-7d_oi-status": "rejected" } })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    current = "claude-fable-test";
+    expect((await callBody(big("claude-fable-test"))).status).toBe(429); // no replay for a streamed body
+    expect(who()).toEqual(["Bearer tok-a"]);
+    seen.length = 0;
+    clock.ms += 120_000; // well past any burst hold
+    expect((await callBody(big("claude-fable-test"))).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]); // held for Fable
+    seen.length = 0;
+    current = "claude-opus-test";
+    expect((await callBody(JSON.stringify({ model: "claude-opus-test", max_tokens: 1, messages: [] }))).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a"]); // other models still use it
+  });
+
   test("isModelScopedRejection: scoped window only, never when an account window is rejected", () => {
     const h = (o: Record<string, string>) => new Headers(o);
     expect(isModelScopedRejection(h({ "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-7d-status": "allowed", "anthropic-ratelimit-unified-7d_oi-status": "rejected" }))).toBe(true);

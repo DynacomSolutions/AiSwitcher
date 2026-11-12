@@ -79,7 +79,10 @@ const HOP_BY_HOP = ["connection", "proxy-connection", "keep-alive", "proxy-authe
 /** Error types or codes that mean "this login is out of quota". A bare 403 (for example "insufficient permissions") is not one. */
 const QUOTA_CODES = /^(insufficient_quota|rate_limit_error|rate_limit_exceeded|usage_limit_reached|quota_exceeded|billing_hard_limit_reached)$/i;
 
-export type Body = { kind: "none" } | { kind: "buffered"; bytes: Uint8Array } | { kind: "stream"; stream: ReadableStream<Uint8Array> };
+export type Body = { kind: "none" } | { kind: "buffered"; bytes: Uint8Array } | { kind: "stream"; stream: ReadableStream<Uint8Array>; /** The first bytes, for sniffing the model. */ head?: Uint8Array };
+
+/** How much of a streamed body is read up front to find its model. */
+const STREAM_HEAD_BYTES = 64 * 1024;
 
 /** The declared Content-Length, or NaN when absent or malformed (`Number("")` would be a misleading 0). */
 export function declaredLength(req: Request): number {
@@ -115,8 +118,25 @@ export async function readBody(req: Request): Promise<Body> {
     size += r.value.length;
     overflow = size > REPLAY_LIMIT_BYTES;
   }
-  // Too big to replay: hand the buffered part and the rest on, byte for byte.
-  return { kind: "stream", stream: chainStream(chunks, reader) };
+  // Too big to replay. Read a little first (when nothing is read yet) so the model can be sniffed: a quota answer for
+  // a streamed body still holds the member for that model. The bytes go on unchanged.
+  while (size < STREAM_HEAD_BYTES) {
+    const r = await reader.read();
+    if (r.done) break;
+    chunks.push(r.value);
+    size += r.value.length;
+  }
+  const headLen = Math.min(size, STREAM_HEAD_BYTES);
+  const head = new Uint8Array(headLen);
+  let at = 0;
+  for (const c of chunks) {
+    if (at >= headLen) break;
+    const take = c.subarray(0, Math.min(c.length, headLen - at));
+    head.set(take, at);
+    at += take.length;
+  }
+  // Hand the read part and the rest on, byte for byte.
+  return { kind: "stream", stream: chainStream(chunks, reader), head };
 }
 
 /** The already-read chunks followed by the rest of the reader, unmodified. */
@@ -328,7 +348,14 @@ export function scanModel(b: Uint8Array): { ok: boolean; model?: string } {
   }
 }
 
+/** A streamed body's model, when its JSON names `model` before the head ends (Claude Code sends it first). */
+const HEAD_MODEL = /^\s*\{\s*"model"\s*:\s*"([A-Za-z0-9._:\[\]\/-]{1,200})"/;
+
 function requestModel(body: Body): string | undefined {
+  if (body.kind === "stream") {
+    if (!body.head) return undefined;
+    return HEAD_MODEL.exec(new TextDecoder().decode(body.head))?.[1];
+  }
   if (body.kind !== "buffered" || body.bytes.length === 0 || body.bytes[0] !== 0x7b) return undefined; // only a JSON object has a model
   const scanned = scanModel(body.bytes);
   if (scanned.ok) return scanned.model;
@@ -847,6 +874,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       await holdCredentialFailure(pick.identity, err);
     }
     let cur: Response | undefined = first;
+    if (!poolReplay && app.target.kind === "pool" && cur) {
+      // A body that cannot be replayed (streamed, over the replay cap) gets no failover, but its quota answer still holds
+      // the member back, so the next request does not land on the same full member.
+      const q = await isQuota(cur);
+      cur = q.res;
+      if (q.quota) holdQuota(pick.identity, cur);
+    }
     if (poolReplay) {
       let quota = false;
       if (cur) {
