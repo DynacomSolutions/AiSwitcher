@@ -24,6 +24,7 @@ import { writeFileAtomic } from "../identities/pool/fs.ts";
 import { findIdentityByNameOrAlias, loadIdentitiesFile } from "../identities/store.ts";
 import type { ToolConfig } from "../identities/types.ts";
 import { aisRemoteCacheDir } from "../shared/ais-home.ts";
+import { isInBaseCheckout } from "../shared/memory-land.ts";
 import { mergeJsonlFiles, mergeJsonlTail } from "./dedupe.ts";
 import { listHistories, PrefixCache, hashPrefix, TAIL_MIN_BYTES, TAIL_PLAN_FILE, type HistoryManifest, type TailPlan } from "./tail-sync.ts";
 import { mergeRegistryConflict } from "./registry.ts";
@@ -41,6 +42,8 @@ export interface TreeMergeResult {
   busyPaths: string[];
   /** Paths this user cannot re-time or overwrite (root-owned); sync excludes them from later runs. */
   deniedPaths?: string[];
+  /** Incoming paths deliberately not applied: shared hooks while ~/.ais/hooks lives in a git-base checkout. Not an error and not retried. */
+  skippedPaths?: string[];
   /** Tail transfers whose prefix did not match: the sender must stage these histories whole. */
   needsFull?: string[];
 }
@@ -801,7 +804,9 @@ export async function mergeIncomingProfileTree(
   const conflictRoot =
     options.conflictRoot ??
     join(aisRemoteCacheDir(home), "merge-conflicts", new Date().toISOString().replaceAll(":", "-"));
-  const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [], deniedPaths: [] };
+  const result: TreeMergeResult = { mergedJsonlFiles: 0, copiedFiles: 0, preservedConflicts: 0, preservedConflictPaths: [], busyPaths: [], deniedPaths: [], skippedPaths: [] };
+  // Git is the source of truth for hooks when ~/.ais/hooks resolves into a base checkout: never write there.
+  const skipHooks = await isInBaseCheckout(join(home, ".ais", "hooks"));
   const registries = registryRelPaths(scope, home);
   const ownerPass = options.ownerPass ?? { lookups: 0 };
   const cache = await PrefixCache.load(home);
@@ -845,6 +850,10 @@ export async function mergeIncomingProfileTree(
   for await (const source of walkFiles(incomingRoot)) {
     const rel = pathWithin(incomingRoot, source);
     if (!rel || registries.has(rel)) continue;
+    if (skipHooks && rel.startsWith(".ais/hooks/")) {
+      result.skippedPaths!.push(rel);
+      continue;
+    }
     const destination = join(home, rel);
 
     const login = guard.native.get(rel);

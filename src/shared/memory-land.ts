@@ -33,6 +33,22 @@ export function parseBaseToplevel(toplevel: string): { root: string; org: string
   return { root: rawRoot || "/", org, repo };
 }
 
+/** True when `dir` (the checkout root or anything below it) resolves into a
+ * git-base base checkout. Path work only: no git subprocess. A missing path is
+ * never in a base. */
+export async function isInBaseCheckout(dir: string): Promise<boolean> {
+  let resolved: string;
+  try {
+    resolved = await realpath(dir);
+  } catch {
+    return false;
+  }
+  for (let current = resolved; ; current = dirname(current)) {
+    if (parseBaseToplevel(current)) return true;
+    if (dirname(current) === current) return false;
+  }
+}
+
 async function isExecutable(path: string): Promise<boolean> {
   try {
     if (!(await stat(path)).isFile()) return false;
