@@ -399,8 +399,8 @@ describe("local gateway failover", () => {
     expect(await (await r.post()).text()).toBe("from-b");
   });
 
-  test("body over 8 MiB gets no fallback and the remote error passes through", async () => {
-    const big = "x".repeat(8 * 1024 * 1024 + 10);
+  test("body over the replay limit gets no fallback and the remote error passes through", async () => {
+    const big = "x".repeat(32 * 1024 * 1024 + 10);
     const r = rig({ remote: () => new Response("busy", { status: 503 }) });
     const res = await r.post("/claude/v1/messages", big);
     expect(res.status).toBe(503);

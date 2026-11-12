@@ -141,12 +141,12 @@ const MIB = 1024 * 1024;
 const big = (n: number): string => JSON.stringify({ model: "claude-x", pad: "y".repeat(n - 100) });
 
 describe("gateway memory", () => {
-  test("defaults to 512 MiB and reads AIS_GATEWAY_BODY_BUDGET_MB", () => {
-    expect(BODY_BUDGET_BYTES).toBe(512 * MIB);
-    expect(bodyBudgetFromEnv({})).toBe(512 * MIB);
+  test("defaults to 1 GiB and reads AIS_GATEWAY_BODY_BUDGET_MB", () => {
+    expect(BODY_BUDGET_BYTES).toBe(1024 * MIB);
+    expect(bodyBudgetFromEnv({})).toBe(1024 * MIB);
     expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "64" })).toBe(64 * MIB);
-    expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "junk" })).toBe(512 * MIB);
-    expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "0" })).toBe(512 * MIB);
+    expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "junk" })).toBe(1024 * MIB);
+    expect(bodyBudgetFromEnv({ AIS_GATEWAY_BODY_BUDGET_MB: "0" })).toBe(1024 * MIB);
   });
 
   test("waits and completes when budget frees: bodies held stay within the budget and nobody gets a 503", async () => {
@@ -169,7 +169,7 @@ describe("gateway memory", () => {
   });
 
   test("chunked bodies with no Content-Length reserve the replay cap, so held bytes stay within the budget", async () => {
-    const r = await rig({ budget: 16 * MIB, holdMs: 40 });
+    const r = await rig({ budget: 64 * MIB, holdMs: 40 });
     const chunk = new TextEncoder().encode(big(MIB));
     const chunked = (): Promise<Response> =>
       r.postRaw(
@@ -189,7 +189,7 @@ describe("gateway memory", () => {
     );
     r.stop();
     expect(statuses.every((s) => s === 200)).toBe(true);
-    // 16 MiB budget / 8 MiB reserved per unknown-length request = 2 at a time.
+    // 64 MiB budget / 32 MiB reserved per unknown-length request = 2 at a time.
     expect(r.peak()).toBeLessThanOrEqual(2);
   });
 

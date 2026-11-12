@@ -61,7 +61,7 @@ export interface GatewayDeps {
 const SIDE_COUNT_MAX_INFLIGHT = 4;
 
 /** Default cap on request-body bytes buffered at one time (the rest wait, holding no memory). */
-export const BODY_BUDGET_BYTES = 512 * 1024 * 1024;
+export const BODY_BUDGET_BYTES = 1024 * 1024 * 1024;
 
 /** The budget in bytes: `AIS_GATEWAY_BODY_BUDGET_MB` when it is a positive number, else the default. */
 export function bodyBudgetFromEnv(env: Record<string, string | undefined> = process.env): number {
@@ -69,8 +69,11 @@ export function bodyBudgetFromEnv(env: Record<string, string | undefined> = proc
   return Number.isFinite(mb) && mb > 0 ? Math.floor(mb * 1024 * 1024) : BODY_BUDGET_BYTES;
 }
 
-/** Request bodies up to this size are buffered so they can be replayed (401 retry, failover). */
-export const REPLAY_LIMIT_BYTES = 8 * 1024 * 1024;
+/**
+ * Request bodies up to this size are buffered so they can be replayed (401 retry, failover). It matches Anthropic's own request size
+ * limit (32 MB), so every request the provider accepts can fail over to another member; long agent threads with screenshots run past 8 MiB.
+ */
+export const REPLAY_LIMIT_BYTES = 32 * 1024 * 1024;
 /** Quota errors (403) are only inspected up to this size. */
 export const ERROR_PEEK_BYTES = 64 * 1024;
 

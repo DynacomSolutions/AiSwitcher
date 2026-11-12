@@ -630,7 +630,7 @@ describe("failover and refresh", () => {
     const { clock, who } = await burstSetup("pair");
     const gw = createGatewayApp(deps);
     const t = await addApp(baseApp({ name: "pool3", target: { kind: "pool" } }));
-    const big = (model: string) => JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "x".repeat(9 * 1024 * 1024) }] });
+    const big = (model: string) => JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "x".repeat(33 * 1024 * 1024) }] });
     const callBody = async (body: string) => {
       const r = await gw.request("http://gw.test/pool3/v1/messages", { method: "POST", body, headers: { authorization: `Bearer ${t}`, "content-length": String(body.length) } });
       return new Response(await r.arrayBuffer(), { status: r.status });
@@ -1068,7 +1068,7 @@ describe("failover and refresh", () => {
     usage.a = live(10);
     usage.b = live(20);
     handler = () => new Response("{}", { status: 429, headers: { "content-type": "application/json" } });
-    const big = new Uint8Array(8 * 1024 * 1024 + 1000);
+    const big = new Uint8Array(32 * 1024 * 1024 + 1000);
     for (let i = 0; i < big.length; i++) big[i] = (i * 7) % 251;
     const res = await call("/pool/v1/messages", t, { method: "POST", body: big, headers: { "content-type": "application/octet-stream" } });
     expect(res.status).toBe(429);
@@ -1331,7 +1331,7 @@ describe("fix round 1", () => {
   test("an over-limit body 401 refreshes the credential but is not retried", async () => {
     const t = await addApp(baseApp({}));
     handler = () => new Response('{"e":"auth"}', { status: 401 });
-    const big = new Uint8Array(8 * 1024 * 1024 + 10);
+    const big = new Uint8Array(32 * 1024 * 1024 + 10);
     const res = await call("/pin/v1/messages", t, { method: "POST", body: big, headers: { "content-type": "application/octet-stream" } });
     expect(res.status).toBe(401);
     expect(refreshCalls).toBe(1);
@@ -1345,14 +1345,14 @@ describe("fix round 1", () => {
     let n = 0;
     const body = new ReadableStream<Uint8Array>({
       pull(c) {
-        if (n++ < 9) c.enqueue(chunk);
+        if (n++ < 33) c.enqueue(chunk);
         else c.close();
       },
     });
     const res = await call("/pool/v1/messages", t, { method: "POST", body, duplex: "half", headers: { "content-type": "application/octet-stream" } } as RequestInit);
     expect(res.status).toBe(429);
     expect(seen.length).toBe(1);
-    expect(seen[0]!.body.length).toBe(9 * 1024 * 1024);
+    expect(seen[0]!.body.length).toBe(33 * 1024 * 1024);
   });
 
   test("cap check failing open is counted", async () => {
