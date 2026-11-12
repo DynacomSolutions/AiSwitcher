@@ -18,7 +18,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
  *   app's model allowlist does not apply to it, and its 401/429/402/403 answers are passed through untouched (no forced login
  *   refresh, no pool hold or failover), so an unverified side route can never disable a login chat calls depend on. The
  *   daily token cap still applies, and these calls
- *   are also counted per app against SIDE_DAILY_LIMIT_DEFAULT requests a day (no token rows are invented for them).
+ *   are also counted per app against AIS_GATEWAY_SIDE_DAILY_LIMIT requests a day when that is set (no token rows are invented for them).
  * - `serve`: the gateway answers itself from its own pool state (a pinned app gets PIN_FORWARD's provider answer instead).
  * - `account`: see AccountOp.
  *
@@ -67,12 +67,14 @@ export const PIN_FORWARD: Partial<Record<ServedName, string>> = {
   "codex-reset-credits": "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
 };
 
-/** Side and served requests an app may make per day, counted apart from tokens. AIS_GATEWAY_SIDE_DAILY_LIMIT overrides. */
-export const SIDE_DAILY_LIMIT_DEFAULT = 5_000;
-
-export function sideDailyLimitFromEnv(env: Record<string, string | undefined> = process.env): number {
+/**
+ * Side and served requests an app may make per day, only when AIS_GATEWAY_SIDE_DAILY_LIMIT is set. Unset means no limit: the gateway
+ * never invents its own caps, the provider's own answers decide (a default cap here once blocked Claude Code's /api/oauth calls for the
+ * whole agent pool).
+ */
+export function sideDailyLimitFromEnv(env: Record<string, string | undefined> = process.env): number | undefined {
   const n = Number(env.AIS_GATEWAY_SIDE_DAILY_LIMIT ?? "");
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : SIDE_DAILY_LIMIT_DEFAULT;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
 
 /** Repeated slashes collapsed, so a rule and the path sent upstream agree ("/api//oauth" is "/api/oauth"). */

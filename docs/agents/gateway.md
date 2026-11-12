@@ -225,8 +225,9 @@ speech call is not a model call); the daily token cap does.
 - **CONNECT proxy**: every request with an `aisg_` bearer (any method and path, body included) is handed to that app's route;
   an `aisg_` token the gateway does not accept is 401 and never sent on. Other bearers are forwarded unchanged.
 - **Side routes** (lists, search, fetch, speech) pass the provider's 401/402/403/429 straight to the app: no login
-  refresh, no pool hold, no failover. Side and served calls are counted per app and day apart from tokens (default 5000 a
-  day, `AIS_GATEWAY_SIDE_DAILY_LIMIT`; over it the answer is 429); no token rows are written for them. Codex reset credits
+  refresh, no pool hold, no failover. Side and served calls have no gateway limit by default; only when
+  `AIS_GATEWAY_SIDE_DAILY_LIMIT` is set are they counted per app and day and answered 429 over it. No token rows are
+  written for them. Codex reset credits
   are cached 60 s per app.
 - Repeated slashes in any app path are collapsed before matching and before the path is sent upstream. Claude paths are
   matched after decoding, lower-casing and dropping `;params`.

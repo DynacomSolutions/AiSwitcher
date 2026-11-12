@@ -838,6 +838,7 @@ describe("daily limits", () => {
   test("a slow database is cancelled on timeout and never has more than four calls in flight", async () => {
     await addApp("k", "kimi", "openai");
     deps.sideCountTimeoutMs = 150;
+    deps.sideDailyLimit = 5_000;
     let calls = 0;
     const signals: AbortSignal[] = [];
     store.bumpSideCount = (_a, _d, signal) => {
@@ -1026,4 +1027,11 @@ describe("account API of the other providers", () => {
     }
     expect(seen).toHaveLength(0);
   });
+});
+
+test("side and served calls have no gateway daily limit unless AIS_GATEWAY_SIDE_DAILY_LIMIT is set", async () => {
+  const { sideDailyLimitFromEnv } = await import("../../src/gateway/routes.ts");
+  expect(sideDailyLimitFromEnv({})).toBeUndefined();
+  expect(sideDailyLimitFromEnv({ AIS_GATEWAY_SIDE_DAILY_LIMIT: "0" })).toBeUndefined();
+  expect(sideDailyLimitFromEnv({ AIS_GATEWAY_SIDE_DAILY_LIMIT: "12" })).toBe(12);
 });
