@@ -117,16 +117,28 @@ describe("model lists", () => {
       await addApp("app", provider, style, { models: ["only-this-model"] }); // the allowlist must not block a list call
       const res = await call("app", path, { method: "GET" });
       expect(res.status).toBe(200);
-      expect(seen).toHaveLength(1);
-      expect(new URL(seen[0]!.url).pathname).toBe(want);
-      expect(seen[0]!.headers.get("x-orig-host")).toBe(host);
-      expect(seen[0]!.headers.get("authorization") ?? seen[0]!.headers.get("x-api-key")).toContain("tok-");
+      // A pool app asks every member (their plans can differ) and answers with the union.
+      expect(seen).toHaveLength(2);
+      for (const s of seen) {
+        expect(new URL(s.url).pathname).toBe(want);
+        expect(s.headers.get("x-orig-host")).toBe(host);
+      }
+      expect(seen.map((s) => s.headers.get("authorization") ?? s.headers.get("x-api-key") ?? "").sort()).toEqual([expect.stringContaining("tok-a"), expect.stringContaining("tok-b")]);
       expect(requests.at(-1)).toMatchObject({ app: "app", provider, httpStatus: 200 });
     });
   }
 
+  test("a pinned app's list is the provider's answer for its one identity", async () => {
+    await addApp("app", "codex", "openai", { target: { kind: "pin", identity: "b" } });
+    reply = () => new Response(JSON.stringify({ models: [{ slug: "m1", visibility: "list" }] }), { headers: { "content-type": "application/json", etag: 'W/"upstream"' } });
+    const res = await call("app", "/models?client_version=0.167.2", { method: "GET" });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.headers.get("authorization")).toBe("Bearer tok-b");
+    expect(res.headers.get("etag")).toBe('W/"upstream"');
+  });
+
   test("a single model id and the query string are forwarded", async () => {
-    await addApp("app", "claude", "anthropic");
+    await addApp("app", "claude", "anthropic", { target: { kind: "pin", identity: "a" } });
     await call("app", "/v1/models/claude-x?limit=5", { method: "GET" });
     expect(seen[0]!.url).toContain("/v1/models/claude-x?limit=5");
   });
@@ -146,6 +158,124 @@ describe("model lists", () => {
     await addApp("app", "kimi", "openai");
     const res = await createGatewayApp(deps).request("http://gw.test/app/v1/models", { headers: { authorization: ["Bearer", "wrong"].join(" ") } });
     expect(res.status).toBe(401);
+    expect(seen).toHaveLength(0);
+  });
+});
+
+describe("pool model lists are the union of every member's list", () => {
+  const jsonRes = (body: unknown, status = 200, headers: Record<string, string> = {}): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+  const memberOf = (s: Seen): string => (s.headers.get("authorization") ?? s.headers.get("x-api-key") ?? "").replace(/^Bearer /, "").replace(/^tok-/, "");
+  // Member "a" is on a small plan, member "b" on a large one (a real pool on 12 Nov 2026).
+  const codexSmall = { models: [
+    { slug: "gpt-reserve", visibility: "hide", priority: 1, from: "a" },
+    { slug: "gpt-6-luna", visibility: "list", priority: 5, from: "a" },
+    { slug: "gpt-5.6-terra", visibility: "list", priority: 8, from: "a" },
+    { slug: "gpt-shared", visibility: "hide", priority: 9, from: "a" },
+  ] };
+  const codexLarge = { models: [
+    { slug: "gpt-reserve", visibility: "hide", priority: 1, from: "b" },
+    { slug: "gpt-6.1-sol", visibility: "list", priority: 2, from: "b" },
+    { slug: "gpt-6-luna", visibility: "list", priority: 5, from: "b" },
+    { slug: "gpt-shared", visibility: "list", priority: 9, from: "b" },
+  ] };
+
+  test("codex: every slug either member lists, once, in priority order, whichever member the pool would pick", async () => {
+    await addApp("mc", "codex", "openai");
+    reply = (s) => jsonRes(memberOf(s) === "a" ? codexSmall : codexLarge, 200, { etag: `W/"${memberOf(s)}"` });
+    for (const busy of ["a", "b"]) {
+      usage = { a: { identity: "a", windows: [{ label: "five-hour", utilization: busy === "a" ? 90 : 10 }] }, b: { identity: "b", windows: [{ label: "five-hour", utilization: busy === "b" ? 90 : 10 }] } } as unknown as Record<string, PoolUsage>;
+      seen = [];
+      const res = await call("mc", "/models?client_version=0.167.2", { method: "GET" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { models: Array<{ slug: string; visibility: string; from: string }> };
+      expect(body.models.map((m) => m.slug)).toEqual(["gpt-reserve", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-shared"]);
+      // "list" beats "hide", and that entry's fields come from the member that lists it.
+      expect(body.models.find((m) => m.slug === "gpt-shared")).toMatchObject({ visibility: "list", from: "b" });
+      expect(body.models.find((m) => m.slug === "gpt-reserve")?.visibility).toBe("hide");
+      // The union has its own ETag, never one member's.
+      expect(res.headers.get("etag")).toMatch(/^W\/"[0-9a-f]{32}"$/);
+      expect(seen.map(memberOf).sort()).toEqual(["a", "b"]);
+      for (const s of seen) {
+        expect(new URL(s.url).search).toBe("?client_version=0.167.2");
+        expect(s.headers.get("chatgpt-account-id")).toBe("acct");
+      }
+    }
+    expect(requests.at(-1)).toMatchObject({ app: "mc", provider: "codex", status: "ok", httpStatus: 200 });
+  });
+
+  test("conditional headers are not sent on (a 304 from one member would leave nothing to merge)", async () => {
+    await addApp("mc", "codex", "openai");
+    reply = (s) => jsonRes(memberOf(s) === "a" ? codexSmall : codexLarge);
+    await call("mc", "/models", { method: "GET", headers: { "if-none-match": 'W/"x"' } });
+    expect(seen.every((s) => !s.headers.has("if-none-match"))).toBe(true);
+  });
+
+  test("a member that fails is left out; the others still list", async () => {
+    await addApp("mc", "codex", "openai");
+    reply = (s) => (memberOf(s) === "a" ? jsonRes({ error: { message: "nope" } }, 401) : jsonRes(codexLarge));
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { models: Array<{ slug: string }> }).models.map((m) => m.slug)).toContain("gpt-6.1-sol");
+    expect(refreshCalls).toBe(0);
+  });
+
+  test("when no member lists, the first member's own answer is passed through", async () => {
+    await addApp("mc", "codex", "openai");
+    reply = (s) => jsonRes({ error: { message: `out ${memberOf(s)}` } }, 429);
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(429);
+    expect(await res.json()).toEqual({ error: { message: "out a" } });
+    expect(requests.at(-1)).toMatchObject({ status: "upstream_error", httpStatus: 429 });
+  });
+
+  test("only the members the app may use are asked", async () => {
+    await addApp("mc", "codex", "openai", { target: { kind: "pool", identities: ["a"] } });
+    reply = (s) => jsonRes(memberOf(s) === "a" ? codexSmall : codexLarge);
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(seen.map(memberOf)).toEqual(["a"]);
+    expect(((await res.json()) as { models: Array<{ slug: string }> }).models.map((m) => m.slug)).not.toContain("gpt-6.1-sol");
+  });
+
+  test("anthropic style (claude): union by id, first_id/last_id follow the merged list", async () => {
+    await addApp("cl", "claude", "anthropic");
+    reply = (s) =>
+      memberOf(s) === "a"
+        ? jsonRes({ data: [{ type: "model", id: "claude-x" }], has_more: false, first_id: "claude-x", last_id: "claude-x" })
+        : jsonRes({ data: [{ type: "model", id: "claude-x" }, { type: "model", id: "claude-y" }], has_more: false, first_id: "claude-x", last_id: "claude-y" });
+    const res = await call("cl", "/v1/models?limit=1000", { method: "GET" });
+    expect(await res.json()).toEqual({ data: [{ type: "model", id: "claude-x" }, { type: "model", id: "claude-y" }], has_more: false, first_id: "claude-x", last_id: "claude-y" });
+  });
+
+  for (const provider of ["kimi", "zai", "grok", "opencode"] as const) {
+    test(`openai style (${provider}): union by id`, async () => {
+      await addApp("o", provider, "openai");
+      reply = (s) => jsonRes({ object: "list", data: memberOf(s) === "a" ? [{ id: "m1", object: "model" }] : [{ id: "m1", object: "model" }, { id: "m2", object: "model" }] });
+      const res = await call("o", "/v1/models", { method: "GET" });
+      expect(await res.json()).toEqual({ object: "list", data: [{ id: "m1", object: "model" }, { id: "m2", object: "model" }] });
+    });
+  }
+
+  test("a single model is answered by the first member that has it", async () => {
+    await addApp("cl", "claude", "anthropic");
+    reply = (s) => (memberOf(s) === "a" ? jsonRes({ type: "error", error: { type: "not_found_error", message: "no" } }, 404) : jsonRes({ type: "model", id: "claude-y" }));
+    const res = await call("cl", "/v1/models/claude-y", { method: "GET" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ type: "model", id: "claude-y" });
+    expect(seen.map(memberOf)).toEqual(["a", "b"]);
+  });
+
+  test("a single model no member has keeps the first member's answer", async () => {
+    await addApp("cl", "claude", "anthropic");
+    reply = (s) => jsonRes({ type: "error", error: { type: "not_found_error", message: `no ${memberOf(s)}` } }, 404);
+    const res = await call("cl", "/v1/models/claude-z", { method: "GET" });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe("no a");
+  });
+
+  test("the daily token cap still applies", async () => {
+    await addApp("mc", "codex", "openai", { dailyTokens: 0 });
+    const res = await call("mc", "/models", { method: "GET" });
+    expect(res.status).toBe(429);
     expect(seen).toHaveLength(0);
   });
 });
