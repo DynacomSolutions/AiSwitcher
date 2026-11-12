@@ -147,6 +147,7 @@ describe("a client that disconnects while waiting for a count slot", () => {
       fetch: (async () => new Response("{}")) as unknown as typeof fetch,
       now: () => new Date("2026-11-02T10:00:00.000Z"),
       metrics: noopMetrics,
+      sideDailyLimit: 5_000,
       log: () => {},
       sideCountTimeoutMs: 5_000,
     } satisfies GatewayDeps;
@@ -195,6 +196,7 @@ describe("a client that disconnects while waiting for a count slot", () => {
       fetch: (async () => new Response("{}")) as unknown as typeof fetch,
       now: () => new Date("2026-11-02T10:00:00.000Z"),
       metrics: noopMetrics,
+      sideDailyLimit: 5_000,
       log: () => {},
       sideCountTimeoutMs: 100,
     } satisfies GatewayDeps;

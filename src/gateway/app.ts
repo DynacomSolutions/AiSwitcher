@@ -47,7 +47,7 @@ export interface GatewayDeps {
   browserHub?: BrowserHub;
   /** Most request-body bytes held for replay at once across all requests. Defaults to AIS_GATEWAY_BODY_BUDGET_MB, else BODY_BUDGET_BYTES. */
   bodyBudgetBytes?: number;
-  /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else 5000. */
+  /** Side and served requests (lists, search, speech, pool-served routes) an app may make per day. Defaults to AIS_GATEWAY_SIDE_DAILY_LIMIT, else no limit (not counted at all). */
   sideDailyLimit?: number;
   /** Longest a side-count database call may take before the replica counts from memory (default 5 s). */
   sideCountTimeoutMs?: number;
@@ -558,7 +558,8 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
    * replicas and restarts). If the store cannot answer in time the count falls back to this replica's memory, the failure is
    * counted and raised as an owner alert, and the request goes on.
    */
-  if (side || route?.kind === "serve" || (route?.kind === "account" && route.count !== false)) {
+  const sideLimit = deps.sideDailyLimit ?? sideDailyLimitFromEnv();
+  if (sideLimit !== undefined && (side || route?.kind === "serve" || (route?.kind === "account" && route.count !== false))) {
     const day = new Date(dayStartIct(deps.now()).getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
     let n: number | undefined;
     // At most SIDE_COUNT_MAX_INFLIGHT store calls run at once. The others queue for a slot inside the same time limit as the call itself:
@@ -589,7 +590,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       deps.sideCountHealth?.(false);
       n = fallbackCount(sideCounts, app.name, day);
     }
-    if (n > (deps.sideDailyLimit ?? sideDailyLimitFromEnv())) {
+    if (n > sideLimit) {
       deps.metrics.rejection(app.name, "daily_cap");
       return reject(429, "daily limit for list, search and speech calls reached", identityForRow, undefined, "side_daily_cap");
     }
