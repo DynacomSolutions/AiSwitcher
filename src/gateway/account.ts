@@ -26,11 +26,18 @@ const CODEX_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 /** Per-gateway memory: each member's organisation uuid (learned from its own profile). */
 export interface AccountState {
   orgs: Map<string, { org: string; until: number }>;
+  /** Last good `GET /api/oauth/usage` body per member and query (pinned apps), with the time it was read. */
+  usage: Map<string, { body: Uint8Array; at: number }>;
 }
 
 export function newAccountState(): AccountState {
-  return { orgs: new Map() };
+  return { orgs: new Map(), usage: new Map() };
 }
+
+/** A pinned usage read younger than this is served from the gateway without calling Anthropic. */
+export const PIN_USAGE_FRESH_MS = 30_000;
+/** How long a last good usage body may stand in for Anthropic's 429 (its usage API rate-limits per account). */
+export const PIN_USAGE_STALE_MAX_MS = 6 * 3_600_000;
 
 export interface AccountRequest {
   app: GatewayApp;
@@ -275,7 +282,39 @@ async function run(r: AccountRequest, cls: string): Promise<AccountResult> {
     out[orgAt] = encodeURIComponent(org);
     url = `${new URL(url).origin}${out.join("/")}`;
   }
+  if (r.op === "claude-usage") return pinnedUsage(r, member, url, cls);
   const res = await callAs(r, member, { method: r.method, url: url + r.search, ...(r.body ? { body: r.body } : {}) });
+  return { res: relay(res), identity: member, cls };
+}
+
+/**
+ * Pinned usage read. Anthropic's usage API answers 429 per account when it is read often (the gateway's own usage poll
+ * shares the token), and a client then shows no limits and no reset credits. Reads are shared for a short while, and a
+ * last good body stands in for a 429 or an error, so the client keeps its limits and resets.
+ */
+async function pinnedUsage(r: AccountRequest, member: string, url: string, cls: string): Promise<AccountResult> {
+  const key = `${r.app.provider}/${member}?${wantsResets(r.search) ? "resets" : "plain"}`;
+  const nowMs = r.deps.now().getTime();
+  const hit = r.state.usage.get(key);
+  const cached = (): AccountResult => ({ res: new Response(hit!.body, { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } }), identity: member, cls });
+  if (hit && nowMs - hit.at < PIN_USAGE_FRESH_MS) return cached();
+  let res: Response;
+  try {
+    res = await callAs(r, member, { method: r.method, url: url + r.search });
+  } catch (err) {
+    if (r.signal.aborted) throw err;
+    if (hit && nowMs - hit.at < PIN_USAGE_STALE_MAX_MS) return cached();
+    throw err;
+  }
+  if (res.ok) {
+    const body = new Uint8Array(await res.arrayBuffer());
+    r.state.usage.set(key, { body, at: nowMs });
+    return { res: new Response(body, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json", "cache-control": "no-store" } }), identity: member, cls };
+  }
+  if (hit && nowMs - hit.at < PIN_USAGE_STALE_MAX_MS && (res.status === 429 || res.status >= 500)) {
+    await discard(res);
+    return cached();
+  }
   return { res: relay(res), identity: member, cls };
 }
 
