@@ -73,9 +73,9 @@ function humanReset(iso: unknown): { resetsAt?: string; resetsAtMs?: number } {
 /** Windows from the `GET /api/oauth/usage` body: `limits[]` when present, else five_hour/seven_day. */
 export function windowsFromUsageBody(body: unknown): LimitWindow[] {
   const rec = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
-  const make = (rawLabel: string, label: string, pct: unknown, resets: unknown): LimitWindow[] =>
+  const make = (rawLabel: string, label: string, pct: unknown, resets: unknown, model?: string): LimitWindow[] =>
     typeof pct === "number" && Number.isFinite(pct)
-      ? [{ label, category: categorizeByLabel(rawLabel), usedPercent: pct, ...humanReset(resets) }]
+      ? [{ label, category: categorizeByLabel(rawLabel), usedPercent: pct, ...humanReset(resets), ...(model ? { model } : {}) }]
       : [];
   if (Array.isArray(rec.limits)) {
     return rec.limits.flatMap((raw: unknown) => {
@@ -90,7 +90,7 @@ export function windowsFromUsageBody(body: unknown): LimitWindow[] {
         : kind;
       // Raw label mirrors what the text path passed, so categorisation is identical.
       const rawLabel = kind === "session" ? "session" : kind.startsWith("weekly") ? "week" : kind;
-      return make(rawLabel, label, l.percent, l.resets_at);
+      return make(rawLabel, label, l.percent, l.resets_at, kind === "weekly_scoped" ? str(model) : undefined);
     });
   }
   const five = rec.five_hour as Record<string, unknown> | null | undefined;

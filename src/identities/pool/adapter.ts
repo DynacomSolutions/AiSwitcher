@@ -51,7 +51,13 @@ export interface PoolUsage {
   /** Highest utilisation percent over the provider's windows, when known. */
   maxUtilization?: number;
   /** Optional per-window detail for display and generic reset scheduling. */
-  windows?: Array<{ label: string; utilization: number; resetsAt?: string }>;
+  windows?: Array<{
+    label: string;
+    utilization: number;
+    resetsAt?: string;
+    /** Set on a window that counts for one model only (e.g. "Fable"): it limits requests for that model, never the account. */
+    model?: string;
+  }>;
   /** Paid capacity the member can fall back on once its windows are full. */
   extraUsage?: ExtraUsageInfo;
   error?: string;

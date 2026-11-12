@@ -36,10 +36,18 @@ export interface UsageWindowReading {
   resetsAt?: string;
 }
 
+/** A weekly window that counts for one model only (Anthropic's per-model weekly limits, e.g. Fable). */
+export interface ScopedWindowReading extends UsageWindowReading {
+  /** The model's display name as the usage endpoint gives it, e.g. "Fable". */
+  model: string;
+}
+
 export interface MemberUsage {
   status: "live" | "rate-limited" | "unavailable";
   fiveHour?: UsageWindowReading;
   sevenDay?: UsageWindowReading;
+  /** Per-model weekly windows. Not in `maxUtilization`: they block requests for their own model only. */
+  scoped?: ScopedWindowReading[];
   /** Highest utilisation of the two windows, when at least one is known. */
   maxUtilization?: number;
   extraUsage?: ExtraUsageInfo;
@@ -83,11 +91,49 @@ export function extraUsageFromBody(body: unknown): ExtraUsageInfo | undefined {
   };
 }
 
+/** A `limits[]` entry as a window reading (`percent`, `resets_at`), or undefined. */
+function limitEntry(raw: Record<string, unknown>): UsageWindowReading | undefined {
+  return window({ utilization: raw.percent, resets_at: raw.resets_at });
+}
+
+/**
+ * The per-model weekly windows of a usage body: `limits[]` entries of kind `weekly_scoped` with a model scope, plus
+ * older bodies' `seven_day_<model>` fields for models `limits[]` did not name.
+ */
+export function scopedWindowsFromBody(body: unknown): ScopedWindowReading[] {
+  const rec = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+  const out: ScopedWindowReading[] = [];
+  const seen = new Set<string>();
+  for (const raw of Array.isArray(rec.limits) ? rec.limits : []) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const l = raw as Record<string, unknown>;
+    if (l.kind !== "weekly_scoped") continue;
+    const name = (l.scope as { model?: { display_name?: unknown } } | null | undefined)?.model?.display_name;
+    const reading = limitEntry(l);
+    if (typeof name !== "string" || name.trim() === "" || !reading) continue;
+    out.push({ model: name.trim(), ...reading });
+    seen.add(name.trim().toLowerCase());
+  }
+  for (const [key, value] of Object.entries(rec)) {
+    const m = /^seven_day_(.+)$/.exec(key);
+    const reading = m ? window(value) : undefined;
+    if (!m || !reading || seen.has((m[1] as string).toLowerCase())) continue;
+    out.push({ model: m[1] as string, ...reading });
+  }
+  return out;
+}
+
 /** Defensive parse of the usage body: unknown/missing windows are skipped. */
 export function parseUsageBody(body: unknown, capturedAt: string = new Date().toISOString()): MemberUsage {
   const rec = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
-  const fiveHour = window(rec.five_hour);
-  const sevenDay = window(rec.seven_day);
+  const limits = (Array.isArray(rec.limits) ? rec.limits : []).filter((l): l is Record<string, unknown> => typeof l === "object" && l !== null);
+  const fromLimits = (kind: string) => {
+    const entry = limits.find((l) => l.kind === kind);
+    return entry ? limitEntry(entry) : undefined;
+  };
+  const fiveHour = window(rec.five_hour) ?? fromLimits("session");
+  const sevenDay = window(rec.seven_day) ?? fromLimits("weekly_all");
+  const scoped = scopedWindowsFromBody(body);
   const values = [fiveHour?.utilization, sevenDay?.utilization].filter((v): v is number => v !== undefined);
   if (values.length === 0) return { status: "unavailable", error: "usage response carried no five_hour/seven_day utilisation", capturedAt };
   const extraUsage = extraUsageFromBody(body);
@@ -96,6 +142,7 @@ export function parseUsageBody(body: unknown, capturedAt: string = new Date().to
     ...(extraUsage ? { extraUsage } : {}),
     ...(fiveHour ? { fiveHour } : {}),
     ...(sevenDay ? { sevenDay } : {}),
+    ...(scoped.length > 0 ? { scoped } : {}),
     maxUtilization: Math.max(...values),
     capturedAt,
   };
@@ -110,6 +157,8 @@ export interface FetchUsageDeps {
   cacheDir?: string;
   /** Never refresh an expired token: report the account unavailable instead. For callers that must not rotate grants (the gateway). */
   noRefresh?: boolean;
+  /** Ask the endpoint now, even when another process read it less than a minute ago (the gateway, right after a quota 429). The 429 backoff still applies. */
+  fresh?: boolean;
 }
 
 function backoffPath(member: Identity, cacheDir: string): string {
@@ -142,7 +191,7 @@ async function recordBackoff(member: Identity, cacheDir: string, nowMs: number, 
 
 const clearBackoff = (member: Identity, cacheDir: string) => rm(backoffPath(member, cacheDir), { force: true }).catch(() => {});
 
-/** Rebuilds a live MemberUsage from the shared last-good read (session and week windows only); undefined when it holds neither. */
+/** Rebuilds a live MemberUsage from the shared last-good read (session, week and per-model week windows); undefined when it holds neither session nor week. */
 function usageFromLastGood(last: Awaited<ReturnType<typeof loadLastGood>>): MemberUsage | undefined {
   if (!last?.capturedAt) return undefined;
   const reading = (label: string): UsageWindowReading | undefined => {
@@ -151,6 +200,9 @@ function usageFromLastGood(last: Awaited<ReturnType<typeof loadLastGood>>): Memb
   };
   const fiveHour = reading("session (5h)");
   const sevenDay = reading("week (all)");
+  const scoped: ScopedWindowReading[] = last.windows.flatMap((w) =>
+    w.model ? [{ model: w.model, utilization: Math.min(100, Math.max(0, w.usedPercent)), ...(w.resetsAtMs !== undefined ? { resetsAt: new Date(w.resetsAtMs).toISOString() } : {}) }] : [],
+  );
   const values = [fiveHour?.utilization, sevenDay?.utilization].filter((v): v is number => v !== undefined);
   if (values.length === 0) return undefined;
   return {
@@ -158,6 +210,7 @@ function usageFromLastGood(last: Awaited<ReturnType<typeof loadLastGood>>): Memb
     ...(last.extraUsage ? { extraUsage: last.extraUsage } : {}),
     ...(fiveHour ? { fiveHour } : {}),
     ...(sevenDay ? { sevenDay } : {}),
+    ...(scoped.length > 0 ? { scoped } : {}),
     maxUtilization: Math.max(...values),
     capturedAt: last.capturedAt,
   };
@@ -265,7 +318,7 @@ export async function fetchMemberUsage(member: Identity, deps: FetchUsageDeps = 
 async function readMemberUsage(member: Identity, deps: FetchUsageDeps, cacheDir: string): Promise<MemberUsage> {
   const nowMs = deps.now?.() ?? Date.now();
   const capturedAt = new Date(nowMs).toISOString();
-  const fresh = usageFromLastGood(await freshLastGood(member, cacheDir, nowMs));
+  const fresh = deps.fresh ? undefined : usageFromLastGood(await freshLastGood(member, cacheDir, nowMs));
   if (fresh) return fresh;
   const until = await backoffUntil(member, cacheDir);
   if (until > nowMs) {

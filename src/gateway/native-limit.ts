@@ -51,9 +51,15 @@ function windowsOf(usage: PoolUsage | undefined): LimitWindow[] {
   const out: LimitWindow[] = [];
   for (const w of usage?.windows ?? []) {
     const slot = slotOf(w.label) ?? (out.some((o) => o.slot === "short") ? "long" : "short");
-    if (out.some((o) => o.slot === slot)) continue;
     const reset = parseReset(w.resetsAt);
-    out.push({ slot, utilization: w.utilization, ...(reset !== undefined ? { resetsAtSec: reset } : {}) });
+    const entry: LimitWindow = { slot, utilization: w.utilization, ...(reset !== undefined ? { resetsAtSec: reset } : {}) };
+    const at = out.findIndex((o) => o.slot === slot);
+    // A per-model weekly window (left in only for a request for that model) stands for the week when it is fuller.
+    if (at >= 0) {
+      if (w.model !== undefined && w.utilization > (out[at] as LimitWindow).utilization) out[at] = entry;
+      continue;
+    }
+    out.push(entry);
   }
   return out;
 }

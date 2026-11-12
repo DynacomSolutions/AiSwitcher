@@ -428,6 +428,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     ledger,
     creds,
     usageFor: hooks.usageFor ?? (async (provider, identity) => usage.get(provider, await canonical(provider, identity))),
+    ...(hooks.usageFor ? {} : { refreshUsage: async (provider: GatewayProvider, identity: string) => usage.refreshNow(provider, await canonical(provider, identity)) }),
     canonical,
     sideCountHealth: (ok) => (ok ? alerter.recover("side-count-unavailable", "gateway") : alerter.raise("side-count-unavailable", "gateway", "the gateway database could not count list, search and speech requests; the limit is enforced per replica from memory until it can")),
     poolMembers,
