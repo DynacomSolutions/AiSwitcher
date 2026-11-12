@@ -3,7 +3,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
 import type { GatewayDeps } from "./app.ts";
 import type { GatewayApp } from "./types.ts";
 
-export const DEFAULT_RESERVE_PERCENT = 80;
+export const DEFAULT_RESERVE_PERCENT = 100;
 
 async function usageOf(deps: Pick<GatewayDeps, "usageFor">, app: GatewayApp, identity: string): Promise<PoolUsage | undefined> {
   try {
