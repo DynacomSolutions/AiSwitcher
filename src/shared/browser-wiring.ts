@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { expandPath } from "../identities/match.ts";
 import { allowedAccounts, isSwapPool, type PoolIdentity } from "../identities/pool/swap-pool.ts";
 import { isRetired } from "../identities/retired.ts";
@@ -35,6 +35,22 @@ export function poolMemberConfigDirs(file: IdentitiesFile, pool: PoolIdentity): 
     if (member && !isRetired(member)) dirs.push(expandPath(member.configDir));
   }
   return dirs;
+}
+
+const normaliseDir = (dir: string): string => {
+  const r = resolve(expandPath(dir));
+  return r.length > 1 ? r.replace(/\/+$/, "") : r;
+};
+
+/**
+ * Registered identity (pool or plain) whose config dir is `configDir`, for a launch whose
+ * CLAUDE_CONFIG_DIR / CODEX_HOME was preset (T3 Code, other launchers). Identity resolution
+ * skips the registry then, but the browser wiring still needs to know it is a pool. Retired
+ * identities are never returned.
+ */
+export function identityForConfigDir(file: IdentitiesFile, configDir: string): Identity | undefined {
+  const target = normaliseDir(configDir);
+  return file.identities.find((i) => !isRetired(i) && normaliseDir(i.configDir) === target);
 }
 
 /**

@@ -26,7 +26,7 @@ import { promptFromCliArgs } from "./herdr-tab-title.ts";
 import { consumeOfflineWarned, shimOfflineNotice } from "./connectivity.ts";
 import { launchWithSession, runSessionSidecar, takeSidecarSpec } from "./session-sidecar.ts";
 import { readSecretsKey } from "../cli/gateway/secrets-file.ts";
-import { browserLaunchEnv, browserMcpArgs, browserPoolWiring } from "./browser-wiring.ts";
+import { browserLaunchEnv, browserMcpArgs, browserPoolWiring, identityForConfigDir } from "./browser-wiring.ts";
 import { resolveInstalledAisBinary } from "../sync/background.ts";
 import { isAisLive, noteLiveFeatureDisabled } from "./live-mode.ts";
 
@@ -183,9 +183,13 @@ export async function runWrapper(
       sharedConfigArgs,
     );
     const gatewayUrl = cfg.toolName !== "claude" && cfg.toolName !== "codex" ? undefined : process.env.AIS_GATEWAY_PROXY_URL || (await readSecretsKey("AIS_GATEWAY_PROXY_URL"));
-    const browserPool = await browserPoolWiring(cfg.toolName, resolved.identity, () => loadIdentitiesFile(cfg.identitiesJsonPath));
-    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, resolved.identity, resolveInstalledAisBinary(), {
-      ...(activeIdentity !== undefined ? { identityName: activeIdentity } : {}),
+    // A preset config dir (T3 Code sets CLAUDE_CONFIG_DIR) resolves no identity; map it back
+    // to the registered one so a pool folder gets pool wiring instead of none.
+    const browserIdentity = resolved.identity ?? (resolved.source === "env" ? await loadIdentitiesFile(cfg.identitiesJsonPath).then((f) => identityForConfigDir(f, resolved.configDirValue), () => undefined) : undefined);
+    const browserPool = await browserPoolWiring(cfg.toolName, browserIdentity, () => loadIdentitiesFile(cfg.identitiesJsonPath));
+    const browserIdentityName = browserIdentity?.name ?? activeIdentity;
+    const browserArgs = browserMcpArgs(cfg.toolName, resolved.configDirValue, browserIdentity, resolveInstalledAisBinary(), {
+      ...(browserIdentityName !== undefined ? { identityName: browserIdentityName } : {}),
       ...(gatewayUrl ? { gateway: gatewayUrl } : {}),
       ...(browserPool ? { pool: browserPool } : {}),
       ...(parsed.cleanedArgv[0] !== undefined ? { firstArg: parsed.cleanedArgv[0] } : {}),

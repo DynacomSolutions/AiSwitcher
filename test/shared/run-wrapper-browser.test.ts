@@ -86,3 +86,19 @@ test("launch path: swap pool identity -> member dirs -> --pool args; plain ident
   expect(await browserPoolWiring("kimi", pool, async () => file)).toBeUndefined();
   expect(await browserPoolWiring("claude", pool, async () => { throw new Error("x"); })).toBeUndefined();
 });
+
+import { identityForConfigDir } from "../../src/shared/browser-wiring.ts";
+
+test("preset config dir (T3 Code) maps back to its registered pool, which then gets --pool wiring", async () => {
+  const id = (name: string, extra: object = {}) => ({ name, label: name, configDir: `/m/${name}`, ...extra });
+  const pool = { name: "team-pool", label: "p", configDir: "/ids/swap", swapPool: { accounts: ["a", "b"], active: "a" } };
+  const file: any = { version: 1, identities: [id("a"), id("b"), id("old", { configDir: "/ids/old", retired: true }), pool] };
+  const found = identityForConfigDir(file, "/ids/swap/");
+  expect(found?.name).toBe("team-pool");
+  expect(identityForConfigDir(file, "/m/a")?.name).toBe("a");
+  expect(identityForConfigDir(file, "/ids/old")).toBeUndefined();
+  expect(identityForConfigDir(file, "/elsewhere")).toBeUndefined();
+  const wiring = await browserPoolWiring("claude", found, async () => file);
+  const args = browserMcpArgs("claude", "/ids/swap", found, "/bin/ais", { exists: (p) => p === "/m/b/ais-browser-token", identityName: found!.name, pool: wiring! });
+  expect(JSON.parse(args[0]!.slice("--mcp-config=".length)).mcpServers["ais-browser"].args).toEqual(["browser", "mcp", "--pool", "team-pool", "--tool", "claude"]);
+});
