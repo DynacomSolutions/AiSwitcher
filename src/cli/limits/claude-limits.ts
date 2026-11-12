@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
-import { freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
+import { freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, carriedManualReset, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
@@ -225,7 +225,10 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
   if (apiWindows.length > 0) {
     const overage = overageFromUsageBody(body);
     const extraUsage = extraUsageFromBody(body);
-    const manualReset = manualResetFromCedarEmber((body as { cedar_ember?: unknown }).cedar_ember);
+    // Anthropic includes cedar_ember only near a limit: without it, keep the last seen grant list (marked stale).
+    const manualReset =
+      manualResetFromCedarEmber((body as { cedar_ember?: unknown }).cedar_ember) ??
+      carriedManualReset((await loadLastGood(identity, cacheDir))?.manualReset);
     const live: FetchedLimitResult = {
       ...base,
       windows: apiWindows,
@@ -329,7 +332,7 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
 
   const overage = overageFromUsageText(usageStdout);
   // Non-fatal and sequential: it may refresh the token, which must not race the /usage spawn above.
-  const manualReset = await fetchMemberResets(identity);
+  const manualReset = (await fetchMemberResets(identity)) ?? carriedManualReset((await loadLastGood(identity, cacheDir))?.manualReset);
   return {
     ...base,
     windows,

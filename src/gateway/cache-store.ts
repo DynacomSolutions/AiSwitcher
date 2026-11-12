@@ -92,6 +92,10 @@ export class CachedGatewayStore implements GatewayStore {
     return this.inner.usageSince(app, since);
   }
 
+  usageTotalsSince(since: Date): Promise<Map<string, number>> {
+    return this.inner.usageTotalsSince(since);
+  }
+
   bumpSideCount(app: string, day: string, signal?: AbortSignal): Promise<number> {
     return this.inner.bumpSideCount(app, day, signal);
   }

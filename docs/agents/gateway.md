@@ -44,6 +44,12 @@ ais gateway app list | show <name> | update <name> [flags] | rotate <name> | rev
 ais gateway usage [--app=billing] [--provider=claude] [--days=7] [--json]
 ```
 
+The console (`ais web`) has a Gateway page with the same list, edit (reserve,
+models, daily cap; it can also clear them), rotate and revoke. Its rotate calls the CLI's own
+`rotateApp`, so the Secret and `~/.secrets` on the console host are updated as
+`ais gateway app rotate` does, and the new token is shown once. Existing
+tokens cannot be shown: the gateway keeps only prefixes and hashes.
+
 ## Pinned or pool
 
 - `--identity=<id>` pins the app to one AIS identity. Use it when the app needs one

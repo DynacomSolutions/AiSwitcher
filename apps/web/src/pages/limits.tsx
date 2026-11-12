@@ -1,5 +1,7 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CreditCard, RotateCcw } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
 
 import { ToolBadge } from "@/components/badges";
 import { ProviderLabel } from "@/components/provider-icon";
@@ -7,7 +9,18 @@ import { PoolUsageCards } from "@/components/pool-usage-cards";
 import { GlobalUsageCards } from "@/components/usage-counter";
 import { PageTabRedirect, PageTabs, usePageTab, type PageTab } from "@/components/page-tabs";
 import { EmptyState, ErrorBanner, PageHeader } from "@/components/page-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -16,9 +29,10 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import { useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
+import { qk, useLimitsQuery, usePoolsUsageQuery } from "@/hooks/queries";
+import { api } from "@/lib/api";
 import { clampPercent, formatMoney, relTime } from "@/lib/format";
-import type { LimitFetchStatus, LimitWindow, ManualResetInfo, OverageInfo, ToolLimitResult } from "@/types/api";
+import type { LimitFetchStatus, LimitWindow, ManualResetInfo, OverageInfo, ResetGrant, ToolLimitResult } from "@/types/api";
 
 function StatusBadge({ status }: { status: LimitFetchStatus }) {
   switch (status) {
@@ -87,21 +101,123 @@ function OverageBlock({ overage }: { overage: OverageInfo }) {
   );
 }
 
-function ManualResetBlock({ reset }: { reset: ManualResetInfo }) {
-  const count = reset.availableCount > 1 ? ` ×${reset.availableCount}` : "";
-  const label = reset.label ? `: ${reset.label}` : "";
-  const expiry = reset.expiresAt ? ` (expires ${reset.expiresAt})` : "";
+const GRANT_KIND: Record<ResetGrant["kind"], string> = { full: "Full", fable: "Fable only", other: "Other" };
+
+function grantState(grant: ResetGrant, cooldown: boolean): string {
+  if (grant.resetsLeft <= 0) return "used up";
+  if (grant.paused) return "paused";
+  if (cooldown) return "cooling down";
+  return grant.usableNow ? "usable now" : "not usable now";
+}
+
+function UseResetDialog({ identity, grant, onClose }: { identity: string; grant: ResetGrant; onClose: () => void }) {
+  const qc = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: () => api.useClaudeReset(identity, grant.id),
+    onSuccess: (r) => {
+      void qc.invalidateQueries({ queryKey: qk.limits });
+      const left = r.resetsLeft !== undefined ? `, ${r.resetsLeft} left` : "";
+      toast.success(`Reset ${r.result}`, { description: `${identity}: ${grant.label ?? grant.id}${left}${r.cleared.length ? `; cleared ${r.cleared.join(", ")}` : ""}` });
+      onClose();
+    },
+    onError: (error) => toast.error("Reset failed", { description: error.message }),
+  });
+  return (
+    <AlertDialog open onOpenChange={(open) => !open && onClose()}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Use a reset on {identity}?</AlertDialogTitle>
+          <AlertDialogDescription>
+            Spends one of {grant.resetsLeft} left on “{grant.label ?? grant.id}” ({GRANT_KIND[grant.kind]}). Anthropic clears the matching usage
+            limits now; a spent reset cannot be given back.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={mutation.isPending}
+            onClick={(e) => {
+              e.preventDefault();
+              mutation.mutate();
+            }}
+          >
+            {mutation.isPending ? "Resetting..." : "Use reset"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function ManualResetBlock({ reset, result }: { reset: ManualResetInfo; result: ToolLimitResult }) {
+  const [using, setUsing] = useState<ResetGrant | null>(null);
+  if (!reset.grants) {
+    // Codex credits (and old cached Claude reads): one summary line.
+    if (reset.availableCount <= 0) return null;
+    const count = reset.availableCount > 1 ? ` ×${reset.availableCount}` : "";
+    const label = reset.label ? `: ${reset.label}` : "";
+    const expiry = reset.expiresAt ? ` (expires ${reset.expiresAt})` : "";
+    return (
+      <>
+        <Separator />
+        <div className="flex items-start gap-2 text-xs text-emerald-600 dark:text-emerald-400">
+          <RotateCcw aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+          <span>
+            Manual reset available{count}
+            {label}
+            {expiry}
+          </span>
+        </div>
+      </>
+    );
+  }
+  const cooldown = reset.cooldownUntil !== undefined && Date.parse(reset.cooldownUntil) > Date.now();
+  // A spend is offered only on a live list for a real claude identity (a pool row mirrors a member's login).
+  const canSpend = result.toolName === "claude" && !reset.stale && !cooldown;
   return (
     <>
       <Separator />
-      <div className="flex items-start gap-2 text-xs text-emerald-600 dark:text-emerald-400">
-        <RotateCcw aria-hidden className="mt-0.5 size-3.5 shrink-0" />
-        <span>
-          Manual reset available{count}
-          {label}
-          {expiry}
-        </span>
+      <div className="space-y-2 text-xs">
+        <div className="flex items-center gap-2 font-medium">
+          <RotateCcw aria-hidden className="size-3.5 shrink-0" />
+          Reset credits ({reset.grants.length})
+          {reset.grantsCapturedAt ? (
+            <span className={reset.stale ? "font-normal text-amber-600 dark:text-amber-400" : "font-normal text-muted-foreground"}>
+              {reset.stale ? "last seen " : "seen "}
+              {relTime(reset.grantsCapturedAt)}
+            </span>
+          ) : null}
+        </div>
+        {reset.stale ? (
+          <p className="text-muted-foreground">Anthropic lists reset credits only near a limit; this is the last list it sent.</p>
+        ) : null}
+        {cooldown ? <p className="text-amber-600 dark:text-amber-400">Cooling down until {new Date(reset.cooldownUntil!).toLocaleString()}.</p> : null}
+        {reset.grants.length === 0 ? <p className="text-muted-foreground">No reset credits.</p> : null}
+        <ul className="space-y-2">
+          {reset.grants.map((g) => (
+            <li key={g.id} className="flex items-start justify-between gap-2">
+              <div className="min-w-0 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Badge variant={g.kind === "full" ? "success" : g.kind === "fable" ? "warning" : "muted"}>{GRANT_KIND[g.kind]}</Badge>
+                  <span className="min-w-0 break-words" title={g.id}>
+                    {g.label ?? g.id}
+                  </span>
+                </div>
+                <div className="text-muted-foreground">
+                  {g.resetsLeft} left · {grantState(g, cooldown)}
+                  {g.endsAt ? ` · ${Date.parse(g.endsAt) > Date.now() ? "expires" : "expired"} ${new Date(g.endsAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}` : ""}
+                </div>
+              </div>
+              {canSpend && g.usableNow && g.resetsLeft > 0 ? (
+                <Button variant="outline" size="sm" className="h-7 shrink-0 text-xs" onClick={() => setUsing(g)}>
+                  Use reset
+                </Button>
+              ) : null}
+            </li>
+          ))}
+        </ul>
       </div>
+      {using ? <UseResetDialog identity={result.identity.name} grant={using} onClose={() => setUsing(null)} /> : null}
     </>
   );
 }
@@ -141,7 +257,7 @@ function LimitCard({ result }: { result: ToolLimitResult }) {
           <p className="text-sm text-muted-foreground">This tool reported no quota windows.</p>
         ) : null}
         {result.overage ? <OverageBlock overage={result.overage} /> : null}
-        {result.manualReset ? <ManualResetBlock reset={result.manualReset} /> : null}
+        {result.manualReset ? <ManualResetBlock reset={result.manualReset} result={result} /> : null}
       </CardContent>
     </Card>
   );

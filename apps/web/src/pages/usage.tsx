@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { ResponsiveBar } from "@nivo/bar";
 import type { BarTooltipProps } from "@nivo/bar";
 
@@ -306,7 +307,11 @@ function GatewayAppsCard({ data, days }: { data: GatewayUsageResponse; days: num
       <CardHeader>
         <CardTitle className="text-base">Gateway apps</CardTitle>
         <CardDescription>
-          Tokens per gateway app over the last {days} days (input, output and cache writes).
+          Tokens per gateway app over the last {days} days (input, output and cache writes). Manage apps on the{" "}
+          <Link to="/gateway" className="underline underline-offset-2">
+            Gateway
+          </Link>{" "}
+          page.
         </CardDescription>
       </CardHeader>
       <CardContent className="px-0">
@@ -356,6 +361,9 @@ export function UsagePage() {
   const query = useUsageQuery();
   const gateway = useGatewayUsageQuery(7);
   const gatewayData = gateway.data?.configured ? gateway.data : undefined;
+  // The tab stays unless the server says this console has no gateway admin: hiding it while the query
+  // loads (or after a failed poll) made /usage/gateway redirect away and the tab vanish.
+  const gatewayTab = gateway.data?.configured !== false;
   const results = query.data?.results ?? [];
 
   const [provider, setProvider] = useState("all");
@@ -416,12 +424,12 @@ export function UsagePage() {
       { segment: "projects", label: "Projects" },
       { segment: "repos", label: "Repos" },
       { segment: "orgs", label: "Orgs" },
-      ...(gatewayData ? [{ segment: "gateway", label: "Gateway apps" }] : []),
+      ...(gatewayTab ? [{ segment: "gateway", label: "Gateway apps" }] : []),
     ],
-    [gatewayData],
+    [gatewayTab],
   );
   const { active, invalid } = usePageTab(tabs);
-  if (invalid) return <PageTabRedirect to={USAGE_BASE} />;
+  if (invalid && !gateway.isLoading) return <PageTabRedirect to={USAGE_BASE} />;
 
 
   const stateBlock = query.isLoading || (query.data?.pending && results.length === 0) ? (
@@ -468,10 +476,16 @@ export function UsagePage() {
 
       ) : null}
 
-      {ready || gatewayData ? <PageTabs tabs={tabs} active={active} base={USAGE_BASE} /> : null}
+      {ready || gatewayTab ? <PageTabs tabs={tabs} active={active} base={USAGE_BASE} /> : null}
 
-      {active === "gateway" && gatewayData ? (
-        <GatewayAppsCard data={gatewayData} days={7} />
+      {active === "gateway" ? (
+        gatewayData ? (
+          <GatewayAppsCard data={gatewayData} days={7} />
+        ) : gateway.isError ? (
+          <ErrorBanner message={`Gateway usage could not be loaded: ${gateway.error.message}`} />
+        ) : (
+          <div className="h-64 animate-pulse rounded-xl bg-muted" />
+        )
       ) : !ready ? (
         stateBlock
       ) : (
