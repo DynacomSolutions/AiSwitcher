@@ -79,11 +79,12 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|claude-proxy|t3-proxy|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
-      serve: sub("ais gateway serve [--port=] [--admin-port=]", "Run the proxy and admin API (env: AIS_GATEWAY_PORT, AIS_GATEWAY_ADMIN_PORT, AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_ADMIN_TOKEN)"),
+      serve: sub("ais gateway serve [--port=] [--admin-port=]", "Run the proxy and admin API (env: AIS_GATEWAY_PORT, AIS_GATEWAY_ADMIN_PORT, AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_ADMIN_TOKEN; PostgreSQL credential store: AIS_GATEWAY_CREDENTIAL_STORE=pg, AIS_GATEWAY_STORE_KEY, AIS_GATEWAY_FILE_STORE, AIS_GATEWAY_STORE_IMPORT, AIS_GATEWAY_REPLICA_URL)"),
+      store: sub("ais gateway store import [--dry-run]", "Copy this host's gateway logins, registries and heartbeat into the PostgreSQL credential store; idempotent, a login is only replaced by a fresher one (env: AIS_GATEWAY_DATABASE_URL, AIS_GATEWAY_STORE_KEY)"),
       local: sub("ais gateway local [install|status]", "Host-local failover proxy on 127.0.0.1 (env: AIS_GATEWAY_LOCAL_PORT, AIS_GATEWAY_REMOTE_URL); install sets up the ais-gateway-local.service user unit"),
       app: sub(
         "ais gateway app add|update <name> --namespace=<ns> --provider=<p> [--style=anthropic|openai] (--pool [--identities=a,b] | --identity=<id>) [--models=glob,glob] [--daily-tokens=N] [--reserve=100]; app list|show|rotate|revoke [<name>]",

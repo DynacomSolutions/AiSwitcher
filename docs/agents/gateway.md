@@ -386,6 +386,71 @@ CLIProxyAPI's refresh journal):
   `ais_gateway_refresh_lock_wait_seconds_total` and
   `ais_gateway_refresh_guard_degraded_total`.
 
+## Credential store and replicas
+
+The gateway can keep every login in PostgreSQL instead of host files, so it runs on any node and as several replicas
+(`src/gateway/home-store.ts`, `home-mirror.ts`, `home-import.ts`, `pg-leader.ts`, `browser/cluster.ts`). PostgreSQL is
+the source of truth.
+
+What is stored: an encrypted copy of exactly the files the file-based model uses, keyed by their HOME-relative path
+(table `gateway_home_files`): the identity registries, each account's credential files (member store copies with their
+`.claude.json`, identity-folder logins, swap pool copies, pi and kimi copies, zai/ali `crush.json`, opencode
+`auth.json`), revoked markers, the ownership heartbeat and the host home the registries were written on. Every replica
+writes the rows into its own HOME and follows changes (LISTEN `ais_gateway_files`, plus a 5 s poll), so the refresh, the
+guard and the credential cache work unchanged. Registry paths are translated with `AIS_HOST_HOME`, taken from the
+imported metadata when the deployment does not set it. Opencode's SQLite database is not copied: when only it holds the
+key, the import writes the key to `data/opencode/ais-gateway-key.json` for the replicas (never onto the host).
+
+Encryption: AES-256-GCM, key in `AIS_GATEWAY_STORE_KEY` (32 random bytes, base64 or hex; `openssl rand -base64 32`), the
+path as associated data. Losing the key loses the logins (re-run the import from the host files); rotating it means a
+fresh import into an emptied table.
+
+Refresh: under the account's advisory lock the guard first pulls the account's rows into HOME (adopt-first and the
+journal see the store's copy), refreshes, and pushes the changed files back (compare-and-swap on the version it pulled)
+before the lock is released. A push that fails is retried, then left to the background pass; the journal already refuses
+the spent token anywhere else. Everything for one account in one process runs under an in-process mutex, so a background
+pull never lands between a refresh's write and its push.
+
+Sync rule per file (base = the version and hash this replica last synced): local unchanged and row moved, the row is
+written; local changed and row unchanged, the file is pushed; both changed (or no base yet), a login goes to the fresher
+grant (later expiry, ties to the store), registries and host files keep the host's copy under a file store and take the
+row otherwise. Deleted files are not propagated.
+
+Environment (`ais gateway serve`):
+
+- `AIS_GATEWAY_CREDENTIAL_STORE=pg` turns it on; default `files` is the old behaviour.
+- `AIS_GATEWAY_STORE_KEY` (required with `pg`).
+- `AIS_GATEWAY_FILE_STORE=1` only on a replica whose HOME is the host's real files (hostPath): refreshed grants are written
+  back to the files and host changes (a new login) are imported (every 5 s for tracked files, every 5 minutes for new
+  ones). Without it HOME must be a writable pod-local directory (emptyDir) and is overwritten from the store.
+- `AIS_GATEWAY_STORE_IMPORT=1` with a file store: run the import at startup.
+- `AIS_GATEWAY_REPLICA_URL` (default `http://$POD_IP:<admin port>`): this replica's admin address for the browser relay.
+
+Import: `ais gateway store import [--dry-run]` on the host that holds the files (needs `AIS_GATEWAY_DATABASE_URL` and
+`AIS_GATEWAY_STORE_KEY`). Idempotent: a missing path is added; registries, host files and markers take the host copy; a
+login is replaced only by a strictly fresher grant, under the account's refresh lock, and never by a refresh token the
+journal shows rotated out; the heartbeat is only seeded. After a new login on the host, run it again (a file-store replica
+does it on its own).
+
+Replicas:
+
+- Leader: a session advisory lock (`ais-gateway-leader`). Only the leader runs the idle keep-alive and writes the
+  heartbeat (pushed to the store, so a file-store replica writes it back for the host). Every replica serves and refreshes
+  on demand (401, expiry) through the guard.
+- ali console-session renewal does not run on the credential store (its browser profile is on the host); the heartbeat
+  never names ali, so the host timer and the console keep renewing it.
+- In-memory state that is per replica and safe to diverge: exhausted and short holds (each replica learns a 429 or a
+  credential failure from the upstream itself, at the cost of one extra failed attempt per replica), the side-count
+  fallback while the database is down, the 401 refresh cooldown, pairing rate limits and active-session counts. Shared:
+  apps, tokens, usage, side counts, the refresh lock and journal, the logins, browser presence.
+- Browser relay: see `docs/agents/browser.md` (sockets stay on their replica; calls are forwarded).
+
+Health: `/healthz` is liveness (always `ok` while the process serves). `/readyz` is readiness: 503 while warming (with the
+store: until the first full pull finished), draining, or when the database has not answered a ping (every 5 s, 2 s
+timeout) for 15 s.
+
+The console stands down for every store-owned login (`docs/agents/console-web.md`, `AIS_GATEWAY_STORE_DATABASE_URL`).
+
 ## Member store and routing every identity through the gateway
 
 The gateway used to read each account's login from the same identity folders the local tools use (the registry's

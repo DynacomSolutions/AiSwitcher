@@ -52,7 +52,7 @@ File upload is deliberately unsupported: it would let an agent read arbitrary lo
 ## Deploy requirements
 
 - The Emissary Mapping for the gateway needs `allow_upgrade: [websocket]` and `timeout_ms` of 0 or at least 130000, or long calls and the socket are cut.
-- The gateway runs as a single replica.
+- The gateway may run as several replicas. They need the shared PostgreSQL (presence table `gateway_browser_presence`, NOTIFY channel `ais_gateway_browser`) and must reach each other's admin port: every replica publishes `AIS_GATEWAY_REPLICA_URL` (default `http://$POD_IP:<admin port>`) and serves `POST /internal/browser/relay` there, authenticated with a secret derived from the admin token (HMAC; the admin token itself never leaves the replica). Keep that port cluster-internal.
 
 ## Tool timeout
 
@@ -60,7 +60,9 @@ The relay allows up to 125 s per call (`wait`). Codex is wired with `mcp_servers
 
 ## Limits
 
-The relay keeps sockets, pairing rate limits and in-flight calls in memory, so the gateway must run as a single replica. Scaling it out needs a shared relay first.
+Each extension socket lives on the replica it connected to. Replicas publish their bindings in PostgreSQL every 5 s and on every attach, detach or pause change; a call for a browser held by another replica is forwarded to that replica's admin relay endpoint, which runs it on its local hub (and aborts it when the forwarded request is dropped). A row not refreshed for 20 s is ignored, so a dead replica's browsers disappear after at most that long. If a binding reconnects to another replica, the newer connection wins and the older socket is closed with 4409. Revoking a binding closes its socket on whichever replica holds it. If the database or the other replica is unreachable, local browsers keep working and the remote ones return `no_browser` (presence stale) or `browser_disconnected` (replica did not answer).
+
+In-flight calls, pairing rate limits and active-session counts are per replica and may diverge; the replica that serves a call counts its metrics.
 
 Agent tabs live in the user's window, inside the session's tab group. Agents work entirely in the background: new tabs open inactive, and navigation, input, evaluation and screenshots go through the debugger (CDP, with focus emulation on) without ever activating a tab or focusing a window, so the owner's active tab never changes. Only a click in the side panel may switch tabs. A page in an agent tab can still open a tab itself (a `target=_blank` link or `window.open` after an agent click); Chrome treats the click as a user gesture and opens that tab in the foreground. The extension spots it through CDP `Page.windowOpen` on the agent tab, adds the new tab to the agent's session (its own group, or the granted group it came from) and makes the owner's previous tab active again. When the owner is looking at the agent tab, a link opens as usual. Each session has exactly one tab group: creation is serialised per session id, the group is persisted in `chrome.storage.session`, and a live group with the same title is re-adopted after a worker restart. If Chrome still does not render a tab (minimised window), the call fails with `tab_hidden` after 8 s.
 

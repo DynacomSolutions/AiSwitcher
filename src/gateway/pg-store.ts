@@ -9,12 +9,16 @@ import init0001 from "./migrations/0001_init.sql" with { type: "text" };
 import browser0002 from "./migrations/0002_browser.sql" with { type: "text" };
 import refreshJournal0003 from "./migrations/0003_refresh_journal.sql" with { type: "text" };
 import sideCounts0004 from "./migrations/0004_side_counts.sql" with { type: "text" };
+import homeFiles0005 from "./migrations/0005_home_files.sql" with { type: "text" };
+import browserPresence0006 from "./migrations/0006_browser_presence.sql" with { type: "text" };
 
 const MIGRATIONS: { version: string; sql: string }[] = [
   { version: "0001_init", sql: init0001 },
   { version: "0002_browser", sql: browser0002 },
   { version: "0003_refresh_journal", sql: refreshJournal0003 },
   { version: "0004_side_counts", sql: sideCounts0004 },
+  { version: "0005_home_files", sql: homeFiles0005 },
+  { version: "0006_browser_presence", sql: browserPresence0006 },
 ];
 
 /** Arbitrary constant key serialising concurrent migrators (including the first-run table create). */

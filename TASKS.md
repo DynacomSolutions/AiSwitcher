@@ -274,3 +274,11 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 185 | Local gateway serves HTTPS for codex 0.167 (pool identity) | done | claude | codex-local-https | 182 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/501 (f0d6377); host updated, local gateway serves HTTPS on 47141.<br>Pool home moved to https://localhost:47141; codex 0.167 `account/read` and `model/list` pass; all four T3 Codex instances load. |
 | 186 | Backup keeps corrupt SQLite files as raw copies, without a warning every run | done | claude | backup-codex-quarantine | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/504 (ec3c38a); host updated.<br>Live codex backup: 66 snapshotted, 0 skipped, 3 kept as raw copies, no corruption warnings. |
 | 187 | Backup skips codex `.tmp/` scratch clones | done | claude | backup-codex-dot-tmp | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/507 (2f18716); host updated.<br>First run dropped 145,215 tracked `.tmp` files (one catch-up run with a longer budget).<br>Live codex backup: committed, 0 index errors, 0 warnings. |
+
+## 14. Gateway survives any node loss
+ETA: 2026-11-14 18:00 ICT
+AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gateway replicas.
+
+| ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
+|---|---|---|---|---|---|---|---|
+| 195 | Gateway credential store in PostgreSQL, multi-replica relay, console stand-down | doing | claude | gateway-ha | | 2026-11-13 07:48 ICT | Owner goal 2026-11-13 after the main node died. Deployment side is done by the .cluster session. |

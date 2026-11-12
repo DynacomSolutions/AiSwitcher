@@ -40,6 +40,7 @@ interface Conn {
   paused: boolean;
   extensionVersion?: string;
   authenticating?: boolean;
+  attachedAt?: number;
   helloTimer?: ReturnType<typeof setTimeout>;
   silenceTimer?: ReturnType<typeof setTimeout>;
 }
@@ -59,10 +60,21 @@ export interface HubOptions {
   helloTimeoutMs?: number;
   silenceTimeoutMs?: number;
   now?: () => number;
+  /** Called after a binding attaches or detaches, or its paused state changes (cluster presence hook). */
+  onChange?: () => void;
+}
+
+/** A locally connected binding as shown to the cluster presence table. */
+export interface LocalPresence {
+  binding: BrowserBinding;
+  extensionVersion?: string;
+  paused: boolean;
+  /** Epoch ms of the attach (hello accepted). */
+  attachedAt: number;
 }
 
 /**
- * Relay state: one authenticated socket per binding, in memory (single replica).
+ * Relay state: one authenticated socket per binding, in memory. With several replicas, ClusterBrowserHub (cluster.ts) shares presence and relays calls.
  * Call arguments and results only pass through; nothing about their content is stored or logged.
  */
 export class BrowserHub {
@@ -72,10 +84,21 @@ export class BrowserHub {
   private readonly sessions = new Map<string, number>();
   private readonly metrics: GatewayMetrics;
   private readonly now: () => number;
+  /** Settable after construction so a cluster wrapper can hook in. Never allowed to throw into the hub. */
+  onChange?: () => void;
 
   constructor(private readonly opts: HubOptions) {
     this.metrics = opts.metrics ?? noopMetrics;
     this.now = opts.now ?? Date.now;
+    this.onChange = opts.onChange;
+  }
+
+  private changed(): void {
+    try {
+      this.onChange?.();
+    } catch {
+      // presence is best effort
+    }
   }
 
   /** Socket opened: it must send `hello` before the timeout. */
@@ -133,6 +156,7 @@ export class BrowserHub {
         return;
       case "state":
         conn.paused = msg.paused === true;
+        this.changed();
         return;
       case "result": {
         const result = sanitiseResult(msg.result);
@@ -159,7 +183,9 @@ export class BrowserHub {
     if (old && old !== conn) this.drop(old, 4409, "replaced by a newer connection");
     conn.binding = binding;
     this.byBinding.set(binding.name, conn);
+    conn.attachedAt = this.now();
     this.touch(conn);
+    this.changed();
   }
 
   detach(ws: HubSocket): void {
@@ -168,15 +194,27 @@ export class BrowserHub {
     if (conn.helloTimer) clearTimeout(conn.helloTimer);
     if (conn.silenceTimer) clearTimeout(conn.silenceTimer);
     this.conns.delete(ws);
-    if (conn.binding && this.byBinding.get(conn.binding.name) === conn) this.byBinding.delete(conn.binding.name);
+    const wasBound = conn.binding && this.byBinding.get(conn.binding.name) === conn;
+    if (wasBound) this.byBinding.delete((conn.binding as BrowserBinding).name);
     for (const [id, p] of [...this.pending]) {
       if (p.ws === ws) this.settle(id, { id, ok: false, error: "browser_disconnected", message: "The browser disconnected during the call." });
     }
+    if (wasBound) this.changed();
   }
 
   /** Extension version reported in `hello` by the live connection of `binding`, if any. */
   extensionVersion(binding: string): string | undefined {
     return this.byBinding.get(binding)?.extensionVersion;
+  }
+
+  /** Live local connections with the data the cluster publishes. */
+  localPresence(): LocalPresence[] {
+    return [...this.byBinding.values()].map((c) => ({
+      binding: c.binding as BrowserBinding,
+      paused: c.paused,
+      attachedAt: c.attachedAt ?? this.now(),
+      ...(c.extensionVersion ? { extensionVersion: c.extensionVersion } : {}),
+    }));
   }
 
   connected(): BrowserBinding[] {
@@ -228,8 +266,13 @@ export class BrowserHub {
 
   /** Closes the live socket of a revoked binding (code 4401). */
   revoke(binding: string): void {
+    this.closeBinding(binding, 4401, "binding revoked");
+  }
+
+  /** Closes the live local socket of `binding` with `code`, if there is one. */
+  closeBinding(binding: string, code: number, reason: string): void {
     const conn = this.byBinding.get(binding);
-    if (conn) this.drop(conn, 4401, "binding revoked");
+    if (conn) this.drop(conn, code, reason);
   }
 
   closeAll(code: number): void {

@@ -1182,3 +1182,20 @@ describe("public host", () => {
     }
   });
 });
+
+describe("readiness follows the database", () => {
+  test("/readyz fails while the database does not answer, /healthz stays up", async () => {
+    let down = false;
+    const g = await boot({ ping: async () => {
+      if (down) throw new Error("connect ECONNREFUSED");
+    }, pingMs: 50 });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    down = true;
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 503);
+    expect(await (await fetch(`${base(g)}/readyz`)).text()).toBe("database unreachable\n");
+    expect(await status(`${base(g)}/healthz`)).toBe(200);
+    expect(g.ready()).toBe(false);
+    down = false;
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+  });
+});

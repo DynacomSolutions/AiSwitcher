@@ -126,7 +126,7 @@ const TOOL_CONFIGS: Record<GatewayProvider, ToolConfig> = {
 function watchedFiles(provider: GatewayProvider, dir: string): string[] {
   if (provider === "opencode") {
     const base = join(dir, "data", "opencode");
-    return [join(base, "opencode.db"), join(base, "opencode.db-wal"), join(base, "auth.json")];
+    return [join(base, "opencode.db"), join(base, "opencode.db-wal"), join(base, "auth.json"), join(base, "ais-gateway-key.json")];
   }
   return [primaryFile(provider, dir)];
 }
@@ -207,7 +207,10 @@ async function readCredential(provider: GatewayProvider, id: Identity, registry?
       const v2 = (await readOpencodeV2Credentials(dir))?.find((c) => c.provider === "opencode-go")?.entry.key;
       if (nonEmpty(v2)) return { identity, accessToken: v2 };
       const legacy = (await readOpencodeAuth(dir))?.["opencode-go"]?.key;
-      return nonEmpty(legacy) ? { identity, accessToken: legacy } : undefined;
+      if (nonEmpty(legacy)) return { identity, accessToken: legacy };
+      // A replica without the host's SQLite database reads the key the credential store import derived from it (home-import.ts).
+      const derived = (await readJsonObject(join(dir, "data", "opencode", "ais-gateway-key.json")))?.["opencode-go"] as { key?: unknown } | undefined;
+      return nonEmpty(derived?.key) ? { identity, accessToken: derived.key } : undefined;
     }
   }
 }

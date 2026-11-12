@@ -67,4 +67,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   codex JWTs, kimi/pi/opencode expiry fields) plus ali's scheduler refresh
   state, so the identity list can show logged in / expiring / expired /
   not logged in / unknown per tool.
+- The console's refresh scheduler (`src/server/auth-refresh.ts`) never refreshes a claude, codex, grok or kimi login that
+  the gateway's PostgreSQL credential store owns (a `login` row in `gateway_home_files`), manual runs included: the gateway
+  renews it and a second refresher would fork the rotating refresh token. Set `AIS_GATEWAY_STORE_DATABASE_URL` on the
+  console wherever the gateway runs on that store. When the store cannot be read the scheduler stands down for all four
+  tools (fail closed) and retries the check after 15 s. Without the variable nothing changes. ali is never affected.
 

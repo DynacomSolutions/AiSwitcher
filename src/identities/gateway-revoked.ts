@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { withOauthRefreshLock } from "./claude-swap-lock.ts";
-import { hasMemberCopy, isMemberStoreTool, memberDir, memberLoginFile, memberStoreRoot } from "./gateway-members.ts";
+import { hasMemberCopy, isMemberStoreTool, localWritten, memberDir, memberLoginFile, memberStoreRoot } from "./gateway-members.ts";
 import { refreshFingerprint, refreshOf } from "./gateway-routed.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
 
@@ -54,6 +54,7 @@ export async function recordLoginRevoked(tool: string, name: string, code: strin
       if (!fingerprint.startsWith(rejected)) return false;
       const marker: RevokedMarker = { at: now().toISOString(), code, fingerprint };
       await writeFileAtomic(revokedMarkerPath(tool, name, root), `${JSON.stringify(marker)}\n`);
+      await localWritten(revokedMarkerPath(tool, name, root), "marker", `${tool}/${name}`);
       return true;
     });
   } catch {

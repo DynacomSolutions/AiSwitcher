@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisHome } from "../shared/ais-home.ts";
+import { localWritten } from "./gateway-members.ts";
 import { writeFileAtomic } from "./pool/fs.ts";
 
 /**
@@ -25,6 +26,7 @@ export const heartbeatPath = (): string => process.env.AIS_GATEWAY_HEARTBEAT ?? 
 
 export async function writeHeartbeat(hb: GatewayHeartbeat, path: string = heartbeatPath()): Promise<void> {
   await writeFileAtomic(path, `${JSON.stringify(hb)}\n`);
+  await localWritten(path, "heartbeat");
 }
 
 /** The heartbeat, or undefined when missing or malformed. */

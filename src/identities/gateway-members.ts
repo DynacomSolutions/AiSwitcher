@@ -37,6 +37,21 @@ export const MEMBER_FILES: Record<MemberStoreTool, string[]> = {
 
 let enabled = false;
 
+/** What a gateway-written file is, for the PostgreSQL credential store's hook. */
+export type LocalWriteKind = "heartbeat" | "marker";
+type LocalWriteHook = (absPath: string, kind: LocalWriteKind, account: string | null) => Promise<void>;
+let localWriteHook: LocalWriteHook | undefined;
+
+/** Set by `ais gateway serve` on the PostgreSQL store: gateway-written files (heartbeat, revoked markers) are pushed to it. */
+export function setLocalWriteHook(hook: LocalWriteHook | undefined): void {
+  localWriteHook = hook;
+}
+
+/** Tells the store hook a gateway-owned file was written. Never throws. */
+export async function localWritten(absPath: string, kind: LocalWriteKind, account: string | null = null): Promise<void> {
+  await localWriteHook?.(absPath, kind, account).catch(() => undefined);
+}
+
 /** Called by the gateway processes (`ais gateway serve`, `ais gateway local`): from then on they read the member store. */
 export function enableMemberStore(): void {
   enabled = true;
