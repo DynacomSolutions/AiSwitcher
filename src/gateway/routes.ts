@@ -43,7 +43,7 @@ import type { PoolUsage } from "../identities/pool/adapter.ts";
  *   ChatGPT account detail: `deny`, answered 404 with no upstream call and no login.
  */
 export type Route =
-  | { kind: "upstream"; url: string; side: boolean }
+  | { kind: "upstream"; url: string; side: boolean; /** A model list: "list" the collection, "one" a single model. A pool app gets the pool's answer (models-union.ts). */ models?: "list" | "one" }
   | { kind: "serve"; name: ServedName }
   | { kind: "account"; op: AccountOp; url: string; /** false: not counted against the daily side limit (telemetry and the like). */ count?: false }
   | { kind: "deny"; status: 403 | 404 };
@@ -143,14 +143,15 @@ const KIMI_V1 = `${KIMI_ANTHROPIC_BASE}/v1`;
 
 /** The model-list URL for a provider, or "serve" when the gateway answers itself. `id` is "" or "/<model id>". */
 function modelsRoute(provider: GatewayProvider, style: ApiStyle, id: string): Route | undefined {
+  const models = id === "" ? ("list" as const) : ("one" as const);
   switch (provider) {
     case "claude":
-      return { kind: "upstream", url: `${adapterFor("claude").upstreamBase(style)}/v1/models${id}`, side: true };
+      return { kind: "upstream", url: `${adapterFor("claude").upstreamBase(style)}/v1/models${id}`, side: true, models };
     case "codex":
       // The Codex backend lists models only as a collection.
-      return id === "" ? { kind: "upstream", url: `${CODEX_UPSTREAM_BASE}/models`, side: true } : undefined;
+      return id === "" ? { kind: "upstream", url: `${CODEX_UPSTREAM_BASE}/models`, side: true, models } : undefined;
     case "kimi":
-      return { kind: "upstream", url: `${KIMI_V1}/models${id}`, side: true };
+      return { kind: "upstream", url: `${KIMI_V1}/models${id}`, side: true, models };
     case "ali":
       return id === "" ? { kind: "serve", name: "ali-models" } : undefined;
     case "zai":
@@ -158,7 +159,7 @@ function modelsRoute(provider: GatewayProvider, style: ApiStyle, id: string): Ro
     case "opencode": {
       const base = adapterFor(provider).upstreamBase(style);
       // An Anthropic-style base has no /v1 of its own; an OpenAI-style one does (or is versioned, as zai's /v4).
-      return { kind: "upstream", url: `${base}${style === "anthropic" ? "/v1" : ""}/models${id}`, side: true };
+      return { kind: "upstream", url: `${base}${style === "anthropic" ? "/v1" : ""}/models${id}`, side: true, models };
     }
   }
 }

@@ -16,6 +16,7 @@ import { nativeLimitResponse } from "./native-limit.ts";
 import { bounded } from "./refresh-guard.ts";
 import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
+import { poolModels } from "./models-union.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
 import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
@@ -564,7 +565,9 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       return reject(429, "daily limit for list, search and speech calls reached", identityForRow, undefined, "side_daily_cap");
     }
   }
-  if (route?.kind === "serve" || route?.kind === "account") {
+  /** A pool app's model list: the union of its members' lists (or the first member that has the one model), see models-union.ts. */
+  const poolList = route?.kind === "upstream" && route.models !== undefined && app.target.kind === "pool" ? route : undefined;
+  if (route?.kind === "serve" || route?.kind === "account" || poolList) {
     // Answered from the gateway's own pool state, or forwarded to the provider's account API with the member's login (no token rows). The daily cap still applies.
     if (app.dailyTokens !== undefined) {
       let usedNow = 0;
@@ -578,7 +581,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         return reject(429, "daily token cap reached", identityForRow, undefined, "daily_cap");
       }
     }
-    if (route.kind === "account") {
+    if (route?.kind === "account") {
       let bytes: Uint8Array | undefined;
       if (req.body) {
         // Bounded: a declared length over the limit is refused unread; otherwise the body is read in chunks inside the body budget and cut off at the limit.
@@ -594,6 +597,13 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       record(who, out.res.status >= 400 ? "rejected" : "ok", out.res.status, undefined, false, undefined, undefined, out.cls);
       return out.res;
     }
+    if (poolList) {
+      const listed = await poolModels({ app, deps, style, url: poolList.url + url.search, incoming: req.headers, signal: ctrl.signal, single: poolList.models === "one" });
+      req.signal.removeEventListener("abort", onAbort);
+      record(identityForRow, listed.status >= 400 ? "upstream_error" : "ok", listed.status, undefined, false);
+      return listed;
+    }
+    if (route?.kind !== "serve") throw new Error("unreachable: not a served route");
     const served = await serveRoute(route.name, { app, style, deps, signal: ctrl.signal, cache: resetCredits });
     req.signal.removeEventListener("abort", onAbort);
     record(identityForRow, served.status >= 400 ? "rejected" : "ok", served.status, undefined, false);

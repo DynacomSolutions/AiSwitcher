@@ -163,7 +163,13 @@ speech call is not a model call); the daily token cap does.
 
 - **Model lists**, `GET /models` or `/v1/models` (and `/models/<id>` where the
   provider has it), for every provider. ali has no upstream list, so the gateway
-  lists the models AIS knows.
+  lists the models AIS knows. A pool app gets what the pool can serve, not one
+  member's plan (`src/gateway/models-union.ts`, board 13.190): the list is the union of every member
+  the app may use (matched by `slug` or `id`; "list" visibility beats "hide", and
+  that entry's fields come from a member that lists it; Codex entries in `priority`
+  order; its own ETag), and `/models/<id>` is answered by the first member that has
+  it. A member that fails is left out; if none lists, the first member's answer
+  stands. Conditional headers are not sent on. A pinned app keeps the plain pass-through.
 - **kimi** `POST /search` and `POST /fetch` (also under `/v1`), sent to the Kimi
   Coding `search` and `fetch` services. UNPROVEN live.
 - **codex** `POST /v1/audio/transcriptions` (or `/transcribe`), sent to ChatGPT's
