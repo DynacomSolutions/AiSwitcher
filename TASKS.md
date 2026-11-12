@@ -281,4 +281,4 @@ AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gat
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
-| 195 | Gateway credential store in PostgreSQL, multi-replica relay, console stand-down | doing | claude | gateway-ha | | 2026-11-13 07:48 ICT | Owner goal 2026-11-13 after the main node died. Deployment side is done by the .cluster session. |
+| 195 | Gateway credential store in PostgreSQL, multi-replica relay, console stand-down | done | claude | gateway-ha | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/527 (9048774).<br>Two-process test: one rotation under concurrency, both serve, browser call across replicas, survivor serves after kill.<br>Deployment (replicas, no hostPath, store key Secret) is done by the .cluster session. |
