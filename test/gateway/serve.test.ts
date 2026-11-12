@@ -866,6 +866,18 @@ describe("keep-alive across every refreshable tool", () => {
     expect(seen).toEqual(["codex:-", "kimi:-", "codex:fp-c", "kimi:-"]);
   });
 
+  test("keepAliveOnce stops refreshing once shouldStop turns true", async () => {
+    let stopping = false;
+    const seen: string[] = [];
+    const refresh = (async (tool: string, id: { name: string }) => {
+      seen.push(id.name);
+      stopping = true;
+      return { tool, identity: id.name, outcome: "refreshed", detail: "", written: [], writeFailures: [] };
+    }) as never;
+    await keepAliveOnce({ refresh, accounts: async () => [member("a"), member("b"), member("c")], tools: ["kimi"], metrics: { keepAlive: () => {} }, shouldStop: () => stopping });
+    expect(seen).toEqual(["a"]);
+  });
+
   test("the gateway timer keeps codex and kimi members alive through the guard", async () => {
     const backend = new MemoryRefreshBackend();
     const seen = new Set<string>();
@@ -1180,5 +1192,22 @@ describe("public host", () => {
       if (prev === undefined) delete process.env.AIS_GATEWAY_PUBLIC_HOSTS;
       else process.env.AIS_GATEWAY_PUBLIC_HOSTS = prev;
     }
+  });
+});
+
+describe("readiness follows the database", () => {
+  test("/readyz fails while the database does not answer, /healthz stays up", async () => {
+    let down = false;
+    const g = await boot({ ping: async () => {
+      if (down) throw new Error("connect ECONNREFUSED");
+    }, pingMs: 50 });
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    down = true;
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 503);
+    expect(await (await fetch(`${base(g)}/readyz`)).text()).toBe("database unreachable\n");
+    expect(await status(`${base(g)}/healthz`)).toBe(200);
+    expect(g.ready()).toBe(false);
+    down = false;
+    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
   });
 });

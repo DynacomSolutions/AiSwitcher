@@ -33,7 +33,7 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object
 
 
 export interface CallDeps extends BrowserDeps {
-  hub: BrowserHub;
+  hub: Pick<BrowserHub, "connected" | "call" | "abort" | "revoke" | "extensionVersion">;
   metrics?: GatewayMetrics;
 }
 

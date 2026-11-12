@@ -189,9 +189,23 @@ export interface GuardDeps {
   onDegraded?(account: RefreshAccount, reason: string): void;
   /** Consecutive interrupted attempts with the current refresh token (0 once it is cleared). Alert from 2 up. */
   onInterrupted?(account: RefreshAccount, count: number): void;
+  /** A refresh's result could not be written to the credential store (after retries); the local file stays ahead for the background pass. */
+  onStoreWriteFailed?(account: RefreshAccount): void;
   /** The guard worked again for this account. */
   onHealthy?(account: RefreshAccount): void;
   warn?(message: string): void;
+  /**
+   * The PostgreSQL credential store (home-mirror.ts), when the gateway runs on it. `run` serialises the whole refresh with
+   * this process's other work on the account; `pull` brings the store's copy into the local files once the lock is held
+   * (so adopt-first and the journal see the store), and `push` writes what the refresh changed back before the lock goes.
+   */
+  sync?: GuardSync;
+}
+
+export interface GuardSync {
+  run<T>(account: RefreshAccount, fn: () => Promise<T>): Promise<T>;
+  pull(tool: RefreshableTool, identity: Identity): Promise<void>;
+  push(tool: RefreshableTool, identity: Identity, written: string[]): Promise<void>;
 }
 
 const defaultReadGrant = async (tool: RefreshableTool, identity: Identity, claudeRegistryPath?: string): Promise<OAuthGrant | undefined> =>
@@ -251,7 +265,25 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
   };
   const ROTATED_OUT_MESSAGE = "refresh refused: this refresh token was already rotated out (journal) and is not sent again; the newer grant is missing from the stores";
 
-  return (async (tool, identity, opts) => {
+  /** Pushes what a refresh wrote; retried, then left to the store's background pass (the local file stays ahead). */
+  const pushBack = async (tool: RefreshableTool, identity: Identity, written: string[]): Promise<void> => {
+    if (!deps.sync) return;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await bounded(deps.sync.push(tool, identity, written), callMs * 2, "credential store write");
+        return;
+      } catch (err) {
+        if (attempt >= 2) {
+          warn(`credential store write for ${tool}/${identity.name} failed (${reason(err)}); retried in the background`);
+          deps.onStoreWriteFailed?.({ provider: tool, identity: identity.name });
+          return;
+        }
+        await sleep(200 * (attempt + 1));
+      }
+    }
+  };
+
+  const guarded = (async (tool, identity, opts) => {
     const account: RefreshAccount = { provider: tool, identity: identity.name };
     const count = (event: Parameters<RefreshGuardMetrics["refreshGuard"]>[0], seconds?: number): void => deps.metrics.refreshGuard(event, tool, identity.name, seconds);
     const settle = (res: IdentityGrantRefresh): IdentityGrantRefresh => {
@@ -274,6 +306,12 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         count("failure");
         throw err;
       }
+      if (deps.sync) {
+        // Each replica's file lock is local: refreshing here could send the same single-use refresh token as another replica.
+        count("failure");
+        deps.onDegraded?.(account, reason(err));
+        throw new RefreshGuardRetryable(`refresh lock unavailable (${reason(err)}); not refreshing without it on the shared credential store`);
+      }
       // The guard cannot run. Refreshing still goes ahead under AIS's file lock and the expectedAccessToken compare-and-swap.
       count("degraded");
       deps.onDegraded?.(account, reason(err));
@@ -281,7 +319,9 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       const guardLocal = async ({ fingerprint }: { fingerprint: string }): Promise<void> => {
         if (rotatedOut.has(`${tool}\u0000${identity.name}\u0000${fingerprint}`)) throw new RefreshRefused(ROTATED_OUT_MESSAGE, false);
       };
-      return settle(await refresh(tool, identity, { ...opts, beforePost: guardLocal }));
+      const res = await refresh(tool, identity, { ...opts, beforePost: guardLocal });
+      await pushBack(tool, identity, res.written ?? []);
+      return settle(res);
     }
     deps.onHealthy?.(account);
     if (lock.contended) count("lock_wait", lock.waitedMs / 1000);
@@ -316,6 +356,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
     try {
       let latest: OAuthGrant | undefined;
       try {
+        if (deps.sync) await bounded(deps.sync.pull(tool, identity), callMs * 2, "credential store read");
         latest = await read(tool, identity, opts?.claudeRegistryPath);
       } catch (err) {
         // A transient read error must neither send the token request unseen nor report a dead login.
@@ -374,9 +415,12 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
         res = await refresh(tool, identity, { ...opts, beforePost });
       } catch (err) {
         if (claim !== undefined) await resolveClaim(claim, "failed").catch((e) => warn(`refresh journal write failed (${reason(e)})`));
+        await pushBack(tool, identity, []);
         count("failure");
         throw err;
       }
+      // Under the lock, before the journal resolves: another replica must never pull the spent grant once the lock is free.
+      await pushBack(tool, identity, res.written ?? []);
       if (res.outcome === "refreshed" && res.beforeFingerprint && res.afterFingerprint && res.beforeFingerprint !== res.afterFingerprint) {
         markRotatedOut(`${tool}\u0000${identity.name}\u0000${res.beforeFingerprint}`);
         deps.onInterrupted?.(account, 0);
@@ -393,4 +437,7 @@ export function guardRefresh(refresh: RefreshFn, deps: GuardDeps): RefreshFn {
       await bounded(lock.release(), callMs, "refresh lock release").catch((e) => warn(`refresh lock release failed (${reason(e)})`));
     }
   }) as RefreshFn;
+  if (!deps.sync) return guarded;
+  const sync = deps.sync;
+  return ((tool, identity, opts) => sync.run({ provider: tool, identity: identity.name }, () => guarded(tool, identity, opts))) as RefreshFn;
 }

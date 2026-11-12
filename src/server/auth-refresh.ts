@@ -15,6 +15,8 @@ import { grantFingerprint, withReadErrorProbe } from "../identities/oauth-reconc
 import { isRetired } from "../identities/retired.ts";
 import type { Identity } from "../identities/types.ts";
 import { consoleWebDir } from "./state.ts";
+import { createOwnershipCheck } from "../gateway/home-store.ts";
+import { GATEWAY_REFRESH_TOOLS } from "../identities/gateway-managed.ts";
 
 async function listIdentitiesFromRegistry(tool: string): Promise<Identity[]> {
   const cfg = TOOL_CONFIGS[tool as keyof typeof TOOL_CONFIGS];
@@ -120,6 +122,25 @@ async function currentGrantFingerprint(tool: string, identity: Identity): Promis
 }
 
 export const DEFAULT_REFRESH_INTERVAL_MS = 10 * 60_000;
+
+/** The console's view of the gateway's PostgreSQL credential store; set it wherever the gateway runs on that store. */
+export const STORE_DATABASE_ENV = "AIS_GATEWAY_STORE_DATABASE_URL";
+
+/** Tools whose logins the gateway refreshes: the console never refreshes one of these that the store owns. */
+const STORE_REFRESHED_TOOLS: ReadonlySet<string> = new Set(GATEWAY_REFRESH_TOOLS);
+
+/**
+ * Accounts ("tool/identity") the gateway's PostgreSQL store owns, or undefined when the store cannot be read. Built from
+ * AIS_GATEWAY_STORE_DATABASE_URL; without it nothing is owned (the console refreshes as before).
+ */
+export type StoreOwnership = () => Promise<Set<string> | undefined>;
+
+function storeOwnershipFromEnv(): StoreOwnership {
+  const url = process.env[STORE_DATABASE_ENV]?.trim();
+  if (!url) return async () => new Set<string>();
+  const check = createOwnershipCheck(url);
+  return () => check.owned();
+}
 
 export function parseRefreshExpiryWindowHours(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return DEFAULT_EXPIRY_WINDOW_HOURS;
@@ -254,6 +275,8 @@ export class AuthRefreshScheduler {
     private readonly expiryWindowHours: number = parseRefreshExpiryWindowHours(process.env.AIS_AUTH_REFRESH_EXPIRY_HOURS),
     /** Injectable so tests never read real credential stores. */
     private readonly fingerprintOf: (tool: string, identity: Identity) => Promise<string | undefined> = currentGrantFingerprint,
+    /** Injectable so tests never reach a database. */
+    private readonly storeOwned: StoreOwnership = storeOwnershipFromEnv(),
   ) {
     if (this.intervalMs > 0 && this.intervalMs < 60_000) this.intervalMs = 60_000;
   }
@@ -375,6 +398,16 @@ export class AuthRefreshScheduler {
     this.inFlight.add(key);
     let failed = false;
     try {
+      // The gateway's credential store owns this login: refreshing here would fork its rotating refresh token, so stand down
+      // (manual runs too). A store that cannot be read stands down as well: never guess.
+      if (STORE_REFRESHED_TOOLS.has(tool)) {
+        const owned = await this.storeOwned().catch(() => undefined);
+        if (owned === undefined || owned.has(`${tool}/${identity.name}`)) {
+          entry.lastError = null;
+          entry.lastDetail = owned === undefined ? "gateway credential store unreachable; left to the gateway" : "renewed by the gateway (credential store)";
+          return true;
+        }
+      }
       await this.clearIfSuperseded(entry, identity);
       const outcome = await refresher(identity, { ...context, lastSuccessAt: entry.lastSuccessAt, revokedFingerprint: entry.revokedFingerprint ?? undefined });
       if (outcome === undefined) {

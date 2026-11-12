@@ -2,10 +2,17 @@ import { startUsageProxy, type RunningUsageProxy } from "./usage-proxy.ts";
 import { parseToken, verifyToken } from "./tokens.ts";
 import { startModelPriceRefresh } from "../identities/model-price-source.ts";
 import { TOOL_CONFIGS } from "../cli/identities/resolve-tool.ts";
-import { DEAD_REFRESH_CODES, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { DEAD_REFRESH_CODES, effectiveGrantPaths, OAuthRefreshError, readEffectiveGrant, refreshIdentityOAuthGrant, type RefreshableTool } from "../identities/oauth-refresh.ts";
+import { SQL } from "bun";
+import { readFile } from "node:fs/promises";
+import { ClusterBrowserHub, RELAY_PATH } from "./browser/cluster.ts";
+import { HomeMirror } from "./home-mirror.ts";
+import { importHome, STORE_META_PATH } from "./home-import.ts";
+import { PgHomeStore } from "./home-store.ts";
+import { PgLeader } from "./pg-leader.ts";
 import { SwapLockError } from "../identities/claude-swap-lock.ts";
 import { PgRefreshBackend } from "./pg-refresh-backend.ts";
-import { guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, type RefreshGuardBackend } from "./refresh-guard.ts";
+import { bounded, guardRefresh, JOURNAL_RETENTION_MS, RefreshGuardRetryable, type RefreshGuardBackend } from "./refresh-guard.ts";
 import { isRetired } from "../identities/retired.ts";
 import { allowedAccounts, findPool, isSwapPool } from "../identities/pool/swap-pool.ts";
 import { loadIdentitiesFile } from "../identities/store.ts";
@@ -28,7 +35,7 @@ import { createUsageSource, fetchPoolUsage, type FetchUsage } from "./usage-sour
 import type { GatewayProvider } from "./types.ts";
 import type { IdentitiesFile, Identity } from "../identities/types.ts";
 import { readHeartbeat, writeHeartbeat, type GatewayHeartbeat } from "../identities/gateway-heartbeat.ts";
-import { enableMemberStore, memberStoreEnabled } from "../identities/gateway-members.ts";
+import { enableMemberStore, memberStoreEnabled, setLocalWriteHook } from "../identities/gateway-members.ts";
 import { recordLoginRevoked } from "../identities/gateway-revoked.ts";
 import { GATEWAY_REFRESH_TOOLS, listGatewayManagedAccounts, markGatewayOwnerProcess } from "../identities/gateway-managed.ts";
 
@@ -47,6 +54,13 @@ export interface GatewayOptions {
   handleSignals?: boolean;
   /** The CONNECT proxy for gateway-routed Claude Code (usage-proxy.ts). Off when absent. */
   connect?: { port: number; tlsDir: string; publishCaTo?: string };
+  /**
+   * Logins in the PostgreSQL credential store (home-store.ts) instead of host files. `key`: AIS_GATEWAY_STORE_KEY.
+   * `fileStore`: this replica's HOME holds the host's real files (write-back and import). `importOnStart`: run the import first.
+   */
+  credentialStore?: { key: Buffer; fileStore?: boolean; importOnStart?: boolean };
+  /** This replica's admin base URL for other replicas (browser relay forwarding). Multi-replica relay is on when set. */
+  replicaUrl?: string;
 }
 
 /** Everything a test (or another host) may replace. Production uses the defaults. */
@@ -90,6 +104,15 @@ export interface GatewayHooks {
   stopCeilingMs?: number;
   /** Tests: do not read or write the shared gateway heartbeat file. */
   noHeartbeat?: boolean;
+  /** Replica HOME for the credential store mirror (default the process home). */
+  home?: string;
+  /** Database reachability check behind /readyz (default SELECT 1 on the gateway database; a no-op when openStore is replaced). */
+  ping?(): Promise<void>;
+  pingMs?: number;
+  /** Credential store follow interval (default 5 s). */
+  storePollMs?: number;
+  /** Leader election interval (default 10 s). */
+  leaderTryMs?: number;
   overlapMs?: number;
   exit?(code: number): void;
 }
@@ -329,6 +352,8 @@ export async function keepAliveOnce(deps: {
   mintedAt?: (tool: string, account: Identity) => Promise<number | undefined>;
   /** Called after the pass with every login held and its last success: the gateway's heartbeat. */
   onPass?: (held: Record<string, { lastSuccessAt?: string }>, at: Date) => Promise<void>;
+  /** Checked before each account: true ends the pass (the gateway is stopping and its stores are about to close). */
+  shouldStop?: () => boolean;
 }): Promise<void> {
   // A grant diagnosed revoked is remembered by fingerprint and not POSTed again until a re-login mints a different one.
   const revoked = deps.revoked ?? new Map<string, string>();
@@ -337,6 +362,7 @@ export async function keepAliveOnce(deps: {
   const held: Record<string, { lastSuccessAt?: string }> = {};
   for (const tool of deps.tools ?? ["claude"]) {
     for (const account of await deps.accounts(tool).catch(() => [] as Identity[])) {
+      if (deps.shouldStop?.()) break;
       const key = `${tool}/${account.name}`;
       held[key] = {};
       try {
@@ -387,6 +413,13 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const alerter = createAlerter(hooks.notify ?? stderrNotifier);
   const failedTokens = new Map<string, string>();
   const refreshBackend = hooks.refreshBackend ?? new PgRefreshBackend(opts.databaseUrl);
+  // PostgreSQL credential store: this replica's HOME follows the store; refreshes pull and push under the account lock.
+  const pgCreds = opts.credentialStore;
+  const homeStore = pgCreds ? new PgHomeStore(opts.databaseUrl, pgCreds.key) : undefined;
+  const mirror = homeStore ? new HomeMirror(homeStore, { ...(hooks.home ? { home: hooks.home } : {}), fileStore: pgCreds?.fileStore === true }) : undefined;
+  const leader = pgCreds ? new PgLeader(opts.databaseUrl, hooks.leaderTryMs ?? 10_000) : undefined;
+  if (mirror) setLocalWriteHook(async (abs, kind, account) => mirror.push([abs], account, kind));
+  const grantPaths = (tool: RefreshableTool, identity: Identity): Promise<string[]> => effectiveGrantPaths(tool, identity).catch(() => [] as string[]);
   const inflightRefreshes = new Set<Promise<unknown>>();
   const guarded = guardRefresh(hooks.refreshImpl ?? refreshIdentityOAuthGrant, {
     backend: refreshBackend,
@@ -398,6 +431,29 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       else alerter.recover("refresh-interrupted", key);
     },
     onHealthy: (account) => alerter.recover("refresh-guard-degraded", `${account.provider}/${account.identity}`),
+    ...(mirror
+      ? {
+          sync: {
+            run: (account, fn) => mirror.withAccount(`${account.provider}/${account.identity}`, fn),
+            pull: async (tool, identity) => mirror.pullAccount(`${tool}/${identity.name}`, await grantPaths(tool, identity)),
+            push: async (tool, identity, written) => {
+              const account = `${tool}/${identity.name}`;
+              let first: unknown;
+              try {
+                await mirror.push([...new Set([...(await grantPaths(tool, identity)), ...written])], account, "login");
+              } catch (err) {
+                first = err;
+              }
+              // Whatever the listed paths missed (or a failed push left behind) goes too: every tracked file of the account that changed.
+              await mirror.pushAccountDirty(account).catch((err) => {
+                throw first ?? err;
+              });
+              alerter.recover("credential-store-write-failed", account);
+            },
+          },
+          onStoreWriteFailed: (account) => alerter.raise("credential-store-write-failed", `${account.provider}/${account.identity}`, `the gateway could not write the ${account.provider} login "${account.identity}" to the credential store after a refresh; the new token only exists on this replica until it can (check the database)`),
+        }
+      : {}),
   });
   const instrumented = instrumentRefresh(guarded, { metrics, alerter, failed: failedTokens });
   /** The one guarded refresh: the credential cache and the keep-alive both go through it, and stop() waits for it. */
@@ -425,6 +481,11 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       return b;
     },
     metrics });
+  // Several replicas: a call for a browser whose socket another replica holds is forwarded there (browser/cluster.ts).
+  const relay = opts.replicaUrl
+    ? new ClusterBrowserHub({ hub, databaseUrl: opts.databaseUrl, replicaId: `${process.env.HOSTNAME ?? "gateway"}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`, replicaUrl: opts.replicaUrl, adminToken: opts.adminToken })
+    : undefined;
+  const browser = relay ?? hub;
   metrics.browserGauges = { connected: () => hub.connected().length, sessions: () => hub.activeSessions() };
 
   const proxy = createGatewayApp({
@@ -438,7 +499,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     poolMembers,
     browserPoolMembers,
     browserIdentityExists,
-    browserHub: hub,
+    browserHub: browser,
     fetch: hooks.fetch ?? fetch,
     now,
     metrics: recoverOnSuccess(metrics, alerter),
@@ -451,10 +512,40 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     }
     return undefined;
   };
-  const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: hub, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
+  const admin = createAdminApp({ store, adminToken: opts.adminToken, now, identityState: hooks.identityState ?? defaultIdentityState, browserPoolMembers, browserIdentityExists, browserHub: browser, ...(hooks.overlapMs !== undefined ? { overlapMs: hooks.overlapMs } : {}) });
 
   let warmed = false;
   let draining = false;
+  let storeSynced = false;
+  let relayStarted = false;
+  let importTimer: ReturnType<typeof setInterval> | undefined;
+  /** Last time the database answered /readyz's ping (ms); readiness fails when it is older than three pings. */
+  let dbOkAt = 0;
+  const pingMs = hooks.pingMs ?? 5_000;
+  const pingSql = hooks.ping || hooks.openStore ? undefined : new SQL(opts.databaseUrl, { max: 1 });
+  const ping = hooks.ping ?? (pingSql ? async () => void (await pingSql`SELECT 1`) : async () => undefined);
+  const checkDb = async (): Promise<void> => {
+    try {
+      await bounded(ping(), Math.min(2_000, pingMs), "database ping");
+      dbOkAt = Date.now();
+    } catch {
+      // readiness drops once the last good answer is too old
+    }
+  };
+  const dbOk = (): boolean => Date.now() - dbOkAt <= pingMs * 3;
+  const pingTimer = setInterval(() => void checkDb(), pingMs);
+  pingTimer.unref?.();
+  void checkDb();
+  /** The host home the registries were written on, so their paths translate on any node (unless the deployment set it). */
+  async function adoptStoreMeta(): Promise<void> {
+    if (!mirror || process.env.AIS_HOST_HOME?.trim()) return;
+    try {
+      const meta = JSON.parse(await readFile(mirror.abs(STORE_META_PATH), "utf8")) as { hostHome?: unknown };
+      if (typeof meta.hostHome === "string" && meta.hostHome.startsWith("/")) process.env.AIS_HOST_HOME = meta.hostHome;
+    } catch {
+      // no import yet: paths are used as they are
+    }
+  }
   let wake: (() => void) | undefined;
   const sleep = (ms: number): Promise<void> =>
     new Promise((resolve) => {
@@ -504,6 +595,31 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       let stage = "migrate";
       try {
         await (hooks.migrate ?? migrate)(opts.databaseUrl);
+        if (mirror && homeStore && !storeSynced) {
+          if (pgCreds?.importOnStart && pgCreds.fileStore) {
+            stage = "credential store import";
+            const r = await importHome(homeStore, { home: mirror.home, lock: refreshBackend });
+            console.info(`gateway: credential store import: ${r.added.length} added, ${r.updated.length} updated, ${r.unchanged.length} unchanged, ${r.skipped.length} kept`);
+          }
+          stage = "credential store";
+          await mirror.pullAll();
+          await adoptStoreMeta();
+          await seedFromHeartbeat();
+          await mirror.start(hooks.storePollMs ?? 5_000);
+          leader?.start();
+          if (pgCreds?.fileStore) {
+            // New host files (a login added on the host) are picked up by re-running the import now and then.
+            importTimer = setInterval(() => {
+              if (!draining) void importHome(homeStore, { home: mirror.home, lock: refreshBackend }).catch(() => undefined);
+            }, 5 * 60_000);
+            importTimer.unref?.();
+          }
+          storeSynced = true;
+        }
+        if (relay && !relayStarted) {
+          relayStarted = true;
+          await relay.start();
+        }
         stage = "app cache";
         await store.warm();
         if (draining) return;
@@ -559,7 +675,13 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     // Operational endpoints answer only inside the cluster (vmagent and probes use the pod address): on a public host they do not exist.
     if (isOperationalPath(path) && viaPublicHost(req.headers, req.url, publicHosts)) return markGatewayResponse(new Response("not found\n", { status: 404 }));
     if (path === "/healthz") return new Response("ok\n");
-    if (path === "/readyz") return warmed && !draining ? new Response("ready\n") : new Response(draining ? "draining\n" : "warming\n", { status: 503 });
+    if (path === "/readyz") {
+      if (draining) return new Response("draining\n", { status: 503 });
+      if (!warmed) return new Response("warming\n", { status: 503 });
+      // A replica that cannot reach the database cannot refresh, guard or count: take it out of the rotation.
+      if (!dbOk()) return new Response("database unreachable\n", { status: 503 });
+      return new Response("ready\n");
+    }
     if (path === "/metrics") return new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } });
     if (!warmed) return providerError(await styleForPath({ store }, path), 503, "gateway is starting");
     srv.timeout(req, 0); // A long generation is not idle.
@@ -568,7 +690,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const adminServer = Bun.serve({
     hostname: hooks.host ?? "0.0.0.0",
     port: opts.adminPort,
-    fetch: (req) => admin.fetch(req),
+    fetch: (req) => (relay && req.method === "POST" && new URL(req.url).pathname === RELAY_PATH ? relay.handleRelay(req) : admin.fetch(req)),
   });
 
   const checkLedger = watchLedger(ledger, alerter);
@@ -576,13 +698,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   alertTimer.unref?.();
   const revokedGrants = new Map<string, string>();
   // Seeded from the previous heartbeat so a restart does not rotate every codex and kimi login again at once.
-  if (!hooks.noHeartbeat) {
+  // With the credential store the heartbeat arrives with the first pull, so the seed runs then.
+  async function seedFromHeartbeat(): Promise<void> {
+    if (hooks.noHeartbeat) return;
     const prior = await readHeartbeat();
     for (const [k, v] of Object.entries(prior?.held ?? {})) {
       const seeded = v.lastSuccessAt && v.lastSuccessAt > now().toISOString() ? now().toISOString() : v.lastSuccessAt;
       if (seeded && !(lastSuccessAt.get(k) && lastSuccessAt.get(k)! >= seeded)) lastSuccessAt.set(k, seeded);
     }
   }
+  if (!mirror) await seedFromHeartbeat();
   let keepAliveRunning = false;
   let keepAliveRun: Promise<void> | undefined;
   const aliAbort = new AbortController();
@@ -593,9 +718,13 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   const selfTestEnabled = !hooks.noHeartbeat || hooks.aliSetup !== undefined;
   if (!selfTestEnabled) aliSetupOk = true;
   // Tests (noHeartbeat) never touch the real registry or auth browser unless they inject an ali source.
-  const aliList = hooks.aliAccounts ?? (hooks.noHeartbeat ? undefined : listAliAccounts);
+  // With the credential store the ali console session is not renewed here (its browser profile lives on the host): the host
+  // and the console keep renewing it, and the heartbeat never claims it.
+  const aliList = hooks.aliAccounts ?? (hooks.noHeartbeat || pgCreds ? undefined : listAliAccounts);
   const keepAliveTimer = setInterval(() => {
     if (keepAliveRunning || draining || !warmed) return;
+    // Several replicas: only the leader runs the idle pass and writes the heartbeat (on-demand refreshes run everywhere).
+    if (leader && !leader.isLeader()) return;
     keepAliveRunning = true;
     keepAliveRun = keepAliveOnce({
       refresh: refreshLogin,
@@ -604,6 +733,7 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       lastSuccess: lastSuccessAt,
       now,
       mintedAt: grantMintedAt,
+      shouldStop: () => draining,
       // The heartbeat also names the ali logins this gateway renews, so the host timer, the daemon and the CLI stand down.
       onPass: hooks.noHeartbeat
         ? undefined
@@ -650,6 +780,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       clearInterval(alertTimer);
       clearInterval(keepAliveTimer);
       clearInterval(pruneTimer);
+      clearInterval(pingTimer);
+      if (importTimer) clearInterval(importTimer);
       store.stop();
       // Bun's stop(false) refuses new connections and resolves once active requests are done.
       await Promise.all([server.stop(false), adminServer.stop(false), connectProxy?.stop(false)]);
@@ -658,7 +790,16 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
       aliAbort.abort();
       await Promise.allSettled([...inflightRefreshes]);
       await Promise.race([Promise.allSettled([keepAliveRun]), new Promise<void>((r) => setTimeout(r, hooks.stopCeilingMs ?? 10_000).unref?.())]);
+      // A keep-alive account that was already past its stop check may have started a refresh meanwhile: wait for it too.
+      await Promise.allSettled([...inflightRefreshes]);
       await ledger.close();
+      await relay?.stop().catch(() => undefined);
+      await mirror?.stop().catch(() => undefined);
+      await leader?.stop().catch(() => undefined);
+      if (mirror) setLocalWriteHook(undefined);
+      // Last pushes (a heartbeat written during the pass) need the store open until here.
+      await homeStore?.close().catch(() => undefined);
+      await pingSql?.close().catch(() => undefined);
       await inner.close?.();
       await refreshBackend.close?.();
     })();
@@ -708,6 +849,6 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     port: server.port as number,
     adminPort: adminServer.port as number,
     ...(connectProxy ? { connectPort: connectProxy.port } : {}),
-    ready: () => warmed && !draining,
+    ready: () => warmed && !draining && dbOk(),
   };
 }

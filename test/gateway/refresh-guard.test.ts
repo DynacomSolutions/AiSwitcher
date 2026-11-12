@@ -437,4 +437,35 @@ describe("refresh guard", () => {
     expect(backend.entries.some((e) => e.oldFp === "ancient")).toBe(false);
     expect(backend.entries.some((e) => e.oldFp === "openfp")).toBe(true);
   });
+
+  test("with a shared credential store, a lock backend failure refuses the refresh instead of running without the lock", async () => {
+    const w = world();
+    const backend: RefreshGuardBackend = { acquire: async () => Promise.reject(new Error("connection refused")) };
+    const degraded: string[] = [];
+    const metrics = metricsOf();
+    const sync = { run: <T,>(_a: unknown, fn: () => Promise<T>) => fn(), pull: async () => {}, push: async () => {} };
+    const guard = guardRefresh(w.refresh, { backend, metrics, readGrant: w.read, sync, onDegraded: (_a, why) => void degraded.push(why) });
+    await expect(guard("claude", ID, { force: true })).rejects.toBeInstanceOf(RefreshGuardRetryable);
+    expect(w.posts).toBe(0);
+    expect(degraded).toHaveLength(1);
+    expect(metrics.render()).toContain('ais_gateway_refresh_failures_total{provider="claude",identity="acct1"} 1');
+    // Without the store the old behaviour stays: the refresh goes ahead on the file lock.
+    const plain = guardRefresh(w.refresh, { backend, metrics: metricsOf(), readGrant: w.read });
+    expect((await plain("claude", ID, { force: true })).outcome).toBe("refreshed");
+  });
+
+  test("a store write that keeps failing after a refresh calls onStoreWriteFailed", async () => {
+    const w = world();
+    const failed: string[] = [];
+    const sync = {
+      run: <T,>(_a: unknown, fn: () => Promise<T>) => fn(),
+      pull: async () => {},
+      push: async () => {
+        throw new Error("down");
+      },
+    };
+    const guard = guardRefresh(w.refresh, { backend: new MemoryRefreshBackend(), metrics: metricsOf(), readGrant: w.read, sync, warn: () => {}, onStoreWriteFailed: (a) => void failed.push(`${a.provider}/${a.identity}`) });
+    expect((await guard("claude", ID, { force: true })).outcome).toBe("refreshed");
+    expect(failed).toEqual(["claude/acct1"]);
+  });
 });
