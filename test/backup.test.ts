@@ -346,6 +346,25 @@ describe("runBackup integration", () => {
     expect(await gitLs(repoDir)).not.toContain(".codex/x.lock");
   });
 
+  test("thousands of newly excluded files leave the index quickly; glob characters are literal", async () => {
+    const home = await makeHome();
+    await write(join(home, ".codex", "a.txt"), "a\n");
+    await write(join(home, ".codex", "keep[1]*.txt"), "k\n");
+    const locks = Array.from({ length: 4000 }, (_, i) => `.codex/s/${i} [x]*.lock`);
+    await Promise.all(locks.map((path) => write(join(home, path), "l\n")));
+    const repoDir = await runBackup(["codex"], home);
+    const git = ["git", `--git-dir=${join(repoDir, ".git")}`, `--work-tree=${home}`];
+    await Bun.spawn([...git, "add", "-f", ".codex/s"]).exited;
+    const indexed = async () => (await gitOut(repoDir, ["ls-files", "-z"])).split("\0").filter(Boolean);
+    expect((await indexed()).filter((p) => p.endsWith(".lock"))).toHaveLength(4000);
+    await write(join(home, ".codex", "a.txt"), "b\n");
+    const started = Date.now();
+    await runBackup(["codex"], home);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect((await indexed()).filter((p) => p.endsWith(".lock"))).toEqual([]);
+    expect(await gitLs(repoDir)).toContain(".codex/keep[1]*.txt");
+  }, 60_000);
+
   test("core.bare is set so plain git in the backups dir does not show deletions", async () => {
     const home = await makeHome();
     await write(join(home, ".codex", "a.txt"), "a\n");
