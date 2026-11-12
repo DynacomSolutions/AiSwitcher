@@ -78,7 +78,7 @@ export async function loadGatewayUsage(days: number, deps: LoadGatewayUsageDeps 
   try {
     const res = await doFetch(`${url.replace(/\/+$/, "")}/usage?days=${encodeURIComponent(String(days))}`, {
       headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(deps.timeoutMs ?? 5000),
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 15_000),
     });
     if (!res.ok) return { configured: true, rows: [], error: `admin answered ${res.status}` };
     return { configured: true, rows: mapGatewayUsage(await res.json()) };
@@ -127,7 +127,7 @@ export async function loadGatewayIdentityUsage(since: Date, deps: LoadGatewayUsa
   try {
     const res = await doFetch(`${url.replace(/\/+$/, "")}/usage/identities?since=${encodeURIComponent(since.toISOString())}`, {
       headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(deps.timeoutMs ?? 5000),
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 15_000),
     });
     if (!res.ok) return { configured: true, rows: [], error: res.status === 404 ? "gateway admin has no per-identity usage yet (older version)" : `admin answered ${res.status}` };
     return { configured: true, rows: mapGatewayIdentityUsage(await res.json()) };

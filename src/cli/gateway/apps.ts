@@ -203,6 +203,40 @@ function appName(positionals: string[]): string {
   return name;
 }
 
+/**
+ * `ais gateway app rotate`: mints a new token and delivers it (kube Secret, ~/.secrets, registered Codex homes, the
+ * one printed copy). The console's rotate action calls this same function, so both update the same places.
+ * Returns the minted token so a caller that captures `deps.out` can still hand it over when delivery throws.
+ */
+export async function rotateApp(admin: Admin, deps: GatewayCliDeps, flags: Flags, name: string): Promise<{ token: string; url: string; previousTokensExpireAt: string }> {
+  const { json: cur } = await admin.call("GET", `/apps/${name}`);
+  const url = await proxyUrl(deps, flags, name);
+  const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
+  const token = mintedToken(minted.json);
+  const previousTokensExpireAt = str(minted.json.previousTokensExpireAt);
+  try {
+    await deliverToken(deps, name, str(cur.namespace), url, token);
+  } catch (e) {
+    throw new RotateDeliveryError(e instanceof Error ? e.message : String(e), { token, url, previousTokensExpireAt });
+  }
+  deps.out("previous tokens keep working until " + previousTokensExpireAt);
+  return { token, url, previousTokensExpireAt };
+}
+
+/** The token was minted but at least one delivery step failed; `minted` carries it (message is already redacted). */
+export class RotateDeliveryError extends Error {
+  // Private, so printing the error object (Bun shows own enumerable fields) can never show the token.
+  readonly #minted: { token: string; url: string; previousTokensExpireAt: string };
+  constructor(message: string, minted: { token: string; url: string; previousTokensExpireAt: string }) {
+    super(message);
+    this.name = "RotateDeliveryError";
+    this.#minted = minted;
+  }
+  get minted(): { token: string; url: string; previousTokensExpireAt: string } {
+    return this.#minted;
+  }
+}
+
 export async function runAppCommand(action: string | undefined, positionals: string[], flags: Flags, deps: GatewayCliDeps): Promise<void> {
   const { admin } = await connect(deps);
   switch (action) {
@@ -249,12 +283,7 @@ export async function runAppCommand(action: string | undefined, positionals: str
       return;
     }
     case "rotate": {
-      const name = appName(positionals);
-      const { json: cur } = await admin.call("GET", `/apps/${name}`);
-      const url = await proxyUrl(deps, flags, name);
-      const minted = await admin.call("POST", `/apps/${name}/tokens`, {});
-      await deliverToken(deps, name, str(cur.namespace), url, mintedToken(minted.json));
-      deps.out("previous tokens keep working until " + str(minted.json.previousTokensExpireAt));
+      await rotateApp(admin, deps, flags, appName(positionals));
       return;
     }
     case "revoke": {

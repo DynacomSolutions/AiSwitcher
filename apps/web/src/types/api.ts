@@ -212,10 +212,38 @@ export interface OverageInfo {
 /** A manually-spendable reset the provider grants the account (e.g. codex's
  * "Full reset (Weekly + 5 hr)"). Present only when at least one is usable
  * right now. */
+export type ResetGrantKind = "full" | "fable" | "other";
+
+export interface ResetGrant {
+  id: string;
+  label?: string;
+  kind: ResetGrantKind;
+  resetsLeft: number;
+  usableNow: boolean;
+  paused: boolean;
+  endsAt?: string;
+}
+
 export interface ManualResetInfo {
   availableCount: number;
   label?: string;
   expiresAt?: string;
+  /** Claude: every reset grant, usable or not (full and Fable-only). */
+  grants?: ResetGrant[];
+  cooldownUntil?: string;
+  /** When the provider last reported the grant list. */
+  grantsCapturedAt?: string;
+  /** Carried over from an earlier read: the latest read did not include the grants. */
+  stale?: boolean;
+}
+
+export interface UseResetResult {
+  identity: string;
+  grantId: string;
+  result: string;
+  resetsLeft?: number;
+  cleared: string[];
+  cooldownUntil?: string;
 }
 
 export type LimitFetchStatus = "live" | "cached" | "unavailable" | "pending";
@@ -318,6 +346,56 @@ export interface GatewayUsageResponse {
   configured: boolean;
   rows: GatewayAppUsage[];
   error?: string;
+}
+
+/* Gateway apps (GET /api/gateway/apps) */
+
+export interface GatewayAppTokenDto {
+  prefix: string;
+  createdAt: string;
+  expiresAt?: string;
+}
+
+export interface GatewayAppDto {
+  name: string;
+  owner: string;
+  namespace: string;
+  provider: string;
+  style: string;
+  target: { kind: "pin"; identity: string } | { kind: "pool"; identities?: string[] };
+  models?: string[];
+  dailyTokens?: number;
+  reservePercent?: number;
+  effectiveReservePercent: number;
+  state: "active" | "revoked";
+  createdAt?: string;
+  lastUsedAt?: string;
+  tokens: GatewayAppTokenDto[];
+  usage1d: number | null;
+  usage7d: number | null;
+}
+
+export interface GatewayAppsResponse {
+  configured: boolean;
+  apps: GatewayAppDto[];
+  defaultReservePercent: number;
+  error?: string;
+  usageError?: string;
+}
+
+export interface GatewayAppPatch {
+  reservePercent?: number | null;
+  models?: string[] | null;
+  dailyTokens?: number | null;
+}
+
+export interface GatewayRotateResult {
+  app: string;
+  token: string;
+  url: string;
+  previousTokensExpireAt: string;
+  messages: string[];
+  deliveryError?: string;
 }
 
 /* AIS Browser */

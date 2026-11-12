@@ -201,7 +201,9 @@ export function createAdminApp(deps: AdminDeps): Hono {
     if (providerFilter !== undefined && !PROVIDERS.includes(providerFilter as GatewayProvider)) return err(400, "unknown provider");
     const since = new Date(deps.now().getTime() - days * 86400_000);
     const apps = (await store.listApps()).filter((a) => (appFilter === undefined || a.name === appFilter) && (providerFilter === undefined || a.provider === providerFilter));
-    const usage = await Promise.all(apps.map(async (a) => ({ app: a.name, provider: a.provider, days, tokens: await store.usageSince(a.name, since) })));
+    // One grouped ledger read for every app (was one SUM per app in parallel, which took seconds with ~60 apps).
+    const totals = await store.usageTotalsSince(since);
+    const usage = apps.map((a) => ({ app: a.name, provider: a.provider, days, tokens: totals.get(a.name) ?? 0 }));
     return c.json({ usage });
   });
 

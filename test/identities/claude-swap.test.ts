@@ -563,17 +563,19 @@ describe("usage api", () => {
     };
     const block = (g: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({ eligible: true, grants: [{ ...grant, ...g }], ...extra });
 
-    test("maps usable grants only", () => {
-      expect(manualResetFromCedarEmber(block({}), NOW)).toBeUndefined();
+    test("keeps every grant but counts only usable ones", () => {
+      const used = manualResetFromCedarEmber(block({}), NOW);
+      expect(used).toMatchObject({ availableCount: 0, grants: [{ id: grant.id, resetsLeft: 0, usableNow: false }] });
       const one = manualResetFromCedarEmber(block({ resets_left: 1 }), NOW);
-      expect(one).toMatchObject({ availableCount: 1, label: grant.label });
+      expect(one).toMatchObject({ availableCount: 1, label: grant.label, grants: [{ usableNow: true }] });
       expect(one?.expiresAt).toBeTruthy();
-      expect(manualResetFromCedarEmber(block({ resets_left: 1 }, { eligible: false }), NOW)).toBeUndefined();
-      expect(manualResetFromCedarEmber(block({ resets_left: 1, paused: true }), NOW)).toBeUndefined();
-      expect(manualResetFromCedarEmber(block({ resets_left: 1, ends_at: "2026-10-01T00:00:00Z" }), NOW)).toBeUndefined();
-      for (const junk of [undefined, null, "x", {}, { eligible: true, grants: "x" }, { eligible: true, grants: [null, { resets_left: "x" }] }]) {
+      expect(manualResetFromCedarEmber(block({ resets_left: 1 }, { eligible: false }), NOW)?.availableCount).toBe(0);
+      expect(manualResetFromCedarEmber(block({ resets_left: 1, paused: true }), NOW)).toMatchObject({ availableCount: 0, grants: [{ paused: true, usableNow: false }] });
+      expect(manualResetFromCedarEmber(block({ resets_left: 1, ends_at: "2026-10-01T00:00:00Z" }), NOW)?.availableCount).toBe(0);
+      for (const junk of [undefined, null, "x", {}, { eligible: true, grants: "x" }]) {
         expect(manualResetFromCedarEmber(junk, NOW)).toBeUndefined();
       }
+      expect(manualResetFromCedarEmber({ eligible: true, grants: [null, { resets_left: "x" }] }, NOW)).toMatchObject({ availableCount: 0, grants: [] });
     });
 
     test("fetchMemberResets sends the claude-cli user agent and never throws", async () => {
