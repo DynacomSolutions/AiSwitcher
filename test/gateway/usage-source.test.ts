@@ -197,3 +197,24 @@ describe("pool selection details", () => {
     expect(r).toEqual({ identity: "work" });
   });
 });
+
+describe("refreshNow (after a quota answer)", () => {
+  test("reads the source with `fresh`, once for concurrent calls, after a plain read already in flight", async () => {
+    const calls: Array<boolean | undefined> = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const src = createUsageSource({
+      fetchUsage: async (_p, _i, opts) => {
+        calls.push(opts?.fresh);
+        if (!opts?.fresh) await gate;
+        return live(opts?.fresh ? 77 : 10);
+      },
+    });
+    void src.get("claude", "id1"); // a plain read that may predate the quota answer
+    const both = Promise.all([src.refreshNow("claude", "id1"), src.refreshNow("claude", "id1")]);
+    release();
+    await both;
+    expect(calls).toEqual([undefined, true]);
+    expect((await src.get("claude", "id1"))?.maxUtilization).toBe(77);
+  });
+});

@@ -253,7 +253,7 @@ function earliestPoolReset<U extends PoolUsage>(
     const member = members.find((entry) => entry.name === name);
     const usage = rows.find((row) => row.name === name)?.usage;
     if (!member || usage?.status !== "live") return undefined;
-    const windows = usage.windows ?? [];
+    const windows = accountWindows(usage);
     if (!windows.length) return undefined;
     let latestReset = now;
     let exhausted = false;
@@ -272,8 +272,13 @@ function earliestPoolReset<U extends PoolUsage>(
   return memberResets.some((reset) => reset === undefined) ? Math.min(earliestKnown, now + 30_000) : earliestKnown;
 }
 
+/** The account-wide windows: a per-model window (e.g. Fable weekly) never makes the whole member exhausted. */
+function accountWindows(usage: PoolUsage): NonNullable<PoolUsage["windows"]> {
+  return (usage.windows ?? []).filter((window) => window.model === undefined);
+}
+
 function knownResetOrCooldown(usage: PoolUsage, now: number, cooldownMs: number): number {
-  const windows = usage.windows ?? [];
+  const windows = accountWindows(usage);
   const exhausted = windows.filter((window) => window.utilization >= 100);
   const resets = exhausted.map((window) => typeof window.resetsAt === "string" ? Date.parse(window.resetsAt) : Number.NaN)
     .filter((value) => Number.isFinite(value) && value > now);
@@ -281,7 +286,7 @@ function knownResetOrCooldown(usage: PoolUsage, now: number, cooldownMs: number)
 }
 
 function exhaustedResetAt(usage: PoolUsage, now: number): number | undefined {
-  const exhausted = (usage.windows ?? []).filter((window) => window.utilization >= 100);
+  const exhausted = accountWindows(usage).filter((window) => window.utilization >= 100);
   if (!exhausted.length) return undefined;
   const resets = exhausted.map((window) => typeof window.resetsAt === "string" ? Date.parse(window.resetsAt) : Number.NaN);
   if (resets.some((value) => !Number.isFinite(value) || value <= now)) return undefined;

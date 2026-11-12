@@ -21,6 +21,7 @@ export const claudeAdapter: PoolAdapter<MemberUsage> = {
       windows: [
         ...(usage.fiveHour ? [{ label: "five-hour", utilization: usage.fiveHour.utilization, ...(usage.fiveHour.resetsAt ? { resetsAt: usage.fiveHour.resetsAt } : {}) }] : []),
         ...(usage.sevenDay ? [{ label: "seven-day", utilization: usage.sevenDay.utilization, ...(usage.sevenDay.resetsAt ? { resetsAt: usage.sevenDay.resetsAt } : {}) }] : []),
+        ...(usage.scoped ?? []).map((w) => ({ label: `seven-day (${w.model})`, model: w.model, utilization: w.utilization, ...(w.resetsAt ? { resetsAt: w.resetsAt } : {}) })),
       ],
     }));
   },

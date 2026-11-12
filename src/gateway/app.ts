@@ -18,7 +18,7 @@ import { fallbackCount, Gate } from "./side-count.ts";
 import { ACCOUNT_BODY_LIMIT, forwardAccount, readCapped, newAccountState, type AccountState } from "./account.ts";
 import { poolModels } from "./models-union.ts";
 import { collapseSlashes, PIN_FORWARD, routeFor, serveRoute, sideDailyLimitFromEnv, type AccountOp, type ResetCreditsCache } from "./routes.ts";
-import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity } from "./select.ts";
+import { DEFAULT_RESERVE_PERCENT, memberUsages, pickIdentity, usageForModel, utilisationOf } from "./select.ts";
 import type { GatewayStore } from "./store.ts";
 import { verifyToken } from "./tokens.ts";
 import type { ApiStyle, GatewayApp, GatewayProvider, UsageRow } from "./types.ts";
@@ -30,6 +30,8 @@ export interface GatewayDeps {
   ledger: LedgerBuffer;
   creds: Pick<CredentialCache, "get" | "refreshAfter401"> & Partial<Pick<CredentialCache, "signature">>;
   usageFor(provider: GatewayProvider, identity: string): Promise<PoolUsage | undefined>;
+  /** Reads one member's usage from the source now and waits (single-flight); `usageFor` answers with it afterwards. */
+  refreshUsage?(provider: GatewayProvider, identity: string): Promise<void>;
   poolMembers(provider: GatewayProvider): Promise<string[]>;
   /** Resolves an alias to the identity's canonical name. Ledger rows, metrics and alerts use the canonical name. */
   canonical?(provider: GatewayProvider, identity: string): Promise<string>;
@@ -719,19 +721,43 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     const nowMs = deps.now().getTime();
     if (res.status === 429 && isModelScopedRejection(res.headers)) {
       // Only one model's own window is full (Anthropic's per-model weekly limits): the account still serves every other
-      // model, so it is held for this model only. Without a model to scope it to, it is a brief burst hold.
-      if (model !== undefined) exhausted.set(`${exKey(name)}${MODEL_HOLD_SEP}${model}`, exhaustedUntil(res.headers, nowMs));
+      // model, so it is held for this model only, until that window's own reset. Without a model to scope it to, it is a
+      // brief burst hold.
+      if (model !== undefined) bridgeUntilReading(name, `${exKey(name)}${MODEL_HOLD_SEP}${model}`, scopedResetUntil(res.headers, nowMs));
       else {
         exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
         holds.set(exKey(name), { kind: "burst", long: false });
+        void refreshFromSource(name);
       }
     } else if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
-      exhausted.set(exKey(name), exhaustedUntil(res.headers, nowMs));
       holds.delete(exKey(name));
+      bridgeUntilReading(name, exKey(name), exhaustedUntil(res.headers, nowMs));
     } else if (res.status === 429) {
+      // A burst 429 (no window rejected) is not about usage: its hold is the provider's retry-after. The source is still
+      // read again so the next pick sees current figures.
       exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
       holds.set(exKey(name), { kind: "burst", long: false });
+      void refreshFromSource(name);
     }
+  };
+  /** Reads the member's usage from the source now (single-flight per member), so the next pick decides on real data. */
+  const refreshFromSource = (name: string): Promise<void> =>
+    deps.refreshUsage ? deps.refreshUsage(app.provider, name).catch(() => undefined) : Promise.resolve();
+  /**
+   * A quota hold only bridges until the source has been read again: when the fresh reading (live, not stale) shows the
+   * windows that apply to this request's model below 100%, the hold ends; otherwise it stands until the provider's reset.
+   */
+  const bridgeUntilReading = (name: string, key: string, until: number): void => {
+    exhausted.set(key, until);
+    if (!deps.refreshUsage) return; // no source to read again: the provider's reset decides alone
+    const forModel = model;
+    void refreshFromSource(name).then(async () => {
+      if (exhausted.get(key) !== until) return; // a newer answer replaced this hold
+      const reading = await deps.usageFor(app.provider, name).catch(() => undefined);
+      if (!reading || reading.stale || reading.status !== "live") return;
+      const util = utilisationOf(usageForModel(reading, forModel));
+      if (util !== undefined && util < 100 && exhausted.get(key) === until) exhausted.delete(key);
+    });
   };
   // While the pool still has headroom and only short holds (burst 429s, brief credential retries) stand in the way,
   // the gateway waits for the first hold to end instead of answering 429: a client CLI treats a 429 as a hard limit.
@@ -747,14 +773,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (shortHeld.length === 0) return false;
     // Only worth waiting when some member would be picked once the short holds are gone.
     const quotaOut = new Set([...held].filter((n) => !shortHeld.includes(n)));
-    if (!("identity" in (await pickIdentity(app, deps, quotaOut)))) return false;
+    if (!("identity" in (await pickIdentity(app, deps, quotaOut, model)))) return false;
     const soonest = Math.min(...shortHeld.map((n) => exhausted.get(exKey(n)) ?? now));
     waits++;
     await (deps.sleep ?? defaultSleep)(Math.min(Math.max(soonest - now, SHORT_HOLD_MIN_SLEEP_MS), left), req.signal);
     return !req.signal.aborted;
   };
-  let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined);
-  while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames());
+  let picked = await pickIdentity(app, deps, app.target.kind === "pool" ? await exhaustedNames() : undefined, model);
+  while ("reject" in picked && picked.reject === "no-headroom" && (await waitForShortHold())) picked = await pickIdentity(app, deps, await exhaustedNames(), model);
   const pick = picked;
   if ("reject" in pick) {
     deps.metrics.rejection(app.name, pick.reject === "reserve" ? "reserve" : pick.reject === "no-identities" ? "no_identities" : "no_headroom");
@@ -765,12 +791,12 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
     if (pick.reject === "no-headroom" && app.target.kind === "pool") {
       // Only the short holds are ignored: members out for proven quota exhaustion stay excluded.
       const quotaOut = new Set([...(await exhaustedNames())].filter((n) => !holds.has(exKey(n))));
-      let free = await pickIdentity(app, deps, quotaOut);
+      let free = await pickIdentity(app, deps, quotaOut, model);
       let h = "identity" in free ? holds.get(exKey(free.identity)) : undefined;
       if (h?.kind === "cred") {
         // A burst-held member frees sooner than a credential-held one, so it decides the answer.
         const noCred = new Set([...quotaOut, ...[...holds].filter(([k, v]) => v.kind === "cred" && k.startsWith(exKey(""))).map(([k]) => k.slice(exKey("").length))]);
-        const alt = await pickIdentity(app, deps, noCred);
+        const alt = await pickIdentity(app, deps, noCred, model);
         if ("identity" in alt && holds.get(exKey(alt.identity))?.kind === "burst") {
           free = alt;
           h = holds.get(exKey(alt.identity));
@@ -789,7 +815,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       }
     }
     if (pick.reject !== "no-identities") {
-      const native = nativeLimitResponse(app.provider, await memberUsages(app, deps), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now());
+      const native = nativeLimitResponse(app.provider, await memberUsages(app, deps, model), app.reservePercent ?? DEFAULT_RESERVE_PERCENT, deps.now());
       if (native) {
         record(identityForRow, "rejected", 429, undefined, false, undefined, model, reason);
         return native;
@@ -896,7 +922,7 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
       let name = pick.identity;
       while (quota || !cur) {
         tried.add(name);
-        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]));
+        const next = await pickIdentity(app, deps, new Set([...(await exhaustedNames()), ...tried]), model);
         if (!("identity" in next)) {
           // Everyone left is only briefly held: wait for the first to free, then try the pool again from the top.
           if (quota && cur && !provesSubscriptionExhaustion(cur.headers) && (await waitForShortHold())) {
@@ -1091,6 +1117,23 @@ export function burstHoldUntil(headers: Headers, nowMs: number): number {
     else if (Number.isFinite(Date.parse(retry))) ms = Math.max(0, Date.parse(retry) - nowMs);
   }
   return nowMs + Math.min(ms, BURST_HOLD_MAX_MS);
+}
+
+/**
+ * Epoch ms until which a member stays held for one model after a model-scoped 429: the rejected scoped window's own
+ * reset header (for example `anthropic-ratelimit-unified-7d_oi-reset`), else the general reset (exhaustedUntil).
+ */
+export function scopedResetUntil(headers: Headers, nowMs: number): number {
+  const resets: number[] = [];
+  for (const [k, v] of headers) {
+    const m = SCOPED_WINDOW_STATUS.exec(k);
+    if (!m || v.trim().toLowerCase() !== "rejected") continue;
+    const raw = headers.get(`anthropic-ratelimit-unified-${m[1]}-reset`) ?? "";
+    const n = Number(raw);
+    const at = raw.trim() !== "" && Number.isFinite(n) && n > 0 ? (n < 1e11 ? n * 1000 : n) : Date.parse(raw);
+    if (Number.isFinite(at) && at > nowMs && at <= nowMs + EXHAUSTED_MAX_MS) resets.push(at);
+  }
+  return resets.length > 0 ? Math.max(...resets) : exhaustedUntil(headers, nowMs);
 }
 
 const EXHAUSTED_DEFAULT_MS = 5 * 60_000;

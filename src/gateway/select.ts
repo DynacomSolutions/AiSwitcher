@@ -13,6 +13,26 @@ async function usageOf(deps: Pick<GatewayDeps, "usageFor">, app: GatewayApp, ide
   }
 }
 
+function normalisedModel(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** True when a scoped window's model (a display name such as "Fable") names the request model id (e.g. "claude-fable-5-2"). */
+export function scopedModelMatches(windowModel: string, requestModel: string | undefined): boolean {
+  if (requestModel === undefined) return false;
+  const needle = normalisedModel(windowModel);
+  return needle !== "" && normalisedModel(requestModel).includes(needle);
+}
+
+/**
+ * The reading as it applies to one request: per-model windows (a Fable weekly, say) are kept only when the request
+ * model is that model, so a full Fable window never blocks Opus. Without a request model every per-model window goes.
+ */
+export function usageForModel(usage: PoolUsage | undefined, model: string | undefined): PoolUsage | undefined {
+  if (!usage?.windows?.some((w) => w.model !== undefined)) return usage;
+  return { ...usage, windows: usage.windows.filter((w) => w.model === undefined || scopedModelMatches(w.model, model)) };
+}
+
 /**
  * The worst window percent, or undefined when the reading carries no number.
  * A status alone never counts: for claude "rate-limited" means the usage
@@ -47,30 +67,35 @@ export async function allowedMembers(app: GatewayApp, deps: Pick<GatewayDeps, "p
   return names;
 }
 
-/** The usage readings of the members an app may use, for the native limit answer (reset times). */
-export async function memberUsages(app: GatewayApp, deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">): Promise<Array<PoolUsage | undefined>> {
+/** The usage readings of the members an app may use, for the native limit answer (reset times), as they apply to `model`. */
+export async function memberUsages(
+  app: GatewayApp,
+  deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
+  model?: string,
+): Promise<Array<PoolUsage | undefined>> {
   let names: string[];
   try {
     names = await allowedMembers(app, deps);
   } catch {
     return [];
   }
-  return Promise.all(names.map((n) => usageOf(deps, app, n)));
+  return Promise.all(names.map(async (n) => usageForModel(await usageOf(deps, app, n), model)));
 }
 
 /**
  * Pinned: the identity, unless its worst window is at or over the reserve.
  * Pool: the member with the lowest utilisation below the reserve; members with
- * no usage figure are allowed after those with one.
+ * no usage figure are allowed after those with one. A per-model window counts only for a request for that model.
  */
 export async function pickIdentity(
   app: GatewayApp,
   deps: Pick<GatewayDeps, "usageFor" | "poolMembers" | "canonical">,
   exclude?: string | ReadonlySet<string>,
+  model?: string,
 ): Promise<{ identity: string } | { reject: "reserve" | "no-headroom" | "no-identities" }> {
   const reserve = app.reservePercent ?? DEFAULT_RESERVE_PERCENT;
   if (app.target.kind === "pin") {
-    const util = reserveUtilisationOf(await usageOf(deps, app, app.target.identity));
+    const util = reserveUtilisationOf(usageForModel(await usageOf(deps, app, app.target.identity), model));
     if (util !== undefined && util >= reserve) return { reject: "reserve" };
     return { identity: app.target.identity };
   }
@@ -81,7 +106,7 @@ export async function pickIdentity(
   if (skip && skip.size > 0) names = names.filter((n) => !skip.has(n));
   const rows = await Promise.all(
     names.map(async (name) => {
-      const usage = await usageOf(deps, app, name);
+      const usage = usageForModel(await usageOf(deps, app, name), model);
       const util = reserveUtilisationOf(usage);
       return { name, usage: util === undefined ? undefined : ({ status: "live", maxUtilization: util, capturedAt: "", ...(usage?.extraUsage ? { extraUsage: usage.extraUsage } : {}) } as PoolUsage) };
     }),

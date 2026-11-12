@@ -22,6 +22,8 @@ export interface LimitWindow {
   resetsAtMs?: number;
   /** Extra free-text status, e.g. "credits depleted". */
   note?: string;
+  /** A weekly window scoped to one model (claude `weekly_scoped`): the model's display name, e.g. "Fable". */
+  model?: string;
 }
 
 /** "pending" is a display-only state a fetch result never actually settles

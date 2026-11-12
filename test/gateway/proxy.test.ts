@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { createGatewayApp, isModelScopedRejection, type GatewayDeps } from "../../src/gateway/app.ts";
+import { createGatewayApp, isModelScopedRejection, scopedResetUntil, type GatewayDeps } from "../../src/gateway/app.ts";
 import { extractToken } from "../../src/gateway/auth.ts";
 import { checkCaps, dayStartIct } from "../../src/gateway/caps.ts";
 import { GatewayCredentialError, RefreshCooldownError } from "../../src/gateway/credentials.ts";
@@ -652,6 +652,101 @@ describe("failover and refresh", () => {
     current = "claude-opus-test";
     expect((await callBody(JSON.stringify({ model: "claude-opus-test", max_tokens: 1, messages: [] }))).status).toBe(200);
     expect(who()).toEqual(["Bearer tok-a"]); // other models still use it
+  });
+
+  /** A reading with a Fable weekly window, as the claude adapter gives it. */
+  const fableReading = (sevenDay: number, fable: number, extra: Partial<PoolUsage> = {}): PoolUsage => ({
+    ...live(sevenDay),
+    windows: [
+      { label: "seven-day", utilization: sevenDay },
+      { label: "seven-day (Fable)", model: "Fable", utilization: fable },
+    ],
+    ...extra,
+  });
+  const fableHeaders = (resetAt: number) => ({
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-reset": String(resetAt),
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+    "anthropic-ratelimit-unified-7d_oi-reset": String(resetAt),
+  });
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+
+  // Incident 12 Nov 2026: a big Fable request went to the member at 100% Fable while another had Fable headroom.
+  test("a streamed Fable request goes straight to the member whose source reading has Fable headroom", async () => {
+    const { who } = await burstSetup("pair");
+    usage.a = fableReading(10, 100); // lowest 7d, Fable full
+    usage.b = fableReading(40, 20);
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "pool4", target: { kind: "pool" } }));
+    const send = async (model: string) => {
+      const body = JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "x".repeat(9 * 1024 * 1024) }] });
+      const r = await gw.request("http://gw.test/pool4/v1/messages", { method: "POST", body, headers: { authorization: `Bearer ${t}`, "content-length": String(body.length) } });
+      return new Response(await r.arrayBuffer(), { status: r.status });
+    };
+    handler = () => new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    expect((await send("claude-fable-5-2")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    expect((await send("claude-opus-5-5")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a"]); // a full Fable week never blocks Opus
+  });
+
+  test("a quota 429 reads the member from the source at once; a fresh reading with headroom for the model ends the hold", async () => {
+    const { clock, who } = await burstSetup("pair");
+    const refreshed: string[] = [];
+    let next: PoolUsage = fableReading(10, 15); // below b (20%) for Fable too
+    deps.refreshUsage = async (_p, id) => {
+      refreshed.push(id);
+      usage[id] = next;
+    };
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "pool5", target: { kind: "pool" } }));
+    const send = async (model: string) => {
+      const r = await gw.request("http://gw.test/pool5/v1/messages", { method: "POST", body: JSON.stringify({ model, max_tokens: 1, messages: [] }), headers: { authorization: `Bearer ${t}` } });
+      return new Response(await r.arrayBuffer(), { status: r.status });
+    };
+    const resetAt = Math.floor((clock.ms + 6 * 86_400_000) / 1000);
+    let full = true;
+    handler = (_req, s) =>
+      full && s.headers.get("authorization") === "Bearer tok-a"
+        ? new Response("{}", { status: 429, headers: fableHeaders(resetAt) })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    expect((await send("claude-fable-5-2")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    await settle();
+    expect(refreshed).toEqual(["a"]); // one fresh read, straight after the 429
+    // The source says a has Fable headroom (say a reset was spent): the hold is gone, a is picked again.
+    full = false;
+    seen.length = 0;
+    expect((await send("claude-fable-5-2")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a"]);
+
+    // A reading that could not be refreshed (stale) does not end the hold: the provider's own reset does.
+    full = true;
+    next = fableReading(10, 15, { stale: true });
+    seen.length = 0;
+    await send("claude-fable-5-2");
+    await settle();
+    full = false;
+    seen.length = 0;
+    clock.ms += 86_400_000;
+    usage.b = { ...live(20), stale: true }; // neither has a figure the pick ranks on: without the hold, a would go first
+    await send("claude-fable-5-2");
+    expect(who()).toEqual(["Bearer tok-b"]);
+    seen.length = 0;
+    clock.ms = resetAt * 1000 + 1;
+    usage.a = fableReading(10, 15); // a figure again, so only the hold could keep a out
+    await send("claude-fable-5-2");
+    expect(who()).toEqual(["Bearer tok-a"]);
+  });
+
+  test("scopedResetUntil: the rejected scoped window's own reset, else the general one", () => {
+    const now = NOW.getTime();
+    const own = Math.floor((now + 3 * 86_400_000) / 1000);
+    const general = Math.floor((now + 3_600_000) / 1000);
+    expect(scopedResetUntil(new Headers({ "anthropic-ratelimit-unified-reset": String(general), "anthropic-ratelimit-unified-7d_oi-status": "rejected", "anthropic-ratelimit-unified-7d_oi-reset": String(own) }), now)).toBe(own * 1000);
+    expect(scopedResetUntil(new Headers({ "anthropic-ratelimit-unified-reset": String(general), "anthropic-ratelimit-unified-7d_oi-status": "rejected" }), now)).toBe(general * 1000);
   });
 
   test("isModelScopedRejection: scoped window only, never when an account window is rejected", () => {
