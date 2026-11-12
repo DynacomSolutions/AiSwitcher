@@ -58,8 +58,10 @@ ais gateway usage [--app=billing] [--provider=claude] [--days=7] [--json]
 ## Caps and reserve
 
 - `--daily-tokens=N` caps the app's tokens per day.
-- `--reserve=80` (1 to 100) is the share of an identity's limit that apps may use,
-  keeping the rest for people working in AIS directly.
+- `--reserve=N` (1 to 100, default 100) is the share of an identity's limit that apps
+  may use, keeping the rest for people working in AIS directly. The default is 100:
+  no app is refused before the provider itself says the account is full. Set a lower
+  value only for an app that must leave headroom for others.
 - `--models=id,id` restricts which models the app may request. Each entry is an
   exact model id, as the request body names it; globs and prefixes are not matched.
 

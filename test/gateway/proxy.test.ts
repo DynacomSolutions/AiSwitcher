@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PoolUsage } from "../../src/identities/pool/adapter.ts";
-import { createGatewayApp, type GatewayDeps } from "../../src/gateway/app.ts";
+import { createGatewayApp, isModelScopedRejection, type GatewayDeps } from "../../src/gateway/app.ts";
 import { extractToken } from "../../src/gateway/auth.ts";
 import { checkCaps, dayStartIct } from "../../src/gateway/caps.ts";
 import { GatewayCredentialError, RefreshCooldownError } from "../../src/gateway/credentials.ts";
@@ -402,8 +402,18 @@ describe("caps and selection", () => {
     expect((await call("/pin/v1/messages", t, { method: "POST", body: "{}" })).status).toBe(200);
   });
 
-  test("pool picks lowest utilisation below reserve", async () => {
+  test("the default reserve is 100: a member at 90% is still picked", async () => {
     const app = baseApp({ name: "pool", target: { kind: "pool" } });
+    usage.a = live(90);
+    usage.b = live(95);
+    expect(await pickIdentity(app, deps)).toEqual({ identity: "a" });
+    usage.a = live(100);
+    usage.b = live(100);
+    expect(await pickIdentity(app, deps)).toEqual({ reject: "no-headroom" });
+  });
+
+  test("pool picks lowest utilisation below reserve", async () => {
+    const app = baseApp({ name: "pool", target: { kind: "pool" }, reservePercent: 80 });
     usage.a = live(70);
     usage.b = live(20);
     expect(await pickIdentity(app, deps)).toEqual({ identity: "b" });
@@ -572,6 +582,55 @@ describe("failover and refresh", () => {
     clock.ms += 301_000;
     await call();
     expect(who()[0]).toBe("Bearer tok-a");
+  });
+
+  // Incident 12 Nov 2026: one Fable request on accounts at 100% of their Fable weekly (account weekly ~70%) held those
+  // accounts out of the whole pool until the Fable reset, for every model; the pool then ran dry and answered 429.
+  test("a model-scoped 429 (a Fable-only weekly limit) holds the member for that model only", async () => {
+    const { clock, who } = await burstSetup("pair");
+    const gw = createGatewayApp(deps);
+    const t = await addApp(baseApp({ name: "pool2", target: { kind: "pool" } }));
+    const callModel = async (model: string) => {
+      current = model;
+      const r = await gw.request("http://gw.test/pool2/v1/messages", { method: "POST", body: JSON.stringify({ model, max_tokens: 1, messages: [] }), headers: { authorization: `Bearer ${t}` } });
+      return new Response(await r.arrayBuffer(), { status: r.status });
+    };
+    let current = "";
+    const resetAt = Math.floor((clock.ms + 6 * 86_400_000) / 1000);
+    const fableFull = {
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-reset": String(resetAt),
+      "anthropic-ratelimit-unified-representative-claim": "seven_day_overage_included",
+      "anthropic-ratelimit-unified-7d-status": "allowed",
+      "anthropic-ratelimit-unified-7d-utilization": "0.7",
+      "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+      "anthropic-ratelimit-unified-7d_oi-reset": String(resetAt),
+    };
+    handler = (_req, s) =>
+      s.headers.get("authorization") === "Bearer tok-a" && current === "claude-fable-test"
+        ? new Response("{}", { status: 429, headers: fableFull })
+        : new Response(anthropicJson, { headers: { "content-type": "application/json" } });
+    // Fable on a (lowest usage): Fable-full, fails over to b.
+    expect((await callModel("claude-fable-test")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a", "Bearer tok-b"]);
+    // Opus still goes to a: the Fable limit does not touch it.
+    seen.length = 0;
+    clock.ms += 60_000;
+    expect((await callModel("claude-opus-test")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-a"]);
+    // Fable skips a straight away while its Fable hold lasts.
+    seen.length = 0;
+    expect((await callModel("claude-fable-test")).status).toBe(200);
+    expect(who()).toEqual(["Bearer tok-b"]);
+  });
+
+  test("isModelScopedRejection: scoped window only, never when an account window is rejected", () => {
+    const h = (o: Record<string, string>) => new Headers(o);
+    expect(isModelScopedRejection(h({ "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-7d-status": "allowed", "anthropic-ratelimit-unified-7d_oi-status": "rejected" }))).toBe(true);
+    expect(isModelScopedRejection(h({ "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-7d-status": "rejected", "anthropic-ratelimit-unified-7d_oi-status": "rejected" }))).toBe(false);
+    expect(isModelScopedRejection(h({ "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-5h-status": "rejected" }))).toBe(false);
+    expect(isModelScopedRejection(h({ "anthropic-ratelimit-unified-status": "rejected" }))).toBe(false);
+    expect(isModelScopedRejection(h({ "anthropic-ratelimit-unified-overage-status": "rejected", "anthropic-ratelimit-unified-status": "rejected" }))).toBe(false);
   });
 
   test("Codex usage_limit_reached 429 without headers counts as exhausted for five minutes", async () => {
@@ -1335,7 +1394,7 @@ describe("native limit answers", () => {
   });
 
   test("pool with every member over the reserve answers with the Anthropic limit shape and the earliest reset", async () => {
-    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" } }));
+    const t = await addApp(baseApp({ name: "pool", target: { kind: "pool" }, reservePercent: 80 }));
     usage.a = win(100, "2026-11-02T14:00:00.000Z");
     usage.b = win(90, "2026-11-02T12:30:00.000Z");
     const res = await call("/pool/v1/messages", t, { method: "POST", body: "{}" });

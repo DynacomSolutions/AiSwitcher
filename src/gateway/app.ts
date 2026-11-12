@@ -661,7 +661,14 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
         exhausted.delete(k);
         holds.delete(k);
       } else if (k.startsWith(`${app.provider}\u0000`)) {
-        const name = k.slice(app.provider.length + 1);
+        const rest = k.slice(app.provider.length + 1);
+        const scoped = rest.indexOf(MODEL_HOLD_SEP);
+        if (scoped >= 0) {
+          // A model-scoped hold (a Fable-only limit, say) keeps the member out for that model only.
+          if (model !== undefined && rest.slice(scoped + MODEL_HOLD_SEP.length) === model) out.add(rest.slice(0, scoped));
+          continue;
+        }
+        const name = rest;
         // A member held for a credential failure (short or long) is released as soon as its credential file changes:
         // a fresh login must not wait out the hold.
         const h = holds.get(k);
@@ -683,7 +690,15 @@ async function proxy(req: Request, deps: GatewayDeps, log: (line: string) => voi
   /** Hold a member after a quota-type answer: until reset when exhaustion is proven (or 402/403), else briefly. */
   const holdQuota = (name: string, res: Response): void => {
     const nowMs = deps.now().getTime();
-    if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
+    if (res.status === 429 && isModelScopedRejection(res.headers)) {
+      // Only one model's own window is full (Anthropic's per-model weekly limits): the account still serves every other
+      // model, so it is held for this model only. Without a model to scope it to, it is a brief burst hold.
+      if (model !== undefined) exhausted.set(`${exKey(name)}${MODEL_HOLD_SEP}${model}`, exhaustedUntil(res.headers, nowMs));
+      else {
+        exhausted.set(exKey(name), burstHoldUntil(res.headers, nowMs));
+        holds.set(exKey(name), { kind: "burst", long: false });
+      }
+    } else if (res.status === 402 || res.status === 403 || (res.status === 429 && provesSubscriptionExhaustion(res.headers))) {
       exhausted.set(exKey(name), exhaustedUntil(res.headers, nowMs));
       holds.delete(exKey(name));
     } else if (res.status === 429) {
@@ -1007,6 +1022,29 @@ export function provesSubscriptionExhaustion(headers: Headers): boolean {
   if (headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1") return true;
   for (const k of ["status", "5h-status", "7d-status"]) if (headers.get(`anthropic-ratelimit-unified-${k}`)?.trim().toLowerCase() === "rejected") return true;
   return false;
+}
+
+/** Separates a member from the model its hold is scoped to, inside an `exhausted` key. */
+const MODEL_HOLD_SEP = "\u0000model\u0000";
+const ACCOUNT_WINDOW_STATUS = /^anthropic-ratelimit-unified-(5h|7d)-status$/;
+const SCOPED_WINDOW_STATUS = /^anthropic-ratelimit-unified-([a-z0-9]+_[a-z0-9_]+)-status$/;
+
+/**
+ * True when a 429 rejects one model-scoped window only (for example `7d_oi`, a model's own weekly limit), while the
+ * account-wide 5h and 7d windows still allow: the account is out of that model, not out of capacity. Observed live:
+ * a Fable request on an account at 100% of its Fable weekly answered `7d-status: allowed`, `7d_oi-status: rejected`,
+ * `representative-claim: seven_day_overage_included`, and the same account served Opus normally.
+ */
+export function isModelScopedRejection(headers: Headers): boolean {
+  if (headers.get(SUBSCRIPTION_EXHAUSTED_HEADER) === "1") return false;
+  let scopedRejected = false;
+  for (const [k, v] of headers) {
+    const rejected = v.trim().toLowerCase() === "rejected";
+    if (!rejected) continue;
+    if (ACCOUNT_WINDOW_STATUS.test(k)) return false; // an account-wide window is full: the whole account is out
+    if (SCOPED_WINDOW_STATUS.test(k)) scopedRejected = true;
+  }
+  return scopedRejected;
 }
 
 /** Epoch ms until which a member that answered a burst 429 is held back: its retry-after (seconds or HTTP date), capped at 60 s, default 15 s. */
