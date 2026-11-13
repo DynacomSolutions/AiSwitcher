@@ -30,14 +30,22 @@ export interface MirrorOptions {
   /** True when HOME holds the host's real files (hostPath): write-back and import. */
   fileStore?: boolean;
   warn?: (message: string) => void;
+  /** Called with each row's outcome (host sync counts what it wrote and pushed). */
+  onOutcome?: (path: string, outcome: ReconcileOutcome) => void;
 }
+
+export type ReconcileOutcome = "same" | "wrote" | "pushed" | "kept" | "conflict";
 
 interface Base {
   version: number;
   sha: string;
 }
 
-/** Seconds of the latest expiry-like value in a credential file (any `*expir*`, `last_refresh`, a JWT's `exp`), or undefined. */
+/**
+ * Seconds of the latest expiry-like value in a credential file (any `*expir*`, `last_refresh`, a JWT's `exp`), or undefined.
+ * A refresh token's own expiry (`refreshTokenExpiresAt`, `refresh_token_expires_*`) is not the grant's age: Claude Code keeps
+ * it when it blanks a login after a failed refresh, so counting it made a logged-out file look fresher than a live grant.
+ */
 export function grantFreshness(text: string): number | undefined {
   let json: unknown;
   try {
@@ -63,6 +71,7 @@ export function grantFreshness(text: string): number | undefined {
   const walk = (v: unknown, depth: number): void => {
     if (depth > 6 || typeof v !== "object" || v === null) return;
     for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      if (/expir/i.test(k) && /refresh/i.test(k)) continue;
       if (/expir/i.test(k)) {
         if (typeof x === "number") take(toSeconds(x));
         else if (typeof x === "string") take(/^\d+$/.test(x) ? toSeconds(Number(x)) : Date.parse(x) / 1000);
@@ -155,6 +164,7 @@ export class HomeMirror {
   private pending = new Set<string>();
   private draining: Promise<void> | undefined;
   private readonly warn: (message: string) => void;
+  private readonly onOutcome: ((path: string, outcome: ReconcileOutcome) => void) | undefined;
   /** Time of the last full pass that reached the database (ms). */
   lastSyncAt = 0;
 
@@ -165,6 +175,7 @@ export class HomeMirror {
     this.home = opts.home ?? homedir();
     this.fileStore = opts.fileStore === true;
     this.warn = opts.warn ?? ((m) => console.warn(`gateway store: ${m}`));
+    this.onOutcome = opts.onOutcome;
   }
 
   /** HOME-relative form of an absolute path, or undefined outside HOME. */
@@ -197,7 +208,13 @@ export class HomeMirror {
   }
 
   /** Applies one row against the local file by the three-way rule. Returns what happened. */
-  private async reconcile(row: HomeFileRow): Promise<"same" | "wrote" | "pushed" | "kept" | "conflict"> {
+  private async reconcile(row: HomeFileRow): Promise<ReconcileOutcome> {
+    const outcome = await this.reconcileRow(row);
+    this.onOutcome?.(row.path, outcome);
+    return outcome;
+  }
+
+  private async reconcileRow(row: HomeFileRow): Promise<ReconcileOutcome> {
     const abs = this.abs(row.path);
     const local = await readLocal(abs);
     const base = this.bases.get(row.path);

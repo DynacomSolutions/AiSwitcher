@@ -140,7 +140,12 @@ src/
                           profile-sync-daemon.ts (`ais __profile_sync_daemon`: one
                           30 s scan per identity root for all sessions; watch.ts
                           holds the stat-walk); profile-sync-service.ts installs
-                          its user unit from `ais update` and install:shims
+                          its user unit from `ais update` and install:shims;
+                          store-sync-supervisor.ts keeps one `ais gateway store
+                          sync` child running under that daemon while the
+                          gateway's PostgreSQL credential store is configured
+                          (gateway/host-sync.ts writes gateway refreshes into the
+                          host login files and pushes new host logins)
    server/              the local console API behind `ais web` — thin HTTP wrappers around
                            the EXISTING engines (store/actions, limits fetchers, usage
                            aggregation, resume readers, zai/ali auth writers), no new

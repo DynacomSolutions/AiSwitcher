@@ -10,6 +10,7 @@ import { startBackgroundProfileSync } from "./background.ts";
 import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
 import { listLiveSessions, sessionRegistryDir, type IsRunning, type RegisteredSession } from "./session-registry.ts";
 import type { SyncRunOptions } from "./types.ts";
+import { createStoreSyncSupervisor, type StoreSyncSupervisor } from "./store-sync-supervisor.ts";
 import { POLL_MS, scanTree, snapshotsDiffer, type Snapshot } from "./watch.ts";
 
 /**
@@ -268,6 +269,11 @@ export interface RunDaemonOptions {
   /** Stops the loop (tests); SIGTERM/SIGINT do the same in production. */
   signal?: AbortSignal;
   deps?: DaemonDeps;
+  /**
+   * Supervisor of the host credential-store sync child (store-sync-supervisor.ts). Default: one is created when no `deps`
+   * are given (production); tests pass their own or `false`.
+   */
+  storeSync?: StoreSyncSupervisor | false;
 }
 
 /**
@@ -284,6 +290,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
   }
   const pollMs = options.pollMs ?? POLL_MS;
   const daemon = createProfileSyncDaemon(options.deps);
+  const storeSync = options.storeSync === false ? undefined : (options.storeSync ?? (options.deps ? undefined : createStoreSyncSupervisor()));
   let stopped = false;
   let wake: (() => void) | undefined;
   const onSignal = () => {
@@ -310,6 +317,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
         } catch { /* state dir unavailable right now: keep running, retry next poll */ }
       }
       try { await daemon.tick(); } catch { /* keep polling */ }
+      try { await storeSync?.tick(); } catch { /* retried next poll */ }
       if (stopped) break;
       await new Promise<void>((resolve) => {
         wake = resolve;
@@ -319,6 +327,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
     }
     return 0;
   } finally {
+    storeSync?.stop();
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
     options.signal?.removeEventListener("abort", onSignal);

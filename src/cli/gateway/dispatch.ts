@@ -117,10 +117,19 @@ export function replicaUrlFromEnv(env: Record<string, string | undefined>, admin
   return `http://${ip.includes(":") ? `[${ip}]` : ip}:${adminPort}`;
 }
 
-/** `ais gateway store import [--dry-run]`: copies this host's gateway login files into the PostgreSQL store (idempotent). */
+const STORE_USAGE = "Usage: ais gateway store import [--dry-run] | sync [--once] | setup --key-file=<path>  (database URL on stdin)";
+
+/**
+ * `ais gateway store import [--dry-run]`: copies this host's gateway login files into the PostgreSQL store (idempotent).
+ * `ais gateway store sync [--once]`: keeps this host's login files in step with the store (host-sync.ts).
+ * `ais gateway store setup --key-file=<path>`: records the store's database URL (stdin) and key in ~/.secrets for the sync.
+ */
 async function runStoreCommand(args: string[], flags: ParsedArgs["flags"], deps: GatewayCliDeps): Promise<void> {
   const [action, ...extra] = args;
-  if (action !== "import" || extra.length > 0) throw new CliUsageError("Usage: ais gateway store import [--dry-run]  (needs AIS_GATEWAY_DATABASE_URL and AIS_GATEWAY_STORE_KEY)");
+  if (extra.length > 0) throw new CliUsageError(STORE_USAGE);
+  if (action === "sync") return runStoreSync(boolFlag(flags, "once"), deps);
+  if (action === "setup") return runStoreSetup(stringFlag(flags, "key-file"), deps);
+  if (action !== "import") throw new CliUsageError(STORE_USAGE);
   const databaseUrl = process.env.AIS_GATEWAY_DATABASE_URL;
   if (!databaseUrl) throw new CliUsageError("AIS_GATEWAY_DATABASE_URL is required");
   const key = parseStoreKey(process.env[STORE_KEY_ENV]);
@@ -143,4 +152,69 @@ async function runStoreCommand(args: string[], flags: ParsedArgs["flags"], deps:
     await store.close().catch(() => undefined);
     await lock.close().catch(() => undefined);
   }
+}
+
+async function runStoreSync(once: boolean, deps: GatewayCliDeps): Promise<void> {
+  const { describeHostSync, hostStoreConfig, hostSyncLockPath, hostSyncOnce, startHostSync } = await import("../../gateway/host-sync.ts");
+  const cfg = await hostStoreConfig();
+  if (!cfg) throw new CliUsageError("No credential store configured on this host: run `ais gateway store setup --key-file=<path>` with the database URL on stdin (or set AIS_GATEWAY_STORE_DATABASE_URL and AIS_GATEWAY_STORE_KEY)");
+  if (once) {
+    deps.out(describeHostSync(await hostSyncOnce(cfg)));
+    return;
+  }
+  const { acquireDaemonLock, daemonLockState } = await import("../../sync/profile-sync-daemon.ts");
+  const lockPath = hostSyncLockPath();
+  if (!acquireDaemonLock(lockPath)) throw new CliUsageError("another `ais gateway store sync` is already running on this host");
+  const parent = process.ppid;
+  const sync = startHostSync(cfg);
+  let stop!: () => void;
+  const stopped = new Promise<void>((r) => (stop = r));
+  process.once("SIGTERM", () => stop());
+  process.once("SIGINT", () => stop());
+  // Supervised by the profile-sync daemon: when that daemon goes (restart after an update), this child goes too.
+  const watch = setInterval(() => {
+    if (process.ppid !== parent || daemonLockState(lockPath) === "other") stop();
+  }, 5_000);
+  try {
+    deps.out(describeHostSync(await Promise.race([sync.ready, stopped.then(() => sync.ready)])));
+    await stopped;
+  } finally {
+    clearInterval(watch);
+    await sync.stop();
+    const { unlinkSync } = await import("node:fs");
+    try {
+      if (daemonLockState(lockPath) === "mine") unlinkSync(lockPath);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+async function runStoreSetup(keyFile: string | undefined, deps: GatewayCliDeps): Promise<void> {
+  if (!keyFile) throw new CliUsageError("Usage: ais gateway store setup --key-file=<path>  (the database URL is read from stdin, never argv)");
+  const { readFile } = await import("node:fs/promises");
+  const { homedir } = await import("node:os");
+  const { appendSecretsFile, defaultSecretsPath } = await import("./secrets-file.ts");
+  const { STORE_DATABASE_URL_KEY } = await import("../../gateway/host-sync.ts");
+  const { PgHomeStore } = await import("../../gateway/home-store.ts");
+  const databaseUrl = (await Bun.stdin.text()).trim();
+  if (!/^postgres(ql)?:\/\//.test(databaseUrl)) throw new CliUsageError("stdin must hold the store's postgres:// URL");
+  const key = parseStoreKey((await readFile(keyFile.replace(/^~(?=\/)/, homedir()), "utf8")).trim());
+  // Prove both before writing anything: the database answers and the newest row decrypts with this key.
+  const store = new PgHomeStore(databaseUrl, key, `host-setup:${process.pid}`);
+  try {
+    const metas = await store.list(0);
+    const newest = [...metas].sort((a, b) => b.version - a.version)[0];
+    if (newest && (await store.get([newest.path])).length === 0) throw new CliUsageError("the key does not decrypt the store's rows; check --key-file");
+    deps.out(`gateway store setup: database reachable, ${metas.length} rows, key decrypts`);
+  } finally {
+    await store.close().catch(() => undefined);
+  }
+  await appendSecretsFile(STORE_DATABASE_URL_KEY, databaseUrl);
+  await appendSecretsFile(STORE_KEY_ENV, key.toString("base64"));
+  deps.out(`gateway store setup: ${STORE_DATABASE_URL_KEY} and ${STORE_KEY_ENV} written to ${defaultSecretsPath()} (backup kept)`);
+  const { installProfileSyncService, describeProfileSyncServiceResult } = await import("../../sync/profile-sync-service.ts");
+  const r = await installProfileSyncService({ restartIfActive: true });
+  const line = describeProfileSyncServiceResult(r);
+  if (line) deps.out(line.line);
 }

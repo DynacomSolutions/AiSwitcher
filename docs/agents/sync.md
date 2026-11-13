@@ -68,7 +68,12 @@ reconciliation.
   however many sessions share it, plus each crush session's own `<cwd>/.crush`,
   and on a change starts one detached identity-scoped sync and marks the usage
   snapshot dirty. A configDir change syncs without `cwd` (only crush-backed
-  tools read it); a `.crush` change syncs with that cwd. Sidecars never scan:
+  tools read it); a `.crush` change syncs with that cwd. The same daemon also
+  supervises the host credential-store sync (`sync/store-sync-supervisor.ts`,
+  `docs/agents/gateway.md` "Host files"): only on a host whose
+  `AIS_GATEWAY_STORE_DATABASE_URL` is set (env or `~/.secrets`), as a separate
+  `ais gateway store sync` child, because the store import switches on the
+  member-store view for its whole process. Sidecars never scan:
   without the daemon only the post-exit sync runs, by design. A root's first
   scan counts files modified since its earliest live session registered
   (`registeredAt`), so writes before the first poll or during a daemon
