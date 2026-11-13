@@ -145,7 +145,10 @@ src/
                           sync` child running under that daemon while the
                           gateway's PostgreSQL credential store is configured
                           (gateway/host-sync.ts writes gateway refreshes into the
-                          host login files and pushes new host logins)
+                          host login files and pushes new host logins);
+                          t3-models-ticker.ts runs the T3 gateway model-list sync
+                          (identities/t3-gateway-models.ts, `ais gateway t3-models`)
+                          from that daemon every 10 minutes
    server/              the local console API behind `ais web` — thin HTTP wrappers around
                            the EXISTING engines (store/actions, limits fetchers, usage
                            aggregation, resume readers, zai/ali auth writers), no new

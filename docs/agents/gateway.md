@@ -275,6 +275,30 @@ break in every thread. The command refuses to write them and fails when the file
 in `~/.secrets`, the environment, or the `HTTPS_PROXY` of a `~/.t3/gateway/t3-claude-*` folder. T3 must be restarted to
 apply a change; the command never restarts it.
 
+### T3 Code model lists (Kimi ACP, OpenCode)
+
+kimi-code and OpenCode do not list the models of a custom provider: they show only what their config names. AIS keeps
+those lists equal to the gateway's `GET <base>/models` (`src/identities/t3-gateway-models.ts`). It scans every folder
+under `~/.t3/gateway/` (`T3CODE_HOME` honoured):
+
+- `config.toml` (kimi-code, `KIMI_CODE_HOME`): for each `[providers.<p>]` with `type = "kimi"`, `base_url` and `api_key`,
+  the `[models.<id>]` blocks of that provider become one per gateway model, in gateway order: `provider`, `model`,
+  `display_name`, `max_context_size` (`context_length`) and `capabilities` (`image_in`/`video_in`/`audio_in` from the input
+  modalities, `always_thinking` when `supports_thinking_type` is `only`, else `thinking` for a reasoning model,
+  `dynamically_loaded_tools` from `supports_dynamic_tools`). Other keys of a block that stays, blocks of other providers,
+  comments and every other table are kept. A `default_model` that names a model that is gone moves to the first gateway
+  model. A file whose content already matches is not rewritten, whatever its formatting.
+- `opencode.json`: for each `provider.<p>` with `options.baseURL`, `options.apiKey` and a `models` map, the map becomes the
+  gateway ids; an entry that stays keeps its keys and `name` follows the gateway. `{file:...}` and `{env:...}` in the key,
+  base URL and headers are resolved as OpenCode does; the request sends the provider's headers (`x-opencode-session`).
+
+A list that cannot be read (network error, non-2xx such as an expired upstream key, empty list) leaves the file as it is.
+Files keep their mode. The host profile-sync daemon (`ais __profile_sync_daemon`) runs the sync at start and every
+10 minutes in the background, logging changes and each new failure once, so a new gateway model needs no command.
+`ais gateway t3-models` runs it now; `--check` writes nothing and fails when a list is out of date or unreadable. T3 Code
+0.1.7 reads an ACP picker from the live config of the instance's latest session, so a new model shows after a new session
+of that instance starts.
+
 ### Codex usage limits on a folder
 
 `ais gateway codex-home <dir>...` sets up Codex folders (CODEX_HOME, for example T3 Code's) that run through the gateway

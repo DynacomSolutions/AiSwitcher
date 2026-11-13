@@ -11,6 +11,7 @@ import { SYNC_TOOL_CONFIGS } from "./rsync.ts";
 import { listLiveSessions, sessionRegistryDir, type IsRunning, type RegisteredSession } from "./session-registry.ts";
 import type { SyncRunOptions } from "./types.ts";
 import { createStoreSyncSupervisor, type StoreSyncSupervisor } from "./store-sync-supervisor.ts";
+import { createT3ModelsTicker, type T3ModelsTicker } from "./t3-models-ticker.ts";
 import { POLL_MS, scanTree, snapshotsDiffer, type Snapshot } from "./watch.ts";
 
 /**
@@ -274,6 +275,8 @@ export interface RunDaemonOptions {
    * are given (production); tests pass their own or `false`.
    */
   storeSync?: StoreSyncSupervisor | false;
+  /** T3 gateway model-list sync (t3-models-ticker.ts). Default: one is created when no `deps` are given (production). */
+  t3Models?: T3ModelsTicker | false;
 }
 
 /**
@@ -291,6 +294,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
   const pollMs = options.pollMs ?? POLL_MS;
   const daemon = createProfileSyncDaemon(options.deps);
   const storeSync = options.storeSync === false ? undefined : (options.storeSync ?? (options.deps ? undefined : createStoreSyncSupervisor()));
+  const t3Models = options.t3Models === false ? undefined : (options.t3Models ?? (options.deps ? undefined : createT3ModelsTicker()));
   let stopped = false;
   let wake: (() => void) | undefined;
   const onSignal = () => {
@@ -318,6 +322,7 @@ export async function runProfileSyncDaemon(options: RunDaemonOptions = {}): Prom
       }
       try { await daemon.tick(); } catch { /* keep polling */ }
       try { await storeSync?.tick(); } catch { /* retried next poll */ }
+      try { await t3Models?.tick(); } catch { /* retried next interval */ }
       if (stopped) break;
       await new Promise<void>((resolve) => {
         wake = resolve;
