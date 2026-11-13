@@ -79,7 +79,7 @@ export const HELP: Record<string, HelpNode> = {
     },
   },
   gateway: {
-    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|codex-home ...",
+    usage: "ais gateway serve|local|app|usage|store|claude-proxy|t3-proxy|t3-models|codex-home ...",
     desc: "AI Gateway: token-authenticated proxy over AIS logins",
     examples: ["AIS_GATEWAY_DATABASE_URL=postgres://... AIS_GATEWAY_ADMIN_TOKEN=... ais gateway serve"],
     subs: {
@@ -98,6 +98,10 @@ export const HELP: Record<string, HelpNode> = {
       "t3-proxy": sub(
         "ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]",
         "Route api.anthropic.com for the T3 Code server only (not its children) through the gateway CONNECT proxy so T3's account usage and reset credits come from the gateway: installs ~/.ais/t3/anthropic-proxy.cjs and sets NODE_OPTIONS (--require), AIS_T3_ANTHROPIC_PROXY and NODE_EXTRA_CA_CERTS in ~/.t3/service.env (T3CODE_HOME honoured; never HTTPS_PROXY); --check only reports, --remove undoes it; restart T3 to apply (never done here)",
+      ),
+      "t3-models": sub(
+        "ais gateway t3-models [--check]",
+        "Make the model lists of the T3 Code gateway folders (~/.t3/gateway/*: kimi-code config.toml [models.*] blocks of a type=kimi provider, opencode.json provider models) equal to the gateway's GET <base>/models now; every other key stays; the profile-sync daemon does this every 10 minutes; --check only reports",
       ),
       "codex-home": sub(
         "ais gateway codex-home <codex home dir>... [--check]",
