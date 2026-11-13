@@ -282,4 +282,4 @@ AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gat
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 195 | Gateway credential store in PostgreSQL, multi-replica relay, console stand-down | done | claude | gateway-ha | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/527 (9048774), released v0.5.50.<br>Two-process test: one rotation under concurrency, both serve, browser call across replicas, survivor serves after kill.<br>Deployment (replicas, no hostPath, store key Secret) is done by the .cluster session. |
-| 196 | Host login files follow the PostgreSQL credential store without a hostPath replica (write back gateway refreshes, push new host logins) | in_progress | claude | ais-host-store-sync | 195 | 2026-11-14 12:00 ICT | |
+| 196 | Host login files follow the PostgreSQL credential store without a hostPath replica | in_progress | claude | ais-host-store-sync | 14.195 | 2026-11-14 12:00 ICT | Write back gateway refreshes and push new host logins. |
