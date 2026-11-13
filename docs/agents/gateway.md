@@ -428,15 +428,36 @@ Environment (`ais gateway serve`):
 - `AIS_GATEWAY_STORE_KEY` (required with `pg`).
 - `AIS_GATEWAY_FILE_STORE=1` only on a replica whose HOME is the host's real files (hostPath): refreshed grants are written
   back to the files and host changes (a new login) are imported (every 5 s for tracked files, every 5 minutes for new
-  ones). Without it HOME must be a writable pod-local directory (emptyDir) and is overwritten from the store.
+  ones). Without it HOME must be a writable pod-local directory (emptyDir) and is overwritten from the store. No replica
+  needs it any more: the host runs the same mirror itself (Host files, below).
 - `AIS_GATEWAY_STORE_IMPORT=1` with a file store: run the import at startup.
 - `AIS_GATEWAY_REPLICA_URL` (default `http://$POD_IP:<admin port>`): this replica's admin address for the browser relay.
 
 Import: `ais gateway store import [--dry-run]` on the host that holds the files (needs `AIS_GATEWAY_DATABASE_URL` and
 `AIS_GATEWAY_STORE_KEY`). Idempotent: a missing path is added; registries, host files and markers take the host copy; a
 login is replaced only by a strictly fresher grant, under the account's refresh lock, and never by a refresh token the
-journal shows rotated out; the heartbeat is only seeded. After a new login on the host, run it again (a file-store replica
-does it on its own).
+journal shows rotated out; the heartbeat is only seeded. The host sync below re-runs it every 5 minutes.
+
+Host files (`src/gateway/host-sync.ts`, `ais gateway store sync`): the replicas have no hostPath, so the host that holds the
+real login files keeps them in step itself. It runs the file-store mirror (HomeMirror with `fileStore`, the rule above)
+against the host HOME, plus the import every 5 minutes for new files: a gateway refresh is written into the host file (so
+grok, kimi, pi, zai, opencode and anything else reading its own files never holds a refresh token the gateway rotated), and
+a host file that changed (a new login, a host tool's own refresh) is pushed when its grant is fresher. Newest token wins
+both ways; a login never replaces a fresher one, and the import never uploads a token the journal shows rotated out.
+Freshness is the grant's expiry (`grantFreshness`); a refresh token's own expiry (`refreshTokenExpiresAt`,
+`refresh_token_expires_*`) is ignored, because Claude Code keeps it when it blanks a login after a failed refresh, and
+counting it made a blanked file look fresher than the live grant.
+
+- Runs as a child of the host profile-sync daemon (`src/sync/store-sync-supervisor.ts`), no unit of its own, only when
+  `AIS_GATEWAY_STORE_DATABASE_URL` is set (environment or `~/.secrets`); the key is `AIS_GATEWAY_STORE_KEY` or a file named
+  by `AIS_GATEWAY_STORE_KEY_FILE`. The same variable makes the console stand down, so one setting covers both. Restarted
+  with a backoff (10 s to 5 minutes); it exits when the daemon goes. One per host (lock `~/.ais/state/gateway-store-sync.lock`).
+- `ais gateway store setup --key-file=<path>` reads the database URL from stdin (never argv), proves the database answers
+  and the key decrypts a row, writes both into `~/.secrets` (backup first, mode 0600) and restarts the daemon.
+  The URL must reach the database from the host: the pooler's service address, not an in-cluster DNS name the host
+  cannot resolve.
+- `ais gateway store sync --once`: one pass, prints counts only (written, pushed, import added/updated/kept).
+- Logs name paths and error class names only, never a token.
 
 Replicas:
 
