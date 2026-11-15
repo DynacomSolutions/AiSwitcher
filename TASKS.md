@@ -3,7 +3,7 @@
 Track product work, bugs and acceptance evidence. Routine Git operations are not tasks.
 
 ## 1. Product work
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 1 | Preserve Grok's explicit memory control through the identity launcher | done | grok_memory_fix | | | | Exact-key forwarding and four real-subprocess regressions are source-reviewed. Focused QA completed successfully; full CI on `97ae2de` passed typecheck and 609 tests across 76 files with zero failures. Compiled launcher inspected live: both launcher and real Grok child receive `GROK_MEMORY=0`. Installed binary matches the tested candidate byte-for-byte, with a rollback copy; other launchers and shared memory settings are unchanged. Other session markers and explicit child overrides remain intact. |
@@ -90,7 +90,7 @@ ETA: 2026-11-14 18:00 ICT
 | 192 | Backup untracks excluded files in seconds, not hours (host updates failed on the backup lock) | in_review | claude | backup-lock-host-update | | 2026-11-12 12:00 ICT | Was 191. `git rm --cached --pathspec-from-file` matched 145k paths against a 687k-entry index for 40+ min; two v0.5.48 host updates timed out on the lock. `update-index --force-remove` takes 9.5 s on a copy. |
 
 ## 2. Live USB
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 
 UK 16:00 BST on 2026-10-24; owner check after.
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
@@ -124,7 +124,7 @@ ETA: 2026-11-07 18:00 ICT
 | 98 | Fix main CI: spend guard canary and Host app Browser smoke | done | claude-20261031-main-ci-red | main-ci-red | | 2026-10-31 23:30 ICT | Merged in https://github.com/DynacomSolutions/AiSwitcher/pull/319 (b9e97f3).<br>Canary tests now use the Bun binary as `codex`; @playwright/test 1.58.2 to 1.64.1 for ubuntu26.04.<br>All PR 319 checks green. |
 
 ## 4. AIS AI Gateway for cluster apps
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -172,7 +172,7 @@ ETA: 2026-11-14 18:00 ICT
 | 197 | AIS keeps T3 Code gateway model lists (Kimi ACP config.toml, OpenCode opencode.json) in sync with the gateway's /models automatically | done | claude | gateway-model-sync | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/533 (3863f45), released v0.5.52, installed on the host, ais-profile-sync restarted (syncs at start and every 10 min).<br>Live 2026-11-14: `ais gateway t3-models --check` shows both Kimi ACP instances current, each with the gateway's 6 ids (k3, k3-256k, k3.1-pro, k3.1-pro-highspeed, kimi-for-coding, kimi-for-coding-highspeed). Write proof: a k3 block removed from one Kimi file was restored; every other key and mode 600 unchanged.<br>The OpenCode instance fails with upstream HTTP 401 `api_key_expired` (its pinned identity's OpenCode key expired; owner must renew it), so its 31-model file is left as it is until then. |
 
 ## 5. Usage and limits accuracy across web, CLI and TUI
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -200,7 +200,7 @@ ETA: 2026-11-14 18:00 ICT
 | 188 | Breakdown page: count each Claude message once (usage lines repeat per content block) | done | claude | usage-projects-native | | 2026-11-12 12:00 ICT | Was 187.<br>PR https://github.com/DynacomSolutions/AiSwitcher/pull/502.<br>Claude writes the same message.id:requestId usage on 1.7-3.5 lines; breakdown sums every line, so categories are about 2x. |
 | 189 | Usage store keeps recorded usage when transcripts are deleted | done | claude | usage-store-retain | | 2026-11-12 12:00 ICT | Personal Claude partition lost 60 deleted-transcript sessions ($3.1k, Jun-Aug) when the Tokscale cache was rewritten at 04:47 after a binary rebuild.<br>Cause: transcripts gone from disk; Tokscale drops a missing transcript's cache entry unless it holds retained rows.<br>Fix: AIS retains lost sessions as manifest segments; `ais usage import-batch` absorbs a backup. Branch is on top of #502. |
 ## 6. Browser control extension
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -220,14 +220,14 @@ ETA: 2026-11-14 18:00 ICT
 | 194 | AIS Browser tools reach T3 pool sessions: a launch with CLAUDE_CONFIG_DIR preset to a registered identity's folder gets the browser wiring (pool: `--pool`) | done | claude | fix/browser-wiring-preset-config-dir | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/522 (e127c64), released v0.5.49.<br>Owner report 2026-11-12: T3 agents on the Claude pool had no ais-browser tools and improvised a shim with a member's token, so groups were named by short session ID ("8749c2"). Cause: preset env config dir resolves no identity, so wiring looked for a token in the pool folder. |
 
 ## 7. Profile-sync watcher CPU on shared hosts
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 127 | One host-level profile-sync watcher instead of a scan per session sidecar | in_review | claude-20261105-sync-daemon | perf/host-profile-sync-daemon | | 2026-11-06 18:00 ICT | PR https://github.com/DynacomSolutions/AiSwitcher/pull/375<br>`ais __profile_sync_daemon`, 30 s poll; sidecars only register.<br>`ais update` and install:shims install and start the unit; not installed on any host yet.<br>Was 124. |
 
 ## 8. Gateway client under a base path
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
@@ -277,10 +277,12 @@ Keep new codex releases working against the AIS gateway placeholder login.
 | 187 | Backup skips codex `.tmp/` scratch clones | done | claude | backup-codex-dot-tmp | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/507 (2f18716); host updated.<br>First run dropped 145,215 tracked `.tmp` files (one catch-up run with a longer budget).<br>Live codex backup: committed, 0 index errors, 0 warnings. |
 
 ## 14. Gateway survives any node loss
-ETA: 2026-11-14 18:00 ICT
+ETA: 2026-11-15 23:00 ICT
 AIS auth keeps working while any cluster node is up: logins in PostgreSQL, N gateway replicas.
 
 | ID | Task | Status | Owner | Branch | Depends | ETA | Notes |
 |---|---|---|---|---|---|---|---|
 | 195 | Gateway credential store in PostgreSQL, multi-replica relay, console stand-down | done | claude | gateway-ha | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/527 (9048774), released v0.5.50.<br>Two-process test: one rotation under concurrency, both serve, browser call across replicas, survivor serves after kill.<br>Deployment (replicas, no hostPath, store key Secret) is done by the .cluster session. |
 | 196 | Host login files follow the PostgreSQL credential store without a hostPath replica | done | claude | ais-host-store-sync | 14.195 | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/530 (addec72), released v0.5.51.<br>`ais gateway store sync` runs under the profile-sync daemon when AIS_GATEWAY_STORE_DATABASE_URL is set (`ais gateway store setup`).<br>Host configured; first pass converged 43 rows. grantFreshness ignores refreshTokenExpiresAt. |
+| 198 | Gateway stays Ready while PostgreSQL is unreachable once logins are loaded | in progress | claude | gateway-node-loss | 14.195 | | `/readyz` failed on every replica while the PostgreSQL primary was down, though the replicas served 200s from loaded logins. |
+| 199 | Host clients reach the gateway without the local ClusterIP (node failover) | in progress | claude | gateway-node-loss | 14.195 | | T3 preload and Claude identities use a ClusterIP CONNECT proxy, dead when the host's own k3s is down. |

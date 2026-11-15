@@ -4,6 +4,7 @@ import { resolveRemoteBase } from "./local-remote.ts";
 import { runKubectl } from "./kube-secret.ts";
 import { runAppCommand, runUsageCommand, type GatewayCliDeps } from "./apps.ts";
 import { localGatewayTlsPort } from "../../gateway/local-tls.ts";
+import { CONNECT_RELAY_DEFAULT_PORT, parseUpstreams, startConnectRelay, type ConnectRelay } from "../../gateway/connect-relay.ts";
 import { installDrainHandlers, LOCAL_GATEWAY_DEFAULT_PORT, startLocalGateway } from "../../gateway/local.ts";
 import { parseStoreKey, STORE_KEY_ENV } from "../../gateway/home-store.ts";
 import { DEFAULT_GATEWAY_ADMIN_PORT, DEFAULT_GATEWAY_CONNECT_PORT, DEFAULT_GATEWAY_PORT, startGateway } from "../../gateway/serve.ts";
@@ -85,6 +86,8 @@ async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): P
     deps.out("gateway local: ok");
     return;
   }
+  // Before the HTTP listener: whoever waits for the HTTP port (the unit's ExecStartPost, the slot handover) finds the relay up too.
+  const relay = await startConfiguredConnectRelay();
   const running = await startLocalGateway({ port, remoteBase, bindRetryMs: 30_000, tls: { port: localGatewayTlsPort(port) } });
   console.info(`gateway local: listening on 127.0.0.1:${running.port}${running.tlsPort ? ` (https ${running.tlsPort})` : ""}`);
   if (running.tlsPort) {
@@ -92,8 +95,28 @@ async function runLocal(args: string[], deps: GatewayCliDeps, check: boolean): P
     const { migrateRegisteredLocalCodexHomes } = await import("../../identities/codex-gateway-home.ts");
     await migrateRegisteredLocalCodexHomes(port, running.tlsPort).catch((e) => console.info(`gateway local: codex home migration skipped (${e instanceof Error ? e.message : String(e)})`));
   }
-  installDrainHandlers(running);
+  installDrainHandlers(relay ? { drain: async () => void (await Promise.all([relay.drain(), running.drain()])) } : running);
   await new Promise<void>(() => {});
+}
+
+/**
+ * The loopback CONNECT relay (src/gateway/connect-relay.ts), when AIS_GATEWAY_CONNECT_UPSTREAMS is set (shell env first,
+ * then ~/.secrets). Port: AIS_GATEWAY_CONNECT_LOCAL_PORT, default 47132. A bad config or a busy port is logged and the
+ * local gateway still starts: the relay only carries the CONNECT path, never the model calls.
+ */
+async function startConfiguredConnectRelay(): Promise<ConnectRelay | undefined> {
+  const { readSecretsKey } = await import("./secrets-file.ts");
+  const text = process.env.AIS_GATEWAY_CONNECT_UPSTREAMS || (await readSecretsKey("AIS_GATEWAY_CONNECT_UPSTREAMS"));
+  if (!text) return undefined;
+  try {
+    const port = portOf(undefined, process.env.AIS_GATEWAY_CONNECT_LOCAL_PORT, CONNECT_RELAY_DEFAULT_PORT, "AIS_GATEWAY_CONNECT_LOCAL_PORT");
+    const relay = await startConnectRelay({ port, upstreams: parseUpstreams(text) });
+    console.info(`gateway local: connect relay on 127.0.0.1:${relay.port} (upstreams ${text})`);
+    return relay;
+  } catch (err) {
+    console.info(`gateway local: warning: connect relay not started (${err instanceof Error ? err.message : String(err)})`);
+    return undefined;
+  }
 }
 
 /** Env names of the PostgreSQL credential store (docs/agents/gateway.md, "Credential store and replicas"). */

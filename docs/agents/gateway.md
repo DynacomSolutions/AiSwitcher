@@ -261,6 +261,17 @@ hand: Claude Code sends every request through it, including a plain-HTTP loopbac
 10 Nov 2026, row 4.162). `--check` and `ais doctor` report a folder in that state. Run a real `claude -p` turn on each
 folder after a change: running sessions read settings.json at once.
 
+### CONNECT relay on the host (failover across nodes)
+
+`HTTPS_PROXY` and `AIS_T3_ANTHROPIC_PROXY` take one URL. A ClusterIP there works only while the host's own k3s runs,
+so a host with k3s down loses the proxy for every session even though replicas run on the other nodes. Set
+`AIS_GATEWAY_CONNECT_UPSTREAMS` (`~/.secrets` or env, `host:port` list) and `ais gateway local` also runs a TCP relay
+on `127.0.0.1:47132` (`AIS_GATEWAY_CONNECT_LOCAL_PORT`); point `AIS_GATEWAY_CONNECT_PROXY_URL` at it and rerun
+`ais gateway claude-proxy` and `ais gateway t3-proxy`. The relay pipes bytes unchanged to the first upstream that
+accepts within 1.5 s. A host name expands to all its addresses, this host's first, and the last good resolution is
+kept when DNS fails. An upstream that fails is skipped for 30 s. The upstreams must reach the gateway's port 47132 on
+each node (a `hostPort` in the deployment), and the network policy must admit the host's address.
+
 ### T3 Code account API (resets)
 
 `ais gateway t3-proxy [--proxy=<url>] [--ca=<path>] [--check] [--remove]` makes T3 Code's own Anthropic account reads
@@ -497,8 +508,11 @@ Replicas:
 - Browser relay: see `docs/agents/browser.md` (sockets stay on their replica; calls are forwarded).
 
 Health: `/healthz` is liveness (always `ok` while the process serves). `/readyz` is readiness: 503 while warming (with the
-store: until the first full pull finished), draining, or when the database has not answered a ping (every 5 s, 2 s
-timeout) for 15 s.
+store: until the first full pull finished) or draining. Once warm, a replica stays ready while the database is down: it
+serves from the logins it loaded, ledger rows queue in memory (oldest dropped past 50,000) and the store sync retries
+on its poll. Taking it out of rotation would leave no gateway at all while the PostgreSQL primary is down. The body
+says `ready, database unreachable` when the database has not answered a ping (every 5 s, 2 s timeout) for 15 s, and
+the log has one `database unreachable` line per outage. A replica that never warmed stays unready.
 
 The console stands down for every store-owned login (`docs/agents/console-web.md`, `AIS_GATEWAY_STORE_DATABASE_URL`).
 

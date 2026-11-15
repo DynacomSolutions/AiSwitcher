@@ -27,7 +27,7 @@ import { BrowserHub } from "./browser/hub.ts";
 import { CachedGatewayStore } from "./cache-store.ts";
 import { CredentialCache, type RefreshFn } from "./credentials.ts";
 import { providerError } from "./errors.ts";
-import { LedgerBuffer } from "./ledger-buffer.ts";
+import { errorTag, LedgerBuffer } from "./ledger-buffer.ts";
 import { PrometheusMetrics, type GatewayMetrics } from "./metrics.ts";
 import { migrate, PgGatewayStore } from "./pg-store.ts";
 import type { GatewayStore } from "./store.ts";
@@ -519,8 +519,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
   let storeSynced = false;
   let relayStarted = false;
   let importTimer: ReturnType<typeof setInterval> | undefined;
-  /** Last time the database answered /readyz's ping (ms); readiness fails when it is older than three pings. */
+  /** Last time the database answered the ping (ms); reported by /readyz, never a reason to drop out of the rotation once warm. */
   let dbOkAt = 0;
+  let dbDownLogged = false;
   const pingMs = hooks.pingMs ?? 5_000;
   const pingSql = hooks.ping || hooks.openStore ? undefined : new SQL(opts.databaseUrl, { max: 1 });
   const ping = hooks.ping ?? (pingSql ? async () => void (await pingSql`SELECT 1`) : async () => undefined);
@@ -528,8 +529,13 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     try {
       await bounded(ping(), Math.min(2_000, pingMs), "database ping");
       dbOkAt = Date.now();
-    } catch {
-      // readiness drops once the last good answer is too old
+      if (dbDownLogged) console.info("gateway: database reachable again");
+      dbDownLogged = false;
+    } catch (err) {
+      if (dbOkAt > 0 && !dbOk() && !dbDownLogged) {
+        dbDownLogged = true;
+        console.warn(`gateway: database unreachable (${errorTag(err)}); still ready, serving from loaded logins`);
+      }
     }
   };
   const dbOk = (): boolean => Date.now() - dbOkAt <= pingMs * 3;
@@ -678,9 +684,9 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     if (path === "/readyz") {
       if (draining) return new Response("draining\n", { status: 503 });
       if (!warmed) return new Response("warming\n", { status: 503 });
-      // A replica that cannot reach the database cannot refresh, guard or count: take it out of the rotation.
-      if (!dbOk()) return new Response("database unreachable\n", { status: 503 });
-      return new Response("ready\n");
+      // A warm replica serves from its loaded logins; ledger rows queue and the store sync retries until the database is back.
+      // Taking it out of the rotation would leave no gateway at all while the database primary is down.
+      return new Response(dbOk() ? "ready\n" : "ready, database unreachable\n");
     }
     if (path === "/metrics") return new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } });
     if (!warmed) return providerError(await styleForPath({ store }, path), 503, "gateway is starting");
@@ -849,6 +855,6 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     port: server.port as number,
     adminPort: adminServer.port as number,
     ...(connectProxy ? { connectPort: connectProxy.port } : {}),
-    ready: () => warmed && !draining && dbOk(),
+    ready: () => warmed && !draining,
   };
 }
