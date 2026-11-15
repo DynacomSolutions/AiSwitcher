@@ -1195,19 +1195,19 @@ describe("public host", () => {
   });
 });
 
-describe("readiness follows the database", () => {
-  test("/readyz fails while the database does not answer, /healthz stays up", async () => {
+describe("readiness once warm does not follow the database", () => {
+  test("a warm gateway stays ready and serves while the database does not answer", async () => {
     let down = false;
     const g = await boot({ ping: async () => {
       if (down) throw new Error("connect ECONNREFUSED");
     }, pingMs: 50 });
     await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
     down = true;
-    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 503);
-    expect(await (await fetch(`${base(g)}/readyz`)).text()).toBe("database unreachable\n");
+    await waitFor(async () => (await (await fetch(`${base(g)}/readyz`)).text()) === "ready, database unreachable\n");
+    expect(await status(`${base(g)}/readyz`)).toBe(200);
     expect(await status(`${base(g)}/healthz`)).toBe(200);
-    expect(g.ready()).toBe(false);
+    expect(g.ready()).toBe(true);
     down = false;
-    await waitFor(async () => (await status(`${base(g)}/readyz`)) === 200);
+    await waitFor(async () => (await (await fetch(`${base(g)}/readyz`)).text()) === "ready\n");
   });
 });
