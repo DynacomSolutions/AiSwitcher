@@ -674,7 +674,11 @@ one API:
   dashboard with live agent processes, identity editing, rate limits, token
   usage, resumable sessions, auth status and fixes, local models, and a config-file editor
   for skills/agents/hooks/rules/memory inside whitelisted roots. Every page
-  live-polls; nothing is a stale snapshot.
+  live-polls; nothing is a stale snapshot. The WebUI installs as a PWA
+  (browser menu "Install AIS Console", or "Add to Home Screen" on mobile) on
+  `localhost` or any HTTPS origin; plain-HTTP LAN addresses cannot install.
+  Its service worker caches nothing (no API data or token is stored) and only
+  shows an offline page when the server cannot be reached.
 - **TUI**: `ais tui` launches the ratatui dashboard (`apps/tui`, Rust) against
   the same server, with tick-polled tabs for status, processes, identities,
   limits, usage, sessions, auth, and local models.
