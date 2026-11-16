@@ -160,14 +160,21 @@ describe("BrowserHub", () => {
     expect(hub.connected()).toEqual([]);
   });
 
-  test("a failed send (0 or -1) settles browser_disconnected at once", async () => {
-    for (const code of [0, -1]) {
-      const hub = mk();
-      const ws = new FakeWs();
-      await hello(hub, ws);
-      ws.sendResult = code;
-      expect(await hub.call("work", req(`c${code}`), 60_000)).toMatchObject({ ok: false, error: "browser_disconnected" });
-    }
+  test("a dropped send (0) settles browser_disconnected at once; a queued send (-1) still waits for the result", async () => {
+    const dropped = mk();
+    const ws0 = new FakeWs();
+    await hello(dropped, ws0);
+    ws0.sendResult = 0;
+    expect(await dropped.call("work", req("c0"), 60_000)).toMatchObject({ ok: false, error: "browser_disconnected" });
+
+    // Backpressure: a large call (an upload) is queued and delivered, so the hub must wait for its result.
+    const queued = mk();
+    const ws1 = new FakeWs();
+    await hello(queued, ws1);
+    ws1.sendResult = -1;
+    const pending = queued.call("work", req("c1"), 60_000);
+    await queued.message(ws1, JSON.stringify({ t: "result", result: { id: "c1", ok: true, content: [{ type: "text", text: "done" }] } }));
+    expect(await pending).toMatchObject({ ok: true });
   });
 
   test("a caller abort settles as timeout, not internal", async () => {

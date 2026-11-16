@@ -3,7 +3,7 @@
   "name": "AIS Browser",
   "version": "0.0.0",
   "description": "Lets AIS agents drive this Chrome profile through the AIS gateway.",
-  "minimum_chrome_version": "116",
+  "minimum_chrome_version": "125",
   "permissions": [
     "debugger",
     "tabs",

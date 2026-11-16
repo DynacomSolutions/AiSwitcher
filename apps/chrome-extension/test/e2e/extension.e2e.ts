@@ -200,7 +200,26 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
         port: 0,
         fetch(req) {
           const u = new URL(req.url);
-          const body = u.pathname === "/second"
+          // Reports every file a file input receives: name, type, size and SHA-256, so the test can prove the content arrived intact.
+          const reporter = `<script>
+            async function report(input) {
+              const files = [];
+              for (const f of input.files) {
+                const h = await crypto.subtle.digest("SHA-256", await f.arrayBuffer());
+                files.push([f.name, f.type, f.size, [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("")].join("|"));
+              }
+              (window.uploads ||= []).push({ id: input.id || "fresh", files });
+            }
+            document.addEventListener("change", e => report(e.target));
+            function freshInput() { const made = document.createElement("input"); made.setAttribute("type", "file"); made.addEventListener("change", () => report(made)); (made).click(); }
+          </script>`;
+          const body = u.pathname === "/upload"
+            ? `<h1 id="title">Upload</h1><input type="file" id="direct" multiple><input type="file" id="hiddenInput" style="display:none">
+               <button id="pick" onclick="document.getElementById('hiddenInput').click()">Choose logo</button><button id="fresh" onclick="freshInput()">Choose cover</button>
+               <iframe id="frame" src="http://localhost:${site.port}/upload-frame" style="position:absolute;left:120px;top:360px;width:520px;height:200px;border:1px solid #999"></iframe>${reporter}`
+            : u.pathname === "/upload-frame"
+            ? `<input type="file" id="frameInput" style="display:none"><button id="framePick" onclick="document.getElementById('frameInput').click()">Upload in frame</button>${reporter}`
+            : u.pathname === "/second"
             ? `<h1>Second page</h1><p id="p">Landed.</p>`
             : u.pathname === "/opener"
             ? `<h1>Opener</h1><a id="open" href="/second" target="_blank">Open in new tab</a>`
@@ -438,6 +457,70 @@ describe.skipIf(!chromium)("AIS Browser extension in real Chromium", () => {
     expect(await call(agents.a!, "navigate", { tabId: tabB, url: "https://example.test/" })).toMatchObject({ ok: false, error: "forbidden_tab" });
     expect((await call(agents.b!, "screenshot", { tabId: tabB })).ok).toBe(true);
   });
+
+  it("upload_file puts files from the agent's machine on file inputs: direct, behind a button, created on the fly and inside a cross-origin iframe", async () => {
+    const sha = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
+    const write = async (name: string, bytes: Uint8Array): Promise<string> => { const f = join(runDir, name); await writeFile(f, bytes); return f; };
+    const random = (n: number): Uint8Array => { const b = new Uint8Array(n); for (let i = 0; i < n; i += 65536) crypto.getRandomValues(b.subarray(i, Math.min(n, i + 65536))); return b; };
+    const logoBytes = random(4321);
+    const coverBytes = random(9 * 1024 * 1024); // close to the 10 MiB limit: the call is far larger than a socket buffer
+    const logo = await write("logo.png", logoBytes);
+    const cover = await write("cover.jpg", coverBytes);
+    const note = await write("note.txt", new TextEncoder().encode("hello upload\n"));
+    const row = (name: string, type: string, bytes: Uint8Array) => [name, type, bytes.length, sha(bytes)].join("|");
+
+    const { tabId } = JSON.parse(textOf(await call(agents.a!, "tabs_create", { url: `http://127.0.0.1:${site.port}/upload` }))) as { tabId: number };
+    const top = await pageSession(u => u.endsWith("/upload"));
+    // The iframe is another site, so Chromium runs it as its own target: the case that needs a child debugger session.
+    const frameTarget = await until("cross-origin iframe target", async () => (await targets()).find(t => t.type === "iframe" && t.url.endsWith("/upload-frame")));
+    const frame = await cdp.attach(frameTarget.targetId);
+    const uploads = (s: Session) => s.eval<Array<{ id: string; files: string[] }>>(`window.uploads || []`);
+    const upload = async (args: Record<string, unknown>) => { const r = await call(agents.a!, "upload_file", { tabId, ...args }); return r.ok ? textOf(r) : `${r.error}: ${r.message}`; };
+
+    const tree = textOf(await call(agents.a!, "read_page", { tabId }));
+    const ref = (re: RegExp) => { const m = re.exec(tree)?.[1]; if (!m) throw new Error(`no match for ${re} in:\n${tree}`); return m; };
+    const direct = ref(/button "Choose files"[^[]*\[(ref_\d+)\]/i);
+
+    // 1. A ref to the file input itself: two files at once.
+    expect(await upload({ ref: direct, paths: [logo, note] })).toBe("Uploaded logo.png, note.txt.");
+    expect((await until("direct upload", async () => (await uploads(top)).find(u => u.id === "direct"))).files).toEqual([row("logo.png", "image/png", logoBytes), row("note.txt", "text/plain", new TextEncoder().encode("hello upload\n"))]);
+
+    // 2. A button that opens the chooser of a hidden input. 9 MiB travels shim -> gateway -> extension -> page.
+    expect(await upload({ ref: ref(/button "Choose logo" \[(ref_\d+)\]/), paths: [cover] })).toBe("Uploaded cover.jpg.");
+    expect((await until("hidden input upload", async () => (await uploads(top)).find(u => u.id === "hiddenInput"))).files).toEqual([row("cover.jpg", "image/jpeg", coverBytes)]);
+
+    // 3. A button that makes a file input on the fly, never in the document.
+    expect(await upload({ ref: ref(/button "Choose cover" \[(ref_\d+)\]/), paths: [logo] })).toBe("Uploaded logo.png.");
+    expect((await until("on-the-fly input upload", async () => (await uploads(top)).find(u => u.id === "fresh"))).files).toEqual([row("logo.png", "image/png", logoBytes)]);
+
+    // 4. Inside the cross-origin iframe, by screenshot coordinate.
+    const shotRes = await call(agents.a!, "screenshot", { tabId });
+    if (!shotRes.ok || shotRes.content[0]?.type !== "image") throw new Error("no screenshot");
+    const scale = jpegSize(shotRes.content[0].data)!.width / (await top.eval<number>(`innerWidth`));
+    const box = await top.eval<{ x: number; y: number }>(`(() => { const el = document.getElementById("frame"); const rect = el.getBoundingClientRect(); return { x: rect["left"] + el["clientLeft"], y: rect["top"] + el["clientTop"] }; })()`);
+    const inFrame = await centreOf(frame, "framePick");
+    expect(await upload({ coordinate: [(box.x + inFrame.x) * scale, (box.y + inFrame.y) * scale], paths: [logo] })).toBe("Uploaded logo.png.");
+    expect((await until("iframe upload", async () => (await uploads(frame)).find(u => u.id === "frameInput"))).files).toEqual([row("logo.png", "image/png", logoBytes)]);
+
+    // Refusals: each one names the cause and uploads nothing.
+    const before = (await uploads(top)).length;
+    expect(await upload({ ref: ref(/button "Choose logo" \[(ref_\d+)\]/), paths: [logo, note] })).toBe("bad_args: This file input takes one file");
+    const title = await centreOf(top, "title");
+    expect(await upload({ coordinate: [title.x * scale, title.y * scale], paths: [logo] })).toContain("opened no file chooser");
+    expect(await upload({ ref: direct, paths: [join(runDir, "missing.png")] })).toContain("is not a file on this machine");
+    expect(await upload({ ref: direct, paths: [await write("big.bin", random(10 * 1024 * 1024 + 1))] })).toContain("the limit is 10485760 bytes");
+    expect((await uploads(top)).length).toBe(before);
+
+    // The gateway takes content only. A path on the machine that runs Chrome is refused before any browser sees it.
+    const token = (await readFile(join(runDir, "agent-a", "ais-browser-token"), "utf8")).trim();
+    const post = (args: Record<string, unknown>) => fetch(`${gw()}/browser/call`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ session: { id: "sess-a" }, tool: "upload_file", args: { tabId, ref: direct, ...args } }) });
+    const refused = await post({ paths: ["/etc/passwd"] });
+    expect(refused.status).toBe(400);
+    expect(((await refused.json()) as { error: string }).error).toBe("files is required");
+    expect((await post({ files: [{ name: "/etc/passwd", mimeType: "text/plain", data: "" }] })).status).toBe(400);
+    expect((await uploads(top)).length).toBe(before);
+    expect((await call(agents.a!, "close_tab", { tabId })).ok).toBe(true);
+  }, 120_000);
 
   it("a target=_blank link the agent clicks opens behind the owner's tab and joins the agent's group", async () => {
     const tabInfo = (id: number) => sw.eval<{ active: boolean; groupId: number }>(`chrome.tabs.get(${id}).then(t => ({ active: t.active, groupId: t.groupId }))`);

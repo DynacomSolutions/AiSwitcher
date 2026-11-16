@@ -1,7 +1,7 @@
 import { DEFAULT_CALL_TIMEOUT_MS, SESSION_END_TOOL, WAIT_CALL_TIMEOUT_MS } from "../../../../src/browser/protocol.ts";
 import type { BrowserErrorCode, CallRequest, CallResult } from "../../../../src/browser/protocol.ts";
 import { TOOL_SCHEMAS, validateToolArgs } from "../../../../src/browser/tool-args.ts";
-import type { ExtensionTool, ToolArgs } from "../../../../src/browser/tool-args.ts";
+import type { ExtensionTool, ToolArgs, UploadFile } from "../../../../src/browser/tool-args.ts";
 import type { ChromeApi, TabInfo } from "./chrome-api.ts";
 import { parseKeys } from "./keys.ts";
 import type { State } from "./state.ts";
@@ -18,6 +18,12 @@ const BUFFER_LIMIT = 500;
 export const CAPTURE_TIMEOUT_MS = 8000;
 /** After a hover the overlay stays hidden this long (or until the next non-hover call) so it cannot steal the pointer. */
 export const HOVER_HOLD_MS = 1500;
+/** How long the click of an upload may take to open the file chooser. */
+export const FILE_CHOOSER_WAIT_MS = 3000;
+/** Cross-origin iframes inside iframes: how deep the upload looks for a file chooser. */
+const MAX_FRAME_DEPTH = 5;
+/** Only iframes: workers and other targets of the page stay unattached. */
+const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: "iframe" }] };
 
 type Content = Extract<CallResult, { ok: true }>["content"];
 
@@ -60,6 +66,9 @@ const NOISE = new Set(["none", "generic", "InlineTextBox", "LineBreak", "present
 
 interface RefTable { byRef: Map<string, number>; byNode: Map<number, string>; next: number }
 interface NetEntry { id: string; method: string; url: string; status?: number; error?: string }
+/** An event a waiter was resolved with; `sessionId` is set when it came from a cross-origin iframe. */
+interface Waited { params: Record<string, unknown>; sessionId?: string }
+interface Waiter { methods: string[]; frames: boolean; resolve: (e: Waited) => void }
 
 export interface ExecutorDeps {
   api: ChromeApi;
@@ -70,6 +79,7 @@ export interface ExecutorDeps {
   defaultTimeoutMs?: number;
   captureTimeoutMs?: number;
   hoverHoldMs?: number;
+  fileChooserWaitMs?: number;
 }
 
 export class Executor {
@@ -88,7 +98,10 @@ export class Executor {
   private readonly consoleBuf = new Map<number, string[]>();
   private readonly netBuf = new Map<number, NetEntry[]>();
   private readonly lastPoint = new Map<number, { x: number; y: number }>();
-  private readonly waiters = new Map<number, Set<{ methods: string[]; resolve: () => void }>>();
+  private readonly waiters = new Map<number, Set<Waiter>>();
+  /** Per tab: the sessions told to attach to their cross-origin iframes (undefined is the page), and the sessions of those iframes. Set up by the first upload. */
+  private readonly autoAttached = new Map<number, Set<string | undefined>>();
+  private readonly frameSessions = new Map<number, Set<string>>();
 
   constructor(deps: ExecutorDeps) {
     this.api = deps.api;
@@ -102,7 +115,8 @@ export class Executor {
     this.defaultTimeout = deps.defaultTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this.captureTimeout = deps.captureTimeoutMs ?? CAPTURE_TIMEOUT_MS;
     this.hoverHold = deps.hoverHoldMs ?? HOVER_HOLD_MS;
-    this.api.debugger.onEvent((tabId, method, params) => this.onEvent(tabId, method, params));
+    this.chooserWait = deps.fileChooserWaitMs ?? FILE_CHOOSER_WAIT_MS;
+    this.api.debugger.onEvent((tabId, method, params, sessionId) => this.onEvent(tabId, method, params, sessionId));
     this.api.debugger.onDetach((tabId, reason) => {
       this.dropTab(tabId);
       // The user dismissed Chrome's debugging bar: treat as Stop for everything.
@@ -117,6 +131,7 @@ export class Executor {
   private readonly defaultTimeout: number;
   private readonly captureTimeout: number;
   private readonly hoverHold: number;
+  private readonly chooserWait: number;
   private readonly held = new Map<number, ReturnType<typeof setTimeout>>();
 
   async run(req: CallRequest): Promise<CallResult> {
@@ -234,14 +249,7 @@ export class Executor {
       case "click": {
         const p = await this.target(sig, tabId, a("click"));
         await this.input(sig, tabId, p, "click");
-        const button = a("click").button ?? "left";
-        const clickCount = a("click").clickCount ?? 1;
-        const base = { x: p.x, y: p.y, button, buttons: button === "left" ? 1 : button === "right" ? 2 : 4 };
-        await this.hidden(sig, tabId, async () => {
-          await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
-          await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", clickCount });
-          await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", clickCount, buttons: 0 });
-        });
+        await this.press(sig, tabId, p, a("click").button ?? "left", a("click").clickCount ?? 1);
         return text(`Clicked at (${Math.round(p.x)}, ${Math.round(p.y)}).`);
       }
       case "hover": {
@@ -292,6 +300,7 @@ export class Executor {
         return text(`Scrolled ${s.direction}.`);
       }
       case "form_input": return this.formInput(sig, tabId, a("form_input").ref, a("form_input").value);
+      case "upload_file": return this.uploadFile(sig, tabId, a("upload_file"));
       case "javascript": {
         const r = (await this.cdp(sig, tabId, "Runtime.evaluate", { expression: a("javascript").code, awaitPromise: true, returnByValue: true, userGesture: true })) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string; exception?: { description?: string } } };
         if (r.exceptionDetails) throw new ToolError("internal", `JavaScript error: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "unknown"}`);
@@ -433,10 +442,11 @@ export class Executor {
     try { await this.api.debugger.send(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }); } catch { /* best effort */ }
   }
 
-  private async cdp(sig: AbortSignal, tabId: number, method: string, params?: Record<string, unknown>): Promise<unknown> {
+  /** `sessionId` sends the command to a cross-origin iframe of the tab instead of its top page. */
+  private async cdp(sig: AbortSignal, tabId: number, method: string, params?: Record<string, unknown>, sessionId?: string): Promise<unknown> {
     await this.ensureAttached(sig, tabId);
     this.throwIfAborted(sig);
-    const result = await this.api.debugger.send(tabId, method, params);
+    const result = await (sessionId === undefined ? this.api.debugger.send(tabId, method, params) : this.api.debugger.send(tabId, method, params, sessionId));
     this.throwIfAborted(sig);
     return result;
   }
@@ -468,6 +478,8 @@ export class Executor {
     this.consoleBuf.delete(tabId);
     this.netBuf.delete(tabId);
     this.lastPoint.delete(tabId);
+    this.autoAttached.delete(tabId);
+    this.frameSessions.delete(tabId);
   }
 
   private push<T>(map: Map<number, T[]>, tabId: number, item: T): void {
@@ -477,9 +489,19 @@ export class Executor {
     map.set(tabId, arr);
   }
 
-  private onEvent(tabId: number, method: string, p: Record<string, unknown>): void {
+  private onEvent(tabId: number, method: string, p: Record<string, unknown>, sessionId?: string): void {
     const ws = this.waiters.get(tabId);
-    if (ws) for (const w of [...ws]) if (w.methods.includes(method)) { ws.delete(w); w.resolve(); }
+    if (ws) for (const w of [...ws]) if (w.methods.includes(method) && (w.frames || sessionId === undefined)) { ws.delete(w); w.resolve({ params: p, ...(sessionId === undefined ? {} : { sessionId }) }); }
+    if (method === "Target.attachedToTarget" && (p.targetInfo as { type?: string } | undefined)?.type === "iframe" && typeof p.sessionId === "string") {
+      const set = this.frameSessions.get(tabId) ?? new Set();
+      set.add(p.sessionId);
+      this.frameSessions.set(tabId, set);
+    } else if (method === "Target.detachedFromTarget" && typeof p.sessionId === "string") {
+      this.frameSessions.get(tabId)?.delete(p.sessionId);
+      this.autoAttached.get(tabId)?.delete(p.sessionId);
+    }
+    // Console, network and navigation state describe the top page only.
+    if (sessionId !== undefined) return;
     if (method === "Page.frameNavigated" && !(p.frame as { parentId?: string } | undefined)?.parentId) this.domReady.delete(tabId);
     if (method === "Runtime.consoleAPICalled") {
       const args = (p.args as Array<{ value?: unknown; description?: string }> | undefined) ?? [];
@@ -502,12 +524,13 @@ export class Executor {
     }
   }
 
-  private waitForEvent(tabId: number, methods: string[], ms: number): { promise: Promise<void>; cancel: () => void } {
+  /** Resolves with the first of `methods`, or undefined after `ms`. `frames` also accepts events from cross-origin iframes. */
+  private waitForEvent(tabId: number, methods: string[], ms: number, frames = false): { promise: Promise<Waited | undefined>; cancel: () => void } {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const w = { methods, resolve: () => {} };
-    const promise = new Promise<void>(resolve => {
-      w.resolve = () => { if (timer) clearTimeout(timer); resolve(); };
-      timer = setTimeout(resolve, ms);
+    const w: Waiter = { methods, frames, resolve: () => {} };
+    const promise = new Promise<Waited | undefined>(resolve => {
+      w.resolve = e => { if (timer) clearTimeout(timer); resolve(e); };
+      timer = setTimeout(() => resolve(undefined), ms);
     });
     const set = this.waiters.get(tabId) ?? new Set();
     set.add(w);
@@ -539,7 +562,7 @@ export class Executor {
         const r = (await this.cdp(sig, tabId, "Page.navigate", { url: this.normaliseUrl(target) })) as { errorText?: string };
         if (r.errorText) throw new ToolError("internal", `Navigation failed: ${r.errorText}`);
       }
-      await Promise.race([loaded.promise, new Promise<void>(r => sig.addEventListener("abort", () => r(), { once: true }))]);
+      await Promise.race([loaded.promise, new Promise<undefined>(r => sig.addEventListener("abort", () => r(undefined), { once: true }))]);
       this.throwIfAborted(sig);
     } finally {
       loaded.cancel();
@@ -686,6 +709,125 @@ export class Executor {
     this.throwIfAborted(sig);
   }
 
+  /** A trusted click at a page point, with the overlay out of the way. */
+  private async press(sig: AbortSignal, tabId: number, p: { x: number; y: number }, button: "left" | "right" | "middle" = "left", clickCount = 1): Promise<void> {
+    const base = { x: p.x, y: p.y, button, buttons: button === "left" ? 1 : button === "right" ? 2 : 4 };
+    await this.hidden(sig, tabId, async () => {
+      await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y });
+      await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", clickCount });
+      await this.cdp(sig, tabId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", clickCount, buttons: 0 });
+    });
+  }
+
+  // ---- upload ------------------------------------------------------------
+
+  /**
+   * Puts the files on a file input. The content comes with the call and the File objects are built in the page, so nothing
+   * is read from the disk of this machine. A ref to a file input is filled directly; any other target is clicked and the
+   * file chooser it opens is held back (no dialog appears) to learn which input asked for files.
+   */
+  private async uploadFile(sig: AbortSignal, tabId: number, args: ToolArgs["upload_file"]): Promise<Content> {
+    let input: { backendNodeId: number; sessionId?: string } | undefined;
+    if (args.ref) {
+      const backendNodeId = this.refTable(tabId).byRef.get(args.ref);
+      if (backendNodeId === undefined) throw new ToolError("bad_args", `Unknown ref ${args.ref}; call read_page or find first.`);
+      if (await this.isFileInput(sig, tabId, backendNodeId)) input = { backendNodeId };
+    }
+    input ??= await this.openChooser(sig, tabId, args);
+    await this.setFiles(sig, tabId, input, args.files);
+    return text(`Uploaded ${args.files.map(f => f.name).join(", ")}.`);
+  }
+
+  private async isFileInput(sig: AbortSignal, tabId: number, backendNodeId: number): Promise<boolean> {
+    await this.ensureDom(sig, tabId);
+    let node: { nodeName?: string; attributes?: string[] } | undefined;
+    try {
+      node = ((await this.cdp(sig, tabId, "DOM.describeNode", { backendNodeId })) as { node?: typeof node }).node;
+    } catch (e) {
+      if (e instanceof ToolError) throw e;
+      throw new ToolError("bad_args", "The element is stale; call read_page again.");
+    }
+    const attrs = node?.attributes ?? [];
+    const type = attrs.findIndex((name, i) => i % 2 === 0 && name.toLowerCase() === "type");
+    return node?.nodeName?.toUpperCase() === "INPUT" && type >= 0 && attrs[type + 1]?.toLowerCase() === "file";
+  }
+
+  /** Clicks the target with file chooser interception on, in the page and in every cross-origin iframe, and returns the input that asked for files. */
+  private async openChooser(sig: AbortSignal, tabId: number, target: { ref?: string; coordinate?: [number, number] }): Promise<{ backendNodeId: number; sessionId?: string }> {
+    const p = await this.target(sig, tabId, target);
+    const armed = await this.interceptChoosers(sig, tabId);
+    const opened = this.waitForEvent(tabId, ["Page.fileChooserOpened"], this.chooserWait, true);
+    try {
+      await this.input(sig, tabId, p, "click");
+      await this.press(sig, tabId, p);
+      const chooser = await opened.promise;
+      this.throwIfAborted(sig);
+      if (!chooser) throw new ToolError("bad_args", "The click opened no file chooser. Give the file input, or the button that opens the file dialog.");
+      const backendNodeId = chooser.params.backendNodeId;
+      if (typeof backendNodeId !== "number") throw new ToolError("bad_args", "The page asked for files without a file input, which cannot be filled.");
+      return { backendNodeId, ...(chooser.sessionId === undefined ? {} : { sessionId: chooser.sessionId }) };
+    } finally {
+      opened.cancel();
+      // Interception is on for this call only: when the user uses the tab, their own file dialogs open as usual.
+      // Sent directly: the call may already be aborted, and the dialogs must come back regardless.
+      if (this.attached.has(tabId)) {
+        await Promise.all(armed.map(async s => {
+          try { await this.api.debugger.send(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }, s); } catch { /* frame or tab gone */ }
+        }));
+      }
+    }
+  }
+
+  /** Turns file chooser interception on for the page and its cross-origin iframes; returns the sessions it is on for (undefined is the page). */
+  private async interceptChoosers(sig: AbortSignal, tabId: number): Promise<Array<string | undefined>> {
+    // A cross-origin iframe is its own target: its file chooser is only reported on its own session.
+    const reached = this.autoAttached.get(tabId) ?? new Set();
+    this.autoAttached.set(tabId, reached);
+    const reach = async (sessionId?: string): Promise<void> => {
+      if (reached.has(sessionId)) return;
+      try { await this.cdp(sig, tabId, "Target.setAutoAttach", AUTO_ATTACH, sessionId); } catch (e) { if (e instanceof ToolError) throw e; /* no iframe support: the page itself still works */ }
+      reached.add(sessionId);
+    };
+    await reach();
+    await this.cdp(sig, tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+    const armed: Array<string | undefined> = [undefined];
+    for (let depth = 0; depth < MAX_FRAME_DEPTH; depth++) {
+      const fresh = [...(this.frameSessions.get(tabId) ?? [])].filter(s => !armed.includes(s));
+      if (fresh.length === 0) break;
+      for (const s of fresh) {
+        armed.push(s);
+        try {
+          await reach(s);
+          await this.cdp(sig, tabId, "Page.enable", undefined, s);
+          await this.cdp(sig, tabId, "Page.setInterceptFileChooserDialog", { enabled: true }, s);
+        } catch (e) {
+          if (e instanceof ToolError) throw e; // aborted; anything else means the iframe went away
+        }
+      }
+    }
+    return armed;
+  }
+
+  private async setFiles(sig: AbortSignal, tabId: number, input: { backendNodeId: number; sessionId?: string }, files: UploadFile[]): Promise<void> {
+    const s = input.sessionId;
+    let r: { exceptionDetails?: { exception?: { description?: string }; text?: string } };
+    try {
+      if (s === undefined) await this.ensureDom(sig, tabId);
+      else {
+        await this.cdp(sig, tabId, "DOM.enable", undefined, s);
+        await this.cdp(sig, tabId, "DOM.getDocument", { depth: 0 }, s);
+      }
+      const node = (await this.cdp(sig, tabId, "DOM.resolveNode", { backendNodeId: input.backendNodeId }, s)) as { object?: { objectId?: string } };
+      const objectId = node.object?.objectId;
+      if (!objectId) throw new Error("no object");
+      r = (await this.cdp(sig, tabId, "Runtime.callFunctionOn", { objectId, returnByValue: true, arguments: [{ value: files }], functionDeclaration: SET_FILES_FN }, s)) as typeof r;
+    } catch (e) {
+      if (e instanceof ToolError) throw e;
+      throw new ToolError("bad_args", "The file input went away before the files were set; call read_page again.");
+    }
+    if (r.exceptionDetails) throw new ToolError("bad_args", (r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "Cannot set the files").split("\n")[0]!.replace(/^Error: /, ""));
+  }
+
   private async formInput(sig: AbortSignal, tabId: number, ref: string, value: string | number | boolean): Promise<Content> {
     const backendNodeId = this.refTable(tabId).byRef.get(ref);
     if (backendNodeId === undefined) throw new ToolError("bad_args", `Unknown ref ${ref}; call read_page or find first.`);
@@ -718,4 +860,23 @@ const FORM_INPUT_FN = `function (v) {
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
   return "ok";
+}`;
+
+/** Runs in the page, on the file input. Builds the File objects from the content sent with the call. */
+const SET_FILES_FN = `function (files) {
+  const el = this;
+  if (!(el instanceof HTMLInputElement) || el.type !== "file") throw new Error("The element is not a file input");
+  if (el.disabled) throw new Error("The file input is disabled");
+  if (files.length > 1 && !el.multiple) throw new Error("This file input takes one file");
+  const dt = new DataTransfer();
+  for (const f of files) {
+    const bin = atob(f.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    dt.items.add(new File([bytes], f.name, { type: f.mimeType }));
+  }
+  el.files = dt.files;
+  el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return el.files.length;
 }`;

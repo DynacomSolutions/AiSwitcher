@@ -10,6 +10,12 @@ export type Coordinate = [number, number];
 export interface TabArgs { tabId: number }
 export interface ElementTarget extends TabArgs { ref?: string; coordinate?: Coordinate }
 
+/** A file to upload: its content, never a path. Nothing is read from the disk of the machine that runs Chrome. */
+export interface UploadFile { name: string; mimeType: string; data: string }
+/** Total decoded size of the files in one upload_file call. */
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+export const MAX_UPLOAD_FILES = 10;
+
 export interface ToolArgs {
   tabs_context: Record<string, never>;
   tabs_create: { url?: string; groupId?: number };
@@ -24,6 +30,7 @@ export interface ToolArgs {
   scroll: ElementTarget & { direction?: "up" | "down" | "left" | "right"; amount?: number };
   hover: ElementTarget;
   form_input: TabArgs & { ref: string; value: string | number | boolean };
+  upload_file: ElementTarget & { files: UploadFile[] };
   javascript: TabArgs & { code: string };
   get_console: TabArgs & { onlyErrors?: boolean; pattern?: string; clear?: boolean };
   get_network: TabArgs & { urlPattern?: string; clear?: boolean };
@@ -69,6 +76,16 @@ export const TOOL_SCHEMAS: Record<ExtensionTool, { description: string; inputSch
   scroll: { description: "Scroll the page (or the element or point given) in a direction, or scroll a ref into view when no direction is given.", inputSchema: obj({ tabId, ref, coordinate, direction: { type: "string", enum: ["up", "down", "left", "right"] }, amount: { type: "number", minimum: 1, maximum: 50, description: "Wheel ticks, default 3." } }, ["tabId"]) },
   hover: { description: "Move the pointer over an element by ref, or a point by coordinate.", inputSchema: obj({ tabId, ref, coordinate }, ["tabId"]) },
   form_input: { description: "Set the value of an input, textarea, select or checkbox by ref.", inputSchema: obj({ tabId, ref, value: { description: "String, number or boolean." } }, ["tabId", "ref", "value"]) },
+  upload_file: {
+    description: "Upload files to the page. Give the file input, or the button that opens the file chooser, by ref or coordinate: it is clicked, the chooser is held back (no dialog opens) and the files are set on its input. Works inside iframes.",
+    inputSchema: obj({
+      tabId, ref, coordinate,
+      files: {
+        type: "array", minItems: 1, maxItems: MAX_UPLOAD_FILES, description: "File content. A path is never accepted.",
+        items: obj({ name: { type: "string", description: "File name without a folder." }, mimeType: { type: "string" }, data: { type: "string", description: "Content as base64." } }, ["name", "mimeType", "data"]),
+      },
+    }, ["tabId", "files"]),
+  },
   javascript: { description: "Evaluate JavaScript in the page and return the JSON result.", inputSchema: obj({ tabId, code: { type: "string" } }, ["tabId", "code"]) },
   get_console: { description: "Return console messages and log entries collected since the extension attached to the tab.", inputSchema: obj({ tabId, onlyErrors: { type: "boolean" }, pattern: { type: "string", description: "Case-insensitive substring filter." }, clear: { type: "boolean" } }, ["tabId"]) },
   get_network: { description: "Return network requests collected since the extension attached to the tab.", inputSchema: obj({ tabId, urlPattern: { type: "string", description: "Case-insensitive substring filter." }, clear: { type: "boolean" } }, ["tabId"]) },
@@ -121,7 +138,30 @@ function check(schema: JsonSchema, value: unknown, path: string): string | undef
   }
 }
 
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/** Decoded size of a base64 string, or undefined when it is not base64. */
+export function base64Bytes(data: string): number | undefined {
+  if (data.length % 4 !== 0 || !BASE64.test(data)) return undefined;
+  return (data.length / 4) * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+}
+
+/** Checks the schema cannot express: plain file names (never a path), real base64 and the size limit. */
+function checkUpload(files: UploadFile[]): string | undefined {
+  let total = 0;
+  for (const [i, f] of files.entries()) {
+    if (f.name === "" || f.name.length > 255 || f.name === "." || f.name === ".." || /[\\/\0]/.test(f.name)) return `files[${i}].name must be a file name without a folder`;
+    if (!/^[\w.+-]+\/[\w.+-]+$/.test(f.mimeType) || f.mimeType.length > 255) return `files[${i}].mimeType must be a MIME type such as image/png`;
+    const size = base64Bytes(f.data);
+    if (size === undefined) return `files[${i}].data must be base64`;
+    total += size;
+  }
+  return total > MAX_UPLOAD_BYTES ? `files are ${total} bytes in total; the limit is ${MAX_UPLOAD_BYTES} bytes` : undefined;
+}
+
 /** Returns an error message when args do not satisfy the tool schema, else undefined. */
 export function validateToolArgs(tool: ExtensionTool, args: unknown): string | undefined {
-  return check(TOOL_SCHEMAS[tool].inputSchema, args, "args");
+  const err = check(TOOL_SCHEMAS[tool].inputSchema, args, "args");
+  if (err) return err;
+  return tool === "upload_file" ? checkUpload((args as ToolArgs["upload_file"]).files) : undefined;
 }
