@@ -652,6 +652,8 @@ export async function startGateway(opts: GatewayOptions, hooks: GatewayHooks = {
     websocket: {
       // Screenshots arrive base64 inside one frame.
       maxPayloadLength: 32 * 1024 * 1024,
+      // A call with an upload (up to 10 MiB of files, as base64) waits in the send queue while the browser reads it.
+      backpressureLimit: 64 * 1024 * 1024,
       open: (ws) => hub.open(ws),
       message: (ws, data) => {
         void hub.message(ws, typeof data === "string" ? data : data.toString("utf8"));

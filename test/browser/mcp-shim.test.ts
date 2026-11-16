@@ -1,7 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
 import { BROWSER_TOOLS } from "../../src/browser/protocol.ts";
 import { handleRpc, STOPPED_BY_USER_NOTE, type ShimContext } from "../../src/browser/mcp-shim.ts";
+import { MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, validateToolArgs } from "../../src/browser/tool-args.ts";
 
 let seen: { auth: string | null; body: any }[] = [];
 let reply: unknown = {};
@@ -29,7 +33,10 @@ test("initialize and notification", async () => {
 test("tools/list returns every tool; browser prop on all but list_browsers", async () => {
   const r: any = await handleRpc({ id: 2, method: "tools/list" }, ctx());
   expect(r.result.tools.map((t: any) => t.name)).toEqual([...BROWSER_TOOLS]);
-  expect(r.result.tools.map((t: any) => t.name)).not.toContain("upload_file");
+  // The agent names files on its own machine (`paths`); the content field the shim sends on (`files`) is not offered to it.
+  const upload = r.result.tools.find((t: any) => t.name === "upload_file");
+  expect(Object.keys(upload.inputSchema.properties).sort()).toEqual(["browser", "coordinate", "paths", "ref", "tabId"]);
+  expect(upload.inputSchema.required).toEqual(["tabId", "paths"]);
   for (const t of r.result.tools) {
     expect(t.inputSchema.properties.browser !== undefined).toBe(t.name !== "list_browsers");
   }
@@ -41,6 +48,48 @@ test("tools/call posts to the gateway and maps image content", async () => {
   expect(r.result.content).toEqual([{ type: "text", text: "hi" }, { type: "image", data: "QQ==", mimeType: "image/jpeg" }]);
   expect(r.result.isError).toBeUndefined();
   expect(seen[0]).toEqual({ auth: "Bearer tok", body: { browser: "b1", session: { id: "abcdef123", identity: "work", label: "work / abcdef" }, tool: "screenshot", args: { tabId: 3 } } });
+});
+
+test("upload_file reads the files on the agent's machine and sends their content, never a path", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ais-upload-"));
+  try {
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0, 255, 7]);
+    await writeFile(join(dir, "logo.png"), bytes);
+    await writeFile(join(dir, "notes.txt"), "hello");
+    await writeFile(join(dir, "blob"), "x");
+    reply = { id: "x", ok: true, content: [{ type: "text", text: "Uploaded logo.png." }] };
+    const r = await call("upload_file", { tabId: 3, ref: "ref_1", browser: "b1", paths: [join(dir, "logo.png"), join(dir, "notes.txt"), join(dir, "blob")] });
+    expect(r.result.isError).toBeUndefined();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.body.args).toEqual({
+      tabId: 3,
+      ref: "ref_1",
+      files: [
+        { name: "logo.png", mimeType: "image/png", data: Buffer.from(bytes).toString("base64") },
+        { name: "notes.txt", mimeType: "text/plain", data: Buffer.from("hello").toString("base64") },
+        { name: "blob", mimeType: "application/octet-stream", data: "eA==" },
+      ],
+    });
+    expect(JSON.stringify(seen[0]!.body)).not.toContain(dir);
+    expect(validateToolArgs("upload_file", seen[0]!.body.args)).toBeUndefined();
+
+    // Refused on the agent's machine: nothing is sent to the gateway.
+    seen = [];
+    const text = async (paths: unknown) => (await call("upload_file", { tabId: 3, ref: "ref_1", paths })).result.content[0].text as string;
+    expect(await text([join(dir, "missing.png")])).toBe(`bad_args: ${join(dir, "missing.png")} is not a file on this machine`);
+    expect(await text([dir])).toBe(`bad_args: ${dir} is not a file on this machine`);
+    expect(await text([])).toBe("bad_args: paths must be a list of file paths");
+    expect(await text("logo.png")).toBe("bad_args: paths must be a list of file paths");
+    expect(await text(Array.from({ length: MAX_UPLOAD_FILES + 1 }, () => join(dir, "blob")))).toBe(`bad_args: paths allows at most ${MAX_UPLOAD_FILES} files`);
+    await writeFile(join(dir, "big.bin"), new Uint8Array(MAX_UPLOAD_BYTES));
+    expect(await text([join(dir, "big.bin"), join(dir, "blob")])).toBe(`bad_args: files are ${MAX_UPLOAD_BYTES + 1} bytes in total; the limit is ${MAX_UPLOAD_BYTES} bytes`);
+    expect(seen).toHaveLength(0);
+    // Exactly at the limit is allowed.
+    expect((await call("upload_file", { tabId: 3, ref: "ref_1", paths: [join(dir, "big.bin")] })).result.isError).toBeUndefined();
+    expect(validateToolArgs("upload_file", seen[0]!.body.args)).toBeUndefined();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("a gateway base with a path prefix keeps the prefix on /browser/call", async () => {
