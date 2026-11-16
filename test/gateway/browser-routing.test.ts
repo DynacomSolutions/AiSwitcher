@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { base64Bytes, MAX_UPLOAD_BYTES } from "../../src/browser/tool-args.ts";
 import type { BrowserBinding } from "../../src/browser/types.ts";
 import { createGatewayApp } from "../../src/gateway/app.ts";
 import { BrowserHub, type HubSocket } from "../../src/gateway/browser/hub.ts";
@@ -153,7 +154,40 @@ describe("POST /browser/call", () => {
   test("bad bodies are 400", async () => {
     expect((await call({ session, tool: "nope" })).status).toBe(400);
     expect((await call({ tool: "navigate" })).status).toBe(400);
-    expect((await call({ session, tool: "upload_file", args: { tabId: 1, ref: "ref_1", paths: ["/etc/passwd"] } })).status).toBe(400);
+  });
+
+  test("upload_file takes file content only: a host path, a folder in a name and an oversized upload are 400 and reach no browser", async () => {
+    const ws = await connect(b("w", { kind: "identity", identity: "id1" }));
+    const upload = (args: Record<string, unknown>) => call({ session, tool: "upload_file", args: { tabId: 1, ref: "ref_1", ...args } });
+    const file = { name: "logo.png", mimeType: "image/png", data: "AAAA" };
+    const refused = await upload({ paths: ["/etc/passwd"] });
+    expect(refused.status).toBe(400);
+    expect(await refused.json()).toEqual({ error: "files is required" });
+    expect(await (await upload({ files: [file], paths: ["/etc/passwd"] })).json()).toEqual({ error: "unknown argument paths" });
+    expect(await (await upload({ files: [{ ...file, path: "/etc/passwd" }] })).json()).toEqual({ error: "unknown argument path" });
+    for (const name of ["/etc/passwd", "..", "dir\\logo.png", ""]) expect((await upload({ files: [{ ...file, name }] })).status).toBe(400);
+    expect((await upload({ files: [{ ...file, data: "not base64!" }] })).status).toBe(400);
+    expect((await upload({ files: [] })).status).toBe(400);
+    const big = await upload({ files: [{ ...file, data: "A".repeat((Math.floor(MAX_UPLOAD_BYTES / 3) + 1) * 4) }] });
+    expect(big.status).toBe(400);
+    expect(((await big.json()) as { error: string }).error).toContain(`the limit is ${MAX_UPLOAD_BYTES} bytes`);
+    expect(ws.sent.some((m) => m.t === "call")).toBe(false);
+  });
+
+  test("upload_file forwards the file content to the browser", async () => {
+    const ws = await connect(b("w", { kind: "identity", identity: "id1" }));
+    const files = [{ name: "logo.png", mimeType: "image/png", data: `${"A".repeat(Math.floor(MAX_UPLOAD_BYTES / 3) * 4)}AA==` }]; // exactly the limit
+    expect(base64Bytes(files[0]!.data)).toBe(MAX_UPLOAD_BYTES);
+    let forwarded: unknown;
+    const orig = ws.send.bind(ws);
+    ws.send = (d: string) => {
+      const m = JSON.parse(d) as { req?: { tool: string; args: unknown } };
+      if (m.req?.tool === "upload_file") forwarded = m.req.args;
+      orig(d);
+    };
+    answer(ws, "Uploaded logo.png.");
+    expect(await (await call({ session, tool: "upload_file", args: { tabId: 1, ref: "ref_1", files } })).json()).toMatchObject({ ok: true, content: [{ type: "text", text: "Uploaded logo.png." }] });
+    expect(forwarded).toEqual({ tabId: 1, ref: "ref_1", files });
   });
 
   test("session.id over 128 characters is 400", async () => {
