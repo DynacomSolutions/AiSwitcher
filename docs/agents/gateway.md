@@ -505,6 +505,12 @@ Replicas:
   credential failure from the upstream itself, at the cost of one extra failed attempt per replica), the side-count
   fallback while the database is down, the 401 refresh cooldown, pairing rate limits and active-session counts. Shared:
   apps, tokens, usage, side counts, the refresh lock and journal, the logins, browser presence.
+- Quota holds (a 429 proving exhaustion, a 402/403, a model-scoped 429) last until the provider's reset. They end early
+  when the one fresh usage read right after the 429 is live and below 100% for the request's model, or by a probe: while
+  the pool has no headroom, one request per held member, replica and 5 minutes goes to that member anyway. Anthropic's
+  answer decides: a 2xx ends its account hold and its hold for that model; a refusal renews the hold and is passed through.
+  The usage endpoint answers 429 for full accounts, so without the probe a reset spent outside the gateway (incident 16 Nov
+  2026) stayed held for days on every replica that had seen the 429.
 - Browser relay: see `docs/agents/browser.md` (sockets stay on their replica; calls are forwarded).
 
 Health: `/healthz` is liveness (always `ok` while the process serves). `/readyz` is readiness: 503 while warming (with the

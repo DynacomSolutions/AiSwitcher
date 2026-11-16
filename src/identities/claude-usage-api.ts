@@ -26,7 +26,7 @@ export const CLAUDE_RESETS_USER_AGENT = "claude-cli/2.1.296 (external, cli)";
 const USAGE_TIMEOUT_MS = 10_000;
 const EXPIRY_SKEW_SECONDS = 60;
 // Every pool member is read by many processes (daemon, hooks, one ais-usage poller per session); share reads and 429 backoff via cacheDir.
-const FRESH_READ_TTL_MS = 60_000;
+export const FRESH_READ_TTL_MS = 60_000;
 const DEFAULT_BACKOFF_SECONDS = 120;
 const MAX_BACKOFF_SECONDS = 15 * 60;
 

@@ -57,7 +57,10 @@ export function createUsageSource(opts: { fetchUsage: FetchUsage; ttlMs?: number
         // unavailable) keeps the last figure: answering "no limits" for a full account is wrong (T3 showed "No limits reported").
         const prev = entries.get(key)?.value;
         const hasFigure = (v: PoolUsage | undefined): boolean => !!v && v.status !== "unavailable" && ((v.windows?.length ?? 0) > 0 || typeof v.maxUtilization === "number");
-        entries.set(key, { value: hasFigure(u) ? u : staleOf(prev), at: now() });
+        // For claude, "rate-limited" with a figure is the usage endpoint's 429 backoff repeating the last good read: old
+        // figures, so stale (shown, never refused on). Codex says "rate-limited" for a live reading at 100%: that one stands.
+        const backoff = provider === "claude" && u?.status === "rate-limited";
+        entries.set(key, { value: hasFigure(u) ? (backoff ? staleOf(u) : u) : staleOf(prev), at: now() });
       } catch {
         // Keep the old figure; retry after the next ttl.
         entries.set(key, { value: staleOf(entries.get(key)?.value), at: now() });

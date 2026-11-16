@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { aisCacheDir } from "../../shared/ais-home.ts";
 import type { Identity } from "../../identities/types.ts";
-import { freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, carriedManualReset, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
+import { FRESH_READ_TTL_MS, freshLastGood, fetchUsageBodyWithResets, manualResetFromCedarEmber, carriedManualReset, fetchMemberResets, extraUsageFromBody } from "../../identities/claude-usage-api.ts";
 import { reconcileOnceForFetch } from "../../identities/oauth-refresh.ts";
 import { spawnCapturedBounded } from "../../shared/exec.ts";
 import { resolveRealBinary } from "../../shared/resolve-binary.ts";
@@ -201,6 +201,14 @@ export async function loadLastGood(identity: Identity, cacheDir: string): Promis
   }
 }
 
+/** True when the read's grant list is as fresh as the shared-read TTL, or there is none to refresh (none seen, or carried stale). */
+function grantsCurrent(read: FetchedLimitResult, nowMs: number): boolean {
+  const reset = read.manualReset;
+  if (!reset?.grants || reset.stale) return true;
+  const age = nowMs - Date.parse(reset.grantsCapturedAt ?? "");
+  return age >= 0 && age < FRESH_READ_TTL_MS;
+}
+
 export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDeps = {}): Promise<FetchedLimitResult> {
   const cacheDir = deps.cacheDir ?? aisCacheDir();
   const base: Pick<FetchedLimitResult, "toolName" | "identity"> = { toolName: "claude", identity };
@@ -215,9 +223,12 @@ export async function fetchClaudeLimits(identity: Identity, deps: ClaudeLimitsDe
   // stores AIS can only rewrite wholesale.
   await (deps.reconcile ?? reconcileOnceForFetch)("claude", identity);
 
-  // Shared across processes: a read younger than the TTL (by any caller) answers without touching the endpoint.
-  const fresh = await freshLastGood(identity, cacheDir, Date.now());
-  if (fresh) return fresh;
+  // Shared across processes: a read younger than the TTL (by any caller) answers without touching the endpoint, unless
+  // its reset grants are older. The pool poll rewrites the windows every minute but carries the grants it cannot read
+  // (its endpoint has no cedar_ember), so a reset spent outside AIS would never show while pollers keep the file fresh.
+  const nowMs = Date.now();
+  const fresh = await freshLastGood(identity, cacheDir, nowMs);
+  if (fresh && grantsCurrent(fresh, nowMs)) return fresh;
 
   // Fast path: one HTTP call. Any failure falls through to the spawn path below.
   const { body, status } = await (deps.fetchBody ?? fetchUsageBodyWithResets)(identity);
