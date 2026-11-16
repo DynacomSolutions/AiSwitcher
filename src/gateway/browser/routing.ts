@@ -1,6 +1,7 @@
 import { Hono } from "hono";
-import { BROWSER_TOOLS, SESSION_END_TOOL, DEFAULT_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallResult } from "../../browser/protocol.ts";
+import { BROWSER_TOOLS, SESSION_END_TOOL, DEFAULT_CALL_TIMEOUT_MS, UPLOAD_CALL_TIMEOUT_MS, WAIT_CALL_TIMEOUT_MS, type BrowserErrorCode, type BrowserTool, type CallResult } from "../../browser/protocol.ts";
 import { shortSessionId } from "../../browser/session-label.ts";
+import { validateToolArgs } from "../../browser/tool-args.ts";
 import type { BrowserBinding } from "../../browser/types.ts";
 import type { GatewayMetrics } from "../metrics.ts";
 import { authAgentToken } from "./auth.ts";
@@ -68,6 +69,11 @@ export function createCallRoutes(deps: CallDeps): Hono {
     if (body.browser !== undefined && typeof body.browser !== "string") return c.json({ error: "browser must be a string" }, 400);
     const id = crypto.randomUUID();
     const args = (body.args ?? {}) as Record<string, unknown>;
+    // An upload carries file content only. A path (or anything else outside the schema) and an oversized upload stop here, before any browser sees them.
+    if (tool === "upload_file") {
+      const invalid = validateToolArgs("upload_file", args);
+      if (invalid) return c.json({ error: invalid }, 400);
+    }
     const label = typeof body.session.label === "string" ? body.session.label.slice(0, 80) : "";
 
     const connected = deps.hub.connected();
@@ -103,7 +109,7 @@ export function createCallRoutes(deps: CallDeps): Hono {
     const result = await deps.hub.call(
       chosen.name,
       { id, session: forwardedSession(chosen, a.identity, body.session.id, label), tool: tool as BrowserTool, args },
-      tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : DEFAULT_CALL_TIMEOUT_MS,
+      tool === "wait" ? WAIT_CALL_TIMEOUT_MS + 5_000 : tool === "upload_file" ? UPLOAD_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS,
     );
     c.req.raw.signal.removeEventListener("abort", onAbort);
     return c.json(result);

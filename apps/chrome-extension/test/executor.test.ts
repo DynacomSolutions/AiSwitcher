@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { BrowserTool, CallRequest } from "../../../src/browser/protocol.ts";
-import { TOOL_SCHEMAS, validateToolArgs } from "../../../src/browser/tool-args.ts";
+import { base64Bytes, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, TOOL_SCHEMAS, validateToolArgs } from "../../../src/browser/tool-args.ts";
 import { capText, Executor, jpegSize } from "../src/background/executor.ts";
 import type { ExecutorDeps } from "../src/background/executor.ts";
 import { State } from "../src/background/state.ts";
@@ -210,8 +210,8 @@ describe("args and tools", () => {
   });
 
   test("every tool except list_browsers has a schema", () => {
-    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(19);
-    expect(Object.keys(TOOL_SCHEMAS)).not.toContain("upload_file");
+    expect(Object.keys(TOOL_SCHEMAS)).toHaveLength(20);
+    expect(Object.keys(TOOL_SCHEMAS)).toContain("upload_file");
     expect(validateToolArgs("click", { tabId: 1, coordinate: [1, 2] })).toBeUndefined();
     expect(validateToolArgs("click", { tabId: 1, coordinate: [1] })).toBeDefined();
     expect(validateToolArgs("click", { tabId: 1, junk: 1 })).toBeDefined();
@@ -583,5 +583,161 @@ describe("visuals and abort hygiene", () => {
     expect(restores()).toBe(base + 3);
     await new Promise(res => setTimeout(res, 100));
     expect(restores()).toBe(base + 3); // and the timer does not fire again
+  });
+});
+
+describe("upload_file", () => {
+  const file = { name: "logo.png", mimeType: "image/png", data: "iVBORw==" };
+  const FILE_INPUT = { node: { nodeName: "INPUT", attributes: ["id", "logo", "type", "file"] } };
+  const BUTTON = { node: { nodeName: "BUTTON", attributes: ["type", "button"] } };
+  const methods = (api: FakeChrome) => api.cdpLog.map(c => `${c.sessionId ? `${c.sessionId}:` : ""}${c.method}`);
+  const calls = (api: FakeChrome, method: string) => api.cdpLog.filter(c => c.method === method);
+
+  /** A tab whose read_page gave ref_1 (backend node 40), with the page-side plumbing every upload needs. */
+  async function page(extra: Partial<ExecutorDeps> = {}) {
+    const s = setup(undefined, { fileChooserWaitMs: 40, ...extra });
+    const tab = await s.tabs.create(session, "https://example.test/");
+    s.api.cdpResults["Accessibility.getFullAXTree"] = { nodes: [{ nodeId: "1", role: { value: "button" }, name: { value: "Choose file" }, backendDOMNodeId: 40 }] };
+    s.api.cdpResults["DOM.getContentQuads"] = { quads: [[10, 10, 30, 10, 30, 20, 10, 20]] };
+    s.api.cdpResults["DOM.resolveNode"] = (p?: Record<string, unknown>) => ({ object: { objectId: `obj-${String(p?.backendNodeId)}` } });
+    s.api.cdpResults["Runtime.callFunctionOn"] = { result: { value: 1 } };
+    await s.executor.run(call("read_page", { tabId: tab.id }));
+    s.api.cdpLog.length = 0;
+    return { ...s, tabId: tab.id };
+  }
+
+  test("a host path is never accepted: rejected before any action, and no path-taking command exists", async () => {
+    const { api, executor, tabId } = await page();
+    api.cdpResults["DOM.describeNode"] = FILE_INPUT;
+    for (const args of [
+      { ref: "ref_1", paths: ["/etc/passwd"] },
+      { ref: "ref_1", files: [file], paths: ["/etc/passwd"] },
+      { ref: "ref_1", files: [{ ...file, path: "/etc/passwd" }] },
+      { ref: "ref_1", files: [{ ...file, name: "/etc/passwd" }] },
+      { ref: "ref_1", files: [{ ...file, name: "../secrets" }] },
+      { ref: "ref_1", files: ["/etc/passwd"] },
+    ]) {
+      expect(await executor.run(call("upload_file", { tabId, ...args }))).toMatchObject({ ok: false, error: "bad_args" });
+    }
+    expect(api.cdpLog).toHaveLength(0);
+    // A good upload sets the files from the content sent with the call: DOM.setFileInputFiles (the command that reads host paths) is never used.
+    expect(await executor.run(call("upload_file", { tabId, ref: "ref_1", files: [file] }))).toMatchObject({ ok: true });
+    expect(methods(api)).not.toContain("DOM.setFileInputFiles");
+  });
+
+  test("size and shape limits", () => {
+    const args = (files: unknown) => ({ tabId: 1, ref: "ref_1", files });
+    expect(validateToolArgs("upload_file", args([file]))).toBeUndefined();
+    expect(validateToolArgs("upload_file", args([{ ...file, data: "" }]))).toBeUndefined();
+    expect(validateToolArgs("upload_file", args([]))).toBe("files needs at least 1 items");
+    expect(validateToolArgs("upload_file", args(Array.from({ length: MAX_UPLOAD_FILES + 1 }, () => file)))).toBe(`files allows at most ${MAX_UPLOAD_FILES} items`);
+    expect(validateToolArgs("upload_file", args([{ ...file, data: "abc" }]))).toBe("files[0].data must be base64");
+    expect(validateToolArgs("upload_file", args([{ ...file, mimeType: "png" }]))).toContain("mimeType");
+    expect(validateToolArgs("upload_file", args([{ name: "logo.png", data: "AAAA" }]))).toContain("mimeType is required");
+    // The limit is on the files together: two files, each over half of it.
+    const groups = Math.floor(MAX_UPLOAD_BYTES / 6) + 1;
+    const half = "A".repeat(groups * 4);
+    expect(validateToolArgs("upload_file", args([{ ...file, data: half }]))).toBeUndefined();
+    expect(validateToolArgs("upload_file", args([{ ...file, data: half }, { ...file, data: half }]))).toBe(`files are ${groups * 6} bytes in total; the limit is ${MAX_UPLOAD_BYTES} bytes`);
+    expect(base64Bytes("")).toBe(0);
+    expect(base64Bytes("QQ==")).toBe(1);
+    expect(base64Bytes("QUI=")).toBe(2);
+    expect(base64Bytes("QUJD")).toBe(3);
+  });
+
+  test("a ref to a file input is filled directly, without a click", async () => {
+    const { api, executor, tabId } = await page();
+    api.cdpResults["DOM.describeNode"] = FILE_INPUT;
+    const r = await executor.run(call("upload_file", { tabId, ref: "ref_1", files: [file, { ...file, name: "cover.jpg" }] }));
+    expect(textOf(r)).toBe("Uploaded logo.png, cover.jpg.");
+    expect(methods(api)).not.toContain("Input.dispatchMouseEvent");
+    expect(methods(api)).not.toContain("Page.setInterceptFileChooserDialog");
+    const set = calls(api, "Runtime.callFunctionOn")[0]!.params!;
+    expect(set.objectId).toBe("obj-40");
+    expect(set.arguments).toEqual([{ value: [file, { ...file, name: "cover.jpg" }] }]);
+  });
+
+  test("a button is clicked with the file chooser held back, and the input that asked gets the files", async () => {
+    const { api, executor, tabId } = await page();
+    api.cdpResults["DOM.describeNode"] = BUTTON;
+    api.cdpResults["Input.dispatchMouseEvent"] = (p?: Record<string, unknown>) => {
+      if (p?.type === "mouseReleased") api.emit(tabId, "Page.fileChooserOpened", { mode: "selectSingle", backendNodeId: 77 });
+      return {};
+    };
+    expect(textOf(await executor.run(call("upload_file", { tabId, ref: "ref_1", files: [file] })))).toBe("Uploaded logo.png.");
+    const intercept = calls(api, "Page.setInterceptFileChooserDialog").map(c => c.params!.enabled);
+    expect(intercept).toEqual([true, false]); // back off afterwards: the owner's own file dialogs open as usual
+    const order = methods(api);
+    expect(order.indexOf("Page.setInterceptFileChooserDialog")).toBeLessThan(order.indexOf("Input.dispatchMouseEvent"));
+    expect(calls(api, "Input.dispatchMouseEvent").map(c => c.params!.type)).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+    expect(calls(api, "Runtime.callFunctionOn")[0]!.params!.objectId).toBe("obj-77");
+  });
+
+  test("a file chooser inside a cross-origin iframe is caught on that iframe's session", async () => {
+    const { api, executor, tabId } = await page();
+    api.cdpResults["Target.setAutoAttach"] = (_p?: Record<string, unknown>, sessionId?: string) => {
+      // The page has one cross-origin iframe (F1), which itself holds another (F2).
+      if (sessionId === undefined) api.emit(tabId, "Target.attachedToTarget", { sessionId: "F1", targetInfo: { type: "iframe" } });
+      if (sessionId === "F1") api.emit(tabId, "Target.attachedToTarget", { sessionId: "F2", targetInfo: { type: "iframe" } }, "F1");
+      return {};
+    };
+    api.cdpResults["Input.dispatchMouseEvent"] = (p?: Record<string, unknown>) => {
+      if (p?.type === "mouseReleased") api.emit(tabId, "Page.fileChooserOpened", { mode: "selectMultiple", backendNodeId: 9 }, "F2");
+      return {};
+    };
+    // Coordinates need a screenshot first.
+    api.cdpResults["Page.getLayoutMetrics"] = { cssVisualViewport: { clientWidth: 800, clientHeight: 600, pageX: 0, pageY: 0 } };
+    api.cdpResults["Page.captureScreenshot"] = { data: "/9j/" };
+    expect((await executor.run(call("screenshot", { tabId }))).ok).toBe(true);
+    api.cdpLog.length = 0;
+    expect(textOf(await executor.run(call("upload_file", { tabId, coordinate: [200, 300], files: [file] })))).toBe("Uploaded logo.png.");
+    const intercept = calls(api, "Page.setInterceptFileChooserDialog").map(c => `${c.sessionId ?? "page"}:${String(c.params!.enabled)}`);
+    expect(intercept.filter(x => x.endsWith(":true"))).toEqual(["page:true", "F1:true", "F2:true"]);
+    expect(intercept.filter(x => x.endsWith(":false")).sort()).toEqual(["F1:false", "F2:false", "page:false"]);
+    // The files are set inside the iframe that asked, and the click itself goes to the tab.
+    expect(calls(api, "DOM.resolveNode")[0]).toMatchObject({ sessionId: "F2", params: { backendNodeId: 9 } });
+    expect(calls(api, "Runtime.callFunctionOn")[0]!.sessionId).toBe("F2");
+    expect(calls(api, "Input.dispatchMouseEvent").every(c => c.sessionId === undefined)).toBe(true);
+
+    // An iframe that went away is not asked again, and the tab attaches to iframes only once.
+    api.emit(tabId, "Target.detachedFromTarget", { sessionId: "F2" }, "F1");
+    api.cdpLog.length = 0;
+    api.cdpResults["Input.dispatchMouseEvent"] = {};
+    expect(await executor.run(call("upload_file", { tabId, coordinate: [200, 300], files: [file] }))).toMatchObject({ ok: false, error: "bad_args" });
+    expect(calls(api, "Page.setInterceptFileChooserDialog").map(c => c.sessionId ?? "page").sort()).toEqual(["F1", "F1", "page", "page"]);
+    expect(calls(api, "Target.setAutoAttach")).toEqual([]);
+  });
+
+  test("events from an iframe session never count as the page's own", async () => {
+    const { api, executor, tabId } = await page();
+    api.emit(tabId, "Runtime.consoleAPICalled", { type: "log", args: [{ value: "from frame" }] }, "F1");
+    api.emit(tabId, "Runtime.consoleAPICalled", { type: "log", args: [{ value: "from page" }] });
+    expect(textOf(await executor.run(call("get_console", { tabId })))).toBe("[log] from page");
+  });
+
+  test("a click that opens no file chooser fails with a clear message and turns interception off again", async () => {
+    const { api, executor, tabId } = await page();
+    api.cdpResults["DOM.describeNode"] = BUTTON;
+    const r = await executor.run(call("upload_file", { tabId, ref: "ref_1", files: [file] }));
+    expect(r).toMatchObject({ ok: false, error: "bad_args" });
+    expect(r.ok ? "" : r.message).toContain("opened no file chooser");
+    expect(calls(api, "Page.setInterceptFileChooserDialog").map(c => c.params!.enabled)).toEqual([true, false]);
+    expect(methods(api)).not.toContain("Runtime.callFunctionOn");
+  });
+
+  test("a refusal from the page (one file only, not a file input) is reported as bad_args", async () => {
+    const { api, executor, tabId } = await page();
+    api.cdpResults["DOM.describeNode"] = FILE_INPUT;
+    api.cdpResults["Runtime.callFunctionOn"] = { exceptionDetails: { text: "Uncaught", exception: { description: "Error: This file input takes one file\n    at <anonymous>:5:42" } } };
+    const r = await executor.run(call("upload_file", { tabId, ref: "ref_1", files: [file, file] }));
+    expect(r).toEqual({ id: r.id, ok: false, error: "bad_args", message: "This file input takes one file" });
+  });
+
+  test("an unknown ref and a missing target are bad_args; another session's tab is forbidden", async () => {
+    const { api, executor, tabId } = await page();
+    expect(await executor.run(call("upload_file", { tabId, ref: "ref_99", files: [file] }))).toMatchObject({ ok: false, error: "bad_args" });
+    expect(await executor.run(call("upload_file", { tabId, files: [file] }))).toMatchObject({ ok: false, error: "bad_args" });
+    expect(await executor.run(call("upload_file", { tabId, ref: "ref_1", files: [file] }, { id: "s2", identity: "dyn", label: "x" }))).toMatchObject({ ok: false, error: "forbidden_tab" });
+    expect(methods(api)).not.toContain("Runtime.callFunctionOn");
   });
 });

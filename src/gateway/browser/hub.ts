@@ -255,9 +255,10 @@ export class BrowserHub {
       }, timeoutMs);
       this.pending.set(req.id, { ws: conn.ws, tool: req.tool, started, timer, resolve: (r) => resolve(finish(r)) });
       try {
-        // Bun's ServerWebSocket.send returns 0 when the message was dropped and -1 under backpressure.
+        // Bun's ServerWebSocket.send returns 0 when the message was dropped. -1 means it is queued behind backpressure and
+        // still delivered: a call that carries an upload is larger than the socket buffer, so that is its normal result.
         const sent = conn.ws.send(JSON.stringify({ t: "call", req } satisfies GatewayToExt));
-        if (sent === 0 || sent === -1) this.settle(req.id, { id: req.id, ok: false, error: "browser_disconnected", message: "The browser connection failed." });
+        if (sent === 0) this.settle(req.id, { id: req.id, ok: false, error: "browser_disconnected", message: "The browser connection failed." });
       } catch {
         this.settle(req.id, { id: req.id, ok: false, error: "browser_disconnected", message: "The browser connection failed." });
       }

@@ -13,6 +13,7 @@ import { chatNameResolver, type ChatTool } from "./chat-name.ts";
 import { sessionName } from "./session-label.ts";
 import { BROWSER_TOOLS, SESSION_END_TOOL, type CallResult } from "./protocol.ts";
 import { mcpTools } from "./tool-schemas.ts";
+import { readUploadFiles } from "./upload.ts";
 
 export const BROWSER_TOKEN_FILE = "ais-browser-token";
 export const STOPPED_BY_USER_NOTE = "The user stopped browser control. Do not retry unless the user asks.";
@@ -65,6 +66,15 @@ async function callTool(ctx: ShimContext, name: string, rawArgs: unknown, signal
   if (!internal && !(BROWSER_TOOLS as readonly string[]).includes(name)) return errorResult(`bad_args: unknown tool ${name}`);
   if (!internal) usedContexts.add(ctx);
   const { browser, ...args } = (typeof rawArgs === "object" && rawArgs !== null ? rawArgs : {}) as Record<string, unknown>;
+  if (name === "upload_file" && args.paths !== undefined) {
+    // The files are on this machine (the agent's). Only their content travels on: no path reaches the gateway or Chrome.
+    try {
+      args.files = await readUploadFiles(args.paths);
+    } catch (e) {
+      return errorResult(`bad_args: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    delete args.paths;
+  }
   let session = ctx.session;
   // The end notice never waits for a chat-name lookup (it can rescan large transcripts): it reuses the last label.
   if (internal) {
