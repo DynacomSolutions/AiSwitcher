@@ -72,4 +72,9 @@ _Moved unchanged from the former monolithic AGENTS.md (original line numbers: 12
   renews it and a second refresher would fork the rotating refresh token. Set `AIS_GATEWAY_STORE_DATABASE_URL` on the
   console wherever the gateway runs on that store. When the store cannot be read the scheduler stands down for all four
   tools (fail closed) and retries the check after 15 s. Without the variable nothing changes. ali is never affected.
-
+- The WebUI is an installable PWA (`apps/web/public`: `manifest.webmanifest`, icons, `sw.js`). The service worker is
+  deliberately network-only: it never uses the Cache API and answers nothing but a failed page navigation (with an
+  inline offline page), so the console stays a live view and no API response or token lands in browser storage. The
+  static server marks only Vite's hashed `/assets/` as immutable; every other file (index.html, sw.js, the manifest,
+  icons) is `no-cache` so installs pick up new releases. Static files sit outside the `/api` guard, so the browser can
+  fetch the manifest and worker without the token.

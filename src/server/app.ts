@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { extname, join, normalize, resolve } from "node:path";
+import { extname, join, normalize, relative, resolve, sep } from "node:path";
 import { stat } from "node:fs/promises";
 import { Hono } from "hono";
 import pkg from "../../package.json" with { type: "json" };
@@ -474,6 +474,7 @@ function mountStatic(app: Hono, distDir: string | undefined): void {
     ".css": "text/css; charset=utf-8",
     ".svg": "image/svg+xml",
     ".json": "application/json",
+    ".webmanifest": "application/manifest+json",
     ".png": "image/png",
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
@@ -489,12 +490,14 @@ function mountStatic(app: Hono, distDir: string | undefined): void {
     try {
       const info = await stat(filePath);
       if (info.isDirectory()) filePath = join(filePath, "index.html");
-      const isHtml = filePath.endsWith(".html");
+      // Only Vite's content-hashed bundle under /assets/ is immutable.
+      // Everything else keeps a fixed name and must revalidate: index.html
+      // names the hashed bundle (a stale shell keeps users on an old UI),
+      // and the PWA files (sw.js, manifest, icons) must pick up new releases.
+      const hashed = relative(distReal, filePath).startsWith(`assets${sep}`);
       return c.body(Bun.file(filePath).stream(), 200, {
         "Content-Type": MIME[extname(filePath)] ?? "application/octet-stream",
-        // index.html must never be cached: it names the hashed asset bundle,
-        // and a stale shell keeps users on an old UI until a hard refresh.
-        "Cache-Control": isHtml ? "no-cache" : "public, max-age=31536000, immutable",
+        "Cache-Control": hashed ? "public, max-age=31536000, immutable" : "no-cache",
       });
     } catch {
       // SPA deep link: fall back to the shell.

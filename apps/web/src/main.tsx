@@ -28,3 +28,13 @@ createRoot(document.getElementById("root") as HTMLElement).render(
     </QueryClientProvider>
   </StrictMode>,
 );
+
+// Installable PWA: the worker caches nothing (see public/sw.js). Dev builds
+// skip it so Vite's hot reload is never intercepted.
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch((error: unknown) => {
+      console.warn("AIS Console: service worker registration failed", error);
+    });
+  });
+}
