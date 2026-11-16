@@ -255,6 +255,7 @@ Long console pages split into tabs with their own URL path; usage chart shows to
 |---|---|---|---|---|---|---|---|
 | 178 | Split Usage, Dashboard, Limits and Breakdown into URL-path tabs | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Was 175 (clash with 6.175). Owner request 2026-11-11: pages too long.<br>Usage: overview, models, sources, projects, repos, orgs, gateway apps. |
 | 179 | Usage chart: total on hover, readable axis text in dark mode, tooltips on one line | done | claude | ais-webui-tabs-usage-breakdown | | | Merged https://github.com/DynacomSolutions/AiSwitcher/pull/489 (4b3910f), released v0.5.47.<br>Was 176 (clash with 6.176). Axis ticks used theme `color`, which SVG text ignores (needs `fill`). |
+| 200 | Console WebUI installs as a PWA (manifest, icons, service worker) | in_progress | claude | console-pwa | | 2026-11-16 23:30 ICT | Owner request 2026-11-16. |
 
 ## 12. CI runner reliability
 Keep CI green when a GitHub-hosted runner image breaks.
